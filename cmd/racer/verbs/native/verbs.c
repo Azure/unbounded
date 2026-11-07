@@ -147,7 +147,7 @@ struct rdma_verbs_mr {
  * mode in C. Version 7 moved registration mode, the connection manager state
  * machine, and the work request ledger to Rust; this file now only wraps
  * verbs and librdmacm calls. Version 8 added rdma_verbs_prefetch. */
-uint32_t rdma_verbs_abi(void) { return 9; }
+uint32_t rdma_verbs_abi(void) { return 10; }
 
 /* Distinct from negative errno: cleanup leaked a resource. Rust must keep
  * the admission owner and adapter loaded. Stop before another resource leaks. */
@@ -813,3 +813,11 @@ int rdma_verbs_cm_get_event(struct rdma_event_channel *ch, struct rdma_verbs_cm_
 void rdma_verbs_cm_ack(void *handle) { (void)rdma_ack_cm_event(handle); }
 /* Destroy an id. Its QP must be gone and its events acknowledged. */
 int rdma_verbs_cm_destroy_id(struct rdma_cm_id *id) { return rdma_destroy_id(id) ? err() : 0; }
+/* Move `id` to a private event channel, so the shared channel no longer
+ * reports its events. Reading some events makes librdmacm modify the id's QP
+ * (rdma_get_cm_event moves it to error on REJECTED, and to RTR and RTS on a
+ * connect response), so do this before another thread destroys that QP, or
+ * the reader of the shared channel can use the freed QP. Every event read for
+ * the id must be acknowledged, or this waits. rdma_destroy_id frees the
+ * private channel. */
+int rdma_verbs_cm_detach(struct rdma_cm_id *id) { return rdma_migrate_id(id, NULL) ? err() : 0; }

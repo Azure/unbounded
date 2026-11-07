@@ -247,7 +247,7 @@ const WC_IMM: u32 = 1;
 
 /// Native adapter ABI version this crate speaks.
 #[cfg(any(test, all(feature = "native", target_os = "linux")))]
-const ABI_VERSION: u32 = 9;
+const ABI_VERSION: u32 = 10;
 
 /// Completions one [`NativeQueuePair::progress_with`] call reads. A full
 /// batch means more may be waiting without a new channel event.
@@ -495,6 +495,8 @@ native_api! {
     cm_ack: unsafe extern "C" fn(*mut c_void),
 
     cm_destroy_id: unsafe extern "C" fn(*mut c_void) -> c_int,
+
+    cm_detach: unsafe extern "C" fn(*mut c_void) -> c_int,
 }
 
 /// C's `RDMA_VERBS_CLEANUP_LEAK`, outside the negative errno range.
@@ -2207,12 +2209,20 @@ impl<T> NativeQueuePair<T> {
         if qp.is_none() && id.is_none() {
             return Ok(());
         }
+        let api = &self.device.api;
         if let (Some(cm), Some(id)) = (&self.device.cm, id) {
+            // librdmacm modifies an id's QP inside rdma_get_cm_event (to
+            // error on REJECTED, to RTR/RTS on CONNECT_RESPONSE), so the
+            // owner reading the shared channel would race the reaper's QP
+            // destroy and use the freed QP. Move the id to its own channel
+            // first. If that fails, tear down here on the owner instead.
+            if !cm.detach(api, &self.conn) {
+                return Ok(());
+            }
             // Events for the id are ignored from now on: it may be freed on
             // the reaper thread at any time.
             cm.forget(id);
         }
-        let api = &self.device.api;
         let (qp_error, qp_free, destroy_id) = (api.qp_error, api.qp_free, api.cm_destroy_id);
         let (qp, id) = (qp.map(Raw), id.map(Raw));
         let ticket = crate::reaper::Reaper::global().submit(
@@ -2789,6 +2799,8 @@ pub(crate) mod lifetime_tests {
 
         poll_fails: bool,
 
+        detach_fails: bool,
+
         /// Native post calls that reached the adapter.
         posts: usize,
     }
@@ -3133,8 +3145,23 @@ pub(crate) mod lifetime_tests {
 
     unsafe extern "C" fn cm_ack(_: *mut c_void) {}
 
-    unsafe extern "C" fn cm_destroy_id(_: *mut c_void) -> c_int {
-        -1
+    /// Record and release a fixture id (on the calling thread's record).
+    unsafe extern "C" fn cm_destroy_id(p: *mut c_void) -> c_int {
+        event("id");
+        unsafe {
+            drop(Box::from_raw(p.cast::<u8>()));
+        }
+        0
+    }
+
+    /// Record a move off the shared channel and apply the scripted failure.
+    unsafe extern "C" fn cm_detach(_: *mut c_void) -> c_int {
+        if FAULTS.with_borrow(|f| f.detach_fails) {
+            event("detach-failed");
+            return libc::EINVAL;
+        }
+        event("detach");
+        0
     }
     pub(crate) use crate::test_guard::Observer as QuotaObserver;
 
@@ -3201,6 +3228,7 @@ pub(crate) mod lifetime_tests {
             cm_get_event,
             cm_ack,
             cm_destroy_id,
+            cm_detach,
         });
         let device = Rc::new(NativeDevice::new(
             api,
@@ -3297,6 +3325,73 @@ pub(crate) mod lifetime_tests {
             assert!(!f.events.contains(&"stop"), "destroyed off this thread");
             assert!(f.events.contains(&"cq"));
         });
+    }
+
+    /// [`fixture_with`] whose QP has a connection manager id, as in
+    /// registration mode.
+    fn fixture_with_id(offload: bool) -> (Rc<NativeQueuePair>, Rc<NativeRegion>, QuotaObserver) {
+        let (qp, region, charged) = fixture_with(offload);
+        // Only this test's QP uses the device, so the CM can be swapped in.
+        let device = Rc::as_ptr(&qp.device).cast_mut();
+        unsafe {
+            (*device).cm = Some(registration::Cm::test_only(
+                NonNull::new(pointer()).unwrap(),
+            ));
+        }
+        qp.conn.id.set(NonNull::new(pointer()));
+        (qp, region, charged)
+    }
+
+    /// Wait until `qp`'s reaper teardown finished.
+    fn await_reaper(qp: &NativeQueuePair) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while qp.reaping() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    /// A connection manager QP is torn down on the reaper only after its id
+    /// left the shared event channel: reading that channel on the owner
+    /// makes librdmacm modify the id's QP, which the reaper frees. The id
+    /// moves once, even when a later stop resubmits a teardown.
+    fn offloaded_cm_teardown_moves_the_id_off_the_shared_channel_first() {
+        let (qp, _region, _charged) = fixture_with_id(true);
+        assert_eq!(qp.stop(), Err(Error::Io));
+        FAULTS.with_borrow(|f| assert_eq!(f.events, ["detach"]));
+        await_reaper(&qp);
+        qp.stop().unwrap();
+        assert!(qp.conn.detached.get());
+        assert_eq!(qp.conn.id.get(), None);
+        assert_eq!(qp.conn.qp.get(), None);
+        drop(qp);
+        FAULTS.with_borrow(|f| {
+            assert_eq!(f.events.iter().filter(|e| **e == "detach").count(), 1);
+            assert!(!f.events.contains(&"stop"), "QP destroyed off this thread");
+            assert!(!f.events.contains(&"id"), "id destroyed off this thread");
+        });
+    }
+
+    #[test]
+    /// An id that cannot leave the shared channel is torn down on the owner,
+    /// which also reads that channel, so nothing races the QP destroy.
+    fn cm_teardown_stays_on_the_owner_when_the_id_cannot_move() {
+        let (qp, _region, _charged) = fixture_with_id(true);
+        FAULTS.with_borrow_mut(|f| f.detach_fails = true);
+        qp.stop().unwrap();
+        assert!(!qp.reaping());
+        assert!(!qp.conn.detached.get());
+        assert_eq!(qp.conn.id.get(), None);
+        FAULTS.with_borrow(|f| assert_eq!(f.events, ["detach-failed", "stop", "id"]));
+    }
+
+    #[test]
+    /// Without offload (the simulation), the id is never moved.
+    fn inline_cm_teardown_never_moves_the_id() {
+        let (qp, _region, _charged) = fixture_with_id(false);
+        qp.stop().unwrap();
+        FAULTS.with_borrow(|f| assert_eq!(f.events, ["stop", "id"]));
     }
 
     #[test]

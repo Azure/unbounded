@@ -149,6 +149,10 @@ pub(crate) struct Conn {
     /// The connection manager id, once it exists.
     pub(crate) id: Cell<Option<NonNull<c_void>>>,
 
+    /// The id moved off the device's shared event channel (see
+    /// [`Cm::detach`]).
+    pub(crate) detached: Cell<bool>,
+
     /// The QP's CQ, for both queues.
     pub(crate) cq: NonNull<c_void>,
 
@@ -181,6 +185,7 @@ impl Conn {
             send_wrs,
             recv_wrs,
             token,
+            detached: Cell::new(false),
             peer: Cell::new(0),
             state: Cell::new(State::Idle),
             queued: RefCell::new(Vec::new()),
@@ -263,6 +268,23 @@ impl Cm {
         }))
     }
 
+    /// A connection manager over `channel` with no listener, for tests.
+    #[cfg(test)]
+    pub(crate) fn test_only(channel: NonNull<c_void>) -> Self {
+        Self {
+            channel,
+            fd: -1,
+            listener: Cell::new(None),
+            local: [0; 4],
+            port: 0,
+            tokens: RefCell::new(BTreeMap::new()),
+            ids: RefCell::new(BTreeMap::new()),
+            next_token: Cell::new(0),
+            leaked_ids: Cell::new(0),
+            removed: Cell::new(false),
+        }
+    }
+
     /// True once any id on this device, the listener included, reported
     /// `DEVICE_REMOVAL`.
     pub(crate) fn removed(&self) -> bool {
@@ -328,6 +350,27 @@ impl Cm {
     /// Stop routing events to `id`: it is being destroyed elsewhere.
     pub(crate) fn forget(&self, id: NonNull<c_void>) {
         self.ids.borrow_mut().remove(&(id.as_ptr() as usize));
+    }
+
+    /// Move `conn`'s id to a channel of its own, so the shared channel no
+    /// longer reports its events, before another thread destroys its QP.
+    /// Reading some events makes librdmacm modify the id's QP (to error on
+    /// `REJECTED`, to RTR and RTS on a connect response), which would use a
+    /// QP freed concurrently. Every event read for the id must be
+    /// acknowledged already, as [`Self::progress`] does. True if moved, now
+    /// or earlier; false if the id stays on the shared channel.
+    pub(crate) fn detach(&self, api: &Api, conn: &Conn) -> bool {
+        if conn.detached.get() {
+            return true;
+        }
+        let Some(id) = conn.id.get() else {
+            return true;
+        };
+        if unsafe { (api.cm_detach)(id.as_ptr()) } != 0 {
+            return false;
+        }
+        conn.detached.set(true);
+        true
     }
 
     /// Destroy `conn`'s id, if any. Its QP must already be gone. False if

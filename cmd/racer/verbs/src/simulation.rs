@@ -851,6 +851,7 @@ pub(super) fn api() -> Rc<Api> {
         cm_get_event,
         cm_ack,
         cm_destroy_id,
+        cm_detach,
     })
 }
 
@@ -3098,6 +3099,12 @@ unsafe extern "C" fn cm_ack(handle: *mut c_void) {
     {
         *unacked = unacked.saturating_sub(1);
     }
+}
+
+/// Moving an id off its channel is unsupported: the simulation tears QPs
+/// down on the owner thread, so nothing calls it.
+unsafe extern "C" fn cm_detach(_: *mut c_void) -> c_int {
+    -1
 }
 
 /// Destroy an id. Fails (the real call would block) with unacknowledged
