@@ -1372,6 +1372,19 @@ impl<C: Context> ConnectionLease<C> {
         Ok(())
     }
 
+    /// Permit returning a connection idle between exchanges: no exchange framing is
+    /// open in either direction, nothing was read ahead, and no close is pending.
+    /// The caller must not have begun a request on it. Returns whether reuse is now
+    /// permitted. The next send clears it again ([`Self::begin_io`]).
+    pub fn release_idle(&mut self) -> bool {
+        self.reusable = !self.close
+            && self.rx_remaining.is_none()
+            && self.tx_remaining.is_none()
+            && self.read_ahead.is_none()
+            && !self.ahead_descriptors.has_any();
+        self.reusable
+    }
+
     /// Whether a finished exchange currently permits returning this socket idle.
     pub fn is_reusable(&self) -> bool {
         self.reusable
@@ -3004,6 +3017,48 @@ mod tests {
         ));
         io.reclaim_buffer();
         assert_eq!(hooks.used.get(), 0);
+    }
+
+    /// Only a lease with no open exchange, read-ahead, or pending close is released idle.
+    #[test]
+    fn release_idle_requires_a_clean_lease() {
+        let hooks = hooks();
+        let lease = || {
+            let (fd, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+            let lease = ConnectionLease::<Hooks>::from_reserved(
+                fd.into(),
+                hooks.outbound_slot().unwrap(),
+                Policy::default(),
+            )
+            .unwrap();
+            (lease, peer)
+        };
+        let (mut clean, _a) = lease();
+        assert!(!clean.is_reusable());
+        assert!(clean.release_idle());
+        assert!(clean.is_reusable());
+        clean.begin_io();
+        assert!(!clean.is_reusable());
+
+        let (mut sending, _b) = lease();
+        sending.tx_remaining = Some(0);
+        assert!(!sending.release_idle());
+
+        let (mut receiving, _c) = lease();
+        receiving.rx_remaining = Some(3);
+        assert!(!receiving.release_idle());
+
+        let (mut ahead, _d) = lease();
+        let buffer = OwnedBuffer::copy_from(hooks.as_ref(), b"x").unwrap();
+        ahead.restore_read_ahead(buffer, 0..1).unwrap();
+        assert!(!ahead.release_idle());
+
+        let (mut closing, _e) = lease();
+        closing.poison();
+        assert!(!closing.release_idle());
+        drop((clean, sending, receiving, ahead, closing));
+        assert_eq!(hooks.used.get(), 0);
+        assert_eq!(hooks.slots.get(), 0);
     }
 
     /// Underflow and removed excess bytes cannot make a connection reusable.
