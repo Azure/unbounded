@@ -780,6 +780,14 @@ impl NativeDevice {
 
     /// Release this device's own objects before closing. False if any
     /// leaked.
+    /// Stop accepting connections, so another device can listen on this
+    /// one's address. False if the listener leaked.
+    pub(crate) fn stop_listening(&self) -> bool {
+        self.cm
+            .as_ref()
+            .is_none_or(|cm| cm.stop_listening(&self.api))
+    }
+
     fn release(&mut self) -> bool {
         if let Some(cm) = &mut self.cm {
             if !cm.close(&self.api) {

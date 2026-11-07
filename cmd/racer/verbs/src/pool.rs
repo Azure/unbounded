@@ -443,6 +443,16 @@ impl Pool {
             .set(buffer.index, BufferState::Leaked);
     }
 
+    /// True if the NIC can no longer touch any buffer: each one is free or
+    /// held by a received page, which only the CPU reads.
+    pub(crate) fn nic_quiet(&self) -> bool {
+        let quiet = |shared: &PoolShared| {
+            (0..shared.count() as u32)
+                .all(|i| matches!(shared.state(i), BufferState::Free | BufferState::Owned))
+        };
+        quiet(&self.shared) && self.device.values().all(|d| quiet(&d.shared))
+    }
+
     /// Received pages still alive outside the owner.
     pub(crate) fn outstanding(&self) -> usize {
         Arc::strong_count(&self.shared) - 1
