@@ -1042,6 +1042,10 @@ pub struct WorkerApplication {
     /// The rails were withdrawn after a failed activation.
     rdma_withdrawn: bool,
 
+    /// The rails were advertised again after a withdrawal, and membership
+    /// may still list none for this node until the controller republishes.
+    rdma_readvertised: bool,
+
     /// Device losses the owner reported so far (see
     /// `rdma_verbs::Client::device_losses`), so only new ones close the round.
     rdma_losses_seen: u64,
@@ -1711,6 +1715,7 @@ impl WorkerApplication {
                 .as_ref()
                 .map(|managed| (managed.report.clone(), config.shares.get())),
             rdma_withdrawn: false,
+            rdma_readvertised: false,
             rdma_losses_seen: 0,
             rdma_lost: None,
             rail_probe: started,

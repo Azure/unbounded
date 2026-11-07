@@ -221,16 +221,27 @@ impl WorkerApplication {
         Ok(())
     }
     /// The node's rails: one device per published rail, chosen near the owner.
+    ///
+    /// While this node's own rails are withdrawn (or advertised again but not
+    /// yet republished), membership lists none for it, so the discovered
+    /// rails stand in. Otherwise activation could never succeed, and only a
+    /// successful activation advertises the rails again.
     pub(super) fn native_publication(&self) -> Result<Vec<racer_wire::control::RailMapping>> {
         let snapshot = self.snapshots.current()?;
         let member = snapshot.membership.member(self.keys.node())?;
+        let published =
+            if member.rails.is_empty() && (self.rdma_withdrawn || self.rdma_readvertised) {
+                &self.discovered_nics
+            } else {
+                &member.rails
+            };
         let owner = self.node.native.owner_worker();
         let numa = match owner {
             Some(owner) => self.node.native.numa(owner)?.and_then(|p| p.numa_node),
             None => None,
         };
         Ok(crate::rdma::select_worker(
-            &member.rails,
+            published,
             &self.discovered_nics,
             0,
             numa,
@@ -246,6 +257,16 @@ impl WorkerApplication {
             return Ok(());
         };
         self.refresh_inventory()?;
+        if self.rdma_readvertised
+            && let Ok(snapshot) = self.snapshots.current()
+            && snapshot
+                .membership
+                .member(self.keys.node())
+                .is_ok_and(|member| !member.rails.is_empty())
+        {
+            // Membership lists the advertised rails again.
+            self.rdma_readvertised = false;
+        }
         if let Some(task) = self.native_task.as_mut()
             && let Poll::Ready(result) = task.as_mut().poll(cx)
         {
@@ -439,6 +460,7 @@ impl WorkerApplication {
     fn native_activation_succeeded(&mut self) {
         if std::mem::take(&mut self.rdma_withdrawn) {
             eprintln!("racer: stage=rdma-activation state=active; advertising RDMA rails again");
+            self.rdma_readvertised = true;
             if let Some((report, shares)) = &self.rdma_report {
                 report(*shares, self.discovered_nics.clone());
             }
@@ -1766,6 +1788,162 @@ mod tests {
         run(&mut worker);
         assert!(links.rail_ready(RailId(0)));
         assert_eq!(metrics.count(Event::RdmaDeviceLoss), 1);
+    }
+
+    /// Apply a publication listing this node with `rails`.
+    fn publish_rails(
+        worker: &mut WorkerApplication,
+        app: &Application,
+        sequence: u64,
+        rails: Vec<racer_wire::control::RailMapping>,
+    ) {
+        worker
+            .snapshots
+            .apply(
+                Publication {
+                    pools: Vec::new(),
+                    schema_version: racer_wire::control::SCHEMA_VERSION,
+                    cluster: app.config.cluster.clone(),
+                    sequence: PublicationSequence(sequence),
+                    membership_version: MembershipVersion(sequence),
+                    members: vec![racer_wire::control::Member {
+                        node: app.config.node.clone(),
+                        shares: std::num::NonZeroU32::new(1).unwrap(),
+                        peer_endpoint: "127.0.0.1:7443".into(),
+                        rails,
+                        site: "site1".into(),
+                    }],
+                    caches: vec![],
+                    page_size: racer_wire::object::PageSize::DEFAULT,
+                }
+                .with_default_pool(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    /// Regression: after a VF unplug and replug, when membership has already
+    /// dropped the withdrawn rails, RDMA still reactivates from the
+    /// discovered rails, and stays active until membership lists them again.
+    /// (Renamed replugs are covered by `vf_replug_with_null_gid_twin_keeps_rail`
+    /// and `lost_devices_back`; the simulated owner cannot rename devices.)
+    fn lost_device_reactivates_after_membership_withdrawal() {
+        use crate::telemetry::Event;
+        use rdma_verbs::simulation::Device;
+        use rdma_verbs::simulation::Simulation;
+        use std::os::unix::fs::symlink;
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = Scratch(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("target")
+                .join(format!("withdrawn-device-{}", std::process::id())),
+        );
+        let root = dir.0.join("infiniband");
+        let pci = dir.0.join("7870:00:00.0");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&pci).unwrap();
+        let plug = || {
+            std::fs::create_dir_all(root.join("mana_0")).unwrap();
+            symlink(&pci, root.join("mana_0").join("device")).unwrap();
+        };
+        plug();
+        let sim = Simulation::new();
+        let simulated = sim
+            .with_devices(vec![Device::new("mana_0", [1; 16])])
+            .unwrap();
+        let _devices = simulated.enter();
+        let env = racer_io::Env::host();
+        let mut app = configured();
+        app.discovered_nics[0].device = "mana_0".into();
+        app.discovered_nics[0].rail = RailId(0);
+        app.node
+            .inventory
+            .update_keyed(vec![(
+                app.discovered_nics[0].clone(),
+                Some("7870:00:00.0".into()),
+            )])
+            .unwrap();
+        let (mut worker, engine) = worker(&env, &app, true, true);
+        worker.rdma_sysfs = root.clone();
+        let mut service = test_owner(&app, engine);
+        let mut run = |worker: &mut WorkerApplication| {
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            for _ in 0..20 {
+                worker.poll_native(&mut cx).unwrap();
+                service.poll_budgeted(&mut cx, 64).unwrap();
+            }
+        };
+        run(&mut worker);
+        let links = worker.links.clone().unwrap();
+        assert!(links.rail_ready(RailId(0)));
+        let metrics = worker.telemetry.metrics.clone();
+        // Unplug, and the controller republishes the withdrawn (empty) rails.
+        std::fs::remove_dir_all(root.join("mana_0")).unwrap();
+        worker.rail_probe = worker.ctx().now();
+        run(&mut worker);
+        assert!(worker.rdma_lost.is_some());
+        assert!(worker.rdma_withdrawn);
+        publish_rails(&mut worker, &app, 2, Vec::new());
+        plug();
+        worker.native_retry = worker.ctx().now();
+        run(&mut worker);
+        assert!(links.rail_ready(RailId(0)), "RDMA reactivates");
+        assert!(worker.rdma_lost.is_none());
+        assert!(!worker.rdma_withdrawn);
+        assert!(worker.rdma_readvertised);
+        assert_eq!(metrics.count(Event::RdmaDeviceReactivation), 1);
+        // Membership still lists no rails: the active rails stay compatible.
+        let startup = scope(&racer_io::Clock::host(), Duration::from_secs(1)).unwrap();
+        worker.refresh_snapshot(&startup).unwrap();
+        run(&mut worker);
+        assert!(links.rail_ready(RailId(0)));
+        // The controller republishes the advertised rails.
+        let mut advertised = worker.discovered_nics.clone();
+        advertised[0].numa_node = None;
+        publish_rails(&mut worker, &app, 3, advertised);
+        worker.refresh_snapshot(&startup).unwrap();
+        run(&mut worker);
+        assert!(!worker.rdma_readvertised);
+        assert!(links.rail_ready(RailId(0)));
+        assert_eq!(metrics.count(Event::RdmaDeviceLoss), 1);
+    }
+
+    #[test]
+    /// Regression: a failed activation withdraws the rails, and the retry
+    /// still activates once membership lists none for this node.
+    fn failed_activation_retries_after_membership_withdrawal() {
+        use rdma_verbs::simulation::Device;
+        use rdma_verbs::simulation::Simulation;
+        let sim = Simulation::new()
+            .with_devices(vec![Device::new("test-device", [1; 16])])
+            .unwrap();
+        let _devices = sim.enter();
+        let env = racer_io::Env::host();
+        let mut app = configured();
+        app.discovered_nics[0].device = "test-device".into();
+        let (mut worker, engine) = worker(&env, &app, true, true);
+        let mut service = test_owner(&app, engine);
+        sim.implicit_odp(false);
+        let mut run = |worker: &mut WorkerApplication| {
+            worker.native_retry = worker.ctx().now();
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            for _ in 0..20 {
+                worker.poll_native(&mut cx).unwrap();
+                service.poll_budgeted(&mut cx, 64).unwrap();
+            }
+        };
+        run(&mut worker);
+        assert!(worker.rdma_withdrawn);
+        publish_rails(&mut worker, &app, 2, Vec::new());
+        sim.implicit_odp(true);
+        run(&mut worker);
+        assert!(worker.links.as_ref().unwrap().rail_ready(RailId(7)));
+        assert!(!worker.rdma_withdrawn);
     }
 
     #[test]

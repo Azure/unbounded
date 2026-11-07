@@ -1949,8 +1949,14 @@ While the device is missing, the dataplane does not retry activation. Once
 every lost PCI address is back in sysfs and the old links and page buffers are
 released, it reactivates RDMA. A device that came back under a new name
 refreshes the device inventory first; rails are keyed by PCI address, so it
-keeps its rail. A successful reactivation logs `stage=rdma-device
-state=reactivated` and counts `racer_rdma_device_reactivations_total`.
+keeps its rail. Only ports with a non-null GID are inventoried, so a VF that
+comes back as two devices at one PCI address (for example `rdmaP30832p0s0`
+with a null GID and `roceP30832p0s0` with the RoCE GID) uses the RoCE one.
+While its rails are withdrawn, the membership lists none for this node, so
+reactivation (like the retry after a failed activation) uses the discovered
+rails and then advertises them again. A successful reactivation logs
+`stage=rdma-device state=reactivated` and counts
+`racer_rdma_device_reactivations_total`.
 
 The RDMA owner thread hands queue pair and connection manager teardowns to
 helper threads named `racer-rdma-reaper`, at most one teardown every 2 ms per
