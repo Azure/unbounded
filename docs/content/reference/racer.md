@@ -1946,8 +1946,21 @@ HTTP without waiting for their deadlines. It also deactivates RDMA, so
 advertising its rails, the same way as after a failed activation. Each loss
 logs `stage=rdma-device state=lost` and counts `racer_rdma_device_losses_total`.
 While the device is missing, the dataplane does not retry activation. Once
-every lost PCI address is back in sysfs and the old links and page buffers are
-released, it reactivates RDMA. A device that came back under a new name
+every lost PCI address is back in sysfs and the old links are gone, it
+reactivates RDMA. It does not wait for received pages that are still held, for
+example by a read in progress: no NIC can reach them once their device is gone,
+so their page buffers are freed later, when the pages are released. Until then
+they stay counted against `RACER_REGISTERED_BYTES`, so a reactivation that
+cannot fund its pool yet fails and retries. While it waits, the dataplane logs
+`stage=rdma-device state=waiting reason=...` each time the reason changes:
+`device_missing:<device>`, `drain_<blocker>` (the old round is still releasing
+its `links`, its `buffers` that a NIC may still use, its `registering` pools,
+or never releases a `leaked` native object), or `inventory_refresh:<error>`.
+`racer_rdma_reactivation_waiting_device` is 1 while it waits for a device and
+`racer_rdma_reactivation_waiting_drain` is 1 while it waits for the old round.
+A failed activation logs `stage=rdma-activation state=failed` when it withdraws
+the rails, and again on the 1st, 2nd, 4th, 8th, and so on consecutive failed
+retry. A device that came back under a new name
 refreshes the device inventory first; rails are keyed by PCI address, so it
 keeps its rail. Only ports with a non-null GID are inventoried, so a VF that
 comes back as two devices at one PCI address (for example `rdmaP30832p0s0`

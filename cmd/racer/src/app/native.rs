@@ -338,7 +338,7 @@ impl WorkerApplication {
         {
             return Ok(());
         }
-        if self.rdma_lost.is_some() && !self.lost_devices_back(&links)? {
+        if self.rdma_lost.is_some() && !self.lost_devices_back(&links) {
             self.native_retry = self.ctx().now() + RAIL_PROBE;
             return Ok(());
         }
@@ -445,7 +445,17 @@ impl WorkerApplication {
         self.telemetry
             .metrics
             .record(crate::telemetry::Event::RdmaActivationFailure, 1);
-        if !self.rdma_withdrawn {
+        if self.rdma_withdrawn {
+            // Retries log too, on the 1st, 2nd, 4th, 8th, ... consecutive
+            // failure, so a reactivation that keeps failing stays visible
+            // without one line per retry.
+            if self.native_failures.is_power_of_two() {
+                eprintln!(
+                    "racer: stage=rdma-activation state=failed error={error:?} failures={}; RDMA rails stay withdrawn, retrying",
+                    self.native_failures
+                );
+            }
+        } else {
             eprintln!(
                 "racer: stage=rdma-activation state=failed error={error:?}; withdrawing RDMA rails and retrying"
             );
@@ -485,16 +495,27 @@ impl WorkerApplication {
             return;
         }
         let now = self.ctx().now();
-        let mut lost = reported;
-        if !lost && now >= self.rail_probe {
+        let mut missing = Vec::new();
+        if !reported && now >= self.rail_probe {
             self.rail_probe = now + RAIL_PROBE;
-            lost = self.rail_keys().iter().any(|(device, key)| {
-                key.starts_with("pci:")
-                    && crate::rdma::rail_presence(&self.rdma_sysfs, device, key)
-                        != crate::rdma::RailPresence::Present
-            });
+            missing = self
+                .actual_rails
+                .iter()
+                .zip(self.rail_keys())
+                .filter(|(_, (device, key))| {
+                    key.starts_with("pci:")
+                        && crate::rdma::rail_presence(&self.rdma_sysfs, device, key)
+                            != crate::rdma::RailPresence::Present
+                })
+                .map(|(mapping, _)| mapping.rail)
+                .collect();
         }
-        if lost {
+        if reported || !missing.is_empty() {
+            // The owner learns of losses only sysfs shows, so the round does
+            // not wait for pages no NIC can reach any more.
+            for rail in missing {
+                links.report_lost(rail);
+            }
             self.native_device_lost(links);
         }
     }
@@ -537,6 +558,7 @@ impl WorkerApplication {
             self.rdma_withdrawn = true;
         }
         self.rdma_lost = Some(lost);
+        self.rdma_waiting = None;
         self.native_failures = 0;
         self.native_retry = self.ctx().now() + RAIL_PROBE;
     }
@@ -544,10 +566,37 @@ impl WorkerApplication {
     /// Whether every lost device is back and the old round drained, so a
     /// new activation can start. A device back under a new name (a VF
     /// replug) refreshes the inventory first, so activation finds it.
-    fn lost_devices_back(&mut self, links: &crate::rdma::Links) -> Result<bool> {
-        let Some(lost) = &self.rdma_lost else {
-            return Ok(true);
-        };
+    ///
+    /// Each change in what it waits for is logged once and shown by the
+    /// `racer_rdma_reactivation_waiting_*` gauges, and a failed inventory
+    /// refresh is logged and retried, so a stalled reactivation is visible.
+    fn lost_devices_back(&mut self, links: &crate::rdma::Links) -> bool {
+        let waiting = self.reactivation_waiting(links);
+        let metrics = &self.telemetry.metrics;
+        metrics.set_gauge(
+            crate::telemetry::Gauge::RdmaWaitingDevice,
+            u64::from(matches!(&waiting, Some(w) if w.starts_with("device"))),
+        );
+        metrics.set_gauge(
+            crate::telemetry::Gauge::RdmaWaitingDrain,
+            u64::from(matches!(&waiting, Some(w) if w.starts_with("drain"))),
+        );
+        if waiting != self.rdma_waiting {
+            if let Some(reason) = &waiting {
+                eprintln!(
+                    "racer: stage=rdma-device state=waiting reason={reason}; reactivating once it clears"
+                );
+            }
+            self.rdma_waiting = waiting.clone();
+        }
+        waiting.is_none()
+    }
+
+    /// What reactivation after a device loss waits for, or `None` once it
+    /// may start: `device_missing:<name>`, `drain_<blocker>` (see
+    /// [`rdma_verbs::DrainBlocker`]), or `inventory_refresh:<error>`.
+    fn reactivation_waiting(&mut self, links: &crate::rdma::Links) -> Option<String> {
+        let lost = self.rdma_lost.as_ref()?;
         let mut renamed = false;
         for (device, key) in lost {
             match crate::rdma::rail_presence(&self.rdma_sysfs, device, key) {
@@ -555,18 +604,29 @@ impl WorkerApplication {
                 crate::rdma::RailPresence::Renamed => renamed = true,
                 // A name-keyed rail cannot be found by address: try anyway.
                 crate::rdma::RailPresence::Missing if !key.starts_with("pci:") => {}
-                crate::rdma::RailPresence::Missing => return Ok(false),
+                crate::rdma::RailPresence::Missing => {
+                    return Some(format!("device_missing:{device}"));
+                }
             }
         }
         if !links.drained() {
-            return Ok(false);
+            let blocker = links
+                .drain_blocker()
+                .map_or("pending", rdma_verbs::DrainBlocker::as_str);
+            return Some(format!("drain_{blocker}"));
         }
         if renamed {
             // Opens the devices: only once they are all back.
-            self.node.inventory.refresh()?;
-            self.refresh_inventory()?;
+            if let Err(error) = self
+                .node
+                .inventory
+                .refresh()
+                .and_then(|_| self.refresh_inventory())
+            {
+                return Some(format!("inventory_refresh:{error:?}"));
+            }
         }
-        Ok(true)
+        None
     }
 }
 
@@ -1706,7 +1766,7 @@ mod tests {
     /// round at once so reads use HTTP, activation waits while the device is
     /// missing, and RDMA reactivates by itself once it is back.
     fn lost_device_falls_back_and_reactivates_when_back() {
-        use crate::telemetry::Event;
+        use crate::telemetry::{Event, Gauge};
         use rdma_verbs::simulation::Device;
         use rdma_verbs::simulation::Simulation;
         use std::os::unix::fs::symlink;
@@ -1769,11 +1829,20 @@ mod tests {
         assert!(worker.rdma_lost.is_some());
         assert_eq!(metrics.count(Event::RdmaDeviceLoss), 1);
         assert_eq!(metrics.count(Event::RdmaActivationFailure), 0);
+        // The owner learns of the loss sysfs showed, so the round drains
+        // without waiting for pages no NIC can reach.
+        assert_eq!(links.device_losses(), 1);
         // Still missing: no activation is attempted.
         worker.native_retry = worker.ctx().now();
         run(&mut worker);
         assert!(worker.native_task.is_none());
         assert!(!links.rail_ready(RailId(0)));
+        assert_eq!(
+            worker.rdma_waiting.as_deref(),
+            Some("device_missing:test-device")
+        );
+        assert_eq!(metrics.gauge(Gauge::RdmaWaitingDevice), 1);
+        assert_eq!(metrics.gauge(Gauge::RdmaWaitingDrain), 0);
         assert_eq!(metrics.count(Event::RdmaActivationFailure), 0);
         // Replug: activation resumes and the rail is ready again.
         plug();
@@ -1781,6 +1850,8 @@ mod tests {
         run(&mut worker);
         assert!(links.rail_ready(RailId(0)));
         assert!(worker.rdma_lost.is_none());
+        assert_eq!(worker.rdma_waiting, None);
+        assert_eq!(metrics.gauge(Gauge::RdmaWaitingDevice), 0);
         assert_eq!(metrics.count(Event::RdmaDeviceReactivation), 1);
         assert_eq!(metrics.count(Event::RdmaDeviceLoss), 1);
         // Healthy probes change nothing.
@@ -1819,6 +1890,97 @@ mod tests {
                 .with_default_pool(),
             )
             .unwrap();
+    }
+
+    #[test]
+    /// A device back before the old round drained waits for the drain,
+    /// says so in the log and the `racer_rdma_reactivation_waiting_drain`
+    /// gauge, and reactivates once the owner drains.
+    fn lost_device_waits_for_drain_then_reactivates() {
+        use crate::telemetry::{Event, Gauge};
+        use rdma_verbs::simulation::Device;
+        use rdma_verbs::simulation::Simulation;
+        use std::os::unix::fs::symlink;
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = Scratch(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("target")
+                .join(format!("undrained-device-{}", std::process::id())),
+        );
+        let root = dir.0.join("infiniband");
+        let pci = dir.0.join("7870:00:00.0");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&pci).unwrap();
+        let plug = || {
+            std::fs::create_dir_all(root.join("mana_0")).unwrap();
+            symlink(&pci, root.join("mana_0").join("device")).unwrap();
+        };
+        plug();
+        let sim = Simulation::new();
+        let simulated = sim
+            .with_devices(vec![Device::new("mana_0", [1; 16])])
+            .unwrap();
+        let _devices = simulated.enter();
+        let env = racer_io::Env::host();
+        let mut app = configured();
+        app.discovered_nics[0].device = "mana_0".into();
+        app.discovered_nics[0].rail = RailId(0);
+        app.node
+            .inventory
+            .update_keyed(vec![(
+                app.discovered_nics[0].clone(),
+                Some("7870:00:00.0".into()),
+            )])
+            .unwrap();
+        let (mut worker, engine) = worker(&env, &app, true, true);
+        worker.rdma_sysfs = root.clone();
+        let mut service = test_owner(&app, engine);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        for _ in 0..20 {
+            worker.poll_native(&mut cx).unwrap();
+            service.poll_budgeted(&mut cx, 64).unwrap();
+        }
+        let links = worker.links.clone().unwrap();
+        assert!(links.rail_ready(RailId(0)));
+        let metrics = worker.telemetry.metrics.clone();
+        // Unplug and replug before the owner runs: the round is closed but
+        // not drained.
+        std::fs::remove_dir_all(root.join("mana_0")).unwrap();
+        worker.rail_probe = worker.ctx().now();
+        worker.poll_native(&mut cx).unwrap();
+        assert!(worker.rdma_lost.is_some());
+        plug();
+        worker.native_retry = worker.ctx().now();
+        worker.poll_native(&mut cx).unwrap();
+        assert!(
+            worker.native_task.is_none(),
+            "activation waits for the drain"
+        );
+        assert!(
+            worker
+                .rdma_waiting
+                .as_deref()
+                .is_some_and(|w| w.starts_with("drain_")),
+            "{:?}",
+            worker.rdma_waiting
+        );
+        assert_eq!(metrics.gauge(Gauge::RdmaWaitingDrain), 1);
+        assert_eq!(metrics.gauge(Gauge::RdmaWaitingDevice), 0);
+        for _ in 0..20 {
+            service.poll_budgeted(&mut cx, 64).unwrap();
+            worker.native_retry = worker.ctx().now();
+            worker.poll_native(&mut cx).unwrap();
+        }
+        assert!(links.rail_ready(RailId(0)), "RDMA reactivates");
+        assert!(worker.rdma_lost.is_none());
+        assert_eq!(worker.rdma_waiting, None);
+        assert_eq!(metrics.gauge(Gauge::RdmaWaitingDrain), 0);
+        assert_eq!(metrics.count(Event::RdmaDeviceReactivation), 1);
     }
 
     #[test]

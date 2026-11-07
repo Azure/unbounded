@@ -501,6 +501,8 @@ metrics! { Gauge, GAUGES, GAUGE_COUNT;
             Self::RdmaLinksBackoff => "racer_rdma_links_backoff",
             Self::RdmaLinksBreaking => "racer_rdma_links_breaking",
             Self::RdmaGrantWaiters => "racer_rdma_grant_waiters",
+            Self::RdmaWaitingDevice => "racer_rdma_reactivation_waiting_device",
+            Self::RdmaWaitingDrain => "racer_rdma_reactivation_waiting_drain",
 }
 /// One nonempty intermediate HTTP relay_body call, after sending its response head.
 /// Success credits the entire ciphertext body only after both HTTP finish checks.

@@ -1055,6 +1055,10 @@ pub struct WorkerApplication {
     /// back in sysfs and for the old round to drain.
     rdma_lost: Option<Vec<(String, String)>>,
 
+    /// What reactivation after a device loss last waited for, as logged, so
+    /// each change logs once.
+    rdma_waiting: Option<String>,
+
     /// Next sysfs presence probe of the active rails.
     rail_probe: std::time::Instant,
 
@@ -1718,6 +1722,7 @@ impl WorkerApplication {
             rdma_readvertised: false,
             rdma_losses_seen: 0,
             rdma_lost: None,
+            rdma_waiting: None,
             rail_probe: started,
             rdma_sysfs: crate::rdma::SYSFS_INFINIBAND.into(),
             telemetry: Rc::new(telemetry),
