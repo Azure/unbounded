@@ -84,6 +84,15 @@ Priority 0 has no weighted share when competing with positive-priority caches.
 The cache keeps its working allowance, is preferred for eviction, and is still
 cached while capacity is idle.
 
+Memory-cache entries do not expire with time at normal memory pressure. An
+entry leaves the memory cache only when its space is needed: a new read or
+fill reclaims least recently used idle entries when the ciphertext budget is
+full, publication keeps headroom for in-flight reads, and entries whose page
+key leaves the keyring or whose cache turns on passthrough are dropped. When
+`RACER_MEMORY_PRESSURE` reports elevated or critical pressure, entries not
+read or written for 30 seconds are also released, and critical pressure
+reclaims idle entries directly.
+
 ### Passthrough
 
 Set `spec.passthrough` to turn off caching for a cache. Racer still serves
