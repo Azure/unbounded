@@ -1042,6 +1042,10 @@ pub struct WorkerApplication {
     /// The rails were withdrawn after a failed activation.
     rdma_withdrawn: bool,
 
+    /// The rails were advertised again after a withdrawal, and membership
+    /// may still list none for this node until the controller republishes.
+    rdma_readvertised: bool,
+
     /// Device losses the owner reported so far (see
     /// `rdma_verbs::Client::device_losses`), so only new ones close the round.
     rdma_losses_seen: u64,
@@ -1050,6 +1054,30 @@ pub struct WorkerApplication {
     /// RDMA reactivates. While set, activation waits for every key to be
     /// back in sysfs and for the old round to drain.
     rdma_lost: Option<Vec<(String, String)>>,
+
+    /// What reactivation after a device loss last waited for, as logged, so
+    /// each change logs once.
+    rdma_waiting: Option<String>,
+    /// The native task attaches GPU landings, not activates.
+    attaching_landings: bool,
+
+    /// Since when, and as which names per lost device, sysfs has shown the
+    /// lost devices back unchanged (see `RAIL_SETTLE`).
+    rdma_settle: Option<(std::time::Instant, Vec<Vec<String>>)>,
+
+    /// Reactivation attempts that found the lost devices back but unusable.
+    rdma_attempts: u32,
+
+    /// `RAIL_SETTLE`, shortened by tests.
+    rail_settle: std::time::Duration,
+
+    /// Verbs character devices in sysfs and where to create fresh nodes for
+    /// them before reactivating (see `crate::rdma::refresh_char_devices`).
+    /// `None` in tests, which must not create device nodes on the host.
+    rdma_char_devices: Option<(std::path::PathBuf, std::path::PathBuf)>,
+
+    /// The nodes were refreshed since the last device loss.
+    rdma_char_refreshed: bool,
 
     /// Next sysfs presence probe of the active rails.
     rail_probe: std::time::Instant,
@@ -1711,8 +1739,21 @@ impl WorkerApplication {
                 .as_ref()
                 .map(|managed| (managed.report.clone(), config.shares.get())),
             rdma_withdrawn: false,
+            rdma_readvertised: false,
             rdma_losses_seen: 0,
             rdma_lost: None,
+            rdma_waiting: None,
+            attaching_landings: false,
+            rdma_settle: None,
+            rdma_attempts: 0,
+            rail_settle: native::RAIL_SETTLE,
+            rdma_char_devices: (!cfg!(test)).then(|| {
+                (
+                    crate::rdma::SYSFS_INFINIBAND_VERBS.into(),
+                    crate::rdma::DEV_CHAR.into(),
+                )
+            }),
+            rdma_char_refreshed: false,
             rail_probe: started,
             rdma_sysfs: crate::rdma::SYSFS_INFINIBAND.into(),
             telemetry: Rc::new(telemetry),
