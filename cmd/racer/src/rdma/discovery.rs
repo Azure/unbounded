@@ -781,6 +781,58 @@ mod tests {
     }
 
     #[test]
+    /// After a MANA VF replug sysfs lists two devices at the old PCI address:
+    /// `rdmaP...` with a null GID and `roceP...` with the RoCE GID. Only the
+    /// usable one is inventoried, so the key is not ambiguous and the
+    /// replacement keeps the lost device's rail.
+    fn vf_replug_with_null_gid_twin_keeps_rail() {
+        use std::os::unix::fs::symlink;
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = Scratch(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("target")
+                .join(format!("vf-replug-{}", std::process::id())),
+        );
+        let root = dir.0.join("infiniband");
+        let pci = dir.0.join("7870:00:00.0");
+        std::fs::create_dir_all(&pci).unwrap();
+        for name in ["mana_0", "rdmaP30832p0s0", "roceP30832p0s0"] {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+            symlink(&pci, root.join(name).join("device")).unwrap();
+        }
+        let port = |device: &str, gid: [u8; 16]| PortInfo {
+            device: device.into(),
+            port: 1,
+            gid,
+            numa_node: None,
+        };
+        let inventory = Inventory::default();
+        let before = inventory
+            .update_keyed(inventory_keyed_at(vec![port("mana_0", [1; 16])], &root))
+            .unwrap();
+        assert_eq!(rails(&before), vec![("mana_0".into(), 0)]);
+        let after = inventory
+            .update_keyed(inventory_keyed_at(
+                vec![
+                    port("rdmaP30832p0s0", [0; 16]),
+                    port("roceP30832p0s0", [1; 16]),
+                ],
+                &root,
+            ))
+            .unwrap();
+        assert_eq!(rails(&after), vec![("roceP30832p0s0".into(), 0)]);
+        assert_eq!(
+            inventory.device_key("roceP30832p0s0", 1).as_deref(),
+            Some("pci:7870:00:00.0")
+        );
+    }
+
+    #[test]
     /// Two names at one PCI address and port are ambiguous and withdraw.
     fn duplicate_hardware_keys_withdraw() {
         let inventory = Inventory::default();
