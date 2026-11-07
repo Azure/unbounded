@@ -1937,8 +1937,10 @@ impl MemoryCache {
         }
         removed
     }
-    /// Release entries not inserted or hit for at least `racer_core::cache::IDLE_TTL`,
-    /// skipping any still referenced elsewhere (retried on the next pass).
+    /// Release entries not inserted or hit for at least `racer_core::cache::IDLE_TTL`.
+    /// Workers call this only under memory pressure; otherwise entries stay
+    /// until reclaim needs their space. Skips any still referenced elsewhere
+    /// (retried on the next pass).
     /// Examines at most `racer_core::cache::EXPIRY_BATCH` entries per class per call and
     /// returns the number of entries released. Freed buffers return to the
     /// pools, whose own maintenance decays them.
@@ -3381,6 +3383,38 @@ pub(crate) mod tests {
                     at += racer_core::cache::EXPIRY_CHECKPOINT;
                 }
                 released
+            }
+
+            /// Without pressure, workers skip `expire_idle`: entries outlive the
+            /// former idle TTL under the remaining maintenance and leave only
+            /// when reclaim needs their space, least recently used first.
+            #[test]
+            fn idle_entries_persist_without_expiry_until_reclaimed() {
+                let env = racer_io::Env::host();
+                let admission = admission(8);
+                let cache = MemoryCache::new(
+                    BufferPool::new(admission.clone()),
+                    crate::test_support::availability(&env),
+                );
+                let start = std::time::Instant::now();
+                let old = publish(&cache, &admission, "old");
+                let recent = publish(&cache, &admission, "recent");
+                let mut at = std::time::Duration::ZERO;
+                while at <= racer_core::cache::IDLE_TTL * 4 {
+                    cache.sweep_unavailable(racer_core::cache::EXPIRY_BATCH);
+                    cache.buffers().maintain_idle_buffers(start + at);
+                    at += racer_core::cache::EXPIRY_CHECKPOINT;
+                }
+                assert!(cache.entries.borrow().pages.contains_key(&old));
+                assert!(cache.entries.borrow().pages.contains_key(&recent));
+                assert!(cache.ciphertext(&recent).unwrap().is_some());
+                // Reclaim takes the least recently used idle entry first.
+                assert_eq!(
+                    cache.reclaim_idle(ResourceClass::Ciphertext, None, 1, |_, _| 0),
+                    page_alloc::buf::GRANULE
+                );
+                assert!(!cache.entries.borrow().pages.contains_key(&old));
+                assert!(cache.entries.borrow().pages.contains_key(&recent));
             }
 
             #[test]

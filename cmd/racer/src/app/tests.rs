@@ -5318,7 +5318,7 @@ fn maintain_pools_releases_idle_aligned_storage() {
 }
 
 #[test]
-fn maintain_pools_expires_idle_cache_entries_then_their_aligned_storage() {
+fn maintain_pools_keeps_idle_cache_entries_until_pressure_then_frees_aligned_storage() {
     use crate::admission::ResourceClass;
     use racer_wire::control as wire;
     let env = racer_io::Env::host();
@@ -5370,9 +5370,25 @@ fn maintain_pools_expires_idle_cache_entries_then_their_aligned_storage() {
     worker.memory.publish(page).unwrap();
     assert_eq!(worker.buffer_pool_stats().bytes, 0);
 
-    let start = std::time::Instant::now();
     let second = Duration::from_secs(1);
-    let mut now = start;
+    let mut now = std::time::Instant::now();
+    // At normal pressure idle entries outlive the idle TTL.
+    let idle = now;
+    while now < idle + racer_core::cache::IDLE_TTL * 3 {
+        worker.maintain_pools(now);
+        assert_eq!(worker.buffer_pool_stats().bytes, 0);
+        now += second;
+    }
+    assert!(worker.memory.ciphertext(&page_id).unwrap().is_some());
+    // Under pressure, entries idle for the TTL are released.
+    assert!(
+        worker
+            .pressure
+            .responder
+            .on_level(crate::pressure::PressureLevel::Elevated)
+            .is_some()
+    );
+    let start = now;
     while now < start + racer_core::cache::IDLE_TTL {
         worker.maintain_pools(now);
         now += second;

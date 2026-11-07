@@ -2248,9 +2248,13 @@ impl WorkerApplication {
     /// Each pool is O(1) until its observation window elapses.
     fn maintain_pools(&self, now: std::time::Instant) {
         self.store.writer.maintain_staging(now);
-        // Expire idle cache entries first so their buffers reach the pools
-        // before those decay.
-        self.memory.expire_idle(now);
+        // Under memory pressure, expire idle cache entries first so their
+        // buffers reach the pools before those decay. At Normal, entries stay
+        // until reservation, headroom, or pressure reclaim needs their space.
+        let level = self.pressure.responder.level();
+        if crate::pressure::pressure_actions(level).expire_idle_cache {
+            self.memory.expire_idle(now);
+        }
         // Drop pages whose key left the keyring, a bounded batch per turn.
         self.memory
             .sweep_unavailable(racer_core::cache::EXPIRY_BATCH);

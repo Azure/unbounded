@@ -391,8 +391,8 @@ impl<K: Ord + Eq + Hash + Clone, V, H: BuildHasher, G: Grouping<K>> OrderedLru<K
     }
 }
 
-/// Entries nobody inserted or hit for this long are released by the dataplane memory cache, so a
-/// worker that served a burst does not keep its cached pages (and their pooled buffers) forever.
+/// Under memory pressure, entries nobody inserted or hit for this long are released by the
+/// dataplane memory cache. At normal pressure, entries leave only when their space is reclaimed.
 pub const IDLE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 /// Minimum spacing of the clock checkpoints that map wall time to LRU ticks.
 pub const EXPIRY_CHECKPOINT: std::time::Duration = std::time::Duration::from_secs(1);
