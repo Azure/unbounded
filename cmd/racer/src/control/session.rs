@@ -27,13 +27,17 @@ const RENEWAL_MIN_WAIT: Duration = Duration::from_secs(1);
 /// Longest serving renewal sleep, bounding wall-clock steps.
 const RENEWAL_MAX_WAIT: Duration = Duration::from_secs(30);
 
-/// Consecutive seat 401/403 startup rejections retried before `Unauthorized`
-/// is reported as fatal.
+/// Consecutive seat 401/403 startup rejections, or issued chains that do not
+/// verify against the current key feed roots, retried before `Unauthorized` is
+/// reported as fatal.
 ///
 /// During an all-at-once rollout, control seats restart together with nodes. A
 /// seat that is up but has not yet loaded current credentials can answer a
 /// valid bootstrap token or identity with 401/403. Each retry demotes the seats
 /// involved and backs off with the issuance policy (about 1s, 2s, 4s, 8s, 16s).
+/// Likewise a newly ready seat issues under its own issuer root while the key
+/// feed seat may still serve a keyring without it; that retry also refetches the
+/// keyring.
 /// Nothing rejected is accepted. Local and TLS-level authentication failures are
 /// not retried, and a persistent seat rejection still ends startup once this
 /// bound is spent.
@@ -654,14 +658,14 @@ impl Session {
                 return Err(Error::Unavailable);
             }
             self.auth.seat_rejected.set(false);
-            let mut result = self.start_inner(scope).await;
-            if result.as_ref().is_err_and(|e| *e == Error::Unauthorized)
-                && self.auth.seat_rejected.get()
-            {
-                result = Err(self.startup_rejected(scope));
-            } else if result.is_ok() {
-                self.startup_rejections.set(0);
-            }
+            self.auth.enrollment.take_untrusted_chain();
+            let result = match self.start_inner(scope).await {
+                Ok(identity) => {
+                    self.startup_rejections.set(0);
+                    Ok(identity)
+                }
+                Err(error) => Err(self.startup_failure(error, scope)),
+            };
             if result.as_ref().is_err_and(|e| transient(*e)) {
                 self.renewal_next.set(Some(
                     self.issuance_backoff(&self.enrollment_transport.io()?.reactor.ctx().clone())?,
@@ -669,6 +673,26 @@ impl Session {
             }
             result
         })
+    }
+
+    /// Classify a failed startup attempt.
+    ///
+    /// `Unauthorized` is retried within the bound of [`Self::startup_rejected`]
+    /// only when a seat answered 401/403 or when the issued chain did not verify
+    /// against the current key feed roots. A newly ready seat commits its issuer
+    /// root before it issues, but the key feed that supplied our roots may be a
+    /// seat still serving an older record, so the untrusted case also drops the
+    /// staged startup trust: the retry fetches a newer keyring before enrolling
+    /// again. Every other error is returned unchanged.
+    fn startup_failure(&self, error: Error, scope: &RequestScope) -> Error {
+        let untrusted = self.auth.enrollment.take_untrusted_chain();
+        if error != Error::Unauthorized || !(self.auth.seat_rejected.get() || untrusted) {
+            return error;
+        }
+        if untrusted {
+            self.auth.startup_bundle.borrow_mut().take();
+        }
+        self.startup_rejected(scope)
     }
 
     /// Bound startup retries after a seat answered 401/403.
@@ -1311,6 +1335,61 @@ pub(super) mod tests {
         clock.advance(Duration::from_millis(5));
         assert_eq!(session.startup_rejected(&ended), Error::Unauthorized);
         assert_eq!(session.startup_rejected(&scope(&env)), Error::Unavailable);
+    }
+
+    /// An issued chain that does not verify against the key feed roots (a seat
+    /// that became ready under a root the feed seat has not yet served) is
+    /// retried within the startup bound, after dropping the staged startup
+    /// trust so the next attempt refetches the keyring. Unrelated
+    /// `Unauthorized` failures stay fatal, other errors pass through, and a
+    /// persistent mismatch is fatal once the bound is spent.
+    #[test]
+    fn startup_untrusted_chain_refetches_trust_and_is_bounded() {
+        let clock = racer_io::SimClock::new(744);
+        let env = racer_io::Env::new(racer_io::Env::host().driver.clone(), clock.ctx(0));
+        let session = session(&env);
+        let demotes = startup_feed(&env, &session, vec![]);
+        let (ca, _) = crate::test_support::enrollment::ca();
+        let stage = || {
+            *session.auth.startup_bundle.borrow_mut() = Some(startup_bundle(1, ca.der()));
+        };
+        let staged = || session.auth.startup_bundle.borrow().is_some();
+
+        // Neither a seat rejection nor an untrusted chain: local failure, fatal.
+        stage();
+        assert_eq!(
+            session.startup_failure(Error::Unauthorized, &scope(&env)),
+            Error::Unauthorized
+        );
+        assert!(staged());
+        assert_eq!(session.startup_rejections.get(), 0);
+
+        // A non-authentication error clears the flag and passes through.
+        session.auth.enrollment.mark_untrusted_chain();
+        assert_eq!(session.startup_failure(Error::Io, &scope(&env)), Error::Io);
+        assert!(!session.auth.enrollment.take_untrusted_chain());
+        assert!(staged());
+
+        for attempt in 1..=STARTUP_UNAUTHORIZED_RETRIES {
+            stage();
+            session.auth.enrollment.mark_untrusted_chain();
+            assert_eq!(
+                session.startup_failure(Error::Unauthorized, &scope(&env)),
+                Error::Unavailable
+            );
+            assert!(!staged(), "retry must refetch the keyring");
+            assert!(!session.auth.enrollment.take_untrusted_chain());
+            assert_eq!(session.startup_rejections.get(), attempt);
+            assert_eq!(demotes.get(), attempt);
+            assert_eq!(session.renewal_error(), Some(Error::Unauthorized));
+            assert!(session.identity().is_none());
+        }
+        session.auth.enrollment.mark_untrusted_chain();
+        assert_eq!(
+            session.startup_failure(Error::Unauthorized, &scope(&env)),
+            Error::Unauthorized
+        );
+        assert!(!session.auth.started.get());
     }
 
     /// Receipts never regress by sequence and remain independent of acceptance.

@@ -2240,6 +2240,57 @@ pub(crate) mod tests {
             assert!(testing::drive(&r, enrollment.accept_response(response, &scope)).is_ok());
         }
 
+        /// A chain from an issuer root missing from the current trust roots is
+        /// rejected and flagged as untrusted, the pending request survives, and
+        /// the same response verifies once refreshed roots include that issuer.
+        /// Other certificate policy failures are not flagged.
+        #[test]
+        fn enrollment_from_unknown_issuer_is_flagged_and_retryable_with_new_roots() {
+            let env = racer_io::Env::host();
+            let Some(r) = testing::reactor(&env) else {
+                return;
+            };
+            let d = testing::Directory::new();
+            let scope = testing::scope();
+            let enrollment = Enrollment::new(
+                racer_wire::control::ClusterId("11111111-1111-4111-8111-111111111111".into()),
+                d.0.join("token"),
+                d.0.join("identity"),
+                Rc::new(ReactorControlIo::new(r.clone())),
+            );
+            let request = testing::drive(
+                &r,
+                enrollment.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope),
+            )
+            .unwrap();
+            let (old, _) = testing::ca();
+            let (new, new_key) = testing::ca();
+            enrollment
+                .set_peer_trust_roots(vec![old.der().to_vec()])
+                .unwrap();
+            let response = testing::issue(&request, &new, &new_key, OLD_NODE);
+            assert!(matches!(
+                testing::drive(&r, enrollment.accept_response(response.clone(), &scope)),
+                Err(Error::Unauthorized)
+            ));
+            assert!(enrollment.take_untrusted_chain());
+            assert!(!enrollment.take_untrusted_chain());
+            // A trusted issuer with a mismatched cluster is not a trust lag.
+            let mut foreign = response.clone();
+            foreign.cluster =
+                racer_wire::control::ClusterId("44444444-4444-4444-8444-444444444444".into());
+            enrollment
+                .set_peer_trust_roots(vec![old.der().to_vec(), new.der().to_vec()])
+                .unwrap();
+            assert!(matches!(
+                testing::drive(&r, enrollment.accept_response(foreign, &scope)),
+                Err(Error::Unauthorized)
+            ));
+            assert!(!enrollment.take_untrusted_chain());
+            assert!(testing::drive(&r, enrollment.accept_response(response, &scope)).is_ok());
+            assert!(!enrollment.take_untrusted_chain());
+        }
+
         #[test]
         fn enrollment_and_renewal_refresh_authenticated_physical_inventory() {
             use rdma_verbs::simulation::Device;

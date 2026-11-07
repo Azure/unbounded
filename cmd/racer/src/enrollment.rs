@@ -22,7 +22,7 @@ use racer_wire::control::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     num::NonZeroU32,
     path::PathBuf,
     sync::Arc,
@@ -71,6 +71,12 @@ pub struct Enrollment<H: Host> {
     identity_directory: PathBuf,
 
     roots: RefCell<Vec<Vec<u8>>>,
+
+    /// Set when the last issued chain did not verify against `roots`. Each
+    /// seat signs with its own issuer root, and a key feed served by another
+    /// seat can lag the record that committed it, so startup may retry this
+    /// with fresh trust. Nothing that failed verification is ever accepted.
+    untrusted_chain: Cell<bool>,
 
     host: H,
 
@@ -186,6 +192,7 @@ impl<H: Host> Enrollment<H> {
             token_path,
             identity_directory,
             roots: RefCell::new(Vec::new()),
+            untrusted_chain: Cell::new(false),
             host,
             attempts: Attempts::default(),
         }
@@ -204,6 +211,18 @@ impl<H: Host> Enrollment<H> {
     /// Return the configured cluster binding.
     pub fn cluster(&self) -> &ClusterId {
         &self.cluster
+    }
+
+    /// Whether the last issued chain failed verification against the current
+    /// trust roots, clearing the flag.
+    pub fn take_untrusted_chain(&self) -> bool {
+        self.untrusted_chain.replace(false)
+    }
+
+    /// Record an untrusted issued chain without running verification.
+    #[cfg(test)]
+    pub(crate) fn mark_untrusted_chain(&self) {
+        self.untrusted_chain.set(true);
     }
 
     /// Validate all roots before atomically replacing the enrollment trust snapshot.
@@ -317,7 +336,10 @@ impl<H: Host> Enrollment<H> {
             &self.cluster,
             &r.node,
         )
-        .map_err(|_| Error::Unauthorized)?;
+        .map_err(|_| {
+            self.untrusted_chain.set(true);
+            Error::Unauthorized
+        })?;
         let (_, cert) = x509_parser::parse_x509_certificate(&r.certificate_chain[0])
             .map_err(|_| Error::Unauthorized)?;
         let san = cert
