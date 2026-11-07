@@ -195,7 +195,7 @@ pub(crate) struct Cm {
 
     fd: c_int,
 
-    listener: Option<NonNull<c_void>>,
+    listener: Cell<Option<NonNull<c_void>>>,
 
     /// The local IPv4 address.
     pub(crate) local: [u8; 4],
@@ -252,7 +252,7 @@ impl Cm {
         Ok(Some(Self {
             channel,
             fd,
-            listener: NonNull::new(listener),
+            listener: Cell::new(NonNull::new(listener)),
             local,
             port,
             tokens: RefCell::new(BTreeMap::new()),
@@ -274,13 +274,22 @@ impl Cm {
         self.fd
     }
 
-    /// Destroy the listener and the channel. False if either leaked.
-    pub(crate) fn close(&mut self, api: &Api) -> bool {
-        if let Some(listener) = self.listener {
+    /// Destroy the listener, freeing its address and port for another
+    /// device (the same VF back under a new name, say). False if it leaked.
+    pub(crate) fn stop_listening(&self, api: &Api) -> bool {
+        if let Some(listener) = self.listener.get() {
             if unsafe { (api.cm_destroy_id)(listener.as_ptr()) } != 0 {
                 return false;
             }
-            self.listener = None;
+            self.listener.set(None);
+        }
+        true
+    }
+
+    /// Destroy the listener and the channel. False if either leaked.
+    pub(crate) fn close(&mut self, api: &Api) -> bool {
+        if !self.stop_listening(api) {
+            return false;
         }
         self.leaked_ids.get() == 0 && unsafe { (api.cm_channel_free)(self.channel.as_ptr()) } == 0
     }

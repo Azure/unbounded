@@ -15,7 +15,7 @@ use std::{
     rc::Rc,
     sync::{
         Arc, Mutex, PoisonError, RwLock,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
     task::{Context, Poll, Waker},
     time::{Duration, Instant},
@@ -368,6 +368,10 @@ struct NodeShared {
     /// devices are freed.
     lost: Mutex<Vec<u16>>,
 
+    /// Rails a caller reported lost ([`Client::report_lost`]), not yet
+    /// applied.
+    reported_lost: Mutex<Vec<u16>>,
+
     /// The latest [`Client::retain`] request, not yet applied.
     retain: Mutex<Option<std::collections::BTreeSet<LinkKey>>>,
 
@@ -378,10 +382,63 @@ struct NodeShared {
     /// Grant requests parked in the owner ([`Client::grant_waiters`]).
     grant_waiters: AtomicUsize,
 
+    /// Why a closed round has not drained yet (see [`DrainBlocker`]), as
+    /// its code; 0 when nothing blocks it.
+    blocker: AtomicU8,
+
     /// False once the owner (or its port) is dropped.
     alive: AtomicBool,
 
     owner: AtomicWaker,
+}
+
+/// What keeps a closed round from draining.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DrainBlocker {
+    /// Links are still breaking or their QPs are still being destroyed.
+    Links,
+
+    /// Page pools are still registering off the owner thread.
+    Registering,
+
+    /// The NIC may still use a page buffer (bound, exposed, invalidating,
+    /// or quarantined), or a received page of a live device is still held.
+    Buffers,
+
+    /// A native object leaked against the round's charge: the round never
+    /// drains.
+    Leaked,
+}
+
+impl DrainBlocker {
+    /// Metric and log label.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Links => "links",
+            Self::Registering => "registering",
+            Self::Buffers => "buffers",
+            Self::Leaked => "leaked",
+        }
+    }
+
+    fn code(self) -> u8 {
+        match self {
+            Self::Links => 1,
+            Self::Registering => 2,
+            Self::Buffers => 3,
+            Self::Leaked => 4,
+        }
+    }
+
+    fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::Links),
+            2 => Some(Self::Registering),
+            3 => Some(Self::Buffers),
+            4 => Some(Self::Leaked),
+            _ => None,
+        }
+    }
 }
 
 /// Create the owner port and `workers` clients (at least one).
@@ -400,10 +457,12 @@ pub fn node(workers: usize) -> Result<(Vec<Client>, OwnerPort)> {
         break_counts: Default::default(),
         device_losses: AtomicU64::new(0),
         lost: Mutex::new(Vec::new()),
+        reported_lost: Mutex::new(Vec::new()),
         retain: Mutex::new(None),
         closed: AtomicBool::new(false),
         drained: AtomicBool::new(false),
         grant_waiters: AtomicUsize::new(0),
+        blocker: AtomicU8::new(0),
         alive: AtomicBool::new(true),
         owner: AtomicWaker::new(),
     });
@@ -806,6 +865,19 @@ impl Client {
             .clone()
     }
 
+    /// Report `rail`'s device gone, as the caller saw it (its sysfs entry
+    /// vanished, say): the owner treats it as if the device reported its
+    /// own removal (see [`Self::device_losses`]). Report before
+    /// [`Self::close`] so the round does not wait for pages no NIC can reach.
+    pub fn report_lost(&self, rail: u16) {
+        self.shared
+            .reported_lost
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(rail);
+        self.shared.owner.wake();
+    }
+
     /// Close the node: the owner sends `Close` on ready links, breaks every
     /// link, and frees everything once no page is held. Does not wait.
     pub fn close(&self) {
@@ -821,6 +893,16 @@ impl Client {
     /// True once closed and every native object is gone.
     pub fn drained(&self) -> bool {
         self.shared.drained.load(Ordering::Acquire)
+    }
+
+    /// Why the closed round has not drained yet, or `None` when it has (or
+    /// is not closed). Lets a caller waiting to reactivate say what it is
+    /// waiting for.
+    pub fn drain_blocker(&self) -> Option<DrainBlocker> {
+        if !self.closed() || self.drained() {
+            return None;
+        }
+        DrainBlocker::from_code(self.shared.blocker.load(Ordering::Acquire))
     }
 
     /// Start a new round after [`Self::close`]. `Overloaded` until drained;
@@ -948,6 +1030,11 @@ pub struct Owner {
 
     devices: BTreeMap<u16, DeviceState>,
 
+    /// Devices of earlier rounds whose pools still had pages out when the
+    /// round drained, kept until those pages return (see
+    /// [`Self::finish_shutdown`]). Each keeps its round's charge.
+    retired: Vec<DeviceState>,
+
     quota: Option<Arc<GuardOwner>>,
 
     settings: Option<Settings>,
@@ -1027,6 +1114,7 @@ impl Owner {
             links: BTreeMap::new(),
             dying: Vec::new(),
             devices: BTreeMap::new(),
+            retired: Vec::new(),
             quota: None,
             settings: None,
             activating: None,
@@ -1095,7 +1183,8 @@ impl Owner {
             || (self.closing && !self.leaked && !self.drained())
         {
             at(now + RETRY_SOON);
-        } else if !self.dying.is_empty() {
+        } else if !self.dying.is_empty() || !self.retired.is_empty() {
+            // Returned pages wake the owner; this only backs that up.
             at(now + REAPER_POLL);
         }
         for link in self.links.values() {
@@ -1185,6 +1274,7 @@ impl Owner {
         self.progress(now);
         self.reap();
         self.serve_waiters(now);
+        self.reap_retired();
 
         if self.closing {
             self.finish_shutdown();
@@ -2143,10 +2233,19 @@ impl Owner {
 
         // A removed device fails its links' QPs too: break them as lost
         // before polling turns that into an error break with a backoff.
+        let reported = std::mem::take(
+            &mut *self
+                .shared
+                .reported_lost
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
         let removed: Vec<u16> = self
             .devices
             .iter()
-            .filter(|(rail, device)| device.device.removed() && !self.lost.contains(rail))
+            .filter(|(rail, device)| {
+                (device.device.removed() || reported.contains(rail)) && !self.lost.contains(rail)
+            })
             .map(|(rail, _)| *rail)
             .collect();
 
@@ -2246,13 +2345,25 @@ impl Owner {
     }
 
     /// Free pools and devices once nothing uses them, then mark drained.
+    ///
+    /// A round that lost a device does not wait for received pages that
+    /// higher layers still hold, nor for buffers its gone device leaked: no
+    /// NIC can reach that memory any more. Those pools move to
+    /// [`Self::retired`] and are freed once idle, so the caller can
+    /// reactivate as soon as the device is back instead of waiting on
+    /// pages it may hold for as long as it likes.
     fn finish_shutdown(&mut self) {
-        if self.shared.drained.load(Ordering::Acquire)
-            || self.activating.is_some()
-            || !self.attaching.is_empty()
-            || !self.links.is_empty()
-            || !self.dying.is_empty()
-        {
+        if self.shared.drained.load(Ordering::Acquire) {
+            return;
+        }
+
+        if self.activating.is_some() || !self.attaching.is_empty() {
+            self.block(DrainBlocker::Registering);
+            return;
+        }
+
+        if !self.links.is_empty() || !self.dying.is_empty() {
+            self.block(DrainBlocker::Links);
             return;
         }
 
@@ -2276,11 +2387,31 @@ impl Owner {
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
 
-        if self.devices.values().any(|d| !d.pool.idle()) {
+        let lost_round = !self.lost.is_empty();
+
+        // A pool may stop the drain only while it is in use, and a lost
+        // round retires the pools no NIC can reach any more.
+        let blocked = |rail: &u16, d: &DeviceState| {
+            if d.pool.idle() {
+                return false;
+            }
+            let retire = lost_round
+                && retirable(&d.pool, self.lost.contains(rail))
+                && d.device.stop_listening();
+            !retire
+        };
+
+        if self.devices.iter().any(|(rail, d)| blocked(rail, d)) {
+            self.block(DrainBlocker::Buffers);
             return;
         }
 
-        self.devices.clear();
+        for (_, device) in std::mem::take(&mut self.devices) {
+            if !device.pool.idle() {
+                self.retired.push(device);
+            }
+        }
+
         self.backoff.clear();
         self.lost.clear();
         self.shared
@@ -2289,20 +2420,38 @@ impl Owner {
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
 
+        // Retired pools still hold the charge: they release it once idle.
+        let retired = !self.retired.is_empty();
+
         if self
             .quota
             .take()
-            .is_some_and(|q| q.quarantined() || Arc::strong_count(&q) != 1)
+            .is_some_and(|q| q.quarantined() || (!retired && Arc::strong_count(&q) != 1))
+            && !lost_round
         {
-            // A native object leaked against the charge: never drained.
+            // A native object leaked against the charge: never drained. A
+            // lost device's objects cannot be freed at all; its charge stays
+            // quarantined, but the device's return may start a new round.
             self.leaked = true;
         }
 
         if self.leaked {
+            self.block(DrainBlocker::Leaked);
             return;
         }
 
+        self.shared.blocker.store(0, Ordering::Release);
         self.shared.drained.store(true, Ordering::Release);
+    }
+
+    /// Record why the closed round has not drained yet.
+    fn block(&self, blocker: DrainBlocker) {
+        self.shared.blocker.store(blocker.code(), Ordering::Release);
+    }
+
+    /// Free retired pools whose pages have all returned.
+    fn reap_retired(&mut self) {
+        self.retired.retain(|device| !device.pool.idle());
     }
 
     /// Publish the link snapshot if anything changed or a backoff expired.
@@ -2391,6 +2540,13 @@ impl Drop for Owner {
         // Pools leak their regions if pages are still held (see `pool.rs`).
         self.devices.clear();
     }
+}
+
+/// Whether a lost round may stop waiting for `pool`: the NIC can no longer
+/// touch it, either because only received pages hold its buffers or
+/// because its device (`lost`) is gone.
+fn retirable(pool: &Pool, lost: bool) -> bool {
+    lost || pool.nic_quiet()
 }
 
 /// True when an owner with `pending` work has neither a timer (`wake`) nor

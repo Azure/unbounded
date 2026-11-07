@@ -885,6 +885,18 @@ impl Links {
         self.client.drained()
     }
 
+    /// Why the closed node has not drained yet (see
+    /// [`rdma_verbs::Client::drain_blocker`]).
+    pub fn drain_blocker(&self) -> Option<rdma_verbs::DrainBlocker> {
+        self.client.drain_blocker()
+    }
+
+    /// Report `rail`'s device gone (see
+    /// [`rdma_verbs::Client::report_lost`]). Call before [`Self::close`].
+    pub fn report_lost(&self, rail: RailId) {
+        self.client.report_lost(rail.0);
+    }
+
     /// Close the node: every link breaks and the owner drains. A later
     /// [`Self::activate`] reopens once drained.
     pub fn close(&self) {

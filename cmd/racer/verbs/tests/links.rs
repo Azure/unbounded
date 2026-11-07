@@ -1442,6 +1442,98 @@ fn device_attach_does_not_block_live_links() {
 }
 
 #[test]
+/// A received page that a higher layer still holds (a cache, say) does not
+/// keep a round that lost its device from draining: no NIC can reach the
+/// page, so the round drains, a new one activates while the page is out,
+/// and the old pool is freed once the page returns. The page stays readable
+/// throughout.
+fn device_removal_drains_with_received_page_held() {
+    let _profile = default_profile(Profile::Registration);
+    let mut w = world();
+    let (ea, eb) = link_up(&mut w);
+    let deadline = w.now() + 60 * SECOND;
+    let granted = w.a.clients[0].grant(TO_B, ea, [1; 16], 3, deadline);
+    let granted = wait(&mut w, &granted).unwrap();
+    let written = w.b.clients[0].write(TO_A, eb, granted.tag, bytes(vec![7, 8, 9]), deadline);
+    assert_eq!(wait(&mut w, &written), Ok(()));
+    let held = page(ready(&granted.arrival));
+    assert!(w.sim.remove_device("sim1") >= 2);
+    pump(&mut w);
+    assert_eq!(w.a.clients[0].device_losses(), 1);
+    w.a.clients[0].close();
+    pump(&mut w);
+    assert!(w.a.clients[0].drained(), "held page blocked the drain");
+    assert_eq!(w.a.clients[0].drain_blocker(), None);
+    w.a.clients[0].reopen().unwrap();
+    let activation = w.a.clients[1].activate(config(&w.a.charge));
+    assert!(wait(&mut w, &activation).is_ok());
+    assert_eq!(held.bytes(), [7, 8, 9]);
+    drop(held);
+    pump(&mut w);
+    link_up(&mut w);
+    shutdown(w);
+}
+
+#[test]
+/// A device loss the caller reports (from sysfs) counts like one the device
+/// reports itself: links on the rail break as lost, and a held page does not
+/// keep the round from draining.
+fn reported_loss_drains_with_received_page_held() {
+    profiles(|| {
+        let mut w = world();
+        let (ea, eb) = link_up(&mut w);
+        let deadline = w.now() + 5 * SECOND;
+        let granted = w.a.clients[0].grant(TO_B, ea, [1; 16], 4, deadline);
+        let granted = wait(&mut w, &granted).unwrap();
+        let written = w.b.clients[0].write(TO_A, eb, granted.tag, bytes(vec![2; 4]), deadline);
+        assert_eq!(wait(&mut w, &written), Ok(()));
+        let held = page(ready(&granted.arrival));
+        w.a.clients[0].report_lost(7);
+        w.a.clients[0].close();
+        pump(&mut w);
+        assert_eq!(w.a.clients[0].device_losses(), 1);
+        assert_eq!(w.a.clients[0].link_breaks(BreakReason::DeviceLost), 1);
+        assert!(w.a.clients[0].drained(), "held page blocked the drain");
+        w.a.clients[0].reopen().unwrap();
+        let activation = w.a.clients[1].activate(config(&w.a.charge));
+        assert!(wait(&mut w, &activation).is_ok());
+        assert_eq!(held.bytes(), [2; 4]);
+        drop(held);
+        pump(&mut w);
+        shutdown(w);
+    });
+}
+
+#[test]
+/// Without a lost device a held page still blocks the drain, and the
+/// client says why.
+fn held_page_blocks_drain_without_device_loss() {
+    profiles(|| {
+        let mut w = world();
+        let (ea, eb) = link_up(&mut w);
+        let deadline = w.now() + 5 * SECOND;
+        let granted = w.a.clients[0].grant(TO_B, ea, [1; 16], 4, deadline);
+        let granted = wait(&mut w, &granted).unwrap();
+        let written = w.b.clients[0].write(TO_A, eb, granted.tag, bytes(vec![2; 4]), deadline);
+        assert_eq!(wait(&mut w, &written), Ok(()));
+        let held = page(ready(&granted.arrival));
+        assert_eq!(w.a.clients[0].drain_blocker(), None, "not closed");
+        w.a.clients[0].close();
+        pump(&mut w);
+        assert!(!w.a.clients[0].drained());
+        assert_eq!(
+            w.a.clients[0].drain_blocker(),
+            Some(rdma_verbs::DrainBlocker::Buffers)
+        );
+        drop(held);
+        pump(&mut w);
+        assert!(w.a.clients[0].drained());
+        assert_eq!(w.a.clients[0].drain_blocker(), None);
+        shutdown(w);
+    });
+}
+
+#[test]
 /// A removed device (an Azure VF hot-unplug) breaks every link on its rail
 /// at once, fails their ops without waiting for deadlines, counts the loss,
 /// and refuses new links on the rail until the round is closed; a fresh
