@@ -1513,6 +1513,7 @@ mod tests {
                         requested: usize::MAX,
                         cache_used: Some(usize::MAX),
                         cache_limit: Some(usize::MAX),
+                        holders: None,
                     }),
                 );
             }
@@ -1992,7 +1993,8 @@ mod tests {
                 text.lines()
                     .filter(|line| line.contains("{worker="))
                     .count(),
-                5 * 64
+                // Quotas, staging pool, ciphertext holders, and receive waiters.
+                (5 + crate::admission::CIPHERTEXT_HOLDERS.len() + 1) * 64
             );
             // Streaming has no fixed body cap: several times the largest
             // catalog still scrapes completely over HTTP.

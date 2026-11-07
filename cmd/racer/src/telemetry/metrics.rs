@@ -1043,6 +1043,38 @@ impl Metrics {
                     )?;
                 }
             }
+            self.write_ciphertext_holders(out)?;
+        }
+        Ok(())
+    }
+
+    /// Per-worker ciphertext usage by holder, from each worker's latest
+    /// sample against its live aggregate charge, and peer receives waiting
+    /// for ciphertext budget now.
+    fn write_ciphertext_holders(&self, out: &mut impl std::fmt::Write) -> std::fmt::Result {
+        const BYTES: &str = "racer_ciphertext_holder_bytes";
+        const WAITING: &str = "racer_peer_receive_ciphertext_waiting";
+        let workers = || self.admission.iter().filter_map(|shard| shard.get());
+        writeln!(out, "# TYPE {BYTES} gauge")?;
+        for (worker, usage) in workers() {
+            let used = usage.used(crate::admission::ResourceClass::Ciphertext);
+            let bytes = usage.policy().holders().snapshot(used);
+            for (holder, value) in crate::admission::CIPHERTEXT_HOLDERS
+                .iter()
+                .zip(bytes.values())
+            {
+                writeln!(
+                    out,
+                    "{BYTES}{{worker=\"{}\",holder=\"{holder}\"}} {value}",
+                    worker.0
+                )?;
+            }
+        }
+        writeln!(out, "# TYPE {WAITING} gauge")?;
+        for (worker, usage) in workers() {
+            let used = usage.used(crate::admission::ResourceClass::Ciphertext);
+            let waiting = usage.policy().holders().snapshot(used).receive_waiting;
+            writeln!(out, "{WAITING}{{worker=\"{}\"}} {waiting}", worker.0)?;
         }
         Ok(())
     }
@@ -1608,9 +1640,55 @@ mod tests {
                 idle.lines()
                     .filter(|line| line.contains("{worker="))
                     .count(),
-                2 * 4
+                2 * (4 + crate::admission::CIPHERTEXT_HOLDERS.len() + 1)
             );
             assert!(!idle.contains("request="));
+        }
+
+        #[test]
+        fn worker_ciphertext_holders_attribute_sampled_and_unsampled_charges() {
+            let metrics = Metrics::default();
+            let admission = flow_control::Quotas::new(AdmissionPolicy::new(
+                crate::test_support::cluster::config(false).limits,
+            ));
+            metrics
+                .observe_admission(WorkerId(3), admission.shared())
+                .unwrap();
+            let scrape = || {
+                let mut output = String::new();
+                metrics.write_prometheus(&mut output).unwrap();
+                output
+            };
+            let line = |holder: &str, value: usize| {
+                format!(
+                    "racer_ciphertext_holder_bytes{{worker=\"3\",holder=\"{holder}\"}} {value}\n"
+                )
+            };
+            let idle = scrape();
+            assert_eq!(
+                idle.matches("# TYPE racer_ciphertext_holder_bytes gauge\n")
+                    .count(),
+                1
+            );
+            for holder in crate::admission::CIPHERTEXT_HOLDERS {
+                assert!(idle.contains(&line(holder, 0)), "{holder}: {idle}");
+            }
+            assert!(idle.contains("racer_peer_receive_ciphertext_waiting{worker=\"3\"} 0\n"));
+            let _charge = admission
+                .reserve(None, ResourceClass::Ciphertext, 1000)
+                .unwrap();
+            let holders = admission.policy().holders();
+            holders.store(crate::admission::HolderSample {
+                cache_idle: 300,
+                cache_pinned: 200,
+                ..Default::default()
+            });
+            let _waiting = holders.waiting();
+            let busy = scrape();
+            assert!(busy.contains(&line("cache_idle", 300)));
+            assert!(busy.contains(&line("cache_pinned", 200)));
+            assert!(busy.contains(&line("other", 500)));
+            assert!(busy.contains("racer_peer_receive_ciphertext_waiting{worker=\"3\"} 1\n"));
         }
 
         #[test]

@@ -1563,6 +1563,7 @@ impl Transfers {
         if !matches!(first, Err(Error::Overloaded)) {
             return first;
         }
+        let _waiting = self.wire.0.policy().holders().waiting();
         let reactor = self.io.reactor();
         let clock = || scope.clock().now();
         let now = clock();

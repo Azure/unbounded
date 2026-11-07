@@ -1871,6 +1871,33 @@ impl MemoryCache {
         }
         released
     }
+    /// Retained ciphertext bytes split into idle entries, entries pinned only
+    /// by a queued disk write (`writer_only`), and entries pinned by any other
+    /// owner. Walks every entry, so call it at a sampling interval.
+    pub(crate) fn ciphertext_held(
+        &self,
+        writer_only: impl Fn(&PageId, &CiphertextPage) -> bool,
+    ) -> (usize, usize, usize) {
+        let (mut idle, mut pinned, mut writer) = (0usize, 0usize, 0usize);
+        let mut count = |id: &PageId, page: &CiphertextPage| {
+            let bytes = page.inner.reservation().amount();
+            let slot = if page.exclusive() {
+                &mut idle
+            } else if writer_only(id, page) {
+                &mut writer
+            } else {
+                &mut pinned
+            };
+            *slot = slot.saturating_add(bytes);
+        };
+        for (id, (_, entry)) in &self.entries.borrow().pages {
+            count(id, &entry.ciphertext);
+        }
+        for (id, entry) in self.ciphertext_entries.borrow().iter() {
+            count(id, &entry.copy.ciphertext);
+        }
+        (idle, pinned, writer)
+    }
     #[cfg(any(test, feature = "subscription-interop"))]
     pub(crate) fn remove_cache(&self, cache: &CacheId) -> Result<()> {
         self.remove_caches(&std::collections::HashSet::from([cache.clone()]))
@@ -3511,6 +3538,55 @@ pub(crate) mod tests {
                 drop((observer, cipher_observer));
                 drop(reader);
                 assert_eq!(page(&pinned).pins(), 2);
+            }
+
+            #[test]
+            fn ciphertext_held_splits_idle_pinned_and_writer_entries() {
+                let env = racer_io::Env::host();
+                let admission = admission(8);
+                let cache = MemoryCache::new(
+                    BufferPool::new(admission.clone()),
+                    crate::test_support::availability(&env),
+                );
+                let none = |_: &PageId, _: &CiphertextPage| false;
+                assert_eq!(cache.ciphertext_held(none), (0, 0, 0));
+                let idle = publish(&cache, &admission, "idle");
+                let read = publish(&cache, &admission, "read");
+                let queued = publish(&cache, &admission, "queued");
+                let cipher = publish_ciphertext(&cache, &admission, "cipher");
+                let page = |id: &PageId| cache.entries.borrow().pages[id].1.ciphertext.clone();
+                let bytes = |page: &CiphertextPage| page.inner.reservation().amount();
+                let cipher_bytes =
+                    bytes(&cache.ciphertext_entries.borrow()[&cipher].copy.ciphertext);
+                let (idle_bytes, read_bytes, queued_bytes) = (
+                    bytes(&page(&idle)),
+                    bytes(&page(&read)),
+                    bytes(&page(&queued)),
+                );
+                // Every entry is idle until another owner pins it.
+                assert_eq!(
+                    cache.ciphertext_held(none),
+                    (idle_bytes + read_bytes + queued_bytes + cipher_bytes, 0, 0)
+                );
+                let reader = page(&read);
+                let writer = page(&queued);
+                let cipher_reader = cache.ciphertext_entries.borrow()[&cipher]
+                    .copy
+                    .ciphertext
+                    .clone();
+                let only_writer = |id: &PageId, _: &CiphertextPage| id == &queued;
+                assert_eq!(
+                    cache.ciphertext_held(only_writer),
+                    (idle_bytes, read_bytes + cipher_bytes, queued_bytes)
+                );
+                // Unpinned observers never make an entry look held.
+                let observer = page(&idle).unpinned();
+                drop((reader, writer, cipher_reader));
+                assert_eq!(
+                    cache.ciphertext_held(only_writer),
+                    (idle_bytes + read_bytes + queued_bytes + cipher_bytes, 0, 0)
+                );
+                drop(observer);
             }
 
             #[test]

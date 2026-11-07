@@ -1237,6 +1237,38 @@ impl StoreWriter {
         self.note_discard(crate::telemetry::Event::DirtyDiscardCanceled, removed);
         removed
     }
+    /// Whether the only pins on `ciphertext` besides the caller's are this
+    /// writer's queued or submitted copy of `id`.
+    pub(crate) fn pins_only_writer(
+        &self,
+        id: &PageId,
+        ciphertext: &crate::memory::CiphertextPage,
+    ) -> bool {
+        ciphertext.pins() == 2
+            && self.pending.borrow().get(id).is_some_and(|dirty| {
+                std::sync::Arc::ptr_eq(&dirty.page.ciphertext.inner, &ciphertext.inner)
+            })
+    }
+    /// Ciphertext the writer holds for queued and submitted writes: staging
+    /// charges, and page charges no other owner pins. Walks every pending
+    /// write, so call it at a sampling interval, not per page.
+    pub(crate) fn ciphertext_held(&self) -> (usize, usize) {
+        let pending = self.pending.borrow();
+        pending
+            .values()
+            .fold((0usize, 0usize), |(staging, exclusive), dirty| {
+                let page = &dirty.page.ciphertext;
+                let owned = if page.exclusive() {
+                    page.inner.reservation().amount()
+                } else {
+                    0
+                };
+                (
+                    staging.saturating_add(dirty.staging_bytes()),
+                    exclusive.saturating_add(owned),
+                )
+            })
+    }
     /// Unpin exactly one otherwise-idle memory bundle. The two ciphertext owners
     /// must be that bundle and this queued write, not a submitted operation/reader.
     pub(crate) fn discard_idle_copy(

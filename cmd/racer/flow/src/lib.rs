@@ -261,6 +261,11 @@ impl<P: Policy + Clone> Clone for SharedQuotas<P> {
 }
 
 impl<P: Policy> SharedQuotas<P> {
+    /// Borrow the application policy this handle admits under.
+    pub fn policy(&self) -> &P {
+        &self.policy
+    }
+
     /// Register the single shared admission waiter before checking capacity.
     pub fn register(&self, waker: &std::task::Waker) {
         self.totals.wake.register(waker);

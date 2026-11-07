@@ -220,6 +220,8 @@ pub enum Detail {
         requested: usize,
         cache_used: Option<usize>,
         cache_limit: Option<usize>,
+        /// Ciphertext holder breakdown of the rejecting worker.
+        holders: Option<crate::admission::HolderBytes>,
     },
     CacheEntries {
         used: usize,
@@ -1437,6 +1439,7 @@ mod protected_failure_tests {
             requested: usize::MAX,
             cache_used: Some(usize::MAX),
             cache_limit: Some(usize::MAX),
+            holders: None,
         };
         observer.final_fill_admission(
             &scope,

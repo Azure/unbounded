@@ -989,6 +989,9 @@ pub struct WorkerApplication {
 
     next_health: std::time::Instant,
 
+    /// Next ciphertext holder sample (`racer_ciphertext_holder_bytes`).
+    next_holder_sample: std::time::Instant,
+
     pressure: WorkerPressure,
 
     drivers: Rc<crate::drivers::DriverQueue>,
@@ -1326,6 +1329,31 @@ mod ownership_maintenance_tests {
             Duration::ZERO
         );
     }
+}
+
+/// Spacing of ciphertext holder samples; each walks the memory cache and
+/// the writer's pending pages once.
+const HOLDER_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Record one ciphertext holder sample for the worker `admission` admits for.
+fn sample_ciphertext_holders(
+    admission: &flow_control::Quotas<AdmissionPolicy>,
+    memory: &MemoryCache,
+    writer: &StoreWriter,
+) {
+    let (cache_idle, cache_pinned, cache_writer) =
+        memory.ciphertext_held(|page, ciphertext| writer.pins_only_writer(page, ciphertext));
+    let (writer_staging, writer_exclusive) = writer.ciphertext_held();
+    admission
+        .policy()
+        .holders()
+        .store(crate::admission::HolderSample {
+            cache_idle,
+            cache_pinned,
+            cache_writer,
+            writer_staging,
+            writer_exclusive,
+        });
 }
 
 impl WorkerApplication {
@@ -1797,6 +1825,7 @@ impl WorkerApplication {
             cache_preparing_generation: 0,
             control_scope: None,
             next_health: started,
+            next_holder_sample: started,
             pressure: WorkerPressure::new(
                 config.memory_pressure,
                 &node_pressure,
@@ -2237,6 +2266,7 @@ impl WorkerApplication {
         let now = self.ctx().now();
         if now >= self.next_health {
             self.observe_memory(now);
+            self.sample_ciphertext_holders(now);
             self.reclaim_cache_under_pressure();
             stage_result(worker, "health", self.observe_health())?;
             self.next_health = now + Duration::from_millis(100);
@@ -2340,6 +2370,17 @@ impl WorkerApplication {
             }
         }
         self.memory.buffers().reclaim_idle_buffers();
+    }
+
+    /// Attribute this worker's ciphertext charges to the memory cache and
+    /// disk writer at most once per [`HOLDER_SAMPLE_INTERVAL`]. Admission
+    /// rejections and `/metrics` read the latest sample.
+    fn sample_ciphertext_holders(&mut self, now: std::time::Instant) {
+        if now < self.next_holder_sample {
+            return;
+        }
+        self.next_holder_sample = now + HOLDER_SAMPLE_INTERVAL;
+        sample_ciphertext_holders(&self.runtime.admission, &self.memory, &self.store.writer);
     }
 
     /// Publish this worker's staging pool and, on the sampling worker, the

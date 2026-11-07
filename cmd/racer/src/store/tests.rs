@@ -6387,3 +6387,34 @@ fn write_failure_causes_map_to_distinct_discard_reasons() {
         Event::DirtyDiscardWriteFailed
     ));
 }
+
+#[test]
+fn ciphertext_held_reports_staging_exclusive_and_writer_only_pins() {
+    let env = racer_io::Env::host();
+    let f = Fixture::new(&env);
+    let _ = futures::executor::block_on(f.store.open()).unwrap();
+    assert_eq!(f.store.writer.ciphertext_held(), (0, 0));
+    let copy = f.copy(1, 3);
+    let id = copy.ciphertext.envelope().page.clone();
+    let exclusive = copy.ciphertext.inner.reservation().amount();
+    f.enqueue(copy).unwrap();
+    // The queued copy is the only pin, so the writer owns its whole charge.
+    let (staging, owned) = f.store.writer.ciphertext_held();
+    assert_eq!(owned, exclusive);
+    assert_eq!(
+        staging,
+        f.store.writer.pending.borrow()[&id].staging_bytes()
+    );
+    // A page shared with another owner is not counted as the writer's own,
+    // and the writer is its only other pin.
+    let metadata = f.copy(2, 3).metadata.immutable();
+    let shared = crate::memory::tests::bundle_for(&f.admission, metadata);
+    f.enqueue(shared.copy()).unwrap();
+    let page = shared.plaintext.page().clone();
+    assert_eq!(f.store.writer.ciphertext_held().1, exclusive);
+    assert!(f.store.writer.pins_only_writer(&page, &shared.ciphertext));
+    let reader = shared.ciphertext.clone();
+    assert!(!f.store.writer.pins_only_writer(&page, &shared.ciphertext));
+    drop(reader);
+    assert!(!f.store.writer.pins_only_writer(&id, &shared.ciphertext));
+}
