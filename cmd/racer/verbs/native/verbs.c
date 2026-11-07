@@ -196,7 +196,6 @@ int rdma_verbs_discover(struct rdma_verbs_port *out, uint32_t capacity) {
     int count = 0, n = 0;
     struct ibv_device **list = ibv_get_device_list(&n);
     if (!list) return -errno;
-    fprintf(stderr, "racer: stage=rdma-discover devices=%d\n", n);
     for (int i = 0; i < n; ++i) {
         struct ibv_context *ctx = ibv_open_device(list[i]);
         if (!ctx) {
@@ -206,15 +205,10 @@ int rdma_verbs_discover(struct rdma_verbs_port *out, uint32_t capacity) {
         }
         struct ibv_device_attr attr;
         uint32_t flags = 0;
-        errno = 0;
-        int queried = ibv_query_device(ctx, &attr);
-        if (!queried) {
+        if (!ibv_query_device(ctx, &attr)) {
             if (attr.device_cap_flags & IBV_DEVICE_MEM_WINDOW_TYPE_2B) flags |= RDMA_VERBS_PORT_MW;
             else if (supports_rc(ctx)) flags |= RDMA_VERBS_PORT_RC;
         }
-        if (!flags)
-            fprintf(stderr, "racer: stage=rdma-discover device=%s skipped=no_capability query=%d errno=%d\n",
-                    ibv_get_device_name(list[i]), queried, errno);
         if (!flags) {
             if (ibv_close_device(ctx)) {
                 count = RDMA_VERBS_CLEANUP_LEAK;
@@ -226,11 +220,7 @@ int rdma_verbs_discover(struct rdma_verbs_port *out, uint32_t capacity) {
             struct ibv_port_attr port;
             union ibv_gid gid, ipv4;
             memset(&ipv4, 0, sizeof(ipv4));
-            if (ibv_query_port(ctx, p, &port) || port.state != IBV_PORT_ACTIVE) {
-                fprintf(stderr, "racer: stage=rdma-discover device=%s port=%u skipped=inactive errno=%d\n",
-                        ibv_get_device_name(list[i]), p, errno);
-                continue;
-            }
+            if (ibv_query_port(ctx, p, &port) || port.state != IBV_PORT_ACTIVE) continue;
             if (ibv_query_gid(ctx, p, 0, &gid)) {
                 fprintf(stderr, "racer: stage=rdma-discover device=%s port=%u skipped=gid errno=%d\n",
                         ibv_get_device_name(list[i]), p, errno);

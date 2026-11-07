@@ -1061,6 +1061,16 @@ pub struct WorkerApplication {
     /// The native task attaches GPU landings, not activates.
     attaching_landings: bool,
 
+    /// Since when, and as which names per lost device, sysfs has shown the
+    /// lost devices back unchanged (see `RAIL_SETTLE`).
+    rdma_settle: Option<(std::time::Instant, Vec<Vec<String>>)>,
+
+    /// Reactivation attempts that found the lost devices back but unusable.
+    rdma_attempts: u32,
+
+    /// `RAIL_SETTLE`, shortened by tests.
+    rail_settle: std::time::Duration,
+
     /// Next sysfs presence probe of the active rails.
     rail_probe: std::time::Instant,
 
@@ -1726,6 +1736,9 @@ impl WorkerApplication {
             rdma_lost: None,
             rdma_waiting: None,
             attaching_landings: false,
+            rdma_settle: None,
+            rdma_attempts: 0,
+            rail_settle: native::RAIL_SETTLE,
             rail_probe: started,
             rdma_sysfs: crate::rdma::SYSFS_INFINIBAND.into(),
             telemetry: Rc::new(telemetry),

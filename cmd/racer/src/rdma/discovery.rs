@@ -357,6 +357,26 @@ pub fn rail_presence(root: &Path, device: &str, key: &str) -> RailPresence {
     }
 }
 
+/// Names sysfs under `root` lists for hardware `key` (see
+/// [`Inventory::rail_key`]), sorted: every device at a PCI key's address
+/// (a VF can carry several, such as a null-GID twin), or the device itself
+/// for a name key when it exists.
+pub fn rail_devices(root: &Path, key: &str) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(root)
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+                .filter(|name| match key.strip_prefix(PCI_KEY_PREFIX) {
+                    Some(bdf) => sysfs_pci(root, name).as_deref() == Some(bdf),
+                    None => name == key && valid_device(name),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
 /// [`inventory`] with each port's PCI address, when sysfs reports one.
 fn keyed_inventory() -> Vec<(RailMapping, Option<String>)> {
     inventory_keyed_at(
