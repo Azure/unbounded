@@ -67,6 +67,10 @@ pub struct Granted {
 
     /// Resolves once the peer wrote or released, after the fence.
     pub arrival: Op<Arrival>,
+
+    /// The request parked for a free grant slot or page buffer before this
+    /// grant (see [`crate::Client::grant_parked`]).
+    pub waited: bool,
 }
 
 /// How a grant ended.
@@ -313,6 +317,9 @@ struct GrantEntry {
     deadline: Instant,
 
     granted: Option<Completer<Granted>>,
+
+    /// The request parked before this grant ([`Granted::waited`]).
+    waited: bool,
 
     arrival: Option<Completer<Arrival>>,
 }
@@ -700,12 +707,22 @@ impl Link {
         self.last_used = now;
     }
 
+    /// True while every grant slot of the link is held.
+    pub(crate) fn grants_full(&self) -> bool {
+        self.grants.len() >= self.grant_cap as usize
+    }
+
     /// Bind a window over a free buffer and queue a `Grant`. `done` gets the
-    /// tag and arrival op once the `Grant` is posted. With `device`, the
-    /// buffer comes from that device pool and the arrival is
-    /// [`Arrival::Device`]: fails with [`Error::Unavailable`] if the rail has
-    /// no such device pool and [`Error::Overloaded`] if none is free.
+    /// tag and arrival op once the `Grant` is posted; `waited` is reported
+    /// as [`Granted::waited`]. With `device`, the buffer comes from that
+    /// device pool and the arrival is [`Arrival::Device`]: fails with
+    /// [`Error::Unavailable`] if the rail has no such device pool.
+    ///
+    /// When every grant slot ([`Self::grants_full`]) or every buffer of the
+    /// pool is held, `done` comes back uncompleted, so the caller can fail
+    /// it [`Error::Overloaded`] or park it until something frees.
     #[allow(clippy::too_many_arguments)]
+    #[must_use]
     pub(crate) fn grant(
         &mut self,
         pool: &Pool,
@@ -713,27 +730,27 @@ impl Link {
         transfer: [u8; 16],
         length: u32,
         deadline: Instant,
+        waited: bool,
         done: Completer<Granted>,
         now: Instant,
-    ) {
+    ) -> Option<Completer<Granted>> {
         if self.phase != Phase::Ready {
             let _ = done.complete(Err(Error::Unavailable));
-            return;
+            return None;
         }
 
         if length == 0 || length > self.limits.buffer_len {
             let _ = done.complete(Err(Error::InvalidRange));
-            return;
+            return None;
         }
 
-        if self.grants.len() >= self.grant_cap as usize {
-            let _ = done.complete(Err(Error::Overloaded));
-            return;
+        if self.grants_full() {
+            return Some(done);
         }
 
         if device.is_some_and(|id| pool.device_shared(id).is_none()) {
             let _ = done.complete(Err(Error::Unavailable));
-            return;
+            return None;
         }
 
         let window = if let Some(id) = device {
@@ -749,7 +766,7 @@ impl Link {
                     }
                     Err(error) => {
                         let _ = done.complete(Err(error));
-                        return;
+                        return None;
                     }
                 },
             }
@@ -764,8 +781,7 @@ impl Link {
         };
         let Some(buffer) = taken else {
             self.free_window(device, window);
-            let _ = done.complete(Err(Error::Overloaded));
-            return;
+            return Some(done);
         };
 
         let tag = self.allocate_tag();
@@ -781,10 +797,12 @@ impl Link {
                 state: GrantState::Binding,
                 deadline,
                 granted: Some(done),
+                waited,
                 arrival: None,
             },
         );
         self.outbox.push_back(Outgoing::Bind(tag));
+        None
     }
 
     /// Return `window` to its free list.
@@ -1513,7 +1531,11 @@ impl Link {
                 if let Some(granted) = entry.granted.take() {
                     // A dropped op drops `arrival`: the grant is abandoned and
                     // ends at the peer's write or release, or its deadline.
-                    let _ = granted.complete(Ok(Granted { tag, arrival }));
+                    let _ = granted.complete(Ok(Granted {
+                        tag,
+                        arrival,
+                        waited: entry.waited,
+                    }));
                 }
             }
             Outgoing::Release {

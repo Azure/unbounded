@@ -11,11 +11,11 @@
 //! Clients queue commands and get results through [`Op`]s.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     rc::Rc,
     sync::{
         Arc, Mutex, PoisonError, RwLock,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     task::{Context, Poll, Waker},
     time::{Duration, Instant},
@@ -263,6 +263,9 @@ enum Command {
         transfer: [u8; 16],
         length: u32,
         deadline: Instant,
+        /// Park until then if every grant slot or buffer is held
+        /// ([`Client::grant_parked`]); `None` fails `Overloaded` at once.
+        park: Option<Instant>,
         done: Completer<Granted>,
     },
 
@@ -372,6 +375,9 @@ struct NodeShared {
 
     drained: AtomicBool,
 
+    /// Grant requests parked in the owner ([`Client::grant_waiters`]).
+    grant_waiters: AtomicUsize,
+
     /// False once the owner (or its port) is dropped.
     alive: AtomicBool,
 
@@ -397,6 +403,7 @@ pub fn node(workers: usize) -> Result<(Vec<Client>, OwnerPort)> {
         retain: Mutex::new(None),
         closed: AtomicBool::new(false),
         drained: AtomicBool::new(false),
+        grant_waiters: AtomicUsize::new(0),
         alive: AtomicBool::new(true),
         owner: AtomicWaker::new(),
     });
@@ -581,8 +588,46 @@ impl Client {
             transfer,
             length,
             deadline,
+            park: None,
             done,
         })
+    }
+
+    /// Receiver: like [`Self::grant`], but when every grant slot of the link
+    /// or every buffer of its rail's pool is held, the request parks in the
+    /// owner until one frees or `until` passes, instead of failing
+    /// `Overloaded` at once. Parked requests are served in arrival order per
+    /// rail, from the owner's poll that sees the release, so a freed buffer
+    /// goes to the oldest waiter that can use it. A request still parked at
+    /// `until` fails `Overloaded`; one whose link broke fails `Unavailable`;
+    /// dropping the op withdraws it without taking a buffer. The grant
+    /// reports [`Granted::waited`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn grant_parked(
+        &self,
+        key: LinkKey,
+        epoch: Epoch,
+        transfer: [u8; 16],
+        length: u32,
+        deadline: Instant,
+        until: Instant,
+    ) -> Op<Granted> {
+        self.submit(|done| Command::Grant {
+            key,
+            epoch,
+            device: None,
+            transfer,
+            length,
+            deadline,
+            park: Some(until),
+            done,
+        })
+    }
+
+    /// Grant requests parked in the owner ([`Self::grant_parked`]), as of
+    /// its last poll.
+    pub fn grant_waiters(&self) -> usize {
+        self.shared.grant_waiters.load(Ordering::Relaxed)
     }
 
     /// Receiver: like [`Self::grant`], but over a free buffer of the rail's
@@ -609,6 +654,7 @@ impl Client {
             transfer,
             length,
             deadline,
+            park: None,
             done,
         })
     }
@@ -936,6 +982,30 @@ pub struct Owner {
 
     /// Scratch for the commands taken in one poll, reused across polls.
     commands: Vec<Command>,
+
+    /// Parked grant requests by rail, oldest first ([`Client::grant_parked`]).
+    waiters: BTreeMap<u16, VecDeque<Waiter>>,
+
+    /// No parked request expires before this; `None` with none parked.
+    park_expiry: Option<Instant>,
+}
+
+/// A grant request parked until a grant slot or page buffer frees.
+struct Waiter {
+    key: LinkKey,
+
+    epoch: Epoch,
+
+    transfer: [u8; 16],
+
+    length: u32,
+
+    deadline: Instant,
+
+    /// Fail `Overloaded` once this passes.
+    until: Instant,
+
+    done: Completer<Granted>,
 }
 
 impl Owner {
@@ -970,6 +1040,8 @@ impl Owner {
             leaked: false,
             backlog: false,
             commands: Vec::new(),
+            waiters: BTreeMap::new(),
+            park_expiry: None,
         }
     }
 
@@ -1030,6 +1102,9 @@ impl Owner {
             if let Some(t) = link.next_deadline() {
                 at(t);
             }
+        }
+        if let Some(t) = self.park_expiry {
+            at(t);
         }
         next
     }
@@ -1109,6 +1184,7 @@ impl Owner {
         self.advance_registrations();
         self.progress(now);
         self.reap();
+        self.serve_waiters(now);
 
         if self.closing {
             self.finish_shutdown();
@@ -1133,7 +1209,8 @@ impl Owner {
         let pending = !self.links.is_empty()
             || !self.dying.is_empty()
             || (self.closing && !self.leaked && !self.drained())
-            || self.expiry.is_some();
+            || self.expiry.is_some()
+            || !self.waiters.is_empty();
         let external = self.activating.is_some() || !self.attaching.is_empty();
         assert!(
             !missing_wake(pending, self.next_wake(), external),
@@ -1197,15 +1274,47 @@ impl Owner {
                 transfer,
                 length,
                 deadline,
+                park,
                 done,
-            } => match self.ready(key, epoch) {
-                Some((link, pool)) => {
-                    link.grant(pool, device, transfer, length, deadline, done, now)
+            } => {
+                // Host grants may park; device (landing) grants fall back to
+                // host memory instead. Behind older waiters on the rail, park
+                // without trying, so a buffer freed since goes to them first.
+                let park = park.filter(|_| device.is_none());
+                let queued = park.is_some()
+                    && self
+                        .waiters
+                        .get(&key.rail)
+                        .is_some_and(|queue| !queue.is_empty());
+                let done = match self.ready(key, epoch) {
+                    None => {
+                        let _ = done.complete(Err(Error::Unavailable));
+                        return;
+                    }
+                    Some(_) if queued => done,
+                    Some((link, pool)) => {
+                        match link.grant(pool, device, transfer, length, deadline, false, done, now)
+                        {
+                            Some(done) => done,
+                            None => return,
+                        }
+                    }
+                };
+                match park {
+                    Some(until) if until > now => self.park(Waiter {
+                        key,
+                        epoch,
+                        transfer,
+                        length,
+                        deadline,
+                        until,
+                        done,
+                    }),
+                    _ => {
+                        let _ = done.complete(Err(Error::Overloaded));
+                    }
                 }
-                None => {
-                    let _ = done.complete(Err(Error::Unavailable));
-                }
-            },
+            }
             Command::Write {
                 key,
                 epoch,
@@ -1234,6 +1343,116 @@ impl Owner {
                 self.break_matching(key, epoch, declined, now);
             }
         }
+    }
+
+    /// Queue `waiter` behind the rail's older waiters.
+    fn park(&mut self, waiter: Waiter) {
+        self.park_expiry = Some(
+            self.park_expiry
+                .map_or(waiter.until, |t| t.min(waiter.until)),
+        );
+        self.waiters
+            .entry(waiter.key.rail)
+            .or_default()
+            .push_back(waiter);
+        self.count_waiters();
+    }
+
+    /// Publish the parked request count.
+    fn count_waiters(&self) {
+        let parked = self.waiters.values().map(VecDeque::len).sum();
+        self.shared.grant_waiters.store(parked, Ordering::Relaxed);
+    }
+
+    /// Grant parked requests that a grant slot or buffer freed for, oldest
+    /// first per rail, after this poll's releases. A request that still finds
+    /// its link's slots full stays parked without blocking the requests
+    /// behind it (other links may have slots); one that finds the rail's pool
+    /// empty stops the rail, so a later request never takes a buffer ahead
+    /// of an older one. Expired, withdrawn, and orphaned (link gone or
+    /// replaced) requests leave whenever a request may have expired or the
+    /// link table changed, and on shutdown.
+    fn serve_waiters(&mut self, now: Instant) {
+        if self.waiters.is_empty() {
+            return;
+        }
+
+        if self.closing {
+            for (_, queue) in std::mem::take(&mut self.waiters) {
+                for waiter in queue {
+                    let _ = waiter.done.complete(Err(Error::Unavailable));
+                }
+            }
+            self.park_expiry = None;
+            self.count_waiters();
+            return;
+        }
+
+        let sweep = self.dirty || self.park_expiry.is_some_and(|t| now >= t);
+        let mut waiters = std::mem::take(&mut self.waiters);
+        let mut expiry: Option<Instant> = None;
+
+        for queue in waiters.values_mut() {
+            let mut kept = VecDeque::with_capacity(queue.len());
+            let mut exhausted = false;
+
+            while let Some(waiter) = queue.pop_front() {
+                if exhausted && !sweep {
+                    // Nothing behind an empty pool can be granted, and
+                    // nothing needs to expire yet.
+                    kept.push_back(waiter);
+                    kept.append(queue);
+                    break;
+                }
+                if waiter.done.is_abandoned() {
+                    continue;
+                }
+                let Some((link, pool)) = self.ready(waiter.key, waiter.epoch) else {
+                    let _ = waiter.done.complete(Err(Error::Unavailable));
+                    continue;
+                };
+                if now >= waiter.until {
+                    let _ = waiter.done.complete(Err(Error::Overloaded));
+                    continue;
+                }
+                let full = link.grants_full();
+                let left = if exhausted || full {
+                    Some(waiter.done)
+                } else {
+                    link.grant(
+                        pool,
+                        None,
+                        waiter.transfer,
+                        waiter.length,
+                        waiter.deadline,
+                        true,
+                        waiter.done,
+                        now,
+                    )
+                };
+                if let Some(done) = left {
+                    // Slots full stays local to the link; an empty pool
+                    // blocks the rail.
+                    exhausted |= !full;
+                    expiry = Some(expiry.map_or(waiter.until, |t| t.min(waiter.until)));
+                    kept.push_back(Waiter { done, ..waiter });
+                }
+            }
+
+            *queue = kept;
+        }
+
+        waiters.retain(|_, queue| !queue.is_empty());
+        self.waiters = waiters;
+        // Requests skipped behind an empty pool keep the old bound.
+        self.park_expiry = if self.waiters.is_empty() {
+            None
+        } else if sweep {
+            expiry
+        } else {
+            self.park_expiry
+        };
+        self.count_waiters();
     }
 
     /// The link for `key` named by `link`, and its pool.

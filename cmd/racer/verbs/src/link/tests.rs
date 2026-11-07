@@ -167,8 +167,11 @@ fn poll<T>(op: &Op<T>) -> Option<Result<T>> {
 
 fn grant(side: &mut Side, length: u32, deadline: Instant, now: Instant) -> Op<Granted> {
     let (granted, done) = op();
-    side.link
-        .grant(&side.pool, None, [7; 16], length, deadline, done, now);
+    if let Some(done) = side.link.grant(
+        &side.pool, None, [7; 16], length, deadline, false, done, now,
+    ) {
+        let _ = done.complete(Err(Error::Overloaded));
+    }
     granted
 }
 
@@ -201,7 +204,7 @@ fn transfer(p: &mut Pair, to_a: bool, bytes: &[u8]) -> RegisteredPage {
     let granted = grant(receiver, bytes.len() as u32, deadline, now);
     let _ = (receiver, sender);
     assert_eq!(pump(p), (None, None));
-    let Granted { tag, arrival } = poll(&granted).unwrap().unwrap();
+    let Granted { tag, arrival, .. } = poll(&granted).unwrap().unwrap();
     let sender = if to_a { &mut p.b } else { &mut p.a };
     let written = write(sender, tag, bytes.to_vec(), deadline, now);
     assert_eq!(pump(p), (None, None));
@@ -431,7 +434,7 @@ fn abandoned_arrival_with_late_release() {
         let now = p.now;
         let granted = grant(&mut p.a, 10, now + 5 * SECOND, now);
         assert_eq!(pump(&mut p), (None, None));
-        let Granted { tag, arrival } = poll(&granted).unwrap().unwrap();
+        let Granted { tag, arrival, .. } = poll(&granted).unwrap().unwrap();
         drop(arrival);
         assert_eq!(pump(&mut p), (None, None));
         assert_eq!(p.a.pool.shared().count_in(BufferState::Exposed), 1);
@@ -442,7 +445,7 @@ fn abandoned_arrival_with_late_release() {
         // An abandoned arrival whose write lands frees the page right away.
         let granted = grant(&mut p.a, 10, now + 5 * SECOND, now);
         assert_eq!(pump(&mut p), (None, None));
-        let Granted { tag, arrival } = poll(&granted).unwrap().unwrap();
+        let Granted { tag, arrival, .. } = poll(&granted).unwrap().unwrap();
         drop(arrival);
         let written = write(&mut p.b, tag, vec![1; 10], now + 5 * SECOND, now);
         assert_eq!(pump(&mut p), (None, None));
@@ -692,7 +695,7 @@ fn unequal_grant_limits_use_the_minimum() {
                 assert_eq!(pump(&mut p), (None, None), "link stays up");
 
                 for granted in held {
-                    let Granted { tag, arrival } = poll(&granted).unwrap().unwrap();
+                    let Granted { tag, arrival, .. } = poll(&granted).unwrap().unwrap();
                     let sender = if to_a { &mut p.b } else { &mut p.a };
                     let written = write(sender, tag, vec![9], deadline, now);
                     assert_eq!(pump(&mut p), (None, None));
@@ -1167,7 +1170,7 @@ fn direct_write(p: &mut Pair, source: &Arc<Vec<u8>>) -> (Op<()>, Op<Arrival>) {
     let (now, deadline) = (p.now, p.now + 5 * SECOND);
     let granted = grant(&mut p.a, source.len() as u32, deadline, now);
     assert_eq!(pump(p), (None, None));
-    let Granted { tag, arrival } = poll(&granted).unwrap().unwrap();
+    let Granted { tag, arrival, .. } = poll(&granted).unwrap().unwrap();
     p.sim.fault(Operation::WriteImm, Fault::Delay(1_000_000));
     let (written, done) = op();
     p.b.link
@@ -1187,7 +1190,7 @@ fn direct_write_reads_in_place_and_holds_the_source_until_completion() {
         let (now, deadline) = (p.now, p.now + 5 * SECOND);
         let granted = grant(&mut p.a, 100, deadline, now);
         assert_eq!(pump(&mut p), (None, None));
-        let Granted { tag, arrival } = poll(&granted).unwrap().unwrap();
+        let Granted { tag, arrival, .. } = poll(&granted).unwrap().unwrap();
         p.sim.fault(Operation::WriteImm, Fault::Delay(3));
         let (written, done) = op();
         p.b.link
@@ -1223,7 +1226,7 @@ fn direct_writes_accept_boxed_and_static_sources() {
             let (now, deadline) = (p.now, p.now + 5 * SECOND);
             let granted = grant(&mut p.a, expected.len() as u32, deadline, now);
             assert_eq!(pump(&mut p), (None, None));
-            let Granted { tag, arrival } = poll(&granted).unwrap().unwrap();
+            let Granted { tag, arrival, .. } = poll(&granted).unwrap().unwrap();
             let (written, done) = op();
             p.b.link
                 .write(tag, Source::new(source.clone()), deadline, done, now);

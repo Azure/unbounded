@@ -97,6 +97,10 @@ const TO_A: LinkKey = LinkKey {
 };
 
 fn config(charge: &Arc<AtomicUsize>) -> NodeConfig {
+    config_with(charge, 2)
+}
+
+fn config_with(charge: &Arc<AtomicUsize>, grants_per_link: u32) -> NodeConfig {
     charge.fetch_add(1, Ordering::AcqRel);
     NodeConfig {
         selector: Box::new(|ports| {
@@ -106,7 +110,7 @@ fn config(charge: &Arc<AtomicUsize>) -> NodeConfig {
         pool_bytes: BUFFERS * len() + 17,
         buffer_len: len(),
         max_links: 2,
-        grants_per_link: 2,
+        grants_per_link,
         idle: Duration::from_secs(120),
         guard: Arc::new(Charge(charge.clone())),
     }
@@ -129,12 +133,17 @@ fn node(sim: &Simulation, n: u8, ctx: racer_io::WorkerCtx) -> Node {
 }
 
 fn world() -> World {
+    world_with(2)
+}
+
+/// A world whose links advertise `grants_per_link` grants.
+fn world_with(grants_per_link: u32) -> World {
     let sim = Simulation::new();
     let clock = SimClock::new(7);
     let mut a = node(&sim, 1, clock.ctx(1));
     let mut b = node(&sim, 2, clock.ctx(1));
     for node in [&mut a, &mut b] {
-        let activation = node.clients[0].activate(config(&node.charge));
+        let activation = node.clients[0].activate(config_with(&node.charge, grants_per_link));
         node.owner().poll_budgeted(4).unwrap();
         let selected = ready(&activation).unwrap();
         assert_eq!(selected[0].tag, 7);
@@ -249,10 +258,12 @@ fn pages_flow_both_ways_over_one_link() {
             let Granted {
                 tag: tag_a,
                 arrival: arrival_a,
+                ..
             } = ready(&into_a).unwrap();
             let Granted {
                 tag: tag_b,
                 arrival: arrival_b,
+                ..
             } = ready(&into_b).unwrap();
             let to_a =
                 w.b.clients[1 - worker].write(TO_A, eb, tag_a, bytes(vec![round; 100]), deadline);
@@ -1474,4 +1485,165 @@ fn device_removal_breaks_rail_and_recovers_after_reopen() {
     assert_eq!(w.a.clients[0].device_losses(), 1, "losses are cumulative");
     link_up(&mut w);
     shutdown(w);
+}
+
+#[test]
+/// A parked grant request waits for a free slot instead of failing, is
+/// served in arrival order as slots free, and reports that it waited. One
+/// that finds a slot free is granted at once without waiting.
+fn parked_grants_wake_in_order_on_release() {
+    profiles(|| {
+        let mut w = world();
+        let (ea, eb) = link_up(&mut w);
+        let deadline = w.now() + 5 * SECOND;
+        let until = w.now() + SECOND;
+        let first = w.a.clients[0].grant_parked(TO_B, ea, [1; 16], 10, deadline, until);
+        let first = wait(&mut w, &first).unwrap();
+        assert!(!first.waited);
+        let second = w.a.clients[0].grant(TO_B, ea, [2; 16], 10, deadline);
+        let second = wait(&mut w, &second).unwrap();
+        // Both slots held: a plain grant fails, parked ones wait.
+        let plain = w.a.clients[0].grant(TO_B, ea, [3; 16], 10, deadline);
+        assert_eq!(wait(&mut w, &plain).err(), Some(Error::Overloaded));
+        let older = w.a.clients[1].grant_parked(TO_B, ea, [4; 16], 10, deadline, until);
+        pump(&mut w);
+        let newer = w.a.clients[0].grant_parked(TO_B, ea, [5; 16], 10, deadline, until);
+        pump(&mut w);
+        assert!(pending(&older) && pending(&newer));
+        assert_eq!(w.a.clients[0].grant_waiters(), 2);
+        // Each release wakes the oldest waiter.
+        let released = w.b.clients[0].release(TO_A, eb, first.tag);
+        assert_eq!(wait(&mut w, &released), Ok(()));
+        let older = ready(&older).unwrap();
+        assert!(older.waited);
+        assert!(pending(&newer));
+        assert_eq!(w.a.clients[0].grant_waiters(), 1);
+        let written = w.b.clients[0].write(TO_A, eb, second.tag, bytes(vec![7; 10]), deadline);
+        assert_eq!(wait(&mut w, &written), Ok(()));
+        drop(page(ready(&second.arrival)));
+        pump(&mut w);
+        let newer = ready(&newer).unwrap();
+        assert!(newer.waited);
+        assert_eq!(w.a.clients[0].grant_waiters(), 0);
+        for tag in [older.tag, newer.tag] {
+            let released = w.b.clients[0].release(TO_A, eb, tag);
+            assert_eq!(wait(&mut w, &released), Ok(()));
+        }
+        pump(&mut w);
+        assert_eq!(w.a.clients[0].buffers(7, BufferState::Free), Some(BUFFERS));
+        shutdown(w);
+    });
+}
+
+#[test]
+/// When the rail's pool runs out before the link's slots, parked requests
+/// still take freed buffers in arrival order.
+fn parked_grants_wait_for_pool_buffers_in_order() {
+    window_only(|| {
+        let mut w = world_with(BUFFERS as u32 + 2);
+        let (ea, eb) = link_up(&mut w);
+        let deadline = w.now() + 5 * SECOND;
+        let until = w.now() + SECOND;
+        let mut held = Vec::new();
+        for i in 0..BUFFERS {
+            let granted = w.a.clients[0].grant(TO_B, ea, [i as u8; 16], 10, deadline);
+            held.push(wait(&mut w, &granted).unwrap());
+        }
+        assert_eq!(w.a.clients[0].buffers(7, BufferState::Free), Some(0));
+        let waiters: Vec<_> = (0..2u8)
+            .map(|i| {
+                let op = w.a.clients[usize::from(i)].grant_parked(
+                    TO_B,
+                    ea,
+                    [9 + i; 16],
+                    10,
+                    deadline,
+                    until,
+                );
+                pump(&mut w);
+                op
+            })
+            .collect();
+        assert!(waiters.iter().all(pending));
+        let released = w.b.clients[0].release(TO_A, eb, held[0].tag);
+        assert_eq!(wait(&mut w, &released), Ok(()));
+        assert!(ready(&waiters[0]).unwrap().waited);
+        assert!(pending(&waiters[1]));
+        // A new request queues behind the older waiter, even with a buffer
+        // free by the time the owner sees it.
+        let late = w.a.clients[0].grant_parked(TO_B, ea, [20; 16], 10, deadline, until);
+        let released = w.b.clients[0].release(TO_A, eb, held[1].tag);
+        assert_eq!(wait(&mut w, &released), Ok(()));
+        assert!(ready(&waiters[1]).unwrap().waited);
+        assert!(pending(&late));
+        // Shutdown fails what is still parked.
+        shutdown(w);
+        assert_eq!(ready(&late).err(), Some(Error::Unavailable));
+    });
+}
+
+#[test]
+/// A withdrawn waiter takes no buffer: the next one gets the slot and every
+/// buffer comes back. A waiter still parked at its wait limit fails
+/// `Overloaded`; one whose link breaks, or that is parked at shutdown,
+/// fails `Unavailable`.
+fn parked_grants_cancel_expire_and_fail_with_the_link() {
+    profiles(|| {
+        let mut w = world();
+        let (ea, eb) = link_up(&mut w);
+        let deadline = w.now() + 5 * SECOND;
+        let until = w.now() + SECOND;
+        let mut held = Vec::new();
+        for i in 0..2u8 {
+            let granted = w.a.clients[0].grant(TO_B, ea, [i; 16], 10, deadline);
+            held.push(wait(&mut w, &granted).unwrap());
+        }
+        let withdrawn = w.a.clients[0].grant_parked(TO_B, ea, [3; 16], 10, deadline, until);
+        pump(&mut w);
+        let kept = w.a.clients[0].grant_parked(TO_B, ea, [4; 16], 10, deadline, until);
+        pump(&mut w);
+        drop(withdrawn);
+        let released = w.b.clients[0].release(TO_A, eb, held[0].tag);
+        assert_eq!(wait(&mut w, &released), Ok(()));
+        let kept = ready(&kept).unwrap();
+        assert!(kept.waited);
+        assert_eq!(w.a.clients[0].grant_waiters(), 0);
+        // Expiry: both slots held again, and nothing frees in time.
+        let expiring = w.a.clients[0].grant_parked(
+            TO_B,
+            ea,
+            [5; 16],
+            10,
+            deadline,
+            w.now() + Duration::from_millis(100),
+        );
+        pump(&mut w);
+        assert!(pending(&expiring));
+        // A limit already passed fails at once.
+        let late = w.a.clients[0].grant_parked(TO_B, ea, [6; 16], 10, deadline, w.now());
+        assert_eq!(wait(&mut w, &late).err(), Some(Error::Overloaded));
+        w.clock.advance(Duration::from_millis(100));
+        assert_eq!(wait(&mut w, &expiring).err(), Some(Error::Overloaded));
+        assert_eq!(w.a.clients[0].grant_waiters(), 0);
+        for tag in [held[1].tag, kept.tag] {
+            let released = w.b.clients[0].release(TO_A, eb, tag);
+            assert_eq!(wait(&mut w, &released), Ok(()));
+        }
+        pump(&mut w);
+        assert_eq!(w.a.clients[0].buffers(7, BufferState::Free), Some(BUFFERS));
+        // A broken link fails its waiters `Unavailable`.
+        let mut fill = Vec::new();
+        for i in 0..2u8 {
+            let granted = w.a.clients[0].grant(TO_B, ea, [i; 16], 10, deadline);
+            fill.push(wait(&mut w, &granted).unwrap());
+        }
+        let orphan = w.a.clients[0].grant_parked(TO_B, ea, [7; 16], 10, deadline, until);
+        pump(&mut w);
+        assert!(pending(&orphan));
+        w.a.clients[0].break_link(TO_B, ea);
+        assert_eq!(wait(&mut w, &orphan).err(), Some(Error::Unavailable));
+        assert_eq!(w.a.clients[0].grant_waiters(), 0);
+        drop(fill);
+        shutdown(w);
+    });
 }
