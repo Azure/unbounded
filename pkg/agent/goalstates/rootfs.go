@@ -7,8 +7,10 @@ import "github.com/Azure/unbounded/pkg/agent/config"
 
 // RootFS defines the goal state of the machine root fs.
 // This goal state produces a rootfs that is ready for running a Kubernetes node
-// via systemd-nspawn from dir points to `.MachineDir`.
+// via systemd-nspawn from the machine directory.
 type RootFS struct {
+	// MachineDir is the nspawn backend's root directory. It is an intentional
+	// nspawn-only goal state field; phases reach it through Root().
 	MachineDir             string
 	NSpawnConfigFile       string // e.g. /etc/systemd/nspawn/node.nspawn
 	ServiceOverrideFile    string // e.g. /etc/systemd/system/systemd-nspawn@node.service.d/override.conf

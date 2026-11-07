@@ -19,7 +19,6 @@ import (
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 	"sigs.k8s.io/yaml"
 
-	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 )
@@ -72,7 +71,7 @@ func (c *configureKubelet) Do(_ context.Context) error {
 // writing a file. For example, the static-pod manifests directory must be
 // present even when no static pods have been configured yet.
 func (c *configureKubelet) ensureRuntimeFolders() error {
-	dir := filepath.Join(c.goalState.MachineDir, goalstates.KubeletStaticPodManifestsDir)
+	dir := c.goalState.Root().Path(goalstates.KubeletStaticPodManifestsDir)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("create %s: %w", dir, err)
 	}
@@ -94,9 +93,7 @@ func StartKubelet(log *slog.Logger, goalState *goalstates.NodeStart) phases.Task
 func (s *startKubelet) Name() string { return "start-kubelet" }
 
 func (s *startKubelet) Do(ctx context.Context) error {
-	if _, err := executil.MachineRun(ctx, s.log, s.goalState.MachineName,
-		"systemctl", "enable", "--now", goalstates.SystemdUnitKubelet,
-	); err != nil {
+	if _, err := s.goalState.Exec(ctx, s.log, "systemctl", "enable", "--now", goalstates.SystemdUnitKubelet); err != nil {
 		return fmt.Errorf("systemctl enable --now %s in %s: %w",
 			goalstates.SystemdUnitKubelet, s.goalState.MachineName, err)
 	}
@@ -107,7 +104,7 @@ func (s *startKubelet) Do(ctx context.Context) error {
 // ensureKubeletCACert writes the API server CA certificate into the machine
 // rootfs PKI directory.
 func (c *configureKubelet) ensureKubeletCACert() error {
-	dest := filepath.Join(c.goalState.MachineDir, goalstates.KubeletAPIServerCACertPath)
+	dest := c.goalState.Root().Path(goalstates.KubeletAPIServerCACertPath)
 
 	return c.write(dest, c.goalState.Kubelet.CACertData, 0o644)
 }
@@ -142,7 +139,7 @@ func (c *configureKubelet) ensureKubeletConfiguration() error {
 		return fmt.Errorf("marshal KubeletConfiguration: %w", err)
 	}
 
-	dest := filepath.Join(c.goalState.MachineDir, goalstates.KubeletConfigurationPath)
+	dest := c.goalState.Root().Path(goalstates.KubeletConfigurationPath)
 
 	return c.write(dest, data, 0o644)
 }
@@ -213,7 +210,7 @@ func (c *configureKubelet) ensureKubeletServiceUnit() error {
 		return err
 	}
 
-	dest := filepath.Join(c.goalState.MachineDir, goalstates.SystemdSystemDir, goalstates.SystemdUnitKubelet)
+	dest := c.goalState.Root().Path(filepath.Join(goalstates.SystemdSystemDir, goalstates.SystemdUnitKubelet))
 
 	return c.write(dest, buf.Bytes(), 0o644)
 }
@@ -268,7 +265,7 @@ func (c *configureKubelet) ensureKubeletDropIns() error {
 			return fmt.Errorf("render %s: %w", d.name, err)
 		}
 
-		dest := filepath.Join(c.goalState.MachineDir, goalstates.KubeletServiceDropInDir, d.name)
+		dest := c.goalState.Root().Path(filepath.Join(goalstates.KubeletServiceDropInDir, d.name))
 		if err := c.write(dest, buf.Bytes(), 0o644); err != nil {
 			return fmt.Errorf("write %s: %w", dest, err)
 		}
@@ -283,7 +280,7 @@ func (c *configureKubelet) ensureKubeconfig() error {
 	spec := c.goalState.Kubelet
 	switch {
 	case len(spec.KubeconfigData) > 0:
-		dest := filepath.Join(c.goalState.MachineDir, goalstates.KubeletKubeconfigPath)
+		dest := c.goalState.Root().Path(goalstates.KubeletKubeconfigPath)
 		if err := c.write(dest, spec.KubeconfigData, 0o600); err != nil {
 			return err
 		}
@@ -296,7 +293,7 @@ func (c *configureKubelet) ensureKubeconfig() error {
 			return err
 		}
 
-		dropInPath := filepath.Join(c.goalState.MachineDir, goalstates.KubeletServiceDropInDir, "10-kubeconfig.conf")
+		dropInPath := c.goalState.Root().Path(filepath.Join(goalstates.KubeletServiceDropInDir, "10-kubeconfig.conf"))
 
 		previousDropIn, err := os.ReadFile(dropInPath)
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -304,7 +301,7 @@ func (c *configureKubelet) ensureKubeconfig() error {
 		}
 
 		if bytes.Contains(previousDropIn, []byte("KUBELET_KUBECONFIG_ARGS=--kubeconfig=")) {
-			dest := filepath.Join(c.goalState.MachineDir, goalstates.KubeletKubeconfigPath)
+			dest := c.goalState.Root().Path(goalstates.KubeletKubeconfigPath)
 			if err := os.Remove(dest); err != nil && !errors.Is(err, os.ErrNotExist) {
 				return fmt.Errorf("remove direct kubelet kubeconfig: %w", err)
 			}
@@ -355,7 +352,7 @@ func (c *configureKubelet) ensureBootstrapKubeconfig() error {
 		return fmt.Errorf("serialize bootstrap kubeconfig: %w", err)
 	}
 
-	dest := filepath.Join(c.goalState.MachineDir, goalstates.KubeletBootstrapKubeconfigPath)
+	dest := c.goalState.Root().Path(goalstates.KubeletBootstrapKubeconfigPath)
 
 	return c.write(dest, data, 0o600)
 }
@@ -373,7 +370,7 @@ func (c *configureKubelet) ensureExecKubeconfig() error {
 	}
 	// Exec credential plugins provide renewable tokens, so write directly
 	// to the kubelet kubeconfig path (no TLS bootstrap needed).
-	dest := filepath.Join(c.goalState.MachineDir, goalstates.KubeletKubeconfigPath)
+	dest := c.goalState.Root().Path(goalstates.KubeletKubeconfigPath)
 
 	return c.write(dest, data, 0o600)
 }

@@ -17,6 +17,7 @@ import (
 	"strings"
 
 	"github.com/Azure/unbounded/pkg/agent/internal/nvidia"
+	"github.com/Azure/unbounded/pkg/agent/isolation"
 )
 
 // NVIDIA host discovery and goal state resolution.
@@ -109,11 +110,7 @@ type NvidiaLibMapping struct {
 
 // NvidiaLibDirMount represents a read-only bind mount of a host directory
 // containing NVIDIA libraries into the nspawn container.
-type NvidiaLibDirMount struct {
-	Index        int    // mount index, used by symlink creation to map libs to their container path
-	HostDir      string // e.g. "/usr/lib/x86_64-linux-gnu"
-	ContainerDir string // e.g. "/run/host-nvidia/0"
-}
+type NvidiaLibDirMount = isolation.LibDirMount
 
 // NvidiaRuntime describes the NVIDIA container runtime configuration for
 // containerd. When Enabled is true the runtime is registered as a handler

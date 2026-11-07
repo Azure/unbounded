@@ -7,7 +7,6 @@ import (
 	"context"
 	_ "embed"
 	"fmt"
-	"path/filepath"
 
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
@@ -82,7 +81,7 @@ func (c *configureOS) Do(_ context.Context) error {
 	}
 
 	for _, f := range configs {
-		dest := filepath.Join(c.goalState.MachineDir, f.path)
+		dest := c.goalState.Root().Path(f.path)
 		if err := utilio.WriteFile(dest, f.content, 0o644); err != nil {
 			return fmt.Errorf("write %s: %w", dest, err)
 		}

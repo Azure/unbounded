@@ -44,7 +44,7 @@ func DownloadCNIBinaries(log *slog.Logger, goalState *goalstates.RootFS) phases.
 func (d *downloadCNIBinaries) Name() string { return "download-cni-binaries" }
 
 func (d *downloadCNIBinaries) Do(ctx context.Context) error {
-	destDir := filepath.Join(d.goalState.MachineDir, cniBinDir)
+	destDir := d.goalState.Root().Path(cniBinDir)
 	override := cniDownloadSource(d.goalState)
 	version := downloadSourceVersion(d.goalState.CNIPluginVersion, override)
 
