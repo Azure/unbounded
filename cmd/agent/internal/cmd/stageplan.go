@@ -38,10 +38,14 @@ type stagePlan interface {
 
 // configuredMode is the isolation mode a bootstrap configuration selects. A nil
 // configuration, as in tests that exercise only the mode independent stages,
-// is the default mode. The agent configuration does not record a mode yet, so
-// every configuration selects the default mode.
-func configuredMode(_ *provision.UnboundedAgentConfig) (isolation.Mode, error) {
-	return isolation.DefaultMode, nil
+// is the default mode. A mode this agent cannot operate is an error, so the
+// bootstrap refuses it before it touches the host.
+func configuredMode(cfg *provision.UnboundedAgentConfig) (isolation.Mode, error) {
+	if cfg == nil {
+		return isolation.DefaultMode, nil
+	}
+
+	return cfg.IsolationMode()
 }
 
 // plan returns the bootstrap plan for the configured isolation mode, building

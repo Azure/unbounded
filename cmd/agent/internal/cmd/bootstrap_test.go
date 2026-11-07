@@ -19,6 +19,7 @@ import (
 	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/isolation"
 	"github.com/Azure/unbounded/pkg/agent/preflight"
 )
 
@@ -254,5 +255,54 @@ func TestClassifyNodeStartFailure(t *testing.T) {
 			err := fmt.Errorf("%s: %w", tc.task, errors.New("boom"))
 			require.Equal(t, tc.want, classifyNodeStartFailure(err))
 		})
+	}
+}
+
+// Declaring the default mode explicitly must not change the fingerprint of an
+// nspawn installation, or every host recorded before the Isolation key existed
+// would refuse a start that sets it.
+func TestBootstrapIdentity_DefaultModeKeepsTheFingerprint(t *testing.T) {
+	dir := filepath.Join("testdata", "bootstrap-v1")
+	cfg, err := loadConfigFromFile(filepath.Join(dir, "input.json"))
+	require.NoError(t, err)
+	require.NoError(t, normalizeConfig(slog.New(slog.DiscardHandler), cfg))
+
+	unset, err := bootstrapIdentity(cfg)
+	require.NoError(t, err)
+
+	data, err := os.ReadFile(filepath.Join(dir, string(installstate.Complete)+".json"))
+	require.NoError(t, err)
+
+	var record installstate.Record
+	require.NoError(t, json.Unmarshal(data, &record))
+	require.Equal(t, record.ConfigFingerprint, unset.ConfigFingerprint, "the unset mode keeps the recorded v1 fingerprint")
+
+	cfg.Isolation = "nspawn"
+	explicit, err := bootstrapIdentity(cfg)
+	require.NoError(t, err)
+	require.Equal(t, unset, explicit)
+}
+
+func TestConfiguredMode(t *testing.T) {
+	mode, err := configuredMode(nil)
+	require.NoError(t, err)
+	require.Equal(t, isolation.DefaultMode, mode)
+
+	for _, value := range []string{"", "nspawn"} {
+		mode, err = configuredMode(&provision.UnboundedAgentConfig{AgentConfig: provision.AgentConfig{Isolation: value}})
+		require.NoError(t, err, value)
+		require.Equal(t, isolation.ModeNSpawn, mode, value)
+	}
+
+	// A mode this agent has no table entry for is refused, and so is the
+	// bootstrap plan for it.
+	for _, value := range []string{"none", "container", "microvm"} {
+		cfg := &provision.UnboundedAgentConfig{AgentConfig: provision.AgentConfig{Isolation: value}}
+
+		_, err = configuredMode(cfg)
+		require.ErrorContains(t, err, "unsupported isolation mode", value)
+
+		_, err = (&agentStages{cfg: cfg}).plan()
+		require.Error(t, err, value)
 	}
 }
