@@ -56,7 +56,7 @@ func TestControlPlaneSeatsAndFailover(t *testing.T) {
 	stateUID, stateRV := h.waitStateSecret()
 	h.waitWebhook()
 
-	admissionNS := "racer-admission-failover"
+	admissionNS := "racer-authority-failover"
 	h.apply("apiVersion: v1\nkind: Namespace\nmetadata:\n  name: " + admissionNS + "\n")
 	h.assertWebhookAdmission(admissionNS)
 

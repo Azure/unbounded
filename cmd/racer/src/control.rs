@@ -1,5 +1,8 @@
 //! Racer control policy and reactor adapters for enrollment and immutable publications.
 
+#[cfg(test)]
+use crate::control::rest::Response;
+use crate::drivers::Busy;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
@@ -8,26 +11,34 @@ use crate::runtime::Reactor;
 use crate::runtime::RequestScope;
 #[cfg(test)]
 use crate::topology::Membership;
-use racer_control_wire as wire;
-#[cfg(test)]
-use racer_control_wire::BundleGeneration;
-use racer_control_wire::CacheDefinition;
-use racer_control_wire::CacheId;
-use racer_control_wire::ClusterId;
-#[cfg(test)]
-use racer_control_wire::EnrollmentId;
-use racer_control_wire::KeyId;
-#[cfg(test)]
-use racer_control_wire::MembershipVersion;
-#[cfg(test)]
-use racer_control_wire::NodeId;
-#[cfg(test)]
-use racer_control_wire::Publication;
-use racer_control_wire::PublicationSequence;
 #[cfg(test)]
 use racer_crypto::identity::BundleInstaller;
 use racer_crypto::identity::KeyPurpose;
 use racer_crypto::identity::Keyring;
+use racer_io::ring::Descriptor;
+#[cfg(test)]
+use racer_io::scoped::fs::prelude::*;
+use racer_io::scoped::fs::secure;
+#[cfg(test)]
+use racer_io::scoped::fs::secure::{
+    BENEATH, NO_MAGICLINKS, atomic_write, directory, read_at, read_path,
+};
+use racer_wire::control as wire;
+#[cfg(test)]
+use racer_wire::control::BundleGeneration;
+use racer_wire::control::CacheDefinition;
+use racer_wire::control::CacheId;
+use racer_wire::control::ClusterId;
+#[cfg(test)]
+use racer_wire::control::EnrollmentId;
+use racer_wire::control::KeyId;
+#[cfg(test)]
+use racer_wire::control::MembershipVersion;
+#[cfg(test)]
+use racer_wire::control::NodeId;
+#[cfg(test)]
+use racer_wire::control::Publication;
+use racer_wire::control::PublicationSequence;
 use std::cell::Cell;
 #[cfg(test)]
 use std::cell::RefCell;
@@ -35,9 +46,7 @@ use std::cell::RefCell;
 use std::ffi::CString;
 use std::net::SocketAddr;
 #[cfg(test)]
-use std::os::fd::AsRawFd;
 #[cfg(test)]
-use std::os::fd::FromRawFd;
 #[cfg(test)]
 use std::path::Path;
 use std::path::PathBuf;
@@ -48,22 +57,15 @@ use std::time::Duration;
 use std::time::Instant;
 #[cfg(test)]
 use std::time::SystemTime;
-use uring_runtime::drivers::Busy;
-use uring_runtime::reactor::descriptor::Descriptor;
-use uring_runtime::reactor::filesystem::secure;
-#[cfg(test)]
-use uring_runtime::reactor::filesystem::secure::{
-    BENEATH, NO_MAGICLINKS, atomic_write, directory, read_at, read_path,
-};
-use wire_codec::rest;
-#[cfg(test)]
-use wire_codec::rest::Response;
 
+pub mod cell;
 pub mod managed;
+pub mod poll;
 pub mod publication;
 pub mod rails;
+pub mod rest;
 pub mod session;
-use controlplane::Published;
+use crate::control::cell::PublicationCell;
 #[cfg(test)]
 use publication::PublicationTarget;
 
@@ -88,7 +90,7 @@ pub struct ControlEndpoint {
 /// Called from the control reactor; implementations must only enqueue work.
 pub type Report = Arc<dyn Fn(u32, Vec<wire::RailMapping>) + Send + Sync>;
 
-/// Managed-mode bindings from the embedded cluster-control service.
+/// Managed-mode bindings from the embedded authority service.
 #[derive(Clone)]
 pub struct Managed {
     /// Elected endpoints refreshed by discovery; read on every connection checkout.
@@ -138,12 +140,16 @@ pub struct Snapshot {
     /// Shared immutable topology retained by in-flight operations.
     pub membership: std::sync::Arc<crate::topology::Membership>,
 
-    /// Cache namespaces admitted by this publication.
-    pub caches: Vec<CacheDefinition>,
+    /// Cache namespaces admitted by this publication, indexed by id.
+    pub caches: Arc<Caches>,
 
     /// Node pools of `caches`, as validated from the publication. Placement
     /// reads them through `membership`.
-    pub pools: Vec<racer_control_wire::Pool>,
+    pub pools: Vec<racer_wire::control::Pool>,
+
+    /// Cluster-wide page size, fixed for the life of the process: a publication that
+    /// changes it is rejected.
+    pub page_size: racer_wire::object::PageSize,
 
     content_hash: [u8; 32],
 
@@ -158,8 +164,9 @@ impl Snapshot {
             cluster: ClusterId("test".into()),
             sequence: PublicationSequence(1),
             membership,
-            caches: Vec::new(),
+            caches: Arc::default(),
             pools: Vec::new(),
+            page_size: racer_wire::object::PageSize::DEFAULT,
             content_hash: [0; 32],
             membership_hash: [0; 32],
         }
@@ -186,33 +193,46 @@ pub trait CacheTransition {
 /// No removal history is needed: an absent UID/key is a miss. Reintroducing a UID
 /// denotes the same immutable namespace; a different namespace requires a new UID.
 pub struct Availability {
-    publications: Arc<Published<Snapshot>>,
+    publications: Arc<PublicationCell<Snapshot>>,
 
     keys: Rc<Keyring>,
+
+    /// Worker-local copy of the published cache index, reloaded on epoch change.
+    /// It holds only the cache index, never the membership, so idle workers do
+    /// not consume publication grace capacity.
+    caches: cell::EpochCopy<Arc<Caches>>,
 }
 
 impl Availability {
     /// Bind admission checks to current publications and worker-local keys.
-    pub fn new(publications: Arc<Published<Snapshot>>, keys: Rc<Keyring>) -> Self {
-        Self { publications, keys }
+    pub fn new(publications: Arc<PublicationCell<Snapshot>>, keys: Rc<Keyring>) -> Self {
+        Self {
+            publications,
+            keys,
+            caches: cell::EpochCopy::default(),
+        }
+    }
+
+    /// Run `f` over the current cache definition, if published. Takes no lock
+    /// and no shared reference count while the publication is unchanged.
+    #[inline]
+    fn with_cache<R>(&self, cache: &CacheId, f: impl FnOnce(Option<&CacheDefinition>) -> R) -> R {
+        self.caches.with(
+            &self.publications,
+            |s| s.caches.clone(),
+            |caches| f(caches.and_then(|c| c.find(cache))),
+        )
     }
 
     /// Check whether the current publication admits this cache.
     pub fn cache(&self, cache: &CacheId) -> bool {
-        self.publications
-            .current()
-            .is_ok_and(|s| s.is_some_and(|s| s.caches.iter().any(|c| &c.id == cache)))
+        self.with_cache(cache, |c| c.is_some())
     }
 
     /// Published mode of this cache. Unpublished caches report `Cached`; the
     /// other admission checks already refuse them.
-    pub fn mode(&self, cache: &CacheId) -> racer_control_wire::CacheMode {
-        self.publications
-            .current()
-            .ok()
-            .flatten()
-            .and_then(|s| s.caches.iter().find(|c| &c.id == cache).map(|c| c.mode))
-            .unwrap_or_default()
+    pub fn mode(&self, cache: &CacheId) -> racer_wire::control::CacheMode {
+        self.with_cache(cache, |c| c.map(|c| c.mode).unwrap_or_default())
     }
 
     /// Whether this cache retains no pages or metadata.
@@ -222,23 +242,89 @@ impl Availability {
 
     /// Require both cache admission and an active page key for metadata reads.
     pub fn metadata(&self, cache: &CacheId) -> bool {
-        self.cache(cache) && self.keys.active(cache, KeyPurpose::Page).is_ok()
+        self.cache(cache) && self.keys.has_active(cache, KeyPurpose::Page)
+    }
+
+    /// Generation of the installed keyring, which changes whenever keys are
+    /// added or retired. Retention sweeps restart when it changes.
+    pub fn key_generation(&self) -> Option<u64> {
+        self.keys.generation().ok().flatten()
     }
 
     /// Require cache admission and the exact key needed by a stored page.
     pub fn page(&self, cache: &CacheId, key: KeyId) -> bool {
-        self.cache(cache) && self.keys.lease(Some(cache), key, KeyPurpose::Page).is_ok()
+        self.cache(cache) && self.keys.admits(cache, key, KeyPurpose::Page)
+    }
+}
+
+/// Published cache definitions in publication order, with an id index built
+/// once at publication so lookups by id are logarithmic, not linear.
+#[derive(Debug, Default)]
+pub struct Caches {
+    definitions: Vec<CacheDefinition>,
+
+    /// Positions into `definitions`, sorted by cache id.
+    by_id: Vec<u32>,
+}
+
+impl Caches {
+    /// Index definitions by id.
+    pub fn new(definitions: Vec<CacheDefinition>) -> Self {
+        let mut by_id: Vec<u32> = (0..definitions.len() as u32).collect();
+        by_id.sort_by(|a, b| {
+            definitions[*a as usize]
+                .id
+                .cmp(&definitions[*b as usize].id)
+        });
+        Self { definitions, by_id }
+    }
+
+    /// Position of `cache` in publication order.
+    pub fn position(&self, cache: &CacheId) -> Option<usize> {
+        self.by_id
+            .binary_search_by(|i| self.definitions[*i as usize].id.cmp(cache))
+            .ok()
+            .map(|i| self.by_id[i] as usize)
+    }
+
+    /// Definition of `cache`, if published.
+    pub fn find(&self, cache: &CacheId) -> Option<&CacheDefinition> {
+        self.position(cache).map(|i| &self.definitions[i])
+    }
+
+    /// Whether `cache` is published.
+    pub fn contains(&self, cache: &CacheId) -> bool {
+        self.position(cache).is_some()
+    }
+}
+
+impl std::ops::Deref for Caches {
+    type Target = [CacheDefinition];
+
+    fn deref(&self) -> &[CacheDefinition] {
+        &self.definitions
+    }
+}
+
+impl From<Vec<CacheDefinition>> for Caches {
+    fn from(definitions: Vec<CacheDefinition>) -> Self {
+        Self::new(definitions)
     }
 }
 
 /// Publish a single-node fixture admitting the supplied cache namespaces.
 #[cfg(test)]
-pub(crate) fn for_caches(keys: Rc<Keyring>, caches: Vec<CacheId>) -> Rc<Availability> {
+pub(crate) fn for_caches(
+    env: &racer_io::Env,
+    keys: Rc<Keyring>,
+    caches: Vec<CacheId>,
+) -> Rc<Availability> {
     for_cache_modes(
+        env,
         keys,
         caches
             .into_iter()
-            .map(|id| (id, racer_control_wire::CacheMode::Cached))
+            .map(|id| (id, racer_wire::control::CacheMode::Cached))
             .collect(),
     )
 }
@@ -246,14 +332,15 @@ pub(crate) fn for_caches(keys: Rc<Keyring>, caches: Vec<CacheId>) -> Rc<Availabi
 /// Publish a single-node fixture admitting the supplied caches in their modes.
 #[cfg(test)]
 pub(crate) fn for_cache_modes(
+    env: &racer_io::Env,
     keys: Rc<Keyring>,
-    caches: Vec<(CacheId, racer_control_wire::CacheMode)>,
+    caches: Vec<(CacheId, racer_wire::control::CacheMode)>,
 ) -> Rc<Availability> {
     let availability = Rc::new(Availability::new(
-        Arc::new(Published::new(Snapshot::retention(1))),
+        Arc::new(PublicationCell::new(Snapshot::retention(1))),
         keys,
     ));
-    availability.publish_modes(caches);
+    availability.publish_modes(env, caches);
     availability
 }
 
@@ -261,50 +348,59 @@ pub(crate) fn for_cache_modes(
 impl Availability {
     /// Publish the next single-node fixture with `caches` in their modes, as a
     /// controller would after a ClusterCache edit.
-    pub(crate) fn publish_modes(&self, caches: Vec<(CacheId, racer_control_wire::CacheMode)>) {
-        use racer_control_wire::SCHEMA_VERSION;
+    pub(crate) fn publish_modes(
+        &self,
+        env: &racer_io::Env,
+        caches: Vec<(CacheId, racer_wire::control::CacheMode)>,
+    ) {
+        use racer_wire::control::SCHEMA_VERSION;
         let sequence = self
             .publications
             .current()
             .unwrap()
             .map_or(1, |snapshot| snapshot.sequence.0 + 1);
-        PublicationTarget::new(self.keys.cluster().clone(), self.publications.clone())
-            .apply(
-                Publication {
-                    pools: Vec::new(),
-                    schema_version: SCHEMA_VERSION,
-                    cluster: self.keys.cluster().clone(),
-                    sequence: PublicationSequence(sequence),
-                    membership_version: racer_control_wire::MembershipVersion(1),
-                    members: vec![wire::Member {
-                        node: self.keys.node().clone(),
-                        shares: std::num::NonZeroU32::new(1).unwrap(),
-                        peer_endpoint: "127.0.0.1:7443".into(),
-                        rails: vec![],
-                        site: String::new(),
-                    }],
-                    caches: caches
-                        .into_iter()
-                        .enumerate()
-                        .map(|(i, (id, mode))| {
-                            let name = format!("rotation-{i}");
-                            let (client_socket, origin_socket) =
-                                wire::canonical_socket_paths(&name).unwrap();
-                            CacheDefinition {
-                                id,
-                                name,
-                                client_socket,
-                                origin_socket,
-                                priority: racer_control_wire::DEFAULT_PRIORITY,
-                                mode,
-                                origin: None,
-                            }
-                        })
-                        .collect(),
-                }
-                .with_default_pool(),
-            )
-            .unwrap();
+        PublicationTarget::new(
+            self.keys.cluster().clone(),
+            self.publications.clone(),
+            env.ctx.clock.clone(),
+        )
+        .apply(
+            Publication {
+                pools: Vec::new(),
+                schema_version: SCHEMA_VERSION,
+                cluster: self.keys.cluster().clone(),
+                sequence: PublicationSequence(sequence),
+                membership_version: racer_wire::control::MembershipVersion(1),
+                members: vec![wire::Member {
+                    node: self.keys.node().clone(),
+                    shares: std::num::NonZeroU32::new(1).unwrap(),
+                    peer_endpoint: "127.0.0.1:7443".into(),
+                    rails: vec![],
+                    site: String::new(),
+                }],
+                caches: caches
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, (id, mode))| {
+                        let name = format!("rotation-{i}");
+                        let (client_socket, origin_socket) =
+                            wire::canonical_socket_paths(&name).unwrap();
+                        CacheDefinition {
+                            id,
+                            name,
+                            client_socket,
+                            origin_socket,
+                            priority: racer_wire::control::DEFAULT_PRIORITY,
+                            mode,
+                            origin: None,
+                        }
+                    })
+                    .collect(),
+                page_size: racer_wire::object::PageSize::DEFAULT,
+            }
+            .with_default_pool(),
+        )
+        .unwrap();
     }
 }
 
@@ -321,9 +417,7 @@ pub struct ReactorControlIo {
 impl secure::Host for ReactorControlIo {
     type Scope = RequestScope;
 
-    type Budget = crate::runtime::AdmissionBudget;
-
-    fn reactor(&self) -> &uring_runtime::reactor::Reactor<Self::Scope, Self::Budget> {
+    fn reactor(&self) -> &racer_io::scoped::Reactor<Self::Scope> {
         &self.reactor
     }
 
@@ -331,7 +425,11 @@ impl secure::Host for ReactorControlIo {
         parent.check()?;
         let mut scope = parent.clone();
         let mut id = [0; 16];
-        uring_runtime::environment::fill_random(&mut id).map_err(|_| Error::Io)?;
+        self.reactor
+            .ctx()
+            .rng
+            .fill(&mut id)
+            .map_err(|_| Error::Io)?;
         scope.request = crate::model::RequestId(id);
         Ok(scope)
     }
@@ -345,23 +443,31 @@ impl secure::Host for ReactorControlIo {
     }
 }
 
-impl controlplane::Host for ReactorControlIo {
-    fn sleep<'a>(&'a self, until: Instant, scope: &'a RequestScope) -> Operation<'a, ()> {
-        ReactorControlIo::sleep(self, until, scope)
-    }
-
-    fn classify(&self, error: Error) -> controlplane::FailureClass {
-        match error {
-            Error::Cancelled => controlplane::FailureClass::Cancelled,
-            Error::Unauthorized => controlplane::FailureClass::Rejected,
-            error if transient(error) => controlplane::FailureClass::Retry,
-            _ => controlplane::FailureClass::Permanent,
-        }
-    }
-}
-
 impl rest::Io for ReactorControlIo {
-    type FileBytes = uring_runtime::reactor::filesystem::ReadBuffer;
+    type Reactor = crate::runtime::Reactor;
+
+    type Charge = flow_control::Charge<crate::admission::AdmissionPolicy>;
+
+    fn reactor(&self) -> Rc<crate::runtime::Reactor> {
+        self.reactor.clone()
+    }
+
+    fn charge(&self, bytes: usize) -> Result<Self::Charge> {
+        self.reactor
+            .admission()
+            .reserve(None, crate::admission::ResourceClass::RequestContext, bytes)
+            .map_err(Into::into)
+    }
+
+    fn ctx(&self) -> &racer_io::WorkerCtx {
+        self.reactor.ctx()
+    }
+
+    fn sim(&self) -> Option<racer_io::sim::SimOs> {
+        self.reactor.sim_os()
+    }
+
+    type FileBytes = racer_io::scoped::fs::ReadBuffer;
 
     type Error = Error;
 
@@ -370,9 +476,15 @@ impl rest::Io for ReactorControlIo {
     type Lease = crate::admission::ConnectionReservation;
 
     fn lease(&self) -> Result<Option<Rc<Self::Lease>>> {
-        self.reactor
-            .reserve_connection(crate::admission::ResourceClass::ControlConnection)
-            .map(|lease| Some(Rc::new(lease)))
+        let lease = Rc::new(
+            self.reactor
+                .reserve_connection(crate::admission::ResourceClass::ControlConnection)?,
+        );
+        #[cfg(test)]
+        if let Some(probe) = &self.connect_probe {
+            probe.observe(&lease);
+        }
+        Ok(Some(lease))
     }
 
     fn ready<'a>(
@@ -384,18 +496,6 @@ impl rest::Io for ReactorControlIo {
         scope: &'a RequestScope,
     ) -> Operation<'a, ()> {
         Box::pin(async move {
-            #[cfg(test)]
-            if let Some(probe) = &self.connect_probe
-                && probe.suppress(&fd, read, write, &lease, scope)?
-            {
-                let mut wait = scope.clone();
-                if probe.mode == "parent" {
-                    wait.deadline.0 = probe.parent_deadline;
-                }
-                return self
-                    .sleep(wait.deadline.0 + std::time::Duration::from_millis(1), &wait)
-                    .await;
-            }
             let interest =
                 if read { libc::POLLIN } else { 0 } | if write { libc::POLLOUT } else { 0 };
             self.reactor
@@ -448,18 +548,7 @@ impl ReactorControlIo {
 
     /// Wait until an absolute deadline under the caller's cancellation scope.
     pub fn sleep<'a>(&'a self, until: Instant, scope: &'a RequestScope) -> Operation<'a, ()> {
-        Box::pin(async move {
-            use uring_runtime::reactor::timer::SleepMode;
-            #[cfg(test)]
-            let mode = if uring_runtime::environment::simulation_seed().is_some() {
-                SleepMode::ClockPoll
-            } else {
-                SleepMode::Kernel
-            };
-            #[cfg(not(test))]
-            let mode = SleepMode::Kernel;
-            self.reactor.sleep_until(until, mode, scope).await
-        })
+        Box::pin(async move { self.reactor.sleep_until(until, scope).await })
     }
 }
 
@@ -484,29 +573,32 @@ pub(crate) mod tests {
     //! Control transport, publication, and durable identity lifecycle scenarios.
 
     use super::*;
+    use crate::enrollment::{Enrollment, LocalSigningIdentity};
     use crate::test_support::enrollment as testing;
     use crate::test_support::projected_file;
     use futures::TryFutureExt;
-    use racer_control_wire::canonical_socket_paths;
-    use racer_control_wire::decode_enrollment_request;
-    use racer_control_wire::decode_publication;
-    use racer_control_wire::encode_enrollment_request;
-    use racer_control_wire::encode_publication;
-    use racer_control_wire::validate_definitions;
-    use racer_crypto::enrollment::{Enrollment, LocalSigningIdentity};
+    use racer_wire::control::canonical_socket_paths;
+    use racer_wire::control::decode_enrollment_request;
+    use racer_wire::control::decode_publication;
+    use racer_wire::control::encode_enrollment_request;
+    use racer_wire::control::encode_publication;
+    use racer_wire::control::validate_definitions;
     use std::num::NonZeroU32;
 
     #[test]
     fn socket_readiness_errno_is_transient_but_file_errno_is_not() {
-        use uring_runtime::reactor::simulation::{Fault, Simulation};
-        use wire_codec::rest::Io;
-        let sim = Simulation::new();
-        let _os = sim.enter();
-        let r = Rc::new(Reactor::new(Rc::new(flow_control::Quotas::new(
-            crate::admission::AdmissionPolicy::new(
-                crate::test_support::cluster::config(false).limits,
-            ),
-        ))));
+        use crate::control::rest::Io;
+        use racer_io::sim::{Fault, SimOs};
+        let sim = SimOs::new();
+        let env = racer_io::Env::sim(&sim, racer_io::WorkerCtx::host());
+        let r = Rc::new(Reactor::new(
+            Rc::new(flow_control::Quotas::new(
+                crate::admission::AdmissionPolicy::new(
+                    crate::test_support::cluster::config(false).limits,
+                ),
+            )),
+            &env,
+        ));
         let io = ReactorControlIo::new(r.clone());
         let scope = testing::scope();
         let (socket, _peer) = sim.socket_pair();
@@ -525,17 +617,20 @@ pub(crate) mod tests {
     #[test]
     fn atomic_write_preserves_cause_and_requires_reconciliation_after_publication() {
         use crate::error::PublicationCause;
+        use racer_io::sim::{Fault, SimOs};
         use std::future::Future;
         use std::task::{Context, Poll};
-        use uring_runtime::reactor::simulation::{Fault, Simulation};
         for case in ["success", "write", "rename", "cancel-rename", "sync"] {
-            let sim = Simulation::new();
-            let _os = sim.enter();
-            let r = Reactor::new(Rc::new(flow_control::Quotas::new(
-                crate::admission::AdmissionPolicy::new(
-                    crate::test_support::cluster::config(false).limits,
-                ),
-            )));
+            let sim = SimOs::new();
+            let env = racer_io::Env::sim(&sim, racer_io::WorkerCtx::host());
+            let r = Reactor::new(
+                Rc::new(flow_control::Quotas::new(
+                    crate::admission::AdmissionPolicy::new(
+                        crate::test_support::cluster::config(false).limits,
+                    ),
+                )),
+                &env,
+            );
             let scope = testing::scope();
             sim.write_file(Path::new("/identity"), b"old").unwrap();
             sim.disk().sync_all().unwrap();
@@ -584,7 +679,7 @@ pub(crate) mod tests {
             let expected = match case {
                 "write" => Err(Error::Os(libc::ENOSPC)),
                 "rename" => Err(Error::RenameUncertain(PublicationCause::Os(libc::EIO))),
-                "cancel-rename" => Err(Error::RenameUncertain(PublicationCause::Cancelled)),
+                "cancel-rename" => Err(Error::RenameUncertain(PublicationCause::Canceled)),
                 "sync" => Err(Error::PublishedNotDurable(PublicationCause::Os(libc::EIO))),
                 _ => Ok(()),
             };
@@ -633,21 +728,23 @@ pub(crate) mod tests {
         fn bundle_installation_is_idempotent_and_rejects_rollback() {
             use racer_crypto::identity::KeyEpochs;
             use racer_crypto::identity::KeyPurpose;
-            let publication = racer_control_wire::decode_publication(include_bytes!(concat!(
+            let publication = racer_wire::control::decode_publication(include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/control-wire/testdata/publication.json"
+                "/wire/testdata/publication.json"
             )))
             .unwrap();
             let keys = Rc::new(Keyring::new(
                 publication.cluster,
                 publication.members[0].node.clone(),
-                Arc::new(KeyEpochs::default()),
+                Arc::new(KeyEpochs::with_clock(crate::enrollment::wall_clock(
+                    &racer_io::Clock::host(),
+                ))),
             ));
             let installer = BundleInstaller::new(keys.clone());
             let (ca, _) = testing::ca();
             let mut bundle = wire::decode_bundle(include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/control-wire/testdata/bundle.json"
+                "/wire/testdata/bundle.json"
             )))
             .unwrap();
             bundle.generation = BundleGeneration(2);
@@ -693,7 +790,8 @@ pub(crate) mod tests {
         }
         #[test]
         fn coherent_projection_rejects_partial_and_escaping_links() {
-            let Some(reactor) = testing::reactor() else {
+            let env = racer_io::Env::host();
+            let Some(reactor) = testing::reactor(&env) else {
                 return;
             };
             let d = testing::Directory::new();
@@ -715,7 +813,7 @@ pub(crate) mod tests {
                 d.0.join("epoch-a/bundle.json"),
                 include_bytes!(concat!(
                     env!("CARGO_MANIFEST_DIR"),
-                    "/control-wire/testdata/bundle.json"
+                    "/wire/testdata/bundle.json"
                 )),
             )
             .unwrap();
@@ -740,9 +838,9 @@ pub(crate) mod tests {
         use super::session::Session;
         use super::*;
         use crate::test_support::enrollment as testing;
-        use racer_control_wire::ClusterId;
-        use racer_control_wire::NodeId;
         use racer_crypto::identity::KeyEpochs;
+        use racer_wire::control::ClusterId;
+        use racer_wire::control::NodeId;
         use std::sync::Arc;
         #[test]
         fn busy_guard_rejects_overlap_without_releasing_the_owner() {
@@ -763,7 +861,9 @@ pub(crate) mod tests {
             let keys = Rc::new(Keyring::new(
                 cluster.clone(),
                 NodeId("22222222-2222-4222-8222-222222222222".into()),
-                Arc::new(KeyEpochs::default()),
+                Arc::new(KeyEpochs::with_clock(crate::enrollment::wall_clock(
+                    &racer_io::Clock::host(),
+                ))),
             ));
             Session::new(
                 ControlEndpoint {
@@ -783,18 +883,23 @@ pub(crate) mod tests {
                 BundleInstaller::new(keys),
                 Rc::new(PublicationTarget::new(
                     cluster,
-                    Arc::new(Published::new(Snapshot::retention(2))),
+                    Arc::new(PublicationCell::new(Snapshot::retention(2))),
+                    racer_io::Clock::host(),
                 )),
             )
         }
         #[test]
         fn lagging_replica_retries_preserve_state_without_enrollment() {
-            session::tests::lagging_replica();
+            let env = racer_io::Env::host();
+            session::tests::lagging_replica(&env);
         }
         #[test]
         fn changed_binding_latches_restart_across_abandoned_or_failed_persistence() {
+            let env = racer_io::Env::host();
             for abandon in [false, true] {
-                let Some(r) = testing::reactor() else { return };
+                let Some(r) = testing::reactor(&env) else {
+                    return;
+                };
                 let d = testing::Directory::new();
                 let client = client(&d, r.clone());
                 let (ca, key) = testing::ca();
@@ -874,11 +979,13 @@ pub(crate) mod tests {
         }
         #[test]
         fn status_policy_backoff_and_shutdown_are_explicit() {
-            session::tests::status_retry_shutdown();
+            let env = racer_io::Env::host();
+            session::tests::status_retry_shutdown(&env);
         }
         #[test]
         fn keyring_cursor_status_and_retry_are_independent() {
-            session::tests::independent_keyring();
+            let env = racer_io::Env::host();
+            session::tests::independent_keyring(&env);
         }
     }
 
@@ -886,14 +993,14 @@ pub(crate) mod tests {
         //! Shared control wire codecs preserve application contract validation.
 
         use super::*;
-        use racer_control_wire::decode_bundle;
-        use racer_control_wire::decode_enrollment_response;
-        use racer_control_wire::encode_bundle;
-        use racer_control_wire::encode_enrollment_response;
+        use racer_wire::control::decode_bundle;
+        use racer_wire::control::decode_enrollment_response;
+        use racer_wire::control::encode_bundle;
+        use racer_wire::control::encode_enrollment_response;
 
         #[test]
         fn application_roundtrips_preserve_exact_wire_records() {
-            const ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/control-wire/testdata/");
+            const ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/wire/testdata/");
             for name in [
                 "publication.json",
                 "bootstrap-request.json",
@@ -962,7 +1069,7 @@ pub(crate) mod tests {
         fn replacement_definitions_and_socket_paths_are_validated() {
             let mut defs = decode_publication(include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/control-wire/testdata/publication.json"
+                "/wire/testdata/publication.json"
             )))
             .unwrap()
             .caches;
@@ -999,7 +1106,8 @@ pub(crate) mod tests {
         use super::*;
         #[test]
         fn preparation_reuses_same_version_without_reading_member_weights() {
-            let store = store(2);
+            let env = racer_io::Env::host();
+            let store = store(&env, 2);
             let first = store.apply(publication(1)).unwrap();
             let before = crate::topology::scored_members();
             // Cache-only: pools, and so membership, are unchanged.
@@ -1023,13 +1131,10 @@ pub(crate) mod tests {
 
         #[test]
         fn background_preparation_keeps_cpu_work_off_the_polling_thread() {
-            let store = store(2);
+            let env = racer_io::Env::host();
+            let store = store(&env, 2);
             let before = crate::topology::scored_members();
-            let job = controlplane::Target::<publication::PublicationCodec>::prepare(
-                &store,
-                Arc::new(publication(1)),
-            )
-            .unwrap();
+            let job = PublicationTarget::projection(&store, Arc::new(publication(1))).unwrap();
             let prepared = std::thread::spawn(job).join().unwrap().unwrap();
             assert_eq!(
                 crate::topology::scored_members(),
@@ -1043,12 +1148,14 @@ pub(crate) mod tests {
 
         #[test]
         fn background_preparation_admission_and_canceled_scope_are_bounded() {
-            preparation_fence(false);
+            let env = racer_io::Env::host();
+            preparation_fence(&env, false);
         }
 
         #[test]
         fn canceled_background_wait_keeps_job_admission_until_completion() {
-            preparation_fence(true);
+            let env = racer_io::Env::host();
+            preparation_fence(&env, true);
         }
 
         /// Domain projection gate proving that Sync, not the adapter, owns job admission.
@@ -1060,20 +1167,18 @@ pub(crate) mod tests {
             submissions: Rc<Cell<usize>>,
         }
 
-        impl controlplane::Target<publication::PublicationCodec> for GatedTarget {
-            type Prepared = Arc<Snapshot>;
-
+        impl crate::control::poll::Install for GatedTarget {
             fn prepare(
                 &self,
-                document: Arc<Publication>,
-            ) -> Result<controlplane::feed::Preparation<Self::Prepared, Error>> {
+                document: crate::control::poll::Document,
+            ) -> Result<crate::control::poll::Preparation> {
                 self.submissions.set(self.submissions.get() + 1);
                 let wait = self
                     .wait
                     .borrow_mut()
                     .take()
                     .expect("only one job admitted");
-                let job = controlplane::Target::prepare(&self.target, document)?;
+                let job = self.target.prepare(document)?;
                 Ok(Box::new(move || {
                     wait.recv_timeout(Duration::from_secs(5))
                         .map_err(|_| Error::DeadlineExceeded)?;
@@ -1081,26 +1186,29 @@ pub(crate) mod tests {
                 }))
             }
 
-            fn install(&self, document: &Publication, prepared: &Arc<Snapshot>) -> Result<()> {
-                controlplane::Target::install(&self.target, document, prepared)
+            fn install(
+                &self,
+                document: &crate::control::poll::Document,
+                prepared: &crate::control::poll::Prepared,
+            ) -> Result<()> {
+                self.target.install(document, prepared)
             }
         }
 
         /// One full publication followed by a held long poll.
         struct PublicationSource(Cell<bool>);
 
-        impl controlplane::feed::Source<ReactorControlIo> for PublicationSource {
+        impl crate::control::poll::Fetch for PublicationSource {
             fn get<'a>(
                 &'a self,
                 _: &'a str,
                 _: Option<&'a str>,
                 _: usize,
                 scope: &'a RequestScope,
-            ) -> uring_runtime::Operation<'a, Response, controlplane::feed::FetchError<Error>>
-            {
+            ) -> racer_io::Operation<'a, Response, crate::control::poll::FetchError> {
                 Box::pin(async move {
                     if self.0.replace(true) {
-                        uring_runtime::drivers::poll_scoped(scope, |_| {
+                        crate::drivers::poll_scoped(scope, |_| {
                             std::task::Poll::<Result<Response>>::Pending
                         })
                         .await
@@ -1119,36 +1227,36 @@ pub(crate) mod tests {
         }
 
         /// Cancel before or during a turn and fence the retained finite CPU closure.
-        fn preparation_fence(cancel_wait: bool) {
+        fn preparation_fence(env: &racer_io::Env, cancel_wait: bool) {
             use std::future::Future;
-            let clock = uring_runtime::environment::SimulationClock::new(407);
-            let _time = clock.environment(0).enter();
-            let sim = uring_runtime::reactor::simulation::Simulation::new();
-            let _os = sim.enter();
-            let reactor = Rc::new(Reactor::new(Rc::new(flow_control::Quotas::new(
-                crate::admission::AdmissionPolicy::new(
-                    crate::test_support::cluster::config(false).limits,
-                ),
-            ))));
-            let target = store(2);
+            let clock = racer_io::SimClock::new(407);
+            let sim_env = clock.ctx(0);
+            let env = racer_io::Env::new(env.driver.clone(), sim_env.clone());
+            let sim_ctx = sim_env.clone();
+            let sim = racer_io::sim::SimOs::new();
+            let env = racer_io::Env::sim(&sim, env.ctx.clone());
+            let reactor = Rc::new(Reactor::new(
+                Rc::new(flow_control::Quotas::new(
+                    crate::admission::AdmissionPolicy::new(
+                        crate::test_support::cluster::config(false).limits,
+                    ),
+                )),
+                &env,
+            ));
+            let target = store(&env, 2);
             let published = target.published.clone();
             let submissions = Rc::new(Cell::new(0));
             let (release, wait) = std::sync::mpsc::channel();
-            let mut sync = controlplane::Sync::new(
+            let mut sync = crate::control::poll::Poll::new(
                 Rc::new(ReactorControlIo::new(reactor.clone())),
-                controlplane::Feed::new(
-                    publication::PublicationCodec,
-                    wire::SNAPSHOT_PATH.into(),
-                    wire::MAX_PUBLICATION_BYTES,
-                )
-                .unwrap(),
-                PublicationSource(Cell::new(false)),
-                GatedTarget {
+                crate::control::poll::Doc::Publication,
+                Box::new(PublicationSource(Cell::new(false))),
+                Box::new(GatedTarget {
                     target,
                     wait: RefCell::new(Some(wait)),
                     submissions: submissions.clone(),
-                },
-                controlplane::feed::Schedule {
+                }),
+                crate::control::poll::Schedule {
                     turn: Duration::from_secs(5),
                     tick: Duration::from_millis(1),
                     retry_min: Duration::from_millis(1),
@@ -1156,9 +1264,10 @@ pub(crate) mod tests {
                 },
             )
             .unwrap();
-            let scope = RequestScope::new(
+            let scope = RequestScope::on(
+                &sim_ctx.clock,
                 crate::model::RequestId([7; 16]),
-                uring_runtime::environment::now() + Duration::from_secs(10),
+                sim_ctx.clock.now() + Duration::from_secs(10),
             )
             .unwrap();
             testing::drive(&reactor, Box::pin(sync.turn(&scope))).unwrap();
@@ -1172,24 +1281,25 @@ pub(crate) mod tests {
                 scope.cancel().unwrap();
                 assert!(matches!(
                     turn.as_mut().poll(&mut cx),
-                    std::task::Poll::Ready(Err(Error::Cancelled))
+                    std::task::Poll::Ready(Err(Error::Canceled))
                 ));
             } else {
                 scope.cancel().unwrap();
                 assert_eq!(
                     testing::drive(&reactor, Box::pin(sync.turn(&scope))),
-                    Err(Error::Cancelled)
+                    Err(Error::Canceled)
                 );
             }
             assert_eq!(submissions.get(), 1);
             assert_eq!(
                 testing::drive(&reactor, Box::pin(sync.shutdown(&scope))),
-                Err(Error::Cancelled)
+                Err(Error::Canceled)
             );
             release.send(()).unwrap();
-            let shutdown_scope = RequestScope::new(
+            let shutdown_scope = RequestScope::on(
+                &sim_ctx.clock,
                 crate::model::RequestId([8; 16]),
-                uring_runtime::environment::now() + Duration::from_secs(10),
+                sim_ctx.clock.now() + Duration::from_secs(10),
             )
             .unwrap();
             let mut shutdown = Box::pin(sync.shutdown(&shutdown_scope));
@@ -1212,7 +1322,7 @@ pub(crate) mod tests {
         fn publication(sequence: u64) -> Publication {
             let mut p = decode_publication(include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/control-wire/testdata/publication.json"
+                "/wire/testdata/publication.json"
             )))
             .unwrap();
             p.sequence.0 = sequence;
@@ -1225,10 +1335,11 @@ pub(crate) mod tests {
             }
             p
         }
-        fn store(retained: usize) -> PublicationTarget {
+        fn store(env: &racer_io::Env, retained: usize) -> PublicationTarget {
             PublicationTarget::new(
                 publication(1).cluster,
-                Arc::new(Published::new(Snapshot::retention(retained))),
+                Arc::new(PublicationCell::new(Snapshot::retention(retained))),
+                env.ctx.clock.clone(),
             )
         }
         fn membership(sequence: u64, version: u64) -> Publication {
@@ -1238,14 +1349,15 @@ pub(crate) mod tests {
         }
         #[test]
         fn default_two_old_generations_resolve_without_local_request_pins() {
-            let store = store(2);
+            let env = racer_io::Env::host();
+            let store = store(&env, 2);
             for version in 1..20 {
                 store.apply(membership(version, version)).unwrap();
                 for old in version.saturating_sub(2).max(1)..=version {
                     assert_eq!(
                         store
                             .published
-                            .resolve(old, uring_runtime::environment::now())
+                            .resolve(old, racer_io::Clock::host().now())
                             .unwrap()
                             .unwrap()
                             .version
@@ -1257,7 +1369,7 @@ pub(crate) mod tests {
                     assert!(
                         store
                             .published
-                            .resolve(version - 3, uring_runtime::environment::now())
+                            .resolve(version - 3, racer_io::Clock::host().now())
                             .unwrap()
                             .is_none()
                     );
@@ -1265,8 +1377,24 @@ pub(crate) mod tests {
             }
         }
         #[test]
+        fn page_size_is_adopted_once_and_never_changed() {
+            let env = racer_io::Env::host();
+            let store = store(&env, 2);
+            let mut first = publication(1);
+            first.page_size = racer_wire::object::PageSize::new(64 << 10).unwrap();
+            assert_eq!(store.apply(first).unwrap().page_size.get(), 64 << 10);
+            assert!(matches!(
+                store.apply(publication(2)),
+                Err(Error::InvalidConfiguration)
+            ));
+            let mut same = publication(3);
+            same.page_size = racer_wire::object::PageSize::new(64 << 10).unwrap();
+            assert_eq!(store.apply(same).unwrap().page_size.get(), 64 << 10);
+        }
+        #[test]
         fn cache_only_history_uses_one_slot_and_weak_registry_stays_bounded() {
-            let store = store(0);
+            let env = racer_io::Env::host();
+            let store = store(&env, 0);
             let first = store.apply(publication(1)).unwrap();
             let mut history = vec![first.clone()];
             for sequence in 2..40 {
@@ -1278,7 +1406,7 @@ pub(crate) mod tests {
                 assert!(
                     store
                         .published
-                        .resolve(2, uring_runtime::environment::now())
+                        .resolve(2, racer_io::Clock::host().now())
                         .unwrap()
                         .is_none()
                 );
@@ -1295,14 +1423,14 @@ pub(crate) mod tests {
                 assert!(
                     store
                         .published
-                        .resolve(version, uring_runtime::environment::now())
+                        .resolve(version, racer_io::Clock::host().now())
                         .unwrap()
                         .is_some()
                 );
                 assert!(
                     store
                         .published
-                        .resolve(version - 1, uring_runtime::environment::now())
+                        .resolve(version - 1, racer_io::Clock::host().now())
                         .unwrap()
                         .is_none()
                 );
@@ -1310,7 +1438,8 @@ pub(crate) mod tests {
         }
         #[test]
         fn delayed_thread_lease_blocks_admission_until_release() {
-            let store = store(1);
+            let env = racer_io::Env::host();
+            let store = store(&env, 1);
             let published = store.published.clone();
             store.apply(publication(1)).unwrap();
             let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -1320,7 +1449,7 @@ pub(crate) mod tests {
                 ready_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
                 let incoming = published
-                    .resolve(1, uring_runtime::environment::now())
+                    .resolve(1, racer_io::Clock::host().now())
                     .unwrap()
                     .unwrap();
                 assert!(Arc::ptr_eq(&snapshot.membership, &incoming));
@@ -1338,7 +1467,8 @@ pub(crate) mod tests {
         }
         #[test]
         fn atomic_replay_rollback_and_leased_history() {
-            let store = store(1);
+            let env = racer_io::Env::host();
+            let store = store(&env, 1);
             let first = store.apply(publication(1)).unwrap();
             assert!(Arc::ptr_eq(&first, &store.apply(publication(1)).unwrap()));
             let mut changed = publication(1);
@@ -1365,7 +1495,8 @@ pub(crate) mod tests {
         }
         #[test]
         fn site_changes_require_new_membership_and_preserve_leased_history() {
-            let store = store(3);
+            let env = racer_io::Env::host();
+            let store = store(&env, 3);
             let old = store.apply(publication(1)).unwrap();
             let mut next = publication(2);
             next.members[0].site = "site1".into();
@@ -1389,6 +1520,7 @@ pub(crate) mod tests {
         }
         #[test]
         fn staged_resources_commit_only_on_accepted_replacement() {
+            let env = racer_io::Env::host();
             struct Transition(Rc<std::cell::Cell<usize>>);
             impl CacheTransition for Transition {
                 fn commit(self: Box<Self>) {
@@ -1396,7 +1528,7 @@ pub(crate) mod tests {
                 }
             }
             let committed = Rc::new(std::cell::Cell::new(0));
-            let store = store(0);
+            let store = store(&env, 0);
             let publish = |p| store.apply_staged(p, Some(Box::new(Transition(committed.clone()))));
             let first = publish(publication(1)).unwrap();
             assert_eq!(committed.get(), 1);
@@ -1410,10 +1542,10 @@ pub(crate) mod tests {
         /// Same-version races cannot swap topology allocations or commit resources.
         #[test]
         fn stale_projection_and_foreign_cluster_leave_publication_unchanged() {
-            use controlplane::Target;
-            let target = store(2);
+            let env = racer_io::Env::host();
+            let target = store(&env, 2);
             target.apply(publication(1)).unwrap();
-            let old_job = target.prepare(Arc::new(membership(3, 2))).unwrap();
+            let old_job = target.projection(Arc::new(membership(3, 2))).unwrap();
             let current = target.apply(membership(2, 2)).unwrap();
             let stale = old_job().unwrap();
             assert!(!Arc::ptr_eq(&current.membership, &stale.membership));
@@ -1425,8 +1557,11 @@ pub(crate) mod tests {
             let mut foreign = membership(3, 3);
             foreign.cluster = ClusterId("00000000-0000-4000-8000-000000000001".into());
             assert!(matches!(target.project(foreign), Err(Error::Unauthorized)));
-            let other =
-                PublicationTarget::new(ClusterId("foreign".into()), target.published.clone());
+            let other = PublicationTarget::new(
+                ClusterId("foreign".into()),
+                target.published.clone(),
+                racer_io::Clock::host(),
+            );
             assert!(matches!(
                 other.accept(current.clone(), None),
                 Err(Error::Unauthorized)
@@ -1437,17 +1572,22 @@ pub(crate) mod tests {
         /// Domain topology byte estimates and configured grace deadlines reach Published.
         #[test]
         fn domain_grace_retention_honors_bytes_time_and_external_pins() {
-            let probe = store(2).project(publication(1)).unwrap();
+            let env = racer_io::Env::host();
+            let probe = store(&env, 2).project(publication(1)).unwrap();
             let bytes = probe.membership.retained_bytes();
             assert!(bytes > 0);
             for budget in [0, bytes] {
                 let mut policy = Snapshot::retention(2);
                 policy.grace_bytes = budget;
-                let published = Arc::new(Published::new(policy));
-                let target = PublicationTarget::new(publication(1).cluster, published.clone());
+                let published = Arc::new(PublicationCell::new(policy));
+                let target = PublicationTarget::new(
+                    publication(1).cluster,
+                    published.clone(),
+                    racer_io::Clock::host(),
+                );
                 target.apply(publication(1)).unwrap();
                 target.apply(membership(2, 2)).unwrap();
-                let now = uring_runtime::environment::now();
+                let now = racer_io::Clock::host().now();
                 let held = published.resolve(1, now).unwrap();
                 assert_eq!(held.is_some(), budget >= bytes);
                 let expired = now + Duration::from_secs(31);
@@ -1466,7 +1606,6 @@ pub(crate) mod tests {
 
         use super::*;
         use crate::test_support::enrollment as testing;
-        use std::cell::Cell;
         use std::cell::RefCell;
         use std::io::Read;
         use std::io::Write;
@@ -1600,62 +1739,35 @@ pub(crate) mod tests {
             (endpoint, server)
         }
 
-        /// Observe and suppress first-writable readiness on the real reactor adapter.
+        /// Count connection attempts through the real adapter's admission hook.
         pub(crate) struct ConnectProbe {
-            calls: Cell<usize>,
-
-            held: RefCell<Option<std::rc::Weak<Descriptor>>>,
-
             leases: RefCell<Vec<std::rc::Weak<crate::admission::ConnectionReservation>>>,
 
             pub(crate) addresses: [SocketAddr; 2],
-
-            pub(crate) mode: &'static str,
-
-            pub(crate) parent_deadline: Instant,
         }
 
         impl ConnectProbe {
-            /// Hold the first connect attempt and observe later address fallback.
-            pub(crate) fn suppress(
-                &self,
-                fd: &Rc<Descriptor>,
-                read: bool,
-                write: bool,
-                lease: &Option<Rc<crate::admission::ConnectionReservation>>,
-                scope: &RequestScope,
-            ) -> Result<bool> {
-                self.leases
-                    .borrow_mut()
-                    .push(Rc::downgrade(lease.as_ref().expect("admission lease")));
-                if !read && write {
-                    let call = self.calls.get();
-                    self.calls.set(call + 1);
-                    if call == 0 {
-                        *self.held.borrow_mut() = Some(Rc::downgrade(fd));
-                        assert!(scope.deadline.0 < self.parent_deadline);
-                        if self.mode == "cancel" {
-                            scope.cancel()?;
-                        }
-                        // Suppress a real socket's writable notification, not Simulation::connect.
-                        return Ok(true);
-                    }
-                    // Inspect the actual OS socket at the public readiness boundary.
-                    let raw = unsafe { libc::dup(fd.as_raw_fd()) };
-                    assert!(raw >= 0);
-                    let socket = unsafe { std::net::TcpStream::from_raw_fd(raw) };
-                    assert_eq!(socket.peer_addr().unwrap(), self.addresses[1]);
-                }
-                Ok(false)
+            /// Record one connection attempt's admission slot.
+            pub(crate) fn observe(&self, lease: &Rc<crate::admission::ConnectionReservation>) {
+                self.leases.borrow_mut().push(Rc::downgrade(lease));
+            }
+
+            /// Connection attempts admitted so far.
+            fn calls(&self) -> usize {
+                self.leases.borrow().len()
             }
         }
 
+        /// A first address that accepts TCP but never answers TLS gets only its
+        /// share of the deadline; the next address then connects, and
+        /// cancellation or overall expiry ends the attempt with every socket closed.
         #[test]
-        fn real_connect_readiness_blackhole_yields_to_next_address_and_cleans_fds() {
+        fn real_connect_blackhole_yields_to_next_address_and_cleans_fds() {
             use std::task::Context;
             use std::task::Poll;
+            let env = racer_io::Env::host();
             for mode in ["local", "cancel", "parent"] {
-                let Some(reactor) = testing::reactor() else {
+                let Some(reactor) = testing::reactor(&env) else {
                     return;
                 };
                 let d = testing::Directory::new();
@@ -1666,6 +1778,9 @@ pub(crate) mod tests {
                 let first = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
                 let healthy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
                 let addresses = [first.local_addr().unwrap(), healthy.local_addr().unwrap()];
+                // Outside "local" the second listener stays open but silent,
+                // so both addresses hang until the caller's deadline.
+                let silent = healthy.try_clone().unwrap();
                 let server = (mode == "local").then(|| {
                     std::thread::spawn(move || {
                         let mut socket = accept(&healthy);
@@ -1686,18 +1801,15 @@ pub(crate) mod tests {
                         assert_disconnected(&mut socket);
                     })
                 });
-                let scope = RequestScope::new(
+                let started = Instant::now();
+                let scope = RequestScope::host(
                     crate::model::RequestId([7; 16]),
-                    Instant::now() + Duration::from_millis(300),
+                    started + Duration::from_millis(400),
                 )
                 .unwrap();
                 let io = Rc::new(ConnectProbe {
-                    calls: Cell::new(0),
-                    held: RefCell::new(None),
                     leases: RefCell::new(Vec::new()),
                     addresses,
-                    mode,
-                    parent_deadline: scope.deadline.0,
                 });
                 let transport = session::transport(&ControlEndpoint {
                     url: "https://localhost".into(),
@@ -1715,6 +1827,9 @@ pub(crate) mod tests {
                         break result;
                     }
                     assert!(Instant::now() < watchdog);
+                    if mode == "cancel" && Instant::now() >= started + Duration::from_millis(50) {
+                        let _ = scope.cancel();
+                    }
                     reactor.poll_budgeted(64).unwrap();
                     reactor.wait(Duration::from_millis(1)).unwrap();
                 };
@@ -1722,29 +1837,34 @@ pub(crate) mod tests {
                 match mode {
                     "local" => {
                         let connection = result.unwrap();
-                        assert_eq!(io.calls.get(), 2);
+                        assert_eq!(io.calls(), 2);
                         assert!(
                             Instant::now() < scope.deadline.0,
                             "TLS retains overall budget"
                         );
                         drop(connection);
                     }
-                    "cancel" => assert!(matches!(result, Err(Error::Cancelled))),
-                    _ => assert!(matches!(result, Err(Error::DeadlineExceeded))),
+                    "cancel" => {
+                        assert!(matches!(result, Err(Error::Canceled)));
+                        assert_eq!(io.calls(), 1);
+                    }
+                    _ => {
+                        assert!(
+                            matches!(result, Err(Error::DeadlineExceeded)),
+                            "{:?}",
+                            result.as_ref().err()
+                        );
+                        assert_eq!(io.calls(), 2);
+                    }
                 }
-                if mode != "local" {
-                    assert_eq!(io.calls.get(), 1);
-                }
-                assert!(io.held.borrow().as_ref().unwrap().upgrade().is_none());
+                transport.close_idle();
                 let mut closed = accept(&first);
                 closed
                     .set_read_timeout(Some(Duration::from_secs(1)))
                     .unwrap();
-                assert_eq!(
-                    closed.read(&mut [0; 1]).unwrap(),
-                    0,
-                    "both failed socket FDs closed"
-                );
+                let mut byte = [0; 1];
+                // The client may have sent its TLS hello before closing.
+                while closed.read(&mut byte).unwrap() != 0 {}
                 assert_eq!(reactor.in_flight(), 0);
                 assert!(
                     io.leases
@@ -1755,6 +1875,7 @@ pub(crate) mod tests {
                 if let Some(server) = server {
                     server.join().unwrap();
                 }
+                drop(silent);
             }
         }
         fn enrolled(
@@ -1765,7 +1886,7 @@ pub(crate) mod tests {
         ) -> LocalSigningIdentity {
             let scope = testing::scope();
             let enrollment = Enrollment::new(
-                racer_control_wire::ClusterId("11111111-1111-4111-8111-111111111111".into()),
+                racer_wire::control::ClusterId("11111111-1111-4111-8111-111111111111".into()),
                 d.0.join("token"),
                 d.0.join("identity"),
                 Rc::new(ReactorControlIo::new(r.clone())),
@@ -1789,7 +1910,10 @@ pub(crate) mod tests {
         }
         #[test]
         fn real_ring_server_auth_and_mutual_tls() {
-            let Some(r) = testing::reactor() else { return };
+            let env = racer_io::Env::host();
+            let Some(r) = testing::reactor(&env) else {
+                return;
+            };
             let d = testing::Directory::new();
             let (ca, ca_key) = testing::ca();
             let identity = enrolled(&r, &d, &ca, &ca_key);
@@ -1880,7 +2004,10 @@ pub(crate) mod tests {
         }
         #[test]
         fn backend_disconnect_recovers_on_fresh_connection_without_circuit() {
-            let Some(r) = testing::reactor() else { return };
+            let env = racer_io::Env::host();
+            let Some(r) = testing::reactor(&env) else {
+                return;
+            };
             let d = testing::Directory::new();
             let (ca, key) = testing::ca();
             let identity = enrolled(&r, &d, &ca, &key);
@@ -1942,8 +2069,11 @@ pub(crate) mod tests {
         }
         #[test]
         fn malformed_delta_base_and_method_are_rejected_before_writing() {
-            session::tests::canonical_delta_and_get_only();
-            let Some(r) = testing::reactor() else { return };
+            let env = racer_io::Env::host();
+            session::tests::canonical_delta_and_get_only(&env);
+            let Some(r) = testing::reactor(&env) else {
+                return;
+            };
             let d = testing::Directory::new();
             let (ca, key) = testing::ca();
             let tls = server_config(&ca, &key, true);
@@ -2030,19 +2160,22 @@ pub(crate) mod tests {
         }
         #[test]
         fn not_yet_valid_identity_is_rejected_before_transport_io() {
-            let Some(r) = testing::reactor() else { return };
+            let env = racer_io::Env::host();
+            let Some(r) = testing::reactor(&env) else {
+                return;
+            };
             let d = testing::Directory::new();
             let (ca, key) = testing::ca();
             let identity = enrolled(&r, &d, &ca, &key);
-            assert!(identity.valid_now());
-            let clock = uring_runtime::environment::SimulationClock::new(17);
-            let environment = clock.environment(1);
+            assert!(identity.valid_at(racer_io::Clock::host().wall_now()));
+            let clock = racer_io::SimClock::new(17);
+            let environment = clock.ctx(1);
             // Roll only the scoped wall clock back after real enrollment. The generic
             // Identity has expiry only; Racer must enforce its not-before policy itself.
             clock.set_wall_time(SystemTime::now() - Duration::from_secs(3600));
-            let _guard = environment.enter();
-            assert!(!identity.valid_now());
-            session::tests::reject_future_identity(identity);
+            let env = racer_io::Env::new(env.driver.clone(), environment.clone());
+            assert!(!identity.valid_at(env.ctx.clock.clone().wall_now()));
+            session::tests::reject_future_identity(&env, identity);
         }
     }
 
@@ -2051,11 +2184,14 @@ pub(crate) mod tests {
 
         #[test]
         fn enrollment_requires_exactly_one_identity_san() {
-            let Some(r) = testing::reactor() else { return };
+            let env = racer_io::Env::host();
+            let Some(r) = testing::reactor(&env) else {
+                return;
+            };
             let d = testing::Directory::new();
             let scope = testing::scope();
             let enrollment = Enrollment::new(
-                racer_control_wire::ClusterId("11111111-1111-4111-8111-111111111111".into()),
+                racer_wire::control::ClusterId("11111111-1111-4111-8111-111111111111".into()),
                 d.0.join("token"),
                 d.0.join("identity"),
                 Rc::new(ReactorControlIo::new(r.clone())),
@@ -2081,7 +2217,7 @@ pub(crate) mod tests {
                 let der =
                     rustls::pki_types::CertificateSigningRequestDer::from(request.csr_der.clone());
                 let mut csr = rcgen::CertificateSigningRequestParams::from_der(&der).unwrap();
-                let now = uring_runtime::environment::wall_now();
+                let now = racer_io::Clock::host().wall_now();
                 csr.params.not_before = (now - Duration::from_secs(1)).into();
                 csr.params.not_after = (now + Duration::from_secs(3600)).into();
                 csr.params.subject_alt_names = vec![
@@ -2104,11 +2240,65 @@ pub(crate) mod tests {
             assert!(testing::drive(&r, enrollment.accept_response(response, &scope)).is_ok());
         }
 
+        /// A chain from an issuer root missing from the current trust roots is
+        /// rejected and flagged as untrusted, the pending request survives, and
+        /// the same response verifies once refreshed roots include that issuer.
+        /// Other certificate policy failures are not flagged.
+        #[test]
+        fn enrollment_from_unknown_issuer_is_flagged_and_retryable_with_new_roots() {
+            let env = racer_io::Env::host();
+            let Some(r) = testing::reactor(&env) else {
+                return;
+            };
+            let d = testing::Directory::new();
+            let scope = testing::scope();
+            let enrollment = Enrollment::new(
+                racer_wire::control::ClusterId("11111111-1111-4111-8111-111111111111".into()),
+                d.0.join("token"),
+                d.0.join("identity"),
+                Rc::new(ReactorControlIo::new(r.clone())),
+            );
+            let request = testing::drive(
+                &r,
+                enrollment.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope),
+            )
+            .unwrap();
+            let (old, _) = testing::ca();
+            let (new, new_key) = testing::ca();
+            enrollment
+                .set_peer_trust_roots(vec![old.der().to_vec()])
+                .unwrap();
+            let response = testing::issue(&request, &new, &new_key, OLD_NODE);
+            assert!(matches!(
+                testing::drive(&r, enrollment.accept_response(response.clone(), &scope)),
+                Err(Error::Unauthorized)
+            ));
+            assert!(enrollment.take_untrusted_chain());
+            assert!(!enrollment.take_untrusted_chain());
+            // A trusted issuer with a mismatched cluster is not a trust lag.
+            let mut foreign = response.clone();
+            foreign.cluster =
+                racer_wire::control::ClusterId("44444444-4444-4444-8444-444444444444".into());
+            enrollment
+                .set_peer_trust_roots(vec![old.der().to_vec(), new.der().to_vec()])
+                .unwrap();
+            assert!(matches!(
+                testing::drive(&r, enrollment.accept_response(foreign, &scope)),
+                Err(Error::Unauthorized)
+            ));
+            assert!(!enrollment.take_untrusted_chain());
+            assert!(testing::drive(&r, enrollment.accept_response(response, &scope)).is_ok());
+            assert!(!enrollment.take_untrusted_chain());
+        }
+
         #[test]
         fn enrollment_and_renewal_refresh_authenticated_physical_inventory() {
             use rdma_verbs::simulation::Device;
             use rdma_verbs::simulation::Simulation;
-            let Some(r) = testing::reactor() else { return };
+            let env = racer_io::Env::host();
+            let Some(r) = testing::reactor(&env) else {
+                return;
+            };
             let d = testing::Directory::new();
             let scope = testing::scope();
             let io = Rc::new(ReactorControlIo::new(r.clone()));
@@ -2118,7 +2308,7 @@ pub(crate) mod tests {
                 io.clone(),
             );
             let enrollment = Enrollment::new(
-                racer_control_wire::ClusterId("11111111-1111-4111-8111-111111111111".into()),
+                racer_wire::control::ClusterId("11111111-1111-4111-8111-111111111111".into()),
                 d.0.join("token"),
                 d.0.join("identity"),
                 io,
@@ -2171,7 +2361,10 @@ pub(crate) mod tests {
 
         #[test]
         fn renewal_tracks_short_issued_lifetime_and_preserves_default() {
-            let Some(r) = testing::reactor() else { return };
+            let env = racer_io::Env::host();
+            let Some(r) = testing::reactor(&env) else {
+                return;
+            };
             for (lifetime, due) in [(120, 80), (86400, 57600), (86700, 57600)] {
                 let d = testing::Directory::new();
                 let e = Enrollment::new(
@@ -2207,26 +2400,30 @@ pub(crate) mod tests {
                 csr.params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
                 response.certificate_chain = vec![csr.signed_by(&ca, &key).unwrap().der().to_vec()];
                 let identity = testing::drive(&r, e.accept_response(response, &scope)).unwrap();
-                let clock = uring_runtime::environment::SimulationClock::new_at(
+                let clock = racer_io::SimClock::new_at(
                     51,
                     std::time::Instant::now(),
                     wall + Duration::from_secs(due - 1),
                 );
-                let _time = clock.environment(1).enter();
-                assert!(!identity.renewal_due());
+                let sim_env = clock.ctx(1);
+                let sim_ctx = sim_env.clone();
+                assert!(!identity.renewal_due_at(sim_ctx.clock.clone().wall_now()));
                 clock.advance(Duration::from_secs(1));
-                assert!(identity.renewal_due());
-                assert!(identity.valid_now());
+                assert!(identity.renewal_due_at(sim_ctx.clock.clone().wall_now()));
+                assert!(identity.valid_at(sim_ctx.clock.clone().wall_now()));
                 clock.advance(Duration::from_secs(lifetime - due));
-                assert!(!identity.valid_now());
-                assert!(identity.renewal_due());
+                assert!(!identity.valid_at(sim_ctx.clock.clone().wall_now()));
+                assert!(identity.renewal_due_at(sim_ctx.clock.clone().wall_now()));
             }
         }
 
         #[test]
         fn authenticated_replacement_preserves_cluster_key_and_correlation_checks() {
-            let Some(r) = testing::reactor() else { return };
+            let env = racer_io::Env::host();
             for expired in [false, true] {
+                let Some(r) = testing::reactor(&env) else {
+                    return;
+                };
                 let d = testing::Directory::new();
                 let e = Enrollment::new(
                     ClusterId("11111111-1111-4111-8111-111111111111".into()),
@@ -2245,12 +2442,33 @@ pub(crate) mod tests {
                     e.accept_response(testing::issue(&request, &ca, &key, OLD_NODE), &scope),
                 )
                 .unwrap();
-                let clock = uring_runtime::environment::SimulationClock::new_at(
+                let clock = racer_io::SimClock::new_at(
                     31,
                     std::time::Instant::now(),
                     SystemTime::now() + Duration::from_secs(172800),
                 );
-                let _time = expired.then(|| clock.environment(1).enter());
+                // The expired case continues on a reactor built on a clock two
+                // days ahead, over the same enrollment files.
+                let env = if expired {
+                    racer_io::Env::new(env.driver.clone(), clock.ctx(1))
+                } else {
+                    env.clone()
+                };
+                let (r, e) = if expired {
+                    let Some(r) = testing::reactor(&env) else {
+                        return;
+                    };
+                    let e = Enrollment::new(
+                        e.cluster().clone(),
+                        d.0.join("token"),
+                        d.0.join("identity"),
+                        Rc::new(ReactorControlIo::new(r.clone())),
+                    );
+                    e.set_peer_trust_roots(vec![ca.der().to_vec()]).unwrap();
+                    (r, e)
+                } else {
+                    (r, e)
+                };
                 if expired {
                     assert!(
                         testing::drive(&r, e.load_identity(&scope))
@@ -2258,20 +2476,26 @@ pub(crate) mod tests {
                             .is_none()
                     );
                 }
+                // Certificates must be valid at the worker clock that verifies them, which
+                // runs two days ahead of host time in the expired case.
+                let issued_at = r.ctx().clock.wall_now() - Duration::from_secs(1);
+                let issue = |request: &_, ca: &_, key: &_, node: &str| {
+                    testing::issue_at(request, ca, key, node, issued_at)
+                };
                 let old = std::fs::read(d.0.join("identity/identity.json")).unwrap();
                 let request =
                     testing::drive(&r, e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope))
                         .unwrap();
-                let response = testing::issue(&request, &ca, &key, NEW_NODE);
+                let response = issue(&request, &ca, &key, NEW_NODE);
                 let mut wrong_san = response.clone();
                 wrong_san.node = NodeId(OLD_NODE.into());
                 let mut wrong_id = response.clone();
                 wrong_id.enrollment = EnrollmentId(OLD_NODE.into());
                 let mut foreign_request = request.clone();
                 foreign_request.cluster = ClusterId("44444444-4444-4444-8444-444444444444".into());
-                let foreign = testing::issue(&foreign_request, &ca, &key, NEW_NODE);
+                let foreign = issue(&foreign_request, &ca, &key, NEW_NODE);
                 let (rogue_ca, rogue_key) = testing::ca();
-                let rogue = testing::issue(&request, &rogue_ca, &rogue_key, NEW_NODE);
+                let rogue = issue(&request, &rogue_ca, &rogue_key, NEW_NODE);
                 let other = Enrollment::new(
                     e.cluster().clone(),
                     d.0.join("token"),
@@ -2284,7 +2508,7 @@ pub(crate) mod tests {
                 )
                 .unwrap();
                 other_request.enrollment = request.enrollment.clone();
-                let wrong_key = testing::issue(&other_request, &ca, &key, NEW_NODE);
+                let wrong_key = issue(&other_request, &ca, &key, NEW_NODE);
                 for bad in [wrong_san, wrong_id, foreign, rogue, wrong_key] {
                     assert!(matches!(
                         testing::drive(&r, e.accept_response(bad, &scope)),
@@ -2337,7 +2561,10 @@ pub(crate) mod tests {
 
         #[test]
         fn replacement_crash_at_each_completion_recovers_and_reauthenticates() {
-            let Some(r) = testing::reactor() else { return };
+            let env = racer_io::Env::host();
+            let Some(r) = testing::reactor(&env) else {
+                return;
+            };
             let (ca, key) = testing::ca();
             let mut saw_old = false;
             let mut saw_new = false;
@@ -2416,7 +2643,10 @@ pub(crate) mod tests {
 
         #[test]
         fn durable_retry_key_pairing_identity_and_rotation() {
-            let Some(r) = testing::reactor() else { return };
+            let env = racer_io::Env::host();
+            let Some(r) = testing::reactor(&env) else {
+                return;
+            };
             let scope = testing::scope();
             let directory = testing::Directory::new();
             let token = directory.0.join("token");
@@ -2476,8 +2706,8 @@ pub(crate) mod tests {
             assert!(testing::drive(&r, again.accept_response(wrong, &scope)).is_err());
             assert!(directory.0.join("identity/pending.json").exists());
             let identity = testing::drive(&r, again.accept_response(response, &scope)).unwrap();
-            assert!(identity.valid_now());
-            assert!(!identity.renewal_due());
+            assert!(identity.valid_at(racer_io::Clock::host().wall_now()));
+            assert!(!identity.renewal_due_at(racer_io::Clock::host().wall_now()));
             assert_eq!(
                 testing::drive(&r, again.load_identity(&scope))
                     .unwrap()
@@ -2513,7 +2743,10 @@ pub(crate) mod tests {
         fn durable_rail_journal_prevents_restart_renumbering_and_corruption_fails_closed() {
             use rdma_verbs::simulation::Device;
             use rdma_verbs::simulation::Simulation;
-            let Some(r) = testing::reactor() else { return };
+            let env = racer_io::Env::host();
+            let Some(r) = testing::reactor(&env) else {
+                return;
+            };
             let scope = testing::scope();
             let directory = testing::Directory::new();
             let make = || {
@@ -2561,39 +2794,56 @@ pub(crate) mod tests {
         #[test]
         fn saturated_rail_journal_still_persists_and_enrolls_known_ports() {
             use crate::rdma::MAX_JOURNAL_BYTES;
-            use racer_control_wire::RailId;
-            use racer_control_wire::RailMapping;
-            let Some(r) = testing::reactor() else { return };
+            use racer_wire::control::RailId;
+            let env = racer_io::Env::host();
+            let Some(r) = testing::reactor(&env) else {
+                return;
+            };
             let scope = testing::scope();
             let directory = testing::Directory::new();
             let inventory: Arc<crate::rdma::Inventory> = Arc::new(Default::default());
             use rdma_verbs::simulation::Device;
             use rdma_verbs::simulation::Simulation;
             let name = |i| format!("{i:04}{}", "x".repeat(59));
-            for batch in 0..20 {
-                inventory
-                    .update(
-                        (batch * 64..(batch + 1) * 64)
-                            .map(|i| RailMapping {
-                                device: name(i),
-                                port: 1,
-                                rail: RailId(0),
-                                gid: Some([1; 16]),
-                                numa_node: None,
-                            })
-                            .collect(),
-                    )
-                    .unwrap();
-                assert!(inventory.reservations().unwrap().len() <= MAX_JOURNAL_BYTES);
+            // Hot-plug reuses withdrawn rails, so only a restored journal
+            // can sit at the byte bound.
+            let mut bytes = 0;
+            let mut rails: Vec<_> = (0..1024)
+                .map(|i| (name(i), 1u8, i as u16))
+                .take_while(|e| {
+                    bytes += serde_json::to_vec(e).unwrap().len() + 1;
+                    bytes + 40 < MAX_JOURNAL_BYTES
+                })
+                .collect();
+            // Top up with a shorter name so a longer replacement cannot fit.
+            let encoded =
+                |rails: &Vec<(String, u8, u16)>| serde_json::to_vec(rails).unwrap().len() + 22;
+            for len in (1..=63).rev() {
+                let mut topped = rails.clone();
+                topped.push(("y".repeat(len), 1u8, rails.len() as u16));
+                if encoded(&topped) <= MAX_JOURNAL_BYTES {
+                    rails = topped;
+                    break;
+                }
             }
+            inventory
+                .restore(
+                    format!(
+                        r#"{{"version":2,"rails":{}}}"#,
+                        serde_json::to_string(&rails).unwrap()
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+            assert!(inventory.reservations().unwrap().len() <= MAX_JOURNAL_BYTES);
             let expected_journal = inventory.reservations().unwrap();
             let sim = Simulation::new()
                 .with_devices(vec![
                     Device::new(name(0), [2; 16]),
-                    Device::new(name(2000), [3; 16]),
+                    Device::new(format!("2000{}", "\"".repeat(59)), [3; 16]),
                 ])
                 .unwrap();
-            let _environment = sim.enter();
+            let _devices = sim.enter();
             let make = || {
                 let io = Rc::new(ReactorControlIo::new(r.clone()));
                 let e = Enrollment::new(
@@ -2625,7 +2875,10 @@ pub(crate) mod tests {
         }
         #[test]
         fn rejects_symlinked_identity_and_insecure_modes() {
-            let Some(r) = testing::reactor() else { return };
+            let env = racer_io::Env::host();
+            let Some(r) = testing::reactor(&env) else {
+                return;
+            };
             let scope = testing::scope();
             use std::os::unix::fs::PermissionsExt;
             use std::os::unix::fs::symlink;
@@ -2673,10 +2926,10 @@ pub(crate) mod tests {
         use crate::test_support::enrollment as testing;
         #[test]
         fn secure_adapters_preserve_token_symlinks_identity_rejection_and_errors() {
-            use uring_runtime::reactor::simulation::Simulation;
-            let sim = Simulation::new();
-            let _environment = sim.enter();
-            let r = testing::reactor().unwrap();
+            use racer_io::sim::SimOs;
+            let sim = SimOs::new();
+            let env = racer_io::Env::sim(&sim, racer_io::WorkerCtx::host());
+            let r = testing::reactor(&env).unwrap();
             let scope = testing::scope();
             sim.write_file(Path::new("/token-data"), b"token").unwrap();
             sim.symlink(Path::new("token-data"), Path::new("/token"))
@@ -2749,7 +3002,8 @@ pub(crate) mod tests {
         #[test]
         fn enrollment_creates_private_child_beneath_kubelet_host_path() {
             use std::os::unix::fs::PermissionsExt;
-            let Some(r) = testing::reactor() else {
+            let env = racer_io::Env::host();
+            let Some(r) = testing::reactor(&env) else {
                 return;
             };
             let d = testing::Directory::new();
@@ -2759,7 +3013,7 @@ pub(crate) mod tests {
             let scope = testing::scope();
             let enrollment = |path| {
                 Enrollment::new(
-                    racer_control_wire::ClusterId("11111111-1111-4111-8111-111111111111".into()),
+                    racer_wire::control::ClusterId("11111111-1111-4111-8111-111111111111".into()),
                     d.0.join("token"),
                     path,
                     Rc::new(ReactorControlIo::new(r.clone())),
@@ -2813,7 +3067,8 @@ pub(crate) mod tests {
         }
         #[test]
         fn canceled_replacement_never_exposes_partial_state_and_retry_fences_late_work() {
-            let Some(r) = testing::reactor() else {
+            let env = racer_io::Env::host();
+            let Some(r) = testing::reactor(&env) else {
                 return;
             };
             let d = testing::Directory::new();
@@ -2886,7 +3141,8 @@ pub(crate) mod tests {
         }
         #[test]
         fn canceled_replacement_at_each_submission_boundary_is_complete_or_old() {
-            let Some(r) = testing::reactor() else {
+            let env = racer_io::Env::host();
+            let Some(r) = testing::reactor(&env) else {
                 return;
             };
             let d = testing::Directory::new();
@@ -2944,13 +3200,14 @@ pub(crate) mod tests {
         }
         #[test]
         fn real_ring_enrollment_durability_projection_and_abandoned_retry() {
-            let Some(r) = testing::reactor() else {
+            let env = racer_io::Env::host();
+            let Some(r) = testing::reactor(&env) else {
                 return;
             };
             let d = testing::Directory::new();
             let scope = testing::scope();
             let e = Enrollment::new(
-                racer_control_wire::ClusterId("11111111-1111-4111-8111-111111111111".into()),
+                racer_wire::control::ClusterId("11111111-1111-4111-8111-111111111111".into()),
                 d.0.join("token"),
                 d.0.join("identity"),
                 Rc::new(ReactorControlIo::new(r.clone())),
@@ -3043,5 +3300,39 @@ pub(crate) mod tests {
             );
             assert_eq!(r.in_flight(), 0);
         }
+    }
+}
+
+#[cfg(test)]
+mod caches_tests {
+    //! Indexed cache lookup agrees with publication order.
+
+    use super::*;
+
+    fn definition(id: &str, priority: u16) -> CacheDefinition {
+        CacheDefinition {
+            id: CacheId(id.into()),
+            name: id.into(),
+            client_socket: PathBuf::new(),
+            origin_socket: PathBuf::new(),
+            priority,
+            mode: racer_wire::control::CacheMode::default(),
+            origin: None,
+        }
+    }
+
+    #[test]
+    fn lookup_by_id_preserves_publication_order() {
+        let caches = Caches::new(vec![
+            definition("c", 0),
+            definition("a", 1),
+            definition("b", 2),
+        ]);
+        assert_eq!(caches.position(&CacheId("a".into())), Some(1));
+        assert_eq!(caches.find(&CacheId("b".into())).unwrap().priority, 2);
+        assert!(caches.contains(&CacheId("c".into())));
+        assert!(!caches.contains(&CacheId("d".into())));
+        assert_eq!(caches[0].id, CacheId("c".into()));
+        assert!(!Caches::default().contains(&CacheId("a".into())));
     }
 }

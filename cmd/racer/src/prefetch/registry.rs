@@ -13,9 +13,9 @@ use super::api::{
 };
 use super::metrics::{Counter, Outcome};
 use super::{Config, Priority, REFS_PAGE};
-use crate::model::{CacheKey, ObjectId, ObjectVersion, PAGE_BYTES, StrongEtag, VersionMetadata};
-use racer_control_wire::{CacheId, NodeId};
-use racer_object_wire::prefetch::{ErrorCode, PrefetchError, RefsFilter};
+use crate::model::{CacheKey, ObjectId, ObjectVersion, PageSize, StrongEtag, VersionMetadata};
+use racer_wire::control::{CacheId, NodeId};
+use racer_wire::object::prefetch::{ErrorCode, PrefetchError, RefsFilter};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -37,7 +37,20 @@ pub struct UnitKey {
 /// Request context a unit's fill uses. Kept in memory only.
 pub struct UnitContext {
     pub metadata: Option<String>,
-    pub authorization: Option<Arc<Zeroizing<Vec<u8>>>>,
+    pub authorization: Credential,
+}
+
+/// A ticket's origin credential (`Authorization` header), kept in memory only. `None` is a
+/// ticket without one: its fills carry no credential.
+pub type Credential = Option<Arc<Zeroizing<Vec<u8>>>>;
+
+/// Whether two credentials are the same value.
+fn same_credential(a: &Credential, b: &Credential) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b) || a.as_slice() == b.as_slice(),
+        _ => false,
+    }
 }
 
 /// The result of resolving one ref's version at submit.
@@ -90,19 +103,27 @@ impl UnitState {
     }
 }
 
+/// Credentials belong to tickets, not units: a fill uses the credential of the
+/// highest-priority interested ticket whose credential this unit has not seen
+/// rejected, so a ticket is never served with another ticket's credential
+/// unless that ticket is the one being filled for. An origin refusal fails
+/// only the tickets holding the refused credential; the unit is retried with
+/// the next distinct credential among the remaining tickets, each distinct
+/// credential at most once.
 struct Unit {
     metadata: VersionMetadata,
-    context: Arc<UnitContext>,
+    /// The first interested ref's origin metadata.
+    ref_metadata: Option<String>,
     interest: BTreeSet<TicketKey>,
+    /// The credential of the in-flight fill.
+    credential: Option<Credential>,
+    /// Credentials the origin refused for this unit.
+    rejected: Vec<Credential>,
     state: UnitState,
     attempts: u32,
     not_before: Option<Instant>,
     owner: Option<NodeId>,
     dispatcher: Option<TicketKey>,
-}
-
-fn page_bytes() -> u64 {
-    PAGE_BYTES
 }
 
 /// One ref after version resolution.
@@ -120,6 +141,11 @@ struct Ticket {
     cache: CacheId,
     id: String,
     priority: Priority,
+    /// Replaced by every accepted PUT.
+    authorization: Credential,
+    /// Units the origin refused this ticket's credential for; they fail only
+    /// this ticket's refs.
+    rejected: std::collections::HashSet<UnitKey>,
     generation: u64,
     sequence: u64,
     hash: [u8; 32],
@@ -172,6 +198,8 @@ pub enum PutCheck {
 /// Ticket and unit state for one node.
 pub struct Registry {
     config: Config,
+    /// Wall time for ticket timestamps.
+    clock: racer_io::Clock,
     tickets: BTreeMap<TicketKey, Ticket>,
     units: HashMap<UnitKey, Unit>,
     rotation: [VecDeque<TicketKey>; 3],
@@ -180,19 +208,23 @@ pub struct Registry {
     rng: u64,
     events: Vec<CounterEvent>,
     finished: Vec<(Priority, Outcome)>,
+    /// Cluster page size refs are cut at.
+    page: PageSize,
 }
 
 /// Wall-clock milliseconds for status timestamps.
-pub fn wall_ms() -> u64 {
-    uring_runtime::environment::wall_now()
+pub fn wall_ms(clock: &racer_io::Clock) -> u64 {
+    clock
+        .wall_now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis().min(u128::from(u64::MAX)) as u64)
 }
 
 impl Registry {
-    pub fn new(config: Config, seed: u64) -> Self {
+    pub fn new(config: Config, seed: u64, clock: racer_io::Clock) -> Self {
         Self {
             config,
+            clock,
             tickets: BTreeMap::new(),
             units: HashMap::new(),
             rotation: Default::default(),
@@ -200,7 +232,14 @@ impl Registry {
             rng: seed | 1,
             events: Vec::new(),
             finished: Vec::new(),
+            page: PageSize::DEFAULT,
         }
+    }
+
+    /// Cut refs into pages of `size`, the cluster page size. Set before the
+    /// first ticket; a cluster never changes its page size once adopted.
+    pub fn set_page_size(&mut self, size: PageSize) {
+        self.page = size;
     }
 
     pub fn configure(&mut self, config: Config) {
@@ -254,7 +293,7 @@ impl Registry {
                 .map(|t| t.priority)
                 .min()
                 .unwrap_or_default();
-            queued[priority.index()] += page_bytes();
+            queued[priority.index()] += self.page.get();
         }
         (queued, tickets)
     }
@@ -270,6 +309,7 @@ impl Registry {
         cache: &CacheId,
         id: &str,
         spec: &Spec,
+        authorization: &Credential,
         now: Instant,
     ) -> Result<PutCheck, PrefetchError> {
         let key = (cache.clone(), id.to_owned());
@@ -305,9 +345,13 @@ impl Registry {
                         format!("generation {g} sequence {s} was submitted with another payload"),
                     ));
                 }
+                // A rotated credential is accepted: the ticket is applied again with it.
+                if !ticket.released && !same_credential(&ticket.authorization, authorization) {
+                    return Ok(PutCheck::Proceed);
+                }
                 if !ticket.released {
                     ticket.expires_at = now + Duration::from_secs(ticket.ttl_seconds);
-                    ticket.expires_at_ms = wall_ms() + ticket.ttl_seconds * 1000;
+                    ticket.expires_at_ms = wall_ms(&self.clock) + ticket.ttl_seconds * 1000;
                 }
                 return Ok(PutCheck::Replay(Box::new(
                     self.status(cache, id, None, None)?,
@@ -358,16 +402,16 @@ impl Registry {
         id: &str,
         spec: Spec,
         resolved: Vec<Resolution>,
-        authorization: Option<Arc<Zeroizing<Vec<u8>>>>,
+        authorization: Credential,
         now: Instant,
     ) -> Result<(u16, Status), PrefetchError> {
         // Another PUT may have raced the version resolution.
-        if let PutCheck::Replay(status) = self.check_put(cache, id, &spec, now)? {
+        if let PutCheck::Replay(status) = self.check_put(cache, id, &spec, &authorization, now)? {
             return Ok((200, *status));
         }
         let key = (cache.clone(), id.to_owned());
         self.check_limits(&key)?;
-        let wall = wall_ms();
+        let wall = wall_ms(&self.clock);
         let created = !self.tickets.contains_key(&key);
         if let Some(old) = self.tickets.get(&key) {
             let priority = old.priority;
@@ -375,8 +419,7 @@ impl Registry {
         }
         // Normalize refs into page sets.
         let mut refs = Vec::with_capacity(spec.refs.len());
-        let mut contexts: HashMap<Option<String>, Arc<UnitContext>> = HashMap::new();
-        let mut desired: Vec<(UnitKey, VersionMetadata, Arc<UnitContext>)> = Vec::new();
+        let mut desired: Vec<(UnitKey, VersionMetadata, Option<String>)> = Vec::new();
         let mut seen = std::collections::HashSet::new();
         let mut logical = 0u64;
         for (raw, resolution) in spec.refs.iter().zip(resolved) {
@@ -404,24 +447,16 @@ impl Registry {
                             .length
                             .map_or(length, |l| raw.offset.saturating_add(l).min(length));
                         entry.length = end - raw.offset;
-                        entry.pages = raw.offset / PAGE_BYTES..end.div_ceil(PAGE_BYTES);
+                        let page = self.page.get();
+                        entry.pages = raw.offset / page..end.div_ceil(page);
                         logical = logical.saturating_add(entry.length);
-                        let context = contexts
-                            .entry(raw.metadata.clone())
-                            .or_insert_with(|| {
-                                Arc::new(UnitContext {
-                                    metadata: raw.metadata.clone(),
-                                    authorization: authorization.clone(),
-                                })
-                            })
-                            .clone();
                         for page in entry.pages.clone() {
                             let unit = UnitKey {
                                 version: metadata.version.clone(),
                                 page,
                             };
                             if seen.insert(unit.clone()) {
-                                desired.push((unit, metadata.clone(), context.clone()));
+                                desired.push((unit, metadata.clone(), raw.metadata.clone()));
                             }
                         }
                     }
@@ -443,7 +478,7 @@ impl Registry {
             let priority = old.priority;
             for unit in dropped {
                 if self.drop_interest(&key, &unit) {
-                    self.event(Counter::WindowDroppedBytes, priority, page_bytes());
+                    self.event(Counter::WindowDroppedBytes, priority, self.page.get());
                 }
             }
         }
@@ -457,6 +492,8 @@ impl Registry {
             cache: cache.clone(),
             id: id.to_owned(),
             priority: spec.priority,
+            authorization,
+            rejected: std::collections::HashSet::new(),
             generation: spec.generation,
             sequence: spec.sequence,
             hash: spec.hash,
@@ -475,7 +512,7 @@ impl Registry {
             open: 0,
             in_flight_bytes: 0,
             logical_requested: logical,
-            aligned_requested: desired.len() as u64 * page_bytes(),
+            aligned_requested: desired.len() as u64 * self.page.get(),
             already_resident: 0,
             joined: 0,
             fetched: 0,
@@ -501,18 +538,32 @@ impl Registry {
         let priority = ticket.priority;
         self.event(Counter::RequestedBytes, priority, ticket.logical_requested);
         self.event(Counter::AlignedBytes, priority, ticket.aligned_requested);
-        for (unit_key, metadata, context) in desired {
+        for (unit_key, metadata, ref_metadata) in desired {
             let already = kept.contains(&unit_key);
             match self.units.get_mut(&unit_key) {
+                // The origin already refused this credential for the unit.
+                Some(unit)
+                    if unit.state.open()
+                        && unit
+                            .rejected
+                            .iter()
+                            .any(|c| same_credential(c, &ticket.authorization)) =>
+                {
+                    unit.interest.remove(&key);
+                    ticket.rejected.insert(unit_key);
+                }
                 Some(unit) => {
                     unit.interest.insert(key.clone());
                     if unit.state.open() {
                         ticket.open += 1;
                     } else if unit.state == UnitState::Admitted && !already {
-                        ticket.already_resident += page_bytes();
-                        ticket.admitted += page_bytes();
-                        self.events
-                            .push((Counter::AlreadyResidentBytes, priority, page_bytes()));
+                        ticket.already_resident += self.page.get();
+                        ticket.admitted += self.page.get();
+                        self.events.push((
+                            Counter::AlreadyResidentBytes,
+                            priority,
+                            self.page.get(),
+                        ));
                     }
                 }
                 None => {
@@ -520,8 +571,10 @@ impl Registry {
                         unit_key,
                         Unit {
                             metadata,
-                            context,
+                            ref_metadata,
                             interest: BTreeSet::from([key.clone()]),
+                            credential: None,
+                            rejected: Vec::new(),
                             state: UnitState::Queued,
                             attempts: 0,
                             not_before: None,
@@ -529,7 +582,7 @@ impl Registry {
                             dispatcher: None,
                         },
                     );
-                    self.pending_bytes += page_bytes();
+                    self.pending_bytes += self.page.get();
                     ticket.open += 1;
                 }
             }
@@ -575,7 +628,7 @@ impl Registry {
             UnitState::InFlight => false,
             UnitState::Queued => {
                 self.units.remove(unit_key);
-                self.pending_bytes = self.pending_bytes.saturating_sub(page_bytes());
+                self.pending_bytes = self.pending_bytes.saturating_sub(self.page.get());
                 true
             }
             UnitState::Admitted | UnitState::Failed(_) => {
@@ -643,7 +696,7 @@ impl Registry {
         // An idle ticket may always dispatch one page, even under a bound
         // smaller than a page.
         let floor = usize::from(ticket.in_flight_bytes == 0);
-        let room = usize::try_from(budget / page_bytes())
+        let room = usize::try_from(budget / self.page.get())
             .unwrap_or(usize::MAX)
             .max(floor)
             .min(max_pages);
@@ -652,6 +705,8 @@ impl Registry {
         }
         let mut first_queued = None;
         let mut chosen: Vec<UnitKey> = Vec::new();
+        // One batch carries one credential and one origin metadata value.
+        let mut batch_context: Option<(Credential, Option<String>)> = None;
         for (index, unit_key) in ticket
             .units
             .iter()
@@ -675,6 +730,19 @@ impl Registry {
             {
                 continue;
             }
+            let Some(credential) = self.credential_for(unit) else {
+                continue;
+            };
+            match &batch_context {
+                Some((batch_credential, metadata))
+                    if !same_credential(batch_credential, &credential)
+                        || metadata != &unit.ref_metadata =>
+                {
+                    continue;
+                }
+                Some(_) => {}
+                None => batch_context = Some((credential, unit.ref_metadata.clone())),
+            }
             chosen.push(unit_key.clone());
             if chosen.len() >= room {
                 break;
@@ -688,18 +756,23 @@ impl Registry {
         let first = chosen.first()?.clone();
         let unit = self.units.get(&first)?;
         let metadata = unit.metadata.clone();
-        let context = unit.context.clone();
+        let (credential, ref_metadata) = batch_context?;
+        let context = Arc::new(UnitContext {
+            metadata: ref_metadata,
+            authorization: credential.clone(),
+        });
         let mut pages = Vec::with_capacity(chosen.len());
         for unit_key in &chosen {
             let unit = self.units.get_mut(unit_key).expect("chosen unit");
             unit.state = UnitState::InFlight;
             unit.dispatcher = Some(key.clone());
+            unit.credential = Some(credential.clone());
             pages.push(unit_key.page);
         }
         pages.sort_unstable();
         pages.dedup();
         if let Some(ticket) = self.tickets.get_mut(key) {
-            ticket.in_flight_bytes += chosen.len() as u64 * page_bytes();
+            ticket.in_flight_bytes += chosen.len() as u64 * self.page.get();
         }
         Some(Batch {
             dispatcher: key.clone(),
@@ -708,6 +781,70 @@ impl Registry {
             context,
             pages,
         })
+    }
+
+    /// The credential a fill of `unit` uses: that of the highest-priority live
+    /// interested ticket (ties by ticket key). `None` when no ticket can be
+    /// served; `Some(None)` is a fill without a credential.
+    fn credential_for(&self, unit: &Unit) -> Option<Credential> {
+        unit.interest
+            .iter()
+            .filter_map(|key| self.tickets.get(key))
+            .filter(|ticket| !ticket.released)
+            .filter(|ticket| {
+                !unit
+                    .rejected
+                    .iter()
+                    .any(|c| same_credential(c, &ticket.authorization))
+            })
+            .min_by_key(|ticket| ticket.priority)
+            .map(|ticket| ticket.authorization.clone())
+    }
+
+    /// The origin refused the in-flight fill's credential: fail the unit for
+    /// the tickets holding it and keep it queued for the others. Returns false
+    /// when no other ticket is left, so the unit fails as usual.
+    fn reject_credential(&mut self, unit_key: &UnitKey) -> bool {
+        let Some(unit) = self.units.get_mut(unit_key) else {
+            return false;
+        };
+        let Some(used) = unit.credential.take() else {
+            return false;
+        };
+        let refused: Vec<TicketKey> = unit
+            .interest
+            .iter()
+            .filter(|key| {
+                self.tickets
+                    .get(*key)
+                    .is_none_or(|t| t.released || same_credential(&t.authorization, &used))
+            })
+            .cloned()
+            .collect();
+        if refused.len() == unit.interest.len() {
+            return false;
+        }
+        unit.rejected.push(used);
+        for key in &refused {
+            unit.interest.remove(key);
+        }
+        unit.state = UnitState::Queued;
+        unit.not_before = None;
+        let interested: Vec<TicketKey> = unit.interest.iter().cloned().collect();
+        for key in &refused {
+            if let Some(ticket) = self.tickets.get_mut(key) {
+                ticket.rejected.insert(unit_key.clone());
+                ticket.open = ticket.open.saturating_sub(1);
+            }
+            self.settle(key);
+        }
+        for key in interested {
+            if let Some(ticket) = self.tickets.get_mut(&key) {
+                ticket.cursor = 0;
+            }
+            self.schedule(&key);
+        }
+        true
     }
 
     /// Apply one owner answer.
@@ -726,12 +863,15 @@ impl Registry {
         }
         let dispatcher = unit.dispatcher.take();
         if let Some(ticket) = dispatcher.as_ref().and_then(|k| self.tickets.get_mut(k)) {
-            ticket.in_flight_bytes = ticket.in_flight_bytes.saturating_sub(page_bytes());
+            ticket.in_flight_bytes = ticket.in_flight_bytes.saturating_sub(self.page.get());
         }
         let dispatch_priority = dispatcher
             .as_ref()
             .and_then(|k| self.tickets.get(k))
             .map_or(Priority::Normal, |t| t.priority);
+        if outcome == UnitOutcome::Failed(RefError::Forbidden) && self.reject_credential(unit_key) {
+            return;
+        }
         let max_attempts = self.config.max_attempts as u32;
         let next = match outcome {
             UnitOutcome::Admitted | UnitOutcome::Resident => UnitState::Admitted,
@@ -765,7 +905,7 @@ impl Registry {
                         .is_some_and(|u| u.interest.is_empty())
                     {
                         self.units.remove(unit_key);
-                        self.pending_bytes = self.pending_bytes.saturating_sub(page_bytes());
+                        self.pending_bytes = self.pending_bytes.saturating_sub(self.page.get());
                     }
                     return;
                 }
@@ -775,7 +915,7 @@ impl Registry {
         unit.state = next;
         unit.owner = owner;
         unit.not_before = None;
-        self.pending_bytes = self.pending_bytes.saturating_sub(page_bytes());
+        self.pending_bytes = self.pending_bytes.saturating_sub(self.page.get());
         let interested: Vec<TicketKey> = unit.interest.iter().cloned().collect();
         let resident = outcome == UnitOutcome::Resident;
         for key in &interested {
@@ -785,20 +925,20 @@ impl Registry {
             ticket.open = ticket.open.saturating_sub(1);
             let priority = ticket.priority;
             if next == UnitState::Admitted {
-                ticket.admitted += page_bytes();
+                ticket.admitted += self.page.get();
                 let counter = if resident {
-                    ticket.already_resident += page_bytes();
+                    ticket.already_resident += self.page.get();
                     Counter::AlreadyResidentBytes
                 } else if Some(key) == dispatcher.as_ref() {
-                    ticket.fetched += page_bytes();
+                    ticket.fetched += self.page.get();
                     Counter::FetchedBytes
                 } else {
-                    ticket.joined += page_bytes();
+                    ticket.joined += self.page.get();
                     Counter::JoinedBytes
                 };
-                self.events.push((counter, priority, page_bytes()));
+                self.events.push((counter, priority, self.page.get()));
                 self.events
-                    .push((Counter::AdmittedBytes, priority, page_bytes()));
+                    .push((Counter::AdmittedBytes, priority, self.page.get()));
             }
         }
         if interested.is_empty() {
@@ -845,13 +985,13 @@ impl Registry {
             }
         }
         for interested in requeued {
-            self.pending_bytes += page_bytes();
+            self.pending_bytes += self.page.get();
             for key in interested {
                 if let Some(ticket) = self.tickets.get_mut(&key) {
                     ticket.open += 1;
                     ticket.cursor = 0;
                     ticket.finished_recorded = false;
-                    ticket.admitted = ticket.admitted.saturating_sub(page_bytes());
+                    ticket.admitted = ticket.admitted.saturating_sub(self.page.get());
                 }
                 self.schedule(&key);
             }
@@ -893,7 +1033,7 @@ impl Registry {
         let record = !ticket.finished_recorded;
         ticket.canceled = Some(reason);
         ticket.finished_recorded = true;
-        ticket.updated_at_ms = wall_ms();
+        ticket.updated_at_ms = wall_ms(&self.clock);
         let priority = ticket.priority;
         if record {
             self.finished.push((priority, Outcome::Canceled));
@@ -1053,10 +1193,14 @@ impl Registry {
                 };
                 let mut pending = false;
                 for page in entry.pages.clone() {
-                    let unit = self.units.get(&UnitKey {
+                    let unit_key = UnitKey {
                         version: version.clone(),
                         page,
-                    });
+                    };
+                    if ticket.rejected.contains(&unit_key) {
+                        return (RefOutcome::Failed, Some(RefError::Forbidden));
+                    }
+                    let unit = self.units.get(&unit_key);
                     match unit.map(|u| u.state) {
                         Some(UnitState::Failed(error)) => {
                             return (RefOutcome::Failed, Some(error));
@@ -1079,7 +1223,7 @@ impl Registry {
             .iter()
             .zip(&ticket.refs)
             .filter(|((o, _), _)| *o == RefOutcome::Failed)
-            .map(|(_, r)| (r.pages.end - r.pages.start) * page_bytes())
+            .map(|(_, r)| (r.pages.end - r.pages.start) * self.page.get())
             .sum()
     }
 
@@ -1087,10 +1231,14 @@ impl Registry {
         let mut queued = 0;
         let mut in_flight = 0;
         if !ticket.released {
-            for key in &ticket.units {
+            for key in ticket
+                .units
+                .iter()
+                .filter(|k| !ticket.rejected.contains(*k))
+            {
                 match self.units.get(key).map(|u| u.state) {
-                    Some(UnitState::Queued) => queued += page_bytes(),
-                    Some(UnitState::InFlight) => in_flight += page_bytes(),
+                    Some(UnitState::Queued) => queued += self.page.get(),
+                    Some(UnitState::InFlight) => in_flight += self.page.get(),
                     _ => {}
                 }
             }

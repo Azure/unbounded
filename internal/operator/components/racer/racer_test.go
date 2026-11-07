@@ -612,7 +612,7 @@ func TestLegacyControllerMigration(t *testing.T) {
 	require.NotContains(t, ds.Annotations, "unbounded-cloud.io/racer-installation-uid")
 
 	for _, e := range ds.Spec.Template.Spec.Containers[0].Env {
-		require.NotContains(t, []string{"RACER_CLUSTER_ID", "RACER_CONTROL_ENDPOINT", "RACER_TRUST_BUNDLE"}, e.Name)
+		require.NotContains(t, []string{"RACER_CLUSTER_ID", "RACER_CONTROL_ENDPOINT", "RACER_CONTROL_TRUST_BUNDLE"}, e.Name)
 	}
 
 	for _, v := range ds.Spec.Template.Spec.Volumes {

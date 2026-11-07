@@ -1,15 +1,16 @@
 use super::response::response;
 use super::*;
 use crate::config::Limits;
+use crate::model::PAGE_BYTES;
 use crate::model::{CacheKey, ContentType, RequestId};
 use crate::security::OpaqueMetadata;
 use futures::executor::block_on;
-use racer_control_wire::{AzureOriginDefinition, CacheId};
+use racer_io::ring::IoBuffer;
+use racer_wire::control::{AzureOriginDefinition, CacheId};
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
-use uring_runtime::reactor::IoBuffer;
 
 const ETAG: &[u8] = b"\"0x8DC\"";
 
@@ -143,7 +144,7 @@ struct Harness {
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
     limits: Arc<AzureLimits>,
     definition: OriginDefinition,
-    snapshots: Arc<Published<Snapshot>>,
+    snapshots: Arc<PublicationCell<Snapshot>>,
 }
 
 fn harness() -> Harness {
@@ -160,6 +161,8 @@ fn harness() -> Harness {
         queue_entries: n,
         connections_per_neighbor: n,
         client_connections: n,
+        peer_connections: n,
+        outbound_connections: n,
         pipes: n,
         range_window_pages: n,
         header_bytes: NonZeroUsize::new(32768).unwrap(),
@@ -175,7 +178,7 @@ fn harness() -> Harness {
     let fake = Rc::new(Fake::default());
     let tokens = Rc::new(Tokens::default());
     let shared = Arc::new(AzureLimits::default());
-    let snapshots = Arc::new(Published::new(Snapshot::retention(2)));
+    let snapshots = Arc::new(PublicationCell::new(Snapshot::retention(2)));
     let origin = AzureOrigin::new(
         fake.clone(),
         tokens.clone(),
@@ -217,7 +220,7 @@ fn context(key: &str, version: &str) -> OriginContext {
 }
 
 fn scope() -> RequestScope {
-    RequestScope::new(RequestId([1; 16]), Instant::now() + Duration::from_secs(5)).unwrap()
+    RequestScope::host(RequestId([1; 16]), Instant::now() + Duration::from_secs(5)).unwrap()
 }
 
 fn page(context: &OriginContext, number: u64) -> PageId {
@@ -412,7 +415,7 @@ fn bootstrap_small_object_and_version_id() {
     h.blob(200, PAGE_BYTES + 1, None, &[]);
     assert_eq!(
         h.bootstrap(&context("k", "")).map(|_| ()),
-        Err(Error::Internal)
+        Err(Error::BadGateway)
     );
 }
 
@@ -525,13 +528,13 @@ fn page_rejects_version_changes_and_bad_framing() {
         h.blob(206, 5, Some(bad.into()), &[]);
         assert_eq!(
             h.page(&context, 0).map(|_| ()),
-            Err(Error::Internal),
+            Err(Error::BadGateway),
             "{bad}"
         );
     }
     // Content-Length disagrees with the range.
     h.blob(206, 4, range(), &[]);
-    assert_eq!(h.page(&context, 0).map(|_| ()), Err(Error::Internal));
+    assert_eq!(h.page(&context, 0).map(|_| ()), Err(Error::BadGateway));
     // Short body: the connection closed early.
     h.push(206, &fake_head(ETAG), vec![0; 3]);
     assert_eq!(h.page(&context, 0).map(|_| ()), Err(Error::Unavailable));
@@ -539,7 +542,7 @@ fn page_rejects_version_changes_and_bad_framing() {
     h.blob(206, 5, range(), &[("Transfer-Encoding", b"chunked")]);
     assert_eq!(h.page(&context, 0).map(|_| ()), Err(Error::BadGateway));
     h.blob(200, 5, None, &[]);
-    assert_eq!(h.page(&context, 0).map(|_| ()), Err(Error::Internal));
+    assert_eq!(h.page(&context, 0).map(|_| ()), Err(Error::BadGateway));
     h.blob(206, 5, range(), &[("x-ms-access-tier", b"Archive")]);
     assert_eq!(h.page(&context, 0).map(|_| ()), Err(Error::Internal));
     h.blob(206, 5, range(), &[("Content-Encoding", b"gzip")]);
@@ -825,7 +828,7 @@ mod router {
     use crate::origin::router::OriginRouter;
     use crate::read::candidates::CandidatePolicy;
     use crate::topology::{Member, Membership, Placement};
-    use racer_control_wire::{CacheMode, ClusterId, MembershipVersion, NodeId};
+    use racer_wire::control::{CacheMode, ClusterId, MembershipVersion, NodeId};
 
     /// Counts adapter calls; never performs I/O.
     #[derive(Default)]
@@ -867,20 +870,29 @@ mod router {
 
     /// Publish the shared fixture, with an Azure origin when `native`.
     fn publish(h: &Harness, native: bool) -> CacheId {
-        let mut publication = racer_control_wire::decode_publication(include_bytes!(concat!(
+        let mut publication = racer_wire::control::decode_publication(include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/control-wire/testdata/publication.json"
+            "/wire/testdata/publication.json"
         )))
         .unwrap();
         if native {
             publication.caches[0].origin = Some(h.definition.clone());
         }
-        let target = PublicationTarget::new(publication.cluster.clone(), h.snapshots.clone());
+        let target = PublicationTarget::new(
+            publication.cluster.clone(),
+            h.snapshots.clone(),
+            racer_io::Clock::host(),
+        );
         target.apply(publication).unwrap();
         h.snapshots.current().unwrap().unwrap().caches[0].id.clone()
     }
 
-    fn authority(h: &Harness, object: &ObjectId, page: u64) -> OriginAuthority {
+    fn authority(
+        env: &racer_io::Env,
+        h: &Harness,
+        object: &ObjectId,
+        page: u64,
+    ) -> OriginAuthority {
         let node = NodeId("node".into());
         let membership = Arc::new(
             Membership::validate(
@@ -899,16 +911,21 @@ mod router {
             Rc::new(racer_crypto::identity::Keyring::new(
                 ClusterId("cluster".into()),
                 node.clone(),
-                Arc::new(racer_crypto::identity::KeyEpochs::default()),
+                Arc::new(racer_crypto::identity::KeyEpochs::with_clock(
+                    crate::enrollment::wall_clock(&racer_io::Clock::host()),
+                )),
             )),
             h.admission.clone(),
+            racer_io::WorkerCtx::host().rng,
         ));
         CandidatePolicy::new(
             node,
             Rc::new(Placement::new(2)),
-            crate::test_support::NoPeers::requester(),
+            crate::test_support::NoPeers::requester(env),
             credentials,
             h.snapshots.clone(),
+            racer_io::WorkerCtx::host(),
+            std::rc::Rc::new(crate::drivers::DriverQueue::new(1024)),
         )
         .local_authority(
             membership,
@@ -942,18 +959,22 @@ mod router {
     fn new_snapshots_prune_worker_state_once() {
         let h = harness();
         let apply = |native: bool, sequence: u64| {
-            let mut publication = racer_control_wire::decode_publication(include_bytes!(concat!(
+            let mut publication = racer_wire::control::decode_publication(include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/control-wire/testdata/publication.json"
+                "/wire/testdata/publication.json"
             )))
             .unwrap();
-            publication.sequence = racer_control_wire::PublicationSequence(sequence);
+            publication.sequence = racer_wire::control::PublicationSequence(sequence);
             if native {
                 publication.caches[0].origin = Some(h.definition.clone());
             }
-            PublicationTarget::new(publication.cluster.clone(), h.snapshots.clone())
-                .apply(publication)
-                .unwrap();
+            PublicationTarget::new(
+                publication.cluster.clone(),
+                h.snapshots.clone(),
+                racer_io::Clock::host(),
+            )
+            .apply(publication)
+            .unwrap();
             h.snapshots.current().unwrap().unwrap().caches[0].id.clone()
         };
         let object = in_cache(&apply(true, 1)).object;
@@ -973,10 +994,11 @@ mod router {
 
     #[test]
     fn native_caches_use_azure_and_others_use_the_adapter() {
+        let env = racer_io::Env::host();
         let h = harness();
         let cache = publish(&h, true);
         let context = in_cache(&cache);
-        let authority = authority(&h, &context.object, 0);
+        let authority = authority(&env, &h, &context.object, 0);
         let reserve = || {
             h.admission
                 .reserve(Some(&cache), ResourceClass::Plaintext, PAGE_BYTES as usize)
@@ -1014,10 +1036,11 @@ mod router {
 
     #[test]
     fn caches_without_an_origin_use_the_adapter() {
+        let env = racer_io::Env::host();
         let h = harness();
         let cache = publish(&h, false);
         let context = in_cache(&cache);
-        let authority = authority(&h, &context.object, 0);
+        let authority = authority(&env, &h, &context.object, 0);
         let (router, adapter, fake) = router(h, true);
         let _ = block_on(router.metadata(&authority, &context, MetadataSelector::Fresh, &scope()));
         assert_eq!(adapter.0.get(), 1);
@@ -1026,10 +1049,11 @@ mod router {
 
     #[test]
     fn without_azure_every_cache_uses_the_adapter() {
+        let env = racer_io::Env::host();
         let h = harness();
         let cache = publish(&h, true);
         let context = in_cache(&cache);
-        let authority = authority(&h, &context.object, 0);
+        let authority = authority(&env, &h, &context.object, 0);
         let (router, adapter, fake) = router(h, false);
         let _ = block_on(router.metadata(&authority, &context, MetadataSelector::Fresh, &scope()));
         assert_eq!(adapter.0.get(), 1);

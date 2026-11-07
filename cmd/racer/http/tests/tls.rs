@@ -1,8 +1,11 @@
-//! Pooled HTTPS exchanges through kernel TLS and the userspace relay.
+//! Pooled HTTPS exchanges through kernel TLS and userspace TLS.
 use flow_control::{Charge, Policy, Quotas, Rejection};
 use http1::connection::{self, Context as HttpContext, Endpoint as EndpointPolicy, PoolConfig};
 use http1::tls::{TlsClient, TlsMode, rustls};
 use http1::{Codec, Header, MessageHead, StartLine};
+use racer_io::cancel::Cancellation;
+use racer_io::ring::IoBuffer;
+use racer_io::{Scope, ring::SocketAddress};
 use std::{
     future::Future,
     io::{Read, Write},
@@ -14,18 +17,13 @@ use std::{
     task::{Context, Poll, Waker},
     time::{Duration, Instant},
 };
-use uring_runtime::{
-    Scope,
-    environment::{Cancellation, now},
-    reactor::{IoBuffer, SocketAddress},
-};
 
 const PAGE: usize = 16 << 20;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Error {
     Http(http1::Error),
-    Runtime(uring_runtime::Error),
+    Runtime(racer_io::Error),
     Quota(flow_control::Error),
 }
 impl From<http1::Error> for Error {
@@ -33,8 +31,8 @@ impl From<http1::Error> for Error {
         Self::Http(e)
     }
 }
-impl From<uring_runtime::Error> for Error {
-    fn from(e: uring_runtime::Error) -> Self {
+impl From<racer_io::Error> for Error {
+    fn from(e: racer_io::Error) -> Self {
         Self::Runtime(e)
     }
 }
@@ -94,22 +92,22 @@ impl Scope for RequestScope {
     type Error = Error;
 
     fn check(&self) -> Result<()> {
-        if self.cancellation.is_cancelled() {
-            return Err(uring_runtime::Error::Cancelled.into());
+        if self.cancellation.is_canceled() {
+            return Err(racer_io::Error::Canceled.into());
         }
-        if now() >= self.deadline {
-            return Err(uring_runtime::Error::DeadlineExceeded.into());
+        if Instant::now() >= self.deadline {
+            return Err(racer_io::Error::DeadlineExceeded.into());
         }
         Ok(())
     }
 
-    fn cancellation(&self) -> Option<&Cancellation> {
-        Some(&self.cancellation)
+    fn cancel_token(&self) -> Option<&racer_io::CancelToken> {
+        Some(self.cancellation.token())
     }
 }
 fn scope() -> RequestScope {
     RequestScope {
-        deadline: now() + Duration::from_secs(60),
+        deadline: Instant::now() + Duration::from_secs(60),
         cancellation: Cancellation::new().unwrap(),
     }
 }
@@ -153,8 +151,6 @@ impl HttpContext for Caller {
 
     type Scope = RequestScope;
 
-    type Budget = ();
-
     type Reactor = std::rc::Rc<Reactor>;
 
     type Charge = Charge<Limits>;
@@ -179,7 +175,7 @@ impl HttpContext for Caller {
         self.0.is_stopped()
     }
 }
-type Reactor = uring_runtime::reactor::Reactor<RequestScope, ()>;
+type Reactor = racer_io::scoped::Reactor<RequestScope>;
 type Pool = connection::HttpPool<Caller>;
 type Io = connection::HttpIo<Caller>;
 
@@ -194,7 +190,7 @@ fn fixture() -> Fixture {
 }
 fn fixture_with(context: usize) -> Fixture {
     let admission = std::rc::Rc::new(Quotas::new(Limits(context)));
-    let reactor = std::rc::Rc::new(Reactor::new(64, ()));
+    let reactor = std::rc::Rc::new(Reactor::new(64, &racer_io::Env::host()));
     reactor.init().unwrap();
     let pool = Pool::new(
         std::rc::Rc::new(reactor.clone()),
@@ -497,7 +493,7 @@ fn untrusted_certificate_fails_handshake() {
         let result = drive(&fixture.reactor, fixture.pool.checkout(&endpoint, &scope));
         assert!(matches!(
             result.err(),
-            Some(Error::Runtime(uring_runtime::Error::Os(libc::EPROTO)))
+            Some(Error::Runtime(racer_io::Error::Os(libc::EPROTO)))
         ));
         if mode == TlsMode::Userspace {
             break;
@@ -575,7 +571,7 @@ fn kernel_mode_fails_when_key_install_fails() {
     let result = drive(&fixture.reactor, fixture.pool.checkout(&endpoint, &scope));
     assert!(matches!(
         result.err(),
-        Some(Error::Runtime(uring_runtime::Error::Unavailable))
+        Some(Error::Runtime(racer_io::Error::Unavailable))
     ));
     assert_eq!(accepted.load(Ordering::SeqCst), 1);
     http1::tls::fail_next_key_installs(0);
@@ -673,11 +669,11 @@ fn abandoned_tls_handshake_releases_connection() {
     }
 }
 
-/// Cancelling a checkout while the userspace reconnect after a failed kernel
+/// Canceling a checkout while the userspace reconnect after a failed kernel
 /// key install is stalled releases both sockets and the slot.
 #[cfg(feature = "test-util")]
 #[test]
-fn cancelled_fallback_reconnect_releases_connection() {
+fn canceled_fallback_reconnect_releases_connection() {
     if !kernel_tls_available() {
         return;
     }
@@ -726,7 +722,7 @@ fn cancelled_fallback_reconnect_releases_connection() {
     http1::tls::fail_next_key_installs(0);
     assert!(matches!(
         result.err(),
-        Some(Error::Runtime(uring_runtime::Error::Cancelled))
+        Some(Error::Runtime(racer_io::Error::Canceled))
     ));
     drive(&fixture.reactor, fixture.reactor.drain()).unwrap();
     assert_released(&fixture, &endpoint);
@@ -734,15 +730,15 @@ fn cancelled_fallback_reconnect_releases_connection() {
     assert_eq!(fixture.admission.used(Resource::Context), 0);
 }
 
-/// A budget that admits the handshake but not the relay buffers rejects the
+/// A budget that admits the handshake but not the userspace TLS buffers rejects the
 /// userspace connect and leaks neither the charge nor the slot.
 #[test]
-fn userspace_relay_over_budget_is_rejected() {
+fn userspace_tls_over_budget_is_rejected() {
     let identity = identity(&["localhost"]);
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let (server, accepted) = serve(listener, Some(&identity), false, 1);
-    let fixture = fixture_with(http1::tls::RELAY_ALLOCATION - 1);
+    let fixture = fixture_with(http1::tls::USERSPACE_ALLOCATION - 1);
     let endpoint = tls_endpoint(&identity, address, TlsMode::Userspace);
     let scope = scope();
     let result = drive(&fixture.reactor, fixture.pool.checkout(&endpoint, &scope));
@@ -755,10 +751,10 @@ fn userspace_relay_over_budget_is_rejected() {
     server.join().unwrap();
 }
 
-/// The relay charge stays held while the connection idles in the pool and is
-/// released once the pool closes it and the relay thread exits.
+/// The userspace TLS charge stays held while the connection idles in the pool and is
+/// released once the pool closes it and drops the session.
 #[test]
-fn userspace_relay_charge_spans_idle_connection() {
+fn userspace_tls_charge_spans_idle_connection() {
     let identity = identity(&["localhost"]);
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
@@ -775,18 +771,18 @@ fn userspace_relay_charge_spans_idle_connection() {
             .iter()
             .any(|(key, counts)| *key == endpoint && *counts == (0, 1))
     );
-    assert!(fixture.admission.used(Resource::Context) >= http1::tls::RELAY_ALLOCATION);
+    assert!(fixture.admission.used(Resource::Context) >= http1::tls::USERSPACE_ALLOCATION);
     fixture.pool.close();
     // Only the I/O helper's cached head buffer may remain charged.
-    assert!(fixture.admission.used(Resource::Context) < http1::tls::RELAY_ALLOCATION);
+    assert!(fixture.admission.used(Resource::Context) < http1::tls::USERSPACE_ALLOCATION);
     drop(fixture);
     server.join().unwrap();
 }
 
-/// Cancelling an exchange on a userspace connection releases the relay charge
+/// Canceling an exchange on a userspace connection releases the userspace TLS charge
 /// once the connection is dropped.
 #[test]
-fn cancelled_userspace_exchange_releases_relay_charge() {
+fn canceled_userspace_exchange_releases_tls_charge() {
     let identity = identity(&["localhost"]);
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
@@ -795,8 +791,8 @@ fn cancelled_userspace_exchange_releases_relay_charge() {
     let endpoint = tls_endpoint(&identity, address, TlsMode::Userspace);
     let scope = scope();
     let connection = drive(&fixture.reactor, fixture.pool.checkout(&endpoint, &scope)).unwrap();
-    assert!(fixture.admission.used(Resource::Context) >= http1::tls::RELAY_ALLOCATION);
-    // No request was sent, so the head receive stalls until cancelled.
+    assert!(fixture.admission.used(Resource::Context) >= http1::tls::USERSPACE_ALLOCATION);
+    // No request was sent, so the head receive stalls until canceled.
     let result = {
         let receive = fixture.io.receive_head(connection, &scope);
         let mut receive = std::pin::pin!(receive);
@@ -811,12 +807,380 @@ fn cancelled_userspace_exchange_releases_relay_charge() {
     };
     assert!(matches!(
         result.err(),
-        Some(Error::Runtime(uring_runtime::Error::Cancelled))
+        Some(Error::Runtime(racer_io::Error::Canceled))
     ));
     drive(&fixture.reactor, fixture.reactor.drain()).unwrap();
     assert_released(&fixture, &endpoint);
     // Only the I/O helper's cached head buffer may remain charged.
-    assert!(fixture.admission.used(Resource::Context) < http1::tls::RELAY_ALLOCATION);
+    assert!(fixture.admission.used(Resource::Context) < http1::tls::USERSPACE_ALLOCATION);
     drop(fixture);
     server.join().unwrap();
+}
+
+/// Serve scripted small responses, one per request head, over TLS or plaintext.
+fn serve_small(
+    listener: TcpListener,
+    identity: Option<&Identity>,
+    responses: Vec<(&'static [u8], bool)>,
+) -> std::thread::JoinHandle<usize> {
+    let config = identity.map(|identity| {
+        Arc::new(
+            rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+                .with_no_client_auth()
+                .with_single_cert(identity.chain.clone(), identity.key.clone_key())
+                .unwrap(),
+        )
+    });
+    std::thread::spawn(move || {
+        let mut accepted = 0;
+        let mut responses = responses.into_iter();
+        while responses.len() > 0 {
+            let Ok((tcp, _)) = listener.accept() else {
+                break;
+            };
+            accepted += 1;
+            let mut stream: Box<dyn ReadWrite> = match &config {
+                Some(config) => Box::new(rustls::StreamOwned::new(
+                    rustls::ServerConnection::new(config.clone()).unwrap(),
+                    tcp,
+                )),
+                None => Box::new(tcp),
+            };
+            loop {
+                let mut head = Vec::new();
+                let mut byte = [0];
+                while !head.ends_with(b"\r\n\r\n") {
+                    match stream.read(&mut byte) {
+                        Ok(1) => head.push(byte[0]),
+                        _ => break,
+                    }
+                }
+                if !head.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+                let Some((response, close)) = responses.next() else {
+                    break;
+                };
+                let _ = stream.write_all(response);
+                let _ = stream.flush();
+                if close {
+                    break;
+                }
+            }
+        }
+        accepted
+    })
+}
+
+trait ReadWrite: Read + Write {}
+impl<T: Read + Write> ReadWrite for T {}
+
+/// Parse with the shared codec and accept any small framing.
+fn small_plan(bytes: &[u8]) -> Result<Option<http1::small_exchange::Plan<Error, u16>>> {
+    let codec = Codec::<()>::new(16 * 1024).transfer_coding();
+    let Some((head, length)) = codec.decode_head(bytes)? else {
+        return Ok(None);
+    };
+    let StartLine::Response { status } = head.start else {
+        return Err(http1::Error::Malformed.into());
+    };
+    Ok(Some(http1::small_exchange::Plan {
+        head_length: length,
+        framing: http1::small::Framing::from_response(&head)
+            .map_err(|_| Error::Http(http1::Error::Malformed))?,
+        limits: http1::small::Limits {
+            body: 64,
+            ..Default::default()
+        },
+        close: head.closes_connection()?,
+        body_error: |_| Error::Http(http1::Error::Malformed),
+        value: status,
+    }))
+}
+
+fn small_exchange(fixture: &Fixture, endpoint: &Endpoint) -> Result<(u16, Vec<u8>, bool, bool)> {
+    let scope = scope();
+    drive(&fixture.reactor, async {
+        let connection = fixture.pool.checkout(endpoint, &scope).await?;
+        let reused = connection.reused();
+        let mut parse = small_plan;
+        let exchanged = fixture
+            .io
+            .exchange_small(
+                connection,
+                b"GET /small HTTP/1.1\r\nHost: test\r\n\r\n",
+                16 * 1024,
+                &mut parse,
+                &scope,
+            )
+            .await?;
+        Ok((
+            exchanged.value,
+            exchanged.body.to_vec(),
+            exchanged.connection.is_reusable(),
+            reused,
+        ))
+    })
+}
+
+fn small_modes() -> Vec<Option<TlsMode>> {
+    let mut modes = vec![None, Some(TlsMode::Userspace)];
+    if kernel_tls_available() {
+        modes.push(Some(TlsMode::Kernel));
+    }
+    modes
+}
+
+#[test]
+fn small_exchange_reuses_chunked_and_length_responses() {
+    let identity = identity(&["localhost"]);
+    for mode in small_modes() {
+        let fixture = fixture();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = serve_small(
+            listener,
+            mode.map(|_| &identity),
+            vec![
+                (
+                    &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n"[..],
+                    false,
+                ),
+                (&b"HTTP/1.1 503 Busy\r\nContent-Length: 2\r\n\r\nno"[..], false),
+            ],
+        );
+        let endpoint = match mode {
+            Some(mode) => tls_endpoint(&identity, address, mode),
+            None => Endpoint { address, tls: None },
+        };
+        assert_eq!(
+            small_exchange(&fixture, &endpoint).unwrap(),
+            (200, b"abcde".to_vec(), true, false)
+        );
+        assert_eq!(
+            small_exchange(&fixture, &endpoint).unwrap(),
+            (503, b"no".to_vec(), true, true)
+        );
+        drop(fixture);
+        assert_eq!(server.join().unwrap(), 1, "{mode:?}");
+    }
+}
+
+#[test]
+fn small_exchange_close_delimited_body_is_not_reused() {
+    let identity = identity(&["localhost"]);
+    for mode in small_modes() {
+        let fixture = fixture();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = serve_small(
+            listener,
+            mode.map(|_| &identity),
+            vec![(b"HTTP/1.1 200 OK\r\nX: y\r\n\r\nclose-delimited", true)],
+        );
+        let endpoint = match mode {
+            Some(mode) => tls_endpoint(&identity, address, mode),
+            None => Endpoint { address, tls: None },
+        };
+        assert_eq!(
+            small_exchange(&fixture, &endpoint).unwrap(),
+            (200, b"close-delimited".to_vec(), false, false),
+            "{mode:?}"
+        );
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn small_exchange_rejects_pipelined_bytes_oversize_and_truncation() {
+    for (response, expected) in [
+        (
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nab"[..],
+            Error::Http(http1::Error::Malformed),
+        ),
+        (
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 65\r\n\r\n"[..],
+            Error::Http(http1::Error::Malformed),
+        ),
+        (
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nab"[..],
+            Error::Runtime(racer_io::Error::Io),
+        ),
+        (
+            &b"HTTP/1.1 200 OK\r\n"[..],
+            Error::Runtime(racer_io::Error::Io),
+        ),
+    ] {
+        let fixture = fixture();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = serve_small(listener, None, vec![(response, true)]);
+        let endpoint = Endpoint { address, tls: None };
+        let result = small_exchange(&fixture, &endpoint);
+        assert_eq!(result.err(), Some(expected));
+        server.join().unwrap();
+    }
+}
+
+/// Process CPU time (user plus system) in seconds.
+fn process_cpu() -> f64 {
+    // SAFETY: getrusage writes one rusage structure.
+    let usage = unsafe {
+        let mut usage = std::mem::zeroed::<libc::rusage>();
+        assert_eq!(libc::getrusage(libc::RUSAGE_SELF, &mut usage), 0);
+        usage
+    };
+    let seconds = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+    seconds(usage.ru_utime) + seconds(usage.ru_stime)
+}
+
+/// Userspace TLS 1.3 throughput over loopback: wall time and process CPU per
+/// GiB, including the in-process rustls server. Run with
+/// `cargo test -p http1 --release --all-features --test tls -- --ignored --nocapture userspace_tls_throughput`.
+#[test]
+#[ignore = "benchmark"]
+fn userspace_tls_throughput() {
+    const PAGES: usize = 64;
+    let identity = identity(&["localhost"]);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (server, _) = serve(listener, Some(&identity), false, 1);
+    let fixture = fixture();
+    let endpoint = tls_endpoint(&identity, address, TlsMode::Userspace);
+    // Warm up the connection and handshake.
+    fetch(&fixture, &endpoint, 1, false).unwrap();
+    let cpu = process_cpu();
+    let started = Instant::now();
+    fetch(&fixture, &endpoint, PAGES, false).unwrap();
+    let wall = started.elapsed().as_secs_f64();
+    let cpu = process_cpu() - cpu;
+    let gib = (PAGES * PAGE) as f64 / (1u64 << 30) as f64;
+    eprintln!(
+        "userspace TLS: {:.2} GiB in {wall:.3}s = {:.2} GiB/s, {:.3} CPU s/GiB",
+        gib,
+        gib / wall,
+        cpu / gib
+    );
+    fixture.pool.close();
+    drop(fixture);
+    server.join().unwrap();
+}
+
+/// Open and discard one fresh connection, reporting whether it used kernel TLS.
+fn connect_once(fixture: &Fixture, endpoint: &Endpoint) -> bool {
+    let scope = scope();
+    let mut connection = drive(&fixture.reactor, fixture.pool.checkout(endpoint, &scope)).unwrap();
+    let kernel = connection.is_kernel_tls();
+    assert_eq!(connection.is_userspace_tls(), !kernel);
+    connection.poison();
+    drop(connection);
+    kernel
+}
+
+/// A permanent ULP failure (module absent) stops kernel TLS attempts for that
+/// endpoint only; a policy failure (EPERM) is retried on every connection.
+#[test]
+fn kernel_unavailable_is_remembered_per_endpoint_and_not_for_eperm() {
+    let identity = identity(&["localhost"]);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (server, accepted) = serve(listener, Some(&identity), false, 5);
+    let fixture = fixture();
+
+    let eperm = tls_endpoint(&identity, address, TlsMode::Auto);
+    http1::tls::fail_next_ulp_attaches(2, libc::EPERM);
+    assert!(!connect_once(&fixture, &eperm));
+    assert!(!connect_once(&fixture, &eperm));
+    assert_eq!(
+        http1::tls::pending_ulp_failures(),
+        0,
+        "EPERM is retried on the next connection"
+    );
+
+    let absent = tls_endpoint(&identity, address, TlsMode::Auto);
+    http1::tls::fail_next_ulp_attaches(2, libc::ENOENT);
+    assert!(!connect_once(&fixture, &absent));
+    assert!(!connect_once(&fixture, &absent));
+    assert_eq!(
+        http1::tls::pending_ulp_failures(),
+        1,
+        "the endpoint skips kernel TLS after ENOENT"
+    );
+
+    // A different endpoint still tries kernel TLS.
+    let other = tls_endpoint(&identity, address, TlsMode::Auto);
+    assert!(!connect_once(&fixture, &other));
+    assert_eq!(http1::tls::pending_ulp_failures(), 0);
+    http1::tls::fail_next_ulp_attaches(0, 0);
+
+    drive(&fixture.reactor, fixture.reactor.drain()).unwrap();
+    fixture.pool.close();
+    drop(fixture);
+    server.join().unwrap();
+    assert_eq!(accepted.load(Ordering::SeqCst), 5);
+}
+
+/// A TLS 1.3 KeyUpdate from the server mid-response is handled by userspace
+/// TLS: the client answers with its own KeyUpdate and the connection stays
+/// usable for the next request.
+#[test]
+fn userspace_tls_handles_server_key_update() {
+    let identity = identity(&["localhost"]);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let config = Arc::new(
+        rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+            .with_no_client_auth()
+            .with_single_cert(identity.chain.clone(), identity.key.clone_key())
+            .unwrap(),
+    );
+    let server = std::thread::spawn(move || {
+        let body: Vec<u8> = (0..PAGE * 2).map(pattern).collect();
+        let (tcp, _) = listener.accept().unwrap();
+        let session = rustls::ServerConnection::new(config).unwrap();
+        let mut stream = rustls::StreamOwned::new(session, tcp);
+        let mut served = 0;
+        loop {
+            let mut head = Vec::new();
+            let mut byte = [0];
+            while !head.ends_with(b"\r\n\r\n") {
+                match stream.read(&mut byte) {
+                    Ok(1) => head.push(byte[0]),
+                    _ => return served,
+                }
+            }
+            let text = String::from_utf8(head).unwrap();
+            let (a, b) = text
+                .lines()
+                .find_map(|l| l.strip_prefix("Range: bytes="))
+                .unwrap()
+                .split_once('-')
+                .unwrap();
+            let range = a.parse::<usize>().unwrap()..b.parse::<usize>().unwrap() + 1;
+            let response = format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {}-{}/{}\r\nETag: \"0x1\"\r\nx-ms-blob-type: BlockBlob\r\n\r\n",
+                range.len(),
+                range.start,
+                range.end - 1,
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            let middle = range.start + range.len() / 2;
+            stream.write_all(&body[range.start..middle]).unwrap();
+            stream.conn.refresh_traffic_keys().unwrap();
+            stream.write_all(&body[middle..range.end]).unwrap();
+            stream.flush().unwrap();
+            served += 1;
+        }
+    });
+    let fixture = fixture();
+    let endpoint = tls_endpoint(&identity, address, TlsMode::Userspace);
+    assert!(!fetch_pages(&fixture, &endpoint, 3).unwrap());
+    fixture.pool.close();
+    drop(fixture);
+    assert_eq!(
+        server.join().unwrap(),
+        3,
+        "one connection served every page"
+    );
 }

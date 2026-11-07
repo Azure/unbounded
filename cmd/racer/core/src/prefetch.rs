@@ -5,7 +5,7 @@
 //! prefetch fills and, optionally, origin bytes per second. A demand read that
 //! joins a prefetch flight promotes it, which returns its slot and tokens.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::hash::Hash;
 use std::time::{Duration, Instant};
 
@@ -182,15 +182,56 @@ pub fn backoff(attempt: u32, unit: f64, retry_after: Option<Duration>) -> Durati
 /// Longest throttle deferral the owner reports.
 const MAX_THROTTLE_WAIT: Duration = Duration::from_secs(3600);
 
-/// Owner-side prefetch admission. Each admitted fill holds one slot until it
-/// finishes or a demand read promotes it.
+/// Backstop lifetime of an owner fill's slot. A fill that neither finishes nor is promoted
+/// within it (its holder leaked) gives the slot back on the next admission.
+pub const OWNER_LEASE_TTL: Duration = Duration::from_secs(300);
+
+/// Owner-side prefetch admission. Each admitted fill holds one slot until its
+/// last holder finishes, a demand read promotes it, or its lease expires.
+///
+/// Admissions of a key that is already filling join that fill: they take no
+/// slot and no tokens, but each holds a reference, and the slot is released
+/// only when the last reference finishes. Every admission returns a
+/// [`OwnerLease`] with a unique id that is passed back to [`OwnerBudget::finish`];
+/// finishing a lease twice, or a lease from an entry that has since expired, is ignored, so a
+/// duplicated release can never drop another holder's reference.
 #[derive(Debug)]
 pub struct OwnerBudget<K> {
     concurrent: usize,
     rate: u64,
     tokens: f64,
     refilled: Option<Instant>,
-    active: HashMap<K, u64>,
+    ttl: Duration,
+    generation: u64,
+    next_lease: u64,
+    /// Entries holding a slot (not promoted).
+    slots: usize,
+    active: HashMap<K, OwnerEntry>,
+}
+
+#[derive(Debug)]
+struct OwnerEntry {
+    bytes: u64,
+    /// Ids of the live leases referencing this fill.
+    holders: BTreeSet<u64>,
+    generation: u64,
+    promoted: bool,
+    expires: Instant,
+}
+
+/// One admission's reference to an owner fill (see [`OwnerBudget::admit`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[must_use = "a lease must be finished"]
+pub struct OwnerLease {
+    generation: u64,
+    id: u64,
+}
+
+impl OwnerLease {
+    /// Unique id of this admission's reference.
+    pub fn id(self) -> u64 {
+        self.id
+    }
 }
 
 /// Why the owner deferred a fill.
@@ -212,13 +253,23 @@ impl<K: Eq + Hash + Clone> OwnerBudget<K> {
             rate,
             tokens: rate as f64,
             refilled: None,
+            ttl: OWNER_LEASE_TTL,
+            generation: 0,
+            next_lease: 0,
+            slots: 0,
             active: HashMap::new(),
         }
     }
 
+    /// Replace the backstop lease lifetime ([`OWNER_LEASE_TTL`]).
+    pub fn with_lease_ttl(mut self, ttl: Duration) -> Self {
+        self.ttl = ttl;
+        self
+    }
+
     /// Fills holding a slot.
     pub fn active(&self) -> usize {
-        self.active.len()
+        self.slots
     }
 
     fn refill(&mut self, now: Instant) {
@@ -232,14 +283,44 @@ impl<K: Eq + Hash + Clone> OwnerBudget<K> {
         self.refilled = Some(now);
     }
 
+    /// Drop entries whose lease expired by `now`, releasing their slots (their tokens stay
+    /// spent). Returns the dropped keys.
+    pub fn expire(&mut self, now: Instant) -> Vec<K> {
+        let mut expired = Vec::new();
+        let slots = &mut self.slots;
+        self.active.retain(|key, entry| {
+            if entry.expires > now {
+                return true;
+            }
+            if !entry.promoted {
+                *slots -= 1;
+            }
+            expired.push(key.clone());
+            false
+        });
+        expired
+    }
+
     /// Admit a fill of `bytes` for `key`, or say how long to wait. A key that
-    /// is already active is admitted again without another slot (the caller
-    /// joins the same flight).
-    pub fn admit(&mut self, key: K, bytes: u64, now: Instant) -> Result<(), (Deferral, Duration)> {
-        if self.active.contains_key(&key) {
-            return Ok(());
+    /// is already filling is admitted again without another slot or tokens
+    /// (the caller joins the same flight) and takes another reference.
+    pub fn admit(
+        &mut self,
+        key: K,
+        bytes: u64,
+        now: Instant,
+    ) -> Result<OwnerLease, (Deferral, Duration)> {
+        self.expire(now);
+        let id = self.next_lease;
+        if let Some(entry) = self.active.get_mut(&key) {
+            self.next_lease += 1;
+            entry.holders.insert(id);
+            return Ok(OwnerLease {
+                generation: entry.generation,
+                id,
+            });
         }
-        if self.active.len() >= self.concurrent {
+        if self.slots >= self.concurrent {
             return Err((Deferral::Concurrency, Duration::from_millis(100)));
         }
         self.refill(now);
@@ -259,33 +340,69 @@ impl<K: Eq + Hash + Clone> OwnerBudget<K> {
             // Charge the whole page; the balance may go negative (debt).
             self.tokens -= bytes as f64;
         }
-        self.active.insert(key, bytes);
-        Ok(())
+        self.generation += 1;
+        self.next_lease += 1;
+        let generation = self.generation;
+        self.active.insert(
+            key,
+            OwnerEntry {
+                bytes,
+                holders: BTreeSet::from([id]),
+                generation,
+                promoted: false,
+                expires: now.checked_add(self.ttl).unwrap_or(now),
+            },
+        );
+        self.slots += 1;
+        Ok(OwnerLease { generation, id })
     }
 
-    /// Release the slot of a finished fill. Returns false if it was already
-    /// released (finished or promoted).
-    pub fn finish(&mut self, key: &K) -> bool {
-        self.active.remove(key).is_some()
+    /// Return one admission's reference. Returns true if this released the
+    /// fill's slot: it was the last reference, and the fill was neither
+    /// promoted nor expired.
+    pub fn finish(&mut self, key: &K, lease: OwnerLease) -> bool {
+        let Some(entry) = self.active.get_mut(key) else {
+            return false;
+        };
+        if entry.generation != lease.generation {
+            return false;
+        }
+        if !entry.holders.remove(&lease.id) || !entry.holders.is_empty() {
+            return false;
+        }
+        let promoted = entry.promoted;
+        self.active.remove(key);
+        if !promoted {
+            self.slots -= 1;
+        }
+        !promoted
     }
 
     /// A demand read joined `key`'s flight: release its slot and refund its
-    /// tokens. Returns whether it was an active prefetch fill.
+    /// tokens. The fill's references stay until they finish. Returns whether
+    /// it was an active prefetch fill.
     pub fn promote(&mut self, key: &K) -> bool {
-        match self.active.remove(key) {
-            Some(bytes) => {
+        match self.active.get_mut(key) {
+            Some(entry) if !entry.promoted => {
+                entry.promoted = true;
+                self.slots -= 1;
                 if self.rate != 0 {
                     // Refund exactly what admit charged, capped at a full bucket.
-                    self.tokens = (self.tokens + bytes as f64).min(self.rate as f64);
+                    self.tokens = (self.tokens + entry.bytes as f64).min(self.rate as f64);
                 }
                 true
             }
-            None => false,
+            _ => false,
         }
     }
 
     /// Whether `key` holds a slot.
     pub fn is_active(&self, key: &K) -> bool {
+        self.active.get(key).is_some_and(|entry| !entry.promoted)
+    }
+
+    /// Whether any admission still references `key` (holding a slot or promoted).
+    pub fn holds(&self, key: &K) -> bool {
         self.active.contains_key(key)
     }
 }
@@ -294,6 +411,44 @@ impl<K: Eq + Hash + Clone> OwnerBudget<K> {
 #[allow(clippy::disallowed_methods)] // Tests build instants to feed the API.
 mod tests {
     use super::*;
+
+    #[test]
+    fn owner_leases_are_unique_and_finish_once() {
+        let now = Instant::now();
+        let mut owner = OwnerBudget::new(1, 0);
+        let a = owner.admit(1u8, 10, now).unwrap();
+        let b = owner.admit(1u8, 10, now).unwrap();
+        assert_ne!(a.id(), b.id());
+        // Finishing `a` twice must not drop `b`'s reference.
+        assert!(!owner.finish(&1, a));
+        assert!(!owner.finish(&1, a));
+        assert!(owner.holds(&1));
+        assert_eq!(owner.active(), 1);
+        assert!(owner.finish(&1, b));
+        assert!(!owner.holds(&1));
+        assert_eq!(owner.active(), 0);
+        assert!(!owner.finish(&1, b));
+    }
+
+    #[test]
+    fn owner_lease_expiry_releases_slot_and_ignores_late_finish() {
+        let now = Instant::now();
+        let ttl = Duration::from_secs(5);
+        let mut owner = OwnerBudget::new(1, 0).with_lease_ttl(ttl);
+        let old = owner.admit(1u8, 10, now).unwrap();
+        assert!(
+            owner
+                .expire(now + ttl - Duration::from_millis(1))
+                .is_empty()
+        );
+        assert_eq!(owner.expire(now + ttl), vec![1]);
+        assert_eq!(owner.active(), 0);
+        // A new fill of the same key; the expired lease cannot release it.
+        let new = owner.admit(1u8, 10, now + ttl).unwrap();
+        assert!(!owner.finish(&1, old));
+        assert!(owner.is_active(&1));
+        assert!(owner.finish(&1, new));
+    }
 
     #[test]
     fn priorities_round_trip_and_order() {
@@ -391,18 +546,22 @@ mod tests {
     fn owner_budget_bounds_concurrency_and_promotes() {
         let now = Instant::now();
         let mut budget = OwnerBudget::new(2, 0);
-        assert!(budget.admit(1, 16, now).is_ok());
+        let one = budget.admit(1, 16, now).unwrap();
         assert!(budget.admit(2, 16, now).is_ok());
         // Joining an active key takes no slot.
-        assert!(budget.admit(1, 16, now).is_ok());
+        let joined = budget.admit(1, 16, now).unwrap();
         assert_eq!(
             budget.admit(3, 16, now).unwrap_err().0,
             Deferral::Concurrency
         );
         assert!(budget.promote(&1));
-        assert!(!budget.finish(&1), "promotion already released the slot");
-        assert!(budget.admit(3, 16, now).is_ok());
-        assert!(budget.finish(&3));
+        assert!(
+            !budget.finish(&1, one),
+            "promotion already released the slot"
+        );
+        let three = budget.admit(3, 16, now).unwrap();
+        assert!(budget.finish(&3, three));
+        assert!(!budget.finish(&1, joined));
         assert_eq!(budget.active(), 1);
     }
 
@@ -441,14 +600,16 @@ mod tests {
         for key in 0..4u64 {
             loop {
                 match budget.admit(key, page, now) {
-                    Ok(()) => break,
+                    Ok(lease) => {
+                        assert!(budget.finish(&key, lease));
+                        break;
+                    }
                     Err((why, wait)) => {
                         assert_eq!(why, Deferral::Throttle);
                         now += wait;
                     }
                 }
             }
-            assert!(budget.finish(&key));
         }
         // The first page starts at once; each later one waits 16 s of debt.
         let elapsed = now - start;
@@ -497,5 +658,49 @@ mod tests {
         let later = start + Duration::from_secs(1_000_000);
         assert!(idle.admit(2, 10, later).is_ok());
         assert!(idle.admit(3, 1, later).is_err());
+    }
+
+    /// A second admission of an active key holds a reference: the first
+    /// holder finishing must not release the slot under the second.
+    #[test]
+    fn owner_budget_same_key_admissions_are_refcounted() {
+        let now = Instant::now();
+        let mut budget = OwnerBudget::new(1, 0);
+        let first = budget.admit(1, 16, now).unwrap();
+        let second = budget.admit(1, 16, now).unwrap();
+        assert!(!budget.finish(&1, first));
+        assert!(budget.is_active(&1));
+        assert_eq!(budget.active(), 1);
+        assert_eq!(
+            budget.admit(2, 16, now).unwrap_err().0,
+            Deferral::Concurrency
+        );
+        assert!(budget.finish(&1, second));
+        assert_eq!(budget.active(), 0);
+        assert!(!budget.holds(&1));
+        // A lease finished twice is ignored once its entry is gone.
+        assert!(!budget.finish(&1, second));
+        assert!(budget.admit(2, 16, now).is_ok());
+    }
+
+    /// A leaked lease expires and gives its slot back; its stale lease cannot
+    /// release a later fill of the same key.
+    #[test]
+    fn owner_budget_leases_expire() {
+        let now = Instant::now();
+        let ttl = Duration::from_secs(5);
+        let mut budget = OwnerBudget::new(1, 0).with_lease_ttl(ttl);
+        let leaked = budget.admit(1, 16, now).unwrap();
+        assert!(budget.admit(2, 16, now + ttl / 2).is_err());
+        assert_eq!(budget.expire(now + ttl / 2), Vec::<i32>::new());
+        let fresh = budget.admit(1, 16, now + ttl).unwrap();
+        assert_ne!(fresh, leaked);
+        assert!(!budget.finish(&1, leaked));
+        assert!(budget.is_active(&1));
+        // Promoted entries expire too.
+        assert!(budget.promote(&1));
+        assert_eq!(budget.expire(now + 3 * ttl), vec![1]);
+        assert!(!budget.finish(&1, fresh));
+        assert_eq!(budget.active(), 0);
     }
 }

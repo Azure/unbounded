@@ -21,7 +21,7 @@ resubmits the same id and only missing pages are scheduled.
 ## Current code this replaces
 
 - Client parser: only `HEAD` and `POST` under `/v1/objects/` are accepted
-  (`cmd/racer/object-wire/src/client.rs:177-179`, `:338-356`); any other
+  (`cmd/racer/wire/src/object/client.rs:177-179`, `:338-356`); any other
   method is 405 with `Allow: HEAD, POST` (`client.rs:615-619`). A request body
   is rejected: `Content-Length` is accepted only as `0`
   (`client.rs:241-255`). Query strings are not parsed; the target is used
@@ -65,7 +65,7 @@ socket belongs to. `.` and `..` alone are invalid (400).
 
 ### Parser extension
 
-The object-wire client parser gains a separate prefetch route:
+The `racer_wire::object` client parser gains a separate prefetch route:
 
 - Dispatch on the path prefix before the `/v1/objects/` key parse. Split the
   target at the first `?` for prefetch paths only.
@@ -116,7 +116,10 @@ The object-wire client parser gains a separate prefetch route:
 Unknown top-level or ref fields are 400 (strict parse). Duplicate refs are
 allowed and deduplicated at page level. The `Authorization` header applies to
 every ref, is kept in memory only, and is replaced by each accepted PUT (a PUT
-without it clears it).
+without it clears it). This includes a PUT with the same `(generation,
+sequence)` and body whose `Authorization` value differs: it is applied again
+with the new credential instead of being answered as a replay. Credentials
+belong to tickets, not to the units they share; see "Credentials" below.
 
 Refs are normalized into per-version page sets (16 MiB pages) right after etag
 resolution; the server does not retain the raw JSON. It keeps a SHA-256 of the
@@ -137,16 +140,16 @@ Let the ticket hold `(G, S)`.
 | `g > G` (any `s`) | Supersede, 200; the previous window is reported `superseded` in metrics only, the ticket keeps its id |
 | `g < G` | 409 `stale_generation` |
 
-A PUT on a terminal ticket (SUCCEEDED, PARTIAL, FAILED, CANCELLED) with a
+A PUT on a terminal ticket (SUCCEEDED, PARTIAL, FAILED, CANCELED) with a
 higher `(g, s)` restarts it. With equal `(g, s)` and same hash it returns the
 retained status (200). A one-shot batch is a single PUT with `(0, 0)`.
 
 Replacing the desired set: pages no longer desired drop this ticket's
 interest (queued units with zero interest are removed; in-flight fills are not
-cancelled). New pages are planned. Pages already admitted for this ticket stay
+canceled). New pages are planned. Pages already admitted for this ticket stay
 counted.
 
-Every accepted PUT renews the TTL. On expiry the ticket goes CANCELLED with
+Every accepted PUT renews the TTL. On expiry the ticket goes CANCELED with
 reason `expired` and releases its interest. Nothing is evicted.
 
 ### Status codes
@@ -222,8 +225,8 @@ Object read errors keep their empty bodies.
 
 - `state`: `QUEUED` (accepted, nothing dispatched), `RUNNING`, `SUCCEEDED`
   (every ref admitted), `PARTIAL` (settled, some refs failed), `FAILED` (settled,
-  every ref failed), `CANCELLED`.
-- `reason`: `null` unless CANCELLED: `client`, `expired`, `superseded`
+  every ref failed), `CANCELED`.
+- `reason`: `null` unless CANCELED: `client`, `expired`, `superseded`
   (only used for a ticket replaced by a cache UID change), `cache_removed`,
   `passthrough`.
 - `settled`: true when no unit for the current `(generation, sequence)` is
@@ -272,9 +275,9 @@ id, at most 1024 (the node ticket limit):
 
 ### DELETE
 
-Returns 200 with the CANCELLED status (`reason: "client"`). Interest is
+Returns 200 with the CANCELED status (`reason: "client"`). Interest is
 released; queued units with no remaining interest are dropped; in-flight fills
-complete normally; nothing is evicted. A cancelled ticket is retained like
+complete normally; nothing is evicted. A canceled ticket is retained like
 other terminal tickets.
 
 ## Configuration
@@ -327,7 +330,27 @@ A per-node `PrefetchCoordinator` replaces `WarmRegistry`. It owns:
   `budget_timeout` (for deferrals and overload) or `origin_error`.
   `VersionUnavailable` fails only that ref (`version_changed`), giving PARTIAL.
   `NotFound` maps to `not_found`; `OriginRejected`/`OriginForbidden` to
-  `forbidden`.
+  `forbidden`, which fails only the tickets whose credential was refused (see
+  "Credentials").
+
+### Credentials
+
+A unit is shared by every ticket that wants it, but a credential belongs to the
+ticket that supplied it:
+
+- A fill of a unit uses the credential of the highest-priority live ticket
+  interested in it (ties broken by ticket key). A ticket without
+  `Authorization` is filled without a credential; it is never filled using
+  another ticket's token.
+- A batch carries one credential: units whose chosen credential differs from
+  the batch's first unit wait for a later batch.
+- When the origin refuses a fill (`forbidden`), the refs of every ticket
+  holding that credential fail `forbidden` for that unit, and the unit stays
+  queued for the remaining tickets with the next distinct credential, without
+  backoff. Each distinct credential is tried at most once per unit; when no
+  other credential is left, the unit fails as before.
+- A ticket that adds interest with a credential already refused for a tracked
+  unit fails that unit at once. A PUT with a new credential joins it again.
 - Membership change re-plans queued and in-flight-to-departed-owner units.
   Active windows (not settled or within TTL) re-queue admitted pages whose
   owner left the cluster or the cache's pool. A selector change publishes a new
@@ -509,7 +532,7 @@ specified above. Where the server had to choose, it did the following.
   no separate queue per owner.
 - Ticket limit: before answering 429 `ticket_limit`, the oldest retained
   terminal ticket is dropped to make room.
-- TTL expiry: an unsettled ticket becomes CANCELLED (`expired`). A settled
+- TTL expiry: an unsettled ticket becomes CANCELED (`expired`). A settled
   ticket keeps its SUCCEEDED, PARTIAL, or FAILED state and releases its
   interest. Retention (`RACER_PREFETCH_TICKET_RETENTION_SECS`) counts from
   expiry or cancellation.
@@ -570,7 +593,7 @@ specified above. Where the server had to choose, it did the following.
 - Parser: methods, ids, query params, body limits, content type, 405/413.
 - Idempotency table rows above, TTL expiry, retention GC, 429 limits.
 - Scheduler: dedup across tickets, priority and round-robin order, pending
-  bound, window replace dropping interest without cancelling flights,
+  bound, window replace dropping interest without canceling flights,
   re-plan on membership change.
 - Owner: resident, join, start, deferred under budget, probe bitmap,
   passthrough, old-peer `peer_unsupported`.

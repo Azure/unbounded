@@ -1511,3 +1511,123 @@ func TestOriginWithoutCacheUIDAcceptsAnyCache(t *testing.T) {
 		}
 	}
 }
+
+// headResponse reads one HEAD response from conn and requires a 200.
+func headResponse(t *testing.T, reader *bufio.Reader) {
+	t.Helper()
+
+	response, err := http.ReadResponse(reader, &http.Request{Method: "HEAD"})
+	if err != nil || response.StatusCode != http.StatusOK {
+		t.Fatal("HEAD response", err)
+	}
+
+	closeQuietly(response.Body)
+}
+
+// An idle keep-alive connection must not hold the last slot while another
+// connection waits: the waiter closes it and is served well before any idle
+// timeout.
+func TestOriginWaitingConnectionEvictsIdleConnection(t *testing.T) {
+	path, cancel, done := startOrigin(t, func(l *originLimits) {
+		l.maxConnections, l.idleTimeout = 1, time.Hour
+	}, func(context.Context, OriginRequest) (Metadata, io.ReadCloser, error) {
+		return originMeta(0), nil, nil
+	})
+
+	defer func() { cancel(); <-done }()
+
+	idle := originDial(t, path)
+	if _, err := idle.Write(rawRequest("HEAD", "")); err != nil {
+		t.Fatal(err)
+	}
+
+	headResponse(t, bufio.NewReader(idle))
+
+	waiting := originDial(t, path)
+	if _, err := waiting.Write(rawRequest("HEAD", "")); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := waiting.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	headResponse(t, bufio.NewReader(waiting))
+
+	var one [1]byte
+	if _, err := idle.Read(one[:]); err != io.EOF {
+		t.Fatal("idle connection not closed", err)
+	}
+}
+
+// A connection with a request in progress is never evicted: the waiter is
+// admitted only after that response, once its connection goes idle.
+func TestOriginWaitingConnectionKeepsActiveConnection(t *testing.T) {
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+
+	var calls atomic.Int32
+
+	path, cancel, done := startOrigin(t, func(l *originLimits) {
+		l.maxConnections, l.idleTimeout = 1, time.Hour
+	}, func(context.Context, OriginRequest) (Metadata, io.ReadCloser, error) {
+		if calls.Add(1) == 1 {
+			entered <- struct{}{}
+
+			<-release
+		}
+
+		return originMeta(0), nil, nil
+	})
+
+	defer func() { cancel(); <-done }()
+
+	active := originDial(t, path)
+	if _, err := active.Write(rawRequest("HEAD", "")); err != nil {
+		t.Fatal(err)
+	}
+
+	<-entered
+
+	waiting := originDial(t, path)
+	if _, err := waiting.Write(rawRequest("HEAD", "")); err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(50 * time.Millisecond)
+
+	if calls.Load() != 1 {
+		t.Fatal("admitted beyond the cap while the only connection was active")
+	}
+
+	close(release)
+	headResponse(t, bufio.NewReader(active))
+	headResponse(t, bufio.NewReader(waiting))
+
+	if calls.Load() != 2 {
+		t.Fatal("waiter not served", calls.Load())
+	}
+}
+
+// Without a waiting connection, idle connections stay open.
+func TestOriginIdleConnectionsStayOpenWithoutWaiters(t *testing.T) {
+	path, cancel, done := startOrigin(t, func(l *originLimits) {
+		l.maxConnections, l.idleTimeout = 1, time.Hour
+	}, func(context.Context, OriginRequest) (Metadata, io.ReadCloser, error) {
+		return originMeta(0), nil, nil
+	})
+
+	defer func() { cancel(); <-done }()
+
+	idle := originDial(t, path)
+	reader := bufio.NewReader(idle)
+
+	for range 2 {
+		if _, err := idle.Write(rawRequest("HEAD", "")); err != nil {
+			t.Fatal(err)
+		}
+
+		headResponse(t, reader)
+		time.Sleep(20 * time.Millisecond)
+	}
+}

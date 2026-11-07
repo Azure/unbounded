@@ -7,6 +7,7 @@
 //! background.
 
 use super::link_setup;
+use super::setup::{Opened, SetupTable};
 use super::*;
 use rdma_verbs::Arrival;
 use rdma_verbs::Client;
@@ -16,7 +17,6 @@ use rdma_verbs::LinkKey;
 use rdma_verbs::LinkState;
 use rdma_verbs::Op;
 use rdma_verbs::Source;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::PoisonError;
@@ -69,11 +69,97 @@ pub fn fund_publication<T>(publication: &mut Vec<T>, registered_bytes: usize) {
     publication.truncate(funded_devices(registered_bytes, publication.len()));
 }
 
-/// Grants per link: each concurrent page to a peer already needs one HTTP connection.
-pub fn grants_per_link(connections_per_neighbor: usize) -> u32 {
-    u32::try_from(connections_per_neighbor)
+/// Most grants one link advertises. Each link posts `2 * grants + 4`
+/// receives, `4 * grants + 8` sends (times 4 work requests each in
+/// registration mode), and binds up to `grants` memory windows. Activation
+/// further caps the value so each link's QP and CQ fit the device's reported
+/// `max_qp_wr`, `max_cqe`, and `max_mw`.
+pub const GRANTS_PER_LINK_CAP: u32 = 1024;
+
+/// Grants per link for a rail funding `buffers_per_rail` page buffers.
+///
+/// A link may hold as many grants as its rail has buffers: the rail's pool is
+/// the real limit, and a smaller per-link cap only turns hash skew across
+/// rails (several concurrent pages landing on one rail) into HTTP fallbacks.
+/// The peer's advertised value still caps each link at `min(local, peer)`.
+pub fn grants_per_link(buffers_per_rail: usize) -> u32 {
+    u32::try_from(buffers_per_rail)
         .unwrap_or(u32::MAX)
-        .clamp(1, link_setup::MAX_GRANTS_PER_LINK)
+        .clamp(1, GRANTS_PER_LINK_CAP.min(link_setup::MAX_GRANTS_PER_LINK))
+}
+
+/// Longest a receiver's grant request stays parked for a free grant slot or
+/// page buffer ([`Links::grant_parked`]). A grant is held from the request
+/// until the sender's page lands, so exhaustion usually means a slow sender
+/// (its disk), not a broken link, and the registered pool is the receiver's
+/// concurrency limit. A parked request costs no CPU until a release wakes it
+/// in arrival order, so the wait covers several grant lifetimes (each a
+/// sender disk read under load, often hundreds of milliseconds) rather than
+/// failing the page into a full range-window retry. A request still parked
+/// at the limit fails `Overloaded` and its range window retries it, rather
+/// than moving the page over HTTP, which costs the receiver far more CPU and
+/// the sender the same disk read. Nothing is reserved while waiting, so
+/// memory stays bounded by the registered pool.
+pub const GRANT_WAIT: Duration = Duration::from_secs(1);
+
+/// Interval between attempts in [`retry_overloaded`].
+pub const OVERLOAD_POLL: Duration = Duration::from_millis(1);
+
+/// When a receiver's grant request parked at `now` stops waiting:
+/// [`GRANT_WAIT`], but never more than half the time left before
+/// `deadline`, so a granted page keeps the other half for its head round
+/// trip, the sender's read, and the write.
+pub fn grant_wait_until(now: Instant, deadline: Instant) -> Instant {
+    now + GRANT_WAIT.min(deadline.saturating_duration_since(now) / 2)
+}
+
+/// Run `attempt` until it does not fail [`Error::Overloaded`], sleeping
+/// [`OVERLOAD_POLL`] between attempts (`sleep` takes the wake time), until
+/// another attempt would start after `until`. Returns the last result and the
+/// number of waits. Any other error, including a failed sleep, ends at once.
+pub async fn retry_overloaded<T, A, AF, S, SF>(
+    mut attempt: A,
+    mut sleep: S,
+    now: impl Fn() -> Instant,
+    until: Instant,
+) -> (Result<T>, u32)
+where
+    A: FnMut() -> AF,
+    AF: std::future::Future<Output = Result<T>>,
+    S: FnMut(Instant) -> SF,
+    SF: std::future::Future<Output = Result<()>>,
+{
+    let mut waits = 0u32;
+    loop {
+        match attempt().await {
+            Err(Error::Overloaded) => {
+                let wake = now() + OVERLOAD_POLL;
+                if wake > until {
+                    return (Err(Error::Overloaded), waits);
+                }
+                waits = waits.saturating_add(1);
+                if let Err(error) = sleep(wake).await {
+                    return (Err(error), waits);
+                }
+            }
+            result => return (result, waits),
+        }
+    }
+}
+
+/// Count one receiver grant request that `waited` (parked) for a slot
+/// ([`Links::grant_parked`]) and whether it was `granted` in the end.
+pub fn record_grant_wait(metrics: Option<&crate::telemetry::Metrics>, waited: bool, granted: bool) {
+    let Some(metrics) = metrics else {
+        return;
+    };
+    if !waited {
+        return;
+    }
+    metrics.record(crate::telemetry::Event::RdmaGrantWaits, 1);
+    if granted {
+        metrics.record(crate::telemetry::Event::RdmaGrantWaitGranted, 1);
+    }
 }
 
 /// Opaque verbs key for a peer and rail: `SHA-256(NodeId)` and the rail.
@@ -93,34 +179,16 @@ pub struct LinkNode {
     /// Activation finished (successfully or not) for the current round.
     settled: std::sync::atomic::AtomicBool,
 
-    /// Last accepted incoming setup per key, for the rate limit.
-    setups: Mutex<HashMap<LinkKey, Instant>>,
+    /// Every key's setup state and the responder rate limit (see
+    /// [`super::setup`]).
+    setup: Mutex<SetupTable>,
 
-    /// Setups this node initiated and has not finished.
-    initiating: Mutex<HashMap<LinkKey, Initiating>>,
+    /// The membership whose RDMA edges links were last trimmed to, so only
+    /// the first worker to see a new membership sends the request.
+    retained: Mutex<std::sync::Weak<crate::topology::Membership>>,
 
-    /// Source of reservation tokens for `initiating`.
-    reservations: std::sync::atomic::AtomicU64,
-
-    /// GPU helper and per-GPU landing bytes, when `gpu-read` pages may land
-    /// in GPU memory (GPUDirect RDMA).
-    gpu_landing: Mutex<Option<(Arc<crate::gpu::GpuHelper>, u64)>>,
-
-    /// Landing was configured after the current rails attached theirs, so
-    /// the owner must attach landings on the rails already active. Set and
-    /// cleared under the `gpu_landing` lock, so an activation that reads the
-    /// new configuration consumes it and rails never attach twice.
-    landing_pending: std::sync::atomic::AtomicBool,
-
-    /// GPU landing slices registered this round, by rail and GPU.
-    landings: Mutex<HashMap<(u16, i32), Arc<crate::gpu::GpuLanding>>>,
-
-    /// NIC slots in each registered landing slice this round, by rail and GPU.
-    landing_slots: Mutex<HashMap<(u16, i32), usize>>,
-
-    /// Landing grants that found no free slot, by rail and GPU. Kept across
-    /// rounds so the metric only grows.
-    landing_exhausted: Mutex<HashMap<(u16, i32), u64>>,
+    /// GPU landing state, owned by the GPU side; this node drives it.
+    gpu_landing: Arc<crate::gpu_landing::GpuLandingRegistry>,
 }
 
 /// Split each GPU's landing buffer of `slots` page slots across `rails`.
@@ -160,19 +228,11 @@ pub fn plan_landing(
     plan
 }
 
-/// One setup this node initiated: reserved before the owner answers, then
-/// keyed by the epoch the owner opened.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Initiating {
-    Reserved(u64),
-    Opened(Epoch),
-}
-
-/// Holds an `Initiating::Reserved` entry while `open` waits on the owner.
-/// Dropping it (error or cancellation) clears only its own reservation and,
-/// if the owner already opened a link the caller never read, breaks that
-/// epoch so the link does not sit in `Connecting`. The owner breaks links
-/// it opens after the op is gone.
+/// Holds a [`super::setup::SetupState::Opening`] attempt while `open` waits
+/// on the owner. Dropping it (error or cancellation) cancels only its own
+/// attempt and, if the owner already opened a link the caller never read,
+/// breaks that epoch so the link does not sit in `Connecting`. The owner
+/// breaks links it opens after the op is gone.
 struct Reservation<'a> {
     node: &'a LinkNode,
     key: LinkKey,
@@ -187,10 +247,7 @@ impl Drop for Reservation<'_> {
         {
             client.break_link(self.key, opened.epoch);
         }
-        let mut initiating = LinkNode::lock(&self.node.initiating);
-        if initiating.get(&self.key) == Some(&Initiating::Reserved(self.token)) {
-            initiating.remove(&self.key);
-        }
+        LinkNode::lock(&self.node.setup).cancel(self.key, self.token);
     }
 }
 
@@ -210,6 +267,8 @@ impl LinkNode {
     }
 
     fn settle(&self, rails: Vec<RailMapping>) {
+        self.gpu_landing
+            .set_rails(rails.iter().map(|mapping| mapping.rail.0).collect());
         *Self::lock(&self.active) = rails;
         self.settled
             .store(true, std::sync::atomic::Ordering::Release);
@@ -223,91 +282,48 @@ impl LinkNode {
     /// lazily on the first `gpu-read`) marks those rails pending; the owner
     /// worker attaches them on its next turn (see [`Self::take_landing_pending`]).
     pub fn set_gpu_landing(&self, helper: Arc<crate::gpu::GpuHelper>, bytes: u64) {
-        let mut landing = Self::lock(&self.gpu_landing);
-        *landing = (bytes != 0).then_some((helper, bytes));
-        self.landing_pending
-            .store(landing.is_some(), std::sync::atomic::Ordering::Release);
+        self.gpu_landing.configure(helper, bytes);
     }
 
     /// Whether landing still needs attaching on the rails already active.
     /// Clears the mark; the caller must then attach them.
     pub fn take_landing_pending(&self) -> bool {
-        let _landing = Self::lock(&self.gpu_landing);
-        self.landing_pending
-            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        self.gpu_landing.take_pending()
     }
 
-    /// The landing configuration, consuming any pending mark: the caller
-    /// attaches with it.
-    fn take_gpu_landing(&self) -> Option<(Arc<crate::gpu::GpuHelper>, u64)> {
-        let landing = Self::lock(&self.gpu_landing);
-        self.landing_pending
-            .store(false, std::sync::atomic::Ordering::Release);
-        landing.clone()
+    /// The GPU landing registry this node drives.
+    pub fn gpu_landing(&self) -> &Arc<crate::gpu_landing::GpuLandingRegistry> {
+        &self.gpu_landing
     }
 
     /// GPU `ordinal`'s landing slice on `rail` this round, if any.
     pub fn landing(&self, rail: RailId, ordinal: i32) -> Option<Arc<crate::gpu::GpuLanding>> {
-        Self::lock(&self.landings).get(&(rail.0, ordinal)).cloned()
+        self.gpu_landing.landing(rail.0, ordinal)
     }
 
-    /// Landing state of each active rail, for metrics: the rail, and the
-    /// `(ordinal, slots)` of each GPU landing slice registered on it.
+    /// Landing state of each active rail, for metrics.
     pub fn landing_state(&self) -> Vec<(u16, Vec<(i32, usize)>)> {
-        let slots = Self::lock(&self.landing_slots);
-        let mut rails: Vec<u16> = Self::lock(&self.active)
-            .iter()
-            .map(|mapping| mapping.rail.0)
-            .collect();
-        rails.sort_unstable();
-        rails.dedup();
-        rails
-            .into_iter()
-            .map(|rail| {
-                let mut gpus: Vec<(i32, usize)> = slots
-                    .iter()
-                    .filter(|((r, _), _)| *r == rail)
-                    .map(|(&(_, ordinal), &count)| (ordinal, count))
-                    .collect();
-                gpus.sort_unstable();
-                (rail, gpus)
-            })
-            .collect()
+        self.gpu_landing.state()
     }
 
     /// Count one landing grant on `rail` for GPU `ordinal` that found no
     /// free slot.
     pub fn count_landing_exhausted(&self, rail: RailId, ordinal: i32) {
-        let mut counts = Self::lock(&self.landing_exhausted);
-        let count = counts.entry((rail.0, ordinal)).or_default();
-        *count = count.saturating_add(1);
+        self.gpu_landing.count_exhausted(rail.0, ordinal);
     }
 
-    /// Landing exhaustion counts for metrics: every slice registered this
-    /// round (0 if none yet) and every slice that ever exhausted, sorted by
-    /// rail then GPU ordinal.
+    /// Landing exhaustion counts for metrics.
     pub fn landing_exhausted(&self) -> Vec<((u16, i32), u64)> {
-        let counts = Self::lock(&self.landing_exhausted);
-        let mut keys: Vec<(u16, i32)> = Self::lock(&self.landing_slots)
-            .keys()
-            .chain(counts.keys())
-            .copied()
-            .collect();
-        keys.sort_unstable();
-        keys.dedup();
-        keys.into_iter()
-            .map(|key| (key, counts.get(&key).copied().unwrap_or(0)))
-            .collect()
+        self.gpu_landing.exhausted()
     }
 
     /// Whether GPU landing is configured (GPU decrypt and RDMA both on).
     pub fn gpu_landing_configured(&self) -> bool {
-        Self::lock(&self.gpu_landing).is_some()
+        self.gpu_landing.configured()
     }
 
     fn reset(&self) {
-        Self::lock(&self.landings).clear();
-        Self::lock(&self.landing_slots).clear();
+        self.gpu_landing.clear_round();
         Self::lock(&self.active).clear();
         self.settled
             .store(false, std::sync::atomic::Ordering::Release);
@@ -339,6 +355,14 @@ impl<'a> SetupAttempt<'a> {
     pub fn finish(mut self) {
         self.done = true;
     }
+
+    /// The peer declined the setup for a benign reason (lost tie-break, rate
+    /// limit, overload): drop the attempt and retry soon, without the
+    /// escalating backoff of a failure.
+    pub fn decline(mut self) {
+        self.done = true;
+        self.links.decline(self.peer, self.rail, self.epoch);
+    }
 }
 
 impl Drop for SetupAttempt<'_> {
@@ -349,17 +373,19 @@ impl Drop for SetupAttempt<'_> {
     }
 }
 
-/// Result of checking an incoming setup before it reaches the owner.
+pub use super::setup::SetupAdmission;
+
+/// How a link setup this node initiated ended, for metrics.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SetupAdmission {
-    /// Accept the offer.
-    Accept,
+pub enum SetupOutcome {
+    /// The link connected.
+    Success,
 
-    /// Our own concurrent offer wins: answer `409 Conflict`.
-    Conflict,
+    /// The peer refused for a benign reason (`409`, `429`, `503`).
+    Declined,
 
-    /// Rate limited or overloaded: answer `429 Too Many Requests`.
-    Busy,
+    /// Anything else, including `403`.
+    Failed,
 }
 
 /// Per-worker facade over the node owner.
@@ -370,16 +396,25 @@ pub struct Links {
 
     local: NodeId,
 
-    grants_per_link: u32,
-
     retry: Rc<NativeRetry>,
 
     tasks: RefCell<Vec<Operation<'static, ()>>>,
 
     draining: Cell<bool>,
 
+    /// Owner break counters last recorded, by [`rdma_verbs::BreakReason`]
+    /// index, so [`Self::sync_link_metrics`] records only the growth.
+    breaks_seen: Cell<[u64; rdma_verbs::BreakReason::ALL.len()]>,
+
     /// Transfer counters, so benchmarks can tell which path pages took.
     metrics: Option<crate::telemetry::Metrics>,
+
+    /// This worker's clock (setup rate limits, stage timing) and entropy
+    /// (setup nonces).
+    ctx: racer_io::WorkerCtx,
+
+    /// This worker's NUMA node, if known, for NUMA-local rail choice.
+    numa: Option<usize>,
 }
 
 impl Links {
@@ -388,22 +423,44 @@ impl Links {
         client: Client,
         node: Arc<LinkNode>,
         local: NodeId,
-        connections_per_neighbor: usize,
         reactor: Option<Rc<crate::runtime::Reactor>>,
+        ctx: racer_io::WorkerCtx,
     ) -> Self {
         // Simulation uses explicitly fired one-shot alarms, never ClockPoll.
-        #[cfg(test)]
-        let reactor = reactor.filter(|_| uring_runtime::environment::simulation_seed().is_none());
+        let reactor = reactor.filter(|_| !ctx.is_simulated());
         Self {
             client,
             node,
             local,
-            grants_per_link: grants_per_link(connections_per_neighbor),
             retry: reactor.map_or_else(NativeRetry::unattached, NativeRetry::new),
             tasks: RefCell::new(Vec::new()),
             draining: Cell::new(false),
+            breaks_seen: Cell::new([0; rdma_verbs::BreakReason::ALL.len()]),
             metrics: None,
+            ctx,
+            numa: None,
         }
+    }
+
+    /// Set this worker's NUMA node, so [`Self::local_rails`] prefers rails
+    /// whose NIC is on it.
+    pub fn with_numa(mut self, numa: Option<usize>) -> Self {
+        self.numa = numa;
+        self
+    }
+
+    /// Rails whose NIC is on this worker's NUMA node and whose link to
+    /// `peer` is ready. Empty when the worker's node is unknown.
+    pub fn local_rails(&self, peer: &NodeId) -> Vec<RailId> {
+        let Some(numa) = self.numa else {
+            return Vec::new();
+        };
+        self.active()
+            .into_iter()
+            .filter(|m| m.numa_node == Some(numa))
+            .map(|m| m.rail)
+            .filter(|&rail| self.ready(peer, rail).is_some())
+            .collect()
     }
 
     /// Count pages and bytes in `metrics`.
@@ -426,7 +483,7 @@ impl Links {
         sum: crate::telemetry::Event,
         start: std::time::Instant,
     ) {
-        let elapsed = uring_runtime::environment::now().saturating_duration_since(start);
+        let elapsed = self.ctx.clock.now().saturating_duration_since(start);
         self.record(sum, u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX));
         self.record(count, 1);
     }
@@ -436,17 +493,91 @@ impl Links {
         self.record(crate::telemetry::Event::RdmaHttpFallback, 1);
     }
 
+    /// Count one link setup this node initiated, by outcome.
+    pub fn record_setup(&self, outcome: SetupOutcome) {
+        self.record(
+            match outcome {
+                SetupOutcome::Success => crate::telemetry::Event::RdmaLinkSetupSuccess,
+                SetupOutcome::Declined => crate::telemetry::Event::RdmaLinkSetupDeclined,
+                SetupOutcome::Failed => crate::telemetry::Event::RdmaLinkSetupFailed,
+            },
+            1,
+        );
+    }
+
+    /// The owner's count of link breaks for `reason` since the node started.
+    pub fn link_breaks(&self, reason: rdma_verbs::BreakReason) -> u64 {
+        self.client.link_breaks(reason)
+    }
+
+    /// Publish the owner's link break counters and link state counts. Call
+    /// from one worker only (the native owner), since the break counters
+    /// are node-wide.
+    pub fn sync_link_metrics(&self) {
+        use crate::telemetry::{Event, Gauge};
+        use rdma_verbs::BreakReason;
+        let Some(metrics) = &self.metrics else {
+            return;
+        };
+        let mut seen = self.breaks_seen.get();
+        for (index, reason) in BreakReason::ALL.into_iter().enumerate() {
+            let now = self.client.link_breaks(reason);
+            let grown = now.saturating_sub(seen[index]);
+            seen[index] = now;
+            if grown == 0 {
+                continue;
+            }
+            let event = match reason {
+                BreakReason::Error => Event::RdmaLinkBreakError,
+                BreakReason::Timeout => Event::RdmaLinkBreakTimeout,
+                BreakReason::PeerClosed => Event::RdmaLinkBreakPeerClosed,
+                BreakReason::Closed => Event::RdmaLinkBreakClosed,
+                BreakReason::Abandoned => Event::RdmaLinkBreakAbandoned,
+                BreakReason::Declined => Event::RdmaLinkBreakDeclined,
+                BreakReason::GrantExpired => Event::RdmaLinkBreakGrantExpired,
+                BreakReason::DeviceLost => Event::RdmaLinkBreakDeviceLost,
+            };
+            metrics.record(event, grown);
+        }
+        self.breaks_seen.set(seen);
+        let counts = self.client.link_counts();
+        for (gauge, value) in [
+            (Gauge::RdmaLinksReady, counts.ready),
+            (Gauge::RdmaLinksConnecting, counts.connecting),
+            (Gauge::RdmaLinksBackoff, counts.backoff),
+            (Gauge::RdmaLinksBreaking, counts.breaking),
+        ] {
+            metrics.set_gauge(gauge, value as u64);
+        }
+    }
+
     /// As [`Self::record_http_fallback`], because no ready link to the peer existed.
     pub fn record_fallback_no_link(&self) {
         self.record_http_fallback();
         self.record(crate::telemetry::Event::RdmaFallbackNoLink, 1);
     }
 
-    /// As [`Self::record_http_fallback`], because the grant failed, typically
-    /// with every page buffer in use.
-    pub fn record_fallback_grant(&self) {
+    /// As [`Self::record_http_fallback`], because the grant failed with
+    /// `error`. [`Error::Overloaded`] (every page buffer or grant slot of the
+    /// link in use, or the owner queue full) also counts separately.
+    pub fn record_fallback_grant(&self, error: Error) {
         self.record_http_fallback();
         self.record(crate::telemetry::Event::RdmaFallbackGrant, 1);
+        if error == Error::Overloaded {
+            self.record(crate::telemetry::Event::RdmaFallbackGrantOverloaded, 1);
+        }
+    }
+
+    /// Count a page request that failed `Overloaded` because no grant slot
+    /// or page buffer freed on any eligible rail within its wait, so its
+    /// range window retries it instead of the page going over HTTP.
+    pub fn record_grant_backpressure(&self) {
+        self.record(crate::telemetry::Event::RdmaGrantBackpressure, 1);
+    }
+
+    /// Count a grant request that parked for a slot ([`record_grant_wait`]).
+    pub fn record_grant_wait(&self, waited: bool, granted: bool) {
+        record_grant_wait(self.metrics.as_ref(), waited, granted);
     }
 
     /// Count a page body delivered over HTTP because its hop qualified for RDMA by Site and
@@ -455,6 +586,22 @@ impl Links {
     /// since the page never planned RDMA.
     pub fn record_fallback_overflow(&self) {
         self.record(crate::telemetry::Event::RdmaFallbackOverflow, 1);
+    }
+
+    /// Count a granted page the sender declined to write, so the receiver
+    /// gets its body over HTTP: the response was not a page body
+    /// (`not_page`), or the sender's own plan for the page and edge differs
+    /// from the granted rail (`plan_mismatch`), for example after a rail or
+    /// membership change.
+    pub fn record_send_declined(&self, not_page: bool) {
+        self.record(
+            if not_page {
+                crate::telemetry::Event::RdmaSendDeclinedNotPage
+            } else {
+                crate::telemetry::Event::RdmaSendDeclinedPlan
+            },
+            1,
+        );
     }
 
     /// Free page buffers across the active rails.
@@ -534,7 +681,7 @@ impl Links {
             }
             match &result {
                 Ok(rails) => self.node.settle(rails.clone()),
-                Err(Error::Cancelled | Error::DeadlineExceeded) => {}
+                Err(Error::Canceled | Error::DeadlineExceeded) => {}
                 Err(_) => self.node.settle(Vec::new()),
             }
             result
@@ -595,7 +742,7 @@ impl Links {
                     pool_bytes,
                     buffer_len: BUFFER_LEN,
                     max_links: crate::topology::RDMA_PEERS,
-                    grants_per_link: self.grants_per_link,
+                    grants_per_link: grants_per_link(pool_bytes / BUFFER_LEN),
                     idle: LINK_IDLE,
                     guard,
                 }),
@@ -624,7 +771,7 @@ impl Links {
     /// log: pages then land in host memory as usual. A GPU whose buffer no
     /// rail registered drops it again, which frees the GPU memory.
     pub(crate) async fn attach_landings(&self, rails: &[RailMapping], scope: &RequestScope) {
-        let Some((helper, bytes)) = self.node.take_gpu_landing() else {
+        let Some((helper, bytes)) = self.node.gpu_landing.take_config() else {
             return;
         };
         let slots = (bytes / BUFFER_LEN as u64) as usize;
@@ -685,8 +832,9 @@ impl Links {
                             "racer: stage=gpu-landing rail={} ordinal={ordinal} state=enabled slots={slots}",
                             rail.0
                         );
-                        LinkNode::lock(&self.node.landings).insert((rail.0, ordinal), slice);
-                        LinkNode::lock(&self.node.landing_slots).insert((rail.0, ordinal), slots);
+                        self.node
+                            .gpu_landing
+                            .register(rail.0, ordinal, slice, slots);
                     }
                     Err(error) => eprintln!(
                         "racer: stage=gpu-landing rail={} ordinal={ordinal} state=failed reason={error}",
@@ -697,9 +845,56 @@ impl Links {
         }
     }
 
+    /// Close links to peers that are no longer RDMA edges of `membership`,
+    /// instead of leaving them until their idle timeout. Links on every
+    /// active rail to the remaining edge peers are kept. Runs once per
+    /// membership across the node's workers.
+    pub fn retain_edges(&self, membership: &Arc<crate::topology::Membership>) {
+        {
+            let mut retained = LinkNode::lock(&self.node.retained);
+            if std::ptr::eq(retained.as_ptr(), Arc::as_ptr(membership)) {
+                return;
+            }
+            *retained = Arc::downgrade(membership);
+        }
+        let rails = self.active();
+        if rails.is_empty() {
+            return;
+        }
+        let keep = crate::rdma::rdma_edge_peers(membership, &self.local)
+            .iter()
+            .flat_map(|peer| rails.iter().map(move |m| link_key(peer, m.rail)))
+            .collect();
+        self.client.retain(keep);
+    }
+
     /// Whether GPU `ordinal` has a landing slice on `rail` this round.
     pub fn has_landing(&self, rail: RailId, ordinal: i32) -> bool {
         self.node.landing(rail, ordinal).is_some()
+    }
+
+    /// Devices the owner lost since the node started (see
+    /// [`rdma_verbs::Client::device_losses`]).
+    pub fn device_losses(&self) -> u64 {
+        self.client.device_losses()
+    }
+
+    /// True once the closed node freed every native object, so a new
+    /// activation can reopen it.
+    pub fn drained(&self) -> bool {
+        self.client.drained()
+    }
+
+    /// Why the closed node has not drained yet (see
+    /// [`rdma_verbs::Client::drain_blocker`]).
+    pub fn drain_blocker(&self) -> Option<rdma_verbs::DrainBlocker> {
+        self.client.drain_blocker()
+    }
+
+    /// Report `rail`'s device gone (see
+    /// [`rdma_verbs::Client::report_lost`]). Call before [`Self::close`].
+    pub fn report_lost(&self, rail: RailId) {
+        self.client.report_lost(rail.0);
     }
 
     /// Close the node: every link breaks and the owner drains. A later
@@ -760,7 +955,7 @@ impl Links {
         self.rail_ready(rail)
             && peer != &self.local
             && self.state(peer, rail) == LinkState::Idle
-            && !LinkNode::lock(&self.node.initiating).contains_key(&link_key(peer, rail))
+            && LinkNode::lock(&self.node.setup).idle(&link_key(peer, rail))
     }
 
     /// Initiator: open the link and return its epoch and encoded v2 setup.
@@ -772,16 +967,10 @@ impl Links {
     ) -> Result<(Epoch, Vec<u8>)> {
         let key = link_key(peer, rail);
         let mut reservation = {
-            let mut initiating = LinkNode::lock(&self.node.initiating);
-            if initiating.contains_key(&key) {
-                return Err(Error::Overloaded);
-            }
-            // Reserve the key before the owner answers; replaced with the epoch.
-            let token = self
-                .node
-                .reservations
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            initiating.insert(key, Initiating::Reserved(token));
+            // Claim the key before the owner answers.
+            let token = LinkNode::lock(&self.node.setup)
+                .begin(key)
+                .ok_or(Error::Overloaded)?;
             Reservation {
                 node: &self.node,
                 key,
@@ -795,19 +984,17 @@ impl Links {
         };
         // Read: the caller now owns the epoch.
         reservation.pending = None;
-        {
-            let mut initiating = LinkNode::lock(&self.node.initiating);
-            // A responder-side accept may have replaced our reservation.
-            if initiating.get(&key) == Some(&Initiating::Reserved(reservation.token)) {
-                initiating.insert(key, Initiating::Opened(opened.epoch));
-            }
-        }
+        // A responder-side accept may have superseded the attempt; then the
+        // owner already replaced this epoch and `connect` fails on it.
+        let _: Opened =
+            LinkNode::lock(&self.node.setup).opened(key, reservation.token, opened.epoch);
         drop(reservation);
         let setup = link_setup::Setup::new(
             rail,
             opened.setup.endpoint.to_bytes(),
             opened.setup.recv_credits,
-            self.grants_per_link,
+            opened.setup.grants_per_link,
+            &self.ctx.rng,
         );
         match setup {
             Ok(setup) => Ok((opened.epoch, setup.encode())),
@@ -858,11 +1045,16 @@ impl Links {
         self.finish_initiating(key, epoch);
     }
 
+    /// Initiator: the peer declined the setup on `epoch` for a benign reason.
+    /// Like [`Self::abandon`], but the key retries after the minimum backoff.
+    pub fn decline(&self, peer: &NodeId, rail: RailId, epoch: Epoch) {
+        let key = link_key(peer, rail);
+        self.client.decline_link(key, epoch);
+        self.finish_initiating(key, epoch);
+    }
+
     fn finish_initiating(&self, key: LinkKey, epoch: Epoch) {
-        let mut initiating = LinkNode::lock(&self.node.initiating);
-        if initiating.get(&key) == Some(&Initiating::Opened(epoch)) {
-            initiating.remove(&key);
-        }
+        LinkNode::lock(&self.node.setup).finish(key, epoch);
     }
 
     /// Responder: rate limit and tie-break an authenticated offer from `peer`.
@@ -872,22 +1064,8 @@ impl Links {
         if !self.rail_ready(rail) || peer == &self.local {
             return SetupAdmission::Busy;
         }
-        if LinkNode::lock(&self.node.initiating).contains_key(&key)
-            && link_setup::tie_break(&self.local, peer) == link_setup::TieBreak::Reject
-        {
-            return SetupAdmission::Conflict;
-        }
-        let now = uring_runtime::environment::now();
-        let mut setups = LinkNode::lock(&self.node.setups);
-        if setups
-            .get(&key)
-            .is_some_and(|last| now < *last + SETUP_INTERVAL)
-        {
-            return SetupAdmission::Busy;
-        }
-        setups.retain(|_, last| now < *last + SETUP_INTERVAL);
-        setups.insert(key, now);
-        SetupAdmission::Accept
+        let we_win = link_setup::tie_break(&self.local, peer) == link_setup::TieBreak::Reject;
+        LinkNode::lock(&self.node.setup).admit(key, we_win, self.ctx.clock.now(), SETUP_INTERVAL)
     }
 
     /// Responder: accept `remote` (already authenticated and admitted) and
@@ -904,7 +1082,7 @@ impl Links {
         // The link id needs our nonce before the owner returns our endpoint.
         let mut nonce = [0; 16];
         while nonce == [0; 16] {
-            uring_runtime::environment::fill_random(&mut nonce).map_err(|_| Error::Io)?;
+            self.ctx.rng.fill(&mut nonce).map_err(|_| Error::Io)?;
         }
         let link_id = link_setup::LinkId::for_setup(remote, &nonce);
         let opened = self
@@ -923,13 +1101,13 @@ impl Links {
             )
             .await?;
         // Our own concurrent offer, if any, lost the tie-break.
-        LinkNode::lock(&self.node.initiating).remove(&key);
+        LinkNode::lock(&self.node.setup).accepted(key);
         let setup = link_setup::Setup {
             rail,
             nonce,
             endpoint: opened.setup.endpoint.to_bytes(),
             recv_credits: opened.setup.recv_credits,
-            grants_per_link: self.grants_per_link,
+            grants_per_link: opened.setup.grants_per_link,
         };
         Ok(setup.encode())
     }
@@ -942,22 +1120,52 @@ impl Links {
         transfer: TransferId,
         scope: &RequestScope,
     ) -> Result<PendingReceive> {
+        self.grant_inner(peer, rail, transfer, None, scope)
+            .await
+            .map(|(pending, _)| pending)
+    }
+
+    /// Receiver: like [`Self::grant`], but when every grant slot of the link
+    /// or every buffer of the rail is held, park in the owner until one frees
+    /// (oldest request first) or `until` passes, then fail `Overloaded`.
+    /// Also returns whether the request parked.
+    pub async fn grant_parked(
+        &self,
+        peer: &NodeId,
+        rail: RailId,
+        transfer: TransferId,
+        until: Instant,
+        scope: &RequestScope,
+    ) -> Result<(PendingReceive, bool)> {
+        self.grant_inner(peer, rail, transfer, Some(until), scope)
+            .await
+    }
+
+    async fn grant_inner(
+        &self,
+        peer: &NodeId,
+        rail: RailId,
+        transfer: TransferId,
+        park: Option<Instant>,
+        scope: &RequestScope,
+    ) -> Result<(PendingReceive, bool)> {
         scope.check()?;
         let (epoch, link) = self.ready(peer, rail).ok_or(Error::Unavailable)?;
         let length = MAX_CIPHERTEXT as u32;
-        let granted = self
-            .wait(
-                self.client.grant(
-                    link_key(peer, rail),
-                    epoch,
-                    transfer.0,
-                    length,
-                    scope.deadline.0,
-                ),
-                scope,
-            )
-            .await?;
-        Ok(PendingReceive {
+        let key = link_key(peer, rail);
+        let op = match park {
+            Some(until) => {
+                self.client
+                    .grant_parked(key, epoch, transfer.0, length, scope.deadline.0, until)
+            }
+            None => self
+                .client
+                .grant(key, epoch, transfer.0, length, scope.deadline.0),
+        };
+        let granted = self.wait(op, scope).await?;
+        let waited = granted.waited;
+        let pending = PendingReceive {
+            granted: (self.ctx.clock.clone(), self.ctx.clock.now()),
             metrics: self.metrics.clone(),
             retry: self.retry.clone(),
             link,
@@ -967,7 +1175,13 @@ impl Links {
             transfer,
             arrival: granted.arrival,
             landing: None,
-        })
+        };
+        Ok((pending, waited))
+    }
+
+    /// Receiver grant requests parked for a free slot ([`Self::grant_parked`]).
+    pub fn grant_waiters(&self) -> usize {
+        self.client.grant_waiters()
     }
 
     /// Receiver: like [`Self::grant`], but the window is over a slot of GPU
@@ -1008,6 +1222,7 @@ impl Links {
             Err(error) => return Err(error),
         };
         Ok(PendingReceive {
+            granted: (self.ctx.clock.clone(), self.ctx.clock.now()),
             metrics: self.metrics.clone(),
             retry: self.retry.clone(),
             link,
@@ -1041,6 +1256,12 @@ impl Links {
         // The owner posts the write straight from the page through the
         // device's implicit on-demand paging region and holds it until the
         // completion, or until the QP is destroyed if the link breaks.
+        // Map the page into the NIC first, here on the worker: an unmapped
+        // source takes a NIC page fault per 4 KiB page, each stalling the
+        // queue pair, and every write on the link waits behind them.
+        if self.client.prefetch(grant.rail.0, page.bytes()).is_err() {
+            self.record(crate::telemetry::Event::RdmaPrefetchFailed, 1);
+        }
         let source = Source::new(Arc::new(PageSource(page.clone())));
         let key = link_key(peer, grant.rail);
         let written = self
@@ -1051,11 +1272,12 @@ impl Links {
             )
             .await;
         if let Err(error) = written {
-            // Cancellation or the deadline can win after the owner already
-            // consumed the tag. A `Release` for a consumed tag would wait for
-            // a grant that never comes, so break this epoch instead.
-            if matches!(error, Error::Cancelled | Error::DeadlineExceeded) {
-                self.client.break_link(key, epoch);
+            // Cancellation or the deadline can win before or after the owner
+            // consumed the tag. Release is idempotent per epoch: it frees a
+            // grant the write never used and completes at once for a tag
+            // already written, so the link survives either way.
+            if matches!(error, Error::Canceled | Error::DeadlineExceeded) {
+                self.release_epoch(key, epoch, grant.tag);
             }
             return Err(error);
         }
@@ -1067,19 +1289,38 @@ impl Links {
     }
 
     /// Sender: decline the peer's grant if its link is still the granted one.
+    ///
+    /// The owner matches the grant's link id against its own link table,
+    /// not the worker snapshot: a snapshot that lags a just-ready link would
+    /// otherwise skip the release and leave the peer's grant exposed until
+    /// its deadline, which breaks the peer's link. Release is idempotent on
+    /// the owner, and a grant whose link is gone has nothing to release.
     pub fn release(&self, peer: &NodeId, grant: &AuthenticatedGrant) {
-        if let Some((epoch, link)) = self.ready(peer, grant.rail)
-            && link == grant.link
+        if !self.rail_ready(grant.rail) {
+            return;
+        }
+        let key = link_key(peer, grant.rail);
+        let release = self.client.release_link(key, grant.link, grant.tag);
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        // Refused before the owner saw it (full queue): break the link on
+        // the guaranteed path, as `release_epoch` does.
+        if let std::task::Poll::Ready(Err(rdma_verbs::Error::Overloaded)) = release.poll(&mut cx)
+            && let LinkState::Ready { epoch, link_id } = self.client.link(key)
+            && link_id == grant.link
         {
-            let key = link_key(peer, grant.rail);
-            let release = self.client.release(key, epoch, grant.tag);
-            // An op that failed before the owner saw it (full queue, owner
-            // gone) never sends `Release`; the peer would hold the window until
-            // its deadline. Break the epoch on the guaranteed path instead.
-            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-            if let std::task::Poll::Ready(Err(_)) = release.poll(&mut cx) {
-                self.client.break_link(key, epoch);
-            }
+            self.client.break_link(key, epoch);
+        }
+    }
+
+    /// Send `Release` for `tag` on `key`'s link at `epoch`.
+    fn release_epoch(&self, key: LinkKey, epoch: Epoch, tag: u32) {
+        let release = self.client.release(key, epoch, tag);
+        // An op that failed before the owner saw it (full queue, owner
+        // gone) never sends `Release`; the peer would hold the window until
+        // its deadline. Break the epoch on the guaranteed path instead.
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        if let std::task::Poll::Ready(Err(_)) = release.poll(&mut cx) {
+            self.client.break_link(key, epoch);
         }
     }
 }
@@ -1132,11 +1373,19 @@ pub struct PendingReceive {
     transfer: TransferId,
     arrival: Op<Arrival>,
 
+    /// When the owner granted the buffer, and the clock to time its hold.
+    granted: (racer_io::Clock, Instant),
+
     /// The GPU landing buffer the grant is over, for a landing grant.
     landing: Option<Arc<crate::gpu::GpuLanding>>,
 }
 
 impl PendingReceive {
+    /// The rail the window was granted on.
+    pub fn rail(&self) -> RailId {
+        self.rail
+    }
+
     /// True for a grant over a GPU landing slot ([`Links::grant_landing`]).
     pub fn is_landing(&self) -> bool {
         self.landing.is_some()
@@ -1174,7 +1423,7 @@ impl PendingReceive {
         let page = match arrival {
             Ok(Arrival::Device(page)) => page,
             Ok(Arrival::Released | Arrival::Page(_)) => return Err(Error::Io),
-            Err(error @ Error::Cancelled) => return Err(error),
+            Err(error @ Error::Canceled) => return Err(error),
             Err(_) => {
                 scope.check()?;
                 return Err(Error::Io);
@@ -1227,15 +1476,40 @@ impl PendingReceive {
         head: &VerifiedHead,
         envelope: PageEnvelope,
         admission: &Rc<flow_control::Quotas<AdmissionPolicy>>,
+        reclaim: Option<&crate::peer::transport::Reclaim<'_>>,
         scope: &RequestScope,
     ) -> Result<CiphertextPage> {
         scope.check()?;
         let length = self.check_completion(head, &envelope)?;
-        let reservation = admission.reserve(
-            Some(&envelope.page.version.object.cache),
-            ResourceClass::Ciphertext,
+        // Idle cache entries yield to the in-flight receive before it fails.
+        let reservation = crate::peer::transport::reserve_ciphertext(
+            admission,
+            reclaim,
+            &envelope.page.version.object.cache,
             length as usize,
         )?;
+        self.finish_reserved(head, envelope, reservation, admission, scope)
+            .await
+    }
+
+    /// The page length a signed completion names, after checking that it names
+    /// this link, tag, transfer, and the envelope's length.
+    pub fn completion_length(&self, head: &VerifiedHead, envelope: &PageEnvelope) -> Result<u32> {
+        self.check_completion(head, envelope)
+    }
+
+    /// [`Self::finish`] with ciphertext budget the caller already reserved for
+    /// [`Self::completion_length`] bytes.
+    pub async fn finish_reserved(
+        self,
+        head: &VerifiedHead,
+        envelope: PageEnvelope,
+        reservation: flow_control::Charge<AdmissionPolicy>,
+        admission: &Rc<flow_control::Quotas<AdmissionPolicy>>,
+        scope: &RequestScope,
+    ) -> Result<CiphertextPage> {
+        scope.check()?;
+        let length = self.check_completion(head, &envelope)?;
         let arrival = self
             .retry
             .wait(scope, poll_fn(|cx| self.arrival.poll(cx)))
@@ -1244,7 +1518,7 @@ impl PendingReceive {
             Ok(Arrival::Page(page)) => page,
             // A landing grant finishes with `finish_landed`.
             Ok(Arrival::Released | Arrival::Device(_)) => return Err(Error::Io),
-            Err(error @ Error::Cancelled) => return Err(error),
+            Err(error @ Error::Canceled) => return Err(error),
             Err(_) => {
                 scope.check()?;
                 return Err(Error::Io);
@@ -1257,7 +1531,17 @@ impl PendingReceive {
             metrics.record(crate::telemetry::Event::RdmaPagesReceived, 1);
             metrics.record(crate::telemetry::Event::RdmaReceivedBytes, length.into());
         }
-        BufferPool::new(admission.clone()).registered_ciphertext(reservation, envelope, page)
+        let (clock, since) = self.granted.clone();
+        let hold = self
+            .metrics
+            .clone()
+            .map(|metrics| crate::memory::ReceiveHold::new(metrics, clock, since));
+        BufferPool::new(admission.clone()).registered_ciphertext_held(
+            reservation,
+            envelope,
+            page,
+            hold,
+        )
     }
 }
 

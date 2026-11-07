@@ -3,7 +3,7 @@
 //! Primitive callers supply entropy, ensure nonce uniqueness for each key, and
 //! choose domain separation. AEAD borrows input and writes directly to caller-owned
 //! output without allocating or staging plaintext. Public-key parsing does not
-//! establish identity or trust. CRC detects accidental corruption, not forgery.
+//! establish identity or trust.
 //!
 //! Callers must protect and erase their input seeds, key buffers, and imported
 //! DER. Secret-key ownership and explicit PKCS#8 export retain upstream
@@ -13,13 +13,14 @@
 //! Public workflows and standard vectors live in `tests/primitives.rs`; private
 //! epoch/cache state-space tests remain here. Tests do not establish timing or
 //! secret-erasure guarantees. Run `cargo test -p racer-crypto` from the workspace.
-//! Select ignored CRC hardware tests individually on supported hosts; they fail
-//! on unsupported hardware rather than silently skipping.
 
-#![forbid(unsafe_code)]
+// `deny` rather than `forbid` so the single SIMD GHASH module can opt in with a
+// scoped `allow`; every other module still rejects `unsafe`.
+#![deny(unsafe_code)]
 #![deny(missing_docs)]
 
-pub mod enrollment;
+#[cfg(target_arch = "x86_64")]
+mod ghash_x86;
 
 use chacha20poly1305::{
     KeyInit, Tag, XChaCha20Poly1305,
@@ -128,7 +129,9 @@ pub fn seal(
 ///
 /// Only the master AES-256 key schedule and the CMAC subkey K1 are retained.
 /// Each call derives the per-nonce AES-256-GCM key and runs the bulk AEAD
-/// through ring, whose AES-GCM uses AES-NI/VAES and carry-less multiply.
+/// through aws-lc-rs, whose AES-GCM uses AES-NI/VAES and carry-less multiply
+/// and opens out of place, so a page decrypts from its source buffer into its
+/// destination in one pass.
 /// The output is byte-identical to the reference construction.
 pub(crate) struct PageCipher {
     // aes is built with its zeroize feature, so the schedule is wiped on drop.
@@ -169,19 +172,6 @@ impl PageCipher {
         Ok(kx)
     }
 
-    fn derive(&self, nonce: &[u8; 24]) -> Result<ring::aead::LessSafeKey, Error> {
-        let kx = self.derive_key(nonce)?;
-        let key = ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, &kx[..])
-            .map_err(|_| Error(()))?;
-        Ok(ring::aead::LessSafeKey::new(key))
-    }
-
-    fn gcm_nonce(nonce: &[u8; 24]) -> ring::aead::Nonce {
-        let mut tail = [0u8; 12];
-        tail.copy_from_slice(&nonce[12..]);
-        ring::aead::Nonce::assume_unique_for_key(tail)
-    }
-
     /// See [`seal`]. A wrong output length leaves `out` untouched; any later
     /// error zeroes it.
     pub(crate) fn seal(
@@ -195,13 +185,14 @@ impl PageCipher {
             return Err(Error(()));
         }
         let result = (|| {
-            let key = self.derive(nonce)?;
+            let kx = self.derive_key(nonce)?;
             let (ciphertext, tag_out) = out.split_at_mut(plaintext.len());
+            // aws-lc-rs seals only in place; sealing is off the receive path.
             ciphertext.copy_from_slice(plaintext);
-            let tag = key
+            let tag = gcm_key(&kx)?
                 .seal_in_place_separate_tag(
-                    Self::gcm_nonce(nonce),
-                    ring::aead::Aad::from(aad),
+                    gcm_nonce(nonce),
+                    aws_lc_rs::aead::Aad::from(aad),
                     ciphertext,
                 )
                 .map_err(|_| Error(()))?;
@@ -228,9 +219,13 @@ impl PageCipher {
             return Err(Error(()));
         }
         let (ciphertext, tag) = sealed.split_at(length);
-        // ring has no out-of-place open, so decrypt a copy in place.
-        out.copy_from_slice(ciphertext);
-        self.open_in_place(nonce, aad, out, tag)
+        let result = self
+            .derive_key(nonce)
+            .and_then(|kx| gcm_open(&kx, gcm_nonce(nonce), aad, ciphertext, tag, out));
+        if result.is_err() {
+            out.fill(0);
+        }
+        result
     }
 
     /// Open `inout`, which already holds the ciphertext body, in place against
@@ -243,24 +238,181 @@ impl PageCipher {
         inout: &mut [u8],
         tag: &[u8],
     ) -> Result<(), Error> {
-        let result = (|| {
-            let tag = ring::aead::Tag::try_from(tag).map_err(|_| Error(()))?;
-            let key = self.derive(nonce)?;
-            key.open_in_place_separate_tag(
-                Self::gcm_nonce(nonce),
-                ring::aead::Aad::from(aad),
-                tag,
-                inout,
-                0..,
-            )
-            .map(|_| ())
-            .map_err(|_| Error(()))
-        })();
+        let result = self
+            .derive_key(nonce)
+            .and_then(|kx| gcm_open_in_place(&kx, gcm_nonce(nonce), aad, inout, tag));
         if result.is_err() {
             inout.fill(0);
         }
         result
     }
+}
+
+/// The AES-GCM nonce: the last 12 bytes of the XAES nonce.
+fn gcm_nonce(nonce: &[u8; 24]) -> aws_lc_rs::aead::Nonce {
+    aws_lc_rs::aead::Nonce::assume_unique_for_key(std::array::from_fn(|i| nonce[12 + i]))
+}
+
+fn gcm_key(key: &[u8; 32]) -> Result<aws_lc_rs::aead::LessSafeKey, Error> {
+    let key = aws_lc_rs::aead::UnboundKey::new(&aws_lc_rs::aead::AES_256_GCM, key)
+        .map_err(|_| Error(()))?;
+    Ok(aws_lc_rs::aead::LessSafeKey::new(key))
+}
+
+/// AES-256-GCM open from `ciphertext` straight into `out` in one pass, with no
+/// staging copy. The two must not overlap. On error `out` may hold
+/// unauthenticated plaintext; callers zero it.
+fn gcm_open(
+    key: &[u8; 32],
+    nonce: aws_lc_rs::aead::Nonce,
+    aad: &[u8],
+    ciphertext: &[u8],
+    tag: &[u8],
+    out: &mut [u8],
+) -> Result<(), Error> {
+    if tag.len() != TAG_LEN || ciphertext.len() != out.len() {
+        return Err(Error(()));
+    }
+    gcm_key(key)?
+        .open_separate_gather(nonce, aws_lc_rs::aead::Aad::from(aad), ciphertext, tag, out)
+        .map_err(|_| Error(()))
+}
+
+/// AES-256-GCM open of `inout` in place. On error `inout` may hold
+/// unauthenticated plaintext; callers zero it.
+fn gcm_open_in_place(
+    key: &[u8; 32],
+    nonce: aws_lc_rs::aead::Nonce,
+    aad: &[u8],
+    inout: &mut [u8],
+    tag: &[u8],
+) -> Result<(), Error> {
+    if tag.len() != TAG_LEN {
+        return Err(Error(()));
+    }
+    gcm_key(key)?
+        .open_in_place_separate_tag(nonce, aws_lc_rs::aead::Aad::from(aad), tag, inout)
+        .map(|_| ())
+        .map_err(|_| Error(()))
+}
+
+impl PageCipher {
+    /// See [`verify_tag`].
+    pub(crate) fn verify_tag(
+        &self,
+        nonce: &[u8; 24],
+        aad: &[&[u8]],
+        ciphertext: &[u8],
+        tag: &[u8],
+    ) -> Result<(), Error> {
+        use aes::cipher::{BlockCipherEncrypt, KeyInit};
+        if tag.len() != TAG_LEN {
+            return Err(Error(()));
+        }
+        let kx = self.derive_key(nonce)?;
+        let aes = aes::Aes256::new((&*kx).into());
+        // H = AES_K(0^128) keys GHASH.
+        let mut h = Zeroizing::new([0u8; 16]);
+        aes.encrypt_block((&mut *h).into());
+        let mut ghash = PageGhash::new(&h);
+        // Stream AAD fields through a 16-byte carry so split fields hash
+        // exactly like their concatenation without staging them.
+        let mut carry = [0u8; 16];
+        let mut used = 0usize;
+        let mut aad_len = 0u64;
+        for part in aad {
+            aad_len += part.len() as u64;
+            let mut part = *part;
+            if used > 0 {
+                let take = part.len().min(16 - used);
+                carry[used..used + take].copy_from_slice(&part[..take]);
+                used += take;
+                part = &part[take..];
+                if used < 16 {
+                    continue;
+                }
+                ghash.update_padded(&carry);
+            }
+            let whole = part.len() & !15;
+            ghash.update_padded(&part[..whole]);
+            let tail = &part[whole..];
+            carry[..tail.len()].copy_from_slice(tail);
+            used = tail.len();
+        }
+        if used > 0 {
+            ghash.update_padded(&carry[..used]);
+        }
+        ghash.update_padded(ciphertext);
+        let mut lengths = [0u8; 16];
+        lengths[..8].copy_from_slice(&(aad_len * 8).to_be_bytes());
+        lengths[8..].copy_from_slice(&((ciphertext.len() as u64) * 8).to_be_bytes());
+        ghash.update_padded(&lengths);
+        let s = ghash.finalize();
+        // J0 = IV || 0^31 || 1 for a 96-bit IV.
+        let mut j0 = Zeroizing::new([0u8; 16]);
+        j0[..12].copy_from_slice(&nonce[12..]);
+        j0[15] = 1;
+        aes.encrypt_block((&mut *j0).into());
+        let mut expected = Zeroizing::new([0u8; 16]);
+        for i in 0..16 {
+            expected[i] = s[i] ^ j0[i];
+        }
+        if ct_eq(&expected[..], tag) {
+            Ok(())
+        } else {
+            Err(Error(()))
+        }
+    }
+}
+
+/// GHASH with an aggregated PCLMULQDQ/VPCLMULQDQ path on x86_64 and the
+/// portable `ghash` crate everywhere else (or when the CPU lacks CLMUL).
+enum PageGhash {
+    #[cfg(target_arch = "x86_64")]
+    Fast(ghash_x86::Ghash),
+    Portable(ghash::GHash),
+}
+
+impl PageGhash {
+    fn new(h: &[u8; 16]) -> Self {
+        #[cfg(target_arch = "x86_64")]
+        if let Some(fast) = ghash_x86::Ghash::new(h) {
+            return Self::Fast(fast);
+        }
+        Self::Portable(ghash::GHash::new(h.into()))
+    }
+
+    fn update_padded(&mut self, data: &[u8]) {
+        use ghash::universal_hash::UniversalHash;
+        match self {
+            #[cfg(target_arch = "x86_64")]
+            Self::Fast(g) => g.update_padded(data),
+            Self::Portable(g) => g.update_padded(data),
+        }
+    }
+
+    fn finalize(self) -> [u8; 16] {
+        use ghash::universal_hash::UniversalHash;
+        match self {
+            #[cfg(target_arch = "x86_64")]
+            Self::Fast(g) => g.finalize(),
+            Self::Portable(g) => g.finalize().into(),
+        }
+    }
+}
+
+/// Check an XAES-256-GCM tag over `aad` (the concatenation of its parts) and
+/// `ciphertext` without decrypting. Accepts exactly the inputs [`open`]
+/// accepts, at the cost of one GHASH pass plus three AES blocks. Comparison is
+/// constant time. Nothing is allocated.
+pub fn verify_tag(
+    key: &[u8; 32],
+    nonce: &[u8; 24],
+    aad: &[&[u8]],
+    ciphertext: &[u8],
+    tag: &[u8],
+) -> Result<(), Error> {
+    PageCipher::new(key).verify_tag(nonce, aad, ciphertext, tag)
 }
 
 fn seal_with<C>(
@@ -347,6 +499,45 @@ impl DerivedPageKey {
     }
 }
 
+impl DerivedPageKey {
+    /// Authenticate and decrypt `inout`, which holds a page's ciphertext body,
+    /// in place against the separate 16-byte `tag`, with the AES-256-GCM key
+    /// and nonce [`xaes_derive`] produced. Equivalent to [`open`] with the
+    /// original key and nonce, without the copy [`open`] makes. Any failure,
+    /// including a bad tag length, zeroes `inout`, since a failed tag check
+    /// leaves unauthenticated plaintext behind.
+    pub fn open_in_place(&self, aad: &[u8], inout: &mut [u8], tag: &[u8]) -> Result<(), Error> {
+        let result = gcm_open_in_place(&self.key, self.gcm_nonce(), aad, inout, tag);
+        if result.is_err() {
+            inout.fill(0);
+        }
+        result
+    }
+
+    /// Authenticate and decrypt the ciphertext body `ciphertext` against the
+    /// separate 16-byte `tag`, writing the plaintext to `out` in one pass.
+    /// `out` must be exactly as long as `ciphertext` and must not overlap it.
+    /// Any failure, including a bad length, zeroes `out`, since a failed tag
+    /// check leaves unauthenticated plaintext behind.
+    pub fn open_into(
+        &self,
+        aad: &[u8],
+        ciphertext: &[u8],
+        tag: &[u8],
+        out: &mut [u8],
+    ) -> Result<(), Error> {
+        let result = gcm_open(&self.key, self.gcm_nonce(), aad, ciphertext, tag, out);
+        if result.is_err() {
+            out.fill(0);
+        }
+        result
+    }
+
+    fn gcm_nonce(&self) -> aws_lc_rs::aead::Nonce {
+        aws_lc_rs::aead::Nonce::assume_unique_for_key(self.nonce)
+    }
+}
+
 /// Derive the AES-256-GCM key and nonce XAES-256-GCM uses for `nonce`, as
 /// specified at <https://c2sp.org/XAES-256-GCM>:
 /// `L = AES-256(K, 0^128)`, `K1 = L << 1` (xor `0x87` on carry), and the key is
@@ -420,37 +611,6 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.iter().zip(b).fold(0u8, |diff, (a, b)| diff | (a ^ b)) == 0
 }
 
-/// CRC-64/XZ checksum. Detects accidental corruption, not malicious changes.
-pub fn crc64(bytes: &[u8]) -> u64 {
-    let mut digest = crc64fast::Digest::new();
-    digest.write(bytes);
-    digest.sum64()
-}
-
-/// Bytes copied and then checksummed while they are still cache resident.
-const COPY_CRC_CHUNK: usize = 128 * 1024;
-
-/// Copy the leading `out.len()` bytes of `input` into `out` and return the
-/// CRC-64/XZ of all of `input`, reading `input` from memory only once.
-///
-/// Each chunk is checksummed from `out` right after it is copied, while it is
-/// still in cache, so this costs about one pass instead of a copy plus a
-/// separate checksum scan. Fails without touching `out` when `out` is longer
-/// than `input`.
-pub fn copy_prefix_crc64(input: &[u8], out: &mut [u8]) -> Result<u64, Error> {
-    let (prefix, rest) = input.split_at_checked(out.len()).ok_or(Error(()))?;
-    let mut digest = crc64fast::Digest::new();
-    for (from, to) in prefix
-        .chunks(COPY_CRC_CHUNK)
-        .zip(out.chunks_mut(COPY_CRC_CHUNK))
-    {
-        to.copy_from_slice(from);
-        digest.write(to);
-    }
-    digest.write(rest);
-    Ok(digest.sum64())
-}
-
 pub mod identity {
     //! Trust roots, certificate validation, and locally generated Ed25519 identities.
     //!
@@ -466,7 +626,7 @@ pub mod identity {
     //! caller-owned. Purpose, cache, and key ID checks do not consult current admission.
     //!
     //! Callers own nonce uniqueness, canonical AAD/messages, quotas, cancellation,
-    //! CRC checks, telemetry, and completion ownership. PKCS8 persistence export is
+    //! integrity checks, telemetry, and completion ownership. PKCS8 persistence export is
     //! explicit and zeroizing. Errors contain no input data. Certificate caches are
     //! worker-local and non-Send; verified peers cannot be constructed by callers.
     //! This module has no dependency on the dataplane worker or service graph.
@@ -489,26 +649,29 @@ pub mod identity {
     //! key without consuming additional entropy. Production does not enable it.
     use crate::{SigningKey, VerifyingKey};
     #[cfg(test)]
-    use racer_control_wire::CacheKeyPurpose;
+    use racer_wire::control::CacheKeyPurpose;
 
     /// Check the canonical UUID spelling used by Racer identity bindings.
-    pub use racer_control_wire::valid_uuid as canonical_uuid;
-    use racer_control_wire::{
-        BundleGeneration, CacheId, CacheKeyRef, CacheKeyState, ClusterId, KeyId, NodeId,
-        SCHEMA_VERSION,
+    pub use racer_wire::control::valid_uuid as canonical_uuid;
+    use racer_wire::control::{
+        BundleGeneration, CacheId, CacheKeyRef, CacheKeyState, ClusterId, KEYRING_SCHEMA_VERSION,
+        KeyId, MAX_BUNDLE_KEYS, MAX_RETAINED_PAGE_KEYS, NodeId,
     };
     use rustls::{
         RootCertStore,
         pki_types::{CertificateDer, PrivatePkcs8KeyDer},
     };
     use sha2::{Digest, Sha256};
+    use std::collections::{HashMap, HashSet};
     use std::{
-        cell::RefCell,
+        cell::{Cell, RefCell},
         collections::VecDeque,
         rc::Rc,
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex, Weak,
+            atomic::{AtomicU64, Ordering},
+        },
     };
-    use uring_runtime::environment;
     use x509_parser::{extensions::GeneralName, parse_x509_certificate};
     use zeroize::Zeroizing;
 
@@ -555,15 +718,88 @@ pub mod identity {
         expires: u64,
 
         valid_from: u64,
+
+        clock: WallClock,
+    }
+
+    /// Per-node wall clock injected at construction, so identity checks need no
+    /// ambient runtime state. Host builds read `SystemTime::now`; simulations pass
+    /// their virtual clock.
+    #[derive(Clone)]
+    pub struct WallClock(Arc<dyn Fn() -> std::time::SystemTime + Send + Sync>);
+
+    impl WallClock {
+        /// Read the host wall clock.
+        pub fn host() -> Self {
+            Self(Arc::new(std::time::SystemTime::now))
+        }
+
+        /// Read wall time from a caller-owned source, such as a simulated clock.
+        pub fn new(now: impl Fn() -> std::time::SystemTime + Send + Sync + 'static) -> Self {
+            Self(Arc::new(now))
+        }
+
+        /// Current wall time.
+        pub fn now(&self) -> std::time::SystemTime {
+            (self.0)()
+        }
+
+        /// Wall time for rustls, clamped to the Unix epoch for pre-epoch clocks.
+        /// This retains rustls's whole-second truncation and does not set certificate policy.
+        pub fn unix_time(&self) -> rustls::pki_types::UnixTime {
+            rustls::pki_types::UnixTime::since_unix_epoch(
+                self.now()
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default(),
+            )
+        }
+    }
+
+    impl std::fmt::Debug for WallClock {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("WallClock")
+        }
     }
 
     /// Shared publication lock for complete epochs and their signing identity.
-    #[derive(Default)]
     pub struct KeyEpochs {
         state: Mutex<State>,
+
+        /// Advanced with Release after every replacement of the published key
+        /// table, so keyring views reload their worker-local index lazily.
+        epoch: AtomicU64,
+
+        clock: WallClock,
+    }
+
+    impl Default for KeyEpochs {
+        /// Epochs checked against the host wall clock.
+        fn default() -> Self {
+            Self::with_clock(WallClock::host())
+        }
+    }
+
+    impl KeyEpochs {
+        /// Epochs whose identity and trust checks read the given wall clock.
+        pub fn with_clock(clock: WallClock) -> Self {
+            Self {
+                state: Mutex::default(),
+                epoch: AtomicU64::new(0),
+                clock,
+            }
+        }
+
+        /// The wall clock used for identity and trust checks.
+        pub fn clock(&self) -> &WallClock {
+            &self.clock
+        }
     }
 
     /// A cluster/node view of shared epochs, responsible for admission and rotation.
+    ///
+    /// Each view keeps a local copy of the admission index, reloaded only when
+    /// the shared epoch moves, so admission checks and leases take no lock.
+    /// The index holds no key material; leases upgrade a weak entry reference.
     #[derive(Clone)]
     pub struct Keyring {
         cluster: ClusterId,
@@ -571,6 +807,11 @@ pub mod identity {
         node: NodeId,
 
         epochs: Arc<KeyEpochs>,
+
+        /// Epoch of `local`; `u64::MAX` before the first load.
+        local_epoch: Cell<u64>,
+
+        local: RefCell<Option<Arc<KeyIndex>>>,
     }
 
     /// Canonical bundle replay tracking paired with its current keyring owner.
@@ -585,7 +826,7 @@ pub mod identity {
         Replay,
 
         /// Canonical wire validation failed.
-        Wire(racer_control_wire::Error),
+        Wire(racer_wire::control::Error),
 
         /// The keyring rejected the proposed epoch.
         Identity(Error),
@@ -595,14 +836,7 @@ pub mod identity {
     struct BundleDelivery {
         keys: Rc<Keyring>,
 
-        accepted: Option<AcceptedBundle>,
-    }
-
-    /// Accepted canonical content used to reject conflicting delivery cursors.
-    struct AcceptedBundle {
-        generation: BundleGeneration,
-
-        hash: [u8; 32],
+        accepted: Option<BundleGeneration>,
     }
 
     impl BundleInstaller {
@@ -618,11 +852,7 @@ pub mod identity {
 
         /// Return the last successfully accepted bundle generation.
         pub fn generation(&self) -> Option<BundleGeneration> {
-            self.state
-                .borrow()
-                .accepted
-                .as_ref()
-                .map(|accepted| accepted.generation)
+            self.state.borrow().accepted
         }
 
         /// Replace the keyring and reset delivery tracking for its new owner.
@@ -636,28 +866,21 @@ pub mod identity {
         /// Canonicalize unordered records, reject replay, and atomically install keys.
         pub fn install(
             &self,
-            mut bundle: racer_control_wire::KeyringBundle,
+            mut bundle: racer_wire::control::KeyringBundle,
         ) -> std::result::Result<(BundleGeneration, Vec<Vec<u8>>), BundleError> {
             bundle.peer_trust_roots.sort();
             bundle
                 .cache_keys
                 .sort_by(|a, b| reference_order(&a.key).cmp(&reference_order(&b.key)));
-            let encoded = Zeroizing::new(
-                racer_control_wire::encode_bundle(&bundle).map_err(BundleError::Wire)?,
-            );
-            let hash: [u8; 32] = Sha256::digest(&*encoded).into();
-            let mut state = self.state.borrow_mut();
-            if let Some(old) = state.accepted.as_ref()
-                && (bundle.generation < old.generation
-                    || bundle.generation == old.generation && hash != old.hash)
-            {
-                return Err(BundleError::Replay);
+            if bundle.cache_keys.len() > MAX_BUNDLE_KEYS {
+                return Err(BundleError::Identity(Error::InvalidConfiguration));
             }
-            // Even exact cached delivery must consult current shared epochs.
-            // Another keyring view may have advanced or retired this generation.
+            let mut state = self.state.borrow_mut();
+            // Replay is judged once, against the shared published epoch, by
+            // `accept_bundle`; exact redelivery is acknowledged without change.
             let roots = bundle.peer_trust_roots.clone();
-            let generation = state.keys.install(bundle).map_err(BundleError::Identity)?;
-            state.accepted = Some(AcceptedBundle { generation, hash });
+            let generation = state.keys.install_checked(&bundle.into())?;
+            state.accepted = Some(generation);
             Ok((generation, roots))
         }
     }
@@ -672,13 +895,15 @@ pub mod identity {
     /// fn diagnostic(key: racer_crypto::identity::KeyLease) { println!("{key:?}"); }
     /// ```
     pub struct KeyLease {
-        reference: CacheKeyRef,
+        /// The admitted epoch entry; cloning it never allocates.
+        entry: Arc<Entry>,
 
-        secret: Arc<Secret>,
+        /// Whether the key was active when leased. Only active keys seal.
+        sealable: bool,
     }
 
     /// The wire-defined purpose permanently bound to a key epoch.
-    pub use racer_control_wire::CacheKeyPurpose as KeyPurpose;
+    pub use racer_wire::control::CacheKeyPurpose as KeyPurpose;
 
     /// Worker-local verifier caching exact chains against the current trust roots.
     /// ```compile_fail
@@ -713,15 +938,16 @@ pub mod identity {
 
     /// Only successful certificate validation can construct a verified peer.
     /// ```compile_fail
-    /// let peer = racer_crypto::identity::VerifiedPeer { node: racer_control_wire::NodeId("forged".into()) };
+    /// let peer = racer_crypto::identity::VerifiedPeer { node: racer_wire::control::NodeId("forged".into()) };
     /// ```
     pub struct VerifiedPeer {
         node: NodeId,
     }
 
     /// An authenticated leaf key and the conservative lifetime of its trust snapshot.
-    pub(super) struct ValidatedChain {
-        pub(super) key: VerifyingKey,
+    pub struct ValidatedChain {
+        /// The validated leaf public key.
+        pub key: VerifyingKey,
 
         valid_from: u64,
 
@@ -752,9 +978,9 @@ pub mod identity {
         cache_keys: Vec<CacheEncryptionKey>,
     }
 
-    impl From<racer_control_wire::KeyringBundle> for KeyringBundle {
+    impl From<racer_wire::control::KeyringBundle> for KeyringBundle {
         /// Move transferred material into private, zeroizing validation staging.
-        fn from(bundle: racer_control_wire::KeyringBundle) -> Self {
+        fn from(bundle: racer_wire::control::KeyringBundle) -> Self {
             Self {
                 schema_version: bundle.schema_version,
                 cluster: bundle.cluster,
@@ -777,13 +1003,18 @@ pub mod identity {
     }
 
     impl PendingIdentity {
-        /// Generate a key from the scoped runtime entropy source.
+        /// Generate a key from operating-system entropy.
         pub fn generate() -> Result<Self> {
             let mut seed = Zeroizing::new([0u8; 32]);
-            environment::fill_random(&mut *seed).map_err(|_| Error::Unavailable)?;
-            Ok(Self {
-                key: SigningKey::from_seed(&seed),
-            })
+            getrandom::getrandom(&mut *seed).map_err(|_| Error::Unavailable)?;
+            Ok(Self::from_seed(&seed))
+        }
+
+        /// Derive a key from caller-supplied entropy, such as a seeded simulation source.
+        pub fn from_seed(seed: &[u8; 32]) -> Self {
+            Self {
+                key: SigningKey::from_seed(seed),
+            }
         }
 
         /// Recover a bounded Ed25519 PKCS8 key without accepting a certificate.
@@ -823,8 +1054,9 @@ pub mod identity {
             node: NodeId,
             chain: Vec<Vec<u8>>,
             roots: &[Vec<u8>],
+            clock: &WallClock,
         ) -> Result<SigningIdentity> {
-            let verified = verify_chain(roots, &chain, &cluster, &node)?;
+            let verified = verify_chain(clock, roots, &chain, &cluster, &node)?;
             if verified.key != self.key.verifying_key() {
                 return Err(Error::Unauthorized);
             }
@@ -835,6 +1067,7 @@ pub mod identity {
                 expires: verified.expires,
                 valid_from: verified.valid_from,
                 chain,
+                clock: clock.clone(),
             })
         }
     }
@@ -852,8 +1085,9 @@ pub mod identity {
             pkcs8: &[u8],
             chain: Vec<Vec<u8>>,
             roots: &[Vec<u8>],
+            clock: &WallClock,
         ) -> Result<Self> {
-            PendingIdentity::recover(pkcs8)?.accept(cluster, node, chain, roots)
+            PendingIdentity::recover(pkcs8)?.accept(cluster, node, chain, roots, clock)
         }
 
         /// Return the cluster authenticated by the certificate.
@@ -873,7 +1107,7 @@ pub mod identity {
 
         /// Sign the exact message only within the accepted validity interval.
         pub fn sign(&self, message: &[u8]) -> Result<Vec<u8>> {
-            let now = unix_time().as_secs();
+            let now = self.clock.unix_time().as_secs();
             if now < self.valid_from || now >= self.expires {
                 return Err(Error::Unauthorized);
             }
@@ -881,11 +1115,12 @@ pub mod identity {
         }
     }
 
-    /// One exact chain validated against a specific immutable root snapshot.
+    /// One chain, keyed by its collision-resistant fingerprint, validated against
+    /// a specific immutable root snapshot.
     struct CachedPeer {
         roots: Arc<Vec<Vec<u8>>>,
 
-        chain: Vec<Vec<u8>>,
+        fingerprint: [u8; 32],
 
         node: NodeId,
 
@@ -894,6 +1129,17 @@ pub mod identity {
         until: u64,
 
         checked: u64,
+    }
+
+    /// Length-prefixed digest of an exact chain for the validation cache.
+    fn chain_fingerprint(chain: &[Vec<u8>]) -> [u8; 32] {
+        let mut hash = Sha256::new();
+        hash.update(b"racer-crypto/certificate-chain\0");
+        for cert in chain {
+            hash.update((cert.len() as u64).to_be_bytes());
+            hash.update(cert);
+        }
+        hash.finalize().into()
     }
 
     impl VerifiedPeer {
@@ -922,30 +1168,38 @@ pub mod identity {
             }
         }
 
-        /// Reuse exact-chain validation only while roots and time remain valid.
-        fn key(&self, chain: &[Vec<u8>], expected: &NodeId) -> Result<VerifyingKey> {
+        /// Reuse chain validation only while roots and time remain valid. The
+        /// fingerprint must be a collision-resistant digest the caller computed
+        /// from `chain` itself, never a value read from the wire.
+        fn key(
+            &self,
+            fingerprint: &[u8; 32],
+            chain: &[Vec<u8>],
+            expected: &NodeId,
+        ) -> Result<VerifyingKey> {
             let roots = self.keys.peer_trust_roots()?;
-            let now = unix_time().as_secs();
+            let clock = self.keys.epochs.clock();
+            let now = clock.unix_time().as_secs();
             let mut cache = self.cache.lock().map_err(|_| Error::Unavailable)?;
             cache.retain(|entry| {
                 Arc::ptr_eq(&entry.roots, &roots) && now >= entry.checked && now < entry.until
             });
             if let Some(entry) = cache
                 .iter()
-                .find(|entry| &entry.node == expected && entry.chain == chain)
+                .find(|entry| &entry.node == expected && &entry.fingerprint == fingerprint)
             {
                 return Ok(entry.key);
             }
             drop(cache);
-            let verified = verify_chain(&roots, chain, &self.cluster, expected)?;
+            let verified = verify_chain(clock, &roots, chain, &self.cluster, expected)?;
             let mut cache = self.cache.lock().map_err(|_| Error::Unavailable)?;
-            // At most 64 exact, wire-bounded chains (4 MiB of chain bytes).
+            // At most 64 validated chain fingerprints.
             if cache.len() == 64 {
                 cache.pop_front();
             }
             cache.push_back(CachedPeer {
                 roots,
-                chain: chain.to_vec(),
+                fingerprint: *fingerprint,
                 node: expected.clone(),
                 key: verified.key,
                 until: verified.expires,
@@ -960,7 +1214,7 @@ pub mod identity {
             if &self.cluster != self.keys.cluster() {
                 return Err(Error::Unauthorized);
             }
-            self.key(chain, expected)?;
+            self.key(&chain_fingerprint(chain), chain, expected)?;
             Ok(VerifiedPeer {
                 node: expected.clone(),
             })
@@ -974,10 +1228,29 @@ pub mod identity {
             message: &[u8],
             signature: &[u8],
         ) -> Result<VerifiedPeer> {
+            self.verify_signed_fingerprint(
+                &chain_fingerprint(chain),
+                chain,
+                expected,
+                message,
+                signature,
+            )
+        }
+
+        /// Like [`Self::verify_signed`], reusing validation by a fingerprint that the
+        /// caller computed from `chain` with a collision-resistant digest.
+        pub fn verify_signed_fingerprint(
+            &self,
+            fingerprint: &[u8; 32],
+            chain: &[Vec<u8>],
+            expected: &NodeId,
+            message: &[u8],
+            signature: &[u8],
+        ) -> Result<VerifiedPeer> {
             if &self.cluster != self.keys.cluster() {
                 return Err(Error::Unauthorized);
             }
-            let key = self.key(chain, expected)?;
+            let key = self.key(fingerprint, chain, expected)?;
             key.verify_strict(message, signature)
                 .map_err(|_| Error::Unauthorized)?;
             Ok(VerifiedPeer {
@@ -989,7 +1262,10 @@ pub mod identity {
     /// Empty or coherent publication, with an independently installable identity.
     #[derive(Default)]
     struct State {
-        published: Option<PublishedBundle>,
+        published: Option<Arc<PublishedBundle>>,
+
+        /// Secret-free admission index of `published`.
+        index: Option<Arc<KeyIndex>>,
 
         identity: Option<InstalledIdentity>,
     }
@@ -1004,7 +1280,66 @@ pub mod identity {
 
         roots: Arc<Vec<Vec<u8>>>,
 
-        entries: Vec<Entry>,
+        entries: Vec<Arc<Entry>>,
+    }
+
+    /// Secret-free, sorted admission metadata for one published table. Worker
+    /// views cache it; it never extends the lifetime of key material.
+    struct KeyIndex {
+        cluster: ClusterId,
+
+        generation: BundleGeneration,
+
+        entries: Vec<IndexEntry>,
+    }
+
+    /// One admitted epoch in [`KeyIndex`], sorted like the published entries.
+    struct IndexEntry {
+        reference: CacheKeyRef,
+
+        state: CacheKeyState,
+
+        entry: Weak<Entry>,
+    }
+
+    impl KeyIndex {
+        /// Build the index for a published table.
+        fn new(published: &PublishedBundle) -> Self {
+            Self {
+                cluster: published.cluster.clone(),
+                generation: published.generation,
+                entries: published
+                    .entries
+                    .iter()
+                    .map(|entry| IndexEntry {
+                        reference: entry.reference.clone(),
+                        state: entry.state,
+                        entry: Arc::downgrade(entry),
+                    })
+                    .collect(),
+            }
+        }
+
+        /// Find an exact epoch.
+        fn find(&self, cache: &CacheId, id: KeyId, purpose: KeyPurpose) -> Option<&IndexEntry> {
+            let key = ((cache, purpose as u8), id.0);
+            self.entries
+                .binary_search_by(|entry| reference_order(&entry.reference).cmp(&key))
+                .ok()
+                .map(|i| &self.entries[i])
+        }
+
+        /// Find the unique active epoch of a cache and purpose.
+        fn active(&self, cache: &CacheId, purpose: KeyPurpose) -> Option<&IndexEntry> {
+            let group = (cache, purpose as u8);
+            let first = self
+                .entries
+                .partition_point(|entry| reference_group(&entry.reference) < group);
+            self.entries[first..]
+                .iter()
+                .take_while(|entry| reference_group(&entry.reference) == group)
+                .find(|entry| entry.state == CacheKeyState::Active)
+        }
     }
 
     /// An accepted signing identity and the trust snapshot that validated it.
@@ -1081,7 +1416,11 @@ pub mod identity {
             out: &mut [u8],
         ) -> Result<()> {
             self.bound_material(cache, self.id(), KeyPurpose::Page)?;
-            self.secret
+            if !self.sealable {
+                return Err(Error::MissingKey);
+            }
+            self.entry
+                .secret
                 .page_cipher
                 .seal(nonce, aad, input, out)
                 .map_err(|_| Error::CorruptRecord)
@@ -1101,7 +1440,8 @@ pub mod identity {
             out: &mut [u8],
         ) -> Result<()> {
             self.bound_material(cache, id, KeyPurpose::Page)?;
-            self.secret
+            self.entry
+                .secret
                 .page_cipher
                 .open(nonce, aad, input, out)
                 .map_err(|_| Error::CorruptRecord)
@@ -1122,9 +1462,32 @@ pub mod identity {
             tag: &[u8],
         ) -> Result<()> {
             self.bound_material(cache, id, KeyPurpose::Page)?;
-            self.secret
+            self.entry
+                .secret
                 .page_cipher
                 .open_in_place(nonce, aad, inout, tag)
+                .map_err(|_| Error::CorruptRecord)
+        }
+
+        /// Verify a page tag without decrypting. `aad` parts are hashed as
+        /// their concatenation. Checks cache, key ID and purpose like
+        /// [`Self::open_page`] and accepts exactly what it would accept.
+        // Keep borrowed buffer and expected-identity arguments explicit at this boundary.
+        #[allow(clippy::too_many_arguments)]
+        pub fn verify_page_tag(
+            &self,
+            cache: &CacheId,
+            id: KeyId,
+            nonce: &[u8; 24],
+            aad: &[&[u8]],
+            ciphertext: &[u8],
+            tag: &[u8],
+        ) -> Result<()> {
+            self.bound_material(cache, id, KeyPurpose::Page)?;
+            self.entry
+                .secret
+                .page_cipher
+                .verify_tag(nonce, aad, ciphertext, tag)
                 .map_err(|_| Error::CorruptRecord)
         }
 
@@ -1151,6 +1514,9 @@ pub mod identity {
             input: &[u8],
             out: &mut [u8],
         ) -> Result<()> {
+            if !self.sealable {
+                return Err(Error::MissingKey);
+            }
             crate::seal_credentials(
                 self.bound_material(cache, self.id(), KeyPurpose::OriginCredentials)?,
                 nonce,
@@ -1220,39 +1586,76 @@ pub mod identity {
 
         /// Return the immutable generation-bound key ID.
         pub fn id(&self) -> KeyId {
-            self.reference.id
+            self.entry.reference.id
         }
 
         /// Return the cache authorized to use this secret.
         pub fn cache(&self) -> &CacheId {
-            &self.reference.cache
+            &self.entry.reference.cache
         }
 
         /// Exact immutable epoch identity, independent of current admission.
         pub fn reference(&self) -> &CacheKeyRef {
-            &self.reference
+            &self.entry.reference
         }
 
         /// Borrow private material only for the lease's fixed purpose.
         fn material(&self, purpose: KeyPurpose) -> Result<&[u8; 32]> {
-            if self.reference.purpose != purpose {
+            if self.entry.reference.purpose != purpose {
                 return Err(Error::MissingKey);
             }
-            Ok(&self.secret.material)
+            Ok(&self.entry.secret.material)
         }
     }
 
     impl Keyring {
         /// Locally installed coherent bundle, not a controller acknowledgment.
         pub fn generation(&self) -> Result<Option<u64>> {
-            Ok(self
-                .epochs
-                .state
-                .lock()
-                .map_err(|_| Error::Unavailable)?
-                .published
-                .as_ref()
-                .map(|bundle| bundle.generation.0))
+            self.with_index(|index| Ok(index.map(|index| index.generation.0)))
+        }
+
+        /// Run `f` over the current admission index, reloading the local copy
+        /// under the shared lock only when the published epoch has moved.
+        #[inline]
+        fn with_index<R>(&self, f: impl FnOnce(Option<&KeyIndex>) -> Result<R>) -> Result<R> {
+            if self.epochs.epoch.load(Ordering::Acquire) != self.local_epoch.get() {
+                self.reload()?;
+            }
+            f(self.local.borrow().as_deref())
+        }
+
+        /// Replace the local index copy with the shared one.
+        #[cold]
+        fn reload(&self) -> Result<()> {
+            let state = self.epochs.state.lock().map_err(|_| Error::Unavailable)?;
+            // The epoch only changes under this lock, so it names `index` exactly.
+            let epoch = self.epochs.epoch.load(Ordering::Relaxed);
+            let index = state.index.clone();
+            drop(state);
+            let old = self.local.replace(index);
+            self.local_epoch.set(epoch);
+            drop(old);
+            Ok(())
+        }
+
+        /// Whether the current table admits this exact epoch.
+        pub fn admits(&self, cache: &CacheId, id: KeyId, purpose: KeyPurpose) -> bool {
+            self.with_index(|index| {
+                Ok(index.is_some_and(|index| {
+                    index.cluster == self.cluster && index.find(cache, id, purpose).is_some()
+                }))
+            })
+            .unwrap_or(false)
+        }
+
+        /// Whether the current table has an active key for this cache and purpose.
+        pub fn has_active(&self, cache: &CacheId, purpose: KeyPurpose) -> bool {
+            self.with_index(|index| {
+                Ok(index.is_some_and(|index| {
+                    index.cluster == self.cluster && index.active(cache, purpose).is_some()
+                }))
+            })
+            .unwrap_or(false)
         }
 
         /// Create a node-bound view without implicitly installing any keys.
@@ -1261,6 +1664,8 @@ pub mod identity {
                 cluster,
                 node,
                 epochs,
+                local_epoch: Cell::new(u64::MAX),
+                local: RefCell::new(None),
             }
         }
 
@@ -1287,41 +1692,70 @@ pub mod identity {
         /// Validate a wire transfer and atomically publish a complete key epoch.
         pub fn install(
             &self,
-            bundle: racer_control_wire::KeyringBundle,
+            bundle: racer_wire::control::KeyringBundle,
         ) -> Result<BundleGeneration> {
             // Bound private staging before allocating it, including direct callers
             // that do not pass through the wire decoder's byte limit.
-            if bundle.cache_keys.len() > 4096 {
+            if bundle.cache_keys.len() > MAX_BUNDLE_KEYS {
                 return Err(Error::InvalidConfiguration);
             }
             self.install_inner(&bundle.into())
         }
 
-        /// Prepare outside the lock, then validate the transition and publish once.
+        /// Install, reporting replay as a configuration error.
         fn install_inner(&self, bundle: &KeyringBundle) -> Result<BundleGeneration> {
-            let validated = ValidatedBundle::prepare(bundle, &self.cluster, &self.node)?;
-            let mut state = self.epochs.state.lock().map_err(|_| Error::Unavailable)?;
-            let published = validated.transition(state.published.as_ref())?;
-            if let Some(published) = published {
-                state.published = Some(published);
-            }
+            self.install_checked(bundle).map_err(|error| match error {
+                BundleError::Identity(error) => error,
+                BundleError::Replay | BundleError::Wire(_) => Error::InvalidConfiguration,
+            })
+        }
+
+        /// Prepare outside the lock, then validate the transition and publish once.
+        fn install_checked(
+            &self,
+            bundle: &KeyringBundle,
+        ) -> std::result::Result<BundleGeneration, BundleError> {
+            let validated =
+                ValidatedBundle::prepare(self.epochs.clock(), bundle, &self.cluster, &self.node)
+                    .map_err(BundleError::Identity)?;
+            let mut state = self
+                .epochs
+                .state
+                .lock()
+                .map_err(|_| BundleError::Identity(Error::Unavailable))?;
+            let published = validated.transition(state.published.as_deref())?;
+            let retired = published.map(|published| {
+                state.index = Some(Arc::new(KeyIndex::new(&published)));
+                // Release pairs with the Acquire load in `with_index`.
+                self.epochs.epoch.fetch_add(1, Ordering::Release);
+                state.published.replace(Arc::new(published))
+            });
+            drop(state);
+            drop(retired);
+            // Drop this view's copy of the old index now rather than on next use.
+            self.reload().map_err(BundleError::Identity)?;
             Ok(bundle.generation)
         }
     }
 
     impl<'a> ValidatedBundle<'a> {
         /// Validate bounded input and fingerprint its original, order-sensitive form.
-        fn prepare(bundle: &'a KeyringBundle, cluster: &ClusterId, node: &NodeId) -> Result<Self> {
-            if bundle.schema_version != SCHEMA_VERSION
+        fn prepare(
+            clock: &WallClock,
+            bundle: &'a KeyringBundle,
+            cluster: &ClusterId,
+            node: &NodeId,
+        ) -> Result<Self> {
+            if bundle.schema_version != KEYRING_SCHEMA_VERSION
                 || &bundle.cluster != cluster
-                || bundle.cache_keys.len() > 4096
+                || bundle.cache_keys.len() > MAX_BUNDLE_KEYS
                 || bundle.generation.0 == 0
                 || !canonical_uuid(&cluster.0)
                 || !canonical_uuid(&node.0)
             {
                 return Err(Error::InvalidConfiguration);
             }
-            root_store(&bundle.peer_trust_roots)?;
+            root_store(clock, &bundle.peer_trust_roots)?;
             let mut hash = Sha256::new();
             hash.update(b"racer/keyring/bundle/v1\0");
             hash.update((bundle.peer_trust_roots.len() as u64).to_be_bytes());
@@ -1340,41 +1774,40 @@ pub mod identity {
             let fingerprint: [u8; 32] = hash.finalize().into();
             // Validate the downloaded epoch before acquiring the shared publication
             // lock. Existing immutable secret leases remain usable during validation.
-            for (i, candidate) in bundle.cache_keys.iter().enumerate() {
+            // Hashed checks keep validation O(n) for the largest catalogs.
+            let n = bundle.cache_keys.len();
+            let mut references = HashSet::with_capacity(n);
+            let mut materials = HashSet::with_capacity(n);
+            // Per cache and purpose: prepared, active, and decrypt counts.
+            let mut groups: HashMap<(&CacheId, u8), [usize; 3]> = HashMap::with_capacity(n);
+            for candidate in &bundle.cache_keys {
                 let generation = candidate
                     .key
                     .id
                     .generation()
                     .ok_or(Error::InvalidConfiguration)?;
-                if generation > bundle.generation.0 {
-                    return Err(Error::InvalidConfiguration);
-                }
-                if !canonical_uuid(&candidate.key.cache.0) {
-                    return Err(Error::InvalidConfiguration);
-                }
-                if bundle
-                    .cache_keys
-                    .iter()
-                    .filter(|k| {
-                        k.key.cache == candidate.key.cache
-                            && k.key.purpose == candidate.key.purpose
-                            && k.state == CacheKeyState::Active
-                    })
-                    .count()
-                    != 1
+                if generation > bundle.generation.0
+                    || !canonical_uuid(&candidate.key.cache.0)
+                    || !references.insert(reference_order(&candidate.key))
+                    || !materials.insert(&*candidate.material)
                 {
                     return Err(Error::InvalidConfiguration);
                 }
-                for other in &bundle.cache_keys[..i] {
-                    if candidate.key == other.key
-                        || candidate.material == other.material
-                        || (candidate.state == CacheKeyState::Active
-                            && other.state == CacheKeyState::Active
-                            && candidate.key.cache == other.key.cache
-                            && candidate.key.purpose == other.key.purpose)
-                    {
-                        return Err(Error::InvalidConfiguration);
-                    }
+                let counts = groups.entry(reference_group(&candidate.key)).or_default();
+                counts[match candidate.state {
+                    CacheKeyState::Prepared => 0,
+                    CacheKeyState::Active => 1,
+                    CacheKeyState::Decrypt => 2,
+                }] += 1;
+            }
+            for ((_, purpose), [prepared, active, decrypt]) in groups {
+                let max_decrypt = if purpose == KeyPurpose::Page as u8 {
+                    MAX_RETAINED_PAGE_KEYS - 1
+                } else {
+                    0
+                };
+                if active != 1 || prepared > 1 || decrypt > max_decrypt {
+                    return Err(Error::InvalidConfiguration);
                 }
             }
             Ok(Self {
@@ -1385,45 +1818,94 @@ pub mod identity {
 
         /// Check the current epoch and construct a replacement without mutating it.
         /// Exact replay returns no replacement, preserving all shared owner identities.
-        fn transition(self, current: Option<&PublishedBundle>) -> Result<Option<PublishedBundle>> {
+        fn transition(
+            self,
+            current: Option<&PublishedBundle>,
+        ) -> std::result::Result<Option<PublishedBundle>, BundleError> {
             let Self {
                 bundle,
                 fingerprint,
             } = self;
+            if accept_bundle(current, bundle, &fingerprint)? == Accepted::Exact {
+                return Ok(None);
+            }
+            self::transition_entries(bundle, fingerprint, current).map_err(BundleError::Identity)
+        }
+    }
+
+    /// How a delivered bundle relates to the published one.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum Accepted {
+        /// The exact published bundle was delivered again.
+        Exact,
+
+        /// A newer generation (or the first one).
+        Newer,
+    }
+
+    /// The single replay and monotonicity check for keyring bundles: a
+    /// different cluster is invalid; an older generation, or the same
+    /// generation with different content, is a replay.
+    fn accept_bundle(
+        current: Option<&PublishedBundle>,
+        bundle: &KeyringBundle,
+        fingerprint: &[u8; 32],
+    ) -> std::result::Result<Accepted, BundleError> {
+        let Some(current) = current else {
+            return Ok(Accepted::Newer);
+        };
+        if current.cluster != bundle.cluster {
+            return Err(BundleError::Identity(Error::InvalidConfiguration));
+        }
+        if bundle.generation < current.generation
+            || bundle.generation == current.generation && current.fingerprint != *fingerprint
+        {
+            return Err(BundleError::Replay);
+        }
+        Ok(if bundle.generation == current.generation {
+            Accepted::Exact
+        } else {
+            Accepted::Newer
+        })
+    }
+
+    /// Build a replacement table for a newer generation without mutating the
+    /// current one.
+    fn transition_entries(
+        bundle: &KeyringBundle,
+        fingerprint: [u8; 32],
+        current: Option<&PublishedBundle>,
+    ) -> Result<Option<PublishedBundle>> {
+        {
             if let Some(current) = current {
-                if current.cluster != bundle.cluster || bundle.generation < current.generation {
-                    return Err(Error::InvalidConfiguration);
-                }
-                if current.generation == bundle.generation {
-                    return if current.fingerprint == fingerprint {
-                        Ok(None)
-                    } else {
-                        Err(Error::InvalidConfiguration)
-                    };
-                }
+                let by_reference: HashMap<_, &Arc<Entry>> = current
+                    .entries
+                    .iter()
+                    .map(|e| (reference_order(&e.reference), e))
+                    .collect();
+                let by_material: HashMap<&[u8; 32], &CacheKeyRef> = current
+                    .entries
+                    .iter()
+                    .map(|e| (&*e.secret.material, &e.reference))
+                    .collect();
                 for candidate in &bundle.cache_keys {
                     let generation = candidate
                         .key
                         .id
                         .generation()
                         .ok_or(Error::InvalidConfiguration)?;
+                    let old = by_reference.get(&reference_order(&candidate.key));
                     // Removed IDs cannot reenter admission, even as prepared keys.
-                    if generation <= current.generation.0
-                        && !current.entries.iter().any(|e| e.reference == candidate.key)
-                    {
+                    if generation <= current.generation.0 && old.is_none() {
                         return Err(Error::InvalidConfiguration);
                     }
-                    if let Some(old) = current
-                        .entries
-                        .iter()
-                        .find(|e| e.reference == candidate.key)
-                        && *old.secret.material != *candidate.material
-                    {
+                    if old.is_some_and(|old| *old.secret.material != *candidate.material) {
                         return Err(Error::InvalidConfiguration);
                     }
-                    if current.entries.iter().any(|e| {
-                        e.reference != candidate.key && *e.secret.material == *candidate.material
-                    }) {
+                    if by_material
+                        .get(&*candidate.material)
+                        .is_some_and(|r| **r != candidate.key)
+                    {
                         return Err(Error::InvalidConfiguration);
                     }
                 }
@@ -1437,17 +1919,20 @@ pub mod identity {
                     let retained = current.and_then(|current| {
                         current
                             .entries
-                            .iter()
-                            .find(|e| e.reference == candidate.key)
+                            .binary_search_by(|e| {
+                                reference_order(&e.reference).cmp(&reference_order(&candidate.key))
+                            })
+                            .ok()
+                            .map(|i| &current.entries[i])
                     });
-                    Entry {
+                    Arc::new(Entry {
                         reference: candidate.key.clone(),
                         state: candidate.state,
                         secret: retained.map_or_else(
                             || Arc::new(Secret::new(candidate.material.clone())),
                             |entry| entry.secret.clone(),
                         ),
-                    }
+                    })
                 })
                 .collect();
             entries
@@ -1476,12 +1961,13 @@ pub mod identity {
             }
             let roots = self.peer_trust_roots()?;
             let verified = verify_chain(
+                self.epochs.clock(),
                 &roots,
                 identity.certificate_chain(),
                 &self.cluster,
                 &self.node,
             )?;
-            let checked = unix_time().as_secs();
+            let checked = self.epochs.clock().unix_time().as_secs();
             let mut state = self.epochs.state.lock().map_err(|_| Error::Unavailable)?;
             if !state
                 .published
@@ -1507,7 +1993,7 @@ pub mod identity {
             if identity.node() != &self.node || identity.cluster() != &self.cluster {
                 return Err(Error::Unauthorized);
             }
-            let now = unix_time().as_secs();
+            let now = self.epochs.clock().unix_time().as_secs();
             let identity = identity.clone();
             let published = state.published.as_ref().ok_or(Error::MissingKey)?;
             if Arc::ptr_eq(&installed.roots, &published.roots)
@@ -1519,6 +2005,7 @@ pub mod identity {
             let roots = published.roots.clone();
             drop(state);
             let verified = verify_chain(
+                self.epochs.clock(),
                 &roots,
                 identity.certificate_chain(),
                 &self.cluster,
@@ -1545,56 +2032,48 @@ pub mod identity {
             Ok(identity)
         }
 
-        /// Admit a specific active or prepared epoch for its cache and purpose.
+        /// Admit a specific active, prepared, or decrypt epoch for its cache and
+        /// purpose. Only a lease of a key that was active when leased can seal.
         pub fn lease(
             &self,
             cache: Option<&CacheId>,
             id: KeyId,
             purpose: KeyPurpose,
         ) -> Result<KeyLease> {
-            let reference = CacheKeyRef {
-                cache: cache.ok_or(Error::MissingKey)?.clone(),
-                id,
-                purpose,
-            };
-            let state = self.epochs.state.lock().map_err(|_| Error::Unavailable)?;
-            let published = state.published.as_ref().ok_or(Error::MissingKey)?;
-            if published.cluster != self.cluster {
-                return Err(Error::MissingKey);
-            }
-            let position = published
-                .entries
-                .binary_search_by(|entry| {
-                    reference_order(&entry.reference).cmp(&reference_order(&reference))
-                })
-                .map_err(|_| Error::MissingKey)?;
-            let entry = &published.entries[position];
-            Ok(KeyLease {
-                reference,
-                secret: entry.secret.clone(),
-            })
+            let cache = cache.ok_or(Error::MissingKey)?;
+            self.lease_with(|index| index.find(cache, id, purpose))
         }
 
         /// Admit the unique active key for this cache and purpose.
         pub fn active(&self, cache: &CacheId, purpose: KeyPurpose) -> Result<KeyLease> {
-            let state = self.epochs.state.lock().map_err(|_| Error::Unavailable)?;
-            let published = state.published.as_ref().ok_or(Error::MissingKey)?;
-            if published.cluster != self.cluster {
-                return Err(Error::MissingKey);
+            self.lease_with(|index| index.active(cache, purpose))
+        }
+
+        /// Lease the entry selected from the current index without a lock or
+        /// an allocation. A concurrent replacement can retire the entry between
+        /// the epoch check and the upgrade; then reload once and retry.
+        fn lease_with(
+            &self,
+            select: impl Fn(&KeyIndex) -> Option<&IndexEntry>,
+        ) -> Result<KeyLease> {
+            for _ in 0..2 {
+                let leased = self.with_index(|index| {
+                    let index = index.ok_or(Error::MissingKey)?;
+                    if index.cluster != self.cluster {
+                        return Err(Error::MissingKey);
+                    }
+                    let found = select(index).ok_or(Error::MissingKey)?;
+                    Ok(found.entry.upgrade().map(|entry| KeyLease {
+                        entry,
+                        sealable: found.state == CacheKeyState::Active,
+                    }))
+                })?;
+                if let Some(lease) = leased {
+                    return Ok(lease);
+                }
+                self.reload()?;
             }
-            let group = (cache, purpose as u8);
-            let first = published
-                .entries
-                .partition_point(|entry| reference_group(&entry.reference) < group);
-            let entry = published.entries[first..]
-                .iter()
-                .take_while(|entry| reference_group(&entry.reference) == group)
-                .find(|entry| entry.state == CacheKeyState::Active)
-                .ok_or(Error::MissingKey)?;
-            Ok(KeyLease {
-                reference: entry.reference.clone(),
-                secret: entry.secret.clone(),
-            })
+            Err(Error::MissingKey)
         }
     }
 
@@ -1617,19 +2096,9 @@ pub mod identity {
         (reference_group(reference), reference.id.0)
     }
 
-    /// Scoped wall time for rustls, clamped to the Unix epoch for pre-epoch clocks.
-    /// This retains rustls's whole-second truncation and does not set certificate policy.
-    pub fn unix_time() -> rustls::pki_types::UnixTime {
-        rustls::pki_types::UnixTime::since_unix_epoch(
-            environment::wall_now()
-                .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                .unwrap_or_default(),
-        )
-    }
-
-    /// Shared enrollment/activation policy for bounded roots, client-auth chains,
-    /// canonical node URI, and a non-CA Ed25519 leaf without certificate-signing usage.
-    pub(super) fn verify_chain(
+    /// Validate a node client-auth chain against roots at the clock's current time.
+    pub fn verify_chain(
+        clock: &WallClock,
         roots: &[Vec<u8>],
         chain: &[Vec<u8>],
         cluster: &ClusterId,
@@ -1643,7 +2112,7 @@ pub mod identity {
             return Err(Error::Unauthorized);
         }
         let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
-            Arc::new(root_store(roots)?),
+            Arc::new(root_store(clock, roots)?),
             Arc::new(rustls::crypto::ring::default_provider()),
         )
         .build()
@@ -1654,7 +2123,7 @@ pub mod identity {
             .map(|c| CertificateDer::from(c.as_slice()))
             .collect();
         verifier
-            .verify_client_cert(&leaf, &intermediates, unix_time())
+            .verify_client_cert(&leaf, &intermediates, clock.unix_time())
             .map_err(|_| Error::Unauthorized)?;
         let (rest, cert) = parse_x509_certificate(&chain[0]).map_err(|_| Error::Unauthorized)?;
         if !rest.is_empty()
@@ -1715,7 +2184,7 @@ pub mod identity {
     }
 
     /// Parse bounded CA roots and require every configured root to be valid now.
-    pub(super) fn root_store(roots: &[Vec<u8>]) -> Result<RootCertStore> {
+    pub fn root_store(clock: &WallClock, roots: &[Vec<u8>]) -> Result<RootCertStore> {
         if roots.is_empty() || roots.len() > 32 {
             return Err(Error::Unauthorized);
         }
@@ -1725,7 +2194,7 @@ pub mod identity {
                 return Err(Error::Unauthorized);
             }
             let (rest, cert) = parse_x509_certificate(root).map_err(|_| Error::Unauthorized)?;
-            let now = unix_time().as_secs();
+            let now = clock.unix_time().as_secs();
             let now = i64::try_from(now).map_err(|_| Error::Unauthorized)?;
             let now = x509_parser::time::ASN1Time::from_timestamp(now)
                 .map_err(|_| Error::Unauthorized)?;
@@ -1837,8 +2306,8 @@ pub mod identity {
             let installer = BundleInstaller::new(keys.clone());
             let (old_ca, _) = ca();
             let (new_ca, _) = ca();
-            let old = racer_control_wire::KeyringBundle {
-                schema_version: SCHEMA_VERSION,
+            let old = racer_wire::control::KeyringBundle {
+                schema_version: racer_wire::control::KEYRING_SCHEMA_VERSION,
                 cluster,
                 generation: BundleGeneration(2),
                 peer_trust_roots: vec![old_ca.der().to_vec()],
@@ -1856,10 +2325,8 @@ pub mod identity {
             newer.peer_trust_roots = vec![new_ca.der().to_vec()];
             other.install(newer.clone()).unwrap();
             assert_eq!(keys.generation().unwrap(), Some(3));
-            assert_eq!(
-                installer.install(old),
-                Err(BundleError::Identity(Error::InvalidConfiguration))
-            );
+            // Rollback below the shared epoch is a replay.
+            assert_eq!(installer.install(old), Err(BundleError::Replay));
             assert_eq!(*keys.peer_trust_roots().unwrap(), newer.peer_trust_roots);
             assert_eq!(installer.generation(), Some(BundleGeneration(2)));
             assert_eq!(
@@ -1885,8 +2352,8 @@ pub mod identity {
             };
             let installer = BundleInstaller::new(keys());
             assert_eq!(installer.generation(), None);
-            let mut bundle = racer_control_wire::KeyringBundle {
-                schema_version: racer_control_wire::SCHEMA_VERSION,
+            let mut bundle = racer_wire::control::KeyringBundle {
+                schema_version: racer_wire::control::KEYRING_SCHEMA_VERSION,
                 cluster,
                 generation: BundleGeneration(2),
                 peer_trust_roots: vec![first.der().to_vec(), second.der().to_vec()],
@@ -1914,9 +2381,10 @@ pub mod identity {
             );
             bundle.generation = BundleGeneration(3);
             bundle.peer_trust_roots = vec![vec![0; 128]];
+            // Malformed roots fail trust validation (no wire re-encoding).
             assert_eq!(
                 installer.install(bundle.clone()),
-                Err(BundleError::Wire(racer_control_wire::Error::InvalidRequest))
+                Err(BundleError::Identity(Error::Unauthorized))
             );
             let (_, chain) = issue(
                 &first,
@@ -1943,16 +2411,19 @@ pub mod identity {
         /// Cached chains still require current roots, time, exact bytes, and signatures.
         #[test]
         fn cache_requires_exact_chain_current_trust_time_and_fresh_signature() {
-            let clock = environment::SimulationClock::new(93);
-            let _environment = clock.environment(0).enter();
+            let wall = Arc::new(Mutex::new(std::time::SystemTime::now()));
+            let clock = {
+                let wall = wall.clone();
+                WallClock::new(move || *wall.lock().unwrap())
+            };
             let (pending, chain, roots) = issued();
             let keys = Rc::new(Keyring::new(
                 ClusterId(CLUSTER.into()),
                 NodeId(NODE.into()),
-                Arc::new(KeyEpochs::default()),
+                Arc::new(KeyEpochs::with_clock(clock.clone())),
             ));
-            let bundle = |generation, roots| racer_control_wire::KeyringBundle {
-                schema_version: racer_control_wire::SCHEMA_VERSION,
+            let bundle = |generation, roots| racer_wire::control::KeyringBundle {
+                schema_version: racer_wire::control::KEYRING_SCHEMA_VERSION,
                 cluster: ClusterId(CLUSTER.into()),
                 generation: BundleGeneration(generation),
                 peer_trust_roots: roots,
@@ -1965,6 +2436,7 @@ pub mod identity {
                     NodeId(NODE.into()),
                     chain.clone(),
                     &roots,
+                    &clock,
                 )
                 .unwrap();
             let certs = Certificates::new(ClusterId(CLUSTER.into()), keys.clone());
@@ -1983,13 +2455,12 @@ pub mod identity {
             let mut changed = chain.clone();
             changed[0].push(0);
             assert!(certs.verify(&changed, &node).is_err());
-            let original = environment::wall_now();
+            let original = clock.now();
             let (_, until) = validity(chain.iter().chain(roots.iter())).unwrap();
-            clock.set_wall_time(
-                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(until + 1),
-            );
+            *wall.lock().unwrap() =
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(until + 1);
             assert!(certs.verify(&chain, &node).is_err());
-            clock.set_wall_time(original);
+            *wall.lock().unwrap() = original;
             certs.verify(&chain, &node).unwrap();
             let (_, _, replacement) = issued();
             keys.install(bundle(2, replacement)).unwrap();
@@ -2024,6 +2495,18 @@ pub mod identity {
     mod keyring_tests {
         use super::tests::{CACHE, CLUSTER, NODE};
         use super::*;
+
+        /// Decode a hex test fixture. Fixtures are decoded at runtime so test nonces
+        /// are not mistaken for hard-coded production crypto values.
+        fn hex_fixture<const N: usize>(hex: &str) -> [u8; N] {
+            let digit = |byte: u8| (byte as char).to_digit(16).unwrap() as u8;
+            let bytes: Vec<u8> = hex
+                .as_bytes()
+                .chunks_exact(2)
+                .map(|pair| digit(pair[0]) << 4 | digit(pair[1]))
+                .collect();
+            bytes.try_into().unwrap()
+        }
 
         /// Install the default cache's page and credential keys.
         fn keys() -> Keyring {
@@ -2104,7 +2587,7 @@ pub mod identity {
                 assert_eq!(keys.generation().unwrap(), Some(1));
                 assert!(Arc::ptr_eq(&roots, &keys.peer_trust_roots().unwrap()));
                 let admitted = keys.active(held.cache(), KeyPurpose::Page).unwrap();
-                assert!(Arc::ptr_eq(&held.secret, &admitted.secret));
+                assert!(Arc::ptr_eq(&held.entry.secret, &admitted.entry.secret));
             }
 
             initial.generation = BundleGeneration(2);
@@ -2112,9 +2595,45 @@ pub mod identity {
             assert_eq!(keys.generation().unwrap(), Some(2));
             assert!(Arc::ptr_eq(&roots, &keys.peer_trust_roots().unwrap()));
             assert!(Arc::ptr_eq(
-                &held.secret,
-                &keys.active(held.cache(), KeyPurpose::Page).unwrap().secret
+                &held.entry.secret,
+                &keys
+                    .active(held.cache(), KeyPurpose::Page)
+                    .unwrap()
+                    .entry
+                    .secret
             ));
+        }
+
+        /// Views share one published table but cache only a secret-free index:
+        /// an idle view never extends key material, and sees rotation lazily.
+        #[test]
+        fn view_index_follows_epoch_without_pinning_secrets() {
+            let keys = keys();
+            let other = Keyring::new(
+                keys.cluster().clone(),
+                keys.node().clone(),
+                keys.epochs.clone(),
+            );
+            let roots = (*keys.peer_trust_roots().unwrap()).clone();
+            let first = rotation_bundle(2, roots.clone());
+            keys.install_inner(&first).unwrap();
+            let cache = CacheId(CACHE.into());
+            let lease = other.active(&cache, KeyPurpose::Page).unwrap();
+            let held = lease.reference().clone();
+            assert!(other.admits(&cache, held.id, KeyPurpose::Page));
+            assert!(other.has_active(&cache, KeyPurpose::Page));
+            let secret = Arc::downgrade(&lease.entry.secret);
+            keys.install_inner(&rotation_bundle(100, roots)).unwrap();
+            // `other` has not looked since; its stale index must not pin secrets.
+            drop(lease);
+            assert!(secret.upgrade().is_none());
+            assert!(!other.admits(&cache, held.id, KeyPurpose::Page));
+            assert!(
+                other
+                    .lease(Some(&cache), held.id, KeyPurpose::Page)
+                    .is_err()
+            );
+            assert_eq!(other.generation().unwrap(), Some(100));
         }
 
         /// Removed epochs cannot return even after skipped bundle generations.
@@ -2127,7 +2646,7 @@ pub mod identity {
             let lease = keys
                 .active(&CacheId(CACHE.into()), KeyPurpose::Page)
                 .unwrap();
-            let secret = Arc::downgrade(&lease.secret);
+            let secret = Arc::downgrade(&lease.entry.secret);
             // Skipped bundle generations are normal after projected-secret delays.
             let next = rotation_bundle(100, roots.clone());
             keys.install_inner(&next).unwrap();
@@ -2212,12 +2731,12 @@ pub mod identity {
                 KeyId(*b"RKG1\0\0\0\0\0\0\0\0\0\0\0\0"),
                 KeyId::from_generation(3, 0).unwrap(),
             ] {
-                let bundle = racer_control_wire::KeyringBundle {
-                    schema_version: SCHEMA_VERSION,
+                let bundle = racer_wire::control::KeyringBundle {
+                    schema_version: racer_wire::control::KEYRING_SCHEMA_VERSION,
                     cluster: ClusterId(CLUSTER.into()),
                     generation: BundleGeneration(2),
                     peer_trust_roots: roots.clone(),
-                    cache_keys: vec![racer_control_wire::CacheEncryptionKey::new(
+                    cache_keys: vec![racer_wire::control::CacheEncryptionKey::new(
                         CacheKeyRef {
                             cache: CacheId(CACHE.into()),
                             id,
@@ -2235,7 +2754,7 @@ pub mod identity {
         /// Build a default pair with generation-one key IDs and configurable admission.
         fn bundle(generation: u64, roots: Vec<Vec<u8>>, state: CacheKeyState) -> KeyringBundle {
             KeyringBundle {
-                schema_version: SCHEMA_VERSION,
+                schema_version: racer_wire::control::KEYRING_SCHEMA_VERSION,
                 cluster: ClusterId(CLUSTER.into()),
                 generation: BundleGeneration(generation),
                 peer_trust_roots: roots,
@@ -2336,7 +2855,7 @@ pub mod identity {
             keys.install_inner(&rotated).unwrap();
             let active = keys.active(&cache, KeyPurpose::Page).unwrap();
             assert_eq!(active.id(), prepared.id());
-            assert!(Arc::ptr_eq(&active.secret, &prepared.secret));
+            assert!(Arc::ptr_eq(&active.entry.secret, &prepared.entry.secret));
             assert!(
                 keys.lease(Some(&cache), lease.id(), KeyPurpose::Page)
                     .is_err()
@@ -2350,7 +2869,7 @@ pub mod identity {
             let keys = keys();
             let cache = CacheId(CACHE.into());
             let lease = keys.active(&cache, KeyPurpose::Page).unwrap();
-            let reference = lease.reference.clone();
+            let reference = lease.reference().clone();
             let mut next = bundle(
                 2,
                 (*keys.peer_trust_roots().unwrap()).clone(),
@@ -2368,7 +2887,7 @@ pub mod identity {
                 keys.active(&cache, KeyPurpose::Page).unwrap().id(),
                 KeyId::from_generation(2, 4).unwrap()
             );
-            let secret = Arc::downgrade(&lease.secret);
+            let secret = Arc::downgrade(&lease.entry.secret);
             assert_eq!(lease.material(KeyPurpose::Page).unwrap(), &[7; 32]);
             assert_eq!(secret.strong_count(), 1);
             // Exact replay must acknowledge the new epoch without reviving the old one.
@@ -2434,6 +2953,72 @@ pub mod identity {
             assert_eq!(held.material(KeyPurpose::Page).unwrap(), &[7; 32]);
         }
 
+        /// Decrypt keys are leased for reading but never seal or become active,
+        /// and only page keys may be decrypt keys, up to the retention bound.
+        #[test]
+        fn decrypt_keys_open_but_never_seal_or_activate() {
+            let keys = keys();
+            let cache = CacheId(CACHE.into());
+            let roots = (*keys.peer_trust_roots().unwrap()).clone();
+            let mut next = bundle(2, roots.clone(), CacheKeyState::Active);
+            next.cache_keys[0].key.id = KeyId::from_generation(2, 1).unwrap();
+            next.cache_keys[0].material = Zeroizing::new([9; 32]);
+            let mut old = bundle(1, roots.clone(), CacheKeyState::Decrypt).cache_keys;
+            old.truncate(1);
+            next.cache_keys.append(&mut old);
+            keys.install_inner(&next).unwrap();
+            let old_id = KeyId::from_generation(1, 1).unwrap();
+            let active = keys.active(&cache, KeyPurpose::Page).unwrap();
+            assert_ne!(active.id(), old_id);
+            let decrypt = keys.lease(Some(&cache), old_id, KeyPurpose::Page).unwrap();
+            let mut sealed = [0; 19];
+            let nonce: [u8; 24] = hex_fixture(&"01".repeat(24));
+            assert_eq!(
+                decrypt.seal_page(&cache, &nonce, b"aad", b"abc", &mut sealed),
+                Err(Error::MissingKey)
+            );
+            active
+                .seal_page(&cache, &nonce, b"aad", b"abc", &mut sealed)
+                .unwrap();
+            // Origin credential keys keep no decrypt history.
+            let mut origin = bundle(3, roots.clone(), CacheKeyState::Active);
+            origin.cache_keys[0].key.id = KeyId::from_generation(2, 1).unwrap();
+            origin.cache_keys[0].material = Zeroizing::new([9; 32]);
+            origin.cache_keys.push(CacheEncryptionKey {
+                key: CacheKeyRef {
+                    cache: cache.clone(),
+                    id: KeyId::from_generation(3, 9).unwrap(),
+                    purpose: CacheKeyPurpose::OriginCredentials,
+                },
+                state: CacheKeyState::Decrypt,
+                material: Zeroizing::new([10; 32]),
+            });
+            assert_eq!(
+                keys.install_inner(&origin),
+                Err(Error::InvalidConfiguration)
+            );
+            // At most MAX_RETAINED_PAGE_KEYS - 1 decrypt page keys.
+            let mut many = bundle(3, roots, CacheKeyState::Active);
+            many.cache_keys[0].key.id = KeyId::from_generation(2, 1).unwrap();
+            many.cache_keys[0].material = Zeroizing::new([9; 32]);
+            for i in 0..MAX_RETAINED_PAGE_KEYS as u32 {
+                let mut material = Zeroizing::new([11; 32]);
+                material[..4].copy_from_slice(&i.to_be_bytes());
+                many.cache_keys.push(CacheEncryptionKey {
+                    key: CacheKeyRef {
+                        cache: cache.clone(),
+                        id: KeyId::from_generation(3, 100 + i).unwrap(),
+                        purpose: CacheKeyPurpose::Page,
+                    },
+                    state: CacheKeyState::Decrypt,
+                    material,
+                });
+            }
+            assert_eq!(keys.install_inner(&many), Err(Error::InvalidConfiguration));
+            many.cache_keys.pop();
+            keys.install_inner(&many).unwrap();
+        }
+
         /// Capacity counts only current admission, not previously issued leases.
         #[test]
         fn capacity_is_bounded_by_current_bundle_not_outstanding_leases() {
@@ -2444,7 +3029,7 @@ pub mod identity {
             let roots = (*keys.peer_trust_roots().unwrap()).clone();
             let mut full = rotation_bundle(2, roots.clone());
             let template = full.cache_keys[0].clone();
-            full.cache_keys = (0..4096u32)
+            full.cache_keys = (0..MAX_BUNDLE_KEYS as u32)
                 .map(|i| {
                     let mut key = template.clone();
                     key.key.cache = CacheId(format!("{i:08x}-1111-4111-8111-111111111111"));
@@ -2454,12 +3039,12 @@ pub mod identity {
                 })
                 .collect();
             keys.install_inner(&full).unwrap();
-            assert_eq!(admitted_count(&keys), 4096);
+            assert_eq!(admitted_count(&keys), MAX_BUNDLE_KEYS);
             full.generation = BundleGeneration(3);
             full.cache_keys.push(template);
             assert_eq!(keys.install_inner(&full), Err(Error::InvalidConfiguration));
             assert_eq!(keys.generation().unwrap(), Some(2));
-            assert_eq!(admitted_count(&keys), 4096);
+            assert_eq!(admitted_count(&keys), MAX_BUNDLE_KEYS);
             keys.install_inner(&rotation_bundle(3, roots)).unwrap();
             assert_eq!(admitted_count(&keys), 2);
             assert_eq!(held.material(KeyPurpose::Page).unwrap(), &[7; 32]);
@@ -2476,6 +3061,7 @@ pub mod identity {
                         NodeId(NODE.into()),
                         chain,
                         &roots,
+                        &WallClock::host(),
                     )
                     .unwrap(),
             );

@@ -27,13 +27,13 @@ use crate::runtime::RequestScope;
 use crate::security::CredentialCrypto;
 use crate::security::OriginContext;
 use crate::store::catalog::Index;
-use flow_control::coalesce;
-use std::cell::RefCell;
+use racer_core::read::cohort::{CohortKey, Member, MetadataCohort, Started, Step};
+use racer_core::read::flight::WakeTarget;
+use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::future::poll_fn;
 use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::task::Poll;
 use std::task::Waker;
 use std::time::Duration;
@@ -41,7 +41,7 @@ use std::time::Instant;
 use std::time::SystemTime;
 
 // Cohort bounds and purposes live in racer-core.
-use racer_core::read::{MAX_REFRESH_ATTEMPTS, MAX_WAITERS, RefreshPurpose};
+use racer_core::read::RefreshPurpose;
 
 /// Peer operation a refresh purpose permits.
 trait PurposeOperation {
@@ -66,20 +66,13 @@ impl PurposeOperation for RefreshPurpose {
 }
 
 /// Credential-free identity; current metadata and bootstrap never share a leader.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct RefreshKey {
-    object: ObjectId,
+type RefreshKey = CohortKey<ObjectId>;
 
-    purpose: RefreshPurpose,
-}
-
-impl RefreshKey {
-    /// Group only requests for the same object, pin, and permitted work.
-    fn new(object: &ObjectId, purpose: &RefreshPurpose) -> Self {
-        Self {
-            object: object.clone(),
-            purpose: purpose.clone(),
-        }
+/// Group only requests for the same object, pin, and permitted work.
+fn refresh_key(object: &ObjectId, purpose: &RefreshPurpose) -> RefreshKey {
+    CohortKey {
+        object: object.clone(),
+        purpose: purpose.clone(),
     }
 }
 
@@ -93,49 +86,192 @@ struct RefreshOutput {
 
 // Match runtime::HashMap's cfg exactly: dependency simulation features must not
 // switch production or integration-test builds to seeded hashing.
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "dst")))]
 type RefreshHashState = std::collections::hash_map::RandomState;
-#[cfg(test)]
+#[cfg(any(test, feature = "dst"))]
 type RefreshHashState = crate::runtime::HashState;
-type Cohorts = coalesce::Table<RefreshKey, Result<RefreshOutput>, RefreshHashState>;
-type Registration = coalesce::Registration<RefreshKey, Result<RefreshOutput>, RefreshHashState>;
-type RefreshEvent = coalesce::Event<Result<RefreshOutput>>;
+type Cohorts = MetadataCohort<ObjectId, Result<RefreshOutput>, (), RefreshHashState, WakeTarget>;
+
+/// An event of one cohort registration.
+#[derive(Clone, Debug)]
+enum RefreshEvent<V> {
+    /// This registration owns the next attempt.
+    Lead,
+
+    /// The cohort finished or exhausted its elections.
+    Complete(V),
+}
 
 /// Only credential-free coordination lives here. Context, membership and credits
 /// remain request-owned or in its admitted worker driver, never in this table.
+///
+/// Deadlines and attempt budgets are enforced by the caller (the ingress deadline
+/// guard and the leader's budget check), so the cohort runs on a frozen clock with
+/// a nonzero budget: it never expires waiters or refuses elections on its own.
 struct RefreshTable {
-    inner: Rc<Cohorts>,
+    inner: RefCell<Cohorts>,
+
+    at: Instant,
 }
-impl Default for RefreshTable {
-    fn default() -> Self {
+
+impl RefreshTable {
+    /// At most `capacity` keys admit at once and `capacity * MAX_WAITERS`
+    /// registrations, including readers of completed cohorts, are live.
+    fn new(capacity: usize, at: Instant) -> Self {
         Self {
-            inner: Rc::new(Cohorts::new(
-                coalesce::Limits {
-                    waiters_per_cohort: MAX_WAITERS,
-                    attempts_per_cohort: MAX_REFRESH_ATTEMPTS,
-                },
-                Err(Error::Unavailable),
-            )),
+            inner: RefCell::new(
+                Cohorts::with_limits(capacity, at, RefreshHashState::default()).retain_retired(),
+            ),
+            at,
         }
     }
+
+    fn deadline(&self) -> Instant {
+        self.at + Duration::from_secs(1)
+    }
+
+    /// Run `f` on the cohorts, then drop retired wake targets and wake others
+    /// only after releasing the borrow: wakers may reenter the table.
+    fn update<T>(&self, f: impl FnOnce(&mut Cohorts, &mut Vec<WakeTarget>) -> T) -> T {
+        let mut wakes = Vec::new();
+        let (value, retired) = {
+            let mut cohorts = self.inner.borrow_mut();
+            let value = f(&mut cohorts, &mut wakes);
+            (value, cohorts.take_retired())
+        };
+        drop(retired);
+        for wake in wakes {
+            wake.wake();
+        }
+        value
+    }
+
+    fn join(self: &Rc<Self>, key: RefreshKey) -> Result<Registration> {
+        let (at, deadline) = (self.at, self.deadline());
+        let joined =
+            self.update(|cohorts, wakes| cohorts.join(&key, at, deadline, 1, |_| Ok(()), wakes));
+        let member = joined.map_err(|error| match error {
+            racer_core::read::Error::FlightFull | racer_core::read::Error::Overloaded => {
+                Error::Overloaded
+            }
+            other => other.into(),
+        })?;
+        Ok(Registration {
+            owner: Rc::new(RegistrationOwner {
+                table: self.clone(),
+                key,
+                member,
+                started: Cell::new(None),
+            }),
+        })
+    }
+
+    /// Live registrations, including readers of completed cohorts.
+    #[cfg(test)]
+    fn registration_count(&self) -> usize {
+        self.inner.borrow().attached()
+    }
+
+    /// Cohorts still admitting registrations.
+    #[cfg(test)]
+    fn active_count(&self) -> usize {
+        self.inner.borrow().open()
+    }
 }
-impl RefreshTable {
-    fn join(&self, key: RefreshKey, capacity: usize) -> Result<Registration> {
-        self.inner
-            .join(key, capacity)
-            .map_err(|_| Error::Overloaded)
+
+/// A worker-local handle to one cohort waiter. Clones retain its leadership;
+/// only dropping the last handle detaches it.
+#[derive(Clone)]
+struct Registration {
+    owner: Rc<RegistrationOwner>,
+}
+
+struct RegistrationOwner {
+    table: Rc<RefreshTable>,
+
+    key: RefreshKey,
+
+    member: Member,
+
+    /// The capability of the attempt this registration leads, if any.
+    started: Cell<Option<Started>>,
+}
+
+impl Registration {
+    /// Whether this is the last handle for this registration, not the cohort.
+    fn is_only_handle(&self) -> bool {
+        Rc::strong_count(&self.owner) == 1
+    }
+
+    /// Register the latest wake target and elect at most once per waiter.
+    fn event(&self, waker: &Waker) -> Poll<RefreshEvent<Result<RefreshOutput>>> {
+        let owner = &self.owner;
+        // Clone outside the table borrow: a waker's clone may reenter the table.
+        let target = WakeTarget(waker.clone());
+        let at = owner.table.at;
+        let step = owner
+            .table
+            .update(|cohorts, wakes| cohorts.poll(&owner.key, owner.member, at, 1, target, wakes));
+        match step {
+            Ok(Step::Pending) => Poll::Pending,
+            Ok(Step::Lead(started)) => {
+                owner.started.set(Some(started));
+                Poll::Ready(RefreshEvent::Lead)
+            }
+            Ok(Step::Ready(result)) => Poll::Ready(RefreshEvent::Complete(result)),
+            Ok(Step::Failed(error)) | Err(error) => {
+                Poll::Ready(RefreshEvent::Complete(Err(error.into())))
+            }
+        }
+    }
+
+    /// Release leadership after a failed attempt so another waiter may lead.
+    /// A credential-specific rejection fails only this waiter with it.
+    fn retry(&self, error: Error) {
+        let owner = &self.owner;
+        let Some(started) = owner.started.take() else {
+            return;
+        };
+        let error =
+            racer_core::read::Error::try_from(error).unwrap_or(racer_core::read::Error::Canceled);
+        // A stale leader has nothing to release.
+        let _ = owner
+            .table
+            .update(|cohorts, wakes| cohorts.retry(&owner.key, started, error, wakes));
+    }
+
+    /// Broadcast the leader's result and close admission before waking readers.
+    /// The operation owner must call this only after completion, not cancellation.
+    fn finish(&self, result: Result<RefreshOutput>) {
+        let owner = &self.owner;
+        let Some(started) = owner.started.take() else {
+            return;
+        };
+        // A stale leader cannot publish.
+        let _ = owner
+            .table
+            .update(|cohorts, wakes| cohorts.finish(&owner.key, started, result, wakes));
+    }
+}
+
+impl Drop for RegistrationOwner {
+    /// Detach once, then wake followers outside the table borrow.
+    fn drop(&mut self) {
+        self.table.update(|cohorts, wakes| {
+            cohorts.detach(&self.key, self.member, wakes);
+        });
     }
 }
 
 #[derive(Default)]
 struct IngressDeadlines {
-    inner: Rc<uring_runtime::environment::Registry>,
+    inner: Rc<racer_io::deadline::Registry>,
 }
 /// One entry per admitted resolve, shared across its follower and leader waits.
 /// The refresh registration quota bounds these entries. Drivers never own this
 /// guard: ingress expiry must not release their acquisition or completion fences.
 struct IngressDeadline {
-    inner: uring_runtime::environment::Registration,
+    inner: racer_io::deadline::Registration,
 }
 impl IngressDeadlines {
     fn register(self: &Rc<Self>, deadline: Instant) -> Result<IngressDeadline> {
@@ -163,7 +299,7 @@ impl IngressDeadline {
 
 #[derive(Default)]
 struct Clock {
-    inner: uring_runtime::environment::Observer,
+    inner: racer_io::deadline::Observer,
 }
 impl Clock {
     fn observe(&mut self, wall: SystemTime, monotonic: Instant) -> bool {
@@ -203,7 +339,7 @@ pub struct MetadataDependencies {
 
     pub fill: Rc<super::fill::Fill>,
 
-    pub owners: Arc<super::dispatch::WorkerDirectory>,
+    pub owners: std::rc::Rc<super::dispatch::WorkerDirectory>,
 }
 
 /// Coordinate metadata observations on the page-zero worker.
@@ -214,8 +350,6 @@ pub struct MetadataService {
     origin: Rc<dyn Origin>,
 
     credentials: Rc<CredentialCrypto>,
-
-    capacity: usize,
 
     storage: MetadataDependencies,
 
@@ -257,13 +391,13 @@ impl MetadataService {
         capacity: usize,
         storage: MetadataDependencies,
     ) -> Self {
+        let at = candidates.ctx().now();
         Self {
             candidates,
             origin,
             credentials,
-            capacity,
             storage,
-            refreshes: Rc::new(RefreshTable::default()),
+            refreshes: Rc::new(RefreshTable::new(capacity, at)),
             deadlines: Rc::new(IngressDeadlines::default()),
             clock: Rc::new(RefCell::new(Clock::default())),
         }
@@ -315,11 +449,11 @@ impl MetadataService {
 
     /// Invalidate current observations when the clock's freshness is uncertain.
     fn observe_clock(&self) -> Result<SystemTime> {
-        let now = uring_runtime::environment::wall_now();
+        let now = self.candidates.ctx().clock.wall_now();
         if self
             .clock
             .borrow_mut()
-            .observe(now, uring_runtime::environment::now())
+            .observe(now, self.candidates.ctx().now())
         {
             self.storage.index.invalidate_freshness()?;
         }
@@ -347,12 +481,12 @@ impl MetadataService {
                 });
             }
             // HEAD cannot join a body-fetching bootstrap leader or elect one.
-            let key = RefreshKey::new(&context.object, &purpose);
-            let registration = self.refreshes.join(key, self.capacity)?;
+            let key = refresh_key(&context.object, &purpose);
+            let registration = self.refreshes.join(key)?;
             let deadline = self.deadlines.register(scope.deadline.0)?;
             let cancellation = scope.cancellation.subscribe()?;
             let event = poll_fn(|cx| {
-                uring_runtime::drivers::poll(cx, 64);
+                self.candidates.drivers().poll(cx, 64);
                 cancellation.register(cx.waker());
                 if let Err(error) = deadline.check(scope, cx.waker()) {
                     return Poll::Ready(Err(error));
@@ -371,9 +505,12 @@ impl MetadataService {
                     if budget.remaining_attempts() == 0 {
                         return Err(Error::Unavailable);
                     }
-                    let driver_permit = uring_runtime::drivers::reserve().map_err(Error::from)?;
+                    let driver_permit = self.candidates.drivers().reserve().map_err(Error::from)?;
                     let mut nonce = [0; 16];
-                    uring_runtime::environment::fill_random(&mut nonce)
+                    self.candidates
+                        .ctx()
+                        .rng
+                        .fill(&mut nonce)
                         .map_err(|_| Error::Unavailable)?;
                     let attempt = crate::model::AttemptId(nonce);
                     let sealed = self.credentials.seal(context, attempt, scope)?;
@@ -387,7 +524,7 @@ impl MetadataService {
                     let caller_scope = scope.clone();
                     let caller_cancellation = caller_scope.cancellation.subscribe()?;
                     let owned_scope =
-                        RequestScope::new(caller_scope.request, caller_scope.deadline.0)?;
+                        caller_scope.child(caller_scope.request, caller_scope.deadline.0)?;
                     let mut owned_budget = budget.transfer();
                     let (send, mut receive) = futures::channel::oneshot::channel();
                     driver_permit.submit_detached(Box::pin(async move {
@@ -399,10 +536,10 @@ impl MetadataService {
                             &mut owned_budget,
                         ));
                         let result = poll_fn(|cx| {
-                            if !caller_scope.cancellation.is_cancelled() {
+                            if !caller_scope.cancellation.is_canceled() {
                                 caller_cancellation.register(cx.waker());
                             }
-                            if !owned_scope.cancellation.is_cancelled()
+                            if !owned_scope.cancellation.is_canceled()
                                 && (caller_scope.check().is_err()
                                     || driver_registration.is_only_handle())
                             {
@@ -418,12 +555,12 @@ impl MetadataService {
                                 Ok(output)
                             }
                             Err(RefreshFailure::Rejected(error)) => {
-                                driver_registration.retry();
+                                driver_registration.retry(error);
                                 Err(error)
                             }
                             Err(RefreshFailure::Terminal(error)) => {
                                 if caller_budget_failure(error, &owned_budget) {
-                                    driver_registration.retry();
+                                    driver_registration.retry(error);
                                 } else {
                                     driver_registration.finish(Err(error));
                                 }
@@ -438,7 +575,7 @@ impl MetadataService {
                     let (result, remaining) = poll_fn(|cx| {
                         cancellation.register(cx.waker());
                         deadline.check(scope, cx.waker())?;
-                        uring_runtime::drivers::poll(cx, 64);
+                        self.candidates.drivers().poll(cx, 64);
                         match Pin::new(&mut receive).poll(cx) {
                             Poll::Ready(Ok(value)) => Poll::Ready(Ok(value)),
                             Poll::Ready(Err(_)) => Poll::Ready(Err(Error::Unavailable)),
@@ -473,7 +610,7 @@ impl MetadataService {
         self.observe_clock()?;
         let clock_epoch = self.clock.borrow().inner.epoch();
         let mode = self.storage.fill.mode(&context.object.cache);
-        let resolution = if mode == racer_control_wire::CacheMode::PassthroughLocal {
+        let resolution = if mode == racer_wire::control::CacheMode::PassthroughLocal {
             // The local route asks this node's own origin and never a peer.
             CandidateResolution::Origin(self.candidates.local_authority(
                 membership.clone(),
@@ -522,6 +659,7 @@ impl MetadataService {
                 PeerResponse::VersionUnavailable => return Err(Error::VersionUnavailable.into()),
                 PeerResponse::NotFound => return Err(Error::NotFound.into()),
                 PeerResponse::Overloaded => return Err(Error::Overloaded.into()),
+                PeerResponse::FlightFull => return Err(Error::FlightFull.into()),
                 PeerResponse::Miss | PeerResponse::Unavailable => {
                     return Err(Error::Unavailable.into());
                 }
@@ -577,7 +715,7 @@ impl MetadataService {
     ) -> std::result::Result<RefreshOutput, RefreshFailure> {
         authority.validate(&context.object, PageNumber(0))?;
         budget
-            .begin_attempt(uring_runtime::environment::now(), scope.deadline.0)
+            .begin_attempt(scope.clock().now(), scope.deadline.0)
             .map_err(Error::from)?;
         let selector = purpose.selector();
         let acquisition = match purpose {
@@ -865,7 +1003,9 @@ pub(crate) mod tests {
     use crate::model::ExpiresAt;
     use crate::model::WorkerId;
     use futures::task::noop_waker;
-    use racer_control_wire::CacheId;
+    use racer_core::read::{MAX_REFRESH_ATTEMPTS, MAX_WAITERS};
+    use racer_wire::control::CacheId;
+    use std::sync::Arc;
     use std::time::UNIX_EPOCH;
 
     fn metadata(etag: &str, length: u64) -> ObjectMetadata {
@@ -885,7 +1025,7 @@ pub(crate) mod tests {
 
     /// Use the metadata-only current cohort for coordination fixtures.
     fn key() -> RefreshKey {
-        RefreshKey::new(&metadata("v1", 0).version.object, &RefreshPurpose::Current)
+        refresh_key(&metadata("v1", 0).version.object, &RefreshPurpose::Current)
     }
 
     fn output() -> RefreshOutput {
@@ -941,7 +1081,7 @@ pub(crate) mod tests {
     /// Each purpose and pin owns its election, completion, and capacity slot.
     #[test]
     fn refresh_purposes_isolate_cohorts_without_splitting_identical_pins() {
-        let table = RefreshTable::default();
+        let table = Rc::new(RefreshTable::new(4, Instant::now()));
         let object = metadata("v1", 0).version.object;
         let purposes = [
             RefreshPurpose::Current,
@@ -953,9 +1093,9 @@ pub(crate) mod tests {
         let cohorts: Vec<_> = purposes
             .iter()
             .map(|purpose| {
-                let key = RefreshKey::new(&object, purpose);
-                let leader = table.join(key.clone(), purposes.len()).unwrap();
-                let follower = table.join(key, purposes.len()).unwrap();
+                let key = refresh_key(&object, purpose);
+                let leader = table.join(key.clone()).unwrap();
+                let follower = table.join(key).unwrap();
                 assert!(matches!(
                     leader.event(&waker),
                     Poll::Ready(RefreshEvent::Lead)
@@ -964,14 +1104,11 @@ pub(crate) mod tests {
                 (leader, follower)
             })
             .collect();
-        assert_eq!(table.inner.active_count(), purposes.len());
+        assert_eq!(table.active_count(), purposes.len());
         let mut other_object = object.clone();
         other_object.key = CacheKey([1; 32]);
         assert!(matches!(
-            table.join(
-                RefreshKey::new(&other_object, &RefreshPurpose::Current),
-                purposes.len()
-            ),
+            table.join(refresh_key(&other_object, &RefreshPurpose::Current),),
             Err(Error::Overloaded)
         ));
 
@@ -984,7 +1121,7 @@ pub(crate) mod tests {
         for index in [0, 2, 3] {
             assert!(cohorts[index].1.event(&waker).is_pending());
         }
-        cohorts[2].0.retry();
+        cohorts[2].0.retry(Error::Unavailable);
         assert!(matches!(
             cohorts[2].1.event(&waker),
             Poll::Ready(RefreshEvent::Lead)
@@ -997,8 +1134,8 @@ pub(crate) mod tests {
             Poll::Ready(RefreshEvent::Complete(Ok(_)))
         ));
         drop(cohorts);
-        assert_eq!(table.inner.active_count(), 0);
-        assert_eq!(table.inner.registration_count(), 0);
+        assert_eq!(table.active_count(), 0);
+        assert_eq!(table.registration_count(), 0);
     }
 
     pub(crate) fn deadline_probe(
@@ -1006,7 +1143,7 @@ pub(crate) mod tests {
         due: Instant,
     ) -> Operation<'static, ()> {
         let deadline = service.deadlines.register(due).unwrap();
-        let scope = RequestScope::new(
+        let scope = RequestScope::host(
             crate::model::RequestId([0; 16]),
             Instant::now() + Duration::from_secs(600),
         )
@@ -1025,7 +1162,7 @@ pub(crate) mod tests {
         refreshes: usize,
     ) {
         assert_eq!(service.deadlines.inner.len(), deadlines);
-        assert_eq!(service.refreshes.inner.registration_count(), refreshes);
+        assert_eq!(service.refreshes.registration_count(), refreshes);
     }
 
     #[test]
@@ -1033,7 +1170,7 @@ pub(crate) mod tests {
         let table = Rc::new(IngressDeadlines::default());
         let now = Instant::now();
         let due = now + Duration::from_secs(60);
-        let scope = RequestScope::new(crate::model::RequestId([0; 16]), due).unwrap();
+        let scope = RequestScope::host(crate::model::RequestId([0; 16]), due).unwrap();
         let old = Arc::new(crate::test_support::WakeCounter::default());
         let latest = Arc::new(crate::test_support::WakeCounter::default());
         let later = table.register(due + Duration::from_secs(1)).unwrap();
@@ -1067,34 +1204,29 @@ pub(crate) mod tests {
     #[test]
     fn ingress_deadline_drop_reclaims_entries_and_refresh_capacity_without_stale_keys() {
         let table = Rc::new(IngressDeadlines::default());
-        let refreshes = Rc::new(RefreshTable::default());
+        let refreshes = Rc::new(RefreshTable::new(1, Instant::now()));
         let due = Instant::now() + Duration::from_secs(60);
         for _ in 0..2 * MAX_WAITERS {
-            let registration = refreshes.join(key(), 1).unwrap();
+            let registration = refreshes.join(key()).unwrap();
             let deadline = table.register(due).unwrap();
             assert_eq!(table.inner.len(), 1);
             registration.finish(Ok(output()));
             drop(deadline);
             drop(registration);
             assert!(table.inner.is_empty());
-            assert_eq!(refreshes.inner.registration_count(), 0);
+            assert_eq!(refreshes.registration_count(), 0);
         }
         let entries: Vec<_> = (0..MAX_WAITERS)
-            .map(|_| {
-                (
-                    refreshes.join(key(), 1).unwrap(),
-                    table.register(due).unwrap(),
-                )
-            })
+            .map(|_| (refreshes.join(key()).unwrap(), table.register(due).unwrap()))
             .collect();
-        assert!(matches!(refreshes.join(key(), 1), Err(Error::Overloaded)));
+        assert!(matches!(refreshes.join(key()), Err(Error::Overloaded)));
         assert_eq!(table.inner.len(), MAX_WAITERS);
         drop(entries);
         assert!(table.inner.is_empty());
-        assert_eq!(refreshes.inner.active_count(), 0);
-        assert_eq!(refreshes.inner.registration_count(), 0);
+        assert_eq!(refreshes.active_count(), 0);
+        assert_eq!(refreshes.registration_count(), 0);
         let table = Rc::new(IngressDeadlines {
-            inner: Rc::new(uring_runtime::environment::Registry::with_next_id(u64::MAX)),
+            inner: Rc::new(racer_io::deadline::Registry::with_next_id(u64::MAX)),
         });
         assert!(matches!(table.register(due), Err(Error::Overloaded)));
         assert!(table.inner.is_empty());
@@ -1103,9 +1235,9 @@ pub(crate) mod tests {
     #[test]
     fn refresh_notifications_cover_registration_completion_and_reelection_order() {
         for complete_first in [false, true] {
-            let table = Rc::new(RefreshTable::default());
-            let leader = table.join(key(), 1).unwrap();
-            let follower = table.join(key(), 1).unwrap();
+            let table = Rc::new(RefreshTable::new(1, Instant::now()));
+            let leader = table.join(key()).unwrap();
+            let follower = table.join(key()).unwrap();
             let count = Arc::new(crate::test_support::WakeCounter::default());
             let waker = Waker::from(count.clone());
             assert!(matches!(
@@ -1123,9 +1255,9 @@ pub(crate) mod tests {
                 Poll::Ready(RefreshEvent::Complete(Ok(_)))
             ));
         }
-        let table = Rc::new(RefreshTable::default());
-        let leader = table.join(key(), 1).unwrap();
-        let follower = table.join(key(), 1).unwrap();
+        let table = Rc::new(RefreshTable::new(1, Instant::now()));
+        let leader = table.join(key()).unwrap();
+        let follower = table.join(key()).unwrap();
         let count = Arc::new(crate::test_support::WakeCounter::default());
         let waker = Waker::from(count.clone());
         assert!(matches!(
@@ -1133,7 +1265,7 @@ pub(crate) mod tests {
             Poll::Ready(RefreshEvent::Lead)
         ));
         assert!(follower.event(&waker).is_pending());
-        leader.retry();
+        leader.retry(Error::Unavailable);
         assert_eq!(count.count(), 1);
         assert!(matches!(
             follower.event(&waker),
@@ -1143,11 +1275,10 @@ pub(crate) mod tests {
 
     #[test]
     fn worker_driver_retains_leadership_after_request_drop_until_completion() {
-        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
-        let _owner = queue.enter();
-        let table = Rc::new(RefreshTable::default());
-        let request = table.join(key(), 1).unwrap();
-        let follower = table.join(key(), 1).unwrap();
+        let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
+        let table = Rc::new(RefreshTable::new(1, Instant::now()));
+        let request = table.join(key()).unwrap();
+        let follower = table.join(key()).unwrap();
         let waker = noop_waker();
         assert!(matches!(
             request.event(&waker),
@@ -1155,21 +1286,22 @@ pub(crate) mod tests {
         ));
         let driver = request.clone();
         let (complete, fence) = futures::channel::oneshot::channel::<()>();
-        uring_runtime::drivers::reserve()
+        queue
+            .reserve()
             .unwrap()
             .submit_detached(Box::pin(async move {
                 fence.await.map_err(|_| Error::Io)?;
-                driver.retry();
+                driver.retry(Error::Unavailable);
                 Ok::<_, Error>(())
             }));
         let mut cx = std::task::Context::from_waker(&waker);
-        uring_runtime::drivers::poll(&mut cx, 64);
+        queue.poll(&mut cx, 64);
         drop(request);
         assert!(follower.event(&waker).is_pending());
-        assert_eq!(table.inner.registration_count(), 2);
+        assert_eq!(table.registration_count(), 2);
         complete.send(()).unwrap();
-        uring_runtime::drivers::poll(&mut cx, 64);
-        assert_eq!(table.inner.registration_count(), 1);
+        queue.poll(&mut cx, 64);
+        assert_eq!(table.registration_count(), 1);
         assert!(matches!(
             follower.event(&waker),
             Poll::Ready(RefreshEvent::Lead)
@@ -1178,9 +1310,9 @@ pub(crate) mod tests {
 
     #[test]
     fn rejected_or_canceled_leader_does_not_fail_other_callers() {
-        let table = Rc::new(RefreshTable::default());
-        let first = table.join(key(), 1).unwrap();
-        let second = table.join(key(), 1).unwrap();
+        let table = Rc::new(RefreshTable::new(1, Instant::now()));
+        let first = table.join(key()).unwrap();
+        let second = table.join(key()).unwrap();
         let waker = noop_waker();
         assert!(matches!(
             first.event(&waker),
@@ -1233,14 +1365,99 @@ pub(crate) mod tests {
         );
     }
 
+    thread_local! {
+        static ON_HOOK_CLONE: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+        static ON_HOOK_DROP: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    }
+
+    /// A waker whose next clone or drop runs a one-shot hook on this thread.
+    fn hook_waker() -> Waker {
+        fn raw() -> std::task::RawWaker {
+            unsafe fn clone(_: *const ()) -> std::task::RawWaker {
+                if let Some(hook) = ON_HOOK_CLONE.with(|slot| slot.borrow_mut().take()) {
+                    hook();
+                }
+                raw()
+            }
+            unsafe fn drop(_: *const ()) {
+                if let Some(hook) = ON_HOOK_DROP.with(|slot| slot.borrow_mut().take()) {
+                    hook();
+                }
+            }
+            unsafe fn wake(_: *const ()) {}
+            static VTABLE: std::task::RawWakerVTable =
+                std::task::RawWakerVTable::new(clone, wake, wake, drop);
+            std::task::RawWaker::new(std::ptr::null(), &VTABLE)
+        }
+        // SAFETY: The vtable never dereferences its data pointer.
+        unsafe { Waker::from_raw(raw()) }
+    }
+
+    /// Waker clone, replacement, and detach callbacks may reenter the cohorts.
+    #[test]
+    fn cohort_wakers_may_reenter_the_table() {
+        let table = Rc::new(RefreshTable::new(1, Instant::now()));
+        let leader = table.join(key()).unwrap();
+        let follower = table.join(key()).unwrap();
+        assert!(matches!(
+            leader.event(&noop_waker()),
+            Poll::Ready(RefreshEvent::Lead)
+        ));
+        let nested = table.clone();
+        let admitted = Rc::new(RefCell::new(Vec::new()));
+        let sink = admitted.clone();
+        ON_HOOK_CLONE.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                sink.borrow_mut().push(nested.join(key()).unwrap());
+            }))
+        });
+        let waker = hook_waker();
+        assert!(follower.event(&waker).is_pending());
+        assert_eq!(admitted.borrow().len(), 1);
+
+        // Replacing the parked waker drops it after the table borrow ends.
+        let nested = table.clone();
+        let sink = admitted.clone();
+        ON_HOOK_DROP.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                sink.borrow_mut().push(nested.join(key()).unwrap());
+            }))
+        });
+        assert!(follower.event(&noop_waker()).is_pending());
+        assert_eq!(admitted.borrow().len(), 2);
+
+        // Detaching drops the parked waker after the table borrow ends too.
+        let parked = hook_waker();
+        assert!(follower.event(&parked).is_pending());
+        drop(parked);
+        let nested = table.clone();
+        let sink = admitted.clone();
+        ON_HOOK_DROP.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                sink.borrow_mut().push(nested.join(key()).unwrap());
+            }))
+        });
+        drop(follower);
+        assert_eq!(admitted.borrow().len(), 3);
+        drop(waker);
+        leader.finish(Ok(output()));
+        drop(leader);
+        admitted.borrow_mut().clear();
+        assert_eq!(table.registration_count(), 0);
+        assert_eq!(table.active_count(), 0);
+    }
+
     #[test]
     fn cohort_retries_entries_and_live_registrations_are_bounded() {
-        let table = Rc::new(RefreshTable::default());
-        assert!(matches!(table.join(key(), 0), Err(Error::Overloaded)));
-        let observer = table.join(key(), 1).unwrap();
+        let table = Rc::new(RefreshTable::new(1, Instant::now()));
+        assert!(matches!(
+            Rc::new(RefreshTable::new(0, Instant::now())).join(key()),
+            Err(Error::Overloaded)
+        ));
+        let observer = table.join(key()).unwrap();
         let waker = noop_waker();
         for _ in 0..MAX_REFRESH_ATTEMPTS {
-            let leader = table.join(key(), 1).unwrap();
+            let leader = table.join(key()).unwrap();
             assert!(matches!(
                 leader.event(&waker),
                 Poll::Ready(RefreshEvent::Lead)
@@ -1253,24 +1470,29 @@ pub(crate) mod tests {
         ));
         drop(observer);
         let waiters: Vec<_> = (0..MAX_WAITERS)
-            .map(|_| table.join(key(), 1).unwrap())
+            .map(|_| table.join(key()).unwrap())
             .collect();
-        assert!(matches!(table.join(key(), 1), Err(Error::Overloaded)));
+        assert!(matches!(table.join(key()), Err(Error::Overloaded)));
+        assert!(matches!(
+            waiters[0].event(&waker),
+            Poll::Ready(RefreshEvent::Lead)
+        ));
         waiters[0].finish(Ok(output()));
         // Completed readers also count against the global registration quota.
-        assert!(matches!(table.join(key(), 1), Err(Error::Overloaded)));
+        assert!(matches!(table.join(key()), Err(Error::Overloaded)));
         drop(waiters);
-        let first = table.join(key(), 1).unwrap();
-        let different = RefreshKey::new(
+        let first = table.join(key()).unwrap();
+        let different = refresh_key(
             &key().object,
             &RefreshPurpose::Pinned(StrongEtag::test_value("old")),
         );
-        assert!(matches!(table.join(different, 1), Err(Error::Overloaded)));
+        assert!(matches!(table.join(different), Err(Error::Overloaded)));
         drop(first);
     }
 
     #[test]
     fn clock_discontinuities_invalidate_freshness_but_preserve_old_descriptors() {
+        let env = racer_io::Env::host();
         let mut clock = Clock::default();
         let wall = UNIX_EPOCH + Duration::from_secs(100);
         let mono = Instant::now();
@@ -1282,7 +1504,12 @@ pub(crate) mod tests {
             mono + Duration::from_secs(4)
         ));
         assert_eq!(clock.inner.epoch(), 2);
-        let index = Index::new(WorkerId(0), 4, crate::test_support::availability());
+        let index = Index::new(
+            WorkerId(0),
+            4,
+            crate::test_support::availability(&env),
+            racer_io::Clock::host(),
+        );
         let old = metadata("old", 7);
         let mut new = metadata("new", 900);
         new.expires_at = ExpiresAt::test_time(SystemTime::now() + Duration::from_secs(60));
@@ -1332,7 +1559,7 @@ pub(crate) mod tests {
             Err(Error::CorruptRecord)
         );
         assert_ne!(
-            RefreshKey::new(&expected.version.object, &selector.into()),
+            refresh_key(&expected.version.object, &selector.into()),
             key()
         );
     }

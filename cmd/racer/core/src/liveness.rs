@@ -689,7 +689,8 @@ mod silence_tests {
 // later); past that it is `Overdue` and a further timeout gives origin authority and marks rank 0
 // silent. An own origin failure marks it `Failed` for `hang_after`, so a later `Unavailable` from
 // rank 0 does not cost a second origin request. Any answer signed by rank 0 forgets the page. Only
-// timeouts withhold origin.
+// timeouts withhold origin. A page refused only for load (`busy`) is not overdue while rank 0 keeps
+// answering other probes ([`Rank0Watch::alive`]): load is not a hang.
 
 /// Default bound on watched pages per node.
 pub const WATCH_CAPACITY: usize = 4096;
@@ -718,6 +719,8 @@ struct Rank0Entry<N> {
     until: Instant,
     last: Instant,
     failed: bool,
+    /// Only load refusals noted the page, never a timeout.
+    busy: bool,
 }
 
 /// Bounded, expiring map from a page to rank 0's presumed state.
@@ -728,6 +731,8 @@ pub struct Rank0Watch<K, N> {
     entries: HashMap<K, Rank0Entry<N>>,
     /// Ranks 0 silent past a deadline, with last confirmation.
     silent: HashMap<N, Instant>,
+    /// Ranks 0 that last signed an answer to this node, with when.
+    alive: HashMap<N, Instant>,
     /// Insertion order for eviction; stale stamps are skipped.
     order: VecDeque<(K, Instant)>,
 }
@@ -740,6 +745,7 @@ impl<K: Eq + Hash + Clone, N: Eq + Hash + Clone> Rank0Watch<K, N> {
             hang_after,
             entries: HashMap::new(),
             silent: HashMap::new(),
+            alive: HashMap::new(),
             order: VecDeque::new(),
         }
     }
@@ -773,6 +779,9 @@ impl<K: Eq + Hash + Clone, N: Eq + Hash + Clone> Rank0Watch<K, N> {
                     }
                 } else if now < e.until && !silent {
                     Rank0State::Fetching
+                } else if e.busy && !silent && self.answering(rank0, now) {
+                    // Refused only for load, and rank 0 still answers: busy, not hung.
+                    Rank0State::Fetching
                 } else {
                     Rank0State::Overdue
                 }
@@ -790,6 +799,7 @@ impl<K: Eq + Hash + Clone, N: Eq + Hash + Clone> Rank0Watch<K, N> {
         if live {
             let entry = self.entries.get_mut(&key).expect("live");
             entry.last = now;
+            entry.busy = false;
             if now >= entry.until {
                 if self.silent.len() >= self.capacity && !self.silent.contains_key(&rank0) {
                     let ttl = self.ttl;
@@ -808,11 +818,60 @@ impl<K: Eq + Hash + Clone, N: Eq + Hash + Clone> Rank0Watch<K, N> {
                     until: deadline.max(now + self.hang_after),
                     last: now,
                     failed: false,
+                    busy: false,
                 },
             );
         }
         self.order.push_back((key, now));
         self.compact();
+    }
+
+    /// A probe for `key` was refused for load. Like [`Self::timed_out`] for `key` alone: the page
+    /// turns [`Rank0State::Overdue`] once its interval passes, but `rank0` is never marked silent,
+    /// so load on one page (often this node's own admission) cannot send every page whose rank 0
+    /// is `rank0` to origin. Nor does the page turn overdue while `rank0` keeps answering
+    /// ([`Self::alive`]): only a rank 0 that stopped answering lets load reach origin.
+    pub fn busy(&mut self, key: K, rank0: N, now: Instant, deadline: Instant) {
+        let live = self.entries.get(&key).is_some_and(|e| {
+            e.node == rank0 && !e.failed && now.saturating_duration_since(e.last) <= self.ttl
+        });
+        if live {
+            self.entries.get_mut(&key).expect("live").last = now;
+        } else {
+            self.insert(
+                key.clone(),
+                Rank0Entry {
+                    node: rank0,
+                    until: deadline.max(now + self.hang_after),
+                    last: now,
+                    failed: false,
+                    busy: true,
+                },
+            );
+        }
+        self.order.push_back((key, now));
+        self.compact();
+    }
+
+    /// `rank0` signed an answer to this node (any page, any outcome): it is alive. A page refused
+    /// only for load stays [`Rank0State::Fetching`] while this is recent ([`Self::hang_after`]).
+    pub fn alive(&mut self, rank0: N, now: Instant) {
+        if self.alive.len() >= self.capacity && !self.alive.contains_key(&rank0) {
+            let window = self.hang_after;
+            self.alive
+                .retain(|_, at| now.saturating_duration_since(*at) <= window);
+            if self.alive.len() >= self.capacity {
+                return;
+            }
+        }
+        let at = self.alive.entry(rank0).or_insert(now);
+        *at = (*at).max(now);
+    }
+
+    fn answering(&self, rank0: &N, now: Instant) -> bool {
+        self.alive
+            .get(rank0)
+            .is_some_and(|at| now.saturating_duration_since(*at) <= self.hang_after)
     }
 
     /// This owner's own origin fetch for `key` failed. Failures inside the
@@ -835,6 +894,7 @@ impl<K: Eq + Hash + Clone, N: Eq + Hash + Clone> Rank0Watch<K, N> {
                     until: now + self.hang_after,
                     last: now,
                     failed: true,
+                    busy: false,
                 },
             );
         }
@@ -1032,6 +1092,59 @@ mod rank0_tests {
         assert_eq!(w.state(&2, &A, now + 2 * S), Rank0State::Overdue);
         w.answered_failure(&9, &A);
         assert_eq!(w.state(&2, &A, now + 2 * S), Rank0State::Unknown);
+    }
+
+    #[test]
+    fn busy_probes_make_only_their_page_overdue() {
+        let now = Instant::now();
+        let mut w = Rank0Watch::new(8, WATCH_TTL, 5 * S);
+        w.busy(1, A, now, now + S);
+        // Within the interval rank 0 may be fetching: the reader waits.
+        assert_eq!(w.state(&1, &A, now + S), Rank0State::Fetching);
+        // Refused past the interval: this page may reach origin.
+        w.busy(1, A, now + 6 * S, now + 7 * S);
+        assert_eq!(w.state(&1, &A, now + 6 * S), Rank0State::Overdue);
+        // Load is not silence: other pages of the same rank 0 are unaffected.
+        assert_eq!(w.state(&2, &A, now + 6 * S), Rank0State::Unknown);
+        // Contrast: repeated timeouts do mark rank 0 silent for every page.
+        w.timed_out(3, A, now, now + S);
+        w.timed_out(3, A, now + 6 * S, now + 7 * S);
+        assert_eq!(w.state(&2, &A, now + 6 * S), Rank0State::Overdue);
+        // An answer forgets the page.
+        let mut w = Rank0Watch::new(8, WATCH_TTL, 5 * S);
+        w.busy(1, A, now, now + S);
+        w.answered(&1, &A);
+        assert_eq!(w.state(&1, &A, now + 6 * S), Rank0State::Unknown);
+    }
+
+    #[test]
+    fn busy_pages_wait_while_rank_zero_answers() {
+        let now = Instant::now();
+        let mut w = Rank0Watch::new(2, WATCH_TTL, 5 * S);
+        w.busy(1, A, now, now + S);
+        // Rank 0 answers other probes: a page refused only for load is not overdue.
+        w.alive(A, now + 4 * S);
+        assert_eq!(w.state(&1, &A, now + 6 * S), Rank0State::Fetching);
+        w.busy(1, A, now + 9 * S, now + 10 * S);
+        assert_eq!(w.state(&1, &A, now + 9 * S), Rank0State::Fetching);
+        // Rank 0 stopped answering: load may now reach origin.
+        assert_eq!(w.state(&1, &A, now + 10 * S), Rank0State::Overdue);
+        // Another node's answers say nothing about this rank 0.
+        w.alive(8, now + 10 * S);
+        assert_eq!(w.state(&1, &A, now + 10 * S), Rank0State::Overdue);
+        // Answers never hold a page whose rank 0 timed out.
+        w.alive(A, now + 10 * S);
+        assert_eq!(w.state(&1, &A, now + 10 * S), Rank0State::Fetching);
+        w.timed_out(1, A, now + 10 * S, now + 11 * S);
+        assert_eq!(w.state(&1, &A, now + 10 * S), Rank0State::Overdue);
+        // Nor a page whose rank 0 is silent node-wide.
+        w.busy(2, A, now + 10 * S, now + 11 * S);
+        assert_eq!(w.state(&2, &A, now + 16 * S), Rank0State::Overdue);
+        // The alive map stays bounded.
+        for i in 0..100u8 {
+            w.alive(i, now + 100 * S + u32::from(i) * 10 * S);
+        }
+        assert!(w.alive.len() <= 2);
     }
 
     #[test]

@@ -5,6 +5,7 @@
 //! its application model. Historical proof verification does not admit a message;
 //! the carrying connection must first admit its fresh session head.
 
+mod chains;
 pub mod control;
 pub mod forwarding;
 pub mod link;
@@ -12,6 +13,10 @@ mod session;
 #[cfg(test)]
 mod tests;
 
+pub use chains::{
+    Chain, Chains, MAX_CHAIN_BYTES, MAX_CHAINS_FIELD, MAX_CHAINS_PER_MESSAGE, MAX_SESSION_CHAINS,
+    fingerprint, resolve,
+};
 pub use session::{Context, Session, accept, connect, install_session};
 
 /// Test-only inspection and malformed-frame construction for adapter regressions.
@@ -39,21 +44,21 @@ pub mod test_util {
         signatures.sign_fields(head)
     }
 
+    pub use crate::chains::test_util::*;
     pub use crate::session::test_util::*;
 }
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use http1::{Header, MessageHead, StartLine};
-use racer_control_wire::NodeId;
 use racer_crypto::identity::{Certificates, Keyring, VerifiedPeer};
+use racer_wire::control::NodeId;
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
     rc::Rc,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use uring_runtime::environment::Deadline;
 
 /// Failures contain no signed fields, credentials, or body bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,7 +80,7 @@ pub enum Error {
     /// Preserve the identity component's failure classification.
     Identity(racer_crypto::identity::Error),
     /// Preserve the runtime component's failure classification.
-    Runtime(uring_runtime::Error),
+    Runtime(racer_io::Error),
 }
 
 /// A bounded wire mechanism result.
@@ -96,8 +101,8 @@ impl From<racer_crypto::identity::Error> for Error {
     }
 }
 
-impl From<uring_runtime::Error> for Error {
-    fn from(value: uring_runtime::Error) -> Self {
+impl From<racer_io::Error> for Error {
+    fn from(value: racer_io::Error) -> Self {
         Self::Runtime(value)
     }
 }
@@ -127,6 +132,12 @@ pub struct Signatures {
     certificates: Rc<Certificates>,
 
     request_mac: Rc<dyn RequestMac>,
+
+    /// Worker clock and entropy for timestamps, deadlines, and challenges.
+    ctx: racer_io::WorkerCtx,
+
+    /// The local identity's chain, reused while the identity keeps it.
+    local: std::cell::RefCell<Option<Arc<Chain>>>,
 }
 
 /// Unverified signed HTTP provenance, excluding payload bytes.
@@ -136,6 +147,11 @@ pub struct SignedHead {
 
     /// Detached Ed25519 signature, also represented in the signature field.
     pub signature: Vec<u8>,
+
+    /// Not on the wire: the chain named by the signed `racer-certificate`
+    /// fingerprint, resolved from the carrying session when decoded or set by
+    /// the signer. Verification requires it and checks it against the field.
+    pub chain: Option<Arc<Chain>>,
 }
 
 /// Authenticated provenance and its certificate identity.
@@ -177,12 +193,37 @@ impl Signatures {
         keys: Rc<Keyring>,
         certificates: Rc<Certificates>,
         request_mac: Rc<dyn RequestMac>,
+        ctx: racer_io::WorkerCtx,
     ) -> Self {
         Self {
             keys,
             certificates,
             request_mac,
+            ctx,
+            local: Default::default(),
         }
+    }
+
+    /// Return the local identity's chain, re-encoding only after rotation.
+    fn local_chain(
+        &self,
+        identity: &racer_crypto::identity::SigningIdentity,
+    ) -> Result<Arc<Chain>> {
+        let mut local = self.local.borrow_mut();
+        if let Some(chain) = local.as_ref()
+            && chain.certificates() == identity.certificate_chain()
+        {
+            return Ok(chain.clone());
+        }
+        let chain = Chain::new(identity.certificate_chain())?;
+        chains::remember(&chain);
+        *local = Some(chain.clone());
+        Ok(chain)
+    }
+
+    /// Worker clock and entropy used by this signer and its sessions.
+    pub fn ctx(&self) -> &racer_io::WorkerCtx {
+        &self.ctx
     }
 
     /// Return the local authenticated node identity.
@@ -192,37 +233,50 @@ impl Signatures {
 
     /// Sign retained provenance; replay admission belongs to its carrying session.
     pub fn sign(&self, head: MessageHead) -> Result<SignedHead> {
-        if head.headers.iter().any(|h| {
-            is_auth_field(&h.name.to_ascii_lowercase())
-                && !h.name.eq_ignore_ascii_case("racer-receiver")
-        }) {
+        if head
+            .headers
+            .iter()
+            .any(|h| is_auth_field(&h.name) && !h.name.eq_ignore_ascii_case("racer-receiver"))
+        {
             return Err(Error::InvalidRequest);
         }
         receiver(&head)?;
-        let signed = self.sign_fields(head)?;
+        let signed = self.sign_fields_with(head, false)?;
+        Codec::new(MAX_SIGNED_HEAD).encode_head(&signed.head)?;
+        Ok(signed)
+    }
+
+    /// Sign a handshake head that also carries the signer's full chain.
+    pub(crate) fn sign_handshake(&self, head: MessageHead) -> Result<SignedHead> {
+        receiver(&head)?;
+        let signed = self.sign_fields_with(head, true)?;
         Codec::new(MAX_HEAD).encode_head(&signed.head)?;
         Ok(signed)
     }
 
-    pub(crate) fn sign_fields(&self, mut head: MessageHead) -> Result<SignedHead> {
+    pub(crate) fn sign_fields(&self, head: MessageHead) -> Result<SignedHead> {
+        self.sign_fields_with(head, false)
+    }
+
+    fn sign_fields_with(&self, mut head: MessageHead, full_chain: bool) -> Result<SignedHead> {
         let identity = self.keys.signing_identity()?;
         if identity.node() != self.node() {
             return Err(Error::Unauthorized);
         }
+        let chain = self.local_chain(&identity)?;
         push(&mut head, "racer-profile", PROFILE);
         uuid(&self.keys.cluster().0)?;
         uuid(&self.node().0)?;
         push(&mut head, "racer-cluster", &self.keys.cluster().0);
         push(&mut head, "racer-signer", &self.node().0);
-        push_binary(
-            &mut head,
-            "racer-certificates",
-            &encode_chain(identity.certificate_chain())?,
-        );
+        push_binary(&mut head, "racer-certificate", chain.fingerprint());
+        if full_chain {
+            push_binary(&mut head, "racer-certificates", chain.encoded());
+        }
         push(
             &mut head,
             "racer-timestamp",
-            millis(uring_runtime::environment::wall_now())?,
+            millis(self.ctx.clock.wall_now())?,
         );
         self.request_mac.sign(&self.keys, &mut head)?;
         let input = signature_input(&head)?;
@@ -237,7 +291,11 @@ impl Signatures {
             format!("racer=:{}:", binary(&signature)),
         );
         Codec::new(MAX_ENVELOPE_HEAD).encode_head(&head)?;
-        Ok(SignedHead { head, signature })
+        Ok(SignedHead {
+            head,
+            signature,
+            chain: Some(chain),
+        })
     }
 
     /// Verify retained provenance addressed to this node, without replay admission.
@@ -251,7 +309,12 @@ impl Signatures {
 
     /// Verify a historical hop under the fresh-message timestamp window.
     pub fn verify_historical(&self, signed: &SignedHead) -> Result<VerifiedPeer> {
-        self.verify_signed_age(&signed.head, &signed.signature, true)
+        self.verify_signed_age(
+            &signed.head,
+            &signed.signature,
+            signed.chain.as_deref(),
+            true,
+        )
     }
 
     /// Revalidate retained request authority bounded by its original signed deadline.
@@ -261,7 +324,7 @@ impl Signatures {
         signed: &SignedHead,
         deadline: u64,
     ) -> Result<VerifiedPeer> {
-        if deadline <= millis(uring_runtime::environment::wall_now())? {
+        if deadline <= millis(self.ctx.clock.wall_now())? {
             return Err(Error::DeadlineExceeded);
         }
         if field(&signed.head, "racer-kind")? != "request"
@@ -269,13 +332,19 @@ impl Signatures {
         {
             return Err(Error::Unauthorized);
         }
-        self.verify_signed_age(&signed.head, &signed.signature, false)
+        self.verify_signed_age(
+            &signed.head,
+            &signed.signature,
+            signed.chain.as_deref(),
+            false,
+        )
     }
 
     fn verify_signed_age(
         &self,
         head: &MessageHead,
         signature: &[u8],
+        chain: Option<&Chain>,
         fresh: bool,
     ) -> Result<VerifiedPeer> {
         if field(head, "racer-profile")? != PROFILE
@@ -292,13 +361,14 @@ impl Signatures {
             return Err(Error::Unauthorized);
         }
         let signer = node_field(head, "racer-signer")?;
-        let chain = decode_chain(&decode_binary(
-            field(head, "racer-certificates")?.as_bytes(),
-        )?)?;
+        let chain = chain.ok_or(Error::Unauthorized)?;
+        if fingerprint(head)? != *chain.fingerprint() {
+            return Err(Error::Unauthorized);
+        }
         let timestamp = UNIX_EPOCH
             .checked_add(Duration::from_millis(number(head, "racer-timestamp")?))
             .ok_or(Error::Unauthorized)?;
-        let now = uring_runtime::environment::wall_now();
+        let now = self.ctx.clock.wall_now();
         if timestamp
             > now
                 .checked_add(Duration::from_secs(5))
@@ -311,7 +381,13 @@ impl Signatures {
             return Err(Error::Replay);
         }
         self.certificates
-            .verify_signed(&chain, &signer, &base, signature)
+            .verify_signed_fingerprint(
+                chain.fingerprint(),
+                chain.certificates(),
+                &signer,
+                &base,
+                signature,
+            )
             .map_err(Into::into)
     }
 }
@@ -325,7 +401,10 @@ pub fn is_auth_field(name: &str) -> bool {
         "racer-cluster",
         "racer-signer",
         "racer-receiver",
+        "racer-certificate",
         "racer-certificates",
+        "racer-chains",
+        "racer-proof-signers",
         "racer-session",
         "racer-direction",
         "racer-sequence",
@@ -345,22 +424,26 @@ pub fn mac_base(head: &MessageHead) -> Result<Vec<u8>> {
         out.extend_from_slice(value);
         Ok(())
     }
-    let mut out = b"racer/request-mac/message/v1\0".to_vec();
-    let start = match &head.start {
-        StartLine::Request { method, target } => format!("{method} {target}"),
-        _ => return Err(Error::Unauthorized),
+    let StartLine::Request { method, target } = &head.start else {
+        return Err(Error::Unauthorized);
     };
-    append(&mut out, start.as_bytes())?;
-    for name in components(head)? {
+    let components = Components::new(head)?;
+    let mut out = b"racer/request-mac/message/v1\0".to_vec();
+    let start_len =
+        u32::try_from(method.len() + 1 + target.len()).map_err(|_| Error::InvalidRequest)?;
+    out.extend_from_slice(&start_len.to_be_bytes());
+    out.extend_from_slice(method.as_bytes());
+    out.push(b' ');
+    out.extend_from_slice(target.as_bytes());
+    for (name, value) in &components.fields {
         if name.starts_with('@') || name == "racer-request-mac" {
             continue;
         }
         append(&mut out, name.as_bytes())?;
-        append(&mut out, head.unique(&name)?.ok_or(Error::Unauthorized)?)?;
+        append(&mut out, value)?;
     }
     Ok(out)
 }
-
 /// Parse a canonical UUID node field.
 pub fn node_field(head: &MessageHead, name: &str) -> Result<NodeId> {
     let node = field(head, name)?;
@@ -373,74 +456,123 @@ pub fn receiver(head: &MessageHead) -> Result<NodeId> {
     node_field(head, "racer-receiver")
 }
 
-fn components(head: &MessageHead) -> Result<Vec<String>> {
-    Codec::new(MAX_ENVELOPE_HEAD).encode_head(head)?;
-    let mut names = BTreeSet::new();
-    for h in &head.headers {
-        let name = h.name.to_ascii_lowercase();
-        if !names.insert(name)
-            || h.value.first().is_some_and(|b| b.is_ascii_whitespace())
-            || h.value.last().is_some_and(|b| b.is_ascii_whitespace())
-            || h.value.iter().any(u8::is_ascii_control)
-        {
+/// Covered components of one head, validated and indexed once per frame.
+///
+/// `fields` holds lowercased header names (excluding the signature fields)
+/// sorted bytewise with their values; duplicate names are rejected here, so
+/// each lookup is unique by construction.
+struct Components<'a> {
+    start: &'a StartLine,
+    fields: Vec<(String, &'a [u8])>,
+}
+
+impl<'a> Components<'a> {
+    fn new(head: &'a MessageHead) -> Result<Self> {
+        // Full head validation (names, size, framing); not implied elsewhere on
+        // the verify path.
+        Codec::new(MAX_ENVELOPE_HEAD).encode_head(head)?;
+        let mut fields = Vec::with_capacity(head.headers.len());
+        for h in &head.headers {
+            if h.value.first().is_some_and(|b| b.is_ascii_whitespace())
+                || h.value.last().is_some_and(|b| b.is_ascii_whitespace())
+                || h.value.iter().any(u8::is_ascii_control)
+            {
+                return Err(Error::Unauthorized);
+            }
+            fields.push((h.name.to_ascii_lowercase(), h.value.as_slice()));
+        }
+        fields.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        if fields.windows(2).any(|w| w[0].0 == w[1].0) {
             return Err(Error::Unauthorized);
         }
+        fields.retain(|(name, _)| name != "signature" && name != "signature-input");
+        Ok(Self {
+            start: &head.start,
+            fields,
+        })
     }
-    names.remove("signature");
-    names.remove("signature-input");
-    let mut components = match head.start {
-        StartLine::Request { .. } => vec!["@method".into(), "@request-target".into()],
-        StartLine::Response { .. } => vec!["@status".into()],
-    };
-    components.extend(names);
-    Ok(components)
+
+    fn derived(&self) -> &'static [&'static str] {
+        match self.start {
+            StartLine::Request { .. } => &["@method", "@request-target"],
+            StartLine::Response { .. } => &["@status"],
+        }
+    }
+
+    fn signature_input(&self, head: &MessageHead) -> Result<String> {
+        let timestamp = number(head, "racer-timestamp")? / 1000;
+        let keyid = field(head, "racer-signer")?;
+        uuid(&keyid)?;
+        let mut out = String::with_capacity(160 + 24 * self.fields.len());
+        out.push('(');
+        let names = self
+            .derived()
+            .iter()
+            .copied()
+            .chain(self.fields.iter().map(|(n, _)| n.as_str()));
+        for (i, name) in names.enumerate() {
+            if i > 0 {
+                out.push(' ');
+            }
+            out.push('"');
+            out.push_str(name);
+            out.push('"');
+        }
+        use std::fmt::Write as _;
+        let _ = write!(
+            out,
+            ");created={timestamp};keyid=\"{keyid}\";alg=\"ed25519\";tag=\"{PROFILE}\""
+        );
+        Ok(out)
+    }
+
+    fn signature_base(&self, input: &str) -> Vec<u8> {
+        let mut base = Vec::with_capacity(
+            128 + input.len()
+                + self
+                    .fields
+                    .iter()
+                    .map(|(n, v)| n.len() + v.len() + 5)
+                    .sum::<usize>(),
+        );
+        let line = |base: &mut Vec<u8>, name: &str, value: &[u8]| {
+            base.push(b'"');
+            base.extend_from_slice(name.as_bytes());
+            base.extend_from_slice(b"\": ");
+            base.extend_from_slice(value);
+            base.push(b'\n');
+        };
+        match self.start {
+            StartLine::Request { method, target } => {
+                line(&mut base, "@method", method.as_bytes());
+                line(&mut base, "@request-target", target.as_bytes());
+            }
+            StartLine::Response { status } => {
+                line(&mut base, "@status", status.to_string().as_bytes());
+            }
+        }
+        for (name, value) in &self.fields {
+            line(&mut base, name, value);
+        }
+        base.extend_from_slice(b"\"@signature-params\": ");
+        base.extend_from_slice(input.as_bytes());
+        base
+    }
 }
 
 fn signature_input(head: &MessageHead) -> Result<String> {
-    signature_input_for_components(head, &components(head)?)
-}
-
-fn signature_input_for_components(head: &MessageHead, components: &[String]) -> Result<String> {
-    let components = components
-        .iter()
-        .map(|s| format!("\"{s}\""))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let timestamp = number(head, "racer-timestamp")? / 1000;
-    let keyid = field(head, "racer-signer")?;
-    uuid(&keyid)?;
-    Ok(format!(
-        "({components});created={timestamp};keyid=\"{keyid}\";alg=\"ed25519\";tag=\"{}\"",
-        PROFILE
-    ))
+    Components::new(head)?.signature_input(head)
 }
 
 /// RFC 9421 section 2.5 signature base under the strict canonical peer profile.
 fn signature_base(head: &MessageHead) -> Result<Vec<u8>> {
-    let components = components(head)?;
-    let input = signature_input_for_components(head, &components)?;
-    if field(head, "signature-input")? != format!("racer={input}") {
+    let components = Components::new(head)?;
+    let input = components.signature_input(head)?;
+    let carried = field(head, "signature-input")?;
+    if carried.strip_prefix("racer=") != Some(input.as_str()) {
         return Err(Error::Unauthorized);
     }
-    let mut base = Vec::new();
-    for name in components {
-        base.extend_from_slice(format!("\"{name}\": ").as_bytes());
-        match (name.as_str(), &head.start) {
-            ("@method", StartLine::Request { method, .. }) => {
-                base.extend_from_slice(method.as_bytes());
-            }
-            ("@request-target", StartLine::Request { target, .. }) => {
-                base.extend_from_slice(target.as_bytes());
-            }
-            ("@status", StartLine::Response { status }) => {
-                base.extend_from_slice(status.to_string().as_bytes());
-            }
-            _ => base.extend_from_slice(head.unique(&name)?.ok_or(Error::Unauthorized)?),
-        }
-        base.push(b'\n');
-    }
-    base.extend_from_slice(format!("\"@signature-params\": {input}").as_bytes());
-    Ok(base)
+    Ok(components.signature_base(&input))
 }
 
 /// Bind the exact signature base and signature without hashing payload bytes.
@@ -455,60 +587,42 @@ pub fn signed_digest(head: &SignedHead) -> Result<[u8; 32]> {
     Ok(hash.finalize().into())
 }
 
-fn encode_chain(chain: &[Vec<u8>]) -> Result<Vec<u8>> {
-    if chain.is_empty() || chain.len() > 8 {
-        return Err(Error::Unauthorized);
-    }
-    let mut bytes = Vec::new();
-    for cert in chain {
-        if cert.is_empty() || cert.len() > 16384 {
-            return Err(Error::Unauthorized);
-        }
-        bytes.extend_from_slice(&(cert.len() as u32).to_be_bytes());
-        bytes.extend_from_slice(cert);
-    }
-    if bytes.len() > 65536 {
-        return Err(Error::Unauthorized);
-    }
-    Ok(bytes)
-}
-
-fn decode_chain(mut bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
-    if bytes.len() > 65536 {
-        return Err(Error::Unauthorized);
-    }
-    let mut chain = Vec::new();
-    while !bytes.is_empty() {
-        if bytes.len() < 4 || chain.len() == 8 {
-            return Err(Error::Unauthorized);
-        }
-        let n =
-            u32::from_be_bytes(bytes[..4].try_into().map_err(|_| Error::Unauthorized)?) as usize;
-        bytes = &bytes[4..];
-        if n == 0 || n > 16384 || bytes.len() < n {
-            return Err(Error::Unauthorized);
-        }
-        chain.push(bytes[..n].to_vec());
-        bytes = &bytes[n..];
-    }
-    if chain.is_empty() {
-        return Err(Error::Unauthorized);
-    }
-    Ok(chain)
-}
-
 /// Current framing version.
-pub const VERSION: &str = "1";
+pub const VERSION: &str = "2";
 /// Current exchange target.
 pub const REQUEST_TARGET: &str = "/racer/peer/v1/exchange";
-/// Maximum carried hop count (links on one route), shared with `racer_core::route`.
-pub const MAX_HOPS: usize = racer_core::route::MAX_LINKS as usize;
-/// Maximum retained signed HTTP head.
-pub const MAX_SIGNED_HEAD: usize = MAX_HEAD;
-/// Maximum expanded envelope and its outer authentication head.
-pub const MAX_ENVELOPE_HEAD: usize = (MAX_HOPS + 1) * (MAX_SIGNED_HEAD * 2);
+/// Maximum carried hop count (links on one route), shared with `racer_wire::route`.
+pub const MAX_HOPS: usize = racer_wire::route::MAX_LINKS as usize;
+/// Field names `racer-hop-{i}` for every carried hop index.
+pub(crate) const HOP_FIELDS: [&str; MAX_HOPS] = [
+    "racer-hop-0",
+    "racer-hop-1",
+    "racer-hop-2",
+    "racer-hop-3",
+    "racer-hop-4",
+    "racer-hop-5",
+    "racer-hop-6",
+    "racer-hop-7",
+];
+/// Maximum retained signed HTTP head (one proof).
+///
+/// Proofs name their chain by fingerprint, so this bounds only logical fields.
+/// The largest request proof carries 8 KiB of metadata and 8 KiB of sealed
+/// authorization, about 22 KiB in base64, plus fixed route and auth fields.
+pub const MAX_SIGNED_HEAD: usize = 32 * 1024;
+/// Padded base64 length of `n` bytes.
+const fn base64_len(n: usize) -> usize {
+    n.div_ceil(3) * 4
+}
+/// Outer session fields, framing, and the sender-local proof-signer hint.
+const OUTER_HEAD: usize = 16 * 1024;
+/// Maximum expanded envelope and its outer authentication head: every proof
+/// (original and hops) framed with its detached signature, the most chains one
+/// message can attach, and the outer session fields.
+pub const MAX_ENVELOPE_HEAD: usize =
+    (MAX_HOPS + 1) * (base64_len(64 + MAX_SIGNED_HEAD) + 64) + MAX_CHAINS_FIELD + OUTER_HEAD;
 /// Canonical signature profile tag.
-pub const PROFILE: &str = "racer-peer-v1";
+pub const PROFILE: &str = "racer-peer-v2";
 /// Maximum ordinary canonical field or head.
 pub const MAX_HEAD: usize = 64 * 1024;
 /// Maximum opaque payload admitted by this wire profile, including the AEAD tag.
@@ -516,7 +630,7 @@ pub const MAX_BODY: usize = 16 * 1024 * 1024 + 16;
 
 /// Reject noncanonical UUID spelling at the trust boundary.
 pub fn uuid(value: &str) -> Result<()> {
-    if !racer_control_wire::valid_uuid(value) {
+    if !racer_wire::control::valid_uuid(value) {
         return Err(Error::InvalidRequest);
     }
     Ok(())
@@ -566,15 +680,16 @@ pub fn push_binary(head: &mut MessageHead, name: &str, bytes: &[u8]) {
 }
 /// Map a wall-clock timestamp to canonical milliseconds.
 pub fn millis(time: SystemTime) -> Result<u64> {
-    uring_runtime::environment::unix_millis(time).map_err(Into::into)
+    racer_io::ctx::unix_millis(time).map_err(Into::into)
 }
-/// Encode a deadline using the environment's stable clock mapping.
-pub fn encode_deadline(deadline: Deadline) -> Result<u64> {
-    deadline.to_unix_millis().map_err(Into::into)
+/// Encode a deadline using `clock`'s stable anchor.
+pub fn encode_deadline(clock: &racer_io::Clock, deadline: Instant) -> Result<u64> {
+    racer_io::ctx::instant_to_unix_millis(deadline, clock.anchor()).map_err(Into::into)
 }
-/// Decode a deadline without renewing its authority at each hop.
-pub fn decode_deadline(value: u64) -> Result<Deadline> {
-    Deadline::from_unix_millis(value).map_err(Into::into)
+/// Decode a deadline through `clock`'s stable anchor without renewing its
+/// authority at each hop.
+pub fn decode_deadline(clock: &racer_io::Clock, value: u64) -> Result<Instant> {
+    racer_io::ctx::unix_millis_to_instant(value, clock.anchor()).map_err(Into::into)
 }
 /// Encode a bounded node list with big-endian length prefixes and padded base64.
 pub fn nodes(nodes: &[NodeId]) -> Result<String> {
@@ -691,6 +806,24 @@ pub fn encode_envelope(
             value: encode_signed(head)?,
         });
     }
+    // Sender-local hint: the carrying session replaces it with the chains this
+    // session has not yet sent, so no proof is decoded again on the send path.
+    let mut signers: Vec<[u8; 32]> = Vec::with_capacity(authentication.hops.len() + 1);
+    for proof in std::iter::once(authentication.original.as_ref()).chain(&authentication.hops) {
+        let fingerprint = fingerprint(&proof.head)?;
+        if !signers.contains(&fingerprint) {
+            signers.push(fingerprint);
+        }
+    }
+    headers.push(Header {
+        name: PROOF_SIGNERS.into(),
+        value: signers
+            .iter()
+            .map(|f| binary(f))
+            .collect::<Vec<_>>()
+            .join(",")
+            .into_bytes(),
+    });
     if !response {
         headers.push(Header::new("host", b""));
     }
@@ -709,8 +842,64 @@ pub fn encode_envelope(
     Ok(head)
 }
 
-/// Decode framing; callers separately verify proofs and admit the carrying session.
-pub fn decode_envelope(head: MessageHead, response: bool) -> Result<(ForwardedHead, usize)> {
+/// Status of the unsigned answer to a request its holder could not verify for overload.
+pub const OVERLOADED_STATUS: u16 = 429;
+
+/// The unsigned overload answer: status [`OVERLOADED_STATUS`] and an empty body. A holder sends
+/// it when it sheds a request before verifying it, for example with its crypto queue full. It
+/// carries nothing from the request and costs no key operation, so it reveals only that the
+/// holder is busy, which closing the connection would reveal as well.
+pub fn overloaded_head() -> MessageHead {
+    MessageHead {
+        start: StartLine::Response {
+            status: OVERLOADED_STATUS,
+        },
+        headers: vec![Header {
+            name: "content-length".into(),
+            value: b"0".to_vec(),
+        }],
+    }
+}
+
+/// Whether `head` is exactly [`overloaded_head`]. Anything else keeps the signed envelope path.
+pub fn is_overloaded(head: &MessageHead) -> bool {
+    matches!(
+        head.start,
+        StartLine::Response {
+            status: OVERLOADED_STATUS
+        }
+    ) && matches!(
+        head.headers.as_slice(),
+        [Header { name, value }] if name.eq_ignore_ascii_case("content-length") && value == b"0"
+    )
+}
+
+/// Unsigned sender-local field naming every proof signer's chain fingerprint.
+pub(crate) const PROOF_SIGNERS: &str = "racer-proof-signers";
+
+/// Parse the proof-signer hint written by [`encode_envelope`].
+pub(crate) fn proof_signers(value: &[u8]) -> Result<Vec<[u8; 32]>> {
+    let mut signers = Vec::new();
+    for part in value.split(|b| *b == b',') {
+        if signers.len() == MAX_CHAINS_PER_MESSAGE {
+            return Err(Error::InvalidRequest);
+        }
+        signers.push(
+            decode_binary(part)?
+                .try_into()
+                .map_err(|_| Error::InvalidRequest)?,
+        );
+    }
+    Ok(signers)
+}
+
+/// Decode framing and resolve every proof's chain from its carrier, normally the
+/// session that admitted the message. Callers separately verify proofs.
+pub fn decode_envelope(
+    head: MessageHead,
+    response: bool,
+    chains: &dyn Chains,
+) -> Result<(ForwardedHead, usize)> {
     match (&head.start, response) {
         (StartLine::Request { method, target }, false)
             if method == "POST" && target == REQUEST_TARGET => {}
@@ -750,8 +939,13 @@ pub fn decode_envelope(head: MessageHead, response: bool) -> Result<(ForwardedHe
                 }
                 length = Some(parsed);
             }
-            "racer-original" => original = Some(Arc::new(decode_signed(&header.value)?)),
-            "connection" | "host" => {}
+            "racer-original" => {
+                let mut proof = decode_signed(&header.value)?;
+                resolve(&mut proof, chains)?;
+                original = Some(Arc::new(proof));
+            }
+            // Present only when no session consumed it, as in sessionless fixtures.
+            "connection" | "host" | PROOF_SIGNERS => {}
             _ => {
                 let suffix = name
                     .strip_prefix("racer-hop-")
@@ -760,7 +954,9 @@ pub fn decode_envelope(head: MessageHead, response: bool) -> Result<(ForwardedHe
                 if index >= MAX_HOPS || suffix != index.to_string() {
                     return Err(Error::InvalidRequest);
                 }
-                hops.insert(index, decode_signed(&header.value)?);
+                let mut proof = decode_signed(&header.value)?;
+                resolve(&mut proof, chains)?;
+                hops.insert(index, proof);
             }
         }
     }
@@ -792,7 +988,8 @@ pub fn encode_signed(head: &SignedHead) -> Result<Vec<u8>> {
     Ok(STANDARD.encode(framed).into_bytes())
 }
 
-/// Decode exactly one bounded signed head, rejecting trailing bytes.
+/// Decode exactly one bounded signed head, rejecting trailing bytes. The chain
+/// stays unresolved until [`resolve`] consults the carrier.
 pub fn decode_signed(bytes: &[u8]) -> Result<SignedHead> {
     if bytes.len() > (MAX_SIGNED_HEAD + 64).div_ceil(3) * 4 {
         return Err(Error::InvalidRequest);
@@ -810,5 +1007,6 @@ pub fn decode_signed(bytes: &[u8]) -> Result<SignedHead> {
     Ok(SignedHead {
         head,
         signature: decoded[..64].to_vec(),
+        chain: None,
     })
 }

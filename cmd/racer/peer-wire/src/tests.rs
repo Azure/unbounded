@@ -1,13 +1,18 @@
 //! Mechanism fixtures and byte/authentication regression tests.
 
 use super::*;
-use racer_control_wire::{BundleGeneration, ClusterId, KeyringBundle, SCHEMA_VERSION};
 use racer_crypto::identity::{
     KeyEpochs,
     test_util::{ca, issue},
 };
+use racer_wire::control::{BundleGeneration, ClusterId, KeyringBundle};
 
 /// Deterministic canonical fixture identity.
+fn wall_clock(ctx: &racer_io::WorkerCtx) -> racer_crypto::identity::WallClock {
+    let clock = ctx.clock.clone();
+    racer_crypto::identity::WallClock::new(move || clock.wall_now())
+}
+
 pub(crate) fn node(n: usize) -> NodeId {
     NodeId(format!("{n:08x}-1111-4111-8111-111111111111"))
 }
@@ -24,7 +29,8 @@ impl RequestMac for NoMac {
 }
 
 /// Independent certificate network without application credential policy.
-pub(crate) fn network(count: usize) -> Vec<Rc<Signatures>> {
+/// Signing identities whose wall clocks and signatures read `ctx`.
+pub(crate) fn network(count: usize, ctx: &racer_io::WorkerCtx) -> Vec<Rc<Signatures>> {
     let (ca, key) = ca();
     let roots = vec![ca.der().to_vec()];
     let cluster = ClusterId(node(99).0);
@@ -33,15 +39,21 @@ pub(crate) fn network(count: usize) -> Vec<Rc<Signatures>> {
             let node = node(i);
             let (pending, chain) = issue(&ca, &key, &cluster, &node, |_| {});
             let identity = pending
-                .accept(cluster.clone(), node.clone(), chain, &roots)
+                .accept(
+                    cluster.clone(),
+                    node.clone(),
+                    chain,
+                    &roots,
+                    &wall_clock(ctx),
+                )
                 .unwrap();
             let keys = Rc::new(Keyring::new(
                 cluster.clone(),
                 node,
-                Arc::new(KeyEpochs::default()),
+                Arc::new(KeyEpochs::with_clock(wall_clock(ctx))),
             ));
             keys.install(KeyringBundle {
-                schema_version: SCHEMA_VERSION,
+                schema_version: racer_wire::control::KEYRING_SCHEMA_VERSION,
                 cluster: cluster.clone(),
                 generation: BundleGeneration(1),
                 peer_trust_roots: roots.clone(),
@@ -50,7 +62,12 @@ pub(crate) fn network(count: usize) -> Vec<Rc<Signatures>> {
             .unwrap();
             keys.install_signing_identity(Arc::new(identity)).unwrap();
             let certificates = Rc::new(Certificates::new(cluster.clone(), keys.clone()));
-            Rc::new(Signatures::new(keys, certificates, Rc::new(NoMac)))
+            Rc::new(Signatures::new(
+                keys,
+                certificates,
+                Rc::new(NoMac),
+                ctx.clone(),
+            ))
         })
         .collect()
 }
@@ -236,7 +253,7 @@ fn signature_base_preserves_obs_text_and_rejects_controls() {
 
 #[test]
 fn object_context_signature_base_vector_and_proof_preserve_opaque_bytes() {
-    use racer_object_wire::{CacheKey, client::RequestParser, origin};
+    use racer_wire::object::{CacheKey, client::RequestParser, origin};
 
     let metadata = b"a,\\b\x80";
     let authorization = b"Bearer \xff";
@@ -260,7 +277,7 @@ fn object_context_signature_base_vector_and_proof_preserve_opaque_bytes() {
 
     push(&mut head, "racer-timestamp", "1700000000123");
     push(&mut head, "racer-signer", node(0).0);
-    let params = "(\"@method\" \"@request-target\" \"authorization\" \"content-length\" \"host\" \"racer-metadata\" \"racer-signer\" \"racer-timestamp\");created=1700000000;keyid=\"00000000-1111-4111-8111-111111111111\";alg=\"ed25519\";tag=\"racer-peer-v1\"";
+    let params = "(\"@method\" \"@request-target\" \"authorization\" \"content-length\" \"host\" \"racer-metadata\" \"racer-signer\" \"racer-timestamp\");created=1700000000;keyid=\"00000000-1111-4111-8111-111111111111\";alg=\"ed25519\";tag=\"racer-peer-v2\"";
     push(&mut head, "signature-input", format!("racer={params}"));
     let mut expected = b"\"@method\": GET\n\"@request-target\": /v1/objects/abababababababababababababababababababababababababababababababab\n\"authorization\": Bearer \xff\n\"content-length\": 0\n\"host\": racer\n\"racer-metadata\": a,\\b\x80\n\"racer-signer\": 00000000-1111-4111-8111-111111111111\n\"racer-timestamp\": 1700000000123\n\"@signature-params\": ".to_vec();
     expected.extend_from_slice(params.as_bytes());
@@ -268,11 +285,16 @@ fn object_context_signature_base_vector_and_proof_preserve_opaque_bytes() {
 
     head.headers.retain(|h| !is_auth_field(&h.name));
     push(&mut head, "racer-receiver", node(1).0);
-    let n = network(2);
+    let n = network(2, &racer_io::WorkerCtx::host());
     let signed = n[0].sign(head).unwrap();
     let digest = signed_digest(&signed).unwrap();
     let encoded = encode_signed(&signed).unwrap();
-    let decoded = decode_signed(&encoded).unwrap();
+    let mut decoded = decode_signed(&encoded).unwrap();
+    assert!(
+        n[1].verify_proof(decode_signed(&encoded).unwrap()).is_err(),
+        "unresolved chain"
+    );
+    resolve(&mut decoded, &test_util::AnyChain).unwrap();
     assert_eq!(signed_digest(&decoded).unwrap(), digest);
     let verified = n[1].verify_proof(decoded).unwrap();
     assert_eq!(
@@ -285,6 +307,7 @@ fn object_context_signature_base_vector_and_proof_preserve_opaque_bytes() {
     );
     for name in ["racer-metadata", "authorization"] {
         let mut tampered = decode_signed(&encoded).unwrap();
+        resolve(&mut tampered, &test_util::AnyChain).unwrap();
         let value = &mut tampered
             .head
             .headers
@@ -311,28 +334,32 @@ fn rfc9421_exact_request_and_response_signature_base_vectors() {
     push(&mut request, "racer-timestamp", "1700000000123");
     push(&mut request, "racer-signer", node(0).0);
     push(&mut request, "content-length", "0");
-    let params = "(\"@method\" \"@request-target\" \"content-length\" \"host\" \"racer-signer\" \"racer-timestamp\");created=1700000000;keyid=\"00000000-1111-4111-8111-111111111111\";alg=\"ed25519\";tag=\"racer-peer-v1\"";
+    let params = "(\"@method\" \"@request-target\" \"content-length\" \"host\" \"racer-signer\" \"racer-timestamp\");created=1700000000;keyid=\"00000000-1111-4111-8111-111111111111\";alg=\"ed25519\";tag=\"racer-peer-v2\"";
     push(&mut request, "signature-input", format!("racer={params}"));
     assert_eq!(signature_base(&request).unwrap(), format!("\"@method\": POST\n\"@request-target\": /racer/peer/v1?attempt=1\n\"content-length\": 0\n\"host\": \n\"racer-signer\": 00000000-1111-4111-8111-111111111111\n\"racer-timestamp\": 1700000000123\n\"@signature-params\": {params}").as_bytes());
     request.start = StartLine::Response { status: 200 };
     request
         .headers
         .retain(|h| h.name != "signature-input" && h.name != "host");
-    let params = "(\"@status\" \"content-length\" \"racer-signer\" \"racer-timestamp\");created=1700000000;keyid=\"00000000-1111-4111-8111-111111111111\";alg=\"ed25519\";tag=\"racer-peer-v1\"";
+    let params = "(\"@status\" \"content-length\" \"racer-signer\" \"racer-timestamp\");created=1700000000;keyid=\"00000000-1111-4111-8111-111111111111\";alg=\"ed25519\";tag=\"racer-peer-v2\"";
     push(&mut request, "signature-input", format!("racer={params}"));
     assert_eq!(signature_base(&request).unwrap(), format!("\"@status\": 200\n\"content-length\": 0\n\"racer-signer\": 00000000-1111-4111-8111-111111111111\n\"racer-timestamp\": 1700000000123\n\"@signature-params\": {params}").as_bytes());
 }
 
 #[test]
 fn ed25519_rfc9421_base_tamper_replay_and_receiver_challenge() {
-    let n = network(3);
+    let n = network(3, &racer_io::WorkerCtx::host());
     let original = n[0].sign(head()).unwrap();
-    let clone = || decode_signed(&encode_signed(&original).unwrap()).unwrap();
+    let clone = || {
+        let mut copy = decode_signed(&encode_signed(&original).unwrap()).unwrap();
+        resolve(&mut copy, &test_util::AnyChain).unwrap();
+        copy
+    };
     let base = String::from_utf8(signature_base(&original.head).unwrap()).unwrap();
     assert!(base.starts_with(
         "\"@method\": POST\n\"@request-target\": /racer/peer/v1\n\"content-length\": 0\n"
     ));
-    assert!(base.ends_with(";alg=\"ed25519\";tag=\"racer-peer-v1\""));
+    assert!(base.ends_with(";alg=\"ed25519\";tag=\"racer-peer-v2\""));
     for h in &original.head.headers {
         let mut tamper = clone();
         tamper
@@ -363,17 +390,13 @@ fn ed25519_rfc9421_base_tamper_replay_and_receiver_challenge() {
 
 #[test]
 fn timestamp_window_and_retained_deadline_revalidate_authority() {
-    let clock = uring_runtime::environment::SimulationClock::new_at(
-        87,
-        std::time::Instant::now(),
-        SystemTime::now(),
-    );
-    let _guard = clock.environment(0).enter();
-    let n = network(2);
+    let clock = racer_io::SimClock::new_at(87, std::time::Instant::now(), SystemTime::now());
+    let sim_ctx = clock.ctx(0);
+    let n = network(2, &sim_ctx);
     let mut head = head();
     head.headers.retain(|h| h.name != "racer-kind");
     push(&mut head, "racer-kind", "request");
-    let deadline = millis(uring_runtime::environment::wall_now()).unwrap() + 120_000;
+    let deadline = millis(sim_ctx.clock.wall_now()).unwrap() + 120_000;
     push(&mut head, "racer-route-deadline", deadline);
     let signed = n[0].sign(head).unwrap();
     clock.advance(Duration::from_secs(60));
@@ -395,7 +418,7 @@ fn timestamp_window_and_retained_deadline_revalidate_authority() {
 
 #[test]
 fn envelope_limits_and_canonical_fields_preserve_exact_bytes() {
-    let n = network(2);
+    let n = network(2, &racer_io::WorkerCtx::host());
     let signed = n[0].sign(head()).unwrap();
     let encoded = encode_signed(&signed).unwrap();
     let auth = ForwardedHead {
@@ -403,8 +426,12 @@ fn envelope_limits_and_canonical_fields_preserve_exact_bytes() {
         hops: vec![],
     };
     for length in [0, MAX_BODY] {
-        let (decoded, actual) =
-            decode_envelope(encode_envelope(&auth, true, length).unwrap(), true).unwrap();
+        let (decoded, actual) = decode_envelope(
+            encode_envelope(&auth, true, length).unwrap(),
+            true,
+            &test_util::AnyChain,
+        )
+        .unwrap();
         assert_eq!(actual, length);
         assert_eq!(encode_signed(&decoded.original).unwrap(), encoded);
     }
@@ -412,17 +439,17 @@ fn envelope_limits_and_canonical_fields_preserve_exact_bytes() {
     assert!(encode_envelope(&auth, false, 1).is_err());
     for (name, value) in [
         ("content-length", "00"),
-        ("racer-peer-version", "2"),
+        ("racer-peer-version", "1"),
         ("racer-hop-1", "AAAA"),
     ] {
         let mut bad = encode_envelope(&auth, false, 0).unwrap();
         bad.headers.retain(|h| h.name != name);
         push(&mut bad, name, value);
-        assert!(decode_envelope(bad, false).is_err());
+        assert!(decode_envelope(bad, false, &test_util::AnyChain).is_err());
     }
     let mut duplicate = encode_envelope(&auth, false, 0).unwrap();
     push(&mut duplicate, "Content-Length", 0);
-    assert!(decode_envelope(duplicate, false).is_err());
+    assert!(decode_envelope(duplicate, false, &test_util::AnyChain).is_err());
     let mut trailing = STANDARD.decode(&encoded).unwrap();
     trailing.extend_from_slice(b"extra");
     assert!(decode_signed(STANDARD.encode(trailing).as_bytes()).is_err());
@@ -471,17 +498,18 @@ fn node_list_encoding_rejects_duplicates_invalid_ids_and_excess_hops() {
 #[test]
 fn control_chain_rejects_phase_previous_identity_and_extension_substitution() {
     use crate::control::{Binding, Phase};
-    let n = network(3);
+    let n = network(3, &racer_io::WorkerCtx::host());
     let binding = Binding {
         request: [1; 32],
         response: [2; 32],
         transfer: [3; 16],
         membership: 1,
-        deadline: encode_deadline(Deadline(
-            uring_runtime::environment::now() + Duration::from_secs(30),
-        ))
+        deadline: encode_deadline(
+            &racer_io::Clock::host(),
+            racer_io::Clock::host().now() + Duration::from_secs(30),
+        )
         .unwrap(),
-        rail: racer_control_wire::RailId(1),
+        rail: racer_wire::control::RailId(1),
     };
     let grant = || {
         vec![Header::new(
@@ -521,15 +549,37 @@ fn control_chain_rejects_phase_previous_identity_and_extension_substitution() {
                 .is_err()
         );
     }
-    assert!(binding.head(Phase::Accept, &previous, 0, vec![]).is_err());
     assert!(
         binding
-            .head(Phase::Finish, &previous, MAX_BODY, vec![])
+            .head(
+                &racer_io::Clock::host(),
+                Phase::Accept,
+                &previous,
+                0,
+                vec![]
+            )
+            .is_err()
+    );
+    assert!(
+        binding
+            .head(
+                &racer_io::Clock::host(),
+                Phase::Finish,
+                &previous,
+                MAX_BODY,
+                vec![]
+            )
             .is_ok()
     );
     assert!(
         binding
-            .head(Phase::Finish, &previous, MAX_BODY + 1, vec![])
+            .head(
+                &racer_io::Clock::host(),
+                Phase::Finish,
+                &previous,
+                MAX_BODY + 1,
+                vec![]
+            )
             .is_err()
     );
 }
@@ -568,7 +618,7 @@ fn route_transition_consumes_one_link_without_refilling_authority() {
 #[test]
 fn request_builders_supply_host_for_strict_http_codec() {
     use crate::control::{Binding, Phase};
-    let n = network(2);
+    let n = network(2, &racer_io::WorkerCtx::host());
     let original = n[0].sign(head()).unwrap();
     let hop = forwarding::hop_head("request-hop", &original, &original).unwrap();
     assert_eq!(hop.unique("host").unwrap(), Some(b"".as_slice()));
@@ -580,21 +630,23 @@ fn request_builders_supply_host_for_strict_http_codec() {
     };
     let envelope = encode_envelope(&auth, false, 0).unwrap();
     assert_eq!(envelope.unique("host").unwrap(), Some(b"".as_slice()));
-    decode_envelope(envelope, false).unwrap();
+    decode_envelope(envelope, false, &test_util::AnyChain).unwrap();
     let binding = Binding {
         request: [1; 32],
         response: [2; 32],
         transfer: [3; 16],
         membership: 1,
         deadline: 1,
-        rail: racer_control_wire::RailId(1),
+        rail: racer_wire::control::RailId(1),
     };
     let grant = vec![Header::new(
         "racer-rdma-grant",
         binary(&[7; 38]).into_bytes(),
     )];
     for (phase, extensions) in [(Phase::Accept, grant), (Phase::Finish, vec![])] {
-        let head = binding.head(phase, &[0; 32], 0, extensions).unwrap();
+        let head = binding
+            .head(&racer_io::Clock::host(), phase, &[0; 32], 0, extensions)
+            .unwrap();
         assert_eq!(
             head.unique("host").unwrap(),
             (!phase.response()).then_some(b"".as_slice())
@@ -622,9 +674,14 @@ fn credential_policy_runs_after_profile_checks_before_signature_verification() {
         }
     }
 
-    let n = network(2);
+    let n = network(2, &racer_io::WorkerCtx::host());
     let policy = Rc::new(Reject(std::cell::Cell::new(0)));
-    let verifier = Signatures::new(n[1].keys.clone(), n[1].certificates.clone(), policy.clone());
+    let verifier = Signatures::new(
+        n[1].keys.clone(),
+        n[1].certificates.clone(),
+        policy.clone(),
+        racer_io::WorkerCtx::host(),
+    );
     let mut signed = n[0].sign(head()).unwrap();
     signed.signature[0] ^= 1;
     assert!(matches!(
@@ -650,7 +707,7 @@ fn credential_policy_runs_after_profile_checks_before_signature_verification() {
 #[test]
 fn rdma_link_request_and_response_roundtrip_and_reject_substitution() {
     use crate::link::{BINDING_FIELD, KIND, MAX_SETUP, RdmaLink, SETUP_FIELD, TARGET};
-    let n = network(3);
+    let n = network(3, &racer_io::WorkerCtx::host());
     let request = RdmaLink {
         setup: vec![7; 74],
         binding: None,
@@ -824,5 +881,192 @@ fn route_state_accepts_eight_links_and_rejects_nine() {
             Some(Error::HopBudgetExhausted),
             "{links} links, {visited} visited"
         );
+    }
+}
+
+#[test]
+fn overloaded_head_is_exact_and_bodiless() {
+    let head = overloaded_head();
+    assert!(is_overloaded(&head));
+    // The encoded answer carries nothing but the status and an empty body.
+    let bytes = Codec::new(MAX_HEAD).encode_head(&head).unwrap();
+    assert_eq!(
+        bytes,
+        b"HTTP/1.1 429 \r\ncontent-length: 0\r\n\r\n".to_vec()
+    );
+    let mut other = overloaded_head();
+    other.start = StartLine::Response { status: 503 };
+    assert!(!is_overloaded(&other));
+    let mut body = overloaded_head();
+    body.headers[0].value = b"1".to_vec();
+    assert!(!is_overloaded(&body));
+    let mut extra = overloaded_head();
+    extra.headers.push(Header {
+        name: "racer-peer-version".into(),
+        value: VERSION.as_bytes().to_vec(),
+    });
+    assert!(!is_overloaded(&extra));
+    // A signed envelope is never mistaken for it, and it never decodes as one.
+    assert!(decode_envelope(overloaded_head(), true, &test_util::AnyChain).is_err());
+}
+
+/// Previous allocation-heavy implementation, kept as a byte-for-byte oracle.
+mod legacy {
+    use super::*;
+
+    fn components(head: &MessageHead) -> Result<Vec<String>> {
+        Codec::new(MAX_ENVELOPE_HEAD).encode_head(head)?;
+        let mut names = BTreeSet::new();
+        for h in &head.headers {
+            let name = h.name.to_ascii_lowercase();
+            if !names.insert(name)
+                || h.value.first().is_some_and(|b| b.is_ascii_whitespace())
+                || h.value.last().is_some_and(|b| b.is_ascii_whitespace())
+                || h.value.iter().any(u8::is_ascii_control)
+            {
+                return Err(Error::Unauthorized);
+            }
+        }
+        names.remove("signature");
+        names.remove("signature-input");
+        let mut components = match head.start {
+            StartLine::Request { .. } => vec!["@method".into(), "@request-target".into()],
+            StartLine::Response { .. } => vec!["@status".into()],
+        };
+        components.extend(names);
+        Ok(components)
+    }
+
+    pub(super) fn signature_input(head: &MessageHead) -> Result<String> {
+        let components = components(head)?
+            .iter()
+            .map(|s| format!("\"{s}\""))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let timestamp = number(head, "racer-timestamp")? / 1000;
+        let keyid = field(head, "racer-signer")?;
+        uuid(&keyid)?;
+        Ok(format!(
+            "({components});created={timestamp};keyid=\"{keyid}\";alg=\"ed25519\";tag=\"{}\"",
+            PROFILE
+        ))
+    }
+
+    pub(super) fn signature_base(head: &MessageHead) -> Result<Vec<u8>> {
+        let components = components(head)?;
+        let input = signature_input(head)?;
+        if field(head, "signature-input")? != format!("racer={input}") {
+            return Err(Error::Unauthorized);
+        }
+        let mut base = Vec::new();
+        for name in components {
+            base.extend_from_slice(format!("\"{name}\": ").as_bytes());
+            match (name.as_str(), &head.start) {
+                ("@method", StartLine::Request { method, .. }) => {
+                    base.extend_from_slice(method.as_bytes())
+                }
+                ("@request-target", StartLine::Request { target, .. }) => {
+                    base.extend_from_slice(target.as_bytes())
+                }
+                ("@status", StartLine::Response { status }) => {
+                    base.extend_from_slice(status.to_string().as_bytes())
+                }
+                _ => base.extend_from_slice(head.unique(&name)?.ok_or(Error::Unauthorized)?),
+            }
+            base.push(b'\n');
+        }
+        base.extend_from_slice(format!("\"@signature-params\": {input}").as_bytes());
+        Ok(base)
+    }
+
+    pub(super) fn mac_base(head: &MessageHead) -> Result<Vec<u8>> {
+        fn append(out: &mut Vec<u8>, value: &[u8]) -> Result<()> {
+            let length = u32::try_from(value.len()).map_err(|_| Error::InvalidRequest)?;
+            out.extend_from_slice(&length.to_be_bytes());
+            out.extend_from_slice(value);
+            Ok(())
+        }
+        let mut out = b"racer/request-mac/message/v1\0".to_vec();
+        let start = match &head.start {
+            StartLine::Request { method, target } => format!("{method} {target}"),
+            _ => return Err(Error::Unauthorized),
+        };
+        append(&mut out, start.as_bytes())?;
+        for name in components(head)? {
+            if name.starts_with('@') || name == "racer-request-mac" {
+                continue;
+            }
+            append(&mut out, name.as_bytes())?;
+            append(&mut out, head.unique(&name)?.ok_or(Error::Unauthorized)?)?;
+        }
+        Ok(out)
+    }
+}
+
+fn copy(head: &MessageHead) -> MessageHead {
+    MessageHead {
+        start: match &head.start {
+            StartLine::Request { method, target } => StartLine::Request {
+                method: method.clone(),
+                target: target.clone(),
+            },
+            StartLine::Response { status } => StartLine::Response { status: *status },
+        },
+        headers: head
+            .headers
+            .iter()
+            .map(|h| Header {
+                name: h.name.clone(),
+                value: h.value.clone(),
+            })
+            .collect(),
+    }
+}
+
+#[test]
+fn signature_and_mac_bases_match_legacy_implementation_bytes() {
+    for response in [false, true] {
+        for (fields, value_bytes) in [(0, 0), (1, 1), (8, 16), (40, 3)] {
+            let mut head = canonical_fixture(response, fields, value_bytes);
+            push(&mut head, "Racer-Request-Mac", "racer=:abc:");
+            head.headers.push(Header {
+                name: "X-Obs".into(),
+                value: vec![b'a', 0x80, b'z'],
+            });
+            // Refresh signature-input to cover the added fields.
+            head.headers
+                .retain(|h| !h.name.eq_ignore_ascii_case("signature-input"));
+            let input = signature_input(&head).unwrap();
+            assert_eq!(input, legacy::signature_input(&head).unwrap());
+            push(&mut head, "signature-input", format!("racer={input}"));
+            for mixed in [false, true] {
+                let mut head = copy(&head);
+                if mixed {
+                    head.headers.reverse();
+                    for h in &mut head.headers {
+                        h.name = h.name.to_ascii_uppercase();
+                    }
+                }
+                assert_eq!(
+                    signature_base(&head).unwrap(),
+                    legacy::signature_base(&head).unwrap()
+                );
+                assert_eq!(mac_base(&head).is_ok(), legacy::mac_base(&head).is_ok());
+                if !response {
+                    assert_eq!(mac_base(&head).unwrap(), legacy::mac_base(&head).unwrap());
+                }
+            }
+            let mut dup = copy(&head);
+            push(&mut dup, "x-obs", "again");
+            assert!(signature_base(&dup).is_err() && legacy::signature_base(&dup).is_err());
+            assert!(mac_base(&dup).is_err() && legacy::mac_base(&dup).is_err());
+        }
+    }
+}
+
+#[test]
+fn hop_field_table_matches_hop_names() {
+    for (i, name) in HOP_FIELDS.iter().enumerate() {
+        assert_eq!(*name, format!("racer-hop-{i}"));
     }
 }

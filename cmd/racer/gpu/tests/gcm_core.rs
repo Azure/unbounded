@@ -1,8 +1,8 @@
 //! Checks the C decrypt core (`native/gcm_core.h`, run serially through the
-//! same chunked GHASH and CRC decomposition the CUDA kernels use) against the
-//! `racer-crypto` XAES-256-GCM implementation and CRC-64/XZ.
+//! same chunked GHASH decomposition the CUDA kernels use) against the
+//! `racer-crypto` XAES-256-GCM implementation.
 
-use racer_gpu::gcm::{self, VERDICT_CRC, VERDICT_PASS, VERDICT_TAG};
+use racer_gpu::gcm::{self, VERDICT_PASS, VERDICT_TAG};
 
 /// Deterministic xorshift bytes.
 struct Rng(u64);
@@ -20,7 +20,7 @@ impl Rng {
 
     /// A random array.
     fn array<const N: usize>(&mut self) -> [u8; N] {
-        let mut out = [0; N];
+        let mut out = [u8::default(); N];
         self.fill(&mut out);
         out
     }
@@ -67,11 +67,11 @@ fn page(rng: &mut Rng, length: usize) -> Page {
 }
 
 /// Decrypt through the C core with the Rust-derived XAES key.
-fn open(page: &Page, aad: &[u8], sealed: &[u8], crc: Option<u64>) -> (u32, u64, Vec<u8>) {
+fn open(page: &Page, aad: &[u8], sealed: &[u8]) -> (u32, Vec<u8>) {
     let derived = racer_crypto::xaes_derive(&page.key, &page.nonce);
     let mut out = vec![0xa5; sealed.len() - 16];
-    let verdict = gcm::decrypt(derived.key(), derived.nonce(), aad, sealed, crc, &mut out).unwrap();
-    (verdict.status, verdict.crc, out)
+    let verdict = gcm::decrypt(derived.key(), derived.nonce(), aad, sealed, &mut out).unwrap();
+    (verdict.status, out)
 }
 
 #[test]
@@ -107,18 +107,9 @@ fn core_matches_crypto_crate_for_many_lengths() {
     }
     for length in lengths {
         let page = page(&mut rng, length);
-        let expected_crc = racer_crypto::crc64(&page.sealed);
-        assert_eq!(gcm::crc64(&page.sealed), expected_crc, "length {length}");
-        let (status, crc, out) = open(&page, &page.aad, &page.sealed, Some(expected_crc));
+        let (status, out) = open(&page, &page.aad, &page.sealed);
         assert_eq!(status, VERDICT_PASS, "length {length}");
-        assert_eq!(crc, expected_crc, "length {length}");
         assert!(out == page.plaintext, "length {length}");
-        let (status, crc, _) = open(&page, &page.aad, &page.sealed, None);
-        assert_eq!(
-            (status, crc),
-            (VERDICT_PASS, expected_crc),
-            "length {length}"
-        );
     }
 }
 
@@ -128,43 +119,32 @@ fn core_rejects_tampering_without_writing() {
     let mut rng = Rng(42);
     for length in [1, 16, 4097, 70_001] {
         let page = page(&mut rng, length);
-        let crc = racer_crypto::crc64(&page.sealed);
         let untouched = vec![0xa5; length];
 
-        // Flipped ciphertext bit, with and without a matching stored CRC.
+        // Flipped ciphertext bit.
         let mut sealed = page.sealed.clone();
         sealed[length / 2] ^= 0x10;
-        let (status, actual, out) = open(&page, &page.aad, &sealed, Some(crc));
-        assert_eq!(status, VERDICT_CRC);
-        assert_eq!(actual, racer_crypto::crc64(&sealed));
-        assert_eq!(out, untouched);
-        let fresh = racer_crypto::crc64(&sealed);
-        let (status, _, out) = open(&page, &page.aad, &sealed, Some(fresh));
+        let (status, out) = open(&page, &page.aad, &sealed);
         assert_eq!(status, VERDICT_TAG);
         assert_eq!(out, untouched);
 
         // Flipped tag bit.
         let mut sealed = page.sealed.clone();
         sealed[length + 15] ^= 1;
-        let (status, _, out) = open(&page, &page.aad, &sealed, None);
+        let (status, out) = open(&page, &page.aad, &sealed);
         assert_eq!(status, VERDICT_TAG);
         assert_eq!(out, untouched);
 
         // Wrong AAD.
         let mut aad = page.aad.clone();
         aad[20] ^= 1;
-        let (status, _, out) = open(&page, &aad, &page.sealed, Some(crc));
+        let (status, out) = open(&page, &aad, &page.sealed);
         assert_eq!(status, VERDICT_TAG);
         assert_eq!(out, untouched);
 
         // Truncated AAD.
-        let (status, _, _) = open(&page, &page.aad[..page.aad.len() - 1], &page.sealed, None);
+        let (status, _) = open(&page, &page.aad[..page.aad.len() - 1], &page.sealed);
         assert_eq!(status, VERDICT_TAG);
-
-        // Wrong expected CRC with intact data.
-        let (status, actual, out) = open(&page, &page.aad, &page.sealed, Some(crc ^ 1));
-        assert_eq!((status, actual), (VERDICT_CRC, crc));
-        assert_eq!(out, untouched);
 
         // Wrong key.
         let mut other = page.key;
@@ -176,7 +156,6 @@ fn core_rejects_tampering_without_writing() {
             derived.nonce(),
             &page.aad,
             &page.sealed,
-            None,
             &mut out,
         )
         .unwrap();

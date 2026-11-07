@@ -14,7 +14,8 @@ fn setup() -> (
     crate::memory::PageResult,
 ) {
     let mut w = world();
-    link_up(&mut w);
+    let env = w.env.clone();
+    link_up(&env, &mut w);
     let admission = memory_admission(16);
     let page = bundle(&admission, "v1");
     (w, admission, page)
@@ -30,11 +31,12 @@ fn free(w: &World) -> Option<usize> {
 
 /// Wrap a freshly received copy of `page`'s ciphertext without copying.
 fn registered(
+    env: &racer_io::Env,
     w: &mut World,
     admission: &Rc<flow_control::Quotas<AdmissionPolicy>>,
     page: &CiphertextPage,
 ) -> CiphertextPage {
-    let received = receive_registered(w, page);
+    let received = receive_registered(env, w, page);
     let pointer = received.bytes().as_ptr();
     let envelope = page.envelope().clone();
     let reservation = admission
@@ -54,10 +56,10 @@ fn registered(
 
 #[test]
 fn registered_ciphertext_reads_in_place_and_drop_frees_buffer() {
+    let env = racer_io::Env::host();
     let (mut w, admission, page) = setup();
-    let ciphertext = registered(&mut w, &admission, &page.ciphertext);
+    let ciphertext = registered(&env, &mut w, &admission, &page.ciphertext);
     assert_eq!(ciphertext.bytes(), page.ciphertext.bytes());
-    assert_eq!(ciphertext.checksum(), page.ciphertext.checksum());
     assert_eq!(owned(&w), Some(1));
     let before = admission.used(ResourceClass::Ciphertext);
     // A clone on another thread keeps the buffer; dropping it there frees it.
@@ -73,6 +75,7 @@ fn registered_ciphertext_reads_in_place_and_drop_frees_buffer() {
 
 #[test]
 fn registered_ciphertext_rejects_bad_length_and_reservation() {
+    let env = racer_io::Env::host();
     let (mut w, admission, page) = setup();
     let pool = BufferPool::new(admission.clone());
     let cache = page.metadata.version.object.cache.clone();
@@ -81,7 +84,7 @@ fn registered_ciphertext_rejects_bad_length_and_reservation() {
     let mut short = page.ciphertext.envelope().clone();
     short.plaintext_length -= 1;
     short.ciphertext_length -= 1;
-    let received = receive_registered(&mut w, &page.ciphertext);
+    let received = receive_registered(&env, &mut w, &page.ciphertext);
     assert_eq!(
         pool.registered_ciphertext(reserve(ResourceClass::Ciphertext, 18), short, received)
             .err(),
@@ -90,7 +93,7 @@ fn registered_ciphertext_rejects_bad_length_and_reservation() {
     pump!(w);
     assert_eq!(free(&w), Some(2), "the rejected page is freed");
     // Wrong reservation class.
-    let received = receive_registered(&mut w, &page.ciphertext);
+    let received = receive_registered(&env, &mut w, &page.ciphertext);
     assert_eq!(
         pool.registered_ciphertext(
             reserve(ResourceClass::Plaintext, 19),
@@ -104,13 +107,14 @@ fn registered_ciphertext_rejects_bad_length_and_reservation() {
     assert_eq!(free(&w), Some(2));
     assert_eq!(
         admission.used(ResourceClass::Plaintext),
-        3,
-        "only the bundle"
+        4096,
+        "only the bundle, at one plaintext granule"
     );
 }
 
 #[test]
 fn retainable_and_rehome_copy_out_and_release_the_buffer() {
+    let env = racer_io::Env::host();
     let (mut w, admission, page) = setup();
     let pool = BufferPool::new(admission.clone());
     let owned_page = page.ciphertext.clone();
@@ -118,7 +122,7 @@ fn retainable_and_rehome_copy_out_and_release_the_buffer() {
         &pool.retainable(owned_page).unwrap().inner,
         &page.ciphertext.inner
     ));
-    let ciphertext = registered(&mut w, &admission, &page.ciphertext);
+    let ciphertext = registered(&env, &mut w, &admission, &page.ciphertext);
     let pointer = ciphertext.bytes().as_ptr();
     let used = admission.used(ResourceClass::Ciphertext);
     let copy = pool.retainable(ciphertext).unwrap();
@@ -137,13 +141,13 @@ fn retainable_and_rehome_copy_out_and_release_the_buffer() {
     pump!(w);
     assert_eq!(free(&w), Some(2));
     // An exclusive registered page still copies on rehome.
-    let ciphertext = registered(&mut w, &admission, &page.ciphertext);
+    let ciphertext = registered(&env, &mut w, &admission, &page.ciphertext);
     let pointer = ciphertext.bytes().as_ptr();
     let reservation = admission
         .reserve(
             Some(&page.metadata.version.object.cache),
             ResourceClass::Ciphertext,
-            19,
+            page_alloc::buf::GRANULE,
         )
         .unwrap();
     let moved = ciphertext.rehome(reservation).unwrap();
@@ -156,8 +160,9 @@ fn retainable_and_rehome_copy_out_and_release_the_buffer() {
 
 #[test]
 fn retainable_failure_drops_the_page_and_frees_the_buffer() {
+    let env = racer_io::Env::host();
     let (mut w, admission, page) = setup();
-    let ciphertext = registered(&mut w, &admission, &page.ciphertext);
+    let ciphertext = registered(&env, &mut w, &admission, &page.ciphertext);
     let pool = BufferPool::new(admission.clone());
     // Exhaust ciphertext admission so the copy-out cannot be charged.
     let cache = page.metadata.version.object.cache.clone();
@@ -175,17 +180,18 @@ fn retainable_failure_drops_the_page_and_frees_the_buffer() {
 
 #[test]
 fn memory_cache_publish_copies_out_registered_ciphertext() {
+    let env = racer_io::Env::host();
     let (mut w, admission, page) = setup();
     let cache = MemoryCache::new(
         BufferPool::new(admission.clone()),
-        crate::test_support::availability(),
+        crate::test_support::availability(&env),
     );
     let id = page.plaintext.page().clone();
     // Unverified ciphertext entries.
     let unverified = UnverifiedPage {
         copy: crate::memory::CiphertextCopy {
             metadata: page.metadata.clone(),
-            ciphertext: registered(&mut w, &admission, &page.ciphertext),
+            ciphertext: registered(&env, &mut w, &admission, &page.ciphertext),
         },
         disk_token: None,
     };
@@ -204,7 +210,7 @@ fn memory_cache_publish_copies_out_registered_ciphertext() {
     assert_eq!(free(&w), Some(2));
     // Verified pages.
     let mut result = page.clone();
-    result.ciphertext = registered(&mut w, &admission, &page.ciphertext);
+    result.ciphertext = registered(&env, &mut w, &admission, &page.ciphertext);
     cache.publish(result.clone()).unwrap();
     // A duplicate publish keeps the first copy and does not charge again.
     let used = admission.used(ResourceClass::Ciphertext);
@@ -235,13 +241,12 @@ fn aligned_charge(
 
 #[test]
 fn detach_registered_copies_once_into_the_pool_and_shares_with_the_cache() {
+    let env = racer_io::Env::host();
     let (mut w, admission, page) = setup();
     let pool = BufferPool::new(admission.clone());
-    let cache = MemoryCache::new(pool.clone(), crate::test_support::availability());
+    let cache = MemoryCache::new(pool.clone(), crate::test_support::availability(&env));
     let baseline = admission.used(ResourceClass::Ciphertext);
-    let ciphertext = registered(&mut w, &admission, &page.ciphertext);
-    let checksum = page.ciphertext.checksum();
-    ciphertext.expected_checksum(checksum).unwrap();
+    let ciphertext = registered(&env, &mut w, &admission, &page.ciphertext);
     let pointer = ciphertext.bytes().as_ptr();
     let before = crate::memory::registered_copy_outs();
     let charge = aligned_charge(&pool, &admission, &ciphertext);
@@ -250,7 +255,11 @@ fn detach_registered_copies_once_into_the_pool_and_shares_with_the_cache() {
     assert!(!detached.is_registered());
     assert_ne!(detached.bytes().as_ptr(), pointer);
     assert_eq!(detached.bytes(), page.ciphertext.bytes());
-    assert_eq!(detached.cached_checksum(), Some(checksum), "checksum kept");
+    assert_eq!(
+        detached.envelope(),
+        page.ciphertext.envelope(),
+        "envelope kept"
+    );
     assert!(detached.is_disk_aligned(crate::memory::default_disk_alignment()));
     // The registered buffer was released by the copy-out.
     pump!(w);
@@ -278,10 +287,11 @@ fn detach_registered_copies_once_into_the_pool_and_shares_with_the_cache() {
 
 #[test]
 fn detach_registered_shares_an_earlier_retained_copy() {
+    let env = racer_io::Env::host();
     let (mut w, admission, page) = setup();
     let pool = BufferPool::new(admission.clone());
     let baseline = admission.used(ResourceClass::Ciphertext);
-    let ciphertext = registered(&mut w, &admission, &page.ciphertext);
+    let ciphertext = registered(&env, &mut w, &admission, &page.ciphertext);
     let before = crate::memory::registered_copy_outs();
     // A retaining path copies the page out first and the registered page
     // remembers that copy.
@@ -303,24 +313,26 @@ fn detach_registered_shares_an_earlier_retained_copy() {
 
 #[test]
 fn detach_registered_returns_the_buffer_to_the_worker_pool() {
+    let env = racer_io::Env::host();
     let (mut w, admission, page) = setup();
     let pool = BufferPool::new(admission.clone());
-    let ciphertext = registered(&mut w, &admission, &page.ciphertext);
+    let ciphertext = registered(&env, &mut w, &admission, &page.ciphertext);
     let charge = aligned_charge(&pool, &admission, &ciphertext);
     let detached = pool.detach_registered(ciphertext, charge).unwrap();
-    let idle = pool.aligned_stats();
+    let idle = pool.disk_idle_bytes();
     drop(detached);
-    assert!(pool.aligned_stats() != idle, "the copy is pooled storage");
+    assert!(pool.disk_idle_bytes() > idle, "the copy is pooled storage");
     pump!(w);
     assert_eq!(free(&w), Some(2));
 }
 
 #[test]
 fn detach_registered_refuses_short_charges_and_frees_the_buffer() {
+    let env = racer_io::Env::host();
     let (mut w, admission, page) = setup();
     let pool = BufferPool::new(admission.clone());
     let baseline = admission.used(ResourceClass::Ciphertext);
-    let ciphertext = registered(&mut w, &admission, &page.ciphertext);
+    let ciphertext = registered(&env, &mut w, &admission, &page.ciphertext);
     let before = crate::memory::registered_copy_outs();
     let short = admission
         .reserve(
@@ -341,9 +353,10 @@ fn detach_registered_refuses_short_charges_and_frees_the_buffer() {
 
 #[test]
 fn rehome_aligned_copies_shared_pages_into_the_pool() {
+    let env = racer_io::Env::host();
     let (mut w, admission, page) = setup();
     let pool = BufferPool::new(admission.clone());
-    let ciphertext = registered(&mut w, &admission, &page.ciphertext);
+    let ciphertext = registered(&env, &mut w, &admission, &page.ciphertext);
     let before = crate::memory::registered_copy_outs();
     let charge = aligned_charge(&pool, &admission, &ciphertext);
     let moved = pool.rehome_aligned(ciphertext, charge).unwrap();
@@ -364,4 +377,41 @@ fn rehome_aligned_copies_shared_pages_into_the_pool() {
     drop((moved, same));
     pump!(w);
     assert_eq!(free(&w), Some(2));
+}
+
+#[test]
+fn receive_hold_is_recorded_once_the_buffer_returns_to_the_pool() {
+    use crate::telemetry::Event;
+    let env = racer_io::Env::host();
+    let (mut w, admission, page) = setup();
+    let metrics = crate::telemetry::Metrics::default();
+    let clock = w.clock.ctx(1).clock.clone();
+    let received = receive_registered(&env, &mut w, &page.ciphertext);
+    let envelope = page.ciphertext.envelope().clone();
+    let reservation = admission
+        .reserve(
+            Some(&envelope.page.version.object.cache),
+            ResourceClass::Ciphertext,
+            received.len(),
+        )
+        .unwrap();
+    let hold = crate::memory::ReceiveHold::new(metrics.clone(), clock.clone(), clock.now());
+    let pool = BufferPool::new(admission.clone());
+    let ciphertext = pool
+        .registered_ciphertext_held(reservation, envelope, received, Some(hold))
+        .unwrap();
+    w.clock.advance(std::time::Duration::from_millis(7));
+    // A clone still holds the buffer: nothing is recorded yet.
+    let clone = ciphertext.clone();
+    drop(ciphertext);
+    assert_eq!(metrics.count(Event::RdmaReceiveHoldCount), 0);
+    // A copy-out drops the last registered handle and records the hold.
+    let charge = aligned_charge(&pool, &admission, &clone);
+    let detached = pool.detach_registered(clone, charge).unwrap();
+    assert!(!detached.is_registered());
+    assert_eq!(metrics.count(Event::RdmaReceiveHoldCount), 1);
+    assert_eq!(metrics.count(Event::RdmaReceiveHoldNs), 7_000_000);
+    pump!(w);
+    assert_eq!(free(&w), Some(2), "the buffer is back while the copy lives");
+    drop(detached);
 }

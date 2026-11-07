@@ -6,11 +6,11 @@ use crate::http::{ConnectionLease, HttpIo};
 use crate::read::Coordinator;
 use crate::runtime::Cancellation;
 use http1::MessageHead;
-use racer_control_wire::CacheId;
-use racer_object_wire::prefetch::PrefetchRequest;
+use racer_io::ring::IoBuffer;
+use racer_wire::control::CacheId;
+use racer_wire::object::prefetch::PrefetchRequest;
 use std::task::Poll;
 use std::time::Duration;
-use uring_runtime::reactor::IoBuffer;
 
 /// Scope for a PUT, which resolves versions before answering.
 const PUT_TIMEOUT: Duration = Duration::from_secs(70);
@@ -23,7 +23,7 @@ pub(super) fn is_prefetch(head: &MessageHead) -> bool {
     matches!(
         &head.start,
         http1::StartLine::Request { target, .. }
-            if racer_object_wire::prefetch::is_prefetch_target(target)
+            if racer_wire::object::prefetch::is_prefetch_target(target)
     )
 }
 
@@ -39,7 +39,7 @@ pub(super) async fn serve(
     cancellation: Cancellation,
 ) -> Result<()> {
     let limits = reads.prefetch_directory().prefetch.config().limits();
-    let parsed = racer_object_wire::prefetch::parse(&head, &limits, header_limit);
+    let parsed = racer_wire::object::prefetch::parse(&head, &limits, header_limit);
     let budget = match &parsed {
         Ok(PrefetchRequest::Get { query, .. }) => {
             timeout.max(query.wait.unwrap_or_default() + WAIT_SLACK)
@@ -47,7 +47,7 @@ pub(super) async fn serve(
         Ok(PrefetchRequest::Put { .. }) => timeout.max(PUT_TIMEOUT),
         _ => timeout,
     };
-    let scope = super::listener::new_scope(budget, cancellation)?;
+    let scope = super::listener::new_scope(io.reactor().ctx(), budget, cancellation)?;
     let response = match parsed {
         Err(error) => crate::prefetch::service::error(error),
         Ok(request) => {
@@ -67,12 +67,7 @@ pub(super) async fn serve(
                 None => &[],
             };
             // A client disconnect ends a long-poll wait.
-            let watch = crate::runtime::RequestScope {
-                body_deadlines: None,
-                request: scope.request,
-                deadline: scope.deadline,
-                cancellation: Cancellation::new()?,
-            };
+            let watch = scope.child(scope.request, scope.deadline.0)?;
             let socket = connection.socket();
             let mut disconnected = Some(io.disconnected(&connection, &watch));
             let mut handled = Box::pin(crate::prefetch::service::handle(

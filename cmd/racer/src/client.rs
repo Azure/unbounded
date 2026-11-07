@@ -18,7 +18,6 @@ use crate::model::CacheKey;
 use crate::model::MAX_FIELD_BYTES;
 use crate::model::ObjectId;
 use crate::model::ObjectMetadata;
-use crate::model::PAGE_BYTES;
 use crate::model::PageNumber;
 use crate::model::ResolvedRange;
 use crate::read::ReadPayload;
@@ -34,14 +33,14 @@ use http1::Header;
 use http1::MessageHead;
 #[cfg(test)]
 use http1::StartLine;
-use racer_control_wire::CacheId;
+use racer_io::ring::IoBuffer;
+use racer_wire::control::CacheId;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
 use std::time::Duration;
-use uring_runtime::reactor::IoBuffer;
 
 pub mod direct;
 pub mod listener;
@@ -53,9 +52,9 @@ use direct::DirectPage;
 use direct::DirectSink;
 use direct::GpuService;
 
-use racer_object_wire::client::MAX_HEAD_BYTES;
-pub use racer_object_wire::client::ReadKind;
-use racer_object_wire::client::frame;
+use racer_wire::object::client::MAX_HEAD_BYTES;
+pub use racer_wire::object::client::ReadKind;
+use racer_wire::object::client::frame;
 
 /// A validated client operation and its byte-preserving origin context.
 pub struct ClientRequest {
@@ -67,14 +66,14 @@ pub struct ClientRequest {
 /// Apply the shared wire parser before attaching the socket's authorized cache.
 #[derive(Clone)]
 pub struct RequestParser {
-    wire: racer_object_wire::client::RequestParser,
+    wire: racer_wire::object::client::RequestParser,
 }
 
 impl RequestParser {
     /// Set the raw HTTP head cap used by both framing and semantic validation.
     pub fn new(header_limit: usize) -> Self {
         Self {
-            wire: racer_object_wire::client::RequestParser::new(header_limit),
+            wire: racer_wire::object::client::RequestParser::new(header_limit),
         }
     }
 
@@ -157,7 +156,7 @@ async fn handle_read_result(
         responses.send_error(connection, error, scope).await?;
         return Ok(None);
     }
-    let watch_scope = RequestScope::new(scope.request, scope.deadline.0)?;
+    let watch_scope = scope.child(scope.request, scope.deadline.0)?;
     let socket = connection.socket();
     // Keep four slots for duplex sends, receives, and listener progress. Tiny
     // rings retain the synchronous fallback rather than losing delivery capacity.
@@ -252,6 +251,10 @@ pub struct Responses {
 
     /// The process GPU slot while it waits for its first `gpu-read`.
     lazy_gpu: Option<Arc<crate::gpu_slot::GpuSlot>>,
+
+    /// The worker's crypto client. With it, a `host-read` into a memfd
+    /// sealed against shrinking decrypts pages straight into the memfd.
+    host_crypto: Option<Rc<crate::security::CryptoClient>>,
 }
 
 /// Duplex subscription framing. Delivered leases stay pinned until exact release.
@@ -259,7 +262,7 @@ fn subscription_head(
     metadata: &ObjectMetadata,
     range: Option<ResolvedRange>,
 ) -> Result<MessageHead> {
-    racer_object_wire::client::subscription_head(metadata, range).map_err(Into::into)
+    racer_wire::object::client::subscription_head(metadata, range).map_err(Into::into)
 }
 /// Retain a partial release across polls without an unbounded input queue.
 struct Releases {
@@ -277,7 +280,7 @@ impl Releases {
     fn poll(
         &mut self,
         cx: &mut Context<'_>,
-        socket: &Rc<uring_runtime::reactor::descriptor::Descriptor>,
+        socket: &Rc<racer_io::ring::Descriptor>,
         stream: &mut RangeStream,
         outstanding: &mut BTreeMap<PageNumber, u32>,
         current: Option<(crate::model::PageSlice, &crate::http::FinalSend)>,
@@ -469,7 +472,7 @@ impl Responses {
                 stream.enable_progress(timeout);
                 while sent < expected {
                     let mut progress_scope = scope.clone();
-                    progress_scope.deadline.0 = uring_runtime::environment::now() + timeout;
+                    progress_scope.deadline.0 = progress_scope.clock().now() + timeout;
                     let reader = if let Some(reader) = first.take() {
                         reader
                     } else {
@@ -557,7 +560,7 @@ impl Responses {
                     let offset = slice
                         .page
                         .0
-                        .checked_mul(PAGE_BYTES)
+                        .checked_mul(range.page_size().get())
                         .and_then(|n| n.checked_add(u64::from(slice.offset)))
                         .ok_or(Error::BadGateway)?;
                     // Acquisition owns no delivery pipe and continues even while
@@ -600,7 +603,7 @@ impl Responses {
                             let socket = socket.clone();
                             let reservation = reservation.clone();
                             let mut receive_scope = scope.clone();
-                            receive_scope.deadline.0 = uring_runtime::environment::now() + timeout;
+                            receive_scope.deadline.0 = receive_scope.clock().now() + timeout;
                             ready = Some(Box::pin(async move {
                                 reactor
                                     .readiness_with_lease(
@@ -637,7 +640,7 @@ impl Responses {
                 }
             }
             let mut final_scope = scope.clone();
-            final_scope.deadline.0 = uring_runtime::environment::now() + timeout;
+            final_scope.deadline.0 = final_scope.clock().now() + timeout;
             connection =
                 send_frame(&self.io, connection, frame(2, pages, sent, 0), &final_scope).await?;
             // Completion closes the subscription without waiting for final releases.
@@ -674,10 +677,9 @@ impl Responses {
                 .await;
             if result.is_err() {
                 // Give device work a short, independent bound to settle.
-                if let Ok(final_scope) = RequestScope::new(
-                    scope.request,
-                    uring_runtime::environment::now() + Duration::from_secs(1),
-                ) {
+                if let Ok(final_scope) =
+                    scope.child(scope.request, scope.clock().now() + Duration::from_secs(1))
+                {
                     let _ = sink.finish(&final_scope).await;
                 }
             }
@@ -698,7 +700,7 @@ impl Responses {
     ) -> Result<ConnectionLease> {
         let delivery = kind.direct().ok_or(Error::Internal)?;
         let destination = kind.destination().ok_or(Error::Internal)?;
-        let head = racer_object_wire::client::direct_head(
+        let head = racer_wire::object::client::direct_head(
             &response.metadata,
             response.payload.range(),
             delivery,
@@ -737,7 +739,7 @@ impl Responses {
             stream.enable_progress(timeout);
             while sent < expected {
                 let mut progress_scope = scope.clone();
-                progress_scope.deadline.0 = uring_runtime::environment::now() + timeout;
+                progress_scope.deadline.0 = progress_scope.clock().now() + timeout;
                 let item = match first.take() {
                     Some(item) => item,
                     None => std::future::poll_fn(|cx| {
@@ -769,7 +771,7 @@ impl Responses {
                 let offset = slice
                     .page
                     .0
-                    .checked_mul(PAGE_BYTES)
+                    .checked_mul(range.page_size().get())
                     .and_then(|n| n.checked_add(u64::from(slice.offset)))
                     .ok_or(Error::BadGateway)?;
                 // The parser and validate bound offset + range length.
@@ -836,7 +838,7 @@ impl Responses {
             }
         }
         let mut final_scope = scope.clone();
-        final_scope.deadline.0 = uring_runtime::environment::now() + timeout;
+        final_scope.deadline.0 = final_scope.clock().now() + timeout;
         sink.finish(&final_scope).await?;
         connection =
             send_frame(&self.io, connection, frame(2, pages, sent, 0), &final_scope).await?;
@@ -852,7 +854,14 @@ impl Responses {
             observer: Observer::default(),
             gpu: Default::default(),
             lazy_gpu: None,
+            host_crypto: None,
         }
+    }
+
+    /// Decrypt `host-read` pages straight into a sealed memfd with `crypto`.
+    pub fn with_host_crypto(mut self, crypto: Rc<crate::security::CryptoClient>) -> Self {
+        self.host_crypto = Some(crypto);
+        self
     }
 
     /// Serve `gpu-read` with this backend. Without one, `gpu-read` is 501.
@@ -873,7 +882,7 @@ impl Responses {
     /// Awaits without blocking the worker. Other requests never call this,
     /// so nothing else touches a GPU.
     ///
-    /// The wait honors `scope`: an expired or cancelled request stops waiting
+    /// The wait honors `scope`: an expired or canceled request stops waiting
     /// and releases its connection, while the shared start keeps running for
     /// later requests.
     pub(crate) async fn prepare_gpu(&self, scope: &RequestScope) -> Result<()> {
@@ -913,7 +922,13 @@ impl Responses {
         received: http1::connection::ReceivedDescriptors,
     ) -> Result<Option<Box<dyn DirectSink>>> {
         let gpu = self.gpu.borrow().clone();
-        direct::open_sink(kind, received, &self.delivery, gpu.as_ref())
+        direct::open_sink(
+            kind,
+            received,
+            &self.delivery,
+            gpu.as_ref(),
+            self.host_crypto.as_ref(),
+        )
     }
 
     /// Route detailed delivery failures to the worker's observer.
@@ -944,10 +959,8 @@ impl Responses {
             // only a short, independently bounded final head, then close.
             let final_scope;
             let scope = if scope.check().is_err() {
-                final_scope = RequestScope::new(
-                    scope.request,
-                    uring_runtime::environment::now() + Duration::from_secs(1),
-                )?;
+                final_scope =
+                    scope.child(scope.request, scope.clock().now() + Duration::from_secs(1))?;
                 &final_scope
             } else {
                 scope
@@ -967,7 +980,7 @@ impl Responses {
         }
         match kind {
             ReadKind::Subscription { range, .. } => {
-                let expected = expected_subscription_range(*range, response.metadata.length)?;
+                let expected = expected_subscription_range(*range, response)?;
                 if response.payload.range() != expected {
                     return Err(Error::BadGateway);
                 }
@@ -980,7 +993,7 @@ impl Responses {
             | ReadKind::GpuRead {
                 range, destination, ..
             } => {
-                let expected = expected_subscription_range(*range, response.metadata.length)?;
+                let expected = expected_subscription_range(*range, response)?;
                 if response.payload.range() != expected {
                     return Err(Error::BadGateway);
                 }
@@ -989,7 +1002,7 @@ impl Responses {
                     return Err(Error::InvalidRequest);
                 }
                 let delivery = kind.direct().ok_or(Error::Internal)?;
-                racer_object_wire::client::direct_head(
+                racer_wire::object::client::direct_head(
                     &response.metadata,
                     response.payload.range(),
                     delivery,
@@ -1040,7 +1053,7 @@ impl Responses {
             if !matches!(&response.payload, ReadPayload::Empty) {
                 return Err(Error::BadGateway);
             }
-            let head = racer_object_wire::client::success_head(&response.metadata, None)?;
+            let head = racer_wire::object::client::success_head(&response.metadata, None)?;
             connection = self.io.send_head(connection, head, scope).await?.connection;
             connection.finish_exchange()?;
             if let Some(observation) = observation.as_mut() {
@@ -1052,16 +1065,23 @@ impl Responses {
 }
 
 /// Resolve the request's expected body shape, treating invalid successes as 502.
+/// The range a response must carry for `range`, resolved at the page size the response's
+/// stream was cut at (the published cluster page size), so only the bytes are compared.
 fn expected_subscription_range(
     range: Option<ByteRange>,
-    length: u64,
+    response: &ReadResponse,
 ) -> Result<Option<ResolvedRange>> {
+    let length = response.metadata.length;
     if length == 0 && range.is_none() {
         return Ok(None);
     }
+    let page = response
+        .payload
+        .range()
+        .map_or(crate::model::PageSize::DEFAULT, |r| r.page_size());
     range
         .unwrap_or(ByteRange::From(0))
-        .resolve(length)
+        .resolve_paged(length, page)
         .map(Some)
         .map_err(|_| Error::BadGateway)
 }
@@ -1084,7 +1104,7 @@ fn error_head(error: Error) -> Result<MessageHead> {
         Error::VersionUnavailable => 412,
         Error::UnsatisfiableRangeWithLength(length) if length <= i64::MAX as u64 => 416,
         Error::BadGateway | Error::CorruptRecord => 502,
-        Error::Unavailable | Error::Overloaded | Error::DeadlineExceeded | Error::Cancelled | Error::StaleFlight | Error::IncompatibleMembership | Error::HopBudgetExhausted | Error::MissingKey
+        Error::Unavailable | Error::Overloaded | Error::FlightFull | Error::DeadlineExceeded | Error::Canceled | Error::StaleFlight | Error::IncompatibleMembership | Error::HopBudgetExhausted | Error::MissingKey
         // Clock rollback or peer restart can reject an otherwise valid attempt's
         // freshness. It is unavailable to this client, not an internal failure.
         | Error::Replay | Error::Io | Error::Os(_) => 503,
@@ -1097,12 +1117,12 @@ fn error_head(error: Error) -> Result<MessageHead> {
         Error::UnsatisfiableRangeWithLength(length) => Some(length),
         _ => None,
     };
-    racer_object_wire::client::error_head(status, length).map_err(Into::into)
+    racer_wire::object::client::error_head(status, length).map_err(Into::into)
 }
 
 /// Encode metadata-only success headers using the shared wire contract.
 fn success_head(metadata: &ObjectMetadata, range: Option<ResolvedRange>) -> Result<MessageHead> {
-    racer_object_wire::client::success_head(metadata, range).map_err(Into::into)
+    racer_wire::object::client::success_head(metadata, range).map_err(Into::into)
 }
 
 #[cfg(test)]

@@ -1,0 +1,74 @@
+# Racer DST cost table, shared by Full and Model fidelity so both price the
+# same operation the same way.
+#
+# Every value is an unsigned integer (underscores allowed). Sections and keys
+# are fixed; `racer_dst::costs::Costs::parse` rejects unknown or missing keys.
+# Recalibrate when the measured baselines move by more than 10%.
+#
+# Sources:
+#   [baseline]  release-build measurements recorded 2026-11-04 on an AMD EPYC
+#               9V74 Azure VM (noisy host, load 42-71 on 48 vCPUs; treat as
+#               order-of-magnitude).
+#   [assumed]   modeling assumptions, not measurements: round numbers for a
+#               typical deployment that keep scenario results stable. Change
+#               them only together with the scenario bounds that depend on them.
+
+[crypto]
+# [baseline] "Crypto, 1 core, 16 MiB page: seal / open = 3.57 / 3.58 GiB/s".
+seal_bytes_per_sec = 3_833_258_311
+open_bytes_per_sec = 3_843_995_729
+# Disk-copy validation is an AEAD tag check (CRC was removed): 15.56 GiB/s
+# measured on 16 MiB pages, release build. The Model charges no copy validation
+# yet (it did not charge CRC either).
+tag_check_bytes_per_sec = 16_707_422_781
+# [baseline] "memcpy = 9.2 GiB/s".
+memcpy_bytes_per_sec = 9_878_424_781
+# Peer wire v2 (certificate chains sent once per session), release build of
+# `peer_crypto_cost_benchmark` (src/peer/tests/opaque.rs, ignored): direct
+# request sign 64 us, relayed (one forwarder) sign 76 us, response sign 114 us,
+# direct verify 73 us, two-proof verify 160 us.
+# A request carrying n proofs costs sign_ns + (n - 1) * sign_hop_ns to sign and
+# verify_ns + (n - 1) * verify_hop_ns to verify.
+sign_ns = 64_000
+sign_hop_ns = 12_000
+sign_response_ns = 114_000
+verify_ns = 73_000
+verify_hop_ns = 87_000
+
+[cpu]
+# [assumed] Worker threads per node.
+workers = 2
+# [assumed] Fixed per-request dispatch cost.
+request_ns = 5_000
+# [assumed] CPU per poll of a placement ranking.
+ranking_chunk_ns = 2_000
+# [assumed] CPU per node expanded by a route search.
+path_expand_ns_per_node = 50
+# [assumed] Control-plane handshake CPU (200 us).
+control_handshake_ns = 200_000
+
+[nic]
+# [assumed] 10 Gbit/s NIC (1.25e9 B/s), transferred in 1 MiB chunks.
+bytes_per_sec = 1_250_000_000
+chunk_bytes = 1_048_576
+
+[disk]
+# [assumed] Local NVMe: 2 GB/s read, 1 GB/s write, 100 us latency.
+read_bytes_per_sec = 2_000_000_000
+write_bytes_per_sec = 1_000_000_000
+latency_ns = 100_000
+
+[origin]
+# [assumed] Origin: cache count, concurrent requests, aggregate bandwidth
+# (5e9 B/s), first-byte latency (30 ms) and retry delay (50 ms).
+caches = 4
+concurrency = 64
+bytes_per_sec = 5_000_000_000
+latency_ns = 30_000_000
+retry_ns = 50_000_000
+
+[rtt]
+# [assumed] RTT within a site (200 us), between sites (20 ms), jitter (5 ms).
+local_ns = 200_000
+remote_ns = 20_000_000
+jitter_ns = 5_000_000

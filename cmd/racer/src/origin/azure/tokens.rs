@@ -19,8 +19,8 @@ use crate::error::{Error, Operation, Result};
 use crate::origin::azure_auth::{self, AuthEndpoints, AuthError, AzureTokenCache};
 use crate::remote::Resolver;
 use crate::runtime::{Reactor, RequestScope};
-use racer_control_wire::AzureCredential;
-use racer_control_wire::OriginDefinition;
+use racer_wire::control::AzureCredential;
+use racer_wire::control::OriginDefinition;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -65,11 +65,6 @@ pub struct AzureTokenCaches {
 }
 
 impl AzureTokenCaches {
-    /// Production token endpoints from the environment.
-    pub fn from_env() -> Self {
-        Self::new(AuthEndpoints::from_env())
-    }
-
     pub fn new(endpoints: AuthEndpoints) -> Self {
         Self {
             endpoints,
@@ -197,7 +192,7 @@ impl AzureTokenSource for AzureTokens {
         challenge: Option<&[u8]>,
         sent: Option<&[u8]>,
     ) -> bool {
-        self.rejected_at(credential, challenge, sent, Instant::now())
+        self.rejected_at(credential, challenge, sent, self.reactor.ctx().clock.now())
     }
 
     /// Drop sources for credentials no published origin uses. A request in
@@ -290,6 +285,7 @@ mod tests {
 
     #[test]
     fn rejected_tokens_refresh_at_most_once_per_window_per_credential() {
+        let env = racer_io::Env::host();
         // IMDS names each token after the requesting client and request count.
         let count = Arc::new(Mutex::new(0usize));
         let seen = count.clone();
@@ -310,7 +306,7 @@ mod tests {
             )
             .into_bytes()
         });
-        let Some(reactor) = reactor() else {
+        let Some(reactor) = reactor(&env) else {
             let _ = std::net::TcpStream::connect(address);
             return;
         };
@@ -358,6 +354,7 @@ mod tests {
 
     #[test]
     fn stale_rejections_keep_newer_tokens_across_workers() {
+        let env = racer_io::Env::host();
         let count = Arc::new(Mutex::new(0usize));
         let seen = count.clone();
         let (address, accepted, server) = serve(None, 4, move |_, _| {
@@ -372,7 +369,7 @@ mod tests {
             )
             .into_bytes()
         });
-        let Some(reactor) = reactor() else {
+        let Some(reactor) = reactor(&env) else {
             let _ = std::net::TcpStream::connect(address);
             return;
         };
@@ -456,7 +453,8 @@ mod tests {
 
     #[test]
     fn sources_and_caches_for_unpublished_credentials_are_dropped() {
-        let Some(reactor) = reactor() else { return };
+        let env = racer_io::Env::host();
+        let Some(reactor) = reactor(&env) else { return };
         let caches = Arc::new(AzureTokenCaches::new(AuthEndpoints {
             imds: RemoteEndpoint::http("127.0.0.1", 9).unwrap(),
             authority: "https://login.microsoftonline.com/".into(),
@@ -466,7 +464,7 @@ mod tests {
         let tokens = AzureTokens::new(caches.clone(), reactor);
         let origin = |credential: AzureCredential| {
             OriginDefinition::azure(
-                racer_control_wire::AzureContainerUrl::parse(
+                racer_wire::control::AzureContainerUrl::parse(
                     "https://acct.blob.core.windows.net/models",
                 )
                 .unwrap(),

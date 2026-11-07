@@ -15,8 +15,14 @@ use crate::model::RequestId;
 use crate::read::Coordinator;
 use crate::runtime::Cancellation;
 use crate::runtime::RequestScope;
-use racer_control_wire::CacheDefinition;
-use racer_control_wire::CacheId;
+#[cfg(test)]
+pub(super) use crate::uds_endpoint::file_path;
+use crate::uds_endpoint::publication::{Endpoint, Publication, Rename, Replacement};
+#[cfg(test)]
+pub(super) use crate::uds_endpoint::same_inode;
+use racer_io::scoped::ready_set::ReadySet;
+use racer_wire::control::CacheDefinition;
+use racer_wire::control::CacheId;
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -31,34 +37,28 @@ use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
 use std::time::Duration;
-#[cfg(test)]
-pub(super) use uds_endpoint::file_path;
-use uds_endpoint::publication::{Endpoint, Publication, Rename, Replacement};
-#[cfg(test)]
-pub(super) use uds_endpoint::same_inode;
-use uring_runtime::reactor::ready_set::ReadySet;
 
 enum Listener {
-    Real(uds_endpoint::BoundSocket),
-    #[cfg(test)]
-    Sim(uds_endpoint::simulation::BoundSocket),
+    Real(crate::uds_endpoint::BoundSocket),
+    #[cfg(any(test, feature = "dst"))]
+    Sim(crate::uds_endpoint::simulation::BoundSocket),
 }
 impl Listener {
-    fn accept(&self) -> std::io::Result<(uring_runtime::reactor::descriptor::Descriptor, ())> {
+    fn accept(&self) -> std::io::Result<(racer_io::ring::Descriptor, ())> {
         #[cfg(test)]
         if let Some(errno) = FAIL_ACCEPT.with(|fail| fail.take()) {
             return Err(std::io::Error::from_raw_os_error(errno));
         }
         match self {
             Self::Real(listener) => listener.accept().map(|(socket, _)| (socket.into(), ())),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "dst"))]
             Self::Sim(socket) => socket.accept().map(|fd| (fd, ())),
         }
     }
 }
 enum Directory {
     Real(Rc<File>),
-    #[cfg(test)]
+    #[cfg(any(test, feature = "dst"))]
     Sim,
 }
 
@@ -149,14 +149,14 @@ impl BoundListener {
         }
         match &self.listener {
             Listener::Real(socket) => socket.set_mode(mode),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "dst"))]
             Listener::Sim(socket) => socket.set_mode(mode),
         }
     }
 }
 
 pub(super) struct Active {
-    pub(super) runnable: Arc<uring_runtime::drivers::Runnable>,
+    pub(super) runnable: Arc<racer_io::exec::Runnable>,
     pub(super) deadline: Rc<Cell<std::time::Instant>>,
     pub(super) expired: Option<std::time::Instant>,
     pub(super) cache: CacheId,
@@ -270,7 +270,7 @@ impl ClientListeners {
         let idle = Rc::new(Cell::new(!retirement_request));
         let task_idle = idle.clone();
         let timeout = self.request_timeout;
-        let deadline = Rc::new(Cell::new(uring_runtime::environment::now() + timeout));
+        let deadline = Rc::new(Cell::new(self.io.reactor().ctx().now() + timeout));
         let task_deadline = deadline.clone();
         let parser = self.parser.clone();
         let reads = self.reads.clone();
@@ -303,7 +303,7 @@ impl ClientListeners {
             .await
         });
         self.active.borrow_mut().push_back(Active {
-            runnable: uring_runtime::drivers::Runnable::new(),
+            runnable: racer_io::exec::Runnable::new(),
             deadline,
             expired: None,
             cache,
@@ -327,7 +327,7 @@ impl ClientListeners {
             || !authorization
                 .allowed
                 .load(std::sync::atomic::Ordering::Acquire)
-            || uring_runtime::environment::now() >= authorization.deadline
+            || self.io.reactor().ctx().now() >= authorization.deadline
         {
             return Ok(());
         }
@@ -373,7 +373,7 @@ impl ClientListeners {
     ) -> Operation<'a, PreparedListeners> {
         Box::pin(async move {
             scope.check()?;
-            racer_control_wire::validate_definitions(definitions)?;
+            racer_wire::control::validate_definitions(definitions)?;
             if !self.accepting.get() {
                 return Err(Error::Unavailable);
             }
@@ -393,6 +393,7 @@ impl ClientListeners {
                 retirement_records: self.retirement_records.clone(),
                 new_records: Vec::new(),
                 retirement_timeout: self.request_timeout,
+                clock: self.io.reactor().ctx().clock.clone(),
                 exchanged: BTreeSet::new(),
                 retained_names: definitions.iter().map(|d| d.name.clone()).collect(),
             };
@@ -400,7 +401,7 @@ impl ClientListeners {
             self.cleanup.borrow_mut().clear();
             self.retirement_records
                 .borrow_mut()
-                .retain(|record| record.live(uring_runtime::environment::now()));
+                .retain(|record| record.live(self.io.reactor().ctx().now()));
             let old = self.listeners.borrow().clone();
             let old_by_name: BTreeMap<_, _> = old
                 .values()
@@ -439,7 +440,7 @@ impl ClientListeners {
                     name: listener.definition.name.clone(),
                     listener: Rc::downgrade(listener),
                     allowed: Arc::downgrade(&listener.backlog_allowed),
-                    deadline: uring_runtime::environment::now(),
+                    deadline: self.io.reactor().ctx().now(),
                 });
             }
             // Commit must not allocate while adding deferred owners to the queue.
@@ -476,11 +477,16 @@ impl ClientListeners {
                     continue;
                 }
                 let mut random = [0; 16];
-                uring_runtime::environment::fill_random(&mut random)
+                self.io
+                    .reactor()
+                    .ctx()
+                    .rng
+                    .fill(&mut random)
                     .map_err(|_| Error::Unavailable)?;
                 let temporary = format!(".racer-{:032x}", u128::from_ne_bytes(random));
                 let previous = old_by_name.get(definition.name.as_str()).cloned();
                 let next = Rc::new(bind(
+                    self.io.reactor(),
                     &self.root,
                     definition.clone(),
                     &temporary,
@@ -566,8 +572,7 @@ impl ClientListeners {
             }
             let deadline = active.deadline.get();
             let force = active.expired != Some(deadline)
-                && (uring_runtime::environment::now() >= deadline
-                    || active.cancellation.is_cancelled());
+                && (self.io.reactor().ctx().now() >= deadline || active.cancellation.is_canceled());
             if force {
                 active.expired = Some(deadline);
             }
@@ -610,10 +615,10 @@ impl ClientListeners {
             {
                 break;
             }
-            #[cfg(not(test))]
+            #[cfg(not(any(test, feature = "dst")))]
             let simulated = false;
-            #[cfg(test)]
-            let simulated = uring_runtime::reactor::simulation::Simulation::current().is_some();
+            #[cfg(any(test, feature = "dst"))]
+            let simulated = self.io.reactor().sim_os().is_some();
             let listener = if simulated {
                 let listeners = self.listeners.borrow();
                 let key = self.sim_cursor.borrow().clone();
@@ -700,7 +705,7 @@ impl ClientListeners {
         };
         if !self.accepting.get()
             || entry.remaining == 0
-            || uring_runtime::environment::now() >= entry.deadline
+            || self.io.reactor().ctx().now() >= entry.deadline
         {
             return;
         }
@@ -946,7 +951,7 @@ async fn serve_connection(
             crate::admission::ResourceClass::RequestContext,
             super::MAX_HEAD_BYTES,
         )?;
-        let idle_scope = new_scope(timeout, cancellation.clone())?;
+        let idle_scope = new_scope(io.reactor().ctx(), timeout, cancellation.clone())?;
         deadline.set(idle_scope.deadline.0);
         // Read with recvmsg so a direct read's descriptor arrives with its head.
         let received = io
@@ -960,7 +965,7 @@ async fn serve_connection(
         let mut observation = metrics.request()?;
         // Idle/header admission has its own bound. A healthy pooled connection
         // gets a fresh operation budget only after each complete request head.
-        let scope = new_scope(timeout, cancellation.clone())?;
+        let scope = new_scope(io.reactor().ctx(), timeout, cancellation.clone())?;
         deadline.set(scope.deadline.0);
         let scope = &scope;
         // Prefetch tickets have their own JSON route and close the connection.
@@ -1007,12 +1012,10 @@ async fn serve_connection(
             other => other,
         };
         if gpu_read {
-            metrics
-                .gpu()
-                .record_request(crate::gpu_telemetry::GpuReadOutcome::classify(
-                    parsed.as_ref().map(|_| ()).map_err(|error| *error),
-                    responses.has_gpu(),
-                ));
+            metrics.record_gpu_request(crate::gpu_telemetry::GpuReadOutcome::classify(
+                parsed.as_ref().map(|_| ()).map_err(|error| *error),
+                responses.has_gpu(),
+            ));
         }
         let (request, sink) = match parsed {
             Ok(parsed) => parsed,
@@ -1025,12 +1028,7 @@ async fn serve_connection(
         let kind = request.kind.clone();
         let object = request.origin.object.clone();
         let socket = connection.socket();
-        let watch_scope = RequestScope {
-            body_deadlines: None,
-            request: scope.request,
-            deadline: scope.deadline,
-            cancellation: Cancellation::new()?,
-        };
+        let watch_scope = scope.child(scope.request, scope.deadline.0)?;
         let mut disconnected = Some(io.disconnected(&connection, &watch_scope));
         let mut disconnect_observed = false;
         #[cfg(test)]
@@ -1093,15 +1091,17 @@ async fn serve_connection(
     }
 }
 
-pub(super) fn new_scope(timeout: Duration, cancellation: Cancellation) -> Result<RequestScope> {
+pub(super) fn new_scope(
+    ctx: &racer_io::WorkerCtx,
+    timeout: Duration,
+    cancellation: Cancellation,
+) -> Result<RequestScope> {
     let mut id = [0; 16];
-    uring_runtime::environment::fill_random(&mut id).map_err(|_| Error::Unavailable)?;
-    Ok(RequestScope {
-        body_deadlines: None,
-        request: RequestId(id),
-        deadline: uring_runtime::environment::Deadline(uring_runtime::environment::now() + timeout),
-        cancellation,
-    })
+    ctx.rng.fill(&mut id).map_err(|_| Error::Unavailable)?;
+    let mut scope =
+        RequestScope::with_clock(RequestId(id), ctx.now() + timeout, ctx.clock.clone())?;
+    scope.cancellation = cancellation;
+    Ok(scope)
 }
 
 // Level-triggered listener index. Idle turns wait on one completion-owned poll.
@@ -1146,15 +1146,15 @@ impl ReadyListeners {
                 #[allow(clippy::infallible_destructuring_match)]
                 let socket = match &listener.listener {
                     Listener::Real(socket) => socket,
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "dst"))]
                     _ => return Err(Error::InvalidConfiguration),
                 };
                 ready.insert(socket.as_raw_fd(), index)?;
             }
             self.index = Some(ready);
-            self.scope = Some(new_scope(
-                Duration::from_secs(365 * 24 * 3600),
-                Cancellation::new()?,
+            self.scope = Some(RequestScope::untimed(
+                RequestId([0; 16]),
+                owner.io.reactor().ctx().clock.clone(),
             )?);
             self.generation = owner.generation.get();
         }
@@ -1166,15 +1166,16 @@ impl ReadyListeners {
             let scope = self.scope.clone();
             Box::pin(async move {
                 let scope = scope.ok_or(Error::Internal)?;
-                uring_runtime::drivers::retry_listener(&scope, || {
-                    reactor.readiness_with_lease(
-                        fd.clone(),
-                        libc::POLLIN as u32,
-                        fd.clone(),
-                        &scope,
-                    )
-                })
-                .await
+                reactor
+                    .retry_overloaded(&scope, || {
+                        reactor.readiness_with_lease(
+                            fd.clone(),
+                            libc::POLLIN as u32,
+                            fd.clone(),
+                            &scope,
+                        )
+                    })
+                    .await
             })
         })?;
         Ok(ready.and_then(|index| self.listeners[index].upgrade()))
@@ -1195,6 +1196,8 @@ impl ReadyListeners {
 /// Owns prepared paths and sockets. Keep this on the listener's worker. Drop
 /// rolls back; commit performs no filesystem or network operations.
 pub struct PreparedListeners {
+    /// Retirement deadlines.
+    clock: racer_io::Clock,
     generation: Rc<Cell<u64>>,
     definitions: Vec<CacheDefinition>,
     target: Rc<RefCell<BTreeMap<CacheId, Rc<BoundListener>>>>,
@@ -1247,7 +1250,7 @@ impl PreparedListeners {
             retain
         });
         if self.accepting.get() {
-            let retirement_deadline = uring_runtime::environment::now() + self.retirement_timeout;
+            let retirement_deadline = self.clock.now() + self.retirement_timeout;
             for mut record in self.new_records.drain(..) {
                 record.deadline = retirement_deadline;
                 self.retirement_records.borrow_mut().push(record);
@@ -1304,11 +1307,11 @@ impl Drop for PreparedListeners {
 }
 
 pub(super) fn open_directory(path: &Path) -> Result<File> {
-    uds_endpoint::open_directory(path, 0o755).map_err(directory_error)
+    crate::uds_endpoint::open_directory(path, 0o755).map_err(directory_error)
 }
 
 pub(super) fn child_directory(parent: &File, name: &[u8]) -> Result<File> {
-    uds_endpoint::child_directory(parent, name, 0o755).map_err(directory_error)
+    crate::uds_endpoint::child_directory(parent, name, 0o755).map_err(directory_error)
 }
 
 fn directory_error(error: std::io::Error) -> Error {
@@ -1333,13 +1336,13 @@ pub(super) fn prepare_origin_directory(cache: &File) -> Result<()> {
         .map_err(directory_error)
 }
 
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "dst")))]
 fn origin_owner() -> super::origin_directory::Owner {
     super::origin_directory::Owner::ORIGIN
 }
 
 /// Unit tests run unprivileged, so assign the directory to the test user.
-#[cfg(test)]
+#[cfg(any(test, feature = "dst"))]
 fn origin_owner() -> super::origin_directory::Owner {
     // SAFETY: geteuid/getegid have no preconditions.
     super::origin_directory::Owner {
@@ -1357,7 +1360,7 @@ const CLIENT_DIRECTORY_SEARCH: u32 = 0o011;
 /// are removed, and group and other search bits are added, so an existing
 /// 0700 or 0750 directory becomes 0711 or 0751. Ownership is not changed.
 pub(super) fn prepare_client_directory(directory: &File) -> Result<()> {
-    uds_endpoint::restrict_directory(directory, 0o022).map_err(directory_error)?;
+    crate::uds_endpoint::restrict_directory(directory, 0o022).map_err(directory_error)?;
     grant_client_search(directory)
 }
 
@@ -1381,7 +1384,7 @@ fn grant_client_search(directory: &File) -> Result<()> {
     // Linux may clear setgid when the caller is not in the group.
     if !after.is_dir()
         || (after.uid(), after.gid()) != (before.uid(), before.gid())
-        || !uds_endpoint::same_inode(&before, &after)
+        || !crate::uds_endpoint::same_inode(&before, &after)
         || (actual != wanted && actual != wanted & !0o2000)
     {
         return Err(directory_error(std::io::Error::other(
@@ -1392,16 +1395,17 @@ fn grant_client_search(directory: &File) -> Result<()> {
 }
 
 fn bind(
+    #[cfg_attr(not(test), allow(unused_variables))] reactor: &crate::runtime::Reactor,
     root: &Path,
     definition: CacheDefinition,
     basename: &str,
     previous: Option<&BoundListener>,
 ) -> Result<BoundListener> {
-    #[cfg(test)]
-    if let Some(sim) = uring_runtime::reactor::simulation::Simulation::current() {
+    #[cfg(any(test, feature = "dst"))]
+    if let Some(sim) = reactor.sim_os() {
         let directory = root.join(&definition.name).join("client");
         let listener =
-            uds_endpoint::simulation::BoundSocket::bind(sim, directory.clone(), basename)
+            crate::uds_endpoint::simulation::BoundSocket::bind(sim, directory.clone(), basename)
                 .map_err(|_| Error::Io)?;
         let bound = BoundListener {
             definition,
@@ -1411,6 +1415,7 @@ fn bind(
             backlog_allowed: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             owner: None,
         };
+        #[cfg(test)]
         if FAIL_CHMOD.with(|fail| fail.replace(false)) {
             return Err(Error::Io);
         }
@@ -1430,8 +1435,8 @@ fn bind(
         None => Rc::new(EndpointOwner::acquire(&directory)?),
     };
     let directory = Rc::new(directory);
-    let listener =
-        uds_endpoint::BoundSocket::bind(owner.0.clone(), basename).map_err(directory_error)?;
+    let listener = crate::uds_endpoint::BoundSocket::bind(owner.0.clone(), basename)
+        .map_err(directory_error)?;
     #[cfg(test)]
     if FAIL_CHMOD.with(|fail| fail.replace(false)) {
         return Err(Error::Io);
@@ -1453,7 +1458,7 @@ impl Endpoint for BoundListener {
     type Error = Error;
 
     fn ownership_error() -> Error {
-        directory_error(<uds_endpoint::BoundSocket as Endpoint>::ownership_error())
+        directory_error(<crate::uds_endpoint::BoundSocket as Endpoint>::ownership_error())
     }
 
     fn owns(&self, basename: &str) -> bool {
@@ -1462,7 +1467,7 @@ impl Endpoint for BoundListener {
                 .owns_checked(basename)
                 .map_err(directory_error)
                 .unwrap_or(false),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "dst"))]
             Listener::Sim(socket) => socket.owns(basename),
         }
     }
@@ -1473,7 +1478,7 @@ impl Endpoint for BoundListener {
                 .absent_checked(basename)
                 .map_err(directory_error)
                 .unwrap_or(false),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "dst"))]
             Listener::Sim(socket) => socket.absent(basename),
         }
     }
@@ -1483,11 +1488,11 @@ impl Endpoint for BoundListener {
             (Listener::Real(first), Listener::Real(second)) => {
                 first.same_directory(second).map_err(directory_error)
             }
-            #[cfg(test)]
+            #[cfg(any(test, feature = "dst"))]
             (Listener::Sim(first), Listener::Sim(second)) => {
                 first.same_directory(second).map_err(|_| Error::Io)
             }
-            #[cfg(test)]
+            #[cfg(any(test, feature = "dst"))]
             _ => Ok(false),
         }
     }
@@ -1509,7 +1514,7 @@ impl Endpoint for BoundListener {
         }
         match &self.listener {
             Listener::Real(socket) => socket.rename(from, to, mode).map_err(directory_error),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "dst"))]
             Listener::Sim(socket) => socket.rename(from, to, mode).map_err(|_| Error::Io),
         }
     }
@@ -1517,7 +1522,7 @@ impl Endpoint for BoundListener {
     fn set_basename(&self, basename: String) {
         match &self.listener {
             Listener::Real(socket) => socket.set_basename(basename),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "dst"))]
             Listener::Sim(socket) => socket.set_basename(basename),
         }
     }
@@ -1525,7 +1530,7 @@ impl Endpoint for BoundListener {
     fn owns_checked(&self, basename: &str) -> Result<bool> {
         match &self.listener {
             Listener::Real(socket) => socket.owns_checked(basename).map_err(directory_error),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "dst"))]
             Listener::Sim(_) => Ok(self.owns(basename)),
         }
     }
@@ -1533,7 +1538,7 @@ impl Endpoint for BoundListener {
     fn absent_checked(&self, basename: &str) -> Result<bool> {
         match &self.listener {
             Listener::Real(socket) => socket.absent_checked(basename).map_err(directory_error),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "dst"))]
             Listener::Sim(_) => Ok(self.absent(basename)),
         }
     }
@@ -1543,13 +1548,13 @@ impl Endpoint for BoundListener {
             Listener::Real(socket) => socket
                 .validate_names(temporary, canonical)
                 .map_err(directory_error),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "dst"))]
             Listener::Sim(_)
                 if temporary_name(temporary) && canonical == endpoint_layout()?.canonical() =>
             {
                 Ok(())
             }
-            #[cfg(test)]
+            #[cfg(any(test, feature = "dst"))]
             Listener::Sim(_) => Err(Self::ownership_error()),
         }
     }
@@ -1559,14 +1564,14 @@ impl Endpoint for BoundListener {
     }
 
     fn completed_error() -> Error {
-        directory_error(<uds_endpoint::BoundSocket as Endpoint>::completed_error())
+        directory_error(<crate::uds_endpoint::BoundSocket as Endpoint>::completed_error())
     }
 }
 
 // Persistent per-endpoint ownership. Never remove the lock inode, even on clean
 // shutdown. Socket hard links are crash witnesses, not connect-failure heuristics.
-fn endpoint_layout() -> Result<uds_endpoint::Layout> {
-    uds_endpoint::Layout::new(
+fn endpoint_layout() -> Result<crate::uds_endpoint::Layout> {
+    crate::uds_endpoint::Layout::new(
         ".racer-client.lock",
         "socket",
         ".racer-owned-",
@@ -1575,7 +1580,7 @@ fn endpoint_layout() -> Result<uds_endpoint::Layout> {
     .map_err(directory_error)
 }
 
-pub(super) struct EndpointOwner(Rc<uds_endpoint::EndpointOwner>);
+pub(super) struct EndpointOwner(Rc<crate::uds_endpoint::EndpointOwner>);
 
 impl EndpointOwner {
     #[cfg(test)]
@@ -1584,7 +1589,7 @@ impl EndpointOwner {
     }
 
     pub(super) fn acquire(directory: &File) -> Result<Self> {
-        uds_endpoint::EndpointOwner::acquire(directory, endpoint_layout()?)
+        crate::uds_endpoint::EndpointOwner::acquire(directory, endpoint_layout()?)
             .map(|owner| Self(Rc::new(owner)))
             .map_err(directory_error)
     }

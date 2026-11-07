@@ -9,23 +9,23 @@ use super::azure::{AzureOrigin, AzureTokenSource, AzureTransport};
 use super::{MetadataReply, Origin, OriginPage};
 use crate::admission::AdmissionPolicy;
 use crate::control::Snapshot;
+use crate::control::cell::PublicationCell;
 use crate::error::{Error, Operation};
 use crate::model::{MetadataSelector, ObjectId, PageId, PageNumber};
 use crate::read::candidates::OriginAuthority;
 use crate::runtime::RequestScope;
 use crate::security::OriginContext;
-use controlplane::Published;
 use std::sync::Arc;
 
 pub struct OriginRouter<U, T, K> {
-    snapshots: Arc<Published<Snapshot>>,
+    snapshots: Arc<PublicationCell<Snapshot>>,
     adapter: U,
     azure: Option<AzureOrigin<T, K>>,
 }
 
 impl<U: Origin, T: AzureTransport, K: AzureTokenSource> OriginRouter<U, T, K> {
     pub fn new(
-        snapshots: Arc<Published<Snapshot>>,
+        snapshots: Arc<PublicationCell<Snapshot>>,
         adapter: U,
         azure: Option<AzureOrigin<T, K>>,
     ) -> Self {
@@ -45,13 +45,23 @@ impl<U: Origin, T: AzureTransport, K: AzureTokenSource> OriginRouter<U, T, K> {
         azure.observe(&snapshot);
         let index = snapshot
             .caches
-            .iter()
-            .position(|cache| cache.id == object.cache && cache.origin.is_some())?;
+            .position(&object.cache)
+            .filter(|i| snapshot.caches[*i].origin.is_some())?;
         Some((azure, snapshot, index))
     }
 }
 
 impl<U: Origin, T: AzureTransport, K: AzureTokenSource> Origin for OriginRouter<U, T, K> {
+    /// The published cluster page size; the default before any publication.
+    fn page_size(&self) -> crate::error::Result<racer_wire::object::PageSize> {
+        Ok(self
+            .snapshots
+            .current()?
+            .map_or(racer_wire::object::PageSize::DEFAULT, |snapshot| {
+                snapshot.page_size
+            }))
+    }
+
     fn bootstrap_reserved<'a>(
         &'a self,
         authority: &'a OriginAuthority,

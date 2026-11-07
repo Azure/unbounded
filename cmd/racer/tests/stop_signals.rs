@@ -33,11 +33,11 @@ impl ClusterControl for Outage {
         Err(BootstrapError::Pending)
     }
 
-    fn endpoints(&self) -> wire_codec::DiscoveredEndpoints {
+    fn endpoints(&self) -> racer::control::rest::DiscoveredEndpoints {
         Default::default()
     }
 
-    fn report(&self, _: u32, _: Vec<racer_control_wire::RailMapping>) {}
+    fn report(&self, _: u32, _: Vec<racer_wire::control::RailMapping>) {}
 }
 
 fn bootstrap_stops_on(signal: libc::c_int) {
@@ -52,7 +52,7 @@ fn bootstrap_stops_on(signal: libc::c_int) {
     assert!(config.managed());
     let started = Instant::now();
     let result = managed::start(&mut config, control.clone(), &|| signals.requested());
-    assert_eq!(result, Err(Error::Cancelled));
+    assert_eq!(result, Err(Error::Canceled));
     // The stop arrives inside a blocking wait; it must end well before one
     // full 30 s bootstrap wait, within a couple of short polls.
     assert!(
@@ -121,8 +121,8 @@ fn binary_exits_cleanly_on_signal_during_bootstrap() {
                 ("KUBERNETES_SERVICE_HOST", "127.0.0.1"),
             ])
             .env("KUBERNETES_SERVICE_PORT", api.port().to_string())
-            .env("RACER_API_CA", root.join("ca.crt"))
-            .env("RACER_API_TOKEN", root.join("token"))
+            .env("RACER_KUBE_API_CA", root.join("ca.crt"))
+            .env("RACER_KUBE_API_TOKEN", root.join("token"))
             .env("RACER_CONTROL_TOKEN", root.join("token"))
             .env("RACER_IDENTITY_DIRECTORY", root.join("identity"))
             .env("RACER_SLAB_DIRECTORY", root.join("slabs"))

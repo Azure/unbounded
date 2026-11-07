@@ -1,6 +1,7 @@
 //! Worker-local encrypted slab storage. No HTTP, plaintext, or origin credentials.
-//! Versioned little-endian records protect framing with header SHA-256. The stored
-//! CRC is checked before AEAD at the fill boundary; padding is never returned.
+//! Versioned little-endian records protect framing with header SHA-256. Ciphertext
+//! integrity is checked with its AEAD tag at the fill boundary; padding is never
+//! returned.
 use self::catalog::Index;
 use self::catalog::IndexedPage;
 use self::catalog::RecordLocation;
@@ -31,8 +32,8 @@ use page_alloc::Generation;
 use page_alloc::SegmentLease;
 use page_alloc::Segments;
 use page_alloc::Slab;
-use racer_control_wire::CacheId;
-use racer_control_wire::KeyId;
+use racer_wire::control::CacheId;
+use racer_wire::control::KeyId;
 use sha2::Digest;
 use sha2::Sha256;
 use std::cell::Cell;
@@ -43,6 +44,7 @@ use std::rc::Rc;
 pub mod catalog;
 pub mod checkpoint;
 pub mod holds;
+mod pages;
 
 pub struct Store {
     pub reader: Rc<StoreReader>,
@@ -87,7 +89,6 @@ impl Store {
 /// AEAD validation remains owned by fill.
 pub struct StoreReader {
     metrics: crate::telemetry::Metrics,
-    clock: Rc<catalog::SegmentClock>,
     index: Rc<Index>,
     segments: Rc<Segments>,
     slabs: Rc<Slab<flow_control::Charge<AdmissionPolicy>>>,
@@ -123,7 +124,6 @@ impl StoreReader {
         self.index.version(version)
     }
     pub fn new(
-        clock: Rc<catalog::SegmentClock>,
         index: Rc<Index>,
         segments: Rc<Segments>,
         slabs: Rc<Slab<flow_control::Charge<AdmissionPolicy>>>,
@@ -133,7 +133,6 @@ impl StoreReader {
     ) -> Self {
         Self {
             metrics: crate::telemetry::Metrics::default(),
-            clock,
             index,
             segments,
             slabs,
@@ -212,7 +211,7 @@ impl StoreReader {
                 }
             };
             let length = entry.location.extent.length();
-            let amount = staging_capacity(length)?;
+            let amount = staging_capacity(length)?.max(self.buffers.disk_capacity(length)?);
             let mut reserved = reserve(amount);
             if matches!(reserved, Err(Error::Overloaded)) {
                 self.slabs.reclaim_idle();
@@ -225,10 +224,10 @@ impl StoreReader {
             {
                 return Err(Error::InvalidConfiguration);
             }
-            let buffer = self.slabs.allocate(length, reservation)?;
+            let buffer = self.buffers.disk_buffer(length, reservation)?;
             let buffer = match self
                 .slabs
-                .read(&self.reactor, entry.location.extent, buffer, lease, scope)
+                .read_buf(&self.reactor, entry.location.extent, buffer, lease, scope)
                 .await
             {
                 Ok(b) => b,
@@ -244,7 +243,7 @@ impl StoreReader {
             // A record with this magic but a different format version (for
             // example, written by a newer release) is a cold cache miss, not
             // evidence of damaged storage. Never parse its remaining fields.
-            let bytes = buffer.bytes()?;
+            let bytes: &[u8] = &buffer;
             if bytes.get(..8) == Some(MAGIC)
                 && bytes
                     .get(8..12)
@@ -253,7 +252,7 @@ impl StoreReader {
                 self.invalidate(&token)?;
                 return Ok(None);
             }
-            let decoded = match parse(&buffer, entry.location.extent) {
+            let decoded = match parse_bytes(&buffer, entry.location.extent) {
                 Ok(d) => d,
                 Err(_) => {
                     self.corrupt_miss();
@@ -262,6 +261,7 @@ impl StoreReader {
                 }
             };
             if decoded.header.envelope.page != *page
+                || decoded.header.envelope.page_size != entry.page_size
                 || decoded.header.generation != entry.location.generation
                 || decoded.header.metadata != entry.metadata
                 || decoded.header.envelope.key_id != entry.key_id
@@ -281,11 +281,11 @@ impl StoreReader {
                 decoded.header.envelope,
                 decoded.ciphertext,
             )?;
-            ciphertext.expected_checksum(decoded.checksum)?;
-            self.clock.mark_read(entry.location.segment)?;
-            self.index
-                .retention()
-                .disk_read(page, u64::from(entry.metadata.page_length(page)?));
+            self.index.touch(page);
+            self.index.retention().disk_read(
+                page,
+                u64::from(entry.metadata.page_length_in(page, entry.page_size)?),
+            );
             Ok(Some((
                 CiphertextCopy {
                     metadata: entry.metadata.for_pin(),
@@ -311,9 +311,9 @@ impl StoreReader {
     /// Locate a published v2 record's ciphertext on its device for a direct
     /// (cuFile) read, reading and validating only the header through host
     /// memory. Returns None on a miss, for v1 records, and for any record
-    /// this read path would also treat as a miss. The ciphertext checksum is
-    /// not verified here: the consumer must check
-    /// [`DirectRecord::checksum`] before trusting the bytes.
+    /// this read path would also treat as a miss. The ciphertext is not
+    /// verified here: the consumer must check the GCM tag (the GPU does)
+    /// before trusting the bytes.
     pub(crate) fn direct_read<'a>(
         &'a self,
         page: &'a PageId,
@@ -385,6 +385,7 @@ impl StoreReader {
             };
             drop(buffer);
             if decoded.header.envelope.page != *page
+                || decoded.header.envelope.page_size != entry.page_size
                 || decoded.header.generation != location.generation
                 || decoded.header.metadata != entry.metadata
                 || decoded.header.envelope.key_id != entry.key_id
@@ -410,15 +411,15 @@ impl StoreReader {
             } else {
                 ciphertext.length
             };
-            self.clock.mark_read(location.segment)?;
-            self.index
-                .retention()
-                .disk_read(page, u64::from(entry.metadata.page_length(page)?));
+            self.index.touch(page);
+            self.index.retention().disk_read(
+                page,
+                u64::from(entry.metadata.page_length_in(page, entry.page_size)?),
+            );
             Ok(Some(DirectRecord {
                 token,
                 metadata: entry.metadata.for_pin(),
                 envelope: decoded.header.envelope,
-                checksum: decoded.checksum,
                 ciphertext,
                 read_length,
                 lease: hold,
@@ -433,8 +434,6 @@ pub(crate) struct DirectRecord {
     pub token: ReadToken,
     pub metadata: crate::model::ObjectMetadata,
     pub envelope: PageEnvelope,
-    /// The stored CRC-64 of the sealed page (ciphertext and tag).
-    pub checksum: u64,
     pub ciphertext: DirectCiphertext,
     /// Bytes to transfer from `ciphertext.offset`: the ciphertext length
     /// rounded up to whole 4 KiB blocks when the record holds them.
@@ -446,11 +445,10 @@ pub(crate) struct DirectRecord {
 
 struct Dirty {
     hold: Option<holds::HoldGuard>,
-    _resident: catalog::Resident,
 
     _payload: crate::retention::Payload,
 
-    _metric: ::telemetry::Lease,
+    _metric: crate::telemetry::primitives::Lease,
 
     ticket: u64,
 
@@ -473,6 +471,10 @@ impl Dirty {
 /// Foreground queue selection and positional removal inspect only this prefix.
 /// VecDeque::remove shifts the shorter side, so a prefix victim also bounds moves.
 const QUEUE_RECLAIM_CANDIDATES: usize = 64;
+/// Writes the worker writer keeps in flight, and the most one of its progress
+/// calls submits (refilling as writes complete) before returning.
+pub(crate) const WRITER_WINDOW: usize = 8;
+pub(crate) const WRITER_CALL_WRITES: usize = 4 * WRITER_WINDOW;
 
 /// Locate queued work without inspecting the unselected suffix.
 fn queued_position(queue: &VecDeque<PageId>, page: &PageId) -> Option<usize> {
@@ -480,6 +482,90 @@ fn queued_position(queue: &VecDeque<PageId>, page: &PageId) -> Option<usize> {
         .iter()
         .take(QUEUE_RECLAIM_CANDIDATES)
         .position(|queued| queued == page)
+}
+
+/// Pending versions summarized for [`StoreWriter::metadata`], so a lookup
+/// costs O(1) unless one version's queued pages use different keys.
+struct PendingVersion {
+    pages: usize,
+    metadata: VersionMetadata,
+    /// The key of every queued page, or `None` once two keys were seen.
+    key: Option<racer_wire::control::KeyId>,
+}
+
+/// Queued dirty copies keyed by page, with a per-version summary kept in step
+/// on every insert and removal.
+#[derive(Default)]
+struct PendingWrites {
+    pages: HashMap<PageId, Dirty>,
+    versions: HashMap<ObjectVersion, PendingVersion>,
+}
+
+impl std::ops::Deref for PendingWrites {
+    type Target = HashMap<PageId, Dirty>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.pages
+    }
+}
+
+impl PendingWrites {
+    fn get_mut(&mut self, page: &PageId) -> Option<&mut Dirty> {
+        self.pages.get_mut(page)
+    }
+
+    fn insert(&mut self, page: PageId, dirty: Dirty) {
+        let key = dirty.page.ciphertext.envelope().key_id;
+        match self.versions.get_mut(&page.version) {
+            Some(version) => {
+                version.pages += 1;
+                version.key = version.key.filter(|known| *known == key);
+            }
+            None => {
+                self.versions.insert(
+                    page.version.clone(),
+                    PendingVersion {
+                        pages: 1,
+                        metadata: dirty.page.metadata.immutable(),
+                        key: Some(key),
+                    },
+                );
+            }
+        }
+        if let Some(old) = self.pages.insert(page, dirty) {
+            self.forget(&old);
+        }
+    }
+
+    fn forget(&mut self, dirty: &Dirty) {
+        let version = &dirty.page.ciphertext.envelope().page.version;
+        if let Some(entry) = self.versions.get_mut(version) {
+            entry.pages -= 1;
+            if entry.pages == 0 {
+                self.versions.remove(version);
+            }
+        }
+    }
+
+    fn remove(&mut self, page: &PageId) -> Option<Dirty> {
+        let dirty = self.pages.remove(page)?;
+        self.forget(&dirty);
+        Some(dirty)
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(&PageId, &mut Dirty) -> bool) {
+        let versions = &mut self.versions;
+        self.pages.retain(|page, dirty| {
+            let kept = keep(page, dirty);
+            if !kept && let Some(entry) = versions.get_mut(&page.version) {
+                entry.pages -= 1;
+                if entry.pages == 0 {
+                    versions.remove(&page.version);
+                }
+            }
+            kept
+        });
+    }
 }
 
 /// Bounded dirty copies persist asynchronously, with publication after full I/O.
@@ -492,19 +578,57 @@ pub struct StoreWriter {
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
     reactor: Rc<Reactor>,
     clock: RefCell<Option<Rc<SegmentClock>>>,
-    pending: RefCell<HashMap<PageId, Dirty>>,
+    pending: RefCell<PendingWrites>,
     queue: RefCell<VecDeque<PageId>>,
     next: Cell<u64>,
     capacity: Cell<usize>,
     busy: Cell<bool>,
     paused: Cell<bool>,
+    /// Set by the owner while a checkpoint cut waits for this writer: the
+    /// current progress call finishes its in-flight writes without refilling.
+    refill_fenced: Cell<bool>,
     waiters: RefCell<HashMap<u64, Option<std::task::Waker>>>,
     next_waiter: Cell<u64>,
     active_scope: RefCell<Option<RequestScope>>,
     availability: Rc<crate::control::Availability>,
     discarded: Cell<u64>,
     closed: Cell<bool>,
+    /// Set when a write found no free segment (or index entry) while segment
+    /// reuse was frozen by a checkpoint. New writes wait until the freeze ends.
+    space_deferred: Cell<bool>,
+    /// Last time a persist failure was logged, for rate limiting.
+    last_failure_log: Cell<Option<std::time::Instant>>,
 }
+/// Why a dirty page write failed, for `racer_dirty_discard_reasons_total`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WriteFailure {
+    /// No free segment slot was available after reclamation.
+    NoSpace,
+    /// No index entry was available after reclamation.
+    IndexFull,
+    /// The device or OS reported an I/O error.
+    Io,
+    /// Any other failure.
+    Other,
+}
+impl WriteFailure {
+    pub(crate) fn classify(error: Error) -> Self {
+        match error {
+            Error::Io | Error::Os(_) => Self::Io,
+            _ => Self::Other,
+        }
+    }
+    pub(crate) fn event(self) -> crate::telemetry::Event {
+        match self {
+            Self::NoSpace => crate::telemetry::Event::DirtyDiscardWriteFailedNoSpace,
+            Self::IndexFull => crate::telemetry::Event::DirtyDiscardWriteFailedIndexFull,
+            Self::Io => crate::telemetry::Event::DirtyDiscardWriteFailedIo,
+            Self::Other => crate::telemetry::Event::DirtyDiscardWriteFailed,
+        }
+    }
+}
+/// Minimum spacing between logged persist failures on one worker.
+const PERSIST_FAILURE_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 impl StoreWriter {
     pub fn retention(&self) -> Rc<crate::retention::Retention> {
         self.index.retention()
@@ -514,10 +638,7 @@ impl StoreWriter {
         &self,
         retention: &'a crate::retention::Retention,
     ) -> crate::retention::Scoring<'a> {
-        retention.scoring_at(
-            uring_runtime::environment::now(),
-            self.index.disk_capacity(),
-        )
+        retention.scoring_at(self.index.clock().now(), self.index.disk_capacity())
     }
     /// Install before read engines capture the shared policy.
     pub fn set_retention(&self, retention: Rc<crate::retention::Retention>) {
@@ -540,17 +661,20 @@ impl StoreWriter {
             admission,
             reactor,
             clock: RefCell::new(None),
-            pending: RefCell::new(HashMap::default()),
+            pending: RefCell::default(),
             queue: RefCell::new(VecDeque::new()),
             next: Cell::new(1),
             capacity: Cell::new(64),
             busy: Cell::new(false),
             paused: Cell::new(false),
+            refill_fenced: Cell::new(false),
             waiters: RefCell::new(HashMap::default()),
             next_waiter: Cell::new(0),
             active_scope: RefCell::new(None),
             availability,
             discarded: Cell::new(0),
+            space_deferred: Cell::new(false),
+            last_failure_log: Cell::new(None),
             closed: Cell::new(false),
         }
     }
@@ -572,6 +696,7 @@ impl StoreWriter {
             return Err(Error::InvalidConfiguration);
         }
         self.index.set_page_capacity(page_entries)?;
+        self.publish_headroom(&clock);
         *self.clock.borrow_mut() = Some(clock);
         self.capacity.set(queue_entries);
         Ok(())
@@ -610,7 +735,7 @@ impl StoreWriter {
         self.metrics.observe_disks(samples);
     }
     /// Sample per-cache resident bytes and fair shares for published caches.
-    pub(crate) fn observe_cache_disks(&self, caches: &[racer_control_wire::CacheDefinition]) {
+    pub(crate) fn observe_cache_disks(&self, caches: &[racer_wire::control::CacheDefinition]) {
         let usage = self.retention().cache_disk(self.index.disk_capacity());
         self.metrics
             .observe_cache_disks(cache_disk_samples(caches, usage));
@@ -787,18 +912,23 @@ impl StoreWriter {
         })
     }
 
+    /// Drop a still-queued write by ticket. The queue is searched only when
+    /// the ticket is still pending, so a completed or superseded write costs
+    /// one map lookup.
     fn remove_queued_ticket(&self, page: &PageId, ticket: u64) {
-        let position = self.queue.borrow().iter().position(|queued| queued == page);
         if self
             .pending
             .borrow()
             .get(page)
-            .is_some_and(|dirty| dirty.ticket == ticket)
-            && let Some(position) = position
+            .is_none_or(|dirty| dirty.ticket != ticket)
         {
+            return;
+        }
+        let position = self.queue.borrow().iter().position(|queued| queued == page);
+        if let Some(position) = position {
             self.queue.borrow_mut().remove(position);
             self.pending.borrow_mut().remove(page);
-            self.note_discard(1);
+            self.note_discard(crate::telemetry::Event::DirtyDiscardCanceled, 1);
         }
     }
 
@@ -821,12 +951,14 @@ impl StoreWriter {
                 .reserve_completion(Some(cache), ResourceClass::Ciphertext, length)
                 .map_err(Error::from)
         };
-        let result = reserve();
-        if matches!(result, Err(Error::Overloaded)) {
-            self.slabs.reclaim_idle();
-            return reserve();
-        }
-        result
+        crate::admission::report_final(&self.admission, || {
+            let result = reserve();
+            if matches!(result, Err(Error::Overloaded)) {
+                self.slabs.reclaim_idle();
+                return reserve();
+            }
+            result
+        })
     }
     /// The fill owner may reclaim idle cached bytes for exact aligned staging.
     /// Reclamation is synchronous and happens before queue acceptance; no writer
@@ -900,7 +1032,10 @@ impl StoreWriter {
             page.ciphertext = copy;
         }
         if page.ciphertext.is_registered() {
-            let length = page.ciphertext.bytes().len();
+            // Copy out into storage aligned for this device, so persist writes
+            // the body in place and staging only covers the header block.
+            let alignment = record_alignment(self.slabs.alignment()?)?;
+            let length = page.ciphertext.rehome_capacity(alignment)?;
             let reservation = reserve_staging(length)?;
             reservation.validate(ResourceClass::Ciphertext, length)?;
             if !self.admission.owns(&reservation)
@@ -908,9 +1043,13 @@ impl StoreWriter {
             {
                 return Err(Error::InvalidConfiguration);
             }
-            page.ciphertext = page.ciphertext.rehome(reservation)?;
+            page.ciphertext = page.ciphertext.rehome_aligned_to(reservation, alignment)?;
         }
         let full = self.pending.borrow().len() >= self.capacity.get();
+        // A full queue picks its victim first, but discards it only once every
+        // fallible step below has succeeded: a refused page must not cost an
+        // accepted one.
+        let mut displace = None;
         if full {
             let retention = self.retention();
             let scoring = self.scoring(&retention);
@@ -930,9 +1069,7 @@ impl StoreWriter {
             if !self.index.is_held(&id) && scoring.rank(&id) <= rank {
                 return Err(Error::Overloaded);
             }
-            self.queue.borrow_mut().remove(position);
-            self.pending.borrow_mut().remove(&victim);
-            self.note_discard(1);
+            displace = Some((position, victim));
         }
         // Reserve the staging persist will need before queue acceptance. Thus
         // accepted dirty copies never wait for ciphertext holders to release
@@ -945,30 +1082,33 @@ impl StoreWriter {
             return Err(Error::InvalidConfiguration);
         }
         let ticket = self.next.get();
-        self.next
-            .set(ticket.checked_add(1).ok_or(Error::Unavailable)?);
-        self.pending.borrow_mut().insert(
-            id.clone(),
-            Dirty {
-                hold: if self.index.is_held(&id) {
-                    Some(self.index.protect_hold(&id.version)?)
-                } else {
-                    None
-                },
-                _resident: self.index.track(&id)?,
-                _payload: self.retention().payload(
-                    u64::from(page.ciphertext.envelope().plaintext_length),
-                    false,
-                ),
-                _metric: self
-                    .metrics
-                    .lease(crate::telemetry::Gauge::PendingDiskWrites)?,
-                ticket,
-                page,
-                _reservation: Rc::new(dirty),
-                staging: Some(staging),
+        let next = ticket.checked_add(1).ok_or(Error::Unavailable)?;
+        let entry = Dirty {
+            hold: if self.index.is_held(&id) {
+                Some(self.index.protect_hold(&id.version)?)
+            } else {
+                None
             },
-        );
+            _payload: self.retention().payload(
+                u64::from(page.ciphertext.envelope().plaintext_length),
+                false,
+            ),
+            _metric: self
+                .metrics
+                .lease_local(crate::telemetry::Gauge::PendingDiskWrites)?,
+            ticket,
+            page,
+            _reservation: Rc::new(dirty),
+            staging: Some(staging),
+        };
+        // Nothing below fails: commit the replacement.
+        if let Some((position, victim)) = displace {
+            self.queue.borrow_mut().remove(position);
+            self.pending.borrow_mut().remove(&victim);
+            self.note_discard(crate::telemetry::Event::DirtyDiscardDisplaced, 1);
+        }
+        self.next.set(next);
+        self.pending.borrow_mut().insert(id.clone(), entry);
         self.queue.borrow_mut().push_back(id);
         Ok(ticket)
     }
@@ -980,19 +1120,74 @@ impl StoreWriter {
             .filter(|d| self.allowed(&d.page))
             .map(|d| d.page.clone()))
     }
+    /// Metadata of a version with a queued page this node may still serve.
+    /// O(1) unless the version's queued pages use different keys.
     pub fn metadata(&self, version: &ObjectVersion) -> Result<Option<VersionMetadata>> {
-        Ok(self
-            .pending
-            .borrow()
-            .iter()
-            .find(|(p, d)| &p.version == version && self.allowed(&d.page))
-            .map(|(_, d)| d.page.metadata.immutable()))
+        let pending = self.pending.borrow();
+        let Some(entry) = pending.versions.get(version) else {
+            return Ok(None);
+        };
+        let cache = &version.object.cache;
+        let allowed = match entry.key {
+            Some(key) => {
+                self.availability.page(cache, key) && !self.availability.passthrough(cache)
+            }
+            None => pending
+                .pages
+                .iter()
+                .any(|(p, d)| &p.version == version && self.allowed(&d.page)),
+        };
+        Ok(allowed.then(|| entry.metadata.clone()))
     }
     pub fn pending_count(&self) -> usize {
         self.pending.borrow().len()
     }
+    /// Stop (or resume) refilling in-flight writes beyond the first batch of
+    /// the current progress call. Used to let a checkpoint cut proceed.
+    pub(crate) fn set_refill_fence(&self, fenced: bool) {
+        self.refill_fenced.set(fenced);
+    }
+    fn refill_allowed(&self) -> bool {
+        !self.paused.get() && !self.refill_fenced.get()
+    }
     pub(crate) fn can_start_progress(&self) -> bool {
-        !self.paused.get() && !self.busy.get()
+        !self.paused.get() && !self.busy.get() && !self.space_deferred()
+    }
+    /// Publish this worker's free segments and reclamation headroom target.
+    fn publish_headroom(&self, clock: &SegmentClock) {
+        self.metrics.set_local_gauge(
+            crate::telemetry::Gauge::FreeSegments,
+            clock.free_count() as u64,
+        );
+        self.metrics.set_local_gauge(
+            crate::telemetry::Gauge::FreeSegmentTarget,
+            clock.target() as u64,
+        );
+    }
+    /// True while writes wait for a checkpoint freeze to end because no free
+    /// segment or index entry could be reclaimed. Clears once reuse thaws.
+    pub(crate) fn space_deferred(&self) -> bool {
+        if self.space_deferred.get() && !self.segments.reuse_frozen() {
+            self.space_deferred.set(false);
+        }
+        self.space_deferred.get()
+    }
+    /// Log a persist failure at most once per interval per worker.
+    fn log_persist_failure(&self, failure: WriteFailure, error: Error) {
+        let now = self.index.clock().now();
+        if self
+            .last_failure_log
+            .get()
+            .is_some_and(|last| now.saturating_duration_since(last) < PERSIST_FAILURE_LOG_INTERVAL)
+        {
+            return;
+        }
+        self.last_failure_log.set(Some(now));
+        eprintln!(
+            "racer: worker={} stage=persist cause={failure:?} error={error:?} discarded={}",
+            self.index.worker().0,
+            self.discarded.get()
+        );
     }
     pub fn queued_count(&self) -> usize {
         self.queue.borrow().len()
@@ -1003,9 +1198,13 @@ impl StoreWriter {
     pub fn discarded_count(&self) -> u64 {
         self.discarded.get()
     }
-    fn note_discard(&self, count: usize) {
+    fn note_discard(&self, reason: crate::telemetry::Event, count: usize) {
+        if count == 0 {
+            return;
+        }
         self.metrics
             .record(crate::telemetry::Event::DirtyDiscard, count as u64);
+        self.metrics.record(reason, count as u64);
         self.discarded
             .set(self.discarded.get().saturating_add(count as u64));
     }
@@ -1037,8 +1236,40 @@ impl StoreWriter {
             }
             removed += usize::from(pending.remove(&page).is_some());
         }
-        self.note_discard(removed);
+        self.note_discard(crate::telemetry::Event::DirtyDiscardCanceled, removed);
         removed
+    }
+    /// Whether the only pins on `ciphertext` besides the caller's are this
+    /// writer's queued or submitted copy of `id`.
+    pub(crate) fn pins_only_writer(
+        &self,
+        id: &PageId,
+        ciphertext: &crate::memory::CiphertextPage,
+    ) -> bool {
+        ciphertext.pins() == 2
+            && self.pending.borrow().get(id).is_some_and(|dirty| {
+                std::sync::Arc::ptr_eq(&dirty.page.ciphertext.inner, &ciphertext.inner)
+            })
+    }
+    /// Ciphertext the writer holds for queued and submitted writes: staging
+    /// charges, and page charges no other owner pins. Walks every pending
+    /// write, so call it at a sampling interval, not per page.
+    pub(crate) fn ciphertext_held(&self) -> (usize, usize) {
+        let pending = self.pending.borrow();
+        pending
+            .values()
+            .fold((0usize, 0usize), |(staging, exclusive), dirty| {
+                let page = &dirty.page.ciphertext;
+                let owned = if page.exclusive() {
+                    page.inner.reservation().amount()
+                } else {
+                    0
+                };
+                (
+                    staging.saturating_add(dirty.staging_bytes()),
+                    exclusive.saturating_add(owned),
+                )
+            })
     }
     /// Unpin exactly one otherwise-idle memory bundle. The two ciphertext owners
     /// must be that bundle and this queued write, not a submitted operation/reader.
@@ -1057,11 +1288,11 @@ impl StoreWriter {
         let mut pending = self.pending.borrow_mut();
         if pending.get(id).is_some_and(|dirty| {
             std::sync::Arc::ptr_eq(&dirty.page.ciphertext.inner, &ciphertext.inner)
-                && std::sync::Arc::strong_count(&ciphertext.inner) == 2
+                && ciphertext.pins() == 2
         }) {
             queue.remove(position);
             let dirty = pending.remove(id).expect("located queued copy");
-            self.note_discard(1);
+            self.note_discard(crate::telemetry::Event::DirtyDiscardPressure, 1);
             return dirty.staging_bytes();
         }
         0
@@ -1115,7 +1346,7 @@ impl StoreWriter {
                 queue.remove(position);
             }
         }
-        self.note_discard(removed);
+        self.note_discard(crate::telemetry::Event::DirtyDiscardOwnedReclaim, removed);
         removed
     }
     /// Release only enough queued ciphertext/staging charges to cover a deficit.
@@ -1146,7 +1377,7 @@ impl StoreWriter {
             }
             if let Some(dirty) = pending.remove(&id) {
                 released = released.saturating_add(dirty.staging_bytes());
-                if std::sync::Arc::strong_count(&dirty.page.ciphertext.inner) == 1 {
+                if dirty.page.ciphertext.exclusive() {
                     released =
                         released.saturating_add(dirty.page.ciphertext.inner.reservation().amount());
                 }
@@ -1158,11 +1389,24 @@ impl StoreWriter {
                 queue.remove(position);
             }
         }
-        self.note_discard(removed);
+        self.note_discard(crate::telemetry::Event::DirtyDiscardPressure, removed);
         released
     }
     /// Drive at most `budget` writes. Keep polling this future through reactor completion.
     pub fn progress<'a>(&'a self, budget: usize, scope: &'a RequestScope) -> Operation<'a, usize> {
+        self.progress_pipelined(budget, budget, scope)
+    }
+    /// Drive at most `total` writes with up to `window` in flight, submitting
+    /// the next queued write as each completes so one slow write does not
+    /// idle the device for a whole batch. Refill beyond the first `window`
+    /// stops once a pause or refill fence is requested.
+    pub fn progress_pipelined<'a>(
+        &'a self,
+        window: usize,
+        total: usize,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, usize> {
+        let budget = window.min(total);
         Box::pin(async move {
             if self.paused.get() {
                 WriterWaiter::new(self)?.ready(false).await;
@@ -1175,63 +1419,107 @@ impl StoreWriter {
             use futures::StreamExt;
             use futures::stream::FuturesUnordered;
             let mut writes = FuturesUnordered::new();
-            for _ in 0..budget {
-                if scope.check().is_err() {
-                    self.discard_unsubmitted();
-                    break;
-                }
-                let position = {
-                    let queue = self.queue.borrow();
-                    let retention = self.retention();
-                    let scoring = self.scoring(&retention);
-                    // Reverse the tie breaker to keep FIFO within equal value.
-                    queue
-                        .iter()
-                        .enumerate()
-                        .take(QUEUE_RECLAIM_CANDIDATES)
-                        .max_by_key(|(position, id)| {
-                            (scoring.rank(id), std::cmp::Reverse(*position))
-                        })
-                        .map(|(position, _)| position)
-                };
-                let id =
-                    match position.and_then(|position| self.queue.borrow_mut().remove(position)) {
+            // Refill stops at `total`, or once a pause or checkpoint fence is
+            // requested, so callers waiting for the batch still run.
+            let limit = total;
+            let mut submitted = 0usize;
+            let mut stopped = false;
+            let mut completed = 0;
+            let mut failure = None;
+            loop {
+                while !stopped
+                    && writes.len() < budget
+                    && submitted < limit
+                    && (submitted < budget || self.refill_allowed())
+                    && !self.space_deferred()
+                {
+                    if scope.check().is_err() {
+                        self.discard_unsubmitted();
+                        stopped = true;
+                        break;
+                    }
+                    let position = {
+                        let queue = self.queue.borrow();
+                        let retention = self.retention();
+                        let scoring = self.scoring(&retention);
+                        // Reverse the tie breaker to keep FIFO within equal value.
+                        queue
+                            .iter()
+                            .enumerate()
+                            .take(QUEUE_RECLAIM_CANDIDATES)
+                            .max_by_key(|(position, id)| {
+                                (scoring.rank(id), std::cmp::Reverse(*position))
+                            })
+                            .map(|(position, _)| position)
+                    };
+                    let id = match position
+                        .and_then(|position| self.queue.borrow_mut().remove(position))
+                    {
                         Some(id) => id,
                         None => break,
                     };
-                let page = match self.copy_only(&id)? {
-                    Some(p) => p,
-                    None => {
-                        self.pending.borrow_mut().remove(&id);
-                        continue;
-                    }
+                    let page = match self.copy_only(&id)? {
+                        Some(p) => p,
+                        None => {
+                            self.pending.borrow_mut().remove(&id);
+                            continue;
+                        }
+                    };
+                    // Install cleanup BEFORE allocation, reclamation or submission.
+                    // Every attempted copy leaves the queue, including disposable failures.
+                    let mut cleanup = DirtyCleanup {
+                        writer: self,
+                        persisted: false,
+                        requeue: false,
+                        failure: None,
+                        page: id.clone(),
+                        ticket: self
+                            .pending
+                            .borrow()
+                            .get(&id)
+                            .ok_or(Error::Unavailable)?
+                            .ticket,
+                    };
+                    submitted += 1;
+                    writes.push(async move {
+                        let cause = Cell::new(None);
+                        let result = self.persist(&id, &page, scope, &cause).await;
+                        cleanup.persisted = result.is_ok();
+                        if let Err(error) = result {
+                            let failure = cause.get().unwrap_or(WriteFailure::classify(error));
+                            // Out of space while a checkpoint freezes reuse: no
+                            // reclaim can help until publication, so keep the
+                            // page queued (its staging is untouched) and retry
+                            // after the freeze ends instead of discarding it.
+                            if matches!(failure, WriteFailure::NoSpace | WriteFailure::IndexFull)
+                                && self.segments.reuse_frozen()
+                                && self.pending.borrow().get(&id).is_some_and(|dirty| {
+                                    dirty.ticket == cleanup.ticket && dirty.staging.is_some()
+                                })
+                            {
+                                cleanup.requeue = true;
+                                self.space_deferred.set(true);
+                                if let Some(clock) = self.clock.borrow().as_ref() {
+                                    clock.note_starved();
+                                }
+                                self.metrics
+                                    .record(crate::telemetry::Event::DirtyWriteDeferred, 1);
+                            } else {
+                                cleanup.failure = Some(failure);
+                                self.log_persist_failure(failure, error);
+                            }
+                        }
+                        drop(cleanup);
+                        result
+                    });
+                }
+                let Some(result) = writes.next().await else {
+                    break;
                 };
-                // Install cleanup BEFORE allocation, reclamation or submission.
-                // Every attempted copy leaves the queue, including disposable failures.
-                let mut cleanup = DirtyCleanup {
-                    writer: self,
-                    persisted: false,
-                    page: id.clone(),
-                    ticket: self
-                        .pending
-                        .borrow()
-                        .get(&id)
-                        .ok_or(Error::Unavailable)?
-                        .ticket,
-                };
-                writes.push(async move {
-                    let result = self.persist(&id, &page, scope).await;
-                    cleanup.persisted = result.is_ok();
-                    drop(cleanup);
-                    result
-                });
-            }
-            let mut completed = 0;
-            let mut failure = None;
-            while let Some(result) = writes.next().await {
                 completed += 1;
                 if let Some(clock) = self.clock.borrow().as_ref() {
                     let _ = clock.reclaim_now();
+                    self.publish_headroom(clock);
                 }
                 // Quota/space pressure and cache I/O failures never fail the node.
                 if let Err(error) = result {
@@ -1242,14 +1530,18 @@ impl StoreWriter {
                             | Error::Os(_)
                             | Error::Unavailable
                             | Error::MissingKey
-                            | Error::Cancelled
+                            | Error::Canceled
                             | Error::DeadlineExceeded
                     ) {
                         failure = Some(error);
                     }
-                    if matches!(error, Error::Cancelled | Error::DeadlineExceeded) {
+                    if matches!(error, Error::Canceled | Error::DeadlineExceeded) {
                         self.discard_unsubmitted();
+                        stopped = true;
                     }
+                }
+                if failure.is_some() {
+                    stopped = true;
                 }
             }
             failure.map_or(Ok(completed), Err)
@@ -1260,17 +1552,55 @@ impl StoreWriter {
         id: &PageId,
         page: &CiphertextCopy,
         scope: &RequestScope,
+        cause: &Cell<Option<WriteFailure>>,
     ) -> Result<()> {
         // Recovery or another publisher may have installed the mapping since enqueue.
         if self.index.lookup(id)?.is_some() {
             return Ok(());
         }
+        let index_full = |error: Error| {
+            if error == Error::Overloaded {
+                cause.set(Some(WriteFailure::IndexFull));
+            }
+            error
+        };
         // Capacity is owned across the await, including invalidation/replacement.
-        let index_ticket = self
-            .index
-            .reserve_page_for(id, self.clock.borrow().is_some())?;
+        let mut index_ticket = match self.index.reserve_page_for(id) {
+            Err(Error::Overloaded) if self.clock.borrow().is_some() => {
+                let clock = self.clock.borrow().clone().expect("checked clock");
+                // Index full: evict a whole low-value segment, then retry.
+                let _ = clock.reclaim_entries();
+                self.index.reserve_page_for(id).map_err(index_full)?
+            }
+            ticket => ticket.map_err(index_full)?,
+        };
         let alignment = self.slabs.alignment()?;
         let disk_bytes = record_length(page, alignment)?;
+        // Reserve disk space before taking the staging charge, so a write
+        // that finds no space leaves the queued page intact for a retry.
+        let no_space = |error: Error| {
+            if error == Error::Overloaded {
+                cause.set(Some(WriteFailure::NoSpace));
+            }
+            error
+        };
+        let (segment, location) = match index_ticket.append(id, &self.segments, disk_bytes) {
+            Ok(append) => append,
+            Err(Error::Overloaded) => {
+                // Retry even when reclamation falls short of its headroom
+                // target: one recycled segment is enough for this record.
+                let reclaimed = self
+                    .clock
+                    .borrow()
+                    .clone()
+                    .map_or(Ok(()), |clock| clock.reclaim_now());
+                match index_ticket.append(id, &self.segments, disk_bytes) {
+                    Ok(append) => append,
+                    Err(error) => return Err(no_space(reclaimed.err().unwrap_or(error))),
+                }
+            }
+            Err(error) => return Err(error),
+        };
         let (staging, dirty, ticket) = {
             let mut pending = self.pending.borrow_mut();
             let entry = pending.get_mut(id).ok_or(Error::Unavailable)?;
@@ -1292,22 +1622,9 @@ impl StoreWriter {
         };
         let mut buffer = self.slabs.allocate(staged, staging)?;
         buffer.retain(dirty);
-        let (segment, extent) = match self.segments.append(disk_bytes).map_err(Error::from) {
-            Ok(append) => append,
-            Err(Error::Overloaded) => {
-                if let Some(clock) = self.clock.borrow().clone() {
-                    clock.reclaim_now()?;
-                }
-                self.segments.append(disk_bytes)?
-            }
-            Err(error) => return Err(error),
-        };
-        let location = RecordLocation {
-            segment: segment.id(),
-            generation: segment.generation(),
-            extent,
-        };
-        let _publication_guard = self.index.publishing(location.segment);
+        // The appended record keeps its segment from eviction until the
+        // ticket publishes or drops (including future cancellation).
+        let extent = location.extent;
         let _publication_lease = self.segments.lease(location.segment, location.generation)?;
         if zero_copy {
             if extent.length() != disk_bytes {
@@ -1354,6 +1671,7 @@ impl StoreWriter {
             index_ticket.publish(
                 id.clone(),
                 IndexedPage {
+                    page_size: page.ciphertext.envelope().page_size,
                     location,
                     metadata: page.metadata.immutable(),
                     key_id: page.ciphertext.envelope().key_id,
@@ -1364,7 +1682,7 @@ impl StoreWriter {
             self.retention()
                 .published(id, u64::from(page.ciphertext.envelope().plaintext_length));
         } else if self.pending.borrow().contains_key(id) {
-            self.note_discard(1);
+            self.note_discard(crate::telemetry::Event::DirtyDiscardSuperseded, 1);
         }
         Ok(())
     }
@@ -1374,7 +1692,11 @@ impl StoreWriter {
             if scope.check().is_err() {
                 self.cancel_pending_writes()?;
             }
-            // An application-held progress future must be polled alongside drain.
+            // An application-held progress future must be polled alongside
+            // drain. Sleep until it finishes (Busy wakes writer waiters) or the
+            // scope is canceled, instead of polling in a self-wake loop.
+            let waiter = WriterWaiter::with_limit(self, usize::MAX)?;
+            let cancellation = scope.cancellation.subscribe()?;
             std::future::poll_fn(|cx| {
                 if scope.check().is_err()
                     && let Err(error) = self.cancel_pending_writes()
@@ -1382,13 +1704,14 @@ impl StoreWriter {
                     return std::task::Poll::Ready(Err(error));
                 }
                 if !self.busy.get() {
-                    std::task::Poll::Ready(Ok(()))
-                } else {
-                    cx.waker().wake_by_ref();
-                    std::task::Poll::Pending
+                    return std::task::Poll::Ready(Ok(()));
                 }
+                cancellation.register(cx.waker());
+                waiter.register(cx.waker());
+                std::task::Poll::Pending
             })
             .await?;
+            drop((cancellation, waiter));
             while self.pending_count() != 0 {
                 scope.check()?;
                 self.progress(8, scope).await?;
@@ -1410,7 +1733,10 @@ impl StoreWriter {
         let mut pending = self.pending.borrow_mut();
         let before = pending.len();
         pending.retain(|p, _| !caches.contains(&p.version.object.cache));
-        self.note_discard(before - pending.len());
+        self.note_discard(
+            crate::telemetry::Event::DirtyDiscardRemoved,
+            before - pending.len(),
+        );
         self.queue
             .borrow_mut()
             .retain(|p| !caches.contains(&p.version.object.cache));
@@ -1506,6 +1832,18 @@ impl<'a> WriterWaiter<'a> {
         Ok(Self { writer, id })
     }
 
+    /// Wake `waker` at the next writer state change.
+    fn register(&self, waker: &std::task::Waker) {
+        let old = self
+            .writer
+            .waiters
+            .borrow_mut()
+            .get_mut(&self.id)
+            .expect("registered writer waiter")
+            .replace(waker.clone());
+        drop(old);
+    }
+
     async fn ready(&self, checkpoint: bool) {
         std::future::poll_fn(|cx| {
             if !self.writer.busy.get() && (checkpoint || !self.writer.paused.get()) {
@@ -1535,6 +1873,9 @@ impl Drop for WriterWaiter<'_> {
 struct DirtyCleanup<'a> {
     writer: &'a StoreWriter,
     persisted: bool,
+    /// Keep the page pending and put it back at the queue front.
+    requeue: bool,
+    failure: Option<WriteFailure>,
     page: PageId,
     ticket: u64,
 }
@@ -1545,9 +1886,15 @@ impl Drop for DirtyCleanup<'_> {
             .get(&self.page)
             .is_some_and(|dirty| dirty.ticket == self.ticket)
         {
+            if self.requeue && !self.persisted {
+                drop(pending);
+                self.writer.queue.borrow_mut().push_front(self.page.clone());
+                return;
+            }
             pending.remove(&self.page);
             if !self.persisted {
-                self.writer.note_discard(1);
+                let failure = self.failure.unwrap_or(WriteFailure::Other);
+                self.writer.note_discard(failure.event(), 1);
             }
         }
     }
@@ -1555,7 +1902,11 @@ impl Drop for DirtyCleanup<'_> {
 // Page record format version, stored after the magic. Readers treat any other
 // version as a cold miss.
 //
-// Version 2 layout:
+// Version 5 layout (version 3 plus the page size after the cipher, so a store
+// reopened under another published page size sees its pages as cut at the old
+// size). Version 5 has the version 4 layout; its ciphertext is sealed under
+// page AAD v2, which also binds the page size, so version 4 records are a cold
+// miss rather than an authentication failure:
 // - `[0, real)`: header fields followed by a SHA-256 digest of the preceding
 //   header bytes. `real` is at most `MAX_RAW_HEADER_BYTES`.
 // - `[real, header_len)`: zero padding. `header_len` (stored at bytes 12..16)
@@ -1564,7 +1915,7 @@ impl Drop for DirtyCleanup<'_> {
 // - `[header_len, header_len + ciphertext_length)`: ciphertext, so it starts at
 //   a disk-aligned offset and can be written from its own aligned buffer.
 // - The remainder up to the record extent is zero padding.
-pub const FORMAT_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 5;
 pub const MAX_ID_BYTES: usize = 4096;
 pub const MAX_ETAG_BYTES: usize = 8192;
 /// Upper bound on the unpadded header, including its digest.
@@ -1621,10 +1972,10 @@ struct DiskBody {
 }
 // SAFETY: the Arc-held ciphertext storage is never mutated after
 // construction, so the returned slice is stable while `self` is alive.
-unsafe impl uring_runtime::reactor::SharedWriteBuffer for DiskBody {
-    type Error = Error;
-    fn write_bytes(&self) -> Result<&[u8]> {
-        disk_body_prefix(&self.page, self.alignment, self.length).ok_or(Error::InvalidConfiguration)
+unsafe impl racer_io::ring::SharedWriteBuffer for DiskBody {
+    fn write_bytes(&self) -> racer_io::Result<&[u8]> {
+        disk_body_prefix(&self.page, self.alignment, self.length)
+            .ok_or(racer_io::Error::InvalidConfiguration)
     }
 }
 /// Large records share capacity classes while their disk extents stay exact.
@@ -1653,7 +2004,6 @@ pub struct EncodedRecord {
 pub struct DecodedRecord {
     pub header: RecordHeader,
     pub ciphertext: std::ops::Range<usize>,
-    pub checksum: u64,
 }
 impl DecodedRecord {
     /// Ciphertext byte range relative to the record start, if the record's
@@ -1670,7 +2020,7 @@ impl DecodedRecord {
 /// The descriptor is the worker-local O_DIRECT
 /// descriptor the slab reads through, suitable for registration with cuFile.
 pub struct DirectCiphertext {
-    pub descriptor: Rc<uring_runtime::reactor::descriptor::Descriptor>,
+    pub descriptor: Rc<racer_io::ring::Descriptor>,
     /// Absolute byte offset of the first ciphertext byte on `descriptor`.
     pub offset: u64,
     /// Ciphertext length in bytes, including the AEAD tag.
@@ -1742,6 +2092,14 @@ fn record_unit(alignment: Alignment) -> Result<usize> {
         Ok(unit)
     }
 }
+/// `device` with its length unit raised to the record unit. The record body is
+/// padded to the record unit, which may be coarser than the device's length
+/// unit (512-byte sectors pad to 4 KiB), so aligned ciphertext must be padded
+/// to it too for persist to write the body in place.
+pub(crate) fn record_alignment(device: Alignment) -> Result<Alignment> {
+    Alignment::new(device.memory(), device.offset(), record_unit(device)?)
+        .map_err(|_| Error::InvalidConfiguration)
+}
 fn align_up(len: usize, unit: usize) -> Result<usize> {
     len.checked_next_multiple_of(unit)
         .ok_or(Error::CorruptRecord)
@@ -1791,8 +2149,9 @@ fn raw_layout(page: &CiphertextCopy, generation: Generation) -> Result<usize> {
     {
         return Err(Error::CorruptRecord);
     }
+    // Cipher and page size trail the variable-length fields.
     let header_bytes = HEADER_PREFIX_BYTES
-        .checked_add(12)
+        .checked_add(4 + 4)
         .ok_or(Error::CorruptRecord)?
         .checked_add(cache.len())
         .and_then(|len| len.checked_add(etag.len()))
@@ -1870,7 +2229,6 @@ fn header_bytes(page: &CiphertextCopy, generation: Generation, layout: &RecordLa
     out.extend_from_slice(&(etag.len() as u32).to_le_bytes());
     out.extend_from_slice(cache);
     out.extend_from_slice(etag);
-    out.extend_from_slice(&page.ciphertext.checksum().to_le_bytes());
     out.extend_from_slice(
         &(page
             .metadata
@@ -1883,6 +2241,8 @@ fn header_bytes(page: &CiphertextCopy, generation: Generation, layout: &RecordLa
         out.extend_from_slice(content_type.as_bytes());
     }
     out.extend_from_slice(&(envelope.cipher as u32).to_le_bytes());
+    // Every page size is at most 16 MiB, so it fits a u32.
+    out.extend_from_slice(&(envelope.page_size.get() as u32).to_le_bytes());
     debug_assert_eq!(out.len() + HEADER_DIGEST_BYTES, layout.header_bytes);
     let digest = Sha256::digest(&out);
     out.extend_from_slice(&digest);
@@ -1974,7 +2334,7 @@ pub fn parse_bytes(bytes: &[u8], extent: Extent) -> Result<DecodedRecord> {
 /// without touching the ciphertext. The prefix must cover the whole header
 /// block; reading min(MAX_HEADER_BYTES, extent length) bytes always does. This
 /// lets a direct-to-GPU reader validate framing through host memory and then
-/// transfer only `DecodedRecord::ciphertext`. The ciphertext checksum is not
+/// transfer only `DecodedRecord::ciphertext`. The ciphertext AEAD tag is not
 /// verified here.
 pub fn parse_prefix(prefix: &[u8], extent: Extent) -> Result<DecodedRecord> {
     if prefix.len() > extent.length() {
@@ -2030,7 +2390,6 @@ fn parse_header(bytes: &[u8], extent: Extent) -> Result<DecodedRecord> {
             .to_owned(),
     );
     let etag = StrongEtag::parse(r.take(etag_len)?).map_err(|_| Error::CorruptRecord)?;
-    let checksum = r.u64()?;
     let content_type_length = r.u32()? as usize;
     let content_type = if content_type_length == 0 {
         None
@@ -2041,6 +2400,8 @@ fn parse_header(bytes: &[u8], extent: Extent) -> Result<DecodedRecord> {
         )
     };
     let cipher = crate::model::PageCipher::try_from(r.u32()?)?;
+    let page_size = racer_wire::object::PageSize::from_wire(u64::from(r.u32()?))
+        .map_err(|_| Error::CorruptRecord)?;
     if !r.0.is_empty() || generation.0 == 0 {
         return Err(Error::CorruptRecord);
     }
@@ -2055,6 +2416,7 @@ fn parse_header(bytes: &[u8], extent: Extent) -> Result<DecodedRecord> {
     };
     let envelope = PageEnvelope {
         cipher,
+        page_size,
         page: PageId { version, number },
         key_id,
         nonce,
@@ -2078,7 +2440,6 @@ fn parse_header(bytes: &[u8], extent: Extent) -> Result<DecodedRecord> {
             extent,
         },
         ciphertext: header_len..logical_bytes,
-        checksum,
     })
 }
 /// Length of the variable header fields after the 16-byte fixed prefix and
@@ -2096,13 +2457,12 @@ fn header_fields_len(r: &mut Decoder<'_>) -> Result<usize> {
     }
     r.take(cache_len)?;
     r.take(etag_len)?;
-    r.take(8)?;
     let content_type_len = r.u32()? as usize;
     if content_type_len > MAX_RAW_HEADER_BYTES {
         return Err(Error::CorruptRecord);
     }
     r.take(content_type_len)?;
-    r.take(4)?;
+    r.take(4 + 4)?;
     Ok(start - r.0.len())
 }
 pub fn decode(
@@ -2124,9 +2484,9 @@ pub(super) struct Decoder<'a>(pub(super) &'a [u8]);
 impl<'a> Decoder<'a> {
     fn read<T>(
         &mut self,
-        read: impl FnOnce(&mut wire_codec::Reader<'a>) -> wire_codec::Result<T>,
+        read: impl FnOnce(&mut racer_wire::codec::Reader<'a>) -> racer_wire::codec::Result<T>,
     ) -> Result<T> {
-        let mut reader = wire_codec::Reader::new(self.0, wire_codec::Endian::Little);
+        let mut reader = racer_wire::codec::Reader::new(self.0, racer_wire::codec::Endian::Little);
         let result = read(&mut reader);
         self.0 = reader.remaining();
         result.map_err(|_| Error::CorruptRecord)
@@ -2152,7 +2512,7 @@ impl<'a> Decoder<'a> {
 /// catalog size and the usage list. Usage for caches that are no longer
 /// published is dropped.
 fn cache_disk_samples(
-    caches: &[racer_control_wire::CacheDefinition],
+    caches: &[racer_wire::control::CacheDefinition],
     usage: Vec<crate::retention::CacheDisk>,
 ) -> Vec<crate::telemetry::CacheDiskUsage> {
     let names: std::collections::HashMap<&CacheId, &str> = caches

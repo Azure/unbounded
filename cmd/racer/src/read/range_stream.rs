@@ -15,6 +15,7 @@ use crate::error::Result;
 use crate::http::Delivery;
 use crate::http::ReaderLease;
 use crate::memory::PageResult;
+use crate::memory::VerifiedPage;
 use crate::model::ObjectMetadata;
 use crate::model::ObjectVersion;
 use crate::model::PAGE_BYTES;
@@ -44,22 +45,16 @@ use std::task::Waker;
 use std::time::Duration;
 use std::time::Instant;
 
+use racer_core::read::effect::{EffectId, EffectIds};
+use racer_core::read::window as win;
+use racer_core::read::{self, PageBudget};
 #[cfg(test)]
-use racer_core::read::SELECTIONS;
-use racer_core::read::{self, DIRECT_AHEAD, SlotKind};
+use racer_core::read::{DIRECT_AHEAD, SELECTIONS, window::PAGE_RETRIES};
 
 /// Flights requested per provider contract. A provider grants at most this
 /// many pending selections per contract, or one if it predates multi-flight.
 pub(crate) const REQUESTED_FLIGHTS: u16 = 4;
 const _: () = assert!(REQUESTED_FLIGHTS <= racer_core::subscriptions::MAX_SUBSCRIPTION_FLIGHTS);
-
-/// Spill fills (hold plus spill fill) a read keeps in flight.
-const SPILL_FILLS: usize = 2;
-
-/// Lifetime of a read's spill hold. Holds are renewed by nothing; a page that
-/// expires before delivery is fetched again. Short, because a version's hold
-/// lasts until the latest deadline of all its holders.
-const SPILL_HOLD: Duration = Duration::from_secs(60);
 
 /// One open read window registered for selection fan-out.
 struct Reader {
@@ -75,7 +70,7 @@ struct Reader {
 }
 
 /// One provider contract: (version, membership, provider).
-type ContractKey = (ObjectVersion, u64, racer_control_wire::NodeId);
+type ContractKey = (ObjectVersion, u64, racer_wire::control::NodeId);
 
 /// A peer subscription contract and the selections it has in flight.
 struct Contract {
@@ -100,6 +95,8 @@ struct State {
 /// Node-wide registry of open read windows and peer subscription contracts.
 pub(crate) struct Scheduler {
     capacity: usize,
+    /// Contract expiry and identifiers.
+    ctx: racer_io::WorkerCtx,
     state: Mutex<State>,
 }
 
@@ -111,8 +108,8 @@ impl Scheduler {
     pub(crate) fn contract(
         &self,
         selection: &Selection,
-        membership: racer_control_wire::MembershipVersion,
-        provider: racer_control_wire::NodeId,
+        membership: racer_wire::control::MembershipVersion,
+        provider: racer_wire::control::NodeId,
         requested: Option<u16>,
         deadline: Instant,
     ) -> Result<(crate::peer::subscriptions::Subscription, Instant)> {
@@ -123,7 +120,7 @@ impl Scheduler {
         let version = selection.version.clone();
         let demand = selection.demand.clone();
         let mut state = self.state.lock().unwrap();
-        let now = uring_runtime::environment::now();
+        let now = self.ctx.now();
         // Expired contracts are dropped only once idle, so a late drop never
         // releases a flight of the contract that replaced it.
         state
@@ -135,7 +132,7 @@ impl Scheduler {
                 return Err(Error::Overloaded);
             }
             let mut id = [0; 16];
-            uring_runtime::environment::fill_random(&mut id).map_err(|_| Error::Unavailable)?;
+            self.ctx.rng.fill(&mut id).map_err(|_| Error::Unavailable)?;
             state.contracts.insert(
                 key.clone(),
                 Contract {
@@ -145,6 +142,10 @@ impl Scheduler {
                         demand: Default::default(),
                         sequence: 0,
                         page_budget: u32::MAX,
+                        // Largest-page units on purpose: the provider debits the
+                        // same `PAGE_BYTES + 16` per selection
+                        // (`racer_core::subscriptions`), and `u32::MAX` of them
+                        // never binds whatever the published page size.
                         byte_budget: u64::from(u32::MAX) * (PAGE_BYTES + 16),
                         flights: None,
                     },
@@ -200,7 +201,7 @@ impl Scheduler {
     pub(crate) fn granted(
         &self,
         selection: &Selection,
-        provider: &racer_control_wire::NodeId,
+        provider: &racer_wire::control::NodeId,
         flights: u16,
     ) {
         let Some(key) = selection.contract.lock().unwrap().clone() else {
@@ -215,7 +216,7 @@ impl Scheduler {
     }
 
     /// The provider refused a multi-flight request: one flight from now on.
-    pub(crate) fn refused(&self, selection: &Selection, provider: &racer_control_wire::NodeId) {
+    pub(crate) fn refused(&self, selection: &Selection, provider: &racer_wire::control::NodeId) {
         let Some(key) = selection.contract.lock().unwrap().clone() else {
             return;
         };
@@ -228,23 +229,16 @@ impl Scheduler {
     }
 
     /// Unused granted flights across the live contracts of `version`.
+    #[cfg(test)]
     fn spare(&self, version: &ObjectVersion) -> usize {
-        let now = uring_runtime::environment::now();
-        self.state
-            .lock()
-            .unwrap()
-            .contracts
-            .iter()
-            .filter(|((contracted, _, _), contract)| {
-                contracted == version && contract.expires > now
-            })
-            .map(|(_, contract)| usize::from(contract.granted.saturating_sub(contract.inflight)))
-            .sum()
+        let now = self.ctx.now();
+        spare(&self.state.lock().unwrap(), version, now)
     }
 
-    pub(crate) fn new(capacity: usize) -> Arc<Self> {
+    pub(crate) fn new(capacity: usize, ctx: racer_io::WorkerCtx) -> Arc<Self> {
         Arc::new(Self {
             capacity,
+            ctx,
             state: Mutex::new(State {
                 contracts: BTreeMap::new(),
                 sequence: 0,
@@ -279,22 +273,8 @@ impl Scheduler {
 
     /// Give a selected page to every open window of its version that wants it.
     fn offer(&self, version: &ObjectVersion, page: &PageResult) {
-        let number = page.plaintext.page().number.0;
-        let wake = {
-            let mut state = self.state.lock().unwrap();
-            state
-                .readers
-                .values_mut()
-                .filter_map(|reader| {
-                    if &reader.version != version || !reader.wants.remove(&number) {
-                        return None;
-                    }
-                    reader.busy.remove(&number);
-                    reader.offered.push_back(page.clone());
-                    reader.waker.take()
-                })
-                .collect::<Vec<_>>()
-        };
+        let mut wake = Vec::new();
+        offer(&mut self.state.lock().unwrap(), version, page, &mut wake);
         for waker in wake {
             waker.wake();
         }
@@ -308,6 +288,30 @@ impl Scheduler {
     }
 }
 
+/// Unused granted flights across the live contracts of `version`.
+fn spare(state: &State, version: &ObjectVersion, now: Instant) -> usize {
+    state
+        .contracts
+        .iter()
+        .filter(|((contracted, _, _), contract)| contracted == version && contract.expires > now)
+        .map(|(_, contract)| usize::from(contract.granted.saturating_sub(contract.inflight)))
+        .sum()
+}
+
+/// Queue `page` for every open window of `version` that wants it; their wakers
+/// go to `wake`, to be woken once the lock is released.
+fn offer(state: &mut State, version: &ObjectVersion, page: &PageResult, wake: &mut Vec<Waker>) {
+    let number = page.plaintext.page().number.0;
+    for reader in state.readers.values_mut() {
+        if &reader.version != version || !reader.wants.remove(&number) {
+            continue;
+        }
+        reader.busy.remove(&number);
+        reader.offered.push_back(page.clone());
+        wake.extend(reader.waker.take());
+    }
+}
+
 /// Registration of one stream's window. Dropping it stops fan-out to the stream.
 struct WindowLease {
     scheduler: Arc<Scheduler>,
@@ -315,7 +319,59 @@ struct WindowLease {
 }
 
 impl WindowLease {
+    /// One step's exchange with the scheduler, under one lock: publish the
+    /// pages `window` still wants and those it is busy with, take the pages
+    /// offered to it, fan its directly `filled` pages out to other windows of
+    /// `version`, and refresh `facts` (pages busy elsewhere, spare flights).
+    fn exchange(
+        &self,
+        window: Option<&win::ReadWindow>,
+        filled: &mut Vec<PageResult>,
+        version: &ObjectVersion,
+        waker: &Waker,
+        offered: &mut VecDeque<PageResult>,
+        facts: &mut win::Facts,
+    ) {
+        let now = self.scheduler.ctx.now();
+        let mut wake = Vec::new();
+        {
+            let mut guard = self.scheduler.state.lock().unwrap();
+            let state = &mut *guard;
+            if let Some(reader) = state.readers.get_mut(&self.id) {
+                match window {
+                    Some(window) => window.interest_into(&mut reader.wants, &mut reader.busy),
+                    None => {
+                        reader.wants.clear();
+                        reader.busy.clear();
+                    }
+                }
+                if !reader
+                    .waker
+                    .as_ref()
+                    .is_some_and(|known| known.will_wake(waker))
+                {
+                    reader.waker = Some(waker.clone());
+                }
+                offered.extend(reader.offered.drain(..));
+            }
+            for page in filled.drain(..) {
+                offer(state, version, &page, &mut wake);
+            }
+            facts.elsewhere.clear();
+            for (id, reader) in &state.readers {
+                if *id != self.id && &reader.version == version {
+                    facts.elsewhere.extend(reader.busy.iter().copied());
+                }
+            }
+            facts.spare = spare(state, version, now);
+        }
+        for waker in wake {
+            waker.wake();
+        }
+    }
+
     /// Publish the pages this window still wants and those it is fetching.
+    #[cfg(test)]
     fn sync(&self, wants: BTreeSet<u64>, busy: BTreeSet<u64>, waker: &Waker) {
         let mut state = self.scheduler.state.lock().unwrap();
         if let Some(reader) = state.readers.get_mut(&self.id) {
@@ -326,6 +382,7 @@ impl WindowLease {
     }
 
     /// Selected pages offered since the last call.
+    #[cfg(test)]
     fn take_offered(&self) -> VecDeque<PageResult> {
         let mut state = self.scheduler.state.lock().unwrap();
         state
@@ -335,13 +392,9 @@ impl WindowLease {
             .unwrap_or_default()
     }
 
-    /// Give a directly filled page to other windows of the version.
-    fn offer(&self, page: &PageResult) {
-        self.scheduler.offer(&page.metadata.version, page);
-    }
-
     /// Pages that other windows of the same version are already selecting or
     /// filling directly.
+    #[cfg(test)]
     fn busy_elsewhere(&self) -> BTreeSet<u64> {
         let state = self.scheduler.state.lock().unwrap();
         let Some(version) = state.readers.get(&self.id).map(|r| &r.version) else {
@@ -423,69 +476,12 @@ fn window_error(error: flow_control::Error) -> Error {
     }
 }
 
-/// Client range progress admits independent pages under bounded child allowances.
-/// Restarts of one page's direct fill after transient failures. Each restart
-/// gets a fresh page budget, so this bounds total attempts per page.
-const PAGE_RETRIES: u8 = 16;
-
-enum RangeBudget {
-    ClientPages {
-        deadline: Instant,
-    },
-    ProgressingPages {
-        timeout: Duration,
-    },
-    #[cfg(test)]
-    Shared(AcquisitionBudget),
-}
 #[cfg(test)]
 pub(crate) fn client_page_budget_for_test(deadline: Instant) -> AcquisitionBudget {
-    RangeBudget::ClientPages { deadline }
-        .next_page(false)
-        .unwrap()
+    PageBudget::Client { deadline }
+        .next_page(racer_io::Clock::host().now())
         .unwrap()
 }
-impl RangeBudget {
-    fn next_page(&mut self, _pending: bool) -> Result<Option<AcquisitionBudget>> {
-        match self {
-            Self::ProgressingPages { timeout } => Ok(Some(AcquisitionBudget::new(
-                uring_runtime::environment::now() + *timeout,
-                8,
-                16,
-            ))),
-            Self::ClientPages { deadline } => {
-                if uring_runtime::environment::now() >= *deadline {
-                    return Err(Error::DeadlineExceeded);
-                }
-                Ok(Some(AcquisitionBudget::new(*deadline, 8, 16)))
-            }
-            #[cfg(test)]
-            Self::Shared(budget) => {
-                let attempts = budget.remaining_attempts().min(8);
-                let links = budget.remaining_links().min(16);
-                if _pending && (attempts == 0 || links < 4) {
-                    return Ok(None);
-                }
-                budget
-                    .partition(attempts, links)
-                    .map(Some)
-                    .map_err(Into::into)
-            }
-        }
-    }
-    fn complete(&mut self, _remaining: AcquisitionBudget) -> Result<()> {
-        match self {
-            Self::ClientPages { .. } | Self::ProgressingPages { .. } => Ok(()),
-            #[cfg(test)]
-            Self::Shared(budget) => Ok(budget.reunite(_remaining)?),
-        }
-    }
-}
-
-type Fetch = Operation<'static, (Result<PageResult>, AcquisitionBudget)>;
-
-/// A direct fill in sealed mode, which may return ciphertext for the GPU.
-type SealedFetch = Operation<'static, (Result<Fetched>, AcquisitionBudget)>;
 
 /// One page for a direct read: plaintext, or ciphertext the sink verifies.
 pub(crate) enum DirectItem {
@@ -494,61 +490,56 @@ pub(crate) enum DirectItem {
     Sealed(Box<SealedPage>, crate::model::PageSlice),
 }
 
-/// One page of the read window, `slots[i]` is page `next + i`.
-#[allow(clippy::large_enum_variant)] // Avoid allocating again when an in-window page becomes ready.
-enum Slot {
-    /// Looking the page up in local memory on its owning worker.
-    Probing(Operation<'static, Option<PageResult>>),
-    /// Not in memory and not requested. `select` is false once a selection
-    /// covering the page failed; it is then only filled directly.
-    Missing { select: bool },
+/// One outstanding operation of the window, keyed by its [`EffectId`].
+enum Io {
+    /// Looking the page up in local memory (or its held disk copy).
+    Probe(Operation<'static, Option<PageResult>>),
     /// A direct fill through the owning worker.
-    Fetching(Fetch),
-    /// A direct fill in sealed mode.
-    FetchingSealed(SealedFetch),
-    /// Fetched as ciphertext for the GPU to verify.
+    Fetch(Operation<'static, PageResult>),
+    /// A direct fill in sealed mode, which may return ciphertext for the GPU.
+    FetchSealed(Operation<'static, Fetched>),
+    /// A provider selection; its page arrives through the scheduler's fan-out.
+    Select(Operation<'static, PageResult>),
+    /// Reserving this read's spill hold on a page.
+    Hold(PageNumber, Operation<'static, HoldEpoch>),
+    /// Filling a held page, which persists it under the hold.
+    SpillFill(Operation<'static, ()>),
+}
+
+/// A page the window holds under a handle until it is delivered or discarded.
+enum Held {
+    Page(WindowPage),
     Sealed(Box<SealedPage>),
-    /// Covered by an outstanding provider selection.
-    Selecting,
-    /// Fetched, or failed. An error waits here until the page reaches the head.
-    Ready(Result<PageResult>),
 }
 
-/// A page fetched ahead of the in-memory window onto local disk.
-enum Spilling {
-    /// Reserving this read's hold on the page's owning worker.
-    Holding(Operation<'static, HoldEpoch>),
-    /// Filling the held page, which persists it under the hold.
-    Filling(Operation<'static, ()>),
-    /// Published under this read's hold.
-    Spilled,
+/// A validated plaintext page held for in-order delivery. It keeps only the
+/// plaintext the client reads, never the page's ciphertext: a window waiting
+/// on its head would otherwise pin the ciphertext (and the memory cache entry
+/// sharing it) of every ready page behind the head. Windows on one worker can
+/// then fill that worker's ciphertext share between them and wait for one
+/// another's heads until a request deadline frees the pages.
+struct WindowPage {
+    plaintext: VerifiedPage,
 }
 
-/// Read spill state: pages in `[next + window, next + window + limit)` may be
-/// parked on disk under per-page holds until the window reaches them.
-struct Spill {
-    limit: usize,
-    /// Set once a hold is refused; the read then keeps only its memory window.
-    refused: bool,
-    pages: BTreeMap<u64, Spilling>,
-    /// Pages this read holds and the hold epoch each was taken under; each owes
-    /// exactly one release under that epoch.
-    held: BTreeMap<u64, HoldEpoch>,
-}
-
-/// One outstanding provider selection and the window pages it covers.
-struct Pending {
-    operation: Fetch,
-    pages: BTreeSet<u64>,
+impl WindowPage {
+    fn new(result: PageResult) -> Self {
+        Self {
+            plaintext: result.plaintext,
+        }
+    }
 }
 
 /// Open pinned streams on the ingress reactor using the shared worker directory.
 pub struct RangeStreams {
-    directory: Arc<WorkerDirectory>,
+    directory: std::rc::Rc<WorkerDirectory>,
 
     delivery: Rc<Delivery>,
 
     window_pages: usize,
+
+    /// This worker's detached driver queue for stream cleanup and hints.
+    drivers: Rc<crate::drivers::DriverQueue>,
 }
 
 /// The body stays on the ingress reactor, including its delivery pipe leases.
@@ -558,6 +549,9 @@ pub struct RangeStreams {
 /// send::<RangeStream>();
 /// ```
 pub struct RangeStream {
+    /// The opening worker's detached driver queue.
+    drivers: Rc<crate::drivers::DriverQueue>,
+
     /// The cache retains nothing: no peer selections and no spill holds.
     passthrough: bool,
 
@@ -579,46 +573,72 @@ pub struct RangeStream {
 
     scope: RequestScope,
 
-    directory: Arc<WorkerDirectory>,
+    directory: std::rc::Rc<WorkerDirectory>,
 
     delivery: Rc<Delivery>,
 
     window_pages: usize,
 
-    budget: RangeBudget,
+    budget: PageBudget,
 
-    /// Delivery cursor: the next page handed to the client.
-    next: u64,
+    /// Spill pages past the window, 0 when the read does not spill.
+    spill: usize,
 
-    /// One past the last page of the range.
-    end: u64,
+    /// The window machine, built on first use from the settings above.
+    window: Option<win::ReadWindow>,
 
-    slots: VecDeque<Slot>,
+    ids: EffectIds,
 
-    selections: Vec<Pending>,
+    /// Outstanding operations, polled each step.
+    io: Vec<(EffectId, Io)>,
 
-    spill: Option<Spill>,
+    /// Pages fetched, probed or offered, by handle.
+    pages: BTreeMap<EffectId, Held>,
+
+    /// Inputs produced without an operation (an operation that could not start).
+    inputs: VecDeque<win::Input>,
+
+    /// Effects to apply, reused across steps.
+    effects: Vec<win::Effect>,
+
+    /// Pages offered by the scheduler, not yet fed to the window.
+    offered: VecDeque<PageResult>,
+
+    /// Directly filled pages to fan out to other windows at the next exchange.
+    filled: Vec<PageResult>,
+
+    /// Scheduler facts from the latest exchange.
+    facts: win::Facts,
+    /// The cursor and per-slot interest classes the latest exchange published.
+    published: (u64, Vec<u8>),
+
+    /// Spill hold epochs by the window's epoch number.
+    epochs: BTreeMap<win::Epoch, HoldEpoch>,
+
+    next_epoch: win::Epoch,
+
+    /// Failures without a core error, by page: the core sees them as `Internal`.
+    failures: BTreeMap<u64, Error>,
 
     /// Set for direct GPU reads: misses are fetched sealed for this GPU.
     sealed: Option<SealedTarget>,
 
     terminated: bool,
-
-    /// Direct fills restarted after a transient failure, per page.
-    retries: BTreeMap<u64, u8>,
 }
 
 impl RangeStreams {
     /// Bind stream creation to this worker's delivery resources and read window.
     pub fn new(
-        directory: Arc<WorkerDirectory>,
+        directory: std::rc::Rc<WorkerDirectory>,
         delivery: Rc<Delivery>,
         window_pages: usize,
+        drivers: Rc<crate::drivers::DriverQueue>,
     ) -> Self {
         Self {
             directory,
             delivery,
             window_pages,
+            drivers,
         }
     }
 
@@ -628,7 +648,7 @@ impl RangeStreams {
     }
 
     /// Share the same metadata and page owners used by newly opened streams.
-    pub(crate) fn directory(&self) -> &Arc<WorkerDirectory> {
+    pub(crate) fn directory(&self) -> &std::rc::Rc<WorkerDirectory> {
         &self.directory
     }
 
@@ -642,7 +662,7 @@ impl RangeStreams {
         membership: Arc<crate::topology::Membership>,
         scope: RequestScope,
     ) -> Result<RangeStream> {
-        let budget = RangeBudget::ClientPages {
+        let budget = PageBudget::Client {
             deadline: scope.deadline.0,
         };
         scope.check()?;
@@ -656,14 +676,13 @@ impl RangeStreams {
             return Err(Error::InvalidRange);
         }
         Ok(RangeStream {
+            drivers: self.drivers.clone(),
             passthrough: false,
             error: None,
             lease: None,
             credits: None,
             retained: BTreeMap::new(),
             metadata,
-            next: range.first_page().0,
-            end: range.last_page().0 + 1,
             range,
             context,
             membership,
@@ -672,12 +691,22 @@ impl RangeStreams {
             delivery: self.delivery.clone(),
             window_pages: self.window_pages,
             budget,
-            slots: VecDeque::new(),
-            selections: Vec::new(),
-            spill: None,
+            spill: 0,
+            window: None,
+            ids: EffectIds::new(),
+            io: Vec::new(),
+            pages: BTreeMap::new(),
+            inputs: VecDeque::new(),
+            effects: Vec::new(),
+            offered: VecDeque::new(),
+            filled: Vec::new(),
+            facts: win::Facts::default(),
+            published: (0, Vec::new()),
+            epochs: BTreeMap::new(),
+            next_epoch: 0,
+            failures: BTreeMap::new(),
             sealed: None,
             terminated: false,
-            retries: BTreeMap::new(),
         })
     }
 }
@@ -693,6 +722,7 @@ impl RangeStream {
     /// spill would hold pages on disk. Call before the subscription is configured.
     pub(crate) fn set_passthrough(&mut self) {
         self.passthrough = true;
+        self.window = None;
     }
 
     /// Install exact page/byte release credits once, before delivery. The fetch
@@ -702,39 +732,62 @@ impl RangeStream {
         if self.lease.is_some() {
             return Err(Error::InvalidRequest);
         }
-        if !(1..=64).contains(&pages) || !(PAGE_BYTES..=64 * PAGE_BYTES).contains(&bytes) {
+        // Credits cover at least one page of the cluster page size. The ceiling
+        // stays at the largest page size so a client sized for 16 MiB pages is
+        // still accepted; byte credits only bound, never size, a delivery.
+        let size = self.range.page_size().get();
+        if !(1..=64).contains(&pages) || !(size..=64 * PAGE_BYTES).contains(&bytes) {
             return Err(Error::InvalidRequest);
         }
-        let credits = Window::new(pages, bytes, PAGE_BYTES).map_err(window_error)?;
+        let credits = Window::new(pages, bytes, size).map_err(window_error)?;
         let lease = self
             .directory
             .subscriptions
             .open(self.metadata.version.clone())?;
         self.credits = Some(credits);
         self.lease = Some(lease);
+        self.facts.leased = true;
         let limit = self.directory.spill_config().range_spill_pages;
-        self.spill = (limit != 0 && !self.passthrough).then(|| Spill {
-            limit,
-            refused: false,
-            pages: BTreeMap::new(),
-            held: BTreeMap::new(),
-        });
+        self.spill = if self.passthrough { 0 } else { limit };
+        self.window = None;
         Ok(())
     }
 
     /// Fetch pages that are not verified plaintext in memory as sealed pages
     /// for `target`'s GPU. Call before the first delivery.
     pub(crate) fn set_sealed(&mut self, target: SealedTarget) -> Result<()> {
-        if self.terminated || !self.slots.is_empty() {
+        if self.terminated
+            || self
+                .window
+                .as_ref()
+                .is_some_and(|window| window.slots().next().is_some() || window.terminated())
+        {
             return Err(Error::InvalidRequest);
         }
         self.sealed = Some(target);
+        self.window = None;
         Ok(())
+    }
+
+    /// The window machine, built from the stream's settings on first use.
+    fn window(&mut self) -> &mut win::ReadWindow {
+        let config = win::WindowConfig {
+            start: self.range.first_page().0,
+            end: self.range.last_page().0 + 1,
+            window_pages: self.window_pages,
+            sealed: self.sealed.is_some(),
+            passthrough: self.passthrough,
+            spill: self.spill,
+            budget: self.budget,
+        };
+        self.window
+            .get_or_insert_with(|| win::ReadWindow::new(config))
     }
 
     /// Tell a sealed page's owner what the GPU decided.
     pub(crate) fn report_sealed(&self, report: SealedReport, passed: bool) {
-        self.directory.report_sealed(report, passed, &self.scope);
+        self.directory
+            .report_sealed(&self.drivers, report, passed, &self.scope);
     }
 
     /// Release exactly one delivered page and its retained plaintext charge.
@@ -761,427 +814,288 @@ impl RangeStream {
         }
     }
 
-    /// One step of the fetch job: collect completions and offers, then admit
-    /// new probes, direct fills and selections until nothing changes.
+    /// One step of the fetch job: feed completions and offers to the window and
+    /// apply the work it plans until nothing changes, then exchange with the
+    /// node-wide scheduler once (more only while it offers pages).
     fn step(&mut self, cx: &mut Context<'_>) -> Result<()> {
         let scope = self.operation_scope();
         scope.check()?;
+        // Offers that arrived since the last step go first, as they spare
+        // direct fills of their pages.
+        // Facts (pages busy elsewhere, spare flights) are refreshed once per
+        // step so admission sees other windows' current work.
+        self.exchange(cx);
         loop {
-            self.refill(&scope);
-            let mut changed = self.poll_slots(cx)?;
-            changed |= self.take_offered(&scope);
-            changed |= self.poll_selections(cx)?;
-            changed |= self.admit(&scope)?;
-            changed |= self.poll_spill(cx);
-            changed |= self.admit_spill(&scope);
-            if !changed {
-                break;
+            loop {
+                let mut changed = self.poll_io(cx, &scope);
+                changed |= self.feed_offered(&scope);
+                changed |= self.pump(&scope);
+                if !changed {
+                    break;
+                }
             }
-        }
-        self.sync(cx);
-        Ok(())
-    }
-
-    /// Keep the window full: each page entering it takes its exact client
-    /// credit, then probes memory. Window pages plus delivered, unreleased pages
-    /// never exceed the client's credits, so fetching ahead pins no more
-    /// plaintext than the client may hold.
-    fn refill(&mut self, scope: &RequestScope) {
-        while self.slots.len() < self.window_pages && self.page_at(self.slots.len()) < self.end {
-            let number = PageNumber(self.page_at(self.slots.len()));
-            if !self.reserve(number) {
-                break;
+            // Exchange again only when other windows would see a difference.
+            if self.filled.is_empty() && !self.interest_changed() {
+                return Ok(());
             }
-            let page = PageId {
-                version: self.metadata.version.clone(),
-                number,
-            };
-            let directory = self.directory.clone();
-            let scope = scope.clone();
-            let sealed = self.sealed.is_some();
-            let spilled = self
-                .spill
-                .as_mut()
-                .and_then(|spill| spill.pages.remove(&number.0));
-            self.slots.push_back(Slot::Probing(match spilled {
-                // A sealed read probes live plaintext only. Cached or disk
-                // ciphertext is then fetched sealed, so the GPU rather than
-                // the CPU decrypts it.
-                None if sealed => {
-                    Box::pin(async move { directory.cached_page(page, &scope).await })
-                }
-                // Holding pages stay with the spill state until the hold
-                // completes, so the hold is released exactly once.
-                None => Box::pin(async move { directory.local_page(page, &scope).await }),
-                Some(Spilling::Holding(holding)) => {
-                    self.spill
-                        .as_mut()
-                        .unwrap()
-                        .pages
-                        .insert(number.0, Spilling::Holding(holding));
-                    if sealed {
-                        Box::pin(async move { directory.cached_page(page, &scope).await })
-                    } else {
-                        Box::pin(async move { directory.local_page(page, &scope).await })
-                    }
-                }
-                // A sealed read probes memory only: a spilled page on disk is
-                // then fetched sealed, so the GPU decrypts it.
-                Some(Spilling::Spilled) if sealed => {
-                    Box::pin(async move { directory.cached_page(page, &scope).await })
-                }
-                Some(Spilling::Filling(warming)) if sealed => Box::pin(async move {
-                    let _ = warming.await;
-                    directory.cached_page(page, &scope).await
-                }),
-                // A spilled page is read back from memory or its held disk copy.
-                // If that fails the page is fetched normally.
-                Some(Spilling::Spilled) => {
-                    Box::pin(async move { directory.held_page(page, &scope).await.map(Some) })
-                }
-                Some(Spilling::Filling(warming)) => Box::pin(async move {
-                    warming.await?;
-                    directory.held_page(page, &scope).await.map(Some)
-                }),
-            }));
+            if !self.exchange(cx) {
+                return Ok(());
+            }
         }
     }
 
-    /// Reserve the client credit of one window page, if it fits.
-    fn reserve(&mut self, number: PageNumber) -> bool {
-        let Some(length) = self
-            .range
-            .slice_at(number)
-            .ok()
-            .flatten()
-            .map(|slice| u64::from(slice.length))
-        else {
+    /// Whether the window's per-slot interest differs from what the latest
+    /// exchange published.
+    fn interest_changed(&mut self) -> bool {
+        let Some(window) = self.window.as_ref() else {
             return false;
         };
-        self.credits.as_mut().is_some_and(|credits| {
-            credits.can_reserve(length) && credits.reserve(number, length).is_ok()
-        })
-    }
-
-    /// Place a page in the window with its credit, as `refill` would.
-    #[cfg(test)]
-    fn inject(&mut self, slot: Slot) {
-        assert!(self.reserve(PageNumber(self.page_at(self.slots.len()))));
-        self.slots.push_back(slot);
-    }
-
-    fn page_at(&self, index: usize) -> u64 {
-        self.next + index as u64
-    }
-
-    fn slot_mut(&mut self, number: u64) -> Option<&mut Slot> {
-        let index = usize::try_from(number.checked_sub(self.next)?).ok()?;
-        self.slots.get_mut(index)
-    }
-
-    /// The slot for a finished direct fill. A fill that failed only because
-    /// owners and helpers were busy (`Overloaded`) or its attempts ran out
-    /// (`Unavailable`) is fetched again with a fresh page budget, up to
-    /// [`PAGE_RETRIES`] times per page, rather than ending the whole read.
-    /// Under heavy fan-in these failures are transient: the page's owners
-    /// shed readers to helpers, and a later attempt usually succeeds.
-    fn retry_or(&mut self, number: PageNumber, result: Result<PageResult>) -> Slot {
-        match result {
-            Err(Error::Overloaded | Error::Unavailable)
-                if self.per_page_budget()
-                    && self.scope.check().is_ok()
-                    && self.retry_page(number) =>
-            {
-                Slot::Missing { select: false }
-            }
-            result => Slot::Ready(result),
+        let classes = window.slots().map(interest_class);
+        if window.cursor() != self.published.0
+            || window.slots().len() != self.published.1.len()
+            || !classes.eq(self.published.1.iter().copied())
+        {
+            return true;
         }
+        false
     }
 
-    /// Whether every page fill gets its own fresh budget, so a restart does
-    /// not spend credits other pages need.
-    fn per_page_budget(&self) -> bool {
-        matches!(
-            self.budget,
-            RangeBudget::ClientPages { .. } | RangeBudget::ProgressingPages { .. }
-        )
-    }
-
-    /// Count one restart of `number`'s fill; false once its retries are spent.
-    fn retry_page(&mut self, number: PageNumber) -> bool {
-        // Pages behind the delivery cursor never come back.
-        let next = self.next;
-        self.retries.retain(|page, _| *page >= next);
-        let count = self.retries.entry(number.0).or_insert(0);
-        if *count >= PAGE_RETRIES {
-            return false;
-        }
-        *count += 1;
-        true
-    }
-
-    fn poll_slots(&mut self, cx: &mut Context<'_>) -> Result<bool> {
-        let mut changed = false;
-        for index in 0..self.slots.len() {
-            let number = PageNumber(self.page_at(index));
-            let next = match &mut self.slots[index] {
-                Slot::Probing(probe) => match probe.as_mut().poll(cx) {
-                    Poll::Pending => continue,
-                    Poll::Ready(Ok(Some(page))) => {
-                        if self.validate(&page, number).is_ok() {
-                            Slot::Ready(Ok(page))
-                        } else {
-                            Slot::Missing { select: true }
-                        }
-                    }
-                    // A miss or a failed probe is fetched normally. Stream
-                    // cancellation and deadlines are checked by `step` itself.
-                    Poll::Ready(_) => Slot::Missing { select: true },
-                },
-                Slot::Fetching(fetch) => match fetch.as_mut().poll(cx) {
-                    Poll::Pending => continue,
-                    Poll::Ready(Ok((result, remaining))) => {
-                        if let (Ok(page), Some(lease)) = (&result, &self.lease) {
-                            lease.offer(page);
-                        }
-                        let result = self.budget.complete(remaining).and(result);
-                        self.retry_or(number, result)
-                    }
-                    Poll::Ready(Err(error)) => self.retry_or(number, Err(error)),
-                },
-                Slot::FetchingSealed(fetch) => match fetch.as_mut().poll(cx) {
-                    Poll::Pending => continue,
-                    Poll::Ready(Ok((result, remaining))) => {
-                        let completed = self.budget.complete(remaining);
-                        match result {
-                            Ok(Fetched::Page(page)) => {
-                                if let Some(lease) = &self.lease {
-                                    lease.offer(&page);
-                                }
-                                Slot::Ready(completed.map(|()| page))
-                            }
-                            Ok(Fetched::Sealed(sealed)) => match completed
-                                .and_then(|()| self.validate_sealed(&sealed, number))
-                            {
-                                Ok(()) => Slot::Sealed(sealed),
-                                Err(error) => Slot::Ready(Err(error)),
-                            },
-                            Err(error) => Slot::Ready(completed.and(Err(error))),
-                        }
-                    }
-                    Poll::Ready(Err(error)) => Slot::Ready(Err(error)),
-                },
-                _ => continue,
-            };
-            self.slots[index] = next;
-            changed = true;
-        }
-        Ok(changed)
-    }
-
-    /// Accept pages that any selection of this version offered to this window.
-    fn take_offered(&mut self, scope: &RequestScope) -> bool {
+    /// Publish this window's interest and fan out its filled pages, take the
+    /// pages other selections offered it and refresh the scheduler facts, under
+    /// one scheduler lock. True when pages were offered.
+    fn exchange(&mut self, cx: &Context<'_>) -> bool {
         let Some(lease) = self.lease.as_ref() else {
             return false;
         };
-        let mut changed = false;
-        for page in lease.take_offered() {
-            let number = page.plaintext.page().number;
-            if self.validate(&page, number).is_err() {
-                continue;
-            }
-            let Some(slot) = self.slot_mut(number.0) else {
-                continue;
-            };
-            if !matches!(
-                slot,
-                Slot::Probing(_) | Slot::Missing { .. } | Slot::Selecting
-            ) {
-                continue;
-            }
-            *slot = Slot::Ready(Ok(page.clone()));
-            // Selected pages are accepted unobserved on their owner; record
-            // this reader's interest once it takes the page.
-            self.directory.observe_verified(page, scope);
-            changed = true;
+        if let Some(window) = self.window.as_ref() {
+            self.published.0 = window.cursor();
+            self.published.1.clear();
+            self.published.1.extend(window.slots().map(interest_class));
         }
+        lease.exchange(
+            self.window.as_ref(),
+            &mut self.filled,
+            &self.metadata.version,
+            cx.waker(),
+            &mut self.offered,
+            &mut self.facts,
+        );
+        !self.offered.is_empty()
+    }
+
+    /// Plan new work: refill the window within client credits, then direct
+    /// fills, selections and spill holds.
+    fn pump(&mut self, scope: &RequestScope) -> bool {
+        let now = self.scope.clock().now();
+        self.window();
+        let Some(window) = self.window.as_mut() else {
+            return false;
+        };
+        let range = self.range;
+        let credits = &mut self.credits;
+        let mut effects = std::mem::take(&mut self.effects);
+        window.pump(
+            now,
+            &self.facts,
+            |number| reserve(&range, credits, PageNumber(number)),
+            &mut self.ids,
+            &mut effects,
+        );
+        let changed = !effects.is_empty();
+        self.apply(&mut effects, scope);
+        self.effects = effects;
         changed
     }
 
-    fn poll_selections(&mut self, cx: &mut Context<'_>) -> Result<bool> {
-        let mut changed = false;
-        let mut index = 0;
-        while index < self.selections.len() {
-            let Poll::Ready(completion) = self.selections[index].operation.as_mut().poll(cx) else {
-                index += 1;
-                continue;
-            };
-            let pending = self.selections.swap_remove(index);
-            let result = match completion {
-                Ok((result, remaining)) => {
-                    self.budget.complete(remaining)?;
-                    result
+    /// Feed one input to the window and apply what it emits.
+    fn feed(&mut self, input: win::Input, scope: &RequestScope) {
+        let live = self.scope.check().is_ok();
+        self.window();
+        let Some(window) = self.window.as_mut() else {
+            return;
+        };
+        let mut effects = std::mem::take(&mut self.effects);
+        if window.on(input, live, &mut self.ids, &mut effects).is_err() {
+            // A completion the window no longer waits for: drop its page.
+            if let win::Input::Probed { id, .. } | win::Input::Fetched { id, .. } = input {
+                self.pages.remove(&id);
+            }
+        }
+        self.apply(&mut effects, scope);
+        self.effects = effects;
+    }
+
+    /// Start or perform each effect the window emitted.
+    fn apply(&mut self, effects: &mut Vec<win::Effect>, scope: &RequestScope) {
+        for effect in effects.drain(..) {
+            match effect {
+                win::Effect::Probe { id, page, from } => {
+                    let probe = self.start_probe(PageNumber(page), from, scope);
+                    self.io.push((id, Io::Probe(probe)));
                 }
-                Err(error) => Err(error),
-            };
-            // The selected page was already offered. Pages the provider did not
-            // send may be selected again; after a failure, including the
-            // selection's own deadline, they are only filled directly. The
-            // stream's cancellation and deadline are checked by `step`.
-            let select = result.is_ok();
-            for number in pending.pages {
-                if let Some(slot) = self.slot_mut(number)
-                    && matches!(slot, Slot::Selecting)
-                {
-                    *slot = Slot::Missing { select };
+                win::Effect::Fetch {
+                    id,
+                    page,
+                    budget,
+                    sealed: _,
+                    retry,
+                } => self.start_fetch(id, PageNumber(page), budget.build(), retry, scope),
+                win::Effect::Select {
+                    id,
+                    intervals,
+                    pages: _,
+                    budget,
+                } => self.start_selection(id, intervals, budget.build(), scope),
+                win::Effect::Hold { id, page, hold } => self.start_hold(id, page, hold, scope),
+                win::Effect::SpillFill { id, page } => {
+                    let fill = self.start_spill_fill(PageNumber(page));
+                    self.io.push((id, Io::SpillFill(fill)));
+                }
+                win::Effect::Release(pages) => {
+                    let pages = pages
+                        .into_iter()
+                        .filter_map(|(number, epoch)| {
+                            Some((PageNumber(number), self.epochs.remove(&epoch)?))
+                        })
+                        .collect::<Vec<_>>();
+                    if !pages.is_empty() {
+                        self.directory.release_read_pages(
+                            &self.drivers,
+                            &self.metadata.version,
+                            pages,
+                            self.scope.request,
+                        );
+                    }
+                }
+                win::Effect::Discard(handle) => {
+                    self.pages.remove(&handle);
                 }
             }
-            changed = true;
         }
-        Ok(changed)
     }
 
-    fn pending(&self) -> bool {
-        !self.selections.is_empty()
-            || self
-                .slots
-                .iter()
-                .any(|slot| matches!(slot, Slot::Fetching(_) | Slot::FetchingSealed(_)))
-    }
-
-    /// Start a direct fill for the head page, up to `direct_ahead` more holes,
-    /// and provider selections for the remaining holes.
-    fn admit(&mut self, scope: &RequestScope) -> Result<bool> {
-        // A failed page stops admission at and after it until it reaches the
-        // client. Pages before it are still filled, or the stream could never
-        // deliver them and so never surface the error.
-        let kinds = self.kinds();
-        let failed = read::first_failure(&kinds);
-        // Pages another window is selecting or filling arrive through its
-        // fan-out. Only the head is always filled directly, so it never waits
-        // on another window; a concurrent fill of the same page joins the
-        // owner's flight instead of transferring it again.
-        let elsewhere = self
-            .lease
+    /// Whether `number` is past the window's head: its plaintext would wait
+    /// behind the head for delivery (see [`RequestScope::ahead`]).
+    fn ahead(&self, number: PageNumber) -> bool {
+        self.window
             .as_ref()
-            .map(WindowLease::busy_elsewhere)
-            .unwrap_or_default();
-        let plan = read::direct_fills(&kinds, self.direct_ahead(), |index| {
-            elsewhere.contains(&self.page_at(index))
-        });
-        let mut changed = false;
-        for index in plan {
-            if !self.start_fetch(index, scope)? {
-                return Ok(changed);
-            }
-            changed = true;
-        }
-        // Earlier holes behind a failure are filled directly: each becomes the
-        // head in turn, so no new selection is needed to reach the error.
-        while failed.is_none() && self.may_select() && self.start_selection(scope)? {
-            changed = true;
-        }
-        Ok(changed)
+            .is_some_and(|window| number.0 > window.cursor())
     }
 
-    /// Direct fills to keep in flight beyond the head page. Provider selections
-    /// deliver verified plaintext, so a sealed read fills its whole window
-    /// directly. Its direct fills stage disk pages with cuFile and keep
-    /// ciphertext for the GPU to decrypt. A passthrough read never selects,
-    /// so it also fills its whole window directly to keep origin reads
-    /// parallel. The range budget still bounds the fills in flight.
-    fn direct_ahead(&self) -> usize {
-        if self.sealed.is_some() || self.passthrough {
-            self.window_pages.saturating_sub(1).max(DIRECT_AHEAD)
-        } else {
-            DIRECT_AHEAD
-        }
-    }
-
-    /// Returns false when the range budget admits no more work for now.
-    fn start_fetch(&mut self, index: usize, scope: &RequestScope) -> Result<bool> {
-        let Some(child) = self.budget.next_page(self.pending())? else {
-            return Ok(false);
-        };
-        let mut child_scope = scope.clone();
-        child_scope.deadline.0 = child.deadline();
-        let page = PageId {
+    fn page_id(&self, number: PageNumber) -> PageId {
+        PageId {
             version: self.metadata.version.clone(),
-            number: PageNumber(self.page_at(index)),
-        };
-        let fetch = match &self.sealed {
-            Some(target) => self
-                .directory
-                .start_page_sealed(
-                    page,
-                    self.membership.clone(),
-                    &self.context,
-                    &child_scope,
-                    child,
-                    target.clone(),
-                )
-                .map(Slot::FetchingSealed),
-            None => self
-                .directory
-                .start_page(
-                    page,
-                    self.membership.clone(),
-                    &self.context,
-                    &child_scope,
-                    child,
-                )
-                .map(Slot::Fetching),
-        };
-        self.slots[index] = fetch.unwrap_or_else(|error| Slot::Ready(Err(error)));
-        Ok(true)
-    }
-
-    /// Whether the read may start another selection: its first always, more
-    /// only while a contract of the version has an unused granted flight.
-    fn may_select(&self) -> bool {
-        read::may_select(
-            self.selections.len(),
-            self.directory.subscriptions.spare(&self.metadata.version),
-        )
-    }
-
-    /// Scheduling state of each window slot, for the core range planner.
-    fn kinds(&self) -> Vec<SlotKind> {
-        self.slots
-            .iter()
-            .map(|slot| match slot {
-                Slot::Probing(_) => SlotKind::Probing,
-                Slot::Missing { select } => SlotKind::Missing { select: *select },
-                Slot::Fetching(_) | Slot::FetchingSealed(_) => SlotKind::Fetching,
-                Slot::Selecting => SlotKind::Selecting,
-                Slot::Ready(Err(_)) => SlotKind::Failed,
-                Slot::Ready(Ok(_)) | Slot::Sealed(_) => SlotKind::Ready,
-            })
-            .collect()
-    }
-
-    /// The demand and pages of the next selection, if any. Pages that another
-    /// window of this version is selecting are left to that selection's
-    /// fan-out.
-    fn plan_selection(&self) -> Result<Option<(racer_core::subscriptions::Demand, BTreeSet<u64>)>> {
-        if self.passthrough {
-            return Ok(None);
+            number,
         }
-        let Some(lease) = self.lease.as_ref() else {
-            return Ok(None);
-        };
-        self.selection_demand(&lease.busy_elsewhere(), self.share())
     }
 
-    /// Select the next share of the remaining holes from a peer provider. Pages that another
-    /// window of this version is selecting are left to that selection's
-    /// fan-out.
-    fn start_selection(&mut self, scope: &RequestScope) -> Result<bool> {
-        let Some((demand, pages)) = self.plan_selection()? else {
-            return Ok(false);
+    /// Probe a page entering the window. A sealed read probes live plaintext
+    /// only: cached or disk ciphertext is then fetched sealed, so the GPU
+    /// rather than the CPU decrypts it. A spilled page is read back from
+    /// memory or its held disk copy, after its spill fill when one is running;
+    /// if that fails the page is fetched normally.
+    fn start_probe(
+        &mut self,
+        number: PageNumber,
+        from: win::ProbeFrom,
+        scope: &RequestScope,
+    ) -> Operation<'static, Option<PageResult>> {
+        let page = self.page_id(number);
+        let directory = self.directory.clone();
+        let mut scope = scope.clone();
+        scope.ahead = self.ahead(number);
+        match from {
+            win::ProbeFrom::Memory if self.sealed.is_some() => {
+                Box::pin(async move { directory.cached_page(page, &scope).await })
+            }
+            win::ProbeFrom::Memory => {
+                Box::pin(async move { directory.local_page(page, &scope).await })
+            }
+            win::ProbeFrom::Held { after } => {
+                let warming = after.and_then(|fill| {
+                    let index = self.io.iter().position(|(id, _)| *id == fill)?;
+                    let (_, Io::SpillFill(warming)) = self.io.swap_remove(index) else {
+                        unreachable!("a spill fill id names a spill fill");
+                    };
+                    // The window ignores the moved fill's completion; settle it now.
+                    self.inputs
+                        .push_back(win::Input::SpillFilled { id: fill, ok: true });
+                    Some(warming)
+                });
+                Box::pin(async move {
+                    if let Some(warming) = warming {
+                        warming.await?;
+                    }
+                    directory.held_page(page, &scope).await.map(Some)
+                })
+            }
+        }
+    }
+
+    fn start_fetch(
+        &mut self,
+        id: EffectId,
+        number: PageNumber,
+        budget: AcquisitionBudget,
+        retry: u8,
+        scope: &RequestScope,
+    ) {
+        let mut child_scope = scope.clone();
+        child_scope.deadline.0 = budget.deadline();
+        child_scope.ahead = self.ahead(number);
+        let reactor = self.delivery.reactor().clone();
+        let page = self.page_id(number);
+        let io = match &self.sealed {
+            Some(target) => Io::FetchSealed(with_backoff(
+                reactor,
+                scope.clone(),
+                retry,
+                self.directory.start_page_sealed(
+                    page,
+                    self.membership.clone(),
+                    &self.context,
+                    &child_scope,
+                    budget,
+                    target.clone(),
+                ),
+            )),
+            None => Io::Fetch(with_backoff(
+                reactor,
+                scope.clone(),
+                retry,
+                self.directory.start_page(
+                    page,
+                    self.membership.clone(),
+                    &self.context,
+                    &child_scope,
+                    budget,
+                ),
+            )),
         };
-        let Some(child) = self.budget.next_page(self.pending())? else {
-            return Ok(false);
+        self.io.push((id, io));
+    }
+
+    /// Select pages from a peer provider. A selection that cannot start leaves
+    /// its pages to direct fills; the stream's own cancellation is fatal.
+    fn start_selection(
+        &mut self,
+        id: EffectId,
+        intervals: Vec<std::ops::Range<u64>>,
+        budget: AcquisitionBudget,
+        scope: &RequestScope,
+    ) {
+        use flow_control::subscriptions::Interval;
+        let intervals = intervals
+            .into_iter()
+            .map(|r| Interval {
+                start: r.start,
+                end: r.end,
+            })
+            .collect();
+        let Some(demand) = racer_core::subscriptions::Demand::new(intervals) else {
+            self.inputs
+                .push_back(win::Input::Cancel(read::Error::InvalidRequest));
+            return;
         };
         let selection = Selection {
             scheduler: self.directory.subscriptions.clone(),
@@ -1190,215 +1104,57 @@ impl RangeStream {
             contract: Mutex::new(None),
         };
         let mut child_scope = scope.clone();
-        child_scope.deadline.0 = child.deadline();
-        let operation = match self.directory.start_selection(
+        child_scope.deadline.0 = budget.deadline();
+        match self.directory.start_selection(
             self.metadata.version.clone(),
             selection,
             self.membership.clone(),
             &self.context,
             &child_scope,
-            child,
+            budget,
         ) {
-            Ok(operation) => operation,
-            Err(error @ (Error::Cancelled | Error::DeadlineExceeded)) => return Err(error),
-            // A selection that cannot start leaves its pages to direct fills.
-            Err(_) => {
-                for number in &pages {
-                    if let Some(slot) = self.slot_mut(*number) {
-                        *slot = Slot::Missing { select: false };
-                    }
-                }
-                return Ok(true);
+            Ok(operation) => self.io.push((id, Io::Select(operation))),
+            Err(error @ (Error::Canceled | Error::DeadlineExceeded)) => {
+                let error = read::Error::try_from(error).unwrap_or(read::Error::Canceled);
+                self.inputs.push_back(win::Input::Cancel(error));
             }
-        };
-        for number in &pages {
-            if let Some(slot) = self.slot_mut(*number) {
-                *slot = Slot::Selecting;
-            }
+            Err(_) => self.inputs.push_back(win::Input::Selected {
+                id,
+                ok: false,
+                started: false,
+            }),
         }
-        self.selections.push(Pending { operation, pages });
-        Ok(true)
     }
 
-    /// Pages the next selection may demand: an even share of the selectable
-    /// holes over the selections the read can start now (its free selection
-    /// slots, bounded by the version's spare granted flights), so concurrent
-    /// selections cover disjoint parts of the window. A single-flight read
-    /// demands every selectable hole, as one selection lets the provider choose.
-    fn share(&self) -> usize {
-        let holes = self
-            .slots
-            .iter()
-            .filter(|slot| matches!(slot, Slot::Missing { select: true }))
-            .count();
-        let spare = self.directory.subscriptions.spare(&self.metadata.version);
-        read::share(holes, self.selections.len(), spare)
-    }
-
-    /// Up to `limit` selectable holes of the window, excluding pages that
-    /// another window is selecting or filling, as a canonical demand of at
-    /// most the wire interval limit.
-    fn selection_demand(
-        &self,
-        elsewhere: &BTreeSet<u64>,
-        limit: usize,
-    ) -> Result<Option<(racer_core::subscriptions::Demand, BTreeSet<u64>)>> {
-        use flow_control::subscriptions::Interval;
-        use racer_core::subscriptions::{Demand, MAX_DEMAND_INTERVALS};
-        let Some((intervals, pages)) = read::selection_demand(
-            &self.kinds(),
-            self.next,
-            |number| elsewhere.contains(&number),
-            limit,
-            MAX_DEMAND_INTERVALS,
-        ) else {
-            return Ok(None);
-        };
-        let intervals = intervals
-            .into_iter()
-            .map(|r| Interval {
-                start: r.start,
-                end: r.end,
-            })
-            .collect();
-        Ok(Some((
-            Demand::new(intervals).ok_or(Error::InvalidRequest)?,
-            pages,
-        )))
-    }
-
-    /// Publish this window's wanted and in-flight pages for fan-out.
-    fn sync(&self, cx: &Context<'_>) {
-        let Some(lease) = self.lease.as_ref() else {
+    /// Reserve this read's spill hold on a page past the window, for at most
+    /// `hold` and never past the read's own deadline.
+    fn start_hold(&mut self, id: EffectId, number: u64, hold: Duration, scope: &RequestScope) {
+        let remaining = scope
+            .deadline
+            .0
+            .saturating_duration_since(scope.clock().now());
+        let Some(until) = scope.clock().wall_now().checked_add(hold.min(remaining)) else {
+            self.inputs.push_back(win::Input::Held {
+                id,
+                result: Err(read::Error::InvalidRequest),
+            });
             return;
         };
-        let mut wants = BTreeSet::new();
-        let mut busy = BTreeSet::new();
-        for (index, slot) in self.slots.iter().enumerate() {
-            let number = self.page_at(index);
-            match slot {
-                Slot::Selecting => {
-                    wants.insert(number);
-                    busy.insert(number);
-                }
-                Slot::Fetching(_) | Slot::FetchingSealed(_) => {
-                    busy.insert(number);
-                }
-                Slot::Probing(_) | Slot::Missing { .. } => {
-                    wants.insert(number);
-                }
-                _ => {}
-            }
-        }
-        lease.sync(wants, busy, cx.waker());
-    }
-
-    /// Return every spill hold this read still owns.
-    fn release_spill(&mut self) {
-        let Some(spill) = self.spill.take() else {
-            return;
-        };
-        // A pending hold may still be applied; its completion fence says so.
-        for (number, state) in spill.pages {
-            let Spilling::Holding(holding) = state else {
-                continue;
-            };
-            let Ok(permit) = uring_runtime::drivers::reserve() else {
-                continue;
-            };
-            let directory = self.directory.clone();
-            let version = self.metadata.version.clone();
-            let request = self.scope.request;
-            permit.submit_detached(Box::pin(async move {
-                if let Ok(epoch) = holding.await {
-                    directory.release_read_pages(&version, [(PageNumber(number), epoch)], request);
-                }
-                Ok::<(), Error>(())
-            }));
-        }
-        if !spill.held.is_empty() {
-            self.directory.release_read_pages(
-                &self.metadata.version,
-                spill
-                    .held
-                    .into_iter()
-                    .map(|(number, epoch)| (PageNumber(number), epoch)),
-                self.scope.request,
-            );
-        }
-    }
-
-    fn poll_spill(&mut self, cx: &mut Context<'_>) -> bool {
-        let horizon = self.page_at(self.slots.len());
-        let Some(spill) = self.spill.as_mut() else {
-            return false;
-        };
-        let mut changed = false;
-        let mut release = Vec::new();
-        let mut fill = Vec::new();
-        spill.pages.retain(|number, state| {
-            match state {
-                Spilling::Holding(op) => {
-                    let Poll::Ready(result) = op.as_mut().poll(cx) else {
-                        return true;
-                    };
-                    changed = true;
-                    let Ok(epoch) = result else {
-                        // Hold limits, a missing key or no disk: keep the memory window.
-                        spill.refused = true;
-                        return false;
-                    };
-                    // The window reached the page while its hold was pending.
-                    if *number < horizon {
-                        release.push((PageNumber(*number), epoch));
-                        return false;
-                    }
-                    spill.held.insert(*number, epoch);
-                    fill.push(*number);
-                    true
-                }
-                Spilling::Filling(op) => {
-                    let Poll::Ready(result) = op.as_mut().poll(cx) else {
-                        return true;
-                    };
-                    changed = true;
-                    if result.is_ok() {
-                        *state = Spilling::Spilled;
-                        return true;
-                    }
-                    if let Some(epoch) = spill.held.remove(number) {
-                        release.push((PageNumber(*number), epoch));
-                    }
-                    // A failed spill fill (origin refusal, version change, no
-                    // disk) would likely fail again, and each retry takes a
-                    // fresh fill budget. Stop spilling: the page is fetched
-                    // through the window like any other.
-                    spill.refused = true;
-                    false
-                }
-                Spilling::Spilled => true,
-            }
-        });
-        for number in fill {
-            let operation = self.start_spill_fill(PageNumber(number));
-            if let Some(spill) = self.spill.as_mut() {
-                spill.pages.insert(number, Spilling::Filling(operation));
-            }
-        }
-        if !release.is_empty() {
-            self.directory
-                .release_read_pages(&self.metadata.version, release, self.scope.request);
-        }
-        changed
+        let directory = self.directory.clone();
+        let page = self.page_id(PageNumber(number));
+        let scope = scope.clone();
+        self.io.push((
+            id,
+            Io::Hold(
+                PageNumber(number),
+                Box::pin(async move { directory.hold_read_page(&page, until, &scope).await }),
+            ),
+        ));
     }
 
     fn start_spill_fill(&self, number: PageNumber) -> Operation<'static, ()> {
-        let page = PageId {
-            version: self.metadata.version.clone(),
-            number,
-        };
         match self.directory.start_spill_page(
-            page,
+            self.page_id(number),
             self.metadata.immutable(),
             self.membership.clone(),
             &self.context,
@@ -1409,52 +1165,190 @@ impl RangeStream {
         }
     }
 
-    /// Start holds for pages past the window.
-    fn admit_spill(&mut self, scope: &RequestScope) -> bool {
-        let start = self.page_at(self.slots.len());
-        let Some(spill) = self.spill.as_mut() else {
-            return false;
-        };
-        if spill.refused {
-            return false;
-        }
-        let remaining = scope
-            .deadline
-            .0
-            .saturating_duration_since(uring_runtime::environment::now());
-        let Some(until) =
-            uring_runtime::environment::wall_now().checked_add(SPILL_HOLD.min(remaining))
-        else {
-            return false;
-        };
-        let mut active = spill
-            .pages
-            .values()
-            .filter(|state| !matches!(state, Spilling::Spilled))
-            .count();
-        let end = start.saturating_add(spill.limit as u64).min(self.end);
+    /// The core error for a page failure. Errors without a core counterpart
+    /// reach the window as `Internal` and are restored when the page fails the
+    /// read.
+    fn core_error(&mut self, number: u64, error: Error) -> read::Error {
+        read::Error::try_from(error).unwrap_or_else(|error| {
+            self.failures.insert(number, error);
+            read::Error::Internal
+        })
+    }
+
+    /// Poll every outstanding operation once and feed what finished. True when
+    /// the window received any input.
+    fn poll_io(&mut self, cx: &mut Context<'_>, scope: &RequestScope) -> bool {
         let mut changed = false;
-        for number in start..end {
-            if active >= SPILL_FILLS {
-                break;
+        while let Some(input) = self.inputs.pop_front() {
+            self.feed(input, scope);
+            changed = true;
+        }
+        let mut index = 0;
+        while index < self.io.len() {
+            let (id, operation) = &mut self.io[index];
+            let id = *id;
+            let input = match operation {
+                Io::Probe(probe) => match probe.as_mut().poll(cx) {
+                    Poll::Pending => None,
+                    Poll::Ready(result) => {
+                        let number = self.number_of(id);
+                        // A miss or a failed probe is fetched normally. Stream
+                        // cancellation and deadlines are checked by `step`.
+                        let found = match (result, number) {
+                            (Ok(Some(page)), Some(number))
+                                if self.validate(&page, number).is_ok() =>
+                            {
+                                self.pages.insert(id, Held::Page(WindowPage::new(page)));
+                                true
+                            }
+                            _ => false,
+                        };
+                        Some(win::Input::Probed { id, found })
+                    }
+                },
+                Io::Fetch(fetch) => match fetch.as_mut().poll(cx) {
+                    Poll::Pending => None,
+                    Poll::Ready(result) => Some(self.fetched(id, result.map(Fetched::Page))),
+                },
+                Io::FetchSealed(fetch) => match fetch.as_mut().poll(cx) {
+                    Poll::Pending => None,
+                    Poll::Ready(result) => Some(self.fetched(id, result)),
+                },
+                Io::Select(select) => match select.as_mut().poll(cx) {
+                    // The selected page was already offered. Pages the provider
+                    // did not send may be selected again; after a failure,
+                    // including the selection's own deadline, they are only
+                    // filled directly. The stream's cancellation and deadline
+                    // are checked by `step`.
+                    Poll::Pending => None,
+                    Poll::Ready(result) => Some(win::Input::Selected {
+                        id,
+                        ok: result.is_ok(),
+                        started: true,
+                    }),
+                },
+                Io::Hold(number, hold) => match hold.as_mut().poll(cx) {
+                    Poll::Pending => None,
+                    Poll::Ready(result) => {
+                        let _ = number;
+                        Some(win::Input::Held {
+                            id,
+                            result: result
+                                .map(|epoch| {
+                                    self.next_epoch += 1;
+                                    self.epochs.insert(self.next_epoch, epoch);
+                                    self.next_epoch
+                                })
+                                .map_err(|_| read::Error::Unavailable),
+                        })
+                    }
+                },
+                Io::SpillFill(fill) => match fill.as_mut().poll(cx) {
+                    Poll::Pending => None,
+                    Poll::Ready(result) => Some(win::Input::SpillFilled {
+                        id,
+                        ok: result.is_ok(),
+                    }),
+                },
+            };
+            let Some(input) = input else {
+                index += 1;
+                continue;
+            };
+            self.io.swap_remove(index);
+            self.feed(input, scope);
+            changed = true;
+        }
+        changed
+    }
+
+    /// The input for a finished direct fill. A filled plaintext page also goes
+    /// to other windows of the version; a sealed page is checked against the
+    /// pin now.
+    fn fetched(&mut self, id: EffectId, result: Result<Fetched>) -> win::Input {
+        let number = self.number_of(id);
+        let result = match result {
+            Ok(Fetched::Page(page)) => {
+                // Validate now: the held page keeps no ciphertext to check later.
+                let checked = number
+                    .ok_or(Error::StaleFlight)
+                    .and_then(|number| self.validate(&page, number));
+                match checked {
+                    Ok(()) => {
+                        if self.lease.is_some() {
+                            self.filled.push(page.clone());
+                        }
+                        self.pages.insert(id, Held::Page(WindowPage::new(page)));
+                        Ok(win::Fetched::Page)
+                    }
+                    Err(error) => Err(error),
+                }
             }
-            if spill.pages.contains_key(&number) {
+            Ok(Fetched::Sealed(sealed)) => {
+                let checked = number
+                    .ok_or(Error::StaleFlight)
+                    .and_then(|number| self.validate_sealed(&sealed, number));
+                match checked {
+                    Ok(()) => {
+                        self.pages.insert(id, Held::Sealed(sealed));
+                        Ok(win::Fetched::Sealed)
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            Err(error) => Err(error),
+        };
+        win::Input::Fetched {
+            id,
+            result: result.map_err(|error| {
+                let page = number.map_or(u64::MAX, |number| number.0);
+                self.core_error(page, error)
+            }),
+        }
+    }
+
+    /// The page of the window slot waiting on `id`.
+    fn number_of(&self, id: EffectId) -> Option<PageNumber> {
+        let window = self.window.as_ref()?;
+        let index = window.index_of(id)?;
+        Some(PageNumber(window.cursor() + index as u64))
+    }
+
+    /// Accept pages that any selection of this version offered to this window.
+    fn feed_offered(&mut self, scope: &RequestScope) -> bool {
+        let mut changed = false;
+        while let Some(page) = self.offered.pop_front() {
+            let number = page.plaintext.page().number;
+            if self.validate(&page, number).is_err() {
                 continue;
             }
-            let directory = self.directory.clone();
-            let page = PageId {
-                version: self.metadata.version.clone(),
-                number: PageNumber(number),
+            let handle = self.ids.allocate();
+            self.pages
+                .insert(handle, Held::Page(WindowPage::new(page.clone())));
+            let discarded = self.effects.len();
+            self.window();
+            let Some(window) = self.window.as_mut() else {
+                continue;
             };
-            let scope = scope.clone();
-            spill.pages.insert(
-                number,
-                Spilling::Holding(Box::pin(async move {
-                    directory.hold_read_page(&page, until, &scope).await
-                })),
+            let mut effects = std::mem::take(&mut self.effects);
+            let _ = window.on(
+                win::Input::Offered {
+                    page: number.0,
+                    handle,
+                },
+                true,
+                &mut self.ids,
+                &mut effects,
             );
-            active += 1;
-            changed = true;
+            let accepted = !effects[discarded..].contains(&win::Effect::Discard(handle));
+            self.apply(&mut effects, scope);
+            self.effects = effects;
+            if accepted {
+                // Selected pages are accepted unobserved on their owner; record
+                // this reader's interest once it takes the page.
+                self.directory.observe_verified(&self.drivers, page, scope);
+                changed = true;
+            }
         }
         changed
     }
@@ -1463,19 +1357,27 @@ impl RangeStream {
     /// acquiring the first slice. Already admitted pages retain their original deadlines
     /// and retry budgets; only newly admitted, distinct pages get child scopes.
     pub(crate) fn enable_progress(&mut self, timeout: Duration) {
-        if matches!(self.budget, RangeBudget::ClientPages { .. }) {
-            self.budget = RangeBudget::ProgressingPages { timeout };
+        if matches!(self.budget, PageBudget::Client { .. }) {
+            self.budget = PageBudget::Progressing { timeout };
+            if let Some(window) = self.window.as_mut() {
+                window.set_budget(self.budget);
+            }
         }
     }
     fn operation_scope(&self) -> RequestScope {
         let mut scope = self.scope.clone();
-        if let RangeBudget::ProgressingPages { timeout } = self.budget {
-            scope.deadline.0 = uring_runtime::environment::now() + timeout;
+        if let PageBudget::Progressing { timeout } = self.budget {
+            scope.deadline.0 = scope.clock().now() + timeout;
         }
         scope
     }
     fn validate_sealed(&self, sealed: &SealedPage, number: PageNumber) -> Result<()> {
         validate_pin(&self.metadata, &sealed.metadata)?;
+        // The range slices at its own page size. A page cut at another size
+        // authenticates but covers different object bytes.
+        if sealed.envelope.page_size != self.range.page_size() {
+            return Err(Error::CorruptRecord);
+        }
         sealed.validate_for(&PageId {
             version: self.metadata.version.clone(),
             number,
@@ -1483,6 +1385,9 @@ impl RangeStream {
     }
     fn validate(&self, result: &PageResult, number: PageNumber) -> Result<()> {
         validate_pin(&self.metadata, &result.metadata)?;
+        if result.ciphertext.envelope().page_size != self.range.page_size() {
+            return Err(Error::CorruptRecord);
+        }
         result.validate_for(&PageId {
             version: self.metadata.version.clone(),
             number,
@@ -1532,109 +1437,353 @@ impl RangeStream {
             self.scope.cancel()
         })
     }
+
+    /// End the read: the window releases every hold it owns, pending holds are
+    /// released by detached tasks once applied, and all other work is dropped.
     fn terminate(&mut self) {
-        self.release_spill();
+        if let Some(window) = self.window.as_mut() {
+            let mut effects = std::mem::take(&mut self.effects);
+            window.terminate(&mut effects);
+            let scope = self.scope.clone();
+            self.apply(&mut effects, &scope);
+            self.effects = effects;
+        }
+        for (_, operation) in self.io.drain(..) {
+            let Io::Hold(number, holding) = operation else {
+                continue;
+            };
+            // A pending hold may still be applied; its completion fence says so.
+            let Ok(permit) = self.drivers.reserve() else {
+                continue;
+            };
+            let drivers = self.drivers.clone();
+            let directory = self.directory.clone();
+            let version = self.metadata.version.clone();
+            let request = self.scope.request;
+            permit.submit_detached(Box::pin(async move {
+                if let Ok(epoch) = holding.await {
+                    directory.release_read_pages(&drivers, &version, [(number, epoch)], request);
+                }
+                Ok::<(), Error>(())
+            }));
+        }
         self.terminated = true;
-        self.slots.clear();
-        self.selections.clear();
+        self.pages.clear();
+        self.inputs.clear();
+        self.offered.clear();
+        self.filled.clear();
         self.retained.clear();
         self.lease = None;
         self.credits = None;
     }
 
-    /// Whether the head page can be handed to the client now.
-    fn deliverable(&self) -> bool {
-        matches!(self.slots.front(), Some(Slot::Ready(_) | Slot::Sealed(_)))
-    }
-
     async fn deliver(&mut self) -> Result<Option<DirectItem>> {
         let scope = self.operation_scope();
         let cancellation = scope.cancellation.subscribe()?;
-        poll_fn(|cx| -> Poll<Result<()>> {
+        let next = poll_fn(|cx| -> Poll<Result<win::Next>> {
             cancellation.register(cx.waker());
             self.poll_prefetch(cx);
             if let Some(error) = self.error.take() {
                 return Poll::Ready(Err(error));
             }
-            if self.next == self.end || self.deliverable() {
-                Poll::Ready(Ok(()))
-            } else {
-                Poll::Pending
+            let mut effects = std::mem::take(&mut self.effects);
+            let next = self.window().next(&mut effects);
+            self.apply(&mut effects, &scope);
+            self.effects = effects;
+            match next {
+                win::Next::Wait => Poll::Pending,
+                next => Poll::Ready(Ok(next)),
             }
         })
         .await?;
-        if self.next == self.end {
-            self.terminated = true;
-            return Ok(None);
+        let (number, handle) = match next {
+            win::Next::End => {
+                self.terminated = true;
+                return Ok(None);
+            }
+            win::Next::Fail(error) => {
+                let cursor = self.window().cursor();
+                return Err(match error {
+                    read::Error::Internal => {
+                        self.failures.remove(&cursor).unwrap_or(Error::Internal)
+                    }
+                    error => error.into(),
+                });
+            }
+            win::Next::Page { page, handle, .. } => (PageNumber(page), handle),
+            win::Next::Wait => return Err(Error::StaleFlight),
+        };
+        if !self.failures.is_empty() {
+            self.failures.retain(|page, _| *page > number.0);
         }
         scope.check()?;
-        let number = PageNumber(self.next);
-        let result = match self.slots.pop_front() {
-            Some(Slot::Ready(result)) => {
-                self.next += 1;
-                result?
-            }
-            Some(Slot::Sealed(sealed)) => {
-                self.next += 1;
+        match self.pages.remove(&handle) {
+            Some(Held::Sealed(sealed)) => {
                 self.validate_sealed(&sealed, number)?;
                 let slice = self.range.slice_at(number)?.ok_or(Error::CorruptRecord)?;
                 self.issue(number)?;
-                return Ok(Some(DirectItem::Sealed(sealed, slice)));
+                Ok(Some(DirectItem::Sealed(sealed, slice)))
             }
-            _ => return Err(Error::StaleFlight),
-        };
-        self.validate(&result, number)?;
-        let slice = self.range.slice_at(number)?.ok_or(Error::CorruptRecord)?;
-        self.issue(number)?;
-        self.retained.insert(number, result.plaintext.clone());
-        self.delivery
-            .attach(result.plaintext, slice)
-            .map(|reader| Some(DirectItem::Plaintext(reader)))
+            Some(Held::Page(result)) => {
+                if result.plaintext.page().number != number {
+                    return Err(Error::CorruptRecord);
+                }
+                let slice = self.range.slice_at(number)?.ok_or(Error::CorruptRecord)?;
+                self.issue(number)?;
+                self.retained.insert(number, result.plaintext.clone());
+                self.delivery
+                    .attach(result.plaintext, slice)
+                    .map(|reader| Some(DirectItem::Plaintext(reader)))
+            }
+            None => Err(Error::StaleFlight),
+        }
     }
 
-    /// Account one page as handed to the client, and drop its spill hold.
+    /// Account one page as handed to the client. The window released its
+    /// spill hold.
     fn issue(&mut self, number: PageNumber) -> Result<()> {
         self.credits
             .as_mut()
             .ok_or(Error::InvalidRequest)?
             .issued(number)
-            .map_err(window_error)?;
-        if let Some(spill) = self.spill.as_mut()
-            && let Some(epoch) = spill.held.remove(&number.0)
-        {
-            self.directory.release_read_pages(
-                &self.metadata.version,
-                [(number, epoch)],
-                self.scope.request,
-            );
-        }
-        Ok(())
+            .map_err(window_error)
     }
 
     /// Pages admitted into the window: fetched, being fetched or selected.
     pub fn buffered_pages(&self) -> usize {
-        self.slots
-            .iter()
-            .filter(|slot| {
-                matches!(
-                    slot,
-                    Slot::Fetching(_)
-                        | Slot::FetchingSealed(_)
-                        | Slot::Selecting
-                        | Slot::Ready(_)
-                        | Slot::Sealed(_)
-                )
-            })
-            .count()
+        self.window.as_ref().map_or(0, |window| {
+            window
+                .slots()
+                .filter(|slot| {
+                    matches!(
+                        slot,
+                        win::Slot::Fetching(_)
+                            | win::Slot::Selecting(_)
+                            | win::Slot::Ready { .. }
+                            | win::Slot::Failed(_)
+                    )
+                })
+                .count()
+        })
     }
+}
+
+/// A scripted window slot for tests, with the operation it waits on.
+#[cfg(test)]
+#[allow(clippy::large_enum_variant)]
+enum TestSlot {
+    Probing(Operation<'static, Option<PageResult>>),
+    Missing {
+        select: bool,
+    },
+    Fetching(Operation<'static, PageResult>),
+    FetchingSealed(Operation<'static, Fetched>),
+    Sealed(Box<SealedPage>),
+    /// Covered by a selection that never completes.
+    Selecting,
+    Ready(Result<PageResult>),
+}
+
+#[cfg(test)]
+impl RangeStream {
+    /// Place a page in the window with its credit, as `pump` would.
+    fn inject(&mut self, slot: TestSlot) {
+        let index = self.window().slots().count();
+        let number = PageNumber(self.window().cursor() + index as u64);
+        assert!(reserve(&self.range, &mut self.credits, number));
+        self.place(index, slot);
+    }
+
+    /// Replace (or append) window slot `index` with a scripted one.
+    fn place(&mut self, index: usize, slot: TestSlot) {
+        let number = self.window().cursor() + index as u64;
+        let id = self.ids.allocate();
+        let slot = match slot {
+            TestSlot::Probing(probe) => {
+                self.io.push((id, Io::Probe(probe)));
+                win::Slot::Probing(id)
+            }
+            TestSlot::Missing { select } => win::Slot::Missing { select },
+            TestSlot::Fetching(fetch) => {
+                self.io.push((id, Io::Fetch(fetch)));
+                win::Slot::Fetching(id)
+            }
+            TestSlot::FetchingSealed(fetch) => {
+                self.io.push((id, Io::FetchSealed(fetch)));
+                win::Slot::Fetching(id)
+            }
+            TestSlot::Sealed(sealed) => {
+                self.pages.insert(id, Held::Sealed(sealed));
+                win::Slot::Ready {
+                    handle: id,
+                    sealed: true,
+                }
+            }
+            TestSlot::Selecting => win::Slot::Selecting(id),
+            TestSlot::Ready(Ok(page)) => match self.validate(&page, PageNumber(number)) {
+                Ok(()) => {
+                    self.pages.insert(id, Held::Page(WindowPage::new(page)));
+                    win::Slot::Ready {
+                        handle: id,
+                        sealed: false,
+                    }
+                }
+                Err(error) => win::Slot::Failed(self.core_error(number, error)),
+            },
+            TestSlot::Ready(Err(error)) => win::Slot::Failed(self.core_error(number, error)),
+        };
+        self.window().place(index, slot);
+    }
+
+    /// Script one selection over window `pages`, waiting on `operation`.
+    fn inject_selection(&mut self, pages: &[u64], operation: Operation<'static, PageResult>) {
+        let id = self.ids.allocate();
+        let cursor = self.window().cursor();
+        for number in pages {
+            self.window()
+                .place((number - cursor) as usize, win::Slot::Selecting(id));
+        }
+        self.io.push((id, Io::Select(operation)));
+    }
+
+    fn slot(&self, index: usize) -> win::Slot {
+        *self.window.as_ref().unwrap().slots().nth(index).unwrap()
+    }
+
+    fn slot_count(&self) -> usize {
+        self.window
+            .as_ref()
+            .map_or(0, |window| window.slots().count())
+    }
+
+    fn selections(&self) -> usize {
+        self.window.as_ref().map_or(0, win::ReadWindow::selections)
+    }
+
+    fn direct_ahead(&mut self) -> usize {
+        self.window().direct_ahead()
+    }
+
+    /// Poll the window's operations once and feed what finished, without
+    /// planning new work.
+    fn poll_slots(&mut self, cx: &mut Context<'_>) -> bool {
+        let scope = self.operation_scope();
+        self.poll_io(cx, &scope)
+    }
+
+    /// The selections a pump would start now, as their page sets. Their
+    /// operations are not started; the planned pages stay selecting.
+    fn plan_selections(&mut self) -> Vec<BTreeSet<u64>> {
+        let waker = futures::task::noop_waker();
+        self.exchange(&Context::from_waker(&waker));
+        let now = self.scope.clock().now();
+        let facts = self.facts.clone();
+        let mut effects = Vec::new();
+        self.window();
+        let window = self.window.as_mut().unwrap();
+        window.pump(now, &facts, |_| false, &mut self.ids, &mut effects);
+        effects
+            .into_iter()
+            .filter_map(|effect| match effect {
+                win::Effect::Select { pages, .. } => Some(pages),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The selectable holes a selection limited to `limit` pages would
+    /// demand, excluding pages selected `elsewhere`.
+    fn selection_demand(
+        &mut self,
+        elsewhere: &BTreeSet<u64>,
+        limit: usize,
+    ) -> Option<(Vec<std::ops::Range<u64>>, BTreeSet<u64>)> {
+        let window = self.window();
+        let kinds = window.slots().map(win::Slot::kind).collect::<Vec<_>>();
+        read::selection_demand(
+            &kinds,
+            window.cursor(),
+            |number| elsewhere.contains(&number),
+            limit,
+            racer_core::subscriptions::MAX_DEMAND_INTERVALS,
+        )
+    }
+}
+
+/// Whether the window restarts a fill that failed with `error` (while its
+/// retries last); see [`win::PAGE_RETRIES`].
+fn restarted(error: Error) -> bool {
+    matches!(
+        error,
+        Error::Overloaded | Error::FlightFull | Error::Unavailable
+    )
+}
+
+/// Hold a restartable fill failure for the next restart's backoff before the
+/// window sees it, so pressure that other reads relieve is waited out rather
+/// than retried in a tight loop. A fill that could not start fails the same way.
+fn with_backoff<T: 'static>(
+    reactor: Rc<crate::runtime::Reactor>,
+    scope: RequestScope,
+    retry: u8,
+    started: Result<Operation<'static, T>>,
+) -> Operation<'static, T> {
+    Box::pin(async move {
+        let result = match started {
+            Ok(operation) => operation.await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = &result
+            && restarted(*error)
+        {
+            let until = scope.clock().now() + win::retry_delay(retry.saturating_add(1));
+            // A canceled or expired scope ends the read; the window sees that.
+            let _ = reactor.sleep_until(until, &scope).await;
+        }
+        result
+    })
+}
+
+/// How a slot shows in the scheduler: wanted, busy, both or neither.
+fn interest_class(slot: &win::Slot) -> u8 {
+    match slot {
+        win::Slot::Probing(_) | win::Slot::Missing { .. } => 1,
+        win::Slot::Fetching(_) => 2,
+        win::Slot::Selecting(_) => 3,
+        win::Slot::Ready { .. } | win::Slot::Failed(_) => 0,
+    }
+}
+
+/// Reserve the client credit of one window page, if it fits. Window pages plus
+/// delivered, unreleased pages never exceed the client's credits, so fetching
+/// ahead pins no more plaintext than the client may hold.
+fn reserve(
+    range: &ResolvedRange,
+    credits: &mut Option<Window<PageNumber>>,
+    number: PageNumber,
+) -> bool {
+    let Some(length) = range
+        .slice_at(number)
+        .ok()
+        .flatten()
+        .map(|slice| u64::from(slice.length))
+    else {
+        return false;
+    };
+    credits.as_mut().is_some_and(|credits| {
+        credits.can_reserve(length) && credits.reserve(number, length).is_ok()
+    })
 }
 
 impl Drop for RangeStream {
     fn drop(&mut self) {
-        self.release_spill();
+        let terminated = self.terminated;
+        if !terminated || !self.io.is_empty() {
+            self.terminate();
+        }
         // ReaderLease and runtime completion owners retain already submitted I/O.
         // This cancels acquisition only; it cannot revoke another reader's lease.
-        if !self.terminated {
+        if !terminated {
             let _ = self.scope.cancel();
         }
     }
@@ -1666,8 +1815,8 @@ pub(super) mod tests {
     use crate::model::WorkerId;
     use crate::runtime::Reactor;
     use crate::topology::Membership;
-    use racer_control_wire::CacheId;
-    use racer_control_wire::MembershipVersion;
+    use racer_wire::control::CacheId;
+    use racer_wire::control::MembershipVersion;
 
     struct Fixture {
         admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
@@ -1676,15 +1825,16 @@ pub(super) mod tests {
     }
 
     impl Fixture {
-        fn new(limits: crate::config::Limits, capacity: usize) -> Self {
+        fn new(env: &racer_io::Env, limits: crate::config::Limits, capacity: usize) -> Self {
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
-            let reactor = Rc::new(Reactor::new(admission.clone()));
-            let pipes = Rc::new(new_pipe_pool(admission.clone()));
-            let directory = Arc::new(
+            let reactor = Rc::new(Reactor::new(admission.clone(), env));
+            let pipes = Rc::new(new_pipe_pool(admission.clone(), reactor.sim_os()));
+            let directory = std::rc::Rc::new(
                 WorkerDirectory::new(
                     Arc::new(WorkerMap::new(vec![WorkerId(0)]).unwrap()),
                     vec![WorkerId(0)],
                     capacity,
+                    racer_io::WorkerCtx::host(),
                 )
                 .unwrap(),
             );
@@ -1692,6 +1842,7 @@ pub(super) mod tests {
                 directory,
                 Rc::new(Delivery::new(reactor, Duration::from_secs(30))),
                 capacity,
+                std::rc::Rc::new(crate::drivers::DriverQueue::new(1024)),
             );
             Self {
                 admission,
@@ -1721,25 +1872,33 @@ pub(super) mod tests {
                 .unwrap()
         }
     }
-    fn remaining_credits(budget: &RangeBudget) -> (u32, u8) {
-        let RangeBudget::Shared(budget) = budget else {
-            panic!("expected aggregate budget")
-        };
-        (budget.remaining_attempts(), budget.remaining_links())
-    }
     pub(crate) fn page_result(
         admission: &flow_control::Quotas<AdmissionPolicy>,
         metadata: &ObjectMetadata,
         number: u64,
     ) -> PageResult {
-        use crate::admission::ResourceClass;
+        page_result_sized(
+            admission,
+            metadata,
+            number,
+            racer_wire::object::PageSize::DEFAULT,
+        )
+    }
+
+    /// Page `number` of `metadata` cut at `size`.
+    pub(crate) fn page_result_sized(
+        admission: &flow_control::Quotas<AdmissionPolicy>,
+        metadata: &ObjectMetadata,
+        number: u64,
+        size: racer_wire::object::PageSize,
+    ) -> PageResult {
         use crate::memory::CiphertextBytes;
         use crate::memory::CiphertextPage;
         use crate::memory::VerifiedBytes;
         use crate::memory::VerifiedPage;
         use crate::model::Nonce;
         use crate::model::PageEnvelope;
-        let length = (metadata.length - number * PAGE_BYTES).min(PAGE_BYTES) as usize;
+        let length = (metadata.length - number * size.get()).min(size.get()) as usize;
         let page = PageId {
             version: metadata.version.clone(),
             number: PageNumber(number),
@@ -1750,19 +1909,20 @@ pub(super) mod tests {
             plaintext: VerifiedPage {
                 inner: Arc::new(VerifiedBytes {
                     page: page.clone(),
-                    storage: flow_control::ChargedBytes {
-                        bytes: vec![number as u8; length],
-                        reservation: admission
-                            .reserve(cache, ResourceClass::Plaintext, length)
-                            .unwrap(),
-                    },
+                    storage: crate::memory::fixture_plaintext(
+                        admission,
+                        cache,
+                        &vec![number as u8; length],
+                    ),
                 }),
             },
             ciphertext: CiphertextPage {
+                pinned: true,
                 provenance: None,
                 inner: Arc::new(CiphertextBytes {
-                    checksum: Default::default(),
+                    pins: Default::default(),
                     envelope: PageEnvelope {
+                        page_size: size,
                         cipher: crate::model::PageCipher::Xaes256Gcm,
                         page,
                         key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
@@ -1770,13 +1930,11 @@ pub(super) mod tests {
                         plaintext_length: length as u32,
                         ciphertext_length: length as u32 + 16,
                     },
-                    storage: flow_control::ChargedBytes {
-                        bytes: vec![0; length + 16],
-                        reservation: admission
-                            .reserve(cache, ResourceClass::Ciphertext, length + 16)
-                            .unwrap(),
-                    }
-                    .into(),
+                    storage: crate::memory::fixture_ciphertext_storage(
+                        admission,
+                        cache,
+                        &vec![0; length + 16],
+                    ),
                 }),
             },
         }
@@ -1784,21 +1942,23 @@ pub(super) mod tests {
 
     #[test]
     fn sealed_reads_fill_their_whole_window_directly() {
+        let env = racer_io::Env::host();
         for (window, sealed) in [(1, 1), (2, 1), (8, 7)] {
-            let f = Fixture::new(crate::test_support::cluster::config(false).limits, window);
+            let f = Fixture::new(
+                &env,
+                crate::test_support::cluster::config(false).limits,
+                window,
+            );
             let mut metadata = metadata();
             metadata.length = 16 * PAGE_BYTES;
             let range = ByteRange::From(0).resolve(metadata.length).unwrap();
             let scope =
-                RequestScope::new(RequestId([9; 16]), Instant::now() + Duration::from_secs(60))
+                RequestScope::host(RequestId([9; 16]), Instant::now() + Duration::from_secs(60))
                     .unwrap();
             let mut stream = f.open(&metadata, range, scope);
             assert_eq!(stream.direct_ahead(), DIRECT_AHEAD);
             stream
-                .set_sealed(SealedTarget {
-                    helper: crate::gpu::testing::helper(&[None]),
-                    ordinal: 0,
-                })
+                .set_sealed(SealedTarget::gpu(crate::gpu::testing::helper(&[None]), 0))
                 .unwrap();
             assert_eq!(stream.direct_ahead(), sealed, "window {window}");
         }
@@ -1806,13 +1966,18 @@ pub(super) mod tests {
 
     #[test]
     fn passthrough_reads_fill_their_whole_window_directly() {
+        let env = racer_io::Env::host();
         for (window, passthrough) in [(1, 1), (2, 1), (8, 7)] {
-            let f = Fixture::new(crate::test_support::cluster::config(false).limits, window);
+            let f = Fixture::new(
+                &env,
+                crate::test_support::cluster::config(false).limits,
+                window,
+            );
             let mut metadata = metadata();
             metadata.length = 16 * PAGE_BYTES;
             let range = ByteRange::From(0).resolve(metadata.length).unwrap();
             let scope =
-                RequestScope::new(RequestId([9; 16]), Instant::now() + Duration::from_secs(60))
+                RequestScope::host(RequestId([9; 16]), Instant::now() + Duration::from_secs(60))
                     .unwrap();
             let mut stream = f.open(&metadata, range, scope);
             assert_eq!(stream.direct_ahead(), DIRECT_AHEAD);
@@ -1823,7 +1988,8 @@ pub(super) mod tests {
 
     #[test]
     fn sealed_pages_are_delivered_in_order_only_to_direct_readers() {
-        let f = Fixture::new(crate::test_support::cluster::config(false).limits, 2);
+        let env = racer_io::Env::host();
+        let f = Fixture::new(&env, crate::test_support::cluster::config(false).limits, 2);
         let admission = &f.admission;
         let mut metadata = metadata();
         metadata.length = 2 * PAGE_BYTES;
@@ -1834,13 +2000,14 @@ pub(super) mod tests {
         .resolve(metadata.length)
         .unwrap();
         let scope = || {
-            RequestScope::new(RequestId([9; 16]), Instant::now() + Duration::from_secs(60)).unwrap()
+            RequestScope::host(RequestId([9; 16]), Instant::now() + Duration::from_secs(60))
+                .unwrap()
         };
         let mut stream = f.open(&metadata, range, scope());
         stream.configure_subscription(4, 4 * PAGE_BYTES).unwrap();
         let first = crate::read::sealed::tests::sealed(&page_result(admission, &metadata, 0));
-        stream.inject(Slot::Sealed(Box::new(first)));
-        stream.inject(Slot::Ready(Ok(page_result(admission, &metadata, 1))));
+        stream.inject(TestSlot::Sealed(Box::new(first)));
+        stream.inject(TestSlot::Ready(Ok(page_result(admission, &metadata, 1))));
         match futures::executor::block_on(stream.next_direct()).unwrap() {
             Some(DirectItem::Sealed(page, slice)) => {
                 assert_eq!(page.page().number, PageNumber(0));
@@ -1871,23 +2038,139 @@ pub(super) mod tests {
         let mut stream = f.open(&metadata, range, scope());
         stream.configure_subscription(4, 4 * PAGE_BYTES).unwrap();
         let other = crate::read::sealed::tests::sealed(&page_result(admission, &metadata, 1));
-        stream.inject(Slot::Sealed(Box::new(other)));
+        stream.inject(TestSlot::Sealed(Box::new(other)));
         assert!(futures::executor::block_on(stream.next_direct()).is_err());
 
         // A Get stream never yields sealed pages.
         let mut stream = f.open(&metadata, range, scope());
         stream.configure_subscription(4, 4 * PAGE_BYTES).unwrap();
         let first = crate::read::sealed::tests::sealed(&page_result(admission, &metadata, 0));
-        stream.inject(Slot::Sealed(Box::new(first)));
+        stream.inject(TestSlot::Sealed(Box::new(first)));
         assert_eq!(
             futures::executor::block_on(stream.next_slice()).err(),
             Some(Error::Internal)
         );
     }
 
+    /// Pages filled behind a waiting head keep only their plaintext. Holding
+    /// their ciphertext let windows on one worker fill its ciphertext share
+    /// with ready pages while each waited for a head whose fill needed that
+    /// share, a stall only request deadlines broke.
+    #[test]
+    fn ready_pages_behind_a_waiting_head_release_their_ciphertext() {
+        let env = racer_io::Env::host();
+        let f = Fixture::new(&env, crate::test_support::cluster::config(false).limits, 4);
+        let admission = &f.admission;
+        let mut metadata = metadata();
+        metadata.length = 3 * PAGE_BYTES;
+        let range = ByteRange::Closed {
+            first: 0,
+            last: 3 * PAGE_BYTES - 1,
+        }
+        .resolve(metadata.length)
+        .unwrap();
+        let scope =
+            RequestScope::host(RequestId([7; 16]), Instant::now() + Duration::from_secs(60))
+                .unwrap();
+        let mut stream = f.open(&metadata, range, scope);
+        stream.configure_subscription(4, 4 * PAGE_BYTES).unwrap();
+        let (head, gate) = futures::channel::oneshot::channel::<PageResult>();
+        stream.inject(TestSlot::Fetching(Box::pin(async move {
+            gate.await.map_err(|_| Error::Unavailable)
+        })));
+        for number in 1..3 {
+            let page = page_result(admission, &metadata, number);
+            stream.inject(TestSlot::Fetching(Box::pin(async move { Ok(page) })));
+        }
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(stream.next_slice().as_mut().poll(&mut cx).is_pending());
+        // Both ready pages are held, but only their plaintext stays charged.
+        assert_eq!(
+            admission.used(ResourceClass::Plaintext),
+            2 * PAGE_BYTES as usize
+        );
+        assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+        // The head fill still needs ciphertext and now finds the share free.
+        head.send(page_result(admission, &metadata, 0))
+            .ok()
+            .unwrap();
+        for number in 0..3 {
+            let reader = futures::executor::block_on(stream.next_slice())
+                .unwrap()
+                .unwrap();
+            assert_eq!(reader.slice().page, PageNumber(number));
+        }
+        assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+    }
+
+    /// Only work for the window's head may wait for plaintext; pages past it are
+    /// marked ahead (see [`RequestScope::ahead`]), and the mark moves with the
+    /// head as pages are delivered.
+    #[test]
+    fn pages_past_the_window_head_are_ahead() {
+        let env = racer_io::Env::host();
+        let f = Fixture::new(&env, crate::test_support::cluster::config(false).limits, 4);
+        let admission = &f.admission;
+        let mut metadata = metadata();
+        metadata.length = 3 * PAGE_BYTES;
+        let range = ByteRange::Closed {
+            first: 0,
+            last: 3 * PAGE_BYTES - 1,
+        }
+        .resolve(metadata.length)
+        .unwrap();
+        let scope =
+            RequestScope::host(RequestId([8; 16]), Instant::now() + Duration::from_secs(60))
+                .unwrap();
+        let mut stream = f.open(&metadata, range, scope);
+        stream.configure_subscription(4, 4 * PAGE_BYTES).unwrap();
+        // No window yet: nothing is ahead.
+        assert!(!stream.ahead(PageNumber(1)));
+        for number in 0..3 {
+            let page = page_result(admission, &metadata, number);
+            stream.inject(TestSlot::Fetching(Box::pin(async move { Ok(page) })));
+        }
+        assert!(!stream.ahead(PageNumber(0)));
+        assert!(stream.ahead(PageNumber(1)));
+        assert!(stream.ahead(PageNumber(2)));
+        let reader = futures::executor::block_on(stream.next_slice())
+            .unwrap()
+            .unwrap();
+        assert_eq!(reader.slice().page, PageNumber(0));
+        assert!(!stream.ahead(PageNumber(1)));
+        assert!(stream.ahead(PageNumber(2)));
+    }
+
+    /// A filled page for another page number fails its slot instead of being held.
+    #[test]
+    fn filled_pages_for_another_number_fail_their_slot() {
+        let env = racer_io::Env::host();
+        let f = Fixture::new(&env, crate::test_support::cluster::config(false).limits, 4);
+        let admission = &f.admission;
+        let mut metadata = metadata();
+        metadata.length = 2 * PAGE_BYTES;
+        let range = ByteRange::Closed {
+            first: 0,
+            last: 2 * PAGE_BYTES - 1,
+        }
+        .resolve(metadata.length)
+        .unwrap();
+        let scope =
+            RequestScope::host(RequestId([8; 16]), Instant::now() + Duration::from_secs(60))
+                .unwrap();
+        let mut stream = f.open(&metadata, range, scope);
+        stream.configure_subscription(4, 4 * PAGE_BYTES).unwrap();
+        let wrong = page_result(admission, &metadata, 1);
+        stream.inject(TestSlot::Fetching(Box::pin(async move { Ok(wrong) })));
+        assert!(futures::executor::block_on(stream.next_slice()).is_err());
+        assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+    }
+
     #[test]
     fn retained_boundary_slices_keep_full_plaintext_charged_until_exact_release() {
-        let f = Fixture::new(crate::test_support::cluster::config(false).limits, 2);
+        let env = racer_io::Env::host();
+        let f = Fixture::new(&env, crate::test_support::cluster::config(false).limits, 2);
         let admission = &f.admission;
         let mut metadata = metadata();
         metadata.length = 2 * PAGE_BYTES;
@@ -1897,12 +2180,15 @@ pub(super) mod tests {
         }
         .resolve(metadata.length)
         .unwrap();
-        let scope = RequestScope::new(RequestId([9; 16]), Instant::now() + Duration::from_secs(60))
-            .unwrap();
+        let scope =
+            RequestScope::host(RequestId([9; 16]), Instant::now() + Duration::from_secs(60))
+                .unwrap();
         let mut stream = f.open(&metadata, range, scope);
         stream.configure_subscription(4, PAGE_BYTES).unwrap();
         for number in 0..2 {
-            stream.inject(Slot::Ready(Ok(page_result(admission, &metadata, number))));
+            stream.inject(TestSlot::Ready(Ok(page_result(
+                admission, &metadata, number,
+            ))));
         }
         for number in 0..2 {
             let reader = futures::executor::block_on(stream.next_slice())
@@ -1913,9 +2199,7 @@ pub(super) mod tests {
             drop(reader);
         }
         assert_eq!(stream.retained.len(), 2);
-        // Idle recycled buffers are still charged; reclaim only those to isolate
-        // the unreleased leases, which must remain charged despite reclamation.
-        admission.reclaim_buffers();
+        // Unreleased leases remain charged.
         assert_eq!(
             admission.used(ResourceClass::Plaintext),
             2 * PAGE_BYTES as usize
@@ -1930,28 +2214,26 @@ pub(super) mod tests {
             2 * PAGE_BYTES as usize
         );
         stream.release_page(PageNumber(0), 1).unwrap();
-        admission.reclaim_buffers();
         assert_eq!(
             admission.used(ResourceClass::Plaintext),
             PAGE_BYTES as usize
         );
         futures::executor::block_on(stream.cancel()).unwrap();
-        admission.reclaim_buffers();
         assert_eq!(admission.used(ResourceClass::Plaintext), 0);
         assert!(stream.retained.is_empty());
     }
 
     #[test]
     fn optional_remote_observation_never_blocks_ready_delivery_or_duplicates_on_repoll() {
+        let env = racer_io::Env::host();
         for repoll in [false, true] {
-            let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(8));
-            let _queue = queue.enter();
-            let f = Fixture::new(crate::test_support::cluster::config(false).limits, 2);
+            let f = Fixture::new(&env, crate::test_support::cluster::config(false).limits, 2);
+            let queue = f.streams.drivers.clone();
             let directory = f.streams.directory();
             assert_eq!(directory.test_observation_mailbox(), 0);
             let mut metadata = metadata();
             metadata.length = 3;
-            let scope = RequestScope::new(
+            let scope = RequestScope::host(
                 RequestId([12; 16]),
                 Instant::now() + Duration::from_secs(60),
             )
@@ -1963,8 +2245,8 @@ pub(super) mod tests {
             );
             stream.configure_subscription(1, PAGE_BYTES).unwrap();
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-            stream.inject(Slot::Selecting);
-            stream.sync(&cx);
+            stream.inject(TestSlot::Selecting);
+            stream.exchange(&cx);
             let demand = racer_core::subscriptions::Demand::new(vec![
                 flow_control::subscriptions::Interval { start: 0, end: 1 },
             ])
@@ -1975,14 +2257,17 @@ pub(super) mod tests {
             if repoll {
                 stream.poll_prefetch(&mut cx);
                 stream.poll_prefetch(&mut cx);
-                assert!(matches!(stream.slots.front(), Some(Slot::Ready(Ok(_)))));
+                assert!(matches!(stream.slot(0), win::Slot::Ready { .. }));
             }
             // No endpoint is ever polled. A continuous next_slice future must
             // still deliver immediately with the accepted hint unanswered.
             let mut next = stream.next_slice();
             let reader = match next.as_mut().poll(&mut cx) {
                 Poll::Ready(Ok(Some(reader))) => reader,
-                _ => panic!("optional owner receipt blocked ready page"),
+                other => panic!(
+                    "optional owner receipt blocked ready page (repoll {repoll}): {:?}",
+                    other.map(|result| result.map(|reader| reader.is_some()))
+                ),
             };
             assert_eq!(reader.slice().length, 3);
             drop(next);
@@ -2000,24 +2285,29 @@ pub(super) mod tests {
     #[test]
     fn later_page_pipe_wait_survives_temporary_polls_and_cleans_up() {
         use crate::test_support::WakeCounter;
+        let env = racer_io::Env::host();
         {
             for mode in ["release", "cancel", "drop"] {
                 let mut limits = crate::test_support::cluster::config(false).limits;
                 limits.pipes = std::num::NonZeroUsize::new(1).unwrap();
-                let f = Fixture::new(limits, 2);
+                let f = Fixture::new(&env, limits, 2);
                 let admission = &f.admission;
                 let pipes = &f.pipes;
                 let metadata = metadata();
-                let scope =
-                    RequestScope::new(RequestId([8; 16]), Instant::now() + Duration::from_secs(60))
-                        .unwrap();
+                let scope = RequestScope::host(
+                    RequestId([8; 16]),
+                    Instant::now() + Duration::from_secs(60),
+                )
+                .unwrap();
                 let range = ByteRange::From(PAGE_BYTES - 1)
                     .resolve(metadata.length)
                     .unwrap();
                 let mut stream = f.open(&metadata, range, scope.clone());
                 stream.configure_subscription(2, PAGE_BYTES).unwrap();
                 for number in 0..2 {
-                    stream.inject(Slot::Ready(Ok(page_result(admission, &metadata, number))));
+                    stream.inject(TestSlot::Ready(Ok(page_result(
+                        admission, &metadata, number,
+                    ))));
                 }
                 let first = futures::executor::block_on(stream.next_slice())
                     .unwrap()
@@ -2079,7 +2369,6 @@ pub(super) mod tests {
                     _ => drop((second, stream, held)),
                 }
                 assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
-                admission.reclaim_buffers();
                 assert_eq!(admission.used(ResourceClass::Plaintext), 0);
                 assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
             }
@@ -2087,24 +2376,26 @@ pub(super) mod tests {
     }
     #[test]
     fn credit_starved_stream_never_holds_pipe_and_cancel_detaches_demand() {
-        let f = Fixture::new(crate::test_support::cluster::config(false).limits, 1);
+        let env = racer_io::Env::host();
+        let f = Fixture::new(&env, crate::test_support::cluster::config(false).limits, 1);
         let admission = &f.admission;
         let pipes = &f.pipes;
         let directory = &f.streams.directory;
         let metadata = metadata();
         let range = ByteRange::From(0).resolve(metadata.length).unwrap();
-        let scope = RequestScope::new(RequestId([7; 16]), Instant::now() + Duration::from_secs(60))
-            .unwrap();
+        let scope =
+            RequestScope::host(RequestId([7; 16]), Instant::now() + Duration::from_secs(60))
+                .unwrap();
         let mut stream = f.open(&metadata, range, scope.clone());
         stream.configure_subscription(1, PAGE_BYTES).unwrap();
-        stream.inject(Slot::Ready(Ok(page_result(admission, &metadata, 0))));
+        stream.inject(TestSlot::Ready(Ok(page_result(admission, &metadata, 0))));
         // Model a delivered page still owned by a slow caller.
         let first = futures::executor::block_on(stream.next_slice())
             .unwrap()
             .unwrap();
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         assert!(stream.next_slice().as_mut().poll(&mut cx).is_pending());
-        assert!(stream.slots.is_empty(), "no credit admits no window page");
+        assert_eq!(stream.slot_count(), 0, "no credit admits no window page");
         drop(first);
         assert_eq!(pipes.idle_count(), 0, "no pipe was even allocated");
         assert!(matches!(
@@ -2112,7 +2403,7 @@ pub(super) mod tests {
             Err(Error::Overloaded)
         ));
         futures::executor::block_on(stream.cancel()).unwrap();
-        assert!(scope.cancellation.is_cancelled());
+        assert!(scope.cancellation.is_canceled());
         assert!(stream.lease.is_none());
         assert!(stream.retained.is_empty());
         assert!(directory.subscriptions.open(metadata.version).is_ok());
@@ -2120,12 +2411,12 @@ pub(super) mod tests {
     #[test]
     fn client_page_progress_outlives_attempt_and_link_totals_without_refilling_retries() {
         let deadline = Instant::now() + std::time::Duration::from_secs(60);
-        let mut budget = RangeBudget::ClientPages { deadline };
+        let budget = PageBudget::Client { deadline };
         // Model a healthy remote page that spends a four-link route and transfers
         // acquisition credits to its destination. Neither spend can accumulate
         // into a range-length limit, and unused credits cannot grow later pages.
         for _ in 0..100 {
-            let mut page = budget.next_page(false).unwrap().unwrap();
+            let mut page = budget.next_page(racer_io::Clock::host().now()).unwrap();
             assert_eq!(page.remaining_attempts(), 8);
             assert_eq!(page.remaining_links(), 16);
             assert_eq!(page.begin_attempt(Instant::now(), deadline), Ok(deadline));
@@ -2138,9 +2429,8 @@ pub(super) mod tests {
                 remote.begin_attempt(Instant::now(), deadline),
                 Err(racer_core::read::Error::Unavailable)
             );
-            budget.complete(page).unwrap();
         }
-        let mut page = budget.next_page(false).unwrap().unwrap();
+        let mut page = budget.next_page(racer_io::Clock::host().now()).unwrap();
         for _ in 0..8 {
             page.begin_attempt(Instant::now(), deadline).unwrap();
         }
@@ -2157,45 +2447,25 @@ pub(super) mod tests {
             page.begin_attempt(deadline, deadline),
             Err(racer_core::read::Error::DeadlineExceeded)
         );
-        let mut expired = RangeBudget::ClientPages {
+        let expired = PageBudget::Client {
             deadline: Instant::now(),
         };
         assert!(matches!(
-            expired.next_page(false),
-            Err(Error::DeadlineExceeded)
+            expired.next_page(racer_io::Clock::host().now()),
+            Err(racer_core::read::Error::DeadlineExceeded)
         ));
-    }
-    #[test]
-    fn explicit_aggregate_range_budget_never_refills_spent_pages() {
-        let deadline = Instant::now() + std::time::Duration::from_secs(60);
-        let mut budget = RangeBudget::Shared(AcquisitionBudget::new(deadline, 2, 4));
-        let mut page = budget.next_page(false).unwrap().unwrap();
-        assert!(budget.next_page(true).unwrap().is_none());
-        page.begin_attempt(Instant::now(), deadline).unwrap();
-        page.begin_attempt(Instant::now(), deadline).unwrap();
-        page.charge_links(4).unwrap();
-        budget.complete(page).unwrap();
-        let mut next = budget.next_page(false).unwrap().unwrap();
-        assert_eq!(next.deadline(), deadline);
-        assert_eq!(
-            next.begin_attempt(Instant::now(), deadline),
-            Err(racer_core::read::Error::Unavailable)
-        );
-        assert_eq!(
-            next.charge_links(1),
-            Err(racer_core::read::Error::HopBudgetExhausted)
-        );
     }
     #[test]
     fn pending_client_window_never_restarts_failed_pages_and_honors_original_deadline() {
         use std::cell::Cell;
         use std::time::Duration;
+        let env = racer_io::Env::host();
         for expire in [false, true] {
-            let f = Fixture::new(crate::test_support::cluster::config(false).limits, 2);
+            let f = Fixture::new(&env, crate::test_support::cluster::config(false).limits, 2);
             let mut metadata = metadata();
             metadata.length = 100 * PAGE_BYTES;
             let scope =
-                RequestScope::new(RequestId([1; 16]), Instant::now() + Duration::from_secs(60))
+                RequestScope::host(RequestId([1; 16]), Instant::now() + Duration::from_secs(60))
                     .unwrap();
             let mut stream = f.open(
                 &metadata,
@@ -2207,11 +2477,14 @@ pub(super) mod tests {
             let gate = Rc::new(Cell::new(false));
             // Script both admitted acquisitions, avoiding full-page allocation.
             // A full pending window must prevent admission of page two onward.
-            for number in 0..2 {
-                let mut budget = stream.budget.next_page(number != 0).unwrap().unwrap();
+            for _ in 0..2 {
+                let mut budget = stream
+                    .budget
+                    .next_page(racer_io::Clock::host().now())
+                    .unwrap();
                 let attempts = attempts.clone();
                 let gate = gate.clone();
-                stream.inject(Slot::Fetching(Box::pin(async move {
+                stream.inject(TestSlot::Fetching(Box::pin(async move {
                     for _ in 0..8 {
                         budget
                             .begin_attempt(Instant::now(), budget.deadline())
@@ -2226,11 +2499,10 @@ pub(super) mod tests {
                         }
                     })
                     .await;
-                    let result = budget
+                    budget
                         .begin_attempt(Instant::now(), budget.deadline())
                         .map(|_| unreachable!("same page received fresh retry credits"))
-                        .map_err(Error::from);
-                    Ok((result, budget))
+                        .map_err(Error::from)
                 })));
             }
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
@@ -2245,7 +2517,7 @@ pub(super) mod tests {
                 assert!(stream.next_slice().as_mut().poll(&mut cx).is_pending());
                 assert_eq!(attempts.get(), 16);
                 assert_eq!(stream.buffered_pages(), 2);
-                assert_eq!((stream.next, stream.slots.len()), (0, 2));
+                assert_eq!((stream.window().cursor(), stream.slot_count()), (0, 2));
             }
             let expected = if expire {
                 stream.scope.deadline.0 = Instant::now();
@@ -2266,7 +2538,7 @@ pub(super) mod tests {
             ));
         }
     }
-    fn metadata() -> ObjectMetadata {
+    pub(crate) fn metadata() -> ObjectMetadata {
         ObjectMetadata {
             content_type: None,
             version: ObjectVersion {
@@ -2293,10 +2565,11 @@ pub(super) mod tests {
     fn stream_with_budget(
         f: &Fixture,
         metadata: &ObjectMetadata,
-        budget: RangeBudget,
+        budget: PageBudget,
     ) -> RangeStream {
-        let scope = RequestScope::new(RequestId([5; 16]), Instant::now() + Duration::from_secs(60))
-            .unwrap();
+        let scope =
+            RequestScope::host(RequestId([5; 16]), Instant::now() + Duration::from_secs(60))
+                .unwrap();
         let mut stream = f.open(
             metadata,
             ByteRange::From(0).resolve(metadata.length).unwrap(),
@@ -2306,176 +2579,229 @@ pub(super) mod tests {
         stream.budget = budget;
         stream
     }
+    /// Sealed (GPU) fills retry `Overloaded` and `Unavailable` like plaintext fills instead of
+    /// ending the read on the first transient failure; only `Unavailable` is capped.
+    #[test]
+    fn transient_sealed_fill_failures_are_refetched_until_retries_run_out() {
+        let env = racer_io::Env::host();
+        let f = Fixture::new(&env, crate::test_support::cluster::config(false).limits, 2);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut stream = stream_with_budget(&f, &metadata(), PageBudget::Client { deadline });
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let failing =
+            |error| -> TestSlot { TestSlot::FetchingSealed(Box::pin(async move { Err(error) })) };
+        stream.inject(failing(Error::Overloaded));
+        assert!(stream.poll_slots(&mut cx));
+        assert_eq!(stream.slot(0), win::Slot::Missing { select: false });
+        // The first `Overloaded` is uncapped, so all `Unavailable` retries remain.
+        for _ in 0..PAGE_RETRIES {
+            stream.place(0, failing(Error::Unavailable));
+            stream.poll_slots(&mut cx);
+            assert_eq!(stream.slot(0), win::Slot::Missing { select: false });
+        }
+        // Local pressure is waited out past the `Unavailable` cap.
+        for _ in 0..PAGE_RETRIES {
+            stream.place(0, failing(Error::Overloaded));
+            stream.poll_slots(&mut cx);
+            assert_eq!(stream.slot(0), win::Slot::Missing { select: false });
+        }
+        // The page's `Unavailable` retries are spent: the failure now reaches the reader.
+        stream.place(0, failing(Error::Unavailable));
+        stream.poll_slots(&mut cx);
+        assert_eq!(stream.slot(0), win::Slot::Failed(read::Error::Unavailable));
+        // A non-transient failure is not retried.
+        let mut stream = stream_with_budget(&f, &metadata(), PageBudget::Client { deadline });
+        stream.inject(failing(Error::OriginForbidden));
+        stream.poll_slots(&mut cx);
+        assert_eq!(
+            stream.slot(0),
+            win::Slot::Failed(read::Error::OriginForbidden)
+        );
+    }
     #[test]
     fn transient_fill_failures_are_refetched_until_retries_run_out() {
-        let f = Fixture::new(crate::test_support::cluster::config(false).limits, 2);
+        let env = racer_io::Env::host();
+        let f = Fixture::new(&env, crate::test_support::cluster::config(false).limits, 2);
         let deadline = Instant::now() + Duration::from_secs(60);
-        let mut stream = stream_with_budget(&f, &metadata(), RangeBudget::ClientPages { deadline });
+        let mut stream = stream_with_budget(&f, &metadata(), PageBudget::Client { deadline });
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-        let failing = |error| -> Slot {
-            let budget = AcquisitionBudget::new(deadline, 8, 16);
-            Slot::Fetching(Box::pin(async move { Ok((Err(error), budget)) }))
-        };
+        let failing =
+            |error| -> TestSlot { TestSlot::Fetching(Box::pin(async move { Err(error) })) };
         stream.inject(failing(Error::Overloaded));
-        stream.poll_slots(&mut cx).unwrap();
-        assert!(matches!(stream.slots[0], Slot::Missing { select: false }));
-        for _ in 1..PAGE_RETRIES {
-            stream.slots[0] = failing(Error::Unavailable);
-            stream.poll_slots(&mut cx).unwrap();
-            assert!(matches!(stream.slots[0], Slot::Missing { select: false }));
+        stream.poll_slots(&mut cx);
+        assert_eq!(stream.slot(0), win::Slot::Missing { select: false });
+        // The first `Overloaded` is uncapped, so all `Unavailable` retries remain.
+        for _ in 0..PAGE_RETRIES {
+            stream.place(0, failing(Error::Unavailable));
+            stream.poll_slots(&mut cx);
+            assert_eq!(stream.slot(0), win::Slot::Missing { select: false });
         }
-        // The page's retries are spent: the failure now reaches the reader.
-        stream.slots[0] = failing(Error::Overloaded);
-        stream.poll_slots(&mut cx).unwrap();
-        assert!(matches!(
-            stream.slots[0],
-            Slot::Ready(Err(Error::Overloaded))
+        // Local pressure is waited out past the `Unavailable` cap.
+        for _ in 0..PAGE_RETRIES {
+            stream.place(0, failing(Error::Overloaded));
+            stream.poll_slots(&mut cx);
+            assert_eq!(stream.slot(0), win::Slot::Missing { select: false });
+        }
+        // The page's `Unavailable` retries are spent: the failure now reaches the reader.
+        stream.place(0, failing(Error::Unavailable));
+        stream.poll_slots(&mut cx);
+        assert_eq!(stream.slot(0), win::Slot::Failed(read::Error::Unavailable));
+    }
+
+    /// A restartable fill failure is held for the next restart's backoff;
+    /// success and final errors are not, and a canceled scope ends the wait.
+    #[test]
+    fn restartable_fill_failures_wait_for_their_backoff() {
+        let clock = racer_io::SimClock::new(907);
+        let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
+        let admission = Rc::new(flow_control::Quotas::new(
+            crate::admission::AdmissionPolicy::new(
+                crate::test_support::cluster::config(false).limits,
+            ),
         ));
+        let reactor = Rc::new(crate::runtime::Reactor::new(admission, &env));
+        let scope = || {
+            RequestScope::with_clock(
+                RequestId([3; 16]),
+                env.ctx.clock.now() + Duration::from_secs(60),
+                env.ctx.clock.clone(),
+            )
+            .unwrap()
+        };
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let fill = |result: Result<u8>| -> Result<Operation<'static, u8>> {
+            Ok(Box::pin(std::future::ready(result)))
+        };
+        // Success and final errors pass through at once.
+        for result in [Ok(7), Err(Error::CorruptRecord)] {
+            let mut op = with_backoff(reactor.clone(), scope(), 3, fill(result));
+            assert_eq!(op.as_mut().poll(&mut cx), Poll::Ready(result));
+        }
+        // Restartable failures, including one that could not start, wait.
+        for (retry, started) in [
+            (0, fill(Err(Error::Overloaded))),
+            (3, fill(Err(Error::Unavailable))),
+            (u8::MAX, Err(Error::FlightFull)),
+        ] {
+            let error = match &started {
+                Ok(_) if retry == 0 => Error::Overloaded,
+                Ok(_) => Error::Unavailable,
+                Err(error) => *error,
+            };
+            let delay = win::retry_delay(retry.saturating_add(1));
+            assert!(!delay.is_zero());
+            let mut op = with_backoff(reactor.clone(), scope(), retry, started);
+            assert!(op.as_mut().poll(&mut cx).is_pending());
+            clock.advance(delay - Duration::from_millis(1));
+            assert!(op.as_mut().poll(&mut cx).is_pending());
+            clock.advance(Duration::from_millis(1));
+            assert_eq!(op.as_mut().poll(&mut cx), Poll::Ready(Err(error)));
+        }
+        // Cancellation ends the wait with the fill's own error.
+        let canceled = scope();
+        let mut op = with_backoff(
+            reactor.clone(),
+            canceled.clone(),
+            0,
+            fill(Err(Error::Overloaded)),
+        );
+        assert!(op.as_mut().poll(&mut cx).is_pending());
+        canceled.cancel().unwrap();
+        assert_eq!(
+            op.as_mut().poll(&mut cx),
+            Poll::Ready(Err(Error::Overloaded))
+        );
     }
 
     #[test]
     fn non_transient_fill_failures_are_not_refetched() {
-        let f = Fixture::new(crate::test_support::cluster::config(false).limits, 2);
+        let env = racer_io::Env::host();
+        let f = Fixture::new(&env, crate::test_support::cluster::config(false).limits, 2);
         let deadline = Instant::now() + Duration::from_secs(60);
-        let mut stream = stream_with_budget(&f, &metadata(), RangeBudget::ClientPages { deadline });
+        let mut stream = stream_with_budget(&f, &metadata(), PageBudget::Client { deadline });
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-        let budget = AcquisitionBudget::new(deadline, 8, 16);
-        stream.inject(Slot::Fetching(Box::pin(async move {
-            Ok((Err(Error::CorruptRecord), budget))
+        stream.inject(TestSlot::Fetching(Box::pin(async move {
+            Err(Error::CorruptRecord)
         })));
-        stream.poll_slots(&mut cx).unwrap();
-        assert!(matches!(
-            stream.slots[0],
-            Slot::Ready(Err(Error::CorruptRecord))
-        ));
+        stream.poll_slots(&mut cx);
+        assert_eq!(
+            stream.slot(0),
+            win::Slot::Failed(read::Error::CorruptRecord)
+        );
     }
 
     #[test]
-    fn out_of_order_completion_waits_for_front_and_returns_only_unused_credits() {
-        let f = Fixture::new(crate::test_support::cluster::config(false).limits, 2);
-        let deadline = Instant::now() + Duration::from_secs(60);
-        let mut budget = AcquisitionBudget::new(deadline, 6, 8);
-        let mut first_budget = budget.partition(3, 4).unwrap();
-        let mut last_budget = budget.partition(3, 4).unwrap();
-        first_budget
-            .begin_attempt(Instant::now(), deadline)
-            .unwrap();
-        last_budget.begin_attempt(Instant::now(), deadline).unwrap();
-        last_budget.charge_links(3).unwrap();
-        let gate = Rc::new(std::cell::Cell::new(false));
-        let opened = gated(gate.clone());
-        let mut stream = stream_with_budget(&f, &metadata(), RangeBudget::Shared(budget));
-        stream.inject(Slot::Fetching(Box::pin(async move {
-            opened.await;
-            Ok((Err(Error::VersionUnavailable), first_budget))
-        })));
-        stream.inject(Slot::Fetching(Box::pin(async move {
-            Ok((Err(Error::Unavailable), last_budget))
-        })));
-        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-        stream.poll_prefetch(&mut cx);
-        assert!(matches!(
-            stream.slots[1],
-            Slot::Ready(Err(Error::Unavailable))
-        ));
-        assert!(matches!(stream.slots[0], Slot::Fetching(_)));
-        assert_eq!(remaining_credits(&stream.budget), (2, 1));
-        // Re-polling a completed page must not return its credits twice.
-        assert!(stream.next_slice().as_mut().poll(&mut cx).is_pending());
-        assert_eq!(remaining_credits(&stream.budget), (2, 1));
-        gate.set(true);
-        stream.poll_prefetch(&mut cx);
-        assert!(matches!(
-            stream.slots.front(),
-            Some(Slot::Ready(Err(Error::VersionUnavailable)))
-        ));
-        let RangeBudget::Shared(budget) = &stream.budget else {
-            unreachable!()
-        };
-        assert_eq!(
-            (
-                budget.remaining_attempts(),
-                budget.remaining_links(),
-                budget.deadline()
-            ),
-            (4, 5, deadline)
-        );
-        // The head error is delivered first; the later error never is.
-        assert!(matches!(
-            stream.next_slice().as_mut().poll(&mut cx),
-            Poll::Ready(Err(Error::VersionUnavailable))
-        ));
-        assert!(matches!(
-            stream.next_slice().as_mut().poll(&mut cx),
-            Poll::Ready(Ok(None))
-        ));
-    }
-    #[test]
-    fn abandoning_window_drops_waiters_without_refunding_outstanding_spends() {
+    fn abandoning_window_drops_waiters() {
+        let env = racer_io::Env::host();
         struct Dropped(Rc<std::cell::Cell<bool>>);
         impl Drop for Dropped {
             fn drop(&mut self) {
                 self.0.set(true);
             }
         }
-        let f = Fixture::new(crate::test_support::cluster::config(false).limits, 2);
+        let f = Fixture::new(&env, crate::test_support::cluster::config(false).limits, 2);
         let deadline = Instant::now() + Duration::from_secs(60);
-        let mut budget = AcquisitionBudget::new(deadline, 3, 4);
-        let child = budget.partition(3, 4).unwrap();
         let mut metadata = metadata();
         metadata.length = 3;
-        let mut stream = stream_with_budget(&f, &metadata, RangeBudget::Shared(budget));
+        let mut stream = stream_with_budget(&f, &metadata, PageBudget::Client { deadline });
         let dropped = Rc::new(std::cell::Cell::new(false));
         let guard = Dropped(dropped.clone());
-        stream.inject(Slot::Fetching(Box::pin(async move {
+        stream.inject(TestSlot::Fetching(Box::pin(async move {
             let _guard = guard;
             std::future::pending::<()>().await;
-            Ok((Err(Error::Cancelled), child))
+            Err(Error::Canceled)
         })));
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         assert!(stream.next_slice().as_mut().poll(&mut cx).is_pending());
         futures::executor::block_on(stream.cancel()).unwrap();
         assert!(dropped.get());
-        assert_eq!(remaining_credits(&stream.budget), (0, 0));
     }
     #[test]
     fn later_failure_still_fills_earlier_pages_and_surfaces_in_order() {
-        let f = Fixture::new(crate::test_support::cluster::config(false).limits, 2);
+        let env = racer_io::Env::host();
+        let f = Fixture::new(&env, crate::test_support::cluster::config(false).limits, 2);
         let deadline = Instant::now() + Duration::from_secs(60);
-        let mut stream = stream_with_budget(&f, &metadata(), RangeBudget::ClientPages { deadline });
+        let mut stream = stream_with_budget(&f, &metadata(), PageBudget::Client { deadline });
         // The head probe misses only after the later page has already failed.
         let gate = Rc::new(std::cell::Cell::new(false));
         let opened = gated(gate.clone());
-        stream.inject(Slot::Probing(Box::pin(async move {
+        stream.inject(TestSlot::Probing(Box::pin(async move {
             opened.await;
             Ok(None)
         })));
-        let budget = stream.budget.next_page(false).unwrap().unwrap();
-        stream.inject(Slot::Fetching(Box::pin(async move {
-            Ok((Err(Error::VersionUnavailable), budget))
+        stream.inject(TestSlot::Fetching(Box::pin(async move {
+            Err(Error::VersionUnavailable)
         })));
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         assert!(stream.next_slice().as_mut().poll(&mut cx).is_pending());
-        assert!(matches!(
-            stream.slots[1],
-            Slot::Ready(Err(Error::VersionUnavailable))
-        ));
+        assert_eq!(
+            stream.slot(1),
+            win::Slot::Failed(read::Error::VersionUnavailable)
+        );
         gate.set(true);
         stream.poll_prefetch(&mut cx);
         // The missed head gets a direct fill despite the later failure (this
         // fixture has no worker, so starting it may fail at once), and nothing
         // is admitted at or past the failed page.
         assert!(
-            matches!(stream.slots[0], Slot::Fetching(_) | Slot::Ready(Err(_))),
+            matches!(
+                stream.slot(0),
+                win::Slot::Fetching(_)
+                    | win::Slot::Failed(_)
+                    | win::Slot::Missing { select: false }
+            ),
             "the head must not be left without work"
         );
-        assert!(matches!(
-            stream.slots[1],
-            Slot::Ready(Err(Error::VersionUnavailable))
-        ));
-        assert!(stream.selections.is_empty());
+        assert_eq!(
+            stream.slot(1),
+            win::Slot::Failed(read::Error::VersionUnavailable)
+        );
+        assert_eq!(stream.selections(), 0);
         // Once the head arrives it is delivered, then the failure ends the stream.
-        stream.slots[0] = Slot::Ready(Ok(page_result(&f.admission, &metadata(), 0)));
+        stream.place(
+            0,
+            TestSlot::Ready(Ok(page_result(&f.admission, &metadata(), 0))),
+        );
         let Poll::Ready(Ok(Some(reader))) = stream.next_slice().as_mut().poll(&mut cx) else {
             panic!("head deliverable");
         };
@@ -2487,29 +2813,25 @@ pub(super) mod tests {
     }
     #[test]
     fn memory_hits_in_window_deliver_without_fetching_earlier_pages() {
-        let f = Fixture::new(crate::test_support::cluster::config(false).limits, 2);
+        let env = racer_io::Env::host();
+        let f = Fixture::new(&env, crate::test_support::cluster::config(false).limits, 2);
         let metadata = metadata();
         let deadline = Instant::now() + Duration::from_secs(60);
-        let mut stream = stream_with_budget(
-            &f,
-            &metadata,
-            RangeBudget::Shared(AcquisitionBudget::new(deadline, 8, 16)),
-        );
+        let mut stream = stream_with_budget(&f, &metadata, PageBudget::Client { deadline });
         let gate = Rc::new(std::cell::Cell::new(false));
         let opened = gated(gate.clone());
         let head = page_result(&f.admission, &metadata, 0);
-        let budget = stream.budget.next_page(false).unwrap().unwrap();
-        stream.inject(Slot::Fetching(Box::pin(async move {
+        stream.inject(TestSlot::Fetching(Box::pin(async move {
             opened.await;
-            Ok((Ok(head), budget))
+            Ok(head)
         })));
         let hit = page_result(&f.admission, &metadata, 1);
-        stream.inject(Slot::Probing(Box::pin(async move { Ok(Some(hit)) })));
+        stream.inject(TestSlot::Probing(Box::pin(async move { Ok(Some(hit)) })));
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         assert!(stream.next_slice().as_mut().poll(&mut cx).is_pending());
         // The memory hit is ready ahead of the head and started no fill.
-        assert!(matches!(stream.slots[1], Slot::Ready(Ok(_))));
-        assert!(stream.selections.is_empty());
+        assert!(matches!(stream.slot(1), win::Slot::Ready { .. }));
+        assert_eq!(stream.selections(), 0);
         gate.set(true);
         for number in 0..2 {
             let Poll::Ready(Ok(Some(reader))) = stream.next_slice().as_mut().poll(&mut cx) else {
@@ -2520,10 +2842,12 @@ pub(super) mod tests {
     }
     #[test]
     fn out_of_order_direct_fill_is_buffered_and_delivered_in_order() {
-        let f = Fixture::new(crate::test_support::cluster::config(false).limits, 2);
+        let env = racer_io::Env::host();
+        let f = Fixture::new(&env, crate::test_support::cluster::config(false).limits, 2);
         let metadata = metadata();
-        let scope = RequestScope::new(RequestId([6; 16]), Instant::now() + Duration::from_secs(60))
-            .unwrap();
+        let scope =
+            RequestScope::host(RequestId([6; 16]), Instant::now() + Duration::from_secs(60))
+                .unwrap();
         let mut stream = f.open(
             &metadata,
             ByteRange::From(0).resolve(metadata.length).unwrap(),
@@ -2534,18 +2858,14 @@ pub(super) mod tests {
         let opened = gated(gate.clone());
         let head = page_result(&f.admission, &metadata, 0);
         let later = page_result(&f.admission, &metadata, 1);
-        let first = stream.budget.next_page(false).unwrap().unwrap();
-        let second = stream.budget.next_page(true).unwrap().unwrap();
-        stream.inject(Slot::Fetching(Box::pin(async move {
+        stream.inject(TestSlot::Fetching(Box::pin(async move {
             opened.await;
-            Ok((Ok(head), first))
+            Ok(head)
         })));
-        stream.inject(Slot::Fetching(Box::pin(
-            async move { Ok((Ok(later), second)) },
-        )));
+        stream.inject(TestSlot::Fetching(Box::pin(async move { Ok(later) })));
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         assert!(stream.next_slice().as_mut().poll(&mut cx).is_pending());
-        assert!(matches!(stream.slots[1], Slot::Ready(Ok(_))));
+        assert!(matches!(stream.slot(1), win::Slot::Ready { .. }));
         gate.set(true);
         let Poll::Ready(Ok(Some(reader))) = stream.next_slice().as_mut().poll(&mut cx) else {
             panic!("head deliverable");
@@ -2558,26 +2878,30 @@ pub(super) mod tests {
     }
     #[test]
     fn selection_fanout_reaches_every_window_that_wants_the_page() {
-        let f = Fixture::new(crate::test_support::cluster::config(false).limits, 4);
+        let env = racer_io::Env::host();
+        let f = Fixture::new(&env, crate::test_support::cluster::config(false).limits, 4);
         let metadata = metadata();
         let mut streams = (0..2)
             .map(|_| {
                 let mut stream = f.open(
                     &metadata,
                     ByteRange::From(0).resolve(metadata.length).unwrap(),
-                    RequestScope::new(RequestId([4; 16]), Instant::now() + Duration::from_secs(60))
-                        .unwrap(),
+                    RequestScope::host(
+                        RequestId([4; 16]),
+                        Instant::now() + Duration::from_secs(60),
+                    )
+                    .unwrap(),
                 );
                 stream.configure_subscription(2, 2 * PAGE_BYTES).unwrap();
-                stream.inject(Slot::Ready(Ok(page_result(&f.admission, &metadata, 0))));
-                stream.inject(Slot::Selecting);
+                stream.inject(TestSlot::Ready(Ok(page_result(&f.admission, &metadata, 0))));
+                stream.inject(TestSlot::Selecting);
                 stream
             })
             .collect::<Vec<_>>();
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         for stream in &mut streams {
             stream.poll_prefetch(&mut cx);
-            assert!(matches!(stream.slots[1], Slot::Selecting));
+            assert!(matches!(stream.slot(1), win::Slot::Selecting(_)));
         }
         assert_eq!(
             streams[0].lease.as_ref().unwrap().busy_elsewhere(),
@@ -2604,7 +2928,7 @@ pub(super) mod tests {
             .unwrap();
         for stream in &mut streams {
             stream.poll_prefetch(&mut cx);
-            assert!(matches!(stream.slots[1], Slot::Ready(Ok(_))));
+            assert!(matches!(stream.slot(1), win::Slot::Ready { .. }));
             for number in 0..2 {
                 let Poll::Ready(Ok(Some(reader))) = stream.next_slice().as_mut().poll(&mut cx)
                 else {
@@ -2616,16 +2940,17 @@ pub(super) mod tests {
     }
     #[test]
     fn selection_failure_returns_pages_to_direct_fill_and_cancellation_is_fatal() {
-        let f = Fixture::new(crate::test_support::cluster::config(false).limits, 2);
+        let env = racer_io::Env::host();
+        let f = Fixture::new(&env, crate::test_support::cluster::config(false).limits, 2);
         let metadata = metadata();
         for error in [
             Error::Unavailable,
             Error::Overloaded,
-            Error::Cancelled,
+            Error::Canceled,
             Error::DeadlineExceeded,
         ] {
             let scope =
-                RequestScope::new(RequestId([3; 16]), Instant::now() + Duration::from_secs(60))
+                RequestScope::host(RequestId([3; 16]), Instant::now() + Duration::from_secs(60))
                     .unwrap();
             let mut stream = f.open(
                 &metadata,
@@ -2633,49 +2958,46 @@ pub(super) mod tests {
                 scope.clone(),
             );
             stream.configure_subscription(2, 2 * PAGE_BYTES).unwrap();
-            stream.inject(Slot::Ready(Ok(page_result(&f.admission, &metadata, 0))));
-            stream.inject(Slot::Selecting);
-            let budget = stream.budget.next_page(false).unwrap().unwrap();
-            stream.selections.push(Pending {
-                operation: Box::pin(async move { Ok((Err(error), budget)) }),
-                pages: BTreeSet::from([1]),
-            });
+            stream.inject(TestSlot::Ready(Ok(page_result(&f.admission, &metadata, 0))));
+            stream.inject(TestSlot::Missing { select: true });
+            stream.inject_selection(&[1], Box::pin(async move { Err(error) }));
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
             // A selection's own failure, even of its child deadline, is not
             // the stream's.
-            assert_eq!(stream.poll_selections(&mut cx), Ok(true));
-            assert!(stream.selections.is_empty());
-            assert!(matches!(stream.slots[1], Slot::Missing { select: false }));
+            assert!(stream.poll_slots(&mut cx));
+            assert_eq!(stream.selections(), 0);
+            assert_eq!(stream.slot(1), win::Slot::Missing { select: false });
             // The page is no longer offered for selection, only for a direct fill.
             assert!(
                 stream
                     .selection_demand(&BTreeSet::new(), usize::MAX)
-                    .unwrap()
                     .is_none()
             );
             // Canceling the stream itself is fatal.
             scope.cancel().unwrap();
             stream.poll_prefetch(&mut cx);
-            assert_eq!(stream.error, Some(Error::Cancelled));
+            assert_eq!(stream.error, Some(Error::Canceled));
         }
     }
     #[test]
     fn spill_stays_off_by_default() {
-        let f = Fixture::new(crate::test_support::cluster::config(false).limits, 4);
+        let env = racer_io::Env::host();
+        let f = Fixture::new(&env, crate::test_support::cluster::config(false).limits, 4);
         let mut metadata = metadata();
         metadata.length = 4 * PAGE_BYTES;
         let mut stream = f.open(
             &metadata,
             ByteRange::From(0).resolve(metadata.length).unwrap(),
-            RequestScope::new(RequestId([2; 16]), Instant::now() + Duration::from_secs(60))
+            RequestScope::host(RequestId([2; 16]), Instant::now() + Duration::from_secs(60))
                 .unwrap(),
         );
         stream.configure_subscription(4, 4 * PAGE_BYTES).unwrap();
-        assert!(stream.spill.is_none());
+        assert_eq!(stream.spill, 0);
     }
     #[test]
     fn passthrough_stream_issues_no_selection_and_never_spills() {
-        let f = Fixture::new(crate::test_support::cluster::config(false).limits, 4);
+        let env = racer_io::Env::host();
+        let f = Fixture::new(&env, crate::test_support::cluster::config(false).limits, 4);
         f.streams
             .directory
             .configure_spill(crate::read::spill::Config {
@@ -2689,21 +3011,21 @@ pub(super) mod tests {
             let mut stream = f.open(
                 &metadata,
                 ByteRange::From(0).resolve(metadata.length).unwrap(),
-                RequestScope::new(RequestId([3; 16]), Instant::now() + Duration::from_secs(60))
+                RequestScope::host(RequestId([3; 16]), Instant::now() + Duration::from_secs(60))
                     .unwrap(),
             );
             if passthrough {
                 stream.set_passthrough();
             }
             stream.configure_subscription(4, 4 * PAGE_BYTES).unwrap();
-            assert_eq!(stream.spill.is_none(), passthrough);
+            assert_eq!(stream.spill == 0, passthrough);
             for _ in 0..4 {
-                stream.inject(Slot::Missing { select: true });
+                stream.inject(TestSlot::Missing { select: true });
             }
             // Selections ask providers for retained copies; passthrough
             // pages are each fetched through their owner's flight instead.
             assert_eq!(
-                stream.plan_selection().unwrap().is_none(),
+                stream.plan_selections().is_empty(),
                 passthrough,
                 "passthrough={passthrough}"
             );
@@ -2711,55 +3033,34 @@ pub(super) mod tests {
     }
     #[test]
     fn read_keeps_disjoint_selections_in_flight_up_to_spare_granted_flights() {
-        let f = Fixture::new(crate::test_support::cluster::config(false).limits, 8);
+        let env = racer_io::Env::host();
+        let f = Fixture::new(&env, crate::test_support::cluster::config(false).limits, 10);
         let mut metadata = metadata();
-        metadata.length = 8 * PAGE_BYTES;
+        metadata.length = 10 * PAGE_BYTES;
         let open = || {
             let mut stream = f.open(
                 &metadata,
                 ByteRange::From(0).resolve(metadata.length).unwrap(),
-                RequestScope::new(RequestId([5; 16]), Instant::now() + Duration::from_secs(60))
+                RequestScope::host(RequestId([5; 16]), Instant::now() + Duration::from_secs(60))
                     .unwrap(),
             );
-            stream.configure_subscription(8, 8 * PAGE_BYTES).unwrap();
-            for _ in 0..8 {
-                stream.inject(Slot::Missing { select: true });
+            stream.configure_subscription(10, 10 * PAGE_BYTES).unwrap();
+            for _ in 0..10 {
+                stream.inject(TestSlot::Missing { select: true });
             }
             stream
         };
-        // Admit selections as `admit` does, with operations that never finish
-        // in place of worker submissions.
-        let admit = |stream: &mut RangeStream| {
-            while stream.may_select() {
-                let Some((_, pages)) = stream.plan_selection().unwrap() else {
-                    break;
-                };
-                for number in &pages {
-                    *stream.slot_mut(*number).unwrap() = Slot::Selecting;
-                }
-                stream.selections.push(Pending {
-                    operation: Box::pin(std::future::pending()),
-                    pages,
-                });
-            }
-        };
-        let selected = |stream: &RangeStream| {
-            stream
-                .selections
-                .iter()
-                .map(|pending| pending.pages.clone())
-                .collect::<Vec<_>>()
-        };
-        // Before any provider grants more than one flight, a read runs one
-        // selection over every selectable hole beyond its direct fills.
+        // The head and `DIRECT_AHEAD` pages are filled directly; selections
+        // cover the rest. Before any provider grants more than one flight, a
+        // read runs one selection over every selectable hole.
+        assert_eq!(DIRECT_AHEAD, 1);
         let mut stream = open();
-        admit(&mut stream);
-        assert_eq!(selected(&stream), vec![BTreeSet::from_iter(0..8)]);
+        assert_eq!(stream.plan_selections(), vec![BTreeSet::from_iter(2..10)]);
         drop(stream);
         // A grant of several flights on a contract of the version lets the
         // read split its holes over several concurrent selections.
         let scheduler = &f.streams.directory.subscriptions;
-        let provider = racer_control_wire::NodeId("provider".into());
+        let provider = racer_wire::control::NodeId("provider".into());
         let granted = Selection::for_test(
             scheduler,
             metadata.version.clone(),
@@ -2782,24 +3083,18 @@ pub(super) mod tests {
         drop(granted);
         assert_eq!(scheduler.spare(&metadata.version), 4);
         let mut stream = open();
-        admit(&mut stream);
-        let pages = selected(&stream);
+        let pages = stream.plan_selections();
         assert_eq!(pages.len(), SELECTIONS);
         assert_eq!(
             pages,
             vec![
-                BTreeSet::from([0, 1]),
                 BTreeSet::from([2, 3]),
                 BTreeSet::from([4, 5]),
                 BTreeSet::from([6, 7]),
+                BTreeSet::from([8, 9]),
             ]
         );
-        assert!(
-            stream
-                .slots
-                .iter()
-                .all(|slot| matches!(slot, Slot::Selecting))
-        );
+        assert!((2..10).all(|index| matches!(stream.slot(index), win::Slot::Selecting(_))));
         drop(stream);
         // Once the granted flights are in use, a read starts only its first
         // selection, over every hole.
@@ -2827,42 +3122,33 @@ pub(super) mod tests {
             .collect::<Vec<_>>();
         assert_eq!(scheduler.spare(&metadata.version), 0);
         let mut stream = open();
-        admit(&mut stream);
-        assert_eq!(selected(&stream), vec![BTreeSet::from_iter(0..8)]);
+        assert_eq!(stream.plan_selections(), vec![BTreeSet::from_iter(2..10)]);
         drop(held);
     }
     #[test]
     fn selection_demand_covers_only_selectable_holes_not_selected_elsewhere() {
-        let f = Fixture::new(crate::test_support::cluster::config(false).limits, 8);
+        let env = racer_io::Env::host();
+        let f = Fixture::new(&env, crate::test_support::cluster::config(false).limits, 8);
         let mut metadata = metadata();
         metadata.length = 8 * PAGE_BYTES;
         let mut stream = f.open(
             &metadata,
             ByteRange::From(0).resolve(metadata.length).unwrap(),
-            RequestScope::new(RequestId([2; 16]), Instant::now() + Duration::from_secs(60))
+            RequestScope::host(RequestId([2; 16]), Instant::now() + Duration::from_secs(60))
                 .unwrap(),
         );
         stream.configure_subscription(8, 8 * PAGE_BYTES).unwrap();
-        stream.inject(Slot::Fetching(Box::pin(std::future::pending())));
-        stream.inject(Slot::Ready(Ok(page_result(&f.admission, &metadata, 1))));
-        stream.inject(Slot::Missing { select: true });
-        stream.inject(Slot::Missing { select: false });
+        stream.inject(TestSlot::Fetching(Box::pin(std::future::pending())));
+        stream.inject(TestSlot::Ready(Ok(page_result(&f.admission, &metadata, 1))));
+        stream.inject(TestSlot::Missing { select: true });
+        stream.inject(TestSlot::Missing { select: false });
         for _ in 4..8 {
-            stream.inject(Slot::Missing { select: true });
+            stream.inject(TestSlot::Missing { select: true });
         }
-        let (demand, pages) = stream
+        let (intervals, pages) = stream
             .selection_demand(&BTreeSet::from([5]), usize::MAX)
-            .unwrap()
             .unwrap();
-        use flow_control::subscriptions::Interval;
-        assert_eq!(
-            demand.intervals(),
-            &[
-                Interval { start: 2, end: 3 },
-                Interval { start: 4, end: 5 },
-                Interval { start: 6, end: 8 },
-            ]
-        );
+        assert_eq!(intervals, [2..3, 4..5, 6..8]);
         assert_eq!(pages, BTreeSet::from([2, 4, 6, 7]));
     }
     #[test]
@@ -2911,13 +3197,13 @@ pub(super) mod tests {
         let total = 4 * PAGE_BYTES + 17;
         let range = ByteRange::From(PAGE_BYTES).resolve(total).unwrap();
         for (capped, progressing) in [(true, false), (false, true), (false, false)] {
-            let clock = uring_runtime::environment::SimulationClock::new(55);
-            let environment = clock.environment(0);
-            let _clock = environment.enter();
+            let clock = racer_io::SimClock::new(55);
+            let environment = clock.ctx(0);
+            let env = racer_io::Env::new(racer_io::Driver::Uring, environment.clone());
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(false).limits,
             )));
-            let reactor = Rc::new(Reactor::new(admission.clone()));
+            let reactor = Rc::new(Reactor::new(admission.clone(), &env));
             let io = Rc::new(crate::http::new_io(
                 reactor.clone(),
                 Codec::new(32768),
@@ -2933,15 +3219,16 @@ pub(super) mod tests {
             metadata.length = total;
             metadata.version.object.cache = CacheId(crate::test_support::security::CACHE.into());
             let (client_socket, origin_socket) =
-                racer_control_wire::canonical_socket_paths("framing").unwrap();
+                racer_wire::control::canonical_socket_paths("framing").unwrap();
             let worker = crate::test_support::ReadWorker::new(
-                racer_control_wire::CacheDefinition {
+                &env,
+                racer_wire::control::CacheDefinition {
                     id: metadata.version.object.cache.clone(),
                     name: "framing".into(),
                     client_socket,
                     origin_socket,
-                    priority: racer_control_wire::DEFAULT_PRIORITY,
-                    mode: racer_control_wire::CacheMode::Cached,
+                    priority: racer_wire::control::DEFAULT_PRIORITY,
+                    mode: racer_wire::control::CacheMode::Cached,
                     origin: None,
                 },
                 metadata.clone(),
@@ -2950,10 +3237,10 @@ pub(super) mod tests {
                 delivery.clone(),
                 4,
             );
-            let _queue = worker.drivers.enter();
-            let scope = RequestScope::new(
+            let scope = RequestScope::on(
+                &env.ctx.clock,
                 RequestId([7; 16]),
-                uring_runtime::environment::now()
+                env.ctx.now()
                     + if progressing {
                         Duration::from_millis(30)
                     } else {
@@ -3099,7 +3386,7 @@ pub(super) mod tests {
                     && headers_sent.load(std::sync::atomic::Ordering::Acquire)
                     && worker
                         .origin
-                        .completed(racer_object_wire::test_util::RequestKind::PinnedGet)
+                        .completed(racer_wire::object::test_util::RequestKind::PinnedGet)
                         == 4
                     && worker.is_drained()
                 {
@@ -3126,10 +3413,9 @@ pub(super) mod tests {
                 assert!(Instant::now() < drain_deadline, "read worker did not drain");
             }
             worker.poll(&mut cx);
-            admission.reclaim_buffers();
             if progressing {
                 assert!(
-                    uring_runtime::environment::now() > scope.deadline.0,
+                    env.ctx.now() > scope.deadline.0,
                     "stream must cross the scaled old absolute deadline"
                 );
             }
@@ -3140,32 +3426,31 @@ pub(super) mod tests {
 
     #[test]
     fn progressing_page_children_keep_deadlines_and_retry_limits_across_long_streams() {
-        let clock = uring_runtime::environment::SimulationClock::new(81);
-        let _environment = clock.environment(0).enter();
+        let clock = racer_io::SimClock::new(81);
+        let sim_env = clock.ctx(0);
+        let sim_ctx = sim_env.clone();
         let timeout = Duration::from_millis(30);
-        let old_deadline = uring_runtime::environment::now() + timeout;
-        let mut budget = RangeBudget::ProgressingPages { timeout };
+        let old_deadline = sim_ctx.clock.now() + timeout;
+        let budget = PageBudget::Progressing { timeout };
         for _ in 0..12 {
-            let mut page = budget.next_page(false).unwrap().unwrap();
+            let mut page = budget.next_page(sim_ctx.clock.clone().now()).unwrap();
             let deadline = page.deadline();
-            assert_eq!(deadline, uring_runtime::environment::now() + timeout);
+            assert_eq!(deadline, sim_ctx.clock.now() + timeout);
             for _ in 0..8 {
-                page.begin_attempt(uring_runtime::environment::now(), deadline)
-                    .unwrap();
+                page.begin_attempt(sim_ctx.clock.now(), deadline).unwrap();
             }
             assert_eq!(
-                page.begin_attempt(uring_runtime::environment::now(), deadline),
+                page.begin_attempt(sim_ctx.clock.now(), deadline),
                 Err(racer_core::read::Error::Unavailable)
             );
             clock.advance(Duration::from_millis(20));
             assert_eq!(page.deadline(), deadline);
-            budget.complete(page).unwrap();
         }
-        assert!(uring_runtime::environment::now() > old_deadline);
-        let mut stalled = budget.next_page(false).unwrap().unwrap();
+        assert!(sim_ctx.clock.now() > old_deadline);
+        let mut stalled = budget.next_page(sim_ctx.clock.clone().now()).unwrap();
         clock.advance(timeout);
         assert_eq!(
-            stalled.begin_attempt(uring_runtime::environment::now(), stalled.deadline()),
+            stalled.begin_attempt(sim_ctx.clock.now(), stalled.deadline()),
             Err(racer_core::read::Error::DeadlineExceeded)
         );
     }
@@ -3178,10 +3463,10 @@ pub(super) mod tests {
         use crate::model::StrongEtag;
         use flow_control::Quotas;
         use flow_control::subscriptions::Interval;
-        use racer_control_wire::CacheId;
-        use racer_control_wire::MembershipVersion;
-        use racer_control_wire::NodeId;
         use racer_core::subscriptions::Demand as WireDemand;
+        use racer_wire::control::CacheId;
+        use racer_wire::control::MembershipVersion;
+        use racer_wire::control::NodeId;
         fn version() -> ObjectVersion {
             ObjectVersion {
                 object: ObjectId {
@@ -3243,8 +3528,8 @@ pub(super) mod tests {
         }
         #[test]
         fn contracts_never_refill_and_start_with_one_selection_per_provider() {
-            let scheduler = Scheduler::new(4);
-            let deadline = uring_runtime::environment::now() + std::time::Duration::from_secs(30);
+            let scheduler = Scheduler::new(4, racer_io::WorkerCtx::host());
+            let deadline = racer_io::Clock::host().now() + std::time::Duration::from_secs(30);
             let (first, one) = issue(&scheduler, 0, "provider", Some(4), deadline);
             let (one, _) = one.unwrap();
             // Until the provider grants more, a second concurrent selection
@@ -3283,8 +3568,8 @@ pub(super) mod tests {
         }
         #[test]
         fn contract_serves_up_to_granted_flights_and_refusal_resets_to_one() {
-            let scheduler = Scheduler::new(4);
-            let deadline = uring_runtime::environment::now() + std::time::Duration::from_secs(30);
+            let scheduler = Scheduler::new(4, racer_io::WorkerCtx::host());
+            let deadline = racer_io::Clock::host().now() + std::time::Duration::from_secs(30);
             let provider = NodeId("provider".into());
             let (first, result) = issue(&scheduler, 0, "provider", Some(3), deadline);
             result.unwrap();
@@ -3326,13 +3611,13 @@ pub(super) mod tests {
         }
         #[test]
         fn expired_contract_drains_before_a_fresh_one_replaces_it() {
-            let scheduler = Scheduler::new(4);
-            let deadline = uring_runtime::environment::now() + std::time::Duration::from_millis(20);
+            let scheduler = Scheduler::new(4, racer_io::WorkerCtx::host());
+            let deadline = racer_io::Clock::host().now() + std::time::Duration::from_millis(20);
             let (first, result) = issue(&scheduler, 0, "provider", Some(2), deadline);
             let (old, _) = result.unwrap();
             scheduler.granted(&first, &NodeId("provider".into()), 2);
             std::thread::sleep(std::time::Duration::from_millis(30));
-            let later = uring_runtime::environment::now() + std::time::Duration::from_secs(30);
+            let later = racer_io::Clock::host().now() + std::time::Duration::from_secs(30);
             // The expired contract never signs another request.
             let (_, draining) = issue(&scheduler, 1, "provider", Some(2), later);
             assert_eq!(draining, Err(Error::Overloaded));
@@ -3372,7 +3657,7 @@ pub(super) mod tests {
         }
         #[test]
         fn scheduler_windows_are_bounded_and_drop_frees_capacity() {
-            let scheduler = Scheduler::new(2);
+            let scheduler = Scheduler::new(2, racer_io::WorkerCtx::host());
             let first = scheduler.open(version()).unwrap();
             let second = scheduler.open(version()).unwrap();
             assert!(matches!(scheduler.open(version()), Err(Error::Overloaded)));
@@ -3383,7 +3668,7 @@ pub(super) mod tests {
         }
         #[test]
         fn offer_fans_out_to_every_window_that_wants_the_page() {
-            let scheduler = Scheduler::new(4);
+            let scheduler = Scheduler::new(4, racer_io::WorkerCtx::host());
             let first = scheduler.open(version()).unwrap();
             let second = scheduler.open(version()).unwrap();
             let slow = scheduler.open(version()).unwrap();
@@ -3406,7 +3691,7 @@ pub(super) mod tests {
         }
         #[test]
         fn offers_outside_wanted_pages_are_dropped_and_inbox_stays_bounded() {
-            let scheduler = Scheduler::new(1);
+            let scheduler = Scheduler::new(1, racer_io::WorkerCtx::host());
             let reader = scheduler.open(version()).unwrap();
             want(&reader, &[0, 1]);
             let selection = Selection::for_test(&scheduler, version(), demand(0, 1_000_000));
@@ -3425,7 +3710,7 @@ pub(super) mod tests {
         }
         #[test]
         fn dropped_window_is_removed_from_fanout_and_busy_elsewhere() {
-            let scheduler = Scheduler::new(2);
+            let scheduler = Scheduler::new(2, racer_io::WorkerCtx::host());
             let supplier = scheduler.open(version()).unwrap();
             let reader = scheduler.open(version()).unwrap();
             supplier.sync(
@@ -3461,7 +3746,7 @@ pub(super) mod tests {
             f.open(
                 metadata,
                 range,
-                RequestScope::new(
+                RequestScope::host(
                     crate::model::RequestId([1; 16]),
                     Instant::now() + Duration::from_secs(60),
                 )
@@ -3470,7 +3755,9 @@ pub(super) mod tests {
         }
         #[test]
         fn partial_final_page_uses_exact_bytes_and_completion_does_not_require_release() {
-            let f = super::Fixture::new(crate::test_support::cluster::config(false).limits, 2);
+            let env = racer_io::Env::host();
+            let f =
+                super::Fixture::new(&env, crate::test_support::cluster::config(false).limits, 2);
             let mut metadata = super::metadata();
             metadata.length = PAGE_BYTES + 5;
             let range = crate::model::ByteRange::From(PAGE_BYTES - 3)
@@ -3479,7 +3766,7 @@ pub(super) mod tests {
             let mut reader = stream(&f, &metadata, range);
             reader.configure_subscription(2, PAGE_BYTES).unwrap();
             for number in 0..2 {
-                reader.inject(Slot::Ready(Ok(super::page_result(
+                reader.inject(TestSlot::Ready(Ok(super::page_result(
                     &f.admission,
                     &metadata,
                     number,
@@ -3517,7 +3804,9 @@ pub(super) mod tests {
         }
         #[test]
         fn credit_boundaries_and_invalid_transitions_preserve_request_errors() {
-            let f = super::Fixture::new(crate::test_support::cluster::config(false).limits, 2);
+            let env = racer_io::Env::host();
+            let f =
+                super::Fixture::new(&env, crate::test_support::cluster::config(false).limits, 2);
             let mut metadata = super::metadata();
             metadata.length = PAGE_BYTES;
             let range = crate::model::ByteRange::From(0)
@@ -3530,7 +3819,7 @@ pub(super) mod tests {
                     Err(Error::InvalidRequest)
                 );
                 reader.configure_subscription(pages, bytes).unwrap();
-                reader.inject(Slot::Ready(Ok(super::page_result(
+                reader.inject(TestSlot::Ready(Ok(super::page_result(
                     &f.admission,
                     &metadata,
                     0,
@@ -3557,8 +3846,96 @@ pub(super) mod tests {
             }
         }
         #[test]
+        fn small_page_credits_are_bounded_by_the_range_page_size() {
+            let env = racer_io::Env::host();
+            let f =
+                super::Fixture::new(&env, crate::test_support::cluster::config(false).limits, 1);
+            let size = racer_wire::object::PageSize::new(64 << 10).unwrap();
+            let metadata = super::metadata();
+            let range = crate::model::ByteRange::From(0)
+                .resolve_paged(1, size)
+                .unwrap();
+            // One small page of credit is enough; less is not.
+            let mut reader = stream(&f, &metadata, range);
+            assert_eq!(
+                reader.configure_subscription(1, size.get() - 1),
+                Err(Error::InvalidRequest)
+            );
+            reader.configure_subscription(1, size.get()).unwrap();
+            drop(reader);
+            // Credits sized for the largest page stay accepted.
+            let mut reader = stream(&f, &metadata, range);
+            reader.configure_subscription(4, 4 * PAGE_BYTES).unwrap();
+        }
+        #[test]
+        fn pages_cut_at_another_page_size_are_never_delivered() {
+            let env = racer_io::Env::host();
+            let f =
+                super::Fixture::new(&env, crate::test_support::cluster::config(false).limits, 1);
+            let small = racer_wire::object::PageSize::new(64 << 10).unwrap();
+            let mut metadata = super::metadata();
+            metadata.length = 2 * PAGE_BYTES;
+            let scope = || {
+                RequestScope::host(
+                    crate::model::RequestId([1; 16]),
+                    Instant::now() + Duration::from_secs(60),
+                )
+                .unwrap()
+            };
+            // A small page 1 holds object bytes 64 KiB onward; a default-size
+            // range wants page 1 to hold bytes 16 MiB onward.
+            let range = crate::model::ByteRange::From(PAGE_BYTES)
+                .resolve(metadata.length)
+                .unwrap();
+            let mut reader = f.open(&metadata, range, scope());
+            reader.configure_subscription(1, PAGE_BYTES).unwrap();
+            reader.inject(TestSlot::Ready(Ok(super::page_result_sized(
+                &f.admission,
+                &metadata,
+                1,
+                small,
+            ))));
+            assert_eq!(
+                futures::executor::block_on(reader.next_slice()).err(),
+                Some(Error::CorruptRecord)
+            );
+            drop(reader);
+            // A default-size page is equally foreign to a small-page range.
+            let range = crate::model::ByteRange::From(small.get())
+                .resolve_paged(metadata.length, small)
+                .unwrap();
+            let mut reader = f.open(&metadata, range, scope());
+            reader.configure_subscription(1, PAGE_BYTES).unwrap();
+            reader.inject(TestSlot::Ready(Ok(super::page_result(
+                &f.admission,
+                &metadata,
+                1,
+            ))));
+            assert_eq!(
+                futures::executor::block_on(reader.next_slice()).err(),
+                Some(Error::CorruptRecord)
+            );
+            drop(reader);
+            // The same small page is delivered whole to a range cut at its size.
+            let mut reader = f.open(&metadata, range, scope());
+            reader.configure_subscription(1, PAGE_BYTES).unwrap();
+            reader.inject(TestSlot::Ready(Ok(super::page_result_sized(
+                &f.admission,
+                &metadata,
+                1,
+                small,
+            ))));
+            let delivered = futures::executor::block_on(reader.next_slice())
+                .unwrap()
+                .unwrap();
+            assert_eq!(delivered.slice().page, PageNumber(1));
+            assert_eq!(u64::from(delivered.slice().length), small.get());
+        }
+        #[test]
         fn invalid_credit_contracts_never_admit_demand() {
-            let f = super::Fixture::new(crate::test_support::cluster::config(false).limits, 1);
+            let env = racer_io::Env::host();
+            let f =
+                super::Fixture::new(&env, crate::test_support::cluster::config(false).limits, 1);
             let metadata = super::metadata();
             let range = crate::model::ByteRange::From(0).resolve(1).unwrap();
             for (pages, bytes) in [

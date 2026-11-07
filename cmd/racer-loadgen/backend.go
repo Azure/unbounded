@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"hash/fnv"
 	"io"
 	"net/http"
@@ -73,7 +74,13 @@ func (p *puller) configureUDS(capacity int) error {
 	p.closeBackend = client.Close
 	p.acquire = udsAcquirer(client)
 
-	if p.opts.RangeBytes > 0 {
+	switch {
+	case p.opts.Delivery == deliveryHostRead:
+		pool := &memfdPool{}
+		p.acquire = p.udsHostReadAcquirer(client, pool)
+		// Close the client first so no pull still uses a memfd.
+		p.closeBackend = func() error { return errors.Join(client.Close(), pool.close()) }
+	case p.opts.RangeBytes > 0:
 		p.acquire = p.udsRangedAcquirer(client)
 	}
 

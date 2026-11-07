@@ -26,16 +26,16 @@ use crate::worker::CryptoRuntime;
 use error::Operation;
 use model::PAGE_BYTES;
 use model::*;
-use racer_control_wire::BundleGeneration;
-use racer_control_wire::CacheEncryptionKey;
-use racer_control_wire::CacheKeyPurpose;
-use racer_control_wire::CacheKeyRef;
-use racer_control_wire::CacheKeyState;
-use racer_control_wire::KeyringBundle;
-use racer_control_wire::SCHEMA_VERSION;
-use racer_control_wire::{CacheId, ClusterId, NodeId};
 use racer_crypto::identity::KeyEpochs;
 use racer_crypto::identity::Keyring;
+use racer_io::ring::IoBuffer;
+use racer_wire::control::BundleGeneration;
+use racer_wire::control::CacheEncryptionKey;
+use racer_wire::control::CacheKeyPurpose;
+use racer_wire::control::CacheKeyRef;
+use racer_wire::control::CacheKeyState;
+use racer_wire::control::KeyringBundle;
+use racer_wire::control::{CacheId, ClusterId, NodeId};
 use runtime::Reactor;
 use runtime::RequestScope;
 use security::OriginContext;
@@ -47,7 +47,6 @@ use std::task::Context;
 use std::time::Duration;
 use std::time::Instant;
 use std::time::UNIX_EPOCH;
-use uring_runtime::reactor::IoBuffer;
 
 // Only origin content is generated. No client wire framing, scheduling, credit
 // accounting, page validation, encryption, or delivery is implemented here.
@@ -128,13 +127,16 @@ impl origin::Origin for GeneratedOrigin {
             scope.check()?;
             authority.validate(&context.object, page.number)?;
             let metadata = metadata(context);
-            let length = metadata.immutable().page_length(page)? as usize;
+            // The fixture publishes the default page size; cut at it explicitly.
+            let size = racer_wire::object::PageSize::DEFAULT;
+            let length = metadata.immutable().page_length_in(page, size)? as usize;
             let mut plaintext = self.0.plaintext(reservation, length)?;
-            let offset = page.number.0 * PAGE_BYTES;
+            let offset = page.number.0 * size.get();
             for (i, byte) in plaintext.bytes_mut()?.iter_mut().enumerate() {
                 *byte = ((offset + i as u64) % 251) as u8;
             }
             Ok(origin::OriginPage {
+                page_size: size,
                 metadata,
                 plaintext,
             })
@@ -146,7 +148,7 @@ impl NoPeer {
     fn direct_hedge_available(
         &self,
         _: &std::sync::Arc<crate::topology::Membership>,
-        _: &racer_control_wire::NodeId,
+        _: &racer_wire::control::NodeId,
     ) -> bool {
         false
     }
@@ -185,31 +187,31 @@ struct SubscriptionFixture {
     root: PathBuf,
     clients: client::listener::ClientListeners,
     endpoint: read::dispatch::WorkerEndpoint,
-    drivers: Rc<uring_runtime::drivers::DriverQueue>,
+    drivers: Rc<crate::drivers::DriverQueue>,
     engine: security::PageCryptoEngine,
     crypto: Rc<security::CryptoClient>,
     reactor: Rc<Reactor>,
     writer: Rc<store::StoreWriter>,
     memory: Rc<memory::MemoryCache>,
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
-    cache: racer_control_wire::CacheDefinition,
+    cache: racer_wire::control::CacheDefinition,
     scope: RequestScope,
 }
 
 impl SubscriptionFixture {
     fn construct(root: PathBuf) -> Self {
+        use crate::control::cell::PublicationCell;
         use client::RequestParser;
         use client::Responses;
         use client::listener::ClientListeners;
         use control::Snapshot;
         use control::publication::PublicationTarget;
-        use controlplane::Published;
         use http::Delivery;
         use memory::BufferPool;
         use memory::MemoryCache;
-        use racer_control_wire::CacheDefinition;
-        use racer_control_wire::Publication;
-        use racer_control_wire::*;
+        use racer_wire::control::CacheDefinition;
+        use racer_wire::control::Publication;
+        use racer_wire::control::*;
         use read::Coordinator;
         use read::candidates::CandidatePolicy;
         use read::dispatch::WorkerDirectory;
@@ -225,7 +227,6 @@ impl SubscriptionFixture {
         use store::StoreReader;
         use store::StoreWriter;
         use store::catalog::Index;
-        use store::catalog::SegmentClock;
 
         let mut limits = interop_limits();
         // Independent of the 512 MiB logical object: at most four plaintext pages.
@@ -235,31 +236,35 @@ impl SubscriptionFixture {
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             limits.clone(),
         )));
-        let reactor = Rc::new(Reactor::new(admission.clone()));
+        let reactor = Rc::new(Reactor::new(admission.clone(), &racer_io::Env::host()));
         reactor.init().unwrap();
         let buffers = BufferPool::new(admission.clone());
-        let keys = Rc::new(interop_keys());
-        let published = Arc::new(Published::new(Snapshot::retention(2)));
+        let keys = Rc::new(interop_keys(&reactor.ctx().clock));
+        let published = Arc::new(PublicationCell::new(Snapshot::retention(2)));
         let availability = Rc::new(control::Availability::new(published.clone(), keys.clone()));
-        let snapshots = Rc::new(PublicationTarget::new(keys.cluster().clone(), published));
+        let snapshots = Rc::new(PublicationTarget::new(
+            keys.cluster().clone(),
+            published,
+            reactor.ctx().clock.clone(),
+        ));
         let (client_socket, origin_socket) =
-            racer_control_wire::canonical_socket_paths("interop").unwrap();
+            racer_wire::control::canonical_socket_paths("interop").unwrap();
         let cache = CacheDefinition {
             id: CacheId("33333333-3333-4333-8333-333333333333".into()),
             name: "interop".into(),
             client_socket,
             origin_socket,
-            priority: racer_control_wire::DEFAULT_PRIORITY,
-            mode: racer_control_wire::CacheMode::Cached,
+            priority: racer_wire::control::DEFAULT_PRIORITY,
+            mode: racer_wire::control::CacheMode::Cached,
             origin: None,
         };
         snapshots
             .apply(Publication {
-                schema_version: racer_control_wire::SCHEMA_VERSION,
+                schema_version: racer_wire::control::SCHEMA_VERSION,
                 cluster: keys.cluster().clone(),
                 sequence: PublicationSequence(1),
                 membership_version: MembershipVersion(1),
-                members: vec![racer_control_wire::Member {
+                members: vec![racer_wire::control::Member {
                     node: keys.node().clone(),
                     shares: std::num::NonZeroU32::new(1).unwrap(),
                     peer_endpoint: "127.0.0.1:1".into(),
@@ -267,18 +272,25 @@ impl SubscriptionFixture {
                     site: String::new(),
                 }],
                 caches: vec![cache.clone()],
-                pools: racer_control_wire::default_pools(std::slice::from_ref(&cache)),
+                pools: racer_wire::control::default_pools(std::slice::from_ref(&cache)),
+                page_size: racer_wire::object::PageSize::DEFAULT,
             })
             .unwrap();
-        let directory = Arc::new(
+        let directory = std::rc::Rc::new(
             WorkerDirectory::new(
                 Arc::new(WorkerMap::new(vec![WorkerId(0)]).unwrap()),
                 vec![WorkerId(0)],
                 16,
+                racer_io::WorkerCtx::host(),
             )
             .unwrap(),
         );
-        let index = Rc::new(Index::new(WorkerId(0), 16, availability.clone()));
+        let index = Rc::new(Index::new(
+            WorkerId(0),
+            16,
+            availability.clone(),
+            reactor.ctx().clock.clone(),
+        ));
         let segments = Rc::new(page_alloc::Segments::new(64 * 1024 * 1024));
         let slabs = Rc::new(page_alloc::Slab::new(
             root.join("slabs/worker-0-slab-0.dat"),
@@ -295,8 +307,9 @@ impl SubscriptionFixture {
             reactor.clone(),
             availability.clone(),
         ));
+        // Building the eviction clock binds hold accounting to the segments.
+        let _ = crate::store::catalog::SegmentClock::new(index.clone(), segments.clone(), 1);
         let disk = Rc::new(StoreReader::new(
-            Rc::new(SegmentClock::new(index.clone(), segments.clone(), 1)),
             index.clone(),
             segments,
             slabs,
@@ -306,20 +319,31 @@ impl SubscriptionFixture {
         ));
         let (port, engine) = security::pair(WorkerId(0), 0, limits.queue_entries);
         let crypto = Rc::new(security::CryptoClient::new(port));
-        let engine = PageCryptoEngine::new(CryptoRuntime { port: engine });
-        let credentials = Rc::new(CredentialCrypto::new(keys.clone(), admission.clone()));
+        let engine = PageCryptoEngine::new(CryptoRuntime {
+            port: engine,
+            ctx: reactor.ctx().clone(),
+        });
+        let credentials = Rc::new(CredentialCrypto::new(
+            keys.clone(),
+            admission.clone(),
+            reactor.ctx().rng.clone(),
+        ));
         let peers = peer::Requester::scripted(
+            reactor.ctx().clock.clone(),
             Rc::new(NoPeer),
             NoPeer::direct_hedge_available,
             NoPeer::request,
             NoPeer::request_direct,
         );
+        let drivers = Rc::new(crate::drivers::DriverQueue::new(1024));
         let candidates = Rc::new(CandidatePolicy::new(
             keys.node().clone(),
             Rc::new(topology::Placement::new(16)),
             peers.clone(),
             credentials.clone(),
-            Arc::new(Published::new(Snapshot::retention(2))),
+            Arc::new(PublicationCell::new(Snapshot::retention(2))),
+            racer_io::WorkerCtx::host(),
+            drivers.clone(),
         ));
         let origin = Rc::new(GeneratedOrigin(buffers.clone()));
         let memory = Rc::new(MemoryCache::new(buffers.clone(), availability.clone()));
@@ -330,8 +354,17 @@ impl SubscriptionFixture {
             writer: writer.clone(),
             origin: origin.clone(),
             candidates: candidates.clone(),
-            flights: Rc::new(Flights::new(admission.clone(), availability.clone())),
-            crypto: Rc::new(PageCrypto::new(keys, crypto.clone())),
+            flights: Rc::new(Flights::new(
+                admission.clone(),
+                availability.clone(),
+                racer_io::Clock::host(),
+                drivers.clone(),
+            )),
+            crypto: Rc::new(PageCrypto::new(
+                keys,
+                crypto.clone(),
+                crate::memory::BufferPool::new(admission.clone()),
+            )),
             credentials: credentials.clone(),
             admission: admission.clone(),
             metadata_owner: directory.clone(),
@@ -348,7 +381,12 @@ impl SubscriptionFixture {
             },
         ));
         let delivery = Rc::new(Delivery::new(reactor.clone(), Duration::from_secs(10)));
-        let streams = Rc::new(RangeStreams::new(directory.clone(), delivery.clone(), 2));
+        let streams = Rc::new(RangeStreams::new(
+            directory.clone(),
+            delivery.clone(),
+            2,
+            drivers.clone(),
+        ));
         let coordinator = Rc::new(Coordinator::new(
             snapshots.published.clone(),
             metadata,
@@ -373,15 +411,15 @@ impl SubscriptionFixture {
             admission.clone(),
         );
         clients.set_root(root.clone());
-        let scope = RequestScope::new(
+        let scope = RequestScope::with_clock(
             RequestId([1; 16]),
             Instant::now() + Duration::from_secs(180),
+            racer_io::Clock::host(),
         )
         .unwrap();
         futures::executor::block_on(clients.reconcile(std::slice::from_ref(&cache), &scope))
             .unwrap();
         std::fs::write(root.join("ready"), b"ready").unwrap();
-        let drivers = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
         Self {
             root,
             clients,
@@ -399,7 +437,6 @@ impl SubscriptionFixture {
     }
 
     fn serve(&mut self) -> usize {
-        let _guard = self.drivers.enter();
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         let mut peak = 0;
         while !self.root.join("stop").exists() {
@@ -418,7 +455,7 @@ impl SubscriptionFixture {
         self.clients.poll_budgeted(cx, 64).unwrap();
         self.endpoint.poll_budgeted(64).unwrap();
         self.drivers.poll(cx, 64);
-        uring_runtime::group::Service::poll_budgeted(
+        crate::lifecycle::Service::poll_budgeted(
             &mut self.engine,
             &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
             64,
@@ -430,7 +467,6 @@ impl SubscriptionFixture {
     }
 
     fn teardown(&mut self) {
-        let _guard = self.drivers.enter();
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         self.clients.cancel_cache(&self.cache.id).unwrap();
         self.clients.stop_admission();
@@ -448,9 +484,6 @@ impl SubscriptionFixture {
             self.reactor.wait(Duration::from_millis(1)).unwrap();
         }
         self.memory.remove_cache(&self.cache.id).unwrap();
-        // Returned allocation buffers remain charged until their reusable pool is
-        // reclaimed. They are not live subscription leases.
-        self.admission.reclaim_buffers();
         assert_eq!(
             self.admission.used(ResourceClass::Plaintext),
             0,
@@ -475,6 +508,8 @@ fn interop_limits() -> Limits {
         queue_entries: count,
         connections_per_neighbor: count,
         client_connections: count,
+        peer_connections: count,
+        outbound_connections: count,
         pipes: count,
         range_window_pages: count,
         header_bytes: NonZeroUsize::new(16 * 1024).unwrap(),
@@ -488,12 +523,12 @@ fn interop_limits() -> Limits {
     }
 }
 
-fn interop_keys() -> racer_crypto::identity::Keyring {
+fn interop_keys(clock: &racer_io::Clock) -> racer_crypto::identity::Keyring {
     let cluster = ClusterId("11111111-1111-4111-8111-111111111111".into());
     let keys = Keyring::new(
         cluster.clone(),
         NodeId("22222222-2222-4222-8222-222222222222".into()),
-        Arc::new(KeyEpochs::default()),
+        Arc::new(KeyEpochs::with_clock(crate::enrollment::wall_clock(clock))),
     );
     let mut ca = rcgen::CertificateParams::new(vec![]).unwrap();
     ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
@@ -501,7 +536,7 @@ fn interop_keys() -> racer_crypto::identity::Keyring {
         .self_signed(&rcgen::KeyPair::generate().unwrap())
         .unwrap();
     keys.install(KeyringBundle {
-        schema_version: SCHEMA_VERSION,
+        schema_version: racer_wire::control::KEYRING_SCHEMA_VERSION,
         cluster,
         generation: BundleGeneration(1),
         peer_trust_roots: vec![ca.der().to_vec()],

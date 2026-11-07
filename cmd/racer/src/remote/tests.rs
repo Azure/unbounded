@@ -186,10 +186,10 @@ fn endpoint_identity_authority_and_validation() {
     let a = RemoteEndpoint::http("Account.Blob.Core.Windows.Net", 80).unwrap();
     assert_eq!(a.host(), "account.blob.core.windows.net");
     assert_eq!(a.authority(), "account.blob.core.windows.net");
-    assert!(a.needs_resolve());
+    assert!(a.needs_resolve(racer_io::Clock::host().now()));
     let v6 = RemoteEndpoint::http("[::1]", 10000).unwrap();
     assert_eq!(v6.authority(), "[::1]:10000");
-    assert!(!v6.needs_resolve());
+    assert!(!v6.needs_resolve(racer_io::Clock::host().now()));
     assert_eq!(v6.address().unwrap(), "[::1]:10000".parse().unwrap());
     let imds = RemoteEndpoint::http("169.254.169.254", 80).unwrap();
     assert_eq!(imds.authority(), "169.254.169.254");
@@ -215,7 +215,8 @@ fn endpoint_identity_authority_and_validation() {
 
 #[test]
 fn resolution_caches_rotates_and_keeps_stale_addresses() {
-    let Some(reactor) = reactor() else { return };
+    let env = racer_io::Env::host();
+    let Some(reactor) = reactor(&env) else { return };
     let endpoint = RemoteEndpoint::http("origin.example", 80).unwrap();
     assert_eq!(endpoint.address().err(), Some(Error::Unavailable));
     let resolver = MapResolver::new(vec![
@@ -244,7 +245,8 @@ fn resolution_caches_rotates_and_keeps_stale_addresses() {
 
 #[test]
 fn re_resolution_keeps_rotating_instead_of_pinning_the_first_address() {
-    let Some(reactor) = reactor() else { return };
+    let env = racer_io::Env::host();
+    let Some(reactor) = reactor(&env) else { return };
     let endpoint = RemoteEndpoint::http("origin.example", 80).unwrap();
     let dead: SocketAddr = "10.0.0.1:80".parse().unwrap();
     let live: SocketAddr = "10.0.0.2:80".parse().unwrap();
@@ -284,7 +286,8 @@ fn json_response(body: &str, chunked: bool) -> Vec<u8> {
 
 #[test]
 fn small_exchange_over_http_and_https_by_name() {
-    let Some(reactor) = reactor() else { return };
+    let env = racer_io::Env::host();
+    let Some(reactor) = reactor(&env) else { return };
     let identity = test_identity(&["token.example"]);
     for (tls, chunked) in [(false, false), (false, true), (true, false), (true, true)] {
         let (address, _, server) = serve(
@@ -337,7 +340,8 @@ fn small_exchange_over_http_and_https_by_name() {
 /// record-layer placement), reading a 16 MiB body in bounded chunks.
 #[test]
 fn pooled_remote_endpoint_range_reads() {
-    let Some(reactor) = reactor() else { return };
+    let env = racer_io::Env::host();
+    let Some(reactor) = reactor(&env) else { return };
     const BODY: usize = 16 << 20;
     let identity = test_identity(&["account.blob.example"]);
     for tls in [false, true] {
@@ -410,7 +414,7 @@ fn pooled_remote_endpoint_range_reads() {
                     while offset < BODY {
                         let buffer = io.buffer(256 * 1024)?;
                         let read = io.read_body_exact(connection, buffer, &scope).await?;
-                        use uring_runtime::reactor::IoBuffer as _;
+                        use racer_io::ring::IoBuffer as _;
                         let bytes = read.buffer.bytes()?;
                         assert!(
                             bytes
@@ -440,7 +444,8 @@ fn pooled_remote_endpoint_range_reads() {
 
 #[test]
 fn overlapping_exchanges_each_try_every_address() {
-    let Some(reactor) = reactor() else { return };
+    let env = racer_io::Env::host();
+    let Some(reactor) = reactor(&env) else { return };
     let endpoint = RemoteEndpoint::http("origin.example", 80).unwrap();
     let refused: SocketAddr = "10.0.0.1:80".parse().unwrap();
     let healthy: SocketAddr = "10.0.0.2:80".parse().unwrap();

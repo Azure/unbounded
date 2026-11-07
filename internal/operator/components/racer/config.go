@@ -4,6 +4,8 @@
 package racer
 
 import (
+	_ "embed"
+	"encoding/json"
 	"fmt"
 	"math"
 	"slices"
@@ -15,108 +17,127 @@ import (
 	"github.com/Azure/unbounded/internal/racer/workload"
 )
 
-// gpuStagingUnit mirrors GPU_STAGING_UNIT in cmd/racer/src/config.rs.
-const gpuStagingUnit = 2 << 20
+// dataplaneSettingsJSON is generated from the dataplane's configuration table
+// (cmd/racer/src/config/table.rs). Regenerate it with
+// `BLESS=1 cargo test -p racer config::tests::generated_reference_is_current`
+// in cmd/racer; that test fails when this file is stale.
+//
+//go:embed dataplane-settings.json
+var dataplaneSettingsJSON []byte
 
-// Constants mirrored from cmd/racer/src: MIB, MAX_BYTES, and
-// MAX_ENTRIES in config.rs, PAGE_BYTES in model, DUPLICATE_BYTES in
-// read/candidates.rs, and the storage record size checked in config.rs
-// (a page, a 16-byte tag, and MAX_HEADER_BYTES from store.rs).
-const (
-	mib            = 1 << 20
-	maxBytes       = 64 << 30
-	maxEntries     = 1 << 20
-	pageBytes      = 16 * mib
-	duplicateBytes = 2*pageBytes + 16
-	recordBytes    = pageBytes + 16 + 16384 + 4096
-)
+// dataplaneSetting is one entry of the generated table.
+type dataplaneSetting struct {
+	Name    string   `json:"name"`
+	Owner   string   `json:"owner"`
+	Scope   string   `json:"scope"`
+	Kind    string   `json:"kind"`
+	Min     string   `json:"min"`
+	Max     string   `json:"max"`
+	Step    string   `json:"step"`
+	Values  []string `json:"values"`
+	Default *string  `json:"default"`
+	// EmptyUnset marks settings where "" means unset, as Kubernetes expands
+	// absent field references.
+	EmptyUnset bool `json:"empty_unset"`
+}
 
-// The checks below mirror the startup parsing in
-// cmd/racer/src/config.rs so that a value the dataplane would refuse
-// fails the operator plan instead of rolling Pods into a crash loop. They
-// cover per-key syntax and ranges, not cross-key or hardware policy.
-var (
-	// Enumerated keys and their accepted values.
-	dataplaneEnumKeys = map[string][]string{
-		"RACER_ENABLE_RDMA":       {"auto", "true", "false"},
-		"RACER_ENABLE_GPU":        {"auto", "true", "false"},
-		"RACER_REPLICA_SELECTION": {"primary", "spread"},
-		"RACER_ADMISSION_MODE":    {"disabled", "second-sight"},
+// dataplaneSettings indexes the generated table by name. The checks below
+// apply the same per-key rules the dataplane applies at startup, so a value
+// it would refuse fails the operator plan instead of rolling Pods into a
+// crash loop. Cross-key rules that need the node, such as plaintext budgets
+// that must fit the range window, are left to the dataplane.
+var dataplaneSettings = func() map[string]dataplaneSetting {
+	var list []dataplaneSetting
+
+	if err := json.Unmarshal(dataplaneSettingsJSON, &list); err != nil {
+		panic(fmt.Sprintf("parse dataplane-settings.json: %v", err))
 	}
 
-	// Booleans parse with Rust's bool FromStr, which accepts only true and false.
-	dataplaneBoolKeys = []string{
-		"RACER_ALLOW_SMT", "RACER_OPAQUE_RELAY", "RACER_PEER_TCP_NODELAY",
-		"RACER_MEMORY_PRESSURE", "RACER_PPROF_ENABLED", "RACER_GPU_PCI_P2PDMA",
+	settings := make(map[string]dataplaneSetting, len(list))
+	for _, setting := range list {
+		settings[setting.Name] = setting
 	}
 
-	// Inclusive single-key ranges from Config::from_lookup and the validate
-	// methods it calls. Cross-key rules, such as RACER_CRYPTO_HELPERS at most
-	// RACER_IO_WORKERS or plaintext budgets that must fit the range window,
-	// are left to the dataplane.
-	dataplaneRangeKeys = map[string][2]uint64{
-		"RACER_GPU_LANDING_BYTES":              {0, math.MaxUint64},
-		"RACER_IO_WORKERS":                     {1, 65536},
-		"RACER_CRYPTO_HELPERS":                 {1, 65536},
-		"RACER_SHARES":                         {1, math.MaxUint32},
-		"RACER_DISK_PAGE_ENTRIES":              {1, maxEntries},
-		"RACER_ADMISSION_HISTORY_BYTES":        {32, 512 * mib},
-		"RACER_ADMISSION_PERIOD_SECS":          {1, 86400},
-		"RACER_CHECKPOINT_BYTES":               {1, 512 * mib},
-		"RACER_DEVICE_BUSY_WAIT_SECS":          {0, 3600},
-		"RACER_RETAINED_SEGMENT_PERCENT":       {1, 100},
-		"RACER_PREFETCH_MAX_BODY_BYTES":        {4096, 64 * mib},
-		"RACER_PREFETCH_MAX_REFS":              {1, 1 << 20},
-		"RACER_PREFETCH_MAX_TICKETS":           {1, 65536},
-		"RACER_PREFETCH_MAX_TTL_SECS":          {1, 86400},
-		"RACER_PREFETCH_TICKET_RETENTION_SECS": {0, 86400},
-		"RACER_PREFETCH_MAX_WAIT_SECS":         {1, 600},
-		"RACER_PREFETCH_DEFAULT_PENDING_BYTES": {pageBytes, 1 << 50},
-		"RACER_PREFETCH_MAX_PENDING_BYTES":     {pageBytes, 1 << 50},
-		"RACER_PREFETCH_NODE_PENDING_BYTES":    {pageBytes, 1 << 52},
-		"RACER_PREFETCH_CONCURRENT_FILLS":      {1, 1024},
-		"RACER_PREFETCH_ORIGIN_BYTES_PER_SEC":  {0, 1 << 40},
-		"RACER_PREFETCH_MAX_ATTEMPTS":          {1, 32},
-		"RACER_RANGE_SPILL_PAGES":              {0, 1024},
-		"RACER_PAGE_HEDGE_DELAY_MS":            {1, 30000},
-		"RACER_PAGE_HEDGE_SLOTS":               {0, 32},
-		"RACER_PAGE_HEDGE_BYTES":               {0, 32 * duplicateBytes},
-		"RACER_PEER_INFLIGHT_MAX":              {1, 65536},
-		"RACER_PEER_PER_NEIGHBOR_MAX":          {1, 65536},
-		"RACER_PEER_ADMISSION_RECOVERY_MS":     {1, 60000},
-		"RACER_PEER_RECEIVE_MAX":               {0, 65536},
-		"RACER_PEER_RECEIVE_QUEUE_MAX":         {1, 65536},
-		"RACER_PEER_RECEIVE_WAIT_MS":           {1, 30000},
-		"RACER_SLAB_BYTES":                     {1, math.MaxInt64},
-		"RACER_SEGMENT_BYTES":                  {recordBytes, math.MaxInt64},
-		"RACER_FREE_SEGMENT_RESERVE":           {1, maxEntries - 1},
-		"RACER_PLAINTEXT_BYTES":                {1, maxBytes},
-		"RACER_CIPHERTEXT_BYTES":               {1, maxBytes},
-		"RACER_DIRTY_BYTES":                    {pageBytes + 16, maxBytes},
-		"RACER_REGISTERED_BYTES":               {1, maxBytes},
-		"RACER_REQUEST_CONTEXT_BYTES":          {128 * 1024, maxBytes},
-		"RACER_FLIGHTS":                        {1, 65536},
-		"RACER_WAITERS_PER_FLIGHT":             {1, 4096},
-		"RACER_QUEUE_ENTRIES":                  {2, 65536},
-		"RACER_CONNECTIONS_PER_NEIGHBOR":       {1, 1024},
-		"RACER_CLIENT_CONNECTIONS":             {1, 65536},
-		"RACER_PIPES":                          {1, 65536},
-		"RACER_RANGE_WINDOW_PAGES":             {1, 64},
-		"RACER_HEADER_BYTES":                   {1024, 32 * 1024},
-		"RACER_PLACEMENT_CACHE_BYTES":          {1024, 512 * mib},
-		"RACER_CACHED_PATHS":                   {1, maxEntries},
-		"RACER_PATH_CACHE_BYTES":               {1, 512 * mib},
-		"RACER_ACTIVE_PATH_SEARCHES":           {1, 64},
-		"RACER_RETAINED_SNAPSHOTS":             {2, 64},
-		"RACER_METADATA_ENTRIES":               {1, maxEntries},
-		"RACER_RELAY_TRANSFERS":                {1, 65536},
-		"RACER_ORIGIN_CONNECTIONS_PER_CACHE":   {1, 1024},
-		"RACER_REQUEST_TIMEOUT_MS":             {1, 86400000},
-		"RACER_PEER_ATTEMPT_TIMEOUT_MS":        {1, 86400000},
-		"RACER_READER_STALL_TIMEOUT_MS":        {1, 86400000},
-		"RACER_SHUTDOWN_TIMEOUT_MS":            {1, 3600000},
+	return settings
+}()
+
+// maxDataplaneValueBytes mirrors MAX_VALUE_BYTES in cmd/racer/src/config/spec.rs.
+const maxDataplaneValueBytes = 4096
+
+// checkDataplaneValue applies one setting's syntax and bounds, returning the
+// rule it breaks or "" when the value is accepted.
+func checkDataplaneValue(setting dataplaneSetting, value string) string {
+	if value == "" {
+		if setting.EmptyUnset {
+			return ""
+		}
+
+		return "must not be empty"
 	}
-)
+
+	if len(value) > maxDataplaneValueBytes || strings.IndexFunc(value, unicode.IsControl) >= 0 {
+		return fmt.Sprintf("must be at most %d bytes without control characters", maxDataplaneValueBytes)
+	}
+
+	switch setting.Kind {
+	case "bool":
+		if value != "true" && value != "false" {
+			return "must be true or false"
+		}
+	case "enum":
+		if !slices.Contains(setting.Values, value) {
+			return "must be one of " + strings.Join(setting.Values, ", ")
+		}
+	case "unsigned":
+		minimum, maximum, step, err := unsignedBounds(setting)
+		if err != nil {
+			return "cannot be checked: " + err.Error()
+		}
+
+		n, valid := dataplaneDecimal(value)
+		if !valid || n < minimum || n > maximum {
+			return fmt.Sprintf("must be an integer from %d to %d", minimum, maximum)
+		}
+
+		if step > 1 && n%step != 0 {
+			return fmt.Sprintf("must be a multiple of %d", step)
+		}
+	}
+
+	return ""
+}
+
+// unsignedBounds parses an unsigned setting's bounds from the generated table.
+// An empty bound means none: Min defaults to 0, Max to the uint64 maximum, and
+// Step to 1.
+func unsignedBounds(setting dataplaneSetting) (minimum, maximum, step uint64, err error) {
+	parse := func(field, raw string, fallback uint64) (uint64, error) {
+		if raw == "" {
+			return fallback, nil
+		}
+
+		n, err := strconv.ParseUint(raw, 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("setting %s has invalid %s bound %q: %w", setting.Name, field, raw, err)
+		}
+
+		return n, nil
+	}
+
+	if minimum, err = parse("min", setting.Min, 0); err != nil {
+		return 0, 0, 0, err
+	}
+
+	if maximum, err = parse("max", setting.Max, math.MaxUint64); err != nil {
+		return 0, 0, 0, err
+	}
+
+	if step, err = parse("step", setting.Step, 1); err != nil {
+		return 0, 0, 0, err
+	}
+
+	return minimum, maximum, step, nil
+}
 
 // validateDataplaneConfig reports every racer-settings value the
 // dataplane or operator would reject, sorted by key, in one error.
@@ -127,35 +148,26 @@ func validateDataplaneConfig(data map[string]string) error {
 		problems = append(problems, key+" "+rule)
 	}
 
-	for key, allowed := range dataplaneEnumKeys {
-		if value, ok := data[key]; ok && !slices.Contains(allowed, value) {
-			add(key, "must be one of "+strings.Join(allowed, ", "))
+	for key, value := range data {
+		if !strings.HasPrefix(key, "RACER_") {
+			continue
 		}
-	}
 
-	for _, key := range dataplaneBoolKeys {
-		if value, ok := data[key]; ok && value != "true" && value != "false" {
-			add(key, "must be true or false")
+		setting, known := dataplaneSettings[key]
+		if !known {
+			add(key, "is not a recognized setting; unknown RACER_* variables fail dataplane startup")
+
+			continue
 		}
-	}
 
-	for key, bounds := range dataplaneRangeKeys {
-		if value, ok := data[key]; ok {
-			if n, valid := dataplaneDecimal(value); !valid || n < bounds[0] || n > bounds[1] {
-				add(key, fmt.Sprintf("must be an integer from %d to %d", bounds[0], bounds[1]))
+		if rule := checkDataplaneValue(setting, value); rule != "" {
+			add(key, rule)
+		}
+
+		if _, both := data[key+"_PER_WORKER"]; both {
+			if _, paired := dataplaneSettings[key+"_PER_WORKER"]; paired {
+				add(key, "and "+key+"_PER_WORKER must not both be set; the first is a node-wide total, the second a per-worker amount")
 			}
-		}
-	}
-
-	if value, ok := data["RACER_GPU_STAGING_BYTES"]; ok {
-		if n, valid := dataplaneDecimal(value); !valid || n < gpuStagingUnit || n%gpuStagingUnit != 0 {
-			add("RACER_GPU_STAGING_BYTES", "must be a nonzero multiple of 2097152 (2 MiB)")
-		}
-	}
-
-	if value, ok := data["RACER_GPU_LANDING_BYTES"]; ok {
-		if n, valid := dataplaneDecimal(value); valid && n%gpuStagingUnit != 0 {
-			add("RACER_GPU_LANDING_BYTES", "must be 0 or a multiple of 2097152 (2 MiB)")
 		}
 	}
 
@@ -170,12 +182,6 @@ func validateDataplaneConfig(data map[string]string) error {
 		seats, err := strconv.ParseUint(value, 10, 8)
 		if err != nil || strconv.FormatUint(seats, 10) != value || seats < 1 || seats > workload.MaxControlSeats {
 			add(workload.ControlSeatsKey, fmt.Sprintf("must be auto or an integer from 1 to %d", workload.MaxControlSeats))
-		}
-	}
-
-	if value, ok := data[workload.NVIDIAKey]; ok {
-		if mode := workload.NVIDIAInjection(value); mode != workload.NVIDIAOff && mode != workload.NVIDIAEnv && mode != workload.NVIDIACDI {
-			add(workload.NVIDIAKey, "must be off, env, or cdi")
 		}
 	}
 

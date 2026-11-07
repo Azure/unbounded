@@ -552,7 +552,7 @@ mod tests {
                 Duration::ZERO,
                 &AtomicBool::new(true)
             ),
-            Err(Error::Cancelled)
+            Err(Error::Canceled)
         ));
     }
     #[test]
@@ -571,7 +571,7 @@ mod tests {
                 &AtomicBool::new(true),
                 Instant::now() + Duration::from_secs(1)
             ),
-            Err(Error::Cancelled)
+            Err(Error::Canceled)
         ));
     }
 }

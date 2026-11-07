@@ -31,6 +31,19 @@ pub const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 /// After sending `Close`, break at the latest this long later.
 pub(crate) const CLOSE_GRACE: Duration = Duration::from_secs(1);
 
+/// How long past its deadline an exposed grant may wait for the peer's
+/// write or `Release` before the link closes gracefully.
+///
+/// Only the peer or a QP teardown can fence an exposed grant: the protocol
+/// has no grantor-side revoke, and invalidating the window alone would leave
+/// the tag in the peer's grant table (a later reuse of the tag, or the
+/// peer's write, would then break the link anyway). So an orphaned grant
+/// (for example the peer shed the request before it saw the grant) keeps
+/// its buffer exposed and its grant slot held for this long, and then the
+/// link sends `Close`. The buffer stays `Exposed` until the QP is destroyed,
+/// so a late write can never land in a reused buffer.
+pub const EXPOSED_GRACE: Duration = Duration::from_secs(10);
+
 const SEND_CTL: u8 = 1;
 const RECV_CTL: u8 = 2;
 const WRITE: u8 = 3;
@@ -54,6 +67,10 @@ pub struct Granted {
 
     /// Resolves once the peer wrote or released, after the fence.
     pub arrival: Op<Arrival>,
+
+    /// The request parked for a free grant slot or page buffer before this
+    /// grant (see [`crate::Client::grant_parked`]).
+    pub waited: bool,
 }
 
 /// How a grant ended.
@@ -166,6 +183,45 @@ pub(crate) fn depths(grants: u32) -> Option<(u32, u32)> {
     (grants > 0).then_some((send, recv))
 }
 
+/// The largest grants per link whose QP and CQ fit `caps` in `mode`, or
+/// `None` if not even one grant fits. Mirrors the sizing in
+/// `NativeQueuePair::new_with_depth`: registration mode posts up to
+/// `WRITE_WRS` send WRs per send, and the CQ holds every send and receive
+/// WR. In window mode each grant binds its own memory window. A zero limit
+/// means the device did not report it and leaves it unbounded.
+pub(crate) fn max_grants(mode: crate::ffi::Mode, caps: &crate::ffi::Caps) -> Option<u32> {
+    let limit = |v: u32| if v == 0 { u32::MAX } else { v };
+    let per_send = match mode {
+        crate::ffi::Mode::Window => 1,
+        crate::ffi::Mode::Registration => crate::ffi::WRITE_WRS,
+    };
+    let fits = |g: u32| {
+        depths(g).is_some_and(|(send, recv)| {
+            send.checked_mul(per_send).is_some_and(|send_wrs| {
+                send_wrs <= limit(caps.max_qp_wr)
+                    && recv <= limit(caps.max_qp_wr)
+                    && send_wrs
+                        .checked_add(recv)
+                        .is_some_and(|cq| cq <= limit(caps.max_cqe) && cq <= i32::MAX as u32)
+            })
+        }) && (mode != crate::ffi::Mode::Window || g <= limit(caps.max_mw))
+    };
+    if !fits(1) {
+        return None;
+    }
+    // `fits` is monotonic: binary search the largest passing value.
+    let (mut lo, mut hi) = (1u32, u32::MAX);
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        if fits(mid) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    Some(lo)
+}
+
 /// Who started the link.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Role {
@@ -195,7 +251,7 @@ pub(crate) enum Phase {
 /// Why a link must be broken.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Break {
-    /// Error completion, protocol violation, or exposed grant deadline.
+    /// Error completion or protocol violation.
     Error,
 
     /// The peer sent `Close`.
@@ -241,7 +297,7 @@ enum Outcome {
     Released,
 
     /// Never exposed to the peer; the grant op fails with this.
-    Cancelled(Error),
+    Canceled(Error),
 }
 
 /// A grant we issued (receiver side).
@@ -261,6 +317,9 @@ struct GrantEntry {
     deadline: Instant,
 
     granted: Option<Completer<Granted>>,
+
+    /// The request parked before this grant ([`Granted::waited`]).
+    waited: bool,
 
     arrival: Option<Completer<Arrival>>,
 }
@@ -287,8 +346,13 @@ enum Waiting {
         done: Completer<()>,
     },
 
+    /// A release requested before its `Grant` arrived. Sent when the grant
+    /// arrives; forgotten at `deadline`. `done` is `None` when the caller
+    /// was already answered (the tag was unknown at the time).
     Release {
-        done: Completer<()>,
+        done: Option<Completer<()>>,
+
+        deadline: Instant,
     },
 }
 
@@ -301,7 +365,7 @@ enum Outgoing {
 
         transfer: [u8; 16],
 
-        done: Completer<()>,
+        done: Option<Completer<()>>,
     },
 
     Credit,
@@ -386,7 +450,9 @@ enum InFlight {
 pub(crate) struct Link {
     // Declared first: dropped (stopped and freed) before the windows and
     // regions it may use.
-    qp: Rc<NativeQueuePair>,
+    /// The only ledger of posted work: each send-queue request carries its
+    /// [`InFlight`] record until it completes or the QP stops.
+    qp: Rc<NativeQueuePair<InFlight>>,
 
     windows: Vec<Rc<MemoryWindow>>,
 
@@ -418,8 +484,6 @@ pub(crate) struct Link {
     /// Receives we reposted but have not reported.
     owed: u32,
 
-    sq_used: u32,
-
     next_tag: u32,
 
     free_windows: Vec<usize>,
@@ -440,9 +504,12 @@ pub(crate) struct Link {
 
     waiting: BTreeMap<u32, Waiting>,
 
-    outbox: VecDeque<Outgoing>,
+    /// Peer grant tags this epoch already wrote or released, newest last,
+    /// bounded by twice the grant cap. A repeated `Release` for one of them
+    /// completes at once instead of waiting for a grant that never comes.
+    consumed: VecDeque<u32>,
 
-    inflight: BTreeMap<u64, InFlight>,
+    outbox: VecDeque<Outgoing>,
 
     /// Buffers held until the QP is destroyed.
     quarantine: Vec<Buffer>,
@@ -459,8 +526,20 @@ pub(crate) struct Link {
 
     close_sent: bool,
 
+    /// The QP was ready (connected and, in registration mode, established
+    /// by the connection manager) at some poll.
+    established: bool,
+
     /// Ops were failed by `destroy`.
     failed: bool,
+
+    /// An exposed grant outlived [`EXPOSED_GRACE`] and started a `Close`.
+    /// Taken by [`Link::take_grant_expired`].
+    grant_expired: bool,
+
+    /// The last poll read a full completion batch: more may wait in the CQ
+    /// without raising a new channel event.
+    more: bool,
 }
 
 impl Link {
@@ -473,6 +552,7 @@ impl Link {
         quota: &Arc<GuardOwner>,
         limits: Limits,
         now: Instant,
+        rng: &racer_io::Rng,
     ) -> Result<Self> {
         let (send_depth, recv_depth) = depths(limits.grants).ok_or(Error::InvalidConfiguration)?;
         let send_slots = recv_depth;
@@ -482,6 +562,7 @@ impl Link {
             Arc::new(AtomicBool::new(false)),
             send_depth,
             recv_depth,
+            rng,
         )?;
         let control = NativeRegion::with_access(
             device.clone(),
@@ -519,22 +600,24 @@ impl Link {
             credits: 0,
             unreturned: 0,
             owed: 0,
-            sq_used: 0,
             next_tag: 0,
             free_slots: (recv_depth..recv_depth + send_slots).rev().collect(),
             grants: BTreeMap::new(),
             grant_cap: limits.grants,
             remote: BTreeMap::new(),
             waiting: BTreeMap::new(),
+            consumed: VecDeque::new(),
             outbox: VecDeque::new(),
-            inflight: BTreeMap::new(),
             quarantine: Vec::new(),
             held: Vec::new(),
             created: now,
             ready_since: None,
             last_used: now,
             close_sent: false,
+            established: false,
+            more: false,
             failed: false,
+            grant_expired: false,
         })
     }
 
@@ -567,6 +650,11 @@ impl Link {
 
     pub(crate) fn link_id(&self) -> u64 {
         self.link_id
+    }
+
+    /// Whether an expired exposed grant started a `Close` since the last call.
+    pub(crate) fn take_grant_expired(&mut self) -> bool {
+        std::mem::take(&mut self.grant_expired)
     }
 
     /// When the link became `Ready`, if it did.
@@ -619,12 +707,22 @@ impl Link {
         self.last_used = now;
     }
 
+    /// True while every grant slot of the link is held.
+    pub(crate) fn grants_full(&self) -> bool {
+        self.grants.len() >= self.grant_cap as usize
+    }
+
     /// Bind a window over a free buffer and queue a `Grant`. `done` gets the
-    /// tag and arrival op once the `Grant` is posted. With `device`, the
-    /// buffer comes from that device pool and the arrival is
-    /// [`Arrival::Device`]: fails with [`Error::Unavailable`] if the rail has
-    /// no such device pool and [`Error::Overloaded`] if none is free.
+    /// tag and arrival op once the `Grant` is posted; `waited` is reported
+    /// as [`Granted::waited`]. With `device`, the buffer comes from that
+    /// device pool and the arrival is [`Arrival::Device`]: fails with
+    /// [`Error::Unavailable`] if the rail has no such device pool.
+    ///
+    /// When every grant slot ([`Self::grants_full`]) or every buffer of the
+    /// pool is held, `done` comes back uncompleted, so the caller can fail
+    /// it [`Error::Overloaded`] or park it until something frees.
     #[allow(clippy::too_many_arguments)]
+    #[must_use]
     pub(crate) fn grant(
         &mut self,
         pool: &Pool,
@@ -632,27 +730,27 @@ impl Link {
         transfer: [u8; 16],
         length: u32,
         deadline: Instant,
+        waited: bool,
         done: Completer<Granted>,
         now: Instant,
-    ) {
+    ) -> Option<Completer<Granted>> {
         if self.phase != Phase::Ready {
             let _ = done.complete(Err(Error::Unavailable));
-            return;
+            return None;
         }
 
         if length == 0 || length > self.limits.buffer_len {
             let _ = done.complete(Err(Error::InvalidRange));
-            return;
+            return None;
         }
 
-        if self.grants.len() >= self.grant_cap as usize {
-            let _ = done.complete(Err(Error::Overloaded));
-            return;
+        if self.grants_full() {
+            return Some(done);
         }
 
         if device.is_some_and(|id| pool.device_shared(id).is_none()) {
             let _ = done.complete(Err(Error::Unavailable));
-            return;
+            return None;
         }
 
         let window = if let Some(id) = device {
@@ -668,7 +766,7 @@ impl Link {
                     }
                     Err(error) => {
                         let _ = done.complete(Err(error));
-                        return;
+                        return None;
                     }
                 },
             }
@@ -683,8 +781,7 @@ impl Link {
         };
         let Some(buffer) = taken else {
             self.free_window(device, window);
-            let _ = done.complete(Err(Error::Overloaded));
-            return;
+            return Some(done);
         };
 
         let tag = self.allocate_tag();
@@ -700,10 +797,12 @@ impl Link {
                 state: GrantState::Binding,
                 deadline,
                 granted: Some(done),
+                waited,
                 arrival: None,
             },
         );
         self.outbox.push_back(Outgoing::Bind(tag));
+        None
     }
 
     /// Return `window` to its free list.
@@ -781,6 +880,7 @@ impl Link {
         }
 
         self.remote.remove(&tag);
+        self.mark_consumed(tag);
         self.outbox.push_back(Outgoing::Write {
             tag,
             source: Payload {
@@ -805,29 +905,62 @@ impl Link {
         self.last_used = now;
 
         if let Some(remote) = self.remote.remove(&tag) {
+            self.mark_consumed(tag);
             self.outbox.push_back(Outgoing::Release {
                 tag,
                 transfer: remote.transfer,
-                done,
+                done: Some(done),
             });
             return;
         }
 
+        let deadline = now + self.limits.idle;
+
         match self.waiting.remove(&tag) {
             Some(Waiting::Write { done: write, .. }) => {
-                let _ = write.complete(Err(Error::Cancelled));
-                self.waiting.insert(tag, Waiting::Release { done });
+                let _ = write.complete(Err(Error::Canceled));
+                self.waiting.insert(
+                    tag,
+                    Waiting::Release {
+                        done: Some(done),
+                        deadline,
+                    },
+                );
             }
+            // Idempotent: the earlier release still sends when the grant
+            // arrives.
             Some(waiting @ Waiting::Release { .. }) => {
                 self.waiting.insert(tag, waiting);
-                let _ = done.complete(Err(Error::InvalidRequest));
+                let _ = done.complete(Ok(()));
+            }
+            // Already written or released this epoch: nothing left to do.
+            None if self.consumed.contains(&tag) => {
+                let _ = done.complete(Ok(()));
             }
             None if self.waiting.len() >= 2 * self.limits.grants as usize => {
                 let _ = done.complete(Err(Error::Overloaded));
             }
+            // Unknown tag: answer now, and still release the grant if it
+            // arrives before the deadline.
             None => {
-                self.waiting.insert(tag, Waiting::Release { done });
+                let _ = done.complete(Ok(()));
+                self.waiting.insert(
+                    tag,
+                    Waiting::Release {
+                        done: None,
+                        deadline,
+                    },
+                );
             }
+        }
+    }
+
+    /// Record that the peer's grant `tag` was written or released.
+    fn mark_consumed(&mut self, tag: u32) {
+        self.consumed.retain(|&t| t != tag);
+        self.consumed.push_back(tag);
+        while self.consumed.len() > 2 * self.limits.grants as usize {
+            self.consumed.pop_front();
         }
     }
 
@@ -839,9 +972,53 @@ impl Link {
         }
     }
 
+    /// When this link next needs a poll without a wake source: `Some(t)`
+    /// with `t` in the past means at once. Completions, connection manager
+    /// events, commands, and returned buffers wake the owner on their own;
+    /// this covers timers and work that raises no event.
+    pub(crate) fn next_deadline(&self) -> Option<Instant> {
+        if self.more || self.qp.has_synthetic() {
+            return Some(self.created);
+        }
+        let mut next: Option<Instant> = None;
+        let mut at = |t: Instant| next = Some(next.map_or(t, |n| n.min(t)));
+        if matches!(self.phase, Phase::Created | Phase::Connecting) || !self.established {
+            at(self.created + SETUP_TIMEOUT);
+        }
+        for grant in self.grants.values() {
+            match grant.state {
+                GrantState::Bound => at(grant.deadline),
+                GrantState::Exposed if self.phase == Phase::Ready => {
+                    at(grant.deadline + EXPOSED_GRACE);
+                }
+                _ => {}
+            }
+        }
+        for waiting in self.waiting.values() {
+            match waiting {
+                Waiting::Write { deadline, .. } | Waiting::Release { deadline, .. } => {
+                    at(*deadline);
+                }
+            }
+        }
+        for outgoing in &self.outbox {
+            if let Outgoing::Write { deadline, .. } = outgoing {
+                at(*deadline);
+            }
+        }
+        match self.phase {
+            Phase::Ready => at(self.last_used + self.limits.idle),
+            Phase::Closing { until } => at(until),
+            Phase::Created | Phase::Connecting => {}
+        }
+        next
+    }
+
     /// Reap completions, run timers, and post queued work.
     pub(crate) fn poll(&mut self, pool: &Pool, now: Instant) -> std::result::Result<(), Break> {
-        if matches!(self.phase, Phase::Created | Phase::Connecting)
+        self.established |= self.qp.ready();
+
+        if (matches!(self.phase, Phase::Created | Phase::Connecting) || !self.established)
             && now >= self.created + SETUP_TIMEOUT
         {
             return Err(Break::Timeout);
@@ -852,13 +1029,17 @@ impl Link {
         let progressed = if self.phase == Phase::Created {
             Ok(0)
         } else {
-            self.qp.progress_with(|c| completions.push(c))
+            self.qp
+                .progress_with(|c, record| completions.push((c, record)))
         };
+        self.more = progressed
+            .as_ref()
+            .is_ok_and(|&n| n >= crate::ffi::POLL_BATCH);
 
         // Completions before a failed one are still valid. A `Close` among
         // them means the peer closed first; anything else is an error.
-        for completion in completions {
-            match self.complete(pool, completion, now) {
+        for (completion, record) in completions {
+            match self.complete(pool, completion, record, now) {
                 Ok(()) => {}
                 Err(Break::PeerClosed) => return Err(Break::PeerClosed),
                 Err(error) if progressed.is_ok() => return Err(error),
@@ -902,14 +1083,14 @@ impl Link {
         &mut self,
         pool: &Pool,
         c: WorkCompletion,
+        record: Option<InFlight>,
         now: Instant,
     ) -> std::result::Result<(), Break> {
         if (c.id >> 56) as u8 == RECV_CTL {
             return self.received(pool, c.id as u32, c, now);
         }
 
-        let inflight = self.inflight.remove(&c.id).ok_or(Break::Error)?;
-        self.sq_used -= 1;
+        let inflight = record.ok_or(Break::Error)?;
 
         match inflight {
             InFlight::Control { slot, done, close } => {
@@ -930,11 +1111,11 @@ impl Link {
 
                 if abandoned || now >= entry.deadline {
                     let error = if abandoned {
-                        Error::Cancelled
+                        Error::Canceled
                     } else {
                         Error::DeadlineExceeded
                     };
-                    entry.state = GrantState::Invalidating(Outcome::Cancelled(error));
+                    entry.state = GrantState::Invalidating(Outcome::Canceled(error));
                     self.outbox.push_back(Outgoing::Invalidate(tag));
                 } else {
                     entry.state = GrantState::Bound;
@@ -973,7 +1154,7 @@ impl Link {
                             let _ = arrival.complete(Ok(Arrival::Released));
                         }
                     }
-                    Outcome::Cancelled(error) => {
+                    Outcome::Canceled(error) => {
                         pool.release(buffer);
 
                         if let Some(granted) = entry.granted.take() {
@@ -1105,8 +1286,9 @@ impl Link {
                         deadline,
                         done,
                     }) => self.start_write(tag, source, deadline, done),
-                    Some(Waiting::Release { done }) => {
+                    Some(Waiting::Release { done, .. }) => {
                         self.remote.remove(&tag);
+                        self.mark_consumed(tag);
                         self.outbox.push_back(Outgoing::Release {
                             tag,
                             transfer: transfer_id,
@@ -1139,7 +1321,8 @@ impl Link {
 
     /// Fail or break on passed deadlines.
     fn expire(&mut self, now: Instant) -> std::result::Result<(), Break> {
-        let mut cancelled = Vec::new();
+        let mut canceled = Vec::new();
+        let mut orphaned = false;
 
         for (&tag, entry) in &mut self.grants {
             if now < entry.deadline {
@@ -1147,33 +1330,61 @@ impl Link {
             }
 
             match entry.state {
-                // An exposed window can only be fenced by the peer or a break.
-                GrantState::Exposed => return Err(Break::Error),
+                // An exposed window can only be fenced by the peer or a QP
+                // teardown. Wait out the grace for a late write or release,
+                // then close the link without counting it as a failure.
+                GrantState::Exposed => {
+                    orphaned |= now >= entry.deadline + EXPOSED_GRACE;
+                }
                 GrantState::Bound => {
                     entry.state =
-                        GrantState::Invalidating(Outcome::Cancelled(Error::DeadlineExceeded));
-                    cancelled.push(tag);
+                        GrantState::Invalidating(Outcome::Canceled(Error::DeadlineExceeded));
+                    canceled.push(tag);
                 }
                 GrantState::Binding | GrantState::Invalidating(_) => {}
             }
         }
 
-        for tag in cancelled {
+        for tag in canceled {
             self.outbox
                 .retain(|o| !matches!(o, Outgoing::Grant(t) if *t == tag));
             self.outbox.push_back(Outgoing::Invalidate(tag));
         }
 
+        if orphaned {
+            match self.phase {
+                Phase::Ready => {
+                    self.close(now, CLOSE_GRACE);
+                    self.grant_expired = true;
+                }
+                // Already closing: the teardown fences the grant.
+                Phase::Closing { .. } => {}
+                // Grants exist only on ready links.
+                Phase::Created | Phase::Connecting => return Err(Break::Error),
+            }
+        }
+
         let expired: Vec<u32> = self
             .waiting
             .iter()
-            .filter(|(_, w)| matches!(w, Waiting::Write { deadline, .. } if now >= *deadline))
+            .filter(|(_, w)| {
+                matches!(w, Waiting::Write { deadline, .. } | Waiting::Release { deadline, .. }
+                    if now >= *deadline)
+            })
             .map(|(tag, _)| *tag)
             .collect();
 
         for tag in expired {
-            if let Some(Waiting::Write { done, .. }) = self.waiting.remove(&tag) {
-                let _ = done.complete(Err(Error::DeadlineExceeded));
+            match self.waiting.remove(&tag) {
+                Some(
+                    Waiting::Write { done, .. }
+                    | Waiting::Release {
+                        done: Some(done), ..
+                    },
+                ) => {
+                    let _ = done.complete(Err(Error::DeadlineExceeded));
+                }
+                Some(Waiting::Release { done: None, .. }) | None => {}
             }
         }
 
@@ -1188,7 +1399,9 @@ impl Link {
                     done,
                     ..
                 } if now >= deadline => {
+                    // Never posted: the grant is unused again.
                     self.remote.insert(tag, remote);
+                    self.consumed.retain(|&t| t != tag);
                     let _ = done.complete(Err(Error::DeadlineExceeded));
                 }
                 other => kept.push_back(other),
@@ -1205,7 +1418,9 @@ impl Link {
         let mut blocked = false;
         let mut i = 0;
 
-        while i < self.outbox.len() && self.sq_used < self.send_depth {
+        // A registration-mode QP connects asynchronously: nothing posts
+        // until the connection manager established it.
+        while i < self.outbox.len() && self.qp.ready() && self.qp.sends() < self.send_depth {
             let item = &self.outbox[i];
             let need = item.credits();
 
@@ -1243,6 +1458,7 @@ impl Link {
                     pool.region_of(buffer),
                     pool.offset(buffer),
                     entry.length,
+                    u64::from(self.limits.buffer_len),
                 )?;
                 entry.key = key;
                 self.track(wr(BIND, tag), InFlight::Bind(tag));
@@ -1289,7 +1505,7 @@ impl Link {
 
                 if entry.granted.as_ref().is_none_or(Completer::is_abandoned) {
                     // Never exposed: fence the bound window and free it.
-                    entry.state = GrantState::Invalidating(Outcome::Cancelled(Error::Cancelled));
+                    entry.state = GrantState::Invalidating(Outcome::Canceled(Error::Canceled));
                     return self.post(pool, Outgoing::Invalidate(tag));
                 }
 
@@ -1315,7 +1531,11 @@ impl Link {
                 if let Some(granted) = entry.granted.take() {
                     // A dropped op drops `arrival`: the grant is abandoned and
                     // ends at the peer's write or release, or its deadline.
-                    let _ = granted.complete(Ok(Granted { tag, arrival }));
+                    let _ = granted.complete(Ok(Granted {
+                        tag,
+                        arrival,
+                        waited: entry.waited,
+                    }));
                 }
             }
             Outgoing::Release {
@@ -1328,7 +1548,7 @@ impl Link {
                         tag,
                         transfer_id: transfer,
                     },
-                    Some(done),
+                    done,
                     false,
                 )?;
             }
@@ -1400,9 +1620,9 @@ impl Link {
         self.unreturned += 1;
     }
 
+    /// Attach `inflight` to the posted request `id` in the QP's ledger.
     fn track(&mut self, id: u64, inflight: InFlight) {
-        self.sq_used += 1;
-        self.inflight.insert(id, inflight);
+        self.qp.attach(id, inflight);
     }
 
     /// Fail every op with [`Error::Unavailable`], move every buffer to
@@ -1424,6 +1644,12 @@ impl Link {
 
         self.held.clear();
         true
+    }
+
+    /// True while the QP's teardown runs on a reaper thread: the owner is
+    /// woken when it finishes, so [`Self::destroy`] need not be retried soon.
+    pub(crate) fn reaping(&self) -> bool {
+        self.qp.reaping()
     }
 
     /// Owner shutdown after a failed destroy: the buffers are never reused.
@@ -1459,8 +1685,15 @@ impl Link {
         }
 
         for (_, waiting) in std::mem::take(&mut self.waiting) {
-            let (Waiting::Write { done, .. } | Waiting::Release { done }) = waiting;
-            let _ = done.complete(Err(Error::Unavailable));
+            match waiting {
+                Waiting::Write { done, .. }
+                | Waiting::Release {
+                    done: Some(done), ..
+                } => {
+                    let _ = done.complete(Err(Error::Unavailable));
+                }
+                Waiting::Release { done: None, .. } => {}
+            }
         }
 
         for outgoing in self.outbox.drain(..) {
@@ -1469,14 +1702,16 @@ impl Link {
                     // Not posted: no NIC access, so the source drops now.
                     let _ = done.complete(Err(Error::Unavailable));
                 }
-                Outgoing::Release { done, .. } => {
+                Outgoing::Release {
+                    done: Some(done), ..
+                } => {
                     let _ = done.complete(Err(Error::Unavailable));
                 }
                 _ => {}
             }
         }
 
-        for (_, inflight) in std::mem::take(&mut self.inflight) {
+        for inflight in self.qp.take_records() {
             match inflight {
                 InFlight::Write { source, done } => {
                     self.held.push(source.bytes);

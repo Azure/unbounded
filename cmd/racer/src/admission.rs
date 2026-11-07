@@ -14,15 +14,132 @@ use flow_control::Policy;
 use flow_control::Quotas;
 use flow_control::Rejection;
 use flow_control::SharedQuotas;
-use racer_control_wire::CacheId;
+use racer_wire::control::CacheId;
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
 use std::task::Waker;
 
 pub use racer_core::admission::ResourceClass;
 use racer_core::admission::Rules;
+
+/// Holders of a worker's ciphertext budget, in exposition order.
+pub const CIPHERTEXT_HOLDERS: [&str; 6] = [
+    "cache_idle",
+    "cache_pinned",
+    "cache_writer",
+    "writer_staging",
+    "writer_exclusive",
+    "other",
+];
+
+/// Bytes of one worker's ciphertext budget by holder. The worker samples the
+/// memory cache and disk writer into it periodically; peer receives update
+/// `receive_waiting` as they start and stop waiting. Readers on any thread see
+/// the latest sample without touching worker state.
+#[derive(Debug, Default)]
+pub struct CiphertextHolders {
+    cache_idle: AtomicUsize,
+    cache_pinned: AtomicUsize,
+    cache_writer: AtomicUsize,
+    writer_staging: AtomicUsize,
+    writer_exclusive: AtomicUsize,
+    receive_waiting: AtomicUsize,
+}
+
+/// One sample of the holders the worker can attribute by walking its tables.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HolderSample {
+    /// Retained memory-cache entries no other owner pins: reclaim frees these.
+    pub cache_idle: usize,
+    /// Retained entries pinned by a reader, sender, decrypt, or other owner.
+    pub cache_pinned: usize,
+    /// Retained entries pinned only by a queued disk write.
+    pub cache_writer: usize,
+    /// Disk-writer staging charged as ciphertext, queued or submitted.
+    pub writer_staging: usize,
+    /// Queued or submitted disk-write pages the memory cache does not retain.
+    pub writer_exclusive: usize,
+}
+
+/// A worker's ciphertext usage split by holder. `other` is the aggregate use
+/// no sampled table accounts for: peer receives in flight, origin and disk
+/// fills, decrypts, hedges, and peer send bodies not retained by the cache.
+/// Sampled holders may lag the aggregate by one sample interval.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HolderBytes {
+    pub cache_idle: usize,
+    pub cache_pinned: usize,
+    pub cache_writer: usize,
+    pub writer_staging: usize,
+    pub writer_exclusive: usize,
+    pub other: usize,
+    /// Peer receives waiting for ciphertext budget now (a count, not bytes).
+    pub receive_waiting: usize,
+}
+
+impl HolderBytes {
+    /// Byte values in [`CIPHERTEXT_HOLDERS`] order.
+    pub fn values(&self) -> [usize; CIPHERTEXT_HOLDERS.len()] {
+        [
+            self.cache_idle,
+            self.cache_pinned,
+            self.cache_writer,
+            self.writer_staging,
+            self.writer_exclusive,
+            self.other,
+        ]
+    }
+}
+
+impl CiphertextHolders {
+    pub fn store(&self, sample: HolderSample) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.cache_idle.store(sample.cache_idle, Relaxed);
+        self.cache_pinned.store(sample.cache_pinned, Relaxed);
+        self.cache_writer.store(sample.cache_writer, Relaxed);
+        self.writer_staging.store(sample.writer_staging, Relaxed);
+        self.writer_exclusive
+            .store(sample.writer_exclusive, Relaxed);
+    }
+    /// The latest sample against aggregate usage `used`.
+    pub fn snapshot(&self, used: usize) -> HolderBytes {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut bytes = HolderBytes {
+            cache_idle: self.cache_idle.load(Relaxed),
+            cache_pinned: self.cache_pinned.load(Relaxed),
+            cache_writer: self.cache_writer.load(Relaxed),
+            writer_staging: self.writer_staging.load(Relaxed),
+            writer_exclusive: self.writer_exclusive.load(Relaxed),
+            other: 0,
+            receive_waiting: self.receive_waiting.load(Relaxed),
+        };
+        let sampled = bytes
+            .values()
+            .iter()
+            .fold(0usize, |a, b| a.saturating_add(*b));
+        bytes.other = used.saturating_sub(sampled);
+        bytes
+    }
+    /// Count one peer receive waiting for ciphertext until the guard drops.
+    pub fn waiting(self: &Arc<Self>) -> ReceiveWaiting {
+        self.receive_waiting
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ReceiveWaiting(self.clone())
+    }
+}
+
+/// One peer receive waiting for ciphertext budget.
+pub struct ReceiveWaiting(Arc<CiphertextHolders>);
+impl Drop for ReceiveWaiting {
+    fn drop(&mut self) {
+        self.0
+            .receive_waiting
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 
 pub struct AdmissionPolicy {
     rules: Rules,
@@ -31,6 +148,10 @@ pub struct AdmissionPolicy {
 
     /// Published cache priorities. Clones share one table.
     weights: crate::priority::Weights,
+
+    /// Sampled ciphertext holders of the worker this policy admits for.
+    /// Clones share one record.
+    holders: Arc<CiphertextHolders>,
 }
 impl Clone for AdmissionPolicy {
     fn clone(&self) -> Self {
@@ -38,6 +159,7 @@ impl Clone for AdmissionPolicy {
             rules: self.rules.clone(),
             observer: self.observer.clone(),
             weights: self.weights.clone(),
+            holders: self.holders.clone(),
         }
     }
 }
@@ -46,6 +168,8 @@ impl AdmissionPolicy {
         Self {
             rules: Rules::new(
                 limits,
+                // Floors are fixed before the cluster page size is published, so
+                // they guarantee progress at the largest page size.
                 racer_core::admission::Floors::for_page(
                     PAGE_BYTES as usize,
                     crate::store::MAX_HEADER_BYTES,
@@ -53,7 +177,12 @@ impl AdmissionPolicy {
             ),
             observer: OnceLock::new(),
             weights: crate::priority::Weights::default(),
+            holders: Arc::default(),
         }
+    }
+    /// Sampled ciphertext holders, shared by clones of this policy.
+    pub fn holders(&self) -> &Arc<CiphertextHolders> {
+        &self.holders
     }
     /// Shared priority table. Call `Quotas::reweigh` after updating it.
     pub fn weights(&self) -> &crate::priority::Weights {
@@ -102,6 +231,68 @@ mod observer_tests {
     }
 
     #[test]
+    fn ciphertext_rejections_carry_the_worker_holder_breakdown() {
+        let mut limits = crate::test_support::cluster::config(false).limits;
+        limits.ciphertext_bytes = std::num::NonZeroUsize::new(1000).unwrap();
+        let quotas = Quotas::new(AdmissionPolicy::new(limits));
+        let holders = quotas.policy().holders().clone();
+        holders.store(HolderSample {
+            cache_idle: 100,
+            cache_pinned: 200,
+            cache_writer: 50,
+            writer_staging: 25,
+            writer_exclusive: 25,
+        });
+        let _held = quotas
+            .reserve(None, ResourceClass::Ciphertext, 900)
+            .unwrap();
+        let waiting = holders.waiting();
+        let (_, detail) = capture_rejection(&quotas, || {
+            quotas
+                .reserve(None, ResourceClass::Ciphertext, 200)
+                .map_err(Error::from)
+        });
+        let Some(Detail::Resource {
+            holders: Some(bytes),
+            ..
+        }) = detail
+        else {
+            panic!("ciphertext rejection without holders: {detail:?}");
+        };
+        assert_eq!(
+            bytes,
+            HolderBytes {
+                cache_idle: 100,
+                cache_pinned: 200,
+                cache_writer: 50,
+                writer_staging: 25,
+                writer_exclusive: 25,
+                other: 500,
+                receive_waiting: 1,
+            }
+        );
+        drop(waiting);
+        assert_eq!(holders.snapshot(0).receive_waiting, 0);
+        // A stale sample above live usage leaves nothing unattributed.
+        assert_eq!(holders.snapshot(10).other, 0);
+        // Other classes carry no ciphertext breakdown.
+        let (_, detail) = capture_rejection(&quotas, || {
+            quotas
+                .reserve(None, ResourceClass::Plaintext, usize::MAX)
+                .map_err(Error::from)
+        });
+        assert!(matches!(
+            detail,
+            Some(Detail::Resource { holders: None, .. })
+        ));
+        // Clones share one record.
+        assert!(Arc::ptr_eq(
+            quotas.policy().clone().holders(),
+            quotas.policy().holders()
+        ));
+    }
+
+    #[test]
     fn memory_fair_limits_follow_live_priority_with_floor() {
         let mut limits = crate::test_support::cluster::config(false).limits;
         limits.range_window_pages = std::num::NonZeroUsize::new(2).unwrap();
@@ -111,13 +302,13 @@ mod observer_tests {
         let floor = quotas.policy().floor(class);
         let a = CacheId("a".into());
         let b = CacheId("b".into());
-        let definition = |id: &CacheId, priority| racer_control_wire::CacheDefinition {
+        let definition = |id: &CacheId, priority| racer_wire::control::CacheDefinition {
             id: id.clone(),
             name: id.0.clone(),
             client_socket: "/c".into(),
             origin_socket: "/o".into(),
             priority,
-            mode: racer_control_wire::CacheMode::Cached,
+            mode: racer_wire::control::CacheMode::Cached,
             origin: None,
         };
         // Unknown caches use the default priority, so shares start equal.
@@ -156,13 +347,13 @@ mod observer_tests {
         let quotas = Quotas::new(AdmissionPolicy::new(limits));
         let a = CacheId("a".into());
         let z = CacheId("z".into());
-        let definition = |id: &CacheId, priority| racer_control_wire::CacheDefinition {
+        let definition = |id: &CacheId, priority| racer_wire::control::CacheDefinition {
             id: id.clone(),
             name: id.0.clone(),
             client_socket: "/c".into(),
             origin_socket: "/o".into(),
             priority,
-            mode: racer_control_wire::CacheMode::Cached,
+            mode: racer_wire::control::CacheMode::Cached,
             origin: None,
         };
         quotas
@@ -170,7 +361,7 @@ mod observer_tests {
             .weights()
             .update(&[definition(&a, 1000), definition(&z, 0)]);
         quotas.reweigh();
-        let context = racer_object_wire::client::MAX_HEAD_BYTES;
+        let context = racer_wire::object::client::MAX_HEAD_BYTES;
         let _active = quotas
             .reserve(Some(&a), ResourceClass::RequestContext, context)
             .unwrap();
@@ -223,15 +414,33 @@ pub(crate) fn capture_rejection<T>(
 ) -> (Result<T>, Option<Detail>) {
     let (result, rejection) = admission.observe_rejections(operation);
     let detail = if matches!(result, Err(Error::Overloaded)) {
-        rejection.map(rejection_detail)
+        rejection.map(|rejection| rejection_detail(rejection, Some(admission.policy().holders())))
     } else {
         None
     };
     (result, detail)
 }
 
-/// Keep resource names and telemetry mapping in application policy.
-fn rejection_detail(rejection: Rejection<ResourceClass>) -> Detail {
+/// Run a reserve-reclaim-retry `operation` so its retried attempts do not
+/// each record an Admission failure: only a final `Overloaded` reports the
+/// last rejection, once. A recovered retry records nothing.
+pub(crate) fn report_final<T>(
+    admission: &Quotas<AdmissionPolicy>,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let (result, rejection) = admission.retrying(operation);
+    if let (Err(Error::Overloaded), Some(rejection)) = (&result, rejection) {
+        admission.report(rejection);
+    }
+    result
+}
+
+/// Keep resource names and telemetry mapping in application policy. A
+/// ciphertext rejection carries the worker's latest holder breakdown.
+fn rejection_detail(
+    rejection: Rejection<ResourceClass>,
+    holders: Option<&CiphertextHolders>,
+) -> Detail {
     match rejection {
         Rejection::Keys { used, limit } => Detail::CacheEntries { used, limit },
         Rejection::Resource {
@@ -248,6 +457,9 @@ fn rejection_detail(rejection: Rejection<ResourceClass>) -> Detail {
             requested,
             cache_used: key_used,
             cache_limit: key_limit,
+            holders: holders
+                .filter(|_| matches!(class, ResourceClass::Ciphertext))
+                .map(|holders| holders.snapshot(used)),
         },
     }
 }
@@ -283,7 +495,7 @@ impl Policy for AdmissionPolicy {
         Rules::covers(class)
     }
     fn rejected(&self, rejection: Rejection<ResourceClass>) {
-        let detail = rejection_detail(rejection);
+        let detail = rejection_detail(rejection, Some(&self.holders));
         self.observer()
             .record(Failure::new(Stage::Admission, Error::Overloaded).detail(detail));
     }
@@ -345,7 +557,7 @@ mod capture_tests {
             detail.is_none(),
             "recovered operation must not report final rejection"
         );
-        let (_, detail) = capture_rejection(&quotas, || Err::<(), _>(Error::Cancelled));
+        let (_, detail) = capture_rejection(&quotas, || Err::<(), _>(Error::Canceled));
         assert!(detail.is_none());
     }
 
@@ -435,6 +647,9 @@ pub fn reserve_connection(
     if matches!(role, ResourceClass::IngressConnection) {
         return reserve_ingress(&admission.shared());
     }
+    if matches!(role, ResourceClass::PeerIngressConnection) {
+        return reserve_peer_ingress(&admission.shared());
+    }
     if !matches!(
         role,
         ResourceClass::OutboundConnection | ResourceClass::ControlConnection
@@ -489,10 +704,27 @@ pub fn reserve_fill(
 pub fn reserve_ingress(admission: &SharedQuotas<AdmissionPolicy>) -> Result<ConnectionReservation> {
     reserve_ingress_charges(admission).map_err(Into::into)
 }
+/// Admit an inbound peer socket against `PeerIngressConnection` and the total.
+pub fn reserve_peer_ingress(
+    admission: &SharedQuotas<AdmissionPolicy>,
+) -> Result<ConnectionReservation> {
+    reserve_peer_ingress_charges(admission).map_err(Into::into)
+}
 fn reserve_ingress_charges(
     admission: &SharedQuotas<AdmissionPolicy>,
 ) -> flow_control::Result<ConnectionReservation> {
     let role = admission.reserve(ResourceClass::IngressConnection, 1)?;
+    let total = admission.reserve(ResourceClass::Connection, 1)?;
+    Ok(ConnectionReservation {
+        _total: total,
+        _role: role,
+        ordinary: None,
+    })
+}
+fn reserve_peer_ingress_charges(
+    admission: &SharedQuotas<AdmissionPolicy>,
+) -> flow_control::Result<ConnectionReservation> {
+    let role = admission.reserve(ResourceClass::PeerIngressConnection, 1)?;
     let total = admission.reserve(ResourceClass::Connection, 1)?;
     Ok(ConnectionReservation {
         _total: total,
@@ -512,29 +744,59 @@ pub(crate) struct Accepted {
     pub reservation: ConnectionReservation,
     pub kind: Kind,
 }
-struct IngressAdmission(SharedQuotas<AdmissionPolicy>);
+struct IngressAdmission {
+    quotas: SharedQuotas<AdmissionPolicy>,
+    peer: bool,
+}
 impl flow_control::HandoffAdmission for IngressAdmission {
     type Reservation = ConnectionReservation;
     fn register(&self, waker: &Waker) {
-        self.0.register(waker);
+        self.quotas.register(waker);
     }
     fn reserve(&self) -> flow_control::Result<ConnectionReservation> {
-        reserve_ingress_charges(&self.0)
+        if self.peer {
+            reserve_peer_ingress_charges(&self.quotas)
+        } else {
+            reserve_ingress_charges(&self.quotas)
+        }
     }
 }
-pub(crate) struct Ingress(Arc<flow_control::Handoff<WorkerId, IngressAdmission, (OwnedFd, Kind)>>);
+/// Hands accepted sockets to the worker that reserved their slot. Client sockets reserve
+/// `IngressConnection`, peer sockets `PeerIngressConnection`; both also hold the `Connection`
+/// total.
+pub(crate) struct Ingress {
+    handoff: Arc<flow_control::Handoff<WorkerId, IngressAdmission, (OwnedFd, Kind)>>,
+    peer: bool,
+}
 pub(crate) struct Offer(flow_control::Offer<WorkerId, IngressAdmission, (OwnedFd, Kind)>);
 impl Ingress {
+    /// A handoff for client sockets.
     pub fn new(workers: &[WorkerId]) -> Self {
-        Self(Arc::new(flow_control::Handoff::new(workers)))
+        Self {
+            handoff: Arc::new(flow_control::Handoff::new(workers)),
+            peer: false,
+        }
+    }
+    /// A handoff for inbound peer sockets.
+    pub fn for_peers(workers: &[WorkerId]) -> Self {
+        Self {
+            peer: true,
+            ..Self::new(workers)
+        }
     }
     pub fn install(&self, worker: WorkerId, admission: &Quotas<AdmissionPolicy>) -> Result<()> {
-        self.0
-            .install(&worker, IngressAdmission(admission.shared()))
+        self.handoff
+            .install(
+                &worker,
+                IngressAdmission {
+                    quotas: admission.shared(),
+                    peer: self.peer,
+                },
+            )
             .map_err(Into::into)
     }
     pub fn reserve(self: &Arc<Self>, waker: &Waker) -> Result<Offer> {
-        self.0.reserve(waker).map(Offer).map_err(Into::into)
+        self.handoff.reserve(waker).map(Offer).map_err(Into::into)
     }
     pub fn pop_batch<const N: usize>(
         &self,
@@ -542,7 +804,7 @@ impl Ingress {
         waker: &Waker,
         budget: usize,
     ) -> Result<[Option<Accepted>; N]> {
-        self.0
+        self.handoff
             .pop_batch(&worker, waker, budget)
             .map(|items| {
                 items.map(|item| {
@@ -559,7 +821,7 @@ impl Ingress {
             .map_err(Into::into)
     }
     pub fn close(&self, worker: WorkerId) {
-        self.0.close(&worker);
+        self.handoff.close(&worker);
     }
 }
 impl Offer {
@@ -611,13 +873,13 @@ mod tests {
         }
         // With a small budget the allowance is clipped to the equal split, so
         // a priority-0 cache cannot take more than an equal-priority peer.
-        let definition = |id: &CacheId, priority| racer_control_wire::CacheDefinition {
+        let definition = |id: &CacheId, priority| racer_wire::control::CacheDefinition {
             id: id.clone(),
             name: id.0.clone(),
             client_socket: "/c".into(),
             origin_socket: "/o".into(),
             priority,
-            mode: racer_control_wire::CacheMode::Cached,
+            mode: racer_wire::control::CacheMode::Cached,
             origin: None,
         };
         limits.range_window_pages = std::num::NonZeroUsize::new(2).unwrap();
@@ -798,13 +1060,12 @@ mod tests {
         assert_eq!(admission.used(ResourceClass::IngressConnection), 1);
         drop(connection);
         assert_eq!(admission.used(ResourceClass::Connection), 0);
-        let mut charge = admission
+        let charge = admission
             .reserve(None, ResourceClass::Ciphertext, 1 << 20)
             .unwrap();
-        charge.recycle(vec![0xa7; 1 << 20]);
-        drop(charge);
-        assert_eq!(usage.used(ResourceClass::Ciphertext), 1 << 20);
         drop(admission);
+        assert_eq!(usage.used(ResourceClass::Ciphertext), 1 << 20);
+        drop(charge);
         assert_eq!(usage.used(ResourceClass::Ciphertext), 0);
     }
 
@@ -825,9 +1086,9 @@ mod tests {
 
     #[test]
     fn ordinary_outbound_leaves_metadata_reserve_and_reclassification_enforces_it() {
-        for (connections, ordinary, total) in [(64, 15, 16), (8, 1, 2), (4, 1, 1)] {
+        for (ordinary, total) in [(63, 64), (15, 16), (1, 2), (1, 1)] {
             let mut limits = crate::test_support::cluster::config(false).limits;
-            limits.client_connections = std::num::NonZeroUsize::new(connections).unwrap();
+            limits.outbound_connections = std::num::NonZeroUsize::new(total).unwrap();
             let admission = Quotas::new(AdmissionPolicy::new(limits));
             assert_eq!(admission.limit(ResourceClass::OutboundConnection), total);
             assert_eq!(
@@ -883,11 +1144,16 @@ mod tests {
             3,
             "snapshot, enrollment, and key delivery slots"
         );
+        // Peer ingress has its own slots, also outside client admission.
+        let peers: Vec<_> = (0..admission.limit(ResourceClass::PeerIngressConnection))
+            .map(|_| reserve_connection(&admission, ResourceClass::PeerIngressConnection).unwrap())
+            .collect();
+        assert!(reserve_connection(&admission, ResourceClass::PeerIngressConnection).is_err());
         assert_eq!(
             admission.used(ResourceClass::Connection),
             admission.limit(ResourceClass::Connection)
         );
-        drop((ingress, outbound, control));
+        drop((ingress, outbound, control, peers));
         assert_eq!(admission.used(ResourceClass::Connection), 0);
     }
 
@@ -971,7 +1237,7 @@ mod tests {
     /// Owner contracts for node-wide and cache-keyed admission classes.
     mod capacity {
         use super::*;
-        use racer_control_wire::CacheId;
+        use racer_wire::control::CacheId;
         use std::num::NonZeroUsize;
 
         const PLAIN: usize = PAGE_BYTES as usize;
@@ -1072,9 +1338,9 @@ mod rules_equivalence_tests {
     use super::*;
     use std::num::NonZeroUsize;
 
-    /// The policy as it read before the rules moved to racer-core, kept
-    /// verbatim so the delegation is checked against it.
-    fn legacy_limit(limits: &Limits, class: ResourceClass) -> usize {
+    /// Each class's limit restated directly from `Limits`, independent of the
+    /// racer-core rules the policy delegates to.
+    fn reference_limit(limits: &Limits, class: ResourceClass) -> usize {
         match class {
             ResourceClass::Plaintext => limits.plaintext_bytes.get(),
             ResourceClass::Ciphertext => limits.ciphertext_bytes.get(),
@@ -1086,25 +1352,33 @@ mod rules_equivalence_tests {
                 .flights
                 .get()
                 .saturating_mul(limits.waiters_per_flight.get()),
-            ResourceClass::Connection => limits.client_connections.get(),
+            ResourceClass::Connection => limits
+                .client_connections
+                .get()
+                .saturating_add(limits.peer_connections.get())
+                .saturating_add(limits.outbound_connections.get()),
             ResourceClass::ControlConnection => (limits.client_connections.get() / 4).min(3),
-            ResourceClass::OutboundConnection => limits.client_connections.get() / 4,
+            // Peer and outbound sockets have their own limits since peer ingress was sized
+            // apart from client connections (`dst/MODEL.md`, "Peer connection slots").
+            ResourceClass::OutboundConnection => limits.outbound_connections.get(),
             ResourceClass::OrdinaryOutboundConnection => {
-                let outbound = legacy_limit(limits, ResourceClass::OutboundConnection);
+                let outbound = reference_limit(limits, ResourceClass::OutboundConnection);
                 outbound
                     - usize::from(outbound >= 2) * racer_core::admission::METADATA_OUTBOUND_RESERVE
             }
-            ResourceClass::IngressConnection => limits.client_connections.get().saturating_sub(
-                legacy_limit(limits, ResourceClass::ControlConnection)
-                    + legacy_limit(limits, ResourceClass::OutboundConnection),
-            ),
+            ResourceClass::IngressConnection => limits
+                .client_connections
+                .get()
+                .saturating_sub(reference_limit(limits, ResourceClass::ControlConnection)),
+            ResourceClass::PeerIngressConnection => limits.peer_connections.get(),
             ResourceClass::Pipe => limits.pipes.get(),
             ResourceClass::ControlProgress => limits.queue_entries.get(),
             ResourceClass::Relay => limits.relay_transfers.get(),
+            ResourceClass::Pool => limits.ciphertext_bytes.get(),
         }
     }
 
-    fn legacy_floor(class: ResourceClass) -> usize {
+    fn reference_floor(class: ResourceClass) -> usize {
         match class {
             ResourceClass::Plaintext => PAGE_BYTES as usize,
             ResourceClass::Ciphertext => page_alloc::buffer_capacity(
@@ -1116,9 +1390,9 @@ mod rules_equivalence_tests {
         }
     }
 
-    /// Cache priority's per-cache allowance as it read before it moved to
+    /// Cache priority's per-cache allowance restated independently of
     /// racer-core.
-    fn legacy_progress(limits: &Limits, class: ResourceClass) -> usize {
+    fn reference_progress(limits: &Limits, class: ResourceClass) -> usize {
         let window = limits.range_window_pages.get();
         let record = PAGE_BYTES as usize + 16 + crate::store::MAX_HEADER_BYTES;
         match class {
@@ -1137,7 +1411,7 @@ mod rules_equivalence_tests {
         for class in ResourceClass::ALL {
             assert_eq!(
                 policy.progress(class),
-                legacy_progress(&limits, class),
+                reference_progress(&limits, class),
                 "{class:?}"
             );
             assert_eq!(
@@ -1151,15 +1425,17 @@ mod rules_equivalence_tests {
             );
             assert_eq!(
                 policy.limit(class),
-                legacy_limit(&limits, class),
+                reference_limit(&limits, class),
                 "{class:?}"
             );
-            assert_eq!(policy.floor(class), legacy_floor(class), "{class:?}");
+            assert_eq!(policy.floor(class), reference_floor(class), "{class:?}");
             assert_eq!(
                 AdmissionPolicy::wakes(class),
                 matches!(
                     class,
-                    ResourceClass::Connection | ResourceClass::IngressConnection
+                    ResourceClass::Connection
+                        | ResourceClass::IngressConnection
+                        | ResourceClass::PeerIngressConnection
                 )
             );
             assert_eq!(
@@ -1175,7 +1451,7 @@ mod rules_equivalence_tests {
     }
 
     #[test]
-    fn moved_rules_match_legacy_policy() {
+    fn delegated_rules_match_reference_policy() {
         let config = crate::test_support::cluster::config(false);
         check(config.limits.clone());
         // Unset environment yields exactly the racer-core per-worker defaults.
@@ -1187,8 +1463,11 @@ mod rules_equivalence_tests {
         check(scaled.limits);
         let one = NonZeroUsize::MIN;
         for connections in [1, 2, 3, 4, 7, 8, 11, 12, 13, 16, 65_536] {
+            let connections = NonZeroUsize::new(connections).unwrap();
             check(Limits {
-                client_connections: NonZeroUsize::new(connections).unwrap(),
+                client_connections: connections,
+                peer_connections: connections,
+                outbound_connections: connections,
                 ..Limits::default()
             });
         }

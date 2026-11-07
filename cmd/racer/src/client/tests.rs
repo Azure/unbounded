@@ -9,6 +9,7 @@ use crate::http::new_pipe_pool;
 use crate::model::ExpiresAt;
 use crate::model::ObjectMetadata;
 use crate::model::ObjectVersion;
+use crate::model::PAGE_BYTES;
 use crate::model::StrongEtag;
 use crate::read::ReadResponse;
 use crate::runtime::Cancellation;
@@ -16,7 +17,7 @@ use crate::runtime::Reactor;
 use crate::runtime::RequestScope;
 use crate::test_support::ReadWorker;
 use crate::test_support::origin::RequestKind;
-use racer_control_wire::CacheDefinition;
+use racer_wire::control::CacheDefinition;
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::ffi::CString;
@@ -50,7 +51,8 @@ mod acquisition {
     #[test]
     fn raw_uds_late_rust_acquisition_failure_never_appends_second_status() {
         use crate::model::PAGE_BYTES;
-        let (fixture, pipes) = body_fixture_with_large_page(16, false, true);
+        let env = racer_io::Env::host();
+        let (fixture, pipes) = body_fixture_with_large_page(&env, 16, false, true);
         let metadata = body_metadata(3 * PAGE_BYTES + 13);
         let worker = fixture.worker.as_ref().unwrap();
         worker.origin.set_version(metadata.clone());
@@ -99,6 +101,7 @@ mod acquisition {
 
     #[test]
     fn coordinator_enforces_pinned_head_and_unsatisfiable_range_length() {
+        let env = racer_io::Env::host();
         for (length, fields, status) in [
             (4, "", "200"),
             (4, "If-Match: \"v1\"\r\n", "200"),
@@ -106,7 +109,7 @@ mod acquisition {
             (4, "Range: bytes=4-\r\n", "416"),
             (0, "Range: bytes=0-\r\n", "416"),
         ] {
-            let (fixture, _pipes) = body_fixture(16, false);
+            let (fixture, _pipes) = body_fixture(&env, 16, false);
             fixture
                 .worker
                 .as_ref()
@@ -156,8 +159,9 @@ mod directory {
     }
     #[test]
     fn startup_hardens_existing_client_directory_and_origin_without_changing_ancestors() {
+        let env = racer_io::Env::host();
         for mode in [0o777, 0o775, 0o757, 0o770, 0o722, 0o2775, 0o1777] {
-            let fixture = Fixture::new();
+            let fixture = Fixture::new(&env);
             let path = fixture.socket().parent().unwrap().to_owned();
             fs::create_dir_all(&path).unwrap();
             let cache = path.parent().unwrap();
@@ -196,7 +200,7 @@ mod directory {
     }
     #[test]
     fn secure_client_directory_permissions_are_unchanged() {
-        // Generic mode combinations live in uds-endpoint. Keep adapter coverage
+        // Generic mode combinations live in uds_endpoint. Keep adapter coverage
         // for read-only/sticky modes and no metadata mutation on the first call.
         for mode in [0o755, 0o711, 0o751, 0o511, 0o1711] {
             let root = Root::new();
@@ -361,7 +365,7 @@ mod directory {
     }
     #[test]
     fn client_directory_preparation_pins_inode_across_path_replacement() {
-        // uds-endpoint covers symlink replacement. Exercise the application's
+        // uds_endpoint covers symlink replacement. Exercise the application's
         // adapter with a real replacement directory and the retained old handle.
         let root = Root::new();
         let parent = open_directory(&root.0).unwrap();
@@ -424,10 +428,11 @@ mod directory {
     }
     #[test]
     fn startup_rejects_foreign_owned_directory_without_chmod() {
+        let env = racer_io::Env::host();
         if unsafe { libc::geteuid() } != 0 {
             return;
         }
-        let fixture = Fixture::new();
+        let fixture = Fixture::new(&env);
         let path = fixture.socket().parent().unwrap().to_owned();
         fs::create_dir_all(&path).unwrap();
         let directory = File::open(&path).unwrap();
@@ -447,10 +452,11 @@ mod recovery {
 
     #[test]
     fn crash_owner_child() {
+        let env = racer_io::Env::host();
         let Ok(root) = std::env::var("RACER_SOCKET_CRASH_ROOT") else {
             return;
         };
-        let mut fixture = Fixture::new();
+        let mut fixture = Fixture::new(&env);
         fs::remove_dir(&fixture.root.0).unwrap();
         fixture.root.0 = root.into();
         fixture.listeners.root = fixture.root.0.clone();
@@ -476,6 +482,7 @@ mod recovery {
     fn sigkill_restart_recovers_committed_and_prepared_endpoints() {
         use std::process::Command;
         use std::process::Stdio;
+        let env = racer_io::Env::host();
         struct Child(std::process::Child);
         impl Drop for Child {
             fn drop(&mut self) {
@@ -484,7 +491,7 @@ mod recovery {
             }
         }
         for stage in ["committed", "prepared"] {
-            let fixture = Fixture::new();
+            let fixture = Fixture::new(&env);
             let mut child = Child(
                 Command::new(std::env::current_exe().unwrap())
                     .args([
@@ -551,6 +558,7 @@ mod recovery {
 
     #[test]
     fn endpoint_ownership_rejects_unsafe_locks_and_foreign_sockets() {
+        let env = racer_io::Env::host();
         for kind in [
             "symlink",
             "hardlink",
@@ -561,7 +569,7 @@ mod recovery {
             "foreign-live",
             "foreign-stale",
         ] {
-            let fixture = Fixture::new();
+            let fixture = Fixture::new(&env);
             let directory = fixture.socket().parent().unwrap().to_owned();
             fs::create_dir_all(&directory).unwrap();
             fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
@@ -618,7 +626,8 @@ mod recovery {
 
     #[test]
     fn lock_replacement_and_live_witness_without_lock_are_refused() {
-        let fixture = Fixture::new();
+        let env = racer_io::Env::host();
+        let fixture = Fixture::new(&env);
         fixture.reconcile(&[definition()]).unwrap();
         let directory = File::open(fixture.socket().parent().unwrap()).unwrap();
         let lock = file_path(&directory).join(".racer-client.lock");
@@ -640,7 +649,8 @@ mod recovery {
 
     #[test]
     fn recovery_preserves_stale_foreign_inode_and_recovers_unpublished_witness() {
-        let fixture = Fixture::new();
+        let env = racer_io::Env::host();
+        let fixture = Fixture::new(&env);
         let directory = fixture.root.0.join("example/client");
         fs::create_dir_all(&directory).unwrap();
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
@@ -684,11 +694,12 @@ fn local_and_distributed_installs_drain_responses_and_retire_idle_generations() 
     use crate::model::WorkerId;
     use crate::test_support::WakeCounter;
     use std::task::Waker;
+    let env = racer_io::Env::host();
 
     for distributed in [false, true] {
         for busy in [false, true] {
-            let mut acceptor = Fixture::new();
-            let mut worker = Fixture::new();
+            let mut acceptor = Fixture::new(&env);
+            let mut worker = Fixture::new(&env);
             let ingress = Arc::new(Ingress::new(&[WorkerId(1)]));
             if distributed {
                 ingress
@@ -774,10 +785,11 @@ fn queued_handoffs_reject_retired_generations_and_stopped_receivers() {
     use crate::admission::Ingress;
     use crate::admission::ResourceClass;
     use crate::model::WorkerId;
+    let env = racer_io::Env::host();
 
     for stop_receiver in [false, true] {
-        let mut acceptor = Fixture::new();
-        let worker = Fixture::new();
+        let mut acceptor = Fixture::new(&env);
+        let worker = Fixture::new(&env);
         let ingress = Arc::new(Ingress::new(&[WorkerId(1)]));
         ingress
             .install(WorkerId(1), &worker.listeners.admission)
@@ -819,12 +831,12 @@ fn queued_handoffs_reject_retired_generations_and_stopped_receivers() {
 
 #[test]
 fn simulated_listener_preparation_rollback_and_real_http_exchange() {
-    use uring_runtime::reactor::SocketAddress;
-    use uring_runtime::reactor::simulation::Simulation;
-    let sim = Simulation::new();
-    let _environment = sim.enter();
+    use racer_io::ring::SocketAddress;
+    use racer_io::sim::SimOs;
+    let sim = SimOs::new();
+    let env = racer_io::Env::sim(&sim, racer_io::WorkerCtx::host());
     let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits())));
-    let reactor = Rc::new(Reactor::new(admission.clone()));
+    let reactor = Rc::new(Reactor::new(admission.clone(), &env));
     let io = Rc::new(crate::http::new_io(
         reactor.clone(),
         Codec::new(32768),
@@ -833,6 +845,7 @@ fn simulated_listener_preparation_rollback_and_real_http_exchange() {
     ));
     let delivery = Rc::new(Delivery::new(reactor.clone(), Duration::from_secs(2)));
     let worker = ReadWorker::new(
+        &env,
         definition(),
         body_metadata(17),
         admission.clone(),
@@ -866,8 +879,8 @@ fn simulated_listener_preparation_rollback_and_real_http_exchange() {
     assert_eq!(sim.metadata(&path).unwrap().0, inode);
     assert_eq!(sim.metadata(&path).unwrap().1 & 0o777, 0o666);
     let client = sim.connect(SocketAddress::Unix(path)).unwrap();
-    let client = client.into_sim().unwrap();
-    client
+    let client_handle = client.as_sim().unwrap();
+    client_handle
         .send(&request("HEAD", "If-Match: \"v1\"\r\n"))
         .unwrap();
     // Exercise the same retirement path without a host filesystem. The queued
@@ -881,7 +894,6 @@ fn simulated_listener_preparation_rollback_and_real_http_exchange() {
     let mut response = Vec::new();
     let mut bytes = [0; 4096];
     for _ in 0..1000 {
-        let _queue = worker.drivers.enter();
         listeners
             .poll_budgeted(
                 &mut Context::from_waker(futures::task::noop_waker_ref()),
@@ -890,7 +902,7 @@ fn simulated_listener_preparation_rollback_and_real_http_exchange() {
             .unwrap();
         reactor.poll_budgeted(16).unwrap();
         worker.poll(&mut Context::from_waker(futures::task::noop_waker_ref()));
-        match client.recv(&mut bytes) {
+        match client_handle.recv(&mut bytes) {
             Ok(n) => response.extend_from_slice(&bytes[..n]),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => (),
             Err(e) => panic!("{e}"),
@@ -943,6 +955,8 @@ fn limits() -> Limits {
         queue_entries: n,
         connections_per_neighbor: n,
         client_connections: n,
+        peer_connections: n,
+        outbound_connections: n,
         pipes: n,
         range_window_pages: n,
         header_bytes: NonZeroUsize::new(32768).unwrap(),
@@ -961,13 +975,21 @@ fn definition() -> CacheDefinition {
         name: "example".into(),
         client_socket: "/run/racer/example/client/socket".into(),
         origin_socket: "/run/racer/example/origin/socket".into(),
-        priority: racer_control_wire::DEFAULT_PRIORITY,
-        mode: racer_control_wire::CacheMode::Cached,
+        priority: racer_wire::control::DEFAULT_PRIORITY,
+        mode: racer_wire::control::CacheMode::Cached,
         origin: None,
     }
 }
 fn scope() -> RequestScope {
-    new_scope(Duration::from_secs(5), Cancellation::new().unwrap()).unwrap()
+    new_scope(
+        &racer_io::WorkerCtx {
+            clock: racer_io::Clock::host(),
+            rng: racer_io::Rng::os(),
+        },
+        Duration::from_secs(5),
+        Cancellation::new().unwrap(),
+    )
+    .unwrap()
 }
 struct Fixture {
     root: Root,
@@ -998,13 +1020,13 @@ impl Fixture {
         }
     }
 
-    fn new() -> Self {
-        Self::with_limits(limits())
+    fn new(env: &racer_io::Env) -> Self {
+        Self::with_limits(env, limits())
     }
-    fn with_limits(limits: Limits) -> Self {
+    fn with_limits(env: &racer_io::Env, limits: Limits) -> Self {
         let root = Root::new();
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
-        let reactor = Rc::new(Reactor::new(admission.clone()));
+        let reactor = Rc::new(Reactor::new(admission.clone(), env));
         // Production client-socket framing, so route body caps are exercised.
         let io = Rc::new(crate::http::client_io(reactor.clone(), admission.clone()));
         let delivery = Rc::new(Delivery::new(reactor.clone(), Duration::from_secs(2)));
@@ -1012,6 +1034,7 @@ impl Fixture {
         metadata.expires_at =
             ExpiresAt::from_system_time(UNIX_EPOCH + Duration::from_millis(1234)).unwrap();
         let worker = ReadWorker::new(
+            env,
             definition(),
             metadata,
             admission.clone(),
@@ -1074,7 +1097,7 @@ impl Fixture {
             scope.cancel().unwrap();
         }
         self.listeners.active.borrow_mut().push_back(Active {
-            runnable: uring_runtime::drivers::Runnable::new(),
+            runnable: racer_io::exec::Runnable::new(),
             deadline: Rc::new(Cell::new(scope.deadline.0)),
             expired: None,
             cache: definition().id,
@@ -1119,7 +1142,6 @@ impl Fixture {
         stream
     }
     fn pump(&self, budget: usize) {
-        let _queue = self.worker.as_ref().map(|worker| worker.drivers.enter());
         self.listeners
             .poll_budgeted(
                 &mut Context::from_waker(futures::task::noop_waker_ref()),
@@ -1140,7 +1162,7 @@ impl Fixture {
     /// one at a time and the reactor reaps it before the next connection runs.
     ///
     /// The deadline only catches hangs. Simulated GPU decrypts run the
-    /// bit-serial host GCM emulation on the single helper thread, roughly
+    /// bit-serial host GCM emulation on the GPU executor thread, roughly
     /// 0.4-0.7s per page on one CPU, so a multi-page exchange on a shared CI
     /// runner can legitimately take several seconds.
     fn receive_budgeted(&self, socket: &mut UnixStream, eof: bool, budget: usize) -> Vec<u8> {
@@ -1180,13 +1202,14 @@ fn request(method: &str, fields: &str) -> Vec<u8> {
 
 #[test]
 fn client_listener_readiness_recovers_from_queue_pressure() {
+    let env = racer_io::Env::host();
     let mut limits = limits();
     limits.queue_entries = NonZeroUsize::new(8).unwrap();
-    let fixture = Fixture::with_limits(limits);
+    let fixture = Fixture::with_limits(&env, limits);
     fixture.reconcile(&[definition()]).unwrap();
     let scope = scope();
     let (reader, _writer) = UnixStream::pair().unwrap();
-    let reader = Rc::new(uring_runtime::reactor::descriptor::Descriptor::from(reader));
+    let reader = Rc::new(racer_io::ring::Descriptor::from(reader));
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     let mut pressure = Vec::new();
     for _ in 0..8 {
@@ -1212,14 +1235,22 @@ fn client_listener_readiness_recovers_from_queue_pressure() {
     );
 }
 
-fn sleep_until(deadline: Instant) {
-    std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+/// A kernel-backed environment whose monotonic clock only moves when the test
+/// advances it, so request-timeout tests do not race scheduler delays.
+fn frozen_env() -> (racer_io::Env, racer_io::ctx::VirtualClock) {
+    let clock = racer_io::ctx::VirtualClock::new();
+    let env = racer_io::Env::new(
+        racer_io::ring::Driver::Uring,
+        racer_io::WorkerCtx::simulated(&clock, 0, 0),
+    );
+    (env, clock)
 }
 
 #[test]
 fn configured_timeout_bounds_idle_partial_headers_and_keepalive() {
     for mode in ["idle", "partial", "keepalive"] {
-        let mut fixture = Fixture::new();
+        let (env, clock) = frozen_env();
+        let mut fixture = Fixture::new(&env);
         assert_eq!(fixture.listeners.request_timeout(), Duration::from_secs(30));
         let timeout = Duration::from_millis(200);
         fixture.listeners = fixture.listeners.with_request_timeout(timeout);
@@ -1240,16 +1271,16 @@ fn configured_timeout_bounds_idle_partial_headers_and_keepalive() {
         assert_no_head(&mut socket);
         // Make progress inside the header budget, then cross its original
         // deadline before a renewed budget could expire.
-        let started = Instant::now();
+        let started = clock.now();
         if mode == "partial" {
-            sleep_until(started + timeout / 2);
+            clock.advance_to(started + timeout / 2).unwrap();
             socket.write_all(b"HEAD /v1/objects/").unwrap();
             for _ in 0..16 {
                 fixture.pump(16);
             }
             assert_no_head(&mut socket);
         }
-        sleep_until(started + timeout + Duration::from_millis(20));
+        clock.advance_to(started + timeout).unwrap();
         // The expired budget closes the connection, but under load its timer
         // and close completions can take more than a fixed number of pumps to
         // be reaped. Wait for the close itself, bounded by wall-clock time.
@@ -1275,7 +1306,8 @@ fn configured_timeout_bounds_idle_partial_headers_and_keepalive() {
 
 #[test]
 fn configured_timeout_starts_fresh_operations_after_headers_and_on_reuse() {
-    let mut fixture = Fixture::new();
+    let (env, clock) = frozen_env();
+    let mut fixture = Fixture::new(&env);
     let timeout = Duration::from_millis(500);
     fixture.listeners = fixture.listeners.with_request_timeout(timeout);
     fixture
@@ -1292,16 +1324,15 @@ fn configured_timeout_starts_fresh_operations_after_headers_and_on_reuse() {
         fixture.pump(16);
     }
     assert!(fixture.listeners.read_scopes.borrow().is_empty());
-    std::thread::sleep(Duration::from_millis(100));
-    let before = Instant::now();
+    clock.advance(Duration::from_millis(100)).unwrap();
+    let before = clock.now();
     socket.write_all(b"\r\n").unwrap();
     for _ in 0..16 {
         fixture.pump(16);
     }
     let first = fixture.listeners.read_scopes.borrow()[0].clone();
     fixture.wait_for_origin(RequestKind::Head, 1);
-    assert!(first.deadline.0 >= before + timeout);
-    assert!(first.deadline.0 <= Instant::now() + timeout);
+    assert_eq!(first.deadline.0, before + timeout);
     fixture
         .worker
         .as_ref()
@@ -1319,6 +1350,9 @@ fn configured_timeout_starts_fresh_operations_after_headers_and_on_reuse() {
         .unwrap()
         .origin
         .block(RequestKind::Head);
+    // Reuse the connection later so a fresh operation budget is observable.
+    clock.advance(Duration::from_millis(100)).unwrap();
+    let reused = clock.now();
     socket.write_all(&head).unwrap();
     for _ in 0..16 {
         fixture.pump(16);
@@ -1326,9 +1360,10 @@ fn configured_timeout_starts_fresh_operations_after_headers_and_on_reuse() {
     let second = fixture.listeners.read_scopes.borrow()[1].clone();
     fixture.wait_for_origin(RequestKind::Head, 2);
     assert_ne!(first.request, second.request);
+    assert_eq!(second.deadline.0, reused + timeout);
     assert!(second.deadline.0 > first.deadline.0);
     assert_no_head(&mut socket);
-    sleep_until(second.deadline.0 + Duration::from_millis(20));
+    clock.advance_to(second.deadline.0).unwrap();
     let output = fixture.receive(&mut socket, true);
     assert!(output.starts_with(b"HTTP/1.1 503 "), "{output:?}");
     assert!(output.ends_with(b"\r\n\r\n"));
@@ -1341,7 +1376,8 @@ fn accepted_client_wakes_before_first_poll_and_blocked_clients_are_fair() {
     use crate::test_support::WakeCounter;
     use std::sync::Arc;
     use std::task::Waker;
-    let fixture = Fixture::new();
+    let env = racer_io::Env::host();
+    let fixture = Fixture::new(&env);
     fixture.reconcile(&[definition()]).unwrap();
     let _socket = fixture.connect();
     let count = Arc::new(WakeCounter::default());
@@ -1367,7 +1403,7 @@ fn accepted_client_wakes_before_first_poll_and_blocked_clients_are_fair() {
         senders.push(send);
         let order = order.clone();
         fixture.listeners.active.borrow_mut().push_back(Active {
-            runnable: uring_runtime::drivers::Runnable::new(),
+            runnable: racer_io::exec::Runnable::new(),
             deadline: Rc::new(Cell::new(Instant::now() + Duration::from_secs(5))),
             expired: None,
             cache: definition().id,
@@ -1417,7 +1453,7 @@ fn accepted_client_wakes_before_first_poll_and_blocked_clients_are_fair() {
     assert_eq!(fixture.listeners.active_connections(), 0);
     let mut yielded = false;
     fixture.listeners.active.borrow_mut().push_back(Active {
-        runnable: uring_runtime::drivers::Runnable::new(),
+        runnable: racer_io::exec::Runnable::new(),
         deadline: Rc::new(Cell::new(Instant::now() + Duration::from_secs(5))),
         expired: None,
         cache: definition().id,
@@ -1445,6 +1481,7 @@ fn accepted_client_wakes_before_first_poll_and_blocked_clients_are_fair() {
 }
 
 fn install_body_worker(
+    env: &racer_io::Env,
     fixture: &mut Fixture,
     delivery: Rc<Delivery>,
     large: bool,
@@ -1456,6 +1493,7 @@ fn install_body_worker(
     use crate::test_support::ReadWorker;
     let length = if large { PAGE_BYTES + 1 } else { 5 };
     let worker = ReadWorker::new(
+        env,
         definition(),
         ObjectMetadata {
             content_type: None,
@@ -1492,6 +1530,7 @@ fn install_body_worker(
 #[test]
 fn actual_uds_nonempty_range_and_late_failure_truncates() {
     use crate::model::WorkerId;
+    let env = racer_io::Env::host();
     for (late_failure, fields, expected_range, expected_length, expected_body) in [
         (
             false,
@@ -1529,7 +1568,7 @@ fn actual_uds_nonempty_range_and_late_failure_truncates() {
             b"xx".as_slice(),
         ),
     ] {
-        let mut fixture = Fixture::new();
+        let mut fixture = Fixture::new(&env);
         let failures = crate::telemetry::Failures::default();
         let observer = failures.observer(WorkerId(0));
         let delivery = Rc::new(Delivery::new(
@@ -1540,7 +1579,7 @@ fn actual_uds_nonempty_range_and_late_failure_truncates() {
             Responses::new(fixture.listeners.io.clone(), delivery.clone())
                 .with_observer(observer.clone()),
         );
-        install_body_worker(&mut fixture, delivery, late_failure, false);
+        install_body_worker(&env, &mut fixture, delivery, late_failure, false);
         fixture.reconcile(&[definition()]).unwrap();
         let mut socket = fixture.connect();
         socket
@@ -1606,8 +1645,9 @@ fn actual_uds_nonempty_range_and_late_failure_truncates() {
 #[test]
 fn subscription_retains_delivered_page_until_release_and_rejects_invalid_releases() {
     use crate::admission::ResourceClass;
+    let env = racer_io::Env::host();
     for release in [Some((0u64, 2u32)), Some((0, 1)), Some((1, 2)), None] {
-        let (mut fixture, pipes) = body_fixture_with_large_page(4, false, true);
+        let (mut fixture, pipes) = body_fixture_with_large_page(&env, 4, false, true);
         let failures = crate::telemetry::Failures::default();
         fixture.listeners.responses = Rc::new(
             Responses::new(
@@ -1680,13 +1720,15 @@ fn subscription_retains_delivered_page_until_release_and_rejects_invalid_release
 }
 
 fn body_fixture(
+    env: &racer_io::Env,
     queue: usize,
     fail_first: bool,
 ) -> (Fixture, Rc<flow_control::PipePool<AdmissionPolicy>>) {
-    body_fixture_with_large_page(queue, fail_first, false)
+    body_fixture_with_large_page(env, queue, fail_first, false)
 }
 
 fn body_fixture_with_large_page(
+    env: &racer_io::Env,
     queue: usize,
     fail_first: bool,
     large_page: bool,
@@ -1694,9 +1736,9 @@ fn body_fixture_with_large_page(
     let mut limits = limits();
     limits.pipes = NonZeroUsize::new(1).unwrap();
     limits.queue_entries = NonZeroUsize::new(queue).unwrap();
-    let mut fixture = Fixture::with_limits(limits);
+    let mut fixture = Fixture::with_limits(env, limits);
     let admission = fixture.listeners.admission.clone();
-    let pipes = Rc::new(new_pipe_pool(admission.clone()));
+    let pipes = Rc::new(new_pipe_pool(admission.clone(), env.sim_os().cloned()));
     let delivery = Rc::new(Delivery::new(
         fixture.reactor.clone(),
         Duration::from_secs(2),
@@ -1705,7 +1747,7 @@ fn body_fixture_with_large_page(
         fixture.listeners.io.clone(),
         delivery.clone(),
     ));
-    install_body_worker(&mut fixture, delivery, large_page, fail_first);
+    install_body_worker(env, &mut fixture, delivery, large_page, fail_first);
     fixture.reconcile(&[definition()]).unwrap();
     (fixture, pipes)
 }
@@ -1745,7 +1787,6 @@ fn assert_no_body_leases(fixture: &Fixture) {
 }
 
 fn assert_only_idle_pipes(fixture: &Fixture, pipes: &flow_control::PipePool<AdmissionPolicy>) {
-    fixture.listeners.admission.reclaim_buffers();
     use crate::admission::ResourceClass;
     assert_eq!(fixture.listeners.active_connections(), 0);
     assert_eq!(
@@ -1763,7 +1804,8 @@ fn assert_only_idle_pipes(fixture: &Fixture, pipes: &flow_control::PipePool<Admi
 
 #[test]
 fn configured_timeout_is_not_renewed_by_response_or_stream_progress() {
-    let (mut fixture, _pipes) = body_fixture_with_large_page(16, false, true);
+    let (env, clock) = frozen_env();
+    let (mut fixture, _pipes) = body_fixture_with_large_page(&env, 16, false, true);
     let timeout = Duration::from_millis(800);
     fixture.listeners = fixture.listeners.with_request_timeout(timeout);
     fixture
@@ -1785,7 +1827,7 @@ fn configured_timeout_is_not_renewed_by_response_or_stream_progress() {
     let scope = fixture.listeners.read_scopes.borrow()[0].clone();
     // Consume part of the total budget before committing response headers.
     fixture.wait_for_origin(RequestKind::Head, 1);
-    sleep_until(scope.deadline.0 - timeout / 2);
+    clock.advance_to(scope.deadline.0 - timeout / 2).unwrap();
     fixture
         .worker
         .as_ref()
@@ -1801,6 +1843,7 @@ fn configured_timeout_is_not_renewed_by_response_or_stream_progress() {
         + 4;
     let mut bytes = [0; 8192];
     // Keep making observable body progress without draining the whole page.
+    let stalled = Instant::now() + Duration::from_secs(10);
     for _ in 0..4 {
         loop {
             fixture.pump(16);
@@ -1810,7 +1853,8 @@ fn configured_timeout_is_not_renewed_by_response_or_stream_progress() {
                     break;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    assert!(Instant::now() < scope.deadline.0);
+                    assert!(clock.now() < scope.deadline.0);
+                    assert!(Instant::now() < stalled, "no streaming progress");
                 }
                 result => panic!("expected streaming progress: {result:?}"),
             }
@@ -1818,7 +1862,9 @@ fn configured_timeout_is_not_renewed_by_response_or_stream_progress() {
     }
     assert!(output.len() > head_end);
     assert_eq!(fixture.listeners.active_connections(), 1);
-    sleep_until(scope.deadline.0 + Duration::from_millis(20));
+    clock
+        .advance_to(scope.deadline.0 + Duration::from_millis(20))
+        .unwrap();
     for _ in 0..64 {
         fixture.pump(16);
     }
@@ -1840,7 +1886,8 @@ fn configured_timeout_is_not_renewed_by_response_or_stream_progress() {
 
 #[test]
 fn client_disconnect_cancels_pending_metadata_before_acquisition_deadline() {
-    let fixture = Fixture::new();
+    let env = racer_io::Env::host();
+    let fixture = Fixture::new(&env);
     fixture
         .worker
         .as_ref()
@@ -1861,20 +1908,21 @@ fn client_disconnect_cancels_pending_metadata_before_acquisition_deadline() {
     // is observed and the connection is gone, well inside the acquisition
     // deadline.
     let wait = Instant::now() + Duration::from_secs(1);
-    while (!scope.cancellation.is_cancelled() || fixture.listeners.active_connections() != 0)
+    while (!scope.cancellation.is_canceled() || fixture.listeners.active_connections() != 0)
         && Instant::now() < wait
     {
         fixture.pump(16);
         std::thread::yield_now();
     }
-    assert!(scope.cancellation.is_cancelled());
+    assert!(scope.cancellation.is_canceled());
     assert!(Instant::now() < scope.deadline.0);
     assert_no_body_leases(&fixture);
 }
 
 #[test]
 fn delivery_watch_cancels_disconnected_body_and_releases_leases() {
-    let (fixture, pipes) = body_fixture_with_large_page(16, false, true);
+    let env = racer_io::Env::host();
+    let (fixture, pipes) = body_fixture_with_large_page(&env, 16, false, true);
     let mut socket = fixture.connect();
     socket
         .write_all(&request(
@@ -1899,7 +1947,8 @@ fn delivery_watch_cancels_disconnected_body_and_releases_leases() {
 
 #[test]
 fn delivery_head_allows_request_write_half_close() {
-    let fixture = Fixture::new();
+    let env = racer_io::Env::host();
+    let fixture = Fixture::new(&env);
     fixture.reconcile(&[definition()]).unwrap();
     let mut socket = fixture.connect();
     socket
@@ -1917,6 +1966,7 @@ fn delivery_head_allows_request_write_half_close() {
 
 #[test]
 fn actual_uds_pipe_waiters_progress_within_budget_and_overflow_before_206() {
+    let env = racer_io::Env::host();
     // Duplex completion frames and the next response head may be in flight
     // together, in addition to listener readiness. Keep reactor headroom
     // while proving that an exhausted relay pipe quota cannot block delivery.
@@ -1924,7 +1974,7 @@ fn actual_uds_pipe_waiters_progress_within_budget_and_overflow_before_206() {
     // them asynchronously, so under CPU starvation all five connections can
     // hold entries together, and a full ring closes a connection with
     // Overloaded and no response. Pipe quota, not ring size, is under test.
-    let (mut fixture, pipes) = body_fixture(16, false);
+    let (mut fixture, pipes) = body_fixture(&env, 16, false);
     let failures = crate::telemetry::Failures::default();
     fixture.listeners.responses = Rc::new(
         Responses::new(
@@ -1980,7 +2030,8 @@ fn actual_uds_pipe_waiters_progress_within_budget_and_overflow_before_206() {
 
 #[test]
 fn actual_uds_first_page_failure_is_complete_503() {
-    let (mut fixture, _pipes) = body_fixture(16, true);
+    let env = racer_io::Env::host();
+    let (mut fixture, _pipes) = body_fixture(&env, 16, true);
     let failures = crate::telemetry::Failures::default();
     let delivery = Rc::new(Delivery::new(
         fixture.reactor.clone(),
@@ -2015,7 +2066,8 @@ fn actual_uds_first_page_failure_is_complete_503() {
 #[test]
 fn actual_uds_waiting_deadline_and_cache_shutdown_release_all_leases() {
     for cancel in [false, true] {
-        let (mut fixture, pipes) = body_fixture(16, false);
+        let (env, clock) = frozen_env();
+        let (mut fixture, pipes) = body_fixture(&env, 16, false);
         fixture.listeners = fixture
             .listeners
             .with_request_timeout(Duration::from_millis(200));
@@ -2026,7 +2078,7 @@ fn actual_uds_waiting_deadline_and_cache_shutdown_release_all_leases() {
         if cancel {
             fixture.listeners.cancel_cache(&definition().id).unwrap();
         } else {
-            std::thread::sleep(Duration::from_millis(220));
+            clock.advance(Duration::from_millis(200)).unwrap();
         }
         let output = fixture.receive(&mut socket, true);
         assert!(output.starts_with(b"HTTP/1.1 503 "), "{output:?}");
@@ -2040,7 +2092,8 @@ fn actual_uds_waiting_deadline_and_cache_shutdown_release_all_leases() {
 
 #[test]
 fn actual_uds_empty_bootstrap_and_canceled_success() {
-    let fixture = Fixture::new();
+    let env = racer_io::Env::host();
+    let fixture = Fixture::new(&env);
     fixture.reconcile(&[definition()]).unwrap();
     let mut metadata = body_metadata(0);
     metadata.version.etag = StrongEtag::parse(b"\"\"").unwrap();
@@ -2102,7 +2155,8 @@ fn actual_uds_empty_bootstrap_and_canceled_success() {
 
 #[test]
 fn actual_uds_head_keepalive_removal_and_accept_fairness() {
-    let fixture = Fixture::new();
+    let env = racer_io::Env::host();
+    let fixture = Fixture::new(&env);
     assert!(!fixture.socket().exists());
     fixture.reconcile(&[definition()]).unwrap();
     assert_eq!(
@@ -2139,7 +2193,8 @@ fn actual_uds_head_keepalive_removal_and_accept_fairness() {
 
 #[test]
 fn actual_uds_errors_and_idle_drain() {
-    let fixture = Fixture::new();
+    let env = racer_io::Env::host();
+    let fixture = Fixture::new(&env);
     fixture.reconcile(&[definition()]).unwrap();
     for (method, fields, status, extra) in [
         ("GET", "", "405", "allow: head, post\r\n"),
@@ -2176,7 +2231,8 @@ fn actual_uds_errors_and_idle_drain() {
 
 #[test]
 fn actual_uds_prefetch_route_answers_json_and_closes() {
-    let fixture = Fixture::new();
+    let env = racer_io::Env::host();
+    let fixture = Fixture::new(&env);
     fixture.reconcile(&[definition()]).unwrap();
     for (raw, status, expected) in [
         (
@@ -2250,7 +2306,8 @@ fn actual_uds_prefetch_route_answers_json_and_closes() {
 
 #[test]
 fn actual_uds_rejected_raw_heads_receive_sdk_errors() {
-    let fixture = Fixture::new();
+    let env = racer_io::Env::host();
+    let fixture = Fixture::new(&env);
     fixture.reconcile(&[definition()]).unwrap();
     let mut oversized = request("HEAD", &format!("X-Padding: {}\r\n", "x".repeat(32768)));
     // Hit the cap without sending beyond it: a full unterminated head is 431.
@@ -2288,8 +2345,9 @@ fn actual_uds_rejected_raw_heads_receive_sdk_errors() {
 
 #[test]
 fn actual_uds_configured_head_cap_counts_only_wire_bytes() {
+    let env = racer_io::Env::host();
     for limit in [512, super::MAX_HEAD_BYTES] {
-        let mut fixture = Fixture::new();
+        let mut fixture = Fixture::new(&env);
         fixture.listeners.parser = RequestParser::new(limit);
         fixture.reconcile(&[definition()]).unwrap();
         for separator in ["", " ", "\t", "  "] {
@@ -2322,7 +2380,8 @@ fn actual_uds_configured_head_cap_counts_only_wire_bytes() {
 
 #[test]
 fn actual_uds_configured_head_limit_counts_received_bytes() {
-    let mut fixture = Fixture::new();
+    let env = racer_io::Env::host();
+    let mut fixture = Fixture::new(&env);
     let limit = 512;
     fixture.listeners.parser = RequestParser::new(limit);
     fixture.reconcile(&[definition()]).unwrap();
@@ -2353,7 +2412,8 @@ fn actual_uds_configured_head_limit_counts_received_bytes() {
 
 #[test]
 fn response_payload_validation_preserves_range_pin_and_empty_contracts() {
-    let fixture = Fixture::new();
+    let env = racer_io::Env::host();
+    let fixture = Fixture::new(&env);
     let worker = fixture.worker.as_ref().unwrap();
     let responses = &fixture.listeners.responses;
     let metadata = body_metadata(17);
@@ -2422,7 +2482,8 @@ fn response_payload_validation_preserves_range_pin_and_empty_contracts() {
 
 #[test]
 fn actual_uds_read_failures_and_immutable_result_validation() {
-    let fixture = Fixture::new();
+    let env = racer_io::Env::host();
+    let fixture = Fixture::new(&env);
     fixture.reconcile(&[definition()]).unwrap();
     for (error, fields, status, range) in [
         (Error::NotFound, "", 404, None),
@@ -2433,10 +2494,11 @@ fn actual_uds_read_failures_and_immutable_result_validation() {
             416,
             Some("content-range: bytes */17\r\n"),
         ),
-        (Error::Cancelled, "", 503, None),
+        (Error::Canceled, "", 503, None),
         (Error::OriginRejected, "", 401, None),
         (Error::OriginForbidden, "", 403, None),
         (Error::Overloaded, "", 503, None),
+        (Error::FlightFull, "", 503, None),
     ] {
         let kind = if fields.is_empty() {
             ReadKind::Head
@@ -2445,7 +2507,7 @@ fn actual_uds_read_failures_and_immutable_result_validation() {
                 etag: StrongEtag::parse(b"\"v1\"").unwrap(),
             }
         };
-        let output = fixture.result_output(kind, Err(error), error == Error::Cancelled);
+        let output = fixture.result_output(kind, Err(error), error == Error::Canceled);
         let text = std::str::from_utf8(&output).unwrap().to_ascii_lowercase();
         assert!(text.starts_with(&format!("http/1.1 {status}")), "{text}");
         assert!(text.contains("content-length: 0\r\n"));
@@ -2455,7 +2517,7 @@ fn actual_uds_read_failures_and_immutable_result_validation() {
         }
         assert!(text.ends_with("\r\n\r\n"));
     }
-    fixture.assert_metrics(7, 7, 0);
+    fixture.assert_metrics(8, 8, 0);
     assert_eq!(
         fixture
             .listeners
@@ -2488,6 +2550,7 @@ fn actual_uds_read_failures_and_immutable_result_validation() {
 
 #[test]
 fn real_coordinator_maps_adapter_metadata_failures() {
+    let env = racer_io::Env::host();
     for (status, pin, expected) in [
         (404, false, 404),
         (404, true, 502),
@@ -2496,7 +2559,7 @@ fn real_coordinator_maps_adapter_metadata_failures() {
         (403, false, 403),
         (503, false, 503),
     ] {
-        let fixture = Fixture::new();
+        let fixture = Fixture::new(&env);
         fixture
             .worker
             .as_ref()
@@ -2526,10 +2589,11 @@ fn real_coordinator_maps_adapter_metadata_failures() {
 fn exchanged_listener_backlog_is_budgeted_routed_to_old_uid_and_released() {
     use crate::admission::Ingress;
     use crate::model::WorkerId;
+    let env = racer_io::Env::host();
 
     for distributed in [false, true] {
-        let mut fixture = Fixture::new();
-        let receiver = Fixture::new();
+        let mut fixture = Fixture::new(&env);
+        let receiver = Fixture::new(&env);
         let ingress = Arc::new(Ingress::new(&[WorkerId(1)]));
         if distributed {
             ingress
@@ -2634,8 +2698,9 @@ fn exchanged_listener_backlog_is_budgeted_routed_to_old_uid_and_released() {
 
 #[test]
 fn retirement_accept_failure_and_retry_limit_release_the_listener() {
+    let env = racer_io::Env::host();
     for failure in ["interrupted", "accept", "chmod", "pressure"] {
-        let fixture = Fixture::new();
+        let fixture = Fixture::new(&env);
         fixture.reconcile(&[definition()]).unwrap();
         let old = Rc::downgrade(&fixture.listeners.listeners.borrow()[&definition().id]);
         let mut replacement = definition();
@@ -2689,12 +2754,13 @@ fn retirement_accept_failure_and_retry_limit_release_the_listener() {
 #[test]
 fn retirement_waits_for_admission_but_expires_without_capacity() {
     use crate::admission::ResourceClass;
+    let env = racer_io::Env::host();
     for (expire, resource) in [
         (false, ResourceClass::IngressConnection),
         (false, ResourceClass::Connection),
         (true, ResourceClass::IngressConnection),
     ] {
-        let mut fixture = Fixture::new();
+        let mut fixture = Fixture::new(&env);
         if expire {
             fixture.listeners = fixture.listeners.with_request_timeout(Duration::ZERO);
         }
@@ -2740,24 +2806,26 @@ fn retirement_waits_for_admission_but_expires_without_capacity() {
 
 #[test]
 fn production_snapshot_replacement_rejects_old_backlog_uid_with_503() {
+    use crate::control::cell::PublicationCell;
     use crate::control::publication::PublicationTarget;
     use crate::control::{Availability, Snapshot};
-    use controlplane::Published;
-    use racer_control_wire::{MembershipVersion, Publication, PublicationSequence};
-    let mut fixture = Fixture::new();
-    let keys = Rc::new(crate::test_support::security::keys());
-    let state = Arc::new(Published::new(Snapshot::retention(2)));
+    use racer_wire::control::{MembershipVersion, Publication, PublicationSequence};
+    let env = racer_io::Env::host();
+    let mut fixture = Fixture::new(&env);
+    let keys = Rc::new(crate::test_support::security::keys(&env));
+    let state = Arc::new(PublicationCell::new(Snapshot::retention(2)));
     let snapshots = Rc::new(PublicationTarget::new(
         keys.cluster().clone(),
         state.clone(),
+        racer_io::Clock::host(),
     ));
     let mut publication = Publication {
         pools: Vec::new(),
-        schema_version: racer_control_wire::SCHEMA_VERSION,
+        schema_version: racer_wire::control::SCHEMA_VERSION,
         cluster: keys.cluster().clone(),
         sequence: PublicationSequence(1),
         membership_version: MembershipVersion(1),
-        members: vec![racer_control_wire::Member {
+        members: vec![racer_wire::control::Member {
             node: keys.node().clone(),
             shares: std::num::NonZeroU32::new(1).unwrap(),
             peer_endpoint: "127.0.0.1:1".into(),
@@ -2765,6 +2833,7 @@ fn production_snapshot_replacement_rejects_old_backlog_uid_with_503() {
             site: String::new(),
         }],
         caches: vec![definition()],
+        page_size: racer_wire::object::PageSize::DEFAULT,
     }
     .with_default_pool();
     snapshots.apply(publication.clone()).unwrap();
@@ -2782,7 +2851,7 @@ fn production_snapshot_replacement_rejects_old_backlog_uid_with_503() {
     socket.write_all(&request("HEAD", "")).unwrap();
     publication.sequence = PublicationSequence(2);
     publication.caches[0].id = CacheId("00000000-0000-4000-8000-000000000003".into());
-    publication.pools = racer_control_wire::default_pools(&publication.caches);
+    publication.pools = racer_wire::control::default_pools(&publication.caches);
     publication.membership_version.0 += 1;
     let transition =
         futures::executor::block_on(fixture.listeners.prepare(&publication.caches, &scope()))
@@ -2790,7 +2859,7 @@ fn production_snapshot_replacement_rejects_old_backlog_uid_with_503() {
     snapshots
         .apply_staged(publication.clone(), Some(Box::new(transition)))
         .unwrap();
-    assert_eq!(snapshots.current().unwrap().caches, publication.caches);
+    assert_eq!(**snapshots.current().unwrap().caches, *publication.caches);
     let response = fixture.receive(&mut socket, true);
     assert!(response.starts_with(b"HTTP/1.1 503"), "{response:?}");
     assert_eq!(
@@ -2806,9 +2875,10 @@ fn production_snapshot_replacement_rejects_old_backlog_uid_with_503() {
 fn retirement_handoff_uses_remote_capacity_and_honors_shutdown() {
     use crate::admission::{Ingress, ResourceClass};
     use crate::model::WorkerId;
+    let env = racer_io::Env::host();
     for stop in ["none", "receiver", "source"] {
-        let mut source = Fixture::new();
-        let receiver = Fixture::new();
+        let mut source = Fixture::new(&env);
+        let receiver = Fixture::new(&env);
         let ingress = Arc::new(Ingress::new(&[WorkerId(0), WorkerId(1)]));
         ingress
             .install(WorkerId(0), &source.listeners.admission)
@@ -2872,7 +2942,8 @@ fn retirement_handoff_uses_remote_capacity_and_honors_shutdown() {
 #[test]
 fn retirement_generations_are_bounded_and_removal_allows_immediate_recreation() {
     use crate::admission::ResourceClass;
-    let fixture = Fixture::new();
+    let env = racer_io::Env::host();
+    let fixture = Fixture::new(&env);
     let held = fixture
         .listeners
         .admission
@@ -2917,7 +2988,8 @@ fn retirement_generations_are_bounded_and_removal_allows_immediate_recreation() 
 
 #[test]
 fn priority_only_changes_reuse_listeners_beyond_retirement_bound() {
-    let fixture = Fixture::new();
+    let env = racer_io::Env::host();
+    let fixture = Fixture::new(&env);
     let count = MAX_RETIRING_LISTENERS + 1;
     let mut caches: Vec<_> = (0..count)
         .map(|n| {
@@ -2927,8 +2999,8 @@ fn priority_only_changes_reuse_listeners_beyond_retirement_bound() {
                 client_socket: format!("/run/racer/{name}/client/socket").into(),
                 origin_socket: format!("/run/racer/{name}/origin/socket").into(),
                 name,
-                priority: racer_control_wire::DEFAULT_PRIORITY,
-                mode: racer_control_wire::CacheMode::Cached,
+                priority: racer_wire::control::DEFAULT_PRIORITY,
+                mode: racer_wire::control::CacheMode::Cached,
                 origin: None,
             }
         })
@@ -2942,9 +3014,9 @@ fn priority_only_changes_reuse_listeners_beyond_retirement_bound() {
         cache.priority = 7;
         // Mode changes in either direction reuse the socket too.
         cache.mode = [
-            racer_control_wire::CacheMode::PassthroughPeers,
-            racer_control_wire::CacheMode::PassthroughLocal,
-            racer_control_wire::CacheMode::Cached,
+            racer_wire::control::CacheMode::PassthroughPeers,
+            racer_wire::control::CacheMode::PassthroughLocal,
+            racer_wire::control::CacheMode::Cached,
         ][n % 3];
     }
     let prepared =
@@ -2975,8 +3047,8 @@ fn listener_reuse_ignores_only_priority() {
     next.priority = 0;
     assert!(same_endpoint(&current, &next));
     for mode in [
-        racer_control_wire::CacheMode::PassthroughPeers,
-        racer_control_wire::CacheMode::PassthroughLocal,
+        racer_wire::control::CacheMode::PassthroughPeers,
+        racer_wire::control::CacheMode::PassthroughLocal,
     ] {
         next.mode = mode;
         assert!(same_endpoint(&current, &next));
@@ -2998,9 +3070,10 @@ fn listener_reuse_ignores_only_priority() {
 fn retirement_queued_authorization_outlives_fd_but_not_removal_or_explicit_stop() {
     use crate::admission::{Ingress, ResourceClass};
     use crate::model::WorkerId;
+    let env = racer_io::Env::host();
     for action in ["keep", "remove-reuse", "stop-reuse"] {
-        let mut source = Fixture::new();
-        let receiver = Fixture::new();
+        let mut source = Fixture::new(&env);
+        let receiver = Fixture::new(&env);
         let ingress = Arc::new(Ingress::new(&[WorkerId(1)]));
         ingress
             .install(WorkerId(1), &receiver.listeners.admission)
@@ -3064,10 +3137,11 @@ fn retirement_queued_authorization_outlives_fd_but_not_removal_or_explicit_stop(
 fn retirement_revocation_registry_bounds_queued_generations_after_fd_release() {
     use crate::admission::Ingress;
     use crate::model::WorkerId;
-    let mut source = Fixture::new();
+    let env = racer_io::Env::host();
+    let mut source = Fixture::new(&env);
     let mut receiver_limits = limits();
     receiver_limits.client_connections = NonZeroUsize::new(256).unwrap();
-    let receiver = Fixture::with_limits(receiver_limits);
+    let receiver = Fixture::with_limits(&env, receiver_limits);
     let ingress = Arc::new(Ingress::new(&[WorkerId(1)]));
     ingress
         .install(WorkerId(1), &receiver.listeners.admission)
@@ -3103,7 +3177,8 @@ fn retirement_revocation_registry_bounds_queued_generations_after_fd_release() {
 
 #[test]
 fn retirement_shutdown_overtaken_commit_defers_previous_socket_cleanup() {
-    let fixture = Fixture::new();
+    let env = racer_io::Env::host();
+    let fixture = Fixture::new(&env);
     fixture.reconcile(&[definition()]).unwrap();
     let old = Rc::downgrade(&fixture.listeners.listeners.borrow()[&definition().id]);
     let inode = fs::metadata(fixture.socket()).unwrap().ino();
@@ -3140,7 +3215,8 @@ fn retirement_shutdown_overtaken_commit_defers_previous_socket_cleanup() {
 
 #[test]
 fn prepared_transition_rolls_back_bind_chmod_and_drop() {
-    let fixture = Fixture::new();
+    let env = racer_io::Env::host();
+    let fixture = Fixture::new(&env);
     fixture.reconcile(&[definition()]).unwrap();
     let inode = fs::metadata(fixture.socket()).unwrap().ino();
     let mut changed = definition();
@@ -3214,7 +3290,8 @@ fn prepared_transition_rolls_back_bind_chmod_and_drop() {
 
 #[test]
 fn abandoned_prepare_future_removes_temporary_socket() {
-    let fixture = Fixture::new();
+    let env = racer_io::Env::host();
+    let fixture = Fixture::new(&env);
     fixture.reconcile(&[definition()]).unwrap();
     let inode = fs::metadata(fixture.socket()).unwrap().ino();
     let mut changed = definition();
@@ -3248,7 +3325,8 @@ fn abandoned_prepare_future_removes_temporary_socket() {
 
 #[test]
 fn prepared_rename_failure_restores_already_exchanged_paths() {
-    let fixture = Fixture::new();
+    let env = racer_io::Env::host();
+    let fixture = Fixture::new(&env);
     fixture.reconcile(&[definition()]).unwrap();
     let inode = fs::metadata(fixture.socket()).unwrap().ino();
     let mut changed = definition();
@@ -3293,7 +3371,8 @@ fn prepared_rename_failure_restores_already_exchanged_paths() {
 
 #[test]
 fn prepared_uid_reuse_and_foreign_replacement_are_inode_safe() {
-    let fixture = Fixture::new();
+    let env = racer_io::Env::host();
+    let fixture = Fixture::new(&env);
     fixture.reconcile(&[definition()]).unwrap();
     // The dataplane created the origin directory; the adapter owns its socket.
     let origin = fixture.root.0.join("example/origin");
@@ -3331,7 +3410,8 @@ fn prepared_uid_reuse_and_foreign_replacement_are_inode_safe() {
 
 #[test]
 fn removal_commit_drains_active_response_and_reused_uid_does_not_revive_old_keepalive() {
-    let fixture = Fixture::new();
+    let env = racer_io::Env::host();
+    let fixture = Fixture::new(&env);
     fixture
         .worker
         .as_ref()
@@ -3381,7 +3461,8 @@ fn removal_commit_drains_active_response_and_reused_uid_does_not_revive_old_keep
 
 #[test]
 fn per_cache_cancellation_drains_active_read_and_keeps_other_cache() {
-    let fixture = Fixture::new();
+    let env = racer_io::Env::host();
+    let fixture = Fixture::new(&env);
     fixture
         .worker
         .as_ref()
@@ -3426,7 +3507,8 @@ fn per_cache_cancellation_drains_active_read_and_keeps_other_cache() {
 
 #[test]
 fn socket_lifecycle_rejects_symlinks_and_preserves_unowned_paths() {
-    let fixture = Fixture::new();
+    let env = racer_io::Env::host();
+    let fixture = Fixture::new(&env);
     let origin = fixture.root.0.join("example/origin");
     fs::create_dir_all(&origin).unwrap();
     fs::write(origin.join("socket"), b"adapter owned").unwrap();
@@ -3583,10 +3665,14 @@ mod response {
         use crate::model::PageNumber;
         use crate::model::PageSlice;
         use crate::runtime::Reactor;
+        let env = racer_io::Env::host();
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         )));
-        let delivery = Delivery::new(Rc::new(Reactor::new(admission)), Duration::from_secs(2));
+        let delivery = Delivery::new(
+            Rc::new(Reactor::new(admission, &env)),
+            Duration::from_secs(2),
+        );
         let slice = PageSlice {
             page: PageNumber(0),
             offset: 0,
@@ -3632,7 +3718,7 @@ mod response {
             Error::Overloaded,
             Error::Io,
             Error::InvalidRequest,
-            Error::Cancelled,
+            Error::Canceled,
             Error::DeadlineExceeded,
         ] {
             assert!(
@@ -3642,14 +3728,14 @@ mod response {
     }
     #[test]
     fn gate_actual_readiness_rejection_selects_client_boundary() {
-        let sim = uring_runtime::reactor::simulation::Simulation::new();
-        let _environment = sim.enter();
+        let sim = racer_io::sim::SimOs::new();
+        let env = racer_io::Env::sim(&sim, racer_io::WorkerCtx::host());
         let mut limits = crate::test_support::cluster::config(false).limits;
         limits.queue_entries = std::num::NonZeroUsize::new(1).unwrap();
         let admission = Rc::new(flow_control::Quotas::new(
             crate::admission::AdmissionPolicy::new(limits),
         ));
-        let reactor = crate::runtime::Reactor::new(admission);
+        let reactor = crate::runtime::Reactor::new(admission, &env);
         let scope = scope();
         let (fd, _peer) = sim.socket_pair();
         let fd = Rc::new(fd);
@@ -3679,13 +3765,16 @@ mod response {
     }
     #[test]
     fn gate_payload_readiness_and_early_boundary_contracts() {
-        let sim = uring_runtime::reactor::simulation::Simulation::new();
-        let _environment = sim.enter();
+        let sim = racer_io::sim::SimOs::new();
+        let env = racer_io::Env::sim(&sim, racer_io::WorkerCtx::host());
         let mut limits = crate::test_support::cluster::config(false).limits;
         limits.queue_entries = std::num::NonZeroUsize::new(1).unwrap();
-        let reactor = crate::runtime::Reactor::new(Rc::new(flow_control::Quotas::new(
-            crate::admission::AdmissionPolicy::new(limits),
-        )));
+        let reactor = crate::runtime::Reactor::new(
+            Rc::new(flow_control::Quotas::new(
+                crate::admission::AdmissionPolicy::new(limits),
+            )),
+            &env,
+        );
         let scope = scope();
         let (fd, _peer) = sim.socket_pair();
         let fd = Rc::new(fd);
@@ -3729,11 +3818,7 @@ mod response {
     #[test]
     fn slice_failure_never_submits_auxiliary_readiness() {
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-        for error in [
-            Error::Cancelled,
-            Error::DeadlineExceeded,
-            Error::Unavailable,
-        ] {
+        for error in [Error::Canceled, Error::DeadlineExceeded, Error::Unavailable] {
             assert!(
                 matches!(poll_slice_or_readiness(&mut cx, |_| Poll::Ready(Err(error)), |_| panic!("terminal acquisition must not submit readiness")), Poll::Ready(Err(actual)) if actual == error)
             );
@@ -3984,7 +4069,12 @@ mod parser_tests {
             assert!(parse(head("POST", &[(name, b"2"), (name, b"2")])).is_err());
         }
         for pages in [1, 64] {
-            for bytes in [PAGE_BYTES, 64 * PAGE_BYTES] {
+            for bytes in [
+                racer_wire::object::PageSize::TEST_MIN.get(),
+                racer_wire::object::PageSize::MIN.get(),
+                PAGE_BYTES,
+                64 * PAGE_BYTES,
+            ] {
                 for ordered in ["0", "1", "2", "01"] {
                     let parsed = parse(head(
                         "POST",
@@ -4003,7 +4093,12 @@ mod parser_tests {
         }
         for (name, value) in [
             ("Racer-Page-Credits", "65".into()),
-            ("Racer-Byte-Credits", (PAGE_BYTES - 1).to_string()),
+            // Below the smallest publishable page; a cluster's own page size
+            // is enforced when the stream installs credits.
+            (
+                "Racer-Byte-Credits",
+                (racer_wire::object::PageSize::TEST_MIN.get() - 1).to_string(),
+            ),
             ("Racer-Byte-Credits", (64 * PAGE_BYTES + 1).to_string()),
         ] {
             assert!(parse(head("POST", &[(name, value.as_bytes())])).is_err());
@@ -4150,9 +4245,10 @@ fn handoff_acceptor_drains_backlog_and_wakes_only_while_one_remains() {
     use crate::model::WorkerId;
     use crate::test_support::WakeCounter;
     use std::task::Waker;
+    let env = racer_io::Env::host();
 
-    let mut acceptor = Fixture::new();
-    let worker = Fixture::new();
+    let mut acceptor = Fixture::new(&env);
+    let worker = Fixture::new(&env);
     let ingress = Arc::new(Ingress::new(&[WorkerId(1)]));
     ingress
         .install(WorkerId(1), &worker.listeners.admission)
@@ -4188,6 +4284,7 @@ mod direct;
 #[ignore = "set RACER_SDK_ROOT to the Go repository and run --ignored sdk_prefetch"]
 fn sdk_prefetch_conformance_against_actual_uds() {
     use std::process::Command;
+    let env = racer_io::Env::host();
     let root = PathBuf::from(std::env::var_os("RACER_SDK_ROOT").expect("RACER_SDK_ROOT required"));
     assert!(root.join("pkg/racersdk/prefetch.go").is_file());
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -4224,7 +4321,7 @@ fn sdk_prefetch_conformance_against_actual_uds() {
         "SDK build: {}",
         String::from_utf8_lossy(&build.stderr)
     );
-    let fixture = Fixture::new();
+    let fixture = Fixture::new(&env);
     fixture.reconcile(&[definition()]).unwrap();
     let directory = File::open(fixture.socket().parent().unwrap()).unwrap();
     let mut child = Command::new(&binary)
@@ -4262,7 +4359,8 @@ fn sdk_prefetch_conformance_against_actual_uds() {
 #[test]
 fn prefetch_put_bodies_stay_charged_while_versions_resolve() {
     use crate::admission::ResourceClass;
-    let fixture = Fixture::new();
+    let env = racer_io::Env::host();
+    let fixture = Fixture::new(&env);
     let origin = &fixture.worker.as_ref().unwrap().origin;
     origin.block(RequestKind::Head);
     fixture.reconcile(&[definition()]).unwrap();

@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/opencontainers/go-digest"
@@ -49,6 +50,9 @@ type pullOptions struct {
 	RangeRetries      int
 	RangeRotate       bool
 	RangeCohorts      int
+	// Delivery is stream (SDK Get over the socket) or host-read (Racer
+	// writes into a pooled memfd). host-read requires the uds backend.
+	Delivery string
 }
 
 type puller struct {
@@ -68,6 +72,8 @@ type puller struct {
 	expected     map[digest.Digest]blobSource
 	// Shared by workers; production uses the concurrency-safe package RNG.
 	randomFloat64 func() float64
+	// Shared cursor for the sweep profile.
+	sweep atomic.Uint64
 }
 
 func newPuller(img *syntheticImage, opts pullOptions, metrics *loadMetrics) (*puller, error) {
@@ -81,6 +87,10 @@ func newPuller(img *syntheticImage, opts pullOptions, metrics *loadMetrics) (*pu
 
 	if opts.DiagnoseIntegrity && !opts.Verify {
 		return nil, errors.New("diagnose-integrity requires verify")
+	}
+
+	if err := validateDelivery(opts); err != nil {
+		return nil, err
 	}
 
 	if img == nil || metrics == nil {
@@ -484,6 +494,10 @@ func (p *puller) reportProgress(body io.Reader) func() int64 {
 
 // readBody counts bytes even when Read returns data together with an error.
 func (p *puller) readBody(body io.Reader) (int64, string, error) {
+	if host, ok := body.(*hostReadBody); ok {
+		return p.readHostBody(host)
+	}
+
 	if !p.opts.Verify && !p.opts.DiagnoseIntegrity {
 		// Keep both the *os.File destination and Object source unwrapped so the
 		// SDK can splice. Each concurrent read borrows its own file; see drainFiles.

@@ -1,27 +1,49 @@
-//! Racer authentication and renewal policy around two independent generic feeds.
+//! Racer authentication and renewal policy around two independent long polls.
 
-use super::publication::{PublicationCodec, PublicationTarget};
+use super::poll::{
+    self, Doc, Document, Fetch, FetchError, Install, Poll, Preparation, Prepared, Rejection,
+    Schedule,
+};
+use super::publication::PublicationTarget;
 use super::rails::RailJournal;
 use super::{ControlEndpoint, ReactorControlIo, transient};
+use crate::control::rest;
+use crate::enrollment::{Enrollment, LocalSigningIdentity};
 use crate::error::{Error, Operation, Result};
 use crate::runtime::RequestScope;
-use controlplane::feed::{Identity, Preparation, RejectionPolicy, Schedule};
-use controlplane::{Client, Codec, Credentials, Feed, Sync, Target};
-use racer_control_wire as wire;
-use racer_crypto::enrollment::{Enrollment, LocalSigningIdentity};
 use racer_crypto::identity::{BundleInstaller, Keyring};
-use sha2::{Digest, Sha256};
+use racer_wire::control as wire;
 use std::{
     cell::{Cell, RefCell},
     ops::{Deref, DerefMut},
     rc::Rc,
-    sync::Arc,
     time::{Duration, Instant},
 };
-use wire_codec::rest;
 use zeroize::Zeroizing;
 
-/// Owner-local session. Only generic Sync owns cursors, retry, and preparation jobs.
+/// Shortest serving renewal recheck, the former fixed cadence.
+const RENEWAL_MIN_WAIT: Duration = Duration::from_secs(1);
+
+/// Longest serving renewal sleep, bounding wall-clock steps.
+const RENEWAL_MAX_WAIT: Duration = Duration::from_secs(30);
+
+/// Consecutive seat 401/403 startup rejections, or issued chains that do not
+/// verify against the current key feed roots, retried before `Unauthorized` is
+/// reported as fatal.
+///
+/// During an all-at-once rollout, control seats restart together with nodes. A
+/// seat that is up but has not yet loaded current credentials can answer a
+/// valid bootstrap token or identity with 401/403. Each retry demotes the seats
+/// involved and backs off with the issuance policy (about 1s, 2s, 4s, 8s, 16s).
+/// Likewise a newly ready seat issues under its own issuer root while the key
+/// feed seat may still serve a keyring without it; that retry also refetches the
+/// keyring.
+/// Nothing rejected is accepted. Local and TLS-level authentication failures are
+/// not retried, and a persistent seat rejection still ends startup once this
+/// bound is spent.
+pub(crate) const STARTUP_UNAUTHORIZED_RETRIES: u32 = 5;
+
+/// Owner-local session. Only the two polls own cursors, retry, and preparation jobs.
 pub struct Session {
     block_devices: RefCell<Option<String>>,
     rails: RailJournal,
@@ -47,23 +69,9 @@ pub struct Session {
 
     pub(super) snapshots: Rc<PublicationTarget>,
 
-    // Keep the concrete generic owner type visible rather than aliased.
-    #[allow(clippy::type_complexity)]
-    publications: RefCell<
-        Option<Sync<ReactorControlIo, ObservedPublication, PublicationSource, PublicationInstall>>,
-    >,
+    publications: RefCell<Option<Poll>>,
 
-    #[allow(clippy::type_complexity)]
-    keyrings: RefCell<
-        Option<
-            Sync<
-                ReactorControlIo,
-                BundleCodec,
-                Client<ReactorControlIo, FeedCredentials>,
-                BundleTarget,
-            >,
-        >,
-    >,
+    keyrings: RefCell<Option<Poll>>,
 
     received: Rc<Cell<Option<(u64, u64)>>>,
 
@@ -78,6 +86,9 @@ pub struct Session {
     renewal_next: Cell<Option<Instant>>,
 
     issuance_failures: Cell<u32>,
+
+    /// Consecutive startup attempts rejected with `Unauthorized`.
+    startup_rejections: Cell<u32>,
 
     issuance_retry_after: Cell<Option<Duration>>,
 
@@ -105,13 +116,18 @@ pub(super) struct Authentication {
     restart_required: Cell<bool>,
 
     startup_bundle: RefCell<Option<wire::KeyringBundle>>,
+
+    /// Whether the last control response was an HTTP 401/403 from a seat, as
+    /// opposed to a local or TLS-level authentication failure. Only the former
+    /// is retried during startup.
+    seat_rejected: Cell<bool>,
 }
 
 impl Authentication {
     /// Reject every new submission after stop or authenticated node replacement.
     fn check(&self) -> Result<()> {
         if self.stopped.get() {
-            return Err(Error::Cancelled);
+            return Err(Error::Canceled);
         }
         if self.restart_required.get() {
             return Err(Error::NodeIdentityChanged);
@@ -159,93 +175,143 @@ impl<T> Drop for Turn<'_, T> {
     }
 }
 
-/// Independent per-feed authentication policy using one node-binding authority.
-struct FeedCredentials {
+/// Authenticated REST client for one document. Identity first; token
+/// fallback only where the document's policy allows it.
+struct Client {
+    transport: rest::Transport<ReactorControlIo>,
+
     auth: Rc<Authentication>,
 
-    policy: RejectionPolicy,
+    doc: Doc,
+
+    /// Set on request entry so renewal completion never cancels an active GET.
+    started: Option<Rc<Cell<bool>>>,
 }
 
-/// Observe only request entry so renewal completion never cancels an active GET.
-struct PublicationSource {
-    client: Client<ReactorControlIo, FeedCredentials>,
-
-    started: Rc<Cell<bool>>,
-}
-
-impl controlplane::feed::Source<ReactorControlIo> for PublicationSource {
-    fn get<'a>(
-        &'a self,
-        path: &'a str,
-        digest: Option<&'a str>,
-        limit: usize,
-        scope: &'a RequestScope,
-    ) -> uring_runtime::Operation<'a, rest::Response, controlplane::feed::FetchError<Error>> {
-        self.started.set(true);
-        self.client.get(path, digest, limit, scope)
-    }
-
-    fn close(&self) {
-        self.client.close();
-    }
-
-    fn demote(&self) {
-        self.client.demote();
-    }
-}
-
-/// REST credential lease; borrows the crypto-owned private key without exporting it.
-struct IdentityLease(LocalSigningIdentity);
-
-impl Identity for IdentityLease {
-    fn identity(&self) -> rest::Identity<'_> {
-        rest::Identity {
-            certificate_chain: self.0.certificate_chain(),
-            private_key: self.0.private_key_der(),
-            expires: self.0.expires_at(),
-        }
-    }
-}
-
-impl Credentials<ReactorControlIo> for FeedCredentials {
-    type Identity = IdentityLease;
-
-    type Token = Zeroizing<String>;
-
-    fn identity(&self) -> Result<Option<Self::Identity>> {
+impl Client {
+    /// Snapshot a currently usable TLS identity.
+    fn identity(&self) -> Result<Option<LocalSigningIdentity>> {
         self.auth.check()?;
         Ok(self
             .auth
             .identity
             .borrow()
             .clone()
-            .filter(|i| i.valid_now())
-            .map(IdentityLease))
+            .filter(|i| i.valid_at(self.auth.enrollment.wall_now())))
     }
 
-    fn policy(&self) -> RejectionPolicy {
-        self.policy
+    /// Validate structured errors before using Retry-After or rejection policy.
+    fn validate(response: rest::Response) -> std::result::Result<rest::Response, FetchError> {
+        match poll::validate_response(&response) {
+            Ok(()) => Ok(response),
+            Err(error) => Err(FetchError {
+                error,
+                retry_after: if matches!(response.status, 429 | 503) {
+                    response.retry_after
+                } else {
+                    None
+                },
+            }),
+        }
     }
 
-    fn token<'a>(&'a self, scope: &'a RequestScope) -> Operation<'a, Option<Self::Token>> {
-        Box::pin(async move {
-            self.auth.check()?;
-            Ok(Some(self.auth.enrollment.read_token(scope).await?))
-        })
-    }
-
-    fn rejected(&self) {
-        self.auth.binding_check.set(true);
-    }
-
-    fn validate_response(&self, response: &rest::Response) -> Result<()> {
-        validate_response(response)
+    async fn request(
+        &self,
+        connection: rest::Connection<ReactorControlIo>,
+        path: &str,
+        bearer: Option<&str>,
+        digest: Option<&str>,
+        limit: usize,
+        scope: &RequestScope,
+    ) -> std::result::Result<rest::Response, FetchError> {
+        let response = connection
+            .request(
+                rest::Request {
+                    method: rest::Method::Get,
+                    path,
+                    bearer,
+                    header: digest.map(|digest| (poll::DIGEST_HEADER, digest)),
+                    body: &[],
+                    limit,
+                },
+                scope,
+            )
+            .await?;
+        let result = Self::validate(response);
+        self.auth
+            .seat_rejected
+            .set(matches!(&result, Err(f) if f.error == Error::Unauthorized));
+        result
     }
 }
 
-/// Codec receipt observation is diagnostic only; generic Feed retains the delta base.
-struct ObservedPublication {
-    received: Rc<Cell<Option<(u64, u64)>>>,
+impl Fetch for Client {
+    /// Prefer identity authentication; token fallback gets a fresh TLS connection.
+    fn get<'a>(
+        &'a self,
+        path: &'a str,
+        digest: Option<&'a str>,
+        limit: usize,
+        scope: &'a RequestScope,
+    ) -> racer_io::Operation<'a, rest::Response, FetchError> {
+        if let Some(started) = &self.started {
+            started.set(true);
+        }
+        Box::pin(async move {
+            self.auth.seat_rejected.set(false);
+            let policy = self.doc.rejection();
+            if let Some(identity) = self.identity()? {
+                let result = async {
+                    let connection = self
+                        .transport
+                        .connect(
+                            Some(rest::Identity {
+                                certificate_chain: identity.certificate_chain(),
+                                private_key: identity.private_key_der(),
+                                expires: identity.expires_at(),
+                            }),
+                            scope,
+                        )
+                        .await?;
+                    self.request(connection, path, None, digest, limit, scope)
+                        .await
+                }
+                .await;
+                match result {
+                    Err(failure)
+                        if poll::classify(failure.error) == poll::FailureClass::Rejected =>
+                    {
+                        self.auth.binding_check.set(true);
+                        self.transport.close_idle();
+                        if policy == Rejection::IdentityOnly {
+                            return Err(failure);
+                        }
+                    }
+                    other => return other,
+                }
+            } else if policy == Rejection::IdentityOnly {
+                return Err(Error::Unauthorized.into());
+            }
+            // The token attempt decides the outcome; a TLS failure here is local.
+            self.auth.seat_rejected.set(false);
+            // No token leaves this owner until CA and server name verification.
+            let connection = self.transport.connect(None, scope).await?;
+            self.auth.check()?;
+            let token: Zeroizing<String> = self.auth.enrollment.read_token(scope).await?;
+            self.request(connection, path, Some(token.as_str()), digest, limit, scope)
+                .await
+        })
+    }
+
+    /// Drop the idle TLS connection without touching the other poll.
+    fn close(&self) {
+        self.transport.close_idle();
+    }
+
+    /// Move the next request away from the seat that served the last response.
+    fn demote(&self) {
+        self.transport.demote();
+    }
 }
 
 /// Retain the newest receipt for diagnostics, including equal-sequence replacements.
@@ -258,32 +324,6 @@ fn observe_receipt(received: &Cell<Option<(u64, u64)>>, document: &wire::Publica
     }
 }
 
-impl Codec for ObservedPublication {
-    type Document = wire::Publication;
-
-    type Version = u64;
-
-    type Error = Error;
-
-    fn version(&self, document: &Self::Document) -> u64 {
-        document.sequence.0
-    }
-
-    fn decode(&self, bytes: &[u8]) -> Result<Self::Document> {
-        PublicationCodec.decode(bytes)
-    }
-
-    fn delta(&self, base: &Self::Document, bytes: &[u8]) -> Result<Self::Document> {
-        PublicationCodec.delta(base, bytes)
-    }
-
-    fn digest(&self, document: &Self::Document) -> Result<String> {
-        let digest = PublicationCodec.digest(document)?;
-        observe_receipt(&self.received, document);
-        Ok(digest)
-    }
-}
-
 /// Keep domain installation local while delegating CPU projection to PublicationTarget.
 struct PublicationInstall {
     target: Rc<PublicationTarget>,
@@ -293,90 +333,68 @@ struct PublicationInstall {
     auth: Rc<Authentication>,
 }
 
-impl Target<ObservedPublication> for PublicationInstall {
-    type Prepared = Arc<super::Snapshot>;
-
-    fn prepare(
-        &self,
-        document: Arc<wire::Publication>,
-    ) -> Result<Preparation<Self::Prepared, Error>> {
+impl Install for PublicationInstall {
+    fn prepare(&self, document: Document) -> Result<Preparation> {
         self.auth.check()?;
-        observe_receipt(&self.received, &document);
+        self.received(&document);
         self.target.prepare(document)
     }
 
-    fn install(&self, document: &wire::Publication, prepared: &Self::Prepared) -> Result<()> {
+    fn install(&self, document: &Document, prepared: &Prepared) -> Result<()> {
         self.auth.check()?;
         self.target.install(document, prepared)
     }
-}
 
-/// Keyring documents have their own generation and no delta representation.
-struct BundleCodec;
-
-impl Codec for BundleCodec {
-    type Document = wire::KeyringBundle;
-
-    type Version = u64;
-
-    type Error = Error;
-
-    fn version(&self, document: &Self::Document) -> u64 {
-        document.generation.0
-    }
-
-    fn decode(&self, bytes: &[u8]) -> Result<Self::Document> {
-        Ok(wire::decode_bundle(bytes)?)
-    }
-
-    fn delta(&self, _: &Self::Document, _: &[u8]) -> Result<Self::Document> {
-        Err(Error::InvalidRequest)
-    }
-
-    fn digest(&self, document: &Self::Document) -> Result<String> {
-        let mut canonical = document.clone();
-        canonical.peer_trust_roots.sort();
-        canonical.cache_keys.sort_by(|a, b| {
-            (&a.key.cache, a.key.purpose as u8, a.key.id.0).cmp(&(
-                &b.key.cache,
-                b.key.purpose as u8,
-                b.key.id.0,
-            ))
-        });
-        let bytes = Zeroizing::new(wire::encode_bundle(&canonical)?);
-        Ok(format!("{:x}", Sha256::digest(&*bytes)))
+    fn received(&self, document: &Document) {
+        if let Document::Publication(document) = document {
+            observe_receipt(&self.received, document);
+        }
     }
 }
 
 /// Key acceptance is separate from publication acceptance and identity renewal.
-struct BundleTarget {
+struct BundleInstall {
     auth: Rc<Authentication>,
 
     error: Rc<Cell<Option<Error>>>,
 }
 
-impl Target<BundleCodec> for BundleTarget {
-    type Prepared = Arc<wire::KeyringBundle>;
-
-    fn prepare(
-        &self,
-        document: Arc<wire::KeyringBundle>,
-    ) -> Result<Preparation<Self::Prepared, Error>> {
+impl Install for BundleInstall {
+    fn prepare(&self, document: Document) -> Result<Preparation> {
         self.auth.check()?;
+        let Document::Keyring(document) = document else {
+            return Err(Error::InvalidRequest);
+        };
         if &document.cluster != self.auth.enrollment.cluster() {
             return Err(Error::Unauthorized);
         }
         Ok(Box::new(move || {
             super::verifier(&document.peer_trust_roots)?;
-            Ok(document)
+            Ok(Prepared::Keyring(document))
         }))
     }
 
-    fn install(&self, _: &wire::KeyringBundle, prepared: &Self::Prepared) -> Result<()> {
+    fn install(&self, _: &Document, prepared: &Prepared) -> Result<()> {
         let result = (|| {
+            let Prepared::Keyring(prepared) = prepared else {
+                return Err(Error::InvalidRequest);
+            };
             self.auth.check()?;
             if self.auth.started.get() {
                 self.auth.secrets.install((**prepared).clone())?;
+            } else if self
+                .auth
+                .keys
+                .borrow()
+                .generation()?
+                .is_some_and(|accepted| prepared.generation.0 < accepted)
+            {
+                // Keys are shared node-wide, so an earlier session may already
+                // have installed a newer bundle. A fresh startup poll has no
+                // cursor, so a seat restarted during a rollout can still serve
+                // it an older generation. Refuse it here, before it becomes the
+                // startup bundle that `activate_identity` would fail to install.
+                return Err(Error::Replay);
             }
             self.auth
                 .enrollment
@@ -422,6 +440,7 @@ impl Session {
                 binding_check: Cell::new(false),
                 restart_required: Cell::new(false),
                 startup_bundle: RefCell::new(None),
+                seat_rejected: Cell::new(false),
             }),
             snapshots,
             publications: RefCell::new(None),
@@ -433,6 +452,7 @@ impl Session {
             renewal_error: Cell::new(None),
             renewal_next: Cell::new(None),
             issuance_failures: Cell::new(0),
+            startup_rejections: Cell::new(0),
             issuance_retry_after: Cell::new(None),
             busy: Cell::new(false),
             enrollment_busy: Cell::new(false),
@@ -445,51 +465,39 @@ impl Session {
             return Err(Error::InvalidConfiguration);
         }
         self.enrollment_transport.attach_io(io.clone());
-        let source = |policy| {
+        let client = |doc, started| {
             let transport = transport(&self.endpoint);
             transport.attach_io(io.clone());
-            Client::new(
+            Box::new(Client {
                 transport,
-                FeedCredentials {
-                    auth: self.auth.clone(),
-                    policy,
-                },
-                "X-Racer-Delta-Base".into(),
-            )
+                auth: self.auth.clone(),
+                doc,
+                started,
+            })
         };
-        *self.publications.borrow_mut() = Some(Sync::new(
+        *self.publications.borrow_mut() = Some(Poll::new(
             io.clone(),
-            Feed::new(
-                ObservedPublication {
-                    received: self.received.clone(),
-                },
-                wire::SNAPSHOT_PATH.into(),
-                wire::MAX_PUBLICATION_BYTES,
-            )?,
-            PublicationSource {
-                client: source(RejectionPolicy::IdentityOnly),
-                started: self.publication_fetch_started.clone(),
-            },
-            PublicationInstall {
+            Doc::Publication,
+            client(
+                Doc::Publication,
+                Some(self.publication_fetch_started.clone()),
+            ),
+            Box::new(PublicationInstall {
                 target: self.snapshots.clone(),
                 received: self.received.clone(),
                 auth: self.auth.clone(),
-            },
-            schedule(),
+            }),
+            Schedule::control(),
         )?);
-        *self.keyrings.borrow_mut() = Some(Sync::new(
+        *self.keyrings.borrow_mut() = Some(Poll::new(
             io.clone(),
-            Feed::new(
-                BundleCodec,
-                wire::KEYRING_PATH.into(),
-                wire::MAX_BUNDLE_BYTES,
-            )?,
-            source(RejectionPolicy::TokenFallback),
-            BundleTarget {
+            Doc::Keyring,
+            client(Doc::Keyring, None),
+            Box::new(BundleInstall {
                 auth: self.auth.clone(),
                 error: self.keyring_error.clone(),
-            },
-            schedule(),
+            }),
+            Schedule::control(),
         )?);
         Ok(())
     }
@@ -547,7 +555,7 @@ impl Session {
         self.renewal_next.get()
     }
 
-    /// Startup uses issuance retry policy; the generic feed schedules serving polls.
+    /// Startup uses issuance retry policy; the publication poll schedules serving polls.
     pub fn next_attempt(&self) -> Option<Instant> {
         if self.auth.started.get() {
             self.publication_next.get()
@@ -556,18 +564,41 @@ impl Session {
         }
     }
 
+    /// When the serving renewal loop next needs to check `renew_if_due`: the
+    /// identity's renewal time or a scheduled retry, at least [`RENEWAL_MIN_WAIT`]
+    /// and at most [`RENEWAL_MAX_WAIT`] from `now`. The cap bounds the effect of
+    /// wall-clock steps on a monotonic sleep.
+    fn renewal_wake(&self, now: Instant) -> Instant {
+        let wall = self.auth.enrollment.wall_now();
+        let due = self.identity().map_or(Duration::ZERO, |identity| {
+            identity
+                .renewal_at()
+                .duration_since(wall)
+                .unwrap_or(Duration::ZERO)
+        });
+        let retry = self
+            .renewal_next
+            .get()
+            .map(|next| next.saturating_duration_since(now));
+        // A due identity waits only on its scheduled retry.
+        let wait = match retry {
+            Some(retry) if due.is_zero() => retry,
+            Some(retry) => due.min(retry),
+            None => due,
+        };
+        now + wait.clamp(RENEWAL_MIN_WAIT, RENEWAL_MAX_WAIT)
+    }
+
     /// Token issuance is not a feed; preserve bounded independent renewal retry.
-    fn issuance_backoff(&self) -> Result<Instant> {
+    fn issuance_backoff(&self, ctx: &racer_io::WorkerCtx) -> Result<Instant> {
         let failures = self.issuance_failures.get().saturating_add(1);
         self.issuance_failures.set(failures);
         let mut random = [0; 8];
-        uring_runtime::environment::fill_random(&mut random).map_err(|_| Error::Io)?;
+        ctx.rng.fill(&mut random).map_err(|_| Error::Io)?;
         let ceiling = (1u64 << failures.saturating_sub(1).min(5)).min(30) * 1000;
         let delay = Duration::from_millis(1000 + u64::from_ne_bytes(random) % (ceiling - 999))
             .max(self.issuance_retry_after.take().unwrap_or_default());
-        uring_runtime::environment::now()
-            .checked_add(delay)
-            .ok_or(Error::InvalidRequest)
+        ctx.now().checked_add(delay).ok_or(Error::InvalidRequest)
     }
 
     /// Submit a retry-stable CSR after server-authenticated TLS and a fresh token read.
@@ -579,6 +610,7 @@ impl Session {
         Box::pin(async move {
             self.auth.check()?;
             let _busy = super::enter(&self.enrollment_busy)?;
+            self.auth.seat_rejected.set(false);
             let body = wire::encode_enrollment_request(request)?;
             let connection = self.enrollment_transport.connect(None, scope).await?;
             let token = self.auth.enrollment.read_token(scope).await?;
@@ -596,6 +628,7 @@ impl Session {
                 )
                 .await?;
             if let Err(error) = validate_response(&response) {
+                self.auth.seat_rejected.set(error == Error::Unauthorized);
                 if matches!(error, Error::Unavailable | Error::Overloaded) {
                     self.issuance_retry_after.set(response.retry_after);
                 }
@@ -620,16 +653,68 @@ impl Session {
             if self
                 .renewal_next
                 .get()
-                .is_some_and(|n| n > uring_runtime::environment::now())
+                .is_some_and(|n| n > scope.clock().now())
             {
                 return Err(Error::Unavailable);
             }
-            let result = self.start_inner(scope).await;
+            self.auth.seat_rejected.set(false);
+            self.auth.enrollment.take_untrusted_chain();
+            let result = match self.start_inner(scope).await {
+                Ok(identity) => {
+                    self.startup_rejections.set(0);
+                    Ok(identity)
+                }
+                Err(error) => Err(self.startup_failure(error, scope)),
+            };
             if result.as_ref().is_err_and(|e| transient(*e)) {
-                self.renewal_next.set(Some(self.issuance_backoff()?));
+                self.renewal_next.set(Some(
+                    self.issuance_backoff(&self.enrollment_transport.io()?.reactor.ctx().clone())?,
+                ));
             }
             result
         })
+    }
+
+    /// Classify a failed startup attempt.
+    ///
+    /// `Unauthorized` is retried within the bound of [`Self::startup_rejected`]
+    /// only when a seat answered 401/403 or when the issued chain did not verify
+    /// against the current key feed roots. A newly ready seat commits its issuer
+    /// root before it issues, but the key feed that supplied our roots may be a
+    /// seat still serving an older record, so the untrusted case also drops the
+    /// staged startup trust: the retry fetches a newer keyring before enrolling
+    /// again. Every other error is returned unchanged.
+    fn startup_failure(&self, error: Error, scope: &RequestScope) -> Error {
+        let untrusted = self.auth.enrollment.take_untrusted_chain();
+        if error != Error::Unauthorized || !(self.auth.seat_rejected.get() || untrusted) {
+            return error;
+        }
+        if untrusted {
+            self.auth.startup_bundle.borrow_mut().take();
+        }
+        self.startup_rejected(scope)
+    }
+
+    /// Bound startup retries after a seat answered 401/403.
+    ///
+    /// Returns `Unavailable` (retryable) while within
+    /// [`STARTUP_UNAUTHORIZED_RETRIES`], after demoting the enrollment and key
+    /// feed seats so the next attempt prefers another seat. Once the bound is
+    /// spent, or the startup scope has ended, returns `Unauthorized` so a
+    /// permanent rejection still surfaces. The rejected response was never
+    /// accepted; this only changes whether startup tries again.
+    fn startup_rejected(&self, scope: &RequestScope) -> Error {
+        self.renewal_error.set(Some(Error::Unauthorized));
+        let rejections = self.startup_rejections.get().saturating_add(1);
+        self.startup_rejections.set(rejections);
+        if rejections > STARTUP_UNAUTHORIZED_RETRIES || scope.check().is_err() {
+            return Error::Unauthorized;
+        }
+        self.enrollment_transport.demote();
+        if let Some(keyrings) = self.keyrings.borrow().as_ref() {
+            keyrings.demote();
+        }
+        Error::Unavailable
     }
 
     /// Key feed must accept trust before identity recovery and fresh issuance.
@@ -692,7 +777,10 @@ impl Session {
         if let Some(bundle) = self.auth.startup_bundle.borrow().as_ref() {
             self.auth.secrets.install(bundle.clone())?;
         }
-        keys.install_signing_identity(identity.signing_identity(&keys.peer_trust_roots()?)?)?;
+        keys.install_signing_identity(identity.signing_identity(
+            &keys.peer_trust_roots()?,
+            &self.auth.enrollment.wall_clock(),
+        )?)?;
         self.auth.startup_bundle.borrow_mut().take();
         Ok(())
     }
@@ -707,7 +795,7 @@ impl Session {
         self.block_devices.borrow().clone()
     }
 
-    /// One publication Sync turn, concurrent with independent renewal policy.
+    /// One publication poll turn, concurrent with independent renewal policy.
     pub fn progress<'a>(&'a self, scope: &'a RequestScope) -> Operation<'a, ()> {
         Box::pin(async move {
             self.auth.check()?;
@@ -717,9 +805,15 @@ impl Session {
             let _busy = super::enter(&self.busy)?;
             // Without usable identity, do not start an identity-only fetch that
             // could race renewal and advance its own authentication retry clock.
-            if self.identity().is_none_or(|identity| !identity.valid_now()) {
+            if self
+                .identity()
+                .is_none_or(|identity| !identity.valid_at(self.auth.enrollment.wall_now()))
+            {
                 self.renew_if_due(scope).await?;
-                if self.identity().is_none_or(|identity| !identity.valid_now()) {
+                if self
+                    .identity()
+                    .is_none_or(|identity| !identity.valid_at(self.auth.enrollment.wall_now()))
+                {
                     return Err(Error::Unavailable);
                 }
             }
@@ -729,20 +823,29 @@ impl Session {
                 loop {
                     self.renew_if_due(scope).await?;
                     renewed.set(true);
-                    self.enrollment_transport
-                        .io()?
-                        .sleep(
-                            uring_runtime::environment::now() + Duration::from_secs(1),
-                            scope,
-                        )
-                        .await?;
+                    let wake = self.renewal_wake(scope.clock().now());
+                    let io = self.enrollment_transport.io()?;
+                    let sleep = io.sleep(wake, scope);
+                    // A rejected fetch sets `binding_check` on this lane and wakes
+                    // this select, so renewal starts without waiting for `wake`.
+                    let rejected = std::future::poll_fn(|_| {
+                        if self.auth.binding_check.get() {
+                            std::task::Poll::Ready(Ok(()))
+                        } else {
+                            std::task::Poll::Pending
+                        }
+                    });
+                    futures::future::select(sleep, Box::pin(rejected))
+                        .await
+                        .factor_first()
+                        .0?;
                 }
                 #[allow(unreachable_code)]
                 Ok::<(), Error>(())
             };
             let result = {
                 // A quick 204 must not repeatedly abandon the current issuance.
-                // Only authentication policy is coordinated here; Sync owns all
+                // Only authentication policy is coordinated here; the poll owns all
                 // feed receipt, preparation, installation, and retry scheduling.
                 let publication = async {
                     let mut completed = None;
@@ -751,7 +854,7 @@ impl Session {
                         let result = {
                             let mut turn = Box::pin(driver.turn(scope));
                             std::future::poll_fn(|cx| {
-                                // Sync must always be polled during backoff: it
+                                // The poll must always be polled during backoff: it
                                 // drives local preparation and worker barriers.
                                 let result = turn.as_mut().poll(cx);
                                 if result.is_ready() {
@@ -771,7 +874,7 @@ impl Session {
                             return result;
                         }
                         // A completed fetch may only have submitted preparation.
-                        // Keep Sync ticking while issuance is held; never restart
+                        // Keep the poll ticking while issuance is held; never restart
                         // an active long poll just because renewal completed.
                         completed = Some(result);
                     }
@@ -795,7 +898,7 @@ impl Session {
         })
     }
 
-    /// Independently advance key delivery, keeping generic retry and acceptance state.
+    /// Independently advance key delivery, keeping its own retry and acceptance state.
     pub fn keyring_progress<'a>(&'a self, scope: &'a RequestScope) -> Operation<'a, ()> {
         Box::pin(async move {
             self.auth.check()?;
@@ -808,7 +911,7 @@ impl Session {
                     driver.status().error
                 });
             match result {
-                Err(Error::NodeIdentityChanged | Error::Cancelled) => result,
+                Err(Error::NodeIdentityChanged | Error::Canceled) => result,
                 _ if self.auth.started.get() => scope.check(),
                 _ => result,
             }
@@ -838,11 +941,14 @@ impl Session {
 
     /// Renewal failures never reset either feed or discard a still-valid identity.
     async fn renew_if_due(&self, scope: &RequestScope) -> Result<()> {
-        if (self.auth.binding_check.get() || self.identity().is_none_or(|i| i.renewal_due()))
+        if (self.auth.binding_check.get()
+            || self
+                .identity()
+                .is_none_or(|i| i.renewal_due_at(self.auth.enrollment.wall_now())))
             && self
                 .renewal_next
                 .get()
-                .is_none_or(|n| n <= uring_runtime::environment::now())
+                .is_none_or(|n| n <= scope.clock().now())
         {
             let result = async {
                 let nics = self.rails.persist(scope).await?;
@@ -868,8 +974,13 @@ impl Session {
                     if !transient(error) && error != Error::Unauthorized {
                         return Err(error);
                     }
-                    self.renewal_next.set(Some(self.issuance_backoff()?));
-                    if self.identity().is_none_or(|i| !i.valid_now()) {
+                    self.renewal_next.set(Some(self.issuance_backoff(
+                        &self.enrollment_transport.io()?.reactor.ctx().clone(),
+                    )?));
+                    if self
+                        .identity()
+                        .is_none_or(|i| !i.valid_at(self.auth.enrollment.wall_now()))
+                    {
                         return Err(if error == Error::Unauthorized {
                             Error::Unavailable
                         } else {
@@ -900,7 +1011,10 @@ impl Session {
         }
         let identity = accepted?;
         let keys = self.auth.keys.borrow();
-        keys.install_signing_identity(identity.signing_identity(&keys.peer_trust_roots()?)?)?;
+        keys.install_signing_identity(identity.signing_identity(
+            &keys.peer_trust_roots()?,
+            &self.auth.enrollment.wall_clock(),
+        )?)?;
         *self.auth.identity.borrow_mut() = Some(identity);
         Ok(())
     }
@@ -946,23 +1060,7 @@ impl Session {
 
 /// Validate the structured code/status agreement before retry or auth classification.
 pub(super) fn validate_response(response: &rest::Response) -> Result<()> {
-    if response.status == 200 || response.status == 204 {
-        return Ok(());
-    }
-    let (status, error) = match wire::decode_error(&response.body)?.code {
-        wire::ProtocolFailure::InvalidRequest => (400, Error::InvalidRequest),
-        wire::ProtocolFailure::Unauthenticated => (401, Error::Unauthorized),
-        wire::ProtocolFailure::Forbidden => (403, Error::Unauthorized),
-        wire::ProtocolFailure::Conflict => (409, Error::Replay),
-        wire::ProtocolFailure::TooLarge => (413, Error::InvalidRequest),
-        wire::ProtocolFailure::UnsupportedVersion => (426, Error::IncompatibleMembership),
-        wire::ProtocolFailure::Overloaded => (429, Error::Overloaded),
-        wire::ProtocolFailure::Unavailable => (503, Error::Unavailable),
-    };
-    if status != response.status {
-        return Err(Error::InvalidRequest);
-    }
-    Err(error)
+    poll::validate_response(response)
 }
 
 /// Separate REST pool per feed and for issuance. Managed pools follow the shared
@@ -980,27 +1078,319 @@ pub(super) fn transport(endpoint: &ControlEndpoint) -> rest::Transport<ReactorCo
     transport
 }
 
-/// Generic feed progress remains responsive during held polls and remote backoff.
-fn schedule() -> Schedule {
-    Schedule {
-        turn: wire::POLL_WAIT + Duration::from_secs(10),
-        tick: Duration::from_millis(10),
-        retry_min: Duration::from_secs(1),
-        retry_max: Duration::from_secs(30),
-    }
-}
-
 #[cfg(test)]
 pub(super) mod tests {
-    //! Scripted application policy over the real generic feed and synchronization owners.
+    //! Scripted application policy over the real long-poll owners.
 
     use super::*;
-    use controlplane::feed::{FetchError, Source};
-    use std::{
-        collections::VecDeque,
-        future::Future,
-        task::{Context, Poll},
-    };
+    use std::sync::Arc;
+    use std::{collections::VecDeque, future::Future, task::Context};
+
+    /// Valid bundle at `generation` whose peer trust roots and key material pass validation.
+    fn startup_bundle(generation: u64, ca: &[u8]) -> wire::KeyringBundle {
+        let mut bundle = wire::decode_bundle(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/wire/testdata/bundle.json"
+        )))
+        .unwrap();
+        bundle.generation = racer_wire::control::BundleGeneration(generation);
+        bundle.peer_trust_roots = vec![ca.to_vec()];
+        // The wire vector repeats material across purposes; use distinct material.
+        let key = &bundle.cache_keys[2];
+        bundle.cache_keys[2] = wire::CacheEncryptionKey::new(
+            key.key.clone(),
+            key.state,
+            zeroize::Zeroizing::new([2; 32]),
+        );
+        bundle
+    }
+
+    /// Before startup completes, a bundle older than the node-wide accepted one
+    /// (installed by an earlier session in this process) is refused as a replay
+    /// instead of becoming the startup bundle. Equal and newer ones are staged.
+    #[test]
+    fn startup_bundle_older_than_shared_keys_is_refused() {
+        let env = racer_io::Env::host();
+        let session = session(&env);
+        let (ca, _) = crate::test_support::enrollment::ca();
+        // An earlier session in this process already installed generation 2.
+        session
+            .auth
+            .secrets
+            .install(startup_bundle(2, ca.der()))
+            .unwrap();
+        assert!(!session.auth.started.get());
+        let error = Rc::new(Cell::new(None));
+        let install = BundleInstall {
+            auth: session.auth.clone(),
+            error: error.clone(),
+        };
+        let stage = |generation| {
+            let bundle = Arc::new(startup_bundle(generation, ca.der()));
+            install.install(
+                &Document::Keyring(bundle.clone()),
+                &Prepared::Keyring(bundle),
+            )
+        };
+        assert_eq!(stage(1), Err(Error::Replay));
+        assert_eq!(error.get(), Some(Error::Replay));
+        assert!(session.auth.startup_bundle.borrow().is_none());
+        for generation in [2, 3] {
+            stage(generation).unwrap();
+            assert_eq!(error.get(), None);
+            assert_eq!(
+                session
+                    .auth
+                    .startup_bundle
+                    .borrow()
+                    .as_ref()
+                    .map(|b| b.generation.0),
+                Some(generation)
+            );
+        }
+        // The shared keys were never rolled back.
+        assert_eq!(session.auth.keys.borrow().generation().unwrap(), Some(2));
+    }
+
+    /// Scripted key feed that also counts seat demotions.
+    struct Demoting {
+        script: Script,
+
+        auth: Rc<Authentication>,
+
+        demotes: Rc<Cell<u32>>,
+    }
+
+    impl Fetch for Demoting {
+        /// Mark 401/403 as seat-originated, as the session's real client does.
+        fn get<'a>(
+            &'a self,
+            path: &'a str,
+            digest: Option<&'a str>,
+            limit: usize,
+            scope: &'a RequestScope,
+        ) -> racer_io::Operation<'a, rest::Response, FetchError> {
+            Box::pin(async move {
+                let result = self.script.get(path, digest, limit, scope).await;
+                self.auth
+                    .seat_rejected
+                    .set(matches!(&result, Err(f) if f.error == Error::Unauthorized));
+                result
+            })
+        }
+
+        fn close(&self) {}
+
+        fn demote(&self) {
+            self.demotes.set(self.demotes.get() + 1);
+        }
+    }
+
+    fn unauthenticated() -> rest::Response {
+        rest::Response {
+            status: 401,
+            body: br#"{"code":"unauthenticated"}"#.to_vec(),
+            retry_after: None,
+        }
+    }
+
+    /// Install a scripted startup key feed and return its demotion counter.
+    fn startup_feed(
+        env: &racer_io::Env,
+        session: &Session,
+        responses: Vec<rest::Response>,
+    ) -> Rc<Cell<u32>> {
+        let demotes = Rc::new(Cell::new(0));
+        session.enrollment_transport.attach_io(host(env));
+        *session.keyrings.borrow_mut() = Some(
+            Poll::new(
+                host(env),
+                Doc::Keyring,
+                Box::new(Demoting {
+                    script: Script {
+                        responses: RefCell::new(responses.into()),
+                        requests: Rc::new(RefCell::new(vec![])),
+                    },
+                    auth: session.auth.clone(),
+                    demotes: demotes.clone(),
+                }),
+                Box::new(BundleInstall {
+                    auth: session.auth.clone(),
+                    error: session.keyring_error.clone(),
+                }),
+                Schedule::control(),
+            )
+            .unwrap(),
+        );
+        demotes
+    }
+
+    /// One startup attempt after its scheduled retry time.
+    fn start_once(
+        clock: &racer_io::SimClock,
+        env: &racer_io::Env,
+        session: &Session,
+    ) -> Result<()> {
+        if let Some(next) = session.next_attempt() {
+            let now = env.ctx.now();
+            if next > now {
+                clock.advance(next - now);
+            }
+        }
+        drive(clock, session.start(&scope(env))).map(|_| ())
+    }
+
+    /// A seat that rejects startup (for example one restarted during a rollout
+    /// that has not loaded current credentials) is retried on another seat with
+    /// backoff, and nothing it served is staged. A genuine bundle from a later
+    /// seat is then accepted normally.
+    #[test]
+    fn startup_unauthorized_from_seat_is_retried_and_not_accepted() {
+        let clock = racer_io::SimClock::new(741);
+        let env = racer_io::Env::new(racer_io::Env::host().driver.clone(), clock.ctx(0));
+        let session = session(&env);
+        let demotes = startup_feed(
+            &env,
+            &session,
+            vec![
+                unauthenticated(),
+                unauthenticated(),
+                rest::Response {
+                    status: 200,
+                    body: include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/wire/testdata/bundle.json"
+                    ))
+                    .to_vec(),
+                    retry_after: None,
+                },
+            ],
+        );
+        for attempt in 1..=2u32 {
+            assert_eq!(start_once(&clock, &env, &session), Err(Error::Unavailable));
+            assert!(session.auth.startup_bundle.borrow().is_none());
+            assert!(!session.auth.started.get());
+            assert!(session.identity().is_none());
+            assert_eq!(session.renewal_error(), Some(Error::Unauthorized));
+            assert_eq!(session.startup_rejections.get(), attempt);
+            // The poll and the startup policy each move off the rejecting seat.
+            assert!(demotes.get() >= 2 * attempt);
+            assert!(
+                session
+                    .next_attempt()
+                    .is_some_and(|next| next > env.ctx.now())
+            );
+        }
+        // The next seat serves a valid bundle, which the startup key turn
+        // accepts as usual.
+        if let Some(next) = session.next_attempt() {
+            clock.advance(next.saturating_duration_since(env.ctx.now()));
+        }
+        drive(&clock, session.keyring_startup_turn(&scope(&env))).unwrap();
+        assert_eq!(
+            session
+                .auth
+                .startup_bundle
+                .borrow()
+                .as_ref()
+                .map(|b| b.generation.0),
+            Some(u64::MAX)
+        );
+        assert!(!session.auth.started.get());
+    }
+
+    /// A rejection that persists past the bounded retries is still fatal.
+    #[test]
+    fn startup_unauthorized_is_fatal_once_retries_are_spent() {
+        let clock = racer_io::SimClock::new(742);
+        let env = racer_io::Env::new(racer_io::Env::host().driver.clone(), clock.ctx(0));
+        let session = session(&env);
+        let attempts = STARTUP_UNAUTHORIZED_RETRIES + 1;
+        startup_feed(
+            &env,
+            &session,
+            (0..attempts).map(|_| unauthenticated()).collect(),
+        );
+        for _ in 0..STARTUP_UNAUTHORIZED_RETRIES {
+            assert_eq!(start_once(&clock, &env, &session), Err(Error::Unavailable));
+        }
+        assert_eq!(start_once(&clock, &env, &session), Err(Error::Unauthorized));
+        assert!(session.auth.startup_bundle.borrow().is_none());
+        assert!(!session.auth.started.get());
+        assert!(session.identity().is_none());
+    }
+
+    /// A seat rejection seen after the startup scope has ended is not retried.
+    #[test]
+    fn startup_unauthorized_after_scope_end_is_fatal() {
+        let clock = racer_io::SimClock::new(743);
+        let env = racer_io::Env::new(racer_io::Env::host().driver.clone(), clock.ctx(0));
+        let session = session(&env);
+        let ended = RequestScope::on(
+            &env.ctx.clock,
+            crate::model::RequestId([9; 16]),
+            env.ctx.now() + Duration::from_millis(1),
+        )
+        .unwrap();
+        clock.advance(Duration::from_millis(5));
+        assert_eq!(session.startup_rejected(&ended), Error::Unauthorized);
+        assert_eq!(session.startup_rejected(&scope(&env)), Error::Unavailable);
+    }
+
+    /// An issued chain that does not verify against the key feed roots (a seat
+    /// that became ready under a root the feed seat has not yet served) is
+    /// retried within the startup bound, after dropping the staged startup
+    /// trust so the next attempt refetches the keyring. Unrelated
+    /// `Unauthorized` failures stay fatal, other errors pass through, and a
+    /// persistent mismatch is fatal once the bound is spent.
+    #[test]
+    fn startup_untrusted_chain_refetches_trust_and_is_bounded() {
+        let clock = racer_io::SimClock::new(744);
+        let env = racer_io::Env::new(racer_io::Env::host().driver.clone(), clock.ctx(0));
+        let session = session(&env);
+        let demotes = startup_feed(&env, &session, vec![]);
+        let (ca, _) = crate::test_support::enrollment::ca();
+        let stage = || {
+            *session.auth.startup_bundle.borrow_mut() = Some(startup_bundle(1, ca.der()));
+        };
+        let staged = || session.auth.startup_bundle.borrow().is_some();
+
+        // Neither a seat rejection nor an untrusted chain: local failure, fatal.
+        stage();
+        assert_eq!(
+            session.startup_failure(Error::Unauthorized, &scope(&env)),
+            Error::Unauthorized
+        );
+        assert!(staged());
+        assert_eq!(session.startup_rejections.get(), 0);
+
+        // A non-authentication error clears the flag and passes through.
+        session.auth.enrollment.mark_untrusted_chain();
+        assert_eq!(session.startup_failure(Error::Io, &scope(&env)), Error::Io);
+        assert!(!session.auth.enrollment.take_untrusted_chain());
+        assert!(staged());
+
+        for attempt in 1..=STARTUP_UNAUTHORIZED_RETRIES {
+            stage();
+            session.auth.enrollment.mark_untrusted_chain();
+            assert_eq!(
+                session.startup_failure(Error::Unauthorized, &scope(&env)),
+                Error::Unavailable
+            );
+            assert!(!staged(), "retry must refetch the keyring");
+            assert!(!session.auth.enrollment.take_untrusted_chain());
+            assert_eq!(session.startup_rejections.get(), attempt);
+            assert_eq!(demotes.get(), attempt);
+            assert_eq!(session.renewal_error(), Some(Error::Unauthorized));
+            assert!(session.identity().is_none());
+        }
+        session.auth.enrollment.mark_untrusted_chain();
+        assert_eq!(
+            session.startup_failure(Error::Unauthorized, &scope(&env)),
+            Error::Unauthorized
+        );
+        assert!(!session.auth.started.get());
+    }
 
     /// Receipts never regress by sequence and remain independent of acceptance.
     #[test]
@@ -1023,7 +1413,7 @@ pub(super) mod tests {
         assert_eq!(received.get(), Some((1, publication.membership_version.0)));
     }
 
-    /// Scripted wire boundary; real Feed/Sync still owns all protocol progress.
+    /// Scripted wire boundary; the real Poll still owns all protocol progress.
     struct Script {
         responses: RefCell<VecDeque<rest::Response>>,
 
@@ -1032,14 +1422,14 @@ pub(super) mod tests {
         requests: Rc<RefCell<Vec<(String, Option<String>)>>>,
     }
 
-    impl Source<ReactorControlIo> for Script {
+    impl Fetch for Script {
         fn get<'a>(
             &'a self,
             path: &'a str,
             digest: Option<&'a str>,
             _: usize,
             _: &'a RequestScope,
-        ) -> uring_runtime::Operation<'a, rest::Response, FetchError<Error>> {
+        ) -> racer_io::Operation<'a, rest::Response, FetchError> {
             Box::pin(async move {
                 self.requests
                     .borrow_mut()
@@ -1060,15 +1450,35 @@ pub(super) mod tests {
         fn close(&self) {}
     }
 
+    /// A poll over a scripted wire boundary with the session's real install hook.
+    fn scripted(env: &racer_io::Env, session: &Session, doc: Doc, source: Script) -> Poll {
+        let install: Box<dyn Install> = match doc {
+            Doc::Publication => Box::new(PublicationInstall {
+                target: session.snapshots.clone(),
+                received: session.received.clone(),
+                auth: session.auth.clone(),
+            }),
+            Doc::Keyring => Box::new(BundleInstall {
+                auth: session.auth.clone(),
+                error: session.keyring_error.clone(),
+            }),
+        };
+        Poll::new(
+            host(env),
+            doc,
+            Box::new(source),
+            install,
+            Schedule::control(),
+        )
+        .unwrap()
+    }
+
     /// Explicit simulated clock progression with a host watchdog and CPU yield.
-    fn drive<T>(
-        clock: &uring_runtime::environment::SimulationClock,
-        operation: impl Future<Output = T>,
-    ) -> T {
+    fn drive<T>(clock: &racer_io::SimClock, operation: impl Future<Output = T>) -> T {
         let mut operation = std::pin::pin!(operation);
         let until = Instant::now() + Duration::from_secs(5);
         loop {
-            if let Poll::Ready(result) = operation
+            if let std::task::Poll::Ready(result) = operation
                 .as_mut()
                 .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
             {
@@ -1081,21 +1491,25 @@ pub(super) mod tests {
     }
 
     /// Application error/scoping adapter, without any external sockets.
-    fn host() -> Rc<ReactorControlIo> {
+    fn host(env: &racer_io::Env) -> Rc<ReactorControlIo> {
         Rc::new(ReactorControlIo::new(Rc::new(
-            crate::runtime::Reactor::new(Rc::new(flow_control::Quotas::new(
-                crate::admission::AdmissionPolicy::new(
-                    crate::test_support::cluster::config(false).limits,
-                ),
-            ))),
+            crate::runtime::Reactor::new(
+                Rc::new(flow_control::Quotas::new(
+                    crate::admission::AdmissionPolicy::new(
+                        crate::test_support::cluster::config(false).limits,
+                    ),
+                )),
+                env,
+            ),
         )))
     }
 
-    /// Long enough for several independent generic retry turns.
-    fn scope() -> RequestScope {
-        RequestScope::new(
+    /// Long enough for several independent retry turns.
+    fn scope(env: &racer_io::Env) -> RequestScope {
+        RequestScope::on(
+            &env.ctx.clock,
             crate::model::RequestId([8; 16]),
-            uring_runtime::environment::now() + Duration::from_secs(300),
+            env.ctx.now() + Duration::from_secs(300),
         )
         .unwrap()
     }
@@ -1104,7 +1518,7 @@ pub(super) mod tests {
     fn document(sequence: u64) -> wire::Publication {
         let mut p = wire::decode_publication(include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/control-wire/testdata/publication.json"
+            "/wire/testdata/publication.json"
         )))
         .unwrap();
         p.sequence.0 = sequence;
@@ -1112,7 +1526,7 @@ pub(super) mod tests {
     }
 
     /// Session fixture intentionally has no token and no attached transport until requested.
-    fn session() -> Session {
+    fn session(env: &racer_io::Env) -> Session {
         let p = document(1);
         let keys = Rc::new(Keyring::new(
             p.cluster.clone(),
@@ -1129,31 +1543,34 @@ pub(super) mod tests {
                 p.cluster.clone(),
                 "missing-token".into(),
                 "missing-identity".into(),
-                host(),
+                host(env),
             )),
             RailJournal::new(
                 Arc::new(Default::default()),
                 "missing-identity".into(),
-                host(),
+                host(env),
             ),
             std::num::NonZeroU32::new(4).unwrap(),
             keys.clone(),
             BundleInstaller::new(keys),
             Rc::new(PublicationTarget::new(
                 p.cluster,
-                Arc::new(controlplane::Published::new(
+                Arc::new(crate::control::cell::PublicationCell::new(
                     super::super::Snapshot::retention(0),
                 )),
+                env.ctx.clock.clone(),
             )),
         )
     }
 
     /// Preserve the former lagging-replica scenario through real generic scheduling.
-    pub(crate) fn lagging_replica() {
-        let clock = uring_runtime::environment::SimulationClock::new(731);
-        let _time = clock.environment(0).enter();
+    pub(crate) fn lagging_replica(env: &racer_io::Env) {
+        let clock = racer_io::SimClock::new(731);
+        let sim_env = clock.ctx(0);
+        let env = racer_io::Env::new(env.driver.clone(), sim_env.clone());
+        let sim_ctx = sim_env.clone();
         for pending in [false, true] {
-            let session = session();
+            let session = session(&env);
             let first = document(10);
             let accepted = session.snapshots.apply(first.clone()).unwrap();
             let mut next = document(11);
@@ -1179,39 +1596,29 @@ pub(super) mod tests {
                 retry_after: None,
             });
             let requests = Rc::new(RefCell::new(Vec::new()));
-            let mut sync = Sync::new(
-                host(),
-                Feed::new(
-                    ObservedPublication {
-                        received: session.received.clone(),
-                    },
-                    wire::SNAPSHOT_PATH.into(),
-                    wire::MAX_PUBLICATION_BYTES,
-                )
-                .unwrap(),
-                Script {
+            let mut sync = Poll::new(
+                host(&env),
+                Doc::Publication,
+                Box::new(Script {
                     responses: RefCell::new(responses),
                     requests: requests.clone(),
-                },
-                PublicationInstall {
+                }),
+                Box::new(PublicationInstall {
                     target: session.snapshots.clone(),
                     received: session.received.clone(),
                     auth: session.auth.clone(),
-                },
-                schedule(),
+                }),
+                Schedule::control(),
             )
             .unwrap();
-            sync.seed(Arc::new(first)).unwrap();
-            let scope = scope();
+            sync.seed(Document::Publication(Arc::new(first))).unwrap();
+            let scope = scope(&env);
             if pending {
                 drive(&clock, sync.turn(&scope)).unwrap();
             }
             for error in [Error::Unavailable, Error::Overloaded] {
                 assert_eq!(drive(&clock, sync.turn(&scope)), Err(error));
-                assert!(
-                    sync.status().next_fetch
-                        >= uring_runtime::environment::now() + Duration::from_secs(7)
-                );
+                assert!(sync.status().next_fetch >= sim_ctx.clock.now() + Duration::from_secs(7));
                 assert_eq!(sync.status().accepted, Some(10));
                 assert_eq!(sync.status().pending, pending.then_some(11));
                 assert!(Arc::ptr_eq(
@@ -1243,7 +1650,7 @@ pub(super) mod tests {
     }
 
     /// Structured failures feed generic Retry-After, while stop fences both drivers.
-    pub(crate) fn status_retry_shutdown() {
+    pub(crate) fn status_retry_shutdown(env: &racer_io::Env) {
         for (status, code, expected) in [
             (413, "too_large", Error::InvalidRequest),
             (503, "forbidden", Error::InvalidRequest),
@@ -1259,19 +1666,19 @@ pub(super) mod tests {
                 Err(expected)
             );
         }
-        let clock = uring_runtime::environment::SimulationClock::new(732);
-        let _time = clock.environment(0).enter();
-        let session = session();
-        session.attach_io(host()).unwrap();
-        let scope = scope();
+        let clock = racer_io::SimClock::new(732);
+        let env = racer_io::Env::new(env.driver.clone(), clock.ctx(0));
+        let session = session(&env);
+        session.attach_io(host(&env)).unwrap();
+        let scope = scope(&env);
         drive(&clock, session.shutdown(&scope)).unwrap();
         assert_eq!(
             drive(&clock, session.progress(&scope)),
-            Err(Error::Cancelled)
+            Err(Error::Canceled)
         );
         assert_eq!(
             drive(&clock, session.keyring_progress(&scope)),
-            Err(Error::Cancelled)
+            Err(Error::Canceled)
         );
         assert!(
             session
@@ -1286,12 +1693,12 @@ pub(super) mod tests {
     }
 
     /// Key feed validates 204 and tracks its cursor independently of publication/issuance.
-    pub(crate) fn independent_keyring() {
-        let clock = uring_runtime::environment::SimulationClock::new(733);
-        let _time = clock.environment(0).enter();
-        let session = session();
-        session.attach_io(host()).unwrap();
-        let scope = scope();
+    pub(crate) fn independent_keyring(env: &racer_io::Env) {
+        let clock = racer_io::SimClock::new(733);
+        let env = racer_io::Env::new(env.driver.clone(), clock.ctx(0));
+        let session = session(&env);
+        session.attach_io(host(&env)).unwrap();
+        let scope = scope(&env);
         let key_owner = Turn::take(&session.keyrings).unwrap();
         assert_eq!(
             drive(&clock, session.keyring_progress(&scope)),
@@ -1305,20 +1712,6 @@ pub(super) mod tests {
             (true, vec![], true),
             (true, vec![b'x'], false),
         ] {
-            let feed = Feed::new(
-                BundleCodec,
-                wire::KEYRING_PATH.into(),
-                wire::MAX_BUNDLE_BYTES,
-            )
-            .unwrap();
-            if seed {
-                let bundle = wire::decode_bundle(include_bytes!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/control-wire/testdata/bundle.json"
-                )))
-                .unwrap();
-                feed.restore(Some(Arc::new(bundle)));
-            }
             let source = Script {
                 responses: RefCell::new(VecDeque::from([rest::Response {
                     status: 204,
@@ -1327,10 +1720,16 @@ pub(super) mod tests {
                 }])),
                 requests: Rc::new(RefCell::new(vec![])),
             };
-            assert_eq!(
-                drive(&clock, feed.fetch::<ReactorControlIo, _>(&source, &scope)).is_ok(),
-                success
-            );
+            let feed = scripted(&env, &session, Doc::Keyring, source);
+            if seed {
+                let bundle = wire::decode_bundle(include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/wire/testdata/bundle.json"
+                )))
+                .unwrap();
+                feed.restore(Some(Document::Keyring(Arc::new(bundle))));
+            }
+            assert_eq!(drive(&clock, feed.fetch(&scope)).is_ok(), success);
         }
         assert!(
             session
@@ -1347,20 +1746,13 @@ pub(super) mod tests {
     }
 
     /// No string method or externally supplied delta digest exists in the feed API.
-    pub(crate) fn canonical_delta_and_get_only() {
-        let clock = uring_runtime::environment::SimulationClock::new(734);
-        let _time = clock.environment(0).enter();
-        let feed = Feed::new(
-            PublicationCodec,
-            wire::SNAPSHOT_PATH.into(),
-            wire::MAX_PUBLICATION_BYTES,
-        )
-        .unwrap();
-        let p = document(1);
-        let digest = PublicationCodec.digest(&p).unwrap();
+    pub(crate) fn canonical_delta_and_get_only(env: &racer_io::Env) {
+        let clock = racer_io::SimClock::new(734);
+        let env = racer_io::Env::new(env.driver.clone(), clock.ctx(0));
+        let p = Document::Publication(Arc::new(document(1)));
+        let digest = p.digest().unwrap();
         assert_eq!(digest.len(), 64);
         assert!(digest.bytes().all(|b| b.is_ascii_hexdigit()));
-        feed.restore(Some(Arc::new(p)));
         let requests = Rc::new(RefCell::new(vec![]));
         let source = Script {
             responses: RefCell::new(VecDeque::from([rest::Response {
@@ -1370,7 +1762,9 @@ pub(super) mod tests {
             }])),
             requests: requests.clone(),
         };
-        drive(&clock, feed.fetch::<ReactorControlIo, _>(&source, &scope())).unwrap();
+        let feed = scripted(&env, &session(&env), Doc::Publication, source);
+        feed.restore(Some(p));
+        drive(&clock, feed.fetch(&scope(&env))).unwrap();
         assert_eq!(
             requests.borrow()[0],
             (format!("{}?after=1", wire::SNAPSHOT_PATH), Some(digest))
@@ -1378,23 +1772,26 @@ pub(super) mod tests {
     }
 
     /// Not-before policy is enforced before the generic transport receives an identity.
-    pub(crate) fn reject_future_identity(identity: LocalSigningIdentity) {
-        let session = session();
+    pub(crate) fn reject_future_identity(env: &racer_io::Env, identity: LocalSigningIdentity) {
+        let session = session(env);
         *session.auth.identity.borrow_mut() = Some(identity);
-        let credentials = FeedCredentials {
+        let client = Client {
+            transport: transport(&session.endpoint),
             auth: session.auth.clone(),
-            policy: RejectionPolicy::IdentityOnly,
+            doc: Doc::Publication,
+            started: None,
         };
-        assert!(credentials.identity().unwrap().is_none());
-        assert_eq!(credentials.policy(), RejectionPolicy::IdentityOnly);
+        assert!(client.identity().unwrap().is_none());
+        assert_eq!(Doc::Publication.rejection(), Rejection::IdentityOnly);
+        assert_eq!(Doc::Keyring.rejection(), Rejection::TokenFallback);
     }
 
     /// Pending documents, not lossy reconstructed snapshots, form the next delta base.
     #[test]
     fn pending_publication_delta_uses_exact_received_document() {
-        let clock = uring_runtime::environment::SimulationClock::new(735);
-        let _time = clock.environment(0).enter();
-        let session = session();
+        let clock = racer_io::SimClock::new(735);
+        let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
+        let session = session(&env);
         let first = document(10);
         let held = session.snapshots.apply(first.clone()).unwrap();
         let mut pending = document(11);
@@ -1410,7 +1807,7 @@ pub(super) mod tests {
             "sequence": "12", "membership_version": next.membership_version.0.to_string(),
             "content_hash": wire::content_hash(&next).unwrap(),
             "upsert_members": [], "remove_members": [], "caches": [],
-            "pools": []
+            "pools": [], "page_bytes": 16777216
         });
         let requests = Rc::new(RefCell::new(vec![]));
         let source = Script {
@@ -1428,27 +1825,20 @@ pub(super) mod tests {
             ])),
             requests: requests.clone(),
         };
-        let mut sync = Sync::new(
-            host(),
-            Feed::new(
-                ObservedPublication {
-                    received: session.received.clone(),
-                },
-                wire::SNAPSHOT_PATH.into(),
-                wire::MAX_PUBLICATION_BYTES,
-            )
-            .unwrap(),
-            source,
-            PublicationInstall {
+        let mut sync = Poll::new(
+            host(&env),
+            Doc::Publication,
+            Box::new(source),
+            Box::new(PublicationInstall {
                 target: session.snapshots.clone(),
                 received: session.received.clone(),
                 auth: session.auth.clone(),
-            },
-            schedule(),
+            }),
+            Schedule::control(),
         )
         .unwrap();
-        sync.seed(Arc::new(first)).unwrap();
-        let scope = scope();
+        sync.seed(Document::Publication(Arc::new(first))).unwrap();
+        let scope = scope(&env);
         drive(&clock, sync.turn(&scope)).unwrap();
         drive(&clock, sync.turn(&scope)).unwrap();
         assert_eq!(sync.status().accepted, Some(10));
@@ -1473,7 +1863,8 @@ pub(super) mod tests {
     /// Managed reports carry configured shares and are sent only when rails change.
     #[test]
     fn managed_report_forwards_distinct_rails_only() {
-        let session = session();
+        let env = racer_io::Env::host();
+        let session = session(&env);
         session.mark_serving();
         session.report_rails(&[]);
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1499,7 +1890,8 @@ pub(super) mod tests {
     /// open; then only the newest rails, once.
     #[test]
     fn managed_report_waits_until_serving() {
-        let session = session();
+        let env = racer_io::Env::host();
+        let session = session(&env);
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = seen.clone();
         session.set_report(Arc::new(move |shares, rails| {
@@ -1524,11 +1916,33 @@ pub(super) mod tests {
         assert_eq!(*seen.lock().unwrap(), vec![(4, vec![rail]), (4, vec![])]);
     }
 
+    /// The serving renewal loop sleeps until its scheduled retry within
+    /// fixed bounds instead of rechecking every second.
+    #[test]
+    fn renewal_wake_follows_retry_within_bounds() {
+        let env = racer_io::Env::host();
+        let session = session(&env);
+        let now = Instant::now();
+        // No identity and no retry keeps the former one-second recheck.
+        assert_eq!(session.renewal_wake(now), now + RENEWAL_MIN_WAIT);
+        session
+            .renewal_next
+            .set(Some(now + Duration::from_secs(10)));
+        assert_eq!(session.renewal_wake(now), now + Duration::from_secs(10));
+        session
+            .renewal_next
+            .set(Some(now + Duration::from_secs(100)));
+        assert_eq!(session.renewal_wake(now), now + RENEWAL_MAX_WAIT);
+        session.renewal_next.set(Some(now));
+        assert_eq!(session.renewal_wake(now), now + RENEWAL_MIN_WAIT);
+    }
+
     /// Without any persisted rails, serving reports nothing (there is
     /// nothing to report yet; enrollment persists rails first).
     #[test]
     fn serving_without_rails_reports_nothing() {
-        let session = session();
+        let env = racer_io::Env::host();
+        let session = session(&env);
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = seen.clone();
         session.set_report(Arc::new(move |shares, rails| {

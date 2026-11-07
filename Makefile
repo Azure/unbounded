@@ -366,8 +366,13 @@ help: ## Show this help
 	@echo ""
 	@echo "Racer:"
 	@echo "  racer-test                       Test the Rust Racer workspace and Go Racer API and wire contracts"
+	@echo "  racer-fmt                        Format the Rust Racer workspace"
+	@echo "  racer-lint                       Check Rust formatting, workspace Clippy, and Racer purity"
+	@echo "  racer-purity-graph               Fail when a pure Racer crate depends on an IO crate"
 	@echo "  racer-gpu-test                   Build the CUDA shim with kernels and run GPU hardware tests"
-	@echo "  racer-sim                        Run the Racer simulator (ARGS='--scenario smoke --nodes 16')"
+	@echo "  racer-fuzz                       Run each Racer libFuzzer target briefly (FUZZ_SECONDS, default 30)"
+	@echo "  racer-dst                        Run the Racer DST seed set twice each (DST_SEEDS, DST_STEPS, DST_FILTER)"
+	@echo "  racer-dst-report                 Write one Model scenario's JSON report (ARGS='--scenario full-failover --nodes 200')"
 	@echo "  racer-envtest                    Run Racer API-server tests with KUBEBUILDER_ASSETS"
 	@echo "  racer-envtest-ci                 Provision pinned assets and run Racer API-server tests"
 	@echo "  racer-generate                   Generate Racer deepcopy and CRD artifacts"
@@ -577,6 +582,29 @@ racer-rust-test: ## Test the Rust Racer workspace, including the embedded cluste
 
 racer-test: racer-go-test racer-rust-test ## Check Racer
 
+RACER_RUST_TOOLCHAIN ?= 1.96.0
+
+.PHONY: racer-fmt racer-lint racer-purity-graph
+racer-fmt: ## Format the Rust Racer workspace
+	timeout --signal=TERM --kill-after=10s 300s cargo +$(RACER_RUST_TOOLCHAIN) fmt --manifest-path cmd/racer/Cargo.toml --all
+
+racer-purity-graph: ## Fail when a pure Racer crate depends on an IO crate
+	timeout --signal=TERM --kill-after=10s 300s python3 hack/scripts/racer-purity-graph.py --manifest-path cmd/racer/Cargo.toml --strict
+
+racer-lint: racer-purity-graph ## Check Rust formatting, workspace Clippy, and Racer purity
+	timeout --signal=TERM --kill-after=10s 300s cargo +$(RACER_RUST_TOOLCHAIN) fmt --manifest-path cmd/racer/Cargo.toml --all --check
+	timeout --signal=TERM --kill-after=10s 1200s cargo +$(RACER_RUST_TOOLCHAIN) clippy --locked --manifest-path cmd/racer/Cargo.toml --workspace --all-targets -- -D warnings
+	timeout --signal=TERM --kill-after=10s 600s cargo +$(RACER_RUST_TOOLCHAIN) test --locked --manifest-path cmd/racer/Cargo.toml -p racer-core --test purity
+
+FUZZ_SECONDS ?= 30
+RACER_FUZZ_TARGETS ?= http_head small_body peer_envelope control_documents store_record checkpoint
+
+.PHONY: racer-fuzz
+racer-fuzz: ## Run each Racer libFuzzer target for FUZZ_SECONDS (default 30)
+	cd cmd/racer/fuzz && for target in $(RACER_FUZZ_TARGETS); do \
+		timeout --signal=TERM --kill-after=10s 1500s env RUSTC_BOOTSTRAP=1 cargo +$(RACER_RUST_TOOLCHAIN) fuzz run "$$target" "corpus/$$target" -- -max_total_time=$(FUZZ_SECONDS) || exit 1; \
+	done
+
 RACER_GPU_NATIVE ?= $(CURDIR)/bin/racer-gpu-native
 # 1 skips when no GPU is found; require fails instead (dedicated GPU runners).
 RACER_GPU_TESTS ?= require
@@ -611,11 +639,20 @@ racer-python-dist: ## Build sdists and wheels for racer-client and racer-vllm in
 	timeout --signal=TERM --kill-after=10s 300s "$(RACER_PY_VENV)/bin/python" -m build -o tmp/racer-python-dist clients/python/racer
 	timeout --signal=TERM --kill-after=10s 300s "$(RACER_PY_VENV)/bin/python" -m build -o tmp/racer-python-dist clients/python/racer-vllm
 
-RACER_SIM_TIMEOUT ?= 7200s
+RACER_DST_TIMEOUT ?= 1200s
 
-.PHONY: racer-sim
-racer-sim: ## Run the Racer discrete-event simulator; pass options with ARGS='--nodes 50000 --seed 1'
-	timeout --signal=TERM --kill-after=10s $(RACER_SIM_TIMEOUT) cargo run --release --locked --manifest-path cmd/racer/Cargo.toml -p racer-sim -- $(ARGS)
+# DST_SEEDS: seed file or count N (seeds 1..=N per scenario); default dst/seeds/{ci,regressions}.txt.
+# DST_STEPS: step budget per run. DST_FILTER: scenario name substring. Each entry runs twice.
+.PHONY: racer-dst
+racer-dst: ## Run the Racer deterministic simulation tests; every seed runs twice and must match
+	DST_SEEDS="$(DST_SEEDS)" DST_STEPS="$(DST_STEPS)" DST_FILTER="$(DST_FILTER)" timeout --signal=TERM --kill-after=10s $(RACER_DST_TIMEOUT) cargo +$(RACER_RUST_TOOLCHAIN) run --locked --profile test --manifest-path cmd/racer/Cargo.toml -p racer-dst --bin racer-dst
+
+RACER_DST_REPORT_TIMEOUT ?= 7200s
+
+# One Model scenario's JSON report: --scenario, --nodes, --seed, --duration, --config, --out.
+.PHONY: racer-dst-report
+racer-dst-report: ## Write one Racer Model scenario's JSON report; pass options with ARGS='--scenario full-failover --nodes 200'
+	timeout --signal=TERM --kill-after=10s $(RACER_DST_REPORT_TIMEOUT) cargo +$(RACER_RUST_TOOLCHAIN) run --release --locked --manifest-path cmd/racer/Cargo.toml -p racer-dst --bin racer-dst -- $(ARGS)
 
 $(SETUP_ENVTEST):
 	@mkdir -p bin tmp/envtest-tools

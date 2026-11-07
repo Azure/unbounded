@@ -4,19 +4,16 @@ use peer_wire::{
     control::{Binding, Phase},
     decode_deadline, encode_deadline,
 };
-use racer_control_wire::{
-    BundleGeneration, ClusterId, KeyringBundle, NodeId, RailId, SCHEMA_VERSION,
-};
 use racer_crypto::identity::{
     Certificates, KeyEpochs, Keyring,
     test_util::{ca, issue},
 };
+use racer_wire::control::{BundleGeneration, ClusterId, KeyringBundle, NodeId, RailId};
 use std::{
     rc::Rc,
     sync::Arc,
     time::{Duration, Instant, UNIX_EPOCH},
 };
-use uring_runtime::environment::{Deadline, SimulationClock, now};
 
 struct NoMac;
 
@@ -31,21 +28,33 @@ impl RequestMac for NoMac {
 }
 
 fn signatures() -> Signatures {
+    signatures_with(racer_io::WorkerCtx::host())
+}
+
+fn signatures_with(ctx: racer_io::WorkerCtx) -> Signatures {
     let (ca, key) = ca();
     let roots = vec![ca.der().to_vec()];
     let cluster = ClusterId("00000099-1111-4111-8111-111111111111".into());
     let node = NodeId("00000001-1111-4111-8111-111111111111".into());
     let (pending, chain) = issue(&ca, &key, &cluster, &node, |_| {});
     let identity = pending
-        .accept(cluster.clone(), node.clone(), chain, &roots)
+        .accept(
+            cluster.clone(),
+            node.clone(),
+            chain,
+            &roots,
+            &racer_crypto::identity::WallClock::host(),
+        )
         .unwrap();
     let keys = Rc::new(Keyring::new(
         cluster.clone(),
         node,
-        Arc::new(KeyEpochs::default()),
+        Arc::new(KeyEpochs::with_clock(
+            racer_crypto::identity::WallClock::host(),
+        )),
     ));
     keys.install(KeyringBundle {
-        schema_version: SCHEMA_VERSION,
+        schema_version: racer_wire::control::KEYRING_SCHEMA_VERSION,
         cluster: cluster.clone(),
         generation: BundleGeneration(1),
         peer_trust_roots: roots,
@@ -54,7 +63,7 @@ fn signatures() -> Signatures {
     .unwrap();
     keys.install_signing_identity(Arc::new(identity)).unwrap();
     let certificates = Rc::new(Certificates::new(cluster, keys.clone()));
-    Signatures::new(keys, certificates, Rc::new(NoMac))
+    Signatures::new(keys, certificates, Rc::new(NoMac), ctx)
 }
 
 fn binding(deadline: u64) -> Binding {
@@ -70,7 +79,6 @@ fn binding(deadline: u64) -> Binding {
 
 #[test]
 fn head_and_sign_reject_unmappable_deadlines() {
-    let signatures = signatures();
     let origin = Instant::now();
     let (mut low, mut high) = (0, u64::MAX);
     while low < high {
@@ -82,12 +90,13 @@ fn head_and_sign_reject_unmappable_deadlines() {
         }
     }
     let wall_seconds = 1_800_000_000;
-    let clock = SimulationClock::new_at(
+    let sim = racer_io::SimClock::new_at(
         1,
         origin + Duration::from_secs(low),
         UNIX_EPOCH + Duration::from_secs(wall_seconds),
     );
-    let _environment = clock.environment(0).enter();
+    let signatures = signatures_with(sim.ctx(0));
+    let clock = signatures.ctx().clock.clone();
     binding(wall_seconds * 1000)
         .sign(
             &signatures,
@@ -100,13 +109,13 @@ fn head_and_sign_reject_unmappable_deadlines() {
         .unwrap();
     for deadline in [(wall_seconds + 1) * 1000, u64::MAX] {
         assert!(matches!(
-            decode_deadline(deadline),
-            Err(Error::Runtime(uring_runtime::Error::InvalidInput))
+            decode_deadline(&clock, deadline),
+            Err(Error::Runtime(racer_io::Error::InvalidInput))
         ));
         let binding = binding(deadline);
         assert!(matches!(
-            binding.head(Phase::Finish, &[0; 32], 0, vec![]),
-            Err(Error::Runtime(uring_runtime::Error::InvalidInput))
+            binding.head(&clock, Phase::Finish, &[0; 32], 0, vec![]),
+            Err(Error::Runtime(racer_io::Error::InvalidInput))
         ));
         assert!(matches!(
             binding.sign(
@@ -117,7 +126,7 @@ fn head_and_sign_reject_unmappable_deadlines() {
                 0,
                 vec![]
             ),
-            Err(Error::Runtime(uring_runtime::Error::InvalidInput))
+            Err(Error::Runtime(racer_io::Error::InvalidInput))
         ));
     }
 }
@@ -125,13 +134,16 @@ fn head_and_sign_reject_unmappable_deadlines() {
 #[test]
 fn representable_deadline_boundaries_preserve_verification_policy() {
     let signatures = signatures();
+    let clock = racer_io::Clock::host();
     for deadline in [0, u64::MAX] {
         assert_eq!(
-            encode_deadline(decode_deadline(deadline).unwrap()),
+            encode_deadline(&clock, decode_deadline(&clock, deadline).unwrap()),
             Ok(deadline)
         );
         let binding = binding(deadline);
-        let head = binding.head(Phase::Finish, &[0; 32], 0, vec![]).unwrap();
+        let head = binding
+            .head(&clock, Phase::Finish, &[0; 32], 0, vec![])
+            .unwrap();
         assert_eq!(
             head.unique("racer-payload-deadline").unwrap(),
             Some(deadline.to_string().as_bytes())
@@ -165,7 +177,13 @@ fn representable_deadline_boundaries_preserve_verification_policy() {
 #[test]
 fn future_deadline_signs_and_verifies() {
     let signatures = signatures();
-    let binding = binding(encode_deadline(Deadline(now() + Duration::from_secs(30))).unwrap());
+    let binding = binding(
+        encode_deadline(
+            &racer_io::Clock::host(),
+            racer_io::Clock::host().now() + Duration::from_secs(30),
+        )
+        .unwrap(),
+    );
     let signed = binding
         .sign(
             &signatures,

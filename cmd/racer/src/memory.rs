@@ -16,7 +16,7 @@ use crate::model::PageId;
 use crate::model::VersionMetadata;
 use crate::runtime::HashMap;
 use crate::runtime::HashSet;
-use racer_control_wire::CacheId;
+use racer_wire::control::CacheId;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -30,75 +30,27 @@ pub(crate) fn default_disk_alignment() -> page_alloc::Alignment {
     page_alloc::Alignment::new(4096, 4096, 4096).expect("valid default alignment")
 }
 
-/// Idle full-page buffers each worker's aligned ciphertext pool may keep.
+/// Idle buffers each worker's pool keeps per capacity class.
 ///
-/// Unlike the flow-control recycler, whose idle `Vec`s keep their admission
-/// charge until reclaimed, aligned buffers release their Ciphertext charge as
-/// soon as they become idle (see [`PoolCharge`]): a retained charge would pin
-/// admission that unrelated reservations, which cannot reach this pool, then
-/// fail on. Idle aligned storage is therefore unaccounted, so the budget is
-/// kept to a few pages per worker, and every path that reclaims the recycler
-/// ([`BufferPool::reclaim_idle_buffers`]) also empties this pool.
-///
-/// This is a ceiling, not a steady state: the pool's demand controller
-/// ([`page_alloc::PoolDemand`]) releases buffers that stay idle for a whole
-/// maintenance window, oldest first, so an idle worker's pool empties within a
-/// few windows of [`BufferPool::maintain_idle_buffers`] while continuous reuse
-/// keeps it full. Memory pressure constrains the pool to hold nothing.
-pub(crate) const ALIGNED_POOL_IDLE_PAGES: usize = 4;
-
-/// Accounting for aligned ciphertext storage.
-///
-/// Live buffers hold their Ciphertext reservation. When a page or unfrozen
-/// buffer is dropped, the reservation is released before the storage returns
-/// to its worker pool, so idle storage never holds admission.
-pub(crate) enum PoolCharge {
-    Held(CiphertextCharge),
-    /// Idle storage. `wipe` preserves the released charge's erase policy.
-    Released {
-        wipe: bool,
-    },
-}
-impl PoolCharge {
-    /// The live reservation, absent only while storage is going idle.
-    pub(crate) fn held(&self) -> Option<&CiphertextCharge> {
-        match self {
-            Self::Held(charge) => Some(charge),
-            Self::Released { .. } => None,
-        }
-    }
-    fn released(&self) -> Self {
-        Self::Released {
-            wipe: page_alloc::Charge::requires_wipe(self),
-        }
-    }
-}
-impl page_alloc::Charge for PoolCharge {
-    fn covers(&self, bytes: usize) -> bool {
-        match self {
-            Self::Held(charge) => charge.covers(bytes),
-            // Only applied to storage already accounted by its allocation.
-            Self::Released { .. } => true,
-        }
-    }
-    fn requires_wipe(&self) -> bool {
-        match self {
-            Self::Held(charge) => charge.requires_wipe(),
-            Self::Released { wipe } => *wipe,
-        }
-    }
-}
+/// Idle storage stays charged to [`ResourceClass::Pool`], so the bound is kept
+/// to a few pages per class. This is a ceiling, not a steady state:
+/// [`BufferPool::maintain_idle_buffers`] sheds half of the idle storage after
+/// each window without a checkout, so an idle worker's pool empties within a
+/// few windows while continuous reuse keeps it warm. Memory pressure sheds it
+/// at once.
+pub(crate) const POOL_IDLE_PER_CLASS: usize = 4;
 
 /// Writable aligned ciphertext storage from one worker's pool. Dropping it
-/// unfrozen releases its reservation and returns the storage to that pool.
-pub struct CiphertextBuffer(Option<page_alloc::DetachedBuffer<PoolCharge>>);
+/// unfrozen returns the storage to that pool and releases its reservation.
+pub struct CiphertextBuffer {
+    buffer: DiskBuffer,
+    /// Length through the next device length-unit boundary.
+    padded: usize,
+}
 impl CiphertextBuffer {
-    fn inner(&self) -> &page_alloc::DetachedBuffer<PoolCharge> {
-        self.0.as_ref().expect("live ciphertext buffer")
-    }
     /// Requested length in bytes.
     pub fn len(&self) -> usize {
-        self.inner().len()
+        self.buffer.len()
     }
     /// Always false: pools reject zero-length buffers.
     pub fn is_empty(&self) -> bool {
@@ -106,110 +58,103 @@ impl CiphertextBuffer {
     }
     /// Allocation capacity the reservation covers.
     pub fn capacity(&self) -> usize {
-        self.inner().capacity()
+        self.buffer.capacity()
     }
     /// The Ciphertext reservation accounting for this storage.
     pub(crate) fn charge(&self) -> &CiphertextCharge {
-        self.inner().charge().held().expect("held while live")
+        self.buffer.charge()
     }
     /// Bytes, which may hold stale ciphertext until fully written.
     pub fn as_slice(&self) -> &[u8] {
-        self.inner().as_slice()
+        &self.buffer
     }
     /// Exclusively borrow exactly the requested bytes.
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        self.0
-            .as_mut()
-            .expect("live ciphertext buffer")
-            .as_mut_slice()
+        &mut self.buffer
     }
-    /// Zero the pad and freeze without copying.
-    fn freeze(mut self) -> AlignedBody {
-        AlignedBody(self.0.take().expect("live ciphertext buffer").freeze())
+    /// Swap the reservation for `charge`, which must cover the capacity.
+    /// Returns the replaced charge, or `charge` back when it does not cover.
+    pub(crate) fn replace_charge(
+        &mut self,
+        charge: CiphertextCharge,
+    ) -> std::result::Result<CiphertextCharge, CiphertextCharge> {
+        self.buffer.replace_charge(charge)
     }
-}
-impl Drop for CiphertextBuffer {
-    fn drop(&mut self) {
-        if let Some(buffer) = self.0.take() {
-            // Freezing only zero-fills the pad; the body's drop releases the
-            // reservation before the storage goes idle.
-            drop(AlignedBody(buffer.freeze()));
-        }
+    /// Zero the pad and freeze without copying. The returned buffer's length
+    /// is the padded length; the second value is the ciphertext length.
+    fn freeze(self) -> (DiskBuffer, usize) {
+        let Self { mut buffer, padded } = self;
+        let length = buffer.len();
+        buffer.spare_mut()[length..padded].fill(0);
+        buffer
+            .set_len(padded)
+            .expect("padded length is within capacity");
+        (buffer, length)
     }
 }
 impl std::fmt::Debug for CiphertextBuffer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CiphertextBuffer")
-            .field("length", &self.0.as_ref().map(|b| b.len()))
+            .field("length", &self.buffer.len())
             .finish_non_exhaustive()
     }
 }
-// SAFETY: the detached allocation is exclusively owned, stable, and live
-// until Drop, and is only exposed through these borrows.
-unsafe impl uring_runtime::reactor::IoBuffer for CiphertextBuffer {
-    type Error = Error;
-    fn bytes(&self) -> Result<&[u8]> {
+// SAFETY: the pooled allocation is exclusively owned, stable, and live until
+// Drop, and is only exposed through these borrows.
+unsafe impl racer_io::ring::IoBuffer for CiphertextBuffer {
+    fn bytes(&self) -> racer_io::Result<&[u8]> {
         Ok(self.as_slice())
     }
-    fn bytes_mut(&mut self) -> Result<&mut [u8]> {
+    fn bytes_mut(&mut self) -> racer_io::Result<&mut [u8]> {
         Ok(self.as_mut_slice())
     }
 }
 
-/// Frozen aligned ciphertext that releases its reservation before the storage
-/// returns to its worker pool.
-pub(crate) struct AlignedBody(page_alloc::FrozenBuffer<PoolCharge>);
-impl AlignedBody {
-    pub(crate) fn charge(&self) -> &CiphertextCharge {
-        self.0.charge().held().expect("held while live")
-    }
-    fn rebind(&mut self, charge: CiphertextCharge) -> Result<()> {
-        self.0.rebind(PoolCharge::Held(charge)).map_err(Into::into)
-    }
-}
-impl std::ops::Deref for AlignedBody {
-    type Target = page_alloc::FrozenBuffer<PoolCharge>;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-impl Drop for AlignedBody {
-    fn drop(&mut self) {
-        let released = self.0.charge().released();
-        // Released covers any capacity, so rebinding cannot fail.
-        let _ = self.0.rebind(released);
-    }
+/// Demand state for trimming one worker's idle pooled storage.
+#[derive(Clone, Copy, Debug, Default)]
+struct IdleDemand {
+    window_start: Option<std::time::Instant>,
+    takes_at_start: u64,
+    idle_at_start: usize,
+    constrained: bool,
+    trimmed: u64,
 }
 
 /// Per-worker ciphertext and plaintext allocation front end.
 ///
-/// Cloned handles share one [`page_alloc::WorkerBufferPool`], so aligned
-/// ciphertext buffers return to the worker that created them even when they are
-/// filled or dropped on a shared crypto thread.
+/// Cloned handles share one [`page_alloc::buf::Pool`], so buffers return to
+/// the worker that created them even when they are filled or dropped on a
+/// shared crypto thread.
 #[derive(Clone)]
 pub struct BufferPool {
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
-    aligned: page_alloc::WorkerBufferPool<PoolCharge>,
+    /// Direct-I/O alignment of this worker's store devices.
+    alignment: page_alloc::Alignment,
+    /// Every pooled buffer: aligned ciphertext, disk reads, and wipe-on-return
+    /// plaintext. Idle storage is charged to [`ResourceClass::Pool`] and
+    /// returns here from any thread, so a warm path reuses a mapping instead
+    /// of mapping and unmapping a fresh one.
+    disk: Rc<std::cell::RefCell<page_alloc::buf::Pool>>,
+    demand: Rc<std::cell::Cell<IdleDemand>>,
 }
 /// Mutable staging buffer, not proof of authentication and not client-deliverable.
 /// Fixed-size owned backing stays at the same address when this owner moves.
-pub struct PlaintextBuffer(flow_control::ChargedBuffer<AdmissionPolicy>);
+pub struct PlaintextBuffer(PlaintextBuf);
 impl PlaintextBuffer {
-    pub(crate) fn into_parts(self) -> (Box<[u8]>, flow_control::Charge<AdmissionPolicy>) {
-        self.0.into_parts()
+    pub(crate) fn into_buf(self) -> PlaintextBuf {
+        self.0
     }
     pub(crate) fn reservation(&self) -> &flow_control::Charge<AdmissionPolicy> {
         self.0.charge()
     }
 }
 // SAFETY: private fixed backing and reservation remain exclusively owned.
-unsafe impl uring_runtime::reactor::IoBuffer for PlaintextBuffer {
-    type Error = Error;
-    fn bytes(&self) -> Result<&[u8]> {
-        Ok(self.0.bytes())
+unsafe impl racer_io::ring::IoBuffer for PlaintextBuffer {
+    fn bytes(&self) -> racer_io::Result<&[u8]> {
+        Ok(&self.0)
     }
-    fn bytes_mut(&mut self) -> Result<&mut [u8]> {
-        Ok(self.0.bytes_mut())
+    fn bytes_mut(&mut self) -> racer_io::Result<&mut [u8]> {
+        Ok(&mut self.0)
     }
 }
 /// Only page authentication/origin validation may create this publishable type.
@@ -217,15 +162,45 @@ unsafe impl uring_runtime::reactor::IoBuffer for PlaintextBuffer {
 pub struct VerifiedPage {
     pub(crate) inner: Arc<VerifiedBytes>,
 }
-/// Authenticated page identity paired with one recyclable payload owner.
+/// Authenticated page identity paired with one pooled, wipe-on-return payload.
 pub(crate) struct VerifiedBytes {
     pub page: PageId,
 
-    pub storage: flow_control::ChargedBytes<AdmissionPolicy>,
+    pub storage: PlaintextBuf,
+}
+
+/// Plaintext page storage checked out of a worker's buffer pool. The charge
+/// covers the pooled capacity; the buffer is wiped before it is reused.
+pub type PlaintextBuf = page_alloc::buf::Buf<PlaintextCharge>;
+
+/// Admission charge backing pooled plaintext storage.
+///
+/// [`AdmissionPolicy`] lets only ciphertext charges back page allocator
+/// storage, so slabs and aligned ciphertext pools can never hold plaintext.
+/// This wrapper is the one sanctioned exception: it covers a pooled
+/// plaintext buffer, which is always wiped before reuse or release.
+pub struct PlaintextCharge(pub(crate) flow_control::Charge<AdmissionPolicy>);
+
+impl page_alloc::Charge for PlaintextCharge {
+    fn covers(&self, bytes: usize) -> bool {
+        self.0.class() == ResourceClass::Plaintext && self.0.amount() >= bytes
+    }
+
+    fn requires_wipe(&self) -> bool {
+        true
+    }
+}
+
+impl std::ops::Deref for PlaintextCharge {
+    type Target = flow_control::Charge<AdmissionPolicy>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 impl std::ops::Deref for VerifiedBytes {
-    type Target = flow_control::ChargedBytes<AdmissionPolicy>;
+    type Target = PlaintextBuf;
 
     /// Borrow allocation and accounting without exposing mutable verified contents.
     fn deref(&self) -> &Self::Target {
@@ -240,37 +215,122 @@ impl std::ops::DerefMut for VerifiedBytes {
         &mut self.storage
     }
 }
-#[derive(Clone)]
+
+/// Fixture plaintext: copies `bytes` into unpooled storage charged to
+/// `admission` under `key` for the full buffer capacity.
+#[cfg(test)]
+pub(crate) fn fixture_plaintext(
+    admission: &flow_control::Quotas<AdmissionPolicy>,
+    key: Option<&racer_wire::control::CacheId>,
+    bytes: &[u8],
+) -> PlaintextBuf {
+    let capacity = bytes
+        .len()
+        .max(1)
+        .next_multiple_of(page_alloc::buf::GRANULE);
+    let charge = admission
+        .reserve(key, ResourceClass::Plaintext, capacity)
+        .expect("fixture plaintext admission");
+    fixture_storage(charge, bytes)
+}
+
+/// Fixture plaintext over a caller-made charge covering one granule-rounded
+/// buffer of `bytes.len()`.
+#[cfg(test)]
+pub(crate) fn fixture_storage(
+    charge: flow_control::Charge<AdmissionPolicy>,
+    bytes: &[u8],
+) -> PlaintextBuf {
+    let mut storage = page_alloc::buf::Buf::unpooled(bytes.len(), 1, PlaintextCharge(charge), true)
+        .expect("fixture buffer");
+    storage.copy_from_slice(bytes);
+    storage
+}
+/// A handle on immutable ciphertext.
+///
+/// Handles are pinning by default: each pinning handle, including every clone
+/// of one, counts in [`CiphertextBytes::pins`] until dropped. Caches and write
+/// queues ask [`Self::pins`] whether evicting their entry would free the bytes,
+/// instead of reading the `Arc` strong count. Telemetry, sampling, and other
+/// observers take [`Self::unpinned`] handles, which keep the bytes alive but
+/// never make an entry look busy.
 pub struct CiphertextPage {
     pub(crate) inner: Arc<CiphertextBytes>,
     pub(crate) provenance: Option<crate::telemetry::PeerProvenance>,
+    /// Whether this handle counts in `inner.pins`.
+    pub(crate) pinned: bool,
 }
-/// Ciphertext metadata and checksum cache remain separate from allocation ownership.
+impl Clone for CiphertextPage {
+    fn clone(&self) -> Self {
+        if self.pinned {
+            self.inner.pins.pin();
+        }
+        Self {
+            inner: self.inner.clone(),
+            provenance: self.provenance,
+            pinned: self.pinned,
+        }
+    }
+}
+impl Drop for CiphertextPage {
+    fn drop(&mut self) {
+        if self.pinned {
+            self.inner.pins.unpin();
+        }
+    }
+}
+/// Count of pinning [`CiphertextPage`] handles on one allocation. It starts at
+/// one for the handle that constructs the bytes.
+pub(crate) struct PinCount(std::sync::atomic::AtomicU32);
+impl Default for PinCount {
+    fn default() -> Self {
+        Self(std::sync::atomic::AtomicU32::new(1))
+    }
+}
+impl PinCount {
+    fn pin(&self) {
+        let previous = self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            previous != 0 && previous != u32::MAX,
+            "ciphertext pin count"
+        );
+    }
+    fn unpin(&self) {
+        let previous = self.0.fetch_sub(1, std::sync::atomic::Ordering::Release);
+        debug_assert!(previous != 0, "ciphertext pin count underflow");
+    }
+    fn get(&self) -> u32 {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+/// Ciphertext metadata remains separate from allocation ownership.
 pub(crate) struct CiphertextBytes {
-    pub checksum: std::sync::OnceLock<u64>,
-
     pub envelope: PageEnvelope,
 
     pub storage: CiphertextStorage,
+
+    /// Pinning handles; see [`CiphertextPage`].
+    pub(crate) pins: PinCount,
 }
 
+/// Pooled disk read storage charged to the reading cache's Ciphertext class.
+pub(crate) type DiskBuffer = page_alloc::buf::Buf<flow_control::Charge<AdmissionPolicy>>;
+
 pub(crate) enum CiphertextStorage {
-    Owned(flow_control::ChargedBytes<AdmissionPolicy>),
+    /// Ciphertext copied or read into page allocator storage (a disk record,
+    /// a TCP receive, or a fixture); `range` is its ciphertext.
     Slab {
-        buffer: page_alloc::FrozenBuffer<flow_control::Charge<AdmissionPolicy>>,
+        buffer: DiskBuffer,
         range: std::ops::Range<usize>,
     },
     /// Ciphertext produced directly into direct-I/O aligned storage.
     ///
     /// Invariant, established by construction: the bytes start at offset 0 of
-    /// an allocation aligned to its pool's memory unit, and
-    /// `buffer.padded_slice()` holds the ciphertext followed only by zeros up
-    /// to a length-unit boundary. The store may write `padded_slice()`
-    /// directly; see [`CiphertextPage::disk_body`].
-    Aligned {
-        buffer: AlignedBody,
-        length: usize,
-    },
+    /// an allocation aligned to its pool's memory unit, and `buffer` (its
+    /// whole logical length) holds the ciphertext followed only by zeros up
+    /// to a length-unit boundary. The store may write it directly; see
+    /// [`CiphertextPage::disk_body`].
+    Aligned { buffer: DiskBuffer, length: usize },
     /// A received RDMA page still in registered pool memory. Request-scoped
     /// only: retaining paths copy it out (see `retainable`) so pool buffers
     /// are never pinned by caches or write queues. Dropping it on any thread
@@ -281,19 +341,50 @@ pub(crate) enum CiphertextStorage {
         /// The first copy-out, shared by every later retaining path (memory
         /// cache, disk write queue) so a page is copied out at most once.
         retained: std::sync::OnceLock<CiphertextPage>,
+        /// Records how long the buffer was held. Declared after `page` so it
+        /// drops, and measures, once the buffer is back in its pool.
+        _hold: Option<Box<ReceiveHold>>,
     },
 }
 
-impl From<flow_control::ChargedBytes<AdmissionPolicy>> for CiphertextStorage {
-    fn from(bytes: flow_control::ChargedBytes<AdmissionPolicy>) -> Self {
-        Self::Owned(bytes)
+/// Times one registered receive buffer from its grant until it returns to
+/// the pool, as `racer_rdma_receive_buffer_hold_nanoseconds_{sum,count}`.
+/// Recorded on drop, on whichever thread drops the page.
+pub(crate) struct ReceiveHold {
+    metrics: crate::telemetry::Metrics,
+    clock: racer_io::Clock,
+    since: std::time::Instant,
+}
+
+impl ReceiveHold {
+    pub(crate) fn new(
+        metrics: crate::telemetry::Metrics,
+        clock: racer_io::Clock,
+        since: std::time::Instant,
+    ) -> Self {
+        Self {
+            metrics,
+            clock,
+            since,
+        }
+    }
+}
+
+impl Drop for ReceiveHold {
+    fn drop(&mut self) {
+        let held = self.clock.now().saturating_duration_since(self.since);
+        self.metrics.record(
+            crate::telemetry::Event::RdmaReceiveHoldNs,
+            u64::try_from(held.as_nanos()).unwrap_or(u64::MAX),
+        );
+        self.metrics
+            .record(crate::telemetry::Event::RdmaReceiveHoldCount, 1);
     }
 }
 
 impl CiphertextBytes {
     pub(crate) fn reservation(&self) -> &flow_control::Charge<AdmissionPolicy> {
         match &self.storage {
-            CiphertextStorage::Owned(storage) => &storage.reservation,
             CiphertextStorage::Slab { buffer, .. } => buffer.charge(),
             CiphertextStorage::Aligned { buffer, .. } => buffer.charge(),
             CiphertextStorage::Registered { reservation, .. } => reservation,
@@ -301,7 +392,6 @@ impl CiphertextBytes {
     }
     pub(crate) fn capacity(&self) -> usize {
         match &self.storage {
-            CiphertextStorage::Owned(storage) => storage.bytes.capacity(),
             CiphertextStorage::Slab { buffer, .. } => buffer.capacity(),
             CiphertextStorage::Aligned { buffer, .. } => buffer.capacity(),
             CiphertextStorage::Registered { page, .. } => page.len(),
@@ -310,34 +400,115 @@ impl CiphertextBytes {
 }
 
 #[cfg(test)]
-impl std::ops::Deref for CiphertextBytes {
-    type Target = flow_control::ChargedBytes<AdmissionPolicy>;
-
-    /// Borrow vector-backed fixtures; frozen slab bytes have no mutable fixture API.
-    fn deref(&self) -> &Self::Target {
-        match &self.storage {
-            CiphertextStorage::Owned(storage) => storage,
-            CiphertextStorage::Slab { .. } | CiphertextStorage::Aligned { .. } => {
-                panic!("slab ciphertext is immutable")
-            }
-            CiphertextStorage::Registered { .. } => panic!("registered ciphertext is immutable"),
-        }
-    }
-}
-
-#[cfg(test)]
-impl std::ops::DerefMut for CiphertextBytes {
-    /// Allow malformed vector fixtures without exposing mutable production bytes.
-    fn deref_mut(&mut self) -> &mut Self::Target {
+impl CiphertextBytes {
+    /// Mutable fixture bytes, for building malformed ciphertext.
+    pub(crate) fn fixture_bytes_mut(&mut self) -> &mut [u8] {
         match &mut self.storage {
-            CiphertextStorage::Owned(storage) => storage,
-            CiphertextStorage::Slab { .. } | CiphertextStorage::Aligned { .. } => {
-                panic!("slab ciphertext is immutable")
-            }
+            CiphertextStorage::Slab { buffer, range } => &mut buffer[range.clone()],
+            CiphertextStorage::Aligned { buffer, length } => &mut buffer[..*length],
             CiphertextStorage::Registered { .. } => panic!("registered ciphertext is immutable"),
         }
     }
+    /// Resize fixture ciphertext within its buffer capacity, filling new
+    /// bytes with `value`.
+    pub(crate) fn fixture_resize(&mut self, length: usize, value: u8) {
+        let (buffer, start, end) = match &mut self.storage {
+            CiphertextStorage::Slab { buffer, range } => {
+                let start = range.start;
+                (buffer, start, &mut range.end)
+            }
+            CiphertextStorage::Aligned { buffer, length } => (buffer, 0, length),
+            CiphertextStorage::Registered { .. } => panic!("registered ciphertext is immutable"),
+        };
+        let old = *end;
+        let new = start + length;
+        if new > buffer.len() {
+            buffer.set_len(new).expect("fixture ciphertext capacity");
+        }
+        if new > old {
+            buffer[old..new].fill(value);
+        }
+        *end = new;
+    }
+    /// Drop the last fixture byte.
+    pub(crate) fn fixture_pop(&mut self) {
+        let length = self.fixture_bytes_mut().len();
+        self.fixture_resize(length - 1, 0);
+    }
+    /// Append one fixture byte.
+    pub(crate) fn fixture_push(&mut self, value: u8) {
+        let length = self.fixture_bytes_mut().len();
+        self.fixture_resize(length + 1, value);
+    }
+    /// Replace the fixture's admission charge.
+    pub(crate) fn fixture_replace_charge(&mut self, charge: flow_control::Charge<AdmissionPolicy>) {
+        let replaced = match &mut self.storage {
+            CiphertextStorage::Slab { buffer, .. } | CiphertextStorage::Aligned { buffer, .. } => {
+                buffer.replace_charge(charge).is_ok()
+            }
+            CiphertextStorage::Registered { reservation, .. } => {
+                *reservation = charge;
+                true
+            }
+        };
+        assert!(replaced, "fixture charge must cover the buffer");
+    }
 }
+
+/// A buffer pool over fresh default-limit admission, for fixtures whose
+/// crypto never encrypts against another admission.
+#[cfg(test)]
+pub(crate) fn fixture_buffer_pool() -> BufferPool {
+    BufferPool::new(Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+        crate::test_support::cluster::config(false).limits,
+    ))))
+}
+
+/// Fixture AEAD output of `charge.amount()` bytes in unpooled aligned
+/// storage. The charge is topped up from `admission` to the buffer capacity.
+#[cfg(test)]
+pub(crate) fn fixture_encrypt_output(
+    admission: &flow_control::Quotas<AdmissionPolicy>,
+    mut charge: flow_control::Charge<AdmissionPolicy>,
+) -> Box<CiphertextBuffer> {
+    let alignment = default_disk_alignment();
+    let length = charge.amount();
+    let padded = padded_length(alignment, length).expect("fixture ciphertext length");
+    let capacity = unpooled_capacity(alignment, padded);
+    let extra = admission
+        .reserve(charge.key(), ResourceClass::Ciphertext, capacity - length)
+        .expect("fixture ciphertext admission");
+    assert!(charge.merge(extra).is_ok(), "fixture charge merge");
+    let mut buffer = page_alloc::buf::Buf::unpooled(padded, alignment.memory(), charge, false)
+        .expect("fixture buffer");
+    buffer.set_len(length).expect("fixture length");
+    Box::new(CiphertextBuffer { buffer, padded })
+}
+
+/// Fixture ciphertext storage: copies `bytes` into unpooled storage charged
+/// to `admission` under `key` for the full buffer capacity.
+#[cfg(test)]
+pub(crate) fn fixture_ciphertext_storage(
+    admission: &flow_control::Quotas<AdmissionPolicy>,
+    key: Option<&CacheId>,
+    bytes: &[u8],
+) -> CiphertextStorage {
+    let capacity = bytes
+        .len()
+        .max(1)
+        .next_multiple_of(page_alloc::buf::GRANULE);
+    let charge = admission
+        .reserve(key, ResourceClass::Ciphertext, capacity)
+        .expect("fixture ciphertext admission");
+    let mut buffer =
+        page_alloc::buf::Buf::unpooled(bytes.len(), 1, charge, false).expect("fixture buffer");
+    buffer.copy_from_slice(bytes);
+    CiphertextStorage::Slab {
+        buffer,
+        range: 0..bytes.len(),
+    }
+}
+
 impl BufferPool {
     /// Use the default 4 KiB disk alignment for aligned ciphertext.
     pub fn new(admission: Rc<flow_control::Quotas<AdmissionPolicy>>) -> Self {
@@ -348,46 +519,127 @@ impl BufferPool {
         admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
         alignment: page_alloc::Alignment,
     ) -> Self {
-        let budget = aligned_capacity(alignment, PAGE_BYTES as usize + 16)
-            .map_or(0, |page| page.saturating_mul(ALIGNED_POOL_IDLE_PAGES));
+        let disk = page_alloc::buf::Pool::new(
+            page_alloc::buf::PoolConfig {
+                alignment: alignment.memory(),
+                max_idle_per_class: POOL_IDLE_PER_CLASS,
+            },
+            flow_control::QuotaPoolAccount::new(admission.shared(), ResourceClass::Pool),
+        )
+        .expect("disk alignment is a valid pool alignment");
         Self {
             admission,
-            aligned: page_alloc::WorkerBufferPool::with_budget(alignment, budget),
+            alignment,
+            disk: Rc::new(std::cell::RefCell::new(disk)),
+            demand: Default::default(),
         }
     }
     /// Direct-I/O alignment of aligned ciphertext buffers from this worker.
+    #[cfg(test)]
     pub(crate) fn alignment(&self) -> page_alloc::Alignment {
-        self.aligned.alignment()
+        self.alignment
     }
-    /// Idle counters of this worker's aligned ciphertext pool.
+    /// Idle and trimming counters of this worker's pool. `bytes` is the
+    /// charged idle storage; `entries` is not tracked.
     #[cfg(test)]
-    pub(crate) fn aligned_stats(&self) -> page_alloc::SharedPoolStats {
-        self.aligned.stats()
+    pub(crate) fn pool_stats(&self) -> page_alloc::PoolStats {
+        let demand = self.demand.get();
+        page_alloc::PoolStats {
+            bytes: self.disk.borrow().idle_bytes(),
+            max_depth: POOL_IDLE_PER_CLASS,
+            trimmed: demand.trimmed,
+            constrained: demand.constrained,
+            ..Default::default()
+        }
     }
-    /// Demand counters of this worker's aligned ciphertext pool.
-    #[cfg(test)]
-    pub(crate) fn aligned_pool_stats(&self) -> page_alloc::PoolStats {
-        self.aligned.pool_stats()
-    }
-    /// Advance demand sizing of the aligned pool, releasing storage that stayed
-    /// idle. O(1) until the observation window elapses; returns bytes freed.
+    /// Release idle storage that went unused for a whole maintenance window:
+    /// half of what was idle when the window opened, provided nothing was
+    /// checked out since, or all of it while constrained. O(1) until
+    /// the window elapses; returns bytes released.
     pub(crate) fn maintain_idle_buffers(&self, now: std::time::Instant) -> usize {
-        self.aligned.maintain(now)
+        let mut demand = self.demand.get();
+        let Ok(mut pool) = self.disk.try_borrow_mut() else {
+            return 0;
+        };
+        let takes = pool.takes();
+        if demand.constrained {
+            let released = pool.shed(usize::MAX);
+            if released > 0 {
+                demand.trimmed = demand.trimmed.saturating_add(1);
+                self.demand.set(demand);
+            }
+            return released;
+        }
+        let Some(start) = demand.window_start else {
+            demand.window_start = Some(now);
+            demand.takes_at_start = takes;
+            demand.idle_at_start = pool.idle_bytes();
+            self.demand.set(demand);
+            return 0;
+        };
+        let mut released = 0;
+        if now.saturating_duration_since(start) >= page_alloc::DEFAULT_WINDOW {
+            // Only storage idle since the window started counts as unused.
+            let stale = pool.idle_bytes().min(demand.idle_at_start);
+            if takes == demand.takes_at_start && stale > 0 {
+                released = pool.shed(stale.div_ceil(2));
+            }
+            demand.window_start = Some(now);
+            demand.takes_at_start = takes;
+            demand.idle_at_start = pool.idle_bytes();
+        }
+        if released > 0 {
+            demand.trimmed = demand.trimmed.saturating_add(1);
+        }
+        self.demand.set(demand);
+        released
     }
-    /// Refuse aligned returns and release idle storage at the next maintenance
-    /// while memory is constrained.
+    /// Release idle storage now, and at every maintenance while memory is
+    /// constrained.
     pub(crate) fn constrain_idle_buffers(&self, constrained: bool) {
-        self.aligned.set_constrained(constrained);
+        let mut demand = self.demand.get();
+        demand.constrained = constrained;
+        self.demand.set(demand);
+        if constrained {
+            self.shed_disk_buffers();
+        }
     }
-    /// Release idle recycled storage: the flow-control recycler and this
-    /// worker's aligned pool, dropping the admission charges both retain.
+    /// Discard idle disk read storage (`MADV_DONTNEED`) and release its
+    /// [`ResourceClass::Pool`] charge. Returns the bytes released.
+    pub(crate) fn shed_disk_buffers(&self) -> usize {
+        self.disk
+            .try_borrow_mut()
+            .map_or(0, |mut pool| pool.shed(usize::MAX))
+    }
+    /// Idle bytes held by the disk read pool.
+    #[cfg(test)]
+    pub(crate) fn disk_idle_bytes(&self) -> usize {
+        self.disk.borrow().idle_bytes()
+    }
+    /// Check out a pooled disk read buffer of exactly `length` bytes. The
+    /// reservation must be a Ciphertext charge from this worker's admission
+    /// covering the pooled capacity; contents are unspecified until the read.
+    pub(crate) fn disk_buffer(
+        &self,
+        length: usize,
+        reservation: flow_control::Charge<AdmissionPolicy>,
+    ) -> Result<DiskBuffer> {
+        if !self.admission.owns(&reservation) {
+            return Err(Error::InvalidConfiguration);
+        }
+        Ok(self.disk.borrow_mut().take(length, reservation, false)?)
+    }
+    /// Capacity a pooled disk read of `length` bytes is charged for.
+    pub(crate) fn disk_capacity(&self, length: usize) -> Result<usize> {
+        Ok(self.disk.borrow().capacity_for(length)?)
+    }
+    /// Release this worker's idle pooled storage and the admission it retains.
     pub(crate) fn reclaim_idle_buffers(&self) {
-        self.admission.reclaim_buffers();
-        self.aligned.clear();
+        self.shed_disk_buffers();
     }
     /// Admission a pooled aligned buffer of `length` bytes must be charged for.
     pub(crate) fn aligned_capacity(&self, length: usize) -> Result<usize> {
-        aligned_capacity(self.alignment(), length)
+        self.disk_capacity(padded_length(self.alignment, length)?)
     }
     /// Check out aligned ciphertext storage for exactly `length` bytes.
     ///
@@ -403,58 +655,77 @@ impl BufferPool {
             return Err(Error::InvalidConfiguration);
         }
         reservation.validate(ResourceClass::Ciphertext, self.aligned_capacity(length)?)?;
-        self.aligned
-            .take(length, PoolCharge::Held(reservation))
-            .map(|buffer| CiphertextBuffer(Some(buffer)))
-            .map_err(Into::into)
+        let padded = padded_length(self.alignment, length)?;
+        let mut buffer = self.disk.borrow_mut().take(padded, reservation, false)?;
+        buffer.set_len(length)?;
+        Ok(CiphertextBuffer { buffer, padded })
     }
     /// Check out aligned storage for AEAD output, replacing an exact-length
-    /// reservation with one covering the pooled capacity when needed.
-    ///
-    /// `Ok(Err(reservation))` hands the original reservation back when the
-    /// larger charge is refused, so the caller can fall back to unaligned
-    /// output. `Err` means allocation failed after the charge was consumed.
-    pub(crate) fn encryption_output(
+    /// reservation with one covering the pooled capacity when needed. Fails
+    /// with the admission error when the larger charge is refused.
+    pub fn encryption_output(
         &self,
-        reservation: CiphertextCharge,
+        mut reservation: CiphertextCharge,
         length: usize,
-    ) -> Result<std::result::Result<CiphertextBuffer, CiphertextCharge>> {
-        let Ok(capacity) = self.aligned_capacity(length) else {
-            return Ok(Err(reservation));
+    ) -> Result<CiphertextBuffer> {
+        let capacity = self.aligned_capacity(length)?;
+        if !self.admission.owns(&reservation) {
+            return Err(Error::InvalidConfiguration);
+        }
+        reservation.validate(ResourceClass::Ciphertext, length)?;
+        self.top_up(&mut reservation, capacity)?;
+        self.aligned_ciphertext(reservation, length)
+    }
+    /// Grow `reservation` to at least `capacity` under its key, shedding idle
+    /// pooled buffers once if admission refuses.
+    fn top_up(&self, reservation: &mut CiphertextCharge, capacity: usize) -> Result<()> {
+        let Some(needed) = capacity
+            .checked_sub(reservation.amount())
+            .filter(|n| *n > 0)
+        else {
+            return Ok(());
         };
-        if !self.admission.owns(&reservation)
-            || reservation
-                .validate(ResourceClass::Ciphertext, length)
-                .is_err()
-        {
-            return Ok(Err(reservation));
-        }
-        if reservation.amount() >= capacity {
-            return self.aligned_ciphertext(reservation, length).map(Ok);
-        }
         let key = reservation.key().cloned();
-        let mut larger = self
+        let mut extra = self
             .admission
-            .reserve(key.as_ref(), ResourceClass::Ciphertext, capacity);
-        if larger.is_err() {
+            .reserve(key.as_ref(), ResourceClass::Ciphertext, needed);
+        if extra.is_err() {
             // Idle pooled buffers may be what pins this worker's admission.
-            self.aligned.clear();
-            larger = self
+            self.shed_disk_buffers();
+            extra = self
                 .admission
-                .reserve(key.as_ref(), ResourceClass::Ciphertext, capacity);
+                .reserve(key.as_ref(), ResourceClass::Ciphertext, needed);
         }
-        let Ok(larger) = larger else {
-            return Ok(Err(reservation));
-        };
-        drop(reservation);
-        self.aligned_ciphertext(larger, length).map(Ok)
+        reservation
+            .merge(extra?)
+            .map_err(|_| Error::InvalidConfiguration)
     }
     pub fn plaintext(
         &self,
         reservation: flow_control::Charge<AdmissionPolicy>,
         length: usize,
     ) -> Result<PlaintextBuffer> {
-        if length == 0 || length > PAGE_BYTES as usize {
+        if length == 0 {
+            return Err(Error::InvalidConfiguration);
+        }
+        self.plaintext_storage(reservation, length)
+            .map(PlaintextBuffer)
+    }
+    /// Bytes charged for pooled plaintext of `length` bytes: the 4 KiB
+    /// granule-rounded capacity the pool hands out.
+    pub(crate) fn plaintext_capacity(&self, length: usize) -> Result<usize> {
+        Ok(self.disk.borrow().capacity_for(length)?)
+    }
+    /// Check out pooled, wipe-on-return plaintext storage of exactly `length`
+    /// bytes. `reservation` must be an owned Plaintext charge for at least
+    /// `length`; it is topped up to the pooled capacity under the same key.
+    /// Contents are unspecified until the producer overwrites them.
+    pub fn plaintext_storage(
+        &self,
+        mut reservation: flow_control::Charge<AdmissionPolicy>,
+        length: usize,
+    ) -> Result<PlaintextBuf> {
+        if length > PAGE_BYTES as usize {
             return Err(Error::InvalidConfiguration);
         }
         self.validate_reservation(
@@ -463,17 +734,34 @@ impl BufferPool {
             length,
             reservation.key(),
         )?;
-        Ok(PlaintextBuffer(flow_control::ChargedBuffer::new(
-            reservation,
-            length,
-        )?))
+        let capacity = self.disk.borrow().capacity_for(length)?;
+        if reservation.amount() < capacity {
+            let extra = self.admission.reserve(
+                reservation.key(),
+                ResourceClass::Plaintext,
+                capacity - reservation.amount(),
+            )?;
+            reservation
+                .merge(extra)
+                .map_err(|_| Error::InvalidConfiguration)?;
+        } else {
+            reservation.shrink(capacity)?;
+        }
+        Ok(self
+            .disk
+            .borrow_mut()
+            .take(length, PlaintextCharge(reservation), true)?)
     }
+    /// Copy received ciphertext into pooled storage. `reservation` must be an owned
+    /// Ciphertext charge keyed to the page's cache covering at least
+    /// `bytes.len()`; it is topped up (or shrunk) to the pooled capacity.
     pub fn ciphertext(
         &self,
         mut reservation: flow_control::Charge<AdmissionPolicy>,
         envelope: PageEnvelope,
-        bytes: Vec<u8>,
+        bytes: impl AsRef<[u8]>,
     ) -> Result<CiphertextPage> {
+        let bytes = bytes.as_ref();
         envelope.validate()?;
         if bytes.len() != envelope.ciphertext_length as usize {
             return Err(Error::CorruptRecord);
@@ -481,26 +769,49 @@ impl BufferPool {
         self.validate_reservation(
             &reservation,
             ResourceClass::Ciphertext,
-            bytes.capacity(),
+            bytes.len(),
             Some(&envelope.page.version.object.cache),
         )?;
-        reservation.shrink(bytes.capacity())?;
+        let capacity = self.disk_capacity(bytes.len())?;
+        if reservation.amount() < capacity {
+            self.top_up(&mut reservation, capacity)?;
+        } else {
+            reservation.shrink(capacity)?;
+        }
+        let mut buffer = self.disk_buffer(bytes.len(), reservation)?;
+        buffer.copy_from_slice(bytes);
         Ok(CiphertextPage {
+            pinned: true,
             provenance: None,
             inner: Arc::new(CiphertextBytes {
-                checksum: std::sync::OnceLock::new(),
+                pins: Default::default(),
                 envelope,
-                storage: flow_control::ChargedBytes { bytes, reservation }.into(),
+                storage: CiphertextStorage::Slab {
+                    buffer,
+                    range: 0..bytes.len(),
+                },
             }),
         })
     }
     /// Wrap a received registered page without copying. The reservation
     /// covers exactly the received length, the page's visible capacity.
+    #[cfg(test)]
     pub(crate) fn registered_ciphertext(
         &self,
         reservation: flow_control::Charge<AdmissionPolicy>,
         envelope: PageEnvelope,
         page: rdma_verbs::RegisteredPage,
+    ) -> Result<CiphertextPage> {
+        self.registered_ciphertext_held(reservation, envelope, page, None)
+    }
+    /// [`Self::registered_ciphertext`] that records the buffer's hold time
+    /// with `hold` once the buffer returns to its pool.
+    pub(crate) fn registered_ciphertext_held(
+        &self,
+        reservation: flow_control::Charge<AdmissionPolicy>,
+        envelope: PageEnvelope,
+        page: rdma_verbs::RegisteredPage,
+        hold: Option<ReceiveHold>,
     ) -> Result<CiphertextPage> {
         envelope.validate()?;
         if page.len() != envelope.ciphertext_length as usize {
@@ -513,14 +824,16 @@ impl BufferPool {
             Some(&envelope.page.version.object.cache),
         )?;
         Ok(CiphertextPage {
+            pinned: true,
             provenance: None,
             inner: Arc::new(CiphertextBytes {
-                checksum: std::sync::OnceLock::new(),
+                pins: Default::default(),
                 envelope,
                 storage: CiphertextStorage::Registered {
                     page,
                     reservation,
                     retained: std::sync::OnceLock::new(),
+                    _hold: hold.map(Box::new),
                 },
             }),
         })
@@ -601,7 +914,7 @@ impl BufferPool {
         page.rehome(reservation)
     }
     /// Copy `page`'s bytes into a pooled aligned page, preserving its envelope,
-    /// known checksum, and provenance.
+    /// and provenance.
     fn copy_aligned(
         &self,
         page: &CiphertextPage,
@@ -609,26 +922,25 @@ impl BufferPool {
     ) -> Result<CiphertextPage> {
         let length = page.bytes().len();
         let mut buffer = self.aligned_ciphertext(reservation, length)?;
-        buffer.as_mut_slice().copy_from_slice(page.bytes());
-        let mut copy =
-            self.aligned_ciphertext_page(buffer, page.envelope().clone(), page.cached_checksum())?;
+        // The copy is next read by an O_DIRECT write or a peer send, not by
+        // this core, so stream it past the cache.
+        page_alloc::stream::copy_streaming(buffer.as_mut_slice(), page.bytes());
+        let mut copy = self.aligned_ciphertext_page(buffer, page.envelope().clone())?;
         copy.provenance = page.provenance;
         page.record_copy_out(&copy);
         Ok(copy)
     }
     pub(crate) fn slab_ciphertext(
         &self,
-        buffer: page_alloc::AlignedBuffer<flow_control::Charge<AdmissionPolicy>>,
+        buffer: DiskBuffer,
         envelope: PageEnvelope,
         range: std::ops::Range<usize>,
     ) -> Result<CiphertextPage> {
         envelope.validate()?;
-        if buffer.as_slice().get(range.clone()).is_none()
-            || range.len() != envelope.ciphertext_length as usize
+        if buffer.get(range.clone()).is_none() || range.len() != envelope.ciphertext_length as usize
         {
             return Err(Error::CorruptRecord);
         }
-        let buffer = buffer.freeze()?;
         self.validate_reservation(
             buffer.charge(),
             ResourceClass::Ciphertext,
@@ -638,9 +950,10 @@ impl BufferPool {
         // The read CQE has returned ownership. Freeze exposes no mutable bytes,
         // and the full padded allocation and charge outlive every ciphertext view.
         Ok(CiphertextPage {
+            pinned: true,
             provenance: None,
             inner: Arc::new(CiphertextBytes {
-                checksum: std::sync::OnceLock::new(),
+                pins: Default::default(),
                 envelope,
                 storage: CiphertextStorage::Slab { buffer, range },
             }),
@@ -652,13 +965,11 @@ impl BufferPool {
     /// Mirrors [`Self::ciphertext`]: the length must equal the envelope's
     /// ciphertext length, and the buffer's charge must be a Ciphertext
     /// reservation from this admission for the page's cache covering the full
-    /// capacity. Freezing zero-fills the pad. A known `checksum` is cached
-    /// eagerly; it must be the CRC-64 of the ciphertext bytes.
+    /// capacity. Freezing zero-fills the pad.
     pub(crate) fn aligned_ciphertext_page(
         &self,
         buffer: CiphertextBuffer,
         envelope: PageEnvelope,
-        checksum: Option<u64>,
     ) -> Result<CiphertextPage> {
         envelope.validate()?;
         let length = buffer.len();
@@ -671,7 +982,7 @@ impl BufferPool {
             buffer.capacity(),
             Some(&envelope.page.version.object.cache),
         )?;
-        Ok(CiphertextPage::from_aligned(buffer, envelope, checksum))
+        Ok(CiphertextPage::from_aligned(buffer, envelope))
     }
     fn entry_limit(&self) -> usize {
         self.admission.policy().limits().metadata_entries.get()
@@ -695,9 +1006,9 @@ impl BufferPool {
         page.validate_metadata()?;
         let cache = Some(&page.plaintext.page().version.object.cache);
         self.validate_reservation(
-            &page.plaintext.inner.reservation,
+            page.plaintext.inner.charge(),
             ResourceClass::Plaintext,
-            page.plaintext.inner.bytes.capacity(),
+            page.plaintext.inner.capacity(),
             cache,
         )?;
         self.validate_reservation(
@@ -734,6 +1045,10 @@ fn note_registered_copy_out() {
 pub(crate) fn registered_copy_outs() -> u64 {
     REGISTERED_COPY_OUTS.with(std::cell::Cell::get)
 }
+/// Capacity of an unpooled buffer of `padded` bytes at `alignment`.
+fn unpooled_capacity(alignment: page_alloc::Alignment, padded: usize) -> usize {
+    padded.next_multiple_of(alignment.memory().max(page_alloc::buf::GRANULE))
+}
 /// Bytes from the start of `length` through the next length-unit boundary.
 fn padded_length(alignment: page_alloc::Alignment, length: usize) -> Result<usize> {
     let unit = alignment.length();
@@ -742,27 +1057,55 @@ fn padded_length(alignment: page_alloc::Alignment, length: usize) -> Result<usiz
         .filter(|padded| length != 0 && *padded <= page_alloc::Alignment::MAX_TRANSFER_LENGTH)
         .ok_or(Error::InvalidConfiguration)
 }
-/// Capacity of the pooled size class holding `length` padded bytes.
-fn aligned_capacity(alignment: page_alloc::Alignment, length: usize) -> Result<usize> {
-    page_alloc::buffer_capacity(padded_length(alignment, length)?)
-        .ok_or(Error::InvalidConfiguration)
-}
 impl VerifiedPage {
     pub fn page(&self) -> &PageId {
         &self.inner.page
     }
     pub fn bytes(&self) -> &[u8] {
-        &self.inner.bytes
+        &self.inner.storage
     }
 }
 
 impl CiphertextPage {
+    /// Pinning handles on these bytes, including this one when it pins.
+    pub(crate) fn pins(&self) -> u32 {
+        self.inner.pins.get()
+    }
+    /// Whether this is the only pinning handle, so dropping it frees the
+    /// bytes unless an unpinned observer still holds them.
+    pub(crate) fn exclusive(&self) -> bool {
+        self.pins() == 1
+    }
+    /// An observer handle that keeps the bytes alive without pinning them.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "for telemetry and sampling observers")
+    )]
+    pub(crate) fn unpinned(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            provenance: self.provenance,
+            pinned: false,
+        }
+    }
     /// Rehome a completed receive before retaining it in another worker's cache.
     /// Admit the new charge first. Shared transport owners keep their original
     /// allocation and charge until fenced; only exclusive bytes can move in place.
-    pub(crate) fn rehome(
+    pub(crate) fn rehome(self, reservation: flow_control::Charge<AdmissionPolicy>) -> Result<Self> {
+        self.rehome_aligned_to(reservation, default_disk_alignment())
+    }
+    /// Charge a rehomed copy needs to land in zero-padded storage aligned for
+    /// `alignment`, so a disk write can use it without another copy.
+    pub(crate) fn rehome_capacity(&self, alignment: page_alloc::Alignment) -> Result<usize> {
+        padded_length(alignment, self.bytes().len())
+            .map(|padded| unpooled_capacity(alignment, padded))
+    }
+    /// [`Self::rehome`], copying into storage aligned for `alignment` (the
+    /// device's) when `reservation` covers [`Self::rehome_capacity`].
+    pub(crate) fn rehome_aligned_to(
         mut self,
         reservation: flow_control::Charge<AdmissionPolicy>,
+        alignment: page_alloc::Alignment,
     ) -> Result<Self> {
         reservation.validate(ResourceClass::Ciphertext, self.inner.capacity())?;
         if reservation.key() != Some(&self.envelope().page.version.object.cache) {
@@ -773,43 +1116,51 @@ impl CiphertextPage {
             && let Some(inner) = Arc::get_mut(&mut self.inner)
         {
             match &mut inner.storage {
-                CiphertextStorage::Owned(storage) => storage.reservation = reservation,
-                CiphertextStorage::Slab { buffer, .. } => buffer.rebind(reservation)?,
-                CiphertextStorage::Aligned { buffer, .. } => buffer.rebind(reservation)?,
+                CiphertextStorage::Slab { buffer, .. } => {
+                    buffer
+                        .replace_charge(reservation)
+                        .map_err(|_| Error::from(page_alloc::Error::InvalidConfiguration))?;
+                }
+                CiphertextStorage::Aligned { buffer, .. } => {
+                    buffer
+                        .replace_charge(reservation)
+                        .map_err(|_| Error::from(page_alloc::Error::InvalidConfiguration))?;
+                }
                 CiphertextStorage::Registered { .. } => unreachable!(),
             }
             return Ok(self);
         }
         let length = self.bytes().len();
-        let alignment = default_disk_alignment();
         // Prefer a zero-padded aligned copy the store can write without
-        // another copy; fall back to a Vec when the charge only covers the
-        // exact length.
+        // another copy; otherwise copy into unaligned storage the charge covers.
         let copy = if let Ok(padded) = padded_length(alignment, length)
-            && reservation.amount() >= padded
+            && reservation.amount() >= unpooled_capacity(alignment, padded)
         {
-            let mut buffer = alignment.allocate(padded, PoolCharge::Held(reservation))?;
             // Fresh allocations are zeroed, so the pad past `length` stays zero.
-            buffer.as_mut_slice()[..length].copy_from_slice(self.bytes());
+            let mut buffer =
+                page_alloc::buf::Buf::unpooled(padded, alignment.memory(), reservation, false)?;
+            buffer[..length].copy_from_slice(self.bytes());
             Self {
+                pinned: true,
                 inner: Arc::new(CiphertextBytes {
-                    checksum: self.inner.checksum.clone(),
+                    pins: Default::default(),
                     envelope: self.envelope().clone(),
-                    storage: CiphertextStorage::Aligned {
-                        buffer: AlignedBody(buffer.freeze()?),
-                        length,
-                    },
+                    storage: CiphertextStorage::Aligned { buffer, length },
                 }),
                 provenance: self.provenance,
             }
         } else {
-            let mut bytes = reservation.buffer(length)?;
-            bytes.copy_from_slice(self.bytes());
+            let mut buffer = page_alloc::buf::Buf::unpooled(length, 1, reservation, false)?;
+            buffer.copy_from_slice(self.bytes());
             Self {
+                pinned: true,
                 inner: Arc::new(CiphertextBytes {
-                    checksum: self.inner.checksum.clone(),
+                    pins: Default::default(),
                     envelope: self.envelope().clone(),
-                    storage: flow_control::ChargedBytes { bytes, reservation }.into(),
+                    storage: CiphertextStorage::Slab {
+                        buffer,
+                        range: 0..length,
+                    },
                 }),
                 provenance: self.provenance,
             }
@@ -840,67 +1191,26 @@ impl CiphertextPage {
         }
     }
     /// Freeze aligned output into a page. Callers have validated the length
-    /// against `envelope` and the buffer's Ciphertext charge; a `checksum`
-    /// must be the CRC-64 of the ciphertext.
-    pub(crate) fn from_aligned(
-        buffer: CiphertextBuffer,
-        envelope: PageEnvelope,
-        checksum: Option<u64>,
-    ) -> Self {
-        let length = buffer.len();
+    /// against `envelope` and the buffer's Ciphertext charge.
+    pub(crate) fn from_aligned(buffer: CiphertextBuffer, envelope: PageEnvelope) -> Self {
+        let (buffer, length) = buffer.freeze();
         Self {
+            pinned: true,
             provenance: None,
             inner: Arc::new(CiphertextBytes {
-                checksum: checksum.map_or_else(std::sync::OnceLock::new, Into::into),
+                pins: Default::default(),
                 envelope,
-                storage: CiphertextStorage::Aligned {
-                    buffer: buffer.freeze(),
-                    length,
-                },
+                storage: CiphertextStorage::Aligned { buffer, length },
             }),
         }
-    }
-    pub fn checksum(&self) -> u64 {
-        *self
-            .inner
-            .checksum
-            .get_or_init(|| racer_crypto::crc64(self.bytes()))
-    }
-    /// Never initializes a checksum or scans bytes on the I/O thread.
-    pub(crate) fn cached_checksum(&self) -> Option<u64> {
-        self.inner.checksum.get().copied()
-    }
-    pub(crate) fn verify_checksum(&self) -> Result<()> {
-        self.verify_computed_checksum(racer_crypto::crc64(self.bytes()))
-    }
-    /// Verify a checksum the caller computed over exactly [`Self::bytes`],
-    /// with the same effect as [`Self::verify_checksum`].
-    pub(crate) fn verify_computed_checksum(&self, actual: u64) -> Result<()> {
-        if self
-            .inner
-            .checksum
-            .get()
-            .is_some_and(|expected| *expected != actual)
-        {
-            return Err(Error::CorruptRecord);
-        }
-        let _ = self.inner.checksum.set(actual);
-        Ok(())
-    }
-    pub(crate) fn expected_checksum(&self, checksum: u64) -> Result<()> {
-        self.inner
-            .checksum
-            .set(checksum)
-            .map_err(|_| Error::CorruptRecord)
     }
     pub fn envelope(&self) -> &PageEnvelope {
         &self.inner.envelope
     }
     pub fn bytes(&self) -> &[u8] {
         match &self.inner.storage {
-            CiphertextStorage::Owned(storage) => &storage.bytes,
-            CiphertextStorage::Slab { buffer, range } => &buffer.as_slice()[range.clone()],
-            CiphertextStorage::Aligned { buffer, length } => &buffer.as_slice()[..*length],
+            CiphertextStorage::Slab { buffer, range } => &buffer[range.clone()],
+            CiphertextStorage::Aligned { buffer, length } => &buffer[..*length],
             CiphertextStorage::Registered { page, .. } => page.bytes(),
         }
     }
@@ -916,7 +1226,7 @@ impl CiphertextPage {
         let CiphertextStorage::Aligned { buffer, .. } = &self.inner.storage else {
             return None;
         };
-        let padded = buffer.padded_slice();
+        let padded: &[u8] = buffer;
         ((padded.as_ptr() as usize).is_multiple_of(alignment.memory())
             && padded.len().is_multiple_of(alignment.length()))
         .then_some(padded)
@@ -932,9 +1242,8 @@ impl CiphertextPage {
     }
 }
 // SAFETY: shared ciphertext backing is immutable and retained by the owner.
-unsafe impl uring_runtime::reactor::SendBuffer for CiphertextPage {
-    type Error = Error;
-    fn send_bytes(&self) -> Result<&[u8]> {
+unsafe impl racer_io::ring::SendBuffer for CiphertextPage {
+    fn send_bytes(&self) -> racer_io::Result<&[u8]> {
         Ok(self.bytes())
     }
 }
@@ -1182,6 +1491,20 @@ pub struct MemoryCache {
     pressure_cursor: RefCell<Option<CacheId>>,
     availability: Rc<crate::control::Availability>,
     expiry: RefCell<racer_core::cache::Expiry>,
+    key_sweep: RefCell<KeySweep>,
+    /// Evict idle entries on publish to keep in-flight ciphertext headroom.
+    headroom: bool,
+}
+
+/// Progress of a bounded pass that drops entries whose page key the node no
+/// longer holds. A pass starts whenever the keyring generation changes and
+/// walks each table in recency order; entries touched during the pass move
+/// past the cursor and are still visited.
+#[derive(Default)]
+struct KeySweep {
+    generation: Option<u64>,
+    verified: Option<u64>,
+    ciphertext: Option<u64>,
 }
 
 impl MemoryCache {
@@ -1203,7 +1526,16 @@ impl MemoryCache {
             pressure_cursor: RefCell::new(None),
             availability,
             expiry: RefCell::new(racer_core::cache::Expiry::default()),
+            key_sweep: RefCell::default(),
+            headroom: true,
         }
+    }
+    /// Let retained entries fill the whole ciphertext share, for tests of
+    /// reclaim under a full cache.
+    #[cfg(test)]
+    pub(crate) fn without_headroom(mut self) -> Self {
+        self.headroom = false;
+        self
     }
     /// Published cache admission and modes shared with the read path.
     pub(crate) fn availability(&self) -> &Rc<crate::control::Availability> {
@@ -1301,8 +1633,41 @@ impl MemoryCache {
         if entries.len() + self.entries.borrow().len() >= self.pool.entry_limit() {
             return Err(Error::Overloaded);
         }
+        let cache = id.version.object.cache.clone();
         entries.insert(id.clone(), page);
+        drop(entries);
+        self.keep_headroom(&cache);
         Ok(())
+    }
+    /// Evict idle entries so `cache` can still admit one range window of
+    /// ciphertext. Retained entries keep their Ciphertext charge, so a full
+    /// cache would otherwise leave no room for in-flight fills, disk reads,
+    /// hedges, or relays, and admission sites that do not reclaim would fail
+    /// `Overloaded`. Pinned entries are never evicted, so the reserve is best
+    /// effort. Skipped when the window exceeds a quarter of the cache's fair
+    /// share, where it would cost more retention than it protects.
+    fn keep_headroom(&self, cache: &CacheId) {
+        use flow_control::Policy as _;
+        if !self.headroom {
+            return;
+        }
+        let class = ResourceClass::Ciphertext;
+        let admission = &self.pool.admission;
+        let reserve = admission.policy().progress(class);
+        if reserve > admission.fair_limit(cache, class) / 4 {
+            return;
+        }
+        let Some((owner, bytes)) = admission.reclamation(cache, class, reserve) else {
+            return;
+        };
+        self.reclaim(
+            class,
+            owner.as_ref(),
+            bytes,
+            |cache| admission.excess(cache, class),
+            |_, _| 0,
+            |_, _| 0,
+        );
     }
     pub(crate) fn invalidate_ciphertext(&self, page: &UnverifiedPage) {
         let id = &page.copy.ciphertext.envelope().page;
@@ -1384,7 +1749,7 @@ impl MemoryCache {
         }
         if let Some((_, entry)) = entries.pages.get_mut(id) {
             match entry.plaintext.upgrade() {
-                Some(live) if live.bytes != page.plaintext.inner.bytes => {
+                Some(live) if live.storage[..] != page.plaintext.inner.storage[..] => {
                     return Err(Error::CorruptRecord);
                 }
                 Some(_) => {}
@@ -1400,7 +1765,11 @@ impl MemoryCache {
             let id = entries.victim(idle).ok_or(Error::Overloaded)?;
             entries.remove(&id);
         }
-        entries.insert(page)
+        let cache = page.metadata.version.object.cache.clone();
+        entries.insert(page)?;
+        drop(entries);
+        self.keep_headroom(&cache);
+        Ok(())
     }
     pub(crate) fn metadata(&self, version: &ObjectVersion) -> Result<Option<VersionMetadata>> {
         if self.availability.passthrough(&version.object.cache) {
@@ -1437,6 +1806,13 @@ impl MemoryCache {
     /// Busy ciphertext protects a retained page; live plaintext does not, since
     /// the cache holds it only weakly.
     pub fn evict_idle(&self, bytes: usize) -> Result<usize> {
+        let released = self.evict_idle_entries(bytes)?;
+        self.pool.reclaim_buffers();
+        Ok(released)
+    }
+    /// Like [`Self::evict_idle`], but keeps idle pooled buffers so later
+    /// reads reuse them instead of allocating.
+    pub fn evict_idle_entries(&self, bytes: usize) -> Result<usize> {
         let mut released = self.reclaim_ciphertext(None, bytes);
         let mut entries = self.entries.borrow_mut();
         let mut versions = Vec::new();
@@ -1454,7 +1830,6 @@ impl MemoryCache {
         for id in versions {
             entries.forget_version(&id);
         }
-        self.pool.reclaim_buffers();
         Ok(released)
     }
     /// One bounded LRU pass over ciphertext. The callback may release a queued
@@ -1496,6 +1871,33 @@ impl MemoryCache {
         }
         released
     }
+    /// Retained ciphertext bytes split into idle entries, entries pinned only
+    /// by a queued disk write (`writer_only`), and entries pinned by any other
+    /// owner. Walks every entry, so call it at a sampling interval.
+    pub(crate) fn ciphertext_held(
+        &self,
+        writer_only: impl Fn(&PageId, &CiphertextPage) -> bool,
+    ) -> (usize, usize, usize) {
+        let (mut idle, mut pinned, mut writer) = (0usize, 0usize, 0usize);
+        let mut count = |id: &PageId, page: &CiphertextPage| {
+            let bytes = page.inner.reservation().amount();
+            let slot = if page.exclusive() {
+                &mut idle
+            } else if writer_only(id, page) {
+                &mut writer
+            } else {
+                &mut pinned
+            };
+            *slot = slot.saturating_add(bytes);
+        };
+        for (id, (_, entry)) in &self.entries.borrow().pages {
+            count(id, &entry.ciphertext);
+        }
+        for (id, entry) in self.ciphertext_entries.borrow().iter() {
+            count(id, &entry.copy.ciphertext);
+        }
+        (idle, pinned, writer)
+    }
     #[cfg(any(test, feature = "subscription-interop"))]
     pub(crate) fn remove_cache(&self, cache: &CacheId) -> Result<()> {
         self.remove_caches(&std::collections::HashSet::from([cache.clone()]))
@@ -1521,8 +1923,51 @@ impl MemoryCache {
         }
         Ok(())
     }
-    /// Release entries not inserted or hit for at least `racer_core::cache::IDLE_TTL`,
-    /// skipping any still referenced elsewhere (retried on the next pass).
+    /// Drop at most `budget` examined entries per table whose cache or page
+    /// key is no longer admitted. Idle until the keyring generation changes,
+    /// then resumes each call until both tables have been walked once.
+    /// Returns the number of entries removed.
+    pub(crate) fn sweep_unavailable(&self, budget: usize) -> usize {
+        let mut sweep = self.key_sweep.borrow_mut();
+        let generation = self.availability.key_generation();
+        if generation != sweep.generation {
+            *sweep = KeySweep {
+                generation,
+                verified: Some(0),
+                ciphertext: Some(0),
+            };
+        }
+        let mut removed = 0;
+        if let Some(after) = sweep.verified {
+            let mut entries = self.entries.borrow_mut();
+            let (selected, next) = entries.expiring(after, u64::MAX, budget);
+            sweep.verified = next;
+            for (_, id) in selected {
+                if !self.available(&entries.pages[&id].1) {
+                    entries.remove(&id);
+                    removed += 1;
+                }
+            }
+        }
+        if let Some(after) = sweep.ciphertext {
+            let mut entries = self.ciphertext_entries.borrow_mut();
+            let (selected, next) = entries.expiring(after, u64::MAX, budget);
+            sweep.ciphertext = next;
+            for (_, id) in selected {
+                let cache = &id.version.object.cache;
+                let key = entries[&id].copy.ciphertext.envelope().key_id;
+                if self.availability.passthrough(cache) || !self.availability.page(cache, key) {
+                    entries.remove(&id);
+                    removed += 1;
+                }
+            }
+        }
+        removed
+    }
+    /// Release entries not inserted or hit for at least `racer_core::cache::IDLE_TTL`.
+    /// Workers call this only under memory pressure; otherwise entries stay
+    /// until reclaim needs their space. Skips any still referenced elsewhere
+    /// (retried on the next pass).
     /// Examines at most `racer_core::cache::EXPIRY_BATCH` entries per class per call and
     /// returns the number of entries released. Freed buffers return to the
     /// pools, whose own maintenance decays them.
@@ -1554,7 +1999,7 @@ impl MemoryCache {
                 entries.expiring(after, ciphertext_cutoff, racer_core::cache::EXPIRY_BATCH);
             expiry.ciphertext = next;
             for (_, id) in selected {
-                if Arc::strong_count(&entries[&id].copy.ciphertext.inner) == 1 {
+                if entries[&id].copy.ciphertext.exclusive() {
                     entries.remove(&id);
                     released += 1;
                 }
@@ -1666,7 +2111,7 @@ impl MemoryCache {
                     break;
                 }
                 entries.lanes.advance(cache, tick);
-                if Arc::strong_count(&entries[&id].copy.ciphertext.inner) != 1 {
+                if !entries[&id].copy.ciphertext.exclusive() {
                     continue;
                 }
                 if let Some(entry) = entries.remove(&id) {
@@ -1718,7 +2163,7 @@ impl MemoryCache {
             }
             *self.ciphertext_cursor.borrow_mut() = Some(id.clone());
             if cache.is_some_and(|c| c != &id.version.object.cache)
-                || Arc::strong_count(&entries[&id].copy.ciphertext.inner) != 1
+                || !entries[&id].copy.ciphertext.exclusive()
             {
                 continue;
             }
@@ -1729,9 +2174,9 @@ impl MemoryCache {
         released
     }
 }
-/// No owner outside the cache shares the retained ciphertext.
+/// No pinning handle outside the cache shares the retained ciphertext.
 fn idle(entry: &CachedPage) -> bool {
-    Arc::strong_count(&entry.ciphertext.inner) == 1
+    entry.ciphertext.exclusive()
 }
 
 #[cfg(test)]
@@ -1740,10 +2185,11 @@ pub(crate) mod tests {
     use crate::model::Nonce;
     use crate::model::PageNumber;
     use crate::model::VersionMetadata;
-    use uring_runtime::reactor::IoBuffer;
+    use racer_io::ring::IoBuffer;
     /// Owner and reclamation contracts over real allocations.
     mod owners {
         use super::*;
+        use crate::lifecycle::Service;
         use crate::model::CacheKey;
         use crate::model::ObjectId;
         use crate::model::RequestId;
@@ -1759,10 +2205,10 @@ pub(crate) mod tests {
         use std::task::Context;
         use std::time::Duration;
         use std::time::Instant;
-        use uring_runtime::group::Service;
 
         const PLAIN: usize = PAGE_BYTES as usize;
-        const CIPHER: usize = PLAIN + 16;
+        /// Pooled ciphertext charge for one full page: its tag rounds up a granule.
+        const CIPHER: usize = PLAIN + page_alloc::buf::GRANULE;
 
         fn admission(pages: usize, dirty: usize) -> Rc<flow_control::Quotas<AdmissionPolicy>> {
             let mut limits = crate::test_support::cluster::config(false).limits;
@@ -1806,22 +2252,19 @@ pub(crate) mod tests {
             let pool = BufferPool::new(admission.clone());
             let mut plaintext = pool.plaintext(reserved.plaintext, length).unwrap();
             plaintext.bytes_mut().unwrap().fill(7);
-            let (bytes, reservation) = plaintext.into_parts();
             // Structural fixture only: production allocation and owner layout, not an
             // authentication oracle (security/aead.rs performs this transfer).
             let plaintext = VerifiedPage {
                 inner: Arc::new(VerifiedBytes {
                     page: id.clone(),
-                    storage: flow_control::ChargedBytes {
-                        bytes: bytes.into_vec(),
-                        reservation,
-                    },
+                    storage: plaintext.into_buf(),
                 }),
             };
             let ciphertext = pool
                 .ciphertext(
                     reserved.ciphertext,
                     PageEnvelope {
+                        page_size: racer_wire::object::PageSize::DEFAULT,
                         cipher: crate::model::PageCipher::Xaes256Gcm,
                         page: id,
                         key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
@@ -1840,7 +2283,6 @@ pub(crate) mod tests {
         }
 
         fn occupancy(admission: &flow_control::Quotas<AdmissionPolicy>) -> [usize; 3] {
-            admission.reclaim_buffers();
             [
                 ResourceClass::Plaintext,
                 ResourceClass::Ciphertext,
@@ -1854,11 +2296,12 @@ pub(crate) mod tests {
         /// ciphertext; lookup removal is not a completion fence.
         #[test]
         fn duplicate_owners_charge_once_until_each_last_owner() {
+            let env = racer_io::Env::host();
             let real = admission(2, CIPHER);
             let cache = CacheId(crate::test_support::security::CACHE.into());
             let memory = MemoryCache::new(
                 BufferPool::new(real.clone()),
-                crate::test_support::availability(),
+                crate::test_support::availability(&env),
             );
             let page = allocated_page(&real, &cache, "v1", PLAIN);
             let id = page.plaintext.page().clone();
@@ -1897,13 +2340,14 @@ pub(crate) mod tests {
         /// by the cache, which holds plaintext weakly.
         #[test]
         fn fair_reclamation_keeps_other_cache() {
+            let env = racer_io::Env::host();
             for class in [ResourceClass::Plaintext, ResourceClass::Ciphertext] {
                 let real = admission(4, CIPHER);
                 let a = CacheId(crate::test_support::security::CACHE.into());
                 let b = CacheId("44444444-4444-4444-8444-444444444444".into());
                 let memory = MemoryCache::new(
                     BufferPool::new(real.clone()),
-                    crate::test_support::availability_for(vec![a.clone(), b.clone()]),
+                    crate::test_support::availability_for(&env, vec![a.clone(), b.clone()]),
                 );
                 let mut ids = Vec::new();
                 for (cache, version) in [(&b, "other"), (&a, "old"), (&a, "new")] {
@@ -1954,7 +2398,7 @@ pub(crate) mod tests {
         }
 
         fn scope() -> RequestScope {
-            RequestScope::new(
+            RequestScope::host(
                 RequestId([1; 16]),
                 Instant::now() + Duration::from_secs(600),
             )
@@ -1966,6 +2410,7 @@ pub(crate) mod tests {
         /// after admission stops.
         #[test]
         fn canceled_crypto_holds_owners_until_completion_reap() {
+            let env = racer_io::Env::host();
             let real = admission(1, CIPHER);
             let cache = CacheId(crate::test_support::security::CACHE.into());
             let reserved = crate::admission::reserve_fill(&real, &cache, false).unwrap();
@@ -1974,13 +2419,18 @@ pub(crate) mod tests {
             let (port, engine_port) = security::pair(WorkerId(0), 0, NonZeroUsize::new(1).unwrap());
             let client = Rc::new(CryptoClient::new(port));
             let crypto = PageCrypto::new(
-                Rc::new(crate::test_support::security::keys()),
+                Rc::new(crate::test_support::security::keys(&env)),
                 client.clone(),
+                buffers.clone(),
             );
-            let mut engine = PageCryptoEngine::new(CryptoRuntime { port: engine_port });
+            let mut engine = PageCryptoEngine::new(CryptoRuntime {
+                port: engine_port,
+                ctx: racer_io::WorkerCtx::host(),
+            });
             let scope = scope();
             let mut work = crypto.encrypt(
                 page_id(&descriptor(&cache, "v1", 3)),
+                racer_wire::object::PageSize::DEFAULT,
                 plaintext,
                 reserved.ciphertext,
                 &scope,
@@ -1988,20 +2438,26 @@ pub(crate) mod tests {
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
             assert!(work.as_mut().poll(&mut cx).is_pending());
             assert_eq!(client.outstanding(), 1);
-            assert_eq!(occupancy(&real), [3, CIPHER, 0], "accepted crypto");
+            assert_eq!(occupancy(&real), [4096, PLAIN + 16, 0], "accepted crypto");
             scope.cancel().unwrap();
             assert!(work.as_mut().poll(&mut cx).is_pending());
             drop(work);
             real.stop();
             client.poll_budgeted(1).unwrap();
-            assert_eq!(occupancy(&real), [3, CIPHER, 0], "canceled caller");
+            assert_eq!(occupancy(&real), [4096, PLAIN + 16, 0], "canceled caller");
             assert_eq!(client.outstanding(), 1);
             engine.poll_budgeted(&mut cx, 1).unwrap();
-            assert_eq!(occupancy(&real), [3, CIPHER, 0], "published, not reaped");
+            assert_eq!(
+                occupancy(&real),
+                [4096, PLAIN + 16, 0],
+                "published, not reaped"
+            );
             assert_eq!(client.outstanding(), 1);
             client.poll_budgeted(1).unwrap();
             assert_eq!(client.outstanding(), 0);
             assert_eq!(occupancy(&real), [0, 0, 0], "reaped");
+            // Reaped plaintext returns to the worker pool as idle Pool bytes.
+            buffers.reclaim_idle_buffers();
             assert!(
                 ResourceClass::ALL
                     .iter()
@@ -2017,6 +2473,7 @@ pub(crate) mod tests {
         #[ignore = "deterministic cache refill trace experiment"]
         fn reclaim_trace_experiment() {
             use sha2::{Digest, Sha256};
+            let env = racer_io::Env::host();
             const WARMUP: usize = 2048;
             const MEASURE: usize = 20000;
             let cache_id = CacheId(crate::test_support::security::CACHE.into());
@@ -2037,7 +2494,7 @@ pub(crate) mod tests {
                 limits.metadata_entries = std::num::NonZeroUsize::new(512).unwrap();
                 let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
                 let pool = BufferPool::new(admission.clone());
-                let cache = MemoryCache::new(pool.clone(), crate::test_support::availability());
+                let cache = MemoryCache::new(pool.clone(), crate::test_support::availability(&env));
                 let mut random = 0x6a09_e667_f3bc_c909u64;
                 let mut hash = Sha256::new();
                 let mut hits = 0;
@@ -2100,20 +2557,22 @@ pub(crate) mod tests {
                                 Err(error) => panic!("unexpected admission error: {error:?}"),
                             };
                         let cipher_charge = reserve(ResourceClass::Ciphertext, 24);
-                        let plain_charge = reserve(ResourceClass::Plaintext, 8);
+                        let plain_charge =
+                            reserve(ResourceClass::Plaintext, page_alloc::buf::GRANULE);
                         let plaintext = VerifiedPage {
                             inner: Arc::new(VerifiedBytes {
                                 page: page.clone(),
-                                storage: flow_control::ChargedBytes {
-                                    bytes: (rank as u64).to_le_bytes().to_vec(),
-                                    reservation: plain_charge,
-                                },
+                                storage: crate::memory::fixture_storage(
+                                    plain_charge,
+                                    &(rank as u64).to_le_bytes(),
+                                ),
                             }),
                         };
                         let ciphertext = pool
                             .ciphertext(
                                 cipher_charge,
                                 PageEnvelope {
+                                    page_size: racer_wire::object::PageSize::DEFAULT,
                                     cipher: crate::model::PageCipher::Xaes256Gcm,
                                     page,
                                     key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
@@ -2144,7 +2603,6 @@ pub(crate) mod tests {
                 }
                 assert_eq!(hits + refills, MEASURE);
                 cache.evict_idle(usize::MAX).unwrap();
-                admission.reclaim_buffers();
                 assert!(cache.entries.borrow().pages.is_empty());
                 assert_eq!(admission.used(ResourceClass::Plaintext), 0);
                 assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
@@ -2190,7 +2648,8 @@ pub(crate) mod tests {
                 use super::*;
                 use std::cell::Cell;
 
-                const CIPHER: usize = 19;
+                /// Pooled charge for one 19-byte fixture ciphertext.
+                const CIPHER: usize = page_alloc::buf::GRANULE;
 
                 /// Published cache IDs are UUIDs; derive a stable one per name.
                 fn id(cache: &str) -> CacheId {
@@ -2200,10 +2659,11 @@ pub(crate) mod tests {
                     CacheId(format!("{hash:08x}-4444-4444-8444-444444444444"))
                 }
 
-                fn memory(caches: &[&str], entries: usize) -> MemoryCache {
+                fn memory(env: &racer_io::Env, caches: &[&str], entries: usize) -> MemoryCache {
                     MemoryCache::new(
                         BufferPool::new(admission(entries)),
                         crate::test_support::availability_for(
+                            env,
                             caches.iter().map(|cache| id(cache)).collect(),
                         ),
                     )
@@ -2308,9 +2768,74 @@ pub(crate) mod tests {
                     }
                 }
 
+                /// A peer receive against a ciphertext share full of cache
+                /// entries reclaims idle entries before failing, and still
+                /// fails `Overloaded` without evicting when every entry is busy.
+                #[test]
+                fn peer_receive_reclaims_idle_cache_before_overloaded() {
+                    let env = racer_io::Env::host();
+                    let mut limits = crate::test_support::cluster::config(false).limits;
+                    limits.metadata_entries = std::num::NonZeroUsize::new(100).unwrap();
+                    limits.ciphertext_bytes = std::num::NonZeroUsize::new(4 * CIPHER).unwrap();
+                    let admission =
+                        Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
+                    let cache = MemoryCache::new(
+                        BufferPool::new(admission.clone()),
+                        crate::test_support::availability_for(&env, vec![id("a")]),
+                    );
+                    let pages: Vec<_> = (0..4)
+                        .map(|i| verified_in(&cache, "a", &format!("p{i}")))
+                        .collect();
+                    assert_eq!(admission.used(ResourceClass::Ciphertext), 4 * CIPHER);
+                    // The same policy production wires into `Transfers`.
+                    let reclaim = |owner: &CacheId, amount: usize| {
+                        let class = ResourceClass::Ciphertext;
+                        for _ in 0..2 {
+                            let Some((owner, bytes)) = admission.reclamation(owner, class, amount)
+                            else {
+                                break;
+                            };
+                            cache.reclaim(
+                                class,
+                                owner.as_ref(),
+                                bytes,
+                                |cache| admission.excess(cache, class),
+                                |_, _| 0,
+                                |_, _| 0,
+                            );
+                        }
+                    };
+                    let receive = |reclaim: Option<&crate::peer::transport::Reclaim<'_>>| {
+                        crate::peer::transport::reserve_ciphertext(
+                            &admission,
+                            reclaim,
+                            &id("a"),
+                            CIPHER,
+                        )
+                    };
+                    // Without reclamation the full share rejects the receive.
+                    assert_eq!(receive(None).err(), Some(Error::Overloaded));
+                    // Readers hold every entry: nothing is evicted.
+                    let readers: Vec<_> = pages
+                        .iter()
+                        .map(|page| cache.ciphertext(page).unwrap().unwrap())
+                        .collect();
+                    assert_eq!(receive(Some(&reclaim)).err(), Some(Error::Overloaded));
+                    assert_eq!(resident(&cache, "a"), 4);
+                    assert_eq!(admission.used(ResourceClass::Ciphertext), 4 * CIPHER);
+                    // Idle entries yield to the in-flight receive.
+                    drop(readers);
+                    let charge = receive(Some(&reclaim)).unwrap();
+                    assert_eq!(charge.amount(), CIPHER);
+                    assert!(resident(&cache, "a") < 4);
+                    assert!(admission.used(ResourceClass::Ciphertext) <= 4 * CIPHER);
+                    assert_lanes(&cache);
+                }
+
                 #[test]
                 fn global_reclaim_prefers_over_share_cache_after_live_reweight() {
-                    let cache = memory(&["low", "high"], 1000);
+                    let env = racer_io::Env::host();
+                    let cache = memory(&env, &["low", "high"], 1000);
                     let admission = cache.pool.admission.clone();
                     // High pages are oldest, so an unweighted pass picks them first.
                     let high: Vec<_> = (0..20)
@@ -2366,7 +2891,8 @@ pub(crate) mod tests {
 
                 #[test]
                 fn busy_over_share_pages_survive_and_fallback_releases_idle_bytes() {
-                    let cache = memory(&["low", "high"], 100);
+                    let env = racer_io::Env::host();
+                    let cache = memory(&env, &["low", "high"], 100);
                     let high = verified_in(&cache, "high", "h");
                     let low: Vec<_> = (0..3)
                         .map(|i| verified_in(&cache, "low", &format!("l{i}")))
@@ -2423,7 +2949,8 @@ pub(crate) mod tests {
 
                 #[test]
                 fn reclaim_credits_queued_and_writer_bytes() {
-                    let cache = memory(&["low", "high"], 100);
+                    let env = racer_io::Env::host();
+                    let cache = memory(&env, &["low", "high"], 100);
                     let low = verified_in(&cache, "low", "l");
                     // A queued writer shares the page, so it is not idle.
                     let copy = cache.ciphertext(&low).unwrap().unwrap();
@@ -2470,7 +2997,8 @@ pub(crate) mod tests {
 
                 #[test]
                 fn plaintext_pressure_releases_nothing() {
-                    let cache = memory(&["low"], 100);
+                    let env = racer_io::Env::host();
+                    let cache = memory(&env, &["low"], 100);
                     verified_in(&cache, "low", "l");
                     unverified_in(&cache, "low", "u");
                     for owner in [None, Some(&id("low"))] {
@@ -2492,7 +3020,8 @@ pub(crate) mod tests {
 
                 #[test]
                 fn lanes_track_insert_touch_remove_and_cache_removal() {
-                    let cache = memory(&["a", "b", "c"], 100);
+                    let env = racer_io::Env::host();
+                    let cache = memory(&env, &["a", "b", "c"], 100);
                     let a = verified_in(&cache, "a", "a0");
                     let b = unverified_in(&cache, "b", "b0");
                     verified_in(&cache, "c", "c0");
@@ -2519,11 +3048,12 @@ pub(crate) mod tests {
 
                 #[test]
                 fn window_rotation_and_lane_scans_are_bounded() {
+                    let env = racer_io::Env::host();
                     const CACHES: usize = 1000;
                     let names: Vec<_> = (0..CACHES).map(|i| format!("c{i:04}")).collect();
                     let mut all: Vec<&str> = names.iter().map(String::as_str).collect();
                     all.push("target");
-                    let cache = memory(&all, 4 * CACHES);
+                    let cache = memory(&env, &all, 4 * CACHES);
                     // Older busy entries of other caches fill a whole scan window.
                     let busy: Vec<_> = (0..racer_core::cache::RECLAIM_WINDOW + 44)
                         .map(|i| {
@@ -2595,12 +3125,13 @@ pub(crate) mod tests {
 
                 #[test]
                 fn early_success_rotation_reaches_every_cache() {
+                    let env = racer_io::Env::host();
                     // A multiple of the window, so a cursor that jumped to the
                     // last prefetched cache would revisit only every eighth.
                     const CACHES: usize = 2 * racer_core::cache::PRESSURE_WINDOW;
                     let names: Vec<_> = (0..CACHES).map(|i| format!("r{i:02}")).collect();
                     let all: Vec<&str> = names.iter().map(String::as_str).collect();
-                    let cache = memory(&all, 8 * CACHES);
+                    let cache = memory(&env, &all, 8 * CACHES);
                     // Each cache keeps a held entry, so its lane survives, and
                     // two idle entries, so every call can succeed at once.
                     let held: Vec<_> = names
@@ -2648,6 +3179,7 @@ pub(crate) mod tests {
                 /// other live or writer-owned bytes, so no 16 MiB pages are needed.
                 #[test]
                 fn real_quotas_choose_over_share_cache_after_live_reweight() {
+                    let env = racer_io::Env::host();
                     let page = PAGE_BYTES as usize;
                     let class = ResourceClass::Ciphertext;
                     let mut limits = crate::test_support::cluster::config(false).limits;
@@ -2656,15 +3188,16 @@ pub(crate) mod tests {
                     let admission =
                         Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
                     let (low, high) = (id("low"), id("high"));
-                    let definition = |id: &CacheId, priority| racer_control_wire::CacheDefinition {
-                        id: id.clone(),
-                        name: id.0.clone(),
-                        client_socket: "/c".into(),
-                        origin_socket: "/o".into(),
-                        priority,
-                        mode: racer_control_wire::CacheMode::Cached,
-                        origin: None,
-                    };
+                    let definition =
+                        |id: &CacheId, priority| racer_wire::control::CacheDefinition {
+                            id: id.clone(),
+                            name: id.0.clone(),
+                            client_socket: "/c".into(),
+                            origin_socket: "/o".into(),
+                            priority,
+                            mode: racer_wire::control::CacheMode::Cached,
+                            origin: None,
+                        };
                     let weigh = |low_priority, high_priority| {
                         admission.policy().weights().update(&[
                             definition(&low, low_priority),
@@ -2675,8 +3208,13 @@ pub(crate) mod tests {
                     weigh(900, 100);
                     let cache = MemoryCache::new(
                         BufferPool::new(admission.clone()),
-                        crate::test_support::availability_for(vec![low.clone(), high.clone()]),
-                    );
+                        crate::test_support::availability_for(
+                            &env,
+                            vec![low.clone(), high.clone()],
+                        ),
+                    )
+                    // This test pins exact over-share reclaim of a full cache.
+                    .without_headroom();
                     // High activates first, alone, with 20 pages of accounted bytes.
                     let high_pages: Vec<_> = (0..4)
                         .map(|i| verified_in(&cache, "high", &format!("h{i}")))
@@ -2740,17 +3278,18 @@ pub(crate) mod tests {
 
             #[test]
             fn capacity_and_eviction_resume_after_examined_victim() {
+                let env = racer_io::Env::host();
                 for capacity in [false, true] {
                     let admission = admission(if capacity { 3 } else { 8 });
                     let cache = MemoryCache::new(
                         BufferPool::new(admission.clone()),
-                        crate::test_support::availability(),
+                        crate::test_support::availability(&env),
                     );
                     let a = publish(&cache, &admission, "a");
                     let b = publish(&cache, &admission, "b");
                     let c = publish(&cache, &admission, "c");
                     if !capacity {
-                        assert_eq!(cache.evict_idle(1), Ok(19));
+                        assert_eq!(cache.evict_idle(1), Ok(page_alloc::buf::GRANULE));
                     }
                     let d = publish(&cache, &admission, "d");
                     assert!(!cache.entries.borrow().pages.contains_key(&a));
@@ -2758,7 +3297,7 @@ pub(crate) mod tests {
                     if capacity {
                         publish(&cache, &admission, "e");
                     } else {
-                        assert_eq!(cache.evict_idle(1), Ok(19));
+                        assert_eq!(cache.evict_idle(1), Ok(page_alloc::buf::GRANULE));
                     }
                     let entries = cache.entries.borrow();
                     assert!(!entries.pages.contains_key(&b));
@@ -2770,11 +3309,12 @@ pub(crate) mod tests {
 
             #[test]
             fn zero_targets_and_ciphertext_sufficiency_leave_paired_cursor_untouched() {
+                let env = racer_io::Env::host();
                 for evict in [false, true] {
                     let admission = admission(8);
                     let cache = MemoryCache::new(
                         BufferPool::new(admission.clone()),
-                        crate::test_support::availability(),
+                        crate::test_support::availability(&env),
                     );
                     let paired = publish(&cache, &admission, "paired");
                     let cipher = publish_ciphertext(&cache, &admission, "cipher");
@@ -2790,13 +3330,13 @@ pub(crate) mod tests {
                     assert_eq!(cache.entries.borrow().reclaim_after, 0);
                     assert_eq!(*cache.ciphertext_cursor.borrow(), None);
                     if evict {
-                        assert_eq!(cache.evict_idle(1), Ok(19));
+                        assert_eq!(cache.evict_idle(1), Ok(page_alloc::buf::GRANULE));
                     } else {
                         assert_eq!(
                             cache.reclaim_idle(ResourceClass::Ciphertext, None, 1, |_, _| panic!(
                                 "target already met"
                             )),
-                            19
+                            page_alloc::buf::GRANULE
                         );
                     }
                     assert_eq!(cache.entries.borrow().reclaim_after, 0);
@@ -2807,10 +3347,11 @@ pub(crate) mod tests {
 
             #[test]
             fn examined_filters_and_staging_callback_advance_cursor() {
+                let env = racer_io::Env::host();
                 let admission = admission(8);
                 let cache = MemoryCache::new(
                     BufferPool::new(admission.clone()),
-                    crate::test_support::availability(),
+                    crate::test_support::availability(&env),
                 );
                 let a = publish(&cache, &admission, "a");
                 let b = publish(&cache, &admission, "b");
@@ -2825,7 +3366,7 @@ pub(crate) mod tests {
                 assert_eq!(cache.entries.borrow().reclaim_after, 0);
                 assert_eq!(
                     cache.reclaim_idle(ResourceClass::Ciphertext, None, 1, |_, _| 0),
-                    19
+                    page_alloc::buf::GRANULE
                 );
                 assert_eq!(cache.entries.borrow().reclaim_after, 2);
                 assert!(cache.entries.borrow().pages.contains_key(&a));
@@ -2871,12 +3412,45 @@ pub(crate) mod tests {
                 released
             }
 
+            /// Without pressure, workers skip `expire_idle`: entries outlive the
+            /// former idle TTL under the remaining maintenance and leave only
+            /// when reclaim needs their space, least recently used first.
             #[test]
-            fn expire_idle_releases_untouched_entries_and_keeps_recent_hits() {
+            fn idle_entries_persist_without_expiry_until_reclaimed() {
+                let env = racer_io::Env::host();
                 let admission = admission(8);
                 let cache = MemoryCache::new(
                     BufferPool::new(admission.clone()),
-                    crate::test_support::availability(),
+                    crate::test_support::availability(&env),
+                );
+                let start = std::time::Instant::now();
+                let old = publish(&cache, &admission, "old");
+                let recent = publish(&cache, &admission, "recent");
+                let mut at = std::time::Duration::ZERO;
+                while at <= racer_core::cache::IDLE_TTL * 4 {
+                    cache.sweep_unavailable(racer_core::cache::EXPIRY_BATCH);
+                    cache.buffers().maintain_idle_buffers(start + at);
+                    at += racer_core::cache::EXPIRY_CHECKPOINT;
+                }
+                assert!(cache.entries.borrow().pages.contains_key(&old));
+                assert!(cache.entries.borrow().pages.contains_key(&recent));
+                assert!(cache.ciphertext(&recent).unwrap().is_some());
+                // Reclaim takes the least recently used idle entry first.
+                assert_eq!(
+                    cache.reclaim_idle(ResourceClass::Ciphertext, None, 1, |_, _| 0),
+                    page_alloc::buf::GRANULE
+                );
+                assert!(!cache.entries.borrow().pages.contains_key(&old));
+                assert!(cache.entries.borrow().pages.contains_key(&recent));
+            }
+
+            #[test]
+            fn expire_idle_releases_untouched_entries_and_keeps_recent_hits() {
+                let env = racer_io::Env::host();
+                let admission = admission(8);
+                let cache = MemoryCache::new(
+                    BufferPool::new(admission.clone()),
+                    crate::test_support::availability(&env),
                 );
                 let start = std::time::Instant::now();
                 let cold = publish(&cache, &admission, "cold");
@@ -2918,11 +3492,110 @@ pub(crate) mod tests {
             }
 
             #[test]
-            fn republishing_verified_ciphertext_does_not_pin_it() {
+            fn pinned_readers_keep_entries_busy_and_unpinned_observers_do_not() {
+                let env = racer_io::Env::host();
                 let admission = admission(8);
                 let cache = MemoryCache::new(
                     BufferPool::new(admission.clone()),
-                    crate::test_support::availability(),
+                    crate::test_support::availability(&env),
+                );
+                let start = std::time::Instant::now();
+                let pinned = publish(&cache, &admission, "pinned");
+                let observed = publish(&cache, &admission, "observed");
+                let cipher = publish_ciphertext(&cache, &admission, "cipher");
+                let page = |id: &PageId| cache.entries.borrow().pages[id].1.ciphertext.clone();
+                let reader = page(&pinned);
+                assert_eq!(reader.pins(), 2);
+                let clone = reader.clone();
+                assert_eq!(reader.pins(), 3);
+                drop(clone);
+                assert_eq!(reader.pins(), 2);
+                let observer = page(&observed).unpinned();
+                assert_eq!(observer.pins(), 1);
+                let observer_clone = observer.clone();
+                assert_eq!(observer.pins(), 1);
+                drop(observer_clone);
+                let cipher_observer = cache.ciphertext_entries.borrow()[&cipher]
+                    .copy
+                    .ciphertext
+                    .unpinned();
+                assert_eq!(
+                    expire_through(
+                        &cache,
+                        start,
+                        racer_core::cache::IDLE_TTL + racer_core::cache::EXPIRY_CHECKPOINT
+                    ),
+                    2
+                );
+                // The pinned reader keeps its entry; observers do not.
+                assert!(cache.entries.borrow().pages.contains_key(&pinned));
+                assert!(!cache.entries.borrow().pages.contains_key(&observed));
+                assert!(!cache.ciphertext_entries.borrow().contains_key(&cipher));
+                // Observers still keep the bytes readable after eviction.
+                assert_eq!(observer.pins(), 0);
+                assert!(!observer.bytes().is_empty());
+                assert!(!cipher_observer.bytes().is_empty());
+                drop((observer, cipher_observer));
+                drop(reader);
+                assert_eq!(page(&pinned).pins(), 2);
+            }
+
+            #[test]
+            fn ciphertext_held_splits_idle_pinned_and_writer_entries() {
+                let env = racer_io::Env::host();
+                let admission = admission(8);
+                let cache = MemoryCache::new(
+                    BufferPool::new(admission.clone()),
+                    crate::test_support::availability(&env),
+                );
+                let none = |_: &PageId, _: &CiphertextPage| false;
+                assert_eq!(cache.ciphertext_held(none), (0, 0, 0));
+                let idle = publish(&cache, &admission, "idle");
+                let read = publish(&cache, &admission, "read");
+                let queued = publish(&cache, &admission, "queued");
+                let cipher = publish_ciphertext(&cache, &admission, "cipher");
+                let page = |id: &PageId| cache.entries.borrow().pages[id].1.ciphertext.clone();
+                let bytes = |page: &CiphertextPage| page.inner.reservation().amount();
+                let cipher_bytes =
+                    bytes(&cache.ciphertext_entries.borrow()[&cipher].copy.ciphertext);
+                let (idle_bytes, read_bytes, queued_bytes) = (
+                    bytes(&page(&idle)),
+                    bytes(&page(&read)),
+                    bytes(&page(&queued)),
+                );
+                // Every entry is idle until another owner pins it.
+                assert_eq!(
+                    cache.ciphertext_held(none),
+                    (idle_bytes + read_bytes + queued_bytes + cipher_bytes, 0, 0)
+                );
+                let reader = page(&read);
+                let writer = page(&queued);
+                let cipher_reader = cache.ciphertext_entries.borrow()[&cipher]
+                    .copy
+                    .ciphertext
+                    .clone();
+                let only_writer = |id: &PageId, _: &CiphertextPage| id == &queued;
+                assert_eq!(
+                    cache.ciphertext_held(only_writer),
+                    (idle_bytes, read_bytes + cipher_bytes, queued_bytes)
+                );
+                // Unpinned observers never make an entry look held.
+                let observer = page(&idle).unpinned();
+                drop((reader, writer, cipher_reader));
+                assert_eq!(
+                    cache.ciphertext_held(only_writer),
+                    (idle_bytes + read_bytes + queued_bytes + cipher_bytes, 0, 0)
+                );
+                drop(observer);
+            }
+
+            #[test]
+            fn republishing_verified_ciphertext_does_not_pin_it() {
+                let env = racer_io::Env::host();
+                let admission = admission(8);
+                let cache = MemoryCache::new(
+                    BufferPool::new(admission.clone()),
+                    crate::test_support::availability(&env),
                 );
                 let start = std::time::Instant::now();
                 let page = publish(&cache, &admission, "page");
@@ -2947,10 +3620,11 @@ pub(crate) mod tests {
 
             #[test]
             fn publish_ciphertext_still_caches_pages_without_verified_entry() {
+                let env = racer_io::Env::host();
                 let admission = admission(8);
                 let cache = MemoryCache::new(
                     BufferPool::new(admission.clone()),
-                    crate::test_support::availability(),
+                    crate::test_support::availability(&env),
                 );
                 let verified = publish(&cache, &admission, "verified");
                 let other = publish_ciphertext(&cache, &admission, "other");
@@ -2961,10 +3635,11 @@ pub(crate) mod tests {
 
             #[test]
             fn expire_idle_skips_entries_in_use_until_released() {
+                let env = racer_io::Env::host();
                 let admission = admission(8);
                 let cache = MemoryCache::new(
                     BufferPool::new(admission.clone()),
-                    crate::test_support::availability(),
+                    crate::test_support::availability(&env),
                 );
                 let start = std::time::Instant::now();
                 let page = publish(&cache, &admission, "page");
@@ -2991,11 +3666,12 @@ pub(crate) mod tests {
 
             #[test]
             fn expire_idle_bounds_work_per_call() {
+                let env = racer_io::Env::host();
                 let count = racer_core::cache::EXPIRY_BATCH * 2 + 3;
                 let admission = admission(count * 2 + 8);
                 let cache = MemoryCache::new(
                     BufferPool::new(admission.clone()),
-                    crate::test_support::availability(),
+                    crate::test_support::availability(&env),
                 );
                 for n in 0..count {
                     publish(&cache, &admission, &format!("p{n:03}"));
@@ -3023,12 +3699,13 @@ pub(crate) mod tests {
 
             #[test]
             fn expire_idle_resumes_past_busy_prefix_across_checkpoints() {
+                let env = racer_io::Env::host();
                 let busy = racer_core::cache::EXPIRY_BATCH + 1;
                 let idle = 3;
                 let admission = admission((busy + idle) * 2 + 8);
                 let cache = MemoryCache::new(
                     BufferPool::new(admission.clone()),
-                    crate::test_support::availability(),
+                    crate::test_support::availability(&env),
                 );
                 let mut held = Vec::new();
                 for n in 0..busy {
@@ -3065,10 +3742,11 @@ pub(crate) mod tests {
 
             #[test]
             fn expiry_checkpoints_stay_bounded() {
+                let env = racer_io::Env::host();
                 let admission = admission(8);
                 let cache = MemoryCache::new(
                     BufferPool::new(admission.clone()),
-                    crate::test_support::availability(),
+                    crate::test_support::availability(&env),
                 );
                 let start = std::time::Instant::now();
                 expire_through(&cache, start, racer_core::cache::IDLE_TTL * 10);
@@ -3085,20 +3763,21 @@ pub(crate) mod tests {
 
             #[test]
             fn ciphertext_partial_scan_preserves_unexamined_keys_after_insertion() {
+                let env = racer_io::Env::host();
                 let admission = admission(8);
                 let cache = MemoryCache::new(
                     BufferPool::new(admission.clone()),
-                    crate::test_support::availability(),
+                    crate::test_support::availability(&env),
                 );
                 let a = publish_ciphertext(&cache, &admission, "a");
                 let b = publish_ciphertext(&cache, &admission, "b");
                 let c = publish_ciphertext(&cache, &admission, "c");
                 assert!(a < b && b < c);
-                assert_eq!(cache.reclaim_ciphertext(None, 1), 19);
+                assert_eq!(cache.reclaim_ciphertext(None, 1), page_alloc::buf::GRANULE);
                 assert_eq!(*cache.ciphertext_cursor.borrow(), Some(a));
                 let d = publish_ciphertext(&cache, &admission, "d");
                 assert!(c < d);
-                assert_eq!(cache.reclaim_ciphertext(None, 1), 19);
+                assert_eq!(cache.reclaim_ciphertext(None, 1), page_alloc::buf::GRANULE);
                 assert_eq!(*cache.ciphertext_cursor.borrow(), Some(b.clone()));
                 let entries = cache.ciphertext_entries.borrow();
                 assert!(!entries.contains_key(&b));
@@ -3108,10 +3787,11 @@ pub(crate) mod tests {
 
             #[test]
             fn ciphertext_busy_prefix_and_wrong_cache_advance_bounded_scan() {
+                let env = racer_io::Env::host();
                 let admission = admission(300);
                 let cache = MemoryCache::new(
                     BufferPool::new(admission.clone()),
-                    crate::test_support::availability(),
+                    crate::test_support::availability(&env),
                 );
                 for n in 0..257 {
                     publish_ciphertext(&cache, &admission, &format!("v{n:03}"));
@@ -3128,7 +3808,7 @@ pub(crate) mod tests {
                     .collect();
                 assert_eq!(cache.reclaim_ciphertext(None, 1), 0);
                 assert_eq!(*cache.ciphertext_cursor.borrow(), Some(ids[255].clone()));
-                assert_eq!(cache.reclaim_ciphertext(None, 1), 19);
+                assert_eq!(cache.reclaim_ciphertext(None, 1), page_alloc::buf::GRANULE);
                 assert_eq!(*cache.ciphertext_cursor.borrow(), Some(ids[256].clone()));
                 drop(held);
                 assert_eq!(
@@ -3137,16 +3817,17 @@ pub(crate) mod tests {
                 );
                 assert_eq!(*cache.ciphertext_cursor.borrow(), Some(ids[255].clone()));
                 assert_eq!(cache.ciphertext_entries.borrow().len(), 256);
-                assert_eq!(cache.reclaim_ciphertext(None, 1), 19);
+                assert_eq!(cache.reclaim_ciphertext(None, 1), page_alloc::buf::GRANULE);
                 assert_eq!(*cache.ciphertext_cursor.borrow(), Some(ids[0].clone()));
             }
 
             #[test]
             fn empty_and_maximum_clock_selection_is_nonmutating_and_wraps() {
+                let env = racer_io::Env::host();
                 let admission = admission(8);
                 let cache = MemoryCache::new(
                     BufferPool::new(admission.clone()),
-                    crate::test_support::availability(),
+                    crate::test_support::availability(&env),
                 );
                 cache.entries.borrow_mut().reclaim_after = u64::MAX;
                 assert!(cache.entries.borrow().candidates().is_empty());
@@ -3162,12 +3843,12 @@ pub(crate) mod tests {
                 assert_eq!(cache.entries.borrow().reclaim_after, u64::MAX);
                 assert_eq!(
                     cache.reclaim_idle(ResourceClass::Ciphertext, None, 1, |_, _| 0),
-                    19
+                    page_alloc::buf::GRANULE
                 );
                 assert_eq!(cache.entries.borrow().reclaim_after, u64::MAX - 1);
                 assert_eq!(
                     cache.reclaim_idle(ResourceClass::Ciphertext, None, 1, |_, _| 0),
-                    19
+                    page_alloc::buf::GRANULE
                 );
                 assert_eq!(cache.entries.borrow().reclaim_after, u64::MAX);
                 assert_eq!(
@@ -3183,11 +3864,11 @@ pub(crate) mod tests {
                 Touch,
             }
 
-            fn check(class: ResourceClass, change: Change) {
+            fn check(env: &racer_io::Env, class: ResourceClass, change: Change) {
                 let admission = admission(8);
                 let cache = MemoryCache::new(
                     BufferPool::new(admission.clone()),
-                    crate::test_support::availability(),
+                    crate::test_support::availability(env),
                 );
                 let mut ids = Vec::new();
                 for name in ["a", "b", "c"] {
@@ -3204,7 +3885,7 @@ pub(crate) mod tests {
                     assert_eq!(cache.entries.borrow().reclaim_after, 0);
                     return;
                 }
-                let charge = 19;
+                let charge = page_alloc::buf::GRANULE;
                 assert!(
                     cache
                         .entries
@@ -3220,7 +3901,10 @@ pub(crate) mod tests {
                     assert!(entries.pages.contains_key(&ids[1]), "B remains idle");
                     assert!(entries.pages.contains_key(&ids[2]), "C remains idle");
                 }
-                assert_eq!(admission.used(ResourceClass::Ciphertext), 38);
+                assert_eq!(
+                    admission.used(ResourceClass::Ciphertext),
+                    2 * page_alloc::buf::GRANULE
+                );
 
                 let expected = match change {
                     Change::None => vec![false, false, true],
@@ -3257,41 +3941,48 @@ pub(crate) mod tests {
 
             #[test]
             fn plaintext_without_new_ticks_reclaims_older_idle_page() {
-                check(ResourceClass::Plaintext, Change::None);
+                let env = racer_io::Env::host();
+                check(&env, ResourceClass::Plaintext, Change::None);
             }
 
             #[test]
             fn ciphertext_without_new_ticks_reclaims_older_idle_page() {
-                check(ResourceClass::Ciphertext, Change::None);
+                let env = racer_io::Env::host();
+                check(&env, ResourceClass::Ciphertext, Change::None);
             }
 
             #[test]
             fn plaintext_preserves_newly_published_page() {
-                check(ResourceClass::Plaintext, Change::Publish);
+                let env = racer_io::Env::host();
+                check(&env, ResourceClass::Plaintext, Change::Publish);
             }
 
             #[test]
             fn ciphertext_preserves_newly_published_page() {
-                check(ResourceClass::Ciphertext, Change::Publish);
+                let env = racer_io::Env::host();
+                check(&env, ResourceClass::Ciphertext, Change::Publish);
             }
 
             #[test]
             fn plaintext_preserves_recently_touched_page() {
-                check(ResourceClass::Plaintext, Change::Touch);
+                let env = racer_io::Env::host();
+                check(&env, ResourceClass::Plaintext, Change::Touch);
             }
 
             #[test]
             fn ciphertext_preserves_recently_touched_page() {
-                check(ResourceClass::Ciphertext, Change::Touch);
+                let env = racer_io::Env::host();
+                check(&env, ResourceClass::Ciphertext, Change::Touch);
             }
         }
 
         #[test]
         fn ciphertext_residency_is_distinct_bounded_and_conditionally_invalidated() {
+            let env = racer_io::Env::host();
             let admission = admission(2);
             let cache = MemoryCache::new(
                 BufferPool::new(admission.clone()),
-                crate::test_support::availability(),
+                crate::test_support::availability(&env),
             );
             let first = bundle(&admission, "cipher");
             let id = first.plaintext.page().clone();
@@ -3329,10 +4020,11 @@ pub(crate) mod tests {
         }
         #[test]
         fn publication_retains_ciphertext_and_only_a_weak_plaintext_handle() {
+            let env = racer_io::Env::host();
             let admission = admission(8);
             let cache = MemoryCache::new(
                 BufferPool::new(admission.clone()),
-                crate::test_support::availability(),
+                crate::test_support::availability(&env),
             );
             let page = bundle(&admission, "v1");
             let id = page.plaintext.page().clone();
@@ -3346,7 +4038,10 @@ pub(crate) mod tests {
             drop((shared, held));
             // The cache alone keeps no plaintext or plaintext charge.
             assert_eq!(admission.used(ResourceClass::Plaintext), 0);
-            assert_eq!(admission.used(ResourceClass::Ciphertext), 19);
+            assert_eq!(
+                admission.used(ResourceClass::Ciphertext),
+                page_alloc::buf::GRANULE
+            );
             assert!(cache.get(&id).unwrap().is_none());
             // Local readers decrypt the verified ciphertext; peers copy it.
             let local = cache.unverified(&id).unwrap().unwrap();
@@ -3366,15 +4061,19 @@ pub(crate) mod tests {
             assert!(Arc::ptr_eq(&shared.ciphertext.inner, &ciphertext.inner));
             drop((shared, relinked, ciphertext));
             assert_eq!(admission.used(ResourceClass::Plaintext), 0);
-            assert_eq!(admission.used(ResourceClass::Ciphertext), 19);
+            assert_eq!(
+                admission.used(ResourceClass::Ciphertext),
+                page_alloc::buf::GRANULE
+            );
             assert_eq!(cache.entries.borrow().len(), 1);
         }
         #[test]
         fn failed_decrypt_of_verified_ciphertext_invalidates_the_entry() {
+            let env = racer_io::Env::host();
             let admission = admission(8);
             let cache = MemoryCache::new(
                 BufferPool::new(admission.clone()),
-                crate::test_support::availability(),
+                crate::test_support::availability(&env),
             );
             let page = bundle(&admission, "v1");
             let id = page.plaintext.page().clone();
@@ -3394,10 +4093,11 @@ pub(crate) mod tests {
         }
         #[test]
         fn expiry_releases_verified_ciphertext_while_a_reader_holds_plaintext() {
+            let env = racer_io::Env::host();
             let admission = admission(8);
             let cache = MemoryCache::new(
                 BufferPool::new(admission.clone()),
-                crate::test_support::availability(),
+                crate::test_support::availability(&env),
             );
             let page = bundle(&admission, "v1");
             let id = page.plaintext.page().clone();
@@ -3415,10 +4115,11 @@ pub(crate) mod tests {
         }
         #[test]
         fn bounded_reclamation_advances_past_a_busy_prefix() {
+            let env = racer_io::Env::host();
             let admission = admission(300);
             let cache = MemoryCache::new(
                 BufferPool::new(admission.clone()),
-                crate::test_support::availability(),
+                crate::test_support::availability(&env),
             );
             let mut busy = Vec::new();
             let mut ids = Vec::new();
@@ -3431,7 +4132,7 @@ pub(crate) mod tests {
                 cache.publish(page).unwrap();
             }
             assert_eq!(cache.evict_idle(1), Ok(0));
-            assert_eq!(cache.evict_idle(1), Ok(19));
+            assert_eq!(cache.evict_idle(1), Ok(page_alloc::buf::GRANULE));
             assert!(cache.ciphertext(&ids[256]).unwrap().is_none());
             assert!(cache.ciphertext(&ids[257]).unwrap().is_some());
             assert!(
@@ -3443,8 +4144,11 @@ pub(crate) mod tests {
                 assert!(cache.get(reader.plaintext.page()).unwrap().is_some());
             }
             // Only the readers' live plaintext stays charged.
-            assert_eq!(admission.used(ResourceClass::Plaintext), 256 * 3);
-            assert_eq!(admission.used(ResourceClass::Ciphertext), 299 * 19);
+            assert_eq!(admission.used(ResourceClass::Plaintext), 256 * 4096);
+            assert_eq!(
+                admission.used(ResourceClass::Ciphertext),
+                299 * page_alloc::buf::GRANULE
+            );
             drop(busy);
             for _ in 0..3 {
                 cache.evict_idle(usize::MAX).unwrap();
@@ -3457,10 +4161,11 @@ pub(crate) mod tests {
         }
         #[test]
         fn busy_leases_protect_both_allocations_and_eviction_releases_idle_bytes() {
+            let env = racer_io::Env::host();
             let admission = admission(8);
             let cache = MemoryCache::new(
                 BufferPool::new(admission.clone()),
-                crate::test_support::availability(),
+                crate::test_support::availability(&env),
             );
             let page = bundle(&admission, "v1");
             let id = page.plaintext.page().clone();
@@ -3473,8 +4178,8 @@ pub(crate) mod tests {
             // charge is never counted as cache bytes.
             assert!(cache.get(&id).unwrap().is_some());
             assert_eq!(cache.evict_idle(0), Ok(0));
-            assert_eq!(cache.evict_idle(1), Ok(19));
-            assert_eq!(admission.used(ResourceClass::Plaintext), 3);
+            assert_eq!(cache.evict_idle(1), Ok(page_alloc::buf::GRANULE));
+            assert_eq!(admission.used(ResourceClass::Plaintext), 4096);
             drop(plaintext);
             assert_eq!(admission.used(ResourceClass::Plaintext), 0);
             assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
@@ -3483,10 +4188,11 @@ pub(crate) mod tests {
         }
         #[test]
         fn duplicate_preserves_original_ciphertext_metadata_and_expired_deadline() {
+            let env = racer_io::Env::host();
             let admission = admission(8);
             let cache = MemoryCache::new(
                 BufferPool::new(admission.clone()),
-                crate::test_support::availability(),
+                crate::test_support::availability(&env),
             );
             let page = bundle(&admission, "v1");
             let id = page.plaintext.page().clone();
@@ -3511,17 +4217,21 @@ pub(crate) mod tests {
                 cache.metadata(&id.version).unwrap(),
                 Some(copy.metadata.immutable())
             );
-            assert_eq!(admission.used(ResourceClass::Ciphertext), 19);
+            assert_eq!(
+                admission.used(ResourceClass::Ciphertext),
+                page_alloc::buf::GRANULE
+            );
         }
         /// A duplicate publish is not a use, so the oldest
         /// insert is still evicted first (the simulator's `memory_insert`
         /// keeps the same order).
         #[test]
         fn duplicate_publish_does_not_touch() {
+            let env = racer_io::Env::host();
             let admission = admission(2);
             let cache = MemoryCache::new(
                 BufferPool::new(admission.clone()),
-                crate::test_support::availability(),
+                crate::test_support::availability(&env),
             );
             let id = |v: &str| bundle(&admission, v).plaintext.page().clone();
             for version in ["v0", "v1", "v0", "v2"] {
@@ -3533,10 +4243,11 @@ pub(crate) mod tests {
         }
         #[test]
         fn capacity_evicts_least_recent_idle_entry_and_rejects_all_busy() {
+            let env = racer_io::Env::host();
             let admission = admission(2);
             let cache = MemoryCache::new(
                 BufferPool::new(admission.clone()),
-                crate::test_support::availability(),
+                crate::test_support::availability(&env),
             );
             let first = bundle(&admission, "v1");
             let first_id = first.plaintext.page().clone();
@@ -3565,14 +4276,18 @@ pub(crate) mod tests {
             assert!(cache.ciphertext(&third_id).unwrap().is_none());
             assert!(cache.ciphertext(&fourth_id).unwrap().is_some());
             assert_eq!(admission.used(ResourceClass::Plaintext), 0);
-            assert_eq!(admission.used(ResourceClass::Ciphertext), 38);
+            assert_eq!(
+                admission.used(ResourceClass::Ciphertext),
+                2 * page_alloc::buf::GRANULE
+            );
         }
         #[test]
         fn publication_rejects_foreign_undercharged_and_conflicting_bundles() {
+            let env = racer_io::Env::host();
             let admission = admission(8);
             let cache = MemoryCache::new(
                 BufferPool::new(admission.clone()),
-                crate::test_support::availability(),
+                crate::test_support::availability(&env),
             );
             assert_eq!(
                 cache.publish(bundle(&self::admission(8), "v1")),
@@ -3581,20 +4296,26 @@ pub(crate) mod tests {
             let mut malformed = bundle(&admission, "v1");
             Arc::get_mut(&mut malformed.ciphertext.inner)
                 .unwrap()
-                .bytes
-                .pop();
+                .fixture_pop();
             assert_eq!(cache.publish(malformed), Err(Error::CorruptRecord));
             let mut undercharged = bundle(&admission, "v1");
+            // Plaintext storage cannot carry a non-plaintext charge at all;
+            // a charge for another cache must still be refused at publish.
             let wrong = admission
                 .reserve(
-                    Some(&undercharged.metadata.version.object.cache),
-                    ResourceClass::Ciphertext,
-                    3,
+                    Some(&CacheId("other".into())),
+                    ResourceClass::Plaintext,
+                    page_alloc::buf::GRANULE,
                 )
                 .unwrap();
-            Arc::get_mut(&mut undercharged.plaintext.inner)
+            let storage = &mut Arc::get_mut(&mut undercharged.plaintext.inner)
                 .unwrap()
-                .reservation = wrong;
+                .storage;
+            let ciphertext = admission
+                .reserve(None, ResourceClass::Ciphertext, page_alloc::buf::GRANULE)
+                .unwrap();
+            assert!(storage.replace_charge(PlaintextCharge(ciphertext)).is_err());
+            assert!(storage.replace_charge(PlaintextCharge(wrong)).is_ok());
             assert_eq!(
                 cache.publish(undercharged),
                 Err(Error::InvalidConfiguration)
@@ -3607,7 +4328,7 @@ pub(crate) mod tests {
             let mut conflicting = bundle(&admission, "v1");
             Arc::get_mut(&mut conflicting.plaintext.inner)
                 .unwrap()
-                .bytes[0] ^= 1;
+                .storage[0] ^= 1;
             assert_eq!(cache.publish(conflicting), Err(Error::CorruptRecord));
             let mut inconsistent = bundle(&admission, "v2");
             let rejected_id = inconsistent.plaintext.page().clone();
@@ -3615,19 +4336,26 @@ pub(crate) mod tests {
             assert_eq!(cache.publish(inconsistent), Err(Error::CorruptRecord));
             assert_eq!(cache.get(&id).unwrap().unwrap().plaintext.bytes(), &[1; 3]);
             assert!(cache.get(&rejected_id).unwrap().is_none());
-            assert_eq!(admission.used(ResourceClass::Plaintext), 3);
-            assert_eq!(admission.used(ResourceClass::Ciphertext), 19);
+            assert_eq!(admission.used(ResourceClass::Plaintext), 4096);
+            assert_eq!(
+                admission.used(ResourceClass::Ciphertext),
+                page_alloc::buf::GRANULE
+            );
             drop(held);
             assert_eq!(admission.used(ResourceClass::Plaintext), 0);
         }
         #[test]
         fn eviction_is_cache_scoped_and_preserves_live_leases() {
+            let env = racer_io::Env::host();
             let admission = admission(8);
             let other_cache = CacheId("44444444-4444-4444-8444-444444444444".into());
-            let availability = crate::test_support::availability_for(vec![
-                CacheId(crate::test_support::security::CACHE.into()),
-                other_cache.clone(),
-            ]);
+            let availability = crate::test_support::availability_for(
+                &env,
+                vec![
+                    CacheId(crate::test_support::security::CACHE.into()),
+                    other_cache.clone(),
+                ],
+            );
             let cache = MemoryCache::new(BufferPool::new(admission.clone()), availability);
             let page = bundle(&admission, "v1");
             let id = page.plaintext.page().clone();
@@ -3641,22 +4369,143 @@ pub(crate) mod tests {
             assert!(cache.ciphertext(&id).unwrap().is_none());
             assert!(cache.ciphertext(&other_id).unwrap().is_some());
             assert_eq!(page.plaintext.bytes(), &[1; 3]);
-            assert_eq!(admission.used(ResourceClass::Plaintext), 3);
+            assert_eq!(admission.used(ResourceClass::Plaintext), 4096);
             drop(page);
             assert_eq!(admission.used(ResourceClass::Plaintext), 0);
             let lease = cache.ciphertext(&other_id).unwrap().unwrap();
             cache.remove_cache(&other_id.version.object.cache).unwrap();
             assert!(cache.ciphertext(&other_id).unwrap().is_none());
-            assert_eq!(admission.used(ResourceClass::Ciphertext), 19);
+            assert_eq!(
+                admission.used(ResourceClass::Ciphertext),
+                page_alloc::buf::GRANULE
+            );
             drop(lease);
             assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
         }
+        /// A cache whose ciphertext limit affords the headroom reserve plus
+        /// `granules` granule-sized entries, with everything but those
+        /// entries and the reserve held by `in_flight`.
+        fn headroom_cache(
+            env: &racer_io::Env,
+            granules: usize,
+        ) -> (
+            Rc<flow_control::Quotas<AdmissionPolicy>>,
+            MemoryCache,
+            flow_control::Charge<AdmissionPolicy>,
+            usize,
+        ) {
+            use flow_control::Policy as _;
+            let mut limits = crate::test_support::cluster::config(false).limits;
+            limits.metadata_entries = std::num::NonZeroUsize::new(64).unwrap();
+            let probe = AdmissionPolicy::new(limits.clone());
+            let reserve = probe.progress(ResourceClass::Ciphertext);
+            let limit = 4 * reserve + granules * page_alloc::buf::GRANULE;
+            limits.ciphertext_bytes = std::num::NonZeroUsize::new(limit).unwrap();
+            let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
+            let cache = MemoryCache::new(
+                BufferPool::new(admission.clone()),
+                crate::test_support::availability(env),
+            );
+            let key = CacheId(crate::test_support::security::CACHE.into());
+            let in_flight = admission
+                .reserve(Some(&key), ResourceClass::Ciphertext, 3 * reserve)
+                .unwrap();
+            (admission, cache, in_flight, reserve)
+        }
+        fn headroom_key() -> CacheId {
+            CacheId(crate::test_support::security::CACHE.into())
+        }
+        /// Publishing evicts the oldest idle entries until one range window
+        /// of ciphertext is free again for in-flight work.
+        #[test]
+        fn publish_keeps_ciphertext_headroom_by_evicting_idle_entries() {
+            let env = racer_io::Env::host();
+            let (admission, cache, _in_flight, reserve) = headroom_cache(&env, 4);
+            let limit = admission.limit(ResourceClass::Ciphertext);
+            let mut ids = Vec::new();
+            for version in 0..8 {
+                let page = bundle(&admission, &format!("v{version}"));
+                ids.push(page.plaintext.page().clone());
+                cache.publish(page).unwrap();
+                assert!(admission.used(ResourceClass::Ciphertext) <= limit - reserve);
+            }
+            assert_eq!(cache.resident().len(), 4);
+            for id in &ids[4..] {
+                assert!(cache.resident().contains(id), "newest entries stay");
+            }
+            // The headroom admits a fresh window without any reclaim.
+            let _window = admission
+                .reserve(Some(&headroom_key()), ResourceClass::Ciphertext, reserve)
+                .unwrap();
+        }
+        /// Pinned entries are never evicted to make headroom, and publish
+        /// still succeeds while every entry is pinned.
+        #[test]
+        fn publish_headroom_never_evicts_pinned_entries() {
+            let env = racer_io::Env::host();
+            let (admission, cache, _in_flight, reserve) = headroom_cache(&env, 4);
+            let limit = admission.limit(ResourceClass::Ciphertext);
+            let pinned: Vec<_> = (0..8)
+                .map(|version| {
+                    let page = bundle(&admission, &format!("v{version}"));
+                    cache.publish(page.clone()).unwrap();
+                    page
+                })
+                .collect();
+            // Past the headroom target, yet nothing was evicted.
+            assert_eq!(cache.resident().len(), 8);
+            assert!(admission.used(ResourceClass::Ciphertext) > limit - reserve);
+            // Once readers release, the next publish restores the headroom.
+            drop(pinned);
+            cache.publish(bundle(&admission, "fresh")).unwrap();
+            assert!(admission.used(ResourceClass::Ciphertext) <= limit - reserve);
+            assert!(cache.resident().len() <= 4);
+        }
+        /// Unverified ciphertext entries obey the same headroom.
+        #[test]
+        fn publish_ciphertext_keeps_headroom() {
+            let env = racer_io::Env::host();
+            let (admission, cache, _in_flight, reserve) = headroom_cache(&env, 4);
+            let limit = admission.limit(ResourceClass::Ciphertext);
+            for version in 0..8 {
+                let page = bundle(&admission, &format!("c{version}"));
+                cache
+                    .publish_ciphertext(UnverifiedPage {
+                        copy: page.copy(),
+                        disk_token: None,
+                    })
+                    .unwrap();
+                drop(page);
+            }
+            assert!(admission.used(ResourceClass::Ciphertext) <= limit - reserve);
+        }
+        /// A budget too small to spare a window keeps every idle entry.
+        #[test]
+        fn publish_skips_headroom_when_budget_cannot_afford_it() {
+            let env = racer_io::Env::host();
+            let mut limits = crate::test_support::cluster::config(false).limits;
+            limits.metadata_entries = std::num::NonZeroUsize::new(64).unwrap();
+            limits.ciphertext_bytes =
+                std::num::NonZeroUsize::new(8 * page_alloc::buf::GRANULE).unwrap();
+            let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
+            let cache = MemoryCache::new(
+                BufferPool::new(admission.clone()),
+                crate::test_support::availability(&env),
+            );
+            for version in 0..6 {
+                cache
+                    .publish(bundle(&admission, &format!("v{version}")))
+                    .unwrap();
+            }
+            assert_eq!(cache.resident().len(), 6);
+        }
         #[test]
         fn eviction_is_idempotent_and_churn_needs_no_tombstones() {
+            let env = racer_io::Env::host();
             let admission = admission(1);
             let cache = MemoryCache::new(
                 BufferPool::new(admission),
-                crate::test_support::availability(),
+                crate::test_support::availability(&env),
             );
             let id = CacheId("cache".into());
             assert_eq!(cache.remove_cache(&id), Ok(()));
@@ -3670,19 +4519,24 @@ pub(crate) mod tests {
         fn empty_stable_catalog_rotates_without_consuming_page_metadata_capacity() {
             use crate::control::for_caches;
             use crate::test_support::security::rotation_bundle;
+            let env = racer_io::Env::host();
             let admission = admission(1024);
-            let keys = Rc::new(crate::test_support::security::keys());
+            let keys = Rc::new(crate::test_support::security::keys(&env));
             let roots = (*keys.peer_trust_roots().unwrap()).clone();
             let caches: Vec<_> = (0..356)
                 .map(|cache| CacheId(format!("{cache:08x}-0000-4000-8000-000000000000")))
                 .collect();
             let memory = MemoryCache::new(
                 BufferPool::new(admission.clone()),
-                for_caches(keys.clone(), caches.clone()),
+                for_caches(&env, keys.clone(), caches.clone()),
             );
-            use racer_control_wire::CacheKeyPurpose;
-            let mut previous: Vec<racer_control_wire::CacheKeyRef> = Vec::new();
-            for generation in 2u64..=6 {
+            use racer_wire::control::{CacheEncryptionKey, CacheKeyPurpose, CacheKeyState};
+            // The authority default: the active page key plus RETAINED - 1
+            // decrypt keys stay readable. Pages of a key stay readable for
+            // RETAINED - 1 rotations and become unreadable after the next.
+            const RETAINED: usize = 7;
+            let mut history: Vec<Vec<CacheEncryptionKey>> = Vec::new();
+            for generation in 2u64..=(RETAINED as u64 + 3) {
                 let mut next = rotation_bundle(generation, roots.clone());
                 let templates = std::mem::take(&mut next.cache_keys);
                 for cache in 0u64..356 {
@@ -3691,18 +4545,36 @@ pub(crate) mod tests {
                         key.key.cache = CacheId(format!("{cache:08x}-0000-4000-8000-000000000000"));
                         let (reference, state, mut material) = key.clone().into_installation();
                         material[8..16].copy_from_slice(&cache.to_be_bytes());
-                        key =
-                            racer_control_wire::CacheEncryptionKey::new(reference, state, material);
+                        key = racer_wire::control::CacheEncryptionKey::new(
+                            reference, state, material,
+                        );
+                        next.cache_keys.push(key);
+                    }
+                }
+                let pages: Vec<_> = next
+                    .cache_keys
+                    .iter()
+                    .filter(|key| key.key.purpose == CacheKeyPurpose::Page)
+                    .cloned()
+                    .collect();
+                for old in history.iter().rev().take(RETAINED - 1) {
+                    for key in old {
+                        let mut key = key.clone();
+                        key.state = CacheKeyState::Decrypt;
                         next.cache_keys.push(key);
                     }
                 }
                 keys.install(next.clone()).unwrap();
-                for key in previous {
-                    if key.purpose == CacheKeyPurpose::Page {
-                        assert!(!memory.availability.page(&key.cache, key.id));
+                for (age, old) in history.iter().rev().enumerate() {
+                    for key in old {
+                        assert_eq!(
+                            memory.availability.page(&key.key.cache, key.key.id),
+                            age < RETAINED - 1,
+                            "generation {generation} age {age}"
+                        );
                     }
                 }
-                previous = next.cache_keys.iter().map(|key| key.key.clone()).collect();
+                history.push(pages);
             }
             assert_eq!(memory.evict_idle(usize::MAX), Ok(0));
             assert_eq!(admission.used(ResourceClass::Plaintext), 0);
@@ -3750,20 +4622,26 @@ pub(crate) mod tests {
         let plaintext = VerifiedPage {
             inner: Arc::new(VerifiedBytes {
                 page: page.clone(),
-                storage: flow_control::ChargedBytes {
-                    bytes: vec![1; 3],
-                    reservation: admission
-                        .reserve(Some(cache), ResourceClass::Plaintext, 3)
-                        .unwrap(),
-                },
+                storage: crate::memory::fixture_plaintext(admission, Some(cache), &[1; 3]),
             }),
         };
-        let ciphertext = BufferPool::new(admission.clone())
-            .ciphertext(
+        // Disk-aligned like production AEAD output, so persistence writes the
+        // body in place and stages only the header block.
+        let pool = BufferPool::new(admission.clone());
+        let mut buffer = pool
+            .encryption_output(
                 admission
                     .reserve(Some(cache), ResourceClass::Ciphertext, 19)
                     .unwrap(),
+                19,
+            )
+            .unwrap();
+        buffer.as_mut_slice().fill(2);
+        let ciphertext = pool
+            .aligned_ciphertext_page(
+                buffer,
                 PageEnvelope {
+                    page_size: racer_wire::object::PageSize::DEFAULT,
                     cipher: crate::model::PageCipher::Xaes256Gcm,
                     page,
                     key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
@@ -3771,7 +4649,6 @@ pub(crate) mod tests {
                     plaintext_length: 3,
                     ciphertext_length: 19,
                 },
-                vec![2; 19],
             )
             .unwrap();
         PageResult {
@@ -3781,7 +4658,7 @@ pub(crate) mod tests {
         }
     }
     #[test]
-    fn slab_ciphertext_keeps_pointer_capacity_checksum_and_rehomes() {
+    fn slab_ciphertext_keeps_pointer_capacity_and_rehomes() {
         for shared in [false, true] {
             let source = admission(8);
             let target = admission(8);
@@ -3789,17 +4666,17 @@ pub(crate) mod tests {
             let envelope = fixture.ciphertext.envelope().clone();
             let cache = envelope.page.version.object.cache.clone();
             drop(fixture);
-            let mut buffer = page_alloc::Alignment::new(4096, 4096, 4096)
-                .unwrap()
-                .allocate(
-                    4096,
-                    source
-                        .reserve(Some(&cache), ResourceClass::Ciphertext, 4096)
-                        .unwrap(),
-                )
-                .unwrap();
-            buffer.as_mut_slice()[137..156].fill(7);
-            let pointer = buffer.as_slice()[137..].as_ptr();
+            let mut buffer = page_alloc::buf::Buf::unpooled(
+                4096,
+                4096,
+                source
+                    .reserve(Some(&cache), ResourceClass::Ciphertext, 4096)
+                    .unwrap(),
+                false,
+            )
+            .unwrap();
+            buffer[137..156].fill(7);
+            let pointer = buffer[137..].as_ptr();
             let page = BufferPool::new(source.clone())
                 .slab_ciphertext(buffer, envelope, 137..156)
                 .unwrap();
@@ -3807,10 +4684,6 @@ pub(crate) mod tests {
             assert_eq!(page.bytes(), &[7; 19]);
             assert_eq!(page.inner.capacity(), 4096);
             assert_eq!(source.used(ResourceClass::Ciphertext), 4096);
-            page.expected_checksum(racer_crypto::crc64(&[7; 19]))
-                .unwrap();
-            assert_eq!(page.verify_checksum(), Ok(()));
-            let checksum = page.checksum();
             let retained = shared.then(|| page.clone());
             let moved = page
                 .rehome(
@@ -3820,8 +4693,6 @@ pub(crate) mod tests {
                 )
                 .unwrap();
             assert_eq!(moved.bytes().as_ptr() == pointer, !shared);
-            assert_eq!(moved.checksum(), checksum);
-            assert_eq!(moved.verify_checksum(), Ok(()));
             assert!(target.owns(moved.inner.reservation()));
             assert_eq!(
                 source.used(ResourceClass::Ciphertext),
@@ -3829,7 +4700,6 @@ pub(crate) mod tests {
             );
             std::thread::spawn(move || {
                 assert_eq!(moved.bytes(), &[7; 19]);
-                assert_eq!(moved.verify_checksum(), Ok(()));
                 drop(moved);
             })
             .join()
@@ -3841,7 +4711,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn slab_ciphertext_rejects_bad_ranges_authority_and_checksum() {
+    fn slab_ciphertext_rejects_bad_ranges_and_authority() {
         let source = admission(8);
         let other = admission(8);
         let fixture = bundle(&source, "slab");
@@ -3854,15 +4724,15 @@ pub(crate) mod tests {
             4090..4109,
             std::ops::Range { start: 20, end: 1 },
         ] {
-            let buffer = page_alloc::Alignment::new(4096, 4096, 4096)
-                .unwrap()
-                .allocate(
-                    4096,
-                    source
-                        .reserve(Some(&cache), ResourceClass::Ciphertext, 4096)
-                        .unwrap(),
-                )
-                .unwrap();
+            let buffer = page_alloc::buf::Buf::unpooled(
+                4096,
+                4096,
+                source
+                    .reserve(Some(&cache), ResourceClass::Ciphertext, 4096)
+                    .unwrap(),
+                false,
+            )
+            .unwrap();
             assert!(matches!(
                 BufferPool::new(source.clone()).slab_ciphertext(buffer, envelope.clone(), range),
                 Err(Error::CorruptRecord)
@@ -3870,9 +4740,12 @@ pub(crate) mod tests {
             assert_eq!(source.used(ResourceClass::Ciphertext), 0);
         }
         for class in [ResourceClass::Ciphertext, ResourceClass::Plaintext] {
-            let buffer = page_alloc::Alignment::new(4096, 4096, 4096)
-                .unwrap()
-                .allocate(4096, source.reserve(Some(&cache), class, 4096).unwrap());
+            let buffer = page_alloc::buf::Buf::unpooled(
+                4096,
+                4096,
+                source.reserve(Some(&cache), class, 4096).unwrap(),
+                false,
+            );
             if matches!(class, ResourceClass::Plaintext) {
                 assert!(matches!(
                     buffer,
@@ -3890,21 +4763,18 @@ pub(crate) mod tests {
             ));
             assert_eq!(source.used(class), 0);
         }
-        let buffer = page_alloc::Alignment::new(4096, 4096, 4096)
-            .unwrap()
-            .allocate(
-                4096,
-                source
-                    .reserve(Some(&cache), ResourceClass::Ciphertext, 4096)
-                    .unwrap(),
-            )
-            .unwrap();
+        let buffer = page_alloc::buf::Buf::unpooled(
+            4096,
+            4096,
+            source
+                .reserve(Some(&cache), ResourceClass::Ciphertext, 4096)
+                .unwrap(),
+            false,
+        )
+        .unwrap();
         let page = BufferPool::new(source.clone())
             .slab_ciphertext(buffer, envelope, 4077..4096)
             .unwrap();
-        page.expected_checksum(racer_crypto::crc64(page.bytes()) ^ 1)
-            .unwrap();
-        assert_eq!(page.verify_checksum(), Err(Error::CorruptRecord));
         assert!(matches!(
             page.rehome(
                 other
@@ -3930,19 +4800,19 @@ pub(crate) mod tests {
                 remote: [b'b'; 36],
             };
             page.ciphertext.provenance = Some(provenance);
-            let checksum = page.ciphertext.checksum();
             let pointer = page.ciphertext.bytes().as_ptr();
+            let original = page.ciphertext.bytes().to_vec();
             let retained = shared.then(|| page.ciphertext.clone());
             let reservation = target
                 .reserve(
                     Some(&page.metadata.version.object.cache),
                     ResourceClass::Ciphertext,
-                    19,
+                    page_alloc::buf::GRANULE,
                 )
                 .unwrap();
             let moved = page.ciphertext.rehome(reservation).unwrap();
             assert_eq!(moved.bytes().as_ptr() == pointer, !shared);
-            assert_eq!(moved.checksum(), checksum);
+            assert_eq!(moved.bytes(), &original[..]);
             assert_eq!(moved.provenance, Some(provenance));
             if let Some(retained) = &retained {
                 assert_eq!(retained.provenance, Some(provenance));
@@ -3950,9 +4820,12 @@ pub(crate) mod tests {
             assert!(target.owns(moved.inner.reservation()));
             assert_eq!(
                 source.used(ResourceClass::Ciphertext),
-                if shared { 19 } else { 0 }
+                if shared { page_alloc::buf::GRANULE } else { 0 }
             );
-            assert_eq!(target.used(ResourceClass::Ciphertext), 19);
+            assert_eq!(
+                target.used(ResourceClass::Ciphertext),
+                page_alloc::buf::GRANULE
+            );
             drop(retained);
             assert_eq!(source.used(ResourceClass::Ciphertext), 0);
             drop(moved);
@@ -3990,7 +4863,7 @@ pub(crate) mod tests {
         );
         // Length and cache mismatches are rejected and storage returns idle.
         assert!(matches!(
-            pool.aligned_ciphertext_page(fill(length - 1), envelope.clone(), None),
+            pool.aligned_ciphertext_page(fill(length - 1), envelope.clone()),
             Err(Error::CorruptRecord)
         ));
         let wrong = CacheId("wrong".into());
@@ -3999,24 +4872,26 @@ pub(crate) mod tests {
             .unwrap();
         buffer.as_mut_slice().fill(1);
         assert!(matches!(
-            pool.aligned_ciphertext_page(buffer, envelope.clone(), None),
+            pool.aligned_ciphertext_page(buffer, envelope.clone()),
             Err(Error::InvalidConfiguration)
         ));
-        assert_eq!(pool.aligned_stats().idle_buffers, 1);
-        assert_eq!(source.used(ResourceClass::Ciphertext), length);
+        assert_eq!(pool.disk_idle_bytes(), capacity);
+        assert_eq!(
+            source.used(ResourceClass::Ciphertext),
+            page_alloc::buf::GRANULE
+        );
 
         let mut buffer = pool
             .aligned_ciphertext(reserve(&source, &cache, capacity), length)
             .unwrap();
-        assert_eq!(pool.aligned_stats().idle_buffers, 0, "storage is recycled");
+        assert_eq!(pool.disk_idle_bytes(), 0, "storage is recycled");
         buffer
             .as_mut_slice()
             .copy_from_slice(base.ciphertext.bytes());
         let page = pool
-            .aligned_ciphertext_page(buffer, envelope.clone(), Some(7))
+            .aligned_ciphertext_page(buffer, envelope.clone())
             .unwrap();
         assert_eq!(page.bytes(), base.ciphertext.bytes());
-        assert_eq!(page.cached_checksum(), Some(7));
         let body = page.disk_body(alignment).unwrap();
         assert_eq!(body.as_ptr(), page.bytes().as_ptr());
         assert_eq!(body.len(), 4096);
@@ -4024,8 +4899,16 @@ pub(crate) mod tests {
         // A device needing a larger unit gets no zero-copy body.
         let stricter = page_alloc::Alignment::new(4096, 8192, 8192).unwrap();
         assert!(!page.is_disk_aligned(stricter));
-        // Vec-backed pages always need a copy.
-        assert!(!base.ciphertext.is_disk_aligned(alignment));
+        // Copied pages are not zero-padded and always need a copy.
+        let copied = BufferPool::new(source.clone())
+            .ciphertext(
+                reserve(&source, &cache, length),
+                envelope.clone(),
+                base.ciphertext.bytes(),
+            )
+            .unwrap();
+        assert!(!copied.is_disk_aligned(alignment));
+        drop(copied);
 
         // A shared page is copied into fresh aligned storage.
         let retained = page.clone();
@@ -4035,13 +4918,16 @@ pub(crate) mod tests {
         assert!(moved.is_disk_aligned(alignment));
         assert!(target.owns(moved.inner.reservation()));
         drop(retained);
-        assert_eq!(pool.aligned_stats().idle_buffers, 1);
-        assert_eq!(source.used(ResourceClass::Ciphertext), length);
+        assert_eq!(pool.disk_idle_bytes(), capacity);
+        assert_eq!(
+            source.used(ResourceClass::Ciphertext),
+            page_alloc::buf::GRANULE
+        );
         drop(moved);
         assert_eq!(target.used(ResourceClass::Ciphertext), 0);
         // Releasing idle storage keeps admission untouched.
         pool.reclaim_idle_buffers();
-        assert_eq!(pool.aligned_stats().idle_buffers, 0);
+        assert_eq!(pool.disk_idle_bytes(), 0);
     }
 
     #[test]
@@ -4060,38 +4946,45 @@ pub(crate) mod tests {
             let buffers: Vec<_> = (0..count).map(|_| take()).collect();
             drop(buffers);
         };
-        burst(ALIGNED_POOL_IDLE_PAGES);
-        assert_eq!(pool.aligned_stats().idle_buffers, ALIGNED_POOL_IDLE_PAGES);
+        let full = POOL_IDLE_PER_CLASS * capacity;
+        burst(POOL_IDLE_PER_CLASS);
+        assert_eq!(pool.disk_idle_bytes(), full);
         let window = page_alloc::DEFAULT_WINDOW;
         let start = std::time::Instant::now();
         assert_eq!(pool.maintain_idle_buffers(start), 0);
         // Active reuse every window keeps the pool full.
         for turn in 1..=20 {
-            burst(ALIGNED_POOL_IDLE_PAGES);
+            burst(POOL_IDLE_PER_CLASS);
             assert_eq!(pool.maintain_idle_buffers(start + window * turn), 0);
-            assert_eq!(pool.aligned_stats().idle_buffers, ALIGNED_POOL_IDLE_PAGES);
+            assert_eq!(pool.disk_idle_bytes(), full);
         }
-        // Once idle, a few windows release everything.
-        let mut now = start + window * 20;
-        for _ in 0..ALIGNED_POOL_IDLE_PAGES {
+        // Once idle, each window releases half; a few windows release all.
+        let mut now = start + window * 21;
+        assert_eq!(pool.maintain_idle_buffers(now), full / 2);
+        for _ in 0..POOL_IDLE_PER_CLASS {
             now += window;
             pool.maintain_idle_buffers(now);
         }
-        assert_eq!(pool.aligned_stats(), page_alloc::SharedPoolStats::default());
-        assert!(pool.aligned_pool_stats().trimmed >= ALIGNED_POOL_IDLE_PAGES as u64);
+        assert_eq!(pool.disk_idle_bytes(), 0);
+        assert!(pool.pool_stats().trimmed >= 2);
         assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+        assert_eq!(admission.used(ResourceClass::Pool), 0);
 
-        // Constrained pools refuse returns.
-        pool.constrain_idle_buffers(true);
+        // A constrained pool sheds at once and at every maintenance.
         burst(1);
-        assert_eq!(pool.aligned_stats().idle_buffers, 0);
+        pool.constrain_idle_buffers(true);
+        assert!(pool.pool_stats().constrained);
+        assert_eq!(pool.disk_idle_bytes(), 0);
+        burst(1);
+        assert_eq!(pool.maintain_idle_buffers(now), capacity);
+        assert_eq!(pool.disk_idle_bytes(), 0);
         pool.constrain_idle_buffers(false);
         burst(1);
-        assert_eq!(pool.aligned_stats().idle_buffers, 1);
+        assert_eq!(pool.disk_idle_bytes(), capacity);
     }
 
     #[test]
-    fn encryption_output_upgrades_exact_charges_and_falls_back_when_refused() {
+    fn encryption_output_upgrades_exact_charges_and_rejects_foreign_ones() {
         let source = admission(8);
         let pool = BufferPool::new(source.clone());
         let cache = CacheId("cache".into());
@@ -4101,25 +4994,22 @@ pub(crate) mod tests {
         let exact = source
             .reserve(Some(&cache), ResourceClass::Ciphertext, length)
             .unwrap();
-        let Ok(Ok(buffer)) = pool.encryption_output(exact, length) else {
-            panic!("aligned output");
-        };
+        let buffer = pool.encryption_output(exact, length).unwrap();
         assert_eq!(buffer.len(), length);
         assert_eq!(buffer.charge().amount(), capacity);
         assert_eq!(source.used(ResourceClass::Ciphertext), capacity);
         drop(buffer);
         assert_eq!(source.used(ResourceClass::Ciphertext), 0);
-        // A charge from another worker's admission is handed back unchanged.
+        // A charge from another worker's admission is rejected and released.
         let other = admission(8);
         let foreign = other
             .reserve(Some(&cache), ResourceClass::Ciphertext, length)
             .unwrap();
-        let returned = pool
-            .encryption_output(foreign, length)
-            .unwrap()
-            .unwrap_err();
-        assert!(other.owns(&returned));
-        assert_eq!(returned.amount(), length);
+        assert!(matches!(
+            pool.encryption_output(foreign, length),
+            Err(Error::InvalidConfiguration)
+        ));
+        assert_eq!(other.used(ResourceClass::Ciphertext), 0);
     }
 
     #[test]
@@ -4141,13 +5031,16 @@ pub(crate) mod tests {
                 Err(Error::InvalidConfiguration)
             ));
         }
-        assert_eq!(source.used(ResourceClass::Ciphertext), 19);
+        assert_eq!(
+            source.used(ResourceClass::Ciphertext),
+            page_alloc::buf::GRANULE
+        );
         assert_eq!(target.used(ResourceClass::Ciphertext), 0);
         assert_eq!(target.used(ResourceClass::Plaintext), 0);
     }
 
     #[test]
-    fn aead_fingerprints_reuse_crc_and_separate_body_from_identity() {
+    fn aead_fingerprints_record_stored_tag_and_separate_body_from_identity() {
         use crate::model::RequestId;
         use crate::security::capture_aead_failure;
         let admission = admission(8);
@@ -4158,16 +5051,9 @@ pub(crate) mod tests {
             // Production passes the already validated canonical page_aad bytes.
             let mut aad = p.envelope().nonce.0.to_vec();
             aad.extend_from_slice(p.envelope().page.version.etag.as_bytes());
-            capture_aead_failure(p, &aad, request)
+            capture_aead_failure(p, &aad, request, 0)
         };
-        assert_eq!(page.ciphertext.cached_checksum(), None);
-        assert_eq!(capture(&page.ciphertext).crc, None);
         assert_eq!(capture(&page.ciphertext).peer, None);
-        assert_eq!(
-            page.ciphertext.cached_checksum(),
-            None,
-            "capture must not hash payload"
-        );
         let provenance = crate::telemetry::PeerProvenance {
             request: RequestId([3; 16]),
             attempt: crate::model::AttemptId([4; 16]),
@@ -4175,8 +5061,6 @@ pub(crate) mod tests {
             remote: [b'b'; 36],
         };
         page.ciphertext.provenance = Some(provenance);
-        page.ciphertext.verify_checksum().unwrap();
-        assert_eq!(page.ciphertext.verify_checksum(), Ok(()));
         let first = capture(&page.ciphertext);
         let repeat = capture(&page.ciphertext);
         // Frozen SHA-256 vectors include the domain, u64 field lengths, exact
@@ -4201,23 +5085,24 @@ pub(crate) mod tests {
         assert_eq!(first.key, page.ciphertext.envelope().key_id.0);
         assert_eq!(first.nonce, [2; 24]);
         assert_eq!((first.plaintext, first.ciphertext), (3, 19));
-        assert_eq!(
-            first.crc,
-            Some(racer_crypto::crc64(page.ciphertext.bytes()))
-        );
+        let stored_tag = |p: &CiphertextPage| {
+            let bytes = p.bytes();
+            <[u8; 16]>::try_from(&bytes[bytes.len() - 16..]).unwrap()
+        };
+        assert_eq!(first.tag, stored_tag(&page.ciphertext));
         assert_eq!(first.page, repeat.page);
         assert_eq!(first.aad, repeat.aad);
-        assert_eq!(first.crc, repeat.crc);
+        assert_eq!(first.tag, repeat.tag);
         let inner = Arc::get_mut(&mut page.ciphertext.inner).unwrap();
-        inner.bytes[0] ^= 1;
+        // A body change before the tag leaves the stored tag fingerprint alone.
+        inner.fixture_bytes_mut()[0] ^= 1;
         assert!(page.validate_metadata().is_ok());
-        assert_eq!(page.ciphertext.verify_checksum(), Err(Error::CorruptRecord));
-        assert_eq!(capture(&page.ciphertext).crc, first.crc);
-        assert_eq!(page.ciphertext.cached_checksum(), first.crc);
-        Arc::get_mut(&mut page.ciphertext.inner).unwrap().checksum = std::sync::OnceLock::new();
-        page.ciphertext.verify_checksum().unwrap();
+        assert_eq!(capture(&page.ciphertext).tag, first.tag);
+        let inner = Arc::get_mut(&mut page.ciphertext.inner).unwrap();
+        let last = inner.fixture_bytes_mut().len() - 1;
+        inner.fixture_bytes_mut()[last] ^= 1;
         let changed = capture(&page.ciphertext);
-        assert_ne!(first.crc, changed.crc);
+        assert_ne!(first.tag, changed.tag);
         assert_eq!(first.page, changed.page);
         assert_eq!(first.aad, changed.aad);
         Arc::get_mut(&mut page.ciphertext.inner)
@@ -4226,7 +5111,7 @@ pub(crate) mod tests {
             .nonce
             .0[0] ^= 1;
         let changed_aad = capture(&page.ciphertext);
-        assert_eq!(changed.crc, changed_aad.crc);
+        assert_eq!(changed.tag, changed_aad.tag);
         assert_eq!(changed.page, changed_aad.page);
         assert_ne!(changed.aad, changed_aad.aad);
         let failures = crate::telemetry::Failures::default();
@@ -4250,24 +5135,39 @@ pub(crate) mod tests {
         assert_eq!(retained, text, "diagnostic facts do not retain page owners");
     }
     #[test]
-    fn plaintext_is_stable_zeroed_and_reservation_backed() {
+    fn plaintext_is_stable_pooled_and_reservation_backed() {
         let admission = admission(8);
         let pool = BufferPool::new(admission.clone());
         let cache = CacheId("cache".into());
+        let granule = page_alloc::buf::GRANULE;
         let reservation = admission
-            .reserve(Some(&cache), ResourceClass::Plaintext, 8)
+            .reserve(Some(&cache), ResourceClass::Plaintext, 3)
             .unwrap();
         let mut buffer = pool.plaintext(reservation, 3).unwrap();
-        assert_eq!(buffer.bytes().unwrap(), &[0; 3]);
         let pointer = buffer.bytes().unwrap().as_ptr();
         buffer.bytes_mut().unwrap().copy_from_slice(b"abc");
-        let (bytes, reservation) = buffer.into_parts();
-        assert_eq!(bytes.as_ptr(), pointer);
-        assert_eq!(&*bytes, b"abc");
-        assert_eq!(reservation.amount(), 3);
-        assert_eq!(admission.used(ResourceClass::Plaintext), 3);
-        drop((bytes, reservation));
+        // The charge is topped up to cover the pooled capacity.
+        assert_eq!(buffer.reservation().amount(), granule);
+        let storage = buffer.into_buf();
+        assert_eq!(storage.as_ptr(), pointer);
+        assert_eq!(&*storage, b"abc");
+        assert!(storage.wipes());
+        assert_eq!(admission.used(ResourceClass::Plaintext), granule);
+        drop(storage);
         assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+        // The idle buffer is reused, charged to the pool while idle.
+        assert_eq!(admission.used(ResourceClass::Pool), granule);
+        let reused = pool
+            .plaintext_storage(
+                admission
+                    .reserve(Some(&cache), ResourceClass::Plaintext, granule)
+                    .unwrap(),
+                3,
+            )
+            .unwrap();
+        assert_eq!(reused.as_ptr(), pointer);
+        assert_eq!(&*reused, &[0; 3], "pooled plaintext is wiped on return");
+        assert_eq!(admission.used(ResourceClass::Pool), 0);
     }
     #[test]
     fn allocations_reject_wrong_provenance_class_cache_and_bounds() {
@@ -4358,8 +5258,11 @@ pub(crate) mod tests {
         let pointer = cipher.bytes().as_ptr();
         assert_eq!(page.ciphertext.bytes().as_ptr(), pointer);
         drop(page);
-        assert_eq!(admission.used(ResourceClass::Plaintext), 3);
-        assert_eq!(admission.used(ResourceClass::Ciphertext), 19);
+        assert_eq!(admission.used(ResourceClass::Plaintext), 4096);
+        assert_eq!(
+            admission.used(ResourceClass::Ciphertext),
+            page_alloc::buf::GRANULE
+        );
         std::thread::spawn(move || drop((plain, cipher)))
             .join()
             .unwrap();
@@ -4417,8 +5320,7 @@ pub(crate) mod tests {
                 let mut page = crate::memory::tests::bundle(&admission, "v1");
                 std::sync::Arc::get_mut(&mut page.ciphertext.inner)
                     .unwrap()
-                    .bytes
-                    .resize(length, 0);
+                    .fixture_resize(length, 0);
                 let expected = if length == 19 {
                     Ok(())
                 } else {
@@ -4477,6 +5379,8 @@ pub(crate) mod tests {
                 queue_entries: small,
                 connections_per_neighbor: small,
                 client_connections: small,
+                peer_connections: small,
+                outbound_connections: small,
                 pipes: std::num::NonZeroUsize::new(pipes).unwrap(),
                 range_window_pages: small,
                 header_bytes: small,
@@ -4497,31 +5401,19 @@ pub(crate) mod tests {
             use std::task::Poll;
             use std::time::Duration;
             use std::time::Instant;
+            let env = racer_io::Env::host();
             let admission = admission(1);
-            let pool = new_pipe_pool(admission.clone());
+            let pool = new_pipe_pool(admission.clone(), env.sim_os().cloned());
             let scope =
-                RequestScope::new(RequestId([0; 16]), Instant::now() + Duration::from_secs(5))
+                RequestScope::host(RequestId([0; 16]), Instant::now() + Duration::from_secs(5))
                     .unwrap();
-            let mut registrations = Vec::new();
-            loop {
-                match scope.cancellation.subscribe() {
-                    Ok(registration) => registrations.push(registration),
-                    Err(Error::Overloaded) => break,
-                    Err(error) => panic!("unexpected registration failure: {error:?}"),
-                }
-                assert!(registrations.len() <= 1024);
-            }
             let mut cx = Context::from_waker(Waker::noop());
             let Poll::Ready(Ok(held)) = acquire_wait(&pool, &scope).as_mut().poll(&mut cx) else {
-                panic!("immediate acquisition unnecessarily subscribed")
+                panic!("immediate acquisition failed")
             };
-            assert!(matches!(
-                acquire_wait(&pool, &scope).as_mut().poll(&mut cx),
-                Poll::Ready(Err(Error::Overloaded))
-            ));
+            assert_eq!(scope.cancellation.waiters(), 0);
             assert_eq!(admission.used(ResourceClass::RequestContext), 0);
             assert_eq!(admission.used(ResourceClass::Pipe), 1);
-            drop(registrations);
             let mut wait = acquire_wait(&pool, &scope);
             assert!(wait.as_mut().poll(&mut cx).is_pending());
             drop(held);
@@ -4538,16 +5430,17 @@ pub(crate) mod tests {
             use std::task::Poll;
             use std::time::Duration;
             use std::time::Instant;
+            let env = racer_io::Env::host();
             for failure in [
-                Some(Error::Cancelled),
+                Some(Error::Canceled),
                 Some(Error::DeadlineExceeded),
                 Some(Error::Unavailable),
                 None,
             ] {
                 let admission = admission(1);
-                let pool = new_pipe_pool(admission.clone());
+                let pool = new_pipe_pool(admission.clone(), env.sim_os().cloned());
                 let held = pool.acquire().unwrap();
-                let scope = RequestScope::new(
+                let scope = RequestScope::host(
                     RequestId([0; 16]),
                     Instant::now()
                         + if failure == Some(Error::DeadlineExceeded) {
@@ -4567,7 +5460,7 @@ pub(crate) mod tests {
                     pool.waiter_bytes()
                 );
                 match failure {
-                    Some(Error::Cancelled) => {
+                    Some(Error::Canceled) => {
                         scope.cancel().unwrap();
                         assert!(count.count() > 0);
                     }
@@ -4586,7 +5479,7 @@ pub(crate) mod tests {
                 drop(held);
                 if failure != Some(Error::Unavailable) {
                     // No stale FIFO entry may prevent the next caller's progress.
-                    let fresh = RequestScope::new(
+                    let fresh = RequestScope::host(
                         RequestId([1; 16]),
                         Instant::now() + Duration::from_secs(5),
                     )

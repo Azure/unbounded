@@ -6,17 +6,27 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+// REST loopback fixtures are shared by unit and integration tests and name `racer::`.
+#[cfg(test)]
+extern crate self as racer;
+
 pub mod admission;
+pub mod affinity;
 pub mod app;
 pub mod client;
 pub mod config;
 pub mod control;
+pub mod drivers;
+pub mod enrollment;
 pub mod error;
+pub mod fd_limit;
 pub mod gpu;
+pub mod gpu_landing;
 pub mod gpu_slot;
 pub mod gpu_telemetry;
 pub mod hardware;
 pub mod http;
+pub mod lifecycle;
 pub mod memory;
 pub mod model;
 pub mod origin;
@@ -33,6 +43,7 @@ pub mod security;
 pub mod store;
 pub mod telemetry;
 pub mod topology;
+pub mod uds_endpoint;
 pub mod worker;
 
 #[cfg(feature = "subscription-interop")]

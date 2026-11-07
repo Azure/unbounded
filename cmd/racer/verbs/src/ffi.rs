@@ -3,15 +3,23 @@
 //! Only the native thread uses these. Each type owns one RDMA object and frees
 //! it on drop. If freeing fails, the object is leaked on purpose, along with
 //! everything it depends on, because the NIC may still be using it.
+//!
+//! The adapter only wraps libibverbs and librdmacm calls. Policy lives here:
+//! the device mode (window or registration, see `registration.rs`), the work
+//! request ledger in [`NativeQueuePair`], and the connection manager state
+//! machine.
 use crate::{DeviceMemory, Error, GuardOwner, Result};
 
 use std::{
     cell::{Cell, RefCell},
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     ffi::{CStr, c_char, c_int, c_void},
     ptr::NonNull,
-    rc::Rc,
-    sync::Arc,
+    rc::{Rc, Weak},
+    sync::{
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
 };
 
 #[cfg(any(test, feature = "simulation"))]
@@ -22,12 +30,23 @@ pub mod simulation;
 #[path = "discovery_fault_tests.rs"]
 mod discovery_fault_tests;
 
+#[path = "registration.rs"]
+mod registration;
+
+#[cfg(test)]
+#[path = "registration_tests.rs"]
+mod registration_tests;
+
+use registration::{Cm, Conn, State};
+pub(crate) use registration::{HUGE, WRITE_WRS};
+
 /// One port from `discover`. Matches `struct rdma_verbs_port` in C.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Port {
     name: [c_char; 64],
 
+    /// GID index 0.
     gid: [u8; 16],
 
     mtu: u32,
@@ -37,16 +56,134 @@ struct Port {
     port: u8,
 
     link_layer: u8,
+
+    /// The IPv4-mapped RoCE GID at `ipv4_index`, if that is not -1.
+    ipv4_gid: [u8; 16],
+
+    ipv4_index: i32,
+
+    /// `PORT_*` facts.
+    flags: u32,
+}
+
+impl Port {
+    /// An empty entry for `discover` to fill.
+    const EMPTY: Self = Self {
+        name: [0; 64],
+        gid: [0; 16],
+        mtu: 0,
+        lid: 0,
+        port: 0,
+        link_layer: 0,
+        ipv4_gid: [0; 16],
+        ipv4_index: -1,
+        flags: 0,
+    };
+}
+
+/// `RDMA_VERBS_PORT_MW`: the device has type 2B memory windows.
+const PORT_MW: u32 = 1;
+
+/// `RDMA_VERBS_PORT_RC`: the device can create RC QPs.
+const PORT_RC: u32 = 2;
+
+/// A device's capabilities for one port. Matches `struct rdma_verbs_caps`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct Caps {
+    /// `CAP_*` bits.
+    flags: u32,
+
+    /// The port's maximum message size.
+    max_msg_sz: u32,
+
+    /// The IPv4-mapped GID's index, or -1.
+    ipv4_index: i32,
+
+    /// The IPv4 address in that GID.
+    ipv4: [u8; 4],
+
+    /// The device's `max_qp_wr`: work requests per send or receive queue.
+    /// Zero means unknown, treated as unlimited.
+    pub(crate) max_qp_wr: u32,
+
+    /// The device's `max_cqe`: entries per CQ. Zero means unknown.
+    pub(crate) max_cqe: u32,
+
+    /// The device's `max_mw`: memory windows. Zero means unknown.
+    pub(crate) max_mw: u32,
+}
+
+/// `RDMA_VERBS_CAP_MW`: type 2B memory windows.
+#[cfg(any(test, feature = "simulation"))]
+const CAP_MW: u32 = 1;
+
+/// `RDMA_VERBS_CAP_ODP`: implicit on-demand paging for RC writes.
+const CAP_ODP: u32 = 2;
+
+/// One scatter-gather entry. Matches `struct rdma_verbs_sge`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct Sge {
+    addr: u64,
+
+    length: u32,
+
+    lkey: u32,
+}
+
+/// `RDMA_VERBS_POST_IMM`: the write carries an immediate.
+const POST_IMM: u32 = 1;
+
+/// `RDMA_VERBS_POST_SIGNALED`: the write completes on this side's CQ.
+const POST_SIGNALED: u32 = 2;
+
+/// One connection manager event. Matches `struct rdma_verbs_cm_event`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CmEvent {
+    /// Pass to `cm_ack`.
+    handle: *mut c_void,
+
+    id: *mut c_void,
+
+    listen_id: *mut c_void,
+
+    kind: i32,
+
+    status: i32,
+
+    private_len: u32,
+
+    private: [u8; 56],
+
+    reserved: u32,
+}
+
+impl Default for CmEvent {
+    fn default() -> Self {
+        Self {
+            handle: std::ptr::null_mut(),
+            id: std::ptr::null_mut(),
+            listen_id: std::ptr::null_mut(),
+            kind: -1,
+            status: 0,
+            private_len: 0,
+            private: [0; 56],
+            reserved: 0,
+        }
+    }
 }
 
 /// A QP's address. Swap these with the peer to connect.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Endpoint {
-    /// Port GID.
+    /// Port GID. In registration mode, the IPv4-mapped GID.
     pub gid: [u8; 16],
 
-    /// QP number. Nonzero, 24 bits.
+    /// QP number. Nonzero, 24 bits. In registration mode, a token naming the
+    /// QP in the connection request.
     pub qpn: u32,
 
     /// Starting packet sequence number. 24 bits.
@@ -110,7 +247,11 @@ const WC_IMM: u32 = 1;
 
 /// Native adapter ABI version this crate speaks.
 #[cfg(any(test, all(feature = "native", target_os = "linux")))]
-const ABI_VERSION: u32 = 6;
+const ABI_VERSION: u32 = 10;
+
+/// Completions one [`NativeQueuePair::progress_with`] call reads. A full
+/// batch means more may be waiting without a new channel event.
+pub(crate) const POLL_BATCH: usize = 32;
 
 /// Completion opcodes (`enum ibv_wc_opcode`), pinned by C static asserts.
 pub(crate) mod opcode {
@@ -151,19 +292,24 @@ pub(crate) mod status {
 pub(crate) struct Access(u32);
 
 impl Access {
-    /// Page buffers: `LOCAL_WRITE | MW_BIND`. Remote writes only via windows.
+    /// Page buffers: `LOCAL_WRITE | MW_BIND`. Remote writes only via windows
+    /// (or, in registration mode, per-grant registrations).
     pub(crate) const PAGES: Self = Self(1);
 
     /// Control slots: `LOCAL_WRITE` only.
     pub(crate) const CONTROL: Self = Self(2);
+
+    /// `REMOTE_WRITE` on a registration.
+    const REMOTE_WRITE: u32 = 4;
 
     /// Page buffers plus `REMOTE_WRITE` on the region itself. Tests only:
     /// production grants remote access through memory windows alone.
     #[cfg(test)]
     pub(crate) const PAGES_REMOTE_WRITE: Self = Self(1 | 4);
 
-    /// Marks an implicit ODP region from `rdma_verbs_register_implicit`.
-    /// Never passed to `rdma_verbs_register`; only a local write source.
+    /// Marks an implicit ODP region from `rdma_verbs_register_implicit`, or
+    /// a registration-mode source region. Never passed to
+    /// `rdma_verbs_register`; only a local write source.
     pub(crate) const IMPLICIT: Self = Self(8);
 
     /// Marks a dma-buf page region from `rdma_verbs_register_dmabuf`. Never
@@ -174,6 +320,19 @@ impl Access {
     pub(crate) fn bits(self) -> u32 {
         self.0
     }
+}
+
+/// How a device grants remote access and connects QPs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Mode {
+    /// Type 2 memory windows bound per grant, implicit ODP for write
+    /// sources, QPs connected with plain verbs (mlx5).
+    Window,
+
+    /// No windows and no ODP: per-grant and per-write registrations, QPs
+    /// connected through the connection manager (MANA). See
+    /// `registration.rs`.
+    Registration,
 }
 
 /// A successful completion, as reported by
@@ -245,15 +404,33 @@ macro_rules! native_api {
 native_api! {
     discover: unsafe extern "C" fn(*mut Port, u32) -> c_int,
 
-    open: unsafe extern "C" fn(*const c_char) -> *mut c_void,
+    open: unsafe extern "C" fn(*const c_char, c_int) -> *mut c_void,
 
     close: unsafe extern "C" fn(*mut c_void) -> c_int,
 
-    qp: unsafe extern "C" fn(*mut c_void, u8, u32, u32, *mut u32) -> *mut c_void,
+    query_caps: unsafe extern "C" fn(*mut c_void, u8, *mut Caps) -> c_int,
 
-    connect: unsafe extern "C" fn(*mut c_void, *const Endpoint, *const Endpoint, c_int) -> c_int,
+    comp_channel: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
 
-    stop: unsafe extern "C" fn(*mut c_void) -> c_int,
+    comp_channel_fd: unsafe extern "C" fn(*mut c_void) -> c_int,
+
+    comp_channel_free: unsafe extern "C" fn(*mut c_void) -> c_int,
+
+    cq_create: unsafe extern "C" fn(*mut c_void, u32, *mut c_void) -> *mut c_void,
+
+    cq_free: unsafe extern "C" fn(*mut c_void) -> c_int,
+
+    req_notify: unsafe extern "C" fn(*mut c_void) -> c_int,
+
+    get_cq_event: unsafe extern "C" fn(*mut c_void, *mut *mut c_void) -> c_int,
+
+    ack_cq_events: unsafe extern "C" fn(*mut c_void, u32),
+
+    qp: unsafe extern "C" fn(*mut c_void, *mut c_void, u8, u32, u32, *mut u32) -> *mut c_void,
+
+    connect: unsafe extern "C" fn(*mut c_void, *const Endpoint, *const Endpoint) -> c_int,
+
+    qp_error: unsafe extern "C" fn(*mut c_void) -> c_int,
 
     qp_free: unsafe extern "C" fn(*mut c_void) -> c_int,
 
@@ -261,27 +438,65 @@ native_api! {
 
     register_implicit: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
 
+    prefetch: unsafe extern "C" fn(*mut c_void, u64, u32) -> c_int,
+
     register_dmabuf: unsafe extern "C" fn(*mut c_void, u64, u64, u64, c_int) -> *mut c_void,
 
     deregister: unsafe extern "C" fn(*mut c_void) -> c_int,
 
     bytes: unsafe extern "C" fn(*mut c_void) -> *mut u8,
 
+    lkey: unsafe extern "C" fn(*mut c_void) -> u32,
+
+    reg_mr: unsafe extern "C" fn(*mut c_void, u64, u64, u32, *mut u32, *mut u32) -> *mut c_void,
+
+    dereg_mr: unsafe extern "C" fn(*mut c_void) -> c_int,
+
     window: unsafe extern "C" fn(*mut c_void, *mut u32) -> *mut c_void,
 
     window_free: unsafe extern "C" fn(*mut c_void) -> c_int,
 
-    bind: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut u32, u64, u64, u32) -> c_int,
+    bind: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, u32, u64, u64, u32) -> c_int,
 
-    invalidate: unsafe extern "C" fn(*mut c_void, *mut c_void, u32, u64) -> c_int,
+    invalidate: unsafe extern "C" fn(*mut c_void, u32, u64) -> c_int,
 
-    write_imm: unsafe extern "C" fn(*mut c_void, *mut c_void, u64, u32, u64, u32, u32, u64) -> c_int,
+    post_write: unsafe extern "C" fn(*mut c_void, *const Sge, u32, u64, u32, u32, u32, u64) -> c_int,
 
-    send: unsafe extern "C" fn(*mut c_void, *mut c_void, u64, u32, u64) -> c_int,
+    post_send: unsafe extern "C" fn(*mut c_void, *const Sge, u32, u64) -> c_int,
 
-    post_recv: unsafe extern "C" fn(*mut c_void, *mut c_void, u64, u32, u64) -> c_int,
+    post_recv: unsafe extern "C" fn(*mut c_void, *const Sge, u32, u64) -> c_int,
 
     poll: unsafe extern "C" fn(*mut c_void, *mut Completion, u32) -> c_int,
+
+    cm_channel: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
+
+    cm_channel_fd: unsafe extern "C" fn(*mut c_void) -> c_int,
+
+    cm_channel_free: unsafe extern "C" fn(*mut c_void) -> c_int,
+
+    cm_listen: unsafe extern "C" fn(*mut c_void, *mut c_void, *const u8, u16, *mut *mut c_void) -> c_int,
+
+    cm_id: unsafe extern "C" fn(*mut c_void, *mut *mut c_void) -> c_int,
+
+    cm_resolve_addr: unsafe extern "C" fn(*mut c_void, *const u8, *const u8, u16, c_int) -> c_int,
+
+    cm_resolve_route: unsafe extern "C" fn(*mut c_void, c_int) -> c_int,
+
+    cm_create_qp: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, u32, u32, *mut u32) -> *mut c_void,
+
+    cm_connect: unsafe extern "C" fn(*mut c_void, *const u8, u32) -> c_int,
+
+    cm_accept: unsafe extern "C" fn(*mut c_void, *const u8, u32) -> c_int,
+
+    cm_reject: unsafe extern "C" fn(*mut c_void) -> c_int,
+
+    cm_get_event: unsafe extern "C" fn(*mut c_void, *mut CmEvent) -> c_int,
+
+    cm_ack: unsafe extern "C" fn(*mut c_void),
+
+    cm_destroy_id: unsafe extern "C" fn(*mut c_void) -> c_int,
+
+    cm_detach: unsafe extern "C" fn(*mut c_void) -> c_int,
 }
 
 /// C's `RDMA_VERBS_CLEANUP_LEAK`, outside the negative errno range.
@@ -368,9 +583,81 @@ pub(crate) struct NativeDevice {
 
     /// Port info. `qpn` and `psn` are unset.
     pub(crate) endpoint: Endpoint,
+
+    pub(crate) mode: Mode,
+
+    caps: Caps,
+
+    /// The completion channel every CQ on the device reports to.
+    comp: Option<NonNull<c_void>>,
+
+    /// Whether each live CQ is armed, by CQ handle.
+    armed: RefCell<BTreeMap<usize, Rc<Cell<bool>>>>,
+    /// Counts [`Self::progress`] passes over the completion channel.
+    passes: Cell<u64>,
+    /// Scratch for [`Self::progress`]: events to ack, counted per CQ.
+    acks: RefCell<Vec<(*mut c_void, u32)>>,
+    /// Inside a [`Self::begin_pass`] window: every event raised before the
+    /// window opened has been consumed, so a QP whose CQ is still armed and
+    /// was drained in an earlier pass has nothing new to poll.
+    in_pass: Cell<bool>,
+
+    /// Registration mode: the connection manager.
+    cm: Option<Cm>,
+
+    /// Source registrations whose deregistration failed for good. Each one
+    /// leaked and quarantined its owner's charge.
+    leaked_registrations: Cell<usize>,
+
+    /// Wakes the owner when a reaper thread finishes a teardown.
+    waker: RefCell<Option<std::task::Waker>>,
+
+    /// Destroy QPs and ids on a reaper thread (see `reaper.rs`) instead of
+    /// on the owner thread.
+    offload_teardown: bool,
 }
 
 impl NativeDevice {
+    /// Whether the device supports implicit on-demand paging for RC writes.
+    pub(crate) fn supports_implicit(&self) -> bool {
+        self.caps.flags & CAP_ODP != 0
+    }
+
+    /// The largest grants per link whose QP and CQ fit this device's
+    /// reported limits, or `None` if not even one grant fits.
+    pub(crate) fn max_grants(&self) -> Option<u32> {
+        crate::link::max_grants(self.mode, &self.caps)
+    }
+
+    /// A device over `raw` with nothing else created yet.
+    fn new(
+        api: Rc<Api>,
+        raw: NonNull<c_void>,
+        quota: Option<Arc<GuardOwner>>,
+        name: String,
+        endpoint: Endpoint,
+        mode: Mode,
+    ) -> Self {
+        Self {
+            api,
+            raw,
+            quota,
+            name,
+            endpoint,
+            mode,
+            caps: Caps::default(),
+            comp: None,
+            armed: RefCell::new(BTreeMap::new()),
+            passes: Cell::new(0),
+            acks: RefCell::new(Vec::new()),
+            in_pass: Cell::new(false),
+            cm: None,
+            leaked_registrations: Cell::new(0),
+            waker: RefCell::new(None),
+            offload_teardown: false,
+        }
+    }
+
     /// NUMA node from sysfs (or the simulation), if known.
     pub(crate) fn numa_node(&self) -> Option<usize> {
         #[cfg(any(test, feature = "simulation"))]
@@ -389,12 +676,141 @@ impl NativeDevice {
         .parse()
         .ok()
     }
+
+    /// True for the simulated fabric.
+    fn simulated(&self) -> bool {
+        #[cfg(any(test, feature = "simulation"))]
+        return simulation::is_api(&self.api);
+        #[cfg(not(any(test, feature = "simulation")))]
+        false
+    }
+
+    /// File descriptors to wait on for this device's progress: the
+    /// completion channel and, in registration mode, the connection manager
+    /// channel. Both are nonblocking; poll the owner when one is readable.
+    #[cfg(test)]
+    pub(crate) fn fds(&self) -> Vec<c_int> {
+        let mut fds = Vec::new();
+        self.fds_into(&mut fds);
+        fds
+    }
+
+    /// Append [`Self::fds`] to `out` without allocating a new Vec.
+    pub(crate) fn fds_into(&self, out: &mut Vec<c_int>) {
+        if let Some(comp) = self.comp {
+            out.push(unsafe { (self.api.comp_channel_fd)(comp.as_ptr()) });
+        }
+        if let Some(cm) = &self.cm {
+            out.push(cm.fd());
+        }
+    }
+
+    /// Handle every waiting completion channel and connection manager
+    /// event without blocking. A CQ with an event is re-armed (then
+    /// re-polled) by its QP's next progress.
+    pub(crate) fn progress(&self) {
+        if let Some(comp) = self.comp {
+            // Ack once per CQ rather than once per event: each ack takes the
+            // CQ's lock in libibverbs.
+            let mut acks = self.acks.borrow_mut();
+            acks.clear();
+            loop {
+                let mut cq = std::ptr::null_mut();
+                if unsafe { (self.api.get_cq_event)(comp.as_ptr(), &mut cq) } != 0 {
+                    break;
+                }
+                match acks.iter_mut().find(|(c, _)| *c == cq) {
+                    Some((_, count)) => *count += 1,
+                    None => acks.push((cq, 1)),
+                }
+                if let Some(armed) = self.armed.borrow().get(&(cq as usize)) {
+                    armed.set(false);
+                }
+            }
+            for &(cq, count) in acks.iter() {
+                unsafe { (self.api.ack_cq_events)(cq, count) };
+            }
+            acks.clear();
+            drop(acks);
+            self.passes.set(self.passes.get().wrapping_add(1));
+        }
+        if let Some(cm) = &self.cm {
+            cm.progress(self);
+        }
+    }
+
+    /// Handle channel events like [`Self::progress`] and open a pass in
+    /// which QPs may skip polling CQs that raised no event. The owner must
+    /// poll every QP on the device, then call [`Self::end_pass`].
+    pub(crate) fn begin_pass(&self) {
+        self.progress();
+        self.in_pass.set(true);
+    }
+
+    /// Wake `waker` when a teardown of a QP on this device finishes.
+    pub(crate) fn set_waker(&self, waker: &std::task::Waker) {
+        let mut current = self.waker.borrow_mut();
+        if !current.as_ref().is_some_and(|w| w.will_wake(waker)) {
+            *current = Some(waker.clone());
+        }
+    }
+
+    /// True once the connection manager reported the device removed. Every
+    /// QP and id on it is dead; only teardown remains.
+    pub(crate) fn removed(&self) -> bool {
+        self.cm.as_ref().is_some_and(Cm::removed)
+    }
+
+    /// Close the pass opened by [`Self::begin_pass`].
+    pub(crate) fn end_pass(&self) {
+        self.in_pass.set(false);
+    }
+
+    #[cfg(test)]
+    /// Source registrations that leaked for good.
+    pub(crate) fn leaked_registrations(&self) -> usize {
+        self.leaked_registrations.get()
+    }
+
+    /// Keep an MR whose deregistration failed for good, charged forever.
+    fn leak_registration(&self, quota: &Arc<GuardOwner>) {
+        self.leaked_registrations
+            .set(self.leaked_registrations.get() + 1);
+        quota.quarantine();
+        std::mem::forget(quota.clone());
+    }
+
+    /// Stop accepting connections, so another device can listen on this
+    /// one's address. False if the listener leaked.
+    pub(crate) fn stop_listening(&self) -> bool {
+        self.cm
+            .as_ref()
+            .is_none_or(|cm| cm.stop_listening(&self.api))
+    }
+
+    /// Release this device's own objects before closing. False if any
+    /// leaked.
+    fn release(&mut self) -> bool {
+        if let Some(cm) = &mut self.cm {
+            if !cm.close(&self.api) {
+                return false;
+            }
+            self.cm = None;
+        }
+        if let Some(comp) = self.comp {
+            if unsafe { (self.api.comp_channel_free)(comp.as_ptr()) } != 0 {
+                return false;
+            }
+            self.comp = None;
+        }
+        true
+    }
 }
 
 impl Drop for NativeDevice {
     /// Close the device. On failure, keep the library and charged owner.
     fn drop(&mut self) {
-        if unsafe { (self.api.close)(self.raw.as_ptr()) } != 0 {
+        if !self.release() || unsafe { (self.api.close)(self.raw.as_ptr()) } != 0 {
             if let Some(quota) = self.quota.take() {
                 quota.quarantine();
                 std::mem::forget(quota);
@@ -405,7 +821,7 @@ impl Drop for NativeDevice {
 }
 
 /// List ports and open a device for each. Fails on more than 64 ports.
-/// Skips ports whose device will not open.
+/// Skips ports whose device will not open or set up.
 pub(crate) fn discover() -> Result<Vec<NativeDevice>> {
     discover_with_quota(|| None)
 }
@@ -425,19 +841,16 @@ pub(crate) fn discover_with_quota(
 }
 
 /// Charge temporary discovery contexts before calling into the adapter.
+///
+/// Picks each port's mode: window mode on devices with memory windows,
+/// registration mode on devices that can create RC QPs and have an
+/// IPv4-mapped GID (the connection manager addresses peers by IPv4).
 fn discover_with_api(
     api: Rc<Api>,
     mut quota: impl FnMut() -> Option<Arc<GuardOwner>>,
 ) -> Result<Vec<NativeDevice>> {
     let discovery_quota = quota();
-    let mut ports = [Port {
-        name: [0; 64],
-        gid: [0; 16],
-        mtu: 0,
-        lid: 0,
-        port: 0,
-        link_layer: 0,
-    }; 64];
+    let mut ports = [Port::EMPTY; 64];
     let count = unsafe { (api.discover)(ports.as_mut_ptr(), ports.len() as u32) };
     if count == CLEANUP_LEAK {
         if let Some(quota) = discovery_quota {
@@ -459,8 +872,16 @@ fn discover_with_api(
             .to_str()
             .map_err(|_| Error::Io)?
             .to_owned();
+        let (mode, gid) = if port.flags & PORT_MW != 0 {
+            (Mode::Window, port.gid)
+        } else if port.flags & PORT_RC != 0 && port.ipv4_index >= 0 {
+            (Mode::Registration, port.ipv4_gid)
+        } else {
+            continue;
+        };
         let open_quota = quota();
-        let raw = unsafe { (api.open)(port.name.as_ptr()) };
+        let raw =
+            unsafe { (api.open)(port.name.as_ptr(), c_int::from(mode == Mode::Registration)) };
         if raw == OPEN_CLEANUP_LEAK {
             if let Some(quota) = open_quota {
                 quota.quarantine();
@@ -470,15 +891,20 @@ fn discover_with_api(
             return Err(Error::Unavailable);
         }
         let Some(raw) = NonNull::new(raw) else {
+            eprintln!(
+                "racer: stage=rdma-discover device={name} port={} skipped=open_failed mode={mode:?}",
+                port.port
+            );
             continue;
         };
-        devices.push(NativeDevice {
-            api: api.clone(),
+        // From here dropping `device` releases whatever was set up.
+        let mut device = NativeDevice::new(
+            api.clone(),
             raw,
-            quota: open_quota,
+            open_quota,
             name,
-            endpoint: Endpoint {
-                gid: port.gid,
+            Endpoint {
+                gid,
                 qpn: 0,
                 psn: 0,
                 mtu: port.mtu,
@@ -486,7 +912,40 @@ fn discover_with_api(
                 port: port.port,
                 link_layer: port.link_layer,
             },
-        });
+            mode,
+        );
+        // Real devices tear QPs down on a reaper thread; the simulation is
+        // single-threaded and deterministic.
+        device.offload_teardown = !device.simulated();
+        if unsafe { (api.query_caps)(raw.as_ptr(), port.port, &mut device.caps) } != 0 {
+            continue;
+        }
+        if mode == Mode::Registration
+            && (u64::from(device.caps.max_msg_sz) < registration::CHUNK
+                || device.caps.ipv4_index < 0
+                || registration::ipv4_of(&gid) != Some(device.caps.ipv4))
+        {
+            continue;
+        }
+        let Some(comp) = NonNull::new(unsafe { (api.comp_channel)(raw.as_ptr()) }) else {
+            continue;
+        };
+        device.comp = Some(comp);
+        if mode == Mode::Registration {
+            match Cm::start(&api, raw, device.caps.ipv4, registration::cm_port()) {
+                Ok(Some(cm)) => device.cm = Some(cm),
+                Ok(None) => continue,
+                Err(()) => {
+                    if let Some(quota) = device.quota.take() {
+                        quota.quarantine();
+                        std::mem::forget(quota);
+                    }
+                    std::mem::forget(device);
+                    return Err(Error::Unavailable);
+                }
+            }
+        }
+        devices.push(device);
     }
     Ok(devices)
 }
@@ -501,7 +960,12 @@ fn discover_with_api(
 pub(crate) struct NativeRegion {
     device: Rc<NativeDevice>,
 
-    raw: NonNull<c_void>,
+    /// `None` for a registration-mode source region, which registers each
+    /// write's memory instead.
+    raw: Option<NonNull<c_void>>,
+
+    /// The local key. 0 without `raw`.
+    lkey: u32,
 
     /// The dma-buf owner. Kept alive while registered, and leaked with the
     /// region if deregister fails.
@@ -526,13 +990,16 @@ impl NativeRegion {
         if length == 0 || u64::try_from(length).is_err() {
             return Err(Error::InvalidRange);
         }
+        let bits = register_bits(&device, access);
         let raw = NonNull::new(unsafe {
-            (device.api.register)(device.raw.as_ptr(), length as u64, access.bits())
+            (device.api.register)(device.raw.as_ptr(), length as u64, bits)
         })
         .ok_or(Error::Unavailable)?;
+        let lkey = unsafe { (device.api.lkey)(raw.as_ptr()) };
         Ok(Rc::new(Self {
             device,
-            raw,
+            raw: Some(raw),
+            lkey,
             memory: None,
             length,
             quota: Some(quota),
@@ -542,6 +1009,9 @@ impl NativeRegion {
 
     /// Register all of `memory`'s dma-buf range as page buffers. `memory`
     /// stays alive until deregister succeeds, or forever if it fails.
+    /// Window mode only. The owner registers through [`Registering::dmabuf`]
+    /// instead; tests build device pools with this synchronous form.
+    #[cfg(test)]
     pub(crate) fn dmabuf(
         device: Rc<NativeDevice>,
         memory: DeviceMemory,
@@ -553,6 +1023,9 @@ impl NativeRegion {
         if length == 0 || u64::try_from(length).is_err() {
             return Err(Error::InvalidRange);
         }
+        if device.mode != Mode::Window {
+            return Err(Error::Unavailable);
+        }
         let raw = NonNull::new(unsafe {
             (device.api.register_dmabuf)(
                 device.raw.as_ptr(),
@@ -563,9 +1036,11 @@ impl NativeRegion {
             )
         })
         .ok_or(Error::Unavailable)?;
+        let lkey = unsafe { (device.api.lkey)(raw.as_ptr()) };
         Ok(Rc::new(Self {
             device,
-            raw,
+            raw: Some(raw),
+            lkey,
             memory: Some(memory),
             length,
             quota: Some(quota),
@@ -583,18 +1058,34 @@ impl NativeRegion {
         self.memory.is_some()
     }
 
-    /// Register the whole process address space as one implicit on-demand
-    /// paging MR, for zero-copy write sources. `None` if the device lacks
-    /// implicit ODP for RC writes.
+    /// The zero-copy write source region over the whole process address
+    /// space. `None` if the device cannot provide one.
+    ///
+    /// Window mode registers one implicit on-demand paging MR, and needs
+    /// the device to support implicit ODP for RC writes. Registration mode
+    /// registers nothing here: each write registers its own source memory
+    /// while it is in flight.
     ///
     /// The region owns no bytes: an `offset` is a virtual address, and
     /// [`Self::as_ptr`] is null. Callers must keep the source memory alive
     /// and unmodified until the post's completion or the QP's destruction.
     pub(crate) fn implicit(device: Rc<NativeDevice>, quota: Arc<GuardOwner>) -> Option<Rc<Self>> {
-        let raw = NonNull::new(unsafe { (device.api.register_implicit)(device.raw.as_ptr()) })?;
+        let raw = match device.mode {
+            Mode::Registration => None,
+            Mode::Window => {
+                if device.caps.flags & CAP_ODP == 0 {
+                    return None;
+                }
+                Some(NonNull::new(unsafe {
+                    (device.api.register_implicit)(device.raw.as_ptr())
+                })?)
+            }
+        };
+        let lkey = raw.map_or(0, |raw| unsafe { (device.api.lkey)(raw.as_ptr()) });
         Some(Rc::new(Self {
             device,
             raw,
+            lkey,
             memory: None,
             length: usize::MAX,
             quota: Some(quota),
@@ -602,20 +1093,42 @@ impl NativeRegion {
         }))
     }
 
-    /// True for an implicit address-space region from [`Self::implicit`].
+    /// A thread-safe handle that faults source memory into this implicit
+    /// region's NIC page tables ahead of a write. `None` unless implicit.
+    ///
+    /// The handle does not keep the region alive: whoever shares it must
+    /// withdraw every copy before dropping the region (see
+    /// [`Prefetcher::run`]).
+    pub(crate) fn prefetcher(&self) -> Option<Prefetcher> {
+        if !self.is_implicit() {
+            return None;
+        }
+        Some(Prefetcher {
+            call: self.device.api.prefetch,
+            raw: self.raw?.as_ptr() as usize,
+        })
+    }
+
+    /// True for an address-space region from [`Self::implicit`].
     pub(crate) fn is_implicit(&self) -> bool {
         self.access == Access::IMPLICIT
+    }
+
+    /// True for a registration-mode source region: writes register their
+    /// own memory.
+    fn is_dynamic(&self) -> bool {
+        self.raw.is_none()
     }
 
     /// The start of the registered buffer, valid while `self` lives.
     ///
     /// The caller must not read or write any range the NIC may still access.
-    /// Null for a dma-buf region.
+    /// Null for an implicit or dma-buf region.
     pub(crate) fn as_ptr(&self) -> *mut u8 {
-        if self.is_device() {
-            return std::ptr::null_mut();
+        match self.raw {
+            Some(raw) if !self.is_device() => unsafe { (self.device.api.bytes)(raw.as_ptr()) },
+            _ => std::ptr::null_mut(),
         }
-        unsafe { (self.device.api.bytes)(self.raw.as_ptr()) }
     }
 
     /// True if `[offset, offset + length)` is a nonempty range of the region.
@@ -631,23 +1144,389 @@ impl NativeRegion {
         if let Some(memory) = &self.memory {
             return memory.iova();
         }
+        let Some(raw) = self.raw else {
+            return 0;
+        };
         #[cfg(any(test, feature = "simulation"))]
         if simulation::is_api(&self.device.api) {
-            return simulation::address(self.raw);
+            return simulation::address(raw);
         }
-        unsafe { (self.device.api.bytes)(self.raw.as_ptr()) as u64 }
+        unsafe { (self.device.api.bytes)(raw.as_ptr()) as u64 }
     }
 
     /// Registered size in bytes.
     pub(crate) fn length(&self) -> usize {
         self.length
     }
+
+    /// The scatter-gather entry for `[offset, offset + length)`.
+    fn sge(&self, offset: u64, length: u32) -> Sge {
+        let addr = if self.is_implicit() {
+            offset
+        } else {
+            self.as_ptr() as u64 + offset
+        };
+        Sge {
+            addr,
+            length,
+            lkey: self.lkey,
+        }
+    }
+}
+
+/// Faults caller memory into one device's implicit on-demand paging region
+/// from any thread. See [`NativeRegion::prefetcher`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Prefetcher {
+    call: unsafe extern "C" fn(*mut c_void, u64, u32) -> c_int,
+
+    /// The implicit region's native handle.
+    raw: usize,
+}
+
+impl Prefetcher {
+    /// Map `bytes` in the NIC's page tables and wait until done, so a write
+    /// posted from them does not stall on NIC page faults. Prefetching is
+    /// only advice: it never changes what a write reads, and a failure only
+    /// means the write may fault.
+    ///
+    /// # Safety
+    ///
+    /// The implicit region must stay registered until this returns. The
+    /// owner guarantees it by withdrawing the handle under a lock that the
+    /// caller holds across the call.
+    pub(crate) unsafe fn run(&self, bytes: &[u8]) -> Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let length = u32::try_from(bytes.len()).map_err(|_| Error::InvalidRange)?;
+        // SAFETY: the caller keeps the region registered; the C side only
+        // reads its handle and passes the range to the kernel as advice.
+        match unsafe { (self.call)(self.raw as *mut c_void, bytes.as_ptr() as u64, length) } {
+            0 => Ok(()),
+            libc::EOPNOTSUPP | libc::ENOSYS => Err(Error::Unavailable),
+            libc::EINVAL => Err(Error::InvalidRange),
+            _ => Err(Error::Io),
+        }
+    }
+}
+
+/// The native access bits for a region of `access` on `device`.
+fn register_bits(device: &NativeDevice, access: Access) -> u32 {
+    // Registration mode has no windows: page buffers need no MW_BIND, and
+    // grants register them for remote write.
+    match device.mode {
+        Mode::Registration if access.bits() & Access::PAGES.bits() != 0 => {
+            Access::CONTROL.bits() | (access.bits() & Access::REMOTE_WRITE)
+        }
+        _ => access.bits(),
+    }
+}
+
+/// Where a background registration leaves its result.
+struct RegisterSlot {
+    done: AtomicBool,
+
+    /// The native region handle, 0 on failure. Valid once `done`.
+    raw: AtomicUsize,
+}
+
+/// Wakes the owner when a background registration finishes.
+pub(crate) type RegisterWake = Arc<dyn Fn() + Send + Sync>;
+
+/// Highest NUMA node [`prefer_node`] accepts. Linux allows at most 1024.
+const MAX_NUMA_NODES: usize = 1024;
+
+/// The `set_mempolicy` node mask that selects only `node`, in `c_ulong`
+/// words, or `None` when `node` is out of range.
+fn node_mask(node: usize) -> Option<Vec<libc::c_ulong>> {
+    if node >= MAX_NUMA_NODES {
+        return None;
+    }
+    let bits = libc::c_ulong::BITS as usize;
+    let mut mask = vec![0; node / bits + 1];
+    mask[node / bits] |= 1 << (node % bits);
+    Some(mask)
+}
+
+/// Prefer `node` for the calling thread's future page allocations, so pages
+/// it first touches land there (falling back to other nodes when it is
+/// full). Best effort: an unknown node or a failed call keeps the default
+/// local policy. Returns whether the policy was set.
+fn prefer_node(node: Option<usize>) -> bool {
+    const MPOL_PREFERRED: libc::c_int = 1;
+    let Some(mask) = node.and_then(node_mask) else {
+        return false;
+    };
+    // The kernel reads `maxnode - 1` bits.
+    let maxnode = (mask.len() * libc::c_ulong::BITS as usize + 1) as libc::c_ulong;
+    // SAFETY: `mask` holds `maxnode - 1` bits and outlives the call.
+    unsafe {
+        libc::syscall(
+            libc::SYS_set_mempolicy,
+            MPOL_PREFERRED,
+            mask.as_ptr(),
+            maxnode,
+        ) == 0
+    }
+}
+
+/// A region registration running off the owner thread.
+///
+/// Pinning and registering a large buffer (`ibv_reg_mr`, `ibv_reg_dmabuf_mr`)
+/// can block for a long time, so the native call runs on a short-lived
+/// helper thread while the owner keeps serving. Only that one call leaves
+/// the owner thread; the result becomes a [`NativeRegion`] on the owner in
+/// [`Self::finish`]. Under the simulation the call runs inline (the
+/// simulation is single-threaded) and `Simulation::hold_registrations`
+/// keeps it pending.
+///
+/// Dropped unfinished, it frees a finished registration, but leaks the
+/// device, the dma-buf owner, and the charge (quarantined) if the helper is
+/// still running, since the helper may still use them.
+pub(crate) struct Registering {
+    device: Option<Rc<NativeDevice>>,
+
+    memory: Option<DeviceMemory>,
+
+    length: usize,
+
+    access: Access,
+
+    quota: Option<Arc<GuardOwner>>,
+
+    slot: Arc<RegisterSlot>,
+}
+
+impl Registering {
+    /// Start allocating and registering `length` bytes with `access`, as
+    /// [`NativeRegion::with_access`] does. `wake` runs once it finishes.
+    pub(crate) fn host(
+        device: Rc<NativeDevice>,
+        length: usize,
+        access: Access,
+        quota: Arc<GuardOwner>,
+        wake: RegisterWake,
+    ) -> Result<Self> {
+        if length == 0 || u64::try_from(length).is_err() {
+            return Err(Error::InvalidRange);
+        }
+        let bits = register_bits(&device, access);
+        let register = device.api.register;
+        let raw = device.raw.as_ptr() as usize;
+        // Registration first touches (pins) the buffer, so place it on the
+        // device's NUMA node rather than wherever the owner thread runs.
+        let node = device.numa_node();
+        Ok(Self::start(
+            device,
+            None,
+            length,
+            access,
+            quota,
+            wake,
+            node,
+            move || unsafe { register(raw as *mut c_void, length as u64, bits) } as usize,
+        ))
+    }
+
+    /// Start creating `device`'s implicit on-demand paging region, as
+    /// [`NativeRegion::implicit`] does, off the owner thread. On mlx5 this
+    /// one call takes over a second per device (the kernel populates the
+    /// implicit MR's translation tables through UMR), so creating each
+    /// device's region on its own helper makes activation cost the slowest
+    /// device instead of the sum. `Ok(None)` for a registration-mode device,
+    /// which needs no native region: use [`NativeRegion::implicit`].
+    pub(crate) fn implicit(
+        device: Rc<NativeDevice>,
+        quota: Arc<GuardOwner>,
+        wake: RegisterWake,
+    ) -> Result<Option<Self>> {
+        match device.mode {
+            Mode::Registration => return Ok(None),
+            Mode::Window if !device.supports_implicit() => return Err(Error::Unavailable),
+            Mode::Window => {}
+        }
+        let register = device.api.register_implicit;
+        let raw = device.raw.as_ptr() as usize;
+        Ok(Some(Self::start(
+            device,
+            None,
+            usize::MAX,
+            Access::IMPLICIT,
+            quota,
+            wake,
+            None,
+            move || unsafe { register(raw as *mut c_void) } as usize,
+        )))
+    }
+
+    /// Start registering all of `memory`'s dma-buf range, as
+    /// [`NativeRegion::dmabuf`] does. `wake` runs once it finishes.
+    pub(crate) fn dmabuf(
+        device: Rc<NativeDevice>,
+        memory: DeviceMemory,
+        quota: Arc<GuardOwner>,
+        wake: RegisterWake,
+    ) -> Result<Self> {
+        use std::os::fd::AsRawFd;
+
+        let length = memory.length();
+        if length == 0 || u64::try_from(length).is_err() {
+            return Err(Error::InvalidRange);
+        }
+        if device.mode != Mode::Window {
+            return Err(Error::Unavailable);
+        }
+        let register = device.api.register_dmabuf;
+        let raw = device.raw.as_ptr() as usize;
+        let (offset, iova, fd) = (memory.offset(), memory.iova(), memory.fd().as_raw_fd());
+        // `memory` (and so `fd`) lives in the returned value until the
+        // helper is done, or forever if it is dropped first.
+        Ok(Self::start(
+            device,
+            Some(memory),
+            length,
+            Access::DEVICE,
+            quota,
+            wake,
+            None,
+            move || unsafe { register(raw as *mut c_void, offset, length as u64, iova, fd) }
+                as usize,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start(
+        device: Rc<NativeDevice>,
+        memory: Option<DeviceMemory>,
+        length: usize,
+        access: Access,
+        quota: Arc<GuardOwner>,
+        wake: RegisterWake,
+        node: Option<usize>,
+        call: impl FnOnce() -> usize + Send + 'static,
+    ) -> Self {
+        let slot = Arc::new(RegisterSlot {
+            done: AtomicBool::new(false),
+            raw: AtomicUsize::new(0),
+        });
+        #[cfg(any(test, feature = "simulation"))]
+        let inline = simulation::is_api(&device.api);
+        #[cfg(not(any(test, feature = "simulation")))]
+        let inline = false;
+        let finish = {
+            let slot = slot.clone();
+            move |raw: usize| {
+                slot.raw.store(raw, Ordering::Release);
+                slot.done.store(true, Ordering::Release);
+                wake();
+            }
+        };
+        if inline {
+            finish(call());
+        } else {
+            // A shared slot so a failed spawn can still run the call here.
+            let call = Arc::new(Mutex::new(Some(call)));
+            let spawned = {
+                let call = call.clone();
+                let finish = finish.clone();
+                std::thread::Builder::new()
+                    .name("racer-rdma-register".into())
+                    .spawn(move || {
+                        // Only this short-lived helper thread takes the policy.
+                        prefer_node(node);
+                        let call = call.lock().unwrap_or_else(PoisonError::into_inner).take();
+                        if let Some(call) = call {
+                            finish(call());
+                        }
+                    })
+            };
+            if spawned.is_err() {
+                let call = call.lock().unwrap_or_else(PoisonError::into_inner).take();
+                if let Some(call) = call {
+                    finish(call());
+                }
+            }
+        }
+        Self {
+            device: Some(device),
+            memory,
+            length,
+            access,
+            quota: Some(quota),
+            slot,
+        }
+    }
+
+    /// True once [`Self::finish`] has a result.
+    pub(crate) fn ready(&self) -> bool {
+        if !self.slot.done.load(Ordering::Acquire) {
+            return false;
+        }
+        #[cfg(any(test, feature = "simulation"))]
+        if let Some(device) = &self.device
+            && simulation::is_api(&device.api)
+            && simulation::registrations_held(device.raw.as_ptr())
+        {
+            return false;
+        }
+        true
+    }
+
+    /// The registered region. Call once [`Self::ready`].
+    pub(crate) fn finish(mut self) -> Result<Rc<NativeRegion>> {
+        debug_assert!(self.ready());
+        self.take().ok_or(Error::Unavailable)
+    }
+
+    /// Turn a finished registration into its region; `None` if it failed.
+    fn take(&mut self) -> Option<Rc<NativeRegion>> {
+        let raw = NonNull::new(self.slot.raw.swap(0, Ordering::AcqRel) as *mut c_void);
+        let device = self.device.take()?;
+        let memory = self.memory.take();
+        let quota = self.quota.take();
+        let raw = raw?;
+        let lkey = unsafe { (device.api.lkey)(raw.as_ptr()) };
+        Some(Rc::new(NativeRegion {
+            device,
+            raw: Some(raw),
+            lkey,
+            memory,
+            length: self.length,
+            quota,
+            access: self.access,
+        }))
+    }
+}
+
+impl Drop for Registering {
+    fn drop(&mut self) {
+        if self.device.is_none() {
+            return;
+        }
+        if self.slot.done.load(Ordering::Acquire) {
+            // Deregisters (or leaks) through `NativeRegion::drop`.
+            drop(self.take());
+            return;
+        }
+        // The helper may still use the device and the dma-buf: leak them
+        // with the charge, which can then never drain.
+        std::mem::forget(self.device.take());
+        std::mem::forget(self.memory.take());
+        if let Some(quota) = self.quota.take() {
+            quota.quarantine();
+            std::mem::forget(quota);
+        }
+    }
 }
 
 impl Drop for NativeRegion {
     /// Deregister. On failure, leak the device, guard, and dma-buf owner.
     fn drop(&mut self) {
-        if unsafe { (self.device.api.deregister)(self.raw.as_ptr()) } != 0 {
+        let Some(raw) = self.raw else {
+            return;
+        };
+        if unsafe { (self.device.api.deregister)(raw.as_ptr()) } != 0 {
             std::mem::forget(self.device.clone());
             std::mem::forget(self.memory.take());
             self.quota.as_ref().unwrap().quarantine();
@@ -656,34 +1535,49 @@ impl Drop for NativeRegion {
     }
 }
 
-/// A reusable type 2 memory window for ranged binds.
+/// A reusable grant slot.
 ///
-/// Each bind uses a fresh rkey (`ibv_inc_rkey` of the previous one), so a
-/// stale key from an earlier grant never matches. The window keeps the last
-/// region it was bound to alive until it is freed, because the NIC may still
-/// accept writes through it.
+/// Window mode: a type 2 memory window for ranged binds. Each bind uses a
+/// fresh rkey (`ibv_inc_rkey` of the previous one), so a stale key from an
+/// earlier grant never matches.
+///
+/// Registration mode: the holder of one grant's remote-write registration.
+/// Each bind registers the granted bytes and uses that registration's rkey.
+///
+/// Either way the window keeps the last region it was bound to alive until
+/// it is freed, because the NIC may still accept writes through it.
 pub(crate) struct MemoryWindow {
     device: Rc<NativeDevice>,
 
-    raw: NonNull<c_void>,
+    /// The memory window. `None` in registration mode.
+    raw: Option<NonNull<c_void>>,
 
-    /// Key the next bind will use.
+    /// Key the next bind will use (window mode).
     next_key: Cell<u32>,
 
     region: RefCell<Option<Rc<NativeRegion>>>,
+
+    /// Registration mode: the live grant's MR and rkey.
+    grant: Cell<Option<(NonNull<c_void>, u32)>>,
 }
 
 impl MemoryWindow {
     /// Allocate a window on `device`.
     pub(crate) fn new(device: &Rc<NativeDevice>) -> Result<Rc<Self>> {
         let mut key = 0;
-        let raw = NonNull::new(unsafe { (device.api.window)(device.raw.as_ptr(), &mut key) })
-            .ok_or(Error::Unavailable)?;
+        let raw = match device.mode {
+            Mode::Registration => None,
+            Mode::Window => Some(
+                NonNull::new(unsafe { (device.api.window)(device.raw.as_ptr(), &mut key) })
+                    .ok_or(Error::Unavailable)?,
+            ),
+        };
         Ok(Rc::new(Self {
             device: device.clone(),
             raw,
             next_key: Cell::new(key),
             region: RefCell::new(None),
+            grant: Cell::new(None),
         }))
     }
 
@@ -700,9 +1594,15 @@ pub(crate) fn inc_rkey(key: u32) -> u32 {
 }
 
 impl Drop for MemoryWindow {
-    /// Free the window. On failure, leak the device and the bound region.
+    /// Free the window, or deregister a live grant. On failure, leak the
+    /// device and the bound region.
     fn drop(&mut self) {
-        if unsafe { (self.device.api.window_free)(self.raw.as_ptr()) } != 0 {
+        let freed = match (self.raw, self.grant.get()) {
+            (Some(raw), _) => unsafe { (self.device.api.window_free)(raw.as_ptr()) == 0 },
+            (None, Some((mr, _))) => unsafe { (self.device.api.dereg_mr)(mr.as_ptr()) == 0 },
+            (None, None) => true,
+        };
+        if !freed {
             if let Some(region) = self.region.get_mut().take() {
                 if let Some(quota) = &region.quota {
                     quota.quarantine();
@@ -716,7 +1616,7 @@ impl Drop for MemoryWindow {
 
 /// A posted work request. Keeps its region and window alive until it
 /// completes or the QP stops.
-struct Pending {
+struct Pending<T> {
     /// Expected completion opcode. Ignored for receives.
     opcode: u32,
 
@@ -729,9 +1629,16 @@ struct Pending {
     _region: Rc<NativeRegion>,
 
     _window: Option<Rc<MemoryWindow>>,
+
+    /// Registration mode: the write's source registrations, released when it
+    /// completes.
+    mrs: Vec<NonNull<c_void>>,
+
+    /// The caller's record for this work, attached after a successful post.
+    user: Option<T>,
 }
 
-impl Pending {
+impl<T> Pending<T> {
     /// True if a successful completion `c` is what this work should produce.
     fn matches(&self, c: &Completion) -> bool {
         if c.status != 0 {
@@ -749,11 +1656,26 @@ impl Pending {
     }
 }
 
+/// Teardown result bit: the QP is destroyed (or never existed).
+const TORN_QP: u64 = 1;
+
+/// Teardown result bit: the connection manager id is destroyed (or never
+/// existed).
+const TORN_ID: u64 = 2;
+
+/// A handle moved to a reaper thread. The owner no longer touches it.
+struct Raw(NonNull<c_void>);
+
+// SAFETY: libibverbs and librdmacm handles may be used from any thread; the
+// owner hands each one over and stops using it.
+unsafe impl Send for Raw {}
+
 /// A queue pair (QP) and its completion queue.
 ///
-/// Tracks posted work. [`Self::stop`] is the only way to be sure the NIC is
-/// done with its memory.
-pub(crate) struct NativeQueuePair {
+/// Tracks posted work: this is the only ledger of work requests, and callers
+/// attach their own record `T` to each posted request with [`Self::attach`].
+/// [`Self::stop`] is the only way to be sure the NIC is done with its memory.
+pub(crate) struct NativeQueuePair<T = ()> {
     /// Keeps every QP and CQ leak charged to its owner.
     quota: Arc<GuardOwner>,
 
@@ -762,7 +1684,26 @@ pub(crate) struct NativeQueuePair {
 
     device: Rc<NativeDevice>,
 
-    raw: NonNull<c_void>,
+    /// The CQ both queues report to.
+    cq: NonNull<c_void>,
+
+    /// The CQ is armed on the device's completion channel.
+    armed: Rc<Cell<bool>>,
+
+    /// The CQ was successfully armed and a poll since left it empty: until
+    /// the channel reports an event (which clears `armed`), the CQ holds
+    /// nothing new and, inside a device pass, polling it can be skipped.
+    quiet: Cell<bool>,
+
+    /// The device's channel pass count when `quiet` was set. Skipping is
+    /// only safe after a later pass consumed any event raised since.
+    quiet_pass: Cell<u64>,
+
+    /// The last arm of the CQ succeeded.
+    notify_ok: Cell<bool>,
+
+    /// The QP handle and its connection state.
+    conn: Rc<Conn>,
 
     pub(crate) endpoint: Endpoint,
 
@@ -772,10 +1713,25 @@ pub(crate) struct NativeQueuePair {
     /// Stop was requested. No new work.
     terminating: Cell<bool>,
 
+    /// The QP and id teardown running on a reaper thread (native devices
+    /// only; see `reaper.rs`). Until it finishes, nothing is released.
+    teardown: RefCell<Option<crate::reaper::Ticket>>,
+
     connected: Cell<bool>,
 
     /// Posted work by ID.
-    pending: RefCell<BTreeMap<u64, Pending>>,
+    pending: RefCell<BTreeMap<u64, Pending<T>>>,
+
+    /// Records of work released by a successful stop, kept for
+    /// [`Self::take_records`] so the caller can still answer them.
+    released: RefCell<Vec<T>>,
+
+    /// Registration mode: bind and invalidate completions produced here.
+    synthetic: RefCell<VecDeque<Completion>>,
+
+    /// Registration mode: source registrations to release at stop, because
+    /// their deregistration failed or their write was only partly posted.
+    held: RefCell<Vec<NonNull<c_void>>>,
 
     /// Send queue limit and current use.
     send_capacity: u32,
@@ -792,50 +1748,101 @@ pub(crate) struct NativeQueuePair {
     failure: Cell<Option<Failure>>,
 }
 
-impl NativeQueuePair {
+impl<T> NativeQueuePair<T> {
     /// Create a QP with `send_depth` send and `recv_depth` receive WRs, and
     /// a CQ for both. Both depths must be nonzero.
+    ///
+    /// The CQ holds a full error flush. In registration mode a counted send
+    /// may post up to `WRITE_WRS` pieces, so the hardware send queue and the
+    /// CQ hold that many entries per send, and the QP itself only exists
+    /// once the connection manager connects; the endpoint's `qpn` is a
+    /// random 24-bit token naming it in the setup exchange.
     pub(crate) fn new_with_depth(
         device: Rc<NativeDevice>,
         quota: Arc<GuardOwner>,
         stop_observer: Arc<std::sync::atomic::AtomicBool>,
         send_depth: u32,
         recv_depth: u32,
+        rng: &racer_io::Rng,
     ) -> Result<Rc<Self>> {
         if send_depth == 0 || recv_depth == 0 || send_depth.checked_add(recv_depth).is_none() {
             return Err(Error::InvalidConfiguration);
         }
-        let mut qpn = 0;
-        let raw = NonNull::new(unsafe {
-            (device.api.qp)(
-                device.raw.as_ptr(),
-                device.endpoint.port,
-                send_depth,
-                recv_depth,
-                &mut qpn,
-            )
-        });
-        let Some(raw) = raw else {
-            if qpn == u32::MAX {
+        let send_wrs = match device.mode {
+            Mode::Window => send_depth,
+            Mode::Registration => send_depth
+                .checked_mul(registration::WRITE_WRS)
+                .ok_or(Error::InvalidConfiguration)?,
+        };
+        let depth = send_wrs
+            .checked_add(recv_depth)
+            .filter(|d| *d <= i32::MAX as u32)
+            .ok_or(Error::InvalidConfiguration)?;
+        let api = &device.api;
+        let channel = device.comp.map_or(std::ptr::null_mut(), NonNull::as_ptr);
+        let cq = NonNull::new(unsafe { (api.cq_create)(device.raw.as_ptr(), depth, channel) })
+            .ok_or(Error::Unavailable)?;
+
+        /// Free `cq` after a failed setup, leaking the device on failure.
+        fn abandon(device: Rc<NativeDevice>, quota: Arc<GuardOwner>, cq: NonNull<c_void>) {
+            if unsafe { (device.api.cq_free)(cq.as_ptr()) } != 0 {
                 quota.quarantine();
                 std::mem::forget(quota);
                 std::mem::forget(device);
             }
-            return Err(Error::Unavailable);
+        }
+
+        let mut qpn = 0;
+        let qp = match device.mode {
+            Mode::Window => {
+                let raw = NonNull::new(unsafe {
+                    (api.qp)(
+                        device.raw.as_ptr(),
+                        cq.as_ptr(),
+                        device.endpoint.port,
+                        send_depth,
+                        recv_depth,
+                        &mut qpn,
+                    )
+                });
+                let Some(raw) = raw else {
+                    if qpn == u32::MAX {
+                        // The QP leaked and may still use the CQ.
+                        quota.quarantine();
+                        std::mem::forget(quota);
+                        std::mem::forget(device);
+                    } else {
+                        abandon(device, quota, cq);
+                    }
+                    return Err(Error::Unavailable);
+                };
+                Some(raw)
+            }
+            Mode::Registration => {
+                let cm = device.cm.as_ref().expect("registration mode has a CM");
+                match cm.token(device.simulated(), rng) {
+                    Ok(token) => qpn = token,
+                    Err(error) => {
+                        abandon(device, quota, cq);
+                        return Err(error);
+                    }
+                }
+                None
+            }
         };
         let mut psn = [0; 4];
-        #[cfg(any(test, feature = "simulation"))]
-        let simulated = simulation::is_api(&device.api);
-        #[cfg(not(any(test, feature = "simulation")))]
-        let simulated = false;
-        if simulated {
+        if device.simulated() {
             psn = qpn.to_be_bytes();
-        } else if uring_runtime::environment::fill_random(&mut psn).is_err() {
-            if unsafe { (device.api.qp_free)(raw.as_ptr()) } != 0 {
+        } else if rng.fill(&mut psn).is_err() {
+            if let Some(raw) = qp
+                && unsafe { (api.qp_free)(raw.as_ptr()) } != 0
+            {
                 quota.quarantine();
                 std::mem::forget(quota);
                 std::mem::forget(device);
+                return Err(Error::Io);
             }
+            abandon(device, quota, cq);
             return Err(Error::Io);
         }
         let endpoint = Endpoint {
@@ -843,16 +1850,35 @@ impl NativeQueuePair {
             psn: u32::from_be_bytes(psn) & 0xffffff,
             ..device.endpoint
         };
+        let conn = Rc::new(Conn::new(cq, send_wrs, recv_depth, qpn));
+        conn.qp.set(qp);
+        if let Some(cm) = &device.cm {
+            cm.register(&conn);
+        }
+        let armed = Rc::new(Cell::new(false));
+        device
+            .armed
+            .borrow_mut()
+            .insert(cq.as_ptr() as usize, armed.clone());
         Ok(Rc::new(Self {
             quota,
             stop_observer,
             device,
-            raw,
+            cq,
+            armed,
+            quiet: Cell::new(false),
+            quiet_pass: Cell::new(0),
+            notify_ok: Cell::new(false),
+            conn,
             endpoint,
             stopped: Cell::new(false),
             terminating: Cell::new(false),
+            teardown: RefCell::new(None),
             connected: Cell::new(false),
             pending: RefCell::new(BTreeMap::new()),
+            released: RefCell::new(Vec::new()),
+            synthetic: RefCell::new(VecDeque::new()),
+            held: RefCell::new(Vec::new()),
             send_capacity: send_depth,
             sends: Cell::new(0),
             recv_capacity: recv_depth,
@@ -864,10 +1890,15 @@ impl NativeQueuePair {
 
     /// Connect to `remote`. Once only. On failure, stops the QP.
     ///
-    /// `initiator` is the side that opened the link. Devices in the adapter's
-    /// registration mode connect through the RDMA connection manager: the
-    /// initiator connects and returns once connected, the responder records
-    /// the initiator and returns at once. Window-mode devices ignore it.
+    /// `initiator` is the side that opened the link. In window mode the QP
+    /// is ready at once and `initiator` is ignored. In registration mode the
+    /// connection manager connects asynchronously, driven by
+    /// [`NativeDevice::progress`] (which [`Self::progress_with`] also runs
+    /// until connected): the initiator starts resolving the responder's
+    /// address, and the responder registers the initiator's token so its
+    /// listener accepts that initiator's request, and only that one. Posts
+    /// other than receives fail with [`Error::Unavailable`] until
+    /// [`Self::ready`].
     pub(crate) fn connect(&self, remote: Endpoint, initiator: bool) -> Result<()> {
         remote.validate()?;
         if self.stopped.get()
@@ -877,25 +1908,47 @@ impl NativeQueuePair {
         {
             return Err(Error::InvalidRequest);
         }
-        if unsafe {
-            (self.device.api.connect)(
-                self.raw.as_ptr(),
-                &self.endpoint,
-                &remote,
-                c_int::from(initiator),
-            )
-        } != 0
-        {
+        let connected = match (self.device.mode, &self.device.cm) {
+            (Mode::Registration, Some(cm)) => {
+                self.conn.peer.set(remote.qpn);
+                match registration::ipv4_of(&remote.gid) {
+                    None => Err(Error::Unavailable),
+                    Some(_) if !initiator => Ok(()),
+                    Some(address) => cm.connect(&self.device.api, &self.conn, address),
+                }
+            }
+            _ => {
+                let qp = self.conn.qp.get().ok_or(Error::Unavailable)?;
+                if unsafe { (self.device.api.connect)(qp.as_ptr(), &self.endpoint, &remote) } != 0 {
+                    Err(Error::Unavailable)
+                } else {
+                    self.conn.state.set(State::Established);
+                    Ok(())
+                }
+            }
+        };
+        if let Err(error) = connected {
             self.stop()?;
-            return Err(Error::Unavailable);
+            return Err(error);
         }
         self.connected.set(true);
         Ok(())
     }
 
-    /// True if connected and not stopping.
+    /// True if connected, established, and not stopping.
+    /// Completions this QP made up itself (registration mode binds and
+    /// invalidates) that the next progress call reports. They raise no
+    /// channel event, so the owner must poll again without waiting.
+    pub(crate) fn has_synthetic(&self) -> bool {
+        !self.synthetic.borrow().is_empty()
+    }
+
     pub(crate) fn ready(&self) -> bool {
-        self.connected.get() && !self.stopped.get() && !self.terminating.get()
+        self.connected.get()
+            && !self.stopped.get()
+            && !self.terminating.get()
+            && self.conn.state.get() == State::Established
+            && self.conn.qp.get().is_some()
     }
 
     #[cfg(test)]
@@ -904,8 +1957,34 @@ impl NativeQueuePair {
         self.stopped.get()
     }
 
+    /// Attach the caller's record to posted work `id`. It is handed back
+    /// with the work's completion, or by [`Self::take_records`].
+    pub(crate) fn attach(&self, id: u64, record: T) {
+        if let Some(pending) = self.pending.borrow_mut().get_mut(&id) {
+            pending.user = Some(record);
+        }
+    }
+
+    /// Posted send-queue work not yet completed.
+    pub(crate) fn sends(&self) -> u32 {
+        self.sends.get()
+    }
+
+    /// Take every attached record, leaving the work itself (and the memory
+    /// it holds) tracked until it completes or the QP stops.
+    pub(crate) fn take_records(&self) -> Vec<T> {
+        let mut records = std::mem::take(&mut *self.released.borrow_mut());
+        records.extend(
+            self.pending
+                .borrow_mut()
+                .values_mut()
+                .filter_map(|pending| pending.user.take()),
+        );
+        records
+    }
+
     /// Add `pending` under `id` and count it against its queue.
-    fn track(&self, id: u64, pending: Pending) {
+    fn track(&self, id: u64, pending: Pending<T>) {
         let counter = if pending.recv {
             &self.recvs
         } else {
@@ -915,48 +1994,95 @@ impl NativeQueuePair {
         self.pending.borrow_mut().insert(id, pending);
     }
 
-    /// Remove the work under `id` and release its queue slot.
-    fn untrack(&self, id: u64) -> Option<Pending> {
-        let pending = self.pending.borrow_mut().remove(&id)?;
+    /// Remove the work under `id` and release its queue slot. Its source
+    /// registrations are released too.
+    fn untrack(&self, id: u64) -> Option<Pending<T>> {
+        let mut pending = self.pending.borrow_mut().remove(&id)?;
         let counter = if pending.recv {
             &self.recvs
         } else {
             &self.sends
         };
         counter.set(counter.get() - 1);
+        registration::release(&self.device, std::mem::take(&mut pending.mrs), &self.held);
         Some(pending)
     }
 
-    /// Check the post result. If the post failed, nothing reached the NIC, so
-    /// drop the record.
-    fn submitted(&self, id: u64, rc: i32) -> Result<()> {
-        if rc != 0 {
-            self.untrack(id);
-            return Err(Error::Io);
-        }
-        Ok(())
-    }
-
     /// Read up to 32 completions without blocking and report each successful
-    /// completion to `sink` after its work is released. Returns how many.
+    /// completion, with its attached record, to `sink` after its work is
+    /// released. Returns how many.
     ///
-    /// Any failed or unexpected completion stops the QP and returns
-    /// [`Error::Io`]. Tests can read the first one through `failure`.
-    pub(crate) fn progress_with(&self, mut sink: impl FnMut(WorkCompletion)) -> Result<usize> {
+    /// Re-arms the CQ on the device's completion channel before polling, so
+    /// a completion that lands after this poll wakes the channel.
+    ///
+    /// Any failed or unexpected completion, or a failed connection, stops
+    /// the QP and returns [`Error::Io`]. Tests can read the first failed
+    /// completion through `failure`.
+    pub(crate) fn progress_with(
+        &self,
+        mut sink: impl FnMut(WorkCompletion, Option<T>),
+    ) -> Result<usize> {
         if self.stopped.get() {
             return Ok(0);
         }
         if self.terminating.get() {
             self.stop()?;
-            return Err(Error::Cancelled);
+            return Err(Error::Canceled);
         }
-        let mut completions = [Completion::default(); 32];
-        let n = unsafe { (self.device.api.poll)(self.raw.as_ptr(), completions.as_mut_ptr(), 32) };
-        if !(0..=32).contains(&n) {
-            self.stop()?;
-            return Err(Error::Io);
+        let api = &self.device.api;
+        if self.device.mode == Mode::Registration && self.conn.state.get() != State::Established {
+            self.device.progress();
         }
-        for c in &completions[..n as usize] {
+        if self.device.comp.is_some() && !self.armed.get() {
+            // Arm, then poll: a completion between the two still raises an
+            // event, and one before is polled below.
+            self.notify_ok
+                .set(unsafe { (api.req_notify)(self.cq.as_ptr()) } == 0);
+            self.armed.set(true);
+            self.quiet.set(false);
+        }
+        // Armed, drained since, and no event yet: nothing new to poll.
+        let skip = self.device.in_pass.get()
+            && self.armed.get()
+            && self.quiet.get()
+            && self.quiet_pass.get() != self.device.passes.get();
+        let mut completions = [Completion::default(); POLL_BATCH];
+        let mut n = 0;
+        {
+            let mut synthetic = self.synthetic.borrow_mut();
+            while n < completions.len()
+                && let Some(c) = synthetic.pop_front()
+            {
+                completions[n] = c;
+                n += 1;
+            }
+        }
+        let room = (completions.len() - n) as u32;
+        if room > 0 && !skip {
+            let got = unsafe { (api.poll)(self.cq.as_ptr(), completions[n..].as_mut_ptr(), room) };
+            if !(0..=room as c_int).contains(&got) {
+                self.stop()?;
+                return Err(Error::Io);
+            }
+            n += got as usize;
+            // Only a successful arm followed by a short poll proves the
+            // CQ is drained and an event will announce the next completion.
+            if self.armed.get() && self.notify_ok.get() && (got as u32) < room {
+                self.quiet.set(true);
+                self.quiet_pass.set(self.device.passes.get());
+            }
+        }
+        for c in &mut completions[..n] {
+            if self.device.mode == Mode::Registration
+                && c.status == 0
+                && c.opcode == opcode::RECV_RDMA_WITH_IMM
+                && c.flags & WC_IMM != 0
+            {
+                // The top byte counts the pieces before the last one.
+                let whole = u64::from(c.imm >> 24) * registration::CHUNK + u64::from(c.byte_len);
+                c.imm &= registration::TAG_MASK;
+                c.byte_len = u32::try_from(whole).unwrap_or(u32::MAX);
+            }
             let valid = self
                 .pending
                 .borrow()
@@ -975,15 +2101,24 @@ impl NativeQueuePair {
                 return Err(Error::Io);
             }
             std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
-            drop(self.untrack(c.id).ok_or(Error::Io)?);
-            sink(WorkCompletion {
-                id: c.id,
-                opcode: c.opcode,
-                byte_len: c.byte_len,
-                imm: (c.flags & WC_IMM != 0).then_some(c.imm),
-            });
+            let mut pending = self.untrack(c.id).ok_or(Error::Io)?;
+            let user = pending.user.take();
+            drop(pending);
+            sink(
+                WorkCompletion {
+                    id: c.id,
+                    opcode: c.opcode,
+                    byte_len: c.byte_len,
+                    imm: (c.flags & WC_IMM != 0).then_some(c.imm),
+                },
+                user,
+            );
         }
-        Ok(n as usize)
+        if self.conn.state.get() == State::Failed {
+            self.stop()?;
+            return Err(Error::Io);
+        }
+        Ok(n)
     }
 
     /// Stop the QP for good. After success the NIC will not touch its memory
@@ -995,7 +2130,23 @@ impl NativeQueuePair {
             return Ok(());
         }
         self.terminating.set(true);
-        if unsafe { (self.device.api.stop)(self.raw.as_ptr()) } != 0 {
+        let api = &self.device.api;
+        if self.conn.state.get() != State::Failed {
+            self.conn.state.set(State::Failed);
+        }
+        if self.device.offload_teardown {
+            self.teardown_off_thread()?;
+        }
+        if let Some(qp) = self.conn.qp.get() {
+            let _ = unsafe { (api.qp_error)(qp.as_ptr()) };
+            if unsafe { (api.qp_free)(qp.as_ptr()) } != 0 {
+                return Err(Error::Io);
+            }
+            self.conn.qp.set(None);
+        }
+        if let Some(cm) = &self.device.cm
+            && !cm.destroy_id(api, &self.conn)
+        {
             return Err(Error::Io);
         }
         self.stopped.set(true);
@@ -1005,12 +2156,111 @@ impl NativeQueuePair {
         let pending = std::mem::take(&mut *self.pending.borrow_mut());
         self.sends.set(0);
         self.recvs.set(0);
-        drop(pending);
+        self.synthetic.borrow_mut().clear();
+        self.conn.queued.borrow_mut().clear();
+        let mut records = Vec::new();
+        for (_, mut p) in pending {
+            registration::release(&self.device, std::mem::take(&mut p.mrs), &self.held);
+            records.extend(p.user.take());
+        }
+        // No QP can use them now: retry once, then keep them for good.
+        let held = std::mem::take(&mut *self.held.borrow_mut());
+        for mr in held {
+            if unsafe { (api.dereg_mr)(mr.as_ptr()) } != 0 {
+                self.device.leak_registration(&self.quota);
+            }
+        }
+        self.released.borrow_mut().extend(records);
         Ok(())
     }
 
+    /// True while the QP's teardown runs on a reaper thread.
+    pub(crate) fn reaping(&self) -> bool {
+        self.teardown
+            .borrow()
+            .as_ref()
+            .is_some_and(|ticket| ticket.result().is_none())
+    }
+
+    /// Destroy the QP and its connection manager id on a reaper thread, so
+    /// a teardown stuck in the kernel cannot stall the owner. `Ok` once both
+    /// are gone; else `Err(Io)`, like any failed stop, while the teardown
+    /// runs (see [`Self::reaping`]), when the reaper is full, or when it
+    /// failed (a later call retries what is left).
+    fn teardown_off_thread(&self) -> Result<()> {
+        if let Some(ticket) = self.teardown.borrow_mut().take_if(|t| t.result().is_some()) {
+            let result = ticket.result().unwrap_or(0);
+            if result & TORN_QP != 0 {
+                self.conn.qp.set(None);
+            }
+            if result & TORN_ID != 0 {
+                self.conn.id.set(None);
+            }
+            if self.conn.qp.get().is_some() || self.conn.id.get().is_some() {
+                return Err(Error::Io);
+            }
+            return Ok(());
+        }
+        if self.teardown.borrow().is_some() {
+            return Err(Error::Io);
+        }
+        let qp = self.conn.qp.get();
+        let id = self.conn.id.get();
+        if qp.is_none() && id.is_none() {
+            return Ok(());
+        }
+        let api = &self.device.api;
+        if let (Some(cm), Some(id)) = (&self.device.cm, id) {
+            // librdmacm modifies an id's QP inside rdma_get_cm_event (to
+            // error on REJECTED, to RTR/RTS on CONNECT_RESPONSE), so the
+            // owner reading the shared channel would race the reaper's QP
+            // destroy and use the freed QP. Move the id to its own channel
+            // first. If that fails, tear down here on the owner instead.
+            if !cm.detach(api, &self.conn) {
+                return Ok(());
+            }
+            // Events for the id are ignored from now on: it may be freed on
+            // the reaper thread at any time.
+            cm.forget(id);
+        }
+        let (qp_error, qp_free, destroy_id) = (api.qp_error, api.qp_free, api.cm_destroy_id);
+        let (qp, id) = (qp.map(Raw), id.map(Raw));
+        let ticket = crate::reaper::Reaper::global().submit(
+            move || {
+                let (qp, id) = (qp, id);
+                let mut result = 0;
+                match qp {
+                    Some(qp) => {
+                        let _ = unsafe { qp_error(qp.0.as_ptr()) };
+                        if unsafe { qp_free(qp.0.as_ptr()) } == 0 {
+                            result |= TORN_QP;
+                        }
+                    }
+                    None => result |= TORN_QP,
+                }
+                match id {
+                    // The QP must be gone before its id.
+                    Some(id) if result & TORN_QP != 0 => {
+                        if unsafe { destroy_id(id.0.as_ptr()) } == 0 {
+                            result |= TORN_ID;
+                        }
+                    }
+                    Some(_) => {}
+                    None => result |= TORN_ID,
+                }
+                result
+            },
+            self.device.waker.borrow().clone(),
+        );
+        // The C library stays loaded: this QP holds the device, and a
+        // teardown that never finishes leaks it (see `Drop`).
+        *self.teardown.borrow_mut() = ticket;
+        Err(Error::Io)
+    }
+
     /// Validate and record a ranged post under the caller's `id`, then run
-    /// `post`. A rejected post leaves nothing behind; the QP stays usable.
+    /// `post`, which may add source registrations to its argument. A
+    /// rejected post leaves nothing behind; the QP stays usable.
     #[allow(clippy::too_many_arguments)]
     fn post_ranged(
         &self,
@@ -1021,7 +2271,7 @@ impl NativeQueuePair {
         offset: u64,
         length: u32,
         window: Option<Rc<MemoryWindow>>,
-        post: impl FnOnce() -> c_int,
+        post: impl FnOnce(&mut Vec<NonNull<c_void>>) -> c_int,
     ) -> Result<()> {
         if (region.is_implicit() && (recv || opcode != opcode::RDMA_WRITE))
             || (region.is_device() && !matches!(opcode, opcode::BIND_MW | opcode::LOCAL_INV))
@@ -1031,8 +2281,9 @@ impl NativeQueuePair {
         {
             return Err(Error::InvalidRequest);
         }
-        // Receives may be posted before connect (verbs INIT state), so the
-        // peer never finds the queue empty once it can send.
+        // Receives may be posted before connect (verbs INIT state, or queued
+        // until the connection manager creates the QP), so the peer never
+        // finds the queue empty once it can send.
         let open = if recv {
             !self.stopped.get() && !self.terminating.get()
         } else {
@@ -1057,10 +2308,29 @@ impl NativeQueuePair {
                 length,
                 _region: region.clone(),
                 _window: window,
+                mrs: Vec::new(),
+                user: None,
             },
         );
         std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-        self.submitted(id, post())
+        let mut mrs = Vec::new();
+        let rc = post(&mut mrs);
+        if rc != 0 {
+            self.untrack(id);
+            return Err(Error::Io);
+        }
+        if let Some(pending) = self.pending.borrow_mut().get_mut(&id) {
+            pending.mrs = mrs;
+        }
+        Ok(())
+    }
+
+    /// The QP, which a successful [`Self::ready`] check guarantees.
+    fn qp(&self) -> *mut c_void {
+        self.conn
+            .qp
+            .get()
+            .map_or(std::ptr::null_mut(), NonNull::as_ptr)
     }
 
     /// Post a signaled `SEND` of `length` bytes of `region` at `offset`.
@@ -1080,8 +2350,9 @@ impl NativeQueuePair {
             offset,
             length,
             None,
-            || unsafe {
-                (self.device.api.send)(self.raw.as_ptr(), region.raw.as_ptr(), offset, length, id)
+            |_| {
+                let sge = region.sge(offset, length);
+                unsafe { (self.device.api.post_send)(self.qp(), &sge, 1, id) }
             },
         )
     }
@@ -1097,30 +2368,24 @@ impl NativeQueuePair {
         offset: u64,
         length: u32,
     ) -> Result<()> {
-        self.post_ranged(
-            id,
-            true,
-            opcode::RECV,
-            region,
-            offset,
-            length,
-            None,
-            || unsafe {
-                (self.device.api.post_recv)(
-                    self.raw.as_ptr(),
-                    region.raw.as_ptr(),
-                    offset,
-                    length,
-                    id,
-                )
-            },
-        )
+        self.post_ranged(id, true, opcode::RECV, region, offset, length, None, |_| {
+            let sge = region.sge(offset, length);
+            match self.conn.qp.get() {
+                Some(qp) => unsafe { (self.device.api.post_recv)(qp.as_ptr(), &sge, 1, id) },
+                // Registration mode before the QP exists.
+                None => {
+                    self.conn.queued.borrow_mut().push((id, sge));
+                    0
+                }
+            }
+        })
     }
 
     /// Post a signaled `RDMA_WRITE_WITH_IMM` of `length` bytes of `region` at
-    /// `offset` to the peer's `address` through window `key`, carrying `imm`
+    /// `offset` to the peer's `address` through `key`, carrying `imm`
     /// (host byte order). Completes with [`opcode::RDMA_WRITE`]. Consumes one
-    /// peer receive.
+    /// peer receive. In registration mode `imm` must fit in 24 bits, and a
+    /// write from the source region registers its memory while in flight.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn write_imm(
         &self,
@@ -1132,7 +2397,9 @@ impl NativeQueuePair {
         key: u32,
         imm: u32,
     ) -> Result<()> {
-        if address.checked_add(length.into()).is_none() {
+        if address.checked_add(length.into()).is_none()
+            || (self.device.mode == Mode::Registration && imm & !registration::TAG_MASK != 0)
+        {
             return Err(Error::InvalidRequest);
         }
         self.post_ranged(
@@ -1143,26 +2410,52 @@ impl NativeQueuePair {
             offset,
             length,
             None,
-            || unsafe {
-                (self.device.api.write_imm)(
-                    self.raw.as_ptr(),
-                    region.raw.as_ptr(),
-                    offset,
-                    length,
-                    address,
-                    key,
-                    imm,
-                    id,
-                )
+            |mrs| {
+                let qp = self.qp();
+                if region.is_dynamic() {
+                    let Some(qp) = NonNull::new(qp) else {
+                        return libc::EAGAIN;
+                    };
+                    return registration::post_dynamic(
+                        &self.device,
+                        qp,
+                        offset,
+                        length,
+                        address,
+                        key,
+                        imm,
+                        id,
+                        mrs,
+                        &self.held,
+                    );
+                }
+                let sge = region.sge(offset, length);
+                unsafe {
+                    (self.device.api.post_write)(
+                        qp,
+                        &sge,
+                        1,
+                        address,
+                        key,
+                        imm,
+                        POST_IMM | POST_SIGNALED,
+                        id,
+                    )
+                }
             },
         )
     }
 
     /// Post a signaled, fenced bind of `window` over `length` bytes of
-    /// `region` at `offset`, with remote write access. Returns the window's new rkey.
+    /// `region` at `offset`, with remote write access. Returns the new rkey.
     /// Completes with [`opcode::BIND_MW`]. The region must be registered
     /// with [`Access::PAGES`] (with or without remote write), and a window
     /// stays tied to the first region it is bound to.
+    ///
+    /// In registration mode this registers the granted bytes for remote
+    /// write (see `registration::grant_span`; `limit` is how many bytes the
+    /// granted buffer has from `offset`) and completes at once.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn bind_window(
         &self,
         id: u64,
@@ -1170,6 +2463,7 @@ impl NativeQueuePair {
         region: &Rc<NativeRegion>,
         offset: u64,
         length: u32,
+        limit: u64,
     ) -> Result<u32> {
         if !Rc::ptr_eq(&window.device, &self.device)
             || region.access.bits() & Access::PAGES.bits() == 0
@@ -1181,6 +2475,7 @@ impl NativeQueuePair {
         {
             return Err(Error::InvalidRequest);
         }
+        let api = &self.device.api;
         let mut key = window.next_key.get();
         self.post_ranged(
             id,
@@ -1190,25 +2485,86 @@ impl NativeQueuePair {
             offset,
             length,
             Some(window.clone()),
-            || unsafe {
-                (self.device.api.bind)(
-                    self.raw.as_ptr(),
-                    window.raw.as_ptr(),
-                    region.raw.as_ptr(),
-                    &mut key,
-                    id,
-                    offset,
-                    length,
-                )
+            |_| {
+                let Some(raw) = window.raw else {
+                    return self
+                        .bind_registration(id, window, region, offset, length, limit, &mut key);
+                };
+                let Some(mr) = region.raw else {
+                    return libc::EINVAL;
+                };
+                unsafe {
+                    (api.bind)(
+                        self.qp(),
+                        raw.as_ptr(),
+                        mr.as_ptr(),
+                        key,
+                        id,
+                        offset,
+                        length,
+                    )
+                }
             },
         )?;
         *window.region.borrow_mut() = Some(region.clone());
-        window.next_key.set(inc_rkey(key));
+        if window.raw.is_some() {
+            window.next_key.set(inc_rkey(key));
+        }
         Ok(key)
     }
 
+    /// Registration-mode bind: register the granted bytes for remote write
+    /// and queue the completion.
+    #[allow(clippy::too_many_arguments)]
+    fn bind_registration(
+        &self,
+        id: u64,
+        window: &MemoryWindow,
+        region: &NativeRegion,
+        offset: u64,
+        length: u32,
+        limit: u64,
+        key: &mut u32,
+    ) -> c_int {
+        let api = &self.device.api;
+        if region.as_ptr().is_null() {
+            return libc::EINVAL;
+        }
+        if let Some((mr, _)) = window.grant.get() {
+            if unsafe { (api.dereg_mr)(mr.as_ptr()) } != 0 {
+                return libc::EBUSY;
+            }
+            window.grant.set(None);
+        }
+        let start = region.as_ptr() as u64 + offset;
+        let limit = limit.min(region.length as u64 - offset);
+        let span = registration::grant_span(start, length, limit);
+        let (mut lkey, mut rkey) = (0, 0);
+        let Some(mr) = NonNull::new(unsafe {
+            (api.reg_mr)(
+                self.device.raw.as_ptr(),
+                start,
+                span,
+                Access::CONTROL.bits() | Access::REMOTE_WRITE,
+                &mut lkey,
+                &mut rkey,
+            )
+        }) else {
+            return libc::ENOMEM;
+        };
+        window.grant.set(Some((mr, rkey)));
+        *key = rkey;
+        self.synthetic.borrow_mut().push_back(Completion {
+            id,
+            opcode: opcode::BIND_MW,
+            ..Completion::default()
+        });
+        0
+    }
+
     /// Post a signaled `LOCAL_INV` of `key` on `window`. Not fenced. Completes
-    /// with [`opcode::LOCAL_INV`].
+    /// with [`opcode::LOCAL_INV`]. In registration mode this deregisters the
+    /// grant, so the key stops working, and completes at once.
     pub(crate) fn invalidate_window(
         &self,
         id: u64,
@@ -1221,6 +2577,10 @@ impl NativeQueuePair {
         if !Rc::ptr_eq(&window.device, &self.device) {
             return Err(Error::InvalidRequest);
         }
+        let api = &self.device.api;
+        if window.raw.is_none() && window.grant.get().is_none_or(|(_, rkey)| rkey != key) {
+            return Err(Error::InvalidRequest);
+        }
         // Hold the region until the CQE. No data moves, so any valid range works.
         self.post_ranged(
             id,
@@ -1230,8 +2590,23 @@ impl NativeQueuePair {
             0,
             1,
             Some(window.clone()),
-            || unsafe {
-                (self.device.api.invalidate)(self.raw.as_ptr(), window.raw.as_ptr(), key, id)
+            |_| {
+                if window.raw.is_some() {
+                    return unsafe { (api.invalidate)(self.qp(), key, id) };
+                }
+                let Some((mr, _)) = window.grant.get() else {
+                    return libc::EINVAL;
+                };
+                if unsafe { (api.dereg_mr)(mr.as_ptr()) } != 0 {
+                    return libc::EBUSY;
+                }
+                window.grant.set(None);
+                self.synthetic.borrow_mut().push_back(Completion {
+                    id,
+                    opcode: opcode::LOCAL_INV,
+                    ..Completion::default()
+                });
+                0
             },
         )
     }
@@ -1243,18 +2618,26 @@ impl NativeQueuePair {
     }
 }
 
-impl Drop for NativeQueuePair {
-    /// Stop, then free. If stop fails, leak the QP's work and device, since
-    /// the NIC may still use them.
+impl<T> Drop for NativeQueuePair<T> {
+    /// Stop, then free the CQ. If stop fails, leak the QP's work and device,
+    /// since the NIC may still use them.
     fn drop(&mut self) {
+        if let Some(cm) = &self.device.cm {
+            cm.unregister(&self.conn);
+        }
         if self.stop().is_err() {
             self.quota.quarantine();
             std::mem::forget(self.quota.clone());
             std::mem::forget(std::mem::take(self.pending.get_mut()));
+            std::mem::forget(std::mem::take(self.held.get_mut()));
             std::mem::forget(self.device.clone());
             return;
         }
-        if unsafe { (self.device.api.qp_free)(self.raw.as_ptr()) } != 0 {
+        self.device
+            .armed
+            .borrow_mut()
+            .remove(&(self.cq.as_ptr() as usize));
+        if unsafe { (self.device.api.cq_free)(self.cq.as_ptr()) } != 0 {
             self.quota.quarantine();
             std::mem::forget(self.quota.clone());
             std::mem::forget(self.device.clone());
@@ -1266,6 +2649,47 @@ impl Drop for NativeQueuePair {
 mod tests {
     //! Endpoint validation and optional native discovery contracts.
     use super::*;
+
+    #[test]
+    fn node_mask_selects_one_node() {
+        let bits = libc::c_ulong::BITS as usize;
+        assert_eq!(node_mask(0), Some(vec![1]));
+        assert_eq!(node_mask(1), Some(vec![2]));
+        assert_eq!(node_mask(bits), Some(vec![0, 1]));
+        assert_eq!(node_mask(bits + 3), Some(vec![0, 8]));
+        assert_eq!(node_mask(1023).map(|m| m.len()), Some(1024 / bits));
+        assert_eq!(node_mask(1024), None);
+    }
+
+    #[test]
+    fn prefer_node_sets_a_preferred_policy_on_the_calling_thread_only() {
+        const MPOL_PREFERRED: libc::c_int = 1;
+        fn mode() -> libc::c_int {
+            let mut mode: libc::c_int = -1;
+            // SAFETY: a null mask with maxnode 0 only reads the mode.
+            let rc = unsafe {
+                libc::syscall(
+                    libc::SYS_get_mempolicy,
+                    &mut mode as *mut libc::c_int,
+                    std::ptr::null_mut::<libc::c_ulong>(),
+                    0 as libc::c_ulong,
+                    std::ptr::null_mut::<libc::c_void>(),
+                    0 as libc::c_ulong,
+                )
+            };
+            assert_eq!(rc, 0);
+            mode
+        }
+        assert!(!prefer_node(None));
+        assert!(!prefer_node(Some(4096)));
+        let before = mode();
+        // Node 0 exists on every Linux host.
+        let set = std::thread::spawn(|| (prefer_node(Some(0)), mode()))
+            .join()
+            .unwrap();
+        assert_eq!(set, (true, MPOL_PREFERRED));
+        assert_eq!(mode(), before);
+    }
 
     /// Require the real adapter's ABI and every symbol without opening any device.
     #[cfg(all(feature = "native", target_os = "linux"))]
@@ -1324,6 +2748,35 @@ mod tests {
 }
 
 #[cfg(test)]
+mod prefetch_tests {
+    use super::*;
+
+    /// Fails with the errno encoded in the low byte of `length`.
+    unsafe extern "C" fn advise(_: *mut c_void, _: u64, length: u32) -> c_int {
+        (length & 0xff) as c_int
+    }
+
+    #[test]
+    /// Native results map to crate errors; empty ranges never reach C.
+    fn prefetch_maps_native_results() {
+        let p = Prefetcher {
+            call: advise,
+            raw: 1,
+        };
+        let run = |len: usize| unsafe { p.run(&vec![0; len]) };
+        assert_eq!(unsafe { p.run(&[]) }, Ok(()));
+        assert_eq!(run(0x100), Ok(()));
+        assert_eq!(
+            run(0x100 + libc::EOPNOTSUPP as usize),
+            Err(Error::Unavailable)
+        );
+        assert_eq!(run(0x100 + libc::ENOSYS as usize), Err(Error::Unavailable));
+        assert_eq!(run(0x100 + libc::EINVAL as usize), Err(Error::InvalidRange));
+        assert_eq!(run(0x100 + libc::EFAULT as usize), Err(Error::Io));
+    }
+}
+
+#[cfg(test)]
 pub(crate) mod lifetime_tests {
     //! FFI fault injection exercises production ownership, ABI, and quarantine safety.
     use super::*;
@@ -1346,11 +2799,18 @@ pub(crate) mod lifetime_tests {
 
         poll_fails: bool,
 
+        detach_fails: bool,
+
         /// Native post calls that reached the adapter.
         posts: usize,
     }
 
     thread_local! { static FAULTS: RefCell<Faults> = RefCell::new(Faults::default()); }
+
+    /// While set, the fixture's QP destroy blocks, on every thread. Only the
+    /// offloaded-teardown test sets it, and only its QP is destroyed off
+    /// the test thread.
+    static HANG: AtomicBool = AtomicBool::new(false);
 
     /// Record the order of native ownership releases.
     fn event(value: &'static str) {
@@ -1368,7 +2828,7 @@ pub(crate) mod lifetime_tests {
     }
 
     /// Allocate a fixture device context.
-    unsafe extern "C" fn open(_: *const c_char) -> *mut c_void {
+    unsafe extern "C" fn open(_: *const c_char, _: c_int) -> *mut c_void {
         pointer()
     }
 
@@ -1381,9 +2841,61 @@ pub(crate) mod lifetime_tests {
         0
     }
 
+    /// The fixture reports no capabilities.
+    unsafe extern "C" fn query_caps(_: *mut c_void, _: u8, _: *mut Caps) -> c_int {
+        0
+    }
+
+    /// The fixture has no completion channel.
+    unsafe extern "C" fn comp_channel(_: *mut c_void) -> *mut c_void {
+        std::ptr::null_mut()
+    }
+
+    /// No channel, no fd.
+    unsafe extern "C" fn comp_channel_fd(_: *mut c_void) -> c_int {
+        -1
+    }
+
+    /// Nothing to free.
+    unsafe extern "C" fn comp_channel_free(_: *mut c_void) -> c_int {
+        0
+    }
+
+    /// Allocate a fixture completion queue.
+    unsafe extern "C" fn cq_create(_: *mut c_void, _: u32, _: *mut c_void) -> *mut c_void {
+        pointer()
+    }
+
+    /// Record and release the fixture completion queue.
+    unsafe extern "C" fn cq_free(p: *mut c_void) -> c_int {
+        event("cq");
+        unsafe {
+            drop(Box::from_raw(p.cast::<u8>()));
+        }
+        0
+    }
+
+    /// Arming always succeeds.
+    unsafe extern "C" fn req_notify(_: *mut c_void) -> c_int {
+        0
+    }
+
+    /// No channel events.
+    unsafe extern "C" fn get_cq_event(_: *mut c_void, _: *mut *mut c_void) -> c_int {
+        -libc::EAGAIN
+    }
+
+    /// Nothing to acknowledge.
+    unsafe extern "C" fn ack_cq_events(_: *mut c_void, _: u32) {}
+
     /// The fixture device has no implicit ODP.
     unsafe extern "C" fn register_implicit(_: *mut c_void) -> *mut c_void {
         std::ptr::null_mut()
+    }
+
+    /// Nothing to prefetch without implicit ODP.
+    unsafe extern "C" fn prefetch(_: *mut c_void, _: u64, _: u32) -> c_int {
+        libc::EOPNOTSUPP
     }
 
     /// The fixture device has no dma-buf support.
@@ -1398,7 +2910,14 @@ pub(crate) mod lifetime_tests {
     }
 
     /// Allocate a fixture queue pair with a fixed valid number.
-    unsafe extern "C" fn qp(_: *mut c_void, _: u8, _: u32, _: u32, qpn: *mut u32) -> *mut c_void {
+    unsafe extern "C" fn qp(
+        _: *mut c_void,
+        _: *mut c_void,
+        _: u8,
+        _: u32,
+        _: u32,
+        qpn: *mut u32,
+    ) -> *mut c_void {
         unsafe {
             *qpn = 7;
         }
@@ -1406,28 +2925,26 @@ pub(crate) mod lifetime_tests {
     }
 
     /// Accept connection setup without a physical peer.
-    unsafe extern "C" fn connect(
-        _: *mut c_void,
-        _: *const Endpoint,
-        _: *const Endpoint,
-        _: c_int,
-    ) -> c_int {
+    unsafe extern "C" fn connect(_: *mut c_void, _: *const Endpoint, _: *const Endpoint) -> c_int {
         0
     }
 
-    /// Record a terminal fence and apply the scripted failure state.
-    unsafe extern "C" fn stop(_: *mut c_void) -> c_int {
-        event("stop");
-        if FAULTS.with_borrow(|f| f.stop_fails) {
-            5
-        } else {
-            0
-        }
+    /// Moving to the error state always succeeds.
+    unsafe extern "C" fn qp_error(_: *mut c_void) -> c_int {
+        0
     }
 
-    /// Record and release the fixture queue pair and completion queue.
+    /// Record a terminal fence (QP destruction) and apply the scripted
+    /// failure state.
     unsafe extern "C" fn qp_free(p: *mut c_void) -> c_int {
-        event("cq");
+        // Stand in for a destroy stuck in the kernel, on any thread.
+        while HANG.load(Ordering::Acquire) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        event("stop");
+        if FAULTS.with_borrow(|f| f.stop_fails) {
+            return 5;
+        }
         unsafe {
             drop(Box::from_raw(p.cast::<u8>()));
         }
@@ -1453,6 +2970,28 @@ pub(crate) mod lifetime_tests {
         unsafe { (&mut *p.cast::<Vec<u8>>()).as_mut_ptr() }
     }
 
+    /// Every fixture region has local key 0.
+    unsafe extern "C" fn lkey(_: *mut c_void) -> u32 {
+        0
+    }
+
+    /// The fixture registers nothing.
+    unsafe extern "C" fn reg_mr(
+        _: *mut c_void,
+        _: u64,
+        _: u64,
+        _: u32,
+        _: *mut u32,
+        _: *mut u32,
+    ) -> *mut c_void {
+        std::ptr::null_mut()
+    }
+
+    /// Nothing to deregister.
+    unsafe extern "C" fn dereg_mr(_: *mut c_void) -> c_int {
+        -1
+    }
+
     /// Allocate a fixture window with a fixed remote key.
     unsafe extern "C" fn window(_: *mut c_void, key: *mut u32) -> *mut c_void {
         unsafe {
@@ -1475,7 +3014,7 @@ pub(crate) mod lifetime_tests {
         _: *mut c_void,
         _: *mut c_void,
         _: *mut c_void,
-        _: *mut u32,
+        _: u32,
         _: u64,
         _: u64,
         _: u32,
@@ -1491,13 +3030,13 @@ pub(crate) mod lifetime_tests {
         })
     }
 
-    /// Accept or reject a write with immediate according to the fault script.
-    unsafe extern "C" fn write_imm(
+    /// Accept or reject a write according to the fault script.
+    unsafe extern "C" fn post_write(
         _: *mut c_void,
-        _: *mut c_void,
-        _: u64,
+        _: *const Sge,
         _: u32,
         _: u64,
+        _: u32,
         _: u32,
         _: u32,
         _: u64,
@@ -1506,23 +3045,17 @@ pub(crate) mod lifetime_tests {
     }
 
     /// Accept or reject a send according to the fault script.
-    unsafe extern "C" fn send(_: *mut c_void, _: *mut c_void, _: u64, _: u32, _: u64) -> c_int {
+    unsafe extern "C" fn post_send(_: *mut c_void, _: *const Sge, _: u32, _: u64) -> c_int {
         post_result()
     }
 
     /// Accept or reject a receive according to the fault script.
-    unsafe extern "C" fn post_recv(
-        _: *mut c_void,
-        _: *mut c_void,
-        _: u64,
-        _: u32,
-        _: u64,
-    ) -> c_int {
+    unsafe extern "C" fn post_recv(_: *mut c_void, _: *const Sge, _: u32, _: u64) -> c_int {
         post_result()
     }
 
     /// Accept or reject an invalidation according to the fault script.
-    unsafe extern "C" fn invalidate(_: *mut c_void, _: *mut c_void, _: u32, _: u64) -> c_int {
+    unsafe extern "C" fn invalidate(_: *mut c_void, _: u32, _: u64) -> c_int {
         post_result()
     }
 
@@ -1542,6 +3075,94 @@ pub(crate) mod lifetime_tests {
         })
     }
 
+    /// The fixture has no connection manager.
+    unsafe extern "C" fn cm_channel(_: *mut c_void) -> *mut c_void {
+        std::ptr::null_mut()
+    }
+
+    unsafe extern "C" fn cm_channel_fd(_: *mut c_void) -> c_int {
+        -1
+    }
+
+    unsafe extern "C" fn cm_channel_free(_: *mut c_void) -> c_int {
+        0
+    }
+
+    unsafe extern "C" fn cm_listen(
+        _: *mut c_void,
+        _: *mut c_void,
+        _: *const u8,
+        _: u16,
+        _: *mut *mut c_void,
+    ) -> c_int {
+        -1
+    }
+
+    unsafe extern "C" fn cm_id(_: *mut c_void, _: *mut *mut c_void) -> c_int {
+        -1
+    }
+
+    unsafe extern "C" fn cm_resolve_addr(
+        _: *mut c_void,
+        _: *const u8,
+        _: *const u8,
+        _: u16,
+        _: c_int,
+    ) -> c_int {
+        -1
+    }
+
+    unsafe extern "C" fn cm_resolve_route(_: *mut c_void, _: c_int) -> c_int {
+        -1
+    }
+
+    unsafe extern "C" fn cm_create_qp(
+        _: *mut c_void,
+        _: *mut c_void,
+        _: *mut c_void,
+        _: u32,
+        _: u32,
+        _: *mut u32,
+    ) -> *mut c_void {
+        std::ptr::null_mut()
+    }
+
+    unsafe extern "C" fn cm_connect(_: *mut c_void, _: *const u8, _: u32) -> c_int {
+        -1
+    }
+
+    unsafe extern "C" fn cm_accept(_: *mut c_void, _: *const u8, _: u32) -> c_int {
+        -1
+    }
+
+    unsafe extern "C" fn cm_reject(_: *mut c_void) -> c_int {
+        -1
+    }
+
+    unsafe extern "C" fn cm_get_event(_: *mut c_void, _: *mut CmEvent) -> c_int {
+        -libc::EAGAIN
+    }
+
+    unsafe extern "C" fn cm_ack(_: *mut c_void) {}
+
+    /// Record and release a fixture id (on the calling thread's record).
+    unsafe extern "C" fn cm_destroy_id(p: *mut c_void) -> c_int {
+        event("id");
+        unsafe {
+            drop(Box::from_raw(p.cast::<u8>()));
+        }
+        0
+    }
+
+    /// Record a move off the shared channel and apply the scripted failure.
+    unsafe extern "C" fn cm_detach(_: *mut c_void) -> c_int {
+        if FAULTS.with_borrow(|f| f.detach_fails) {
+            event("detach-failed");
+            return libc::EINVAL;
+        }
+        event("detach");
+        0
+    }
     pub(crate) use crate::test_guard::Observer as QuotaObserver;
 
     /// Create a quota owner and an observer of its retained charge.
@@ -1552,36 +3173,69 @@ pub(crate) mod lifetime_tests {
 
     /// Reset faults and create a connected queue pair with charged source memory.
     pub(crate) fn fixture() -> (Rc<NativeQueuePair>, Rc<NativeRegion>, QuotaObserver) {
+        fixture_with(false)
+    }
+
+    /// [`fixture`] on a device that tears QPs down on a reaper thread.
+    fn fixture_with(offload: bool) -> (Rc<NativeQueuePair>, Rc<NativeRegion>, QuotaObserver) {
         FAULTS.with_borrow_mut(|f| *f = Faults::default());
         let api = Rc::new(Api {
             library: None,
             discover,
             open,
             close,
+            query_caps,
+            comp_channel,
+            comp_channel_fd,
+            comp_channel_free,
+            cq_create,
+            cq_free,
+            req_notify,
+            get_cq_event,
+            ack_cq_events,
             qp,
             connect,
-            stop,
+            qp_error,
             qp_free,
             register,
             register_implicit,
+            prefetch,
             register_dmabuf,
             deregister,
             bytes,
+            lkey,
+            reg_mr,
+            dereg_mr,
             window,
             window_free,
             bind,
             invalidate,
-            write_imm,
-            send,
+            post_write,
+            post_send,
             post_recv,
             poll,
+            cm_channel,
+            cm_channel_fd,
+            cm_channel_free,
+            cm_listen,
+            cm_id,
+            cm_resolve_addr,
+            cm_resolve_route,
+            cm_create_qp,
+            cm_connect,
+            cm_accept,
+            cm_reject,
+            cm_get_event,
+            cm_ack,
+            cm_destroy_id,
+            cm_detach,
         });
-        let device = Rc::new(NativeDevice {
+        let device = Rc::new(NativeDevice::new(
             api,
-            raw: NonNull::new(pointer()).unwrap(),
-            quota: None,
-            name: "test-only".into(),
-            endpoint: Endpoint {
+            NonNull::new(pointer()).unwrap(),
+            None,
+            "test-only".into(),
+            Endpoint {
                 gid: [1; 16],
                 qpn: 0,
                 psn: 0,
@@ -1590,13 +3244,17 @@ pub(crate) mod lifetime_tests {
                 port: 1,
                 link_layer: 1,
             },
-        });
+            Mode::Window,
+        ));
+        let mut device = device;
+        Rc::get_mut(&mut device).unwrap().offload_teardown = offload;
         let qp = NativeQueuePair::new_with_depth(
             device.clone(),
             GuardOwner::new(Arc::new(())),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             32,
             4,
+            &racer_io::Rng::os(),
         )
         .unwrap();
         qp.connect(qp.endpoint, true).unwrap();
@@ -1637,17 +3295,118 @@ pub(crate) mod lifetime_tests {
     }
 
     #[test]
+    /// A QP destroy stuck in the kernel runs on a reaper thread: stop
+    /// returns at once and keeps reporting the teardown in progress, the
+    /// write's source stays charged (the NIC may still read it), and only
+    /// once the destroy returns does stop release it.
+    fn offloaded_teardown_never_blocks_and_releases_only_after_it_finishes() {
+        let (qp, region, charged) = fixture_with(true);
+        qp.write_imm(wr(1), &region, 0, 32, 4096, 7, 0).unwrap();
+        drop(region);
+        HANG.store(true, Ordering::Release);
+        let started = std::time::Instant::now();
+        assert_eq!(qp.stop(), Err(Error::Io));
+        assert!(qp.reaping());
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(qp.stop(), Err(Error::Io));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(charged.get(), 1, "held while the destroy is stuck");
+        HANG.store(false, Ordering::Release);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while qp.reaping() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        qp.stop().unwrap();
+        assert!(!qp.reaping());
+        assert_eq!(charged.get(), 0);
+        drop(qp);
+        FAULTS.with_borrow(|f| {
+            assert!(!f.events.contains(&"stop"), "destroyed off this thread");
+            assert!(f.events.contains(&"cq"));
+        });
+    }
+
+    /// [`fixture_with`] whose QP has a connection manager id, as in
+    /// registration mode.
+    fn fixture_with_id(offload: bool) -> (Rc<NativeQueuePair>, Rc<NativeRegion>, QuotaObserver) {
+        let (qp, region, charged) = fixture_with(offload);
+        // Only this test's QP uses the device, so the CM can be swapped in.
+        let device = Rc::as_ptr(&qp.device).cast_mut();
+        unsafe {
+            (*device).cm = Some(registration::Cm::test_only(
+                NonNull::new(pointer()).unwrap(),
+            ));
+        }
+        qp.conn.id.set(NonNull::new(pointer()));
+        (qp, region, charged)
+    }
+
+    /// Wait until `qp`'s reaper teardown finished.
+    fn await_reaper(qp: &NativeQueuePair) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while qp.reaping() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    /// A connection manager QP is torn down on the reaper only after its id
+    /// left the shared event channel: reading that channel on the owner
+    /// makes librdmacm modify the id's QP, which the reaper frees. The id
+    /// moves once, even when a later stop resubmits a teardown.
+    fn offloaded_cm_teardown_moves_the_id_off_the_shared_channel_first() {
+        let (qp, _region, _charged) = fixture_with_id(true);
+        assert_eq!(qp.stop(), Err(Error::Io));
+        FAULTS.with_borrow(|f| assert_eq!(f.events, ["detach"]));
+        await_reaper(&qp);
+        qp.stop().unwrap();
+        assert!(qp.conn.detached.get());
+        assert_eq!(qp.conn.id.get(), None);
+        assert_eq!(qp.conn.qp.get(), None);
+        drop(qp);
+        FAULTS.with_borrow(|f| {
+            assert_eq!(f.events.iter().filter(|e| **e == "detach").count(), 1);
+            assert!(!f.events.contains(&"stop"), "QP destroyed off this thread");
+            assert!(!f.events.contains(&"id"), "id destroyed off this thread");
+        });
+    }
+
+    #[test]
+    /// An id that cannot leave the shared channel is torn down on the owner,
+    /// which also reads that channel, so nothing races the QP destroy.
+    fn cm_teardown_stays_on_the_owner_when_the_id_cannot_move() {
+        let (qp, _region, _charged) = fixture_with_id(true);
+        FAULTS.with_borrow_mut(|f| f.detach_fails = true);
+        qp.stop().unwrap();
+        assert!(!qp.reaping());
+        assert!(!qp.conn.detached.get());
+        assert_eq!(qp.conn.id.get(), None);
+        FAULTS.with_borrow(|f| assert_eq!(f.events, ["detach-failed", "stop", "id"]));
+    }
+
+    #[test]
+    /// Without offload (the simulation), the id is never moved.
+    fn inline_cm_teardown_never_moves_the_id() {
+        let (qp, _region, _charged) = fixture_with_id(false);
+        qp.stop().unwrap();
+        FAULTS.with_borrow(|f| assert_eq!(f.events, ["stop", "id"]));
+    }
+
+    #[test]
     /// Failed fencing keeps an in-flight bind's window and region charged
     /// while late DMA remains possible. The window is freed before its region.
     fn failed_fence_quarantines_late_remote_writes_and_quota() {
         let (qp, region, charged) = fixture();
         let window = MemoryWindow::new(&qp.device).unwrap();
-        qp.bind_window(wr(1), &window, &region, 0, 32).unwrap();
+        qp.bind_window(wr(1), &window, &region, 0, 32, u64::MAX)
+            .unwrap();
         FAULTS.with_borrow_mut(|f| f.stop_fails = true);
         assert_eq!(qp.stop(), Err(Error::Io));
         // Inject a late NIC write while the owner is quarantined.
         unsafe {
-            *bytes(region.raw.as_ptr()) = 99;
+            *bytes(region.raw.unwrap().as_ptr()) = 99;
         }
         drop(region);
         drop(window);
@@ -1734,7 +3493,8 @@ pub(crate) mod lifetime_tests {
     fn unrecoverable_destroy_never_releases_quarantined_quota() {
         let (qp, region, charged) = fixture();
         let window = MemoryWindow::new(&qp.device).unwrap();
-        qp.bind_window(wr(1), &window, &region, 0, 32).unwrap();
+        qp.bind_window(wr(1), &window, &region, 0, 32, u64::MAX)
+            .unwrap();
         drop(region);
         drop(window);
         FAULTS.with_borrow_mut(|f| f.stop_fails = true);
@@ -1750,7 +3510,9 @@ pub(crate) mod lifetime_tests {
     fn invalidation_cqe_does_not_release_remote_buffer() {
         let (qp, region, charged) = fixture();
         let window = MemoryWindow::new(&qp.device).unwrap();
-        let key = qp.bind_window(wr(1), &window, &region, 0, 32).unwrap();
+        let key = qp
+            .bind_window(wr(1), &window, &region, 0, 32, u64::MAX)
+            .unwrap();
         complete(wr(1), 0, opcode::BIND_MW);
         qp.invalidate_window(wr(2), &window, key).unwrap();
         complete(wr(2), 0, opcode::LOCAL_INV);
@@ -1766,8 +3528,18 @@ pub(crate) mod lifetime_tests {
     #[test]
     /// Rust ABI records match the native adapter's asserted sizes and offsets.
     fn private_abi_layout_matches_c_static_assertions() {
-        assert_eq!(std::mem::size_of::<Port>(), 88);
+        assert_eq!(std::mem::size_of::<Port>(), 112);
         assert_eq!(std::mem::offset_of!(Port, mtu), 80);
+        assert_eq!(std::mem::offset_of!(Port, ipv4_gid), 88);
+        assert_eq!(std::mem::offset_of!(Port, flags), 108);
+        assert_eq!(std::mem::size_of::<Caps>(), 28);
+        assert_eq!(std::mem::offset_of!(Caps, ipv4), 12);
+        assert_eq!(std::mem::size_of::<Sge>(), 16);
+        assert_eq!(std::mem::offset_of!(Sge, lkey), 12);
+        assert_eq!(std::mem::size_of::<CmEvent>(), 96);
+        assert_eq!(std::mem::offset_of!(CmEvent, kind), 24);
+        assert_eq!(std::mem::offset_of!(CmEvent, private_len), 32);
+        assert_eq!(std::mem::offset_of!(CmEvent, private), 36);
         assert_eq!(std::mem::size_of::<Endpoint>(), 32);
         assert_eq!(std::mem::offset_of!(Endpoint, qpn), 16);
         assert_eq!(std::mem::size_of::<Completion>(), 32);
@@ -1790,6 +3562,7 @@ pub(crate) mod lifetime_tests {
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             send,
             recv,
+            &racer_io::Rng::os(),
         )
         .unwrap();
         qp.connect(qp.endpoint, true).unwrap();
@@ -1805,7 +3578,7 @@ pub(crate) mod lifetime_tests {
     /// Collect successful completions from one progress call.
     fn drain(qp: &NativeQueuePair) -> Result<Vec<WorkCompletion>> {
         let mut out = Vec::new();
-        qp.progress_with(|c| out.push(c))?;
+        qp.progress_with(|c, _| out.push(c))?;
         Ok(out)
     }
 
@@ -1881,6 +3654,45 @@ pub(crate) mod lifetime_tests {
     }
 
     #[test]
+    /// The QP is the only ledger: an attached record comes back with its
+    /// completion, a failed post holds no record, and stop hands the rest back.
+    fn ledger_records_return_with_completion_or_after_stop() {
+        let (plain, _, _) = fixture();
+        let region =
+            NativeRegion::with_access(plain.device.clone(), 64, Access::CONTROL, quota().0)
+                .unwrap();
+        let qp = NativeQueuePair::<&'static str>::new_with_depth(
+            plain.device.clone(),
+            GuardOwner::new(Arc::new(())),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            4,
+            1,
+            &racer_io::Rng::os(),
+        )
+        .unwrap();
+        qp.connect(qp.endpoint, true).unwrap();
+        qp.send(wr(1), &region, 0, 8).unwrap();
+        qp.attach(wr(1), "first");
+        qp.send(wr(2), &region, 8, 8).unwrap();
+        qp.attach(wr(2), "second");
+        FAULTS.with_borrow_mut(|f| f.post_fails = true);
+        assert_eq!(qp.send(wr(3), &region, 16, 8), Err(Error::Io));
+        qp.attach(wr(3), "never posted");
+        FAULTS.with_borrow_mut(|f| f.post_fails = false);
+        assert_eq!(qp.sends(), 2);
+        complete(wr(2), 0, opcode::SEND);
+        let mut seen = Vec::new();
+        qp.progress_with(|c, record| seen.push((c.id, record)))
+            .unwrap();
+        assert_eq!(seen, [(wr(2), Some("second"))]);
+        assert_eq!(qp.sends(), 1);
+        qp.stop().unwrap();
+        assert_eq!(qp.sends(), 0);
+        assert_eq!(qp.take_records(), ["first"]);
+        assert!(qp.take_records().is_empty());
+    }
+
+    #[test]
     /// Bad ids, ranges, regions, and full queues are refused before the adapter.
     fn ranged_posts_validate_before_reaching_the_adapter() {
         let (qp, region) = ranged_fixture(2, 1);
@@ -1912,12 +3724,13 @@ pub(crate) mod lifetime_tests {
         // Zero depths are a configuration error.
         for (send, recv) in [(0, 1), (1, 0), (u32::MAX, 1)] {
             assert!(matches!(
-                NativeQueuePair::new_with_depth(
+                NativeQueuePair::<()>::new_with_depth(
                     qp.device.clone(),
                     GuardOwner::new(Arc::new(())),
                     Arc::new(std::sync::atomic::AtomicBool::new(false)),
                     send,
                     recv,
+                    &racer_io::Rng::os(),
                 ),
                 Err(Error::InvalidConfiguration)
             ));
@@ -2039,17 +3852,23 @@ pub(crate) mod lifetime_tests {
     /// until the window is freed.
     fn memory_window_binds_with_fresh_keys_and_holds_its_region() {
         let (qp, region) = ranged_fixture(4, 1);
-        assert_eq!(region.as_ptr(), unsafe { bytes(region.raw.as_ptr()) });
+        assert_eq!(region.as_ptr(), unsafe {
+            bytes(region.raw.unwrap().as_ptr())
+        });
         let window = MemoryWindow::new(&qp.device).unwrap();
         assert_eq!(window.next_key(), 71);
-        let first = qp.bind_window(wr(1), &window, &region, 64, 32).unwrap();
+        let first = qp
+            .bind_window(wr(1), &window, &region, 64, 32, u64::MAX)
+            .unwrap();
         assert_eq!(first, 71);
         assert_eq!(window.next_key(), 72);
         complete(wr(1), 0, opcode::BIND_MW);
         qp.invalidate_window(wr(2), &window, first).unwrap();
         complete(wr(2), 0, opcode::LOCAL_INV);
         assert_eq!(drain(&qp).unwrap().len(), 2);
-        let second = qp.bind_window(wr(3), &window, &region, 0, 256).unwrap();
+        let second = qp
+            .bind_window(wr(3), &window, &region, 0, 256, u64::MAX)
+            .unwrap();
         assert_ne!(first, second);
         // Low byte wraps, index bits are kept.
         assert_eq!(inc_rkey(0x1234_56ff), 0x1234_5600);
@@ -2057,18 +3876,18 @@ pub(crate) mod lifetime_tests {
         let other =
             NativeRegion::with_access(qp.device.clone(), 256, Access::PAGES, quota().0).unwrap();
         assert_eq!(
-            qp.bind_window(wr(4), &window, &other, 0, 8),
+            qp.bind_window(wr(4), &window, &other, 0, 8, u64::MAX),
             Err(Error::InvalidRequest)
         );
         let control =
             NativeRegion::with_access(qp.device.clone(), 64, Access::CONTROL, quota().0).unwrap();
         let fresh = MemoryWindow::new(&qp.device).unwrap();
         assert_eq!(
-            qp.bind_window(wr(4), &fresh, &control, 0, 8),
+            qp.bind_window(wr(4), &fresh, &control, 0, 8, u64::MAX),
             Err(Error::InvalidRequest)
         );
         assert_eq!(
-            qp.bind_window(wr(4), &fresh, &region, 200, 57),
+            qp.bind_window(wr(4), &fresh, &region, 200, 57, u64::MAX),
             Err(Error::InvalidRequest)
         );
         // Invalidating a never-bound window is refused.
@@ -2078,7 +3897,10 @@ pub(crate) mod lifetime_tests {
         );
         // A failed post keeps the key for the next attempt.
         FAULTS.with_borrow_mut(|f| f.post_fails = true);
-        assert_eq!(qp.bind_window(wr(4), &fresh, &region, 0, 8), Err(Error::Io));
+        assert_eq!(
+            qp.bind_window(wr(4), &fresh, &region, 0, 8, u64::MAX),
+            Err(Error::Io)
+        );
         FAULTS.with_borrow_mut(|f| f.post_fails = false);
         assert_eq!(fresh.next_key(), 71);
         qp.stop().unwrap();
@@ -2125,6 +3947,7 @@ pub(crate) mod lifetime_tests {
                 Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 4,
                 4,
+                &racer_io::Rng::os(),
             )
             .unwrap()
         };
@@ -2144,7 +3967,7 @@ pub(crate) mod lifetime_tests {
             loop {
                 assert!(Instant::now() < until, "native CQ timeout");
                 let mut done = false;
-                qp.progress_with(|c| done |= c.id == id)?;
+                qp.progress_with(|c, _| done |= c.id == id)?;
                 if done {
                     return Ok(());
                 }
@@ -2154,7 +3977,7 @@ pub(crate) mod lifetime_tests {
 
         let window = MemoryWindow::new(&device).unwrap();
         let key = receiver
-            .bind_window(wr(1), &window, &destination, 0, 4096)
+            .bind_window(wr(1), &window, &destination, 0, 4096, u64::MAX)
             .unwrap();
         wait(&receiver, wr(1)).unwrap();
         receiver.post_recv(wr(2), &control, 0, 64).unwrap();
@@ -2179,5 +4002,170 @@ pub(crate) mod lifetime_tests {
         sender.stop().unwrap();
         let landed = unsafe { std::slice::from_raw_parts(destination.as_ptr(), 4096) };
         assert_eq!(landed, [0xa5; 4096]);
+    }
+
+    /// Wait up to a few seconds for a helper thread to finish.
+    fn settle(registering: &Registering) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !registering.ready() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "helper never finished"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    /// A native registration runs on a helper thread, wakes the owner when
+    /// done, and its region deregisters normally.
+    fn registering_runs_off_thread_and_wakes() {
+        let (_qp, region, _charged) = fixture();
+        let (quota, charged) = quota();
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let wake: RegisterWake = {
+            let wakes = wakes.clone();
+            Arc::new(move || {
+                wakes.fetch_add(1, Ordering::AcqRel);
+            })
+        };
+        let owner = std::thread::current().id();
+        let registering = Registering::start(
+            region.device.clone(),
+            None,
+            64,
+            Access::PAGES,
+            quota,
+            wake,
+            None,
+            move || {
+                assert_ne!(std::thread::current().id(), owner, "ran on the owner");
+                Box::into_raw(Box::new(vec![0u8; 64])) as usize
+            },
+        );
+        // The helper publishes the result before it wakes the owner, so wait
+        // for the wake: `ready` alone can be observed before the wake runs.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while wakes.load(Ordering::Acquire) == 0 {
+            assert!(std::time::Instant::now() < deadline, "helper never woke");
+            std::thread::yield_now();
+        }
+        assert!(registering.ready(), "woken before the result was ready");
+        assert_eq!(wakes.load(Ordering::Acquire), 1);
+        let built = registering.finish().unwrap();
+        assert_eq!(built.length(), 64);
+        drop(built);
+        assert_eq!(charged.get(), 0, "charge returned after deregister");
+    }
+
+    #[test]
+    /// Registrations started together run concurrently, one helper each, so
+    /// activating many devices costs the slowest one, not the sum. Every
+    /// helper waits for all of them to start: run serially, none succeeds.
+    fn registrations_run_in_parallel() {
+        const DEVICES: usize = 8;
+        let (_qp, region, _charged) = fixture();
+        let started = Arc::new(AtomicUsize::new(0));
+        let wake: RegisterWake = Arc::new(|| {});
+        let pending: Vec<_> = (0..DEVICES)
+            .map(|_| {
+                let (quota, _) = quota();
+                let started = started.clone();
+                Registering::start(
+                    region.device.clone(),
+                    None,
+                    64,
+                    Access::PAGES,
+                    quota,
+                    wake.clone(),
+                    None,
+                    move || {
+                        started.fetch_add(1, Ordering::AcqRel);
+                        let deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(10);
+                        while started.load(Ordering::Acquire) < DEVICES {
+                            if std::time::Instant::now() >= deadline {
+                                return 0;
+                            }
+                            std::thread::yield_now();
+                        }
+                        Box::into_raw(Box::new(vec![0u8; 64])) as usize
+                    },
+                )
+            })
+            .collect();
+        for registering in pending {
+            settle(&registering);
+            assert!(registering.finish().is_ok(), "helpers ran serially");
+        }
+    }
+
+    #[test]
+    /// A failed registration reports `Unavailable` and returns the charge.
+    fn registering_failure_returns_the_charge() {
+        let (_qp, region, _charged) = fixture();
+        let (quota, charged) = quota();
+        let registering = Registering::start(
+            region.device.clone(),
+            None,
+            64,
+            Access::PAGES,
+            quota,
+            Arc::new(|| {}),
+            None,
+            || 0,
+        );
+        settle(&registering);
+        assert_eq!(registering.finish().err(), Some(Error::Unavailable));
+        assert_eq!(charged.get(), 0);
+    }
+
+    #[test]
+    /// Dropped while the helper still runs, a registration leaks its device
+    /// and charge (quarantined) instead of freeing what the helper uses; a
+    /// finished but unclaimed one deregisters.
+    fn registering_dropped_mid_flight_leaks() {
+        let (_qp, region, _charged) = fixture();
+        let (charge, charged) = quota();
+        let observed = charge.clone();
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let (finished, done) = std::sync::mpsc::channel::<()>();
+        let registering = Registering::start(
+            region.device.clone(),
+            None,
+            64,
+            Access::PAGES,
+            charge,
+            Arc::new(move || {
+                let _ = finished.send(());
+            }),
+            None,
+            move || {
+                wait.recv().unwrap();
+                0
+            },
+        );
+        assert!(!registering.ready());
+        drop(registering);
+        assert!(observed.quarantined());
+        drop(observed);
+        go.send(()).unwrap();
+        done.recv().unwrap();
+        assert_eq!(charged.get(), 1, "a leaked charge never returns");
+
+        let (quota, charged) = quota();
+        let registering = Registering::start(
+            region.device.clone(),
+            None,
+            64,
+            Access::PAGES,
+            quota,
+            Arc::new(|| {}),
+            None,
+            || Box::into_raw(Box::new(vec![0u8; 64])) as usize,
+        );
+        settle(&registering);
+        drop(registering);
+        assert_eq!(charged.get(), 0, "an unclaimed region deregisters");
     }
 }

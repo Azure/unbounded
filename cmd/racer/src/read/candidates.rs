@@ -32,8 +32,9 @@ use crate::telemetry::{
 use crate::topology::Candidates;
 use crate::topology::Placement;
 use crate::topology::RouteBudget;
-use racer_control_wire::NodeId;
 use racer_core::read::hints::OfferEnd;
+use racer_io::deadline::Deadline;
+use racer_wire::control::NodeId;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -42,19 +43,18 @@ use std::task::Poll;
 use std::time::Duration;
 #[cfg(test)]
 use std::time::Instant;
-use uring_runtime::environment::Deadline;
 
 fn reserve_hedge_pages(
     admission: &flow_control::Quotas<crate::admission::AdmissionPolicy>,
-    cache: &racer_control_wire::CacheId,
+    cache: &racer_wire::control::CacheId,
+    page_bytes: usize,
     pages: usize,
 ) -> Result<(
     flow_control::Charge<crate::admission::AdmissionPolicy>,
     flow_control::Charge<crate::admission::AdmissionPolicy>,
 )> {
     use crate::admission::ResourceClass;
-    let (plaintext, ciphertext) =
-        racer_core::read::hedge_page_charges(crate::model::PAGE_BYTES as usize, pages);
+    let (plaintext, ciphertext) = racer_core::read::hedge_page_charges(page_bytes, pages);
     let plaintext = admission.reserve(Some(cache), ResourceClass::Plaintext, plaintext)?;
     let ciphertext = admission.reserve(Some(cache), ResourceClass::Ciphertext, ciphertext)?;
     Ok((plaintext, ciphertext))
@@ -76,41 +76,41 @@ pub struct OriginAuthority {
     /// on the local route: this node calls its own origin without ranking.
     local: bool,
 }
+use racer_core::read::acquisition::{
+    Effect as AcqEffectOf, Input as AcqInputOf, Io, PageAcquisition, Phase as AcqPhase, RankAnswer,
+    RankBasis, Report as AcqReport, Terminal,
+};
+use racer_core::read::effect::EffectIds;
 use racer_core::read::walk::{
-    Action, Event as FillEvent, Evidence, Features, Fill, FillConfig, HedgeEnd, List, MAX_HANDOFF,
-    Mode as WalkMode, NOT_MEMBER, Notes, Outcome as WalkOutcome, Probe, Rank0Note, Ranked, Ranking,
-    RemainingEnd, RemainingWalk, Reply as FillReply, RouteMode, SilenceNote,
+    Features, FillConfig, HedgeEnd, List, MAX_HANDOFF, Mode as WalkMode, NOT_MEMBER, Notes,
+    Outcome as WalkOutcome, Probe, Rank0Note, Ranked, RemainingEnd, RemainingWalk,
+    Reply as FillReply, RouteMode, SilenceNote,
 };
 pub use racer_core::read::{ProbeOutcome, ReplicaSelection};
 pub(crate) use racer_core::read::{VisitOrder, replica_score, visit_order};
 
-/// One read's acquisition (`CandidatePolicy::drive`): the racer-core
-/// [`Fill`] and the rankings its member positions refer to.
+type Machine = PageAcquisition<Candidates, Arc<crate::topology::Membership>, VerifiedResponse>;
+type AcqEffect = AcqEffectOf<Candidates, Arc<crate::topology::Membership>, VerifiedResponse>;
+pub(crate) type AcqInput =
+    AcqInputOf<Candidates, Arc<crate::topology::Membership>, VerifiedResponse>;
+pub(crate) type AcqIo = Io<Candidates, Arc<crate::topology::Membership>, VerifiedResponse>;
+
+/// One read's acquisition: the racer-core [`PageAcquisition`] that decides it,
+/// and what only the dataplane holds while performing its effects.
 pub(crate) struct Acquisition {
-    fill: Fill,
+    machine: Machine,
+    ids: EffectIds,
+    out: std::collections::VecDeque<AcqEffect>,
     /// The caller's membership version (diagnostics).
     membership: u64,
-    /// The caller's ranking, for the first `Ranking::Current`.
-    initial: Option<Candidates>,
-    /// The ranking the walk probes.
-    current: Option<Candidates>,
-    /// The previous membership's ranking a stale fallback walks, until the walk takes it.
-    fallback: Option<Candidates>,
-    /// The membership a refresh adopts.
-    latest: Option<std::sync::Arc<crate::topology::Membership>>,
-    /// Version - 1, which predecessors are asked under.
-    previous: Option<std::sync::Arc<crate::topology::Membership>>,
-    /// Version - 1 for a stale fallback, when peers still resolve it.
-    stale_previous: Option<std::sync::Arc<crate::topology::Membership>>,
-    /// The answer awaiting validation, and the outstanding probe's
-    /// destination, mode, and send time.
-    answer: Option<VerifiedResponse>,
-    dest: Option<ProbeDest>,
+    /// The overflow helper the outstanding probe went to, if not a member.
+    helper: Option<NodeId>,
+    /// Whether the outstanding probe acquires.
     acquire: bool,
-    sent: std::time::Instant,
     /// A dataplane error racer-core cannot represent, for its failure.
     error: Option<Error>,
-    phase: Phase,
+    /// Whether the walk entered its remaining-copy phase.
+    remaining: bool,
     authority: Option<OriginAuthority>,
     pub(crate) trail: CandidateTrail,
 }
@@ -125,22 +125,50 @@ impl Acquisition {
         })
     }
 
+    /// Why the walk that last ended at origin had authority.
+    pub(crate) fn origin_reason(&self) -> Option<racer_core::read::walk::OriginReason> {
+        self.machine.fill().origin_reason
+    }
+
     /// The ranking the walk probes.
     pub(crate) fn candidates(&self) -> &Candidates {
-        self.current.as_ref().expect("ranked")
+        self.machine.current().expect("ranked")
     }
-}
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Phase {
-    Walk,
-    Origin,
-    Remaining,
-}
+    /// Feed `input` to the machine and queue what it plans.
+    pub(crate) fn feed(
+        &mut self,
+        input: AcqInput,
+        budget: &mut AcquisitionBudget,
+        now: std::time::Instant,
+    ) -> Result<()> {
+        let mut out = Vec::new();
+        self.machine
+            .on(input, budget, now, &mut self.ids, &mut out)
+            .map_err(|_| Error::Internal)?;
+        self.out.extend(out);
+        if self.machine.phase() == AcqPhase::Remaining && !self.remaining {
+            self.remaining = true;
+            self.trail = CandidateTrail {
+                site: CandidateSite::RemainingCopy,
+                ..Default::default()
+            };
+        }
+        Ok(())
+    }
 
-enum ProbeDest {
-    Member(u32),
-    Helper(NodeId),
+    /// The next effect to perform. The machine always plans one until done.
+    pub(crate) fn next(&mut self) -> Result<AcqEffect> {
+        self.out.pop_front().ok_or(Error::Internal)
+    }
+
+    /// The dataplane error for the machine's failure `error`.
+    pub(crate) fn error(&mut self, error: racer_core::read::Error) -> Error {
+        match (self.error.take(), error) {
+            (Some(error), racer_core::read::Error::Internal) => error,
+            (_, error) => Error::from(error),
+        }
+    }
 }
 
 /// The owners of `candidates` as member positions.
@@ -158,6 +186,10 @@ fn positions(candidates: &Candidates) -> List<u32, MAX_HANDOFF> {
 }
 
 pub struct CandidatePolicy {
+    /// Time and entropy for this worker's candidate walks.
+    ctx: racer_io::WorkerCtx,
+    /// This worker's detached driver queue, shared with its other owners.
+    drivers: Rc<crate::drivers::DriverQueue>,
     hedge: Option<Arc<Hedges>>,
     replica_selection: ReplicaSelection,
     attempt_timeout: std::time::Duration,
@@ -166,7 +198,7 @@ pub struct CandidatePolicy {
     placement: Rc<Placement>,
     peers: Rc<Requester>,
     credentials: Rc<CredentialCrypto>,
-    published: Arc<controlplane::Published<crate::control::Snapshot>>,
+    published: Arc<crate::control::cell::PublicationCell<crate::control::Snapshot>>,
     ownership_refresh: RefCell<OwnershipRefresh>,
     single_flight: RefCell<SingleFlightPeers>,
     /// Timer for waiting on a destination that is behind. Without one, the walk skips it as before.
@@ -311,6 +343,7 @@ impl CandidatePolicy {
         scope: &RequestScope,
         budget: &mut AcquisitionBudget,
         admission: &Rc<flow_control::Quotas<crate::admission::AdmissionPolicy>>,
+        page_bytes: usize,
         validate: impl Fn(VerifiedResponse, RequestScope) -> Operation<'a, crate::memory::PageResult>,
     ) -> Result<(Option<crate::memory::PageResult>, HedgeEnd)> {
         let Some(hedges) = self.hedge.as_ref().filter(|h| h.enabled()) else {
@@ -331,12 +364,12 @@ impl CandidatePolicy {
         }
         check_budget(scope, budget)?;
         let reservation = (|| {
-            let slot = hedges.acquire()?;
-            let escrow = reserve_hedge_pages(admission, &context.object.cache, 1)?;
+            let slot = hedges.acquire(page_bytes)?;
+            let escrow = reserve_hedge_pages(admission, &context.object.cache, page_bytes, 1)?;
             // The caller already holds its serial plaintext page. Escrow is
             // additional accounting, not a buffer consumed by either validator.
             // Fund BOTH contenders before spending credits or changing routing.
-            let working = reserve_hedge_pages(admission, &context.object.cache, 2)?;
+            let working = reserve_hedge_pages(admission, &context.object.cache, page_bytes, 2)?;
             drop(working);
             Ok::<_, Error>((slot, escrow))
         })();
@@ -348,9 +381,8 @@ impl CandidatePolicy {
         // remaining original links for serial candidates or one epoch refresh.
         let (mut secondary_budget, mut primary_budget) =
             racer_core::read::walk::hedge_budgets(budget)?;
-        let primary_scope =
-            RequestScope::new(scope.request, scope.deadline.0.min(budget.deadline()))?;
-        let secondary_scope = RequestScope::new(scope.request, primary_scope.deadline.0)?;
+        let primary_scope = scope.child(scope.request, scope.deadline.0.min(budget.deadline()))?;
+        let secondary_scope = scope.child(scope.request, primary_scope.deadline.0)?;
         let stale = std::cell::Cell::new(false);
         let primary_outcome = std::cell::Cell::new(None);
         let primary = async {
@@ -395,7 +427,7 @@ impl CandidatePolicy {
             }
             // Recheck local headroom after the delay. The escrow remains held;
             // these trial reservations do not replace actual receive/crypto quota.
-            let capacity = reserve_hedge_pages(admission, &context.object.cache, 1);
+            let capacity = reserve_hedge_pages(admission, &context.object.cache, page_bytes, 1);
             let Ok(capacity) = capacity else {
                 hedges.suppressed();
                 return Err(Error::Overloaded);
@@ -443,10 +475,7 @@ impl CandidatePolicy {
         };
         match result {
             Ok(result) => Ok((Some(result), HedgeEnd::Won)),
-            Err(error)
-                if racer_core::read::Error::try_from(error)
-                    .is_ok_and(racer_core::read::walk::hedge_fallback) =>
-            {
+            Err(error) if racer_core::read::walk::hedge_fallback(peer_core_error(error)) => {
                 Ok((None, lost))
             }
             Err(error) => Err(error),
@@ -597,7 +626,7 @@ impl CandidatePolicy {
                 if requested.is_some() && !matches!(error, Error::Overloaded) {
                     self.single_flight
                         .borrow_mut()
-                        .insert(destination.clone(), uring_runtime::environment::now());
+                        .insert(destination.clone(), self.ctx.now());
                     return Ok(ProviderSelection::Refused {
                         provider: destination.clone(),
                     });
@@ -638,7 +667,7 @@ impl CandidatePolicy {
             {
                 self.single_flight
                     .borrow_mut()
-                    .insert(destination.clone(), uring_runtime::environment::now());
+                    .insert(destination.clone(), self.ctx.now());
                 Ok(ProviderSelection::Refused {
                     provider: destination.clone(),
                 })
@@ -654,7 +683,7 @@ impl CandidatePolicy {
             || self
                 .single_flight
                 .borrow_mut()
-                .contains(provider, uring_runtime::environment::now())
+                .contains(provider, self.ctx.now())
         {
             return None;
         }
@@ -666,9 +695,13 @@ impl CandidatePolicy {
         placement: Rc<Placement>,
         peers: Rc<Requester>,
         credentials: Rc<CredentialCrypto>,
-        published: Arc<controlplane::Published<crate::control::Snapshot>>,
+        published: Arc<crate::control::cell::PublicationCell<crate::control::Snapshot>>,
+        ctx: racer_io::WorkerCtx,
+        drivers: Rc<crate::drivers::DriverQueue>,
     ) -> Self {
         Self {
+            ctx,
+            drivers,
             hedge: None,
             // Low-level construction keeps canonical order; the service reads
             // its selection from configuration (default `Spread`).
@@ -713,6 +746,7 @@ impl CandidatePolicy {
             WalkOutcome::Transport(_) | WalkOutcome::TimedOut => true,
             WalkOutcome::Copy
             | WalkOutcome::Shed
+            | WalkOutcome::Fetching
             | WalkOutcome::Failed
             | WalkOutcome::Probe(ProbeOutcome::CopyMiss | ProbeOutcome::VersionUnavailable) => {
                 false
@@ -723,9 +757,7 @@ impl CandidatePolicy {
             .member(destination)
             .map(|m| m.site.clone())
             .unwrap_or_default();
-        self.notices
-            .borrow_mut()
-            .observe(site, cut, uring_runtime::environment::now());
+        self.notices.borrow_mut().observe(site, cut, self.ctx.now());
     }
 
     /// Whether this policy can wait for a destination that is behind.
@@ -739,6 +771,15 @@ impl CandidatePolicy {
 
     /// Let readers wait for a destination that is behind this node's membership instead of skipping
     /// it.
+    /// This worker's time and entropy.
+    pub(crate) fn drivers(&self) -> &Rc<crate::drivers::DriverQueue> {
+        &self.drivers
+    }
+
+    pub(crate) fn ctx(&self) -> &racer_io::WorkerCtx {
+        &self.ctx
+    }
+
     pub(crate) fn with_reactor(mut self, reactor: Rc<crate::runtime::Reactor>) -> Self {
         self.reactor = Some(reactor);
         self
@@ -747,7 +788,6 @@ impl CandidatePolicy {
     /// Sleep until `until` under the request's scope. `false` without a
     /// timer.
     async fn stale_sleep(&self, until: std::time::Instant, scope: &RequestScope) -> Result<bool> {
-        use uring_runtime::reactor::timer::SleepMode;
         #[cfg(test)]
         if self.instant_stale_wait.get() {
             return Ok(true);
@@ -755,15 +795,7 @@ impl CandidatePolicy {
         let Some(reactor) = &self.reactor else {
             return Ok(false);
         };
-        #[cfg(test)]
-        let mode = if uring_runtime::environment::simulation_seed().is_some() {
-            SleepMode::ClockPoll
-        } else {
-            SleepMode::Kernel
-        };
-        #[cfg(not(test))]
-        let mode = SleepMode::Kernel;
-        reactor.sleep_until(until, mode, scope).await?;
+        reactor.sleep_until(until, scope).await?;
         Ok(true)
     }
 
@@ -975,7 +1007,6 @@ impl CandidatePolicy {
         let membership = self
             .published
             .current()
-            .map_err(Error::from)
             .and_then(|s| s.map(|s| s.membership.clone()).ok_or(Error::Unavailable));
         let object = page.version.object.clone();
         let number = page.number;
@@ -1042,29 +1073,52 @@ impl CandidatePolicy {
         Box::pin(async move {
             let mut a = self.acquisition(candidates, &operation, scope, false, true);
             let mut copy = None;
-            let action = self
-                .drive(
-                    &mut a,
-                    FillEvent::Start { local_hit: false },
-                    context,
-                    &operation,
-                    scope,
-                    budget,
-                    &mut validate,
-                    &mut copy,
-                )
-                .await?;
-            match action {
-                Action::Done(Ok(_)) => {
-                    Ok(CandidateResolution::Copy(copy.expect("a validated copy")))
+            a.feed(
+                AcqInputOf::Start { local_hit: false },
+                budget,
+                self.ctx.now(),
+            )?;
+            loop {
+                match a.next()?.split() {
+                    Err(Terminal::Report(report)) => {
+                        self.report(&a, report, &operation, scope, budget);
+                    }
+                    Err(Terminal::Done(done)) => {
+                        return match done.result {
+                            Ok(_) => Ok(CandidateResolution::Copy(copy.expect("a validated copy"))),
+                            Err(error) => {
+                                let error = a.error(error);
+                                Err(self
+                                    .failed(&mut a, error, done.notes, &operation, scope, budget))
+                            }
+                        };
+                    }
+                    Ok(Io::Origin { authority, .. }) => {
+                        scope.check()?;
+                        self.authority(&mut a, authority.rank, &operation);
+                        return Ok(CandidateResolution::Origin(
+                            a.authority.take().expect("origin authority"),
+                        ));
+                    }
+                    Ok(Io::Hedge { .. } | Io::Publish { .. }) => {
+                        unreachable!("a walk-only acquisition neither hedges nor publishes")
+                    }
+                    Ok(io) => {
+                        let input = self
+                            .perform(
+                                &mut a,
+                                io,
+                                context,
+                                &operation,
+                                scope,
+                                budget,
+                                &mut validate,
+                                &mut copy,
+                            )
+                            .await;
+                        a.feed(input, budget, self.ctx.now())?;
+                    }
                 }
-                Action::Origin { rank } => {
-                    self.authority(&mut a, rank, &operation);
-                    Ok(CandidateResolution::Origin(
-                        a.authority.take().expect("origin authority"),
-                    ))
-                }
-                action => unreachable!("a walk-only acquisition asked for {action:?}"),
             }
         })
     }
@@ -1081,216 +1135,178 @@ impl CandidatePolicy {
     ) -> Acquisition {
         // Without a timer, the walk skips a destination that is behind instead of waiting for it.
         let features = Features::PRODUCTION.with(Features::STALE_WAIT, self.can_wait());
+        let config = FillConfig {
+            operation: operation_kind(operation),
+            hedge,
+            walk_only,
+            scope: scope.deadline.0,
+            features,
+        };
         Acquisition {
-            fill: Fill::new(FillConfig {
-                operation: operation_kind(operation),
-                hedge,
-                walk_only,
-                scope: scope.deadline.0,
-                features,
-            }),
             membership: candidates.membership.version.0,
-            initial: Some(candidates),
-            current: None,
-            fallback: None,
-            latest: None,
-            previous: None,
-            stale_previous: None,
-            answer: None,
-            dest: None,
+            machine: PageAcquisition::new(config, candidates, self.ctx.now()),
+            ids: EffectIds::new(),
+            out: Default::default(),
+            helper: None,
             acquire: false,
-            sent: uring_runtime::environment::now(),
             error: None,
-            phase: Phase::Walk,
+            remaining: false,
             authority: None,
             trail: CandidateTrail::default(),
         }
     }
 
-    /// Run `acquisition` from `event` until it needs what only the caller
-    /// performs: a hedge, an origin fetch, a publication, or the end. A
-    /// validated copy lands in `copy`. racer-core owns every decision; this
-    /// loop performs the rankings and exchanges it plans.
-    #[allow(clippy::too_many_arguments)] // The driver borrows the read's distinct inputs.
-    pub(crate) async fn drive<'a, T: 'a>(
+    /// Perform one effect the machine planned and return its answer. The
+    /// caller performs hedges, origin fetches and publications itself; a
+    /// validated copy lands in `copy`.
+    #[allow(clippy::too_many_arguments)] // The interpreter borrows the read's distinct inputs.
+    pub(crate) async fn perform<'a, T: 'a>(
         &'a self,
         a: &mut Acquisition,
-        event: FillEvent<'_>,
+        io: AcqIo,
         context: &'a OriginContext,
         operation: &PeerOperation,
         scope: &RequestScope,
         budget: &mut AcquisitionBudget,
         validate: &mut (impl FnMut(VerifiedResponse) -> Operation<'a, T> + 'a),
         copy: &mut Option<T>,
-    ) -> Result<Action> {
+    ) -> AcqInput {
+        // A dataplane error is kept only for the step that reported it.
+        a.error = None;
         let (object, page) = operation_identity(operation);
-        let now = uring_runtime::environment::now;
-        let mut next = a.fill.on(event, budget, now());
-        loop {
-            let (action, evidence) = next;
-            if !matches!(action, Action::Done(Err(_))) {
-                a.error = None;
+        let now = || self.ctx.now();
+        match io {
+            Io::Rank { id, basis, .. } => {
+                let result = self
+                    .rank_for(a, basis, context, object, page, operation, scope, budget)
+                    .await
+                    .map_err(|error| a.core_error(error));
+                AcqInputOf::Ranked { id, result }
             }
-            // The walk took the previous membership's ranking.
-            if a.fallback
-                .as_ref()
-                .is_some_and(|c| c.membership.version.0 == a.fill.version)
-            {
-                a.current = a.fallback.take();
-            }
-            if evidence.notes & Notes::REMAINING != 0 {
-                a.phase = Phase::Remaining;
-                a.trail = CandidateTrail {
-                    site: CandidateSite::RemainingCopy,
-                    ..Default::default()
+            Io::Hints { id, .. } => {
+                let PeerOperation::Page { page: page_id, .. } = operation else {
+                    unreachable!("only page owners ask for hints");
                 };
+                let current = a.candidates();
+                let membership = &current.membership;
+                let hints: Vec<u32> = self
+                    .successors
+                    .borrow_mut()
+                    .probe(page_id, now())
+                    .iter()
+                    .filter_map(|node| membership.position(node).ok())
+                    .map(|p| p as u32)
+                    .collect();
+                let rank0 = match a.machine.fill().rank {
+                    Some(rank) if rank > 0 => {
+                        self.rank0_watch
+                            .borrow()
+                            .state(page_id, &current.ordered[0], now())
+                    }
+                    _ => racer_core::liveness::Rank0State::Unknown,
+                };
+                AcqInputOf::Hints { id, hints, rank0 }
             }
-            self.apply(a, &evidence, operation, scope, budget);
-            let event = match action {
-                Action::Rank { ranking, version } => {
-                    let ranked = self
-                        .rank_for(
-                            a, ranking, version, context, object, page, operation, scope, budget,
-                        )
-                        .await;
-                    FillEvent::Ranked(ranked.map_err(|error| a.core_error(error)))
-                }
-                Action::Hints => {
-                    let PeerOperation::Page { page: id, .. } = operation else {
-                        unreachable!("only page owners ask for hints");
-                    };
-                    let current = a.current.as_ref().expect("ranked");
-                    let membership = &current.membership;
-                    let hints: Vec<u32> = self
-                        .successors
-                        .borrow_mut()
-                        .probe(id, now())
-                        .iter()
-                        .filter_map(|node| membership.position(node).ok())
-                        .map(|p| p as u32)
-                        .collect();
-                    let rank0 = match a.fill.rank {
-                        Some(rank) if rank > 0 => {
-                            self.rank0_watch
-                                .borrow()
-                                .state(id, &current.ordered[0], now())
-                        }
-                        _ => racer_core::liveness::Rank0State::Unknown,
-                    };
-                    next = a.fill.on(
-                        FillEvent::Hints {
-                            hints: &hints,
-                            rank0,
-                        },
-                        budget,
-                        now(),
-                    );
-                    continue;
-                }
-                Action::Refresh => {
-                    let latest = match self.published.current() {
-                        Ok(latest) => latest.map(|published| published.membership.clone()),
-                        Err(error) => {
-                            let error = a.core_error(Error::from(error));
-                            next = a.fill.on(FillEvent::Abort(error), budget, now());
-                            continue;
-                        }
-                    };
-                    let version = latest.as_ref().map(|latest| latest.version.0);
-                    a.latest = latest;
-                    // Version - 1, when still resolvable by peers that adopted
-                    // the current one (replaced within
-                    // `PREVIOUS_MEMBERSHIP_WITHIN`) and listing this node.
-                    let current = a.current.as_ref().expect("ranked");
-                    a.stale_previous = current
-                        .membership
-                        .version
-                        .0
-                        .checked_sub(1)
-                        .and_then(|previous| {
-                            self.published
-                                .resolve_recent(
-                                    previous,
-                                    now(),
-                                    racer_core::read::walk::PREVIOUS_MEMBERSHIP_WITHIN,
-                                )
-                                .ok()
-                                .flatten()
-                        })
-                        .filter(|previous| previous.member(&self.node).is_ok());
-                    FillEvent::Membership {
-                        latest: version,
-                        previous_recent_member: a.stale_previous.is_some(),
+            Io::Refresh { id, .. } => {
+                let latest = match self.published.current() {
+                    Ok(latest) => latest.map(|published| published.membership.clone()),
+                    Err(error) => {
+                        let error = a.core_error(error);
+                        return AcqInputOf::Membership {
+                            id,
+                            latest: Err(error),
+                            recent_previous: None,
+                        };
                     }
-                }
-                Action::Probe(probe) => {
-                    self.probe(a, probe, context, object, page, operation, scope, budget)
-                        .await
-                }
-                Action::Validate => {
-                    let response = a.answer.take().expect("an answer to validate");
-                    let validated = validated_copy(response, operation, a.acquire, validate).await;
-                    note_validation(&mut a.trail, &validated);
-                    FillEvent::Validated(match validated {
-                        Ok(Ok(validated)) => {
-                            *copy = Some(validated);
-                            Ok(None)
-                        }
-                        Ok(Err(outcome)) => Ok(Some(outcome)),
-                        Err(error) => Err(a.core_error(error)),
+                };
+                // Version - 1, when still resolvable by peers that adopted
+                // the current one (replaced within
+                // `PREVIOUS_MEMBERSHIP_WITHIN`) and listing this node.
+                let recent_previous = a
+                    .candidates()
+                    .membership
+                    .version
+                    .0
+                    .checked_sub(1)
+                    .and_then(|previous| {
+                        self.published
+                            .resolve_recent(
+                                previous,
+                                now(),
+                                racer_core::read::walk::PREVIOUS_MEMBERSHIP_WITHIN,
+                            )
+                            .ok()
+                            .flatten()
                     })
+                    .filter(|previous| previous.member(&self.node).is_ok());
+                AcqInputOf::Membership {
+                    id,
+                    latest: Ok(latest.map(|latest| (latest.version.0, latest))),
+                    recent_previous,
                 }
-                Action::Batch {
-                    first,
-                    count,
-                    remaining_opportunities,
-                } => {
-                    let current = a.current.as_ref().expect("ranked");
-                    let membership = current.membership.clone();
-                    let targets = &a.fill.handoff[first..first + count];
-                    match self
-                        .granted_batch(
-                            &membership,
-                            targets,
-                            remaining_opportunities,
-                            context,
-                            operation,
-                            scope,
-                            budget.deadline(),
-                            validate,
-                            &mut a.trail,
-                        )
-                        .await
-                    {
-                        Ok(Some(validated)) => {
-                            *copy = Some(validated);
-                            FillEvent::BatchDone { copy: true }
-                        }
-                        Ok(None) => FillEvent::BatchDone { copy: false },
-                        Err(error) => FillEvent::Abort(a.core_error(error)),
+            }
+            Io::Send {
+                id, probe, dest, ..
+            } => {
+                self.probe(
+                    a, id, probe, dest, context, object, page, operation, scope, budget,
+                )
+                .await
+            }
+            Io::Validate { id, answer } => {
+                let validated = validated_copy(answer, operation, a.acquire, validate).await;
+                note_validation(&mut a.trail, &validated);
+                let result = match validated {
+                    Ok(Ok(validated)) => {
+                        *copy = Some(validated);
+                        Ok(None)
                     }
-                }
-                Action::Wait(wait) => {
-                    if let Err(error) = self.stale_sleep(now() + wait, scope).await {
-                        return Err(self.failed(a, error, &evidence, operation, scope, budget));
+                    Ok(Err(outcome)) => Ok(Some(outcome)),
+                    Err(error) => Err(a.core_error(error)),
+                };
+                AcqInputOf::Validated { id, result }
+            }
+            Io::Batch {
+                id,
+                targets,
+                remaining_opportunities,
+                ..
+            } => {
+                let membership = a.candidates().membership.clone();
+                let result = match self
+                    .granted_batch(
+                        &membership,
+                        &targets,
+                        remaining_opportunities,
+                        context,
+                        operation,
+                        scope,
+                        budget.deadline(),
+                        validate,
+                        &mut a.trail,
+                    )
+                    .await
+                {
+                    Ok(Some(validated)) => {
+                        *copy = Some(validated);
+                        Ok(true)
                     }
-                    FillEvent::Timer
-                }
-                Action::Done(Err(error)) => {
-                    let error = match (a.error.take(), error) {
-                        (Some(error), racer_core::read::Error::Internal) => error,
-                        (_, error) => Error::from(error),
-                    };
-                    return Err(self.failed(a, error, &evidence, operation, scope, budget));
-                }
-                Action::Origin { .. } => {
-                    a.phase = Phase::Origin;
-                    return Ok(action);
-                }
-                Action::Idle => unreachable!("one probe is outstanding at a time"),
-                action => return Ok(action),
-            };
-            next = a.fill.on(event, budget, now());
+                    Ok(None) => Ok(false),
+                    Err(error) => Err(a.core_error(error)),
+                };
+                AcqInputOf::Batched { id, result }
+            }
+            Io::Sleep { id, until } => {
+                let result = self
+                    .stale_sleep(until, scope)
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| a.core_error(error));
+                AcqInputOf::Timer { id, result }
+            }
+            Io::Hedge { .. } | Io::Origin { .. } | Io::Publish { .. } => {
+                unreachable!("the caller performs hedges, origin fetches and publications")
+            }
         }
     }
 
@@ -1298,53 +1314,43 @@ impl CandidatePolicy {
     #[allow(clippy::too_many_arguments)] // The ranking borrows the read's distinct inputs.
     async fn rank_for(
         &self,
-        a: &mut Acquisition,
-        ranking: Ranking,
-        version: Option<u64>,
+        a: &Acquisition,
+        basis: RankBasis<Candidates, Arc<crate::topology::Membership>>,
         context: &OriginContext,
         object: &ObjectId,
         page: PageNumber,
         operation: &PeerOperation,
         scope: &RequestScope,
         budget: &AcquisitionBudget,
-    ) -> Result<Ranked> {
+    ) -> Result<RankAnswer<Candidates, Arc<crate::topology::Membership>>> {
         let page_operation = matches!(operation, PeerOperation::Page { .. });
-        match ranking {
-            Ranking::Current => {
+        let candidates = match basis {
+            RankBasis::Verify(candidates) => {
                 check_budget(scope, budget)?;
-                let candidates = match (version, a.initial.take()) {
-                    (None, Some(candidates)) => {
-                        if object != &context.object {
-                            return Err(Error::InvalidRequest);
-                        }
-                        // Public Candidates values are not authority.
-                        // Recompute before origin.
-                        let expected = self
-                            .candidates_scoped(candidates.membership.clone(), object, page, scope)
-                            .await?;
-                        if expected.ordered != candidates.ordered {
-                            return Err(Error::IncompatibleMembership);
-                        }
-                        candidates
-                    }
-                    _ => {
-                        let latest = a.latest.take().ok_or(Error::Unavailable)?;
-                        self.candidates_scoped(latest, object, page, scope).await?
-                    }
-                };
-                if candidates.ordered.is_empty() || candidates.ordered.len() > 3 {
+                if object != &context.object {
+                    return Err(Error::InvalidRequest);
+                }
+                // Public Candidates values are not authority.
+                // Recompute before origin.
+                let expected = self
+                    .candidates_scoped(candidates.membership.clone(), object, page, scope)
+                    .await?;
+                if expected.ordered != candidates.ordered {
                     return Err(Error::IncompatibleMembership);
                 }
-                let ranked = self.ranked(&candidates, object, page, page_operation);
-                a.current = Some(candidates);
-                a.previous = None;
-                Ok(ranked)
+                candidates
             }
-            Ranking::Previous => {
+            RankBasis::Latest(latest) => {
+                check_budget(scope, budget)?;
+                self.candidates_scoped(latest, object, page, scope).await?
+            }
+            RankBasis::Fallback(previous) => {
+                self.candidates_scoped(previous, object, page, scope)
+                    .await?
+            }
+            RankBasis::Previous { version } => {
                 // Ranking failures are not errors; the walk just goes without.
-                let version = version.expect("a previous version");
-                let current = a.current.as_ref().expect("ranked");
-                let now = uring_runtime::environment::now();
+                let now = self.ctx.now();
                 let previous = self
                     .published
                     .resolve(version, now)
@@ -1369,6 +1375,7 @@ impl CandidatePolicy {
                     .candidates_scoped(previous, object, page, scope)
                     .await?;
                 // Previous owners that are no longer members are not asked.
+                let current = a.candidates();
                 let owners: List<u32, MAX_HANDOFF> = previous
                     .ordered
                     .iter()
@@ -1379,36 +1386,24 @@ impl CandidatePolicy {
                             .map_or(NOT_MEMBER, |p| p as u32)
                     })
                     .collect();
-                let recent_member = recent.is_some();
-                a.previous = recent;
-                Ok(Ranked {
-                    recent_member,
-                    ..Ranked::new(version, &owners, None)
-                })
+                return Ok(RankAnswer {
+                    ranked: Ranked {
+                        recent_member: recent.is_some(),
+                        ..Ranked::new(version, &owners, None)
+                    },
+                    ranking: None,
+                    recent,
+                });
             }
-            Ranking::Fallback => {
-                let previous = a.stale_previous.take().ok_or(Error::Unavailable)?;
-                let previous = self
-                    .candidates_scoped(previous, object, page, scope)
-                    .await?;
-                if previous.ordered.is_empty() || previous.ordered.len() > 3 {
-                    return Err(Error::IncompatibleMembership);
-                }
-                let ranked = self.ranked(&previous, object, page, page_operation);
-                a.fallback = Some(previous);
-                Ok(ranked)
-            }
-            Ranking::Authority => {
-                check_budget(scope, budget)?;
-                if a.fill.funding {
-                    a.trail.site = CandidateSite::Funding;
-                }
-                let current = a.current.as_ref().expect("ranked");
-                let owners = positions(current);
-                let rank = current.ordered.iter().position(|node| node == &self.node);
-                Ok(Ranked::new(current.membership.version.0, &owners, rank))
-            }
+        };
+        if candidates.ordered.is_empty() || candidates.ordered.len() > 3 {
+            return Err(Error::IncompatibleMembership);
         }
+        Ok(RankAnswer {
+            ranked: self.ranked(&candidates, object, page, page_operation),
+            ranking: Some(candidates),
+            recent: None,
+        })
     }
 
     /// What the walk needs from `candidates`: the owners as member
@@ -1459,46 +1454,48 @@ impl CandidatePolicy {
     async fn probe(
         &self,
         a: &mut Acquisition,
+        id: racer_core::read::effect::EffectId,
         probe: Probe,
+        dest: Option<u32>,
         context: &OriginContext,
         object: &ObjectId,
         page: PageNumber,
         operation: &PeerOperation,
         scope: &RequestScope,
         budget: &mut AcquisitionBudget,
-    ) -> FillEvent<'static> {
-        let current = a.current.as_ref().expect("ranked");
+    ) -> AcqInput {
+        let current = a.candidates();
         let membership = current.membership.clone();
         // Canonical ranks past the owners address handoff targets or, for a
         // non-owner, the overflow helper.
-        let helper;
-        let destination = match a.fill.dest(&probe) {
+        let destination = match dest {
             Some(p) => {
-                a.dest = Some(ProbeDest::Member(p));
-                &membership.members()[p as usize].node
+                a.helper = None;
+                membership.members()[p as usize].node.clone()
             }
             None => match self.fanout_helper(current, object, page) {
                 Some(node) => {
-                    helper = node;
-                    a.dest = Some(ProbeDest::Helper(helper.clone()));
-                    &helper
+                    a.helper = Some(node.clone());
+                    node
                 }
                 // Every candidate helper is excluded: a miss.
-                None => return FillEvent::NoHelper,
+                None => {
+                    a.helper = None;
+                    return AcqInputOf::NoHelper { id };
+                }
             },
         };
-        let request_membership = match (&a.previous, probe.previous) {
+        let request_membership = match (a.machine.previous(), probe.previous) {
             (Some(previous), true) => previous.clone(),
-            _ => membership.clone(),
+            _ => membership,
         };
-        let remaining = a.phase == Phase::Remaining;
+        let remaining = a.machine.phase() == AcqPhase::Remaining;
         a.acquire = probe.mode == WalkMode::Acquire;
-        a.sent = uring_runtime::environment::now();
-        let mut timed_out = false;
+        let mut exchanged = Exchanged::default();
         let response = self
             .request_traced(
                 &request_membership,
-                destination,
+                &destination,
                 context,
                 operation,
                 if a.acquire {
@@ -1507,7 +1504,7 @@ impl CandidatePolicy {
                     FetchMode::CopyOnly
                 },
                 scope,
-                a.fill.request_budget(budget),
+                a.machine.request_budget(budget),
                 probe.remaining_opportunities,
                 if probe.route == RouteMode::FundedRoute {
                     RequestMode::FundedRoute
@@ -1515,47 +1512,58 @@ impl CandidatePolicy {
                     RequestMode::SharedRoute
                 },
                 Some((&mut a.trail, probe.canonical as u8)),
-                &mut timed_out,
+                &mut exchanged,
             )
             .await;
-        FillEvent::Reply(match response {
+        let mut answer = None;
+        let reply = match response {
             Ok(response) => {
-                let signed = response.origin().node() == destination;
+                let signed = response.origin().node() == &destination;
                 let kind = response.response().kind();
                 if kind.has_payload() {
-                    a.answer = Some(response);
+                    answer = Some(response);
                 }
                 FillReply::Answer { kind, signed }
             }
             // Sent but unanswered within the attempt's own bound.
-            Err(_) if timed_out && !remaining => FillReply::TimedOut,
+            Err(_) if exchanged.timed_out && !remaining => FillReply::TimedOut,
             Err(error) => FillReply::Failed {
                 error: a.core_error(error),
-                sent: true,
+                // A local failure before the request went out (planning, sealing, admission)
+                // is no evidence about the destination.
+                sent: exchanged.sent,
                 scope_live: scope.check().is_ok(),
             },
-        })
+        };
+        AcqInputOf::Replied { id, reply, answer }
     }
 
-    /// Apply what one event showed: silence, rank 0 and route evidence.
-    fn apply(
+    /// Apply what the machine reported: silence, rank 0 and route evidence.
+    /// Origin outcomes are recorded where the caller performs the fetch.
+    pub(crate) fn report(
         &self,
         a: &Acquisition,
-        evidence: &Evidence,
+        report: AcqReport,
         operation: &PeerOperation,
         scope: &RequestScope,
         budget: &AcquisitionBudget,
     ) {
-        // The remaining-copy walk records no evidence.
-        if a.phase == Phase::Remaining {
-            return;
-        }
-        let (Some(dest), Some(current)) = (&a.dest, &a.current) else {
+        let AcqReport::Evidence {
+            evidence,
+            dest,
+            sent,
+            ..
+        } = report
+        else {
             return;
         };
-        let destination = match dest {
-            ProbeDest::Member(p) => &current.membership.members()[*p as usize].node,
-            ProbeDest::Helper(node) => node,
+        let Some(current) = a.machine.current() else {
+            return;
+        };
+        let destination = match (dest, &a.helper) {
+            (Some(p), _) => &current.membership.members()[p as usize].node,
+            (None, Some(node)) => node,
+            (None, None) => return,
         };
         let health = self.peers.link_health();
         let page = match operation {
@@ -1571,9 +1579,19 @@ impl CandidatePolicy {
             // A probe of the page's rank 0 asks whether rank 0 answers at all: `poll_pings` sends
             // the ping. Any other timeout only demotes the owner in this node's visit order.
             (Some(SilenceNote::TimedOut { needed }), Some(id)) => {
-                health.silence_timed_out(destination, id.clone(), a.sent, needed);
+                health.silence_timed_out(destination, id.clone(), sent, needed);
             }
             _ => {}
+        }
+        // Any answer the destination signed, shed included, shows it alive: a page whose rank 0
+        // is the destination and was refused only for load keeps waiting on it.
+        if matches!(
+            evidence.silence,
+            Some(SilenceNote::Answered | SilenceNote::Shed)
+        ) {
+            self.rank0_watch
+                .borrow_mut()
+                .alive(destination.clone(), self.ctx.now());
         }
         // Update the rank 0 watch from this owner's page probe of rank 0: a timeout notes the page
         // with the request's deadline, an answer signed by rank 0 itself forgets it.
@@ -1583,7 +1601,13 @@ impl CandidatePolicy {
                 Rank0Note::TimedOut => watch.timed_out(
                     id.clone(),
                     destination.clone(),
-                    uring_runtime::environment::now(),
+                    self.ctx.now(),
+                    budget.deadline().min(scope.deadline.0),
+                ),
+                Rank0Note::Busy => watch.busy(
+                    id.clone(),
+                    destination.clone(),
+                    self.ctx.now(),
                     budget.deadline().min(scope.deadline.0),
                 ),
                 Rank0Note::Failed => watch.answered_failure(id, destination),
@@ -1595,26 +1619,28 @@ impl CandidatePolicy {
         }
     }
 
-    /// Record why the read failed and return the dataplane error.
-    fn failed(
+    /// Record why the read failed and return the dataplane error. `notes`
+    /// are the final step's evidence notes.
+    pub(crate) fn failed(
         &self,
         a: &mut Acquisition,
         mut error: Error,
-        evidence: &Evidence,
+        notes: u16,
         operation: &PeerOperation,
         scope: &RequestScope,
         budget: &AcquisitionBudget,
     ) -> Error {
-        if a.phase == Phase::Walk && a.fill.funding {
+        let phase = a.machine.phase();
+        if phase == AcqPhase::Walk && a.machine.fill().funding {
             a.trail.site = CandidateSite::Funding;
         }
-        if evidence.notes & (Notes::EXHAUSTED | Notes::EXHAUSTED_FUNDING) != 0
-            || (a.phase == Phase::Walk && error == Error::VersionUnavailable)
+        if notes & (Notes::EXHAUSTED | Notes::EXHAUSTED_FUNDING) != 0
+            || (phase == AcqPhase::Walk && error == Error::VersionUnavailable)
         {
             if let Err(stop) = check_budget(scope, budget) {
                 error = stop;
             } else if error == Error::Unavailable {
-                if evidence.notes & Notes::EXHAUSTED != 0 {
+                if notes & Notes::EXHAUSTED != 0 {
                     a.trail.site = CandidateSite::Exhausted;
                 }
                 self.observer.record(
@@ -1627,8 +1653,8 @@ impl CandidatePolicy {
                 );
             }
         }
-        match a.phase {
-            Phase::Walk => self.record_final(
+        match phase {
+            AcqPhase::Walk => self.record_final(
                 operation,
                 a.membership,
                 scope,
@@ -1636,15 +1662,15 @@ impl CandidatePolicy {
                 error,
                 std::mem::take(&mut a.trail),
             ),
-            Phase::Remaining => match (a.fill.remaining_end, &a.authority) {
+            AcqPhase::Remaining => match (a.machine.fill().remaining_end, &a.authority) {
                 (Some(RemainingEnd::None), Some(authority)) => {
                     // Record the miss diagnostic; the walk classifies it.
                     self.final_origin_miss(authority, operation, scope, budget);
                 }
                 _ => {
                     let membership = a
-                        .current
-                        .as_ref()
+                        .machine
+                        .current()
                         .map_or(a.membership, |c| c.membership.version.0);
                     self.record_final(
                         operation,
@@ -1656,7 +1682,7 @@ impl CandidatePolicy {
                     );
                 }
             },
-            Phase::Origin => {}
+            AcqPhase::Origin => {}
         }
         error
     }
@@ -1669,7 +1695,10 @@ impl CandidatePolicy {
         operation: &PeerOperation,
     ) -> &'a OriginAuthority {
         let (object, page) = operation_identity(operation);
-        let current = a.current.as_ref().expect("ranked");
+        if a.machine.fill().funding {
+            a.trail.site = CandidateSite::Funding;
+        }
+        let current = a.machine.current().expect("ranked");
         a.authority.insert(OriginAuthority {
             diagnostic: a.trail.clone(),
             membership: current.membership.clone(),
@@ -1677,7 +1706,7 @@ impl CandidatePolicy {
             object: object.clone(),
             owners: current.ordered.clone(),
             page,
-            predecessor_evidence: a.fill.evidence.to_vec(),
+            predecessor_evidence: a.machine.fill().evidence.to_vec(),
             rank,
             local: false,
         })
@@ -1691,9 +1720,9 @@ impl CandidatePolicy {
         membership: std::sync::Arc<crate::topology::Membership>,
         object: &ObjectId,
         page: PageNumber,
-        mode: racer_control_wire::CacheMode,
+        mode: racer_wire::control::CacheMode,
     ) -> Result<OriginAuthority> {
-        if mode != racer_control_wire::CacheMode::PassthroughLocal {
+        if mode != racer_wire::control::CacheMode::PassthroughLocal {
             return Err(Error::Unauthorized);
         }
         let authority = OriginAuthority {
@@ -1731,14 +1760,19 @@ impl CandidatePolicy {
         validate: &mut (impl FnMut(VerifiedResponse) -> Operation<'a, T> + 'a),
         trail: &mut CandidateTrail,
     ) -> Result<Option<T>> {
-        let mut grants: Vec<(AcquisitionBudget, bool)> = targets
+        let mut grants: Vec<(AcquisitionBudget, Exchanged)> = targets
             .iter()
-            .map(|_| (racer_core::read::walk::granted_budget(deadline), false))
+            .map(|_| {
+                (
+                    racer_core::read::walk::granted_budget(deadline),
+                    Exchanged::default(),
+                )
+            })
             .collect();
         let node = |p: &u32| &membership.members()[*p as usize].node;
-        let sent = uring_runtime::environment::now();
+        let sent = self.ctx.now();
         let responses = futures::future::join_all(targets.iter().zip(grants.iter_mut()).map(
-            |(target, (grant, timed_out))| {
+            |(target, (grant, exchanged))| {
                 self.request_traced(
                     membership,
                     node(target),
@@ -1750,7 +1784,7 @@ impl CandidatePolicy {
                     remaining_opportunities,
                     RequestMode::FundedRoute,
                     None,
-                    timed_out,
+                    exchanged,
                 )
             },
         ))
@@ -1758,14 +1792,14 @@ impl CandidatePolicy {
         // Silence evidence as for a sequential granted probe: the destination's own answer clears
         // it, a timeout only demotes (a granted target is never rank 0).
         if let PeerOperation::Page { page: id, .. } = operation {
-            for ((target, (_, timed_out)), response) in targets.iter().zip(&grants).zip(&responses)
+            for ((target, (_, exchanged)), response) in targets.iter().zip(&grants).zip(&responses)
             {
                 let destination = node(target);
                 match response {
                     Ok(response) if response.origin().node() == destination => {
                         self.peers.link_health().silence_answered(destination);
                     }
-                    Err(_) if *timed_out => {
+                    Err(_) if exchanged.timed_out => {
                         let _ = self.peers.link_health().silence_timed_out(
                             destination,
                             id.clone(),
@@ -1793,12 +1827,7 @@ impl CandidatePolicy {
                         Err(error) => return Err(error),
                     }
                 }
-                Err(error)
-                    if racer_core::read::Error::try_from(error)
-                        .ok()
-                        .and_then(racer_core::read::walk::transport_outcome)
-                        .is_some()
-                        || scope.check().is_ok() => {}
+                Err(error) if peer_outcome(error).is_some() || scope.check().is_ok() => {}
                 Err(error) => return Err(error),
             }
         }
@@ -1879,7 +1908,7 @@ impl CandidatePolicy {
                             probe.remaining_opportunities,
                             RequestMode::SharedRoute,
                             Some((&mut trail, probe.index as u8)),
-                            &mut false,
+                            &mut Exchanged::default(),
                         )
                         .await
                     {
@@ -1892,10 +1921,7 @@ impl CandidatePolicy {
                                 Err(outcome) => WalkOutcome::Probe(outcome),
                             }
                         }
-                        Err(error) => match racer_core::read::Error::try_from(error)
-                            .ok()
-                            .and_then(racer_core::read::walk::transport_outcome)
-                        {
+                        Err(error) => match peer_outcome(error) {
                             Some(outcome) => WalkOutcome::Transport(outcome),
                             None => return Err(error),
                         },
@@ -1975,7 +2001,7 @@ impl CandidatePolicy {
             remaining_opportunities,
             request_mode,
             None,
-            &mut false,
+            &mut Exchanged::default(),
         )
         .await
     }
@@ -1993,7 +2019,7 @@ impl CandidatePolicy {
         remaining_opportunities: u32,
         request_mode: RequestMode,
         trail: Option<(&mut CandidateTrail, u8)>,
-        timed_out: &mut bool,
+        exchanged: &mut Exchanged,
     ) -> Result<VerifiedResponse> {
         match self
             .request_delivered(
@@ -2008,7 +2034,7 @@ impl CandidatePolicy {
                 request_mode,
                 trail,
                 None,
-                timed_out,
+                exchanged,
             )
             .await?
         {
@@ -2047,7 +2073,7 @@ impl CandidatePolicy {
             RequestMode::SharedRoute,
             None,
             Some(ordinal),
-            &mut false,
+            &mut Exchanged::default(),
         )
         .await
     }
@@ -2072,9 +2098,9 @@ impl CandidatePolicy {
         request_mode: RequestMode,
         trail: Option<(&mut CandidateTrail, u8)>,
         landing: Option<i32>,
-        timed_out: &mut bool,
+        exchanged: &mut Exchanged,
     ) -> Result<Delivered> {
-        *timed_out = false;
+        *exchanged = Exchanged::default();
         let mut remote = [b'?'; 36];
         if trail.is_some() && racer_crypto::identity::canonical_uuid(&destination.0) {
             remote.copy_from_slice(destination.0.as_bytes());
@@ -2092,7 +2118,7 @@ impl CandidatePolicy {
             attempts: budget.remaining_attempts(),
             links: budget.remaining_links(),
             overall: if trail.is_some() {
-                crate::telemetry::timestamp(budget.deadline())
+                crate::telemetry::timestamp(scope.clock(), budget.deadline())
             } else {
                 0
             },
@@ -2109,7 +2135,7 @@ impl CandidatePolicy {
             // racer-core reserves the complete route and remote credits before
             // sending and derives the share, local cap, and body budget. Lost
             // responses cannot refund forwarded links; no retry gets fresh credits.
-            let now = uring_runtime::environment::now();
+            let now = self.ctx.now();
             let plan = racer_core::read::walk::plan_attempt(
                 budget,
                 racer_core::read::walk::AttemptInputs {
@@ -2138,18 +2164,21 @@ impl CandidatePolicy {
             // the latter per attempt would make a later update renew provider authority.
             let signed_deadline = overall;
             if trail.is_some() {
-                facts.overall = crate::telemetry::timestamp(overall);
-                facts.share = crate::telemetry::timestamp(plan.share);
-                facts.cap = crate::telemetry::timestamp(attempt_end);
+                facts.overall = crate::telemetry::timestamp(scope.clock(), overall);
+                facts.share = crate::telemetry::timestamp(scope.clock(), plan.share);
+                facts.cap = crate::telemetry::timestamp(scope.clock(), attempt_end);
             }
             // A clone shares cancellation: timing it out would cancel the caller too.
-            let mut attempt_scope = RequestScope::new(scope.request, overall)?;
+            let mut attempt_scope = scope.child(scope.request, overall)?;
             attempt_scope.set_candidate_idle(plan.idle)?;
             attempt_scope.set_candidate_total(attempt_end)?;
             attempt_scope.body_deadlines = Some((overall, plan.share));
             attempt_scope.set_candidate_body_budget(plan.observation, plan.complete_by)?;
             let mut bytes = [0; 16];
-            uring_runtime::environment::fill_random(&mut bytes).map_err(|_| Error::Unavailable)?;
+            self.ctx
+                .rng
+                .fill(&mut bytes)
+                .map_err(|_| Error::Unavailable)?;
             let attempt = AttemptId(bytes);
             facts.attempt = Some(attempt);
             let credentials = &self.credentials;
@@ -2192,6 +2221,7 @@ impl CandidatePolicy {
             };
             let mut stopped = None;
             facts.site = CandidateSite::Exchange;
+            exchanged.sent = true;
             let response = std::future::poll_fn(|cx| {
                 registration.register(cx.waker());
                 if stopped.is_none() {
@@ -2216,6 +2246,7 @@ impl CandidatePolicy {
                         CandidateOutcome::ResponseError(Error::Unavailable)
                     }
                     PeerResponse::Overloaded => CandidateOutcome::ResponseError(Error::Overloaded),
+                    PeerResponse::FlightFull => CandidateOutcome::ResponseError(Error::FlightFull),
                     PeerResponse::VersionUnavailable => {
                         CandidateOutcome::ResponseError(Error::VersionUnavailable)
                     }
@@ -2246,6 +2277,7 @@ impl CandidatePolicy {
                 Ok(Delivered::Response(response)) => {
                     let error = match response.response() {
                         PeerResponse::Overloaded => Some(Error::Overloaded),
+                        PeerResponse::FlightFull => Some(Error::FlightFull),
                         PeerResponse::Unavailable => Some(Error::Unavailable),
                         PeerResponse::VersionUnavailable => Some(Error::VersionUnavailable),
                         PeerResponse::StaleMembership => Some(Error::IncompatibleMembership),
@@ -2284,13 +2316,13 @@ impl CandidatePolicy {
             // (`WalkOutcome::TimedOut`).
             match stop {
                 Some(Error::DeadlineExceeded) => {
-                    *timed_out = true;
+                    exchanged.timed_out = true;
                     Err(Error::Unavailable)
                 }
                 Some(error) => Err(error),
                 None => match response {
                     Err(Error::DeadlineExceeded) => {
-                        *timed_out = true;
+                        exchanged.timed_out = true;
                         Err(Error::Unavailable)
                     }
                     result => result,
@@ -2322,7 +2354,7 @@ impl CandidatePolicy {
         if !should_notice(Some(rank)) || owners.get(rank) != Some(&self.node) {
             return false;
         }
-        let now = uring_runtime::environment::now();
+        let now = self.ctx.now();
         let mut noted = false;
         // Rank 0 and, for a holder at rank 2, rank 1 unless it answered this owner's walk.
         for index in notice_indexes(Some(rank), evidence) {
@@ -2366,11 +2398,9 @@ impl CandidatePolicy {
         let Some(rank0) = owners.first() else {
             return;
         };
-        self.rank0_watch.borrow_mut().failed(
-            page.clone(),
-            rank0.clone(),
-            uring_runtime::environment::now(),
-        );
+        self.rank0_watch
+            .borrow_mut()
+            .failed(page.clone(), rank0.clone(), self.ctx.now());
     }
 
     /// Send due copy offers, at most [`MAX_OFFERS_IN_FLIGHT`] at a time, each on its own detached
@@ -2408,7 +2438,7 @@ impl CandidatePolicy {
                 self.notices.borrow_mut().release(&group);
                 continue;
             }
-            let Ok(permit) = uring_runtime::drivers::reserve() else {
+            let Ok(permit) = self.drivers.reserve() else {
                 // No driver slot this turn: count it as a failed offer
                 // (local, so not a cut).
                 let _ = self
@@ -2424,7 +2454,7 @@ impl CandidatePolicy {
                 let _flight = flight;
                 metrics.record(Event::OrphanOfferSent, 1);
                 let end = policy.offer(&due).await.unwrap_or(OfferEnd::Cut);
-                let now = uring_runtime::environment::now();
+                let now = policy.ctx.now();
                 match end {
                     OfferEnd::Dropped => {}
                     OfferEnd::Delivered => metrics.record(Event::OrphanOfferDelivered, 1),
@@ -2457,7 +2487,7 @@ impl CandidatePolicy {
             return;
         }
         for (peer, page) in health.due_pings(now, room) {
-            let Ok(permit) = uring_runtime::drivers::reserve() else {
+            let Ok(permit) = self.drivers.reserve() else {
                 // No driver slot this turn: the ping's slot goes stale and
                 // the next timeout asks again.
                 return;
@@ -2470,7 +2500,7 @@ impl CandidatePolicy {
                 let _flight = flight;
                 metrics.record(Event::SilencePingSent, 1);
                 let answered = policy.ping(&peer, &page).await;
-                let now = uring_runtime::environment::now();
+                let now = policy.ctx.now();
                 if health.ping_outcome(&peer, answered, now) {
                     metrics.record(Event::SilencePeerSilent, 1);
                 }
@@ -2483,10 +2513,12 @@ impl CandidatePolicy {
     /// classify the result (`racer_core::liveness::ping_verdict`).
     async fn ping(&self, peer: &NodeId, page: &crate::model::PageId) -> Option<bool> {
         use racer_core::read::hints::NOTICE_LINKS;
-        let deadline = uring_runtime::environment::now() + self.attempt_timeout;
+        let ctx = self.ctx.clone();
+        let deadline = ctx.now() + self.attempt_timeout;
         let mut id = [0; 16];
-        uring_runtime::environment::fill_random(&mut id).ok()?;
-        let scope = RequestScope::new(crate::model::RequestId(id), deadline).ok()?;
+        ctx.rng.fill(&mut id).ok()?;
+        let scope =
+            RequestScope::with_clock(crate::model::RequestId(id), deadline, ctx.clock).ok()?;
         let membership = self.published.current().ok()??.membership.clone();
         let context = OriginContext {
             object: page.version.object.clone(),
@@ -2500,7 +2532,7 @@ impl CandidatePolicy {
         // A fresh grant: one local exchange, no remote attempts, and
         // `NOTICE_LINKS` route links.
         let mut budget = AcquisitionBudget::new(deadline, 1, NOTICE_LINKS);
-        let mut timed_out = false;
+        let mut exchanged = Exchanged::default();
         let response = self
             .request_traced(
                 &membership,
@@ -2513,7 +2545,7 @@ impl CandidatePolicy {
                 1,
                 RequestMode::FundedRoute,
                 None,
-                &mut timed_out,
+                &mut exchanged,
             )
             .await;
         racer_core::liveness::ping_verdict(match response {
@@ -2521,7 +2553,7 @@ impl CandidatePolicy {
                 response.origin().node() == peer,
                 matches!(response.response(), PeerResponse::Unavailable),
             )),
-            Err(error) => Err(timed_out || matches!(error, Error::DeadlineExceeded)),
+            Err(error) => Err(exchanged.timed_out || matches!(error, Error::DeadlineExceeded)),
         })
     }
 
@@ -2534,10 +2566,11 @@ impl CandidatePolicy {
     ) -> Result<OfferEnd> {
         use racer_core::read::hints::{NOTICE_LINKS, notice_target};
         let (page, index) = (&due.key.0, due.key.1);
-        let deadline = uring_runtime::environment::now() + self.attempt_timeout;
+        let ctx = self.ctx.clone();
+        let deadline = ctx.now() + self.attempt_timeout;
         let mut id = [0; 16];
-        uring_runtime::environment::fill_random(&mut id).map_err(|_| Error::Unavailable)?;
-        let scope = RequestScope::new(crate::model::RequestId(id), deadline)?;
+        ctx.rng.fill(&mut id).map_err(|_| Error::Unavailable)?;
+        let scope = RequestScope::with_clock(crate::model::RequestId(id), deadline, ctx.clock)?;
         let membership = self
             .published
             .current()?
@@ -2706,7 +2739,7 @@ fn candidate_final_validation_tail_preserves_identity_and_omissions() {
 
 fn check_budget(scope: &RequestScope, budget: &AcquisitionBudget) -> Result<()> {
     scope.check()?;
-    if uring_runtime::environment::now() >= budget.deadline() {
+    if scope.clock().now() >= budget.deadline() {
         Err(Error::DeadlineExceeded)
     } else {
         Ok(())
@@ -2936,6 +2969,10 @@ fn validate_payload(response: &PeerResponse, operation: &PeerOperation) -> Resul
 // so low quotas fall back to the serial walk. The serial continuation skips the consumed primary.
 // A winner waits for the loser's exchange and crypto fence before returning.
 
+/// Duplicate bytes for the largest page size. This is the upper bound a
+/// single hedge can charge, so it sizes the default and the validation
+/// floor of `RACER_PAGE_HEDGE_BYTES`; each hedge charges
+/// `duplicate_bytes` at the published page size.
 pub const DUPLICATE_BYTES: usize =
     racer_core::read::duplicate_bytes(crate::model::PAGE_BYTES as usize);
 #[derive(Clone, Copy)]
@@ -2970,10 +3007,12 @@ pub(crate) struct Hedges {
     config: HedgeConfig,
     capacity: Arc<flow_control::Hedges>,
     metrics: Metrics,
+    clock: racer_io::Clock,
 }
 pub(crate) struct Permit {
     owner: Arc<Hedges>,
     capacity: flow_control::HedgePermit,
+    bytes: usize,
 }
 impl Hedges {
     pub(crate) fn for_worker(&self, metrics: Metrics) -> Arc<Self> {
@@ -2981,13 +3020,19 @@ impl Hedges {
             config: self.config,
             capacity: self.capacity.clone(),
             metrics,
+            clock: self.clock.clone(),
         })
     }
-    pub(crate) fn new(config: HedgeConfig, metrics: Metrics) -> Result<Arc<Self>> {
+    pub(crate) fn new(
+        config: HedgeConfig,
+        metrics: Metrics,
+        clock: racer_io::Clock,
+    ) -> Result<Arc<Self>> {
         config.validate()?;
         Ok(Arc::new(Self {
             config,
             metrics,
+            clock,
             capacity: flow_control::Hedges::new(config.slots, config.bytes),
         }))
     }
@@ -2997,40 +3042,43 @@ impl Hedges {
     pub(crate) fn suppressed(&self) {
         self.metrics.record(Event::PageHedgeSuppressed, 1);
     }
-    pub(crate) fn acquire(self: &Arc<Self>) -> Result<Permit> {
-        let capacity = self.capacity.acquire(
-            DUPLICATE_BYTES,
-            uring_runtime::environment::now() + self.config.delay,
-        )?;
+    /// Acquires a slot and one duplicate's bytes at `page_bytes`, the
+    /// published page size.
+    pub(crate) fn acquire(self: &Arc<Self>, page_bytes: usize) -> Result<Permit> {
+        let bytes = racer_core::read::duplicate_bytes(page_bytes);
+        let capacity = self
+            .capacity
+            .acquire(bytes, self.clock.now() + self.config.delay)?;
         Ok(Permit {
             owner: self.clone(),
             capacity,
+            bytes,
         })
     }
     pub(crate) fn poll(&self) {
-        self.capacity.poll(uring_runtime::environment::now());
+        self.capacity.poll(self.clock.now());
     }
 }
 impl Permit {
     pub(crate) fn delay(&self, cx: &mut Context<'_>) -> Poll<()> {
-        self.capacity.delay(uring_runtime::environment::now(), cx)
+        self.capacity.delay(self.owner.clock.now(), cx)
     }
     pub(crate) fn started(&self) {
         self.owner.metrics.record(Event::PageHedgeStarted, 1);
         self.owner
             .metrics
-            .record(Event::PageHedgeDuplicateBytes, DUPLICATE_BYTES as u64);
+            .record(Event::PageHedgeDuplicateBytes, self.bytes as u64);
     }
     pub(crate) fn won(&self) {
         self.owner.metrics.record(Event::PageHedgeWon, 1);
     }
 }
-impl uring_runtime::drivers::HedgeScope for RequestScope {
+impl crate::drivers::HedgeScope for RequestScope {
     fn cancel(&self) {
         let _ = RequestScope::cancel(self);
     }
 }
-impl uring_runtime::drivers::HedgePolicy<Error> for &Permit {
+impl crate::drivers::HedgePolicy<Error> for &Permit {
     fn delay(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         Permit::delay(self, cx)
     }
@@ -3040,8 +3088,8 @@ impl uring_runtime::drivers::HedgePolicy<Error> for &Permit {
     fn failure(&mut self) -> Error {
         Error::Unavailable
     }
-    fn won(&mut self, contender: uring_runtime::drivers::Contender) {
-        if contender == uring_runtime::drivers::Contender::Secondary {
+    fn won(&mut self, contender: crate::drivers::Contender) {
+        if contender == crate::drivers::Contender::Secondary {
             Permit::won(self);
         }
     }
@@ -3057,7 +3105,7 @@ pub(crate) async fn race(
     parent: &crate::runtime::RequestScope,
     permit: &Permit,
 ) -> Result<crate::memory::PageResult> {
-    uring_runtime::drivers::race(
+    crate::drivers::race(
         primary,
         secondary,
         primary_scope,
@@ -3071,6 +3119,29 @@ fn recoverable(error: Error) -> bool {
     racer_core::read::Error::try_from(error).is_ok_and(racer_core::read::recoverable)
 }
 
+/// How far one peer exchange got.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct Exchanged {
+    /// Sent but unanswered within the attempt's own bound.
+    pub(super) timed_out: bool,
+    /// The request was handed to the peer transport; failures before that
+    /// (planning, sealing, admission) are local.
+    pub(super) sent: bool,
+}
+
+/// A failed peer exchange as racer-core sees it. Dataplane errors without a core counterpart
+/// (`Replay`, `StaleFlight`, a prefetch batch mismatch, `BadGateway`, ...) come from one peer's
+/// answer or a protocol mismatch with it, so they become `Internal`, which the walk treats as
+/// that owner's unusable copy and moves on (`racer_core::read::walk::transport_outcome`).
+fn peer_core_error(error: Error) -> racer_core::read::Error {
+    racer_core::read::Error::try_from(error).unwrap_or(racer_core::read::Error::Internal)
+}
+
+/// Walk evidence for a failed peer exchange; `None` ends the read.
+fn peer_outcome(error: Error) -> Option<ProbeOutcome> {
+    racer_core::read::walk::transport_outcome(peer_core_error(error))
+}
+
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
@@ -3079,9 +3150,10 @@ pub(super) mod tests {
     use crate::model::ObjectMetadata;
     use crate::model::ObjectVersion;
     use crate::model::StrongEtag;
-    use racer_control_wire::CacheId;
+    use racer_wire::control::CacheId;
     #[test]
     fn candidate_failure_routes_spend_initial_allowance_with_four_then_eight_link_ceiling() {
+        let env = racer_io::Env::host();
         struct Routes(RefCell<Vec<(u8, u32)>>);
         impl Routes {
             fn direct_hedge_available(
@@ -3112,21 +3184,24 @@ pub(super) mod tests {
                 Box::pin(async { Err(Error::Unavailable) })
             }
         }
-        let (membership, placement, context, scope, credentials) = fixture();
+        let (membership, placement, context, scope, credentials) = fixture(&env);
         let peers = Rc::new(Routes(RefCell::new(Vec::new())));
         let policy = CandidatePolicy::new(
             NodeId("outside".into()),
             placement,
             Requester::scripted(
+                env.ctx.clock.clone(),
                 peers.clone(),
                 Routes::direct_hedge_available,
                 Routes::request,
                 Routes::request_direct,
             ),
             credentials,
-            Arc::new(controlplane::Published::new(
+            Arc::new(crate::control::cell::PublicationCell::new(
                 crate::control::Snapshot::retention(2),
             )),
+            racer_io::WorkerCtx::host(),
+            std::rc::Rc::new(crate::drivers::DriverQueue::new(1024)),
         );
         let mut budget = AcquisitionBudget::new(scope.deadline.0, 16, 24);
         let result = futures::executor::block_on(policy.resolve_with_budget(
@@ -3202,7 +3277,9 @@ pub(super) mod tests {
             Box::pin(async move { Err(self.error) })
         }
     }
-    pub(crate) fn fixture() -> (
+    pub(crate) fn fixture(
+        env: &racer_io::Env,
+    ) -> (
         std::sync::Arc<crate::topology::Membership>,
         Rc<Placement>,
         OriginContext,
@@ -3213,10 +3290,10 @@ pub(super) mod tests {
         use crate::model::RequestId;
         use crate::topology::Member;
         use crate::topology::Membership;
-        use racer_control_wire::ClusterId;
-        use racer_control_wire::MembershipVersion;
         use racer_crypto::identity::KeyEpochs;
         use racer_crypto::identity::Keyring;
+        use racer_wire::control::ClusterId;
+        use racer_wire::control::MembershipVersion;
         let membership = std::sync::Arc::new(
             Membership::validate(
                 MembershipVersion(1),
@@ -3237,7 +3314,8 @@ pub(super) mod tests {
             metadata: None,
             authorization: None,
         };
-        let scope = RequestScope::new(
+        let scope = RequestScope::on(
+            &env.ctx.clock,
             RequestId([0; 16]),
             Instant::now() + std::time::Duration::from_secs(60),
         )
@@ -3248,14 +3326,16 @@ pub(super) mod tests {
         let keys = Rc::new(Keyring::new(
             ClusterId("cluster".into()),
             NodeId("local".into()),
-            std::sync::Arc::new(KeyEpochs::default()),
+            std::sync::Arc::new(KeyEpochs::with_clock(crate::enrollment::wall_clock(
+                &env.ctx.clock,
+            ))),
         ));
         (
             membership,
             Rc::new(Placement::new(16)),
             context,
             scope,
-            Rc::new(CredentialCrypto::new(keys, admission)),
+            Rc::new(CredentialCrypto::new(keys, admission, env.ctx.clone().rng)),
         )
     }
     fn spread_membership(count: usize) -> std::sync::Arc<crate::topology::Membership> {
@@ -3263,7 +3343,7 @@ pub(super) mod tests {
         use crate::topology::Membership;
         std::sync::Arc::new(
             Membership::validate(
-                racer_control_wire::MembershipVersion(1),
+                racer_wire::control::MembershipVersion(1),
                 (0..count)
                     .map(|i| Member {
                         node: NodeId(format!("33333333-3333-4333-8333-{i:012}")),
@@ -3278,24 +3358,31 @@ pub(super) mod tests {
         )
     }
 
-    fn spread_policy(node: NodeId, selection: ReplicaSelection) -> CandidatePolicy {
+    fn spread_policy(
+        env: &racer_io::Env,
+        node: NodeId,
+        selection: ReplicaSelection,
+    ) -> CandidatePolicy {
         let peers = Rc::new(RecordedPeer {
             calls: RefCell::new(vec![]),
             error: Error::Unavailable,
         });
-        policy(node, peers).with_replica_selection(selection)
+        policy(env, node, peers).with_replica_selection(selection)
     }
 
     #[test]
     fn policy_visit_order_is_deterministic_and_neighbor_first_on_large_membership() {
+        let env = racer_io::Env::host();
+        // A 64 member full mesh limit, so 100 members make several columns.
+        let _mesh = ::topology::test_util::FullMeshMax::set(64);
         let membership = spread_membership(100);
         let placement = Placement::new(64);
         let mut neighbor_first = 0;
         let mut relayed_first_primary = 0;
         let mut relayed_first_spread = 0;
         for requester in membership.members().iter().take(20) {
-            let spread = spread_policy(requester.node.clone(), ReplicaSelection::Spread);
-            let primary = spread_policy(requester.node.clone(), ReplicaSelection::Primary);
+            let spread = spread_policy(&env, requester.node.clone(), ReplicaSelection::Spread);
+            let primary = spread_policy(&env, requester.node.clone(), ReplicaSelection::Primary);
             for page in 0..64 {
                 let candidates = placement.rank(membership.clone(), &object(), PageNumber(page));
                 if candidates.ordered.contains(&requester.node) {
@@ -3342,6 +3429,7 @@ pub(super) mod tests {
     #[test]
     fn spread_visits_an_older_later_owner_before_a_newer_owner() {
         use crate::topology::Membership;
+        let env = racer_io::Env::host();
         let all = spread_membership(12);
         let placement = Placement::new(64);
         let mut moved = 0;
@@ -3350,7 +3438,7 @@ pub(super) mod tests {
             let newest = ranked.ordered[0].clone();
             // `newest` arrives in version 2; the others were in version 1.
             let before = Membership::validate(
-                racer_control_wire::MembershipVersion(1),
+                racer_wire::control::MembershipVersion(1),
                 all.members()
                     .iter()
                     .filter(|m| m.node != newest)
@@ -3360,7 +3448,7 @@ pub(super) mod tests {
             .unwrap();
             let chain = std::sync::Arc::new(
                 Membership::validate_with_predecessor(
-                    racer_control_wire::MembershipVersion(2),
+                    racer_wire::control::MembershipVersion(2),
                     all.members().to_vec(),
                     Some(&before),
                 )
@@ -3372,7 +3460,7 @@ pub(super) mod tests {
                 if candidates.ordered.contains(&requester.node) {
                     continue;
                 }
-                let spread = spread_policy(requester.node.clone(), ReplicaSelection::Spread);
+                let spread = spread_policy(&env, requester.node.clone(), ReplicaSelection::Spread);
                 let plain = spread
                     .visit_order(&ranked, &object(), PageNumber(page))
                     .ranks()
@@ -3390,7 +3478,8 @@ pub(super) mod tests {
                 } else {
                     assert_eq!(lineage, plain, "page {page}");
                 }
-                let primary = spread_policy(requester.node.clone(), ReplicaSelection::Primary);
+                let primary =
+                    spread_policy(&env, requester.node.clone(), ReplicaSelection::Primary);
                 assert_eq!(
                     primary
                         .visit_order(&candidates, &object(), PageNumber(page))
@@ -3405,13 +3494,14 @@ pub(super) mod tests {
 
     #[test]
     fn spread_splits_first_choice_evenly_across_neighbor_replicas() {
+        let env = racer_io::Env::host();
         // Four members form a complete graph, so every owner is a neighbor.
         let membership = membership();
         let placement = Placement::new(64);
         let mut counts = [0usize; 3];
         let mut total = 0;
         for requester in membership.members() {
-            let policy = spread_policy(requester.node.clone(), ReplicaSelection::Spread);
+            let policy = spread_policy(&env, requester.node.clone(), ReplicaSelection::Spread);
             for page in 0..3000 {
                 let candidates = placement.rank(membership.clone(), &object(), PageNumber(page));
                 if candidates.ordered.contains(&requester.node) {
@@ -3440,6 +3530,7 @@ pub(super) mod tests {
 
     #[test]
     fn spread_noncandidate_funds_out_of_order_owner_by_canonical_rank() {
+        let env = racer_io::Env::host();
         futures::executor::block_on(async {
             let membership = membership();
             let placement = Placement::new(8);
@@ -3456,7 +3547,7 @@ pub(super) mod tests {
                 .node
                 .clone();
             // Find a page whose spread order visits a non-primary owner first.
-            let probe = spread_policy(local.clone(), ReplicaSelection::Spread);
+            let probe = spread_policy(&env, local.clone(), ReplicaSelection::Spread);
             let (page, candidates, order) = (0..256)
                 .map(PageNumber)
                 .find_map(|page| {
@@ -3474,6 +3565,7 @@ pub(super) mod tests {
                     local.clone(),
                     Rc::new(Placement::new(8)),
                     Requester::scripted(
+                        env.ctx.clock.clone(),
                         peers.clone(),
                         FundedPeer::direct_hedge_available,
                         FundedPeer::request,
@@ -3481,6 +3573,8 @@ pub(super) mod tests {
                     ),
                     probe.credentials.clone(),
                     probe.published.clone(),
+                    racer_io::WorkerCtx::host(),
+                    std::rc::Rc::new(crate::drivers::DriverQueue::new(1024)),
                 )
                 .with_replica_selection(selection);
                 let context = OriginContext {
@@ -3611,10 +3705,15 @@ pub(super) mod tests {
     /// A non-owner whose owner itself sheds it (a signed `Overloaded` from the destination) asks
     /// its mesh helper (the delegate in the owner's column) once, with an Acquire funded from what is left (too little for
     /// the helper to ask another helper), then the remaining owners. A transport `Overloaded` (no
-    /// signed answer, as from a congested route) does not.
+    /// signed answer, as from a congested route or a holder that shed the request before
+    /// verifying it, `racer_core::route::unverified_failure`) does the same: the helper is the
+    /// way around a busy hop as well as a busy owner.
     #[test]
     fn shed_reader_asks_the_page_helper_once_then_the_other_owners() {
         use crate::test_support::security::{network, node};
+        let env = racer_io::Env::host();
+        // A 64 member full mesh limit, so 100 members make several columns.
+        let _mesh = ::topology::test_util::FullMeshMax::set(64);
         futures::executor::block_on(async {
             // More than 64 members: several mesh columns, so readers outside
             // the owners' columns have a helper.
@@ -3622,7 +3721,7 @@ pub(super) mod tests {
             let nodes: Vec<NodeId> = (0..count).map(node).collect();
             let membership = std::sync::Arc::new(
                 crate::topology::Membership::validate(
-                    racer_control_wire::MembershipVersion(1),
+                    racer_wire::control::MembershipVersion(1),
                     nodes
                         .iter()
                         .enumerate()
@@ -3639,7 +3738,7 @@ pub(super) mod tests {
             );
             let placement = Placement::new(8);
             let local = 0;
-            let probe = spread_policy(nodes[local].clone(), ReplicaSelection::Primary);
+            let probe = spread_policy(&env, nodes[local].clone(), ReplicaSelection::Primary);
             let (page, candidates, helper) = (0..256)
                 .map(PageNumber)
                 .find_map(|page| {
@@ -3655,7 +3754,7 @@ pub(super) mod tests {
             for transport in [false, true] {
                 let peers = Rc::new(ShedPeer {
                     nodes: nodes.clone(),
-                    signing: network(count)
+                    signing: network(&env, count)
                         .into_iter()
                         .map(crate::peer::forwarding::Forwarding::new)
                         .collect(),
@@ -3668,6 +3767,7 @@ pub(super) mod tests {
                     nodes[local].clone(),
                     Rc::new(Placement::new(8)),
                     Requester::scripted(
+                        env.ctx.clock.clone(),
                         peers.clone(),
                         ShedPeer::direct_hedge_available,
                         ShedPeer::request,
@@ -3675,6 +3775,8 @@ pub(super) mod tests {
                     ),
                     probe.credentials.clone(),
                     probe.published.clone(),
+                    racer_io::WorkerCtx::host(),
+                    std::rc::Rc::new(crate::drivers::DriverQueue::new(1024)),
                 );
                 let context = OriginContext {
                     object: object(),
@@ -3713,10 +3815,6 @@ pub(super) mod tests {
                 );
                 let calls = peers.calls.borrow();
                 let visited: Vec<_> = calls.iter().map(|(to, ..)| to.clone()).collect();
-                if transport {
-                    assert!(!visited.contains(&helper), "{visited:?}");
-                    continue;
-                }
                 assert_eq!(
                     visited[..2],
                     [candidates.ordered[0].clone(), helper.clone()]
@@ -3788,10 +3886,11 @@ pub(super) mod tests {
 
     #[test]
     fn only_candidates_mint_authority_after_ordered_copy_probes() {
-        ordered_predecessor_probes(4);
+        let env = racer_io::Env::host();
+        ordered_predecessor_probes(&env, 4);
     }
-    fn ordered_predecessor_probes(attempts: u32) {
-        let (membership, placement, context, scope, credentials) = fixture();
+    fn ordered_predecessor_probes(env: &racer_io::Env, attempts: u32) {
+        let (membership, placement, context, scope, credentials) = fixture(env);
         let ordered = placement
             .rank(membership.clone(), &context.object, PageNumber(0))
             .ordered;
@@ -3803,15 +3902,18 @@ pub(super) mod tests {
             ordered[2].clone(),
             placement,
             Requester::scripted(
+                env.ctx.clock.clone(),
                 peer.clone(),
                 ProbePeer::direct_hedge_available,
                 ProbePeer::request,
                 ProbePeer::request_direct,
             ),
             credentials,
-            Arc::new(controlplane::Published::new(
+            Arc::new(crate::control::cell::PublicationCell::new(
                 crate::control::Snapshot::retention(2),
             )),
+            racer_io::WorkerCtx::host(),
+            std::rc::Rc::new(crate::drivers::DriverQueue::new(1024)),
         );
         let candidates = policy.candidates(membership, &context.object, PageNumber(0));
         let mut budget = AcquisitionBudget::new(scope.deadline.0, attempts, 8);
@@ -3844,7 +3946,8 @@ pub(super) mod tests {
     }
     #[test]
     fn noncandidate_never_gets_origin_and_auth_failure_is_not_miss_evidence() {
-        let (membership, placement, context, scope, credentials) = fixture();
+        let env = racer_io::Env::host();
+        let (membership, placement, context, scope, credentials) = fixture(&env);
         let peer = Rc::new(ProbePeer {
             calls: RefCell::new(vec![]),
             error: Error::Unauthorized,
@@ -3856,15 +3959,18 @@ pub(super) mod tests {
             ordered[1].clone(),
             placement.clone(),
             Requester::scripted(
+                env.ctx.clock.clone(),
                 peer.clone(),
                 ProbePeer::direct_hedge_available,
                 ProbePeer::request,
                 ProbePeer::request_direct,
             ),
             credentials.clone(),
-            Arc::new(controlplane::Published::new(
+            Arc::new(crate::control::cell::PublicationCell::new(
                 crate::control::Snapshot::retention(2),
             )),
+            racer_io::WorkerCtx::host(),
+            std::rc::Rc::new(crate::drivers::DriverQueue::new(1024)),
         );
         let mut budget = AcquisitionBudget::new(scope.deadline.0, 4, 8);
         let result = futures::executor::block_on(policy.resolve_with_budget(
@@ -3878,7 +3984,17 @@ pub(super) mod tests {
             &scope,
             &mut budget,
         ));
-        assert!(matches!(result, Err(Error::Unauthorized)));
+        // A rank 0 answer that failed verification no longer ends the read (it used to return
+        // `Unauthorized`), but it is still not miss evidence: the origin authority records it
+        // as transient, so an origin miss cannot claim absence.
+        let Ok(CandidateResolution::Origin(authority)) = result else {
+            panic!("rank 1 must fall through to origin")
+        };
+        assert_eq!(
+            authority.predecessor_evidence,
+            vec![ProbeOutcome::UnusableCopy]
+        );
+        assert_eq!(policy.origin_miss_error(&authority), Error::Unavailable);
         let peer = Rc::new(ProbePeer {
             calls: RefCell::new(vec![]),
             error: Error::Unavailable,
@@ -3887,15 +4003,18 @@ pub(super) mod tests {
             NodeId("outside".into()),
             placement,
             Requester::scripted(
+                env.ctx.clock.clone(),
                 peer.clone(),
                 ProbePeer::direct_hedge_available,
                 ProbePeer::request,
                 ProbePeer::request_direct,
             ),
             credentials,
-            Arc::new(controlplane::Published::new(
+            Arc::new(crate::control::cell::PublicationCell::new(
                 crate::control::Snapshot::retention(2),
             )),
+            racer_io::WorkerCtx::host(),
+            std::rc::Rc::new(crate::drivers::DriverQueue::new(1024)),
         );
         let mut budget = AcquisitionBudget::new(scope.deadline.0, 16, 24);
         let result = futures::executor::block_on(policy.resolve_with_budget(
@@ -3913,6 +4032,160 @@ pub(super) mod tests {
         assert_eq!(peer.calls.borrow().len(), 3);
         assert!(peer.calls.borrow().iter().all(|(_, copy)| !copy));
     }
+    /// One owner's failed exchange is that owner's failure, not the read's: errors without a
+    /// core counterpart (replay, stale flight, protocol mismatch) and failed verification move
+    /// the walk to the next owner instead of ending it as `Internal`.
+    #[test]
+    fn peer_exchange_failure_tries_next_owner() {
+        let env = racer_io::Env::host();
+        for error in [
+            Error::Replay,
+            Error::StaleFlight,
+            Error::Unauthorized,
+            Error::Internal,
+            Error::InvalidRequest,
+            Error::CorruptRecord,
+            Error::MissingKey,
+            Error::BadGateway,
+        ] {
+            let (membership, placement, context, scope, credentials) = fixture(&env);
+            let peer = Rc::new(ProbePeer {
+                calls: RefCell::new(vec![]),
+                error,
+            });
+            let policy = CandidatePolicy::new(
+                NodeId("outside".into()),
+                placement,
+                Requester::scripted(
+                    env.ctx.clock.clone(),
+                    peer.clone(),
+                    ProbePeer::direct_hedge_available,
+                    ProbePeer::request,
+                    ProbePeer::request_direct,
+                ),
+                credentials,
+                Arc::new(crate::control::cell::PublicationCell::new(
+                    crate::control::Snapshot::retention(2),
+                )),
+                racer_io::WorkerCtx::host(),
+                std::rc::Rc::new(crate::drivers::DriverQueue::new(1024)),
+            );
+            let mut budget = AcquisitionBudget::new(scope.deadline.0, 16, 24);
+            let result = futures::executor::block_on(policy.resolve_with_budget(
+                policy.candidates(membership, &context.object, PageNumber(0)),
+                &context,
+                PeerOperation::Metadata {
+                    object: context.object.clone(),
+                    selector: MetadataSelector::Fresh,
+                    mode: FetchMode::Acquire,
+                },
+                &scope,
+                &mut budget,
+            ));
+            assert_eq!(peer.calls.borrow().len(), 3, "{error:?}");
+            assert!(
+                matches!(result, Err(Error::Unavailable)),
+                "{error:?}: {:?}",
+                result.err()
+            );
+        }
+        // The caller's own scope ending stays terminal.
+        let (membership, placement, context, scope, credentials) = fixture(&env);
+        let peer = Rc::new(ProbePeer {
+            calls: RefCell::new(vec![]),
+            error: Error::Canceled,
+        });
+        let policy = CandidatePolicy::new(
+            NodeId("outside".into()),
+            placement,
+            Requester::scripted(
+                env.ctx.clock.clone(),
+                peer.clone(),
+                ProbePeer::direct_hedge_available,
+                ProbePeer::request,
+                ProbePeer::request_direct,
+            ),
+            credentials,
+            Arc::new(crate::control::cell::PublicationCell::new(
+                crate::control::Snapshot::retention(2),
+            )),
+            racer_io::WorkerCtx::host(),
+            std::rc::Rc::new(crate::drivers::DriverQueue::new(1024)),
+        );
+        let mut budget = AcquisitionBudget::new(scope.deadline.0, 16, 24);
+        let result = futures::executor::block_on(policy.resolve_with_budget(
+            policy.candidates(membership, &context.object, PageNumber(0)),
+            &context,
+            PeerOperation::Metadata {
+                object: context.object.clone(),
+                selector: MetadataSelector::Fresh,
+                mode: FetchMode::Acquire,
+            },
+            &scope,
+            &mut budget,
+        ));
+        assert_eq!(peer.calls.borrow().len(), 1);
+        assert!(matches!(result, Err(Error::Canceled)), "{:?}", result.err());
+    }
+
+    /// A failure before the request leaves this node is reported as not sent, so the walk does
+    /// not count it against the destination; a transport failure after handing it over is.
+    #[test]
+    fn exchange_reports_whether_the_request_was_sent() {
+        let env = racer_io::Env::host();
+        let (membership, placement, context, scope, credentials) = fixture(&env);
+        let peer = Rc::new(ProbePeer {
+            calls: RefCell::new(vec![]),
+            error: Error::Unavailable,
+        });
+        let policy = CandidatePolicy::new(
+            NodeId("outside".into()),
+            placement,
+            Requester::scripted(
+                env.ctx.clock.clone(),
+                peer.clone(),
+                ProbePeer::direct_hedge_available,
+                ProbePeer::request,
+                ProbePeer::request_direct,
+            ),
+            credentials,
+            Arc::new(crate::control::cell::PublicationCell::new(
+                crate::control::Snapshot::retention(2),
+            )),
+            racer_io::WorkerCtx::host(),
+            std::rc::Rc::new(crate::drivers::DriverQueue::new(1024)),
+        );
+        let destination = membership.members()[0].node.clone();
+        let operation = PeerOperation::Metadata {
+            object: context.object.clone(),
+            selector: MetadataSelector::Fresh,
+            mode: FetchMode::CopyOnly,
+        };
+        let exchange = |links| {
+            let mut budget = AcquisitionBudget::new(scope.deadline.0, 4, links);
+            let mut exchanged = Exchanged::default();
+            let result = futures::executor::block_on(policy.request_traced(
+                &membership,
+                &destination,
+                &context,
+                &operation,
+                FetchMode::CopyOnly,
+                &scope,
+                &mut budget,
+                1,
+                RequestMode::SharedRoute,
+                None,
+                &mut exchanged,
+            ));
+            (result.err(), exchanged.sent)
+        };
+        // No links: planning fails locally, nothing is sent.
+        assert_eq!(exchange(0), (Some(Error::HopBudgetExhausted), false));
+        assert!(peer.calls.borrow().is_empty());
+        assert_eq!(exchange(8), (Some(Error::Unavailable), true));
+        assert_eq!(peer.calls.borrow().len(), 1);
+    }
+
     #[test]
     fn signed_failure_classification_preserves_auth_and_version_distinctions() {
         let operation = PeerOperation::Metadata {
@@ -4039,7 +4312,7 @@ pub(super) mod tests {
     fn membership() -> std::sync::Arc<crate::topology::Membership> {
         use crate::topology::Member;
         use crate::topology::Membership;
-        use racer_control_wire::MembershipVersion;
+        use racer_wire::control::MembershipVersion;
         std::sync::Arc::new(
             Membership::validate(
                 MembershipVersion(1),
@@ -4056,7 +4329,7 @@ pub(super) mod tests {
             .unwrap(),
         )
     }
-    fn policy(node: NodeId, peers: Rc<RecordedPeer>) -> CandidatePolicy {
+    fn policy(env: &racer_io::Env, node: NodeId, peers: Rc<RecordedPeer>) -> CandidatePolicy {
         use racer_crypto::identity::KeyEpochs;
         use racer_crypto::identity::Keyring;
         let config = crate::test_support::cluster::config(false);
@@ -4066,25 +4339,34 @@ pub(super) mod tests {
         let keys = Rc::new(Keyring::new(
             config.cluster,
             node.clone(),
-            std::sync::Arc::new(KeyEpochs::default()),
+            std::sync::Arc::new(KeyEpochs::with_clock(crate::enrollment::wall_clock(
+                &racer_io::Clock::host(),
+            ))),
         ));
         CandidatePolicy::new(
             node,
             Rc::new(Placement::new(8)),
             Requester::scripted(
+                env.ctx.clock.clone(),
                 peers,
                 RecordedPeer::direct_hedge_available,
                 RecordedPeer::request,
                 RecordedPeer::request_direct,
             ),
-            Rc::new(CredentialCrypto::new(keys, admission)),
-            Arc::new(controlplane::Published::new(
+            Rc::new(CredentialCrypto::new(
+                keys,
+                admission,
+                racer_io::WorkerCtx::host().rng,
+            )),
+            Arc::new(crate::control::cell::PublicationCell::new(
                 crate::control::Snapshot::retention(2),
             )),
+            racer_io::WorkerCtx::host(),
+            std::rc::Rc::new(crate::drivers::DriverQueue::new(1024)),
         )
     }
     fn scope() -> RequestScope {
-        RequestScope::new(
+        RequestScope::host(
             crate::model::RequestId([7; 16]),
             Instant::now() + std::time::Duration::from_secs(60),
         )
@@ -4095,6 +4377,7 @@ pub(super) mod tests {
         use crate::model::{PageId, VersionMetadata, WorkerId};
         use crate::store::catalog::{Index, IndexSnapshot, IndexedPage, RecordLocation};
         use crate::topology::tests::fixtures;
+        let env = racer_io::Env::host();
         let members = fixtures::membership(1000);
         let page = PageId {
             version: ObjectVersion {
@@ -4111,14 +4394,20 @@ pub(super) mod tests {
             calls: RefCell::new(vec![]),
             error: Error::Unavailable,
         });
-        let mut policy = policy(owner.clone(), peers.clone());
-        let index = Index::new(WorkerId(0), 8, crate::test_support::availability());
+        let mut policy = policy(&env, owner.clone(), peers.clone());
+        let index = Index::new(
+            WorkerId(0),
+            8,
+            crate::test_support::availability(&env),
+            racer_io::Clock::host(),
+        );
         index.set_page_capacity(1).unwrap();
         index
             .restore(IndexSnapshot {
                 entries: vec![(
                     page.clone(),
                     IndexedPage {
+                        page_size: racer_wire::object::PageSize::DEFAULT,
                         location: RecordLocation {
                             segment: page_alloc::SegmentId(0),
                             generation: page_alloc::Generation(1),
@@ -4154,7 +4443,7 @@ pub(super) mod tests {
         );
         let next = Arc::new(
             crate::topology::Membership::validate(
-                racer_control_wire::MembershipVersion(2),
+                racer_wire::control::MembershipVersion(2),
                 members
                     .members()
                     .iter()
@@ -4184,6 +4473,7 @@ pub(super) mod tests {
 
     #[test]
     fn ownership_scoped_refresh_warms_current_only_and_honors_cancellation() {
+        let env = racer_io::Env::host();
         let members = membership();
         let page = crate::model::PageId {
             version: ObjectVersion {
@@ -4200,13 +4490,13 @@ pub(super) mod tests {
             calls: RefCell::new(vec![]),
             error: Error::Unavailable,
         });
-        let mut policy = policy(owner, peers);
+        let mut policy = policy(&env, owner, peers);
         policy.published = crate::test_support::published_membership(members);
-        let cancelled = scope();
-        cancelled.cancel().unwrap();
+        let canceled = scope();
+        canceled.cancel().unwrap();
         assert_eq!(
-            futures::executor::block_on(policy.refresh_ownership_scoped(&page, &cancelled)),
-            Err(Error::Cancelled)
+            futures::executor::block_on(policy.refresh_ownership_scoped(&page, &canceled)),
+            Err(Error::Canceled)
         );
         assert!(!policy.owns_current(&page));
         futures::executor::block_on(policy.refresh_ownership_scoped(&page, &scope())).unwrap();
@@ -4224,21 +4514,24 @@ pub(super) mod tests {
         use crate::peer::transport::Transfers;
         use crate::store::catalog::Index;
         use racer_crypto::identity::{Certificates, KeyEpochs, Keyring};
+        let env = racer_io::Env::host();
 
         for _ in 0..3 {
             let config = crate::test_support::cluster::config(false);
             let admission = Rc::new(flow_control::Quotas::new(
                 crate::admission::AdmissionPolicy::new(config.limits.clone()),
             ));
-            let reactor = Rc::new(crate::runtime::Reactor::new(admission.clone()));
+            let reactor = Rc::new(crate::runtime::Reactor::new(admission.clone(), &env));
             let keys = Rc::new(Keyring::new(
                 config.cluster.clone(),
                 config.node.clone(),
-                Arc::new(KeyEpochs::default()),
+                Arc::new(KeyEpochs::with_clock(crate::enrollment::wall_clock(
+                    &racer_io::Clock::host(),
+                ))),
             ));
             let published = crate::test_support::published_membership(Arc::new(
                 crate::topology::Membership::validate(
-                    racer_control_wire::MembershipVersion(1),
+                    racer_wire::control::MembershipVersion(1),
                     vec![crate::topology::Member {
                         node: config.node.clone(),
                         shares: std::num::NonZeroU32::new(1).unwrap(),
@@ -4259,6 +4552,7 @@ pub(super) mod tests {
                 crate::model::WorkerId(0),
                 1,
                 availability.clone(),
+                racer_io::Clock::host(),
             ));
             let writer = Rc::new(crate::store::StoreWriter::new(
                 index,
@@ -4288,6 +4582,7 @@ pub(super) mod tests {
             let signatures = Rc::new(Signatures::new(
                 keys.clone(),
                 Rc::new(Certificates::new(config.cluster, keys.clone())),
+                racer_io::WorkerCtx::host(),
             ));
             // Real network requester/transport plus the same strong reclamation
             // captures as production. No I/O or slab file is opened in this test.
@@ -4311,21 +4606,32 @@ pub(super) mod tests {
             );
             let requester = Rc::new(Requester::new(
                 Rc::new(crate::topology::Paths::new(
-                    Rc::new(crate::topology::LinkHealth::default()),
+                    Rc::new(crate::topology::LinkHealth::on(env.ctx.clock.clone())),
                     1,
                 )),
                 Rc::new(Forwarding::new(signatures)),
                 transfers,
                 Rc::new(
-                    crate::peer::PeerNetwork::new(config.node.clone(), published.clone()).unwrap(),
+                    crate::peer::PeerNetwork::new(
+                        config.node.clone(),
+                        published.clone(),
+                        racer_io::Clock::host(),
+                    )
+                    .unwrap(),
                 ),
             ));
             let policy = Rc::new(CandidatePolicy::new(
                 config.node,
                 Rc::new(Placement::new(1)),
                 requester,
-                Rc::new(CredentialCrypto::new(keys, admission)),
+                Rc::new(CredentialCrypto::new(
+                    keys,
+                    admission,
+                    racer_io::WorkerCtx::host().rng,
+                )),
                 published,
+                racer_io::WorkerCtx::host(),
+                std::rc::Rc::new(crate::drivers::DriverQueue::new(1024)),
             ));
             let weak_policy = Rc::downgrade(&policy);
             let callback = policy.ownership_callback();
@@ -4368,10 +4674,12 @@ pub(super) mod tests {
     }
     #[test]
     fn backup_probes_only_predecessors_in_order_before_scoped_origin_authority() {
-        ordered_predecessor_probes(3);
+        let env = racer_io::Env::host();
+        ordered_predecessor_probes(&env, 3);
     }
     #[test]
     fn noncandidate_acquires_from_candidates_and_never_mints_origin_authority() {
+        let env = racer_io::Env::host();
         futures::executor::block_on(async {
             let membership = membership();
             let candidates = Placement::new(8).rank(membership.clone(), &object(), PageNumber(0));
@@ -4386,7 +4694,7 @@ pub(super) mod tests {
                 calls: RefCell::new(vec![]),
                 error: Error::Unavailable,
             });
-            let policy = policy(local, peers.clone());
+            let policy = policy(&env, local, peers.clone());
             let context = OriginContext {
                 object: object(),
                 metadata: None,
@@ -4411,13 +4719,14 @@ pub(super) mod tests {
     }
     #[test]
     fn peer_auth_failure_is_not_predecessor_miss_evidence() {
+        let env = racer_io::Env::host();
         futures::executor::block_on(async {
             let candidates = Placement::new(8).rank(membership(), &object(), PageNumber(0));
             let peers = Rc::new(RecordedPeer {
                 calls: RefCell::new(vec![]),
                 error: Error::Unauthorized,
             });
-            let policy = policy(candidates.ordered[1].clone(), peers.clone());
+            let policy = policy(&env, candidates.ordered[1].clone(), peers.clone());
             let context = OriginContext {
                 object: object(),
                 metadata: None,
@@ -4430,24 +4739,32 @@ pub(super) mod tests {
                 selector: MetadataSelector::Fresh,
                 mode: FetchMode::Acquire,
             };
-            assert!(matches!(
-                policy
-                    .resolve_with_budget(candidates, &context, operation, &scope, &mut budget)
-                    .await,
-                Err(Error::Unauthorized)
-            ));
+            // Formerly terminal `Unauthorized`; now the walk moves on, recording the failure as
+            // transient evidence rather than a miss.
+            let Ok(CandidateResolution::Origin(authority)) = policy
+                .resolve_with_budget(candidates, &context, operation, &scope, &mut budget)
+                .await
+            else {
+                panic!("rank 1 must fall through to origin")
+            };
+            assert_eq!(
+                authority.predecessor_evidence,
+                vec![ProbeOutcome::UnusableCopy]
+            );
+            assert_eq!(policy.origin_miss_error(&authority), Error::Unavailable);
             assert_eq!(peers.calls.borrow().len(), 1);
         });
     }
     #[test]
     fn origin_version_miss_cannot_claim_absence_when_predecessor_was_unreachable() {
+        let env = racer_io::Env::host();
         let membership = membership();
         let ranked = Placement::new(8).rank(membership.clone(), &object(), PageNumber(0));
         let peers = Rc::new(RecordedPeer {
             calls: RefCell::new(vec![]),
             error: Error::Unavailable,
         });
-        let policy = policy(ranked.ordered[1].clone(), peers);
+        let policy = policy(&env, ranked.ordered[1].clone(), peers);
         let mut authority = OriginAuthority {
             diagnostic: CandidateTrail::default(),
             membership,
@@ -4469,6 +4786,53 @@ pub(super) mod tests {
 
     mod hedging {
         use super::*;
+        const MAX_PAGE: usize = crate::model::PAGE_BYTES as usize;
+
+        #[test]
+        fn small_pages_charge_duplicates_at_the_published_page_size() {
+            let page = 64 * 1024;
+            let duplicate = racer_core::read::duplicate_bytes(page);
+            let metrics = Metrics::default();
+            // A budget of one max-size duplicate funds many small-page hedges.
+            let owner = Hedges::new(
+                HedgeConfig {
+                    slots: 4,
+                    bytes: DUPLICATE_BYTES,
+                    delay: Duration::from_millis(1),
+                },
+                metrics.clone(),
+                racer_io::Clock::host(),
+            )
+            .unwrap();
+            let permits: Vec<_> = (0..4).map(|_| owner.acquire(page).unwrap()).collect();
+            permits[0].started();
+            assert_eq!(
+                metrics.writer_count(Event::PageHedgeDuplicateBytes),
+                duplicate as u64
+            );
+            drop(permits);
+            // At the largest page, the same budget funds only one duplicate.
+            let first = owner.acquire(MAX_PAGE).unwrap();
+            assert!(matches!(owner.acquire(MAX_PAGE), Err(Error::Overloaded)));
+            drop(first);
+        }
+
+        #[test]
+        fn small_pages_reserve_hedge_buffers_at_the_published_page_size() {
+            use crate::admission::ResourceClass;
+            let page = 64 * 1024;
+            let mut limits = crate::test_support::cluster::config(false).limits;
+            limits.plaintext_bytes = std::num::NonZeroUsize::new(4 * page).unwrap();
+            limits.ciphertext_bytes = std::num::NonZeroUsize::new(4 * (page + 16)).unwrap();
+            let admission =
+                flow_control::Quotas::new(crate::admission::AdmissionPolicy::new(limits));
+            let cache = racer_wire::control::CacheId(crate::test_support::security::CACHE.into());
+            let (plaintext, ciphertext) = reserve_hedge_pages(&admission, &cache, page, 2).unwrap();
+            assert_eq!(admission.used(ResourceClass::Plaintext), 2 * page);
+            assert_eq!(admission.used(ResourceClass::Ciphertext), 2 * (page + 16));
+            drop((plaintext, ciphertext));
+            assert!(reserve_hedge_pages(&admission, &cache, MAX_PAGE, 1).is_err());
+        }
         #[test]
         fn worker_handles_share_capacity_but_not_counter_shards() {
             let metrics = Metrics::for_workers(2).unwrap();
@@ -4479,11 +4843,12 @@ pub(super) mod tests {
                     delay: Duration::from_millis(1),
                 },
                 metrics[0].clone(),
+                racer_io::Clock::host(),
             )
             .unwrap();
             let second = first.for_worker(metrics[1].clone());
-            let permit = second.acquire().unwrap();
-            assert!(matches!(first.acquire(), Err(Error::Overloaded)));
+            let permit = second.acquire(MAX_PAGE).unwrap();
+            assert!(matches!(first.acquire(MAX_PAGE), Err(Error::Overloaded)));
             first.suppressed();
             permit.started();
             permit.won();
@@ -4498,7 +4863,7 @@ pub(super) mod tests {
             assert_eq!(metrics[0].writer_count(Event::PageHedgeSuppressed), 1);
             assert_eq!(metrics[1].writer_count(Event::PageHedgeSuppressed), 0);
             drop(permit);
-            assert!(first.acquire().is_ok());
+            assert!(first.acquire(MAX_PAGE).is_ok());
         }
         use crate::model::RequestId;
         use crate::read::tests::page;
@@ -4506,12 +4871,15 @@ pub(super) mod tests {
         use std::cell::Cell;
         use std::future::Future;
         use std::rc::Rc;
-        use uring_runtime::environment::SimulationClock;
-        use uring_runtime::environment::now;
-        fn scope() -> RequestScope {
-            RequestScope::new(RequestId([1; 16]), now() + Duration::from_secs(10)).unwrap()
+        fn scope(env: &racer_io::Env) -> RequestScope {
+            RequestScope::on(
+                &env.ctx.clock,
+                RequestId([1; 16]),
+                env.ctx.now() + Duration::from_secs(10),
+            )
+            .unwrap()
         }
-        fn controller(slots: usize, bytes: usize) -> Arc<Hedges> {
+        fn controller(env: &racer_io::Env, slots: usize, bytes: usize) -> Arc<Hedges> {
             Hedges::new(
                 HedgeConfig {
                     slots,
@@ -4519,6 +4887,7 @@ pub(super) mod tests {
                     delay: Duration::from_millis(10),
                 },
                 Metrics::default(),
+                env.ctx.clock.clone(),
             )
             .unwrap()
         }
@@ -4526,13 +4895,13 @@ pub(super) mod tests {
         fn malformed_speculative_http_and_wire_heads_do_not_veto_valid_primary() {
             for kind in ["invalid", "large", "wire"] {
                 for same_poll in [false, true] {
-                    let clock = SimulationClock::new(933);
-                    let _env = clock.environment(0).enter();
-                    let owner = controller(1, DUPLICATE_BYTES);
-                    let permit = owner.acquire().unwrap();
-                    let a = scope();
-                    let b = scope();
-                    let parent = scope();
+                    let clock = racer_io::SimClock::new(933);
+                    let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
+                    let owner = controller(&env, 1, DUPLICATE_BYTES);
+                    let permit = owner.acquire(MAX_PAGE).unwrap();
+                    let a = scope(&env);
+                    let b = scope(&env);
+                    let parent = scope(&env);
                     let ready = Cell::new(false);
                     let malformed_ready = Cell::new(false);
                     let primary = std::future::poll_fn(|_| {
@@ -4560,11 +4929,13 @@ pub(super) mod tests {
                         let parsed = codec.decode_head(bytes);
                         let error = match parsed {
                             Err(e) => Error::from(e),
-                            Ok(Some((head, _))) => {
-                                crate::peer::protocol::decode_envelope(head, true)
-                                    .err()
-                                    .expect("missing signed wire envelope")
-                            }
+                            Ok(Some((head, _))) => crate::peer::protocol::decode_envelope(
+                                head,
+                                true,
+                                &peer_wire::test_util::AnyChain,
+                            )
+                            .err()
+                            .expect("missing signed wire envelope"),
                             _ => panic!("complete malformed frame"),
                         };
                         assert!(matches!(
@@ -4590,7 +4961,7 @@ pub(super) mod tests {
                         );
                     } else {
                         assert!(result.is_pending());
-                        assert!(!a.cancellation.is_cancelled());
+                        assert!(!a.cancellation.is_canceled());
                         ready.set(true);
                         assert!(
                             matches!(work.as_mut().poll(&mut cx), Poll::Ready(Ok(page)) if page.plaintext.bytes() == [42])
@@ -4601,11 +4972,12 @@ pub(super) mod tests {
         }
         #[test]
         fn fast_primary_never_launches_secondary_or_records_duplicate_bytes() {
-            let owner = controller(1, DUPLICATE_BYTES);
-            let permit = owner.acquire().unwrap();
-            let a = scope();
-            let b = scope();
-            let parent = scope();
+            let env = racer_io::Env::host();
+            let owner = controller(&env, 1, DUPLICATE_BYTES);
+            let permit = owner.acquire(MAX_PAGE).unwrap();
+            let a = scope(&env);
+            let b = scope(&env);
+            let parent = scope(&env);
             let result = futures::executor::block_on(race(
                 async { Ok(page(1)) },
                 async {
@@ -4624,11 +4996,12 @@ pub(super) mod tests {
         }
         #[test]
         fn canceled_parent_never_polls_unlaunched_attempts() {
-            let owner = controller(1, DUPLICATE_BYTES);
-            let permit = owner.acquire().unwrap();
-            let a = scope();
-            let b = scope();
-            let parent = scope();
+            let env = racer_io::Env::host();
+            let owner = controller(&env, 1, DUPLICATE_BYTES);
+            let permit = owner.acquire(MAX_PAGE).unwrap();
+            let a = scope(&env);
+            let b = scope(&env);
+            let parent = scope(&env);
             parent.cancel().unwrap();
             let never = || async {
                 panic!("canceled parent submitted work");
@@ -4637,31 +5010,31 @@ pub(super) mod tests {
             };
             assert_eq!(
                 futures::executor::block_on(race(never(), never(), &a, &b, &parent, &permit)).err(),
-                Some(Error::Cancelled)
+                Some(Error::Canceled)
             );
         }
         #[test]
         fn worker_owned_race_keeps_permit_after_caller_detaches_until_loser_fence() {
-            let clock = SimulationClock::new(906);
-            let _env = clock.environment(0).enter();
-            let owner = controller(1, DUPLICATE_BYTES);
-            let permit = owner.acquire().unwrap();
-            let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
-            let _guard = queue.enter();
+            let clock = racer_io::SimClock::new(906);
+            let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
+            let owner = controller(&env, 1, DUPLICATE_BYTES);
+            let permit = owner.acquire(MAX_PAGE).unwrap();
+            let queue = Rc::new(crate::drivers::DriverQueue::new(1024));
             let (send, receive) = futures::channel::oneshot::channel();
             let fence = Rc::new(Cell::new(false));
             let primary_fence = fence.clone();
             let completion = Rc::new(Cell::new(false));
             let done = completion.clone();
-            uring_runtime::drivers::reserve()
+            queue
+                .reserve()
                 .unwrap()
                 .submit_detached(Box::pin(async move {
-                    let a = scope();
-                    let b = scope();
-                    let parent = scope();
+                    let a = scope(&env);
+                    let b = scope(&env);
+                    let parent = scope(&env);
                     let primary = std::future::poll_fn(|cx| {
                         if primary_fence.get() {
-                            Poll::Ready(Err(Error::Cancelled))
+                            Poll::Ready(Err(Error::Canceled))
                         } else {
                             cx.waker().wake_by_ref();
                             Poll::Pending
@@ -4680,20 +5053,25 @@ pub(super) mod tests {
             queue.poll(&mut cx, 4);
             drop(receive);
             assert!(!completion.get());
-            assert!(matches!(owner.acquire(), Err(Error::Overloaded)));
+            assert!(matches!(owner.acquire(MAX_PAGE), Err(Error::Overloaded)));
             fence.set(true);
             queue.poll(&mut cx, 4);
             assert!(completion.get());
-            assert!(owner.acquire().is_ok());
+            assert!(owner.acquire(MAX_PAGE).is_ok());
             assert_eq!(queue.pending(), 0);
         }
         #[test]
         fn shared_slots_bytes_and_alarm_wake_are_bounded() {
-            let clock = SimulationClock::new(901);
-            let _env = clock.environment(0).enter();
-            let owner = controller(2, DUPLICATE_BYTES);
-            let permit = owner.acquire().unwrap();
-            assert!(matches!(owner.clone().acquire(), Err(Error::Overloaded)));
+            let clock = racer_io::SimClock::new(901);
+            let sim_env = clock.ctx(0);
+            let env = racer_io::Env::new(racer_io::Driver::Uring, sim_env.clone());
+            let sim_ctx = sim_env.clone();
+            let owner = controller(&env, 2, DUPLICATE_BYTES);
+            let permit = owner.acquire(MAX_PAGE).unwrap();
+            assert!(matches!(
+                owner.clone().acquire(MAX_PAGE),
+                Err(Error::Overloaded)
+            ));
             let wake = std::sync::Arc::new(crate::test_support::WakeCounter::default());
             let waker = std::task::Waker::from(wake.clone());
             let mut cx = Context::from_waker(&waker);
@@ -4705,26 +5083,30 @@ pub(super) mod tests {
             assert_eq!(wake.count(), 1);
             assert!(permit.delay(&mut cx).is_ready());
             drop(permit);
-            assert!(owner.acquire().is_ok());
+            assert!(owner.acquire(MAX_PAGE).is_ok());
             assert!(
-                !Hedges::new(HedgeConfig::default(), Metrics::default())
-                    .unwrap()
-                    .enabled()
+                !Hedges::new(
+                    HedgeConfig::default(),
+                    Metrics::default(),
+                    sim_ctx.clock.clone()
+                )
+                .unwrap()
+                .enabled()
             );
         }
         #[test]
         fn validated_secondary_waits_for_primary_fence_and_keeps_slot() {
-            let clock = SimulationClock::new(902);
-            let _env = clock.environment(0).enter();
-            let owner = controller(1, DUPLICATE_BYTES);
-            let permit = owner.acquire().unwrap();
-            let a = scope();
-            let b = scope();
-            let parent = scope();
+            let clock = racer_io::SimClock::new(902);
+            let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
+            let owner = controller(&env, 1, DUPLICATE_BYTES);
+            let permit = owner.acquire(MAX_PAGE).unwrap();
+            let a = scope(&env);
+            let b = scope(&env);
+            let parent = scope(&env);
             let fence = Rc::new(Cell::new(false));
             let primary = std::future::poll_fn(|_| {
                 if fence.get() {
-                    Poll::Ready(Err(Error::Cancelled))
+                    Poll::Ready(Err(Error::Canceled))
                 } else {
                     Poll::Pending
                 }
@@ -4741,26 +5123,26 @@ pub(super) mod tests {
             assert!(race.as_mut().poll(&mut cx).is_pending());
             clock.advance(Duration::from_millis(10));
             assert!(race.as_mut().poll(&mut cx).is_pending());
-            assert!(a.cancellation.is_cancelled());
-            assert!(!parent.cancellation.is_cancelled());
-            assert!(matches!(owner.acquire(), Err(Error::Overloaded)));
+            assert!(a.cancellation.is_canceled());
+            assert!(!parent.cancellation.is_canceled());
+            assert!(matches!(owner.acquire(MAX_PAGE), Err(Error::Overloaded)));
             fence.set(true);
             assert!(
                 matches!(race.as_mut().poll(&mut cx), Poll::Ready(Ok(page)) if page.plaintext.bytes() == [42])
             );
             drop(race);
             drop(permit);
-            assert!(owner.acquire().is_ok());
+            assert!(owner.acquire(MAX_PAGE).is_ok());
         }
         #[test]
         fn invalid_fast_copy_does_not_displace_valid_slow_primary() {
-            let clock = SimulationClock::new(903);
-            let _env = clock.environment(0).enter();
-            let owner = controller(1, DUPLICATE_BYTES);
-            let permit = owner.acquire().unwrap();
-            let a = scope();
-            let b = scope();
-            let parent = scope();
+            let clock = racer_io::SimClock::new(903);
+            let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
+            let owner = controller(&env, 1, DUPLICATE_BYTES);
+            let permit = owner.acquire(MAX_PAGE).unwrap();
+            let a = scope(&env);
+            let b = scope(&env);
+            let parent = scope(&env);
             let ready = Cell::new(false);
             let primary = std::future::poll_fn(|_| {
                 if ready.get() {
@@ -4781,7 +5163,7 @@ pub(super) mod tests {
             assert!(race.as_mut().poll(&mut cx).is_pending());
             clock.advance(Duration::from_millis(10));
             assert!(race.as_mut().poll(&mut cx).is_pending());
-            assert!(!a.cancellation.is_cancelled());
+            assert!(!a.cancellation.is_canceled());
             ready.set(true);
             assert!(
                 matches!(race.as_mut().poll(&mut cx), Poll::Ready(Ok(page)) if page.plaintext.bytes() == [7])
@@ -4790,13 +5172,13 @@ pub(super) mod tests {
         }
         #[test]
         fn parent_cancellation_drains_both_and_never_returns_a_winner() {
-            let clock = SimulationClock::new(904);
-            let _env = clock.environment(0).enter();
-            let owner = controller(1, DUPLICATE_BYTES);
-            let permit = owner.acquire().unwrap();
-            let a = scope();
-            let b = scope();
-            let parent = scope();
+            let clock = racer_io::SimClock::new(904);
+            let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
+            let owner = controller(&env, 1, DUPLICATE_BYTES);
+            let permit = owner.acquire(MAX_PAGE).unwrap();
+            let a = scope(&env);
+            let b = scope(&env);
+            let parent = scope(&env);
             let fence = Cell::new(false);
             let child = || {
                 std::future::poll_fn(|_| {
@@ -4814,12 +5196,12 @@ pub(super) mod tests {
             assert!(race.as_mut().poll(&mut cx).is_pending());
             parent.cancel().unwrap();
             assert!(race.as_mut().poll(&mut cx).is_pending());
-            assert!(a.cancellation.is_cancelled() && b.cancellation.is_cancelled());
-            assert!(matches!(owner.acquire(), Err(Error::Overloaded)));
+            assert!(a.cancellation.is_canceled() && b.cancellation.is_canceled());
+            assert!(matches!(owner.acquire(MAX_PAGE), Err(Error::Overloaded)));
             fence.set(true);
             assert!(matches!(
                 race.as_mut().poll(&mut cx),
-                Poll::Ready(Err(Error::Cancelled))
+                Poll::Ready(Err(Error::Canceled))
             ));
         }
     }

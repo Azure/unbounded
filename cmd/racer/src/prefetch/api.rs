@@ -2,7 +2,7 @@
 
 use super::{Config, Priority};
 use crate::model::{CacheKey, StrongEtag};
-use racer_object_wire::prefetch::{ErrorCode, PrefetchError};
+use racer_wire::object::prefetch::{ErrorCode, PrefetchError};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -173,7 +173,7 @@ pub enum State {
     Partial,
     #[serde(rename = "FAILED")]
     Failed,
-    #[serde(rename = "CANCELLED")]
+    #[serde(rename = "CANCELED")]
     Canceled,
 }
 

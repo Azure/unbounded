@@ -8,6 +8,7 @@ use crate::test_support::security::{network, node};
 /// Open a single-node read graph with `range_spill_pages` enabled and a
 /// one-page client credit, so every page past the head is a spill candidate.
 fn spill_reader(
+    env: &racer_io::Env,
     pages: u64,
     spill: usize,
 ) -> (
@@ -16,12 +17,12 @@ fn spill_reader(
     crate::read::dispatch::WorkerEndpoint,
     crate::read::range_stream::RangeStream,
 ) {
-    let signers = network(1);
-    let f = fixture_with(pages * PAGE_BYTES, None);
+    let signers = network(env, 1);
+    let f = fixture_with(env, pages * PAGE_BYTES, None);
     f.reactor.init().unwrap();
     let membership = Arc::new(
         Membership::validate(
-            racer_control_wire::MembershipVersion(1),
+            racer_wire::control::MembershipVersion(1),
             vec![Member {
                 node: node(0),
                 shares: NonZeroU32::new(1).unwrap(),
@@ -32,7 +33,8 @@ fn spill_reader(
         )
         .unwrap(),
     );
-    let (local, endpoint, _) = coordinator(&f, &signers[0], &membership, NoPeer::requester());
+    let (local, endpoint, _) =
+        coordinator(env, &f, &signers[0], &membership, NoPeer::requester(env));
     f.fill
         .dependencies
         .metadata_owner
@@ -73,9 +75,8 @@ fn holders(f: &Fixture, number: u64) -> u32 {
 
 #[test]
 fn read_spill_holds_pages_past_the_window_and_releases_each_after_delivery() {
-    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
-    let _queue = queue.enter();
-    let (mut f, _local, mut endpoint, mut stream) = spill_reader(4, 2);
+    let env = racer_io::Env::host();
+    let (mut f, _local, mut endpoint, mut stream) = spill_reader(&env, 4, 2);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     // Without delivering, the window holds page 0 and spill parks 1 and 2.
     for _ in 0..4096 {
@@ -138,9 +139,8 @@ fn read_spill_holds_pages_past_the_window_and_releases_each_after_delivery() {
 
 #[test]
 fn read_spill_cancel_releases_every_hold() {
-    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
-    let _queue = queue.enter();
-    let (mut f, _local, mut endpoint, mut stream) = spill_reader(4, 2);
+    let env = racer_io::Env::host();
+    let (mut f, _local, mut endpoint, mut stream) = spill_reader(&env, 4, 2);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     for _ in 0..4096 {
         stream.poll_prefetch(&mut cx);
@@ -162,14 +162,13 @@ fn read_spill_cancel_releases_every_hold() {
 
 #[test]
 fn read_spill_hold_refused_falls_back_to_memory_window() {
-    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
-    let _queue = queue.enter();
-    let (mut f, _local, mut endpoint, mut stream) = spill_reader(4, 2);
+    let env = racer_io::Env::host();
+    let (mut f, _local, mut endpoint, mut stream) = spill_reader(&env, 4, 2);
     // Another version takes every hold the node admits.
     let mut other = f.page.version.clone();
     other.etag = crate::model::StrongEtag::test_value("hold-capacity");
     let index = f.fill.dependencies.writer.index();
-    let until = uring_runtime::environment::wall_now() + Duration::from_secs(300);
+    let until = racer_io::Clock::host().wall_now() + Duration::from_secs(300);
     let mut capacity = 1 << 20;
     while capacity > 0 && index.reserve_hold(&other, capacity, until).is_err() {
         capacity /= 2;
@@ -206,9 +205,8 @@ fn read_spill_hold_refused_falls_back_to_memory_window() {
 
 #[test]
 fn read_spill_fill_failure_stops_spill_without_retrying() {
-    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
-    let _queue = queue.enter();
-    let (mut f, _local, mut endpoint, mut stream) = spill_reader(3, 1);
+    let env = racer_io::Env::host();
+    let (mut f, _local, mut endpoint, mut stream) = spill_reader(&env, 3, 1);
     // The head stays blocked while every origin fill fails, so only the spill
     // path can reach page 1.
     f.origin.blocked_pages.borrow_mut().insert(0);

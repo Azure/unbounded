@@ -25,14 +25,7 @@ fn internal_close_failures_keep_admission_and_adapter() {
         for fail_close in [0, 1, 2] {
             unsafe { reset(mode, fail_close) };
             let leaks = matches!(mode, 0..=3 | 7) && fail_close != 0;
-            let mut ports = [Port {
-                name: [0; 64],
-                gid: [0; 16],
-                mtu: 0,
-                lid: 0,
-                port: 0,
-                link_layer: 0,
-            }; 64];
+            let mut ports = [Port::EMPTY; 64];
             let result = unsafe { (api.discover)(ports.as_mut_ptr(), 64) };
             let expected = if leaks {
                 CLEANUP_LEAK
@@ -113,6 +106,21 @@ fn bind_is_signaled_and_fenced() {
     assert_eq!(unsafe { flags(1) }, 2);
 }
 
+/// The thin wrappers translate verbs and connection manager calls: SGE
+/// bounds, write flags and immediates, completion translation, completion
+/// channels, and connection manager event copies.
+#[test]
+#[ignore = "requires discovery_faults.c adapter, not the production adapter"]
+fn wrappers_translate_verbs_results() {
+    let _lock = FAULTS.lock().unwrap();
+    let api = Api::load().expect("load C fault adapter");
+    let library = api.library.unwrap();
+    let wrappers = unsafe { libc::dlsym(library.as_ptr(), c"rdma_test_wrappers".as_ptr()) };
+    assert!(!wrappers.is_null(), "must load C faults");
+    let wrappers: unsafe extern "C" fn() -> u32 = unsafe { std::mem::transmute(wrappers) };
+    assert_eq!(unsafe { wrappers() }, 0, "first failed check");
+}
+
 /// Check the real C open outcomes and retain only failed cleanup owners.
 #[test]
 #[ignore = "requires discovery_faults.c adapter, not the production adapter"]
@@ -139,7 +147,7 @@ fn open_cleanup_failures_keep_admission_and_adapter() {
         (8, c"discovery-test", 0, 1, 1, 0),
     ] {
         unsafe { reset(mode, fail_close) };
-        let raw = unsafe { (api.open)(name.as_ptr()) };
+        let raw = unsafe { (api.open)(name.as_ptr(), 0) };
         if mode == 8 {
             assert!(!raw.is_null() && raw != OPEN_CLEANUP_LEAK);
         } else if mode == 2 && fail_close == 1 {
@@ -238,7 +246,7 @@ fn activate(
     selector: impl FnOnce(&[crate::PortInfo]) -> Result<Vec<(u16, usize)>> + Send + 'static,
 ) -> (Result<Vec<crate::Selection>>, (Owner, crate::Client)) {
     let (mut clients, port) = node(1).unwrap();
-    let mut owner = Owner::new(port);
+    let mut owner = Owner::new(port, racer_io::WorkerCtx::host());
     let client = clients.remove(0);
     let activation = client.activate(NodeConfig {
         selector: Box::new(selector),

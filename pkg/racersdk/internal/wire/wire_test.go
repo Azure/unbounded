@@ -1186,3 +1186,68 @@ func TestWriterFailures(t *testing.T) {
 		t.Fatal("empty interval count")
 	}
 }
+
+func TestHostReadHead(t *testing.T) {
+	r := Request{Key: [32]byte{1}, Pin: `"v1"`}
+
+	head, err := HostReadHead(r, HostReadOptions{Offset: 2, Length: 3, Pin: `"v1"`, DestinationOffset: 7, DestinationLength: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s := string(head)
+	for _, want := range []string{
+		"POST /v1/objects/01" + strings.Repeat("0", 62) + "/host-read HTTP/1.1\r\n",
+		"Host: racer\r\n", "Content-Length: 0\r\n",
+		"Racer-Destination-Offset: 7\r\n", "Racer-Destination-Length: 3\r\n",
+		"Range: bytes=2-4\r\n", "If-Match: \"v1\"\r\n",
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("head %q lacks %q", s, want)
+		}
+	}
+
+	if strings.Contains(s, "Credits") {
+		t.Errorf("head %q sends credits", s)
+	}
+
+	for name, o := range map[string]HostReadOptions{
+		"zero window":     {},
+		"range too large": {Length: 4, DestinationLength: 3},
+		"window overflow": {DestinationOffset: math.MaxInt64, DestinationLength: 1},
+	} {
+		if _, err := HostReadHead(r, o); err == nil {
+			t.Errorf("%s: expected an error", name)
+		}
+	}
+}
+
+func TestParseHostReadResponse(t *testing.T) {
+	base := "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nETag: \"v1\"\r\nRacer-Expires-At: 1234\r\n" +
+		"Racer-Object-Length: 5\r\nRacer-Range-Start: 1\r\nRacer-Range-End: 4\r\nConnection: close\r\n"
+	o := HostReadOptions{Offset: 1, Length: 3, DestinationLength: 3}
+
+	got, err := ParseHostReadResponse([]byte(base+"Content-Length: 42\r\nRacer-Delivery: host\r\n\r\n"), o)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got.First != 1 || got.End != 4 || got.Pages != 1 {
+		t.Fatalf("got %+v", got)
+	}
+
+	for name, head := range map[string]string{
+		"payload length": base + "Content-Length: 45\r\nRacer-Delivery: host\r\n\r\n",
+		"no delivery":    base + "Content-Length: 42\r\n\r\n",
+		"gpu delivery":   base + "Content-Length: 42\r\nRacer-Delivery: gpu\r\n\r\n",
+	} {
+		if _, err := ParseHostReadResponse([]byte(head), o); err == nil {
+			t.Errorf("%s: expected an error", name)
+		}
+	}
+
+	if _, err := ParseSubscriptionResponse([]byte(base+"Content-Length: 45\r\nRacer-Delivery: host\r\n\r\n"),
+		SubscriptionOptions{Offset: 1, Length: 3}); err == nil {
+		t.Error("stream response with Racer-Delivery accepted")
+	}
+}

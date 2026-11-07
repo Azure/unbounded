@@ -4,17 +4,18 @@
 //! `designs/racer-rdma-sessions.md`, "Link table and state machine".
 //!
 //! [`node`] returns one [`Client`] per I/O worker and one [`OwnerPort`].
-//! Build the [`Owner`] from the port on the native thread and host it with
-//! [`crate::WithNative::with_host`] (or poll it with
-//! [`Owner::poll_budgeted`]). Every libibverbs call runs on that thread.
+//! Build the [`Owner`] from the port on the native thread and run it with
+//! [`crate::OwnerRole`] (or poll it with [`Owner::poll_budgeted`]). Every
+//! libibverbs call runs on that thread, except pool registrations, which run
+//! on short-lived helper threads (`ffi::Registering`).
 //! Clients queue commands and get results through [`Op`]s.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     rc::Rc,
     sync::{
         Arc, Mutex, PoisonError, RwLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
     task::{Context, Poll, Waker},
     time::{Duration, Instant},
@@ -25,7 +26,7 @@ use futures::task::AtomicWaker;
 use crate::{
     DeviceMemory, Endpoint, Error, Guard, GuardOwner, PortInfo, Result, Selection,
     channel::{self, Completer, Op, op},
-    ffi::{self, Access, NativeDevice, NativeRegion},
+    ffi::{self, Access, NativeDevice, NativeRegion, RegisterWake, Registering},
     link::{self, Break, Epoch, Granted, Limits, Link, Phase, Role, Source},
     pool::{BufferState, Pool, PoolShared},
 };
@@ -36,13 +37,91 @@ pub const COMMAND_QUEUE: usize = 64;
 /// First backoff after a failed link.
 pub const BACKOFF_MIN: Duration = Duration::from_secs(1);
 
-/// Longest backoff.
-pub const BACKOFF_MAX: Duration = Duration::from_secs(60);
+/// Longest backoff. Short, because every page to a key in backoff goes over
+/// HTTP; repeated failures only cost a cheap setup attempt this often.
+pub const BACKOFF_MAX: Duration = Duration::from_secs(5);
 
 /// A link ready this long resets its backoff.
 pub const BACKOFF_RESET: Duration = Duration::from_secs(60);
 
-pub use link::SETUP_TIMEOUT;
+pub use link::{EXPOSED_GRACE, SETUP_TIMEOUT};
+
+/// Why the owner tore down (or started closing) a link. Counted per node,
+/// see [`Client::link_breaks`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, PartialOrd, Ord)]
+pub enum BreakReason {
+    /// Error completion, protocol violation, or a failed connect. Backs off.
+    Error,
+
+    /// Not ready within [`SETUP_TIMEOUT`]. Backs off.
+    Timeout,
+
+    /// The peer sent `Close`. No backoff.
+    PeerClosed,
+
+    /// Our own `Close` finished (idle close, retain, shutdown, or an
+    /// expired grant). No backoff.
+    Closed,
+
+    /// The caller broke the link with [`Client::break_link`], typically a
+    /// failed setup exchange. Backs off.
+    Abandoned,
+
+    /// The caller declined the link with [`Client::decline_link`]: the peer
+    /// refused the setup for a benign reason (lost tie-break, rate limit,
+    /// overload). Retries after [`BACKOFF_MIN`] without escalating.
+    Declined,
+
+    /// An exposed grant outlived its deadline plus [`EXPOSED_GRACE`], so the
+    /// link started a graceful `Close`. Also counted as [`Self::Closed`]
+    /// once the close finishes.
+    GrantExpired,
+
+    /// The link's device was removed (for example an Azure VF hot-unplug).
+    /// The rail stays down for the rest of the round; no backoff, because
+    /// no new link starts on it until the caller reactivates.
+    DeviceLost,
+}
+
+impl BreakReason {
+    /// Every reason, in counter index order.
+    pub const ALL: [Self; 8] = [
+        Self::Error,
+        Self::Timeout,
+        Self::PeerClosed,
+        Self::Closed,
+        Self::Abandoned,
+        Self::Declined,
+        Self::GrantExpired,
+        Self::DeviceLost,
+    ];
+
+    fn of(reason: Break) -> Self {
+        match reason {
+            Break::Error => Self::Error,
+            Break::Timeout => Self::Timeout,
+            Break::PeerClosed => Self::PeerClosed,
+            Break::Closed => Self::Closed,
+        }
+    }
+}
+
+/// Published links by state, from the latest snapshot. Idle keys are not
+/// tracked.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LinkCounts {
+    /// Setup in progress.
+    pub connecting: usize,
+
+    /// Data may flow.
+    pub ready: usize,
+
+    /// Closing or being destroyed.
+    pub breaking: usize,
+
+    /// Refused until the backoff passes.
+    pub backoff: usize,
+}
 
 /// Opaque caller identity for a link. Racer uses `SHA-256(NodeId)` and the
 /// rail.
@@ -114,11 +193,14 @@ pub struct NodeConfig {
     pub selector: Box<LinkSelector>,
 
     /// Registered bytes per selected device, split into receive page
-    /// buffers. Every selected device must also support implicit on-demand
-    /// paging, which writes read caller memory through.
+    /// buffers. A selected window-mode device must also support implicit
+    /// on-demand paging, which writes read caller memory through;
+    /// registration-mode devices register write sources per write instead.
     pub pool_bytes: usize,
 
-    /// Page buffer length (Racer: `MAX_CIPHERTEXT` rounded up to 4 KiB).
+    /// Page buffer length (Racer: `MAX_CIPHERTEXT` rounded up to 2 MiB). In
+    /// registration mode it must be a multiple of 2 MiB, or activation fails
+    /// with [`Error::InvalidConfiguration`].
     pub buffer_len: usize,
 
     /// Max links (QPs) per device.
@@ -133,6 +215,16 @@ pub struct NodeConfig {
     /// Charged for every native object of this activation; leaks with any
     /// leaked object.
     pub guard: Guard,
+}
+
+/// How a command names its link.
+#[derive(Clone, Copy)]
+enum LinkMatch {
+    /// The QP incarnation.
+    Epoch(Epoch),
+
+    /// The handshake link id.
+    Id(u64),
 }
 
 /// Owner commands.
@@ -171,6 +263,9 @@ enum Command {
         transfer: [u8; 16],
         length: u32,
         deadline: Instant,
+        /// Park until then if every grant slot or buffer is held
+        /// ([`Client::grant_parked`]); `None` fails `Overloaded` at once.
+        park: Option<Instant>,
         done: Completer<Granted>,
     },
 
@@ -185,34 +280,165 @@ enum Command {
 
     Release {
         key: LinkKey,
-        epoch: Epoch,
+        link: LinkMatch,
         tag: u32,
         done: Completer<()>,
     },
 
-    Break(LinkKey, Epoch),
+    /// Break the link; `true` declines it (benign, no escalating backoff).
+    Break(LinkKey, Epoch, bool),
+}
+
+/// Published link states, keyed by link.
+type LinkMap = BTreeMap<LinkKey, LinkState>;
+
+/// The owner's published link table: an `Arc` swapped under a mutex that is
+/// held only for the pointer swap or clone, plus a generation counter so
+/// readers can reuse a cached `Arc` without locking.
+///
+/// Unlike a `try_read` on a `RwLock`, a read never fails under contention:
+/// it waits at most for one pointer swap, and a writer never waits for
+/// readers to finish with the old table.
+struct Snapshot {
+    current: Mutex<Arc<LinkMap>>,
+
+    /// Bumped after every swap of `current`.
+    generation: AtomicU64,
+}
+
+impl Snapshot {
+    fn new() -> Self {
+        Self {
+            current: Mutex::new(Arc::new(LinkMap::new())),
+            generation: AtomicU64::new(0),
+        }
+    }
+
+    /// The latest table and its generation.
+    fn load(&self) -> (u64, Arc<LinkMap>) {
+        let current = self.current.lock().unwrap_or_else(PoisonError::into_inner);
+        // Read under the lock: the generation matches the table.
+        (self.generation.load(Ordering::Acquire), current.clone())
+    }
+
+    /// Replace the table. The old one drops outside the lock.
+    fn store(&self, links: LinkMap) {
+        let links = Arc::new(links);
+        let old = {
+            let mut current = self.current.lock().unwrap_or_else(PoisonError::into_inner);
+            self.generation.fetch_add(1, Ordering::AcqRel);
+            std::mem::replace(&mut *current, links)
+        };
+        drop(old);
+    }
+}
+
+/// A worker's cached copy of the [`Snapshot`].
+struct Cached {
+    generation: u64,
+
+    links: Arc<LinkMap>,
 }
 
 /// State shared by the owner and every client.
 struct NodeShared {
-    links: RwLock<BTreeMap<LinkKey, LinkState>>,
+    links: Snapshot,
 
     pools: RwLock<BTreeMap<u16, Arc<PoolShared>>>,
 
     /// Device pools by rail and pool id, once attached.
     device_pools: RwLock<BTreeMap<(u16, u32), Arc<PoolShared>>>,
 
-    /// Breaks that did not fit in a command queue.
-    breaks: Mutex<Vec<(LinkKey, Epoch)>>,
+    /// Write source prefetch by rail, for window-mode devices. The owner
+    /// withdraws an entry under the write lock before dropping its implicit
+    /// region, and [`Client::prefetch`] holds the read lock across the call.
+    prefetch: RwLock<BTreeMap<u16, ffi::Prefetcher>>,
+
+    /// Breaks that did not fit in a command queue; `true` declines.
+    breaks: Mutex<Vec<(LinkKey, Epoch, bool)>>,
+
+    /// Link breaks by [`BreakReason`] index, since the node started.
+    break_counts: [AtomicU64; BreakReason::ALL.len()],
+
+    /// Devices this node lost (see [`BreakReason::DeviceLost`]), since the
+    /// node started.
+    device_losses: AtomicU64,
+
+    /// Rails whose device was lost this round, cleared when the round's
+    /// devices are freed.
+    lost: Mutex<Vec<u16>>,
+
+    /// Rails a caller reported lost ([`Client::report_lost`]), not yet
+    /// applied.
+    reported_lost: Mutex<Vec<u16>>,
+
+    /// The latest [`Client::retain`] request, not yet applied.
+    retain: Mutex<Option<std::collections::BTreeSet<LinkKey>>>,
 
     closed: AtomicBool,
 
     drained: AtomicBool,
 
+    /// Grant requests parked in the owner ([`Client::grant_waiters`]).
+    grant_waiters: AtomicUsize,
+
+    /// Why a closed round has not drained yet (see [`DrainBlocker`]), as
+    /// its code; 0 when nothing blocks it.
+    blocker: AtomicU8,
+
     /// False once the owner (or its port) is dropped.
     alive: AtomicBool,
 
     owner: AtomicWaker,
+}
+
+/// What keeps a closed round from draining.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DrainBlocker {
+    /// Links are still breaking or their QPs are still being destroyed.
+    Links,
+
+    /// Page pools are still registering off the owner thread.
+    Registering,
+
+    /// The NIC may still use a page buffer (bound, exposed, invalidating,
+    /// or quarantined), or a received page of a live device is still held.
+    Buffers,
+
+    /// A native object leaked against the round's charge: the round never
+    /// drains.
+    Leaked,
+}
+
+impl DrainBlocker {
+    /// Metric and log label.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Links => "links",
+            Self::Registering => "registering",
+            Self::Buffers => "buffers",
+            Self::Leaked => "leaked",
+        }
+    }
+
+    fn code(self) -> u8 {
+        match self {
+            Self::Links => 1,
+            Self::Registering => 2,
+            Self::Buffers => 3,
+            Self::Leaked => 4,
+        }
+    }
+
+    fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::Links),
+            2 => Some(Self::Registering),
+            3 => Some(Self::Buffers),
+            4 => Some(Self::Leaked),
+            _ => None,
+        }
+    }
 }
 
 /// Create the owner port and `workers` clients (at least one).
@@ -223,12 +449,20 @@ pub fn node(workers: usize) -> Result<(Vec<Client>, OwnerPort)> {
 
     let (handles, channel) = channel::channels(workers, COMMAND_QUEUE)?;
     let shared = Arc::new(NodeShared {
-        links: RwLock::new(BTreeMap::new()),
+        links: Snapshot::new(),
         pools: RwLock::new(BTreeMap::new()),
         device_pools: RwLock::new(BTreeMap::new()),
+        prefetch: RwLock::new(BTreeMap::new()),
         breaks: Mutex::new(Vec::new()),
+        break_counts: Default::default(),
+        device_losses: AtomicU64::new(0),
+        lost: Mutex::new(Vec::new()),
+        reported_lost: Mutex::new(Vec::new()),
+        retain: Mutex::new(None),
         closed: AtomicBool::new(false),
         drained: AtomicBool::new(false),
+        grant_waiters: AtomicUsize::new(0),
+        blocker: AtomicU8::new(0),
         alive: AtomicBool::new(true),
         owner: AtomicWaker::new(),
     });
@@ -237,6 +471,7 @@ pub fn node(workers: usize) -> Result<(Vec<Client>, OwnerPort)> {
         .map(|worker| Client {
             worker,
             shared: shared.clone(),
+            cached: Mutex::new(None),
         })
         .collect();
 
@@ -262,6 +497,9 @@ pub struct Client {
     worker: channel::Worker<Command>,
 
     shared: Arc<NodeShared>,
+
+    /// The last snapshot this worker read. Uncontended: one worker owns it.
+    cached: Mutex<Option<Cached>>,
 }
 
 /// An op that already failed with `error`.
@@ -295,18 +533,67 @@ impl Client {
     }
 
     /// Discover ports, run the selector, and register one page pool per
-    /// selected device. Once per round.
+    /// selected device. Once per round. The pool registrations run on a
+    /// helper thread, so the owner keeps serving while they pin memory; the
+    /// op resolves once every pool is registered.
     pub fn activate(&self, config: NodeConfig) -> Op<Vec<Selection>> {
         self.submit(|done| Command::Activate(config, done))
     }
 
-    /// Snapshot of `key`'s link. A busy snapshot reads as [`LinkState::Idle`]
-    /// (callers then use HTTP or get `Overloaded` from `open`).
+    /// Snapshot of `key`'s link as last published by the owner. May lag the
+    /// owner, but never reads as [`LinkState::Idle`] because of a concurrent
+    /// publish: the read reuses this worker's cached table while the
+    /// generation is unchanged and otherwise waits at most for one pointer
+    /// swap.
     pub fn link(&self, key: LinkKey) -> LinkState {
-        match self.shared.links.try_read() {
-            Ok(links) => links.get(&key).copied().unwrap_or(LinkState::Idle),
-            Err(_) => LinkState::Idle,
+        let generation = self.shared.links.generation.load(Ordering::Acquire);
+        let mut cached = self.cached.lock().unwrap_or_else(PoisonError::into_inner);
+
+        if cached.as_ref().is_none_or(|c| c.generation != generation) {
+            let (generation, links) = self.shared.links.load();
+            *cached = Some(Cached { generation, links });
         }
+
+        cached
+            .as_ref()
+            .and_then(|c| c.links.get(&key).copied())
+            .unwrap_or(LinkState::Idle)
+    }
+
+    /// Links by state in the latest published snapshot.
+    pub fn link_counts(&self) -> LinkCounts {
+        let (_, links) = self.shared.links.load();
+        let mut counts = LinkCounts::default();
+
+        for state in links.values() {
+            match state {
+                LinkState::Idle => {}
+                LinkState::Connecting(_) => counts.connecting += 1,
+                LinkState::Ready { .. } => counts.ready += 1,
+                LinkState::Breaking => counts.breaking += 1,
+                LinkState::Backoff(_) => counts.backoff += 1,
+            }
+        }
+
+        counts
+    }
+
+    /// Links broken (or, for [`BreakReason::GrantExpired`], closed) for
+    /// `reason` since the node started.
+    pub fn link_breaks(&self, reason: BreakReason) -> u64 {
+        self.shared.break_counts[reason as usize].load(Ordering::Relaxed)
+    }
+
+    /// Close every link whose key is not in `keep`: ready links send `Close`
+    /// and drain, others break, and none backs off. Used when peers stop
+    /// being RDMA edges. The latest request wins; never lost to a full queue.
+    pub fn retain(&self, keep: std::collections::BTreeSet<LinkKey>) {
+        *self
+            .shared
+            .retain
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(keep);
+        self.shared.owner.wake();
     }
 
     /// Start a link as initiator. Returns the local setup to sign and send.
@@ -360,8 +647,46 @@ impl Client {
             transfer,
             length,
             deadline,
+            park: None,
             done,
         })
+    }
+
+    /// Receiver: like [`Self::grant`], but when every grant slot of the link
+    /// or every buffer of its rail's pool is held, the request parks in the
+    /// owner until one frees or `until` passes, instead of failing
+    /// `Overloaded` at once. Parked requests are served in arrival order per
+    /// rail, from the owner's poll that sees the release, so a freed buffer
+    /// goes to the oldest waiter that can use it. A request still parked at
+    /// `until` fails `Overloaded`; one whose link broke fails `Unavailable`;
+    /// dropping the op withdraws it without taking a buffer. The grant
+    /// reports [`Granted::waited`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn grant_parked(
+        &self,
+        key: LinkKey,
+        epoch: Epoch,
+        transfer: [u8; 16],
+        length: u32,
+        deadline: Instant,
+        until: Instant,
+    ) -> Op<Granted> {
+        self.submit(|done| Command::Grant {
+            key,
+            epoch,
+            device: None,
+            transfer,
+            length,
+            deadline,
+            park: Some(until),
+            done,
+        })
+    }
+
+    /// Grant requests parked in the owner ([`Self::grant_parked`]), as of
+    /// its last poll.
+    pub fn grant_waiters(&self) -> usize {
+        self.shared.grant_waiters.load(Ordering::Relaxed)
     }
 
     /// Receiver: like [`Self::grant`], but over a free buffer of the rail's
@@ -388,6 +713,7 @@ impl Client {
             transfer,
             length,
             deadline,
+            park: None,
             done,
         })
     }
@@ -398,7 +724,8 @@ impl Client {
     /// per GPU, say); each id once per rail per round, after
     /// [`Self::activate`]. Resolves to the number of device buffers. The
     /// memory stays registered until the node drains, and the node holds
-    /// `memory` until then; it is never read or written by the CPU.
+    /// `memory` until then; it is never read or written by the CPU. The
+    /// registration runs on a helper thread; the owner keeps serving.
     pub fn attach_device(&self, rail: u16, id: u32, memory: DeviceMemory) -> Op<usize> {
         self.submit(|done| Command::AttachDevice {
             rail,
@@ -429,12 +756,52 @@ impl Client {
         })
     }
 
+    /// Sender: map `bytes` into `rail`'s NIC page tables before writing
+    /// them, so the write does not stall the queue pair on NIC page faults
+    /// (window mode reads sources through implicit on-demand paging).
+    ///
+    /// Runs on the calling thread and blocks until the kernel has mapped
+    /// the range, so the cost lands on the caller rather than the owner.
+    /// Only advice: it never changes what a write reads.
+    ///
+    /// `Ok(false)` if `rail` has nothing to prefetch into (registration
+    /// mode, or not activated); `Ok(true)` once mapped. Fails `Unavailable`
+    /// if the provider cannot prefetch, and `Io` or `InvalidRange` if the
+    /// kernel refused the range; the write may then take NIC page faults.
+    pub fn prefetch(&self, rail: u16, bytes: &[u8]) -> Result<bool> {
+        let prefetch = self
+            .shared
+            .prefetch
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        let Some(prefetcher) = prefetch.get(&rail) else {
+            return Ok(false);
+        };
+        // SAFETY: the owner withdraws the entry under the write lock before
+        // it drops the region, and this read lock is held across the call.
+        unsafe { prefetcher.run(bytes) }.map(|()| true)
+    }
+
     /// Sender: decline the peer's grant `tag`. Resolves on the send
     /// completion.
     pub fn release(&self, key: LinkKey, epoch: Epoch, tag: u32) -> Op<()> {
         self.submit(|done| Command::Release {
             key,
-            epoch,
+            link: LinkMatch::Epoch(epoch),
+            tag,
+            done,
+        })
+    }
+
+    /// Sender: decline the peer's grant `tag` on whichever current link of
+    /// `key` carries handshake id `link_id`, without consulting the
+    /// snapshot. The owner resolves the link, so a snapshot that lags a
+    /// just-ready link cannot skip the release. Fails `Unavailable` if no
+    /// ready link of `key` has that id.
+    pub fn release_link(&self, key: LinkKey, link_id: u64, tag: u32) -> Op<()> {
+        self.submit(|done| Command::Release {
+            key,
+            link: LinkMatch::Id(link_id),
             tag,
             done,
         })
@@ -444,14 +811,25 @@ impl Client {
     /// ops fail with `Unavailable`. Never lost: a full queue falls back to a
     /// shared list.
     pub fn break_link(&self, key: LinkKey, epoch: Epoch) {
-        if let Err((_, Command::Break(key, epoch))) =
-            self.worker.try_send(Command::Break(key, epoch))
+        self.submit_break(key, epoch, false);
+    }
+
+    /// Like [`Self::break_link`], for a setup the peer declined for a benign
+    /// reason (lost tie-break, rate limit, overload): the key retries after
+    /// [`BACKOFF_MIN`] and its backoff does not escalate.
+    pub fn decline_link(&self, key: LinkKey, epoch: Epoch) {
+        self.submit_break(key, epoch, true);
+    }
+
+    fn submit_break(&self, key: LinkKey, epoch: Epoch, declined: bool) {
+        if let Err((_, Command::Break(key, epoch, declined))) =
+            self.worker.try_send(Command::Break(key, epoch, declined))
         {
             self.shared
                 .breaks
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .push((key, epoch));
+                .push((key, epoch, declined));
             self.shared.owner.wake();
         }
     }
@@ -469,6 +847,37 @@ impl Client {
         Some(pools.get(&(rail, id))?.count_in(state))
     }
 
+    /// Devices lost since the node started: each one broke every link on its
+    /// rail with [`BreakReason::DeviceLost`]. A caller that sees this grow
+    /// should [`Self::close`] the round and reactivate once the device is
+    /// back.
+    pub fn device_losses(&self) -> u64 {
+        self.shared.device_losses.load(Ordering::Relaxed)
+    }
+
+    /// Rails whose device was lost this round. New links on them fail with
+    /// [`Error::Unavailable`] until the round is closed and reactivated.
+    pub fn lost_rails(&self) -> Vec<u16> {
+        self.shared
+            .lost
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Report `rail`'s device gone, as the caller saw it (its sysfs entry
+    /// vanished, say): the owner treats it as if the device reported its
+    /// own removal (see [`Self::device_losses`]). Report before
+    /// [`Self::close`] so the round does not wait for pages no NIC can reach.
+    pub fn report_lost(&self, rail: u16) {
+        self.shared
+            .reported_lost
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(rail);
+        self.shared.owner.wake();
+    }
+
     /// Close the node: the owner sends `Close` on ready links, breaks every
     /// link, and frees everything once no page is held. Does not wait.
     pub fn close(&self) {
@@ -484,6 +893,16 @@ impl Client {
     /// True once closed and every native object is gone.
     pub fn drained(&self) -> bool {
         self.shared.drained.load(Ordering::Acquire)
+    }
+
+    /// Why the closed round has not drained yet, or `None` when it has (or
+    /// is not closed). Lets a caller waiting to reactivate say what it is
+    /// waiting for.
+    pub fn drain_blocker(&self) -> Option<DrainBlocker> {
+        if !self.closed() || self.drained() {
+            return None;
+        }
+        DrainBlocker::from_code(self.shared.blocker.load(Ordering::Acquire))
     }
 
     /// Start a new round after [`Self::close`]. `Overloaded` until drained;
@@ -524,6 +943,49 @@ struct Settings {
     max_links: usize,
 }
 
+/// A selected device whose page pool is still registering.
+struct PendingDevice {
+    tag: u16,
+
+    /// `None` once finished into `region`.
+    registering: Option<Registering>,
+
+    region: Option<Result<Rc<NativeRegion>>>,
+
+    /// The implicit region being created off this thread (window mode);
+    /// `None` once finished into `implicit` or when none is needed.
+    implicit_registering: Option<Registering>,
+
+    /// `None` until the implicit region exists (or failed).
+    implicit: Option<Result<Rc<NativeRegion>>>,
+
+    device: Rc<NativeDevice>,
+}
+
+/// An activation waiting for its page pool registrations.
+struct Activation {
+    selected: Vec<Selection>,
+
+    devices: Vec<PendingDevice>,
+
+    buffer_len: usize,
+
+    settings: Settings,
+
+    done: Completer<Vec<Selection>>,
+}
+
+/// A device pool registration in flight.
+struct Attaching {
+    rail: u16,
+
+    id: u32,
+
+    registering: Option<Registering>,
+
+    done: Completer<usize>,
+}
+
 /// A link being destroyed.
 struct Dying {
     key: LinkKey,
@@ -539,12 +1001,20 @@ struct Backoff {
     delay: Duration,
 }
 
+/// Retry delay for owner work that raises no wake event: failed destroys
+/// and shutdown checks.
+pub const RETRY_SOON: Duration = Duration::from_millis(1);
+
+/// Backup poll for link teardowns running on a reaper thread, which wake
+/// the owner themselves when they finish.
+const REAPER_POLL: Duration = Duration::from_millis(100);
+
 /// Runs on the native thread and owns every link, pool, and device.
 ///
-/// Not `Send`. Poll it with [`Self::poll_budgeted`], or host it with
-/// [`crate::WithNative::with_host`].
+/// Not `Send`. Poll it with [`Self::poll_budgeted`], or run it on its own
+/// thread with [`crate::OwnerRole`].
 pub struct Owner {
-    environment: uring_runtime::environment::Environment,
+    ctx: racer_io::WorkerCtx,
 
     #[cfg(any(test, feature = "simulation"))]
     simulation: Option<crate::simulation::Simulation>,
@@ -560,11 +1030,25 @@ pub struct Owner {
 
     devices: BTreeMap<u16, DeviceState>,
 
+    /// Devices of earlier rounds whose pools still had pages out when the
+    /// round drained, kept until those pages return (see
+    /// [`Self::finish_shutdown`]). Each keeps its round's charge.
+    retired: Vec<DeviceState>,
+
     quota: Option<Arc<GuardOwner>>,
 
     settings: Option<Settings>,
 
+    /// An activation whose page pools are registering off this thread.
+    activating: Option<Activation>,
+
+    /// Device pools registering off this thread.
+    attaching: Vec<Attaching>,
+
     backoff: BTreeMap<LinkKey, Backoff>,
+
+    /// Rails whose device was removed this round.
+    lost: std::collections::BTreeSet<u16>,
 
     next_epoch: u64,
 
@@ -579,12 +1063,42 @@ pub struct Owner {
 
     /// A native object leaked against this round's charge: never drained.
     leaked: bool,
+
+    /// The last poll left commands in the queue: poll again at once.
+    backlog: bool,
+
+    /// Scratch for the commands taken in one poll, reused across polls.
+    commands: Vec<Command>,
+
+    /// Parked grant requests by rail, oldest first ([`Client::grant_parked`]).
+    waiters: BTreeMap<u16, VecDeque<Waiter>>,
+
+    /// No parked request expires before this; `None` with none parked.
+    park_expiry: Option<Instant>,
+}
+
+/// A grant request parked until a grant slot or page buffer frees.
+struct Waiter {
+    key: LinkKey,
+
+    epoch: Epoch,
+
+    transfer: [u8; 16],
+
+    length: u32,
+
+    deadline: Instant,
+
+    /// Fail `Overloaded` once this passes.
+    until: Instant,
+
+    done: Completer<Granted>,
 }
 
 impl Owner {
-    /// Build the owner. Call on the native thread; it captures that
-    /// thread's environment (and simulation, in tests).
-    pub fn new(port: OwnerPort) -> Self {
+    /// Build the owner. Call on the native thread; `ctx` supplies its time
+    /// and entropy (and it captures the thread's simulation, in tests).
+    pub fn new(port: OwnerPort, ctx: racer_io::WorkerCtx) -> Self {
         // Move the fields out; `OwnerPort::drop` must not mark the node dead.
         let port = std::mem::ManuallyDrop::new(port);
         // SAFETY: each field is read once out of a `ManuallyDrop`.
@@ -592,7 +1106,7 @@ impl Owner {
             unsafe { (std::ptr::read(&port.channel), std::ptr::read(&port.shared)) };
 
         Self {
-            environment: uring_runtime::environment::Environment::current(),
+            ctx,
             #[cfg(any(test, feature = "simulation"))]
             simulation: crate::simulation::current(),
             channel,
@@ -600,14 +1114,22 @@ impl Owner {
             links: BTreeMap::new(),
             dying: Vec::new(),
             devices: BTreeMap::new(),
+            retired: Vec::new(),
             quota: None,
             settings: None,
+            activating: None,
+            attaching: Vec::new(),
             backoff: BTreeMap::new(),
+            lost: std::collections::BTreeSet::new(),
             next_epoch: 1,
             closing: false,
             dirty: false,
             expiry: None,
             leaked: false,
+            backlog: false,
+            commands: Vec::new(),
+            waiters: BTreeMap::new(),
+            park_expiry: None,
         }
     }
 
@@ -619,7 +1141,66 @@ impl Owner {
 
         for device in self.devices.values() {
             device.pool.register_owner(waker);
+            device.device.set_waker(waker);
         }
+    }
+
+    /// Nonblocking file descriptors whose readiness means
+    /// [`Self::poll_budgeted`] has work: each device's completion channel
+    /// and, in registration mode, its connection manager channel. Changes
+    /// with activation. Timers and commands still need the driver waker and
+    /// periodic polls.
+    pub fn poll_fds(&self) -> Vec<std::os::fd::RawFd> {
+        let mut fds = Vec::new();
+        self.poll_fds_into(&mut fds);
+        fds
+    }
+
+    /// Append [`Self::poll_fds`] to `out`, so a caller can reuse its buffer.
+    pub fn poll_fds_into(&self, out: &mut Vec<std::os::fd::RawFd>) {
+        for device in self.devices.values() {
+            device.device.fds_into(out);
+        }
+    }
+
+    /// When the owner next needs a poll that no wake source announces:
+    /// `None` means only a wake source (a command, a close, a returned
+    /// buffer, or a [`Self::poll_fds`] descriptor) brings new work. A time
+    /// at or before now means poll again at once (a full completion batch,
+    /// queued commands, or synthetic completions).
+    pub fn next_wake(&self) -> Option<Instant> {
+        let now = self.ctx.now();
+        let mut next: Option<Instant> = self.expiry;
+        let mut at = |t: Instant| next = Some(next.map_or(t, |n| n.min(t)));
+        if self.backlog {
+            return Some(now);
+        }
+        // Destroys to retry and shutdown checks retry on a short timer. The
+        // snapshot always publishes within the poll that dirtied it.
+        // A teardown on a reaper thread wakes the owner when it finishes;
+        // `REAPER_POLL` only backs that up.
+        if self.dying.iter().any(|d| !d.link.reaping())
+            || (self.closing && !self.leaked && !self.drained())
+        {
+            at(now + RETRY_SOON);
+        } else if !self.dying.is_empty() || !self.retired.is_empty() {
+            // Returned pages wake the owner; this only backs that up.
+            at(now + REAPER_POLL);
+        }
+        for link in self.links.values() {
+            if let Some(t) = link.next_deadline() {
+                at(t);
+            }
+        }
+        if let Some(t) = self.park_expiry {
+            at(t);
+        }
+        next
+    }
+
+    /// The owner's clock.
+    pub fn ctx_now(&self) -> Instant {
+        self.ctx.now()
     }
 
     /// Close from the owner side. Same as [`Client::close`].
@@ -639,8 +1220,7 @@ impl Owner {
             return Ok(());
         }
 
-        let _environment = self.environment.enter();
-        let now = uring_runtime::environment::now();
+        let now = self.ctx.now();
         let closed = self.shared.closed.load(Ordering::Acquire);
 
         if !closed && self.closing {
@@ -654,13 +1234,16 @@ impl Owner {
             self.begin_shutdown(now);
         }
 
-        let mut commands = Vec::new();
+        let mut commands = std::mem::take(&mut self.commands);
         self.channel
             .try_drain(budget, |_, command| commands.push(command));
+        self.backlog = commands.len() >= budget;
 
-        for command in commands {
+        for command in commands.drain(..) {
             self.handle(command, now);
         }
+
+        self.commands = commands;
 
         let breaks = std::mem::take(
             &mut *self
@@ -670,41 +1253,85 @@ impl Owner {
                 .unwrap_or_else(PoisonError::into_inner),
         );
 
-        for (key, epoch) in breaks {
-            self.break_matching(key, epoch, now);
+        for (key, epoch, declined) in breaks {
+            self.break_matching(key, epoch, declined, now);
         }
 
+        let retain = self
+            .shared
+            .retain
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+
+        if let Some(keep) = retain
+            && !self.closing
+        {
+            self.retain_links(&keep, now);
+        }
+
+        self.advance_registrations();
         self.progress(now);
         self.reap();
+        self.serve_waiters(now);
+        self.reap_retired();
 
         if self.closing {
             self.finish_shutdown();
         }
 
         self.publish(now);
+        #[cfg(any(test, feature = "simulation"))]
+        self.check_wake();
         Ok(())
+    }
+
+    /// Simulation-only invariant: an owner with work left must have armed a
+    /// wake for it. Links, dying links, an undrained shutdown, and a pending
+    /// backoff expiry need [`Self::next_wake`]; registrations in flight are
+    /// woken by their helper (or held by the simulation). A violation means
+    /// a parked owner would sleep forever: a missing timer.
+    #[cfg(any(test, feature = "simulation"))]
+    fn check_wake(&self) {
+        if self.simulation.is_none() {
+            return;
+        }
+        let pending = !self.links.is_empty()
+            || !self.dying.is_empty()
+            || (self.closing && !self.leaked && !self.drained())
+            || self.expiry.is_some()
+            || !self.waiters.is_empty();
+        let external = self.activating.is_some() || !self.attaching.is_empty();
+        assert!(
+            !missing_wake(pending, self.next_wake(), external),
+            "rdma owner has pending work and no armed wake source"
+        );
     }
 
     fn handle(&mut self, command: Command, now: Instant) {
         if self.closing {
-            // Dropping the command fails its op with `Cancelled`; say why.
+            if matches!(command, Command::Activate(..)) {
+                eprintln!(
+                    "racer: stage=rdma-activation step=owner error=Unavailable reason=closing"
+                );
+            }
+            // Dropping the command fails its op with `Canceled`; say why.
             fail(command, Error::Unavailable);
             return;
         }
 
         match command {
             Command::Activate(config, done) => {
-                let result = self.activate(config);
-                if result.is_err() {
+                // Completes once the page pools are registered.
+                if self.activate(config, done).is_err() {
                     self.abandon_activation();
+                    self.dirty = true;
                 }
-                self.dirty = true;
-                let _ = done.complete(result);
             }
             Command::Open(key, done) => {
                 // The initiator went away: do not leave the link Connecting.
                 if let Err(Ok(opened)) = done.complete(self.open(key, now)) {
-                    self.break_matching(key, opened.epoch, now);
+                    self.break_matching(key, opened.epoch, false, now);
                 }
             }
             Command::Accept {
@@ -731,7 +1358,9 @@ impl Owner {
                 memory,
                 done,
             } => {
-                let _ = done.complete(self.attach_device(rail, id, memory));
+                if let Err((error, done)) = self.attach_device(rail, id, memory, done) {
+                    let _ = done.complete(Err(error));
+                }
             }
             Command::Grant {
                 key,
@@ -740,15 +1369,47 @@ impl Owner {
                 transfer,
                 length,
                 deadline,
+                park,
                 done,
-            } => match self.ready(key, epoch) {
-                Some((link, pool)) => {
-                    link.grant(pool, device, transfer, length, deadline, done, now)
+            } => {
+                // Host grants may park; device (landing) grants fall back to
+                // host memory instead. Behind older waiters on the rail, park
+                // without trying, so a buffer freed since goes to them first.
+                let park = park.filter(|_| device.is_none());
+                let queued = park.is_some()
+                    && self
+                        .waiters
+                        .get(&key.rail)
+                        .is_some_and(|queue| !queue.is_empty());
+                let done = match self.ready(key, epoch) {
+                    None => {
+                        let _ = done.complete(Err(Error::Unavailable));
+                        return;
+                    }
+                    Some(_) if queued => done,
+                    Some((link, pool)) => {
+                        match link.grant(pool, device, transfer, length, deadline, false, done, now)
+                        {
+                            Some(done) => done,
+                            None => return,
+                        }
+                    }
+                };
+                match park {
+                    Some(until) if until > now => self.park(Waiter {
+                        key,
+                        epoch,
+                        transfer,
+                        length,
+                        deadline,
+                        until,
+                        done,
+                    }),
+                    _ => {
+                        let _ = done.complete(Err(Error::Overloaded));
+                    }
                 }
-                None => {
-                    let _ = done.complete(Err(Error::Unavailable));
-                }
-            },
+            }
             Command::Write {
                 key,
                 epoch,
@@ -764,16 +1425,143 @@ impl Owner {
             },
             Command::Release {
                 key,
-                epoch,
+                link,
                 tag,
                 done,
-            } => match self.ready(key, epoch) {
+            } => match self.matching(key, link) {
                 Some((link, _)) => link.release(tag, done, now),
                 None => {
                     let _ = done.complete(Err(Error::Unavailable));
                 }
             },
-            Command::Break(key, epoch) => self.break_matching(key, epoch, now),
+            Command::Break(key, epoch, declined) => {
+                self.break_matching(key, epoch, declined, now);
+            }
+        }
+    }
+
+    /// Queue `waiter` behind the rail's older waiters.
+    fn park(&mut self, waiter: Waiter) {
+        self.park_expiry = Some(
+            self.park_expiry
+                .map_or(waiter.until, |t| t.min(waiter.until)),
+        );
+        self.waiters
+            .entry(waiter.key.rail)
+            .or_default()
+            .push_back(waiter);
+        self.count_waiters();
+    }
+
+    /// Publish the parked request count.
+    fn count_waiters(&self) {
+        let parked = self.waiters.values().map(VecDeque::len).sum();
+        self.shared.grant_waiters.store(parked, Ordering::Relaxed);
+    }
+
+    /// Grant parked requests that a grant slot or buffer freed for, oldest
+    /// first per rail, after this poll's releases. A request that still finds
+    /// its link's slots full stays parked without blocking the requests
+    /// behind it (other links may have slots); one that finds the rail's pool
+    /// empty stops the rail, so a later request never takes a buffer ahead
+    /// of an older one. Expired, withdrawn, and orphaned (link gone or
+    /// replaced) requests leave whenever a request may have expired or the
+    /// link table changed, and on shutdown.
+    fn serve_waiters(&mut self, now: Instant) {
+        if self.waiters.is_empty() {
+            return;
+        }
+
+        if self.closing {
+            for (_, queue) in std::mem::take(&mut self.waiters) {
+                for waiter in queue {
+                    let _ = waiter.done.complete(Err(Error::Unavailable));
+                }
+            }
+            self.park_expiry = None;
+            self.count_waiters();
+            return;
+        }
+
+        let sweep = self.dirty || self.park_expiry.is_some_and(|t| now >= t);
+        let mut waiters = std::mem::take(&mut self.waiters);
+        let mut expiry: Option<Instant> = None;
+
+        for queue in waiters.values_mut() {
+            let mut kept = VecDeque::with_capacity(queue.len());
+            let mut exhausted = false;
+
+            while let Some(waiter) = queue.pop_front() {
+                if exhausted && !sweep {
+                    // Nothing behind an empty pool can be granted, and
+                    // nothing needs to expire yet.
+                    kept.push_back(waiter);
+                    kept.append(queue);
+                    break;
+                }
+                if waiter.done.is_abandoned() {
+                    continue;
+                }
+                let Some((link, pool)) = self.ready(waiter.key, waiter.epoch) else {
+                    let _ = waiter.done.complete(Err(Error::Unavailable));
+                    continue;
+                };
+                if now >= waiter.until {
+                    let _ = waiter.done.complete(Err(Error::Overloaded));
+                    continue;
+                }
+                let full = link.grants_full();
+                let left = if exhausted || full {
+                    Some(waiter.done)
+                } else {
+                    link.grant(
+                        pool,
+                        None,
+                        waiter.transfer,
+                        waiter.length,
+                        waiter.deadline,
+                        true,
+                        waiter.done,
+                        now,
+                    )
+                };
+                if let Some(done) = left {
+                    // Slots full stays local to the link; an empty pool
+                    // blocks the rail.
+                    exhausted |= !full;
+                    expiry = Some(expiry.map_or(waiter.until, |t| t.min(waiter.until)));
+                    kept.push_back(Waiter { done, ..waiter });
+                }
+            }
+
+            *queue = kept;
+        }
+
+        waiters.retain(|_, queue| !queue.is_empty());
+        self.waiters = waiters;
+        // Requests skipped behind an empty pool keep the old bound.
+        self.park_expiry = if self.waiters.is_empty() {
+            None
+        } else if sweep {
+            expiry
+        } else {
+            self.park_expiry
+        };
+        self.count_waiters();
+    }
+
+    /// The link for `key` named by `link`, and its pool.
+    fn matching(&mut self, key: LinkKey, link: LinkMatch) -> Option<(&mut Link, &Pool)> {
+        match link {
+            LinkMatch::Epoch(epoch) => self.ready(key, epoch),
+            LinkMatch::Id(id) => {
+                let link = self
+                    .links
+                    .get_mut(&key)
+                    .filter(|link| link.phase() == Phase::Ready && link.link_id() == id)?;
+                let device = self.devices.get(&key.rail)?;
+                Some((link, &device.pool))
+            }
         }
     }
 
@@ -791,7 +1579,7 @@ impl Owner {
     /// regions are already dropped, so the charge returns unless a native
     /// object leaked against it.
     fn abandon_activation(&mut self) {
-        if self.settings.is_some() || !self.devices.is_empty() {
+        if self.settings.is_some() || !self.devices.is_empty() || self.activating.is_some() {
             return;
         }
 
@@ -804,21 +1592,96 @@ impl Owner {
         }
     }
 
-    /// Register `memory` as `rail`'s device pool `id`.
-    fn attach_device(&mut self, rail: u16, id: u32, memory: DeviceMemory) -> Result<usize> {
+    /// The owner's wake, for registrations finishing off this thread.
+    fn register_wake(&self) -> RegisterWake {
+        let shared = self.shared.clone();
+        Arc::new(move || shared.owner.wake())
+    }
+
+    /// Start registering `memory` as `rail`'s device pool `id`; `done`
+    /// completes once it is registered (see [`Self::advance_registrations`]).
+    #[allow(clippy::type_complexity)]
+    fn attach_device(
+        &mut self,
+        rail: u16,
+        id: u32,
+        memory: DeviceMemory,
+        done: Completer<usize>,
+    ) -> std::result::Result<(), (Error, Completer<usize>)> {
         #[cfg(any(test, feature = "simulation"))]
         let _simulation = self
             .simulation
             .as_ref()
             .map(crate::simulation::Simulation::enter);
-        let quota = self.quota.clone().ok_or(Error::InvalidRequest)?;
-        let state = self.devices.get_mut(&rail).ok_or(Error::InvalidRequest)?;
+        let Some(quota) = self.quota.clone() else {
+            return Err((Error::InvalidRequest, done));
+        };
+        let wake = self.register_wake();
+        let Some(state) = self.devices.get(&rail) else {
+            return Err((Error::InvalidRequest, done));
+        };
 
-        if state.pool.device_shared(id).is_some() {
-            return Err(Error::InvalidRequest);
+        if state.pool.device_shared(id).is_some()
+            || self.attaching.iter().any(|a| a.rail == rail && a.id == id)
+        {
+            return Err((Error::InvalidRequest, done));
         }
 
-        let region = NativeRegion::dmabuf(state.device.clone(), memory, quota)?;
+        match Registering::dmabuf(state.device.clone(), memory, quota, wake) {
+            Ok(registering) => {
+                self.attaching.push(Attaching {
+                    rail,
+                    id,
+                    registering: Some(registering),
+                    done,
+                });
+                Ok(())
+            }
+            Err(error) => Err((error, done)),
+        }
+    }
+
+    /// Finish registrations that completed off this thread: build the
+    /// activation's pools once all of them are in, and attach device pools.
+    fn advance_registrations(&mut self) {
+        if self.activating.is_none() && self.attaching.is_empty() {
+            return;
+        }
+
+        #[cfg(any(test, feature = "simulation"))]
+        let _simulation = self
+            .simulation
+            .as_ref()
+            .map(crate::simulation::Simulation::enter);
+        self.advance_activation();
+
+        let mut index = 0;
+
+        while index < self.attaching.len() {
+            if !self.attaching[index]
+                .registering
+                .as_ref()
+                .is_some_and(Registering::ready)
+            {
+                index += 1;
+                continue;
+            }
+
+            let mut attaching = self.attaching.swap_remove(index);
+            let region = attaching.registering.take().expect("ready").finish();
+            let result =
+                region.and_then(|region| self.attach_region(attaching.rail, attaching.id, region));
+            let _ = attaching.done.complete(result);
+        }
+    }
+
+    /// Attach a registered dma-buf region as `rail`'s device pool `id`.
+    fn attach_region(&mut self, rail: u16, id: u32, region: Rc<NativeRegion>) -> Result<usize> {
+        if self.closing {
+            return Err(Error::Unavailable);
+        }
+
+        let state = self.devices.get_mut(&rail).ok_or(Error::Unavailable)?;
         state.pool.attach_device(id, region)?;
         // The driver waker reaches the device pool on its next registration.
         let shared = state.pool.device_shared(id).expect("just attached").clone();
@@ -831,8 +1694,146 @@ impl Owner {
         Ok(count)
     }
 
-    fn activate(&mut self, config: NodeConfig) -> Result<Vec<Selection>> {
-        if self.settings.is_some() || !self.devices.is_empty() {
+    /// Complete the activation once every page pool registration is done.
+    fn advance_activation(&mut self) {
+        let Some(activation) = &mut self.activating else {
+            return;
+        };
+        let mut pending = false;
+
+        for device in &mut activation.devices {
+            match device.implicit_registering.as_ref().map(Registering::ready) {
+                Some(true) => {
+                    let registering = device.implicit_registering.take().expect("ready");
+                    device.implicit = Some(registering.finish());
+                }
+                Some(false) => pending = true,
+                None => {}
+            }
+            match device.registering.as_ref().map(Registering::ready) {
+                Some(true) => {
+                    device.region = Some(device.registering.take().expect("ready").finish());
+                }
+                Some(false) => pending = true,
+                None => {}
+            }
+        }
+
+        if pending {
+            return;
+        }
+
+        let activation = self.activating.take().expect("checked");
+        let result = self.install(
+            activation.devices,
+            activation.buffer_len,
+            activation.settings,
+        );
+        self.dirty = true;
+
+        match result {
+            Ok(()) => {
+                let _ = activation.done.complete(Ok(activation.selected));
+            }
+            Err(error) => {
+                eprintln!("racer: stage=rdma-activation step=install error={error:?}");
+                self.abandon_activation();
+                let _ = activation.done.complete(Err(error));
+            }
+        }
+    }
+
+    /// Build the pools of a fully registered activation and serve them.
+    fn install(
+        &mut self,
+        devices: Vec<PendingDevice>,
+        buffer_len: usize,
+        settings: Settings,
+    ) -> Result<()> {
+        if self.closing {
+            return Err(Error::Unavailable);
+        }
+
+        let quota = self.quota.clone().ok_or(Error::Unavailable)?;
+        let mut built = BTreeMap::new();
+
+        for pending in devices {
+            let region = pending.region.ok_or(Error::Unavailable)??;
+            let implicit = pending.implicit.ok_or(Error::Unavailable)??;
+            let pool = Pool::new(region, implicit, buffer_len, quota.clone())?;
+            built.insert(
+                pending.tag,
+                DeviceState {
+                    pool,
+                    device: pending.device,
+                },
+            );
+        }
+
+        {
+            let mut pools = self
+                .shared
+                .pools
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
+            pools.clear();
+            pools.extend(
+                built
+                    .iter()
+                    .map(|(rail, d)| (*rail, d.pool.shared().clone())),
+            );
+        }
+
+        {
+            let mut prefetch = self
+                .shared
+                .prefetch
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
+            prefetch.clear();
+            prefetch.extend(
+                built
+                    .iter()
+                    .filter(|(_, d)| d.device.mode == ffi::Mode::Window)
+                    .filter_map(|(rail, d)| Some((*rail, d.pool.implicit().prefetcher()?))),
+            );
+        }
+
+        self.devices = built;
+        self.settings = Some(settings);
+        Ok(())
+    }
+
+    /// Discover, select, and start registering one page pool per selected
+    /// device off this thread. `done` completes once they are registered
+    /// (see [`Self::advance_activation`]); on an early error it completes
+    /// here and the error is returned.
+    fn activate(&mut self, config: NodeConfig, done: Completer<Vec<Selection>>) -> Result<()> {
+        match self.start_activation(config) {
+            Ok((selected, devices, buffer_len, settings)) => {
+                self.activating = Some(Activation {
+                    selected,
+                    devices,
+                    buffer_len,
+                    settings,
+                    done,
+                });
+                Ok(())
+            }
+            Err(error) => {
+                eprintln!("racer: stage=rdma-activation step=start error={error:?}");
+                let _ = done.complete(Err(error));
+                Err(error)
+            }
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn start_activation(
+        &mut self,
+        config: NodeConfig,
+    ) -> Result<(Vec<Selection>, Vec<PendingDevice>, usize, Settings)> {
+        if self.settings.is_some() || !self.devices.is_empty() || self.activating.is_some() {
             return Err(Error::InvalidRequest);
         }
 
@@ -855,7 +1856,9 @@ impl Owner {
             .map(crate::simulation::Simulation::enter);
         let quota = GuardOwner::new(config.guard);
         self.quota = Some(quota.clone());
-        let discovered = ffi::discover_with_quota(|| Some(quota.clone()))?;
+        let discovered = ffi::discover_with_quota(|| Some(quota.clone())).inspect_err(|error| {
+            eprintln!("racer: stage=rdma-activation step=discover error={error:?}");
+        })?;
         let ports: Vec<PortInfo> = discovered
             .iter()
             .map(|d| PortInfo {
@@ -865,7 +1868,15 @@ impl Owner {
                 numa_node: d.numa_node(),
             })
             .collect();
-        let plan = (config.selector)(&ports)?;
+        let plan = (config.selector)(&ports).inspect_err(|error| {
+            eprintln!(
+                "racer: stage=rdma-activation step=select error={error:?} ports={:?}",
+                ports
+                    .iter()
+                    .map(|p| (&p.device, p.port, std::net::Ipv6Addr::from(p.gid)))
+                    .collect::<Vec<_>>()
+            );
+        })?;
         let mut selected = Vec::new();
 
         for (rail, index) in plan {
@@ -886,7 +1897,7 @@ impl Owner {
 
         let mut devices: Vec<Option<NativeDevice>> = discovered.into_iter().map(Some).collect();
         let count = config.pool_bytes / config.buffer_len;
-        let mut built = BTreeMap::new();
+        let mut pending = Vec::new();
 
         for selection in &selected {
             let device = Rc::new(
@@ -894,55 +1905,104 @@ impl Owner {
                     .take()
                     .ok_or(Error::InvalidConfiguration)?,
             );
+            // Registration-mode grants round up to whole 2 MiB pages within
+            // their buffer, so buffers must be whole pages.
+            if device.mode == ffi::Mode::Registration
+                && !(config.buffer_len as u64).is_multiple_of(ffi::HUGE)
+            {
+                return Err(Error::InvalidConfiguration);
+            }
             // Writes read caller memory in place; there is no copy path.
-            // Probe implicit ODP first so an unsupported device fails before
-            // the receive pool is allocated and registered.
-            let implicit =
-                NativeRegion::implicit(device.clone(), quota.clone()).ok_or(Error::Unavailable)?;
-            let region = NativeRegion::with_access(
-                device.clone(),
+            // Check implicit ODP support first (window mode) so an
+            // unsupported device fails before anything slow starts.
+            let implicit = match device.mode {
+                ffi::Mode::Registration => Some(Ok(NativeRegion::implicit(
+                    device.clone(),
+                    quota.clone(),
+                )
+                .ok_or_else(|| {
+                    eprintln!(
+                        "racer: stage=rdma-activation step=implicit-region error=Unavailable"
+                    );
+                    Error::Unavailable
+                })?)),
+                ffi::Mode::Window if !device.supports_implicit() => {
+                    eprintln!("racer: stage=rdma-activation step=implicit-odp error=Unavailable");
+                    return Err(Error::Unavailable);
+                }
+                ffi::Mode::Window => None,
+            };
+            pending.push(PendingDevice {
+                tag: selection.tag as u16,
+                registering: None,
+                region: None,
+                implicit_registering: None,
+                implicit,
+                device,
+            });
+        }
+
+        // Each link's QP and CQ must fit every selected device's limits, or
+        // QP creation fails on every link. The setup exchange takes
+        // min(local, peer), so capping the local value suffices.
+        let mut grants = config.grants_per_link;
+        for device in &pending {
+            grants = grants.min(device.device.max_grants().ok_or_else(|| {
+                eprintln!("racer: stage=rdma-activation step=device-limits error=Unavailable");
+                Error::Unavailable
+            })?);
+        }
+
+        // Every check passed: start the slow registrations, each on its own
+        // helper thread, so the devices proceed in parallel. Creating an
+        // implicit ODP region alone takes over a second per mlx5 device.
+        let wake = self.register_wake();
+
+        for device in &mut pending {
+            if device.implicit.is_none() {
+                device.implicit_registering =
+                    ffi::Registering::implicit(device.device.clone(), quota.clone(), wake.clone())?;
+            }
+            device.registering = Some(Registering::host(
+                device.device.clone(),
                 count * config.buffer_len,
                 Access::PAGES,
                 quota.clone(),
-            )?;
-            let pool = Pool::new(region, implicit, config.buffer_len, quota.clone())?;
-            built.insert(selection.tag as u16, DeviceState { pool, device });
+                wake.clone(),
+            )?);
         }
 
-        {
-            let mut pools = self
-                .shared
-                .pools
-                .write()
-                .unwrap_or_else(PoisonError::into_inner);
-            pools.clear();
-            pools.extend(
-                built
-                    .iter()
-                    .map(|(rail, d)| (*rail, d.pool.shared().clone())),
-            );
-        }
-
-        self.devices = built;
-        self.settings = Some(Settings {
+        let settings = Settings {
             limits: Limits {
-                grants: config.grants_per_link,
+                grants,
                 buffer_len,
                 idle: config.idle,
             },
             max_links: config.max_links,
-        });
-        Ok(selected)
+        };
+        Ok((selected, pending, config.buffer_len, settings))
     }
 
     /// A new link on `key.rail`, if the rail exists and has room.
+    ///
+    /// Live and dying links are counted separately, each against
+    /// `max_links`: a link for `key` that the new one replaces does not count
+    /// as live, so a replacement on a full rail is admitted, and dying links
+    /// (whose QPs still exist until destroyed) cannot crowd out live ones.
     fn create(&mut self, key: LinkKey, role: Role, now: Instant) -> Result<Link> {
         let settings = self.settings.ok_or(Error::Unavailable)?;
+        if self.lost.contains(&key.rail) {
+            return Err(Error::Unavailable);
+        }
         let device = self.devices.get(&key.rail).ok_or(Error::Unavailable)?;
-        let used = self.links.keys().filter(|k| k.rail == key.rail).count()
-            + self.dying.iter().filter(|d| d.key.rail == key.rail).count();
+        let live = self
+            .links
+            .keys()
+            .filter(|k| k.rail == key.rail && **k != key)
+            .count();
+        let dying = self.dying.iter().filter(|d| d.key.rail == key.rail).count();
 
-        if used >= settings.max_links {
+        if live >= settings.max_links || dying >= settings.max_links {
             return Err(Error::Overloaded);
         }
 
@@ -950,7 +2010,15 @@ impl Owner {
         self.next_epoch += 1;
         let quota = self.quota.as_ref().ok_or(Error::Unavailable)?;
 
-        Link::new(epoch, role, &device.device, quota, settings.limits, now)
+        Link::new(
+            epoch,
+            role,
+            &device.device,
+            quota,
+            settings.limits,
+            now,
+            &self.ctx.rng,
+        )
     }
 
     fn open(&mut self, key: LinkKey, now: Instant) -> Result<Opened> {
@@ -961,7 +2029,16 @@ impl Owner {
             return Err(Error::Overloaded);
         }
 
-        let link = self.create(key, Role::Initiator, now)?;
+        let link = match self.create(key, Role::Initiator, now) {
+            Ok(link) => link,
+            Err(error) => {
+                // A missing rail is not a failure of this link.
+                if error != Error::Unavailable {
+                    self.back_off(key, false, now);
+                }
+                return Err(error);
+            }
+        };
         let opened = opened(&link);
         self.links.insert(key, link);
         self.dirty = true;
@@ -980,27 +2057,40 @@ impl Owner {
             return Err(Error::InvalidRequest);
         }
 
-        // An authenticated setup replaces whatever we had.
-        if let Some(old) = self.links.remove(&key) {
-            self.dying.push(Dying { key, link: old });
-            self.dirty = true;
-        }
-
         let role = if initiator {
             Role::Initiator
         } else {
             Role::Responder
         };
-        let mut link = self.create(key, role, now)?;
-        link.connect(
+        // Build the replacement before retiring the old link, so a refused
+        // or failed setup leaves the current link in place.
+        let mut link = match self.create(key, role, now) {
+            Ok(link) => link,
+            Err(error) => {
+                // A missing rail is not a failure of this link.
+                if error != Error::Unavailable {
+                    self.back_off(key, false, now);
+                }
+                return Err(error);
+            }
+        };
+        if let Err(error) = link.connect(
             remote.endpoint,
             remote.recv_credits,
             remote.grants_per_link,
             link_id,
             now,
-        )?;
+        ) {
+            self.dying.push(Dying { key, link });
+            self.back_off(key, false, now);
+            self.dirty = true;
+            return Err(error);
+        }
         let opened = opened(&link);
-        self.links.insert(key, link);
+        // An authenticated setup replaces whatever we had.
+        if let Some(old) = self.links.insert(key, link) {
+            self.dying.push(Dying { key, link: old });
+        }
         self.dirty = true;
         Ok(opened)
     }
@@ -1039,41 +2129,52 @@ impl Owner {
         result
     }
 
-    fn break_matching(&mut self, key: LinkKey, epoch: Epoch, now: Instant) {
+    fn break_matching(&mut self, key: LinkKey, epoch: Epoch, declined: bool, now: Instant) {
         if self
             .links
             .get(&key)
             .is_some_and(|link| link.epoch() == epoch)
         {
-            self.break_link(key, Break::Error, now);
+            let reason = if declined {
+                BreakReason::Declined
+            } else {
+                BreakReason::Abandoned
+            };
+            self.break_for(key, reason, now);
         }
     }
 
     /// Move `key`'s link to the dying list and record what comes next.
     fn break_link(&mut self, key: LinkKey, reason: Break, now: Instant) {
+        self.break_for(key, BreakReason::of(reason), now);
+    }
+
+    /// Count `reason` in the shared break counters.
+    fn count_break(&self, reason: BreakReason) {
+        self.shared.break_counts[reason as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn break_for(&mut self, key: LinkKey, reason: BreakReason, now: Instant) {
         let Some(link) = self.links.remove(&key) else {
             return;
         };
 
+        self.count_break(reason);
+
         match reason {
-            Break::PeerClosed | Break::Closed => {
+            BreakReason::PeerClosed
+            | BreakReason::Closed
+            | BreakReason::GrantExpired
+            | BreakReason::DeviceLost => {
                 self.backoff.remove(&key);
             }
-            Break::Error | Break::Timeout => {
+            // Benign: retry soon, and forget any escalation.
+            BreakReason::Declined => self.back_off(key, true, now),
+            BreakReason::Error | BreakReason::Timeout | BreakReason::Abandoned => {
                 let reset = link
                     .ready_since()
                     .is_some_and(|since| now.saturating_duration_since(since) >= BACKOFF_RESET);
-                let delay = match self.backoff.get(&key) {
-                    Some(previous) if !reset => (previous.delay * 2).min(BACKOFF_MAX),
-                    _ => BACKOFF_MIN,
-                };
-                self.backoff.insert(
-                    key,
-                    Backoff {
-                        until: now + jitter(delay),
-                        delay,
-                    },
-                );
+                self.back_off(key, reset, now);
             }
         }
 
@@ -1081,8 +2182,77 @@ impl Owner {
         self.dirty = true;
     }
 
+    /// Back `key` off after a failure: double the previous delay unless
+    /// `reset`, starting from `BACKOFF_MIN`.
+    fn back_off(&mut self, key: LinkKey, reset: bool, now: Instant) {
+        let delay = match self.backoff.get(&key) {
+            Some(previous) if !reset => (previous.delay * 2).min(BACKOFF_MAX),
+            _ => BACKOFF_MIN,
+        };
+        self.backoff.insert(
+            key,
+            Backoff {
+                until: now + jitter(delay, &self.ctx.rng),
+                delay,
+            },
+        );
+        self.dirty = true;
+    }
+
+    /// Close links whose keys are not in `keep`, without backoff.
+    fn retain_links(&mut self, keep: &std::collections::BTreeSet<LinkKey>, now: Instant) {
+        let gone: Vec<LinkKey> = self
+            .links
+            .keys()
+            .filter(|key| !keep.contains(key))
+            .copied()
+            .collect();
+
+        for key in gone {
+            self.backoff.remove(&key);
+            let link = self.links.get_mut(&key).unwrap();
+
+            if link.phase() == Phase::Ready {
+                link.close(now, link::CLOSE_GRACE);
+            } else if !matches!(link.phase(), Phase::Closing { .. }) {
+                self.break_link(key, Break::Closed, now);
+            }
+        }
+
+        self.dirty = true;
+    }
+
     /// Poll every live link and break the failed ones.
     fn progress(&mut self, now: Instant) {
+        // Completion channel and connection manager events first: the
+        // links below re-arm and poll their CQs.
+        // Each device pass lets links skip CQs that raised no event.
+        for device in self.devices.values() {
+            device.device.begin_pass();
+        }
+
+        // A removed device fails its links' QPs too: break them as lost
+        // before polling turns that into an error break with a backoff.
+        let reported = std::mem::take(
+            &mut *self
+                .shared
+                .reported_lost
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+        let removed: Vec<u16> = self
+            .devices
+            .iter()
+            .filter(|(rail, device)| {
+                (device.device.removed() || reported.contains(rail)) && !self.lost.contains(rail)
+            })
+            .map(|(rail, _)| *rail)
+            .collect();
+
+        for rail in removed {
+            self.lose_device(rail, now);
+        }
+
         let mut broken = Vec::new();
 
         for (key, link) in &mut self.links {
@@ -1092,16 +2262,52 @@ impl Owner {
 
             let phase = link.phase();
 
-            if let Err(reason) = link.poll(&device.pool, now) {
+            let polled = link.poll(&device.pool, now);
+
+            if link.take_grant_expired() {
+                self.shared.break_counts[BreakReason::GrantExpired as usize]
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+
+            if let Err(reason) = polled {
                 broken.push((*key, reason));
             } else if link.phase() != phase {
                 self.dirty = true;
             }
         }
 
+        for device in self.devices.values() {
+            device.device.end_pass();
+        }
+
         for (key, reason) in broken {
             self.break_link(key, reason, now);
         }
+    }
+
+    /// `rail`'s device is gone: break every link on it at once (a `Close`
+    /// could never be sent), fail their ops so callers fall back without
+    /// waiting for deadlines, and refuse new links until the round closes.
+    fn lose_device(&mut self, rail: u16, now: Instant) {
+        if !self.lost.insert(rail) {
+            return;
+        }
+        self.shared.device_losses.fetch_add(1, Ordering::Relaxed);
+        self.shared
+            .lost
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(rail);
+        let keys: Vec<LinkKey> = self
+            .links
+            .keys()
+            .filter(|key| key.rail == rail)
+            .copied()
+            .collect();
+        for key in keys {
+            self.break_for(key, BreakReason::DeviceLost, now);
+        }
+        self.dirty = true;
     }
 
     /// Destroy dying links; keep the ones whose destroy failed for a retry.
@@ -1139,47 +2345,113 @@ impl Owner {
     }
 
     /// Free pools and devices once nothing uses them, then mark drained.
+    ///
+    /// A round that lost a device does not wait for received pages that
+    /// higher layers still hold, nor for buffers its gone device leaked: no
+    /// NIC can reach that memory any more. Those pools move to
+    /// [`Self::retired`] and are freed once idle, so the caller can
+    /// reactivate as soon as the device is back instead of waiting on
+    /// pages it may hold for as long as it likes.
     fn finish_shutdown(&mut self) {
-        if self.shared.drained.load(Ordering::Acquire)
-            || !self.links.is_empty()
-            || !self.dying.is_empty()
-        {
+        if self.shared.drained.load(Ordering::Acquire) {
+            return;
+        }
+
+        if self.activating.is_some() || !self.attaching.is_empty() {
+            self.block(DrainBlocker::Registering);
+            return;
+        }
+
+        if !self.links.is_empty() || !self.dying.is_empty() {
+            self.block(DrainBlocker::Links);
             return;
         }
 
         // Clients read receive-pool state through these; withdraw them before
         // checking that every device pool is idle.
-        match self.shared.pools.try_write() {
-            Ok(mut pools) => pools.clear(),
-            Err(_) => return,
-        }
+        // Readers hold these locks only to count buffers.
+        self.shared
+            .pools
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+        self.shared
+            .device_pools
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+        // Before any implicit region can drop.
+        self.shared
+            .prefetch
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
 
-        match self.shared.device_pools.try_write() {
-            Ok(mut pools) => pools.clear(),
-            Err(_) => return,
-        }
+        let lost_round = !self.lost.is_empty();
 
-        if self.devices.values().any(|d| !d.pool.idle()) {
+        // A pool may stop the drain only while it is in use, and a lost
+        // round retires the pools no NIC can reach any more.
+        let blocked = |rail: &u16, d: &DeviceState| {
+            if d.pool.idle() {
+                return false;
+            }
+            let retire = lost_round
+                && retirable(&d.pool, self.lost.contains(rail))
+                && d.device.stop_listening();
+            !retire
+        };
+
+        if self.devices.iter().any(|(rail, d)| blocked(rail, d)) {
+            self.block(DrainBlocker::Buffers);
             return;
         }
 
-        self.devices.clear();
+        for (_, device) in std::mem::take(&mut self.devices) {
+            if !device.pool.idle() {
+                self.retired.push(device);
+            }
+        }
+
         self.backoff.clear();
+        self.lost.clear();
+        self.shared
+            .lost
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+
+        // Retired pools still hold the charge: they release it once idle.
+        let retired = !self.retired.is_empty();
 
         if self
             .quota
             .take()
-            .is_some_and(|q| q.quarantined() || Arc::strong_count(&q) != 1)
+            .is_some_and(|q| q.quarantined() || (!retired && Arc::strong_count(&q) != 1))
+            && !lost_round
         {
-            // A native object leaked against the charge: never drained.
+            // A native object leaked against the charge: never drained. A
+            // lost device's objects cannot be freed at all; its charge stays
+            // quarantined, but the device's return may start a new round.
             self.leaked = true;
         }
 
         if self.leaked {
+            self.block(DrainBlocker::Leaked);
             return;
         }
 
+        self.shared.blocker.store(0, Ordering::Release);
         self.shared.drained.store(true, Ordering::Release);
+    }
+
+    /// Record why the closed round has not drained yet.
+    fn block(&self, blocker: DrainBlocker) {
+        self.shared.blocker.store(blocker.code(), Ordering::Release);
+    }
+
+    /// Free retired pools whose pages have all returned.
+    fn reap_retired(&mut self) {
+        self.retired.retain(|device| !device.pool.idle());
     }
 
     /// Publish the link snapshot if anything changed or a backoff expired.
@@ -1192,11 +2464,7 @@ impl Owner {
             return;
         }
 
-        let Ok(mut links) = self.shared.links.try_write() else {
-            return;
-        };
-
-        links.clear();
+        let mut links = LinkMap::new();
         self.expiry = None;
 
         for (key, backoff) in &self.backoff {
@@ -1225,6 +2493,7 @@ impl Owner {
             links.insert(*key, state);
         }
 
+        self.shared.links.store(links);
         self.dirty = false;
     }
 }
@@ -1233,7 +2502,6 @@ impl Drop for Owner {
     /// Fail every op, destroy every link (leaking what cannot be
     /// destroyed), and leak pools that are still in use.
     fn drop(&mut self) {
-        let _environment = self.environment.enter();
         self.shared.alive.store(false, Ordering::Release);
         self.shared.closed.store(true, Ordering::Release);
         let keys: Vec<LinkKey> = self.links.keys().copied().collect();
@@ -1252,11 +2520,7 @@ impl Drop for Owner {
             }
         }
 
-        self.shared
-            .links
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clear();
+        self.shared.links.store(LinkMap::new());
         self.shared
             .pools
             .write()
@@ -1267,9 +2531,29 @@ impl Drop for Owner {
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
+        // Before any implicit region can drop.
+        self.shared
+            .prefetch
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
         // Pools leak their regions if pages are still held (see `pool.rs`).
         self.devices.clear();
     }
+}
+
+/// Whether a lost round may stop waiting for `pool`: the NIC can no longer
+/// touch it, either because only received pages hold its buffers or
+/// because its device (`lost`) is gone.
+fn retirable(pool: &Pool, lost: bool) -> bool {
+    lost || pool.nic_quiet()
+}
+
+/// True when an owner with `pending` work has neither a timer (`wake`) nor
+/// an `external` wake source for it.
+#[cfg(any(test, feature = "simulation"))]
+fn missing_wake(pending: bool, wake: Option<Instant>, external: bool) -> bool {
+    pending && wake.is_none() && !external
 }
 
 /// Fail `command`'s op with `error`.
@@ -1298,34 +2582,16 @@ fn opened(link: &Link) -> Opened {
 }
 
 /// `delay` plus or minus up to 20 %.
-fn jitter(delay: Duration) -> Duration {
+fn jitter(delay: Duration, rng: &racer_io::Rng) -> Duration {
     let mut bytes = [0u8; 2];
 
-    if uring_runtime::environment::fill_random(&mut bytes).is_err() {
+    if rng.fill(&mut bytes).is_err() {
         return delay;
     }
 
     // 0..=400 per mille, centered: 800..=1200.
     let per_mille = 800 + u64::from(u16::from_be_bytes(bytes)) % 401;
     delay * per_mille as u32 / 1000
-}
-
-impl crate::NativeHost for Owner {
-    fn register_driver(&self, waker: &Waker) {
-        Owner::register_driver(self, waker);
-    }
-
-    fn poll_budgeted(&mut self, budget: usize) -> Result<()> {
-        Owner::poll_budgeted(self, budget)
-    }
-
-    fn close(&self) {
-        Owner::close(self);
-    }
-
-    fn drained(&self) -> bool {
-        Owner::drained(self)
-    }
 }
 
 #[cfg(test)]
@@ -1336,12 +2602,23 @@ mod tests {
     /// Jitter stays within 20 % of the delay.
     fn jitter_is_bounded() {
         for _ in 0..100 {
-            let d = jitter(Duration::from_secs(10));
+            let d = jitter(Duration::from_secs(10), &racer_io::Rng::os());
             assert!(
                 d >= Duration::from_secs(8) && d <= Duration::from_secs(12),
                 "{d:?}"
             );
         }
+    }
+
+    #[test]
+    /// The wake check flags only pending work with no timer and no external
+    /// wake.
+    fn missing_wake_needs_pending_work_and_no_source() {
+        let now = Instant::now();
+        assert!(missing_wake(true, None, false));
+        assert!(!missing_wake(true, Some(now), false));
+        assert!(!missing_wake(true, None, true));
+        assert!(!missing_wake(false, None, false));
     }
 
     #[test]
@@ -1352,6 +2629,59 @@ mod tests {
         send::<OwnerPort>();
         send::<Source>();
         assert_eq!(node(0).err(), Some(Error::InvalidConfiguration));
+    }
+
+    #[test]
+    /// A reader racing a stream of publishes never sees a ready link as
+    /// `Idle`: every published table holds the link, and a read either
+    /// reuses its cached table or waits for the swap.
+    fn contended_snapshot_never_reads_idle() {
+        let (clients, port) = node(1).unwrap();
+        let key = LinkKey {
+            peer: [1; 32],
+            rail: 0,
+        };
+        let client = clients.into_iter().next().unwrap();
+        let ready = |n: u64| LinkState::Ready {
+            epoch: Epoch(n),
+            link_id: n,
+        };
+        port.shared.links.store(LinkMap::from([(key, ready(0))]));
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let mut reads = 0u64;
+                while !stop.load(Ordering::Acquire) || reads < 1000 {
+                    assert!(matches!(client.link(key), LinkState::Ready { .. }));
+                    reads += 1;
+                }
+                // A later read sees the last publish.
+                client.link(key)
+            })
+        };
+        for n in 1..=20_000 {
+            port.shared.links.store(LinkMap::from([(key, ready(n))]));
+        }
+        stop.store(true, Ordering::Release);
+        assert_eq!(reader.join().unwrap(), ready(20_000));
+    }
+
+    #[test]
+    /// A read reuses the cached table until the generation moves.
+    fn snapshot_read_tracks_generation() {
+        let (clients, port) = node(1).unwrap();
+        let key = LinkKey {
+            peer: [2; 32],
+            rail: 1,
+        };
+        assert_eq!(clients[0].link(key), LinkState::Idle);
+        port.shared
+            .links
+            .store(LinkMap::from([(key, LinkState::Breaking)]));
+        assert_eq!(clients[0].link(key), LinkState::Breaking);
+        port.shared.links.store(LinkMap::new());
+        assert_eq!(clients[0].link(key), LinkState::Idle);
     }
 
     #[test]
@@ -1376,7 +2706,7 @@ mod tests {
         for op in ops.drain(..) {
             assert_eq!(
                 op.poll(&mut cx).map(|r| r.err()),
-                Poll::Ready(Some(Error::Cancelled))
+                Poll::Ready(Some(Error::Canceled))
             );
         }
         assert_eq!(

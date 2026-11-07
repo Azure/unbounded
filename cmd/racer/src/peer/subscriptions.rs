@@ -13,8 +13,8 @@ use crate::model::ObjectMetadata;
 use crate::model::ObjectVersion;
 use crate::model::PageId;
 use crate::model::PageNumber;
-use racer_control_wire::MembershipVersion;
-use racer_control_wire::NodeId;
+use racer_wire::control::MembershipVersion;
+use racer_wire::control::NodeId;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -95,7 +95,7 @@ impl From<racer_core::subscriptions::Kind> for Error {
         use racer_core::subscriptions::Kind;
         match kind {
             Kind::DeadlineExceeded => Self::DeadlineExceeded,
-            Kind::Cancelled => Self::Cancelled,
+            Kind::Canceled => Self::Canceled,
             Kind::Overloaded => Self::Overloaded,
             Kind::Unavailable => Self::Unavailable,
             Kind::StaleFlight => Self::StaleFlight,
@@ -255,14 +255,14 @@ impl Subscriptions {
     ) -> Result<Selection> {
         use crate::peer::protocol::encode_deadline;
         use crate::peer::protocol::millis;
-        let now = || millis(uring_runtime::environment::wall_now());
+        let now = || millis(scope.clock().wall_now());
         scope.check()?;
         let object = subscription.version.object.clone();
         let key = self.admit(
             subscription,
             membership.version,
             receiver,
-            encode_deadline(scope.deadline)?,
+            encode_deadline(scope.clock(), scope.deadline)?,
             now()?,
         )?;
         // Free the flight slot on failure or cancellation. The sequence stays
@@ -295,7 +295,7 @@ impl Subscriptions {
                     // A ready/hot rank must not chain arbitrary endpoint work in
                     // one poll. Also separate the final cold quantum from the
                     // next rank, preserving the per-poll member hash bound.
-                    uring_runtime::drivers::yield_now().await;
+                    racer_io::exec::yield_now().await;
                 }
             }
         }
@@ -508,7 +508,7 @@ mod tests {
     use crate::model::ObjectId;
     use crate::model::StrongEtag;
     use flow_control::subscriptions::Interval;
-    use racer_control_wire::CacheId;
+    use racer_wire::control::CacheId;
     use std::rc::Rc;
 
     fn subscription(id: u8, start: u64, end: u64) -> Subscription {
@@ -827,9 +827,10 @@ mod tests {
                     )
                     .unwrap(),
                 PageEnvelope {
+                    page_size: racer_wire::object::PageSize::DEFAULT,
                     cipher: crate::model::PageCipher::Xaes256Gcm,
                     page: page.clone(),
-                    key_id: racer_control_wire::KeyId([1; 16]),
+                    key_id: racer_wire::control::KeyId([1; 16]),
                     nonce: Nonce([2; 24]),
                     plaintext_length: 3,
                     ciphertext_length: 19,
@@ -853,7 +854,10 @@ mod tests {
         let a = first.try_result(2).unwrap().unwrap();
         let b = second.try_result(2).unwrap().unwrap();
         assert_eq!(a.ciphertext.bytes().as_ptr(), b.ciphertext.bytes().as_ptr());
-        assert_eq!(admission.used(ResourceClass::Ciphertext), 19);
+        assert_eq!(
+            admission.used(ResourceClass::Ciphertext),
+            page_alloc::buf::GRANULE
+        );
         assert_eq!(a.grant.remaining_page_budget, 9);
         assert_eq!(b.grant.remaining_byte_budget, 1005);
         assert_ne!(a.grant.receiver, b.grant.receiver);
@@ -923,9 +927,10 @@ mod tests {
             )
             .unwrap();
         let envelope = PageEnvelope {
+            page_size: racer_wire::object::PageSize::DEFAULT,
             cipher: crate::model::PageCipher::Xaes256Gcm,
             page: page.clone(),
-            key_id: racer_control_wire::KeyId([1; 16]),
+            key_id: racer_wire::control::KeyId([1; 16]),
             nonce: Nonce([2; 24]),
             plaintext_length: 3,
             ciphertext_length: 19,
