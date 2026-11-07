@@ -225,15 +225,16 @@ impl DecryptInto {
         populate(destination)?;
         let key = &self.page.key;
         if start == 0 && end == length {
-            destination.copy_from_slice(body);
+            // Decrypt from the ciphertext copy straight into the mapping in
+            // one pass. A failed tag check zeroes the destination.
             return key
-                .open_in_place(&self.page.aad, destination, tag)
+                .open_into(&self.page.aad, body, tag, destination)
                 .map_err(|_| Error::CorruptRecord);
         }
-        // A partial page: authenticate the whole page in wiped scratch memory
-        // and copy out only the requested bytes.
-        let mut scratch = zeroize::Zeroizing::new(body.to_vec());
-        key.open_in_place(&self.page.aad, &mut scratch, tag)
+        // A partial page: authenticate the whole page into wiped scratch
+        // memory and copy out only the requested bytes.
+        let mut scratch = zeroize::Zeroizing::new(vec![0u8; length]);
+        key.open_into(&self.page.aad, body, tag, &mut scratch)
             .map_err(|_| Error::CorruptRecord)?;
         destination.copy_from_slice(&scratch[start..end]);
         Ok(())

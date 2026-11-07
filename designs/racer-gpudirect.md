@@ -125,7 +125,8 @@ the client's file only when the file is a tmpfs memfd sealed with
 `F_SEAL_SHRINK`, open read-write, and long enough for the window, so a client
 cannot truncate it under the mapping and crash the dataplane. Then pages that
 are not plaintext in dataplane memory arrive sealed, as for `gpu-read`, and a
-crypto worker copies the ciphertext into the mapping and decrypts it in place
+crypto worker decrypts the ciphertext straight into the mapping in one pass
+with an out-of-place AES-256-GCM open, zeroing the bytes if the tag check fails
 (`cmd/racer/src/client/direct/host_map.rs`).
 
 ### Fallback
