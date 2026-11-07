@@ -881,6 +881,10 @@ fn discover_with_api(
             return Err(Error::Unavailable);
         }
         let Some(raw) = NonNull::new(raw) else {
+            eprintln!(
+                "racer: stage=rdma-discover device={name} port={} skipped=open_failed mode={mode:?}",
+                port.port
+            );
             continue;
         };
         // From here dropping `device` releases whatever was set up.

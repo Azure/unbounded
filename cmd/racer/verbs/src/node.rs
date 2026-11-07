@@ -1220,6 +1220,11 @@ impl Owner {
 
     fn handle(&mut self, command: Command, now: Instant) {
         if self.closing {
+            if matches!(command, Command::Activate(..)) {
+                eprintln!(
+                    "racer: stage=rdma-activation step=owner error=Unavailable reason=closing"
+                );
+            }
             // Dropping the command fails its op with `Canceled`; say why.
             fail(command, Error::Unavailable);
             return;
@@ -1641,6 +1646,7 @@ impl Owner {
                 let _ = activation.done.complete(Ok(activation.selected));
             }
             Err(error) => {
+                eprintln!("racer: stage=rdma-activation step=install error={error:?}");
                 self.abandon_activation();
                 let _ = activation.done.complete(Err(error));
             }
@@ -1725,6 +1731,7 @@ impl Owner {
                 Ok(())
             }
             Err(error) => {
+                eprintln!("racer: stage=rdma-activation step=start error={error:?}");
                 let _ = done.complete(Err(error));
                 Err(error)
             }
@@ -1759,7 +1766,9 @@ impl Owner {
             .map(crate::simulation::Simulation::enter);
         let quota = GuardOwner::new(config.guard);
         self.quota = Some(quota.clone());
-        let discovered = ffi::discover_with_quota(|| Some(quota.clone()))?;
+        let discovered = ffi::discover_with_quota(|| Some(quota.clone())).inspect_err(|error| {
+            eprintln!("racer: stage=rdma-activation step=discover error={error:?}");
+        })?;
         let ports: Vec<PortInfo> = discovered
             .iter()
             .map(|d| PortInfo {
@@ -1769,7 +1778,15 @@ impl Owner {
                 numa_node: d.numa_node(),
             })
             .collect();
-        let plan = (config.selector)(&ports)?;
+        let plan = (config.selector)(&ports).inspect_err(|error| {
+            eprintln!(
+                "racer: stage=rdma-activation step=select error={error:?} ports={:?}",
+                ports
+                    .iter()
+                    .map(|p| (&p.device, p.port, std::net::Ipv6Addr::from(p.gid)))
+                    .collect::<Vec<_>>()
+            );
+        })?;
         let mut selected = Vec::new();
 
         for (rail, index) in plan {
@@ -1809,11 +1826,18 @@ impl Owner {
             // Check implicit ODP support first (window mode) so an
             // unsupported device fails before anything slow starts.
             let implicit = match device.mode {
-                ffi::Mode::Registration => {
-                    Some(Ok(NativeRegion::implicit(device.clone(), quota.clone())
-                        .ok_or(Error::Unavailable)?))
-                }
+                ffi::Mode::Registration => Some(Ok(NativeRegion::implicit(
+                    device.clone(),
+                    quota.clone(),
+                )
+                .ok_or_else(|| {
+                    eprintln!(
+                        "racer: stage=rdma-activation step=implicit-region error=Unavailable"
+                    );
+                    Error::Unavailable
+                })?)),
                 ffi::Mode::Window if !device.supports_implicit() => {
+                    eprintln!("racer: stage=rdma-activation step=implicit-odp error=Unavailable");
                     return Err(Error::Unavailable);
                 }
                 ffi::Mode::Window => None,
@@ -1833,7 +1857,10 @@ impl Owner {
         // min(local, peer), so capping the local value suffices.
         let mut grants = config.grants_per_link;
         for device in &pending {
-            grants = grants.min(device.device.max_grants().ok_or(Error::Unavailable)?);
+            grants = grants.min(device.device.max_grants().ok_or_else(|| {
+                eprintln!("racer: stage=rdma-activation step=device-limits error=Unavailable");
+                Error::Unavailable
+            })?);
         }
 
         // Every check passed: start the slow registrations, each on its own

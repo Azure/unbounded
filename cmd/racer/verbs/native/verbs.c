@@ -23,6 +23,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
@@ -197,7 +198,11 @@ int rdma_verbs_discover(struct rdma_verbs_port *out, uint32_t capacity) {
     if (!list) return -errno;
     for (int i = 0; i < n; ++i) {
         struct ibv_context *ctx = ibv_open_device(list[i]);
-        if (!ctx) continue;
+        if (!ctx) {
+            fprintf(stderr, "racer: stage=rdma-discover device=%s skipped=open errno=%d\n",
+                    ibv_get_device_name(list[i]), errno);
+            continue;
+        }
         struct ibv_device_attr attr;
         uint32_t flags = 0;
         if (!ibv_query_device(ctx, &attr)) {
@@ -216,7 +221,11 @@ int rdma_verbs_discover(struct rdma_verbs_port *out, uint32_t capacity) {
             union ibv_gid gid, ipv4;
             memset(&ipv4, 0, sizeof(ipv4));
             if (ibv_query_port(ctx, p, &port) || port.state != IBV_PORT_ACTIVE) continue;
-            if (ibv_query_gid(ctx, p, 0, &gid)) continue;
+            if (ibv_query_gid(ctx, p, 0, &gid)) {
+                fprintf(stderr, "racer: stage=rdma-discover device=%s port=%u skipped=gid errno=%d\n",
+                        ibv_get_device_name(list[i]), p, errno);
+                continue;
+            }
             int index = ipv4_gid_index(ctx, p, port.gid_tbl_len, &ipv4);
             if ((uint32_t)count < capacity) {
                 struct rdma_verbs_port *v = &out[count];
@@ -251,7 +260,10 @@ void *rdma_verbs_open(const char *name, int cm) {
     if (cm) {
         int m = 0;
         struct ibv_context **list = rdma_get_devices(&m);
-        if (!list) return NULL;
+        if (!list) {
+            fprintf(stderr, "racer: stage=rdma-open device=%s cm=1 step=get_devices errno=%d\n", name, errno);
+            return NULL;
+        }
         for (int i = 0; i < m; ++i) {
             if (strcmp(name, ibv_get_device_name(list[i]->device))) continue;
             struct rdma_verbs_device *d = calloc(1, sizeof(*d));
@@ -259,9 +271,12 @@ void *rdma_verbs_open(const char *name, int cm) {
             d->ctx = list[i]; d->cm_list = list;
             d->pd = ibv_alloc_pd(d->ctx);
             if (d->pd) return d;
+            fprintf(stderr, "racer: stage=rdma-open device=%s cm=1 step=alloc_pd errno=%d\n", name, errno);
             free(d);
-            break;
+            rdma_free_devices(list);
+            return NULL;
         }
+        fprintf(stderr, "racer: stage=rdma-open device=%s cm=1 step=lookup devices=%d\n", name, m);
         rdma_free_devices(list);
         return NULL;
     }
