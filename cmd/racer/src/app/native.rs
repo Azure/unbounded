@@ -306,7 +306,16 @@ impl WorkerApplication {
                 }
                 Ok(_) => {}
             }
-            self.native_retry = self.ctx().now() + activation_retry_delay(self.native_failures);
+            // After a device loss, attempts are bounded by
+            // `REACTIVATION_ATTEMPTS`, so they retry at the probe interval
+            // rather than backing off: a process that cannot reopen the
+            // device then restarts within seconds, not minutes.
+            let delay = if self.rdma_lost.is_some() {
+                RAIL_PROBE
+            } else {
+                activation_retry_delay(self.native_failures)
+            };
+            self.native_retry = self.ctx().now() + delay;
         }
         self.actual_rails = links.active();
         if self.native_owner() {
@@ -670,7 +679,8 @@ impl WorkerApplication {
     }
 
     /// What reactivation after a device loss waits for, or `None` once it
-    /// may start: `device_missing:<name>`, `device_settling`, `drain_<blocker>`
+    /// may start: `device_missing:<name>`, `device_inactive:<name>`,
+    /// `device_settling`, `drain_<blocker>`
     /// (see [`rdma_verbs::DrainBlocker`]), `inventory_refresh:<error>`, or
     /// `device_undiscovered`.
     ///
@@ -695,7 +705,17 @@ impl WorkerApplication {
                     return Some(format!("device_missing:{device}"));
                 }
             }
-            names.push(crate::rdma::rail_devices(&self.rdma_sysfs, key));
+            let at = crate::rdma::rail_devices(&self.rdma_sysfs, key);
+            if !at.is_empty()
+                && !at
+                    .iter()
+                    .any(|name| crate::rdma::device_active(&self.rdma_sysfs, name))
+            {
+                // Back, but no port is up yet: not an attempt.
+                self.rdma_settle = None;
+                return Some(format!("device_inactive:{device}"));
+            }
+            names.push(at);
         }
         let now = self.ctx().now();
         match &self.rdma_settle {

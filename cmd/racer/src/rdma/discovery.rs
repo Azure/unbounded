@@ -377,6 +377,21 @@ pub fn rail_devices(root: &Path, key: &str) -> Vec<String> {
     names
 }
 
+/// Whether sysfs under `root` shows any port of `device` ACTIVE. Tests
+/// whose tree has no `ports` directory count as active.
+pub fn device_active(root: &Path, device: &str) -> bool {
+    if !valid_device(device) {
+        return false;
+    }
+    let Ok(ports) = std::fs::read_dir(root.join(device).join("ports")) else {
+        return root.join(device).exists() && !root.join(device).join("ports").exists();
+    };
+    ports.filter_map(|port| port.ok()).any(|port| {
+        std::fs::read_to_string(port.path().join("state"))
+            .is_ok_and(|state| state.contains("ACTIVE"))
+    })
+}
+
 /// [`inventory`] with each port's PCI address, when sysfs reports one.
 fn keyed_inventory() -> Vec<(RailMapping, Option<String>)> {
     inventory_keyed_at(
@@ -711,6 +726,50 @@ mod tests {
     /// The sysfs probe tells a present device from one renamed at the same
     /// PCI address (a VF replug) and from a missing one, and a name key only
     /// checks the name.
+    fn rail_devices_list_every_name_at_an_address_and_port_state() {
+        use std::os::unix::fs::symlink;
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = Scratch(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("target")
+                .join(format!("rail-devices-{}", std::process::id())),
+        );
+        let root = dir.0.join("infiniband");
+        let pci = dir.0.join("7870:00:00.0");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&pci).unwrap();
+        let key = "pci:7870:00:00.0";
+        assert!(rail_devices(&root, key).is_empty());
+        assert!(rail_devices(&root, "mana_0").is_empty());
+        for name in ["roceP30832p0s0", "rdmaP30832p0s0"] {
+            std::fs::create_dir_all(root.join(name).join("ports").join("1")).unwrap();
+            symlink(&pci, root.join(name).join("device")).unwrap();
+        }
+        std::fs::create_dir_all(root.join("other")).unwrap();
+        assert_eq!(
+            rail_devices(&root, key),
+            vec!["rdmaP30832p0s0".to_owned(), "roceP30832p0s0".to_owned()]
+        );
+        assert_eq!(rail_devices(&root, "other"), vec!["other".to_owned()]);
+        assert!(rail_devices(&root, "pci:0000:01:00.0").is_empty());
+        // Ports exist but none is up yet.
+        let state = root.join("roceP30832p0s0/ports/1/state");
+        assert!(!device_active(&root, "roceP30832p0s0"));
+        std::fs::write(&state, "1: DOWN\n").unwrap();
+        assert!(!device_active(&root, "roceP30832p0s0"));
+        std::fs::write(&state, "4: ACTIVE\n").unwrap();
+        assert!(device_active(&root, "roceP30832p0s0"));
+        assert!(device_active(&root, "other"), "no ports directory");
+        assert!(!device_active(&root, "missing"));
+        assert!(!device_active(&root, "../escape"));
+    }
+
+    #[test]
     fn rail_presence_tracks_vf_unplug_and_rename() {
         use std::os::unix::fs::symlink;
         struct Scratch(std::path::PathBuf);
