@@ -32,7 +32,8 @@ resources:
     memory: 64Mi
 
 namespace:
-  # Render a Namespace object for the release namespace. Off for Helm and AKS
-  # cluster extension installs, which own the release namespace; on for the
-  # static `kubectl apply` manifests (values-static.yaml).
+  # Only `make unbounded-operator-manifests` sets this (values-static.yaml) to
+  # put a Namespace in the static `kubectl apply` manifests. The schema pins it
+  # to false for Helm and AKS extension installs: if a release owned the
+  # namespace, `helm uninstall` would delete every component in it.
   create: false

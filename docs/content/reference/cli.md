@@ -113,9 +113,16 @@ helm install unbounded-operator deploy/unbounded-operator/chart \
   --set image.tag=<release>
 ```
 
-Use one method per cluster. The chart refuses to install over an operator that
-`install` created. `helm uninstall` removes the operator and its RBAC; the CRDs,
-Sites and the components the operator reconciled remain.
+Use one method per cluster. Each refuses to take over the other: the chart
+won't install over an operator that `install` created, and `install` won't
+apply over an operator Deployment or ClusterRoleBinding owned by a Helm release
+(including the AKS flex operator extension). To switch methods, remove the
+existing install first.
+
+`helm uninstall` removes the operator, its RBAC and its ConfigMap. The chart
+never creates the release namespace (`--create-namespace` does), so Helm leaves
+the namespace alone, and the CRDs, Sites and the components the operator
+reconciled into it, including unbounded-net, keep running.
 
 > **Breaking change:** `--image-registry` is now a full image-repository prefix
 > (registry host plus org/namespace), not a bare host the operator appends

@@ -1,6 +1,8 @@
 {{- if .Values.namespace.create }}
-# Only the static `kubectl apply` render creates the namespace (values-static.yaml).
-# Helm and AKS cluster extensions install into a release namespace they manage.
+# Only the static `kubectl apply` render creates the namespace (values-static.yaml,
+# rendered with --skip-schema-validation). The schema pins namespace.create to
+# false so a Helm or AKS extension install can't take ownership of the namespace
+# that holds every operator-managed component.
 apiVersion: v1
 kind: Namespace
 metadata:

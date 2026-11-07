@@ -1,6 +1,8 @@
 # Values for the static manifests in deploy/unbounded-operator/rendered, which
 # `kubectl unbounded install` embeds and the release publishes as
 # unbounded-operator-<tag>.yaml. `make unbounded-operator-manifests` supplies
-# the image, registry, endpoint and reapLegacyResources.
+# the image, registry, endpoint and reapLegacyResources, and renders with
+# --skip-schema-validation because the schema forbids namespace.create for
+# Helm installs. Excluded from the packaged chart by .helmignore.
 namespace:
   create: true

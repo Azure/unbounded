@@ -24,7 +24,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["create"],
-      "properties": {"create": {"type": "boolean"}}
+      "properties": {"create": {"const": false}}
     },
     "global": {"type": "object"},
     "Azure": {

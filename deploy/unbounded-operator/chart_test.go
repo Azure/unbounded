@@ -59,6 +59,7 @@ func renderStatic(t *testing.T, r staticRender) string {
 		"template", "unbounded-operator", chart,
 		"--namespace", r.namespace,
 		"--values", filepath.Join(chart, "values-static.yaml"),
+		"--skip-schema-validation",
 		"--set-string", "image.reference="+r.image,
 		"--set-string", "imageRegistry="+r.registry,
 		"--set-file", "apiServerEndpoint="+endpointFile,
@@ -184,6 +185,7 @@ func TestChartRejectsInvalidValues(t *testing.T) {
 		"image name with registry": "image.name=ghcr.io/azure/unbounded-operator",
 		"malformed digest":         "image.digest=latest",
 		"unknown value":            "operatorImage=foo",
+		"chart-owned namespace":    "namespace.create=true",
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -223,7 +225,7 @@ func helmBinary(t *testing.T) string {
 
 	p, err := exec.LookPath("helm")
 	if err != nil {
-		t.Skip("helm not found; run `make install-helm` or set HELM")
+		t.Fatal("helm not found; run make install-helm or set HELM")
 	}
 
 	return p

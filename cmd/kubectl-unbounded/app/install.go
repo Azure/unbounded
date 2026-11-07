@@ -146,6 +146,10 @@ func (h *installHandler) execute(ctx context.Context) error {
 		}
 	}
 
+	if err := h.refuseHelmManagedOperator(ctx); err != nil {
+		return err
+	}
+
 	if err := h.prepareOperatorConfig(ctx); err != nil {
 		return err
 	}
@@ -170,6 +174,62 @@ func (h *installHandler) execute(ctx context.Context) error {
 		if err := h.waitForCRDs(ctx); err != nil {
 			return err
 		}
+	}
+
+	return nil
+}
+
+// helmReleaseAnnotation marks objects owned by a Helm release, including the
+// unbounded-operator chart installed by Helm or an AKS cluster extension.
+const helmReleaseAnnotation = "meta.helm.sh/release-name"
+
+// refuseHelmManagedOperator stops install from server-side applying over an
+// operator that a Helm release owns. Applying with ForceOwnership would flip
+// the operator image back and forth with every helm upgrade, and the shared
+// ClusterRoleBinding would point at whichever operator was installed last,
+// leaving the other one without RBAC.
+func (h *installHandler) refuseHelmManagedOperator(ctx context.Context) error {
+	checks := []struct {
+		apiVersion, kind string
+		key              client.ObjectKey
+	}{
+		{"apps/v1", "Deployment", client.ObjectKey{Namespace: h.namespace, Name: "unbounded-operator"}},
+		{"rbac.authorization.k8s.io/v1", "ClusterRoleBinding", client.ObjectKey{Name: "unbounded-operator"}},
+	}
+
+	for _, c := range checks {
+		obj := &unstructured.Unstructured{}
+		obj.SetAPIVersion(c.apiVersion)
+		obj.SetKind(c.kind)
+
+		if err := h.kubeResourcesCli.Get(ctx, c.key, obj); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+
+			return fmt.Errorf("inspect %s %s: %w", c.kind, c.key, err)
+		}
+
+		release := obj.GetAnnotations()[helmReleaseAnnotation]
+		if release == "" {
+			continue
+		}
+
+		where := obj.GetAnnotations()["meta.helm.sh/release-namespace"]
+		if where == "" {
+			where = obj.GetNamespace()
+		}
+
+		ref := c.key.Name
+		if c.key.Namespace != "" {
+			ref = c.key.String()
+		}
+
+		return fmt.Errorf(
+			"%s %s is managed by Helm release %q in namespace %q (for example the AKS flex operator extension); "+
+				"upgrade or remove it with helm or the extension instead of kubectl unbounded install",
+			c.kind, ref, release, where,
+		)
 	}
 
 	return nil

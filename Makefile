@@ -1288,6 +1288,7 @@ unbounded-operator-manifests: $(HELM) ## Render unbounded-operator manifests int
 	$(HELM) template unbounded-operator $(UNBOUNDED_OPERATOR_CHART_DIR) \
 		--namespace $(UNBOUNDED_OPERATOR_NAMESPACE) \
 		--values $(UNBOUNDED_OPERATOR_CHART_DIR)/values-static.yaml \
+		--skip-schema-validation \
 		--set-string image.reference=$(UNBOUNDED_OPERATOR_IMAGE) \
 		--set-string imageRegistry=$(UNBOUNDED_OPERATOR_IMAGE_REGISTRY) \
 		--set-file apiServerEndpoint=$(UNBOUNDED_OPERATOR_RENDER_DIR)/api-server-endpoint \
