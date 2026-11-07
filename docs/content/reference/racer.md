@@ -1493,6 +1493,21 @@ quarter of the time left in the request), instead of failing at once. Failing
 would close the connection mid-body and leave its port in `TIME_WAIT`.
 `racer_peer_receive_ciphertext_waits_total` counts bodies that waited and
 `racer_peer_receive_ciphertext_wait_granted_total` those that then got budget.
+A page the peer already wrote over an RDMA link waits for budget the same way, and
+the connection that carried its signed completion returns to the pool even if the
+wait runs out.
+
+`racer_peer_connection_closes_total{reason}` counts peer connections this node, as the
+requester, closed instead of returning to its pool. Each close leaves a local port in
+`TIME_WAIT` toward that peer for 60 s, so a sustained rate near the ephemeral port range
+divided by 60 exhausts ports (`racer_peer_connect_local_exhausted_total`). `reason` is
+`abandoned` (the exchange was dropped mid-flight, such as a lost race or a read whose
+client went away), `canceled`, `deadline`, `overloaded` (local admission refused a
+response already on the wire), `peer_close` (the peer answered `Connection: close`),
+or `error` (any other failure after the request was sent). An exchange that fails
+before sending its request, or after a complete bodiless answer such as a peer's
+`Overloaded`, keeps its connection and is not counted. Idle connections closed after
+30 s unused are not counted.
 
 The diagnostics listener uses port 9090 by default.
 Persist scrape configuration on workload templates or supported overrides, not only live Pods.

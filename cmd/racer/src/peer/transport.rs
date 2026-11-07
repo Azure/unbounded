@@ -637,6 +637,7 @@ impl Transfers {
         membership: &std::sync::Arc<crate::topology::Membership>,
         length: usize,
         scope: &RequestScope,
+        watch: &CloseWatch,
     ) -> Result<RelayResponse> {
         binding.response = envelope_digest(&authentication)?;
         let (verified, phase) = binding.verify(
@@ -676,10 +677,18 @@ impl Transfers {
             // The owner keeps the tag until the sender's release arrives.
             drop(pending);
             return self
-                .receive_fallback(connection, authentication, length, scope)
+                .receive_fallback(connection, authentication, length, scope, watch)
                 .await
                 .map(RelayResponse::Complete);
         }
+        // A signed `Complete` ends the HTTP exchange: its head carries no body, and the
+        // page arrives over the link. Finish it now so a failure while the page lands
+        // (ciphertext budget, a lost arrival, a canceled read) returns the socket to
+        // the pool instead of closing it. The lease is held to the end so its peer and
+        // receive permits keep covering the page until it is materialized.
+        let mut connection = connection;
+        connection.finish_exchange()?;
+        watch.settle(&connection);
         if pending.is_landing() {
             let landed = pending
                 .finish_landed(&verified, &envelope, &native_scope(scope))
@@ -712,8 +721,7 @@ impl Transfers {
                 )?,
                 false,
             )?;
-            let mut connection = connection;
-            connection.finish_exchange()?;
+            drop(connection);
             return Ok(RelayResponse::Landed(Box::new(LandedResponse {
                 authentication,
                 metadata,
@@ -722,13 +730,23 @@ impl Transfers {
             })));
         }
         let (admission, _) = &self.wire;
+        // The sender already wrote the page, so wait briefly for ciphertext budget
+        // rather than discard a delivered page and send the walk around again.
+        let completed = pending.completion_length(&verified, &envelope)?;
+        let reservation = self
+            .reserve_ciphertext_waiting(
+                &envelope.page.version.object.cache,
+                completed as usize,
+                scope,
+            )
+            .await?;
         // The arrival stays in registered memory; retaining paths copy it out.
         let page = pending
-            .finish(
+            .finish_reserved(
                 &verified,
                 envelope,
+                reservation,
                 admission,
-                self.reclaim.as_deref(),
                 &native_scope(scope),
             )
             .await?;
@@ -766,8 +784,7 @@ impl Transfers {
             &crate::peer::protocol::response_head(&response, &request_digest, &path)?,
             false,
         )?;
-        let mut connection = connection;
-        connection.finish_exchange()?;
+        drop(connection);
         Ok(RelayResponse::Complete(SignedResponse {
             authentication,
             response,
@@ -779,6 +796,7 @@ impl Transfers {
         authentication: ForwardedHead,
         length: usize,
         scope: &RequestScope,
+        watch: &CloseWatch,
     ) -> Result<SignedResponse> {
         scope.check()?;
         let cache = super::protocol::page_descriptor(&authentication.original.head)
@@ -792,6 +810,7 @@ impl Transfers {
         let response = codec.response_body(authentication, buffer.into_body(), scope)?;
         validate_body_length(&response.response, length)?;
         connection.finish_exchange()?;
+        watch.settle(&connection);
         Ok(response)
     }
 }
@@ -1164,6 +1183,81 @@ pub(crate) fn local_connect_overload(error: Error) -> Error {
     }
 }
 
+/// Counts a requester's peer connection that closes instead of returning to the pool.
+///
+/// Every close leaves this node's ephemeral port in `TIME_WAIT` toward the peer for
+/// the kernel's 60 s, so a steady close rate runs the node out of ports for that peer
+/// (`racer_peer_connect_local_exhausted_total`). The exchange holds the watch while its
+/// lease would close if dropped: from checkout until the lease is clean again (after
+/// the handshake, or a finished exchange) or handed to a relay. A watch dropped while
+/// held counts one close labeled by the exchange's error, or `abandoned` when the
+/// exchange future itself was dropped mid-flight (a lost race or a canceled read).
+#[derive(Default)]
+pub(super) struct CloseWatch {
+    metrics: Option<crate::telemetry::Metrics>,
+    held: std::cell::Cell<bool>,
+    error: std::cell::Cell<Option<Error>>,
+}
+
+impl CloseWatch {
+    fn new(metrics: Option<crate::telemetry::Metrics>) -> Self {
+        Self {
+            metrics,
+            held: std::cell::Cell::new(false),
+            error: std::cell::Cell::new(None),
+        }
+    }
+
+    /// The exchange now owns a lease that closes if dropped.
+    fn hold(&self) {
+        self.held.set(true);
+    }
+
+    /// The exchange's lease returns to the pool if dropped, or is no longer its own.
+    fn release(&self) {
+        self.held.set(false);
+    }
+
+    /// Settle a lease after a successful `finish_exchange`: it pools unless the peer
+    /// asked to close it (`Connection: close`), which counts as `peer_close`.
+    fn settle(&self, connection: &ConnectionLease) {
+        if !connection.is_reusable() && self.held.get() {
+            self.record(Event::PeerConnectionClosePeerClose);
+        }
+        self.release();
+    }
+
+    /// Record the error that ends the exchange.
+    fn fail(&self, error: Error) {
+        self.error.set(Some(error));
+    }
+
+    fn record(&self, event: Event) {
+        if let Some(metrics) = &self.metrics {
+            metrics.record(event, 1);
+        }
+    }
+
+    /// The close reason for a watch still held when the exchange ends.
+    fn reason(error: Option<Error>) -> Event {
+        match error {
+            None => Event::PeerConnectionCloseAbandoned,
+            Some(Error::Canceled) => Event::PeerConnectionCloseCanceled,
+            Some(Error::DeadlineExceeded) => Event::PeerConnectionCloseDeadline,
+            Some(Error::Overloaded) => Event::PeerConnectionCloseOverloaded,
+            Some(_) => Event::PeerConnectionCloseError,
+        }
+    }
+}
+
+impl Drop for CloseWatch {
+    fn drop(&mut self) {
+        if self.held.get() {
+            self.record(Self::reason(self.error.get()));
+        }
+    }
+}
+
 /// Generic Io has lost errno and may mean local ENOBUFS/ENOMEM. It is not link
 /// evidence. Only an observed orderly EOF is classified here; connect preserves
 /// its errno separately in HttpPool.
@@ -1415,7 +1509,9 @@ impl Transfers {
         self
     }
     /// The signed envelope and HTTP ciphertext share one exclusive pooled socket.
-    /// A failed/abandoned exchange is never marked reusable.
+    /// An exchange that fails or is abandoned after its head is sent and before its
+    /// response completes is never marked reusable; one that fails before the head is
+    /// sent, or after a bodiless answer completes, returns the socket to the pool.
     /// Exchange a signed request while recording the caller's transfer timing.
     #[allow(clippy::too_many_arguments)] // Keep transport, security, and timing inputs explicit.
     pub(super) fn exchange_timed<'a>(
@@ -1433,242 +1529,270 @@ impl Transfers {
         scope: &'a RequestScope,
     ) -> Operation<'a, RelayResponse> {
         Box::pin(async move {
-            scope.check()?;
-            let (admission, codec) = &self.wire;
-            let head_size = std::iter::once(request.authentication.original.as_ref())
-                .chain(request.authentication.hops.iter())
-                .try_fold(0usize, |total, signed| {
-                    signed.head.headers.iter().try_fold(total, |n, h| {
-                        n.checked_add(h.value.len() + h.name.len())
-                            .ok_or(Error::InvalidRequest)
-                    })
-                })?;
-            let _head_reservation = admission.reserve(
-                None,
-                ResourceClass::RequestContext,
-                head_size
-                    .checked_mul(3)
-                    .ok_or(Error::InvalidRequest)?
-                    .max(1),
-            )?;
-            let mut head = encode_envelope(&request.authentication, false, 0)?;
-            let signatures = self.signatures.clone();
-            let peer = crate::peer::protocol::receiver(
-                &request
-                    .authentication
-                    .hops
-                    .last()
-                    .unwrap_or(&request.authentication.original)
-                    .head,
-            )?;
-            let observer = admission.policy().observer();
-            if let Some(timing) = timing.as_deref_mut() {
-                timing.enable(&request.request, plan, relay.is_some());
-            }
-            let mut connection = observer
-                .result(
-                    Stage::PeerCheckout,
-                    scope,
-                    self.http
-                        .checkout_with_state(
-                            &endpoint,
-                            crate::http::State {
-                                relay: crate::http::RelayResources::admitted(relay.clone()),
-                                exchange: crate::http::PeerExchange::new(
-                                    peer_admission.clone(),
-                                    receive_permit,
-                                    Some(failure.clone()),
-                                ),
-                                ..Default::default()
-                            },
-                            scope,
+            let watch = CloseWatch::new(self.metrics.clone());
+            let result = async {
+                scope.check()?;
+                let (admission, codec) = &self.wire;
+                let head_size = std::iter::once(request.authentication.original.as_ref())
+                    .chain(request.authentication.hops.iter())
+                    .try_fold(0usize, |total, signed| {
+                        signed.head.headers.iter().try_fold(total, |n, h| {
+                            n.checked_add(h.value.len() + h.name.len())
+                                .ok_or(Error::InvalidRequest)
+                        })
+                    })?;
+                let _head_reservation = admission.reserve(
+                    None,
+                    ResourceClass::RequestContext,
+                    head_size
+                        .checked_mul(3)
+                        .ok_or(Error::InvalidRequest)?
+                        .max(1),
+                )?;
+                let mut head = encode_envelope(&request.authentication, false, 0)?;
+                let signatures = self.signatures.clone();
+                let peer = crate::peer::protocol::receiver(
+                    &request
+                        .authentication
+                        .hops
+                        .last()
+                        .unwrap_or(&request.authentication.original)
+                        .head,
+                )?;
+                let observer = admission.policy().observer();
+                if let Some(timing) = timing.as_deref_mut() {
+                    timing.enable(&request.request, plan, relay.is_some());
+                }
+                let mut connection = observer
+                    .result(
+                        Stage::PeerCheckout,
+                        scope,
+                        self.http
+                            .checkout_with_state(
+                                &endpoint,
+                                crate::http::State {
+                                    relay: crate::http::RelayResources::admitted(relay.clone()),
+                                    exchange: crate::http::PeerExchange::new(
+                                        peer_admission.clone(),
+                                        receive_permit,
+                                        Some(failure.clone()),
+                                    ),
+                                    ..Default::default()
+                                },
+                                scope,
+                            )
+                            .await,
+                    )
+                    .map_err(|error| {
+                        let error = local_connect_overload(error);
+                        if error == Error::Overloaded {
+                            self.record(Event::PeerConnectLocalExhausted, 1);
+                        }
+                        error
+                    })?;
+                watch.hold();
+                connection.state_mut().exchange.admission = peer_admission.clone();
+                if let Some(timing) = timing.as_deref_mut() {
+                    timing.end(0);
+                }
+                connection.state_mut().relay.reservation = relay.clone();
+                // Connection and handshake get separate bounded idle allowances.
+                // No header byte can renew the request/head allowance.
+                scope.candidate_progress()?;
+                let mut connection = {
+                    if let Some(timing) = timing.as_deref_mut() {
+                        timing.begin();
+                    }
+                    let _permit = connection
+                        .state()
+                        .session
+                        .is_none()
+                        .then(|| admission.reserve(None, ResourceClass::ControlProgress, 1))
+                        .transpose()?;
+                    observer.result(
+                        Stage::PeerHandshake,
+                        scope,
+                        crate::peer::protocol::connect(
+                            &self.io, connection, signatures, &peer, scope,
                         )
                         .await,
-                )
-                .map_err(|error| {
-                    let error = local_connect_overload(error);
-                    if error == Error::Overloaded {
-                        self.record(Event::PeerConnectLocalExhausted, 1);
-                    }
-                    error
-                })?;
-            connection.state_mut().exchange.admission = peer_admission.clone();
-            if let Some(timing) = timing.as_deref_mut() {
-                timing.end(0);
-            }
-            connection.state_mut().relay.reservation = relay.clone();
-            // Connection and handshake get separate bounded idle allowances.
-            // No header byte can renew the request/head allowance.
-            scope.candidate_progress()?;
-            let connection = {
+                    )?
+                };
+                if let Some(timing) = timing.as_deref_mut() {
+                    timing.end(1);
+                }
+                // Nothing of this exchange is on the wire yet. A grant wait that fails
+                // or is canceled before the head is sent returns the socket to the pool
+                // instead of closing it; `send_head` revokes this.
+                if connection.release_idle() {
+                    watch.release();
+                }
+                // Native response verification requires an authenticated membership lease.
+                let granting = scope.clock().now();
+                let native = if let Some(membership) = &membership {
+                    self.accept_native(&request, plan, membership, landing, scope)
+                        .await?
+                } else {
+                    None
+                };
+                if native.is_some() {
+                    self.record_rdma_stage(Event::RdmaGrantCount, Event::RdmaGrantNs, granting);
+                }
+                // Overflow counts only page bodies this hop actually receives.
+                let overflow = self.links.clone().filter(|_| {
+                    overflow_hop(
+                        plan,
+                        membership.as_deref(),
+                        &request.request.operation,
+                        self.signatures.node(),
+                        &peer,
+                    )
+                });
+                if let TransportPlan::Rdma { rail } = plan
+                    && membership.is_some()
+                    && self
+                        .links
+                        .as_ref()
+                        .is_some_and(|links| links.ready(&peer, rail).is_none())
+                {
+                    self.ensure_link(&endpoint, &peer, rail);
+                }
+                scope.candidate_progress()?;
+                if let Some((_, accept, _, _)) = &native {
+                    attach(&mut head, accept)?;
+                }
                 if let Some(timing) = timing.as_deref_mut() {
                     timing.begin();
                 }
-                let _permit = connection
-                    .state()
-                    .session
-                    .is_none()
-                    .then(|| admission.reserve(None, ResourceClass::ControlProgress, 1))
-                    .transpose()?;
-                observer.result(
-                    Stage::PeerHandshake,
+                let heading = scope.clock().now();
+                watch.hold();
+                let sent = observer.result(
+                    Stage::PeerHead,
                     scope,
-                    crate::peer::protocol::connect(&self.io, connection, signatures, &peer, scope)
-                        .await,
-                )?
-            };
-            if let Some(timing) = timing.as_deref_mut() {
-                timing.end(1);
-            }
-            // Native response verification requires an authenticated membership lease.
-            let granting = scope.clock().now();
-            let native = if let Some(membership) = &membership {
-                self.accept_native(&request, plan, membership, landing, scope)
-                    .await?
-            } else {
-                None
-            };
-            if native.is_some() {
-                self.record_rdma_stage(Event::RdmaGrantCount, Event::RdmaGrantNs, granting);
-            }
-            // Overflow counts only page bodies this hop actually receives.
-            let overflow = self.links.clone().filter(|_| {
-                overflow_hop(
-                    plan,
-                    membership.as_deref(),
-                    &request.request.operation,
-                    self.signatures.node(),
-                    &peer,
-                )
-            });
-            if let TransportPlan::Rdma { rail } = plan
-                && membership.is_some()
-                && self
-                    .links
-                    .as_ref()
-                    .is_some_and(|links| links.ready(&peer, rail).is_none())
-            {
-                self.ensure_link(&endpoint, &peer, rail);
-            }
-            scope.candidate_progress()?;
-            if let Some((_, accept, _, _)) = &native {
-                attach(&mut head, accept)?;
-            }
-            if let Some(timing) = timing.as_deref_mut() {
-                timing.begin();
-            }
-            let heading = scope.clock().now();
-            let sent = observer.result(
-                Stage::PeerHead,
-                scope,
-                self.io.send_head(connection, head, scope).await,
-            )?;
-            let mut received = observer.result(
-                Stage::PeerHead,
-                scope,
-                self.io.receive_head(sent.connection, scope).await,
-            )?;
-            if let Some(timing) = timing.as_deref_mut() {
-                timing.end(2);
-            }
-            if native.is_some() {
-                self.record_rdma_stage(Event::RdmaHeadCount, Event::RdmaHeadNs, heading);
-            }
-            if peer_wire::is_overloaded(&received.value) {
-                // The next holder shed the request before verifying it
-                // (`racer_core::route::unverified_failure`): a relay signs its own `Overloaded`,
-                // a requester's walk asks its helper. The answer is complete (no body) and the
-                // holder keeps the connection open (`PeerServer` finishes the exchange), so pool it:
-                // closing it here would park an ephemeral port in `TIME_WAIT` for every shed, and
-                // a hot holder's sheds would run this node out of ports for that holder.
-                let mut connection = received.connection;
-                let _ = connection.finish_exchange();
-                drop(connection);
-                return Err(Error::Overloaded);
-            }
-            let control = detach(
-                &mut received.value,
-                crate::peer::protocol::chains(&received.connection)?,
-            )?;
-            let relay_context = if relay.is_some() {
-                let size = received.value.headers.iter().try_fold(0usize, |n, h| {
-                    n.checked_add(h.value.len() + h.name.len())
-                        .ok_or(Error::InvalidRequest)
-                })?;
-                Some(admission.reserve(
-                    None,
-                    ResourceClass::RequestContext,
-                    size.checked_mul(3).ok_or(Error::InvalidRequest)?.max(1),
-                )?)
-            } else {
-                None
-            };
-            let (authentication, length) = decode_envelope(
-                received.value,
-                true,
-                crate::peer::protocol::chains(&received.connection)?,
-            )?;
-            if let Some(control) = control {
-                let (binding, accept, peer, pending) = native.ok_or(Error::Unauthorized)?;
-                let arriving = scope.clock().now();
-                let received = self
-                    .receive_native(
-                        received.connection,
+                    self.io.send_head(connection, head, scope).await,
+                )?;
+                let mut received = observer.result(
+                    Stage::PeerHead,
+                    scope,
+                    self.io.receive_head(sent.connection, scope).await,
+                )?;
+                if let Some(timing) = timing.as_deref_mut() {
+                    timing.end(2);
+                }
+                if native.is_some() {
+                    self.record_rdma_stage(Event::RdmaHeadCount, Event::RdmaHeadNs, heading);
+                }
+                if peer_wire::is_overloaded(&received.value) {
+                    // The next holder shed the request before verifying it
+                    // (`racer_core::route::unverified_failure`): a relay signs its own `Overloaded`,
+                    // a requester's walk asks its helper. The answer is complete (no body) and the
+                    // holder keeps the connection open (`PeerServer` finishes the exchange), so pool it:
+                    // closing it here would park an ephemeral port in `TIME_WAIT` for every shed, and
+                    // a hot holder's sheds would run this node out of ports for that holder.
+                    let mut connection = received.connection;
+                    if connection.finish_exchange().is_ok() {
+                        watch.settle(&connection);
+                    }
+                    drop(connection);
+                    return Err(Error::Overloaded);
+                }
+                let control = detach(
+                    &mut received.value,
+                    crate::peer::protocol::chains(&received.connection)?,
+                )?;
+                let relay_context = if relay.is_some() {
+                    let size = received.value.headers.iter().try_fold(0usize, |n, h| {
+                        n.checked_add(h.value.len() + h.name.len())
+                            .ok_or(Error::InvalidRequest)
+                    })?;
+                    Some(admission.reserve(
+                        None,
+                        ResourceClass::RequestContext,
+                        size.checked_mul(3).ok_or(Error::InvalidRequest)?.max(1),
+                    )?)
+                } else {
+                    None
+                };
+                let (authentication, length) = decode_envelope(
+                    received.value,
+                    true,
+                    crate::peer::protocol::chains(&received.connection)?,
+                )?;
+                if let Some(control) = control {
+                    let (binding, accept, peer, pending) = native.ok_or(Error::Unauthorized)?;
+                    let arriving = scope.clock().now();
+                    let received = self
+                        .receive_native(
+                            received.connection,
+                            authentication,
+                            binding,
+                            accept,
+                            peer,
+                            control,
+                            pending,
+                            membership.as_ref().ok_or(Error::IncompatibleMembership)?,
+                            length,
+                            scope,
+                            &watch,
+                        )
+                        .await;
+                    if received.is_ok() {
+                        self.record_rdma_stage(
+                            Event::RdmaArrivalCount,
+                            Event::RdmaArrivalNs,
+                            arriving,
+                        );
+                    }
+                    return received;
+                }
+                if relay.is_some() {
+                    received.connection.state_mut().relay.context = relay_context;
+                    // The relay owns the connection and finishes or closes it.
+                    watch.release();
+                    return Ok(RelayResponse::Http {
                         authentication,
-                        binding,
-                        accept,
-                        peer,
-                        control,
-                        pending,
-                        membership.as_ref().ok_or(Error::IncompatibleMembership)?,
+                        connection: Box::new(received.connection),
                         length,
+                        overflow,
+                    });
+                }
+                if let Some(timing) = timing.as_deref_mut() {
+                    timing.begin();
+                }
+                let (mut connection, body) = self
+                    .receive_http_body(
+                        received.connection,
+                        length,
+                        &request,
+                        &peer,
+                        &peer_admission,
+                        &failure,
                         scope,
                     )
-                    .await;
-                if received.is_ok() {
-                    self.record_rdma_stage(Event::RdmaArrivalCount, Event::RdmaArrivalNs, arriving);
+                    .await?;
+                scope.check()?;
+                if let Some(timing) = timing.as_deref_mut() {
+                    timing.end(3);
                 }
-                return received;
-            }
-            if relay.is_some() {
-                received.connection.state_mut().relay.context = relay_context;
-                return Ok(RelayResponse::Http {
-                    authentication,
-                    connection: Box::new(received.connection),
-                    length,
-                    overflow,
-                });
-            }
-            if let Some(timing) = timing.as_deref_mut() {
-                timing.begin();
-            }
-            let (mut connection, body) = self
-                .receive_http_body(
-                    received.connection,
-                    length,
-                    &request,
-                    &peer,
-                    &peer_admission,
-                    &failure,
+                let response = observer.result(
+                    Stage::PeerDecode,
                     scope,
-                )
-                .await?;
-            scope.check()?;
-            if let Some(timing) = timing.as_deref_mut() {
-                timing.end(3);
+                    codec.response_body(authentication, body, scope),
+                )?;
+                validate_body_length(&response.response, length)?;
+                connection.finish_exchange()?;
+                watch.settle(&connection);
+                record_overflow(
+                    overflow.as_deref(),
+                    delivers_page_body(&response.response, length),
+                );
+                Ok(RelayResponse::Complete(response))
             }
-            let response = observer.result(
-                Stage::PeerDecode,
-                scope,
-                codec.response_body(authentication, body, scope),
-            )?;
-            validate_body_length(&response.response, length)?;
-            connection.finish_exchange()?;
-            record_overflow(
-                overflow.as_deref(),
-                delivers_page_body(&response.response, length),
-            );
-            Ok(RelayResponse::Complete(response))
+            .await;
+            if let Err(error) = &result {
+                watch.fail(*error);
+            }
+            result
         })
     }
 
@@ -1858,6 +1982,85 @@ pub(crate) async fn relay_body(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A held watch counts one close by the exchange's error, or `abandoned` when the
+    /// exchange future was dropped; a released watch counts nothing.
+    #[test]
+    fn close_watch_counts_only_held_connections_by_reason() {
+        use crate::telemetry::{Event, Metrics};
+        let cases = [
+            (None, Event::PeerConnectionCloseAbandoned),
+            (Some(Error::Canceled), Event::PeerConnectionCloseCanceled),
+            (
+                Some(Error::DeadlineExceeded),
+                Event::PeerConnectionCloseDeadline,
+            ),
+            (
+                Some(Error::Overloaded),
+                Event::PeerConnectionCloseOverloaded,
+            ),
+            (Some(Error::Io), Event::PeerConnectionCloseError),
+            (Some(Error::Unauthorized), Event::PeerConnectionCloseError),
+        ];
+        for (error, event) in cases {
+            let metrics = Metrics::default();
+            let watch = CloseWatch::new(Some(metrics.clone()));
+            watch.hold();
+            if let Some(error) = error {
+                watch.fail(error);
+            }
+            drop(watch);
+            assert_eq!(metrics.count(event), 1, "{error:?}");
+
+            // Released (pooled or handed off) before the error: no close.
+            let metrics = Metrics::default();
+            let watch = CloseWatch::new(Some(metrics.clone()));
+            watch.hold();
+            watch.release();
+            if let Some(error) = error {
+                watch.fail(error);
+            }
+            drop(watch);
+            assert_eq!(metrics.count(event), 0, "{error:?}");
+        }
+        // Never held (checkout failed): nothing to close.
+        let metrics = Metrics::default();
+        let watch = CloseWatch::new(Some(metrics.clone()));
+        watch.fail(Error::Overloaded);
+        drop(watch);
+        assert_eq!(metrics.count(Event::PeerConnectionCloseOverloaded), 0);
+    }
+
+    /// Settling a finished lease pools it, unless the peer asked to close it.
+    #[test]
+    fn close_watch_settle_counts_a_peer_requested_close() {
+        use crate::telemetry::{Event, Metrics};
+        let env = racer_io::Env::host();
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+            crate::test_support::cluster::config(true).limits,
+        )));
+        let _reactor = Rc::new(crate::runtime::Reactor::new(admission.clone(), &env));
+        for close in [false, true] {
+            let metrics = Metrics::default();
+            let watch = CloseWatch::new(Some(metrics.clone()));
+            let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+            let mut lease = crate::http::from_accepted(a.into(), &admission).unwrap();
+            lease.set_framing(Some(0), Some(0), false);
+            if close {
+                lease.poison();
+            }
+            lease.finish_exchange().unwrap();
+            watch.hold();
+            watch.settle(&lease);
+            assert!(!watch.held.get());
+            drop(watch);
+            assert_eq!(
+                metrics.count(Event::PeerConnectionClosePeerClose),
+                u64::from(close)
+            );
+            assert_eq!(metrics.count(Event::PeerConnectionCloseAbandoned), 0);
+        }
+    }
 
     /// Overflow counts a page only when its body arrives over an overflow
     /// edge, once per hop, and never for bodiless outcomes or other edges.
@@ -2497,6 +2700,9 @@ mod tests {
             sender_down: bool,
             /// The receiver grants a slot of a simulated GPU's landing buffer.
             landing: bool,
+            /// The receiver's ciphertext share for the page's cache is held in full
+            /// until the end of the exchange.
+            ciphertext_full: bool,
         }
 
         struct PageOutcome {
@@ -2516,6 +2722,10 @@ mod tests {
             free: (Option<usize>, Option<usize>),
             /// Sends the sender declined because its plan disagreed with the grant.
             declined: u64,
+            /// The receiver's exchange left its connection closing instead of reusable.
+            closed: bool,
+            /// Receiver ciphertext budget waits.
+            ciphertext_waits: u64,
         }
 
         fn page_membership(
@@ -2718,6 +2928,19 @@ mod tests {
                 crate::rdma::links::tests::pump(&mut w.a.owner, &mut w.b.owner);
             }
             let released = std::cell::Cell::new(false);
+            let receiver_metrics = crate::telemetry::Metrics::default();
+            let receiver = receiver.with_metrics(receiver_metrics.clone());
+            let full = std::cell::RefCell::new(Vec::new());
+            if case.ciphertext_full {
+                for shift in (0..48).rev() {
+                    while let Ok(charge) =
+                        admission.reserve(Some(&cache), ResourceClass::Ciphertext, 1 << shift)
+                    {
+                        full.borrow_mut().push(charge);
+                    }
+                }
+            }
+            let watch = CloseWatch::new(Some(receiver_metrics.clone()));
             let (a, b) = UnixStream::pair().unwrap();
             let a = crate::http::from_accepted(a.into(), &admission).unwrap();
             let b = crate::http::from_accepted(b.into(), &admission).unwrap();
@@ -2739,6 +2962,7 @@ mod tests {
                         headers: vec![extension("content-length", b"0".to_vec())],
                     };
                     attach(&mut initial, &p::decode_signed(&accept_wire)?)?;
+                    watch.hold();
                     let sent = receiver.io.send_head(a, initial, &scope).await?;
                     let mut received = receiver.io.receive_head(sent.connection, &scope).await?;
                     let control = detach(
@@ -2776,6 +3000,7 @@ mod tests {
                             &receiver_membership,
                             length,
                             &scope,
+                            &watch,
                         )
                         .await
                 };
@@ -2840,6 +3065,11 @@ mod tests {
                     reactor.wait(Duration::from_millis(1)).unwrap();
                 }
             };
+            drop(full);
+            if let Err(error) = &result {
+                watch.fail(*error);
+            }
+            let closed = watch.held.get();
             crate::rdma::links::tests::pump(&mut w.a.owner, &mut w.b.owner);
             let free = |w: &crate::rdma::links::tests::World| {
                 (
@@ -2892,11 +3122,38 @@ mod tests {
                 released: released.get(),
                 free: free(&w),
                 declined: sender_metrics.count(crate::telemetry::Event::RdmaSendDeclinedPlan),
+                closed,
+                ciphertext_waits: receiver_metrics
+                    .count(crate::telemetry::Event::PeerReceiveCiphertextWaits),
             }
         }
 
         fn page_bytes(result: &Result<Vec<u8>>) -> Vec<u8> {
             result.as_ref().expect("page").clone()
+        }
+
+        /// A page the sender already wrote over the link, arriving while the receiver's
+        /// ciphertext budget is full, waits for budget and then fails `Overloaded`, but
+        /// its HTTP exchange is complete (the `Complete` head carries no body), so the
+        /// connection returns to the pool rather than closing into `TIME_WAIT`.
+        #[test]
+        fn native_complete_without_ciphertext_budget_keeps_the_connection() {
+            let env = racer_io::Env::host();
+            let outcome = page_roundtrip(
+                &env,
+                PageCase {
+                    ciphertext_full: true,
+                    ..PageCase::default()
+                },
+            );
+            assert!(matches!(outcome.result, Err(Error::Overloaded)));
+            assert_eq!(outcome.sent, Ok(true));
+            assert_eq!(outcome.ciphertext_waits, 1);
+            assert!(
+                !outcome.closed,
+                "the finished exchange pools its connection"
+            );
+            assert_eq!(outcome.free.0, outcome.free.1, "the grant is released");
         }
 
         #[test]
@@ -2915,6 +3172,7 @@ mod tests {
                     assert_eq!(page_bytes(&outcome.result), vec![0x5a; 144]);
                     assert_eq!(outcome.sent, Ok(true));
                     assert_eq!(outcome.declined, 0);
+                    assert!(!outcome.closed, "a completed exchange pools");
                     assert_eq!(
                         (outcome.completed, outcome.fallbacks, outcome.completions),
                         (1, 0, 1),

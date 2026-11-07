@@ -337,6 +337,12 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::PeerConnectLocalExhausted => "racer_peer_connect_local_exhausted_total",
             Self::PeerReceiveCiphertextWaits => "racer_peer_receive_ciphertext_waits_total",
             Self::PeerReceiveCiphertextWaitGranted => "racer_peer_receive_ciphertext_wait_granted_total",
+            Self::PeerConnectionCloseAbandoned => "racer_peer_connection_closes_total" { "reason=\"abandoned\"" },
+            Self::PeerConnectionCloseCanceled => "racer_peer_connection_closes_total" { "reason=\"canceled\"" },
+            Self::PeerConnectionCloseDeadline => "racer_peer_connection_closes_total" { "reason=\"deadline\"" },
+            Self::PeerConnectionCloseOverloaded => "racer_peer_connection_closes_total" { "reason=\"overloaded\"" },
+            Self::PeerConnectionClosePeerClose => "racer_peer_connection_closes_total" { "reason=\"peer_close\"" },
+            Self::PeerConnectionCloseError => "racer_peer_connection_closes_total" { "reason=\"error\"" },
             Self::RdmaPlanHttpNoRail => "racer_rdma_plan_http_total" { "reason=\"no_rail\"" },
             Self::RdmaPlanHttpIneligible => "racer_rdma_plan_http_total" { "reason=\"ineligible\"" },
             Self::RdmaPlanHttpOverflow => "racer_rdma_plan_http_total" { "reason=\"overflow\"" },
@@ -1973,6 +1979,7 @@ mod tests {
                     line.contains('{')
                         && !line.starts_with("racer_gpu_read_requests_total{")
                         && !line.starts_with("racer_rdma_link_breaks_total{")
+                        && !line.starts_with("racer_peer_connection_closes_total{")
                         && !line.starts_with("racer_rdma_link_setups_total{")
                         && !line.starts_with("racer_rdma_plan_http_total{")
                         && !line.starts_with("racer_rdma_send_declined_total{")

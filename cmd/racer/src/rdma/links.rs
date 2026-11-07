@@ -1416,6 +1416,28 @@ impl PendingReceive {
             &envelope.page.version.object.cache,
             length as usize,
         )?;
+        self.finish_reserved(head, envelope, reservation, admission, scope)
+            .await
+    }
+
+    /// The page length a signed completion names, after checking that it names
+    /// this link, tag, transfer, and the envelope's length.
+    pub fn completion_length(&self, head: &VerifiedHead, envelope: &PageEnvelope) -> Result<u32> {
+        self.check_completion(head, envelope)
+    }
+
+    /// [`Self::finish`] with ciphertext budget the caller already reserved for
+    /// [`Self::completion_length`] bytes.
+    pub async fn finish_reserved(
+        self,
+        head: &VerifiedHead,
+        envelope: PageEnvelope,
+        reservation: flow_control::Charge<AdmissionPolicy>,
+        admission: &Rc<flow_control::Quotas<AdmissionPolicy>>,
+        scope: &RequestScope,
+    ) -> Result<CiphertextPage> {
+        scope.check()?;
+        let length = self.check_completion(head, &envelope)?;
         let arrival = self
             .retry
             .wait(scope, poll_fn(|cx| self.arrival.poll(cx)))
