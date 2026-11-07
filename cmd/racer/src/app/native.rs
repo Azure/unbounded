@@ -618,6 +618,7 @@ impl WorkerApplication {
         self.rdma_waiting = None;
         self.rdma_settle = None;
         self.rdma_attempts = 0;
+        self.rdma_char_refreshed = false;
         self.native_failures = 0;
         self.native_retry = self.ctx().now() + RAIL_PROBE;
     }
@@ -734,6 +735,22 @@ impl WorkerApplication {
                 .drain_blocker()
                 .map_or("pending", rdma_verbs::DrainBlocker::as_str);
             return Some(format!("drain_{blocker}"));
+        }
+        if !self.rdma_char_refreshed {
+            self.rdma_char_refreshed = true;
+            if let Some((sysfs, dir)) = &self.rdma_char_devices {
+                match crate::rdma::refresh_char_devices(sysfs, dir) {
+                    Ok(count) => eprintln!(
+                        "racer: stage=rdma-device state=char-devices-refreshed count={count} dir={}",
+                        dir.display()
+                    ),
+                    // Reopening may still work; a restart covers it if not.
+                    Err(error) => eprintln!(
+                        "racer: stage=rdma-device state=char-devices-failed dir={} error={error}",
+                        dir.display()
+                    ),
+                }
+            }
         }
         // A device back under its old name still needs a refresh when the
         // inventory dropped it meanwhile: a re-enrollment refreshes the
@@ -2250,6 +2267,7 @@ mod tests {
             .unwrap();
         let (mut worker, engine) = worker(&env, &app, true, true);
         worker.rdma_sysfs = root.clone();
+        worker.rdma_char_devices = Some((dir.0.join("infiniband_verbs"), dir.0.join("char")));
         let mut service = test_owner(&app, engine);
         let mut run = |worker: &mut WorkerApplication| {
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
@@ -2289,6 +2307,10 @@ mod tests {
         worker.native_retry = worker.ctx().now();
         run(&mut worker);
         assert!(links.rail_ready(RailId(0)), "RDMA reactivates");
+        assert!(
+            worker.rdma_char_refreshed,
+            "fresh character device nodes before reopening"
+        );
         assert_eq!(metrics.count(Event::RdmaDeviceReactivation), 1);
     }
 

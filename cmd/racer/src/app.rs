@@ -1071,6 +1071,14 @@ pub struct WorkerApplication {
     /// `RAIL_SETTLE`, shortened by tests.
     rail_settle: std::time::Duration,
 
+    /// Verbs character devices in sysfs and where to create fresh nodes for
+    /// them before reactivating (see `crate::rdma::refresh_char_devices`).
+    /// `None` in tests, which must not create device nodes on the host.
+    rdma_char_devices: Option<(std::path::PathBuf, std::path::PathBuf)>,
+
+    /// The nodes were refreshed since the last device loss.
+    rdma_char_refreshed: bool,
+
     /// Next sysfs presence probe of the active rails.
     rail_probe: std::time::Instant,
 
@@ -1739,6 +1747,13 @@ impl WorkerApplication {
             rdma_settle: None,
             rdma_attempts: 0,
             rail_settle: native::RAIL_SETTLE,
+            rdma_char_devices: (!cfg!(test)).then(|| {
+                (
+                    crate::rdma::SYSFS_INFINIBAND_VERBS.into(),
+                    crate::rdma::DEV_CHAR.into(),
+                )
+            }),
+            rdma_char_refreshed: false,
             rail_probe: started,
             rdma_sysfs: crate::rdma::SYSFS_INFINIBAND.into(),
             telemetry: Rc::new(telemetry),
