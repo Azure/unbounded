@@ -1336,7 +1336,8 @@ impl SecurityCodec {
             ResponseBody::Empty
         } else {
             // Unkeyed staging; the decoder recharges it to the page's cache.
-            let reservation = self.admission.reserve(
+            // Peer bodies may use the receive headroom (`Rules::headroom`).
+            let reservation = self.admission.reserve_priority(
                 None,
                 ResourceClass::Ciphertext,
                 self.buffers.aligned_capacity(body.len())?,
@@ -1382,7 +1383,9 @@ impl SecurityCodec {
                     ResponseBody::Empty => return Err(Error::InvalidRequest),
                     ResponseBody::Aligned(mut buffer) => {
                         if buffer.charge().key().is_none() && self.admission.owns(buffer.charge()) {
-                            let keyed = self.admission.reserve(
+                            // The swap briefly holds both charges; like the
+                            // staging it replaces, it may use the headroom.
+                            let keyed = self.admission.reserve_priority(
                                 Some(&metadata.version.object.cache),
                                 ResourceClass::Ciphertext,
                                 buffer.capacity(),

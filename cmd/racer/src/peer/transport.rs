@@ -1180,7 +1180,8 @@ impl WireBuffer {
         if length > crate::model::PAGE_BYTES as usize + 16 {
             return Err(Error::InvalidRequest);
         }
-        let reservation = admission.reserve(
+        // A peer body may use the receive headroom (`Rules::headroom`).
+        let reservation = admission.reserve_priority(
             None,
             ResourceClass::Ciphertext,
             buffers.aligned_capacity(length)?,
@@ -1219,6 +1220,11 @@ type ReclaimCiphertext = Reclaim<'static>;
 /// Reserve keyed peer-receive ciphertext, reclaiming idle cache memory once
 /// before failing. Idle cache entries keep their Ciphertext charge, so without
 /// this a full cache share would reject every in-flight peer receive.
+///
+/// Peer bodies may use the ciphertext headroom other admission leaves free
+/// (`Rules::headroom`). Pinned cache entries, sends to other peers, disk work,
+/// and hedges can otherwise fill the whole budget while the local readers
+/// that would release some of it wait on exactly these receives.
 pub(crate) fn reserve_ciphertext(
     admission: &flow_control::Quotas<AdmissionPolicy>,
     reclaim: Option<&Reclaim<'_>>,
@@ -1227,7 +1233,7 @@ pub(crate) fn reserve_ciphertext(
 ) -> Result<flow_control::Charge<AdmissionPolicy>> {
     let reserve = || {
         admission
-            .reserve(Some(cache), ResourceClass::Ciphertext, capacity)
+            .reserve_priority(Some(cache), ResourceClass::Ciphertext, capacity)
             .map_err(Error::from)
     };
     crate::admission::report_final(admission, || match (reserve(), reclaim) {
@@ -3704,6 +3710,72 @@ mod tests {
             WireBuffer::unkeyed(&buffers, &admission, length),
             Err(Error::Unavailable)
         ));
+        assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+    }
+    /// A worker whose ciphertext is all held by work other than peer receives
+    /// (pinned cache entries, sends to peers, disk work, hedges) still admits
+    /// the receives its waiting readers need, up to the headroom and no more.
+    #[test]
+    fn peer_receives_use_the_headroom_other_ciphertext_cannot_fill() {
+        use flow_control::Policy as _;
+        let mut limits = crate::test_support::cluster::config(false).limits;
+        let progress = AdmissionPolicy::new(limits.clone()).progress(ResourceClass::Ciphertext);
+        limits.ciphertext_bytes = std::num::NonZeroUsize::new(10 * progress).unwrap();
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
+        let limit = admission.limit(ResourceClass::Ciphertext);
+        let headroom = admission.policy().headroom(ResourceClass::Ciphertext);
+        assert_eq!(headroom, progress);
+        let buffers = crate::memory::BufferPool::new(admission.clone());
+        let page = buffers
+            .aligned_capacity(crate::model::PAGE_BYTES as usize + 16)
+            .unwrap();
+        assert!(page <= headroom);
+        let cache = racer_wire::control::CacheId("11111111-5555-4555-8555-555555555555".into());
+        // Ordinary holders fill everything below the headroom.
+        let mut held = Vec::new();
+        for shift in (0..48).rev() {
+            while let Ok(charge) =
+                admission.reserve(Some(&cache), ResourceClass::Ciphertext, 1 << shift)
+            {
+                held.push(charge);
+            }
+        }
+        assert_eq!(admission.used(ResourceClass::Ciphertext), limit - headroom);
+        // Neither ordinary nor completion admission reaches the headroom.
+        assert!(
+            admission
+                .reserve_completion(Some(&cache), ResourceClass::Ciphertext, 1)
+                .is_err()
+        );
+        // Keyed and unkeyed peer bodies do, without reclaiming anything.
+        let keyed = reserve_ciphertext(&admission, None, &cache, page).unwrap();
+        let unkeyed = WireBuffer::unkeyed(&buffers, &admission, page / 2).unwrap();
+        assert!(matches!(unkeyed, WireBuffer::Aligned(_)));
+        assert!(
+            admission
+                .reserve(Some(&cache), ResourceClass::Ciphertext, 1)
+                .is_err(),
+            "receives never open room for other holders"
+        );
+        // Receives that fill the headroom are refused at the hard limit.
+        let mut receives = vec![keyed];
+        while let Ok(charge) = reserve_ciphertext(&admission, None, &cache, page) {
+            receives.push(charge);
+        }
+        assert!(admission.used(ResourceClass::Ciphertext) <= limit);
+        assert_eq!(
+            reserve_ciphertext(&admission, None, &cache, page).err(),
+            Some(Error::Overloaded)
+        );
+        // A completed receive frees room for the next receive only.
+        receives.pop();
+        assert!(
+            admission
+                .reserve(Some(&cache), ResourceClass::Ciphertext, 1)
+                .is_err()
+        );
+        receives.push(reserve_ciphertext(&admission, None, &cache, page).unwrap());
+        drop((receives, unkeyed, held));
         assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
     }
     /// Keyed TCP and HTTP peer bodies reserve through the production reclaim

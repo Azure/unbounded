@@ -479,6 +479,9 @@ impl Policy for AdmissionPolicy {
     fn floor(&self, class: ResourceClass) -> usize {
         self.rules.floor(class)
     }
+    fn headroom(&self, class: ResourceClass) -> usize {
+        self.rules.headroom(class)
+    }
     fn progress(&self, class: ResourceClass) -> usize {
         self.rules.progress(class)
     }

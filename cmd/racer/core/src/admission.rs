@@ -302,6 +302,25 @@ impl Rules {
         }
     }
 
+    /// Ciphertext only peer receive bodies may use (`Policy::headroom`): one
+    /// range-window allowance ([`Self::progress`]). Everything else a worker
+    /// charges as ciphertext (retained and pinned cache entries, bodies sent
+    /// to peers, disk reads and writes, hedges) stops this far below the
+    /// limit, so a page already on the wire can always land and release the
+    /// local readers waiting on it. Off when it would exceed an eighth of the
+    /// limit, where it would cost more retention than it protects.
+    pub fn headroom(&self, class: ResourceClass) -> usize {
+        if !matches!(class, ResourceClass::Ciphertext) {
+            return 0;
+        }
+        let reserve = self.progress(class);
+        if reserve.saturating_mul(8) <= self.limit(class) {
+            reserve
+        } else {
+            0
+        }
+    }
+
     /// Priority weights page-memory budgets (`Policy::weighted`). Other request-serving classes
     /// keep an equal split so a priority-0 cache can still serve requests.
     pub fn weighted(class: ResourceClass) -> bool {
@@ -423,6 +442,33 @@ mod tests {
         let mut huge = limits;
         huge.queue_entries = nz(usize::MAX);
         assert_eq!(huge.crypto_submissions(), usize::MAX);
+    }
+
+    #[test]
+    fn ciphertext_headroom_is_one_window_and_off_for_small_budgets() {
+        let page = 16 * MIB;
+        let floors = Floors::for_page(page, 20480);
+        let mut limits = Limits {
+            range_window_pages: nz(6),
+            ciphertext_bytes: nz(3_272_356_035),
+            ..Limits::default()
+        };
+        let rules = Rules::new(limits.clone(), floors);
+        let window = rules.progress(ResourceClass::Ciphertext);
+        assert_eq!(window, 6 * floors.sealed + floors.record);
+        assert_eq!(rules.headroom(ResourceClass::Ciphertext), window);
+        for class in ResourceClass::ALL {
+            if class != ResourceClass::Ciphertext {
+                assert_eq!(rules.headroom(class), 0, "{class:?}");
+            }
+        }
+        // Exactly an eighth still reserves; any smaller budget does not.
+        limits.ciphertext_bytes = nz(8 * window);
+        let rules = Rules::new(limits.clone(), floors);
+        assert_eq!(rules.headroom(ResourceClass::Ciphertext), window);
+        limits.ciphertext_bytes = nz(8 * window - 1);
+        let rules = Rules::new(limits, floors);
+        assert_eq!(rules.headroom(ResourceClass::Ciphertext), 0);
     }
 
     #[test]

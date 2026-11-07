@@ -60,6 +60,16 @@ pub trait Policy: 'static {
     /// Return the aggregate ceiling for a class.
     fn limit(&self, class: Self::Class) -> usize;
 
+    /// Return bytes of the aggregate ceiling that only priority admission
+    /// ([`Quotas::reserve_priority`]) may use. Ordinary and completion
+    /// admission, and reclamation targets, stop this far below the ceiling,
+    /// so work that must finish for the authority to drain keeps room even
+    /// when everything else has filled the class. Values above the ceiling
+    /// are clamped to it.
+    fn headroom(&self, _class: Self::Class) -> usize {
+        0
+    }
+
     /// Return the minimum keyed share, clipped to the aggregate ceiling.
     fn floor(&self, _class: Self::Class) -> usize {
         1
@@ -308,7 +318,7 @@ impl<P: Policy> SharedQuotas<P> {
         if amount == 0 {
             return Err(Error::InvalidInput.into());
         }
-        let limit = self.limit(class);
+        let limit = ordinary_limit(&self.policy, class);
         self.totals
             .counter(class)
             .reserve(amount, limit)
@@ -574,7 +584,8 @@ impl<P: Policy> Quotas<P> {
         if local_deficit != 0 {
             return Some((Some(key.clone()), local_deficit));
         }
-        let headroom = self.limit(class).checked_sub(amount)?;
+        // Reclaim for ordinary admission, which cannot use the priority headroom.
+        let headroom = ordinary_limit(&self.policy, class).checked_sub(amount)?;
         let deficit = self.used(class).saturating_sub(headroom);
         (deficit != 0).then_some((None, deficit))
     }
@@ -613,6 +624,18 @@ impl<P: Policy> Quotas<P> {
         amount: usize,
     ) -> std::result::Result<Charge<P>, ReserveError<P::Class>> {
         self.reserve_inner(key, class, amount, AdmissionMode::Ordinary)
+    }
+
+    /// Admit work that keeps the authority draining: like [`Self::reserve`],
+    /// but it may also use the class's [`Policy::headroom`].
+    pub fn reserve_priority(
+        &self,
+        key: Option<&P::Key>,
+        class: P::Class,
+        amount: usize,
+    ) -> Result<Charge<P>> {
+        self.reserve_inner(key, class, amount, AdmissionMode::Priority)
+            .map_err(|failure| failure.error)
     }
 
     /// For already-admitted work during drain only. Aggregate limits still apply.
@@ -734,7 +757,7 @@ impl<P: Policy> Quotas<P> {
         amount: usize,
         mode: AdmissionMode,
     ) -> std::result::Result<Charge<P>, ReserveError<P::Class>> {
-        if self.is_stopped() && mode == AdmissionMode::Ordinary && !P::allows_stopped(class) {
+        if self.is_stopped() && mode != AdmissionMode::Completion && !P::allows_stopped(class) {
             return Err(Error::Unavailable.into());
         }
         if amount == 0 {
@@ -744,18 +767,23 @@ impl<P: Policy> Quotas<P> {
         // Clone before checking limits: application code may admit more work,
         // change policy, stop admission, or panic without owning a charge yet.
         let key = key.cloned();
-        let limit = self.limit(class);
-        if let Some(local) = local.as_ref().filter(|_| mode == AdmissionMode::Ordinary) {
+        let limit = match mode {
+            AdmissionMode::Priority => self.limit(class),
+            AdmissionMode::Ordinary | AdmissionMode::Completion => {
+                ordinary_limit(&self.policy, class)
+            }
+        };
+        if let Some(local) = local.as_ref().filter(|_| mode != AdmissionMode::Completion) {
             let fair = self.fair_limit_for(class, local);
             let used = local.counter(class).used();
             if used.checked_add(amount).is_none_or(|next| next > fair) {
-                return Err(self.rejected(class, amount, Some(used), Some(fair)));
+                return Err(self.rejected(class, limit, amount, Some(used), Some(fair)));
             }
         }
         self.totals
             .counter(class)
             .reserve(amount, limit)
-            .map_err(|_| self.rejected(class, amount, None, None))?;
+            .map_err(|_| self.rejected(class, limit, amount, None, None))?;
         if let Some(local) = &local {
             local.counter(class).add(amount);
         }
@@ -769,7 +797,7 @@ impl<P: Policy> Quotas<P> {
         };
         // Policy and key callbacks may stop admission. Drop the completed owner
         // to roll back both counters while preserving completion and drain work.
-        if self.is_stopped() && mode == AdmissionMode::Ordinary && !P::allows_stopped(class) {
+        if self.is_stopped() && mode != AdmissionMode::Completion && !P::allows_stopped(class) {
             return Err(Error::Unavailable.into());
         }
         Ok(charge)
@@ -835,6 +863,7 @@ impl<P: Policy> Quotas<P> {
     fn rejected(
         &self,
         class: P::Class,
+        limit: usize,
         requested: usize,
         key_used: Option<usize>,
         key_limit: Option<usize>,
@@ -842,7 +871,7 @@ impl<P: Policy> Quotas<P> {
         self.report_rejection(Rejection::Resource {
             class,
             used: self.used(class),
-            limit: self.limit(class),
+            limit,
             requested,
             key_used,
             key_limit,
@@ -957,6 +986,16 @@ enum AdmissionMode {
 
     /// Existing work bypasses stop and fairness, but not hard limits.
     Completion,
+
+    /// Draining work obeys stop and fairness and may use the class headroom.
+    Priority,
+}
+
+/// Aggregate ceiling of ordinary and completion admission: the class limit
+/// less its priority headroom.
+fn ordinary_limit<P: Policy>(policy: &P, class: P::Class) -> usize {
+    let limit = policy.limit(class);
+    limit - policy.headroom(class).min(limit)
 }
 
 /// Worker-local key lookup; charges retain records independently.
@@ -1176,6 +1215,80 @@ mod quota_tests {
         assert_eq!(Error::Unavailable.to_string(), "flow control unavailable");
     }
 
+    /// Ordinary, completion, and shared admission stop at the headroom;
+    /// priority admission may fill it, under the same stop and fairness rules.
+    #[test]
+    fn priority_admission_alone_uses_the_class_headroom() {
+        let mut policy = TestPolicy::new(100, 4);
+        policy.headroom = 30;
+        let quotas = Quotas::new(policy.clone());
+        let key = "a".to_string();
+        let ordinary = quotas.reserve(Some(&key), Resource::Payload, 70).unwrap();
+        assert!(quotas.reserve(None, Resource::Payload, 1).is_err());
+        assert!(
+            quotas
+                .reserve_completion(None, Resource::Payload, 1)
+                .is_err()
+        );
+        assert!(quotas.shared().reserve(Resource::Payload, 1).is_err());
+        // The rejection reports the ordinary ceiling it was held to.
+        assert!(matches!(
+            policy.rejected.lock().unwrap().last(),
+            Some(Rejection::Resource {
+                limit: 70,
+                used: 70,
+                ..
+            })
+        ));
+        // Ordinary reclamation targets the ordinary ceiling.
+        assert_eq!(
+            quotas.reclamation(&"b".to_string(), Resource::Payload, 10),
+            Some((None, 10))
+        );
+        // Other classes keep their whole limit.
+        let other = quotas.reserve(None, Resource::Other, 100).unwrap();
+        let priority = quotas
+            .reserve_priority(Some(&key), Resource::Payload, 30)
+            .unwrap();
+        assert_eq!(quotas.used(Resource::Payload), 100);
+        assert!(
+            quotas.reserve_priority(None, Resource::Payload, 1).is_err(),
+            "the hard limit still binds"
+        );
+        drop(priority);
+        // Keyed fairness applies to priority admission too.
+        drop(other);
+        let other_key = "b".to_string();
+        let _b = quotas
+            .reserve(Some(&other_key), Resource::Other, 1)
+            .unwrap();
+        // Two active keys halve the share below what `a` already holds.
+        assert_eq!(quotas.fair_limit(&key, Resource::Payload), 50);
+        assert!(
+            quotas
+                .reserve_priority(Some(&key), Resource::Payload, 1)
+                .is_err()
+        );
+        assert!(
+            quotas
+                .reserve_priority(Some(&other_key), Resource::Payload, 30)
+                .is_ok()
+        );
+        // Stop refuses priority work like ordinary work.
+        drop(ordinary);
+        quotas.stop();
+        assert_eq!(
+            quotas.reserve_priority(None, Resource::Payload, 1).err(),
+            Some(Error::Unavailable)
+        );
+        // A headroom above the limit leaves ordinary admission nothing.
+        let mut policy = TestPolicy::new(10, 4);
+        policy.headroom = 20;
+        let quotas = Quotas::new(policy);
+        assert!(quotas.reserve(None, Resource::Payload, 1).is_err());
+        assert!(quotas.reserve_priority(None, Resource::Payload, 10).is_ok());
+    }
+
     /// Retried attempts stay quiet; only an explicit terminal report reaches policy.
     #[test]
     fn retrying_captures_without_reporting_until_terminal_report() {
@@ -1259,6 +1372,9 @@ mod quota_tests {
         limit_samples: Arc<Mutex<VecDeque<usize>>>,
 
         weights: Arc<Mutex<HashMap<String, u64>>>,
+
+        /// Payload bytes only priority admission may use.
+        headroom: usize,
     }
 
     impl TestPolicy {
@@ -1270,6 +1386,7 @@ mod quota_tests {
                 rejected: Arc::default(),
                 limit_samples: Arc::default(),
                 weights: Arc::default(),
+                headroom: 0,
             }
         }
     }
@@ -1293,6 +1410,15 @@ mod quota_tests {
         /// Configured key weights, defaulting to 1.
         fn weight(&self, key: &String) -> u64 {
             self.weights.lock().unwrap().get(key).copied().unwrap_or(1)
+        }
+
+        /// Only payload keeps a priority headroom.
+        fn headroom(&self, class: Resource) -> usize {
+            if matches!(class, Resource::Payload) {
+                self.headroom
+            } else {
+                0
+            }
         }
 
         /// Progress stays an equal split regardless of key weight.

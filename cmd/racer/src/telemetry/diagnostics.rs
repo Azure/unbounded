@@ -1890,8 +1890,9 @@ mod tests {
                         admission
                             .reserve(None, ResourceClass::Relay, usize::MAX)
                             .unwrap(),
+                        // Priority admission reaches the whole limit, headroom included.
                         admission
-                            .reserve(None, ResourceClass::Ciphertext, usize::MAX)
+                            .reserve_priority(None, ResourceClass::Ciphertext, usize::MAX)
                             .unwrap(),
                     )
                 })
