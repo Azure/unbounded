@@ -39,6 +39,15 @@ notices:
         link: https://docs.rs/crate/aes/0.9.3/source/LICENSE-APACHE
       - name: MIT License
         link: https://docs.rs/crate/aes/0.9.3/source/LICENSE-MIT
+  - dependency: aws-lc-rs
+    ecosystem: cargo
+    copyright:
+      - See LICENSE file
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/aws-lc-rs/1.19.0/source/LICENSE
+      - name: ISC License
+        link: https://docs.rs/crate/aws-lc-rs/1.19.0/source/LICENSE
   - dependency: base64
     ecosystem: cargo
     copyright:
@@ -913,21 +922,6 @@ notices:
         link: https://docs.rs/crate/regex/1.13.1/source/LICENSE-APACHE
       - name: MIT License
         link: https://docs.rs/crate/regex/1.13.1/source/LICENSE-MIT
-  - dependency: ring
-    ecosystem: cargo
-    copyright:
-      - Copyright (c) 2009 The Go Authors. All rights reserved.
-      - Copyright 2015 The Chromium Authors. All rights reserved.
-      - Copyright 2015-2025 Brian Smith.
-    license:
-      - name: Apache License, Version 2.0
-        link: https://docs.rs/crate/ring/0.17.14/source/LICENSE-BoringSSL
-      - name: BSD 3-Clause License
-        link: https://docs.rs/crate/ring/0.17.14/source/LICENSE-BoringSSL
-      - name: ISC License
-        link: https://docs.rs/crate/ring/0.17.14/source/LICENSE-other-bits
-      - name: MIT License
-        link: https://docs.rs/crate/ring/0.17.14/source/src/polyfill/once_cell/LICENSE-MIT
   - dependency: rustls
     ecosystem: cargo
     copyright:

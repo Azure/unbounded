@@ -129,7 +129,9 @@ pub fn seal(
 ///
 /// Only the master AES-256 key schedule and the CMAC subkey K1 are retained.
 /// Each call derives the per-nonce AES-256-GCM key and runs the bulk AEAD
-/// through ring, whose AES-GCM uses AES-NI/VAES and carry-less multiply.
+/// through aws-lc-rs, whose AES-GCM uses AES-NI/VAES and carry-less multiply
+/// and opens out of place, so a page decrypts from its source buffer into its
+/// destination in one pass.
 /// The output is byte-identical to the reference construction.
 pub(crate) struct PageCipher {
     // aes is built with its zeroize feature, so the schedule is wiped on drop.
@@ -170,19 +172,6 @@ impl PageCipher {
         Ok(kx)
     }
 
-    fn derive(&self, nonce: &[u8; 24]) -> Result<ring::aead::LessSafeKey, Error> {
-        let kx = self.derive_key(nonce)?;
-        let key = ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, &kx[..])
-            .map_err(|_| Error(()))?;
-        Ok(ring::aead::LessSafeKey::new(key))
-    }
-
-    fn gcm_nonce(nonce: &[u8; 24]) -> ring::aead::Nonce {
-        let mut tail = [0u8; 12];
-        tail.copy_from_slice(&nonce[12..]);
-        ring::aead::Nonce::assume_unique_for_key(tail)
-    }
-
     /// See [`seal`]. A wrong output length leaves `out` untouched; any later
     /// error zeroes it.
     pub(crate) fn seal(
@@ -196,13 +185,14 @@ impl PageCipher {
             return Err(Error(()));
         }
         let result = (|| {
-            let key = self.derive(nonce)?;
+            let kx = self.derive_key(nonce)?;
             let (ciphertext, tag_out) = out.split_at_mut(plaintext.len());
+            // aws-lc-rs seals only in place; sealing is off the receive path.
             ciphertext.copy_from_slice(plaintext);
-            let tag = key
+            let tag = gcm_key(&kx)?
                 .seal_in_place_separate_tag(
-                    Self::gcm_nonce(nonce),
-                    ring::aead::Aad::from(aad),
+                    gcm_nonce(nonce),
+                    aws_lc_rs::aead::Aad::from(aad),
                     ciphertext,
                 )
                 .map_err(|_| Error(()))?;
@@ -229,9 +219,13 @@ impl PageCipher {
             return Err(Error(()));
         }
         let (ciphertext, tag) = sealed.split_at(length);
-        // ring has no out-of-place open, so decrypt a copy in place.
-        out.copy_from_slice(ciphertext);
-        self.open_in_place(nonce, aad, out, tag)
+        let result = self
+            .derive_key(nonce)
+            .and_then(|kx| gcm_open(&kx, gcm_nonce(nonce), aad, ciphertext, tag, out));
+        if result.is_err() {
+            out.fill(0);
+        }
+        result
     }
 
     /// Open `inout`, which already holds the ciphertext body, in place against
@@ -244,24 +238,62 @@ impl PageCipher {
         inout: &mut [u8],
         tag: &[u8],
     ) -> Result<(), Error> {
-        let result = (|| {
-            let tag = ring::aead::Tag::try_from(tag).map_err(|_| Error(()))?;
-            let key = self.derive(nonce)?;
-            key.open_in_place_separate_tag(
-                Self::gcm_nonce(nonce),
-                ring::aead::Aad::from(aad),
-                tag,
-                inout,
-                0..,
-            )
-            .map(|_| ())
-            .map_err(|_| Error(()))
-        })();
+        let result = self
+            .derive_key(nonce)
+            .and_then(|kx| gcm_open_in_place(&kx, gcm_nonce(nonce), aad, inout, tag));
         if result.is_err() {
             inout.fill(0);
         }
         result
     }
+}
+
+/// The AES-GCM nonce: the last 12 bytes of the XAES nonce.
+fn gcm_nonce(nonce: &[u8; 24]) -> aws_lc_rs::aead::Nonce {
+    aws_lc_rs::aead::Nonce::assume_unique_for_key(std::array::from_fn(|i| nonce[12 + i]))
+}
+
+fn gcm_key(key: &[u8; 32]) -> Result<aws_lc_rs::aead::LessSafeKey, Error> {
+    let key = aws_lc_rs::aead::UnboundKey::new(&aws_lc_rs::aead::AES_256_GCM, key)
+        .map_err(|_| Error(()))?;
+    Ok(aws_lc_rs::aead::LessSafeKey::new(key))
+}
+
+/// AES-256-GCM open from `ciphertext` straight into `out` in one pass, with no
+/// staging copy. The two must not overlap. On error `out` may hold
+/// unauthenticated plaintext; callers zero it.
+fn gcm_open(
+    key: &[u8; 32],
+    nonce: aws_lc_rs::aead::Nonce,
+    aad: &[u8],
+    ciphertext: &[u8],
+    tag: &[u8],
+    out: &mut [u8],
+) -> Result<(), Error> {
+    if tag.len() != TAG_LEN || ciphertext.len() != out.len() {
+        return Err(Error(()));
+    }
+    gcm_key(key)?
+        .open_separate_gather(nonce, aws_lc_rs::aead::Aad::from(aad), ciphertext, tag, out)
+        .map_err(|_| Error(()))
+}
+
+/// AES-256-GCM open of `inout` in place. On error `inout` may hold
+/// unauthenticated plaintext; callers zero it.
+fn gcm_open_in_place(
+    key: &[u8; 32],
+    nonce: aws_lc_rs::aead::Nonce,
+    aad: &[u8],
+    inout: &mut [u8],
+    tag: &[u8],
+) -> Result<(), Error> {
+    if tag.len() != TAG_LEN {
+        return Err(Error(()));
+    }
+    gcm_key(key)?
+        .open_in_place_separate_tag(nonce, aws_lc_rs::aead::Aad::from(aad), tag, inout)
+        .map(|_| ())
+        .map_err(|_| Error(()))
 }
 
 impl PageCipher {
@@ -475,25 +507,34 @@ impl DerivedPageKey {
     /// including a bad tag length, zeroes `inout`, since a failed tag check
     /// leaves unauthenticated plaintext behind.
     pub fn open_in_place(&self, aad: &[u8], inout: &mut [u8], tag: &[u8]) -> Result<(), Error> {
-        let result = (|| {
-            let tag = ring::aead::Tag::try_from(tag).map_err(|_| Error(()))?;
-            let key = ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, &self.key[..])
-                .map_err(|_| Error(()))?;
-            ring::aead::LessSafeKey::new(key)
-                .open_in_place_separate_tag(
-                    ring::aead::Nonce::assume_unique_for_key(self.nonce),
-                    ring::aead::Aad::from(aad),
-                    tag,
-                    inout,
-                    0..,
-                )
-                .map(|_| ())
-                .map_err(|_| Error(()))
-        })();
+        let result = gcm_open_in_place(&self.key, self.gcm_nonce(), aad, inout, tag);
         if result.is_err() {
             inout.fill(0);
         }
         result
+    }
+
+    /// Authenticate and decrypt the ciphertext body `ciphertext` against the
+    /// separate 16-byte `tag`, writing the plaintext to `out` in one pass.
+    /// `out` must be exactly as long as `ciphertext` and must not overlap it.
+    /// Any failure, including a bad length, zeroes `out`, since a failed tag
+    /// check leaves unauthenticated plaintext behind.
+    pub fn open_into(
+        &self,
+        aad: &[u8],
+        ciphertext: &[u8],
+        tag: &[u8],
+        out: &mut [u8],
+    ) -> Result<(), Error> {
+        let result = gcm_open(&self.key, self.gcm_nonce(), aad, ciphertext, tag, out);
+        if result.is_err() {
+            out.fill(0);
+        }
+        result
+    }
+
+    fn gcm_nonce(&self) -> aws_lc_rs::aead::Nonce {
+        aws_lc_rs::aead::Nonce::assume_unique_for_key(self.nonce)
     }
 }
 

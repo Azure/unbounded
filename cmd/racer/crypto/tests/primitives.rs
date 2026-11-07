@@ -1564,3 +1564,153 @@ fn derived_key_opens_in_place_and_wipes_on_failure() {
 fn test_vector<const N: usize>(bytes: [u8; N]) -> [u8; N] {
     core::array::from_fn(|index| bytes[index] ^ u8::from(index >= N))
 }
+
+/// `open_into` decrypts out of place to the same plaintext as `open`, and
+/// zeroes the destination on a bad tag, AAD, body, or length.
+#[test]
+fn derived_key_opens_into_and_wipes_on_failure() {
+    let key = test_vector([4; 32]);
+    let nonce = test_vector([8; 24]);
+    let aad = b"page aad".to_vec();
+    for length in [0usize, 1, 15, 16, 17, 4096 + 5] {
+        let plaintext: Vec<u8> = (0..length).map(|i| i as u8 ^ 0xa5).collect();
+        let mut sealed = vec![0; length + TAG_LEN];
+        seal(&key, &nonce, &aad, &plaintext, &mut sealed).unwrap();
+        let derived = racer_crypto::xaes_derive(&key, &nonce);
+        let (ciphertext, tag) = sealed.split_at(length);
+
+        let mut out = vec![0xee; length];
+        derived.open_into(&aad, ciphertext, tag, &mut out).unwrap();
+        assert_eq!(out, plaintext);
+
+        let wiped = |result: Result<(), racer_crypto::Error>, out: &[u8]| {
+            assert!(result.is_err());
+            assert!(out.iter().all(|&b| b == 0));
+        };
+        let mut out = vec![0xee; length];
+        wiped(derived.open_into(b"other", ciphertext, tag, &mut out), &out);
+
+        let mut bad_tag = tag.to_vec();
+        bad_tag[15] ^= 1;
+        let mut out = vec![0xee; length];
+        wiped(derived.open_into(&aad, ciphertext, &bad_tag, &mut out), &out);
+
+        let mut out = vec![0xee; length];
+        wiped(derived.open_into(&aad, ciphertext, &tag[..15], &mut out), &out);
+
+        let mut out = vec![0xee; length + 1];
+        wiped(derived.open_into(&aad, ciphertext, tag, &mut out), &out);
+
+        if length > 0 {
+            let mut body = ciphertext.to_vec();
+            body[length / 2] ^= 0x80;
+            let mut out = vec![0xee; length];
+            wiped(derived.open_into(&aad, &body, tag, &mut out), &out);
+        }
+    }
+}
+
+/// Pages sealed by the previous ring AES-256-GCM backend open with the
+/// current one, and pages sealed now open with ring: the wire format is
+/// unchanged.
+#[test]
+fn page_aead_interoperates_with_ring() {
+    use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
+    let mut state = 0x243f_6a88_85a3_08d3u64;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state as u8
+    };
+    for round in 0..48 {
+        let key: [u8; 32] = std::array::from_fn(|_| next());
+        let nonce: [u8; 24] = std::array::from_fn(|_| next());
+        let plaintext: Vec<u8> = (0..round * 131).map(|_| next()).collect();
+        let aad: Vec<u8> = (0..round % 40).map(|_| next()).collect();
+        let derived = racer_crypto::xaes_derive(&key, &nonce);
+        let ring_key = || {
+            LessSafeKey::new(UnboundKey::new(&AES_256_GCM, derived.key()).unwrap())
+        };
+        let ring_nonce = || Nonce::assume_unique_for_key(*derived.nonce());
+
+        // ring seals; the current backend opens.
+        let mut ring_sealed = plaintext.clone();
+        let tag = ring_key()
+            .seal_in_place_separate_tag(ring_nonce(), Aad::from(&aad), &mut ring_sealed)
+            .unwrap();
+        ring_sealed.extend_from_slice(tag.as_ref());
+        let mut out = vec![0; plaintext.len()];
+        open(&key, &nonce, &aad, &ring_sealed, &mut out).unwrap();
+        assert_eq!(out, plaintext);
+
+        // The current backend seals byte for byte like ring; ring opens it.
+        let mut sealed = vec![0; plaintext.len() + TAG_LEN];
+        seal(&key, &nonce, &aad, &plaintext, &mut sealed).unwrap();
+        assert_eq!(sealed, ring_sealed);
+        let (body, tag) = sealed.split_at_mut(plaintext.len());
+        ring_key()
+            .open_in_place_separate_tag(
+                ring_nonce(),
+                Aad::from(&aad),
+                ring::aead::Tag::try_from(&*tag).unwrap(),
+                body,
+                0..,
+            )
+            .unwrap();
+        assert_eq!(body, &plaintext[..]);
+    }
+}
+
+/// Per 16 MiB page cost of copy-then-open-in-place (the ring-era receive
+/// path) versus one-pass out-of-place open. Run with
+/// `cargo test -p racer-crypto --release --test primitives -- --ignored page_open_bench --nocapture`.
+#[test]
+#[ignore = "benchmark"]
+fn page_open_bench() {
+    const PAGE: usize = 16 << 20;
+    const ROUNDS: u32 = 32;
+    let key = test_vector([5; 32]);
+    let nonce = test_vector([6; 24]);
+    let aad = b"bench aad".to_vec();
+    let plaintext: Vec<u8> = (0..PAGE).map(|i| (i * 31) as u8).collect();
+    let mut sealed = vec![0; PAGE + TAG_LEN];
+    seal(&key, &nonce, &aad, &plaintext, &mut sealed).unwrap();
+    let (ciphertext, tag) = sealed.split_at(PAGE);
+    let derived = racer_crypto::xaes_derive(&key, &nonce);
+    let mut out = vec![0u8; PAGE];
+    let mut time = |label: &str, f: &mut dyn FnMut(&mut [u8])| {
+        f(&mut out);
+        let start = std::time::Instant::now();
+        for _ in 0..ROUNDS {
+            f(&mut out);
+        }
+        let ms = start.elapsed().as_secs_f64() * 1e3 / f64::from(ROUNDS);
+        assert_eq!(out, plaintext);
+        println!("{label}: {ms:.3} ms/page ({:.2} GB/s)", PAGE as f64 / ms / 1e6);
+    };
+    let mut ring_path = |dst: &mut [u8]| {
+        use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, Tag, UnboundKey};
+        dst.copy_from_slice(ciphertext);
+        LessSafeKey::new(UnboundKey::new(&AES_256_GCM, derived.key()).unwrap())
+            .open_in_place_separate_tag(
+                Nonce::assume_unique_for_key(*derived.nonce()),
+                Aad::from(&aad),
+                Tag::try_from(tag).unwrap(),
+                dst,
+                0..,
+            )
+            .unwrap();
+    };
+    time("ring copy + open in place", &mut ring_path);
+    time("aws-lc copy + open in place", &mut |dst: &mut [u8]| {
+        dst.copy_from_slice(ciphertext);
+        derived.open_in_place(&aad, dst, tag).unwrap();
+    });
+    time("aws-lc open out of place", &mut |dst: &mut [u8]| {
+        derived.open_into(&aad, ciphertext, tag, dst).unwrap();
+    });
+    time("open (XAES derive + out of place)", &mut |dst: &mut [u8]| {
+        open(&key, &nonce, &aad, &sealed, dst).unwrap();
+    });
+}
