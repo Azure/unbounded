@@ -136,7 +136,10 @@ func (p *memfdPool) get(size int64) (*memfd, error) {
 		// A memfd that cannot shrink lets Racer map it and decrypt pages
 		// straight into it. The file can still grow.
 		if _, err := unix.FcntlInt(uintptr(fd), unix.F_ADD_SEALS, unix.F_SEAL_SHRINK); err != nil {
-			_ = unix.Close(fd)
+			if cerr := unix.Close(fd); cerr != nil {
+				return nil, fmt.Errorf("seal memfd: %w (close: %w)", err, cerr)
+			}
+
 			return nil, fmt.Errorf("seal memfd: %w", err)
 		}
 
