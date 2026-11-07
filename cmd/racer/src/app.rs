@@ -1058,6 +1058,8 @@ pub struct WorkerApplication {
     /// What reactivation after a device loss last waited for, as logged, so
     /// each change logs once.
     rdma_waiting: Option<String>,
+    /// The native task attaches GPU landings, not activates.
+    attaching_landings: bool,
 
     /// Next sysfs presence probe of the active rails.
     rail_probe: std::time::Instant,
@@ -1723,6 +1725,7 @@ impl WorkerApplication {
             rdma_losses_seen: 0,
             rdma_lost: None,
             rdma_waiting: None,
+            attaching_landings: false,
             rail_probe: started,
             rdma_sysfs: crate::rdma::SYSFS_INFINIBAND.into(),
             telemetry: Rc::new(telemetry),

@@ -271,6 +271,15 @@ impl WorkerApplication {
             && let Poll::Ready(result) = task.as_mut().poll(cx)
         {
             self.native_task = None;
+            // An activation that selected no rail is a failure too: counted,
+            // logged, and retried, never a silent idle round.
+            let result = match result {
+                Ok(rails) if rails.is_empty() && !self.attaching_landings => {
+                    Err(Error::Unavailable)
+                }
+                result => result,
+            };
+            self.attaching_landings = false;
             match &result {
                 Err(error) => {
                     links.close();
@@ -323,6 +332,7 @@ impl WorkerApplication {
             && links.node().take_landing_pending()
         {
             let rails = self.actual_rails.clone();
+            self.attaching_landings = true;
             let turn = scope(&self.ctx().clock, Duration::from_secs(5))?;
             self.native_task = Some(Box::pin(async move {
                 links.attach_landings(&rails, &turn).await;
@@ -345,12 +355,31 @@ impl WorkerApplication {
         let publication = match self.native_publication() {
             // Not a member yet: a new node joins only after it serves.
             // Activate once a publication lists it.
-            Err(Error::IncompatibleMembership) => return Ok(()),
-            result => result?,
+            Err(Error::IncompatibleMembership) => {
+                self.note_waiting(Some("membership_missing".into()));
+                return Ok(());
+            }
+            Err(error) => {
+                self.note_waiting(Some(format!("publication:{error:?}")));
+                return Err(error);
+            }
+            Ok(publication) => publication,
         };
         if publication.is_empty() {
+            self.note_waiting(Some(format!(
+                "publication_empty:discovered={}",
+                self.discovered_nics.len()
+            )));
             return Ok(());
         }
+        self.note_waiting(None);
+        eprintln!(
+            "racer: stage=rdma-activation state=starting rails={:?}",
+            publication
+                .iter()
+                .map(|m| m.device.as_str())
+                .collect::<Vec<_>>()
+        );
         let admission = self.runtime.admission.clone();
         let registered = admission.limit(crate::admission::ResourceClass::Registered);
         let turn = scope(
@@ -581,15 +610,25 @@ impl WorkerApplication {
             crate::telemetry::Gauge::RdmaWaitingDrain,
             u64::from(matches!(&waiting, Some(w) if w.starts_with("drain"))),
         );
-        if waiting != self.rdma_waiting {
-            if let Some(reason) = &waiting {
-                eprintln!(
-                    "racer: stage=rdma-device state=waiting reason={reason}; reactivating once it clears"
-                );
-            }
-            self.rdma_waiting = waiting.clone();
+        let clear = waiting.is_none();
+        if !clear {
+            self.note_waiting(waiting);
         }
-        waiting.is_none()
+        clear
+    }
+
+    /// Log once per change why RDMA is not activating after a device loss.
+    fn note_waiting(&mut self, waiting: Option<String>) {
+        if self.rdma_lost.is_none() || waiting == self.rdma_waiting {
+            return;
+        }
+        match &waiting {
+            Some(reason) => eprintln!(
+                "racer: stage=rdma-device state=waiting reason={reason}; reactivating once it clears"
+            ),
+            None => eprintln!("racer: stage=rdma-device state=ready; activating"),
+        }
+        self.rdma_waiting = waiting;
     }
 
     /// What reactivation after a device loss waits for, or `None` once it
