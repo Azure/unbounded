@@ -1593,10 +1593,16 @@ fn derived_key_opens_into_and_wipes_on_failure() {
         let mut bad_tag = tag.to_vec();
         bad_tag[15] ^= 1;
         let mut out = vec![0xee; length];
-        wiped(derived.open_into(&aad, ciphertext, &bad_tag, &mut out), &out);
+        wiped(
+            derived.open_into(&aad, ciphertext, &bad_tag, &mut out),
+            &out,
+        );
 
         let mut out = vec![0xee; length];
-        wiped(derived.open_into(&aad, ciphertext, &tag[..15], &mut out), &out);
+        wiped(
+            derived.open_into(&aad, ciphertext, &tag[..15], &mut out),
+            &out,
+        );
 
         let mut out = vec![0xee; length + 1];
         wiped(derived.open_into(&aad, ciphertext, tag, &mut out), &out);
@@ -1629,9 +1635,7 @@ fn page_aead_interoperates_with_ring() {
         let plaintext: Vec<u8> = (0..round * 131).map(|_| next()).collect();
         let aad: Vec<u8> = (0..round % 40).map(|_| next()).collect();
         let derived = racer_crypto::xaes_derive(&key, &nonce);
-        let ring_key = || {
-            LessSafeKey::new(UnboundKey::new(&AES_256_GCM, derived.key()).unwrap())
-        };
+        let ring_key = || LessSafeKey::new(UnboundKey::new(&AES_256_GCM, derived.key()).unwrap());
         let ring_nonce = || Nonce::assume_unique_for_key(*derived.nonce());
 
         // ring seals; the current backend opens.
@@ -1687,7 +1691,10 @@ fn page_open_bench() {
         }
         let ms = start.elapsed().as_secs_f64() * 1e3 / f64::from(ROUNDS);
         assert_eq!(out, plaintext);
-        println!("{label}: {ms:.3} ms/page ({:.2} GB/s)", PAGE as f64 / ms / 1e6);
+        println!(
+            "{label}: {ms:.3} ms/page ({:.2} GB/s)",
+            PAGE as f64 / ms / 1e6
+        );
     };
     let mut ring_path = |dst: &mut [u8]| {
         use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, Tag, UnboundKey};
@@ -1710,7 +1717,10 @@ fn page_open_bench() {
     time("aws-lc open out of place", &mut |dst: &mut [u8]| {
         derived.open_into(&aad, ciphertext, tag, dst).unwrap();
     });
-    time("open (XAES derive + out of place)", &mut |dst: &mut [u8]| {
-        open(&key, &nonce, &aad, &sealed, dst).unwrap();
-    });
+    time(
+        "open (XAES derive + out of place)",
+        &mut |dst: &mut [u8]| {
+            open(&key, &nonce, &aad, &sealed, dst).unwrap();
+        },
+    );
 }
