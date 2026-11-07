@@ -1951,11 +1951,44 @@ HTTP without waiting for their deadlines. It also deactivates RDMA, so
 advertising its rails, the same way as after a failed activation. Each loss
 logs `stage=rdma-device state=lost` and counts `racer_rdma_device_losses_total`.
 While the device is missing, the dataplane does not retry activation. Once
-every lost PCI address is back in sysfs and the old links and page buffers are
-released, it reactivates RDMA. A device that came back under a new name
+every lost PCI address is back in sysfs and the old links are gone, it
+reactivates RDMA. It does not wait for received pages that are still held, for
+example by a read in progress: no NIC can reach them once their device is gone,
+so their page buffers are freed later, when the pages are released. Until then
+they stay counted against `RACER_REGISTERED_BYTES`, so a reactivation that
+cannot fund its pool yet fails and retries. While it waits, the dataplane logs
+`stage=rdma-device state=waiting reason=...` each time the reason changes:
+`device_missing:<device>`, `device_inactive:<device>` (back, but no port is
+ACTIVE yet), `device_settling`, `drain_<blocker>` (the old round is still
+releasing its `links`, its `buffers` that a NIC may still use, its
+`registering` pools, or never releases a `leaked` native object),
+`inventory_refresh:<error>`, or `device_undiscovered`.
+Device names at each lost PCI address must hold still for 5 seconds before
+the dataplane lists devices again, so a udev rename of a replugged VF (for
+example `mana_0` to `roceP30832p0s0`) lands first: libibverbs keeps the name it
+first saw for the life of the process. Before the first reopen after a loss,
+the dataplane creates fresh `/dev/char/<major>:<minor>` nodes for every verbs
+character device in `/sys/class/infiniband_verbs`, because a container's
+bind-mounted `/dev/infiniband/uverbsN` keeps reaching the removed device and
+rdma-core falls back to `/dev/char`. After a loss, activation retries every
+2 seconds instead of backing off. Once the device is back with an ACTIVE port,
+6 consecutive attempts that cannot use it log `stage=rdma-device
+state=restarting reason=device_unusable` and fail the worker, so the process
+restarts with a fresh verbs device list. Reads use HTTP until then.
+`racer_rdma_reactivation_waiting_device` is 1 while it waits for a device and
+`racer_rdma_reactivation_waiting_drain` is 1 while it waits for the old round.
+A failed activation logs `stage=rdma-activation state=failed` when it withdraws
+the rails, and again on the 1st, 2nd, 4th, 8th, and so on consecutive failed
+retry. A device that came back under a new name
 refreshes the device inventory first; rails are keyed by PCI address, so it
-keeps its rail. A successful reactivation logs `stage=rdma-device
-state=reactivated` and counts `racer_rdma_device_reactivations_total`.
+keeps its rail. Only ports with a non-null GID are inventoried, so a VF that
+comes back as two devices at one PCI address (for example `rdmaP30832p0s0`
+with a null GID and `roceP30832p0s0` with the RoCE GID) uses the RoCE one.
+While its rails are withdrawn, the membership lists none for this node, so
+reactivation (like the retry after a failed activation) uses the discovered
+rails and then advertises them again. A successful reactivation logs
+`stage=rdma-device state=reactivated` and counts
+`racer_rdma_device_reactivations_total`.
 
 The RDMA owner thread hands queue pair and connection manager teardowns to
 helper threads named `racer-rdma-reaper`, at most one teardown every 2 ms per
