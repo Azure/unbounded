@@ -115,3 +115,50 @@ func FileSHA256(path string) ([sha256.Size]byte, error) {
 
 	return digest, nil
 }
+
+// WriteFileAtomic writes data to path through a uniquely named temporary file
+// in the same directory and a rename, creating missing parent directories with
+// mode 0755. It is durable: the file is synced before the rename, and the
+// directory holding it, and every parent it created, is synced after, so a
+// crash leaves either the old content or the new one and never a missing or
+// partial file. Two concurrent writers never share a temporary file.
+func WriteFileAtomic(path string, data []byte, mode os.FileMode) error {
+	var created []string
+
+	for dir := filepath.Dir(path); ; dir = filepath.Dir(dir) {
+		_, err := os.Stat(dir)
+		if err == nil {
+			break
+		}
+
+		if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+
+		created = append(created, dir)
+	}
+
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+
+	// renameio syncs the temporary file before it renames it into place.
+	if err := renameio.WriteFile(path, data, mode, renameio.WithTempDir(filepath.Dir(path))); err != nil {
+		return err
+	}
+
+	// The file's own directory first, then each directory this call created,
+	// and the existing directory that holds the topmost of them.
+	dirs := []string{filepath.Dir(path)}
+	for _, dir := range created {
+		dirs = append(dirs, filepath.Dir(dir))
+	}
+
+	for _, dir := range dirs {
+		if err := SyncDir(dir); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}

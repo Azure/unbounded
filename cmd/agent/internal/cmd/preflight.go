@@ -30,6 +30,9 @@ type preflightHandler struct {
 	output                string
 	writer                io.Writer
 	checks                []preflight.Checker
+	// installation is the install-state store admission reads. Nil means the
+	// host's default store; tests point it at a temporary directory.
+	installation *installstate.Store
 }
 
 func newCmdPreflight(cmdCtx *CommandContext) *cobra.Command {
@@ -88,7 +91,12 @@ func (h *preflightHandler) execute(ctx context.Context) error {
 		return err
 	}
 
-	_, disposition, err := installstate.Admit(installstate.DefaultStore(), id.MachineName, id.ConfigFingerprint)
+	installation := h.installation
+	if installation == nil {
+		installation = installstate.DefaultStore()
+	}
+
+	_, disposition, err := installstate.Admit(installation, id.MachineName, id.ConfigFingerprint)
 	if err != nil {
 		return err
 	}

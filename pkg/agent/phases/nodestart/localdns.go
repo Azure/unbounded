@@ -36,7 +36,7 @@ func (c *configureLocalDNS) Do(_ context.Context) error {
 		return nil
 	}
 
-	root := filepath.Join(c.goalState.MachineDir, "etc/unbounded/localdns")
+	root := c.goalState.Root().Path("etc/unbounded/localdns")
 	if err := utilio.WriteFile(filepath.Join(root, "Corefile"), c.goalState.LocalDNS.Corefile, 0o644); err != nil {
 		return fmt.Errorf("write LocalDNS Corefile: %w", err)
 	}
@@ -63,7 +63,7 @@ func (c *configureLocalDNS) Do(_ context.Context) error {
 		return fmt.Errorf("render LocalDNS slice: %w", err)
 	}
 
-	if err := utilio.WriteFile(filepath.Join(c.goalState.MachineDir, "etc/systemd/system", goalstates.LocalDNSSliceUnit), slice.Bytes(), 0o644); err != nil {
+	if err := utilio.WriteFile(c.goalState.Root().Path(filepath.Join("etc/systemd/system", goalstates.LocalDNSSliceUnit)), slice.Bytes(), 0o644); err != nil {
 		return fmt.Errorf("write LocalDNS slice: %w", err)
 	}
 
@@ -84,8 +84,8 @@ func (c *configureLocalDNS) Do(_ context.Context) error {
 
 	resolverContent := []byte(strings.Join(resolverLines, "\n") + "\n")
 	for _, resolvPath := range []string{
-		filepath.Join(c.goalState.MachineDir, "etc/resolv.conf"),
-		filepath.Join(c.goalState.MachineDir, strings.TrimPrefix(goalstates.LocalDNSResolvConfPath, "/")),
+		c.goalState.Root().Path("etc/resolv.conf"),
+		c.goalState.Root().Path(strings.TrimPrefix(goalstates.LocalDNSResolvConfPath, "/")),
 	} {
 		if err := utilio.WriteFile(resolvPath, resolverContent, 0o644); err != nil {
 			return fmt.Errorf("write machine resolver %s: %w", resolvPath, err)

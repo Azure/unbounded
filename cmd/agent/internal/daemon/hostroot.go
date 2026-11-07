@@ -65,7 +65,7 @@ func reconcileHostRootUnderLock(ctx context.Context, log *slog.Logger, store *in
 // the legacy root, removes the binary install scripts seed there for older
 // agents. It reports whether the daemon has to be restarted from the moved
 // files, which it is by stopping; see ErrRestartRequested.
-func reconcileHostRoot(ctx context.Context, log *slog.Logger, operator nodeOperator, active *ActiveMachine) (bool, error) {
+func reconcileHostRoot(ctx context.Context, log *slog.Logger, lifecycle lifecycleMigrator, active *ActiveMachine) (bool, error) {
 	released, err := hostroot.LegacyReleased()
 	if err != nil {
 		return false, err
@@ -91,7 +91,7 @@ func reconcileHostRoot(ctx context.Context, log *slog.Logger, operator nodeOpera
 		CurrentPath:  paths.CurrentPath,
 		LastGoodPath: paths.LastGoodPath,
 		RewriteUnits: func(ctx context.Context) error {
-			return rewriteHostRootUnits(ctx, log, operator, active)
+			return rewriteHostRootUnits(ctx, log, lifecycle, active)
 		},
 		Verify: verifyMovedDaemon,
 		// The restart itself is the daemon stopping, once this returns.
@@ -139,7 +139,7 @@ func verifyMovedDaemon(ctx context.Context, root string) error {
 
 // rewriteHostRootUnits points every unit and script that names the agent's
 // files at the files under the host root.
-func rewriteHostRootUnits(ctx context.Context, log *slog.Logger, operator nodeOperator, active *ActiveMachine) error {
+func rewriteHostRootUnits(ctx context.Context, log *slog.Logger, lifecycle lifecycleMigrator, active *ActiveMachine) error {
 	paths, err := goalstates.ResolvedAgentUpgradePaths()
 	if err != nil {
 		return err
@@ -167,7 +167,7 @@ func rewriteHostRootUnits(ctx context.Context, log *slog.Logger, operator nodeOp
 
 	// Last, because it reloads systemd: the nspawn lifecycle helper, the
 	// machine's service override and its config regeneration unit.
-	if err := operator.EnsureLifecycleMigration(ctx, log, active); err != nil {
+	if err := lifecycle.EnsureLifecycleMigration(ctx, log, active); err != nil {
 		return err
 	}
 
