@@ -93,13 +93,15 @@ archives:
     formats:
       - tar.gz
     name_template: "unbounded-agent-{{ .Os }}-{{ .Arch }}"
+    # Only the binary until #1094: agents from before the fix for #1093 reject
+    # AgentUpgrade archives holding any other file. Leaving `files` out would
+    # add LICENSE* and README*; `none*` matches nothing.
     files:
-      - LICENSE
-      - NOTICE
+      - none*
 
   # Direct-download consumers can use the agent without extracting an archive.
   # These binaries are included in checksums.txt alongside the existing archives.
-  # LICENSE and NOTICE remain in the tar.gz; binary outputs carry no extra files.
+  # Binary outputs carry no extra files.
   - id: unbounded-agent-binary
     ids:
       - unbounded-agent

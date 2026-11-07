@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -22,11 +21,6 @@ import (
 	"time"
 
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
-)
-
-const (
-	defaultMaxArchiveBytes = 256 << 20 // 256 MiB
-	defaultMaxBinaryBytes  = 256 << 20 // 256 MiB
 )
 
 // Layout describes caller-owned blue-green agent binary paths.
@@ -39,18 +33,18 @@ type Layout struct {
 	LastGoodPath string
 }
 
-// InstallOptions configures a bounded agent release archive install.
+// InstallOptions configures an agent release archive install.
 type InstallOptions struct {
 	DownloadURL string
 	// ExpectedSHA256 may be empty only when the caller trusts both the archive
 	// source and the transport path.
-	ExpectedSHA256    string
-	ExpectedMember    string
-	Mode              os.FileMode
-	MaxArchiveBytes   int64
-	MaxExtractedBytes int64
-	HTTPClient        *http.Client
-	ExactMember       bool
+	ExpectedSHA256 string
+	// ExpectedMember is the file to install from the archive root, with or
+	// without a "./" prefix. Every other archive entry is ignored, including
+	// entries elsewhere in the archive with the same name.
+	ExpectedMember string
+	Mode           os.FileMode
+	HTTPClient     *http.Client
 }
 
 // SwitchResult describes a completed blue-green binary switch.
@@ -92,28 +86,8 @@ func normalizeInstallOptions(opts InstallOptions) (normalizedInstallOptions, err
 		return normalizedInstallOptions{}, fmt.Errorf("agent binary mode must contain permission bits only")
 	}
 
-	if opts.MaxArchiveBytes < 0 || opts.MaxExtractedBytes < 0 {
-		return normalizedInstallOptions{}, fmt.Errorf("agent archive size limits must not be negative")
-	}
-
-	if opts.MaxArchiveBytes > math.MaxInt64-1 {
-		return normalizedInstallOptions{}, fmt.Errorf("maximum archive size is too large")
-	}
-
-	if opts.MaxExtractedBytes > math.MaxInt64/2 {
-		return normalizedInstallOptions{}, fmt.Errorf("maximum extracted size is too large")
-	}
-
 	if opts.Mode == 0 {
 		opts.Mode = daemonBinaryMode
-	}
-
-	if opts.MaxArchiveBytes == 0 {
-		opts.MaxArchiveBytes = defaultMaxArchiveBytes
-	}
-
-	if opts.MaxExtractedBytes == 0 {
-		opts.MaxExtractedBytes = defaultMaxBinaryBytes
 	}
 
 	opts.HTTPClient = boundedHTTPClient(opts.HTTPClient)
@@ -172,24 +146,22 @@ func installFromTarGz(ctx context.Context, targetPath string, opts InstallOption
 		normalized.parsedURL,
 		normalized.expectedDigest,
 		normalized.verifyDigest,
-		opts.MaxArchiveBytes,
 	)
 	if err != nil {
 		return err
 	}
 	defer os.Remove(archivePath) //nolint:errcheck // temporary archive cleanup
 
-	if err := extractOnlyArchiveMember(archivePath, targetPath, opts); err != nil {
+	if err := extractArchiveMember(archivePath, targetPath, opts); err != nil {
 		return err
 	}
 
 	return Verify(ctx, targetPath)
 }
 
-// InstallAndSwitchFromTarGz downloads a bounded HTTP or HTTPS release
-// archive, installs the configured member into the inactive slot, and atomically
-// updates the last-good and current links. When ExactMember is set, the archive
-// must contain only the exact configured base name.
+// InstallAndSwitchFromTarGz downloads an HTTP or HTTPS release archive,
+// installs the configured member into the inactive slot, and atomically
+// updates the last-good and current links.
 func InstallAndSwitchFromTarGz(
 	ctx context.Context,
 	log *slog.Logger,
@@ -225,7 +197,7 @@ func InstallAndSwitchFromTarGz(
 		targetPath = paths.GreenPath
 	}
 
-	archivePath, err := downloadArchive(ctx, opts.HTTPClient, parsedURL, expectedDigest, verifyDigest, opts.MaxArchiveBytes)
+	archivePath, err := downloadArchive(ctx, opts.HTTPClient, parsedURL, expectedDigest, verifyDigest)
 	if err != nil {
 		return SwitchResult{}, err
 	}
@@ -245,7 +217,7 @@ func InstallAndSwitchFromTarGz(
 		}
 	}
 
-	if err := extractOnlyArchiveMember(archivePath, targetPath, opts); err != nil {
+	if err := extractArchiveMember(archivePath, targetPath, opts); err != nil {
 		return SwitchResult{}, err
 	}
 
@@ -355,7 +327,6 @@ func downloadArchive(
 	parsedURL *url.URL,
 	expected [sha256.Size]byte,
 	verifyDigest bool,
-	maxBytes int64,
 ) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, parsedURL.String(), http.NoBody)
 	if err != nil {
@@ -376,10 +347,6 @@ func downloadArchive(
 		return "", fmt.Errorf("download agent archive from %s: HTTP status %d", redactedURL(parsedURL), resp.StatusCode)
 	}
 
-	if resp.ContentLength > maxBytes {
-		return "", fmt.Errorf("agent archive exceeds %d-byte limit", maxBytes)
-	}
-
 	temp, err := os.CreateTemp("", "agent-upgrade-*.tar.gz")
 	if err != nil {
 		return "", fmt.Errorf("create temporary agent archive: %w", err)
@@ -398,13 +365,8 @@ func downloadArchive(
 
 	hasher := sha256.New()
 
-	n, err := io.Copy(io.MultiWriter(temp, hasher), io.LimitReader(resp.Body, maxBytes+1))
-	if err != nil {
+	if _, err := io.Copy(io.MultiWriter(temp, hasher), resp.Body); err != nil {
 		return "", fmt.Errorf("read agent archive: %w", err)
-	}
-
-	if n > maxBytes {
-		return "", fmt.Errorf("agent archive exceeds %d-byte limit", maxBytes)
 	}
 
 	if verifyDigest && !equalDigest(hasher.Sum(nil), expected[:]) {
@@ -420,7 +382,10 @@ func downloadArchive(
 	return path, nil
 }
 
-func extractOnlyArchiveMember(archivePath, targetPath string, opts InstallOptions) (err error) {
+// extractArchiveMember installs the archive's ExpectedMember at targetPath. The
+// binary is staged beside targetPath and renamed into place only after the
+// archive is accepted, so a rejected archive leaves targetPath unchanged.
+func extractArchiveMember(archivePath, targetPath string, opts InstallOptions) (err error) {
 	archive, err := os.Open(archivePath)
 	if err != nil {
 		return fmt.Errorf("open agent archive: %w", err)
@@ -438,99 +403,82 @@ func extractOnlyArchiveMember(archivePath, targetPath string, opts InstallOption
 	}
 	defer gz.Close() //nolint:errcheck // extraction reports read errors
 
-	found := false
-	stagedPath := ""
+	tarReader := tar.NewReader(gz)
 
-	defer func() {
-		if stagedPath != "" {
-			os.Remove(stagedPath) //nolint:errcheck // best effort staged file cleanup
-		}
-	}()
-
-	decompressed := &countingReader{reader: io.LimitReader(gz, 2*opts.MaxExtractedBytes+1)}
-
-	tarReader := tar.NewReader(decompressed)
 	for {
-		header, nextErr := tarReader.Next()
-		if errors.Is(nextErr, io.EOF) {
-			break
+		header, err := tarReader.Next()
+		if errors.Is(err, io.EOF) {
+			return fmt.Errorf("agent archive does not contain %q at its root", opts.ExpectedMember)
 		}
 
-		if nextErr != nil {
-			return fmt.Errorf("read agent archive: %w", nextErr)
+		if err != nil {
+			return fmt.Errorf("read agent archive: %w", err)
 		}
 
-		memberName := filepath.Clean(header.Name)
-		if !safeArchiveName(header.Name, opts.ExactMember) {
-			return fmt.Errorf("agent archive contains unsafe member name %q", header.Name)
-		}
-
-		if opts.ExactMember && header.Name != opts.ExpectedMember {
-			return fmt.Errorf("agent archive contains unexpected member %q", header.Name)
-		}
-
-		if !opts.ExactMember && filepath.Base(memberName) != opts.ExpectedMember {
+		if strings.TrimPrefix(header.Name, "./") != opts.ExpectedMember {
 			continue
 		}
 
-		if found {
-			return fmt.Errorf("agent archive contains duplicate member %q", opts.ExpectedMember)
+		if header.Typeflag != tar.TypeReg {
+			return fmt.Errorf("agent archive member %q is not a regular file", header.Name)
 		}
 
-		if header.Typeflag != tar.TypeReg || header.Size <= 0 || header.Size > opts.MaxExtractedBytes {
-			return fmt.Errorf("agent archive member %q is not a valid bounded regular file", opts.ExpectedMember)
+		if header.Size == 0 {
+			return fmt.Errorf("agent archive member %q is empty", header.Name)
 		}
 
-		if mkdirErr := os.MkdirAll(filepath.Dir(targetPath), 0o750); mkdirErr != nil {
-			return fmt.Errorf("create agent binary directory: %w", mkdirErr)
+		stagedPath, err := stageArchiveMember(targetPath, tarReader, opts.Mode)
+		if err != nil {
+			return err
+		}
+		defer os.Remove(stagedPath) //nolint:errcheck // no-op once the binary is renamed into place
+
+		// gzip verifies its checksum only at the end of the stream, and that
+		// checksum is all that catches a corrupted download without a SHA-256.
+		if _, err := io.Copy(io.Discard, gz); err != nil {
+			return fmt.Errorf("read agent archive: %w", err)
 		}
 
-		staged, createErr := os.CreateTemp(filepath.Dir(targetPath), ".agent-upgrade-*")
-		if createErr != nil {
-			return fmt.Errorf("create staged agent binary: %w", createErr)
+		if err := os.Rename(stagedPath, targetPath); err != nil {
+			return fmt.Errorf("install upgraded agent binary: %w", err)
 		}
 
-		stagedPath = staged.Name()
-		if closeErr := staged.Close(); closeErr != nil {
-			return fmt.Errorf("close staged agent binary: %w", closeErr)
-		}
-
-		if err := utilio.InstallFileWithLimitedSize(stagedPath, tarReader, opts.Mode, opts.MaxExtractedBytes); err != nil {
-			return fmt.Errorf("stage upgraded agent binary: %w", err)
-		}
-
-		found = true
+		return nil
 	}
-
-	if _, err := io.Copy(io.Discard, decompressed); err != nil {
-		return fmt.Errorf("finish reading agent archive: %w", err)
-	}
-
-	if decompressed.count > 2*opts.MaxExtractedBytes {
-		return fmt.Errorf("decompressed agent archive exceeds %d-byte limit", 2*opts.MaxExtractedBytes)
-	}
-
-	if !found {
-		return fmt.Errorf("agent archive does not contain expected member %q", opts.ExpectedMember)
-	}
-
-	if err := os.Rename(stagedPath, targetPath); err != nil {
-		return fmt.Errorf("install upgraded agent binary: %w", err)
-	}
-
-	stagedPath = ""
-
-	return nil
 }
 
-func safeArchiveName(name string, exact bool) bool {
-	cleaned := filepath.Clean(name)
-	if name == "" || cleaned == "." || cleaned == ".." || filepath.IsAbs(name) ||
-		strings.Contains(name, `\`) || strings.HasPrefix(cleaned, ".."+string(filepath.Separator)) {
-		return false
+// stageArchiveMember writes body to a new file in targetPath's directory and
+// returns its path. The caller renames or removes it.
+func stageArchiveMember(targetPath string, body io.Reader, mode os.FileMode) (string, error) {
+	dir := filepath.Dir(targetPath)
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return "", fmt.Errorf("create agent binary directory: %w", err)
 	}
 
-	return !exact || cleaned == name
+	staged, err := os.CreateTemp(dir, ".agent-upgrade-*")
+	if err != nil {
+		return "", fmt.Errorf("create staged agent binary: %w", err)
+	}
+
+	_, err = io.Copy(staged, body)
+	if err == nil {
+		err = staged.Chmod(mode)
+	}
+
+	if err == nil {
+		err = staged.Sync()
+	}
+
+	if closeErr := staged.Close(); err == nil {
+		err = closeErr
+	}
+
+	if err != nil {
+		os.Remove(staged.Name()) //nolint:errcheck // best effort staged file cleanup
+		return "", fmt.Errorf("stage upgraded agent binary: %w", err)
+	}
+
+	return staged.Name(), nil
 }
 
 func canonicalPathEntry(path string) (string, error) {
@@ -635,18 +583,6 @@ func executablePath(path string) (string, error) {
 	}
 
 	return resolved, nil
-}
-
-type countingReader struct {
-	reader io.Reader
-	count  int64
-}
-
-func (r *countingReader) Read(data []byte) (int, error) {
-	n, err := r.reader.Read(data)
-	r.count += int64(n)
-
-	return n, err
 }
 
 func equalDigest(actual, expected []byte) bool {

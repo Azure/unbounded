@@ -294,13 +294,13 @@ class TestLegacyAgent(unittest.TestCase):
         self.assertEqual(seen["url"], f"{e2e.LEGACY_AGENT_RELEASE_URL}/{e2e.LEGACY_AGENT_TARBALL}")
         self.assertEqual(after, "http://previous")
 
-    def test_downloaded_release_is_checked_and_repackaged_alone(self):
-        """AgentUpgrade takes an archive holding the agent alone, and the release
-        also ships its license files."""
+    def test_downloaded_release_is_checked_and_served_as_published(self):
+        """AgentUpgrade takes the release archive as published, license files
+        and all, so it is checked but not repackaged."""
         def release(content: bytes) -> bytes:
             buffer = io.BytesIO()
             with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
-                for name, data in (("LICENSE", b"license"), ("unbounded-agent", content)):
+                for name, data in (("LICENSE", b"license"), ("NOTICE", b"notice"), ("unbounded-agent", content)):
                     info = tarfile.TarInfo(name)
                     info.size = len(data)
                     archive.addfile(info, io.BytesIO(data))
@@ -315,9 +315,7 @@ class TestLegacyAgent(unittest.TestCase):
                     patch.object(e2e, "http_get", return_value=checksums), \
                     patch.object(e2e, "download_file", side_effect=lambda _url, dest, data=tarball: dest.write_bytes(data)):
                 if ok:
-                    with tarfile.open(e2e._download_legacy_agent_tarball()) as archive:
-                        self.assertEqual(archive.getnames(), ["unbounded-agent"])
-                        self.assertEqual(archive.extractfile("unbounded-agent").read(), b"the release")
+                    self.assertEqual(e2e._download_legacy_agent_tarball().read_bytes(), good)
                 else:
                     with self.assertRaises(SystemExit):
                         e2e._download_legacy_agent_tarball()
