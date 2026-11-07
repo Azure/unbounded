@@ -1475,6 +1475,36 @@ fn device_removal_drains_with_received_page_held() {
 }
 
 #[test]
+/// A device loss the caller reports (from sysfs) counts like one the device
+/// reports itself: links on the rail break as lost, and a held page does not
+/// keep the round from draining.
+fn reported_loss_drains_with_received_page_held() {
+    profiles(|| {
+        let mut w = world();
+        let (ea, eb) = link_up(&mut w);
+        let deadline = w.now() + 5 * SECOND;
+        let granted = w.a.clients[0].grant(TO_B, ea, [1; 16], 4, deadline);
+        let granted = wait(&mut w, &granted).unwrap();
+        let written = w.b.clients[0].write(TO_A, eb, granted.tag, bytes(vec![2; 4]), deadline);
+        assert_eq!(wait(&mut w, &written), Ok(()));
+        let held = page(ready(&granted.arrival));
+        w.a.clients[0].report_lost(7);
+        w.a.clients[0].close();
+        pump(&mut w);
+        assert_eq!(w.a.clients[0].device_losses(), 1);
+        assert_eq!(w.a.clients[0].link_breaks(BreakReason::DeviceLost), 1);
+        assert!(w.a.clients[0].drained(), "held page blocked the drain");
+        w.a.clients[0].reopen().unwrap();
+        let activation = w.a.clients[1].activate(config(&w.a.charge));
+        assert!(wait(&mut w, &activation).is_ok());
+        assert_eq!(held.bytes(), [2; 4]);
+        drop(held);
+        pump(&mut w);
+        shutdown(w);
+    });
+}
+
+#[test]
 /// Without a lost device a held page still blocks the drain, and the
 /// client says why.
 fn held_page_blocks_drain_without_device_loss() {

@@ -368,6 +368,10 @@ struct NodeShared {
     /// devices are freed.
     lost: Mutex<Vec<u16>>,
 
+    /// Rails a caller reported lost ([`Client::report_lost`]), not yet
+    /// applied.
+    reported_lost: Mutex<Vec<u16>>,
+
     /// The latest [`Client::retain`] request, not yet applied.
     retain: Mutex<Option<std::collections::BTreeSet<LinkKey>>>,
 
@@ -453,6 +457,7 @@ pub fn node(workers: usize) -> Result<(Vec<Client>, OwnerPort)> {
         break_counts: Default::default(),
         device_losses: AtomicU64::new(0),
         lost: Mutex::new(Vec::new()),
+        reported_lost: Mutex::new(Vec::new()),
         retain: Mutex::new(None),
         closed: AtomicBool::new(false),
         drained: AtomicBool::new(false),
@@ -858,6 +863,19 @@ impl Client {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+
+    /// Report `rail`'s device gone, as the caller saw it (its sysfs entry
+    /// vanished, say): the owner treats it as if the device reported its
+    /// own removal (see [`Self::device_losses`]). Report before
+    /// [`Self::close`] so the round does not wait for pages no NIC can reach.
+    pub fn report_lost(&self, rail: u16) {
+        self.shared
+            .reported_lost
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(rail);
+        self.shared.owner.wake();
     }
 
     /// Close the node: the owner sends `Close` on ready links, breaks every
@@ -2188,10 +2206,19 @@ impl Owner {
 
         // A removed device fails its links' QPs too: break them as lost
         // before polling turns that into an error break with a backoff.
+        let reported = std::mem::take(
+            &mut *self
+                .shared
+                .reported_lost
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
         let removed: Vec<u16> = self
             .devices
             .iter()
-            .filter(|(rail, device)| device.device.removed() && !self.lost.contains(rail))
+            .filter(|(rail, device)| {
+                (device.device.removed() || reported.contains(rail)) && !self.lost.contains(rail)
+            })
             .map(|(rail, _)| *rail)
             .collect();
 
