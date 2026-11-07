@@ -421,6 +421,20 @@ pub(crate) fn capture_rejection<T>(
     (result, detail)
 }
 
+/// Run a reserve-reclaim-retry `operation` so its retried attempts do not
+/// each record an Admission failure: only a final `Overloaded` reports the
+/// last rejection, once. A recovered retry records nothing.
+pub(crate) fn report_final<T>(
+    admission: &Quotas<AdmissionPolicy>,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let (result, rejection) = admission.retrying(operation);
+    if let (Err(Error::Overloaded), Some(rejection)) = (&result, rejection) {
+        admission.report(rejection);
+    }
+    result
+}
+
 /// Keep resource names and telemetry mapping in application policy. A
 /// ciphertext rejection carries the worker's latest holder breakdown.
 fn rejection_detail(

@@ -951,12 +951,14 @@ impl StoreWriter {
                 .reserve_completion(Some(cache), ResourceClass::Ciphertext, length)
                 .map_err(Error::from)
         };
-        let result = reserve();
-        if matches!(result, Err(Error::Overloaded)) {
-            self.slabs.reclaim_idle();
-            return reserve();
-        }
-        result
+        crate::admission::report_final(&self.admission, || {
+            let result = reserve();
+            if matches!(result, Err(Error::Overloaded)) {
+                self.slabs.reclaim_idle();
+                return reserve();
+            }
+            result
+        })
     }
     /// The fill owner may reclaim idle cached bytes for exact aligned staging.
     /// Reclamation is synchronous and happens before queue acceptance; no writer

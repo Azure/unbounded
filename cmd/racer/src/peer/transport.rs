@@ -1230,14 +1230,13 @@ pub(crate) fn reserve_ciphertext(
             .reserve(Some(cache), ResourceClass::Ciphertext, capacity)
             .map_err(Error::from)
     };
-    let result = reserve();
-    match (result, reclaim) {
+    crate::admission::report_final(admission, || match (reserve(), reclaim) {
         (Err(Error::Overloaded), Some(reclaim)) => {
             reclaim(cache, capacity);
             reserve()
         }
         (result, _) => result,
-    }
+    })
 }
 
 /// A connect that failed for want of a local resource says nothing about the peer.
@@ -1559,7 +1558,16 @@ impl Transfers {
         capacity: usize,
         scope: &RequestScope,
     ) -> Result<flow_control::Charge<AdmissionPolicy>> {
-        let first = self.reserve_ciphertext(cache, capacity);
+        let admission = &self.wire.0;
+        // Every poll retries, so only the attempt that gives up is recorded.
+        let last = std::cell::Cell::new(None);
+        let attempt = || {
+            let (result, rejection) =
+                admission.retrying(|| self.reserve_ciphertext(cache, capacity));
+            last.set(rejection.or(last.get()));
+            result
+        };
+        let first = attempt();
         if !matches!(first, Err(Error::Overloaded)) {
             return first;
         }
@@ -1569,12 +1577,15 @@ impl Transfers {
         let now = clock();
         let until = now + CIPHERTEXT_WAIT.min(scope.deadline.0.saturating_duration_since(now) / 4);
         let (reserved, _) = crate::rdma::links::retry_overloaded(
-            || std::future::ready(self.reserve_ciphertext(cache, capacity)),
+            || std::future::ready(attempt()),
             |wake| reactor.sleep_until(wake, scope),
             clock,
             until,
         )
         .await;
+        if let (Err(Error::Overloaded), Some(rejection)) = (&reserved, last.get()) {
+            admission.report(rejection);
+        }
         self.record(Event::PeerReceiveCiphertextWaits, 1);
         if reserved.is_ok() {
             self.record(Event::PeerReceiveCiphertextWaitGranted, 1);
@@ -3765,6 +3776,12 @@ mod tests {
         let reactor = Rc::new(crate::runtime::Reactor::new(admission.clone(), &env));
         let signers = crate::peer::tests::signers(&env);
         let metrics = crate::telemetry::Metrics::for_workers(1).unwrap().remove(0);
+        let failures = crate::telemetry::Failures::default();
+        let recorded = || {
+            let mut out = String::new();
+            failures.write(&mut out).unwrap();
+            out
+        };
         let transfers = |metrics: crate::telemetry::Metrics| {
             let io = Rc::new(crate::http::new_io(
                 reactor.clone(),
@@ -3829,6 +3846,10 @@ mod tests {
                 held.borrow_mut().push(charge);
             }
         }
+        // Observe from here so the fixture's own filling is not counted.
+        admission
+            .policy()
+            .set_observer(failures.observer(crate::model::WorkerId(0)));
         // Nothing frees: the wait ends `Overloaded` within its bound.
         let started = std::time::Instant::now();
         {
@@ -3843,6 +3864,13 @@ mod tests {
             );
         }
         assert!(started.elapsed() < CIPHERTEXT_WAIT * 4);
+        // The wait retried many times but records one Admission failure, with
+        // the worker's holder breakdown, when it gives up.
+        let out = recorded();
+        assert!(out.contains("total=1 "), "{out}");
+        assert!(out.contains("stage=Admission"), "{out}");
+        assert!(out.contains("holders: Some("), "{out}");
+        assert!(out.contains("receive_waiting: 1 "), "{out}");
         assert_eq!(metrics.count(Event::PeerReceiveCiphertextWaits), 1);
         assert_eq!(metrics.count(Event::PeerReceiveCiphertextWaitGranted), 0);
         // Decode frees budget during the wait: the third reclaim (the first poll after the
@@ -3867,6 +3895,8 @@ mod tests {
         };
         assert_eq!(charge.amount(), 64);
         assert_eq!(calls.get(), 3);
+        // A wait that is granted records no failure.
+        assert!(recorded().contains("total=1 "));
         assert_eq!(metrics.count(Event::PeerReceiveCiphertextWaits), 2);
         assert_eq!(metrics.count(Event::PeerReceiveCiphertextWaitGranted), 1);
         drop(charge);

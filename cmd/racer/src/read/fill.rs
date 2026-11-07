@@ -696,6 +696,20 @@ impl Fill {
         // Zero released bytes does not mean exhaustion: the memory cursor may
         // have crossed only busy or other-cache entries. No await allows new
         // local charges to interleave; remote completions can only free bytes.
+        let admission = &self.dependencies.admission;
+        crate::admission::report_final(admission, || {
+            self.reclaim_retry(cache, class, amount, reserve)
+        })
+    }
+
+    /// The retry loop of [`Self::reserve_reclaiming`], recording every rejection.
+    fn reclaim_retry(
+        &self,
+        cache: &racer_wire::control::CacheId,
+        class: ResourceClass,
+        amount: usize,
+        reserve: impl Fn() -> Result<flow_control::Charge<AdmissionPolicy>>,
+    ) -> Result<flow_control::Charge<AdmissionPolicy>> {
         flow_control::progress::reclaim_retry(2, reserve, |error| {
             if *error != Error::Overloaded {
                 return false;

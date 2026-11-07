@@ -37,7 +37,7 @@ pub use racer_flow_core::admission::{
 };
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{HashMap, VecDeque},
     hash::Hash,
     marker::PhantomData,
@@ -211,6 +211,10 @@ pub struct Quotas<P: Policy> {
     local: PhantomData<Rc<()>>,
 
     rejection: RefCell<Option<Option<Rejection<P::Class>>>>,
+
+    /// Depth of [`Quotas::retrying`] scopes; while nonzero, rejections are
+    /// captured but not reported to policy.
+    retrying: Cell<usize>,
 }
 
 /// Owns a live charge independently of the local quota authority and policy.
@@ -448,6 +452,7 @@ impl<P: Policy> Quotas<P> {
             stopped: Arc::new(AtomicBool::new(false)),
             local: PhantomData,
             rejection: RefCell::new(None),
+            retrying: Cell::new(0),
         }
     }
 
@@ -473,6 +478,30 @@ impl<P: Policy> Quotas<P> {
         let rejection = self.rejection.borrow().as_ref().copied().flatten();
         drop(guard);
         (result, rejection)
+    }
+
+    /// Run attempts the caller may retry: their rejections are captured as in
+    /// [`Self::observe_rejections`] but not reported to policy. A caller that
+    /// gives up reports the returned rejection once with [`Self::report`].
+    /// Nesting is allowed; reports from inner scopes stay quiet too.
+    pub fn retrying<T>(&self, operation: impl FnOnce() -> T) -> (T, Option<Rejection<P::Class>>) {
+        struct Depth<'a>(&'a Cell<usize>);
+        impl Drop for Depth<'_> {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() - 1);
+            }
+        }
+        self.retrying.set(self.retrying.get() + 1);
+        let depth = Depth(&self.retrying);
+        let result = self.observe_rejections(operation);
+        drop(depth);
+        result
+    }
+
+    /// Report a terminal rejection captured by [`Self::retrying`], subject to
+    /// any enclosing retrying scope and rejection sink.
+    pub fn report(&self, rejection: Rejection<P::Class>) {
+        let _ = self.report_rejection(rejection);
     }
 
     /// Create a transferable unkeyed handle.
@@ -825,7 +854,9 @@ impl<P: Policy> Quotas<P> {
         if let Some(sink) = self.rejection.borrow_mut().as_mut() {
             *sink = Some(rejection);
         }
-        self.policy.rejected(rejection);
+        if self.retrying.get() == 0 {
+            self.policy.rejected(rejection);
+        }
         ReserveError {
             error: Error::Overloaded,
             rejection: Some(rejection),
@@ -1143,6 +1174,53 @@ mod quota_tests {
     #[test]
     fn unavailable_display_is_state_neutral() {
         assert_eq!(Error::Unavailable.to_string(), "flow control unavailable");
+    }
+
+    /// Retried attempts stay quiet; only an explicit terminal report reaches policy.
+    #[test]
+    fn retrying_captures_without_reporting_until_terminal_report() {
+        let policy = TestPolicy::new(10, 4);
+        let quotas = Quotas::new(policy.clone());
+        let rejected = || policy.rejected.lock().unwrap().len();
+        let (result, rejection) = quotas.retrying(|| {
+            let first = quotas.reserve(None, Resource::Payload, 11);
+            // A nested scope stays quiet and restores the outer depth.
+            let ((), inner) = quotas.retrying(|| {
+                assert!(quotas.reserve(None, Resource::Payload, 12).is_err());
+            });
+            assert!(matches!(
+                inner,
+                Some(Rejection::Resource { requested: 12, .. })
+            ));
+            // A report inside a retrying scope stays quiet as well.
+            quotas.report(inner.unwrap());
+            first.and_then(|_| quotas.reserve(None, Resource::Payload, 13))
+        });
+        assert!(result.is_err());
+        assert!(matches!(
+            rejection,
+            Some(Rejection::Resource { requested: 12, .. })
+        ));
+        assert_eq!(rejected(), 0, "retried attempts are not reported");
+        quotas.report(rejection.unwrap());
+        assert_eq!(rejected(), 1);
+        // A recovered retry reports nothing at all.
+        let (result, _) = quotas.retrying(|| {
+            let _ = quotas.reserve(None, Resource::Payload, 11);
+            quotas.reserve(None, Resource::Payload, 1)
+        });
+        assert!(result.is_ok());
+        assert_eq!(rejected(), 1);
+        // Outside any scope every rejection is reported again.
+        assert!(quotas.reserve(None, Resource::Payload, 11).is_err());
+        assert_eq!(rejected(), 2);
+        // A panicking attempt does not leave the authority quiet.
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            quotas.retrying(|| panic!("fixture"));
+        }));
+        assert!(panic.is_err());
+        assert!(quotas.reserve(None, Resource::Payload, 11).is_err());
+        assert_eq!(rejected(), 3);
     }
 
     /// Distinct payload, wake-enabled, and drain-progress fixture classes.
