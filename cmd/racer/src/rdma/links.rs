@@ -1153,6 +1153,7 @@ impl Links {
         let granted = self.wait(op, scope).await?;
         let waited = granted.waited;
         let pending = PendingReceive {
+            granted: (self.ctx.clock.clone(), self.ctx.clock.now()),
             metrics: self.metrics.clone(),
             retry: self.retry.clone(),
             link,
@@ -1209,6 +1210,7 @@ impl Links {
             Err(error) => return Err(error),
         };
         Ok(PendingReceive {
+            granted: (self.ctx.clock.clone(), self.ctx.clock.now()),
             metrics: self.metrics.clone(),
             retry: self.retry.clone(),
             link,
@@ -1358,6 +1360,9 @@ pub struct PendingReceive {
     rail: RailId,
     transfer: TransferId,
     arrival: Op<Arrival>,
+
+    /// When the owner granted the buffer, and the clock to time its hold.
+    granted: (racer_io::Clock, Instant),
 
     /// The GPU landing buffer the grant is over, for a landing grant.
     landing: Option<Arc<crate::gpu::GpuLanding>>,
@@ -1514,7 +1519,17 @@ impl PendingReceive {
             metrics.record(crate::telemetry::Event::RdmaPagesReceived, 1);
             metrics.record(crate::telemetry::Event::RdmaReceivedBytes, length.into());
         }
-        BufferPool::new(admission.clone()).registered_ciphertext(reservation, envelope, page)
+        let (clock, since) = self.granted.clone();
+        let hold = self
+            .metrics
+            .clone()
+            .map(|metrics| crate::memory::ReceiveHold::new(metrics, clock, since));
+        BufferPool::new(admission.clone()).registered_ciphertext_held(
+            reservation,
+            envelope,
+            page,
+            hold,
+        )
     }
 }
 

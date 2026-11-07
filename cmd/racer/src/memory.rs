@@ -341,7 +341,45 @@ pub(crate) enum CiphertextStorage {
         /// The first copy-out, shared by every later retaining path (memory
         /// cache, disk write queue) so a page is copied out at most once.
         retained: std::sync::OnceLock<CiphertextPage>,
+        /// Records how long the buffer was held. Declared after `page` so it
+        /// drops, and measures, once the buffer is back in its pool.
+        _hold: Option<Box<ReceiveHold>>,
     },
+}
+
+/// Times one registered receive buffer from its grant until it returns to
+/// the pool, as `racer_rdma_receive_buffer_hold_nanoseconds_{sum,count}`.
+/// Recorded on drop, on whichever thread drops the page.
+pub(crate) struct ReceiveHold {
+    metrics: crate::telemetry::Metrics,
+    clock: racer_io::Clock,
+    since: std::time::Instant,
+}
+
+impl ReceiveHold {
+    pub(crate) fn new(
+        metrics: crate::telemetry::Metrics,
+        clock: racer_io::Clock,
+        since: std::time::Instant,
+    ) -> Self {
+        Self {
+            metrics,
+            clock,
+            since,
+        }
+    }
+}
+
+impl Drop for ReceiveHold {
+    fn drop(&mut self) {
+        let held = self.clock.now().saturating_duration_since(self.since);
+        self.metrics.record(
+            crate::telemetry::Event::RdmaReceiveHoldNs,
+            u64::try_from(held.as_nanos()).unwrap_or(u64::MAX),
+        );
+        self.metrics
+            .record(crate::telemetry::Event::RdmaReceiveHoldCount, 1);
+    }
 }
 
 impl CiphertextBytes {
@@ -757,11 +795,23 @@ impl BufferPool {
     }
     /// Wrap a received registered page without copying. The reservation
     /// covers exactly the received length, the page's visible capacity.
+    #[cfg(test)]
     pub(crate) fn registered_ciphertext(
         &self,
         reservation: flow_control::Charge<AdmissionPolicy>,
         envelope: PageEnvelope,
         page: rdma_verbs::RegisteredPage,
+    ) -> Result<CiphertextPage> {
+        self.registered_ciphertext_held(reservation, envelope, page, None)
+    }
+    /// [`Self::registered_ciphertext`] that records the buffer's hold time
+    /// with `hold` once the buffer returns to its pool.
+    pub(crate) fn registered_ciphertext_held(
+        &self,
+        reservation: flow_control::Charge<AdmissionPolicy>,
+        envelope: PageEnvelope,
+        page: rdma_verbs::RegisteredPage,
+        hold: Option<ReceiveHold>,
     ) -> Result<CiphertextPage> {
         envelope.validate()?;
         if page.len() != envelope.ciphertext_length as usize {
@@ -783,6 +833,7 @@ impl BufferPool {
                     page,
                     reservation,
                     retained: std::sync::OnceLock::new(),
+                    _hold: hold.map(Box::new),
                 },
             }),
         })

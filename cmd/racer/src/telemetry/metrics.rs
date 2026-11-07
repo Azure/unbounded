@@ -370,6 +370,8 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::RdmaHeadNs => "racer_rdma_head_nanoseconds_sum",
             Self::RdmaArrivalCount => "racer_rdma_arrival_nanoseconds_count",
             Self::RdmaArrivalNs => "racer_rdma_arrival_nanoseconds_sum",
+            Self::RdmaReceiveHoldCount => "racer_rdma_receive_buffer_hold_nanoseconds_count",
+            Self::RdmaReceiveHoldNs => "racer_rdma_receive_buffer_hold_nanoseconds_sum",
             Self::RdmaSendCount => "racer_rdma_send_nanoseconds_count",
             Self::RdmaSendNs => "racer_rdma_send_nanoseconds_sum",
             Self::RdmaServeCount => "racer_rdma_serve_nanoseconds_count",

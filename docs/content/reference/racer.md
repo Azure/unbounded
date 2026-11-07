@@ -1875,6 +1875,11 @@ Native activation registers the page-buffer pool within 5 s plus 1 s per GiB of
 reports no RDMA rails (so peers stop planning RDMA to it), and retries; it
 advertises its rails again once activation succeeds. `racer_rdma_active` is 1
 while rails are active, and `racer_rdma_free_buffers` counts free page buffers.
+`racer_rdma_receive_buffer_hold_nanoseconds_sum` and `_count` time each received
+page's buffer from its grant until it returns to the pool. A received page is
+copied out of its buffer before it is decrypted, delivered, or persisted, so
+divide the sum by the count: a hold well above the sender's send time means
+something still pins received buffers, and the pool then limits receive rate.
 `racer_rdma_http_fallback_total` counts pages that planned RDMA but went over
 HTTP; `racer_rdma_fallback_no_link_total` and `racer_rdma_fallback_grant_total`
 split out the two common reasons: no ready link to the peer yet, and a grant that

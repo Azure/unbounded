@@ -378,3 +378,40 @@ fn rehome_aligned_copies_shared_pages_into_the_pool() {
     pump!(w);
     assert_eq!(free(&w), Some(2));
 }
+
+#[test]
+fn receive_hold_is_recorded_once_the_buffer_returns_to_the_pool() {
+    use crate::telemetry::Event;
+    let env = racer_io::Env::host();
+    let (mut w, admission, page) = setup();
+    let metrics = crate::telemetry::Metrics::default();
+    let clock = w.clock.ctx(1).clock.clone();
+    let received = receive_registered(&env, &mut w, &page.ciphertext);
+    let envelope = page.ciphertext.envelope().clone();
+    let reservation = admission
+        .reserve(
+            Some(&envelope.page.version.object.cache),
+            ResourceClass::Ciphertext,
+            received.len(),
+        )
+        .unwrap();
+    let hold = crate::memory::ReceiveHold::new(metrics.clone(), clock.clone(), clock.now());
+    let pool = BufferPool::new(admission.clone());
+    let ciphertext = pool
+        .registered_ciphertext_held(reservation, envelope, received, Some(hold))
+        .unwrap();
+    w.clock.advance(std::time::Duration::from_millis(7));
+    // A clone still holds the buffer: nothing is recorded yet.
+    let clone = ciphertext.clone();
+    drop(ciphertext);
+    assert_eq!(metrics.count(Event::RdmaReceiveHoldCount), 0);
+    // A copy-out drops the last registered handle and records the hold.
+    let charge = aligned_charge(&pool, &admission, &clone);
+    let detached = pool.detach_registered(clone, charge).unwrap();
+    assert!(!detached.is_registered());
+    assert_eq!(metrics.count(Event::RdmaReceiveHoldCount), 1);
+    assert_eq!(metrics.count(Event::RdmaReceiveHoldNs), 7_000_000);
+    pump!(w);
+    assert_eq!(free(&w), Some(2), "the buffer is back while the copy lives");
+    drop(detached);
+}
