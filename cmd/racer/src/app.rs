@@ -1494,10 +1494,14 @@ impl WorkerApplication {
             node.publications.clone(),
             reactor.ctx().clock.clone(),
         )?);
-        let wire = Rc::new(crate::peer::protocol::SecurityCodec::new(
-            admission.clone(),
-            buffers.clone(),
-        ));
+        let wire = Rc::new(
+            crate::peer::protocol::SecurityCodec::new(admission.clone(), buffers.clone())
+                .with_reclamation(Self::ciphertext_reclaimer(
+                    admission.clone(),
+                    memory.clone(),
+                    writer.clone(),
+                )),
+        );
         let transfers = Transfers::new(
             http.clone(),
             io.clone(),

@@ -962,10 +962,24 @@ pub(crate) fn decode_signed(bytes: &[u8]) -> Result<SignedHead> {
 pub struct SecurityCodec {
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
     buffers: BufferPool,
+    reclaim: Option<Rc<super::transport::Reclaim<'static>>>,
 }
 impl SecurityCodec {
     pub fn new(admission: Rc<flow_control::Quotas<AdmissionPolicy>>, buffers: BufferPool) -> Self {
-        Self { admission, buffers }
+        Self {
+            admission,
+            buffers,
+            reclaim: None,
+        }
+    }
+    /// Free idle cache memory before refusing the keyed recharge of an
+    /// unkeyed response body, as keyed peer receives do.
+    pub(crate) fn with_reclamation(
+        mut self,
+        reclaim: impl Fn(&racer_wire::control::CacheId, usize) + 'static,
+    ) -> Self {
+        self.reclaim = Some(Rc::new(reclaim));
+        self
     }
     /// The receiving worker's allocation front end.
     pub(crate) fn buffers(&self) -> &BufferPool {
@@ -1382,9 +1396,10 @@ impl SecurityCodec {
                     ResponseBody::Empty => return Err(Error::InvalidRequest),
                     ResponseBody::Aligned(mut buffer) => {
                         if buffer.charge().key().is_none() && self.admission.owns(buffer.charge()) {
-                            let keyed = self.admission.reserve(
-                                Some(&metadata.version.object.cache),
-                                ResourceClass::Ciphertext,
+                            let keyed = super::transport::reserve_ciphertext(
+                                &self.admission,
+                                self.reclaim.as_deref(),
+                                &metadata.version.object.cache,
                                 buffer.capacity(),
                             )?;
                             // The unkeyed staging charge is released here.
@@ -1850,6 +1865,125 @@ pub(crate) mod tests {
                 assert_eq!(admission.used(ResourceClass::Plaintext), 0);
                 assert_eq!(foreign.used(ResourceClass::Ciphertext), 0);
             }
+        }
+        /// The keyed recharge of an unkeyed response body reclaims idle cache
+        /// memory before failing, and still fails `Overloaded` when the
+        /// reclaimer frees nothing because every entry is in use.
+        #[test]
+        fn unkeyed_body_recharge_reclaims_before_overloaded() {
+            let env = racer_io::Env::host();
+            let signers = crate::peer::tests::signers(&env);
+            let cache = CacheId("cccccccc-1111-4111-8111-111111111111".into());
+            let mut limits = crate::test_support::cluster::config(false).limits;
+            let capacity = page_alloc::buf::GRANULE;
+            // Room for the unkeyed staging plus one more page.
+            limits.ciphertext_bytes = std::num::NonZeroUsize::new(2 * capacity).unwrap();
+            let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
+            let buffers = BufferPool::new(admission.clone());
+            let metadata = ObjectMetadata {
+                content_type: None,
+                version: ObjectVersion {
+                    object: ObjectId {
+                        cache: cache.clone(),
+                        key: CacheKey([3; 32]),
+                    },
+                    etag: StrongEtag::test_value("v1"),
+                },
+                length: 3,
+                expires_at: ExpiresAt::from_system_time(UNIX_EPOCH).unwrap(),
+            };
+            let page = buffers
+                .ciphertext(
+                    admission
+                        .reserve(Some(&cache), ResourceClass::Ciphertext, 19)
+                        .unwrap(),
+                    PageEnvelope {
+                        page_size: racer_wire::object::PageSize::DEFAULT,
+                        cipher: crate::model::PageCipher::Xaes256Gcm,
+                        page: PageId {
+                            version: metadata.version.clone(),
+                            number: PageNumber(0),
+                        },
+                        key_id: KeyId([1; 16]),
+                        nonce: Nonce([2; 24]),
+                        plaintext_length: 3,
+                        ciphertext_length: 19,
+                    },
+                    vec![9; 19],
+                )
+                .unwrap();
+            let response = PeerResponse::Page {
+                metadata,
+                ciphertext: page,
+            };
+            let mut head = response_head(
+                &response,
+                &[3; 32],
+                &[signers[0].node().clone(), signers[2].node().clone()],
+            )
+            .unwrap();
+            push(&mut head, "racer-receiver", &signers[0].node().0);
+            let original = std::sync::Arc::new(signers[2].sign(head).unwrap());
+            drop(response);
+            let scope = RequestScope::host(
+                RequestId([1; 16]),
+                racer_io::Clock::host().now() + Duration::from_secs(30),
+            )
+            .unwrap();
+            let auth = || ForwardedHead {
+                original: original.clone(),
+                hops: vec![],
+            };
+            // A cached page holds the cache's remaining share.
+            let cached = Rc::new(std::cell::RefCell::new(Some(
+                admission
+                    .reserve(Some(&cache), ResourceClass::Ciphertext, capacity)
+                    .unwrap(),
+            )));
+            let pinned = Rc::new(std::cell::Cell::new(true));
+            let calls = Rc::new(std::cell::Cell::new(0));
+            let reclaiming = SecurityCodec::new(admission.clone(), buffers.clone())
+                .with_reclamation({
+                    let cached = cached.clone();
+                    let pinned = pinned.clone();
+                    let calls = calls.clone();
+                    let expected = cache.clone();
+                    move |owner, amount| {
+                        assert_eq!(owner, &expected);
+                        assert_eq!(amount, capacity);
+                        calls.set(calls.get() + 1);
+                        if !pinned.get() {
+                            cached.borrow_mut().take();
+                        }
+                    }
+                });
+            // Without reclamation the full share rejects the recharge.
+            let plain = SecurityCodec::new(admission.clone(), buffers.clone());
+            assert_eq!(
+                plain.response(auth(), vec![9; 19], &scope).err(),
+                Some(Error::Overloaded)
+            );
+            assert_eq!(admission.used(ResourceClass::Ciphertext), capacity);
+            // The entry is in use: nothing is evicted and the recharge fails.
+            assert_eq!(
+                reclaiming.response(auth(), vec![9; 19], &scope).err(),
+                Some(Error::Overloaded)
+            );
+            assert_eq!(calls.get(), 1);
+            assert!(cached.borrow().is_some());
+            assert_eq!(admission.used(ResourceClass::Ciphertext), capacity);
+            // An idle entry yields to the received page.
+            pinned.set(false);
+            let received = reclaiming.response(auth(), vec![9; 19], &scope).unwrap();
+            assert_eq!(calls.get(), 2);
+            assert!(cached.borrow().is_none());
+            let PeerResponse::Page { ciphertext, .. } = received.response else {
+                panic!("page required")
+            };
+            assert_eq!(ciphertext.bytes(), &[9; 19]);
+            assert_eq!(admission.used(ResourceClass::Ciphertext), capacity);
+            drop(ciphertext);
+            assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
         }
         #[test]
         fn received_aligned_body_becomes_disk_aligned_page_and_rejects_mismatches() {
