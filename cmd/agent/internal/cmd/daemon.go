@@ -31,12 +31,19 @@ func newCmdDaemon(cmdCtx *CommandContext) *cobra.Command {
 
 			cmdCtx.Setup()
 
-			modes, err := agentModes().operators()
+			table := agentModes()
+
+			modes, err := table.operators()
 			if err != nil {
 				return err
 			}
 
-			err = daemon.Run(ctx, cmdCtx.Logger, modes)
+			backends, err := table.backends()
+			if err != nil {
+				return err
+			}
+
+			err = daemon.Run(ctx, cmdCtx.Logger, modes, backends)
 
 			restart := inPlaceRestart{
 				currentPath: daemonCurrentPath,

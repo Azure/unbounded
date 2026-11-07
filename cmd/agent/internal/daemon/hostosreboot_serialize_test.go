@@ -18,6 +18,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
+	agentdaemon "github.com/Azure/unbounded/pkg/agent/daemon"
 )
 
 func outOfBandOperation(name, machineRef string, kind v1alpha3.OperationKind) *v1alpha3.MachineOperation {
@@ -482,4 +484,46 @@ func TestMarkHostSoftRebootWaiting_IgnoresDeletedOperation(t *testing.T) {
 	c := fakeStatusClient()
 
 	require.NoError(t, markHostSoftRebootWaiting(context.Background(), c, "op-soft", "waiting"))
+}
+
+// A reprovision handoff defers every MachineOperation before its handler runs,
+// so a HostSoftReboot that an out-of-band host operation would also hold is
+// left as it was: Pending, with no waiting message, and no requeue, for the
+// daemon the handoff installs to pick up.
+func TestReconcileHostSoftReboot_AHandoffDefersItBeforeTheOutOfBandCheck(t *testing.T) {
+	machine := &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "test-machine", Generation: 4}}
+	outOfBand := outOfBandOperation("op-oob", "test-machine", v1alpha3.OperationHostPowerOff)
+	outOfBand.Status.Phase = v1alpha3.OperationPhaseInProgress
+	op := &fakeNodeOperator{bootID: "boot-1"}
+	c := fakeStatusClient(machine, outOfBand, hostSoftRebootOperation("op-soft"))
+
+	handoff := &handoffState{}
+	handoff.set()
+
+	target := &machineOperationTarget{
+		installation: installstate.NewStore(filepath.Join(t.TempDir(), "state"), filepath.Join(t.TempDir(), "install.lock")),
+		Client:       c,
+		log:          discardLogger(),
+		machineName:  "test-machine",
+		nodeOperator: op,
+		handoff:      handoff,
+	}
+
+	result, err := target.handlers()[v1alpha3.OperationHostSoftReboot](context.Background(), nil, agentdaemon.MachineOperation{Name: "op-soft", Kind: v1alpha3.OperationHostSoftReboot})
+	require.NoError(t, err)
+	assert.Zero(t, result.RequeueAfter)
+	assert.Zero(t, op.rebootCalls)
+
+	soft := getMachineOperation(t, c, "op-soft")
+	assert.Empty(t, soft.Status.Phase)
+	assert.Empty(t, soft.Status.Message, "the out-of-band check does not run during a handoff")
+
+	// Without the handoff, the out-of-band operation holds it.
+	target.handoff = &handoffState{}
+
+	result, err = target.handlers()[v1alpha3.OperationHostSoftReboot](context.Background(), nil, agentdaemon.MachineOperation{Name: "op-soft", Kind: v1alpha3.OperationHostSoftReboot})
+	require.NoError(t, err)
+	assert.Equal(t, hostSoftRebootWaitInterval, result.RequeueAfter)
+	assert.Zero(t, op.rebootCalls)
+	assert.Equal(t, "waiting for out-of-band host operation op-oob", getMachineOperation(t, c, "op-soft").Status.Message)
 }

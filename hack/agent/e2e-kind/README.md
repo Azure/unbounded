@@ -21,6 +21,16 @@ Focused configuration creates only the bridge rather than a colliding default VM
 Use matching cluster/VM/subnet variables when invoking commands or cleanup on a
 preserved environment. Same-disk reinstall checks host boot identity.
 
+The harness never uses your default kubeconfig. `run-local.sh` creates the Kind
+cluster into `tmp/e2e-kind/$KIND_CLUSTER_NAME.kubeconfig`, and every `e2e.py`
+command rewrites that file from `kind get kubeconfig` and points `KUBECONFIG` at
+it for itself and every tool it starts (`kubectl`, `kubectl-unbounded`, the
+bootstrap rendering). A command refuses to run unless the file holds only the
+`kind-$KIND_CLUSTER_NAME` context and uses it. `E2E_KUBECONFIG` names a file to
+use as it is instead; it gets the same check. The metalman smokes
+(`hack/smoke-metalman.py`, `hack/smoke-metalman-http.py`) do the same for the
+`kind` cluster with a file in their temporary directory.
+
 ## Azure Container Linux (immutable hosts)
 
 `HOST_BASE_OS=acl` boots an immutable host: `/usr` is a read-only dm-verity
@@ -186,3 +196,103 @@ cloud-init host:
 HOST_BASE_OS=ubuntu2404 E2E_SUITE=migration KEEP_ENV=1 \
   bash hack/agent/e2e-kind/run-local.sh
 ```
+
+## Isolation modes
+
+The agent runs the node stack in one of two isolation modes: `nspawn` (the
+default) and `none`. `ISOLATION_MODE` selects the mode under test and adds
+`--isolation <mode>` to `kubectl unbounded machine manual-bootstrap`. Left
+unset, no flag is passed and the existing suites behave exactly as before.
+
+Every isolation suite is listed here. "Mode" is the value of `ISOLATION_MODE` to
+run it with; the suites that change the mode start in the default mode and move
+the node themselves. A change is declared the way an operator does it: the
+harness patches `spec.isolation` on the Machine, checks that nothing moves and
+`IsolationDrift` shows the declared mode as not yet applied, then deletes the
+Node, which triggers the repave that applies it. Every change between `nspawn`
+and `none` is a reprovision (the host is reset and bootstrapped again), and the
+agent only reprovisions a Machine annotated
+`unbounded-cloud.io/allow-reprovision: "true"`; without it the change is
+reported `Failed` with reason `ReprovisionNotAllowed` and the repave goes ahead
+in the current mode. The harness sets the annotation for the changes it expects
+to succeed and removes it afterward. It does not choose the strategy: it asserts
+the one `status.isolationChange` records.
+
+| Suite | Mode | Covers |
+|---|---|---|
+| `isolation-operations` | `nspawn`, `none` or unset | The full operation set in one mode: join, status, preflight, `unbounded-agent exec` and `logs`, soft reboot (`NodeReboot`, which must restart the kubelet of the node stack), host-driven and operation-driven `AgentUpgrade` with rollback, repave, host reboot, `AgentReset`, and reinstall on the same disk. |
+| `isolation-reset` | `nspawn`, `none` or unset | `unbounded-agent reset` run on the host removes the node stack of the mode, the agent's files and units, and leaves no reprovision handoff (unit, staged agent or staged configuration with the bootstrap token). |
+| `isolation-reset-after-reprovision` | unset | The same reset on a node that reached `none` by a reprovision, after checking the handoff was cleaned up once the change succeeded. |
+| `isolation-matrix` | unset | Every ordered pair of modes (`nspawn` -> `none` -> `nspawn`), by reprovision. After each change it also runs a soft reboot and a host reboot (and the `none` preflight), so a node that was changed behaves like one that was bootstrapped, and checks no reprovision handoff is left. |
+| `isolation-drift` | unset | The `IsolationDrift` states: an empty spec declares nothing (`NoModeDeclared`), a declared unapplied mode shows `AppliedModeDiffers` while nothing moves, withdrawing it clears the drift, and a change refused for want of the reprovision opt-in shows `ChangeRefused` and is not retried. A change that succeeds ends at `AppliedModeMatches`; `isolation-matrix` asserts that after every change. |
+| `isolation-rollback` | `nspawn`, `none` or unset | A change that cannot go ahead leaves the node in its mode: declaring the applied mode moves nothing and records nothing, and a change that needs a reprovision is refused without the opt-in (`ReprovisionNotAllowed`) while the repave brings the node back in its mode, with no handoff staged and no retry. |
+
+```sh
+HOST_BASE_OS=ubuntu2404 ISOLATION_MODE=none E2E_SUITE=isolation-operations KEEP_ENV=1 \
+  bash hack/agent/e2e-kind/run-local.sh
+HOST_BASE_OS=ubuntu2404 E2E_SUITE=isolation-matrix KEEP_ENV=1 \
+  bash hack/agent/e2e-kind/run-local.sh
+HOST_BASE_OS=ubuntu2404 E2E_SUITE=isolation-rollback KEEP_ENV=1 \
+  bash hack/agent/e2e-kind/run-local.sh
+```
+
+The suites need QEMU with KVM, Docker and a Kind cluster, and they run one at a
+time: the bridge, tap and veth names, the Kind cluster, the VM and the subnet are
+fixed. If your shell predates your membership of the `kvm` group, wrap the
+command with `sg kvm -c '...'`.
+
+These suites are not part of the per-change CI e2e workflow: each one creates a
+Kind cluster and boots a VM, and the set is too expensive to run on every change.
+`isolation-matrix` and `isolation-rollback` run every night in
+`.github/workflows/agent-isolation-nightly.yaml` (also started by hand with
+`workflow_dispatch`). Run the others by hand with `run-local.sh`, or run the
+whole plan with `isolation_plan.py`, when you change the agent's isolation code.
+
+When a step fails, the harness prints the unit state, the journals of the agent
+and the node stack, and the state of any mode change and reprovision handoff.
+Bootstrap tokens and kubeconfig credentials are redacted from that output.
+
+After a refused change the harness waits `RETRY_SOAK` seconds (default 60) to
+prove nothing retries the change without a new trigger. `MIGRATION_TIMEOUT`
+(seconds, default 900) bounds how long each mode change may take to reach a
+terminal `status.isolationChange`.
+NodeConfig variants that check nspawn files (`additional-host-mounts.json`) are
+nspawn-only and are not part of the isolation suites.
+
+## Isolation test plan and report
+
+`isolation_plan.py` runs the scenarios in
+`designs/agent-isolation-modes-test-plan.md` (every operation in each mode,
+every ordered mode transition, drift, a refused change, reset on the host) and
+writes a report.
+Each scenario is one e2e suite on a fresh VM; a failed scenario does not stop the
+run unless `--fail-fast`.
+
+```sh
+sudo apt-get install -y qemu-system-x86 qemu-utils genisoimage iptables   # once
+sudo usermod -aG kvm "$USER"                  # once; log in again, or wrap with `sg kvm -c`
+PATH="$PWD/tmp/bin:$PATH" python3 hack/agent/e2e-kind/isolation_plan.py run
+```
+
+| Command | Effect |
+|---|---|
+| `isolation_plan.py list` | The scenario catalog (IDs, mode, suite). |
+| `run --scenario D01 T01` | Run only these scenarios. Also `--category`, `--tag`, `--exclude-tag transition`. |
+| `run --dry-run` | Show what would run and what is skipped, without touching anything. |
+| `run --no-up` | Use a Kind cluster and bridge you created; create and remove nothing. |
+| `run --keep-env` | Leave the cluster, bridge and VM in place afterward. |
+| `render <results.json> --html` | Regenerate `report.md` and `report.html` from saved results. |
+
+The run creates the Kind cluster, VM bridge and controllers once (the `setup`
+suite through `run-local.sh`), then for each scenario retires the previous VM,
+launches a new one, runs `e2e.py run-suite`, and captures a JSON snapshot of the
+Machine and node stack. Everything lands in
+`tmp/isolation-report/<run-id>/`: `report.md`, `report.html`, `results.json`,
+and a log per scenario (`<ID>/suite.log`, plus `<ID>/diagnostics/` for a
+failure). Bootstrap tokens are redacted. The report has the environment, a
+summary, an operation by mode coverage matrix, a transition matrix and the
+detail of each scenario. Scenarios that need other hardware (GPU) or another
+host OS (`requires` in the catalog) are reported as skipped with the reason.
+
+Every suite in the table above can also be run directly with `E2E_SUITE` through
+`run-local.sh`, with `ISOLATION_MODE` set as the table says.
