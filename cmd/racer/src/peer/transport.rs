@@ -221,6 +221,49 @@ fn native_scope(scope: &RequestScope) -> RequestScope {
         .min(scope.clock().now() + Duration::from_secs(5));
     bounded
 }
+/// Rails a receiver may grant a page on, in the order it tries them: the
+/// chosen `rail`, the other `local` (NUMA-local) rails, then every other
+/// `active` rail, keeping only those `eligible` (a ready link that both ends
+/// publish).
+fn spare_rails(
+    rail: RailId,
+    local: &[RailId],
+    active: impl IntoIterator<Item = RailId>,
+    eligible: impl Fn(RailId) -> bool,
+) -> Vec<RailId> {
+    let mut rails = vec![rail];
+    for r in local.iter().copied().chain(active) {
+        if !rails.contains(&r) && eligible(r) {
+            rails.push(r);
+        }
+    }
+    rails
+}
+/// What a receiver does when its grant for a hop fails with an error.
+#[derive(Debug, PartialEq, Eq)]
+enum GrantFailure {
+    /// Fail the page request `Overloaded` so its range window retries it.
+    Backpressure,
+    /// Carry the body over HTTP instead.
+    Fallback,
+    /// Fail the request with the error.
+    Fail,
+}
+/// Classify a failed grant. A page whose grant found every slot of every
+/// eligible rail held (`Overloaded`) on a live request pushes back: grants are
+/// held until the sender's page lands, so exhaustion means a slow sender, and
+/// HTTP would read the same disk at a much higher receive cost. Other
+/// recoverable failures (a link that broke, a lost device) and non-page bodies
+/// fall back to HTTP as before.
+fn grant_failure(error: Error, page: bool, scope: &RequestScope) -> GrantFailure {
+    if error == Error::Overloaded && page && scope.check().is_ok() {
+        GrantFailure::Backpressure
+    } else if native_failure(error, scope) {
+        GrantFailure::Fallback
+    } else {
+        GrantFailure::Fail
+    }
+}
 fn native_failure(error: Error, scope: &RequestScope) -> bool {
     scope.check().is_ok() && (recoverable(error) || error == Error::DeadlineExceeded)
 }
@@ -488,7 +531,7 @@ impl Transfers {
             links.record_fallback_no_link();
             return Ok(None);
         }
-        let binding = Binding::request(
+        let mut binding = Binding::request(
             &request.authentication,
             request.request.route.membership.0,
             scope,
@@ -517,14 +560,58 @@ impl Transfers {
         let granted = match landed {
             Some(pending) => Ok(pending),
             None => {
-                // All of the rail's buffers or the link's grant slots are in use: wait briefly for
-                // one rather than carry the page over the far costlier HTTP path.
+                // All of the rail's buffers or the link's grant slots are in use. Try the
+                // other eligible rails first (NUMA-local ones before the rest), then wait
+                // for a slot, polling the rails in turn.
+                let rails = if landing.is_none() {
+                    spare_rails(
+                        rail,
+                        &links.local_rails(&peer),
+                        links.active().iter().map(|m| m.rail),
+                        |r| {
+                            links.ready(&peer, r).is_some()
+                                && crate::rdma::admits_rail(
+                                    plan,
+                                    membership,
+                                    self.signatures.node(),
+                                    &peer,
+                                    r,
+                                )
+                        },
+                    )
+                } else {
+                    vec![rail]
+                };
                 let native = native_scope(scope);
                 let reactor = self.io.reactor();
                 let clock = || native.clock().now();
                 let until = crate::rdma::links::grant_wait_until(clock(), native.deadline.0);
+                let attempts = std::cell::Cell::new(0usize);
+                let transfer = binding.transfer;
                 let (granted, waited) = crate::rdma::links::retry_overloaded(
-                    || links.grant(&peer, rail, binding.transfer, &native),
+                    || {
+                        let first = attempts.get();
+                        attempts.set(first + 1);
+                        let rails = &rails;
+                        let peer = &peer;
+                        let native = &native;
+                        async move {
+                            // The first attempt sweeps every rail; each later poll tries one.
+                            let order: Vec<_> = if first == 0 {
+                                rails.clone()
+                            } else {
+                                vec![rails[(first - 1) % rails.len()]]
+                            };
+                            let mut last = Err(Error::Overloaded);
+                            for r in order {
+                                last = links.grant(peer, r, transfer, native).await;
+                                if !matches!(last, Err(Error::Overloaded)) {
+                                    break;
+                                }
+                            }
+                            last
+                        }
+                    },
                     |wake| reactor.sleep_until(wake, &native),
                     clock,
                     until,
@@ -534,14 +621,25 @@ impl Transfers {
                 granted
             }
         };
+        let page = matches!(
+            request.request.operation,
+            crate::peer::protocol::Operation::Page { .. }
+        );
         let pending = match granted {
             Ok(pending) => pending,
-            Err(error) if native_failure(error, scope) => {
-                links.record_fallback_grant(error);
-                return Ok(None);
-            }
-            Err(error) => return Err(error),
+            Err(error) => match grant_failure(error, page, scope) {
+                GrantFailure::Backpressure => {
+                    links.record_grant_backpressure();
+                    return Err(Error::Overloaded);
+                }
+                GrantFailure::Fallback => {
+                    links.record_fallback_grant(error);
+                    return Ok(None);
+                }
+                GrantFailure::Fail => return Err(error),
+            },
         };
+        binding.rail = pending.rail();
         let accept = binding.sign(
             &self.signatures,
             &peer,
@@ -2687,6 +2785,50 @@ mod tests {
             assert!(!native_failure(Error::DeadlineExceeded, &scope));
             assert!(!native_failure(Error::Os(libc::ECONNRESET), &scope));
         }
+        #[test]
+        fn grant_exhaustion_on_a_page_pushes_back_instead_of_falling_back() {
+            let scope =
+                RequestScope::host(RequestId([1; 16]), Instant::now() + Duration::from_secs(30))
+                    .unwrap();
+            assert_eq!(
+                grant_failure(Error::Overloaded, true, &scope),
+                GrantFailure::Backpressure
+            );
+            // Non-page bodies still need HTTP when no slot frees.
+            assert_eq!(
+                grant_failure(Error::Overloaded, false, &scope),
+                GrantFailure::Fallback
+            );
+            // A link that broke or a lost device still falls back.
+            for error in [Error::Unavailable, Error::Io, Error::Os(libc::ECONNRESET)] {
+                assert_eq!(grant_failure(error, true, &scope), GrantFailure::Fallback);
+            }
+            assert_eq!(
+                grant_failure(Error::Unauthorized, true, &scope),
+                GrantFailure::Fail
+            );
+            scope.cancel().unwrap();
+            assert_eq!(
+                grant_failure(Error::Overloaded, true, &scope),
+                GrantFailure::Fail
+            );
+        }
+
+        #[test]
+        fn spare_rails_try_the_chosen_then_local_then_every_eligible_rail() {
+            let r = RailId;
+            assert_eq!(
+                spare_rails(r(2), &[r(1), r(2), r(3)], [r(0), r(1), r(5), r(6)], |x| x
+                    != r(6)),
+                vec![r(2), r(1), r(3), r(0), r(5)]
+            );
+            // Ineligible local rails are skipped; the chosen rail always comes first.
+            assert_eq!(
+                spare_rails(r(4), &[r(1)], [r(4)], |x| x != r(1)),
+                vec![r(4)]
+            );
+        }
+
         /// One page over a ready link, driven as the peer server and requester do.
         #[derive(Clone, Copy, Default)]
         struct PageCase {

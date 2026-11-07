@@ -1088,6 +1088,77 @@ pub(crate) mod send_in_place {
         assert!(out.contains("racer_rdma_grant_wait_granted_total 1"));
     }
 
+    /// A receiver waiting on an exhausted rail gets the slot a release frees,
+    /// and one whose slots never free gives up `Overloaded` at its bound.
+    #[test]
+    fn grant_waiter_wakes_when_a_grant_is_released() {
+        let mut w = world();
+        let env = w.env.clone();
+        let (a, b) = (w.a.links.local().clone(), w.b.links.local().clone());
+        link_up(&env, &mut w);
+        let scope = scope(&env);
+        let first = drive!(w, w.a.links.grant(&b, RAIL, TransferId([1; 16]), &scope)).unwrap();
+        let _second = drive!(w, w.a.links.grant(&b, RAIL, TransferId([2; 16]), &scope)).unwrap();
+        assert_eq!(
+            drive!(w, w.a.links.grant(&b, RAIL, TransferId([3; 16]), &scope)).err(),
+            Some(Error::Overloaded),
+            "every buffer is granted"
+        );
+        // Nothing frees: the wait ends `Overloaded` at its bound.
+        let start = Instant::now();
+        let clock = Cell::new(start);
+        let (result, waits) = drive!(
+            w,
+            retry_overloaded(
+                || w.a.links.grant(&b, RAIL, TransferId([3; 16]), &scope),
+                |wake| {
+                    clock.set(wake);
+                    async { Ok(()) }
+                },
+                || clock.get(),
+                start + Duration::from_millis(5),
+            )
+        );
+        assert_eq!(result.err(), Some(Error::Overloaded));
+        assert_eq!(waits, 5);
+        // The sender declines the first grant while the receiver waits: the
+        // waiter takes the freed buffer.
+        let header = STANDARD.decode(first.header_value()).unwrap();
+        let grant = AuthenticatedGrant::decode(&header, RAIL, TransferId([1; 16])).unwrap();
+        let released = Cell::new(false);
+        let clock = Cell::new(start);
+        let (result, waits) = drive!(
+            w,
+            retry_overloaded(
+                || w.a.links.grant(&b, RAIL, TransferId([4; 16]), &scope),
+                |wake| {
+                    clock.set(wake);
+                    if !released.replace(true) {
+                        w.b.links.release(&a, &grant);
+                    }
+                    async { Ok(()) }
+                },
+                || clock.get(),
+                start + Duration::from_millis(40),
+            )
+        );
+        assert!(result.is_ok(), "the released buffer is granted");
+        assert!(waits >= 1);
+    }
+
+    #[test]
+    fn grant_backpressure_is_not_an_http_fallback() {
+        let w = world();
+        let (w, ma, _) = metered(w);
+        w.a.links.record_grant_backpressure();
+        assert_eq!(ma.count(Event::RdmaGrantBackpressure), 1);
+        assert_eq!(ma.count(Event::RdmaHttpFallback), 0);
+        assert_eq!(ma.count(Event::RdmaFallbackGrantOverloaded), 0);
+        let mut out = String::new();
+        ma.write_prometheus(&mut out).unwrap();
+        assert!(out.contains("racer_rdma_grant_backpressure_total 1"));
+    }
+
     #[test]
     fn overloaded_grant_fallback_is_counted_apart() {
         let w = world();

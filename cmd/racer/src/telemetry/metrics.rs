@@ -334,6 +334,7 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::RdmaFallbackOverflow => "racer_rdma_fallback_overflow_total",
             Self::RdmaGrantWaits => "racer_rdma_grant_waits_total",
             Self::RdmaGrantWaitGranted => "racer_rdma_grant_wait_granted_total",
+            Self::RdmaGrantBackpressure => "racer_rdma_grant_backpressure_total",
             Self::PeerConnectLocalExhausted => "racer_peer_connect_local_exhausted_total",
             Self::PeerReceiveCiphertextWaits => "racer_peer_receive_ciphertext_waits_total",
             Self::PeerReceiveCiphertextWaitGranted => "racer_peer_receive_ciphertext_wait_granted_total",

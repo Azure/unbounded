@@ -88,19 +88,21 @@ pub fn grants_per_link(buffers_per_rail: usize) -> u32 {
         .clamp(1, GRANTS_PER_LINK_CAP.min(link_setup::MAX_GRANTS_PER_LINK))
 }
 
-/// Longest a receiver waits for a free grant slot or page buffer on a rail
-/// before it carries the page over HTTP instead. A page transfer holds its
-/// buffer for a few milliseconds, so a slot usually frees well within this,
-/// and the wait is far cheaper than the HTTP path's CPU cost. Nothing is
+/// Longest a receiver waits for a free grant slot or page buffer before it
+/// gives up. A grant is held from the request until the sender's page lands,
+/// so exhaustion usually means a slow sender (its disk), not a broken link:
+/// a page request then fails `Overloaded` and its range window retries it
+/// with backoff, rather than moving the page over HTTP, which costs the
+/// receiver far more CPU and the sender the same disk read. Nothing is
 /// reserved while waiting, so memory stays bounded by the registered pool.
-pub const GRANT_WAIT: Duration = Duration::from_millis(20);
+pub const GRANT_WAIT: Duration = Duration::from_millis(50);
 
 /// Interval between grant attempts while waiting ([`GRANT_WAIT`]).
 pub const GRANT_WAIT_POLL: Duration = Duration::from_millis(1);
 
 /// When a receiver that found its rail's grants exhausted at `now` stops
 /// waiting: [`GRANT_WAIT`], but never more than a quarter of the time left
-/// before `deadline`, so the HTTP fallback keeps most of the request.
+/// before `deadline`, so a retry keeps most of the request.
 pub fn grant_wait_until(now: Instant, deadline: Instant) -> Instant {
     now + GRANT_WAIT.min(deadline.saturating_duration_since(now) / 4)
 }
@@ -558,6 +560,13 @@ impl Links {
         if error == Error::Overloaded {
             self.record(crate::telemetry::Event::RdmaFallbackGrantOverloaded, 1);
         }
+    }
+
+    /// Count a page request that failed `Overloaded` because no grant slot
+    /// or page buffer freed on any eligible rail within its wait, so its
+    /// range window retries it instead of the page going over HTTP.
+    pub fn record_grant_backpressure(&self) {
+        self.record(crate::telemetry::Event::RdmaGrantBackpressure, 1);
     }
 
     /// Count a grant that waited for a slot ([`record_grant_wait`]).
@@ -1314,6 +1323,11 @@ pub struct PendingReceive {
 }
 
 impl PendingReceive {
+    /// The rail the window was granted on.
+    pub fn rail(&self) -> RailId {
+        self.rail
+    }
+
     /// True for a grant over a GPU landing slot ([`Links::grant_landing`]).
     pub fn is_landing(&self) -> bool {
         self.landing.is_some()
