@@ -800,7 +800,7 @@ Examples:
 	cmd.Flags().StringVar(&handler.nodeIP, "node-ip", "", "IP address to pass to kubelet")
 	cmd.Flags().BoolVar(&handler.localDNS, "local-dns", false, "Enable the nspawn-local CoreDNS cache")
 	cmd.Flags().StringVar(&handler.ociImage, "oci-image", "", "OCI image source for the agent rootfs (registry reference, HTTPS OCI layout archive, or oci-layout:// URL)")
-	cmd.Flags().StringVar(&handler.isolation, "isolation", "", "Where the node stack runs. Only nspawn (the default) is supported")
+	cmd.Flags().StringVar(&handler.isolation, "isolation", "", "Where the node stack runs: nspawn (the default) or none")
 	cmd.Flags().StringVar(&handler.sandboxImage, "sandbox-image", "", "Containerd CRI sandbox image reference")
 	cmd.Flags().StringVar(&handler.offlineArtifactsSource, "offline-artifacts-source", "", "Offline rootfs binary artifact source to embed in agent config (absolute path, file:// URL, HTTPS archive, or oci:// artifact reference)")
 	cmd.Flags().StringArrayVar(&handler.additionalHostMounts, "additional-host-mount", nil, `Extra host bind-mount for the nspawn machine in "source[:target][:ro]" format (can be repeated). target defaults to source; append :ro for a read-only mount`)

@@ -19,6 +19,7 @@ import (
 	"github.com/Azure/unbounded/internal/hostroot"
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/isolation"
 )
 
 // The move itself is tested in internal/hostroot.
@@ -147,4 +148,17 @@ func TestClearDaemonStartLimit(t *testing.T) {
 			assert.Equal(t, "reset-failed\n"+goalstates.DaemonUnit+"\n", string(recorded))
 		})
 	}
+}
+
+func TestLocalDNSNetworkNodeOrdersOnlyAnNSpawnMachine(t *testing.T) {
+	nspawnNode, err := localDNSNetworkNode(discardLogger(), &ActiveMachine{Name: "kube1", Config: baseConfig()})
+	require.NoError(t, err)
+	require.True(t, nspawnNode.NSpawnMachine())
+
+	cfg := baseConfig()
+	cfg.Isolation = "none"
+
+	noneNode, err := localDNSNetworkNode(discardLogger(), &ActiveMachine{Name: "kube1", Config: cfg, Mode: isolation.ModeNone})
+	require.NoError(t, err)
+	require.False(t, noneNode.NSpawnMachine(), "a none node gets no systemd-nspawn@ drop-in")
 }

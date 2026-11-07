@@ -25,11 +25,11 @@ import (
 	"github.com/Azure/unbounded/internal/machineops"
 )
 
-// The API of this release declares only nspawn. A newer CRD, or an agent
+// The API of this release declares nspawn and none. A newer CRD, or an agent
 // reporting a refused change, can still carry other names, so the drift logic
 // treats modes as opaque strings.
 const (
-	isolationNone      unboundedv1alpha3.IsolationMode = "none"
+	isolationNone                                      = unboundedv1alpha3.IsolationNone
 	isolationContainer unboundedv1alpha3.IsolationMode = "container"
 )
 

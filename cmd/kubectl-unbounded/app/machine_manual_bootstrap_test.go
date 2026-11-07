@@ -1574,14 +1574,14 @@ func TestManualBootstrapHandler_Isolation(t *testing.T) {
 
 	kubeconfigPath := writeTempKubeconfig(t)
 
-	for _, mode := range []string{"", "nspawn"} {
+	for _, mode := range []string{"", "nspawn", "none"} {
 		h := manualBootstrapHandler{siteName: "dc1", machineName: "my-node", kubeconfigPath: kubeconfigPath, isolation: mode}
 		require.NoError(t, h.validate(), "mode %q", mode)
 	}
 
 	// Modes the agent of this release cannot operate are refused before the
 	// cluster is contacted.
-	for _, mode := range []string{"none", "container", "microvm"} {
+	for _, mode := range []string{"container", "microvm"} {
 		h := manualBootstrapHandler{siteName: "dc1", machineName: "my-node", kubeconfigPath: kubeconfigPath, isolation: mode}
 		require.ErrorContains(t, h.validate(), "invalid --isolation", "mode %q", mode)
 	}

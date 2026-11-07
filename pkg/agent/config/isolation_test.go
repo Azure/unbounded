@@ -21,8 +21,8 @@ func TestAgentConfigValidateIsolation(t *testing.T) {
 	}{
 		{"", isolation.ModeNSpawn, false},
 		{"nspawn", isolation.ModeNSpawn, false},
+		{"none", isolation.ModeNone, false},
 		// Modes this agent has no backend for are refused, not run as nspawn.
-		{"none", "", true},
 		{"container", "", true},
 		{"microvm", "", true},
 	}

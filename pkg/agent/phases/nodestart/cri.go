@@ -37,6 +37,16 @@ const (
 type configureContainerd struct {
 	goalState *goalstates.NodeStart
 
+	// skipUnit leaves the containerd service unit alone. Host-native backends
+	// own their unit and must never write the distro's containerd.service.
+	skipUnit bool
+
+	// configPath is where the main configuration is written. Empty means
+	// goalstates.ContainerdConfigPath, the path the nspawn machine's
+	// containerd reads. A host-native backend passes its own path so the
+	// distro's /etc/containerd/config.toml is never written.
+	configPath string
+
 	changeTracker
 }
 
@@ -64,8 +74,10 @@ func (c *configureContainerd) Do(_ context.Context) error {
 		}
 	}
 
-	if err := c.ensureContainerdServiceUnit(); err != nil {
-		return fmt.Errorf("ensure containerd service unit: %w", err)
+	if !c.skipUnit {
+		if err := c.ensureContainerdServiceUnit(); err != nil {
+			return fmt.Errorf("ensure containerd service unit: %w", err)
+		}
 	}
 
 	if err := c.ensureGPUDropInConfigs(); err != nil {
@@ -91,7 +103,12 @@ func (c *configureContainerd) ensureContainerdConfig() error {
 		return err
 	}
 
-	dest := c.goalState.Root().Path(goalstates.ContainerdConfigPath)
+	configPath := c.configPath
+	if configPath == "" {
+		configPath = goalstates.ContainerdConfigPath
+	}
+
+	dest := c.goalState.Root().Path(configPath)
 
 	return c.write(dest, buf.Bytes(), 0o644)
 }
@@ -162,6 +179,25 @@ func (c *configureContainerd) ensureGPUDropInConfigs() error {
 	)
 }
 
+// HostConfigTask is a configuration task for a host-native node stack that can
+// say whether it changed any file, so a reapply restarts only what it altered.
+type HostConfigTask interface {
+	phases.Task
+	// Changed reports whether Do wrote content that differed from disk.
+	Changed() bool
+}
+
+func (c *changeTracker) Changed() bool { return c.changed }
+
+// ConfigureContainerdOnHost returns a task that writes the containerd
+// configuration for a host-native node stack and leaves the service unit to the
+// backend. The main configuration goes to configPath, which the backend's unit
+// passes to containerd; the drop-ins and registry hosts stay at the paths the
+// nspawn machine uses.
+func ConfigureContainerdOnHost(goalState *goalstates.NodeStart, configPath string) HostConfigTask {
+	return &configureContainerd{goalState: goalState, skipUnit: true, configPath: configPath}
+}
+
 type startContainerd struct {
 	log       *slog.Logger
 	goalState *goalstates.NodeStart
@@ -170,6 +206,19 @@ type startContainerd struct {
 type importContainerImages struct {
 	log       *slog.Logger
 	goalState *goalstates.NodeStart
+	// hostDir is the host directory the staged archives are read from. Empty
+	// means goalstates.ContainerImageArchiveHostDir.
+	hostDir string
+}
+
+func (i *importContainerImages) archivePath(a stagedContainerImageArchive) string {
+	// The nspawn machine sees the staged directory bind mounted at a fixed
+	// path. A host-native node stack reads the staged files where they are.
+	if i.goalState.HostNative() {
+		return a.hostPath
+	}
+
+	return a.machinePath
 }
 
 // StartContainerd returns a task that enables and starts the containerd systemd service
@@ -182,6 +231,14 @@ func StartContainerd(log *slog.Logger, goalState *goalstates.NodeStart) phases.T
 // image archives into containerd.
 func ImportContainerImages(log *slog.Logger, goalState *goalstates.NodeStart) phases.Task {
 	return &importContainerImages{log: log, goalState: goalState}
+}
+
+// ImportContainerImagesFrom is ImportContainerImages reading the staged
+// archives from hostDir instead of goalstates.ContainerImageArchiveHostDir. An
+// empty hostDir is the default. It is for host-native node stacks whose
+// operator carries the archive directory, so tests can point it elsewhere.
+func ImportContainerImagesFrom(log *slog.Logger, goalState *goalstates.NodeStart, hostDir string) phases.Task {
+	return &importContainerImages{log: log, goalState: goalState, hostDir: hostDir}
 }
 
 func (s *startContainerd) Name() string { return "start-containerd" }
@@ -198,22 +255,27 @@ func (s *startContainerd) Do(ctx context.Context) error {
 func (i *importContainerImages) Name() string { return "import-container-images" }
 
 func (i *importContainerImages) Do(ctx context.Context) error {
-	archives, err := stagedContainerImageArchives(goalstates.ContainerImageArchiveHostDir)
+	hostDir := i.hostDir
+	if hostDir == "" {
+		hostDir = goalstates.ContainerImageArchiveHostDir
+	}
+
+	archives, err := stagedContainerImageArchives(hostDir)
 	if err != nil {
 		return err
 	}
 
 	for _, archive := range archives {
 		i.log.Info("importing container image archive",
-			"archive", archive.machinePath,
+			"archive", i.archivePath(archive),
 			"host_archive", archive.hostPath,
 		)
 
-		if _, err := i.goalState.Exec(ctx, i.log, "ctr", "--namespace", "k8s.io", "images", "import", archive.machinePath); err != nil {
-			return fmt.Errorf("import container image archive %s in %s: %w", archive.machinePath, i.goalState.MachineName, err)
+		if _, err := i.goalState.Exec(ctx, i.log, "ctr", "--namespace", "k8s.io", "images", "import", i.archivePath(archive)); err != nil {
+			return fmt.Errorf("import container image archive %s in %s: %w", i.archivePath(archive), i.goalState.MachineName, err)
 		}
 
-		i.log.Info("imported container image archive", "archive", archive.machinePath)
+		i.log.Info("imported container image archive", "archive", i.archivePath(archive))
 	}
 
 	return nil

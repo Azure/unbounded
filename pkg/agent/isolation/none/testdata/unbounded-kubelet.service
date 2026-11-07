@@ -1,0 +1,21 @@
+[Unit]
+Description=Kubelet (unbounded agent)
+ConditionPathExists=/opt/unbounded/node/current/bin/kubelet
+Wants=network-online.target unbounded-containerd.service
+After=network-online.target unbounded-containerd.service
+
+[Service]
+Restart=always
+RestartSec=1
+RestartMaxDelaySec=60
+RestartSteps=10
+SuccessExitStatus=143
+ExecStart=/opt/unbounded/node/current/bin/kubelet \
+        --config=/var/lib/kubelet/config.yaml \
+        $KUBELET_NODE_CONFIG_ARGS \
+        $KUBELET_TUNING_ARGS \
+        $KUBELET_KUBECONFIG_ARGS \
+        $KUBELET_EXTRA_ARGS
+
+[Install]
+WantedBy=multi-user.target

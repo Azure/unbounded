@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/Azure/unbounded/pkg/agent/config"
 	"github.com/Azure/unbounded/pkg/agent/internal/nvidia"
 	"github.com/Azure/unbounded/pkg/agent/isolation"
 )
@@ -339,13 +340,53 @@ func NVIDIAStateAvailable(nvidia NvidiaHost) bool {
 	return len(nvidia.GPUDevicePaths) > 0 && len(nvidia.LibMappings) > 0 && nvidia.DriverVersion != ""
 }
 
+// NvidiaToolkit locates the NVIDIA Container Toolkit tools for a node stack
+// that runs them from the host (isolation mode none). The zero value means the
+// paths the rootfs images ship them at, which is what every other mode uses.
+type NvidiaToolkit struct {
+	// CTKPath is the nvidia-ctk executable. Empty means NvidiaCTKPath.
+	CTKPath string
+	// ContainerRuntimePath is the nvidia-container-runtime executable. Empty
+	// means NvidiaContainerRuntimePath.
+	ContainerRuntimePath string
+}
+
+// CTK returns the nvidia-ctk path.
+func (t NvidiaToolkit) CTK() string {
+	if t.CTKPath != "" {
+		return t.CTKPath
+	}
+
+	return NvidiaCTKPath
+}
+
+// ContainerRuntime returns the nvidia-container-runtime path.
+func (t NvidiaToolkit) ContainerRuntime() string {
+	if t.ContainerRuntimePath != "" {
+		return t.ContainerRuntimePath
+	}
+
+	return NvidiaContainerRuntimePath
+}
+
+// nvidiaToolkitFor returns the toolkit location cfg selects. Only isolation
+// mode none runs the toolkit from the host, so the setting means nothing to
+// the other modes and is not applied there.
+func nvidiaToolkitFor(cfg *config.AgentConfig) NvidiaToolkit {
+	if cfg.NvidiaToolkit == nil || cfg.Isolation != string(isolation.ModeNone) {
+		return NvidiaToolkit{}
+	}
+
+	return NvidiaToolkit{CTKPath: cfg.NvidiaToolkit.CTKPath, ContainerRuntimePath: cfg.NvidiaToolkit.ContainerRuntimePath}
+}
+
 // resolveNvidiaRuntime returns the NVIDIA container runtime goal state using
 // the caller-selected provisioned capability.
-func resolveNvidiaRuntime(enabled bool) NvidiaRuntime {
+func resolveNvidiaRuntime(enabled bool, toolkit NvidiaToolkit) NvidiaRuntime {
 	return NvidiaRuntime{
 		Enabled:                    enabled,
 		RuntimeClassName:           NvidiaRuntimeClassName,
-		RuntimePath:                NvidiaContainerRuntimePath,
+		RuntimePath:                toolkit.ContainerRuntime(),
 		DisableSetAsDefaultRuntime: false,
 	}
 }

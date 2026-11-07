@@ -1,0 +1,23 @@
+[Unit]
+Description=containerd container runtime (unbounded agent)
+Documentation=https://containerd.io
+After=network.target local-fs.target
+
+[Service]
+ExecStartPre=-/sbin/modprobe overlay
+ExecStart=/opt/unbounded/node/current/bin/containerd --config /etc/unbounded/containerd/config.toml
+Type=notify
+Delegate=yes
+KillMode=process
+Restart=always
+RestartSec=1
+RestartMaxDelaySec=60
+RestartSteps=10
+LimitNPROC=infinity
+LimitCORE=infinity
+LimitNOFILE=infinity
+TasksMax=infinity
+OOMScoreAdjust=-999
+
+[Install]
+WantedBy=multi-user.target
