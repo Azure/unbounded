@@ -221,19 +221,13 @@ fn native_scope(scope: &RequestScope) -> RequestScope {
         .min(scope.clock().now() + Duration::from_secs(5));
     bounded
 }
-/// Rails a receiver may grant a page on, in the order it tries them: the
-/// chosen `rail`, the other `local` (NUMA-local) rails, then every other
-/// `active` rail, keeping only those `eligible` (a ready link that both ends
-/// publish).
-fn spare_rails(
-    rail: RailId,
-    local: &[RailId],
-    active: impl IntoIterator<Item = RailId>,
-    eligible: impl Fn(RailId) -> bool,
-) -> Vec<RailId> {
-    let mut rails = vec![rail];
-    for r in local.iter().copied().chain(active) {
-        if !rails.contains(&r) && eligible(r) {
+/// NUMA-`local` rails other than the chosen `rail` that a receiver may grant a
+/// page on when `rail` has no free slot, in order, keeping only those
+/// `eligible` (a ready link that both ends publish).
+fn spare_rails(rail: RailId, local: &[RailId], eligible: impl Fn(RailId) -> bool) -> Vec<RailId> {
+    let mut rails = Vec::new();
+    for &r in local {
+        if r != rail && !rails.contains(&r) && eligible(r) {
             rails.push(r);
         }
     }
@@ -560,64 +554,51 @@ impl Transfers {
         let granted = match landed {
             Some(pending) => Ok(pending),
             None => {
-                // All of the rail's buffers or the link's grant slots are in use. Try the
-                // other eligible rails first (NUMA-local ones before the rest), then wait
-                // for a slot, polling the rails in turn.
-                let rails = if landing.is_none() {
-                    spare_rails(
-                        rail,
-                        &links.local_rails(&peer),
-                        links.active().iter().map(|m| m.rail),
-                        |r| {
-                            links.ready(&peer, r).is_some()
-                                && crate::rdma::admits_rail(
-                                    plan,
-                                    membership,
-                                    self.signatures.node(),
-                                    &peer,
-                                    r,
-                                )
-                        },
-                    )
+                // Take a free slot on the chosen rail, or else on another NUMA-local rail,
+                // then park on the chosen rail until a slot frees (oldest request first).
+                // Waiting costs nothing until a release wakes it; other NUMA nodes' rails
+                // would land the page in remote memory, and when one rail is out of
+                // buffers the rest usually are too.
+                let spares = if landing.is_none() {
+                    spare_rails(rail, &links.local_rails(&peer), |r| {
+                        links.ready(&peer, r).is_some()
+                            && crate::rdma::admits_rail(
+                                plan,
+                                membership,
+                                self.signatures.node(),
+                                &peer,
+                                r,
+                            )
+                    })
                 } else {
-                    vec![rail]
+                    Vec::new()
                 };
                 let native = native_scope(scope);
-                let reactor = self.io.reactor();
-                let clock = || native.clock().now();
-                let until = crate::rdma::links::grant_wait_until(clock(), native.deadline.0);
-                let attempts = std::cell::Cell::new(0usize);
                 let transfer = binding.transfer;
-                let (granted, waited) = crate::rdma::links::retry_overloaded(
-                    || {
-                        let first = attempts.get();
-                        attempts.set(first + 1);
-                        let rails = &rails;
-                        let peer = &peer;
-                        let native = &native;
-                        async move {
-                            // The first attempt sweeps every rail; each later poll tries one.
-                            let order: Vec<_> = if first == 0 {
-                                rails.clone()
-                            } else {
-                                vec![rails[(first - 1) % rails.len()]]
-                            };
-                            let mut last = Err(Error::Overloaded);
-                            for r in order {
-                                last = links.grant(peer, r, transfer, native).await;
-                                if !matches!(last, Err(Error::Overloaded)) {
-                                    break;
-                                }
-                            }
-                            last
+                let mut granted = Err(Error::Overloaded);
+                if !spares.is_empty() {
+                    for r in std::iter::once(rail).chain(spares) {
+                        granted = links.grant(&peer, r, transfer, &native).await;
+                        if !matches!(granted, Err(Error::Overloaded)) {
+                            break;
                         }
-                    },
-                    |wake| reactor.sleep_until(wake, &native),
-                    clock,
-                    until,
-                )
-                .await;
-                links.record_grant_wait(waited, granted.is_ok());
+                    }
+                }
+                if matches!(granted, Err(Error::Overloaded)) {
+                    let until = crate::rdma::links::grant_wait_until(
+                        native.clock().now(),
+                        native.deadline.0,
+                    );
+                    let parked = links
+                        .grant_parked(&peer, rail, transfer, until, &native)
+                        .await;
+                    let waited = match &parked {
+                        Ok((_, waited)) => *waited,
+                        Err(error) => *error == Error::Overloaded,
+                    };
+                    links.record_grant_wait(waited, parked.is_ok());
+                    granted = parked.map(|(pending, _)| pending);
+                }
                 granted
             }
         };
@@ -2815,18 +2796,16 @@ mod tests {
         }
 
         #[test]
-        fn spare_rails_try_the_chosen_then_local_then_every_eligible_rail() {
+        fn spare_rails_are_the_other_eligible_local_rails() {
             let r = RailId;
             assert_eq!(
-                spare_rails(r(2), &[r(1), r(2), r(3)], [r(0), r(1), r(5), r(6)], |x| x
-                    != r(6)),
-                vec![r(2), r(1), r(3), r(0), r(5)]
+                spare_rails(r(2), &[r(1), r(2), r(3), r(1), r(6)], |x| x != r(6)),
+                vec![r(1), r(3)]
             );
-            // Ineligible local rails are skipped; the chosen rail always comes first.
-            assert_eq!(
-                spare_rails(r(4), &[r(1)], [r(4)], |x| x != r(1)),
-                vec![r(4)]
-            );
+            // Ineligible local rails are skipped, and other NUMA nodes' rails
+            // are never spares.
+            assert!(spare_rails(r(4), &[r(1)], |x| x != r(1)).is_empty());
+            assert!(spare_rails(r(4), &[], |_| true).is_empty());
         }
 
         /// One page over a ready link, driven as the peer server and requester do.

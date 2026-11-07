@@ -88,27 +88,33 @@ pub fn grants_per_link(buffers_per_rail: usize) -> u32 {
         .clamp(1, GRANTS_PER_LINK_CAP.min(link_setup::MAX_GRANTS_PER_LINK))
 }
 
-/// Longest a receiver waits for a free grant slot or page buffer before it
-/// gives up. A grant is held from the request until the sender's page lands,
-/// so exhaustion usually means a slow sender (its disk), not a broken link:
-/// a page request then fails `Overloaded` and its range window retries it
-/// with backoff, rather than moving the page over HTTP, which costs the
-/// receiver far more CPU and the sender the same disk read. Nothing is
-/// reserved while waiting, so memory stays bounded by the registered pool.
-pub const GRANT_WAIT: Duration = Duration::from_millis(50);
+/// Longest a receiver's grant request stays parked for a free grant slot or
+/// page buffer ([`Links::grant_parked`]). A grant is held from the request
+/// until the sender's page lands, so exhaustion usually means a slow sender
+/// (its disk), not a broken link, and the registered pool is the receiver's
+/// concurrency limit. A parked request costs no CPU until a release wakes it
+/// in arrival order, so the wait covers several grant lifetimes (each a
+/// sender disk read under load, often hundreds of milliseconds) rather than
+/// failing the page into a full range-window retry. A request still parked
+/// at the limit fails `Overloaded` and its range window retries it, rather
+/// than moving the page over HTTP, which costs the receiver far more CPU and
+/// the sender the same disk read. Nothing is reserved while waiting, so
+/// memory stays bounded by the registered pool.
+pub const GRANT_WAIT: Duration = Duration::from_secs(1);
 
-/// Interval between grant attempts while waiting ([`GRANT_WAIT`]).
-pub const GRANT_WAIT_POLL: Duration = Duration::from_millis(1);
+/// Interval between attempts in [`retry_overloaded`].
+pub const OVERLOAD_POLL: Duration = Duration::from_millis(1);
 
-/// When a receiver that found its rail's grants exhausted at `now` stops
-/// waiting: [`GRANT_WAIT`], but never more than a quarter of the time left
-/// before `deadline`, so a retry keeps most of the request.
+/// When a receiver's grant request parked at `now` stops waiting:
+/// [`GRANT_WAIT`], but never more than half the time left before
+/// `deadline`, so a granted page keeps the other half for its head round
+/// trip, the sender's read, and the write.
 pub fn grant_wait_until(now: Instant, deadline: Instant) -> Instant {
-    now + GRANT_WAIT.min(deadline.saturating_duration_since(now) / 4)
+    now + GRANT_WAIT.min(deadline.saturating_duration_since(now) / 2)
 }
 
 /// Run `attempt` until it does not fail [`Error::Overloaded`], sleeping
-/// [`GRANT_WAIT_POLL`] between attempts (`sleep` takes the wake time), until
+/// [`OVERLOAD_POLL`] between attempts (`sleep` takes the wake time), until
 /// another attempt would start after `until`. Returns the last result and the
 /// number of waits. Any other error, including a failed sleep, ends at once.
 pub async fn retry_overloaded<T, A, AF, S, SF>(
@@ -127,7 +133,7 @@ where
     loop {
         match attempt().await {
             Err(Error::Overloaded) => {
-                let wake = now() + GRANT_WAIT_POLL;
+                let wake = now() + OVERLOAD_POLL;
                 if wake > until {
                     return (Err(Error::Overloaded), waits);
                 }
@@ -141,13 +147,13 @@ where
     }
 }
 
-/// Count one receiver grant that `waited` for a slot ([`retry_overloaded`])
-/// and whether it was `granted` in the end.
-pub fn record_grant_wait(metrics: Option<&crate::telemetry::Metrics>, waited: u32, granted: bool) {
+/// Count one receiver grant request that `waited` (parked) for a slot
+/// ([`Links::grant_parked`]) and whether it was `granted` in the end.
+pub fn record_grant_wait(metrics: Option<&crate::telemetry::Metrics>, waited: bool, granted: bool) {
     let Some(metrics) = metrics else {
         return;
     };
-    if waited == 0 {
+    if !waited {
         return;
     }
     metrics.record(crate::telemetry::Event::RdmaGrantWaits, 1);
@@ -569,8 +575,8 @@ impl Links {
         self.record(crate::telemetry::Event::RdmaGrantBackpressure, 1);
     }
 
-    /// Count a grant that waited for a slot ([`record_grant_wait`]).
-    pub fn record_grant_wait(&self, waited: u32, granted: bool) {
+    /// Count a grant request that parked for a slot ([`record_grant_wait`]).
+    pub fn record_grant_wait(&self, waited: bool, granted: bool) {
         record_grant_wait(self.metrics.as_ref(), waited, granted);
     }
 
@@ -1102,22 +1108,51 @@ impl Links {
         transfer: TransferId,
         scope: &RequestScope,
     ) -> Result<PendingReceive> {
+        self.grant_inner(peer, rail, transfer, None, scope)
+            .await
+            .map(|(pending, _)| pending)
+    }
+
+    /// Receiver: like [`Self::grant`], but when every grant slot of the link
+    /// or every buffer of the rail is held, park in the owner until one frees
+    /// (oldest request first) or `until` passes, then fail `Overloaded`.
+    /// Also returns whether the request parked.
+    pub async fn grant_parked(
+        &self,
+        peer: &NodeId,
+        rail: RailId,
+        transfer: TransferId,
+        until: Instant,
+        scope: &RequestScope,
+    ) -> Result<(PendingReceive, bool)> {
+        self.grant_inner(peer, rail, transfer, Some(until), scope)
+            .await
+    }
+
+    async fn grant_inner(
+        &self,
+        peer: &NodeId,
+        rail: RailId,
+        transfer: TransferId,
+        park: Option<Instant>,
+        scope: &RequestScope,
+    ) -> Result<(PendingReceive, bool)> {
         scope.check()?;
         let (epoch, link) = self.ready(peer, rail).ok_or(Error::Unavailable)?;
         let length = MAX_CIPHERTEXT as u32;
-        let granted = self
-            .wait(
-                self.client.grant(
-                    link_key(peer, rail),
-                    epoch,
-                    transfer.0,
-                    length,
-                    scope.deadline.0,
-                ),
-                scope,
-            )
-            .await?;
-        Ok(PendingReceive {
+        let key = link_key(peer, rail);
+        let op = match park {
+            Some(until) => {
+                self.client
+                    .grant_parked(key, epoch, transfer.0, length, scope.deadline.0, until)
+            }
+            None => self
+                .client
+                .grant(key, epoch, transfer.0, length, scope.deadline.0),
+        };
+        let granted = self.wait(op, scope).await?;
+        let waited = granted.waited;
+        let pending = PendingReceive {
             metrics: self.metrics.clone(),
             retry: self.retry.clone(),
             link,
@@ -1127,7 +1162,13 @@ impl Links {
             transfer,
             arrival: granted.arrival,
             landing: None,
-        })
+        };
+        Ok((pending, waited))
+    }
+
+    /// Receiver grant requests parked for a free slot ([`Self::grant_parked`]).
+    pub fn grant_waiters(&self) -> usize {
+        self.client.grant_waiters()
     }
 
     /// Receiver: like [`Self::grant`], but the window is over a slot of GPU

@@ -989,14 +989,14 @@ pub(crate) mod send_in_place {
     }
 
     #[test]
-    fn grant_wait_is_bounded_by_its_cap_and_a_quarter_of_the_deadline() {
+    fn grant_wait_is_bounded_by_its_cap_and_half_the_deadline() {
         let now = Instant::now();
         let long = now + Duration::from_secs(10);
         assert_eq!(grant_wait_until(now, long), now + GRANT_WAIT);
         let short = now + Duration::from_millis(40);
         assert_eq!(
             grant_wait_until(now, short),
-            now + Duration::from_millis(10)
+            now + Duration::from_millis(20)
         );
         assert_eq!(grant_wait_until(now, now), now);
         assert_eq!(grant_wait_until(now, now - Duration::from_secs(1)), now);
@@ -1077,9 +1077,9 @@ pub(crate) mod send_in_place {
     fn grant_waits_are_counted() {
         let w = world();
         let (w, ma, _) = metered(w);
-        w.a.links.record_grant_wait(0, true);
-        w.a.links.record_grant_wait(3, true);
-        w.a.links.record_grant_wait(2, false);
+        w.a.links.record_grant_wait(false, true);
+        w.a.links.record_grant_wait(true, true);
+        w.a.links.record_grant_wait(true, false);
         assert_eq!(ma.count(Event::RdmaGrantWaits), 2);
         assert_eq!(ma.count(Event::RdmaGrantWaitGranted), 1);
         let mut out = String::new();
@@ -1088,62 +1088,62 @@ pub(crate) mod send_in_place {
         assert!(out.contains("racer_rdma_grant_wait_granted_total 1"));
     }
 
-    /// A receiver waiting on an exhausted rail gets the slot a release frees,
-    /// and one whose slots never free gives up `Overloaded` at its bound.
+    /// A receiver parked on an exhausted rail is woken by the release that
+    /// frees a slot, with no polling: the request is pending until the sender
+    /// declines a grant, then granted and reported as waited. One whose wait
+    /// limit has passed fails `Overloaded`, and one that finds a slot free is
+    /// granted without waiting.
     #[test]
-    fn grant_waiter_wakes_when_a_grant_is_released() {
+    fn parked_grant_wakes_when_a_grant_is_released() {
         let mut w = world();
         let env = w.env.clone();
         let (a, b) = (w.a.links.local().clone(), w.b.links.local().clone());
         link_up(&env, &mut w);
         let scope = scope(&env);
-        let first = drive!(w, w.a.links.grant(&b, RAIL, TransferId([1; 16]), &scope)).unwrap();
+        let until = env.ctx.now() + Duration::from_secs(1);
+        let (first, waited) = drive!(
+            w,
+            w.a.links
+                .grant_parked(&b, RAIL, TransferId([1; 16]), until, &scope)
+        )
+        .unwrap();
+        assert!(!waited, "a free slot is granted at once");
         let _second = drive!(w, w.a.links.grant(&b, RAIL, TransferId([2; 16]), &scope)).unwrap();
         assert_eq!(
             drive!(w, w.a.links.grant(&b, RAIL, TransferId([3; 16]), &scope)).err(),
             Some(Error::Overloaded),
             "every buffer is granted"
         );
-        // Nothing frees: the wait ends `Overloaded` at its bound.
-        let start = Instant::now();
-        let clock = Cell::new(start);
-        let (result, waits) = drive!(
-            w,
-            retry_overloaded(
-                || w.a.links.grant(&b, RAIL, TransferId([3; 16]), &scope),
-                |wake| {
-                    clock.set(wake);
-                    async { Ok(()) }
-                },
-                || clock.get(),
-                start + Duration::from_millis(5),
+        // A wait limit already passed fails at once.
+        assert_eq!(
+            drive!(
+                w,
+                w.a.links
+                    .grant_parked(&b, RAIL, TransferId([3; 16]), env.ctx.now(), &scope)
             )
+            .err(),
+            Some(Error::Overloaded)
         );
-        assert_eq!(result.err(), Some(Error::Overloaded));
-        assert_eq!(waits, 5);
-        // The sender declines the first grant while the receiver waits: the
-        // waiter takes the freed buffer.
+        let mut parked =
+            Box::pin(
+                w.a.links
+                    .grant_parked(&b, RAIL, TransferId([4; 16]), until, &scope),
+            );
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        for _ in 0..4 {
+            assert!(parked.as_mut().poll(&mut cx).is_pending());
+            pump!(w);
+        }
+        assert_eq!(w.a.links.grant_waiters(), 1);
+        // The sender declines the first grant: the parked request takes the
+        // freed buffer.
         let header = STANDARD.decode(first.header_value()).unwrap();
         let grant = AuthenticatedGrant::decode(&header, RAIL, TransferId([1; 16])).unwrap();
-        let released = Cell::new(false);
-        let clock = Cell::new(start);
-        let (result, waits) = drive!(
-            w,
-            retry_overloaded(
-                || w.a.links.grant(&b, RAIL, TransferId([4; 16]), &scope),
-                |wake| {
-                    clock.set(wake);
-                    if !released.replace(true) {
-                        w.b.links.release(&a, &grant);
-                    }
-                    async { Ok(()) }
-                },
-                || clock.get(),
-                start + Duration::from_millis(40),
-            )
-        );
-        assert!(result.is_ok(), "the released buffer is granted");
-        assert!(waits >= 1);
+        w.b.links.release(&a, &grant);
+        let (pending, waited) = drive!(w, parked).unwrap();
+        assert!(waited);
+        assert_eq!(pending.rail(), RAIL);
+        assert_eq!(w.a.links.grant_waiters(), 0);
     }
 
     #[test]

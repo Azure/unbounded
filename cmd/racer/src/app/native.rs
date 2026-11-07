@@ -288,6 +288,10 @@ impl WorkerApplication {
                 crate::telemetry::Gauge::RdmaFreeBuffers,
                 links.free_buffers() as u64,
             );
+            metrics.set_gauge(
+                crate::telemetry::Gauge::RdmaGrantWaiters,
+                links.grant_waiters() as u64,
+            );
             links.sync_link_metrics();
         }
         // The GPU helper started lazily after these rails activated: attach
