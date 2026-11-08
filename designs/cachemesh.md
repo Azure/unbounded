@@ -491,6 +491,27 @@ cell balancing or reshape, epoch, invalidations. A new leader starts from its
 own view, so no state is rebuilt from scratch; pending joins and suspicions
 are simply retried by their senders.
 
+Implementation notes (`leader` package):
+
+- Within a delta, cell balancing or reshape comes before the partition moves
+  (`Assign`), so the planner prefers the final cell-mates of removed owners.
+  The full order is: `NewTerm`, bootstrap (`Config`, `AddMember(self)`,
+  `Epoch`), admissions, promotions, drains and drained removals, suspicion
+  removals, cells, `Assign`, `Epoch`, `Invalidate`.
+- `Tick(now, epochNow, view, newTerm)` emits `NewTerm` itself when `newTerm`
+  is nonzero. A leader that is not a member of its view (a lottery winner)
+  admits itself as `Joining` in that first delta, removing a stale record of
+  its own ID; outside a term start a non-member leader publishes nothing.
+- Quarantine, warmup, and drain timers run on the leader's monotonic clock
+  from when it set the member's state. For states set by an earlier leader
+  the start is estimated as `now - (epochNow - Member.Since) * EpochPeriod`.
+- The leader drains itself on `Leave` but never removes itself; the next
+  leader removes it.
+- The placement scan is skipped when the table and the planner inputs
+  (slots, keys, weights, cells) are unchanged since a plan with no moves.
+- Input queues (joins, leaves, suspected targets, invalidations) are bounded
+  by `MaxPending` (4096); suspicion reports per target by 64.
+
 ## Leader election
 
 `elect.Elector` is a state machine. It emits `LeaseOp`s (`Get`, `GetCached`,
