@@ -41,7 +41,11 @@
 //     Otherwise the best backup takes the request: KindBackup with
 //     FlagBackup, Alternate = the next backup or, if o is Degraded, o. When
 //     self is itself the best backup it serves the request: KindSelf with
-//     Owner != self and FlagBackup set in the header.
+//     Owner != self and FlagBackup set in the header. A member of o's cell
+//     that receives a request with FlagBackup serves it the same way,
+//     whatever its own health view of o, so a backup hop is always final.
+//     A caller that retries or hedges to Alternate after a final hop sends
+//     Decision.AlternateHeader, which carries FlagBackup.
 //   - otherwise relay: for each dimension where cx and co differ, lowest
 //     first, the candidate cell is cx with that coordinate replaced by co's.
 //     Next is the best usable member of the first candidate cell that has
@@ -168,6 +172,22 @@ type Decision struct {
 	HedgeAfter time.Duration
 	// Header is the header to send with the request.
 	Header Header
+}
+
+// AlternateHeader returns the header to send to Alternate when retrying or
+// hedging. After a final hop (KindOwner or KindBackup) the Alternate is a backup of the owner (or the owner itself after a
+// KindBackup), so the header carries FlagBackup and the receiver serves the
+// request instead of sending it back to the owner the caller gave up on.
+// After a relay hop it is Header unchanged.
+func (d *Decision) AlternateHeader() Header {
+	h := d.Header
+
+	switch d.Kind {
+	case KindOwner, KindBackup:
+		h.Flags |= FlagBackup
+	}
+
+	return h
 }
 
 // Config configures an Env.
@@ -687,8 +707,12 @@ func (s *State) final(d *Decision, p uint32, owner view.Slot, oc uint32, avoid v
 	}
 
 	toOwner := ou == health.Healthy || !t[0].ok() || (ou == health.Degraded && t[0].class < health.Healthy)
-	if standin && s.selfCell == oc && ou != health.Unusable {
-		toOwner = true
+	if standin && s.selfCell == oc {
+		// The sender already judged the owner unusable (or saw it fail):
+		// serve as its stand-in. Sending back to an owner this member
+		// still sees as usable would add a hop past D and, with
+		// failovers, bounce between the owner and its backups.
+		toOwner = false
 	}
 
 	switch {

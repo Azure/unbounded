@@ -742,3 +742,69 @@ func TestRouteManyAndHedge(t *testing.T) {
 		t.Fatal("untracked not healthy")
 	}
 }
+
+// TestStandInIgnoresOwnHealthView is a regression test: a backup that
+// receives a Backup-flagged request serves it even when its own health view
+// still finds the owner usable. It used to send the request back to the
+// owner, which took D+1 hops and, with caller failovers to the next backup,
+// bounced between the owner and its backups until the TTL ran out (found by
+// the DST data-plane workload).
+func TestStandInIgnoresOwnHealthView(t *testing.T) {
+	v := smallView(t)
+	senderTr := newTracker(0)
+	sender := newFixture(v, newEnv(senderTr, 10))
+	backups := newFixture(v, newEnv(newTracker(0), 10)) // sees everyone healthy
+	self := view.Slot(5)
+	p := findKind(t, sender.st[self], KindOwner)
+	owner := v.Table().Owner(p)
+
+	if v.Cell(owner) == v.Cell(self) {
+		t.Skip("owner is a cell-mate")
+	}
+
+	eject(t, senderTr, v, owner)
+
+	d := sender.st[self].RoutePartition(p)
+	if d.Kind != KindBackup {
+		t.Fatalf("%+v", d)
+	}
+
+	bd, err := backups.st[d.Next.Slot].Forward(d.Header)
+	if err != nil || bd.Kind != KindSelf || bd.Owner.Slot != owner || bd.Header.Flags&FlagBackup == 0 {
+		t.Fatalf("backup: %+v %v", bd, err)
+	}
+
+	// Without the flag the same member routes to the owner it finds healthy.
+	h := d.Header
+	h.Flags &^= FlagBackup
+
+	if od, err := backups.st[d.Next.Slot].Forward(h); err != nil || od.Kind != KindOwner {
+		t.Fatalf("unflagged: %+v %v", od, err)
+	}
+}
+
+func TestAlternateHeader(t *testing.T) {
+	v := smallView(t)
+	f := newFixture(v, newEnv(newTracker(0), 10))
+	self := view.Slot(5)
+
+	d := f.st[self].RoutePartition(findKind(t, f.st[self], KindOwner))
+	if d.Alternate.IsZero() {
+		t.Skip("no alternate")
+	}
+
+	ah := d.AlternateHeader()
+	if ah.Flags&FlagBackup == 0 || d.Header.Flags&FlagBackup != 0 {
+		t.Fatalf("owner: %+v / %+v", ah, d.Header)
+	}
+
+	// The backup serves a failover from the owner hop.
+	if bd, err := f.st[d.Alternate.Slot].Forward(ah); err != nil || bd.Kind != KindSelf {
+		t.Fatalf("failover: %+v %v", bd, err)
+	}
+
+	r := f.st[self].RoutePartition(findKind(t, f.st[self], KindRelay))
+	if r.AlternateHeader() != r.Header {
+		t.Fatalf("relay alternate header changed: %+v", r.AlternateHeader())
+	}
+}
