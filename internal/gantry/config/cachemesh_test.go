@@ -28,7 +28,7 @@ func TestCachemeshDefaultsDisabled(t *testing.T) {
 	}
 
 	if m.ChunkSize != 64<<20 || m.MetadataTTL != 5*time.Minute || m.LeaseName != "gantry-cachemesh" ||
-		m.ChunkCacheBytes != 8<<30 || !m.CacheTags || !m.VerifyDigest || m.Lookahead != 8 {
+		m.ChunkCacheBytes != 4<<30 || !m.CacheTags || !m.VerifyDigest || m.Lookahead != 8 {
 		t.Fatalf("unexpected defaults: %+v", m)
 	}
 

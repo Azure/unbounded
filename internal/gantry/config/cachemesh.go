@@ -14,7 +14,7 @@ import (
 const (
 	DefaultCachemeshLeaseName       = "gantry-cachemesh"
 	DefaultCachemeshChunkSize       = 64 << 20
-	DefaultCachemeshChunkCacheBytes = 8 << 30
+	DefaultCachemeshChunkCacheBytes = 4 << 30
 	DefaultCachemeshMetadataTTL     = 5 * time.Minute
 
 	// MinCachemeshChunkSize and MaxCachemeshChunkSize bound chunk_size. Each
@@ -88,8 +88,11 @@ type CachemeshConfig struct {
 	// evicting the cached chunks.
 	VerifyDigest bool `yaml:"verify_digest"`
 
-	// ChunkCacheBytes is the in-memory chunk cache budget in bytes. Chunks
-	// being filled count against it and are never evicted.
+	// ChunkCacheBytes bounds all chunk memory in bytes: cached chunks plus
+	// chunks being filled, which are never evicted. When in-flight chunks
+	// alone reach the budget, peer requests that need a new fill get 429
+	// and local requests wait. The agent's memory limit must leave room
+	// for this budget plus normal agent overhead.
 	ChunkCacheBytes int64 `yaml:"chunk_cache_bytes"`
 
 	// MaxConcurrentChunkFills caps chunks this agent fetches from a peer or
@@ -130,7 +133,7 @@ func defaultCachemeshConfig() CachemeshConfig {
 		CacheTags:                true,
 		VerifyDigest:             true,
 		ChunkCacheBytes:          DefaultCachemeshChunkCacheBytes,
-		MaxConcurrentChunkFills:  128,
+		MaxConcurrentChunkFills:  64,
 		MaxConcurrentChunkServes: 512,
 		Lookahead:                8,
 		ChunkTimeout:             5 * time.Minute,
