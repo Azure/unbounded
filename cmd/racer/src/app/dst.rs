@@ -124,6 +124,7 @@ pub mod cluster {
             memory_pressure: true,
             pprof_enabled: false,
             enable_rdma,
+            rdma_breaker: crate::rdma::breaker::BreakerConfig::default(),
             enable_gpu: crate::config::GpuMode::Disabled,
             gpu_staging_bytes: crate::config::DEFAULT_GPU_STAGING_BYTES,
             gpu_landing_bytes: crate::config::DEFAULT_GPU_LANDING_BYTES,

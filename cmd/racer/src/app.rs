@@ -1515,6 +1515,7 @@ impl WorkerApplication {
                         reactor.ctx().clone(),
                     )
                     .with_numa(numa)
+                    .with_breaker(config.rdma_breaker)
                     .with_metrics(metrics.clone()),
                 )
             })
