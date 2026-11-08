@@ -512,6 +512,24 @@ Implementation notes (`leader` package):
 - Input queues (joins, leaves, suspected targets, invalidations) are bounded
   by `MaxPending` (4096); suspicion reports per target by 64.
 
+Implementation notes (`node` package):
+
+- `Routed` messages are relayed straight to the leader address the relay
+  knows (from its view, the Lease, or a `Pong` hint) rather than hop by hop
+  over the grid; `TTL` (4) bounds relay chains while leaders change.
+- A member with no `Config.Seeds` issues one cached Lease read at start. If
+  it finds no live holder it bootstraps: it acts as a candidate until it has
+  a view. A member without a view that wins the Lease any other way (a
+  lottery) releases it instead of publishing a second genesis.
+- A member that finds itself removed (for example after a partition) and is
+  not leaving rejoins with the same incarnation, using the leader and random
+  members of its last view as seeds.
+- A failed `Broadcast` forward is retried once with the next-ranked member
+  of the same cell.
+- Elector and health ticks run every `TickInterval` (1s).
+- `node.Shared` (simulation only) shares interned views, encoded deltas,
+  snapshots, and candidate lists across nodes in one process.
+
 ## Leader election
 
 `elect.Elector` is a state machine. It emits `LeaseOp`s (`Get`, `GetCached`,
