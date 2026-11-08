@@ -439,6 +439,10 @@ type Config struct {
 
 	// LogFormat is "json" (production) or "text" (development).
 	LogFormat string `yaml:"log_format"`
+
+	// Cachemesh configures the optional cachemesh content path. Disabled
+	// by default. See CachemeshConfig.
+	Cachemesh CachemeshConfig `yaml:"cachemesh"`
 }
 
 // UpstreamRegistry describes one OCI registry the agent mirrors.
@@ -576,6 +580,8 @@ func NewDefault() *Config {
 
 		LogLevel:  "info",
 		LogFormat: "json",
+
+		Cachemesh: defaultCachemeshConfig(),
 	}
 }
 
@@ -790,6 +796,8 @@ func (c *Config) LoadEnv(env func(string) string) error {
 
 	setStr("LOG_LEVEL", &c.LogLevel)
 	setStr("LOG_FORMAT", &c.LogFormat)
+
+	errs = append(errs, c.loadCachemeshEnv(env)...)
 
 	return errors.Join(errs...)
 }
@@ -1325,6 +1333,8 @@ func (c *Config) Validate() error {
 	if c.ChairNamespace != "" && c.PodIP == "" {
 		errs = append(errs, errors.New("chair_namespace requires pod_ip for holder address publication"))
 	}
+
+	errs = append(errs, c.validateCachemesh()...)
 
 	return errors.Join(errs...)
 }
