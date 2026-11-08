@@ -7,6 +7,7 @@
 //
 //	gen-image   stream a synthetic N-layer image into an OCI distribution
 //	            registry without holding layers in memory or on disk.
+//	image-info  print the manifest digest and total blob bytes of an image.
 //	delete-image delete a manifest (by tag) so registry garbage-collect can
 //	            reclaim its blobs.
 //	summarize   parse the raw output of run.sh and write summary.md/json.
@@ -29,6 +30,8 @@ func main() {
 	switch os.Args[1] {
 	case "gen-image":
 		err = runGenImage(os.Args[2:])
+	case "image-info":
+		err = runImageInfo(os.Args[2:])
 	case "delete-image":
 		err = runDeleteImage(os.Args[2:])
 	case "summarize":
@@ -47,5 +50,5 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: gantry-cluster-bench {gen-image|delete-image|summarize|compare} [flags]")
+	fmt.Fprintln(os.Stderr, "usage: gantry-cluster-bench {gen-image|image-info|delete-image|summarize|compare} [flags]")
 }

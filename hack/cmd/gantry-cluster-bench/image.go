@@ -468,3 +468,50 @@ func runDeleteImage(args []string) error {
 
 	return nil
 }
+
+// runImageInfo prints "<manifest-digest> <total-bytes>" where total-bytes is
+// the sum of the config and layer blob sizes.
+func runImageInfo(args []string) error {
+	fs := flag.NewFlagSet("image-info", flag.ExitOnError)
+	registry := fs.String("registry", "127.0.0.1:5005", "registry host:port")
+	repo := fs.String("repo", "bench/g40", "repository")
+	tag := fs.String("tag", "", "tag or digest (required)")
+
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	if *tag == "" {
+		return errors.New("--tag is required")
+	}
+
+	rc, err := newRegistryClient(*registry, *repo)
+	if err != nil {
+		return err
+	}
+
+	resp, err := rc.do(context.Background(), http.MethodGet, rc.url("/manifests/"+*tag), nil, 0,
+		map[string]string{"Accept": mediaTypeManifest})
+	if err != nil {
+		return err
+	}
+	defer closeBody(resp)
+
+	if err := checkStatus(resp, http.StatusOK); err != nil {
+		return err
+	}
+
+	var m manifest
+	if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
+		return err
+	}
+
+	total := m.Config.Size
+	for _, l := range m.Layers {
+		total += l.Size
+	}
+
+	fmt.Printf("%s %d\n", resp.Header.Get("Docker-Content-Digest"), total)
+
+	return nil
+}

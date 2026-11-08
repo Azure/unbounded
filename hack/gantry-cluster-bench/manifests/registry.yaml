@@ -1,0 +1,83 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Origin registry for the gantry cluster bench. Plain HTTP on the node's
+# primary IP, port 5005, storage on the node root filesystem. The "tools"
+# container is used to run gantry-cluster-bench gen-image against
+# 127.0.0.1:5005 (no network hop) and to read /proc/net/dev for origin egress.
+# REGISTRY_NODE is substituted by registry.sh.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: origin-registry
+  namespace: gantry-bench
+  labels:
+    app: origin-registry
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: origin-registry
+  template:
+    metadata:
+      labels:
+        app: origin-registry
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        kubernetes.io/hostname: ${REGISTRY_NODE}
+      terminationGracePeriodSeconds: 10
+      containers:
+        - name: registry
+          image: docker.io/library/registry:3
+          env:
+            - name: REGISTRY_HTTP_ADDR
+              value: "0.0.0.0:5005"
+            - name: REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY
+              value: /var/lib/registry
+            - name: REGISTRY_STORAGE_DELETE_ENABLED
+              value: "true"
+            - name: REGISTRY_LOG_LEVEL
+              value: warn
+            - name: OTEL_TRACES_EXPORTER
+              value: none
+          ports:
+            - containerPort: 5005
+              name: http
+          readinessProbe:
+            httpGet:
+              path: /v2/
+              port: 5005
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: "2"
+              memory: 2Gi
+            limits:
+              cpu: "16"
+              memory: 16Gi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/registry
+        - name: tools
+          image: docker.io/library/ubuntu:24.04
+          command: ["sleep", "infinity"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "16"
+              memory: 4Gi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/registry
+              readOnly: true
+      volumes:
+        - name: data
+          hostPath:
+            path: /var/lib/gantry-bench-registry
+            type: DirectoryOrCreate

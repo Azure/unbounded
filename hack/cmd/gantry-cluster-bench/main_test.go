@@ -120,6 +120,16 @@ func (f *fakeRegistry) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if _, ok := f.blobs[p[strings.LastIndex(p, "/")+1:]]; !ok {
 			w.WriteHeader(http.StatusNotFound)
 		}
+	case r.Method == http.MethodGet && strings.Contains(p, "/manifests/"):
+		b, ok := f.manifests[p[strings.LastIndex(p, "/")+1:]]
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+
+		sum := sha256.Sum256(b)
+		w.Header().Set("Docker-Content-Digest", "sha256:"+hex.EncodeToString(sum[:]))
+		_, _ = w.Write(b)
 	case r.Method == http.MethodPut && strings.Contains(p, "/manifests/"):
 		b, _ := io.ReadAll(r.Body)
 		f.manifests[p[strings.LastIndex(p, "/")+1:]] = b
@@ -158,6 +168,14 @@ func TestGenImagePushesConsistentImage(t *testing.T) {
 
 	if _, ok := reg.blobs[m.Config.Digest]; !ok {
 		t.Fatal("config blob missing")
+	}
+
+	if err := runImageInfo([]string{"--registry", srv.URL, "--repo", "bench/t", "--tag", "x"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := runImageInfo([]string{"--registry", srv.URL, "--repo", "bench/t", "--tag", "missing"}); err == nil {
+		t.Fatal("want error for missing tag")
 	}
 }
 

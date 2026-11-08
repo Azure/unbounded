@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Runs inside the gantry-bench DaemonSet pods (privileged, hostPID,
+# hostNetwork). containerd and kubelet run inside a systemd-nspawn machine on
+# these nodes; PID 1 of the pod's (host) PID namespace is that machine's
+# systemd, so "nsenter -t 1 -m -u -n -p" gives the kubelet/containerd view
+# (/run/containerd/containerd.sock, /etc/containerd/certs.d, crictl, ctr).
+#
+# MODE:
+#   prep-apply   write /etc/containerd/certs.d/<ORIGIN>/hosts.toml
+#   prep-remove  remove that directory
+#   clean        remove bench images and gantry leases, report disk free
+#   pull         sample node stats, pull IMAGE at START_AT, print RESULT
+#
+# Every mode prints a final "DONE <node>" line and then sleeps, so the
+# runner can collect logs before deleting the DaemonSet.
+set -euo pipefail
+
+NODE="${NODE_NAME:?NODE_NAME}"
+MODE="${MODE:?MODE}"
+NIC="${NIC:-eth0}"
+DISK="${DISK:-nvme0n1}"
+INTERVAL="${INTERVAL:-1}"
+
+host() { nsenter -t 1 -m -u -n -p -- "$@"; }
+# crictl_ hides the harmless "/etc/crictl.yaml does not exist" warnings.
+crictl_() {
+  host crictl --runtime-endpoint unix:///run/containerd/containerd.sock "$@" 2> >(grep -v 'crictl.yaml' >&2)
+}
+now_ns() { local t="${EPOCHREALTIME/./}"; printf '%s000' "${t}"; }
+
+finish() {
+  echo "DONE ${NODE}"
+  exec sleep infinity
+}
+
+prep_apply() {
+  local dir="/etc/containerd/certs.d/${ORIGIN:?ORIGIN}"
+  host mkdir -p "${dir}"
+  host sh -c "cat > '${dir}/hosts.toml.tmp' && mv '${dir}/hosts.toml.tmp' '${dir}/hosts.toml'" <<EOF
+# Managed by hack/gantry-cluster-bench (prep.sh). Bench origin registry.
+server = "http://${ORIGIN}"
+
+[host."http://127.0.0.1:5000"]
+  capabilities = ["pull", "resolve"]
+  dial_timeout = "200ms"
+EOF
+  echo "PREP ${NODE} applied ${dir}/hosts.toml"
+  host cat "${dir}/hosts.toml"
+}
+
+prep_remove() {
+  host rm -rf "/etc/containerd/certs.d/${ORIGIN:?ORIGIN}"
+  echo "PREP ${NODE} removed"
+}
+
+clean() {
+  local pattern="${CLEAN_PATTERN:-^${ORIGIN:?ORIGIN}/bench/}" ids n=0 id
+  ids="$(crictl_ images --no-trunc | awk -v p="${pattern}" 'NR > 1 && $1 ~ p {print $3}' | sort -u)"
+  for id in ${ids}; do
+    crictl_ rmi "${id}" >/dev/null && n=$((n + 1))
+  done
+  echo "CLEAN ${NODE} images_removed=${n}"
+
+  # Gantry pins in-flight and served blobs with leases named gantry-*
+  # (expire after 60m). Dropping them lets containerd GC the blobs now.
+  local leases
+  leases="$(host ctr -n k8s.io leases ls -q 2>/dev/null | grep '^gantry-' || true)"
+  n=0
+  for id in ${leases}; do
+    host ctr -n k8s.io leases rm "${id}" >/dev/null 2>&1 && n=$((n + 1))
+  done
+  echo "CLEAN ${NODE} leases_removed=${n}"
+
+  # Content not referenced by any image or lease.
+  host ctr -n k8s.io content prune references >/dev/null 2>&1 || echo "CLEAN ${NODE} content prune failed"
+
+  if [[ "${DROP_CACHES:-0}" == "1" ]]; then
+    sync
+    if echo 3 >/proc/sys/vm/drop_caches 2>/dev/null; then
+      echo "CLEAN ${NODE} drop_caches=ok"
+    else
+      echo "CLEAN ${NODE} drop_caches=failed"
+    fi
+  fi
+
+  local left
+  left="$(crictl_ images --no-trunc | awk -v p="${pattern}" 'NR > 1 && $1 ~ p' | wc -l)"
+  echo "CLEAN ${NODE} remaining_bench_images=${left} lease_count=$(host ctr -n k8s.io leases ls -q | wc -l)"
+  echo "DISK ${NODE} $(host df -B1 --output=avail,size /var/lib/containerd | tail -1)"
+}
+
+# find_pid prints the PID of the first process whose comm equals $1.
+find_pid() {
+  local d c
+  for d in /proc/[0-9]*; do
+    c=""
+    read -r c <"${d}/comm" 2>/dev/null || continue
+    if [[ "${c}" == "$1" ]]; then
+      printf '%s\n' "${d#/proc/}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# proc_stats prints "ticks rss_kb" for PID $1, or "- -".
+proc_stats() {
+  local pid="$1" stat rest f rss="" line
+  if [[ -z "${pid}" ]] || ! read -r stat <"/proc/${pid}/stat" 2>/dev/null; then
+    printf -- '- -'
+    return
+  fi
+  rest="${stat##*) }"
+  read -ra f <<<"${rest}"
+  while read -r line; do
+    if [[ "${line}" == VmRSS:* ]]; then
+      read -r _ rss _ <<<"${line}"
+      break
+    fi
+  done <"/proc/${pid}/status"
+  # After "comm) ", utime and stime are fields 12 and 13 (0-based 11, 12).
+  printf '%s %s' "$((f[11] + f[12]))" "${rss:--}"
+}
+
+sampler() {
+  local gpid="" cpid="" line rx tx dw busy total memt mema a
+  while :; do
+    [[ -n "${gpid}" && -d "/proc/${gpid}" ]] || gpid="$(find_pid gantry || true)"
+    [[ -n "${cpid}" && -d "/proc/${cpid}" ]] || cpid="$(find_pid containerd || true)"
+
+    rx=- tx=-
+    while read -r line; do
+      line="${line/:/ }"
+      read -ra a <<<"${line}"
+      if [[ "${a[0]}" == "${NIC}" ]]; then rx="${a[1]}" tx="${a[9]}"; break; fi
+    done </proc/net/dev
+
+    dw=-
+    while read -r line; do
+      read -ra a <<<"${line}"
+      if [[ "${a[2]}" == "${DISK}" ]]; then dw="${a[9]}"; break; fi
+    done </proc/diskstats
+
+    read -ra a </proc/stat
+    total=$((a[1] + a[2] + a[3] + a[4] + a[5] + a[6] + a[7] + a[8]))
+    busy=$((total - a[4] - a[5]))
+
+    memt=- mema=-
+    while read -r line; do
+      case "${line}" in
+        MemTotal:*) read -r _ memt _ <<<"${line}" ;;
+        MemAvailable:*) read -r _ mema _ <<<"${line}"; break ;;
+      esac
+    done </proc/meminfo
+
+    echo "SAMPLE ${NODE} $(now_ns) ${rx} ${tx} ${dw} ${busy} ${total} ${memt} ${mema} $(proc_stats "${gpid}") $(proc_stats "${cpid}")"
+    sleep "${INTERVAL}"
+  done
+}
+
+pull() {
+  : "${IMAGE:?IMAGE}" "${START_AT:?START_AT}"
+  sampler &
+  local spid=$! start end rc=0 wait_s
+  echo "INFO ${NODE} nic=${NIC} disk=${DISK} image=${IMAGE} start_at=${START_AT}"
+
+  wait_s=$((START_AT - EPOCHSECONDS))
+  if ((wait_s > 0)); then
+    # Sleep to just before START_AT, then spin on the sub-second remainder.
+    sleep "$((wait_s - 1))"
+    while (($(now_ns) < START_AT * 1000000000)); do sleep 0.01; done
+  fi
+
+  start="$(now_ns)"
+  crictl_ --timeout 30s pull --pull-timeout "${PULL_TIMEOUT:-3600}s" "${IMAGE}" >/tmp/pull.out 2>&1 || rc=$?
+  end="$(now_ns)"
+  echo "RESULT ${NODE} ${start} ${end} ${rc}"
+  sed "s/^/PULLOUT ${NODE} /" /tmp/pull.out
+
+  sleep "${TAIL_SECONDS:-15}"
+  kill "${spid}" 2>/dev/null || true
+  echo "DISK ${NODE} $(host df -B1 --output=avail,size /var/lib/containerd | tail -1)"
+}
+
+case "${MODE}" in
+  prep-apply) prep_apply ;;
+  prep-remove) prep_remove ;;
+  clean) clean ;;
+  pull) pull ;;
+  sample) sampler ;;
+  *) echo "unknown MODE ${MODE}" >&2; exit 2 ;;
+esac
+
+finish
