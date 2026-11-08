@@ -216,6 +216,10 @@ impl Default for Metrics {
             .unwrap()
     }
 }
+/// Samples [`Metrics::write_host_read_mappings`] writes.
+#[cfg(test)]
+const HOST_READ_MAPPING_LINES: usize = 5;
+
 // Declaration order is the counter index; names are the exported wire contract.
 metrics! { Event, EVENTS, EVENT_COUNT;
             Self::PeerReceiveAdmitted => "racer_peer_receive_admitted_total",
@@ -789,6 +793,38 @@ impl Metrics {
         Ok(())
     }
 
+    /// Write the process-wide host-read mapping cache series, always
+    /// five samples.
+    fn write_host_read_mappings(out: &mut impl Write) -> std::fmt::Result {
+        let stats = crate::client::direct::MappingCache::global().stats();
+        for (name, kind, value) in [
+            (
+                "racer_host_read_mapping_reuses_total",
+                "counter",
+                stats.reuses,
+            ),
+            (
+                "racer_host_read_mappings_created_total",
+                "counter",
+                stats.created,
+            ),
+            (
+                "racer_host_read_mappings_evicted_total",
+                "counter",
+                stats.evicted,
+            ),
+            ("racer_host_read_mappings_cached", "gauge", stats.cached),
+            (
+                "racer_host_read_mappings_cached_bytes",
+                "gauge",
+                stats.cached_bytes,
+            ),
+        ] {
+            writeln!(out, "# TYPE {name} {kind}\n{name} {value}")?;
+        }
+        Ok(())
+    }
+
     /// Write node-wide admission for every class, plus staging pools.
     fn write_worker_pools(&self, out: &mut impl Write) -> std::fmt::Result {
         let installed: Vec<_> = self
@@ -1106,7 +1142,10 @@ impl Exposition<'_> {
             1 => metrics.write_retention(out)?,
             2 => metrics.write_held(out)?,
             3 => metrics.write_disks(out)?,
-            4 => metrics.write_memory(out)?,
+            4 => {
+                metrics.write_memory(out)?;
+                Metrics::write_host_read_mappings(out)?;
+            }
             5 => metrics.write_worker_pools(out)?,
             stage => {
                 let caches = self
@@ -1957,6 +1996,7 @@ mod tests {
                     + GAUGE_COUNT
                     + RETENTION_METRICS.len()
                     + HELD_METRICS.len()
+                    + HOST_READ_MAPPING_LINES
                     + crate::prefetch::metrics::SAMPLE_LINES
                     + DISK_CLASS_METRICS.len() * 2
                     + crate::gpu_telemetry::BASE_SERIES
@@ -2031,6 +2071,7 @@ mod tests {
                             + GAUGE_COUNT
                             + RETENTION_METRICS.len()
                             + HELD_METRICS.len()
+                            + HOST_READ_MAPPING_LINES
                             + crate::prefetch::metrics::SAMPLE_LINES
                             + DISK_CLASS_METRICS.len() * 2
                             + crate::gpu_telemetry::BASE_SERIES
