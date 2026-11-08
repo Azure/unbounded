@@ -662,3 +662,31 @@ func TestLargerCluster(t *testing.T) {
 		}
 	}
 }
+
+// TestInitialView starts a cluster from a view taken from another cluster:
+// members already in it need no join, and a leader is elected over it.
+func TestInitialView(t *testing.T) {
+	src := grow(t, 6)
+	src.run(2 * time.Minute)
+	v := src.nodes[0].View()
+
+	c := newCluster(t)
+
+	for i := range 6 {
+		cfg := c.cfg(i, nil)
+		// Reuse the identities of the source cluster.
+		cfg.Incarnation = src.nodes[i].cfg.Incarnation
+		cfg.Initial = v
+		c.add(cfg)
+
+		if c.nodes[i].Self() == view.NoSlot {
+			t.Fatalf("node %d not a member of its initial view", i)
+		}
+	}
+
+	c.waitConverged(2 * time.Minute)
+
+	if c.nodes[c.leader()].View().Term() <= v.Term() {
+		t.Fatal("no new term over the initial view")
+	}
+}
