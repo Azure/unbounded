@@ -400,9 +400,21 @@ func (c *Cluster) checkSane() {
 }
 
 // termBudget bounds the number of terms of a scenario: the first, and a
-// few per fault (a lost leader, a fenced lineage, a released Lease).
+// few per fault (a lost leader, a fenced lineage, a released Lease). Each
+// injected Lease conflict on a renewal ends a term, so LeaseConflicts adds
+// one per RetryPeriod it lasts.
 func termBudget(sc Scenario) int {
-	return 2 + 4*len(sc.Faults)
+	n := 2
+
+	for _, f := range sc.Faults {
+		n += 4
+
+		if f.Kind == LeaseConflicts {
+			n += int(f.Duration / retryPeriod)
+		}
+	}
+
+	return n
 }
 
 // quietRun runs for d after convergence and fails if a new term starts or

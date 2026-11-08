@@ -111,6 +111,20 @@ func defaultCases(seeds []uint64, explicit bool) []dstCase {
 		cases = append(cases, dstCase{name: fmt.Sprintf("small/%d", s), sc: sc, twice: true})
 	}
 
+	// Pinned seeds from sweeps (run once; they are full-size explicit
+	// scenarios): tiny/293 has a term per injected Lease conflict; tiny/75
+	// has skewed lottery takeovers (excused overlaps). small/28 (a
+	// bootstrap herd after a cold restart found a released Lease) is left
+	// to sweeps for runtime.
+	for _, p := range []struct {
+		size string
+		seed uint64
+	}{{"tiny", 293}, {"tiny", 75}} {
+		c, _ := sweepCase(p.size, p.seed)
+		c.name = "pinned/" + c.name
+		cases = append(cases, c)
+	}
+
 	// Whole-cluster and partial restarts.
 	cases = append(cases, dstCase{name: "restarts", sc: GenerateRestarts(seeds[0], 16), twice: true})
 

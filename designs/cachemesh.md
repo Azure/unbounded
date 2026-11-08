@@ -349,6 +349,10 @@ table as bit-packed columns; derived indexes are rebuilt and checked by
   multiple of the period, and always less than `T + 2*period`.
 - `Invalidate(keyspace)` asks the leader to bump the generation, which makes
   every existing stamp of that keyspace stale.
+- A whole-cluster cold restart (see the node notes) bootstraps a new view
+  whose epoch starts at 0 again. Every cached value died with its process,
+  so this is safe today; stamps persisted across process restarts would need
+  the epoch carried over (for example in the Lease).
 
 ## Health
 
@@ -895,7 +899,11 @@ exercises every state of the library. It contains:
 Safety invariants, checked continuously:
 
 1. At most one member publishes deltas for any term; terms increase across
-   acquisitions; the same version never has two digests.
+   acquisitions; the same version never has two digests. No two members may
+   publish (`Leading` with `CanPublish` true) for different terms at the
+   same instant while clocks are within the election's safety bounds (wall
+   clocks within `ClockSkewAllowance` of each other, monotonic rates with
+   `rmax/rmin < LeaseDuration/RenewDeadline`).
 2. A member's view version never decreases and never accepts a lower term.
 3. Every view passes `view.Validate`.
 4. Each member's neighbor count stays within `MaxNeighbors` once cells are
@@ -907,7 +915,9 @@ Safety invariants, checked continuously:
    `T + period + drift slack` after it was issued.
 7. Lease API traffic stays within its budget: steady state at most
    `Candidates/RetryPeriod` plus the leader's renewals; during leader loss
-   about `LotteryBudgetQPS`.
+   about `LotteryBudgetQPS`. Followers make no Lease calls in steady state,
+   and a joiner makes one cached read at start and at most one per
+   seed-refresh period after.
 
 Liveness invariants, checked after faults heal and a settle period:
 
@@ -931,7 +941,8 @@ handoff, panic, hedge, lottery, damping, and so on), and the suite fails if a
 registered state is never reached across the default seed set.
 
 Default `go test` runs a seed set that finishes in about a minute and includes
-a 10k-member cluster.
+a 10k-member cluster, a scripted series of whole-cluster and partial
+restarts, and two simulated hours of churn on a small cluster.
 
 Implementation notes (control-plane suite, `dst.Cluster` and
 `suite_test.go`): each member is a `node.Node` with its own `dst.Clock`,
@@ -941,9 +952,55 @@ prebuilt by running the leader logic offline (`node.Config.Initial`), so the
 first leader is elected over an existing view. The default set is 16 tiny
 and 4 small generated scenarios (each run twice and trace-compared), one
 1,000-member and one 10,000-member scenario; only every fourth tiny/small
-seed keeps `PartitionBits` 20, the rest use 16 to bound runtime. The lease
-budget checked in quiet periods (no fault within the last 90s) is 8
-operations per second. The data-plane workload plugs in through
+seed keeps `PartitionBits` 20, the rest use 16 to bound runtime. The default set also has
+`restarts` (`GenerateRestarts`: a partial restart that kills the leader
+and all but two members, then whole-cluster restarts with and without
+seeds) and `longrun` (`GenerateLongRun`: two simulated hours of churn on
+12 members, a fault every few minutes); both require convergence at
+`Checkpoint` faults between their faults and finish in a few seconds.
+
+Control-plane invariants (`dst/control.go`):
+
+- Leader overlap (invariant 1) is checked whenever a member publishes. An
+  overlap while clocks are outside the safety bounds is counted
+  (`leader-overlap-excused`) instead of failing: generated `ClockSkew`
+  faults step wall clocks by up to 60s, beyond `ClockSkewAllowance`, and a
+  skewed lottery member can take a live Lease (fencing by term still
+  holds). Generated `ClockDrift` stays within +-10%, inside the +-20% that
+  the default durations tolerate, so drift alone never excuses an overlap.
+- Lease calls are attributed per member and classified: a node's own seed
+  reads must be at least 25s apart per process (16 join attempts of 2s on
+  a clock up to 10% fast); elector calls in quiet periods (no fault within
+  the last 90s) are at most `Candidates + 2` per second, at most
+  `5*(Candidates+1) + Candidates + 1` per 10s window, made by at most
+  `Candidates + 2` members, each of which was a candidate or the leader at
+  one end of the window. In any second after cluster formation (30s after
+  the first term) elector calls are at most `4*LotteryBudgetQPS +
+  Candidates + 2`: one second can hold a lottery round's reads and the
+  previous round's acquiring writes, a sum with mean `2*LotteryBudgetQPS`
+  and standard deviation about 6, so the bound is more than six standard
+  deviations above it.
+- Term churn: after convergence, clusters of at most 512 members run 60s
+  more and must start no new term, keep the same leader, and stay
+  converged. A converged cluster has at most `2 + 4*faults` terms (plus one
+  per `RetryPeriod` of injected Lease conflicts, each of which can fail a
+  renewal and end a term) and a
+  view sequence number no larger than the elapsed seconds.
+- Bounded state: every 10s every member's `node.Stats` are checked against
+  their caps (pending calls, ahead queue, seeds, delta log, leader queues),
+  and no removed neighbor may linger past its expiry.
+- Scenarios draw `ColdRestart` and `PartialRestart` (each in about one in
+  eight) and the delta log size (default, 64, or 32, so partitioned
+  members catch up by snapshot) from a separate random stream, so
+  existing seeds keep their other faults. After a whole-cluster restart
+  the epoch restarts at zero, so the liveness epoch check counts from the
+  last bootstrap.
+- `TestDSTSweep` runs a resumable sweep in parallel:
+  `CACHEMESH_DST_SWEEP=tiny:1-300,small:1-150,restarts:1-40,longrun:1-30,medium:1-25`
+  with `CACHEMESH_DST_SWEEP_OUT=<file>` (one line per case, each run twice
+  and trace-compared; cases already in the file are skipped).
+
+The data-plane workload plugs in through
 `dst.Workload`. `CACHEMESH_DST_SEEDS`, `CACHEMESH_DST_SEED`, and
 `CACHEMESH_DST_LARGE=1` (100k members) control longer runs.
 
