@@ -146,7 +146,7 @@ func TestDSTSweep(t *testing.T) {
 				}
 
 				mu.Lock()
-				fmt.Fprintf(out, "%s %s wall=%v %s\n", c.name, status, time.Since(start).Round(time.Millisecond), r.stats)
+				fmt.Fprintf(out, "%s %s wall=%v %s\n", c.name, status, time.Since(start).Round(time.Millisecond), strings.ReplaceAll(r.stats, "\n", " | "))
 				mu.Unlock()
 			}
 		})
