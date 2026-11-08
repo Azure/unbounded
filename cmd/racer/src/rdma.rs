@@ -113,8 +113,9 @@ fn validate_native_page_size(page_size: libc::c_long) -> Result<()> {
 use discovery::inventory_at;
 pub use discovery::{
     DEV_CHAR, Inventory, MAX_JOURNAL_BYTES, RailPresence, SYSFS_INFINIBAND, SYSFS_INFINIBAND_VERBS,
-    Snapshot, char_devices_present, device_active, inventory, match_publication, rail_devices,
-    rail_presence, refresh_char_devices, select_worker, verbs_char_devices,
+    Snapshot, char_devices_present, device_active, device_discoverable, discoverable_devices,
+    inventory, match_publication, rail_devices, rail_presence, refresh_char_devices, select_worker,
+    verbs_char_devices,
 };
 
 // RDMA requires compatible authenticated mappings; discovery can only veto.

@@ -372,6 +372,9 @@ impl WorkerApplication {
             return Ok(());
         }
         if self.rdma_lost.is_some() && !self.lost_devices_back(&links) {
+            // Only a device sysfs shows discoverable (a valid GID) that
+            // this process still cannot list counts toward a restart; a
+            // missing, inactive, or settling device waits indefinitely.
             if self.rdma_waiting.as_deref() == Some("device_undiscovered") {
                 self.reactivation_attempt_failed()?;
             }
@@ -399,6 +402,9 @@ impl WorkerApplication {
                 "publication_empty:discovered={}",
                 self.discovered_nics.len()
             )));
+            if self.rdma_lost.is_none() && self.rescan_devices() {
+                cx.waker().wake_by_ref();
+            }
             return Ok(());
         }
         self.note_waiting(None);
@@ -545,6 +551,11 @@ pub(crate) const RAIL_PROBE: Duration = Duration::from_secs(2);
 /// lands first.
 pub(crate) const RAIL_SETTLE: Duration = Duration::from_secs(5);
 
+/// How often a process with no usable discovered rail rescans sysfs for
+/// RDMA devices: one that started while a device was unbound, or on a node
+/// that gained one, activates once it appears.
+pub(crate) const RDMA_RESCAN: Duration = Duration::from_secs(10);
+
 /// Reactivation attempts, after a lost device is back and settled, before
 /// the process restarts to rebuild its verbs device list.
 pub(crate) const REACTIVATION_ATTEMPTS: u32 = 6;
@@ -585,6 +596,55 @@ impl WorkerApplication {
             }
             self.native_device_lost(links);
         }
+    }
+
+    /// Rescan for RDMA devices when no rail is discovered, at most every
+    /// [`RDMA_RESCAN`]. Sysfs is read first (cheap, no verbs call); only
+    /// when it shows a discoverable, active device the inventory lacks are
+    /// the verbs character device nodes refreshed and the inventory
+    /// rediscovered (verbs port discovery, no connection manager listener).
+    /// Each change in what sysfs shows is logged once. Returns whether the
+    /// inventory changed, so activation should be tried now.
+    fn rescan_devices(&mut self) -> bool {
+        let now = self.ctx().now();
+        if now < self.rdma_rescan {
+            return false;
+        }
+        self.rdma_rescan = now + RDMA_RESCAN;
+        let found = crate::rdma::discoverable_devices(&self.rdma_sysfs);
+        if self.rdma_rescan_seen.as_ref() != Some(&found) {
+            eprintln!("racer: stage=rdma-rescan state=sysfs devices={found:?}");
+            self.rdma_rescan_seen = Some(found.clone());
+        }
+        if !found
+            .iter()
+            .any(|name| !self.discovered_nics.iter().any(|n| &n.device == name))
+        {
+            return false;
+        }
+        self.refresh_char_devices_if_stale();
+        let before = self.inventory_generation;
+        if let Err(error) = self
+            .node
+            .inventory
+            .refresh()
+            .and_then(|_| self.refresh_inventory())
+        {
+            eprintln!("racer: stage=rdma-rescan state=failed error={error:?}");
+            return false;
+        }
+        if self.inventory_generation == before || self.discovered_nics.is_empty() {
+            return false;
+        }
+        eprintln!(
+            "racer: stage=rdma-rescan state=discovered rails={}; activating",
+            self.discovered_nics.len()
+        );
+        // This node advertised no rails: activate on the discovered ones,
+        // and advertise them once activation succeeds.
+        self.rdma_withdrawn = true;
+        self.native_retry = now;
+        true
     }
 
     /// `(device, hardware key)` of each active rail.
@@ -758,6 +818,17 @@ impl WorkerApplication {
                 }
             }
             let at = crate::rdma::rail_devices(&self.rdma_sysfs, key);
+            if key.starts_with("pci:")
+                && !at
+                    .iter()
+                    .any(|name| crate::rdma::device_discoverable(&self.rdma_sysfs, name))
+            {
+                // Only a device discovery drops is at the address, such as
+                // a MANA VF's null-GID `rdmaP...` twin while the RoCE
+                // device is unbound: still missing, however long it takes.
+                self.rdma_settle = None;
+                return Some(format!("device_missing:{device}"));
+            }
             if !at.is_empty()
                 && !at
                     .iter()
@@ -1769,6 +1840,8 @@ mod tests {
         )
         .unwrap();
         worker.discovered_nics = app.discovered_nics.clone();
+        // Tests never rescan the host's sysfs; each sets its own tree.
+        worker.rdma_sysfs = std::path::PathBuf::from("/nonexistent-racer-test-sysfs");
         worker
             .snapshots
             .apply(
@@ -2594,6 +2667,166 @@ mod tests {
         assert_eq!(worker.rdma_waiting.as_deref(), Some("device_undiscovered"));
         assert!(!links.rail_ready(RailId(0)));
         assert_eq!(metrics.count(Event::RdmaDeviceReactivation), 0);
+    }
+
+    #[test]
+    /// A MANA VF whose RoCE device is unbound leaves its null-GID `rdmaP...`
+    /// twin at the same PCI address. However long that lasts, the device
+    /// stays missing and no attempt counts toward a restart; once the RoCE
+    /// device is back, RDMA reactivates.
+    fn lost_device_with_only_null_gid_twin_waits_without_restarting() {
+        use crate::telemetry::Event;
+        use rdma_verbs::simulation::{Device, Simulation};
+        use std::os::unix::fs::symlink;
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = Scratch(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("target")
+                .join(format!("null-gid-twin-{}", std::process::id())),
+        );
+        let root = dir.0.join("infiniband");
+        let pci = dir.0.join("7870:00:00.0");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&pci).unwrap();
+        let plug = |name: &str, gid: &str| {
+            let port = root.join(name).join("ports").join("1");
+            std::fs::create_dir_all(port.join("gids")).unwrap();
+            std::fs::write(port.join("state"), "4: ACTIVE\n").unwrap();
+            std::fs::write(port.join("gids").join("0"), gid).unwrap();
+            symlink(&pci, root.join(name).join("device")).unwrap();
+        };
+        const NULL: &str = "0000:0000:0000:0000:0000:0000:0000:0000\n";
+        const ROCE: &str = "fe80:0000:0000:0000:0000:0000:0000:0001\n";
+        plug("roceP0", ROCE);
+        plug("rdmaP0", NULL);
+        let sim = Simulation::new();
+        let simulated = sim
+            .with_devices(vec![Device::new("roceP0", [1; 16])])
+            .unwrap();
+        let _devices = simulated.enter();
+        let env = racer_io::Env::host();
+        let mut app = configured();
+        app.discovered_nics[0].device = "roceP0".into();
+        app.discovered_nics[0].rail = RailId(0);
+        app.node
+            .inventory
+            .update_keyed(vec![(
+                app.discovered_nics[0].clone(),
+                Some("7870:00:00.0".into()),
+            )])
+            .unwrap();
+        let (mut worker, engine) = worker(&env, &app, true, true);
+        worker.rdma_sysfs = root.clone();
+        worker.rail_settle = Duration::ZERO;
+        let mut service = test_owner(&app, engine);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        for _ in 0..20 {
+            worker.poll_native(&mut cx).unwrap();
+            service.poll_budgeted(&mut cx, 64).unwrap();
+        }
+        let links = worker.links.clone().unwrap();
+        assert!(links.rail_ready(RailId(0)));
+        let metrics = worker.telemetry.metrics.clone();
+        // Unbind the RoCE device; its twin stays.
+        std::fs::remove_dir_all(root.join("roceP0")).unwrap();
+        worker.rail_probe = worker.ctx().now();
+        for _ in 0..REACTIVATION_ATTEMPTS * 3 {
+            service.poll_budgeted(&mut cx, 64).unwrap();
+            worker.native_retry = worker.ctx().now();
+            worker.poll_native(&mut cx).unwrap();
+        }
+        assert!(worker.rdma_lost.is_some());
+        assert_eq!(worker.rdma_attempts, 0);
+        assert_eq!(
+            worker.rdma_waiting.as_deref(),
+            Some("device_missing:roceP0")
+        );
+        // Bound again: RDMA reactivates.
+        plug("roceP0", ROCE);
+        for _ in 0..40 {
+            service.poll_budgeted(&mut cx, 64).unwrap();
+            worker.native_retry = worker.ctx().now();
+            worker.poll_native(&mut cx).unwrap();
+        }
+        assert!(worker.rdma_lost.is_none());
+        assert!(links.rail_ready(RailId(0)));
+        assert_eq!(metrics.count(Event::RdmaDeviceReactivation), 1);
+    }
+
+    #[test]
+    /// A process that started with no RDMA device (one was unbound) rescans
+    /// sysfs and activates once a device appears; with none, it does not
+    /// rediscover, and a twin with only a null GID does not count.
+    fn rescan_activates_a_device_that_appears_after_start() {
+        use rdma_verbs::simulation::{Device, Simulation};
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = Scratch(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("target")
+                .join(format!("rescan-{}", std::process::id())),
+        );
+        let root = dir.0.join("infiniband");
+        std::fs::create_dir_all(&root).unwrap();
+        let twin = root.join("rdmaP0").join("ports").join("1");
+        std::fs::create_dir_all(twin.join("gids")).unwrap();
+        std::fs::write(twin.join("state"), "4: ACTIVE\n").unwrap();
+        std::fs::write(
+            twin.join("gids").join("0"),
+            "0000:0000:0000:0000:0000:0000:0000:0000\n",
+        )
+        .unwrap();
+        let sim = Simulation::new();
+        let simulated = sim
+            .with_devices(vec![Device::new("test-device", [1; 16])])
+            .unwrap();
+        let _devices = simulated.enter();
+        let env = racer_io::Env::host();
+        let mut app = configured();
+        app.node.inventory.update(Vec::new()).unwrap();
+        app.discovered_nics.clear();
+        let (mut worker, engine) = worker(&env, &app, true, true);
+        worker.rdma_sysfs = root.clone();
+        let mut service = test_owner(&app, engine);
+        let generation = app.node.inventory.generation();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let mut run = |worker: &mut WorkerApplication| {
+            for _ in 0..20 {
+                worker.rdma_rescan = worker.ctx().now();
+                worker.poll_native(&mut cx).unwrap();
+                service.poll_budgeted(&mut cx, 64).unwrap();
+            }
+        };
+        run(&mut worker);
+        assert!(worker.actual_rails.is_empty());
+        assert_eq!(
+            worker.rdma_waiting.as_deref(),
+            Some("publication_empty:discovered=0")
+        );
+        // Only the null-GID twin: no verbs rediscovery at all.
+        assert_eq!(app.node.inventory.generation(), generation);
+        assert_eq!(worker.rdma_rescan_seen, Some(Vec::new()));
+        // The device appears.
+        std::fs::create_dir_all(root.join("test-device")).unwrap();
+        run(&mut worker);
+        assert_eq!(worker.discovered_nics.len(), 1);
+        assert!(!worker.actual_rails.is_empty());
+        assert!(
+            worker
+                .links
+                .as_ref()
+                .unwrap()
+                .rail_ready(worker.actual_rails[0].rail)
+        );
     }
 
     #[test]

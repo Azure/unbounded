@@ -392,6 +392,47 @@ pub fn device_active(root: &Path, device: &str) -> bool {
     })
 }
 
+/// Whether sysfs under `root` shows a port of `device` that discovery would
+/// keep: a nonzero port whose GID 0 is not the null GID (the filter of
+/// [`rdma_verbs::discovery::inventory_at`]). A MANA VF's `rdmaP...` twin
+/// carries only a null GID, so it alone never makes a device discoverable.
+/// A port whose GID cannot be read counts as discoverable (verbs decides),
+/// and so does a test tree with no `ports` directory.
+pub fn device_discoverable(root: &Path, device: &str) -> bool {
+    if !valid_device(device) {
+        return false;
+    }
+    let dir = root.join(device);
+    let Ok(ports) = std::fs::read_dir(dir.join("ports")) else {
+        return dir.exists() && !dir.join("ports").exists();
+    };
+    ports.filter_map(|port| port.ok()).any(|port| {
+        if port.file_name() == "0" {
+            return false;
+        }
+        match std::fs::read_to_string(port.path().join("gids").join("0")) {
+            Ok(gid) => gid.trim().chars().any(|c| c != '0' && c != ':'),
+            Err(_) => true,
+        }
+    })
+}
+
+/// Names of every device sysfs under `root` lists that discovery would keep
+/// (see [`device_discoverable`]) and that has a port ACTIVE, sorted. Cheap:
+/// sysfs reads only, no verbs call.
+pub fn discoverable_devices(root: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(root)
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+                .filter(|name| device_discoverable(root, name) && device_active(root, name))
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
 /// Where sysfs lists verbs character devices (`uverbsN/dev` is `major:minor`).
 pub const SYSFS_INFINIBAND_VERBS: &str = "/sys/class/infiniband_verbs";
 
@@ -897,6 +938,51 @@ mod tests {
                 assert!(!dev.join("231:192").exists(), "the stale node is gone");
             }
         }
+    }
+
+    #[test]
+    fn device_discoverable_ignores_null_gid_twins_and_inactive_ports() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("discoverable-{}", std::process::id()));
+        let root = dir.join("infiniband");
+        let port = |name: &str, n: &str, gid: Option<&str>, state: &str| {
+            let p = root.join(name).join("ports").join(n);
+            std::fs::create_dir_all(p.join("gids")).unwrap();
+            std::fs::write(p.join("state"), state).unwrap();
+            if let Some(gid) = gid {
+                std::fs::write(p.join("gids").join("0"), gid).unwrap();
+            }
+        };
+        port(
+            "rdmaP0",
+            "1",
+            Some("0000:0000:0000:0000:0000:0000:0000:0000\n"),
+            "4: ACTIVE",
+        );
+        port(
+            "roceP0",
+            "1",
+            Some("fe80:0000:0000:0000:0000:0000:0000:0001\n"),
+            "4: ACTIVE",
+        );
+        port("down0", "1", Some("fe80::1"), "1: DOWN");
+        port("nogid", "1", None, "4: ACTIVE");
+        port("zero", "0", Some("fe80::1"), "4: ACTIVE");
+        std::fs::create_dir_all(root.join("bare")).unwrap();
+        assert!(!device_discoverable(&root, "rdmaP0"));
+        assert!(device_discoverable(&root, "roceP0"));
+        assert!(device_discoverable(&root, "nogid"));
+        assert!(!device_discoverable(&root, "zero"));
+        assert!(device_discoverable(&root, "bare"));
+        assert!(!device_discoverable(&root, "absent"));
+        assert!(!device_discoverable(&root, ".."));
+        assert_eq!(
+            discoverable_devices(&root),
+            vec!["bare".to_string(), "nogid".into(), "roceP0".into()]
+        );
+        assert!(discoverable_devices(&dir.join("absent")).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
