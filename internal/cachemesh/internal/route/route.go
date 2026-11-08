@@ -405,16 +405,29 @@ func (s *State) TryHedge(h Header) bool {
 
 // Route routes key in keyspace seed from this member.
 func (s *State) Route(seed uint64, key []byte) (d Decision) {
-	s.decide(&d, hashing.Partition(hashing.KeyHash(seed, key), s.bits), view.NoSlot, 0)
+	s.RouteTo(&d, seed, key)
 
 	return d
 }
 
+// RouteTo is Route writing the decision into *d, which must be the zero
+// Decision. Filling the caller's Decision in place avoids copying a
+// freshly written Decision, which defeats store-to-load forwarding.
+func (s *State) RouteTo(d *Decision, seed uint64, key []byte) {
+	s.decide(d, hashing.Partition(hashing.KeyHash(seed, key), s.bits), view.NoSlot, 0)
+}
+
 // RouteHash routes a key whose hashing.KeyHash is h.
 func (s *State) RouteHash(h uint64) (d Decision) {
-	s.decide(&d, hashing.Partition(h, s.bits), view.NoSlot, 0)
+	s.RouteHashTo(&d, h)
 
 	return d
+}
+
+// RouteHashTo is RouteHash writing the decision into *d, which must be the
+// zero Decision (see RouteTo).
+func (s *State) RouteHashTo(d *Decision, h uint64) {
+	s.decide(d, hashing.Partition(h, s.bits), view.NoSlot, 0)
 }
 
 // RoutePartition routes partition p. A p outside the table gives
@@ -444,13 +457,21 @@ func (s *State) RouteMany(seed uint64, keys [][]byte, out []Decision) {
 // Forward routes a request received with header h. On ErrTTLExhausted the
 // decision is still returned for diagnostics but must not be sent.
 func (s *State) Forward(h Header) (d Decision, err error) {
+	err = s.ForwardTo(&d, h)
+
+	return d, err
+}
+
+// ForwardTo is Forward writing the decision into *d, which must be the zero
+// Decision (see RouteTo). *d is left zero when the header is rejected.
+func (s *State) ForwardTo(d *Decision, h Header) error {
 	// Fast validity test; check builds the descriptive error.
 	if h.Format != HeaderFormat || h.Flags&^flagsKnown != 0 || h.Hops > h.TTL {
-		return d, h.check()
+		return h.check()
 	}
 
 	if s.bits < 32 && h.Partition>>s.bits != 0 {
-		return d, ErrBadHeader
+		return ErrBadHeader
 	}
 
 	// Inline the common case (sender not ahead) before calling note.
@@ -463,16 +484,16 @@ func (s *State) Forward(h Header) (d Decision, err error) {
 		avoid = view.NoSlot
 	}
 
-	s.decide(&d, h.Partition, avoid, h.Flags)
+	s.decide(d, h.Partition, avoid, h.Flags)
 
 	d.Header.TTL = h.TTL
 	d.Header.Hops = h.Hops + 1
 
 	if !d.Next.IsZero() && int(h.Hops)+1 >= int(h.TTL) {
-		return d, ErrTTLExhausted
+		return ErrTTLExhausted
 	}
 
-	return d, nil
+	return nil
 }
 
 // cand is a ranked candidate. class is a health.Usability; the zero value

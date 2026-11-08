@@ -293,6 +293,7 @@ func (pl *Planner) scan(t *Table) {
 
 	for ci := range t.NumChunks() {
 		base := uint32(ci) << chunkShift
+
 		owners, _, _ := t.Columns(ci)
 		for j, o := range owners {
 			i := pl.owner(o)
@@ -317,6 +318,7 @@ func (pl *Planner) scan(t *Table) {
 
 	for ci := range t.NumChunks() {
 		base := uint32(ci) << chunkShift
+
 		owners, _, _ := t.Columns(ci)
 		for j, o := range owners {
 			i := pl.owner(o)
