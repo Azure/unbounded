@@ -719,7 +719,9 @@ Racer-Destination-Length: <length>
   decrypted this way. When such a page arrives from a peer over RDMA, the
   crypto worker copies it out of the RDMA receive buffer into the dataplane's
   ciphertext cache and decrypts it in the same pass, 128 KiB at a time, so
-  the received bytes are read from memory once. The receive buffer is held
+  the received bytes are read from memory once. Each decrypted chunk lands in
+  a small cache-resident buffer and is copied into the client's memfd with
+  non-temporal stores, so the memfd is never read. The receive buffer is held
   until that pass ends. A page that fails authentication is not cached or
   persisted. `racer_host_read_fused_decrypt_pages_total` counts pages
   decrypted this way. Such a page enters the memory cache only after it

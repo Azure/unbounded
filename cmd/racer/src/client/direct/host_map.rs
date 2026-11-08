@@ -558,15 +558,16 @@ impl DecryptInto {
         if let Some(mut store) = self.page.fused_store.take()
             && store.len() == bytes.len()
         {
-            let output = if start == 0 && end == length {
-                racer_crypto::FusedOutput::Whole(destination)
-            } else {
-                // A partial page: only the requested bytes leave the
-                // chunk-sized scratch.
-                racer_crypto::FusedOutput::Scratch {
-                    out: destination,
-                    start,
-                }
+            // Whole and partial pages both decrypt into the chunk-sized,
+            // cache-resident scratch and leave it with non-temporal stores,
+            // so the mapping is never read for ownership. With many helpers
+            // decrypting at once this moves about 1.7x the bytes of
+            // decrypting straight into the mapping on a 2-socket EPYC 9575F
+            // (`fused_open_bench`: 426 vs 249 GB/s at 128 threads), because
+            // the node is memory-bandwidth bound, not AES bound.
+            let output = racer_crypto::FusedOutput::Scratch {
+                out: destination,
+                start,
             };
             // A failure drops `store` unpublished, back to its pool.
             key.open_copy_into(
