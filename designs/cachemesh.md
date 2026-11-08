@@ -587,11 +587,15 @@ Implementation notes (`node` package):
   lists the other members it knows. Seeds are cleared only when the last
   known member leaves. Clearing them on every release let a fresh member
   bootstrap a second cluster next to the live one.
-- A leaving member never (re)joins. A member removed by a partition that
-  is then asked to leave used to keep sending joins, and one reaching the
-  leader after the process stopped re-admitted it. A join the leader had
-  already queued can still admit a member whose process has stopped;
-  failure detection removes it.
+- A leaving member that has been in a view never rejoins. A member
+  removed by a partition that is then asked to leave used to keep sending
+  joins, and one reaching the leader after the process stopped re-admitted
+  it. A join the leader had already queued can still admit a member whose
+  process has stopped; failure detection removes it. A process asked to
+  leave before it ever joined still joins: its admission replaces a stale
+  record of its earlier incarnation, which nothing else removes (the new
+  process answers pings at the same address), and the leave then drains
+  it.
 - Calls that time out together are failed in call ID order, so map
   iteration order never reaches the outbox.
 - A starting member without seeds treats any Lease record with a holder or
@@ -1174,13 +1178,15 @@ Data-plane invariants (each failure names the seed and replay command):
   routed decisions, plus one.
 - Tail latency, judged on requests from clients that are members of their
   view, start at least 30s after a slow-member fault of at least 10x
-  began, while membership is settled and slow members are the only
+  began, while membership is settled and judged slow members are the only
   data-plane fault (no other fault except clock skew or drift, API server
-  outage, lease conflicts, or invalidation active within the last minute):
-  outlier detection is relative to the median of a member's peers, so
-  while most peers time out (partition, loss) a slow member is not an
-  outlier, and crashed or paused peers take the few ejections
-  `MaxEjectionPercent` allows. The requests that send a hop to a slow
+  outage, lease conflicts, or invalidation active within the last two
+  minutes; members slowed below 10x count as another fault): outlier
+  detection is relative to the median of a member's peers, so while most
+  peers time out (partition, loss) a slow member is not an outlier and the
+  inflated median takes a while to recover, and crashed or paused peers
+  take the few ejections `MaxEjectionPercent` allows. The requests that
+  send a hop to a slow
   member are at most half of the expected count without protection (slow
   share of running members times the mean path length) when at least 20
   are expected; with at least 200 baseline and judged requests, p99 is at

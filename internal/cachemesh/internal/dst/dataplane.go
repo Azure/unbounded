@@ -689,28 +689,37 @@ func (w *DataPlane) slowWindow(r *dpReq, now int64) {
 	r.slowExp = float64(slow) / float64(live)
 }
 
-// otherFaultNear reports whether a fault other than slow members, clock
-// skew or drift, and control-plane-only faults (API server outage, lease
-// conflicts, keyspace invalidation) is active at now or ended less than a
-// minute ago. Tail-latency protection is judged only while slow members are
-// the only data-plane fault: outlier detection is relative to the median of
-// a member's peers, so while most peers time out (partition, loss) a slow
-// member is not an outlier, and crashed or paused peers take the few
-// ejections MaxEjectionPercent allows.
+// otherFaultNear reports whether a fault other than judged slow members
+// (at least slowJudged), clock skew or drift, and control-plane-only faults
+// (API server outage, lease conflicts, keyspace invalidation) is active at
+// now or ended less than two minutes ago. Tail-latency protection is judged
+// only while judged slow members are the only data-plane fault: outlier
+// detection is relative to the median of a member's peers, so while most
+// peers time out (partition, loss) a slow member is not an outlier and the
+// inflated median takes a while to recover; crashed or paused peers take
+// the few ejections MaxEjectionPercent allows; and members slowed below the
+// judged factor shift the median without counting as slow.
 func (w *DataPlane) otherFaultNear(now int64) bool {
 	for _, f := range w.c.sc.Faults {
-		switch f.Kind {
-		case SlowMembers, ClockSkew, ClockDrift, APIServerOutage, LeaseConflicts, KeyspaceInvalidation:
+		switch {
+		case f.Kind == SlowMembers && f.Value >= slowJudged:
+			continue
+		case f.Kind == ClockSkew, f.Kind == ClockDrift, f.Kind == APIServerOutage,
+			f.Kind == LeaseConflicts, f.Kind == KeyspaceInvalidation:
 			continue
 		}
 
-		if f.Start <= now && f.End()+60*sec >= now {
+		if f.Start <= now && f.End()+otherFaultPad >= now {
 			return true
 		}
 	}
 
 	return false
 }
+
+// otherFaultPad is how long after another fault ends tail latency is not
+// judged.
+const otherFaultPad = 120 * sec
 
 // decided records coverage for a routing decision made at member i.
 func (w *DataPlane) decided(i uint32, d *route.Decision) {
@@ -1586,8 +1595,9 @@ const (
 	// tailMinExpected is the least expected number of slow touches (without
 	// protection) for the touch reduction to be judged.
 	tailMinExpected = 20
-	// tailTouchRatio bounds touched/expected. Sweeps of 1,500 tiny and
-	// small runs saw at most 0.38 with this many expected touches.
+	// tailTouchRatio bounds touched/expected. Over 64 judged runs in a
+	// 500-run sweep the ratio was at most 0.30 (mean 0.12); without health
+	// protection it is about 1.
 	tailTouchRatio = 0.5
 	// tailMinSamples is the least number of requests in the baseline and
 	// in the judged windows for latency quantiles to be compared.
