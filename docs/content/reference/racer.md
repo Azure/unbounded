@@ -363,7 +363,7 @@ each worker and are never divided.
 | Variable | Default | Scope | Accepted | Description |
 | --- | --- | --- | --- | --- |
 | `RACER_ENABLE_RDMA` | `auto` | Node | `auto`, `true`, `false` | `auto` uses native RDMA when built in and ports exist at startup; `true` reserves RDMA resources even without ports, for hotplug; `false` turns it off. |
-| `RACER_RDMA_BREAKER` | `true` | Node | `true`, `false` | Per peer and rail circuit breaker: after a hard RDMA failure with a peer (link break, setup failure, grant or write error), or 3 page timeouts in a row with no RDMA success between them, pages to and from it use HTTP at once until a cooldown passes and one probe page succeeds over RDMA. Load (no grant slot or flight room) never trips it. |
+| `RACER_RDMA_BREAKER` | `false` | Node | `true`, `false` | Per peer and rail circuit breaker, off by default: after a hard RDMA failure with a peer (link break, setup failure, grant or write error), or 3 page timeouts in a row with no RDMA success between them, pages to and from it use HTTP at once until a cooldown passes and one probe page succeeds over RDMA. Load (no grant slot or flight room) never trips it. |
 | `RACER_RDMA_BREAKER_COOLDOWN_MS` | `2000` | Node | 1..3,600,000 ms | First breaker cooldown; it doubles for each consecutive trip, up to `RACER_RDMA_BREAKER_MAX_COOLDOWN_MS`, less up to a fifth as jitter. |
 | `RACER_RDMA_BREAKER_MAX_COOLDOWN_MS` | `30000` | Node | 1..3,600,000 ms | Longest breaker cooldown; at least `RACER_RDMA_BREAKER_COOLDOWN_MS`. |
 | `RACER_RDMA_PAGE_TIMEOUT_MS` | `5000` | Node | 1..60,000 ms | Longest one page's RDMA grant or write may take before the page goes over HTTP in the same exchange; counts a soft breaker failure. |
@@ -1940,8 +1940,12 @@ Release images include native verbs support; discovery/provider failures retain 
 
 ### RDMA circuit breaker
 
-Each node keeps a circuit breaker per peer and rail (`RACER_RDMA_BREAKER`, on by
-default). A busy link is slow, not broken, so the breaker sorts failure signals in
+Each node can keep a circuit breaker per peer and rail (`RACER_RDMA_BREAKER`, off by
+default). Without it, a page whose grant or write fails or times out still falls back
+to HTTP within the same exchange, and a lost device is withdrawn at once, so the
+breaker only saves the timeout on pages sent to a peer whose link is already known to
+be bad. On a 150-node MANA cluster with RDMA cut on 10 nodes for 60 s, it did not
+change cold-read time measurably and cost about half a core per node. A busy link is slow, not broken, so the breaker sorts failure signals in
 three kinds:
 
 - Hard failures trip it at once: a link being torn down (`link_down`), a link setup

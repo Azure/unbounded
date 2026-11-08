@@ -3136,20 +3136,23 @@ mod tests {
     }
 
     #[test]
-    fn rdma_breaker_defaults_on_and_cooldowns_are_ordered() {
+    fn rdma_breaker_defaults_off_and_cooldowns_are_ordered() {
         let config = parse(&[]).unwrap();
         assert_eq!(
             config.rdma_breaker,
-            crate::rdma::breaker::BreakerConfig::default()
+            crate::rdma::breaker::BreakerConfig {
+                enabled: false,
+                ..crate::rdma::breaker::BreakerConfig::default()
+            }
         );
         let tuned = parse(&[
-            ("RACER_RDMA_BREAKER", "false"),
+            ("RACER_RDMA_BREAKER", "true"),
             ("RACER_RDMA_BREAKER_COOLDOWN_MS", "500"),
             ("RACER_RDMA_BREAKER_MAX_COOLDOWN_MS", "500"),
             ("RACER_RDMA_PAGE_TIMEOUT_MS", "750"),
         ])
         .unwrap();
-        assert!(!tuned.rdma_breaker.enabled);
+        assert!(tuned.rdma_breaker.enabled);
         assert_eq!(tuned.rdma_breaker.base, Duration::from_millis(500));
         assert_eq!(tuned.rdma_breaker.max, Duration::from_millis(500));
         assert_eq!(tuned.rdma_breaker.page_timeout, Duration::from_millis(750));

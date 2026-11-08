@@ -354,8 +354,8 @@ const BASE: &[Var] = &[
         "RACER_RDMA_BREAKER",
         Group::Hardware,
         Kind::Bool,
-        Value("true"),
-        "Per peer and rail circuit breaker: after a hard RDMA failure with a peer (link break, setup failure, grant or write error), or 3 page timeouts in a row with no RDMA success between them, pages to and from it use HTTP at once until a cooldown passes and one probe page succeeds over RDMA. Load (no grant slot or flight room) never trips it.",
+        Value("false"),
+        "Per peer and rail circuit breaker, off by default: after a hard RDMA failure with a peer (link break, setup failure, grant or write error), or 3 page timeouts in a row with no RDMA success between them, pages to and from it use HTTP at once until a cooldown passes and one probe page succeeds over RDMA. Load (no grant slot or flight room) never trips it.",
     ),
     var(
         "RACER_RDMA_BREAKER_COOLDOWN_MS",
