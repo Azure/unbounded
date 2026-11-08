@@ -542,3 +542,33 @@ fn channel_fds_signal_work() {
     }
     assert_eq!(sim.live_resources(), 0);
 }
+
+/// An inventory taken while an owner listens on a registration-mode port
+/// still lists that port. A second listener on the same address fails, so
+/// discovery that starts one dropped the port, and an inventory refresh
+/// (for example at certificate renewal) withdrew RDMA from a healthy node.
+#[test]
+fn inventory_lists_a_port_an_owner_already_listens_on() {
+    let _profile = default_profile(Profile::Registration);
+    let sim = Simulation::new();
+    let node = sim
+        .with_devices(vec![Device::new(
+            "mana0",
+            [10, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 10, 0, 0, 1],
+        )])
+        .unwrap();
+    let _scope = node.enter();
+    let active = discover().unwrap();
+    assert_eq!(active.len(), 1);
+    assert!(active[0].cm.is_some());
+    // A second listener on the active address is refused, as on hardware.
+    assert!(discover().unwrap().is_empty());
+    let ports = crate::inventory().unwrap();
+    assert_eq!(ports.len(), 1);
+    assert_eq!(ports[0].device, "mana0");
+    assert_eq!(ports[0].gid[10..], [0xff, 0xff, 10, 0, 0, 1]);
+    // Inventory leaves no listener behind: once the owner closes, discovery
+    // with a listener works again.
+    drop(active);
+    assert_eq!(discover().unwrap().len(), 1);
+}

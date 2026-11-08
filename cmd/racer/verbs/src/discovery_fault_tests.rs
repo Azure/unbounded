@@ -56,7 +56,7 @@ fn internal_close_failures_keep_admission_and_adapter() {
             let (guard, charged) = crate::test_guard::guard();
             let owner = GuardOwner::new(guard);
             let references = Rc::strong_count(&api);
-            let result = discover_with_api(api.clone(), || Some(owner.clone()));
+            let result = discover_with_api(api.clone(), || Some(owner.clone()), true);
             assert_eq!(owner.quarantined(), leaks);
             assert_eq!(Rc::strong_count(&api), references + usize::from(leaks));
             if leaks || matches!(mode, 4 | 7) {
@@ -182,11 +182,15 @@ fn open_cleanup_failures_keep_admission_and_adapter() {
         unsafe { reset(mode, fail_close) };
         let mut owners = Vec::new();
         let references = Rc::strong_count(&api);
-        let result = discover_with_api(api.clone(), || {
-            let (owner, charged) = lifetime_tests::quota();
-            owners.push((owner.clone(), charged));
-            Some(owner)
-        });
+        let result = discover_with_api(
+            api.clone(),
+            || {
+                let (owner, charged) = lifetime_tests::quota();
+                owners.push((owner.clone(), charged));
+                Some(owner)
+            },
+            true,
+        );
         assert_eq!(unsafe { count(3) }, allocations);
         assert_eq!(unsafe { count(4) }, deallocations);
         let attempts = if leaks { allocations } else { 3 };
