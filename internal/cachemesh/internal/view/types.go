@@ -81,3 +81,80 @@ func (s MemberState) String() string {
 		return "MemberState(" + strconv.Itoa(int(s)) + ")"
 	}
 }
+
+// Limits on view contents. Apply rejects values beyond them and the decoders
+// use them to bound allocation on hostile input.
+const (
+	// MaxIDLen bounds Member.ID (a DNS subdomain name fits).
+	MaxIDLen = 253
+	// MaxAddrLen bounds Member.Addr.
+	MaxAddrLen = 1024
+	// MaxZoneLen bounds Member.Zone.
+	MaxZoneLen = 128
+	// MaxSlots bounds SlotCap and any slot number in a view.
+	MaxSlots = 1 << 22
+	// MaxCells bounds Shape().Cells() of a view.
+	MaxCells = 1 << 22
+	// MaxDeltaOps bounds the number of ops in one delta.
+	MaxDeltaOps = 1 << 16
+	// MaxGens bounds the number of keyspace generations in a view.
+	MaxGens = 1 << 16
+)
+
+// Member is one member record of a view. Members returned by a View are
+// shared and must not be modified.
+type Member struct {
+	// ID is the application-supplied member name, unique in a view.
+	ID string
+	// Incarnation distinguishes restarts of the same ID.
+	Incarnation uint64
+	// Key is hashing.MemberKey(ID, Incarnation), the rendezvous key.
+	Key uint64
+	// Addr is the control and data endpoint chosen by the application.
+	Addr string
+	// Zone is an application-defined failure domain label.
+	Zone string
+	// State is the lifecycle state.
+	State MemberState
+	// Weight is 0..placement.MaxWeight and 0 unless State is Active.
+	Weight uint32
+	// Cell is the member's grid cell, below Shape().Cells().
+	Cell uint32
+	// Joined is the view epoch at which the member was admitted.
+	Joined uint64
+	// Since is the view epoch of the member's last state change.
+	Since uint64
+}
+
+// Config holds the cluster constants, set once by the Config op of the
+// first delta of a cluster.
+type Config struct {
+	// PartitionBits is log2 of the partition count.
+	PartitionBits uint8
+	// InitialOwner owns every partition of the initial table, or NoSlot.
+	InitialOwner Slot
+	// SlotReuseEpochs is how many epochs a freed slot stays unused.
+	SlotReuseEpochs uint32
+	// HandoffEpochs is how long a moved partition reads through from Prev.
+	HandoffEpochs uint32
+}
+
+// DefaultConfig returns the default cluster constants: 2^20 partitions
+// initially owned by slot 0, slot reuse after 16 epochs, handoff for 8.
+func DefaultConfig() Config {
+	return Config{PartitionBits: 20, InitialOwner: 0, SlotReuseEpochs: 16, HandoffEpochs: 8}
+}
+
+// FreeSlot is a slot below SlotCap without a member, reusable once the view
+// epoch reaches ReusableAt.
+type FreeSlot struct {
+	Slot       Slot
+	ReusableAt uint64
+}
+
+// KeyspaceGen is the generation of the keyspace with the given seed.
+// Keyspaces not listed have generation 0.
+type KeyspaceGen struct {
+	Seed uint64
+	Gen  uint32
+}
