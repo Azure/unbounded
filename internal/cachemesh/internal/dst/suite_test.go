@@ -122,7 +122,10 @@ func defaultCases(seeds []uint64, explicit bool) []dstCase {
 	cases = append(cases, dstCase{name: "10k", sc: large, prebuilt: true})
 
 	if Large() {
-		huge := shorten(GenerateKinds(seeds[0], SizeHuge, Crash), 30*sec, 120*sec)
+		huge := GenerateKinds(seeds[0], SizeHuge, Crash)
+		huge.Warmup = 30 * sec
+		huge.CellSize, huge.MaxNeighbors, huge.PartitionBits = 4, 256, 20
+		huge = shorten(huge, 20*sec, 75*sec)
 		cases = append(cases, dstCase{name: "100k", sc: huge, prebuilt: true})
 	}
 
