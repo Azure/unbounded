@@ -102,6 +102,12 @@ pub fn grants_per_link(buffers_per_rail: usize) -> u32 {
 /// memory stays bounded by the registered pool.
 pub const GRANT_WAIT: Duration = Duration::from_secs(1);
 
+/// How long the node owner may sit in one pass, or leave a worker's commands
+/// queued, before [`Links::owner_stalled`] reports it stuck and every rail
+/// stops reading as ready. A healthy pass takes microseconds to a few
+/// milliseconds; device setup runs on helper threads.
+pub const OWNER_STALL: Duration = Duration::from_secs(2);
+
 /// Interval between attempts in [`retry_overloaded`].
 pub const OVERLOAD_POLL: Duration = Duration::from_millis(1);
 
@@ -412,6 +418,13 @@ pub struct Links {
     /// index, so [`Self::sync_link_metrics`] records only the growth.
     breaks_seen: Cell<[u64; rdma_verbs::BreakReason::ALL.len()]>,
 
+    /// Owner loop counters last recorded, so [`Self::sync_link_metrics`]
+    /// records only the growth.
+    loop_seen: Cell<rdma_verbs::OwnerLoop>,
+
+    /// [`OWNER_STALL`], shorter in tests.
+    owner_stall: Duration,
+
     /// Transfer counters, so benchmarks can tell which path pages took.
     metrics: Option<crate::telemetry::Metrics>,
 
@@ -442,6 +455,8 @@ impl Links {
             tasks: RefCell::new(Vec::new()),
             draining: Cell::new(false),
             breaks_seen: Cell::new([0; rdma_verbs::BreakReason::ALL.len()]),
+            loop_seen: Cell::new(rdma_verbs::OwnerLoop::default()),
+            owner_stall: OWNER_STALL,
             metrics: None,
             ctx,
             numa: None,
@@ -676,6 +691,28 @@ impl Links {
             breaker.open_count()
         };
         metrics.set_gauge(Gauge::RdmaBreakerOpen, open as u64);
+        let owner = self.client.owner_loop();
+        let last = self.loop_seen.replace(owner);
+        for (event, now, before) in [
+            (Event::RdmaOwnerPasses, owner.passes, last.passes),
+            (Event::RdmaOwnerCommands, owner.commands, last.commands),
+            (
+                Event::RdmaOwnerWakeCommands,
+                owner.immediate[rdma_verbs::ImmediateWake::Commands as usize],
+                last.immediate[rdma_verbs::ImmediateWake::Commands as usize],
+            ),
+            (
+                Event::RdmaOwnerWakeCompletions,
+                owner.immediate[rdma_verbs::ImmediateWake::Completions as usize],
+                last.immediate[rdma_verbs::ImmediateWake::Completions as usize],
+            ),
+        ] {
+            let grown = now.saturating_sub(before);
+            if grown > 0 {
+                metrics.record(event, grown);
+            }
+        }
+        metrics.set_gauge(Gauge::RdmaOwnerStalled, u64::from(self.owner_stalled()));
         let counts = self.client.link_counts();
         for (gauge, value) in [
             (Gauge::RdmaLinksReady, counts.ready),
@@ -767,9 +804,24 @@ impl Links {
     pub fn rail_ready(&self, rail: RailId) -> bool {
         !self.draining.get()
             && !self.client.closed()
+            && !self.owner_stalled()
             && LinkNode::lock(&self.node.active)
                 .iter()
                 .any(|m| m.rail == rail)
+    }
+
+    /// Whether the node owner looks stuck for [`OWNER_STALL`] (see
+    /// [`rdma_verbs::Client::owner_stalled`]). While it does, no rail reads
+    /// as ready, so new exchanges use HTTP instead of queueing behind it.
+    pub fn owner_stalled(&self) -> bool {
+        self.client.owner_stalled(self.owner_stall)
+    }
+
+    /// Use `threshold` instead of [`OWNER_STALL`].
+    #[cfg(test)]
+    pub(crate) fn with_owner_stall(mut self, threshold: Duration) -> Self {
+        self.owner_stall = threshold;
+        self
     }
 
     /// Snapshot of the link to `peer` on `rail`.
@@ -1298,7 +1350,17 @@ impl Links {
                 .client
                 .grant(key, epoch, transfer.0, length, scope.deadline.0),
         };
-        let granted = self.wait(op, scope).await?;
+        let granted = match self.wait(op, scope).await {
+            Ok(granted) => granted,
+            // The command never reached the owner: it is backed up or stuck.
+            // Waiting cannot help this exchange, and the caller retries an
+            // `Overloaded` page forever, so fail it over to HTTP instead.
+            Err(Error::Overloaded) if self.client.command_queue_full() => {
+                self.record(crate::telemetry::Event::RdmaGrantOwnerQueueFull, 1);
+                return Err(Error::Unavailable);
+            }
+            Err(error) => return Err(error),
+        };
         let waited = granted.waited;
         let pending = PendingReceive {
             granted: (self.ctx.clock.clone(), self.ctx.clock.now()),

@@ -1199,6 +1199,110 @@ pub(crate) mod send_in_place {
         assert!(out.contains("racer_rdma_grant_backpressure_total 1"));
     }
 
+    /// Submit grants that the owner never drains until this worker's
+    /// command queue is full. The returned futures hold the queued ops.
+    fn fill_owner_queue<'a>(
+        w: &'a World,
+        b: &'a NodeId,
+        scope: &'a RequestScope,
+    ) -> Vec<Operation<'a, PendingReceive>> {
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let mut queued = Vec::new();
+        for n in 0..rdma_verbs::COMMAND_QUEUE {
+            let mut grant: Operation<'a, PendingReceive> =
+                Box::pin(w.a.links.grant(b, RAIL, TransferId([n as u8; 16]), scope));
+            assert!(grant.as_mut().poll(&mut cx).is_pending());
+            queued.push(grant);
+        }
+        queued
+    }
+
+    /// A grant whose command cannot reach a backed-up owner fails
+    /// `Unavailable`, which falls back to HTTP, instead of `Overloaded`,
+    /// which a page request would retry forever. It is counted apart.
+    #[test]
+    fn grant_behind_a_full_owner_queue_falls_back() {
+        let mut w = world();
+        let env = w.env.clone();
+        let b = w.b.links.local().clone();
+        link_up(&env, &mut w);
+        let (w, ma, _) = metered(w);
+        let scope = scope(&env);
+        let queued = fill_owner_queue(&w, &b, &scope);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let mut late = Box::pin(w.a.links.grant(&b, RAIL, TransferId([0xff; 16]), &scope));
+        assert_eq!(
+            late.as_mut().poll(&mut cx).map(|r| r.err()),
+            Poll::Ready(Some(Error::Unavailable))
+        );
+        assert_eq!(ma.count(Event::RdmaGrantOwnerQueueFull), 1);
+        let mut out = String::new();
+        ma.write_prometheus(&mut out).unwrap();
+        assert!(out.contains("racer_rdma_grant_owner_queue_full_total 1"));
+        drop(queued);
+    }
+
+    /// An owner that leaves queued commands undrained past the stall
+    /// threshold makes every rail read as not ready, so new exchanges use
+    /// HTTP; once it drains them, the rail is ready again. The owner loop
+    /// counters and the stalled gauge are published.
+    #[test]
+    fn stalled_owner_takes_rails_out_of_service_until_it_drains() {
+        let mut w = world();
+        let env = w.env.clone();
+        let b = w.b.links.local().clone();
+        link_up(&env, &mut w);
+        let (w, ma, _) = metered(w);
+        let threshold = Duration::from_millis(20);
+        let World {
+            _sim,
+            clock,
+            env,
+            a,
+            b: node_b,
+        } = w;
+        let a = Node {
+            links: Rc::new(
+                Rc::into_inner(a.links)
+                    .expect("unshared links")
+                    .with_owner_stall(threshold),
+            ),
+            ..a
+        };
+        let mut w = World {
+            _sim,
+            clock,
+            env: env.clone(),
+            a,
+            b: node_b,
+        };
+        assert!(w.a.links.ready(&b, RAIL).is_some());
+        w.a.links.sync_link_metrics();
+        assert_eq!(ma.gauge(Gauge::RdmaOwnerStalled), 0);
+        assert!(ma.count(Event::RdmaOwnerPasses) > 0);
+        let scope = scope(&env);
+        let queued = fill_owner_queue(&w, &b, &scope);
+        std::thread::sleep(threshold);
+        assert!(w.a.links.owner_stalled());
+        assert!(!w.a.links.rail_ready(RAIL));
+        assert!(w.a.links.ready(&b, RAIL).is_none());
+        w.a.links.sync_link_metrics();
+        assert_eq!(ma.gauge(Gauge::RdmaOwnerStalled), 1);
+        let passes = ma.count(Event::RdmaOwnerPasses);
+        drop(queued);
+        pump!(w);
+        assert!(!w.a.links.owner_stalled());
+        assert!(w.a.links.ready(&b, RAIL).is_some());
+        w.a.links.sync_link_metrics();
+        assert_eq!(ma.gauge(Gauge::RdmaOwnerStalled), 0);
+        assert!(ma.count(Event::RdmaOwnerPasses) > passes);
+        assert!(ma.count(Event::RdmaOwnerCommands) >= rdma_verbs::COMMAND_QUEUE as u64);
+        let mut out = String::new();
+        ma.write_prometheus(&mut out).unwrap();
+        assert!(out.contains("racer_rdma_owner_stalled 0"));
+        assert!(out.contains("racer_rdma_owner_immediate_wakes_total{reason=\"commands\"}"));
+    }
+
     #[test]
     fn overloaded_grant_fallback_is_counted_apart() {
         let w = world();

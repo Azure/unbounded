@@ -3680,6 +3680,65 @@ mod tests {
             );
         }
 
+        /// A receiver whose owner is backed up (its command queue to the
+        /// owner is full) answers over HTTP at once instead of failing the
+        /// page `Overloaded` into a retry loop that never reaches RDMA.
+        #[test]
+        fn backed_up_owner_makes_the_receiver_fall_back_to_http() {
+            use crate::rdma::links::tests::link_up;
+            use crate::rdma::links::tests::world_for;
+            let env = racer_io::Env::host();
+            let signers = crate::peer::tests::signers(&env);
+            let w = world_for(
+                [signers[0].node().clone(), signers[2].node().clone()],
+                false,
+            );
+            let (mut w, metrics, _) = crate::rdma::links::tests::send_in_place::metered(w);
+            let env = w.env.clone();
+            link_up(&env, &mut w);
+            let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+                crate::test_support::cluster::config(true).limits,
+            )));
+            let reactor = Rc::new(Reactor::new(admission.clone(), &env));
+            let receiver =
+                transfers(signers[0].clone(), &admission, &reactor).with_links(w.a.links.clone());
+            let membership = page_membership(&signers, None);
+            let (signed, _) = crate::peer::forwarding::Forwarding::new(signers[0].clone())
+                .sign_request(crate::peer::tests::request(&env, &admission, 0))
+                .unwrap();
+            let scope = signed.request.origin.scope().clone();
+            let peer = signers[2].node().clone();
+            let links = w.a.links.clone();
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            // Queue grants the owner never drains.
+            let mut queued = Vec::new();
+            for n in 0..rdma_verbs::COMMAND_QUEUE {
+                let mut grant =
+                    Box::pin(links.grant(&peer, RailId(7), TransferId([n as u8; 16]), &scope));
+                assert!(grant.as_mut().poll(&mut cx).is_pending());
+                queued.push(grant);
+            }
+            let plan = TransportPlan::Rdma { rail: RailId(7) };
+            let mut accept =
+                Box::pin(receiver.accept_native(&signed, plan, &membership, None, &scope));
+            let Poll::Ready(accepted) = accept.as_mut().poll(&mut cx) else {
+                panic!("a backed-up owner must not make the receiver wait");
+            };
+            assert!(accepted.unwrap().is_none(), "the receiver plans HTTP");
+            assert_eq!(
+                metrics.count(crate::telemetry::Event::RdmaGrantOwnerQueueFull),
+                1
+            );
+            assert_eq!(
+                metrics.count(crate::telemetry::Event::RdmaGrantBackpressure),
+                0
+            );
+            assert_eq!(metrics.count(crate::telemetry::Event::RdmaHttpFallback), 1);
+            drop(accept);
+            drop(queued);
+            crate::rdma::links::tests::pump(&mut w.a.owner, &mut w.b.owner);
+        }
+
         #[test]
         fn simulated_receiver_rejects_complete_from_cross_site_hop() {
             let env = racer_io::Env::host();

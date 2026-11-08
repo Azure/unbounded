@@ -2021,6 +2021,19 @@ reported `max_qp_wr` and `max_cqe` (and, with memory windows, `max_mw`), and by
 the peer's advertised limit. Registration mode posts up to 4 send work requests
 per send, so a device that reports 2048 for both, as MANA does, allows 111
 grants per link. A device that cannot fit even one grant fails RDMA activation.
+A single native thread per node (the RDMA owner) handles every grant, write,
+and release. If the owner spends 2 s inside one pass, or leaves a worker's
+commands queued for 2 s, `racer_rdma_owner_stalled` reads 1 and no rail counts as
+ready: new exchanges go over HTTP until the owner catches up. A grant whose command
+finds the worker's queue to the owner full also goes over HTTP at once, instead of
+pushing back, and counts in `racer_rdma_grant_owner_queue_full_total`.
+`racer_rdma_owner_passes_total` and `racer_rdma_owner_commands_total` count owner
+passes and the commands they handled. `racer_rdma_owner_immediate_wakes_total{reason}`
+counts passes followed at once by another pass instead of a sleep: `commands` (the
+pass used its whole command budget) or `completions` (a link reaped a full
+completion batch, or has completions that raise no event). Passes that keep growing
+on an idle node mean the owner is spinning; a stalled owner with passes that do not
+grow means it is stuck inside one pass.
 `racer_rdma_links_ready`, `racer_rdma_links_connecting`, `racer_rdma_links_backoff`,
 and `racer_rdma_links_breaking` count the node's links by state.
 `racer_rdma_link_breaks_total{reason}` counts links torn down, by `reason`:
