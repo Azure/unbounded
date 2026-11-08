@@ -363,10 +363,10 @@ each worker and are never divided.
 | Variable | Default | Scope | Accepted | Description |
 | --- | --- | --- | --- | --- |
 | `RACER_ENABLE_RDMA` | `auto` | Node | `auto`, `true`, `false` | `auto` uses native RDMA when built in and ports exist at startup; `true` reserves RDMA resources even without ports, for hotplug; `false` turns it off. |
-| `RACER_RDMA_BREAKER` | `true` | Node | `true`, `false` | Per peer and rail circuit breaker: after an RDMA failure with a peer (link break, setup failure, failed or timed-out grant or write), pages to and from it use HTTP at once until a cooldown passes and one probe page succeeds over RDMA. |
+| `RACER_RDMA_BREAKER` | `true` | Node | `true`, `false` | Per peer and rail circuit breaker: after a hard RDMA failure with a peer (link break, setup failure, grant or write error), or 3 page timeouts in a row with no RDMA success between them, pages to and from it use HTTP at once until a cooldown passes and one probe page succeeds over RDMA. Load (no grant slot or flight room) never trips it. |
 | `RACER_RDMA_BREAKER_COOLDOWN_MS` | `2000` | Node | 1..3,600,000 ms | First breaker cooldown; it doubles for each consecutive trip, up to `RACER_RDMA_BREAKER_MAX_COOLDOWN_MS`, less up to a fifth as jitter. |
 | `RACER_RDMA_BREAKER_MAX_COOLDOWN_MS` | `30000` | Node | 1..3,600,000 ms | Longest breaker cooldown; at least `RACER_RDMA_BREAKER_COOLDOWN_MS`. |
-| `RACER_RDMA_PAGE_TIMEOUT_MS` | `2000` | Node | 1..60,000 ms | Longest one page's RDMA grant or write may take before the page goes over HTTP in the same exchange and the breaker trips. |
+| `RACER_RDMA_PAGE_TIMEOUT_MS` | `5000` | Node | 1..60,000 ms | Longest one page's RDMA grant or write may take before the page goes over HTTP in the same exchange; counts a soft breaker failure. |
 | `RACER_MEMORY_PRESSURE` | `true` | Node | `true`, `false` | cgroup v2 memory-pressure monitoring and reclaim. |
 
 #### GPU reads
@@ -1941,24 +1941,40 @@ Release images include native verbs support; discovery/provider failures retain 
 ### RDMA circuit breaker
 
 Each node keeps a circuit breaker per peer and rail (`RACER_RDMA_BREAKER`, on by
-default). It trips on the first RDMA failure with that peer: a link being torn down,
-a link setup this node started that failed, a grant that failed for any reason
-other than full buffers, a write that failed or did not finish within
-`RACER_RDMA_PAGE_TIMEOUT_MS` (2 s), a page whose sender answered the grant over
-HTTP only after that timeout, or a page that the sender reported written but that
-did not arrive. While a breaker is open, pages to and from that peer on that rail
+default). A busy link is slow, not broken, so the breaker sorts failure signals in
+three kinds:
+
+- Hard failures trip it at once: a link being torn down (`link_down`), a link setup
+  this node started that failed and was not declined (`setup`), a grant that failed
+  with an error (`grant`), or a write, or the arrival of a page the sender reported
+  written, that failed with an error (`send`).
+- Soft failures trip it only after 3 in a row with no RDMA success with that peer on
+  that rail in between: a grant, write, or arrival that did not finish within
+  `RACER_RDMA_PAGE_TIMEOUT_MS` (5 s) (`timeout`), or a page whose sender answered
+  the grant over HTTP only after that timeout (`slow_fallback`). Any RDMA success
+  ends the streak, and a streak with no soft failure for
+  `RACER_RDMA_BREAKER_MAX_COOLDOWN_MS` starts over. On a congested link pages keep
+  completing between the slow ones; on a stuck link none do.
+- Load never trips it (`load`): no free grant slot, flight room, or ciphertext
+  budget. That page goes over HTTP and the next one tries RDMA again.
+
+While a breaker is open, pages to and from that peer on that rail
 use HTTP at once, with no grant, grant wait, or write. The link keeps reconnecting
 in the background. After a cooldown (`RACER_RDMA_BREAKER_COOLDOWN_MS`, 2 s, doubling
 for each consecutive trip up to `RACER_RDMA_BREAKER_MAX_COOLDOWN_MS`, 30 s, less up
 to a fifth as jitter), one probe page at a time uses RDMA. Its success closes the
-breaker, and its failure opens it again for the next longer cooldown.
+breaker, and its hard or soft failure opens it again for the next longer cooldown.
+A probe that meets load frees the probe slot for the next page.
 
 A write that fails or runs out of `RACER_RDMA_PAGE_TIMEOUT_MS` goes over HTTP in the
 same exchange, so it does not use up one of the page's retries. The sender releases the
 receiver's grant, and the receiver keeps the buffer reserved until that release
 arrives or the link breaks. A write that lands late can never land in a reused buffer.
 `racer_rdma_breaker_trips_total{reason}` counts trips by `reason`: `link_down`,
-`grant`, `send`, `timeout`, `slow_fallback`, or `setup`. `racer_rdma_breaker_closes_total`
+`grant`, `send`, `timeout`, `slow_fallback`, or `setup`.
+`racer_rdma_breaker_soft_failures_total{reason}` counts soft and load failures that
+did not trip a breaker, by `reason`: `timeout`, `slow_fallback`, or `load`; a high
+count with few trips means congestion, not broken links. `racer_rdma_breaker_closes_total`
 counts breakers closed by a probe, `racer_rdma_breaker_open` is the number of breakers
 open or half-open now, `racer_rdma_breaker_http_total` counts pages sent or planned over
 HTTP because a breaker was open, and `racer_rdma_page_timeouts_total` counts grants and

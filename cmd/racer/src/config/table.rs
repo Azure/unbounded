@@ -355,7 +355,7 @@ const BASE: &[Var] = &[
         Group::Hardware,
         Kind::Bool,
         Value("true"),
-        "Per peer and rail circuit breaker: after an RDMA failure with a peer (link break, setup failure, failed or timed-out grant or write), pages to and from it use HTTP at once until a cooldown passes and one probe page succeeds over RDMA.",
+        "Per peer and rail circuit breaker: after a hard RDMA failure with a peer (link break, setup failure, grant or write error), or 3 page timeouts in a row with no RDMA success between them, pages to and from it use HTTP at once until a cooldown passes and one probe page succeeds over RDMA. Load (no grant slot or flight room) never trips it.",
     ),
     var(
         "RACER_RDMA_BREAKER_COOLDOWN_MS",
@@ -375,8 +375,8 @@ const BASE: &[Var] = &[
         "RACER_RDMA_PAGE_TIMEOUT_MS",
         Group::Hardware,
         uint(1, 60_000, MS),
-        Value("2000"),
-        "Longest one page's RDMA grant or write may take before the page goes over HTTP in the same exchange and the breaker trips.",
+        Value("5000"),
+        "Longest one page's RDMA grant or write may take before the page goes over HTTP in the same exchange; counts a soft breaker failure.",
     ),
     var(
         "RACER_MEMORY_PRESSURE",
