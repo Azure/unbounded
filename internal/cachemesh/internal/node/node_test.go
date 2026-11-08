@@ -91,7 +91,15 @@ type cluster struct {
 	shared *Shared
 	pubs   map[view.Version]view.Digest
 	valid  map[*view.View]bool
+	// fake serves calls to addresses that are not nodes (hostile peers).
+	fake map[string]func(from string, msg []byte) []byte
+	// skew offsets the wall clock of a node index.
+	skew map[int]time.Duration
+	// onLeaseOp, if set, sees every Lease op as a node emits it.
+	onLeaseOp func(i int, op elect.Op)
 }
+
+func (c *cluster) wallOf(i int) time.Time { return c.wall().Add(c.skew[i]) }
 
 func addr(i int) string { return "n" + strconv.Itoa(i) + ":1" }
 
@@ -99,6 +107,7 @@ func newCluster(t *testing.T) *cluster {
 	return &cluster{
 		t: t, now: 1000 * sec, byAddr: map[string]int{}, lat: int64(time.Millisecond),
 		cut: map[[2]int]bool{}, shared: NewShared(0), pubs: map[view.Version]view.Digest{}, valid: map[*view.View]bool{},
+		fake: map[string]func(string, []byte) []byte{}, skew: map[int]time.Duration{},
 	}
 }
 
@@ -138,7 +147,7 @@ func (c *cluster) add(cfg Config) int {
 	}
 
 	c.byAddr[cfg.Addr] = i
-	n.Start(c.now, c.wall())
+	n.Start(c.now, c.wallOf(i))
 	c.flush(i)
 
 	return i
@@ -158,6 +167,10 @@ func (c *cluster) flush(i int) {
 	}
 
 	for _, op := range n.LeaseOps() {
+		if c.onLeaseOp != nil {
+			c.onLeaseOp(i, op)
+		}
+
 		c.at(c.now+c.lat, func() {
 			if c.down[i] || c.nodes[i].cfg.Incarnation != inc {
 				return
@@ -169,7 +182,7 @@ func (c *cluster) flush(i int) {
 					return
 				}
 
-				c.nodes[i].OnLease(c.now, c.wall(), res)
+				c.nodes[i].OnLease(c.now, c.wallOf(i), res)
 				c.flush(i)
 			})
 		})
@@ -180,6 +193,25 @@ func (c *cluster) deliver(from int, inc uint64, call Call) {
 	to, ok := c.byAddr[call.To]
 	if call.Timeout <= 0 {
 		c.t.Fatalf("call with timeout %v to %s", call.Timeout, call.To)
+	}
+
+	if h, fake := c.fake[call.To]; fake {
+		fromAddr := c.nodes[from].cfg.Addr
+
+		c.at(c.now+c.lat, func() {
+			resp := h(fromAddr, call.Msg)
+
+			c.at(c.now+c.lat, func() {
+				if c.down[from] || c.nodes[from].cfg.Incarnation != inc {
+					return
+				}
+
+				c.nodes[from].OnReply(c.now, call.ID, resp, nil)
+				c.flush(from)
+			})
+		})
+
+		return
 	}
 
 	reply := func(resp []byte, err error) {
@@ -267,7 +299,7 @@ func (c *cluster) run(d time.Duration) {
 
 		for i, n := range c.nodes {
 			if !c.down[i] && n.NextDeadline() <= c.now {
-				n.Tick(c.now, c.wall())
+				n.Tick(c.now, c.wallOf(i))
 				c.flush(i)
 			}
 		}

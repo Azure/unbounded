@@ -143,6 +143,7 @@ func (n *Node) setView(now int64, nv *view.View) {
 	case n.slot != view.NoSlot:
 		n.joined = true
 		n.seeds = n.seeds[:0] // no longer needed
+		n.coldStart, n.bootstrapper = false, false
 	case n.joined && n.leaving:
 		n.left = true
 	default:
@@ -162,8 +163,10 @@ func (n *Node) setView(now int64, nv *view.View) {
 	}
 
 	if n.leading && nv.Term() > n.term {
-		// Another leader published a later term: stop at once.
-		n.stopLeading("fenced")
+		// Another leader published a later term: stop at once, and give
+		// the Lease back in case this member still holds it (a lost or
+		// corrupt term annotation can let the lower lineage win it).
+		n.resign(now, "fenced")
 	}
 
 	n.updateNeighbors(now)
@@ -180,6 +183,9 @@ func (n *Node) applyOne(now int64, d *view.Delta, raw []byte) error {
 	if err != nil {
 		return err
 	}
+
+	// A delta chained on top of the view confirms its digest.
+	n.unconfirmed, n.badBase = false, false
 
 	if err := n.log.Append(d, n.encoded(d, raw)); err != nil {
 		// Unreachable: the log head tracks the view.
@@ -198,6 +204,15 @@ func (n *Node) applyOne(now int64, d *view.Delta, raw []byte) error {
 }
 
 func (n *Node) adoptSnapshot(now int64, nv *view.View) {
+	n.adoptSnapshotFrom(now, nv, "")
+}
+
+// adoptSnapshotFrom installs a snapshot served by the peer at from ("" when
+// the source is trusted: the leader of the snapshot, or the local config).
+func (n *Node) adoptSnapshotFrom(now int64, nv *view.View, from string) {
+	n.snapFrom = from
+	n.unconfirmed, n.unconfirmedAt, n.badBase = from != "", now, false
+
 	if n.shared != nil {
 		nv = n.shared.Interner.View(nv)
 	}
@@ -222,6 +237,8 @@ func (n *Node) onBroadcast(now int64, from string, m *wire.Message) {
 		return
 	}
 
+	n.observeTerm(now, d.Version.Term, from)
+
 	cur := n.v.Version()
 
 	switch {
@@ -234,7 +251,7 @@ func (n *Node) onBroadcast(now int64, from string, m *wire.Message) {
 		if err := n.applyOne(now, d, enc); err != nil {
 			if errors.Is(err, view.ErrDigest) {
 				n.event("fork")
-				n.catchUp(now, from, false)
+				n.recoverBase(now, from)
 			}
 
 			return
@@ -275,10 +292,12 @@ func (n *Node) drainAhead(now int64) {
 
 			n.ahead = slices.Delete(n.ahead, i, i+1)
 
-			if n.applyOne(now, a.d, a.enc) == nil {
+			if err := n.applyOne(now, a.d, a.enc); err == nil {
 				n.forward(a.d, a.enc, a.level)
 
 				progress = true
+			} else if errors.Is(err, view.ErrDigest) {
+				n.recoverBase(now, "")
 			}
 
 			break
@@ -373,6 +392,12 @@ func (n *Node) serveCatchUp(m *wire.Message) []byte {
 	mine := n.v.Version()
 
 	switch {
+	case n.leading && m.Have.Term == n.term && mine.Less(m.Have):
+		// Only this member publishes this term, so a requester ahead of it
+		// holds a forged or corrupt view: send ours so it can repair.
+		r.Snapshot = n.snapshot()
+	case n.unconfirmed || n.badBase:
+		// Do not spread a view that may be corrupt.
 	case mine == m.Have && n.v.Digest() == m.HaveDigest, mine.Less(m.Have), mine.IsZero():
 		// Nothing newer.
 	default:
@@ -393,7 +418,7 @@ func (n *Node) serveCatchUp(m *wire.Message) []byte {
 	return wire.Append(nil, &r)
 }
 
-func (n *Node) onCatchUp(now int64, m *wire.Message) {
+func (n *Node) onCatchUp(now int64, m *wire.Message, from string) {
 	switch {
 	case len(m.Deltas) > 0:
 		applied := 0
@@ -404,7 +429,11 @@ func (n *Node) onCatchUp(now int64, m *wire.Message) {
 				continue
 			}
 
-			if n.applyOne(now, d, raw) != nil {
+			if err := n.applyOne(now, d, raw); err != nil {
+				if errors.Is(err, view.ErrDigest) {
+					n.recoverBase(now, from)
+				}
+
 				break
 			}
 
@@ -437,16 +466,34 @@ func (n *Node) onCatchUp(now int64, m *wire.Message) {
 
 		cur := n.v.Version()
 		fromLeader := nv.Leader() == m.From.Slot && nv.Version() == m.Version
+		// A repair source is any peer other than the one that served the
+		// current (suspect) view.
+		repair := (n.badBase || n.unconfirmed) && from != n.snapFrom
+		differs := nv.Digest() != n.v.Digest()
 
-		if cur.Less(nv.Version()) || (cur == nv.Version() && nv.Digest() != n.v.Digest() && fromLeader) {
-			n.adoptSnapshot(now, nv)
-
-			if n.cfg.Hooks.OnCatchUp != nil {
-				n.cfg.Hooks.OnCatchUp(CatchUpSnapshot)
-			}
-
-			n.drainAhead(now)
+		switch {
+		case cur.Less(nv.Version()), cur == nv.Version() && differs && (fromLeader || repair):
+		case n.unconfirmed && fromLeader && from != n.snapFrom && differs && nv.Term() >= cur.Term:
+			// The leader of the term is behind a snapshot nobody has
+			// built on: that snapshot claimed a version that was never
+			// published. Roll back to the leader's view.
+			n.event("snapshot-rollback")
+		default:
+			return
 		}
+
+		src := from
+		if fromLeader {
+			src = ""
+		}
+
+		n.adoptSnapshotFrom(now, nv, src)
+
+		if n.cfg.Hooks.OnCatchUp != nil {
+			n.cfg.Hooks.OnCatchUp(CatchUpSnapshot)
+		}
+
+		n.drainAhead(now)
 	default:
 		if n.cfg.Hooks.OnCatchUp != nil {
 			n.cfg.Hooks.OnCatchUp(CatchUpEmpty)
@@ -620,8 +667,7 @@ func (n *Node) pingSubjects(_ int64) {
 		var m wire.Message
 		n.header(&m, wire.KindPing)
 
-		sb.inflight = true
-		n.send(n.addrOf(sb.slot), &m, &pending{kind: callPing, slot: sb.slot, key: sb.key}, n.cfg.PingTimeout)
+		sb.inflight = n.send(n.addrOf(sb.slot), &m, &pending{kind: callPing, slot: sb.slot, key: sb.key}, n.cfg.PingTimeout)
 	}
 }
 
@@ -688,7 +734,7 @@ func (n *Node) electInput(now int64, wall time.Time) elect.Input {
 	// Lease reads: keep it a follower. Otherwise a joiner without a view
 	// would sit in the lottery and, with a skewed wall clock, take a live
 	// leader's Lease only to give it back.
-	if !n.isMember() && len(n.seeds) > 0 && !n.bootstrapper && !n.leading {
+	if !n.isMember() && len(n.seeds) > 0 && !n.bootstrapper && !n.coldStart && !n.leading {
 		in.HaveView, in.LeaderHeardAt = true, now
 	}
 
@@ -812,6 +858,7 @@ func (n *Node) OnLease(now int64, wall time.Time, r elect.Result) {
 		}
 
 		n.ownReadDone = true
+		defer n.noteColdRead(now, wall, r)
 
 		// Any record that names a holder or seeds means a cluster exists
 		// (or existed): join through it rather than judging liveness with
@@ -863,6 +910,8 @@ func (n *Node) electEvents(now int64) {
 		case elect.Lost:
 			n.stopLeading("lost")
 		case elect.Discovered:
+			// A live holder: join it rather than cold start.
+			n.coldStart = false
 			n.learnSeeds(e.Record.Addr, e.Record.Seeds)
 
 			if n.isMember() && n.v.Term() < e.Record.Term {
@@ -874,7 +923,16 @@ func (n *Node) electEvents(now int64) {
 
 func (n *Node) startLeading(now int64, term uint64) {
 	_, has := n.v.Config()
-	if term <= n.v.Term() || (!has && !n.bootstrapper) {
+	if n.leaving {
+		// The acquire was in flight when Leave was called: a leaving
+		// member never starts a term. Give the Lease straight back.
+		n.event("acquire-declined-leaving")
+		n.leaseOps = append(n.leaseOps, n.el.Release(n.electInput(now, n.wall))...)
+
+		return
+	}
+
+	if term <= n.v.Term() || (!has && !n.bootstrapper && !n.coldStart) {
 		// Cannot start this term from our view (or must not bootstrap a
 		// second cluster): give the Lease back.
 		n.event("acquire-declined")
@@ -912,7 +970,7 @@ func (n *Node) leaderTick(now int64) {
 	if n.startTerm {
 		newTerm = n.term
 	} else if n.v.Term() != n.term {
-		n.stopLeading("fenced")
+		n.resign(now, "fenced")
 
 		return
 	}

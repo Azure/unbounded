@@ -554,7 +554,59 @@ Implementation notes (`node` package):
 - A starting member without seeds treats any Lease record with a holder or
   seeds as a live cluster and joins through it; it bootstraps only when the
   Lease is missing, or released without seeds. Judging the holder's liveness
-  by wall clock here would let a skewed clock start a second cluster.
+  by wall clock alone here would let a skewed clock start a second cluster.
+- Cold start (every member died, so the Lease names a dead leader and dead
+  seeds). A member that has never been in a view enters a cold start when
+  all of these hold at one of its own Lease reads (the start read, or the
+  re-read every 16 join attempts, with or without configured seeds): the
+  record, or its absence, has the same UID and resourceVersion as a read at
+  least `LeaseDuration` earlier on the member's monotonic clock; a held
+  record is expired by wall time beyond `LeaseDuration +
+  ClockSkewAllowance`; and no reply from a peer that has a view arrived for
+  `LeaseDuration`. A cold-starting member is no longer held as a follower,
+  so it enters the lottery (bounding Lease reads at `LotteryBudgetQPS`); a
+  lottery winner publishes a first view like a bootstrapper and the others
+  discover it in the Lease and join. The unchanged-resourceVersion rule is
+  the candidates' rule, so a joiner with a skewed wall clock that is cut off
+  from a live cluster never cold-starts: the live leader's renewals keep
+  changing the record. A `Discovered` live holder cancels a cold start.
+- Higher terms. Every control message and delta carries a full 64-bit term.
+  A member that sees a term above its view's records it
+  (`Elector.ObserveTerm`) and catches up from the sender; a leader that sees
+  a term above its own stops publishing at once and releases the Lease
+  (`resign`), as it does when a view of a later term is applied or its view
+  term no longer matches. The release record carries the highest term the
+  member has seen, so the next holder starts above both lineages even if
+  the Lease term annotation was lost (read as 0). Terms at or above
+  `elect.MaxSaneTerm` (2^62) are garbage and ignored, so terms cannot
+  overflow. `NoteVersion`, fed from data-plane headers whose term is
+  truncated to 32 bits, may trigger a catch-up but never a step-down, so
+  terms that differ only above bit 32 cannot cause a regression.
+- A member that is leaving never starts a term: if a Lease acquire that was
+  in flight when `Leave` was called succeeds, it releases the Lease at once
+  and keeps leaving.
+- Snapshot trust. A snapshot's version and digest are taken from its
+  encoding, so a corrupt or forged one decodes. A snapshot served by a peer
+  other than the leader of its view is *unconfirmed* until a delta applies on
+  top of it (the digest chain then vouches for it). An unconfirmed or bad
+  view is never served to others. When a delta whose base is the current
+  version fails with `view.ErrDigest`, the member re-fetches from a source
+  other than the peer that served the snapshot (the delta's sender, then
+  the leader, the Lease holder, a seed), with a catch-up that does not wait
+  behind one already in flight, and adopts a snapshot at the same version
+  with a different digest from it. If a snapshot stays unconfirmed for
+  `2*EpochPeriod + 2*CallTimeout` (a live leader heartbeats every epoch) it
+  re-fetches the same way. A leader asked for a catch-up by a member that
+  claims to be ahead of it in its own term answers with its snapshot, and
+  an unconfirmed member adopts that lower version from the leader of its
+  term (a forged snapshot claimed a version that was never published).
+  This is the only case in which a view version decreases.
+- Bounded state. Outbound calls awaiting a reply are capped at
+  `MaxPendingCalls` (4096); further calls are dropped and their senders
+  retry on their own timers. Seeds are capped at 32 (64 from the Lease),
+  queued ahead deltas at `MaxAhead`, the delta log at `DeltaLogSize`, the
+  leader's input queues at `MaxPending`; neighbors and subjects follow the
+  view. `Node.Stats` reports every size.
 - A joiner that has seeds stays a follower (the elector is told it has a
   view and has just heard from the leader), so it never enters the lottery;
   otherwise a joiner with a skewed wall clock takes a live leader's Lease and
@@ -618,6 +670,11 @@ States:
   `LeaseDuration + ClockSkewAllowance` (5s) of wall time, the member tries to
   take it. This bounds API traffic during leader loss at about
   `LotteryBudgetQPS` (20/s) across the whole cluster.
+
+`Elector.ObserveTerm` records terms seen outside the Lease (see the node
+notes); the next acquisition uses `max(record.Term, view.Term, observed) +
+1`, a record term at or above `MaxSaneTerm` reads as 0, and `Release` writes
+the highest term seen into the released record.
 
 A record held by the same MemberID with a different incarnation is treated
 like any other holder (wait `LeaseDuration`), since IDs may collide; only a

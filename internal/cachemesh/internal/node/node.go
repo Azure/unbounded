@@ -71,6 +71,7 @@ package node
 
 import (
 	"bytes"
+	"errors"
 	"math/rand/v2"
 	"slices"
 	"time"
@@ -307,6 +308,13 @@ type Node struct {
 	releasing    bool
 	bootstrapper bool
 
+	// Cold start: a starter whose seeds and Lease holder are all dead.
+	coldStart   bool
+	coldSeen    bool
+	coldRV      string
+	coldSince   int64
+	lastContact int64 // last reply from a peer that has a view
+
 	// Joining and leaving.
 	seeds       []string
 	joined      bool // was a member of some view
@@ -323,7 +331,17 @@ type Node struct {
 	catchUpInFlight bool
 	catchUpSentAt   int64
 	ahead           []aheadDelta
-	forwarded       view.Version
+	// snapFrom is the peer the current view's snapshot came from ("" if
+	// it came from the leader of that view, or the view was built from
+	// deltas). unconfirmed is set while such a snapshot has had no delta
+	// applied on top of it, since its version and digest are trusted on
+	// decode; badBase is set when a delta failed its digest check against
+	// the current view.
+	snapFrom      string
+	unconfirmed   bool
+	unconfirmedAt int64
+	badBase       bool
+	forwarded     view.Version
 
 	// Monitoring and neighbors.
 	subjects  []subject
@@ -539,6 +557,12 @@ func (n *Node) Tick(now int64, wall time.Time) {
 	if n.catchUpInFlight && now-n.catchUpSentAt > 2*int64(n.cfg.CallTimeout) {
 		n.catchUpInFlight = false
 	}
+
+	if n.unconfirmed && now-n.unconfirmedAt > n.confirmAfter() {
+		n.unconfirmedAt = now
+		n.event("snapshot-unconfirmed")
+		n.recoverBase(now, "")
+	}
 }
 
 func (n *Node) expireCalls(now int64) {
@@ -564,9 +588,21 @@ func (n *Node) header(m *wire.Message, k wire.Kind) {
 	m.LeaderSlot = n.v.Leader()
 }
 
-func (n *Node) send(to string, m *wire.Message, p *pending, timeout time.Duration) {
+// MaxPendingCalls bounds outbound calls awaiting a reply. Beyond it new
+// calls are dropped (the senders retry on their own timers), so a flood of
+// inbound messages that each cause a relay cannot grow memory without
+// bound.
+const MaxPendingCalls = 4096
+
+func (n *Node) send(to string, m *wire.Message, p *pending, timeout time.Duration) bool {
 	if to == "" || to == n.cfg.Addr {
-		return
+		return false
+	}
+
+	if len(n.calls) >= MaxPendingCalls {
+		n.event("call-dropped")
+
+		return false
 	}
 
 	n.nextCall++
@@ -574,6 +610,8 @@ func (n *Node) send(to string, m *wire.Message, p *pending, timeout time.Duratio
 	p.sentAt = n.now
 	n.calls[id] = p
 	n.outbox = append(n.outbox, Call{ID: id, To: to, Msg: wire.Append(nil, m), Timeout: timeout})
+
+	return true
 }
 
 func (n *Node) addrOf(s view.Slot) string {
@@ -656,17 +694,16 @@ func (n *Node) sendJoin(now int64) {
 		return
 	}
 
-	// Send the join straight to the leader when the newest view names one.
+	// Send the join straight to the leader when one is known (from the
+	// newest view, the Lease, or a Pong hint).
 	to := seed
 
-	if l := n.v.Leader(); l != view.NoSlot {
-		if a := n.addrOf(l); a != "" && a != n.cfg.Addr {
-			to = a
-		}
+	if a, ok := n.leaderTarget(); ok && a != "" {
+		to = a
 	}
 
 	n.toLeader(now, to, &j)
-	n.catchUp(now, seed, true)
+	n.catchUp(now, seed, false)
 	n.event("join-sent")
 
 	// Seeds may all be gone: refresh them from the Lease now and then.
@@ -748,8 +785,11 @@ func (n *Node) Invalidate(now int64, seed uint64) {
 	n.toLeader(now, addr, &m)
 }
 
+// catchUp asks addr for what follows the current view. At most one
+// catch-up is in flight unless force is set (recovery from a bad base,
+// which must not wait behind a request to the peer that caused it).
 func (n *Node) catchUp(now int64, addr string, force bool) {
-	if addr == "" || addr == n.cfg.Addr || n.catchUpInFlight {
+	if addr == "" || addr == n.cfg.Addr || (n.catchUpInFlight && !force) {
 		return
 	}
 
@@ -757,12 +797,17 @@ func (n *Node) catchUp(now int64, addr string, force bool) {
 	n.header(&m, wire.KindCatchUpRequest)
 	m.Have, m.HaveDigest = n.v.Version(), n.v.Digest()
 	m.MaxDeltas = uint32(n.cfg.CatchUpMaxDeltas)
-	n.catchUpInFlight = true
-	n.catchUpSentAt = now
-	n.send(addr, &m, &pending{kind: callCatchUp, addr: addr}, n.cfg.CallTimeout)
+
+	if n.send(addr, &m, &pending{kind: callCatchUp, addr: addr}, n.cfg.CallTimeout) {
+		n.catchUpInFlight = true
+		n.catchUpSentAt = now
+	}
 }
 
-// NoteVersion reports that the data plane saw a member at version ver.
+// NoteVersion reports that the data plane saw a member at version ver. The
+// data-plane header carries only the low 32 bits of the term, so ver is a
+// hint: it may trigger a catch-up but never a leader step-down (see
+// observeTerm, which only trusts full 64-bit terms from control messages).
 func (n *Node) NoteVersion(now int64, from view.Slot, ver view.Version) {
 	if n.v.Version().Less(ver) {
 		n.catchUp(now, n.addrOf(from), false)
@@ -785,6 +830,8 @@ func (n *Node) Handle(now int64, from string, msg []byte) []byte {
 	if n.cfg.Hooks.OnMessage != nil {
 		n.cfg.Hooks.OnMessage(m.Kind)
 	}
+
+	n.observeTerm(now, m.Version.Term, from)
 
 	switch m.Kind {
 	case wire.KindPing:
@@ -942,6 +989,19 @@ func (n *Node) OnReply(now int64, id uint64, resp []byte, err error) {
 		}
 	}
 
+	if m != nil {
+		addr := p.addr
+		if addr == "" && p.slot != view.NoSlot && (p.kind == callPing || p.kind == callBroadcast) {
+			addr = n.addrOf(p.slot)
+		}
+
+		if !m.Version.IsZero() {
+			n.lastContact = now
+		}
+
+		n.observeTerm(now, m.Version.Term, addr)
+	}
+
 	if m == nil || m.Kind == wire.KindNack {
 		if m != nil && p.kind == callCatchUp {
 			n.catchUpInFlight = false
@@ -970,7 +1030,7 @@ func (n *Node) OnReply(now int64, id uint64, resp []byte, err error) {
 		n.catchUpInFlight = false
 
 		if m.Kind == wire.KindCatchUpResponse {
-			n.onCatchUp(now, m)
+			n.onCatchUp(now, m, p.addr)
 		}
 	case callBroadcast:
 		if p.slot != view.NoSlot && n.hl != nil {
@@ -995,5 +1055,147 @@ func (n *Node) fail(p *pending) {
 			n.forwardCell(p.enc, p.seq, p.level, p.cell, 1, p.slot)
 		}
 	case callRouted:
+	}
+}
+
+// --- Hardening ---
+
+// confirmAfter is how long a snapshot from a peer other than its leader may
+// go without a delta on top before the member re-fetches its view from
+// another source. A live leader publishes at least one heartbeat per epoch
+// period.
+func (n *Node) confirmAfter() int64 {
+	return 2*int64(n.cfg.EpochPeriod) + 2*int64(n.cfg.CallTimeout)
+}
+
+// recoverBase re-fetches the view after the current one proved bad (a delta
+// failed its digest check against it) or stayed unconfirmed, from a source
+// other than the peer that served it: from (the peer whose delta failed),
+// then the leader, then a seed.
+func (n *Node) recoverBase(now int64, from string) {
+	n.badBase = true
+	n.event("bad-base")
+	n.catchUp(now, n.repairSource(from), true)
+}
+
+func (n *Node) repairSource(from string) string {
+	cands := []string{from, n.addrOf(n.v.Leader())}
+
+	if li, ok := n.el.Leader(); ok {
+		cands = append(cands, li.Addr)
+	}
+
+	cands = append(cands, n.leaderAddr)
+	cands = append(cands, n.seeds...)
+
+	for _, a := range cands {
+		if a != "" && a != n.cfg.Addr && a != n.snapFrom {
+			return a
+		}
+	}
+
+	return ""
+}
+
+// observeTerm handles a full 64-bit term seen in a control message or
+// delta from addr. A leader that sees a term above its own steps down at
+// once and gives the Lease back; every member remembers the term so its
+// next acquisition starts above it, and catches up from addr when the term
+// is above its view's. Data-plane notes, whose terms are truncated to 32
+// bits, never come here.
+func (n *Node) observeTerm(now int64, term uint64, addr string) {
+	if term <= n.v.Term() && (!n.leading || term <= n.term) {
+		return
+	}
+
+	if term >= elect.MaxSaneTerm {
+		n.event("absurd-term")
+
+		return
+	}
+
+	n.el.ObserveTerm(term)
+
+	if n.leading && term > n.term {
+		n.resign(now, "higher-term")
+	}
+
+	if term > n.v.Term() {
+		n.catchUp(now, addr, false)
+	}
+}
+
+// resign stops publishing and releases the Lease if the elector holds it.
+func (n *Node) resign(now int64, reason string) {
+	n.stopLeading(reason)
+	n.leaseOps = append(n.leaseOps, n.el.Release(n.electInput(now, n.wall))...)
+}
+
+// noteColdRead tracks this member's own Lease reads while it has never
+// been a member. It enables a cold start, which lets the member take part
+// in the lottery and publish a first view, once the Lease shows no sign of
+// life and no peer with a view has answered: the record (or its absence)
+// stayed unchanged for LeaseDuration of local time across reads, it is
+// expired by wall time beyond LeaseDuration+ClockSkewAllowance, and no reply
+// from a member with a view arrived for LeaseDuration. Requiring an
+// unchanged resourceVersion on the local monotonic clock, as candidates do,
+// keeps a member with a skewed wall clock from stealing a live Lease.
+func (n *Node) noteColdRead(now int64, wall time.Time, r elect.Result) {
+	if _, has := n.v.Config(); has || n.joined || n.coldStart || n.bootstrapper {
+		return
+	}
+
+	notFound := errors.Is(r.Err, elect.ErrNotFound)
+	if r.Err != nil && !notFound {
+		return
+	}
+
+	key := "-"
+	if !notFound {
+		key = r.Record.UID + "/" + r.Record.ResourceVersion
+	}
+
+	if !n.coldSeen || key != n.coldRV {
+		n.coldSeen, n.coldRV, n.coldSince = true, key, now
+
+		return
+	}
+
+	ld := n.cfg.Elect.LeaseDuration
+	if !notFound {
+		ld = max(ld, r.Record.LeaseDuration)
+	}
+
+	switch {
+	case now-n.coldSince < int64(ld), now-n.lastContact < int64(ld):
+		return
+	case !notFound && r.Record.Holder != "" && !wall.After(r.Record.RenewTime.Add(ld+n.cfg.Elect.ClockSkewAllowance)):
+		return
+	}
+
+	n.coldStart = true
+	n.event("cold-start")
+}
+
+// Stats reports the sizes of the Node's internal collections, for tests
+// and monitoring. Every one of them is bounded.
+type Stats struct {
+	Calls, Outbox, LeaseOps         int
+	Ahead, Seeds, LeaseSeeds, Log   int
+	Subjects, Neighbors             int
+	Joins, Leaves, Suspects, Invals int
+	Unconfirmed, BadBase, ColdStart bool
+}
+
+// Stats returns the current collection sizes.
+func (n *Node) Stats() Stats {
+	j, l, s, i := n.ld.Pending()
+
+	return Stats{
+		Calls: len(n.calls), Outbox: len(n.outbox), LeaseOps: len(n.leaseOps),
+		Ahead: len(n.ahead), Seeds: len(n.seeds), LeaseSeeds: len(n.leaseSeeds), Log: n.log.Len(),
+		Subjects: len(n.subjects), Neighbors: len(n.neighbors),
+		Joins: j, Leaves: l, Suspects: s, Invals: i,
+		Unconfirmed: n.unconfirmed, BadBase: n.badBase, ColdStart: n.coldStart,
 	}
 }
