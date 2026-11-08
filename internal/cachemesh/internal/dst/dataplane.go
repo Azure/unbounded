@@ -549,9 +549,18 @@ func (w *DataPlane) generate(step int64) {
 		return
 	}
 
-	for range n {
+	// While members are slow, clients pull harder (n extra requests), so
+	// that the requests a client sends to each neighbor between health
+	// re-probes (a Degraded peer is retried once its EWMA decays, about
+	// every 20s) outnumber the re-probes and protection is measurable.
+	extra := int64(0)
+	if w.slowActive() {
+		extra = n
+	}
+
+	for k := range n + extra {
 		origin := live[w.rng.IntN(len(live))]
-		if len(w.clients) > 0 && w.rng.IntN(2) == 0 {
+		if len(w.clients) > 0 && (k >= n || w.rng.IntN(2) == 0) {
 			origin = w.clients[w.rng.IntN(len(w.clients))]
 		}
 
@@ -570,6 +579,19 @@ func (w *DataPlane) generate(step int64) {
 
 		w.c.Sim.After(at, func() { w.issue(origin, seed, ttl, k, false) })
 	}
+}
+
+// slowActive reports whether a slow-member fault is active.
+func (w *DataPlane) slowActive() bool {
+	now := w.c.Sim.Now()
+
+	for _, f := range w.c.sc.Faults {
+		if f.Kind == SlowMembers && f.Start <= now && now < f.End() {
+			return true
+		}
+	}
+
+	return false
 }
 
 // burst sends a herd of requests for the hottest blob.
@@ -1388,6 +1410,15 @@ func (w *DataPlane) checkStamps() {
 			if !fresh {
 				w.cov.expired.Hit()
 
+				continue
+			}
+
+			// The bound holds on members of their view, which hear the
+			// leader's heartbeats. A non-member may have anchored its
+			// epoch from a stale lineage's snapshot (for example a
+			// restarted process that caught up from a partitioned peer)
+			// and lags until it hears the leader.
+			if !st.Member() {
 				continue
 			}
 
