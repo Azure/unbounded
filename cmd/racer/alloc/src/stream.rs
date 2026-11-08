@@ -35,6 +35,25 @@ pub fn copy_streaming(dst: &mut [u8], src: &[u8]) {
     dst.copy_from_slice(src);
 }
 
+/// Copy `src` into `dst` (equal lengths) with non-temporal stores at any
+/// size. For chunked passes whose chunks are each below
+/// [`STREAM_THRESHOLD`] but whose total is not. Falls back to
+/// `copy_from_slice` off x86-64.
+///
+/// # Panics
+/// When the lengths differ, like [`slice::copy_from_slice`].
+pub fn copy_nontemporal(dst: &mut [u8], src: &[u8]) {
+    assert_eq!(dst.len(), src.len(), "copy_nontemporal length mismatch");
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    {
+        // SAFETY: equal-length live slices; `dst` is exclusive so they do not
+        // overlap.
+        unsafe { x86::copy(dst, src) };
+    }
+    #[cfg(not(all(target_arch = "x86_64", not(miri))))]
+    dst.copy_from_slice(src);
+}
+
 /// Zero `bytes` with non-temporal stores when large. Returns `false` without
 /// touching `bytes` when it is too small or the target has no streaming
 /// path, so the caller can use its own fill.
@@ -151,6 +170,20 @@ mod tests {
                     &src[shift..],
                     "len {len} shift {shift}"
                 );
+                assert!(dst[..shift].iter().all(|&b| b == 0));
+                assert!(dst[shift + len..].iter().all(|&b| b == 0));
+            }
+        }
+    }
+
+    #[test]
+    fn copy_nontemporal_matches_for_small_and_unaligned_lengths() {
+        for len in [0, 1, 15, 17, 4096 + 3, 128 << 10] {
+            for shift in [0, 1, 15] {
+                let src = pattern(len + shift);
+                let mut dst = vec![0u8; len + 32];
+                copy_nontemporal(&mut dst[shift..shift + len], &src[shift..]);
+                assert_eq!(&dst[shift..shift + len], &src[shift..]);
                 assert!(dst[..shift].iter().all(|&b| b == 0));
                 assert!(dst[shift + len..].iter().all(|&b| b == 0));
             }
