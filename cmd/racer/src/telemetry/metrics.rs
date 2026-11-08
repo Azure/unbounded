@@ -343,6 +343,15 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::RdmaGrantWaits => "racer_rdma_grant_waits_total",
             Self::RdmaGrantWaitGranted => "racer_rdma_grant_wait_granted_total",
             Self::RdmaGrantBackpressure => "racer_rdma_grant_backpressure_total",
+            Self::RdmaBreakerTripLinkDown => "racer_rdma_breaker_trips_total" { "reason=\"link_down\"" },
+            Self::RdmaBreakerTripGrant => "racer_rdma_breaker_trips_total" { "reason=\"grant\"" },
+            Self::RdmaBreakerTripSend => "racer_rdma_breaker_trips_total" { "reason=\"send\"" },
+            Self::RdmaBreakerTripTimeout => "racer_rdma_breaker_trips_total" { "reason=\"timeout\"" },
+            Self::RdmaBreakerTripSlowFallback => "racer_rdma_breaker_trips_total" { "reason=\"slow_fallback\"" },
+            Self::RdmaBreakerTripSetup => "racer_rdma_breaker_trips_total" { "reason=\"setup\"" },
+            Self::RdmaBreakerClose => "racer_rdma_breaker_closes_total",
+            Self::RdmaBreakerHttp => "racer_rdma_breaker_http_total",
+            Self::RdmaPageTimeout => "racer_rdma_page_timeouts_total",
             Self::PeerConnectLocalExhausted => "racer_peer_connect_local_exhausted_total",
             Self::PeerReceiveCiphertextWaits => "racer_peer_receive_ciphertext_waits_total",
             Self::PeerReceiveCiphertextWaitGranted => "racer_peer_receive_ciphertext_wait_granted_total",
@@ -514,6 +523,7 @@ metrics! { Gauge, GAUGES, GAUGE_COUNT;
             Self::RdmaLinksConnecting => "racer_rdma_links_connecting",
             Self::RdmaLinksBackoff => "racer_rdma_links_backoff",
             Self::RdmaLinksBreaking => "racer_rdma_links_breaking",
+            Self::RdmaBreakerOpen => "racer_rdma_breaker_open",
             Self::RdmaGrantWaiters => "racer_rdma_grant_waiters",
             Self::RdmaWaitingDevice => "racer_rdma_reactivation_waiting_device",
             Self::RdmaWaitingDrain => "racer_rdma_reactivation_waiting_drain",
@@ -2129,6 +2139,7 @@ mod tests {
                     line.contains('{')
                         && !line.starts_with("racer_gpu_read_requests_total{")
                         && !line.starts_with("racer_rdma_link_breaks_total{")
+                        && !line.starts_with("racer_rdma_breaker_trips_total{")
                         && !line.starts_with("racer_peer_connection_closes_total{")
                         && !line.starts_with("racer_rdma_link_setups_total{")
                         && !line.starts_with("racer_rdma_plan_http_total{")
