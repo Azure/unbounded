@@ -541,7 +541,8 @@ Implementation notes (`node` package):
 - `Routed` messages are relayed straight to the leader address the relay
   knows (from its view, the Lease, or a `Pong` hint) rather than hop by hop
   over the grid; `TTL` (4) bounds relay chains while leaders change.
-- A member with no `Config.Seeds` issues one cached Lease read at start. If
+- A member with no `Config.Seeds` issues one cached Lease read at start. Until it is answered the elector is held as a follower, so a starting
+  member makes exactly one Lease call. If
   it finds no live holder it bootstraps: it acts as a candidate until it has
   a view. A member without a view that wins the Lease any other way (a
   lottery) releases it instead of publishing a second genesis.

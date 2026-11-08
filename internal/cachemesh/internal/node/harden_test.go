@@ -522,3 +522,20 @@ func TestSeedsBounded(t *testing.T) {
 		t.Fatalf("%d seeds", s)
 	}
 }
+
+// TestJoinerSingleLeaseRead: a starting member without seeds issues its own
+// cached Lease read and nothing else until that read is answered.
+func TestJoinerSingleLeaseRead(t *testing.T) {
+	n := New(Config{ID: "j", Incarnation: 1, Addr: "j:1", PartitionBits: 8}, rand.New(rand.NewPCG(1, 1)))
+	n.Start(sec, time.Unix(1, 0))
+
+	ops := len(n.LeaseOps())
+	for i := range 20 {
+		n.Tick(int64(i+2)*sec, time.Unix(int64(i+2), 0))
+		ops += len(n.LeaseOps())
+	}
+
+	if ops != 1 {
+		t.Fatalf("%d Lease ops before the first read returned", ops)
+	}
+}

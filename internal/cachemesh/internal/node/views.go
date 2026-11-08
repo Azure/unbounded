@@ -738,6 +738,13 @@ func (n *Node) electInput(now int64, wall time.Time) elect.Input {
 		in.HaveView, in.LeaderHeardAt = true, now
 	}
 
+	// Likewise while this member's own Lease read is outstanding: its
+	// result decides whether to join, bootstrap, or cold start, and a
+	// lottery read in the meantime would only duplicate it.
+	if !n.isMember() && n.ownReadSeq != 0 && !n.ownReadDone && !n.bootstrapper && !n.coldStart && !n.leading {
+		in.HaveView, in.LeaderHeardAt = true, now
+	}
+
 	return in
 }
 
