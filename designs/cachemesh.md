@@ -384,8 +384,9 @@ Envoy and gRPC A50:
 
 Implementation notes (`health` package): the per-tracker slot index is a small
 copy-on-write open-addressing table, so memory is O(tracked peers), not
-O(max slot); `Sync` and `TrackMany` apply a whole neighbor set with one
-rebuild. Untracked slots are `Healthy`. Breaker ejections triggered by
+O(max slot); `Sync` replaces the tracked set with one rebuild (the node calls
+it on every neighbor change) and `TrackMany` adds a batch the same way.
+Untracked slots are `Healthy`. Breaker ejections triggered by
 `Observe` take effect immediately but are timed (and jittered) at the next
 `Tick`, so the random source stays on the control path. At least one peer may
 always be ejected regardless of `MaxEjectionPercent`; the limit counters are
@@ -413,8 +414,10 @@ the monitor sends `Suspect` to the leader, repeated every `SuspectRefresh`
 (5s) while it persists.
 
 The leader removes a member once observers from at least `ObserverCells` (3,
-clamped to the number of distinct observer cells that exist) distinct cells
-have reported it within `SuspicionWindow` (30s). Removals are capped at
+clamped to the number of distinct cells of its observers that are not
+themselves suspected) distinct cells have reported it within
+`SuspicionWindow` (30s). Excluding suspected observers lets the leader remove
+two failed members that observe each other. Removals are capped at
 `max(1, N/1000)` per tick; if more than `DampingFraction` (10%) of members are
 suspected at once, the cap drops to `max(1, N/10000)` per tick so a partition
 cannot empty the cluster quickly.
@@ -741,7 +744,20 @@ handoff, panic, hedge, lottery, damping, and so on), and the suite fails if a
 registered state is never reached across the default seed set.
 
 Default `go test` runs a seed set that finishes in about a minute and includes
-a 10k-member cluster. `CACHEMESH_DST_SEEDS`, `CACHEMESH_DST_SEED`, and
+a 10k-member cluster.
+
+Implementation notes (control-plane suite, `dst.Cluster` and
+`suite_test.go`): each member is a `node.Node` with its own `dst.Clock`,
+ticked at its `NextDeadline`; outbox calls go through `Net.Call` and Lease
+operations through `LeaseServer.Submit`. Large clusters start from a view
+prebuilt by running the leader logic offline (`node.Config.Initial`), so the
+first leader is elected over an existing view. The default set is 16 tiny
+and 4 small generated scenarios (each run twice and trace-compared), one
+1,000-member and one 10,000-member scenario; only every fourth tiny/small
+seed keeps `PartitionBits` 20, the rest use 16 to bound runtime. The lease
+budget checked in quiet periods (no fault within the last 90s) is 8
+operations per second. The data-plane workload plugs in through
+`dst.Workload`. `CACHEMESH_DST_SEEDS`, `CACHEMESH_DST_SEED`, and
 `CACHEMESH_DST_LARGE=1` (100k members) control longer runs.
 
 ## Defaults

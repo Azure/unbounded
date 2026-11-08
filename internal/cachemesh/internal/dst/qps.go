@@ -68,16 +68,16 @@ func (q *QPS) Record(now int64, kind elect.OpKind, member uint32) {
 
 	m.record(now)
 
-	sec := now / nsPerSec
+	second := now / nsPerSec
 	if len(q.series) == 0 {
-		q.first = sec
+		q.first = second
 	}
 
-	for q.first+int64(len(q.series)) <= sec {
+	for q.first+int64(len(q.series)) <= second {
 		q.series = append(q.series, 0)
 	}
 
-	if idx := sec - q.first; idx >= 0 {
+	if idx := second - q.first; idx >= 0 {
 		q.series[idx]++
 	}
 
