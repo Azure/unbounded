@@ -157,7 +157,10 @@ func TestDST(t *testing.T) {
 	total := NewCoverage()
 	total.Register(requiredCoverage...)
 
-	for _, c := range defaultCases(seeds, explicit) {
+	cases := defaultCases(seeds, explicit)
+	ran := 0
+
+	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			start := time.Now()
 			r := runCase(c)
@@ -174,6 +177,8 @@ func TestDST(t *testing.T) {
 
 			total.Merge(r.cov)
 
+			ran++
+
 			if c.twice {
 				if r2 := runCase(c); r2.trace != r.trace || r2.steps != r.steps {
 					t.Fatalf("nondeterministic: trace %x/%x steps %d/%d\nreplay: %s", r.trace, r2.trace, r.steps, r2.steps, ReplayCommand(c.sc.Seed))
@@ -182,7 +187,8 @@ func TestDST(t *testing.T) {
 		})
 	}
 
-	if !explicit && !t.Failed() {
+	// Coverage is judged only over the whole default set (not under -run).
+	if !explicit && !t.Failed() && ran == len(cases) {
 		if missing := total.Missing(); len(missing) > 0 {
 			t.Fatalf("coverage: never reached %v\n%s", missing, total.Report())
 		}
