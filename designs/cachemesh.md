@@ -389,15 +389,18 @@ cannot empty the cluster quickly.
 ### Messages
 
 Every control message carries the sender's `MemberRef{ID, Incarnation,
-Slot}`, `Version`, and `Epoch`. All are encoded by `internal/wire`.
+Slot}`, `Version`, `Digest`, `Epoch`, and the slot of the leader it knows
+(`NoSlot` if none). All are encoded by `internal/wire`. Every message is a
+request answered by one response; `Ack` and `Nack{Reason}` are the generic
+responses.
 
 | Message | Use |
 |---|---|
-| `Ping` / `Pong` | Monitoring, version anti-entropy. |
+| `Ping` / `Pong` | Monitoring, version anti-entropy. `Pong` may carry a leader address hint. |
 | `Broadcast{Delta, Level}` | Delta dissemination along the grid tree. |
-| `CatchUpRequest{Have, HaveDigest}` | Ask a peer for missed deltas. |
-| `CatchUpResponse{Deltas}` or `{Snapshot}` | Deltas from the peer's log if it holds `Have`, otherwise a snapshot. |
-| `Routed{Target, TTL, Payload}` | Relay a message to a member (usually the leader) hop by hop over the grid. |
+| `CatchUpRequest{Have, HaveDigest, MaxDeltas}` | Ask a peer for missed deltas. |
+| `CatchUpResponse{Deltas}` or `{Snapshot}` | Deltas from the peer's log if it holds `Have`, otherwise a snapshot; empty if the peer has nothing newer. |
+| `Routed{Origin, Target or ToLeader, TTL, Hops, Inner}` | Relay a message to a member (usually the leader) hop by hop over the grid. |
 | `Join{Member, PartitionBits}` | Ask to be admitted; sent to a seed, which wraps it in `Routed` to the leader. |
 | `Leave{Member}` | Graceful departure; routed to the leader. |
 | `Suspect{Target, Observer}` | Monitoring report; routed to the leader. |
