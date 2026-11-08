@@ -32,8 +32,10 @@
 //     Active members step through WarmupWeights every WarmupStep.
 //  5. Drains (Leave requests) and removal of members Draining for DrainFor.
 //  6. Suspicion removals: a member reported by observers (per
-//     view.Observers) in at least ObserverCells distinct cells (clamped to
-//     the cells that exist, view.ObserverCells) within SuspicionWindow.
+//     view.Observers) in at least ObserverCells distinct cells within
+//     SuspicionWindow, clamped to the distinct cells of its observers that
+//     are not themselves suspected (so failed members that observe each
+//     other are still removed).
 //     At most max(1, N/1000) per tick, or max(1, N/10000) when more than
 //     DampingFraction of the members are suspected.
 //  7. Cell balancing (SetCell, MaxCellMovesPerTick) or, when the shape
@@ -813,15 +815,18 @@ func (l *Leader) suspicions(st *state, now int64) {
 
 	slices.Sort(l.targets)
 
-	var (
-		due       []view.Slot
-		suspected int
-	)
+	// Pass 1: expire reports and collect the reporting observer cells of
+	// every suspected target.
+	type cand struct {
+		slot  view.Slot
+		cells []uint32
+	}
+
+	var cands []cand
 
 	for _, t := range l.targets {
 		s := l.suspects[t]
 
-		// Expire old reports.
 		s.reports = slices.DeleteFunc(s.reports, func(r report) bool { return now-r.at > window })
 		if len(s.reports) == 0 || !v.IsMember(t) || v.Key(t) != s.key || st.removed[t] {
 			delete(l.suspects, t)
@@ -843,17 +848,45 @@ func (l *Leader) suspicions(st *state, now int64) {
 			}
 		}
 
-		if len(cells) == 0 {
+		if len(cells) > 0 {
+			cands = append(cands, cand{slot: t, cells: cells})
+		}
+	}
+
+	isSuspected := func(s view.Slot) bool {
+		_, ok := slices.BinarySearchFunc(cands, s, func(c cand, x view.Slot) int { return int(c.slot) - int(x) })
+
+		return ok
+	}
+
+	// Pass 2: a target is due when observers in enough distinct cells
+	// reported it. Observers that are themselves suspected do not count
+	// towards the cells required, so two failed members that observe each
+	// other can still be removed.
+	var due []view.Slot
+
+	for _, c := range cands {
+		if c.slot == st.self {
 			continue
 		}
 
-		suspected++
+		l.obs = view.Observers(v, c.slot, l.obs[:0])
 
-		need := max(1, min(l.cfg.ObserverCells, view.ObserverCells(v, t)))
-		if len(cells) >= need && t != st.self {
-			due = append(due, t)
+		var healthy []uint32
+
+		for _, o := range l.obs {
+			if cell := v.Cell(o); !isSuspected(o) && !slices.Contains(healthy, cell) {
+				healthy = append(healthy, cell)
+			}
+		}
+
+		need := max(1, min(l.cfg.ObserverCells, len(healthy)))
+		if len(c.cells) >= need {
+			due = append(due, c.slot)
 		}
 	}
+
+	suspected := len(cands)
 
 	n := v.Len()
 	limit := max(1, n/1000)

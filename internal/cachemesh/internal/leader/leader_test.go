@@ -808,3 +808,61 @@ func BenchmarkTickIdle10k(b *testing.B)  { benchTick(b, 10000, false) }
 func BenchmarkTickIdle100k(b *testing.B) { benchTick(b, 100000, false) }
 func BenchmarkTickJoin10k(b *testing.B)  { benchTick(b, 10000, true) }
 func BenchmarkTickJoin100k(b *testing.B) { benchTick(b, 100000, true) }
+
+// TestSuspicionMutualObservers covers two failed members that observe each
+// other: the suspected observer's cell does not count towards the cells
+// required.
+func TestSuspicionMutualObservers(t *testing.T) {
+	h := grow(t, smallCfg("a"), 40)
+	v := h.v
+
+	cellsOf := func(slots []view.Slot) map[uint32]int {
+		m := map[uint32]int{}
+		for _, s := range slots {
+			m[v.Cell(s)]++
+		}
+
+		return m
+	}
+
+	for t1 := view.Slot(1); t1 < v.SlotCap(); t1++ {
+		obs := view.Observers(v, t1, nil)
+		cells := cellsOf(obs)
+
+		if len(cells) != DefaultObserverCells {
+			continue
+		}
+
+		for _, b := range obs {
+			if b == 0 || cells[v.Cell(b)] != 1 || v.Cell(b) == v.Cell(t1) {
+				continue
+			}
+
+			// b is suspected by one of its own observers (not t1).
+			for _, o := range view.Observers(v, b, nil) {
+				if o != t1 {
+					h.l.Suspect(h.now, b, v.Key(b), o)
+
+					break
+				}
+			}
+
+			for _, o := range obs {
+				if o != b {
+					h.l.Suspect(h.now, t1, v.Key(t1), o)
+				}
+			}
+
+			h.now += sec
+			h.tick(0)
+
+			if h.v.IsMember(t1) {
+				t.Fatalf("slot %d not removed with its suspected observer %d excluded", t1, b)
+			}
+
+			return
+		}
+	}
+
+	t.Skip("no suitable target in this view")
+}
