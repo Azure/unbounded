@@ -416,8 +416,21 @@ fn receive_hold_is_recorded_once_the_buffer_returns_to_the_pool() {
     drop(detached);
 }
 
+/// A random page key, fixed for the test thread so a sealed page and the
+/// key a decrypt job derives from it agree.
+fn page_key() -> [u8; 32] {
+    thread_local! {
+        static KEY: [u8; 32] = {
+            let mut key = [0; 32];
+            getrandom::getrandom(&mut key).unwrap();
+            key
+        };
+    }
+    KEY.with(|key| *key)
+}
+
 /// A real sealed 3-byte page with the same envelope as the bundle, keyed with
-/// `[9; 32]`, as aligned pooled storage. Returns it and its plaintext.
+/// `page_key()`, as aligned pooled storage. Returns it and its plaintext.
 fn really_sealed(
     pool: &BufferPool,
     admission: &Rc<flow_control::Quotas<AdmissionPolicy>>,
@@ -426,7 +439,7 @@ fn really_sealed(
     let envelope = page.ciphertext.envelope().clone();
     let aad = crate::security::page_aad(&envelope).unwrap();
     let mut sealed = vec![0u8; 3 + racer_crypto::TAG_LEN];
-    racer_crypto::seal(&[9; 32], &envelope.nonce.0, &aad, b"abc", &mut sealed).unwrap();
+    racer_crypto::seal(&page_key(), &envelope.nonce.0, &aad, b"abc", &mut sealed).unwrap();
     let mut buffer = pool
         .encryption_output(
             admission
@@ -489,7 +502,7 @@ fn fused_job(
     let mut result = page.clone();
     result.ciphertext = ciphertext;
     let mut sealed = crate::read::sealed::tests::sealed(&result);
-    sealed.key = racer_crypto::xaes_derive(&[9; 32], &sealed.envelope.nonce.0);
+    sealed.key = racer_crypto::xaes_derive(&page_key(), &sealed.envelope.nonce.0);
     if let Some(aad) = aad {
         sealed.aad = aad;
     }
