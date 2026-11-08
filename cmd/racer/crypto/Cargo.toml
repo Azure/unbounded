@@ -44,3 +44,6 @@ ghash = { version = "0.6", features = ["zeroize"] }
 ring = "0.17"
 xaes-256-gcm = { version = "0.1", default-features = false, features = ["zeroize"] }
 futures = "0.3"
+# NUMA binding and the production non-temporal copy for the fused_numa bench.
+libc = "0.2"
+page-alloc = { path = "../alloc" }
