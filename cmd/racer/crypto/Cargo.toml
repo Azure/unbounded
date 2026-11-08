@@ -25,6 +25,9 @@ aes = { version = "0.9", features = ["zeroize"] }
 # straight from the ciphertext buffer into its destination. The default cc
 # builder needs only a C compiler: no cmake, bindgen, Go, or FIPS module.
 aws-lc-rs = { version = "1.19", default-features = false, features = ["aws-lc-sys"] }
+# Streaming AES-256-GCM (EVP) for the fused copy-and-open; the same library
+# aws-lc-rs links, with the same features.
+aws-lc-sys = { version = "0.47", default-features = false }
 # Wipe the buffered stream cipher wrapper as well as the ChaCha20 core.
 cipher = { version = "0.5", features = ["zeroize"] }
 # chacha20poly1305/zeroize does not forward Poly1305 state wiping.

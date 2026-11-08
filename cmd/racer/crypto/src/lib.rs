@@ -14,13 +14,17 @@
 //! epoch/cache state-space tests remain here. Tests do not establish timing or
 //! secret-erasure guarantees. Run `cargo test -p racer-crypto` from the workspace.
 
-// `deny` rather than `forbid` so the single SIMD GHASH module can opt in with a
-// scoped `allow`; every other module still rejects `unsafe`.
+// `deny` rather than `forbid` so the SIMD GHASH module and the aws-lc EVP FFI
+// in `fused` can opt in with a scoped `allow`; every other module still
+// rejects `unsafe`.
 #![deny(unsafe_code)]
 #![deny(missing_docs)]
 
+mod fused;
 #[cfg(target_arch = "x86_64")]
 mod ghash_x86;
+
+pub use fused::{FUSED_CHUNK, FusedOutput};
 
 use chacha20poly1305::{
     KeyInit, Tag, XChaCha20Poly1305,
@@ -531,6 +535,37 @@ impl DerivedPageKey {
             out.fill(0);
         }
         result
+    }
+
+    /// Copy `sealed` (ciphertext body then 16-byte tag) into `store` and
+    /// authenticate and decrypt it into `output` in one pass, `chunk` bytes
+    /// at a time. Each chunk is handed to `copy(destination, source)` for the
+    /// store before it is decrypted, so the decrypt reads it from cache; the
+    /// copy function may use non-temporal stores. [`FusedOutput::Scratch`]
+    /// also routes plaintext through `copy`.
+    ///
+    /// Produces exactly what [`Self::open_into`] produces. On any failure,
+    /// including a bad length or tag, the plaintext destination is zeroed and
+    /// `store` holds unauthenticated bytes the caller must discard.
+    pub fn open_copy_into(
+        &self,
+        aad: &[u8],
+        sealed: &[u8],
+        store: &mut [u8],
+        output: FusedOutput<'_>,
+        chunk: usize,
+        copy: &mut dyn FnMut(&mut [u8], &[u8]),
+    ) -> Result<(), Error> {
+        fused::open_copy_into(
+            &self.key,
+            &self.nonce,
+            aad,
+            sealed,
+            store,
+            output,
+            chunk,
+            copy,
+        )
     }
 
     fn gcm_nonce(&self) -> aws_lc_rs::aead::Nonce {

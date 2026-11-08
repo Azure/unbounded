@@ -1724,3 +1724,345 @@ fn page_open_bench() {
         },
     );
 }
+
+fn fused_fixture(length: usize, aad: &[u8]) -> ([u8; 32], [u8; 24], Vec<u8>, Vec<u8>) {
+    let key = test_vector([7; 32]);
+    let nonce = test_vector([8; 24]);
+    let plaintext: Vec<u8> = (0..length).map(|i| (i * 13 + 5) as u8).collect();
+    let mut sealed = vec![0; length + TAG_LEN];
+    seal(&key, &nonce, aad, &plaintext, &mut sealed).unwrap();
+    (key, nonce, plaintext, sealed)
+}
+
+fn plain_copy(dst: &mut [u8], src: &[u8]) {
+    dst.copy_from_slice(src);
+}
+
+/// The fused copy-and-open matches the one-shot `open` and `open_into` for
+/// every chunk size, including ones not aligned to the 16-byte AES block,
+/// and copies the sealed bytes, tag included, into the store.
+#[test]
+fn open_copy_into_interoperates_with_one_shot_open() {
+    for length in [0usize, 1, 15, 16, 17, 1000, 70_001] {
+        for aad in [&b""[..], b"page aad"] {
+            let (key, nonce, plaintext, sealed) = fused_fixture(length, aad);
+            let derived = racer_crypto::xaes_derive(&key, &nonce);
+            let mut one_shot = vec![0u8; length];
+            open(&key, &nonce, aad, &sealed, &mut one_shot).unwrap();
+            assert_eq!(one_shot, plaintext);
+            for chunk in [1usize, 7, 16, 17, 100, 4097, 65_536, 1 << 20] {
+                let mut store = vec![0xaa; sealed.len()];
+                let mut out = vec![0x55; length];
+                derived
+                    .open_copy_into(
+                        aad,
+                        &sealed,
+                        &mut store,
+                        racer_crypto::FusedOutput::Whole(&mut out),
+                        chunk,
+                        &mut plain_copy,
+                    )
+                    .unwrap();
+                assert_eq!(out, plaintext, "length {length} chunk {chunk}");
+                assert_eq!(store, sealed, "length {length} chunk {chunk}");
+                let mut whole = vec![0x55; length];
+                let mut store = vec![0; sealed.len()];
+                derived
+                    .open_copy_into(
+                        aad,
+                        &sealed,
+                        &mut store,
+                        racer_crypto::FusedOutput::Scratch {
+                            out: &mut whole,
+                            start: 0,
+                        },
+                        chunk,
+                        &mut plain_copy,
+                    )
+                    .unwrap();
+                assert_eq!(whole, plaintext);
+                assert_eq!(store, sealed);
+            }
+        }
+    }
+}
+
+/// Scratch output writes only the requested plaintext range, across chunk
+/// boundaries.
+#[test]
+fn open_copy_into_scratch_writes_partial_ranges() {
+    let length = 10_000;
+    let (key, nonce, plaintext, sealed) = fused_fixture(length, b"aad");
+    let derived = racer_crypto::xaes_derive(&key, &nonce);
+    for (start, end) in [(0, 1), (3, 4099), (4096, 8192), (9_999, 10_000), (1, 9_999)] {
+        for chunk in [16usize, 17, 4096, 20_000] {
+            let mut store = vec![0; sealed.len()];
+            let mut out = vec![0; end - start];
+            derived
+                .open_copy_into(
+                    b"aad",
+                    &sealed,
+                    &mut store,
+                    racer_crypto::FusedOutput::Scratch {
+                        out: &mut out,
+                        start,
+                    },
+                    chunk,
+                    &mut plain_copy,
+                )
+                .unwrap();
+            assert_eq!(out, plaintext[start..end], "{start}..{end} chunk {chunk}");
+            assert_eq!(store, sealed);
+        }
+    }
+    // A range past the plaintext is rejected and the destination zeroed.
+    let mut store = vec![0; sealed.len()];
+    let mut out = vec![1; 2];
+    assert!(
+        derived
+            .open_copy_into(
+                b"aad",
+                &sealed,
+                &mut store,
+                racer_crypto::FusedOutput::Scratch {
+                    out: &mut out,
+                    start: length - 1,
+                },
+                64,
+                &mut plain_copy,
+            )
+            .is_err()
+    );
+    assert_eq!(out, [0, 0]);
+}
+
+/// A tampered body, tag, or AAD, or a wrong length, fails and zeroes the
+/// destination in both output modes.
+#[test]
+fn open_copy_into_rejects_tampering_and_zeroes_output() {
+    let length = 5_000;
+    let (key, nonce, _, sealed) = fused_fixture(length, b"aad");
+    let derived = racer_crypto::xaes_derive(&key, &nonce);
+    let mut cases: Vec<(Vec<u8>, &[u8])> = Vec::new();
+    for index in [0, 17, length - 1, length, length + TAG_LEN - 1] {
+        let mut bad = sealed.clone();
+        bad[index] ^= 1;
+        cases.push((bad, b"aad"));
+    }
+    cases.push((sealed.clone(), b"aaD"));
+    cases.push((sealed[..TAG_LEN - 1].to_vec(), b"aad"));
+    for (bad, aad) in &cases {
+        let body = bad.len().saturating_sub(TAG_LEN);
+        for chunk in [16usize, 33, 1 << 16] {
+            let mut store = vec![0; bad.len()];
+            let mut out = vec![0x77; body];
+            assert!(
+                derived
+                    .open_copy_into(
+                        aad,
+                        bad,
+                        &mut store,
+                        racer_crypto::FusedOutput::Whole(&mut out),
+                        chunk,
+                        &mut plain_copy,
+                    )
+                    .is_err()
+            );
+            assert!(out.iter().all(|b| *b == 0));
+            let mut out = vec![0x77; body.min(100)];
+            let mut store = vec![0; bad.len()];
+            assert!(
+                derived
+                    .open_copy_into(
+                        aad,
+                        bad,
+                        &mut store,
+                        racer_crypto::FusedOutput::Scratch {
+                            out: &mut out,
+                            start: 0,
+                        },
+                        chunk,
+                        &mut plain_copy,
+                    )
+                    .is_err()
+            );
+            assert!(out.iter().all(|b| *b == 0));
+        }
+    }
+    // Mismatched store, output length, or a zero chunk fail too.
+    let mut out = vec![0x77; length];
+    let mut short = vec![0; sealed.len() - 1];
+    fn whole(out: &mut [u8]) -> racer_crypto::FusedOutput<'_> {
+        racer_crypto::FusedOutput::Whole(out)
+    }
+    assert!(
+        derived
+            .open_copy_into(
+                b"aad",
+                &sealed,
+                &mut short,
+                whole(&mut out),
+                64,
+                &mut plain_copy
+            )
+            .is_err()
+    );
+    let mut store = vec![0; sealed.len()];
+    assert!(
+        derived
+            .open_copy_into(
+                b"aad",
+                &sealed,
+                &mut store,
+                whole(&mut out),
+                0,
+                &mut plain_copy
+            )
+            .is_err()
+    );
+    let mut long = vec![0x77; length + 1];
+    assert!(
+        derived
+            .open_copy_into(
+                b"aad",
+                &sealed,
+                &mut store,
+                whole(&mut long),
+                64,
+                &mut plain_copy
+            )
+            .is_err()
+    );
+    assert!(long.iter().all(|b| *b == 0));
+}
+
+/// Per-page cost of the current receive path (full-page copy into the
+/// ciphertext store, then out-of-place open into the destination) against the
+/// fused chunked copy-and-open, on one thread and on many threads over a
+/// working set larger than the last-level cache so DRAM bandwidth shows.
+/// `RACER_FUSED_THREADS` overrides the parallel thread count (default: all
+/// CPUs); `RACER_FUSED_PAGES` the pages per thread (default 4).
+/// `cargo test -p racer-crypto --release --test primitives -- --ignored fused_open_bench --nocapture`.
+#[test]
+#[ignore = "benchmark"]
+fn fused_open_bench() {
+    const PAGE: usize = 16 << 20;
+    let env = |name: &str, default: usize| {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    };
+    let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let threads = env("RACER_FUSED_THREADS", cpus);
+    let pages = env("RACER_FUSED_PAGES", 4);
+    let (key, nonce, plaintext, sealed) = fused_fixture(PAGE, b"bench aad");
+    let derived = racer_crypto::xaes_derive(&key, &nonce);
+    // Copies into the store use non-temporal stores, like the store's
+    // `copy_streaming`.
+    type Path = fn(&racer_crypto::DerivedPageKey, &[u8], &mut [u8], &mut [u8]);
+    let paths: [(&str, Path); 5] = [
+        ("current: stream copy + open_into", |k, s, store, out| {
+            nt_copy(store, s);
+            let (body, tag) = store.split_at(PAGE);
+            k.open_into(b"bench aad", body, tag, out).unwrap();
+        }),
+        ("fused 64 KiB, direct", |k, s, store, out| {
+            fused(k, s, store, out, 64 << 10, false)
+        }),
+        ("fused 128 KiB, direct", |k, s, store, out| {
+            fused(k, s, store, out, 128 << 10, false)
+        }),
+        ("fused 256 KiB, direct", |k, s, store, out| {
+            fused(k, s, store, out, 256 << 10, false)
+        }),
+        ("fused 128 KiB, scratch + NT", |k, s, store, out| {
+            fused(k, s, store, out, 128 << 10, true)
+        }),
+    ];
+    fn fused(
+        k: &racer_crypto::DerivedPageKey,
+        s: &[u8],
+        store: &mut [u8],
+        out: &mut [u8],
+        chunk: usize,
+        scratch: bool,
+    ) {
+        let output = if scratch {
+            racer_crypto::FusedOutput::Scratch { out, start: 0 }
+        } else {
+            racer_crypto::FusedOutput::Whole(out)
+        };
+        k.open_copy_into(b"bench aad", s, store, output, chunk, &mut |d, s| {
+            nt_copy(d, s)
+        })
+        .unwrap();
+    }
+    for (label, path) in paths {
+        for parallel in [1, threads] {
+            let elapsed = std::thread::scope(|scope| {
+                let workers: Vec<_> = (0..parallel)
+                    .map(|_| {
+                        let (derived, sealed) = (&derived, &sealed);
+                        scope.spawn(move || {
+                            let mut sources = vec![sealed.clone(); pages];
+                            let mut stores = vec![vec![0u8; PAGE + TAG_LEN]; pages];
+                            let mut outs = vec![vec![0u8; PAGE]; pages];
+                            for i in 0..pages {
+                                path(derived, &sources[i], &mut stores[i], &mut outs[i]);
+                            }
+                            let start = std::time::Instant::now();
+                            for _ in 0..2 {
+                                for i in 0..pages {
+                                    let source = std::mem::take(&mut sources[i]);
+                                    path(derived, &source, &mut stores[i], &mut outs[i]);
+                                    sources[i] = source;
+                                }
+                            }
+                            let elapsed = start.elapsed();
+                            (elapsed, outs.swap_remove(0))
+                        })
+                    })
+                    .collect();
+                let mut total = std::time::Duration::ZERO;
+                for worker in workers {
+                    let (elapsed, out) = worker.join().unwrap();
+                    assert!(out == plaintext);
+                    total = total.max(elapsed);
+                }
+                total
+            });
+            let count = parallel * pages * 2;
+            let seconds = elapsed.as_secs_f64();
+            println!(
+                "{label} x{parallel}: {:.3} ms/page/thread, {:.2} GB/s aggregate",
+                seconds * 1e3 / (pages * 2) as f64,
+                (count * PAGE) as f64 / seconds / 1e9
+            );
+        }
+    }
+}
+
+/// Non-temporal copy for the benchmark, mirroring `page_alloc::stream`.
+fn nt_copy(dst: &mut [u8], src: &[u8]) {
+    assert_eq!(dst.len(), src.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        use core::arch::x86_64::{__m128i, _mm_loadu_si128, _mm_sfence, _mm_stream_si128};
+        let lead = dst.as_ptr().align_offset(16).min(dst.len());
+        dst[..lead].copy_from_slice(&src[..lead]);
+        let body = (dst.len() - lead) / 16 * 16;
+        // SAFETY: in-bounds 16-byte lanes; destination lanes are aligned.
+        unsafe {
+            let d = dst.as_mut_ptr().add(lead);
+            let s = src.as_ptr().add(lead);
+            for o in (0..body).step_by(16) {
+                _mm_stream_si128(d.add(o).cast::<__m128i>(), _mm_loadu_si128(s.add(o).cast()));
+            }
+            _mm_sfence();
+        }
+        dst[lead + body..].copy_from_slice(&src[lead + body..]);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    dst.copy_from_slice(src);
+}

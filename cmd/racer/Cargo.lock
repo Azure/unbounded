@@ -994,6 +994,7 @@ version = "0.1.0"
 dependencies = [
  "aes",
  "aws-lc-rs",
+ "aws-lc-sys",
  "base64",
  "chacha20poly1305",
  "cipher",
