@@ -145,10 +145,15 @@ func (n *Node) setView(now int64, nv *view.View) {
 		n.seeds = n.seeds[:0] // no longer needed
 	case n.joined && n.leaving:
 		n.left = true
-	case n.joined && len(n.seeds) == 0:
-		// Removed (for example after a partition): rejoin through members
-		// of the last view.
-		n.event("rejoin")
+	default:
+		// Not a member: join (or rejoin after a removal, for example after
+		// a partition) through the leader and members of the newest view,
+		// since configured seeds may have gone away.
+		if n.joined && len(n.seeds) == 0 {
+			n.event("rejoin")
+			n.nextJoin = n.now
+		}
+
 		n.seedsFromView()
 	}
 
@@ -738,25 +743,42 @@ func (n *Node) tickElector(now int64, wall time.Time) {
 
 	n.leaseOps = append(n.leaseOps, n.el.Tick(n.electInput(now, wall))...)
 	n.electEvents(now)
+
+	// The Lease names a leader of a later term than our view (for example
+	// after a partition healed into two lineages): catch up from it. This
+	// costs no API calls; the elector already read the Lease.
+	if li, ok := n.el.Leader(); ok && !n.leading && li.Term > n.v.Term() && li.Addr != "" && li.Addr != n.cfg.Addr {
+		n.event("lease-newer-term")
+		n.catchUp(now, li.Addr, false)
+	}
 }
 
 // seedsFromView uses the leader and a few random members of the current
 // view as join seeds.
 func (n *Node) seedsFromView() {
-	if a := n.addrOf(n.v.Leader()); a != "" && a != n.cfg.Addr {
+	add := func(a string) {
+		if a == "" || a == n.cfg.Addr || slices.Contains(n.seeds, a) {
+			return
+		}
+
+		if len(n.seeds) >= maxSeeds {
+			n.seeds = slices.Delete(n.seeds, 0, 1)
+		}
+
 		n.seeds = append(n.seeds, a)
 	}
 
+	add(n.addrOf(n.v.Leader()))
+
 	if c := n.v.SlotCap(); c > 0 {
-		for range 8 {
-			if a := n.addrOf(view.Slot(n.rng.Uint32N(c))); a != "" && a != n.cfg.Addr && !slices.Contains(n.seeds, a) {
-				n.seeds = append(n.seeds, a)
-			}
+		for range 4 {
+			add(n.addrOf(view.Slot(n.rng.Uint32N(c))))
 		}
 	}
-
-	n.nextJoin = n.now
 }
+
+// maxSeeds bounds the join seed list.
+const maxSeeds = 32
 
 // pickSeeds chooses up to elect.MaxSeeds random member addresses for the
 // Lease.

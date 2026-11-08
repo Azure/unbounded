@@ -655,11 +655,20 @@ func (n *Node) sendJoin(now int64) {
 		return
 	}
 
-	n.toLeader(now, seed, &j)
+	// Send the join straight to the leader when the newest view names one.
+	to := seed
+	if l := n.v.Leader(); l != view.NoSlot {
+		if a := n.addrOf(l); a != "" && a != n.cfg.Addr {
+			to = a
+		}
+	}
+
+	n.toLeader(now, to, &j)
 	n.catchUp(now, seed, true)
 	n.event("join-sent")
 
-	if len(n.cfg.Seeds) == 0 && n.joinTries%16 == 15 {
+	// Seeds may all be gone: refresh them from the Lease now and then.
+	if n.joinTries%16 == 15 {
 		n.rereadLease()
 	}
 }
