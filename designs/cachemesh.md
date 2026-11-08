@@ -448,7 +448,7 @@ Each member monitors a small, fixed set of subjects:
   occupancy, equals this member's rank modulo the same occupancy.
 
 So each member has about `CellSize - 1 + 2D` observers spread over up to
-`2D + 1` cells. Monitors ping each subject every `MonitorInterval` (2s) with
+`2D + 1` cells. Monitors ping each subject every `PingInterval` (2s) with
 `PingTimeout` (1s); the ping also carries the sender's version and epoch, so
 it doubles as anti-entropy. After `SuspectAfter` (3) consecutive failed pings
 the monitor sends `Suspect` to the leader, repeated every `SuspectRefresh`
@@ -459,7 +459,7 @@ clamped to the number of distinct cells of its observers that are not
 themselves suspected) distinct cells have reported it within
 `SuspicionWindow` (30s). Excluding suspected observers lets the leader remove
 two failed members that observe each other. Removals are capped at
-`max(1, N/1000)` per tick; if more than `DampingFraction` (10%) of members are
+`max(1, N/1000)` per tick; if more than `DampingPercent` (10%) of members are
 suspected at once, the cap drops to `max(1, N/10000)` per tick so a partition
 cannot empty the cluster quickly.
 
@@ -883,8 +883,10 @@ Runtime (`Mesh`):
   is reported as a removal of the old peer and an addition of the new one.
   Events are queued and delivered in order by one goroutine, never under
   the Mesh lock. `OnView` and `OnLeadership` hooks go through the same
-  queue (consecutive view events coalesce), so every hook may call Mesh
-  methods. `OnControlError` runs on the failed call's goroutine and
+  queue, so every hook may call Mesh methods. The queue is bounded: since
+  the last leadership event it holds at most one neighbor event, the net
+  change since the last delivered call (a peer added and removed again
+  meanwhile is never reported), and one view event, the latest, after it. `OnControlError` runs on the failed call's goroutine and
   `OnLeaseError` on the Lease goroutine, neither under the lock.
 - `ServeControl` rejects messages over `MaxControlMessageSize`
   (`wire.MaxMessageSize`) with `ErrMessageTooLarge`; other malformed input
@@ -1100,10 +1102,12 @@ Implementation notes (data-plane workload, `dst.DataPlane` in
 
 - Routing state: each running member routes with its own `route.State`
   over a `route.Env` holding its node's `Health()` and `Epoch()` trackers,
-  its own `route.Notes`, its configured seeds as gateways, and its ID and
-  incarnation. The state is rebuilt (O(1)) when the member's view pointer
-  or slot changed; members not in their view route through their seeds or
-  `Direct`.
+  its own `route.Notes`, its node's join seeds (`node.Node.Seeds`: configured,
+  learned from the Lease and from views, other than its own address) as
+  gateways, and its ID and incarnation, as `Mesh` does. The state is rebuilt
+  (O(1)) when the member's view pointer or slot changed, and the `Env` too
+  when a non-member's seed list changed; members not in their view route
+  through those seeds or `Direct`.
 - Requests: keys come from `KeyGen` (blobs and striped layers with TTL 0,
   metadata in the keyspaces `meta/0` to `meta/3` with TTL 5m, Zipf 1.1).
   The cluster-wide rate is the member count clamped to 20..120 per second
@@ -1233,8 +1237,8 @@ median stays high until it observes its peers again.
 | `MaxMovesPerTick` | 4096 |
 | `MaxCellMovesPerTick` | 32 |
 | `HandoffEpochs` / `SlotReuseEpochs` | 8 / 16 |
-| `MonitorInterval` / `PingTimeout` / `SuspectAfter` | 2s / 1s / 3 |
-| `SuspicionWindow` / `ObserverCells` / `DampingFraction` | 30s / 3 / 10% |
+| `PingInterval` / `PingTimeout` / `SuspectAfter` | 2s / 1s / 3 |
+| `SuspicionWindow` / `ObserverCells` / `DampingPercent` | 30s / 3 / 10% |
 | `NeighborLinger` | 30s |
 | `DeltaLogSize` | 512 |
 | `Candidates` / `MinCandidateAge` | 3 / 60s |
