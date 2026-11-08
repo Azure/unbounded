@@ -212,3 +212,22 @@ func TestExpandVersion(t *testing.T) {
 		}
 	}
 }
+
+func TestExpectedSizeFeedsElection(t *testing.T) {
+	c := Config{ExpectedSize: 7}
+	if got := c.nodeConfig().Elect.ExpectedClusterSize; got != 7 {
+		t.Fatalf("ExpectedClusterSize = %d, want 7", got)
+	}
+
+	c = Config{}
+	c.Tuning.Election.ExpectedClusterSize = 9
+
+	if got := c.nodeConfig().Elect.ExpectedClusterSize; got != 9 {
+		t.Fatalf("explicit ExpectedClusterSize = %d, want 9", got)
+	}
+
+	// Zero leaves the elector default in place.
+	if got := (&Config{}).nodeConfig().Elect.ExpectedClusterSize; got != 0 {
+		t.Fatalf("default = %d, want 0 (elector default)", got)
+	}
+}

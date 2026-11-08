@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -20,6 +21,7 @@ import (
 	"github.com/Azure/unbounded/internal/cachemesh/internal/node"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/route"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
+	"github.com/Azure/unbounded/internal/cachemesh/internal/wire"
 )
 
 var (
@@ -33,6 +35,23 @@ var (
 	ErrTooManyCalls = errors.New("cachemesh: too many control calls in flight")
 	// ErrNoLease is reported to the elector of a member without a Lease.
 	ErrNoLease = errors.New("cachemesh: no lease store configured")
+	// ErrMessageTooLarge is returned by ServeControl for a message longer
+	// than MaxControlMessageSize.
+	ErrMessageTooLarge = errors.New("cachemesh: control message too large")
+	// ErrTooManyInvalidations is returned by Invalidate when
+	// MaxPendingInvalidations keyspaces already have an invalidation
+	// pending.
+	ErrTooManyInvalidations = errors.New("cachemesh: too many pending invalidations")
+)
+
+const (
+	// MaxControlMessageSize bounds a control message (request or
+	// response), including view snapshots. Transports may use it to bound
+	// the bodies they read.
+	MaxControlMessageSize = wire.MaxMessageSize
+	// MaxPendingInvalidations bounds the keyspaces with an invalidation
+	// pending at once.
+	MaxPendingInvalidations = 1024
 )
 
 const leaseQueue = 16
@@ -46,7 +65,7 @@ type Mesh struct {
 	// Hot path, lock-free.
 	st     atomic.Pointer[route.State]
 	health *health.Tracker
-	env    *route.Env
+	notes  *route.Notes
 
 	leading atomic.Bool
 	running atomic.Bool
@@ -59,6 +78,10 @@ type Mesh struct {
 	lastSelf view.Slot
 	isLeader bool
 	peers    map[view.Slot]PeerRef // current and lingering neighbors
+	env      *route.Env            // rebuilt when the gateways change
+	gwSeeds  []string              // seeds the current gateways came from
+	seedBuf  []string
+	inval    map[uint64]*invalidation
 
 	wake     chan struct{}
 	left     chan struct{}
@@ -67,12 +90,36 @@ type Mesh struct {
 	sem      chan struct{}
 	leaseQ   chan elect.Op
 
-	nbMu   sync.Mutex
-	nbQ    []nbEvent
-	nbWake chan struct{}
+	evMu   sync.Mutex
+	evQ    []event
+	evWake chan struct{}
 }
 
-type nbEvent struct{ added, removed []PeerRef }
+// event is a hook or watcher call queued for the notify goroutine.
+type event struct {
+	kind           eventKind
+	added, removed []PeerRef
+	version        Version
+	n              int
+	leading        bool
+	term           uint64
+}
+
+type eventKind uint8
+
+const (
+	evNeighbors eventKind = iota
+	evView
+	evLeadership
+)
+
+// invalidation is a pending Invalidate of one keyspace.
+type invalidation struct {
+	haveBase bool
+	base     uint32 // generation in the view when the request was made
+	next     int64  // next (re)send, local monotonic time
+	done     chan struct{}
+}
 
 // New returns a Mesh for cfg. It validates cfg and fills in defaults; the
 // member does nothing until Run.
@@ -109,44 +156,52 @@ func New(cfg Config) (*Mesh, error) {
 		start:    time.Now(),
 		lastSelf: view.NoSlot,
 		peers:    map[view.Slot]PeerRef{},
+		inval:    map[uint64]*invalidation{},
+		notes:    &route.Notes{},
 		wake:     make(chan struct{}, 1),
 		left:     make(chan struct{}),
 		done:     make(chan struct{}),
 		sem:      make(chan struct{}, t.MaxInFlight),
 		leaseQ:   make(chan elect.Op, leaseQueue),
-		nbWake:   make(chan struct{}, 1),
+		evWake:   make(chan struct{}, 1),
 	}
 
 	nc := cfg.nodeConfig()
 	nc.Hooks.OnNeighbors = m.onNeighbors
 	nc.Hooks.OnView = func(v *view.View) {
-		if h := cfg.Hooks.OnView; h != nil {
-			h(v.Version(), v.Len())
+		if cfg.Hooks.OnView != nil {
+			m.queue(event{kind: evView, version: v.Version(), n: v.Len()})
 		}
 	}
 
 	m.n = node.New(nc, rand.New(rand.NewPCG(randUint64(), randUint64())))
 	m.health = m.n.Health()
+	m.gwSeeds = m.n.Seeds(nil)
+	m.env = m.newEnv(m.gwSeeds)
+	m.st.Store(route.NewState(nil, view.NoSlot, m.env))
 
-	gws := make([]PeerRef, 0, len(cfg.Seeds))
-	for _, s := range cfg.Seeds {
-		if s != cfg.Addr {
+	return m, nil
+}
+
+// newEnv returns a routing Env whose gateways are seeds other than this
+// member's own address.
+func (m *Mesh) newEnv(seeds []string) *route.Env {
+	gws := make([]PeerRef, 0, len(seeds))
+	for _, s := range seeds {
+		if s != m.cfg.Addr {
 			gws = append(gws, PeerRef{Slot: view.NoSlot, ID: s, Addr: s})
 		}
 	}
 
-	m.env = route.NewEnv(route.Config{
+	return route.NewEnv(route.Config{
 		Health:          m.health,
 		Epoch:           m.n.Epoch(),
-		Notes:           &route.Notes{},
+		Notes:           m.notes,
 		Gateways:        gws,
-		SelfID:          cfg.ID,
-		SelfIncarnation: cfg.Incarnation,
-		PartitionBits:   cfg.PartitionBits,
+		SelfID:          m.cfg.ID,
+		SelfIncarnation: m.cfg.Incarnation,
+		PartitionBits:   m.cfg.PartitionBits,
 	})
-	m.st.Store(route.NewState(nil, view.NoSlot, m.env))
-
-	return m, nil
 }
 
 func randUint64() uint64 {
@@ -182,9 +237,28 @@ func (m *Mesh) poke() {
 
 // afterLocked refreshes everything derived from the node. Callers hold mu.
 func (m *Mesh) afterLocked() {
-	if v, s := m.n.View(), m.n.Self(); v != m.lastView || s != m.lastSelf {
+	v, s := m.n.View(), m.n.Self()
+	changed := v != m.lastView || s != m.lastSelf
+
+	// While not a member, route through every seed the node knows,
+	// including those learned from the Lease and from views.
+	if s == view.NoSlot {
+		m.seedBuf = m.n.Seeds(m.seedBuf[:0])
+		if !slices.Equal(m.seedBuf, m.gwSeeds) {
+			m.gwSeeds = slices.Clone(m.seedBuf)
+			m.env = m.newEnv(m.gwSeeds)
+			changed = true
+		}
+	}
+
+	if changed {
+		viewChanged := v != m.lastView
 		m.lastView, m.lastSelf = v, s
 		m.st.Store(route.NewState(v, s, m.env))
+
+		if viewChanged && len(m.inval) > 0 {
+			m.checkInvalidations(v)
+		}
 	}
 
 	if leading, term := m.n.Leading(); leading != m.isLeader {
@@ -192,8 +266,8 @@ func (m *Mesh) afterLocked() {
 		m.leading.Store(leading)
 		m.log.Info("cachemesh leadership changed", "leading", leading, "term", term)
 
-		if h := m.cfg.Hooks.OnLeadership; h != nil {
-			h(leading, term)
+		if m.cfg.Hooks.OnLeadership != nil {
+			m.queue(event{kind: evLeadership, leading: leading, term: term})
 		}
 	}
 
@@ -205,7 +279,7 @@ func (m *Mesh) afterLocked() {
 // onNeighbors runs inside node methods (under mu). It maps slots to peers
 // with the current view and queues the event for the watcher goroutine.
 func (m *Mesh) onNeighbors(added, removed []view.Slot) {
-	var ev nbEvent
+	ev := event{kind: evNeighbors}
 
 	v := m.n.View()
 
@@ -241,31 +315,55 @@ func (m *Mesh) onNeighbors(added, removed []view.Slot) {
 		return
 	}
 
-	m.nbMu.Lock()
-	m.nbQ = append(m.nbQ, ev)
-	m.nbMu.Unlock()
+	m.queue(ev)
+}
+
+// queue appends ev for the notify goroutine. Consecutive view events
+// coalesce into the latest, so a slow OnView hook sees fewer calls rather
+// than a growing backlog.
+func (m *Mesh) queue(ev event) {
+	m.evMu.Lock()
+	if n := len(m.evQ); ev.kind == evView && n > 0 && m.evQ[n-1].kind == evView {
+		m.evQ[n-1] = ev
+	} else {
+		m.evQ = append(m.evQ, ev)
+	}
+	m.evMu.Unlock()
 
 	select {
-	case m.nbWake <- struct{}{}:
+	case m.evWake <- struct{}{}:
 	default:
 	}
 }
 
+// notifyLoop delivers queued events in order, one at a time, without
+// holding the Mesh lock, so watchers and hooks may call Mesh methods.
 func (m *Mesh) notifyLoop(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-m.nbWake:
+		case <-m.evWake:
 		}
 
-		m.nbMu.Lock()
-		q := m.nbQ
-		m.nbQ = nil
-		m.nbMu.Unlock()
+		m.evMu.Lock()
+		q := m.evQ
+		m.evQ = nil
+		m.evMu.Unlock()
 
 		for _, ev := range q {
-			m.cfg.Neighbors.OnNeighbors(ev.added, ev.removed)
+			if ctx.Err() != nil {
+				return
+			}
+
+			switch ev.kind {
+			case evNeighbors:
+				m.cfg.Neighbors.OnNeighbors(ev.added, ev.removed)
+			case evView:
+				m.cfg.Hooks.OnView(ev.version, ev.n)
+			case evLeadership:
+				m.cfg.Hooks.OnLeadership(ev.leading, ev.term)
+			}
 		}
 	}
 }
@@ -300,9 +398,7 @@ func (m *Mesh) Run(ctx context.Context) error {
 	go func() {
 		defer wg.Done()
 
-		if m.cfg.Neighbors != nil {
-			m.notifyLoop(ctx)
-		}
+		m.notifyLoop(ctx)
 	}()
 
 	m.mu.Lock()
@@ -320,9 +416,11 @@ func (m *Mesh) Run(ctx context.Context) error {
 		now := m.mono()
 		m.n.Tick(now, time.Now())
 
-		if note, ok := m.env.Notes().Take(); ok {
+		if note, ok := m.notes.Take(); ok {
 			m.n.NoteVersion(now, note.Sender, expandVersion(m.n.View().Version(), note))
 		}
+
+		m.resendInvalidations(now)
 
 		calls := m.n.Outbox()
 		ops := m.n.LeaseOps()
@@ -489,11 +587,20 @@ func (m *Mesh) leaseLoop(ctx context.Context) {
 
 // ServeControl handles one inbound control request from the transport
 // address from and returns the response to send back. It is safe for
-// concurrent use and returns ErrNotRunning unless Run is active. msg is not
-// retained after ServeControl returns.
+// concurrent use, does not block on the network, and returns ErrNotRunning
+// unless Run is active and ErrMessageTooLarge for a message longer than
+// MaxControlMessageSize. Malformed or hostile messages are answered with
+// an encoded rejection, not an error, so the transport just returns the
+// response. from is informational (the sender's own Addr is inside the
+// message). msg is not retained after ServeControl returns, and the
+// response is a new slice owned by the caller.
 func (m *Mesh) ServeControl(_ context.Context, from Endpoint, msg []byte) ([]byte, error) {
 	if !m.running.Load() {
 		return nil, ErrNotRunning
+	}
+
+	if len(msg) > MaxControlMessageSize {
+		return nil, ErrMessageTooLarge
 	}
 
 	m.mu.Lock()
@@ -506,15 +613,96 @@ func (m *Mesh) ServeControl(_ context.Context, from Endpoint, msg []byte) ([]byt
 }
 
 // Invalidate asks the leader to bump the generation of ks, which makes
-// every Stamp issued for ks before the bump stale once members see the new
-// view. It is fire-and-forget: if no leader is known the request is
-// dropped, and it is not retried.
-func (m *Mesh) Invalidate(ks Keyspace) {
+// every Stamp of ks issued before the bump stale (Fresh returns false) on
+// each member once it sees the new view. It waits until this member's view
+// shows the bump and then returns nil.
+//
+// The request is queued and sent to the leader every Tuning.JoinRetry
+// until the bump is seen, so it survives a missing or failing leader.
+// Calls for a keyspace that already has a request pending share it: one
+// bump completes them all. A retry may cause an extra bump, which only
+// makes values stale earlier. Before this member has a view the request
+// waits for one, and the bump must then be seen in a later view.
+//
+// If ctx ends first Invalidate returns ctx.Err(), but the request stays
+// queued and is still delivered while Run is active. It returns
+// ErrNotRunning unless Run is active (or when Run returns while waiting),
+// and ErrTooManyInvalidations when MaxPendingInvalidations other keyspaces
+// are pending. It is safe for concurrent use.
+func (m *Mesh) Invalidate(ctx context.Context, ks Keyspace) error {
+	if !m.running.Load() {
+		return ErrNotRunning
+	}
+
 	m.mu.Lock()
-	m.n.Invalidate(m.mono(), ks.seed)
-	m.afterLocked()
+	inv, ok := m.inval[ks.seed]
+
+	if !ok {
+		if len(m.inval) >= MaxPendingInvalidations {
+			m.mu.Unlock()
+			return ErrTooManyInvalidations
+		}
+
+		inv = &invalidation{done: make(chan struct{})}
+		if v := m.n.View(); hasConfig(v) {
+			inv.haveBase, inv.base = true, v.Gen(ks.seed)
+		}
+
+		m.inval[ks.seed] = inv
+		m.resendInvalidations(m.mono())
+		m.afterLocked()
+	}
+
 	m.mu.Unlock()
 	m.poke()
+
+	select {
+	case <-inv.done:
+		return nil
+	case <-m.done:
+		return ErrNotRunning
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func hasConfig(v *view.View) bool {
+	_, ok := v.Config()
+	return ok
+}
+
+// checkInvalidations completes pending invalidations whose generation
+// moved in v. Callers hold mu.
+func (m *Mesh) checkInvalidations(v *view.View) {
+	if !hasConfig(v) {
+		return
+	}
+
+	for seed, inv := range m.inval {
+		switch g := v.Gen(seed); {
+		case !inv.haveBase:
+			inv.haveBase, inv.base = true, g
+		case g != inv.base:
+			close(inv.done)
+			delete(m.inval, seed)
+		}
+	}
+}
+
+// resendInvalidations sends due pending invalidations to the leader.
+// Callers hold mu.
+func (m *Mesh) resendInvalidations(now int64) {
+	retry := m.cfg.Tuning.JoinRetry
+	if retry <= 0 {
+		retry = node.DefaultJoinRetry
+	}
+
+	for seed, inv := range m.inval {
+		if inv.haveBase && inv.next <= now {
+			m.n.Invalidate(now, seed)
+			inv.next = now + int64(retry)
+		}
+	}
 }
 
 // Leave starts a graceful departure and waits until this member has

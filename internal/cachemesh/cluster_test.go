@@ -349,10 +349,19 @@ func TestCluster(t *testing.T) {
 
 		blob := c.ms[3].m.Stamp(blobs)
 
-		c.waitFor(t, "invalidate", 10*time.Second, func() error {
-			// Invalidate is fire-and-forget; repeat until it lands.
-			c.ms[7].m.Invalidate(meta)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
 
+		// Invalidate returns once the bump is in this member's view.
+		if err := c.ms[7].m.Invalidate(ctx, meta); err != nil {
+			t.Fatalf("Invalidate: %v", err)
+		}
+
+		if c.ms[7].m.Fresh(meta, stamp) {
+			t.Fatal("stamp fresh at the invalidating member after Invalidate")
+		}
+
+		c.waitFor(t, "invalidate", 10*time.Second, func() error {
 			for _, m := range c.live() {
 				if m.m.Fresh(meta, stamp) {
 					return fmt.Errorf("%s: stamp still fresh", m.m.ID())

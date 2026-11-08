@@ -26,8 +26,12 @@ type Endpoint = string
 // request answered by one response. Send delivers msg to the member at
 // addr, where the transport must call that member's Mesh.ServeControl, and
 // returns its response. Send must honor ctx (it carries the call timeout)
-// and be safe for concurrent use. Neither msg nor the returned slice is
-// retained by the other side after the call returns.
+// and be safe for concurrent use; Run waits for outstanding calls before it
+// returns, so a Send that ignores ctx delays Run. msg must not be modified
+// or retained after Send returns, and the returned slice is owned by the
+// Mesh. A non-nil error (including ctx errors) counts as a failed call:
+// the protocol retries or routes around it. At most Tuning.MaxInFlight
+// calls run at once; responses are at most MaxControlMessageSize bytes.
 type ControlTransport interface {
 	Send(ctx context.Context, addr Endpoint, msg []byte) ([]byte, error)
 }
@@ -35,8 +39,12 @@ type ControlTransport interface {
 // NeighborWatcher learns which data-plane peers this member should keep
 // connections to. OnNeighbors calls are delivered one at a time, in order,
 // on a goroutine owned by Run, never while holding the Mesh lock, so the
-// watcher may call any Mesh method. Removals are delayed by the neighbor
-// linger time so in-flight requests can finish.
+// watcher may call any Mesh method. Every removed peer was added earlier
+// with an identical PeerRef; a slot reused by another member is reported
+// as a removal of the old peer and an addition of the new one in the same
+// call. Removals are delayed by Tuning.NeighborLinger so in-flight
+// requests can finish. Events still queued when Run returns are dropped.
+// The slices are owned by the watcher.
 type NeighborWatcher interface {
 	OnNeighbors(added, removed []PeerRef)
 }
@@ -47,21 +55,25 @@ type NeighborFunc func(added, removed []PeerRef)
 // OnNeighbors calls f.
 func (f NeighborFunc) OnNeighbors(added, removed []PeerRef) { f(added, removed) }
 
-// Hooks are optional metric callbacks. They run on control-plane
-// goroutines and must not block; nil fields are skipped. Hooks that are
-// documented to run under the Mesh lock must not call Mesh methods.
+// Hooks are optional metric callbacks; nil fields are skipped. No hook is
+// called while the Mesh lock is held, so hooks may call any Mesh method.
+// They should return quickly.
 type Hooks struct {
-	// OnView is called under the Mesh lock after every view change with
-	// the new version and member count.
+	// OnView is called after view changes with the new version and member
+	// count. It runs on the same goroutine as the NeighborWatcher, in
+	// order with neighbor and leadership events; when it falls behind,
+	// queued view events coalesce into the latest.
 	OnView func(v Version, members int)
-	// OnLeadership is called under the Mesh lock when this member starts
-	// or stops publishing deltas as leader.
+	// OnLeadership is called when this member starts or stops publishing
+	// deltas as leader, on the NeighborWatcher goroutine, in order.
 	OnLeadership func(leading bool, term uint64)
 	// OnControlError is called when an outbound control call fails
-	// (transport error, timeout, or the in-flight limit was reached).
+	// (transport error, timeout, or the in-flight limit was reached). It
+	// runs on the goroutine of the failed call, so calls may be
+	// concurrent.
 	OnControlError func(addr Endpoint, err error)
 	// OnLeaseError is called when a Lease operation fails with an error
-	// other than a conflict or not-found.
+	// other than a conflict or not-found, on the Lease goroutine.
 	OnLeaseError func(op string, err error)
 }
 
@@ -185,6 +197,27 @@ type Config struct {
 	MaxNeighbors int
 	// EpochPeriod is the epoch length the leader publishes. Default 15s.
 	EpochPeriod time.Duration
+	// ExpectedSize is roughly how many members the cluster will have, for
+	// example the desired pod count of the DaemonSet. It sets
+	// Tuning.Election.ExpectedClusterSize (it is an error to set both to
+	// different values). Default 1000.
+	//
+	// A member that has no view yet, or has heard from no leader for a
+	// while, reads the Lease in rounds of a lottery: in each round it reads
+	// with probability min(1, 20/N), where N is the larger of its view's
+	// member count and ExpectedSize, which keeps the whole cluster near 20
+	// Lease reads per second (Election.LotteryBudgetQPS). The lone first
+	// member of a new cluster bootstraps through this lottery, so it waits
+	// about N/20 seconds: under a second with ExpectedSize 20 or less, but
+	// about 50 seconds with the default of 1000.
+	//
+	// The tradeoff: if many more members than ExpectedSize start without a
+	// view at once (a cold restart of the whole cluster), they read the
+	// Lease at about 20*actual/ExpectedSize per second until one of them
+	// is elected. Members that already have a view use its size, so this
+	// only affects members without one. Set ExpectedSize close to the real
+	// size, rounding up, and never far below it for large clusters.
+	ExpectedSize int
 
 	// Tuning holds advanced knobs.
 	Tuning Tuning
@@ -241,6 +274,13 @@ func (c *Config) validate() error {
 		errs = append(errs, errors.New("counts must not be negative"))
 	}
 
+	switch {
+	case c.ExpectedSize < 0:
+		errs = append(errs, errors.New("ExpectedSize must not be negative"))
+	case c.ExpectedSize > 0 && t.Election.ExpectedClusterSize > 0 && c.ExpectedSize != t.Election.ExpectedClusterSize:
+		errs = append(errs, errors.New("ExpectedSize and Tuning.Election.ExpectedClusterSize differ"))
+	}
+
 	if err := t.Election.Validate(); err != nil {
 		errs = append(errs, err)
 	}
@@ -256,6 +296,11 @@ func (c *Config) nodeConfig() node.Config {
 	t := &c.Tuning
 	lt := &t.Leader
 
+	ec := t.Election
+	if ec.ExpectedClusterSize == 0 {
+		ec.ExpectedClusterSize = c.ExpectedSize
+	}
+
 	return node.Config{
 		ID:            c.ID,
 		Incarnation:   c.Incarnation,
@@ -263,7 +308,7 @@ func (c *Config) nodeConfig() node.Config {
 		Zone:          c.Zone,
 		Seeds:         append([]string(nil), c.Seeds...),
 		PartitionBits: c.PartitionBits,
-		Elect:         t.Election,
+		Elect:         ec,
 		Health:        t.Health,
 		Leader: leader.Config{
 			MaxJoinsPerTick:     lt.MaxJoinsPerTick,
