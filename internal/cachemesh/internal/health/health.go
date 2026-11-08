@@ -86,6 +86,7 @@ import (
 	"slices"
 	"sync/atomic"
 	"time"
+	"unsafe"
 )
 
 // Result is the outcome of a request to a peer.
@@ -405,8 +406,8 @@ const (
 const maxLatency = int64(time.Hour)
 
 type hedgeShard struct {
-	routed, hedged atomic.Uint64
-	_              [128 - 16]byte // avoid false sharing (adjacent-line prefetch)
+	routed atomic.Uint64
+	_      [128 - 8]byte // avoid false sharing (adjacent-line prefetch)
 }
 
 // Tracker tracks the health of a set of peers.
@@ -430,8 +431,10 @@ type Tracker struct {
 
 	// The padding keeps the hedge counters, written on every routed
 	// request, off the cache lines of the read-mostly fields above.
-	_     [128]byte
-	hedge [hedgeShards]hedgeShard
+	_      [128]byte
+	hedge  [hedgeShards]hedgeShard
+	hedged atomic.Uint64
+	_      [128 - 8]byte
 
 	// Control-only.
 	cells        map[uint32]*cellCounter
@@ -935,23 +938,49 @@ func (t *Tracker) HedgeAfter(slot uint32) time.Duration {
 	return max(d, t.cfg.HedgeMin)
 }
 
-// NoteRouted counts a routed request toward the hedge budget. hint selects
-// a counter shard; pass any well-mixed per-request value (for example the
-// key hash) and the same value to TryHedge. Hot path.
+// NoteRouted counts a routed request toward the hedge budget. Hot path.
+//
+// The count is spread over shards chosen by the calling goroutine's stack
+// address, so concurrent routers mostly write different cache lines even
+// when they route the same partition; TryHedge sums the shards, so which
+// shard a call lands in never affects a result. hint is unused; it is kept
+// so that callers need not change.
 func (t *Tracker) NoteRouted(hint uint64) {
-	t.hedge[hint&(hedgeShards-1)].routed.Add(1)
+	_ = hint
+
+	t.hedge[stackShard()].routed.Add(1)
+}
+
+// stackShard returns a shard index derived from the address of a local
+// variable: stable for a goroutine (until its stack moves) and different
+// across goroutines, which run on different stacks of at least 8 KiB.
+func stackShard() uint64 {
+	var b byte
+
+	// Stacks are usually carved consecutively, so the low bits of the
+	// 8 KiB block number spread goroutines started together.
+	return uint64(uintptr(unsafe.Pointer(&b))>>13) & (hedgeShards - 1)
 }
 
 // TryHedge admits a hedge if hedges in this interval stay within HedgeRatio
-// of routed requests in the same shard. The check and increment are not
-// atomic together, so concurrent callers may overshoot slightly. Hot path.
+// of the requests routed in this interval. The check and increment are not
+// atomic together, so concurrent callers may overshoot slightly. hint is
+// unused. Hot path, but called only for requests that are hedge candidates,
+// so it reads every shard.
 func (t *Tracker) TryHedge(hint uint64) bool {
-	s := &t.hedge[hint&(hedgeShards-1)]
-	if (s.hedged.Load()+1)*1e6 > s.routed.Load()*t.hedgePM {
+	_ = hint
+
+	var routed uint64
+
+	for i := range t.hedge {
+		routed += t.hedge[i].routed.Load()
+	}
+
+	if (t.hedged.Load()+1)*1e6 > routed*t.hedgePM {
 		return false
 	}
 
-	s.hedged.Add(1)
+	t.hedged.Add(1)
 
 	return true
 }
@@ -1082,8 +1111,9 @@ func (t *Tracker) interval(nt *table) {
 
 	for i := range t.hedge {
 		t.hedge[i].routed.Store(0)
-		t.hedge[i].hedged.Store(0)
 	}
+
+	t.hedged.Store(0)
 }
 
 // ejectionFor returns the ejection time for count n, with jitter.

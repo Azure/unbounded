@@ -5,6 +5,7 @@ package health
 
 import (
 	"math/rand/v2"
+	"sync"
 	"testing"
 	"time"
 )
@@ -225,5 +226,36 @@ func TestLatencySampling(t *testing.T) {
 
 	if got := p.latN.Load(); got != want+1 {
 		t.Fatalf("zero latency counted: latN = %d", got)
+	}
+}
+
+// TestHedgeBudgetAcrossGoroutines checks that the budget counts requests
+// routed from any goroutine, whichever shard they land in.
+func TestHedgeBudgetAcrossGoroutines(t *testing.T) {
+	tr := newT(Config{})
+	tr.Tick(0)
+
+	var wg sync.WaitGroup
+
+	for g := range 8 {
+		wg.Go(func() {
+			for i := range 2000 {
+				tr.NoteRouted(uint64(g*2000 + i))
+			}
+		})
+	}
+
+	wg.Wait()
+
+	got := 0
+
+	for i := range uint64(16000) {
+		if tr.TryHedge(i) {
+			got++
+		}
+	}
+
+	if got != 800 {
+		t.Fatalf("hedges %d want 800", got)
 	}
 }

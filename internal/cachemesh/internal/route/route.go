@@ -398,7 +398,7 @@ func (s *State) Fresh(seed uint64, st epoch.Stamp) bool {
 }
 
 // TryHedge admits a hedge of the request carrying h within the hedge
-// budget, using the partition as the shard hint.
+// budget.
 func (s *State) TryHedge(h Header) bool {
 	return s.h.TryHedge(uint64(h.Partition))
 }

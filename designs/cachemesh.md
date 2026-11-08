@@ -380,7 +380,10 @@ Envoy and gRPC A50:
 - **Hedging**: each decision carries an `Alternate` (the next usable member
   of the same next-hop cell) and `HedgeAfter = clamp(3 * EWMA(Next), 5ms, 1s)`.
   `TryHedge()` enforces a budget of `HedgeRatio` (5%) of routed requests per
-  interval using sharded counters.
+  interval. Routed requests are counted in shards picked by the calling
+  goroutine's stack address, so concurrent routers rarely share a counter
+  line; `TryHedge` (called only for hedge candidates) sums the shards, so the
+  shard choice never changes a result.
 
 Implementation notes (`health` package): the per-tracker slot index is a small
 copy-on-write open-addressing table, so memory is O(tracked peers), not
@@ -396,6 +399,19 @@ with latency data. `HedgeAfter` is `HedgeMax` for a peer with no latency data. A
 observations in a tick decays its EWMA toward the last median (never
 upward), so an idle `Degraded` peer, which routing avoids, recovers instead of
 staying `Degraded` forever. Latencies are capped at one hour.
+
+`Observe` is written for many goroutines reporting on the same peer. A
+`Success` writes one shared counter (the active bucket); the latency mean
+that the EWMA decays toward is sampled (every success up to 64 per interval,
+then one in 8, chosen by the bucket count so it is deterministic), and the
+peak EWMA and the consecutive-failure counter are written only when they
+change. A `Peer` is three 64-byte lines: fields routing reads, counters
+`Observe` writes, and ejection and control fields. `AllHealthy` (no peer
+ejected, probing, degraded at the last tick, or busy; or panic) lets routing
+skip per-peer `Usable` lookups; it is maintained by counters that change only
+on breaker transitions, so it is exact for a single goroutine and
+conservative otherwise. Peers dropped from the tracked set are retired so
+that a stale table cannot eject them.
 
 ## Monitoring and failure detection
 
