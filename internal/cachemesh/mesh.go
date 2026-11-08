@@ -320,22 +320,94 @@ func (m *Mesh) onNeighbors(added, removed []view.Slot) {
 	m.queue(ev)
 }
 
-// queue appends ev for the notify goroutine. Consecutive view events
-// coalesce into the latest, so a slow OnView hook sees fewer calls rather
-// than a growing backlog.
+// queue appends ev for the notify goroutine. Since the last leadership
+// event, the queue holds at most one neighbor event and one view event, so
+// a slow watcher or hook sees fewer calls rather than a growing backlog:
+// neighbor events merge into the net change since the last delivered
+// call, and a view event replaces any earlier queued one and moves to the
+// end, so OnView always reports the latest view after the neighbor events
+// that preceded it.
 func (m *Mesh) queue(ev event) {
 	m.evMu.Lock()
-	if n := len(m.evQ); ev.kind == evView && n > 0 && m.evQ[n-1].kind == evView {
-		m.evQ[n-1] = ev
-	} else {
-		m.evQ = append(m.evQ, ev)
-	}
+	m.evQ = coalesce(m.evQ, ev)
 	m.evMu.Unlock()
 
 	select {
 	case m.evWake <- struct{}{}:
 	default:
 	}
+}
+
+// coalesce appends ev to q, merging it as described on queue.
+func coalesce(q []event, ev event) []event {
+	switch ev.kind {
+	case evView:
+		for i := len(q) - 1; i >= 0 && q[i].kind != evLeadership; i-- {
+			if q[i].kind == evView {
+				q = append(q[:i], q[i+1:]...)
+
+				break
+			}
+		}
+	case evNeighbors:
+		for i := len(q) - 1; i >= 0 && q[i].kind != evLeadership; i-- {
+			if q[i].kind == evNeighbors {
+				q[i] = mergeNeighbors(q[i], ev)
+
+				return q
+			}
+		}
+	case evLeadership:
+	}
+
+	return append(q, ev)
+}
+
+// mergeNeighbors returns the net change of applying a and then b. A peer
+// added then removed, or removed then re-added with an identical PeerRef,
+// cancels out, so the watcher ends with the same set as with both calls.
+func mergeNeighbors(a, b event) event {
+	added := make(map[PeerRef]int, len(a.added))
+	for i, p := range a.added {
+		added[p] = i
+	}
+
+	removed := make(map[PeerRef]int, len(a.removed))
+	for i, p := range a.removed {
+		removed[p] = i
+	}
+
+	drop := func(s []PeerRef, idx map[PeerRef]int, p PeerRef) []PeerRef {
+		i := idx[p]
+		delete(idx, p)
+
+		s[i] = PeerRef{}
+
+		return s
+	}
+
+	for _, p := range b.removed {
+		if _, ok := added[p]; ok {
+			a.added = drop(a.added, added, p)
+		} else {
+			removed[p] = len(a.removed)
+			a.removed = append(a.removed, p)
+		}
+	}
+
+	for _, p := range b.added {
+		if _, ok := removed[p]; ok {
+			a.removed = drop(a.removed, removed, p)
+		} else {
+			added[p] = len(a.added)
+			a.added = append(a.added, p)
+		}
+	}
+
+	a.added = slices.DeleteFunc(a.added, PeerRef.IsZero)
+	a.removed = slices.DeleteFunc(a.removed, PeerRef.IsZero)
+
+	return a
 }
 
 // notifyLoop delivers queued events in order, one at a time, without
@@ -360,7 +432,9 @@ func (m *Mesh) notifyLoop(ctx context.Context) {
 
 			switch ev.kind {
 			case evNeighbors:
-				m.cfg.Neighbors.OnNeighbors(ev.added, ev.removed)
+				if len(ev.added) > 0 || len(ev.removed) > 0 {
+					m.cfg.Neighbors.OnNeighbors(ev.added, ev.removed)
+				}
 			case evView:
 				m.cfg.Hooks.OnView(ev.version, ev.n)
 			case evLeadership:

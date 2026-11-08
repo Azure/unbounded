@@ -43,8 +43,11 @@ type ControlTransport interface {
 // with an identical PeerRef; a slot reused by another member is reported
 // as a removal of the old peer and an addition of the new one in the same
 // call. Removals are delayed by Tuning.NeighborLinger so in-flight
-// requests can finish. Events still queued when Run returns are dropped.
-// The slices are owned by the watcher.
+// requests can finish. While the watcher is busy, queued changes merge
+// into one call with the net change (a peer added and removed again in
+// the meantime is never reported), so the backlog is bounded by the
+// neighbor set rather than by churn. Events still queued when Run returns
+// are dropped. The slices are owned by the watcher.
 type NeighborWatcher interface {
 	OnNeighbors(added, removed []PeerRef)
 }
@@ -61,8 +64,9 @@ func (f NeighborFunc) OnNeighbors(added, removed []PeerRef) { f(added, removed) 
 type Hooks struct {
 	// OnView is called after view changes with the new version and member
 	// count. It runs on the same goroutine as the NeighborWatcher, in
-	// order with neighbor and leadership events; when it falls behind,
-	// queued view events coalesce into the latest.
+	// order with leadership events and after the neighbor events of the
+	// same view; when it falls behind, queued view events coalesce into
+	// the latest.
 	OnView func(v Version, members int)
 	// OnLeadership is called when this member starts or stops publishing
 	// deltas as leader, on the NeighborWatcher goroutine, in order.
