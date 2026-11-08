@@ -1,0 +1,36 @@
+providers/mana: drop a pending CQE that makes no progress
+
+rdma-core v65 mana_poll_cq() keeps a CQE pending while its handler
+reports consumed=false, and loops `while (num_polled < nwc)`. When
+handle_rc_requester_cqe() gets an ACK whose PSN is not below qp->sq_psn,
+advance_send_completions() returns 0 at once, yet the next shadow WQE
+has end_psn <= psn, so consumed stays false. Nothing changes between
+iterations: the poll never returns and holds the CQ spin lock. Observed
+in racer on Azure MANA: the RDMA owner thread spun inside one
+mana_poll_cq() call for the rest of the process lifetime.
+
+Treat "produced nothing and not consumed" as consumed, which is what
+v61 did with every CQE. A later cumulative ACK still completes the
+send WQEs.
+
+--- a/providers/mana/cq.c
++++ b/providers/mana/cq.c
+@@ -566,6 +566,18 @@
+ 		ret = mana_handle_cqe(ctx, &cq->pending_cqe, &wc[num_polled], nwc - num_polled, &consumed);
+ 		num_polled += ret;
+ 
++		/* A CQE that produced nothing and asks to stay pending can never
++		 * make progress: retrying it with the same room spins forever with
++		 * the CQ lock held. Drop it like an unknown CQE; a later ACK covers
++		 * the same send completions, since ACK PSNs are cumulative.
++		 */
++		if (!consumed && ret == 0) {
++			verbs_warn_datapath(verbs_get_ctx(ibcq->context),
++					    "CQE wqid=%u made no progress: dropped\n",
++					    cq->pending_cqe.wqid);
++			consumed = true;
++		}
++
+ 		cq->has_pending_cqe = !consumed;
+ 	}
+ 
