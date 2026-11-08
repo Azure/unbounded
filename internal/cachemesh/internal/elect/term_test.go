@@ -3,7 +3,10 @@
 
 package elect
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 // TestObserveTermRaisesNextTerm: a term seen outside the Lease (another
 // lineage) makes the next acquisition start above it, even when the Lease
@@ -76,5 +79,37 @@ func TestReleaseCarriesObservedTerm(t *testing.T) {
 
 	if h2.e.State() != Leader || h2.e.Term() != 41 {
 		t.Fatalf("next leader %v term %d", h2.e.State(), h2.e.Term())
+	}
+}
+
+// TestLotteryNFloor: a member whose view is far smaller than the cluster
+// still uses ExpectedClusterSize for N, so a small lineage cannot make
+// every member read every round.
+func TestLotteryNFloor(t *testing.T) {
+	t.Parallel()
+
+	reads := 0
+
+	for i := range 50 {
+		s := &memStore{}
+		s.store(Record{Holder: "other", Incarnation: 1, Term: 9, RenewTime: epoch.Add(time.Hour), LeaseDuration: time.Hour})
+
+		e := New(Config{ExpectedClusterSize: 1000}, self(i), newRNG(uint64(i)))
+		in := Input{Wall: epoch, HaveView: true, ClusterSize: 5, ViewTerm: 9}
+
+		for r := range 200 {
+			in.Now = sec(60 + float64(r))
+			for _, op := range e.Tick(in) {
+				reads++
+
+				e.OnResult(in, s.apply(op))
+			}
+		}
+	}
+
+	// 50 members * 200 rounds * 20/1000 = 200 expected; with N=5 every
+	// member would read every round (10000).
+	if reads < 100 || reads > 400 {
+		t.Fatalf("%d lottery reads", reads)
 	}
 }

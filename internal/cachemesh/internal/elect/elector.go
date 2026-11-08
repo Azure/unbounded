@@ -138,7 +138,9 @@ type Config struct {
 	// MinCandidateAge is how long a member must have been admitted before it
 	// can be a candidate. The caller applies it. Default 60s.
 	MinCandidateAge time.Duration
-	// ExpectedClusterSize is N for the lottery when there is no view.
+	// ExpectedClusterSize is the least N for the lottery (see Tick). Set it
+	// near the real cluster size: smaller values let more members read per
+	// round, larger ones slow the lottery down.
 	// Default 1000.
 	ExpectedClusterSize int
 }
@@ -257,8 +259,8 @@ type Input struct {
 	ViewTerm uint64
 	// HaveView reports whether the member has a view.
 	HaveView bool
-	// ClusterSize is the member count of the view. Zero or negative selects
-	// Config.ExpectedClusterSize.
+	// ClusterSize is the member count of the view. The lottery uses the
+	// larger of it and Config.ExpectedClusterSize.
 	ClusterSize int
 	// IsCandidate reports whether the member is a candidate in its view
 	// (see TopCandidates).
@@ -591,11 +593,14 @@ func (e *Elector) Tick(in Input) []Op {
 
 		e.lastRound, e.roundDone = round, true
 
-		// An empty or unset ClusterSize would make p=1 and every member
-		// read every round, so it falls back to ExpectedClusterSize.
+		// N is the larger of the view's size and ExpectedClusterSize. A
+		// view can be far smaller than the cluster (a fresh lineage after
+		// a cold restart or a partition, a member that missed joins), and
+		// with N from it alone every member of such a view would read every
+		// round.
 		n := e.cfg.ExpectedClusterSize
-		if in.HaveView && in.ClusterSize > 0 {
-			n = in.ClusterSize
+		if in.HaveView {
+			n = max(n, in.ClusterSize)
 		}
 
 		p64 := LotteryP64(e.cfg.LotteryBudgetQPS, e.cfg.LotteryRound, n)
@@ -700,7 +705,9 @@ func (e *Elector) Release(in Input) []Op {
 	r := e.held.Clone()
 	r.Holder = ""
 	r.RenewTime = in.Wall
-	r.Seeds = nil
+	// Seeds stay: a member starting without seeds must still find the
+	// cluster through a released Lease rather than bootstrap a new one.
+	r.Seeds = capSeeds(in.Seeds)
 	// Carry the highest term this member has seen (see ObserveTerm) so the
 	// next holder starts above every lineage, even one whose term never
 	// reached the Lease.
