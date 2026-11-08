@@ -561,20 +561,22 @@ func (s *State) decide(d *Decision, p uint32, avoid view.Slot, inFlags uint8) {
 		return
 	}
 
-	ent := s.table.Get(p)
+	// Only the owner column is read here; prev reads the rest of the
+	// entry for the decisions that need it.
+	owner := s.table.Owner(p)
 
-	om, ok := s.v.Member(ent.Owner)
+	om, ok := s.v.Member(owner)
 	if !ok {
 		return
 	}
 
-	fillRef(&d.Owner, ent.Owner, om)
+	fillRef(&d.Owner, owner, om)
 
 	s.h.NoteRouted(uint64(p))
 
-	if ent.Owner == s.self {
+	if owner == s.self {
 		d.Kind = KindSelf
-		s.prev(d, &ent)
+		s.prev(d, p)
 
 		return
 	}
@@ -583,9 +585,9 @@ func (s *State) decide(d *Decision, p uint32, avoid view.Slot, inFlags uint8) {
 
 	mask := s.diffMask(&oc, om.Cell)
 	if mask&(mask-1) == 0 {
-		s.final(d, p, &ent, om.Cell, avoid, inFlags&FlagBackup != 0)
+		s.final(d, p, owner, om.Cell, avoid, inFlags&FlagBackup != 0)
 	} else {
-		s.relay(d, p, &ent, &oc, mask, avoid)
+		s.relay(d, p, owner, &oc, mask, avoid)
 	}
 
 	if !d.Next.IsZero() {
@@ -607,7 +609,10 @@ func (s *State) diffMask(oc *[topology.MaxDims]uint32, cell uint32) uint8 {
 	return m
 }
 
-func (s *State) prev(d *Decision, ent *placement.Entry) {
+// prev sets d.PrevOwner if partition p is in its handoff window.
+func (s *State) prev(d *Decision, p uint32) {
+	ent := s.table.Get(p)
+
 	// Window: the 32-bit epoch distance since the move, taken modulo
 	// 2^32, is in [-handoff, handoff). The negative half covers a member
 	// whose epoch tracker lags the leader's that stamped Moved (it applied
@@ -622,12 +627,12 @@ func (s *State) prev(d *Decision, ent *placement.Entry) {
 }
 
 // final handles an owner that is a neighbor.
-func (s *State) final(d *Decision, p uint32, ent *placement.Entry, oc uint32, avoid view.Slot, standin bool) {
+func (s *State) final(d *Decision, p uint32, owner view.Slot, oc uint32, avoid view.Slot, standin bool) {
 	all := s.h.AllHealthy()
 
 	ou := health.Healthy
 	if !all {
-		ou = s.h.Usable(ent.Owner)
+		ou = s.h.Usable(owner)
 	}
 
 	pm := hashing.Mix64(uint64(p))
@@ -635,7 +640,7 @@ func (s *State) final(d *Decision, p uint32, ent *placement.Entry, oc uint32, av
 	var t top3
 
 	for _, m := range s.v.CellMembers(oc) {
-		if m == ent.Owner || m == avoid {
+		if m == owner || m == avoid {
 			continue
 		}
 
@@ -668,13 +673,13 @@ func (s *State) final(d *Decision, p uint32, ent *placement.Entry, oc uint32, av
 	switch {
 	case toOwner:
 		d.Kind = KindOwner
-		s.setRef(&d.Next, ent.Owner)
+		s.setRef(&d.Next, owner)
 
 		if nb > 0 {
 			s.setRef(&d.Alternate, bk[0])
 		}
 
-		s.prev(d, ent)
+		s.prev(d, p)
 	case t[0].slot == s.self || (standin && s.selfCell == oc):
 		d.Kind = KindSelf
 		d.Header.Flags |= FlagBackup
@@ -687,13 +692,13 @@ func (s *State) final(d *Decision, p uint32, ent *placement.Entry, oc uint32, av
 		case nb > 1:
 			s.setRef(&d.Alternate, bk[1])
 		case ou != health.Unusable:
-			s.setRef(&d.Alternate, ent.Owner)
+			s.setRef(&d.Alternate, owner)
 		}
 	}
 }
 
 // relay handles an owner more than one dimension away.
-func (s *State) relay(d *Decision, p uint32, ent *placement.Entry, oc *[topology.MaxDims]uint32, mask uint8, avoid view.Slot) {
+func (s *State) relay(d *Decision, p uint32, owner view.Slot, oc *[topology.MaxDims]uint32, mask uint8, avoid view.Slot) {
 	pm := hashing.Mix64(uint64(p))
 
 	for pass := range 2 {
@@ -736,8 +741,8 @@ func (s *State) relay(d *Decision, p uint32, ent *placement.Entry, oc *[topology
 
 	d.Kind = KindDirect
 	d.Header.Flags |= FlagDirect
-	s.setRef(&d.Next, ent.Owner)
-	s.prev(d, ent)
+	s.setRef(&d.Next, owner)
+	s.prev(d, p)
 }
 
 // gateway routes from a member that is not in its view.
@@ -749,18 +754,18 @@ func (s *State) gateway(d *Decision, p uint32) {
 			return
 		}
 
-		ent := s.table.Get(p)
+		owner := s.table.Owner(p)
 
-		om, ok := s.v.Member(ent.Owner)
+		om, ok := s.v.Member(owner)
 		if !ok {
 			return
 		}
 
 		d.Kind = KindDirect
 		d.Header.Flags |= FlagDirect
-		fillRef(&d.Owner, ent.Owner, om)
-		fillRef(&d.Next, ent.Owner, om)
-		s.prev(d, &ent)
+		fillRef(&d.Owner, owner, om)
+		fillRef(&d.Next, owner, om)
+		s.prev(d, p)
 		d.HedgeAfter = s.h.HedgeAfter(d.Next.Slot)
 
 		return

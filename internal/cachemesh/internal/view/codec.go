@@ -368,9 +368,9 @@ func AppendSnapshot(b []byte, v *View) []byte {
 	}
 
 	t := v.table
-	b = appendColumn(b, t, func(e placement.Entry) uint32 { return e.Owner + 1 })
-	b = appendColumn(b, t, func(e placement.Entry) uint32 { return e.Prev + 1 })
-	b = appendColumn(b, t, func(e placement.Entry) uint32 { return e.Moved })
+	b = appendColumn(b, t, 0, 1)
+	b = appendColumn(b, t, 1, 1)
+	b = appendColumn(b, t, 2, 0)
 
 	return b
 }
@@ -378,14 +378,29 @@ func AppendSnapshot(b []byte, v *View) []byte {
 // EncodeSnapshot returns the canonical snapshot encoding of v.
 func EncodeSnapshot(v *View) []byte { return AppendSnapshot(nil, v) }
 
-// appendColumn writes one table column as uvarint base, width byte, and a
-// length-prefixed LSB-first bit-packed array of value-base.
-func appendColumn(b []byte, t *placement.Table, f func(placement.Entry) uint32) []byte {
+// tableColumn returns column col (0 owner, 1 prev, 2 moved) of chunk ci.
+func tableColumn(t *placement.Table, ci, col int) []uint32 {
+	owner, prev, moved := t.Columns(ci)
+
+	switch col {
+	case 0:
+		return owner
+	case 1:
+		return prev
+	}
+
+	return moved
+}
+
+// appendColumn writes table column col (see tableColumn), each value plus
+// add, as uvarint base, width byte, and a length-prefixed LSB-first
+// bit-packed array of value-base.
+func appendColumn(b []byte, t *placement.Table, col int, add uint32) []byte {
 	lo, hi := uint32(math.MaxUint32), uint32(0)
 
 	for ci := range t.NumChunks() {
-		for _, e := range t.Chunk(ci) {
-			x := f(e)
+		for _, x := range tableColumn(t, ci, col) {
+			x += add
 			lo, hi = min(lo, x), max(hi, x)
 		}
 	}
@@ -407,8 +422,8 @@ func appendColumn(b []byte, t *placement.Table, f func(placement.Entry) uint32) 
 	)
 
 	for ci := range t.NumChunks() {
-		for _, e := range t.Chunk(ci) {
-			acc |= uint64(f(e)-lo) << have
+		for _, x := range tableColumn(t, ci, col) {
+			acc |= uint64(x+add-lo) << have
 
 			have += w
 			for have >= 8 {

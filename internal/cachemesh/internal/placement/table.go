@@ -10,7 +10,8 @@
 // and stored in 1024-entry chunks; Assign returns a new table that shares
 // every chunk it did not touch, so a delta moving k partitions copies at most
 // k chunks and every view keeps its own table cheaply. Get is a two-level
-// array lookup with no locks and no allocation.
+// array lookup with no locks and no allocation; entries are stored as
+// per-chunk columns so that the owner lookup reads a dense array.
 //
 // The Planner is the deterministic rebalancer the leader runs each tick. Its
 // output depends only on the table contents and the member set (not on the
@@ -57,9 +58,47 @@ type Entry struct {
 }
 
 // Table is an immutable partition table. A nil *Table is not valid.
+//
+// Each chunk stores its entries as three columns (owners, then previous
+// owners, then move epochs) rather than as an array of Entry, so the owner
+// lookup that every routed request makes reads a dense 4-byte array: the
+// owners of 2^20 partitions take 4 MiB instead of the 12 MiB of the whole
+// table, which keeps far more of them in cache.
 type Table struct {
 	bits   uint8
-	chunks [][]Entry
+	chunks []*chunk
+}
+
+// chunk holds the columns of up to ChunkSize partitions in one allocation.
+type chunk struct {
+	owner, prev, moved []uint32
+}
+
+func newChunk(size int) *chunk {
+	buf := make([]uint32, 3*size)
+
+	return &chunk{
+		owner: buf[:size:size],
+		prev:  buf[size : 2*size : 2*size],
+		moved: buf[2*size:],
+	}
+}
+
+func (c *chunk) set(j uint32, e Entry) {
+	c.owner[j], c.prev[j], c.moved[j] = e.Owner, e.Prev, e.Moved
+}
+
+func (c *chunk) clone() *chunk {
+	n := newChunk(len(c.owner))
+	copy(n.owner, c.owner)
+	copy(n.prev, c.prev)
+	copy(n.moved, c.moved)
+
+	return n
+}
+
+func (c *chunk) equal(o *chunk) bool {
+	return slices.Equal(c.owner, o.owner) && slices.Equal(c.prev, o.prev) && slices.Equal(c.moved, o.moved)
 }
 
 // ErrInvalid reports invalid arguments to NewTable or Assign.
@@ -77,12 +116,12 @@ func NewTable(bits uint8, owner uint32) *Table {
 	size := min(n, ChunkSize)
 
 	// Every chunk of a fresh table has the same contents, so share one.
-	c := make([]Entry, size)
-	for i := range c {
-		c[i] = Entry{Owner: owner, Prev: NoMember}
+	c := newChunk(size)
+	for j := range uint32(size) {
+		c.set(j, Entry{Owner: owner, Prev: NoMember})
 	}
 
-	t := &Table{bits: bits, chunks: make([][]Entry, (n+size-1)/size)}
+	t := &Table{bits: bits, chunks: make([]*chunk, (n+size-1)/size)}
 	for i := range t.chunks {
 		t.chunks[i] = c
 	}
@@ -101,33 +140,41 @@ func (t *Table) Len() int { return 1 << t.bits }
 
 // Get returns the entry of partition p. p must be below Len().
 func (t *Table) Get(p uint32) Entry {
-	return t.chunks[p>>chunkShift][p&chunkMask]
+	c, j := t.chunks[p>>chunkShift], p&chunkMask
+
+	return Entry{Owner: c.owner[j], Prev: c.prev[j], Moved: c.moved[j]}
 }
 
-// Owner returns the owner of partition p.
+// Owner returns the owner of partition p. p must be below Len(). It reads
+// only the owner column.
 func (t *Table) Owner(p uint32) uint32 {
-	return t.chunks[p>>chunkShift][p&chunkMask].Owner
+	return t.chunks[p>>chunkShift].owner[p&chunkMask]
 }
 
 // NumChunks returns the number of chunks.
 func (t *Table) NumChunks() int { return len(t.chunks) }
 
-// Chunk returns chunk i, holding partitions i*ChunkSize onward. The slice is
-// shared and must not be modified.
-func (t *Table) Chunk(i int) []Entry { return t.chunks[i] }
+// Columns returns the owner, previous owner, and move epoch columns of chunk
+// i, which holds partitions i*ChunkSize onward. The slices are shared and
+// must not be modified.
+func (t *Table) Columns(i int) (owner, prev, moved []uint32) {
+	c := t.chunks[i]
+
+	return c.owner, c.prev, c.moved
+}
 
 // SameChunk reports whether a and b share the storage of chunk i, which
 // tests use to check copy-on-write sharing.
 func SameChunk(a, b *Table, i int) bool {
-	return &a.chunks[i][0] == &b.chunks[i][0]
+	return a.chunks[i] == b.chunks[i]
 }
 
 // ForEach calls fn for every partition in increasing order.
 func (t *Table) ForEach(fn func(p uint32, e Entry)) {
 	for ci, c := range t.chunks {
 		base := uint32(ci) << chunkShift
-		for j, e := range c {
-			fn(base+uint32(j), e)
+		for j := range c.owner {
+			fn(base+uint32(j), Entry{Owner: c.owner[j], Prev: c.prev[j], Moved: c.moved[j]})
 		}
 	}
 }
@@ -174,8 +221,8 @@ func (t *Table) Assign(parts, owners []uint32, epoch uint32) (*Table, error) {
 	for i, p := range parts {
 		ci, j := p>>chunkShift, p&chunkMask
 
-		old := nt.chunks[ci][j]
-		if old.Owner == owners[i] {
+		old := nt.chunks[ci].owner[j]
+		if old == owners[i] {
 			continue
 		}
 
@@ -185,10 +232,10 @@ func (t *Table) Assign(parts, owners []uint32, epoch uint32) (*Table, error) {
 
 		if !copied[ci] {
 			copied[ci] = true
-			nt.chunks[ci] = slices.Clone(nt.chunks[ci])
+			nt.chunks[ci] = nt.chunks[ci].clone()
 		}
 
-		nt.chunks[ci][j] = Entry{Owner: owners[i], Prev: old.Owner, Moved: epoch}
+		nt.chunks[ci].set(j, Entry{Owner: owners[i], Prev: old, Moved: epoch})
 	}
 
 	if copied == nil {
@@ -210,7 +257,7 @@ func Equal(a, b *Table) bool {
 			continue
 		}
 
-		if !slices.Equal(a.chunks[i], b.chunks[i]) {
+		if !a.chunks[i].equal(b.chunks[i]) {
 			return false
 		}
 	}
@@ -223,9 +270,9 @@ func Equal(a, b *Table) bool {
 func (t *Table) Hash() uint64 {
 	h := hashing.Mix64(uint64(t.bits) + 0x9e3779b97f4a7c15)
 	for _, c := range t.chunks {
-		for _, e := range c {
-			h = hashing.Mix64(h ^ (uint64(e.Owner) | uint64(e.Prev)<<32))
-			h = hashing.Mix64(h ^ uint64(e.Moved))
+		for j := range c.owner {
+			h = hashing.Mix64(h ^ (uint64(c.owner[j]) | uint64(c.prev[j])<<32))
+			h = hashing.Mix64(h ^ uint64(c.moved[j]))
 		}
 	}
 
@@ -239,8 +286,7 @@ func (t *Table) Loads(dst []uint32) []uint32 {
 	clear(dst[:cap(dst)])
 
 	for _, c := range t.chunks {
-		for _, e := range c {
-			o := e.Owner
+		for _, o := range c.owner {
 			if o == NoMember {
 				continue
 			}
@@ -267,21 +313,21 @@ func NewTableFunc(bits uint8, fn func(p uint32) Entry) *Table {
 
 	n := 1 << bits
 	size := min(n, ChunkSize)
-	t := &Table{bits: bits, chunks: make([][]Entry, (n+size-1)/size)}
+	t := &Table{bits: bits, chunks: make([]*chunk, (n+size-1)/size)}
 
-	var prev, cur []Entry
+	var prev, cur *chunk
 
 	for ci := range t.chunks {
 		if cur == nil {
-			cur = make([]Entry, size)
+			cur = newChunk(size)
 		}
 
 		base := uint32(ci) * uint32(size)
-		for j := range cur {
-			cur[j] = fn(base + uint32(j))
+		for j := range uint32(size) {
+			cur.set(j, fn(base+j))
 		}
 
-		if prev != nil && slices.Equal(prev, cur) {
+		if prev != nil && prev.equal(cur) {
 			t.chunks[ci] = prev
 
 			continue

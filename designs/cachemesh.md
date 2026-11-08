@@ -217,7 +217,10 @@ out through a tree about 50 wide, and the caller can cache at each hop.
 - `placement.Table` maps partition to `Entry{Owner, Prev uint32; Moved
   uint32}` (`Moved` is the epoch of the last move). It is stored in 1024-entry
   chunks, copied on write, so a delta that moves k partitions copies at most k
-  chunks.
+  chunks. Each chunk keeps its entries as three columns (owners, previous
+  owners, move epochs), so the owner lookup every request makes reads a dense
+  4 MiB array at 2^20 partitions instead of 12 MiB of entries; `Prev` and
+  `Moved` are read only for decisions whose final hop is the owner.
 - **Backups** are not stored. They are the owner's cell-mates ranked by
   `Score(member.Key, partition)`. A failover to a backup therefore keeps the
   same route except for the last hop.

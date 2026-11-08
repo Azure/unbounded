@@ -293,8 +293,9 @@ func (pl *Planner) scan(t *Table) {
 
 	for ci := range t.NumChunks() {
 		base := uint32(ci) << chunkShift
-		for j, e := range t.Chunk(ci) {
-			i := pl.owner(e.Owner)
+		owners, _, _ := t.Columns(ci)
+		for j, o := range owners {
+			i := pl.owner(o)
 			if i >= 0 && pl.assign[i] {
 				pl.load[i]++
 			} else {
@@ -316,8 +317,9 @@ func (pl *Planner) scan(t *Table) {
 
 	for ci := range t.NumChunks() {
 		base := uint32(ci) << chunkShift
-		for j, e := range t.Chunk(ci) {
-			i := pl.owner(e.Owner)
+		owners, _, _ := t.Columns(ci)
+		for j, o := range owners {
+			i := pl.owner(o)
 			if i >= 0 && pl.assign[i] {
 				pl.donated[pl.cursor[i]] = base + uint32(j)
 				pl.cursor[i]++
@@ -405,8 +407,9 @@ func (pl *Planner) Settled(t *Table, members []Member) (bool, error) {
 	}
 
 	for ci := range t.NumChunks() {
-		for _, e := range t.Chunk(ci) {
-			i := pl.owner(e.Owner)
+		owners, _, _ := t.Columns(ci)
+		for _, o := range owners {
+			i := pl.owner(o)
 			if i < 0 || !pl.assign[i] {
 				return false, nil
 			}

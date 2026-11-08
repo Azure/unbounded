@@ -502,7 +502,7 @@ func TestNewTableFunc(t *testing.T) {
 
 	u := NewTableFunc(14, func(uint32) Entry { return Entry{Owner: 7, Prev: 2, Moved: 5} })
 	for i := 1; i < u.NumChunks(); i++ {
-		if !SameChunk(u, u, i) || &u.Chunk(i)[0] != &u.Chunk(0)[0] {
+		if u.chunks[i] != u.chunks[0] {
 			t.Fatalf("chunk %d not shared", i)
 		}
 	}
