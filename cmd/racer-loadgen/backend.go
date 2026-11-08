@@ -60,7 +60,9 @@ func (p *puller) acquireHTTP(ctx context.Context, kind string, desc ocispec.Desc
 
 func sdkClientConfig(opts pullOptions, capacity int) racersdk.ClientConfig {
 	// Never let the SDK's zero/default 64 silently cap the configured workload.
-	limit := max(1, capacity*opts.BlobConcurrency)
+	// Each blob read with range-bytes runs range-parallel requests at once,
+	// each holding its own connection.
+	limit := max(1, capacity*opts.BlobConcurrency*rangeFanout(opts))
 
 	return racersdk.ClientConfig{Cache: opts.Cache, MaxConnections: limit, PageCredits: opts.PageCredits}
 }
@@ -186,4 +188,13 @@ func trailingNumber(name string) (int64, bool) {
 	n, err := strconv.ParseInt(name[start:end], 10, 64)
 
 	return n, err == nil
+}
+
+// rangeFanout is how many requests one blob read keeps in flight.
+func rangeFanout(opts pullOptions) int {
+	if opts.Backend != "uds" || opts.RangeBytes <= 0 {
+		return 1
+	}
+
+	return max(1, opts.RangeParallel)
 }

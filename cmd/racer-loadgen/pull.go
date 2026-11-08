@@ -122,7 +122,7 @@ func newPuller(img *syntheticImage, opts pullOptions, metrics *loadMetrics) (*pu
 		capacity = maxLiveConcurrency
 	}
 
-	if capacity > int(^uint(0)>>1)/opts.BlobConcurrency {
+	if capacity > int(^uint(0)>>1)/opts.BlobConcurrency/rangeFanout(opts) {
 		return nil, errors.New("combined batch and blob concurrency is too large")
 	}
 
