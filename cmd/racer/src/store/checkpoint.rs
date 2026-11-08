@@ -312,6 +312,9 @@ impl Checkpointer {
             .borrow()
             .upgrade()
             .map(|writer| writer.metrics.clone());
+        // A real helper thread finishes at a wall time the simulator cannot
+        // schedule, so simulation encodes inline to keep replays deterministic.
+        let offload = !reactor.ctx().is_simulated();
         Ok(Box::pin(async move {
             let image = CheckpointImage {
                 version: CHECKPOINT_VERSION,
@@ -322,7 +325,11 @@ impl Checkpointer {
             };
             // Validation and encoding of a large cut is seconds of CPU. Run it
             // on a helper thread so this reactor keeps serving I/O meanwhile.
-            let encoded = encode_offloaded(image, budget).await;
+            let encoded = if offload {
+                encode_offloaded(image, budget).await
+            } else {
+                encode_inline(&image, budget)
+            };
             if let Some(metrics) = &metrics {
                 metrics.record(
                     crate::telemetry::Event::CheckpointEncodeNs,
@@ -376,6 +383,18 @@ fn encode_checked(image: &CheckpointImage, budget: usize) -> Result<(Vec<u8>, [u
     Ok((bytes, current))
 }
 
+/// Run [`encode_checked`] on the calling thread.
+fn encode_inline(image: &CheckpointImage, budget: usize) -> Encoded {
+    let start = std::time::Instant::now();
+    let result = encode_checked(image, budget);
+    Encoded {
+        result,
+        elapsed: start.elapsed(),
+        #[cfg(test)]
+        thread: std::thread::current().name().map(Into::into),
+    }
+}
+
 /// Run [`encode_checked`] on a dedicated helper thread and await its result
 /// without blocking the calling reactor. Falls back to encoding inline only
 /// when the OS refuses a new thread.
@@ -398,14 +417,7 @@ async fn encode_offloaded(image: CheckpointImage, budget: usize) -> Encoded {
             });
         });
     if spawned.is_err() {
-        let start = std::time::Instant::now();
-        let result = encode_checked(&image, budget);
-        return Encoded {
-            result,
-            elapsed: start.elapsed(),
-            #[cfg(test)]
-            thread: std::thread::current().name().map(Into::into),
-        };
+        return encode_inline(&image, budget);
     }
     drop(image);
     receiver.await.unwrap_or(Encoded {
