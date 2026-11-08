@@ -34,11 +34,17 @@ var metaKS = cachemesh.MustKeyspace("layer-metadata", 10*time.Minute)
 // get is the client side: route the key and send the request.
 func (s *server) get(key string) (string, error) {
 	d := s.mesh.Route(metaKS, []byte(key))
-	if d.Kind == cachemesh.KindSelf {
-		return s.serve(key), nil
-	}
 
-	return s.send(d, key)
+	switch d.Kind {
+	case cachemesh.KindSelf:
+		return s.serve(key), nil
+	case cachemesh.KindNoRoute:
+		// Not joined and no gateway known yet: go to the origin or fail.
+		return "", errors.New("no route")
+	default:
+		// Relay, Owner, Backup, Direct, Gateway: send to d.Next.
+		return s.send(d, key)
+	}
 }
 
 // send sends a request to d.Next, observes the outcome, and hedges to

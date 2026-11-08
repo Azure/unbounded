@@ -56,7 +56,9 @@ const (
 
 const leaseQueue = 16
 
-// Mesh is one cluster member. See the package documentation.
+// Mesh is one cluster member. Create it with New; the zero value is not
+// usable. All methods are safe for concurrent use. See the package
+// documentation.
 type Mesh struct {
 	cfg   Config
 	log   *slog.Logger
@@ -707,7 +709,10 @@ func (m *Mesh) resendInvalidations(now int64) {
 
 // Leave starts a graceful departure and waits until this member has
 // observed its own removal (after which Run returns nil), Run stops, or ctx
-// is done. The member keeps serving while it drains.
+// is done. The member keeps serving while it drains. It returns nil once
+// the member has left, ErrNotRunning if Run is not active or returns
+// first, and ctx.Err() if ctx ends first, in which case the departure
+// continues in the background.
 func (m *Mesh) Leave(ctx context.Context) error {
 	if !m.running.Load() {
 		return ErrNotRunning
@@ -779,7 +784,8 @@ func (m *Mesh) Ready() bool {
 }
 
 // Neighbors returns the current data-plane neighbors (without lingering
-// ones).
+// ones) in a new slice. It takes the Mesh lock; prefer a NeighborWatcher
+// to track changes.
 func (m *Mesh) Neighbors() []PeerRef {
 	m.mu.Lock()
 	defer m.mu.Unlock()

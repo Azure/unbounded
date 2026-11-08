@@ -734,7 +734,7 @@ func (m *Mesh) Observe(p PeerRef, r Result, latency time.Duration)
 func (m *Mesh) TryHedge(h Header) bool
 func (m *Mesh) Stamp(ks Keyspace) Stamp
 func (m *Mesh) Fresh(ks Keyspace, s Stamp) bool
-func (m *Mesh) Invalidate(ks Keyspace)
+func (m *Mesh) Invalidate(ctx context.Context, ks Keyspace) error
 func (m *Mesh) ServeControl(ctx context.Context, from Endpoint, msg []byte) ([]byte, error)
 func (m *Mesh) Run(ctx context.Context) error
 func (m *Mesh) Leave(ctx context.Context) error
@@ -790,7 +790,15 @@ error.
 `Lease` (may be nil: the member then joins only through seeds and never
 bootstraps or leads), `Neighbors`, `Logger` (`log/slog`), `Hooks`
 (`OnView`, `OnLeadership`, `OnControlError`, `OnLeaseError`), and the common
-cluster knobs `PartitionBits`, `CellSize`, `MaxNeighbors`, `EpochPeriod`.
+cluster knobs `PartitionBits`, `CellSize`, `MaxNeighbors`, `EpochPeriod`, and
+`ExpectedSize`. `ExpectedSize` sets `Election.ExpectedClusterSize` (setting
+both to different values is an error). It is the lottery floor on N, so it
+trades bootstrap latency for API server protection: the lone first member of
+a new cluster waits about `ExpectedSize / LotteryBudgetQPS` seconds (about
+50s at the default 1000, under a second at 20 or less), while members
+without a view read the Lease at about `LotteryBudgetQPS * actual /
+ExpectedSize` per second. Members with a view use its size, so only a
+cluster-wide cold restart is exposed when the value is too small.
 Advanced knobs live in `Config.Tuning`: node timers (ping, suspicion, join,
 call timeout, linger, leader and elector ticks), `EpochAdvance` (100ms, the
 longest the runtime waits between ticks, bounding epoch staleness),
@@ -804,10 +812,15 @@ Runtime (`Mesh`):
 
 - `New` builds the `node.Node` and a `route.Env` holding the node's health
   and epoch trackers, a `route.Notes`, the self ID and incarnation, and the
-  configured seeds (other than its own address) as gateways
-  (`PeerRef{Slot: NoSlot, ID: addr, Addr: addr}`). Seeds learned later from
-  the Lease are not gateways; a member without configured seeds routes
-  `KindDirect` once it has a view and `KindNoRoute` before.
+  node's join seeds (other than its own address) as gateways
+  (`PeerRef{Slot: NoSlot, ID: addr, Addr: addr}`). While the member is not
+  in its view, the runtime compares the node's seed list (configured seeds,
+  seeds and the leader address learned from the Lease, members of views
+  seen while joining, minus dropped unresponsive ones) after every node call
+  and rebuilds the `Env` and `State` when it changed, so a member configured
+  with only a Lease routes through gateways while joining. A member with no
+  seeds at all routes `KindDirect` once it has a view and `KindNoRoute`
+  before.
 - Every node method runs under one mutex. After each call the runtime
   rebuilds the `atomic.Pointer[route.State]` if the node's view or self slot
   changed, and tracks leadership and `Left`.
@@ -828,8 +841,22 @@ Runtime (`Mesh`):
   report the same `PeerRef` that was added. A slot reused by another member
   is reported as a removal of the old peer and an addition of the new one.
   Events are queued and delivered in order by one goroutine, never under
-  the Mesh lock.
-- `Invalidate` is fire-and-forget: it is dropped when no leader is known.
+  the Mesh lock. `OnView` and `OnLeadership` hooks go through the same
+  queue (consecutive view events coalesce), so every hook may call Mesh
+  methods. `OnControlError` runs on the failed call's goroutine and
+  `OnLeaseError` on the Lease goroutine, neither under the lock.
+- `ServeControl` rejects messages over `MaxControlMessageSize`
+  (`wire.MaxMessageSize`) with `ErrMessageTooLarge`; other malformed input
+  gets an encoded rejection.
+- `Invalidate` queues a request per keyspace seed (at most
+  `MaxPendingInvalidations`, 1024; beyond that `ErrTooManyInvalidations`),
+  recording the keyspace generation of the current view as its base (or the
+  first view's, if it has none yet). The run loop sends it to the leader
+  every `JoinRetry` until a view shows a different generation, which
+  completes every caller waiting on that seed. A canceled ctx returns
+  `ctx.Err()` but leaves the request queued; waiters get `ErrNotRunning`
+  when `Run` returns. Retries can bump a generation more than once, which
+  only makes values stale earlier.
 - Status accessors read the snapshot: `Version`, `Members`, `Leader`,
   `Self`, `Ready` (Active in the view), plus `Leading`, `Neighbors`,
   `Done`, `ID`, `Incarnation`, and `Addr`.
