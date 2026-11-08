@@ -110,9 +110,6 @@ type member struct {
 	last    view.Version
 	lastEp  uint64
 	leaving bool
-	// seeds are the configured seed addresses (the data plane routes
-	// through them as gateways while the member is not in its view).
-	seeds []string
 }
 
 // Fire runs a scheduled tick.
@@ -399,7 +396,6 @@ func (c *Cluster) OnStart(i uint32, inc uint64) {
 		c.cfg.Node(i, &cfg)
 	}
 
-	m.seeds = cfg.Seeds
 
 	m.n = node.New(cfg, c.Sim.Stream("node/"+strconv.FormatUint(uint64(i), 10)+"/"+strconv.FormatUint(inc, 10)))
 	c.members[i] = m

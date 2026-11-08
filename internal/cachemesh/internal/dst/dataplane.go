@@ -266,6 +266,8 @@ type dpMember struct {
 	lastEp    uint64
 	decisions uint64 // Route and Forward calls, for the hedge budget
 	hedges    uint64
+	seeds     []string // gateway seeds env was built with
+	seedBuf   []string
 }
 
 // trackRing keeps the largest tracked-peer count of each check period over
@@ -482,23 +484,48 @@ func (w *DataPlane) state(i uint32) *route.State {
 	if dm.n != m.n {
 		w.gen++
 
-		gws := make([]route.PeerRef, 0, len(m.seeds))
-		for _, s := range m.seeds {
-			gws = append(gws, route.PeerRef{Slot: view.NoSlot, ID: s, Addr: s})
-		}
-
 		*dm = dpMember{n: m.n, gen: w.gen}
-		dm.env = route.NewEnv(route.Config{
-			Health: m.n.Health(), Epoch: m.n.Epoch(), Notes: &route.Notes{}, Gateways: gws,
-			SelfID: memberID(i), SelfIncarnation: m.inc, PartitionBits: w.c.sc.PartitionBits,
-		})
+		dm.seeds = m.n.Seeds(nil)
+		dm.env = w.newEnv(i, m, dm.seeds)
 	}
 
-	if dm.st == nil || dm.st.View() != m.n.View() || dm.st.Self() != m.n.Self() {
+	// While not a member, route through every seed the node knows,
+	// including those learned from the Lease and from views, as the
+	// public Mesh does.
+	rebuilt := false
+
+	if m.n.Self() == view.NoSlot {
+		dm.seedBuf = m.n.Seeds(dm.seedBuf[:0])
+		if !slices.Equal(dm.seedBuf, dm.seeds) {
+			dm.seeds = slices.Clone(dm.seedBuf)
+			dm.env = w.newEnv(i, m, dm.seeds)
+			rebuilt = true
+		}
+	}
+
+	if rebuilt || dm.st == nil || dm.st.View() != m.n.View() || dm.st.Self() != m.n.Self() {
 		dm.st = route.NewState(m.n.View(), m.n.Self(), dm.env)
 	}
 
 	return dm.st
+}
+
+// newEnv returns member i's routing Env with seeds other than its own
+// address as gateways.
+func (w *DataPlane) newEnv(i uint32, m *member, seeds []string) *route.Env {
+	self := memberAddr(i)
+	gws := make([]route.PeerRef, 0, len(seeds))
+
+	for _, s := range seeds {
+		if s != self {
+			gws = append(gws, route.PeerRef{Slot: view.NoSlot, ID: s, Addr: s})
+		}
+	}
+
+	return route.NewEnv(route.Config{
+		Health: m.n.Health(), Epoch: m.n.Epoch(), Notes: &route.Notes{}, Gateways: gws,
+		SelfID: memberID(i), SelfIncarnation: m.inc, PartitionBits: w.c.sc.PartitionBits,
+	})
 }
 
 // noteTracked records member i's tracked-peer count.
