@@ -911,9 +911,23 @@ func (n *Node) nack(r wire.Reason) []byte {
 	return wire.Append(nil, &n.resp)
 }
 
+// noteEpoch moves this member's epoch forward to a peer's when the peer is
+// ahead (pings and pongs carry the sender's epoch). The tracker ignores an
+// epoch it already reaches, so the cluster epoch follows its most advanced
+// member: a leader whose epoch lags (for example a lottery winner that
+// anchored from a stale snapshot) catches up instead of pulling every
+// member that anchors to its heartbeats behind.
+func (n *Node) noteEpoch(now int64, e uint64) {
+	if e > n.ep.Current() {
+		n.ep.Anchor(e, n.ep.Period(), now)
+	}
+}
+
 // noteRemote compares a peer's version with ours and catches up if the
 // peer is ahead.
 func (n *Node) noteRemote(now int64, addr string, m *wire.Message) {
+	n.noteEpoch(now, m.Epoch)
+
 	mine := n.v.Version()
 
 	switch {

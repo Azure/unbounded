@@ -819,3 +819,36 @@ func TestWholeMembershipReplaced(t *testing.T) {
 		t.Fatalf("lineage restarted: %v", v.Version())
 	}
 }
+
+// TestPingEpochAntiEntropy is a regression test: pings carry the sender's
+// epoch, but it was ignored, so a leader whose epoch lagged (a lottery
+// winner that anchored from a stale snapshot) never caught up and every
+// member that anchored to its heartbeats lagged with it, stretching stamp
+// lifetimes (found by the DST data-plane workload).
+func TestPingEpochAntiEntropy(t *testing.T) {
+	c := newCluster(t)
+	a := New(c.cfg(0, nil), rand.New(rand.NewPCG(1, 1)))
+	b := New(c.cfg(1, nil), rand.New(rand.NewPCG(2, 2)))
+	a.Start(c.now, c.wall())
+	b.Start(c.now, c.wall())
+
+	b.ep.Anchor(10, 15*time.Second, c.now)
+
+	var m wire.Message
+
+	b.header(&m, wire.KindPing)
+	a.Handle(c.now+sec, b.cfg.Addr, wire.Append(nil, &m))
+
+	if got := a.Epoch().Current(); got != 10 {
+		t.Fatalf("epoch after ping from a peer at 10: %d", got)
+	}
+
+	// A peer behind does not pull it back or move its phase.
+	a.header(&m, wire.KindPing)
+	m.Epoch = 3
+	a.Handle(c.now+2*sec, b.cfg.Addr, wire.Append(nil, &m))
+
+	if got := a.Epoch().Advance(c.now + 16*sec); got != 11 {
+		t.Fatalf("epoch 15s after the anchor: %d, want 11", got)
+	}
+}

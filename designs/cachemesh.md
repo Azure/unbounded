@@ -344,6 +344,12 @@ table as bit-packed columns; derived indexes are rebuilt and checked by
   that then became leader published its late phase, every member stalled
   to match, and each leader change stretched every lifetime by up to
   another period. Only an anchor ahead of the member re-anchors it.
+- Pings and pongs carry the sender's epoch; a member behind a peer anchors
+  forward to it (the tracker ignores epochs it already reaches). The
+  cluster epoch therefore follows its most advanced member, and a leader
+  whose epoch lags (a lottery winner that anchored from a stale snapshot)
+  catches up within a few ping intervals instead of pulling every member
+  that later anchors to its heartbeats behind it.
 - A member counts epochs from its start (epoch 0 at `Start`) until the
   first heartbeat or snapshot anchors it. Anchoring at monotonic time 0
   would start it at `uptime / period`, ahead of the cluster for good.
