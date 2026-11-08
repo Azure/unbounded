@@ -424,15 +424,19 @@ func (s *State) RouteMany(seed uint64, keys [][]byte, out []Decision) {
 // Forward routes a request received with header h. On ErrTTLExhausted the
 // decision is still returned for diagnostics but must not be sent.
 func (s *State) Forward(h Header) (d Decision, err error) {
-	if err := h.check(); err != nil {
-		return d, err
+	// Fast validity test; check builds the descriptive error.
+	if h.Format != HeaderFormat || h.Flags&^flagsKnown != 0 || h.Hops > h.TTL {
+		return d, h.check()
 	}
 
 	if s.bits < 32 && h.Partition>>s.bits != 0 {
 		return d, ErrBadHeader
 	}
 
-	s.env.notes.note(&h, s.term, s.seq)
+	// Inline the common case (sender not ahead) before calling note.
+	if h.Term > s.term || (h.Term == s.term && h.Seq > s.seq) {
+		s.env.notes.note(&h, s.term, s.seq)
+	}
 
 	avoid := h.Sender
 	if avoid == s.self {
