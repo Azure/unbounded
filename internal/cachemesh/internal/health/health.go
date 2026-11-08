@@ -970,19 +970,21 @@ func stackShard() uint64 {
 func (t *Tracker) TryHedge(hint uint64) bool {
 	_ = hint
 
+	// Sum the shards only until the budget covers one more hedge.
+	need := (t.hedged.Load() + 1) * 1e6
+
 	var routed uint64
 
 	for i := range t.hedge {
 		routed += t.hedge[i].routed.Load()
+		if routed*t.hedgePM >= need {
+			t.hedged.Add(1)
+
+			return true
+		}
 	}
 
-	if (t.hedged.Load()+1)*1e6 > routed*t.hedgePM {
-		return false
-	}
-
-	t.hedged.Add(1)
-
-	return true
+	return false
 }
 
 // Tick advances the control clock to now (node-local monotonic ns). Call it
