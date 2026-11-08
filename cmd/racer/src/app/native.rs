@@ -211,6 +211,16 @@ impl WorkerApplication {
         }
         let snapshot = self.node.inventory.snapshot()?;
         if snapshot.generation != self.inventory_generation {
+            if self.native_owner() && !self.actual_rails.is_empty() {
+                // Not a device loss: an inventory refresh (enrollment or
+                // renewal) changed this node's ports. Say so, or RDMA could
+                // go inactive here without a trace.
+                eprintln!(
+                    "racer: stage=rdma-inventory state=changed generation={} rails={}; reactivating RDMA",
+                    snapshot.generation,
+                    snapshot.nics.len()
+                );
+            }
             self.native_task.take();
             self.close_native();
             self.actual_rails.clear();
@@ -665,16 +675,23 @@ impl WorkerApplication {
         Err(Error::Unavailable)
     }
 
-    /// Log once per change why RDMA is not activating after a device loss.
+    /// Log once per change why RDMA is not activating: after a device loss,
+    /// and otherwise too (an inventory refresh that found no port leaves RDMA
+    /// inactive with nothing else in the log).
     fn note_waiting(&mut self, waiting: Option<String>) {
-        if self.rdma_lost.is_none() || waiting == self.rdma_waiting {
+        if waiting == self.rdma_waiting {
             return;
         }
+        let stage = if self.rdma_lost.is_some() {
+            "rdma-device"
+        } else {
+            "rdma-activation"
+        };
         match &waiting {
             Some(reason) => eprintln!(
-                "racer: stage=rdma-device state=waiting reason={reason}; reactivating once it clears"
+                "racer: stage={stage} state=waiting reason={reason}; activating once it clears"
             ),
-            None => eprintln!("racer: stage=rdma-device state=ready; activating"),
+            None => eprintln!("racer: stage={stage} state=ready; activating"),
         }
         self.rdma_waiting = waiting;
     }
@@ -1921,6 +1938,87 @@ mod tests {
         assert!(links.rail_ready(RailId(0)));
         assert!(worker.rdma_lost.is_none());
         assert_eq!(metrics.count(Event::RdmaDeviceLoss), 0);
+    }
+
+    #[test]
+    /// An inventory refresh while a registration-mode (MANA) rail is active,
+    /// as enrollment renewal does, keeps listing the rail, so it neither
+    /// changes the inventory generation nor tears RDMA down. Discovery used
+    /// to start a second connection manager listener on the active address,
+    /// which fails, so the refresh published no rail and RDMA stayed
+    /// inactive until the process restarted.
+    fn inventory_refresh_keeps_an_active_registration_rail() {
+        use rdma_verbs::simulation::{Device, Profile, Simulation, default_profile};
+        let _profile = default_profile(Profile::Registration);
+        let sim = Simulation::new();
+        let simulated = sim
+            .with_devices(vec![Device::new(
+                "mana0",
+                [10, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 10, 0, 0, 1],
+            )])
+            .unwrap();
+        let _devices = simulated.enter();
+        let env = racer_io::Env::host();
+        let mut app = configured();
+        let initial = app.node.inventory.refresh().unwrap();
+        assert_eq!(initial.nics.len(), 1);
+        app.discovered_nics = initial.nics.clone();
+        let (mut worker, engine) = worker(&env, &app, true, true);
+        let mut service = test_owner(&app, engine);
+        let mut run = |worker: &mut WorkerApplication| {
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            for _ in 0..20 {
+                worker.poll_native(&mut cx).unwrap();
+                service.poll_budgeted(&mut cx, 64).unwrap();
+            }
+        };
+        run(&mut worker);
+        let links = worker.links.clone().unwrap();
+        let rail = initial.nics[0].rail;
+        assert!(links.rail_ready(rail));
+        let refreshed = app.node.inventory.refresh().unwrap();
+        assert_eq!(refreshed.nics, initial.nics);
+        assert_eq!(refreshed.generation, initial.generation);
+        run(&mut worker);
+        assert!(links.rail_ready(rail));
+        assert!(!worker.actual_rails.is_empty());
+        assert_eq!(worker.rdma_waiting, None);
+    }
+
+    #[test]
+    /// An inventory refresh that finds no port leaves RDMA inactive; the
+    /// worker records why, so it is logged rather than silent.
+    fn inventory_refresh_without_ports_records_why_rdma_waits() {
+        use rdma_verbs::simulation::{Device, Simulation};
+        let sim = Simulation::new();
+        let simulated = sim
+            .with_devices(vec![Device::new("test-device", [1; 16])])
+            .unwrap();
+        let _devices = simulated.enter();
+        let env = racer_io::Env::host();
+        let mut app = configured();
+        let initial = app.node.inventory.refresh().unwrap();
+        assert_eq!(initial.nics.len(), 1);
+        app.discovered_nics = initial.nics.clone();
+        let (mut worker, engine) = worker(&env, &app, true, true);
+        let mut service = test_owner(&app, engine);
+        let mut run = |worker: &mut WorkerApplication| {
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            for _ in 0..20 {
+                worker.poll_native(&mut cx).unwrap();
+                service.poll_budgeted(&mut cx, 64).unwrap();
+            }
+        };
+        run(&mut worker);
+        assert!(!worker.actual_rails.is_empty());
+        app.node.inventory.update(Vec::new()).unwrap();
+        run(&mut worker);
+        assert!(worker.actual_rails.is_empty());
+        assert!(worker.rdma_lost.is_none());
+        assert_eq!(
+            worker.rdma_waiting.as_deref(),
+            Some("publication_empty:discovered=0")
+        );
     }
 
     #[test]
