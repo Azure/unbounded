@@ -369,6 +369,23 @@ fn publish(cell: &PublicationCell<Gen>, value: Arc<Gen>) -> Result<Arc<Gen>> {
     cell.publish(value, Instant::now(), |_, _| Ok(()), || ())
 }
 
+/// Per-turn readers never take the admission mutex, so a worker reading the
+/// current generation cannot contend with (or park behind) admission or part
+/// resolution on other workers.
+#[test]
+fn current_reads_do_not_take_admission_lock() {
+    let cell = PublicationCell::new(retention(1));
+    publish(&cell, snapshot(1, 1)).unwrap();
+    let held = cell.state.lock().unwrap();
+    assert_eq!(cell.current().unwrap().unwrap().sequence, 1);
+    let (epoch, current) = cell.current_with_epoch().unwrap();
+    assert_eq!((epoch, current.unwrap().sequence), (1, 1));
+    drop(held);
+    publish(&cell, snapshot(2, 2)).unwrap();
+    let (epoch, current) = cell.current_with_epoch().unwrap();
+    assert_eq!((epoch, current.unwrap().sequence), (2, 2));
+}
+
 /// Both snapshot and direct part leases retain capacity without advancing acceptance.
 #[test]
 fn old_snapshot_and_part_leases_block_without_advancing_cursor() {

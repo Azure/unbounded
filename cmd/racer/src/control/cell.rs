@@ -12,7 +12,7 @@ use crate::error::{Error, Result};
 use std::{
     collections::BTreeMap,
     sync::{
-        Arc, Mutex, Weak,
+        Arc, Mutex, RwLock, Weak,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -110,21 +110,25 @@ pub fn accept<T: Generation>(prev: Option<&T>, next: &T) -> Result<Accepted> {
     Ok(Accepted::NewPart)
 }
 
-/// Node-wide immutable state. Replacement admission and cold reads share one
-/// lock; hot readers follow `epoch` instead.
+/// Node-wide immutable state. Replacement admission and part resolution share
+/// the `state` mutex. The current generation sits behind a separate reader-writer
+/// lock so that per-turn readers on every worker never contend on (or park in)
+/// the admission mutex; only `publish` takes it for writing, after `state`.
 pub struct PublicationCell<T: Generation> {
     retention: Retention,
 
     /// Advanced with Release after every visible replacement of `current`.
     epoch: AtomicU64,
 
+    /// Written only by `publish` while holding `state` (lock order: `state`,
+    /// then `current`), so admission sees stable strong counts.
+    current: RwLock<Option<Arc<T>>>,
+
     state: Mutex<State<T>>,
 }
 
 /// All mutable authority resides under the publication mutex.
 struct State<T: Generation> {
-    current: Option<Arc<T>>,
-
     parts: BTreeMap<T::PartVersion, Weak<T::Part>>,
 
     grace: Vec<(Instant, T::PartVersion, Arc<T::Part>)>,
@@ -136,8 +140,8 @@ impl<T: Generation> PublicationCell<T> {
         Self {
             retention,
             epoch: AtomicU64::new(0),
+            current: RwLock::new(None),
             state: Mutex::new(State {
-                current: None,
                 parts: BTreeMap::new(),
                 grace: Vec::new(),
             }),
@@ -153,14 +157,19 @@ impl<T: Generation> PublicationCell<T> {
 
     /// Lease the complete current publication, if one has been accepted.
     pub fn current(&self) -> Result<Option<Arc<T>>> {
-        Ok(self.lock()?.current.clone())
+        Ok(self.read()?.clone())
     }
 
     /// Lease the current publication together with the epoch that names it.
     pub fn current_with_epoch(&self) -> Result<(u64, Option<Arc<T>>)> {
-        let state = self.lock()?;
-        // The epoch only changes under this lock, so it names `current` exactly.
-        Ok((self.epoch.load(Ordering::Relaxed), state.current.clone()))
+        let current = self.read()?;
+        // The epoch only changes under the write lock, so it names `current` exactly.
+        Ok((self.epoch.load(Ordering::Relaxed), current.clone()))
+    }
+
+    /// Share-lock the current generation, mapping poisoning to an internal error.
+    fn read(&self) -> Result<std::sync::RwLockReadGuard<'_, Option<Arc<T>>>> {
+        self.current.read().map_err(|_| Error::Internal)
     }
 
     /// Lock the state, mapping poisoning to an internal error.
@@ -236,10 +245,11 @@ impl<T: Generation> PublicationCell<T> {
         let mut retired = Vec::new();
         let retired_snapshot;
         let mut state = self.lock()?;
-        let accepted = accept(state.current.as_deref(), &next)?;
-        validate(state.current.as_deref(), &next)?;
+        let mut current = self.current.write().map_err(|_| Error::Internal)?;
+        let accepted = accept(current.as_deref(), &next)?;
+        validate(current.as_deref(), &next)?;
         if accepted == Accepted::Exact
-            && let Some(old) = &state.current
+            && let Some(old) = &*current
         {
             return Ok(old.clone());
         }
@@ -259,7 +269,7 @@ impl<T: Generation> PublicationCell<T> {
                 state.retire(index, &mut retired);
             }
             state.parts.retain(|_, p| p.strong_count() != 0);
-            let replaceable = state.current.as_ref().is_some_and(|old| {
+            let replaceable = current.as_ref().is_some_and(|old| {
                 Arc::strong_count(old) == 1 && Arc::strong_count(old.part()) == 1
             });
             if state
@@ -280,7 +290,7 @@ impl<T: Generation> PublicationCell<T> {
             // externally pinned old parts already consume the entire budget.
             && state.live_parts(&retired) <= self.retention.old_parts
         {
-            if let Some(old) = &state.current
+            if let Some(old) = &*current
                 && T::part_bytes(old.part()) <= self.retention.grace_bytes
             {
                 let entry = (
@@ -300,7 +310,7 @@ impl<T: Generation> PublicationCell<T> {
                 state.retire(0, &mut retired);
             }
         }
-        retired_snapshot = state.current.replace(next.clone());
+        retired_snapshot = current.replace(next.clone());
         // Publish the new generation to epoch readers. Release pairs with the
         // Acquire load in `epoch`, so a reader that observes the new epoch and
         // then locks sees `current` (and everything committed above).
@@ -309,6 +319,7 @@ impl<T: Generation> PublicationCell<T> {
         state
             .parts
             .insert(next.part_version(), Arc::downgrade(next.part()));
+        drop(current);
         drop(state);
         drop(retired_snapshot);
         drop(retired);
