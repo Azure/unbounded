@@ -462,6 +462,17 @@ pub fn refresh_char_devices(sysfs: &Path, dir: &Path) -> std::io::Result<usize> 
     Ok(devices.len())
 }
 
+/// Whether `dir` holds a character device node with the right numbers for
+/// every entry of `devices`.
+pub fn char_devices_present(dir: &Path, devices: &[(u32, u32)]) -> bool {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    devices.iter().all(|&(major, minor)| {
+        std::fs::metadata(dir.join(format!("{major}:{minor}"))).is_ok_and(|meta| {
+            meta.file_type().is_char_device() && meta.rdev() == libc::makedev(major, minor)
+        })
+    })
+}
+
 /// [`inventory`] with each port's PCI address, when sysfs reports one.
 fn keyed_inventory() -> Vec<(RailMapping, Option<String>)> {
     inventory_keyed_at(

@@ -1079,8 +1079,11 @@ pub struct WorkerApplication {
     /// `None` in tests, which must not create device nodes on the host.
     rdma_char_devices: Option<(std::path::PathBuf, std::path::PathBuf)>,
 
-    /// The nodes were refreshed since the last device loss.
-    rdma_char_refreshed: bool,
+    /// The sysfs `(major, minor)` numbers the nodes were last refreshed for
+    /// since the last device loss; `None` before the first refresh. A device
+    /// that comes back with other numbers, or whose node went missing, is
+    /// refreshed again. The flag records whether that refresh succeeded.
+    rdma_char_refreshed: Option<(Vec<(u32, u32)>, bool)>,
 
     /// Next sysfs presence probe of the active rails.
     rail_probe: std::time::Instant,
@@ -1782,7 +1785,7 @@ impl WorkerApplication {
                     crate::rdma::DEV_CHAR.into(),
                 )
             }),
-            rdma_char_refreshed: false,
+            rdma_char_refreshed: None,
             rail_probe: started,
             rdma_sysfs: crate::rdma::SYSFS_INFINIBAND.into(),
             telemetry: Rc::new(telemetry),
