@@ -909,6 +909,7 @@ func TestLotteryZeroClusterSize(t *testing.T) {
 	for i := range n {
 		e := New(Config{ExpectedClusterSize: n}, self(i), newRNG(uint64(i)))
 		in := Input{Wall: epoch, HaveView: true, ClusterSize: 0}
+
 		e.SetHooks(Hooks{OnOp: func(OpKind) {
 			if in.Now >= sec(50) {
 				total++

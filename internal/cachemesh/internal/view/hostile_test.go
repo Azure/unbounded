@@ -154,6 +154,12 @@ func TestHostileDeltas(t *testing.T) {
 
 			accepted++
 
+			if i%10 == 0 {
+				// Random shapes include dimensions of size 1 and 2 and
+				// sparse cells.
+				checkMonitoring(t, nv)
+			}
+
 			if g.r.IntN(4) == 0 {
 				old = append(old, kept{v, before})
 			}
@@ -209,4 +215,46 @@ func TestEpochOverflow(t *testing.T) {
 
 	v = mustApply(t, v, append(ops, view.OpRemoveMember(victim))...)
 	mustFail(t, v, view.ErrInvalid, view.OpAddMember(victim, active(99, 0)))
+}
+
+// TestDeltaLogAheadAndFork checks that Since refuses a view ahead of the
+// head and a view on a fork created by a different leader of the same term
+// and seq.
+func TestDeltaLogAheadAndFork(t *testing.T) {
+	vs, ds := chain(t, 6)
+
+	l := view.NewDeltaLog(8)
+	l.Reset(vs[0])
+
+	for _, d := range ds {
+		if err := l.Append(d, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	head := vs[len(vs)-1]
+
+	ahead := mustApply(t, head, view.OpEpoch(head.Epoch()+1, time.Second))
+	if _, ok := l.Since(ahead.Version(), ahead.Digest(), 0); ok {
+		t.Fatal("served a view ahead of the head")
+	}
+
+	newTerm := mustApply(t, head, view.OpNewTerm(head.Term()+1, head.Leader()))
+	if _, ok := l.Since(newTerm.Version(), newTerm.Digest(), 0); ok {
+		t.Fatal("served a view in a later term")
+	}
+
+	// A fork off vs[2] with the same version as vs[3] but another digest.
+	fork := mustApply(t, vs[2], view.OpEpoch(vs[2].Epoch()+5, time.Second))
+	if fork.Version() != vs[3].Version() || fork.Digest() == vs[3].Digest() {
+		t.Fatal("fork setup")
+	}
+
+	if _, ok := l.Since(fork.Version(), fork.Digest(), 0); ok {
+		t.Fatal("served a forked view")
+	}
+
+	if got, ok := l.Since(vs[3].Version(), vs[3].Digest(), 0); !ok || len(got) != 3 {
+		t.Fatalf("got %d entries, ok %v", len(got), ok)
+	}
 }
