@@ -6,6 +6,7 @@ package view
 import (
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 
 	"github.com/Azure/unbounded/internal/cachemesh/internal/hashing"
@@ -339,6 +340,10 @@ func (a *applier) remove(s Slot) error {
 
 	ci := s >> memShift
 	r := v.epoch + uint64(v.config.SlotReuseEpochs)
+	if r < v.epoch {
+		// Saturate rather than wrap, which would free the slot at once.
+		r = math.MaxUint64
+	}
 	v.mem[ci].reuse[s&memMask] = r
 	v.minReuse[ci] = min(v.minReuse[ci], r)
 	v.n--
