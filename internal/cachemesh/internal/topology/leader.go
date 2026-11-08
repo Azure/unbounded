@@ -27,8 +27,10 @@ func Choose(n, cellSize, maxNeighbors int) Shape {
 		n = 0
 	}
 
+	// Factor may round the product up to just under twice cells, so cap
+	// cells at MaxCells/2 to keep every candidate shape valid.
 	cells := max(1, n/cellSize)
-	cells = min(cells, MaxCells)
+	cells = min(cells, MaxCells/2)
 
 	var (
 		s   Shape

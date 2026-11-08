@@ -618,3 +618,31 @@ func BenchmarkBalanceMoves(b *testing.B) {
 		sink += uint32(len(BalanceMoves(occ, cands, 32)))
 	}
 }
+
+// TestChooseHuge: Factor rounds the cell count up, which used to push the
+// product past MaxCells and panic in mustShape for very large n.
+func TestChooseHuge(t *testing.T) {
+	for _, n := range []int{MaxCells, MaxCells + 12345, 1 << 31, 1<<31 - 1, 1 << 40} {
+		for _, maxN := range []int{1, 16, 256} {
+			s := Choose(n, 1, maxN)
+			if err := s.Validate(); err != nil {
+				t.Fatalf("Choose(%d, 1, %d): %v", n, maxN, err)
+			}
+		}
+	}
+}
+
+func FuzzFastDiv(f *testing.F) {
+	f.Add(uint32(0), uint32(1))
+	f.Add(^uint32(0), uint32(3))
+	f.Add(^uint32(0), ^uint32(0))
+	f.Fuzz(func(t *testing.T, a, d uint32) {
+		if d == 0 {
+			return
+		}
+
+		if got := fastDiv(a, magic(d)); got != a/d {
+			t.Fatalf("fastDiv(%d, %d) = %d, want %d", a, d, got, a/d)
+		}
+	})
+}
