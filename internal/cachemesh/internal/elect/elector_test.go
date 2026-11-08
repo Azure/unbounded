@@ -891,3 +891,39 @@ func runSim(t *testing.T, seed uint64) {
 		}
 	}
 }
+
+// TestLotteryZeroClusterSize checks that a view reporting no members does
+// not make every lottery member read every round.
+func TestLotteryZeroClusterSize(t *testing.T) {
+	t.Parallel()
+
+	s := &memStore{}
+	s.store(Record{Holder: "L", RenewTime: epoch.Add(time.Hour)})
+
+	// Members enter the lottery by 45s (NoLeaderTimeout plus jitter);
+	// reads are counted from 50s on.
+	const n, rounds = 500, 20
+
+	total := 0
+
+	for i := range n {
+		e := New(Config{ExpectedClusterSize: n}, self(i), newRNG(uint64(i)))
+		in := Input{Wall: epoch, HaveView: true, ClusterSize: 0}
+		e.SetHooks(Hooks{OnOp: func(OpKind) {
+			if in.Now >= sec(50) {
+				total++
+			}
+		}})
+
+		for r := range (50 + rounds) * 10 {
+			in.Now = int64(r) * sec(0.1)
+			for _, op := range e.Tick(in) {
+				e.OnResult(in, s.apply(op))
+			}
+		}
+	}
+
+	if qps := float64(total) / rounds; qps > 40 {
+		t.Fatalf("lottery qps %.1f with ClusterSize 0, want ~20", qps)
+	}
+}

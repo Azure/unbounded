@@ -52,7 +52,11 @@
 // is sent at least LeaseDuration after the old anchor, while the old leader
 // stopped by anchor+RenewDeadline. With RenewDeadline < LeaseDuration, and
 // clock rate drift small enough that LeaseDuration-RenewDeadline covers it,
-// the two leaderships do not overlap in global time. The compare-and-swap
+// the two leaderships do not overlap in global time. Precisely, if local
+// monotonic clocks run at rates in [rmin, rmax] of real time, safety needs
+// LeaseDuration/rmax > RenewDeadline/rmin; with the defaults (15s, 10s) the
+// rate ratio rmax/rmin must stay below 1.5, about +-20% drift. A simulator
+// that drifts clocks further must widen the gap between the two. The compare-and-swap
 // guarantees that no write (renewal or other takeover) landed between the
 // observation and the takeover; a renewal still in flight fails with a
 // conflict on one side or the other.
@@ -253,7 +257,8 @@ type Input struct {
 	ViewTerm uint64
 	// HaveView reports whether the member has a view.
 	HaveView bool
-	// ClusterSize is the member count of the view.
+	// ClusterSize is the member count of the view. Zero or negative selects
+	// Config.ExpectedClusterSize.
 	ClusterSize int
 	// IsCandidate reports whether the member is a candidate in its view
 	// (see TopCandidates).
@@ -586,8 +591,10 @@ func (e *Elector) Tick(in Input) []Op {
 
 		e.lastRound, e.roundDone = round, true
 
+		// An empty or unset ClusterSize would make p=1 and every member
+		// read every round, so it falls back to ExpectedClusterSize.
 		n := e.cfg.ExpectedClusterSize
-		if in.HaveView {
+		if in.HaveView && in.ClusterSize > 0 {
 			n = in.ClusterSize
 		}
 
