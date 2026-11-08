@@ -6,6 +6,7 @@ package cachemesh
 import (
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -180,6 +181,39 @@ func BenchmarkMesh(b *testing.B) {
 		b.RunParallel(func(pb *testing.PB) {
 			for pb.Next() {
 				m.Observe(relay.Next, Success, time.Millisecond)
+			}
+		})
+	})
+	// Each goroutine reports on its own neighbor, as when traffic spreads
+	// over many peers; ObserveParallel above is the worst case of every
+	// goroutine reporting on one peer.
+	b.Run("ObserveParallelSpread", func(b *testing.B) {
+		var peers []PeerRef
+
+		seen := map[uint32]bool{}
+
+		for _, k := range keys {
+			if d := m.Route(ks, k); !d.Next.IsZero() && !seen[d.Next.Slot] {
+				seen[d.Next.Slot] = true
+				peers = append(peers, d.Next)
+			}
+		}
+
+		for _, p := range peers {
+			m.Observe(p, Success, time.Millisecond)
+
+			if _, _, ewma := m.health.PeerState(p.Slot); ewma == 0 {
+				b.Fatalf("peer %d is not tracked", p.Slot)
+			}
+		}
+
+		var next atomic.Uint32
+
+		b.ReportAllocs()
+		b.RunParallel(func(pb *testing.PB) {
+			p := peers[int(next.Add(1))%len(peers)]
+			for pb.Next() {
+				m.Observe(p, Success, time.Millisecond)
 			}
 		})
 	})
