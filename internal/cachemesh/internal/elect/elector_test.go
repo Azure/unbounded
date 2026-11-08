@@ -928,3 +928,68 @@ func TestLotteryZeroClusterSize(t *testing.T) {
 		t.Fatalf("lottery qps %.1f with ClusterSize 0, want ~20", qps)
 	}
 }
+
+// TestReleaseKeepsClusterSeeds is a regression test: a member without
+// seeds that took the Lease (a lottery winner without a view, which then
+// declines) wrote and released a record without seeds, which told the next
+// starting member that no cluster existed, and it bootstrapped a second
+// cluster next to the live one (found by the DST data-plane workload: the
+// epoch and keyspace generations restarted).
+func TestReleaseKeepsClusterSeeds(t *testing.T) {
+	t.Parallel()
+
+	s := &memStore{}
+	s.store(Record{Holder: "", Term: 9, RenewTime: epoch, Seeds: []string{"a", "b"}})
+
+	h := newHarness(t, s, 0)
+	h.run(sec(1))
+
+	if h.e.State() != Leader || !slices.Equal(s.rec.Seeds, []string{"a", "b"}) {
+		t.Fatalf("acquire without seeds: state %v seeds %v", h.e.State(), s.rec.Seeds)
+	}
+
+	for _, op := range h.e.Release(h.in) {
+		h.e.OnResult(h.in, s.apply(op))
+	}
+
+	if s.rec.Holder != "" || !slices.Equal(s.rec.Seeds, []string{"a", "b"}) {
+		t.Fatalf("release: %+v", s.rec)
+	}
+}
+
+func TestReleaseSeedsExcludeSelf(t *testing.T) {
+	t.Parallel()
+
+	s := &memStore{}
+	h := newHarness(t, s, 0)
+	me := self(0).Addr
+	h.in.Seeds = []string{me, "c"}
+	h.run(sec(1))
+
+	if !slices.Equal(s.rec.Seeds, []string{me, "c"}) {
+		t.Fatalf("acquire seeds %v", s.rec.Seeds)
+	}
+
+	// A leaving leader points joiners at the remaining members.
+	for _, op := range h.e.Release(h.in) {
+		h.e.OnResult(h.in, s.apply(op))
+	}
+
+	if !slices.Equal(s.rec.Seeds, []string{"c"}) {
+		t.Fatalf("release seeds %v", s.rec.Seeds)
+	}
+
+	// The last member leaving clears them, so a later cluster can start.
+	s2 := &memStore{}
+	h2 := newHarness(t, s2, 0)
+	h2.in.Seeds = []string{me}
+	h2.run(sec(1))
+
+	for _, op := range h2.e.Release(h2.in) {
+		h2.e.OnResult(h2.in, s2.apply(op))
+	}
+
+	if len(s2.rec.Seeds) != 0 {
+		t.Fatalf("last member release seeds %v", s2.rec.Seeds)
+	}
+}

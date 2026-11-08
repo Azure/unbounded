@@ -620,11 +620,35 @@ func (e *Elector) renewRecord(in Input) Record {
 	r.Incarnation = e.self.Incarnation
 	r.Term = e.term
 	r.Addr = e.self.Addr
-	r.Seeds = capSeeds(in.Seeds)
+	r.Seeds = seedsOr(in.Seeds, r.Seeds)
 	r.LeaseDuration = e.cfg.LeaseDuration
 	r.RenewTime = in.Wall
 
 	return r
+}
+
+// seedsOr returns s capped, or keep when s is empty: a holder that knows
+// no seeds (a member without a view that won the lottery) must not erase
+// the seeds through which joiners reach the existing cluster.
+func seedsOr(s, keep []string) []string {
+	if len(s) == 0 {
+		return capSeeds(keep)
+	}
+
+	return capSeeds(s)
+}
+
+// otherSeeds returns s without this member's address, capped.
+func (e *Elector) otherSeeds(s []string) []string {
+	var out []string
+
+	for _, a := range s {
+		if a != e.self.Addr && len(out) < MaxSeeds {
+			out = append(out, a)
+		}
+	}
+
+	return out
 }
 
 func capSeeds(s []string) []string {
@@ -657,7 +681,7 @@ func (e *Elector) acquire(in Input, base Record, notFound bool) []Op {
 	r.Incarnation = e.self.Incarnation
 	r.Term = term
 	r.Addr = e.self.Addr
-	r.Seeds = capSeeds(in.Seeds)
+	r.Seeds = seedsOr(in.Seeds, r.Seeds)
 	r.LeaseDuration = e.cfg.LeaseDuration
 	r.AcquireTime = in.Wall
 	r.RenewTime = in.Wall
@@ -697,6 +721,15 @@ func (e *Elector) MaxTerm() uint64 { return max(e.maxTerm, e.term) }
 // at once (emitting Lost{LostReleased}) and returns an Update that clears
 // Holder so candidates can take the Lease without waiting. Otherwise it
 // returns nil.
+//
+// The released record keeps seeds other than this member: in.Seeds, or the
+// held record's seeds when in.Seeds names no other member. A released Lease
+// without seeds tells a starting member that no cluster exists and that it
+// may bootstrap one, so seeds are cleared only when this member was the
+// last one known (it leaves, and nobody else is listed). Clearing them
+// whenever a member released (for example a member without a view that won
+// the lottery and declined) let a fresh member bootstrap a second cluster
+// next to the existing one.
 func (e *Elector) Release(in Input) []Op {
 	if e.state != Leader {
 		return nil
@@ -705,9 +738,13 @@ func (e *Elector) Release(in Input) []Op {
 	r := e.held.Clone()
 	r.Holder = ""
 	r.RenewTime = in.Wall
-	// Seeds stay: a member starting without seeds must still find the
-	// cluster through a released Lease rather than bootstrap a new one.
-	r.Seeds = capSeeds(in.Seeds)
+	// Seeds stay (see above): a member starting without seeds must still
+	// find the cluster through a released Lease rather than bootstrap a
+	// new one.
+	r.Seeds = e.otherSeeds(in.Seeds)
+	if len(r.Seeds) == 0 {
+		r.Seeds = e.otherSeeds(e.held.Seeds)
+	}
 	// Carry the highest term this member has seen (see ObserveTerm) so the
 	// next holder starts above every lineage, even one whose term never
 	// reached the Lease.
