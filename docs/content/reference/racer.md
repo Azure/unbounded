@@ -552,9 +552,13 @@ before drawing a performance conclusion.
 Each I/O worker submits crypto jobs to its assigned helper, but an idle helper
 runs jobs queued for other helpers on the same NUMA node, so one busy I/O worker
 does not leave its jobs waiting while other helpers on that node sit idle.
-Results always return to the submitting I/O worker. Jobs never move to a
-helper on another NUMA node. `racer_crypto_stolen_jobs_total` counts crypto jobs
-run by a helper other than the submitting I/O worker's own.
+Results always return to the submitting I/O worker. Jobs move to a helper on
+another NUMA node only when they ask for that node: a host-read decrypt into a
+destination resident on the other node runs there (see host reads below).
+`racer_crypto_stolen_jobs_total` counts crypto jobs run by a helper other than
+the submitting I/O worker's own on the same node, and
+`racer_crypto_numa_forwarded_jobs_total` counts jobs forwarded to a helper on
+another node.
 
 Automatic sizing considers CPU affinity, quota, NUMA locality, and progress reserves.
 Without an explicit thread cap, one unpinned control thread runs alongside the
@@ -733,10 +737,19 @@ Racer-Destination-Length: <length>
   same page), or `reservation` (ciphertext admission refused the copy, so the
   page is copied out before the decrypt instead).
   Each page of a host read is fetched by the page's owning worker, which may
-  be on the other NUMA node from the requesting worker whose crypto helpers
-  decrypt it. The owning worker therefore lands an RDMA page on a rail whose
-  NIC is on the requesting worker's NUMA node when such a rail is ready, so
-  the receive buffer is local to the decrypt.
+  be on the other NUMA node from the requesting worker. The decrypt writes
+  two buffers, the ciphertext cache copy and the client's `memfd`, and
+  writes across the socket interconnect cost the most, so the dataplane
+  picks the decrypt's node from the destination: when a page of the
+  client's `memfd` is already resident at the page's destination (for
+  example, a pooled buffer reused for later reads), the decrypt runs on a
+  crypto helper on that page's NUMA node; otherwise it runs on the
+  requesting worker's node, and the decrypt's first write places the
+  destination there. The destination's node is looked up without faulting
+  pages in, once per 2 MiB of a cached mapping. The owning worker then lands
+  an RDMA page on a rail whose NIC is on that node when such a rail is
+  ready, and takes the ciphertext cache copy from storage bound to that
+  node, so all three buffers are local to the decrypt.
   `racer_host_read_fused_numa_pages_total` counts fused pages by `buffer`
   (`registered` for the RDMA receive buffer, `store` for the ciphertext cache
   copy, `destination` for the client's memfd) and `locality`: `local` when

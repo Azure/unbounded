@@ -554,6 +554,11 @@ pub struct DecryptInto {
     /// authenticated it.
     pub(crate) stored: Option<crate::memory::CiphertextBuffer>,
 
+    /// NUMA node whose crypto helpers should run this job: the node of
+    /// the destination pages, when they are resident. None lets the
+    /// requester's helpers run it, and first touch puts the pages there.
+    pub(crate) node: Option<u16>,
+
     /// Where a fused [`Self::run`] found its memory, relative to the crypto
     /// helper that ran it. None for other pages.
     pub(crate) numa: Option<DecryptNuma>,

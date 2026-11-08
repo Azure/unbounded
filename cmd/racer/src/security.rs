@@ -572,21 +572,126 @@ struct SharedLane {
     /// Owner driver, woken when a thief finishes this lane's last job.
     owner: Option<Waker>,
 }
+/// A job a helper on another NUMA node handed to this share's helpers,
+/// because its memory is on this node. Its completion goes back to `lane` of
+/// `origin`, as for a stolen job.
+struct Forwarded {
+    origin: Arc<CryptoShare>,
+
+    lane: usize,
+
+    job: CryptoJob,
+}
+/// Jobs forwarded to a share by helpers on other NUMA nodes.
+#[derive(Default)]
+struct ForeignQueue {
+    jobs: std::collections::VecDeque<Forwarded>,
+
+    /// Every helper of the share is gone; forwarding runs the job locally.
+    closed: bool,
+}
 /// Crypto lanes whose helpers may run each other's jobs, normally one NUMA node.
 /// Every lock is held only for queue operations, never across AEAD work.
+///
+/// Shares of different nodes are linked with [`Self::link`]: a job that asks
+/// for another node's helpers (a host-read decrypt into memory on that node)
+/// is forwarded to that node's share, run by one of its helpers, and
+/// completed on its owner lane like a stolen job.
 pub struct CryptoShare {
     lanes: Box<[std::sync::Mutex<Option<SharedLane>>]>,
 
     /// Lanes whose helper found no work anywhere, with the driver to wake.
     idle: std::sync::Mutex<Vec<(usize, Waker)>>,
+
+    /// NUMA node of this share's helpers, when they are pinned to one.
+    node: Option<usize>,
+
+    /// Shares of other nodes that jobs may be forwarded to.
+    peers: std::sync::OnceLock<Box<[std::sync::Weak<CryptoShare>]>>,
+
+    /// Jobs forwarded here from other nodes' helpers.
+    foreign: std::sync::Mutex<ForeignQueue>,
 }
 impl CryptoShare {
     /// Allocate a group of `lanes` slots, filled as each helper engine starts.
     pub fn new(lanes: usize) -> Arc<Self> {
+        Self::on_node(lanes, None)
+    }
+    /// [`Self::new`], for helpers pinned to NUMA node `node`.
+    pub fn on_node(lanes: usize, node: Option<usize>) -> Arc<Self> {
         Arc::new(Self {
             lanes: (0..lanes).map(|_| std::sync::Mutex::new(None)).collect(),
             idle: std::sync::Mutex::new(Vec::new()),
+            node,
+            peers: std::sync::OnceLock::new(),
+            foreign: std::sync::Mutex::new(ForeignQueue::default()),
         })
+    }
+    /// Let jobs move between `shares` by node. Shares without a node, and
+    /// shares already linked, are left alone.
+    pub fn link(shares: &[Arc<Self>]) {
+        for share in shares.iter().filter(|share| share.node.is_some()) {
+            let peers = shares
+                .iter()
+                .filter(|peer| peer.node.is_some() && peer.node != share.node)
+                .map(Arc::downgrade)
+                .collect();
+            let _ = share.peers.set(peers);
+        }
+    }
+    fn foreign(&self) -> std::sync::MutexGuard<'_, ForeignQueue> {
+        self.foreign
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+    /// The linked share of node `node`, when it is not this share's node.
+    fn peer_on(&self, node: u16) -> Option<Arc<Self>> {
+        let node = Some(usize::from(node));
+        if self.node.is_none() || self.node == node {
+            return None;
+        }
+        self.peers
+            .get()?
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .find(|peer| peer.node == node)
+    }
+    /// Hand `job`, taken from `lane` of this share, to the helpers of the
+    /// node it asks for. Returns the job, to run here, when it asks for no
+    /// other linked node or that node's helpers are gone.
+    fn forward(self: &Arc<Self>, lane: usize, mut job: CryptoJob) -> Option<CryptoJob> {
+        let Some(peer) = job
+            .permit
+            .measurement
+            .node
+            .and_then(|node| self.peer_on(node))
+        else {
+            return Some(job);
+        };
+        {
+            let mut foreign = peer.foreign();
+            if foreign.closed {
+                return Some(job);
+            }
+            job.permit.measurement.forwarded = true;
+            foreign.jobs.push_back(Forwarded {
+                origin: self.clone(),
+                lane,
+                job,
+            });
+        }
+        peer.wake_idle(usize::MAX);
+        None
+    }
+    fn take_foreign(&self) -> Option<Forwarded> {
+        self.foreign().jobs.pop_front()
+    }
+    /// After this share's last helper is gone, refuse further forwarding and
+    /// return the jobs still queued, for the caller to run.
+    fn close_foreign(&self) -> Vec<Forwarded> {
+        let mut foreign = self.foreign();
+        foreign.closed = true;
+        foreign.jobs.drain(..).collect()
     }
     fn slot(&self, lane: usize) -> std::sync::MutexGuard<'_, Option<SharedLane>> {
         // Holders never panic while mutating; recover the data on poison.
@@ -621,8 +726,16 @@ impl CryptoShare {
     fn clear_idle(&self, lane: usize) {
         self.idle().retain(|(idle, _)| *idle != lane);
     }
-    /// Whether any lane other than `lane` has a queued job.
+    /// Whether any lane other than `lane`, or the foreign queue, has a
+    /// queued job.
     fn backlog_except(&self, lane: usize) -> bool {
+        if self
+            .foreign
+            .try_lock()
+            .map_or(true, |foreign| !foreign.jobs.is_empty())
+        {
+            return true;
+        }
         (0..self.lanes.len()).any(|other| {
             other != lane
                 && self.lanes[other]
@@ -1011,12 +1124,24 @@ impl PageCryptoEngine {
             if backlog {
                 self.share.wake_idle(self.lane);
             }
-            let (source, mut job) = match own {
+            let (source, job) = match own {
                 Some(job) => (self.lane, job),
-                None => match self.share.steal(self.lane, &mut self.cursor) {
-                    Some(stolen) => stolen,
-                    None => break,
+                None => match self.share.take_foreign() {
+                    Some(forwarded) => {
+                        self.run_forwarded(forwarded);
+                        processed += 1;
+                        continue;
+                    }
+                    None => match self.share.steal(self.lane, &mut self.cursor) {
+                        Some(stolen) => stolen,
+                        None => break,
+                    },
                 },
+            };
+            // A job for memory on another node runs on that node's helpers.
+            let Some(mut job) = self.share.forward(source, job) else {
+                processed += 1;
+                continue;
             };
             job.permit.dequeued(self.ctx.clock.now());
             job.permit.measurement.stolen = source != self.lane;
@@ -1048,6 +1173,17 @@ impl PageCryptoEngine {
         }
         Ok(())
     }
+    /// Run a job forwarded from another node and complete it on its owner.
+    fn run_forwarded(&self, forwarded: Forwarded) {
+        let Forwarded {
+            origin,
+            lane,
+            mut job,
+        } = forwarded;
+        job.permit.dequeued(self.ctx.clock.now());
+        let completion = Self::process(job, &self.ctx);
+        origin.finish_stolen(lane, completion);
+    }
     /// Closed, with no job queued, running elsewhere, or awaiting publication.
     fn is_drained(&self) -> bool {
         self.share.slot(self.lane).as_ref().is_none_or(|shared| {
@@ -1061,6 +1197,13 @@ impl Drop for PageCryptoEngine {
         self.share.clear_idle(self.lane);
         let shared = self.share.slot(self.lane).take();
         drop(shared);
+        // The last helper of the share runs jobs forwarded to it, so their
+        // owner lanes still see every completion.
+        if (0..self.share.lanes.len()).all(|lane| self.share.slot(lane).is_none()) {
+            for forwarded in self.share.close_foreign() {
+                self.run_forwarded(forwarded);
+            }
+        }
     }
 }
 impl crate::lifecycle::Service<RequestScope> for PageCryptoEngine {
@@ -1514,6 +1657,12 @@ struct Measurement {
 
     /// Executed by a sibling helper rather than the lane's own.
     stolen: bool,
+
+    /// NUMA node whose helpers should run the job, if any.
+    node: Option<u16>,
+
+    /// Forwarded to a helper on [`Self::node`] from another node's helper.
+    forwarded: bool,
 }
 struct DecryptFailureMeta {
     request: RequestId,
@@ -1617,6 +1766,9 @@ impl CryptoCompletion {
         }
         if m.stolen {
             metrics.record(CryptoStolenJobs, 1);
+        }
+        if m.forwarded {
+            metrics.record(crate::telemetry::Event::CryptoForwardedJobs, 1);
         }
         if m.decrypt
             && let CryptoOutcome::Failed { error, .. } = self.outcome
@@ -1934,6 +2086,7 @@ impl CryptoClient {
                         } else if let CryptoInput::DecryptInto(job) = &input {
                             permit.measurement.decrypt = true;
                             permit.measurement.bytes = job.len();
+                            permit.measurement.node = job.node;
                             CryptoJob {
                                 input,
                                 key: None,

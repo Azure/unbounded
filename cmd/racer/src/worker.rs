@@ -734,24 +734,29 @@ impl Resources {
     }
 
     /// Let crypto helpers run queued jobs of other lanes with the same key,
-    /// normally the crypto NUMA node. `keys` holds one key per lane.
-    pub fn share_crypto<K: Ord>(&self, keys: impl IntoIterator<Item = K>) -> Result<()> {
+    /// the NUMA node of the lane's crypto helper. `keys` holds one key per
+    /// lane. Shares of different known nodes are linked, so a job for memory
+    /// on another node can run on that node's helpers.
+    pub fn share_crypto(&self, keys: impl IntoIterator<Item = Option<usize>>) -> Result<()> {
         let keys = keys.into_iter().collect::<Vec<_>>();
         if keys.len() != self.ports.len() {
             return Err(Error::InvalidConfiguration);
         }
-        let mut groups = BTreeMap::<&K, Vec<usize>>::new();
+        let mut groups = BTreeMap::<Option<usize>, Vec<usize>>::new();
         for (lane, key) in keys.iter().enumerate() {
-            groups.entry(key).or_default().push(lane);
+            groups.entry(*key).or_default().push(lane);
         }
-        for lanes in groups.into_values() {
-            let share = security::CryptoShare::new(lanes.len());
+        let mut shares = Vec::new();
+        for (node, lanes) in groups {
+            let share = security::CryptoShare::on_node(lanes.len(), node);
             for (index, lane) in lanes.into_iter().enumerate() {
                 if let Some(port) = self.ports[lane].lock().map_err(|_| Error::Io)?.1.as_mut() {
                     port.share(share.clone(), index);
                 }
             }
+            shares.push(share);
         }
+        security::CryptoShare::link(&shares);
         Ok(())
     }
 

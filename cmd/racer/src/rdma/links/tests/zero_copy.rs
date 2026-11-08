@@ -520,6 +520,7 @@ fn fused_job(
         mapping: Arc::new(mapping),
         destination: 0,
         stored: None,
+        node: None,
         numa: None,
     });
     (job, file, source)
@@ -612,4 +613,135 @@ fn fused_host_decrypt_failure_zeroes_the_destination_and_publishes_nothing() {
     }
     pool.reclaim_idle_buffers();
     assert_eq!(admission.used(ResourceClass::Ciphertext), baseline);
+}
+
+/// One crypto helper lane on NUMA node `node`, in its own share.
+fn helper_on(
+    worker: u16,
+    node: usize,
+) -> (
+    Rc<crate::security::CryptoClient>,
+    crate::security::PageCryptoEngine,
+    Arc<crate::security::CryptoShare>,
+) {
+    use crate::lifecycle::Service as _;
+    let share = crate::security::CryptoShare::on_node(1, Some(node));
+    let (io, mut port) = crate::security::pair(
+        crate::model::WorkerId(worker),
+        1,
+        std::num::NonZeroUsize::new(4).unwrap(),
+    );
+    port.share(share.clone(), 0);
+    let mut engine = crate::security::PageCryptoEngine::new(crate::security::CryptoRuntime {
+        port,
+        ctx: racer_io::WorkerCtx::host(),
+    });
+    // Start the lane and let it find no work.
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    engine.poll_budgeted(&mut cx, 1).unwrap();
+    (
+        Rc::new(crate::security::CryptoClient::new(io)),
+        engine,
+        share,
+    )
+}
+
+/// A host-read decrypt whose destination is on another node runs on that
+/// node's helper, completes on the requester, and is counted; a job for the
+/// helper's own node, or for no node, is not forwarded.
+#[test]
+fn decrypt_into_runs_on_the_destination_nodes_helper() {
+    use crate::lifecycle::Service as _;
+    let env = racer_io::Env::host();
+    let (mut w, admission, page) = setup();
+    let pool = BufferPool::new(admission.clone());
+    let (client, mut near, near_share) = helper_on(0, 0);
+    let (_far_client, mut far, far_share) = helper_on(1, 1);
+    crate::security::CryptoShare::link(&[near_share, far_share]);
+    let metrics = crate::telemetry::Metrics::default();
+    client.set_metrics(metrics.clone());
+    let scope = crate::runtime::RequestScope::host(
+        crate::model::RequestId([1; 16]),
+        std::time::Instant::now() + std::time::Duration::from_secs(10),
+    )
+    .unwrap();
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    for (node, forwarded) in [
+        (Some(1), true),
+        (Some(0), false),
+        (None, false),
+        (Some(7), false),
+    ] {
+        let (mut job, file, _source) =
+            fused_job(&env, &mut w, &pool, &admission, &page, 0..3, None);
+        job.node = node;
+        let before = metrics.count(crate::telemetry::Event::CryptoForwardedJobs);
+        let mut future = std::pin::pin!(client.decrypt_into(job, &scope));
+        assert!(future.as_mut().poll(&mut cx).is_pending());
+        // The requester's helper either runs the job or forwards it.
+        near.poll_budgeted(&mut cx, 1).unwrap();
+        client.poll_budgeted(8).unwrap();
+        let ready = future.as_mut().poll(&mut cx);
+        assert_eq!(ready.is_pending(), forwarded, "node {node:?}");
+        let job = match ready {
+            std::task::Poll::Ready(job) => job.unwrap(),
+            std::task::Poll::Pending => {
+                far.poll_budgeted(&mut cx, 1).unwrap();
+                client.poll_budgeted(8).unwrap();
+                let std::task::Poll::Ready(job) = future.as_mut().poll(&mut cx) else {
+                    panic!("the far helper ran the forwarded job");
+                };
+                job.unwrap()
+            }
+        };
+        assert!(job.fused());
+        assert_eq!(file_bytes(&file, 3), b"abc");
+        assert_eq!(
+            metrics.count(crate::telemetry::Event::CryptoForwardedJobs),
+            before + u64::from(forwarded)
+        );
+        drop(job);
+        pump!(w);
+    }
+}
+
+/// A job forwarded to a node whose last helper then exits still runs and
+/// completes on the requester; later jobs for that node stay local.
+#[test]
+fn forwarded_decrypt_runs_when_the_target_helpers_exit() {
+    use crate::lifecycle::Service as _;
+    let env = racer_io::Env::host();
+    let (mut w, admission, page) = setup();
+    let pool = BufferPool::new(admission.clone());
+    let (client, mut near, near_share) = helper_on(0, 0);
+    let (_far_client, far, far_share) = helper_on(1, 1);
+    let mut far = Some(far);
+    crate::security::CryptoShare::link(&[near_share, far_share]);
+    let scope = crate::runtime::RequestScope::host(
+        crate::model::RequestId([1; 16]),
+        std::time::Instant::now() + std::time::Duration::from_secs(10),
+    )
+    .unwrap();
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    for exited in [false, true] {
+        let (mut job, file, _source) =
+            fused_job(&env, &mut w, &pool, &admission, &page, 0..3, None);
+        job.node = Some(1);
+        let mut future = std::pin::pin!(client.decrypt_into(job, &scope));
+        assert!(future.as_mut().poll(&mut cx).is_pending());
+        near.poll_budgeted(&mut cx, 1).unwrap();
+        if !exited {
+            client.poll_budgeted(8).unwrap();
+            assert!(future.as_mut().poll(&mut cx).is_pending(), "forwarded");
+            // The far node's only helper exits and runs the queued job.
+            drop(far.take());
+        }
+        client.poll_budgeted(8).unwrap();
+        let std::task::Poll::Ready(job) = future.as_mut().poll(&mut cx) else {
+            panic!("completed");
+        };
+        assert!(job.unwrap().fused());
+        assert_eq!(file_bytes(&file, 3), b"abc");
+        pump!(w);
+    }
 }

@@ -3147,6 +3147,7 @@ fn sealing_registered_ciphertext_for_a_host_sink_detaches_during_decrypt() {
         mapping: std::sync::Arc::new(mapping),
         destination: 0,
         stored: None,
+        node: None,
         numa: None,
     });
     job.run().unwrap();

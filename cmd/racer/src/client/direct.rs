@@ -284,6 +284,7 @@ async fn decrypt_into_mapping(
     let job = Box::new(DecryptInto {
         page,
         range,
+        node: mapping.node_at(destination),
         mapping,
         destination,
         stored: None,
