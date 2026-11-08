@@ -157,7 +157,10 @@ neighbors ~= occ * (1 + sum(s[i] - 1)) - 1      where occ = members per cell
 `topology.Choose(n, cellSize, maxNeighbors)` returns the shape with the
 smallest D (1..`MaxDims`=8) such that `ceil(n/cells) * (1 + sum(s[i]-1)) - 1
 <= maxNeighbors`, with `cells = max(1, floor(n/cellSize))` spread as evenly as
-possible across dimensions (sizes differ by at most one). Small clusters get
+possible across dimensions (sizes differ by at most one): every size starts
+at `floor(cells^(1/D))` and sizes are raised by one from dimension 0 upward
+until the product is at least `cells`, so occupancy never exceeds the
+requested cell size by rounding. If no D fits, D=`MaxDims`. Small clusters get
 D=1, a full mesh with one hop.
 
 At 100k members with `CellSize`=4 and `MaxNeighbors`=256 the grid is D=4 with
@@ -193,15 +196,16 @@ out through a tree about 50 wide, and the caller can cache at each hop.
 
 ### Cell assignment and reshape (leader)
 
-- A new member joins the least-occupied cell; ties go to the lowest
-  `Score(member.Key, cell)` winner.
+- A new member joins the least-occupied cell; ties go to the cell with the
+  highest `Score(member.Key, cell)` (`Better` semantics).
 - Each tick, if the most and least occupied cells differ by more than one,
   the leader moves up to `MaxCellMovesPerTick` (32) members from the fullest
   to the emptiest cells, preferring members in `Joining` state.
 - Reshape (all members get new cells) only when the current shape violates a
   hard bound: estimated neighbors with the maximum occupancy exceed
   `MaxNeighbors`, or average occupancy falls below `max(1, CellSize/2)` with
-  more than one cell, or rises above `4*CellSize`. Reshape assigns cells in
+  more than one cell, or rises above `4*CellSize`, and `Choose` would return
+  a different shape (a reshape that cannot fix the bound is skipped). Reshape assigns cells in
   order of `Member.Key` round-robin. Removed neighbor connections linger for
   `NeighborLinger` (30s) so in-flight requests finish.
 
