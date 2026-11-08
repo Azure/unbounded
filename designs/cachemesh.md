@@ -116,7 +116,7 @@ deterministic:
 | `internal/cachemesh/internal/view` | Immutable membership view, deltas, apply, validation, digests, snapshots, delta log, interning | `hashing`, `topology`, `placement` |
 | `internal/cachemesh/internal/epoch` | Rolling cluster epoch tracker, stamps | none |
 | `internal/cachemesh/internal/health` | Per-neighbor breakers, outlier detection, peak-EWMA, hedge budget | none |
-| `internal/cachemesh/internal/route` | Hot-path routing state, `Decision`, `Header` | `view`, `health`, `epoch`, `topology`, `hashing` |
+| `internal/cachemesh/internal/route` | Hot-path routing state, `Decision`, `Header` | `view`, `health`, `epoch`, `topology`, `placement`, `hashing` |
 | `internal/cachemesh/internal/wire` | Control messages and binary codec | `view` |
 | `internal/cachemesh/internal/elect` | Lease election state machine (candidates, lottery, fencing) | `hashing` |
 | `internal/cachemesh/internal/leader` | Leader logic: admission, suspicion, removal, rebalance, cells, epochs | `view`, `placement`, `topology` |
@@ -593,6 +593,47 @@ removals are delayed by `NeighborLinger`.
 
 Per-request cost targets (benchmarked): `Route` on a 100k view under 100ns and
 zero allocations; `Observe` under 50ns and zero allocations; `Fresh` a few ns.
+
+### Route package details
+
+`route.State` is an immutable snapshot of one view and the self slot;
+`route.NewState(v, self, env)` is O(1). `route.Env` (built once per member)
+holds the shared `health.Tracker`, `epoch.Tracker`, `Notes`, the gateway
+list, and optionally the self ID and incarnation, so a reused slot that now
+holds another member is not taken as self. Choices the code makes beyond the
+rules above:
+
+- Ranking within a cell (relays and backups) is by usability class first
+  (Healthy, then Degraded; Unusable excluded), then `Score(member.Key,
+  partition)` with `Better` tie-breaks.
+- Final hop: the owner gets the request when it is Healthy, Degraded with no
+  Healthy backup, or when no backup is usable at all. Otherwise the best
+  backup gets it (`KindBackup`, header flag `Backup`). If this member is
+  itself the best backup, or it receives a `Backup`-flagged request while in
+  the owner's cell and also sees the owner as unusable, it serves the request
+  (`KindSelf` with `Owner` not self and the `Backup` flag set), so backup
+  hops never chain.
+- Relay `Alternate` is the second best of the chosen cell, or the best of the
+  next candidate cell. Health is ignored when no candidate cell has a usable
+  member and when the tracker is in panic.
+- Joining, Draining, and weight-0 members are routed to as owners and used
+  as relays and backups like any other member.
+- `PrevOwner` is set when the owner is the final hop (`KindSelf` as owner,
+  `KindOwner`, `KindDirect`), `Prev` is a current member other than the
+  owner, and `uint32(current epoch) - Moved < HandoffEpochs` (modular, like
+  the 32-bit `Moved`).
+- A non-member uses rendezvous over gateways
+  (`Score(Mix64(KeyHashString(0, addr)), partition)`); without gateways it
+  sends `KindDirect` to the owner if it has a configured view, otherwise
+  `KindNoRoute`. Its TTL is `D + 3` (`MaxDims + 3` without a view) to cover
+  the gateway hop.
+- Header wire form is big-endian: format, flags, hops, TTL (1 byte each),
+  partition, sender, term truncated to 32 bits (4 bytes each), seq, epoch
+  (8 bytes each). Flags: `Hedge` (set by the caller, kept across hops),
+  `Direct`, `Gateway`, `Backup`. `Forward` returns `ErrTTLExhausted` when the
+  outgoing hop would make `Hops` reach `TTL`; serving locally is never
+  refused. It never sends back to the header's sender unless that is the
+  owner.
 
 ## Deterministic simulation testing
 
