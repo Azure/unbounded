@@ -109,7 +109,7 @@ deterministic:
 |---|---|---|
 | `internal/cachemesh` | Public API (`Mesh`, `Config`, aliases of route types), concurrent runtime | all internal |
 | `internal/cachemesh/kubelease` | `elect.Store` over client-go `coordination/v1` Leases | `internal/elect` |
-| `internal/cachemesh/memtransport` | In-process `ControlTransport` for tests and examples | `internal/cachemesh` |
+| `internal/cachemesh/memtransport` | In-process `ControlTransport` and `LeaseStore` for tests and examples | `internal/cachemesh` |
 | `internal/cachemesh/internal/hashing` | Key hashing, mixing, rendezvous scores | `zeebo/xxh3` |
 | `internal/cachemesh/internal/topology` | Grid shapes, cells, neighbor cells, next-hop cells | `hashing` |
 | `internal/cachemesh/internal/placement` | Partition table (chunked copy-on-write), leader rebalancer | `hashing` |
@@ -628,7 +628,7 @@ type Decision struct {
 }
 
 func (m *Mesh) Route(ks Keyspace, key []byte) Decision
-func (m *Mesh) RouteHash(ks Keyspace, h uint64) Decision
+func (m *Mesh) RouteHash(ks Keyspace, h uint64) Decision  // h = ks.Hash(key)
 func (m *Mesh) RouteMany(ks Keyspace, keys [][]byte, out []Decision)
 func (m *Mesh) Forward(h Header) (Decision, error)  // at a relay
 func (m *Mesh) Observe(p PeerRef, r Result, latency time.Duration)
@@ -636,7 +636,7 @@ func (m *Mesh) TryHedge(h Header) bool
 func (m *Mesh) Stamp(ks Keyspace) Stamp
 func (m *Mesh) Fresh(ks Keyspace, s Stamp) bool
 func (m *Mesh) Invalidate(ks Keyspace)
-func (m *Mesh) ServeControl(ctx context.Context, from string, msg []byte) ([]byte, error)
+func (m *Mesh) ServeControl(ctx context.Context, from Endpoint, msg []byte) ([]byte, error)
 func (m *Mesh) Run(ctx context.Context) error
 func (m *Mesh) Leave(ctx context.Context) error
 ```
@@ -648,13 +648,85 @@ version is ahead (the control plane then catches up from it), and otherwise
 computes the next hop from the relay's own view. `Observe` reports outcomes:
 `Success`, `Failure`, `Timeout`, `Overload`.
 
-`ControlTransport.Send(ctx, to Endpoint, msg []byte) ([]byte, error)` is the
-only control-plane transport method. `NeighborWatcher.OnNeighbors(added,
-removed []PeerRef)` tells the caller which data-plane connections to keep;
-removals are delayed by `NeighborLinger`.
+`ControlTransport.Send(ctx, addr Endpoint, msg []byte) ([]byte, error)`
+(`Endpoint` is an alias of `string`) is the only control-plane transport
+method. `NeighborWatcher.OnNeighbors(added, removed []PeerRef)` tells the
+caller which data-plane connections to keep; removals are delayed by
+`NeighborLinger`.
 
 Per-request cost targets (benchmarked): `Route` on a 100k view under 100ns and
 zero allocations; `Observe` under 50ns and zero allocations; `Fresh` a few ns.
+
+### Public API (`internal/cachemesh`)
+
+Types the caller needs are aliases of the internal ones, so nothing is
+converted on the hot path: `Decision`, `Kind` and the `Kind*` constants,
+`PeerRef`, `Header` (with `HeaderSize`, the `Flag*` constants, `ParseHeader`,
+`ErrTTLExhausted`, `ErrBadHeader`), `Result` (`Success`, `Failure`, `Timeout`,
+`Overload`), `Stamp`, `Version`, `Slot`/`NoSlot`, and for election
+`LeaseStore` (`elect.Store`), `LeaseRecord`, `ErrLeaseNotFound`,
+`ErrLeaseConflict`, `ElectionConfig` (`elect.Config`), and `HealthConfig`
+(`health.Config`).
+
+`NewKeyspace(name, ttl)` returns a `Keyspace` value with `Name`, `TTL`,
+`Seed` (`hashing.Seed(name)`), and `Hash(key)`. A zero TTL never expires;
+otherwise the TTL must be at least `MinTTL` (5m). `MustKeyspace` panics on
+error.
+
+`Config` has the required `ID`, `Addr`, and `Transport`, then `Incarnation`
+(zero picks a random nonzero value from `crypto/rand`), `Zone`, `Seeds`,
+`Lease` (may be nil: the member then joins only through seeds and never
+bootstraps or leads), `Neighbors`, `Logger` (`log/slog`), `Hooks`
+(`OnView`, `OnLeadership`, `OnControlError`, `OnLeaseError`), and the common
+cluster knobs `PartitionBits`, `CellSize`, `MaxNeighbors`, `EpochPeriod`.
+Advanced knobs live in `Config.Tuning`: node timers (ping, suspicion, join,
+call timeout, linger, leader and elector ticks), `EpochAdvance` (100ms, the
+longest the runtime waits between ticks, bounding epoch staleness),
+`MaxInFlight` (64 concurrent control calls; excess calls fail at once with
+`ErrTooManyCalls` and the protocol retries them), `LeaseTimeout` (default
+`Election.OpTimeout`), and the nested `Election`, `Health`, and `Leader`
+(`LeaderTuning`) settings. Zero values select defaults; `New` returns
+validation errors.
+
+Runtime (`Mesh`):
+
+- `New` builds the `node.Node` and a `route.Env` holding the node's health
+  and epoch trackers, a `route.Notes`, the self ID and incarnation, and the
+  configured seeds (other than its own address) as gateways
+  (`PeerRef{Slot: NoSlot, ID: addr, Addr: addr}`). Seeds learned later from
+  the Lease are not gateways; a member without configured seeds routes
+  `KindDirect` once it has a view and `KindNoRoute` before.
+- Every node method runs under one mutex. After each call the runtime
+  rebuilds the `atomic.Pointer[route.State]` if the node's view or self slot
+  changed, and tracks leadership and `Left`.
+- `Run` starts the node, then loops: `Tick`, take a `Notes` entry and pass
+  it to `NoteVersion` (widening the 32-bit header term against the view
+  term), drain `Outbox` and `LeaseOps`, and sleep until
+  `min(NextDeadline, EpochAdvance)` or until a reply, lease result, or
+  inbound message wakes it. Each call runs in its own goroutine under
+  `context.WithTimeout(Call.Timeout)` and reports to `OnReply` exactly once.
+  Lease operations run one at a time on one goroutine with `LeaseTimeout`;
+  without a `Lease` they fail at once with `ErrNoLease`. Local monotonic
+  time is nanoseconds since `New` plus one; wall time is `time.Now()`.
+- `Run` returns `ctx.Err()` on cancellation and nil once a `Leave` has
+  completed; it may be called once (`ErrAlreadyRun`). `ServeControl` and
+  `Leave` return `ErrNotRunning` unless `Run` is active.
+- Neighbor slots from the node hook are mapped to `PeerRef`s with the view
+  at the time of the change and remembered, so removals (after linger)
+  report the same `PeerRef` that was added. A slot reused by another member
+  is reported as a removal of the old peer and an addition of the new one.
+  Events are queued and delivered in order by one goroutine, never under
+  the Mesh lock.
+- `Invalidate` is fire-and-forget: it is dropped when no leader is known.
+- Status accessors read the snapshot: `Version`, `Members`, `Leader`,
+  `Self`, `Ready` (Active in the view), plus `Leading`, `Neighbors`,
+  `Done`, `ID`, `Incarnation`, and `Addr`.
+
+`internal/cachemesh/memtransport` provides a `Network` (per-address
+`ControlTransport`s calling registered handlers such as
+`Mesh.ServeControl`, with latency and jitter, drop rate, partition groups,
+and `Unregister` to simulate a crash) and a `LeaseStore` (compare-and-swap
+on `ResourceVersion`, create conflicts, not-found, injectable errors).
 
 ### Route package details
 
