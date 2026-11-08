@@ -48,12 +48,13 @@ type dstResult struct {
 
 func runCase(c dstCase) dstResult {
 	cov := NewCoverage()
-	cl := NewCluster(ClusterConfig{Scenario: c.sc, Prebuilt: c.prebuilt, Coverage: cov})
+	dp := NewDataPlane(dataPlaneConfig(c))
+	cl := NewCluster(ClusterConfig{Scenario: c.sc, Prebuilt: c.prebuilt, Coverage: cov, Workload: dp, Node: dp.ConfigureNode})
 	err := cl.Run()
 
 	return dstResult{
 		trace: cl.Trace.Sum(), steps: cl.Sim.Steps(), cov: cov, err: err,
-		stats: fmt.Sprintf("deltas=%d net=%+v %s", cl.Stats.Get("deltas"), cl.Net.Stats(), cl.ControlStats()),
+		stats: fmt.Sprintf("deltas=%d net=%+v %s\n%s", cl.Stats.Get("deltas"), cl.Net.Stats(), cl.ControlStats(), dp.Summary()),
 	}
 }
 
@@ -182,6 +183,7 @@ func TestDST(t *testing.T) {
 
 	total := NewCoverage()
 	total.Register(requiredCoverage...)
+	total.Register(DataPlaneCoverage...)
 
 	cases := defaultCases(seeds, explicit)
 	ran := 0
@@ -218,5 +220,7 @@ func TestDST(t *testing.T) {
 		if missing := total.Missing(); len(missing) > 0 {
 			t.Fatalf("coverage: never reached %v\n%s", missing, total.Report())
 		}
+
+		t.Logf("data-plane coverage:\n%s", dataPlaneReport(total))
 	}
 }

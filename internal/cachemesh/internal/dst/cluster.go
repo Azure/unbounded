@@ -110,6 +110,9 @@ type member struct {
 	last    view.Version
 	lastEp  uint64
 	leaving bool
+	// seeds are the configured seed addresses (the data plane routes
+	// through them as gateways while the member is not in its view).
+	seeds []string
 }
 
 // Fire runs a scheduled tick.
@@ -396,6 +399,8 @@ func (c *Cluster) OnStart(i uint32, inc uint64) {
 		c.cfg.Node(i, &cfg)
 	}
 
+	m.seeds = cfg.Seeds
+
 	m.n = node.New(cfg, c.Sim.Stream("node/"+strconv.FormatUint(uint64(i), 10)+"/"+strconv.FormatUint(inc, 10)))
 	c.members[i] = m
 	c.Net.Resume(i)
@@ -539,8 +544,22 @@ func peekKind(b []byte) uint16 {
 	return uint16(k)
 }
 
+// DataHandler is implemented by a Workload that receives its own messages
+// (Kind KindData) over the cluster's Net.
+type DataHandler interface {
+	DeliverData(msg *Message)
+}
+
 // Deliver implements Handler.
 func (c *Cluster) Deliver(msg *Message) {
+	if msg.Kind == KindData {
+		if dh, ok := c.cfg.Workload.(DataHandler); ok {
+			dh.DeliverData(msg)
+		}
+
+		return
+	}
+
 	m := c.members[msg.To]
 	if m == nil || m.dead {
 		return // the caller times out
