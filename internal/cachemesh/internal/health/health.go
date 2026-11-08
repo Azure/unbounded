@@ -22,6 +22,11 @@
 // atomic pointer. Re-tracking a slot with a different key resets its state;
 // re-tracking with the same key only updates its cell.
 //
+// Track and Untrack rebuild the table, O(tracked) each. Use Sync (exact
+// set) or TrackMany (additive) to change many peers with one rebuild; a
+// member bootstrapping hundreds of neighbors one Track at a time pays
+// O(n^2).
+//
 // Untracked slots are reported Healthy by Usable, and Observe on them is a
 // cheap no-op: health only filters among neighbors this member tracks.
 //
@@ -362,6 +367,10 @@ func (t *table) lookup(slot uint32) *Peer {
 
 const hedgeShards = 16
 
+// maxLatency caps an observed latency so that latSum cannot overflow and
+// the EWMA math stays well inside int64 and float64 precision.
+const maxLatency = int64(time.Hour)
+
 type hedgeShard struct {
 	routed, hedged atomic.Uint64
 	_              [128 - 16]byte // avoid false sharing (adjacent-line prefetch)
@@ -380,6 +389,9 @@ type Tracker struct {
 	maxEjected atomic.Int32
 	hedgePM    uint64 // hedge budget in parts per million
 
+	// The padding keeps the hedge counters, written on every routed
+	// request, off the cache lines of the read-mostly fields above.
+	_     [128]byte
 	hedge [hedgeShards]hedgeShard
 
 	// Control-only.
@@ -388,6 +400,7 @@ type Tracker struct {
 	lastTick     int64
 	lastInterval int64
 	scratch      []int64
+	median       int64 // median EWMA at the last degrade pass
 	vols         []vol
 }
 
@@ -463,6 +476,96 @@ func (t *Tracker) Untrack(slot uint32) {
 	}
 
 	t.rebuild(peers)
+}
+
+// Ref names a peer for TrackMany and Sync.
+type Ref struct {
+	Slot uint32
+	Key  uint64
+	Cell uint32
+}
+
+// TrackMany is Track for every ref with a single table rebuild, so tracking
+// n peers costs O(n log n + tracked) instead of O(n * tracked). Refs are
+// applied in order; a later ref for the same slot wins. Control path.
+func (t *Tracker) TrackMany(refs []Ref) {
+	t.merge(refs, false)
+}
+
+// Sync makes the tracked set exactly refs: slots not in refs are
+// untracked, and refs are applied as by TrackMany. Peers whose slot and key
+// are unchanged keep their state. It rebuilds the table at most once.
+// Control path.
+func (t *Tracker) Sync(refs []Ref) {
+	t.merge(refs, true)
+}
+
+func (t *Tracker) merge(refs []Ref, exact bool) {
+	old := t.tab.Load()
+
+	// Sort a copy by slot, last ref per slot wins (stable sort keeps
+	// input order among equal slots).
+	rs := slices.Clone(refs)
+	slices.SortStableFunc(rs, func(a, b Ref) int { return cmpU32(a.Slot, b.Slot) })
+
+	w := 0
+
+	for i := range rs {
+		if i+1 < len(rs) && rs[i+1].Slot == rs[i].Slot {
+			continue
+		}
+
+		rs[w] = rs[i]
+		w++
+	}
+
+	rs = rs[:w]
+
+	peers := make([]*Peer, 0, max(len(rs), len(old.peers)))
+	changed := false
+	i, j := 0, 0
+
+	for i < len(old.peers) || j < len(rs) {
+		switch {
+		case j == len(rs) || (i < len(old.peers) && old.peers[i].slot < rs[j].Slot):
+			if exact {
+				changed = true
+			} else {
+				peers = append(peers, old.peers[i])
+			}
+
+			i++
+		case i == len(old.peers) || rs[j].Slot < old.peers[i].slot:
+			peers = append(peers, t.newPeer(rs[j]))
+			changed = true
+			j++
+		default:
+			q, r := old.peers[i], rs[j]
+			if q.key != r.Key {
+				q = t.newPeer(r)
+				changed = true
+			} else if q.cc.Load().cell != r.Cell {
+				q.cc.Store(t.cellFor(r.Cell))
+
+				changed = true
+			}
+
+			peers = append(peers, q)
+			i++
+			j++
+		}
+	}
+
+	if changed {
+		t.rebuild(peers)
+	}
+}
+
+func (t *Tracker) newPeer(r Ref) *Peer {
+	p := &Peer{slot: r.Slot, key: r.Key}
+	p.cc.Store(t.cellFor(r.Cell))
+
+	return p
 }
 
 // Tracked returns the number of tracked peers.
@@ -570,9 +673,10 @@ func (t *Tracker) updatePanic(nt *table) {
 // tryEject moves p from state from to bEjected, respecting limits when
 // from is bHealthy. Safe for concurrent use.
 func (t *Tracker) tryEject(p *Peer, from uint32, reason Reason) bool {
+	// p.until is already 0: it is cleared when an ejection ends (see
+	// transitions), so a concurrent loser of the CAS below never clobbers
+	// the timing of an ejection another caller just made.
 	if from == bProbing {
-		p.until.Store(0)
-
 		if !p.state.CompareAndSwap(bProbing, bEjected) {
 			return false
 		}
@@ -596,8 +700,6 @@ func (t *Tracker) tryEject(p *Peer, from uint32, reason Reason) bool {
 
 		return false
 	}
-
-	p.until.Store(0)
 
 	if !p.state.CompareAndSwap(bHealthy, bEjected) {
 		cc.usable.Add(1)
@@ -628,7 +730,7 @@ func (t *Tracker) Observe(slot uint32, r Result, latency time.Duration) {
 		return
 	}
 
-	if lat := int64(latency); lat > 0 {
+	if lat := min(int64(latency), maxLatency); lat > 0 {
 		p.latSum.Add(lat)
 		p.latN.Add(1)
 
@@ -781,14 +883,24 @@ func (t *Tracker) decayEWMA(nt *table, dt int64) {
 		n := p.latN.Swap(0)
 		sum := p.latSum.Swap(0)
 
-		if n == 0 {
-			continue
+		// A peer with no observations decays toward the median of the
+		// last degrade pass, never upward. Otherwise a Degraded peer,
+		// which routing avoids, would get no traffic and keep its peak
+		// EWMA (and stay Degraded) forever. Once it falls below the
+		// limit traffic returns, and a still-slow peer is marked
+		// Degraded again after its next peak observation. Decaying
+		// toward the median rather than zero keeps idle peers from
+		// dragging the median down.
+		mean := float64(t.median)
+		if n > 0 {
+			mean = float64(sum) / float64(n)
 		}
-
-		mean := float64(sum) / float64(n)
 
 		for {
 			e := p.ewma.Load()
+			if n == 0 && e <= t.median {
+				break
+			}
 
 			ne := int64(mean + (float64(e)-mean)*w)
 			if p.ewma.CompareAndSwap(e, ne) {
@@ -900,6 +1012,10 @@ func (t *Tracker) transitions(nt *table, now int64) {
 				p.probe.Store(0)
 
 				if p.state.CompareAndSwap(bEjected, bProbing) {
+					// Only Tick times ejections, and it ignores until
+					// outside bEjected, so clearing it here means every
+					// future ejection starts untimed.
+					p.until.Store(0)
 					p.reported = bProbing
 
 					if h.OnProbe != nil {
@@ -930,10 +1046,14 @@ func (t *Tracker) degrade(nt *table) {
 
 	var limit int64 = math.MaxInt64
 
+	t.median = 0
+
 	if len(t.scratch) > 0 {
 		slices.Sort(t.scratch)
 
 		median := t.scratch[len(t.scratch)/2]
+
+		t.median = median
 		if median <= math.MaxInt64/t.cfg.DegradedFactor {
 			limit = max(median*t.cfg.DegradedFactor, int64(t.cfg.DegradedFloor))
 		}

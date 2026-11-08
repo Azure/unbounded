@@ -384,13 +384,17 @@ Envoy and gRPC A50:
 
 Implementation notes (`health` package): the per-tracker slot index is a small
 copy-on-write open-addressing table, so memory is O(tracked peers), not
-O(max slot). Untracked slots are `Healthy`. Breaker ejections triggered by
+O(max slot); `Sync` and `TrackMany` apply a whole neighbor set with one
+rebuild. Untracked slots are `Healthy`. Breaker ejections triggered by
 `Observe` take effect immediately but are timed (and jittered) at the next
 `Tick`, so the random source stays on the control path. At least one peer may
 always be ejected regardless of `MaxEjectionPercent`; the limit counters are
 adjusted optimistically and recomputed every `Tick`. `Panic` is recomputed on
 `Tick`, `Track`, and `Untrack`. The degraded median is over all tracked peers
-with latency data. `HedgeAfter` is `HedgeMax` for a peer with no latency data.
+with latency data. `HedgeAfter` is `HedgeMax` for a peer with no latency data. A peer with no
+observations in a tick decays its EWMA toward the last median (never
+upward), so an idle `Degraded` peer, which routing avoids, recovers instead of
+staying `Degraded` forever. Latencies are capped at one hour.
 
 ## Monitoring and failure detection
 
