@@ -214,12 +214,33 @@ fn recoverable(error: Error) -> bool {
 pub(crate) const CIPHERTEXT_WAIT: Duration = Duration::from_millis(250);
 
 fn native_scope(scope: &RequestScope) -> RequestScope {
+    native_scope_within(scope, Duration::from_secs(5))
+}
+/// `scope`, ending no later than `limit` from now.
+fn native_scope_within(scope: &RequestScope, limit: Duration) -> RequestScope {
     let mut bounded = scope.clone();
-    bounded.deadline.0 = bounded
-        .deadline
-        .0
-        .min(scope.clock().now() + Duration::from_secs(5));
+    bounded.deadline.0 = bounded.deadline.0.min(scope.clock().now() + limit);
     bounded
+}
+/// `scope` bounded by the RDMA page timeout of `links`, for one page's grant
+/// or write: past it the page goes over HTTP and the breaker trips.
+fn page_scope(links: &crate::rdma::Links, scope: &RequestScope) -> RequestScope {
+    native_scope_within(scope, links.page_timeout())
+}
+/// Trip the breaker for a failed RDMA grant or write that will go over HTTP
+/// instead, counting a page timeout when the page scope ran out while the
+/// request still had time.
+fn trip_native(links: &crate::rdma::Links, peer: &NodeId, rail: RailId, error: Error, send: bool) {
+    use crate::rdma::breaker::TripReason;
+    let reason = if error == Error::DeadlineExceeded {
+        links.record_page_timeout();
+        TripReason::Timeout
+    } else if send {
+        TripReason::Send
+    } else {
+        TripReason::Grant
+    };
+    links.breaker_trip(peer, rail, reason);
 }
 /// NUMA-`local` rails other than the chosen `rail` that a receiver may grant a
 /// page on when `rail` has no free slot, in order, keeping only those
@@ -395,14 +416,28 @@ impl Transfers {
         }
         binding.response = envelope_digest(&response.authentication)?;
         let previous = signed_digest(&accept.signed)?;
+        // An open breaker sends the body over HTTP at once instead of
+        // writing over a link that recently failed.
+        if links.breaker_admit(peer, binding.rail) == crate::rdma::breaker::Admit::Http {
+            links.release(peer, &grant);
+            links.record_breaker_http();
+            return self
+                .send_fallback(connection, response, &binding, peer, previous, scope)
+                .await;
+        }
         // `Links::send` writes the page in place, or stages a copy without ODP.
+        // The write gets the page timeout, not the whole request: a write the
+        // link cannot finish by then goes over HTTP in this same exchange. The
+        // receiver's grant stays held until our release (or the link break)
+        // reaches it, so a late write cannot land in a reused buffer.
         let sending = scope.clock().now();
         let sent = links
-            .send(peer, &grant, ciphertext, &native_scope(scope))
+            .send(peer, &grant, ciphertext, &page_scope(links, scope))
             .await;
         let sent = match sent {
             Ok(sent) => {
                 links.record_stage(Event::RdmaSendCount, Event::RdmaSendNs, sending);
+                links.breaker_success(peer, binding.rail);
                 sent
             }
             Err(error) => {
@@ -410,6 +445,7 @@ impl Transfers {
                 if !native_failure(error, scope) {
                     return Err(error);
                 }
+                trip_native(links, peer, binding.rail, error, true);
                 return self
                     .send_fallback(connection, response, &binding, peer, previous, scope)
                     .await;
@@ -465,6 +501,27 @@ impl Transfers {
             .write_body(connection, ciphertext.clone(), scope)
             .await?;
         Ok((written.lease, true))
+    }
+    /// Feed the breaker the outcome of a page the sender reported written:
+    /// success closes a half-open breaker; a failed arrival while the request
+    /// is alive trips it.
+    fn native_outcome<T>(
+        &self,
+        peer: &NodeId,
+        rail: RailId,
+        outcome: &Result<T>,
+        scope: &RequestScope,
+    ) {
+        let Some(links) = &self.links else {
+            return;
+        };
+        match outcome {
+            Ok(_) => links.breaker_success(peer, rail),
+            Err(error) if native_failure(*error, scope) => {
+                trip_native(links, peer, rail, *error, true);
+            }
+            Err(_) => {}
+        }
     }
     /// Whether a rail of this node has a landing buffer on GPU `ordinal`.
     pub(crate) fn landing_ready(&self, ordinal: i32) -> bool {
@@ -522,7 +579,17 @@ impl Transfers {
             rail
         };
         if links.ready(&peer, rail).is_none() {
+            // A link being torn down failed; the next one is probed before
+            // pages trust it again.
+            if matches!(links.state(&peer, rail), rdma_verbs::LinkState::Breaking) {
+                links.breaker_trip(&peer, rail, crate::rdma::breaker::TripReason::LinkDown);
+            }
             links.record_fallback_no_link();
+            return Ok(None);
+        }
+        if links.breaker_admit(&peer, rail) == crate::rdma::breaker::Admit::Http {
+            links.record_http_fallback();
+            links.record_breaker_http();
             return Ok(None);
         }
         let mut binding = Binding::request(
@@ -540,7 +607,13 @@ impl Transfers {
                 ) && links.has_landing(rail, ordinal) =>
             {
                 match links
-                    .grant_landing(&peer, rail, binding.transfer, ordinal, &native_scope(scope))
+                    .grant_landing(
+                        &peer,
+                        rail,
+                        binding.transfer,
+                        ordinal,
+                        &page_scope(links, scope),
+                    )
                     .await
                 {
                     Ok(pending) => Some(pending),
@@ -562,6 +635,7 @@ impl Transfers {
                 let spares = if landing.is_none() {
                     spare_rails(rail, &links.local_rails(&peer), |r| {
                         links.ready(&peer, r).is_some()
+                            && !links.breaker_open(&peer, r)
                             && crate::rdma::admits_rail(
                                 plan,
                                 membership,
@@ -573,7 +647,7 @@ impl Transfers {
                 } else {
                     Vec::new()
                 };
-                let native = native_scope(scope);
+                let native = page_scope(links, scope);
                 let transfer = binding.transfer;
                 let mut granted = Err(Error::Overloaded);
                 if !spares.is_empty() {
@@ -615,6 +689,9 @@ impl Transfers {
                 }
                 GrantFailure::Fallback => {
                     links.record_fallback_grant(error);
+                    if error != Error::Overloaded {
+                        trip_native(links, &peer, rail, error, false);
+                    }
                     return Ok(None);
                 }
                 GrantFailure::Fail => return Err(error),
@@ -715,6 +792,7 @@ impl Transfers {
         pending: PendingReceive,
         membership: &std::sync::Arc<crate::topology::Membership>,
         length: usize,
+        granted: std::time::Instant,
         scope: &RequestScope,
         watch: &CloseWatch,
     ) -> Result<RelayResponse> {
@@ -752,6 +830,15 @@ impl Transfers {
         if phase == Phase::Finish {
             if let Some(links) = &self.links {
                 links.record_http_fallback();
+                // An answer this slow most likely means the sender's write
+                // ran out of its page timeout: stop granting to this peer.
+                if scope.clock().now().saturating_duration_since(granted) >= links.page_timeout() {
+                    links.breaker_trip(
+                        verified.peer.node(),
+                        binding.rail,
+                        crate::rdma::breaker::TripReason::SlowFallback,
+                    );
+                }
             }
             // The owner keeps the tag until the sender's release arrives.
             drop(pending);
@@ -771,7 +858,9 @@ impl Transfers {
         if pending.is_landing() {
             let landed = pending
                 .finish_landed(&verified, &envelope, &native_scope(scope))
-                .await?;
+                .await;
+            self.native_outcome(verified.peer.node(), binding.rail, &landed, scope);
+            let landed = landed?;
             #[cfg(test)]
             self.native_completions
                 .set(self.native_completions.get() + 1);
@@ -828,7 +917,9 @@ impl Transfers {
                 admission,
                 &native_scope(scope),
             )
-            .await?;
+            .await;
+        self.native_outcome(verified.peer.node(), binding.rail, &page, scope);
+        let page = page?;
         #[cfg(test)]
         self.native_completions
             .set(self.native_completions.get() + 1);
@@ -1014,7 +1105,10 @@ pub(crate) async fn link_exchange(
             attempt.decline();
             crate::rdma::SetupOutcome::Declined
         }
-        Err(_) => crate::rdma::SetupOutcome::Failed,
+        Err(_) => {
+            links.breaker_trip(peer, rail, crate::rdma::breaker::TripReason::Setup);
+            crate::rdma::SetupOutcome::Failed
+        }
     };
     links.record_setup(outcome);
     result
@@ -1823,6 +1917,7 @@ impl Transfers {
                             pending,
                             membership.as_ref().ok_or(Error::IncompatibleMembership)?,
                             length,
+                            granting,
                             scope,
                             &watch,
                         )
@@ -2831,6 +2926,9 @@ mod tests {
             receiver_site: Option<&'static str>,
             /// The sender's link breaks before it writes.
             sender_down: bool,
+            /// The sender's breaker for the receiver is tripped first, with
+            /// this cooldown.
+            sender_breaker: Option<Duration>,
             /// The receiver grants a slot of a simulated GPU's landing buffer.
             landing: bool,
             /// The receiver's ciphertext share for the page's cache is held in full
@@ -2859,6 +2957,14 @@ mod tests {
             closed: bool,
             /// Receiver ciphertext budget waits.
             ciphertext_waits: u64,
+            /// The sender's breaker for the receiver is open after the exchange.
+            sender_open: bool,
+            /// Sender breaker trips because a write failed.
+            sender_trips: u64,
+            /// Sender pages sent over HTTP because its breaker was open.
+            sender_breaker_http: u64,
+            /// Sender breakers closed by a probe.
+            sender_closes: u64,
         }
 
         fn page_membership(
@@ -3054,6 +3160,20 @@ mod tests {
                 )
                 .unwrap();
             let accept_wire = p::encode_signed(&accept).unwrap();
+            if let Some(cooldown) = case.sender_breaker {
+                let links = sender.links.as_ref().unwrap();
+                links.configure_breaker(crate::rdma::breaker::BreakerConfig {
+                    base: cooldown,
+                    max: cooldown,
+                    ..Default::default()
+                });
+                links.breaker_trip(
+                    signers[0].node(),
+                    RailId(7),
+                    crate::rdma::breaker::TripReason::Setup,
+                );
+                std::thread::sleep(cooldown.min(Duration::from_millis(50)));
+            }
             if case.sender_down {
                 let links = sender.links.as_ref().unwrap();
                 let (epoch, _) = links.ready(signers[0].node(), RailId(7)).unwrap();
@@ -3132,6 +3252,7 @@ mod tests {
                             pending,
                             &receiver_membership,
                             length,
+                            scope.clock().now(),
                             &scope,
                             &watch,
                         )
@@ -3258,6 +3379,14 @@ mod tests {
                 closed,
                 ciphertext_waits: receiver_metrics
                     .count(crate::telemetry::Event::PeerReceiveCiphertextWaits),
+                sender_open: sender
+                    .links
+                    .as_ref()
+                    .unwrap()
+                    .breaker_open(signers[0].node(), RailId(7)),
+                sender_trips: sender_metrics.count(crate::telemetry::Event::RdmaBreakerTripSend),
+                sender_breaker_http: sender_metrics.count(crate::telemetry::Event::RdmaBreakerHttp),
+                sender_closes: sender_metrics.count(crate::telemetry::Event::RdmaBreakerClose),
             }
         }
 
@@ -3413,6 +3542,131 @@ mod tests {
             assert_eq!(
                 (outcome.completed, outcome.fallbacks, outcome.completions),
                 (0, 1, 0)
+            );
+        }
+
+        /// A write that fails on a broken link goes over HTTP in the same
+        /// exchange (no page retry), and trips the sender's breaker.
+        #[test]
+        fn failed_write_trips_the_breaker_and_finishes_over_http() {
+            let env = racer_io::Env::host();
+            let outcome = page_roundtrip(
+                &env,
+                PageCase {
+                    sender_down: true,
+                    ..PageCase::default()
+                },
+            );
+            assert_eq!(page_bytes(&outcome.result), vec![0x5a; 144]);
+            assert_eq!((outcome.completed, outcome.fallbacks), (0, 1));
+            assert!(outcome.sender_open);
+            assert_eq!(outcome.sender_trips, 1);
+        }
+
+        /// While the sender's breaker is open it answers a grant over HTTP at
+        /// once, without writing, and releases the receiver's grant.
+        #[test]
+        fn open_breaker_sends_over_http_without_writing() {
+            let env = racer_io::Env::host();
+            let outcome = page_roundtrip(
+                &env,
+                PageCase {
+                    sender_breaker: Some(Duration::from_secs(60)),
+                    ..PageCase::default()
+                },
+            );
+            assert_eq!(page_bytes(&outcome.result), vec![0x5a; 144]);
+            assert_eq!(outcome.sent, Ok(true));
+            assert_eq!((outcome.completed, outcome.fallbacks), (0, 1));
+            assert_eq!(outcome.sender_breaker_http, 1);
+            assert!(outcome.sender_open);
+            assert_eq!(outcome.free, (Some(2), Some(2)), "the grant is released");
+        }
+
+        /// After the cooldown one probe page goes over RDMA, and its success
+        /// closes the breaker.
+        #[test]
+        fn probe_after_cooldown_writes_and_closes_the_breaker() {
+            let env = racer_io::Env::host();
+            let outcome = page_roundtrip(
+                &env,
+                PageCase {
+                    sender_breaker: Some(Duration::from_millis(5)),
+                    ..PageCase::default()
+                },
+            );
+            assert_eq!(page_bytes(&outcome.result), vec![0x5a; 144]);
+            assert_eq!((outcome.completed, outcome.fallbacks), (1, 0));
+            assert_eq!(outcome.sender_breaker_http, 0);
+            assert_eq!(outcome.sender_closes, 1);
+            assert!(!outcome.sender_open);
+        }
+
+        /// The receiver plans HTTP for a peer whose breaker is open, without
+        /// taking a grant, and grants again once a probe succeeds.
+        #[test]
+        fn open_breaker_makes_the_receiver_plan_http_at_once() {
+            use crate::rdma::links::tests::link_up;
+            use crate::rdma::links::tests::world_for;
+            let env = racer_io::Env::host();
+            let signers = crate::peer::tests::signers(&env);
+            let mut w = world_for(
+                [signers[0].node().clone(), signers[2].node().clone()],
+                false,
+            );
+            let env = w.env.clone();
+            link_up(&env, &mut w);
+            let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+                crate::test_support::cluster::config(true).limits,
+            )));
+            let reactor = Rc::new(Reactor::new(admission.clone(), &env));
+            let receiver =
+                transfers(signers[0].clone(), &admission, &reactor).with_links(w.a.links.clone());
+            let membership = page_membership(&signers, None);
+            let (signed, _) = crate::peer::forwarding::Forwarding::new(signers[0].clone())
+                .sign_request(crate::peer::tests::request(&env, &admission, 0))
+                .unwrap();
+            let scope = signed.request.origin.scope().clone();
+            let peer = signers[2].node().clone();
+            let links = w.a.links.clone();
+            let plan = TransportPlan::Rdma { rail: RailId(7) };
+            let free = || links.buffers(RailId(7), rdma_verbs::BufferState::Free);
+            let accept = |w: &mut crate::rdma::links::tests::World| {
+                crate::rdma::links::tests::drive(&mut w.a.owner, &mut w.b.owner, async {
+                    receiver
+                        .accept_native(&signed, plan, &membership, None, &scope)
+                        .await
+                        .unwrap()
+                        .map(|(_, _, _, pending)| pending)
+                })
+            };
+            // Closed: the receiver grants.
+            let granted = accept(&mut w);
+            assert!(granted.is_some());
+            drop(granted);
+            crate::rdma::links::tests::pump(&mut w.a.owner, &mut w.b.owner);
+            links.configure_breaker(crate::rdma::breaker::BreakerConfig {
+                base: Duration::from_millis(20),
+                max: Duration::from_millis(20),
+                ..Default::default()
+            });
+            links.breaker_trip(&peer, RailId(7), crate::rdma::breaker::TripReason::Send);
+            // Open: HTTP at once, no grant taken.
+            let before = free();
+            assert!(accept(&mut w).is_none());
+            assert_eq!(free(), before);
+            std::thread::sleep(Duration::from_millis(25));
+            // Half-open: one probe grant, then HTTP until it reports.
+            let probe = accept(&mut w);
+            assert!(probe.is_some());
+            assert!(accept(&mut w).is_none());
+            drop(probe);
+            links.breaker_success(&peer, RailId(7));
+            // Closed again. (Both test buffers are now held by grants no
+            // sender released, so check the verdict rather than grant.)
+            assert_eq!(
+                links.breaker_admit(&peer, RailId(7)),
+                crate::rdma::breaker::Admit::Rdma
             );
         }
 

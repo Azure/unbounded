@@ -189,6 +189,12 @@ pub struct LinkNode {
 
     /// GPU landing state, owned by the GPU side; this node drives it.
     gpu_landing: Arc<crate::gpu_landing::GpuLandingRegistry>,
+
+    /// RDMA-to-HTTP circuit breakers per peer and rail.
+    breaker: Mutex<super::breaker::Breaker>,
+
+    /// When a breaker transition was last logged, to rate-limit the log.
+    breaker_logged: Mutex<Option<Instant>>,
 }
 
 /// Split each GPU's landing buffer of `slots` page slots across `rails`.
@@ -488,6 +494,114 @@ impl Links {
         self.record(count, 1);
     }
 
+    /// Set the node-wide breaker tunables. Every worker passes the same
+    /// configuration, so the last write wins harmlessly.
+    pub fn with_breaker(self, config: super::breaker::BreakerConfig) -> Self {
+        self.configure_breaker(config);
+        self
+    }
+
+    /// As [`Self::with_breaker`], on a shared handle.
+    pub fn configure_breaker(&self, config: super::breaker::BreakerConfig) {
+        LinkNode::lock(&self.node.breaker).configure(config);
+    }
+
+    /// Longest one page's RDMA grant or write may take before it goes over
+    /// HTTP instead.
+    pub fn page_timeout(&self) -> Duration {
+        LinkNode::lock(&self.node.breaker).config().page_timeout
+    }
+
+    /// Whether a page to or from `peer` on `rail` may use RDMA now.
+    pub fn breaker_admit(&self, peer: &NodeId, rail: RailId) -> super::breaker::Admit {
+        LinkNode::lock(&self.node.breaker).allow(peer, rail, self.ctx.clock.now())
+    }
+
+    /// Whether the breaker for `peer` on `rail` is open or half-open.
+    pub fn breaker_open(&self, peer: &NodeId, rail: RailId) -> bool {
+        LinkNode::lock(&self.node.breaker).is_open(peer, rail)
+    }
+
+    /// Record an RDMA failure for `peer` on `rail`, tripping its breaker.
+    pub fn breaker_trip(&self, peer: &NodeId, rail: RailId, reason: super::breaker::TripReason) {
+        let now = self.ctx.clock.now();
+        let opened = LinkNode::lock(&self.node.breaker).trip(peer, rail, reason, now);
+        if let Some(transition) = opened {
+            use super::breaker::TripReason as R;
+            use crate::telemetry::Event;
+            self.record(
+                match reason {
+                    R::LinkDown => Event::RdmaBreakerTripLinkDown,
+                    R::Grant => Event::RdmaBreakerTripGrant,
+                    R::Send => Event::RdmaBreakerTripSend,
+                    R::Timeout => Event::RdmaBreakerTripTimeout,
+                    R::SlowFallback => Event::RdmaBreakerTripSlowFallback,
+                    R::Setup => Event::RdmaBreakerTripSetup,
+                },
+                1,
+            );
+            self.log_breaker(peer, rail, transition, now);
+        }
+    }
+
+    /// Record an RDMA success for `peer` on `rail`, closing a half-open breaker.
+    pub fn breaker_success(&self, peer: &NodeId, rail: RailId) {
+        let closed = LinkNode::lock(&self.node.breaker).success(peer, rail);
+        if let Some(transition) = closed {
+            self.record(crate::telemetry::Event::RdmaBreakerClose, 1);
+            self.log_breaker(peer, rail, transition, self.ctx.clock.now());
+        }
+    }
+
+    /// Log a breaker transition, at most one line per second node-wide.
+    fn log_breaker(
+        &self,
+        peer: &NodeId,
+        rail: RailId,
+        transition: super::breaker::Transition,
+        now: Instant,
+    ) {
+        {
+            let mut logged = LinkNode::lock(&self.node.breaker_logged);
+            if logged.is_some_and(|at| now.saturating_duration_since(at) < Duration::from_secs(1)) {
+                return;
+            }
+            *logged = Some(now);
+        }
+        if self.ctx.is_simulated() {
+            return;
+        }
+        match transition {
+            super::breaker::Transition::Opened {
+                reason,
+                cooldown,
+                trips,
+            } => eprintln!(
+                "racer: RDMA breaker open for peer {} rail {}: {} (trip {trips}, HTTP for {} ms)",
+                peer.0,
+                rail.0,
+                reason.label(),
+                cooldown.as_millis()
+            ),
+            super::breaker::Transition::Closed => {
+                eprintln!(
+                    "racer: RDMA breaker closed for peer {} rail {}",
+                    peer.0, rail.0
+                )
+            }
+        }
+    }
+
+    /// Count a page that used HTTP because its breaker was open.
+    pub fn record_breaker_http(&self) {
+        self.record(crate::telemetry::Event::RdmaBreakerHttp, 1);
+    }
+
+    /// Count a page whose RDMA write or grant ran out of the page timeout.
+    pub fn record_page_timeout(&self) {
+        self.record(crate::telemetry::Event::RdmaPageTimeout, 1);
+    }
+
     /// Count a peer transfer that planned RDMA but carried its page over HTTP.
     pub fn record_http_fallback(&self) {
         self.record(crate::telemetry::Event::RdmaHttpFallback, 1);
@@ -540,6 +654,12 @@ impl Links {
             metrics.record(event, grown);
         }
         self.breaks_seen.set(seen);
+        let open = {
+            let mut breaker = LinkNode::lock(&self.node.breaker);
+            breaker.prune(self.ctx.clock.now());
+            breaker.open_count()
+        };
+        metrics.set_gauge(Gauge::RdmaBreakerOpen, open as u64);
         let counts = self.client.link_counts();
         for (gauge, value) in [
             (Gauge::RdmaLinksReady, counts.ready),
