@@ -1097,6 +1097,10 @@ pub struct WorkerApplication {
     /// Discoverable devices the last rescan saw, so each change logs once.
     rdma_rescan_seen: Option<Vec<String>>,
 
+    /// When the rescan last saw the discoverable devices change; they are
+    /// opened only once unchanged for the settle time.
+    rdma_rescan_changed: std::time::Instant,
+
     telemetry: Rc<Telemetry>,
 
     directory: std::rc::Rc<WorkerDirectory>,
@@ -1796,6 +1800,7 @@ impl WorkerApplication {
             rdma_sysfs: crate::rdma::SYSFS_INFINIBAND.into(),
             rdma_rescan: started,
             rdma_rescan_seen: None,
+            rdma_rescan_changed: started,
             telemetry: Rc::new(telemetry),
             directory: directory.clone(),
             node,

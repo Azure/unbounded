@@ -603,8 +603,12 @@ impl WorkerApplication {
     /// when it shows a discoverable, active device the inventory lacks are
     /// the verbs character device nodes refreshed and the inventory
     /// rediscovered (verbs port discovery, no connection manager listener).
-    /// Each change in what sysfs shows is logged once. Returns whether the
-    /// inventory changed, so activation should be tried now.
+    /// Each change in what sysfs shows is logged once, and the devices must
+    /// stay unchanged for [`RAIL_SETTLE`] before they are opened: a device
+    /// that just returned may still be renamed by udev (for example
+    /// `mana_0` to `roceP...`), and activating under the old name would
+    /// look like a fresh device loss. Returns whether the inventory changed,
+    /// so activation should be tried now.
     fn rescan_devices(&mut self) -> bool {
         let now = self.ctx().now();
         if now < self.rdma_rescan {
@@ -615,6 +619,12 @@ impl WorkerApplication {
         if self.rdma_rescan_seen.as_ref() != Some(&found) {
             eprintln!("racer: stage=rdma-rescan state=sysfs devices={found:?}");
             self.rdma_rescan_seen = Some(found.clone());
+            self.rdma_rescan_changed = now;
+        }
+        let settled = self.rdma_rescan_changed + RAIL_SETTLE;
+        if now < settled {
+            self.rdma_rescan = self.rdma_rescan.min(settled);
+            return false;
         }
         if !found
             .iter()
@@ -2801,7 +2811,10 @@ mod tests {
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         let mut run = |worker: &mut WorkerApplication| {
             for _ in 0..20 {
-                worker.rdma_rescan = worker.ctx().now();
+                let now = worker.ctx().now();
+                worker.rdma_rescan = now;
+                // Devices that changed have settled.
+                worker.rdma_rescan_changed = now - RAIL_SETTLE;
                 worker.poll_native(&mut cx).unwrap();
                 service.poll_budgeted(&mut cx, 64).unwrap();
             }
@@ -2815,8 +2828,17 @@ mod tests {
         // Only the null-GID twin: no verbs rediscovery at all.
         assert_eq!(app.node.inventory.generation(), generation);
         assert_eq!(worker.rdma_rescan_seen, Some(Vec::new()));
-        // The device appears.
+        // The device appears; it is not opened until it has settled.
         std::fs::create_dir_all(root.join("test-device")).unwrap();
+        worker.rdma_rescan = worker.ctx().now();
+        let mut cx2 = Context::from_waker(futures::task::noop_waker_ref());
+        worker.poll_native(&mut cx2).unwrap();
+        assert!(worker.discovered_nics.is_empty());
+        assert_eq!(app.node.inventory.generation(), generation);
+        assert_eq!(
+            worker.rdma_rescan_seen,
+            Some(vec!["test-device".to_string()])
+        );
         run(&mut worker);
         assert_eq!(worker.discovered_nics.len(), 1);
         assert!(!worker.actual_rails.is_empty());
