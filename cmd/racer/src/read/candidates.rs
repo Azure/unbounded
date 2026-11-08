@@ -313,6 +313,10 @@ pub(crate) enum ProviderSelection {
     },
 }
 
+/// Most residents with an already cached current ranking that one ownership
+/// refresh turn completes. Each costs a cache lookup, not a member score.
+const OWNERSHIP_PAGES_PER_TURN: usize = 256;
+
 #[derive(Default)]
 struct OwnershipRefresh {
     cursor: u64,
@@ -954,45 +958,65 @@ impl CandidatePolicy {
     }
 
     /// Call once per worker service turn, also when no reads are arriving.
-    /// Walks one indexed resident at a time (including recovered idle pages),
-    /// with at most 256 member scores and 64 ranking-cache CLOCK visits per turn.
-    /// A completed pass returns Idle; schedule another pass on a bounded timer.
-    /// Publication is reloaded every turn, so obsolete partial results cannot
-    /// classify the new topology. Foreground scoped ranking warms the same cache.
+    /// Walks indexed residents (including recovered idle pages) in order. Pages
+    /// whose current ranking is already cached complete without scoring, up to
+    /// [`OWNERSHIP_PAGES_PER_TURN`] per turn; the first page that needs cold
+    /// ranking spends this turn's single quantum (at most 256 member scores and
+    /// 64 ranking-cache CLOCK visits) and ends the turn. Batching warm pages
+    /// keeps a steady-state pass over a large resident set from waking the
+    /// worker once per page. A completed pass returns Idle; schedule another
+    /// pass on a bounded timer. Publication is reloaded every turn, so obsolete
+    /// partial results cannot classify the new topology. Foreground scoped
+    /// ranking warms the same cache.
     pub fn refresh_ownership(
         &self,
         index: &crate::store::catalog::Index,
     ) -> Result<crate::topology::Maintenance> {
         let snapshot = self.published.current()?.ok_or(Error::Unavailable)?;
         let mut work = self.ownership_refresh.borrow_mut();
-        if work.active.is_none() {
-            // Continuous appends must not keep a pass chasing the moving tail
-            // forever while earlier residents retain missing topology hints.
-            if work.visited >= index.page_capacity() {
+        for _ in 0..OWNERSHIP_PAGES_PER_TURN {
+            if work.active.is_none() {
+                // Continuous appends must not keep a pass chasing the moving tail
+                // forever while earlier residents retain missing topology hints.
+                if work.visited >= index.page_capacity() {
+                    work.cursor = 0;
+                    work.visited = 0;
+                    return Ok(crate::topology::Maintenance::Idle);
+                }
+                let (cursor, mut pages) = index.snapshot_pages(work.cursor, 1);
+                work.cursor = cursor;
+                work.active = pages.pop().map(|(page, _)| page);
+                work.visited += usize::from(work.active.is_some());
+            }
+            let Some(page) = &work.active else {
                 work.cursor = 0;
                 work.visited = 0;
                 return Ok(crate::topology::Maintenance::Idle);
+            };
+            if self
+                .placement
+                .cached(
+                    snapshot.membership.clone(),
+                    &page.version.object,
+                    page.number,
+                )
+                .is_some()
+            {
+                work.active = None;
+                continue;
             }
-            let (cursor, mut pages) = index.snapshot_pages(work.cursor, 1);
-            work.cursor = cursor;
-            work.active = pages.pop().map(|(page, _)| page);
-            work.visited += usize::from(work.active.is_some());
-        }
-        let Some(page) = &work.active else {
-            work.cursor = 0;
-            work.visited = 0;
-            return Ok(crate::topology::Maintenance::Idle);
-        };
-        if self
-            .placement
-            .refresh(
-                snapshot.membership.clone(),
-                &page.version.object,
-                page.number,
-            )
-            .is_some()
-        {
-            work.active = None;
+            if self
+                .placement
+                .refresh(
+                    snapshot.membership.clone(),
+                    &page.version.object,
+                    page.number,
+                )
+                .is_some()
+            {
+                work.active = None;
+            }
+            return Ok(crate::topology::Maintenance::Progress);
         }
         Ok(crate::topology::Maintenance::Progress)
     }
@@ -4469,6 +4493,75 @@ pub(super) mod tests {
         .unwrap();
         assert!(!policy.owns_current(&page));
         assert!(peers.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn ownership_refresh_batches_cached_pages_and_ranks_one_cold_page_per_turn() {
+        use crate::model::{PageId, VersionMetadata, WorkerId};
+        use crate::store::catalog::{Index, IndexSnapshot, IndexedPage, RecordLocation};
+        const PAGES: usize = OWNERSHIP_PAGES_PER_TURN + 44;
+        let env = racer_io::Env::host();
+        let members = membership();
+        let peers = Rc::new(RecordedPeer {
+            calls: RefCell::new(vec![]),
+            error: Error::Unavailable,
+        });
+        let mut policy = policy(&env, members.members()[0].node.clone(), peers);
+        policy.placement = Rc::new(Placement::new(4 * PAGES));
+        policy.published = crate::test_support::published_membership(members);
+        let version = ObjectVersion {
+            object: object(),
+            etag: StrongEtag::test_value("batched"),
+        };
+        let index = Index::new(
+            WorkerId(0),
+            8,
+            crate::test_support::availability(&env),
+            racer_io::Clock::host(),
+        );
+        index.set_page_capacity(PAGES).unwrap();
+        let entries = (0..PAGES)
+            .map(|number| {
+                (
+                    PageId {
+                        version: version.clone(),
+                        number: PageNumber(number as u64),
+                    },
+                    IndexedPage {
+                        page_size: racer_wire::object::PageSize::DEFAULT,
+                        location: RecordLocation {
+                            segment: page_alloc::SegmentId(0),
+                            generation: page_alloc::Generation(1),
+                            extent: page_alloc::Extent::new(number as u64 * 512, 512).unwrap(),
+                        },
+                        metadata: VersionMetadata {
+                            content_type: None,
+                            version: version.clone(),
+                            length: 1 << 40,
+                        },
+                        key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
+                    },
+                )
+            })
+            .collect();
+        index
+            .restore(IndexSnapshot {
+                entries,
+                metadata: vec![],
+            })
+            .unwrap();
+        assert_eq!(index.snapshot_pages(0, PAGES).1.len(), PAGES);
+        let pass = || {
+            (1..=4 * PAGES)
+                .find(|_| {
+                    policy.refresh_ownership(&index) == Ok(crate::topology::Maintenance::Idle)
+                })
+                .expect("ownership pass completes")
+        };
+        // Cold ranking spends at most one quantum per turn.
+        assert!(pass() > PAGES);
+        // A settled pass completes warm pages in batches, not one turn per page.
+        assert_eq!(pass(), PAGES.div_ceil(OWNERSHIP_PAGES_PER_TURN));
     }
 
     #[test]
