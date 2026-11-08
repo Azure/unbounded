@@ -631,7 +631,13 @@ func capSeeds(s []string) []string {
 }
 
 func (e *Elector) acquire(in Input, base Record, notFound bool) []Op {
-	term := max(base.Term, in.ViewTerm, e.maxTerm) + 1
+	bt := base.Term
+	if bt >= MaxSaneTerm {
+		// A corrupt annotation; reading it as 0 is safe (see ObserveTerm).
+		bt = 0
+	}
+
+	term := max(bt, in.ViewTerm, e.maxTerm) + 1
 	if notFound {
 		term = max(in.ViewTerm, e.maxTerm) + 1
 		base = Record{}
@@ -659,6 +665,29 @@ func (e *Elector) acquire(in Input, base Record, notFound bool) []Op {
 	return e.issue(in.Now, OpUpdate, purposeAcquire, r)
 }
 
+// MaxSaneTerm bounds the terms the Elector believes. A real cluster never
+// gets near it (one term per election); a larger value can only come from a
+// corrupt or hostile record or message, and accepting it would let the
+// next term overflow.
+const MaxSaneTerm = uint64(1) << 62
+
+// ObserveTerm records a term seen outside the Lease, for example in a view
+// or control message of another lineage. The next acquisition uses a term
+// above it, and a Release carries it, so a Lease whose term annotation was
+// lost or corrupted (read as 0) cannot make a new leader reuse a term.
+// Terms at or above MaxSaneTerm are ignored so the next term cannot
+// overflow.
+func (e *Elector) ObserveTerm(t uint64) {
+	if t >= MaxSaneTerm {
+		return
+	}
+
+	e.maxTerm = max(e.maxTerm, t)
+}
+
+// MaxTerm returns the highest term seen in the Lease, held, or observed.
+func (e *Elector) MaxTerm() uint64 { return max(e.maxTerm, e.term) }
+
 // Release gives up leadership for a graceful leave. If leader, it steps down
 // at once (emitting Lost{LostReleased}) and returns an Update that clears
 // Holder so candidates can take the Lease without waiting. Otherwise it
@@ -672,6 +701,10 @@ func (e *Elector) Release(in Input) []Op {
 	r.Holder = ""
 	r.RenewTime = in.Wall
 	r.Seeds = nil
+	// Carry the highest term this member has seen (see ObserveTerm) so the
+	// next holder starts above every lineage, even one whose term never
+	// reached the Lease.
+	r.Term = max(e.term, e.maxTerm)
 
 	ops := e.issue(in.Now, OpUpdate, purposeRelease, r)
 	e.events = append(e.events, Event{Kind: Lost, Term: e.term, Reason: LostReleased})
@@ -702,7 +735,10 @@ func (e *Elector) noteHolder(r Record) {
 		Addr: r.Addr, Seeds: slices.Clone(r.Seeds), RenewTime: r.RenewTime,
 	}
 	e.haveLead = true
-	e.maxTerm = max(e.maxTerm, r.Term)
+
+	if r.Term < MaxSaneTerm {
+		e.maxTerm = max(e.maxTerm, r.Term)
+	}
 
 	if changed && (r.Holder != e.self.ID || r.Incarnation != e.self.Incarnation) {
 		e.events = append(e.events, Event{Kind: Discovered, Term: r.Term, Record: r.Clone()})
