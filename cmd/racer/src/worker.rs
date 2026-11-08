@@ -169,7 +169,11 @@ impl AffinityPlan {
                         || rails.iter().any(|rail| rail.numa_node == nic.numa_node))
             });
             let pairs =
-                crate::affinity::place_exact(topology, max_threads, io, helpers, config.allow_smt)?
+                crate::affinity::place_exact(topology, max_threads, io, helpers, config.allow_smt)
+                    .map_err(|error| {
+                        eprintln!("racer: affinity placement failed: {error}");
+                        Error::InvalidConfiguration
+                    })?
                     .into_iter()
                     .enumerate()
                     .map(|(index, placement)| WorkerPair {
@@ -1446,7 +1450,10 @@ mod tests {
                 for cpu in &mut split.cpus {
                     cpu.numa_node = Some(usize::from(cpu.cpu >= 20));
                 }
-                assert!(place_exact(split, 40, 20, 20, false).is_err());
+                // Spilling to a second node keeps every helper local to its lanes.
+                let plan = place_exact(split, 40, 20, 20, false).unwrap();
+                assert_eq!(plan.len(), 20);
+                assert!(plan.iter().all(|p| p.lane.numa_node == p.helper.numa_node));
                 let mut duplicate = topology(72, None);
                 duplicate.cpus[1].cpu = 0;
                 assert!(place_exact(duplicate, 40, 20, 20, false).is_err());
@@ -1468,7 +1475,7 @@ mod tests {
             }
 
             #[test]
-            fn exact_nic_preference_selects_one_node_without_capacity_fallback() {
+            fn exact_nic_preference_selects_nic_node_then_spills_locally() {
                 use crate::affinity::place_exact;
                 let mut hardware = topology(16, None);
                 for cpu in &mut hardware.cpus {
@@ -1484,8 +1491,11 @@ mod tests {
                     assert_eq!(pair.helper.cpu, index + 12);
                     assert_eq!(pair.nic.as_ref().unwrap().device, "nic1");
                 }
+                // Too few NIC-local CPUs: spill to node 0, helpers stay local.
                 hardware.cpus.retain(|cpu| cpu.cpu < 12);
-                assert!(place_exact(hardware, 8, 4, 4, false).is_err());
+                let plan = place_exact(hardware, 8, 4, 4, false).unwrap();
+                assert_eq!(plan.len(), 4);
+                assert!(plan.iter().all(|p| p.lane.numa_node == p.helper.numa_node));
             }
 
             #[test]

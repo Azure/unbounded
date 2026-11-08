@@ -149,34 +149,72 @@ pub fn place(
     Ok(pairs)
 }
 
-/// Exact roles on the first preferred NUMA node, without fallback or sharing CPUs.
+/// Why an explicit lane and helper count cannot be placed. The message names
+/// the constraint that does not fit, since the typed error carries no detail.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlacementError(pub String);
+
+impl std::fmt::Display for PlacementError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PlacementError {}
+
+/// Exact roles without sharing CPUs, spread over NIC-local NUMA nodes (the
+/// first node when no NIC locality is known, then further nodes in preference
+/// order while the roles do not fit) in proportion to each node's eligible CPUs. Every lane's helper is on the lane's node, and spare
+/// CPUs are left on every node for the RDMA owner when capacity allows.
 pub fn place_exact(
     mut topology: EffectiveTopology,
     max_threads: usize,
     lanes: usize,
     helpers: usize,
     allow_smt: bool,
-) -> Result<Vec<Placement>> {
-    let total = lanes
-        .checked_add(helpers)
-        .ok_or(Error::InvalidConfiguration)?;
-    if lanes == 0 || helpers == 0 || helpers > lanes || total > max_threads {
-        return Err(Error::InvalidConfiguration);
+) -> std::result::Result<Vec<Placement>, PlacementError> {
+    let fail = |message: String| Err(PlacementError(message));
+    let Some(total) = lanes.checked_add(helpers) else {
+        return fail(format!(
+            "io_workers={lanes} + crypto_helpers={helpers} overflows"
+        ));
+    };
+    if lanes == 0 || helpers == 0 {
+        return fail(format!(
+            "io_workers={lanes} and crypto_helpers={helpers} must both be at least 1"
+        ));
     }
-    if topology
-        .quota
-        .is_some_and(|q| u128::from(q.quota.get()) / u128::from(q.period.get()) < total as u128)
+    if helpers > lanes {
+        return fail(format!(
+            "crypto_helpers={helpers} exceeds io_workers={lanes}; every helper needs a lane"
+        ));
+    }
+    if total > max_threads {
+        return fail(format!(
+            "io_workers={lanes} + crypto_helpers={helpers} = {total} exceeds the worker thread \
+             budget {max_threads} (max_threads minus the RDMA owner when RDMA is enabled)"
+        ));
+    }
+    if let Some(q) = topology.quota
+        && u128::from(q.quota.get()) / u128::from(q.period.get()) < total as u128
     {
-        return Err(Error::InvalidConfiguration);
+        return fail(format!(
+            "{total} pinned threads exceed the cgroup CPU quota {}/{}",
+            q.quota, q.period
+        ));
     }
     topology.cpus.sort_by_key(|cpu| cpu.cpu);
-    if topology
+    if let Some(pair) = topology
         .cpus
         .windows(2)
-        .any(|pair| pair[0].cpu == pair[1].cpu)
+        .find(|pair| pair[0].cpu == pair[1].cpu)
     {
-        return Err(Error::InvalidConfiguration);
+        return fail(format!(
+            "CPU {} is listed twice in the topology",
+            pair[0].cpu
+        ));
     }
+    let visible = topology.cpus.len();
     if !allow_smt {
         let mut cores = HashSet::new();
         topology
@@ -189,35 +227,90 @@ pub fn place_exact(
     for cpu in topology.cpus {
         nodes.entry(cpu.numa_node).or_default().push(cpu);
     }
-    let mut nodes = nodes.into_iter().collect::<Vec<_>>();
-    nodes.sort_by_key(|(node, _)| {
-        (
-            !topology.nics.iter().any(|nic| nic.numa_node == *node),
-            *node,
-        )
-    });
-    let (node, local) = nodes
-        .into_iter()
-        .next()
-        .ok_or(Error::InvalidConfiguration)?;
-    if node.is_none() || local.len() < total {
-        return Err(Error::InvalidConfiguration);
+    if nodes.contains_key(&None) {
+        return fail(
+            "NUMA node of some usable CPUs is unknown; exact placement needs NUMA locality".into(),
+        );
     }
-    let mut cores = HashSet::new();
-    let mut ordered = local
-        .into_iter()
-        .map(|cpu| (!cores.insert((cpu.package, cpu.core)), cpu))
+    let has_nic = |node: &Option<usize>| topology.nics.iter().any(|nic| nic.numa_node == *node);
+    let mut nodes = nodes.into_iter().collect::<Vec<_>>();
+    nodes.sort_by_key(|(node, _)| (!has_nic(node), *node));
+    let eligible = nodes.iter().map(|(_, local)| local.len()).sum::<usize>();
+    let per_node = nodes
+        .iter()
+        .map(|(node, local)| format!("node{}={}", node.unwrap_or_default(), local.len()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    // Spread over every NIC-local node (the first node when no NIC locality is
+    // known), then add further nodes in preference order until the roles fit.
+    let mut chosen = nodes
+        .iter()
+        .filter(|(node, _)| has_nic(node))
+        .count()
+        .max(1);
+    while chosen < nodes.len()
+        && nodes[..chosen].iter().map(|(_, l)| l.len()).sum::<usize>() < total
+    {
+        chosen += 1;
+    }
+    let nodes = nodes.into_iter().take(chosen).collect::<Vec<_>>();
+    let capacity = nodes
+        .iter()
+        .map(|(_, local)| local.len())
         .collect::<Vec<_>>();
-    ordered.sort_by_key(|(sibling, cpu)| (*sibling, cpu.cpu));
-    let local = ordered.into_iter().map(|(_, cpu)| cpu).collect::<Vec<_>>();
-    let nic = topology.nics.into_iter().find(|nic| nic.numa_node == node);
-    Ok((0..lanes)
-        .map(|index| Placement {
+    let Some(split) = split_exact(&capacity, lanes, helpers) else {
+        return fail(format!(
+            "io_workers={lanes} + crypto_helpers={helpers} = {total} do not fit on distinct CPUs \
+             with each helper NUMA-local to its lanes: {eligible} of {visible} usable CPUs are \
+             eligible (RACER_ALLOW_SMT={allow_smt}); eligible CPUs per node: {}",
+            per_node
+        ));
+    };
+    let mut placements = Vec::with_capacity(lanes);
+    for ((node, local), (node_lanes, node_helpers)) in nodes.into_iter().zip(split) {
+        if node_lanes == 0 {
+            continue;
+        }
+        let mut cores = HashSet::new();
+        let mut ordered = local
+            .into_iter()
+            .map(|cpu| (!cores.insert((cpu.package, cpu.core)), cpu))
+            .collect::<Vec<_>>();
+        ordered.sort_by_key(|(sibling, cpu)| (*sibling, cpu.cpu));
+        let local = ordered.into_iter().map(|(_, cpu)| cpu).collect::<Vec<_>>();
+        let nic = topology.nics.iter().find(|nic| nic.numa_node == node);
+        placements.extend((0..node_lanes).map(|index| Placement {
             lane: local[index].clone(),
-            helper: local[lanes + index % helpers].clone(),
-            nic: nic.clone(),
-        })
-        .collect())
+            helper: local[node_lanes + index % node_helpers].clone(),
+            nic: nic.cloned(),
+        }));
+    }
+    Ok(placements)
+}
+
+/// Split lanes and helpers over nodes with the given CPU capacities, roughly in
+/// proportion to capacity. Each node with lanes gets 1..=lanes helpers and no
+/// more roles than CPUs. None when no such split exists.
+fn split_exact(capacity: &[usize], lanes: usize, helpers: usize) -> Option<Vec<(usize, usize)>> {
+    let mut split = vec![(0usize, 0usize); capacity.len()];
+    // Helpers first: each needs one CPU plus at least one lane CPU.
+    for _ in 0..helpers {
+        let node = (0..capacity.len())
+            .filter(|&n| 2 * (split[n].1 + 1) <= capacity[n])
+            .min_by_key(|&n| ((split[n].1 + 1) * 1_000_000 / capacity[n], n))?;
+        split[node].1 += 1;
+    }
+    // Every helper's node needs at least as many lanes as helpers.
+    for entry in &mut split {
+        entry.0 = entry.1;
+    }
+    for _ in 0..lanes - helpers {
+        let node = (0..capacity.len())
+            .filter(|&n| split[n].1 > 0 && split[n].0 + split[n].1 < capacity[n])
+            .min_by_key(|&n| ((split[n].0 + split[n].1 + 1) * 1_000_000 / capacity[n], n))?;
+        split[node].0 += 1;
+    }
+    Some(split)
 }
 
 /// Placement regressions independent of application worker IDs and rails.
@@ -272,6 +365,111 @@ mod placement_tests {
                 }
             }
         }
+    }
+
+    /// Two packages, one NUMA node each, `cores` cores per package, SMT pairs
+    /// numbered like Linux (sibling = cpu + 2 * cores), NICs on both nodes.
+    fn two_socket(cores: usize) -> EffectiveTopology {
+        EffectiveTopology {
+            cpus: (0..4 * cores)
+                .map(|cpu| {
+                    let package = (cpu % (2 * cores)) / cores;
+                    CpuLocation {
+                        cpu,
+                        package,
+                        core: cpu % cores,
+                        numa_node: Some(package),
+                    }
+                })
+                .collect(),
+            quota: None,
+            nics: (0..2)
+                .map(|node| NicLocality {
+                    device: format!("mlx5_{node}"),
+                    numa_node: Some(node),
+                })
+                .collect(),
+        }
+    }
+
+    fn check_exact(plan: &[Placement], lanes: usize, helpers: usize) {
+        assert_eq!(plan.len(), lanes);
+        let cpus = plan
+            .iter()
+            .flat_map(|p| [p.lane.cpu, p.helper.cpu])
+            .collect::<BTreeSet<_>>();
+        assert_eq!(cpus.len(), lanes + helpers, "roles share CPUs");
+        let lane_cpus = plan.iter().map(|p| p.lane.cpu).collect::<BTreeSet<_>>();
+        let helper_cpus = plan.iter().map(|p| p.helper.cpu).collect::<BTreeSet<_>>();
+        assert!(lane_cpus.is_disjoint(&helper_cpus));
+        for p in plan {
+            assert_eq!(p.lane.numa_node, p.helper.numa_node);
+            assert_eq!(p.nic.as_ref().unwrap().numa_node, p.lane.numa_node);
+        }
+    }
+
+    /// Explicit counts larger than one node spread proportionally over both
+    /// NIC-local nodes, with SMT on (64/64 of 256) and off (63/63 of 128).
+    #[test]
+    fn exact_counts_spread_over_two_numa_nodes() {
+        for (smt, lanes, helpers) in [
+            (true, 64, 64),
+            (false, 63, 63),
+            (true, 170, 85),
+            (false, 64, 64),
+        ] {
+            let plan = place_exact(two_socket(64), 255, lanes, helpers, smt).unwrap();
+            check_exact(&plan, lanes, helpers);
+            let on = |node| {
+                plan.iter()
+                    .filter(|p| p.lane.numa_node == Some(node))
+                    .count()
+            };
+            assert!(
+                on(0).abs_diff(on(1)) <= 1,
+                "smt={smt}: {} vs {}",
+                on(0),
+                on(1)
+            );
+            if !smt {
+                // Lanes stay on distinct physical cores when SMT is disallowed.
+                let cores = plan
+                    .iter()
+                    .flat_map(|p| [&p.lane, &p.helper])
+                    .map(|c| (c.package, c.core))
+                    .collect::<BTreeSet<_>>();
+                assert_eq!(cores.len(), lanes + helpers);
+            }
+        }
+        // Small counts still use both rail nodes.
+        let plan = place_exact(two_socket(64), 255, 4, 2, false).unwrap();
+        check_exact(&plan, 4, 2);
+        assert_eq!(
+            plan.iter().filter(|p| p.lane.numa_node == Some(1)).count(),
+            2
+        );
+    }
+
+    /// Failures name the constraint that does not fit.
+    #[test]
+    fn exact_failures_explain_what_does_not_fit() {
+        let message = |lanes, helpers, threads, smt| {
+            place_exact(two_socket(64), threads, lanes, helpers, smt)
+                .err()
+                .unwrap()
+                .to_string()
+        };
+        assert!(message(65, 65, 255, false).contains("eligible CPUs per node: node0=64 node1=64"));
+        assert!(message(65, 65, 255, false).contains("RACER_ALLOW_SMT=false"));
+        assert!(message(64, 64, 100, true).contains("thread budget 100"));
+        assert!(message(4, 5, 100, true).contains("exceeds io_workers"));
+        assert!(message(0, 1, 100, true).contains("at least 1"));
+        // A 3-CPU node holds at most one helper; the rest go elsewhere.
+        assert_eq!(split_exact(&[3, 64], 10, 5), Some(vec![(0, 0), (10, 5)]));
+        assert_eq!(split_exact(&[3, 64], 33, 33), Some(vec![(1, 1), (32, 32)]));
+        assert_eq!(split_exact(&[3, 3], 2, 2), Some(vec![(1, 1), (1, 1)]));
+        assert_eq!(split_exact(&[3, 3], 3, 2), Some(vec![(2, 1), (1, 1)]));
+        assert_eq!(split_exact(&[3, 3], 3, 3), None);
     }
 
     /// Caller identity limits do not overflow, and malformed CPU sets fail before placement.
