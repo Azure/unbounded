@@ -746,3 +746,45 @@ func TestEpochCountsFromStart(t *testing.T) {
 		t.Fatalf("epoch after 31s %d, want 2", got)
 	}
 }
+
+// TestExpiredCallsDeterministic is a regression test: calls that expire
+// together used to be failed in map iteration order, and failing a call
+// sends (suspicions, broadcast retries, catch-ups), so the outbox order
+// varied between identical runs (found by the DST run-twice check).
+func TestExpiredCallsDeterministic(t *testing.T) {
+	c := grow(t, 12)
+	v := c.nodes[0].View()
+	cfg := c.cfg(3, nil)
+	cfg.ID, cfg.Incarnation = c.nodes[3].cfg.ID, c.nodes[3].cfg.Incarnation
+	cfg.Initial = v
+
+	var first []string
+
+	for run := range 20 {
+		n := New(cfg, rand.New(rand.NewPCG(7, 7)))
+		start := c.now
+
+		n.Start(start, c.wall())
+
+		// Never answer: every ping and catch-up stays pending.
+		var out []string
+
+		for step := int64(1); step <= 60; step++ {
+			n.Tick(start+step*sec, c.wall())
+
+			for _, call := range n.Outbox() {
+				out = append(out, call.To+"/"+strconv.FormatUint(call.ID, 10)+"/"+string(call.Msg))
+			}
+		}
+
+		if run == 0 {
+			first = out
+
+			continue
+		}
+
+		if !slices.Equal(out, first) {
+			t.Fatalf("run %d outbox differs:\n%v\n%v", run, out, first)
+		}
+	}
+}

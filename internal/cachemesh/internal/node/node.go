@@ -577,11 +577,22 @@ func (n *Node) Tick(now int64, wall time.Time) {
 func (n *Node) expireCalls(now int64) {
 	limit := 4 * int64(max(n.cfg.CallTimeout, n.cfg.PingTimeout))
 
+	// Fail expired calls in ID order: fail may send, and map iteration
+	// order must not reach the outbox.
+	var expired []uint64
+
 	for id, p := range n.calls {
 		if now-p.sentAt > limit {
-			delete(n.calls, id)
-			n.fail(p)
+			expired = append(expired, id)
 		}
+	}
+
+	slices.Sort(expired)
+
+	for _, id := range expired {
+		p := n.calls[id]
+		delete(n.calls, id)
+		n.fail(p)
 	}
 }
 
