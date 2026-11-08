@@ -1,0 +1,8 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+#
+# PLACEHOLDER: gantry cachemesh mode. Copy values-default.yaml here and add the
+# cachemesh config keys once the feature lands (the orchestrator fills this
+# in). deploy.sh accepts any values file, so both can be layered:
+#   ./deploy.sh values-default.yaml <image> -f values-cachemesh.yaml
+{}

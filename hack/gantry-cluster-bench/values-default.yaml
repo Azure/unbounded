@@ -1,0 +1,51 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Gantry default (p2p) mode for the gantry cluster bench. Used with the repo
+# chart at deploy/gantry/chart via deploy.sh, which sets image.reference and
+# rewrites ORIGIN_ADDR to the origin host:port.
+
+namespace:
+  create: false # deploy.sh uses helm --create-namespace
+
+# Only the 142 Ready bench workers. tolerations: [] keeps the agent off the
+# tainted system nodes and off NotReady nodes (no blanket toleration).
+nodeSelector:
+  cluster-workload: rdma
+tolerations: []
+
+updateStrategy:
+  rollingUpdate:
+    maxUnavailable: 100%
+
+# hosts.toml is already managed by unbounded-agent (_default) and by
+# prep.sh (<origin>/hosts.toml), so the chart must not write certs.d.
+nodeConfig:
+  enabled: false
+
+# Raised from the 8 CPU / 8Gi defaults so a 40GB pull fanned out to peers is
+# not CPU-throttled or OOM-killed. Nodes have 64 CPU / 251GiB and nothing
+# else heavy runs on them during the bench.
+resources:
+  agent:
+    requests:
+      cpu: "1"
+      memory: 1Gi
+    limits:
+      cpu: "16"
+      memory: 64Gi
+
+gantry:
+  peerFetchTimeout: 15m
+  transferMaxConcurrentServes: 10
+  # Plain HTTP is selected by the endpoint scheme. The name must equal the
+  # certs.d directory (containerd sends it as ?ns=). docker.io is listed so
+  # that ?ns= is mandatory and other pulls are not routed to the origin.
+  upstreamRegistries:
+    - name: ORIGIN_ADDR
+      endpoint: http://ORIGIN_ADDR
+    - name: docker.io
+      endpoint: https://registry-1.docker.io
+
+# The chart has no podAnnotations, so Prometheus' kubernetes-pods job does not
+# discover the agents; run.sh scrapes :9095 of every pod directly instead.
