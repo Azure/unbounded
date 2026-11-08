@@ -261,7 +261,9 @@ impl DirectSink for HostSink {
     }
 
     fn sealed_target(&self) -> Option<SealedTarget> {
-        self.direct.as_ref().map(|_| SealedTarget::host())
+        self.direct
+            .as_ref()
+            .map(|(mapping, _)| SealedTarget::host_into(mapping.clone(), self.window.offset))
     }
 
     fn finish<'a>(&'a mut self, _scope: &'a RequestScope) -> Operation<'a, ()> {

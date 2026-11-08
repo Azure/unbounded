@@ -34,6 +34,7 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicU16;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
@@ -72,6 +73,10 @@ pub(crate) struct Region {
     /// writable, so a reused mapping skips `MADV_POPULATE_WRITE`. A hint
     /// only: pages the kernel later reclaims fault back in on access.
     populated: Box<[AtomicU64]>,
+
+    /// One entry per [`POPULATED_CHUNK`]: 1 + the NUMA node its first page
+    /// was found on, or 0 when not yet known. A hint, like `populated`.
+    nodes: Box<[AtomicU16]>,
 }
 
 /// Granularity of [`Region::populated`].
@@ -106,7 +111,30 @@ impl Region {
             populated: (0..chunks.div_ceil(64))
                 .map(|_| AtomicU64::new(0))
                 .collect(),
+            nodes: (0..chunks).map(|_| AtomicU16::new(0)).collect(),
         })
+    }
+
+    /// NUMA node of the chunk holding byte `at`, from its first resident
+    /// page. Cached per chunk once found; None while no page is resident
+    /// there, so a later first touch decides it. Never faults a page in.
+    fn node_at(&self, at: usize) -> Option<u16> {
+        let chunk = at / POPULATED_CHUNK;
+        let slot = self.nodes.get(chunk)?;
+        match slot.load(Ordering::Relaxed) {
+            0 => {}
+            known => return Some(known - 1),
+        }
+        if at >= self.length {
+            return None;
+        }
+        // SAFETY: `at` is inside the mapping; the address is only queried.
+        let address = unsafe { self.base.as_ptr().add(at) };
+        let node = crate::affinity::resident_numa_node(address)
+            .and_then(|node| u16::try_from(node).ok())
+            .filter(|node| *node < u16::MAX)?;
+        slot.store(node + 1, Ordering::Relaxed);
+        Some(node)
     }
 
     /// Chunks wholly inside `[at, at + length)`.
@@ -449,6 +477,18 @@ impl HostMapping {
         }
         // SAFETY: inside the mapping, checked above.
         Ok(unsafe { std::slice::from_raw_parts_mut(region.base.as_ptr().add(at), length) })
+    }
+
+    /// NUMA node of the destination page at file offset `offset`, when a
+    /// page is resident there. Decrypting on a helper of that node writes
+    /// the plaintext to local memory. Cheap after the first query of each
+    /// 2 MiB chunk of the cached mapping.
+    pub(crate) fn node_at(&self, offset: u64) -> Option<u16> {
+        if offset < self.window.offset || offset >= self.window.end() {
+            return None;
+        }
+        let at = usize::try_from(offset).ok()?;
+        self.region.as_ref()?.node_at(at)
     }
 
     /// Fault `bytes`, which start at file offset `offset`, in writable unless

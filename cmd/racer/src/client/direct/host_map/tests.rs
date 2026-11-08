@@ -278,6 +278,83 @@ fn populated_chunks_are_tracked_per_mapping() {
     assert!(region_of(&again).is_populated(CHUNK + 5, 10));
 }
 
+/// The destination node is unknown until a page is resident, is then the
+/// node the page is on, is cached per chunk for later requests, and is never
+/// reported outside the window.
+#[test]
+fn destination_node_is_found_without_faulting_and_cached() {
+    const CHUNK: usize = POPULATED_CHUNK;
+    let cache = cache(8, 1 << 40);
+    let file = memfd(0, 0);
+    file.set_len(2 * CHUNK as u64).unwrap();
+    assert_eq!(
+        unsafe { libc::fcntl(file.as_raw_fd(), libc::F_ADD_SEALS, libc::F_SEAL_SHRINK) },
+        0
+    );
+    let mapping = HostMapping::new_in(&cache, &file, window(CHUNK as u64, CHUNK as u64)).unwrap();
+    let start = CHUNK as u64;
+    assert_eq!(mapping.node_at(start), None, "nothing resident yet");
+    assert_eq!(mapping.node_at(start), None, "the query does not fault");
+    assert_eq!(mapping.node_at(0), None, "outside the window");
+    assert_eq!(mapping.node_at(2 * start), None, "past the window");
+    let bytes = unsafe { mapping.bytes_mut(start, 4096).unwrap() };
+    bytes.fill(1);
+    let Some(node) = crate::affinity::resident_numa_node(bytes.as_ptr()) else {
+        // Seccomp denies move_pages here: the node stays unknown.
+        assert_eq!(mapping.node_at(start), None);
+        return;
+    };
+    let node = u16::try_from(node).unwrap();
+    assert_eq!(mapping.node_at(start + 100), Some(node));
+    let region = region_of(&mapping);
+    assert_eq!(region.nodes[1].load(Ordering::Relaxed), node + 1);
+    // Another request for the same file reads the cached node.
+    let again = HostMapping::new_in(&cache, &file, window(0, 2 * start)).unwrap();
+    assert_eq!(again.node_at(start + CHUNK as u64 - 1), Some(node));
+    assert_eq!(again.node_at(0), None);
+}
+
+/// A host target maps each page of a range to the file offset its first
+/// byte lands at, and reports that chunk's node.
+#[test]
+fn sealed_target_finds_each_page_destination_node() {
+    const CHUNK: usize = POPULATED_CHUNK;
+    const MIB: u64 = 1 << 20;
+    let cache = cache(8, 1 << 40);
+    let file = memfd(0, 0);
+    file.set_len(4 * CHUNK as u64).unwrap();
+    assert_eq!(
+        unsafe { libc::fcntl(file.as_raw_fd(), libc::F_ADD_SEALS, libc::F_SEAL_SHRINK) },
+        0
+    );
+    let mapping = Arc::new(HostMapping::new_in(&cache, &file, window(MIB, 6 * MIB)).unwrap());
+    // 2 MiB pages; the range starts 1 MiB into page 0 and lands at file
+    // offset 1 MiB, so page n > 0 starts at file offset 2n MiB.
+    let size = crate::model::PageSize::new(2 * MIB).unwrap();
+    let range = crate::model::ByteRange::closed(MIB, 7 * MIB - 1)
+        .unwrap()
+        .resolve_paged(16 * MIB, size)
+        .unwrap();
+    let target = crate::read::sealed::SealedTarget::host_into(mapping.clone(), MIB);
+    let page = |n| target.destination_node(&range, crate::model::PageNumber(n));
+    assert!((0..4).all(|n| page(n).is_none()), "nothing resident");
+    // Touch file offset 4 MiB, the start of page 2 and of chunk 2.
+    let bytes = unsafe { mapping.bytes_mut(4 * MIB, 4096).unwrap() };
+    bytes.fill(1);
+    let Some(node) = crate::affinity::resident_numa_node(bytes.as_ptr()) else {
+        return;
+    };
+    let node = u16::try_from(node).unwrap();
+    assert_eq!(page(2), Some(node));
+    assert_eq!(page(1), None, "page 1 starts in chunk 1");
+    assert_eq!(page(4), None, "outside the range");
+    assert_eq!(
+        crate::read::sealed::SealedTarget::host()
+            .destination_node(&range, crate::model::PageNumber(2)),
+        None
+    );
+}
+
 /// Each buffer's locality maps to exactly one labeled event, and an empty or
 /// unknown buffer is never reported as local or remote.
 #[test]

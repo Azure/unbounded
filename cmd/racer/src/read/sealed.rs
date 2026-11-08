@@ -36,6 +36,11 @@ pub struct SealedTarget {
 
     /// The GPU that holds the request's allocation. Unused for a host target.
     pub(crate) ordinal: i32,
+
+    /// For a host-read into a mapped destination: the mapping, and the file
+    /// offset the range's first byte lands at. Used to find each page's
+    /// destination NUMA node before it is fetched.
+    pub(crate) destination: Option<(Arc<crate::client::direct::HostMapping>, u64)>,
 }
 
 impl SealedTarget {
@@ -44,6 +49,7 @@ impl SealedTarget {
         Self {
             helper: Some(helper),
             ordinal,
+            destination: None,
         }
     }
 
@@ -52,7 +58,33 @@ impl SealedTarget {
         Self {
             helper: None,
             ordinal: -1,
+            destination: None,
         }
+    }
+
+    /// For a CPU decrypt into `mapping`, where the range's first byte lands
+    /// at file offset `offset`.
+    pub(crate) fn host_into(mapping: Arc<crate::client::direct::HostMapping>, offset: u64) -> Self {
+        Self {
+            destination: Some((mapping, offset)),
+            ..Self::host()
+        }
+    }
+
+    /// NUMA node of the destination of page `number` of `range`, when the
+    /// target maps the destination and a page is resident there.
+    pub(crate) fn destination_node(
+        &self,
+        range: &crate::model::ResolvedRange,
+        number: crate::model::PageNumber,
+    ) -> Option<u16> {
+        let (mapping, offset) = self.destination.as_ref()?;
+        let slice = range.slice_at(number).ok()??;
+        let byte = number
+            .0
+            .checked_mul(range.page_size().get())?
+            .checked_add(u64::from(slice.offset))?;
+        mapping.node_at(offset.checked_add(byte.checked_sub(range.start())?)?)
     }
 
     /// The GPU that holds the request's allocation.

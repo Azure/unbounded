@@ -102,6 +102,29 @@ pub fn page_numa_node(bytes: &[u8]) -> Option<usize> {
     (status == 0 && node >= 0).then_some(node as usize)
 }
 
+/// NUMA node of the page resident at `address`, without faulting it in.
+/// None when no page is resident there yet, the address is not mapped, or
+/// the kernel does not say (for example when seccomp denies `move_pages`).
+pub fn resident_numa_node(address: *const u8) -> Option<usize> {
+    let mut pages = [address.cast::<libc::c_void>().cast_mut()];
+    let mut status: [libc::c_int; 1] = [-1];
+    // SAFETY: with a null node list, move_pages only queries: it reads one
+    // page address and writes one status int. `address` is looked up in this
+    // process's page tables, never dereferenced.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_move_pages,
+            0 as libc::c_int,
+            1 as libc::c_ulong,
+            pages.as_mut_ptr(),
+            std::ptr::null::<libc::c_int>(),
+            status.as_mut_ptr(),
+            0 as libc::c_int,
+        )
+    };
+    (result == 0 && status[0] >= 0).then_some(status[0] as usize)
+}
+
 /// One lane and its NUMA-local shared helper execution placement.
 pub struct Placement {
     /// CPU that owns the lane's local graph.
@@ -427,6 +450,28 @@ mod placement_tests {
         if let (Some(found), Some(online)) = (page_numa_node(&page), &online) {
             assert!(online.contains(&found));
         }
+        // move_pages reports a written page without faulting, and never a
+        // page that is not resident.
+        if let (Some(found), Some(online)) = (resident_numa_node(page.as_ptr()), &online) {
+            assert!(online.contains(&found));
+        }
+        // SAFETY: a fresh anonymous mapping, unmapped below and never touched.
+        let untouched = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(untouched, libc::MAP_FAILED);
+        assert_eq!(resident_numa_node(untouched.cast()), None);
+        // The query did not fault it in either.
+        assert_eq!(resident_numa_node(untouched.cast()), None);
+        // SAFETY: unmaps exactly the mapping above.
+        unsafe { libc::munmap(untouched, 4096) };
     }
 
     /// Two packages, one NUMA node each, `cores` cores per package, SMT pairs
