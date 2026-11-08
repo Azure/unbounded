@@ -40,6 +40,9 @@ func fastTuning() cachemesh.Tuning {
 			LotteryRound:       100 * time.Millisecond,
 			ClockSkewAllowance: 100 * time.Millisecond,
 			MinCandidateAge:    300 * time.Millisecond,
+			// Tiny clusters bootstrap through the lottery; a small
+			// expected size makes every round eligible.
+			ExpectedClusterSize: 1,
 		},
 		Leader: cachemesh.LeaderTuning{
 			QuarantineFor:   100 * time.Millisecond,
