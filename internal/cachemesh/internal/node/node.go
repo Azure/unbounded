@@ -135,6 +135,11 @@ type Config struct {
 	// MaxAhead bounds queued deltas that are ahead of the view.
 	MaxAhead int
 
+	// Initial, when set, is the view the member starts from, as if it had
+	// adopted it from a snapshot (for example a persisted view, or a view
+	// prebuilt by the simulator). The member still joins if it is not in it.
+	Initial *view.View
+
 	// Shared, when set, deduplicates views, encoded deltas, snapshots, and
 	// candidate lists across nodes in one process (the simulator). It is
 	// not safe for concurrent use.
@@ -322,6 +327,7 @@ type Node struct {
 	// Monitoring and neighbors.
 	subjects  []subject
 	neighbors []neighbor
+	lingerAt  int64 // earliest linger expiry, 0 if none
 
 	// I/O.
 	nextCall uint64
@@ -459,11 +465,18 @@ func (n *Node) Start(now int64, wall time.Time) {
 
 	n.started = true
 	n.now, n.wall = now, wall
+
+	if iv := n.cfg.Initial; iv != nil {
+		n.cfg.Initial = nil
+		n.adoptSnapshot(now, iv)
+		n.heardAt = 0
+	}
+
 	n.nextTick = now
 	n.nextPing = now + n.rng.Int64N(int64(n.cfg.PingInterval))
 	n.nextJoin = now
 
-	if len(n.seeds) == 0 {
+	if len(n.seeds) == 0 && !n.joined {
 		n.ownReadSeq = ownLeaseBit | 1
 		n.leaseOps = append(n.leaseOps, elect.Op{Seq: n.ownReadSeq, Kind: elect.OpGetCached})
 		n.event("lease-seed-read")
@@ -854,6 +867,10 @@ func (n *Node) onRouted(now int64, m *wire.Message) []byte {
 
 // leaderInput feeds a leader-bound message to the leader logic.
 func (n *Node) leaderInput(now int64, m *wire.Message) {
+	if n.cfg.Hooks.OnEvent != nil {
+		n.event("leader-input-" + m.Kind.String())
+	}
+
 	switch m.Kind {
 	case wire.KindJoin:
 		if m.PartitionBits != n.cfg.PartitionBits {

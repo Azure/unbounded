@@ -469,6 +469,7 @@ func (n *Node) updateNeighbors(now int64) {
 
 	var added []view.Slot
 
+	changed := false
 	next := make([]neighbor, 0, len(cur)+len(n.neighbors))
 	i := 0
 
@@ -476,7 +477,9 @@ func (n *Node) updateNeighbors(now int64) {
 		key, cell := n.v.Key(s), n.v.Cell(s)
 
 		for i < len(n.neighbors) && n.neighbors[i].slot < s {
-			next = append(next, n.lingering(now, n.neighbors[i]))
+			nb := n.lingering(now, n.neighbors[i])
+			changed = changed || nb != n.neighbors[i]
+			next = append(next, nb)
 			i++
 		}
 
@@ -485,32 +488,48 @@ func (n *Node) updateNeighbors(now int64) {
 			i++
 
 			if old.key == key {
-				if old.cell != cell || old.lingers != 0 {
-					n.hl.Track(s, key, cell)
-				}
-
-				next = append(next, neighbor{slot: s, key: key, cell: cell})
+				nb := neighbor{slot: s, key: key, cell: cell}
+				changed = changed || nb != old
+				next = append(next, nb)
 
 				continue
 			}
-			// Slot reused by another member: the old one is gone at once.
-			n.hl.Untrack(s)
 		}
 
-		n.hl.Track(s, key, cell)
+		// New, or the slot was reused by another member (the old one is
+		// gone at once).
+		changed = true
+
 		next = append(next, neighbor{slot: s, key: key, cell: cell})
 		added = append(added, s)
 	}
 
 	for ; i < len(n.neighbors); i++ {
-		next = append(next, n.lingering(now, n.neighbors[i]))
+		nb := n.lingering(now, n.neighbors[i])
+		changed = changed || nb != n.neighbors[i]
+		next = append(next, nb)
 	}
 
 	n.neighbors = next
 
+	if changed {
+		n.syncHealth()
+	}
+
 	if len(added) > 0 && n.cfg.Hooks.OnNeighbors != nil {
 		n.cfg.Hooks.OnNeighbors(added, nil)
 	}
+}
+
+// syncHealth makes the health tracker track exactly the current and
+// lingering neighbors.
+func (n *Node) syncHealth() {
+	ps := make([]health.Ref, len(n.neighbors))
+	for i, nb := range n.neighbors {
+		ps[i] = health.Ref{Slot: nb.slot, Key: nb.key, Cell: nb.cell}
+	}
+
+	n.hl.Sync(ps)
 }
 
 func (n *Node) lingering(now int64, nb neighbor) neighbor {
@@ -518,24 +537,43 @@ func (n *Node) lingering(now int64, nb neighbor) neighbor {
 		nb.lingers = now + int64(n.cfg.NeighborLinger)
 	}
 
+	if n.lingerAt == 0 || nb.lingers < n.lingerAt {
+		n.lingerAt = nb.lingers
+	}
+
 	return nb
 }
 
 func (n *Node) expireNeighbors(now int64) {
+	if n.lingerAt == 0 || now < n.lingerAt {
+		return
+	}
+
+	n.lingerAt = 0
+
 	var removed []view.Slot
 
 	n.neighbors = slices.DeleteFunc(n.neighbors, func(nb neighbor) bool {
 		if nb.lingers != 0 && now >= nb.lingers {
-			n.hl.Untrack(nb.slot)
 			removed = append(removed, nb.slot)
 
 			return true
 		}
 
+		if nb.lingers != 0 && (n.lingerAt == 0 || nb.lingers < n.lingerAt) {
+			n.lingerAt = nb.lingers
+		}
+
 		return false
 	})
 
-	if len(removed) > 0 && n.cfg.Hooks.OnNeighbors != nil {
+	if len(removed) == 0 {
+		return
+	}
+
+	n.syncHealth()
+
+	if n.cfg.Hooks.OnNeighbors != nil {
 		n.cfg.Hooks.OnNeighbors(nil, removed)
 	}
 }
@@ -758,7 +796,7 @@ func (n *Node) OnLease(now int64, wall time.Time, r elect.Result) {
 
 		if live {
 			n.learnSeeds(r.Record.Addr, r.Record.Seeds)
-		} else if len(n.cfg.Seeds) == 0 && !n.joined && (r.Err == nil || errors.Is(r.Err, elect.ErrNotFound)) {
+		} else if _, has := n.v.Config(); !has && len(n.cfg.Seeds) == 0 && !n.joined && (r.Err == nil || errors.Is(r.Err, elect.ErrNotFound)) {
 			n.bootstrapper = true
 			n.event("bootstrap-candidate")
 		}
