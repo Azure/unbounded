@@ -343,6 +343,11 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::RdmaGrantWaits => "racer_rdma_grant_waits_total",
             Self::RdmaGrantWaitGranted => "racer_rdma_grant_wait_granted_total",
             Self::RdmaGrantBackpressure => "racer_rdma_grant_backpressure_total",
+            Self::RdmaGrantOwnerQueueFull => "racer_rdma_grant_owner_queue_full_total",
+            Self::RdmaOwnerPasses => "racer_rdma_owner_passes_total",
+            Self::RdmaOwnerCommands => "racer_rdma_owner_commands_total",
+            Self::RdmaOwnerWakeCommands => "racer_rdma_owner_immediate_wakes_total" { "reason=\"commands\"" },
+            Self::RdmaOwnerWakeCompletions => "racer_rdma_owner_immediate_wakes_total" { "reason=\"completions\"" },
             Self::RdmaBreakerTripLinkDown => "racer_rdma_breaker_trips_total" { "reason=\"link_down\"" },
             Self::RdmaBreakerTripGrant => "racer_rdma_breaker_trips_total" { "reason=\"grant\"" },
             Self::RdmaBreakerTripSend => "racer_rdma_breaker_trips_total" { "reason=\"send\"" },
@@ -524,6 +529,7 @@ metrics! { Gauge, GAUGES, GAUGE_COUNT;
             Self::RdmaLinksBreaking => "racer_rdma_links_breaking",
             Self::RdmaBreakerOpen => "racer_rdma_breaker_open",
             Self::RdmaGrantWaiters => "racer_rdma_grant_waiters",
+            Self::RdmaOwnerStalled => "racer_rdma_owner_stalled",
             Self::RdmaWaitingDevice => "racer_rdma_reactivation_waiting_device",
             Self::RdmaWaitingDrain => "racer_rdma_reactivation_waiting_drain",
 }
@@ -2144,6 +2150,7 @@ mod tests {
                         && !line.starts_with("racer_rdma_link_setups_total{")
                         && !line.starts_with("racer_rdma_plan_http_total{")
                         && !line.starts_with("racer_rdma_send_declined_total{")
+                        && !line.starts_with("racer_rdma_owner_immediate_wakes_total{")
                         && !line.starts_with("racer_dirty_discard_reasons_total{")
                         && !line.starts_with("racer_origin_walk_reasons_total{")
                         && !line.starts_with("racer_prefetch_")
