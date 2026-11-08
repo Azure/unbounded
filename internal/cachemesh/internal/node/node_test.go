@@ -852,3 +852,51 @@ func TestPingEpochAntiEntropy(t *testing.T) {
 		t.Fatalf("epoch 15s after the anchor: %d, want 11", got)
 	}
 }
+
+// TestLeavingNonMemberDoesNotJoin is a regression test: a member removed
+// from the view (for example during a partition) that was then asked to
+// leave kept sending joins, and a join that reached the leader after the
+// process had stopped re-admitted it as a ghost Active member (found by the
+// DST data-plane workload's route check).
+func TestLeavingNonMemberDoesNotJoin(t *testing.T) {
+	c := newCluster(t)
+	n := New(c.cfg(1, []string{addr(0)}), rand.New(rand.NewPCG(3, 3)))
+	n.Start(c.now, c.wall())
+
+	if !hasJoin(t, n.Outbox()) {
+		t.Fatal("a joiner sends a join at start")
+	}
+
+	n.Leave(c.now + sec)
+
+	for step := int64(2); step < 30; step++ {
+		n.Tick(c.now+step*sec, c.wall())
+
+		if hasJoin(t, n.Outbox()) {
+			t.Fatalf("join sent %ds after Leave", step-1)
+		}
+	}
+}
+
+func hasJoin(t *testing.T, calls []Call) bool {
+	t.Helper()
+
+	for _, call := range calls {
+		var m wire.Message
+		if err := wire.Decode(call.Msg, &m); err != nil {
+			t.Fatal(err)
+		}
+
+		if m.Kind == wire.KindJoin {
+			return true
+		}
+
+		if m.Kind == wire.KindRouted && len(m.Inner) > 0 {
+			if k, err := wire.PeekKind(m.Inner); err == nil && k == wire.KindJoin {
+				return true
+			}
+		}
+	}
+
+	return false
+}

@@ -464,7 +464,7 @@ func (n *Node) NextDeadline() int64 {
 		d = min(d, n.nextLeader)
 	}
 
-	if !n.isMember() && n.started {
+	if !n.isMember() && !n.leaving && n.started {
 		d = min(d, n.nextJoin)
 	}
 
@@ -548,7 +548,10 @@ func (n *Node) Tick(now int64, wall time.Time) {
 		n.leaderTick(now)
 	}
 
-	if !n.isMember() && now >= n.nextJoin {
+	// A leaving member never (re)joins: a member removed (for example by a
+	// partition) that is asked to leave would otherwise keep sending
+	// joins, and one arriving after its process stopped re-admits it.
+	if !n.isMember() && !n.leaving && now >= n.nextJoin {
 		n.nextJoin = now + int64(n.cfg.JoinRetry)
 		n.sendJoin(now)
 	}
