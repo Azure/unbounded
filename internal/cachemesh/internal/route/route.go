@@ -64,7 +64,8 @@
 // Handoff: when the owner is the final hop (KindSelf as the owner,
 // KindOwner, KindDirect) and the partition moved less than HandoffEpochs
 // epochs ago (uint32(current) - Entry.Moved < HandoffEpochs, wrapping like
-// the 32-bit Moved field), PrevOwner names the previous owner if it is still
+// the 32-bit Moved field; a Moved up to HandoffEpochs ahead of a lagging
+// current epoch also counts), PrevOwner names the previous owner if it is still
 // a member, so the new owner can read through from it on a miss.
 //
 // A member that is not in its own view (joining, or removed) routes through
@@ -300,7 +301,7 @@ func NewState(v *view.View, self view.Slot, env *Env) *State {
 	if ok && v.Table() != nil {
 		s.table = v.Table()
 		s.bits = cfg.PartitionBits
-		s.handoff = cfg.HandoffEpochs
+		s.handoff = min(cfg.HandoffEpochs, 1<<30) // keep 2*handoff in range
 	}
 
 	if m, ok := v.Member(self); ok && s.table != nil &&
@@ -567,8 +568,13 @@ func (s *State) decide(d *Decision, p uint32, avoid view.Slot, inFlags uint8) {
 }
 
 func (s *State) prev(d *Decision, ent *placement.Entry) {
+	// Window: the 32-bit epoch distance since the move, taken modulo
+	// 2^32, is in [-handoff, handoff). The negative half covers a member
+	// whose epoch tracker lags the leader's that stamped Moved (it applied
+	// the move before re-anchoring); without it such a member would drop
+	// PrevOwner for the freshest moves.
 	if ent.Prev == ent.Owner || ent.Prev == placement.NoMember ||
-		uint32(s.e.Current())-ent.Moved >= s.handoff {
+		uint32(s.e.Current())-ent.Moved+s.handoff >= 2*s.handoff {
 		return
 	}
 

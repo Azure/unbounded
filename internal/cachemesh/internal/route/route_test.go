@@ -431,7 +431,9 @@ func TestHandoffWindow(t *testing.T) {
 		t.Fatalf("entry %+v", e)
 	}
 
-	for cur, want := range map[uint64]bool{10: true, 17: true, 18: false, 1 << 33: false} {
+	// 2 and 9: this member's epoch lags the one that stamped Moved=10; a
+	// lag of up to HandoffEpochs still counts as within the window.
+	for cur, want := range map[uint64]bool{1: false, 2: true, 9: true, 10: true, 17: true, 18: false, 1 << 33: false} {
 		st := NewState(nv, nu, newEnv(nil, cur))
 
 		d := st.RoutePartition(p)

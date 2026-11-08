@@ -624,8 +624,9 @@ rules above:
   as relays and backups like any other member.
 - `PrevOwner` is set when the owner is the final hop (`KindSelf` as owner,
   `KindOwner`, `KindDirect`), `Prev` is a current member other than the
-  owner, and `uint32(current epoch) - Moved < HandoffEpochs` (modular, like
-  the 32-bit `Moved`).
+  owner, and `uint32(current epoch) - Moved` is in `[-HandoffEpochs,
+  HandoffEpochs)` modulo 2^32 (the negative half covers a member whose epoch
+  tracker lags the leader that stamped `Moved`).
 - A non-member uses rendezvous over gateways
   (`Score(Mix64(KeyHashString(0, addr)), partition)`); without gateways it
   sends `KindDirect` to the owner if it has a configured view, otherwise
