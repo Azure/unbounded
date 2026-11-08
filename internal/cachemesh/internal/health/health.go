@@ -30,6 +30,14 @@
 // Untracked slots are reported Healthy by Usable, and Observe on them is a
 // cheap no-op: health only filters among neighbors this member tracks.
 //
+// Observe keeps contended writes low because every member may report on
+// the same peer from many goroutines: a Success writes one shared counter
+// (the interval bucket) plus, for every success up to 64 per interval and
+// one in 8 after that, the latency mean the EWMA decays toward. The peak
+// EWMA and the consecutive-failure counter are written only when they
+// change. AllHealthy lets routing skip per-peer Usable lookups when no
+// tracked peer is filtered.
+//
 // # Time
 //
 // The hot path never reads the clock. Tick(now) stores a coarse clock that
@@ -304,6 +312,10 @@ const (
 	bHealthy uint32 = iota
 	bEjected
 	bProbing
+	// bRetired marks a peer dropped from the table (untracked or replaced
+	// by a new key). It never changes again, so a caller still holding an
+	// old table cannot eject it, and it is not counted in Tracker.bad.
+	bRetired
 )
 
 type bucket struct {
@@ -318,27 +330,42 @@ type cellCounter struct {
 }
 
 // Peer is the health state of one tracked neighbor.
+//
+// The fields are grouped by access pattern on three 64-byte lines (a Peer
+// is 192 bytes, a size class whose objects are 64-byte aligned): fields
+// read by every routing decision and rarely written, the counters every
+// Observe writes, and fields used only on ejection and by the control path.
+// Keeping the counters off the first line means a peer hammered by
+// concurrent Observe calls does not slow down Usable for it.
 type Peer struct {
-	slot uint32
-	key  uint64
-	cc   atomic.Pointer[cellCounter]
-
+	// Read-mostly.
+	slot      uint32
 	state     atomic.Uint32
-	probe     atomic.Uint32 // 1 when the probe token is claimed
+	key       uint64
+	cc        atomic.Pointer[cellCounter]
+	busyUntil atomic.Int64
+	ewma      atomic.Int64 // ns
 	consec    atomic.Uint32
+	degraded  atomic.Bool
+	_         [64 - 48]byte
+
+	// Written by every Observe.
+	latSum  atomic.Int64
+	latN    atomic.Int64
+	buckets [2]bucket
+	_       [64 - 48]byte
+
+	// Ejection and control.
+	until     atomic.Int64  // ejection end; 0 means not yet timed
+	probe     atomic.Uint32 // 1 when the probe token is claimed
 	ejections atomic.Int32
 	reason    atomic.Uint32
-	recent    atomic.Bool  // ejected during the current interval
-	until     atomic.Int64 // ejection end; 0 means not yet timed
-	busyUntil atomic.Int64
-	degraded  atomic.Bool
-	ewma      atomic.Int64 // ns
-	latSum    atomic.Int64
-	latN      atomic.Int64
-	buckets   [2]bucket
+	recent    atomic.Bool // ejected during the current interval
 
 	// Control-only.
 	reported uint32 // breaker state last reported through hooks
+	live     bool   // scratch for rebuild: in the new table
+	_        [64 - 32]byte
 }
 
 type entry struct {
@@ -367,6 +394,12 @@ func (t *table) lookup(slot uint32) *Peer {
 
 const hedgeShards = 16
 
+// Latency mean sampling of successes; see Observe.
+const (
+	latSampleAll   = 64
+	latSampleEvery = 8
+)
+
 // maxLatency caps an observed latency so that latSum cannot overflow and
 // the EWMA math stays well inside int64 and float64 precision.
 const maxLatency = int64(time.Hour)
@@ -388,6 +421,12 @@ type Tracker struct {
 	ejected    atomic.Int32 // peers in bEjected or bProbing
 	maxEjected atomic.Int32
 	hedgePM    uint64 // hedge budget in parts per million
+
+	// AllHealthy summary, exact under single-goroutine use and
+	// conservative otherwise (see AllHealthy).
+	bad       atomic.Int32 // peers in bEjected or bProbing
+	nDegraded atomic.Int32 // peers with degraded set at the last Tick
+	busyMax   atomic.Int64 // latest busy deadline ever set
 
 	// The padding keeps the hedge counters, written on every routed
 	// request, off the cache lines of the read-mostly fields above.
@@ -606,6 +645,8 @@ func (t *Tracker) rebuild(peers []*Peer) {
 	nt := &table{entries: make([]entry, size), shift: shift, peers: peers}
 	mask := uint32(size - 1)
 
+	t.retireDropped(peers)
+
 	for _, c := range t.cells {
 		c.n = 0
 	}
@@ -635,6 +676,38 @@ func (t *Tracker) rebuild(peers []*Peer) {
 	t.tab.Store(nt)
 	t.reconcile(nt)
 	t.updatePanic(nt)
+}
+
+// retireDropped moves every peer of the current table that is not in peers
+// to bRetired, keeping Tracker.bad equal to the number of tracked-or-held
+// peers in bEjected or bProbing.
+func (t *Tracker) retireDropped(peers []*Peer) {
+	old := t.tab.Load()
+
+	for _, p := range old.peers {
+		p.live = false
+	}
+
+	for _, p := range peers {
+		p.live = true
+	}
+
+	for _, p := range old.peers {
+		if p.live {
+			continue
+		}
+
+		for {
+			st := p.state.Load()
+			if st == bRetired || p.state.CompareAndSwap(st, bRetired) {
+				if st == bEjected || st == bProbing {
+					t.bad.Add(-1)
+				}
+
+				break
+			}
+		}
+	}
 }
 
 // reconcile recomputes the ejection and per-cell usable counters from peer
@@ -708,6 +781,8 @@ func (t *Tracker) tryEject(p *Peer, from uint32, reason Reason) bool {
 		return false
 	}
 
+	t.bad.Add(1)
+
 	p.reason.Store(uint32(reason))
 	p.ejections.Add(1)
 	p.recent.Store(true)
@@ -724,16 +799,23 @@ func (t *Tracker) Observe(slot uint32, r Result, latency time.Duration) {
 	}
 
 	if r == Overload {
-		p.busyUntil.Store(t.now.Load() + int64(t.cfg.BusyFor))
+		until := t.now.Load() + int64(t.cfg.BusyFor)
+		p.busyUntil.Store(until)
 		p.probe.Store(0)
+
+		for {
+			m := t.busyMax.Load()
+			if m >= until || t.busyMax.CompareAndSwap(m, until) {
+				break
+			}
+		}
 
 		return
 	}
 
-	if lat := min(int64(latency), maxLatency); lat > 0 {
-		p.latSum.Add(lat)
-		p.latN.Add(1)
-
+	lat := min(int64(latency), maxLatency)
+	if lat > 0 {
+		// Peak: any observation above the EWMA raises it immediately.
 		for {
 			e := p.ewma.Load()
 			if lat <= e || p.ewma.CompareAndSwap(e, lat) {
@@ -746,7 +828,15 @@ func (t *Tracker) Observe(slot uint32, r Result, latency time.Duration) {
 	st := p.state.Load()
 
 	if r == Success {
-		b.succ.Add(1)
+		// The latency mean that Tick decays the EWMA toward is sampled:
+		// every success while the interval's success count is at most
+		// latSampleAll, then one in latSampleEvery. The count is the
+		// bucket counter this call increments anyway, so sampling is
+		// deterministic and costs no extra shared write.
+		if n := b.succ.Add(1); lat > 0 && (n <= latSampleAll || n%latSampleEvery == 0) {
+			p.latSum.Add(lat)
+			p.latN.Add(1)
+		}
 
 		if p.consec.Load() != 0 {
 			p.consec.Store(0)
@@ -755,12 +845,18 @@ func (t *Tracker) Observe(slot uint32, r Result, latency time.Duration) {
 		if st == bProbing && p.state.CompareAndSwap(bProbing, bHealthy) {
 			p.cc.Load().usable.Add(1)
 			t.ejected.Add(-1)
+			t.bad.Add(-1)
 		}
 
 		return
 	}
 
 	b.fail.Add(1)
+
+	if lat > 0 {
+		p.latSum.Add(lat)
+		p.latN.Add(1)
+	}
 
 	switch st {
 	case bHealthy:
@@ -789,6 +885,21 @@ func (t *Tracker) Usable(slot uint32) Usability {
 	}
 
 	return Healthy
+}
+
+// AllHealthy reports whether Usable returns Healthy for every slot, so a
+// caller ranking many peers can skip per-peer lookups. It is true when
+// filtering is in panic, or when no peer is Ejected or Probing, none was
+// Degraded at the last Tick, and no busy deadline is still pending. A peer
+// that changes state concurrently may be reported either way, as with
+// Usable; after a peer is dropped from the tracked set it may keep
+// AllHealthy false until the next Tick. Hot path.
+func (t *Tracker) AllHealthy() bool {
+	if t.bad.Load() == 0 && t.nDegraded.Load() == 0 && t.busyMax.Load() <= t.now.Load() {
+		return true
+	}
+
+	return t.panic.Load()
 }
 
 // TryProbe claims the single probe token of a Probing peer. It returns true
@@ -1059,12 +1170,20 @@ func (t *Tracker) degrade(nt *table) {
 		}
 	}
 
+	var nd int32
+
 	for _, p := range nt.peers {
 		d := p.ewma.Load() > limit
+		if d {
+			nd++
+		}
+
 		if p.degraded.Swap(d) != d && t.cfg.Hooks.OnDegraded != nil {
 			t.cfg.Hooks.OnDegraded(p.slot, d)
 		}
 	}
+
+	t.nDegraded.Store(nd)
 }
 
 // PeerState reports the state, ejection count, and EWMA latency of slot.
