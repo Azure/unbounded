@@ -79,7 +79,8 @@ impl DirectPage<'_> {
 /// client's descriptor; dropping the sink must release it.
 ///
 /// The caller calls [`Self::deliver`] once per page, in page order, and waits
-/// for each call before the next. It calls [`Self::finish`] once after the last
+/// for each call before the next, unless the sink accepts the page through
+/// [`Self::deliver_sealed_detached`]. It calls [`Self::finish`] once after the last
 /// page, and on a best-effort basis after a failure, before the kind 2 frame.
 /// A sink may be dropped without `finish`, for example when the client
 /// disconnects; its `Drop` must then keep any resource that a device may still
@@ -111,7 +112,26 @@ pub trait DirectSink {
     fn sealed_target(&self) -> Option<SealedTarget> {
         None
     }
+
+    /// Start delivering a sealed page without borrowing the sink, so the
+    /// caller can run several pages of one request at once. The caller still
+    /// sends page frames in page order, after each returned future resolves.
+    /// The default hands the page back, and the caller falls back to
+    /// [`Self::deliver`] one page at a time.
+    fn deliver_sealed_detached(
+        &self,
+        page: Box<SealedPage>,
+        _range: std::ops::Range<u64>,
+        _destination_offset: u64,
+        _scope: &RequestScope,
+    ) -> std::result::Result<DetachedDelivery, Box<SealedPage>> {
+        Err(page)
+    }
 }
+
+/// A page delivery that owns everything it needs, from
+/// [`DirectSink::deliver_sealed_detached`].
+pub type DetachedDelivery = std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>>>>;
 
 /// A GPU backend for `gpu-read`. Without one, `gpu-read` answers 501.
 pub trait GpuService {
@@ -201,22 +221,41 @@ impl DirectSink for HostSink {
                 DirectPage::Sealed { page, range } => {
                     // Only requested when the file is mapped.
                     let (mapping, crypto) = self.direct.as_ref().ok_or(Error::Internal)?;
-                    let job = Box::new(DecryptInto {
+                    decrypt_into_mapping(
+                        crypto,
+                        mapping.clone(),
                         page,
                         range,
-                        mapping: mapping.clone(),
-                        destination: destination_offset,
-                        stored: None,
-                    });
-                    let mut job = crypto.decrypt_into(job, scope).await?;
-                    // Hand a fused copy to the verdict's owner, then drop the
-                    // ciphertext (and any registered buffer) here, on I/O.
-                    job.publish_store();
-                    drop(job);
-                    Ok(())
+                        destination_offset,
+                        scope,
+                    )
+                    .await
                 }
             }
         })
+    }
+
+    fn deliver_sealed_detached(
+        &self,
+        page: Box<SealedPage>,
+        range: std::ops::Range<u64>,
+        destination_offset: u64,
+        scope: &RequestScope,
+    ) -> std::result::Result<DetachedDelivery, Box<SealedPage>> {
+        let Some((mapping, crypto)) = self.direct.as_ref() else {
+            return Err(page);
+        };
+        let window = self.window;
+        let (mapping, crypto, scope) = (mapping.clone(), crypto.clone(), scope.clone());
+        Ok(Box::pin(async move {
+            let end = destination_offset
+                .checked_add(range.end.saturating_sub(range.start))
+                .ok_or(Error::InvalidRange)?;
+            if destination_offset < window.offset || end > window.end() {
+                return Err(Error::InvalidRange);
+            }
+            decrypt_into_mapping(&crypto, mapping, page, range, destination_offset, &scope).await
+        }))
     }
 
     fn sealed_target(&self) -> Option<SealedTarget> {
@@ -227,6 +266,30 @@ impl DirectSink for HostSink {
         // Completed io_uring writes are already visible through the page cache.
         Box::pin(async { Ok(()) })
     }
+}
+
+/// Decrypt one sealed page on a crypto helper straight into `mapping`.
+async fn decrypt_into_mapping(
+    crypto: &crate::security::CryptoClient,
+    mapping: Arc<HostMapping>,
+    page: Box<SealedPage>,
+    range: std::ops::Range<u64>,
+    destination: u64,
+    scope: &RequestScope,
+) -> Result<()> {
+    let job = Box::new(DecryptInto {
+        page,
+        range,
+        mapping,
+        destination,
+        stored: None,
+    });
+    let mut job = crypto.decrypt_into(job, scope).await?;
+    // Hand a fused copy to the verdict's owner, then drop the ciphertext (and
+    // any registered buffer) here, on I/O.
+    job.publish_store();
+    drop(job);
+    Ok(())
 }
 
 /// Pair the descriptors received with a request head with its parsed kind,

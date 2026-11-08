@@ -247,10 +247,16 @@ fn unsuitable_destinations_keep_positioned_writes() {
 
 /// Replace the retained ciphertext of page 0 with tampered bytes.
 fn tamper_retained(fixture: &Fixture, in_tag: bool) {
+    tamper_retained_page(fixture, 0, in_tag);
+}
+
+/// Replace the retained ciphertext of page `number` with tampered bytes. Every
+/// other page of the cache leaves memory.
+fn tamper_retained_page(fixture: &Fixture, number: u64, in_tag: bool) {
     use crate::memory::CiphertextBytes;
     use crate::memory::CiphertextPage;
     let memory = worker(fixture).memory();
-    let copy = memory.unverified(&page_id(0)).unwrap().unwrap().copy;
+    let copy = memory.unverified(&page_id(number)).unwrap().unwrap().copy;
     let mut bytes = copy.ciphertext.bytes().to_vec();
     let index = if in_tag { bytes.len() - 1 } else { 3 };
     bytes[index] ^= 0x40;
@@ -331,4 +337,43 @@ fn without_crypto_sealed_memfd_keeps_positioned_writes() {
     assert_eq!(frames.len(), 2, "{frames:?}");
     assert!(memfd.contents() == data);
     assert_eq!(worker(&fixture).metric(Event::HostReadDirectDecrypt), 0);
+}
+
+/// Pages of one request decrypt concurrently, but their frames still go out
+/// in page order with contiguous offsets.
+#[test]
+fn concurrent_sealed_pages_send_frames_in_page_order() {
+    let env = racer_io::Env::host();
+    let length = 2 * PAGE_BYTES as usize + 4099;
+    let data = body(length);
+    let fixture = host_fixture(&env, data.clone());
+    arrange(&fixture, 3, length as u64, true, false);
+    let mut memfd = sealed_memfd(length, b'.', libc::F_SEAL_SHRINK);
+    let (head, frames) = host_read(&fixture, &memfd, None, 0, length as u64);
+    assert!(head.starts_with("http/1.1 200"), "{head}");
+    let expected = [
+        (1, 0, 0, PAGE_BYTES as u32),
+        (1, 1, PAGE_BYTES, PAGE_BYTES as u32),
+        (1, 2, 2 * PAGE_BYTES, 4099),
+        (2, 3, length as u64, 0),
+    ];
+    assert_eq!(frames, expected);
+    assert!(memfd.contents() == data);
+    assert_eq!(worker(&fixture).metric(Event::HostReadDirectDecrypt), 3);
+}
+
+/// A tampered page after the first fails the read after the earlier pages'
+/// frames and before its own.
+#[test]
+fn tampered_later_page_fails_after_earlier_frames() {
+    let env = racer_io::Env::host();
+    let length = PAGE_BYTES as usize + 5000;
+    let fixture = host_fixture(&env, body(length));
+    arrange(&fixture, 2, length as u64, true, false);
+    tamper_retained_page(&fixture, 1, false);
+    let memfd = sealed_memfd(length, b'.', libc::F_SEAL_SHRINK);
+    let (head, frames) = host_read(&fixture, &memfd, None, 0, length as u64);
+    assert!(head.starts_with("http/1.1 200"), "{head}");
+    assert_eq!(frames, [(1, 0, 0, PAGE_BYTES as u32)]);
+    assert_eq!(worker(&fixture).metric(Event::CryptoDecryptAeadRejected), 1);
 }

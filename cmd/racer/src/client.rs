@@ -19,6 +19,7 @@ use crate::model::MAX_FIELD_BYTES;
 use crate::model::ObjectId;
 use crate::model::ObjectMetadata;
 use crate::model::PageNumber;
+use crate::model::PageSlice;
 use crate::model::ResolvedRange;
 use crate::read::ReadPayload;
 use crate::read::ReadResponse;
@@ -36,6 +37,7 @@ use http1::StartLine;
 use racer_io::ring::IoBuffer;
 use racer_wire::control::CacheId;
 use std::collections::BTreeMap;
+use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::task::Context;
@@ -48,9 +50,21 @@ pub mod origin_directory;
 mod prefetch;
 
 pub use direct::DIRECT_WINDOW_PAGES;
+use direct::DetachedDelivery;
 use direct::DirectPage;
 use direct::DirectSink;
 use direct::GpuService;
+
+/// A sealed page whose detached delivery is running.
+struct InFlightPage {
+    write: DetachedDelivery,
+    /// Set once `write` resolves.
+    result: Option<Result<()>>,
+    report: crate::read::sealed::SealedReport,
+    slice: PageSlice,
+    /// Object offset of the slice.
+    offset: u64,
+}
 
 use racer_wire::object::client::MAX_HEAD_BYTES;
 pub use racer_wire::object::client::ReadKind;
@@ -737,26 +751,104 @@ impl Responses {
         if let ReadPayload::Stream(stream) = &mut response.payload {
             let range = stream.range();
             stream.enable_progress(timeout);
-            while sent < expected {
+            // Sealed pages the sink can decrypt without borrowing it run
+            // concurrently, up to the direct window; frames still go out in
+            // page order as the oldest page finishes.
+            let depth = DIRECT_WINDOW_PAGES.max(1);
+            let mut inflight: VecDeque<InFlightPage> = VecDeque::new();
+            // A page that must go through the serial `deliver` once every
+            // earlier page is done.
+            let mut held: Option<(DirectItem, PageSlice, u64, u64)> = None;
+            let mut fetched = 0;
+            let mut ready = first.take();
+            loop {
+                if sent >= expected && inflight.is_empty() && held.is_none() && ready.is_none() {
+                    break;
+                }
                 let mut progress_scope = scope.clone();
                 progress_scope.deadline.0 = progress_scope.clock().now() + timeout;
-                let item = match first.take() {
-                    Some(item) => item,
-                    None => std::future::poll_fn(|cx| {
-                        progress_scope.check()?;
-                        stream.next_direct().as_mut().poll(cx)
-                    })
-                    .await
-                    .inspect_err(|&error| {
-                        self.observer.record(
-                            crate::telemetry::Failure::new(
-                                crate::telemetry::Stage::NextSlice,
-                                error,
-                            )
-                            .request(scope),
-                        );
-                    })?
-                    .ok_or(Error::BadGateway)?,
+                if held.is_some() && inflight.is_empty() {
+                    let (item, slice, offset, target) = held.take().ok_or(Error::Internal)?;
+                    self.deliver_serial(sink, stream, item, slice, target, &progress_scope)
+                        .await?;
+                    stream.release_page(slice.page, slice.length)?;
+                    connection = send_frame(
+                        &self.io,
+                        connection,
+                        frame(1, slice.page.0, offset, slice.length),
+                        &progress_scope,
+                    )
+                    .await?;
+                    sent += u64::from(slice.length);
+                    pages += 1;
+                    continue;
+                }
+                let item = match ready.take() {
+                    Some(item) => Some(item),
+                    None => {
+                        let fetch = held.is_none() && fetched < expected && inflight.len() < depth;
+                        let step = std::future::poll_fn(|cx| {
+                            progress_scope.check()?;
+                            for page in inflight.iter_mut() {
+                                if page.result.is_none()
+                                    && let Poll::Ready(result) = page.write.as_mut().poll(cx)
+                                {
+                                    page.result = Some(result);
+                                }
+                            }
+                            if inflight.front().is_some_and(|page| page.result.is_some()) {
+                                return Poll::Ready(Ok(None));
+                            }
+                            if fetch {
+                                if let Poll::Ready(result) = stream.next_direct().as_mut().poll(cx)
+                                {
+                                    return Poll::Ready(
+                                        result.map(|item| Some(item.ok_or(Error::BadGateway))),
+                                    );
+                                }
+                            } else {
+                                // Keep the fetch window moving while writes run.
+                                stream.poll_prefetch(cx);
+                            }
+                            Poll::Pending
+                        })
+                        .await
+                        .inspect_err(|&error| {
+                            self.observer.record(
+                                crate::telemetry::Failure::new(
+                                    crate::telemetry::Stage::NextSlice,
+                                    error,
+                                )
+                                .request(scope),
+                            );
+                        })?;
+                        step.transpose()?
+                    }
+                };
+                let Some(item) = item else {
+                    // The oldest in-flight page finished.
+                    let page = inflight.pop_front().ok_or(Error::Internal)?;
+                    let result = page.result.ok_or(Error::Internal)?;
+                    let mut report = page.report;
+                    report.prefer_retained();
+                    match result {
+                        Ok(()) => stream.report_sealed(report, true),
+                        Err(Error::CorruptRecord) => stream.report_sealed(report, false),
+                        Err(_) => {}
+                    }
+                    result?;
+                    let slice = page.slice;
+                    stream.release_page(slice.page, slice.length)?;
+                    connection = send_frame(
+                        &self.io,
+                        connection,
+                        frame(1, slice.page.0, page.offset, slice.length),
+                        &progress_scope,
+                    )
+                    .await?;
+                    sent += u64::from(slice.length);
+                    pages += 1;
+                    continue;
                 };
                 let slice = match &item {
                     DirectItem::Plaintext(reader) => reader.slice(),
@@ -764,7 +856,7 @@ impl Responses {
                 };
                 if range.slice_at(slice.page)? != Some(slice)
                     || slice.length == 0
-                    || u64::from(slice.length) > expected - sent
+                    || u64::from(slice.length) > expected - fetched
                 {
                     return Err(Error::BadGateway);
                 }
@@ -779,65 +871,45 @@ impl Responses {
                     .offset
                     .checked_add(offset - range.start())
                     .ok_or(Error::BadGateway)?;
-                // A plaintext lease must outlive the write that borrows it.
-                let reader;
-                {
-                    let (page, report) = match item {
-                        DirectItem::Plaintext(lease) => {
-                            reader = Some(lease);
-                            (DirectPage::Plaintext(reader.as_ref().unwrap()), None)
-                        }
-                        DirectItem::Sealed(sealed, _) => {
-                            reader = None;
-                            let report = sealed.report();
-                            let start = u64::from(slice.offset);
-                            (
-                                DirectPage::Sealed {
-                                    page: sealed,
-                                    range: start..start + u64::from(slice.length),
-                                },
-                                Some(report),
-                            )
-                        }
-                    };
-                    let mut write = sink.deliver(page, target, &progress_scope);
-                    let result = std::future::poll_fn(|cx| {
-                        if let Poll::Ready(result) = write.as_mut().poll(cx) {
-                            return Poll::Ready(result);
-                        }
-                        // Keep the fetch window moving while the write runs.
-                        stream.poll_prefetch(cx);
-                        Poll::Pending
-                    })
-                    .await;
-                    drop(write);
-                    if let Some(mut report) = report {
-                        // Release a registered RDMA buffer the decrypt
-                        // already copied out, before the owner persists.
-                        report.prefer_retained();
-                        // The owner drops a copy the GPU rejected, as it would
-                        // after a failed CPU decrypt, and may persist one it
-                        // accepted.
-                        match result {
-                            Ok(()) => stream.report_sealed(report, true),
-                            Err(Error::CorruptRecord) => stream.report_sealed(report, false),
-                            Err(_) => {}
+                fetched += u64::from(slice.length);
+                match item {
+                    DirectItem::Sealed(sealed, _) => {
+                        let report = sealed.report();
+                        let start = u64::from(slice.offset);
+                        let span = start..start + u64::from(slice.length);
+                        match sink.deliver_sealed_detached(sealed, span, target, &progress_scope) {
+                            Ok(mut write) => {
+                                // Poll once so the job is queued to a helper now.
+                                let waker = std::task::Waker::noop();
+                                let result = match write
+                                    .as_mut()
+                                    .poll(&mut std::task::Context::from_waker(waker))
+                                {
+                                    Poll::Ready(result) => Some(result),
+                                    Poll::Pending => None,
+                                };
+                                inflight.push_back(InFlightPage {
+                                    write,
+                                    result,
+                                    report,
+                                    slice,
+                                    offset,
+                                });
+                            }
+                            Err(sealed) => {
+                                held = Some((
+                                    DirectItem::Sealed(sealed, slice),
+                                    slice,
+                                    offset,
+                                    target,
+                                ));
+                            }
                         }
                     }
-                    result?;
+                    item @ DirectItem::Plaintext(_) => {
+                        held = Some((item, slice, offset, target));
+                    }
                 }
-                drop(reader);
-                // The page is written: no client credit gates its release.
-                stream.release_page(slice.page, slice.length)?;
-                connection = send_frame(
-                    &self.io,
-                    connection,
-                    frame(1, slice.page.0, offset, slice.length),
-                    &progress_scope,
-                )
-                .await?;
-                sent += u64::from(slice.length);
-                pages += 1;
             }
         }
         let mut final_scope = scope.clone();
@@ -847,6 +919,63 @@ impl Responses {
             send_frame(&self.io, connection, frame(2, pages, sent, 0), &final_scope).await?;
         observation.success();
         Ok(connection)
+    }
+
+    /// Deliver one page through the sink's borrowing `deliver`, keeping the
+    /// fetch window moving while it runs.
+    async fn deliver_serial(
+        &self,
+        sink: &mut dyn DirectSink,
+        stream: &mut RangeStream,
+        item: DirectItem,
+        slice: PageSlice,
+        target: u64,
+        progress_scope: &RequestScope,
+    ) -> Result<()> {
+        // A plaintext lease must outlive the write that borrows it.
+        let reader;
+        let (page, report) = match item {
+            DirectItem::Plaintext(lease) => {
+                reader = Some(lease);
+                (DirectPage::Plaintext(reader.as_ref().unwrap()), None)
+            }
+            DirectItem::Sealed(sealed, _) => {
+                reader = None;
+                let report = sealed.report();
+                let start = u64::from(slice.offset);
+                (
+                    DirectPage::Sealed {
+                        page: sealed,
+                        range: start..start + u64::from(slice.length),
+                    },
+                    Some(report),
+                )
+            }
+        };
+        let mut write = sink.deliver(page, target, progress_scope);
+        let result = std::future::poll_fn(|cx| {
+            if let Poll::Ready(result) = write.as_mut().poll(cx) {
+                return Poll::Ready(result);
+            }
+            stream.poll_prefetch(cx);
+            Poll::Pending
+        })
+        .await;
+        drop(write);
+        if let Some(mut report) = report {
+            // Release a registered RDMA buffer the decrypt already copied
+            // out, before the owner persists. The owner drops a copy the GPU
+            // rejected, as it would after a failed CPU decrypt, and may
+            // persist one it accepted.
+            report.prefer_retained();
+            match result {
+                Ok(()) => stream.report_sealed(report, true),
+                Err(Error::CorruptRecord) => stream.report_sealed(report, false),
+                Err(_) => {}
+            }
+        }
+        drop(reader);
+        result
     }
 
     /// Attach delivery resources with a no-op observer until configured.
