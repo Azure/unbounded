@@ -1,0 +1,1002 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
+// Package health tracks the health of a member's data-plane neighbors:
+// consecutive-failure breakers with single-probe half-open, Envoy-style
+// outlier detection, peak-EWMA latency, overload ("busy") marking, ejection
+// limits, a panic threshold, and a hedge budget.
+//
+// # Hot and control paths
+//
+// Observe, Usable, TryProbe, HedgeAfter, NoteRouted, and TryHedge are the
+// hot path. They are safe for concurrent use, take no locks, never read the
+// clock, and never allocate. Track, Untrack, and Tick are the control path
+// and must be called from a single goroutine (the runtime tick, or a
+// simulated node). Hooks are invoked only from Tick and Track/Untrack.
+//
+// Peers are identified by a dense slot number plus a member key. Slots can
+// reach about 1M, but a Tracker follows only a few hundred neighbors and the
+// simulator runs up to 100k Trackers in one process, so per-tracker memory is
+// O(tracked), never O(max slot): a small open-addressing table (slot to
+// *Peer) is rebuilt copy-on-write on Track/Untrack and published through an
+// atomic pointer. Re-tracking a slot with a different key resets its state;
+// re-tracking with the same key only updates its cell.
+//
+// Untracked slots are reported Healthy by Usable, and Observe on them is a
+// cheap no-op: health only filters among neighbors this member tracks.
+//
+// # Time
+//
+// The hot path never reads the clock. Tick(now) stores a coarse clock that
+// Observe uses for busy deadlines. Windows (outlier detection intervals,
+// hedge budgets) are delimited by Tick: per-peer counters live in two
+// buckets selected by an atomic index that Tick swaps every Interval.
+// Breaker ejections triggered inline by Observe are timed from the next
+// Tick (at most one runtime tick later), which also draws the jitter, so the
+// random source is only used on the control path.
+//
+// # States
+//
+// The breaker state of a peer is Healthy, Ejected, or Probing. Busy and
+// Degraded are overlays on a Healthy peer that make Usable return Degraded.
+// When an ejection ends the peer becomes Probing: Usable reports Unusable,
+// and exactly one caller may claim the probe with TryProbe. Any Success then
+// makes the peer Healthy; a Failure or Timeout ejects it again with a longer
+// ejection. A claimed probe whose result is never observed is released at
+// the next interval boundary.
+//
+// # Limits
+//
+// At most MaxEjectionPercent of tracked peers (but at least one) are in
+// Ejected or Probing at once, and the last Healthy-state member of a cell is
+// never ejected. These limits are enforced with atomic counters that are
+// adjusted optimistically and rolled back on failure; under concurrent
+// ejections they err on the side of not ejecting. Tick recomputes the
+// counters from peer states each call, which repairs any drift caused by
+// races with Track/Untrack.
+//
+// If more than PanicThreshold percent of tracked peers are unusable, Panic
+// is set and Usable reports every peer Healthy until it clears.
+//
+// # Determinism
+//
+// Outlier detection and EWMA decay use floating point. Their results are
+// local to this member (never compared across members) and are computed in a
+// fixed order (by slot), so given the same inputs and seed the outputs are
+// identical. Concurrent Observe calls are inherently unordered; simulations
+// that need determinism call Observe from one goroutine.
+package health
+
+import (
+	"math"
+	"math/rand/v2"
+	"slices"
+	"sync/atomic"
+	"time"
+)
+
+// Result is the outcome of a request to a peer.
+type Result uint8
+
+// Results.
+const (
+	Success Result = iota
+	Failure
+	Timeout
+	// Overload means the peer shed load. It never trips the breaker.
+	Overload
+)
+
+// Usability ranks a peer for routing. Higher is better.
+type Usability uint8
+
+// Usabilities.
+const (
+	Unusable Usability = iota
+	Degraded
+	Healthy
+)
+
+// State is a peer state for reporting and coverage.
+type State uint8
+
+// States.
+const (
+	StateHealthy State = iota
+	StateDegraded
+	StateBusy
+	StateEjected
+	StateProbing
+)
+
+func (s State) String() string {
+	switch s {
+	case StateHealthy:
+		return "healthy"
+	case StateDegraded:
+		return "degraded"
+	case StateBusy:
+		return "busy"
+	case StateEjected:
+		return "ejected"
+	case StateProbing:
+		return "probing"
+	}
+
+	return "unknown"
+}
+
+// Reason says why a peer was ejected.
+type Reason uint8
+
+// Reasons.
+const (
+	ReasonConsecutiveFailures Reason = iota
+	ReasonSuccessRate
+	ReasonFailurePercentage
+	ReasonProbeFailed
+)
+
+func (r Reason) String() string {
+	switch r {
+	case ReasonConsecutiveFailures:
+		return "consecutive-failures"
+	case ReasonSuccessRate:
+		return "success-rate"
+	case ReasonFailurePercentage:
+		return "failure-percentage"
+	case ReasonProbeFailed:
+		return "probe-failed"
+	}
+
+	return "unknown"
+}
+
+// Config tunes a Tracker. Zero values select the documented defaults;
+// a feature cannot be disabled by setting zero.
+type Config struct {
+	// ConsecutiveFailures ejects a peer after this many Failure or Timeout
+	// results in a row. Default 5.
+	ConsecutiveFailures uint32
+	// BaseEjection is multiplied by the ejection count. Default 30s.
+	BaseEjection time.Duration
+	// MaxEjection caps the ejection time before jitter. Default 300s.
+	MaxEjection time.Duration
+	// EjectionJitter is the maximum added jitter as a percent of the
+	// ejection time. Default 10.
+	EjectionJitter uint32
+	// Interval is the outlier detection, ejection-decay, and hedge budget
+	// window. Default 10s.
+	Interval time.Duration
+	// SuccessRateStdevFactor ejects peers whose success rate is below
+	// mean - factor*stddev. Default 1.9.
+	SuccessRateStdevFactor float64
+	// SuccessRateMinHosts is the number of peers with enough volume
+	// required for success-rate detection. Default 5.
+	SuccessRateMinHosts int
+	// SuccessRateRequestVolume is the per-interval volume a peer needs to be
+	// included in success-rate detection. Default 100.
+	SuccessRateRequestVolume uint64
+	// FailurePercentageThreshold ejects a peer whose failure percentage is
+	// at least this. Default 85.
+	FailurePercentageThreshold uint64
+	// FailurePercentageRequestVolume is the per-interval volume a peer needs
+	// for failure-percentage detection. Default 50.
+	FailurePercentageRequestVolume uint64
+	// EWMADecay is the peak-EWMA time constant. Default 10s.
+	EWMADecay time.Duration
+	// DegradedFactor marks a peer Degraded when its EWMA exceeds this many
+	// times the median EWMA of tracked peers. Default 3.
+	DegradedFactor int64
+	// DegradedFloor is the minimum EWMA for a peer to be Degraded.
+	// Default 10ms.
+	DegradedFloor time.Duration
+	// BusyFor is how long an Overload result marks a peer busy. Default 1s.
+	BusyFor time.Duration
+	// MaxEjectionPercent caps ejected peers as a percent of tracked peers.
+	// At least one peer may always be ejected. Default 10.
+	MaxEjectionPercent int
+	// PanicThreshold disables health filtering when more than this percent
+	// of tracked peers are unusable. Default 50.
+	PanicThreshold int
+	// HedgeRatio is the hedge budget as a fraction of routed requests per
+	// interval. Default 0.05.
+	HedgeRatio float64
+	// HedgeMin and HedgeMax clamp HedgeAfter. Defaults 5ms and 1s.
+	HedgeMin, HedgeMax time.Duration
+	// HedgeFactor multiplies the EWMA for HedgeAfter. Default 3.
+	HedgeFactor int64
+	// Hooks receive state change notifications.
+	Hooks Hooks
+}
+
+// Hooks are optional callbacks, invoked only from the control path (Tick,
+// Track, Untrack). Nil fields are skipped.
+type Hooks struct {
+	// OnEject is called when a peer's ejection is timed (at the first Tick
+	// after it was ejected).
+	OnEject func(slot uint32, reason Reason, ejections int, d time.Duration)
+	// OnProbe is called when an ejection ends and the peer starts probing.
+	OnProbe func(slot uint32)
+	// OnUneject is called when a probing peer has become Healthy.
+	OnUneject func(slot uint32)
+	// OnDegraded is called when a peer's Degraded flag changes.
+	OnDegraded func(slot uint32, degraded bool)
+	// OnPanic is called when the panic state changes.
+	OnPanic func(panic bool)
+}
+
+func (c *Config) setDefaults() {
+	def := func(v *time.Duration, d time.Duration) {
+		if *v <= 0 {
+			*v = d
+		}
+	}
+	def(&c.BaseEjection, 30*time.Second)
+	def(&c.MaxEjection, 300*time.Second)
+	def(&c.Interval, 10*time.Second)
+	def(&c.EWMADecay, 10*time.Second)
+	def(&c.DegradedFloor, 10*time.Millisecond)
+	def(&c.BusyFor, time.Second)
+	def(&c.HedgeMin, 5*time.Millisecond)
+	def(&c.HedgeMax, time.Second)
+
+	if c.ConsecutiveFailures == 0 {
+		c.ConsecutiveFailures = 5
+	}
+
+	if c.EjectionJitter == 0 {
+		c.EjectionJitter = 10
+	}
+
+	if c.SuccessRateStdevFactor <= 0 {
+		c.SuccessRateStdevFactor = 1.9
+	}
+
+	if c.SuccessRateMinHosts <= 0 {
+		c.SuccessRateMinHosts = 5
+	}
+
+	if c.SuccessRateRequestVolume == 0 {
+		c.SuccessRateRequestVolume = 100
+	}
+
+	if c.FailurePercentageThreshold == 0 {
+		c.FailurePercentageThreshold = 85
+	}
+
+	if c.FailurePercentageRequestVolume == 0 {
+		c.FailurePercentageRequestVolume = 50
+	}
+
+	if c.DegradedFactor <= 0 {
+		c.DegradedFactor = 3
+	}
+
+	if c.MaxEjectionPercent <= 0 {
+		c.MaxEjectionPercent = 10
+	}
+
+	if c.PanicThreshold <= 0 {
+		c.PanicThreshold = 50
+	}
+
+	if c.HedgeRatio <= 0 {
+		c.HedgeRatio = 0.05
+	}
+
+	if c.HedgeFactor <= 0 {
+		c.HedgeFactor = 3
+	}
+
+	if c.HedgeMax < c.HedgeMin {
+		c.HedgeMax = c.HedgeMin
+	}
+}
+
+// Breaker states stored in Peer.state.
+const (
+	bHealthy uint32 = iota
+	bEjected
+	bProbing
+)
+
+type bucket struct {
+	succ, fail atomic.Uint64
+}
+
+type cellCounter struct {
+	cell   uint32
+	usable atomic.Int32 // peers in bHealthy
+	n      int          // control-only: tracked peers in this cell
+	tmp    int32        // control-only scratch
+}
+
+// Peer is the health state of one tracked neighbor.
+type Peer struct {
+	slot uint32
+	key  uint64
+	cc   atomic.Pointer[cellCounter]
+
+	state     atomic.Uint32
+	probe     atomic.Uint32 // 1 when the probe token is claimed
+	consec    atomic.Uint32
+	ejections atomic.Int32
+	reason    atomic.Uint32
+	recent    atomic.Bool  // ejected during the current interval
+	until     atomic.Int64 // ejection end; 0 means not yet timed
+	busyUntil atomic.Int64
+	degraded  atomic.Bool
+	ewma      atomic.Int64 // ns
+	latSum    atomic.Int64
+	latN      atomic.Int64
+	buckets   [2]bucket
+
+	// Control-only.
+	reported uint32 // breaker state last reported through hooks
+}
+
+type entry struct {
+	slot uint32
+	p    *Peer
+}
+
+// table is an immutable slot index. peers is sorted by slot.
+type table struct {
+	entries []entry // power-of-two open addressing; p == nil is empty
+	shift   uint32
+	peers   []*Peer
+	cells   []*cellCounter // sorted by cell
+}
+
+func (t *table) lookup(slot uint32) *Peer {
+	mask := uint32(len(t.entries) - 1)
+
+	for i := (slot * 0x9E3779B1) >> t.shift; ; i = (i + 1) & mask {
+		e := &t.entries[i]
+		if e.p == nil || e.slot == slot {
+			return e.p
+		}
+	}
+}
+
+const hedgeShards = 16
+
+type hedgeShard struct {
+	routed, hedged atomic.Uint64
+	_              [128 - 16]byte // avoid false sharing (adjacent-line prefetch)
+}
+
+// Tracker tracks the health of a set of peers.
+type Tracker struct {
+	cfg Config
+	rng *rand.Rand
+
+	tab        atomic.Pointer[table]
+	now        atomic.Int64 // coarse clock set by Tick
+	active     atomic.Uint32
+	panic      atomic.Bool
+	ejected    atomic.Int32 // peers in bEjected or bProbing
+	maxEjected atomic.Int32
+	hedgePM    uint64 // hedge budget in parts per million
+
+	hedge [hedgeShards]hedgeShard
+
+	// Control-only.
+	cells        map[uint32]*cellCounter
+	started      bool
+	lastTick     int64
+	lastInterval int64
+	scratch      []int64
+	vols         []vol
+}
+
+type vol struct {
+	p          *Peer
+	succ, fail uint64
+}
+
+// NewTracker returns a Tracker. rng is used only on the control path, for
+// ejection jitter; nil means a fixed-seed PCG source.
+func NewTracker(cfg Config, rng *rand.Rand) *Tracker {
+	cfg.setDefaults()
+
+	if rng == nil {
+		rng = rand.New(rand.NewPCG(0, 0))
+	}
+
+	t := &Tracker{
+		cfg:     cfg,
+		rng:     rng,
+		hedgePM: uint64(math.Round(cfg.HedgeRatio * 1e6)),
+		cells:   map[uint32]*cellCounter{},
+	}
+	t.tab.Store(&table{entries: make([]entry, 1), shift: 32})
+	t.maxEjected.Store(1)
+
+	return t
+}
+
+// Track starts tracking slot with member key and cell, or updates the cell
+// of an already tracked slot with the same key. A different key resets the
+// slot's state. Control path.
+func (t *Tracker) Track(slot uint32, key uint64, cell uint32) {
+	old := t.tab.Load()
+	if p := old.lookup(slot); p != nil && p.key == key {
+		if p.cc.Load().cell != cell {
+			p.cc.Store(t.cellFor(cell))
+			t.rebuild(old.peers)
+		}
+
+		return
+	}
+
+	p := &Peer{slot: slot, key: key}
+	p.cc.Store(t.cellFor(cell))
+
+	peers := make([]*Peer, 0, len(old.peers)+1)
+	for _, q := range old.peers {
+		if q.slot != slot {
+			peers = append(peers, q)
+		}
+	}
+
+	i, _ := slices.BinarySearchFunc(peers, slot, func(q *Peer, s uint32) int {
+		return cmpU32(q.slot, s)
+	})
+	peers = slices.Insert(peers, i, p)
+	t.rebuild(peers)
+}
+
+// Untrack stops tracking slot. Control path.
+func (t *Tracker) Untrack(slot uint32) {
+	old := t.tab.Load()
+	if old.lookup(slot) == nil {
+		return
+	}
+
+	peers := make([]*Peer, 0, len(old.peers)-1)
+	for _, q := range old.peers {
+		if q.slot != slot {
+			peers = append(peers, q)
+		}
+	}
+
+	t.rebuild(peers)
+}
+
+// Tracked returns the number of tracked peers.
+func (t *Tracker) Tracked() int { return len(t.tab.Load().peers) }
+
+func cmpU32(a, b uint32) int {
+	switch {
+	case a < b:
+		return -1
+	case a > b:
+		return 1
+	}
+
+	return 0
+}
+
+func (t *Tracker) cellFor(cell uint32) *cellCounter {
+	c := t.cells[cell]
+	if c == nil {
+		c = &cellCounter{cell: cell}
+		t.cells[cell] = c
+	}
+
+	return c
+}
+
+func (t *Tracker) rebuild(peers []*Peer) {
+	size := 8
+	for size < 2*len(peers) {
+		size *= 2
+	}
+
+	shift := uint32(32)
+	for s := size; s > 1; s >>= 1 {
+		shift--
+	}
+
+	nt := &table{entries: make([]entry, size), shift: shift, peers: peers}
+	mask := uint32(size - 1)
+
+	for _, c := range t.cells {
+		c.n = 0
+	}
+
+	for _, p := range peers {
+		i := (p.slot * 0x9E3779B1) >> shift
+		for nt.entries[i].p != nil {
+			i = (i + 1) & mask
+		}
+
+		nt.entries[i] = entry{slot: p.slot, p: p}
+		p.cc.Load().n++
+	}
+
+	for k, c := range t.cells {
+		if c.n == 0 {
+			delete(t.cells, k)
+			continue
+		}
+
+		nt.cells = append(nt.cells, c)
+	}
+
+	slices.SortFunc(nt.cells, func(a, b *cellCounter) int { return cmpU32(a.cell, b.cell) })
+
+	t.maxEjected.Store(int32(max(1, len(peers)*t.cfg.MaxEjectionPercent/100)))
+	t.tab.Store(nt)
+	t.reconcile(nt)
+	t.updatePanic(nt)
+}
+
+// reconcile recomputes the ejection and per-cell usable counters from peer
+// states.
+func (t *Tracker) reconcile(nt *table) {
+	for _, c := range nt.cells {
+		c.tmp = 0
+	}
+
+	var ej int32
+
+	for _, p := range nt.peers {
+		if p.state.Load() == bHealthy {
+			p.cc.Load().tmp++
+		} else {
+			ej++
+		}
+	}
+
+	for _, c := range nt.cells {
+		c.usable.Store(c.tmp)
+	}
+
+	t.ejected.Store(ej)
+}
+
+func (t *Tracker) updatePanic(nt *table) {
+	n := len(nt.peers)
+	p := n > 0 && int(t.ejected.Load())*100 > n*t.cfg.PanicThreshold
+
+	if t.panic.Swap(p) != p && t.cfg.Hooks.OnPanic != nil {
+		t.cfg.Hooks.OnPanic(p)
+	}
+}
+
+// tryEject moves p from state from to bEjected, respecting limits when
+// from is bHealthy. Safe for concurrent use.
+func (t *Tracker) tryEject(p *Peer, from uint32, reason Reason) bool {
+	if from == bProbing {
+		p.until.Store(0)
+
+		if !p.state.CompareAndSwap(bProbing, bEjected) {
+			return false
+		}
+
+		p.reason.Store(uint32(reason))
+		p.ejections.Add(1)
+		p.recent.Store(true)
+
+		return true
+	}
+
+	if t.ejected.Add(1) > t.maxEjected.Load() {
+		t.ejected.Add(-1)
+		return false
+	}
+
+	cc := p.cc.Load()
+	if cc.usable.Add(-1) < 1 {
+		cc.usable.Add(1)
+		t.ejected.Add(-1)
+
+		return false
+	}
+
+	p.until.Store(0)
+
+	if !p.state.CompareAndSwap(bHealthy, bEjected) {
+		cc.usable.Add(1)
+		t.ejected.Add(-1)
+
+		return false
+	}
+
+	p.reason.Store(uint32(reason))
+	p.ejections.Add(1)
+	p.recent.Store(true)
+	p.consec.Store(0)
+
+	return true
+}
+
+// Observe records the result and latency of a request to slot. Hot path.
+func (t *Tracker) Observe(slot uint32, r Result, latency time.Duration) {
+	p := t.tab.Load().lookup(slot)
+	if p == nil {
+		return
+	}
+
+	if r == Overload {
+		p.busyUntil.Store(t.now.Load() + int64(t.cfg.BusyFor))
+		p.probe.Store(0)
+
+		return
+	}
+
+	if lat := int64(latency); lat > 0 {
+		p.latSum.Add(lat)
+		p.latN.Add(1)
+
+		for {
+			e := p.ewma.Load()
+			if lat <= e || p.ewma.CompareAndSwap(e, lat) {
+				break
+			}
+		}
+	}
+
+	b := &p.buckets[t.active.Load()&1]
+	st := p.state.Load()
+
+	if r == Success {
+		b.succ.Add(1)
+
+		if p.consec.Load() != 0 {
+			p.consec.Store(0)
+		}
+
+		if st == bProbing && p.state.CompareAndSwap(bProbing, bHealthy) {
+			p.cc.Load().usable.Add(1)
+			t.ejected.Add(-1)
+		}
+
+		return
+	}
+
+	b.fail.Add(1)
+
+	switch st {
+	case bHealthy:
+		if p.consec.Add(1) >= t.cfg.ConsecutiveFailures {
+			t.tryEject(p, bHealthy, ReasonConsecutiveFailures)
+		}
+	case bProbing:
+		t.tryEject(p, bProbing, ReasonProbeFailed)
+	}
+}
+
+// Usable reports how usable slot is for routing. Untracked slots are
+// Healthy. Hot path.
+func (t *Tracker) Usable(slot uint32) Usability {
+	p := t.tab.Load().lookup(slot)
+	if p == nil || t.panic.Load() {
+		return Healthy
+	}
+
+	if p.state.Load() != bHealthy {
+		return Unusable
+	}
+
+	if p.degraded.Load() || p.busyUntil.Load() > t.now.Load() {
+		return Degraded
+	}
+
+	return Healthy
+}
+
+// TryProbe claims the single probe token of a Probing peer. It returns true
+// to exactly one caller per probe. Hot path.
+func (t *Tracker) TryProbe(slot uint32) bool {
+	p := t.tab.Load().lookup(slot)
+
+	return p != nil && p.state.Load() == bProbing && p.probe.CompareAndSwap(0, 1)
+}
+
+// Panic reports whether health filtering is disabled.
+func (t *Tracker) Panic() bool { return t.panic.Load() }
+
+// HedgeAfter returns clamp(HedgeFactor*EWMA, HedgeMin, HedgeMax). A peer
+// without latency data, or an untracked slot, returns HedgeMax so that
+// hedging is conservative until there is data. Hot path.
+func (t *Tracker) HedgeAfter(slot uint32) time.Duration {
+	p := t.tab.Load().lookup(slot)
+	if p == nil {
+		return t.cfg.HedgeMax
+	}
+
+	e := p.ewma.Load()
+	if e <= 0 {
+		return t.cfg.HedgeMax
+	}
+
+	d := t.cfg.HedgeMax
+	if e < int64(t.cfg.HedgeMax)/t.cfg.HedgeFactor {
+		d = time.Duration(e * t.cfg.HedgeFactor)
+	}
+
+	return max(d, t.cfg.HedgeMin)
+}
+
+// NoteRouted counts a routed request toward the hedge budget. hint selects
+// a counter shard; pass any well-mixed per-request value (for example the
+// key hash) and the same value to TryHedge. Hot path.
+func (t *Tracker) NoteRouted(hint uint64) {
+	t.hedge[hint&(hedgeShards-1)].routed.Add(1)
+}
+
+// TryHedge admits a hedge if hedges in this interval stay within HedgeRatio
+// of routed requests in the same shard. The check and increment are not
+// atomic together, so concurrent callers may overshoot slightly. Hot path.
+func (t *Tracker) TryHedge(hint uint64) bool {
+	s := &t.hedge[hint&(hedgeShards-1)]
+	if (s.hedged.Load()+1)*1e6 > s.routed.Load()*t.hedgePM {
+		return false
+	}
+
+	s.hedged.Add(1)
+
+	return true
+}
+
+// Tick advances the control clock to now (node-local monotonic ns). Call it
+// regularly (for example every 100ms) from the control goroutine.
+func (t *Tracker) Tick(now int64) {
+	t.now.Store(now)
+
+	if !t.started {
+		t.started = true
+		t.lastTick = now
+		t.lastInterval = now
+	}
+
+	nt := t.tab.Load()
+
+	t.decayEWMA(nt, now-t.lastTick)
+	t.lastTick = now
+
+	if now-t.lastInterval >= int64(t.cfg.Interval) {
+		t.lastInterval = now
+		t.interval(nt)
+	}
+
+	t.transitions(nt, now)
+	t.reconcile(nt)
+	t.degrade(nt)
+	t.updatePanic(nt)
+}
+
+func (t *Tracker) decayEWMA(nt *table, dt int64) {
+	if dt <= 0 {
+		return
+	}
+
+	w := math.Exp(-float64(dt) / float64(t.cfg.EWMADecay))
+
+	for _, p := range nt.peers {
+		n := p.latN.Swap(0)
+		sum := p.latSum.Swap(0)
+
+		if n == 0 {
+			continue
+		}
+
+		mean := float64(sum) / float64(n)
+
+		for {
+			e := p.ewma.Load()
+
+			ne := int64(mean + (float64(e)-mean)*w)
+			if p.ewma.CompareAndSwap(e, ne) {
+				break
+			}
+		}
+	}
+}
+
+func (t *Tracker) interval(nt *table) {
+	old := t.active.Load() & 1
+	t.active.Store(old ^ 1)
+
+	cfg := &t.cfg
+
+	// Gather counts in slot order.
+	var (
+		sum, sumSq float64
+		hosts      int
+	)
+
+	vols := t.vols[:0]
+	defer func() { clear(vols); t.vols = vols[:0] }()
+
+	for _, p := range nt.peers {
+		b := &p.buckets[old]
+		v := vol{p: p, succ: b.succ.Swap(0), fail: b.fail.Swap(0)}
+		vols = append(vols, v)
+
+		if total := v.succ + v.fail; total >= cfg.SuccessRateRequestVolume {
+			r := float64(v.succ) / float64(total)
+			sum += r
+			sumSq += r * r
+			hosts++
+		}
+	}
+
+	if hosts >= cfg.SuccessRateMinHosts {
+		mean := sum / float64(hosts)
+		stdev := math.Sqrt(max(0, sumSq/float64(hosts)-mean*mean))
+		threshold := mean - cfg.SuccessRateStdevFactor*stdev
+
+		for _, v := range vols {
+			if total := v.succ + v.fail; total >= cfg.SuccessRateRequestVolume &&
+				float64(v.succ)/float64(total) < threshold {
+				t.tryEject(v.p, bHealthy, ReasonSuccessRate)
+			}
+		}
+	}
+
+	for _, v := range vols {
+		if total := v.succ + v.fail; total >= cfg.FailurePercentageRequestVolume &&
+			v.fail*100 >= cfg.FailurePercentageThreshold*total {
+			t.tryEject(v.p, bHealthy, ReasonFailurePercentage)
+		}
+	}
+
+	for _, p := range nt.peers {
+		recent := p.recent.Swap(false)
+		if !recent && p.state.Load() == bHealthy && p.ejections.Load() > 0 {
+			p.ejections.Add(-1)
+		}
+
+		if p.state.Load() == bProbing {
+			p.probe.Store(0) // release a probe whose result was never observed
+		}
+	}
+
+	for i := range t.hedge {
+		t.hedge[i].routed.Store(0)
+		t.hedge[i].hedged.Store(0)
+	}
+}
+
+// ejectionFor returns the ejection time for count n, with jitter.
+func (t *Tracker) ejectionFor(n int32) time.Duration {
+	d := t.cfg.MaxEjection
+	if n > 0 && int64(t.cfg.BaseEjection) <= int64(t.cfg.MaxEjection)/int64(n) {
+		d = t.cfg.BaseEjection * time.Duration(n)
+	}
+
+	j := int64(d) * int64(t.cfg.EjectionJitter) / 100
+
+	return d + time.Duration(t.rng.Int64N(j+1))
+}
+
+func (t *Tracker) transitions(nt *table, now int64) {
+	h := &t.cfg.Hooks
+
+	for _, p := range nt.peers {
+		switch p.state.Load() {
+		case bEjected:
+			u := p.until.Load()
+			if u == 0 {
+				n := p.ejections.Load()
+				d := t.ejectionFor(n)
+				p.until.Store(now + int64(d))
+
+				if h.OnEject != nil {
+					h.OnEject(p.slot, Reason(p.reason.Load()), int(n), d)
+				}
+
+				p.reported = bEjected
+
+				continue
+			}
+
+			if now >= u {
+				p.probe.Store(0)
+
+				if p.state.CompareAndSwap(bEjected, bProbing) {
+					p.reported = bProbing
+
+					if h.OnProbe != nil {
+						h.OnProbe(p.slot)
+					}
+				}
+			}
+		case bHealthy:
+			if p.reported != bHealthy {
+				p.reported = bHealthy
+
+				if h.OnUneject != nil {
+					h.OnUneject(p.slot)
+				}
+			}
+		}
+	}
+}
+
+func (t *Tracker) degrade(nt *table) {
+	t.scratch = t.scratch[:0]
+
+	for _, p := range nt.peers {
+		if e := p.ewma.Load(); e > 0 {
+			t.scratch = append(t.scratch, e)
+		}
+	}
+
+	var limit int64 = math.MaxInt64
+
+	if len(t.scratch) > 0 {
+		slices.Sort(t.scratch)
+
+		median := t.scratch[len(t.scratch)/2]
+		if median <= math.MaxInt64/t.cfg.DegradedFactor {
+			limit = max(median*t.cfg.DegradedFactor, int64(t.cfg.DegradedFloor))
+		}
+	}
+
+	for _, p := range nt.peers {
+		d := p.ewma.Load() > limit
+		if p.degraded.Swap(d) != d && t.cfg.Hooks.OnDegraded != nil {
+			t.cfg.Hooks.OnDegraded(p.slot, d)
+		}
+	}
+}
+
+// PeerState reports the state, ejection count, and EWMA latency of slot.
+// Untracked slots report StateHealthy with zero values.
+func (t *Tracker) PeerState(slot uint32) (State, int, time.Duration) {
+	p := t.tab.Load().lookup(slot)
+	if p == nil {
+		return StateHealthy, 0, 0
+	}
+
+	return t.peerState(p), int(p.ejections.Load()), time.Duration(p.ewma.Load())
+}
+
+func (t *Tracker) peerState(p *Peer) State {
+	switch {
+	case p.state.Load() == bEjected:
+		return StateEjected
+	case p.state.Load() == bProbing:
+		return StateProbing
+	case p.busyUntil.Load() > t.now.Load():
+		return StateBusy
+	case p.degraded.Load():
+		return StateDegraded
+	}
+
+	return StateHealthy
+}
+
+// Counts summarizes tracked peers by state.
+type Counts struct {
+	Tracked, Healthy, Degraded, Busy, Ejected, Probing int
+}
+
+// Counts returns a summary of tracked peers by state.
+func (t *Tracker) Counts() Counts {
+	nt := t.tab.Load()
+	c := Counts{Tracked: len(nt.peers)}
+
+	for _, p := range nt.peers {
+		switch t.peerState(p) {
+		case StateHealthy:
+			c.Healthy++
+		case StateDegraded:
+			c.Degraded++
+		case StateBusy:
+			c.Busy++
+		case StateEjected:
+			c.Ejected++
+		case StateProbing:
+			c.Probing++
+		}
+	}
+
+	return c
+}
