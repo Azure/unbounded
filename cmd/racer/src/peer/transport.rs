@@ -223,24 +223,35 @@ fn native_scope_within(scope: &RequestScope, limit: Duration) -> RequestScope {
     bounded
 }
 /// `scope` bounded by the RDMA page timeout of `links`, for one page's grant
-/// or write: past it the page goes over HTTP and the breaker trips.
+/// or write: past it the page goes over HTTP and the breaker counts a soft
+/// failure.
 fn page_scope(links: &crate::rdma::Links, scope: &RequestScope) -> RequestScope {
     native_scope_within(scope, links.page_timeout())
 }
-/// Trip the breaker for a failed RDMA grant or write that will go over HTTP
-/// instead, counting a page timeout when the page scope ran out while the
-/// request still had time.
+/// Feed the breaker a failed RDMA grant, write, or arrival whose page goes
+/// over HTTP instead. A page timeout is soft, running out of grant slots,
+/// flight room, or ciphertext budget is load, and any other error means the
+/// link is broken.
 fn trip_native(links: &crate::rdma::Links, peer: &NodeId, rail: RailId, error: Error, send: bool) {
+    links.breaker_trip(peer, rail, native_reason(links, error, send));
+}
+/// The breaker reason for a failed RDMA grant (`send` false) or write or
+/// arrival (`send` true), counting a page timeout.
+fn native_reason(
+    links: &crate::rdma::Links,
+    error: Error,
+    send: bool,
+) -> crate::rdma::breaker::TripReason {
     use crate::rdma::breaker::TripReason;
-    let reason = if error == Error::DeadlineExceeded {
-        links.record_page_timeout();
-        TripReason::Timeout
-    } else if send {
-        TripReason::Send
-    } else {
-        TripReason::Grant
-    };
-    links.breaker_trip(peer, rail, reason);
+    match error {
+        Error::DeadlineExceeded => {
+            links.record_page_timeout();
+            TripReason::Timeout
+        }
+        Error::Overloaded | Error::FlightFull => TripReason::Load,
+        _ if send => TripReason::Send,
+        _ => TripReason::Grant,
+    }
 }
 /// NUMA-`local` rails other than the chosen `rail` that a receiver may grant a
 /// page on when `rail` has no free slot, in order, keeping only those
@@ -689,9 +700,7 @@ impl Transfers {
                 }
                 GrantFailure::Fallback => {
                     links.record_fallback_grant(error);
-                    if error != Error::Overloaded {
-                        trip_native(links, &peer, rail, error, false);
-                    }
+                    trip_native(links, &peer, rail, error, false);
                     return Ok(None);
                 }
                 GrantFailure::Fail => return Err(error),
@@ -831,7 +840,8 @@ impl Transfers {
             if let Some(links) = &self.links {
                 links.record_http_fallback();
                 // An answer this slow most likely means the sender's write
-                // ran out of its page timeout: stop granting to this peer.
+                // ran out of its page timeout: a soft failure, which trips
+                // only in a streak with no RDMA success in between.
                 if scope.clock().now().saturating_duration_since(granted) >= links.page_timeout() {
                     links.breaker_trip(
                         verified.peer.node(),
