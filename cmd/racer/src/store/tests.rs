@@ -4682,9 +4682,11 @@ mod checkpoint {
                 1024 * 1024,
             )
             .unwrap();
-        // Encoding yields before the first file submission. Stop at the submission
-        // without reaping its completion, so abandonment exercises the actual fence.
-        for _ in 0..16 {
+        // Encoding runs on a helper thread before the first file submission.
+        // Stop at the submission without reaping its completion, so
+        // abandonment exercises the actual fence.
+        let end = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < end {
             assert!(
                 abandoned
                     .as_mut()
@@ -4694,6 +4696,7 @@ mod checkpoint {
             if reactor.in_flight() > 0 {
                 break;
             }
+            std::thread::sleep(Duration::from_millis(1));
         }
         assert!(reactor.in_flight() > 0);
         drop(abandoned);

@@ -307,20 +307,30 @@ impl Checkpointer {
             return Err(Error::Overloaded);
         }
         let directory = self.directory.clone();
+        let metrics = self
+            .writer
+            .borrow()
+            .upgrade()
+            .map(|writer| writer.metrics.clone());
         Ok(Box::pin(async move {
-            let bytes = encode_incremental(&CheckpointImage {
+            let image = CheckpointImage {
                 version: CHECKPOINT_VERSION,
                 page_size: shards_page_size(&shards)?,
                 cluster,
                 sequence,
                 shards,
-            })
-            .await?;
-            // Never replace a slot with a cut recovery would reject: the
-            // reader caps the file and charges decoded memory against the
-            // same budget, so check both before touching either slot.
-            publishable(&bytes, budget)?;
-            let current = fingerprint(&bytes)?;
+            };
+            // Validation and encoding of a large cut is seconds of CPU. Run it
+            // on a helper thread so this reactor keeps serving I/O meanwhile.
+            let encoded = encode_offloaded(image, budget).await;
+            if let Some(metrics) = &metrics {
+                metrics.record(
+                    crate::telemetry::Event::CheckpointEncodeNs,
+                    u64::try_from(encoded.elapsed.as_nanos()).unwrap_or(u64::MAX),
+                );
+                metrics.record(crate::telemetry::Event::CheckpointEncodeCount, 1);
+            }
+            let (bytes, current) = encoded.result?;
             if previous == Some(current) {
                 return Ok(None);
             }
@@ -344,6 +354,66 @@ impl Checkpointer {
             Ok(Some(current))
         }))
     }
+}
+
+/// Outcome of [`encode_offloaded`], with the CPU wall time it took.
+struct Encoded {
+    result: Result<(Vec<u8>, [u8; DIGEST_BYTES])>,
+    elapsed: std::time::Duration,
+    /// Name of the thread that encoded, so tests can prove the offload.
+    #[cfg(test)]
+    thread: Option<String>,
+}
+
+/// Validate, encode, budget-check, and fingerprint `image`.
+fn encode_checked(image: &CheckpointImage, budget: usize) -> Result<(Vec<u8>, [u8; DIGEST_BYTES])> {
+    let bytes = encode(image)?;
+    // Never replace a slot with a cut recovery would reject: the reader caps
+    // the file and charges decoded memory against the same budget, so check
+    // both before touching either slot.
+    publishable(&bytes, budget)?;
+    let current = fingerprint(&bytes)?;
+    Ok((bytes, current))
+}
+
+/// Run [`encode_checked`] on a dedicated helper thread and await its result
+/// without blocking the calling reactor. Falls back to encoding inline only
+/// when the OS refuses a new thread.
+async fn encode_offloaded(image: CheckpointImage, budget: usize) -> Encoded {
+    let (sender, receiver) = futures::channel::oneshot::channel();
+    let image = std::sync::Arc::new(image);
+    let shared = image.clone();
+    let spawned = std::thread::Builder::new()
+        .name("racer-checkpoint".into())
+        .spawn(move || {
+            let start = std::time::Instant::now();
+            let result = encode_checked(&shared, budget);
+            // Free the image here, not on the reactor.
+            drop(shared);
+            let _ = sender.send(Encoded {
+                result,
+                elapsed: start.elapsed(),
+                #[cfg(test)]
+                thread: std::thread::current().name().map(Into::into),
+            });
+        });
+    if spawned.is_err() {
+        let start = std::time::Instant::now();
+        let result = encode_checked(&image, budget);
+        return Encoded {
+            result,
+            elapsed: start.elapsed(),
+            #[cfg(test)]
+            thread: std::thread::current().name().map(Into::into),
+        };
+    }
+    drop(image);
+    receiver.await.unwrap_or(Encoded {
+        result: Err(Error::Unavailable),
+        elapsed: std::time::Duration::ZERO,
+        #[cfg(test)]
+        thread: None,
+    })
 }
 
 /// Sequence-independent digest of an encoded checkpoint: SHA-256 over the
@@ -1545,6 +1615,26 @@ mod budget_tests {
             assert_eq!(publishable(&bytes, needed - 1), Err(Error::Overloaded));
             assert!(decode_with_budget(&bytes, needed - 1).is_err());
         }
+    }
+
+    /// Validation and encoding run on a helper thread, not the polling
+    /// reactor, and produce exactly what inline encoding produces.
+    #[test]
+    fn offloaded_encode_runs_off_the_reactor_and_matches_inline() {
+        let image = full_image(64, 4);
+        let budget = usize::MAX / 2;
+        let inline = encode_checked(&image, budget).unwrap();
+        let encoded = futures::executor::block_on(encode_offloaded(image, budget));
+        assert_eq!(encoded.thread.as_deref(), Some("racer-checkpoint"));
+        assert_eq!(encoded.result.unwrap(), inline);
+        // Failures on the helper are reported, not lost.
+        let mut bad = full_image(1, 1);
+        bad.version += 1;
+        let encoded = futures::executor::block_on(encode_offloaded(bad, budget));
+        assert_eq!(encoded.result, Err(Error::CorruptRecord));
+        // A cut over budget is refused before any slot write.
+        let encoded = futures::executor::block_on(encode_offloaded(full_image(64, 4), 1));
+        assert_eq!(encoded.result, Err(Error::Overloaded));
     }
 
     #[test]

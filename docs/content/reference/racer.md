@@ -1178,6 +1178,8 @@ Ownership refresh affects subsequent events only, never rewrites old counters.
 | `racer_dirty_discards_total` | Queued page writes (accepted persistence attempts) dropped without a publication, all reasons |
 | `racer_dirty_discard_reasons_total{reason}` | The same discards split by reason, listed below |
 | `racer_dirty_write_deferred_total` | Writes kept queued because no free segment or index entry could be reclaimed during a checkpoint |
+| `racer_checkpoint_encode_nanoseconds_sum` | Total time spent validating and encoding periodic checkpoint cuts on the checkpoint helper thread. Segment reuse stays frozen on every worker for at least this long per cut |
+| `racer_checkpoint_encode_nanoseconds_count` | Checkpoint cuts validated and encoded, including cuts later skipped as unchanged or rejected |
 | `racer_free_segments` | Gauge of free segments, summed over workers, refreshed as writes complete |
 | `racer_free_segment_target` | Gauge of the free segments reclamation keeps ready, summed over workers; see below |
 

@@ -474,6 +474,8 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::DirtyDiscardCanceled => "racer_dirty_discard_reasons_total" { "reason=\"canceled\"" },
             Self::DirtyDiscardRemoved => "racer_dirty_discard_reasons_total" { "reason=\"cache_removed\"" },
             Self::DirtyWriteDeferred => "racer_dirty_write_deferred_total",
+            Self::CheckpointEncodeCount => "racer_checkpoint_encode_nanoseconds_count",
+            Self::CheckpointEncodeNs => "racer_checkpoint_encode_nanoseconds_sum",
             Self::OriginWalkRank0Self => "racer_origin_walk_reasons_total" { "reason=\"rank0_self\"" },
             Self::OriginWalkRank0Miss => "racer_origin_walk_reasons_total" { "reason=\"rank0_miss\"" },
             Self::OriginWalkRank0Overdue => "racer_origin_walk_reasons_total" { "reason=\"rank0_overdue\"" },
