@@ -354,7 +354,7 @@ each worker and are never divided.
 | Variable | Default | Scope | Accepted | Description |
 | --- | --- | --- | --- | --- |
 | `RACER_MAX_THREADS` | Unset: no cap | Node | 2..2^64-1 | Total I/O, crypto, and managed control threads. Managed deployments need at least 3. Kernel io_uring workers are not counted. |
-| `RACER_IO_WORKERS` | Unset: automatic | Node | 1..65,536 | Exact I/O worker count. Requires `RACER_CRYPTO_HELPERS`; their sum must fit `RACER_MAX_THREADS`. |
+| `RACER_IO_WORKERS` | Unset: automatic | Node | 1..65,536 | Exact I/O worker count. Requires `RACER_CRYPTO_HELPERS`; their sum must fit `RACER_MAX_THREADS`. Workers and helpers are spread over the NUMA nodes of the RDMA NICs in proportion to their usable CPUs, with each helper on the node of the workers it serves. |
 | `RACER_CRYPTO_HELPERS` | Unset: automatic | Node | 1..65,536 | Exact crypto helper count, at most `RACER_IO_WORKERS`. Requires `RACER_IO_WORKERS`. |
 | `RACER_ALLOW_SMT` | `false` | Node | `true`, `false` | `true` sizes from logical CPUs instead of one eligible CPU per physical core. |
 
