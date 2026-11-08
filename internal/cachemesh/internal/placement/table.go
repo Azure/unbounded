@@ -255,3 +255,41 @@ func (t *Table) Loads(dst []uint32) []uint32 {
 
 	return dst
 }
+
+// NewTableFunc returns a table of 2^bits partitions whose entry p is fn(p),
+// called once per partition in increasing order. Consecutive chunks with
+// identical contents share storage, so a uniform table costs one chunk. It
+// panics if bits is outside MinBits..MaxBits.
+func NewTableFunc(bits uint8, fn func(p uint32) Entry) *Table {
+	if !ValidBits(bits) {
+		panic(fmt.Sprintf("placement: bits %d outside %d..%d", bits, MinBits, MaxBits))
+	}
+
+	n := 1 << bits
+	size := min(n, ChunkSize)
+	t := &Table{bits: bits, chunks: make([][]Entry, (n+size-1)/size)}
+
+	var prev, cur []Entry
+
+	for ci := range t.chunks {
+		if cur == nil {
+			cur = make([]Entry, size)
+		}
+
+		base := uint32(ci) * uint32(size)
+		for j := range cur {
+			cur[j] = fn(base + uint32(j))
+		}
+
+		if prev != nil && slices.Equal(prev, cur) {
+			t.chunks[ci] = prev
+
+			continue
+		}
+
+		t.chunks[ci] = cur
+		prev, cur = cur, nil
+	}
+
+	return t
+}

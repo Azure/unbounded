@@ -491,3 +491,28 @@ func BenchmarkPlan(b *testing.B) {
 		})
 	}
 }
+
+func TestNewTableFunc(t *testing.T) {
+	tb := NewTableFunc(12, func(p uint32) Entry { return Entry{Owner: p % 3, Prev: NoMember, Moved: p} })
+	for p := range uint32(1 << 12) {
+		if e := tb.Get(p); e.Owner != p%3 || e.Prev != NoMember || e.Moved != p {
+			t.Fatalf("entry %d = %+v", p, e)
+		}
+	}
+
+	u := NewTableFunc(14, func(uint32) Entry { return Entry{Owner: 7, Prev: 2, Moved: 5} })
+	for i := 1; i < u.NumChunks(); i++ {
+		if !SameChunk(u, u, i) || &u.Chunk(i)[0] != &u.Chunk(0)[0] {
+			t.Fatalf("chunk %d not shared", i)
+		}
+	}
+
+	small := NewTableFunc(2, func(p uint32) Entry { return Entry{Owner: p, Prev: NoMember} })
+	if small.Len() != 4 || small.Owner(3) != 3 {
+		t.Fatalf("small table wrong")
+	}
+
+	if !Equal(NewTableFunc(10, func(uint32) Entry { return Entry{Owner: 1, Prev: NoMember} }), NewTable(10, 1)) {
+		t.Fatal("NewTableFunc differs from NewTable")
+	}
+}
