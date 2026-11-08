@@ -1091,6 +1091,12 @@ pub struct WorkerApplication {
     /// Where the presence probe reads RDMA devices (sysfs, or a test tree).
     rdma_sysfs: std::path::PathBuf,
 
+    /// Next sysfs rescan for RDMA devices while none is discovered.
+    rdma_rescan: std::time::Instant,
+
+    /// Discoverable devices the last rescan saw, so each change logs once.
+    rdma_rescan_seen: Option<Vec<String>>,
+
     telemetry: Rc<Telemetry>,
 
     directory: std::rc::Rc<WorkerDirectory>,
@@ -1788,6 +1794,8 @@ impl WorkerApplication {
             rdma_char_refreshed: None,
             rail_probe: started,
             rdma_sysfs: crate::rdma::SYSFS_INFINIBAND.into(),
+            rdma_rescan: started,
+            rdma_rescan_seen: None,
             telemetry: Rc::new(telemetry),
             directory: directory.clone(),
             node,

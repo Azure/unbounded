@@ -2083,8 +2083,11 @@ so their page buffers are freed later, when the pages are released. Until then
 they stay counted against `RACER_REGISTERED_BYTES`, so a reactivation that
 cannot fund its pool yet fails and retries. While it waits, the dataplane logs
 `stage=rdma-device state=waiting reason=...` each time the reason changes:
-`device_missing:<device>`, `device_inactive:<device>` (back, but no port is
-ACTIVE yet), `device_settling`, `drain_<blocker>` (the old round is still
+`device_missing:<device>` (nothing at its PCI address that discovery would
+keep: a device whose ports carry only a null GID, such as the `rdmaP...` twin
+that stays while a MANA VF's RoCE device is unbound, does not count, and the
+dataplane waits for as long as it takes), `device_inactive:<device>` (back, but
+no port is ACTIVE yet), `device_settling`, `drain_<blocker>` (the old round is still
 releasing its `links`, its `buffers` that a NIC may still use, its
 `registering` pools, or never releases a `leaked` native object),
 `inventory_refresh:<error>`, or `device_undiscovered`.
@@ -2099,8 +2102,10 @@ rdma-core falls back to `/dev/char`. It refreshes them again whenever the
 numbers sysfs lists change or one of their nodes is missing, including after
 an attempt that could not discover the device, so a device that returns with
 a new minor number after any outage is reopened without a restart. After a loss, activation retries every
-2 seconds instead of backing off. Once the device is back with an ACTIVE port,
-6 consecutive attempts that cannot use it log `stage=rdma-device
+2 seconds instead of backing off. Once the device is back with an ACTIVE port
+and a non-null GID, 6 consecutive attempts that cannot use it (activation
+failures or `device_undiscovered`; waiting while the device is missing,
+inactive, or settling never counts) log `stage=rdma-device
 state=restarting reason=device_unusable` and fail the worker, so the process
 restarts with a fresh verbs device list. Reads use HTTP until then.
 `racer_rdma_reactivation_waiting_device` is 1 while it waits for a device and
@@ -2117,6 +2122,18 @@ reactivation (like the retry after a failed activation) uses the discovered
 rails and then advertises them again. A successful reactivation logs
 `stage=rdma-device state=reactivated` and counts
 `racer_rdma_device_reactivations_total`.
+
+A dataplane with RDMA enabled that discovered no usable rail (it logs
+`stage=rdma-activation state=waiting reason=publication_empty:discovered=0`),
+for example because it started while a device was unbound, rescans every 10
+seconds. The rescan first reads `/sys/class/infiniband` only, listing devices
+with an ACTIVE port and a non-null GID, and logs `stage=rdma-rescan
+state=sysfs devices=[...]` each time that list changes. Only when it lists a
+device the inventory lacks does the dataplane refresh `/dev/char` nodes and
+rediscover ports (without starting a connection manager listener). Once that
+finds rails, it logs `stage=rdma-rescan state=discovered`, activates them, and
+advertises them on success. A node without RDMA hardware therefore costs one
+directory read per rescan and logs once.
 
 The RDMA owner thread hands queue pair and connection manager teardowns to
 helper threads named `racer-rdma-reaper`, at most one teardown every 2 ms per
