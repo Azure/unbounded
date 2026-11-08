@@ -142,7 +142,7 @@ impl Default for BreakerConfig {
             enabled: true,
             base: Duration::from_secs(2),
             max: Duration::from_secs(30),
-            page_timeout: Duration::from_secs(2),
+            page_timeout: Duration::from_secs(5),
         }
     }
 }
