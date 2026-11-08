@@ -206,9 +206,13 @@ impl DirectSink for HostSink {
                         range,
                         mapping: mapping.clone(),
                         destination: destination_offset,
+                        stored: None,
                     });
-                    // Drop the ciphertext here, on I/O, once the page is in.
-                    drop(crypto.decrypt_into(job, scope).await?);
+                    let mut job = crypto.decrypt_into(job, scope).await?;
+                    // Hand a fused copy to the verdict's owner, then drop the
+                    // ciphertext (and any registered buffer) here, on I/O.
+                    job.publish_store();
+                    drop(job);
                     Ok(())
                 }
             }

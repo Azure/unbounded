@@ -118,6 +118,7 @@ impl SharedCopy {
     pub(super) fn sealed(&self, crypto: &PageCrypto, page: &PageId) -> Result<Box<SealedPage>> {
         let facts = &self.facts;
         let sealed = Box::new(SealedPage {
+            fused_store: None,
             metadata: facts.metadata.clone(),
             envelope: facts.envelope.clone(),
             aad: facts.aad.clone(),

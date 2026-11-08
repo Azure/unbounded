@@ -509,6 +509,10 @@ pub struct DecryptInto {
 
     /// File offset of `range.start`.
     pub(crate) destination: u64,
+
+    /// The page's fused store once [`Self::run`] has filled and
+    /// authenticated it.
+    pub(crate) stored: Option<crate::memory::CiphertextBuffer>,
 }
 
 impl DecryptInto {
@@ -525,7 +529,13 @@ impl DecryptInto {
     /// Authenticate the page and write `range` of its plaintext to the
     /// mapping. Runs on a crypto worker. A failed authentication zeroes the
     /// written bytes and returns [`Error::CorruptRecord`].
-    pub(crate) fn run(&self) -> Result<()> {
+    ///
+    /// When the page arrived in a registered RDMA buffer and the read path
+    /// supplied aligned storage ([`SealedPage::fused_store`]), the page is
+    /// copied into that storage and decrypted in one chunked pass, so the
+    /// registered bytes are read from memory once. The filled storage is kept
+    /// for [`Self::publish_store`] only when the page authenticates.
+    pub(crate) fn run(&mut self) -> Result<()> {
         let SealedSource::Host(copy) = &self.page.source else {
             return Err(Error::Internal);
         };
@@ -545,6 +555,32 @@ impl DecryptInto {
         let destination = unsafe { self.mapping.bytes_mut(self.destination, end - start)? };
         self.mapping.populate(self.destination, destination)?;
         let key = &self.page.key;
+        if let Some(mut store) = self.page.fused_store.take()
+            && store.len() == bytes.len()
+        {
+            let output = if start == 0 && end == length {
+                racer_crypto::FusedOutput::Whole(destination)
+            } else {
+                // A partial page: only the requested bytes leave the
+                // chunk-sized scratch.
+                racer_crypto::FusedOutput::Scratch {
+                    out: destination,
+                    start,
+                }
+            };
+            // A failure drops `store` unpublished, back to its pool.
+            key.open_copy_into(
+                &self.page.aad,
+                bytes,
+                store.as_mut_slice(),
+                output,
+                racer_crypto::FUSED_CHUNK,
+                &mut page_alloc::stream::copy_nontemporal,
+            )
+            .map_err(|_| Error::CorruptRecord)?;
+            self.stored = Some(store);
+            return Ok(());
+        }
         if start == 0 && end == length {
             // Decrypt from the ciphertext copy straight into the mapping in
             // one pass. A failed tag check zeroes the destination.
@@ -559,6 +595,31 @@ impl DecryptInto {
             .map_err(|_| Error::CorruptRecord)?;
         destination.copy_from_slice(&scratch[start..end]);
         Ok(())
+    }
+
+    /// Whether [`Self::run`] authenticated the page and filled its fused
+    /// store, which [`Self::publish_store`] has not yet taken.
+    pub(crate) fn fused(&self) -> bool {
+        self.stored.is_some()
+    }
+
+    /// After a successful fused [`Self::run`], freeze the filled store into a
+    /// ciphertext page and record it on the registered source, so the
+    /// verdict's owner persists and caches that copy instead of copying the
+    /// registered buffer again ([`crate::memory::CiphertextPage::retained_copy`]).
+    /// Runs on the I/O worker. Does nothing for other pages.
+    pub(crate) fn publish_store(&mut self) {
+        let Some(store) = self.stored.take() else {
+            return;
+        };
+        let SealedSource::Host(copy) = &self.page.source else {
+            return;
+        };
+        let source = &copy.copy.ciphertext;
+        let mut detached =
+            crate::memory::CiphertextPage::from_aligned(store, source.envelope().clone());
+        detached.provenance = source.provenance;
+        source.record_copy_out(&detached);
     }
 }
 

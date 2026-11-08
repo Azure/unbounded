@@ -580,7 +580,7 @@ impl PageCryptoEngine {
                     _key: key,
                 };
             }
-            CryptoInput::DecryptInto(job) => {
+            CryptoInput::DecryptInto(mut job) => {
                 let outcome = match scope.check().and_then(|()| job.run()) {
                     Ok(()) => CryptoOutcome::Completed(CryptoOutput::DecryptedInto(job)),
                     Err(error) => {
@@ -1724,6 +1724,9 @@ impl CryptoClient {
                     crate::telemetry::Event::HostReadDirectDecryptBytes,
                     job.len(),
                 );
+                if job.fused() {
+                    metrics.record(crate::telemetry::Event::HostReadFusedDecrypt, 1);
+                }
             }
         }
         let observer = self.observer.borrow();

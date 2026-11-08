@@ -3231,6 +3231,7 @@ mod tests {
         }
         let build = move |source| {
             let page = Box::new(SealedPage {
+                fused_store: None,
                 metadata,
                 aad,
                 key: racer_crypto::xaes_derive(

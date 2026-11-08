@@ -811,7 +811,10 @@ impl Responses {
                     })
                     .await;
                     drop(write);
-                    if let Some(report) = report {
+                    if let Some(mut report) = report {
+                        // Release a registered RDMA buffer the decrypt
+                        // already copied out, before the owner persists.
+                        report.prefer_retained();
                         // The owner drops a copy the GPU rejected, as it would
                         // after a failed CPU decrypt, and may persist one it
                         // accepted.

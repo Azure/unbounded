@@ -3063,6 +3063,7 @@ fn sealing_registered_ciphertext_releases_the_buffer_before_decrypt_and_persist(
                 copy,
                 disk_token: None,
             },
+            false,
         )
         .unwrap();
     assert_eq!(crate::memory::registered_copy_outs(), copies + 1);
@@ -3081,6 +3082,86 @@ fn sealing_registered_ciphertext_releases_the_buffer_before_decrypt_and_persist(
     f.fill.sealed_verdict(sealed.report(), true);
     assert_eq!(crate::memory::registered_copy_outs(), copies + 1);
     drop(sealed);
+}
+
+/// For a host-read sink, sealing keeps the registered page and attaches
+/// empty aligned storage instead; the crypto worker's fused pass fills it,
+/// and the verdict persists that copy without copying the registered
+/// buffer again.
+#[test]
+fn sealing_registered_ciphertext_for_a_host_sink_detaches_during_decrypt() {
+    use std::os::unix::fs::FileExt;
+    let env = racer_io::Env::host();
+    let mut f = fixture_with(&env, 3, None);
+    let mut w = crate::rdma::links::tests::world_for(
+        [
+            crate::rdma::links::tests::node_id(1),
+            crate::rdma::links::tests::node_id(2),
+        ],
+        false,
+    );
+    let env = w.env.clone();
+    crate::rdma::links::tests::link_up(&env, &mut w);
+    let good = encrypted_copy(&mut f);
+    let copy = registered_copy(&env, &f, &mut w, &good, good.ciphertext.bytes().to_vec());
+    let copies = crate::memory::registered_copy_outs();
+    let sealed = f
+        .fill
+        .seal(
+            &f.page,
+            crate::memory::UnverifiedPage {
+                copy,
+                disk_token: None,
+            },
+            true,
+        )
+        .unwrap();
+    assert_eq!(crate::memory::registered_copy_outs(), copies);
+    assert!(sealed.fused_store.is_some());
+    let crate::read::sealed::SealedSource::Host(host) = &sealed.source else {
+        panic!("host source");
+    };
+    assert!(host.copy.ciphertext.is_registered());
+    let length = sealed.plaintext_length() as u64;
+    // SAFETY: plain syscalls on a descriptor this test owns.
+    let file = unsafe {
+        use std::os::fd::FromRawFd;
+        let fd = libc::memfd_create(
+            c"racer-fused".as_ptr(),
+            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        );
+        assert!(fd >= 0);
+        let file = std::fs::File::from_raw_fd(fd);
+        file.set_len(4096).unwrap();
+        assert_eq!(libc::fcntl(fd, libc::F_ADD_SEALS, libc::F_SEAL_SHRINK), 0);
+        file
+    };
+    let mapping = crate::client::direct::HostMapping::new(
+        &file,
+        racer_wire::object::client::Destination { offset: 0, length },
+    )
+    .unwrap();
+    let mut job = Box::new(crate::client::direct::DecryptInto {
+        page: sealed,
+        range: 0..length,
+        mapping: std::sync::Arc::new(mapping),
+        destination: 0,
+        stored: None,
+    });
+    job.run().unwrap();
+    assert!(job.fused());
+    let mut plaintext = vec![0; length as usize];
+    file.read_exact_at(&mut plaintext, 0).unwrap();
+    assert_eq!(plaintext, b"abc");
+    job.publish_store();
+    assert_eq!(crate::memory::registered_copy_outs(), copies + 1);
+    let mut report = job.page.report();
+    report.prefer_retained();
+    drop(job);
+    crate::rdma::links::tests::pump(&mut w.a.owner, &mut w.b.owner);
+    assert_eq!(free_buffers(&w), Some(2), "released once the pass ends");
+    f.fill.sealed_verdict(report, true);
+    assert_eq!(crate::memory::registered_copy_outs(), copies + 1);
 }
 
 #[test]

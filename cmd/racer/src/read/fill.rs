@@ -1137,7 +1137,8 @@ impl Fill {
             .await?;
         match acquired {
             AcquiredPage::Plaintext(result) => Ok(Fetched::Page(result)),
-            AcquiredPage::Ciphertext(copy) => match self.seal(&page, copy) {
+            AcquiredPage::Ciphertext(copy) => match self.seal(&page, copy, target.helper.is_none())
+            {
                 Ok(sealed) => Ok(Fetched::Sealed(sealed)),
                 // A key the GPU cannot use, or an AAD too long for it: the
                 // CPU authenticates the page as for a Get.
@@ -1346,7 +1347,7 @@ impl Fill {
         if let Some(local) = self.acquire_local_copy(page, scope, false).await? {
             return Ok(Some(match local {
                 AcquiredPage::Plaintext(result) => super::sealed::Fetched::Page(result),
-                AcquiredPage::Ciphertext(copy) => match self.seal(page, copy) {
+                AcquiredPage::Ciphertext(copy) => match self.seal(page, copy, false) {
                     Ok(sealed) => super::sealed::Fetched::Sealed(sealed),
                     Err(_) => return Ok(None),
                 },
@@ -1400,6 +1401,7 @@ impl Fill {
                                 copy,
                                 disk_token: None,
                             },
+                            false,
                         )
                         .ok()
                         .map(super::sealed::Fetched::Sealed));
@@ -1422,6 +1424,7 @@ impl Fill {
             .immutable()
             .validate_page_in(&envelope, self.page_size()?)?;
         let sealed = Box::new(super::sealed::SealedPage {
+            fused_store: None,
             aad: crate::security::page_aad(&envelope)?,
             key: self.dependencies.crypto.derive_page_key(&envelope)?,
             metadata,
@@ -1433,21 +1436,38 @@ impl Fill {
         Ok(Some(super::sealed::Fetched::Sealed(sealed)))
     }
 
-    /// Package host ciphertext for GPU verification.
+    /// Package host ciphertext for GPU verification or a host-read decrypt.
     ///
-    /// A registered RDMA page is copied out first, as [`Self::decrypt`] does:
-    /// the sealed page lives until the client sink's decrypt and the verdict's
-    /// persist finish, and a registered buffer held that long throttles RDMA
-    /// receive to the client and disk rate.
+    /// For a GPU, a registered RDMA page is copied out first, as
+    /// [`Self::decrypt`] does: the sealed page lives until the GPU's decrypt
+    /// and the verdict's persist finish, and a registered buffer held that
+    /// long throttles RDMA receive to the client and disk rate.
+    ///
+    /// For a host-read sink (`host`), a registered page instead keeps its
+    /// buffer and gets empty aligned storage: the crypto worker copies and
+    /// decrypts it in one chunked pass (`DecryptInto::run`), so the page is
+    /// read from memory once instead of twice. The buffer is held only until
+    /// that pass ends; the client loop then swaps the verdict's copy for the
+    /// detached one. When the storage cannot be reserved, it detaches as for
+    /// a GPU.
     pub(super) fn seal(
         &self,
         page: &PageId,
         mut copy: UnverifiedPage,
+        host: bool,
     ) -> Result<Box<super::sealed::SealedPage>> {
         validate_copy(&copy.copy, page, self.page_size()?)?;
-        copy.copy.ciphertext = self.detach_registered(copy.copy.ciphertext);
+        let fused_store = if host {
+            self.fused_store(&copy.copy.ciphertext)
+        } else {
+            None
+        };
+        if fused_store.is_none() {
+            copy.copy.ciphertext = self.detach_registered(copy.copy.ciphertext);
+        }
         let envelope = copy.copy.ciphertext.envelope().clone();
         let sealed = Box::new(super::sealed::SealedPage {
+            fused_store,
             metadata: copy.copy.metadata.clone(),
             aad: crate::security::page_aad(&envelope)?,
             key: self.dependencies.crypto.derive_page_key(&envelope)?,
@@ -1526,6 +1546,7 @@ impl Fill {
             Err(_) => return Ok(None),
         };
         let sealed = Box::new(super::sealed::SealedPage {
+            fused_store: None,
             metadata,
             envelope,
             aad,
@@ -2881,6 +2902,26 @@ impl Fill {
     /// Copy-out admission is optional: when it is refused even after
     /// reclamation, the registered page is kept and the memory cache and
     /// store copy it out under their own admission as before.
+    /// Empty aligned storage to detach registered `ciphertext` into during
+    /// its host-read decrypt. None when the page is not registered, already
+    /// has a copy, or the storage cannot be reserved.
+    fn fused_store(
+        &self,
+        ciphertext: &crate::memory::CiphertextPage,
+    ) -> Option<crate::memory::CiphertextBuffer> {
+        if !ciphertext.is_registered() || ciphertext.retained_copy().is_some() {
+            return None;
+        }
+        let buffers = &self.dependencies.buffers;
+        let length = ciphertext.bytes().len();
+        let capacity = buffers.aligned_capacity(length).ok()?;
+        let cache = &ciphertext.envelope().page.version.object.cache;
+        let reservation = self
+            .reserve_with_reclamation(cache, ResourceClass::Ciphertext, capacity)
+            .ok()?;
+        buffers.aligned_ciphertext(reservation, length).ok()
+    }
+
     fn detach_registered(
         &self,
         ciphertext: crate::memory::CiphertextPage,

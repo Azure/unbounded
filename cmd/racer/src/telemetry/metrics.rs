@@ -429,6 +429,7 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::AheadPlaintextDeferred => "racer_ahead_plaintext_deferred_total",
             Self::HostReadDirectDecrypt => "racer_host_read_direct_decrypt_pages_total",
             Self::HostReadDirectDecryptBytes => "racer_host_read_direct_decrypt_bytes_total",
+            Self::HostReadFusedDecrypt => "racer_host_read_fused_decrypt_pages_total",
             Self::GpuReadGpu => "racer_gpu_read_requests_total" { "outcome=\"gpu\"" },
             Self::GpuReadNotEnabled => "racer_gpu_read_requests_total" { "outcome=\"not_enabled\"" },
             Self::GpuReadWrongDevice => "racer_gpu_read_requests_total" { "outcome=\"wrong_device\"" },

@@ -116,6 +116,11 @@ pub struct SealedPage {
     pub key: racer_crypto::DerivedPageKey,
 
     pub source: SealedSource,
+
+    /// Empty aligned ciphertext storage for a host-read decrypt to fill in
+    /// the same pass, when the source is a registered RDMA buffer. See
+    /// `DecryptInto::run`. None leaves the source as it is.
+    pub(crate) fused_store: Option<crate::memory::CiphertextBuffer>,
 }
 
 /// What a page's owning worker needs to act on the GPU's verdict.
@@ -135,6 +140,17 @@ pub struct SealedReport {
 }
 
 impl SealedReport {
+    /// Swap a registered host copy for the detached copy a fused host-read
+    /// decrypt recorded on it, dropping this report's hold on the
+    /// registered buffer. Other copies are left as they are.
+    pub(crate) fn prefer_retained(&mut self) {
+        if let Some(copy) = &mut self.copy
+            && let Some(detached) = copy.copy.ciphertext.retained_copy()
+        {
+            copy.copy.ciphertext = detached;
+        }
+    }
+
     /// Whether the owner has anything to act on for this verdict: a host
     /// copy to persist or invalidate, a disk mapping to drop, or, on
     /// failure, a shared landed copy to forget. A passed landed page leaves
@@ -212,6 +228,7 @@ pub(crate) mod tests {
     pub(crate) fn sealed(result: &PageResult) -> SealedPage {
         let envelope = result.ciphertext.envelope().clone();
         SealedPage {
+            fused_store: None,
             metadata: result.metadata.clone(),
             aad: crate::security::page_aad(&envelope).unwrap_or_default(),
             key: racer_crypto::xaes_derive(

@@ -706,6 +706,12 @@ Racer-Destination-Length: <length>
   page is authenticated. Any other file gets positioned writes only.
   `racer_host_read_direct_decrypt_pages_total` and
   `racer_host_read_direct_decrypt_bytes_total` count pages and plaintext bytes
+  decrypted this way. When such a page arrives from a peer over RDMA, the
+  crypto worker copies it out of the RDMA receive buffer into the dataplane's
+  ciphertext cache and decrypts it in the same pass, 128 KiB at a time, so
+  the received bytes are read from memory once. The receive buffer is held
+  until that pass ends. A page that fails authentication is not cached or
+  persisted. `racer_host_read_fused_decrypt_pages_total` counts pages
   decrypted this way.
 - The dataplane keeps mappings of such files in a process-wide cache keyed
   by the file's device and inode, so repeated requests for the same `memfd`
