@@ -42,6 +42,7 @@ unbounded-kube is organized into several directories:
 - `internal/` - where shared but internal to this project packages are located.
   - `gantry/` - gantry shared packages (21 sub-packages: config, mirror, transfer, discovery, coord, hrw, coldstart, members, metrics, etc.). Includes `internal/gantry/proto/coord/v1/` for the libp2p coordination RPC messages (pull intent, please-pull); kept under internal/ so the wire schema isn't an exported API surface.
   - `net/` - unbounded-net shared packages (APIs, controllers, networking, metrics, webhooks, etc.).
+  - `cachemesh/` - cachemesh, a transport-agnostic routing library for a distributed cache of up to 100k nodes (bounded-degree grid, leader-assigned partition table, Lease-based election). Design: `designs/cachemesh.md`.
 - `tmp/` - project local temporary directory for intermediate stuff that will be cleaned up quickly.
 
 ## Building and Testing
@@ -61,6 +62,7 @@ unbounded-kube is organized into several directories:
 - `make fmt` formats Go source (gofumpt + wsl_v5 blank-line rules); `make lint` runs golangci-lint; `make test` runs all tests.
 - `make lint` runs the same checks locally and in CI and does NOT auto-fix. Always run `make fmt` before committing to satisfy the linter (gofumpt and wsl_v5 are enforced by `make lint`/CI); do not hand-format.
 - Locally `test` implies `lint`. In CI (`CI=1`), each runs independently.
+- `go test ./internal/cachemesh/internal/dst` runs the cachemesh deterministic simulation suite (`TestDST`). Opt-in longer runs: `CACHEMESH_DST_SEED`/`CACHEMESH_DST_SEEDS` for explicit seeds, `CACHEMESH_DST_LARGE=1` for 100k members, and `CACHEMESH_DST_SWEEP` with `CACHEMESH_DST_SWEEP_OUT` (and optional `CACHEMESH_DST_SWEEP_WORKERS`) for a resumable `TestDSTSweep` seed sweep.
 
 ## Coding Standards
 
