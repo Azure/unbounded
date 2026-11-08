@@ -244,6 +244,7 @@ type pending struct {
 	attempt uint8
 	enc     []byte // broadcast delta
 	seq     uint64 // broadcast delta seq
+	addr    string // catch-up peer
 }
 
 type subject struct {
@@ -674,8 +675,33 @@ func (n *Node) sendJoin(now int64) {
 	}
 }
 
+// dropSeed forgets a join seed that did not answer, keeping at least one.
+func (n *Node) dropSeed(addr string) {
+	if n.isMember() || len(n.seeds) <= 1 {
+		return
+	}
+
+	n.seeds = slices.DeleteFunc(n.seeds, func(s string) bool { return s == addr })
+	if len(n.seeds) == 0 {
+		n.seeds = append(n.seeds, addr)
+	}
+}
+
+// addSeed remembers a live peer as a join seed while not a member.
+func (n *Node) addSeed(addr string) {
+	if n.isMember() || addr == "" || addr == n.cfg.Addr || slices.Contains(n.seeds, addr) {
+		return
+	}
+
+	if len(n.seeds) >= maxSeeds {
+		n.seeds = slices.Delete(n.seeds, 0, 1)
+	}
+
+	n.seeds = append(n.seeds, addr)
+}
+
 func (n *Node) rereadLease() {
-	n.ownReadSeq++
+	n.ownReadSeq = (n.ownReadSeq + 1) | ownLeaseBit
 	n.ownReadDone = false
 	n.leaseOps = append(n.leaseOps, elect.Op{Seq: n.ownReadSeq, Kind: elect.OpGetCached})
 	n.event("lease-seed-read")
@@ -723,11 +749,7 @@ func (n *Node) Invalidate(now int64, seed uint64) {
 }
 
 func (n *Node) catchUp(now int64, addr string, force bool) {
-	if addr == "" || addr == n.cfg.Addr || (n.catchUpInFlight && !force) {
-		return
-	}
-
-	if n.catchUpInFlight {
+	if addr == "" || addr == n.cfg.Addr || n.catchUpInFlight {
 		return
 	}
 
@@ -737,7 +759,7 @@ func (n *Node) catchUp(now int64, addr string, force bool) {
 	m.MaxDeltas = uint32(n.cfg.CatchUpMaxDeltas)
 	n.catchUpInFlight = true
 	n.catchUpSentAt = now
-	n.send(addr, &m, &pending{kind: callCatchUp}, n.cfg.CallTimeout)
+	n.send(addr, &m, &pending{kind: callCatchUp, addr: addr}, n.cfg.CallTimeout)
 }
 
 // NoteVersion reports that the data plane saw a member at version ver.
@@ -923,6 +945,7 @@ func (n *Node) OnReply(now int64, id uint64, resp []byte, err error) {
 	if m == nil || m.Kind == wire.KindNack {
 		if m != nil && p.kind == callCatchUp {
 			n.catchUpInFlight = false
+			n.event("catchup-nack")
 
 			return
 		}
@@ -964,6 +987,8 @@ func (n *Node) fail(p *pending) {
 		n.pingDone(n.now, p, false, 0)
 	case callCatchUp:
 		n.catchUpInFlight = false
+		n.event("catchup-failed")
+		n.dropSeed(p.addr)
 	case callBroadcast:
 		if p.attempt == 0 && p.level != wire.LevelLocal {
 			n.event("broadcast-retry")

@@ -525,8 +525,22 @@ Implementation notes (`node` package):
   a view. A member without a view that wins the Lease any other way (a
   lottery) releases it instead of publishing a second genesis.
 - A member that finds itself removed (for example after a partition) and is
-  not leaving rejoins with the same incarnation, using the leader and random
-  members of its last view as seeds.
+  not leaving rejoins with the same incarnation. While not a member, every
+  view it adopts adds the leader and a few random members to its seeds, a
+  `Broadcast` sender is added as a seed, a seed whose catch-up fails is
+  dropped (keeping at least one), and the Lease is re-read every 16 join
+  attempts.
+- A starting member without seeds treats any Lease record with a holder or
+  seeds as a live cluster and joins through it; it bootstraps only when the
+  Lease is missing, or released without seeds. Judging the holder's liveness
+  by wall clock here would let a skewed clock start a second cluster.
+- A joiner that has seeds stays a follower (the elector is told it has a
+  view and has just heard from the leader), so it never enters the lottery;
+  otherwise a joiner with a skewed wall clock takes a live leader's Lease and
+  gives it back, forcing an election each time.
+- When the Lease (as read by the elector) names a leader of a later term
+  than the view, the member catches up from that leader. This heals two
+  lineages left by a partition.
 - A failed `Broadcast` forward is retried once with the next-ranked member
   of the same cell.
 - Elector and health ticks run every `TickInterval` (1s).

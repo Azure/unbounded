@@ -213,6 +213,8 @@ func (n *Node) adoptSnapshot(now int64, nv *view.View) {
 }
 
 func (n *Node) onBroadcast(now int64, from string, m *wire.Message) {
+	n.addSeed(from)
+
 	d, err := n.decodeDelta(m.Delta)
 	if err != nil {
 		n.event("bad-delta")
@@ -672,8 +674,7 @@ func (n *Node) pingDone(now int64, p *pending, ok bool, rtt time.Duration) {
 
 func (n *Node) electInput(now int64, wall time.Time) elect.Input {
 	_, has := n.v.Config()
-
-	return elect.Input{
+	in := elect.Input{
 		Now: now, Wall: wall,
 		ViewTerm:      n.v.Term(),
 		HaveView:      has,
@@ -682,6 +683,16 @@ func (n *Node) electInput(now int64, wall time.Time) elect.Input {
 		LeaderHeardAt: n.heardAt,
 		Seeds:         n.leaseSeeds,
 	}
+
+	// A joiner that has seeds is in contact with the cluster and needs no
+	// Lease reads: keep it a follower. Otherwise a joiner without a view
+	// would sit in the lottery and, with a skewed wall clock, take a live
+	// leader's Lease only to give it back.
+	if !n.isMember() && len(n.seeds) > 0 && !n.bootstrapper && !n.leading {
+		in.HaveView, in.LeaderHeardAt = true, now
+	}
+
+	return in
 }
 
 func (n *Node) isCandidate() bool {
@@ -756,23 +767,11 @@ func (n *Node) tickElector(now int64, wall time.Time) {
 // seedsFromView uses the leader and a few random members of the current
 // view as join seeds.
 func (n *Node) seedsFromView() {
-	add := func(a string) {
-		if a == "" || a == n.cfg.Addr || slices.Contains(n.seeds, a) {
-			return
-		}
-
-		if len(n.seeds) >= maxSeeds {
-			n.seeds = slices.Delete(n.seeds, 0, 1)
-		}
-
-		n.seeds = append(n.seeds, a)
-	}
-
-	add(n.addrOf(n.v.Leader()))
+	n.addSeed(n.addrOf(n.v.Leader()))
 
 	if c := n.v.SlotCap(); c > 0 {
 		for range 4 {
-			add(n.addrOf(view.Slot(n.rng.Uint32N(c))))
+			n.addSeed(n.addrOf(view.Slot(n.rng.Uint32N(c))))
 		}
 	}
 }
@@ -813,14 +812,22 @@ func (n *Node) OnLease(now int64, wall time.Time, r elect.Result) {
 		}
 
 		n.ownReadDone = true
-		live := r.Err == nil && r.Record.Holder != "" &&
-			wall.Before(r.Record.RenewTime.Add(max(r.Record.LeaseDuration, n.cfg.Elect.LeaseDuration)+n.cfg.Elect.ClockSkewAllowance))
 
-		if live {
+		// Any record that names a holder or seeds means a cluster exists
+		// (or existed): join through it rather than judging liveness with
+		// a possibly skewed wall clock. Only a missing Lease, or a released
+		// one without seeds, makes this member bootstrap a cluster.
+		if r.Err == nil && (r.Record.Holder != "" || len(r.Record.Seeds) > 0) {
 			n.learnSeeds(r.Record.Addr, r.Record.Seeds)
-		} else if _, has := n.v.Config(); !has && len(n.cfg.Seeds) == 0 && !n.joined && (r.Err == nil || errors.Is(r.Err, elect.ErrNotFound)) {
-			n.bootstrapper = true
-			n.event("bootstrap-candidate")
+		}
+
+		switch {
+		case len(n.seeds) > 0:
+		case r.Err == nil || errors.Is(r.Err, elect.ErrNotFound):
+			if _, has := n.v.Config(); !has && len(n.cfg.Seeds) == 0 && !n.joined {
+				n.bootstrapper = true
+				n.event("bootstrap-candidate")
+			}
 		}
 
 		return
