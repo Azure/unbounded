@@ -541,11 +541,18 @@ Implementation notes (`node` package):
 - `Routed` messages are relayed straight to the leader address the relay
   knows (from its view, the Lease, or a `Pong` hint) rather than hop by hop
   over the grid; `TTL` (4) bounds relay chains while leaders change.
-- A member with no `Config.Seeds` issues one cached Lease read at start. Until it is answered the elector is held as a follower, so a starting
-  member makes exactly one Lease call. If
-  it finds no live holder it bootstraps: it acts as a candidate until it has
-  a view. A member without a view that wins the Lease any other way (a
-  lottery) releases it instead of publishing a second genesis.
+- A member with no `Config.Seeds` issues one cached Lease read at start.
+  Until it is answered the elector is held as a follower, so a starting
+  member makes exactly one Lease call. If it finds no Lease, or a released
+  one without seeds, it bootstraps: it takes part in the lottery until it
+  has a view (not as a candidate, so members that all start at once without
+  seeds make about `LotteryBudgetQPS` Lease calls rather than one each per
+  `RetryPeriod`; set `ExpectedClusterSize` near the real size, since a
+  single member with the default of 1000 is eligible in about one round in
+  50). A member without a view that wins the Lease and is neither a
+  bootstrapper nor cold-starting releases it instead of publishing a second
+  genesis. A released Lease keeps its seeds, so starters still find the
+  cluster through it.
 - A member that finds itself removed (for example after a partition) and is
   not leaving rejoins with the same incarnation. While not a member, every
   view it adopts adds the leader and a few random members to its seeds, a
@@ -664,13 +671,15 @@ States:
   a current term) for `NoLeaderTimeout` (30s plus jitter), or when there is no
   view at all, a member enters rounds of `LotteryRound` (1s). In round r it is
   eligible if `Score(member.Key, r) < p * 2^64` with
-  `p = min(1, LotteryBudgetQPS * LotteryRound / N)`, where N is the member
-  count of its last view or `ExpectedClusterSize`. An eligible member reads
+  `p = min(1, LotteryBudgetQPS * LotteryRound / N)`, where N is the larger
+  of the member count of its last view and `ExpectedClusterSize`. An eligible member reads
   the Lease once: if a live leader holds it, the member records the leader's
   address and seeds and catches up from a seed; if it is expired by more than
   `LeaseDuration + ClockSkewAllowance` (5s) of wall time, the member tries to
   take it. This bounds API traffic during leader loss at about
-  `LotteryBudgetQPS` (20/s) across the whole cluster.
+  `LotteryBudgetQPS` (20/s) across the whole cluster. The floor on N keeps
+  a member whose view is much smaller than the cluster (a fresh lineage
+  after a cold restart) from reading every round.
 
 `Elector.ObserveTerm` records terms seen outside the Lease (see the node
 notes); the next acquisition uses `max(record.Term, view.Term, observed) +

@@ -1185,13 +1185,26 @@ type Stats struct {
 	Subjects, Neighbors             int
 	Joins, Leaves, Suspects, Invals int
 	Unconfirmed, BadBase, ColdStart bool
+	// Lingering counts removed neighbors kept for NeighborLinger;
+	// LingerOverdue reports one kept past its expiry by more than a tick.
+	Lingering     int
+	LingerOverdue bool
 }
 
 // Stats returns the current collection sizes.
 func (n *Node) Stats() Stats {
 	j, l, s, i := n.ld.Pending()
+	lingering, overdue := 0, false
+
+	for _, nb := range n.neighbors {
+		if nb.lingers != 0 {
+			lingering++
+			overdue = overdue || n.now > nb.lingers+int64(n.cfg.TickInterval)
+		}
+	}
 
 	return Stats{
+		Lingering: lingering, LingerOverdue: overdue,
 		Calls: len(n.calls), Outbox: len(n.outbox), LeaseOps: len(n.leaseOps),
 		Ahead: len(n.ahead), Seeds: len(n.seeds), LeaseSeeds: len(n.leaseSeeds), Log: n.log.Len(),
 		Subjects: len(n.subjects), Neighbors: len(n.neighbors),

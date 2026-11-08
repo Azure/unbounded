@@ -722,10 +722,14 @@ func (n *Node) electInput(now int64, wall time.Time) elect.Input {
 	_, has := n.v.Config()
 	in := elect.Input{
 		Now: now, Wall: wall,
-		ViewTerm:      n.v.Term(),
-		HaveView:      has,
-		ClusterSize:   n.v.Len(),
-		IsCandidate:   n.isCandidate() || (n.bootstrapper && !has),
+		ViewTerm:    n.v.Term(),
+		HaveView:    has,
+		ClusterSize: n.v.Len(),
+		// A bootstrapper (no seeds, no Lease) is not a candidate: it takes
+		// the Lease through the lottery, so a cluster whose members all
+		// start at once without seeds makes about LotteryBudgetQPS Lease
+		// calls, not one per member per RetryPeriod.
+		IsCandidate:   n.isCandidate(),
 		LeaderHeardAt: n.heardAt,
 		Seeds:         n.leaseSeeds,
 	}
