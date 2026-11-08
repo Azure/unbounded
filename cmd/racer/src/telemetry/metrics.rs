@@ -446,6 +446,12 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::AheadPlaintextDeferred => "racer_ahead_plaintext_deferred_total",
             Self::HostReadDirectDecrypt => "racer_host_read_direct_decrypt_pages_total",
             Self::HostReadDirectDecryptBytes => "racer_host_read_direct_decrypt_bytes_total",
+            Self::HostReadRequestCount => "racer_host_read_request_nanoseconds_count",
+            Self::HostReadRequestNs => "racer_host_read_request_nanoseconds_sum",
+            Self::HostReadFirstPageCount => "racer_host_read_first_page_nanoseconds_count",
+            Self::HostReadFirstPageNs => "racer_host_read_first_page_nanoseconds_sum",
+            Self::HostReadInflightPagesCount => "racer_host_read_inflight_pages_count",
+            Self::HostReadInflightPages => "racer_host_read_inflight_pages_sum",
             Self::HostReadFusedDecrypt => "racer_host_read_fused_decrypt_pages_total",
             Self::HostReadFusedSkippedNotRegistered => "racer_host_read_fused_skipped_total" { "reason=\"not_registered\"" },
             Self::HostReadFusedSkippedRetained => "racer_host_read_fused_skipped_total" { "reason=\"retained\"" },
@@ -575,6 +581,10 @@ pub(crate) struct RequestMetrics {
     failure: Option<crate::error::Error>,
 }
 impl RequestMetrics {
+    /// Add `amount` to `event` on this request's worker.
+    pub(crate) fn add(&self, event: Event, amount: u64) {
+        self.active.add(event, amount);
+    }
     pub(crate) fn success(&mut self) {
         self.succeeded = true;
     }

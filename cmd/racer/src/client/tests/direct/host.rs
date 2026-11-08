@@ -360,6 +360,17 @@ fn concurrent_sealed_pages_send_frames_in_page_order() {
     assert_eq!(frames, expected);
     assert!(memfd.contents() == data);
     assert_eq!(worker(&fixture).metric(Event::HostReadDirectDecrypt), 3);
+    let metrics = &fixture.listeners.metrics;
+    assert_eq!(metrics.count(Event::HostReadInflightPagesCount), 3);
+    assert!(
+        metrics.count(Event::HostReadInflightPages) > 3,
+        "{}",
+        metrics.count(Event::HostReadInflightPages)
+    );
+    // The arranging read and this one both completed.
+    assert_eq!(metrics.count(Event::HostReadRequestCount), 2);
+    assert_eq!(metrics.count(Event::HostReadFirstPageCount), 2);
+    assert!(metrics.count(Event::HostReadRequestNs) >= metrics.count(Event::HostReadFirstPageNs));
 }
 
 /// A tampered page after the first fails the read after the earlier pages'

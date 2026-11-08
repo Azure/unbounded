@@ -739,6 +739,21 @@ Racer-Destination-Length: <length>
   `racer_host_read_mappings_evicted_total` count new, reused, and evicted
   mappings; `racer_host_read_mappings_cached` and
   `racer_host_read_mappings_cached_bytes` report the cache's current size.
+- Pages of one request that are decrypted into a mapped `memfd` run on crypto
+  workers concurrently, up to 4 at a time, instead of one after another.
+  Page frames are still sent in page order, each after its page and every
+  earlier page is in the file. `racer_host_read_inflight_pages_sum` and
+  `racer_host_read_inflight_pages_count` give the average number of such
+  decrypts running for a request each time one starts; a value near 1 means
+  pages arrive more slowly than they decrypt.
+- `racer_host_read_request_nanoseconds_sum` and
+  `racer_host_read_request_nanoseconds_count` time each successful host-read
+  from the start of its delivery (after the request is parsed and the
+  descriptor checked) to the final frame.
+  `racer_host_read_first_page_nanoseconds_sum` and
+  `racer_host_read_first_page_nanoseconds_count` time the same start to the
+  first page being ready, before the response head is sent. The difference
+  is time spent delivering pages and sending frames.
 
 `POST /v1/objects/<key>/gpu-read` writes into GPU memory. It works like
 `host-read`, with these differences:

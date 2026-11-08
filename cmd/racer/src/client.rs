@@ -712,7 +712,21 @@ impl Responses {
         observation: &mut crate::telemetry::RequestMetrics,
         timeout: Duration,
     ) -> Result<ConnectionLease> {
+        use crate::telemetry::Event;
+        let started = scope.clock().now();
+        let elapsed = |since: std::time::Instant| {
+            u64::try_from(
+                scope
+                    .clock()
+                    .now()
+                    .saturating_duration_since(since)
+                    .as_nanos(),
+            )
+            .unwrap_or(u64::MAX)
+        };
         let delivery = kind.direct().ok_or(Error::Internal)?;
+        // Stage timings are for host-read only; gpu-read shares this path.
+        let host = matches!(delivery, racer_wire::object::client::DirectDelivery::Host);
         let destination = kind.destination().ok_or(Error::Internal)?;
         let head = racer_wire::object::client::direct_head(
             &response.metadata,
@@ -744,6 +758,10 @@ impl Responses {
         } else {
             None
         };
+        if host && first.is_some() {
+            observation.add(Event::HostReadFirstPageNs, elapsed(started));
+            observation.add(Event::HostReadFirstPageCount, 1);
+        }
         connection.poison();
         connection = self.io.send_head(connection, head, scope).await?.connection;
         let mut sent = 0;
@@ -789,16 +807,8 @@ impl Responses {
                         let fetch = held.is_none() && fetched < expected && inflight.len() < depth;
                         let step = std::future::poll_fn(|cx| {
                             progress_scope.check()?;
-                            for page in inflight.iter_mut() {
-                                if page.result.is_none()
-                                    && let Poll::Ready(result) = page.write.as_mut().poll(cx)
-                                {
-                                    page.result = Some(result);
-                                }
-                            }
-                            if inflight.front().is_some_and(|page| page.result.is_some()) {
-                                return Poll::Ready(Ok(None));
-                            }
+                            // Start the next page first, so its decrypt can
+                            // overlap the ones already running.
                             if fetch {
                                 if let Poll::Ready(result) = stream.next_direct().as_mut().poll(cx)
                                 {
@@ -809,6 +819,16 @@ impl Responses {
                             } else {
                                 // Keep the fetch window moving while writes run.
                                 stream.poll_prefetch(cx);
+                            }
+                            for page in inflight.iter_mut() {
+                                if page.result.is_none()
+                                    && let Poll::Ready(result) = page.write.as_mut().poll(cx)
+                                {
+                                    page.result = Some(result);
+                                }
+                            }
+                            if inflight.front().is_some_and(|page| page.result.is_some()) {
+                                return Poll::Ready(Ok(None));
                             }
                             Poll::Pending
                         })
@@ -895,6 +915,9 @@ impl Responses {
                                     slice,
                                     offset,
                                 });
+                                observation
+                                    .add(Event::HostReadInflightPages, inflight.len() as u64);
+                                observation.add(Event::HostReadInflightPagesCount, 1);
                             }
                             Err(sealed) => {
                                 held = Some((
@@ -918,6 +941,10 @@ impl Responses {
         connection =
             send_frame(&self.io, connection, frame(2, pages, sent, 0), &final_scope).await?;
         observation.success();
+        if host {
+            observation.add(Event::HostReadRequestNs, elapsed(started));
+            observation.add(Event::HostReadRequestCount, 1);
+        }
         Ok(connection)
     }
 
