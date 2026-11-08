@@ -520,6 +520,7 @@ fn fused_job(
         mapping: Arc::new(mapping),
         destination: 0,
         stored: None,
+        numa: None,
     });
     (job, file, source)
 }

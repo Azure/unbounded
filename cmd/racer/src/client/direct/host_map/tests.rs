@@ -277,3 +277,30 @@ fn populated_chunks_are_tracked_per_mapping() {
     let again = HostMapping::new_in(&cache, &file, window(0, length)).unwrap();
     assert!(region_of(&again).is_populated(CHUNK + 5, 10));
 }
+
+/// Each buffer's locality maps to exactly one labeled event, and an empty or
+/// unknown buffer is never reported as local or remote.
+#[test]
+fn decrypt_numa_events_follow_locality() {
+    use crate::telemetry::Event as E;
+    let numa = DecryptNuma {
+        registered: Locality::Remote,
+        store: Locality::Local,
+        destination: Locality::Unknown,
+    };
+    assert_eq!(
+        numa.events(),
+        [
+            E::HostReadFusedNumaRegisteredRemote,
+            E::HostReadFusedNumaStoreLocal,
+            E::HostReadFusedNumaDestinationUnknown,
+        ]
+    );
+    assert_eq!(Locality::of(Some(0), &[]), Locality::Unknown);
+    let written = vec![7u8; 4096];
+    assert_eq!(Locality::of(None, &written), Locality::Unknown);
+    if let Some(node) = crate::affinity::page_numa_node(&written) {
+        assert_eq!(Locality::of(Some(node), &written), Locality::Local);
+        assert_eq!(Locality::of(Some(node + 1), &written), Locality::Remote);
+    }
+}

@@ -1982,6 +1982,9 @@ impl CryptoClient {
                 if job.fused() {
                     metrics.record(crate::telemetry::Event::HostReadFusedDecrypt, 1);
                 }
+                for event in job.numa.iter().flat_map(|numa| numa.events()) {
+                    metrics.record(event, 1);
+                }
             }
         }
         let observer = self.observer.borrow();

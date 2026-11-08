@@ -391,6 +391,15 @@ fn local_rails_are_ready_rails_on_the_worker_numa_node() {
     // A worker of unknown locality has no local rails.
     set_rail_numa(&w, Some(1));
     assert!(w.b.links.local_rails(&a).is_empty());
+    // A reader on another node (a host read's requesting worker) selects
+    // the rails on its node, whatever this worker's node is.
+    assert_eq!(w.a.links.rails_on(&b, Some(1)), vec![RAIL]);
+    assert!(w.a.links.rails_on(&b, Some(0)).is_empty());
+    assert!(w.a.links.rails_on(&b, None).is_empty());
+    Rc::get_mut(&mut w.a.links).unwrap().numa = Some(0);
+    assert!(w.a.links.local_rails(&b).is_empty());
+    assert_eq!(w.a.links.numa(), Some(0));
+    assert_eq!(w.a.links.rails_on(&b, Some(1)), vec![RAIL]);
 }
 
 #[test]

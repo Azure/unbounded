@@ -59,6 +59,49 @@ pub struct EffectiveTopology {
     pub nics: Vec<NicLocality>,
 }
 
+/// NUMA node of the CPU the calling thread runs on. None when the kernel
+/// does not report it. Pinned threads get a stable answer.
+pub fn current_numa_node() -> Option<usize> {
+    let (mut cpu, mut node) = (0u32, 0u32);
+    // SAFETY: getcpu writes one u32 through each of the first two pointers;
+    // the third (cache) argument is unused since Linux 2.6.24.
+    let status = unsafe {
+        libc::syscall(
+            libc::SYS_getcpu,
+            &raw mut cpu,
+            &raw mut node,
+            std::ptr::null_mut::<libc::c_void>(),
+        )
+    };
+    (status == 0).then_some(node as usize)
+}
+
+/// NUMA node of the physical page backing the first byte of `bytes`. None when the kernel
+/// does not say, for example when seccomp denies `get_mempolicy`. A page not
+/// yet allocated is faulted in as for a read, so call this on memory that
+/// has already been written.
+pub fn page_numa_node(bytes: &[u8]) -> Option<usize> {
+    let address = bytes.as_ptr();
+    const MPOL_F_NODE: libc::c_ulong = 1;
+    const MPOL_F_ADDR: libc::c_ulong = 2;
+    let mut node: libc::c_int = -1;
+    // SAFETY: with MPOL_F_NODE | MPOL_F_ADDR the kernel writes one int to
+    // `node` and reads no node mask (null, length 0). `address` is only
+    // looked up in the caller's address space, never dereferenced here. An
+    // empty slice's dangling address fails the lookup and reports None.
+    let status = unsafe {
+        libc::syscall(
+            libc::SYS_get_mempolicy,
+            &raw mut node,
+            std::ptr::null_mut::<libc::c_ulong>(),
+            0usize,
+            address,
+            MPOL_F_NODE | MPOL_F_ADDR,
+        )
+    };
+    (status == 0 && node >= 0).then_some(node as usize)
+}
+
 /// One lane and its NUMA-local shared helper execution placement.
 pub struct Placement {
     /// CPU that owns the lane's local graph.
@@ -364,6 +407,25 @@ mod placement_tests {
                     assert!(plan.iter().all(|p| p.lane.cpu != p.helper.cpu));
                 }
             }
+        }
+    }
+
+    /// The calling thread's node and a written page's node are reported on
+    /// Linux and agree for memory this thread first touched, unless the
+    /// kernel interleaves or binds it.
+    #[test]
+    fn numa_queries_report_nodes() {
+        let node = current_numa_node().expect("getcpu");
+        let online = std::fs::read_to_string("/sys/devices/system/node/online")
+            .ok()
+            .and_then(|list| parse_cpu_list(&list).ok());
+        if let Some(online) = &online {
+            assert!(online.contains(&node), "node {node} not online");
+        }
+        let page = vec![1u8; 4096];
+        // Seccomp may deny get_mempolicy; then the answer is unknown.
+        if let (Some(found), Some(online)) = (page_numa_node(&page), &online) {
+            assert!(online.contains(&found));
         }
     }
 

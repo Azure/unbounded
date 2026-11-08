@@ -572,13 +572,15 @@ impl Transfers {
                 .unwrap_or(&request.authentication.original)
                 .head,
         )?;
-        // Land the page on a rail whose NIC shares this worker's NUMA node
-        // when one is ready, so the NIC writes and this worker copies
-        // node-local memory. A GPU landing keeps the hashed rail, whose
-        // landing buffers were placed for that GPU.
+        // Land the page on a rail whose NIC shares the NUMA node of the
+        // thread that reads it when one is ready, so the NIC writes and the
+        // reader copies node-local memory. That is this worker, or for a host
+        // read the requesting worker (`reader_numa`), whose crypto helpers
+        // decrypt the registered buffer. A GPU landing keeps the hashed rail,
+        // whose landing buffers were placed for that GPU.
         let rail = if landing.is_none() {
             let local: Vec<_> = links
-                .local_rails(&peer)
+                .rails_on(&peer, scope.reader_numa.map(usize::from).or(links.numa()))
                 .into_iter()
                 .filter(|&r| {
                     crate::rdma::admits_rail(plan, membership, self.signatures.node(), &peer, r)

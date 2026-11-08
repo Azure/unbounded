@@ -32,6 +32,8 @@ use std::sync::Arc;
 mod host_map;
 pub use host_map::DecryptInto;
 pub(crate) use host_map::HostMapping;
+#[cfg(test)]
+pub(crate) use host_map::Locality;
 pub(crate) use host_map::MappingCache;
 
 /// The fewest pages the dataplane fetches ahead for one direct read. Clients
@@ -283,6 +285,7 @@ async fn decrypt_into_mapping(
         mapping,
         destination,
         stored: None,
+        numa: None,
     });
     let mut job = crypto.decrypt_into(job, scope).await?;
     // Hand a fused copy to the verdict's owner, then drop the ciphertext (and

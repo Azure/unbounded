@@ -732,6 +732,19 @@ Racer-Destination-Length: <length>
   page out of the receive buffer, for example a plaintext or GPU read of the
   same page), or `reservation` (ciphertext admission refused the copy, so the
   page is copied out before the decrypt instead).
+  Each page of a host read is fetched by the page's owning worker, which may
+  be on the other NUMA node from the requesting worker whose crypto helpers
+  decrypt it. The owning worker therefore lands an RDMA page on a rail whose
+  NIC is on the requesting worker's NUMA node when such a rail is ready, so
+  the receive buffer is local to the decrypt.
+  `racer_host_read_fused_numa_pages_total` counts fused pages by `buffer`
+  (`registered` for the RDMA receive buffer, `store` for the ciphertext cache
+  copy, `destination` for the client's memfd) and `locality`: `local` when
+  the buffer's first page is on the NUMA node of the crypto helper that
+  decrypted it, `remote` when it is on another node, and `unknown` when the
+  kernel does not report either node (for example when seccomp denies
+  `get_mempolicy`). A steady `remote` share means the decrypt reads or writes
+  memory across the socket interconnect.
 - The dataplane keeps mappings of such files in a process-wide cache keyed
   by the file's device and inode, so repeated requests for the same `memfd`
   (for example, parallel ranges of one buffer, or a pooled buffer reused for

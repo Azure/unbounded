@@ -513,6 +513,86 @@ pub struct DecryptInto {
     /// The page's fused store once [`Self::run`] has filled and
     /// authenticated it.
     pub(crate) stored: Option<crate::memory::CiphertextBuffer>,
+
+    /// Where a fused [`Self::run`] found its memory, relative to the crypto
+    /// helper that ran it. None for other pages.
+    pub(crate) numa: Option<DecryptNuma>,
+}
+
+/// Whether one buffer is on the NUMA node of the CPU that read or wrote it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum Locality {
+    /// The CPU's or the memory's node is not reported.
+    #[default]
+    Unknown,
+    Local,
+    Remote,
+}
+
+impl Locality {
+    fn of(cpu: Option<usize>, bytes: &[u8]) -> Self {
+        let memory = (!bytes.is_empty())
+            .then(|| crate::affinity::page_numa_node(bytes))
+            .flatten();
+        match (cpu, memory) {
+            (Some(cpu), Some(memory)) if cpu == memory => Self::Local,
+            (Some(_), Some(_)) => Self::Remote,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// NUMA locality of the three buffers of one fused host-read decrypt. Each is
+/// sampled at its first byte; a 16 MiB buffer may span nodes only under an
+/// interleave policy.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct DecryptNuma {
+    /// The registered RDMA receive buffer the page is read from.
+    pub(crate) registered: Locality,
+
+    /// The ciphertext store the page is copied into.
+    pub(crate) store: Locality,
+
+    /// The client's mapped destination the plaintext is written to.
+    pub(crate) destination: Locality,
+}
+
+impl DecryptNuma {
+    /// The events to count for this decrypt.
+    pub(crate) fn events(self) -> [crate::telemetry::Event; 3] {
+        use crate::telemetry::Event as E;
+        let pick = |locality, [local, remote, unknown]: [E; 3]| match locality {
+            Locality::Local => local,
+            Locality::Remote => remote,
+            Locality::Unknown => unknown,
+        };
+        [
+            pick(
+                self.registered,
+                [
+                    E::HostReadFusedNumaRegisteredLocal,
+                    E::HostReadFusedNumaRegisteredRemote,
+                    E::HostReadFusedNumaRegisteredUnknown,
+                ],
+            ),
+            pick(
+                self.store,
+                [
+                    E::HostReadFusedNumaStoreLocal,
+                    E::HostReadFusedNumaStoreRemote,
+                    E::HostReadFusedNumaStoreUnknown,
+                ],
+            ),
+            pick(
+                self.destination,
+                [
+                    E::HostReadFusedNumaDestinationLocal,
+                    E::HostReadFusedNumaDestinationRemote,
+                    E::HostReadFusedNumaDestinationUnknown,
+                ],
+            ),
+        ]
+    }
 }
 
 impl DecryptInto {
@@ -579,6 +659,14 @@ impl DecryptInto {
                 &mut page_alloc::stream::copy_nontemporal,
             )
             .map_err(|_| Error::CorruptRecord)?;
+            // Three syscalls per page (up to 16 MiB): every buffer is
+            // populated by now, so none faults.
+            let cpu = crate::affinity::current_numa_node();
+            self.numa = Some(DecryptNuma {
+                registered: Locality::of(cpu, bytes),
+                store: Locality::of(cpu, store.as_mut_slice()),
+                destination: Locality::of(cpu, destination),
+            });
             self.stored = Some(store);
             return Ok(());
         }

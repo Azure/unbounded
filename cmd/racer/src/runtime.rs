@@ -112,6 +112,14 @@ pub struct RequestScope {
     /// held behind heads cannot use up a worker's share while the heads wait.
     /// Children inherit it.
     pub(crate) ahead: bool,
+    /// NUMA node of the thread that will read the page's received bytes, when
+    /// that is not the worker that fetches them: a host read decrypts its
+    /// pages on the requesting worker's crypto helpers, while each page is
+    /// fetched by its owning worker. The fetching worker lands RDMA pages on a
+    /// rail whose NIC is on this node, so the registered receive buffer is
+    /// local to the decrypt. None means the fetching worker's own node.
+    /// Children inherit it.
+    pub(crate) reader_numa: Option<u16>,
 }
 impl RequestScope {
     /// The scope's clock.
@@ -225,6 +233,7 @@ impl RequestScope {
             body_deadlines: None,
             clock,
             ahead: false,
+            reader_numa: None,
         })
     }
 

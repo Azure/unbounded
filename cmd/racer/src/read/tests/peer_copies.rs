@@ -3147,9 +3147,15 @@ fn sealing_registered_ciphertext_for_a_host_sink_detaches_during_decrypt() {
         mapping: std::sync::Arc::new(mapping),
         destination: 0,
         stored: None,
+        numa: None,
     });
     job.run().unwrap();
     assert!(job.fused());
+    // Every buffer was written by this thread, so none is on another node.
+    let numa = job.numa.expect("a fused decrypt samples NUMA locality");
+    for locality in [numa.registered, numa.store, numa.destination] {
+        assert_ne!(locality, crate::client::direct::Locality::Remote);
+    }
     let mut plaintext = vec![0; length as usize];
     file.read_exact_at(&mut plaintext, 0).unwrap();
     assert_eq!(plaintext, b"abc");

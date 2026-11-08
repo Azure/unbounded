@@ -457,6 +457,15 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::HostReadFusedSkippedNotRegistered => "racer_host_read_fused_skipped_total" { "reason=\"not_registered\"" },
             Self::HostReadFusedSkippedRetained => "racer_host_read_fused_skipped_total" { "reason=\"retained\"" },
             Self::HostReadFusedSkippedReservation => "racer_host_read_fused_skipped_total" { "reason=\"reservation\"" },
+            Self::HostReadFusedNumaRegisteredLocal => "racer_host_read_fused_numa_pages_total" { "buffer=\"registered\",locality=\"local\"" },
+            Self::HostReadFusedNumaRegisteredRemote => "racer_host_read_fused_numa_pages_total" { "buffer=\"registered\",locality=\"remote\"" },
+            Self::HostReadFusedNumaRegisteredUnknown => "racer_host_read_fused_numa_pages_total" { "buffer=\"registered\",locality=\"unknown\"" },
+            Self::HostReadFusedNumaStoreLocal => "racer_host_read_fused_numa_pages_total" { "buffer=\"store\",locality=\"local\"" },
+            Self::HostReadFusedNumaStoreRemote => "racer_host_read_fused_numa_pages_total" { "buffer=\"store\",locality=\"remote\"" },
+            Self::HostReadFusedNumaStoreUnknown => "racer_host_read_fused_numa_pages_total" { "buffer=\"store\",locality=\"unknown\"" },
+            Self::HostReadFusedNumaDestinationLocal => "racer_host_read_fused_numa_pages_total" { "buffer=\"destination\",locality=\"local\"" },
+            Self::HostReadFusedNumaDestinationRemote => "racer_host_read_fused_numa_pages_total" { "buffer=\"destination\",locality=\"remote\"" },
+            Self::HostReadFusedNumaDestinationUnknown => "racer_host_read_fused_numa_pages_total" { "buffer=\"destination\",locality=\"unknown\"" },
             Self::GpuReadGpu => "racer_gpu_read_requests_total" { "outcome=\"gpu\"" },
             Self::GpuReadNotEnabled => "racer_gpu_read_requests_total" { "outcome=\"not_enabled\"" },
             Self::GpuReadWrongDevice => "racer_gpu_read_requests_total" { "outcome=\"wrong_device\"" },
@@ -2170,6 +2179,7 @@ mod tests {
                         && !line.starts_with("racer_rdma_owner_immediate_wakes_total{")
                         && !line.starts_with("racer_dirty_discard_reasons_total{")
                         && !line.starts_with("racer_host_read_fused_skipped_total{")
+                        && !line.starts_with("racer_host_read_fused_numa_pages_total{")
                         && !line.starts_with("racer_origin_walk_reasons_total{")
                         && !line.starts_with("racer_prefetch_")
                 })

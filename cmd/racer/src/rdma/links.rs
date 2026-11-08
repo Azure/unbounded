@@ -470,10 +470,21 @@ impl Links {
         self
     }
 
+    /// This worker's NUMA node, if known.
+    pub fn numa(&self) -> Option<usize> {
+        self.numa
+    }
+
     /// Rails whose NIC is on this worker's NUMA node and whose link to
     /// `peer` is ready. Empty when the worker's node is unknown.
     pub fn local_rails(&self, peer: &NodeId) -> Vec<RailId> {
-        let Some(numa) = self.numa else {
+        self.rails_on(peer, self.numa)
+    }
+
+    /// Rails whose NIC is on NUMA node `numa` and whose link to `peer` is
+    /// ready. Empty when `numa` is unknown.
+    pub fn rails_on(&self, peer: &NodeId, numa: Option<usize>) -> Vec<RailId> {
+        let Some(numa) = numa else {
             return Vec::new();
         };
         self.active()

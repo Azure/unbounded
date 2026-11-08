@@ -1043,6 +1043,16 @@ impl RangeStream {
         let mut child_scope = scope.clone();
         child_scope.deadline.0 = budget.deadline();
         child_scope.ahead = self.ahead(number);
+        // A host read decrypts on this worker's crypto helpers, so the owning
+        // worker should land the page in memory on this worker's NUMA node.
+        if self
+            .sealed
+            .as_ref()
+            .is_some_and(|target| target.helper.is_none())
+        {
+            child_scope.reader_numa =
+                crate::affinity::current_numa_node().and_then(|node| u16::try_from(node).ok());
+        }
         let reactor = self.delivery.reactor().clone();
         let page = self.page_id(number);
         let io = match &self.sealed {
