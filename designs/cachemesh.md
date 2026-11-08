@@ -675,6 +675,19 @@ caller which data-plane connections to keep; removals are delayed by
 
 Per-request cost targets (benchmarked): `Route` on a 100k view under 100ns and
 zero allocations; `Observe` under 50ns and zero allocations; `Fresh` a few ns.
+`BenchmarkMesh` in `internal/cachemesh` measures them (`Route` over 1,024
+keys, `ObserveParallel` with every goroutine reporting on one peer, the worst
+case); `BenchmarkRouteWide` routes 1M distinct keys, where the owner lookup
+and the owner's member record usually miss every cache level and the cost is
+a few DRAM latencies, and routes from 16 different members in turn.
+
+The route package keeps the per-request work small: when `health.AllHealthy`
+holds it ranks candidates without per-peer `Usable` lookups, it keeps this
+member's cell coordinates in the `State` so only the owner's cell is divided,
+the table lookup reads only the owner column, and decisions are filled in
+place field by field (`State.RouteTo`, `RouteHashTo`, `ForwardTo`, which the
+public methods use): building a `PeerRef` or `Decision` value and copying it
+stalls on store-to-load forwarding.
 
 ### Public API (`internal/cachemesh`)
 
