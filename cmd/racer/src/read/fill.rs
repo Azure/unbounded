@@ -126,6 +126,11 @@ pub struct Fill {
 
     diagnostic: Option<DriverDiagnostic>,
     fence_acquisition: bool,
+    /// Set for a host-read sealed fetch. An elected driver that acquires a
+    /// registered RDMA page then leaves it out of the memory cache, so the
+    /// host-read sink's fused pass makes the only copy; the verdict
+    /// publishes that copy. See [`Self::publish_acquired_ciphertext`].
+    pub(super) defer_registered_publish: bool,
     /// Timers for waiting out local plaintext pressure. Without one, a network fill fails
     /// `Overloaded` once its reclaim attempt cannot make room.
     plaintext_wait: Option<Rc<crate::runtime::Reactor>>,
@@ -989,6 +994,7 @@ impl Fill {
             gpu_copies: Rc::default(),
             diagnostic: None,
             fence_acquisition: false,
+            defer_registered_publish: false,
             plaintext_wait: None,
         }
     }
@@ -1123,7 +1129,11 @@ impl Fill {
         {
             return Ok(fetched);
         }
-        let acquired = self
+        // A host sink copies a registered page out during its decrypt, so
+        // an elected driver must not copy it out first for the memory cache.
+        let mut host = self.clone();
+        host.defer_registered_publish = target.helper.is_none();
+        let acquired = host
             .acquire_with_prefetch(
                 page.clone(),
                 membership.clone(),
@@ -1575,6 +1585,12 @@ impl Fill {
             if let Some(copy) = copy
                 && copy.disk_token.is_none()
             {
+                // A host-read fetch may have left a registered page out of
+                // the memory cache; cache its authenticated detached copy.
+                // A page already cached is left as it is.
+                if !copy.copy.ciphertext.is_registered() {
+                    let _ = self.dependencies.memory.publish_ciphertext(copy.clone());
+                }
                 let interest = crate::retention::Interest::default();
                 let observation = self.retention_observation(&page, &interest, false);
                 self.persist_copy(copy.copy, observation);
@@ -1975,13 +1991,7 @@ impl Fill {
                         fill.persist_verified(page, observation);
                     }
                     if let AcquiredPage::Ciphertext(copy) = &result {
-                        match fill.dependencies.memory.publish_ciphertext(copy.clone()) {
-                            Ok(()) => {}
-                            Err(error)
-                                if racer_core::read::Error::try_from(error)
-                                    .is_ok_and(racer_core::read::ciphertext_publish_tolerated) => {}
-                            Err(error) => return Err(error),
-                        }
+                        fill.publish_acquired_ciphertext(copy)?;
                     }
                     let _ = flights.publish_acquired(leader, result);
                 }
@@ -1998,7 +2008,7 @@ impl Fill {
                 }
             }
             let _ = send.send(owned_budget);
-            Ok(())
+            Ok::<(), Error>(())
         }));
         let remaining = std::future::poll_fn(|cx| {
             self.dependencies.candidates.drivers().poll(cx, 64);
@@ -2895,31 +2905,61 @@ impl Fill {
             .map_or(capacity, |aligned| aligned.max(capacity))
     }
 
-    /// Copy an authenticated registered RDMA page once into pooled aligned
-    /// storage before it is published and persisted, so the memory cache and
-    /// the store share one page and the RDMA buffer returns to its pool.
-    ///
-    /// Copy-out admission is optional: when it is refused even after
-    /// reclamation, the registered page is kept and the memory cache and
-    /// store copy it out under their own admission as before.
+    /// Publish an elected acquisition's ciphertext to the memory cache. A
+    /// host-read sealed fetch skips a registered page: publishing copies it
+    /// out of the RDMA buffer, which would leave the sink's fused pass
+    /// nothing to do and read the page twice. Its verdict publishes the
+    /// detached copy instead ([`Self::sealed_verdict`]).
+    pub(super) fn publish_acquired_ciphertext(&self, copy: &UnverifiedPage) -> Result<()> {
+        if self.defer_registered_publish
+            && copy.copy.ciphertext.is_registered()
+            && copy.copy.ciphertext.retained_copy().is_none()
+        {
+            return Ok(());
+        }
+        match self.dependencies.memory.publish_ciphertext(copy.clone()) {
+            Ok(()) => Ok(()),
+            Err(error)
+                if racer_core::read::Error::try_from(error)
+                    .is_ok_and(racer_core::read::ciphertext_publish_tolerated) =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Empty aligned storage to detach registered `ciphertext` into during
     /// its host-read decrypt. None when the page is not registered, already
-    /// has a copy, or the storage cannot be reserved.
+    /// has a copy, or the storage cannot be reserved; the reason is counted
+    /// in `racer_host_read_fused_skipped_total`.
     fn fused_store(
         &self,
         ciphertext: &crate::memory::CiphertextPage,
     ) -> Option<crate::memory::CiphertextBuffer> {
-        if !ciphertext.is_registered() || ciphertext.retained_copy().is_some() {
+        if !ciphertext.is_registered() {
+            self.metrics
+                .record(Event::HostReadFusedSkippedNotRegistered, 1);
+            return None;
+        }
+        if ciphertext.retained_copy().is_some() {
+            self.metrics.record(Event::HostReadFusedSkippedRetained, 1);
             return None;
         }
         let buffers = &self.dependencies.buffers;
         let length = ciphertext.bytes().len();
-        let capacity = buffers.aligned_capacity(length).ok()?;
         let cache = &ciphertext.envelope().page.version.object.cache;
-        let reservation = self
-            .reserve_with_reclamation(cache, ResourceClass::Ciphertext, capacity)
-            .ok()?;
-        buffers.aligned_ciphertext(reservation, length).ok()
+        let store = buffers.aligned_capacity(length).ok().and_then(|capacity| {
+            let reservation = self
+                .reserve_with_reclamation(cache, ResourceClass::Ciphertext, capacity)
+                .ok()?;
+            buffers.aligned_ciphertext(reservation, length).ok()
+        });
+        if store.is_none() {
+            self.metrics
+                .record(Event::HostReadFusedSkippedReservation, 1);
+        }
+        store
     }
 
     fn detach_registered(

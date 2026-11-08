@@ -3162,6 +3162,148 @@ fn sealing_registered_ciphertext_for_a_host_sink_detaches_during_decrypt() {
     assert_eq!(free_buffers(&w), Some(2), "released once the pass ends");
     f.fill.sealed_verdict(report, true);
     assert_eq!(crate::memory::registered_copy_outs(), copies + 1);
+    // The verdict caches the detached copy, not the registered buffer.
+    let cached = f
+        .fill
+        .dependencies
+        .memory
+        .unverified(&f.page)
+        .unwrap()
+        .expect("cached after the verdict");
+    assert!(!cached.copy.ciphertext.is_registered());
+    assert_eq!(
+        f.fill
+            .metrics
+            .count(Event::HostReadFusedSkippedNotRegistered),
+        0
+    );
+    assert_eq!(f.fill.metrics.count(Event::HostReadFusedSkippedRetained), 0);
+    assert_eq!(
+        f.fill.metrics.count(Event::HostReadFusedSkippedReservation),
+        0
+    );
+}
+
+/// An elected driver for a host-read fetch leaves a registered page out of
+/// the memory cache, so the page reaches the host sink still registered and
+/// with no retained copy, and is fused. Other acquisitions publish it, which
+/// copies it out of the RDMA buffer.
+#[test]
+fn host_read_acquisition_defers_registered_publish_so_the_sink_fuses() {
+    let env = racer_io::Env::host();
+    let mut f = fixture_with(&env, 3, None);
+    let mut w = crate::rdma::links::tests::world_for(
+        [
+            crate::rdma::links::tests::node_id(1),
+            crate::rdma::links::tests::node_id(2),
+        ],
+        false,
+    );
+    let env = w.env.clone();
+    crate::rdma::links::tests::link_up(&env, &mut w);
+    let good = encrypted_copy(&mut f);
+    let bytes = good.ciphertext.bytes().to_vec();
+
+    // Deferred: nothing copied, nothing cached, and the sink fuses.
+    let mut host = f.fill.clone();
+    host.defer_registered_publish = true;
+    let page = crate::memory::UnverifiedPage {
+        copy: registered_copy(&env, &f, &mut w, &good, bytes.clone()),
+        disk_token: None,
+    };
+    let copies = crate::memory::registered_copy_outs();
+    host.publish_acquired_ciphertext(&page).unwrap();
+    assert_eq!(crate::memory::registered_copy_outs(), copies);
+    assert!(
+        f.fill
+            .dependencies
+            .memory
+            .unverified(&f.page)
+            .unwrap()
+            .is_none()
+    );
+    let sealed = host.seal(&f.page, page, true).unwrap();
+    assert!(sealed.fused_store.is_some());
+    drop(sealed);
+
+    // Not deferred: publishing copies the page out, so the sink skips the
+    // fused pass and counts why.
+    let page = crate::memory::UnverifiedPage {
+        copy: registered_copy(&env, &f, &mut w, &good, bytes),
+        disk_token: None,
+    };
+    let copies = crate::memory::registered_copy_outs();
+    f.fill.publish_acquired_ciphertext(&page).unwrap();
+    assert_eq!(crate::memory::registered_copy_outs(), copies + 1);
+    assert!(page.copy.ciphertext.retained_copy().is_some());
+    assert!(
+        f.fill
+            .dependencies
+            .memory
+            .unverified(&f.page)
+            .unwrap()
+            .is_some()
+    );
+    let retained = f.fill.metrics.count(Event::HostReadFusedSkippedRetained);
+    let sealed = f.fill.seal(&f.page, page, true).unwrap();
+    assert!(sealed.fused_store.is_none());
+    assert_eq!(
+        f.fill.metrics.count(Event::HostReadFusedSkippedRetained),
+        retained + 1
+    );
+    drop(sealed);
+
+    // A page that is not registered (memory, disk, HTTP) is not fused.
+    let skipped = f
+        .fill
+        .metrics
+        .count(Event::HostReadFusedSkippedNotRegistered);
+    let sealed = f
+        .fill
+        .seal(
+            &f.page,
+            crate::memory::UnverifiedPage {
+                copy: good.clone(),
+                disk_token: None,
+            },
+            true,
+        )
+        .unwrap();
+    assert!(sealed.fused_store.is_none());
+    assert_eq!(
+        f.fill
+            .metrics
+            .count(Event::HostReadFusedSkippedNotRegistered),
+        skipped + 1
+    );
+}
+
+/// A rejected host-read page is never cached by its verdict.
+#[test]
+fn rejected_host_read_page_is_not_cached() {
+    let env = racer_io::Env::host();
+    let mut f = fixture_with(&env, 3, None);
+    let good = encrypted_copy(&mut f);
+    let sealed = f
+        .fill
+        .seal(
+            &f.page,
+            crate::memory::UnverifiedPage {
+                copy: good,
+                disk_token: None,
+            },
+            true,
+        )
+        .unwrap();
+    f.fill.sealed_verdict(sealed.report(), false);
+    assert!(
+        f.fill
+            .dependencies
+            .memory
+            .unverified(&f.page)
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
@@ -3207,6 +3349,52 @@ fn registered_copy_out_refused_by_admission_keeps_the_registered_page() {
     drop(held);
     crate::rdma::links::tests::pump(&mut w.a.owner, &mut w.b.owner);
     assert_eq!(free_buffers(&w), Some(2));
+}
+
+/// When ciphertext admission refuses the fused store, a host-read page is
+/// sealed without it and the reason is counted.
+#[test]
+fn host_read_fused_store_refused_by_admission_is_counted() {
+    let env = racer_io::Env::host();
+    let mut f = fixture_with(&env, 3, None);
+    let mut w = crate::rdma::links::tests::world_for(
+        [
+            crate::rdma::links::tests::node_id(1),
+            crate::rdma::links::tests::node_id(2),
+        ],
+        false,
+    );
+    let env = w.env.clone();
+    crate::rdma::links::tests::link_up(&env, &mut w);
+    let good = encrypted_copy(&mut f);
+    let copy = registered_copy(&env, &f, &mut w, &good, good.ciphertext.bytes().to_vec());
+    let admission = f.fill.dependencies.admission.clone();
+    let cache = f.context.object.cache.clone();
+    let mut held = Vec::new();
+    for amount in [65536, 4096, 1] {
+        while let Ok(charge) = admission.reserve(Some(&cache), ResourceClass::Ciphertext, amount) {
+            held.push(charge);
+        }
+    }
+    let refused = f.fill.metrics.count(Event::HostReadFusedSkippedReservation);
+    let sealed = f
+        .fill
+        .seal(
+            &f.page,
+            crate::memory::UnverifiedPage {
+                copy,
+                disk_token: None,
+            },
+            true,
+        )
+        .unwrap();
+    assert!(sealed.fused_store.is_none());
+    assert_eq!(
+        f.fill.metrics.count(Event::HostReadFusedSkippedReservation),
+        refused + 1
+    );
+    drop(sealed);
+    drop(held);
 }
 
 /// GPU landing for `gpu-read` (GPUDirect RDMA) through `Fill::acquire_sealed`.

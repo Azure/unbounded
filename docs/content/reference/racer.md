@@ -712,7 +712,14 @@ Racer-Destination-Length: <length>
   the received bytes are read from memory once. The receive buffer is held
   until that pass ends. A page that fails authentication is not cached or
   persisted. `racer_host_read_fused_decrypt_pages_total` counts pages
-  decrypted this way.
+  decrypted this way. Such a page enters the memory cache only after it
+  passes authentication. `racer_host_read_fused_skipped_total` counts host-read pages
+  decrypted without the fused pass, by `reason`: `not_registered` (the page
+  came from memory, disk, or HTTP rather than an RDMA receive buffer, which
+  is expected for local hits), `retained` (another reader already copied the
+  page out of the receive buffer, for example a plaintext or GPU read of the
+  same page), or `reservation` (ciphertext admission refused the copy, so the
+  page is copied out before the decrypt instead).
 - The dataplane keeps mappings of such files in a process-wide cache keyed
   by the file's device and inode, so repeated requests for the same `memfd`
   (for example, parallel ranges of one buffer, or a pooled buffer reused for

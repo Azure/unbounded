@@ -430,6 +430,9 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::HostReadDirectDecrypt => "racer_host_read_direct_decrypt_pages_total",
             Self::HostReadDirectDecryptBytes => "racer_host_read_direct_decrypt_bytes_total",
             Self::HostReadFusedDecrypt => "racer_host_read_fused_decrypt_pages_total",
+            Self::HostReadFusedSkippedNotRegistered => "racer_host_read_fused_skipped_total" { "reason=\"not_registered\"" },
+            Self::HostReadFusedSkippedRetained => "racer_host_read_fused_skipped_total" { "reason=\"retained\"" },
+            Self::HostReadFusedSkippedReservation => "racer_host_read_fused_skipped_total" { "reason=\"reservation\"" },
             Self::GpuReadGpu => "racer_gpu_read_requests_total" { "outcome=\"gpu\"" },
             Self::GpuReadNotEnabled => "racer_gpu_read_requests_total" { "outcome=\"not_enabled\"" },
             Self::GpuReadWrongDevice => "racer_gpu_read_requests_total" { "outcome=\"wrong_device\"" },
@@ -2131,6 +2134,7 @@ mod tests {
                         && !line.starts_with("racer_rdma_plan_http_total{")
                         && !line.starts_with("racer_rdma_send_declined_total{")
                         && !line.starts_with("racer_dirty_discard_reasons_total{")
+                        && !line.starts_with("racer_host_read_fused_skipped_total{")
                         && !line.starts_with("racer_origin_walk_reasons_total{")
                         && !line.starts_with("racer_prefetch_")
                 })
