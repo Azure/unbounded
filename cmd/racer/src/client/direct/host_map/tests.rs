@@ -74,3 +74,206 @@ fn bytes_stay_inside_the_window_and_reach_the_file() {
     assert!(contents[5000..8000].iter().all(|&b| b == 7));
     assert!(contents[8000..].iter().all(|&b| b == 0));
 }
+
+fn cache(max_entries: usize, max_bytes: u64) -> MappingCache {
+    MappingCache::new(max_entries, max_bytes, Duration::from_secs(5))
+}
+
+fn region_of(mapping: &HostMapping) -> &Arc<Region> {
+    mapping.region.as_ref().unwrap()
+}
+
+#[test]
+fn cache_reuses_a_mapping_of_the_same_file() {
+    let cache = cache(8, 1 << 30);
+    let file = memfd(8192, libc::F_SEAL_SHRINK);
+    let first = HostMapping::new_in(&cache, &file, window(0, 4096)).unwrap();
+    let second = HostMapping::new_in(&cache, &file, window(4096, 4096)).unwrap();
+    assert!(Arc::ptr_eq(region_of(&first), region_of(&second)));
+    // Another descriptor for the same file shares the mapping too.
+    let path = format!("/proc/self/fd/{}", file.as_raw_fd());
+    let reopened = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    let third = HostMapping::new_in(&cache, &reopened, window(0, 8192)).unwrap();
+    assert!(Arc::ptr_eq(region_of(&first), region_of(&third)));
+    let stats = cache.stats();
+    assert_eq!((stats.created, stats.reuses), (1, 2));
+    assert_eq!((stats.cached, stats.cached_bytes), (1, 8192));
+
+    let other = memfd(4096, libc::F_SEAL_SHRINK);
+    let fourth = HostMapping::new_in(&cache, &other, window(0, 4096)).unwrap();
+    assert!(!Arc::ptr_eq(region_of(&first), region_of(&fourth)));
+    assert_eq!(cache.stats().created, 2);
+}
+
+#[test]
+fn cache_checks_every_request() {
+    let cache = cache(8, 1 << 30);
+    let file = memfd(8192, libc::F_SEAL_SHRINK);
+    assert!(HostMapping::new_in(&cache, &file, window(0, 4096)).is_some());
+    // A read-only descriptor for the cached file is still refused.
+    let path = format!("/proc/self/fd/{}", file.as_raw_fd());
+    let read_only = std::fs::File::open(&path).unwrap();
+    assert!(HostMapping::new_in(&cache, &read_only, window(0, 4096)).is_none());
+    // So is a window past the end of the file.
+    assert!(HostMapping::new_in(&cache, &file, window(4096, 8192)).is_none());
+    // A later write seal stops reuse.
+    assert_eq!(
+        unsafe { libc::fcntl(file.as_raw_fd(), libc::F_ADD_SEALS, libc::F_SEAL_WRITE) },
+        -1,
+        "a writable shared mapping blocks F_SEAL_WRITE"
+    );
+    let unsealed = memfd(8192, 0);
+    assert!(HostMapping::new_in(&cache, &unsealed, window(0, 4096)).is_none());
+    assert_eq!(cache.stats().reuses, 0);
+}
+
+#[test]
+fn cache_remaps_a_file_that_grew() {
+    use std::os::unix::fs::FileExt;
+    let cache = cache(8, 1 << 30);
+    let file = memfd(4096, libc::F_SEAL_SHRINK);
+    let small = HostMapping::new_in(&cache, &file, window(0, 4096)).unwrap();
+    file.set_len(3 * 4096).unwrap();
+    let large = HostMapping::new_in(&cache, &file, window(4096, 8192)).unwrap();
+    assert!(!Arc::ptr_eq(region_of(&small), region_of(&large)));
+    assert_eq!(region_of(&large).length, 3 * 4096);
+    let stats = cache.stats();
+    assert_eq!(
+        (stats.created, stats.cached, stats.cached_bytes),
+        (2, 1, 3 * 4096)
+    );
+    // The old mapping still works for its request.
+    unsafe { small.bytes_mut(0, 4096).unwrap().fill(1) };
+    unsafe { large.bytes_mut(4096, 8192).unwrap().fill(2) };
+    let mut contents = vec![0; 3 * 4096];
+    file.read_exact_at(&mut contents, 0).unwrap();
+    assert!(contents[..4096].iter().all(|&b| b == 1));
+    assert!(contents[4096..].iter().all(|&b| b == 2));
+    // Small windows reuse the larger mapping.
+    let again = HostMapping::new_in(&cache, &file, window(0, 10)).unwrap();
+    assert!(Arc::ptr_eq(region_of(&again), region_of(&large)));
+}
+
+#[test]
+fn cache_evicts_least_recently_used_beyond_its_caps() {
+    let cache = cache(2, 1 << 30);
+    let files: Vec<_> = (0..3).map(|_| memfd(4096, libc::F_SEAL_SHRINK)).collect();
+    let first = HostMapping::new_in(&cache, &files[0], window(0, 4096)).unwrap();
+    let held = region_of(&first).clone();
+    drop(first);
+    HostMapping::new_in(&cache, &files[1], window(0, 4096)).unwrap();
+    HostMapping::new_in(&cache, &files[2], window(0, 4096)).unwrap();
+    let stats = cache.stats();
+    assert_eq!((stats.cached, stats.evicted), (2, 1));
+    // The evicted mapping stays valid while something holds it.
+    assert!(Arc::strong_count(&held) >= 1);
+    unsafe { std::slice::from_raw_parts_mut(held.base.as_ptr(), 4096).fill(3) };
+    // The byte cap evicts too.
+    let cache = super::tests::cache(8, 8192);
+    let files: Vec<_> = (0..3).map(|_| memfd(4096, libc::F_SEAL_SHRINK)).collect();
+    for file in &files {
+        HostMapping::new_in(&cache, file, window(0, 4096)).unwrap();
+    }
+    let stats = cache.stats();
+    assert_eq!(
+        (stats.cached, stats.cached_bytes, stats.evicted),
+        (2, 8192, 1)
+    );
+    // A file larger than the byte cap is mapped but not cached.
+    let big = memfd(3 * 4096, libc::F_SEAL_SHRINK);
+    let mapping = HostMapping::new_in(&cache, &big, window(0, 4096)).unwrap();
+    assert_eq!(Arc::strong_count(region_of(&mapping)), 1);
+}
+
+#[test]
+fn cache_evicts_idle_mappings_but_not_ones_in_use() {
+    let cache = cache(8, 1 << 30);
+    let busy = memfd(4096, libc::F_SEAL_SHRINK);
+    let idle = memfd(4096, libc::F_SEAL_SHRINK);
+    let in_use = HostMapping::new_in(&cache, &busy, window(0, 4096)).unwrap();
+    drop(HostMapping::new_in(&cache, &idle, window(0, 4096)).unwrap());
+    // HostMapping::drop hands the region to the reaper; wait for it to let go.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let later = Instant::now() + Duration::from_secs(6);
+    let mut evicted = Vec::new();
+    while evicted.is_empty() && Instant::now() < deadline {
+        evicted = cache.take_idle(later);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(evicted.len(), 1);
+    assert!(cache.take_idle(Instant::now()).is_empty(), "not idle yet");
+    let stats = cache.stats();
+    assert_eq!((stats.cached, stats.evicted), (1, 1));
+    unsafe { in_use.bytes_mut(0, 4096).unwrap().fill(1) };
+    drop(in_use);
+}
+
+/// Compare mapping, populating, and unmapping a 64 MiB window per request
+/// with reusing a cached mapping. Run with
+/// `cargo test -p racer --release --lib host_map_bench -- --ignored --nocapture`.
+#[test]
+#[ignore = "benchmark"]
+fn host_map_bench() {
+    const WINDOW: u64 = 64 << 20;
+    const SIZE: u64 = 4 << 30;
+    const ROUNDS: usize = 4;
+    let file = memfd(0, 0);
+    file.set_len(SIZE).unwrap();
+    assert_eq!(
+        unsafe { libc::fcntl(file.as_raw_fd(), libc::F_ADD_SEALS, libc::F_SEAL_SHRINK) },
+        0
+    );
+    let run = |cache: &MappingCache| {
+        let started = Instant::now();
+        for _ in 0..ROUNDS {
+            for offset in (0..SIZE).step_by(WINDOW as usize) {
+                let mapping = HostMapping::new_in(cache, &file, window(offset, WINDOW)).unwrap();
+                let bytes = unsafe { mapping.bytes_mut(offset, WINDOW as usize).unwrap() };
+                mapping.populate(offset, bytes).unwrap();
+                // Unmap here, as the uncached path did per request.
+                let region = mapping.region.as_ref().unwrap().clone();
+                drop(mapping);
+                while Arc::strong_count(&region) > 1 + usize::from(cache.stats().cached > 0) {
+                    std::thread::yield_now();
+                }
+                drop(region);
+            }
+        }
+        started.elapsed() / (ROUNDS as u32 * (SIZE / WINDOW) as u32)
+    };
+    let uncached = run(&MappingCache::new(0, 0, Duration::ZERO));
+    let cached = run(&MappingCache::new(8, SIZE, Duration::from_secs(60)));
+    eprintln!("per 64 MiB request: uncached {uncached:?}, cached {cached:?}");
+}
+
+#[test]
+fn populated_chunks_are_tracked_per_mapping() {
+    const CHUNK: usize = POPULATED_CHUNK;
+    let cache = cache(8, 1 << 40);
+    let file = memfd(0, 0);
+    file.set_len(3 * CHUNK as u64).unwrap();
+    assert_eq!(
+        unsafe { libc::fcntl(file.as_raw_fd(), libc::F_ADD_SEALS, libc::F_SEAL_SHRINK) },
+        0
+    );
+    let length = 3 * CHUNK as u64;
+    let mapping = HostMapping::new_in(&cache, &file, window(0, length)).unwrap();
+    let region = region_of(&mapping);
+    assert!(!region.is_populated(0, 1));
+    // A partial chunk is populated but not marked.
+    let bytes = unsafe { mapping.bytes_mut(1, CHUNK).unwrap() };
+    mapping.populate(1, bytes).unwrap();
+    assert!(!region.is_populated(0, 1));
+    assert!(!region.is_populated(CHUNK, 1));
+    let bytes = unsafe { mapping.bytes_mut(CHUNK as u64, CHUNK).unwrap() };
+    mapping.populate(CHUNK as u64, bytes).unwrap();
+    assert!(region.is_populated(CHUNK, CHUNK));
+    assert!(!region.is_populated(CHUNK, CHUNK + 1));
+    // A later request for the same file sees the marks.
+    let again = HostMapping::new_in(&cache, &file, window(0, length)).unwrap();
+    assert!(region_of(&again).is_populated(CHUNK + 5, 10));
+}

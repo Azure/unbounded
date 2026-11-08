@@ -32,6 +32,7 @@ use std::sync::Arc;
 mod host_map;
 pub use host_map::DecryptInto;
 pub(crate) use host_map::HostMapping;
+pub(crate) use host_map::MappingCache;
 
 /// The fewest pages the dataplane fetches ahead for one direct read. Clients
 /// send no credits, so this window, or `range_window_pages` when larger, alone

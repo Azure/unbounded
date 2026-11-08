@@ -32,6 +32,13 @@ use racer_wire::object::client::Destination;
 use std::os::fd::AsRawFd;
 use std::ptr::NonNull;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::OnceLock;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+use std::sync::mpsc;
+use std::time::Duration;
+use std::time::Instant;
 
 /// `madvise` advice that faults pages in writable; Linux 5.14 and later.
 const MADV_POPULATE_WRITE: libc::c_int = 23;
@@ -39,31 +46,346 @@ const MADV_POPULATE_WRITE: libc::c_int = 23;
 /// `statfs.f_type` of tmpfs, which holds memfds.
 const TMPFS_MAGIC: i64 = 0x0102_1994;
 
-/// A shared, writable mapping of a client file's destination window.
-/// Unmapped on drop. Crypto jobs hold it through an [`Arc`], so it outlives a
-/// request that is dropped while a decrypt is still running.
-pub(crate) struct HostMapping {
+/// How long a cached mapping that no request uses stays mapped. Holding a
+/// mapping keeps the client's memfd alive after the client closes it, so keep
+/// this short.
+const CACHE_IDLE: Duration = Duration::from_secs(5);
+
+/// Most mappings the cache holds.
+const CACHE_MAX_ENTRIES: usize = 128;
+
+/// Most bytes of client files the cache keeps mapped.
+const CACHE_MAX_BYTES: u64 = 256 << 30;
+
+/// How often the background thread evicts idle mappings.
+const REAPER_PERIOD: Duration = Duration::from_secs(1);
+
+/// One `MAP_SHARED` mapping of a whole client file, from offset 0. Unmapped
+/// on drop. The mapping holds a reference to the file, so its inode cannot be
+/// freed or reused while mapped.
+pub(crate) struct Region {
     base: NonNull<u8>,
 
     length: usize,
 
-    /// File offset of `base`.
-    start: u64,
+    /// One bit per [`POPULATED_CHUNK`] of the mapping already faulted in
+    /// writable, so a reused mapping skips `MADV_POPULATE_WRITE`. A hint
+    /// only: pages the kernel later reclaims fault back in on access.
+    populated: Box<[AtomicU64]>,
+}
+
+/// Granularity of [`Region::populated`].
+const POPULATED_CHUNK: usize = 2 << 20;
+
+// SAFETY: the mapping is plain shared memory with no thread affinity.
+unsafe impl Send for Region {}
+unsafe impl Sync for Region {}
+
+impl Region {
+    fn map(fd: libc::c_int, length: usize) -> Option<Self> {
+        // SAFETY: a fresh mapping at a kernel-chosen address. The shrink seal
+        // keeps the file at least `length` bytes long for the mapping's
+        // lifetime, so no access inside it can fault past the end of the file.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                length,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            )
+        };
+        if base == libc::MAP_FAILED {
+            return None;
+        }
+        let chunks = length.div_ceil(POPULATED_CHUNK);
+        Some(Self {
+            base: NonNull::new(base.cast())?,
+            length,
+            populated: (0..chunks.div_ceil(64))
+                .map(|_| AtomicU64::new(0))
+                .collect(),
+        })
+    }
+
+    /// Chunks wholly inside `[at, at + length)`.
+    fn whole_chunks(at: usize, length: usize) -> std::ops::Range<usize> {
+        at.div_ceil(POPULATED_CHUNK)..(at + length) / POPULATED_CHUNK
+    }
+
+    /// Whether every chunk that `[at, at + length)` touches is populated.
+    fn is_populated(&self, at: usize, length: usize) -> bool {
+        let first = at / POPULATED_CHUNK;
+        let last = (at + length).div_ceil(POPULATED_CHUNK);
+        (first..last).all(|chunk| {
+            self.populated[chunk / 64].load(Ordering::Relaxed) & (1 << (chunk % 64)) != 0
+        })
+    }
+
+    /// Mark the chunks wholly inside `[at, at + length)` populated.
+    fn mark_populated(&self, at: usize, length: usize) {
+        for chunk in Self::whole_chunks(at, length) {
+            self.populated[chunk / 64].fetch_or(1 << (chunk % 64), Ordering::Relaxed);
+        }
+    }
+}
+
+impl Drop for Region {
+    fn drop(&mut self) {
+        // SAFETY: unmaps exactly the mapping made in `map`; no slices outlive
+        // the jobs that hold this region.
+        unsafe { libc::munmap(self.base.as_ptr().cast(), self.length) };
+    }
+}
+
+/// Identity of a client file: `st_dev` and `st_ino`.
+type FileKey = (u64, u64);
+
+struct Entry {
+    key: FileKey,
+
+    region: Arc<Region>,
+
+    last_used: Instant,
+}
+
+/// A bounded cache of host-read client mappings, keyed by file identity.
+/// Repeated requests that present the same memfd reuse one mapping instead of
+/// mapping and unmapping it per request; both take the process `mmap_lock`
+/// for writing, and every unmap shoots down TLB entries on all CPUs.
+///
+/// A request reuses a mapping only after presenting a descriptor for the same
+/// file and passing every check [`HostMapping::new`] makes, so the dataplane
+/// writes into a mapping only on behalf of a request that presented that
+/// file.
+pub(crate) struct MappingCache {
+    entries: Mutex<Vec<Entry>>,
+
+    max_entries: usize,
+
+    max_bytes: u64,
+
+    idle: Duration,
+
+    reuses: AtomicU64,
+
+    created: AtomicU64,
+
+    evicted: AtomicU64,
+
+    cached: AtomicU64,
+
+    cached_bytes: AtomicU64,
+}
+
+/// Counters and gauges of the host-read mapping cache.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct MappingCacheStats {
+    pub(crate) reuses: u64,
+
+    pub(crate) created: u64,
+
+    pub(crate) evicted: u64,
+
+    pub(crate) cached: u64,
+
+    pub(crate) cached_bytes: u64,
+}
+
+impl MappingCache {
+    pub(crate) fn new(max_entries: usize, max_bytes: u64, idle: Duration) -> Self {
+        Self {
+            entries: Mutex::new(Vec::new()),
+            max_entries,
+            max_bytes,
+            idle,
+            reuses: AtomicU64::new(0),
+            created: AtomicU64::new(0),
+            evicted: AtomicU64::new(0),
+            cached: AtomicU64::new(0),
+            cached_bytes: AtomicU64::new(0),
+        }
+    }
+
+    /// The process-wide cache. The first call starts the thread that evicts
+    /// idle mappings and unmaps released ones.
+    pub(crate) fn global() -> &'static Self {
+        static CACHE: OnceLock<MappingCache> = OnceLock::new();
+        CACHE.get_or_init(|| {
+            let cache = Self::new(CACHE_MAX_ENTRIES, CACHE_MAX_BYTES, CACHE_IDLE);
+            reaper();
+            cache
+        })
+    }
+
+    pub(crate) fn stats(&self) -> MappingCacheStats {
+        MappingCacheStats {
+            reuses: self.reuses.load(Ordering::Relaxed),
+            created: self.created.load(Ordering::Relaxed),
+            evicted: self.evicted.load(Ordering::Relaxed),
+            cached: self.cached.load(Ordering::Relaxed),
+            cached_bytes: self.cached_bytes.load(Ordering::Relaxed),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Entry>> {
+        self.entries.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn publish(&self, entries: &[Entry]) {
+        self.cached.store(entries.len() as u64, Ordering::Relaxed);
+        let bytes = entries.iter().map(|e| e.region.length as u64).sum();
+        self.cached_bytes.store(bytes, Ordering::Relaxed);
+    }
+
+    /// A mapping of the file behind `fd` that covers `[0, end)`. `size` is the
+    /// file's current size, at least `end`. The caller has checked the file.
+    fn get(&self, fd: libc::c_int, key: FileKey, end: u64, size: u64) -> Option<Arc<Region>> {
+        let now = Instant::now();
+        {
+            let mut entries = self.lock();
+            if let Some(entry) = entries
+                .iter_mut()
+                .find(|e| e.key == key && e.region.length as u64 >= end)
+            {
+                entry.last_used = now;
+                self.reuses.fetch_add(1, Ordering::Relaxed);
+                return Some(entry.region.clone());
+            }
+        }
+        // Map outside the lock: mmap takes the process mmap_lock.
+        let region = Arc::new(Region::map(fd, usize::try_from(size).ok()?)?);
+        self.created.fetch_add(1, Ordering::Relaxed);
+        let mut released = Vec::new();
+        {
+            let mut entries = self.lock();
+            // A smaller mapping of the same file, made before it grew, is
+            // replaced. Requests that hold it keep it alive.
+            let mut index = 0;
+            while index < entries.len() {
+                if entries[index].key == key {
+                    released.push(entries.swap_remove(index).region);
+                } else {
+                    index += 1;
+                }
+            }
+            if region.length as u64 <= self.max_bytes && self.max_entries > 0 {
+                entries.push(Entry {
+                    key,
+                    region: region.clone(),
+                    last_used: now,
+                });
+                // Evict least recently used mappings until within the caps.
+                // An evicted mapping still in use stays mapped until its last
+                // request ends.
+                while entries.len() > self.max_entries
+                    || entries.iter().map(|e| e.region.length as u64).sum::<u64>() > self.max_bytes
+                {
+                    let Some((oldest, _)) = entries
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, e)| !Arc::ptr_eq(&e.region, &region))
+                        .min_by_key(|(_, e)| e.last_used)
+                    else {
+                        break;
+                    };
+                    released.push(entries.swap_remove(oldest).region);
+                    self.evicted.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            self.publish(&entries);
+        }
+        released.into_iter().for_each(release);
+        Some(region)
+    }
+
+    /// Drop mappings no request has used for the idle time and none holds.
+    /// Returns them so the caller unmaps them; the reaper thread does.
+    fn take_idle(&self, now: Instant) -> Vec<Arc<Region>> {
+        let mut entries = self.lock();
+        let mut idle = Vec::new();
+        let mut index = 0;
+        while index < entries.len() {
+            let entry = &entries[index];
+            if Arc::strong_count(&entry.region) == 1
+                && now.saturating_duration_since(entry.last_used) >= self.idle
+            {
+                idle.push(entries.swap_remove(index).region);
+            } else {
+                index += 1;
+            }
+        }
+        self.evicted.fetch_add(idle.len() as u64, Ordering::Relaxed);
+        self.publish(&entries);
+        idle
+    }
+}
+
+/// Channel to the background thread that unmaps released regions, so munmap
+/// and its TLB shootdown stay off the IO and crypto workers.
+fn reaper() -> Option<&'static mpsc::Sender<Arc<Region>>> {
+    static REAPER: OnceLock<Option<mpsc::Sender<Arc<Region>>>> = OnceLock::new();
+    REAPER
+        .get_or_init(|| {
+            let (sender, receiver) = mpsc::channel::<Arc<Region>>();
+            std::thread::Builder::new()
+                .name("racer-hostmap".into())
+                .spawn(move || {
+                    loop {
+                        match receiver.recv_timeout(REAPER_PERIOD) {
+                            Ok(region) => drop(region),
+                            Err(mpsc::RecvTimeoutError::Timeout) => {}
+                            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                        }
+                        drop(MappingCache::global().take_idle(Instant::now()));
+                    }
+                })
+                .ok()?;
+            Some(sender)
+        })
+        .as_ref()
+}
+
+/// Hand a region reference to the reaper thread, or drop it here when there
+/// is none.
+fn release(region: Arc<Region>) {
+    if let Some(sender) = reaper() {
+        if let Err(mpsc::SendError(region)) = sender.send(region) {
+            drop(region);
+        }
+    } else {
+        drop(region);
+    }
+}
+
+/// A request's view of a shared, writable mapping of a client file's
+/// destination window. Crypto jobs hold it through an [`Arc`], so it outlives
+/// a request that is dropped while a decrypt is still running. The region
+/// under it is shared with other requests for the same file through
+/// [`MappingCache`].
+pub(crate) struct HostMapping {
+    /// Some until drop.
+    region: Option<Arc<Region>>,
 
     /// The destination window, in file offsets.
     window: Destination,
 }
 
-// SAFETY: the mapping is plain shared memory with no thread affinity. Jobs
-// write disjoint page ranges, one job per range at a time.
-unsafe impl Send for HostMapping {}
-unsafe impl Sync for HostMapping {}
-
 impl HostMapping {
     /// Map `window` of `file` when it is safe to: a tmpfs file sealed against
     /// shrinking, not sealed against writes, open read-write, and at least
     /// `window.end()` bytes long. None means use positioned writes instead.
+    /// Reuses a cached mapping of the same file when one covers the window.
     pub(crate) fn new(file: &impl AsRawFd, window: Destination) -> Option<Self> {
+        Self::new_in(MappingCache::global(), file, window)
+    }
+
+    pub(crate) fn new_in(
+        cache: &MappingCache,
+        file: &impl AsRawFd,
+        window: Destination,
+    ) -> Option<Self> {
         let fd = file.as_raw_fd();
         if window.length == 0 {
             return None;
@@ -89,37 +411,18 @@ impl HostMapping {
         let mut stat: libc::stat = unsafe { std::mem::zeroed() };
         if unsafe { libc::fstat(fd, &mut stat) } != 0
             || stat.st_mode & libc::S_IFMT != libc::S_IFREG
-            || u64::try_from(stat.st_size).ok()? < end
         {
             return None;
         }
-        let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
-        if !page.is_power_of_two() {
+        let size = u64::try_from(stat.st_size).ok()?;
+        if size < end {
             return None;
         }
-        let start = window.offset & !(page - 1);
-        let length = usize::try_from(end - start).ok()?;
-        let offset = libc::off_t::try_from(start).ok()?;
-        // SAFETY: a fresh mapping at a kernel-chosen address. The seal keeps
-        // the file at least `end` bytes long for the mapping's lifetime, so
-        // no access inside it can fault past the end of the file.
-        let base = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                length,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                fd,
-                offset,
-            )
-        };
-        if base == libc::MAP_FAILED {
-            return None;
-        }
+        #[allow(clippy::unnecessary_cast)]
+        let key = (stat.st_dev as u64, stat.st_ino as u64);
+        let region = cache.get(fd, key, end, size)?;
         Some(Self {
-            base: NonNull::new(base.cast())?,
-            length,
-            start,
+            region: Some(region),
             window,
         })
     }
@@ -139,18 +442,36 @@ impl HostMapping {
         if offset < self.window.offset || end > self.window.end() {
             return Err(Error::InvalidRange);
         }
-        let at = usize::try_from(offset - self.start).map_err(|_| Error::InvalidRange)?;
-        debug_assert!(at + length <= self.length);
+        let region = self.region.as_ref().ok_or(Error::Internal)?;
+        let at = usize::try_from(offset).map_err(|_| Error::InvalidRange)?;
+        if at + length > region.length {
+            return Err(Error::InvalidRange);
+        }
         // SAFETY: inside the mapping, checked above.
-        Ok(unsafe { std::slice::from_raw_parts_mut(self.base.as_ptr().add(at), length) })
+        Ok(unsafe { std::slice::from_raw_parts_mut(region.base.as_ptr().add(at), length) })
+    }
+
+    /// Fault `bytes`, which start at file offset `offset`, in writable unless
+    /// an earlier request already did for this mapping.
+    fn populate(&self, offset: u64, bytes: &mut [u8]) -> Result<()> {
+        let region = self.region.as_ref().ok_or(Error::Internal)?;
+        let at = usize::try_from(offset).map_err(|_| Error::InvalidRange)?;
+        if region.is_populated(at, bytes.len()) {
+            return Ok(());
+        }
+        populate(bytes)?;
+        region.mark_populated(at, bytes.len());
+        Ok(())
     }
 }
 
 impl Drop for HostMapping {
     fn drop(&mut self) {
-        // SAFETY: unmaps exactly the mapping made in `new`; no slices outlive
-        // the jobs that hold this mapping.
-        unsafe { libc::munmap(self.base.as_ptr().cast(), self.length) };
+        // Usually the cache still holds the region; when this is the last
+        // reference, the reaper thread unmaps it.
+        if let Some(region) = self.region.take() {
+            release(region);
+        }
     }
 }
 
@@ -222,7 +543,7 @@ impl DecryptInto {
         // SAFETY: the sink delivers one page at a time and each job covers
         // its own destination bytes.
         let destination = unsafe { self.mapping.bytes_mut(self.destination, end - start)? };
-        populate(destination)?;
+        self.mapping.populate(self.destination, destination)?;
         let key = &self.page.key;
         if start == 0 && end == length {
             // Decrypt from the ciphertext copy straight into the mapping in

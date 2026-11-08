@@ -707,6 +707,21 @@ Racer-Destination-Length: <length>
   `racer_host_read_direct_decrypt_pages_total` and
   `racer_host_read_direct_decrypt_bytes_total` count pages and plaintext bytes
   decrypted this way.
+- The dataplane keeps mappings of such files in a process-wide cache keyed
+  by the file's device and inode, so repeated requests for the same `memfd`
+  (for example, parallel ranges of one buffer, or a pooled buffer reused for
+  later objects) skip a `mmap`, `munmap`, and page-table populate per request.
+  Every request still presents the descriptor and passes every check above.
+  The cache holds up to 128 mappings and 256 GiB of mapped files, evicting the
+  least recently used beyond that, and unmaps a mapping that no request has
+  used for 5 seconds. While a mapping is cached the client's `memfd` memory
+  stays allocated even if the client closed it, and the client cannot add
+  `F_SEAL_WRITE` to it. Unmapping happens on a background thread.
+  `racer_host_read_mappings_created_total`,
+  `racer_host_read_mapping_reuses_total`, and
+  `racer_host_read_mappings_evicted_total` count new, reused, and evicted
+  mappings; `racer_host_read_mappings_cached` and
+  `racer_host_read_mappings_cached_bytes` report the cache's current size.
 
 `POST /v1/objects/<key>/gpu-read` writes into GPU memory. It works like
 `host-read`, with these differences:
