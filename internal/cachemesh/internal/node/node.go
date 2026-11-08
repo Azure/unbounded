@@ -418,11 +418,12 @@ func (n *Node) Elector() *elect.Elector { return n.el }
 // term it publishes under.
 func (n *Node) Leading() (bool, uint64) { return n.leading, n.term }
 
-// Leaving reports whether Leave was called; Left whether the member has
-// observed its own removal after leaving.
+// Leaving reports whether Leave was called.
 func (n *Node) Leaving() bool { return n.leaving }
 
-// Left reports whether the member observed its removal after Leave.
+// Left reports whether the member has left: it observed its removal after
+// Leave, or it had been removed from its view (after being a member) when
+// Leave was called.
 func (n *Node) Left() bool { return n.left }
 
 // Neighbors returns the current (non-lingering) data-plane neighbor slots
@@ -531,6 +532,15 @@ func (n *Node) Leave(now int64) {
 	n.leaveEpoch = n.ep.Current()
 	n.nextLeave = now
 	n.event("leave")
+
+	// A member already removed from its view (for example after a
+	// partition) has nothing to drain and must not rejoin (leftView), so
+	// it has left. Waiting for a view without it would never end: it no
+	// longer joins, sends leaves, or catches up.
+	if n.joined && !n.isMember() && !n.leading {
+		n.left = true
+		n.event("left-removed")
+	}
 }
 
 // Tick runs due timers at local time now.

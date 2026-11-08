@@ -879,6 +879,32 @@ func TestLeavingNonMemberDoesNotJoin(t *testing.T) {
 	}
 }
 
+// TestLeaveAfterRemovalCompletes is a regression test: a member removed
+// from its view and then asked to leave no longer joins, so no later view
+// could show its removal, and Left stayed false forever (the process never
+// finished leaving and fell into the Lease lottery; found by the DST
+// sweep). It has already left. A never-joined process does not.
+func TestLeaveAfterRemovalCompletes(t *testing.T) {
+	c := newCluster(t)
+	n := New(c.cfg(1, []string{addr(0)}), rand.New(rand.NewPCG(3, 3)))
+	n.Start(c.now, c.wall())
+
+	n.joined = true // it was a member of an earlier view, then removed
+	n.Leave(c.now + sec)
+
+	if !n.Left() {
+		t.Fatal("a removed member asked to leave has not left")
+	}
+
+	fresh := New(c.cfg(2, []string{addr(0)}), rand.New(rand.NewPCG(4, 4)))
+	fresh.Start(c.now, c.wall())
+	fresh.Leave(c.now + sec)
+
+	if fresh.Left() {
+		t.Fatal("a never-joined process left without joining")
+	}
+}
+
 // TestLeavingNeverJoinedStillJoins checks that a process that is asked to
 // leave before it ever joined keeps joining: its admission replaces a stale
 // record of its earlier incarnation, which nothing else removes, and the

@@ -587,7 +587,10 @@ Implementation notes (`node` package):
   lists the other members it knows. Seeds are cleared only when the last
   known member leaves. Clearing them on every release let a fresh member
   bootstrap a second cluster next to the live one.
-- A leaving member that has been in a view never rejoins. A member
+- A leaving member that has been in a view never rejoins; if it was
+  already removed when `Leave` was called, it has left at once (it would
+  otherwise wait forever for a view showing a removal that already
+  happened). A member
   removed by a partition that is then asked to leave used to keep sending
   joins, and one reaching the leader after the process stopped re-admitted
   it. A join the leader had already queued can still admit a member whose
