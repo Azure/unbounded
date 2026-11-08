@@ -657,6 +657,7 @@ func (n *Node) sendJoin(now int64) {
 
 	// Send the join straight to the leader when the newest view names one.
 	to := seed
+
 	if l := n.v.Leader(); l != view.NoSlot {
 		if a := n.addrOf(l); a != "" && a != n.cfg.Addr {
 			to = a
