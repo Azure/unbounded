@@ -72,7 +72,10 @@
 // the owner's cell when the owner itself is bad. If no response arrives
 // within HedgeAfter and Alternate is not zero, ask TryHedge; when it
 // returns true, send a copy to Alternate with FlagHedge set. After a
-// failure, Alternate is also the retry target.
+// failure, Alternate is also the retry target. Send hedges and retries to
+// Alternate with Decision.AlternateHeader (plus FlagHedge for a hedge):
+// after a final hop it carries FlagBackup, so the backup serves the
+// request instead of sending it back to the owner the caller gave up on.
 //
 // Route, RouteHash, RouteMany, Forward, Observe, TryHedge, Stamp, and Fresh
 // are safe for concurrent use, take no locks, read no clock, and allocate

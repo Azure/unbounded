@@ -70,7 +70,9 @@ func (s *server) send(d cachemesh.Decision, key string) (string, error) {
 	// A real client starts the hedge after d.HedgeAfter rather than after
 	// a failure; both go through the same budget.
 	if !d.Alternate.IsZero() && s.mesh.TryHedge(d.Header) {
-		h := d.Header
+		// AlternateHeader carries FlagBackup after a final hop, so a
+		// backup serves instead of sending back to the owner.
+		h := d.AlternateHeader()
 		h.Flags |= cachemesh.FlagHedge
 		h.Put(&hdr)
 
