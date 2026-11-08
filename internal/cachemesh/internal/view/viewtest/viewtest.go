@@ -332,15 +332,24 @@ func moveOps(v *view.View, k int, gone map[uint32]bool) []view.Op {
 	}
 
 	k = min(k, t.Len())
-	stride := uint32(t.Len() / k)
-	off := uint32(v.Version().Seq) % stride
+	mask := uint64(t.Len() - 1)
+	seen := make(map[uint32]bool, k)
 	parts := make([]uint32, 0, k)
 	owners := make([]uint32, 0, k)
 
-	for i := range uint32(k) {
-		p := off + i*stride
-		o := members[int(hashing.Mix64(uint64(p)^v.Version().Seq)%uint64(len(members)))]
+	// Pseudo-random distinct partitions, like the rebalancer's scattered
+	// moves.
+	for i := uint64(0); len(seen) < k; i++ {
+		h := hashing.Mix64(i ^ v.Version().Seq<<32)
+		p := uint32(h & mask)
 
+		if seen[p] {
+			continue
+		}
+
+		seen[p] = true
+
+		o := members[int((h>>32)%uint64(len(members)))]
 		if o == t.Owner(p) {
 			continue
 		}

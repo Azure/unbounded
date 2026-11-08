@@ -326,6 +326,7 @@ func TestSetStateAndCell(t *testing.T) {
 	}
 
 	sh, _ := topology.NewShape(2, 2)
+
 	mustFail(t, v, view.ErrInvalid, view.OpSetCell(1, 1))
 	v = mustApply(t, v, view.OpReshape(sh, []uint32{0, 0}))
 	mustFail(t, v, view.ErrInvalid, view.OpSetCell(1, 4))
