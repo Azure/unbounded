@@ -521,6 +521,20 @@ impl<I: Identity, J: Reserved<I>, C: Reserved<I>> WorkerPort<I, J, C> {
             .poll_receive(cx)
     }
 
+    /// Take one job without registering a waker; `None` means currently empty or closed.
+    /// For a cooperating helper that runs this endpoint's jobs on its owner's behalf.
+    pub fn try_job(&mut self) -> crate::Result<Option<J>> {
+        match self.jobs.as_mut() {
+            Some(jobs) => jobs.receive(),
+            None => Ok(None),
+        }
+    }
+
+    /// Whether at least one accepted job is waiting; may be stale at once.
+    pub fn has_jobs(&self) -> bool {
+        self.jobs.as_ref().is_some_and(|jobs| !jobs.is_empty())
+    }
+
     /// Publish a completion retaining its original permit, or return it unchanged.
     pub fn complete(&mut self, completion: C) -> Result<(), SendFailure<C>> {
         if !Arc::ptr_eq(&self.handoff, &completion.permit().handoff) {
@@ -1125,6 +1139,33 @@ mod tests {
             executor.poll(&mut worker, &mut cx, 1, |job| job).unwrap();
             assert!(executor.is_drained());
         }
+    }
+
+    /// A cooperating helper takes jobs without a waker and sees pending work first.
+    #[test]
+    fn worker_try_job_reports_backlog_without_registering() {
+        let (client, mut worker) = pair(7, 2);
+        let drops = Arc::new(AtomicUsize::new(0));
+        assert!(!worker.has_jobs());
+        assert!(worker.try_job().unwrap().is_none());
+        for sequence in 1..=2 {
+            assert!(
+                client
+                    .try_submit(message(&client, sequence, &drops), |_| {})
+                    .is_ok()
+            );
+        }
+        assert!(worker.has_jobs());
+        let first = worker.try_job().unwrap().unwrap();
+        assert_eq!(first.permit().id().2, 1);
+        assert!(worker.has_jobs());
+        let second = worker.try_job().unwrap().unwrap();
+        assert_eq!(second.permit().id().2, 2);
+        assert!(!worker.has_jobs());
+        assert!(worker.complete(second).is_ok());
+        assert!(worker.complete(first).is_ok());
+        assert!(client.receive().unwrap().is_some());
+        assert!(client.receive().unwrap().is_some());
     }
 
     /// A drain that stops at its budget asks the driver for another turn, since

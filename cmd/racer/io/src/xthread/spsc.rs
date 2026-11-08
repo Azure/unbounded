@@ -289,6 +289,11 @@ impl<T> Receiver<T> {
         self.shared.readable.register(waker);
     }
 
+    /// Whether no value is currently published. A concurrent send may make this stale at once.
+    pub fn is_empty(&self) -> bool {
+        self.shared.head.0.load(Ordering::Relaxed) == self.shared.tail.0.load(Ordering::Acquire)
+    }
+
     /// Take one value without waiting; `None` means currently empty, not necessarily EOF.
     pub fn receive(&mut self) -> Result<Option<T>> {
         self.receive_shared()
