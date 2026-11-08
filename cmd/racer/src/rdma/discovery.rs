@@ -395,9 +395,11 @@ pub fn device_active(root: &Path, device: &str) -> bool {
 /// Whether sysfs under `root` shows a port of `device` that discovery would
 /// keep: a nonzero port whose GID 0 is not the null GID (the filter of
 /// [`rdma_verbs::discovery::inventory_at`]). A MANA VF's `rdmaP...` twin
-/// carries only a null GID, so it alone never makes a device discoverable.
-/// A port whose GID cannot be read counts as discoverable (verbs decides),
-/// and so does a test tree with no `ports` directory.
+/// carries only a null GID, or no GID table at all while its `roceP...`
+/// sibling is unbound, so it alone never makes a device discoverable. A port
+/// without a `gids/0` entry is not discoverable. A port whose GID exists but
+/// cannot be read counts as discoverable (verbs decides), and so does a test
+/// tree with no `ports` directory.
 pub fn device_discoverable(root: &Path, device: &str) -> bool {
     if !valid_device(device) {
         return false;
@@ -412,7 +414,7 @@ pub fn device_discoverable(root: &Path, device: &str) -> bool {
         }
         match std::fs::read_to_string(port.path().join("gids").join("0")) {
             Ok(gid) => gid.trim().chars().any(|c| c != '0' && c != ':'),
-            Err(_) => true,
+            Err(error) => error.kind() != std::io::ErrorKind::NotFound,
         }
     })
 }
@@ -972,14 +974,15 @@ mod tests {
         std::fs::create_dir_all(root.join("bare")).unwrap();
         assert!(!device_discoverable(&root, "rdmaP0"));
         assert!(device_discoverable(&root, "roceP0"));
-        assert!(device_discoverable(&root, "nogid"));
+        // A MANA VF's rdmaP twin has no GID table while roceP is unbound.
+        assert!(!device_discoverable(&root, "nogid"));
         assert!(!device_discoverable(&root, "zero"));
         assert!(device_discoverable(&root, "bare"));
         assert!(!device_discoverable(&root, "absent"));
         assert!(!device_discoverable(&root, ".."));
         assert_eq!(
             discoverable_devices(&root),
-            vec!["bare".to_string(), "nogid".into(), "roceP0".into()]
+            vec!["bare".to_string(), "roceP0".into()]
         );
         assert!(discoverable_devices(&dir.join("absent")).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
