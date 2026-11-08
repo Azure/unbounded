@@ -972,12 +972,18 @@ impl Link {
         }
     }
 
+    /// Whether the last poll left completions to reap at once: a full batch
+    /// or synthetic completions, which raise no event.
+    pub(crate) fn busy(&self) -> bool {
+        self.more || self.qp.has_synthetic()
+    }
+
     /// When this link next needs a poll without a wake source: `Some(t)`
     /// with `t` in the past means at once. Completions, connection manager
     /// events, commands, and returned buffers wake the owner on their own;
     /// this covers timers and work that raises no event.
     pub(crate) fn next_deadline(&self) -> Option<Instant> {
-        if self.more || self.qp.has_synthetic() {
+        if self.busy() {
             return Some(self.created);
         }
         let mut next: Option<Instant> = None;
