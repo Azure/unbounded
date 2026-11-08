@@ -464,7 +464,7 @@ func (n *Node) NextDeadline() int64 {
 		d = min(d, n.nextLeader)
 	}
 
-	if !n.isMember() && !n.leaving && n.started {
+	if !n.isMember() && !n.leftView() && n.started {
 		d = min(d, n.nextJoin)
 	}
 
@@ -476,6 +476,15 @@ func (n *Node) NextDeadline() int64 {
 }
 
 func (n *Node) isMember() bool { return n.slot != view.NoSlot }
+
+// leftView reports whether this member was in a view and is leaving: it
+// must not rejoin. A member removed (for example by a partition) that is
+// then asked to leave would otherwise keep sending joins, and one arriving
+// after its process stopped re-admits it. A process that is leaving but
+// never joined still joins: its admission replaces a stale record of an
+// earlier incarnation, which nothing else removes (the new process answers
+// pings at the same address), and the leave then drains it.
+func (n *Node) leftView() bool { return n.leaving && n.joined }
 
 // Start starts the member at local time now.
 func (n *Node) Start(now int64, wall time.Time) {
@@ -548,10 +557,7 @@ func (n *Node) Tick(now int64, wall time.Time) {
 		n.leaderTick(now)
 	}
 
-	// A leaving member never (re)joins: a member removed (for example by a
-	// partition) that is asked to leave would otherwise keep sending
-	// joins, and one arriving after its process stopped re-admits it.
-	if !n.isMember() && !n.leaving && now >= n.nextJoin {
+	if !n.isMember() && !n.leftView() && now >= n.nextJoin {
 		n.nextJoin = now + int64(n.cfg.JoinRetry)
 		n.sendJoin(now)
 	}

@@ -867,6 +867,7 @@ func TestLeavingNonMemberDoesNotJoin(t *testing.T) {
 		t.Fatal("a joiner sends a join at start")
 	}
 
+	n.joined = true // it was a member of an earlier view, then removed
 	n.Leave(c.now + sec)
 
 	for step := int64(2); step < 30; step++ {
@@ -875,6 +876,29 @@ func TestLeavingNonMemberDoesNotJoin(t *testing.T) {
 		if hasJoin(t, n.Outbox()) {
 			t.Fatalf("join sent %ds after Leave", step-1)
 		}
+	}
+}
+
+// TestLeavingNeverJoinedStillJoins checks that a process that is asked to
+// leave before it ever joined keeps joining: its admission replaces a stale
+// record of its earlier incarnation, which nothing else removes, and the
+// leave then drains it.
+func TestLeavingNeverJoinedStillJoins(t *testing.T) {
+	c := newCluster(t)
+	n := New(c.cfg(1, []string{addr(0)}), rand.New(rand.NewPCG(3, 3)))
+	n.Start(c.now, c.wall())
+	n.Outbox()
+	n.Leave(c.now + sec)
+
+	joined := false
+
+	for step := int64(2); step < 30 && !joined; step++ {
+		n.Tick(c.now+step*sec, c.wall())
+		joined = hasJoin(t, n.Outbox())
+	}
+
+	if !joined {
+		t.Fatal("a never-joined leaving process stopped joining")
 	}
 }
 
