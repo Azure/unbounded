@@ -735,3 +735,45 @@ func TestConcurrentHotAndControl(t *testing.T) {
 		t.Fatalf("counter drift not repaired: %+v vs %d", c, tr.ejected.Load())
 	}
 }
+
+func TestSyncReplacesTrackedSet(t *testing.T) {
+	tr := newT(Config{})
+	trackN(tr, 20, 4)
+	tr.Tick(0)
+	fail(tr, 0, 5)
+	fail(tr, 1, 5)
+
+	if tr.Usable(0) != Unusable || tr.Usable(1) != Unusable {
+		t.Fatal("setup: slots 0 and 1 not ejected")
+	}
+
+	// Keep 0..9 (slot 1 with a new key, slot 3 in a new cell), add 30, drop
+	// the rest; slot 5 appears twice and the last entry wins.
+	var peers []Ref
+	for i := range uint32(10) {
+		peers = append(peers, Ref{Slot: i, Key: uint64(1000 + i), Cell: i / 4})
+	}
+
+	peers[1].Key = 7
+	peers[3].Cell = 9
+	peers = append(peers, Ref{Slot: 30, Key: 30, Cell: 9}, Ref{Slot: 5, Key: 1005, Cell: 2})
+	tr.Sync(peers)
+
+	if tr.Tracked() != 11 {
+		t.Fatalf("tracked %d, want 11", tr.Tracked())
+	}
+
+	if tr.Usable(0) != Unusable {
+		t.Fatal("Sync reset the state of an unchanged peer")
+	}
+
+	if tr.Usable(1) != Healthy {
+		t.Fatal("Sync kept the state of a peer whose key changed")
+	}
+
+	tr.Sync(nil)
+
+	if tr.Tracked() != 0 {
+		t.Fatalf("tracked %d after empty Sync", tr.Tracked())
+	}
+}
