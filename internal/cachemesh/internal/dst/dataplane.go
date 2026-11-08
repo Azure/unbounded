@@ -342,7 +342,7 @@ type DataPlane struct {
 	maxEject                     string
 
 	cov struct {
-		kinds                        [8]CoverageHandle
+		kinds                        [7]CoverageHandle
 		failover, ttl, handoff, note CoverageHandle
 		hedgeSent, hedgeWon, denied  CoverageHandle
 		expired, invalidated, over   CoverageHandle
@@ -358,6 +358,7 @@ func NewDataPlane(cfg DataPlaneConfig) *DataPlane {
 // DataPlaneCoverage lists the coverage states the data plane registers.
 var DataPlaneCoverage = []string{
 	"dp-kind-Self", "dp-kind-Relay", "dp-kind-Owner", "dp-kind-Backup", "dp-kind-Gateway", "dp-kind-Direct",
+	"dp-kind-NoRoute",
 	"dp-health-healthy", "dp-health-degraded", "dp-health-busy", "dp-health-ejected", "dp-health-probing",
 	"dp-uneject", "dp-panic", "dp-hedge-sent", "dp-hedge-won", "dp-hedge-denied",
 	"dp-failover", "dp-ttl-exhausted", "dp-handoff", "dp-stamp-expired", "dp-stamp-invalidated",
@@ -660,11 +661,11 @@ func (w *DataPlane) slowWindow(r *dpReq, now int64) {
 		}
 	}
 
-	if judged && w.netFaultNear(now) {
+	if judged && (w.otherFaultNear(now) || !w.settled) {
 		judged = false
 	}
 
-	if !judged || w.slow(r.origin) > 1000 || !slices.Contains(w.clients, r.origin) {
+	if !judged || w.slow(r.origin) > 1000 || !slices.Contains(w.clients, r.origin) || !w.state(r.origin).Member() {
 		return
 	}
 
@@ -688,18 +689,23 @@ func (w *DataPlane) slowWindow(r *dpReq, now int64) {
 	r.slowExp = float64(slow) / float64(live)
 }
 
-// netFaultNear reports whether a fault that degrades many links at once
-// (partition, message loss, rolling restart) is active at now or ended less
-// than a minute ago. Outlier detection is relative to the median of a
-// member's peers, so while most peers time out a slow member is not an
-// outlier and tail-latency protection is not judged.
-func (w *DataPlane) netFaultNear(now int64) bool {
+// otherFaultNear reports whether a fault other than slow members, clock
+// skew or drift, and control-plane-only faults (API server outage, lease
+// conflicts, keyspace invalidation) is active at now or ended less than a
+// minute ago. Tail-latency protection is judged only while slow members are
+// the only data-plane fault: outlier detection is relative to the median of
+// a member's peers, so while most peers time out (partition, loss) a slow
+// member is not an outlier, and crashed or paused peers take the few
+// ejections MaxEjectionPercent allows.
+func (w *DataPlane) otherFaultNear(now int64) bool {
 	for _, f := range w.c.sc.Faults {
 		switch f.Kind {
-		case NetworkPartition, MessageLoss, RollingRestart:
-			if f.Start <= now && f.End()+60*sec >= now {
-				return true
-			}
+		case SlowMembers, ClockSkew, ClockDrift, APIServerOutage, LeaseConflicts, KeyspaceInvalidation:
+			continue
+		}
+
+		if f.Start <= now && f.End()+60*sec >= now {
+			return true
 		}
 	}
 
@@ -709,7 +715,9 @@ func (w *DataPlane) netFaultNear(now int64) bool {
 // decided records coverage for a routing decision made at member i.
 func (w *DataPlane) decided(i uint32, d *route.Decision) {
 	w.mem[i].decisions++
-	w.cov.kinds[d.Kind&7].Hit()
+	if int(d.Kind) < len(w.cov.kinds) {
+		w.cov.kinds[d.Kind].Hit()
+	}
 
 	if !d.PrevOwner.IsZero() {
 		w.cov.handoff.Hit()

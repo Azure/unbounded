@@ -41,3 +41,23 @@ func dataPlaneReport(c *Coverage) string {
 
 	return b.String()
 }
+
+// dataPlaneCases are targeted data-plane cases added to the default set: a
+// 40-member cluster whose only data-plane fault is two slow members (30x,
+// for 150s, long enough to judge tail-latency protection after the
+// detection window), alongside clock drift and a keyspace invalidation.
+func dataPlaneCases() []dstCase {
+	sc := Generate(7, SizeTiny)
+	sc.Members, sc.Capacity, sc.PartitionBits = 40, 40, 16
+	sc.CellSize, sc.MaxNeighbors = 4, 256
+	sc.Warmup = 40 * sec
+	sc.Faults = []Fault{
+		{Kind: ClockDrift, Start: sc.Warmup + 10*sec, Duration: 200 * sec, Count: 1, Value: 200_000, Seed: 1},
+		{Kind: SlowMembers, Start: sc.Warmup + 20*sec, Duration: 150 * sec, Count: 2, Value: 30_000, Seed: 2},
+		{Kind: KeyspaceInvalidation, Start: sc.Warmup + 60*sec, Seed: 3},
+	}
+	sc.Settle = 120 * sec
+	sc.Duration = sc.Warmup + 210*sec + sc.Settle
+
+	return []dstCase{{name: "slow", sc: sc, twice: true}}
+}

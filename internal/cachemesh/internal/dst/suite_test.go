@@ -136,6 +136,8 @@ func defaultCases(seeds []uint64, explicit bool) []dstCase {
 	// converging between faults.
 	cases = append(cases, dstCase{name: "longrun", sc: GenerateLongRun(seeds[0], 12, 2*3600*sec), twice: true})
 
+	cases = append(cases, dataPlaneCases()...)
+
 	medium := shorten(GenerateKinds(seeds[0], SizeMedium, Crash, LeaderCrash, MassJoin, MessageLoss), 60*sec, 150*sec)
 	medium.Members, medium.PartitionBits = 1000, 16
 	medium.Capacity = 1000 + medium.Capacity - medium.Members
