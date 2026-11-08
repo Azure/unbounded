@@ -866,3 +866,40 @@ func TestSuspicionMutualObservers(t *testing.T) {
 
 	t.Skip("no suitable target in this view")
 }
+
+// TestOpBudget checks that a tick with more due work than one delta can
+// hold stays under view.MaxDeltaOps and finishes on later ticks.
+func TestOpBudget(t *testing.T) {
+	if testing.Short() {
+		t.Skip("large")
+	}
+
+	const n = 70000
+
+	v := viewtest.Build(t, n, viewtest.Options{Seed: 5, Joining: n - 100, PartitionBits: 12})
+	m0, _ := v.Member(0)
+	h := newHarness(t, Config{Self: Member{ID: m0.ID, Incarnation: m0.Incarnation}, PartitionBits: 12}, v)
+	h.now = 1000 * sec
+
+	ops := h.tick(0)
+	if len(ops) > view.MaxDeltaOps || count(ops, view.KindSetState) < maxMemberOps-10 {
+		t.Fatalf("%d ops, %d SetState", len(ops), count(ops, view.KindSetState))
+	}
+
+	h.now += sec
+	h.tick(0)
+
+	joining := 0
+
+	h.v.ForEachMember(func(_ view.Slot, m *view.Member) bool {
+		if m.State == view.Joining {
+			joining++
+		}
+
+		return true
+	})
+
+	if joining != 0 {
+		t.Fatalf("%d members still joining", joining)
+	}
+}

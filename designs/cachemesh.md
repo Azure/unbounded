@@ -512,6 +512,8 @@ Implementation notes (`leader` package):
   leader removes it.
 - The placement scan is skipped when the table and the planner inputs
   (slots, keys, weights, cells) are unchanged since a plan with no moves.
+- One delta holds at most `view.MaxDeltaOps - 4096` member ops and 1024
+  invalidations; further due work waits for the next tick.
 - Input queues (joins, leaves, suspected targets, invalidations) are bounded
   by `MaxPending` (4096); suspicion reports per target by 64.
 

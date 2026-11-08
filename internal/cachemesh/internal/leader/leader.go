@@ -398,6 +398,16 @@ type state struct {
 	reshaped []uint32             // Reshape cells by slot, nil without a reshape
 }
 
+// maxMemberOps bounds the per-member ops of one delta, leaving room under
+// view.MaxDeltaOps for cell moves, Assign, Epoch, and invalidations. Work
+// beyond it waits for the next tick.
+const maxMemberOps = view.MaxDeltaOps - 4096
+
+// maxInvalsPerTick bounds Invalidate ops per delta.
+const maxInvalsPerTick = 1024
+
+func (st *state) budget() bool { return len(st.ops) < maxMemberOps }
+
 func (st *state) memberState(s view.Slot) (view.MemberState, uint32) {
 	if op, ok := st.setState[s]; ok {
 		return op.State, op.Weight
@@ -458,11 +468,12 @@ func (l *Leader) Tick(now int64, epochNow uint64, v *view.View, newTerm uint64) 
 		st.ops = append(st.ops, view.OpEpoch(epochNow, l.cfg.EpochPeriod))
 	}
 
-	for _, seed := range l.invals {
+	k := min(len(l.invals), maxInvalsPerTick)
+	for _, seed := range l.invals[:k] {
 		st.ops = append(st.ops, view.OpInvalidate(seed, v.Gen(seed)+1))
 	}
 
-	l.invals = l.invals[:0]
+	l.invals = append(l.invals[:0], l.invals[k:]...)
 
 	if len(st.ops) == 0 {
 		return nil
@@ -617,7 +628,7 @@ func (l *Leader) admit(st *state, _ int64, epochNow uint64) {
 	}
 
 	v := st.v
-	k := min(len(l.joins), l.cfg.MaxJoinsPerTick)
+	k := min(len(l.joins), l.cfg.MaxJoinsPerTick, max(0, (maxMemberOps-len(st.ops))/2))
 
 	batch := make([]Member, 0, k)
 	for _, j := range l.joins[:k] {
@@ -738,7 +749,7 @@ func (l *Leader) promote(st *state, now int64, epochNow uint64) {
 				return true
 			}
 
-			if now-at >= int64(l.cfg.QuarantineFor) {
+			if now-at >= int64(l.cfg.QuarantineFor) && st.budget() {
 				l.setState(st, s, m, view.Active, ww[0], now)
 			}
 		case view.Active:
@@ -749,7 +760,7 @@ func (l *Leader) promote(st *state, now int64, epochNow uint64) {
 			step := int((now - at) / int64(l.cfg.WarmupStep))
 			w := ww[min(step, len(ww)-1)]
 			// A bootstrap leader starts at full weight; never lower one.
-			if w > m.Weight {
+			if w > m.Weight && st.budget() {
 				l.setState(st, s, m, view.Active, w, now)
 			}
 		}
@@ -783,6 +794,12 @@ func (l *Leader) drains(st *state, now int64, epochNow uint64) {
 				continue
 			}
 
+			if !st.budget() {
+				l.leaves[id] = inc // retry next tick
+
+				continue
+			}
+
 			l.setState(st, s, m, view.Draining, 0, now)
 		}
 	}
@@ -792,7 +809,7 @@ func (l *Leader) drains(st *state, now int64, epochNow uint64) {
 			return true
 		}
 
-		if now-l.since(s, m, now, epochNow) >= int64(l.cfg.DrainFor) {
+		if now-l.since(s, m, now, epochNow) >= int64(l.cfg.DrainFor) && st.budget() {
 			l.remove(st, s, RemovedDrained)
 		}
 
@@ -899,7 +916,7 @@ func (l *Leader) suspicions(st *state, now int64) {
 		}
 	}
 
-	for _, t := range due[:min(len(due), limit)] {
+	for _, t := range due[:min(len(due), limit, max(0, maxMemberOps-len(st.ops)))] {
 		delete(l.suspects, t)
 		l.remove(st, t, RemovedSuspected)
 	}
