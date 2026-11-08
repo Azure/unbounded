@@ -52,7 +52,20 @@ const (
 	LeaseConflicts
 	// Pause freezes Count members for Duration.
 	Pause
+	// ColdRestart crashes every member and restarts all of them after
+	// Duration with new incarnations. Value 0 restarts them without seeds
+	// (they find only the dead leader and seeds in the Lease); 1 keeps the
+	// usual seed assignment (seeds that are restarting too).
+	ColdRestart
+	// PartialRestart crashes the leader and every member except Count
+	// survivors, and restarts them after Duration without seeds.
+	PartialRestart
+	// Checkpoint requires the cluster to have converged by Start+Duration.
+	Checkpoint
 
+	// numFaultKinds counts the kinds Generate draws from its main stream;
+	// later kinds come from a separate stream so adding them did not
+	// change existing scenarios.
 	numFaultKinds = int(Pause)
 )
 
@@ -61,6 +74,7 @@ var faultNames = [...]string{
 	"network-partition", "leader-crash", "apiserver-outage", "slow-members",
 	"clock-skew", "clock-drift", "message-loss", "message-duplication",
 	"graceful-drain", "keyspace-invalidation", "lease-conflicts", "pause",
+	"cold-restart", "partial-restart", "checkpoint",
 }
 
 // String returns the kind's name.
@@ -145,6 +159,9 @@ type Scenario struct {
 	Settle   int64
 	// Faults are sorted by Start.
 	Faults []Fault
+	// DeltaLogSize is the members' delta log size; 0 selects the default.
+	// Small logs make partitioned members catch up by snapshot.
+	DeltaLogSize int
 }
 
 // Kinds returns the distinct fault kinds in the scenario, in order.
@@ -166,8 +183,8 @@ func (s *Scenario) Kinds() []FaultKind {
 func (s *Scenario) String() string {
 	var b strings.Builder
 
-	fmt.Fprintf(&b, "seed=%d members=%d capacity=%d cell=%d maxNeighbors=%d bits=%d duration=%.0fs settle=%.0fs\n",
-		s.Seed, s.Members, s.Capacity, s.CellSize, s.MaxNeighbors, s.PartitionBits,
+	fmt.Fprintf(&b, "seed=%d members=%d capacity=%d cell=%d maxNeighbors=%d bits=%d log=%d duration=%.0fs settle=%.0fs\n",
+		s.Seed, s.Members, s.Capacity, s.CellSize, s.MaxNeighbors, s.PartitionBits, s.DeltaLogSize,
 		float64(s.Duration)/1e9, float64(s.Settle)/1e9)
 
 	for _, f := range s.Faults {
@@ -207,7 +224,121 @@ func Generate(seed uint64, size SizeClass) Scenario {
 		kinds = append(kinds, pick(r, AllFaultKinds()...))
 	}
 
-	return generate(seed, r, size, kinds)
+	s := generate(seed, r, size, kinds)
+	extend(&s)
+
+	return s
+}
+
+// extend adds the fault kinds after numFaultKinds, drawn from their own
+// stream: each in about one scenario in eight.
+func extend(s *Scenario) {
+	r := NewRand(s.Seed, "scenario-ext")
+	last := s.Warmup
+
+	for _, f := range s.Faults {
+		last = max(last, f.Start)
+	}
+
+	add := func(f Fault) {
+		f.Start = s.Warmup + r.Int64N(last-s.Warmup+1)
+		f.Seed = r.Uint64()
+		s.Faults = append(s.Faults, f)
+		s.Duration = max(s.Duration, f.End()+s.Settle)
+	}
+
+	s.DeltaLogSize = pick(r, 0, 0, 64, 32)
+
+	if r.IntN(8) == 0 {
+		add(Fault{Kind: ColdRestart, Duration: between(r, 1, 20) * sec, Value: int64(r.IntN(2))})
+	}
+
+	if r.IntN(8) == 0 {
+		add(Fault{Kind: PartialRestart, Duration: between(r, 1, 20) * sec, Count: int(between(r, 1, 3))})
+	}
+
+	sortFaults(s.Faults)
+}
+
+func sortFaults(fs []Fault) {
+	slices.SortStableFunc(fs, func(a, b Fault) int {
+		switch {
+		case a.Start < b.Start:
+			return -1
+		case a.Start > b.Start:
+			return 1
+		default:
+			return 0
+		}
+	})
+}
+
+// longRunKinds are the churn faults of GenerateLongRun.
+var longRunKinds = []FaultKind{
+	Restart, LeaderCrash, RollingRestart, NetworkPartition, Pause, MessageLoss,
+	MessageDuplication, APIServerOutage, LeaseConflicts, ClockDrift, SlowMembers,
+	KeyspaceInvalidation, ColdRestart, PartialRestart,
+}
+
+// GenerateLongRun returns a long scenario on a small cluster: a churn
+// fault every few minutes for duration, each followed by a Checkpoint that
+// requires convergence before the next one.
+func GenerateLongRun(seed uint64, members int, duration int64) Scenario {
+	r := NewRand(seed, "longrun")
+	s := Scenario{
+		Seed: seed, Members: members, Capacity: members, CellSize: 4, MaxNeighbors: 256,
+		PartitionBits: 12, Warmup: 60 * sec, Settle: 120 * sec,
+	}
+
+	for at := s.Warmup; at < duration; {
+		k := pick(r, longRunKinds...)
+		f := Fault{Kind: k, Start: at, Seed: r.Uint64(), Count: 1 + r.IntN(max(1, members/8))}
+
+		switch k {
+		case Restart, Pause, LeaderCrash, ColdRestart, PartialRestart:
+			f.Duration = between(r, 1, 30) * sec
+		case RollingRestart:
+			f.Value = between(r, 500, 3000) * 1_000_000
+			f.Count = members / 2
+			f.Duration = int64(f.Count) * f.Value
+		case NetworkPartition:
+			f.Groups, f.PPM, f.Duration = 2, uint32(between(r, 100_000, 400_000)), between(r, 5, 60)*sec
+		case MessageLoss, MessageDuplication, LeaseConflicts:
+			f.PPM, f.Duration = uint32(between(r, 10_000, 200_000)), between(r, 5, 60)*sec
+		case APIServerOutage:
+			f.Duration = between(r, 5, 60) * sec
+		case ClockDrift:
+			f.Value = pick[int64](r, -1, 1) * between(r, 1_000_000, 100_000_000)
+			f.Duration = between(r, 30, 120) * sec
+		case SlowMembers:
+			f.Value, f.Duration = between(r, 2000, 20_000), between(r, 10, 60)*sec
+		default:
+		}
+
+		if k == ColdRestart {
+			f.Value = int64(r.IntN(2))
+		}
+
+		if k == PartialRestart {
+			f.Count = 1 + r.IntN(2)
+		}
+
+		s.Faults = append(s.Faults, f)
+		end := f.End() + minSettle
+		s.Faults = append(s.Faults, Fault{Kind: Checkpoint, Start: end, Duration: 180 * sec})
+		at = end + 180*sec + between(r, 0, 60)*sec
+	}
+
+	sortFaults(s.Faults)
+
+	s.Duration = s.Warmup
+	for _, f := range s.Faults {
+		s.Duration = max(s.Duration, f.End())
+	}
+
+	s.Duration += s.Settle
+
+	return s
 }
 
 // GenerateKinds is Generate restricted to the given fault kinds, each
@@ -277,7 +408,10 @@ func generate(seed uint64, r *rand.Rand, size SizeClass, kinds []FaultKind) Scen
 				f.Value = between(r, -60, 60) * sec
 			case ClockDrift:
 				f.Count = frac(1, 100)
-				f.Value = pick[int64](r, -1, 1) * between(r, 1_000, 500_000)
+				// Up to +-10% (scaled from the original draw so the
+				// random stream is unchanged), inside the +-20% that
+				// election safety tolerates with the default durations.
+				f.Value = pick[int64](r, -1, 1) * between(r, 1_000, 500_000) * 200
 				f.Duration = between(r, 30, 300) * sec
 			case MessageLoss:
 				f.PPM = uint32(between(r, 1000, 200_000))

@@ -72,6 +72,7 @@ type Cluster struct {
 	validated map[*view.View]bool
 	faultEnd  int64
 	leaseQPS  int // peak steady-state lease QPS observed
+	ctl       controlState
 
 	cov covHandles
 }
@@ -173,6 +174,7 @@ func NewCluster(cfg ClusterConfig) *Cluster {
 	c.Lease = NewLeaseServer(sim, LeaseConfig{})
 	c.Procs = NewProcesses(sim, sc.Capacity, c)
 	c.members = make([]*member, sc.Capacity)
+	c.ctl.init(sc.Capacity)
 
 	if cfg.Prebuilt {
 		c.initial = c.prebuild(sc.Members)
@@ -186,7 +188,10 @@ func NewCluster(cfg ClusterConfig) *Cluster {
 
 	for _, f := range sc.Faults {
 		sim.At(f.Start, func() { c.apply(f) })
-		c.faultEnd = max(c.faultEnd, f.End())
+
+		if f.Kind != Checkpoint {
+			c.faultEnd = max(c.faultEnd, f.End())
+		}
 	}
 
 	if cfg.Workload != nil {
@@ -259,6 +264,13 @@ func (c *Cluster) Run() error {
 
 	if c.err == nil {
 		c.Cov.Hit("converged")
+		c.checkSane()
+
+		// Terms must not churn once faults healed (skipped for large
+		// clusters to bound the suite's runtime).
+		if c.sc.Members <= quietRunMembers {
+			c.quietRun(quietRunFor)
+		}
 	}
 
 	if c.err == nil && c.cfg.Workload != nil {
@@ -269,6 +281,12 @@ func (c *Cluster) Run() error {
 
 	return c.err
 }
+
+// quietRunMembers and quietRunFor configure the post-convergence check.
+const (
+	quietRunMembers = 512
+	quietRunFor     = 60 * sec
+)
 
 // minSettle is the least time after the last fault before liveness is
 // checked: enough for failure detection, removal, and a leader election.
@@ -356,6 +374,7 @@ func (c *Cluster) OnStart(i uint32, inc uint64) {
 		Hooks:         c.hooks(m),
 	}
 	cfg.Leader.MaxJoinsPerTick, cfg.Leader.MaxPending = 0, 0
+	cfg.DeltaLogSize = c.sc.DeltaLogSize
 
 	if c.initial != nil && m.inc == 1 {
 		cfg.Initial = c.initial
@@ -370,6 +389,8 @@ func (c *Cluster) OnStart(i uint32, inc uint64) {
 			}
 		}
 	}
+
+	c.onStartControl(i, &cfg)
 
 	if c.cfg.Node != nil {
 		c.cfg.Node(i, &cfg)
@@ -454,6 +475,7 @@ func (m *member) after() {
 	}
 
 	for _, op := range m.n.LeaseOps() {
+		c.leaseOp(m, op)
 		c.Lease.Submit(m.idx, op, func(r elect.Result) { m.leaseResult(r) })
 	}
 
@@ -594,6 +616,8 @@ func (c *Cluster) onPublish(m *member, d *view.Delta) {
 	}
 
 	c.terms[d.Version.Term] = id
+	c.notePublish(d)
+	c.checkOverlap(m, d)
 
 	if len(d.Ops) > 0 && d.Ops[0].Kind == view.KindNewTerm {
 		c.Cov.Hit("new-term")
@@ -666,21 +690,21 @@ func (c *Cluster) checkPeriodic() {
 		}
 	}
 
-	// Lease QPS: during quiet periods (no fault active, after warmup) the
-	// lease must see at most the candidates' reads plus the leader's
-	// renewals, with slack for jitter and handovers.
+	// Lease calls: per member and per second, within the budgets in
+	// control.go; the steady-state budget applies in quiet periods (no
+	// fault within the last 90s, after warmup).
 	now := c.Sim.Now()
-	if now > max(c.sc.Warmup, startupQuiet) && !c.faultActive(now-30*sec, now) {
+	quiet := now > max(c.sc.Warmup, startupQuiet) && !c.faultActive(now-30*sec, now)
+
+	if quiet {
 		series, _ := c.Lease.QPS().Series(10)
 		for _, q := range series {
 			c.leaseQPS = max(c.leaseQPS, int(q))
 		}
-
-		budget := 8
-		if c.leaseQPS > budget {
-			c.Fail(fmt.Errorf("steady-state lease QPS %d above %d", c.leaseQPS, budget))
-		}
 	}
+
+	c.checkLease(now, quiet)
+	c.checkBounded()
 }
 
 // startupQuiet is when the initial joins (one cached Lease read per member
@@ -690,7 +714,7 @@ const startupQuiet = 120 * sec
 func (c *Cluster) faultActive(from, to int64) bool {
 	for _, f := range c.sc.Faults {
 		// Membership faults cause joins and elections for a while.
-		if f.Start <= to && f.End()+90*sec >= from {
+		if f.Kind != Checkpoint && f.Start <= to && f.End()+90*sec >= from {
 			return true
 		}
 	}
@@ -803,7 +827,8 @@ func (c *Cluster) liveness() error {
 		return fmt.Errorf("liveness: cell occupancy %d..%d", lo, hi)
 	}
 
-	if want := uint64(c.Sim.Now()/int64(leader.DefaultEpochPeriod)) / 2; lv.Epoch() < want {
+	// The epoch restarts at zero with a new cluster (after a cold restart).
+	if want := uint64((c.Sim.Now()-c.ctl.genesisAt)/int64(leader.DefaultEpochPeriod)) / 2; lv.Epoch() < want {
 		return fmt.Errorf("liveness: epoch %d below %d", lv.Epoch(), want)
 	}
 
@@ -939,5 +964,7 @@ func (c *Cluster) apply(f Fault) {
 				sim.After(f.Duration, func() { c.Procs.Resume(i) })
 			}
 		}
+	default:
+		c.applyControl(f)
 	}
 }

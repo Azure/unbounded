@@ -53,7 +53,7 @@ func runCase(c dstCase) dstResult {
 
 	return dstResult{
 		trace: cl.Trace.Sum(), steps: cl.Sim.Steps(), cov: cov, err: err,
-		stats: fmt.Sprintf("deltas=%d net=%+v", cl.Stats.Get("deltas"), cl.Net.Stats()),
+		stats: fmt.Sprintf("deltas=%d net=%+v %s", cl.Stats.Get("deltas"), cl.Net.Stats(), cl.ControlStats()),
 	}
 }
 
@@ -108,6 +108,10 @@ func defaultCases(seeds []uint64, explicit bool) []dstCase {
 		sc := capBits(shorten(Generate(s, SizeSmall), 180*sec, 180*sec))
 		cases = append(cases, dstCase{name: fmt.Sprintf("small/%d", s), sc: sc, twice: true})
 	}
+
+	// Long-run stability: two simulated hours of churn on a small cluster,
+	// converging between faults.
+	cases = append(cases, dstCase{name: "longrun", sc: GenerateLongRun(seeds[0], 12, 2*3600*sec), twice: true})
 
 	medium := shorten(GenerateKinds(seeds[0], SizeMedium, Crash, LeaderCrash, MassJoin, MessageLoss), 60*sec, 150*sec)
 	medium.Members, medium.PartitionBits = 1000, 16
