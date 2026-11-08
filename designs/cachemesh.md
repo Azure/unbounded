@@ -566,7 +566,9 @@ zero allocations; `Observe` under 50ns and zero allocations; `Fresh` a few ns.
 exercises every state of the library. It contains:
 
 - a discrete-event scheduler (`int64` nanosecond clock, events ordered by time
-  then sequence number, one seeded PCG source per run),
+  then sequence number, PCG sources derived from the run seed, one named
+  stream per component so extra draws in one component do not perturb
+  another),
 - a network model: per-link latency with jitter, loss, duplication,
   reordering, slow members, and partitions between member groups,
 - per-member clocks with offset and drift (the library only sees its own
