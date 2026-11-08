@@ -228,20 +228,38 @@ func (c *Cluster) Clock(i uint32) *Clock {
 // Members returns the capacity (number of member indices).
 func (c *Cluster) Members() int { return len(c.members) }
 
-// Run runs the scenario to its end, checking invariants, and returns the
-// first violation.
+// Run runs the scenario, checking safety invariants continuously, and then
+// checks liveness: from the end of the last fault plus a minimum settle
+// period it polls every 10 simulated seconds until the cluster has
+// converged, and fails if it has not by the scenario's end plus the time
+// the rebalancer needs to move every partition once (2^PartitionBits /
+// MaxMovesPerTick ticks). It returns the first violation.
 func (c *Cluster) Run() error {
-	end := c.sc.Duration
-	for c.err == nil && c.Sim.Now() < end {
-		c.Sim.RunUntil(min(end, c.Sim.Now()+10*sec))
+	start := max(c.faultEnd, c.sc.Warmup) + minSettle
+	deadline := max(c.sc.Duration, start) + c.rebalanceBound()
+
+	for c.err == nil {
+		now := c.Sim.Now()
+		if now >= start {
+			err := c.liveness()
+			if err == nil {
+				break
+			}
+
+			if now >= deadline {
+				c.Fail(err)
+
+				break
+			}
+		}
+
+		c.Sim.RunUntil(now + 10*sec)
 		c.checkPeriodic()
 	}
 
-	if c.err != nil {
-		return c.err
+	if c.err == nil {
+		c.Cov.Hit("converged")
 	}
-
-	c.checkLiveness()
 
 	if c.err == nil && c.cfg.Workload != nil {
 		if err := c.cfg.Workload.Check(c); err != nil {
@@ -250,6 +268,14 @@ func (c *Cluster) Run() error {
 	}
 
 	return c.err
+}
+
+// minSettle is the least time after the last fault before liveness is
+// checked: enough for failure detection, removal, and a leader election.
+const minSettle = 60 * sec
+
+func (c *Cluster) rebalanceBound() int64 {
+	return int64(1)<<c.sc.PartitionBits/int64(leader.DefaultMaxMoves)*sec + 60*sec
 }
 
 // --- Prebuilt views ---
@@ -644,7 +670,7 @@ func (c *Cluster) checkPeriodic() {
 	// lease must see at most the candidates' reads plus the leader's
 	// renewals, with slack for jitter and handovers.
 	now := c.Sim.Now()
-	if now > c.sc.Warmup && !c.faultActive(now-30*sec, now) {
+	if now > max(c.sc.Warmup, startupQuiet) && !c.faultActive(now-30*sec, now) {
 		series, _ := c.Lease.QPS().Series(10)
 		for _, q := range series {
 			c.leaseQPS = max(c.leaseQPS, int(q))
@@ -656,6 +682,10 @@ func (c *Cluster) checkPeriodic() {
 		}
 	}
 }
+
+// startupQuiet is when the initial joins (one cached Lease read per member
+// without seeds) are over.
+const startupQuiet = 120 * sec
 
 func (c *Cluster) faultActive(from, to int64) bool {
 	for _, f := range c.sc.Faults {
@@ -691,12 +721,11 @@ func (c *Cluster) Leader() (uint32, bool) {
 	return best, found
 }
 
-func (c *Cluster) checkLiveness() {
+// liveness returns nil once the cluster has converged.
+func (c *Cluster) liveness() error {
 	l, ok := c.Leader()
 	if !ok {
-		c.Fail(errors.New("liveness: no leader"))
-
-		return
+		return errors.New("liveness: no leader")
 	}
 
 	lv := c.members[l].n.View()
@@ -716,26 +745,25 @@ func (c *Cluster) checkLiveness() {
 		live[memberID(m.idx)] = m.inc
 
 		if m.n.View().Digest() != lv.Digest() {
-			c.Fail(fmt.Errorf("liveness: member %d at %v, leader %d at %v", m.idx, m.n.View().Version(), l, lv.Version()))
-
-			return
+			return fmt.Errorf("liveness: member %d at %v, leader %d at %v", m.idx, m.n.View().Version(), l, lv.Version())
 		}
 	}
 
 	if leaders != 1 {
-		c.Fail(fmt.Errorf("liveness: %d leaders", leaders))
-
-		return
+		return fmt.Errorf("liveness: %d leaders", leaders)
 	}
 
-	inView := 0
+	var (
+		inView int
+		err    error
+	)
 
 	lv.ForEachMember(func(_ view.Slot, mm *view.Member) bool {
 		inc, ok := live[mm.ID]
 		if !ok || inc != mm.Incarnation {
 			// Leaving members may remain while draining.
 			if !c.leavingID(mm.ID, mm.Incarnation) {
-				c.Fail(fmt.Errorf("liveness: %s/%d in view but not live", mm.ID, mm.Incarnation))
+				err = fmt.Errorf("liveness: %s/%d in view but not live", mm.ID, mm.Incarnation)
 
 				return false
 			}
@@ -746,14 +774,12 @@ func (c *Cluster) checkLiveness() {
 		return true
 	})
 
-	if c.err != nil {
-		return
+	if err != nil {
+		return err
 	}
 
 	if inView != len(live) {
-		c.Fail(fmt.Errorf("liveness: %d of %d live members in view", inView, len(live)))
-
-		return
+		return fmt.Errorf("liveness: %d of %d live members in view", inView, len(live))
 	}
 
 	pm := make([]placement.Member, 0, lv.Len())
@@ -764,9 +790,7 @@ func (c *Cluster) checkLiveness() {
 	})
 
 	if ok, err := placement.NewPlanner(placement.Config{}).Settled(lv.Table(), pm); err != nil || !ok {
-		c.Fail(fmt.Errorf("liveness: placement not settled (%v)", err))
-
-		return
+		return fmt.Errorf("liveness: placement not settled (%v)", err)
 	}
 
 	lo, hi := lv.Len(), 0
@@ -776,16 +800,14 @@ func (c *Cluster) checkLiveness() {
 	}
 
 	if hi-lo > 1 {
-		c.Fail(fmt.Errorf("liveness: cell occupancy %d..%d", lo, hi))
-
-		return
+		return fmt.Errorf("liveness: cell occupancy %d..%d", lo, hi)
 	}
 
-	if want := uint64(c.sc.Duration/int64(leader.DefaultEpochPeriod)) / 2; lv.Epoch() < want {
-		c.Fail(fmt.Errorf("liveness: epoch %d below %d", lv.Epoch(), want))
+	if want := uint64(c.Sim.Now()/int64(leader.DefaultEpochPeriod)) / 2; lv.Epoch() < want {
+		return fmt.Errorf("liveness: epoch %d below %d", lv.Epoch(), want)
 	}
 
-	c.Cov.Hit("converged")
+	return nil
 }
 
 func (c *Cluster) leavingID(id string, inc uint64) bool {
@@ -849,7 +871,13 @@ func (c *Cluster) apply(f Fault) {
 			c.Procs.Leave(i)
 		}
 	case RollingRestart:
-		for k, i := range c.pick(f, f.Count, false) {
+		// Restarts are Value apart and all happen within Duration.
+		n := f.Count
+		if f.Value > 0 {
+			n = min(n, int(f.Duration/f.Value)+1)
+		}
+
+		for k, i := range c.pick(f, n, false) {
 			sim.After(int64(k)*f.Value, func() {
 				if c.Procs.Crash(i) {
 					sim.After(sec, func() { c.Procs.Start(i) })
