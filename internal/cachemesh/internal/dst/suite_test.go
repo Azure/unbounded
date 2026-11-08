@@ -71,6 +71,8 @@ var requiredCoverage = []string{
 	"leader-damped", "leader-reshape", "leader-cell-move",
 	"leader-plan-mandatory", "leader-plan-optional",
 	"new-term", "member-left", "converged",
+	"fault-cold-restart", "fault-partial-restart", "checkpoint-converged", "node-cold-start",
+	"node-leader-stop-higher-term",
 }
 
 // capBits keeps the default suite fast: 2^20 partitions make every leader
@@ -108,6 +110,9 @@ func defaultCases(seeds []uint64, explicit bool) []dstCase {
 		sc := capBits(shorten(Generate(s, SizeSmall), 180*sec, 180*sec))
 		cases = append(cases, dstCase{name: fmt.Sprintf("small/%d", s), sc: sc, twice: true})
 	}
+
+	// Whole-cluster and partial restarts.
+	cases = append(cases, dstCase{name: "restarts", sc: GenerateRestarts(seeds[0], 16), twice: true})
 
 	// Long-run stability: two simulated hours of churn on a small cluster,
 	// converging between faults.

@@ -33,14 +33,22 @@ const (
 	// period: (Candidates+1) callers, each at most once per RetryPeriod,
 	// plus one call each for the window edges.
 	quietPerWindow = int(10*sec/retryPeriod)*(candidates+1) + candidates + 1
-	// lossPeakPerSecond bounds elector Lease calls in any one second. During
-	// leader loss each lottery round admits Binomial(N, Budget/N) members
-	// (mean LotteryBudgetQPS), each making one read and, if the Lease is
-	// expired, one acquiring write in the next round. Twice the mean covers
-	// the binomial tail (P(X > 2*mean) is below 1e-4 for a mean of 20), so
-	// reads plus writes stay below 3*LotteryBudgetQPS; candidates and the
-	// leader add theirs.
-	lossPeakPerSecond = 3*lotteryBudget + candidates + 2
+	// lossPeakPerSecond bounds elector Lease calls in any one second once a
+	// cluster exists. During leader loss each lottery round admits about
+	// Binomial(N, Budget/N) members (mean LotteryBudgetQPS, N at least
+	// ExpectedClusterSize), each making one read and, if the Lease is
+	// expired, one acquiring write at its next tick, so one second can hold
+	// a round's reads and the previous round's writes: mean
+	// 2*LotteryBudgetQPS, standard deviation about sqrt(2*Budget) (6.3).
+	// 4*LotteryBudgetQPS is more than six standard deviations above the
+	// mean; candidates and the leader add theirs. Before the first term
+	// and for formation after it (a cluster forming) members that
+	// find no Lease bootstrap as candidates, which this bound does not
+	// cover.
+	lossPeakPerSecond = 4*lotteryBudget + candidates + 2
+	// formation is how long after the first term the members that found no
+	// Lease at start (bootstrap candidates) take to discover the leader.
+	formation = 30 * sec
 	// ownReadGap is the least simulated time between two of a joiner's own
 	// seed reads: one per 16 join attempts (32s) on a clock that may run
 	// up to 10% fast, with margin.
@@ -119,7 +127,7 @@ func (c *Cluster) leaseOp(m *member, op elect.Op) {
 	c.ctl.perSec[s]++
 	c.ctl.peak = max(c.ctl.peak, c.ctl.perSec[s])
 
-	if c.ctl.perSec[s] > lossPeakPerSecond {
+	if c.ctl.perSec[s] > lossPeakPerSecond && len(c.ctl.termStarts) > 0 && now > c.ctl.termStarts[0]+formation {
 		c.Fail(fmt.Errorf("%d elector Lease calls in second %d, budget %d", c.ctl.perSec[s], s, lossPeakPerSecond))
 	}
 }
@@ -300,7 +308,7 @@ func (c *Cluster) checkBounded() {
 			bad = "Lease seeds"
 		case s.Log > view.DefaultDeltaLogSize:
 			bad = "delta log"
-		case s.Neighbors > 4*c.sc.MaxNeighbors:
+		case s.LingerOverdue, s.Neighbors-s.Lingering > c.sc.Capacity:
 			bad = "neighbors"
 		case s.Joins > leader.DefaultMaxPending, s.Leaves > leader.DefaultMaxPending,
 			s.Suspects > leader.DefaultMaxPending, s.Invals > leader.DefaultMaxPending:

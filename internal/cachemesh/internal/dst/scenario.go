@@ -453,3 +453,31 @@ func generate(seed uint64, r *rand.Rand, size SizeClass, kinds []FaultKind) Scen
 
 	return s
 }
+
+// GenerateRestarts returns a scripted scenario on a small cluster: a
+// partial restart (the leader and all but two members die), a whole-cluster
+// restart with the usual seeds, and one without seeds, each followed by a
+// Checkpoint.
+func GenerateRestarts(seed uint64, members int) Scenario {
+	r := NewRand(seed, "restarts")
+	s := Scenario{
+		Seed: seed, Members: members, Capacity: members, CellSize: 4, MaxNeighbors: 256,
+		PartitionBits: 12, Warmup: 90 * sec, Settle: 120 * sec,
+	}
+
+	at := s.Warmup
+
+	for _, f := range []Fault{
+		{Kind: PartialRestart, Count: 2, Duration: between(r, 1, 20) * sec},
+		{Kind: ColdRestart, Value: 1, Duration: between(r, 1, 20) * sec},
+		{Kind: ColdRestart, Value: 0, Duration: between(r, 1, 20) * sec},
+	} {
+		f.Start, f.Seed = at, r.Uint64()
+		s.Faults = append(s.Faults, f, Fault{Kind: Checkpoint, Start: f.End() + minSettle, Duration: 240 * sec})
+		at = f.End() + minSettle + 240*sec
+	}
+
+	s.Duration = at + s.Settle
+
+	return s
+}
