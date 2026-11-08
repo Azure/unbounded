@@ -663,9 +663,9 @@ Implementation notes (`node` package):
   queued ahead deltas at `MaxAhead`, the delta log at `DeltaLogSize`, the
   leader's input queues at `MaxPending`; neighbors and subjects follow the
   view. `Node.Stats` reports every size.
-- A joiner that has seeds stays a follower (the elector is told it has a
-  view and has just heard from the leader), so it never enters the lottery;
-  otherwise a joiner with a skewed wall clock takes a live leader's Lease and
+- A joiner that has seeds and holds no configured view stays a follower
+  (the elector is told it has a view and has just heard from the leader),
+  so it enters the lottery only through a cold start (above); otherwise a joiner with a skewed wall clock takes a live leader's Lease and
   gives it back, forcing an election each time. A joiner that holds a
   configured view instead reports when it last applied a new version
   (heartbeats included): while it is in contact with a live cluster that
