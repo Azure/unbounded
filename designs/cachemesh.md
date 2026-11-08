@@ -235,7 +235,10 @@ members in order of `Member.Key`. Each leader tick:
 1. Mandatory: every partition owned by a removed member, or by a member with
    weight 0, gets a new owner. Prefer the old owner's best-ranked cell-mate
    whose load is under its target; otherwise the globally least-loaded member
-   (ties by `Member.Key`). If the previous owner is still a member, set `Prev`.
+   (ties by `Member.Key`). `Assign` always records the old owner in `Prev`;
+  consumers ignore a `Prev` that is no longer a member (slots are not reused
+  within the handoff window). A removed member's cell is known to the
+  rebalancer only if the leader lists it (`placement.Member.Gone`).
 2. Optional, up to `MaxMovesPerTick` (4096): move partitions from the most
    over-target members to the most under-target members, setting `Prev`.
 3. Settled invariant: every assignable member's load is within one of its

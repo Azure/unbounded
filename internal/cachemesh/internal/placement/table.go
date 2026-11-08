@@ -1,0 +1,257 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
+// Package placement holds the cachemesh partition table and the leader's
+// rebalancer.
+//
+// A cluster hashes every key into P = 2^bits partitions. The Table maps each
+// partition to an Entry naming its owner slot, the previous owner (for
+// read-through handoff), and the epoch of the last move. Tables are immutable
+// and stored in 1024-entry chunks; Assign returns a new table that shares
+// every chunk it did not touch, so a delta moving k partitions copies at most
+// k chunks and every view keeps its own table cheaply. Get is a two-level
+// array lookup with no locks and no allocation.
+//
+// The Planner is the deterministic rebalancer the leader runs each tick. Its
+// output depends only on the table contents and the member set (not on the
+// order members are listed in), so any leader computes the same plan. It
+// never reads clocks or randomness.
+package placement
+
+import (
+	"errors"
+	"fmt"
+	"slices"
+
+	"github.com/Azure/unbounded/internal/cachemesh/internal/hashing"
+)
+
+// NoMember marks a partition without an owner or an Entry without a previous
+// owner. It equals the cachemesh NoSlot value, ^uint32(0).
+const NoMember = ^uint32(0)
+
+// Bit bounds for the partition count.
+const (
+	MinBits     = 1
+	MaxBits     = 24
+	DefaultBits = 20
+)
+
+const (
+	chunkShift = 10
+	// ChunkSize is the number of entries per copy-on-write chunk.
+	ChunkSize = 1 << chunkShift
+	chunkMask = ChunkSize - 1
+)
+
+// Entry is the placement of one partition.
+type Entry struct {
+	// Owner is the slot of the owning member, or NoMember.
+	Owner uint32
+	// Prev is the owner before the last move, or NoMember. It may name a
+	// member that has since been removed; consumers must ignore a Prev that
+	// is not a current member.
+	Prev uint32
+	// Moved is the epoch of the last move, truncated to 32 bits.
+	Moved uint32
+}
+
+// Table is an immutable partition table. A nil *Table is not valid.
+type Table struct {
+	bits   uint8
+	chunks [][]Entry
+}
+
+// ErrInvalid reports invalid arguments to NewTable or Assign.
+var ErrInvalid = errors.New("placement: invalid argument")
+
+// NewTable returns a table of 2^bits partitions all owned by owner (which may
+// be NoMember) with Prev NoMember and Moved 0. It panics if bits is outside
+// MinBits..MaxBits; use ValidBits to check untrusted input first.
+func NewTable(bits uint8, owner uint32) *Table {
+	if !ValidBits(bits) {
+		panic(fmt.Sprintf("placement: bits %d outside %d..%d", bits, MinBits, MaxBits))
+	}
+
+	n := 1 << bits
+	size := min(n, ChunkSize)
+
+	// Every chunk of a fresh table has the same contents, so share one.
+	c := make([]Entry, size)
+	for i := range c {
+		c[i] = Entry{Owner: owner, Prev: NoMember}
+	}
+
+	t := &Table{bits: bits, chunks: make([][]Entry, (n+size-1)/size)}
+	for i := range t.chunks {
+		t.chunks[i] = c
+	}
+
+	return t
+}
+
+// ValidBits reports whether bits is an allowed partition bit count.
+func ValidBits(bits uint8) bool { return bits >= MinBits && bits <= MaxBits }
+
+// Bits returns the partition bit count.
+func (t *Table) Bits() uint8 { return t.bits }
+
+// Len returns the number of partitions, 2^Bits().
+func (t *Table) Len() int { return 1 << t.bits }
+
+// Get returns the entry of partition p. p must be below Len().
+func (t *Table) Get(p uint32) Entry {
+	return t.chunks[p>>chunkShift][p&chunkMask]
+}
+
+// Owner returns the owner of partition p.
+func (t *Table) Owner(p uint32) uint32 {
+	return t.chunks[p>>chunkShift][p&chunkMask].Owner
+}
+
+// NumChunks returns the number of chunks.
+func (t *Table) NumChunks() int { return len(t.chunks) }
+
+// Chunk returns chunk i, holding partitions i*ChunkSize onward. The slice is
+// shared and must not be modified.
+func (t *Table) Chunk(i int) []Entry { return t.chunks[i] }
+
+// SameChunk reports whether a and b share the storage of chunk i, which
+// tests use to check copy-on-write sharing.
+func SameChunk(a, b *Table, i int) bool {
+	return &a.chunks[i][0] == &b.chunks[i][0]
+}
+
+// ForEach calls fn for every partition in increasing order.
+func (t *Table) ForEach(fn func(p uint32, e Entry)) {
+	for ci, c := range t.chunks {
+		base := uint32(ci) << chunkShift
+		for j, e := range c {
+			fn(base+uint32(j), e)
+		}
+	}
+}
+
+// Assign returns a table with partition parts[i] owned by owners[i]. Entries
+// whose owner changes get Prev = old owner and Moved = epoch; entries already
+// owned by the requested owner are left untouched (Prev and Moved keep their
+// values). Untouched chunks are shared with t, which is not modified.
+//
+// Assign rejects mismatched lengths, partitions out of range, NoMember
+// owners, and duplicate partitions: a duplicate would make Prev ambiguous, so
+// a delta must name each partition at most once.
+func (t *Table) Assign(parts, owners []uint32, epoch uint32) (*Table, error) {
+	if len(parts) != len(owners) {
+		return nil, fmt.Errorf("%w: %d parts, %d owners", ErrInvalid, len(parts), len(owners))
+	}
+
+	n := uint32(t.Len())
+	for i, p := range parts {
+		if p >= n {
+			return nil, fmt.Errorf("%w: partition %d >= %d", ErrInvalid, p, n)
+		}
+
+		if owners[i] == NoMember {
+			return nil, fmt.Errorf("%w: partition %d assigned to NoMember", ErrInvalid, p)
+		}
+	}
+
+	if len(parts) > 1 {
+		s := slices.Clone(parts)
+		slices.Sort(s)
+
+		for i := 1; i < len(s); i++ {
+			if s[i] == s[i-1] {
+				return nil, fmt.Errorf("%w: duplicate partition %d", ErrInvalid, s[i])
+			}
+		}
+	}
+
+	nt := &Table{bits: t.bits, chunks: slices.Clone(t.chunks)}
+
+	var copied []bool
+
+	for i, p := range parts {
+		ci, j := p>>chunkShift, p&chunkMask
+
+		old := nt.chunks[ci][j]
+		if old.Owner == owners[i] {
+			continue
+		}
+
+		if copied == nil {
+			copied = make([]bool, len(nt.chunks))
+		}
+
+		if !copied[ci] {
+			copied[ci] = true
+			nt.chunks[ci] = slices.Clone(nt.chunks[ci])
+		}
+
+		nt.chunks[ci][j] = Entry{Owner: owners[i], Prev: old.Owner, Moved: epoch}
+	}
+
+	if copied == nil {
+		return t, nil
+	}
+
+	return nt, nil
+}
+
+// Equal reports whether a and b have the same bits and entries. Shared
+// chunks are compared by identity.
+func Equal(a, b *Table) bool {
+	if a.bits != b.bits {
+		return false
+	}
+
+	for i := range a.chunks {
+		if SameChunk(a, b, i) {
+			continue
+		}
+
+		if !slices.Equal(a.chunks[i], b.chunks[i]) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// Hash returns a 64-bit content hash of the table (bits and every entry).
+// Equal tables have equal hashes on every platform.
+func (t *Table) Hash() uint64 {
+	h := hashing.Mix64(uint64(t.bits) + 0x9e3779b97f4a7c15)
+	for _, c := range t.chunks {
+		for _, e := range c {
+			h = hashing.Mix64(h ^ (uint64(e.Owner) | uint64(e.Prev)<<32))
+			h = hashing.Mix64(h ^ uint64(e.Moved))
+		}
+	}
+
+	return h
+}
+
+// Loads writes per-owner partition counts into dst, indexed by owner slot,
+// growing it as needed and zeroing it first. Partitions owned by NoMember are
+// not counted.
+func (t *Table) Loads(dst []uint32) []uint32 {
+	clear(dst[:cap(dst)])
+
+	for _, c := range t.chunks {
+		for _, e := range c {
+			o := e.Owner
+			if o == NoMember {
+				continue
+			}
+
+			if int(o) >= len(dst) {
+				dst = slices.Grow(dst, int(o)+1-len(dst))[:int(o)+1]
+			}
+
+			dst[o]++
+		}
+	}
+
+	return dst
+}
