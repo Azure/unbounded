@@ -145,6 +145,8 @@ pub struct Config {
     /// Opt into logical-CPU sizing instead of one eligible CPU per physical core.
     pub allow_smt: bool,
     pub enable_rdma: bool,
+    /// RDMA-to-HTTP circuit breaker and per-page RDMA timeout.
+    pub rdma_breaker: crate::rdma::breaker::BreakerConfig,
     /// `gpu-read` support. Resolved against hardware at startup, on the GPU
     /// helper thread, because GPU handles cannot move between threads.
     pub enable_gpu: GpuMode,
@@ -487,6 +489,12 @@ impl Config {
                 .transpose()?,
             allow_smt: flag("RACER_ALLOW_SMT"),
             enable_rdma,
+            rdma_breaker: crate::rdma::breaker::BreakerConfig {
+                enabled: flag("RACER_RDMA_BREAKER"),
+                base: millis("RACER_RDMA_BREAKER_COOLDOWN_MS"),
+                max: millis("RACER_RDMA_BREAKER_MAX_COOLDOWN_MS"),
+                page_timeout: millis("RACER_RDMA_PAGE_TIMEOUT_MS"),
+            },
             enable_gpu,
             gpu_staging_bytes: u("RACER_GPU_STAGING_BYTES"),
             gpu_landing_bytes: u("RACER_GPU_LANDING_BYTES"),
@@ -815,6 +823,12 @@ impl Config {
             return rule(
                 "RACER_FLIGHTS, RACER_WAITERS_PER_FLIGHT",
                 "flights times waiters must be at most 1,048,576",
+            );
+        }
+        if self.rdma_breaker.base > self.rdma_breaker.max {
+            return rule(
+                "RACER_RDMA_BREAKER_COOLDOWN_MS, RACER_RDMA_BREAKER_MAX_COOLDOWN_MS",
+                "the breaker cooldown must not exceed its maximum",
             );
         }
         if self.reader_stall_timeout > self.request_timeout {
@@ -3119,6 +3133,34 @@ mod tests {
             ])
             .is_ok()
         );
+    }
+
+    #[test]
+    fn rdma_breaker_defaults_on_and_cooldowns_are_ordered() {
+        let config = parse(&[]).unwrap();
+        assert_eq!(
+            config.rdma_breaker,
+            crate::rdma::breaker::BreakerConfig::default()
+        );
+        let tuned = parse(&[
+            ("RACER_RDMA_BREAKER", "false"),
+            ("RACER_RDMA_BREAKER_COOLDOWN_MS", "500"),
+            ("RACER_RDMA_BREAKER_MAX_COOLDOWN_MS", "500"),
+            ("RACER_RDMA_PAGE_TIMEOUT_MS", "750"),
+        ])
+        .unwrap();
+        assert!(!tuned.rdma_breaker.enabled);
+        assert_eq!(tuned.rdma_breaker.base, Duration::from_millis(500));
+        assert_eq!(tuned.rdma_breaker.max, Duration::from_millis(500));
+        assert_eq!(tuned.rdma_breaker.page_timeout, Duration::from_millis(750));
+        for (name, value) in [
+            ("RACER_RDMA_PAGE_TIMEOUT_MS", "0"),
+            ("RACER_RDMA_PAGE_TIMEOUT_MS", "60001"),
+            ("RACER_RDMA_BREAKER_COOLDOWN_MS", "0"),
+            ("RACER_RDMA_BREAKER_COOLDOWN_MS", "30001"),
+        ] {
+            assert!(parse(&[(name, value)]).is_err(), "{name}={value}");
+        }
     }
 
     #[test]
