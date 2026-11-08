@@ -396,7 +396,6 @@ func (c *Cluster) OnStart(i uint32, inc uint64) {
 		c.cfg.Node(i, &cfg)
 	}
 
-
 	m.n = node.New(cfg, c.Sim.Stream("node/"+strconv.FormatUint(uint64(i), 10)+"/"+strconv.FormatUint(inc, 10)))
 	c.members[i] = m
 	c.Net.Resume(i)
