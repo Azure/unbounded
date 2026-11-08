@@ -549,6 +549,12 @@ Omit both count settings to retain automatic sizing.
 Extra helpers change available crypto execution capacity, not I/O ownership or
 per-I/O budgets. They do not guarantee higher throughput; compare matched workloads
 before drawing a performance conclusion.
+Each I/O worker submits crypto jobs to its assigned helper, but an idle helper
+runs jobs queued for other helpers on the same NUMA node, so one busy I/O worker
+does not leave its jobs waiting while other helpers on that node sit idle.
+Results always return to the submitting I/O worker. Jobs never move to a
+helper on another NUMA node. `racer_crypto_stolen_jobs_total` counts crypto jobs
+run by a helper other than the submitting I/O worker's own.
 
 Automatic sizing considers CPU affinity, quota, NUMA locality, and progress reserves.
 Without an explicit thread cap, one unpinned control thread runs alongside the

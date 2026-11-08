@@ -311,6 +311,7 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::PeerPageBodyNs => "racer_peer_page_body_nanoseconds_sum",
             Self::PeerPageCensored => "racer_peer_page_censored_total",
             Self::CryptoDecryptAeadRejected => "racer_crypto_decrypt_aead_rejected_total",
+            Self::CryptoStolenJobs => "racer_crypto_stolen_jobs_total",
             Self::FillDecryptDiskCorrupt => "racer_fill_decrypt_disk_corrupt_total",
             Self::FillDecryptRetainedCorrupt => "racer_fill_decrypt_retained_corrupt_total",
             Self::FillDecryptPeerCorrupt => "racer_fill_decrypt_peer_corrupt_total",

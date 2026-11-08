@@ -223,6 +223,14 @@ impl AffinityPlan {
             owner_cpu: None,
         })
     }
+    /// Per-lane key of the helpers that may run each other's crypto jobs: the
+    /// crypto NUMA node, so stolen work never crosses a known NUMA boundary.
+    pub fn crypto_share_keys(&self) -> Vec<Option<usize>> {
+        self.pairs
+            .iter()
+            .map(|pair| pair.crypto.numa_node)
+            .collect()
+    }
     /// Deterministic execution groups ordered by crypto CPU, then pair index.
     pub fn crypto_groups(&self) -> Vec<Vec<usize>> {
         let mut groups = BTreeMap::<usize, Vec<usize>>::new();
@@ -721,6 +729,28 @@ impl Resources {
         })
     }
 
+    /// Let crypto helpers run queued jobs of other lanes with the same key,
+    /// normally the crypto NUMA node. `keys` holds one key per lane.
+    pub fn share_crypto<K: Ord>(&self, keys: impl IntoIterator<Item = K>) -> Result<()> {
+        let keys = keys.into_iter().collect::<Vec<_>>();
+        if keys.len() != self.ports.len() {
+            return Err(Error::InvalidConfiguration);
+        }
+        let mut groups = BTreeMap::<&K, Vec<usize>>::new();
+        for (lane, key) in keys.iter().enumerate() {
+            groups.entry(key).or_default().push(lane);
+        }
+        for lanes in groups.into_values() {
+            let share = security::CryptoShare::new(lanes.len());
+            for (index, lane) in lanes.into_iter().enumerate() {
+                if let Some(port) = self.ports[lane].lock().map_err(|_| Error::Io)?.1.as_mut() {
+                    port.share(share.clone(), index);
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn abandon_lane(&self, lane: usize) -> Result<()> {
         if let Some(port) = self
             .ports
@@ -951,6 +981,38 @@ mod tests {
     use super::*;
     use racer_wire::control::CacheId;
     use std::thread;
+
+    /// Lanes with the same key share one crypto group with dense lane slots.
+    #[test]
+    fn crypto_sharing_groups_lanes_by_key() {
+        let env = racer_io::Env::host();
+        let limits = crate::test_support::cluster::config(false).limits;
+        let resources =
+            Resources::new(limits, (0..4).map(WorkerId).collect(), 1, env.ctx.clone()).unwrap();
+        assert_eq!(
+            resources.share_crypto([Some(0)]),
+            Err(Error::InvalidConfiguration)
+        );
+        resources
+            .share_crypto([Some(0), Some(1), Some(0), None])
+            .unwrap();
+        let ports = resources
+            .ports
+            .iter()
+            .map(|ports| ports.lock().unwrap().1.take().unwrap())
+            .collect::<Vec<_>>();
+        let shared = ports
+            .iter()
+            .map(|port| port.shared().unwrap())
+            .collect::<Vec<_>>();
+        assert!(Arc::ptr_eq(shared[0].0, shared[2].0));
+        assert!(!Arc::ptr_eq(shared[0].0, shared[1].0));
+        assert!(!Arc::ptr_eq(shared[0].0, shared[3].0));
+        assert_eq!(
+            (shared[0].1, shared[2].1, shared[1].1, shared[3].1),
+            (0, 1, 0, 0)
+        );
+    }
 
     #[test]
     fn exact_twenty_endpoint_pairs_close_independently() {

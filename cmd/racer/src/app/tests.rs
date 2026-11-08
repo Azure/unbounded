@@ -2893,7 +2893,7 @@ fn node_replacement_drains_all_workers_and_restart_converges() {
             },
             env.ctx.clone(),
         );
-        app.prepare_workers().unwrap();
+        app.prepare_workers(None).unwrap();
         group
             .start(
                 app.clone(),
@@ -3008,7 +3008,7 @@ fn two_worker_real_control_key_lease_drain_and_checkpoint_cut() {
         owner_cpu: None,
     };
     let mut group = WorkerGroup::new(plan, env.ctx.clone());
-    app.prepare_workers().unwrap();
+    app.prepare_workers(None).unwrap();
     group
         .start(
             app.clone(),

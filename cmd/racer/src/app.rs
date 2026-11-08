@@ -575,7 +575,7 @@ impl Application {
         Arc::get_mut(&mut self.config)
             .ok_or(Error::InvalidConfiguration)?
             .node = identity;
-        self.prepare_workers()?;
+        self.prepare_workers(Some(&plan))?;
         // The owner thread outlives the worker group: lanes and crypto jobs
         // return its page buffers while they drain, and dropping it after the
         // group joins waits for the owner to drain.
@@ -2717,7 +2717,8 @@ impl Application {
     }
 
     /// Allocate paired worker resources once before building service lanes.
-    fn prepare_workers(&self) -> Result<()> {
+    /// With a plan, crypto helpers on one NUMA node share their queued jobs.
+    fn prepare_workers(&self, plan: Option<&AffinityPlan>) -> Result<()> {
         let resources = crate::worker::Resources::new(
             self.limits.clone(),
             self.node
@@ -2728,6 +2729,9 @@ impl Application {
             1,
             self.ctx.clone(),
         )?;
+        if let Some(plan) = plan {
+            resources.share_crypto(plan.crypto_share_keys())?;
+        }
         self.resources
             .set(resources)
             .map_err(|_| Error::InvalidConfiguration)

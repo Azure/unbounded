@@ -541,19 +541,176 @@ impl PageCrypto {
 /// Constructed on the paired crypto thread, without access to the I/O service graph.
 /// The vetted AEAD adapter processes owned jobs in bounded quanta, checks the
 /// original deadline/cancellation, and returns every accepted job as a completion.
+///
+/// Helpers that share a [`CryptoShare`] also run each other's queued jobs, so a
+/// backlog on one lane does not wait behind its own helper while siblings idle.
+/// Completions always return through the owning lane's port.
 pub struct PageCryptoEngine {
     ctx: racer_io::WorkerCtx,
 
-    runtime: CryptoRuntime,
+    share: Arc<CryptoShare>,
 
-    executor: offload::Worker<CryptoCompletion>,
+    lane: usize,
+
+    /// Next sibling lane to try when stealing, so thieves spread over lanes.
+    cursor: usize,
+}
+type SharedPort = offload::WorkerPort<CryptoId, CryptoJob, CryptoCompletion>;
+/// One lane's worker endpoint, reachable from every helper of its share group.
+struct SharedLane {
+    port: SharedPort,
+
+    /// Jobs taken from this lane whose completions are not yet published.
+    in_flight: usize,
+
+    /// Completions a thief could not publish; the owner retries and reports them.
+    deferred: std::collections::VecDeque<CryptoCompletion>,
+
+    /// The owner observed closure with no queued job.
+    closed: bool,
+
+    /// Owner driver, woken when a thief finishes this lane's last job.
+    owner: Option<Waker>,
+}
+/// Crypto lanes whose helpers may run each other's jobs, normally one NUMA node.
+/// Every lock is held only for queue operations, never across AEAD work.
+pub struct CryptoShare {
+    lanes: Box<[std::sync::Mutex<Option<SharedLane>>]>,
+
+    /// Lanes whose helper found no work anywhere, with the driver to wake.
+    idle: std::sync::Mutex<Vec<(usize, Waker)>>,
+}
+impl CryptoShare {
+    /// Allocate a group of `lanes` slots, filled as each helper engine starts.
+    pub fn new(lanes: usize) -> Arc<Self> {
+        Arc::new(Self {
+            lanes: (0..lanes).map(|_| std::sync::Mutex::new(None)).collect(),
+            idle: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+    fn slot(&self, lane: usize) -> std::sync::MutexGuard<'_, Option<SharedLane>> {
+        // Holders never panic while mutating; recover the data on poison.
+        self.lanes[lane]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+    fn idle(&self) -> std::sync::MutexGuard<'_, Vec<(usize, Waker)>> {
+        self.idle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+    /// Wake one idle sibling to help with `lane`'s backlog.
+    fn wake_idle(&self, lane: usize) {
+        let waker = {
+            let mut idle = self.idle();
+            idle.iter()
+                .position(|(idle, _)| *idle != lane)
+                .map(|index| idle.swap_remove(index).1)
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+    fn set_idle(&self, lane: usize, waker: &Waker) {
+        let mut idle = self.idle();
+        match idle.iter_mut().find(|(idle, _)| *idle == lane) {
+            Some((_, current)) => current.clone_from(waker),
+            None => idle.push((lane, waker.clone())),
+        }
+    }
+    fn clear_idle(&self, lane: usize) {
+        self.idle().retain(|(idle, _)| *idle != lane);
+    }
+    /// Whether any lane other than `lane` has a queued job.
+    fn backlog_except(&self, lane: usize) -> bool {
+        (0..self.lanes.len()).any(|other| {
+            other != lane
+                && self.lanes[other]
+                    .try_lock()
+                    .is_ok_and(|slot| slot.as_ref().is_some_and(|l| l.port.has_jobs()))
+        })
+    }
+    /// Take one queued job from a sibling, skipping contended or absent lanes.
+    fn steal(&self, lane: usize, cursor: &mut usize) -> Option<(usize, CryptoJob)> {
+        let count = self.lanes.len();
+        for step in 0..count {
+            let other = (*cursor + step) % count;
+            if other == lane {
+                continue;
+            }
+            let Ok(mut slot) = self.lanes[other].try_lock() else {
+                continue;
+            };
+            let Some(shared) = slot.as_mut() else {
+                continue;
+            };
+            if let Ok(Some(job)) = shared.port.try_job() {
+                shared.in_flight += 1;
+                *cursor = (other + 1) % count;
+                return Some((other, job));
+            }
+        }
+        None
+    }
+    /// Publish a stolen job's completion on its owner lane. Failures are kept
+    /// for the owner to report; a lane whose owner is gone drops it.
+    fn finish_stolen(&self, source: usize, completion: CryptoCompletion) {
+        let (wake, orphan) = {
+            let mut slot = self.slot(source);
+            match slot.as_mut() {
+                Some(shared) => {
+                    shared.in_flight -= 1;
+                    let failed = match shared.port.complete(completion) {
+                        Ok(()) => false,
+                        Err(failure) => {
+                            shared.deferred.push_back(failure.command);
+                            true
+                        }
+                    };
+                    let wake = (failed || (shared.closed && shared.in_flight == 0))
+                        .then(|| shared.owner.clone())
+                        .flatten();
+                    (wake, None)
+                }
+                None => (None, Some(completion)),
+            }
+        };
+        drop(orphan);
+        if let Some(waker) = wake {
+            waker.wake();
+        }
+    }
+}
+impl CryptoPort {
+    /// Let helpers sharing `share` run this lane's jobs. `lane` must be unique
+    /// within the share and below its size.
+    pub fn share(&mut self, share: Arc<CryptoShare>, lane: usize) {
+        self.share = Some((share, lane));
+    }
+    #[cfg(test)]
+    pub(crate) fn shared(&self) -> Option<(&Arc<CryptoShare>, usize)> {
+        self.share.as_ref().map(|(share, lane)| (share, *lane))
+    }
 }
 impl PageCryptoEngine {
     pub fn new(runtime: CryptoRuntime) -> Self {
+        let CryptoRuntime {
+            port: CryptoPort { queue, share },
+            ctx,
+        } = runtime;
+        let (share, lane) = share.unwrap_or_else(|| (CryptoShare::new(1), 0));
+        *share.slot(lane) = Some(SharedLane {
+            port: queue,
+            in_flight: 0,
+            deferred: std::collections::VecDeque::new(),
+            closed: false,
+            owner: None,
+        });
         Self {
-            ctx: runtime.ctx.clone(),
-            runtime,
-            executor: offload::Worker::default(),
+            ctx,
+            share,
+            cursor: lane + 1,
+            lane,
         }
     }
     /// The crypto thread's clock and entropy.
@@ -815,18 +972,102 @@ impl PageCryptoEngine {
         }
     }
     fn drive(&mut self, cx: &mut Context<'_>, budget: usize) -> Result<()> {
-        let ctx = &self.ctx;
-        self.executor
-            .poll(&mut self.runtime.port.queue, cx, budget, |mut job| {
-                job.permit.dequeued(ctx.clock.now());
-                Self::process(job, ctx)
-            })
-            .map_err(Into::into)
+        // Publish completions a thief could not, before taking more work.
+        {
+            let mut slot = self.share.slot(self.lane);
+            let shared = slot.as_mut().ok_or(Error::Io)?;
+            if !shared
+                .owner
+                .as_ref()
+                .is_some_and(|w| w.will_wake(cx.waker()))
+            {
+                shared.owner = Some(cx.waker().clone());
+            }
+            while let Some(completion) = shared.deferred.pop_front() {
+                if let Err(failure) = shared.port.complete(completion) {
+                    shared.deferred.push_front(failure.command);
+                    return Err(failure.error.into());
+                }
+            }
+        }
+        let mut processed = 0;
+        while processed < budget {
+            let (own, backlog) = {
+                let mut slot = self.share.slot(self.lane);
+                let shared = slot.as_mut().ok_or(Error::Io)?;
+                match shared.port.poll_job(cx) {
+                    Poll::Pending => (None, false),
+                    Poll::Ready(Err(error)) => return Err(error.into()),
+                    Poll::Ready(Ok(None)) => {
+                        shared.closed = true;
+                        (None, false)
+                    }
+                    Poll::Ready(Ok(Some(job))) => {
+                        shared.in_flight += 1;
+                        (Some(job), shared.port.has_jobs())
+                    }
+                }
+            };
+            if backlog {
+                self.share.wake_idle(self.lane);
+            }
+            let (source, mut job) = match own {
+                Some(job) => (self.lane, job),
+                None => match self.share.steal(self.lane, &mut self.cursor) {
+                    Some(stolen) => stolen,
+                    None => break,
+                },
+            };
+            job.permit.dequeued(self.ctx.clock.now());
+            job.permit.measurement.stolen = source != self.lane;
+            let completion = Self::process(job, &self.ctx);
+            processed += 1;
+            if source != self.lane {
+                self.share.finish_stolen(source, completion);
+                continue;
+            }
+            let mut slot = self.share.slot(self.lane);
+            let shared = slot.as_mut().ok_or(Error::Io)?;
+            shared.in_flight -= 1;
+            if let Err(failure) = shared.port.complete(completion) {
+                shared.deferred.push_back(failure.command);
+                return Err(failure.error.into());
+            }
+        }
+        if budget != 0 && processed == budget {
+            self.share.clear_idle(self.lane);
+            cx.waker().wake_by_ref();
+        } else if budget != 0 {
+            // Advertise idleness, then recheck so a backlog published in
+            // between is not missed.
+            self.share.set_idle(self.lane, cx.waker());
+            if self.share.backlog_except(self.lane) {
+                self.share.clear_idle(self.lane);
+                cx.waker().wake_by_ref();
+            }
+        }
+        Ok(())
+    }
+    /// Closed, with no job queued, running elsewhere, or awaiting publication.
+    fn is_drained(&self) -> bool {
+        self.share.slot(self.lane).as_ref().is_none_or(|shared| {
+            shared.closed && shared.in_flight == 0 && shared.deferred.is_empty()
+        })
+    }
+}
+impl Drop for PageCryptoEngine {
+    /// Remove this lane from its share; dropping the port announces closure.
+    fn drop(&mut self) {
+        self.share.clear_idle(self.lane);
+        let shared = self.share.slot(self.lane).take();
+        drop(shared);
     }
 }
 impl crate::lifecycle::Service<RequestScope> for PageCryptoEngine {
     fn register_driver(&self, waker: &std::task::Waker) {
-        self.runtime.port.register_driver(waker);
+        if let Some(shared) = self.share.slot(self.lane).as_ref() {
+            shared.port.register_driver(waker);
+        }
     }
     fn start<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
         Box::pin(async move { scope.check() })
@@ -846,7 +1087,7 @@ impl crate::lifecycle::Service<RequestScope> for PageCryptoEngine {
             if let Err(error) = self.drive(cx, 1) {
                 return Poll::Ready(Err(error));
             }
-            if self.executor.is_drained() {
+            if self.is_drained() {
                 Poll::Ready(Ok(()))
             } else {
                 let _ = scope;
@@ -1270,6 +1511,9 @@ struct Measurement {
     failure: Option<DecryptFailureMeta>,
 
     scope_failure: crate::telemetry::DecryptScopeFailure,
+
+    /// Executed by a sibling helper rather than the lane's own.
+    stolen: bool,
 }
 struct DecryptFailureMeta {
     request: RequestId,
@@ -1370,6 +1614,9 @@ impl CryptoCompletion {
         ];
         for (event, amount) in events.into_iter().zip(amounts) {
             metrics.record(event, amount);
+        }
+        if m.stolen {
+            metrics.record(CryptoStolenJobs, 1);
         }
         if m.decrypt
             && let CryptoOutcome::Failed { error, .. } = self.outcome
@@ -1490,6 +1737,8 @@ pub struct IoCryptoPort {
 }
 pub struct CryptoPort {
     queue: offload::WorkerPort<CryptoId, CryptoJob, CryptoCompletion>,
+
+    share: Option<(Arc<CryptoShare>, usize)>,
 }
 /// Crypto-thread resources, independent of the I/O worker service graph.
 pub struct CryptoRuntime {
@@ -1520,7 +1769,13 @@ pub fn try_pair(
         },
         capacity,
     )?;
-    Ok((IoCryptoPort { queue: client }, CryptoPort { queue: worker }))
+    Ok((
+        IoCryptoPort { queue: client },
+        CryptoPort {
+            queue: worker,
+            share: None,
+        },
+    ))
 }
 impl IoCryptoPort {
     /// Atomically reserve both directions. Saturation parks with a wakeup rather
@@ -4689,6 +4944,112 @@ mod tests {
             assert!(pool.disk_idle_bytes() > 0);
             assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
         }
+    }
+    /// Helpers sharing a NUMA group run a sibling lane's backlog, return the
+    /// completions to the owning lane, wake an idle sibling, and count the theft.
+    #[test]
+    fn shared_helpers_steal_backlog_and_complete_on_owner_lane() {
+        use crate::admission::AdmissionPolicy;
+        use crate::memory::BufferPool;
+        struct Count(std::sync::atomic::AtomicUsize);
+        impl futures::task::ArcWake for Count {
+            fn wake_by_ref(this: &Arc<Self>) {
+                this.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let env = racer_io::Env::host();
+        let keys = Rc::new(crate::test_support::security::keys(&env));
+        let page = envelope().page;
+        let cache = page.version.object.cache.clone();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let share = CryptoShare::new(2);
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+            crate::test_support::cluster::config(false).limits,
+        )));
+        let pool = BufferPool::new(admission.clone());
+        let mut engines = Vec::new();
+        let mut clients = Vec::new();
+        for worker in 0..2 {
+            let (io, mut port) = pair(WorkerId(worker), 1, NonZeroUsize::new(4).unwrap());
+            port.share(share.clone(), usize::from(worker));
+            clients.push(Rc::new(CryptoClient::new(io)));
+            engines.push(PageCryptoEngine::new(CryptoRuntime {
+                port,
+                ctx: racer_io::WorkerCtx::host(),
+            }));
+        }
+        let metrics = crate::telemetry::Metrics::default();
+        clients[0].set_metrics(metrics.clone());
+        // The thief finds no work and advertises itself idle.
+        let idle = Arc::new(Count(std::sync::atomic::AtomicUsize::new(0)));
+        let idle_waker = futures::task::waker(idle.clone());
+        engines[1]
+            .poll_budgeted(&mut Context::from_waker(&idle_waker), 1)
+            .unwrap();
+        assert_eq!(idle.0.load(Ordering::SeqCst), 0);
+        let crypto = PageCrypto::new(keys, clients[0].clone(), pool.clone());
+        let scope = RequestScope::host(
+            RequestId([1; 16]),
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        let mut futures = Vec::new();
+        for index in 0..3 {
+            let length = 4000 + index;
+            let plaintext = pool
+                .plaintext(
+                    admission
+                        .reserve(Some(&cache), ResourceClass::Plaintext, length)
+                        .unwrap(),
+                    length,
+                )
+                .unwrap();
+            let reservation = admission
+                .reserve(Some(&cache), ResourceClass::Ciphertext, length + 16)
+                .unwrap();
+            let mut future = crypto.encrypt(
+                page.clone(),
+                racer_wire::object::PageSize::DEFAULT,
+                plaintext,
+                reservation,
+                &scope,
+            );
+            assert!(future.as_mut().poll(&mut cx).is_pending());
+            futures.push(future);
+        }
+        // The owner takes one job, sees a backlog, and wakes the idle sibling.
+        engines[0].poll_budgeted(&mut cx, 1).unwrap();
+        assert_eq!(idle.0.load(Ordering::SeqCst), 1);
+        // The sibling runs the remaining backlog of lane 0.
+        engines[1].poll_budgeted(&mut cx, 4).unwrap();
+        engines[0].poll_budgeted(&mut cx, 4).unwrap();
+        clients[0].poll_budgeted(8).unwrap();
+        for future in &mut futures {
+            assert!(matches!(future.as_mut().poll(&mut cx), Poll::Ready(Ok(_))));
+        }
+        assert_eq!(metrics.count(crate::telemetry::Event::CryptoStolenJobs), 2);
+        drop(futures);
+        // Closing lane 0 drains once no stolen job remains in flight.
+        clients[0].port.close_submissions().unwrap();
+        engines[0].poll_budgeted(&mut cx, 1).unwrap();
+        assert!(engines[0].is_drained());
+        assert!(!engines[1].is_drained());
+    }
+    /// Without a share, a lane's backlog is never visible to another helper.
+    #[test]
+    fn unshared_helpers_do_not_steal() {
+        let (io, port) = pair(WorkerId(0), 1, NonZeroUsize::new(1).unwrap());
+        let (_io, other) = pair(WorkerId(1), 1, NonZeroUsize::new(1).unwrap());
+        let engine = PageCryptoEngine::new(CryptoRuntime {
+            port,
+            ctx: racer_io::WorkerCtx::host(),
+        });
+        let thief = PageCryptoEngine::new(CryptoRuntime {
+            port: other,
+            ctx: racer_io::WorkerCtx::host(),
+        });
+        assert!(!Arc::ptr_eq(&engine.share, &thief.share));
+        drop(io);
     }
     #[test]
     fn encryption_preserves_staging_and_charges_on_failure() {
