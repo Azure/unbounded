@@ -182,3 +182,15 @@ func TestHealthVariants(t *testing.T) {
 		}
 	}
 }
+
+func TestReplayCase(t *testing.T) {
+	c := dstCase{name: "tiny/3", sc: Scenario{Seed: 3}}
+
+	if got := replayCase(c, false); !strings.Contains(got, "-run 'TestDST/tiny/3$'") || strings.Contains(got, EnvSeed) {
+		t.Fatalf("default case: %s", got)
+	}
+
+	if got := replayCase(c, true); got != ReplayCommand(3) {
+		t.Fatalf("explicit case: %s", got)
+	}
+}

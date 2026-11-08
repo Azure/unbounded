@@ -3,7 +3,10 @@
 
 package dst
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+)
 
 // dataPlaneConfig picks the data-plane configuration of a suite case: the
 // health variant rotates with the seed (every fourth seed makes panic
@@ -60,4 +63,16 @@ func dataPlaneCases() []dstCase {
 	sc.Duration = sc.Warmup + 210*sec + sc.Settle
 
 	return []dstCase{{name: "slow", sc: sc, twice: true}}
+}
+
+// replayCase returns the command that replays case c. A default-set case is
+// replayed by its subtest name (the default set caps partition bits and
+// includes the fixed medium, 10k, and slow cases, which a seed variable
+// alone does not reproduce); an explicit seed by the seed variable.
+func replayCase(c dstCase, explicit bool) string {
+	if explicit {
+		return ReplayCommand(c.sc.Seed)
+	}
+
+	return fmt.Sprintf("go test ./internal/cachemesh/internal/dst -run 'TestDST/%s$' -count=1 -v", c.name)
 }

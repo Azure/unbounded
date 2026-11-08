@@ -202,7 +202,7 @@ func TestDST(t *testing.T) {
 				ms.HeapAlloc>>20, r.stats)
 
 			if r.err != nil {
-				t.Fatalf("%v\nscenario: %s\nreplay: %s", r.err, c.sc.String(), ReplayCommand(c.sc.Seed))
+				t.Fatalf("%v\nscenario: %s\nreplay: %s", r.err, c.sc.String(), replayCase(c, explicit))
 			}
 
 			total.Merge(r.cov)
@@ -211,7 +211,7 @@ func TestDST(t *testing.T) {
 
 			if c.twice {
 				if r2 := runCase(c); r2.trace != r.trace || r2.steps != r.steps {
-					t.Fatalf("nondeterministic: trace %x/%x steps %d/%d\nreplay: %s", r.trace, r2.trace, r.steps, r2.steps, ReplayCommand(c.sc.Seed))
+					t.Fatalf("nondeterministic: trace %x/%x steps %d/%d\nreplay: %s", r.trace, r2.trace, r.steps, r2.steps, replayCase(c, explicit))
 				}
 			}
 		})

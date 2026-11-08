@@ -334,15 +334,27 @@ table as bit-packed columns; derived indexes are rebuilt and checked by
   every period as a heartbeat.
 - `epoch.Tracker` maps local monotonic time to an epoch:
   `current = anchorEpoch + floor((now - anchorMono) / period)`, re-anchored on
-  every heartbeat received. It never decreases. A member cut off from the
+  heartbeats received. It never decreases. A member cut off from the
   leader keeps advancing on its own clock, so expiry is never suspended.
+- An anchor never moves the phase backward: a heartbeat (or snapshot)
+  whose epoch is at or below the epoch the tracker already computes, with
+  the same period, is ignored. Heartbeats are applied up to a period after
+  their epoch began (catch-up deltas and snapshots replay old `Epoch` ops),
+  and re-anchoring on them delayed the member's epoch boundaries; a member
+  that then became leader published its late phase, every member stalled
+  to match, and each leader change stretched every lifetime by up to
+  another period. Only an anchor ahead of the member re-anchors it.
+- A member counts epochs from its start (epoch 0 at `Start`) until the
+  first heartbeat or snapshot anchors it. Anchoring at monotonic time 0
+  would start it at `uptime / period`, ahead of the cluster for good.
 - `Tracker.Current()` is an atomic load. The runtime calls
   `Tracker.Advance(now)` on every tick (default every 100ms); the request path
   never reads the clock.
 - A keyspace with TTL `T` (zero means never expires, otherwise
   `T >= 5m`) stamps values at the owner with
   `Stamp{Expires: current + ceil(T/period) + 1, Gen: generation}`. Copies
-  keep the owner's stamp. `Fresh(stamp)` is `current < Expires && Gen ==
+  keep the owner's stamp. A member without a view finds only stamps that
+  never expire fresh. `Fresh(stamp)` is `current < Expires && Gen ==
   generation`. A value therefore lives between `T` and
   `ceil(T/period)*period + period` on members whose clocks match the
   leader's, plus clock drift between heartbeats: `T + period` when `T` is a
@@ -563,6 +575,14 @@ Implementation notes (`node` package):
   `Broadcast` sender is added as a seed, a seed whose catch-up fails is
   dropped (keeping at least one), and the Lease is re-read every 16 join
   attempts.
+- The Lease keeps the cluster's seeds: a holder that knows none (a member
+  without a view that won the lottery, which then declines) keeps the
+  record's seeds when it acquires and releases, and a releasing leader
+  lists the other members it knows. Seeds are cleared only when the last
+  known member leaves. Clearing them on every release let a fresh member
+  bootstrap a second cluster next to the live one.
+- Calls that time out together are failed in call ID order, so map
+  iteration order never reaches the outbox.
 - A starting member without seeds treats any Lease record with a holder or
   seeds as a live cluster and joins through it; it bootstraps only when the
   Lease is missing, or released without seeds. Judging the holder's liveness
@@ -631,7 +651,13 @@ Implementation notes (`node` package):
 - A joiner that has seeds stays a follower (the elector is told it has a
   view and has just heard from the leader), so it never enters the lottery;
   otherwise a joiner with a skewed wall clock takes a live leader's Lease and
-  gives it back, forcing an election each time.
+  gives it back, forcing an election each time. A joiner that holds a
+  configured view instead reports when it last applied a new version
+  (heartbeats included): while it is in contact with a live cluster that
+  stays recent, and if every member of its lineage is gone (all restarted
+  with new incarnations before a leader could admit any) it enters the
+  lottery after `NoLeaderTimeout` and the winner admits itself into the
+  existing lineage, keeping its epoch and keyspace generations.
 - When the Lease (as read by the elector) names a leader of a later term
   than the view, the member catches up from that leader. This heals two
   lineages left by a partition.
@@ -883,9 +909,16 @@ rules above:
   Healthy backup, or when no backup is usable at all. Otherwise the best
   backup gets it (`KindBackup`, header flag `Backup`). If this member is
   itself the best backup, or it receives a `Backup`-flagged request while in
-  the owner's cell and also sees the owner as unusable, it serves the request
-  (`KindSelf` with `Owner` not self and the `Backup` flag set), so backup
-  hops never chain.
+  the owner's cell, it serves the request (`KindSelf` with `Owner` not self
+  and the `Backup` flag set), so backup hops never chain and a backup hop is
+  always final. The receiver serves even when its own health view finds the
+  owner usable: health views differ per member, and sending the request back
+  to the owner the sender gave up on took D+1 hops and, with failovers,
+  bounced between the owner and its backups until the TTL ran out.
+- A caller that retries or hedges to `Alternate` sends
+  `Decision.AlternateHeader()`: after a final hop (`KindOwner`,
+  `KindBackup`) it adds the `Backup` flag, so the backup serves; after a
+  relay hop it is the decision's header.
 - Relay `Alternate` is the second best of the chosen cell, or the best of the
   next candidate cell. Health is ignored when no candidate cell has a usable
   member and when the tracker is in panic.
@@ -947,8 +980,12 @@ Safety invariants, checked continuously:
 5. Every request terminates within its TTL; when all members on its path
    share a version, it visits no member twice, takes at most D hops plus one
    failover, and ends at the owner or a backup in the owner's cell.
+   (Failovers do not add hops in the implementation, so the check is at
+   most D hops.)
 6. Epochs never decrease on a member; a stamp is never `Fresh` later than
-   `T + period + drift slack` after it was issued.
+   `T + period + drift slack` after it was issued. (The slack includes up
+   to one period of epoch phase lag on members that anchored late; see the
+   data-plane notes below.)
 7. Lease API traffic stays within its budget: steady state at most
    `Candidates/RetryPeriod` plus the leader's renewals; during leader loss
    about `LotteryBudgetQPS`. Followers make no Lease calls in steady state,
@@ -1039,6 +1076,123 @@ Control-plane invariants (`dst/control.go`):
 The data-plane workload plugs in through
 `dst.Workload`. `CACHEMESH_DST_SEEDS`, `CACHEMESH_DST_SEED`, and
 `CACHEMESH_DST_LARGE=1` (100k members) control longer runs.
+
+Implementation notes (data-plane workload, `dst.DataPlane` in
+`dataplane.go`): every `TestDST` case runs it from the end of the warmup.
+
+- Routing state: each running member routes with its own `route.State`
+  over a `route.Env` holding its node's `Health()` and `Epoch()` trackers,
+  its own `route.Notes`, its configured seeds as gateways, and its ID and
+  incarnation. The state is rebuilt (O(1)) when the member's view pointer
+  or slot changed; members not in their view route through their seeds or
+  `Direct`.
+- Requests: keys come from `KeyGen` (blobs and striped layers with TTL 0,
+  metadata in the keyspaces `meta/0` to `meta/3` with TTL 5m, Zipf 1.1).
+  The cluster-wide rate is the member count clamped to 20..120 per second
+  (100 for the 1,000- and 10,000-member cases). Half the requests come from
+  up to four hot clients (heavy pullers) so that a client routes to each
+  neighbor often enough for health to learn it; while a slow-member fault
+  is active the clients issue as many requests again, so that their
+  traffic to each neighbor outnumbers the re-probes of a Degraded peer
+  (retried once its EWMA decays, about every 20s). Every 30s a herd of 160
+  requests (320 for large cases) for the hottest blob arrives within 20ms,
+  which overloads owners and relays. 0.2% of relayed requests are sent
+  with a TTL of one hop, to exercise TTL exhaustion.
+- Delivery: each hop is a `Net.Call` of kind `KindData` (60, above every
+  control kind) carrying the 32-byte header. The receiver queues it
+  (service time uniform in 0.5..1.5 times 300us, times the member's slow
+  factor; more than 16 in flight is answered `Overload`), then calls
+  `Forward` on its own state, acks, and serves (`KindSelf`) or sends on.
+  The sender observes the ack latency as `Success`, or `Failure`,
+  `Timeout` (hop timeout 250ms), or `Overload`, and then retries the
+  `Alternate` once with `AlternateHeader`. A request abandoned by its
+  sender is dropped by the receiver; a lost ack leaves two live branches,
+  both tracked. The origin hedges to the `Alternate` (with `FlagHedge`)
+  when its first hop is unanswered after `HedgeAfter` and `TryHedge`
+  allows it; the first served branch wins. A receiver that sees a newer
+  version in a header calls `node.NoteVersion` from `Notes.Take`, as
+  `Mesh` does. Every terminal result goes into the trace hash.
+- Phases: a request is steady when membership was settled at the last
+  5-second check (a leader, every running member at its version and in it,
+  no member paused) and no fault was active within 30s; otherwise it is a
+  fault-phase request. Latency histograms are kept overall, per phase, for
+  steady client requests (the tail baseline), and for judged slow windows.
+
+Data-plane invariants (each failure names the seed and replay command):
+
+- (4) Every 5s each member's `Neighbors()` count is at most `MaxNeighbors`
+  (or the estimate of the best shape when no shape meets it) while its
+  view's cell occupancies differ by at most one, and twice that otherwise.
+- (5) Every request reaches a terminal state (served, failed, no route,
+  TTL exhausted, or the origin's 5s deadline) and all its branches resolve
+  within `(MaxDims+3) * 2 * hop timeout + HedgeMax`. A branch whose
+  routers were all members at the same version visits no member twice,
+  takes at most D hops (failovers do not add hops), never exhausts its
+  TTL, and is served by the owner or a member of the owner's cell. No
+  non-truncated request exhausts its TTL in steady state with no view
+  change since a second before it started (TTL exhaustion while a
+  partition move propagates, when the old and new owner each send to the
+  other, is what the TTL is for). A deadline miss in steady state fails.
+- (6) Epochs never decrease. Up to 256 sampled stamps of served metadata
+  requests are checked every 5s on 8 random members: a stamp must not be
+  `Fresh` on a member of its view later than `T + period + slack` after
+  issue, with
+  `slack = period + 2 * TickInterval + 1s + 2 * 0.05% of the age` (a member
+  lags the issuer's epoch phase by at most the period of an anchor that
+  arrived late, plus the leader's and its own tick, plus latency and
+  drift). The issuer still finds it `Fresh` up to `T - period` after issue
+  when no fault was active within 90s. A member whose view has a newer
+  generation for the keyspace never finds an older stamp `Fresh`.
+  Non-members are not held to the upper bound: one may have anchored its
+  epoch from a stale lineage's snapshot (a restarted process that caught
+  up from a partitioned peer) and lags until it hears the leader. A member
+  without any view finds no expiring stamp fresh (`route.State.Fresh`).
+- (11) After convergence, 8 random partitions per member (1 for the large
+  cases) are walked with `RoutePartition` and `Forward` through every
+  member's own state: at most D hops, no `Direct`, `Gateway`, or `NoRoute`,
+  ending at the owner, or at a backup only when the deciding member finds
+  the owner not `Healthy`.
+- Ejections: `Ejected + Probing` never exceeds `MaxEjectionPercent` of the
+  largest tracked count over the last 335s (the longest ejection), which
+  is recorded on every neighbor change; peers ejected while more were
+  tracked stay ejected when neighbors are removed.
+- Hedges: each member's hedges are at most the hedge ratio times its
+  routed decisions, plus one.
+- Tail latency, judged on requests from clients that are members of their
+  view, start at least 30s after a slow-member fault of at least 10x
+  began, while membership is settled and slow members are the only
+  data-plane fault (no other fault except clock skew or drift, API server
+  outage, lease conflicts, or invalidation active within the last minute):
+  outlier detection is relative to the median of a member's peers, so
+  while most peers time out (partition, loss) a slow member is not an
+  outlier, and crashed or paused peers take the few ejections
+  `MaxEjectionPercent` allows. The requests that send a hop to a slow
+  member are at most half of the expected count without protection (slow
+  share of running members times the mean path length) when at least 20
+  are expected; with at least 200 baseline and judged requests, p99 is at
+  most the hop timeout plus three times the steady client p99 (at the 99th
+  percentile a request pays at most one hop timeout), and p50 at most
+  twice the steady p50 plus 1ms. The default set adds a targeted case
+  (`slow`: 40 members, two 30x slow members for 150s, clock drift, an
+  invalidation) so the check always runs.
+
+Health variants rotate with the seed: seeds 2 mod 4 use
+`MaxEjectionPercent` 60 and `PanicThreshold` 20 (with the defaults at most
+10% can be ejected and panic needs more than 50%, so panic is
+unreachable), and seeds 3 mod 4 use `HedgeRatio` 0.5 (the 5% default needs
+about 20 routed requests per shard and interval before the first hedge,
+more than simulated members route). The data-plane coverage states are the
+seven decision kinds, the five health states, uneject, panic,
+hedge sent, won, and denied, failover, TTL exhausted, handoff (`PrevOwner`
+set), stamp expired and invalidated, note-version, overload, the route
+check, and a judged tail window.
+
+Known limits: health protection beyond the first hop depends on relays
+seeing enough traffic to each neighbor, which simulated rates give only to
+the hot clients, so p99 in slow windows is bounded by one hop timeout
+rather than by a multiple of the baseline. An idle peer's EWMA decays only
+toward the median, so after a burst of timeouts (message loss) a member's
+median stays high until it observes its peers again.
 
 ## Defaults
 
