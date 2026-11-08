@@ -123,6 +123,16 @@ impl<C> Worker<C> {
         Ok(())
     }
 
+    /// Whether the queue is at capacity.
+    pub(crate) fn is_full(&self) -> bool {
+        lock(&self.channel.queue).commands.len() >= self.channel.capacity
+    }
+
+    /// Whether the queue holds commands the owner has not drained.
+    pub(crate) fn is_pending(&self) -> bool {
+        !lock(&self.channel.queue).commands.is_empty()
+    }
+
     /// Ready once the queue has space. Fails with [`Error::Unavailable`]
     /// once the owner is gone.
     pub(crate) fn poll_ready(&self, cx: &mut Context<'_>) -> Poll<Result<()>> {

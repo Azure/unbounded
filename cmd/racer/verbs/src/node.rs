@@ -390,6 +390,121 @@ struct NodeShared {
     alive: AtomicBool,
 
     owner: AtomicWaker,
+
+    /// Owner loop progress, read by workers to spot a stalled owner.
+    loop_stats: OwnerLoopStats,
+}
+
+/// Why the owner polled again at once instead of parking (see
+/// [`Owner::next_wake`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ImmediateWake {
+    /// The last pass handled a full command budget; more may be queued.
+    Commands,
+
+    /// A link reaped a full completion batch or holds synthetic
+    /// completions.
+    Completions,
+}
+
+impl ImmediateWake {
+    /// Every reason, in index order.
+    pub const ALL: [Self; 2] = [Self::Commands, Self::Completions];
+
+    /// Metric and log label.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Commands => "commands",
+            Self::Completions => "completions",
+        }
+    }
+}
+
+/// Owner loop counters on the wall clock, independent of the owner's
+/// (possibly simulated) context clock, so a stall is measured in real
+/// time.
+struct OwnerLoopStats {
+    base: std::time::Instant,
+
+    /// Nanoseconds since `base` plus one when the current pass started; 0
+    /// between passes.
+    pass_started: AtomicU64,
+
+    /// Nanoseconds since `base` when the last pass ended.
+    pass_ended: AtomicU64,
+
+    passes: AtomicU64,
+
+    commands: AtomicU64,
+
+    immediate: [AtomicU64; ImmediateWake::ALL.len()],
+}
+
+impl OwnerLoopStats {
+    fn new() -> Self {
+        Self {
+            base: std::time::Instant::now(),
+            pass_started: AtomicU64::new(0),
+            pass_ended: AtomicU64::new(0),
+            passes: AtomicU64::new(0),
+            commands: AtomicU64::new(0),
+            immediate: Default::default(),
+        }
+    }
+
+    fn elapsed(&self) -> u64 {
+        u64::try_from(self.base.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    }
+
+    fn begin(&self) {
+        self.pass_started
+            .store(self.elapsed().saturating_add(1), Ordering::Release);
+    }
+
+    fn end(&self, commands: usize) {
+        self.pass_ended.store(self.elapsed(), Ordering::Release);
+        self.pass_started.store(0, Ordering::Release);
+        self.passes.fetch_add(1, Ordering::Relaxed);
+        self.commands.fetch_add(commands as u64, Ordering::Relaxed);
+    }
+
+    /// How long the current pass has run, if one is running.
+    fn in_pass(&self) -> Option<Duration> {
+        match self.pass_started.load(Ordering::Acquire) {
+            0 => None,
+            started => Some(Duration::from_nanos(
+                self.elapsed().saturating_sub(started - 1),
+            )),
+        }
+    }
+
+    /// Time since the last pass ended (or since the node started).
+    fn since_pass(&self) -> Duration {
+        Duration::from_nanos(
+            self.elapsed()
+                .saturating_sub(self.pass_ended.load(Ordering::Acquire)),
+        )
+    }
+}
+
+/// A snapshot of the owner loop counters ([`Client::owner_loop`]).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct OwnerLoop {
+    /// Completed owner passes ([`Owner::poll_budgeted`] calls that did
+    /// work).
+    pub passes: u64,
+
+    /// Commands the owner handled.
+    pub commands: u64,
+
+    /// Immediate re-polls by [`ImmediateWake`] index.
+    pub immediate: [u64; ImmediateWake::ALL.len()],
+
+    /// How long the current pass has run, if the owner is inside one.
+    pub in_pass: Option<Duration>,
+
+    /// Time since the last pass ended.
+    pub since_pass: Duration,
 }
 
 /// What keeps a closed round from draining.
@@ -465,6 +580,7 @@ pub fn node(workers: usize) -> Result<(Vec<Client>, OwnerPort)> {
         blocker: AtomicU8::new(0),
         alive: AtomicBool::new(true),
         owner: AtomicWaker::new(),
+        loop_stats: OwnerLoopStats::new(),
     });
     let clients = handles
         .into_iter()
@@ -687,6 +803,36 @@ impl Client {
     /// its last poll.
     pub fn grant_waiters(&self) -> usize {
         self.shared.grant_waiters.load(Ordering::Relaxed)
+    }
+
+    /// Owner loop counters, for metrics and diagnostics.
+    pub fn owner_loop(&self) -> OwnerLoop {
+        let stats = &self.shared.loop_stats;
+        OwnerLoop {
+            passes: stats.passes.load(Ordering::Relaxed),
+            commands: stats.commands.load(Ordering::Relaxed),
+            immediate: std::array::from_fn(|i| stats.immediate[i].load(Ordering::Relaxed)),
+            in_pass: stats.in_pass(),
+            since_pass: stats.since_pass(),
+        }
+    }
+
+    /// Whether this worker's command queue to the owner is full, so a new
+    /// command fails [`Error::Overloaded`] without reaching the owner.
+    pub fn command_queue_full(&self) -> bool {
+        self.worker.is_full()
+    }
+
+    /// Whether the owner looks stuck for at least `threshold` of wall time:
+    /// one pass has run that long (a native call that never returns, say),
+    /// or this worker's queue holds commands and no pass ended for that
+    /// long. An idle owner parked with nothing queued is not stalled.
+    pub fn owner_stalled(&self, threshold: Duration) -> bool {
+        let stats = &self.shared.loop_stats;
+        if stats.in_pass().is_some_and(|ran| ran >= threshold) {
+            return true;
+        }
+        self.worker.is_pending() && stats.since_pass() >= threshold
     }
 
     /// Receiver: like [`Self::grant`], but over a free buffer of the rail's
@@ -1172,8 +1318,15 @@ impl Owner {
         let now = self.ctx.now();
         let mut next: Option<Instant> = self.expiry;
         let mut at = |t: Instant| next = Some(next.map_or(t, |n| n.min(t)));
+        let immediate = |reason: ImmediateWake| {
+            self.shared.loop_stats.immediate[reason as usize].fetch_add(1, Ordering::Relaxed);
+            Some(now)
+        };
         if self.backlog {
-            return Some(now);
+            return immediate(ImmediateWake::Commands);
+        }
+        if self.links.values().any(Link::busy) {
+            return immediate(ImmediateWake::Completions);
         }
         // Destroys to retry and shutdown checks retry on a short timer. The
         // snapshot always publishes within the poll that dirtied it.
@@ -1220,6 +1373,7 @@ impl Owner {
             return Ok(());
         }
 
+        self.shared.loop_stats.begin();
         let now = self.ctx.now();
         let closed = self.shared.closed.load(Ordering::Acquire);
 
@@ -1238,6 +1392,7 @@ impl Owner {
         self.channel
             .try_drain(budget, |_, command| commands.push(command));
         self.backlog = commands.len() >= budget;
+        let handled = commands.len();
 
         for command in commands.drain(..) {
             self.handle(command, now);
@@ -1281,6 +1436,7 @@ impl Owner {
         }
 
         self.publish(now);
+        self.shared.loop_stats.end(handled);
         #[cfg(any(test, feature = "simulation"))]
         self.check_wake();
         Ok(())
@@ -2714,5 +2870,72 @@ mod tests {
             Poll::Ready(Some(Error::Unavailable))
         );
         assert_eq!(clients[0].reopen(), Err(Error::Unavailable));
+    }
+
+    #[test]
+    /// A full queue is visible to the worker, and queued commands no pass
+    /// drains for the threshold read as a stalled owner. A drained queue
+    /// does not.
+    fn queued_commands_without_a_pass_stall_the_owner() {
+        let (clients, port) = node(1).unwrap();
+        let key = LinkKey {
+            peer: [1; 32],
+            rail: 0,
+        };
+        let threshold = Duration::from_millis(20);
+        assert!(!clients[0].owner_stalled(threshold));
+        let ops: Vec<_> = (0..COMMAND_QUEUE).map(|_| clients[0].open(key)).collect();
+        assert!(clients[0].command_queue_full());
+        std::thread::sleep(threshold);
+        assert!(clients[0].owner_stalled(threshold));
+        assert!(!clients[0].owner_stalled(Duration::from_secs(3600)));
+
+        let mut owner = Owner::new(port, racer_io::WorkerCtx::host());
+        owner.poll_budgeted(COMMAND_QUEUE).unwrap();
+        assert!(!clients[0].command_queue_full());
+        assert!(!clients[0].owner_stalled(threshold));
+        drop(ops);
+    }
+
+    #[test]
+    /// A pass that runs past the threshold reads as stalled even with an
+    /// empty queue (a native call that never returns); ending it clears
+    /// that.
+    fn a_pass_that_never_ends_stalls_the_owner() {
+        let (clients, port) = node(1).unwrap();
+        let threshold = Duration::from_millis(20);
+        port.shared.loop_stats.begin();
+        assert!(!clients[0].owner_stalled(threshold));
+        std::thread::sleep(threshold);
+        assert!(clients[0].owner_stalled(threshold));
+        assert!(clients[0].owner_loop().in_pass.is_some());
+        port.shared.loop_stats.end(0);
+        assert!(!clients[0].owner_stalled(threshold));
+        assert_eq!(clients[0].owner_loop().in_pass, None);
+    }
+
+    #[test]
+    /// The owner counts passes and handled commands. A pass that used its
+    /// whole command budget re-polls at once and counts a commands wake;
+    /// once drained, an owner with no links parks.
+    fn owner_loop_counts_passes_commands_and_immediate_wakes() {
+        let (clients, port) = node(1).unwrap();
+        let key = LinkKey {
+            peer: [1; 32],
+            rail: 0,
+        };
+        let mut owner = Owner::new(port, racer_io::WorkerCtx::host());
+        let ops: Vec<_> = (0..3).map(|_| clients[0].open(key)).collect();
+        owner.poll_budgeted(2).unwrap();
+        assert!(owner.next_wake().is_some_and(|t| t <= owner.ctx_now()));
+        owner.poll_budgeted(2).unwrap();
+        assert_eq!(owner.next_wake(), None);
+        let stats = clients[0].owner_loop();
+        assert_eq!(stats.passes, 2);
+        assert_eq!(stats.commands, 3);
+        assert_eq!(stats.immediate[ImmediateWake::Commands as usize], 1);
+        assert_eq!(stats.immediate[ImmediateWake::Completions as usize], 0);
+        assert_eq!(stats.in_pass, None);
+        drop(ops);
     }
 }
