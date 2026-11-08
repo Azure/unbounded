@@ -283,6 +283,35 @@ chunks. Ops:
 | `Invalidate{Seed, Gen}` | Keyspace generation bump. |
 | `Config{PartitionBits, ...}` | Cluster constants; only in the first delta of a cluster. |
 
+Delta rules (`view.Apply`):
+
+- `Delta{Base, Version, Digest, Ops}`. `Digest` is the digest of the
+  resulting view, `sha256(Digest(base) || canonical encoding of the delta
+  without its digest)`; the genesis digest is
+  `sha256("cachemesh/view/v1/genesis")`. `Apply` fails with `ErrBase` if
+  `base.Version != delta.Base`, `ErrVersion` unless `Version` is
+  `{base.Term, base.Seq+1}` (or `{Term, 1}` when the first op is `NewTerm`
+  with a larger term), and `ErrDigest` on a digest mismatch, which also
+  detects a forked base.
+- `NewTerm` is only valid as the first op. `Config` is only valid when the
+  view has no config; it creates the table with every partition owned by
+  `InitialOwner` (no 2^20-entry `Assign` at bootstrap) and a one-cell
+  shape, so the bootstrap delta can admit members in cell 0 and a later
+  `Reshape` sets the real grid. Member, cell, and partition ops require a
+  config; `Epoch` and `Invalidate` do not.
+- `AddMember` takes the next slot (`SlotCap`) or a free slot whose
+  reuse epoch has passed; `Joined` and `Since` are set from the view epoch.
+  `RemoveMember` frees the slot until `epoch + SlotReuseEpochs`. `Assign`
+  owners must be members when the op runs.
+- At the end of a delta the leader must be a member when the term is
+  non-zero, and while the view has members no partition may be owned by a
+  non-member (per-slot loads are maintained incrementally, so this check is
+  O(1)). A removal therefore moves the member's partitions in the same
+  delta, before or after the `RemoveMember` op.
+- `Apply` copies only the storage chunks it touches (256 members, 1024
+  loads, 256 cells, 1024 ID index entries per chunk) except for `Config` and
+  `Reshape`, which rebuild the cell index.
+
 `view.Validate(v)` checks every structural invariant (owners are members,
 cells match members, occupancy counts, slot uniqueness, shape bounds). Tests
 and the simulator call it on every view they build.
@@ -291,7 +320,9 @@ Every node keeps a `DeltaLog` of the last `DeltaLogSize` (512) deltas so it
 can serve catch-up. `view.Interner` lets the simulator share identical views
 (keyed by digest) across simulated nodes; production uses no interner.
 
-`view.Snapshot` encodes a whole view; `view.Observers(v, slot)` and
+`view.AppendSnapshot` encodes a whole view (members, free slots, and the
+table as bit-packed columns; derived indexes are rebuilt and checked by
+`DecodeSnapshot`); `view.Observers(v, slot)` and
 `view.Subjects(v, slot)` give the monitoring relation (below).
 
 ## Rolling cluster epoch
