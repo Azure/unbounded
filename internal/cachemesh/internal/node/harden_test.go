@@ -539,3 +539,27 @@ func TestJoinerSingleLeaseRead(t *testing.T) {
 		t.Fatalf("%d Lease ops before the first read returned", ops)
 	}
 }
+
+// TestColdRestartStaleView: every member died and fresh processes start
+// from the last view (for example a persisted one), which none of them is
+// in, so none is a candidate. They must still elect a leader and rejoin.
+func TestColdRestartStaleView(t *testing.T) {
+	c := grow(t, 5)
+	c.run(2 * time.Minute)
+
+	v := c.nodes[c.leader()].View()
+
+	for i := range 5 {
+		c.down[i] = true
+	}
+
+	c.run(time.Second)
+
+	for i := range 5 {
+		cfg := c.cfg(i, []string{addr((i + 1) % 5)})
+		cfg.Initial = v
+		c.add(cfg)
+	}
+
+	c.waitConverged(5 * time.Minute)
+}

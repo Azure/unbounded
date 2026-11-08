@@ -568,16 +568,19 @@ Implementation notes (`node` package):
   Lease is missing, or released without seeds. Judging the holder's liveness
   by wall clock alone here would let a skewed clock start a second cluster.
 - Cold start (every member died, so the Lease names a dead leader and dead
-  seeds). A member that has never been in a view enters a cold start when
+  seeds). A member that is not in its view (it may hold none, or a stale
+  one from before the restart) enters a cold start when
   all of these hold at one of its own Lease reads (the start read, or the
   re-read every 16 join attempts, with or without configured seeds): the
   record, or its absence, has the same UID and resourceVersion as a read at
   least `LeaseDuration` earlier on the member's monotonic clock; a held
   record is expired by wall time beyond `LeaseDuration +
-  ClockSkewAllowance`; and no reply from a peer that has a view arrived for
-  `LeaseDuration`. A cold-starting member is no longer held as a follower,
+  ClockSkewAllowance`; and no reply from a peer that is a member of its
+  view arrived for `LeaseDuration` (peers that hold a view they are not in
+  do not count, or restarted processes would hold each other back). A cold-starting member is no longer held as a follower,
   so it enters the lottery (bounding Lease reads at `LotteryBudgetQPS`); a
-  lottery winner publishes a first view like a bootstrapper and the others
+  lottery winner publishes a first view like a bootstrapper (or a new term
+  of the stale view it holds, admitting itself) and the others
   discover it in the Lease and join. The unchanged-resourceVersion rule is
   the candidates' rule, so a joiner with a skewed wall clock that is cut off
   from a live cluster never cold-starts: the live leader's renewals keep
@@ -594,9 +597,15 @@ Implementation notes (`node` package):
   overflow. `NoteVersion`, fed from data-plane headers whose term is
   truncated to 32 bits, may trigger a catch-up but never a step-down, so
   terms that differ only above bit 32 cannot cause a regression.
-- A member that is leaving never starts a term: if a Lease acquire that was
-  in flight when `Leave` was called succeeds, it releases the Lease at once
-  and keeps leaving.
+- A leaving member hands leadership off once: if a Lease acquire that was
+  in flight when `Leave` was called succeeds (or it wins the lottery), it
+  releases the Lease at once, which any candidate takes immediately. A
+  member that is not in its view always declines. If it wins the Lease
+  again, nobody else could take it, so it leads rather than leave the
+  cluster leaderless (it may be the only live member). A leaving leader
+  drains itself and releases once its partitions have moved; after a first
+  hand-off it releases again only when another member became Active after
+  it started leaving (so is known to be alive).
 - Snapshot trust. A snapshot's version and digest are taken from its
   encoding, so a corrupt or forged one decodes. A snapshot served by a peer
   other than the leader of its view is *unconfirmed* until a delta applies on

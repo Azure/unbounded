@@ -934,9 +934,14 @@ func (n *Node) electEvents(now int64) {
 
 func (n *Node) startLeading(now int64, term uint64) {
 	_, has := n.v.Config()
-	if n.leaving {
-		// The acquire was in flight when Leave was called: a leaving
-		// member never starts a term. Give the Lease straight back.
+	if n.leaving && (!n.isMember() || !n.handedOff) {
+		// The acquire was in flight when Leave was called (or a lottery
+		// read found the Lease free): a leaving member hands leadership
+		// off once by giving the Lease straight back, which any candidate
+		// takes at once. If it wins the Lease again, nobody else could
+		// take it, so it leads (while still a member) rather than leave
+		// the cluster without a leader; see sendLeave for when it lets go.
+		n.handedOff = true
 		n.event("acquire-declined-leaving")
 		n.leaseOps = append(n.leaseOps, n.el.Release(n.electInput(now, n.wall))...)
 

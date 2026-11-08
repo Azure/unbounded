@@ -324,6 +324,8 @@ type Node struct {
 	ownReadDone bool
 	leaving     bool
 	left        bool
+	handedOff   bool   // gave up leadership once while leaving
+	leaveEpoch  uint64 // epoch at Leave
 	nextLeave   int64
 	leaderAddr  string // last known leader address hint
 
@@ -511,6 +513,7 @@ func (n *Node) Leave(now int64) {
 	}
 
 	n.leaving = true
+	n.leaveEpoch = n.ep.Current()
 	n.nextLeave = now
 	n.event("leave")
 }
@@ -746,8 +749,11 @@ func (n *Node) rereadLease() {
 
 func (n *Node) sendLeave(now int64) {
 	if n.isMember() && n.v.State(n.slot) == view.Draining {
-		if n.leading && n.v.Load(n.slot) == 0 && !n.releasing {
-			n.releasing = true
+		// Release once the partitions have moved away. After a first
+		// hand-off that nobody took, release again only for a member
+		// that became Active since this one started leaving, so is alive.
+		if n.leading && n.v.Load(n.slot) == 0 && !n.releasing && (!n.handedOff || n.activeSince(n.leaveEpoch)) {
+			n.releasing, n.handedOff = true, true
 			n.leaseOps = append(n.leaseOps, n.el.Release(n.electInput(now, n.wall))...)
 			n.event("leader-release")
 		}
@@ -995,7 +1001,11 @@ func (n *Node) OnReply(now int64, id uint64, resp []byte, err error) {
 			addr = n.addrOf(p.slot)
 		}
 
-		if !m.Version.IsZero() {
+		// Contact with the cluster means a reply from a member of a view.
+		// Peers that only hold a view they are not in (all restarted after
+		// the members died) do not count, or they would hold each other
+		// back from a cold start forever.
+		if m.From.Slot != view.NoSlot {
 			n.lastContact = now
 		}
 
@@ -1131,17 +1141,18 @@ func (n *Node) resign(now int64, reason string) {
 	n.leaseOps = append(n.leaseOps, n.el.Release(n.electInput(now, n.wall))...)
 }
 
-// noteColdRead tracks this member's own Lease reads while it has never
-// been a member. It enables a cold start, which lets the member take part
-// in the lottery and publish a first view, once the Lease shows no sign of
-// life and no peer with a view has answered: the record (or its absence)
-// stayed unchanged for LeaseDuration of local time across reads, it is
-// expired by wall time beyond LeaseDuration+ClockSkewAllowance, and no reply
-// from a member with a view arrived for LeaseDuration. Requiring an
+// noteColdRead tracks this member's own Lease reads while it is not a
+// member of a view. It enables a cold start, which lets the member take
+// part in the lottery and, if it wins, publish a first view (or a new term
+// of the view it holds), once the Lease shows no sign of life and no member
+// has answered: the record (or its absence) stayed unchanged for
+// LeaseDuration of local time across reads, it is expired by wall time
+// beyond LeaseDuration+ClockSkewAllowance, and no reply from a peer that is
+// a member of its view arrived for LeaseDuration. Requiring an
 // unchanged resourceVersion on the local monotonic clock, as candidates do,
 // keeps a member with a skewed wall clock from stealing a live Lease.
 func (n *Node) noteColdRead(now int64, wall time.Time, r elect.Result) {
-	if _, has := n.v.Config(); has || n.joined || n.coldStart || n.bootstrapper {
+	if n.isMember() || n.coldStart || n.bootstrapper || n.leaving {
 		return
 	}
 
@@ -1211,4 +1222,18 @@ func (n *Node) Stats() Stats {
 		Joins: j, Leaves: l, Suspects: s, Invals: i,
 		Unconfirmed: n.unconfirmed, BadBase: n.badBase, ColdStart: n.coldStart,
 	}
+}
+
+// activeSince reports whether the view has another Active member whose
+// state changed at or after epoch ep.
+func (n *Node) activeSince(ep uint64) bool {
+	found := false
+
+	n.v.ForEachMember(func(s view.Slot, m *view.Member) bool {
+		found = s != n.slot && m.State == view.Active && m.Since >= ep
+
+		return !found
+	})
+
+	return found
 }
