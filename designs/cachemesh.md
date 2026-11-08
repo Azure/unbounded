@@ -497,6 +497,16 @@ States:
   take it. This bounds API traffic during leader loss at about
   `LotteryBudgetQPS` (20/s) across the whole cluster.
 
+A record held by the same MemberID with a different incarnation is treated
+like any other holder (wait `LeaseDuration`), since IDs may collide; only a
+record held by the elector's own incarnation, or a released or missing Lease,
+is taken at once. An outstanding Lease operation whose result has not arrived
+within `OpTimeout` (default `RetryPeriod`) is abandoned and its late result
+ignored. A leader's deadline counts from the send time of its last successful
+write, and the node calls `CanPublish(now)` before every publish, so a leader
+paused past `RenewDeadline` never publishes on wake. `kubelease` preserves
+labels, foreign annotations, and unused spec fields on update.
+
 Fencing: every delta carries its term. Members reject deltas with a term lower
 than their view's term. A leader that loses the Lease stops publishing before
 any other member can acquire it (`RenewDeadline < LeaseDuration`).
