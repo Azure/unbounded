@@ -57,7 +57,10 @@ type Tracker struct {
 	// Writer-only fields.
 	anchorEpoch uint64
 	anchorMono  int64
-	period      time.Duration
+
+	// period is written by Anchor and read by Period, which the request
+	// path may call concurrently (route.State.Stamp), so it is atomic.
+	period atomic.Int64
 }
 
 // Current returns the current epoch. Safe for concurrent use.
@@ -65,11 +68,11 @@ func (t *Tracker) Current() uint64 { return t.cur.Load() }
 
 // Period returns the period of the latest anchor.
 func (t *Tracker) Period() time.Duration {
-	if t.period <= 0 {
-		return DefaultPeriod
+	if p := time.Duration(t.period.Load()); p > 0 {
+		return p
 	}
 
-	return t.period
+	return DefaultPeriod
 }
 
 // Anchor records that epoch began (or was observed) at local time now with
@@ -79,7 +82,7 @@ func (t *Tracker) Period() time.Duration {
 func (t *Tracker) Anchor(epoch uint64, period time.Duration, now int64) uint64 {
 	t.anchorEpoch = epoch
 	t.anchorMono = now
-	t.period = period
+	t.period.Store(int64(period))
 
 	return t.Advance(now)
 }
@@ -89,7 +92,12 @@ func (t *Tracker) Anchor(epoch uint64, period time.Duration, now int64) uint64 {
 func (t *Tracker) Advance(now int64) uint64 {
 	e := t.anchorEpoch
 	if d := now - t.anchorMono; d > 0 {
-		e += uint64(d / int64(t.Period()))
+		n := uint64(d / int64(t.Period()))
+		if e > Never-n {
+			e = Never
+		} else {
+			e += n
+		}
 	}
 
 	if prev := t.cur.Load(); e <= prev {
@@ -121,8 +129,18 @@ func StampFor(current uint64, ttl, period time.Duration, gen uint32) Stamp {
 		period = DefaultPeriod
 	}
 
-	n := uint64((ttl + period - 1) / period)
-	if current > Never-n-1 {
+	if ttl < 0 {
+		// Invalid; treat as already expired rather than wrapping.
+		return Stamp{Expires: current, Gen: gen}
+	}
+
+	// ceil(ttl/period) without overflowing ttl + period - 1.
+	n := uint64(ttl / period)
+	if ttl%period != 0 {
+		n++
+	}
+
+	if current >= Never-n-1 {
 		return Stamp{Expires: Never, Gen: gen}
 	}
 

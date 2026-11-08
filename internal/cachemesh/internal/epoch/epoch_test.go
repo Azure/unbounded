@@ -234,3 +234,53 @@ func BenchmarkAdvance(b *testing.B) {
 		tr.Advance(i)
 	}
 }
+
+func TestStampForExtremes(t *testing.T) {
+	// A TTL near MaxInt64 must not overflow ttl+period-1 into a tiny or
+	// wrapped stamp.
+	s := StampFor(10, time.Duration(math.MaxInt64), DefaultPeriod, 0)
+	if want := uint64(10 + math.MaxInt64/int64(DefaultPeriod) + 2); s.Expires != want {
+		t.Fatalf("huge ttl: Expires = %d, want %d", s.Expires, want)
+	}
+
+	if s := StampFor(5, -time.Second, DefaultPeriod, 0); Fresh(s, 5, 0) {
+		t.Fatalf("negative ttl must not be fresh: %+v", s)
+	}
+
+	if s := StampFor(Never-3, MinTTL, DefaultPeriod, 0); s.Expires != Never {
+		t.Fatalf("saturation: Expires = %d", s.Expires)
+	}
+}
+
+func TestAdvanceSaturates(t *testing.T) {
+	var tr Tracker
+
+	tr.Anchor(Never-1, time.Nanosecond, 0)
+
+	if got := tr.Advance(1 << 40); got != Never {
+		t.Fatalf("Advance = %d, want saturation at %d", got, uint64(Never))
+	}
+}
+
+// TestPeriodConcurrent is meaningful under -race: Period is read on the
+// request path while the tick goroutine anchors.
+func TestPeriodConcurrent(t *testing.T) {
+	var (
+		tr Tracker
+		wg sync.WaitGroup
+	)
+
+	wg.Go(func() {
+		for i := range 1000 {
+			tr.Anchor(uint64(i), time.Duration(1+i%3)*time.Second, int64(i))
+		}
+	})
+
+	for range 1000 {
+		if p := tr.Period(); p <= 0 {
+			t.Fatalf("Period = %v", p)
+		}
+	}
+
+	wg.Wait()
+}
