@@ -349,6 +349,9 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::RdmaBreakerTripTimeout => "racer_rdma_breaker_trips_total" { "reason=\"timeout\"" },
             Self::RdmaBreakerTripSlowFallback => "racer_rdma_breaker_trips_total" { "reason=\"slow_fallback\"" },
             Self::RdmaBreakerTripSetup => "racer_rdma_breaker_trips_total" { "reason=\"setup\"" },
+            Self::RdmaBreakerSoftTimeout => "racer_rdma_breaker_soft_failures_total" { "reason=\"timeout\"" },
+            Self::RdmaBreakerSoftSlowFallback => "racer_rdma_breaker_soft_failures_total" { "reason=\"slow_fallback\"" },
+            Self::RdmaBreakerSoftLoad => "racer_rdma_breaker_soft_failures_total" { "reason=\"load\"" },
             Self::RdmaBreakerClose => "racer_rdma_breaker_closes_total",
             Self::RdmaBreakerHttp => "racer_rdma_breaker_http_total",
             Self::RdmaPageTimeout => "racer_rdma_page_timeouts_total",
@@ -2140,6 +2143,7 @@ mod tests {
                         && !line.starts_with("racer_gpu_read_requests_total{")
                         && !line.starts_with("racer_rdma_link_breaks_total{")
                         && !line.starts_with("racer_rdma_breaker_trips_total{")
+                        && !line.starts_with("racer_rdma_breaker_soft_failures_total{")
                         && !line.starts_with("racer_peer_connection_closes_total{")
                         && !line.starts_with("racer_rdma_link_setups_total{")
                         && !line.starts_with("racer_rdma_plan_http_total{")

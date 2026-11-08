@@ -522,25 +522,41 @@ impl Links {
         LinkNode::lock(&self.node.breaker).is_open(peer, rail)
     }
 
-    /// Record an RDMA failure for `peer` on `rail`, tripping its breaker.
+    /// Record an RDMA failure signal for `peer` on `rail`: a hard failure
+    /// trips its breaker, a soft or load one is counted (see
+    /// [`super::breaker::Severity`]).
     pub fn breaker_trip(&self, peer: &NodeId, rail: RailId, reason: super::breaker::TripReason) {
+        use super::breaker::{TripReason as R, Verdict};
+        use crate::telemetry::Event;
         let now = self.ctx.clock.now();
-        let opened = LinkNode::lock(&self.node.breaker).trip(peer, rail, reason, now);
-        if let Some(transition) = opened {
-            use super::breaker::TripReason as R;
-            use crate::telemetry::Event;
-            self.record(
-                match reason {
-                    R::LinkDown => Event::RdmaBreakerTripLinkDown,
-                    R::Grant => Event::RdmaBreakerTripGrant,
-                    R::Send => Event::RdmaBreakerTripSend,
-                    R::Timeout => Event::RdmaBreakerTripTimeout,
-                    R::SlowFallback => Event::RdmaBreakerTripSlowFallback,
-                    R::Setup => Event::RdmaBreakerTripSetup,
-                },
-                1,
-            );
-            self.log_breaker(peer, rail, transition, now);
+        let verdict = LinkNode::lock(&self.node.breaker).trip(peer, rail, reason, now);
+        match verdict {
+            Verdict::Tripped(transition) => {
+                self.record(
+                    match reason {
+                        R::LinkDown => Event::RdmaBreakerTripLinkDown,
+                        R::Grant => Event::RdmaBreakerTripGrant,
+                        R::Send => Event::RdmaBreakerTripSend,
+                        R::Timeout => Event::RdmaBreakerTripTimeout,
+                        R::SlowFallback => Event::RdmaBreakerTripSlowFallback,
+                        R::Setup => Event::RdmaBreakerTripSetup,
+                        // Load never trips.
+                        R::Load => return,
+                    },
+                    1,
+                );
+                self.log_breaker(peer, rail, transition, now);
+            }
+            Verdict::Counted => {
+                let event = match reason {
+                    R::Timeout => Event::RdmaBreakerSoftTimeout,
+                    R::SlowFallback => Event::RdmaBreakerSoftSlowFallback,
+                    R::Load => Event::RdmaBreakerSoftLoad,
+                    R::LinkDown | R::Grant | R::Send | R::Setup => return,
+                };
+                self.record(event, 1);
+            }
+            Verdict::Ignored => {}
         }
     }
 

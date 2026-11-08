@@ -808,6 +808,46 @@ pub(crate) mod send_in_place {
     }
 
     #[test]
+    fn breaker_counts_soft_failures_and_trips_on_a_streak_or_a_hard_failure() {
+        use crate::rdma::breaker::{SOFT_TRIP_THRESHOLD, TripReason};
+        let w = world();
+        let (w, ma, _) = metered(w);
+        let links = &w.a.links;
+        let peer = NodeId("soft-peer".into());
+        for _ in 0..4 {
+            links.breaker_trip(&peer, RAIL, TripReason::Load);
+        }
+        for _ in 1..SOFT_TRIP_THRESHOLD {
+            links.breaker_trip(&peer, RAIL, TripReason::Timeout);
+        }
+        links.breaker_success(&peer, RAIL);
+        links.breaker_trip(&peer, RAIL, TripReason::SlowFallback);
+        assert!(!links.breaker_open(&peer, RAIL));
+        assert_eq!(ma.count(Event::RdmaBreakerSoftLoad), 4);
+        assert_eq!(
+            ma.count(Event::RdmaBreakerSoftTimeout),
+            u64::from(SOFT_TRIP_THRESHOLD - 1)
+        );
+        assert_eq!(ma.count(Event::RdmaBreakerSoftSlowFallback), 1);
+        assert_eq!(ma.count(Event::RdmaBreakerTripTimeout), 0);
+        // Completing the streak trips it, counted as a trip, not a soft failure.
+        for _ in 1..SOFT_TRIP_THRESHOLD {
+            links.breaker_trip(&peer, RAIL, TripReason::Timeout);
+        }
+        assert!(links.breaker_open(&peer, RAIL));
+        assert_eq!(ma.count(Event::RdmaBreakerTripTimeout), 1);
+        assert_eq!(
+            ma.count(Event::RdmaBreakerSoftTimeout),
+            u64::from(2 * SOFT_TRIP_THRESHOLD - 3)
+        );
+        // A hard failure on another peer trips at once.
+        let other = NodeId("hard-peer".into());
+        links.breaker_trip(&other, RAIL, TripReason::Send);
+        assert!(links.breaker_open(&other, RAIL));
+        assert_eq!(ma.count(Event::RdmaBreakerTripSend), 1);
+    }
+
+    #[test]
     fn send_writes_the_page_in_place_and_counts_it() {
         let mut w = world();
         let env = w.env.clone();
