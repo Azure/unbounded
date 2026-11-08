@@ -1531,6 +1531,15 @@ func (w *DataPlane) walk(from, p uint32, dims int) error {
 
 		next, ok := parseAddr(d.Next.Addr)
 		if !ok || !w.running(next) {
+			// Liveness accepts a leaving member that is still in the view
+			// after its process stopped (it is removed by failure
+			// detection); the walk cannot continue through it.
+			if mm, in := st.View().Member(d.Next.Slot); in && w.c.leavingID(mm.ID, mm.Incarnation) {
+				*w.Counts.Counter("route-check-leaving")++
+
+				return nil
+			}
+
 			return fmt.Errorf("next hop %q is not running", d.Next.Addr)
 		}
 

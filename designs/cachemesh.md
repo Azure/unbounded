@@ -587,6 +587,11 @@ Implementation notes (`node` package):
   lists the other members it knows. Seeds are cleared only when the last
   known member leaves. Clearing them on every release let a fresh member
   bootstrap a second cluster next to the live one.
+- A leaving member never (re)joins. A member removed by a partition that
+  is then asked to leave used to keep sending joins, and one reaching the
+  leader after the process stopped re-admitted it. A join the leader had
+  already queued can still admit a member whose process has stopped;
+  failure detection removes it.
 - Calls that time out together are failed in call ID order, so map
   iteration order never reaches the outbox.
 - A starting member without seeds treats any Lease record with a holder or
@@ -1021,7 +1026,9 @@ registered state is never reached across the default seed set.
 
 Default `go test` runs a seed set that finishes in about a minute and includes
 a 10k-member cluster, a scripted series of whole-cluster and partial
-restarts, and two simulated hours of churn on a small cluster.
+restarts, and two simulated hours of churn on a small cluster. A failure
+prints a replay command: the subtest name for default-set cases,
+`CACHEMESH_DST_SEED` for explicit seeds.
 
 Implementation notes (control-plane suite, `dst.Cluster` and
 `suite_test.go`): each member is a `node.Node` with its own `dst.Clock`,
@@ -1029,8 +1036,9 @@ ticked at its `NextDeadline`; outbox calls go through `Net.Call` and Lease
 operations through `LeaseServer.Submit`. Large clusters start from a view
 prebuilt by running the leader logic offline (`node.Config.Initial`), so the
 first leader is elected over an existing view. The default set is 16 tiny
-and 4 small generated scenarios (each run twice and trace-compared), one
-1,000-member and one 10,000-member scenario; only every fourth tiny/small
+and 4 small generated scenarios and the targeted 40-member `slow` scenario
+(each run twice and trace-compared), one 1,000-member and one
+10,000-member scenario; only every fourth tiny/small
 seed keeps `PartitionBits` 20, the rest use 16 to bound runtime. The default set also has
 `restarts` (`GenerateRestarts`: a partial restart that kills the leader
 and all but two members, then whole-cluster restarts with and without
