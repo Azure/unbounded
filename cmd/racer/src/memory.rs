@@ -30,15 +30,25 @@ pub(crate) fn default_disk_alignment() -> page_alloc::Alignment {
     page_alloc::Alignment::new(4096, 4096, 4096).expect("valid default alignment")
 }
 
-/// Idle buffers each worker's pool keeps per capacity class.
+/// Minimum idle buffers each worker's pool keeps per capacity class.
 ///
-/// Idle storage stays charged to [`ResourceClass::Pool`], so the bound is kept
-/// to a few pages per class. This is a ceiling, not a steady state:
+/// The actual per-class cap is [`pool_idle_per_class`]: as many full pages as
+/// the [`ResourceClass::Pool`] budget covers, since idle storage stays charged
+/// to that class and its byte budget is the real bound. A small fixed count
+/// made every page past the first few under high concurrency map on take and
+/// unmap on return. The cap is a ceiling, not a steady state:
 /// [`BufferPool::maintain_idle_buffers`] sheds half of the idle storage after
 /// each window without a checkout, so an idle worker's pool empties within a
 /// few windows while continuous reuse keeps it warm. Memory pressure sheds it
 /// at once.
 pub(crate) const POOL_IDLE_PER_CLASS: usize = 4;
+
+/// Per-class idle cap for a worker whose [`ResourceClass::Pool`] budget is
+/// `pool_bytes`: the number of full pages it covers, at least
+/// [`POOL_IDLE_PER_CLASS`]. Idle bytes stay bounded by the budget itself.
+pub(crate) fn pool_idle_per_class(pool_bytes: usize) -> usize {
+    (pool_bytes / PAGE_BYTES as usize).max(POOL_IDLE_PER_CLASS)
+}
 
 /// Writable aligned ciphertext storage from one worker's pool. Dropping it
 /// unfrozen returns the storage to that pool and releases its reservation.
@@ -135,6 +145,8 @@ pub struct BufferPool {
     /// returns here from any thread, so a warm path reuses a mapping instead
     /// of mapping and unmapping a fresh one.
     disk: Rc<std::cell::RefCell<page_alloc::buf::Pool>>,
+    /// Per-class idle cap of `disk`.
+    idle_cap: usize,
     demand: Rc<std::cell::Cell<IdleDemand>>,
 }
 /// Mutable staging buffer, not proof of authentication and not client-deliverable.
@@ -519,10 +531,11 @@ impl BufferPool {
         admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
         alignment: page_alloc::Alignment,
     ) -> Self {
+        let idle_cap = pool_idle_per_class(admission.limit(ResourceClass::Pool));
         let disk = page_alloc::buf::Pool::new(
             page_alloc::buf::PoolConfig {
                 alignment: alignment.memory(),
-                max_idle_per_class: POOL_IDLE_PER_CLASS,
+                max_idle_per_class: idle_cap,
             },
             flow_control::QuotaPoolAccount::new(admission.shared(), ResourceClass::Pool),
         )
@@ -531,6 +544,7 @@ impl BufferPool {
             admission,
             alignment,
             disk: Rc::new(std::cell::RefCell::new(disk)),
+            idle_cap,
             demand: Default::default(),
         }
     }
@@ -540,13 +554,21 @@ impl BufferPool {
         self.alignment
     }
     /// Idle and trimming counters of this worker's pool. `bytes` is the
-    /// charged idle storage; `entries` is not tracked.
-    #[cfg(test)]
+    /// charged idle storage; `misses` are checkouts that mapped new storage
+    /// and `rejects` returns that were freed. `entries` is not tracked.
     pub(crate) fn pool_stats(&self) -> page_alloc::PoolStats {
         let demand = self.demand.get();
+        let Ok(pool) = self.disk.try_borrow() else {
+            return Default::default();
+        };
+        let counters = pool.counters();
         page_alloc::PoolStats {
-            bytes: self.disk.borrow().idle_bytes(),
-            max_depth: POOL_IDLE_PER_CLASS,
+            bytes: pool.idle_bytes(),
+            target: self.idle_cap,
+            max_depth: self.idle_cap,
+            hits: counters.hits,
+            misses: counters.misses,
+            rejects: counters.rejects,
             trimmed: demand.trimmed,
             constrained: demand.constrained,
             ..Default::default()
@@ -4928,6 +4950,50 @@ pub(crate) mod tests {
         // Releasing idle storage keeps admission untouched.
         pool.reclaim_idle_buffers();
         assert_eq!(pool.disk_idle_bytes(), 0);
+    }
+
+    #[test]
+    fn pool_idle_cap_follows_pool_budget() {
+        let page = PAGE_BYTES as usize;
+        assert_eq!(pool_idle_per_class(0), POOL_IDLE_PER_CLASS);
+        assert_eq!(pool_idle_per_class(page * 2), POOL_IDLE_PER_CLASS);
+        assert_eq!(pool_idle_per_class(page * 64 + page - 1), 64);
+    }
+
+    #[test]
+    fn concurrent_pages_reuse_storage_without_new_mappings() {
+        let length = PAGE_BYTES as usize + 16;
+        let probe = BufferPool::new(admission(8));
+        let capacity = probe.aligned_capacity(length).unwrap();
+        let depth = 3 * POOL_IDLE_PER_CLASS;
+        let mut limits = crate::test_support::cluster::config(false).limits;
+        limits.ciphertext_bytes = std::num::NonZeroUsize::new(capacity * (depth + 1)).unwrap();
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
+        let pool = BufferPool::new(admission.clone());
+        assert!(pool.pool_stats().max_depth >= depth);
+        let burst = || {
+            let buffers: Vec<_> = (0..depth)
+                .map(|_| {
+                    let reservation = admission
+                        .reserve(None, ResourceClass::Ciphertext, capacity)
+                        .unwrap();
+                    pool.aligned_ciphertext(reservation, length).unwrap()
+                })
+                .collect();
+            drop(buffers);
+        };
+        burst();
+        let warm = pool.pool_stats();
+        assert_eq!(warm.misses, depth as u64);
+        assert_eq!(warm.rejects, 0, "every return fits the Pool budget");
+        for _ in 0..5 {
+            burst();
+        }
+        let steady = pool.pool_stats();
+        assert_eq!(steady.misses, warm.misses, "steady state maps nothing");
+        assert_eq!(steady.rejects, 0);
+        assert_eq!(steady.hits, 5 * depth as u64);
+        assert_eq!(pool.disk_idle_bytes(), depth * capacity);
     }
 
     #[test]

@@ -54,6 +54,10 @@ struct MemoryShards {
     staging:
         crate::telemetry::primitives::SnapshotShards<Option<(WorkerId, flow_control::PoolStats)>>,
 
+    // Each worker's page buffer pool (ciphertext, disk reads, plaintext).
+    buffers:
+        crate::telemetry::primitives::SnapshotShards<Option<(WorkerId, flow_control::PoolStats)>>,
+
     // One node-wide slot written by the sampling worker.
     process: crate::telemetry::primitives::SnapshotShards<ProcessMemory>,
 }
@@ -768,6 +772,13 @@ impl Metrics {
             .replace(self.shard, Some((worker, stats)));
     }
 
+    /// Replace this worker's page buffer pool statistics from its health tick.
+    pub(crate) fn observe_buffer_pool(&self, worker: WorkerId, stats: flow_control::PoolStats) {
+        self.memory
+            .buffers
+            .replace(self.shard, Some((worker, stats)));
+    }
+
     /// Replace the node-wide process and cgroup memory sample.
     pub(crate) fn observe_memory(&self, memory: ProcessMemory) {
         self.memory.process.replace(0, memory);
@@ -852,7 +863,9 @@ impl Metrics {
             }
         }
         let staging: Vec<_> = self.memory.staging.snapshots().flatten().collect();
-        write_pools(out, "staging_pool", &staging)
+        write_pools(out, "staging_pool", &staging)?;
+        let buffers: Vec<_> = self.memory.buffers.snapshots().flatten().collect();
+        write_pools(out, "buffer_pool", &buffers)
     }
 
     /// Install once during worker assembly, not on the admission hot path.
@@ -913,6 +926,7 @@ impl Metrics {
         let disks = crate::telemetry::primitives::SnapshotShards::new(count);
         let memory = Arc::new(MemoryShards {
             staging: crate::telemetry::primitives::SnapshotShards::new(count),
+            buffers: crate::telemetry::primitives::SnapshotShards::new(count),
             process: crate::telemetry::primitives::SnapshotShards::new(1),
         });
         let cache_disks = crate::telemetry::primitives::SnapshotShards::new(count);
@@ -1803,6 +1817,8 @@ mod tests {
             };
             metrics[0].observe_staging_pool(WorkerId(3), staging(2, 4096, 5));
             metrics[1].observe_staging_pool(WorkerId(4), staging(1, 1024, 10));
+            metrics[0].observe_buffer_pool(WorkerId(3), staging(0, 8192, 100));
+            metrics[1].observe_buffer_pool(WorkerId(4), staging(0, 4096, 200));
             output.clear();
             metrics[1].write_prometheus(&mut output).unwrap();
             let sum = |class| quotas.iter().map(|q| q.limit(class)).sum::<usize>();
@@ -1833,6 +1849,11 @@ mod tests {
                 "# TYPE racer_worker_staging_pool_bytes gauge\n".to_string(),
                 "racer_worker_staging_pool_bytes{worker=\"3\"} 4096\n".to_string(),
                 "racer_worker_staging_pool_bytes{worker=\"4\"} 1024\n".to_string(),
+                "racer_buffer_pool_bytes 12288\n".to_string(),
+                "# TYPE racer_buffer_pool_misses_total counter\nracer_buffer_pool_misses_total 302\n"
+                    .to_string(),
+                "racer_buffer_pool_rejects_total 304\n".to_string(),
+                "racer_worker_buffer_pool_bytes{worker=\"3\"} 8192\n".to_string(),
                 // Compatibility series remain per worker.
                 "racer_worker_relay_used{worker=\"4\"} 1\n".to_string(),
             ] {

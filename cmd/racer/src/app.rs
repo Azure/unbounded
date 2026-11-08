@@ -2383,11 +2383,12 @@ impl WorkerApplication {
         sample_ciphertext_holders(&self.runtime.admission, &self.memory, &self.store.writer);
     }
 
-    /// Publish this worker's staging pool and, on the sampling worker, the
+    /// Publish this worker's staging and page buffer pools and, on the sampling worker, the
     /// process memory sample at most once per second.
     fn observe_memory(&mut self, now: std::time::Instant) {
         let metrics = &self.telemetry.metrics;
         metrics.observe_staging_pool(self.worker, self.store.writer.staging_pool_stats());
+        metrics.observe_buffer_pool(self.worker, self.memory.buffers().pool_stats());
         if !self.pressure.samples_memory || now < self.pressure.next_memory_sample {
             return;
         }

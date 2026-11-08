@@ -337,6 +337,9 @@ struct Shared {
 
     max_idle: usize,
 
+    // Returns refused (cap, budget, or closed pool) and freed instead.
+    rejects: AtomicUsize,
+
     classes: [Class; MAX_CLASSES],
 }
 
@@ -358,10 +361,12 @@ impl Shared {
         }
         if class.idle.fetch_add(1, Ordering::AcqRel) >= self.max_idle {
             class.idle.fetch_sub(1, Ordering::AcqRel);
+            self.rejects.fetch_add(1, Ordering::Relaxed);
             return Some(region);
         }
         if !self.account.charge_idle(region.capacity) {
             class.idle.fetch_sub(1, Ordering::AcqRel);
+            self.rejects.fetch_add(1, Ordering::Relaxed);
             return Some(region);
         }
         region.charged = true;
@@ -405,6 +410,21 @@ pub struct Pool {
 
     // Buffers checked out since creation, for demand-driven idle trimming.
     takes: u64,
+
+    // Checkouts that allocated (mapped) new storage.
+    misses: u64,
+}
+
+/// Lifetime counters of a [`Pool`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PoolCounters {
+    /// Checkouts served from idle storage.
+    pub hits: u64,
+    /// Checkouts that allocated new storage (an `mmap` for large buffers).
+    pub misses: u64,
+    /// Returned buffers the pool refused and freed (an `munmap` for large
+    /// buffers): its idle cap or idle budget was full, or it was closed.
+    pub rejects: u64,
 }
 
 impl fmt::Debug for Pool {
@@ -428,13 +448,24 @@ impl Pool {
                 closed: AtomicBool::new(false),
                 idle_bytes: AtomicUsize::new(0),
                 max_idle: config.max_idle_per_class,
+                rejects: AtomicUsize::new(0),
                 classes: std::array::from_fn(|_| Class::new()),
             }),
             local: std::array::from_fn(|_| Vec::new()),
             alignment: config.alignment,
             granule: config.alignment.max(GRANULE),
             takes: 0,
+            misses: 0,
         })
+    }
+
+    /// Lifetime hit, miss, and reject counters.
+    pub fn counters(&self) -> PoolCounters {
+        PoolCounters {
+            hits: self.takes.wrapping_sub(self.misses),
+            misses: self.misses,
+            rejects: self.shared.rejects.load(Ordering::Relaxed) as u64,
+        }
     }
 
     /// Buffers checked out since creation. Owners compare samples across a
@@ -507,7 +538,11 @@ impl Pool {
         self.takes = self.takes.wrapping_add(1);
         let region = match (class != NO_CLASS).then(|| self.pop(class)).flatten() {
             Some(region) => region,
-            None => Region::allocate(capacity, self.alignment, class)?,
+            None => {
+                let region = Region::allocate(capacity, self.alignment, class)?;
+                self.misses = self.misses.wrapping_add(1);
+                region
+            }
         };
         Ok(Buf {
             region: Some(region),
@@ -925,6 +960,47 @@ mod tests {
         // A refused charge is not a checkout.
         assert!(pool.take(4097, Bytes(4096), false).is_err());
         assert_eq!(pool.takes(), 2);
+    }
+
+    #[test]
+    fn counters_track_misses_hits_and_rejects() {
+        let limit = std::sync::Arc::new(IdleLimit::new(8192));
+        let mut pool = pool(&limit);
+        assert_eq!(pool.counters(), PoolCounters::default());
+        let first = pool.take(4096, (), false).unwrap();
+        let second = pool.take(4096, (), false).unwrap();
+        let third = pool.take(4096, (), false).unwrap();
+        // Three idle returns against an 8 KiB budget: the third is freed.
+        drop((first, second, third));
+        assert_eq!(
+            pool.counters(),
+            PoolCounters {
+                hits: 0,
+                misses: 3,
+                rejects: 1,
+            }
+        );
+        // Steady reuse within the idle budget allocates nothing new.
+        for _ in 0..10 {
+            let a = pool.take(4096, (), false).unwrap();
+            let b = pool.take(4096, (), false).unwrap();
+            drop((a, b));
+        }
+        assert_eq!(
+            pool.counters(),
+            PoolCounters {
+                hits: 20,
+                misses: 3,
+                rejects: 1,
+            }
+        );
+        // The per-class cap refuses past four idle buffers.
+        let mut wide = self::pool(&std::sync::Arc::new(IdleLimit::new(1 << 20)));
+        let held: Vec<_> = (0..5)
+            .map(|_| wide.take(4096, (), false).unwrap())
+            .collect();
+        drop(held);
+        assert_eq!(wide.counters().rejects, 1);
     }
 
     #[test]

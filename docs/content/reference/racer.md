@@ -1472,6 +1472,24 @@ network access, especially with host networking.
 `racer_delivery_bytes_total` counts every body byte delivered to clients;
 `racer_delivery_direct_bytes_total` counts only those sent outside the splice path.
 
+Each I/O worker keeps a pool of page buffers for ciphertext copies, disk
+reads, and plaintext. Its series are node-wide sums, updated about once per
+second:
+
+| Metric | Type | Meaning |
+|--------|------|---------|
+| `racer_buffer_pool_bytes` | gauge | Idle buffer bytes kept for reuse, charged to the `pool` admission class |
+| `racer_buffer_pool_target` | gauge | Per-worker cap on idle buffers of one size |
+| `racer_buffer_pool_hits_total` | counter | Buffers taken from idle storage |
+| `racer_buffer_pool_misses_total` | counter | Buffers that needed new memory (an `mmap` for page-sized buffers) |
+| `racer_buffer_pool_rejects_total` | counter | Returned buffers freed instead of kept (an `munmap` for page-sized buffers) |
+| `racer_buffer_pool_trimmed_total` | counter | Times idle buffers were released after an idle window or under memory pressure |
+| `racer_worker_buffer_pool_bytes` | gauge | `racer_buffer_pool_bytes` per worker, labeled `worker` |
+
+`racer_buffer_pool_entries` is always 0. While load is steady, misses and
+rejects should stay flat. If they keep rising, idle buffers do not fit the
+`pool` class budget, which equals the worker's ciphertext budget.
+
 A failed client request also counts in one of
 `racer_request_errors_overloaded_total`, `racer_request_errors_unavailable_total`,
 `racer_request_errors_deadline_total`, `racer_request_errors_cancelled_total`, or
