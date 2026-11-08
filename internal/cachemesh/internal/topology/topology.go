@@ -218,6 +218,10 @@ func (s *Shape) CellOf(coords []uint32) uint32 {
 	return c
 }
 
+// Stride returns the cell-number distance between neighbors in dimension
+// dim: the product of the sizes of the lower dimensions.
+func (s *Shape) Stride(dim int) uint32 { return s.stride[dim] }
+
 // Replace returns cell with its coordinate in dim set to coord.
 func (s *Shape) Replace(cell uint32, dim int, coord uint32) uint32 {
 	return cell - s.Coord(cell, dim)*s.stride[dim] + coord*s.stride[dim]

@@ -265,12 +265,15 @@ type State struct {
 	table    *placement.Table
 	self     view.Slot
 	selfCell uint32
-	member   bool
-	bits     uint8
-	ttl      uint8
-	handoff  uint32
-	term     uint32
-	seq      uint64
+	// selfCoords are the coordinates of selfCell, so that decide divides
+	// only the owner's cell.
+	selfCoords [topology.MaxDims]uint32
+	member     bool
+	bits       uint8
+	ttl        uint8
+	handoff    uint32
+	term       uint32
+	seq        uint64
 }
 
 // NewState returns the routing state of the member at slot self in v. A nil
@@ -308,6 +311,7 @@ func NewState(v *view.View, self view.Slot, env *Env) *State {
 		(env.selfID == "" || (m.ID == env.selfID && (env.selfInc == 0 || m.Incarnation == env.selfInc))) {
 		s.member = true
 		s.selfCell = m.Cell
+		s.shape.Coords(&s.selfCoords, m.Cell)
 	}
 
 	switch {
@@ -356,9 +360,25 @@ func (s *State) Peer(slot view.Slot) (PeerRef, bool) {
 	return PeerRef{Slot: slot, Key: m.Key, ID: m.ID, Addr: m.Addr}, true
 }
 
-func (s *State) ref(slot view.Slot) PeerRef {
-	p, _ := s.Peer(slot)
-	return p
+// setRef fills *dst with the member at slot, or leaves it unchanged if
+// slot is not a member. dst is filled field by field rather than by
+// assigning a PeerRef value: a composite value is built on the stack with
+// 8-byte stores and then copied with 16-byte loads, which defeats
+// store-to-load forwarding and stalls the hot path.
+func (s *State) setRef(dst *PeerRef, slot view.Slot) {
+	m, ok := s.v.Member(slot)
+	if !ok {
+		return
+	}
+
+	fillRef(dst, slot, m)
+}
+
+func fillRef(dst *PeerRef, slot view.Slot, m *view.Member) {
+	dst.Slot = slot
+	dst.Key = m.Key
+	dst.ID = m.ID
+	dst.Addr = m.Addr
 }
 
 // Stamp returns the expiry stamp for a value of keyspace seed with ttl,
@@ -524,17 +544,17 @@ func (s *State) best2(cell uint32, pm uint64, avoid view.Slot, ignore bool) (can
 	return a, b
 }
 
+// decide fills *d, which must be the zero Decision, with the route of
+// partition p. Fields are stored one by one; see setRef.
 func (s *State) decide(d *Decision, p uint32, avoid view.Slot, inFlags uint8) {
-	d.Header = Header{
-		Format:    HeaderFormat,
-		Flags:     inFlags & FlagHedge,
-		TTL:       s.ttl,
-		Partition: p,
-		Sender:    s.self,
-		Term:      s.term,
-		Seq:       s.seq,
-		Epoch:     s.e.Current(),
-	}
+	d.Header.Format = HeaderFormat
+	d.Header.Flags = inFlags & FlagHedge
+	d.Header.TTL = s.ttl
+	d.Header.Partition = p
+	d.Header.Sender = s.self
+	d.Header.Term = s.term
+	d.Header.Seq = s.seq
+	d.Header.Epoch = s.e.Current()
 
 	if !s.member {
 		s.gateway(d, p)
@@ -548,7 +568,7 @@ func (s *State) decide(d *Decision, p uint32, avoid view.Slot, inFlags uint8) {
 		return
 	}
 
-	d.Owner = PeerRef{Slot: ent.Owner, Key: om.Key, ID: om.ID, Addr: om.Addr}
+	fillRef(&d.Owner, ent.Owner, om)
 
 	s.h.NoteRouted(uint64(p))
 
@@ -559,16 +579,32 @@ func (s *State) decide(d *Decision, p uint32, avoid view.Slot, inFlags uint8) {
 		return
 	}
 
-	mask := s.shape.DiffMask(s.selfCell, om.Cell)
+	var oc [topology.MaxDims]uint32
+
+	mask := s.diffMask(&oc, om.Cell)
 	if mask&(mask-1) == 0 {
 		s.final(d, p, &ent, om.Cell, avoid, inFlags&FlagBackup != 0)
 	} else {
-		s.relay(d, p, &ent, om.Cell, mask, avoid)
+		s.relay(d, p, &ent, &oc, mask, avoid)
 	}
 
 	if !d.Next.IsZero() {
 		d.HedgeAfter = s.h.HedgeAfter(d.Next.Slot)
 	}
+}
+
+// diffMask writes the coordinates of cell into oc and returns the mask of
+// dimensions where they differ from selfCoords, as Shape.DiffMask.
+func (s *State) diffMask(oc *[topology.MaxDims]uint32, cell uint32) uint8 {
+	var m uint8
+
+	for i, x := range s.shape.Coords(oc, cell) {
+		if x != s.selfCoords[i] {
+			m |= 1 << i
+		}
+	}
+
+	return m
 }
 
 func (s *State) prev(d *Decision, ent *placement.Entry) {
@@ -582,12 +618,18 @@ func (s *State) prev(d *Decision, ent *placement.Entry) {
 		return
 	}
 
-	d.PrevOwner, _ = s.Peer(ent.Prev)
+	s.setRef(&d.PrevOwner, ent.Prev)
 }
 
 // final handles an owner that is a neighbor.
 func (s *State) final(d *Decision, p uint32, ent *placement.Entry, oc uint32, avoid view.Slot, standin bool) {
-	ou := s.h.Usable(ent.Owner)
+	all := s.h.AllHealthy()
+
+	ou := health.Healthy
+	if !all {
+		ou = s.h.Usable(ent.Owner)
+	}
+
 	pm := hashing.Mix64(uint64(p))
 
 	var t top3
@@ -597,7 +639,7 @@ func (s *State) final(d *Decision, p uint32, ent *placement.Entry, oc uint32, av
 			continue
 		}
 
-		u := s.usable(m, false)
+		u := s.usable(m, all)
 		if u == health.Unusable {
 			continue
 		}
@@ -626,10 +668,10 @@ func (s *State) final(d *Decision, p uint32, ent *placement.Entry, oc uint32, av
 	switch {
 	case toOwner:
 		d.Kind = KindOwner
-		d.Next = d.Owner
+		s.setRef(&d.Next, ent.Owner)
 
 		if nb > 0 {
-			d.Alternate = s.ref(bk[0])
+			s.setRef(&d.Alternate, bk[0])
 		}
 
 		s.prev(d, ent)
@@ -639,29 +681,30 @@ func (s *State) final(d *Decision, p uint32, ent *placement.Entry, oc uint32, av
 	default:
 		d.Kind = KindBackup
 		d.Header.Flags |= FlagBackup
-		d.Next = s.ref(bk[0])
+		s.setRef(&d.Next, bk[0])
 
 		switch {
 		case nb > 1:
-			d.Alternate = s.ref(bk[1])
+			s.setRef(&d.Alternate, bk[1])
 		case ou != health.Unusable:
-			d.Alternate = d.Owner
+			s.setRef(&d.Alternate, ent.Owner)
 		}
 	}
 }
 
 // relay handles an owner more than one dimension away.
-func (s *State) relay(d *Decision, p uint32, ent *placement.Entry, oc uint32, mask uint8, avoid view.Slot) {
+func (s *State) relay(d *Decision, p uint32, ent *placement.Entry, oc *[topology.MaxDims]uint32, mask uint8, avoid view.Slot) {
 	pm := hashing.Mix64(uint64(p))
 
 	for pass := range 2 {
-		ignore := pass == 1 || s.h.Panic()
+		// AllHealthy covers Panic: every peer is Healthy either way.
+		ignore := pass == 1 || s.h.AllHealthy()
 
 		var first, alt cand
 
 		for m := mask; m != 0; m &= m - 1 {
 			dim := topology.FirstDiff(m)
-			c := s.shape.Replace(s.selfCell, dim, s.shape.Coord(oc, dim))
+			c := s.selfCell + (oc[dim]-s.selfCoords[dim])*s.shape.Stride(dim)
 			a, b := s.best2(c, pm, avoid, ignore)
 
 			if !first.ok() {
@@ -677,10 +720,10 @@ func (s *State) relay(d *Decision, p uint32, ent *placement.Entry, oc uint32, ma
 
 		if first.ok() {
 			d.Kind = KindRelay
-			d.Next = s.ref(first.slot)
+			s.setRef(&d.Next, first.slot)
 
 			if alt.ok() {
-				d.Alternate = s.ref(alt.slot)
+				s.setRef(&d.Alternate, alt.slot)
 			}
 
 			return
@@ -693,7 +736,7 @@ func (s *State) relay(d *Decision, p uint32, ent *placement.Entry, oc uint32, ma
 
 	d.Kind = KindDirect
 	d.Header.Flags |= FlagDirect
-	d.Next = d.Owner
+	s.setRef(&d.Next, ent.Owner)
 	s.prev(d, ent)
 }
 
@@ -715,8 +758,8 @@ func (s *State) gateway(d *Decision, p uint32) {
 
 		d.Kind = KindDirect
 		d.Header.Flags |= FlagDirect
-		d.Owner = PeerRef{Slot: ent.Owner, Key: om.Key, ID: om.ID, Addr: om.Addr}
-		d.Next = d.Owner
+		fillRef(&d.Owner, ent.Owner, om)
+		fillRef(&d.Next, ent.Owner, om)
 		s.prev(d, &ent)
 		d.HedgeAfter = s.h.HedgeAfter(d.Next.Slot)
 
