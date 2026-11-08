@@ -7,6 +7,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/Azure/unbounded/internal/cachemesh/internal/epoch"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/hashing"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/health"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/placement"
@@ -806,5 +807,23 @@ func TestAlternateHeader(t *testing.T) {
 	r := f.st[self].RoutePartition(findKind(t, f.st[self], KindRelay))
 	if r.AlternateHeader() != r.Header {
 		t.Fatalf("relay alternate header changed: %+v", r.AlternateHeader())
+	}
+}
+
+// TestFreshWithoutView is a regression test: a member with no view (just
+// started, epoch counted from its own start) found every expiring stamp
+// fresh, since its epoch was below any stamp's expiry (found by the DST
+// data-plane workload).
+func TestFreshWithoutView(t *testing.T) {
+	env := newEnv(newTracker(0), 0)
+	st := NewState(nil, view.NoSlot, env)
+	seed := uint64(7)
+
+	if st.Fresh(seed, epoch.Stamp{Expires: 25}) {
+		t.Fatal("expiring stamp fresh without a view")
+	}
+
+	if !st.Fresh(seed, epoch.StampFor(0, 0, 0, 0)) {
+		t.Fatal("never-expiring stamp must stay fresh")
 	}
 }

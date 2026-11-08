@@ -413,7 +413,14 @@ func (s *State) Stamp(seed uint64, ttl time.Duration) epoch.Stamp {
 }
 
 // Fresh reports whether a value of keyspace seed with stamp st is fresh.
+// Without a configured view this member has not heard the cluster epoch
+// (its tracker counts from its own start), so only stamps that never
+// expire are fresh.
 func (s *State) Fresh(seed uint64, st epoch.Stamp) bool {
+	if s.table == nil && st.Expires != epoch.Never {
+		return false
+	}
+
 	return epoch.Fresh(st, s.e.Current(), s.v.Gen(seed))
 }
 
