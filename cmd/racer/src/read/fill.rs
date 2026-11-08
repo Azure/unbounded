@@ -1147,8 +1147,11 @@ impl Fill {
             .await?;
         match acquired {
             AcquiredPage::Plaintext(result) => Ok(Fetched::Page(result)),
-            AcquiredPage::Ciphertext(copy) => match self.seal(&page, copy, target.helper.is_none())
-            {
+            AcquiredPage::Ciphertext(copy) => match self.seal(
+                &page,
+                copy,
+                target.helper.is_none().then_some(scope.reader_numa),
+            ) {
                 Ok(sealed) => Ok(Fetched::Sealed(sealed)),
                 // A key the GPU cannot use, or an AAD too long for it: the
                 // CPU authenticates the page as for a Get.
@@ -1357,7 +1360,7 @@ impl Fill {
         if let Some(local) = self.acquire_local_copy(page, scope, false).await? {
             return Ok(Some(match local {
                 AcquiredPage::Plaintext(result) => super::sealed::Fetched::Page(result),
-                AcquiredPage::Ciphertext(copy) => match self.seal(page, copy, false) {
+                AcquiredPage::Ciphertext(copy) => match self.seal(page, copy, None) {
                     Ok(sealed) => super::sealed::Fetched::Sealed(sealed),
                     Err(_) => return Ok(None),
                 },
@@ -1411,7 +1414,7 @@ impl Fill {
                                 copy,
                                 disk_token: None,
                             },
-                            false,
+                            None,
                         )
                         .ok()
                         .map(super::sealed::Fetched::Sealed));
@@ -1460,17 +1463,21 @@ impl Fill {
     /// that pass ends; the client loop then swaps the verdict's copy for the
     /// detached one. When the storage cannot be reserved, it detaches as for
     /// a GPU.
+    ///
+    /// `host` is Some for a host-read sink, holding the NUMA node of the
+    /// crypto helper expected to decrypt the page (the requester's
+    /// `reader_numa`); the storage is bound to that node, since its write is
+    /// the most NUMA-sensitive part of the fused pass.
     pub(super) fn seal(
         &self,
         page: &PageId,
         mut copy: UnverifiedPage,
-        host: bool,
+        host: Option<Option<u16>>,
     ) -> Result<Box<super::sealed::SealedPage>> {
         validate_copy(&copy.copy, page, self.page_size()?)?;
-        let fused_store = if host {
-            self.fused_store(&copy.copy.ciphertext)
-        } else {
-            None
+        let fused_store = match host {
+            Some(node) => self.fused_store(&copy.copy.ciphertext, node),
+            None => None,
         };
         if fused_store.is_none() {
             copy.copy.ciphertext = self.detach_registered(copy.copy.ciphertext);
@@ -2936,6 +2943,7 @@ impl Fill {
     fn fused_store(
         &self,
         ciphertext: &crate::memory::CiphertextPage,
+        node: Option<u16>,
     ) -> Option<crate::memory::CiphertextBuffer> {
         if !ciphertext.is_registered() {
             self.metrics
@@ -2953,7 +2961,9 @@ impl Fill {
             let reservation = self
                 .reserve_with_reclamation(cache, ResourceClass::Ciphertext, capacity)
                 .ok()?;
-            buffers.aligned_ciphertext(reservation, length).ok()
+            buffers
+                .aligned_ciphertext_on(reservation, length, node)
+                .ok()
         });
         if store.is_none() {
             self.metrics

@@ -58,6 +58,11 @@ pub struct CiphertextBuffer {
     padded: usize,
 }
 impl CiphertextBuffer {
+    /// NUMA node the storage is bound to, if any.
+    #[cfg(test)]
+    pub(crate) fn node(&self) -> Option<u16> {
+        self.buffer.node()
+    }
     /// Requested length in bytes.
     pub fn len(&self) -> usize {
         self.buffer.len()
@@ -673,12 +678,25 @@ impl BufferPool {
         reservation: CiphertextCharge,
         length: usize,
     ) -> Result<CiphertextBuffer> {
+        self.aligned_ciphertext_on(reservation, length, None)
+    }
+    /// [`Self::aligned_ciphertext`], with storage on NUMA node `node` when it
+    /// is Some and the kernel can bind it (see [`page_alloc::buf::Pool::take_on`]).
+    pub(crate) fn aligned_ciphertext_on(
+        &self,
+        reservation: CiphertextCharge,
+        length: usize,
+        node: Option<u16>,
+    ) -> Result<CiphertextBuffer> {
         if length == 0 || length > PAGE_BYTES as usize + 16 || !self.admission.owns(&reservation) {
             return Err(Error::InvalidConfiguration);
         }
         reservation.validate(ResourceClass::Ciphertext, self.aligned_capacity(length)?)?;
         let padded = padded_length(self.alignment, length)?;
-        let mut buffer = self.disk.borrow_mut().take(padded, reservation, false)?;
+        let mut buffer = self
+            .disk
+            .borrow_mut()
+            .take_on(padded, reservation, false, node)?;
         buffer.set_len(length)?;
         Ok(CiphertextBuffer { buffer, padded })
     }

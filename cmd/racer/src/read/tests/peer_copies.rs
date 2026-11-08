@@ -3063,7 +3063,7 @@ fn sealing_registered_ciphertext_releases_the_buffer_before_decrypt_and_persist(
                 copy,
                 disk_token: None,
             },
-            false,
+            None,
         )
         .unwrap();
     assert_eq!(crate::memory::registered_copy_outs(), copies + 1);
@@ -3113,7 +3113,7 @@ fn sealing_registered_ciphertext_for_a_host_sink_detaches_during_decrypt() {
                 copy,
                 disk_token: None,
             },
-            true,
+            Some(None),
         )
         .unwrap();
     assert_eq!(crate::memory::registered_copy_outs(), copies);
@@ -3228,8 +3228,11 @@ fn host_read_acquisition_defers_registered_publish_so_the_sink_fuses() {
             .unwrap()
             .is_none()
     );
-    let sealed = host.seal(&f.page, page, true).unwrap();
-    assert!(sealed.fused_store.is_some());
+    // The storage is bound to the decrypting helper's node when it is large
+    // enough for mmap storage, and never to another node.
+    let sealed = host.seal(&f.page, page, Some(Some(0))).unwrap();
+    let store = sealed.fused_store.as_ref().unwrap();
+    assert!(matches!(store.node(), None | Some(0)));
     drop(sealed);
 
     // Not deferred: publishing copies the page out, so the sink skips the
@@ -3251,7 +3254,7 @@ fn host_read_acquisition_defers_registered_publish_so_the_sink_fuses() {
             .is_some()
     );
     let retained = f.fill.metrics.count(Event::HostReadFusedSkippedRetained);
-    let sealed = f.fill.seal(&f.page, page, true).unwrap();
+    let sealed = f.fill.seal(&f.page, page, Some(None)).unwrap();
     assert!(sealed.fused_store.is_none());
     assert_eq!(
         f.fill.metrics.count(Event::HostReadFusedSkippedRetained),
@@ -3272,7 +3275,7 @@ fn host_read_acquisition_defers_registered_publish_so_the_sink_fuses() {
                 copy: good.clone(),
                 disk_token: None,
             },
-            true,
+            Some(None),
         )
         .unwrap();
     assert!(sealed.fused_store.is_none());
@@ -3298,7 +3301,7 @@ fn rejected_host_read_page_is_not_cached() {
                 copy: good,
                 disk_token: None,
             },
-            true,
+            Some(None),
         )
         .unwrap();
     f.fill.sealed_verdict(sealed.report(), false);
@@ -3391,7 +3394,7 @@ fn host_read_fused_store_refused_by_admission_is_counted() {
                 copy,
                 disk_token: None,
             },
-            true,
+            Some(None),
         )
         .unwrap();
     assert!(sealed.fused_store.is_none());
