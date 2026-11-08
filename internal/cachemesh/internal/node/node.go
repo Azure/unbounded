@@ -386,7 +386,6 @@ func New(cfg Config, rng *rand.Rand) *Node {
 	n.ld = leader.New(cfg.Leader, rng)
 	n.ld.SetHooks(cfg.Hooks.Leader)
 	n.hl = health.NewTracker(cfg.Health, rng)
-	n.ep.Anchor(0, cfg.EpochPeriod, 0)
 
 	return n
 }
@@ -486,6 +485,13 @@ func (n *Node) Start(now int64, wall time.Time) {
 
 	n.started = true
 	n.now, n.wall = now, wall
+
+	// Count epochs from the start until the first heartbeat or snapshot
+	// anchors the cluster epoch. Anchoring at mono 0 would start the epoch
+	// at now/period (days of uptime in production), and since the epoch
+	// never decreases the member would stay ahead of the cluster and
+	// stamp values that outlive their TTL everywhere else.
+	n.ep.Anchor(0, n.cfg.EpochPeriod, now)
 
 	if iv := n.cfg.Initial; iv != nil {
 		n.cfg.Initial = nil

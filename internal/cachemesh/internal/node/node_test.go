@@ -722,3 +722,27 @@ func TestInitialView(t *testing.T) {
 		t.Fatal("no new term over the initial view")
 	}
 }
+
+// TestEpochCountsFromStart is a regression test: before the first
+// heartbeat the epoch counted from mono 0, so a member whose monotonic
+// clock read days of uptime started days of epochs ahead of the cluster
+// and, since epochs never decrease, stamped values that stayed fresh far
+// past their TTL elsewhere (found by the DST data-plane workload).
+func TestEpochCountsFromStart(t *testing.T) {
+	c := newCluster(t)
+	cfg := c.cfg(0, []string{addr(9)})
+	n := New(cfg, rand.New(rand.NewPCG(1, 2)))
+	start := int64(10 * 24 * time.Hour)
+
+	n.Start(start, c.wall())
+
+	if got := n.Epoch().Current(); got != 0 {
+		t.Fatalf("epoch at start %d, want 0", got)
+	}
+
+	n.Tick(start+31*sec, c.wall())
+
+	if got := n.Epoch().Current(); got != 2 {
+		t.Fatalf("epoch after 31s %d, want 2", got)
+	}
+}
