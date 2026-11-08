@@ -48,6 +48,29 @@ notices:
         link: https://docs.rs/crate/aws-lc-rs/1.19.0/source/LICENSE
       - name: ISC License
         link: https://docs.rs/crate/aws-lc-rs/1.19.0/source/LICENSE
+  - dependency: aws-lc-sys
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2014-2024 Google Inc.
+      - Copyright (c) 2025-2026 Google Inc.
+      - Copyright (c) 1998-2011 The OpenSSL Project. All rights reserved.
+      - Copyright (c) 1995-1998 Eric Young (eay@cryptsoft.com). All rights reserved.
+      - Copyright (c) The mlkem-native project authors.
+      - Copyright (c) The mldsa-native project authors.
+      - Copyright (c) 2015-2020 the fiat-crypto authors.
+      - Copyright 2008 Google Inc.
+      - Copyright (c) The Go Authors. All rights reserved.
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/aws-lc-sys/0.47.0/source/LICENSE
+      - name: ISC License
+        link: https://docs.rs/crate/aws-lc-sys/0.47.0/source/LICENSE
+      - name: MIT License
+        link: https://docs.rs/crate/aws-lc-sys/0.47.0/source/LICENSE
+      - name: BSD 3-Clause License
+        link: https://docs.rs/crate/aws-lc-sys/0.47.0/source/LICENSE
+      - name: MIT No Attribution License
+        link: https://docs.rs/crate/aws-lc-sys/0.47.0/source/LICENSE
   - dependency: base64
     ecosystem: cargo
     copyright:
