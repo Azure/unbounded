@@ -327,6 +327,7 @@ type DataPlane struct {
 	lastView int64 // time of the last view change on any member
 	stamps   []dpStamp
 	period   time.Duration
+	driftPPB int64 // see stampSlack
 
 	// Results.
 	Latency, Steady, Faulty, SlowWin Histogram
@@ -415,6 +416,7 @@ func (w *DataPlane) Attach(c *Cluster) {
 	w.mem = make([]dpMember, len(c.members))
 	w.trk = make([]trackRing, len(c.members))
 	w.period = epoch.DefaultPeriod
+	w.driftPPB = scenarioDriftPPB(c.sc)
 
 	for k := range w.cov.kinds {
 		w.cov.kinds[k] = c.Cov.Handle("dp-kind-" + route.Kind(k).String())
@@ -1367,15 +1369,33 @@ func neighborBound(v *view.View, cellSize, maxNeighbors int) [2]int {
 // issuer's by at most one period (it anchors the epoch when a heartbeat or
 // snapshot arrives, which can be up to a period after the epoch began),
 // plus the leader's tick and the member's own tick (Advance runs once per
-// TickInterval), plus message latency and clock drift.
+// TickInterval), plus message latency and clock drift. Drift is bounded by
+// the scenario's largest ClockDrift (and a 0.05% floor for the
+// oscillator error of undrifted clocks), counted twice: the issuer's and
+// the checker's clocks may drift in opposite directions.
 func (w *DataPlane) stampSlack(age int64) int64 {
-	drift := age * MaxScenarioDriftPPB / 1_000_000_000
+	drift := age * w.driftPPB / 1_000_000_000
 
 	return int64(w.period) + 2*int64(node.DefaultTickInterval) + sec + 2*drift
 }
 
-// MaxScenarioDriftPPB bounds the drift generated scenarios apply.
-const MaxScenarioDriftPPB = 500_000
+// MinDriftPPB is the drift stampSlack allows for even when a scenario
+// injects no ClockDrift (0.05%).
+const MinDriftPPB = 500_000
+
+// scenarioDriftPPB returns the largest drift magnitude sc applies, at least
+// MinDriftPPB.
+func scenarioDriftPPB(sc Scenario) int64 {
+	d := int64(MinDriftPPB)
+
+	for _, f := range sc.Faults {
+		if f.Kind == ClockDrift {
+			d = max(d, f.Value, -f.Value)
+		}
+	}
+
+	return min(d, MaxDriftPPB)
+}
 
 // checkStamps checks invariant 6 on the sampled stamps.
 func (w *DataPlane) checkStamps() {
@@ -1387,6 +1407,13 @@ func (w *DataPlane) checkStamps() {
 	var live []uint32
 
 	for _, s := range w.stamps {
+		// A whole-cluster restart crashed every process that could hold
+		// the value, and the epoch restarts with the new lineage: the
+		// stamp no longer exists anywhere.
+		if w.c.ctl.coldRestartAt > 0 && s.at <= w.c.ctl.coldRestartAt {
+			continue
+		}
+
 		age := now - s.at
 		limit := ttl + period + w.stampSlack(age)
 

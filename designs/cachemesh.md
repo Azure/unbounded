@@ -1155,10 +1155,13 @@ Data-plane invariants (each failure names the seed and replay command):
   requests are checked every 5s on 8 random members: a stamp must not be
   `Fresh` on a member of its view later than `T + period + slack` after
   issue, with
-  `slack = period + 2 * TickInterval + 1s + 2 * 0.05% of the age` (a member
-  lags the issuer's epoch phase by at most the period of an anchor that
-  arrived late, plus the leader's and its own tick, plus latency and
-  drift). The issuer still finds it `Fresh` up to `T - period` after issue
+  `slack = period + 2 * TickInterval + 1s + 2 * D * age`, where `D` is the
+  largest `ClockDrift` the scenario injects (at least 0.05%, up to the
+  generated 10%) (a member lags the issuer's epoch phase by at most the
+  period of an anchor that arrived late, plus the leader's and its own
+  tick, plus latency and drift of both clocks). Stamps issued before a
+  `ColdRestart` are dropped: every process that could hold the value
+  crashed, and the new lineage's epoch restarts at zero. The issuer still finds it `Fresh` up to `T - period` after issue
   when no fault was active within 90s. A member whose view has a newer
   generation for the keyspace never finds an older stamp `Fresh`.
   Non-members are not held to the upper bound: one may have anchored its

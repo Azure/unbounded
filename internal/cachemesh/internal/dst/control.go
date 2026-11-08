@@ -67,7 +67,9 @@ type controlState struct {
 
 	termStarts []int64
 	genesisAt  int64
-	overlaps   int // overlaps excused by clocks outside the safety bounds
+	// coldRestartAt is when the last ColdRestart crashed every member.
+	coldRestartAt int64
+	overlaps      int // overlaps excused by clocks outside the safety bounds
 
 	maxStats node.Stats
 }
@@ -327,6 +329,8 @@ func (c *Cluster) applyControl(f Fault) {
 
 	switch f.Kind {
 	case ColdRestart:
+		c.ctl.coldRestartAt = sim.Now()
+
 		for _, i := range c.Procs.Live(nil) {
 			if c.Procs.Crash(i) {
 				c.ctl.noSeeds[i] = f.Value == 0
