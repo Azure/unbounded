@@ -53,6 +53,7 @@ fn owned_plan(plan: &AffinityPlan) -> AffinityPlan {
         // Automatic mode already has room for the driver; finite caps need one
         // extra slot without changing any I/O-to-crypto assignments.
         max_threads: plan.max_threads.saturating_add(1),
+        owner_cpu: None,
     }
 }
 

@@ -58,6 +58,33 @@ use std::time::Instant;
 #[cfg(test)]
 use crate::lifecycle::IDLE_WAIT;
 use crate::lifecycle::WORK_BUDGET;
+/// An allowed CPU that no lane or helper in `pairs` runs on, so the RDMA
+/// owner's grant and completion work does not queue behind a busy worker.
+/// Prefers a physical core no worker uses (not an SMT sibling of one), then
+/// the first helper's NUMA node, then the lowest CPU. `None` when every
+/// allowed CPU is taken.
+fn spare_cpu(cpus: &[CpuLocation], pairs: &[WorkerPair]) -> Option<CpuLocation> {
+    let used: HashSet<usize> = pairs
+        .iter()
+        .flat_map(|pair| [pair.io.cpu, pair.crypto.cpu])
+        .collect();
+    let cores: HashSet<(usize, usize)> = pairs
+        .iter()
+        .flat_map(|pair| [&pair.io, &pair.crypto])
+        .map(|location| (location.package, location.core))
+        .collect();
+    let anchor = pairs.first().map(|pair| pair.crypto.numa_node);
+    cpus.iter()
+        .filter(|location| !used.contains(&location.cpu))
+        .min_by_key(|location| {
+            (
+                cores.contains(&(location.package, location.core)),
+                anchor.is_some_and(|node| node != location.numa_node),
+                location.cpu,
+            )
+        })
+        .cloned()
+}
 /// One I/O shard and its crypto execution placement. Equal crypto CPU IDs identify
 /// the same execution thread. NIC locality never overrides the end-to-end rail.
 #[derive(Clone, Debug)]
@@ -72,6 +99,8 @@ pub struct AffinityPlan {
     pub pairs: Vec<WorkerPair>,
     /// Includes the caller. Owned startup reserves an additional coordinator slot.
     pub max_threads: usize,
+    /// Allowed CPU no lane or helper uses, for the RDMA owner thread.
+    pub owner_cpu: Option<CpuLocation>,
 }
 #[cfg(test)]
 fn pair_count(max_threads: usize, topology: &EffectiveTopology) -> Result<usize> {
@@ -105,13 +134,34 @@ impl AffinityPlan {
     /// owner, which runs outside the worker group.
     pub fn from_topology(
         config: &Config,
-        mut topology: EffectiveTopology,
+        topology: EffectiveTopology,
         rails: &[RailMapping],
     ) -> Result<Self> {
         let max_threads = config
             .max_threads
             .checked_sub(usize::from(config.enable_rdma))
             .ok_or(Error::InvalidConfiguration)?;
+        let cpus = topology.cpus.clone();
+        let mut plan = Self::place_configured(config, max_threads, topology, rails)?;
+        if config.enable_rdma {
+            plan.owner_cpu = spare_cpu(&cpus, &plan.pairs);
+        }
+        Ok(plan)
+    }
+    /// CPU for the RDMA owner thread: a spare from planning when one exists,
+    /// else the first crypto helper's CPU.
+    pub fn owner_cpu(&self) -> Option<usize> {
+        self.owner_cpu
+            .as_ref()
+            .or_else(|| self.pairs.first().map(|pair| &pair.crypto))
+            .map(|location| location.cpu)
+    }
+    fn place_configured(
+        config: &Config,
+        max_threads: usize,
+        mut topology: EffectiveTopology,
+        rails: &[RailMapping],
+    ) -> Result<Self> {
         if let (Some(io), Some(helpers)) = (config.io_workers, config.crypto_helpers) {
             topology.nics.retain(|nic| {
                 nic.numa_node.is_some()
@@ -129,7 +179,11 @@ impl AffinityPlan {
                         nic: placement.nic,
                     })
                     .collect();
-            return Ok(Self { pairs, max_threads });
+            return Ok(Self {
+                pairs,
+                max_threads,
+                owner_cpu: None,
+            });
         }
         Self::place_with_policy(max_threads, topology, rails, config.allow_smt)
     }
@@ -163,7 +217,11 @@ impl AffinityPlan {
                     nic: placement.nic,
                 })
                 .collect();
-        Ok(Self { pairs, max_threads })
+        Ok(Self {
+            pairs,
+            max_threads,
+            owner_cpu: None,
+        })
     }
     /// Deterministic execution groups ordered by crypto CPU, then pair index.
     pub fn crypto_groups(&self) -> Vec<Vec<usize>> {
@@ -884,6 +942,7 @@ fn colocated_plan(max_threads: usize, workers: u16) -> AffinityPlan {
             })
             .collect(),
         max_threads,
+        owner_cpu: None,
     }
 }
 
@@ -1176,6 +1235,74 @@ mod tests {
                     }),
                     nics: vec![],
                 }
+            }
+
+            #[test]
+            fn rdma_owner_gets_a_spare_cpu_off_busy_cores() {
+                let mut config = crate::test_support::cluster::config(false);
+                config.enable_rdma = true;
+                config.max_threads = 31;
+                let plan = AffinityPlan::from_topology(&config, topology(72, None), &[]).unwrap();
+                let owner = plan.owner_cpu().unwrap();
+                assert!(
+                    plan.pairs
+                        .iter()
+                        .all(|pair| pair.io.cpu != owner && pair.crypto.cpu != owner),
+                    "owner {owner} shares a worker CPU"
+                );
+                // Without RDMA no owner CPU is planned.
+                config.enable_rdma = false;
+                let plan = AffinityPlan::from_topology(&config, topology(72, None), &[]).unwrap();
+                assert!(plan.owner_cpu.is_none());
+            }
+
+            #[test]
+            fn spare_cpu_prefers_unused_core_then_local_node() {
+                let at = |cpu, core, numa| CpuLocation {
+                    cpu,
+                    package: 0,
+                    core,
+                    numa_node: Some(numa),
+                };
+                let pair = WorkerPair {
+                    worker: WorkerId(0),
+                    io: at(0, 0, 0),
+                    crypto: at(1, 1, 0),
+                    nic: None,
+                };
+                // CPU 2 is an SMT sibling of the busy core 0; CPU 3 is a free
+                // core on a remote node; CPU 4 is a free local core.
+                let cpus = [
+                    at(0, 0, 0),
+                    at(1, 1, 0),
+                    at(2, 0, 0),
+                    at(3, 5, 1),
+                    at(4, 6, 0),
+                ];
+                assert_eq!(
+                    spare_cpu(&cpus, std::slice::from_ref(&pair)).unwrap().cpu,
+                    4
+                );
+                assert_eq!(
+                    spare_cpu(&cpus[..4], std::slice::from_ref(&pair))
+                        .unwrap()
+                        .cpu,
+                    3
+                );
+                assert_eq!(
+                    spare_cpu(&cpus[..3], std::slice::from_ref(&pair))
+                        .unwrap()
+                        .cpu,
+                    2
+                );
+                assert!(spare_cpu(&cpus[..2], std::slice::from_ref(&pair)).is_none());
+                // With no spare, the owner falls back to the first helper.
+                let plan = AffinityPlan {
+                    pairs: vec![pair],
+                    max_threads: 2,
+                    owner_cpu: None,
+                };
+                assert_eq!(plan.owner_cpu(), Some(1));
             }
 
             #[test]
@@ -2686,6 +2813,7 @@ mod tests {
             let plan = AffinityPlan {
                 pairs: group.plan.pairs.clone(),
                 max_threads: 2,
+                owner_cpu: None,
             };
             factory.stop_on_poll = true;
             let before = current_cpus().unwrap();
@@ -2713,6 +2841,7 @@ mod tests {
                 let plan = AffinityPlan {
                     pairs: group.plan.pairs.clone(),
                     max_threads: 2,
+                    owner_cpu: None,
                 };
                 factory.stop_on_poll = true;
                 factory.start_delay = Duration::from_millis(300);
@@ -2735,6 +2864,7 @@ mod tests {
                 AffinityPlan {
                     pairs: group.plan.pairs.clone(),
                     max_threads: 2,
+                    owner_cpu: None,
                 },
                 env.ctx.clone(),
             );
@@ -3138,6 +3268,7 @@ mod tests {
             let mut plan = AffinityPlan {
                 pairs: group.plan.pairs.clone(),
                 max_threads: 4,
+                owner_cpu: None,
             };
             let mut second = plan.pairs[0].clone();
             second.worker = WorkerId(1);

@@ -579,11 +579,11 @@ impl Application {
         // The owner thread outlives the worker group: lanes and crypto jobs
         // return its page buffers while they drain, and dropping it after the
         // group joins waits for the owner to drain.
-        let owner = match plan.pairs.first() {
-            Some(first) if self.config.enable_rdma => self
-                .node
-                .native
-                .start_owner(first.crypto.cpu, self.ctx.clone())?,
+        // A spare CPU keeps grant latency off busy crypto helpers.
+        let owner = match plan.owner_cpu() {
+            Some(cpu) if self.config.enable_rdma => {
+                self.node.native.start_owner(cpu, self.ctx.clone())?
+            }
             _ => None,
         };
         let mut workers = WorkerGroup::new(plan, self.ctx.clone());
@@ -3972,6 +3972,7 @@ mod lifecycle_policy_tests {
         let mut ordinary_plan = AffinityPlan {
             pairs: plan.pairs.clone(),
             max_threads: plan.max_threads,
+            owner_cpu: None,
         };
         config.scale_limits(plan.pairs.len()).unwrap();
         let limits = size_workers_configured(&config.limits, &mut plan, false, true).unwrap();
@@ -4030,6 +4031,7 @@ mod lifecycle_policy_tests {
         let mut disabled = AffinityPlan {
             pairs: enabled.pairs.clone(),
             max_threads: enabled.max_threads,
+            owner_cpu: None,
         };
         config.scale_limits(enabled.pairs.len()).unwrap();
         size_workers_configured(&config.limits, &mut enabled, false, true).unwrap();

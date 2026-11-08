@@ -842,6 +842,7 @@ fn queue_limited_plan(planned: usize, supported: usize) -> (Limits, AffinityPlan
                 }
             })
             .collect(),
+        owner_cpu: None,
     };
     (config.limits, plan)
 }
@@ -967,6 +968,7 @@ fn worker_sizing_funds_diagnostics_and_ordinary_progress() {
             let mut rejected_plan = AffinityPlan {
                 pairs: plan.pairs.clone(),
                 max_threads: plan.max_threads,
+                owner_cpu: None,
             };
             assert!(matches!(
                 size_workers(&node, &mut rejected_plan, false),
@@ -2887,6 +2889,7 @@ fn node_replacement_drains_all_workers_and_restart_converges() {
                         nic: None,
                     })
                     .collect(),
+                owner_cpu: None,
             },
             env.ctx.clone(),
         );
@@ -3002,6 +3005,7 @@ fn two_worker_real_control_key_lease_drain_and_checkpoint_cut() {
                 nic: None,
             })
             .collect(),
+        owner_cpu: None,
     };
     let mut group = WorkerGroup::new(plan, env.ctx.clone());
     app.prepare_workers().unwrap();
