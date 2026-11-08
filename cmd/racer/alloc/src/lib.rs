@@ -164,6 +164,8 @@ pub mod buf;
 mod demand;
 pub mod disk_index;
 pub mod intern;
+#[cfg(all(target_os = "linux", not(miri)))]
+mod numa;
 pub mod pending;
 mod segments;
 mod sync;

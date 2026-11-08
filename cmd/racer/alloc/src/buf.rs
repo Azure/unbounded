@@ -196,6 +196,10 @@ struct Region {
 
     class: u8,
 
+    // NUMA node the storage is bound to prefer, when [`Pool::take_on`]
+    // mapped it with that policy. Pages keep the policy across discards.
+    node: Option<u16>,
+
     next: AtomicPtr<Region>,
 }
 
@@ -212,8 +216,24 @@ impl Region {
             clean: true,
             charged: false,
             class,
+            node: None,
             next: AtomicPtr::new(std::ptr::null_mut()),
         }))
+    }
+
+    /// Prefer NUMA node `node` for this storage's pages. Only untouched
+    /// mmap storage takes the policy; returns whether it did.
+    fn prefer_node(&mut self, node: u16) -> bool {
+        #[cfg(all(target_os = "linux", not(miri)))]
+        if let Release::Mapping(length) = self.release
+            && self.node.is_none()
+            && crate::numa::prefer_node(*self.pointer.get_mut(), length, node)
+        {
+            self.node = Some(node);
+            return true;
+        }
+        let _ = node;
+        false
     }
 
     fn bytes(&self) -> &[u8] {
@@ -512,13 +532,23 @@ impl Pool {
         }
     }
 
-    fn pop(&mut self, class: u8) -> Option<Box<Region>> {
+    fn pop(&mut self, class: u8, node: Option<u16>) -> Option<Box<Region>> {
         let index = usize::from(class);
-        if self.local[index].is_empty() {
+        if self.local[index].is_empty() || node.is_some() {
             let local = &mut self.local[index];
             self.shared.classes[index].take_all(|region| local.push(region));
         }
-        let mut region = self.local[index].pop()?;
+        let mut region = match node {
+            None => self.local[index].pop()?,
+            Some(node) => {
+                // Only storage already bound to `node`; the caller maps new
+                // storage there rather than reuse pages on another node.
+                let position = self.local[index]
+                    .iter()
+                    .rposition(|region| region.node == Some(node))?;
+                self.local[index].swap_remove(position)
+            }
+        };
         self.shared.classes[index]
             .idle
             .fetch_sub(1, Ordering::AcqRel);
@@ -530,16 +560,37 @@ impl Pool {
     /// full capacity. Contents are unspecified (never another buffer's wiped
     /// plaintext); use [`Self::take_zeroed`] when zeros are required.
     pub fn take<C: Charge>(&mut self, len: usize, charge: C, wipe: bool) -> Result<Buf<C>> {
+        self.take_on(len, charge, wipe, None)
+    }
+
+    /// [`Self::take`], with storage on NUMA node `node` when it is Some.
+    ///
+    /// Reuses only idle storage this pool bound to `node`; otherwise maps
+    /// new storage with that node as its preferred policy, so its pages
+    /// land there whichever CPU first writes them. Storage the kernel will
+    /// not bind (heap storage under 2 MiB, or a refused `mbind`) is still
+    /// returned, without a node. Idle storage bound to another node stays
+    /// pooled for its own node's takes until trimmed.
+    pub fn take_on<C: Charge>(
+        &mut self,
+        len: usize,
+        charge: C,
+        wipe: bool,
+        node: Option<u16>,
+    ) -> Result<Buf<C>> {
         let capacity = self.capacity_for(len)?;
         if !charge.covers(capacity) {
             return Err(Error::InvalidConfiguration);
         }
         let class = self.class_for(capacity);
         self.takes = self.takes.wrapping_add(1);
-        let region = match (class != NO_CLASS).then(|| self.pop(class)).flatten() {
+        let region = match (class != NO_CLASS).then(|| self.pop(class, node)).flatten() {
             Some(region) => region,
             None => {
-                let region = Region::allocate(capacity, self.alignment, class)?;
+                let mut region = Region::allocate(capacity, self.alignment, class)?;
+                if let Some(node) = node {
+                    region.prefer_node(node);
+                }
                 self.misses = self.misses.wrapping_add(1);
                 region
             }
@@ -696,6 +747,11 @@ impl<C: Charge> Buf<C> {
     /// Memory alignment of the first byte.
     pub fn alignment(&self) -> usize {
         self.region().align
+    }
+
+    /// NUMA node this storage was bound to by [`Pool::take_on`], if any.
+    pub fn node(&self) -> Option<u16> {
+        self.region().node
     }
 
     /// Whether storage is wiped before pooling or freeing.
@@ -947,6 +1003,50 @@ mod tests {
         let empty = pool.take(0, (), false).unwrap();
         assert!(empty.is_empty());
         assert_eq!(empty.capacity(), GRANULE);
+    }
+
+    #[test]
+    fn take_on_reuses_only_storage_bound_to_the_node() {
+        let limit = std::sync::Arc::new(IdleLimit::new(64 << 20));
+        let mut pool = pool(&limit);
+        let len = crate::HUGE_PAGE_BYTES;
+        let bound = pool.take_on(len, (), false, Some(0)).unwrap();
+        if bound.node() != Some(0) {
+            // Not mmap storage here, or the kernel refused mbind: nothing to bind.
+            return;
+        }
+        let address = bound.as_ptr();
+        let plain = pool.take(len, (), false).unwrap();
+        assert_eq!(plain.node(), None);
+        // Pool the bound storage under the plain one, so LIFO alone would
+        // hand back the plain storage.
+        drop(bound);
+        let plain_address = plain.as_ptr();
+        drop(plain);
+        let again = pool.take_on(len, (), false, Some(0)).unwrap();
+        assert_eq!(again.as_ptr(), address, "idle node-0 storage is reused");
+        assert_eq!(again.node(), Some(0));
+        let counters = pool.counters();
+        // Another node's take maps new storage rather than reuse the plain one.
+        let other = pool.take_on(len, (), false, Some(u16::MAX)).unwrap();
+        assert_ne!(other.as_ptr(), plain_address);
+        let plain = pool.take(len, (), false).unwrap();
+        assert_eq!(plain.as_ptr(), plain_address);
+        assert_eq!(other.node(), None, "the kernel has no such node");
+        assert_eq!(pool.counters().misses, counters.misses + 1);
+        drop((plain, again, other));
+        // A plain take may reuse bound storage.
+        let any = pool.take(len, (), false).unwrap();
+        assert!(any.is_pooled());
+    }
+
+    #[test]
+    fn take_on_small_heap_storage_has_no_node() {
+        let limit = std::sync::Arc::new(IdleLimit::new(1 << 20));
+        let mut pool = pool(&limit);
+        let buf = pool.take_on(4096, (), false, Some(0)).unwrap();
+        assert_eq!(buf.node(), None);
+        assert_eq!(buf.len(), 4096);
     }
 
     #[test]
