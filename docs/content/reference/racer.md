@@ -2049,11 +2049,14 @@ releasing its `links`, its `buffers` that a NIC may still use, its
 Device names at each lost PCI address must hold still for 5 seconds before
 the dataplane lists devices again, so a udev rename of a replugged VF (for
 example `mana_0` to `roceP30832p0s0`) lands first: libibverbs keeps the name it
-first saw for the life of the process. Before the first reopen after a loss,
-the dataplane creates fresh `/dev/char/<major>:<minor>` nodes for every verbs
+first saw for the life of the process. Before reopening after a loss, the
+dataplane creates fresh `/dev/char/<major>:<minor>` nodes for every verbs
 character device in `/sys/class/infiniband_verbs`, because a container's
 bind-mounted `/dev/infiniband/uverbsN` keeps reaching the removed device and
-rdma-core falls back to `/dev/char`. After a loss, activation retries every
+rdma-core falls back to `/dev/char`. It refreshes them again whenever the
+numbers sysfs lists change or one of their nodes is missing, including after
+an attempt that could not discover the device, so a device that returns with
+a new minor number after any outage is reopened without a restart. After a loss, activation retries every
 2 seconds instead of backing off. Once the device is back with an ACTIVE port,
 6 consecutive attempts that cannot use it log `stage=rdma-device
 state=restarting reason=device_unusable` and fail the worker, so the process

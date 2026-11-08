@@ -628,7 +628,7 @@ impl WorkerApplication {
         self.rdma_waiting = None;
         self.rdma_settle = None;
         self.rdma_attempts = 0;
-        self.rdma_char_refreshed = false;
+        self.rdma_char_refreshed = None;
         self.native_failures = 0;
         self.native_retry = self.ctx().now() + RAIL_PROBE;
     }
@@ -696,6 +696,40 @@ impl WorkerApplication {
         self.rdma_waiting = waiting;
     }
 
+    /// Create fresh verbs character device nodes when sysfs lists other
+    /// numbers than the last refresh did, or one of their nodes is missing
+    /// or stale. A refresh that ran while the device was still unbound
+    /// (it may return with a new minor) is therefore redone once it is
+    /// back. Cheap when nothing changed: one sysfs read and a `stat` per
+    /// node. Each refresh is logged.
+    fn refresh_char_devices_if_stale(&mut self) {
+        let Some((sysfs, dir)) = &self.rdma_char_devices else {
+            return;
+        };
+        let current = crate::rdma::verbs_char_devices(sysfs);
+        if let Some((last, ok)) = &self.rdma_char_refreshed
+            && *last == current
+            && (!*ok || crate::rdma::char_devices_present(dir, &current))
+        {
+            return;
+        }
+        let refreshed = crate::rdma::refresh_char_devices(sysfs, dir);
+        match &refreshed {
+            Ok(count) => eprintln!(
+                "racer: stage=rdma-device state=char-devices-refreshed count={count} devices={current:?} dir={}",
+                dir.display()
+            ),
+            // Reopening may still work; a restart covers it if not.
+            Err(error) => eprintln!(
+                "racer: stage=rdma-device state=char-devices-failed dir={} error={error}",
+                dir.display()
+            ),
+        }
+        // Recorded even on failure, so a failing refresh is not retried and
+        // logged on every probe; a change in sysfs retries it.
+        self.rdma_char_refreshed = Some((current, refreshed.is_ok()));
+    }
+
     /// What reactivation after a device loss waits for, or `None` once it
     /// may start: `device_missing:<name>`, `device_inactive:<name>`,
     /// `device_settling`, `drain_<blocker>`
@@ -753,22 +787,7 @@ impl WorkerApplication {
                 .map_or("pending", rdma_verbs::DrainBlocker::as_str);
             return Some(format!("drain_{blocker}"));
         }
-        if !self.rdma_char_refreshed {
-            self.rdma_char_refreshed = true;
-            if let Some((sysfs, dir)) = &self.rdma_char_devices {
-                match crate::rdma::refresh_char_devices(sysfs, dir) {
-                    Ok(count) => eprintln!(
-                        "racer: stage=rdma-device state=char-devices-refreshed count={count} dir={}",
-                        dir.display()
-                    ),
-                    // Reopening may still work; a restart covers it if not.
-                    Err(error) => eprintln!(
-                        "racer: stage=rdma-device state=char-devices-failed dir={} error={error}",
-                        dir.display()
-                    ),
-                }
-            }
-        }
+        self.refresh_char_devices_if_stale();
         // A device back under its old name still needs a refresh when the
         // inventory dropped it meanwhile: a re-enrollment refreshes the
         // shared inventory while the device is gone, and nothing else
@@ -796,6 +815,9 @@ impl WorkerApplication {
                 return Some(format!("inventory_refresh:{error:?}"));
             }
             if undiscovered(&self.discovered_nics) {
+                // Opening may have failed on a node refreshed while the
+                // device was still gone: the next attempt checks again.
+                self.refresh_char_devices_if_stale();
                 return Some("device_undiscovered".into());
             }
         }
@@ -2411,10 +2433,77 @@ mod tests {
         run(&mut worker);
         assert!(links.rail_ready(RailId(0)), "RDMA reactivates");
         assert!(
-            worker.rdma_char_refreshed,
+            worker.rdma_char_refreshed.is_some(),
             "fresh character device nodes before reopening"
         );
         assert_eq!(metrics.count(Event::RdmaDeviceReactivation), 1);
+    }
+
+    #[test]
+    /// Regression (live on Azure MANA, `mana_ib` unbind for 15 s): the
+    /// character device nodes were refreshed once while the device was
+    /// still gone, and never again once it came back with new numbers, so
+    /// opening it failed with ENOENT until the process restarted. A refresh
+    /// now follows the device's current sysfs numbers and missing nodes.
+    fn char_devices_refresh_again_when_the_device_returns_changed() {
+        use std::os::unix::fs::MetadataExt;
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = Scratch(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("target")
+                .join(format!("char-refresh-{}", std::process::id())),
+        );
+        let sysfs = dir.0.join("infiniband_verbs");
+        let char_dir = dir.0.join("char");
+        let set = |minor: Option<u32>| {
+            let _ = std::fs::remove_dir_all(&sysfs);
+            std::fs::create_dir_all(&sysfs).unwrap();
+            if let Some(minor) = minor {
+                std::fs::create_dir_all(sysfs.join("uverbs0")).unwrap();
+                std::fs::write(sysfs.join("uverbs0").join("dev"), format!("231:{minor}\n"))
+                    .unwrap();
+            }
+        };
+        let env = racer_io::Env::host();
+        let app = configured();
+        let (mut worker, _engine) = worker(&env, &app, true, true);
+        worker.rdma_char_devices = Some((sysfs.clone(), char_dir.clone()));
+        // Refreshed while the device is unbound: nothing listed.
+        set(None);
+        worker.refresh_char_devices_if_stale();
+        assert_eq!(worker.rdma_char_refreshed, Some((Vec::new(), true)));
+        // Back with a verbs device: refreshed again.
+        set(Some(192));
+        worker.refresh_char_devices_if_stale();
+        let (devices, ok) = worker.rdma_char_refreshed.clone().unwrap();
+        assert_eq!(devices, vec![(231, 192)]);
+        // Back again with a new minor: refreshed for the new numbers.
+        set(Some(193));
+        worker.refresh_char_devices_if_stale();
+        assert_eq!(
+            worker.rdma_char_refreshed.as_ref().unwrap().0,
+            vec![(231, 193)]
+        );
+        if ok {
+            // With CAP_MKNOD: the node exists, and a missing one is recreated.
+            let node = char_dir.join("231:193");
+            assert_eq!(
+                std::fs::metadata(&node).unwrap().rdev(),
+                libc::makedev(231, 193)
+            );
+            std::fs::remove_file(&node).unwrap();
+            worker.refresh_char_devices_if_stale();
+            assert!(node.exists(), "a missing node is recreated");
+        } else {
+            // Without it: an unchanged failing refresh is not retried.
+            worker.refresh_char_devices_if_stale();
+            assert_eq!(worker.rdma_char_refreshed, Some((vec![(231, 193)], false)));
+        }
     }
 
     #[test]
