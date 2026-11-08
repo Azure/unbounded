@@ -31,6 +31,7 @@ use std::path::Path;
 use std::rc::Rc;
 use std::task::Poll;
 
+pub(crate) mod breaker;
 mod discovery;
 pub(crate) mod link_setup;
 pub(crate) mod links;
