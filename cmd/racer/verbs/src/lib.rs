@@ -123,11 +123,14 @@ pub mod discovery;
 
 /// List RDMA ports on this host. Opens and closes devices on this thread.
 ///
+/// Starts no connection manager listener, so it lists a registration-mode
+/// port that an active owner on this host is listening on, too.
+///
 /// Returns [`Error::Unavailable`] with no RDMA backend. Use
 /// [`discovery::inventory_at`] to fill in NUMA info. Rail labels and port
 /// selection are the caller's policy.
 pub fn inventory() -> Result<Vec<PortInfo>> {
-    Ok(ffi::discover()?
+    Ok(ffi::discover_ports()?
         .iter()
         .map(|device| PortInfo {
             device: device.name.clone(),

@@ -822,22 +822,37 @@ impl Drop for NativeDevice {
 
 /// List ports and open a device for each. Fails on more than 64 ports.
 /// Skips ports whose device will not open or set up.
+#[cfg(test)]
 pub(crate) fn discover() -> Result<Vec<NativeDevice>> {
     discover_with_quota(|| None)
+}
+
+/// List usable ports without starting a connection manager listener.
+///
+/// Inventory runs while an active owner may already listen on the
+/// registration-mode connection manager port of the same address. A second
+/// listener there fails, so a [`discover`] at that moment would drop every
+/// active registration-mode port and an inventory refresh would withdraw
+/// RDMA from a healthy node. Activation still starts (and so verifies) the
+/// listener through [`discover_with_quota`].
+pub(crate) fn discover_ports() -> Result<Vec<NativeDevice>> {
+    discover_with_api(load_api()?, || None, false)
+}
+
+/// The simulated API inside a simulation scope, else libibverbs.
+fn load_api() -> Result<Rc<Api>> {
+    #[cfg(any(test, feature = "simulation"))]
+    if simulation::current().is_some() {
+        return Ok(simulation::api());
+    }
+    Api::load()
 }
 
 /// Attach a tracked owner to each opened device before any discovery cleanup.
 pub(crate) fn discover_with_quota(
     quota: impl FnMut() -> Option<Arc<GuardOwner>>,
 ) -> Result<Vec<NativeDevice>> {
-    #[cfg(any(test, feature = "simulation"))]
-    let api = match simulation::current() {
-        Some(_) => simulation::api(),
-        None => Api::load()?,
-    };
-    #[cfg(not(any(test, feature = "simulation")))]
-    let api = Api::load()?;
-    discover_with_api(api, quota)
+    discover_with_api(load_api()?, quota, true)
 }
 
 /// Charge temporary discovery contexts before calling into the adapter.
@@ -845,9 +860,12 @@ pub(crate) fn discover_with_quota(
 /// Picks each port's mode: window mode on devices with memory windows,
 /// registration mode on devices that can create RC QPs and have an
 /// IPv4-mapped GID (the connection manager addresses peers by IPv4).
+/// `listen` starts each registration-mode port's connection manager
+/// listener; a port whose listener cannot start is skipped and logged.
 fn discover_with_api(
     api: Rc<Api>,
     mut quota: impl FnMut() -> Option<Arc<GuardOwner>>,
+    listen: bool,
 ) -> Result<Vec<NativeDevice>> {
     let discovery_quota = quota();
     let mut ports = [Port::EMPTY; 64];
@@ -931,10 +949,16 @@ fn discover_with_api(
             continue;
         };
         device.comp = Some(comp);
-        if mode == Mode::Registration {
+        if mode == Mode::Registration && listen {
             match Cm::start(&api, raw, device.caps.ipv4, registration::cm_port()) {
                 Ok(Some(cm)) => device.cm = Some(cm),
-                Ok(None) => continue,
+                Ok(None) => {
+                    eprintln!(
+                        "racer: stage=rdma-discover device={} port={} skipped=cm_listen",
+                        device.name, device.endpoint.port
+                    );
+                    continue;
+                }
                 Err(()) => {
                     if let Some(quota) = device.quota.take() {
                         quota.quarantine();
