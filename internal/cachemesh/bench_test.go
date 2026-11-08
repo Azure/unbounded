@@ -23,9 +23,14 @@ var (
 // shared 100k-member view with 2^20 partitions.
 func benchMesh(b *testing.B) *Mesh {
 	b.Helper()
-	benchOnce.Do(func() { benchView = viewtest.Build(b, 100_000, viewtest.Options{}) })
 
-	const self = 12345
+	return benchMeshAt(b, 12345)
+}
+
+// benchMeshAt is benchMesh for the member at slot self.
+func benchMeshAt(b *testing.B, self view.Slot) *Mesh {
+	b.Helper()
+	benchOnce.Do(func() { benchView = viewtest.Build(b, 100_000, viewtest.Options{}) })
 
 	mem, _ := benchView.Member(self)
 	cfg := Config{
@@ -185,6 +190,59 @@ func BenchmarkMesh(b *testing.B) {
 				_ = m.Fresh(meta, st)
 			}
 		})
+	})
+}
+
+// BenchmarkRouteWide routes keys spread over the whole keyspace, so the
+// partition table, member records, and cell lists are read cold: 1M
+// distinct keys from one member (the table and records exceed the per-core
+// caches), and 64k keys from 16 different members in turn (each member
+// relays through a different set of neighbor cells).
+func BenchmarkRouteWide(b *testing.B) {
+	ks := MustKeyspace("blobs", 0)
+
+	keys := func(n int) [][]byte {
+		buf := make([]byte, 0, n*12)
+		out := make([][]byte, n)
+
+		for i := range out {
+			start := len(buf)
+			buf = strconv.AppendInt(append(buf, "k:"...), int64(i)*7919, 10)
+			out[i] = buf[start:len(buf):len(buf)]
+		}
+
+		return out
+	}
+
+	b.Run("Keys1M", func(b *testing.B) {
+		m := benchMesh(b)
+		ks1m := keys(1 << 20)
+
+		b.ReportAllocs()
+		b.ResetTimer()
+
+		i := 0
+		for b.Loop() {
+			_ = m.Route(ks, ks1m[i&(1<<20-1)])
+			i++
+		}
+	})
+	b.Run("Selves16", func(b *testing.B) {
+		ms := make([]*Mesh, 16)
+		for i := range ms {
+			ms[i] = benchMeshAt(b, view.Slot(i*6151+17))
+		}
+
+		k64 := keys(1 << 16)
+
+		b.ReportAllocs()
+		b.ResetTimer()
+
+		i := 0
+		for b.Loop() {
+			_ = ms[i&15].Route(ks, k64[(i>>4)&(1<<16-1)])
+			i++
+		}
 	})
 }
 
