@@ -1,0 +1,146 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
+// Package epoch implements the rolling cluster epoch and the expiry stamps
+// built on it.
+//
+// The leader publishes an epoch number every period as a heartbeat. Each
+// member maps its own monotonic clock onto that epoch with a Tracker:
+//
+//	current = max(previous, anchorEpoch + floor((now - anchorMono) / period))
+//
+// where (anchorEpoch, anchorMono, period) come from the most recent Anchor
+// call. A member cut off from the leader keeps advancing on its own clock, so
+// expiry is never suspended.
+//
+// The epoch never decreases. If an anchor implies an epoch below the current
+// value (the leader is behind this member, for example after the member's
+// clock ran fast), the current value is kept and stalls until the anchored
+// clock catches up. Stalling is the safe direction for a member: it extends
+// lifetimes by at most the skew, never shortens them below the TTL as seen by
+// this member's clock.
+//
+// Concurrency contract: Anchor and Advance are called from a single writer
+// goroutine (the runtime tick). Current may be called from any goroutine and
+// is one atomic load. The request path never reads the clock; time is passed
+// in as int64 nanoseconds of a node-local monotonic clock.
+//
+// Stamps: a value with TTL T is stamped at the owner with
+// Expires = current + ceil(T/period) + 1. Because the stamp is issued at an
+// unknown offset within the current epoch, a value is Fresh for at least T and
+// at most ceil(T/period)*period + period of the issuing clock: T + period
+// when T is a multiple of the period, always less than T + 2*period. A TTL of zero never expires.
+// Nothing here uses floating point; members compare stamps exactly.
+package epoch
+
+import (
+	"fmt"
+	"math"
+	"sync/atomic"
+	"time"
+)
+
+const (
+	// MinTTL is the smallest nonzero TTL a metadata keyspace may use.
+	MinTTL = 5 * time.Minute
+	// DefaultPeriod is the default epoch period.
+	DefaultPeriod = 15 * time.Second
+	// Never is the Expires value of a stamp that never expires.
+	Never = math.MaxUint64
+)
+
+// Tracker maps local monotonic time to the cluster epoch. The zero value is
+// ready to use with epoch 0 anchored at mono 0 and DefaultPeriod.
+type Tracker struct {
+	cur atomic.Uint64
+
+	// Writer-only fields.
+	anchorEpoch uint64
+	anchorMono  int64
+	period      time.Duration
+}
+
+// Current returns the current epoch. Safe for concurrent use.
+func (t *Tracker) Current() uint64 { return t.cur.Load() }
+
+// Period returns the period of the latest anchor.
+func (t *Tracker) Period() time.Duration {
+	if t.period <= 0 {
+		return DefaultPeriod
+	}
+
+	return t.period
+}
+
+// Anchor records that epoch began (or was observed) at local time now with
+// the given period, then advances. A non-positive period means DefaultPeriod.
+// The returned value is the current epoch, which may exceed epoch if this
+// member is already ahead.
+func (t *Tracker) Anchor(epoch uint64, period time.Duration, now int64) uint64 {
+	t.anchorEpoch = epoch
+	t.anchorMono = now
+	t.period = period
+
+	return t.Advance(now)
+}
+
+// Advance recomputes the epoch for local time now and returns it. It never
+// decreases the epoch.
+func (t *Tracker) Advance(now int64) uint64 {
+	e := t.anchorEpoch
+	if d := now - t.anchorMono; d > 0 {
+		e += uint64(d / int64(t.Period()))
+	}
+
+	if prev := t.cur.Load(); e <= prev {
+		return prev
+	}
+
+	t.cur.Store(e)
+
+	return e
+}
+
+// Stamp is an expiry stamp carried with a cached value.
+type Stamp struct {
+	// Expires is the first epoch at which the value is stale.
+	Expires uint64
+	// Gen is the keyspace generation at stamping time.
+	Gen uint32
+}
+
+// StampFor returns the stamp for a value issued at epoch current with the
+// given TTL and period. A zero TTL never expires. A non-positive period means
+// DefaultPeriod.
+func StampFor(current uint64, ttl, period time.Duration, gen uint32) Stamp {
+	if ttl == 0 {
+		return Stamp{Expires: Never, Gen: gen}
+	}
+
+	if period <= 0 {
+		period = DefaultPeriod
+	}
+
+	n := uint64((ttl + period - 1) / period)
+	if current > Never-n-1 {
+		return Stamp{Expires: Never, Gen: gen}
+	}
+
+	return Stamp{Expires: current + n + 1, Gen: gen}
+}
+
+// ValidateTTL reports whether ttl is allowed: zero (never expires) or at
+// least MinTTL.
+func ValidateTTL(ttl time.Duration) error {
+	if ttl != 0 && ttl < MinTTL {
+		return fmt.Errorf("epoch: ttl %v must be 0 or at least %v", ttl, MinTTL)
+	}
+
+	return nil
+}
+
+// Fresh reports whether a value with stamp s is still valid at epoch current
+// under keyspace generation gen.
+func Fresh(s Stamp, current uint64, gen uint32) bool {
+	return current < s.Expires && s.Gen == gen
+}

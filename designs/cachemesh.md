@@ -302,8 +302,10 @@ can serve catch-up. `view.Interner` lets the simulator share identical views
   `T >= 5m`) stamps values at the owner with
   `Stamp{Expires: current + ceil(T/period) + 1, Gen: generation}`. Copies
   keep the owner's stamp. `Fresh(stamp)` is `current < Expires && Gen ==
-  generation`. A value therefore lives between `T` and `T + period` on members
-  whose clocks match the leader's, plus clock drift between heartbeats.
+  generation`. A value therefore lives between `T` and
+  `ceil(T/period)*period + period` on members whose clocks match the
+  leader's, plus clock drift between heartbeats: `T + period` when `T` is a
+  multiple of the period, and always less than `T + 2*period`.
 - `Invalidate(keyspace)` asks the leader to bump the generation, which makes
   every existing stamp of that keyspace stale.
 
