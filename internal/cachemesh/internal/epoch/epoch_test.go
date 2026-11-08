@@ -37,17 +37,23 @@ func TestAnchorForwardAndBackward(t *testing.T) {
 	if got := tr.Advance(int64(25 * time.Second)); got != 102 {
 		t.Fatalf("advance: %d", got)
 	}
-	// Leader behind: stall at 102 until the anchor catches up.
+	// A stale (behind) anchor is ignored: the phase is kept, no stall.
 	if got := tr.Anchor(101, p, int64(26*time.Second)); got != 102 {
 		t.Fatalf("backward anchor: %d", got)
 	}
 
-	if got := tr.Advance(int64(35 * time.Second)); got != 102 {
-		t.Fatalf("stall: %d", got)
+	if got := tr.Advance(int64(35 * time.Second)); got != 103 {
+		t.Fatalf("kept phase: %d", got)
 	}
 
-	if got := tr.Advance(int64(46 * time.Second)); got != 103 {
-		t.Fatalf("catch up: %d", got)
+	// An anchor for the epoch the tracker already computes keeps the phase
+	// too, even though it arrives late in the epoch.
+	if got := tr.Anchor(103, p, int64(39*time.Second)); got != 103 {
+		t.Fatalf("same-epoch anchor: %d", got)
+	}
+
+	if got := tr.Advance(int64(40 * time.Second)); got != 104 {
+		t.Fatalf("same-epoch anchor moved the phase: %d", got)
 	}
 	// Forward jump.
 	if got := tr.Anchor(200, p, int64(47*time.Second)); got != 200 {
@@ -283,4 +289,40 @@ func TestPeriodConcurrent(t *testing.T) {
 	}
 
 	wg.Wait()
+}
+
+// TestStaleAnchorsDoNotStretchEpochs is a regression test: each anchor used
+// to reset the phase to the time it was applied, so a heartbeat replayed
+// late (a catch-up delta, a snapshot, a new leader whose own phase was
+// late) delayed every later epoch boundary by up to a period. Repeated
+// across leader changes this stretched stamp lifetimes without bound (found
+// by the DST data-plane workload).
+func TestStaleAnchorsDoNotStretchEpochs(t *testing.T) {
+	const p = 15 * time.Second
+
+	var tr Tracker
+
+	tr.Anchor(0, p, 0)
+
+	// Every period a heartbeat for the epoch that just began arrives 14s
+	// late. The phase must stay at the first anchor's.
+	for e := uint64(1); e <= 40; e++ {
+		at := int64(e)*int64(p) + int64(14*time.Second)
+		if got := tr.Anchor(e, p, at); got != e {
+			t.Fatalf("epoch %d: got %d", e, got)
+		}
+	}
+
+	if got := tr.Advance(41 * int64(p)); got != 41 {
+		t.Fatalf("after 41 periods: %d, want 41", got)
+	}
+
+	// A member that is behind still catches up at once.
+	var lag Tracker
+
+	lag.Anchor(0, p, 0)
+
+	if got := lag.Anchor(10, p, int64(20*time.Second)); got != 10 {
+		t.Fatalf("catch up: %d", got)
+	}
 }

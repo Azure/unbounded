@@ -13,12 +13,19 @@
 // call. A member cut off from the leader keeps advancing on its own clock, so
 // expiry is never suspended.
 //
-// The epoch never decreases. If an anchor implies an epoch below the current
-// value (the leader is behind this member, for example after the member's
-// clock ran fast), the current value is kept and stalls until the anchored
-// clock catches up. Stalling is the safe direction for a member: it extends
-// lifetimes by at most the skew, never shortens them below the TTL as seen by
-// this member's clock.
+// The epoch never decreases, and an anchor never moves the phase backward:
+// an anchor whose epoch is at or below the epoch the current anchor already
+// gives for now (with the same period) is stale information and is ignored.
+// Heartbeats reach a member up to a period after their epoch began (a
+// catch-up delta or snapshot replays an old Epoch op at the time it is
+// applied), so honoring such an anchor would delay this member's epoch
+// boundaries. Worse, a member that became leader with a delayed phase would
+// publish it, every member would stall to match, and each leader change
+// could stretch every stamp's lifetime by up to another period. Only an
+// anchor ahead of this member's epoch (or a period change) re-anchors; a
+// member therefore lags the leader by at most the delay of the anchor that
+// last moved it forward, and a leader that lags its members does not drag
+// them back.
 //
 // Concurrency contract: Anchor and Advance are called from a single writer
 // goroutine (the runtime tick). Current may be called from any goroutine and
@@ -57,6 +64,7 @@ type Tracker struct {
 	// Writer-only fields.
 	anchorEpoch uint64
 	anchorMono  int64
+	anchored    bool
 
 	// period is written by Anchor and read by Period, which the request
 	// path may call concurrently (route.State.Stamp), so it is atomic.
@@ -77,9 +85,20 @@ func (t *Tracker) Period() time.Duration {
 
 // Anchor records that epoch began (or was observed) at local time now with
 // the given period, then advances. A non-positive period means DefaultPeriod.
-// The returned value is the current epoch, which may exceed epoch if this
+// An anchor at or below the epoch the current anchor gives for now, with an
+// unchanged period, is ignored (see the package documentation). The
+// returned value is the current epoch, which may exceed epoch if this
 // member is already ahead.
 func (t *Tracker) Anchor(epoch uint64, period time.Duration, now int64) uint64 {
+	if period <= 0 {
+		period = DefaultPeriod
+	}
+
+	if t.anchored && period == t.Period() && epoch <= t.at(now) {
+		return t.Advance(now)
+	}
+
+	t.anchored = true
 	t.anchorEpoch = epoch
 	t.anchorMono = now
 	t.period.Store(int64(period))
@@ -87,18 +106,25 @@ func (t *Tracker) Anchor(epoch uint64, period time.Duration, now int64) uint64 {
 	return t.Advance(now)
 }
 
-// Advance recomputes the epoch for local time now and returns it. It never
-// decreases the epoch.
-func (t *Tracker) Advance(now int64) uint64 {
+// at returns the epoch the current anchor gives for local time now.
+func (t *Tracker) at(now int64) uint64 {
 	e := t.anchorEpoch
 	if d := now - t.anchorMono; d > 0 {
 		n := uint64(d / int64(t.Period()))
 		if e > Never-n {
-			e = Never
-		} else {
-			e += n
+			return Never
 		}
+
+		e += n
 	}
+
+	return e
+}
+
+// Advance recomputes the epoch for local time now and returns it. It never
+// decreases the epoch.
+func (t *Tracker) Advance(now int64) uint64 {
+	e := t.at(now)
 
 	if prev := t.cur.Load(); e <= prev {
 		return prev
