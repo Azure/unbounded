@@ -737,9 +737,18 @@ func (n *Node) electInput(now int64, wall time.Time) elect.Input {
 	// A joiner that has seeds is in contact with the cluster and needs no
 	// Lease reads: keep it a follower. Otherwise a joiner without a view
 	// would sit in the lottery and, with a skewed wall clock, take a live
-	// leader's Lease only to give it back.
+	// leader's Lease only to give it back. A joiner that holds a configured
+	// view reports when it last heard the leader (heardAt is refreshed by
+	// every version it applies, heartbeats included), so if the whole
+	// membership of its lineage is gone (every member restarted with a new
+	// incarnation while no leader could be elected) it enters the lottery
+	// after NoLeaderTimeout and the winner admits itself into that lineage.
 	if !n.isMember() && len(n.seeds) > 0 && !n.bootstrapper && !n.coldStart && !n.leading {
 		in.HaveView, in.LeaderHeardAt = true, now
+
+		if has {
+			in.LeaderHeardAt = n.heardAt // zero counts from the elector's start
+		}
 	}
 
 	// Likewise while this member's own Lease read is outstanding: its

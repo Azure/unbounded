@@ -788,3 +788,34 @@ func TestExpiredCallsDeterministic(t *testing.T) {
 		}
 	}
 }
+
+// TestWholeMembershipReplaced is a regression test: when every member of
+// the view restarted with a new incarnation before a leader could admit
+// any of them, every process was a joiner with seeds, and joiners with
+// seeds never entered the lottery, so no leader was ever elected (found by
+// the DST data-plane workload once a fresh member could no longer
+// bootstrap a second cluster next to the old one).
+func TestWholeMembershipReplaced(t *testing.T) {
+	c := grow(t, 4)
+	old := c.nodes[0].View()
+
+	// Restart every member at once, each holding the old view (as if it
+	// had caught up from a peer that had not restarted yet).
+	for i := range 4 {
+		cfg := c.cfg(i, []string{addr((i + 1) % 4)})
+		cfg.Initial = old
+		c.add(cfg)
+	}
+
+	c.waitConverged(5 * time.Minute)
+
+	v := c.nodes[c.leader()].View()
+	if v.Term() <= old.Term() || v.Epoch() < old.Epoch() {
+		t.Fatalf("new view %v epoch %d, old %v epoch %d", v.Version(), v.Epoch(), old.Version(), old.Epoch())
+	}
+
+	// The lineage continues: no second genesis.
+	if _, ok := v.Config(); !ok || v.Version().Seq == 1 && v.Len() == 1 {
+		t.Fatalf("lineage restarted: %v", v.Version())
+	}
+}
