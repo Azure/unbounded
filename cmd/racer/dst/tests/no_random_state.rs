@@ -5,6 +5,11 @@
 //! trace check whenever iteration order reaches behavior. Use `BTreeMap`,
 //! `Vec`, or a map with a fixed-seed `BuildHasher` (and name the hasher on
 //! the same line so this check can see it).
+//!
+//! It scans this crate only. Production crates the Model drives (for example
+//! racer-core) do use default-hasher maps; there the double run is the guard,
+//! since std reseeds `RandomState` per map and order-dependent behavior
+//! diverges between the two runs.
 use std::path::Path;
 
 fn scan(dir: &Path, hits: &mut Vec<String>) {
