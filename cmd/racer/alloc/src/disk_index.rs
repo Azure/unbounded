@@ -804,15 +804,16 @@ impl DiskIndex {
         ticket: PageTicket,
         length: usize,
     ) -> std::result::Result<(SegmentLease, Writing), (PageTicket, Error)> {
+        // Check before appending: a lease dropped on this error path would
+        // strand its extent until the segment is recycled.
+        if segments.count() > self.segments.len() {
+            return Err((ticket, Error::InvalidConfiguration));
+        }
         let (lease, extent) = match segments.append(length) {
             Ok(appended) => appended,
             Err(error) => return Err((ticket, error)),
         };
-        let index = lease.id().0 as usize;
-        if index >= self.segments.len() {
-            return Err((ticket, Error::InvalidConfiguration));
-        }
-        self.segments[index].writes += 1;
+        self.segments[lease.id().0 as usize].writes += 1;
         let location = RecordLocation {
             segment: lease.id(),
             generation: lease.generation(),
@@ -1781,6 +1782,22 @@ mod tests {
         drop(lease);
         assert!(index.is_empty() && !index.is_inflight(PageSlot(0)));
         index.check_invariants();
+    }
+
+    #[test]
+    fn append_without_segment_table_consumes_no_space() {
+        let segments = segments(2);
+        let mut index = DiskIndex::new(8, 8, 1).unwrap();
+        let cache = index.add_cache(CacheIdx(0)).unwrap();
+        let ticket = index.reserve(PageSlot(0), cache).unwrap();
+        let Err((ticket, Error::InvalidConfiguration)) = index.append(&segments, ticket, 512)
+        else {
+            panic!("segment table smaller than the segments");
+        };
+        index.ensure_segments(segments.count()).unwrap();
+        let (_lease, writing) = index.append(&segments, ticket, 512).unwrap();
+        // The refused append reserved nothing: this record starts the segment.
+        assert_eq!(writing.location.extent.offset(), 0);
     }
 
     #[test]
