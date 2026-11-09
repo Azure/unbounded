@@ -65,7 +65,9 @@ func (s *Server) serveFromFetcher(ctx context.Context, w http.ResponseWriter, d 
 	ref := ifaces.OriginRef{Registry: upstream, Repository: repo, Digest: d, Kind: kind, Offset: offset}
 
 	started, written, err := s.blobFetcher.FetchBlob(ctx, w, ref, func(total int64, contentType string) {
-		if kind == ifaces.KindManifest && contentType != "" {
+		// Keep any known type whatever the requested kind: the origin can
+		// serve a /blobs/ request from /manifests/ and report its media type.
+		if contentType != "" {
 			w.Header().Set("Content-Type", contentType)
 		}
 

@@ -29,6 +29,7 @@ type fakeFetcher struct {
 	blobs     map[digest.Digest][]byte
 	refs      []ifaces.OriginRef
 	failAfter int
+	ctype     string
 }
 
 func (f *fakeFetcher) FetchBlob(_ context.Context, w io.Writer, ref ifaces.OriginRef, start func(int64, string)) (bool, int64, error) {
@@ -41,7 +42,7 @@ func (f *fakeFetcher) FetchBlob(_ context.Context, w io.Writer, ref ifaces.Origi
 		return false, 0, nil
 	}
 
-	start(int64(len(body)), "")
+	start(int64(len(body)), f.ctype)
 
 	part := body[ref.Offset:]
 	if f.failAfter > 0 && f.failAfter < len(part) {
@@ -290,5 +291,25 @@ func TestMirrorTagResolver(t *testing.T) {
 	resp, _, err = get(t, srv.URL+"/v2/library/app/manifests/v1", nil)
 	if err != nil || resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("failing resolver: resp=%v err=%v", resp, err)
+	}
+}
+
+func TestMirrorBlobFetcherKeepsContentTypeForBlobKind(t *testing.T) {
+	body := []byte(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}`)
+	d := digestOf(body)
+
+	const ctype = "application/vnd.oci.image.index.v1+json"
+
+	fetcher := &fakeFetcher{blobs: map[digest.Digest][]byte{d: body}, ctype: ctype}
+
+	srv, _, _ := cachemeshFixture(t, nil, mirror.WithBlobFetcher(fetcher))
+
+	resp, got, err := get(t, srv.URL+"/v2/library/app/blobs/"+d.String(), nil)
+	if err != nil || resp.StatusCode != http.StatusOK || string(got) != string(body) {
+		t.Fatalf("GET: resp=%v err=%v body=%q", resp, err, got)
+	}
+
+	if ct := resp.Header.Get("Content-Type"); ct != ctype {
+		t.Fatalf("Content-Type %q, want %q", ct, ctype)
 	}
 }
