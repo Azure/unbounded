@@ -1984,18 +1984,26 @@ impl Coordinator {
                             racer_gpu::display_id(&self.uuids[index])
                         );
                     }
-                    // Registered before the executor can release it.
-                    if let Ok(mut owners) = self.engine.state.owners.lock() {
-                        owners.insert(id, device.ordinal);
-                    }
+                    // Register the owner and queue the adoption under one
+                    // owners lock: a concurrent release looks the owner up
+                    // under that lock, so its Release is queued after Adopt.
+                    // Lock order is owners, then the device queue; nothing
+                    // takes owners while holding a queue lock.
+                    let mut owners = self
+                        .engine
+                        .state
+                        .owners
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    owners.insert(id, device.ordinal);
+                    #[cfg(test)]
+                    testing::before_adopt(id);
                     let adopted = device.queue.control(Task::Adopt {
                         id,
                         import: Arc::new(import),
                     });
                     if let Err(error) = adopted {
-                        if let Ok(mut owners) = self.engine.state.owners.lock() {
-                            owners.remove(&id);
-                        }
+                        owners.remove(&id);
                         return Err(error);
                     }
                     return Ok(device.ordinal);
@@ -2966,6 +2974,26 @@ pub(crate) mod testing {
         /// The simulation, on the GPU coordinator thread only.
         static SIM: RefCell<Option<(racer_gpu::simulation::Simulation, racer_gpu::simulation::Environment)>> =
             const { RefCell::new(None) };
+    }
+
+    /// A hook run on the coordinator between registering request `id`'s owner
+    /// and queuing its adoption, keyed by request id.
+    pub(super) static BEFORE_ADOPT: Mutex<Vec<(u64, AdoptHook)>> = Mutex::new(Vec::new());
+
+    /// A hook in [`BEFORE_ADOPT`].
+    pub(super) type AdoptHook = Box<dyn FnOnce() + Send>;
+
+    pub(super) fn before_adopt(id: u64) {
+        let hook = {
+            let mut hooks = BEFORE_ADOPT.lock().unwrap_or_else(|e| e.into_inner());
+            hooks
+                .iter()
+                .position(|(hook, _)| *hook == id)
+                .map(|at| hooks.swap_remove(at).1)
+        };
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 
     /// The coordinator thread's simulation. Call through [`GpuHelper::run`].
@@ -4254,6 +4282,41 @@ mod tests {
             live.imports == 0 && live.streams == 0 && live.events == 0
         });
         assert!(simulation.take_violations().is_empty());
+    }
+
+    #[test]
+    /// A release racing an import, after the coordinator records the owner
+    /// but before it queues the adoption, is ordered after the adoption and
+    /// frees the import instead of leaking it.
+    fn release_racing_an_import_frees_it() {
+        const ID: u64 = 77;
+        let helper = helper(&[None]);
+        let (released, answer) = std::sync::mpsc::channel();
+        let racer = helper.clone();
+        BEFORE_ADOPT.lock().unwrap().push((
+            ID,
+            Box::new(move || {
+                std::thread::spawn(move || {
+                    let (reply, answer) = oneshot::channel();
+                    let queued = racer.release(ID, Some(reply));
+                    let _ = released.send(queued.and_then(|()| {
+                        futures::executor::block_on(answer).unwrap_or(Err(Error::Internal))
+                    }));
+                });
+                // Give the release time to run ahead of the adoption.
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }),
+        ));
+        let _fd = import(&helper, ID, 0);
+        assert_eq!(
+            answer
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap(),
+            Ok(())
+        );
+        let simulation = helper.run(simulation);
+        eventually(|| simulation.live().imports == 0 && owner(&helper, ID).is_none());
+        assert_eq!(helper.leaked(), 0);
     }
 
     #[test]
