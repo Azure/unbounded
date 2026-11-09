@@ -5,10 +5,8 @@ package meshfetch
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -80,17 +78,12 @@ func (c *contentRoot) ingest(key, d string, total int64, data []byte) string {
 func (c *contentRoot) open(t *testing.T) *DirContent {
 	t.Helper()
 
-	dc, err := NewDirContent(DirContentOptions{
-		Root:         c.root,
-		IdleClose:    50 * time.Millisecond,
-		ScanInterval: time.Nanosecond,
-		Logger:       slog.New(slog.DiscardHandler),
-	})
+	dc, err := NewDirContent(c.root, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	t.Cleanup(dc.Close)
+	dc.scanInterval = time.Nanosecond
 
 	return dc
 }
@@ -123,8 +116,7 @@ func TestDirContentCommittedBlob(t *testing.T) {
 }
 
 // An ingest is found through its ref; its readable size is its data
-// file, capped at total, and a descriptor opened on it survives the
-// commit rename.
+// file, capped at total, and reads continue after the commit rename.
 func TestDirContentIngestAndCommit(t *testing.T) {
 	cr := newContentRoot(t)
 	dc := cr.open(t)
@@ -164,7 +156,7 @@ func TestDirContentIngestAndCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The cached descriptor still reads.
+	// The committed blob still reads.
 	if _, err := dc.ReadAt(d, buf, 7000); err != nil || !bytes.Equal(buf, data[7000:8000]) {
 		t.Fatalf("ReadAt after commit: %v", err)
 	}
@@ -193,9 +185,8 @@ func TestDirContentIngestTotal(t *testing.T) {
 	}
 }
 
-// Descriptors of deleted blobs are closed once idle, so containerd's
-// garbage collection gets the space back; reads then fail.
-func TestDirContentClosesIdleDescriptors(t *testing.T) {
+// A deleted blob is no longer read or available.
+func TestDirContentDeletedBlob(t *testing.T) {
 	cr := newContentRoot(t)
 	dc := cr.open(t)
 	d := testDigest(5)
@@ -206,15 +197,9 @@ func TestDirContentClosesIdleDescriptors(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if dc.openFiles() != 1 {
-		t.Fatalf("open files = %d", dc.openFiles())
-	}
-
 	if err := os.Remove(cr.blobPath(d)); err != nil {
 		t.Fatal(err)
 	}
-
-	waitFor(t, "idle descriptor closed", func() bool { return dc.openFiles() == 0 })
 
 	if _, err := dc.ReadAt(d, make([]byte, 10), 0); err == nil {
 		t.Fatal("read of a deleted blob succeeded")
@@ -225,8 +210,7 @@ func TestDirContentClosesIdleDescriptors(t *testing.T) {
 	}
 }
 
-// A truncated ingest (a restarted download) makes reads short and drops
-// the descriptor.
+// A truncated ingest (a restarted download) makes reads short.
 func TestDirContentTruncatedIngest(t *testing.T) {
 	cr := newContentRoot(t)
 	dc := cr.open(t)
@@ -243,10 +227,6 @@ func TestDirContentTruncatedIngest(t *testing.T) {
 
 	if _, err := dc.ReadAt(d, make([]byte, 100), 4000); !errors.Is(err, errContentShort) {
 		t.Fatalf("want short read, got %v", err)
-	}
-
-	if dc.openFiles() != 0 {
-		t.Fatal("descriptor of a truncated ingest kept")
 	}
 }
 
@@ -266,11 +246,11 @@ func TestDirContentRejectsBadDigests(t *testing.T) {
 }
 
 func TestNewDirContentRequiresReadableRoot(t *testing.T) {
-	if _, err := NewDirContent(DirContentOptions{}); err == nil {
+	if _, err := NewDirContent("", nil); err == nil {
 		t.Fatal("empty root accepted")
 	}
 
-	if _, err := NewDirContent(DirContentOptions{Root: filepath.Join(t.TempDir(), "missing")}); err == nil {
+	if _, err := NewDirContent(filepath.Join(t.TempDir(), "missing"), nil); err == nil {
 		t.Fatal("missing root accepted")
 	}
 }
@@ -318,56 +298,5 @@ func TestRefHex(t *testing.T) {
 		if got := refHex(ref); got != want {
 			t.Errorf("refHex(%q) = %q, want %q", ref, got, want)
 		}
-	}
-}
-
-// fakeOpener serves blobs from memory, counting opens.
-type fakeOpener struct {
-	blobs map[string][]byte
-	opens int
-}
-
-func (o *fakeOpener) Open(_ context.Context, d string) (io.ReaderAt, int64, io.Closer, error) {
-	o.opens++
-
-	b, ok := o.blobs[d]
-	if !ok {
-		return nil, 0, nil, errNotFound
-	}
-
-	return bytes.NewReader(b), int64(len(b)), io.NopCloser(nil), nil
-}
-
-func TestOpenerContent(t *testing.T) {
-	d := testDigest(1)
-	o := &fakeOpener{blobs: map[string][]byte{d: pattern(3, 1000)}}
-	src := &OpenerContent{Opener: o}
-
-	if avail, total := src.Available(d); avail != 1000 || total != 1000 {
-		t.Fatalf("Available = %d/%d", avail, total)
-	}
-
-	// The size is cached.
-	src.Available(d)
-
-	if o.opens != 1 {
-		t.Fatalf("opens = %d", o.opens)
-	}
-
-	if avail, _ := src.Available(testDigest(2)); avail != 0 {
-		t.Fatal("absent blob available")
-	}
-
-	buf := make([]byte, 10)
-	if _, err := src.ReadAt(d, buf, 10); err != nil || !bytes.Equal(buf, pattern(3, 1000)[10:20]) {
-		t.Fatalf("ReadAt: %v", err)
-	}
-
-	if _, err := src.ReadAt(d, buf, 995); !errors.Is(err, errContentShort) {
-		t.Fatalf("short read: %v", err)
-	}
-
-	if _, err := src.ReadAt(testDigest(2), buf, 0); err == nil {
-		t.Fatal("absent blob read")
 	}
 }

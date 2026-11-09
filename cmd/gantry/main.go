@@ -209,12 +209,7 @@ func runAgent(args []string) error {
 	var meshAgent *cachemeshAgent
 
 	if c.Cachemesh.Enabled {
-		var open func(ctx context.Context, d digest.Digest) (io.ReadCloser, int64, error)
-		if cdstore != nil {
-			open = cdstore.Open
-		}
-
-		meshAgent, err = newCachemeshAgent(c, mirrorOriginClient, open, reg, logger)
+		meshAgent, err = newCachemeshAgent(c, mirrorOriginClient, reg, logger)
 		if err != nil {
 			return err
 		}

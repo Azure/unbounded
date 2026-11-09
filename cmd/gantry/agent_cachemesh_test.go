@@ -4,7 +4,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -20,9 +19,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	"github.com/Azure/unbounded/internal/gantry/config"
-	gdigest "github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
-	"github.com/Azure/unbounded/internal/gantry/meshfetch"
 	"github.com/Azure/unbounded/internal/gantry/metrics"
 )
 
@@ -76,7 +73,7 @@ func TestNewCachemeshAgentRequiresRangeOrigin(t *testing.T) {
 	c := config.NewDefault()
 	c.Cachemesh.Enabled = true
 
-	_, err := newCachemeshAgent(c, pullOnlyOrigin{}, nil, metrics.New(), slog.New(slog.DiscardHandler))
+	_, err := newCachemeshAgent(c, pullOnlyOrigin{}, metrics.New(), slog.New(slog.DiscardHandler))
 	if err == nil || !strings.Contains(err.Error(), "range") {
 		t.Fatalf("want range capability error, got %v", err)
 	}
@@ -159,9 +156,8 @@ func TestCgroupMemoryLimit(t *testing.T) {
 	}
 }
 
-// cachemeshContent reads the content root directly when it is readable,
-// falls back to the containerd API otherwise, and has no source when
-// neither is available.
+// cachemeshContent reads the content root directly when it is readable
+// and has no source otherwise.
 func TestCachemeshContentSelection(t *testing.T) {
 	logger := slog.New(slog.DiscardHandler)
 	root := t.TempDir()
@@ -178,64 +174,24 @@ func TestCachemeshContentSelection(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	open := func(_ context.Context, d gdigest.Digest) (io.ReadCloser, int64, error) {
-		if d.Hex() != hexd {
-			return nil, 0, errors.New("not found")
+	src := cachemeshContent(root, logger)
+	if src == nil {
+		t.Fatal("readable root: no content source")
+	}
+
+	avail, total := src.Available("sha256:" + hexd)
+	if avail != int64(len(blob)) || total != avail {
+		t.Fatalf("Available = %d/%d", avail, total)
+	}
+
+	buf := make([]byte, 7)
+	if _, err := src.ReadAt("sha256:"+hexd, buf, 6); err != nil || string(buf) != "content" {
+		t.Fatalf("ReadAt = %q, %v", buf, err)
+	}
+
+	for _, r := range []string{"", filepath.Join(root, "missing")} {
+		if src := cachemeshContent(r, logger); src != nil {
+			t.Fatalf("root %q: want no content source", r)
 		}
-
-		r := bytes.NewReader(blob)
-
-		return struct {
-			io.Reader
-			io.ReaderAt
-			io.Closer
-		}{r, r, io.NopCloser(nil)}, int64(len(blob)), nil
-	}
-
-	cm := config.NewDefault().Cachemesh
-	cm.ContentRoot = root
-
-	src, kind, closeFn := cachemeshContent(cm, open, logger)
-	defer closeFn()
-
-	if kind != "dir" {
-		t.Fatalf("kind = %q, want dir", kind)
-	}
-
-	cm.ContentRoot = filepath.Join(root, "missing")
-
-	src2, kind, closeFn2 := cachemeshContent(cm, open, logger)
-	defer closeFn2()
-
-	if kind != "api" {
-		t.Fatalf("kind = %q, want api", kind)
-	}
-
-	for _, s := range []meshfetch.ContentSource{src, src2} {
-		avail, total := s.Available("sha256:" + hexd)
-		if avail != int64(len(blob)) || total != avail {
-			t.Fatalf("Available = %d/%d", avail, total)
-		}
-
-		buf := make([]byte, 7)
-		if _, err := s.ReadAt("sha256:"+hexd, buf, 6); err != nil || string(buf) != "content" {
-			t.Fatalf("ReadAt = %q, %v", buf, err)
-		}
-	}
-
-	if _, kind, _ := cachemeshContent(cm, nil, logger); kind != "none" {
-		t.Fatalf("kind = %q, want none", kind)
-	}
-
-	// A reader without ReadAt is refused.
-	o := blobOpener{open: func(context.Context, gdigest.Digest) (io.ReadCloser, int64, error) {
-		return io.NopCloser(bytes.NewReader(blob)), int64(len(blob)), nil
-	}}
-	if _, _, _, err := o.Open(context.Background(), "sha256:"+hexd); err == nil {
-		t.Fatal("want ReadAt error")
-	}
-
-	if _, _, _, err := o.Open(context.Background(), "bad"); err == nil {
-		t.Fatal("want digest parse error")
 	}
 }

@@ -118,12 +118,10 @@ func benchContentStore(b *testing.B) (*DirContent, string) {
 		b.Fatal(err)
 	}
 
-	dc, err := NewDirContent(DirContentOptions{Root: root})
+	dc, err := NewDirContent(root, nil)
 	if err != nil {
 		b.Fatal(err)
 	}
-
-	b.Cleanup(dc.Close)
 
 	return dc, d
 }

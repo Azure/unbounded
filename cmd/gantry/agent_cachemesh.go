@@ -7,7 +7,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -24,7 +23,6 @@ import (
 	"github.com/Azure/unbounded/internal/cachemesh/kubelease"
 	"github.com/Azure/unbounded/internal/gantry/chairs"
 	"github.com/Azure/unbounded/internal/gantry/config"
-	gdigest "github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/meshfetch"
 	"github.com/Azure/unbounded/internal/gantry/metrics"
@@ -45,8 +43,6 @@ type cachemeshAgent struct {
 	cancel  context.CancelFunc
 	done    chan error
 	tags    bool
-	// closeContent releases the local content source.
-	closeContent func()
 }
 
 // cachemeshMemoryLimitPercent is the share of the container memory limit
@@ -103,52 +99,23 @@ func cgroupMemoryLimit(readFile func(string) ([]byte, error)) int64 {
 	return 0
 }
 
-// blobOpener adapts the containerd content API store to
-// meshfetch.BlobOpener (committed blobs only).
-type blobOpener struct {
-	open func(ctx context.Context, d gdigest.Digest) (io.ReadCloser, int64, error)
-}
+// cachemeshContent returns the local content source: the content root
+// read directly. It returns nil (serve peers from memory only) when the root
+// is unset or unreadable.
+func cachemeshContent(root string, logger *slog.Logger) meshfetch.ContentSource {
+	if root == "" {
+		return nil
+	}
 
-func (o blobOpener) Open(ctx context.Context, d string) (io.ReaderAt, int64, io.Closer, error) {
-	dg, err := gdigest.Parse(d)
+	dc, err := meshfetch.NewDirContent(root, logger)
 	if err != nil {
-		return nil, 0, nil, err
+		logger.Warn("cachemesh content root unreadable; serving peers from memory only",
+			slog.String("content_root", root), slog.Any("err", err))
+
+		return nil
 	}
 
-	rc, size, err := o.open(ctx, dg)
-	if err != nil {
-		return nil, 0, nil, err
-	}
-
-	ra, ok := rc.(io.ReaderAt)
-	if !ok {
-		_ = rc.Close() //nolint:errcheck // read-only handle
-		return nil, 0, nil, errors.New("cachemesh: content reader does not support ReadAt")
-	}
-
-	return ra, size, rc, nil
-}
-
-// cachemeshContent returns the local content source: the content root read
-// directly when it is mounted and readable, else committed blobs over the
-// containerd content API (open may be nil: no local content). The returned
-// close func releases the source.
-func cachemeshContent(cm config.CachemeshConfig, open func(ctx context.Context, d gdigest.Digest) (io.ReadCloser, int64, error), logger *slog.Logger) (meshfetch.ContentSource, string, func()) {
-	if cm.ContentRoot != "" {
-		dc, err := meshfetch.NewDirContent(meshfetch.DirContentOptions{Root: cm.ContentRoot, Logger: logger})
-		if err == nil {
-			return dc, "dir", dc.Close
-		}
-
-		logger.Warn("cachemesh content root unreadable; reading committed blobs over the containerd API",
-			slog.String("content_root", cm.ContentRoot), slog.Any("err", err))
-	}
-
-	if open == nil {
-		return nil, "none", func() {}
-	}
-
-	return &meshfetch.OpenerContent{Opener: blobOpener{open: open}}, "api", func() {}
+	return dc
 }
 
 // cachemeshMemberID names this agent in the mesh: the Kubernetes node name,
@@ -179,11 +146,7 @@ func cachemeshAddr(c *config.Config) (string, error) {
 }
 
 // newCachemeshAgent builds the cachemesh member. It does not start it.
-//
-// open reads committed blobs over the containerd content API; it is the
-// fallback local content source when the content root is not readable.
-// Nil leaves only the content root.
-func newCachemeshAgent(c *config.Config, origin ifaces.OriginPuller, open func(ctx context.Context, d gdigest.Digest) (io.ReadCloser, int64, error), reg *metrics.Registry, logger *slog.Logger) (*cachemeshAgent, error) {
+func newCachemeshAgent(c *config.Config, origin ifaces.OriginPuller, reg *metrics.Registry, logger *slog.Logger) (*cachemeshAgent, error) {
 	cm := c.Cachemesh
 
 	rangeOrigin, ok := origin.(meshfetch.Origin)
@@ -232,7 +195,7 @@ func newCachemeshAgent(c *config.Config, origin ifaces.OriginPuller, open func(c
 		return nil, err
 	}
 
-	content, contentKind, closeContent := cachemeshContent(cm, open, logger)
+	content := cachemeshContent(cm.ContentRoot, logger)
 
 	node, err := meshfetch.New(meshfetch.Config{
 		Mesh:          mesh,
@@ -257,13 +220,12 @@ func newCachemeshAgent(c *config.Config, origin ifaces.OriginPuller, open func(c
 		Hooks:         m.hooks(),
 	})
 	if err != nil {
-		closeContent()
 		return nil, err
 	}
 
 	setCachemeshMemoryLimit(logger, os.Getenv, os.ReadFile)
 
-	a := &cachemeshAgent{mesh: mesh, node: node, logger: logger, tags: tagOrigin != nil, closeContent: closeContent}
+	a := &cachemeshAgent{mesh: mesh, node: node, logger: logger, tags: tagOrigin != nil}
 	a.meshPtr.Store(mesh)
 	m.registerGauges(reg, a)
 
@@ -273,7 +235,7 @@ func newCachemeshAgent(c *config.Config, origin ifaces.OriginPuller, open func(c
 		slog.String("lease", c.CachemeshNamespace()+"/"+cm.LeaseName),
 		slog.Int64("chunk_size", cm.ChunkSize),
 		slog.String("content_root", cm.ContentRoot),
-		slog.String("content_source", contentKind),
+		slog.Bool("content_readable", content != nil),
 		slog.Int64("memory_cache_bytes", cm.MemoryCacheBytes),
 		slog.Int64("page_size", cm.PageSize),
 		slog.Int("max_neighbors", cm.MaxNeighbors),
@@ -345,10 +307,6 @@ func (a *cachemeshAgent) stop() {
 	}
 
 	a.node.Close()
-
-	if a.closeContent != nil {
-		a.closeContent()
-	}
 }
 
 type cachemeshMetrics struct {
