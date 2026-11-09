@@ -601,8 +601,19 @@ async fn reconcile(t: &Rc<Term_>) -> Result<(), StateError> {
             )?
         };
         log_rejected_caches(&plan.rejected_caches);
+        if plan.evicted_roots > 0 {
+            eprintln!(
+                "racer: keyring root slots full; evicted {} root(s) no seat offers",
+                plan.evicted_roots
+            );
+        }
         if plan.refused_roots > 0 {
-            // Root slots are full. Those seats stay unready until slots free up.
+            // Offered roots fill every slot. Those seats stay unready until
+            // slots free up.
+            eprintln!(
+                "racer: keyring root slots full; refused {} offered root(s)",
+                plan.refused_roots
+            );
             shared.last_error.set(Some(crate::Error::Unavailable));
         }
         let PassPlan {

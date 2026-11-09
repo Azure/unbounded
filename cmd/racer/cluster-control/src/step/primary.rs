@@ -106,8 +106,10 @@ pub struct PassPlan {
     pub desired: usize,
     pub eligible: usize,
     pub changed: bool,
-    /// Root offers refused because the keyring root slots are full.
+    /// Root offers refused because offered roots fill every keyring root slot.
     pub refused_roots: usize,
+    /// Unoffered roots evicted to admit offers when the root slots were full.
+    pub evicted_roots: usize,
     /// Names of ClusterCaches left out for an invalid `spec.nodeSelector`.
     pub rejected_caches: Vec<String>,
 }
@@ -295,6 +297,7 @@ pub fn plan_pass(i: &PassInputs<'_>, rng: &mut dyn Entropy) -> Result<PassPlan, 
         eligible,
         changed,
         refused_roots: plan.refused_roots,
+        evicted_roots: plan.evicted_roots,
         rejected_caches,
     })
 }
