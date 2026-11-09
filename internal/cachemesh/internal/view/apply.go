@@ -1169,9 +1169,15 @@ func (l *DeltaLog) Since(have Version, haveDigest Digest, limit int) ([]LogEntry
 // DefaultInternerSize is the default number of entries per Interner table.
 const DefaultInternerSize = 4096
 
+// applyKey identifies a memoized Apply by base digest and delta identity.
+// The delta is keyed by pointer, not by its claimed Digest: a delta with the
+// same claimed digest but different ops must miss and be validated by Apply.
+// Interner.Delta returns one shared *Delta per distinct encoding, so deltas
+// decoded through it still share entries. The FIFO keeps the key, and so the
+// delta, alive, so a pointer cannot be reused while it is cached.
 type applyKey struct {
 	base  Digest
-	delta Digest
+	delta *Delta
 }
 
 // Interner shares identical views and decoded deltas, for example across
@@ -1214,10 +1220,10 @@ func (in *Interner) View(v *View) *View {
 	return v
 }
 
-// Apply is Apply(base, d) memoized on (base digest, delta digest). The
-// result is interned.
+// Apply is Apply(base, d) memoized on (base digest, delta pointer). The
+// result is interned. Callers must not modify d after passing it in.
 func (in *Interner) Apply(base *View, d *Delta) (*View, error) {
-	k := applyKey{base: base.Digest(), delta: d.Digest}
+	k := applyKey{base: base.Digest(), delta: d}
 	if v, ok := in.applied.Get(k); ok && base.Version() == d.Base && v.Version() == d.Version {
 		in.Hits++
 

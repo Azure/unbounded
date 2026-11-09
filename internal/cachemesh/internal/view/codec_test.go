@@ -615,3 +615,42 @@ func BenchmarkBuild(b *testing.B) {
 		viewtest.Build(b, 100_000, viewtest.Options{})
 	}
 }
+
+// A delta that reuses a cached delta's Base, Version, and claimed Digest
+// but carries different ops must still be rejected by the digest check.
+func TestInternerRejectsTamperedOps(t *testing.T) {
+	vs, ds := chain(t, 4)
+	in := view.NewInterner(0)
+
+	if _, err := in.Apply(vs[0], ds[0]); err != nil {
+		t.Fatal(err)
+	}
+
+	tampered := *ds[0]
+	tampered.Ops = []view.Op{view.OpEpoch(vs[0].Epoch()+2, time.Second)}
+
+	if _, err := in.Apply(vs[0], &tampered); !errors.Is(err, view.ErrDigest) {
+		t.Fatalf("direct: err %v, want ErrDigest", err)
+	}
+
+	// The same through the decode cache: the valid encoding is cached
+	// first, then a tampered encoding decodes to a distinct delta.
+	if _, err := in.Delta(view.EncodeDelta(ds[0])); err != nil {
+		t.Fatal(err)
+	}
+
+	td, err := in.Delta(view.EncodeDelta(&tampered))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := in.Apply(vs[0], td); !errors.Is(err, view.ErrDigest) {
+		t.Fatalf("decoded: err %v, want ErrDigest", err)
+	}
+
+	// The valid delta still hits.
+	hits := in.Hits
+	if v, err := in.Apply(vs[0], ds[0]); err != nil || !view.Equal(v, vs[1]) || in.Hits != hits+1 {
+		t.Fatalf("valid delta: err %v hits %d->%d", err, hits, in.Hits)
+	}
+}
