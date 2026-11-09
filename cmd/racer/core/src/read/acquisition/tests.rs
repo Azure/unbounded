@@ -94,16 +94,16 @@ fn page() -> Reply {
 
 fn kind(effect: &Fx) -> &'static str {
     match effect {
-        Effect::Rank { .. } => "Rank",
-        Effect::Hints { .. } => "Hints",
-        Effect::Hedge { .. } => "Hedge",
-        Effect::Refresh { .. } => "Refresh",
-        Effect::Send { .. } => "Send",
-        Effect::Validate { .. } => "Validate",
-        Effect::Batch { .. } => "Batch",
-        Effect::Sleep { .. } => "Sleep",
-        Effect::Origin { .. } => "Origin",
-        Effect::Publish { .. } => "Publish",
+        Effect::Io(Io::Rank { .. }) => "Rank",
+        Effect::Io(Io::Hints { .. }) => "Hints",
+        Effect::Io(Io::Hedge { .. }) => "Hedge",
+        Effect::Io(Io::Refresh { .. }) => "Refresh",
+        Effect::Io(Io::Send { .. }) => "Send",
+        Effect::Io(Io::Validate { .. }) => "Validate",
+        Effect::Io(Io::Batch { .. }) => "Batch",
+        Effect::Io(Io::Sleep { .. }) => "Sleep",
+        Effect::Io(Io::Origin { .. }) => "Origin",
+        Effect::Io(Io::Publish { .. }) => "Publish",
         Effect::Report(_) => "Report",
         Effect::Done(_) => "Done",
     }
@@ -126,7 +126,10 @@ fn owner_to_hints(h: &mut Harness, rank: usize) {
         id,
         result: Err(Error::Unavailable),
     });
-    assert!(matches!(effects[..], [Effect::Hints { version: 5, .. }]));
+    assert!(matches!(
+        effects[..],
+        [Effect::Io(Io::Hints { version: 5, .. })]
+    ));
 }
 
 #[test]
@@ -161,11 +164,11 @@ fn first_ranking_verifies_the_callers_ranking() {
     let effects = start(&mut h);
     assert!(matches!(
         &effects[..],
-        [Effect::Rank {
+        [Effect::Io(Io::Rank {
             ranking: Ranking::Current,
             basis: RankBasis::Verify("initial"),
             ..
-        }]
+        })]
     ));
 }
 
@@ -176,12 +179,12 @@ fn hedge_won_publishes_the_held_copy() {
     let effects = h.ranked(5, None, "r5");
     assert!(matches!(
         effects[..],
-        [Effect::Hedge {
+        [Effect::Io(Io::Hedge {
             eligible: true,
             first: 0,
             second: 1,
             ..
-        }]
+        })]
     ));
     let id = h.id();
     let effects = h.act(Input::Hedged {
@@ -191,10 +194,10 @@ fn hedge_won_publishes_the_held_copy() {
     });
     assert!(matches!(
         effects[..],
-        [Effect::Publish {
+        [Effect::Io(Io::Publish {
             source: Source::Hedge,
             ..
-        }]
+        })]
     ));
     let id = h.id();
     h.act(Input::Published { id, result: Ok(()) });
@@ -223,20 +226,20 @@ fn reader_probe_validates_and_publishes_a_peer_copy() {
     let effects = h.ranked(5, None, "r5");
     assert!(matches!(
         effects[..],
-        [Effect::Send {
+        [Effect::Io(Io::Send {
             dest: Some(10),
             version: 5,
             ..
-        }]
+        })]
     ));
     assert_eq!(h.acq.current(), Some(&"r5"));
     let effects = h.reply(page(), Some("bytes"));
     assert!(matches!(
         effects[..],
-        [Effect::Validate {
+        [Effect::Io(Io::Validate {
             answer: "bytes",
             ..
-        }]
+        })]
     ));
     let id = h.id();
     let effects = h.act(Input::Validated {
@@ -245,10 +248,10 @@ fn reader_probe_validates_and_publishes_a_peer_copy() {
     });
     assert!(matches!(
         effects[..],
-        [Effect::Publish {
+        [Effect::Io(Io::Publish {
             source: Source::Peer,
             ..
-        }]
+        })]
     ));
     let id = h.id();
     h.act(Input::Published { id, result: Ok(()) });
@@ -302,7 +305,7 @@ fn evidence_reports_the_probed_destination() {
     );
     assert!(matches!(
         effects.last(),
-        Some(Effect::Send { dest: Some(11), .. })
+        Some(Effect::Io(Io::Send { dest: Some(11), .. }))
     ));
 }
 
@@ -337,7 +340,9 @@ fn owner_rank0_fetches_from_origin_with_authority() {
         owners: List::from_slice(&[10, 11, 12]),
         rank: 0,
     };
-    assert!(matches!(&effects[..], [Effect::Origin { authority: a, .. }] if *a == authority));
+    assert!(
+        matches!(&effects[..], [Effect::Io(Io::Origin { authority: a, .. })] if *a == authority)
+    );
     assert_eq!(h.acq.phase(), Phase::Origin);
     let id = h.id();
     let effects = h.feed(Input::Origin { id, result: Ok(()) });
@@ -345,10 +350,10 @@ fn owner_rank0_fetches_from_origin_with_authority() {
         &effects[..],
         [
             Effect::Report(Report::OriginFetched { .. }),
-            Effect::Publish {
+            Effect::Io(Io::Publish {
                 source: Source::Origin,
                 ..
-            }
+            })
         ]
     ));
     let id = h.id();
@@ -398,7 +403,10 @@ fn origin_version_miss_starts_the_remaining_walk_without_a_failure_report() {
         result: Err(Error::VersionUnavailable),
     });
     assert!(!effects.iter().any(|e| matches!(e, Effect::Report(_))));
-    assert!(matches!(effects[..], [Effect::Send { dest: Some(11), .. }]));
+    assert!(matches!(
+        effects[..],
+        [Effect::Io(Io::Send { dest: Some(11), .. })]
+    ));
     assert_eq!(h.acq.phase(), Phase::Remaining);
     let effects = h.reply(
         Reply::Answer {
@@ -486,7 +494,7 @@ fn successors_become_a_granted_batch() {
         rank0: Rank0State::Unknown,
     });
     assert!(
-        matches!(&effects[..], [Effect::Batch { targets, version: 5, .. }] if targets == &[12])
+        matches!(&effects[..], [Effect::Io(Io::Batch { targets, version: 5, .. })] if targets == &[12])
     );
     let id = h.id();
     let effects = h.act(Input::Batched {
@@ -495,10 +503,10 @@ fn successors_become_a_granted_batch() {
     });
     assert!(matches!(
         effects[..],
-        [Effect::Publish {
+        [Effect::Io(Io::Publish {
             source: Source::Peer,
             ..
-        }]
+        })]
     ));
 }
 
@@ -533,7 +541,10 @@ fn refresh_ranks_the_adopted_membership() {
     start(&mut h);
     h.ranked(5, None, "r5");
     let effects = h.reply(stale_answer(), None);
-    assert!(matches!(effects[..], [Effect::Refresh { version: 5, .. }]));
+    assert!(matches!(
+        effects[..],
+        [Effect::Io(Io::Refresh { version: 5, .. })]
+    ));
     let id = h.id();
     let effects = h.act(Input::Membership {
         id,
@@ -542,14 +553,17 @@ fn refresh_ranks_the_adopted_membership() {
     });
     assert!(matches!(
         effects[..],
-        [Effect::Rank {
+        [Effect::Io(Io::Rank {
             ranking: Ranking::Current,
             basis: RankBasis::Latest(600),
             ..
-        }]
+        })]
     ));
     let effects = h.ranked(6, None, "r6");
-    assert!(matches!(effects[..], [Effect::Send { version: 6, .. }]));
+    assert!(matches!(
+        effects[..],
+        [Effect::Io(Io::Send { version: 6, .. })]
+    ));
     assert_eq!(h.acq.current(), Some(&"r6"));
 }
 
@@ -582,14 +596,17 @@ fn fallback_walks_the_previous_membership_and_swaps_rankings() {
     });
     assert!(matches!(
         effects[..],
-        [Effect::Rank {
+        [Effect::Io(Io::Rank {
             ranking: Ranking::Fallback,
             basis: RankBasis::Fallback(400),
             ..
-        }]
+        })]
     ));
     let effects = h.ranked(4, None, "r4");
-    assert!(matches!(effects[..], [Effect::Send { version: 4, .. }]));
+    assert!(matches!(
+        effects[..],
+        [Effect::Io(Io::Send { version: 4, .. })]
+    ));
     assert_eq!(h.acq.current(), Some(&"r4"));
 }
 
@@ -605,7 +622,7 @@ fn sleeping() -> Harness {
         recent_previous: None,
     });
     let until = h.now + Duration::from_secs(4);
-    assert!(matches!(effects[..], [Effect::Sleep { until: u, .. }] if u == until));
+    assert!(matches!(effects[..], [Effect::Io(Io::Sleep { until: u, .. })] if u == until));
     h
 }
 
@@ -639,7 +656,10 @@ fn an_elapsed_wait_probes_again() {
     });
     let id = h.id();
     let effects = h.act(Input::Timer { id, result: Ok(()) });
-    assert!(matches!(effects[..], [Effect::Send { dest: Some(10), .. }]));
+    assert!(matches!(
+        effects[..],
+        [Effect::Io(Io::Send { dest: Some(10), .. })]
+    ));
 }
 
 fn exhaust(h: &mut Harness) {
@@ -827,7 +847,7 @@ fn seeded_random_answers_always_terminate() {
             let input: In = match effect {
                 Effect::Done(_) => break,
                 Effect::Report(_) => unreachable!("filtered"),
-                Effect::Rank { id, ranking, .. } => {
+                Effect::Io(Io::Rank { id, ranking, .. }) => {
                     let rank = match pick % 4 {
                         0 => None,
                         r => Some(r as usize - 1),
@@ -850,12 +870,12 @@ fn seeded_random_answers_always_terminate() {
                         },
                     }
                 }
-                Effect::Hints { id, .. } => Input::Hints {
+                Effect::Io(Io::Hints { id, .. }) => Input::Hints {
                     id,
                     hints: if pick % 2 == 0 { vec![] } else { vec![12] },
                     rank0: Rank0State::Unknown,
                 },
-                Effect::Hedge { id, .. } => Input::Hedged {
+                Effect::Io(Io::Hedge { id, .. }) => Input::Hedged {
                     id,
                     end: if pick % 2 == 0 {
                         HedgeEnd::Won
@@ -864,12 +884,12 @@ fn seeded_random_answers_always_terminate() {
                     },
                     copy: pick % 2 == 0,
                 },
-                Effect::Refresh { id, .. } => Input::Membership {
+                Effect::Io(Io::Refresh { id, .. }) => Input::Membership {
                     id,
                     latest: Ok(Some((4 + pick % 3, 1))),
                     recent_previous: (pick % 2 == 0).then_some(2),
                 },
-                Effect::Send { id, .. } => match pick % 6 {
+                Effect::Io(Io::Send { id, .. }) => match pick % 6 {
                     0 => Input::NoHelper { id },
                     1 => Input::Replied {
                         id,
@@ -904,7 +924,7 @@ fn seeded_random_answers_always_terminate() {
                         answer: None,
                     },
                 },
-                Effect::Validate { id, .. } => Input::Validated {
+                Effect::Io(Io::Validate { id, .. }) => Input::Validated {
                     id,
                     result: if pick % 3 == 0 {
                         Ok(Some(ProbeOutcome::UnusableCopy))
@@ -912,12 +932,12 @@ fn seeded_random_answers_always_terminate() {
                         Ok(None)
                     },
                 },
-                Effect::Batch { id, .. } => Input::Batched {
+                Effect::Io(Io::Batch { id, .. }) => Input::Batched {
                     id,
                     result: Ok(pick % 2 == 0),
                 },
-                Effect::Sleep { id, .. } => Input::Timer { id, result: Ok(()) },
-                Effect::Origin { id, .. } => Input::Origin {
+                Effect::Io(Io::Sleep { id, .. }) => Input::Timer { id, result: Ok(()) },
+                Effect::Io(Io::Origin { id, .. }) => Input::Origin {
                     id,
                     result: match pick % 3 {
                         0 => Ok(()),
@@ -925,7 +945,7 @@ fn seeded_random_answers_always_terminate() {
                         _ => Err(Error::Io),
                     },
                 },
-                Effect::Publish { id, .. } => Input::Published { id, result: Ok(()) },
+                Effect::Io(Io::Publish { id, .. }) => Input::Published { id, result: Ok(()) },
             };
             effects = h.act(input);
         }

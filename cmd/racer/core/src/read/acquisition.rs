@@ -37,7 +37,7 @@ pub struct Authority {
     pub rank: usize,
 }
 
-/// What the interpreter ranks for [`Effect::Rank`].
+/// What the interpreter ranks for [`Io::Rank`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RankBasis<R, M> {
     /// The caller's own ranking: recompute it and fail with `IncompatibleMembership` when it
@@ -52,7 +52,7 @@ pub enum RankBasis<R, M> {
     Fallback(M),
 }
 
-/// The interpreter's answer to [`Effect::Rank`].
+/// The interpreter's answer to [`Io::Rank`].
 #[derive(Clone, Debug)]
 pub struct RankAnswer<R, M> {
     pub ranked: Ranked,
@@ -62,9 +62,8 @@ pub struct RankAnswer<R, M> {
     pub recent: Option<M>,
 }
 
-/// An effect of a running acquisition that the interpreter performs: every [`Effect`] except the
-/// [`Effect::Report`]s and [`Effect::Done`] the owner consumes. Holding an `Io` proves the effect
-/// is neither, so code downstream of the owner cannot meet them.
+/// An effect of a running acquisition that the interpreter performs ([`Effect::Io`]), as opposed
+/// to the [`Effect::Report`]s and [`Effect::Done`] the owner consumes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Io<R, M, A> {
     /// Rank the page; answer [`Input::Ranked`].
@@ -115,50 +114,11 @@ pub enum Io<R, M, A> {
 impl<R, M, A> Effect<R, M, A> {
     /// Split an effect into what the interpreter performs and what the owner consumes.
     pub fn split(self) -> Result<Io<R, M, A>, Terminal> {
-        Ok(match self {
-            Effect::Rank { id, ranking, basis } => Io::Rank { id, ranking, basis },
-            Effect::Hints { id, version } => Io::Hints { id, version },
-            Effect::Hedge {
-                id,
-                eligible,
-                first,
-                second,
-            } => Io::Hedge {
-                id,
-                eligible,
-                first,
-                second,
-            },
-            Effect::Refresh { id, version } => Io::Refresh { id, version },
-            Effect::Send {
-                id,
-                probe,
-                dest,
-                version,
-            } => Io::Send {
-                id,
-                probe,
-                dest,
-                version,
-            },
-            Effect::Validate { id, answer } => Io::Validate { id, answer },
-            Effect::Batch {
-                id,
-                version,
-                targets,
-                remaining_opportunities,
-            } => Io::Batch {
-                id,
-                version,
-                targets,
-                remaining_opportunities,
-            },
-            Effect::Sleep { id, until } => Io::Sleep { id, until },
-            Effect::Origin { id, authority } => Io::Origin { id, authority },
-            Effect::Publish { id, source } => Io::Publish { id, source },
-            Effect::Report(report) => return Err(Terminal::Report(report)),
-            Effect::Done(done) => return Err(Terminal::Done(done)),
-        })
+        match self {
+            Effect::Io(io) => Ok(io),
+            Effect::Report(report) => Err(Terminal::Report(report)),
+            Effect::Done(done) => Err(Terminal::Done(done)),
+        }
     }
 }
 
@@ -172,49 +132,8 @@ pub enum Terminal {
 /// One external effect.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Effect<R, M, A> {
-    /// Rank the page; answer [`Input::Ranked`].
-    Rank {
-        id: EffectId,
-        ranking: Ranking,
-        basis: RankBasis<R, M>,
-    },
-    /// Report successor hints and rank 0's state under `version`; answer [`Input::Hints`].
-    Hints { id: EffectId, version: u64 },
-    /// Race a hedge if enabled, eligible and admitted; answer [`Input::Hedged`].
-    Hedge {
-        id: EffectId,
-        eligible: bool,
-        first: usize,
-        second: usize,
-    },
-    /// Report the newest adopted membership and version - 1 of `version` when recent and listing
-    /// this node; answer [`Input::Membership`].
-    Refresh { id: EffectId, version: u64 },
-    /// Send `probe` to member position `dest` of `version` (`None`: the overflow helper) on
-    /// [`PageAcquisition::request_budget`]; answer [`Input::Replied`] or [`Input::NoHelper`].
-    Send {
-        id: EffectId,
-        probe: Probe,
-        dest: Option<u32>,
-        version: u64,
-    },
-    /// Validate the payload of the answer; answer [`Input::Validated`]. A usable copy is kept by
-    /// the interpreter.
-    Validate { id: EffectId, answer: A },
-    /// Send copy-only probes to `targets`, each on its own granted budget; answer
-    /// [`Input::Batched`].
-    Batch {
-        id: EffectId,
-        version: u64,
-        targets: Vec<u32>,
-        remaining_opportunities: u32,
-    },
-    /// Wake at `until`; answer [`Input::Timer`].
-    Sleep { id: EffectId, until: Instant },
-    /// Fetch the page from origin under `authority`; answer [`Input::Origin`].
-    Origin { id: EffectId, authority: Authority },
-    /// Publish the held page; answer [`Input::Published`].
-    Publish { id: EffectId, source: Source },
+    /// I/O the interpreter performs and answers.
+    Io(Io<R, M, A>),
     /// Observations for counters and shared health state; no answer.
     Report(Report),
     /// The acquisition ended. The interpreter's held page is the result on `Ok`.
@@ -455,7 +374,7 @@ impl<R: Clone, M, A> PageAcquisition<R, M, A> {
         &self.fill
     }
 
-    /// The budget the outstanding [`Effect::Send`] spends.
+    /// The budget the outstanding [`Io::Send`] spends.
     pub fn request_budget<'a>(
         &'a mut self,
         budget: &'a mut AcquisitionBudget,
@@ -643,7 +562,7 @@ impl<R: Clone, M, A> PageAcquisition<R, M, A> {
                 Action::Rank { ranking, version } => match self.rank_basis(ranking, version) {
                     Ok(Some(basis)) => {
                         let id = self.expect(ids, Pending::Rank(ranking));
-                        out.push(Effect::Rank { id, ranking, basis });
+                        out.push(Effect::Io(Io::Rank { id, ranking, basis }));
                         return;
                     }
                     // The authority ranking needs no IO, but not past the read's deadline.
@@ -656,7 +575,7 @@ impl<R: Clone, M, A> PageAcquisition<R, M, A> {
                 Action::Hints => {
                     let version = self.fill.version;
                     let id = self.expect(ids, Pending::Hints);
-                    out.push(Effect::Hints { id, version });
+                    out.push(Effect::Io(Io::Hints { id, version }));
                     return;
                 }
                 Action::Hedge {
@@ -665,18 +584,18 @@ impl<R: Clone, M, A> PageAcquisition<R, M, A> {
                     second,
                 } => {
                     let id = self.expect(ids, Pending::Hedge);
-                    out.push(Effect::Hedge {
+                    out.push(Effect::Io(Io::Hedge {
                         id,
                         eligible,
                         first,
                         second,
-                    });
+                    }));
                     return;
                 }
                 Action::Refresh => {
                     let version = self.walked_version();
                     let id = self.expect(ids, Pending::Refresh);
-                    out.push(Effect::Refresh { id, version });
+                    out.push(Effect::Io(Io::Refresh { id, version }));
                     return;
                 }
                 Action::Probe(probe) => {
@@ -685,18 +604,18 @@ impl<R: Clone, M, A> PageAcquisition<R, M, A> {
                     self.sent = now;
                     let version = self.fill.version;
                     let id = self.expect(ids, Pending::Send);
-                    out.push(Effect::Send {
+                    out.push(Effect::Io(Io::Send {
                         id,
                         probe,
                         dest,
                         version,
-                    });
+                    }));
                     return;
                 }
                 Action::Validate => match self.answer.take() {
                     Some(answer) => {
                         let id = self.expect(ids, Pending::Validate);
-                        out.push(Effect::Validate { id, answer });
+                        out.push(Effect::Io(Io::Validate { id, answer }));
                         return;
                     }
                     // An answer reported without its payload cannot be used.
@@ -710,20 +629,20 @@ impl<R: Clone, M, A> PageAcquisition<R, M, A> {
                     let targets = self.fill.handoff[first..first + count].to_vec();
                     let version = self.fill.version;
                     let id = self.expect(ids, Pending::Batch);
-                    out.push(Effect::Batch {
+                    out.push(Effect::Io(Io::Batch {
                         id,
                         version,
                         targets,
                         remaining_opportunities,
-                    });
+                    }));
                     return;
                 }
                 Action::Wait(wait) => {
                     let id = self.expect(ids, Pending::Sleep);
-                    out.push(Effect::Sleep {
+                    out.push(Effect::Io(Io::Sleep {
                         id,
                         until: now + wait,
-                    });
+                    }));
                     return;
                 }
                 Action::Origin { rank } => {
@@ -744,7 +663,7 @@ impl<R: Clone, M, A> PageAcquisition<R, M, A> {
                         return;
                     }
                     let id = self.expect(ids, Pending::Origin);
-                    out.push(Effect::Origin { id, authority });
+                    out.push(Effect::Io(Io::Origin { id, authority }));
                     return;
                 }
                 Action::Publish(source) => {
@@ -752,7 +671,7 @@ impl<R: Clone, M, A> PageAcquisition<R, M, A> {
                         Event::Published(Err(Error::Internal))
                     } else {
                         let id = self.expect(ids, Pending::Publish);
-                        out.push(Effect::Publish { id, source });
+                        out.push(Effect::Io(Io::Publish { id, source }));
                         return;
                     }
                 }
