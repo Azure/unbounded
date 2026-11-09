@@ -971,12 +971,12 @@ exercises every state of the library. It contains:
   then sequence number, PCG sources derived from the run seed, one named
   stream per component so extra draws in one component do not perturb
   another),
-- a network model: per-link latency with jitter, loss, duplication,
-  reordering, slow members, and partitions between member groups,
+- a network model: latency with jitter, loss, duplication, reordering,
+  slow members, and partitions between member groups,
 - per-member clocks with offset and drift (the library only sees its own
   member's clock),
-- an in-memory Lease server implementing `elect.Store` with
-  compare-and-swap, latency, outages, and per-second QPS accounting,
+- an in-memory Lease server with compare-and-swap, latency, outages, and
+  injected conflicts (Lease call budgets are counted by the cluster),
 - a process model: start, crash, restart with a new incarnation, graceful
   leave, pause (stop the world for one member),
 - a data-plane workload: requests from random members for blob, striped-layer,
@@ -1025,19 +1025,22 @@ Scenarios are generated from the seed (swarm testing): cluster size, grid
 parameters, and a random schedule drawn from crash, restart, mass join, scale
 down, rolling restart, network partition and heal, leader crash, API server
 outage, slow members, clock skew and drift, message loss and duplication,
-graceful drain, keyspace invalidation, and lease conflicts. Every run is
-executed twice and the event-trace hashes must match, which catches
-nondeterminism in the library. A failing seed is printed with the command
+graceful drain, keyspace invalidation, and lease conflicts. Selected cases
+(and every explicitly requested seed) are executed twice and the
+event-trace hashes must match, which catches nondeterminism in the library. A failing seed is printed with the command
 that replays it. A coverage registry records states reached (member states,
 elector states, health states, catch-up by delta and by snapshot, reshape,
 handoff, panic, hedge, lottery, damping, and so on), and the suite fails if a
 registered state is never reached across the default seed set.
 
-Default `go test` runs a seed set that finishes in about a minute and includes
-a 10k-member cluster, a scripted series of whole-cluster and partial
-restarts, and two simulated hours of churn on a small cluster. A failure
-prints a replay command: the subtest name for default-set cases,
-`CACHEMESH_DST_SEED` for explicit seeds.
+Default `go test` runs a seed set that finishes in about 30 seconds and
+includes a 1,000-member cluster, a scripted series of whole-cluster and
+partial restarts, and two simulated hours of churn on a small cluster.
+`TestDST` is skipped under `-short` and under `-race`: the simulator runs on
+one goroutine, so the race detector finds nothing there and only slows the
+suite down by more than an order of magnitude. A failure prints a replay
+command: the subtest name for default-set cases, `CACHEMESH_DST_SEED` for
+explicit seeds.
 
 Implementation notes (control-plane suite, `dst.Cluster` and
 `suite_test.go`): each member is a `node.Node` with its own `dst.Clock`,
@@ -1045,17 +1048,21 @@ ticked at its `NextDeadline`; outbox calls go through `Net.Call` and Lease
 operations through `LeaseServer.Submit`. Large clusters start from a view
 prebuilt by running the leader logic offline (`node.Config.Initial`), so the
 first leader is elected over an existing view. The default set is 16 tiny
-and 4 small generated scenarios and the targeted 40-member `slow` scenario
-(each run twice and trace-compared), one 1,000-member and one
-10,000-member scenario; only every fourth tiny/small
-seed keeps `PartitionBits` 20, the rest use 16 to bound runtime. The default set also has
+and 2 small generated scenarios, the targeted 40-member `slow` scenario,
+four pinned regression seeds (`pinned/tiny/293`, `75`, `456`, and `501`,
+found by past seed sweeps and kept at their generated partition bits), and
+one 1,000-member scenario (`medium`); only seed 1 keeps `PartitionBits` 20,
+the rest use 16 to bound runtime. `tiny/2`, `small/2`, `restarts`, and
+`slow` run twice and are trace-compared. A 10,000-member and a
+100,000-member scenario run only with `CACHEMESH_DST_LARGE=1`. The default
+set also has
 `restarts` (`GenerateRestarts`: a partial restart that kills the leader
 and all but two members, then whole-cluster restarts with and without
 seeds) and `longrun` (`GenerateLongRun`: two simulated hours of churn on
 12 members, a fault every few minutes); both require convergence at
 `Checkpoint` faults between their faults and finish in a few seconds.
 
-Control-plane invariants (`dst/control.go`):
+Control-plane invariants (`dst/cluster.go`):
 
 - Leader overlap (invariant 1) is checked whenever a member publishes. An
   overlap while clocks are outside the safety bounds is counted
@@ -1091,14 +1098,12 @@ Control-plane invariants (`dst/control.go`):
   existing seeds keep their other faults. After a whole-cluster restart
   the epoch restarts at zero, so the liveness epoch check counts from the
   last bootstrap.
-- `TestDSTSweep` runs a resumable sweep in parallel:
-  `CACHEMESH_DST_SWEEP=tiny:1-300,small:1-150,restarts:1-40,longrun:1-30,medium:1-25`
-  with `CACHEMESH_DST_SWEEP_OUT=<file>` (one line per case, each run twice
-  and trace-compared; cases already in the file are skipped).
 
 The data-plane workload plugs in through
-`dst.Workload`. `CACHEMESH_DST_SEEDS`, `CACHEMESH_DST_SEED`, and
-`CACHEMESH_DST_LARGE=1` (100k members) control longer runs.
+`dst.Workload`. `CACHEMESH_DST_SEEDS` (a count of extra random seeds or a
+list of seeds), `CACHEMESH_DST_SEED` (replay one seed), and
+`CACHEMESH_DST_LARGE=1` (the 10k- and 100k-member cases) control longer
+runs.
 
 Implementation notes (data-plane workload, `dst.DataPlane` in
 `dataplane.go`): every `TestDST` case runs it from the end of the warmup.

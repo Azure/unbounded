@@ -387,7 +387,7 @@ type Write struct {
 // LeaseServer is an in-memory Lease with API server semantics: reads,
 // create, compare-and-swap update, server-assigned resourceVersion and UID,
 // latency, outages, and injected conflicts. Cached reads are always fresh.
-// Callers keep their own operation counts (see control.go).
+// Callers keep their own operation counts (see Cluster.leaseOp).
 type LeaseServer struct {
 	sim     *Sim
 	rng     *rand.Rand

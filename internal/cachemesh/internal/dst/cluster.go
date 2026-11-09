@@ -710,8 +710,8 @@ func (c *Cluster) checkPeriodic() {
 		}
 	}
 
-	// Lease calls: per member and per second, within the budgets in
-	// control.go; the steady-state budget applies in quiet periods (no
+	// Lease calls: per member and per second, within the Lease budgets
+	// below; the steady-state budget applies in quiet periods (no
 	// fault within the last 90s, after warmup).
 	now := c.Sim.Now()
 	quiet := now > max(c.sc.Warmup, startupQuiet) && !c.faultActive(now-30*sec, now)
@@ -982,8 +982,8 @@ func (c *Cluster) apply(f Fault) {
 	}
 }
 
-// Control-plane invariants beyond the per-event safety checks in
-// cluster.go: leader overlap, Lease call budgets per member and per second,
+// Control-plane invariants beyond the per-event safety checks above:
+// leader overlap, Lease call budgets per member and per second,
 // term churn, and bounded node state.
 
 // Lease budgets, from the elect defaults the simulated members use.

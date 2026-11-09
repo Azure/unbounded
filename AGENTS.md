@@ -62,7 +62,7 @@ unbounded-kube is organized into several directories:
 - `make fmt` formats Go source (gofumpt + wsl_v5 blank-line rules); `make lint` runs golangci-lint; `make test` runs all tests.
 - `make lint` runs the same checks locally and in CI and does NOT auto-fix. Always run `make fmt` before committing to satisfy the linter (gofumpt and wsl_v5 are enforced by `make lint`/CI); do not hand-format.
 - Locally `test` implies `lint`. In CI (`CI=1`), each runs independently.
-- `go test ./internal/cachemesh/internal/dst` runs the cachemesh deterministic simulation suite (`TestDST`). Opt-in longer runs: `CACHEMESH_DST_SEED`/`CACHEMESH_DST_SEEDS` for explicit seeds, `CACHEMESH_DST_LARGE=1` for 100k members, and `CACHEMESH_DST_SWEEP` with `CACHEMESH_DST_SWEEP_OUT` (and optional `CACHEMESH_DST_SWEEP_WORKERS`) for a resumable `TestDSTSweep` seed sweep.
+- `go test ./internal/cachemesh/internal/dst` runs the cachemesh deterministic simulation suite (`TestDST`). It is skipped under `-short` and `-race` (the simulator is single-goroutine). Opt-in longer runs: `CACHEMESH_DST_SEED`/`CACHEMESH_DST_SEEDS` for explicit seeds and `CACHEMESH_DST_LARGE=1` for the 10k- and 100k-member cases.
 
 ## Coding Standards
 
