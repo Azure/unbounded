@@ -11,9 +11,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"runtime/debug"
-	"strconv"
-	"strings"
 	"sync/atomic"
 	"time"
 
@@ -43,60 +40,6 @@ type cachemeshAgent struct {
 	cancel  context.CancelFunc
 	done    chan error
 	tags    bool
-}
-
-// cachemeshMemoryLimitPercent is the share of the container memory limit
-// given to the Go runtime as its soft limit.
-const cachemeshMemoryLimitPercent = 90
-
-// setCachemeshMemoryLimit gives the Go runtime a soft memory limit below the
-// container limit unless GOMEMLIMIT is set. Chunk data lives on disk, but
-// in-flight pages and the hot page tier churn hundreds of MiB of page
-// buffers; the soft limit makes the collector return them before the
-// container limit is reached.
-func setCachemeshMemoryLimit(logger *slog.Logger, getenv func(string) string, readFile func(string) ([]byte, error)) int64 {
-	if getenv("GOMEMLIMIT") != "" {
-		return 0
-	}
-
-	limit := cgroupMemoryLimit(readFile)
-	if limit <= 0 {
-		return 0
-	}
-
-	soft := limit / 100 * cachemeshMemoryLimitPercent
-	debug.SetMemoryLimit(soft)
-	logger.Info("cachemesh: set Go memory limit from the container limit",
-		slog.Int64("container_limit", limit),
-		slog.Int64("go_memory_limit", soft),
-	)
-
-	return soft
-}
-
-// cgroupMemoryLimit returns the cgroup v2 (or v1) memory limit in bytes, or
-// zero when there is none.
-func cgroupMemoryLimit(readFile func(string) ([]byte, error)) int64 {
-	for _, path := range []string{"/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"} {
-		raw, err := readFile(path)
-		if err != nil {
-			continue
-		}
-
-		v := strings.TrimSpace(string(raw))
-		if v == "max" {
-			return 0
-		}
-
-		n, err := strconv.ParseInt(v, 10, 64)
-		if err != nil || n <= 0 || n >= 1<<62 {
-			return 0
-		}
-
-		return n
-	}
-
-	return 0
 }
 
 // cachemeshContent returns the local content source: the content root
@@ -211,11 +154,9 @@ func newCachemeshAgent(c *config.Config, origin ifaces.OriginPuller, reg *metric
 		return nil, err
 	}
 
-	setCachemeshMemoryLimit(logger, os.Getenv, os.ReadFile)
-
 	a := &cachemeshAgent{mesh: mesh, node: node, logger: logger, tags: tagOrigin != nil}
 	a.meshPtr.Store(mesh)
-	m.registerGauges(reg, a)
+	registerCachemeshState(reg, a)
 
 	logger.Info("cachemesh configured",
 		slog.String("id", mesh.ID()),
@@ -312,73 +253,51 @@ type cachemeshMetrics struct {
 	leaseErrors   *prometheus.CounterVec
 }
 
+const cachemeshSubsystem = "cachemesh"
+
 func newCachemeshMetrics(reg *metrics.Registry) *cachemeshMetrics {
-	const sub = "cachemesh"
+	counter := func(name, help string, labels ...string) *prometheus.CounterVec {
+		return reg.NewCounterVec(cachemeshSubsystem, prometheus.CounterOpts{Name: "gantry_cachemesh_" + name, Help: help}, labels)
+	}
+	single := func(name, help string) prometheus.Counter {
+		return reg.NewCounter(cachemeshSubsystem, prometheus.CounterOpts{Name: "gantry_cachemesh_" + name, Help: help})
+	}
+	histogram := func(name, help string, start float64, n int, labels ...string) *prometheus.HistogramVec {
+		return reg.NewHistogramVec(cachemeshSubsystem, prometheus.HistogramOpts{
+			Name: "gantry_cachemesh_" + name, Help: help, Buckets: prometheus.ExponentialBuckets(start, 2, n),
+		}, labels)
+	}
 
 	return &cachemeshMetrics{
-		lookups: reg.NewCounterVec(sub, prometheus.CounterOpts{
-			Name: "gantry_cachemesh_chunk_lookups_total",
-			Help: "Chunk lookups by requester (local mirror request or peer) and result: hit (complete in memory), joined (an in-progress fill), fill (a new fill), or local (a peek served from the local content store).",
-		}, []string{"requester", "result"}),
-		fills: reg.NewCounterVec(sub, prometheus.CounterOpts{
-			Name: "gantry_cachemesh_chunk_fills_total",
-			Help: "Chunk fill attempts by source (origin, peer, prev_owner, owner, local, holder) and outcome (ok, error).",
-		}, []string{"source", "outcome"}),
-		fillBytes: reg.NewCounterVec(sub, prometheus.CounterOpts{
-			Name: "gantry_cachemesh_chunk_fill_bytes_total",
-			Help: "Bytes read into chunk fills, by source.",
-		}, []string{"source"}),
-		fillSeconds: reg.NewHistogramVec(sub, prometheus.HistogramOpts{
-			Name:    "gantry_cachemesh_chunk_fill_duration_seconds",
-			Help:    "Duration of chunk fill attempts, by source and outcome.",
-			Buckets: prometheus.ExponentialBuckets(0.005, 2, 14),
-		}, []string{"source", "outcome"}),
-		peerRequests: reg.NewCounterVec(sub, prometheus.CounterOpts{
-			Name: "gantry_cachemesh_peer_requests_total",
-			Help: "Data-plane requests to peers by result as reported to the mesh health tracker (success, failure, timeout, overload).",
-		}, []string{"result"}),
-		peerSeconds: reg.NewHistogramVec(sub, prometheus.HistogramOpts{
-			Name:    "gantry_cachemesh_peer_request_seconds",
-			Help:    "Time from sending a data-plane request to a peer until its response headers, by result.",
-			Buckets: prometheus.ExponentialBuckets(0.0005, 2, 16),
-		}, []string{"result"}),
-		hedges: reg.NewCounterVec(sub, prometheus.CounterOpts{
-			Name: "gantry_cachemesh_hedges_total",
-			Help: "Hedged chunk requests: sent, won (the hedge answered first), or denied by the hedge budget.",
-		}, []string{"outcome"}),
-		serves: reg.NewCounterVec(sub, prometheus.CounterOpts{
-			Name: "gantry_cachemesh_chunk_serves_total",
-			Help: "Chunk requests from peers by outcome (ok, error, shed, loop, ttl, no_route, not_found, bad_request).",
-		}, []string{"outcome"}),
-		serveBytes: reg.NewCounter(sub, prometheus.CounterOpts{
-			Name: "gantry_cachemesh_chunk_serve_bytes_total",
-			Help: "Chunk bytes sent to peers.",
-		}),
-		blobs: reg.NewCounterVec(sub, prometheus.CounterOpts{
-			Name: "gantry_cachemesh_blob_requests_total",
-			Help: "Mirror blob and manifest requests offered to cachemesh, by outcome (served, declined, aborted, verify_failed).",
-		}, []string{"outcome"}),
-		blobBytes: reg.NewCounter(sub, prometheus.CounterOpts{
-			Name: "gantry_cachemesh_blob_bytes_total",
-			Help: "Bytes served to containerd through cachemesh.",
-		}),
-		blobSeconds: reg.NewHistogramVec(sub, prometheus.HistogramOpts{
-			Name:    "gantry_cachemesh_blob_duration_seconds",
-			Help:    "Duration of mirror requests offered to cachemesh, by outcome.",
-			Buckets: prometheus.ExponentialBuckets(0.005, 2, 16),
-		}, []string{"outcome"}),
-		tags: reg.NewCounterVec(sub, prometheus.CounterOpts{
-			Name: "gantry_cachemesh_tag_lookups_total",
-			Help: "Tag resolutions by outcome: hit (fresh local copy), origin (resolved here as owner), peer, error.",
-		}, []string{"outcome"}),
-		controlErrors: reg.NewCounter(sub, prometheus.CounterOpts{
-			Name: "gantry_cachemesh_control_errors_total",
-			Help: "Failed cachemesh control-plane calls to other members.",
-		}),
-		leaseErrors: reg.NewCounterVec(sub, prometheus.CounterOpts{
-			Name: "gantry_cachemesh_lease_errors_total",
-			Help: "Failed cachemesh Lease operations, by operation.",
-		}, []string{"op"}),
+		lookups: counter("chunk_lookups_total",
+			"Chunk lookups by requester (local mirror request or peer) and result: hit (complete in memory), joined (an in-progress fill), fill (a new fill), or local (a peek served from the local content store).",
+			"requester", "result"),
+		fills: counter("chunk_fills_total",
+			"Chunk fill attempts by source (origin, peer, prev_owner, owner, local, holder) and outcome (ok, error).",
+			"source", "outcome"),
+		fillBytes: counter("chunk_fill_bytes_total", "Bytes read into chunk fills, by source.", "source"),
+		fillSeconds: histogram("chunk_fill_duration_seconds", "Duration of chunk fill attempts, by source and outcome.",
+			0.005, 14, "source", "outcome"),
+		peerRequests: counter("peer_requests_total",
+			"Data-plane requests to peers by result as reported to the mesh health tracker (success, failure, timeout, overload).",
+			"result"),
+		peerSeconds: histogram("peer_request_seconds",
+			"Time from sending a data-plane request to a peer until its response headers, by result.", 0.0005, 16, "result"),
+		hedges: counter("hedges_total",
+			"Hedged chunk requests: sent, won (the hedge answered first), or denied by the hedge budget.", "outcome"),
+		serves: counter("chunk_serves_total",
+			"Chunk requests from peers by outcome (ok, error, shed, loop, ttl, no_route, not_found, bad_request).", "outcome"),
+		serveBytes: single("chunk_serve_bytes_total", "Chunk bytes sent to peers."),
+		blobs: counter("blob_requests_total",
+			"Mirror blob and manifest requests offered to cachemesh, by outcome (served, declined, aborted, verify_failed).",
+			"outcome"),
+		blobBytes: single("blob_bytes_total", "Bytes served to containerd through cachemesh."),
+		blobSeconds: histogram("blob_duration_seconds", "Duration of mirror requests offered to cachemesh, by outcome.",
+			0.005, 16, "outcome"),
+		tags: counter("tag_lookups_total",
+			"Tag resolutions by outcome: hit (fresh local copy), origin (resolved here as owner), peer, error.", "outcome"),
+		controlErrors: single("control_errors_total", "Failed cachemesh control-plane calls to other members."),
+		leaseErrors:   counter("lease_errors_total", "Failed cachemesh Lease operations, by operation.", "op"),
 	}
 }
 
@@ -408,83 +327,104 @@ func (m *cachemeshMetrics) hooks() meshfetch.Hooks {
 	}
 }
 
-func (m *cachemeshMetrics) registerGauges(reg *metrics.Registry, a *cachemeshAgent) {
-	const sub = "cachemesh"
+// cachemeshStateMetric is a gauge or counter read from the mesh or the
+// chunk store at scrape time.
+type cachemeshStateMetric struct {
+	name    string
+	help    string
+	counter bool
+	value   func(a *cachemeshAgent, st meshfetch.Stats) float64
+}
 
-	boolGauge := func(b bool) float64 {
-		if b {
-			return 1
-		}
-
-		return 0
+func boolGauge(b bool) float64 {
+	if b {
+		return 1
 	}
 
-	reg.NewGaugeFunc(sub, prometheus.GaugeOpts{
-		Name: "gantry_cachemesh_members",
-		Help: "Members in this agent's cachemesh view.",
-	}, func() float64 { return float64(a.mesh.Members()) })
-	reg.NewGaugeFunc(sub, prometheus.GaugeOpts{
-		Name: "gantry_cachemesh_view_term",
-		Help: "Term of this agent's cachemesh view.",
-	}, func() float64 { return float64(a.mesh.Version().Term) })
-	reg.NewGaugeFunc(sub, prometheus.GaugeOpts{
-		Name: "gantry_cachemesh_view_seq",
-		Help: "Sequence number of this agent's cachemesh view.",
-	}, func() float64 { return float64(a.mesh.Version().Seq) })
-	reg.NewGaugeFunc(sub, prometheus.GaugeOpts{
-		Name: "gantry_cachemesh_leading",
-		Help: "1 while this agent is the cachemesh leader.",
-	}, func() float64 { return boolGauge(a.mesh.Leading()) })
-	reg.NewGaugeFunc(sub, prometheus.GaugeOpts{
-		Name: "gantry_cachemesh_ready",
-		Help: "1 while this agent is an active cachemesh member (the mirror uses cachemesh only then).",
-	}, func() float64 { return boolGauge(a.mesh.Ready()) })
-	reg.NewGaugeFunc(sub, prometheus.GaugeOpts{
-		Name: "gantry_cachemesh_neighbors",
-		Help: "Data-plane neighbors of this agent in the cachemesh grid.",
-	}, func() float64 { return float64(len(a.mesh.Neighbors())) })
-	reg.NewGaugeFunc(sub, prometheus.GaugeOpts{
-		Name: "gantry_cachemesh_chunk_store_chunks",
-		Help: "Chunks in the chunk store, complete or in progress.",
-	}, func() float64 { return float64(a.node.Stats().Chunks) })
-	reg.NewGaugeFunc(sub, prometheus.GaugeOpts{
-		Name: "gantry_cachemesh_page_memory_bytes",
-		Help: "Memory in chunk page buffers in use: in-flight fill pages, pages being sent, and lingering chunks.",
-	}, func() float64 { return float64(a.node.Stats().PageBytes) })
-	reg.NewCounterFunc(sub, prometheus.CounterOpts{
-		Name: "gantry_cachemesh_local_page_reads_total",
-		Help: "Chunk pages read from the local containerd content store for readers behind a fill's window.",
-	}, func() float64 { return float64(a.node.Stats().LocalReads) })
-	reg.NewCounterFunc(sub, prometheus.CounterOpts{
-		Name: "gantry_cachemesh_local_errors_total",
-		Help: "Failed reads of the local containerd content store; the affected readers retry elsewhere.",
-	}, func() float64 { return float64(a.node.Stats().LocalErrors) })
-	reg.NewCounterFunc(sub, prometheus.CounterOpts{
-		Name: "gantry_cachemesh_local_fills_total",
-		Help: "Chunk fills read from the local containerd content store.",
-	}, func() float64 { return float64(a.node.Stats().LocalFills) })
-	reg.NewCounterFunc(sub, prometheus.CounterOpts{
-		Name: "gantry_cachemesh_holder_peeks_total",
-		Help: "Owner reads of a chunk from a recent requester's content store that succeeded.",
-	}, func() float64 { return float64(a.node.Stats().HolderPeeks) })
-	reg.NewCounterFunc(sub, prometheus.CounterOpts{
-		Name: "gantry_cachemesh_holder_misses_total",
-		Help: "Owner reads of a chunk from a recent requester's content store that failed.",
-	}, func() float64 { return float64(a.node.Stats().HolderMisses) })
-	reg.NewCounterFunc(sub, prometheus.CounterOpts{
-		Name: "gantry_cachemesh_shared_page_reads_total",
-		Help: "Page reads served by a concurrent reader's read instead of the content store.",
-	}, func() float64 { return float64(a.node.Stats().PageReadsShared) })
-	reg.NewGaugeFunc(sub, prometheus.GaugeOpts{
-		Name: "gantry_cachemesh_inflight_borrowed_bytes",
-		Help: "Memory fills borrowed from the in-flight budget for lagging readers.",
-	}, func() float64 { return float64(a.node.Stats().ExtraPageBytes) })
-	reg.NewGaugeFunc(sub, prometheus.GaugeOpts{
-		Name: "gantry_cachemesh_memory_chunks",
-		Help: "Complete chunks peers read that linger in borrowed in-flight pages.",
-	}, func() float64 { return float64(a.node.Stats().MemoryChunks) })
-	reg.NewGaugeFunc(sub, prometheus.GaugeOpts{
-		Name: "gantry_cachemesh_chunk_fills_inflight",
-		Help: "Chunk fills in progress.",
-	}, func() float64 { return float64(a.node.Stats().Inflight) })
+	return 0
+}
+
+var cachemeshStateMetrics = []cachemeshStateMetric{
+	{
+		"members", "Members in this agent's cachemesh view.", false,
+		func(a *cachemeshAgent, _ meshfetch.Stats) float64 { return float64(a.mesh.Members()) },
+	},
+	{
+		"view_term", "Term of this agent's cachemesh view.", false,
+		func(a *cachemeshAgent, _ meshfetch.Stats) float64 { return float64(a.mesh.Version().Term) },
+	},
+	{
+		"view_seq", "Sequence number of this agent's cachemesh view.", false,
+		func(a *cachemeshAgent, _ meshfetch.Stats) float64 { return float64(a.mesh.Version().Seq) },
+	},
+	{
+		"leading", "1 while this agent is the cachemesh leader.", false,
+		func(a *cachemeshAgent, _ meshfetch.Stats) float64 { return boolGauge(a.mesh.Leading()) },
+	},
+	{
+		"ready", "1 while this agent is an active cachemesh member (the mirror uses cachemesh only then).", false,
+		func(a *cachemeshAgent, _ meshfetch.Stats) float64 { return boolGauge(a.mesh.Ready()) },
+	},
+	{
+		"neighbors", "Data-plane neighbors of this agent in the cachemesh grid.", false,
+		func(a *cachemeshAgent, _ meshfetch.Stats) float64 { return float64(len(a.mesh.Neighbors())) },
+	},
+	{
+		"chunk_store_chunks", "Chunks in the chunk store, complete or in progress.", false,
+		func(_ *cachemeshAgent, st meshfetch.Stats) float64 { return float64(st.Chunks) },
+	},
+	{
+		"chunk_fills_inflight", "Chunk fills in progress.", false,
+		func(_ *cachemeshAgent, st meshfetch.Stats) float64 { return float64(st.Inflight) },
+	},
+	{
+		"page_memory_bytes", "Memory in chunk page buffers in use: in-flight fill pages, pages being sent, and lingering chunks.", false,
+		func(_ *cachemeshAgent, st meshfetch.Stats) float64 { return float64(st.PageBytes) },
+	},
+	{
+		"inflight_borrowed_bytes", "Memory fills borrowed from the in-flight budget for lagging readers.", false,
+		func(_ *cachemeshAgent, st meshfetch.Stats) float64 { return float64(st.ExtraPageBytes) },
+	},
+	{
+		"memory_chunks", "Complete chunks peers read that linger in borrowed in-flight pages.", false,
+		func(_ *cachemeshAgent, st meshfetch.Stats) float64 { return float64(st.MemoryChunks) },
+	},
+	{
+		"local_page_reads_total", "Chunk pages read from the local containerd content store for readers behind a fill's window.", true,
+		func(_ *cachemeshAgent, st meshfetch.Stats) float64 { return float64(st.LocalReads) },
+	},
+	{
+		"shared_page_reads_total", "Page reads served by a concurrent reader's read instead of the content store.", true,
+		func(_ *cachemeshAgent, st meshfetch.Stats) float64 { return float64(st.PageReadsShared) },
+	},
+	{
+		"local_errors_total", "Failed reads of the local containerd content store; the affected readers retry elsewhere.", true,
+		func(_ *cachemeshAgent, st meshfetch.Stats) float64 { return float64(st.LocalErrors) },
+	},
+	{
+		"local_fills_total", "Chunk fills read from the local containerd content store.", true,
+		func(_ *cachemeshAgent, st meshfetch.Stats) float64 { return float64(st.LocalFills) },
+	},
+	{
+		"holder_peeks_total", "Owner reads of a chunk from a recent requester's content store that succeeded.", true,
+		func(_ *cachemeshAgent, st meshfetch.Stats) float64 { return float64(st.HolderPeeks) },
+	},
+	{
+		"holder_misses_total", "Owner reads of a chunk from a recent requester's content store that failed.", true,
+		func(_ *cachemeshAgent, st meshfetch.Stats) float64 { return float64(st.HolderMisses) },
+	},
+}
+
+// registerCachemeshState registers the scrape-time gauges and counters of a.
+func registerCachemeshState(reg *metrics.Registry, a *cachemeshAgent) {
+	for _, sm := range cachemeshStateMetrics {
+		f := func() float64 { return sm.value(a, a.node.Stats()) }
+		name := "gantry_cachemesh_" + sm.name
+
+		if sm.counter {
+			reg.NewCounterFunc(cachemeshSubsystem, prometheus.CounterOpts{Name: name, Help: sm.help}, f)
+		} else {
+			reg.NewGaugeFunc(cachemeshSubsystem, prometheus.GaugeOpts{Name: name, Help: sm.help}, f)
+		}
+	}
 }

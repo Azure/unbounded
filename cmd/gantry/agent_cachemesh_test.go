@@ -18,8 +18,10 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
+	"github.com/Azure/unbounded/internal/cachemesh"
 	"github.com/Azure/unbounded/internal/gantry/config"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
+	"github.com/Azure/unbounded/internal/gantry/meshfetch"
 	"github.com/Azure/unbounded/internal/gantry/metrics"
 )
 
@@ -109,53 +111,6 @@ func TestCachemeshMetricsHooks(t *testing.T) {
 	}
 }
 
-func TestCgroupMemoryLimit(t *testing.T) {
-	files := map[string]string{}
-	read := func(path string) ([]byte, error) {
-		v, ok := files[path]
-		if !ok {
-			return nil, errors.New("missing")
-		}
-
-		return []byte(v), nil
-	}
-
-	if got := cgroupMemoryLimit(read); got != 0 {
-		t.Fatalf("no cgroup files: %d", got)
-	}
-
-	files["/sys/fs/cgroup/memory.max"] = "max\n"
-
-	if got := cgroupMemoryLimit(read); got != 0 {
-		t.Fatalf("unlimited: %d", got)
-	}
-
-	files["/sys/fs/cgroup/memory.max"] = "8589934592\n"
-
-	if got := cgroupMemoryLimit(read); got != 8<<30 {
-		t.Fatalf("v2 limit: %d", got)
-	}
-
-	delete(files, "/sys/fs/cgroup/memory.max")
-	files["/sys/fs/cgroup/memory/memory.limit_in_bytes"] = "1073741824"
-
-	if got := cgroupMemoryLimit(read); got != 1<<30 {
-		t.Fatalf("v1 limit: %d", got)
-	}
-
-	// An explicit GOMEMLIMIT wins.
-	env := func(k string) string {
-		if k == "GOMEMLIMIT" {
-			return "1GiB"
-		}
-
-		return ""
-	}
-	if got := setCachemeshMemoryLimit(slog.New(slog.DiscardHandler), env, read); got != 0 {
-		t.Fatalf("GOMEMLIMIT set: applied %d", got)
-	}
-}
-
 // cachemeshContent reads the content root directly when it is readable
 // and has no source otherwise.
 func TestCachemeshContentSelection(t *testing.T) {
@@ -193,5 +148,55 @@ func TestCachemeshContentSelection(t *testing.T) {
 		if src := cachemeshContent(r, logger); src != nil {
 			t.Fatalf("root %q: want no content source", r)
 		}
+	}
+}
+
+type rangeOnlyOrigin struct{}
+
+func (rangeOnlyOrigin) PullRange(context.Context, ifaces.OriginRef, int64) (io.ReadCloser, int64, string, error) {
+	return nil, 0, "", errors.New("unused")
+}
+
+// The scrape-time metrics keep their names: dashboards and the cluster
+// bench summary read them.
+func TestCachemeshStateMetricNames(t *testing.T) {
+	mesh, err := cachemesh.New(cachemesh.Config{ID: "a", Addr: "a:1", Transport: meshfetch.NewControlTransport()})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	node, err := meshfetch.New(meshfetch.Config{Mesh: mesh, Origin: rangeOnlyOrigin{}, ChunkSize: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer node.Close()
+
+	reg := metrics.New()
+	registerCachemeshState(reg, &cachemeshAgent{mesh: mesh, node: node})
+
+	families, err := reg.PrometheusRegistry().Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := map[string]bool{}
+	for _, f := range families {
+		got[f.GetName()] = true
+	}
+
+	for _, name := range []string{
+		"members", "view_term", "view_seq", "leading", "ready", "neighbors", "chunk_store_chunks",
+		"chunk_fills_inflight", "page_memory_bytes", "inflight_borrowed_bytes", "memory_chunks",
+		"local_page_reads_total", "shared_page_reads_total", "local_errors_total", "local_fills_total",
+		"holder_peeks_total", "holder_misses_total",
+	} {
+		if !got["gantry_cachemesh_"+name] {
+			t.Errorf("missing gantry_cachemesh_%s", name)
+		}
+	}
+
+	if len(got) != len(cachemeshStateMetrics) {
+		t.Errorf("registered %d metrics, want %d", len(got), len(cachemeshStateMetrics))
 	}
 }
