@@ -217,6 +217,12 @@ pub struct Config {
     pub authority: Option<racer_authority::Config>,
 }
 
+/// Smallest ciphertext budget for a range window of `window` pages: one page
+/// of acquisition progress beyond the window plus one maximum record header.
+pub(crate) fn min_ciphertext_bytes(window: u64) -> u64 {
+    window * (PAGE_BYTES + 16) + RECORD_BYTES
+}
+
 impl Config {
     /// Read the process environment and parse it. Only `main` calls this.
     pub fn from_env() -> std::result::Result<Self, ConfigError> {
@@ -632,10 +638,15 @@ impl Config {
                         "crypto helpers must not outnumber I/O workers",
                     );
                 }
-                if io.checked_add(helpers).is_none_or(|n| n > self.max_threads) {
+                // With RDMA on, one thread of the cap runs the RDMA owner.
+                if io
+                    .checked_add(helpers)
+                    .and_then(|n| n.checked_add(usize::from(self.enable_rdma)))
+                    .is_none_or(|n| n > self.max_threads)
+                {
                     return rule(
-                        "RACER_IO_WORKERS, RACER_CRYPTO_HELPERS, RACER_MAX_THREADS",
-                        "I/O workers plus crypto helpers must fit the thread cap",
+                        "RACER_IO_WORKERS, RACER_CRYPTO_HELPERS, RACER_ENABLE_RDMA, RACER_MAX_THREADS",
+                        "I/O workers plus crypto helpers, plus the RDMA owner thread when RDMA is enabled, must fit the thread cap",
                     );
                 }
             }
@@ -789,7 +800,7 @@ impl Config {
         // streams; the memory cache retains ciphertext alone.
         let window = limits.range_window_pages.get() as u64;
         let plaintext = (window + 1) * PAGE_BYTES;
-        let ciphertext = window * (PAGE_BYTES + 16) + RECORD_BYTES;
+        let ciphertext = min_ciphertext_bytes(window);
         if (limits.plaintext_bytes.get() as u64) < plaintext {
             return rule(
                 "RACER_PLAINTEXT_BYTES, RACER_RANGE_WINDOW_PAGES",
@@ -864,7 +875,10 @@ impl Config {
         let reserved = self.max_threads - 1;
         // An exact worker pair must still fit beside the control thread.
         if let (Some(io), Some(helpers)) = (self.io_workers, self.crypto_helpers)
-            && io.checked_add(helpers).is_none_or(|n| n > reserved)
+            && io
+                .checked_add(helpers)
+                .and_then(|n| n.checked_add(usize::from(self.enable_rdma)))
+                .is_none_or(|n| n > reserved)
         {
             return Err(Error::InvalidConfiguration);
         }
@@ -1514,10 +1528,25 @@ mod tests {
                 parse(&[
                     ("RACER_IO_WORKERS", io),
                     ("RACER_CRYPTO_HELPERS", helpers),
-                    ("RACER_MAX_THREADS", cap)
+                    ("RACER_MAX_THREADS", cap),
+                    ("RACER_ENABLE_RDMA", "false"),
                 ])
                 .is_ok(),
                 valid
+            );
+        }
+        // With RDMA on, the owner thread takes one thread of the cap.
+        for (cap, valid) in [("30", false), ("31", true)] {
+            assert_eq!(
+                parse(&[
+                    ("RACER_IO_WORKERS", "20"),
+                    ("RACER_CRYPTO_HELPERS", "10"),
+                    ("RACER_MAX_THREADS", cap),
+                    ("RACER_ENABLE_RDMA", "true"),
+                ])
+                .is_ok(),
+                valid,
+                "{cap}"
             );
         }
         assert!(parse(&[("RACER_IO_WORKERS", "20")]).is_err());
@@ -2036,6 +2065,24 @@ mod tests {
         .unwrap();
         assert!(exact.reserve_control_thread().is_err());
         assert_eq!(exact.max_threads, 4);
+        // The RDMA owner also needs its thread beside the control thread.
+        let mut rdma = parse_managed(&[
+            ("RACER_MAX_THREADS", "5"),
+            ("RACER_IO_WORKERS", "2"),
+            ("RACER_CRYPTO_HELPERS", "2"),
+            ("RACER_ENABLE_RDMA", "true"),
+        ])
+        .unwrap();
+        assert!(rdma.reserve_control_thread().is_err());
+        let mut rdma = parse_managed(&[
+            ("RACER_MAX_THREADS", "6"),
+            ("RACER_IO_WORKERS", "2"),
+            ("RACER_CRYPTO_HELPERS", "2"),
+            ("RACER_ENABLE_RDMA", "true"),
+        ])
+        .unwrap();
+        rdma.reserve_control_thread().unwrap();
+        assert_eq!(rdma.max_threads, 5);
         assert!(parse(&[]).unwrap().reserve_control_thread().is_err());
     }
 

@@ -319,14 +319,14 @@ const BASE: &[Var] = &[
         Group::Threads,
         uint(2, u64::MAX, COUNT),
         Unset("no cap"),
-        "Total I/O, crypto, and managed control threads. Managed deployments need at least 3. Kernel io_uring workers are not counted.",
+        "Total I/O, crypto, RDMA owner (when RDMA is enabled), and managed control threads. Managed deployments need at least 3. Kernel io_uring workers are not counted.",
     ),
     var(
         "RACER_IO_WORKERS",
         Group::Threads,
         uint(1, 65_536, COUNT),
         Unset("automatic"),
-        "Exact I/O worker count. Requires `RACER_CRYPTO_HELPERS`; their sum must fit `RACER_MAX_THREADS`. Workers and helpers are spread over the NUMA nodes of the RDMA NICs in proportion to their usable CPUs, with each helper on the node of the workers it serves.",
+        "Exact I/O worker count. Requires `RACER_CRYPTO_HELPERS`; their sum, plus one RDMA owner thread when RDMA is enabled, must fit `RACER_MAX_THREADS`. Workers and helpers are spread over the NUMA nodes of the RDMA NICs in proportion to their usable CPUs, with each helper on the node of the workers it serves.",
     ),
     var(
         "RACER_CRYPTO_HELPERS",

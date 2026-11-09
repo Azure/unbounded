@@ -3575,8 +3575,8 @@ fn partition_limits_with_cause(
         ),
         (
             "ciphertext_bytes",
-            limits.ciphertext_bytes.get()
-                < (window + 1) * (page + 16) + crate::store::MAX_HEADER_BYTES,
+            (limits.ciphertext_bytes.get() as u64)
+                < crate::config::min_ciphertext_bytes(window as u64),
         ),
         ("dirty_bytes", limits.dirty_bytes.get() < page + 16),
         (
