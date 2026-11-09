@@ -10,6 +10,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -27,6 +28,7 @@ func discardLogger() *slog.Logger {
 func fakeScheme() *runtime.Scheme {
 	s := runtime.NewScheme()
 	utilruntime.Must(v1alpha3.AddToScheme(s))
+	utilruntime.Must(corev1.AddToScheme(s))
 
 	return s
 }

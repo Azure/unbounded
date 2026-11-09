@@ -32,6 +32,13 @@ func ResetAgent(log *slog.Logger) phases.Task {
 	return ownedReset(log, installstate.DefaultStore(), phases.Serial(log, StopDaemon(log), resetResources(log)))
 }
 
+// ResetAgentForReprovision is ResetAgent for the reprovision handoff: it leaves
+// the handoff's unit, binary, configuration and journal in place, since the
+// handoff runs from them.
+func ResetAgentForReprovision(log *slog.Logger) phases.Task {
+	return ownedReset(log, installstate.DefaultStore(), phases.Serial(log, StopDaemon(log), resetNodeResources(log)))
+}
+
 type lifecycleTask struct {
 	name string
 	run  func(context.Context) error
@@ -195,7 +202,14 @@ func defaultResetHost() resetHost {
 	}
 }
 
+// resetResources is the whole reset: the node and everything the agent
+// installed, and what a reprovision left behind.
 func resetResources(log *slog.Logger) phases.Task {
+	return phases.Serial(log, resetNodeResources(log), RemoveReprovisionHandoff(log))
+}
+
+// resetNodeResources is the reset without the reprovision handoff's files.
+func resetNodeResources(log *slog.Logger) phases.Task {
 	return resetResourcesOn(log, defaultResetHost())
 }
 
