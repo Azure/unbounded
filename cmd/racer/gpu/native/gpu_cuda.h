@@ -171,8 +171,7 @@ int racer_gpu_stream_wait(void *stream, void *event);
  * `stream` completes (cuLaunchHostFunc). `fn` must not call CUDA. On any
  * error `fn` is never called and the caller still owns `data`. CUDA may
  * never call `fn` if the stream's context fails. RACER_GPU_EUNAVAILABLE
- * when the driver lacks cuLaunchHostFunc. Additive: loaders resolve this
- * symbol optionally, so it does not change RACER_GPU_ABI_VERSION. */
+ * when the driver lacks cuLaunchHostFunc. */
 int racer_gpu_launch_host(void *stream, void (*fn)(void *), void *data);
 
 /* Page-locked host memory, portable across contexts, for asynchronous host

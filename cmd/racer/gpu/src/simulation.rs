@@ -1774,6 +1774,17 @@ unsafe extern "C" fn copy_d2h_async(
     })
 }
 
+/// The simulation completes work only when polled, so it has no completion
+/// thread to call back from: like a driver without `cuLaunchHostFunc`, it
+/// reports host functions unavailable and callers poll instead.
+unsafe extern "C" fn launch_host(
+    _stream: *mut c_void,
+    _function: crate::ffi::HostFn,
+    _data: *mut c_void,
+) -> c_int {
+    code::EUNAVAILABLE
+}
+
 unsafe extern "C" fn flush_rdma(context: *mut c_void, scope: u32) -> c_int {
     with(Operation::FlushRdma, |w| {
         if !w.contexts.contains_key(&id(context)) || (scope != 100 && scope != 200) {
@@ -1832,9 +1843,7 @@ pub(crate) fn api() -> Arc<Api> {
         host_unregister,
         copy_d2h_async,
         flush_rdma,
-        // The simulation completes work only when polled, so it has no
-        // completion thread to call back from; callers poll instead.
-        launch_host: None,
+        launch_host,
     })
 }
 

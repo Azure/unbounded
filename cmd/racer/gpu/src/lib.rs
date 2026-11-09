@@ -1539,11 +1539,8 @@ impl Stream {
     /// stream's context fails, CUDA may never call it, and it is leaked.
     pub fn on_complete(&self, callback: Box<dyn FnOnce() + Send + 'static>) -> Result<()> {
         let shared = self.shared();
-        let Some(launch) = shared.api.launch_host else {
-            return Err(Error::Unavailable);
-        };
         let data = Box::into_raw(Box::new(callback)).cast::<c_void>();
-        let rc = unsafe { launch(self.raw.as_ptr(), host_callback, data) };
+        let rc = unsafe { (shared.api.launch_host)(self.raw.as_ptr(), host_callback, data) };
         if rc != 0 {
             // SAFETY: on error the shim never calls `host_callback`, so
             // `data` is still ours, made by `Box::into_raw` above.
