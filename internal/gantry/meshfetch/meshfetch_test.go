@@ -439,6 +439,10 @@ func TestResolveTagCachesAtOwnerAndExpires(t *testing.T) {
 		}
 	}
 
+	if n := c.origin.tagCredentialed.Load(); n != 0 {
+		t.Fatalf("%d tag lookups were not anonymous", n)
+	}
+
 	if hits := c.origin.tagHits.Load(); hits != 1 {
 		t.Fatalf("origin resolved the tag %d times, want 1", hits)
 	}

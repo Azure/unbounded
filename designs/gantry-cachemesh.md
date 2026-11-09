@@ -396,7 +396,16 @@ Tag resolutions use a separate keyspace, `gantry-meta`, with a 5m TTL
 The mirror answers a tag request from this cache only when `cache_tags` is
 on, the request has no `Authorization` header, and the registry does not
 require authentication (`AuthenticationChallenge`). Otherwise it keeps the
-existing 503, and containerd goes to the origin. A tag cannot be verified
+existing 503, and containerd goes to the origin. The requester's check only
+probes the registry root (or is skipped when credentials are configured), so
+it does not show that the repository itself is public. The metadata owner
+therefore resolves every tag anonymously
+(`registryauth.WithAnonymous`): no delegated authorization, no configured
+credentials or token obtained with them, and no URL user information; an
+endpoint with a query string is refused. A private repository then fails at
+the owner, the requester declines, and containerd pulls the tag with its own
+credentials. Nodes with shared credentials do not use them for mesh tag
+resolution. A tag cannot be verified
 against content, so a node that lies about a tag can point other nodes at
 the wrong image for up to the TTL (see the tag-binding note in
 `designs/gantry-detailed-design.md`). Manifests by digest are safe because

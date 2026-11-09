@@ -20,6 +20,7 @@ import (
 	"github.com/Azure/unbounded/internal/cachemesh"
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/oci"
+	"github.com/Azure/unbounded/internal/gantry/registryauth"
 )
 
 // maxManifestSize bounds a manifest resolved by tag.
@@ -249,7 +250,9 @@ func (n *Node) metaFromOrigin(registry, repo, tag string) (*metaEntry, error) {
 	// measured from when it was read.
 	stamp := n.mesh.Stamp(n.metaKS)
 
-	body, ctype, d, err := n.cfg.Tags.ManifestByTag(ctx, registry, repo, tag)
+	// Resolve anonymously: the result is served to any peer's anonymous
+	// requester, so it must not depend on this node's credentials.
+	body, ctype, d, err := n.cfg.Tags.ManifestByTag(registryauth.WithAnonymous(ctx), registry, repo, tag)
 	if err != nil {
 		return nil, classifyOrigin(err)
 	}

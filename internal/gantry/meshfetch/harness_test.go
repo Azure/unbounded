@@ -26,6 +26,7 @@ import (
 	"github.com/Azure/unbounded/internal/cachemesh/memtransport"
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
+	"github.com/Azure/unbounded/internal/gantry/registryauth"
 )
 
 // fastTuning shrinks cachemesh timers so a test cluster forms in seconds.
@@ -66,6 +67,8 @@ type fakeOrigin struct {
 	tags    map[string]string // "repo:tag" -> digest
 	pulls   map[string]int    // "digest@offset" -> count
 	tagHits atomic.Int32
+	// tagCredentialed counts tag lookups made without an anonymous context.
+	tagCredentialed atomic.Int32
 	// failAt, when set, makes pulls of digest return failAfter bytes and
 	// then an error, for ranges starting at failAt.
 	failDigest string
@@ -178,8 +181,13 @@ func (o *fakeOrigin) PullRange(ctx context.Context, ref ifaces.OriginRef, length
 	return io.NopCloser(r), total, ctype, nil
 }
 
-func (o *fakeOrigin) ManifestByTag(_ context.Context, _, repo, tag string) ([]byte, string, digest.Digest, error) {
+func (o *fakeOrigin) ManifestByTag(ctx context.Context, _, repo, tag string) ([]byte, string, digest.Digest, error) {
 	o.tagHits.Add(1)
+
+	if !registryauth.Anonymous(ctx) || registryauth.Authorization(ctx) != "" {
+		o.tagCredentialed.Add(1)
+	}
+
 	o.mu.Lock()
 	ds, ok := o.tags[repo+":"+tag]
 	b := o.blobs[ds]

@@ -115,7 +115,9 @@ func (s *Server) serveFromFetcher(ctx context.Context, w http.ResponseWriter, d 
 // serveTag answers a manifest-by-tag request through the TagResolver. It
 // returns false, having written nothing, when there is no resolver, the
 // request carries credentials, the registry requires authentication, or
-// the resolver fails.
+// the resolver fails. The challenge check is only a cheap pre-filter: it
+// probes the registry root, not the repository. The resolver's owner fetches
+// the tag anonymously, which is what keeps private repositories out.
 func (s *Server) serveTag(w http.ResponseWriter, r *http.Request, upstream, repo, tag, authorization string) bool {
 	if s.tagResolver == nil || authorization != "" {
 		return false
