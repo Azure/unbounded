@@ -30,12 +30,13 @@ trace hash.
 
 Path: `cmd/racer/core`, crate `racer-core`, lib `racer_core`.
 
-Depends only on `topology`, `racer-wire`, `flow-control`, and `sha2`.
+Depends only on `topology`, `racer-wire`, `racer-flow-core` (re-exported as `racer_core::flow`),
+and `sha2`.
 
 ### Purity rules
 
-- No I/O, clocks, threads, or OS randomness. Callers pass time in (`racer_core::time::Now`: a
-  monotonic `Instant` plus `wall_ms`) and randomness as an explicit RNG (`time::SplitMix64`).
+- No I/O, clocks, threads, or OS randomness. Callers pass time in (a monotonic `Instant`, and
+  wall time where a rule needs it) and randomness as an explicit RNG (`rng::SplitMix64`).
 - `core/clippy.toml` disallows `Instant::now`, `SystemTime::now`, and `thread::spawn`.
 - `core/tests/purity.rs` scans non-test code in `core/src/**/*.rs` and fails on `Instant::now`,
   `SystemTime::now`, `racer_io`, `environment::now`, `getrandom`, and `thread::spawn`.
@@ -46,12 +47,20 @@ Depends only on `topology`, `racer-wire`, `flow-control`, and `sha2`.
 | --- | --- |
 | `admission` | `ResourceClass`, `Limits`, `Floors`, and `Rules` (progress and weighted admission) |
 | `cache` | `TickLru`, `OrderedLru`, per-cache reclaim lanes (`Grouping`, `Lanes`), segment value and retention scoring |
+| `prefetch` | Prefetch priorities, owner peer-operation pages and result records, the owner fill budget (`OwnerBudget`), retry backoff |
+| `rng` | `SplitMix64`, the explicit deterministic RNG |
 | `liveness` | `Silence` (silent next hops and pings) and `Rank0Watch` (rank 0 owners that hang or fail) |
 | `route` | Route budget rules shared by app and wire (`forward`, `relay`, `search_budget`, `validate`), `decide_hop`, relay plans, exchange outcomes, and response validity rules |
 | `subscriptions` | Sans-IO subscription scheduler |
 | `read` | Errors, worker map, peer responses, metadata refresh, serve and persist policy, range slots, candidate order and response classes |
 | `read::budget` | `AcquisitionBudget`, route link limits, hot page shedding (`shed_hot_page`) and helper fanout |
 | `read::walk` | `Fill`: one read's acquisition as a sans-IO state machine (owner targets, the candidate walk, hedges, stale membership refresh, fallback and waits, origin, the post-412 walk, publication), driven by both the dataplane and racer-dst |
+| `read::acquisition` | `PageAcquisition`: the walk plus the rankings, memberships and answers the dataplane keeps beside it, as effects (`Effect::Io`, `Report`, `Done`) and inputs |
+| `read::effect` | `EffectId`s that pair each machine effect with its answer |
+| `read::errors` | The retry/terminal table over the closed `Error` enum |
+| `read::window` | `ReadWindow`: one range read's window of pages (probes, fills, spill holds) |
+| `read::serve` | `ServeDecision`: per-page streaming counters, hot page shedding and the serve dispatch |
+| `read::cohort` | `MetadataCohort`: metadata refresh cohorts on a flight table |
 | `read::hints` | Orphan copy notices and successor hints |
 | `read::flight` | Singleflight step functions (join gates, wait/elect, handover, publish, fail) used by production `src/read/flight.rs` and by `read::worker` |
 | `read::worker` | `WorkerCore`: one worker's flights, acquisitions and serve decisions as events in and effects out, which racer-dst's Model interprets |
@@ -59,21 +68,23 @@ Depends only on `topology`, `racer-wire`, `flow-control`, and `sha2`.
 ### Production callers
 
 - The dataplane (`cmd/racer/src`) calls `racer_core` directly. Page fills drive
-  `racer_core::read::walk::Fill` (`CandidatePolicy::drive` in `src/read/candidates.rs`, called
-  from `acquire_once` in `src/read/fill.rs`). racer-dst's Model drives the same machine through
-  `WorkerCore` (`core/src/read/worker.rs`, interpreted by `dst/src/model/mod.rs`). Range reads use `racer_core::read` range slots
-  (`src/read/range_stream.rs`). The memory cache uses `racer_core::cache` with `ByCache` grouping
-  (`src/memory.rs`). Peer serving sheds hot pages with `racer_core::read::budget::shed_hot_page`
+  `racer_core::read::acquisition::PageAcquisition`, which wraps `racer_core::read::walk::Fill`
+  (built by `CandidatePolicy::acquisition` in `src/read/candidates.rs`, driven from `acquire_once`
+  in `src/read/fill.rs`). racer-dst's Model drives the same machine through
+  `WorkerCore` (`core/src/read/worker.rs`, interpreted by `dst/src/model/mod.rs`). Range reads use `racer_core::read::window::ReadWindow`
+  (`src/read/range_stream.rs`), and metadata refreshes use `racer_core::read::cohort`
+  (`src/read/metadata.rs`). The memory cache uses `racer_core::cache` with `ByCache` grouping
+  (`src/memory.rs`). Peer serving decides and sheds hot pages with `racer_core::read::serve::ServeDecision`
   (`src/peer/server.rs`), as does `WorkerCore::serve`.
 - Production and `WorkerCore` use the same ping and copy offer caps (`MAX_PINGS_IN_FLIGHT`,
   `MAX_OFFERS_IN_FLIGHT` in `racer_core::liveness`).
-- The wire hop limit comes from core: `peer-wire/src/lib.rs:505` sets
-  `MAX_HOPS = racer_core::route::MAX_LINKS`.
+- The wire hop limit and the route budget share one constant: `peer-wire/src/lib.rs` sets
+  `MAX_HOPS = racer_wire::route::MAX_LINKS`.
 - `racer-authority` exposes pure rule functions in `authority/src/rules/` (seat
   lottery and renewal, primary contention and plan pass, seat admission, authorization). Wall
   time and entropy are inputs: `now_micro` takes a
   `SystemTime` (`authority/src/rules/election.rs:126`) and `new_key` takes an `Entropy`
-  (`authority/src/rules/keyring.rs:370`).
+  (`authority/src/rules/keyring.rs` `new_key`).
 
 ## racer-dst
 
@@ -94,7 +105,8 @@ model (`dst/costs.toml`) and one invariant set serve two fidelities (`dst/src/li
 ### Full fidelity
 
 Real application code runs on the simulated driver. `dst/FULL.md` describes the control plane
-world (real authorities against `simulation::FakeKube`), its fault model and invariants.
+world (real authorities against `simulation::FakeKube`, built with racer-authority's `sim`
+feature), its fault model and invariants.
 
 ### Model fidelity
 
@@ -190,7 +202,7 @@ simulated pages and 16 MiB production pages. A page is sent by at most `REPLICAS
 
 ### Route budget
 
-App and wire share one rule: a route carries at most 8 links (`racer_core::route::MAX_LINKS`,
+App and wire share one rule: a route carries at most 8 links (`racer_wire::route::MAX_LINKS`,
 also `MAX_ROUTE_LINKS` in `core/src/read/budget.rs`).
 
 ## Known limitations
