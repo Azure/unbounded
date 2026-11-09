@@ -1114,10 +1114,16 @@ impl Reactor {
         let Some(original) = slot.fence.complete(cancel, result)? else {
             return Ok(());
         };
+        // A readiness poll's result is a mask, never the operation's result:
+        // once canceled or abandoned, report cancellation instead of it.
+        let mut original = original;
+        let polled = std::mem::take(&mut slot.polling);
+        if polled && original >= 0 && (slot.cancel.is_some() || slot.abandoned) {
+            original = -libc::ECANCELED;
+        }
         // Zero-progress retry inside the reactor, never after cancellation.
         if slot.cancel.is_none() && !slot.abandoned {
-            let retry = if slot.polling {
-                slot.polling = false;
+            let retry = if polled {
                 (original >= 0).then_some(false)
             } else if slot.retry_interest != 0
                 && (original == -libc::EINTR || original == -libc::EAGAIN)

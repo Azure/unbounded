@@ -1501,3 +1501,47 @@ fn kernel_wake_rearm_on_full_sq_keeps_wakers_and_submits() {
     // Everything queued was submitted: the next idle turn has nothing to do.
     reactor.reap(64).unwrap();
 }
+
+/// A readiness poll that completes after cancellation must not report its
+/// mask as transferred bytes.
+#[test]
+fn sim_cancel_during_eagain_poll_reports_canceled_not_mask() {
+    for op in ["recv", "send"] {
+        let os = SimOs::new();
+        let clock = crate::ctx::VirtualClock::new();
+        let reactor = simulated(&os, &clock);
+        let (left, right) = os.socket_pair();
+        let (left, right) = (Rc::new(left), Rc::new(right));
+        let ctx = OpCtx::none();
+        if op == "recv" {
+            left.try_send(b"abc").unwrap();
+        }
+        os.inject(op, Fault::Errno(libc::EAGAIN)).unwrap();
+        os.inject("poll", Fault::HoldCompletion(4)).unwrap();
+        let mut cx = Context::from_waker(Waker::noop());
+        let result = if op == "recv" {
+            let mut fut = reactor.recv(right.clone(), vec![0; 8], (), &ctx);
+            assert!(Pin::new(&mut fut).poll(&mut cx).is_pending());
+            let id = fut.id().unwrap();
+            for _ in 0..2 {
+                reactor.reap(16).unwrap();
+            }
+            reactor.cancel_op(id, Error::Canceled);
+            let executor = LocalExecutor::new(Some(reactor.wake_handle()));
+            executor.block_on(&reactor, fut).unwrap().map(|r| r.bytes)
+        } else {
+            let mut fut = reactor.send(left.clone(), b"xyz".to_vec(), (), &ctx);
+            assert!(Pin::new(&mut fut).poll(&mut cx).is_pending());
+            let id = fut.id().unwrap();
+            for _ in 0..2 {
+                reactor.reap(16).unwrap();
+            }
+            reactor.cancel_op(id, Error::Canceled);
+            let executor = LocalExecutor::new(Some(reactor.wake_handle()));
+            executor.block_on(&reactor, fut).unwrap().map(|r| r.bytes)
+        };
+        assert_eq!(result.unwrap_err(), Error::Canceled, "{op}");
+        assert_eq!(reactor.stats().retries, 1, "{op}: one EAGAIN poll");
+        assert_eq!(reactor.in_flight(), 0);
+    }
+}
