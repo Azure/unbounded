@@ -1163,6 +1163,43 @@ func TestPeerReadChunkLingersInMemory(t *testing.T) {
 	}
 }
 
+// An unused lingering chunk is dropped after the linger TTL, returning
+// its memory.
+func TestLingeringChunkExpires(t *testing.T) {
+	s := newTestStore(t, func(c *storeConfig) {
+		c.dir = ""
+		c.extraBudget = 4 * testPage
+		c.lingerTTL = time.Hour
+	})
+	data := pattern(17, testChunk)
+
+	r, _, _ := s.acquire(context.Background(), key(1), 0, false, true)
+	f := r.f
+	_ = f.setMeta(int64(len(data)), "", len(data))
+	_ = f.readFrom(context.Background(), bytes.NewReader(data), nil)
+	f.finish(nil)
+	f.release()
+	r.close()
+
+	if st := s.stats(); st.MemoryChunks != 1 {
+		t.Fatalf("chunk does not linger: %+v", st)
+	}
+
+	// Not yet expired.
+	s.expire(time.Now().Add(30 * time.Minute))
+
+	if !cached(s, key(1)) {
+		t.Fatal("chunk expired early")
+	}
+
+	// cached touched it; expire well after the TTL.
+	s.expire(time.Now().Add(2 * time.Hour))
+
+	if st := s.stats(); st.MemoryChunks != 0 || st.PageBytes != 0 || st.ExtraPageBytes != 0 {
+		t.Fatalf("after expiry: %+v", st)
+	}
+}
+
 // Without a peer reader a lagging local reader paces the fill rather than
 // borrowing memory.
 func TestLocalOnlyFillDoesNotBorrow(t *testing.T) {

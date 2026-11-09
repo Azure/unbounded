@@ -95,6 +95,7 @@ type fill struct {
 	// inMemory marks a complete chunk held only in memory, on the
 	// store's memory list.
 	inMemory bool
+	lastUse  time.Time
 	// owned marks a chunk this member filled as its owner. Owned chunks
 	// sit on their own LRU list and are evicted after the others, so an
 	// owner keeps serving them while transit copies churn.

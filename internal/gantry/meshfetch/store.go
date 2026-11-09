@@ -86,8 +86,11 @@ type storeConfig struct {
 	// stallTimeout is how long a fill that is not written to disk waits
 	// for a reader before dropping it.
 	stallTimeout time.Duration
-	onEvict      func(bytes int64)
-	logger       *slog.Logger
+	// lingerTTL drops a chunk held only in memory once nobody has used it
+	// for this long, so an idle agent returns the memory.
+	lingerTTL time.Duration
+	onEvict   func(bytes int64)
+	logger    *slog.Logger
 }
 
 // diskFaults injects disk errors in tests.
@@ -122,6 +125,7 @@ type store struct {
 	inflight  int
 	space     chan struct{}
 	closed    bool
+	stop      chan struct{}
 	// diskFullUntil pauses disk writes after the file system ran out of
 	// space.
 	diskFullUntil time.Time
@@ -139,6 +143,9 @@ type store struct {
 
 // diskFullBackoff is how long new fills skip the disk after ENOSPC.
 const diskFullBackoff = 10 * time.Second
+
+// defaultLingerTTL bounds how long an unused chunk stays in memory.
+const defaultLingerTTL = 30 * time.Second
 
 func newStore(cfg storeConfig) *store {
 	if cfg.pageSize <= 0 || int64(cfg.pageSize) > cfg.chunkSize {
@@ -165,6 +172,10 @@ func newStore(cfg storeConfig) *store {
 		cfg.logger = slog.Default()
 	}
 
+	if cfg.lingerTTL <= 0 {
+		cfg.lingerTTL = defaultLingerTTL
+	}
+
 	// Keep up to 64MiB of idle page buffers so steady churn does not
 	// allocate.
 	pool := newPagePool(cfg.pageSize, max(2*cfg.window, (64<<20)/cfg.pageSize))
@@ -175,6 +186,7 @@ func newStore(cfg storeConfig) *store {
 		pages: newPageCache(pool, cfg.hotBudget),
 		m:     make(map[chunkKey]*fill),
 		space: make(chan struct{}),
+		stop:  make(chan struct{}),
 	}
 	s.head.next = &s.head
 	s.head.prev = &s.head
@@ -182,6 +194,8 @@ func newStore(cfg storeConfig) *store {
 	s.ownedHead.prev = &s.ownedHead
 	s.memHead.next = &s.memHead
 	s.memHead.prev = &s.memHead
+
+	go s.expireLoop()
 
 	if cfg.dir != "" && cfg.diskBudget > 0 {
 		d, err := openDiskDir(cfg.dir, cfg.pageCache)
@@ -275,6 +289,8 @@ func (s *store) get(k chunkKey, off int) *reader {
 }
 
 func (s *store) touch(f *fill) {
+	f.lastUse = time.Now()
+
 	if f.listed {
 		s.unlink(f)
 		s.pushFront(f)
@@ -500,6 +516,7 @@ func (s *store) finished(f *fill, err error) {
 		switch {
 		case err == nil && inMemory:
 			f.inMemory = true
+			f.lastUse = time.Now()
 			s.memN++
 			s.pushFront(f)
 		case err != nil || !onDisk:
@@ -522,6 +539,39 @@ func (s *store) finished(f *fill, err error) {
 	}
 
 	s.signalSpace()
+}
+
+// expireLoop drops chunks held only in memory that nobody used for
+// lingerTTL.
+func (s *store) expireLoop() {
+	t := time.NewTicker(max(s.cfg.lingerTTL/4, 10*time.Millisecond))
+	defer t.Stop()
+
+	for {
+		select {
+		case <-s.stop:
+			return
+		case now := <-t.C:
+			s.expire(now)
+		}
+	}
+}
+
+// expire drops in-memory chunks unused since now - lingerTTL.
+func (s *store) expire(now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for v := s.memHead.prev; v != &s.memHead; {
+		prev := v.prev
+		if now.Sub(v.lastUse) < s.cfg.lingerTTL {
+			// The list is in use order: the rest is newer.
+			return
+		}
+
+		s.detachLocked(v)
+		v = prev
+	}
 }
 
 // evictLingering drops the least recently used chunk held only in memory,
@@ -599,6 +649,10 @@ func (s *store) unlink(f *fill) {
 func (s *store) close() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if !s.closed {
+		close(s.stop)
+	}
 
 	s.closed = true
 	s.signalSpace()

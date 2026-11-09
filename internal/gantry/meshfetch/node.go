@@ -121,6 +121,9 @@ type Config struct {
 	// reader lags behind a fill that peers read. When it is exhausted the
 	// fill spills to disk. Zero disables borrowing.
 	InflightBytes int64
+	// LingerTTL drops a complete chunk held in borrowed pages once it is
+	// unused for this long. Zero uses 30s.
+	LingerTTL time.Duration
 	// PageCache selects page cache handling of chunk files. Empty uses
 	// PageCacheBypass.
 	PageCache PageCacheMode
@@ -239,6 +242,7 @@ func New(cfg Config) (*Node, error) {
 		diskBudget:   cfg.DiskBytes,
 		hotBudget:    cfg.MemoryBytes,
 		extraBudget:  cfg.InflightBytes,
+		lingerTTL:    cfg.LingerTTL,
 		pageCache:    cfg.PageCache,
 		persist:      cfg.Persist,
 		stallTimeout: cfg.StallTimeout,
