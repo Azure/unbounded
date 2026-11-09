@@ -109,6 +109,22 @@ impl NativeNode {
     }
 }
 
+/// The owner thread's result. An exit before shutdown asked for it leaves
+/// the node serving over HTTP (the owner marks RDMA not alive as it drops),
+/// so log it now, when it happens, and do not fail a later clean shutdown
+/// with it. A failure while stopping is still returned.
+fn owner_exit(result: Result<()>, stop_requested: bool) -> Result<()> {
+    match result {
+        Err(error) if !stop_requested => {
+            eprintln!(
+                "racer: stage=rdma-owner state=exited error={error:?} rdma=disabled fallback=http"
+            );
+            Ok(())
+        }
+        result => result,
+    }
+}
+
 /// The node's RDMA owner thread. Dropping it stops the owner and joins the
 /// thread once the owner drained: a page buffer still held elsewhere keeps
 /// it waiting (with a periodic diagnostic), so memory the NIC may write is
@@ -132,17 +148,18 @@ impl OwnerThread {
                         rdma_verbs::OwnerRole::new(rdma_verbs::Owner::new(port, ctx))
                             .map_err(Error::from)
                     });
-                let mut role = match started {
+                let (mut role, stop) = match started {
                     Ok((role, stop)) => {
-                        let _ = sender.send(Ok(stop));
-                        role
+                        let _ = sender.send(Ok(stop.clone()));
+                        (role, stop)
                     }
                     Err(error) => {
                         let _ = sender.send(Err(error));
                         return Err(error);
                     }
                 };
-                racer_io::exec::run(&mut role).map_err(Error::from)
+                let result = racer_io::exec::run(&mut role).map_err(Error::from);
+                owner_exit(result, stop.requested())
             })
             .map_err(|_| Error::Io)?;
         match receiver.recv() {
@@ -938,6 +955,15 @@ pub(super) fn rails_compatible(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owner_exit_before_stop_is_logged_not_fatal() {
+        assert_eq!(owner_exit(Err(Error::Io), false), Ok(()));
+        assert_eq!(owner_exit(Ok(()), false), Ok(()));
+        // Failures while stopping still fail the shutdown.
+        assert_eq!(owner_exit(Err(Error::Io), true), Err(Error::Io));
+        assert_eq!(owner_exit(Ok(()), true), Ok(()));
+    }
 
     #[test]
     fn rails_compatible_applies_registered_budget() {
