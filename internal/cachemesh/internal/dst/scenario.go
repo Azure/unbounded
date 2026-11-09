@@ -4,10 +4,15 @@
 package dst
 
 import (
+	"cmp"
+	"encoding/binary"
 	"fmt"
 	"math/rand/v2"
 	"slices"
+	"strconv"
 	"strings"
+
+	"github.com/Azure/unbounded/internal/cachemesh/internal/hashing"
 )
 
 // FaultKind is a kind of injected fault.
@@ -261,16 +266,7 @@ func extend(s *Scenario) {
 }
 
 func sortFaults(fs []Fault) {
-	slices.SortStableFunc(fs, func(a, b Fault) int {
-		switch {
-		case a.Start < b.Start:
-			return -1
-		case a.Start > b.Start:
-			return 1
-		default:
-			return 0
-		}
-	})
+	slices.SortStableFunc(fs, func(a, b Fault) int { return cmp.Compare(a.Start, b.Start) })
 }
 
 // longRunKinds are the churn faults of GenerateLongRun.
@@ -432,16 +428,7 @@ func generate(seed uint64, r *rand.Rand, size SizeClass, kinds []FaultKind) Scen
 		}
 	}
 
-	slices.SortStableFunc(s.Faults, func(a, b Fault) int {
-		switch {
-		case a.Start < b.Start:
-			return -1
-		case a.Start > b.Start:
-			return 1
-		default:
-			return 0
-		}
-	})
+	sortFaults(s.Faults)
 
 	end := s.Warmup
 	for _, f := range s.Faults {
@@ -480,4 +467,94 @@ func GenerateRestarts(seed uint64, members int) Scenario {
 	s.Duration = at + s.Settle
 
 	return s
+}
+
+// KeyKind is the kind of a generated workload key.
+type KeyKind uint8
+
+const (
+	// KeyBlob is a content-addressed blob: a 32-byte digest.
+	KeyBlob KeyKind = iota
+	// KeyStripe is a stripe of a layer: a 32-byte digest followed by a
+	// 4-byte big-endian stripe index.
+	KeyStripe
+	// KeyMeta is a metadata key of the form "repo-N:tag-M".
+	KeyMeta
+)
+
+// Workload key mix: a Zipf popularity exponent, stripes per layer, and the
+// blob:stripe:meta weights.
+const (
+	keySkew      = 1.1
+	keyStripes   = 16
+	blobWeight   = 2
+	stripeWeight = 5
+	metaWeight   = 3
+)
+
+// KeyGen generates workload keys with Zipf-distributed popularity. The
+// returned key slice is reused by the next call and must be copied if
+// retained.
+type KeyGen struct {
+	rng  *rand.Rand
+	zipf *rand.Zipf
+	buf  []byte
+}
+
+// NewKeyGen returns a generator of keys over objects [0, keys) whose draws
+// come from rng.
+func NewKeyGen(rng *rand.Rand, keys uint64) *KeyGen {
+	return &KeyGen{rng: rng, zipf: rand.NewZipf(rng, keySkew, 1, keys-1), buf: make([]byte, 0, 64)}
+}
+
+// Next returns a random key, its kind, and the object's popularity rank
+// (0 is the hottest).
+func (g *KeyGen) Next() ([]byte, KeyKind, uint64) {
+	rank := g.zipf.Uint64()
+
+	w := g.rng.Uint32N(blobWeight + stripeWeight + metaWeight)
+
+	switch {
+	case w < blobWeight:
+		return g.Blob(rank), KeyBlob, rank
+	case w < blobWeight+stripeWeight:
+		return g.Stripe(rank, g.rng.Uint32N(keyStripes)), KeyStripe, rank
+	default:
+		return g.Meta(rank), KeyMeta, rank
+	}
+}
+
+func (g *KeyGen) digest(rank uint64) {
+	g.buf = g.buf[:32]
+
+	x := hashing.Mix64(rank ^ 0x9e3779b97f4a7c15)
+	for i := 0; i < 32; i += 8 {
+		binary.BigEndian.PutUint64(g.buf[i:], x)
+		x = hashing.Mix64(x)
+	}
+}
+
+// Blob returns the digest of blob rank.
+func (g *KeyGen) Blob(rank uint64) []byte {
+	g.digest(rank)
+
+	return g.buf
+}
+
+// Stripe returns the key of stripe idx of layer rank.
+func (g *KeyGen) Stripe(rank uint64, idx uint32) []byte {
+	g.digest(rank)
+	g.buf = binary.BigEndian.AppendUint32(g.buf, idx)
+
+	return g.buf
+}
+
+// Meta returns the metadata key of object rank.
+func (g *KeyGen) Meta(rank uint64) []byte {
+	g.buf = append(g.buf[:0], "repo-"...)
+	g.buf = strconv.AppendUint(g.buf, rank/8, 10)
+	g.buf = append(g.buf, ":tag-"...)
+	g.buf = strconv.AppendUint(g.buf, rank%8, 10)
+
+	return g.buf
 }

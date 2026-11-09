@@ -414,7 +414,7 @@ func (w *DataPlane) Attach(c *Cluster) {
 	w.c = c
 	w.cfg.defaults(c.sc.Members)
 	w.rng = c.Sim.Stream("dataplane")
-	w.keys = NewKeyGen(c.Sim.Stream("dataplane/keys"), WorkloadConfig{})
+	w.keys = NewKeyGen(c.Sim.Stream("dataplane/keys"), 100_000)
 	w.mem = make([]dpMember, len(c.members))
 	w.trk = make([]trackRing, len(c.members))
 	w.period = epoch.DefaultPeriod

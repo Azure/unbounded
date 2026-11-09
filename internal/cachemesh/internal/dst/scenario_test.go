@@ -89,7 +89,7 @@ func TestScenarioCoversEveryKind(t *testing.T) {
 }
 
 func TestKeyGen(t *testing.T) {
-	g := NewKeyGen(NewRand(1, "w"), WorkloadConfig{Keys: 1000})
+	g := NewKeyGen(NewRand(1, "w"), 1000)
 	counts := map[KeyKind]int{}
 	ranks := make([]int, 1000)
 
@@ -131,8 +131,8 @@ func TestKeyGen(t *testing.T) {
 		t.Fatalf("Next allocates %v", n)
 	}
 
-	h := NewKeyGen(NewRand(1, "w"), WorkloadConfig{Keys: 1000})
-	g2 := NewKeyGen(NewRand(1, "w"), WorkloadConfig{Keys: 1000})
+	h := NewKeyGen(NewRand(1, "w"), 1000)
+	g2 := NewKeyGen(NewRand(1, "w"), 1000)
 
 	for range 100 {
 		x, _, _ := h.Next()
@@ -141,10 +141,6 @@ func TestKeyGen(t *testing.T) {
 		if !bytes.Equal(x, y) {
 			t.Fatal("nondeterministic")
 		}
-	}
-
-	if KeyMeta.String() != "meta" || KeyKind(9).String() != "unknown" {
-		t.Fatal("names")
 	}
 }
 
