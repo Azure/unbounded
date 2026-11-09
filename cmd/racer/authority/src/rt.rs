@@ -371,8 +371,20 @@ const RECV_BYTES: usize = 16 * 1024;
 pub struct Tcp {
     fd: Rc<Descriptor>,
     /// Receive buffer, reused across reads. `None` after a canceled read
-    /// kept it in the reactor until its fence.
+    /// kept it in the reactor until its fence, and after [`Tcp::readable`]
+    /// released it.
     buf: Option<Vec<u8>>,
+    /// A receive (and its buffer) is in flight on the reactor.
+    receiving: Rc<std::cell::Cell<bool>>,
+}
+
+/// Clears [`Tcp::receiving`] when a receive completes or is canceled.
+struct Receiving(Rc<std::cell::Cell<bool>>);
+
+impl Drop for Receiving {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
 }
 
 impl Tcp {
@@ -381,6 +393,7 @@ impl Tcp {
         Self {
             fd: Rc::new(fd),
             buf: None,
+            receiving: Rc::default(),
         }
     }
 
@@ -408,6 +421,8 @@ impl Tcp {
     /// Receive and append to `out`. Returns 0 at end of stream.
     pub async fn recv_into(&mut self, out: &mut Vec<u8>) -> io::Result<usize> {
         let buf = self.buf.take().unwrap_or_else(|| vec![0; RECV_BYTES]);
+        self.receiving.set(true);
+        let _receiving = Receiving(self.receiving.clone());
         let done = reactor()
             .recv(self.fd.clone(), buf, (), &OpCtx::none())
             .await
@@ -415,6 +430,25 @@ impl Tcp {
         out.extend_from_slice(&done.buffer[..done.bytes]);
         self.buf = Some(done.buffer);
         Ok(done.bytes)
+    }
+
+    /// Release the receive buffer and wait until the socket is readable (or
+    /// closed or failed; the next receive reports which). Idle connections
+    /// wait here so they hold no receive buffer.
+    pub async fn readable(&mut self) -> io::Result<()> {
+        self.buf = None;
+        reactor()
+            .poll_ready(self.fd.clone(), libc::POLLIN as u32, (), &OpCtx::none())
+            .await
+            .map_err(to_io)?;
+        Ok(())
+    }
+
+    /// Whether a receive buffer is held: in flight, or kept for reuse.
+    /// Shared so a test can observe it while a read is pending.
+    #[cfg(test)]
+    pub fn receive_buffer(&self) -> (Rc<std::cell::Cell<bool>>, bool) {
+        (self.receiving.clone(), self.buf.is_some())
     }
 
     /// Send all of `data`.

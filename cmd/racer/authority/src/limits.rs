@@ -51,7 +51,8 @@ pub const MIN_WRITE_BYTES_PER_SEC: u64 = 100 * 1024;
 /// 6250 Nodes per seat, each holding a snapshot and a keyring long poll:
 /// 12500 connections. The rest is headroom for enrollment, replicas, and
 /// clients that fail over from a lost seat. Idle connections hold only TLS
-/// state (no plaintext buffer, see `Conn::wait_for_data`), and full
+/// state (no plaintext, ciphertext, or socket receive buffer: they wait for
+/// readiness, see `Conn::wait_for_data`), and full
 /// publication bodies are shared, never copied per connection. The effective
 /// cap is lowered further when `RLIMIT_NOFILE` is smaller, see
 /// [`connection_capacity`].

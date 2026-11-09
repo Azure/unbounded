@@ -118,8 +118,9 @@ impl Conn {
     }
 
     /// Wait until at least one request byte is buffered. `Ok(false)` means the
-    /// peer closed cleanly first. Releases an idle read buffer, so idle
-    /// keep-alive connections hold no plaintext buffer.
+    /// peer closed cleanly first. Releases the plaintext and ciphertext
+    /// buffers and waits for socket readiness before receiving, so idle
+    /// keep-alive connections hold no read buffers.
     pub async fn wait_for_data(&mut self) -> io::Result<bool> {
         if !self.buf.is_empty() {
             return Ok(true);
@@ -127,6 +128,7 @@ impl Conn {
         if self.buf.capacity() > 0 {
             self.buf = Vec::new();
         }
+        self.tls.wait_readable().await?;
         Ok(self.fill().await? != 0)
     }
 
@@ -461,6 +463,68 @@ pub(crate) mod tests {
         });
         assert!(clock.now() - started >= std::time::Duration::from_secs(3600));
         assert!(wall.elapsed() < std::time::Duration::from_secs(60));
+    }
+
+    #[test]
+    fn idle_connection_holds_no_read_buffers() {
+        let (server, client) = tls_pair();
+        let mut ex = Executor::new(8).unwrap();
+        ex.block_on(async move {
+            let listener = Listener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let address = listener.local_addr().unwrap();
+            let serve = async {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let mut c = Conn::new(TlsStream::server(tcp, server).await.unwrap());
+                assert!(c.wait_for_data().await.unwrap());
+                let head = c.read_head(true, 4096).await.unwrap().unwrap();
+                assert_eq!(head.target, "/one");
+                c.tls
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .await
+                    .unwrap();
+                // Idle: waiting for the next request on a keep-alive connection.
+                // Sample while the wait is still pending.
+                let (_, receiving, _) = c.tls.buffers();
+                let probe = async {
+                    crate::rt::sleep(std::time::Duration::from_millis(100)).await;
+                    receiving.get()
+                };
+                let idle = futures::future::select(Box::pin(c.wait_for_data()), Box::pin(probe));
+                match idle.await {
+                    futures::future::Either::Right((in_flight, _)) => {
+                        assert!(!in_flight, "receive buffer in flight while idle");
+                    }
+                    futures::future::Either::Left(_) => panic!("no data expected"),
+                }
+                let (rx, receiving, kept) = c.tls.buffers();
+                assert_eq!((rx, receiving.get(), kept), (0, false, false));
+                assert_eq!(c.buf.capacity(), 0);
+                // The next request is still served.
+                assert!(c.wait_for_data().await.unwrap());
+                let head = c.read_head(true, 4096).await.unwrap().unwrap();
+                assert_eq!(head.target, "/two");
+            };
+            let call = async {
+                let tcp = Tcp::connect(address).await.unwrap();
+                let tls =
+                    TlsStream::client(tcp, client, ServerName::try_from("localhost").unwrap())
+                        .await
+                        .unwrap();
+                let mut c = Conn::new(tls);
+                c.tls
+                    .write_all(&request("GET", "h", "/one", &[], b""))
+                    .await
+                    .unwrap();
+                let head = c.read_head(false, 4096).await.unwrap().unwrap();
+                assert_eq!(head.status, 200);
+                crate::rt::sleep(std::time::Duration::from_millis(300)).await;
+                c.tls
+                    .write_all(&request("GET", "h", "/two", &[], b""))
+                    .await
+                    .unwrap();
+            };
+            futures::join!(serve, call);
+        });
     }
 
     #[test]

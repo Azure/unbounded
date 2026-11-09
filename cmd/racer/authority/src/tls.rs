@@ -81,6 +81,26 @@ impl TlsStream {
         Ok(n.max(1))
     }
 
+    /// Wait until plaintext or end of stream may be available without
+    /// holding receive buffers: already buffered data returns at once,
+    /// otherwise the ciphertext buffer is freed and the socket is polled for
+    /// readiness before any receive buffer is allocated.
+    pub async fn wait_readable(&mut self) -> io::Result<()> {
+        let state = self.conn.process_new_packets().map_err(invalid)?;
+        if !self.rx.is_empty() || state.plaintext_bytes_to_read() > 0 || state.peer_has_closed() {
+            return Ok(());
+        }
+        self.rx = Vec::new();
+        self.tcp.readable().await
+    }
+
+    /// Received ciphertext capacity and the socket receive buffer state.
+    #[cfg(test)]
+    pub fn buffers(&self) -> (usize, std::rc::Rc<std::cell::Cell<bool>>, bool) {
+        let (receiving, kept) = self.tcp.receive_buffer();
+        (self.rx.capacity(), receiving, kept)
+    }
+
     /// Write all pending TLS records.
     pub async fn flush(&mut self) -> io::Result<()> {
         while self.conn.wants_write() {
