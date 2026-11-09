@@ -283,11 +283,6 @@ func appendRef(b []byte, r *MemberRef) []byte {
 	return codec.AppendU32(b, r.Slot)
 }
 
-func appendVersion(b []byte, v view.Version) []byte {
-	b = codec.AppendUvarint(b, v.Term)
-	return codec.AppendUvarint(b, v.Seq)
-}
-
 // Append appends the canonical encoding of m to b. Append does not validate
 // m; an invalid m (for example an undefined Kind, or both Deltas and
 // Snapshot set) yields bytes that Decode rejects. Use Validate to check.
@@ -295,7 +290,7 @@ func appendVersion(b []byte, v view.Version) []byte {
 func Append(b []byte, m *Message) []byte {
 	b = append(b, FormatVersion, byte(m.Kind))
 	b = appendRef(b, &m.From)
-	b = appendVersion(b, m.Version)
+	b = view.AppendVersion(b, m.Version)
 	b = append(b, m.Digest[:]...)
 	b = codec.AppendUvarint(b, m.Epoch)
 	b = codec.AppendU32(b, m.LeaderSlot)
@@ -309,7 +304,7 @@ func Append(b []byte, m *Message) []byte {
 		b = codec.AppendU8(b, uint8(m.Level))
 		b = codec.AppendBytes(b, m.Delta)
 	case KindCatchUpRequest:
-		b = appendVersion(b, m.Have)
+		b = view.AppendVersion(b, m.Have)
 		b = append(b, m.HaveDigest[:]...)
 		b = codec.AppendUvarint(b, uint64(m.MaxDeltas))
 	case KindCatchUpResponse:
@@ -372,11 +367,6 @@ func readRef(r *codec.Reader, ref *MemberRef) {
 	ref.Slot = r.U32()
 }
 
-func readVersion(r *codec.Reader) view.Version {
-	t := r.Uvarint()
-	return view.Version{Term: t, Seq: r.Uvarint()}
-}
-
 // Decode decodes b into m, replacing its contents (the capacity of m.Deltas
 // is reused). String and byte-string fields alias b; call m.Detach before
 // reusing b if m is retained. On error m holds unspecified partial content.
@@ -394,7 +384,7 @@ func Decode(b []byte, m *Message) error {
 	m.Kind = k
 	r := codec.NewReader(b[2:])
 	readRef(&r, &m.From)
-	m.Version = readVersion(&r)
+	m.Version = view.ReadVersion(&r)
 	r.Fixed(m.Digest[:])
 	m.Epoch = r.Uvarint()
 	m.LeaderSlot = r.U32()
@@ -415,7 +405,7 @@ func Decode(b []byte, m *Message) error {
 
 		m.Delta = r.Bytes(MaxMessageSize)
 	case KindCatchUpRequest:
-		m.Have = readVersion(&r)
+		m.Have = view.ReadVersion(&r)
 		r.Fixed(m.HaveDigest[:])
 		m.MaxDeltas = r.Uvarint32()
 	case KindCatchUpResponse:

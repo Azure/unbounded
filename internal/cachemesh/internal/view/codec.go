@@ -64,10 +64,8 @@ func EncodeDelta(d *Delta) []byte { return AppendDelta(make([]byte, 0, deltaSize
 
 func appendDeltaBody(b []byte, d *Delta) []byte {
 	b = append(b, DeltaFormat)
-	b = codec.AppendUvarint(b, d.Base.Term)
-	b = codec.AppendUvarint(b, d.Base.Seq)
-	b = codec.AppendUvarint(b, d.Version.Term)
-	b = codec.AppendUvarint(b, d.Version.Seq)
+	b = AppendVersion(b, d.Base)
+	b = AppendVersion(b, d.Version)
 	b = codec.AppendUvarint(b, uint64(len(d.Ops)))
 
 	for i := range d.Ops {
@@ -188,10 +186,8 @@ func DecodeDelta(b []byte) (*Delta, error) {
 	}
 
 	d := &Delta{}
-	d.Base.Term = r.Uvarint()
-	d.Base.Seq = r.Uvarint()
-	d.Version.Term = r.Uvarint()
-	d.Version.Seq = r.Uvarint()
+	d.Base = ReadVersion(&r)
+	d.Version = ReadVersion(&r)
 
 	n := r.Len(MaxDeltaOps, 2)
 	if n > 0 {
@@ -296,8 +292,7 @@ func readOp(r *codec.Reader, op *Op) {
 // every member and the table (bit-packed columns), not the derived indexes.
 func AppendSnapshot(b []byte, v *View) []byte {
 	b = append(b, SnapshotFormat)
-	b = codec.AppendUvarint(b, v.version.Term)
-	b = codec.AppendUvarint(b, v.version.Seq)
+	b = AppendVersion(b, v.version)
 	b = append(b, v.digest[:]...)
 	b = appendSlot32(b, v.leader)
 	b = codec.AppendUvarint(b, v.epoch)
@@ -513,8 +508,7 @@ func decodeSnapshot(b []byte) (*View, error) {
 	}
 
 	v := &View{}
-	v.version.Term = r.Uvarint()
-	v.version.Seq = r.Uvarint()
+	v.version = ReadVersion(&r)
 	r.Fixed(v.digest[:])
 	v.leader = readSlot32(&r)
 	v.epoch = r.Uvarint()
@@ -738,4 +732,18 @@ func readTable(r *codec.Reader, v *View) error {
 	}
 
 	return nil
+}
+
+// AppendVersion appends the encoding of v: Term then Seq, as uvarints.
+func AppendVersion(b []byte, v Version) []byte {
+	b = codec.AppendUvarint(b, v.Term)
+
+	return codec.AppendUvarint(b, v.Seq)
+}
+
+// ReadVersion reads a Version written by AppendVersion.
+func ReadVersion(r *codec.Reader) Version {
+	t := r.Uvarint()
+
+	return Version{Term: t, Seq: r.Uvarint()}
 }
