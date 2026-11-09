@@ -504,6 +504,7 @@ func (l *LeaseServer) write(now int64, member uint32, kind elect.OpKind, r elect
 		Time: now, Member: member, Kind: kind,
 		Holder: r.Holder, Incarnation: r.Incarnation, Term: r.Term, RV: l.rv,
 	})
+
 	return r.Clone()
 }
 

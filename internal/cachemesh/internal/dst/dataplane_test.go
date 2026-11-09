@@ -39,14 +39,14 @@ func runDataPlane(t *testing.T, sc Scenario, cfg DataPlaneConfig) (*Cluster, *Da
 func TestDataPlaneQuiet(t *testing.T) {
 	_, dp := runDataPlane(t, quietScenario(3, 24), DataPlaneConfig{})
 
-	req, served := dp.Counts.Get("requests"), dp.Counts.Get("result-served")
+	req, served := dp.count.requests, dp.count.results[resServed]
 	if req == 0 || served == 0 {
 		t.Fatalf("no traffic: %s", dp.Summary())
 	}
 
 	// Without faults only herd overloads and TTL truncation may fail a
 	// request, and nothing may miss its deadline.
-	if d := dp.Counts.Get("result-deadline"); d != 0 {
+	if d := dp.count.results[resDeadline]; d != 0 {
 		t.Fatalf("%d deadline misses: %s", d, dp.Summary())
 	}
 
@@ -54,7 +54,7 @@ func TestDataPlaneQuiet(t *testing.T) {
 		t.Fatalf("served %d of %d: %s", served, req, dp.Summary())
 	}
 
-	if dp.Steady.Count() == 0 || dp.Steady.Quantile(0.5) <= 0 {
+	if len(dp.Steady) == 0 || dp.Steady.quantile(0.5) <= 0 {
 		t.Fatalf("no steady latency: %s", dp.Summary())
 	}
 
@@ -93,7 +93,7 @@ func TestDataPlaneDeterministic(t *testing.T) {
 
 func TestDataPlaneNoHedge(t *testing.T) {
 	_, dp := runDataPlane(t, quietScenario(7, 16), DataPlaneConfig{NoHedge: true, Health: HealthHedge})
-	if h := dp.Counts.Get("hedges"); h != 0 {
+	if h := dp.count.hedges; h != 0 {
 		t.Fatalf("%d hedges with hedging disabled", h)
 	}
 }

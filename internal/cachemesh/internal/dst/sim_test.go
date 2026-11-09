@@ -309,61 +309,6 @@ func TestClockWallAndSimTime(t *testing.T) {
 	}
 }
 
-func TestHistogram(t *testing.T) {
-	var h Histogram
-
-	for i := int64(1); i <= 100_000; i++ {
-		h.Record(i * 1000)
-	}
-
-	for _, q := range []float64{0.5, 0.9, 0.99, 0.999} {
-		want := q * 100_000 * 1000
-		got := float64(h.Quantile(q))
-
-		if got < want*0.98 || got > want*1.02 {
-			t.Fatalf("q%v = %v want %v", q, got, want)
-		}
-	}
-
-	var o Histogram
-	o.Record(-5)
-	o.Record(1 << 62)
-	h.Merge(&o)
-
-	if h.Count() != 100_002 || h.Min() != 0 || h.Max() != 1<<62 || h.Quantile(1) != 1<<62 {
-		t.Fatalf("merge: %s", h.String())
-	}
-
-	if (&Histogram{}).Quantile(0.5) != 0 {
-		t.Fatal("empty")
-	}
-
-	for v := range uint64(1 << 20) {
-		lo, hi := histBounds(histIndex(v))
-		if v < lo || v > hi {
-			t.Fatalf("bounds %d: %d..%d", v, lo, hi)
-		}
-	}
-}
-
-func TestCounters(t *testing.T) {
-	var a, b Counters
-
-	*a.Counter("x") += 2
-
-	b.Add("x", 3)
-	b.Add("a", 1)
-	a.Merge(&b)
-
-	if a.Get("x") != 5 || a.Get("a") != 1 || a.Get("none") != 0 {
-		t.Fatal(a.String())
-	}
-
-	if a.String() != "a=1\nx=5\n" {
-		t.Fatal(a.String())
-	}
-}
-
 func TestCoverage(t *testing.T) {
 	c := NewCoverage()
 	c.Register("b", "a", "c")

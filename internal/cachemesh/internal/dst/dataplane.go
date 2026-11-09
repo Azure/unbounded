@@ -160,9 +160,39 @@ const (
 	stampMembers = 8
 	// checkEvery is the period of the data-plane checks.
 	checkEvery = 5 * sec
-	// ejectWindow covers the longest default ejection (300s plus jitter).
-	ejectWindow = 335 * sec
+	// ejectWindow covers the longest default ejection (MaxEjection plus
+	// its jitter) and one check period.
+	ejectWindow = healthMaxEjection*(100+healthEjectionJitter)/100 + checkEvery
 )
+
+// Health defaults the data-plane invariants depend on. They mirror the
+// unexported health.(*Config).setDefaults in internal/health/health.go;
+// keep the two in sync.
+const (
+	healthHedgeMax           = time.Second
+	healthMaxEjectionPercent = 10
+	healthHedgeRatio         = 0.05
+	healthMaxEjection        = 300 * sec
+	healthEjectionJitter     = 10 // percent
+)
+
+// withHealthDefaults fills in the health defaults the data-plane checks
+// read.
+func withHealthDefaults(c health.Config) health.Config {
+	if c.HedgeMax <= 0 {
+		c.HedgeMax = healthHedgeMax
+	}
+
+	if c.MaxEjectionPercent <= 0 {
+		c.MaxEjectionPercent = healthMaxEjectionPercent
+	}
+
+	if c.HedgeRatio <= 0 {
+		c.HedgeRatio = healthHedgeRatio
+	}
+
+	return c
+}
 
 // Request results.
 type dpResult uint8
@@ -174,9 +204,8 @@ const (
 	resTTL
 	resNoRoute
 	resDeadline
+	numResults
 )
-
-var resNames = [...]string{"open", "served", "failed", "ttl-exhausted", "no-route", "deadline"}
 
 // Ack codes carried in reply Data.
 const (
@@ -201,7 +230,6 @@ type dpReq struct {
 	slowWin  bool    // started in a judged slow-member window
 	slowExp  float64 // expected slow touches without protection, per hop
 	slowSeen bool    // a hop was sent to a slow member
-	slowHop1 bool    // the origin's first hop went to a slow member
 }
 
 // dpCopy is one branch of a request: the members that routed it so far,
@@ -320,7 +348,8 @@ type DataPlane struct {
 	mem  []dpMember
 	trk  []trackRing
 	gen  uint64
-	hcfg health.Config
+	hcfg health.Config // the variant's health configuration
+	lim  health.Config // hcfg with the defaults the checks read
 
 	clients  []uint32 // hot members that issue half of the requests
 	open     []*dpReq
@@ -331,18 +360,18 @@ type DataPlane struct {
 	period   time.Duration
 	driftPPB int64 // see stampSlack
 
-	// Results.
-	Latency, Steady, Faulty, SlowWin Histogram
-	// ClientSteady is the steady-state latency of client requests, the
-	// baseline of the tail-latency check.
-	ClientSteady Histogram
-	Counts       Counters
+	// Latencies of served requests outside fault windows (Steady), of
+	// those issued by clients (ClientSteady, the baseline of the
+	// tail-latency check), and of every request in a judged slow-member
+	// window (SlowWin).
+	Steady, ClientSteady, SlowWin latencies
+	count                         dpCounts
 
-	slowN, slowTouched, slowHop1 int
-	slowExpect                   float64
-	hopsSum, hopsN               uint64
-	maxStampAge                  int64 // largest age at which a stamp was Fresh
-	maxEject                     string
+	slowN, slowTouched int
+	slowExpect         float64
+	hopsSum, hopsN     uint64
+	maxStampAge        int64 // largest age at which a stamp was Fresh
+	maxEject           string
 
 	cov struct {
 		kinds                        [7]CoverageHandle
@@ -355,7 +384,9 @@ type DataPlane struct {
 
 // NewDataPlane returns a data-plane workload.
 func NewDataPlane(cfg DataPlaneConfig) *DataPlane {
-	return &DataPlane{cfg: cfg, hcfg: HealthConfig(cfg.Health)}
+	hc := HealthConfig(cfg.Health)
+
+	return &DataPlane{cfg: cfg, hcfg: hc, lim: withHealthDefaults(hc)}
 }
 
 // DataPlaneCoverage lists the coverage states the data plane registers.
@@ -652,10 +683,10 @@ func (w *DataPlane) issue(origin uint32, seed uint64, ttl time.Duration, key []b
 	r := &dpReq{id: w.nextID, origin: origin, start: now, seed: seed, ttl: ttl, live: 1}
 	r.fault = !w.settled || w.faultNear(now, now, 30*sec)
 	w.open = append(w.open, r)
-	*w.Counts.Counter("requests")++
+	w.count.requests++
 
 	if burst {
-		*w.Counts.Counter("burst-requests")++
+		w.count.burstRequests++
 	}
 
 	w.slowWindow(r, now)
@@ -783,10 +814,6 @@ func (w *DataPlane) dispatch(at uint32, cp *dpCopy, st *route.State, d *route.De
 		h := w.send(at, cp, to, d.Next.Slot, d.Header, d.Alternate, false)
 		h.altHdr = d.AlternateHeader()
 
-		if origin && r.slowWin && w.slow(to) >= slowJudged {
-			r.slowHop1 = true
-		}
-
 		if origin && !w.cfg.NoHedge && !d.Alternate.IsZero() && d.HedgeAfter > 0 {
 			hdr, alt := h.altHdr, d.Alternate
 			w.c.Sim.After(int64(d.HedgeAfter), func() { w.hedge(at, h, hdr, alt) })
@@ -808,14 +835,14 @@ func (w *DataPlane) hedge(at uint32, first *dpHop, hdr route.Header, alt route.P
 	st := w.state(at)
 	if !st.TryHedge(hdr) {
 		w.cov.denied.Hit()
-		*w.Counts.Counter("hedge-denied")++
+		w.count.hedgeDenied++
 
 		return
 	}
 
 	w.cov.hedgeSent.Hit()
 	w.mem[at].hedges++
-	*w.Counts.Counter("hedges")++
+	w.count.hedges++
 	r.hedged = true
 	r.live++
 
@@ -832,7 +859,7 @@ func (w *DataPlane) send(from uint32, cp *dpCopy, to uint32, slot view.Slot, hdr
 	}
 	h.hdr.Put(&h.buf)
 
-	*w.Counts.Counter("hops")++
+	w.count.hops++
 
 	if w.slow(to) >= slowJudged {
 		cp.req.slowSeen = true
@@ -858,7 +885,7 @@ func (w *DataPlane) DeliverData(msg *Message) {
 	dm := &w.mem[msg.To]
 	if dm.inflight >= w.cfg.QueueCap {
 		w.cov.over.Hit()
-		*w.Counts.Counter("overload")++
+		w.count.overload++
 		w.c.Net.Reply(&h.msg, Message{Kind: KindData, Data: ackOverload})
 
 		return
@@ -917,13 +944,13 @@ func (h *dpHop) Fire(_, _ uint64) {
 
 	if errors.Is(err, route.ErrTTLExhausted) {
 		w.cov.ttl.Hit()
-		*w.Counts.Counter("ttl-exhausted")++
+		w.count.ttlExhausted++
 
 		// Steady state: membership settled and no view change on any
 		// member since a second before the request started.
 		steady := !r.fault && w.lastView < r.start-sec
 		if steady && !r.trunc {
-			*w.Counts.Counter("ttl-exhausted-steady")++
+			w.count.ttlExhaustedSteady++
 		}
 
 		if !r.trunc && (cp.consistent() || steady) {
@@ -1008,7 +1035,7 @@ func (h *dpHop) Complete(_ uint64, resp *Message, err error) {
 	}
 
 	w.cov.failover.Hit()
-	*w.Counts.Counter("failovers")++
+	w.count.failovers++
 
 	cp := *h.cp
 	cp.failovers++
@@ -1048,7 +1075,7 @@ func (w *DataPlane) served(at uint32, cp *dpCopy, st *route.State, d *route.Deci
 
 	if !r.done && cp.hedge {
 		w.cov.hedgeWon.Hit()
-		*w.Counts.Counter("hedge-won")++
+		w.count.hedgeWon++
 	}
 
 	if !r.done {
@@ -1146,7 +1173,7 @@ func (w *DataPlane) finish(r *dpReq, res dpResult, branch bool) {
 	now := w.c.Sim.Now()
 	lat := now - r.start
 
-	*w.Counts.Counter("result-" + resNames[res])++
+	w.count.results[res]++
 	w.c.Trace.Add(40, r.id, uint64(res), uint64(lat))
 
 	if res == resDeadline && !r.fault && w.settled && !w.faultNear(r.start, now, 30*sec) {
@@ -1157,16 +1184,12 @@ func (w *DataPlane) finish(r *dpReq, res dpResult, branch bool) {
 	// Slow-window requests count whatever their result: failures are
 	// what slow members cause.
 	if r.slowWin {
-		w.SlowWin.Record(lat)
+		w.SlowWin = append(w.SlowWin, lat)
 		w.slowN++
 		w.slowExpect += r.slowExp
 
 		if r.slowSeen {
 			w.slowTouched++
-		}
-
-		if r.slowHop1 {
-			w.slowHop1++
 		}
 	}
 
@@ -1174,15 +1197,11 @@ func (w *DataPlane) finish(r *dpReq, res dpResult, branch bool) {
 		return
 	}
 
-	w.Latency.Record(lat)
-
-	if r.fault {
-		w.Faulty.Record(lat)
-	} else {
-		w.Steady.Record(lat)
+	if !r.fault {
+		w.Steady = append(w.Steady, lat)
 
 		if slices.Contains(w.clients, r.origin) {
-			w.ClientSteady.Record(lat)
+			w.ClientSteady = append(w.ClientSteady, lat)
 		}
 	}
 }
@@ -1233,12 +1252,7 @@ func (w *DataPlane) membershipSettled() bool {
 // bounds the hops (MaxDims+3 with a gateway hop), and a hedge starts
 // within HedgeMax.
 func (w *DataPlane) hangBound() int64 {
-	hedgeMax := w.hcfg.HedgeMax
-	if hedgeMax <= 0 {
-		hedgeMax = time.Second
-	}
-
-	return int64(topology.MaxDims+3)*2*int64(w.cfg.HopTimeout) + int64(hedgeMax)
+	return int64(topology.MaxDims+3)*2*int64(w.cfg.HopTimeout) + int64(w.lim.HedgeMax)
 }
 
 // compact drops resolved requests and checks that none hangs.
@@ -1303,10 +1317,10 @@ func (w *DataPlane) checkMembers() {
 		w.noteTracked(idx, cts.Tracked)
 		peak := w.trk[i].peak(w.c.Sim.Now())
 
-		limit := max(1, peak*w.maxEjectPct()/100)
+		limit := max(1, peak*w.lim.MaxEjectionPercent/100)
 		if ej := cts.Ejected + cts.Probing; ej > limit {
 			w.maxEject = fmt.Sprintf("member %d: %d of %d tracked peers ejected (peak %d), limit %d", i, ej, cts.Tracked, peak, limit)
-			*w.Counts.Counter("ejection-limit-exceeded")++
+			w.count.ejectionLimitExceeded++
 		}
 
 		if n.Self() == view.NoSlot {
@@ -1327,15 +1341,6 @@ func (w *DataPlane) checkMembers() {
 				i, len(buf), b[0], b[1] == 1, v.Version()))
 		}
 	}
-}
-
-// maxEjectPct is the configured MaxEjectionPercent (default 10).
-func (w *DataPlane) maxEjectPct() int {
-	if w.hcfg.MaxEjectionPercent > 0 {
-		return w.hcfg.MaxEjectionPercent
-	}
-
-	return 10
 }
 
 // healthCov records the health states present in cts.
@@ -1521,7 +1526,7 @@ func (w *DataPlane) Check(c *Cluster) error {
 
 	if w.maxEject != "" {
 		return fmt.Errorf("dataplane: ejection limit exceeded (%d times), last: %s",
-			w.Counts.Get("ejection-limit-exceeded"), w.maxEject)
+			w.count.ejectionLimitExceeded, w.maxEject)
 	}
 
 	if err := w.checkHedges(); err != nil {
@@ -1598,7 +1603,7 @@ func (w *DataPlane) walk(from, p uint32, dims int) error {
 			// after its process stopped (it is removed by failure
 			// detection); the walk cannot continue through it.
 			if mm, in := st.View().Member(d.Next.Slot); in && w.c.leavingID(mm.ID, mm.Incarnation) {
-				*w.Counts.Counter("route-check-leaving")++
+				w.count.routeCheckLeaving++
 
 				return nil
 			}
@@ -1628,10 +1633,7 @@ func (w *DataPlane) walk(from, p uint32, dims int) error {
 // checkHedges checks that each member's hedges stay within the budget of
 // its routed decisions.
 func (w *DataPlane) checkHedges() error {
-	ratio := w.hcfg.HedgeRatio
-	if ratio <= 0 {
-		ratio = 0.05
-	}
+	ratio := w.lim.HedgeRatio
 
 	for i := range w.mem {
 		dm := &w.mem[i]
@@ -1683,19 +1685,19 @@ func (w *DataPlane) checkTail() error {
 			w.slowTouched, w.slowN, exp, tailTouchRatio*100)
 	}
 
-	base := &w.ClientSteady
-	if base.Count() < tailMinSamples || w.SlowWin.Count() < tailMinSamples {
+	base := w.ClientSteady
+	if len(base) < tailMinSamples || len(w.SlowWin) < tailMinSamples {
 		return nil
 	}
 
-	if p99, limit := w.SlowWin.Quantile(0.99), int64(w.cfg.HopTimeout)+3*base.Quantile(0.99); p99 > limit {
+	if p99, limit := w.SlowWin.quantile(0.99), int64(w.cfg.HopTimeout)+3*base.quantile(0.99); p99 > limit {
 		return fmt.Errorf("dataplane: p99 %v in slow-member windows above %v (baseline p99 %v)",
-			time.Duration(p99), time.Duration(limit), time.Duration(base.Quantile(0.99)))
+			time.Duration(p99), time.Duration(limit), time.Duration(base.quantile(0.99)))
 	}
 
-	if p50, limit := w.SlowWin.Quantile(0.5), 2*base.Quantile(0.5)+int64(time.Millisecond); p50 > limit {
+	if p50, limit := w.SlowWin.quantile(0.5), 2*base.quantile(0.5)+int64(time.Millisecond); p50 > limit {
 		return fmt.Errorf("dataplane: p50 %v in slow-member windows above %v (baseline p50 %v)",
-			time.Duration(p50), time.Duration(limit), time.Duration(base.Quantile(0.5)))
+			time.Duration(p50), time.Duration(limit), time.Duration(base.quantile(0.5)))
 	}
 
 	return nil
@@ -1711,21 +1713,46 @@ func (w *DataPlane) meanHops() float64 {
 
 // Summary returns a one-line summary of the run.
 func (w *DataPlane) Summary() string {
-	meanHops := 0.0
-	if w.hopsN > 0 {
-		meanHops = float64(w.hopsSum) / float64(w.hopsN)
-	}
+	n := &w.count
 
-	return fmt.Sprintf("dp: req=%d served=%d failed=%d deadline=%d ttl=%d noroute=%d hops=%.2f hedges=%d/%d won=%d failovers=%d overload=%d slow=%d/%d(exp %.1f) hop1=%d(exp %.1f) maxStampAge=%v steady[%s] faulty[%s] clientSteady[%s] slowwin[%s]",
-		w.Counts.Get("requests"), w.Counts.Get("result-served"), w.Counts.Get("result-failed"),
-		w.Counts.Get("result-deadline"), w.Counts.Get("result-ttl-exhausted"), w.Counts.Get("result-no-route"),
-		meanHops, w.Counts.Get("hedges"), w.Counts.Get("hedge-denied"), w.Counts.Get("hedge-won"),
-		w.Counts.Get("failovers"), w.Counts.Get("overload"), w.slowTouched, w.slowN, w.slowExpect*meanHops, w.slowHop1, w.slowExpect,
-		time.Duration(w.maxStampAge), histMS(&w.Steady), histMS(&w.Faulty), histMS(&w.ClientSteady), histMS(&w.SlowWin))
+	return fmt.Sprintf("dp: req=%d served=%d failed=%d deadline=%d ttl=%d noroute=%d hops=%.2f hedges=%d/%d won=%d "+
+		"failovers=%d overload=%d slow=%d/%d(exp %.1f) maxStampAge=%v steady[%s] clientSteady[%s] slowwin[%s]",
+		n.requests, n.results[resServed], n.results[resFailed], n.results[resDeadline], n.results[resTTL],
+		n.results[resNoRoute], w.meanHops(), n.hedges, n.hedgeDenied, n.hedgeWon, n.failovers, n.overload,
+		w.slowTouched, w.slowN, w.slowExpect*w.meanHops(), time.Duration(w.maxStampAge),
+		w.Steady, w.ClientSteady, w.SlowWin)
 }
 
-func histMS(h *Histogram) string {
+// dpCounts counts data-plane events.
+type dpCounts struct {
+	requests, burstRequests             uint64
+	hops, hedges, hedgeDenied, hedgeWon uint64
+	failovers, overload                 uint64
+	ttlExhausted, ttlExhaustedSteady    uint64
+	ejectionLimitExceeded               uint64
+	routeCheckLeaving                   uint64
+	results                             [numResults]uint64
+}
+
+// latencies is a list of request latencies in nanoseconds.
+type latencies []int64
+
+// quantile returns the q-quantile (0 <= q <= 1) by rank, or 0 if l is
+// empty.
+func (l latencies) quantile(q float64) int64 {
+	if len(l) == 0 {
+		return 0
+	}
+
+	s := slices.Clone(l)
+	slices.Sort(s)
+
+	return s[int(max(0, min(1, q))*float64(len(s)-1))]
+}
+
+// String summarizes l in milliseconds.
+func (l latencies) String() string {
 	ms := func(v int64) string { return strconv.FormatFloat(float64(v)/1e6, 'f', 1, 64) }
 
-	return fmt.Sprintf("n=%d p50=%s p99=%s max=%s", h.Count(), ms(h.Quantile(0.5)), ms(h.Quantile(0.99)), ms(h.Max()))
+	return fmt.Sprintf("n=%d p50=%s p99=%s max=%s", len(l), ms(l.quantile(0.5)), ms(l.quantile(0.99)), ms(l.quantile(1)))
 }
