@@ -64,7 +64,7 @@ func gracefulShutdown(d shutdownDeps) {
 	// cdsub already canceled by the outer ctx; wait briefly for its
 	// pending advertise calls to flush.
 	select {
-	case <-d.cdsubDone:
+	case <-d.cdsubDone: //nolint:errcheck // only the drain matters here
 	case <-shutdownCtx.Done():
 		d.logger.Warn("cdsub did not drain within shutdown budget")
 	}

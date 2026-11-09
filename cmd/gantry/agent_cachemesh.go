@@ -228,7 +228,7 @@ func (a *cachemeshAgent) stop() {
 	a.cancel()
 
 	select {
-	case <-a.done:
+	case <-a.done: //nolint:errcheck // start logged the error of Run
 	case <-ctx.Done():
 	}
 
