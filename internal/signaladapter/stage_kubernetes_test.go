@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -22,7 +24,9 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
+	"k8s.io/client-go/kubernetes"
 	kubernetesfake "k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/rest"
 	clienttesting "k8s.io/client-go/testing"
 	utilptr "k8s.io/utils/ptr"
 
@@ -900,6 +904,65 @@ func TestFailedStagePodCannotReportPassedInvocation(t *testing.T) {
 			ReadPodLog: func(context.Context, string, string, string, bool) (string, error) {
 				return invocationResultPrefix + string(content), nil
 			},
+			PollInterval: time.Millisecond,
+		},
+		Namespace: "signal-system",
+	}
+
+	_, err = executor.waitStagePod(context.Background(), invocation, pod)
+	if err == nil || !strings.Contains(err.Error(), "failed stage Pod reported a passed invocation") {
+		t.Fatalf("waitStagePod() error = %v", err)
+	}
+}
+
+func TestWaitStagePodUsesKubernetesLogsWithoutHook(t *testing.T) {
+	t.Parallel()
+
+	invocation := stageExecutionInvocation()
+	envelope := signalv1.InvocationResultEnvelope{
+		Outcome: signalv1.InvocationOutcomePassed,
+	}
+
+	content, err := json.Marshal(envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pod := &corev1.Pod{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "v1",
+			Kind:       "Pod",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "stage-pod",
+			Namespace: "signal-system",
+			UID:       "pod-uid",
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodFailed},
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if strings.HasSuffix(request.URL.Path, "/log") {
+			_, _ = writer.Write([]byte(invocationResultPrefix + string(content)))
+
+			return
+		}
+
+		writer.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(writer).Encode(pod); err != nil {
+			t.Errorf("encode Pod response: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	client, err := kubernetes.NewForConfig(&rest.Config{Host: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	executor := &KubernetesStageExecutor{
+		Runner: &Runner{
+			Kubernetes:   client,
 			PollInterval: time.Millisecond,
 		},
 		Namespace: "signal-system",

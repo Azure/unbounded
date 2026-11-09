@@ -533,7 +533,7 @@ func (e *KubernetesStageExecutor) waitStagePod(
 		}
 
 		if current.Status.Phase == corev1.PodSucceeded || current.Status.Phase == corev1.PodFailed {
-			logs, logErr := e.Runner.ReadPodLog(ctx, e.Namespace, pod.Name, "test", false)
+			logs, logErr := e.Runner.readPodLog(ctx, e.Namespace, pod.Name, "test", false)
 			if logErr != nil {
 				return signalv1.InvocationResultEnvelope{}, fmt.Errorf("read stage Pod result: %w", logErr)
 			}
