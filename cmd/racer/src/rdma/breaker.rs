@@ -211,7 +211,8 @@ pub enum Transition {
 #[derive(Debug)]
 pub struct Breaker {
     config: BreakerConfig,
-    entries: BTreeMap<(NodeId, u16), Entry>,
+    /// By peer, then rail: lookups borrow the peer id instead of cloning it.
+    entries: BTreeMap<NodeId, BTreeMap<u16, Entry>>,
     seed: u64,
 }
 
@@ -249,7 +250,7 @@ impl Breaker {
             return Admit::Rdma;
         }
         let probe_timeout = self.probe_timeout();
-        let Some(entry) = self.entries.get_mut(&(peer.clone(), rail.0)) else {
+        let Some(entry) = self.entry(peer, rail) else {
             return Admit::Rdma;
         };
         match entry.state {
@@ -275,7 +276,8 @@ impl Breaker {
     /// taking a probe.
     pub fn is_open(&self, peer: &NodeId, rail: RailId) -> bool {
         self.entries
-            .get(&(peer.clone(), rail.0))
+            .get(peer)
+            .and_then(|rails| rails.get(&rail.0))
             .is_some_and(|e| e.state != State::Closed)
     }
 
@@ -292,11 +294,10 @@ impl Breaker {
             return Verdict::Ignored;
         }
         let severity = reason.severity();
-        let key = (peer.clone(), rail.0);
         if severity == Severity::Load {
             // Load says nothing about the link. A probe that met it frees
             // the probe slot so the next page can probe instead.
-            if let Some(entry) = self.entries.get_mut(&key)
+            if let Some(entry) = self.entry(peer, rail)
                 && matches!(entry.state, State::HalfOpen { .. })
             {
                 entry.state = State::HalfOpen { probe: None };
@@ -305,7 +306,11 @@ impl Breaker {
         }
         let reset_after = self.config.max * 4;
         let soft_window = self.config.max;
-        let entry = self.entries.entry(key).or_insert(Entry {
+        if !self.entries.contains_key(peer) {
+            self.entries.insert(peer.clone(), BTreeMap::new());
+        }
+        let rails = self.entries.get_mut(peer).expect("inserted above");
+        let entry = rails.entry(rail.0).or_insert(Entry {
             state: State::Closed,
             trips: 0,
             last_trip: now,
@@ -363,7 +368,7 @@ impl Breaker {
     /// Record an RDMA success for `peer` on `rail`, ending any soft failure
     /// streak. Returns the transition when this closed a half-open breaker.
     pub fn success(&mut self, peer: &NodeId, rail: RailId) -> Option<Transition> {
-        let entry = self.entries.get_mut(&(peer.clone(), rail.0))?;
+        let entry = self.entry(peer, rail)?;
         entry.soft = 0;
         match entry.state {
             State::HalfOpen { .. } => {
@@ -374,10 +379,15 @@ impl Breaker {
         }
     }
 
+    fn entry(&mut self, peer: &NodeId, rail: RailId) -> Option<&mut Entry> {
+        self.entries.get_mut(peer)?.get_mut(&rail.0)
+    }
+
     /// Breakers not closed at `now` (open or half-open).
     pub fn open_count(&self) -> usize {
         self.entries
             .values()
+            .flat_map(BTreeMap::values)
             .filter(|e| e.state != State::Closed)
             .count()
     }
@@ -387,8 +397,11 @@ impl Breaker {
     /// peers.
     pub fn prune(&mut self, now: Instant) {
         let window = self.config.max * 4;
-        self.entries.retain(|_, e| {
-            e.state != State::Closed || now.saturating_duration_since(e.touched) <= window
+        self.entries.retain(|_, rails| {
+            rails.retain(|_, e| {
+                e.state != State::Closed || now.saturating_duration_since(e.touched) <= window
+            });
+            !rails.is_empty()
         });
     }
 }
@@ -511,6 +524,34 @@ mod tests {
         assert!(fresh <= Duration::from_secs(2));
         b.prune(quiet);
         assert_eq!(b.open_count(), 1);
+    }
+
+    #[test]
+    /// Rails of one peer trip, close, and prune independently.
+    fn rails_of_one_peer_are_independent() {
+        let mut b = Breaker::new(config());
+        let now = Instant::now();
+        opened(b.trip(&peer(), RailId(0), TripReason::Send, now));
+        assert!(b.is_open(&peer(), RailId(0)));
+        assert!(!b.is_open(&peer(), RailId(1)));
+        assert_eq!(b.allow(&peer(), RailId(1), now), Admit::Rdma);
+        assert_eq!(
+            b.trip(&peer(), RailId(1), TripReason::Timeout, now),
+            Verdict::Counted
+        );
+        assert_eq!(b.success(&peer(), RailId(1)), None);
+        let later = now + Duration::from_secs(121);
+        b.prune(later);
+        assert_eq!(b.open_count(), 1);
+        assert_eq!(
+            b.entries[&peer()].len(),
+            1,
+            "the quiet closed rail is pruned"
+        );
+        assert_eq!(b.allow(&peer(), RailId(0), later), Admit::Probe);
+        assert_eq!(b.success(&peer(), RailId(0)), Some(Transition::Closed));
+        b.prune(later + Duration::from_secs(121));
+        assert!(b.entries.is_empty());
     }
 
     #[test]
