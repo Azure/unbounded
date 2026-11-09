@@ -162,11 +162,11 @@ func (n *Node) fillChunk(f *fill, req chunkReq, decide decider) error {
 				// previous owner during a handoff, and from the owner
 				// when standing in for it as a backup (an owner that is
 				// merely slow often has the chunk already).
-				if attempt == 0 && !d.PrevOwner.IsZero() && n.fillFromPrev(f, req, d.PrevOwner, "prev_owner") == nil {
+				if attempt == 0 && !d.PrevOwner.IsZero() && n.fillFromPrev(f, req, d.PrevOwner, peekHandoff, "prev_owner") == nil {
 					return nil
 				}
 
-				if attempt == 0 && !d.Owner.IsZero() && d.Owner.ID != n.mesh.ID() && n.fillFromPrev(f, req, d.Owner, "owner") == nil {
+				if attempt == 0 && !d.Owner.IsZero() && d.Owner.ID != n.mesh.ID() && n.fillFromPrev(f, req, d.Owner, peekOwner, "owner") == nil {
 					return nil
 				}
 
@@ -343,13 +343,24 @@ func classifyOrigin(err error) error {
 	return err
 }
 
+// Values of the peek query parameter.
+const (
+	// peekHandoff asks the previous owner of a chunk during a handoff. It
+	// is served only from what the receiver already has.
+	peekHandoff = "1"
+	// peekOwner asks the owner on behalf of a backup standing in for it.
+	// An owner without the chunk starts its origin fill and serves it.
+	peekOwner = "owner"
+)
+
 // peekHeaderTimeout bounds the wait for response headers of a peek.
 const peekHeaderTimeout = 2 * time.Second
 
 // fillFromPrev reads the chunk from another member that may already hold
 // it (a previous owner, or the owner a backup stands in for). That member
-// serves only a complete chunk or one it is reading from the origin.
-func (n *Node) fillFromPrev(f *fill, req chunkReq, prev cachemesh.PeerRef, source string) (err error) {
+// serves a complete chunk or one it is reading from the origin; for a
+// peekOwner request an owner without the chunk also starts its origin fill.
+func (n *Node) fillFromPrev(f *fill, req chunkReq, prev cachemesh.PeerRef, peek, source string) (err error) {
 	start := time.Now()
 	off, _ := f.progress()
 
@@ -363,7 +374,7 @@ func (n *Node) fillFromPrev(f *fill, req chunkReq, prev cachemesh.PeerRef, sourc
 
 	headers := time.AfterFunc(peekHeaderTimeout, cancel)
 
-	resp, err := n.doChunk(ctx, prev, nil, req, off)
+	resp, err := n.doChunk(ctx, prev, nil, peek, req, off)
 
 	headers.Stop()
 
@@ -476,7 +487,7 @@ func (n *Node) sendChunk(ctx context.Context, stalled func() bool, req chunkReq,
 		go func() {
 			t0 := time.Now()
 
-			resp, err := n.doChunk(rctx, p, &h, req, off)
+			resp, err := n.doChunk(rctx, p, &h, "", req, off)
 			results <- peerResult{resp: resp, err: err, peer: p, cancel: rcancel, took: time.Since(t0)}
 		}()
 	}
@@ -595,7 +606,7 @@ func (c cancelOnClose) Close() error {
 }
 
 // chunkQuery builds the query string of a chunk request.
-func (n *Node) chunkQuery(req chunkReq, off int, peek bool) string {
+func (n *Node) chunkQuery(req chunkReq, off int, peek string) string {
 	q := url.Values{}
 	q.Set("r", req.registry)
 	q.Set("n", req.repo)
@@ -608,17 +619,21 @@ func (n *Node) chunkQuery(req chunkReq, off int, peek bool) string {
 		q.Set("o", strconv.Itoa(off))
 	}
 
-	if peek {
-		q.Set("peek", "1")
+	if peek != "" {
+		q.Set("peek", peek)
 	}
 
 	return q.Encode()
 }
 
-// doChunk sends one chunk request. A nil hdr sends a peek request. A
-// non-200 status maps to an error.
-func (n *Node) doChunk(ctx context.Context, p cachemesh.PeerRef, hdr *cachemesh.Header, req chunkReq, off int) (*http.Response, error) {
-	u := "http://" + n.cfg.DataAddr(p) + ChunkPath + "?" + n.chunkQuery(req, off, hdr == nil)
+// doChunk sends one chunk request. A nil hdr sends a peek request of kind
+// peek (peekHandoff or peekOwner). A non-200 status maps to an error.
+func (n *Node) doChunk(ctx context.Context, p cachemesh.PeerRef, hdr *cachemesh.Header, peek string, req chunkReq, off int) (*http.Response, error) {
+	if hdr != nil {
+		peek = ""
+	}
+
+	u := "http://" + n.cfg.DataAddr(p) + ChunkPath + "?" + n.chunkQuery(req, off, peek)
 
 	hreq, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {

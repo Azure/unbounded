@@ -374,7 +374,7 @@ func TestChunkHandlerShedsAndValidates(t *testing.T) {
 	// Fill the serve slot.
 	n.node.serves <- struct{}{}
 
-	q := n.node.chunkQuery(chunkReq{registry: "reg", repo: "library/app", d: d, key: chunkKey{digest: d.String()}}, 0, false)
+	q := n.node.chunkQuery(chunkReq{registry: "reg", repo: "library/app", d: d, key: chunkKey{digest: d.String()}}, 0, "")
 
 	rec := httptest.NewRecorder()
 	n.node.handleChunk(rec, httptest.NewRequest(http.MethodGet, ChunkPath+"?"+q, nil))
@@ -401,7 +401,7 @@ func TestChunkHandlerShedsAndValidates(t *testing.T) {
 
 	// Peek misses return 404 without a fill.
 	rec = httptest.NewRecorder()
-	n.node.handleChunk(rec, httptest.NewRequest(http.MethodGet, ChunkPath+"?"+n.node.chunkQuery(chunkReq{registry: "reg", repo: "library/app", d: d, key: chunkKey{digest: d.String()}}, 0, true), nil))
+	n.node.handleChunk(rec, httptest.NewRequest(http.MethodGet, ChunkPath+"?"+n.node.chunkQuery(chunkReq{registry: "reg", repo: "library/app", d: d, key: chunkKey{digest: d.String()}}, 0, peekHandoff), nil))
 
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("peek miss: %d", rec.Code)
@@ -518,5 +518,80 @@ func TestSendChunkHedgesSlowPeer(t *testing.T) {
 
 	if _, ok := hedges.Load("won"); !ok {
 		t.Fatal("hedge not reported as won")
+	}
+}
+
+// TestOwnerPeekStartsOneOriginFill covers a backup standing in for an owner:
+// the owner, asked with peekOwner before it has the chunk, starts its own
+// origin fill and serves it, so the chunk is read from the origin once. A
+// member that is not the owner still answers 404 without touching the origin.
+func TestOwnerPeekStartsOneOriginFill(t *testing.T) {
+	const cs = 64 << 10
+
+	c := newCluster(t, clusterOpts{n: 4})
+
+	blob := randomBlob(21, 4*cs)
+	d := c.origin.add(blob, "")
+	req := chunkReq{registry: "reg", repo: "library/app", d: d, key: chunkKey{digest: d.String(), kind: kindBlob, index: 1}}
+	key := req.key.routeKey(nil)
+
+	dec := c.nodes[0].mesh.Route(c.nodes[0].node.blobKS, key)
+
+	owner := c.byID[dec.Owner.ID]
+	if owner == nil {
+		t.Fatalf("no owner for chunk 1: %+v", dec)
+	}
+
+	var other *testNode
+
+	for _, n := range c.nodes {
+		if n != owner {
+			other = n
+			break
+		}
+	}
+
+	peek := func(n *testNode) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		n.node.handleChunk(rec, httptest.NewRequest(http.MethodGet, ChunkPath+"?"+n.node.chunkQuery(req, 0, peekOwner), nil))
+
+		return rec
+	}
+
+	// Not the owner: no fill, no origin read.
+	if rec := peek(other); rec.Code != http.StatusNotFound {
+		t.Fatalf("owner peek at a non-owner: status %d, want 404", rec.Code)
+	}
+
+	if got := c.origin.totalPulls(); got != 0 {
+		t.Fatalf("non-owner peek read the origin %d times", got)
+	}
+
+	// A handoff peek at the owner still never starts a fill.
+	rec := httptest.NewRecorder()
+	owner.node.handleChunk(rec, httptest.NewRequest(http.MethodGet, ChunkPath+"?"+owner.node.chunkQuery(req, 0, peekHandoff), nil))
+
+	if rec.Code != http.StatusNotFound || c.origin.totalPulls() != 0 {
+		t.Fatalf("handoff peek at the owner: status %d, origin pulls %d", rec.Code, c.origin.totalPulls())
+	}
+
+	// The owner starts the origin fill and serves it.
+	rec = peek(owner)
+	if rec.Code != http.StatusOK || !bytes.Equal(rec.Body.Bytes(), blob[cs:2*cs]) {
+		t.Fatalf("owner peek: status %d, %d bytes", rec.Code, rec.Body.Len())
+	}
+
+	if got := c.origin.pullCount(d, cs); got != 1 {
+		t.Fatalf("origin pulls of chunk 1 = %d, want 1", got)
+	}
+
+	// A later routed fetch of the whole blob reuses the owner's chunk.
+	started, _, _, body, err := fetch(other, d, ifaces.KindBlob, 0)
+	if err != nil || !started || !bytes.Equal(body, blob) {
+		t.Fatalf("fetch: started=%v err=%v", started, err)
+	}
+
+	if got := c.origin.pullCount(d, cs); got != 1 {
+		t.Fatalf("origin pulls of chunk 1 after fetch = %d, want 1", got)
 	}
 }

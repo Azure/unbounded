@@ -144,8 +144,12 @@ own mirror or from a peer:
   - `KindSelf`: this node owns the chunk (or stands in as a backup). It first
     reads through from `PrevOwner` during a handoff, and from the owner when
     acting as a backup, using a "peek" request that only returns chunks the
-    other node has complete or is reading from the origin. Otherwise it pulls
-    the chunk from the origin.
+    other node has complete or is reading from the origin. A backup's peek
+    (`peek=owner`) additionally makes a node that is the owner in its own
+    view start its origin fill and serve it, so a hedge to a backup does not
+    read the chunk from the origin a second time; a handoff peek (`peek=1`)
+    never starts a fill, since the previous owner's own fill may be waiting
+    on the new owner. Otherwise it pulls the chunk from the origin.
   - Relay, owner, backup, gateway, direct: send to `Next` with the decision
     header. After `HedgeAfter`, if `TryHedge` allows, send a copy with
     `FlagHedge` to `Alternate` using `AlternateHeader`; the first response

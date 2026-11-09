@@ -101,7 +101,7 @@ func (n *Node) handleChunk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	f, status, outcome := n.chunkForPeer(r, q.Get("peek") == "1", req)
+	f, status, outcome := n.chunkForPeer(r, q.Get("peek"), req)
 	if f == nil {
 		n.serveHook(outcome, 0)
 		http.Error(w, outcome, status)
@@ -161,10 +161,13 @@ func (n *Node) shed(w http.ResponseWriter) {
 	http.Error(w, "busy", http.StatusTooManyRequests)
 }
 
-// chunkForPeer finds or starts the fill for a peer request. On failure it
-// returns a nil fill with the status and outcome to report.
-func (n *Node) chunkForPeer(r *http.Request, peek bool, req chunkReq) (*fill, int, string) {
-	if peek {
+// chunkForPeer finds or starts the fill for a peer request. peek is the
+// request's peek parameter: "" for a routed request, peekHandoff from a new
+// owner reading through the previous owner, or peekOwner from a backup
+// reading through the owner. On failure it returns a nil fill with the status
+// and outcome to report.
+func (n *Node) chunkForPeer(r *http.Request, peek string, req chunkReq) (*fill, int, string) {
+	if peek != "" {
 		// Serve only complete chunks and chunks read from the origin
 		// here: an in-progress fill from a peer may be waiting on the
 		// very member that is peeking (the new owner).
@@ -179,6 +182,19 @@ func (n *Node) chunkForPeer(r *http.Request, peek bool, req chunkReq) (*fill, in
 			}
 
 			f.release()
+
+			return nil, http.StatusNotFound, "not_found"
+		}
+
+		// A backup standing in for this member asks before going to the
+		// origin. If this member really owns the chunk, start the origin
+		// fill here and let the backup share it, so the chunk is read from
+		// the origin once. The fill never forwards (the owner's own
+		// decision is KindSelf), so this cannot loop.
+		if peek == peekOwner {
+			if f := n.ownerFill(r, req); f != nil {
+				return f, 0, ""
+			}
 		}
 
 		return nil, http.StatusNotFound, "not_found"
@@ -221,6 +237,28 @@ func (n *Node) chunkForPeer(r *http.Request, peek bool, req chunkReq) (*fill, in
 	}
 
 	return f, 0, ""
+}
+
+// ownerFill starts or joins the fill of req when this member is its owner
+// in its own view, for a backup reading through the owner. It returns nil
+// when this member is not the owner or the fill cannot start.
+func (n *Node) ownerFill(r *http.Request, req chunkReq) *fill {
+	key := req.key.routeKey(make([]byte, 0, 96))
+	decide := func() (cachemesh.Decision, error) {
+		return n.mesh.Route(n.blobKS, key), nil
+	}
+
+	d, _ := decide() //nolint:errcheck // decide never fails
+	if d.Kind != cachemesh.KindSelf || d.Owner.ID != n.mesh.ID() {
+		return nil
+	}
+
+	f, err := n.obtain(r.Context(), req, decide, "peer", noSlot)
+	if err != nil {
+		return nil
+	}
+
+	return f
 }
 
 // errStatus maps a fill error to the status sent to a peer.
