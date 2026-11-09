@@ -802,6 +802,52 @@ mod send_failures {
         );
         drop(pending);
     }
+
+    /// A stalled owner does not skip a release: the command is queued and
+    /// the peer's grant is released once the owner resumes.
+    #[test]
+    fn release_during_an_owner_stall_is_queued() {
+        let mut w = world();
+        let env = w.env.clone();
+        link_up(&env, &mut w);
+        let World {
+            _sim,
+            clock,
+            env,
+            a,
+            b,
+        } = w;
+        let b = Node {
+            links: Rc::new(
+                Rc::into_inner(b.links)
+                    .expect("unshared links")
+                    .with_owner_stall(Duration::ZERO),
+            ),
+            ..b
+        };
+        let mut w = World {
+            _sim,
+            clock,
+            env: env.clone(),
+            a,
+            b,
+        };
+        let (pending, grant) = granted(&env, &mut w, 3);
+        let to = node_id(1);
+        let (epoch, _) = w.b.links.ready(&to, RAIL).unwrap();
+        let key = link_key(&to, RAIL);
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        // One undrained command makes the owner read as stalled.
+        let held = w.b.links.client.release(key, epoch, 1_000);
+        assert!(held.poll(&mut cx).is_pending());
+        assert!(w.b.links.owner_stalled());
+        w.b.links.release(&to, &grant);
+        drop(held);
+        assert!(matches!(
+            drive!(w, poll_fn(|cx| pending.arrival.poll(cx))),
+            Ok(Arrival::Released)
+        ));
+    }
 }
 
 /// Sender side: the page is written in place through implicit on-demand

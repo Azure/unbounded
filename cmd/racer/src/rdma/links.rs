@@ -1525,8 +1525,16 @@ impl Links {
     /// otherwise skip the release and leave the peer's grant exposed until
     /// its deadline, which breaks the peer's link. Release is idempotent on
     /// the owner, and a grant whose link is gone has nothing to release.
+    ///
+    /// Unlike [`Self::rail_ready`], a stalled owner or a draining node does
+    /// not skip the release: the command is queued and runs when the owner
+    /// resumes, instead of letting the peer's grant expire.
     pub fn release(&self, peer: &NodeId, grant: &AuthenticatedGrant) {
-        if !self.rail_ready(grant.rail) {
+        if self.client.closed()
+            || !LinkNode::lock(&self.node.active)
+                .iter()
+                .any(|m| m.rail == grant.rail)
+        {
             return;
         }
         let key = link_key(peer, grant.rail);
