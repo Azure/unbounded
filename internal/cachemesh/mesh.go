@@ -64,7 +64,6 @@ type Mesh struct {
 	// Hot path, lock-free.
 	st     atomic.Pointer[route.State]
 	health *route.HealthTracker
-	notes  *route.Notes
 
 	leading atomic.Bool
 	running atomic.Bool
@@ -73,13 +72,10 @@ type Mesh struct {
 	// Control plane, guarded by mu.
 	mu       sync.Mutex
 	n        *control.Node
+	rt       *control.Router // routing snapshot builder
 	lastView *view.View
-	lastSelf view.Slot
 	isLeader bool
 	peers    map[view.Slot]PeerRef // current and lingering neighbors
-	env      *route.Env            // rebuilt when the gateways change
-	gwSeeds  []string              // seeds the current gateways came from
-	seedBuf  []string
 	inval    map[uint64]*invalidation
 
 	wake     chan struct{}
@@ -150,19 +146,17 @@ func New(cfg Config) (*Mesh, error) {
 	}
 
 	m := &Mesh{
-		cfg:      cfg,
-		log:      cfg.Logger.With("cachemesh.id", cfg.ID),
-		start:    time.Now(),
-		lastSelf: view.NoSlot,
-		peers:    map[view.Slot]PeerRef{},
-		inval:    map[uint64]*invalidation{},
-		notes:    &route.Notes{},
-		wake:     make(chan struct{}, 1),
-		left:     make(chan struct{}),
-		done:     make(chan struct{}),
-		sem:      make(chan struct{}, t.MaxInFlight),
-		leaseQ:   make(chan control.Op, leaseQueue),
-		evWake:   make(chan struct{}, 1),
+		cfg:    cfg,
+		log:    cfg.Logger.With("cachemesh.id", cfg.ID),
+		start:  time.Now(),
+		peers:  map[view.Slot]PeerRef{},
+		inval:  map[uint64]*invalidation{},
+		wake:   make(chan struct{}, 1),
+		left:   make(chan struct{}),
+		done:   make(chan struct{}),
+		sem:    make(chan struct{}, t.MaxInFlight),
+		leaseQ: make(chan control.Op, leaseQueue),
+		evWake: make(chan struct{}, 1),
 	}
 
 	nc := cfg.nodeConfig()
@@ -175,32 +169,11 @@ func New(cfg Config) (*Mesh, error) {
 
 	m.n = control.New(nc, rand.New(rand.NewPCG(randUint64(), randUint64())))
 	m.health = m.n.Health()
-	m.gwSeeds = m.n.Seeds(nil)
-	m.env = m.newEnv(m.gwSeeds)
-	m.st.Store(route.NewState(nil, view.NoSlot, m.env))
+	m.rt = control.NewRouter(m.n)
+	m.lastView = m.n.View()
+	m.st.Store(m.rt.State())
 
 	return m, nil
-}
-
-// newEnv returns a routing Env whose gateways are seeds other than this
-// member's own address.
-func (m *Mesh) newEnv(seeds []string) *route.Env {
-	gws := make([]PeerRef, 0, len(seeds))
-	for _, s := range seeds {
-		if s != m.cfg.Addr {
-			gws = append(gws, PeerRef{Slot: view.NoSlot, ID: s, Addr: s})
-		}
-	}
-
-	return route.NewEnv(route.Config{
-		Health:          m.health,
-		Epoch:           m.n.Epoch(),
-		Notes:           m.notes,
-		Gateways:        gws,
-		SelfID:          m.cfg.ID,
-		SelfIncarnation: m.cfg.Incarnation,
-		PartitionBits:   m.cfg.PartitionBits,
-	})
 }
 
 func randUint64() uint64 {
@@ -236,24 +209,11 @@ func (m *Mesh) poke() {
 
 // afterLocked refreshes everything derived from the node. Callers hold mu.
 func (m *Mesh) afterLocked() {
-	v, s := m.n.View(), m.n.Self()
-	changed := v != m.lastView || s != m.lastSelf
-
-	// While not a member, route through every seed the node knows,
-	// including those learned from the Lease and from views.
-	if s == view.NoSlot {
-		m.seedBuf = m.n.Seeds(m.seedBuf[:0])
-		if !slices.Equal(m.seedBuf, m.gwSeeds) {
-			m.gwSeeds = slices.Clone(m.seedBuf)
-			m.env = m.newEnv(m.gwSeeds)
-			changed = true
-		}
-	}
-
-	if changed {
+	if m.rt.Refresh() {
+		v := m.n.View()
 		viewChanged := v != m.lastView
-		m.lastView, m.lastSelf = v, s
-		m.st.Store(route.NewState(v, s, m.env))
+		m.lastView = v
+		m.st.Store(m.rt.State())
 
 		if viewChanged && len(m.inval) > 0 {
 			m.checkInvalidations(v)
@@ -489,9 +449,7 @@ func (m *Mesh) Run(ctx context.Context) error {
 		now := m.mono()
 		m.n.Tick(now, time.Now())
 
-		if note, ok := m.notes.Take(); ok {
-			m.n.NoteVersion(now, note.Sender, expandVersion(m.n.View().Version(), note))
-		}
+		m.rt.TakeNote(now)
 
 		m.resendInvalidations(now)
 
@@ -520,16 +478,6 @@ func (m *Mesh) Run(ctx context.Context) error {
 		case <-timer.C:
 		}
 	}
-}
-
-// expandVersion widens a header note's 32-bit term using own as reference.
-func expandVersion(own view.Version, n route.Note) view.Version {
-	t := own.Term&^0xffffffff | uint64(n.Term)
-	if n.Term < uint32(own.Term) {
-		t += 1 << 32
-	}
-
-	return view.Version{Term: t, Seq: n.Seq}
 }
 
 func (m *Mesh) dispatch(ctx context.Context, wg *sync.WaitGroup, calls []control.Call) {

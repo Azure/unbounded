@@ -697,3 +697,104 @@ func (n *Node) pingDone(now int64, p *pending, ok bool, rtt time.Duration) {
 	n.toLeader(now, addr, &s)
 	n.event("suspect-sent")
 }
+
+// --- Routing snapshot ---
+
+// Router keeps the routing snapshot (a route.State) of one Node current.
+// The public Mesh and the simulator both use it, so they route with the
+// same gateways and feed header notes back the same way. It is not safe for
+// concurrent use; callers serialize it with the Node.
+type Router struct {
+	n     *Node
+	notes route.Notes
+	env   *route.Env
+	st    *route.State
+	seeds []string // gateway seeds env was built with
+	buf   []string
+}
+
+// NewRouter returns a Router for n with a State for n's current view.
+func NewRouter(n *Node) *Router {
+	r := &Router{n: n}
+	r.seeds = n.Seeds(nil)
+	r.env = r.newEnv()
+	r.st = route.NewState(n.View(), n.Self(), r.env)
+
+	return r
+}
+
+// State returns the current routing snapshot.
+func (r *Router) State() *route.State { return r.st }
+
+// Refresh rebuilds the snapshot if the Node's view, its slot, or (while it
+// is not a member) its gateway seeds changed, and reports whether it did.
+// NewState is O(1).
+func (r *Router) Refresh() bool {
+	n := r.n
+	rebuilt := false
+
+	// While not a member, route through every seed the node knows,
+	// including those learned from the Lease and from views.
+	if n.Self() == view.NoSlot {
+		r.buf = n.Seeds(r.buf[:0])
+		if !slices.Equal(r.buf, r.seeds) {
+			r.seeds = slices.Clone(r.buf)
+			r.env = r.newEnv()
+			rebuilt = true
+		}
+	}
+
+	if !rebuilt && r.st.View() == n.View() && r.st.Self() == n.Self() {
+		return false
+	}
+
+	r.st = route.NewState(n.View(), n.Self(), r.env)
+
+	return true
+}
+
+// TakeNote passes the newest view version seen in request headers since
+// the last call to the Node, and reports whether there was one.
+func (r *Router) TakeNote(now int64) bool {
+	note, ok := r.notes.Take()
+	if ok {
+		r.n.NoteVersion(now, note.Sender, ExpandVersion(r.n.View().Version(), note))
+	}
+
+	return ok
+}
+
+// newEnv returns a routing Env whose gateways are the seeds other than this
+// member's own address.
+func (r *Router) newEnv() *route.Env {
+	c := &r.n.cfg
+	gws := make([]route.PeerRef, 0, len(r.seeds))
+
+	for _, s := range r.seeds {
+		if s != c.Addr {
+			gws = append(gws, route.PeerRef{Slot: view.NoSlot, ID: s, Addr: s})
+		}
+	}
+
+	return route.NewEnv(route.Config{
+		Health:          r.n.Health(),
+		Epoch:           r.n.Epoch(),
+		Notes:           &r.notes,
+		Gateways:        gws,
+		SelfID:          c.ID,
+		SelfIncarnation: c.Incarnation,
+		PartitionBits:   c.PartitionBits,
+	})
+}
+
+// ExpandVersion widens a header note's 32-bit term using own, the version
+// of the local view, as reference: the high 32 bits come from own, and a
+// low part below own's is taken to have wrapped into the next 2^32 block.
+func ExpandVersion(own view.Version, n route.Note) view.Version {
+	t := own.Term&^0xffffffff | uint64(n.Term)
+	if n.Term < uint32(own.Term) {
+		t += 1 << 32
+	}
+
+	return view.Version{Term: t, Seq: n.Seq}
+}

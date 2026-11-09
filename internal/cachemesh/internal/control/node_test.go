@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Azure/unbounded/internal/cachemesh/internal/route"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
 )
 
@@ -1520,4 +1521,46 @@ func TestColdRestartStaleView(t *testing.T) {
 	}
 
 	c.waitConverged(5 * time.Minute)
+}
+
+func TestExpandVersion(t *testing.T) {
+	own := view.Version{Term: 5<<32 | 10, Seq: 3}
+	for _, tc := range []struct {
+		term uint32
+		want uint64
+	}{
+		{10, 5<<32 | 10},
+		{11, 5<<32 | 11},
+		{9, 6<<32 | 9},
+	} {
+		if got := ExpandVersion(own, route.Note{Term: tc.term, Seq: 1}); got.Term != tc.want || got.Seq != 1 {
+			t.Errorf("term %d: got %+v", tc.term, got)
+		}
+	}
+}
+
+// TestRouterRefresh checks that a Router rebuilds its State only when the
+// view or the gateway seeds change, and that gateways exclude this member.
+func TestRouterRefresh(t *testing.T) {
+	n := New(Config{ID: "a", Addr: "a:1", Seeds: []string{"a:1", "b:1"}}, rand.New(rand.NewPCG(1, 1)))
+	r := NewRouter(n)
+
+	st := r.State()
+	if st == nil || r.Refresh() || r.State() != st {
+		t.Fatal("Refresh rebuilt an unchanged state")
+	}
+
+	if d := st.RouteHash(1); d.Kind != route.KindGateway || d.Next.Addr != "b:1" {
+		t.Fatalf("decision %+v, want gateway b:1", d)
+	}
+
+	n.addSeed("c:1")
+
+	if !r.Refresh() || r.State() == st {
+		t.Fatal("Refresh kept the state after the seeds changed")
+	}
+
+	if r.TakeNote(0) {
+		t.Fatal("TakeNote reported a note that was never recorded")
+	}
 }

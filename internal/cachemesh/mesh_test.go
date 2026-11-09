@@ -9,9 +9,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/Azure/unbounded/internal/cachemesh/internal/route"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
 )
 
 type nopTransport struct{}
@@ -194,22 +191,6 @@ func TestRunOnceAndCancel(t *testing.T) {
 
 	if _, err := m.ServeControl(context.Background(), "x", []byte{1}); !errors.Is(err, ErrNotRunning) {
 		t.Fatalf("after Run: %v", err)
-	}
-}
-
-func TestExpandVersion(t *testing.T) {
-	own := view.Version{Term: 5<<32 | 10, Seq: 3}
-	for _, tc := range []struct {
-		term uint32
-		want uint64
-	}{
-		{10, 5<<32 | 10},
-		{11, 5<<32 | 11},
-		{9, 6<<32 | 9},
-	} {
-		if got := expandVersion(own, route.Note{Term: tc.term, Seq: 1}); got.Term != tc.want || got.Seq != 1 {
-			t.Errorf("term %d: got %+v", tc.term, got)
-		}
 	}
 }
 

@@ -283,15 +283,12 @@ type dpHop struct {
 type dpMember struct {
 	n         *control.Node
 	gen       uint64
-	env       *route.Env
-	st        *route.State
+	rt        *control.Router
 	inflight  int
 	busyUntil int64
 	lastEp    uint64
 	decisions uint64 // Route and Forward calls, for the hedge budget
 	hedges    uint64
-	seeds     []string // gateway seeds env was built with
-	seedBuf   []string
 }
 
 // trackRing keeps the largest tracked-peer count of each check period over
@@ -500,7 +497,8 @@ func (w *DataPlane) Start(c *Cluster) {
 // --- Member state ---
 
 // state returns member i's routing state, rebuilding it when the process,
-// its view, or its slot changed. NewState is O(1).
+// its view, its slot, or its gateway seeds changed, with the same
+// control.Router the public Mesh uses.
 func (w *DataPlane) state(i uint32) *route.State {
 	m := w.c.members[i]
 	if m == nil || m.dead {
@@ -511,48 +509,12 @@ func (w *DataPlane) state(i uint32) *route.State {
 	if dm.n != m.n {
 		w.gen++
 
-		*dm = dpMember{n: m.n, gen: w.gen}
-		dm.seeds = m.n.Seeds(nil)
-		dm.env = w.newEnv(i, m, dm.seeds)
+		*dm = dpMember{n: m.n, gen: w.gen, rt: control.NewRouter(m.n)}
 	}
 
-	// While not a member, route through every seed the node knows,
-	// including those learned from the Lease and from views, as the
-	// public Mesh does.
-	rebuilt := false
+	dm.rt.Refresh()
 
-	if m.n.Self() == view.NoSlot {
-		dm.seedBuf = m.n.Seeds(dm.seedBuf[:0])
-		if !slices.Equal(dm.seedBuf, dm.seeds) {
-			dm.seeds = slices.Clone(dm.seedBuf)
-			dm.env = w.newEnv(i, m, dm.seeds)
-			rebuilt = true
-		}
-	}
-
-	if rebuilt || dm.st == nil || dm.st.View() != m.n.View() || dm.st.Self() != m.n.Self() {
-		dm.st = route.NewState(m.n.View(), m.n.Self(), dm.env)
-	}
-
-	return dm.st
-}
-
-// newEnv returns member i's routing Env with seeds other than its own
-// address as gateways.
-func (w *DataPlane) newEnv(i uint32, m *member, seeds []string) *route.Env {
-	self := memberAddr(i)
-	gws := make([]route.PeerRef, 0, len(seeds))
-
-	for _, s := range seeds {
-		if s != self {
-			gws = append(gws, route.PeerRef{Slot: view.NoSlot, ID: s, Addr: s})
-		}
-	}
-
-	return route.NewEnv(route.Config{
-		Health: m.n.Health(), Epoch: m.n.Epoch(), Notes: &route.Notes{}, Gateways: gws,
-		SelfID: memberID(i), SelfIncarnation: m.inc, PartitionBits: w.c.sc.PartitionBits,
-	})
+	return dm.rt.State()
 }
 
 // noteTracked records member i's tracked-peer count.
@@ -965,16 +927,12 @@ func (h *dpHop) Fire(_, _ uint64) {
 // notes passes a newer version seen in a header to member i's control
 // plane, as the public Mesh does.
 func (w *DataPlane) notes(i uint32) {
-	note, ok := w.mem[i].env.Notes().Take()
-	if !ok {
+	if !w.mem[i].rt.TakeNote(w.mono(i)) {
 		return
 	}
 
 	w.cov.note.Hit()
-
-	m := w.c.members[i]
-	m.n.NoteVersion(w.mono(i), note.Sender, view.Version{Term: uint64(note.Term), Seq: note.Seq})
-	m.after()
+	w.c.members[i].after()
 }
 
 // Complete implements Completer for the sender side of a hop.
