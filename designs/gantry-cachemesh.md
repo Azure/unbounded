@@ -384,7 +384,9 @@ Tag resolutions use a separate keyspace, `gantry-meta`, with a 5m TTL
 - Other nodes fetch through `GET /cachemesh/meta?r=&n=&t=` with the route
   header, check that the body matches `Docker-Content-Digest`, and cache the
   entry with the owner's stamp (`Gantry-Stamp-Expires`, `Gantry-Stamp-Gen`).
-- Every holder checks `Mesh.Fresh` before using a copy. One resolution per
+- Every holder checks `Mesh.Fresh` before using a copy, including a
+  resolution it just received from a peer or joined in flight; a stale one
+  is rejected and not cached, and the mirror falls back. One resolution per
   key runs at a time on each node.
 - Each node keeps at most 4096 entries and 64 MiB of manifest bodies
   (`metaCacheBytes`). An insert that would exceed either bound drops expired

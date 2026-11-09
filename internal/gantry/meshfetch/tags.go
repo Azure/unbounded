@@ -25,6 +25,9 @@ import (
 // maxManifestSize bounds a manifest resolved by tag.
 const maxManifestSize = 4 << 20
 
+// errStaleMeta reports a tag resolution whose stamp is not fresh here.
+var errStaleMeta = errors.New("meshfetch: stale tag resolution")
+
 // metaEntry is a resolved tag: the manifest bytes, their media type and
 // digest, and the owner's stamp, which every copy keeps.
 type metaEntry struct {
@@ -163,6 +166,10 @@ func (n *Node) resolveMeta(ctx context.Context, registry, repo, tag string, deci
 			c.mu.Lock()
 			delete(c.calls, key)
 
+			if call.err == nil && !n.mesh.Fresh(n.metaKS, call.e.stamp) {
+				call.e, call.err = nil, errStaleMeta
+			}
+
 			if call.err == nil {
 				c.put(key, call.e, func(s cachemesh.Stamp) bool { return n.mesh.Fresh(n.metaKS, s) })
 			}
@@ -176,6 +183,11 @@ func (n *Node) resolveMeta(ctx context.Context, registry, repo, tag string, deci
 
 	select {
 	case <-call.done:
+		// The entry may have expired while this caller waited.
+		if call.err == nil && !n.mesh.Fresh(n.metaKS, call.e.stamp) {
+			return nil, errStaleMeta
+		}
+
 		return call.e, call.err
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -208,6 +220,12 @@ func (n *Node) fetchMeta(registry, repo, tag string, decide decider) (*metaEntry
 
 		e, err = n.metaFromPeer(ctx, h.to, h.hdr, registry, repo, tag)
 		n.observeErr(ctx, h.to, err, time.Since(t0), false)
+
+		// A lagging peer may answer with a stamp this node already
+		// considers expired.
+		if err == nil && !n.mesh.Fresh(n.metaKS, e.stamp) {
+			e, err = nil, errStaleMeta
+		}
 
 		if err == nil {
 			n.hook(n.cfg.Hooks.OnMeta, "peer")

@@ -6,10 +6,13 @@ package meshfetch
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -931,5 +934,47 @@ func TestMetaCacheByteBudget(t *testing.T) {
 
 	if sum != c.bytes {
 		t.Fatalf("accounting %d != %d", c.bytes, sum)
+	}
+}
+
+func TestResolveTagRejectsStalePeerStamp(t *testing.T) {
+	c := newCluster(t, clusterOpts{n: 2, attempts: 1})
+
+	manifest := []byte(`{"schemaVersion":2}`)
+	sum := sha256.Sum256(manifest)
+	d := "sha256:" + hex.EncodeToString(sum[:])
+
+	// A lagging peer answers with a stamp that is already expired here.
+	stale := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set(headerDigest, d)
+		w.Header().Set(headerStampExpire, "1")
+		w.Header().Set(headerStampGen, "0")
+		_, _ = w.Write(manifest)
+	}))
+	t.Cleanup(stale.Close)
+
+	caller := c.nodes[0]
+
+	dec := caller.mesh.Route(caller.node.metaKS, []byte(metaKey("reg", "library/app", "v1")))
+	if dec.Kind == cachemesh.KindSelf {
+		caller = c.nodes[1]
+		dec = caller.mesh.Route(caller.node.metaKS, []byte(metaKey("reg", "library/app", "v1")))
+	}
+
+	c.addrMu.Lock()
+	c.addrs[dec.Next.ID] = strings.TrimPrefix(stale.URL, "http://")
+	c.addrs[dec.Next.Addr] = c.addrs[dec.Next.ID]
+	c.addrMu.Unlock()
+
+	if _, _, _, err := caller.node.ResolveTag(context.Background(), "reg", "library/app", "v1"); err == nil {
+		t.Fatal("stale peer resolution accepted")
+	}
+
+	caller.node.meta.mu.Lock()
+	cached := len(caller.node.meta.m)
+	caller.node.meta.mu.Unlock()
+
+	if cached != 0 {
+		t.Fatalf("stale resolution cached: %d entries", cached)
 	}
 }
