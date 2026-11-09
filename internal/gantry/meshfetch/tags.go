@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -322,7 +323,7 @@ func (n *Node) metaFromPeer(ctx context.Context, p cachemesh.PeerRef, hdr cachem
 		body:   body,
 		ctype:  resp.Header.Get("Content-Type"),
 		digest: d,
-		stamp:  cachemesh.Stamp{Expires: expires, Gen: uint32(gen)},
+		stamp:  n.boundStamp(cachemesh.Stamp{Expires: expires, Gen: uint32(gen)}),
 	}, nil
 }
 
@@ -380,4 +381,26 @@ func setContentType(h http.Header, ctype string) {
 	}
 
 	h.Set("Content-Type", ctype)
+}
+
+// boundStamp clamps a peer's stamp so a tag binding cannot outlive the
+// keyspace TTL as this node measures it. A skewed, buggy, or malicious
+// peer could otherwise send a far-future Expires (or Never) and keep the
+// binding cached until the next generation bump. One epoch of slack
+// accepts an owner whose epoch tracker runs one epoch ahead of ours.
+func (n *Node) boundStamp(s cachemesh.Stamp) cachemesh.Stamp {
+	limit := n.mesh.Stamp(n.metaKS).Expires
+	if limit == math.MaxUint64 {
+		return s
+	}
+
+	if limit < math.MaxUint64-1 {
+		limit++
+	}
+
+	if s.Expires > limit {
+		s.Expires = limit
+	}
+
+	return s
 }

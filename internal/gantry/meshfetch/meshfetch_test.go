@@ -9,9 +9,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -981,6 +983,59 @@ func TestResolveTagRejectsStalePeerStamp(t *testing.T) {
 
 	if cached != 0 {
 		t.Fatalf("stale resolution cached: %d entries", cached)
+	}
+}
+
+// A peer stamp far beyond the local TTL (here Never) is clamped to what
+// this node would issue now plus one epoch of skew slack, so the binding
+// cannot stay cached past the keyspace TTL.
+func TestResolveTagClampsFarFuturePeerStamp(t *testing.T) {
+	c := newCluster(t, clusterOpts{n: 2, attempts: 1})
+
+	manifest := []byte(`{"schemaVersion":2}`)
+	sum := sha256.Sum256(manifest)
+	d := "sha256:" + hex.EncodeToString(sum[:])
+
+	caller := c.nodes[0]
+
+	dec := caller.mesh.Route(caller.node.metaKS, []byte(metaKey("reg", "library/app", "v1")))
+	if dec.Kind == cachemesh.KindSelf {
+		caller = c.nodes[1]
+		dec = caller.mesh.Route(caller.node.metaKS, []byte(metaKey("reg", "library/app", "v1")))
+	}
+
+	gen := caller.mesh.Stamp(caller.node.metaKS).Gen
+
+	far := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set(headerDigest, d)
+		w.Header().Set(headerStampExpire, strconv.FormatUint(math.MaxUint64, 10))
+		w.Header().Set(headerStampGen, strconv.FormatUint(uint64(gen), 10))
+		_, _ = w.Write(manifest)
+	}))
+	t.Cleanup(far.Close)
+
+	c.addrMu.Lock()
+	c.addrs[dec.Next.ID] = strings.TrimPrefix(far.URL, "http://")
+	c.addrs[dec.Next.Addr] = c.addrs[dec.Next.ID]
+	c.addrMu.Unlock()
+
+	if _, _, _, err := caller.node.ResolveTag(context.Background(), "reg", "library/app", "v1"); err != nil {
+		t.Fatalf("ResolveTag: %v", err)
+	}
+
+	limit := caller.mesh.Stamp(caller.node.metaKS).Expires + 1
+
+	caller.node.meta.mu.Lock()
+	defer caller.node.meta.mu.Unlock()
+
+	if len(caller.node.meta.m) == 0 {
+		t.Fatal("resolution not cached")
+	}
+
+	for k, e := range caller.node.meta.m {
+		if e.stamp.Expires > limit {
+			t.Fatalf("%s: Expires %d exceeds local bound %d", k, e.stamp.Expires, limit)
+		}
 	}
 }
 

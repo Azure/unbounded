@@ -1345,6 +1345,9 @@ Tag resolutions use a separate keyspace, `gantry-meta`, with a 5m TTL
 - Other nodes fetch through `GET /cachemesh/meta?r=&n=&t=` with the route
   header, check that the body matches `Docker-Content-Digest`, and cache the
   entry with the owner's stamp (`Gantry-Stamp-Expires`, `Gantry-Stamp-Gen`).
+  The owner's `Expires` is clamped to at most one epoch past what this node
+  would stamp now, so a skewed or misbehaving peer cannot keep a binding
+  cached past the keyspace TTL; the slack tolerates an owner one epoch ahead.
 - Every holder checks `Mesh.Fresh` before using a copy, including a
   resolution it just received from a peer or joined in flight; a stale one
   is rejected and not cached, and the mirror falls back. One resolution per
