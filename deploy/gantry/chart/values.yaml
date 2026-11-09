@@ -112,10 +112,11 @@ gantry:
     # above diskCacheBytes: the kubelet evicts the pod when it is exceeded.
     chunkDirSizeLimit: ""
     # Hot page tier in bytes: pages read from disk by concurrent readers that
-    # stay in memory (256MiB). Chunk memory is about this plus inflightBytes
-    # plus pageSize x (fillPages x maxConcurrentChunkFills + one page per
-    # active reader), so the defaults stay under 2GiB and the default 8Gi
-    # memory limit is ample.
+    # stay in memory (512MiB). Chunk memory is at most about this plus
+    # inflightBytes plus pageSize x (fillPages x maxConcurrentChunkFills + one
+    # page per active reader), about 3.3GiB with the defaults; measured peaks
+    # were about 3GiB during a 142-node 40GB pull and about 0.6GiB idle. The
+    # default 8Gi memory limit is ample; 4Gi also held in the benchmark.
     memoryCacheBytes: 0
     # Unit of in-flight buffers, disk I/O, read coalescing, and the hot tier
     # (1MiB): a power of two between 64KiB and chunkSize.
@@ -123,13 +124,15 @@ gantry:
     # In-flight pages per chunk fill (4).
     fillPages: 0
     # Memory fills borrow beyond fillPages when a reader lags behind a fill
-    # that peers also read; when exhausted such fills spill to disk (1GiB).
+    # that peers also read; when exhausted such fills spill to disk (2GiB).
     inflightBytes: 0
     # Page cache use of chunk files: bypass (O_DIRECT), drop (buffered, then
     # fadvise DONTNEED), or keep ("bypass").
     pageCache: ""
     # Chunks written to disk: all, shared (only chunks this agent owns or
-    # serves to a peer), or owned (only chunks this agent owns) ("all").
+    # serves to a peer), or owned (only chunks this agent owns) ("owned").
+    # On nodes where containerd already saturates the disk during a pull,
+    # writing transit chunks slows pulls down (designs/gantry-cachemesh.md).
     persist: ""
     # Chunks of one blob fetched ahead of the one being written (8).
     lookahead: 0

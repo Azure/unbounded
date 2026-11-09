@@ -28,8 +28,8 @@ func TestCachemeshDefaultsDisabled(t *testing.T) {
 	}
 
 	if m.ChunkSize != 64<<20 || m.MetadataTTL != 5*time.Minute || m.LeaseName != "gantry-cachemesh" ||
-		m.DiskCacheBytes != 20<<30 || m.MemoryCacheBytes != 256<<20 || m.ChunkDir != "/var/lib/gantry/cachemesh" ||
-		m.PageSize != 1<<20 || m.FillPages != 4 || m.InflightBytes != 1<<30 || m.PageCache != "bypass" || m.Persist != "all" || m.MaxNeighbors != 32 || !m.CacheTags || !m.VerifyDigest || m.Lookahead != 8 {
+		m.DiskCacheBytes != 20<<30 || m.MemoryCacheBytes != 512<<20 || m.ChunkDir != "/var/lib/gantry/cachemesh" ||
+		m.PageSize != 1<<20 || m.FillPages != 4 || m.InflightBytes != 2<<30 || m.PageCache != "bypass" || m.Persist != "owned" || m.MaxNeighbors != 32 || !m.CacheTags || !m.VerifyDigest || m.Lookahead != 8 {
 		t.Fatalf("unexpected defaults: %+v", m)
 	}
 

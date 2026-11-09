@@ -17,12 +17,12 @@ const (
 	DefaultCachemeshChunkSize      = 64 << 20
 	DefaultCachemeshChunkDir       = "/var/lib/gantry/cachemesh"
 	DefaultCachemeshDiskCacheBytes = 20 << 30
-	DefaultCachemeshMemCacheBytes  = 256 << 20
+	DefaultCachemeshMemCacheBytes  = 512 << 20
 	DefaultCachemeshPageSize       = 1 << 20
 	DefaultCachemeshFillPages      = 4
-	DefaultCachemeshInflightBytes  = 1 << 30
+	DefaultCachemeshInflightBytes  = 2 << 30
 	DefaultCachemeshPageCache      = "bypass"
-	DefaultCachemeshPersist        = "all"
+	DefaultCachemeshPersist        = "owned"
 	DefaultCachemeshMetadataTTL    = 5 * time.Minute
 
 	// DefaultCachemeshMaxNeighbors is gantry's data-plane fan-out. The
