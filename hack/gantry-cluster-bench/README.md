@@ -16,7 +16,8 @@ Go helper (`hack/cmd/gantry-cluster-bench`).
 | `build-gantry-image.sh` | builds gantry from any source tree and pushes it to the origin |
 | `deploy.sh` / `undeploy.sh` | helm install / uninstall of `deploy/gantry/chart` |
 | `values-default.yaml` | gantry default (p2p) mode |
-| `values-cachemesh.yaml` | placeholder for cachemesh mode |
+| `values-cachemesh.yaml` | cachemesh mode overlay (layer over values-default.yaml) |
+| `meshstate.sh` | one-line cachemesh state of every agent (ready, leaders, members, term, seq) |
 
 Results and scratch files go to `tmp/gantry-cluster-bench/` at the repo root
 (gitignored).
@@ -92,7 +93,7 @@ All commands run from `hack/gantry-cluster-bench/` with
    ./deploy.sh values-default.yaml "$IMG"
    ```
 
-   The agent limits are raised to 16 CPU / 64Gi so that a 40GB fan-out is not
+   The agent limits are raised to 32 CPU / 48Gi (both modes) so that a 40GB fan-out is not
    throttled. The chart has no pod annotations, so `run.sh` reads each agent's
    `:9095/metrics` through the API server proxy instead of Prometheus.
 
