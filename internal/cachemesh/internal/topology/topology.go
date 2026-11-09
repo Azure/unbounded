@@ -35,7 +35,9 @@ const MaxDims = 8
 // NoCell marks the absence of a cell.
 const NoCell = ^uint32(0)
 
-// MaxCells bounds the number of cells in a shape.
+// MaxCells bounds the number of cells in a shape: it keeps cell arithmetic
+// within uint32. Views apply the stricter view.MaxCells (no more cells than
+// slots), so this bound only matters to Shape and Choose on their own.
 const MaxCells = 1 << 30
 
 // Shape is a grid shape. The zero value is invalid; build shapes with

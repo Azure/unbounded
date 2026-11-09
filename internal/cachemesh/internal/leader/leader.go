@@ -67,6 +67,7 @@ import (
 	"slices"
 	"time"
 
+	"github.com/Azure/unbounded/internal/cachemesh/internal/epoch"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/hashing"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/placement"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/topology"
@@ -86,8 +87,8 @@ const (
 	DefaultMaxCellMovesPerTick = 32
 	DefaultCellSize            = 4
 	DefaultMaxNeighbors        = 256
-	DefaultPartitionBits       = 20
-	DefaultEpochPeriod         = 15 * time.Second
+	DefaultPartitionBits       = placement.DefaultBits
+	DefaultEpochPeriod         = epoch.DefaultPeriod
 	DefaultSlotReuseEpochs     = 16
 	DefaultHandoffEpochs       = 8
 	DefaultMaxPending          = 4096

@@ -36,6 +36,8 @@ import (
 	"unsafe"
 
 	"github.com/Azure/unbounded/internal/cachemesh/internal/codec"
+	"github.com/Azure/unbounded/internal/cachemesh/internal/placement"
+	"github.com/Azure/unbounded/internal/cachemesh/internal/topology"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
 )
 
@@ -44,23 +46,24 @@ const FormatVersion uint8 = 1
 
 // Limits enforced by Decode.
 const (
-	// MaxIDLen bounds a member ID.
-	MaxIDLen = 253
-	// MaxAddrLen bounds a member address.
-	MaxAddrLen = 1024
-	// MaxZoneLen bounds a zone name.
-	MaxZoneLen = 128
+	// MaxIDLen bounds a member ID, as in a view.
+	MaxIDLen = view.MaxIDLen
+	// MaxAddrLen bounds a member address, as in a view.
+	MaxAddrLen = view.MaxAddrLen
+	// MaxZoneLen bounds a zone name, as in a view.
+	MaxZoneLen = view.MaxZoneLen
 	// MaxMessageSize bounds a whole encoded message, including snapshots.
 	MaxMessageSize = 64 << 20
 	// MaxDeltas bounds the deltas in one CatchUpResponse.
 	MaxDeltas = 4096
 	// MaxInnerSize bounds the inner message carried by Routed.
 	MaxInnerSize = 64 << 10
-	// MaxPartitionBits bounds Join.PartitionBits.
-	MaxPartitionBits = 32
+	// MaxPartitionBits bounds Join.PartitionBits: no cluster can use more
+	// bits than a placement table holds.
+	MaxPartitionBits = placement.MaxBits
 	// MaxDimensions is the number of grid dimensions a Broadcast level may
 	// name (levels 0..MaxDimensions-1).
-	MaxDimensions = 8
+	MaxDimensions = topology.MaxDims
 )
 
 // Errors returned by Decode, in addition to wrapped codec errors.

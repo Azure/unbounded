@@ -93,8 +93,10 @@ const (
 	MaxZoneLen = 128
 	// MaxSlots bounds SlotCap and any slot number in a view.
 	MaxSlots = 1 << 22
-	// MaxCells bounds Shape().Cells() of a view.
-	MaxCells = 1 << 22
+	// MaxCells bounds Shape().Cells() of a view. It equals MaxSlots (a view
+	// never needs more cells than members) and is stricter than
+	// topology.MaxCells, which only bounds Shape arithmetic.
+	MaxCells = MaxSlots
 	// MaxDeltaOps bounds the number of ops in one delta.
 	MaxDeltaOps = 1 << 16
 	// MaxGens bounds the number of keyspace generations in a view.
