@@ -1,7 +1,11 @@
 # Gantry cachemesh benchmark: 40GB image to 142 nodes
 
 Results of the gantry benchmark campaign run on 2026-11-09 on the
-`joolshev-rdma` cluster. It compares gantry's default peer-to-peer mode with
+`joolshev-rdma` cluster. Every run below predates the later simplification
+of `meshfetch`, which removed the 512MiB hot page tier, the containerd
+content API fallback, the content store descriptor cache, and most
+cachemesh config knobs (see "Code changes since these runs" at the end).
+Sections describing earlier designs are marked historical. It compares gantry's default peer-to-peer mode with
 the optional cachemesh content path (`designs/gantry-cachemesh.md`) when
 every node pulls the same 40GB image at the same moment.
 
@@ -25,7 +29,7 @@ every node pulls the same 40GB image at the same moment.
   1.33x egress). Both are fixed and covered by regression tests.
 - Cachemesh filled its in-memory chunk cache, so the agent's RSS rose to the
   configured cache size (24GiB here) and stayed there while idle. The
-  disk-backed chunk store that replaced it (see "Disk-backed chunk store"
+  disk-backed chunk store that replaced it (see "Historical: disk-backed chunk store"
   below) keeps the same pull time (p50 about 91s, makespan 97-102s) with
   about 2.8GiB RSS at the peak and about 0.26GiB working set when idle.
 - The final design (see "Containerd content store as the only disk tier")
@@ -257,8 +261,9 @@ gauges through the API server proxy:
    from the origin itself. In B1 this caused 97 extra origin fills (744
    instead of 647, 1.16x egress). Now an owner peek (`peek=owner`) at a member
    that owns the chunk in its own view starts or joins the origin fill there
-   and serves it. Handoff peeks (`peek=1`) still never start a fill, which
-   avoids the deadlock described in `server.go`. The owner path never
+   and serves it. Handoff peeks (then `peek=1`, now `peek=local`) still
+   never start a fill, which avoids the deadlock described at
+   `Node.chunkForPeer` in `node.go`. The owner path never
    forwards, so it cannot loop. Test: `TestOwnerPeekStartsOneOriginFill`.
    Result: 1.00x egress in B2 and B3.
 2. **Owners evicted their own chunks under cache pressure**
@@ -271,10 +276,11 @@ gauges through the API server proxy:
    20s apart. That gave 1.33x egress. The relay grid made this worse because
    relays add transit chunks to every cache. Owned chunks now sit on their
    own LRU list and are evicted only when no other complete chunk is left or
-   when they exceed half of the budget. Tests:
-   `TestStoreEvictsOwnedChunksLast`,
-   `TestStoreCapsOwnedChunksAtHalfTheBudget`, plus an owned-marking check in
-   the owner-peek test. Result: 1.00x egress in C2, C3, and C4, and the C
+   when they exceed half of the budget. That cache and its tests were later
+   replaced by the lingering-chunk design: a lingering chunk this member
+   owns is reclaimed after the ones it does not own (`store.evictLingering`,
+   test `TestEvictLingeringPrefersNotOwned`), and the owner-peek test checks
+   the owned marking. Result: 1.00x egress in C2, C3, and C4, and the C
    makespan improved from 103.8s to 96-99s.
 
 No default-mode bugs were found. Its origin egress was exactly 8.01x in both
@@ -307,9 +313,10 @@ and the first node takes over 200s.
   default of 256, which makes the grid 1-D up to about 256 agents and serves
   each chunk directly from its owner to every node. Gantry now defaults to
   32; the library keeps 256 for 100k-node clusters.
-- `chunkCacheBytes` no longer exists. The chunk store defaults (persist
-  owned chunks, 2GiB in-flight budget, 512MiB hot tier) matched the
-  memory-only speed with a 4Gi memory limit; see "Disk-backed chunk store".
+- `chunkCacheBytes` no longer exists. Keep the in-flight budget default
+  (`inflightBytes`, 2GiB): with it the chunk store matched the memory-only
+  speed with a 4Gi memory limit; see "Containerd content store as the only
+  disk tier".
 - `verifyDigest` costs nothing measurable at these rates. Keep the default
   (`true`) unless a node must serve one blob faster than about 1.8GB/s.
   These runs used `false`, and the one `true` run gave the same results.
@@ -332,9 +339,11 @@ and the first node takes over 200s.
 - Lease API request counts come from the code and from observed Lease
   resourceVersion changes, not from API server metrics.
 
-## Disk-backed chunk store
+## Historical: disk-backed chunk store
 
-Later on 2026-11-09 the in-memory chunk cache was replaced with the
+This design, with private chunk files and a hot page tier, has been
+replaced; its knobs (`persist`, `memoryCacheBytes`, and others) no longer
+exist. Later on 2026-11-09 the in-memory chunk cache was replaced with the
 disk-backed store described in `designs/gantry-cachemesh.md` (chunk store
 section): chunk files on disk, a small window of in-flight pages per fill, a
 store-wide in-flight budget, a hot page tier, and page read coalescing. The
@@ -459,13 +468,13 @@ is memory-only mode C from the first campaign, with a 24GiB chunk cache.
    Every pull on every node stopped (0/142 done after 13 minutes); a
    goroutine dump (`kill -QUIT`) showed the filler blocked in `queueLocked`.
    The writer now takes pages from the window in order and is woken by a
-   non-blocking signal. Test: `TestSpillQueuesBorrowedPages`.
+   non-blocking signal. The spill path and its test were removed with the
+   chunk files.
 2. **Idle memory held by lingering chunks** (mem7). Lingering relay chunks
    kept about 2.7GiB after the pull until something else needed the budget.
    Fixed with a 30s idle TTL for lingering chunks (mem8) and hot pages
-   (mem9). Test:
-   `TestLingeringChunkExpires` and the expiry steps in
-   `TestHotTierAdmitsRepeatedPagesAndEvictsLRU`.
+   (mem9). Test: `TestLingeringChunkExpires`. The hot page tier was later
+   removed.
 
 ### Caveats
 
@@ -496,10 +505,10 @@ in-progress ingests) to serve peers. See "Chunk store" in
 
 - Build `gantry:cd2` from the `gantry-cd` worktree, deployed with
   `values-default.yaml` plus `values-cachemesh.yaml` (agent defaults:
-  `maxNeighbors` 32, 2GiB in-flight budget, 512MiB hot tier,
-  `verifyDigest: false`). The chart mounts
+  `maxNeighbors` 32, 2GiB in-flight budget, 512MiB hot tier (since
+  removed), `verifyDigest: false`). The chart mounts
   `/var/lib/containerd/io.containerd.content.v1.content` read-only; the
-  agent logged `content_source: dir`. During a pull the agent (uid 65532)
+  agent logged `content_source: dir` (now `content_readable: true`). During a pull the agent (uid 65532)
   listed and read `ingest/<key>/{ref,total,data}` (directories 0755, files
   0644).
 - Between runs: `undeploy.sh` (which deletes the namespace and the
@@ -511,7 +520,8 @@ in-progress ingests) to serve peers. See "Chunk store" in
   gantry writes nothing to disk.
 - Two-wave test: after the same reset, the odd-numbered half of the 142
   sorted nodes (71) pulled, then 3 minutes later (after every 30s linger
-  window and hot page TTL expired) the even-numbered half pulled the same
+  window and hot page TTL expired; the hot tier has since been removed) the
+  even-numbered half pulled the same
   image. The second run's origin egress counts only the second wave.
 - A 4-node smoke pull of a 4GB image ran first to check the mount, the
   fallback logging, and the I/O sampling.
@@ -709,3 +719,25 @@ Lease are gone, `clean.sh` with `DROP_CACHES=1` ran on all 142 nodes (about
 garbage collected. `gantry:cd2` (the measured build) remains next to
 `gantry:bench-base` and `gantry:cm3`. Raw data is in
 `tmp/gantry-cluster-bench/cd-*` in the `gantry-cd` worktree (gitignored).
+
+## Code changes since these runs
+
+After the runs above, `meshfetch` and its configuration were simplified
+without a cluster rerun. Local benchmarks (`go test -bench .
+./internal/gantry/meshfetch`) showed no regression; a cluster rerun has not
+been done. The changes:
+
+- The hot page tier (`memory_cache_bytes`, 512MiB in every run above) was
+  removed. Concurrent reads of one page are still coalesced; a page is
+  freed once its last reader is done.
+- The containerd content API fallback was removed: a node without a
+  readable `content_root` serves peers from memory only.
+- `DirContent` opens, reads, and closes the blob per 1MiB page instead of
+  caching descriptors.
+- The agent no longer sets `GOMEMLIMIT` from the cgroup limit.
+- Config is reduced to `enabled`, `namespace`, `chunk_size`,
+  `expected_size`, `max_neighbors`, `content_root`, `inflight_bytes`,
+  `max_concurrent_chunk_fills`, `cache_tags`, and `verify_digest`; the
+  other values used in these runs are now fixed defaults.
+- A blob stream no longer retries a failed fill; only a reader that lost
+  bytes obtains a new one. Attempts per chunk no longer compound.
