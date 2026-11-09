@@ -48,9 +48,13 @@ type HostReadResult struct {
 }
 
 // HostRead asks Racer to write an object range straight into file, normally
-// a memfd, with positioned writes, instead of streaming it over the socket.
-// The file must be a regular file opened for writing without O_APPEND; Racer
-// never maps it. The descriptor is passed to Racer with SCM_RIGHTS on the
+// a memfd, instead of streaming it over the socket. The file must be a
+// regular file opened for writing without O_APPEND. Racer writes with
+// positioned writes, except when file is a memfd opened read-write, sealed
+// with F_SEAL_SHRINK, not sealed with F_SEAL_WRITE or F_SEAL_FUTURE_WRITE,
+// and at least as long as the destination window: Racer then maps the file
+// and decrypts straight into it, skipping a copy. Create such a memfd with
+// MFD_ALLOW_SEALING and add F_SEAL_SHRINK after sizing it. The descriptor is passed to Racer with SCM_RIGHTS on the
 // client socket, so the caller and Racer must be on the same host.
 //
 // HostRead returns once Racer confirms every byte is in the file. On error
