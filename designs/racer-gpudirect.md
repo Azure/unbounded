@@ -489,7 +489,9 @@ copies and bytes, peer copy failures, and host bounces.
   pages until they synchronize.
 - **Waiting.** With nothing in flight the executor sleeps on its queue's
   condition variable. With fences pending it naps between polls, from 20 us
-  doubling to 1 ms, and a new page wakes it at once.
+  doubling to at most 100 us. A new page wakes it at once, and so does a
+  host function (`cuLaunchHostFunc`) queued after each fence, when the
+  driver supports it.
 - **Bounded queue.** Each executor accepts at most `queue_depth` page jobs,
   queued or running (128 by default). More are refused with `Overloaded`
   and counted in `racer_gpu_executor_queue_full_total`.
