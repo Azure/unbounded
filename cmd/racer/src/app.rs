@@ -2763,6 +2763,13 @@ impl Application {
     }
 }
 
+/// Teardown runs the configured drain, then control shutdown, fences, and
+/// the shutdown phase, so it gets the drain budget plus the fixed lifecycle
+/// budget. A shorter fixed deadline would fail a drain the operator allowed.
+fn teardown_budget(shutdown_timeout: Duration) -> Duration {
+    shutdown_timeout.saturating_add(crate::worker::LIFECYCLE_TIMEOUT)
+}
+
 impl crate::lifecycle::Factory<RequestScope> for Application {
     fn build_lane(&self, lane: usize) -> Result<Box<dyn crate::lifecycle::Service<RequestScope>>> {
         self.resources
@@ -2789,7 +2796,11 @@ impl crate::lifecycle::Factory<RequestScope> for Application {
     }
 
     fn teardown_scope(&self, startup: &RequestScope) -> RequestScope {
-        scope(startup.clock(), Duration::from_secs(30)).unwrap_or_else(|_| startup.clone())
+        scope(
+            startup.clock(),
+            teardown_budget(self.config.shutdown_timeout),
+        )
+        .unwrap_or_else(|_| startup.clone())
     }
 }
 

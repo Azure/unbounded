@@ -5535,3 +5535,16 @@ fn prune_stale_slab_files_ignores_symlinked_directories() {
     assert!(!stale.exists());
     std::fs::remove_dir_all(&root).unwrap();
 }
+
+#[test]
+fn teardown_budget_covers_the_configured_drain() {
+    let margin = crate::worker::LIFECYCLE_TIMEOUT;
+    assert_eq!(
+        teardown_budget(Duration::from_secs(1)),
+        Duration::from_secs(1) + margin
+    );
+    // A drain longer than the fixed lifecycle budget still fits.
+    let long = Duration::from_millis(3_600_000);
+    assert!(teardown_budget(long) > long);
+    assert_eq!(teardown_budget(Duration::MAX), Duration::MAX);
+}
