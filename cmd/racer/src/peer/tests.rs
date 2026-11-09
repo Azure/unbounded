@@ -3522,7 +3522,7 @@ fn page_timing_duration_conversion_saturates_and_reversed_clock_is_zero() {
 mod adaptive {
     use crate::peer::*;
     #[test]
-    fn hedges_require_spare_capacity_and_no_local_or_peer_pressure() {
+    fn hedges_require_spare_capacity_and_no_peer_pressure() {
         let clock = racer_io::SimClock::new(905);
         let sim_env = clock.ctx(0);
         let sim_ctx = sim_env.clone();
@@ -3538,11 +3538,14 @@ mod adaptive {
         .unwrap();
         let node = NodeId("a".into());
         assert!(owner.hedge_available(&node));
+        let other = NodeId("b".into());
+        let held: Vec<_> = (0..2).map(|_| owner.acquire(&other).unwrap()).collect();
+        assert!(owner.hedge_available(&node));
         let permit = owner.acquire(&node).unwrap();
-        clock.advance(BACKOFF);
-        permit.observe(Outcome::LocalPressure);
+        // A hedge needs a slot beyond the next one under the total cap.
         assert!(!owner.hedge_available(&node));
-        drop(permit);
+        drop((permit, held));
+        assert!(owner.hedge_available(&node));
         let owner = AdaptivePeers::new(
             Config {
                 total: 4,
@@ -3597,7 +3600,7 @@ mod adaptive {
         drop(held);
     }
     #[test]
-    fn shared_caps_local_pressure_and_completion_fences() {
+    fn shared_caps_and_completion_fences() {
         let metrics = Metrics::default();
         let owner = AdaptivePeers::new(
             Config {
@@ -3615,7 +3618,6 @@ mod adaptive {
         let permit = owner.acquire(&a).unwrap();
         assert!(matches!(worker.acquire(&a), Err(Error::Overloaded)));
         let io = permit.clone();
-        permit.observe(Outcome::LocalPressure);
         drop(permit);
         assert!(matches!(worker.acquire(&a), Err(Error::Overloaded)));
         let second = worker.acquire(&b).unwrap();
@@ -3627,7 +3629,6 @@ mod adaptive {
         drop((io, second));
         assert_eq!(metrics.gauge(Gauge::PeerExchanges), 0);
         assert!(owner.available(&a));
-        assert_eq!(metrics.count(Event::PeerLocalPressure), 1);
         assert_eq!(metrics.count(Event::PeerLinkFailure), 0);
     }
     #[test]
@@ -3667,39 +3668,6 @@ mod adaptive {
         let held: Vec<_> = (0..3).map(|_| owner.acquire(&node).unwrap()).collect();
         assert!(matches!(owner.acquire(&node), Err(Error::Overloaded)));
         drop(held);
-    }
-    /// A collapsed node limit recovers by verified completions, about one slot
-    /// per round trip, without waiting for the recovery interval.
-    #[test]
-    fn collapsed_limit_recovers_with_completions_not_wall_time() {
-        let clock = racer_io::SimClock::new(781);
-        let sim_ctx = clock.ctx(0);
-        let metrics = Metrics::default();
-        let owner = AdaptivePeers::new(
-            Config {
-                total: 512,
-                per_peer: 512,
-                ..Default::default()
-            },
-            metrics.clone(),
-            sim_ctx.clock.clone(),
-        )
-        .unwrap();
-        let node = NodeId("a".into());
-        // Collapse 512 to 8 with rate-limited pressure halvings.
-        let permit = owner.acquire(&node).unwrap();
-        for _ in 0..6 {
-            clock.advance(BACKOFF);
-            permit.observe(Outcome::LocalPressure);
-        }
-        drop(permit);
-        assert_eq!(metrics.gauge(Gauge::PeerAdmissionLimit), 8);
-        // Sum of 8..512 completions restores the full limit with time frozen.
-        let completions: usize = (8..512).sum();
-        for _ in 0..completions {
-            owner.acquire(&node).unwrap().observe(Outcome::Verified);
-        }
-        assert_eq!(metrics.gauge(Gauge::PeerAdmissionLimit), 512);
     }
     #[test]
     fn state_capacity_never_evicts_live_permits_and_ages_retired_entries() {
@@ -3742,42 +3710,6 @@ mod adaptive {
             Err(Error::Overloaded)
         ));
         drop(held);
-    }
-    #[test]
-    fn local_pressure_shrinks_node_limit_without_revoking_work_or_blame() {
-        let clock = racer_io::SimClock::new(781);
-        let sim_env = clock.ctx(0);
-        let sim_ctx = sim_env.clone();
-        let metrics = Metrics::default();
-        let owner = AdaptivePeers::new(
-            Config {
-                total: 4,
-                per_peer: 4,
-                ..Default::default()
-            },
-            metrics.clone(),
-            sim_ctx.clock.clone(),
-        )
-        .unwrap();
-        let node = NodeId("a".into());
-        let permits: Vec<_> = (0..4).map(|_| owner.acquire(&node).unwrap()).collect();
-        clock.advance(BACKOFF);
-        for permit in &permits {
-            permit.observe(Outcome::LocalPressure);
-        }
-        assert_eq!(metrics.gauge(Gauge::PeerAdmissionLimit), 2);
-        assert_eq!(metrics.gauge(Gauge::PeerExchanges), 4);
-        assert!(owner.available(&node));
-        assert_eq!(metrics.count(Event::PeerLinkFailure), 0);
-        assert!(matches!(
-            owner.acquire(&NodeId("other".into())),
-            Err(Error::Overloaded)
-        ));
-        clock.advance(RECOVERY);
-        permits[0].observe(Outcome::Verified);
-        assert_eq!(metrics.gauge(Gauge::PeerAdmissionLimit), 3);
-        drop(permits);
-        assert_eq!(metrics.gauge(Gauge::PeerExchanges), 0);
     }
 }
 mod explicit_clock {

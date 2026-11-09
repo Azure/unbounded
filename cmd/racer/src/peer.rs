@@ -110,8 +110,8 @@ impl Drop for PageTiming<'_> {
 pub struct Config {
     pub total: usize,
     pub per_peer: usize,
-    /// Longest time between one-slot recoveries of a reduced limit after
-    /// verified successes. A limit also recovers one slot per `limit`
+    /// Longest time between one-slot recoveries of a reduced per-peer limit
+    /// after verified successes. A limit also recovers one slot per `limit`
     /// verified completions, about one per round trip.
     pub recovery: Duration,
 }
@@ -165,7 +165,6 @@ impl flow_control::AdaptiveObserver for AdmissionObserver {
                 AdmissionEvent::CircuitRejected => Event::PeerCircuitRejected,
                 AdmissionEvent::Accepted => Event::PeerAdmissionAccepted,
                 AdmissionEvent::Probe => Event::PeerProbe,
-                AdmissionEvent::LocalPressure => Event::PeerLocalPressure,
                 AdmissionEvent::Verified => Event::PeerVerified,
                 AdmissionEvent::LinkFailure => Event::PeerLinkFailure,
             },
@@ -174,9 +173,6 @@ impl flow_control::AdaptiveObserver for AdmissionObserver {
     }
     fn active(&self, active: usize) {
         self.0.set_gauge(Gauge::PeerExchanges, active as u64);
-    }
-    fn limit(&self, limit: usize) {
-        self.0.set_gauge(Gauge::PeerAdmissionLimit, limit as u64);
     }
 }
 impl AdaptivePeers {
@@ -197,6 +193,8 @@ impl AdaptivePeers {
         clock: impl Fn() -> std::time::Instant + Send + Sync + 'static,
     ) -> Result<Arc<Self>> {
         config.validate()?;
+        // The total is a fixed cap, published once for dashboards.
+        metrics.set_gauge(Gauge::PeerAdmissionLimit, config.total as u64);
         Ok(Arc::new(Self {
             shard: metrics.writer_shard(),
             inner: flow_control::Adaptive::new(

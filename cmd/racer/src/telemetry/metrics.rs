@@ -256,7 +256,6 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::PeerProbe => "racer_peer_probes_total",
             Self::PeerVerified => "racer_peer_verified_responses_total",
             Self::PeerLinkFailure => "racer_peer_link_failures_total",
-            Self::PeerLocalPressure => "racer_peer_local_pressure_total",
             Self::Request => "racer_requests_total",
             Self::RequestError => "racer_request_errors_total",
             Self::RequestErrorOverloaded => "racer_request_errors_overloaded_total",

@@ -39,7 +39,7 @@ impl Deadline {
 /// Limits and time intervals for shared adaptive admission.
 #[derive(Clone, Copy)]
 pub struct Config {
-    /// Maximum aggregate active operations before adaptive reductions.
+    /// Fixed cap on aggregate active operations.
     pub total: usize,
 
     /// Maximum active operations for one key before failure reductions.
@@ -48,13 +48,14 @@ pub struct Config {
     /// Maximum retained peer records, including idle backoff history.
     pub capacity: usize,
 
-    /// Peer retry delay and minimum interval between aggregate pressure reductions.
+    /// Peer retry delay after an immediate-link failure or failed probe.
     /// A retry beyond the clock's range keeps the peer circuit open indefinitely.
     pub backoff: Duration,
 
-    /// Longest interval between one-slot verified-success recoveries. A limit
-    /// also recovers one slot per `limit` verified completions since its last
-    /// change, about one per round trip, so recovery scales with throughput.
+    /// Longest interval between one-slot verified-success recoveries of a
+    /// reduced per-key limit. A limit also recovers one slot per `limit`
+    /// verified completions since its last change, about one per round trip,
+    /// so recovery scales with throughput.
     pub recovery: Duration,
 
     /// Minimum idle age before an eligible peer record can be replaced.
@@ -69,9 +70,6 @@ pub enum Outcome {
 
     /// A failure attributable to the immediate peer opens its circuit.
     PeerFailure,
-
-    /// Local overload reduces aggregate admission without blaming the peer.
-    LocalPressure,
 
     /// No evidence should affect admission or peer recovery.
     Neutral,
@@ -92,9 +90,6 @@ pub enum Event {
     /// An accepted operation owns the exclusive recovery probe.
     Probe,
 
-    /// Caller-reported local pressure was observed.
-    LocalPressure,
-
     /// Caller-reported verified success was observed.
     Verified,
 
@@ -114,12 +109,9 @@ pub trait Observer {
 
     /// Publish the current active count without reentering the owner.
     fn active(&self, active: usize);
-
-    /// Publish the current adaptive limit without reentering the owner.
-    fn limit(&self, limit: usize);
 }
 
-/// Shared total and per-key admission with generation-fenced peer recovery.
+/// Fixed total and adaptive per-key admission with generation-fenced peer recovery.
 pub struct Adaptive<K, O> {
     config: Config,
 
@@ -133,13 +125,6 @@ pub struct Adaptive<K, O> {
 /// Mutex-protected aggregate admission and bounded peer records.
 struct State<K> {
     active: usize,
-
-    limit: usize,
-
-    /// Verified completions since the limit last changed.
-    credit: usize,
-
-    updated: Instant,
 
     peers: BTreeMap<K, Peer>,
 }
@@ -179,7 +164,7 @@ pub struct Permit<K: Ord + Clone, O: Observer> {
 }
 
 impl<K: Ord + Clone, O: Observer> Adaptive<K, O> {
-    /// Validate positive limits and publish the initial aggregate ceiling.
+    /// Validate positive limits.
     pub fn new(
         config: Config,
         observer: O,
@@ -192,27 +177,22 @@ impl<K: Ord + Clone, O: Observer> Adaptive<K, O> {
         {
             return Err(Error::InvalidInput);
         }
-        observer.limit(config.total);
-        let updated = now();
         Ok(Arc::new(Self {
             config,
             observer,
             now: Box::new(now),
             state: Mutex::new(State {
                 active: 0,
-                limit: config.total,
-                credit: 0,
-                updated,
                 peers: BTreeMap::new(),
             }),
         }))
     }
 
-    /// Hint whether fully recovered limits leave spare speculative capacity.
+    /// Hint whether the total cap and a fully recovered per-key limit leave
+    /// spare speculative capacity.
     pub fn hedge_available(&self, key: &K) -> bool {
         self.state.lock().is_ok_and(|s| {
-            s.limit == self.config.total
-                && s.active.saturating_add(1) < s.limit
+            s.active.saturating_add(1) < self.config.total
                 && s.peers.get(key).is_none_or(|p| {
                     p.retry.is_none()
                         && !p.probe
@@ -243,7 +223,7 @@ impl<K: Ord + Clone, O: Observer> Adaptive<K, O> {
         // Drop retired keys after the guard on every exit, since Drop may reenter.
         let retired;
         let mut state = self.state.lock().map_err(|_| Error::Unavailable)?;
-        if state.active >= state.limit {
+        if state.active >= self.config.total {
             self.observer.event_on(shard, Event::Rejected);
             return Err(Error::Overloaded);
         }
@@ -314,33 +294,6 @@ impl<K: Ord + Clone, O: Observer> Permit<K, O> {
             return;
         };
         let config = self.owner.config;
-        if outcome == Outcome::LocalPressure {
-            self.owner
-                .observer
-                .event_on(self.shard, Event::LocalPressure);
-            if now.saturating_duration_since(state.updated) >= config.backoff {
-                state.limit = (state.limit / 2).max(1);
-                state.credit = 0;
-                state.updated = now;
-                self.owner.observer.limit(state.limit);
-            }
-            return;
-        }
-        if outcome == Outcome::Verified && state.limit < config.total {
-            state.credit = state.credit.saturating_add(1);
-            if recovers(
-                state.credit,
-                state.limit,
-                state.updated,
-                now,
-                config.recovery,
-            ) {
-                state.limit = state.limit.saturating_add(1).min(config.total);
-                state.credit = 0;
-                state.updated = now;
-                self.owner.observer.limit(state.limit);
-            }
-        }
         let peer = state
             .peers
             .get_mut(&self.key)
@@ -348,7 +301,6 @@ impl<K: Ord + Clone, O: Observer> Permit<K, O> {
         let event = match outcome {
             Outcome::Verified => Event::Verified,
             Outcome::PeerFailure => Event::LinkFailure,
-            Outcome::LocalPressure => Event::LocalPressure,
             Outcome::Neutral => return,
         };
         self.owner.observer.event_on(self.shard, event);
@@ -378,7 +330,7 @@ impl<K: Ord + Clone, O: Observer> Permit<K, O> {
                     peer.updated = now;
                 }
             }
-            Outcome::LocalPressure | Outcome::Neutral => {}
+            Outcome::Neutral => {}
         }
     }
 }
@@ -1902,8 +1854,6 @@ mod tests {
         events: Mutex<Vec<Event>>,
 
         active: Mutex<usize>,
-
-        limit: Mutex<usize>,
     }
 
     impl Observer for Counts {
@@ -1915,11 +1865,6 @@ mod tests {
         /// Save the latest active-work gauge.
         fn active(&self, active: usize) {
             *self.active.lock().unwrap() = active;
-        }
-
-        /// Save the latest admission-limit gauge.
-        fn limit(&self, limit: usize) {
-            *self.limit.lock().unwrap() = limit;
         }
     }
 
@@ -2002,14 +1947,12 @@ mod tests {
         )
         .unwrap();
         let work = owner.acquire(&1).unwrap();
-        work.observe(Outcome::LocalPressure);
         work.observe(Outcome::PeerFailure);
         drop(work);
         let probe = owner.acquire(&1).unwrap();
         probe.observe(Outcome::Verified);
         drop(probe);
         assert!(owner.available(&1));
-        assert_eq!(owner.state.lock().unwrap().limit, config().total / 2);
         assert_eq!(
             owner.state.lock().unwrap().peers[&1].limit,
             config().per_key / 2
@@ -2138,7 +2081,7 @@ mod tests {
 
     /// Stale success cannot undo failure and shared fences retain active work.
     #[test]
-    fn fences_generation_exclusivity_and_local_pressure() {
+    fn fences_generation_exclusivity() {
         let owner = Adaptive::new(config(), Counts::default(), Instant::now).unwrap();
         assert!(owner.hedge_available(&1));
         let old = owner.acquire(&1).unwrap();
@@ -2158,14 +2101,6 @@ mod tests {
         assert!(!owner.available(&1));
         drop(probe);
         assert!(owner.available(&1));
-        let work = owner.acquire(&2).unwrap();
-        owner.state.lock().unwrap().updated = Instant::now() - config().backoff;
-        work.observe(Outcome::LocalPressure);
-        assert_eq!(*owner.observer.limit.lock().unwrap(), 2);
-        assert!(owner.available(&2));
-        owner.state.lock().unwrap().updated = Instant::now() - config().recovery;
-        work.observe(Outcome::Verified);
-        assert_eq!(*owner.observer.limit.lock().unwrap(), 3);
     }
 
     /// Failed probes cannot clear retry, even at the last generation.
@@ -2246,51 +2181,10 @@ mod tests {
         assert_eq!(owner.state.lock().unwrap().peers[&1].limit, 3);
     }
 
-    /// Success at the ceiling must not delay an eligible pressure reduction.
+    /// With a frozen clock, a reduced per-key limit recovers one slot per
+    /// `limit` verified completions and stops at its ceiling.
     #[test]
-    fn recovery_at_ceiling_preserves_pressure_eligibility() {
-        fn now() -> Instant {
-            static NOW: OnceLock<Instant> = OnceLock::new();
-            *NOW.get_or_init(Instant::now)
-        }
-
-        for recovery in [Duration::ZERO, config().recovery] {
-            let config = Config {
-                recovery,
-                ..config()
-            };
-            let owner = Adaptive::new(config, Counts::default(), now).unwrap();
-            let work = owner.acquire(&1).unwrap();
-            let updated = now() - config.backoff.max(config.recovery);
-            owner.state.lock().unwrap().updated = updated;
-
-            for _ in 0..2 {
-                work.observe(Outcome::Verified);
-                let state = owner.state.lock().unwrap();
-                assert_eq!(state.limit, config.total);
-                assert_eq!(state.updated, updated);
-            }
-            work.observe(Outcome::LocalPressure);
-            assert_eq!(*owner.observer.limit.lock().unwrap(), config.total / 2);
-            assert_eq!(owner.state.lock().unwrap().updated, now());
-            assert_eq!(owner.state.lock().unwrap().peers[&1].limit, config.per_key);
-            assert!(owner.available(&1));
-            assert_eq!(
-                *owner.observer.events.lock().unwrap(),
-                [
-                    Event::Accepted,
-                    Event::Verified,
-                    Event::Verified,
-                    Event::LocalPressure,
-                ]
-            );
-        }
-    }
-
-    /// With a frozen clock, a reduced limit recovers one slot per `limit`
-    /// verified completions, for both the total and per-key limits.
-    #[test]
-    fn verified_completions_recover_one_slot_per_limit() {
+    fn verified_completions_recover_one_peer_slot_per_limit() {
         fn now() -> Instant {
             static NOW: OnceLock<Instant> = OnceLock::new();
             *NOW.get_or_init(Instant::now)
@@ -2305,66 +2199,25 @@ mod tests {
         let work = owner.acquire(&1).unwrap();
         {
             let mut state = owner.state.lock().unwrap();
-            state.limit = 4;
-            state.updated = now();
             let peer = state.peers.get_mut(&1).unwrap();
             peer.limit = 2;
             peer.updated = now();
         }
-        for _ in 0..3 {
-            work.observe(Outcome::Verified);
-        }
-        assert_eq!(owner.state.lock().unwrap().limit, 4);
         work.observe(Outcome::Verified);
-        assert_eq!(*owner.observer.limit.lock().unwrap(), 5);
+        assert_eq!(owner.state.lock().unwrap().peers[&1].limit, 2);
+        work.observe(Outcome::Verified);
         assert_eq!(owner.state.lock().unwrap().peers[&1].limit, 3);
-        // Credit restarts at each change: five more completions add one slot.
-        for _ in 0..4 {
+        // Credit restarts at each change: three more completions add one slot.
+        for _ in 0..2 {
             work.observe(Outcome::Verified);
         }
-        assert_eq!(owner.state.lock().unwrap().limit, 5);
+        assert_eq!(owner.state.lock().unwrap().peers[&1].limit, 3);
         work.observe(Outcome::Verified);
-        assert_eq!(owner.state.lock().unwrap().limit, 6);
-        // Each limit stops at its ceiling.
+        assert_eq!(owner.state.lock().unwrap().peers[&1].limit, 4);
         for _ in 0..10_000 {
             work.observe(Outcome::Verified);
         }
-        assert_eq!(owner.state.lock().unwrap().limit, config.total);
         assert_eq!(owner.state.lock().unwrap().peers[&1].limit, config.per_key);
-        // A reduction discards accumulated credit.
-        owner.state.lock().unwrap().updated = now() - config.backoff;
-        work.observe(Outcome::LocalPressure);
-        assert_eq!(owner.state.lock().unwrap().limit, config.total / 2);
-        assert_eq!(owner.state.lock().unwrap().credit, 0);
-    }
-
-    /// Restoring the final slot still starts backoff and rate-limits pressure.
-    #[test]
-    fn recovery_restoring_slot_advances_pressure_backoff() {
-        fn now() -> Instant {
-            static NOW: OnceLock<Instant> = OnceLock::new();
-            *NOW.get_or_init(Instant::now)
-        }
-
-        let config = config();
-        let owner = Adaptive::new(config, Counts::default(), now).unwrap();
-        let work = owner.acquire(&1).unwrap();
-        {
-            let mut state = owner.state.lock().unwrap();
-            state.limit = config.total - 1;
-            state.updated = now() - config.recovery;
-        }
-        work.observe(Outcome::Verified);
-        assert_eq!(*owner.observer.limit.lock().unwrap(), config.total);
-        assert_eq!(owner.state.lock().unwrap().updated, now());
-        work.observe(Outcome::LocalPressure);
-        assert_eq!(*owner.observer.limit.lock().unwrap(), config.total);
-
-        owner.state.lock().unwrap().updated = now() - config.backoff;
-        work.observe(Outcome::LocalPressure);
-        assert_eq!(*owner.observer.limit.lock().unwrap(), config.total / 2);
-        work.observe(Outcome::LocalPressure);
-        assert_eq!(*owner.observer.limit.lock().unwrap(), config.total / 2);
     }
 
     /// Idle age and recovery use independent clocks without wall-clock sleeps.
@@ -2610,7 +2463,6 @@ mod tests {
         .unwrap();
         let permit = owner.acquire(&()).unwrap();
         permit.observe(Outcome::Verified);
-        assert_eq!(*owner.observer.limit.lock().unwrap(), usize::MAX);
         assert_eq!(owner.state.lock().unwrap().peers[&()].limit, usize::MAX);
     }
 }
