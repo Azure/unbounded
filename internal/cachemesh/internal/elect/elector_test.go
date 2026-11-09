@@ -197,12 +197,6 @@ func TestTopCandidates(t *testing.T) {
 		if !slices.Equal(TopCandidates(seed, perm, n), got) {
 			t.Fatalf("iter %d: order dependent", iter)
 		}
-
-		for _, k := range keys {
-			if IsTopCandidate(seed, k, keys, n) != slices.Contains(got, k) {
-				t.Fatalf("iter %d: IsTopCandidate mismatch", iter)
-			}
-		}
 	}
 }
 

@@ -938,9 +938,3 @@ func TopCandidates(leaseSeed uint64, keys []uint64, n int) []uint64 {
 
 	return out
 }
-
-// IsTopCandidate reports whether self is among TopCandidates(leaseSeed,
-// keys, n).
-func IsTopCandidate(leaseSeed, self uint64, keys []uint64, n int) bool {
-	return slices.Contains(TopCandidates(leaseSeed, keys, n), self)
-}
