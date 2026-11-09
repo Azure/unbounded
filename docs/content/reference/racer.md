@@ -1099,7 +1099,8 @@ Out-of-range values fail startup.
 
 The prefetch limits are listed under [environment variables](#environment-variables).
 
-The old `RACER_WARM_*` settings are no longer used.
+The old `RACER_WARM_*` settings never had an effect. The operator removes them
+from `racer-settings` on upgrade.
 
 #### Prefetch metrics
 
@@ -1718,12 +1719,23 @@ override for host networking and set `RACER_NVIDIA` in
 not silently discard them or stop the old controller first.
 
 The operator writes `racer-settings` only when it is absent, so upgrades keep
-existing values. New installs seed `RACER_SEGMENT_BYTES` at 1 GiB and
+existing values. It rewrites retired keys in place: a renamed key, such as
+`RACER_SLAB_BYTES`, moves to its replacement, such as
+`RACER_SLAB_BYTES_PER_WORKER`, with the same value, because the old budget keys
+were already per-worker amounts. If the replacement is already set to a
+different value, the operator reports the conflict and keeps the current
+DaemonSet until you remove one of them. It removes the `RACER_WARM_*` keys and
+reports `RACER_PEER_PORT`, which you replace with the port of
+`RACER_PEER_LISTEN`. The DaemonSet rolls only after the rewritten ConfigMap is
+saved.
+
+New installs seed `RACER_SEGMENT_BYTES` at 1 GiB and
 `RACER_SLAB_BYTES_PER_WORKER` at 4 GiB; earlier releases seeded 64 MiB and
-1 GiB. A 64 MiB segment holds only three 16 MiB page records, wasting about a
-quarter of each device and leaving a small free-segment reserve. To adopt the
-new geometry on an existing install, edit both keys in `racer-settings`; this
-changes storage geometry and starts a cold cache. Keys absent from
+1 GiB, and an upgrade keeps those values. A 64 MiB segment holds only three
+16 MiB page records, wasting about a quarter of each device and leaving a small
+free-segment reserve. To adopt the new geometry on an existing install, edit
+both keys in `racer-settings`; this changes storage geometry and starts a cold
+cache. Keys absent from
 `racer-settings` take the dataplane defaults of the new release.
 
 Expect a cold cache after changing device layout,
