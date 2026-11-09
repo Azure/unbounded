@@ -203,6 +203,20 @@ func runAgent(args []string) error {
 		}),
 		transfer.WithMaxConcurrentServes(c.TransferMaxConcurrentServes),
 	}
+
+	// Optional cachemesh path (off by default). Its control and chunk
+	// endpoints share the transfer listener.
+	var meshAgent *cachemeshAgent
+
+	if c.Cachemesh.Enabled {
+		meshAgent, err = newCachemeshAgent(c, mirrorOriginClient, reg, logger)
+		if err != nil {
+			return err
+		}
+
+		transferOpts = append(transferOpts, transfer.WithExtraRoutes(meshAgent.routes))
+	}
+
 	transferSrv := transfer.New(cstore, transferOpts...)
 
 	transferStop, err := transferSrv.ListenAndServe(c.TransferListen)
@@ -211,6 +225,10 @@ func runAgent(args []string) error {
 	}
 
 	logger.Info("transfer endpoint listening", slog.String("addr", c.TransferListen))
+
+	if meshAgent != nil {
+		meshAgent.start()
+	}
 
 	selfHolder := chairSelfHolder(c, disco)
 
@@ -479,7 +497,10 @@ func runAgent(args []string) error {
 		logger.Info("Lease-chair cold-start orchestrator disabled (no Kubernetes namespace configured)")
 	}
 
-	if layerPrefetcher == nil {
+	if layerPrefetcher == nil || meshAgent != nil {
+		// With cachemesh, layers move through the mesh; chair-seeded
+		// prefetch would add origin pulls of its own. Keep only the
+		// layer-progress tracking.
 		layerPrefetcher = newLayerPrefetcher(nil, cstore, logger, layerProgress.observeManifest)
 	}
 
@@ -640,6 +661,7 @@ func runAgent(args []string) error {
 		// silently breaking the cache-hit 'one origin pull per digest'
 		// invariant for the duration of the rollout window.
 		mirror.WithStartupReadinessGate(),
+		cachemeshMirrorOption(meshAgent),
 	)
 
 	mirrorStop, err := mirrorSrv.ListenAndServe(c.MirrorListen)
@@ -898,6 +920,12 @@ func runAgent(args []string) error {
 		logger.Error("metrics endpoint died", slog.Any("err", err))
 	case err := <-cdsubDone:
 		logger.Error("cdsub loop exited unexpectedly", slog.Any("err", err))
+	}
+
+	// Drain the cachemesh member first, while the transfer listener still
+	// serves its chunks to the members taking over its partitions.
+	if meshAgent != nil {
+		meshAgent.stop()
 	}
 
 	// Graceful shutdown . See agent_shutdown.go for the
