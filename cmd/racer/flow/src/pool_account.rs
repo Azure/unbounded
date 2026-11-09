@@ -2,10 +2,9 @@
 //!
 //! [`QuotaPoolAccount`] adapts aggregate quota counters to
 //! [`page_alloc::buf::PoolAccount`], so idle bytes held by a worker's
-//! [`page_alloc::buf::Pool`] count against a dedicated class (the planned
-//! `ResourceClass::Pool`) that admission sees. It replaced the removed flow
-//! recycler's retained-bytes accounting. Charging is
-//! lock-free and safe from any thread that returns a buffer.
+//! [`page_alloc::buf::Pool`] count against a dedicated class (racer uses
+//! `ResourceClass::Pool`) that admission sees. Charging is lock-free and safe
+//! from any thread that returns a buffer.
 
 use crate::{Policy, SharedQuotas};
 

@@ -176,13 +176,17 @@ impl AffinityPlan {
                     })?
                     .into_iter()
                     .enumerate()
-                    .map(|(index, placement)| WorkerPair {
-                        worker: WorkerId(index as u16),
-                        io: placement.lane,
-                        crypto: placement.helper,
-                        nic: placement.nic,
+                    .map(|(index, placement)| {
+                        Ok(WorkerPair {
+                            worker: WorkerId(
+                                u16::try_from(index).map_err(|_| Error::InvalidConfiguration)?,
+                            ),
+                            io: placement.lane,
+                            crypto: placement.helper,
+                            nic: placement.nic,
+                        })
                     })
-                    .collect();
+                    .collect::<Result<_>>()?;
             return Ok(Self {
                 pairs,
                 max_threads,

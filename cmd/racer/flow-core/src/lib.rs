@@ -1,11 +1,14 @@
 //! Pure flow-control mechanisms: keyed coalescing, flight lifecycle state, adaptive admission,
 //! endpoint circuits, hedges, FIFO bookkeeping, progress prediction, and subscription fanout.
 //!
-//! `racer-core` re-exports this crate as `racer_core::flow`; `flow-control` re-exports it under the
-//! historical paths and adds the IO-bound parts (charged buffers, quotas over `page-alloc`, kernel
-//! pipes). It is a separate crate so `racer-core` can use these mechanisms without depending on
-//! `flow-control` and its IO dependencies (`racer-io`, `page-alloc`). No dependency cycle requires
-//! the split today, so it could fold into `racer-core` if `flow-control` depended on `racer-core`.
+//! `racer-core` re-exports this crate as `racer_core::flow`; `flow-control` re-exports it and adds
+//! the IO-bound parts (charged buffers, quotas over `page-alloc`, kernel pipes).
+//!
+//! The purity fence (`hack/scripts/racer-purity-graph.py`, `core/tests/purity.rs`) forbids pure
+//! crates such as `racer-core` from depending on IO crates such as `flow-control`, so these shared
+//! mechanisms cannot live in `flow-control`. They could instead live in `racer-core` with
+//! `flow-control` depending on `racer-core`; this separate pure crate keeps `flow-control` from
+//! pulling in all of `racer-core` for them.
 //!
 //! Callers pass time in; the crate never reads clocks, spawns threads, or reads OS randomness.
 

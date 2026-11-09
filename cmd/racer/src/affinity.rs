@@ -230,8 +230,9 @@ impl std::error::Error for PlacementError {}
 
 /// Exact roles without sharing CPUs, spread over NIC-local NUMA nodes (the
 /// first node when no NIC locality is known, then further nodes in preference
-/// order while the roles do not fit) in proportion to each node's eligible CPUs. Every lane's helper is on the lane's node, and spare
-/// CPUs are left on every node for the RDMA owner when capacity allows.
+/// order while the roles do not fit) in proportion to each node's eligible CPUs. Every lane's helper is on the lane's node.
+/// No CPU is reserved for the RDMA owner; the caller picks a leftover CPU
+/// when one exists and otherwise shares a helper's CPU.
 pub fn place_exact(
     mut topology: EffectiveTopology,
     max_threads: usize,
@@ -265,8 +266,10 @@ pub fn place_exact(
         && u128::from(q.quota.get()) / u128::from(q.period.get()) < total as u128
     {
         return fail(format!(
-            "{total} pinned threads exceed the cgroup CPU quota {}/{}",
-            q.quota, q.period
+            "{total} pinned threads exceed the cgroup CPU quota {}/{} ({} whole CPUs)",
+            q.quota,
+            q.period,
+            u128::from(q.quota.get()) / u128::from(q.period.get())
         ));
     }
     topology.cpus.sort_by_key(|cpu| cpu.cpu);
