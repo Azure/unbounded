@@ -627,6 +627,57 @@ containerd alone (gantry wrote 0 bytes).
   the content API) was not changed; it does not occur in these runs.
 - The runs used `verifyDigest: false`, like the earlier campaigns.
 
+### Re-verification on merged code
+
+On 2026-11-09 the merged code was rebuilt as `gantry:final1` and rerun with
+the same procedure, limits, and image shape: three 142-node cachemesh runs
+(`fin-cm-r1..r3`), a two-wave run (`fin-wave-w1`, `fin-wave-w2`, 71 nodes
+each, 3 minutes apart), and two same-day default-mode runs (`fin-def-r1`,
+`fin-def-r2`). Every run used a fresh, never-pulled image. All nodes
+succeeded in every run.
+
+| run | mode | nodes | p50 | p90 | p99 | max / makespan | origin egress |
+|---|---|---|---|---|---|---|---|
+| fin-cm-r1 | cachemesh | 142 | 91.9 | 96.2 | 98.5 | 99.1 | 1.00x |
+| fin-cm-r2 | cachemesh | 142 | 92.5 | 95.6 | 99.6 | 101.3 | 1.00x |
+| fin-cm-r3 | cachemesh | 142 | 92.1 | 95.7 | 97.9 | 98.0 | 1.00x |
+| fin-wave-w1 | cachemesh, wave 1 | 71 | 91.9 | 93.8 | 96.7 | 96.7 | 1.00x |
+| fin-wave-w2 | cachemesh, wave 2 | 71 | 86.8 | 88.7 | 93.5 | 93.5 | 0.00x (1 origin fill) |
+| fin-def-r1 | default | 142 | 248.4 | 268.9 | 323.4 | 334.4 | 8.01x |
+| fin-def-r2 | default | 142 | 248.2 | 264.4 | 325.9 | 335.6 | 8.01x |
+
+| metric (p50 across nodes unless noted) | cachemesh fin-cm-r1..r3 | earlier cd2 runs | default fin-def-r1..r2 |
+|---|---|---|---|
+| gantry RSS peak | 2534-2542MiB | 2536-2540MiB | 128-131MiB |
+| gantry working set peak | 2933-2967MiB | 2935-2962MiB | 85-88MiB |
+| gantry working set at end of tail | 257-264MiB | 259-266MiB | 83MiB |
+| gantry CPU avg / peak p99 | 0.8 / 4.9-5.3 cores | 0.8 / 5.1-5.3 cores | 0.4 / 8.5-8.7 cores |
+| gantry cgroup disk write, max node | 0.1MiB | 0.0MiB | 0.0MiB |
+| gantry cgroup disk read | 0.0MiB | 0.0MiB | 0.0MiB |
+| NIC rx avg | 472-477MB/s | 474-475MB/s | 174MB/s |
+| node disk write (incl. 15s tail) | 64.1-64.2GB | 64.2GB | 64.0GB |
+| origin chunk fills | 646-647 | 646 | n/a |
+
+- The merged code reproduces the cd2 results: p50 91.9-92.5s (cd2
+  91.8-92.3s), p99 97.9-99.6s (cd2 97.3-97.6s), makespan 98.0-101.3s (cd2
+  97.8-101.8s), 1.00x origin egress. The direct single-node pull is 94.7s.
+- Default mode is slower than in the earlier campaigns (p50 248s against
+  235-247s, p99 323-326s against 306-311s, makespan 334-336s against
+  313-317s) with the same 8.01x egress. Cachemesh is 2.7x faster on p50 and
+  3.3x on makespan against the same-day baseline.
+- Wave 2 matched the earlier result: 0.00x egress (one origin fill), 322
+  holder reads ok and 2 failed, p50 86.8s.
+- No extra copies: free disk on `/` went from 255.5-255.6GB after
+  `clean.sh` to 169.6GB after each pull on every node that reports nvme0n1
+  (86GB: content store blob plus snapshot), the same as default mode. On
+  w0000, w0070 and w0149 after `fin-cm-r1`, `/var/lib/gantry` held only
+  `libp2p/identity.key` (68 bytes), each of the 4 layer blobs existed as
+  exactly one file on the root filesystem (in the containerd content
+  store), and no other file over 5GB existed outside the content store and
+  snapshots.
+- Tooling anomaly, not a gantry bug: on w0139 the OS disk is `nvme1n1`, not
+  `nvme0n1`, so `node.sh` reports 0 disk writes and about 174GB free for it.
+
 ## Cluster end state
 
 - The gantry release is uninstalled, and the `gantry-system` namespace,
