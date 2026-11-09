@@ -131,8 +131,8 @@ func (c *Cluster) member(a string) (uint32, bool) {
 		return 0, false
 	}
 
-	v, err := strconv.Atoi(a[1:])
-	if err != nil || v < 0 || v >= len(c.members) {
+	v, err := strconv.ParseUint(a[1:], 10, 32)
+	if err != nil || v >= uint64(len(c.members)) {
 		return 0, false
 	}
 
