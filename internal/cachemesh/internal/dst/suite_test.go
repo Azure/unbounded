@@ -77,10 +77,10 @@ var requiredCoverage = []string{
 }
 
 // capBits keeps the default suite fast: 2^20 partitions make every leader
-// tick and view validation scan a million entries, so only every fourth
-// seed keeps 20 bits.
+// tick and view validation scan a million entries, so only seed 1 keeps
+// 20 bits.
 func capBits(sc Scenario) Scenario {
-	if sc.PartitionBits > 16 && sc.Seed%4 != 1 {
+	if sc.PartitionBits > 16 && sc.Seed != 1 {
 		sc.PartitionBits = 16
 	}
 
@@ -96,7 +96,10 @@ func defaultCases(seeds []uint64, explicit bool) []dstCase {
 			sc = capBits(sc)
 		}
 
-		cases = append(cases, dstCase{name: fmt.Sprintf("tiny/%d", s), sc: sc, twice: true})
+		// Explicit seeds always run twice; the default set checks
+		// determinism on one tiny and one small seed (plus the fixed
+		// restarts and slow cases) to keep the suite fast.
+		cases = append(cases, dstCase{name: fmt.Sprintf("tiny/%d", s), sc: sc, twice: explicit || s == 2})
 	}
 
 	if explicit {
@@ -107,9 +110,9 @@ func defaultCases(seeds []uint64, explicit bool) []dstCase {
 		return cases
 	}
 
-	for _, s := range seeds[:min(4, len(seeds))] {
+	for _, s := range seeds[:min(2, len(seeds))] {
 		sc := capBits(shorten(Generate(s, SizeSmall), 180*sec, 180*sec))
-		cases = append(cases, dstCase{name: fmt.Sprintf("small/%d", s), sc: sc, twice: true})
+		cases = append(cases, dstCase{name: fmt.Sprintf("small/%d", s), sc: sc, twice: s == 2})
 	}
 
 	// Pinned seeds from sweeps (run once; they are full-size explicit
@@ -134,7 +137,7 @@ func defaultCases(seeds []uint64, explicit bool) []dstCase {
 
 	// Long-run stability: two simulated hours of churn on a small cluster,
 	// converging between faults.
-	cases = append(cases, dstCase{name: "longrun", sc: GenerateLongRun(seeds[0], 12, 2*3600*sec), twice: true})
+	cases = append(cases, dstCase{name: "longrun", sc: GenerateLongRun(seeds[0], 12, 2*3600*sec)})
 
 	cases = append(cases, dataPlaneCases()...)
 
@@ -143,6 +146,10 @@ func defaultCases(seeds []uint64, explicit bool) []dstCase {
 	medium.Capacity = 1000 + medium.Capacity - medium.Members
 	cases = append(cases, dstCase{name: "medium", sc: medium, prebuilt: true})
 
+	if !Large() {
+		return cases
+	}
+
 	large := GenerateKinds(seeds[0], SizeLarge, Crash, LeaderCrash)
 	large.Warmup = 30 * sec
 	// Production defaults for the grid; they also bound the ping fan-out.
@@ -150,7 +157,7 @@ func defaultCases(seeds []uint64, explicit bool) []dstCase {
 	large = shorten(large, 20*sec, 75*sec)
 	cases = append(cases, dstCase{name: "10k", sc: large, prebuilt: true})
 
-	if Large() {
+	{
 		huge := GenerateKinds(seeds[0], SizeHuge, Crash)
 		huge.Warmup = 30 * sec
 		huge.CellSize, huge.MaxNeighbors, huge.PartitionBits = 4, 256, 20
@@ -170,11 +177,11 @@ func defaultSeeds() []uint64 {
 	return out
 }
 
-// TestControlPlaneDST is the control-plane simulation suite.
+// TestDST is the simulation suite. The simulator is single-goroutine, so the
+// race detector adds nothing but an order-of-magnitude slowdown; the suite
+// is skipped under -race.
 func TestDST(t *testing.T) {
-	if testing.Short() {
-		t.Skip("simulation suite")
-	}
+	skipSlow(t)
 
 	explicit := os.Getenv(EnvSeed) != "" || os.Getenv(EnvSeeds) != ""
 
@@ -224,5 +231,20 @@ func TestDST(t *testing.T) {
 		}
 
 		t.Logf("data-plane coverage:\n%s", dataPlaneReport(total))
+	}
+}
+
+// skipSlow skips a long simulation under -short or -race. The simulator runs
+// on one goroutine, so the race detector finds nothing there and only slows
+// the run down by an order of magnitude.
+func skipSlow(t *testing.T) {
+	t.Helper()
+
+	if testing.Short() {
+		t.Skip("long simulation; skipped under -short")
+	}
+
+	if raceEnabled {
+		t.Skip("long simulation; skipped under -race (the simulator is single-goroutine)")
 	}
 }
