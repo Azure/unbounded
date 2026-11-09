@@ -226,8 +226,10 @@ struct Run {
 }
 
 fn fixture() -> (DerivedPageKey, Vec<u8>, Vec<u8>) {
-    let key = [7u8; 32];
-    let nonce = [8u8; 24];
+    let mut key = [0u8; 32];
+    let mut nonce = [0u8; 24];
+    getrandom::getrandom(&mut key).unwrap();
+    getrandom::getrandom(&mut nonce).unwrap();
     let plaintext: Vec<u8> = (0..PAGE).map(|i| (i * 13 + 5) as u8).collect();
     let mut sealed = vec![0; PAGE + TAG_LEN];
     racer_crypto::seal(&key, &nonce, AAD, &plaintext, &mut sealed).unwrap();
