@@ -86,12 +86,16 @@ func WithContentBackend(backend ContentBackend) Option {
 // Server is the mirror HTTP handler.
 type Server struct {
 	contentBackend ContentBackend
-	cfg            *config.Config
-	store          ifaces.LocalContentStore
-	origin         ifaces.OriginPuller
-	auth           AuthenticationChallenger
-	logger         *slog.Logger
-	metrics        metricsHooks
+	// blobFetcher and tagResolver are the optional cachemesh sources;
+	// nil leaves every path unchanged.
+	blobFetcher BlobFetcher
+	tagResolver TagResolver
+	cfg         *config.Config
+	store       ifaces.LocalContentStore
+	origin      ifaces.OriginPuller
+	auth        AuthenticationChallenger
+	logger      *slog.Logger
+	metrics     metricsHooks
 
 	// dependencies - nil-safe. When both dht and peer are set,
 	// the cache miss path tries DHT-discovered providers before origin.
@@ -846,9 +850,15 @@ func (s *Server) handleV2(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !isDigestRef(ref) {
+		// An optional tag resolver (cachemesh) may answer anonymous tag
+		// requests from its TTL cache.
+		if kind == ifaces.KindManifest && s.contentBackend == nil && s.serveTag(w, r, upstream, repo, ref, authorization) {
+			return
+		}
 		// Tag request (the design doc) - fall through to origin via hosts.toml.
 		// 503 (not 404) so containerd retries against the next mirror.
 		w.WriteHeader(http.StatusServiceUnavailable)
+
 		return
 	}
 
@@ -944,6 +954,10 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 	if rangeHeader := r.Header.Get("Range"); rangeHeader != "" {
 		offset, ok := parseOriginRetryRange(rangeHeader)
 		if ok && kind == ifaces.KindBlob {
+			if r.Method == http.MethodGet && s.serveFromFetcher(ctx, w, d, kind, upstream, repo, offset, logger) {
+				return
+			}
+
 			s.serveOriginRange(ctx, w, d, kind, upstream, repo, offset, logger)
 
 			return
@@ -962,6 +976,12 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 	// peer-GET, or bump p2p_origin_pull_total).
 	if r.Method == http.MethodHead {
 		s.serveHeadMiss(ctx, w, d, kind, upstream, repo, logger)
+		return
+	}
+
+	// 1b. Optional cachemesh path. It declines (writing nothing) when it
+	// cannot serve, and the default peer and origin paths run.
+	if s.serveFromFetcher(ctx, w, d, kind, upstream, repo, 0, logger) {
 		return
 	}
 
