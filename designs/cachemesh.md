@@ -70,16 +70,17 @@ binary codec with fuzz tests instead.
 ## Architecture
 
 ```
-          +-------------------------- cachemesh.Mesh ---------------------------+
-          |                                                                     |
- Route ---+--> atomic.Pointer[route.State] --> view, health, epoch (lock-free)   |
- Forward  |                                                                     |
- Observe -+--> route.HealthTracker (atomics)                                         |
-          |                                                                     |
+          +---------------------------- cachemesh.Mesh -----------------------------+
+          |                                                                         |
+ Route ---+--> atomic.Pointer[route.State] --> view, health, epoch (lock-free)      |
+ Forward  |                                                                         |
+ Observe -+--> route.HealthTracker (atomics)                                        |
+          |                                                                         |
  ServeControl --> inbox --> control.Node (single goroutine, deterministic) --> outbox --> ControlTransport
-          |                    |  control.Elector --> LeaseOp --> kubelease.Store  |
-          |                    |  control.Leader (when elected) --> deltas         |
-          +---------------------------------------------------------------------+
+          |                    |  control.Elector --> LeaseOp --> kubelease.Store   |
+          |                    |  control.Leader (when elected) --> deltas          |
+          |                    |  control.Router --> route.State                    |
+          +-------------------------------------------------------------------------+
 ```
 
 The control plane is a deterministic, single-threaded state machine
