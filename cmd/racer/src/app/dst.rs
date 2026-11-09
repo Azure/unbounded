@@ -317,8 +317,13 @@ pub fn run(name: &str, seed: u64, steps: usize) -> std::result::Result<Run, Stri
     };
     let outcome = std::panic::catch_unwind(|| {
         let fixed = |f: fn()| {
+            FIXED_DIGEST.with(|d| *d.borrow_mut() = Some(Sha256::new()));
             f();
-            Sha256::digest(name.as_bytes()).into()
+            FIXED_DIGEST
+                .with(|d| d.borrow_mut().take())
+                .expect("fixed digest is active")
+                .finalize()
+                .into()
         };
         match name {
             "generated" => replay(seed, steps, false).trace.digest(),
@@ -380,6 +385,21 @@ const STRANDED_TURNS: usize = 2_000;
 // Keeps the removed Racer-Ordered header as a compatibility check: the
 // dataplane ignores it.
 const SUBSCRIPTION_FIELDS: &str = "Content-Length: 0\r\nRacer-Page-Credits: 64\r\nRacer-Byte-Credits: 1073741824\r\nRacer-Ordered: 1\r\n";
+
+/// A fixed scenario's digest comes from the harness replay it ran, not its
+/// name, so the racer-dst double run compares real work.
+#[test]
+fn fixed_scenario_digest_reflects_the_replay() {
+    let name = "refused-peer-connect-fallback";
+    let first = run(name, 1, 0).unwrap();
+    assert_eq!(first, run(name, 2, 0).unwrap());
+    assert_ne!(
+        first.digest,
+        <[u8; 32]>::from(Sha256::digest(name.as_bytes()))
+    );
+    assert_ne!(first.digest, <[u8; 32]>::from(Sha256::new().finalize()));
+    assert!(FIXED_DIGEST.with(|d| d.borrow().is_none()));
+}
 
 /// Seeded role entropy replays for the same reads and stays separate between
 /// role streams.
@@ -912,6 +932,25 @@ struct Harness {
     opaque_relay: bool,
     concurrent_layers: bool,
 }
+thread_local! {
+    /// While a fixed scenario runs, every dropped [`Harness`] folds its replay
+    /// digest in here, so the double run compares what actually ran.
+    static FIXED_DIGEST: RefCell<Option<Sha256>> = const { RefCell::new(None) };
+}
+
+impl Drop for Harness {
+    fn drop(&mut self) {
+        let digest = self.coverage.trace.digest();
+        let events = self.coverage.trace.events;
+        FIXED_DIGEST.with(|d| {
+            if let Some(hash) = d.borrow_mut().as_mut() {
+                hash.update(events.to_le_bytes());
+                hash.update(digest);
+            }
+        });
+    }
+}
+
 impl Harness {
     fn new(seed: u64, sim: SimOs, clock: racer_io::SimClock, native: bool) -> Self {
         let key = racer_crypto::SigningKey::from_seed(&[91; 32])
@@ -2260,7 +2299,7 @@ fn replay(seed: u64, steps: usize, native: bool) -> Coverage {
         );
         std::panic::resume_unwind(error);
     }
-    harness.coverage
+    std::mem::take(&mut harness.coverage)
 }
 
 fn member(config: &Config) -> crate::topology::Member {
