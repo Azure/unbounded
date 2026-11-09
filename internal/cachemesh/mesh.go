@@ -607,8 +607,10 @@ func (m *Mesh) leaseLoop(ctx context.Context) {
 // unless Run is active and ErrMessageTooLarge for a message longer than
 // MaxControlMessageSize. Malformed or hostile messages are answered with
 // an encoded rejection, not an error, so the transport just returns the
-// response. from is informational (the sender's own Addr is inside the
-// message). msg is not retained after ServeControl returns, and the
+// response. from is the transport-level source address (for example an
+// HTTP request's RemoteAddr, which carries an ephemeral source port). It is
+// informational only and never dialed: catch-up and seeding use the
+// sender's advertised Addr, which every control message carries. msg is not retained after ServeControl returns, and the
 // response is a new slice owned by the caller.
 func (m *Mesh) ServeControl(_ context.Context, from Endpoint, msg []byte) ([]byte, error) {
 	if !m.running.Load() {

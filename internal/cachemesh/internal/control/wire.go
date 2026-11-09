@@ -6,7 +6,8 @@
 //
 // Every message is a request or a response carried by one
 // ControlTransport.Send round trip. A message is an envelope (format version,
-// kind, sender, sender's view version, digest, epoch, and known leader slot)
+// kind, sender, sender's advertised address, sender's view version, digest,
+// epoch, and known leader slot)
 // followed by a kind-specific body. Deltas and snapshots are opaque byte
 // strings produced by the view package.
 //
@@ -15,6 +16,7 @@
 //	u8      format version (FormatVersion)
 //	u8      kind
 //	ref     From
+//	string  FromAddr
 //	uvarint Version.Term, uvarint Version.Seq
 //	[32]    Digest
 //	uvarint Epoch
@@ -40,7 +42,7 @@ import (
 )
 
 // FormatVersion is the only envelope format this package reads and writes.
-const FormatVersion uint8 = 1
+const FormatVersion uint8 = 2
 
 // Limits enforced by Decode.
 const (
@@ -155,8 +157,12 @@ type MemberRef struct {
 // encoded; the others are ignored by Append and zeroed by Decode.
 type Message struct {
 	// Envelope, present on every kind.
-	Kind       Kind
-	From       MemberRef
+	Kind Kind
+	From MemberRef
+	// FromAddr is the sender's advertised control address (its
+	// Config.Addr), bounded by MaxAddrLen. Receivers dial it, never the
+	// transport-level source address, which may be an ephemeral port.
+	FromAddr   string
 	Version    view.Version
 	Digest     view.Digest
 	Epoch      uint64
@@ -233,7 +239,7 @@ func (m *Message) Detach() {
 		r.ID = cs(r.ID)
 	}
 
-	m.LeaderAddr, m.Addr, m.Zone = cs(m.LeaderAddr), cs(m.Addr), cs(m.Zone)
+	m.FromAddr, m.LeaderAddr, m.Addr, m.Zone = cs(m.FromAddr), cs(m.LeaderAddr), cs(m.Addr), cs(m.Zone)
 	m.Delta, m.Snapshot, m.Inner = cb(m.Delta), cb(m.Snapshot), cb(m.Inner)
 
 	if m.Deltas != nil {
@@ -288,6 +294,7 @@ func appendRef(b []byte, r *MemberRef) []byte {
 func Append(b []byte, m *Message) []byte {
 	b = append(b, FormatVersion, byte(m.Kind))
 	b = appendRef(b, &m.From)
+	b = view.AppendString(b, m.FromAddr)
 	b = view.AppendVersion(b, m.Version)
 	b = append(b, m.Digest[:]...)
 	b = view.AppendUvarint(b, m.Epoch)
@@ -382,6 +389,7 @@ func Decode(b []byte, m *Message) error {
 	m.Kind = k
 	r := view.NewReader(b[2:])
 	readRef(&r, &m.From)
+	m.FromAddr = aliasString(r.Bytes(MaxAddrLen))
 	m.Version = view.ReadVersion(&r)
 	r.Fixed(m.Digest[:])
 	m.Epoch = r.Uvarint()

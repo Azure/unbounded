@@ -712,6 +712,7 @@ func (n *Node) header(m *Message, k Kind) {
 	m.Reset()
 	m.Kind = k
 	m.From = n.self
+	m.FromAddr = n.cfg.Addr
 	m.Version = n.v.Version()
 	m.Digest = n.v.Digest()
 	m.Epoch = n.ep.Current()
@@ -949,9 +950,14 @@ func (n *Node) NoteVersion(now int64, from view.Slot, ver view.Version) {
 
 // --- Inbound ---
 
-// Handle processes one inbound control request from transport address
-// from and returns the encoded response.
-func (n *Node) Handle(now int64, from string, msg []byte) []byte {
+// Handle processes one inbound control request and returns the encoded
+// response. transportFrom is the transport-level source address; it is
+// informational only and never dialed, because it may carry an ephemeral
+// source port (for example an HTTP RemoteAddr). Catch-up and seeding use
+// the sender's advertised address carried in the message (FromAddr).
+func (n *Node) Handle(now int64, transportFrom string, msg []byte) []byte {
+	_ = transportFrom
+
 	n.now = max(n.now, now)
 	now = n.now
 
@@ -959,6 +965,8 @@ func (n *Node) Handle(now int64, from string, msg []byte) []byte {
 	if err := Decode(msg, m); err != nil {
 		return n.nack(ReasonBadRequest)
 	}
+
+	from := m.FromAddr
 
 	if n.cfg.Hooks.OnMessage != nil {
 		n.cfg.Hooks.OnMessage(m.Kind)

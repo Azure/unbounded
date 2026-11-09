@@ -11,6 +11,7 @@ import (
 	"math/rand/v2"
 	"slices"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -1562,5 +1563,84 @@ func TestRouterRefresh(t *testing.T) {
 
 	if r.TakeNote(0) {
 		t.Fatal("TakeNote reported a note that was never recorded")
+	}
+}
+
+// TestCatchUpTargetsAdvertisedAddr is a regression test: an HTTP transport
+// passes RemoteAddr, which carries the sender's ephemeral source port, as
+// the transport-level source. Catch-up after an ahead ping, a missed
+// broadcast, or a higher term must dial the sender's advertised address
+// carried in the message, never the transport-level source.
+func TestCatchUpTargetsAdvertisedAddr(t *testing.T) {
+	const ephemeral = "10.0.0.9:54321"
+
+	for _, tc := range []struct {
+		name string
+		kind Kind
+		ver  view.Version
+	}{
+		{"ahead-ping", KindPing, view.Version{Term: 0, Seq: 7}},
+		{"higher-term-ping", KindPing, view.Version{Term: 5, Seq: 1}},
+		{"higher-term-ack", KindAck, view.Version{Term: 5, Seq: 1}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newCluster(t)
+			a := New(c.cfg(0, nil), rand.New(rand.NewPCG(1, 1)))
+			a.Start(c.now, c.wall())
+			a.Outbox()
+
+			var m Message
+
+			m.Kind = tc.kind
+			m.From = MemberRef{ID: "n1", Incarnation: 1, Slot: view.NoSlot}
+			m.FromAddr = addr(1)
+			m.Version = tc.ver
+			m.LeaderSlot = view.NoSlot
+			a.Handle(c.now+sec, ephemeral, Append(nil, &m))
+
+			var found bool
+
+			for _, call := range a.Outbox() {
+				if call.To == ephemeral {
+					t.Fatalf("dialed transport source %q", call.To)
+				}
+
+				if k, err := PeekKind(call.Msg); err == nil && k == KindCatchUpRequest {
+					if call.To != addr(1) {
+						t.Fatalf("catch-up to %q, want %q", call.To, addr(1))
+					}
+
+					found = true
+				}
+			}
+
+			if !found {
+				t.Fatal("no catch-up request sent")
+			}
+		})
+	}
+}
+
+// TestFromAddrRoundTrip checks the envelope carries the sender's
+// advertised address and that header fills it from Config.Addr.
+func TestFromAddrRoundTrip(t *testing.T) {
+	c := newCluster(t)
+	a := New(c.cfg(0, nil), rand.New(rand.NewPCG(1, 1)))
+
+	var m, got Message
+
+	a.header(&m, KindPing)
+
+	if m.FromAddr != addr(0) {
+		t.Fatalf("header FromAddr %q, want %q", m.FromAddr, addr(0))
+	}
+
+	if err := Decode(Append(nil, &m), &got); err != nil || got.FromAddr != addr(0) {
+		t.Fatalf("round trip: %q, %v", got.FromAddr, err)
+	}
+
+	m.FromAddr = strings.Repeat("x", MaxAddrLen+1)
+	if err := m.Validate(); err == nil {
+		t.Fatal("oversized FromAddr accepted")
 	}
 }
