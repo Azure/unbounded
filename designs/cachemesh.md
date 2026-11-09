@@ -1,10 +1,12 @@
-# cachemesh: bounded-degree routing for a 100k-node cache
+# cachemesh protocol
 
 ## Status
 
-Implemented in `internal/cachemesh`. This document is the specification the
-code was built against. The code is authoritative; when they disagree, fix
-whichever is wrong and say so in the change.
+Implemented in `internal/cachemesh` (routing library) and
+`internal/gantry/meshfetch` (the gantry data path built on it). Gantry's use
+is optional and off by default. The code is authoritative; when this
+document and the code disagree, fix whichever is wrong and say so in the
+change.
 
 ## Scope
 
@@ -17,10 +19,11 @@ groupcache-style cache spread across up to 100,000 processes. It decides:
 - when a cached metadata value has expired,
 - which members are in the cluster, and who coordinates changes to that set.
 
-It does not move bytes, cache values, or open connections. The embedding
-application (the first consumer is gantry, which will stripe image layers
-across nodes and cache layer metadata separately) owns storage, transports,
-caching, and the requests themselves. A separate design will cover gantry.
+The library does not move bytes, cache values, or open connections. The
+embedding application owns storage, transports, caching, and the requests
+themselves. Gantry is the first user: it stripes image blobs into chunks
+owned by individual agents and caches tag resolutions. The second half of
+this document ([Gantry data path](#gantry-data-path)) specifies that use.
 
 ### Requirements
 
@@ -38,34 +41,12 @@ caching, and the requests themselves. A separate design will cover gantry.
 7. Minimal per-request cost: routing a request allocates nothing, takes no
    locks, and does not read the clock.
 
-## Prior art
-
-| Source | Adopted | Rejected |
-|---|---|---|
-| groupcache | Read-through owner model; owner-fill deduplication (left to the caller) | Global registries, crc32 ring, random hot-cache fill, origin load on any peer error |
-| galaxycache, groupcache-go | Caller-supplied transports; expiry carried with values; asking the previous owner after ownership moves | A client per peer (N connections), broadcast removal |
-| Facebook memcache (NSDI'13) | Leases for fills (left to the caller); cold-cluster warmup | A separate gutter pool; backups in the owner's cell play that role |
-| Kelips, HyperX, Pastry/PAST | Bounded-degree grid; converging routes; caching on the route | Gossip-only convergence (estimated over an hour at 10^5 nodes) |
-| Slicer, Centrifuge, KRaft | Leader-assigned ownership table; versioned deltas; snapshot fallback | A separate distribution tier; the grid distributes |
-| Rapid, Lifeguard | Removal only when several observers agree; batched changes | Flat SWIM gossip (HashiCorp caps pools near 5k nodes) |
-| Envoy, gRPC A50, Finagle | Outlier-detection defaults; peak-EWMA; single-probe half-open; panic threshold | Per-request clock reads for windows |
-| Bazel REAPI | Blob (CAS) versus metadata (AC) split; a salt or generation for mass invalidation | |
-| Spegel | Lesson: per-pod Kubernetes leader election broke near 1000 pods | |
-| Google, Twitter, Uber subsetting | Deterministic, churn-minimizing neighbor choice | Subsetting itself; it assumes any replica can serve, but a cache needs the owner |
-
-Rejected alternatives for placement:
-
-- Rendezvous hashing over all members costs O(N) per lookup at 100k.
-- Skeleton (hierarchical) rendezvous moves several times more keys per join.
-- A hash ring with virtual nodes needs about 100x memory for usable balance.
-- Jump, Anchor, and Memento hashing depend on update order or dense indexes.
-- A leader-assigned partition table gives exact balance, slow start,
-  draining, and O(1) lookups, and the leader already exists.
-
-Rejected alternative for the wire format: protobuf. The repository's protobuf
-workflow needs `protoc-gen-go` on `PATH`, and the data-plane header must be
-fixed-size and allocation-free. The control messages use a small versioned
-binary codec with fuzz tests instead.
+Design choices: placement is a leader-assigned partition table rather than
+rendezvous over all members (O(N) per lookup), a hash ring (memory for
+balance), or jump-style hashing (depends on update order). The leader
+already exists, and a table gives exact balance, slow start, draining, and
+O(1) lookups. Membership changes are leader-ordered deltas spread over the
+grid rather than flat gossip, which converges too slowly at 10^5 members.
 
 ## Architecture
 
@@ -116,6 +97,8 @@ deterministic:
 | `internal/cachemesh/internal/control` | Control plane: the per-member `Node` state machine, Lease election (`Elector`, `Store`), the `Leader` (admission, suspicion, removal, rebalance with the partition `Planner`, cells, epochs), wire messages, and the `Router` that keeps a member's `route.State` current | `route`, `view` |
 | `internal/cachemesh/internal/dst` | Deterministic simulator and the DST suite | `control` and below |
 | `internal/cachemesh/internal/view/viewtest` | View builders for tests | `view` |
+| `internal/gantry/meshfetch` | Gantry chunk and tag transport, chunk store, holder directory | `internal/cachemesh` |
+| `internal/gantry/mirror` (`cachemesh.go`) | Mirror integration: serve blobs and tags through the mesh | `meshfetch` interfaces |
 
 ## Identity and hashing
 
@@ -334,10 +317,8 @@ table as bit-packed columns; derived indexes are rebuilt and checked by
   whose epoch is at or below the epoch the tracker already computes, with
   the same period, is ignored. Heartbeats are applied up to a period after
   their epoch began (catch-up deltas and snapshots replay old `Epoch` ops),
-  and re-anchoring on them delayed the member's epoch boundaries; a member
-  that then became leader published its late phase, every member stalled
-  to match, and each leader change stretched every lifetime by up to
-  another period. Only an anchor ahead of the member re-anchors it.
+  so re-anchoring on them would delay epoch boundaries and stretch value
+  lifetimes. Only an anchor ahead of the member re-anchors it.
 - Pings and pongs carry the sender's epoch; a member behind a peer anchors
   forward to it (the tracker ignores epochs it already reaches). The
   cluster epoch therefore follows its most advanced member, and a leader
@@ -479,6 +460,44 @@ responses.
 | `Suspect{Target, Observer}` | Monitoring report; routed to the leader. |
 | `Invalidate{Seed}` | Keyspace generation bump; routed to the leader. |
 
+### Wire format
+
+Control messages use a small versioned binary codec
+(`internal/cachemesh/internal/control/wire.go`), not protobuf: the codec is
+allocation-free for the frequent kinds and is fuzz tested. Every message is
+an envelope followed by a kind-specific body:
+
+```
+u8      format version (FormatVersion = 2)
+u8      kind
+ref     From          (string ID, uvarint Incarnation, u32 Slot)
+string  FromAddr
+uvarint Version.Term, uvarint Version.Seq
+[32]    Digest
+uvarint Epoch
+u32     LeaderSlot    (NoSlot if unknown)
+...     body
+```
+
+- A message with any other format version is rejected (`ErrVersion`).
+  There is no negotiation: every member of a cluster must run the same
+  format.
+- `FromAddr` is the sender's advertised control address (`Config.Addr`).
+  Receivers dial it, never the transport-level source address, which may be
+  an ephemeral port.
+- Kinds: `Ping` 1, `Pong` 2, `Ack` 3, `Nack` 4, `Broadcast` 5,
+  `CatchUpRequest` 6, `CatchUpResponse` 7, `Routed` 8, `Join` 9, `Leave` 10,
+  `Suspect` 11, `Invalidate` 12.
+- `Nack` reasons: `TTLExhausted` 1, `NoRoute` 2, `NotLeader` 3, `Busy` 4,
+  `BadRequest` 5.
+- `Broadcast.Level` is a dimension index, `-1` (sent by the leader), or `-2`
+  (cell-mate fan-out).
+- Deltas and snapshots are opaque byte strings in the view package's
+  canonical encoding.
+- Limits: a whole message at most `MaxMessageSize` (64MiB, snapshots
+  included), a `Routed` inner message at most 64KiB, at most 4096 deltas per
+  `CatchUpResponse`.
+
 Lost routed messages are retried by their senders (joins every `JoinRetry`
 (2s) until admitted; leaves until `Draining` is observed; suspicions while the
 failure persists).
@@ -579,15 +598,12 @@ Implementation notes (`control.Node`):
   without a view that won the lottery, which then declines) keeps the
   record's seeds when it acquires and releases, and a releasing leader
   lists the other members it knows. Seeds are cleared only when the last
-  known member leaves. Clearing them on every release let a fresh member
-  bootstrap a second cluster next to the live one.
+  known member leaves, so a fresh member cannot bootstrap a second cluster
+  next to the live one.
 - A leaving member that has been in a view never rejoins; if it was
   already removed when `Leave` was called, it has left at once (it would
   otherwise wait forever for a view showing a removal that already
-  happened). A member
-  removed by a partition that is then asked to leave used to keep sending
-  joins, and one reaching the leader after the process stopped re-admitted
-  it. A join the leader had already queued can still admit a member whose
+  happened). A join the leader had already queued can still admit a member whose
   process has stopped; failure detection removes it. A process asked to
   leave before it ever joined still joins: its admission replaces a stale
   record of its earlier incarnation, which nothing else removes (the new
@@ -791,14 +807,6 @@ method. `NeighborWatcher.OnNeighbors(added, removed []PeerRef)` tells the
 caller which data-plane connections to keep; removals are delayed by
 `NeighborLinger`.
 
-Per-request cost targets (benchmarked): `Route` on a 100k view under 100ns and
-zero allocations; `Observe` under 50ns and zero allocations; `Fresh` a few ns.
-`BenchmarkMesh` in `internal/cachemesh` measures them (`Route` over 1,024
-keys, `ObserveParallel` with every goroutine reporting on one peer, the worst
-case); `BenchmarkRouteWide` routes 1M distinct keys, where the owner lookup
-and the owner's member record usually miss every cache level and the cost is
-a few DRAM latencies, and routes from 16 different members in turn.
-
 The route package keeps the per-request work small: when `route.HealthTracker.AllHealthy`
 holds it ranks candidates without per-peer `Usable` lookups, it keeps this
 member's cell coordinates in the `State` so only the owner's cell is divided,
@@ -929,8 +937,8 @@ rules above:
   and the `Backup` flag set), so backup hops never chain and a backup hop is
   always final. The receiver serves even when its own health view finds the
   owner usable: health views differ per member, and sending the request back
-  to the owner the sender gave up on took D+1 hops and, with failovers,
-  bounced between the owner and its backups until the TTL ran out.
+  to the owner the sender gave up on can bounce between the owner and its
+  backups until the TTL runs out.
 - A caller that retries or hedges to `Alternate` sends
   `Decision.AlternateHeader()`: after a final hop (`KindOwner`,
   `KindBackup`) it adds the `Backup` flag, so the backup serves; after a
@@ -958,274 +966,503 @@ rules above:
   refused. It never sends back to the header's sender unless that is the
   owner.
 
+## Gantry data path
+
+Gantry uses cachemesh to move image content between agents. The library
+only decides routes; gantry owns the HTTP transport, the chunk store,
+coalescing, retries, and metrics. Code: `internal/gantry/meshfetch`,
+`internal/gantry/mirror/cachemesh.go`, `internal/gantry/origin/tag.go`,
+`internal/gantry/config/cachemesh.go`, `internal/gantry/transfer`
+(`WithExtraRoutes`), and `cmd/gantry/agent_cachemesh.go`.
+
+Goals:
+
+- Pull each chunk of a blob from the origin registry once per cluster, not
+  once per node.
+- Spread the load of a large image over every node: each node owns some
+  chunks and serves them to the others.
+- Stream bytes through every hop as they arrive, with bounded memory.
+- Leave the default (DHT peer-to-peer) path unchanged when disabled, and use
+  it as the fallback when the mesh cannot serve a request.
+
+### Configuration
+
+All settings live under `cachemesh:` in the agent config
+(`internal/gantry/config/cachemesh.go`). Nothing changes unless `enabled` is
+true.
+
+| YAML key | Env (`GANTRY_` prefix) | Default | Meaning |
+|---|---|---|---|
+| `enabled` | `CACHEMESH_ENABLED` | `false` | Turn the path on. |
+| `namespace` | `CACHEMESH_NAMESPACE` | `chair_namespace` | Namespace of the leader Lease (named `gantry-cachemesh`). |
+| `chunk_size` | `CACHEMESH_CHUNK_SIZE` | 64MiB | Stripe size; power of two, 1MiB to 1GiB, same on every node. |
+| `expected_size` | `CACHEMESH_EXPECTED_SIZE` | 0 (library: 1000) | Expected node count. |
+| `max_neighbors` | `CACHEMESH_MAX_NEIGHBORS` | 32 | Data-plane neighbors per node; at least 1. |
+| `content_root` | `CACHEMESH_CONTENT_ROOT` | `/var/lib/containerd/io.containerd.content.v1.content` | containerd content store directory, mounted read-only; the only disk tier. Empty or unreadable: serve peers from memory only. |
+| `inflight_bytes` | `CACHEMESH_INFLIGHT_BYTES` | 2GiB | Memory fills borrow for lagging readers, recent relay chunks, and owned chunks. |
+| `max_concurrent_chunk_fills` | `CACHEMESH_MAX_CONCURRENT_CHUNK_FILLS` | 64 | Chunks fetched at once. |
+| `cache_tags` | `CACHEMESH_CACHE_TAGS` | `true` | Serve anonymous tag requests from the mesh. |
+| `verify_digest` | `CACHEMESH_VERIFY_DIGEST` | `true` | Hash full blobs before the last byte. |
+
+Validation requires a Lease namespace and `pod_ip`. The Racer backend
+ignores the block. Unknown keys fail at load time (`KnownFields`), and the
+chart schema rejects unknown values.
+
+The rest are fixed defaults in `meshfetch` (`tuning` in
+`internal/gantry/meshfetch/node.go`): 1MiB pages, a fill window of 4 pages,
+512 concurrent chunk responses to peers (more get 429), 8 chunks of one
+blob fetched ahead, 5m per fill attempt, 30s without progress fails an
+attempt, 4 attempts per chunk, hedging on, 30s linger for unused chunks in
+memory, and a 5m tag TTL (`cachemesh.MinTTL`). The grid cell size and
+partition count use the cachemesh library defaults.
+
+Grid shape: gantry defaults `max_neighbors` to 32, unlike the library
+default of 256, which is sized for 100k members. With a few hundred nodes
+and 256 neighbors, every node is a neighbor of every other node, so the
+owner of a popular chunk serves every node itself. With 32 the grid has
+more than one dimension, so requests relay through intermediate nodes that
+cache the chunk on the way and spread the fan-out. Set 256 for a fully
+direct grid.
+
+The Helm chart exposes the same knobs as `gantry.cachemesh.*` (camelCase,
+except `namespace`). Zero values are omitted, so the agent defaults apply.
+It renders the block, and the `GANTRY_NODE_NAME` env var, only when
+`gantry.cachemesh.enabled` is true. Example:
+
+```yaml
+gantry:
+  cachemesh:
+    enabled: true
+    expectedSize: 150
+resources:
+  agent:
+    limits:
+      memory: 8Gi
+```
+
+### Membership
+
+Each agent creates one `cachemesh.Mesh`:
+
+- ID: the Kubernetes node name (`GANTRY_NODE_NAME`), else `POD_NAME`, else
+  the hostname.
+- Addr: `<pod IP>:<transfer port>`. Control and data requests share the
+  transfer listener (default port 5001).
+- Lease: `kubelease.Store` on the leader Lease. The agent Role already allows
+  get, list, create, and update on Leases.
+- Control transport: HTTP/1.1 `POST /cachemesh/control`, body bounded by
+  `cachemesh.MaxControlMessageSize`.
+
+`Run` starts after the transfer listener is up. Agent readiness does not wait
+for the mesh; the mirror simply declines to use it until `Mesh.Ready()`. On
+shutdown the agent calls `Leave` (5s budget) before the transfer listener
+stops, so other members take over its partitions while it can still serve.
+
+### Chunks and keys
+
+A blob of size S is split into `ceil(S / chunk_size)` chunks; the last one
+may be short. Chunk keys live in the immutable keyspace `gantry-blob`
+(TTL 0). The routing key is the kind byte (0 blob, 1 manifest), the digest
+string, and the chunk index as 8 big-endian bytes (`chunkKey.routeKey` in
+`store.go`), so chunks of one layer land on different
+owners.
+
+Manifests by digest use the same path with the manifest kind. They are small
+and fit in one chunk; the owner keeps the upstream Content-Type.
+
+The owner fills a chunk with a bounded `PullRange` request
+(`origin.Client.PullRange`). The first response tells every hop the blob
+size, so there is no separate HEAD request.
+
+### Peer HTTP API
+
+All three routes are registered on the transfer listener with
+`transfer.WithExtraRoutes`, outside the otelhttp wrapper.
+
+`POST /cachemesh/control`: body is one encoded control message, at most
+`cachemesh.MaxControlMessageSize`; the response body is the encoded reply
+(`application/octet-stream`). 503 when the mesh is not running, 400 for a
+bad message.
+
+`GET /cachemesh/chunk` query parameters:
+
+| Param | Meaning |
+|---|---|
+| `r` | Origin registry. |
+| `n` | Repository. |
+| `d` | Blob digest. |
+| `k` | Kind: 0 blob, 1 manifest. |
+| `i` | Chunk index. |
+| `cs` | Sender's chunk size; must equal the receiver's, else 400. |
+| `o` | Optional byte offset within the chunk (resume). |
+| `peek` | Optional. `local`: serve only from memory or the content store. `owner`: as `local`, but an owner in its own view also starts its origin fill and serves it. |
+
+Request headers: `Gantry-Cachemesh-Route` carries the 32-byte route header
+(base64url); `Gantry-Cachemesh-Requester` carries the member address of the
+node whose own containerd pull started the request, and relays forward it.
+
+Response: 200 with `Gantry-Blob-Size`, `Content-Length` of the rest of the
+chunk, and the upstream `Content-Type` when known. Errors: 400 bad request,
+404 (peek miss), 416 offset beyond chunk, 429 shed (more than 512
+concurrent responses), 503 no route, 508 TTL exhausted or loop, 502 other
+fill errors. After the status line is sent, a failure aborts the response
+so the peer sees a short body.
+
+`GET /cachemesh/meta?r=<registry>&n=<repo>&t=<tag>` with the route header
+returns the manifest bytes with `Content-Type`, `Docker-Content-Digest`,
+`Gantry-Stamp-Expires`, and `Gantry-Stamp-Gen`.
+
+### Request flow
+
+On a mirror GET for a digest that is not in the local containerd store (and
+on open-ended `Range: bytes=N-` requests, which containerd uses to resume):
+
+1. If the mesh is not ready, the mirror uses its default path.
+2. The node routes chunk `N / chunk_size` with `Mesh.Route` and waits for
+   the blob size. If that fails, nothing has been written and the mirror uses
+   its default path (peers, then origin).
+3. The mirror writes the status line and headers (200, or 206 with
+   `Content-Range`).
+4. A producer keeps 8 later chunks in flight; the writer copies chunks to
+   containerd in order as their bytes arrive.
+5. A fill retries its sources up to 4 times in all, resuming at the byte it
+   reached (`Node.route` in `fetch.go`). If the writer's reader loses bytes
+   the fill no longer holds (`errLost`), it obtains a new reader, which may
+   start a new fill, and continues from the same byte, up to 4 times
+   (`Node.copyChunk`). A failed fill is not retried again by the writer.
+   After that the response is aborted (`http.ErrAbortHandler`) and
+   containerd retries with a Range request, which goes through the same
+   path.
+
+Every node handles a chunk request the same way, whether it came from its
+own mirror or from a peer:
+
+- If the chunk is in memory (a fill in progress, or a complete chunk
+  lingering), stream it from there. Concurrent requests for one chunk share
+  one fill.
+- Otherwise start a fill. If the local containerd content store holds the
+  whole chunk (a committed blob, or an ingest containerd is still writing),
+  the fill reads it from there. Otherwise the fill is routed. The decision comes from `Route` (local request) or
+  `Forward` with the request header (peer request):
+  - `KindSelf`: this node owns the chunk (or stands in as a backup). It first
+    reads through from `PrevOwner` during a handoff, and from the owner when
+    acting as a backup, using a "peek" request that only returns chunks the
+    other node has complete or is reading from the origin. A backup's peek
+    (`peek=owner`) additionally makes a node that is the owner in its own
+    view start its origin fill and serve it, so a hedge to a backup does not
+    read the chunk from the origin a second time; a handoff peek
+    (`peek=local`) never starts a fill, since the previous owner's own fill
+    may be waiting on the new owner. Every peek is also served from the
+    peer's content store when it holds the whole chunk. The owner then asks
+    recent requesters of the chunk (the holder directory, below), also with
+    `peek=local`. Otherwise it pulls the chunk from the origin. Peeks wait
+    2s for response headers, holder peeks 1s.
+  - Relay, owner, backup, gateway, direct: send to `Next` with the decision
+    header. After `HedgeAfter`, if `TryHedge` allows, send a copy with
+    `FlagHedge` to `Alternate` using `AlternateHeader`; the first response
+    wins. On failure, retry to `Alternate`, then route again.
+  - No route: fail.
+- Every peer outcome is reported with `Observe` (latency to headers).
+  429 and 503 count as `Overload`; stalls as `Timeout`.
+- `ErrTTLExhausted`: serve only from memory or the content store, else 508.
+
+### Chunk store
+
+Gantry keeps no copy of image data on disk. The only disk copy is
+containerd's own content store: containerd writes every blob while it
+pulls through the gantry mirror, and the snapshotter unpacks from that same
+blob. `meshfetch` (`internal/gantry/meshfetch/store.go`, `content.go`, and the
+holder directory in `fetch.go`) holds chunks in bounded memory and
+reads the content store back to serve peers.
+
+#### Fills and the in-flight window
+
+A fill is one chunk being fetched or already complete. The filler reads the
+chunk into a window of 4 page buffers of 1MiB.
+Readers (the local blob stream and peers) that keep up copy bytes out of
+those pages as they arrive, so every hop is cut-through and a hot fan-out
+reads each byte from the network once.
+
+A page leaves the window once no reader needs it from memory. A reader needs
+memory from `max(position, local floor)` on, where the local floor is the
+end of the whole pages of the chunk that the content store held when last
+asked (`fill.needLocked`, `fill.localFloorLocked` in `store.go`). So a page
+is dropped when every reader has passed it, or when containerd has written
+it and lagging readers can read it back. A reader that falls behind the
+window reads the page from the content store through the page cache below;
+if the content store does not have it either, the reader gets `errLost`, the
+local blob stream starts a new fill from the same byte, and a peer request
+that needs bytes a fill has dropped starts a new fill.
+
+The fill asks the content store how much of its chunk it holds
+(`fill.refreshLocal`) at most every 10ms, and only when it matters: when its
+window is full and a reader holds it back, every 40ms while it waits, and
+when a reader finds its page gone.
+
+When the window is full and a reader the content store does not cover still
+needs the oldest page, the fill:
+
+1. borrows another page from the store-wide in-flight budget
+   (`inflight_bytes`) if peers read the fill, so a slow reader does not
+   slow the others down;
+2. otherwise waits for the slowest reader. A fill that only the local blob
+   stream reads always does this: nobody else is waiting, and containerd
+   writes those bytes right after the reader passes them. A reader that
+   holds the fill back for 30s (the stall timeout) is dropped with `errLost`.
+
+With the content store covering everything the local pull has written,
+the only readers that can still exhaust the budget are peers of a chunk
+this node is not pulling itself, and those pace the fill.
+
+#### Lingering and owned chunks
+
+A fill that a peer has read, or that this node fills as the chunk's owner,
+keeps every page in memory while the in-flight budget allows, unless the
+content store already holds the chunk: instead of dropping a page that all
+readers have passed, it borrows a new one. When such a fill completes with
+the whole chunk in memory, it stays in the map on a memory LRU list, so
+peers that ask later (in the relay grid, nodes reach a chunk a few seconds
+apart) join it instead of fetching it again. These chunks give their pages
+back:
+
+- when a fill needs to borrow and the budget is used up (least recently used
+  first, chunks this node does not own before owned ones), and
+- after 30s without use, so an idle agent returns the memory.
+
+Owned chunks linger because the owner's own pull reaches a given chunk at
+an arbitrary time; dropping it at once would make a later peer request pull
+it from the origin again. Each node owns about `image size / nodes` of an
+image.
+
+A complete chunk that left memory is served again from the content store:
+a new fill reads it (`Node.fillFromLocal`), and concurrent requests share
+that fill.
+
+#### Reading the content store
+
+`ContentSource` (`content.go`) is implemented by `DirContent`, which reads
+the content root directly. Committed blobs are at `blobs/sha256/<hex>`.
+In-progress downloads are at `ingest/<key>/data`, where `<key>` is a hash of
+the namespace and ingest ref, so the directory is listed (at most every
+100ms, on a miss) and each `ref` file is parsed for the digest (CRI uses
+`layer-sha256:<hex>`); the readable length is the size of `data`, capped at
+`total`. containerd writes ingests sequentially with plain `write` calls, so
+bytes below the file size are complete and in the page cache. A blob is
+opened as committed, else as its ingest, else as committed again in case
+containerd renamed it in between. On commit containerd renames `data` into
+`blobs/`, so an open descriptor stays valid. Descriptors are shared per
+blob with a reference count and closed 2s after their last use by a timer,
+so a blob that containerd garbage collects does not keep its space for
+long (opening the file for every 1MiB page read made serving from the
+content store about a third slower). A short read (an ingest restarted
+with a truncate, or a deleted blob) drops the descriptor and loses the
+reader, which retries elsewhere. A permission error disables the source with one warning.
+Digests are validated as 64 lowercase hex characters before they become a
+path.
+
+When `content_root` is empty or unreadable (`cachemeshContent` in
+`cmd/gantry/agent_cachemesh.go`), the node runs without a content source:
+it serves peers from memory only, and every fill goes to peers or the
+origin.
+
+Reads are buffered (`pread`), not `O_DIRECT`, to hit the page cache that
+containerd has just filled. Those pages belong to containerd's cgroup, so
+they do not count against the agent's memory.
+
+#### Holder directory
+
+Chunk requests made for a node's own containerd pull carry that node's
+member address in `Gantry-Cachemesh-Requester`; relays forward it. Every
+node remembers the last four requesters of each chunk (`holders` in
+`fetch.go`; at most
+32k chunks, entries expire after 6h). When the owner has the chunk neither
+in memory nor in its own content store, it asks up to two of those
+requesters with `peek=local`, which they serve only from memory or their
+content store, before it goes to the origin. Requesters recorded less than
+20s ago are skipped: they are most likely still pulling the chunk,
+typically in the very request the owner is filling. A requester that no
+longer has the blob answers 404 quickly (1s header timeout).
+
+#### Page coalescing
+
+Content store reads go through a page cache keyed by (digest, absolute page
+index), so readers of different fills of the same chunk share pages.
+Concurrent readers of the same page share one read (singleflight). Each
+entry is a reference-counted page buffer. When its last reader is done the
+page joins a ring of the 32 most recently released pages, so readers of a
+fan-out that trail a few pages behind share the read too; a page pushed
+out of the ring is freed. Evicting a digest (failed verification) frees
+its pages.
+
+#### Memory bound
+
+Chunk memory is page buffers only:
+
+- in-flight windows: 4 x 1MiB per fill, at most
+  `max_concurrent_chunk_fills` fills (256MiB with the defaults);
+- borrowed pages, including lingering and owned chunks: at most
+  `inflight_bytes`;
+- one page per active reader while it writes that page to its socket;
+- the recent page ring: 32 pages (32MiB).
+
+With the defaults that is about 2.3GiB plus the pages being sent. ThePage buffers are anonymous `mmap` mappings outside the Go heap: they do
+not raise the garbage collector's heap goal, and `munmap` returns them to
+the system as soon as they are freed (an idle pool keeps at most 64MiB).
+
+### Integrity
+
+Chunks cannot be checked one by one: OCI only gives the digest of the whole
+blob. Containerd checks the full digest when it commits. With
+`verify_digest`, the serving node also hashes the full blob (offset 0 only)
+and holds back the last byte until the hash matches. On a mismatch it drops
+every cached chunk of the blob and aborts the response, so a bad chunk from
+a peer or the origin cannot be committed and is not served again from this
+node's cache. It also stops reading that blob from the content store for
+10 minutes: the bad bytes may still sit in containerd's ingest. Other nodes
+that cached the bad chunk find out on their own verification.
+
+The content store serves ingests before containerd has verified them. The
+bytes there are exactly what this node's gantry served to containerd, so
+they are as trustworthy as the chunks in memory; containerd still verifies
+the full digest before commit on every node.
+
+### Tags and metadata
+
+Tag resolutions use a separate keyspace, `gantry-meta`, with a 5m TTL
+(`cachemesh.MinTTL`). The routing key is `<registry>/<repo>:<tag>`.
+
+- The owner resolves a tag with one origin GET
+  (`origin.Client.ManifestByTag`), stamps it with `Mesh.Stamp`, and caches
+  the manifest bytes, media type, and digest.
+- Other nodes fetch through `GET /cachemesh/meta?r=&n=&t=` with the route
+  header, check that the body matches `Docker-Content-Digest`, and cache the
+  entry with the owner's stamp (`Gantry-Stamp-Expires`, `Gantry-Stamp-Gen`).
+- Every holder checks `Mesh.Fresh` before using a copy, including a
+  resolution it just received from a peer or joined in flight; a stale one
+  is rejected and not cached, and the mirror falls back. One resolution per
+  key runs at a time on each node.
+- Each node keeps at most 4096 entries and 64 MiB of manifest bodies
+  (`metaCacheBytes`). An insert that would exceed either bound drops expired
+  entries first, then arbitrary ones; a body larger than the byte budget is
+  served but not cached.
+
+The mirror answers a tag request from this cache only when `cache_tags` is
+on, the request has no `Authorization` header, and the registry does not
+require authentication (`AuthenticationChallenge`). Otherwise it keeps the
+existing 503, and containerd goes to the origin. The requester's check only
+probes the registry root (or is skipped when credentials are configured), so
+it does not show that the repository itself is public. The metadata owner
+therefore resolves every tag anonymously
+(`registryauth.WithAnonymous`): no delegated authorization, no configured
+credentials or token obtained with them, and no URL user information; an
+endpoint with a query string is refused. A private repository then fails at
+the owner, the requester declines, and containerd pulls the tag with its own
+credentials. Nodes with shared credentials do not use them for mesh tag
+resolution. A tag cannot be verified
+against content, so a node that lies about a tag can point other nodes at
+the wrong image for up to the TTL (see the tag-binding note in
+`designs/gantry-detailed-design.md`). Manifests by digest are safe because
+containerd verifies them.
+
+### Interaction with the default path
+
+- Local hits, HEAD requests, and the DHT, cold-start, and origin paths are
+  unchanged. The mesh runs after the local-store miss and before the peer
+  lookup.
+- Bytes served through the mesh count in
+  `gantry_mirror_bytes_served_total{source="cachemesh"}` and the completion
+  hooks, so the stream-commit tracker and the advertiser still see them.
+  Completed blobs are announced in the DHT as before.
+- With cachemesh on, the layer prefetcher only tracks layer progress; it no
+  longer asks chairs to seed layers from the origin, which would duplicate
+  the mesh's origin pulls.
+
+### Transport
+
+Data requests use a dedicated HTTP/1.1 client (`meshfetch.NewDataClient`):
+one TCP connection per concurrent chunk avoids HTTP/2 flow-control windows
+capping a single stream. Chunk traffic creates no tracing spans.
+
+Metrics are in the `gantry_cachemesh_*` family (`internal/gantry/metrics`);
+fill sources are labeled `origin`, `peer`, `prev_owner`, `owner`, `local`,
+and `holder`.
+
+### Security
+
+The control, chunk, and metadata endpoints have no authentication, like
+`/v2/` on the transfer port. Anyone who can reach port 5001 can join the mesh
+control plane, read chunks of any blob a node can pull, and make owners pull
+from the origin. Chunk owners pull with the agent's own registry identity
+(configured credentials or anonymous), never with a requester's delegated
+credentials, so a node can obtain blobs that only another node's pod was
+allowed to pull. Use NetworkPolicy to limit the port to Gantry agents.
+
+### Limitations
+
+- Routing loops can form while nodes see different views. A loop between two
+  nodes is refused at once (the receiver checks whether its in-progress fill
+  reads from the sender); longer loops end when the stall timeout fires.
+- A backup that stands in for a slow owner reads through from the owner with
+  `peek=owner`, and an owner without the chunk starts its own origin fill
+  and serves it. The backup still goes to the origin when the owner does
+  not answer (or does not see itself as the owner), so a chunk may be
+  pulled twice.
+- HEAD requests on a local miss still go to the origin from every node.
+- Owners pull from the origin with the agent's origin client, which uses
+  HTTP/2 for HTTPS registries; many concurrent chunk pulls from one owner
+  share a connection.
+- The chunk size must match on every node; a mixed rollout refuses requests
+  between nodes with different sizes, and the mirror falls back.
+- Reading the content store relies on containerd's on-disk layout
+  (`blobs/sha256/<hex>`, `ingest/<key>/{ref,total,data}`, rename on commit,
+  sequential ingest writes), verified against containerd 2.1. A layout
+  change makes the directory reader find nothing (or a permission error
+  disables it), and cachemesh falls back to memory and the origin; it does
+  not serve wrong bytes unless a file under a blob's path holds other data.
+- The agent must be able to read the content root: the chart mounts it
+  read-only, and the non-root agent relies on containerd's default
+  permissions (directories 0755, blobs 0444, ingest files 0644).
+- containerd may garbage collect a blob at any time (immediately, with the
+  default GC settings, once no image or lease references it). Readers then
+  get short reads and retry elsewhere; descriptors are closed after 2s idle
+  so the space is reclaimed.
+- A relay or owner that is not pulling an image keeps its chunks only in
+  memory, for at most 30s unused and while the in-flight budget has room.
+  After that its share is served from requesters' content stores (holder
+  directory) or, if none still has the blob, from the origin.
+- The holder directory only knows requesters whose requests reached this
+  node: with relays, a coalesced relay fill carries one requester. It is
+  lost on restart.
+- Content store reads are synchronous, one page at a time per reader. There
+  is no read-ahead.
+
 ## Deterministic simulation testing
 
-`internal/cachemesh/internal/dst` is the single simulation suite that
-exercises every state of the library. It contains:
+`internal/cachemesh/internal/dst` drives many `control.Node` instances on a
+simulated clock and network (latency, loss, duplication, reordering,
+partitions, slow members, per-member clock offset and drift), with an
+in-memory Lease server and a process model (crash, restart with a new
+incarnation, leave, pause). A data-plane workload routes requests hop by hop
+with `Route` and `Forward` and feeds outcomes to `Observe`. Scenarios are
+generated from a seed; selected cases run twice and must produce the same
+event-trace hash.
 
-- a discrete-event scheduler (`int64` nanosecond clock, events ordered by time
-  then sequence number, PCG sources derived from the run seed, one named
-  stream per component so extra draws in one component do not perturb
-  another),
-- a network model: latency with jitter, loss, duplication, reordering,
-  slow members, and partitions between member groups,
-- per-member clocks with offset and drift (the library only sees its own
-  member's clock),
-- an in-memory Lease server with compare-and-swap, latency, outages, and
-  injected conflicts (Lease call budgets are counted by the cluster),
-- a process model: start, crash, restart with a new incarnation, graceful
-  leave, pause (stop the world for one member),
-- a data-plane workload: requests from random members for blob, striped-layer,
-  and metadata keys with hot-key skew, routed hop by hop with `Route` and
-  `Forward`, outcomes fed to `Observe`, optional hedging, and per-request
-  latency recorded,
-- invariant checkers and a state-coverage registry.
+Invariants it checks:
 
-Safety invariants, checked continuously:
+- Safety: at most one member publishes per term; terms increase; one digest
+  per version; view versions never decrease (except the snapshot-trust case
+  above); every view passes `view.Validate`; the neighbor bound holds once
+  cells are balanced (twice the bound during a reshape); every request ends
+  within its TTL; epochs never decrease and a stamp is never `Fresh` later
+  than `T + period` plus drift slack; Lease traffic stays within budget.
+- Liveness after faults heal: one leader, every live member at the same
+  version, members are exactly the live processes, loads within one of
+  target, sampled routes reach the owner in at most D hops.
 
-1. At most one member publishes deltas for any term; terms increase across
-   acquisitions; the same version never has two digests. No two members may
-   publish (`Leading` with `CanPublish` true) for different terms at the
-   same instant while clocks are within the election's safety bounds (wall
-   clocks within `ClockSkewAllowance` of each other, monotonic rates with
-   `rmax/rmin < LeaseDuration/RenewDeadline`).
-2. A member's view version never decreases and never accepts a lower term.
-3. Every view passes `view.Validate`.
-4. Each member's neighbor count stays within `MaxNeighbors` once cells are
-   balanced, and within twice that during a reshape.
-5. Every request terminates within its TTL; when all members on its path
-   share a version, it visits no member twice, takes at most D hops plus one
-   failover, and ends at the owner or a backup in the owner's cell.
-   (Failovers do not add hops in the implementation, so the check is at
-   most D hops.)
-6. Epochs never decrease on a member; a stamp is never `Fresh` later than
-   `T + period + drift slack` after it was issued. (The slack includes up
-   to one period of epoch phase lag on members that anchored late; see the
-   data-plane notes below.)
-7. Lease API traffic stays within its budget: steady state at most
-   `Candidates/RetryPeriod` plus the leader's renewals; during leader loss
-   about `LotteryBudgetQPS`. Followers make no Lease calls in steady state,
-   and a joiner makes one cached read at start and at most one per
-   seed-refresh period after.
-
-Liveness invariants, checked after faults heal and a settle period:
-
-8. Exactly one leader; every live member converges to the same version.
-9. The view's members are exactly the live processes.
-10. Partition loads are within one of their targets; no cell is empty; the
-    neighbor bound holds.
-11. Sampled routes from every member reach the owner in at most D hops with no
-    `Direct` decisions.
-
-Scenarios are generated from the seed (swarm testing): cluster size, grid
-parameters, and a random schedule drawn from crash, restart, mass join, scale
-down, rolling restart, network partition and heal, leader crash, API server
-outage, slow members, clock skew and drift, message loss and duplication,
-graceful drain, keyspace invalidation, and lease conflicts. Selected cases
-(and every explicitly requested seed) are executed twice and the
-event-trace hashes must match, which catches nondeterminism in the library. A failing seed is printed with the command
-that replays it. A coverage registry records states reached (member states,
-elector states, health states, catch-up by delta and by snapshot, reshape,
-handoff, panic, hedge, lottery, damping, and so on), and the suite fails if a
-registered state is never reached across the default seed set.
-
-Default `go test` runs a seed set that finishes in about 30 seconds and
-includes a 1,000-member cluster, a scripted series of whole-cluster and
-partial restarts, and two simulated hours of churn on a small cluster.
-`TestDST` is skipped under `-short` and under `-race`: the simulator runs on
-one goroutine, so the race detector finds nothing there and only slows the
-suite down by more than an order of magnitude. A failure prints a replay
-command: the subtest name for default-set cases, `CACHEMESH_DST_SEED` for
-explicit seeds.
-
-Implementation notes (control-plane suite, `dst.Cluster` and
-`suite_test.go`): each member is a `control.Node` with its own `dst.Clock`,
-ticked at its `NextDeadline`; outbox calls go through `Net.Call` and Lease
-operations through `LeaseServer.Submit`. Large clusters start from a view
-prebuilt by running the leader logic offline (`control.Config.Initial`), so the
-first leader is elected over an existing view. The default set is 16 tiny
-and 2 small generated scenarios, the targeted 40-member `slow` scenario,
-four pinned regression seeds (`pinned/tiny/293`, `75`, `456`, and `501`,
-found by past seed sweeps and kept at their generated partition bits), and
-one 1,000-member scenario (`medium`); only seed 1 keeps `PartitionBits` 20,
-the rest use 16 to bound runtime. `tiny/2`, `small/2`, `restarts`, and
-`slow` run twice and are trace-compared. A 10,000-member and a
-100,000-member scenario run only with `CACHEMESH_DST_LARGE=1`. The default
-set also has
-`restarts` (`GenerateRestarts`: a partial restart that kills the leader
-and all but two members, then whole-cluster restarts with and without
-seeds) and `longrun` (`GenerateLongRun`: two simulated hours of churn on
-12 members, a fault every few minutes); both require convergence at
-`Checkpoint` faults between their faults and finish in a few seconds.
-
-Control-plane invariants (`dst/cluster.go`):
-
-- Leader overlap (invariant 1) is checked whenever a member publishes. An
-  overlap while clocks are outside the safety bounds is counted
-  (`leader-overlap-excused`) instead of failing: generated `ClockSkew`
-  faults step wall clocks by up to 60s, beyond `ClockSkewAllowance`, and a
-  skewed lottery member can take a live Lease (fencing by term still
-  holds). Generated `ClockDrift` stays within +-10%, inside the +-20% that
-  the default durations tolerate, so drift alone never excuses an overlap.
-- Lease calls are attributed per member and classified: a node's own seed
-  reads must be at least 25s apart per process (16 join attempts of 2s on
-  a clock up to 10% fast); elector calls in quiet periods (no fault within
-  the last 90s) are at most `Candidates + 2` per second, at most
-  `5*(Candidates+1) + Candidates + 1` per 10s window, made by at most
-  `Candidates + 2` members, each of which was a candidate or the leader at
-  one end of the window. In any second after cluster formation (30s after
-  the first term) elector calls are at most `4*LotteryBudgetQPS +
-  Candidates + 2`: one second can hold a lottery round's reads and the
-  previous round's acquiring writes, a sum with mean `2*LotteryBudgetQPS`
-  and standard deviation about 6, so the bound is more than six standard
-  deviations above it.
-- Term churn: after convergence, clusters of at most 512 members run 60s
-  more and must start no new term, keep the same leader, and stay
-  converged. A converged cluster has at most `2 + 4*faults` terms (plus one
-  per `RetryPeriod` of injected Lease conflicts, each of which can fail a
-  renewal and end a term) and a
-  view sequence number no larger than the elapsed seconds.
-- Bounded state: every 10s every member's `control.Stats` are checked against
-  their caps (pending calls, ahead queue, seeds, delta log, leader queues),
-  and no removed neighbor may linger past its expiry.
-- Scenarios draw `ColdRestart` and `PartialRestart` (each in about one in
-  eight) and the delta log size (default, 64, or 32, so partitioned
-  members catch up by snapshot) from a separate random stream, so
-  existing seeds keep their other faults. After a whole-cluster restart
-  the epoch restarts at zero, so the liveness epoch check counts from the
-  last bootstrap.
-
-The data-plane workload plugs in through
-`dst.Workload`. `CACHEMESH_DST_SEEDS` (a count of extra random seeds or a
-list of seeds), `CACHEMESH_DST_SEED` (replay one seed), and
-`CACHEMESH_DST_LARGE=1` (the 10k- and 100k-member cases) control longer
-runs.
-
-Implementation notes (data-plane workload, `dst.DataPlane` in
-`dataplane.go`): every `TestDST` case runs it from the end of the warmup.
-
-- Routing state: each running member routes with its own `route.State`
-  over a `route.Env` holding its node's `Health()` and `Epoch()` trackers,
-  its own `route.Notes`, its node's join seeds (`control.Node.Seeds`: configured,
-  learned from the Lease and from views, other than its own address) as
-  gateways, and its ID and incarnation, built by the same `control.Router`
-  as `Mesh` uses. The state is rebuilt
-  (O(1)) when the member's view pointer or slot changed, and the `Env` too
-  when a non-member's seed list changed; members not in their view route
-  through those seeds or `Direct`.
-- Requests: keys come from `KeyGen` (blobs and striped layers with TTL 0,
-  metadata in the keyspaces `meta/0` to `meta/3` with TTL 5m, Zipf 1.1).
-  The cluster-wide rate is the member count clamped to 20..120 per second
-  (100 for the 1,000- and 10,000-member cases). Half the requests come from
-  up to four hot clients (heavy pullers) so that a client routes to each
-  neighbor often enough for health to learn it; while a slow-member fault
-  is active the clients issue as many requests again, so that their
-  traffic to each neighbor outnumbers the re-probes of a Degraded peer
-  (retried once its EWMA decays, about every 20s). Every 30s a herd of 160
-  requests (320 for large cases) for the hottest blob arrives within 20ms,
-  which overloads owners and relays. 0.2% of relayed requests are sent
-  with a TTL of one hop, to exercise TTL exhaustion.
-- Delivery: each hop is a `Net.Call` of kind `KindData` (60, above every
-  control kind) carrying the 32-byte header. The receiver queues it
-  (service time uniform in 0.5..1.5 times 300us, times the member's slow
-  factor; more than 16 in flight is answered `Overload`), then calls
-  `Forward` on its own state, acks, and serves (`KindSelf`) or sends on.
-  The sender observes the ack latency as `Success`, or `Failure`,
-  `Timeout` (hop timeout 250ms), or `Overload`, and then retries the
-  `Alternate` once with `AlternateHeader`. A request abandoned by its
-  sender is dropped by the receiver; a lost ack leaves two live branches,
-  both tracked. The origin hedges to the `Alternate` (with `FlagHedge`)
-  when its first hop is unanswered after `HedgeAfter` and `TryHedge`
-  allows it; the first served branch wins. A receiver that sees a newer
-  version in a header passes it to its node through
-  `control.Router.TakeNote` (which widens the 32-bit header term with
-  `control.ExpandVersion`), as `Mesh` does. Every terminal result goes into the trace hash.
-- Phases: a request is steady when membership was settled at the last
-  5-second check (a leader, every running member at its version and in it,
-  no member paused) and no fault was active within 30s; otherwise it is a
-  fault-phase request. Latency histograms are kept overall, per phase, for
-  steady client requests (the tail baseline), and for judged slow windows.
-
-Data-plane invariants (each failure names the seed and replay command):
-
-- (4) Every 5s each member's `Neighbors()` count is at most `MaxNeighbors`
-  (or the estimate of the best shape when no shape meets it) while its
-  view's cell occupancies differ by at most one, and twice that otherwise.
-- (5) Every request reaches a terminal state (served, failed, no route,
-  TTL exhausted, or the origin's 5s deadline) and all its branches resolve
-  within `(MaxDims+3) * 2 * hop timeout + HedgeMax`. A branch whose
-  routers were all members at the same version visits no member twice,
-  takes at most D hops (failovers do not add hops), never exhausts its
-  TTL, and is served by the owner or a member of the owner's cell. No
-  non-truncated request exhausts its TTL in steady state with no view
-  change since a second before it started (TTL exhaustion while a
-  partition move propagates, when the old and new owner each send to the
-  other, is what the TTL is for). A deadline miss in steady state fails.
-- (6) Epochs never decrease. Up to 256 sampled stamps of served metadata
-  requests are checked every 5s on 8 random members: a stamp must not be
-  `Fresh` on a member of its view later than `T + period + slack` after
-  issue, with
-  `slack = period + 2 * TickInterval + 1s + 2 * D * age`, where `D` is the
-  largest `ClockDrift` the scenario injects (at least 0.05%, up to the
-  generated 10%) (a member lags the issuer's epoch phase by at most the
-  period of an anchor that arrived late, plus the leader's and its own
-  tick, plus latency and drift of both clocks). Stamps issued before a
-  `ColdRestart` are dropped: every process that could hold the value
-  crashed, and the new lineage's epoch restarts at zero. The issuer still finds it `Fresh` up to `T - period` after issue
-  when no fault was active within 90s. A member whose view has a newer
-  generation for the keyspace never finds an older stamp `Fresh`.
-  Non-members are not held to the upper bound: one may have anchored its
-  epoch from a stale lineage's snapshot (a restarted process that caught
-  up from a partitioned peer) and lags until it hears the leader. A member
-  without any view finds no expiring stamp fresh (`route.State.Fresh`).
-- (11) After convergence, 8 random partitions per member (1 for the large
-  cases) are walked with `RoutePartition` and `Forward` through every
-  member's own state: at most D hops, no `Direct`, `Gateway`, or `NoRoute`,
-  ending at the owner, or at a backup only when the deciding member finds
-  the owner not `Healthy`.
-- Ejections: `Ejected + Probing` never exceeds `MaxEjectionPercent` of the
-  largest tracked count over the last 335s (the longest ejection), which
-  is recorded on every neighbor change; peers ejected while more were
-  tracked stay ejected when neighbors are removed.
-- Hedges: each member's hedges are at most the hedge ratio times its
-  routed decisions, plus one.
-- Tail latency, judged on requests from clients that are members of their
-  view, start at least 30s after a slow-member fault of at least 10x
-  began, while membership is settled and judged slow members are the only
-  data-plane fault (no other fault except clock skew or drift, API server
-  outage, lease conflicts, or invalidation active within the last two
-  minutes; members slowed below 10x count as another fault): outlier
-  detection is relative to the median of a member's peers, so while most
-  peers time out (partition, loss) a slow member is not an outlier and the
-  inflated median takes a while to recover, and crashed or paused peers
-  take the few ejections `MaxEjectionPercent` allows. The requests that
-  send a hop to a slow
-  member are at most half of the expected count without protection (slow
-  share of running members times the mean path length) when at least 20
-  are expected; with at least 200 baseline and judged requests, p99 is at
-  most the hop timeout plus three times the steady client p99 (at the 99th
-  percentile a request pays at most one hop timeout), and p50 at most
-  twice the steady p50 plus 1ms. The default set adds a targeted case
-  (`slow`: 40 members, two 30x slow members for 150s, clock drift, an
-  invalidation) so the check always runs.
-
-Health variants rotate with the seed: seeds 2 mod 4 use
-`MaxEjectionPercent` 60 and `PanicThreshold` 20 (with the defaults at most
-10% can be ejected and panic needs more than 50%, so panic is
-unreachable), and seeds 3 mod 4 use `HedgeRatio` 0.5 (the 5% default needs
-about 20 routed requests per shard and interval before the first hedge,
-more than simulated members route). The data-plane coverage states are the
-seven decision kinds, the five health states, uneject, panic,
-hedge sent, won, and denied, failover, TTL exhausted, handoff (`PrevOwner`
-set), stamp expired and invalidated, note-version, overload, the route
-check, and a judged tail window.
-
-Known limits: health protection beyond the first hop depends on relays
-seeing enough traffic to each neighbor, which simulated rates give only to
-the hot clients, so p99 in slow windows is bounded by one hop timeout
-rather than by a multiple of the baseline. An idle peer's EWMA decays only
-toward the median, so after a burst of timeouts (message loss) a member's
-median stays high until it observes its peers again.
+`go test ./internal/cachemesh/internal/dst` runs the default seed set. It
+is skipped under `-short` and `-race`. `CACHEMESH_DST_SEED`,
+`CACHEMESH_DST_SEEDS`, and `CACHEMESH_DST_LARGE=1` select longer runs; a
+failure prints its replay command.
 
 ## Defaults
 
