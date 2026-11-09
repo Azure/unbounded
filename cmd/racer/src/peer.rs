@@ -1081,13 +1081,17 @@ impl Requester {
                 _ => None,
             };
             let receive_permit = transfers.admit_receive(&request.request, &scope).await?;
-            let _probe = health.acquire(&next)?;
+            let probe = health.acquire(&next)?;
             let sent = scope.clock().now();
-            let permit = paths
-                .peer_admission
-                .as_ref()
-                .map(|a| a.acquire(&next))
-                .transpose()?;
+            let permit = match paths.peer_admission.as_ref().map(|a| a.acquire(&next)) {
+                Some(Err(error)) => {
+                    // No traffic is sent, so the circuit stays eligible.
+                    probe.cancel();
+                    return Err(error);
+                }
+                permit => permit.transpose()?,
+            };
+            let _probe = probe;
             let binding = forwarding.outbound_binding(&request)?;
             let socket_failure = Rc::new(std::cell::Cell::new(false));
             let response = transfers

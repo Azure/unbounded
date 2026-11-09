@@ -438,6 +438,19 @@ mod circuit {
         key: Option<K>,
     }
 
+    impl<K: Ord> Probe<'_, K> {
+        /// Release a probe that sent no traffic, so its timeout does not keep
+        /// the endpoint ineligible.
+        pub fn cancel(mut self) {
+            if let Some(key) = self.key.take() {
+                if let Some(state) = self.health.states.borrow_mut().get_mut(&key) {
+                    state.probe_until = None;
+                }
+                self.health.probes.borrow_mut().remove(&key);
+            }
+        }
+    }
+
     impl<K: Ord> Drop for Probe<'_, K> {
         /// Release exclusivity without erasing the probe's timeout.
         fn drop(&mut self) {
@@ -461,15 +474,20 @@ mod circuit {
         }
 
         /// Acquire an exclusive half-open guard, or an untracked healthy guard.
+        /// Probe capacity is checked first, so a refusal never starts the
+        /// probe timeout.
         pub fn acquire(&self, key: &K, now: Instant) -> Result<Probe<'_, K>> {
+            let probe = self.states.borrow().contains_key(key);
+            if probe
+                && !self.probes.borrow().contains(key)
+                && self.probes.borrow().len() >= self.capacity
+            {
+                return Err(Error::Overloaded);
+            }
             if !self.try_acquire(key, now) {
                 return Err(Error::Unavailable);
             }
-            let probe = self.states.borrow().contains_key(key);
             let key = if probe {
-                if self.probes.borrow().len() >= self.capacity {
-                    return Err(Error::Overloaded);
-                }
                 // Complete application cloning before publishing exclusive ownership.
                 let indexed = key.clone();
                 let owned = key.clone();
@@ -710,9 +728,10 @@ mod circuit {
             );
         }
 
-        /// Probe capacity and failure records remain independent after success.
+        /// Probe capacity and failure records remain independent after success,
+        /// and a capacity refusal does not start the refused key's timeout.
         #[test]
-        fn full_probe_set_preserves_rejected_attempt_timeout() {
+        fn full_probe_set_rejection_keeps_endpoint_eligible() {
             let now = Instant::now();
             let timeout = Duration::from_secs(1);
             let health = Circuits::new(1, timeout);
@@ -729,9 +748,34 @@ mod circuit {
             assert!(health.available(&8, now));
             assert!(matches!(health.acquire(&8, now), Err(Error::Overloaded)));
             drop(held);
-            assert!(!health.available(&8, now));
+            assert!(health.available(&8, now));
+            let probe = health.acquire(&8, now).unwrap();
+            assert!(matches!(health.acquire(&8, now), Err(Error::Unavailable)));
+            drop(probe);
             assert!(matches!(health.acquire(&8, now), Err(Error::Unavailable)));
             assert!(health.acquire(&8, now + timeout).is_ok());
+        }
+
+        /// A canceled probe releases exclusivity and its timeout; healthy guards
+        /// and later failures are unaffected.
+        #[test]
+        fn canceled_probe_keeps_endpoint_eligible() {
+            let now = Instant::now();
+            let health = Circuits::new(1, Duration::from_secs(1));
+            health.acquire(&9, now).unwrap().cancel();
+            assert!(health.is_empty());
+            health.failure(&7, now, |_, _| Duration::ZERO).unwrap();
+            health.acquire(&7, now).unwrap().cancel();
+            assert!(health.available(&7, now));
+            assert_eq!(health.len(), 1);
+            let probe = health.acquire(&7, now).unwrap();
+            assert!(!health.available(&7, now));
+            health
+                .failure(&7, now, |_, _| Duration::from_secs(5))
+                .unwrap();
+            probe.cancel();
+            assert!(!health.available(&7, now));
+            assert!(health.available(&7, now + Duration::from_secs(5)));
         }
     }
 }
