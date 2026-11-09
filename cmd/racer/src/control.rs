@@ -620,7 +620,14 @@ pub(crate) mod tests {
         use racer_io::sim::{Fault, SimOs};
         use std::future::Future;
         use std::task::{Context, Poll};
-        for case in ["success", "write", "rename", "cancel-rename", "sync"] {
+        for case in [
+            "success",
+            "write",
+            "rename",
+            "cancel-before-rename",
+            "cancel-rename",
+            "sync",
+        ] {
             let sim = SimOs::new();
             let env = racer_io::Env::sim(&sim, racer_io::WorkerCtx::host());
             let r = Reactor::new(
@@ -651,9 +658,28 @@ pub(crate) mod tests {
                 "cancel-rename" | "sync" => {
                     sim.inject("rename", Fault::HoldCompletion(20)).unwrap()
                 }
+                // Keep the rename submitted but unexecuted so the cancel wins.
+                "cancel-before-rename" => sim.inject("rename", Fault::Delay(1_000_000)).unwrap(),
                 _ => (),
             }
             let mut operation = Box::pin(atomic_write(&r, &dir, "identity", b"new", &scope));
+            if case == "cancel-before-rename" {
+                let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+                for _ in 0..100 {
+                    assert!(matches!(operation.as_mut().poll(&mut cx), Poll::Pending));
+                    r.poll_budgeted(64).unwrap();
+                    r.wait(Duration::from_millis(1)).unwrap();
+                    if sim
+                        .trace()
+                        .iter()
+                        .any(|event| event.operation == "submit:rename")
+                    {
+                        break;
+                    }
+                }
+                assert_eq!(sim.read_file(Path::new("/identity")).unwrap(), b"old");
+                scope.cancel().unwrap();
+            }
             if matches!(case, "cancel-rename" | "sync") {
                 let mut cx = Context::from_waker(futures::task::noop_waker_ref());
                 for _ in 0..100 {
@@ -679,7 +705,10 @@ pub(crate) mod tests {
             let expected = match case {
                 "write" => Err(Error::Os(libc::ENOSPC)),
                 "rename" => Err(Error::RenameUncertain(PublicationCause::Os(libc::EIO))),
-                "cancel-rename" => Err(Error::RenameUncertain(PublicationCause::Canceled)),
+                // A cancel before the rename runs leaves its outcome uncertain.
+                "cancel-before-rename" => Err(Error::RenameUncertain(PublicationCause::Canceled)),
+                // The rename already succeeded, so the cancel only stops the sync.
+                "cancel-rename" => Err(Error::PublishedNotDurable(PublicationCause::Canceled)),
                 "sync" => Err(Error::PublishedNotDurable(PublicationCause::Os(libc::EIO))),
                 _ => Ok(()),
             };
