@@ -173,7 +173,8 @@ pub enum State {
     Partial,
     #[serde(rename = "FAILED")]
     Failed,
-    #[serde(rename = "CANCELED")]
+    // The wire literal predates the American-English rule and is a client contract.
+    #[serde(rename = "CANCELLED")]
     Canceled,
 }
 
@@ -317,6 +318,24 @@ mod tests {
 
     fn parse(body: &str) -> Result<Spec, PrefetchError> {
         parse_spec(body.as_bytes(), false, &Config::default())
+    }
+
+    #[test]
+    fn state_wire_literals_match_clients() {
+        let cases = [
+            (State::Queued, "QUEUED"),
+            (State::Running, "RUNNING"),
+            (State::Succeeded, "SUCCEEDED"),
+            (State::Partial, "PARTIAL"),
+            (State::Failed, "FAILED"),
+            (State::Canceled, "CANCELLED"),
+        ];
+        for (state, literal) in cases {
+            assert_eq!(
+                serde_json::to_value(state).unwrap(),
+                serde_json::Value::String(literal.into())
+            );
+        }
     }
 
     #[test]

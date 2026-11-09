@@ -928,7 +928,7 @@ dropped. Fills already in flight finish. A `PUT` with a higher position also
 restarts a finished ticket.
 
 Every accepted `PUT` renews the TTL. When the TTL ends, a ticket that is still
-working becomes `CANCELED` with reason `expired`. A settled ticket keeps its
+working becomes `CANCELLED` with reason `expired`. A settled ticket keeps its
 state. Either way it releases its interest. Nothing is evicted. Finished tickets
 stay visible for `RACER_PREFETCH_TICKET_RETENTION_SECS` after expiry or cancel.
 
@@ -982,9 +982,11 @@ stay visible for `RACER_PREFETCH_TICKET_RETENTION_SECS` after expiry or cancel.
 | `SUCCEEDED` | Settled; every ref succeeded |
 | `PARTIAL` | Settled; some refs failed |
 | `FAILED` | Settled; every ref failed |
-| `CANCELED` | Stopped. `reason` is `client`, `expired`, `superseded` (cache UID changed), `cache_removed`, or `passthrough` |
+| `CANCELLED` | Stopped. `reason` is `client`, `expired`, `superseded` (cache UID changed), `cache_removed`, or `passthrough` |
 
-`reason` is `null` unless the state is `CANCELED`. `settled` is true when
+The `CANCELLED` literal keeps its historical spelling because clients match on it.
+
+`reason` is `null` unless the state is `CANCELLED`. `settled` is true when
 nothing for the current position is queued or in flight. A settled window goes
 back to `RUNNING` on its next update.
 
@@ -1035,7 +1037,7 @@ Ref `error` values:
 `GET /v1/prefetches` returns `{"prefetches": [...]}`: summaries sorted by id,
 without `refs` or `coverage`.
 
-`DELETE` returns `200` with the `CANCELED` status and reason `client`. It
+`DELETE` returns `200` with the `CANCELLED` status and reason `client`. It
 releases interest. Fills in flight finish and nothing is evicted.
 
 #### Errors

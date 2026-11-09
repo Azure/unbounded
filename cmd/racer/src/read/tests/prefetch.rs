@@ -165,7 +165,7 @@ fn put_fills_every_page_through_the_owner_and_reports_success() {
         b"",
     );
     assert_eq!(status_code(&deleted), 200);
-    assert_eq!(json(&deleted)["state"], "CANCELED");
+    assert_eq!(json(&deleted)["state"], "CANCELLED");
     assert_eq!(json(&deleted)["reason"], "client");
     let missing = run(&mut f, &mut endpoint, &local, get("nope"), b"");
     assert_eq!(status_code(&missing), 404);
