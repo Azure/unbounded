@@ -25,8 +25,7 @@ const (
 	// In a cluster of a few hundred agents 256 makes every agent a direct
 	// neighbor of every other one, so the owner of a popular chunk serves
 	// every agent itself. 32 forces a multi-hop relay grid that spreads
-	// that load over relay caches; on 142 nodes it pulled a 40GB image in
-	// a p50 of 91s against 104s with 256 (designs/gantry-cachemesh-benchmark.md).
+	// that load over relay caches.
 	DefaultCachemeshMaxNeighbors = 32
 
 	// MinCachemeshChunkSize and MaxCachemeshChunkSize bound chunk_size.
@@ -44,7 +43,7 @@ const (
 // the cachemesh grid. Agents keep chunks only in bounded memory; the only
 // on-disk copy is containerd's content store (ContentRoot), which agents
 // read back to serve peers. Tag resolutions are cached for 5 minutes.
-// See designs/gantry-cachemesh.md.
+// See designs/cachemesh.md.
 type CachemeshConfig struct {
 	// Enabled turns the cachemesh path on (GANTRY_CACHEMESH_ENABLED). The
 	// Racer backend ignores it.

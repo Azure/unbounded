@@ -16,7 +16,7 @@
 //
 // The cachemesh library only routes; this package owns the data-plane
 // transport (HTTP on the transfer listener), the chunk store, coalescing,
-// retries, hedging, and metrics. See designs/gantry-cachemesh.md.
+// retries, hedging, and metrics. See designs/cachemesh.md.
 package meshfetch
 
 import (

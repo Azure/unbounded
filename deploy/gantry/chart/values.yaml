@@ -121,7 +121,7 @@ gantry:
       endpoint: https://registry.example.com
       credentialsPath: ""
       namespaceAlias: ""
-  # Optional cachemesh content path (designs/gantry-cachemesh.md). Off by
+  # Optional cachemesh content path (designs/cachemesh.md). Off by
   # default; when disabled nothing below is rendered and the agent behaves
   # exactly as without it. When enabled, blobs are striped into chunks owned
   # by individual agents, which pull each chunk from the origin once and relay
@@ -155,10 +155,8 @@ gantry:
     # bytes yet, and to keep chunks peers read (or this agent owns) in
     # memory for later peers (up to 30s unused). When exhausted, the slowest
     # such reader paces the fill (2GiB). Chunk memory is at most about this
-    # plus 4MiB per concurrent fill plus 1MiB per active reader; measured
-    # peaks were about 3GiB during a 142-node 40GB pull and about 0.6GiB
-    # idle. The default 8Gi memory limit is ample; 4Gi also held in the
-    # benchmark.
+    # plus 4MiB per concurrent fill plus 1MiB per active reader. Size the
+    # memory limit above that bound.
     inflightBytes: 0
     # Concurrent chunk fills from peers or the origin (64).
     maxConcurrentChunkFills: 0
