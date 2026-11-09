@@ -40,16 +40,61 @@ type metaCall struct {
 	err  error
 }
 
-// metaCache holds resolved tags with singleflight per key.
+// metaCacheBytes bounds the manifest bytes the metadata cache retains,
+// outside the chunk memory budget.
+const metaCacheBytes = 64 << 20
+
+// metaCache holds resolved tags with singleflight per key. It keeps at most
+// max entries and maxBytes of manifest bodies.
 type metaCache struct {
-	mu    sync.Mutex
-	max   int
-	m     map[string]*metaEntry
-	calls map[string]*metaCall
+	mu       sync.Mutex
+	max      int
+	maxBytes int
+	bytes    int
+	m        map[string]*metaEntry
+	calls    map[string]*metaCall
 }
 
-func newMetaCache(maxEntries int) *metaCache {
-	return &metaCache{max: maxEntries, m: make(map[string]*metaEntry), calls: make(map[string]*metaCall)}
+func newMetaCache(maxEntries, maxBytes int) *metaCache {
+	return &metaCache{max: maxEntries, maxBytes: maxBytes, m: make(map[string]*metaEntry), calls: make(map[string]*metaCall)}
+}
+
+// remove drops key. The caller holds mu.
+func (c *metaCache) remove(key string) {
+	if e := c.m[key]; e != nil {
+		c.bytes -= len(e.body)
+		delete(c.m, key)
+	}
+}
+
+// put caches e under key, first dropping expired entries and then arbitrary
+// ones until it fits. A body larger than the budget is not cached. The
+// caller holds mu.
+func (c *metaCache) put(key string, e *metaEntry, fresh func(cachemesh.Stamp) bool) {
+	c.remove(key)
+
+	if len(e.body) > c.maxBytes {
+		return
+	}
+
+	if len(c.m) >= c.max || c.bytes+len(e.body) > c.maxBytes {
+		for k, old := range c.m {
+			if !fresh(old.stamp) {
+				c.remove(k)
+			}
+		}
+	}
+
+	for k := range c.m {
+		if len(c.m) < c.max && c.bytes+len(e.body) <= c.maxBytes {
+			break
+		}
+
+		c.remove(k)
+	}
+
+	c.m[key] = e
+	c.bytes += len(e.body)
 }
 
 func metaKey(registry, repo, tag string) string {
@@ -104,7 +149,7 @@ func (n *Node) resolveMeta(ctx context.Context, registry, repo, tag string, deci
 			return e, nil
 		}
 
-		delete(c.m, key)
+		c.remove(key)
 	}
 
 	call := c.calls[key]
@@ -119,14 +164,7 @@ func (n *Node) resolveMeta(ctx context.Context, registry, repo, tag string, deci
 			delete(c.calls, key)
 
 			if call.err == nil {
-				if len(c.m) >= c.max {
-					for k := range c.m {
-						delete(c.m, k)
-						break
-					}
-				}
-
-				c.m[key] = call.e
+				c.put(key, call.e, func(s cachemesh.Stamp) bool { return n.mesh.Fresh(n.metaKS, s) })
 			}
 			c.mu.Unlock()
 

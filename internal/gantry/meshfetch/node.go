@@ -279,7 +279,7 @@ func New(cfg Config) (*Node, error) {
 		metaKS:  metaKS,
 		store:   st,
 		holders: newHolders(holderChunks),
-		meta:    newMetaCache(4096),
+		meta:    newMetaCache(4096, metaCacheBytes),
 		client:  cfg.Client,
 		log:     log,
 		serves:  make(chan struct{}, cfg.tune.maxServes),

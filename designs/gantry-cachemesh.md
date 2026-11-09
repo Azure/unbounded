@@ -386,6 +386,10 @@ Tag resolutions use a separate keyspace, `gantry-meta`, with a 5m TTL
   entry with the owner's stamp (`Gantry-Stamp-Expires`, `Gantry-Stamp-Gen`).
 - Every holder checks `Mesh.Fresh` before using a copy. One resolution per
   key runs at a time on each node.
+- Each node keeps at most 4096 entries and 64 MiB of manifest bodies
+  (`metaCacheBytes`). An insert that would exceed either bound drops expired
+  entries first, then arbitrary ones; a body larger than the byte budget is
+  served but not cached.
 
 The mirror answers a tag request from this cache only when `cache_tags` is
 on, the request has no `Authorization` header, and the registry does not

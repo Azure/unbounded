@@ -899,3 +899,37 @@ func TestHoldersRecentFirstBounded(t *testing.T) {
 		t.Fatalf("expired entries listed: %v", got)
 	}
 }
+
+func TestMetaCacheByteBudget(t *testing.T) {
+	c := newMetaCache(100, 10)
+	fresh := func(s cachemesh.Stamp) bool { return s.Expires != 1 }
+
+	c.put("a", &metaEntry{body: make([]byte, 4), stamp: cachemesh.Stamp{Expires: 1}}, fresh)
+	c.put("b", &metaEntry{body: make([]byte, 4)}, fresh)
+	c.put("c", &metaEntry{body: make([]byte, 4)}, fresh)
+
+	if c.m["a"] != nil || c.m["b"] == nil || c.m["c"] == nil || c.bytes != 8 {
+		t.Fatalf("expired entry not dropped first: keys=%d bytes=%d", len(c.m), c.bytes)
+	}
+
+	c.put("d", &metaEntry{body: make([]byte, 6)}, fresh)
+
+	if c.bytes > 10 || c.m["d"] == nil {
+		t.Fatalf("over budget: bytes=%d", c.bytes)
+	}
+
+	c.put("big", &metaEntry{body: make([]byte, 11)}, fresh)
+
+	if c.m["big"] != nil || c.bytes > 10 {
+		t.Fatalf("oversized body cached: bytes=%d", c.bytes)
+	}
+
+	sum := 0
+	for _, e := range c.m {
+		sum += len(e.body)
+	}
+
+	if sum != c.bytes {
+		t.Fatalf("accounting %d != %d", c.bytes, sum)
+	}
+}
