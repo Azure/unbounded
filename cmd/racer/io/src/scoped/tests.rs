@@ -451,3 +451,36 @@ mod retry {
         assert_eq!(attempts.get(), 1);
     }
 }
+
+/// Dropping a pending kernel sleep releases its cancel-token registration.
+#[test]
+fn kernel_sleep_until_drop_deregisters_cancel_waiter() {
+    use crate::CancelToken;
+
+    #[derive(Clone)]
+    struct TokenScope(CancelToken);
+
+    impl Scope for TokenScope {
+        type Error = Error;
+
+        fn check(&self) -> Result<()> {
+            self.0.check()
+        }
+
+        fn cancel_token(&self) -> Option<&CancelToken> {
+            Some(&self.0)
+        }
+    }
+
+    if kernel_reactor(1).is_none() {
+        return;
+    }
+    let reactor = super::Reactor::<TokenScope>::new(4, &host_env());
+    reactor.init().unwrap();
+    let scope = TokenScope(CancelToken::new());
+    let mut sleep = reactor.sleep_until(Instant::now() + Duration::from_secs(60), &scope);
+    assert!(poll(&mut sleep).is_pending());
+    assert_eq!(scope.0.waiters(), 1);
+    drop(sleep);
+    assert_eq!(scope.0.waiters(), 0);
+}

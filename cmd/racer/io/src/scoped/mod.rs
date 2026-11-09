@@ -1076,23 +1076,21 @@ pub mod timer {
                     _ => until,
                 };
                 let mut sleep = io.sleep_until(target);
-                let mut key = None;
-                let result = std::future::poll_fn(|cx| {
-                    if let Some(token) = &ctx.cancel
-                        && token.register(&mut key, cx.waker()).is_some()
-                    {
-                        return Poll::Ready(scope.check().and(Err(Error::Canceled.into())));
+                // Deregisters on drop, including when this future is dropped.
+                let cancellation = ctx.cancel.as_ref().map(crate::CancelToken::wait);
+                std::future::poll_fn(|cx| {
+                    if let Some(cancellation) = &cancellation {
+                        cancellation.register(cx.waker());
+                        if cancellation.token().is_canceled() {
+                            return Poll::Ready(scope.check().and(Err(Error::Canceled.into())));
+                        }
                     }
                     if let Err(error) = scope.check() {
                         return Poll::Ready(Err(error));
                     }
                     Pin::new(&mut sleep).poll(cx).map(|()| scope.check())
                 })
-                .await;
-                if let Some(token) = &ctx.cancel {
-                    token.deregister(&mut key);
-                }
-                result
+                .await
             })
         }
     }
