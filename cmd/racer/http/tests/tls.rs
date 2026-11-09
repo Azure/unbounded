@@ -899,6 +899,14 @@ fn small_plan(bytes: &[u8]) -> Result<Option<http1::small_exchange::Plan<Error, 
 }
 
 fn small_exchange(fixture: &Fixture, endpoint: &Endpoint) -> Result<(u16, Vec<u8>, bool, bool)> {
+    small_exchange_limited(fixture, endpoint, 16 * 1024)
+}
+
+fn small_exchange_limited(
+    fixture: &Fixture,
+    endpoint: &Endpoint,
+    head_limit: usize,
+) -> Result<(u16, Vec<u8>, bool, bool)> {
     let scope = scope();
     drive(&fixture.reactor, async {
         let connection = fixture.pool.checkout(endpoint, &scope).await?;
@@ -909,7 +917,7 @@ fn small_exchange(fixture: &Fixture, endpoint: &Endpoint) -> Result<(u16, Vec<u8
             .exchange_small(
                 connection,
                 b"GET /small HTTP/1.1\r\nHost: test\r\n\r\n",
-                16 * 1024,
+                head_limit,
                 &mut parse,
                 &scope,
             )
@@ -1018,6 +1026,30 @@ fn small_exchange_rejects_pipelined_bytes_oversize_and_truncation() {
         let endpoint = Endpoint { address, tls: None };
         let result = small_exchange(&fixture, &endpoint);
         assert_eq!(result.err(), Some(expected));
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn small_exchange_enforces_head_limit_within_one_read() {
+    // Both heads arrive in one read. The second ends past the limit, so it is
+    // rejected even though the whole head was received.
+    let short = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    let head = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n".len();
+    let long = b"HTTP/1.1 200 OK\r\nX-Pad: aaaaaaaaaaaaaaaaaaaa\r\nContent-Length: 2\r\n\r\nok";
+    for (response, expected) in [
+        (&short[..], Ok((200, b"ok".to_vec(), false, false))),
+        (&long[..], Err(Error::Http(http1::Error::HeadTooLarge))),
+    ] {
+        let fixture = fixture();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = serve_small(listener, None, vec![(response, true)]);
+        let endpoint = Endpoint { address, tls: None };
+        assert_eq!(
+            small_exchange_limited(&fixture, &endpoint, head + 8),
+            expected
+        );
         server.join().unwrap();
     }
 }

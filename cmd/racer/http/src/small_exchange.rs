@@ -88,7 +88,8 @@ impl<C: Context> HttpIo<C> {
             let mut received = Zeroizing::new(Vec::new());
             let mut eof = false;
             let plan = loop {
-                if let Some(plan) = parse(&received)? {
+                // The head must fit in `head_limit`; later bytes are body.
+                if let Some(plan) = parse(&received[..received.len().min(head_limit)])? {
                     break plan;
                 }
                 if eof {
