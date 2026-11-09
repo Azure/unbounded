@@ -7,6 +7,8 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 
@@ -25,7 +27,6 @@ func benchCluster(b *testing.B, n int) (*cluster, []byte) {
 	c := newCluster(b, clusterOpts{
 		n:         n,
 		chunkSize: benchChunk,
-		diskBytes: 2 * benchBlob,
 		lookahead: 8,
 	})
 
@@ -100,47 +101,92 @@ func BenchmarkFetchBlobFromPeerCache(b *testing.B) {
 	}
 }
 
-// BenchmarkStreamFromDisk measures copying a chunk on disk to a writer,
-// the per-hop serve cost of a cold page without the network.
-func BenchmarkStreamFromDisk(b *testing.B) {
-	for _, mode := range []PageCacheMode{PageCacheBypass, PageCacheDrop, PageCacheKeep} {
-		b.Run(string(mode), func(b *testing.B) {
-			s := newTestStore(b, func(c *storeConfig) {
-				c.chunkSize = benchChunk
-				c.pageSize = 1 << 20
-				c.diskBudget = 4 * benchChunk
-				c.hotBudget = 0
-				c.pageCache = mode
-			})
-			completeFill(b, s, key(1), make([]byte, benchChunk), false)
+// benchContentStore writes a one-chunk blob to a content root on disk and
+// returns a DirContent over it with the blob's digest.
+func benchContentStore(b *testing.B) (*DirContent, string) {
+	b.Helper()
 
-			b.SetBytes(benchChunk)
-			b.ResetTimer()
+	root := b.TempDir()
+	dir := filepath.Join(root, "blobs", "sha256")
 
-			for range b.N {
-				r := s.get(key(1), 0)
-				if _, err := r.streamTo(context.Background(), &copySink{buf: make([]byte, 1<<20)}); err != nil {
-					b.Fatal(err)
-				}
-
-				r.close()
-			}
-		})
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		b.Fatal(err)
 	}
+
+	d := fmt.Sprintf("sha256:%064x", 1)
+	if err := os.WriteFile(filepath.Join(dir, hexOf(d)), make([]byte, benchChunk), 0o444); err != nil {
+		b.Fatal(err)
+	}
+
+	dc, err := NewDirContent(DirContentOptions{Root: root})
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	b.Cleanup(dc.Close)
+
+	return dc, d
 }
 
-// BenchmarkFanOutFromDisk measures 32 concurrent readers of one chunk on
-// disk: pages are read once and shared.
-func BenchmarkFanOutFromDisk(b *testing.B) {
-	const readers = 32
+// localReader returns a reader of a complete chunk of k whose pages are
+// all behind the window, so every page is read from the content store.
+func localReader(s *store, k chunkKey) *reader {
+	f, r := s.newLocalFill(k, 0)
+	_ = f.setMeta(benchChunk, "", benchChunk)
 
+	f.mu.Lock()
+	f.n = benchChunk
+	f.winStart = benchChunk / s.cfg.pageSize
+	f.localEnd = benchChunk
+	f.mu.Unlock()
+
+	f.finish(nil)
+	f.release()
+
+	return r
+}
+
+// BenchmarkStreamFromLocalContent measures copying a chunk from the
+// content store (page cache warm, as right after containerd wrote it) to a
+// writer: the per-hop serve cost of a page behind the window.
+func BenchmarkStreamFromLocalContent(b *testing.B) {
+	dc, d := benchContentStore(b)
 	s := newTestStore(b, func(c *storeConfig) {
 		c.chunkSize = benchChunk
 		c.pageSize = 1 << 20
-		c.diskBudget = 4 * benchChunk
-		c.hotBudget = 64 << 20
+		c.hotBudget = 0
+		c.content = dc
 	})
-	completeFill(b, s, key(1), make([]byte, benchChunk), false)
+	k := chunkKey{digest: d}
+
+	b.SetBytes(benchChunk)
+	b.ResetTimer()
+
+	for range b.N {
+		r := localReader(s, k)
+
+		if _, err := r.streamTo(context.Background(), &copySink{buf: make([]byte, 1<<20)}); err != nil {
+			b.Fatal(err)
+		}
+
+		r.close()
+	}
+}
+
+// BenchmarkFanOutFromLocalContent measures 32 concurrent readers of one
+// chunk behind the window: pages are read from the content store once and
+// shared.
+func BenchmarkFanOutFromLocalContent(b *testing.B) {
+	const readers = 32
+
+	dc, d := benchContentStore(b)
+	s := newTestStore(b, func(c *storeConfig) {
+		c.chunkSize = benchChunk
+		c.pageSize = 1 << 20
+		c.hotBudget = 64 << 20
+		c.content = dc
+	})
+	k := chunkKey{digest: d}
 
 	b.SetBytes(benchChunk * readers)
 	b.ResetTimer()
@@ -149,7 +195,7 @@ func BenchmarkFanOutFromDisk(b *testing.B) {
 		var wg sync.WaitGroup
 
 		for range readers {
-			r := s.get(key(1), 0)
+			r := localReader(s, k)
 
 			wg.Go(func() {
 				defer r.close()
@@ -159,28 +205,19 @@ func BenchmarkFanOutFromDisk(b *testing.B) {
 		}
 
 		wg.Wait()
-		s.pages.purge(r0(s))
+		s.pages.purge(d)
 	}
 
-	b.ReportMetric(float64(s.stats().DiskReads)/float64(b.N), "disk-reads/op")
-}
-
-// r0 returns the fill of key(1).
-func r0(s *store) *fill {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	return s.m[key(1)]
+	b.ReportMetric(float64(s.stats().LocalReads)/float64(b.N), "local-reads/op")
 }
 
 // BenchmarkFillWithFollowers measures a fill read from memory while 8
-// readers follow it (cut-through), written to disk.
+// readers follow it (cut-through).
 func BenchmarkFillWithFollowers(b *testing.B) {
 	s := newTestStore(b, func(c *storeConfig) {
 		c.chunkSize = benchChunk
 		c.pageSize = 1 << 20
 		c.window = 4
-		c.diskBudget = 4 * benchChunk
 	})
 
 	b.SetBytes(benchChunk)
@@ -233,7 +270,7 @@ func (s *copySink) Write(p []byte) (int, error) {
 // BenchmarkFetchBlobFromPeerCacheVerified is FetchBlobFromPeerCache with
 // full-blob digest verification on.
 func BenchmarkFetchBlobFromPeerCacheVerified(b *testing.B) {
-	c := newCluster(b, clusterOpts{n: 4, chunkSize: benchChunk, diskBytes: 2 * benchBlob, lookahead: 8, verify: true})
+	c := newCluster(b, clusterOpts{n: 4, chunkSize: benchChunk, lookahead: 8, verify: true})
 	d := c.origin.add(randomBlob(43, benchBlob), "")
 
 	benchFetch(b, c.nodes[1], d)

@@ -58,12 +58,14 @@ func (n *Node) FetchBlob(ctx context.Context, w io.Writer, ref ifaces.OriginRef,
 	}
 
 	cs := n.cfg.ChunkSize
+	self := n.mesh.Addr()
 	mk := func(i int64) chunkReq {
 		return chunkReq{
-			registry: ref.Registry,
-			repo:     ref.Repository,
-			d:        ref.Digest,
-			key:      chunkKey{digest: ref.Digest.String(), kind: kind, index: i},
+			registry:  ref.Registry,
+			repo:      ref.Repository,
+			d:         ref.Digest,
+			key:       chunkKey{digest: ref.Digest.String(), kind: kind, index: i},
+			requester: self,
 		}
 	}
 

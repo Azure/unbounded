@@ -10,9 +10,13 @@ import (
 	"unsafe"
 )
 
+// pageAlign is the alignment of page buffers and their capacity.
+const pageAlign = 4096
+
+func alignUp(n int64) int64 { return (n + pageAlign - 1) &^ (pageAlign - 1) }
+
 // page is a reference-counted page buffer. Its capacity is the page size
-// rounded up to dioAlign, and its start is dioAlign aligned, so it can be
-// used for O_DIRECT I/O. On Linux page buffers are anonymous mappings
+// rounded up to pageAlign, and its start is pageAlign aligned. On Linux page buffers are anonymous mappings
 // outside the Go heap: their memory is exactly the live pages, it does not
 // inflate the garbage collector's heap goal, and it returns to the system
 // as soon as a buffer is unmapped.
@@ -102,28 +106,29 @@ func (pp *pagePool) drain() {
 	}
 }
 
-// alignedBuf returns n bytes starting at a dioAlign boundary.
+// alignedBuf returns n bytes starting at a pageAlign boundary.
 func alignedBuf(n int) []byte {
-	b := make([]byte, n+dioAlign)
+	b := make([]byte, n+pageAlign)
 	off := 0
 
-	if r := int(uintptr(unsafe.Pointer(&b[0])) & (dioAlign - 1)); r != 0 { //nolint:gosec // address arithmetic for alignment only
-		off = dioAlign - r
+	if r := int(uintptr(unsafe.Pointer(&b[0])) & (pageAlign - 1)); r != 0 { //nolint:gosec // address arithmetic for alignment only
+		off = pageAlign - r
 	}
 
 	return b[off : off+n : off+n]
 }
 
-// pageKey names one page of one fill. The fill pointer, not the chunk key,
-// identifies the data: a refilled chunk is a different fill.
+// pageKey names one page of a blob by its absolute page index. Every copy
+// of a blob holds the same bytes, so readers of different fills of the
+// same chunk share pages.
 type pageKey struct {
-	f   *fill
-	idx int
+	digest string
+	idx    int64
 }
 
-// diskPage is a page read from a chunk file, shared by every concurrent
-// reader of the same page (read coalescing). Pages that had two or more
-// readers may stay in the hot tier after the last reader is done.
+// diskPage is a page read from the local content store, shared by every
+// concurrent reader of the same page (read coalescing). Pages that had two
+// or more readers may stay in the hot tier after the last reader is done.
 type diskPage struct {
 	key   pageKey
 	p     *page
@@ -140,10 +145,10 @@ type diskPage struct {
 	prev, next *diskPage
 }
 
-// pageCache coalesces disk page reads and keeps a small hot tier of pages
-// with repeated demand: pages that had two or more concurrent readers, or
-// that are read again while their key is still in a small ghost list of
-// recently read pages.
+// pageCache coalesces page reads from the local content store and keeps a
+// small hot tier of pages with repeated demand: pages that had two or more
+// concurrent readers, or that are read again while their key is still in
+// a small ghost list of recently read pages.
 type pageCache struct {
 	pool   *pagePool
 	budget int64
@@ -177,11 +182,11 @@ func newPageCache(pool *pagePool, budget int64) *pageCache {
 	return c
 }
 
-// get returns page idx of f with n valid bytes, reading it from f's file
-// unless another reader is reading it or it is in the hot tier. The caller
-// must call put.
-func (c *pageCache) get(f *fill, file *chunkFile, idx, n int) (*diskPage, error) {
-	k := pageKey{f: f, idx: idx}
+// get returns page idx (absolute, in units of the page size) of blob d
+// with n valid bytes, reading it from src unless another reader is reading
+// it or it is in the hot tier. The caller must call put.
+func (c *pageCache) get(src ContentSource, d string, idx int64, n int) (*diskPage, error) {
+	k := pageKey{digest: d, idx: idx}
 
 	c.mu.Lock()
 	if e := c.m[k]; e != nil {
@@ -216,7 +221,7 @@ func (c *pageCache) get(f *fill, file *chunkFile, idx, n int) (*diskPage, error)
 	e.p = c.pool.get()
 	e.n = n
 
-	err := f.store.readFile(file, e.p.buf, int64(idx)*int64(c.pool.size), n)
+	_, err := src.ReadAt(d, e.p.buf[:n], idx*int64(c.pool.size))
 	if err != nil {
 		e.err = err
 
@@ -268,7 +273,7 @@ func (c *pageCache) remember(k pageKey) {
 		return
 	}
 
-	if old := c.ghostRing[c.ghostNext]; old.f != nil {
+	if old := c.ghostRing[c.ghostNext]; old.digest != "" {
 		delete(c.ghost, old)
 	}
 
@@ -330,21 +335,21 @@ func (c *pageCache) drop(e *diskPage) {
 	}
 }
 
-// purge drops every page of f. Pages with readers are dropped when the
-// last one is done.
-func (c *pageCache) purge(f *fill) {
+// purge drops every page of blob d. Pages with readers are dropped when
+// the last one is done.
+func (c *pageCache) purge(d string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	for i, k := range c.ghostRing {
-		if k.f == f {
+		if k.digest == d {
 			delete(c.ghost, k)
 			c.ghostRing[i] = pageKey{}
 		}
 	}
 
 	for k, e := range c.m {
-		if k.f != f {
+		if k.digest != d {
 			continue
 		}
 

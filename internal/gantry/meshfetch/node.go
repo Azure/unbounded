@@ -27,6 +27,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/Azure/unbounded/internal/cachemesh"
@@ -46,6 +47,7 @@ const (
 // Request and response headers of the chunk and metadata endpoints.
 const (
 	headerRoute       = "Gantry-Cachemesh-Route"
+	headerRequester   = "Gantry-Cachemesh-Requester"
 	headerBlobSize    = "Gantry-Blob-Size"
 	headerStampExpire = "Gantry-Stamp-Expires"
 	headerStampGen    = "Gantry-Stamp-Gen"
@@ -66,10 +68,13 @@ type TagOrigin interface {
 type Hooks struct {
 	// OnLookup reports a chunk lookup by a local blob request ("local") or
 	// a peer ("peer"): result is "hit" (complete in cache), "joined" (an
-	// in-progress fill), or "fill" (a new fill started).
+	// in-progress fill), "fill" (a new fill started), or "local" (a peek
+	// served from the local content store).
 	OnLookup func(requester, result string)
 	// OnFill reports a finished fill attempt: source is "origin", "peer",
-	// "prev_owner", or "owner" (a backup reading through from the owner);
+	// "prev_owner", "owner" (a backup reading through from the owner),
+	// "local" (the local content store), or "holder" (a recent
+	// requester's content store);
 	// outcome is "ok" or "error".
 	OnFill func(source, outcome string, bytes int64, d time.Duration)
 	// OnPeerResult reports every peer request outcome as given to
@@ -87,8 +92,6 @@ type Hooks struct {
 	OnBlob func(outcome string, bytes int64, d time.Duration)
 	// OnMeta reports a tag lookup: "hit", "origin", "peer", "error".
 	OnMeta func(outcome string)
-	// OnEvict reports bytes evicted from the disk chunk store.
-	OnEvict func(bytes int64)
 }
 
 // Config configures a Node.
@@ -101,17 +104,15 @@ type Config struct {
 	Tags TagOrigin
 
 	ChunkSize int64
-	// ChunkDir holds chunk files. It is wiped by New. Empty disables the
-	// disk tier: chunks then only stream through memory.
-	ChunkDir string
-	// DiskBytes bounds chunk files in ChunkDir. Zero disables the disk
-	// tier.
-	DiskBytes int64
-	// MemoryBytes bounds the hot page tier: pages read from disk by
-	// concurrent readers that stay in memory. Zero disables it.
+	// Content is the local containerd content store, the only disk tier:
+	// chunks behind a fill's window and chunks no longer in memory are
+	// read from it. Nil serves peers from memory only.
+	Content ContentSource
+	// MemoryBytes bounds the hot page tier: pages read from the content
+	// store by concurrent readers that stay in memory. Zero disables it.
 	MemoryBytes int64
-	// PageSize is the unit of in-flight buffers, disk I/O, read
-	// coalescing, and the hot tier. Zero uses min(1MiB, ChunkSize). It
+	// PageSize is the unit of in-flight buffers, content store reads,
+	// read coalescing, and the hot tier. Zero uses min(1MiB, ChunkSize). It
 	// must divide ChunkSize.
 	PageSize int
 	// FillPages is the number of in-flight pages each fill holds. Zero
@@ -119,19 +120,13 @@ type Config struct {
 	FillPages int
 	// InflightBytes bounds pages that fills borrow beyond FillPages: for a
 	// reader that lags behind a fill that peers read, and to keep chunks
-	// that peers read in memory for later peers. When it is exhausted a
-	// fill with a lagging reader spills to disk. Zero disables borrowing.
+	// that peers read in memory for later peers. When it is exhausted the
+	// slowest reader the content store does not cover paces the fill.
+	// Zero disables borrowing.
 	InflightBytes int64
 	// LingerTTL drops a complete chunk held in borrowed pages once it is
 	// unused for this long. Zero uses 30s.
-	LingerTTL time.Duration
-	// PageCache selects page cache handling of chunk files. Empty uses
-	// PageCacheBypass.
-	PageCache PageCacheMode
-	// Persist selects which chunks are written to disk. Empty uses
-	// PersistAll.
-	Persist PersistPolicy
-
+	LingerTTL    time.Duration
 	MaxFills     int
 	MaxServes    int
 	Lookahead    int
@@ -154,15 +149,19 @@ type Config struct {
 
 // Node serves and fetches chunks and metadata for one agent.
 type Node struct {
-	cfg    Config
-	mesh   *cachemesh.Mesh
-	blobKS cachemesh.Keyspace
-	metaKS cachemesh.Keyspace
-	store  *store
-	meta   *metaCache
-	client *http.Client
-	log    *slog.Logger
-	serves chan struct{}
+	cfg     Config
+	mesh    *cachemesh.Mesh
+	blobKS  cachemesh.Keyspace
+	metaKS  cachemesh.Keyspace
+	store   *store
+	holders *holders
+	meta    *metaCache
+	client  *http.Client
+	log     *slog.Logger
+	serves  chan struct{}
+
+	holderPeeks  atomic.Int64
+	holderMisses atomic.Int64
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -178,12 +177,8 @@ func New(cfg Config) (*Node, error) {
 		return nil, fmt.Errorf("meshfetch: bad chunk size %d", cfg.ChunkSize)
 	}
 
-	if cfg.DiskBytes < 0 || cfg.MemoryBytes < 0 || cfg.FillPages < 0 || cfg.InflightBytes < 0 {
+	if cfg.MemoryBytes < 0 || cfg.FillPages < 0 || cfg.InflightBytes < 0 {
 		return nil, errors.New("meshfetch: negative cache size")
-	}
-
-	if cfg.DiskBytes > 0 && cfg.DiskBytes < 2*cfg.ChunkSize {
-		return nil, fmt.Errorf("meshfetch: disk budget of %d bytes must hold two chunks of %d", cfg.DiskBytes, cfg.ChunkSize)
 	}
 
 	if cfg.PageSize == 0 {
@@ -192,18 +187,6 @@ func New(cfg Config) (*Node, error) {
 
 	if cfg.PageSize < 0 || int64(cfg.PageSize) > cfg.ChunkSize || cfg.ChunkSize%int64(cfg.PageSize) != 0 {
 		return nil, fmt.Errorf("meshfetch: page size %d must divide chunk size %d", cfg.PageSize, cfg.ChunkSize)
-	}
-
-	switch cfg.PageCache {
-	case "", PageCacheBypass, PageCacheDrop, PageCacheKeep:
-	default:
-		return nil, fmt.Errorf("meshfetch: unknown page cache mode %q", cfg.PageCache)
-	}
-
-	switch cfg.Persist {
-	case "", PersistAll, PersistShared, PersistOwned:
-	default:
-		return nil, fmt.Errorf("meshfetch: unknown persist policy %q", cfg.Persist)
 	}
 
 	if cfg.MaxFills <= 0 || cfg.MaxServes <= 0 || cfg.Lookahead <= 0 || cfg.Attempts <= 0 ||
@@ -239,31 +222,28 @@ func New(cfg Config) (*Node, error) {
 		pageSize:     cfg.PageSize,
 		window:       cfg.FillPages,
 		maxFills:     cfg.MaxFills,
-		dir:          cfg.ChunkDir,
-		diskBudget:   cfg.DiskBytes,
 		hotBudget:    cfg.MemoryBytes,
 		extraBudget:  cfg.InflightBytes,
 		lingerTTL:    cfg.LingerTTL,
-		pageCache:    cfg.PageCache,
-		persist:      cfg.Persist,
+		content:      cfg.Content,
 		stallTimeout: cfg.StallTimeout,
-		onEvict:      cfg.Hooks.OnEvict,
 		logger:       log,
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	n := &Node{
-		cfg:    cfg,
-		mesh:   cfg.Mesh,
-		blobKS: cachemesh.MustKeyspace("gantry-blob", 0),
-		metaKS: metaKS,
-		store:  st,
-		meta:   newMetaCache(4096),
-		client: cfg.Client,
-		log:    log,
-		serves: make(chan struct{}, cfg.MaxServes),
-		ctx:    ctx,
-		cancel: cancel,
+		cfg:     cfg,
+		mesh:    cfg.Mesh,
+		blobKS:  cachemesh.MustKeyspace("gantry-blob", 0),
+		metaKS:  metaKS,
+		store:   st,
+		holders: newHolders(holderChunks),
+		meta:    newMetaCache(4096),
+		client:  cfg.Client,
+		log:     log,
+		serves:  make(chan struct{}, cfg.MaxServes),
+		ctx:     ctx,
+		cancel:  cancel,
 	}
 
 	return n, nil
@@ -275,8 +255,17 @@ func (n *Node) Close() {
 	n.store.close()
 }
 
+// holderChunks bounds the chunks the holder directory remembers.
+const holderChunks = 1 << 15
+
 // Stats returns the chunk store state.
-func (n *Node) Stats() Stats { return n.store.stats() }
+func (n *Node) Stats() Stats {
+	st := n.store.stats()
+	st.HolderPeeks = n.holderPeeks.Load()
+	st.HolderMisses = n.holderMisses.Load()
+
+	return st
+}
 
 // Register adds the chunk and metadata endpoints to mux.
 func (n *Node) Register(mux *http.ServeMux) {

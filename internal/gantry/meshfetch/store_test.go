@@ -9,8 +9,6 @@ import (
 	"errors"
 	"io"
 	"log/slog"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -20,12 +18,13 @@ import (
 const (
 	testPage  = 4096
 	testChunk = 4 * testPage
+	testBlob  = "sha256:x"
 )
 
-func key(i int64) chunkKey { return chunkKey{digest: "sha256:x", index: i} }
+func key(i int64) chunkKey { return chunkKey{digest: testBlob, index: i} }
 
 // newTestStore returns a store with 4KiB pages, 16KiB chunks, a two-page
-// window, and a four-chunk disk budget in a temporary directory.
+// window, and an empty in-memory content store (testContent).
 func newTestStore(t testing.TB, mut func(*storeConfig)) *store {
 	t.Helper()
 
@@ -34,9 +33,8 @@ func newTestStore(t testing.TB, mut func(*storeConfig)) *store {
 		pageSize:     testPage,
 		window:       2,
 		maxFills:     8,
-		dir:          t.TempDir(),
-		diskBudget:   4 * testChunk,
 		hotBudget:    4 * testPage,
+		content:      newMemContent(),
 		stallTimeout: 5 * time.Second,
 		logger:       slog.New(slog.DiscardHandler),
 	}
@@ -48,6 +46,17 @@ func newTestStore(t testing.TB, mut func(*storeConfig)) *store {
 	t.Cleanup(s.close)
 
 	return s
+}
+
+// testContent returns the store's in-memory content store.
+func testContent(s *store) *memContent { return s.cfg.content.(*memContent) }
+
+// putChunk stores a blob in mc whose chunk idx (of chunkSize bytes) is
+// data and that ends with it, as if containerd had pulled it.
+func putChunk(mc *memContent, chunkSize, idx int64, data []byte) {
+	b := make([]byte, idx*chunkSize+int64(len(data)))
+	copy(b[idx*chunkSize:], data)
+	mc.put(testBlob, b)
 }
 
 func pattern(seed byte, n int) []byte {
@@ -73,50 +82,6 @@ func waitFor(t testing.TB, what string, cond func() bool) {
 	}
 }
 
-// onDisk reports whether f is complete on disk with its window freed.
-func onDisk(f *fill) bool {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	return f.done && f.durable == f.chunkLen && len(f.win) == 0
-}
-
-// completeFill fills k with data and waits until it is on disk (when it
-// is written at all). It returns the fill; the caller holds no reference.
-func completeFill(t testing.TB, s *store, k chunkKey, data []byte, owned bool) *fill {
-	t.Helper()
-
-	r, created, err := s.acquire(context.Background(), k, 0, false, false)
-	if err != nil || !created {
-		t.Fatalf("acquire %v: created=%v err=%v", k, created, err)
-	}
-
-	f := r.f
-	if owned {
-		s.markOwned(f)
-	}
-
-	r.close()
-
-	if err := f.setMeta(int64(len(data)), "", len(data)); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := f.readFrom(context.Background(), bytes.NewReader(data), nil); err != nil {
-		t.Fatal(err)
-	}
-
-	f.finish(nil)
-
-	if f.wantDisk.Load() {
-		waitFor(t, "chunk on disk", func() bool { return onDisk(f) || !cached(s, k) })
-	}
-
-	f.release() // filler
-
-	return f
-}
-
 func cached(s *store, k chunkKey) bool {
 	r := s.get(k, 0)
 	if r == nil {
@@ -139,97 +104,47 @@ func readAll(t testing.TB, r *reader) []byte {
 	return buf.Bytes()
 }
 
-func TestStoreDiskBudgetEvictsLRU(t *testing.T) {
-	var evicted int64
+// behind fills chunk k with data, which the content store already holds,
+// while n readers sit at offset 0 without reading. It returns the readers:
+// the fill has dropped every page but its last window from memory, so the
+// readers read the rest from the content store.
+func behind(t testing.TB, s *store, k chunkKey, data []byte, n int) []*reader {
+	t.Helper()
 
-	s := newTestStore(t, func(c *storeConfig) {
-		c.diskBudget = 3 * testChunk
-		c.onEvict = func(n int64) { evicted += n }
-	})
+	putChunk(testContent(s), s.cfg.chunkSize, k.index, data)
 
-	for i := range int64(3) {
-		completeFill(t, s, key(i), pattern(byte(i), testChunk), false)
+	r, created, err := s.acquire(context.Background(), k, 0, false, false)
+	if err != nil || !created {
+		t.Fatalf("acquire %v: created=%v err=%v", k, created, err)
 	}
 
-	// Touch chunk 0 so chunk 1 is the least recently used.
-	if !cached(s, key(0)) {
-		t.Fatal("chunk 0 not cached")
+	f := r.f
+	rs := []*reader{r}
+
+	for len(rs) < n {
+		rs = append(rs, s.get(k, 0))
 	}
 
-	completeFill(t, s, key(3), pattern(3, testChunk), false)
-
-	if cached(s, key(1)) {
-		t.Fatal("chunk 1 should have been evicted")
+	if err := f.setMeta(int64(k.index)*s.cfg.chunkSize+int64(len(data)), "", len(data)); err != nil {
+		t.Fatal(err)
 	}
 
-	if !cached(s, key(0)) || !cached(s, key(3)) {
-		t.Fatal("recently used chunks evicted")
+	if err := f.readFrom(context.Background(), bytes.NewReader(data), nil); err != nil {
+		t.Fatal(err)
 	}
 
-	if evicted != testChunk {
-		t.Fatalf("evicted %d bytes, want %d", evicted, testChunk)
+	f.finish(nil)
+	f.release()
+
+	f.mu.Lock()
+	ws := f.winStart
+	f.mu.Unlock()
+
+	if want := len(data)/s.cfg.pageSize - s.cfg.window; ws != want {
+		t.Fatalf("window starts at page %d, want %d", ws, want)
 	}
 
-	// The evicted chunk's file is gone; three remain.
-	entries, err := os.ReadDir(s.cfg.dir)
-	if err != nil || len(entries) != 3 {
-		t.Fatalf("chunk files: %d, %v; want 3", len(entries), err)
-	}
-
-	if st := s.stats(); st.DiskBytes > 3*testChunk || st.Chunks != 3 {
-		t.Fatalf("stats: %+v", st)
-	}
-}
-
-func TestStoreFillsBeyondDiskBudgetStreamThrough(t *testing.T) {
-	s := newTestStore(t, func(c *storeConfig) { c.diskBudget = 2 * testChunk })
-
-	// Two fills in progress hold the whole disk budget. A third one is
-	// not refused: it streams through memory.
-	var rs []*reader
-
-	for i := range int64(3) {
-		r, created, err := s.acquire(context.Background(), key(i), 0, false, false)
-		if err != nil || !created {
-			t.Fatalf("acquire %d: %v", i, err)
-		}
-
-		rs = append(rs, r)
-	}
-
-	if !rs[0].f.wantDisk.Load() || !rs[1].f.wantDisk.Load() || rs[2].f.wantDisk.Load() {
-		t.Fatal("only the first two fills should get disk")
-	}
-
-	data := pattern(9, testChunk)
-	f := rs[2].f
-
-	go func() {
-		_ = f.setMeta(testChunk, "", testChunk)
-		_ = f.readFrom(context.Background(), bytes.NewReader(data), nil)
-		f.finish(nil)
-		f.release()
-	}()
-
-	if got := readAll(t, rs[2]); !bytes.Equal(got, data) {
-		t.Fatal("stream-through data mismatch")
-	}
-
-	rs[2].close()
-
-	if cached(s, key(2)) {
-		t.Fatal("a stream-through chunk must not stay cached")
-	}
-
-	if st := s.stats(); st.StreamFills != 1 || st.DiskBytes != 2*testChunk {
-		t.Fatalf("stats: %+v", st)
-	}
-
-	for _, r := range rs[:2] {
-		r.f.finish(errors.New("done"))
-		r.f.release()
-		r.close()
-	}
+	return rs
 }
 
 func TestStoreFillCapRefusesAndWaits(t *testing.T) {
@@ -305,12 +220,8 @@ func TestStoreFailedFillIsDroppedAndReadersSeeError(t *testing.T) {
 		t.Fatal("failed fill still cached")
 	}
 
-	if st := s.stats(); st.DiskBytes != 0 || st.Inflight != 0 || st.PageBytes != 0 {
+	if st := s.stats(); st.Inflight != 0 || st.PageBytes != 0 {
 		t.Fatalf("stats after failure: %+v", st)
-	}
-
-	if entries, _ := os.ReadDir(s.cfg.dir); len(entries) != 0 {
-		t.Fatalf("failed fill left %d files", len(entries))
 	}
 }
 
@@ -364,203 +275,11 @@ func TestStreamToFollowsTheFill(t *testing.T) {
 	r.close()
 }
 
-// Concurrent readers of a chunk on disk share one disk read per page.
-func TestDiskPageReadsCoalesce(t *testing.T) {
-	const readers = 6
-
-	s := newTestStore(t, func(c *storeConfig) { c.hotBudget = 0 })
-	data := pattern(1, testChunk)
-	completeFill(t, s, key(1), data, false)
-
-	base := s.stats().DiskReads
-
-	// Each reader writes one page per Write call; the barrier holds every
-	// reader inside Write of the same page, so all of them hold the page
-	// at once.
-	b := newBarrier(readers)
-
-	var wg sync.WaitGroup
-
-	for range readers {
-		r := s.get(key(1), 0)
-		if r == nil {
-			t.Fatal("chunk not cached")
-		}
-
-		wg.Go(func() {
-			defer r.close()
-
-			var buf bytes.Buffer
-
-			if _, err := r.streamTo(context.Background(), barrierWriter{b: b, w: &buf}); err != nil {
-				t.Errorf("streamTo: %v", err)
-			}
-
-			if !bytes.Equal(buf.Bytes(), data) {
-				t.Error("data mismatch")
-			}
-		})
-	}
-
-	wg.Wait()
-
-	st := s.stats()
-	if reads := st.DiskReads - base; reads != testChunk/testPage {
-		t.Fatalf("disk reads = %d, want one per page (%d)", reads, testChunk/testPage)
-	}
-
-	if st.PageReadsShared != (readers-1)*testChunk/testPage {
-		t.Fatalf("shared reads = %d", st.PageReadsShared)
-	}
-
-	if st.HotBytes != 0 || st.PageBytes != 0 {
-		t.Fatalf("pages retained without a hot tier: %+v", st)
-	}
-}
-
-func TestHotTierAdmitsRepeatedPagesAndEvictsLRU(t *testing.T) {
-	pages := int64(testChunk / testPage)
-	data := pattern(2, testChunk)
-
-	readFrom := func(s *store, off int) {
-		t.Helper()
-
-		r := s.get(key(1), off)
-		if got := readAll(t, r); !bytes.Equal(got, data[off:]) {
-			t.Fatalf("off %d: data mismatch", off)
-		}
-
-		r.close()
-	}
-
-	// Sequential readers: the first read is not retained; a second read
-	// while the page is in the ghost list admits it, and the LRU keeps the
-	// last two pages within the budget.
-	s := newTestStore(t, func(c *storeConfig) { c.hotBudget = 2 * testPage })
-	completeFill(t, s, key(1), data, false)
-
-	readFrom(s, 0)
-
-	if st := s.stats(); st.HotBytes != 0 || st.DiskReads != pages || st.PageBytes != 0 {
-		t.Fatalf("single read retained pages: %+v", st)
-	}
-
-	readFrom(s, 0)
-
-	if st := s.stats(); st.HotBytes != 2*testPage || st.DiskReads != 2*pages {
-		t.Fatalf("second read: %+v", st)
-	}
-
-	// A later reader of the last two pages hits the hot tier.
-	readFrom(s, 2*testPage)
-
-	if got := s.stats().DiskReads; got != 2*pages {
-		t.Fatalf("hot pages read from disk again: %d reads", got)
-	}
-
-	// Hot pages unused for the linger TTL are dropped.
-	s.pages.expire(time.Now().Add(-time.Hour))
-
-	if st := s.stats(); st.HotBytes != 2*testPage {
-		t.Fatalf("recent hot pages expired: %+v", st)
-	}
-
-	s.pages.expire(time.Now().Add(time.Hour))
-
-	if st := s.stats(); st.HotBytes != 0 || st.PageBytes != 0 {
-		t.Fatalf("idle hot pages kept: %+v", st)
-	}
-
-	readFrom(s, 0)
-	readFrom(s, 0)
-
-	// Evicting the chunk drops its hot pages.
-	s.evictDigest("sha256:x")
-
-	if st := s.stats(); st.HotBytes != 0 || st.PageBytes != 0 {
-		t.Fatalf("after evict: %+v", st)
-	}
-
-	// Concurrent readers admit pages on first use.
-	s = newTestStore(t, func(c *storeConfig) { c.hotBudget = 2 * testPage })
-	completeFill(t, s, key(1), data, false)
-
-	b := newBarrier(2)
-
-	var wg sync.WaitGroup
-
-	for range 2 {
-		r := s.get(key(1), 0)
-
-		wg.Go(func() {
-			defer r.close()
-
-			_, _ = r.streamTo(context.Background(), barrierWriter{b: b, w: io.Discard})
-		})
-	}
-
-	wg.Wait()
-
-	if st := s.stats(); st.HotBytes != 2*testPage || st.DiskReads != pages {
-		t.Fatalf("after shared read: %+v", st)
-	}
-
-	// Without a hot tier nothing is retained.
-	s = newTestStore(t, func(c *storeConfig) { c.hotBudget = 0 })
-	completeFill(t, s, key(1), data, false)
-	readFrom(s, 0)
-	readFrom(s, 0)
-
-	if st := s.stats(); st.HotBytes != 0 || st.DiskReads != 2*pages {
-		t.Fatalf("no hot tier: %+v", st)
-	}
-}
-
-// A reader that does not keep up does not hold back a fill that is
-// written to disk; it reads the pages it missed from disk.
-func TestSlowReaderFallsBackToDisk(t *testing.T) {
-	s := newTestStore(t, func(c *storeConfig) { c.chunkSize = 16 * testPage })
-	data := pattern(3, 16*testPage)
-
-	r, _, _ := s.acquire(context.Background(), key(1), 0, false, false)
-	f := r.f
-
-	_ = f.setMeta(int64(len(data)), "", len(data))
-
-	maxPages := 0
-	tr := &trackingReader{r: bytes.NewReader(data), each: func() {
-		if live, _ := s.pool.stats(); live > maxPages {
-			maxPages = live
-		}
-	}}
-
-	if err := f.readFrom(context.Background(), tr, nil); err != nil {
-		t.Fatal(err)
-	}
-
-	f.finish(nil)
-	f.release()
-
-	if maxPages > s.cfg.window+1 {
-		t.Fatalf("fill held %d pages, window is %d", maxPages, s.cfg.window)
-	}
-
-	if got := readAll(t, r); !bytes.Equal(got, data) {
-		t.Fatal("slow reader data mismatch")
-	}
-
-	r.close()
-
-	if st := s.stats(); st.DiskReads == 0 {
-		t.Fatalf("slow reader did not read from disk: %+v", st)
-	}
-}
-
-// Without disk, the slowest reader paces the fill, and a reader that
-// stops reading is dropped after the stall timeout.
+// Without local content, the slowest reader paces the fill, and a reader
+// that stops reading is dropped after the stall timeout.
 func TestStreamThroughPacingAndKick(t *testing.T) {
 	s := newTestStore(t, func(c *storeConfig) {
-		c.dir = ""
+		c.content = nil
 		c.stallTimeout = 100 * time.Millisecond
 	})
 	data := pattern(4, testChunk)
@@ -614,7 +333,7 @@ func TestStreamThroughPacingAndKick(t *testing.T) {
 
 // A reader that needs bytes a stream-through fill dropped gets a new fill.
 func TestAcquireReplacesFillMissingPrefix(t *testing.T) {
-	s := newTestStore(t, func(c *storeConfig) { c.dir = "" })
+	s := newTestStore(t, func(c *storeConfig) { c.content = nil })
 	data := pattern(5, testChunk)
 
 	r, _, _ := s.acquire(context.Background(), key(1), 0, false, false)
@@ -673,234 +392,6 @@ func TestAcquireReplacesFillMissingPrefix(t *testing.T) {
 	r.close()
 }
 
-func TestDiskFullFallsBackToStreamThrough(t *testing.T) {
-	s := newTestStore(t, nil)
-
-	creates := 0
-	s.faults = &diskFaults{create: func() error {
-		creates++
-		return errDiskFull
-	}}
-
-	data := pattern(6, testChunk)
-
-	r, _, _ := s.acquire(context.Background(), key(1), 0, false, false)
-	f := r.f
-
-	go func() {
-		_ = f.setMeta(int64(len(data)), "", len(data))
-		_ = f.readFrom(context.Background(), bytes.NewReader(data), nil)
-		f.finish(nil)
-		f.release()
-	}()
-
-	if got := readAll(t, r); !bytes.Equal(got, data) {
-		t.Fatal("data mismatch")
-	}
-
-	r.close()
-
-	if cached(s, key(1)) {
-		t.Fatal("chunk without a file cached")
-	}
-
-	// During the backoff new fills do not try the disk.
-	r2, _, _ := s.acquire(context.Background(), key(2), 0, false, false)
-	if r2.f.wantDisk.Load() || creates != 1 {
-		t.Fatalf("disk retried during backoff: creates=%d", creates)
-	}
-
-	r2.f.finish(errors.New("done"))
-	r2.f.release()
-	r2.close()
-
-	if st := s.stats(); st.DiskErrors != 1 || st.DiskBytes != 0 {
-		t.Fatalf("stats: %+v", st)
-	}
-}
-
-func TestDiskWriteErrorFallsBackToStreamThrough(t *testing.T) {
-	s := newTestStore(t, nil)
-	s.faults = &diskFaults{write: func(idx int) error {
-		if idx == 1 {
-			return errors.New("EIO")
-		}
-
-		return nil
-	}}
-
-	data := pattern(7, testChunk)
-
-	r, _, _ := s.acquire(context.Background(), key(1), 0, false, false)
-	f := r.f
-
-	go func() {
-		_ = f.setMeta(int64(len(data)), "", len(data))
-		_ = f.readFrom(context.Background(), bytes.NewReader(data), nil)
-		f.finish(nil)
-		f.release()
-	}()
-
-	if got := readAll(t, r); !bytes.Equal(got, data) {
-		t.Fatal("data mismatch")
-	}
-
-	r.close()
-
-	waitFor(t, "chunk dropped", func() bool { return !cached(s, key(1)) })
-
-	if st := s.stats(); st.DiskErrors != 1 {
-		t.Fatalf("stats: %+v", st)
-	}
-}
-
-func TestDiskReadErrorDropsChunk(t *testing.T) {
-	s := newTestStore(t, nil)
-	data := pattern(8, testChunk)
-	completeFill(t, s, key(1), data, false)
-
-	s.faults = &diskFaults{read: func(int) error { return errors.New("EIO") }}
-
-	r := s.get(key(1), 0)
-	if _, err := r.streamTo(context.Background(), io.Discard); !errors.Is(err, errLost) {
-		t.Fatalf("want errLost, got %v", err)
-	}
-
-	r.close()
-
-	if cached(s, key(1)) {
-		t.Fatal("unreadable chunk still cached")
-	}
-}
-
-func TestStoreWipesChunkDirAtStartup(t *testing.T) {
-	dir := t.TempDir()
-
-	for _, name := range []string{"c1", "stale"} {
-		if err := os.WriteFile(filepath.Join(dir, name), []byte("old"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	if err := os.Mkdir(filepath.Join(dir, "sub"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-
-	s := newTestStore(t, func(c *storeConfig) { c.dir = dir })
-
-	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
-		t.Fatalf("chunk dir not wiped: %d entries", len(entries))
-	}
-
-	// New chunk files do not collide with anything.
-	completeFill(t, s, key(1), pattern(1, testChunk), false)
-
-	if !cached(s, key(1)) {
-		t.Fatal("chunk not cached after wipe")
-	}
-}
-
-func TestStoreUnusableDirDisablesDisk(t *testing.T) {
-	file := filepath.Join(t.TempDir(), "file")
-	if err := os.WriteFile(file, nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	s := newTestStore(t, func(c *storeConfig) { c.dir = filepath.Join(file, "sub") })
-	if s.disk != nil {
-		t.Fatal("disk enabled on an unusable dir")
-	}
-
-	r, _, _ := s.acquire(context.Background(), key(1), 0, false, false)
-	if r.f.wantDisk.Load() {
-		t.Fatal("fill wants disk without a disk tier")
-	}
-
-	r.f.finish(errors.New("done"))
-	r.f.release()
-	r.close()
-}
-
-// The final chunk of a blob ends inside a page; it round-trips through
-// disk (including O_DIRECT padding).
-func TestPartialFinalPageRoundTrip(t *testing.T) {
-	for _, mode := range []PageCacheMode{PageCacheBypass, PageCacheDrop, PageCacheKeep} {
-		t.Run(string(mode), func(t *testing.T) {
-			s := newTestStore(t, func(c *storeConfig) { c.pageCache = mode })
-			data := pattern(9, 2*testPage+100)
-			completeFill(t, s, key(1), data, false)
-
-			for _, off := range []int{0, 2 * testPage, 2*testPage + 99} {
-				r := s.get(key(1), off)
-				if r == nil {
-					t.Fatal("chunk not cached")
-				}
-
-				if got := readAll(t, r); !bytes.Equal(got, data[off:]) {
-					t.Fatalf("off %d: data mismatch", off)
-				}
-
-				r.close()
-			}
-
-			if st := s.stats(); st.DiskBytes != alignUp(int64(len(data))) {
-				t.Fatalf("charged %d bytes for %d", st.DiskBytes, len(data))
-			}
-		})
-	}
-}
-
-func TestPersistSharedWritesOnlySharedChunks(t *testing.T) {
-	s := newTestStore(t, func(c *storeConfig) { c.persist = PersistShared })
-
-	// Only this member consumes chunk 1: it is never written.
-	completeFill(t, s, key(1), pattern(1, testChunk), false)
-
-	if cached(s, key(1)) || s.stats().DiskWrites != 0 {
-		t.Fatal("local-only chunk written to disk")
-	}
-
-	// Owned chunks are written.
-	completeFill(t, s, key(2), pattern(2, testChunk), true)
-
-	if !cached(s, key(2)) {
-		t.Fatal("owned chunk not cached")
-	}
-
-	// A peer joining a local fill before its first page is gone makes it
-	// a disk chunk.
-	data := pattern(3, testChunk)
-
-	r, _, _ := s.acquire(context.Background(), key(3), 0, false, false)
-	f := r.f
-	_ = f.setMeta(int64(len(data)), "", len(data))
-
-	peer, created, err := s.acquire(context.Background(), key(3), 0, false, true)
-	if err != nil || created {
-		t.Fatalf("peer join: created=%v err=%v", created, err)
-	}
-
-	go func() {
-		_ = f.readFrom(context.Background(), bytes.NewReader(data), nil)
-		f.finish(nil)
-		f.release()
-	}()
-
-	for _, rd := range []*reader{r, peer} {
-		if got := readAll(t, rd); !bytes.Equal(got, data) {
-			t.Fatal("data mismatch")
-		}
-
-		rd.close()
-	}
-
-	waitFor(t, "shared chunk on disk", func() bool { return onDisk(f) })
-
-	if !cached(s, key(3)) {
-		t.Fatal("shared chunk not cached")
-	}
-}
-
 func TestObtainRefusesLoop(t *testing.T) {
 	c := newCluster(t, clusterOpts{n: 1})
 	n := c.nodes[0].node
@@ -928,78 +419,6 @@ func TestObtainRefusesLoop(t *testing.T) {
 	f.finish(errors.New("done"))
 	f.release()
 	r.close()
-}
-
-func TestStoreEvictsOwnedChunksLast(t *testing.T) {
-	s := newTestStore(t, nil)
-
-	// Owned chunk 0 is the oldest; transit chunks 1-3 are newer.
-	completeFill(t, s, key(0), pattern(0, testChunk), true)
-
-	for i := int64(1); i < 4; i++ {
-		completeFill(t, s, key(i), pattern(byte(i), testChunk), false)
-	}
-
-	// Two more transit chunks evict the two oldest transit chunks, not
-	// the older owned one.
-	completeFill(t, s, key(4), pattern(4, testChunk), false)
-	completeFill(t, s, key(5), pattern(5, testChunk), false)
-
-	if !cached(s, key(0)) {
-		t.Fatal("owned chunk evicted before transit chunks")
-	}
-
-	if cached(s, key(1)) || cached(s, key(2)) {
-		t.Fatal("oldest transit chunks should have been evicted")
-	}
-
-	if s.ownedUsed != testChunk {
-		t.Fatalf("ownedUsed = %d, want %d", s.ownedUsed, testChunk)
-	}
-}
-
-func TestStoreCapsOwnedChunksAtHalfTheBudget(t *testing.T) {
-	s := newTestStore(t, nil)
-
-	// Three owned chunks hold more than half of the budget.
-	for i := range int64(3) {
-		completeFill(t, s, key(i), pattern(byte(i), testChunk), true)
-	}
-
-	completeFill(t, s, key(10), pattern(10, testChunk), false)
-
-	// The next chunk evicts the oldest owned chunk, since owned chunks are
-	// over their share, and keeps the transit chunk.
-	completeFill(t, s, key(11), pattern(11, testChunk), false)
-
-	if cached(s, key(0)) {
-		t.Fatal("owned chunks over half the budget must yield first")
-	}
-
-	if !cached(s, key(10)) || !cached(s, key(1)) {
-		t.Fatal("unexpected eviction")
-	}
-
-	if s.ownedUsed != 2*testChunk {
-		t.Fatalf("ownedUsed = %d, want %d", s.ownedUsed, 2*testChunk)
-	}
-
-	// With only owned chunks left they are still evicted LRU.
-	s2 := newTestStore(t, func(c *storeConfig) { c.diskBudget = 2 * testChunk })
-	for i := range int64(3) {
-		completeFill(t, s2, key(i), pattern(byte(i), testChunk), true)
-	}
-
-	if cached(s2, key(0)) || !cached(s2, key(2)) {
-		t.Fatal("owned-only store must evict its oldest chunk")
-	}
-
-	// Evicting a whole digest clears owned accounting.
-	s2.evictDigest("sha256:x")
-
-	if s2.ownedUsed != 0 || s2.used != 0 {
-		t.Fatalf("after evictDigest: ownedUsed=%d used=%d", s2.ownedUsed, s2.used)
-	}
 }
 
 // barrier releases a group of n waiters at a time.
@@ -1047,35 +466,11 @@ func (t *trackingReader) Read(p []byte) (int, error) {
 	return t.r.Read(p)
 }
 
-func TestPersistOwnedWritesOnlyOwnedChunks(t *testing.T) {
-	s := newTestStore(t, func(c *storeConfig) { c.persist = PersistOwned })
-
-	completeFill(t, s, key(1), pattern(1, testChunk), true)
-
-	if !cached(s, key(1)) {
-		t.Fatal("owned chunk not cached")
-	}
-
-	// A peer-initiated fill of a chunk this member does not own streams.
-	r, _, err := s.acquire(context.Background(), key(2), 0, false, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if r.f.wantDisk.Load() {
-		t.Fatal("peer fill of a chunk not owned wants disk")
-	}
-
-	r.f.finish(errors.New("done"))
-	r.f.release()
-	r.close()
-}
-
 // A fill that a peer reads borrows pages from the in-flight budget instead
 // of waiting for a lagging reader, and returns them when it is done.
 func TestFillBorrowsInflightPagesForPeers(t *testing.T) {
 	s := newTestStore(t, func(c *storeConfig) {
-		c.dir = ""
+		c.content = nil
 		c.extraBudget = 2 * testPage
 	})
 	data := pattern(11, testChunk)
@@ -1125,7 +520,7 @@ func TestFillBorrowsInflightPagesForPeers(t *testing.T) {
 // reclaims it.
 func TestPeerReadChunkLingersInMemory(t *testing.T) {
 	s := newTestStore(t, func(c *storeConfig) {
-		c.dir = ""
+		c.content = nil
 		c.extraBudget = 2 * testPage
 	})
 
@@ -1183,7 +578,7 @@ func TestPeerReadChunkLingersInMemory(t *testing.T) {
 // its memory.
 func TestLingeringChunkExpires(t *testing.T) {
 	s := newTestStore(t, func(c *storeConfig) {
-		c.dir = ""
+		c.content = nil
 		c.extraBudget = 4 * testPage
 		c.lingerTTL = time.Hour
 	})
@@ -1220,7 +615,7 @@ func TestLingeringChunkExpires(t *testing.T) {
 // borrowing memory.
 func TestLocalOnlyFillDoesNotBorrow(t *testing.T) {
 	s := newTestStore(t, func(c *storeConfig) {
-		c.dir = ""
+		c.content = nil
 		c.extraBudget = 8 * testPage
 	})
 	data := pattern(12, testChunk)
@@ -1257,70 +652,189 @@ func TestLocalOnlyFillDoesNotBorrow(t *testing.T) {
 	r.close()
 }
 
-// When the in-flight budget is exhausted a fill with a lagging peer spills
-// to disk from its oldest window page; the reader then reads from disk.
-func TestFillSpillsWhenBudgetExhausted(t *testing.T) {
+// Concurrent readers behind the window share one content store read per
+// page.
+func TestLocalPageReadsCoalesce(t *testing.T) {
+	const readers = 6
+
 	s := newTestStore(t, func(c *storeConfig) {
-		c.chunkSize = 16 * testPage
-		c.persist = PersistOwned
-		c.extraBudget = testPage
+		c.hotBudget = 0
+		c.chunkSize = 8 * testPage
 	})
-	data := pattern(13, 16*testPage)
+	data := pattern(1, 8*testPage)
+	rs := behind(t, s, key(1), data, readers)
 
-	r, _, _ := s.acquire(context.Background(), key(1), 3*testPage, false, true)
-	f := r.f
+	// Each reader writes one page per Write call; the barrier holds every
+	// reader inside Write of the same page, so all of them hold the page
+	// at once.
+	b := newBarrier(readers)
 
-	if f.wantDisk.Load() {
-		t.Fatal("PersistOwned fill wants disk before spilling")
+	var wg sync.WaitGroup
+
+	for _, r := range rs {
+		wg.Go(func() {
+			defer r.close()
+
+			var buf bytes.Buffer
+
+			if _, err := r.streamTo(context.Background(), barrierWriter{b: b, w: &buf}); err != nil {
+				t.Errorf("streamTo: %v", err)
+			}
+
+			if !bytes.Equal(buf.Bytes(), data) {
+				t.Error("data mismatch")
+			}
+		})
 	}
 
-	_ = f.setMeta(int64(len(data)), "", len(data))
+	wg.Wait()
 
-	if err := f.readFrom(context.Background(), bytes.NewReader(data), nil); err != nil {
+	local := int64(8 - s.cfg.window)
+
+	st := s.stats()
+	if st.LocalReads != local {
+		t.Fatalf("local reads = %d, want one per page behind the window (%d)", st.LocalReads, local)
+	}
+
+	if st.PageReadsShared != (readers-1)*local {
+		t.Fatalf("shared reads = %d", st.PageReadsShared)
+	}
+
+	if st.HotBytes != 0 || st.PageBytes != 0 {
+		t.Fatalf("pages retained without a hot tier: %+v", st)
+	}
+}
+
+// Pages of one blob are shared across fills: they are keyed by digest and
+// absolute page, not by fill.
+func TestLocalPagesSharedAcrossFills(t *testing.T) {
+	s := newTestStore(t, func(c *storeConfig) { c.hotBudget = 2 * testPage })
+	data := pattern(2, testChunk)
+
+	a := behind(t, s, key(1), data, 1)[0]
+	b := behind(t, s, key(1), data, 1)[0]
+
+	if a.f == b.f {
+		t.Fatal("want two fills")
+	}
+
+	for _, r := range []*reader{a, b} {
+		if got := readAll(t, r); !bytes.Equal(got, data) {
+			t.Fatal("data mismatch")
+		}
+
+		r.close()
+	}
+
+	// The second fill's reader admitted the pages through the ghost list
+	// and both read the same two pages: two reads each.
+	if st := s.stats(); st.LocalReads != 4 || st.HotBytes != 2*testPage {
+		t.Fatalf("stats: %+v", st)
+	}
+
+	// A third reader hits the hot tier.
+	c := behind(t, s, key(1), data, 1)[0]
+	if got := readAll(t, c); !bytes.Equal(got, data) {
+		t.Fatal("data mismatch")
+	}
+
+	c.close()
+
+	if st := s.stats(); st.LocalReads != 4 {
+		t.Fatalf("hot pages read again: %+v", st)
+	}
+
+	// Hot pages unused for the linger TTL are dropped.
+	s.pages.expire(time.Now().Add(-time.Hour))
+
+	if st := s.stats(); st.HotBytes != 2*testPage {
+		t.Fatalf("recent hot pages expired: %+v", st)
+	}
+
+	s.pages.expire(time.Now().Add(time.Hour))
+
+	if st := s.stats(); st.HotBytes != 0 || st.PageBytes != 0 {
+		t.Fatalf("idle hot pages kept: %+v", st)
+	}
+
+	// Concurrent readers admit pages on first use; evicting the digest
+	// drops them.
+	rs := behind(t, s, key(1), data, 2)
+	bar := newBarrier(2)
+
+	var wg sync.WaitGroup
+
+	for _, r := range rs {
+		wg.Go(func() {
+			defer r.close()
+
+			_, _ = r.streamTo(context.Background(), barrierWriter{b: bar, w: io.Discard})
+		})
+	}
+
+	wg.Wait()
+
+	if st := s.stats(); st.HotBytes != 2*testPage {
+		t.Fatalf("after shared read: %+v", st)
+	}
+
+	s.evictDigest(testBlob)
+
+	if st := s.stats(); st.HotBytes != 0 || st.PageBytes != 0 {
+		t.Fatalf("after evict: %+v", st)
+	}
+}
+
+// A reader that does not keep up does not hold back a fill whose bytes
+// the content store holds; it reads the pages it missed from there, and
+// the fill keeps no more than its window in memory.
+func TestSlowReaderFallsBackToLocalContent(t *testing.T) {
+	s := newTestStore(t, func(c *storeConfig) { c.chunkSize = 16 * testPage })
+	data := pattern(3, 16*testPage)
+	putChunk(testContent(s), s.cfg.chunkSize, 1, data)
+
+	r, _, _ := s.acquire(context.Background(), key(1), 0, false, false)
+	f := r.f
+
+	_ = f.setMeta(s.cfg.chunkSize+int64(len(data)), "", len(data))
+
+	maxPages := 0
+	tr := &trackingReader{r: bytes.NewReader(data), each: func() {
+		if live, _ := s.pool.stats(); live > maxPages {
+			maxPages = live
+		}
+	}}
+
+	if err := f.readFrom(context.Background(), tr, nil); err != nil {
 		t.Fatal(err)
 	}
 
 	f.finish(nil)
 	f.release()
 
-	waitFor(t, "spilled pages on disk", func() bool { return onDisk(f) })
-
-	st := s.stats()
-	if st.Spills != 1 || st.DiskWrites != 13 {
-		t.Fatalf("stats: %+v", st)
+	if maxPages > s.cfg.window+1 {
+		t.Fatalf("fill held %d pages, window is %d", maxPages, s.cfg.window)
 	}
 
-	if got := readAll(t, r); !bytes.Equal(got, data[3*testPage:]) {
-		t.Fatal("spilled data mismatch")
+	if got := readAll(t, r); !bytes.Equal(got, data) {
+		t.Fatal("slow reader data mismatch")
 	}
 
 	r.close()
 
-	// A spilled chunk lacks its first pages: it is not cached.
-	if cached(s, key(1)) {
-		t.Fatal("partial chunk cached")
-	}
-
-	if st := s.stats(); st.ExtraPageBytes != 0 || st.DiskBytes != 0 {
-		t.Fatalf("after close: %+v", st)
+	if st := s.stats(); st.LocalReads != 14 {
+		t.Fatalf("slow reader local reads: %+v", st)
 	}
 }
 
-// A fill that borrowed pages beyond its base window and then spills
-// queues more pages than the base window to its writer without blocking
-// (a regression: the writer queue was sized to the base window).
-func TestSpillQueuesBorrowedPages(t *testing.T) {
-	s := newTestStore(t, func(c *storeConfig) {
-		c.chunkSize = 32 * testPage
-		c.diskBudget = 4 * 32 * testPage
-		c.persist = PersistOwned
-		c.extraBudget = 8 * testPage
-	})
-	data := pattern(14, 32*testPage)
+// A fill notices bytes containerd writes while it waits for a lagging
+// reader: once the content store covers the reader, the fill moves on.
+func TestFillWaitsForLocalContentToCatchUp(t *testing.T) {
+	s := newTestStore(t, nil)
+	mc := testContent(s)
+	data := pattern(4, testChunk)
 
-	// A peer reader stuck at the start: the fill borrows eight pages,
-	// then spills with ten pages in its window.
-	r, _, _ := s.acquire(context.Background(), key(1), 0, false, true)
+	r, _, _ := s.acquire(context.Background(), key(0), 0, false, false)
 	f := r.f
 	_ = f.setMeta(int64(len(data)), "", len(data))
 
@@ -1328,20 +842,133 @@ func TestSpillQueuesBorrowedPages(t *testing.T) {
 
 	go func() { done <- f.readFrom(context.Background(), bytes.NewReader(data), nil) }()
 
+	waitFor(t, "fill waits for the reader", func() bool {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+
+		return f.fillerWaiting && f.n == 2*testPage
+	})
+
+	// containerd writes the first page: the reader at 0 is covered.
+	w := mc.ingest(testBlob, int64(len(data)))
+	_, _ = w.Write(data[:testPage])
+
 	select {
 	case err := <-done:
-		if err != nil {
-			t.Fatal(err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("fill blocked queueing pages to the writer")
+		t.Fatalf("fill finished early: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	waitFor(t, "fill moves on", func() bool {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+
+		return f.n > 2*testPage
+	})
+
+	_, _ = w.Write(data[testPage:])
+
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
 
 	f.finish(nil)
 	f.release()
 
-	if st := s.stats(); st.Spills != 1 {
-		t.Fatalf("spills = %d, want 1", st.Spills)
+	if got := readAll(t, r); !bytes.Equal(got, data) {
+		t.Fatal("data mismatch")
+	}
+
+	r.close()
+}
+
+// A failed content store read loses the reader (it retries elsewhere) and
+// stops trusting the content store for that fill.
+func TestLocalReadErrorLosesReader(t *testing.T) {
+	s := newTestStore(t, nil)
+	rs := behind(t, s, key(1), pattern(8, testChunk), 1)
+
+	testContent(s).fail.Store(true)
+
+	r := rs[0]
+	if _, err := r.streamTo(context.Background(), io.Discard); !errors.Is(err, errLost) {
+		t.Fatalf("want errLost, got %v", err)
+	}
+
+	r.f.mu.Lock()
+	end := r.f.localEnd
+	r.f.mu.Unlock()
+
+	if end != 0 {
+		t.Fatalf("localEnd = %d after a read error", end)
+	}
+
+	r.close()
+
+	if st := s.stats(); st.LocalErrors != 1 {
+		t.Fatalf("stats: %+v", st)
+	}
+}
+
+// Content that disappears (containerd garbage collection) loses the reader.
+func TestLocalContentGoneLosesReader(t *testing.T) {
+	s := newTestStore(t, nil)
+	rs := behind(t, s, key(1), pattern(9, testChunk), 1)
+
+	testContent(s).drop(testBlob)
+
+	if _, err := rs[0].streamTo(context.Background(), io.Discard); !errors.Is(err, errLost) {
+		t.Fatalf("want errLost, got %v", err)
+	}
+
+	rs[0].close()
+}
+
+// The final chunk of a blob ends inside a page; readers behind the window
+// read it from the content store at any offset.
+func TestPartialFinalPageRoundTrip(t *testing.T) {
+	s := newTestStore(t, func(c *storeConfig) { c.chunkSize = 8 * testPage })
+	data := pattern(9, 4*testPage+100)
+
+	putChunk(testContent(s), s.cfg.chunkSize, 2, data)
+
+	for _, off := range []int{0, 2 * testPage, 2*testPage + 99, 4*testPage + 99} {
+		r, _, _ := s.acquire(context.Background(), key(2), off, false, false)
+		f := r.f
+		_ = f.setMeta(2*s.cfg.chunkSize+int64(len(data)), "", len(data))
+		_ = f.readFrom(context.Background(), bytes.NewReader(data), nil)
+		f.finish(nil)
+		f.release()
+
+		if got := readAll(t, r); !bytes.Equal(got, data[off:]) {
+			t.Fatalf("off %d: data mismatch", off)
+		}
+
+		r.close()
+	}
+}
+
+// A fill that peers read does not keep its whole chunk in borrowed pages
+// when the content store holds it: later peers read it from there.
+func TestLocallyHeldChunkDoesNotLinger(t *testing.T) {
+	s := newTestStore(t, func(c *storeConfig) { c.extraBudget = 8 * testPage })
+	data := pattern(10, testChunk)
+	putChunk(testContent(s), s.cfg.chunkSize, 1, data)
+
+	r, _, _ := s.acquire(context.Background(), key(1), 0, false, true)
+	f := r.f
+	_ = f.setMeta(s.cfg.chunkSize+int64(len(data)), "", len(data))
+
+	// The peer reader sits at 0, but the content store covers it.
+	if err := f.readFrom(context.Background(), bytes.NewReader(data), nil); err != nil {
+		t.Fatal(err)
+	}
+
+	f.finish(nil)
+	f.release()
+
+	if st := s.stats(); st.ExtraPageBytes != 0 || st.MemoryChunks != 0 {
+		t.Fatalf("locally held chunk kept in memory: %+v", st)
 	}
 
 	if got := readAll(t, r); !bytes.Equal(got, data) {
@@ -1349,4 +976,47 @@ func TestSpillQueuesBorrowedPages(t *testing.T) {
 	}
 
 	r.close()
+}
+
+// The budget reclaims lingering chunks this member does not own first.
+func TestEvictLingeringPrefersNotOwned(t *testing.T) {
+	s := newTestStore(t, func(c *storeConfig) {
+		c.content = nil
+		c.extraBudget = 64 * testPage
+	})
+
+	linger := func(k chunkKey, owned bool) {
+		t.Helper()
+
+		r, _, _ := s.acquire(context.Background(), k, 0, false, true)
+		f := r.f
+
+		if owned {
+			s.markOwned(f)
+		}
+
+		data := pattern(byte(k.index), testChunk)
+		_ = f.setMeta(int64(len(data)), "", len(data))
+		_ = f.readFrom(context.Background(), bytes.NewReader(data), nil)
+		f.finish(nil)
+		f.release()
+		r.close()
+	}
+
+	linger(key(1), true)
+	linger(key(2), false)
+	linger(key(3), true)
+
+	if !s.evictLingering() {
+		t.Fatal("nothing to evict")
+	}
+
+	if cached(s, key(2)) || !cached(s, key(1)) || !cached(s, key(3)) {
+		t.Fatal("want the chunk not owned evicted first")
+	}
+
+	// With only owned chunks left, the least recently used goes.
+	if !s.evictLingering() || cached(s, key(1)) || !cached(s, key(3)) {
+		t.Fatal("want the least recently used owned chunk evicted")
+	}
 }

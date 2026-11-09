@@ -9,6 +9,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -590,7 +591,7 @@ func TestOwnerPeekStartsOneOriginFill(t *testing.T) {
 		t.Fatal("owner does not cache chunk 1")
 	} else {
 		owner.node.store.mu.Lock()
-		owned := r.f.owned
+		owned := r.f.owned.Load()
 		owner.node.store.mu.Unlock()
 		r.close()
 
@@ -607,5 +608,200 @@ func TestOwnerPeekStartsOneOriginFill(t *testing.T) {
 
 	if got := c.origin.pullCount(d, cs); got != 1 {
 		t.Fatalf("origin pulls of chunk 1 after fetch = %d, want 1", got)
+	}
+}
+
+// dropMemory drops every chunk of d from every member's memory (as after
+// the linger windows expire) but keeps their content stores.
+func dropMemory(c *cluster, d string) {
+	for _, n := range c.nodes {
+		s := n.node.store
+
+		s.mu.Lock()
+		for k, f := range s.m {
+			if k.digest == d {
+				s.detachLocked(f)
+			}
+		}
+		s.mu.Unlock()
+
+		s.pages.purge(d)
+	}
+}
+
+// Once memory no longer holds a blob, members serve it from the content
+// stores of the members that pulled it: an owner that pulled it reads its
+// own store, and an owner that did not reads a recent requester's store
+// (the holder directory). The origin is not asked again.
+func TestSecondWaveServedFromContentStores(t *testing.T) {
+	c := newCluster(t, clusterOpts{n: 6})
+
+	const cs = 64 << 10
+
+	blob := randomBlob(7, 12*cs)
+	d := c.origin.add(blob, "application/octet-stream")
+
+	// Wave 1: half of the members pull.
+	for _, n := range c.nodes[:3] {
+		if _, _, _, body, err := fetch(n, d, ifaces.KindBlob, 0); err != nil || !bytes.Equal(body, blob) {
+			t.Fatalf("%s wave 1: %v", n.id, err)
+		}
+	}
+
+	pulls := c.origin.totalPulls()
+	if pulls != 12 {
+		t.Fatalf("wave 1 pulled %d chunks from the origin, want 12", pulls)
+	}
+
+	dropMemory(c, d.String())
+
+	// Wave 2: the other half.
+	for _, n := range c.nodes[3:] {
+		if _, _, _, body, err := fetch(n, d, ifaces.KindBlob, 0); err != nil || !bytes.Equal(body, blob) {
+			t.Fatalf("%s wave 2: %v", n.id, err)
+		}
+	}
+
+	if got := c.origin.totalPulls(); got != pulls {
+		t.Fatalf("wave 2 pulled %d chunks from the origin", got-pulls)
+	}
+
+	var local, holders int64
+
+	for _, n := range c.nodes {
+		st := n.node.Stats()
+		local += st.LocalFills
+		holders += st.HolderPeeks
+	}
+
+	if local == 0 {
+		t.Fatal("no chunk was read from a content store")
+	}
+
+	t.Logf("local fills %d, holder peeks %d", local, holders)
+}
+
+// An owner with nothing in memory or its own store, whose holders are gone,
+// falls back to the origin.
+func TestHolderMissFallsBackToOrigin(t *testing.T) {
+	c := newCluster(t, clusterOpts{n: 4})
+
+	const cs = 64 << 10
+
+	blob := randomBlob(8, 6*cs)
+	d := c.origin.add(blob, "application/octet-stream")
+
+	if _, _, _, _, err := fetch(c.nodes[0], d, ifaces.KindBlob, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	dropMemory(c, d.String())
+
+	// Containerd garbage collected the blob everywhere.
+	for _, n := range c.nodes {
+		n.content.drop(d.String())
+	}
+
+	before := c.origin.totalPulls()
+
+	if _, _, _, body, err := fetch(c.nodes[1], d, ifaces.KindBlob, 0); err != nil || !bytes.Equal(body, blob) {
+		t.Fatalf("refetch: %v", err)
+	}
+
+	if got := c.origin.totalPulls() - before; got != 6 {
+		t.Fatalf("refetch pulled %d chunks, want 6", got)
+	}
+}
+
+// A peek of kind local is served only from memory or the content store,
+// never by fetching; a TTL-exhausted request is served from the content
+// store too.
+func TestLocalPeekServesOnlyLocalContent(t *testing.T) {
+	c := newCluster(t, clusterOpts{n: 2})
+
+	const cs = 64 << 10
+
+	blob := randomBlob(9, 2*cs)
+	d := c.origin.add(blob, "application/octet-stream")
+	n := c.nodes[0]
+	req := chunkReq{registry: "reg", repo: "library/app", d: d, key: chunkKey{digest: d.String(), kind: kindBlob, index: 1}}
+
+	get := func() (int, []byte) {
+		t.Helper()
+
+		u := "http://" + c.dataAddr(cachemesh.PeerRef{ID: n.id}) + ChunkPath + "?" + n.node.chunkQuery(req, 0, peekLocal)
+
+		resp, err := http.Get(u)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		defer func() { _ = resp.Body.Close() }()
+
+		var buf bytes.Buffer
+
+		_, _ = buf.ReadFrom(resp.Body)
+
+		return resp.StatusCode, buf.Bytes()
+	}
+
+	if code, _ := get(); code != http.StatusNotFound {
+		t.Fatalf("peek without content: %d", code)
+	}
+
+	if c.origin.totalPulls() != 0 {
+		t.Fatal("local peek reached the origin")
+	}
+
+	n.content.put(d.String(), blob)
+
+	code, body := get()
+	if code != http.StatusOK || !bytes.Equal(body, blob[cs:]) {
+		t.Fatalf("peek with content: %d, %d bytes", code, len(body))
+	}
+
+	// A digest that failed verification is not served from the store.
+	n.node.store.evictDigest(d.String())
+
+	if code, _ := get(); code != http.StatusNotFound {
+		t.Fatalf("peek of a distrusted digest: %d", code)
+	}
+}
+
+// Requests for a member's own pull carry its address, and members record
+// it as a holder of the chunk.
+func TestRequesterRecordedAsHolder(t *testing.T) {
+	c := newCluster(t, clusterOpts{n: 4})
+
+	const cs = 64 << 10
+
+	blob := randomBlob(10, 8*cs)
+	d := c.origin.add(blob, "application/octet-stream")
+	req := c.nodes[2]
+
+	if _, _, _, _, err := fetch(req, d, ifaces.KindBlob, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	self := req.mesh.Addr()
+	recorded := 0
+
+	for i := range int64(8) {
+		k := chunkKey{digest: d.String(), kind: kindBlob, index: i}
+
+		for _, n := range c.nodes {
+			if n == req {
+				continue
+			}
+
+			if hs := n.node.holders.list(k, ""); slices.Contains(hs, self) {
+				recorded++
+				break
+			}
+		}
+	}
+
+	if recorded == 0 {
+		t.Fatal("requester not recorded as a holder of any chunk")
 	}
 }

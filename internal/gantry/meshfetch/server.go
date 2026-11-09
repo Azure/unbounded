@@ -163,9 +163,10 @@ func (n *Node) shed(w http.ResponseWriter) {
 
 // chunkForPeer finds or starts the fill for a peer request. peek is the
 // request's peek parameter: "" for a routed request, peekHandoff from a new
-// owner reading through the previous owner, or peekOwner from a backup
-// reading through the owner. On failure it returns a nil fill with the status
-// and outcome to report.
+// owner reading through the previous owner, peekOwner from a backup
+// reading through the owner, or peekLocal from an owner reading through a
+// recent requester. On failure it returns a nil fill with the status and
+// outcome to report.
 func (n *Node) chunkForPeer(r *http.Request, peek string, req chunkReq, off int) (*reader, int, string) {
 	if peek != "" {
 		// Serve only complete chunks and chunks read from the origin
@@ -183,8 +184,10 @@ func (n *Node) chunkForPeer(r *http.Request, peek string, req chunkReq, off int)
 			}
 
 			rd.close()
+		}
 
-			return nil, http.StatusNotFound, "not_found"
+		if rd := n.localOnly(req, off); rd != nil {
+			return rd, 0, ""
 		}
 
 		// A backup standing in for this member asks before going to the
@@ -206,6 +209,11 @@ func (n *Node) chunkForPeer(r *http.Request, peek string, req chunkReq, off int)
 		return nil, http.StatusBadRequest, "bad_request"
 	}
 
+	if a := r.Header.Get(headerRequester); validHolder(a) {
+		req.requester = a
+		n.holders.add(req.key, a)
+	}
+
 	d, err := n.mesh.Forward(h)
 
 	switch {
@@ -213,6 +221,10 @@ func (n *Node) chunkForPeer(r *http.Request, peek string, req chunkReq, off int)
 		// The request may not travel further: serve only what is here.
 		if rd := n.store.get(req.key, off); rd != nil {
 			n.lookup("peer", "hit")
+			return rd, 0, ""
+		}
+
+		if rd := n.localOnly(req, off); rd != nil {
 			return rd, 0, ""
 		}
 
@@ -238,6 +250,29 @@ func (n *Node) chunkForPeer(r *http.Request, peek string, req chunkReq, off int)
 	}
 
 	return rd, 0, ""
+}
+
+// localOnly returns a reader of the chunk read from the local content
+// store when it holds the whole chunk, else nil. The fill is outside the
+// store map, so it never joins an in-progress fill that may wait on the
+// requester.
+func (n *Node) localOnly(req chunkReq, off int) *reader {
+	if _, _, ok := n.localChunk(req); !ok {
+		return nil
+	}
+
+	f, r := n.store.newLocalFill(req.key, off)
+
+	n.lookup("peer", "local")
+
+	go func() {
+		defer f.release()
+
+		err := n.fillFromLocal(f, req)
+		f.finish(err)
+	}()
+
+	return r
 }
 
 // ownerFill starts or joins the fill of req when this member is its owner

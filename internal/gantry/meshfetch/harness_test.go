@@ -195,13 +195,102 @@ func (o *fakeOrigin) ManifestByTag(_ context.Context, _, repo, tag string) ([]by
 	return b, ct, digest.MustParse(ds), nil
 }
 
+// memContent is an in-memory ContentSource standing in for containerd's
+// content store: fetch appends what FetchBlob serves, as containerd does
+// while it pulls.
+type memContent struct {
+	mu     sync.Mutex
+	data   map[string][]byte
+	totals map[string]int64
+	reads  atomic.Int64
+	fail   atomic.Bool
+}
+
+func newMemContent() *memContent {
+	return &memContent{data: map[string][]byte{}, totals: map[string]int64{}}
+}
+
+func (m *memContent) Available(d string) (avail, total int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	t, ok := m.totals[d]
+	if !ok {
+		return 0, -1
+	}
+
+	return int64(len(m.data[d])), t
+}
+
+func (m *memContent) ReadAt(d string, p []byte, off int64) (int, error) {
+	m.reads.Add(1)
+
+	if m.fail.Load() {
+		return 0, errors.New("injected content read error")
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	b := m.data[d]
+	if off > int64(len(b)) {
+		return 0, errContentShort
+	}
+
+	k := copy(p, b[off:])
+	if k < len(p) {
+		return k, errContentShort
+	}
+
+	return k, nil
+}
+
+// put stores a complete blob.
+func (m *memContent) put(d string, b []byte) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.data[d] = append([]byte(nil), b...)
+	m.totals[d] = int64(len(b))
+}
+
+// drop deletes a blob (garbage collection).
+func (m *memContent) drop(d string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	delete(m.data, d)
+	delete(m.totals, d)
+}
+
+// ingest returns a writer that appends to blob d of size total.
+func (m *memContent) ingest(d string, total int64) io.Writer {
+	m.mu.Lock()
+	m.data[d] = nil
+	m.totals[d] = total
+	m.mu.Unlock()
+
+	return writerFunc(func(p []byte) (int, error) {
+		m.mu.Lock()
+		m.data[d] = append(m.data[d], p...)
+		m.mu.Unlock()
+
+		return len(p), nil
+	})
+}
+
+type writerFunc func([]byte) (int, error)
+
+func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
+
 type testNode struct {
-	id     string
-	mesh   *cachemesh.Mesh
-	node   *Node
-	srv    *httptest.Server
-	cancel context.CancelFunc
-	errc   chan error
+	id      string
+	mesh    *cachemesh.Mesh
+	node    *Node
+	content *memContent
+	srv     *httptest.Server
+	cancel  context.CancelFunc
+	errc    chan error
 }
 
 type cluster struct {
@@ -218,10 +307,8 @@ type cluster struct {
 type clusterOpts struct {
 	n            int
 	chunkSize    int64
-	diskBytes    int64
 	memBytes     int64
-	noDisk       bool
-	persist      PersistPolicy
+	noContent    bool
 	cellSize     int
 	maxNeighbors int
 	lookahead    int
@@ -237,10 +324,6 @@ func newCluster(t testing.TB, o clusterOpts) *cluster {
 
 	if o.chunkSize == 0 {
 		o.chunkSize = 64 << 10
-	}
-
-	if o.diskBytes == 0 {
-		o.diskBytes = 256 * o.chunkSize
 	}
 
 	if o.memBytes == 0 {
@@ -275,18 +358,21 @@ func newCluster(t testing.TB, o clusterOpts) *cluster {
 
 	for i := range o.n {
 		id := fmt.Sprintf("node-%02d", i)
+		// The member address is host:port shaped, as in production, so
+		// it passes as a holder address.
+		addr := id + ":1"
 
 		var seeds []string
 		if i > 0 {
-			seeds = []string{c.nodes[0].id}
+			seeds = []string{c.nodes[0].id + ":1"}
 		}
 
 		tuning := fastTuning()
 
 		m, err := cachemesh.New(cachemesh.Config{
 			ID:            id,
-			Addr:          id,
-			Transport:     c.net.Transport(id),
+			Addr:          addr,
+			Transport:     c.net.Transport(addr),
 			Seeds:         seeds,
 			Lease:         c.lease,
 			ExpectedSize:  1,
@@ -306,10 +392,7 @@ func newCluster(t testing.TB, o clusterOpts) *cluster {
 			Origin:       c.origin,
 			Tags:         c.origin,
 			ChunkSize:    o.chunkSize,
-			ChunkDir:     t.TempDir(),
-			DiskBytes:    o.diskBytes,
 			MemoryBytes:  o.memBytes,
-			Persist:      o.persist,
 			MaxFills:     1024,
 			MaxServes:    1024,
 			Lookahead:    o.lookahead,
@@ -322,8 +405,10 @@ func newCluster(t testing.TB, o clusterOpts) *cluster {
 			DataAddr:     c.dataAddr,
 			Logger:       logger,
 		}
-		if o.noDisk {
-			cfg.ChunkDir, cfg.DiskBytes = "", 0
+
+		content := newMemContent()
+		if !o.noContent {
+			cfg.Content = content
 		}
 
 		if o.tweak != nil {
@@ -335,7 +420,7 @@ func newCluster(t testing.TB, o clusterOpts) *cluster {
 			t.Fatal(err)
 		}
 
-		tn := &testNode{id: id, mesh: m, node: node, errc: make(chan error, 1)}
+		tn := &testNode{id: id, mesh: m, node: node, content: content, errc: make(chan error, 1)}
 
 		mux := http.NewServeMux()
 		node.Register(mux)
@@ -344,9 +429,10 @@ func newCluster(t testing.TB, o clusterOpts) *cluster {
 
 		c.addrMu.Lock()
 		c.addrs[id] = strings.TrimPrefix(tn.srv.URL, "http://")
+		c.addrs[addr] = c.addrs[id]
 		c.addrMu.Unlock()
 
-		c.net.Register(id, m.ServeControl)
+		c.net.Register(addr, m.ServeControl)
 
 		ctx, cancel := context.WithCancel(context.Background())
 		tn.cancel = cancel
@@ -442,13 +528,20 @@ func randomBlob(seed uint64, n int) []byte {
 	return b
 }
 
-// fetch runs FetchBlob on node n into a buffer.
+// fetch runs FetchBlob on node n into a buffer. A full blob fetch also
+// lands in the node's content store, as a containerd pull would.
 func fetch(n *testNode, d digest.Digest, kind ifaces.OriginRefKind, off int64) (started bool, total int64, ctype string, body []byte, err error) {
 	var buf bytes.Buffer
 
+	var w io.Writer = &buf
+
 	ref := ifaces.OriginRef{Registry: "reg", Repository: "library/app", Digest: d, Kind: kind, Offset: off}
-	started, written, err := n.node.FetchBlob(context.Background(), &buf, ref, func(t int64, ct string) {
+	started, written, err := n.node.FetchBlob(context.Background(), writerFunc(func(p []byte) (int, error) { return w.Write(p) }), ref, func(t int64, ct string) {
 		total, ctype = t, ct
+
+		if off == 0 && kind == ifaces.KindBlob {
+			w = io.MultiWriter(&buf, n.content.ingest(d.String(), t))
+		}
 	})
 
 	if written != int64(buf.Len()) {

@@ -16,7 +16,7 @@ var (
 	errBusy   = errors.New("meshfetch: chunk fill limit reached")
 	errClosed = errors.New("meshfetch: node closed")
 	// errLost reports that a reader needs bytes the fill no longer holds:
-	// they were neither written to disk nor kept in memory.
+	// they are neither in memory nor in the local content store.
 	errLost = errors.New("meshfetch: chunk bytes no longer available")
 )
 
@@ -46,107 +46,96 @@ func (k chunkKey) routeKey(buf []byte) []byte {
 	return append(buf, idx[:]...)
 }
 
-// PersistPolicy selects which chunks are written to the chunk directory.
-type PersistPolicy string
-
-const (
-	// PersistAll writes every chunk to disk.
-	PersistAll PersistPolicy = "all"
-	// PersistShared writes only chunks this agent owns or serves to a
-	// peer. A chunk only this agent consumes streams through memory, with
-	// the fill paced by its slowest reader, and is never written.
-	PersistShared PersistPolicy = "shared"
-	// PersistOwned writes only chunks this agent owns. Every other chunk
-	// streams through memory; a peer that asks for one after its first
-	// page is gone gets a new fill, which refetches it from upstream.
-	PersistOwned PersistPolicy = "owned"
-)
-
 // storeConfig configures a store.
 type storeConfig struct {
 	chunkSize int64
-	// pageSize is the unit of in-flight buffers, disk I/O, read
-	// coalescing, and the hot tier. It divides chunkSize.
+	// pageSize is the unit of in-flight buffers, local content reads,
+	// read coalescing, and the hot tier. It divides chunkSize.
 	pageSize int
 	// window is the number of in-flight pages a fill holds.
 	window int
 	// maxFills caps fills in progress.
 	maxFills int
-	// dir is the chunk directory; empty disables the disk tier.
-	dir string
-	// diskBudget bounds bytes in dir.
-	diskBudget int64
 	// hotBudget bounds the hot page tier in memory.
 	hotBudget int64
 	// extraBudget bounds window pages beyond the base windows of all
 	// fills, borrowed by fills whose readers lag.
 	extraBudget int64
-	pageCache   PageCacheMode
-	persist     PersistPolicy
-	// stallTimeout is how long a fill that is not written to disk waits
-	// for a reader before dropping it.
+	// content is the local containerd content store; nil when there is
+	// none. It is the only disk tier: meshfetch never writes blob bytes.
+	content ContentSource
+	// stallTimeout is how long a fill waits for a lagging reader that
+	// the local content store does not cover before dropping it.
 	stallTimeout time.Duration
 	// lingerTTL drops a chunk held only in memory once nobody has used it
 	// for this long, so an idle agent returns the memory.
 	lingerTTL time.Duration
-	onEvict   func(bytes int64)
 	logger    *slog.Logger
 }
 
-// diskFaults injects disk errors in tests.
-type diskFaults struct {
-	create func() error
-	write  func(idx int) error
-	read   func(idx int) error
-}
-
-// store is the chunk store: a map of fills plus LRU lists of complete
-// chunks on disk, under a disk byte budget that also covers fills being
-// written. Chunks this member owns are kept on a separate list and
-// evicted only when no other complete chunk is left, or when they hold
-// more than half of the budget. Memory holds only in-flight pages of
-// fills, pages being sent, and the hot page tier.
+// store is the chunk store: a map of fills (in progress, or complete and
+// lingering in memory for later peers) over a page tier. Memory holds only
+// in-flight pages of fills, pages being sent, lingering chunks in pages
+// borrowed from the in-flight budget, and the hot page tier. Bytes behind a
+// fill's window are read back from the local containerd content store,
+// which containerd writes while it pulls through this agent.
 type store struct {
 	cfg   storeConfig
-	disk  *diskDir
 	pool  *pagePool
 	pages *pageCache
 
-	mu        sync.Mutex
-	m         map[chunkKey]*fill
-	head      fill // LRU sentinel of other chunks: head.next is most recent
-	ownedHead fill // LRU sentinel of owned chunks
+	mu sync.Mutex
+	m  map[chunkKey]*fill
 	// memHead lists complete chunks held only in memory, in pages borrowed
-	// from the in-flight budget (lingering relay chunks).
-	memHead   fill
-	memN      int
-	ownedUsed int64
-	used      int64
-	inflight  int
-	space     chan struct{}
-	closed    bool
-	stop      chan struct{}
-	// diskFullUntil pauses disk writes after the file system ran out of
-	// space.
-	diskFullUntil time.Time
+	// from the in-flight budget (lingering chunks).
+	memHead  fill
+	memN     int
+	inflight int
+	space    chan struct{}
+	closed   bool
+	stop     chan struct{}
 
-	extraPages atomic.Int64
-	spills     atomic.Int64
+	extraPages  atomic.Int64
+	localFills  atomic.Int64
+	localErrors atomic.Int64
 
-	diskWrites  atomic.Int64
-	diskReads   atomic.Int64
-	diskErrors  atomic.Int64
-	streamFills atomic.Int64
-
-	faults *diskFaults
+	// distrusted maps digests that failed verification to the time until
+	// which their local content is not read: a failed blob may still sit
+	// in an ingest.
+	distrusted sync.Map
 }
 
-// diskFullBackoff is how long new fills skip the disk after ENOSPC.
-const diskFullBackoff = 10 * time.Second
+// distrustTTL is how long a digest that failed verification is not read
+// from the content store.
+const distrustTTL = 10 * time.Minute
+
+// localOK reports whether the local content of digest d may be read.
+func (s *store) localOK(d string) bool {
+	if s.cfg.content == nil {
+		return false
+	}
+
+	v, ok := s.distrusted.Load(d)
+	if !ok {
+		return true
+	}
+
+	if until, _ := v.(time.Time); time.Now().Before(until) { //nolint:errcheck // only time.Time is stored
+		return false
+	}
+
+	s.distrusted.Delete(d)
+
+	return true
+}
 
 // defaultLingerTTL bounds how long an unused chunk or hot page stays in
 // memory.
 const defaultLingerTTL = 30 * time.Second
+
+// localRefresh bounds how often a fill asks the content store how much of
+// its chunk is local.
+const localRefresh = 10 * time.Millisecond
 
 func newStore(cfg storeConfig) *store {
 	if cfg.pageSize <= 0 || int64(cfg.pageSize) > cfg.chunkSize {
@@ -159,14 +148,6 @@ func newStore(cfg storeConfig) *store {
 
 	if cfg.stallTimeout <= 0 {
 		cfg.stallTimeout = 30 * time.Second
-	}
-
-	if cfg.persist == "" {
-		cfg.persist = PersistAll
-	}
-
-	if cfg.pageCache == "" {
-		cfg.pageCache = PageCacheBypass
 	}
 
 	if cfg.logger == nil {
@@ -189,31 +170,12 @@ func newStore(cfg storeConfig) *store {
 		space: make(chan struct{}),
 		stop:  make(chan struct{}),
 	}
-	s.head.next = &s.head
-	s.head.prev = &s.head
-	s.ownedHead.next = &s.ownedHead
-	s.ownedHead.prev = &s.ownedHead
 	s.memHead.next = &s.memHead
 	s.memHead.prev = &s.memHead
 
 	go s.expireLoop()
 
-	if cfg.dir != "" && cfg.diskBudget > 0 {
-		d, err := openDiskDir(cfg.dir, cfg.pageCache)
-		if err != nil {
-			cfg.logger.Warn("cachemesh chunk dir unusable; chunks stream through memory only",
-				slog.String("dir", cfg.dir), slog.Any("err", err))
-		} else {
-			s.disk = d
-		}
-	}
-
 	return s
-}
-
-// direct reports whether O_DIRECT is possible: pages must be aligned.
-func (s *store) direct() bool {
-	return s.cfg.pageCache == PageCacheBypass && s.cfg.pageSize%dioAlign == 0
 }
 
 // borrowExtra charges one page to the in-flight budget if it has room.
@@ -236,27 +198,6 @@ func (s *store) releaseExtra(pages int) {
 	if pages > 0 {
 		s.extraPages.Add(-int64(pages))
 	}
-}
-
-// reserveSpill reserves disk for a fill that spills while it is in the
-// map. Detached fills do not spill: nothing would return the charge.
-func (s *store) reserveSpill(f *fill) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	return f.inMap && !s.closed && s.reserveLocked(f)
-}
-
-func (s *store) readFile(cf *chunkFile, buf []byte, off int64, n int) error {
-	s.diskReads.Add(1)
-
-	if s.faults != nil && s.faults.read != nil {
-		if err := s.faults.read(int(off / int64(s.cfg.pageSize))); err != nil {
-			return err
-		}
-	}
-
-	return cf.readAt(buf, off, n)
 }
 
 // get returns a reader of the fill for k at byte off, or nil when there is
@@ -302,8 +243,8 @@ func (s *store) touch(f *fill) {
 // that can serve from off (created == false) or a new one (created ==
 // true). A new fill holds three references: the map, the filler, and the
 // returned reader. An existing fill that has dropped bytes before off is
-// detached from the map and replaced. shared marks a request from a peer:
-// under PersistShared the chunk is then written to disk. With wait false
+// detached from the map and replaced. shared marks a request from a peer.
+// With wait false
 // acquire returns errBusy when the fill cap is reached; with wait true it
 // blocks until a fill ends or ctx ends.
 func (s *store) acquire(ctx context.Context, k chunkKey, off int, wait, shared bool) (r *reader, created bool, err error) {
@@ -325,16 +266,8 @@ func (s *store) acquire(ctx context.Context, k chunkKey, off int, wait, shared b
 			if r != nil {
 				f.refs.Add(1)
 
-				if shared {
-					f.share()
-				}
-
 				s.touch(f)
 				s.mu.Unlock()
-
-				if shared {
-					f.startDisk(false)
-				}
 
 				return r, false, nil
 			}
@@ -343,7 +276,7 @@ func (s *store) acquire(ctx context.Context, k chunkKey, off int, wait, shared b
 		}
 
 		if s.inflight < s.cfg.maxFills {
-			f := s.newFillLocked(k, shared)
+			f := s.newFillLocked(k)
 			r = f.newReader(off, shared)
 			s.mu.Unlock()
 
@@ -365,90 +298,38 @@ func (s *store) acquire(ctx context.Context, k chunkKey, off int, wait, shared b
 	}
 }
 
-func (s *store) newFillLocked(k chunkKey, shared bool) *fill {
+func (s *store) newFillLocked(k chunkKey) *fill {
 	f := &fill{key: k, store: s, wake: make(chan struct{}), total: -1, upstream: noSlot}
 	f.refs.Store(3)
 	f.inMap = true
 	s.m[k] = f
 	s.inflight++
 
-	if s.cfg.persist == PersistAll || (shared && s.cfg.persist == PersistShared) {
-		s.reserveLocked(f)
-	}
-
-	if !f.wantDisk.Load() {
-		s.streamFills.Add(1)
-	}
-
 	return f
 }
 
-// reserveLocked charges a full chunk of disk to f when the disk tier has
-// room, so f is written to disk once its size is known. Caller holds s.mu.
-func (s *store) reserveLocked(f *fill) bool {
-	if f.wantDisk.Load() {
-		return true
-	}
+// newLocalFill returns a fill of k outside the map, with one reference
+// for the filler and one for the returned reader at offset off. It still
+// counts as a fill in progress.
+func (s *store) newLocalFill(k chunkKey, off int) (*fill, *reader) {
+	f := &fill{key: k, store: s, wake: make(chan struct{}), total: -1, upstream: noSlot, detached: true}
+	f.refs.Store(2)
 
-	if s.disk == nil || time.Now().Before(s.diskFullUntil) || !s.makeRoom(s.cfg.chunkSize) {
-		return false
-	}
+	s.mu.Lock()
+	s.inflight++
+	s.mu.Unlock()
 
-	f.wantDisk.Store(true)
-	f.charge = s.cfg.chunkSize
-	s.used += f.charge
-
-	return true
-}
-
-// makeRoom evicts least recently used complete chunks until n more bytes
-// fit: other chunks first, owned chunks once no other one is left or they
-// exceed half of the budget. Caller holds s.mu.
-func (s *store) makeRoom(n int64) bool {
-	for s.used+n > s.cfg.diskBudget {
-		victim := s.head.prev
-		if victim == &s.head || 2*s.ownedUsed > s.cfg.diskBudget {
-			if o := s.ownedHead.prev; o != &s.ownedHead {
-				victim = o
-			}
-		}
-
-		if victim == &s.head {
-			return false
-		}
-
-		s.evictLocked(victim)
-	}
-
-	return true
+	return f, f.newReader(off, true)
 }
 
 // markOwned records that f is filled by this member as the chunk's owner.
-// Owned chunks are always written to disk when the disk tier has room.
+// A lingering owned chunk is reclaimed after the others.
 func (s *store) markOwned(f *fill) {
-	s.mu.Lock()
-	f.owned = true
-	reserved := s.reserveLocked(f)
-	s.mu.Unlock()
-
-	if reserved {
-		f.startDisk(false)
-	}
+	f.owned.Store(true)
 }
 
-// evictLocked drops a complete chunk. Caller holds s.mu.
-func (s *store) evictLocked(f *fill) {
-	charge := f.charge
-	s.detachLocked(f)
-
-	if s.cfg.onEvict != nil && charge > 0 {
-		s.cfg.onEvict(charge)
-	}
-}
-
-// detachLocked removes f from the map and the LRU lists, returns its disk
-// charge, and unlinks its file. Readers holding f keep reading what it has.
-// Caller holds s.mu.
+// detachLocked removes f from the map and the memory list. Readers
+// holding f keep reading what it has. Caller holds s.mu.
 func (s *store) detachLocked(f *fill) {
 	if !f.inMap {
 		return
@@ -456,40 +337,18 @@ func (s *store) detachLocked(f *fill) {
 
 	if f.listed {
 		s.unlink(f)
-
-		switch {
-		case f.inMemory:
-			s.memN--
-		case f.owned:
-			s.ownedUsed -= f.charge
-		}
+		s.memN--
 	}
 
 	delete(s.m, f.key)
 	f.inMap = false
-	s.used -= f.charge
-	f.charge = 0
 
 	f.mu.Lock()
 	f.detached = true
-	cf := f.file
 	f.mu.Unlock()
 
-	if cf != nil {
-		cf.remove()
-	}
-
-	s.pages.purge(f)
 	s.signalSpace()
 	f.release()
-}
-
-// detach drops f from the map if it is still there.
-func (s *store) detach(f *fill) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.detachLocked(f)
 }
 
 func (s *store) signalSpace() {
@@ -497,15 +356,14 @@ func (s *store) signalSpace() {
 	s.space = make(chan struct{})
 }
 
-// finished lists a complete fill that is on disk as a cached chunk, and
-// drops a failed fill or one that only streamed through memory.
+// finished keeps a complete fill that peers read or that this member owns
+// and that still holds every page in memory on the memory list, so later peers can join it
+// until the in-flight budget needs its pages or it expires. Every other
+// fill leaves the map: later readers get a new fill, which reads the local
+// content store when it covers the chunk.
 func (s *store) finished(f *fill, err error) {
 	f.mu.Lock()
-	onDisk := f.file != nil && !f.diskFailed && f.diskStart == 0
-	size := f.diskSize
-	// A fill peers read that still holds every page in memory lingers
-	// for later peers until the in-flight budget needs its pages.
-	inMemory := !onDisk && f.hadPeers && f.winStart == 0 && f.metaKnown && f.n == f.chunkLen
+	inMemory := (f.hadPeers || f.owned.Load()) && f.winStart == 0 && f.metaKnown && f.n == f.chunkLen
 	f.mu.Unlock()
 
 	s.mu.Lock()
@@ -514,28 +372,13 @@ func (s *store) finished(f *fill, err error) {
 	s.inflight--
 
 	if f.inMap {
-		switch {
-		case err == nil && inMemory:
+		if err == nil && inMemory {
 			f.inMemory = true
 			f.lastUse = time.Now()
 			s.memN++
 			s.pushFront(f)
-		case err != nil || !onDisk:
+		} else {
 			s.detachLocked(f)
-		default:
-			// Charge the real size: short final chunks and small
-			// manifests do not hold a full chunk.
-			if size < f.charge {
-				s.used -= f.charge - size
-				f.charge = size
-			}
-
-			if f.owned {
-				s.ownedUsed += f.charge
-			}
-
-			s.pushFront(f)
-			s.makeRoom(0)
 		}
 	}
 
@@ -576,9 +419,10 @@ func (s *store) expire(now time.Time) {
 	}
 }
 
-// evictLingering drops the least recently used chunk held only in memory,
-// so its pages return to the in-flight budget once its readers are done.
-// It reports whether there was one.
+// evictLingering drops a lingering chunk, so its pages return to the
+// in-flight budget once its readers are done: the least recently used one
+// this member does not own, else the least recently used one. It reports
+// whether there was one.
 func (s *store) evictLingering() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -588,50 +432,38 @@ func (s *store) evictLingering() bool {
 		return false
 	}
 
+	for v := victim; v != &s.memHead; v = v.prev {
+		if !v.owned.Load() {
+			victim = v
+			break
+		}
+	}
+
 	s.detachLocked(victim)
 
 	return true
 }
 
-// diskFailed records a failed disk operation. A full disk pauses disk
-// writes for new fills for a while.
-func (s *store) diskFailed(err error) {
-	s.diskErrors.Add(1)
-
-	full := errors.Is(err, errDiskFull)
-
-	s.mu.Lock()
-	if full {
-		s.diskFullUntil = time.Now().Add(diskFullBackoff)
-	}
-	s.mu.Unlock()
-
-	s.cfg.logger.Warn("cachemesh chunk disk error; streaming through memory",
-		slog.Bool("disk_full", full), slog.Any("err", err))
-}
-
-// evictDigest drops every cached chunk of digest d.
+// evictDigest drops every cached chunk and page of digest d, and stops
+// reading its local content for a while.
 func (s *store) evictDigest(d string) {
+	s.distrusted.Store(d, time.Now().Add(distrustTTL))
+
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	for k, f := range s.m {
 		if k.digest == d && f.listed {
-			s.evictLocked(f)
+			s.detachLocked(f)
 		}
 	}
+	s.mu.Unlock()
+
+	s.pages.purge(d)
 }
 
-// pushFront makes f the most recent chunk of its list.
+// pushFront makes f the most recent lingering chunk.
 func (s *store) pushFront(f *fill) {
-	h := &s.head
-
-	switch {
-	case f.inMemory:
-		h = &s.memHead
-	case f.owned:
-		h = &s.ownedHead
-	}
+	h := &s.memHead
 
 	f.prev = h
 	f.next = h.next
@@ -663,43 +495,39 @@ func (s *store) close() {
 
 // Stats is a point-in-time view of the chunk store.
 type Stats struct {
-	// DiskBytes is charged to the disk budget: chunks on disk plus fills
-	// being written.
-	DiskBytes int64
-	// Chunks in the store, complete or in progress.
+	// Chunks in the store, in progress or lingering.
 	Chunks int
 	// Inflight is the number of fills in progress.
 	Inflight int
 	// PageBytes is memory in page buffers in use: in-flight fill pages,
-	// pages being sent, and the hot tier.
+	// pages being sent, lingering chunks, and the hot tier.
 	PageBytes int64
 	// HotBytes is memory in the hot page tier.
 	HotBytes int64
 	// IdlePageBytes is memory in idle pooled page buffers.
 	IdlePageBytes int64
-	// DiskReads and DiskWrites count page reads and writes.
-	DiskReads  int64
-	DiskWrites int64
-	// DiskErrors counts failed disk operations.
-	DiskErrors int64
-	// PageReadsShared counts page reads served by another reader's disk
-	// read or by the hot tier.
+	// LocalReads counts page reads from the local content store.
+	LocalReads int64
+	// LocalErrors counts failed local content reads.
+	LocalErrors int64
+	// LocalFills counts fills read from the local content store.
+	LocalFills int64
+	// PageReadsShared counts page reads served by another reader's read
+	// or by the hot tier.
 	PageReadsShared int64
-	// StreamFills counts fills not written to disk from their start.
-	StreamFills int64
 	// ExtraPageBytes is memory borrowed from the in-flight budget by
-	// fills whose readers lag.
+	// fills whose readers lag and by lingering chunks.
 	ExtraPageBytes int64
-	// Spills counts fills that spilled to disk when the in-flight budget
-	// was exhausted.
-	Spills int64
-	// MemoryChunks is the number of complete chunks held only in memory.
+	// MemoryChunks is the number of complete chunks lingering in memory.
 	MemoryChunks int
+	// HolderPeeks counts owner reads from a recent requester's local
+	// content store, by outcome ("ok" or "miss").
+	HolderPeeks, HolderMisses int64
 }
 
 func (s *store) stats() Stats {
 	s.mu.Lock()
-	st := Stats{DiskBytes: s.used, Chunks: len(s.m), Inflight: s.inflight, MemoryChunks: s.memN}
+	st := Stats{Chunks: len(s.m), Inflight: s.inflight, MemoryChunks: s.memN}
 	s.mu.Unlock()
 
 	live, idle := s.pool.stats()
@@ -707,13 +535,11 @@ func (s *store) stats() Stats {
 	st.PageBytes = int64(live) * ps
 	st.IdlePageBytes = int64(idle) * ps
 	st.HotBytes = s.pages.hotBytes()
-	st.DiskReads = s.diskReads.Load()
-	st.DiskWrites = s.diskWrites.Load()
-	st.DiskErrors = s.diskErrors.Load()
+	st.LocalReads = s.pages.reads.Load()
+	st.LocalErrors = s.localErrors.Load()
+	st.LocalFills = s.localFills.Load()
 	st.PageReadsShared = s.pages.hits.Load()
-	st.StreamFills = s.streamFills.Load()
 	st.ExtraPageBytes = s.extraPages.Load() * int64(s.cfg.pageSize)
-	st.Spills = s.spills.Load()
 
 	return st
 }

@@ -42,6 +42,11 @@ type chunkReq struct {
 	repo     string
 	d        digest.Digest
 	key      chunkKey
+	// requester is the member address of the agent whose containerd
+	// pull the request serves, carried hop by hop in headerRequester so
+	// the owner learns which members hold the chunk afterwards. Empty
+	// when unknown.
+	requester string
 }
 
 func (r *chunkReq) kind() ifaces.OriginRefKind {
@@ -120,6 +125,12 @@ func (n *Node) fillChunk(f *fill, req chunkReq, decide decider) error {
 		altHdr  cachemesh.Header
 	)
 
+	// The local containerd content store comes first: it needs no
+	// network and no routing.
+	if n.fillFromLocal(f, req) == nil {
+		return nil
+	}
+
 	for attempt := range n.cfg.Attempts {
 		if n.ctx.Err() != nil {
 			return errClosed
@@ -173,6 +184,13 @@ func (n *Node) fillChunk(f *fill, req chunkReq, decide decider) error {
 				}
 
 				if attempt == 0 && !d.Owner.IsZero() && d.Owner.ID != n.mesh.ID() && n.fillFromPrev(f, req, d.Owner, peekOwner, "owner") == nil {
+					return nil
+				}
+
+				// An owner whose memory no longer holds the chunk reads
+				// it from a member that recently pulled it into its own
+				// content store.
+				if attempt == 0 && d.Owner.ID == n.mesh.ID() && n.fillFromHolders(f, req) == nil {
 					return nil
 				}
 
@@ -332,6 +350,128 @@ func (n *Node) fillFromOrigin(f *fill, req chunkReq) (err error) {
 	return f.readFrom(ctx, rc, touch)
 }
 
+// contentReader reads blob d of src sequentially from off.
+type contentReader struct {
+	src ContentSource
+	d   string
+	off int64
+	end int64
+}
+
+func (r *contentReader) Read(p []byte) (int, error) {
+	if r.off >= r.end {
+		return 0, io.EOF
+	}
+
+	p = p[:min(int64(len(p)), r.end-r.off)]
+
+	k, err := r.src.ReadAt(r.d, p, r.off)
+	r.off += int64(k)
+
+	return k, err
+}
+
+// localChunk returns the blob size and chunk length of req when the local
+// content store holds the whole chunk. Only blobs are read locally:
+// manifests need their content type, which the store does not keep.
+func (n *Node) localChunk(req chunkReq) (total int64, chunkLen int, ok bool) {
+	src := n.cfg.Content
+	if req.key.kind != kindBlob || !n.store.localOK(req.key.digest) {
+		return 0, 0, false
+	}
+
+	avail, total := src.Available(req.key.digest)
+	if total <= 0 {
+		return 0, 0, false
+	}
+
+	start := req.key.index * n.cfg.ChunkSize
+
+	cl := min(n.cfg.ChunkSize, total-start)
+	if cl <= 0 || avail < start+cl {
+		return 0, 0, false
+	}
+
+	return total, int(cl), true
+}
+
+// fillFromLocal reads the chunk from the local content store when it
+// holds all of it.
+func (n *Node) fillFromLocal(f *fill, req chunkReq) (err error) {
+	total, chunkLen, ok := n.localChunk(req)
+	if !ok {
+		return errNotFound
+	}
+
+	start := time.Now()
+	off, _ := f.progress()
+
+	defer func() {
+		now, _ := f.progress()
+		n.fillHook("local", err, int64(now-off), start)
+	}()
+
+	if err := f.setMeta(total, "", chunkLen); err != nil {
+		return err
+	}
+
+	ctx, touch, _, cancel := n.attemptCtx()
+	defer cancel()
+
+	f.mu.Lock()
+	f.fromOrigin = false
+	f.upstream = noSlot
+	off = f.n
+	f.mu.Unlock()
+
+	n.store.localFills.Add(1)
+
+	chunkStart := req.key.index * n.cfg.ChunkSize
+	r := &contentReader{src: n.cfg.Content, d: req.key.digest, off: chunkStart + int64(off), end: chunkStart + int64(chunkLen)}
+
+	if err = f.readFrom(ctx, r, touch); err != nil {
+		n.store.localErrors.Add(1)
+	}
+
+	return err
+}
+
+// holderPeekTimeout bounds the wait for response headers of a holder peek.
+const holderPeekTimeout = time.Second
+
+// holderPeekMax bounds the holders an owner asks per chunk.
+const holderPeekMax = 2
+
+// fillFromHolders reads the chunk from members that recently requested it
+// for their own containerd pull. They serve it only from memory or their
+// content store (peekLocal), never by fetching it.
+func (n *Node) fillFromHolders(f *fill, req chunkReq) error {
+	hs := n.holders.list(req.key, n.mesh.Addr())
+	if len(hs) == 0 {
+		return errNotFound
+	}
+
+	for i, h := range hs {
+		if i == holderPeekMax {
+			break
+		}
+
+		err := n.fillFromPrev(f, req, cachemesh.PeerRef{ID: h, Addr: h}, peekLocal, "holder")
+		if err == nil {
+			n.holderPeeks.Add(1)
+			return nil
+		}
+
+		n.holderMisses.Add(1)
+
+		if errors.Is(err, errMetaMismatch) {
+			return err
+		}
+	}
+
+	return errNotFound
+}
+
 func classifyOrigin(err error) error {
 	var oe *ifaces.OriginError
 	if errors.As(err, &oe) {
@@ -357,6 +497,9 @@ const (
 	// peekOwner asks the owner on behalf of a backup standing in for it.
 	// An owner without the chunk starts its origin fill and serves it.
 	peekOwner = "owner"
+	// peekLocal asks a member that recently pulled the chunk into its
+	// content store. It is served only from memory or that store.
+	peekLocal = "local"
 )
 
 // peekHeaderTimeout bounds the wait for response headers of a peek.
@@ -378,7 +521,12 @@ func (n *Node) fillFromPrev(f *fill, req chunkReq, prev cachemesh.PeerRef, peek,
 	ctx, touch, _, cancel := n.attemptCtx()
 	defer cancel()
 
-	headers := time.AfterFunc(peekHeaderTimeout, cancel)
+	timeout := peekHeaderTimeout
+	if peek == peekLocal {
+		timeout = holderPeekTimeout
+	}
+
+	headers := time.AfterFunc(timeout, cancel)
 
 	resp, err := n.doChunk(ctx, prev, nil, peek, req, off)
 
@@ -648,6 +796,10 @@ func (n *Node) doChunk(ctx context.Context, p cachemesh.PeerRef, hdr *cachemesh.
 
 	if hdr != nil {
 		hreq.Header.Set(headerRoute, encodeHeader(*hdr))
+
+		if req.requester != "" {
+			hreq.Header.Set(headerRequester, req.requester)
+		}
 	}
 
 	resp, err := n.client.Do(hreq)
