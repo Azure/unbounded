@@ -65,6 +65,9 @@ func planDataplaneConfig(ctx context.Context, env *component.Env, plan *componen
 		}
 
 		if renamed != nil {
+			// Drop retired keys the earlier template seeded with defaults.
+			renamed, _ = migrateRetiredSettings(renamed)
+
 			// Reject bad carried-over values before the new DaemonSet rolls
 			// out, as for an existing racer-settings.
 			if err := validateDataplaneConfig(renamed); err != nil {
@@ -87,6 +90,23 @@ func planDataplaneConfig(ctx context.Context, env *component.Env, plan *componen
 
 	if err := validateAdoptable(ctx, env, config); err != nil {
 		return nil, err
+	}
+
+	// Earlier templates seeded retired keys with defaults the dataplane now
+	// rejects. Drop them and write the result back, so Pods never import the
+	// old keys through envFrom. The patch carries the observed
+	// resourceVersion, so a concurrent edit conflicts and the pass retries.
+	if migrated, changed := migrateRetiredSettings(config.Data); changed {
+		if err := validateDataplaneConfig(migrated); err != nil {
+			return nil, err
+		}
+
+		base := component.ToUnstructured(config.DeepCopy())
+		config.Data = migrated
+
+		plan.Add(component.Operation{Kind: component.OpMergePatch, Object: component.ToUnstructured(config), Base: base, Component: name})
+
+		return config, nil
 	}
 
 	if err := validateDataplaneConfig(config.Data); err != nil {

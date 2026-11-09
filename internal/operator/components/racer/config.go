@@ -155,6 +155,12 @@ func validateDataplaneConfig(data map[string]string) error {
 
 		setting, known := dataplaneSettings[key]
 		if !known {
+			if retired, ok := retiredSettings[key]; ok {
+				add(key, "is retired; set "+retired.replacement+" instead (check its units and default before copying the value)")
+
+				continue
+			}
+
 			add(key, "is not a recognized setting; unknown RACER_* variables fail dataplane startup")
 
 			continue
@@ -216,4 +222,63 @@ func dataplaneDecimal(value string) (uint64, bool) {
 	n, err := strconv.ParseUint(trimmed, 10, 64)
 
 	return n, err == nil
+}
+
+// retiredSetting describes a RACER_* key that an earlier release accepted
+// and the current dataplane rejects at startup.
+type retiredSetting struct {
+	// replacement names the key that took over, for error messages.
+	replacement string
+
+	// shippedDefault is the value the earlier racer-settings template wrote,
+	// or empty when the template never wrote the key.
+	shippedDefault string
+}
+
+// retiredSettings lists retired keys an administrator or an earlier template
+// may have left in racer-settings (see the rename table in cmd/racer/README.md).
+//
+// The budget keys are not renamed automatically: the old keys were node-wide
+// totals, while their replacements are per-worker amounts multiplied by the
+// worker count, so copying a value would silently change its meaning. Only a
+// value equal to what the earlier template shipped is migrated, by dropping
+// it so the new default applies; that default replaced the old one. Any other
+// value fails validation with a message naming the replacement, so the
+// administrator chooses the new value.
+var retiredSettings = map[string]retiredSetting{
+	"RACER_SLAB_BYTES":                   {replacement: "RACER_SLAB_BYTES_PER_WORKER", shippedDefault: "1073741824"},
+	"RACER_FREE_SEGMENT_RESERVE":         {replacement: "RACER_FREE_SEGMENT_RESERVE_PER_WORKER", shippedDefault: "2"},
+	"RACER_ACTIVE_PATH_SEARCHES":         {replacement: "RACER_ACTIVE_PATH_SEARCHES_PER_WORKER"},
+	"RACER_CONNECTIONS_PER_NEIGHBOR":     {replacement: "RACER_NEIGHBOR_CONNECTIONS_PER_WORKER"},
+	"RACER_ORIGIN_CONNECTIONS_PER_CACHE": {replacement: "RACER_CACHE_ORIGIN_CONNECTIONS_PER_WORKER"},
+	"RACER_SEND_CRC_PAIR":                {replacement: "RACER_SEND_TAG_PAIR"},
+}
+
+// migrateRetiredSettings returns data without retired keys that still hold
+// the earlier template's default, and whether it removed any. The input is
+// not modified. Other retired keys are kept so validation reports them.
+func migrateRetiredSettings(data map[string]string) (map[string]string, bool) {
+	changed := false
+
+	for key, retired := range retiredSettings {
+		if value, ok := data[key]; ok && retired.shippedDefault != "" && value == retired.shippedDefault {
+			changed = true
+		}
+	}
+
+	if !changed {
+		return data, false
+	}
+
+	out := make(map[string]string, len(data))
+
+	for key, value := range data {
+		if retired, ok := retiredSettings[key]; ok && retired.shippedDefault != "" && value == retired.shippedDefault {
+			continue
+		}
+
+		out[key] = value
+	}
+
+	return out, true
 }
