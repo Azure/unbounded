@@ -69,13 +69,13 @@ class PinTest(unittest.TestCase):
     def test_concurrent_writers_do_not_take_each_others_file(self) -> None:
         path = self.root / "tmp" / "e2e-kind" / "e2e.kubeconfig"
         content = fake_kubeconfig(["kind-e2e"], "kind-e2e")
-        errors: list[BaseException] = []
+        errors: list[Exception] = []
 
         def write() -> None:
             try:
                 for _ in range(50):
                     kk.write_from_kind("e2e", path, runner=FakeTools(content))
-            except BaseException as exc:  # noqa: BLE001 - collected for the assertion
+            except Exception as exc:  # collected for the assertion
                 errors.append(exc)
 
         threads = [threading.Thread(target=write) for _ in range(8)]
