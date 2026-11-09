@@ -53,6 +53,7 @@ dashboards and alerts that use the old names:
 | `racer_disk_class_index_evicted_pages_total` | Removed |
 | `racer_disk_class_index_evicted_payload_bytes_total` | Removed |
 | `racer_retention_heat_entries` | Removed |
+| `racer_peer_local_pressure_total` | Removed; `racer_peer_admission_limit` is now a fixed cap |
 
 
 ## Origin HTTPS
