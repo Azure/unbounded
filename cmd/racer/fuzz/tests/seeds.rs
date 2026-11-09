@@ -78,7 +78,11 @@ fn base64(bytes: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::new();
     for chunk in bytes.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = u32::from(b[0]) << 16 | u32::from(b[1]) << 8 | u32::from(b[2]);
         for i in 0..4 {
             if i <= chunk.len() {
@@ -107,7 +111,11 @@ fn generated() -> Vec<(&'static str, &'static str, Vec<u8>)> {
         std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
     };
     let mut out = vec![
-        ("control_documents", "seed-publication", testdata("publication.json")),
+        (
+            "control_documents",
+            "seed-publication",
+            testdata("publication.json"),
+        ),
         ("control_documents", "seed-bundle", testdata("bundle.json")),
         (
             "control_documents",
@@ -153,13 +161,12 @@ fn generated() -> Vec<(&'static str, &'static str, Vec<u8>)> {
         "seed-signed",
         peer_wire::encode_signed(&auth.original).unwrap(),
     ));
+    let chain = Chain::new(&[vec![0x30, 0x03, 0x02, 0x01, 0x01]]).unwrap();
+    out.push(("peer_envelope", "seed-chain", chain.encoded().to_vec()));
     out.push((
         "peer_envelope",
-        "seed-chain",
-        Chain::new(&[vec![0x30, 0x03, 0x02, 0x01, 0x01]])
-            .unwrap()
-            .encoded()
-            .to_vec(),
+        "seed-attachment",
+        peer_wire::encode_attachment(&[chain]).unwrap().into_bytes(),
     ));
 
     // Checkpoint image with one empty shard.
@@ -247,6 +254,7 @@ fn seeds_decode() {
     for (name, data) in seeds("peer_envelope") {
         let ok = peer_wire::decode_signed(&data).is_ok()
             || Chain::decode(&data).is_ok()
+            || peer_wire::decode_attachment(&data).is_ok()
             || match Codec::<()>::new(64 * 1024).decode_head(&data) {
                 Ok(Some((head, _))) => {
                     let response = matches!(head.start, StartLine::Response { .. });
@@ -256,6 +264,12 @@ fn seeds_decode() {
             };
         assert!(ok, "peer_envelope/{name} does not decode");
     }
+    assert_eq!(
+        peer_wire::decode_attachment(&read("peer_envelope", "seed-attachment"))
+            .unwrap()
+            .len(),
+        1
+    );
 
     for (name, data) in seeds("checkpoint") {
         racer::store::checkpoint::decode(&data)

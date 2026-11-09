@@ -149,7 +149,7 @@ pub fn resolve(signed: &mut SignedHead, chains: &dyn Chains) -> Result<()> {
 }
 
 /// Encode chains for one `racer-chains` field.
-pub(crate) fn encode_attachment(chains: &[Arc<Chain>]) -> Result<String> {
+pub fn encode_attachment(chains: &[Arc<Chain>]) -> Result<String> {
     if chains.is_empty() || chains.len() > MAX_CHAINS_PER_MESSAGE {
         return Err(Error::InvalidRequest);
     }
@@ -162,7 +162,7 @@ pub(crate) fn encode_attachment(chains: &[Arc<Chain>]) -> Result<String> {
 }
 
 /// Decode one `racer-chains` field, rejecting duplicates and oversize values.
-pub(crate) fn decode_attachment(value: &[u8]) -> Result<Vec<Arc<Chain>>> {
+pub fn decode_attachment(value: &[u8]) -> Result<Vec<Arc<Chain>>> {
     if value.len() > MAX_CHAINS_FIELD {
         return Err(Error::InvalidRequest);
     }

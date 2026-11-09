@@ -17,6 +17,9 @@ pub use chains::{
     Chain, Chains, MAX_CHAIN_BYTES, MAX_CHAINS_FIELD, MAX_CHAINS_PER_MESSAGE, MAX_SESSION_CHAINS,
     fingerprint, resolve,
 };
+// Exposed for the fuzz targets and their seeds, not as a stable API.
+#[doc(hidden)]
+pub use chains::{decode_attachment, encode_attachment};
 pub use session::{Context, Session, accept, connect, install_session};
 
 /// Test-only inspection and malformed-frame construction for adapter regressions.
