@@ -6,17 +6,9 @@ package meshfetch
 import (
 	"sync"
 	"sync/atomic"
-	"time"
-	"unsafe"
 )
 
-// pageAlign is the alignment of page buffers and their capacity.
-const pageAlign = 4096
-
-func alignUp(n int64) int64 { return (n + pageAlign - 1) &^ (pageAlign - 1) }
-
-// page is a reference-counted page buffer. Its capacity is the page size
-// rounded up to pageAlign, and its start is pageAlign aligned. On Linux page buffers are anonymous mappings
+// page is a reference-counted page buffer. On Linux page buffers are anonymous mappings
 // outside the Go heap: their memory is exactly the live pages, it does not
 // inflate the garbage collector's heap goal, and it returns to the system
 // as soon as a buffer is unmapped.
@@ -65,7 +57,7 @@ func (pp *pagePool) get() *page {
 	}
 	pp.mu.Unlock()
 
-	p := &page{buf: allocPage(int(alignUp(int64(pp.size)))), pool: pp}
+	p := &page{buf: allocPage(pp.size), pool: pp}
 	p.refs.Store(1)
 
 	return p
@@ -106,18 +98,6 @@ func (pp *pagePool) drain() {
 	}
 }
 
-// alignedBuf returns n bytes starting at a pageAlign boundary.
-func alignedBuf(n int) []byte {
-	b := make([]byte, n+pageAlign)
-	off := 0
-
-	if r := int(uintptr(unsafe.Pointer(&b[0])) & (pageAlign - 1)); r != 0 { //nolint:gosec // address arithmetic for alignment only
-		off = pageAlign - r
-	}
-
-	return b[off : off+n : off+n]
-}
-
 // pageKey names one page of a blob by its absolute page index. Every copy
 // of a blob holds the same bytes, so readers of different fills of the
 // same chunk share pages.
@@ -127,77 +107,42 @@ type pageKey struct {
 }
 
 // diskPage is a page read from the local content store, shared by every
-// concurrent reader of the same page (read coalescing). Pages that had two
-// or more readers may stay in the hot tier after the last reader is done.
+// concurrent reader of the same page (read coalescing). It is freed when
+// its last reader is done.
 type diskPage struct {
 	key   pageKey
 	p     *page
-	n     int
 	ready chan struct{}
 	err   error
 
-	// Guarded by pageCache.mu.
-	readers    int
-	shared     bool
-	hot        bool
-	dead       bool
-	lastUse    time.Time
-	prev, next *diskPage
+	// readers is guarded by pageCache.mu.
+	readers int
 }
 
-// pageCache coalesces page reads from the local content store and keeps a
-// small hot tier of pages with repeated demand: pages that had two or more
-// concurrent readers, or that are read again while their key is still in
-// a small ghost list of recently read pages.
+// pageCache coalesces concurrent page reads from the local content store:
+// one read per page however many readers want it at once.
 type pageCache struct {
-	pool   *pagePool
-	budget int64
+	pool *pagePool
 
-	mu sync.Mutex
-	m  map[pageKey]*diskPage
-	// ghost remembers keys of recently dropped single-reader pages, in
-	// FIFO order, so a second read soon after admits the page.
-	ghost     map[pageKey]struct{}
-	ghostRing []pageKey
-	ghostNext int
-	head      diskPage // hot LRU sentinel: head.next is most recent
-	used      int64
-	reads     atomic.Int64
-	hits      atomic.Int64
+	mu    sync.Mutex
+	m     map[pageKey]*diskPage
+	reads atomic.Int64
+	hits  atomic.Int64
 }
 
-func newPageCache(pool *pagePool, budget int64) *pageCache {
-	c := &pageCache{pool: pool, budget: budget, m: make(map[pageKey]*diskPage)}
-
-	if budget > 0 {
-		// Remember four times as many pages as the hot tier holds.
-		n := max(64, int(4*budget/alignUp(int64(pool.size))))
-		c.ghost = make(map[pageKey]struct{}, n)
-		c.ghostRing = make([]pageKey, n)
-	}
-
-	c.head.next = &c.head
-	c.head.prev = &c.head
-
-	return c
+func newPageCache(pool *pagePool) *pageCache {
+	return &pageCache{pool: pool, m: make(map[pageKey]*diskPage)}
 }
 
 // get returns page idx (absolute, in units of the page size) of blob d
 // with n valid bytes, reading it from src unless another reader is reading
-// it or it is in the hot tier. The caller must call put.
+// or holding it. The caller must call put.
 func (c *pageCache) get(src ContentSource, d string, idx int64, n int) (*diskPage, error) {
 	k := pageKey{digest: d, idx: idx}
 
 	c.mu.Lock()
 	if e := c.m[k]; e != nil {
 		e.readers++
-		e.shared = true
-
-		if e.hot {
-			e.lastUse = time.Now()
-			c.unlink(e)
-			c.pushFront(e)
-		}
 		c.mu.Unlock()
 		c.hits.Add(1)
 
@@ -207,19 +152,12 @@ func (c *pageCache) get(src ContentSource, d string, idx int64, n int) (*diskPag
 	}
 
 	e := &diskPage{key: k, ready: make(chan struct{}), readers: 1}
-	if _, ok := c.ghost[k]; ok {
-		delete(c.ghost, k)
-
-		e.shared = true
-	}
-
 	c.m[k] = e
 	c.mu.Unlock()
 
 	c.reads.Add(1)
 
 	e.p = c.pool.get()
-	e.n = n
 
 	_, err := src.ReadAt(d, e.p.buf[:n], idx*int64(c.pool.size))
 	if err != nil {
@@ -229,8 +167,6 @@ func (c *pageCache) get(src ContentSource, d string, idx int64, n int) (*diskPag
 		if c.m[k] == e {
 			delete(c.m, k)
 		}
-
-		e.dead = true
 		c.mu.Unlock()
 	}
 
@@ -239,149 +175,31 @@ func (c *pageCache) get(src ContentSource, d string, idx int64, n int) (*diskPag
 	return e, err
 }
 
-// put drops a reader of e. A page that had concurrent readers stays in
-// the hot tier, which evicts least recently used pages over its budget.
+// put drops a reader of e and frees the page after the last one.
 func (c *pageCache) put(e *diskPage) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	e.readers--
-	if e.readers > 0 || e.hot {
-		return
-	}
+	last := e.readers == 0
 
-	if !e.dead && e.err == nil && e.shared && int64(len(e.p.buf)) <= c.budget {
-		e.hot = true
-		e.lastUse = time.Now()
-		c.used += int64(len(e.p.buf))
-		c.pushFront(e)
-		c.trim()
-
-		return
-	}
-
-	if !e.dead && e.err == nil {
-		c.remember(e.key)
-	}
-
-	c.drop(e)
-}
-
-// remember adds k to the ghost list. Caller holds c.mu.
-func (c *pageCache) remember(k pageKey) {
-	if len(c.ghostRing) == 0 {
-		return
-	}
-
-	if old := c.ghostRing[c.ghostNext]; old.digest != "" {
-		delete(c.ghost, old)
-	}
-
-	c.ghostRing[c.ghostNext] = k
-	c.ghost[k] = struct{}{}
-	c.ghostNext = (c.ghostNext + 1) % len(c.ghostRing)
-}
-
-// expire drops idle hot pages last used before cutoff, so an idle agent
-// returns the hot tier's memory.
-func (c *pageCache) expire(cutoff time.Time) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	for v := c.head.prev; v != &c.head; {
-		prev := v.prev
-		if !v.lastUse.Before(cutoff) {
-			return
-		}
-
-		if v.readers == 0 {
-			c.drop(v)
-		}
-
-		v = prev
-	}
-}
-
-// trim evicts idle hot pages until the tier fits its budget.
-func (c *pageCache) trim() {
-	for v := c.head.prev; c.used > c.budget && v != &c.head; {
-		prev := v.prev
-		if v.readers == 0 {
-			c.drop(v)
-		}
-
-		v = prev
-	}
-}
-
-// drop removes e from the map and the hot list and frees its page. Caller
-// holds c.mu and e has no readers.
-func (c *pageCache) drop(e *diskPage) {
-	if c.m[e.key] == e {
+	if last && c.m[e.key] == e {
 		delete(c.m, e.key)
 	}
+	c.mu.Unlock()
 
-	if e.hot {
-		c.unlink(e)
-		c.used -= int64(len(e.p.buf))
-		e.hot = false
-	}
-
-	e.dead = true
-
-	if e.p != nil {
+	if last {
 		e.p.release()
-		e.p = nil
 	}
 }
 
-// purge drops every page of blob d. Pages with readers are dropped when
-// the last one is done.
+// purge forgets every page of blob d, so later readers read it afresh.
+// Pages with readers are freed when the last one is done.
 func (c *pageCache) purge(d string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	for i, k := range c.ghostRing {
+	for k := range c.m {
 		if k.digest == d {
-			delete(c.ghost, k)
-			c.ghostRing[i] = pageKey{}
+			delete(c.m, k)
 		}
 	}
-
-	for k, e := range c.m {
-		if k.digest != d {
-			continue
-		}
-
-		delete(c.m, k)
-
-		e.dead = true
-		if e.readers == 0 {
-			c.drop(e)
-		} else if e.hot {
-			c.unlink(e)
-			c.used -= int64(len(e.p.buf))
-			e.hot = false
-		}
-	}
-}
-
-func (c *pageCache) pushFront(e *diskPage) {
-	e.prev = &c.head
-	e.next = c.head.next
-	c.head.next.prev = e
-	c.head.next = e
-}
-
-func (c *pageCache) unlink(e *diskPage) {
-	e.prev.next = e.next
-	e.next.prev = e.prev
-	e.prev, e.next = nil, nil
-}
-
-func (c *pageCache) hotBytes() int64 {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	return c.used
 }

@@ -7,12 +7,12 @@ package meshfetch
 
 import "golang.org/x/sys/unix"
 
-// allocPage maps n bytes of anonymous memory. Mappings are page aligned,
-// which satisfies dioAlign. It falls back to the Go heap if mmap fails.
+// allocPage maps n bytes of anonymous memory. It falls back to the Go heap
+// if mmap fails.
 func allocPage(n int) []byte {
 	b, err := unix.Mmap(-1, 0, n, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_PRIVATE|unix.MAP_ANONYMOUS)
 	if err != nil {
-		return alignedBuf(n)
+		return make([]byte, n)
 	}
 
 	return b

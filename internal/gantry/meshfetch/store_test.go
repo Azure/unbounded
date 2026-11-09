@@ -33,7 +33,6 @@ func newTestStore(t testing.TB, mut func(*storeConfig)) *store {
 		pageSize:     testPage,
 		window:       2,
 		maxFills:     8,
-		hotBudget:    4 * testPage,
 		content:      newMemContent(),
 		stallTimeout: 5 * time.Second,
 		logger:       slog.New(slog.DiscardHandler),
@@ -657,10 +656,7 @@ func TestLocalOnlyFillDoesNotBorrow(t *testing.T) {
 func TestLocalPageReadsCoalesce(t *testing.T) {
 	const readers = 6
 
-	s := newTestStore(t, func(c *storeConfig) {
-		c.hotBudget = 0
-		c.chunkSize = 8 * testPage
-	})
+	s := newTestStore(t, func(c *storeConfig) { c.chunkSize = 8 * testPage })
 	data := pattern(1, 8*testPage)
 	rs := behind(t, s, key(1), data, readers)
 
@@ -700,15 +696,16 @@ func TestLocalPageReadsCoalesce(t *testing.T) {
 		t.Fatalf("shared reads = %d", st.PageReadsShared)
 	}
 
-	if st.HotBytes != 0 || st.PageBytes != 0 {
-		t.Fatalf("pages retained without a hot tier: %+v", st)
+	if st.PageBytes != 0 {
+		t.Fatalf("pages retained after the readers: %+v", st)
 	}
 }
 
 // Pages of one blob are shared across fills: they are keyed by digest and
-// absolute page, not by fill.
+// absolute page, not by fill. Pages are freed once their readers are done,
+// and evicting the digest makes later readers read it afresh.
 func TestLocalPagesSharedAcrossFills(t *testing.T) {
-	s := newTestStore(t, func(c *storeConfig) { c.hotBudget = 2 * testPage })
+	s := newTestStore(t, nil)
 	data := pattern(2, testChunk)
 
 	a := behind(t, s, key(1), data, 1)[0]
@@ -718,21 +715,34 @@ func TestLocalPagesSharedAcrossFills(t *testing.T) {
 		t.Fatal("want two fills")
 	}
 
-	for _, r := range []*reader{a, b} {
-		if got := readAll(t, r); !bytes.Equal(got, data) {
-			t.Fatal("data mismatch")
-		}
+	bar := newBarrier(2)
 
-		r.close()
+	var wg sync.WaitGroup
+
+	for _, r := range []*reader{a, b} {
+		wg.Go(func() {
+			defer r.close()
+
+			var buf bytes.Buffer
+
+			if _, err := r.streamTo(context.Background(), barrierWriter{b: bar, w: &buf}); err != nil {
+				t.Errorf("streamTo: %v", err)
+			}
+
+			if !bytes.Equal(buf.Bytes(), data) {
+				t.Error("data mismatch")
+			}
+		})
 	}
 
-	// The second fill's reader admitted the pages through the ghost list
-	// and both read the same two pages: two reads each.
-	if st := s.stats(); st.LocalReads != 4 || st.HotBytes != 2*testPage {
+	wg.Wait()
+
+	// Both fills read the same two pages behind their windows once.
+	if st := s.stats(); st.LocalReads != 2 || st.PageReadsShared != 2 || st.PageBytes != 0 {
 		t.Fatalf("stats: %+v", st)
 	}
 
-	// A third reader hits the hot tier.
+	// A later reader reads the pages again: nothing is retained.
 	c := behind(t, s, key(1), data, 1)[0]
 	if got := readAll(t, c); !bytes.Equal(got, data) {
 		t.Fatal("data mismatch")
@@ -740,47 +750,9 @@ func TestLocalPagesSharedAcrossFills(t *testing.T) {
 
 	c.close()
 
-	if st := s.stats(); st.LocalReads != 4 {
-		t.Fatalf("hot pages read again: %+v", st)
-	}
-
-	// Hot pages unused for the linger TTL are dropped.
-	s.pages.expire(time.Now().Add(-time.Hour))
-
-	if st := s.stats(); st.HotBytes != 2*testPage {
-		t.Fatalf("recent hot pages expired: %+v", st)
-	}
-
-	s.pages.expire(time.Now().Add(time.Hour))
-
-	if st := s.stats(); st.HotBytes != 0 || st.PageBytes != 0 {
-		t.Fatalf("idle hot pages kept: %+v", st)
-	}
-
-	// Concurrent readers admit pages on first use; evicting the digest
-	// drops them.
-	rs := behind(t, s, key(1), data, 2)
-	bar := newBarrier(2)
-
-	var wg sync.WaitGroup
-
-	for _, r := range rs {
-		wg.Go(func() {
-			defer r.close()
-
-			_, _ = r.streamTo(context.Background(), barrierWriter{b: bar, w: io.Discard})
-		})
-	}
-
-	wg.Wait()
-
-	if st := s.stats(); st.HotBytes != 2*testPage {
-		t.Fatalf("after shared read: %+v", st)
-	}
-
 	s.evictDigest(testBlob)
 
-	if st := s.stats(); st.HotBytes != 0 || st.PageBytes != 0 {
+	if st := s.stats(); st.LocalReads != 4 || st.PageBytes != 0 {
 		t.Fatalf("after evict: %+v", st)
 	}
 }

@@ -152,7 +152,6 @@ func BenchmarkStreamFromLocalContent(b *testing.B) {
 	s := newTestStore(b, func(c *storeConfig) {
 		c.chunkSize = benchChunk
 		c.pageSize = 1 << 20
-		c.hotBudget = 0
 		c.content = dc
 	})
 	k := chunkKey{digest: d}
@@ -181,7 +180,6 @@ func BenchmarkFanOutFromLocalContent(b *testing.B) {
 	s := newTestStore(b, func(c *storeConfig) {
 		c.chunkSize = benchChunk
 		c.pageSize = 1 << 20
-		c.hotBudget = 64 << 20
 		c.content = dc
 	})
 	k := chunkKey{digest: d}

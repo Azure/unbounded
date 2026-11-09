@@ -49,15 +49,13 @@ func (k chunkKey) routeKey(buf []byte) []byte {
 // storeConfig configures a store.
 type storeConfig struct {
 	chunkSize int64
-	// pageSize is the unit of in-flight buffers, local content reads,
-	// read coalescing, and the hot tier. It divides chunkSize.
+	// pageSize is the unit of in-flight buffers, local content reads, and
+	// read coalescing. It divides chunkSize.
 	pageSize int
 	// window is the number of in-flight pages a fill holds.
 	window int
 	// maxFills caps fills in progress.
 	maxFills int
-	// hotBudget bounds the hot page tier in memory.
-	hotBudget int64
 	// extraBudget bounds window pages beyond the base windows of all
 	// fills, borrowed by fills whose readers lag.
 	extraBudget int64
@@ -76,7 +74,8 @@ type storeConfig struct {
 // store is the chunk store: a map of fills (in progress, or complete and
 // lingering in memory for later peers) over a page tier. Memory holds only
 // in-flight pages of fills, pages being sent, lingering chunks in pages
-// borrowed from the in-flight budget, and the hot page tier. Bytes behind a
+// borrowed from the in-flight budget, and pages being read from the local
+// content store. Bytes behind a
 // fill's window are read back from the local containerd content store,
 // which containerd writes while it pulls through this agent.
 type store struct {
@@ -129,8 +128,7 @@ func (s *store) localOK(d string) bool {
 	return true
 }
 
-// defaultLingerTTL bounds how long an unused chunk or hot page stays in
-// memory.
+// defaultLingerTTL bounds how long an unused chunk stays in memory.
 const defaultLingerTTL = 30 * time.Second
 
 // localRefresh bounds how often a fill asks the content store how much of
@@ -165,7 +163,7 @@ func newStore(cfg storeConfig) *store {
 	s := &store{
 		cfg:   cfg,
 		pool:  pool,
-		pages: newPageCache(pool, cfg.hotBudget),
+		pages: newPageCache(pool),
 		m:     make(map[chunkKey]*fill),
 		space: make(chan struct{}),
 		stop:  make(chan struct{}),
@@ -397,7 +395,6 @@ func (s *store) expireLoop() {
 			return
 		case now := <-t.C:
 			s.expire(now)
-			s.pages.expire(now.Add(-s.cfg.lingerTTL))
 		}
 	}
 }
@@ -500,10 +497,8 @@ type Stats struct {
 	// Inflight is the number of fills in progress.
 	Inflight int
 	// PageBytes is memory in page buffers in use: in-flight fill pages,
-	// pages being sent, lingering chunks, and the hot tier.
+	// pages being sent, and lingering chunks.
 	PageBytes int64
-	// HotBytes is memory in the hot page tier.
-	HotBytes int64
 	// IdlePageBytes is memory in idle pooled page buffers.
 	IdlePageBytes int64
 	// LocalReads counts page reads from the local content store.
@@ -512,8 +507,8 @@ type Stats struct {
 	LocalErrors int64
 	// LocalFills counts fills read from the local content store.
 	LocalFills int64
-	// PageReadsShared counts page reads served by another reader's read
-	// or by the hot tier.
+	// PageReadsShared counts page reads served by a concurrent reader's
+	// read.
 	PageReadsShared int64
 	// ExtraPageBytes is memory borrowed from the in-flight budget by
 	// fills whose readers lag and by lingering chunks.
@@ -531,10 +526,9 @@ func (s *store) stats() Stats {
 	s.mu.Unlock()
 
 	live, idle := s.pool.stats()
-	ps := alignUp(int64(s.cfg.pageSize))
+	ps := int64(s.cfg.pageSize)
 	st.PageBytes = int64(live) * ps
 	st.IdlePageBytes = int64(idle) * ps
-	st.HotBytes = s.pages.hotBytes()
 	st.LocalReads = s.pages.reads.Load()
 	st.LocalErrors = s.localErrors.Load()
 	st.LocalFills = s.localFills.Load()

@@ -307,7 +307,6 @@ type cluster struct {
 type clusterOpts struct {
 	n            int
 	chunkSize    int64
-	memBytes     int64
 	noContent    bool
 	cellSize     int
 	maxNeighbors int
@@ -324,10 +323,6 @@ func newCluster(t testing.TB, o clusterOpts) *cluster {
 
 	if o.chunkSize == 0 {
 		o.chunkSize = 64 << 10
-	}
-
-	if o.memBytes == 0 {
-		o.memBytes = 16 * o.chunkSize
 	}
 
 	if o.lookahead == 0 {
@@ -392,7 +387,6 @@ func newCluster(t testing.TB, o clusterOpts) *cluster {
 			Origin:       c.origin,
 			Tags:         c.origin,
 			ChunkSize:    o.chunkSize,
-			MemoryBytes:  o.memBytes,
 			MaxFills:     1024,
 			MaxServes:    1024,
 			Lookahead:    o.lookahead,

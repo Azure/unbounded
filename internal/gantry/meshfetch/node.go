@@ -9,10 +9,10 @@
 // pulls it from the origin registry with a bounded Range request. Other
 // agents fetch chunks hop by hop through the cachemesh grid: each hop asks
 // Mesh.Forward where the request goes next, coalesces concurrent requests for
-// the same chunk into one upstream fetch, keeps the chunk in a disk-backed
-// store with a small hot page tier in memory, and streams bytes downstream
-// as they arrive (cut-through). Tag
-// resolutions live in a separate "gantry-meta" keyspace with a TTL.
+// the same chunk into one upstream fetch, keeps the chunk in bounded memory
+// backed by the local containerd content store, and streams bytes
+// downstream as they arrive (cut-through). Tag resolutions live in a
+// separate "gantry-meta" keyspace with a TTL.
 //
 // The cachemesh library only routes; this package owns the data-plane
 // transport (HTTP on the transfer listener), the chunk store, coalescing,
@@ -108,11 +108,8 @@ type Config struct {
 	// chunks behind a fill's window and chunks no longer in memory are
 	// read from it. Nil serves peers from memory only.
 	Content ContentSource
-	// MemoryBytes bounds the hot page tier: pages read from the content
-	// store by concurrent readers that stay in memory. Zero disables it.
-	MemoryBytes int64
 	// PageSize is the unit of in-flight buffers, content store reads,
-	// read coalescing, and the hot tier. Zero uses min(1MiB, ChunkSize). It
+	// and read coalescing. Zero uses min(1MiB, ChunkSize). It
 	// must divide ChunkSize.
 	PageSize int
 	// FillPages is the number of in-flight pages each fill holds. Zero
@@ -177,7 +174,7 @@ func New(cfg Config) (*Node, error) {
 		return nil, fmt.Errorf("meshfetch: bad chunk size %d", cfg.ChunkSize)
 	}
 
-	if cfg.MemoryBytes < 0 || cfg.FillPages < 0 || cfg.InflightBytes < 0 {
+	if cfg.FillPages < 0 || cfg.InflightBytes < 0 {
 		return nil, errors.New("meshfetch: negative cache size")
 	}
 
@@ -222,7 +219,6 @@ func New(cfg Config) (*Node, error) {
 		pageSize:     cfg.PageSize,
 		window:       cfg.FillPages,
 		maxFills:     cfg.MaxFills,
-		hotBudget:    cfg.MemoryBytes,
 		extraBudget:  cfg.InflightBytes,
 		lingerTTL:    cfg.LingerTTL,
 		content:      cfg.Content,

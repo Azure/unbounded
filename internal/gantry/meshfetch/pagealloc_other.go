@@ -5,6 +5,6 @@
 
 package meshfetch
 
-func allocPage(n int) []byte { return alignedBuf(n) }
+func allocPage(n int) []byte { return make([]byte, n) }
 
 func freePage([]byte) {}

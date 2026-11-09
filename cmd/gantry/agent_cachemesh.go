@@ -203,7 +203,6 @@ func newCachemeshAgent(c *config.Config, origin ifaces.OriginPuller, reg *metric
 		Tags:          tagOrigin,
 		ChunkSize:     cm.ChunkSize,
 		Content:       content,
-		MemoryBytes:   cm.MemoryCacheBytes,
 		PageSize:      int(cm.PageSize),
 		FillPages:     cm.FillPages,
 		InflightBytes: cm.InflightBytes,
@@ -464,12 +463,8 @@ func (m *cachemeshMetrics) registerGauges(reg *metrics.Registry, a *cachemeshAge
 	}, func() float64 { return float64(a.node.Stats().Chunks) })
 	reg.NewGaugeFunc(sub, prometheus.GaugeOpts{
 		Name: "gantry_cachemesh_page_memory_bytes",
-		Help: "Memory in chunk page buffers in use: in-flight fill pages, pages being sent, and the hot tier.",
+		Help: "Memory in chunk page buffers in use: in-flight fill pages, pages being sent, and lingering chunks.",
 	}, func() float64 { return float64(a.node.Stats().PageBytes) })
-	reg.NewGaugeFunc(sub, prometheus.GaugeOpts{
-		Name: "gantry_cachemesh_hot_page_bytes",
-		Help: "Memory in the hot page tier.",
-	}, func() float64 { return float64(a.node.Stats().HotBytes) })
 	reg.NewCounterFunc(sub, prometheus.CounterOpts{
 		Name: "gantry_cachemesh_local_page_reads_total",
 		Help: "Chunk pages read from the local containerd content store for readers behind a fill's window.",
@@ -492,7 +487,7 @@ func (m *cachemeshMetrics) registerGauges(reg *metrics.Registry, a *cachemeshAge
 	}, func() float64 { return float64(a.node.Stats().HolderMisses) })
 	reg.NewCounterFunc(sub, prometheus.CounterOpts{
 		Name: "gantry_cachemesh_shared_page_reads_total",
-		Help: "Page reads served by a concurrent reader's read or the hot tier instead of the content store.",
+		Help: "Page reads served by a concurrent reader's read instead of the content store.",
 	}, func() float64 { return float64(a.node.Stats().PageReadsShared) })
 	reg.NewGaugeFunc(sub, prometheus.GaugeOpts{
 		Name: "gantry_cachemesh_inflight_borrowed_bytes",
