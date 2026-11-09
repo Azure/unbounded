@@ -46,6 +46,20 @@ Subcommands (called as individual workflow steps):
     validate-host-agent-upgrade        Verify host-driven upgrade adopts a single-binary deployment.
     validate-agent-upgrade-operation   Verify AgentUpgrade switches the host daemon binary.
     validate-agent-upgrade-rollback    Verify AgentUpgrade rollback restores last-known-good.
+    validate-isolation-mode            Verify the host recorded and runs the ISOLATION_MODE node stack.
+    validate-isolation-exec-logs       Verify unbounded-agent exec and logs reach the node stack.
+    validate-isolation-soft-reboot     Verify NodeReboot restarts only the node stack.
+    change-to-<mode>                   Declare spec.isolation, delete the Node, and verify the repave applied it.
+    validate-isolation-status          Verify status.isolation and the IsolationDrift condition.
+    reconcile-machine-isolation-spec   Set spec.isolation to the applied mode and verify drift clears.
+    declare-isolation-mismatch         Set spec.isolation to an unapplied mode and verify drift appears.
+    validate-reprovision-refused       Declare a mode that needs a reprovision without the opt-in and
+                                       verify the change is refused and the node stays in its mode.
+    validate-isolation-preflight       Run preflight with --isolation and verify the mode's own check ran.
+    reset-agent-on-host                Run unbounded-agent reset on the host and verify it is clean.
+    validate-no-reprovision-handoff    Verify no reprovision handoff unit or staged config is left.
+    validate-same-mode-declaration     Declare the applied mode and verify nothing moves or is recorded.
+    collect-isolation-evidence         Print the mode state of the VM and Machine as one JSON line.
     validate-node-repave-upgrade       Verify OnDelete repave applies a new MCV Kubernetes version.
                                        Also verifies private bpffs isolation across repave.
     validate-node-configs              Discover and validate node config scenarios in parallel.
@@ -63,6 +77,7 @@ import datetime
 import functools
 import hashlib
 import http.client
+import ipaddress
 import json
 import os
 import re
@@ -84,6 +99,8 @@ from threading import Thread
 from typing import Any, Callable
 from xml.etree import ElementTree
 
+import isolation_report
+import kind_kubeconfig
 import ukiboot
 
 # ---------------------------------------------------------------------------
@@ -127,6 +144,28 @@ E2E_SITE_NAME = os.environ.get("E2E_SITE_NAME", "e2e")
 
 # Fixed nspawn machine names used by unbounded-agent (decoupled from the kube node name).
 NSPAWN_MACHINE_NAMES = ["kube1", "kube2"]
+
+# Isolation mode under test, from ISOLATION_MODE: nspawn or none. Empty is
+# today's behavior: no --isolation flag is passed, the host runs the default
+# nspawn mode, and every existing step behaves exactly as before. A new mode is
+# added here, with its node-stack checks in the helpers that branch on
+# isolation_mode(), its preflight check in PREFLIGHT_MODE_CHECKS and any pair it
+# changes in place in IN_PLACE_PAIRS.
+ISOLATION_MODES = ("nspawn", "none")
+ISOLATION_MODE = os.environ.get("ISOLATION_MODE", "")
+if ISOLATION_MODE and ISOLATION_MODE not in ISOLATION_MODES:
+    sys.exit(f"ISOLATION_MODE must be one of {', '.join(ISOLATION_MODES)}, got {ISOLATION_MODE!r}")
+# Agent-owned units and install base of the none mode (pkg/agent/isolation/none).
+NONE_NODE_BASE = "/opt/unbounded/node"
+NONE_UNITS = ("unbounded-containerd.service", "unbounded-kubelet.service")
+# The reprovision handoff a mode change stages to survive its own reset: the
+# directory holds a copy of the agent and the target configuration, which
+# carries the bootstrap token, and the unit runs the handoff.
+REPROVISION_DIR = "/var/lib/unbounded-agent-reprovision"
+REPROVISION_UNIT = "unbounded-agent-reprovision.service"
+# The Machine annotation that allows a mode change by reprovision
+# (unboundedv1alpha3.AnnotationAllowReprovision).
+ALLOW_REPROVISION_ANNOTATION = "unbounded-cloud.io/allow-reprovision"
 
 BRIDGE_NAME = "virbr-e2e"
 TAP_NAME = os.environ.get("TAP_NAME", "tap-e2e")
@@ -634,14 +673,23 @@ def active_nspawn_machine() -> str:
     die("no active nspawn machine found")
 
 
+def machine_shell_command(machine: str, command: str) -> str:
+    """Return the host command that runs *command* in nspawn machine *machine*.
+
+    It uses systemd-run --pipe --wait, which passes the command's output and
+    exit status back. machinectl shell does not: without a terminal it shows
+    nothing and exits 0 whatever the command does, so checks run through it
+    could never fail."""
+    return (f"sudo systemd-run -M {machine} --wait --pipe --quiet "
+            f"/bin/sh -lc {shlex.quote(command)}")
+
+
 def machine_shell(machine: str, command: str) -> str:
-    quoted = json.dumps(command)
-    return ssh_capture(f"sudo machinectl shell {machine} /bin/sh -lc {quoted}")
+    return ssh_capture(machine_shell_command(machine, command))
 
 
 def machine_shell_quiet(machine: str, command: str) -> subprocess.CompletedProcess[str]:
-    quoted = json.dumps(command)
-    return ssh_capture_quiet(f"sudo machinectl shell {machine} /bin/sh -lc {quoted}")
+    return ssh_capture_quiet(machine_shell_command(machine, command))
 
 
 def nspawn_os_release(machine: str) -> str:
@@ -649,7 +697,7 @@ def nspawn_os_release(machine: str) -> str:
     if result.returncode == 0 and result.stdout.strip():
         return result.stdout
 
-    diag(f"Could not read /var/lib/machines/{machine}/etc/os-release directly; trying machinectl shell")
+    diag(f"Could not read /var/lib/machines/{machine}/etc/os-release directly; running cat in the machine")
     return machine_shell(machine, "cat /etc/os-release")
 
 
@@ -731,18 +779,196 @@ def validate_host_nspawn_distro() -> None:
         f"nspawn={nspawn_distro}, machine={machine}")
 
 
+def isolation_mode() -> str:
+    """Return the isolation mode under test. Empty ISOLATION_MODE is nspawn."""
+    return ISOLATION_MODE or "nspawn"
+
+
+def parse_applied_isolation(applied_config: str) -> str:
+    """Return the isolation mode recorded in an applied-config JSON document.
+    A missing or empty value is nspawn, as for a host written by an older agent."""
+    value = json.loads(applied_config).get("Isolation", "")
+    return value or "nspawn"
+
+
+def applied_config_files() -> list[str]:
+    """Return the applied-config files on the VM, one per node-stack slot."""
+    # Regular files only: a test fault can leave a directory with such a name.
+    out = ssh_capture_quiet(
+        "sudo sh -c 'for f in /etc/unbounded/agent/*-applied-config.json; do [ -f \"$f\" ] && echo \"$f\"; done 2>/dev/null'")
+    return out.stdout.split()
+
+
+def applied_isolation() -> str:
+    """Return the isolation mode the host recorded, failing if none is applied
+    or the applied configs disagree."""
+    files = applied_config_files()
+    if not files:
+        die("no applied config found on the host")
+    modes = {parse_applied_isolation(ssh_capture(f"sudo cat {path}")) for path in files}
+    if len(modes) != 1:
+        die(f"applied configs record different isolation modes: {sorted(modes)}")
+    return modes.pop()
+
+
+def node_exec(command: str) -> str:
+    """Run a shell command in the node stack. nspawn keeps its existing
+    machinectl path; other modes use the agent's exec subcommand."""
+    if isolation_mode() == "nspawn":
+        return machine_shell(active_nspawn_machine(), command)
+    return ssh_capture(f"sudo {DAEMON_BINARY} exec -- /bin/sh -c {shlex.quote(command)}")
+
+
+def none_current_version() -> str:
+    """Return the version the none mode's current link selects, or empty."""
+    out = ssh_capture_quiet(f"sudo readlink {NONE_NODE_BASE}/current")
+    return os.path.basename(out.stdout.strip())
+
+
+def isolation_node_marker() -> str:
+    """Return a value that changes when a repave or upgrade replaces the node
+    stack: the current version for none, the slot name otherwise."""
+    if isolation_mode() == "none":
+        return none_current_version()
+    files = applied_config_files()
+    return ",".join(sorted(os.path.basename(f).removesuffix("-applied-config.json") for f in files))
+
+
+def validate_isolation_mode() -> None:
+    """Assert the host recorded the requested mode and runs its node stack the
+    way that mode defines."""
+    mode = isolation_mode()
+    recorded = applied_isolation()
+    if recorded != mode:
+        die(f"applied config records isolation {recorded!r}, expected {mode!r}")
+    if mode == "nspawn":
+        log(f"Applied isolation {recorded}, active machine {active_nspawn_machine()}")
+        return
+    machines = ssh_capture_quiet("sudo sh -c 'machinectl list --no-legend 2>/dev/null | wc -l'")
+    if machines.stdout.strip() not in ("", "0"):
+        die(f"{mode} mode must not run an nspawn machine, machinectl lists: {machines.stdout.strip()}")
+    if mode == "none":
+        for unit in NONE_UNITS:
+            ssh_cmd(f"sudo systemctl is-active {unit}")
+        if not none_current_version():
+            die(f"{NONE_NODE_BASE}/current is not a link to an installed version")
+    log(f"Isolation mode {mode} verified on the host")
+
+
+def validate_isolation_exec_logs() -> None:
+    """Assert the backend-neutral exec and logs subcommands work in every mode."""
+    marker = f"e2e-exec-{int(time.time())}"
+    out = ssh_capture(f"sudo {DAEMON_BINARY} exec -- /bin/echo {marker}")
+    if marker not in out:
+        die(f"unbounded-agent exec did not run in the node stack: {out!r}")
+    logs = ssh_capture(f"sudo {DAEMON_BINARY} logs --unit kubelet --lines 20")
+    if not logs.strip():
+        die("unbounded-agent logs --unit kubelet returned no output")
+    log("unbounded-agent exec and logs work")
+
+
+def node_stack_start_marker() -> str:
+    """Return a value that changes when the kubelet of the node stack is
+    restarted: its ActiveEnterTimestampMonotonic, read through
+    `unbounded-agent exec` so the same command works in every mode. Empty when
+    it cannot be read."""
+    unit = "unbounded-kubelet.service" if isolation_mode() == "none" else "kubelet.service"
+    result = ssh_capture_quiet(
+        f"sudo {DAEMON_BINARY} exec -- systemctl show -p ActiveEnterTimestampMonotonic --value {unit}")
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def validate_isolation_soft_reboot() -> None:
+    """Assert NodeReboot restarts the node stack only: the kubelet of the node
+    stack was restarted, the Node returns Ready and the mode is unchanged. In
+    none mode the host boot ID must not change. A NodeReboot that did nothing
+    leaves the Node Ready, so readiness alone proves nothing; the kubelet start
+    marker must change."""
+    mode = isolation_mode()
+    host_boot_before = ssh_capture("cat /proc/sys/kernel/random/boot_id").strip()
+    marker_before = node_stack_start_marker()
+    if not marker_before:
+        die("cannot read the kubelet start marker of the node stack before NodeReboot")
+    name = f"e2e-isolation-reboot-{int(time.time())}"
+    run_quiet([KUBECTL, "delete", _machine_operation_resource(), name, "--ignore-not-found"], check=False)
+    create_machine_operation(name, AGENT_MACHINE_NAME, "NodeReboot")
+    wait_for_machine_operation_complete(name)
+    wait_for_node_ready(AGENT_MACHINE_NAME)
+    _wait_until(
+        lambda: "" if (marker := node_stack_start_marker()) and marker != marker_before
+        else f"NodeReboot did not restart the kubelet of the node stack: start marker still {marker!r}",
+        120)
+    if mode == "none":
+        for unit in NONE_UNITS:
+            ssh_cmd(f"sudo systemctl is-active {unit}")
+        if ssh_capture("cat /proc/sys/kernel/random/boot_id").strip() != host_boot_before:
+            die("NodeReboot rebooted the host; it must restart only the node stack")
+    if applied_isolation() != mode:
+        die(f"NodeReboot changed the isolation mode away from {mode}")
+    log(f"Soft reboot passed in {mode} mode")
+
+
+def validate_node_stack_removed() -> None:
+    """Assert reset removed the node stack of the mode under test."""
+    mode = isolation_mode()
+    if mode == "nspawn":
+        log("Verifying nspawn machines are stopped on VM...")
+        for nspawn_name in NSPAWN_MACHINE_NAMES:
+            result = subprocess.run(
+                ["ssh", *SSH_OPTS, SSH_TARGET,
+                 f"sudo machinectl show {nspawn_name}"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            if result.returncode == 0:
+                die(f"nspawn machine '{nspawn_name}' is still running after reset")
+            log(f"nspawn machine '{nspawn_name}' is not running")
+        return
+    if mode != "none":
+        die(f"no node stack removal check for isolation mode {mode!r}")
+    leftovers = present_on_host([
+        NONE_NODE_BASE,
+        *[f"/etc/systemd/system/{unit}" for unit in NONE_UNITS],
+    ])
+    if leftovers:
+        die(f"reset left {mode} node stack artifacts on the host: {leftovers}")
+    log(f"{mode} node stack is gone after reset")
+
+
+# Each nspawn machine sees its own bpffs at /sys/fs/bpf, mounted on the host at
+# /run/bpffs/<machine> (the machine's service override). Each container slot
+# has the same layout.
+NODE_BPFFS_BASE = "/run/bpffs"
+
+
+def bpffs_sentinel_script() -> str:
+    """Shell that makes a sentinel in the bpffs at /sys/fs/bpf of the node
+    stack. A directory is a bpffs object of its own, so this needs neither
+    bpftool (the node image ships only the kernel-versioned wrapper, which
+    fails on a host whose kernel has no matching linux-tools) nor any BPF
+    program."""
+    sentinel = f"/sys/fs/bpf/{BPFFS_SENTINEL}"
+    return (f"mountpoint -q /sys/fs/bpf && rm -rf {sentinel} && "
+            f"mkdir {sentinel} && test -d {sentinel}")
+
+
 def create_bpffs_sentinel(machine: str) -> None:
+    """Make the sentinel in the bpffs of nspawn machine *machine*, and check
+    it from the host too, at the machine's bpffs mount, so the check holds
+    whatever runs the command in the machine."""
     log(f"Creating bpffs sentinel in nspawn machine '{machine}'...")
-    machine_shell(machine, textwrap.dedent(f"""\
-        mountpoint -q /sys/fs/bpf
-        rm -f /sys/fs/bpf/{BPFFS_SENTINEL}
-        bpftool map create /sys/fs/bpf/{BPFFS_SENTINEL} type hash key 4 value 4 entries 1 name unb_e2e
-        test -e /sys/fs/bpf/{BPFFS_SENTINEL}
-    """))
+    machine_shell(machine, bpffs_sentinel_script())
+    result = ssh_capture_quiet(f"sudo test -d {NODE_BPFFS_BASE}/{machine}/{BPFFS_SENTINEL}")
+    if result.returncode != 0:
+        die(f"the bpffs sentinel made in nspawn machine '{machine}' is not at "
+            f"{NODE_BPFFS_BASE}/{machine} on the host")
 
 
 def assert_bpffs_sentinel_absent(machine: str) -> None:
-    result = machine_shell_quiet(machine, f"test ! -e /sys/fs/bpf/{BPFFS_SENTINEL}")
+    """Assert nspawn machine *machine* has a bpffs of its own, without the
+    sentinel the previous machine made. Checked on the host, for the same
+    reason as create_bpffs_sentinel."""
+    ssh_cmd(f"sudo mountpoint -q {NODE_BPFFS_BASE}/{machine}")
+    result = ssh_capture_quiet(f"sudo test ! -e {NODE_BPFFS_BASE}/{machine}/{BPFFS_SENTINEL}")
     if result.returncode != 0:
         die(f"bpffs sentinel from previous machine is visible in '{machine}'")
 
@@ -923,6 +1149,8 @@ def node_config_bootstrap_args(node_config: NodeConfig) -> list[str]:
         args.extend(["--register-with-taint", taint])
     if node_config.rootfs_oci_image:
         args.extend(["--oci-image", node_config.rootfs_oci_image])
+    if ISOLATION_MODE:
+        args.extend(["--isolation", ISOLATION_MODE])
     for mount in node_config.additional_host_mounts:
         spec = mount["source"]
         if mount.get("target"):
@@ -1115,6 +1343,7 @@ def wait_for_machine_operation_complete(name: str, timeout_secs: int = 180) -> d
         elapsed += 5
 
     subprocess.run([KUBECTL, "get", resource, name, "-o", "yaml"], check=False)
+    dump_node_stack_diagnostics()
     die(f"Timed out waiting for MachineOperation '{name}' to complete after {timeout_secs}s")
 
 
@@ -1157,6 +1386,7 @@ def wait_for_machine_operation_failed(
         elapsed += 5
 
     subprocess.run([KUBECTL, "get", resource, name, "-o", "yaml"], check=False)
+    dump_node_stack_diagnostics()
     die(f"Timed out waiting for MachineOperation '{name}' to fail after {timeout_secs}s")
 
 
@@ -1504,8 +1734,9 @@ def _build_failing_agent_tarball(tarball: Path) -> None:
 def _build_daemon_failing_agent_tarball(tarball: Path) -> None:
     """Package an executable that passes verification but fails as the daemon.
 
-    It answers version, which is all verification runs, so the failure comes
-    from the daemon.
+    It answers version and supports-isolation, which is all verification runs
+    (the second only on a host that is not in nspawn mode), so the failure
+    comes from the daemon.
     """
 
     _build_script_agent_tarball(
@@ -1514,6 +1745,9 @@ def _build_daemon_failing_agent_tarball(tarball: Path) -> None:
         "#!/bin/sh\n"
         "if [ \"${1:-}\" = \"version\" ]; then\n"
         "    echo unbounded-agent e2e-daemon-failing\n"
+        "    exit 0\n"
+        "fi\n"
+        "if [ \"${1:-}\" = \"supports-isolation\" ]; then\n"
         "    exit 0\n"
         "fi\n"
         "echo failing upgraded agent daemon >&2\n"
@@ -3817,6 +4051,48 @@ def _run_agent_inner(agent_url: str, node_config: NodeConfig, *, reinstall: bool
 # ---------------------------------------------------------------------------
 # wait-for-node
 # ---------------------------------------------------------------------------
+# Credential fields that appear in kubeconfigs and unit environments, on top of
+# the bootstrap tokens and JSON token fields isolation_report.redact removes.
+_YAML_SECRET = re.compile(r"(?m)^(\s*(?:token|client-key-data|password):\s*)\S+")
+
+
+def redact_diagnostics(text: str) -> str:
+    """Remove bootstrap tokens and kubeconfig credentials from remote output
+    before it is printed: the journals of the agent can include them."""
+    return _YAML_SECRET.sub(r"\1<redacted>", isolation_report.redact(text))
+
+
+def dump_node_stack_diagnostics() -> None:
+    """Print what is needed to see why a Node did not register: unit state and
+    journals on the host and the state of a mode change. Every query is best
+    effort and nothing here can fail the run. A mode with its own runtime adds
+    its queries here."""
+    queries = [
+        ("failed host units", "sudo systemctl --failed --no-legend"),
+        ("node stack units", "sudo systemctl list-units --no-legend --all "
+                             "'unbounded-*.service' 'systemd-nspawn@*.service'"),
+        ("agent and node unit journals", "sudo journalctl --no-pager -n 120 -u 'unbounded-*' -u 'systemd-nspawn@*'"),
+        ("host kubelet", "sudo systemctl status kubelet.service --no-pager -l 2>&1 | tail -30"),
+        ("isolation migration journals and reprovision handoff",
+         "sudo sh -c 'for f in /etc/unbounded/agent/isolation-migration.json "
+         f"{REPROVISION_DIR}/journal.json; do echo == $f; cat $f 2>&1; echo; done; "
+         f"ls -la {REPROVISION_DIR} 2>&1; "
+         f"systemctl status {REPROVISION_UNIT} --no-pager -l 2>&1 | tail -30'"),
+        ("cgroup controllers", "cat /sys/fs/cgroup/cgroup.controllers; stat -fc %T /sys/fs/cgroup"),
+        ("kernel messages", "sudo dmesg 2>/dev/null | tail -30"),
+    ]
+    for title, command in queries:
+        try:
+            result = ssh_capture_quiet(command)
+            out = (result.stdout + result.stderr).strip() or f"<no output, exit {result.returncode}>"
+        except Exception as exc:  # noqa: BLE001 - diagnostics must never fail the run
+            out = f"<query failed: {exc}>"
+        print(f"[DIAG]  ---- {title} ----\n{redact_diagnostics(out)}", flush=True)
+    for title, args in (("certificate signing requests", ["get", "csr"]), ("nodes", ["get", "nodes", "-o", "wide"])):
+        subprocess.run([KUBECTL, *args], check=False)
+        print(f"[DIAG]  ---- end {title} ----", flush=True)
+
+
 def wait_for_node_registered() -> None:
     """Wait for the agent node object to appear."""
 
@@ -3839,6 +4115,7 @@ def wait_for_node_registered() -> None:
 
     log("Current nodes:")
     subprocess.run([KUBECTL, "get", "nodes", "-o", "wide"], check=False)
+    dump_node_stack_diagnostics()
     die(f"Timed out waiting for node '{AGENT_MACHINE_NAME}' after {node_timeout}s")
 
 
@@ -3978,11 +4255,13 @@ def validate_local_dns_config(node_config: NodeConfig) -> None:
     if not node_config.local_dns:
         return
 
-    log("Validating nspawn LocalDNS...")
-    machine = active_nspawn_machine()
-    machine_shell(machine, """
-systemctl is-active --quiet localdns.service
+    log(f"Validating {isolation_mode()} LocalDNS...")
+    # The in-node unit name and resolv.conf are nspawn facts. Other modes are
+    # held to the same-path contract (kubelet config, listeners) only.
+    nspawn_only = """systemctl is-active --quiet localdns.service
 grep -qx 'nameserver 169.254.10.10' /etc/resolv.conf
+""" if isolation_mode() == "nspawn" else ""
+    node_exec(nspawn_only + """
 grep -qx 'clusterDNS:' /var/lib/kubelet/config.yaml
 grep -qx -- '- 169.254.10.11' /var/lib/kubelet/config.yaml
 grep -qx 'resolvConf: /etc/unbounded/localdns/resolv.conf' /var/lib/kubelet/config.yaml
@@ -4030,7 +4309,7 @@ for chain in output prerouting; do
 done
 """)
     ssh_cmd(f"curl --silent --fail --noproxy '*' http://{expected_node_ip(node_config)}:9253/metrics | grep -q '^coredns_build_info'")
-    log("nspawn LocalDNS validation passed")
+    log(f"{isolation_mode()} LocalDNS validation passed")
 
 
 def validate_offline_bootstrap_config(node_config: NodeConfig) -> None:
@@ -4383,7 +4662,7 @@ EOF
     # device. The synthetic /dev/zero alias is not an RDMA device class.
     # `machinectl show` succeeds as soon as nspawn registers the machine, and
     # the node's Ready condition can still be the stale pre-reboot value, so
-    # the container's init may not accept `machinectl shell` yet. Poll the
+    # the container's init may not accept commands from the host yet. Poll the
     # in-container check instead of running it once.
     wait_for_machine_shell_success(
         machine,
@@ -5018,17 +5297,8 @@ def reset_agent() -> None:
     else:
         die(f"Timed out waiting for node '{AGENT_MACHINE_NAME}' to be removed after {node_timeout}s")
 
-    # Verify the nspawn machines are no longer running on the VM
-    log("Verifying nspawn machines are stopped on VM...")
-    for nspawn_name in NSPAWN_MACHINE_NAMES:
-        result = subprocess.run(
-            ["ssh", *SSH_OPTS, SSH_TARGET,
-             f"sudo machinectl show {nspawn_name}"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-        if result.returncode == 0:
-            die(f"nspawn machine '{nspawn_name}' is still running after reset")
-        log(f"nspawn machine '{nspawn_name}' is not running")
+    # Verify the node stack of the mode under test is gone from the VM.
+    validate_node_stack_removed()
 
     validate_reset_cleanup()
 
@@ -5596,13 +5866,18 @@ def _daemon_unit_runs(binary_dir: str) -> None:
     its current link, the recovery unit its script, and each machine's service
     override its lifecycle helper."""
 
+    # The machine service override exists only for nspawn; the other modes run
+    # the node as host units and have no machine to override.
+    nspawn = isolation_mode() == "nspawn"
+    override = " /etc/systemd/system/systemd-nspawn@*.service.d/override.conf" if nspawn else ""
     units = ssh_capture(
         "sudo sh -c 'cat /etc/systemd/system/unbounded-agent-daemon.service "
-        "/etc/systemd/system/unbounded-agent-daemon-recovery.service "
-        "/etc/systemd/system/systemd-nspawn@*.service.d/override.conf'")
-    for want in (f"ExecStart={binary_dir}/unbounded-agent-current daemon",
-                 f"ExecStart={binary_dir}/unbounded-agent-daemon-recovery.sh",
-                 f"={binary_dir}/unbounded-agent-nspawn-lifecycle nspawn-lifecycle post-start"):
+        f"/etc/systemd/system/unbounded-agent-daemon-recovery.service{override}'")
+    wants = [f"ExecStart={binary_dir}/unbounded-agent-current daemon",
+             f"ExecStart={binary_dir}/unbounded-agent-daemon-recovery.sh"]
+    if nspawn:
+        wants.append(f"={binary_dir}/unbounded-agent-nspawn-lifecycle nspawn-lifecycle post-start")
+    for want in wants:
         if want not in units:
             die(f"the agent's units do not run {want!r}:\n{units}")
 
@@ -6010,10 +6285,93 @@ def ensure_machine_configuration_for_repave(
     kubectl(["apply", "-f", "-"], input=json.dumps(manifest).encode())
 
 
+# The node label a repave configuration carries to tell its versions apart.
+CONFIG_VERSION_LABEL = "e2e.unbounded-cloud.io/config-version"
+
+
+def publish_repave_configuration(node_config: NodeConfig, current_kubelet_version: str, config_version: str,
+                                 kubernetes_version: str = "") -> tuple[int, str]:
+    """Publish a new version of the Machine's MachineConfiguration, with node
+    label CONFIG_VERSION_LABEL=*config_version* and, when given,
+    *kubernetes_version*, and return the number and name of the
+    MachineConfigurationVersion it produced. Without *kubernetes_version* the
+    version stays, so the repave changes configuration only. Assigning it and
+    deleting the Node is up to the caller."""
+    config_name = MACHINE_CONFIG_NAME
+    ensure_machine_configuration_for_repave(config_name, current_kubelet_version, node_config)
+    manifest = json.loads(kubectl_capture(["get", "machineconfiguration", config_name, "-o", "json"]))
+    metadata = manifest.setdefault("metadata", {})
+    for key in ["creationTimestamp", "generation", "resourceVersion", "uid", "managedFields"]:
+        metadata.pop(key, None)
+    manifest.pop("status", None)
+    kubernetes_template = manifest.setdefault("spec", {}).setdefault(
+        "template", {},
+    ).setdefault("kubernetes", {})
+    if kubernetes_version:
+        kubernetes_template["version"] = kubernetes_version
+    kubernetes_template["nodeLabels"] = {
+        **expected_node_labels(node_config),
+        CONFIG_VERSION_LABEL: config_version,
+    }
+    kubectl(["apply", "-f", "-"], input=json.dumps(manifest).encode())
+    wanted = (kubernetes_template.get("version"), config_version)
+
+    timeout_secs = 120
+    elapsed = 0
+    while elapsed < timeout_secs:
+        result = subprocess.run(
+            [KUBECTL, "get", "machineconfigurationversion",
+             "-l", f"unbounded-cloud.io/machine-configuration={config_name}", "-o", "json"],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            mcvs = json.loads(result.stdout).get("items", [])
+            matching_mcvs = []
+            for mcv in mcvs:
+                kubernetes = mcv.get("spec", {}).get("template", {}).get("kubernetes", {})
+                if (kubernetes.get("version"), (kubernetes.get("nodeLabels") or {}).get(CONFIG_VERSION_LABEL)) == wanted:
+                    matching_mcvs.append(mcv)
+            if matching_mcvs:
+                latest = max(matching_mcvs, key=lambda mcv: mcv.get("spec", {}).get("version", 0))
+                number = latest.get("spec", {}).get("version", 0)
+                name = latest.get("metadata", {}).get("name", "")
+                if number == 0 or not name:
+                    die("Resolved target MachineConfigurationVersion was empty")
+                log(f"MachineConfigurationVersion '{name}' is ready")
+                return number, name
+        if elapsed > 0 and elapsed % 30 == 0:
+            log(f"  ({elapsed}s) waiting for an MCV with Kubernetes {wanted[0]} and {CONFIG_VERSION_LABEL}={config_version}...")
+        time.sleep(5)
+        elapsed += 5
+
+    print_controller_logs(UNBOUNDED_NS, "app=machina-controller")
+    die(f"No MachineConfigurationVersion reached Kubernetes {wanted[0]} and {CONFIG_VERSION_LABEL}={config_version} "
+        f"after {timeout_secs}s")
+    raise AssertionError("unreachable")
+
+
+def assign_repave_configuration(number: int, name: str) -> None:
+    """Assign the Machine to MachineConfigurationVersion *name*, number *number*."""
+    log(f"Assigning Machine '{AGENT_MACHINE_NAME}' to {name}...")
+    run([KUBECTL_UNBOUNDED, "machine", "config", "assign", AGENT_MACHINE_NAME,
+         "--config", MACHINE_CONFIG_NAME, "--version", str(number)])
+
+
+def repave_with_config_change(node_config: NodeConfig, purpose: str) -> None:
+    """Publish and assign a configuration that only changes a node label, so
+    the repave changes no binaries, and delete the Node to start the repave.
+    Waiting for the node to come back is up to the caller."""
+    current = node_kubelet_version(AGENT_MACHINE_NAME)
+    if not current:
+        die(f"Node '{AGENT_MACHINE_NAME}' did not report a kubelet version")
+    number, name = publish_repave_configuration(node_config, current, f"{purpose}-{int(time.time())}")
+    assign_repave_configuration(number, name)
+    log(f"Deleting Node '{AGENT_MACHINE_NAME}' to trigger a configuration-only repave ({purpose})...")
+    kubectl(["delete", "node", AGENT_MACHINE_NAME])
+
+
 def validate_node_repave_upgrade(node_config: NodeConfig) -> None:
     """Validate OnDelete repave applies a new MCV Kubernetes version."""
-
-    config_name = MACHINE_CONFIG_NAME
 
     current_kubelet_version = node_kubelet_version(AGENT_MACHINE_NAME)
     if not current_kubelet_version:
@@ -6024,71 +6382,34 @@ def validate_node_repave_upgrade(node_config: NodeConfig) -> None:
     log(f"Current kubelet version: {current_kubelet_version}")
     log(f"Target kubelet version: {target_kubelet_version}")
 
-    ensure_machine_configuration_for_repave(config_name, current_kubelet_version, node_config)
-    manifest = json.loads(kubectl_capture(["get", "machineconfiguration", config_name, "-o", "json"]))
-    metadata = manifest.setdefault("metadata", {})
-    for key in ["creationTimestamp", "generation", "resourceVersion", "uid", "managedFields"]:
-        metadata.pop(key, None)
-    manifest.pop("status", None)
-    kubernetes_template = manifest.setdefault("spec", {}).setdefault(
-        "template", {},
-    ).setdefault("kubernetes", {})
-    kubernetes_template["version"] = target_kubelet_version
-    kubernetes_template["nodeLabels"] = {
-        **expected_node_labels(node_config),
-        "e2e.unbounded-cloud.io/config-version": "v3",
-    }
-    kubectl(["apply", "-f", "-"], input=json.dumps(manifest).encode())
+    target_version_number, target_mcv = publish_repave_configuration(
+        node_config, current_kubelet_version, "v3", kubernetes_version=target_kubelet_version)
 
-    timeout_secs = 120
-    elapsed = 0
-    target_version_number = 0
-    target_mcv = ""
-    while elapsed < timeout_secs:
-        result = subprocess.run(
-            [KUBECTL, "get", "machineconfigurationversion",
-             "-l", f"unbounded-cloud.io/machine-configuration={config_name}", "-o", "json"],
-            capture_output=True, text=True,
-        )
-        if result.returncode == 0:
-            mcvs = json.loads(result.stdout).get("items", [])
-            matching_mcvs = [
-                mcv for mcv in mcvs
-                if mcv.get("spec", {}).get("template", {}).get("kubernetes", {}).get("version")
-                == target_kubelet_version
-            ]
-            if matching_mcvs:
-                latest = max(matching_mcvs, key=lambda mcv: mcv.get("spec", {}).get("version", 0))
-                target_version_number = latest.get("spec", {}).get("version", 0)
-                target_mcv = latest.get("metadata", {}).get("name", "")
-                log(f"MachineConfigurationVersion '{target_mcv}' is ready")
-                break
-        if elapsed > 0 and elapsed % 30 == 0:
-            log(f"  ({elapsed}s) waiting for MCV with Kubernetes {target_kubelet_version}...")
-        time.sleep(5)
-        elapsed += 5
+    if isolation_mode() == "nspawn":
+        old_nspawn = active_nspawn_machine()
+        create_bpffs_sentinel(old_nspawn)
     else:
-        print_controller_logs(UNBOUNDED_NS, "app=machina-controller")
-        die(f"No MachineConfigurationVersion reached Kubernetes {target_kubelet_version} after {timeout_secs}s")
+        old_marker = isolation_node_marker()
 
-    if target_version_number == 0 or not target_mcv:
-        die("Resolved target MachineConfigurationVersion was empty")
-
-    old_nspawn = active_nspawn_machine()
-    create_bpffs_sentinel(old_nspawn)
-
-    log(f"Assigning Machine '{AGENT_MACHINE_NAME}' to {target_mcv}...")
-    run([KUBECTL_UNBOUNDED, "machine", "config", "assign", AGENT_MACHINE_NAME,
-         "--config", config_name, "--version", str(target_version_number)])
+    assign_repave_configuration(target_version_number, target_mcv)
 
     log(f"Deleting Node '{AGENT_MACHINE_NAME}' to trigger OnDelete repave...")
     kubectl(["delete", "node", AGENT_MACHINE_NAME])
     wait_for_node_absent(AGENT_MACHINE_NAME)
     wait_for_node()
-    new_nspawn = active_nspawn_machine()
-    if new_nspawn == old_nspawn:
-        die(f"repave did not switch nspawn machines: still using {new_nspawn}")
-    assert_bpffs_sentinel_absent(new_nspawn)
+    if isolation_mode() == "nspawn":
+        new_nspawn = active_nspawn_machine()
+        if new_nspawn == old_nspawn:
+            die(f"repave did not switch nspawn machines: still using {new_nspawn}")
+        assert_bpffs_sentinel_absent(new_nspawn)
+    else:
+        # none flips its current link to the new version, so the marker
+        # must change.
+        new_marker = isolation_node_marker()
+        if new_marker == old_marker:
+            die(f"repave did not replace the {isolation_mode()} node stack: still {new_marker!r}")
+        if applied_isolation() != isolation_mode():
+            die("repave changed the isolation mode")
     wait_for_node_kubelet_version(AGENT_MACHINE_NAME, target_kubelet_version)
     node = json.loads(kubectl_capture(["get", "node", AGENT_MACHINE_NAME, "-o", "json"]))
     _assert_expected_node_config(node, node_config)
@@ -6111,6 +6432,727 @@ def validate_node_repave_upgrade(node_config: NodeConfig) -> None:
     log("============================================")
     kubectl(["get", "machine", AGENT_MACHINE_NAME, "-o", "wide"])
     kubectl(["get", "node", AGENT_MACHINE_NAME, "-o", "wide"])
+
+# A DaemonSet whose pod is not host-network, pinned to the agent node.
+POD_CIDR_DAEMONSET = "e2e-pod-cidr"
+
+
+def node_pod_cidrs(node: dict[str, Any]) -> list[str]:
+    """Return the pod CIDRs a Node object was assigned."""
+    spec = node.get("spec", {})
+    return spec.get("podCIDRs") or ([spec["podCIDR"]] if spec.get("podCIDR") else [])
+
+
+def pod_ips_outside_cidrs(pods: list[dict[str, Any]], cidrs: list[str]) -> list[str]:
+    """Return "<namespace>/<name> <ip>" for every IP of a running pod in *pods*
+    that is not host-network, is not being deleted and lies in none of *cidrs*."""
+    networks = [ipaddress.ip_network(cidr, strict=False) for cidr in cidrs]
+    outside = []
+    for pod in pods:
+        metadata, spec, status = pod.get("metadata", {}), pod.get("spec", {}), pod.get("status", {})
+        if spec.get("hostNetwork") or metadata.get("deletionTimestamp") or status.get("phase") != "Running":
+            continue
+        ips = [entry.get("ip", "") for entry in status.get("podIPs") or []]
+        if not ips and status.get("podIP"):
+            ips = [status["podIP"]]
+        for ip in filter(None, ips):
+            if not any(ipaddress.ip_address(ip) in network for network in networks):
+                outside.append(f"{metadata.get('namespace', '')}/{metadata.get('name', '')} {ip}")
+    return outside
+
+
+def pod_cidr_daemonset() -> dict[str, Any]:
+    """Return the DaemonSet validate_none_repave_pod_cidr runs on the agent node."""
+    return {
+        "apiVersion": "apps/v1",
+        "kind": "DaemonSet",
+        "metadata": {"name": POD_CIDR_DAEMONSET, "namespace": TEST_NS},
+        "spec": {
+            "selector": {"matchLabels": {"app": POD_CIDR_DAEMONSET}},
+            "template": {
+                "metadata": {"labels": {"app": POD_CIDR_DAEMONSET}},
+                "spec": {
+                    "affinity": {"nodeAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": {
+                        "nodeSelectorTerms": [{"matchFields": [
+                            {"key": "metadata.name", "operator": "In", "values": [AGENT_MACHINE_NAME]},
+                        ]}],
+                    }}},
+                    "tolerations": [{"operator": "Exists"}],
+                    "terminationGracePeriodSeconds": 1,
+                    "containers": [{"name": "sleep", "image": E2E_WORKLOAD_IMAGE, "command": ["sleep", "infinity"]}],
+                },
+            },
+        },
+    }
+
+
+def agent_node_pods() -> list[dict[str, Any]]:
+    """Return every pod bound to the agent node, in every namespace."""
+    return json.loads(kubectl_capture(["get", "pods", "-A", "--field-selector", f"spec.nodeName={AGENT_MACHINE_NAME}",
+                                       "-o", "json"])).get("items", [])
+
+
+def _pod_cidr_daemonset_problem() -> str:
+    """Return "" once the DaemonSet's pod runs on the agent node."""
+    running = [pod for pod in agent_node_pods()
+               if pod.get("metadata", {}).get("labels", {}).get("app") == POD_CIDR_DAEMONSET
+               and not pod.get("metadata", {}).get("deletionTimestamp")
+               and pod.get("status", {}).get("phase") == "Running" and pod.get("status", {}).get("podIP")]
+    return "" if running else f"the {POD_CIDR_DAEMONSET} DaemonSet pod is not running on {AGENT_MACHINE_NAME}"
+
+
+def validate_none_repave_pod_cidr(node_config: NodeConfig) -> None:
+    """In none mode, run a DaemonSet whose pod is not host-network, repave the
+    node with a configuration-only change and assert every pod IP on the node
+    that is not host-network lies in the new Node's spec.podCIDR. The Node is
+    created again by the repave and can be given another range; a node stack
+    that kept the old range hands out addresses that do not route. Other modes
+    skip it."""
+    if isolation_mode() != "none":
+        log(f"Skipping the repave pod CIDR check in {isolation_mode()} mode")
+        return
+    ns_yaml = capture([KUBECTL, "create", "namespace", TEST_NS, "--dry-run=client", "-o", "yaml"])
+    kubectl(["apply", "-f", "-"], input=ns_yaml.encode())
+    kubectl(["apply", "-f", "-"], input=json.dumps(pod_cidr_daemonset()).encode())
+    _wait_until(_pod_cidr_daemonset_problem, 300)
+    before = node_pod_cidrs(json.loads(kubectl_capture(["get", "node", AGENT_MACHINE_NAME, "-o", "json"])))
+
+    repave_with_config_change(node_config, "pod-cidr")
+    wait_for_node_absent(AGENT_MACHINE_NAME)
+    wait_for_node()
+    after = node_pod_cidrs(json.loads(kubectl_capture(["get", "node", AGENT_MACHINE_NAME, "-o", "json"])))
+    if not after:
+        die(f"the repaved Node '{AGENT_MACHINE_NAME}' has no spec.podCIDR")
+    log(f"Pod CIDRs before the repave {before}, after {after}"
+        + ("" if before != after else " (the same range was assigned again)"))
+
+    _wait_until(_pod_cidr_daemonset_problem, 300)
+
+    def outside() -> str:
+        found = pod_ips_outside_cidrs(agent_node_pods(), after)
+        return f"pods on the repaved node have IPs outside its pod CIDRs {after}: {found}" if found else ""
+
+    _wait_until(outside, 180)
+    kubectl(["delete", "daemonset", POD_CIDR_DAEMONSET, "-n", TEST_NS, "--ignore-not-found"])
+    log(f"Every pod on the repaved none node has an IP in {after}")
+
+
+# What the none operator logs when a repave starts and ends
+# (cmd/agent/internal/daemon/nodeoperator_none.go RepaveNode).
+NONE_REPAVE_STARTED = "starting node upgrade"
+NONE_REPAVE_COMPLETED = "node upgrade completed"
+
+
+def daemon_kill_during_repave_script(since: int, timeout_secs: int) -> str:
+    """Return a host shell script that waits until the daemon has logged, since
+    host time *since*, the start of a none repave and SIGKILLs its main
+    process, as a crash would. systemctl kill signals every process in the
+    unit and can fail with EINVAL for one of them, which leaves the repave
+    running. It prints killed and exits 0, or prints finished and exits 2 when the repave was
+    already over, or prints timeout and exits 1."""
+    unit = "unbounded-agent-daemon.service"
+    return textwrap.dedent(f"""\
+        end=$(( $(date +%s) + {timeout_secs} ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+          logs=$(journalctl -u {unit} --since @{since} -o cat --no-pager 2>/dev/null)
+          case "$logs" in *"{NONE_REPAVE_COMPLETED}"*) echo finished; exit 2;; esac
+          case "$logs" in *"{NONE_REPAVE_STARTED}"*)
+            pid=$(systemctl show -p MainPID --value {unit})
+            if [ "${{pid:-0}}" -gt 0 ] && kill -KILL "$pid"; then echo killed; exit 0; fi
+            echo "no daemon main PID to kill (MainPID=${{pid}})"; exit 1;;
+          esac
+          sleep 0.2
+        done
+        echo timeout
+        exit 1
+        """)
+
+
+def validate_none_repave_survives_daemon_kill(node_config: NodeConfig) -> None:
+    """In none mode, SIGKILL the agent daemon while it runs a configuration-only
+    repave and assert the daemon restarts, the Node comes back Ready and
+    containerd and kubelet run. Other modes skip it."""
+    if isolation_mode() != "none":
+        log(f"Skipping the daemon kill during a repave in {isolation_mode()} mode")
+        return
+    since = int(ssh_capture("date +%s"))
+    script = daemon_kill_during_repave_script(since, 300)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        watcher = pool.submit(ssh_capture_quiet, f"sudo sh -c {shlex.quote(script)}")
+        repave_with_config_change(node_config, "daemon-kill")
+        result = watcher.result()
+    outcome = result.stdout.strip()
+    if result.returncode != 0 or outcome != "killed":
+        die(f"could not kill the daemon during the none repave: {outcome or result.stderr.strip()!r} "
+            f"(exit {result.returncode})")
+    log("Killed the agent daemon with SIGKILL during the none repave")
+    wait_for_daemon_active()
+    wait_for_node()
+    validate_isolation_mode()
+    log("The none node came back Ready, with containerd and kubelet active, after the daemon was killed mid-repave")
+
+
+# ---------------------------------------------------------------------------
+# isolation mode change (spec.isolation declared, applied by the next repave)
+# ---------------------------------------------------------------------------
+MIGRATION_TIMEOUT_SECS = int(os.environ.get("MIGRATION_TIMEOUT", "900"))
+# How long a failed change is watched to prove nothing retries it.
+RETRY_SOAK_SECS = int(os.environ.get("RETRY_SOAK", "60"))
+
+
+def set_effective_isolation(mode: str) -> None:
+    """Make the helpers that branch on the isolation mode follow a mode change."""
+    global ISOLATION_MODE  # noqa: PLW0603
+    ISOLATION_MODE = mode
+
+
+# Ordered mode pairs the daemon changes in place (pkg/agent/isolation/migrate.Plan).
+# In place needs a target with a slot of its own beside the source; none has no
+# slot, so with nspawn and none every change is a reprovision. A mode with
+# slots adds its pairs with nspawn here.
+IN_PLACE_PAIRS: frozenset[tuple[str, str]] = frozenset()
+
+
+def expected_change_strategy(source: str, target: str) -> str:
+    """Return the strategy the daemon records in status.isolationChange for a
+    change from source to target, lower case. The harness does not choose it."""
+    return "inplace" if (source, target) in IN_PLACE_PAIRS else "reprovision"
+
+
+def set_allow_reprovision(allowed: bool) -> None:
+    """Set or remove the Machine annotation that allows a mode change by
+    reprovision. Without it the daemon refuses such a change."""
+    value = f"{ALLOW_REPROVISION_ANNOTATION}=true" if allowed else f"{ALLOW_REPROVISION_ANNOTATION}-"
+    kubectl(["annotate", "machine", AGENT_MACHINE_NAME, "--overwrite", value])
+
+
+def isolation_change_view() -> dict[str, Any]:
+    """Return the Machine's status.isolationChange (targetMode, phase, message,
+    strategy, reason, lastTransitionTime), or an empty dict before any change."""
+    machine = json.loads(kubectl_capture(["get", "machine", AGENT_MACHINE_NAME, "-o", "json"]))
+    return machine.get("status", {}).get("isolationChange") or {}
+
+
+def declare_isolation_spec(mode: str) -> None:
+    """Declare the intended mode in spec.isolation, as an operator does. Nothing
+    moves until the node's next repave."""
+    kubectl(["patch", "machine", AGENT_MACHINE_NAME, "--type=merge", "-p",
+             json.dumps({"spec": {"isolation": mode}})])
+
+
+def wait_for_isolation_change(target: str, phase: str, previous: dict[str, Any],
+                              timeout_secs: int | None = None) -> dict[str, Any]:
+    """Wait for a change to *target* that reached a terminal phase after
+    *previous* was read, and require that phase to be *phase*. A new attempt is
+    told apart from an old one by lastTransitionTime, so a stale Succeeded or
+    Failed for the same target is not mistaken for the new result."""
+    limit = timeout_secs or MIGRATION_TIMEOUT_SECS
+    deadline = time.monotonic() + limit
+    while True:
+        change = isolation_change_view()
+        if (change.get("targetMode") == target and change.get("phase") in ("Succeeded", "Failed")
+                and change.get("lastTransitionTime") != previous.get("lastTransitionTime")):
+            if change["phase"] != phase:
+                die(f"the change to {target} ended {change['phase']}, expected {phase}: {change.get('message', '')!r}")
+            return change
+        if time.monotonic() > deadline:
+            dump_node_stack_diagnostics()
+            die(f"no {phase} status.isolationChange for {target} after {limit}s (last seen: {change})")
+        time.sleep(5)
+
+
+def validate_change_pending(source: str, target: str, marker: str, previous: dict[str, Any]) -> None:
+    """Assert that declaring *target* only reports a drift: the controller sets
+    IsolationDrift True, and the node, its applied mode and its stack are as they
+    were. An earlier failed or refused change to the same target keeps showing
+    as ChangeFailed or ChangeRefused until the next attempt."""
+    allowed = {"AppliedModeDiffers"}
+    if previous.get("phase") == "Failed" and previous.get("targetMode") == target:
+        allowed.add(failed_change_reason(previous))
+    deadline = time.monotonic() + 180
+    while True:
+        view = machine_isolation_view()
+        drift = view["drift"] or {}
+        if (view["spec"] == target and view["observed"] == source and drift.get("status") == "True"
+                and drift.get("reason") in allowed):
+            break
+        if time.monotonic() > deadline:
+            die(f"declaring spec.isolation={target} on a {source} node did not show a drift: {view}")
+        time.sleep(5)
+    if isolation_node_marker() != marker or applied_isolation() != source:
+        die(f"declaring spec.isolation={target} moved the node; it must wait for the next repave")
+    log(f"spec.isolation={target} declared; IsolationDrift is {drift.get('reason')} and the {source} node did not move")
+
+
+def change_isolation_mode(node_config: NodeConfig, target: str) -> None:
+    """Change the mode the way an operator does: declare it in spec.isolation,
+    check nothing moves, allow the reprovision when the pair needs one, delete
+    the Node to trigger the repave, and assert the change succeeded with the
+    strategy the pair calls for, the Node came back with its identity, the new
+    mode is applied and reported, drift is gone and a workload runs. The
+    reprovision opt-in is removed again afterward, so a later refusal check
+    starts without it."""
+    source = applied_isolation()
+    strategy = expected_change_strategy(source, target)
+    previous = isolation_change_view()
+    marker = isolation_node_marker()
+    declare_isolation_spec(target)
+    validate_change_pending(source, target, marker, previous)
+    if strategy == "reprovision":
+        set_allow_reprovision(True)
+    log(f"Deleting Node '{AGENT_MACHINE_NAME}' to trigger the repave that applies spec.isolation={target}...")
+    kubectl(["delete", "node", AGENT_MACHINE_NAME])
+    change = wait_for_isolation_change(target, "Succeeded", previous)
+    if (change.get("strategy") or "").lower() != strategy:
+        die(f"{source} -> {target} used strategy {change.get('strategy')!r}, expected {strategy}")
+    if strategy == "reprovision":
+        set_allow_reprovision(False)
+    set_effective_isolation(target)
+    wait_for_node()
+    validate_isolation_mode()
+    validate_isolation_status()
+    view = machine_isolation_view()
+    drift = view["drift"] or {}
+    if view["spec"] != target or view["observed"] != target or drift.get("status") != "False" \
+            or drift.get("reason") != "AppliedModeMatches":
+        die(f"after the change to {target}: spec={view['spec']!r} observed={view['observed']!r} drift={drift}")
+    node = json.loads(kubectl_capture(["get", "node", AGENT_MACHINE_NAME, "-o", "json"]))
+    _assert_expected_node_config(node, node_config)
+    validate_workload()
+    log(f"Isolation change {source} -> {target} ({strategy}) PASSED")
+
+
+def assert_no_automatic_retry(change: dict[str, Any], soak_secs: int | None = None) -> None:
+    """Assert a failed change is left alone: status.isolationChange keeps the
+    same failed attempt, so nothing retried it without a new trigger (the next
+    Node deletion or configuration change)."""
+    soak = RETRY_SOAK_SECS if soak_secs is None else soak_secs
+    deadline = time.monotonic() + soak
+    while time.monotonic() < deadline:
+        time.sleep(10)
+        now = isolation_change_view()
+        if now.get("lastTransitionTime") != change.get("lastTransitionTime") or now.get("phase") != "Failed":
+            die(f"a failed isolation change was retried without a new trigger: {change} -> {now}")
+    log(f"The failed change to {change.get('targetMode')} was not retried in {soak}s")
+
+
+# status.isolationChange reasons of a change the agent refused before touching
+# the node; the controller reports them as ChangeRefused, any other failure as
+# ChangeFailed (cmd/machina/machina/controller/isolation_conditions.go).
+REASON_REPROVISION_NOT_ALLOWED = "ReprovisionNotAllowed"
+REFUSED_CHANGE_REASONS = (REASON_REPROVISION_NOT_ALLOWED, "UnsupportedMode")
+# How long a change may stay InProgress before the controller calls it
+# ChangeStale (isolationChangeStaleAfter).
+CHANGE_STALE_AFTER_SECS = 2 * 3600
+
+
+def failed_change_reason(change: dict[str, Any]) -> str:
+    """Return the IsolationDrift reason the controller sets for a Failed change."""
+    return "ChangeRefused" if change.get("reason") in REFUSED_CHANGE_REASONS else "ChangeFailed"
+
+
+def validate_change_failed_condition(target: str, change: dict[str, Any]) -> None:
+    """Assert IsolationDrift reports the failed change for *target* as
+    ChangeFailed, or ChangeRefused for a refusal, and carries the failure text."""
+    want = failed_change_reason(change)
+    deadline = time.monotonic() + 120
+    while True:
+        drift = machine_isolation_view()["drift"] or {}
+        if drift.get("status") == "True" and drift.get("reason") == want:
+            break
+        if time.monotonic() > deadline:
+            die(f"IsolationDrift is {drift.get('status')}/{drift.get('reason')} after the failed change to "
+                f"{target}, expected True/{want}")
+        time.sleep(5)
+    if change.get("message") and change["message"].split(" (")[0] not in drift.get("message", ""):
+        die(f"the {want} message does not carry the failure: {drift.get('message')!r} vs {change.get('message')!r}")
+
+
+def other_isolation_mode(mode: str) -> str:
+    """Return a mode other than *mode*: none for nspawn, nspawn otherwise."""
+    return "none" if mode == "nspawn" else "nspawn"
+
+
+def validate_reprovision_refused() -> None:
+    """Declare a mode the node can only reach by reprovision, without the
+    allow-reprovision opt-in, and assert the agent refuses it: the change is
+    Failed with reason ReprovisionNotAllowed, IsolationDrift reports
+    ChangeRefused, the repave the Node deletion triggered still brings the node
+    back in its applied mode, and nothing retries the change. The spec is then
+    set back to the applied mode."""
+    source = applied_isolation()
+    target = other_isolation_mode(source)
+    if expected_change_strategy(source, target) != "reprovision":
+        die(f"{source} -> {target} is not a reprovision; the refusal check needs one")
+    set_allow_reprovision(False)
+    previous = isolation_change_view()
+    marker = isolation_node_marker()
+    declare_isolation_spec(target)
+    validate_change_pending(source, target, marker, previous)
+    log(f"Deleting Node '{AGENT_MACHINE_NAME}' without {ALLOW_REPROVISION_ANNOTATION}; the change to {target} "
+        "must be refused...")
+    kubectl(["delete", "node", AGENT_MACHINE_NAME])
+    change = wait_for_isolation_change(target, "Failed", previous)
+    if change.get("reason") != REASON_REPROVISION_NOT_ALLOWED:
+        die(f"the change to {target} failed with reason {change.get('reason')!r}, expected "
+            f"{REASON_REPROVISION_NOT_ALLOWED}: {change.get('message', '')!r}")
+    if change.get("strategy") and change["strategy"].lower() != "reprovision":
+        die(f"the refused change records strategy {change['strategy']!r}, expected reprovision")
+    # The refusal does not stop the repave: it goes ahead in the applied mode.
+    wait_for_node()
+    if applied_isolation() != source:
+        die(f"a refused change left the applied mode at {applied_isolation()!r}, expected {source!r}")
+    validate_isolation_mode()
+    validate_change_failed_condition(target, change)
+    assert_no_automatic_retry(change)
+    validate_no_reprovision_handoff()
+    declare_isolation_spec(source)
+    validate_isolation_status()
+    validate_workload()
+    log(f"The change {source} -> {target} was refused without {ALLOW_REPROVISION_ANNOTATION} and the node "
+        f"stayed in {source}")
+
+
+def validate_no_reprovision_handoff(timeout_secs: int = 120) -> None:
+    """Assert no reprovision handoff is left on the host: no unit to run it and
+    no staged agent or target configuration, which carries the bootstrap
+    token. A handoff that succeeded is cleaned up by the daemon that reports
+    it, one that gave up removes its own unit and staged files, and a refused
+    change never stages one. The daemon may clean up just after it reports the
+    change, so the check waits up to *timeout_secs* for that."""
+
+    def leftover() -> str:
+        found = present_on_host([
+            f"/etc/systemd/system/{REPROVISION_UNIT}",
+            f"{REPROVISION_DIR}/config.json",
+            f"{REPROVISION_DIR}/unbounded-agent",
+        ])
+        if found:
+            return f"a reprovision handoff was left on the host: {found}"
+        state = ssh_capture_quiet(f"sudo systemctl is-active {REPROVISION_UNIT}").stdout.strip()
+        if state in ("active", "activating"):
+            return f"{REPROVISION_UNIT} is still {state}"
+        return ""
+
+    _wait_until(leftover, timeout_secs)
+    log("No reprovision handoff unit or staged configuration is left on the host")
+
+
+# The nftables flush the agent installs in every mode
+# (pkg/agent/phases/host/configure_nftables.go): its unit, the links that
+# enable it (multi-user.target in none, the nspawn machines in nspawn) and the
+# rules file it loads. Left after a reset, it flushes the ruleset of whatever
+# the host runs next at every boot.
+NFTABLES_FLUSH_UNIT = "nftables-flush.service"
+NFTABLES_FLUSH_ARTIFACTS = (
+    f"/etc/systemd/system/{NFTABLES_FLUSH_UNIT}",
+    f"/etc/systemd/system/multi-user.target.wants/{NFTABLES_FLUSH_UNIT}",
+    f"/etc/systemd/system/systemd-nspawn@.service.requires/{NFTABLES_FLUSH_UNIT}",
+    "/etc/unbounded/kube/nftables-clear.nft",
+)
+
+
+def nftables_flush_leftover(present: list[str], enabled_state: str) -> str:
+    """Return what a reset left of the nftables flush, or "" when nothing is
+    left. *present* are the NFTABLES_FLUSH_ARTIFACTS still on the host and
+    *enabled_state* is what `systemctl is-enabled` printed for the unit: empty
+    or not-found once the unit is gone."""
+    problems = []
+    if present:
+        problems.append(f"still present: {', '.join(present)}")
+    state = enabled_state.strip()
+    if state not in ("", "not-found"):
+        problems.append(f"systemctl is-enabled {NFTABLES_FLUSH_UNIT} prints {state!r}")
+    return "reset left the nftables flush on the host: " + "; ".join(problems) if problems else ""
+
+
+def validate_nftables_flush_removed() -> None:
+    """Assert reset removed the nftables flush unit, its enablement and its
+    rules file."""
+    present = present_on_host(list(NFTABLES_FLUSH_ARTIFACTS))
+    state = ssh_capture_quiet(f"systemctl is-enabled {NFTABLES_FLUSH_UNIT}").stdout
+    problem = nftables_flush_leftover(present, state)
+    if problem:
+        die(problem)
+    log(f"Reset removed {NFTABLES_FLUSH_UNIT} and its rules file")
+
+
+def reset_agent_on_host() -> None:
+    """Run `unbounded-agent reset` on the host, as an operator does without the
+    control plane, and assert the node stack of the mode under test, the
+    agent's files, the nftables flush and any reprovision handoff are gone. The
+    Node object is removed separately, as reset only cleans up the host."""
+    log(f"Running unbounded-agent reset on the host ({isolation_mode()} mode)...")
+    ssh_cmd(f"sudo {DAEMON_BINARY} reset")
+    run_quiet([KUBECTL, "delete", "node", AGENT_MACHINE_NAME, "--ignore-not-found"], check=False)
+    wait_for_node_absent(AGENT_MACHINE_NAME)
+    validate_node_stack_removed()
+    validate_reset_cleanup()
+    validate_nftables_flush_removed()
+    validate_no_reprovision_handoff()
+    log(f"unbounded-agent reset left a clean host in {isolation_mode()} mode")
+
+
+def restore_deleted_node() -> None:
+    """Bring back a Node object that was deleted without a repave to follow: a
+    NodeReboot restarts the node stack, and the kubelet registers the Node
+    again."""
+    name = f"e2e-restore-node-{int(time.time())}"
+    run_quiet([KUBECTL, "delete", _machine_operation_resource(), name, "--ignore-not-found"], check=False)
+    create_machine_operation(name, AGENT_MACHINE_NAME, "NodeReboot")
+    wait_for_machine_operation_complete(name)
+    wait_for_node()
+
+
+def validate_same_mode_declaration() -> None:
+    """Assert that declaring the mode the node already runs moves nothing and
+    records no change, even across the repave a Node deletion triggers."""
+    mode = applied_isolation()
+    previous = isolation_change_view()
+    marker = isolation_node_marker()
+    declare_isolation_spec(mode)
+    validate_isolation_status()
+    kubectl(["delete", "node", AGENT_MACHINE_NAME])
+    # With no drift the repave decides there is nothing to do, and the kubelet of
+    # a running node does not create the deleted Node object again. Give the
+    # repave time to decide, then bring the Node back with a NodeReboot.
+    time.sleep(30)
+    restore_deleted_node()
+    if isolation_node_marker() != marker or applied_isolation() != mode:
+        die("declaring the applied mode changed the node stack")
+    if isolation_change_view() != previous:
+        die(f"declaring the applied mode recorded a change: {isolation_change_view()} (was {previous})")
+    validate_isolation_mode()
+    validate_isolation_status()
+    log(f"Declaring spec.isolation={mode} on a {mode} node moved nothing and recorded no change")
+
+
+# ---------------------------------------------------------------------------
+# isolation test plan steps (see designs/agent-isolation-modes-test-plan.md)
+# ---------------------------------------------------------------------------
+# The unbounded-agent preflight check that belongs to each mode.
+PREFLIGHT_MODE_CHECKS = {
+    "nspawn": "nspawn-runtime",
+    "none": "none-backend",
+}
+
+
+def _change_age_secs(change: dict[str, Any], now: float) -> float | None:
+    """Return how long ago the change last transitioned, or None if unknown."""
+    stamp = change.get("lastTransitionTime") or ""
+    try:
+        when = datetime.datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return now - when.timestamp()
+
+
+def isolation_drift_expectation(spec_isolation: str, observed: str,
+                                change: dict[str, Any] | None = None,
+                                now: float | None = None) -> tuple[str, str]:
+    """Return the IsolationDrift status and reason the machina controller sets
+    for a Machine spec, the mode the agent reported and its status.isolationChange.
+    An empty spec declares nothing. cmd/machina/machina/controller/isolation_conditions.go."""
+    if not spec_isolation:
+        return "False", "NoModeDeclared"
+    if spec_isolation == observed:
+        return "False", "AppliedModeMatches"
+    if change and change.get("targetMode") == spec_isolation:
+        if change.get("phase") == "Failed":
+            return "True", failed_change_reason(change)
+        if change.get("phase") == "InProgress":
+            age = _change_age_secs(change, time.time() if now is None else now)
+            if age is not None and age >= CHANGE_STALE_AFTER_SECS:
+                return "True", "ChangeStale"
+            return "True", "ChangeInProgress"
+    return "True", "AppliedModeDiffers"
+
+
+def machine_isolation_view() -> dict[str, Any]:
+    """Return the Machine's spec.isolation, status.isolation,
+    status.isolationChange and IsolationDrift condition."""
+    machine = json.loads(kubectl_capture(["get", "machine", AGENT_MACHINE_NAME, "-o", "json"]))
+    conditions = machine.get("status", {}).get("conditions", [])
+    return {
+        "spec": machine.get("spec", {}).get("isolation", ""),
+        "observed": machine.get("status", {}).get("isolation", ""),
+        "change": machine.get("status", {}).get("isolationChange") or {},
+        "drift": next((c for c in conditions if c.get("type") == "IsolationDrift"), None),
+    }
+
+
+def validate_isolation_status() -> None:
+    """Assert the daemon reported the applied mode in status.isolation
+    and the controller's IsolationDrift condition agrees with spec.isolation."""
+    mode = isolation_mode()
+    deadline = time.monotonic() + 180
+    problem = ""
+    while True:
+        view = machine_isolation_view()
+        problem = ""
+        if view["observed"] != mode:
+            problem = f"status.isolation is {view['observed']!r}, expected {mode!r}"
+        else:
+            want_status, want_reason = isolation_drift_expectation(view["spec"], view["observed"], view["change"])
+            drift = view["drift"]
+            if drift is None:
+                problem = "IsolationDrift condition is absent although the mode was reported"
+            elif drift.get("status") != want_status or drift.get("reason") != want_reason:
+                problem = (f"IsolationDrift is {drift.get('status')}/{drift.get('reason')}, "
+                           f"expected {want_status}/{want_reason}")
+        if not problem:
+            break
+        if time.monotonic() > deadline:
+            die(problem)
+        time.sleep(5)
+    log(f"Machine reports isolation={view['observed']} (spec.isolation={view['spec'] or '<unset>'}, "
+        f"IsolationDrift={view['drift'].get('status')}/{view['drift'].get('reason')})")
+
+
+def reconcile_machine_isolation_spec() -> None:
+    """Set the Machine's spec.isolation to the mode the node runs, as an operator
+    does to withdraw a change it declared, and assert IsolationDrift clears."""
+    mode = isolation_mode()
+    declare_isolation_spec(mode)
+    validate_isolation_status()
+    view = machine_isolation_view()
+    if view["spec"] != mode or (view["drift"] or {}).get("status") != "False":
+        die(f"IsolationDrift did not clear after spec.isolation={mode}: {view}")
+    log(f"IsolationDrift cleared with spec.isolation={mode}")
+
+
+def declare_isolation_mismatch() -> None:
+    """Declare a mode other than the applied one, as an operator who plans a
+    change does, and assert IsolationDrift turns True with AppliedModeDiffers
+    while nothing moves. It is the state between the edit and the next repave."""
+    applied = isolation_mode()
+    other = other_isolation_mode(applied)
+    marker = isolation_node_marker()
+    declare_isolation_spec(other)
+    validate_isolation_status()
+    view = machine_isolation_view()
+    drift = view["drift"] or {}
+    if view["spec"] != other or drift.get("status") != "True" or drift.get("reason") != "AppliedModeDiffers":
+        die(f"IsolationDrift did not turn True with spec.isolation={other} and {applied} applied: {view}")
+    if isolation_node_marker() != marker:
+        die("declaring a mode moved the node")
+    log(f"IsolationDrift is True with spec.isolation={other} and {applied} applied; nothing moved")
+
+
+def parse_preflight_report(text: str) -> dict[str, Any]:
+    """Parse `unbounded-agent preflight --output json`. Warnings the agent
+    prints before the JSON document are skipped."""
+    start = text.find("{")
+    if start < 0:
+        die(f"preflight produced no JSON document: {text[:200]!r}")
+    return json.loads(text[start:])
+
+
+def validate_isolation_preflight() -> None:
+    """Run the agent preflight on the installed host with --isolation set to the
+    mode under test.
+
+    On a host whose installation is complete and unchanged the command
+    short-circuits to an empty report (cmd preflight.go, AlreadyComplete): it
+    must still exit 0 and print a valid JSON document. The mode's own check
+    only runs before an install, so it is asserted against the report the
+    bootstrap saved, when that bootstrap ran in the mode under test. A report
+    that does carry checks is validated in full."""
+    mode = isolation_mode()
+    # The installed host keeps its configuration as the applied config of the
+    # running slot, not in a config file.
+    configs = applied_config_files()
+    if not configs:
+        die("no applied config found on the host to run preflight against")
+    result = ssh_capture_quiet(
+        f"sudo {DAEMON_BINARY} preflight --config {configs[0]} --isolation {mode} --output json"
+    )
+    if result.returncode != 0 and not result.stdout.strip():
+        die(f"preflight --isolation {mode} exited {result.returncode} with no report: "
+            f"stderr {result.stderr.strip()[-600:]!r}")
+    report = parse_preflight_report(result.stdout)
+    if not report.get("checks"):
+        log(f"Preflight on the installed {mode} host short-circuited to an empty report "
+            f"(installation already complete, exit {result.returncode})")
+        if result.returncode != 0:
+            die(f"preflight --isolation {mode} on an installed host exited {result.returncode}: "
+                f"{result.stderr.strip()[-600:]!r}")
+        assert_bootstrap_preflight_mode_check(mode)
+        return
+    check_isolation_preflight_report(mode, report)
+
+
+def assert_bootstrap_preflight_mode_check(mode: str) -> str:
+    """Assert the preflight report saved by the bootstrap ran the mode's own
+    check, when the bootstrap ran in the mode under test (a node that was
+    migrated here was bootstrapped in another mode, which says nothing).
+
+    Returns "" when the assertion ran, and otherwise the reason it was skipped,
+    which is also reported as a SKIPPED warning so a skipped check never reads
+    as a passed one."""
+    saved = VM_DIR / "unbounded-agent-preflight.json"
+    if not saved.exists():
+        reason = "no bootstrap preflight report was saved"
+        warn(f"SKIPPED the {mode} preflight mode check: {reason}")
+        return reason
+    report = parse_preflight_report(saved.read_text())
+    started_mode = os.environ.get("ISOLATION_MODE") or "nspawn"
+    if started_mode != mode:
+        reason = f"the bootstrap ran in {started_mode}, not {mode}, so its report says nothing about {mode}"
+        warn(f"SKIPPED the {mode} preflight mode check: {reason}")
+        return reason
+    check_isolation_preflight_report(mode, report)
+    return ""
+
+
+def check_isolation_preflight_report(mode: str, report: dict[str, Any]) -> None:
+    names = {check.get("name"): check for check in report.get("checks", [])}
+    want = PREFLIGHT_MODE_CHECKS[mode]
+    if want not in names:
+        die(f"preflight --isolation {mode} did not run the {want} check; ran {sorted(names)}")
+    for other_mode, other in PREFLIGHT_MODE_CHECKS.items():
+        if other_mode != mode and other in names:
+            die(f"preflight --isolation {mode} ran the {other} check of mode {other_mode}")
+    for name, check in sorted(names.items()):
+        log(f"preflight {name}: {check.get('severity')} {check.get('message', '')}")
+    mode_check = names[want]
+    if mode_check.get("severity") == "error":
+        die(f"{want} check failed on a running {mode} host: {mode_check.get('message')}")
+    log(f"Preflight ran the {want} check for {mode} (status {report.get('status')})")
+
+
+def collect_isolation_evidence() -> None:
+    """Print one JSON document describing the mode state of the VM and the
+    Machine, for the test plan report. Every query is best effort."""
+    evidence: dict[str, Any] = {"isolation_mode_under_test": isolation_mode()}
+
+    def attempt(name: str, fn: Callable[[], Any]) -> None:
+        try:
+            evidence[name] = fn()
+        except SystemExit:
+            evidence[name] = {"error": "query failed"}
+        except Exception as exc:  # noqa: BLE001 - evidence must never fail the run
+            evidence[name] = {"error": str(exc)}
+
+    def run_ssh(command: str) -> str:
+        result = ssh_capture_quiet(command)
+        return result.stdout.strip() if result.returncode == 0 else f"exit {result.returncode}"
+
+    attempt("machine", lambda: {k: v for k, v in machine_isolation_view().items()})
+    attempt("applied_isolation", lambda: [
+        {"file": f, "isolation": parse_applied_isolation(ssh_capture(f"sudo cat {f}"))}
+        for f in applied_config_files()])
+    attempt("node_stack_units", lambda: run_ssh(
+        "sudo systemctl list-units --no-legend --all "
+        "'unbounded-*.service' 'systemd-nspawn@*.service'"))
+    attempt("none_current_version", none_current_version)
+    attempt("machinectl", lambda: run_ssh("sudo machinectl list --no-legend"))
+    attempt("agent_daemon", lambda: run_ssh("sudo systemctl is-active unbounded-agent-daemon.service"))
+    attempt("agent_version", lambda: run_ssh(f"sudo {DAEMON_BINARY} version"))
+    attempt("host_boot_id", lambda: run_ssh("cat /proc/sys/kernel/random/boot_id"))
+    attempt("node", lambda: kubectl_capture(["get", "node", AGENT_MACHINE_NAME, "-o", "wide", "--no-headers"]).strip())
+    print("ISOLATION_EVIDENCE " + json.dumps(evidence, sort_keys=True), flush=True)
+
 
 # ---------------------------------------------------------------------------
 # collect-logs
@@ -6194,7 +7236,7 @@ def _collect_one_vm_logs(logs_dir: Path, vm_name: str, vm_ip: str, vm_dir: Path,
         ssh_log(f"vm-machine-{machine}-rootfs.txt", f"sudo ls -la /var/lib/machines/{machine} 2>&1 || true")
         ssh_log(
             f"nspawn-{machine}-units.txt",
-            f"sudo machinectl shell {machine} /usr/bin/systemctl list-units --no-pager",
+            machine_shell_command(machine, "systemctl list-units --no-pager"),
         )
 
 
@@ -6436,6 +7478,7 @@ def validate_host_reboot() -> None:
                 log("Host reboot and fresh workload/DNS passed without component repair")
                 return
         time.sleep(5)
+    dump_node_stack_diagnostics()
     die("node did not return Ready with a fresh boot identity after host reboot")
 
 
@@ -6509,6 +7552,78 @@ SUITES: dict[str, list[str]] = {
                   "validate-host-reboot", "validate-host-root", "reset-agent", "validate-host-staged-files"],
     "bootstrap-recovery": ["run-agent-recovery", "wait-for-node", "validate-workload",
                            "validate-node-repave-upgrade", "validate-bootstrap-repair"],
+    # The isolation test plan suites. Run with ISOLATION_MODE unset (nspawn by
+    # default, no --isolation flag), nspawn or none; the suite is the same for
+    # every mode. Every agent and host operation that applies to a node stack:
+    # join, status, preflight, exec/logs, soft reboot (NodeReboot), host-driven
+    # and operation-driven AgentUpgrade with rollback, repave, host reboot,
+    # AgentReset, reinstall on the same disk. In none, a configuration-only
+    # repave must also put every pod in the new Node's pod CIDR, and survive the
+    # daemon being killed in the middle of it.
+    "isolation-operations": [
+        "run-agent", "wait-for-node", "validate-isolation-mode", "validate-host-root",
+        "validate-controllers-healthy", "validate-node-config", "dump-persisted-agent-config",
+        "validate-kube-proxy", "validate-machine-cr-created", "validate-isolation-status",
+        "validate-isolation-preflight", "validate-isolation-exec-logs", "validate-workload",
+        "validate-isolation-soft-reboot", "validate-host-agent-upgrade", "validate-agent-upgrade-operation",
+        "validate-agent-upgrade-rollback", "validate-workload", "validate-node-repave-upgrade",
+        "validate-workload", "validate-none-repave-pod-cidr", "validate-none-repave-daemon-kill",
+        "validate-host-reboot", "validate-isolation-mode", "validate-isolation-status",
+        "reset-agent", "delete-machine-cr", "ensure-kind-bridge", "reinstall-agent", "wait-for-node",
+        "validate-isolation-mode", "validate-isolation-exec-logs", "validate-workload",
+    ],
+    # `unbounded-agent reset` run on the host, without the control plane,
+    # removes the node stack of the mode, the agent's files and any reprovision
+    # handoff. Run with ISOLATION_MODE unset, nspawn or none.
+    "isolation-reset": [
+        "run-agent", "wait-for-node", "validate-isolation-mode", "validate-workload",
+        "reset-agent-on-host",
+    ],
+    # The same reset on a node that reached its mode by a reprovision, which
+    # staged a handoff (a unit, a copy of the agent and a configuration with the
+    # bootstrap token): none of it may be left afterward.
+    "isolation-reset-after-reprovision": [
+        "run-agent", "wait-for-node", "validate-isolation-mode", "change-to-none",
+        "validate-no-reprovision-handoff", "reset-agent-on-host",
+    ],
+    # Every ordered pair of modes: nspawn -> none and none -> nspawn, both by
+    # reprovision with the allow-reprovision opt-in set. The strategy follows
+    # from the pair; each change asserts the one status.isolationChange
+    # records. Both stops also check that the changed node still behaves: a
+    # soft reboot, a host reboot, a workload and, in none, the preflight. A mode
+    # added to ISOLATION_MODES adds its pairs here.
+    "isolation-matrix": [
+        "run-agent", "wait-for-node", "validate-isolation-mode", "validate-workload",
+        "change-to-none", "validate-isolation-status", "validate-isolation-exec-logs",
+        "validate-isolation-soft-reboot", "validate-isolation-preflight", "validate-host-reboot",
+        "validate-workload", "validate-no-reprovision-handoff",
+        "change-to-nspawn", "validate-isolation-status", "validate-isolation-exec-logs",
+        "validate-isolation-soft-reboot", "validate-host-reboot", "validate-workload",
+        "validate-no-reprovision-handoff", "reset-agent",
+    ],
+    # The drift condition and the change status: an empty spec declares nothing
+    # (NoModeDeclared), a declared mode that is not applied shows
+    # AppliedModeDiffers while nothing moves, withdrawing it clears it, and a
+    # change refused for want of the reprovision opt-in shows ChangeRefused and
+    # is not retried. A change that succeeds ends at AppliedModeMatches;
+    # isolation-matrix asserts that after every change, so this suite makes
+    # none.
+    "isolation-drift": [
+        "run-agent", "wait-for-node", "validate-isolation-status", "declare-isolation-mismatch",
+        "reconcile-machine-isolation-spec", "validate-reprovision-refused", "validate-isolation-status",
+        "reset-agent",
+    ],
+    # A change that cannot go ahead leaves the node in its mode: declaring the
+    # applied mode moves nothing and records nothing, and a change that needs a
+    # reprovision is refused without the allow-reprovision opt-in while the
+    # repave still brings the node back in its applied mode, with no handoff
+    # staged and no retry. Run with ISOLATION_MODE unset, nspawn or none. The
+    # in-place rollback checks come with a mode that changes in place.
+    "isolation-rollback": [
+        "run-agent", "wait-for-node", "validate-isolation-mode", "validate-workload",
+        "validate-same-mode-declaration", "validate-reprovision-refused",
+        "validate-isolation-status", "reset-agent",
+    ],
 }
 
 
@@ -6587,6 +7702,8 @@ COMMANDS: dict[str, Command] = {
     "validate-agent-upgrade-from-legacy": _without_node_config(lambda: validate_agent_upgrade_operation(in_place=False)),
     "validate-agent-upgrade-rollback": _without_node_config(validate_agent_upgrade_rollback),
     "validate-node-repave-upgrade": validate_node_repave_upgrade,
+    "validate-none-repave-pod-cidr": validate_none_repave_pod_cidr,
+    "validate-none-repave-daemon-kill": validate_none_repave_survives_daemon_kill,
     "validate-node-configs": _without_node_config(validate_node_config_scenarios),
     "reset-agent": _without_node_config(reset_agent),
     "validate-host-root": _without_node_config(validate_host_root),
@@ -6596,8 +7713,48 @@ COMMANDS: dict[str, Command] = {
     "validate-host-staged-files": _without_node_config(validate_host_staged_files),
     "run-legacy-agent": run_legacy_agent,
     "validate-agent-downgrade-to-legacy": _without_node_config(validate_agent_downgrade_to_legacy),
+    "validate-isolation-mode": _without_node_config(validate_isolation_mode),
+    "validate-isolation-exec-logs": _without_node_config(validate_isolation_exec_logs),
+    "validate-isolation-soft-reboot": _without_node_config(validate_isolation_soft_reboot),
+    **{f"change-to-{mode}": (lambda nc, mode=mode: change_isolation_mode(nc, mode)) for mode in ISOLATION_MODES},
+    "validate-same-mode-declaration": _without_node_config(validate_same_mode_declaration),
+    "validate-reprovision-refused": _without_node_config(validate_reprovision_refused),
+    "validate-no-reprovision-handoff": _without_node_config(validate_no_reprovision_handoff),
+    "reset-agent-on-host": _without_node_config(reset_agent_on_host),
+    "validate-isolation-status": _without_node_config(validate_isolation_status),
+    "reconcile-machine-isolation-spec": _without_node_config(reconcile_machine_isolation_spec),
+    "declare-isolation-mismatch": _without_node_config(declare_isolation_mismatch),
+    "validate-isolation-preflight": _without_node_config(validate_isolation_preflight),
+    "collect-isolation-evidence": _without_node_config(collect_isolation_evidence),
     "cleanup": _without_node_config(cleanup),
 }
+
+
+# Commands that can run before the Kind cluster exists or after it is gone. They
+# still get KUBECONFIG pointed at the cluster's own file, so nothing they start
+# can reach another cluster; they just do not fail when kind has no cluster.
+CLUSTER_OPTIONAL_COMMANDS = frozenset({
+    "list-suite", "resolve-host-image", "create-vm", "create-vm-bridge", "cleanup",
+    "collect-logs", "collect-isolation-evidence",
+})
+
+
+def pin_kubeconfig(command: str) -> None:
+    """Pin every kubeconfig reader to the Kind cluster, or stop.
+
+    The harness never uses the user's default kubeconfig: its current-context
+    can change under a running suite and send the suite's secrets and Machines
+    to whatever cluster it then names.
+    """
+    required = command not in CLUSTER_OPTIONAL_COMMANDS
+    try:
+        path = kind_kubeconfig.pin(REPO_ROOT, KIND_CLUSTER_NAME, required=required)
+    except kind_kubeconfig.KubeconfigError as exc:
+        die(f"refusing to run {command}: {exc}")
+    if path is not None and VERBOSE:
+        # stderr: list-suite's stdout is parsed.
+        print(f"[INFO]  Using kubeconfig {path} (context {kind_kubeconfig.kind_context(KIND_CLUSTER_NAME)})",
+              file=sys.stderr, flush=True)
 
 
 def main() -> None:
@@ -6635,6 +7792,7 @@ def main() -> None:
     parser.add_argument("--suite", choices=sorted(SUITES), default=None)
     args = parser.parse_args()
     VERBOSE = args.verbose
+    pin_kubeconfig(args.command)
     node_config = load_node_config(
         args.node_config,
         offline_artifacts_oci_ref_override=args.offline_artifacts_oci_ref,
