@@ -74,3 +74,33 @@ func TestManifestByTag(t *testing.T) {
 		t.Fatal("want digest mismatch error")
 	}
 }
+
+func TestManifestByTagPreservesEndpointQuery(t *testing.T) {
+	body := []byte(`{"schemaVersion":2}`)
+	sum := sha256.Sum256(body)
+	want := "sha256:" + hex.EncodeToString(sum[:])
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v2/library/app/manifests/v1" || r.URL.RawQuery != "token=abc&ns=x" {
+			http.NotFound(w, r)
+
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+		w.Header().Set("Docker-Content-Digest", want)
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	c := newClient(t, config.UpstreamRegistry{Name: "reg", Endpoint: srv.URL + "?token=abc&ns=x"})
+
+	_, _, d, err := c.ManifestByTag(context.Background(), "reg", "library/app", "v1")
+	if err != nil {
+		t.Fatalf("ManifestByTag: %v", err)
+	}
+
+	if d.String() != want {
+		t.Fatalf("digest = %s, want %s", d, want)
+	}
+}

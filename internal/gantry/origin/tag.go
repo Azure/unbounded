@@ -44,9 +44,9 @@ func (c *Client) ManifestByTag(ctx context.Context, registryName, repo, tag stri
 		return nil, "", digest.Digest{}, &ifaces.OriginError{Ref: ref, Class: ifaces.FailureNotFound, Err: fmt.Errorf("unknown registry %q", registryName)}
 	}
 
-	u := r.urlWithPath("/v2/" + repo + "/manifests/" + url.PathEscape(tag))
+	u := r.resourceURL("/v2/" + repo + "/manifests/" + url.PathEscape(tag))
 
-	resp, err := r.doRange(ctx, http.MethodGet, u.String(), "")
+	resp, err := r.doRange(ctx, http.MethodGet, u, "")
 	if err != nil {
 		return nil, "", digest.Digest{}, &ifaces.OriginError{Ref: ref, Class: classOf(err), StatusCode: statusOf(err), Err: err}
 	}

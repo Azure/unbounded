@@ -1163,7 +1163,13 @@ func (r *registry) urlFor(ref ifaces.OriginRef) string {
 		resource = "manifests"
 	}
 
-	u := r.urlWithPath("/v2/" + ref.Repository + "/" + resource + "/" + ref.Digest.String())
+	return r.resourceURL("/v2/" + ref.Repository + "/" + resource + "/" + ref.Digest.String())
+}
+
+// resourceURL returns the full URL for a registry resource path, preserving
+// any query string configured on the endpoint.
+func (r *registry) resourceURL(path string) string {
+	u := r.urlWithPath(path)
 	u.RawQuery = r.base.RawQuery
 	u.ForceQuery = r.base.ForceQuery
 
