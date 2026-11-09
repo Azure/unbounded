@@ -105,8 +105,8 @@ impl UnitState {
 
 /// Credentials belong to tickets, not units: a fill uses the credential of the
 /// highest-priority interested ticket whose credential this unit has not seen
-/// rejected, so a ticket is never served with another ticket's credential
-/// unless that ticket is the one being filled for. An origin refusal fails
+/// rejected. Success counts for every interested ticket, so a ticket may see
+/// a unit filled with another ticket's credential. An origin refusal fails
 /// only the tickets holding the refused credential; the unit is retried with
 /// the next distinct credential among the remaining tickets, each distinct
 /// credential at most once.

@@ -339,9 +339,11 @@ A unit is shared by every ticket that wants it, but a credential belongs to the
 ticket that supplied it:
 
 - A fill of a unit uses the credential of the highest-priority live ticket
-  interested in it (ties broken by ticket key). A ticket without
-  `Authorization` is filled without a credential; it is never filled using
-  another ticket's token.
+  interested in it (ties broken by ticket key), and its success counts for
+  every interested ticket. So a ticket without `Authorization`, or with a
+  different token, can see a unit filled with another ticket's credential and
+  report it as fetched, which tells it that the version is readable and
+  resident.
 - A batch carries one credential: units whose chosen credential differs from
   the batch's first unit wait for a later batch.
 - When the origin refuses a fill (`forbidden`), the refs of every ticket
