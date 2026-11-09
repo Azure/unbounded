@@ -296,50 +296,60 @@ pub struct TrustPlan {
     /// Trust to install before the endpoints change: the current trust plus
     /// every desired CA, in current order.
     pub before: Vec<Vec<u8>>,
-    /// Trust to keep after the endpoints changed: desired CAs and CAs still
-    /// within their grace.
-    pub after: Vec<Vec<u8>>,
+    /// CAs the endpoints are about to use.
+    pub desired: Vec<Vec<u8>>,
 }
 
-/// Order webhook trust around an endpoint change. `retired` maps CAs that
-/// left the endpoints to when they left; it is updated in place. A CA stays
-/// trusted for `grace` after it left, and at most `max_retired` retired CAs
-/// are kept (the oldest go first).
-pub fn webhook_trust(
-    current: &[Vec<u8>],
-    desired: &[Vec<u8>],
-    retired: &mut BTreeMap<Vec<u8>, Instant>,
-    now: Instant,
-    grace: Duration,
-    max_retired: usize,
-) -> TrustPlan {
+/// Plan webhook trust around an endpoint change. Pure: nothing is retired
+/// until [`TrustPlan::retire_after`] is called once the endpoints moved.
+pub fn webhook_trust(current: &[Vec<u8>], desired: &[Vec<u8>]) -> TrustPlan {
     let mut before = current.to_vec();
     for d in desired {
         if !before.contains(d) {
             before.push(d.clone());
         }
     }
-    retired.retain(|ca, _| !desired.contains(ca) && before.contains(ca));
-    for ca in before.iter().filter(|c| !desired.contains(c)) {
-        retired.entry(ca.clone()).or_insert(now);
+    TrustPlan {
+        before,
+        desired: desired.to_vec(),
     }
-    retired.retain(|_, at| now.saturating_duration_since(*at) < grace);
-    while retired.len() > max_retired {
-        let oldest = retired
-            .iter()
-            .min_by_key(|(_, at)| **at)
-            .map(|(k, _)| k.clone());
-        if let Some(k) = oldest {
-            retired.remove(&k);
+}
+
+impl TrustPlan {
+    /// Commit the endpoint change at `now` and return the trust to keep
+    /// after it: desired CAs and CAs still within their grace. Call only once
+    /// the endpoints are known to match `desired`, so a CA's grace starts
+    /// when it actually left the endpoints. `retired` maps CAs that left to
+    /// when they left; at most `max_retired` are kept (the oldest go first).
+    pub fn retire_after(
+        &self,
+        retired: &mut BTreeMap<Vec<u8>, Instant>,
+        now: Instant,
+        grace: Duration,
+        max_retired: usize,
+    ) -> Vec<Vec<u8>> {
+        let (before, desired) = (&self.before, &self.desired);
+        retired.retain(|ca, _| !desired.contains(ca) && before.contains(ca));
+        for ca in before.iter().filter(|c| !desired.contains(c)) {
+            retired.entry(ca.clone()).or_insert(now);
         }
+        retired.retain(|_, at| now.saturating_duration_since(*at) < grace);
+        while retired.len() > max_retired {
+            let oldest = retired
+                .iter()
+                .min_by_key(|(_, at)| **at)
+                .map(|(k, _)| k.clone());
+            if let Some(k) = oldest {
+                retired.remove(&k);
+            }
+        }
+        // Keep current order so an unchanged set is not rewritten.
+        before
+            .iter()
+            .filter(|c| desired.contains(c) || retired.contains_key(*c))
+            .cloned()
+            .collect()
     }
-    // Keep current order so an unchanged set is not rewritten.
-    let after = before
-        .iter()
-        .filter(|c| desired.contains(c) || retired.contains_key(*c))
-        .cloned()
-        .collect();
-    TrustPlan { before, after }
 }
 
 /// Seat replica acceptance: a record is accepted only when it does not go
@@ -640,6 +650,27 @@ mod tests {
         assert_eq!(Shell::next_renewal(t), t + limits::LEASE_RENEW);
     }
 
+    struct Planned {
+        before: Vec<Vec<u8>>,
+        after: Vec<Vec<u8>>,
+    }
+
+    fn plan(
+        current: &[Vec<u8>],
+        desired: &[Vec<u8>],
+        retired: &mut BTreeMap<Vec<u8>, Instant>,
+        now: Instant,
+        grace: Duration,
+        max: usize,
+    ) -> Planned {
+        let p = webhook_trust(current, desired);
+        let after = p.retire_after(retired, now, grace, max);
+        Planned {
+            before: p.before,
+            after,
+        }
+    }
+
     #[test]
     fn trust_is_added_before_endpoints_and_removed_after() {
         let t = Instant::now();
@@ -647,7 +678,7 @@ mod tests {
         let (a, b) = (vec![1u8], vec![2u8]);
         let mut retired = BTreeMap::new();
         // B joins: trusted before its endpoint is published.
-        let p = webhook_trust(
+        let p = plan(
             std::slice::from_ref(&a),
             &[a.clone(), b.clone()],
             &mut retired,
@@ -658,7 +689,7 @@ mod tests {
         assert_eq!(p.before, vec![a.clone(), b.clone()]);
         assert_eq!(p.after, vec![a.clone(), b.clone()]);
         // A leaves: still trusted after the endpoint change, within grace.
-        let p = webhook_trust(
+        let p = plan(
             &p.after,
             std::slice::from_ref(&b),
             &mut retired,
@@ -668,7 +699,7 @@ mod tests {
         );
         assert_eq!(p.before, vec![a.clone(), b.clone()]);
         assert_eq!(p.after, vec![a.clone(), b.clone()]);
-        let p = webhook_trust(
+        let p = plan(
             &p.after,
             std::slice::from_ref(&b),
             &mut retired,
@@ -678,7 +709,7 @@ mod tests {
         );
         assert!(p.after.contains(&a));
         // Removed only after the grace.
-        let p = webhook_trust(
+        let p = plan(
             &p.after,
             std::slice::from_ref(&b),
             &mut retired,
@@ -694,7 +725,7 @@ mod tests {
         for (i, ca) in all.iter().enumerate() {
             retired.insert(ca.clone(), t + Duration::from_secs(i as u64));
         }
-        let p = webhook_trust(
+        let p = plan(
             &all,
             &[],
             &mut retired,

@@ -923,15 +923,10 @@ pub async fn reconcile_webhook(
         .map(|b| parse_pem(&b))
         .unwrap_or_default();
     let desired: Vec<Vec<u8>> = seats.iter().map(|s| s.ca.clone()).collect();
-    let trust = shell::webhook_trust(
-        &current,
-        &desired,
-        &mut retired.borrow_mut(),
-        now,
-        WEBHOOK_TRUST_GRACE,
-        annotations::MAX_SEATS,
-    );
-    let union = trust.before;
+    // Pure planning: the grace of a leaving CA starts only once the
+    // endpoints actually moved (see `retire_after` below).
+    let trust = shell::webhook_trust(&current, &desired);
+    let union = trust.before.clone();
     if !fresh() {
         return Ok(());
     }
@@ -970,7 +965,13 @@ pub async fn reconcile_webhook(
         Err(KubeError::NotFound) => {}
         Err(e) => return Err(e),
     }
-    let target = trust.after;
+    // The endpoints now match `desired` (written, unchanged, or no slice).
+    let target = trust.retire_after(
+        &mut retired.borrow_mut(),
+        now,
+        WEBHOOK_TRUST_GRACE,
+        annotations::MAX_SEATS,
+    );
     if union != target && fresh() {
         patch_ca_bundle(shared, &mwc, &target).await?;
     }
@@ -1074,6 +1075,63 @@ mod tests {
                 .await
                 .unwrap();
             assert!(api.requests()[start..].iter().all(|(m, _)| m == "GET"));
+        });
+    }
+
+    #[test]
+    fn webhook_grace_starts_after_endpoints_move() {
+        // The endpoint update keeps failing for longer than the grace. The
+        // old CA must still be trusted right after it finally lands.
+        crate::kube::fake::run(|api, kube| async move {
+            let shared = crate::shared::tests::shared(kube);
+            let mwc = paths::webhook_configuration();
+            let slice = paths::endpoint_slice(&shared.config.namespace);
+            api.put_object(&mwc, json!({"metadata":{"name":"racer-object-sidecar-injector"},"webhooks":[{"name":"a.racer","clientConfig":{"service":{"name":"racer-webhook"}}}]}));
+            api.put_object(&slice, json!({"metadata":{"name":"racer-webhook"},"addressType":"IPv4","ports":[{"port":9443}],"endpoints":[]}));
+            let seat = |n: u8, ip: &str| WebhookSeat {
+                pod: format!("racer-{n}"),
+                uid: format!("u{n}"),
+                ips: vec![ip.parse().unwrap()],
+                ca: crate::rules::keyring::tests::root(n.into()),
+            };
+            let (a, b) = (seat(1, "10.0.0.1"), seat(2, "10.0.0.2"));
+            let retired = RetiredTrust::default();
+            let t0 = crate::rt::now();
+            let yes = || true;
+            reconcile_webhook(&shared, std::slice::from_ref(&a), &retired, t0, &yes)
+                .await
+                .unwrap();
+            // Replace a with b, but the first write fails.
+            api.fail_next_write(500);
+            assert!(
+                reconcile_webhook(&shared, std::slice::from_ref(&b), &retired, t0, &yes)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                api.object(&slice).unwrap()["endpoints"][0]["targetRef"]["name"],
+                "racer-1"
+            );
+            let later = t0 + WEBHOOK_TRUST_GRACE + Duration::from_secs(10);
+            reconcile_webhook(&shared, std::slice::from_ref(&b), &retired, later, &yes)
+                .await
+                .unwrap();
+            assert_eq!(
+                api.object(&slice).unwrap()["endpoints"][0]["targetRef"]["name"],
+                "racer-2"
+            );
+            let v = api.object(&mwc).unwrap();
+            let bundle = parse_pem(
+                &STANDARD
+                    .decode(
+                        v["webhooks"][0]["clientConfig"]["caBundle"]
+                            .as_str()
+                            .unwrap(),
+                    )
+                    .unwrap(),
+            );
+            assert!(bundle.contains(&a.ca), "old CA kept for the grace");
+            assert!(bundle.contains(&b.ca));
         });
     }
 
