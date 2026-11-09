@@ -161,4 +161,10 @@ func TestLocalDNSNetworkNodeOrdersOnlyAnNSpawnMachine(t *testing.T) {
 	noneNode, err := localDNSNetworkNode(discardLogger(), &ActiveMachine{Name: "kube1", Config: cfg, Mode: isolation.ModeNone})
 	require.NoError(t, err)
 	require.False(t, noneNode.NSpawnMachine(), "a none node gets no systemd-nspawn@ drop-in")
+
+	containerNode, err := localDNSNetworkNode(discardLogger(), containerActive("kube2"))
+	require.NoError(t, err)
+	require.False(t, containerNode.NSpawnMachine(), "a container node gets no systemd-nspawn@ drop-in")
+	require.False(t, containerNode.HostNative(), "it keeps its own root")
+	require.Equal(t, "kube2", containerNode.Root().Slot())
 }

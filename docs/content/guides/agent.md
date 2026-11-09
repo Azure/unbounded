@@ -31,8 +31,9 @@ in sequence:
 This describes the default `nspawn` [isolation mode]({{< relref "reference/agent/isolation" >}}).
 The agent always runs on the host, and the isolation mode decides only where the
 node stack runs, so phases 2 and 3 differ by mode. The mode pages describe how
-each one bootstraps: [nspawn]({{< relref "reference/agent/nspawn" >}}) and
-[none]({{< relref "reference/agent/isolation-none" >}}). To choose and
+each one bootstraps: [nspawn]({{< relref "reference/agent/nspawn" >}}),
+[none]({{< relref "reference/agent/isolation-none" >}}) and
+[container]({{< relref "reference/agent/isolation-container" >}}) (experimental). To choose and
 select one, see [Isolation Modes]({{< relref "reference/agent/isolation" >}}).
 
 ## Retrying bootstrap and repairing the daemon

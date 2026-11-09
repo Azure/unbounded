@@ -95,7 +95,7 @@ func (e *migrationEnv) newInPlaceMigration(
 		// The files both stacks write at the same host paths, such as the kubelet
 		// identity. A rollback restarts the source, which needs them as they were.
 		SnapshotConfig: func(context.Context) error {
-			return confsnap.Take(e.snapshotDir(), e.ConfigRoot, e.configPaths())
+			return confsnap.Take(e.snapshotDir(), e.ConfigRoot, e.configPaths(j.From, j.To))
 		},
 		RestoreConfig: func(context.Context) error {
 			err := confsnap.Restore(e.snapshotDir(), e.ConfigRoot)
@@ -135,7 +135,10 @@ func (e *migrationEnv) newInPlaceMigration(
 			return e.waitReady(ctx, log, j.To, j.TargetSlot)
 		},
 		RemoveSourceConfig: func(ctx context.Context) error { return e.removeConfig(ctx, log, j.From, j.SourceSlot) },
-		Record:             m.record,
+		// The bootstrap of the target mode installs a flush unit and apt
+		// guards of its own; the source mode's would otherwise stay.
+		PrepareHost: func(ctx context.Context) error { return e.prepareHost(ctx, log, j.To) },
+		Record:      m.record,
 	}
 
 	return m, nil

@@ -15,11 +15,13 @@ import (
 func TestSupportsIsolation(t *testing.T) {
 	t.Parallel()
 
-	for _, mode := range []string{"nspawn", "none"} {
+	// container is operable by this agent; whether a host may run it is the
+	// experimental opt-in in its configuration, not a property of the binary.
+	for _, mode := range []string{"nspawn", "none", "container"} {
 		require.NoError(t, supportsIsolation(mode), mode)
 	}
 
-	for _, mode := range []string{"", "container", "microvm", "None"} {
+	for _, mode := range []string{"", "microvm", "None"} {
 		require.Error(t, supportsIsolation(mode), mode)
 	}
 }
@@ -37,7 +39,8 @@ func TestSupportsIsolationCommand(t *testing.T) {
 	}
 
 	require.NoError(t, run("none"))
-	require.Error(t, run("container"))
+	require.NoError(t, run("container"))
+	require.Error(t, run("microvm"))
 	require.Error(t, run(), "a mode is required")
 	require.Error(t, run("none", "nspawn"))
 

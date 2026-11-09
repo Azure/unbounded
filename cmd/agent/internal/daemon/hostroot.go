@@ -19,6 +19,7 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/agentbinary"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/isolation"
+	"github.com/Azure/unbounded/pkg/agent/isolation/container"
 	"github.com/Azure/unbounded/pkg/agent/isolation/none"
 	"github.com/Azure/unbounded/pkg/agent/phases/nodestart"
 )
@@ -140,17 +141,28 @@ func verifyMovedDaemon(ctx context.Context, root string) error {
 }
 
 // localDNSNetworkNode is the node start goal state the LocalDNS network files
-// of the active node are written from. A host-native node has no nspawn machine
-// to order after the network unit (its own units do that), so it gets no
-// machine drop-in.
+// of the active node are written from. A host-native or container node has no
+// nspawn machine to order after the network unit (its own units do that), so it
+// gets no machine drop-in.
 func localDNSNetworkNode(log *slog.Logger, active *ActiveMachine) (*goalstates.NodeStart, error) {
 	gs, err := goalstates.ResolveMachine(log, active.Config, active.Name, nil)
 	if err != nil {
 		return nil, fmt.Errorf("resolve machine goal state: %w", err)
 	}
 
-	if activeModeOf(active) == isolation.ModeNone {
+	switch activeModeOf(active) {
+	case isolation.ModeNone:
 		gs.NodeStart.RootOverride = none.Root{}
+	case isolation.ModeContainer:
+		// The container's supervising unit orders itself after the network
+		// unit, so it gets no machine drop-in either.
+		root, err := container.NewDefault(log).NodeRoot(active.Name)
+		if err != nil {
+			return nil, err
+		}
+
+		gs.NodeStart.RootOverride = root
+		gs.NodeStart.InContainer = true
 	}
 
 	return gs.NodeStart, nil

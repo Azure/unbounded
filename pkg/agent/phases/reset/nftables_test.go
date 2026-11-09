@@ -4,11 +4,13 @@
 package reset
 
 import (
+	"bytes"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
 	"testing"
+	"text/template"
 
 	"github.com/stretchr/testify/require"
 
@@ -86,4 +88,42 @@ func TestRemoveNFTablesFlushKeepsTheUnitWhenDisableFails(t *testing.T) {
 
 	require.Error(t, task.Do(t.Context()))
 	require.FileExists(t, unitPath)
+}
+
+// The none and container modes install the node variant of the unit, wanted by
+// multi-user.target, so it runs at every boot. Reset disables it, which removes
+// its multi-user.target.wants link, and deletes the file. The variant is
+// rendered from the template bootstrap uses (host.ConfigureNFTablesFor) with
+// the container mode's units; the host package imports this one, so the
+// template is read from disk rather than through it.
+func TestRemoveNFTablesFlushRemovesTheContainerVariant(t *testing.T) {
+	calls := stubSystemctl(t, 0)
+	task, unitPath := flushTask(t)
+
+	tmplText, err := os.ReadFile(filepath.Join("..", "host", "assets", "nftables-flush-node.service"))
+	require.NoError(t, err)
+
+	var unit bytes.Buffer
+
+	require.NoError(t, template.Must(template.New("unit").Parse(string(tmplText))).Execute(&unit, map[string]string{
+		"NFTablesClearPath": task.clearPath,
+		"Before":            "unbounded-node-kube1.service unbounded-node-kube2.service",
+	}))
+	require.Contains(t, unit.String(), "WantedBy=multi-user.target")
+
+	// As `systemctl enable` leaves it.
+	wants := filepath.Join(task.unitDir, "multi-user.target.wants")
+	require.NoError(t, os.MkdirAll(wants, 0o755))
+	require.NoError(t, os.WriteFile(unitPath, unit.Bytes(), 0o644))
+	require.NoError(t, os.Symlink(unitPath, filepath.Join(wants, goalstates.NFTablesFlushUnit)))
+	require.NoError(t, os.WriteFile(task.clearPath, []byte("flush ruleset\n"), 0o600))
+
+	require.NoError(t, task.Do(t.Context()))
+	require.NoFileExists(t, unitPath)
+	require.NoFileExists(t, task.clearPath)
+
+	recorded, err := os.ReadFile(calls)
+	require.NoError(t, err)
+	require.Equal(t, "disable "+goalstates.NFTablesFlushUnit+"\n", string(recorded),
+		"disable is what removes the multi-user.target.wants link")
 }

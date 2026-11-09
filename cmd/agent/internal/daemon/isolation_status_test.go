@@ -346,7 +346,9 @@ func Test_decodeActiveMachine_Mode(t *testing.T) {
 		return data
 	}
 
-	for value, want := range map[string]isolation.Mode{"": isolation.ModeNSpawn, "nspawn": isolation.ModeNSpawn, "none": isolation.ModeNone} {
+	for value, want := range map[string]isolation.Mode{
+		"": isolation.ModeNSpawn, "nspawn": isolation.ModeNSpawn, "none": isolation.ModeNone, "container": isolation.ModeContainer,
+	} {
 		active, err := decodeActiveMachine(discardLogger(), "kube1", "/applied.json", encode(value))
 		require.NoError(t, err, value)
 		assert.Equal(t, want, active.Mode, value)
@@ -355,7 +357,7 @@ func Test_decodeActiveMachine_Mode(t *testing.T) {
 
 	// A mode this agent cannot operate fails closed rather than being treated
 	// as nspawn.
-	for _, value := range []string{"container", "microvm"} {
+	for _, value := range []string{"microvm"} {
 		_, err := decodeActiveMachine(discardLogger(), "kube1", "/applied.json", encode(value))
 		require.ErrorContains(t, err, "unsupported isolation mode", value)
 	}
@@ -398,7 +400,8 @@ func repaveFixture(t *testing.T, spec api.IsolationMode, version string) (*repav
 func TestReconcileRepave_RefusesAModeChangeAndRepavesInTheCurrentMode(t *testing.T) {
 	for target, want := range map[string]struct{ reason, msg string }{
 		"none":      {api.IsolationChangeReasonReprovisionNotAllowed, api.AnnotationAllowReprovision},
-		"container": {api.IsolationChangeReasonUnsupportedMode, "cannot run isolation \"container\""},
+		"container": {api.IsolationChangeReasonExperimentalNotEnabled, "Experimental.ContainerIsolation"},
+		"microvm":   {api.IsolationChangeReasonUnsupportedMode, "cannot run isolation \"microvm\""},
 	} {
 		t.Run(target, func(t *testing.T) {
 			r, op, c := repaveFixture(t, api.IsolationMode(target), "1.34.9")

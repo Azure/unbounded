@@ -259,7 +259,8 @@ func prepareHostCalls(t *testing.T, file, planType string) []string {
 
 // The nspawn plan hardens APT against machined restarts, a step that exists
 // only for the machine. The none plan has no machine: it does not harden, and
-// it removes the guards first boot wrote for every mode.
+// it removes the guards first boot wrote for every mode. Neither has the
+// container plan.
 func TestOnlyTheNSpawnPlanHardensAPT(t *testing.T) {
 	t.Parallel()
 
@@ -272,4 +273,13 @@ func TestOnlyTheNSpawnPlanHardensAPT(t *testing.T) {
 	require.Contains(t, calls, "RemoveAPTHardening")
 	require.NotContains(t, calls, "DisableContainerd", "EnsureHostClean refused a host with one")
 	require.NotContains(t, calls, "DisableKubelet", "EnsureHostClean refused a host with one")
+
+	// The container plan has no machine either. It still disables the distro
+	// containerd and kubelet, which would own the sockets the container shares
+	// with the host.
+	calls = prepareHostCalls(t, "stageplan_container.go", "containerPlan")
+	require.NotContains(t, calls, "HardenAPT", "the container plan has no machined to harden against")
+	require.Contains(t, calls, "RemoveAPTHardening")
+	require.Contains(t, calls, "DisableContainerd")
+	require.Contains(t, calls, "DisableKubelet")
 }

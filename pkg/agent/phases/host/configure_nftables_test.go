@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/Azure/unbounded/pkg/agent/isolation"
+	"github.com/Azure/unbounded/pkg/agent/isolation/container"
 	"github.com/Azure/unbounded/pkg/agent/isolation/none"
 )
 
@@ -152,6 +153,7 @@ func TestConfigureNFTablesForHostModesOrdersTheFlushBeforeTheNodeUnits(t *testin
 		units []string
 	}{
 		{isolation.ModeNone, []string{none.UnitContainerd, none.UnitKubelet}},
+		{isolation.ModeContainer, []string{container.UnitName("kube1"), container.UnitName("kube2")}},
 	}
 
 	for _, tt := range tests {
@@ -175,7 +177,7 @@ func TestConfigureNFTablesForHostModesOrdersTheFlushBeforeTheNodeUnits(t *testin
 // systemd-container, which is what failed the none bootstrap. They look at the
 // node units instead, and no units active means a fresh host that may flush.
 func TestConfigureNFTablesForHostModesDoesNotNeedMachinectl(t *testing.T) {
-	for _, mode := range []isolation.Mode{isolation.ModeNone} {
+	for _, mode := range []isolation.Mode{isolation.ModeNone, isolation.ModeContainer} {
 		c, ok := ConfigureNFTablesFor(slog.New(slog.DiscardHandler), mode).(*configureNFTables)
 		require.True(t, ok)
 

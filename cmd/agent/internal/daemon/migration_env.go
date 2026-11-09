@@ -23,6 +23,8 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/isolation"
 	"github.com/Azure/unbounded/pkg/agent/isolation/migrate"
 	"github.com/Azure/unbounded/pkg/agent/isolation/nspawn"
+	"github.com/Azure/unbounded/pkg/agent/phases"
+	"github.com/Azure/unbounded/pkg/agent/phases/host"
 	"github.com/Azure/unbounded/pkg/agent/phases/nodestart"
 	"github.com/Azure/unbounded/pkg/agent/phases/reset"
 	"github.com/Azure/unbounded/pkg/agent/phases/rootfs"
@@ -126,6 +128,9 @@ type migrationEnv struct {
 	ReadConfig func(log *slog.Logger, mode isolation.Mode, slot string) (*ActiveMachine, error)
 	// WaitReady waits for the node stack of slot in mode to be up on the host.
 	WaitReady func(ctx context.Context, log *slog.Logger, mode isolation.Mode, slot string) error
+	// PrepareHost applies the host preparation a bootstrap in mode would have
+	// (see prepareHostFor), once an in-place change to mode is up.
+	PrepareHost func(ctx context.Context, log *slog.Logger, mode isolation.Mode) error
 	// Preflight checks the target mode's host requirements for a change by
 	// strategy, without changing anything.
 	Preflight func(ctx context.Context, log *slog.Logger, mode isolation.Mode, strategy migrate.Strategy) error
@@ -189,12 +194,14 @@ func (e *migrationEnv) snapshotDir() string {
 	return filepath.Join(e.configDir(), inPlaceConfigSnapshotName)
 }
 
-func (e *migrationEnv) configPaths() []string {
+// configPaths are the host files saved before a change between the modes, so
+// a rollback can put back whatever either node stack writes in place.
+func (e *migrationEnv) configPaths(modes ...isolation.Mode) []string {
 	if e.ConfigPaths != nil {
 		return e.ConfigPaths()
 	}
 
-	return confsnap.SharedPaths()
+	return confsnap.PathsFor(modes...)
 }
 
 func (e *migrationEnv) attestPath() string {
@@ -213,6 +220,8 @@ func (e *migrationEnv) newBackend(log *slog.Logger, ep migrationEndpoint) (isola
 	switch ep.Mode {
 	case isolation.ModeNSpawn:
 		return nspawnops.Backend(nspawnops.Params{Log: log, Config: ep.Config, Downloads: ep.Downloads}), nspawn.Root(ep.Slot), nil
+	case isolation.ModeContainer:
+		return newContainerMigrationEndpoint(log, ep)
 	default:
 		return nil, nil, fmt.Errorf("in-place migration is not supported for isolation mode %q", ep.Mode)
 	}
@@ -274,12 +283,42 @@ func (e *migrationEnv) waitReady(ctx context.Context, log *slog.Logger, mode iso
 	}
 
 	// The readiness check a repave uses: the kubelet is active and has its
-	// credentials.
+	// credentials. A container waits for it inside Activate.
 	if mode != isolation.ModeNSpawn {
 		return nil
 	}
 
 	return nodestart.WaitForKubelet(log, slot).Do(ctx)
+}
+
+func (e *migrationEnv) prepareHost(ctx context.Context, log *slog.Logger, mode isolation.Mode) error {
+	if e.PrepareHost != nil {
+		return e.PrepareHost(ctx, log, mode)
+	}
+
+	task, err := prepareHostFor(log, mode)
+	if err != nil {
+		return err
+	}
+
+	return task.Do(ctx)
+}
+
+// prepareHostFor is the host preparation that a bootstrap in mode does and
+// that differs between the slot modes, for an in-place change to mode: the
+// nftables flush unit, which an nspawn host installs for its machines and a
+// container host for its node units, and the apt guards, which only an nspawn
+// machine needs. The flush unit is not started while the target node runs
+// (see host.ConfigureNFTablesFor), so it takes effect at the next boot.
+func prepareHostFor(log *slog.Logger, mode isolation.Mode) (phases.Task, error) {
+	switch mode {
+	case isolation.ModeNSpawn:
+		return phases.Serial(log, host.ConfigureNFTablesFor(log, mode), host.HardenAPT(log)), nil
+	case isolation.ModeContainer:
+		return phases.Serial(log, host.ConfigureNFTablesFor(log, mode), host.RemoveAPTHardening(log)), nil
+	default:
+		return nil, fmt.Errorf("in-place migration is not supported for isolation mode %q", mode)
+	}
 }
 
 func (e *migrationEnv) preflight(ctx context.Context, log *slog.Logger, mode isolation.Mode, strategy migrate.Strategy) error {

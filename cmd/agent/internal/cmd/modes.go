@@ -11,6 +11,7 @@ import (
 	"github.com/Azure/unbounded/cmd/agent/internal/nspawnops"
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/isolation"
+	"github.com/Azure/unbounded/pkg/agent/isolation/container"
 	"github.com/Azure/unbounded/pkg/agent/isolation/none"
 )
 
@@ -62,6 +63,17 @@ func agentModes() agentModeTable {
 				return daemon.NoneOperator{}
 			},
 			newPlan: func() stagePlan { return &nonePlan{} },
+		},
+		// Experimental: configuredMode and the daemon refuse it unless the
+		// agent configuration opts in (Experimental.ContainerIsolation).
+		isolation.ModeContainer: {
+			newBackend: func(log *slog.Logger, _ *provision.AgentConfig) isolation.Backend {
+				return container.NewDefault(log)
+			},
+			newOperator: func(daemon.BackendFactory) daemon.ModeOperator {
+				return daemon.ContainerOperator{}
+			},
+			newPlan: func() stagePlan { return &containerPlan{} },
 		},
 	}
 }

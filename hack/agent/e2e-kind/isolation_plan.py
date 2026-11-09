@@ -108,6 +108,16 @@ CATALOG: tuple[Scenario, ...] = (
         tags=("none",),
     ),
     Scenario(
+        "C01", "container: all operations", "operations", "isolation-operations", "container",
+        f"The isolation-operations suite with --isolation container (experimental, so the bootstrap also passes "
+        f"--experimental-container-isolation): {OPERATIONS_TEXT}.",
+        "One unbounded-node-<slot>.service runs the node stack under runc from its OCI bundle, no nspawn machine "
+        "exists, repave switches slots and each slot has its own bpffs, and the same-path contract holds.",
+        tags=("container", "provisional"),
+        notes="Provisional: designed for Azure Container Linux. On ubuntu2404 this exercises runc, the OCI bundle "
+              "and the unit, not the Azure Container Linux assumptions (SELinux label, PID 1 shutdown).",
+    ),
+    Scenario(
         "R01", "Default (no flag): reset on the host", "reset", "isolation-reset", "",
         "Run `unbounded-agent reset` on a default host, as an operator does without the control plane, and check "
         "what it removes.",
@@ -123,6 +133,13 @@ CATALOG: tuple[Scenario, ...] = (
         tags=("none",),
     ),
     Scenario(
+        "R04", "container: reset on the host", "reset", "isolation-reset", "container",
+        "Run `unbounded-agent reset` on a container host and check what it removes.",
+        "Each slot's unbounded-node-<slot>.service unit, OCI bundle, root filesystem and bpffs mount are removed, "
+        "the agent's files and units are gone, and no reprovision handoff unit or staged configuration remains.",
+        tags=("container", "provisional"),
+    ),
+    Scenario(
         "R03", "Reset after a reprovision mode change", "reset", "isolation-reset-after-reprovision", "",
         "Change a default host to none by reprovision, which stages a handoff (a unit, a copy of the agent and a "
         "configuration that carries the bootstrap token), then run `unbounded-agent reset` on the host.",
@@ -133,13 +150,17 @@ CATALOG: tuple[Scenario, ...] = (
     ),
     Scenario(
         "T01", "Every ordered pair of modes", "transitions", "isolation-matrix", "",
-        "Declare each mode in spec.isolation, set the allow-reprovision annotation and delete the Node, for every "
-        "ordered pair: nspawn to none and none to nspawn, both by reprovision. After each change, run a soft "
-        "reboot and a host reboot, and the preflight in none.",
-        "Both ordered pairs complete with status.isolationChange Succeeded and the Reprovision strategy, the new "
-        "mode recorded, a workload running and exec working, and no reprovision handoff left. Each stop survives "
-        "a soft reboot and a host reboot, and none passes its preflight.",
-        tags=("nspawn", "none", "transition"),
+        "Declare each mode in spec.isolation and delete the Node, for every ordered pair: nspawn to container "
+        "(in place), container to none and none to container (reprovision), container to nspawn (in place), "
+        "nspawn to none and none to nspawn (reprovision). A reprovision runs with the allow-reprovision annotation "
+        "set. After the last two changes, run a soft reboot and a host reboot, and the preflight in none.",
+        "All six ordered pairs complete with status.isolationChange Succeeded and the strategy the pair calls for, "
+        "the new mode recorded, a workload running and exec working, and no reprovision handoff left after a "
+        "reprovision. The stops reached by reprovision to none and back to nspawn also survive a soft reboot and "
+        "a host reboot, and none passes its preflight.",
+        tags=("nspawn", "none", "container", "transition", "provisional"),
+        notes="The suite bootstraps with --experimental-container-isolation so the host may change to container. "
+              "Moves involving container are provisional on ubuntu2404.",
     ),
     Scenario(
         "T02", "Machine status and drift across mode changes", "transitions", "isolation-drift", "",
@@ -157,12 +178,37 @@ CATALOG: tuple[Scenario, ...] = (
         "T03", "Mode change that cannot go ahead", "transitions", "isolation-rollback", "",
         "Declare the applied mode and check nothing moves or is recorded, then declare none without the "
         "allow-reprovision annotation, delete the Node and check the change is refused while the repave still "
-        "brings the node back in nspawn, nothing retries it and no handoff is staged.",
-        "status.isolationChange is Failed with reason ReprovisionNotAllowed, IsolationDrift shows ChangeRefused, "
-        "the source mode is recorded and running, and a workload runs.",
-        tags=("nspawn", "none", "transition"),
-        notes="A failed in-place change, and its restore of the shared host configuration, needs a mode that "
-              "changes in place. A failed reprovision has no harness fault and is covered by unit tests only.",
+        "brings the node back in nspawn, nothing retries it and no handoff is staged. Then declare container on "
+        "the host, whose agent configuration does not opt in to the experimental mode, and check it is refused "
+        "the same way.",
+        "status.isolationChange is Failed with reason ReprovisionNotAllowed, then ExperimentalNotEnabled, "
+        "IsolationDrift shows ChangeRefused each time, the source mode is recorded and running, and a workload runs.",
+        tags=("nspawn", "none", "container", "transition"),
+        notes="A failed in-place change and its restore of the shared host configuration are T04. A failed "
+              "reprovision has no harness fault and is covered by unit tests only.",
+    ),
+    Scenario(
+        "T04", "Failed in-place change: rollback and config restore", "transitions", "isolation-rollback-in-place",
+        "container",
+        "Declare the applied mode and check nothing moves or is recorded, check a change to nspawn is refused "
+        "before the node is touched while the host lacks the nspawn runtime, then fail an in-place container to "
+        "nspawn change after the source stopped and check the source runs again, the failure is not retried, and "
+        "the shared host configuration is byte for byte unchanged. Change to nspawn in place, then fail an "
+        "in-place nspawn to container change the same way.",
+        "status.isolationChange is Failed with a persist error and a rollback to the source, IsolationDrift shows "
+        "ChangeFailed, the source mode is recorded and running, no in-place journal is left, and the shared "
+        "config digests match.",
+        tags=("nspawn", "container", "transition", "provisional"),
+        notes="Starts in container mode because only a container host keeps its configuration at the shared host "
+              "paths the digest compares. The fault is harness-only (a directory in place of the target's applied "
+              "config checksum). Reprovision rollback has no harness fault and is covered by unit tests only.",
+    ),
+    Scenario(
+        "A01", "container on Azure Container Linux", "operations", "isolation-operations", "container",
+        "The isolation-operations suite in container mode on an immutable Azure Container Linux host.",
+        "Confirms the provisional container assumptions on the intended platform.",
+        tags=("container", "acl"), requires=("host-os:acl",),
+        notes="Needs HOST_BASE_OS=acl and an image (gallery export or HOST_IMAGE_PATH). Skipped otherwise.",
     ),
     Scenario(
         "G01", "GPU workloads in none mode", "operations", None, "none",

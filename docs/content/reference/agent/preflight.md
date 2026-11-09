@@ -47,7 +47,7 @@ environment to skip that automatic preflight step.
 | Flag | Description |
 |---|---|
 | `--config` | Path to the agent config file. When omitted, the agent uses its normal config loading behavior. |
-| `--isolation` | Isolation mode to check: `nspawn` or `none`. Overrides `Isolation` from the config file. When omitted, the config file decides, and an empty value is `nspawn`. |
+| `--isolation` | Isolation mode to check: `nspawn`, `none`, or `container`. Overrides `Isolation` from the config file. When omitted, the config file decides, and an empty value is `nspawn`. |
 | `--ignore-preflight-errors` | Comma-separated check names whose errors should be reported as warnings. Use `all` to ignore all fatal checks. |
 | `--fail-on-warnings` | Exit non-zero when any warning is returned, even if there are no fatal errors. |
 | `--output` | Output format. Supported values are `text` and `json`. Default: `text`. |
@@ -167,8 +167,9 @@ set is organized around the same bootstrap phases as `unbounded-agent start`.
 | `is-privileged-user` | Error | Preflight is running as root. Bootstrap requires root privileges. |
 | `host-packages` | Error or warning | A supported package manager is available (`apt-get`, `tdnf`, or `dnf`) and required host packages are installed. Missing package manager support is fatal. Missing packages are warnings because bootstrap may install them. |
 | `host-os-configuration` | Error | Host OS configuration paths are writable, including the sysctl config directory and systemd unit directory. |
-| `existing-deployment` | Error | The host has no leftover node deployment from a previous run. In `nspawn` mode it looks for registered `kube1` and `kube2` machines and their files. In `none` mode it also looks for the host-native node directory and units. A resumed installation skips this check. |
+| `existing-deployment` | Error | The host has no leftover node deployment from a previous run. In `nspawn` mode it looks for registered `kube1` and `kube2` machines and their files. In `none` mode it also looks for the host-native node directory and units, and in `container` mode for the container node directory and units. A resumed installation skips this check. |
 | `nspawn-runtime` | Warning | `nspawn` mode only. Required nspawn runtime tools are available: `systemctl`, `machinectl`, and `systemd-nspawn`. It also checks that `/run/systemd/system` is available. Missing tools are warnings because bootstrap may install them. |
+| `container-backend` | Error | `container` mode only (experimental). cgroup v2 is available, the SELinux `spc_t` label is accepted when SELinux is enforcing, and `/etc`, `/opt`, and `/var` are writable. A missing `runc` is not an error because bootstrap installs it. |
 | `none-backend` | Error | `none` mode only. No kubelet or containerd that the agent does not own is present (unit file other than one masked to `/dev/null`, executable, or running process), and `/etc`, `/opt/unbounded/node`, and `/var` are writable. The failure names the mode to use instead. Bootstrap runs the ownership half of this check itself, so a host with such a kubelet or containerd is refused even without `preflight`. |
 | `docker-active` | Warning | Docker is active. Bootstrap will disable Docker when needed. |
 | `containerd-active` | Warning | The host containerd service is active. Bootstrap will disable it before starting the node. |

@@ -10,9 +10,10 @@
 # Scenario definitions are shared with CI in e2e.py. E2E_SUITE selects a focused
 # suite; the default runs lifecycle followed by configuration scenarios.
 #
-# ISOLATION_MODE (nspawn or none) selects where the node stack runs and is
-# passed to the bootstrap as --isolation. Unset keeps the default nspawn
-# behavior. Use E2E_SUITE=isolation-operations with any mode, and
+# ISOLATION_MODE (nspawn, none or container) selects where the node stack runs
+# and is passed to the bootstrap as --isolation, together with
+# --experimental-container-isolation. Unset keeps the default nspawn behavior.
+# Use E2E_SUITE=isolation-operations with any mode, and
 # E2E_SUITE=isolation-matrix with it unset. See README.md.
 #
 # Prerequisites (Fedora):

@@ -37,7 +37,7 @@ type AppliedConfigLocation struct {
 func AppliedConfigLocations() []AppliedConfigLocation {
 	var out []AppliedConfigLocation
 
-	for _, mode := range []isolation.Mode{isolation.ModeNSpawn, isolation.ModeNone} {
+	for _, mode := range []isolation.Mode{isolation.ModeNSpawn, isolation.ModeNone, isolation.ModeContainer} {
 		slots := []string{NSpawnMachineKube1, NSpawnMachineKube2}
 		if mode == isolation.ModeNone {
 			// A none node has no blue/green slot; it always records kube1.

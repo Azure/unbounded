@@ -114,7 +114,7 @@ func TestRecover_ReportsAnInterruptedInPlaceChangeAndClearsItsJournal(t *testing
 	res := recoverChanges(t, h, c)
 
 	assert.True(t, res.resolved)
-	assert.Equal(t, isolation.ModeNSpawn, res.failedTarget)
+	assert.Equal(t, isolation.ModeContainer, res.failedTarget)
 	assert.Contains(t, h.source.Calls(), "start kube1", "rolled back to the source")
 
 	change := getChange(t, c)
@@ -402,6 +402,44 @@ func TestReconcileRepave_AReprovisionThatIsNotAllowedIsRefused(t *testing.T) {
 	assert.Equal(t, v1alpha3.IsolationChangeReasonReprovisionNotAllowed, change.Reason)
 	assert.Equal(t, v1alpha3.IsolationChangeReprovision, change.Strategy)
 	assert.Contains(t, change.Message, v1alpha3.AnnotationAllowReprovision)
+}
+
+// A change between nspawn and container is made in place, and needs no
+// reprovision opt-in.
+func TestReconcileRepave_AContainerChangeIsMadeInPlaceWithoutTheAnnotation(t *testing.T) {
+	h := newMigHarness(t, isolation.ModeNSpawn)
+	r, op, mig, c := changeFixture(t, h, v1alpha3.IsolationContainer, h.active.Config.Cluster.Version, false, healthyClient(t))
+
+	_, err := r.ReconcileRepave(t.Context(), "node-delete")
+	require.NoError(t, err)
+	assert.Equal(t, []migrate.Strategy{migrate.InPlace}, mig.strategies)
+	assert.Nil(t, op.repaveConfig, "a change is not also a same-mode repave")
+
+	m := getMachine(t, c)
+	require.NotNil(t, m.Status.IsolationChange)
+	assert.Equal(t, v1alpha3.IsolationChangeSucceeded, m.Status.IsolationChange.Phase)
+	assert.Equal(t, v1alpha3.IsolationContainer, m.Status.Isolation)
+}
+
+// A host whose agent configuration does not opt in to the experimental mode
+// refuses the change, and the repave goes ahead in the current mode.
+func TestReconcileRepave_AContainerChangeIsRefusedWithoutTheOptIn(t *testing.T) {
+	h := newMigHarness(t, isolation.ModeNSpawn)
+	h.active.Config.Experimental = nil
+	r, op, mig, c := changeFixture(t, h, v1alpha3.IsolationContainer, "1.34.9", true, healthyClient(t))
+
+	_, err := r.ReconcileRepave(t.Context(), "node-delete")
+	require.NoError(t, err)
+
+	assert.Empty(t, mig.strategies, "the engine is never started")
+	require.NotNil(t, op.repaveConfig, "the version rollout goes ahead in the current mode")
+	assert.Equal(t, h.active.Config.Isolation, op.repaveConfig.Isolation)
+
+	change := getChange(t, c)
+	require.NotNil(t, change)
+	assert.Equal(t, v1alpha3.IsolationChangeFailed, change.Phase)
+	assert.Equal(t, v1alpha3.IsolationChangeReasonExperimentalNotEnabled, change.Reason)
+	assert.Contains(t, change.Message, "Experimental.ContainerIsolation")
 }
 
 // A handed off reprovision leaves the daemon about to be removed. Nothing new

@@ -161,3 +161,37 @@ func TestOpenMountTableFailsClosedWithoutTheRealTable(t *testing.T) {
 	require.NoError(t, err)
 	require.Nil(t, f)
 }
+
+// The strict form never detaches the prefix's own mount: a container slot
+// relies on the shared mount at /var/lib/kubelet (or a dedicated disk there)
+// staying in place while the pod volumes below it are cleared.
+func TestUnmountStrictlyBelowLeavesThePrefixMounted(t *testing.T) {
+	t.Parallel()
+
+	info := writeMountInfo(t,
+		mountLine("/var/lib/kubelet"),
+		mountLine("/var/lib/kubelet/pods/a/volumes"),
+		mountLine("/var/lib/kubelet/pods/a"),
+		mountLine("/var/lib/kubelet-other"),
+	)
+
+	var got []string
+
+	run := func(_ context.Context, _ *slog.Logger, name string, args ...string) (string, error) {
+		got = append(got, name+" "+args[0]+" "+args[1])
+		return "", nil
+	}
+
+	require.NoError(t, UnmountStrictlyBelow(t.Context(), nil, run, info, KubeletDir))
+	assert.Equal(t, []string{
+		"umount -l /var/lib/kubelet/pods/a/volumes",
+		"umount -l /var/lib/kubelet/pods/a",
+	}, got)
+
+	// Failures are still reported.
+	failing := func(context.Context, *slog.Logger, string, ...string) (string, error) {
+		return "", errors.New("busy")
+	}
+
+	require.ErrorContains(t, UnmountStrictlyBelow(t.Context(), nil, failing, info, KubeletDir), "unmount /var/lib/kubelet/pods/a")
+}

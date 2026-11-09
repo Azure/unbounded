@@ -423,9 +423,35 @@ Provisional until the node facts in section 13 are collected.
   agent-owned systemd unit supervises the container. The host's docker and
   containerd are not used.
 - Slots: `kube1`/`kube2` with root at `/var/lib/unbounded/containers/<slot>`.
-- Privileges: privileged, shared host netns and PID as needed, host bind mounts
-  for the same-path contract (invariant 3), `rshared` propagation for
-  `/var/lib/kubelet`, device and cgroup rules from grants.
+- Privileges: privileged process, shared host netns, own PID, mount, IPC and
+  cgroup namespaces, host bind mounts for the same-path contract (invariant 3),
+  device and cgroup rules from grants. `/sys` and `/proc/sys` are read-only
+  except `/proc/sys/net` (as nspawn with `SYSTEMD_NSPAWN_API_VFS_WRITABLE=network`),
+  the runtime default masked and read-only paths apply, and udev is masked in
+  the rootfs.
+- Mount propagation: pod volume mounts must be visible on the host. The root
+  propagation is `rshared`, `/var/lib/kubelet` is bound `rshared`, and the
+  supervising unit makes the host's `/var/lib/kubelet` a shared mount (a bind
+  on itself when nothing is mounted there) before every start, so the bind
+  joins its peer group. The agent never unmounts `/var/lib/kubelet` itself
+  when it activates a slot, only the mounts below it.
+- bpffs: a private bpffs per slot at `/run/bpffs/<slot>`, bound at
+  `/sys/fs/bpf`, the same host path the nspawn machine of the slot uses.
+- Supervision: the container runs in the unit's delegated cgroup (runc in
+  `DelegateSubgroup=supervisor`, the container's `cgroupsPath` in `payload`),
+  so stopping the unit ends it. The two slots' units conflict, starting a slot
+  disables the other, stopping one disables it and waits until runc reports
+  the container gone (killing it otherwise), and the pre-start hook refuses
+  while the other slot's container lives. The start timeout is derived from the
+  post-start waits and the unit has a start limit.
+- Gate: experimental. The agent refuses the mode unless its configuration sets
+  `Experimental.ContainerIsolation`; machina provisions it only with
+  `experimentalContainerIsolation` (and then opts every agent config it writes
+  in), metalman (`serve-pxe`) and machine-ops-controller (`HostReplace`) do the
+  same with `--experimental-container-isolation`, sharing
+  `provision.CheckIsolationEnabled` with machina, and
+  `kubectl unbounded machine manual-bootstrap` needs
+  `--experimental-container-isolation`.
 - SELinux: when enforcing, set `process.selinuxLabel` to `spc_t`. A preflight
   check verifies label support. Provisional.
 - Requirements: writable `/etc`, `/opt`, `/var`, a loadable `runc`, cgroup
@@ -440,13 +466,16 @@ Provisional until the node facts in section 13 are collected.
 **Status (WP2, provisional).** Implemented end to end: the OCI bundle and
 supervising unit, bootstrap, start, soft reboot, blue/green upgrade with
 rollback, reset, `exec`, `logs`, preflight, GPU wiring through the
-`node-lifecycle` hooks, and uninstall. The runtime is `runc`, downloaded to
+`node-lifecycle` hooks, and the in-place change to and from `nspawn`. The
+runtime is `runc`, downloaded to
 `/opt/unbounded/runtime/runc` in this mode only.
 Decisions: paths under the bind-mounted same-path directories are written on the
 host side, since a bind mount hides anything written below it in the rootfs;
 both slots share those directories, so a repave resets the shared kubelet state
 and a rollback restarts the old slot against the new shared files (saved and
-restored byte for byte, see section 10.4); the applied config moves to the new
+restored byte for byte, see section 10.4, including `/opt/cni/bin`, which
+preparing a slot writes), and only once the new slot's container is confirmed
+gone; the applied config moves to the new
 slot only after it is healthy; the node-lifecycle post-start hook asks the
 runtime, not `systemctl is-active`, because the unit is still activating while
 `ExecStartPost` runs (an inference from systemd semantics, not observed).
@@ -454,8 +483,13 @@ runtime, not `systemctl is-active`, because the unit is still activating while
 Unverified assumptions, all still open until the node facts in section 13 are
 collected:
 - `spc_t` is accepted by the node policy.
-- `rshared` on `/var/lib/kubelet` propagates through the host root mount, and
-  pod mounts propagate to the host.
+- The shared bind of `/var/lib/kubelet` and the `rshared` root propagation
+  make pod mounts visible on the host.
+- `DelegateSubgroup=` (systemd 254) is available, and runc places the
+  container in the `payload` subgroup of the delegated unit cgroup.
+- The container's private `/dev` is enough: devices that appear on the host
+  later, or that were not granted, are not in it, which limits CSI drivers and
+  device plugins (documented as a limitation).
 - `SIGRTMIN+3` through `runc` stops systemd as PID 1.
 - The capability, device and mount set in `config.json` is enough for kubelet,
   containerd and the CNI.

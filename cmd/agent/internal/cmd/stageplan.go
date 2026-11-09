@@ -45,7 +45,17 @@ func configuredMode(cfg *provision.UnboundedAgentConfig) (isolation.Mode, error)
 		return isolation.DefaultMode, nil
 	}
 
-	return cfg.IsolationMode()
+	mode, err := cfg.IsolationMode()
+	if err != nil {
+		return "", err
+	}
+
+	// An experimental mode runs only on a host whose configuration opts in.
+	if err := cfg.CheckModeEnabled(mode); err != nil {
+		return "", err
+	}
+
+	return mode, nil
 }
 
 // plan returns the bootstrap plan for the configured isolation mode, building
