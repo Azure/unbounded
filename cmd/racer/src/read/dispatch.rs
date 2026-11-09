@@ -56,20 +56,27 @@ struct Mailbox {
     /// Failed GPU verdicts the mailbox could not carry. The owning endpoint
     /// applies them on its next poll so a corrupt copy is never left eligible.
     failed_verdicts: std::sync::Mutex<Vec<super::sealed::SealedReport>>,
+    /// Failed verdicts lost because `failed_verdicts` was full; the owner
+    /// counts them so a corrupt copy left eligible is visible.
+    dropped_verdicts: std::sync::atomic::AtomicU64,
 }
 
 /// Bound on retained failed verdicts per worker. Each entry is one failed GPU
-/// verification; beyond this the owner is far behind and the oldest are kept.
+/// verification; beyond this the owner is far behind: the oldest are kept and
+/// the rest are counted in `racer_failed_verdicts_dropped_total`.
 const FAILED_VERDICT_LIMIT: usize = 4096;
 
 impl Mailbox {
-    /// Retain a failed verdict for the owner. Returns false only when full.
+    /// Retain a failed verdict for the owner. Returns false only when full,
+    /// after counting the drop.
     fn retain_failed_verdict(&self, report: super::sealed::SealedReport) -> bool {
         let mut pending = self
             .failed_verdicts
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         if pending.len() >= FAILED_VERDICT_LIMIT {
+            self.dropped_verdicts
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return false;
         }
         pending.push(report);
@@ -974,6 +981,16 @@ impl WorkerEndpoint {
     }
     /// Apply failed GPU verdicts other workers could not send through the mailbox.
     fn apply_failed_verdicts(&self) {
+        let dropped = self
+            .mailbox
+            .dropped_verdicts
+            .swap(0, std::sync::atomic::Ordering::Relaxed);
+        if dropped != 0 {
+            self.local
+                .fill
+                .metrics
+                .record(crate::telemetry::Event::FailedVerdictDropped, dropped);
+        }
         for report in self.mailbox.take_failed_verdicts() {
             self.local.fill.sealed_verdict(report, false);
         }
@@ -1313,6 +1330,7 @@ impl NodeDirectory {
                         worker,
                         inner: Arc::new(Handoff::new(capacity).expect("validated capacity")),
                         failed_verdicts: std::sync::Mutex::new(Vec::new()),
+                        dropped_verdicts: std::sync::atomic::AtomicU64::new(0),
                     })
                 })
                 .collect(),
@@ -1570,10 +1588,38 @@ mod tests {
         for _ in 0..FAILED_VERDICT_LIMIT {
             assert!(directory.mailboxes[1].retain_failed_verdict(failed_report(page.clone())));
         }
+        assert!(!directory.mailboxes[1].retain_failed_verdict(failed_report(page.clone())));
         assert!(!directory.mailboxes[1].retain_failed_verdict(failed_report(page)));
         assert_eq!(
             directory.mailboxes[1].take_failed_verdicts().len(),
             FAILED_VERDICT_LIMIT
+        );
+        // The owner counts the drops once on its next poll.
+        let env = racer_io::Env::host();
+        let workers = vec![WorkerId(0), WorkerId(1)];
+        let directory = std::rc::Rc::new(
+            WorkerDirectory::new(
+                Arc::new(WorkerMap::new(workers.clone()).unwrap()),
+                workers,
+                1,
+                racer_io::WorkerCtx::host(),
+            )
+            .unwrap(),
+        );
+        let page = page_owned_by(&directory, WorkerId(1));
+        for _ in 0..FAILED_VERDICT_LIMIT + 2 {
+            directory.mailboxes[1].retain_failed_verdict(failed_report(page.clone()));
+        }
+        let (owner, _fixture) = crate::read::tests::admission_coordinator(&env);
+        let mut endpoint = directory.install(WorkerId(1), owner.clone()).unwrap();
+        endpoint.poll_budgeted(0).unwrap();
+        endpoint.poll_budgeted(0).unwrap();
+        assert_eq!(
+            owner
+                .fill
+                .metrics
+                .count(crate::telemetry::Event::FailedVerdictDropped),
+            2
         );
     }
     #[test]

@@ -512,6 +512,7 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::OriginWalkRank0Unusable => "racer_origin_walk_reasons_total" { "reason=\"rank0_unusable\"" },
             Self::OriginWalkRank0Stale => "racer_origin_walk_reasons_total" { "reason=\"rank0_stale\"" },
             Self::OriginWalkRank0NotAsked => "racer_origin_walk_reasons_total" { "reason=\"rank0_not_asked\"" },
+            Self::FailedVerdictDropped => "racer_failed_verdicts_dropped_total",
 }
 
 /// The labeled counter for why an origin fill's walk had authority.
