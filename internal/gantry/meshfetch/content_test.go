@@ -84,6 +84,9 @@ func (c *contentRoot) open(t *testing.T) *DirContent {
 	}
 
 	dc.scanInterval = time.Nanosecond
+	dc.fileIdle = 50 * time.Millisecond
+
+	t.Cleanup(dc.Close)
 
 	return dc
 }
@@ -116,7 +119,8 @@ func TestDirContentCommittedBlob(t *testing.T) {
 }
 
 // An ingest is found through its ref; its readable size is its data
-// file, capped at total, and reads continue after the commit rename.
+// file, capped at total, and a descriptor opened on it survives the
+// commit rename.
 func TestDirContentIngestAndCommit(t *testing.T) {
 	cr := newContentRoot(t)
 	dc := cr.open(t)
@@ -156,7 +160,7 @@ func TestDirContentIngestAndCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The committed blob still reads.
+	// The cached descriptor still reads.
 	if _, err := dc.ReadAt(d, buf, 7000); err != nil || !bytes.Equal(buf, data[7000:8000]) {
 		t.Fatalf("ReadAt after commit: %v", err)
 	}
@@ -185,8 +189,9 @@ func TestDirContentIngestTotal(t *testing.T) {
 	}
 }
 
-// A deleted blob is no longer read or available.
-func TestDirContentDeletedBlob(t *testing.T) {
+// Descriptors of deleted blobs are closed once idle, so containerd's
+// garbage collection gets the space back; reads then fail.
+func TestDirContentClosesIdleDescriptors(t *testing.T) {
 	cr := newContentRoot(t)
 	dc := cr.open(t)
 	d := testDigest(5)
@@ -197,9 +202,15 @@ func TestDirContentDeletedBlob(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	if dc.openFiles() != 1 {
+		t.Fatalf("open files = %d", dc.openFiles())
+	}
+
 	if err := os.Remove(cr.blobPath(d)); err != nil {
 		t.Fatal(err)
 	}
+
+	waitFor(t, "idle descriptor closed", func() bool { return dc.openFiles() == 0 })
 
 	if _, err := dc.ReadAt(d, make([]byte, 10), 0); err == nil {
 		t.Fatal("read of a deleted blob succeeded")
@@ -210,7 +221,8 @@ func TestDirContentDeletedBlob(t *testing.T) {
 	}
 }
 
-// A truncated ingest (a restarted download) makes reads short.
+// A truncated ingest (a restarted download) makes reads short and drops
+// the descriptor.
 func TestDirContentTruncatedIngest(t *testing.T) {
 	cr := newContentRoot(t)
 	dc := cr.open(t)
@@ -227,6 +239,10 @@ func TestDirContentTruncatedIngest(t *testing.T) {
 
 	if _, err := dc.ReadAt(d, make([]byte, 100), 4000); !errors.Is(err, errContentShort) {
 		t.Fatalf("want short read, got %v", err)
+	}
+
+	if dc.openFiles() != 0 {
+		t.Fatal("descriptor of a truncated ingest kept")
 	}
 }
 

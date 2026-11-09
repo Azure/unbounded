@@ -45,10 +45,12 @@ const defaultScanInterval = 100 * time.Millisecond
 // blobs/sha256/<hex>; a blob being downloaded lives at ingest/<key>/data,
 // where ingest/<key>/ref names its digest and ingest/<key>/total its size.
 // containerd writes ingests sequentially and renames data into blobs/ on
-// commit. Every read opens the file, reads one page, and closes it, so a
-// blob containerd deletes never keeps its space. Reads go through the
-// kernel page cache, which usually still holds bytes containerd has just
-// written.
+// commit, so an open descriptor stays valid across the commit. Descriptors
+// are reused across page reads (a fresh descriptor per 1MiB read costs
+// about a third of the read) and closed fileIdle after their last use, so
+// a blob containerd deletes does not keep its space for long. Reads go
+// through the kernel page cache, which usually still holds bytes
+// containerd has just written.
 type DirContent struct {
 	root string
 	log  *slog.Logger
@@ -58,9 +60,27 @@ type DirContent struct {
 	mu       sync.Mutex
 	ingests  map[string]ingestEntry
 	lastScan time.Time
+	// files holds open descriptors by blob hex.
+	files map[string]*openFile
+	// fileIdle closes a descriptor unused for this long.
+	fileIdle time.Duration
 
 	disabled atomic.Bool
 }
+
+// openFile is a shared descriptor of one blob. Guarded by DirContent.mu.
+type openFile struct {
+	f    *os.File
+	refs int
+	// gone is set once the entry left the files map; the last user
+	// closes it.
+	gone bool
+	// idle closes the descriptor fileIdle after its last use.
+	idle *time.Timer
+}
+
+// defaultFileIdle bounds how long an unused descriptor stays open.
+const defaultFileIdle = 2 * time.Second
 
 type ingestEntry struct {
 	dir   string
@@ -89,6 +109,8 @@ func NewDirContent(root string, logger *slog.Logger) (*DirContent, error) {
 		log:          logger,
 		scanInterval: defaultScanInterval,
 		ingests:      make(map[string]ingestEntry),
+		files:        make(map[string]*openFile),
+		fileIdle:     defaultFileIdle,
 	}, nil
 }
 
@@ -262,13 +284,16 @@ func (c *DirContent) ReadAt(d string, p []byte, off int64) (int, error) {
 		return 0, fmt.Errorf("meshfetch: bad digest %q", d)
 	}
 
-	f, err := c.open(h)
+	of, err := c.acquire(h)
 	if err != nil {
 		return 0, err
 	}
 
-	n, err := f.ReadAt(p, off)
-	_ = f.Close() //nolint:errcheck // read-only descriptor
+	n, err := of.f.ReadAt(p, off)
+
+	// A short read may come from a truncated ingest or a deleted blob:
+	// drop the descriptor so the next read opens the blob afresh.
+	c.release(h, of, n < len(p))
 
 	if n < len(p) {
 		if err == nil || errors.Is(err, io.EOF) {
@@ -279,6 +304,108 @@ func (c *DirContent) ReadAt(d string, p []byte, off int64) (int, error) {
 	}
 
 	return n, nil
+}
+
+// acquire returns a shared descriptor of blob h with a reference.
+func (c *DirContent) acquire(h string) (*openFile, error) {
+	c.mu.Lock()
+	if of := c.files[h]; of != nil {
+		of.refs++
+		c.mu.Unlock()
+
+		return of, nil
+	}
+	c.mu.Unlock()
+
+	f, err := c.open(h)
+	if err != nil {
+		return nil, err
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if of := c.files[h]; of != nil {
+		// Another reader opened it meanwhile.
+		_ = f.Close() //nolint:errcheck // read-only descriptor
+		of.refs++
+
+		return of, nil
+	}
+
+	of := &openFile{f: f, refs: 1}
+	of.idle = time.AfterFunc(c.fileIdle, func() { c.closeIdle(h, of) })
+	of.idle.Stop()
+	c.files[h] = of
+
+	return of, nil
+}
+
+// release drops a reference to of; drop removes it from the cache. The
+// last reference arms the idle timer, or closes a dropped descriptor.
+func (c *DirContent) release(h string, of *openFile, drop bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	of.refs--
+
+	if drop && !of.gone {
+		of.gone = true
+		of.idle.Stop()
+		delete(c.files, h)
+	}
+
+	if of.refs > 0 {
+		return
+	}
+
+	if of.gone {
+		_ = of.f.Close() //nolint:errcheck // read-only descriptor
+		return
+	}
+
+	of.idle.Reset(c.fileIdle)
+}
+
+// closeIdle closes of when nobody used it since its timer was armed.
+func (c *DirContent) closeIdle(h string, of *openFile) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if of.refs > 0 || of.gone {
+		return
+	}
+
+	of.gone = true
+
+	delete(c.files, h)
+
+	_ = of.f.Close() //nolint:errcheck // read-only descriptor
+}
+
+// Close closes every idle descriptor; descriptors in use are closed by
+// their last reader.
+func (c *DirContent) Close() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for h, of := range c.files {
+		of.gone = true
+		of.idle.Stop()
+		delete(c.files, h)
+
+		if of.refs == 0 {
+			_ = of.f.Close() //nolint:errcheck // read-only descriptor
+		}
+	}
+}
+
+// openFiles returns the number of cached descriptors (tests).
+func (c *DirContent) openFiles() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return len(c.files)
 }
 
 // open opens blob h: committed, else its ingest, else committed again in

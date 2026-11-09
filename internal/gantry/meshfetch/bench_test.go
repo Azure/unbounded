@@ -123,6 +123,8 @@ func benchContentStore(b *testing.B) (*DirContent, string) {
 		b.Fatal(err)
 	}
 
+	b.Cleanup(dc.Close)
+
 	return dc, d
 }
 
