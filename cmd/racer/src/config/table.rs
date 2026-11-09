@@ -912,9 +912,9 @@ const BASE: &[Var] = &[
     control(var(
         "RACER_PAGE_BYTES",
         Group::Kubernetes,
-        uint(64 * 1024, 16 * 1024 * 1024, BYTES),
+        uint(16 * 1024 * 1024, 16 * 1024 * 1024, BYTES),
         Value("16777216"),
-        "Cluster-wide logical page size, a power of two. Fixed at cluster creation: the authority publishes the value of the primary that made the first publication, records it in the `racer-state` Secret, and ignores later changes with a warning in the primary's log. Running nodes reject a publication that changes it.",
+        "Cluster-wide logical page size. Only 16777216 (16 MiB) is accepted: the client SDKs and the disk index do not yet support other sizes. Fixed at cluster creation: the authority publishes the value of the primary that made the first publication, records it in the `racer-state` Secret, and ignores later changes with a warning in the primary's log. Running nodes reject a publication that changes it.",
     )),
     control(var(
         "RACER_KUBE_API_CA",

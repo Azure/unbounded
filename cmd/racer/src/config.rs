@@ -3354,9 +3354,10 @@ mod tests {
             control(&[]).page_size,
             racer_wire::object::PageSize::DEFAULT
         );
-        let c = control(&[("RACER_PAGE_BYTES", "65536")]);
-        assert_eq!(c.page_size.get(), 65536);
-        for bad in ["4096", "98304", "33554432", "x"] {
+        let c = control(&[("RACER_PAGE_BYTES", "16777216")]);
+        assert_eq!(c.page_size.get(), 16 * 1024 * 1024);
+        // The SDKs and disk index assume 16 MiB pages; other sizes are refused.
+        for bad in ["4096", "65536", "1048576", "98304", "33554432", "x"] {
             assert_eq!(
                 managed_env(&[("RACER_PAGE_BYTES", bad)])
                     .err()

@@ -87,7 +87,7 @@
   {"name": "RACER_WEBHOOK_LISTEN", "owner": "authority", "scope": "node", "kind": "text", "default": ":9443", "empty_unset": true},
   {"name": "RACER_OBJECT_IMAGE", "owner": "authority", "scope": "node", "kind": "text", "default": null, "empty_unset": true},
   {"name": "RACER_RETAINED_PAGE_KEYS", "owner": "authority", "scope": "node", "kind": "unsigned", "min": "1", "max": "16", "step": "1", "default": "7", "empty_unset": true},
-  {"name": "RACER_PAGE_BYTES", "owner": "authority", "scope": "node", "kind": "unsigned", "min": "65536", "max": "16777216", "step": "1", "default": "16777216", "empty_unset": true},
+  {"name": "RACER_PAGE_BYTES", "owner": "authority", "scope": "node", "kind": "unsigned", "min": "16777216", "max": "16777216", "step": "1", "default": "16777216", "empty_unset": true},
   {"name": "RACER_KUBE_API_CA", "owner": "authority", "scope": "node", "kind": "text", "default": "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt", "empty_unset": true},
   {"name": "RACER_KUBE_API_TOKEN", "owner": "authority", "scope": "node", "kind": "text", "default": "/var/run/secrets/kubernetes.io/serviceaccount/token", "empty_unset": true},
   {"name": "RACER_DAEMONSET", "owner": "authority", "scope": "node", "kind": "text", "default": "racer", "empty_unset": true},
