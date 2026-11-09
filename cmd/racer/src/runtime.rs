@@ -260,10 +260,13 @@ impl RequestScope {
     }
 
     /// A new scope for `request` with its own cancellation, on this scope's
-    /// clock.
+    /// clock. It keeps the read-ahead flag and the reader's NUMA node, so an
+    /// acquisition run under an owned child scope still lands its RDMA page
+    /// on a rail local to the helper that decrypts it.
     pub fn child(&self, request: RequestId, deadline: Instant) -> Result<Self> {
         let mut child = Self::with_clock(request, deadline, self.clock.clone())?;
         child.ahead = self.ahead;
+        child.reader_numa = self.reader_numa;
         Ok(child)
     }
 
@@ -507,6 +510,22 @@ mod tests {
             use std::task::Wake;
             use std::task::Waker;
             use std::time::Duration;
+            #[test]
+            fn child_scope_keeps_reader_numa_and_read_ahead() {
+                let clock = racer_io::ctx::VirtualClock::new();
+                let mut scope =
+                    RequestScope::untimed(RequestId([3; 16]), clock.clone().into()).unwrap();
+                let deadline = scope.clock().now() + Duration::from_secs(5);
+                assert_eq!(scope.child(scope.request, deadline).unwrap().reader_numa, None);
+                scope.reader_numa = Some(1);
+                scope.ahead = true;
+                let child = scope.child(RequestId([4; 16]), deadline).unwrap();
+                assert_eq!(child.reader_numa, Some(1));
+                assert!(child.ahead);
+                assert_eq!(child.request, RequestId([4; 16]));
+                assert_eq!(child.deadline_at(), Some(deadline));
+            }
+
             #[test]
             fn untimed_scope_ends_only_by_cancellation_and_narrows_to_bounded() {
                 use crate::control::rest::Scope;
