@@ -129,14 +129,19 @@ func memberAddr(i uint32) string { return "m" + strconv.FormatUint(uint64(i), 10
 
 func memberID(i uint32) string { return "member-" + strconv.FormatUint(uint64(i), 10) }
 
-func parseAddr(a string) (uint32, bool) {
+// member returns the index of the member at address a, or false if a is not
+// the address of a member of c.
+func (c *Cluster) member(a string) (uint32, bool) {
 	if len(a) < 2 || a[0] != 'm' {
 		return 0, false
 	}
 
-	v, err := strconv.ParseUint(a[1:], 10, 32)
+	v, err := strconv.Atoi(a[1:])
+	if err != nil || v < 0 || v >= len(c.members) {
+		return 0, false
+	}
 
-	return uint32(v), err == nil
+	return uint32(v), true
 }
 
 // NewCluster builds a cluster for cfg.Scenario on a fresh simulator.
@@ -456,8 +461,8 @@ func (m *member) after() {
 	now := c.Sim.Now()
 
 	for _, call := range m.n.Outbox() {
-		to, ok := parseAddr(call.To)
-		if !ok || int(to) >= len(c.members) {
+		to, ok := c.member(call.To)
+		if !ok {
 			m.complete(call.ID, nil, errors.New("bad address"))
 
 			continue

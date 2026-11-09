@@ -773,8 +773,8 @@ func (w *DataPlane) dispatch(at uint32, cp *dpCopy, st *route.State, d *route.De
 	case route.KindNoRoute:
 		w.branchEnd(r, resNoRoute)
 	default:
-		to, ok := parseAddr(d.Next.Addr)
-		if !ok || int(to) >= len(w.c.members) {
+		to, ok := w.c.member(d.Next.Addr)
+		if !ok {
 			w.branchEnd(r, resFailed)
 
 			return
@@ -800,8 +800,8 @@ func (w *DataPlane) hedge(at uint32, first *dpHop, hdr route.Header, alt route.P
 		return
 	}
 
-	to, ok := parseAddr(alt.Addr)
-	if !ok || int(to) >= len(w.c.members) {
+	to, ok := w.c.member(alt.Addr)
+	if !ok {
 		return
 	}
 
@@ -1000,8 +1000,8 @@ func (h *dpHop) Complete(_ uint64, resp *Message, err error) {
 		w.cov.health[s].Hit()
 	}
 
-	alt, ok := parseAddr(h.alt.Addr)
-	if h.failover || h.alt.IsZero() || !ok || alt == h.to || int(alt) >= len(w.c.members) || r.done {
+	alt, ok := w.c.member(h.alt.Addr)
+	if h.failover || h.alt.IsZero() || !ok || alt == h.to || r.done {
 		w.branchEnd(r, resFailed)
 
 		return
@@ -1592,7 +1592,7 @@ func (w *DataPlane) walk(from, p uint32, dims int) error {
 			return fmt.Errorf("more than D=%d hops", dims)
 		}
 
-		next, ok := parseAddr(d.Next.Addr)
+		next, ok := w.c.member(d.Next.Addr)
 		if !ok || !w.running(next) {
 			// Liveness accepts a leaving member that is still in the view
 			// after its process stopped (it is removed by failure
