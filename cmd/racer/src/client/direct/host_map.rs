@@ -58,6 +58,11 @@ const CACHE_MAX_ENTRIES: usize = 128;
 /// Most bytes of client files the cache keeps mapped.
 const CACHE_MAX_BYTES: u64 = 256 << 30;
 
+/// Largest client file mapped. The file size is client-controlled (a sparse
+/// memfd can claim terabytes) and the mapping plus its per-chunk bookkeeping
+/// scale with it; a larger file uses positioned writes instead.
+const MAP_MAX_BYTES: u64 = CACHE_MAX_BYTES;
+
 /// How often the background thread evicts idle mappings.
 const REAPER_PERIOD: Duration = Duration::from_secs(1);
 
@@ -432,8 +437,9 @@ pub(crate) struct HostMapping {
 
 impl HostMapping {
     /// Map `window` of `file` when it is safe to: a memfd sealed against
-    /// shrinking, not sealed against writes, open read-write, and at least
-    /// `window.end()` bytes long. None means use positioned writes instead.
+    /// shrinking, not sealed against writes, open read-write, at least
+    /// `window.end()` bytes long, and at most `MAP_MAX_BYTES` long. None means
+    /// use positioned writes instead.
     /// Reuses a cached mapping of the same file when one covers the window.
     pub(crate) fn new(file: &impl AsRawFd, window: Destination) -> Option<Self> {
         Self::new_in(MappingCache::global(), file, window)
@@ -476,7 +482,7 @@ impl HostMapping {
             return None;
         }
         let size = u64::try_from(stat.st_size).ok()?;
-        if size < end {
+        if size < end || size > MAP_MAX_BYTES {
             return None;
         }
         #[allow(clippy::unnecessary_cast)]

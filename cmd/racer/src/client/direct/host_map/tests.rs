@@ -392,3 +392,27 @@ fn decrypt_numa_events_follow_locality() {
         assert_eq!(Locality::of(Some(node + 1), &written), Locality::Remote);
     }
 }
+
+/// A client memfd larger than the mapping cap is never mapped, however
+/// small the window: the request falls back to positioned writes.
+#[test]
+fn oversized_memfds_are_not_mapped() {
+    let file = memfd(0, 0);
+    file.set_len(MAP_MAX_BYTES + 1).unwrap();
+    assert_eq!(
+        unsafe { libc::fcntl(file.as_raw_fd(), libc::F_ADD_SEALS, libc::F_SEAL_SHRINK) },
+        0
+    );
+    let cache = cache(8, u64::MAX);
+    assert!(HostMapping::new_in(&cache, &file, window(0, 4096)).is_none());
+    assert_eq!(cache.stats().created, 0);
+    // A file at the cap still maps.
+    let file = memfd(0, 0);
+    file.set_len(MAP_MAX_BYTES).unwrap();
+    assert_eq!(
+        unsafe { libc::fcntl(file.as_raw_fd(), libc::F_ADD_SEALS, libc::F_SEAL_SHRINK) },
+        0
+    );
+    assert!(HostMapping::new_in(&cache, &file, window(0, 4096)).is_some());
+    assert_eq!(cache.stats().created, 1);
+}
