@@ -6,12 +6,13 @@ package racer
 import (
 	"testing"
 
-	"github.com/Azure/unbounded/internal/operator/component"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+
+	"github.com/Azure/unbounded/internal/operator/component"
 )
 
 // oldTemplateData is the racer-settings payload the earlier template seeded.
