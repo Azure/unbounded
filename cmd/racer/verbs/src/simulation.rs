@@ -227,6 +227,9 @@ pub enum Operation {
 
     Poll,
 
+    /// Arm a CQ on its completion channel.
+    Notify,
+
     CmListen,
 
     CmResolveAddr,
@@ -1800,7 +1803,13 @@ unsafe extern "C" fn req_notify(cq: *mut c_void) -> c_int {
     let Some(h) = (unsafe { handle(cq) }) else {
         return -1;
     };
-    match h.sim.world.borrow_mut().resources.get_mut(&h.id) {
+    let mut world = h.sim.world.borrow_mut();
+    if let Some(qp) = world.qp_on(h.id)
+        && world.rejected(Operation::Notify, qp)
+    {
+        return -1;
+    }
+    match world.resources.get_mut(&h.id) {
         Some(Resource::Cq { armed, .. }) => {
             *armed = true;
             0
@@ -4561,6 +4570,22 @@ mod tests {
             assert_eq!(Rc::strong_count(&link.control), held);
             link.b.stop().unwrap();
             assert_eq!(peek(&link.pages, 4096, 17), [0; 17]);
+        }
+        assert_eq!(sim.live_resources(), 0);
+    }
+
+    #[test]
+    /// A failed CQ arm stops the QP at once instead of leaving its
+    /// completions unannounced until a deadline.
+    fn failed_arm_stops_queue_pair() {
+        let sim = Simulation::new();
+        {
+            let link = link(&sim, |_| {});
+            sim.fault_on(Operation::Notify, Some(link.a.endpoint.qpn), Fault::Reject);
+            assert_eq!(drain(&link.a), Err(Error::Io));
+            assert_eq!(drain(&link.a), Ok(vec![]));
+            assert_eq!(drain(&link.b), Ok(vec![]));
+            link.b.stop().unwrap();
         }
         assert_eq!(sim.live_resources(), 0);
     }

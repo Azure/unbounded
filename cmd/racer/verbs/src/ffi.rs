@@ -1723,9 +1723,6 @@ pub(crate) struct NativeQueuePair<T = ()> {
     /// only safe after a later pass consumed any event raised since.
     quiet_pass: Cell<u64>,
 
-    /// The last arm of the CQ succeeded.
-    notify_ok: Cell<bool>,
-
     /// The QP handle and its connection state.
     conn: Rc<Conn>,
 
@@ -1892,7 +1889,6 @@ impl<T> NativeQueuePair<T> {
             armed,
             quiet: Cell::new(false),
             quiet_pass: Cell::new(0),
-            notify_ok: Cell::new(false),
             conn,
             endpoint,
             stopped: Cell::new(false),
@@ -2060,8 +2056,12 @@ impl<T> NativeQueuePair<T> {
         if self.device.comp.is_some() && !self.armed.get() {
             // Arm, then poll: a completion between the two still raises an
             // event, and one before is polled below.
-            self.notify_ok
-                .set(unsafe { (api.req_notify)(self.cq.as_ptr()) } == 0);
+            // A failed arm would leave completions unannounced and the
+            // owner asleep, so treat it like a failed poll.
+            if unsafe { (api.req_notify)(self.cq.as_ptr()) } != 0 {
+                self.stop()?;
+                return Err(Error::Io);
+            }
             self.armed.set(true);
             self.quiet.set(false);
         }
@@ -2089,9 +2089,9 @@ impl<T> NativeQueuePair<T> {
                 return Err(Error::Io);
             }
             n += got as usize;
-            // Only a successful arm followed by a short poll proves the
-            // CQ is drained and an event will announce the next completion.
-            if self.armed.get() && self.notify_ok.get() && (got as u32) < room {
+            // An arm followed by a short poll proves the CQ is drained and
+            // an event will announce the next completion.
+            if self.armed.get() && (got as u32) < room {
                 self.quiet.set(true);
                 self.quiet_pass.set(self.device.passes.get());
             }
