@@ -10,15 +10,18 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// MaxConditionMessageBytes is the longest metav1.Condition message the API
+// server accepts. Every writer of a condition message truncates to it.
+const MaxConditionMessageBytes = 32768
+
 const (
-	maxConditionReasonBytes  = 1024
-	maxConditionMessageBytes = 32768
-	defaultConditionReason   = "ProviderStatus"
+	maxConditionReasonBytes = 1024
+	defaultConditionReason  = "ProviderStatus"
 )
 
 func normalizeCondition(condition metav1.Condition) metav1.Condition {
 	condition.Reason = normalizeConditionReason(condition.Reason)
-	condition.Message = truncateUTF8Bytes(condition.Message, maxConditionMessageBytes)
+	condition.Message = TruncateUTF8Bytes(condition.Message, MaxConditionMessageBytes)
 
 	return condition
 }
@@ -70,7 +73,9 @@ func isASCIILetter(character byte) bool {
 	return (character >= 'A' && character <= 'Z') || (character >= 'a' && character <= 'z')
 }
 
-func truncateUTF8Bytes(value string, maxBytes int) string {
+// TruncateUTF8Bytes returns value cut to at most maxBytes bytes without
+// splitting a UTF-8 sequence.
+func TruncateUTF8Bytes(value string, maxBytes int) string {
 	if len(value) <= maxBytes {
 		return value
 	}

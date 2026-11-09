@@ -505,3 +505,6 @@ func executeMachineOperationCreateCommand(t *testing.T, args ...string) (string,
 
 	return out.String(), err
 }
+
+// A mode change is declared in the Machine's spec.isolation and applied at the
+// next repave, so there is no operation kind for it.

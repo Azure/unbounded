@@ -15,7 +15,6 @@ import (
 	"github.com/Azure/unbounded/internal/provision"
 	daemon "github.com/Azure/unbounded/pkg/agent/daemon"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
-	"github.com/Azure/unbounded/pkg/agent/isolation"
 )
 
 // hostOperator implements hostOperations on the real host.
@@ -53,31 +52,7 @@ func (hostOperator) FindActiveMachine(log *slog.Logger) (*ActiveMachine, error) 
 			)
 		}
 
-		var cfg provision.AgentConfig
-		if err := json.Unmarshal(data, &cfg); err != nil {
-			return nil, fmt.Errorf("decode applied config %s: %w", path, err)
-		}
-
-		// MachineName must be resolved before the node name because
-		// BackfillNodeName falls back to MachineName. The applied config is
-		// normally persisted with a name already set, so this is usually a
-		// no-op; it covers configs written by older agents or hand-edited.
-		source, err := provision.ResolveMachineName(&cfg)
-		if err != nil {
-			return nil, fmt.Errorf("resolve applied config machine name %s: %w", path, err)
-		}
-
-		if source != "config" {
-			log.Info("resolved unbounded MachineName", "name", cfg.MachineName, "source", source)
-		}
-
-		if err := cfg.BackfillNodeName(); err != nil {
-			return nil, fmt.Errorf("backfill applied config node name %s: %w", path, err)
-		}
-
-		// Every applied config is nspawn until the agent configuration records
-		// a mode.
-		return &ActiveMachine{Name: name, Config: &cfg, Mode: isolation.DefaultMode}, nil
+		return decodeActiveMachine(log, name, path, data)
 	}
 
 	return nil, fmt.Errorf("no applied config found in %s", goalstates.AgentConfigDir)
@@ -106,4 +81,41 @@ func (hostOperator) StageAgentUpgrade(ctx context.Context, log *slog.Logger, req
 
 func (hostOperator) ReconcileHostRoot(ctx context.Context, log *slog.Logger, active *ActiveMachine, lifecycle lifecycleMigrator) (bool, error) {
 	return reconcileHostRoot(ctx, log, lifecycle, active)
+}
+
+// decodeActiveMachine builds the active machine from the applied config data
+// of slot name, read from path, with its isolation mode.
+func decodeActiveMachine(log *slog.Logger, name, path string, data []byte) (*ActiveMachine, error) {
+	var cfg provision.AgentConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("decode applied config %s: %w", path, err)
+	}
+
+	// MachineName must be resolved before the node name because
+	// BackfillNodeName falls back to MachineName. The applied config is
+	// normally persisted with a name already set, so this is usually a
+	// no-op; it covers configs written by older agents or hand-edited.
+	source, err := provision.ResolveMachineName(&cfg)
+	if err != nil {
+		return nil, fmt.Errorf("resolve applied config machine name %s: %w", path, err)
+	}
+
+	if source != "config" {
+		log.Info("resolved unbounded MachineName", "name", cfg.MachineName, "source", source)
+	}
+
+	if err := cfg.BackfillNodeName(); err != nil {
+		return nil, fmt.Errorf("backfill applied config node name %s: %w", path, err)
+	}
+
+	// The applied config records the mode the machine was built in. A
+	// config without one is nspawn. A mode this agent cannot parse fails
+	// closed: operating it as nspawn could destroy a node stack the agent
+	// does not understand.
+	mode, err := cfg.IsolationMode()
+	if err != nil {
+		return nil, fmt.Errorf("applied config %s: %w", path, err)
+	}
+
+	return &ActiveMachine{Name: name, Config: &cfg, Mode: mode}, nil
 }

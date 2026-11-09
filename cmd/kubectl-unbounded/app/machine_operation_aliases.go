@@ -34,7 +34,7 @@ func newMachineNodeRebootCommand(rt *machineCommandRuntime) *cobra.Command {
 	return newMachineOperationAliasCommand(
 		rt,
 		"node-reboot NAME",
-		"Reboot the nspawn-backed Kubernetes node through MachineOperation",
+		"Reboot the Kubernetes node stack through MachineOperation",
 		v1alpha3.OperationNodeReboot,
 		"node-reboot",
 	)

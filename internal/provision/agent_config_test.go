@@ -393,3 +393,30 @@ func TestBuildAgentConfig(t *testing.T) {
 		})
 	}
 }
+
+func TestBuildAgentConfig_Isolation(t *testing.T) {
+	t.Parallel()
+
+	build := func(mode v1alpha3.IsolationMode) UnboundedAgentConfig {
+		return BuildAgentConfig(BuildAgentConfigParams{
+			Machine: &v1alpha3.Machine{
+				ObjectMeta: metav1.ObjectMeta{Name: "m"},
+				Spec:       v1alpha3.MachineSpec{Isolation: mode},
+			},
+			Cluster: ClusterEndpoint{APIServer: "api:443", ClusterDNS: "10.0.0.10", KubeVersion: "v1.34.0"},
+		})
+	}
+
+	// A Machine without the field produces the same output as before it
+	// existed: nothing is emitted for the default.
+	unset := build("")
+	require.Empty(t, unset.Isolation)
+
+	data, err := json.Marshal(unset)
+	require.NoError(t, err)
+	require.NotContains(t, string(data), "Isolation")
+
+	require.Equal(t, "nspawn", build(v1alpha3.IsolationNSpawn).Isolation)
+	// The value is passed through; the agent decides whether it can run it.
+	require.Equal(t, "none", build(v1alpha3.IsolationMode("none")).Isolation)
+}
