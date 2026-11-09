@@ -109,7 +109,6 @@ impl<P: Clone + Eq + Hash> ServeDecision<P> {
         }
     }
 
-    /// First step: a hot body request or a joinable copy-only request needs the ranking.
     /// Whether `page` is hot: a body request for it needs the page's ranking to decide whether
     /// to shed.
     pub fn hot(&self, page: &P) -> bool {
@@ -138,6 +137,8 @@ impl<P: Clone + Eq + Hash> ServeDecision<P> {
         )
     }
 
+    /// First step: a hot body request or a joinable copy-only request needs the ranking
+    /// ([`Step::Rank`], then [`Self::ranked`]); anything else is decided now.
     pub fn decide(&self, page: &P, request: ServeRequest) -> Step {
         if request.body && self.hot(page) {
             return Step::Rank;
