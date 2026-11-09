@@ -122,6 +122,7 @@ cachemesh:
 		"GANTRY_CACHEMESH_HEDGE":             "false",
 		"GANTRY_CACHEMESH_CHUNK_TIMEOUT":     "1m",
 	}
+
 	if err := c.LoadEnv(func(k string) string { return env[k] }); err != nil {
 		t.Fatalf("LoadEnv: %v", err)
 	}
@@ -133,6 +134,7 @@ cachemesh:
 	}
 
 	bad := map[string]string{"GANTRY_CACHEMESH_LOOKAHEAD": "many"}
+
 	if err := c.LoadEnv(func(k string) string { return bad[k] }); err == nil || !strings.Contains(err.Error(), "CACHEMESH_LOOKAHEAD") {
 		t.Fatalf("want parse error, got %v", err)
 	}
