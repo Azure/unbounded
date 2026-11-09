@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"strings"
@@ -102,5 +103,52 @@ func TestCachemeshMetricsHooks(t *testing.T) {
 
 	if got := testutil.ToFloat64(m.lookups.WithLabelValues("local", "hit")); got != 1 {
 		t.Fatalf("lookups = %v", got)
+	}
+}
+
+func TestCgroupMemoryLimit(t *testing.T) {
+	files := map[string]string{}
+	read := func(path string) ([]byte, error) {
+		v, ok := files[path]
+		if !ok {
+			return nil, errors.New("missing")
+		}
+
+		return []byte(v), nil
+	}
+
+	if got := cgroupMemoryLimit(read); got != 0 {
+		t.Fatalf("no cgroup files: %d", got)
+	}
+
+	files["/sys/fs/cgroup/memory.max"] = "max\n"
+
+	if got := cgroupMemoryLimit(read); got != 0 {
+		t.Fatalf("unlimited: %d", got)
+	}
+
+	files["/sys/fs/cgroup/memory.max"] = "8589934592\n"
+
+	if got := cgroupMemoryLimit(read); got != 8<<30 {
+		t.Fatalf("v2 limit: %d", got)
+	}
+
+	delete(files, "/sys/fs/cgroup/memory.max")
+	files["/sys/fs/cgroup/memory/memory.limit_in_bytes"] = "1073741824"
+
+	if got := cgroupMemoryLimit(read); got != 1<<30 {
+		t.Fatalf("v1 limit: %d", got)
+	}
+
+	// An explicit GOMEMLIMIT wins.
+	env := func(k string) string {
+		if k == "GOMEMLIMIT" {
+			return "1GiB"
+		}
+
+		return ""
+	}
+	if got := setCachemeshMemoryLimit(slog.New(slog.DiscardHandler), env, read); got != 0 {
+		t.Fatalf("GOMEMLIMIT set: applied %d", got)
 	}
 }

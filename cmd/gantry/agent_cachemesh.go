@@ -11,6 +11,9 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime/debug"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -40,6 +43,59 @@ type cachemeshAgent struct {
 	cancel  context.CancelFunc
 	done    chan error
 	tags    bool
+}
+
+// cachemeshMemoryLimitPercent is the share of the container memory limit
+// given to the Go runtime as its soft limit.
+const cachemeshMemoryLimitPercent = 90
+
+// setCachemeshMemoryLimit gives the Go runtime a soft memory limit below the
+// container limit unless GOMEMLIMIT is set. The chunk cache keeps gigabytes
+// live; without a limit the default GC target (twice the live heap) can
+// exceed the container limit before a collection runs.
+func setCachemeshMemoryLimit(logger *slog.Logger, getenv func(string) string, readFile func(string) ([]byte, error)) int64 {
+	if getenv("GOMEMLIMIT") != "" {
+		return 0
+	}
+
+	limit := cgroupMemoryLimit(readFile)
+	if limit <= 0 {
+		return 0
+	}
+
+	soft := limit / 100 * cachemeshMemoryLimitPercent
+	debug.SetMemoryLimit(soft)
+	logger.Info("cachemesh: set Go memory limit from the container limit",
+		slog.Int64("container_limit", limit),
+		slog.Int64("go_memory_limit", soft),
+	)
+
+	return soft
+}
+
+// cgroupMemoryLimit returns the cgroup v2 (or v1) memory limit in bytes, or
+// zero when there is none.
+func cgroupMemoryLimit(readFile func(string) ([]byte, error)) int64 {
+	for _, path := range []string{"/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"} {
+		raw, err := readFile(path)
+		if err != nil {
+			continue
+		}
+
+		v := strings.TrimSpace(string(raw))
+		if v == "max" {
+			return 0
+		}
+
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n <= 0 || n >= 1<<62 {
+			return 0
+		}
+
+		return n
+	}
+
+	return 0
 }
 
 // cachemeshMemberID names this agent in the mesh: the Kubernetes node name,
@@ -140,6 +196,8 @@ func newCachemeshAgent(c *config.Config, origin ifaces.OriginPuller, reg *metric
 	if err != nil {
 		return nil, err
 	}
+
+	setCachemeshMemoryLimit(logger, os.Getenv, os.ReadFile)
 
 	a := &cachemeshAgent{mesh: mesh, node: node, logger: logger, tags: tagOrigin != nil}
 	a.meshPtr.Store(mesh)
