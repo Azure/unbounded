@@ -336,6 +336,45 @@ fn small_exchange_over_http_and_https_by_name() {
     }
 }
 
+#[test]
+fn small_exchange_rejects_unsafe_method_and_target_before_connecting() {
+    let env = racer_io::Env::host();
+    let Some(reactor) = reactor(&env) else { return };
+    let endpoint = RemoteEndpoint::http("token.example", 1).unwrap();
+    let resolver = MapResolver::new(vec![]);
+    let scope = scope();
+    for (method, target) in [
+        ("POST", "/a\r\nX-Injected: 1"),
+        ("POST", "/a b"),
+        ("POST", "/a\n"),
+        ("POST", ""),
+        ("PO ST", "/a"),
+        ("POST\r\n", "/a"),
+        ("", "/a"),
+    ] {
+        let result = drive(
+            &reactor,
+            Box::pin(exchange_small(
+                &reactor,
+                &resolver,
+                &endpoint,
+                &SmallRequest {
+                    method,
+                    target,
+                    headers: &[],
+                    body: b"",
+                },
+                MAX_SMALL_BODY,
+                &scope,
+            )),
+        );
+        assert!(
+            matches!(result, Err(Error::InvalidRequest)),
+            "{method:?} {target:?}"
+        );
+    }
+}
+
 /// Pooled ranged GETs to a DNS-named endpoint, plain and HTTPS (automatic
 /// record-layer placement), reading a 16 MiB body in bounded chunks.
 #[test]

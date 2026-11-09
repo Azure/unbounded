@@ -422,6 +422,13 @@ pub async fn exchange_small(
     limit: usize,
     scope: &RequestScope,
 ) -> Result<SmallResponse> {
+    if request.method.is_empty()
+        || !request.method.bytes().all(http1::is_token)
+        || request.target.is_empty()
+        || request.target.bytes().any(|b| b <= 0x20 || b == 0x7f)
+    {
+        return Err(Error::InvalidRequest);
+    }
     endpoint.resolve(resolver, scope).await?;
     let mut wire = Zeroizing::new(Vec::with_capacity(256 + request.body.len()));
     write!(
