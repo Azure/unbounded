@@ -465,6 +465,13 @@ func TestSendChunkHedgesSlowPeer(t *testing.T) {
 
 	inner := slow.srv.Config.Handler
 	slow.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The hedge may be relayed through the slow member when it owns
+		// the chunk; only the original request is slow.
+		if h, err := decodeHeader(r.Header.Get(headerRoute)); err == nil && h.Flags&cachemesh.FlagHedge != 0 {
+			inner.ServeHTTP(w, r)
+			return
+		}
+
 		select {
 		case <-time.After(3 * time.Second):
 		case <-r.Context().Done():
