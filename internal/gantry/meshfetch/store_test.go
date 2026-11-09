@@ -964,7 +964,7 @@ func TestEvictLingeringPrefersNotOwned(t *testing.T) {
 		f := r.f
 
 		if owned {
-			s.markOwned(f)
+			f.owned.Store(true)
 		}
 
 		data := pattern(byte(k.index), testChunk)

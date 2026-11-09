@@ -201,32 +201,35 @@ func (s *store) releaseExtra(pages int) {
 	}
 }
 
-// get returns a reader of the fill for k at byte off, or nil when there is
-// none that can serve from off.
+// get returns a peer reader of the fill for k at byte off, or nil when
+// there is none that can serve from off. It never starts a fill.
 func (s *store) get(k chunkKey, off int) *reader {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	return s.joinLocked(k, off, true)
+}
+
+// joinLocked returns a reader at byte off of the fill for k when there is
+// one that can serve from off, else nil. Caller holds s.mu.
+func (s *store) joinLocked(k chunkKey, off int, shared bool) *reader {
 	f := s.m[k]
 	if f == nil {
 		return nil
 	}
 
 	f.mu.Lock()
-	ok := f.joinable(off)
 
 	var r *reader
-	if ok {
-		r = f.newReaderLocked(off, true)
+	if f.joinable(off) {
+		r = f.newReaderLocked(off, shared)
 	}
 	f.mu.Unlock()
 
-	if !ok {
-		return nil
+	if r != nil {
+		f.refs.Add(1)
+		s.touch(f)
 	}
-
-	f.refs.Add(1)
-	s.touch(f)
 
 	return r
 }
@@ -257,22 +260,12 @@ func (s *store) acquire(ctx context.Context, k chunkKey, off int, wait, shared b
 			return nil, false, errClosed
 		}
 
+		if r = s.joinLocked(k, off, shared); r != nil {
+			s.mu.Unlock()
+			return r, false, nil
+		}
+
 		if f := s.m[k]; f != nil {
-			f.mu.Lock()
-			if f.joinable(off) {
-				r = f.newReaderLocked(off, shared)
-			}
-			f.mu.Unlock()
-
-			if r != nil {
-				f.refs.Add(1)
-
-				s.touch(f)
-				s.mu.Unlock()
-
-				return r, false, nil
-			}
-
 			s.detachLocked(f)
 		}
 
@@ -321,12 +314,6 @@ func (s *store) newLocalFill(k chunkKey, off int) (*fill, *reader) {
 	s.mu.Unlock()
 
 	return f, f.newReader(off, true)
-}
-
-// markOwned records that f is filled by this member as the chunk's owner.
-// A lingering owned chunk is reclaimed after the others.
-func (s *store) markOwned(f *fill) {
-	f.owned.Store(true)
 }
 
 // detachLocked removes f from the map and the memory list. Readers
@@ -853,11 +840,7 @@ func (f *fill) slot(ctx context.Context, n int, touch func()) (*page, error) {
 			// join it (see store.finished), unless the local content
 			// store already holds it.
 			if f.keepWholeLocked() {
-				if s.borrowExtra() || f.reclaimLocked() {
-					f.extra++
-					p := s.pool.get()
-					f.win = append(f.win, p)
-
+				if p := f.borrowLocked(); p != nil {
 					return p, nil
 				}
 			}
@@ -880,11 +863,7 @@ func (f *fill) slot(ctx context.Context, n int, touch func()) (*page, error) {
 		}
 
 		if f.peers > 0 {
-			if s.borrowExtra() || f.reclaimLocked() {
-				f.extra++
-				p := s.pool.get()
-				f.win = append(f.win, p)
-
+			if p := f.borrowLocked(); p != nil {
 				return p, nil
 			}
 		}
@@ -935,6 +914,21 @@ func (f *fill) slot(ctx context.Context, n int, touch func()) (*page, error) {
 // Caller holds f.mu.
 func (f *fill) keepWholeLocked() bool {
 	return (f.hadPeers || f.owned.Load()) && f.winStart == 0 && f.store.cfg.extraBudget > 0 && !f.localPageLocked(0)
+}
+
+// borrowLocked appends a page borrowed from the in-flight budget to the
+// window, reclaiming a lingering chunk if the budget is exhausted. It
+// returns nil when there is nothing to borrow. Caller holds f.mu.
+func (f *fill) borrowLocked() *page {
+	if !f.store.borrowExtra() && !f.reclaimLocked() {
+		return nil
+	}
+
+	f.extra++
+	p := f.store.pool.get()
+	f.win = append(f.win, p)
+
+	return p
 }
 
 // reclaimLocked evicts one lingering in-memory chunk and borrows a page
