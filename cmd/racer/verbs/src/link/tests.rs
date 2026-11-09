@@ -557,6 +557,39 @@ fn abandoned_or_late_grant_is_never_exposed() {
 }
 
 #[test]
+/// A bound grant dropped while it waits for credits is invalidated at once:
+/// it frees its window and buffer instead of holding the queue until its
+/// deadline.
+fn abandoned_grant_short_of_credits_is_freed() {
+    profiles(|| {
+        let mut p = pair();
+        let now = p.now;
+        let saved = p.a.link.credits;
+        p.a.link.credits = 1;
+        let waiting = grant(&mut p.a, 10, now + 5 * SECOND, now);
+        assert_eq!(p.a.link.poll(&p.a.pool, now), Ok(()));
+        assert_eq!(p.a.link.poll(&p.a.pool, now), Ok(()));
+        assert!(matches!(
+            p.a.link.grants.values().next().unwrap().state,
+            GrantState::Bound
+        ));
+        drop(waiting);
+        for _ in 0..4 {
+            assert_eq!(p.a.link.poll(&p.a.pool, now), Ok(()));
+        }
+        assert_eq!(p.a.link.credits, 1, "no credits came back");
+        assert!(p.a.link.outbox.is_empty());
+        assert!(p.a.link.grants.is_empty());
+        assert_eq!(free(&p.a), 4);
+        assert_eq!(p.a.link.free_windows.len(), GRANTS as usize);
+        p.a.link.credits = saved;
+        assert_eq!(pump(&mut p), (None, None));
+        assert!(p.b.link.remote.is_empty());
+        finish(p);
+    });
+}
+
+#[test]
 /// Data waits while credits are short and goes out once the peer returns
 /// them.
 fn credit_exhaustion_waits() {

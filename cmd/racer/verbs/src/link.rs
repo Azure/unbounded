@@ -1428,7 +1428,13 @@ impl Link {
         // until the connection manager established it.
         while i < self.outbox.len() && self.qp.ready() && self.qp.sends() < self.send_depth {
             let item = &self.outbox[i];
-            let need = item.credits();
+            // A grant whose caller went away posts as a zero-credit
+            // invalidate (see `post`), so credits must not hold it, and the
+            // data behind it, in the queue.
+            let need = match item {
+                Outgoing::Grant(tag) if self.abandoned(*tag) => 0,
+                _ => item.credits(),
+            };
 
             let starved = self.credits < need || (item.control() && self.free_slots.is_empty());
 
@@ -1450,6 +1456,13 @@ impl Link {
         }
 
         Ok(())
+    }
+
+    /// Whether grant `tag` has no caller left to receive it.
+    fn abandoned(&self, tag: u32) -> bool {
+        self.grants
+            .get(&tag)
+            .is_some_and(|entry| entry.granted.as_ref().is_none_or(Completer::is_abandoned))
     }
 
     /// Post one item. Callers checked credits, queue space, and slots.
@@ -1507,13 +1520,14 @@ impl Link {
                 self.track(wr(WRITE, tag), InFlight::Write { source, done });
             }
             Outgoing::Grant(tag) => {
-                let entry = self.grants.get_mut(&tag).ok_or(Error::Io)?;
-
-                if entry.granted.as_ref().is_none_or(Completer::is_abandoned) {
+                if self.abandoned(tag) {
+                    let entry = self.grants.get_mut(&tag).ok_or(Error::Io)?;
                     // Never exposed: fence the bound window and free it.
                     entry.state = GrantState::Invalidating(Outcome::Canceled(Error::Canceled));
                     return self.post(pool, Outgoing::Invalidate(tag));
                 }
+
+                let entry = self.grants.get_mut(&tag).ok_or(Error::Io)?;
 
                 let buffer = entry.buffer.as_ref().ok_or(Error::Io)?;
                 let message = ControlKind::Grant {
