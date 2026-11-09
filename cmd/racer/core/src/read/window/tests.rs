@@ -552,6 +552,43 @@ fn a_passed_client_deadline_fails_the_read() {
     assert_eq!(h.next().0, Next::Fail(Error::DeadlineExceeded));
 }
 
+/// A planning failure ends the read on the next `next`: ready pages are discarded without the
+/// caller calling `terminate`.
+#[test]
+fn a_planning_failure_terminates_on_next() {
+    let mut h = Harness::new(WindowConfig {
+        budget: PageBudget::Client {
+            deadline: Instant::now(),
+        },
+        ..config(2, 2)
+    });
+    h.now += Duration::from_secs(1);
+    let effects = h.pump();
+    let ids: Vec<_> = effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::Probe { id, .. } => Some(*id),
+            _ => None,
+        })
+        .collect();
+    h.on(Input::Probed {
+        id: ids[0],
+        found: true,
+    });
+    h.on(Input::Probed {
+        id: ids[1],
+        found: false,
+    });
+    assert!(fetches(&h.pump()).is_empty());
+    assert!(!h.window.terminated());
+    let (next, out) = h.next();
+    assert_eq!(next, Next::Fail(Error::DeadlineExceeded));
+    assert_eq!(out, [Effect::Discard(ids[0])]);
+    assert!(h.window.terminated());
+    // Idempotent: a second `next` or `terminate` emits nothing more.
+    assert_eq!(h.next(), (Next::Fail(Error::DeadlineExceeded), Vec::new()));
+}
+
 #[test]
 fn progressing_pages_get_their_own_deadline() {
     let mut h = Harness::new(WindowConfig {

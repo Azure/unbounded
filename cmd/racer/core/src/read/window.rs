@@ -825,6 +825,7 @@ impl ReadWindow {
     /// Deliver the head page if it is ready. A delivered page's spill hold is released.
     pub fn next(&mut self, out: &mut Vec<Effect>) -> Next {
         if let Some(error) = self.error {
+            self.terminate(out);
             return Next::Fail(error);
         }
         if self.next >= self.config.end {
