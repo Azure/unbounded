@@ -717,6 +717,15 @@ impl ReadWindow {
         }
     }
 
+    /// Whether another `Unavailable` failure of `number`'s fill would still be
+    /// restarted, so the shell backs off only before a real next attempt.
+    #[must_use]
+    pub fn restarts_unavailable(&self, number: u64) -> bool {
+        self.retries
+            .get(&number)
+            .is_none_or(|&(count, _)| count < PAGE_RETRIES)
+    }
+
     /// Count one restart of `number`'s fill; false once its `capped` retries are spent.
     /// Uncapped (local pressure) restarts only grow the backoff.
     fn retry_page(&mut self, number: u64, capped: bool) -> bool {

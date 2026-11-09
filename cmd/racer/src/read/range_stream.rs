@@ -1055,11 +1055,16 @@ impl RangeStream {
         }
         let reactor = self.delivery.reactor().clone();
         let page = self.page_id(number);
+        let last = !self
+            .window
+            .as_ref()
+            .is_none_or(|window| window.restarts_unavailable(number.0));
         let io = match &self.sealed {
             Some(target) => Io::FetchSealed(with_backoff(
                 reactor,
                 scope.clone(),
                 retry,
+                last,
                 self.directory.start_page_sealed(
                     page,
                     self.membership.clone(),
@@ -1073,6 +1078,7 @@ impl RangeStream {
                 reactor,
                 scope.clone(),
                 retry,
+                last,
                 self.directory.start_page(
                     page,
                     self.membership.clone(),
@@ -1732,10 +1738,13 @@ fn restarted(error: Error) -> bool {
 /// Hold a restartable fill failure for the next restart's backoff before the
 /// window sees it, so pressure that other reads relieve is waited out rather
 /// than retried in a tight loop. A fill that could not start fails the same way.
+/// `last` means the window will not restart another `Unavailable` failure, so
+/// that failure is reported at once instead of after a backoff nobody waits for.
 fn with_backoff<T: 'static>(
     reactor: Rc<crate::runtime::Reactor>,
     scope: RequestScope,
     retry: u8,
+    last: bool,
     started: Result<Operation<'static, T>>,
 ) -> Operation<'static, T> {
     Box::pin(async move {
@@ -1745,6 +1754,7 @@ fn with_backoff<T: 'static>(
         };
         if let Err(error) = &result
             && restarted(*error)
+            && !(last && *error == Error::Unavailable)
         {
             let until = scope.clock().now() + win::retry_delay(retry.saturating_add(1));
             // A canceled or expired scope ends the read; the window sees that.
@@ -2684,7 +2694,7 @@ pub(super) mod tests {
         };
         // Success and final errors pass through at once.
         for result in [Ok(7), Err(Error::CorruptRecord)] {
-            let mut op = with_backoff(reactor.clone(), scope(), 3, fill(result));
+            let mut op = with_backoff(reactor.clone(), scope(), 3, false, fill(result));
             assert_eq!(op.as_mut().poll(&mut cx), Poll::Ready(result));
         }
         // Restartable failures, including one that could not start, wait.
@@ -2700,7 +2710,7 @@ pub(super) mod tests {
             };
             let delay = win::retry_delay(retry.saturating_add(1));
             assert!(!delay.is_zero());
-            let mut op = with_backoff(reactor.clone(), scope(), retry, started);
+            let mut op = with_backoff(reactor.clone(), scope(), retry, false, started);
             assert!(op.as_mut().poll(&mut cx).is_pending());
             clock.advance(delay - Duration::from_millis(1));
             assert!(op.as_mut().poll(&mut cx).is_pending());
@@ -2713,6 +2723,7 @@ pub(super) mod tests {
             reactor.clone(),
             canceled.clone(),
             0,
+            false,
             fill(Err(Error::Overloaded)),
         );
         assert!(op.as_mut().poll(&mut cx).is_pending());
@@ -2721,6 +2732,27 @@ pub(super) mod tests {
             op.as_mut().poll(&mut cx),
             Poll::Ready(Err(Error::Overloaded))
         );
+        // The window's last `Unavailable` restart is spent: fail at once.
+        let mut op = with_backoff(
+            reactor.clone(),
+            scope(),
+            16,
+            true,
+            fill(Err(Error::Unavailable)),
+        );
+        assert_eq!(
+            op.as_mut().poll(&mut cx),
+            Poll::Ready(Err(Error::Unavailable))
+        );
+        // Uncapped pressure failures still back off when the cap is spent.
+        let mut op = with_backoff(
+            reactor.clone(),
+            scope(),
+            16,
+            true,
+            fill(Err(Error::Overloaded)),
+        );
+        assert!(op.as_mut().poll(&mut cx).is_pending());
     }
 
     #[test]

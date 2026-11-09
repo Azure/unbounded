@@ -290,6 +290,12 @@ fn unavailable_retries_up_to_the_page_limit_with_backoff() {
         };
         // Every restart reports how many came before it, for the backoff.
         assert_eq!(retry, round, "round {round}");
+        // Only the last attempt's `Unavailable` is not restarted.
+        assert_eq!(
+            h.window.restarts_unavailable(0),
+            round < PAGE_RETRIES,
+            "round {round}"
+        );
         h.on(Input::Fetched {
             id,
             result: Err(Error::Unavailable),
