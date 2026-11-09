@@ -1312,8 +1312,12 @@ impl Owner {
     }
 
     /// Append [`Self::poll_fds`] to `out`, so a caller can reuse its buffer.
+    /// A lost device is left out: its channels can only report errors.
     pub fn poll_fds_into(&self, out: &mut Vec<std::os::fd::RawFd>) {
-        for device in self.devices.values() {
+        for (rail, device) in &self.devices {
+            if self.lost.contains(rail) {
+                continue;
+            }
             device.device.fds_into(out);
         }
     }

@@ -120,6 +120,11 @@ pub struct OwnerRole {
 
     /// Scratch for [`Self::park`], reused across parks.
     pollfds: Vec<libc::pollfd>,
+
+    /// Descriptors that reported an error or hangup (a hot-removed
+    /// device's completion channel), no longer waited on: otherwise every
+    /// park would return at once and spin the owner.
+    dead: Vec<std::os::fd::RawFd>,
 }
 
 impl OwnerRole {
@@ -139,6 +144,7 @@ impl OwnerRole {
             reported: 0,
             fds: Vec::new(),
             pollfds: Vec::new(),
+            dead: Vec::new(),
         };
         Ok((role, stop))
     }
@@ -207,13 +213,22 @@ impl Role for OwnerRole {
         self.fds.clear();
         self.fds.push(self.stop.wake.0.as_raw_fd());
         self.owner.poll_fds_into(&mut self.fds);
+        // Forget dead descriptors the owner no longer lists, so a reused
+        // number is waited on again.
+        self.dead.retain(|fd| self.fds.contains(fd));
         let fds = &mut self.pollfds;
         fds.clear();
-        fds.extend(self.fds.iter().map(|&fd| libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        }));
+        let dead = &self.dead;
+        fds.extend(
+            self.fds
+                .iter()
+                .filter(|fd| !dead.contains(fd))
+                .map(|&fd| libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                }),
+        );
         let spec = timeout.map(|t| libc::timespec {
             tv_sec: t.as_secs().min(i64::MAX as u64) as libc::time_t,
             tv_nsec: libc::c_long::from(t.subsec_nanos() as i32),
@@ -233,8 +248,78 @@ impl Role for OwnerRole {
                 return Err(racer_io::Error::from_io(error));
             }
         }
+        if result > 0 {
+            note_dead(&self.pollfds, &mut self.dead);
+        }
         self.stop.wake.clear();
         self.stop.wakes.fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+}
+
+/// Record every descriptor in `fds` that reported an error, hangup, or
+/// invalid descriptor in `dead`, and log each once.
+fn note_dead(fds: &[libc::pollfd], dead: &mut Vec<std::os::fd::RawFd>) {
+    for p in fds {
+        if p.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0
+            && !dead.contains(&p.fd)
+        {
+            eprintln!(
+                "racer: stage=rdma-owner fd={} revents={:#x} state=ignored; the descriptor \
+                 reported an error and is no longer waited on",
+                p.fd, p.revents
+            );
+            dead.push(p.fd);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    /// Only error, hangup, and invalid descriptors are recorded, once each.
+    fn note_dead_records_failed_descriptors_once() {
+        let fd = |fd, revents| libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents,
+        };
+        let mut dead = vec![7];
+        note_dead(
+            &[
+                fd(3, libc::POLLIN),
+                fd(4, libc::POLLERR),
+                fd(5, libc::POLLHUP | libc::POLLIN),
+                fd(6, libc::POLLNVAL),
+                fd(7, libc::POLLERR),
+                fd(8, 0),
+            ],
+            &mut dead,
+        );
+        assert_eq!(dead, [7, 4, 5, 6]);
+    }
+
+    #[test]
+    /// A pipe whose writer closed reports a hangup through a real poll.
+    fn note_dead_sees_real_hangup() {
+        let mut ends = [0; 2];
+        // SAFETY: `ends` has room for both descriptors.
+        assert_eq!(unsafe { libc::pipe(ends.as_mut_ptr()) }, 0);
+        // SAFETY: both descriptors are fresh and owned here.
+        let (read, write) =
+            unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) };
+        drop(write);
+        let mut fds = [libc::pollfd {
+            fd: read.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        // SAFETY: `fds` outlives the call.
+        assert_eq!(unsafe { libc::poll(fds.as_mut_ptr(), 1, 0) }, 1);
+        let mut dead = Vec::new();
+        note_dead(&fds, &mut dead);
+        assert_eq!(dead, [read.as_raw_fd()]);
     }
 }
