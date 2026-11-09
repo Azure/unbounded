@@ -14,6 +14,7 @@
   {"name": "RACER_RDMA_BREAKER_COOLDOWN_MS", "owner": "dataplane", "scope": "node", "kind": "unsigned", "min": "1", "max": "3600000", "step": "1", "default": "2000", "empty_unset": false},
   {"name": "RACER_RDMA_BREAKER_MAX_COOLDOWN_MS", "owner": "dataplane", "scope": "node", "kind": "unsigned", "min": "1", "max": "3600000", "step": "1", "default": "30000", "empty_unset": false},
   {"name": "RACER_RDMA_PAGE_TIMEOUT_MS", "owner": "dataplane", "scope": "node", "kind": "unsigned", "min": "1", "max": "60000", "step": "1", "default": "5000", "empty_unset": false},
+  {"name": "RACER_RDMA_CM_PORT", "owner": "dataplane", "scope": "node", "kind": "unsigned", "min": "1", "max": "65535", "step": "1", "default": "18515", "empty_unset": false},
   {"name": "RACER_MEMORY_PRESSURE", "owner": "dataplane", "scope": "node", "kind": "bool", "default": "true", "empty_unset": false},
   {"name": "RACER_ENABLE_GPU", "owner": "dataplane", "scope": "node", "kind": "enum", "values": ["auto", "true", "false"], "default": "auto", "empty_unset": false},
   {"name": "RACER_GPU_STAGING_BYTES", "owner": "dataplane", "scope": "node", "kind": "unsigned", "min": "2097152", "max": "18446744073709551615", "step": "2097152", "default": "268435456", "empty_unset": false},

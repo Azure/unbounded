@@ -3156,11 +3156,16 @@ mod tests {
         assert_eq!(tuned.rdma_breaker.base, Duration::from_millis(500));
         assert_eq!(tuned.rdma_breaker.max, Duration::from_millis(500));
         assert_eq!(tuned.rdma_breaker.page_timeout, Duration::from_millis(750));
+        for port in ["1", "18515", "65535"] {
+            assert!(parse(&[("RACER_RDMA_CM_PORT", port)]).is_ok(), "{port}");
+        }
         for (name, value) in [
             ("RACER_RDMA_PAGE_TIMEOUT_MS", "0"),
             ("RACER_RDMA_PAGE_TIMEOUT_MS", "60001"),
             ("RACER_RDMA_BREAKER_COOLDOWN_MS", "0"),
             ("RACER_RDMA_BREAKER_COOLDOWN_MS", "30001"),
+            ("RACER_RDMA_CM_PORT", "0"),
+            ("RACER_RDMA_CM_PORT", "65536"),
         ] {
             assert!(parse(&[(name, value)]).is_err(), "{name}={value}");
         }

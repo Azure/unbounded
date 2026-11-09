@@ -367,6 +367,7 @@ each worker and are never divided.
 | `RACER_RDMA_BREAKER_COOLDOWN_MS` | `2000` | Node | 1..3,600,000 ms | First breaker cooldown; it doubles for each consecutive trip, up to `RACER_RDMA_BREAKER_MAX_COOLDOWN_MS`, less up to a fifth as jitter. |
 | `RACER_RDMA_BREAKER_MAX_COOLDOWN_MS` | `30000` | Node | 1..3,600,000 ms | Longest breaker cooldown; at least `RACER_RDMA_BREAKER_COOLDOWN_MS`. |
 | `RACER_RDMA_PAGE_TIMEOUT_MS` | `5000` | Node | 1..60,000 ms | Longest one page's RDMA grant or write may take before the page goes over HTTP in the same exchange; counts a soft breaker failure. |
+| `RACER_RDMA_CM_PORT` | `18515` | Node | 1..65,535 | TCP port each dataplane's RDMA connection manager listens on; must match on every node. |
 | `RACER_MEMORY_PRESSURE` | `true` | Node | `true`, `false` | cgroup v2 memory-pressure monitoring and reclaim. |
 
 #### GPU reads

@@ -379,6 +379,13 @@ const BASE: &[Var] = &[
         "Longest one page's RDMA grant or write may take before the page goes over HTTP in the same exchange; counts a soft breaker failure.",
     ),
     var(
+        "RACER_RDMA_CM_PORT",
+        Group::Hardware,
+        uint(1, 65_535, COUNT),
+        Value("18515"),
+        "TCP port each dataplane's RDMA connection manager listens on; must match on every node.",
+    ),
+    var(
         "RACER_MEMORY_PRESSURE",
         Group::Hardware,
         Kind::Bool,
