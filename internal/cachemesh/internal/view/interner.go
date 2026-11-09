@@ -13,50 +13,15 @@ type applyKey struct {
 	delta Digest
 }
 
-// fifo is a bounded map evicting the oldest insertion.
-type fifo[K comparable, V any] struct {
-	m     map[K]V
-	order []K
-	next  int
-}
-
-func newFIFO[K comparable, V any](n int) fifo[K, V] {
-	return fifo[K, V]{m: make(map[K]V, n), order: make([]K, 0, n)}
-}
-
-func (f *fifo[K, V]) get(k K) (V, bool) {
-	v, ok := f.m[k]
-
-	return v, ok
-}
-
-func (f *fifo[K, V]) put(k K, v V) {
-	if _, ok := f.m[k]; ok {
-		f.m[k] = v
-
-		return
-	}
-
-	if len(f.order) < cap(f.order) {
-		f.order = append(f.order, k)
-	} else {
-		delete(f.m, f.order[f.next])
-		f.order[f.next] = k
-		f.next = (f.next + 1) % len(f.order)
-	}
-
-	f.m[k] = v
-}
-
 // Interner shares identical views and decoded deltas, for example across
 // thousands of simulated members that apply the same deltas. It is only a
 // cache: results equal those of Apply and DecodeDelta. Each table is bounded
 // and evicts in insertion order. It is not safe for concurrent use.
 // Production code does not use it.
 type Interner struct {
-	byID    fifo[Digest, *View]
-	deltas  fifo[Digest, *Delta]
-	applied fifo[applyKey, *View]
+	byID    FIFO[Digest, *View]
+	deltas  FIFO[Digest, *Delta]
+	applied FIFO[applyKey, *View]
 
 	// Hits and Misses count Apply and Delta cache lookups.
 	Hits, Misses uint64
@@ -70,20 +35,20 @@ func NewInterner(size int) *Interner {
 	}
 
 	return &Interner{
-		byID:    newFIFO[Digest, *View](size),
-		deltas:  newFIFO[Digest, *Delta](size),
-		applied: newFIFO[applyKey, *View](size),
+		byID:    NewFIFO[Digest, *View](size),
+		deltas:  NewFIFO[Digest, *Delta](size),
+		applied: NewFIFO[applyKey, *View](size),
 	}
 }
 
 // View returns the interned view with v's digest, interning v if there is
 // none. Views with equal digests are assumed equal.
 func (in *Interner) View(v *View) *View {
-	if w, ok := in.byID.get(v.Digest()); ok && w.Version() == v.Version() {
+	if w, ok := in.byID.Get(v.Digest()); ok && w.Version() == v.Version() {
 		return w
 	}
 
-	in.byID.put(v.Digest(), v)
+	in.byID.Put(v.Digest(), v)
 
 	return v
 }
@@ -92,7 +57,7 @@ func (in *Interner) View(v *View) *View {
 // result is interned.
 func (in *Interner) Apply(base *View, d *Delta) (*View, error) {
 	k := applyKey{base: base.Digest(), delta: d.Digest}
-	if v, ok := in.applied.get(k); ok && base.Version() == d.Base && v.Version() == d.Version {
+	if v, ok := in.applied.Get(k); ok && base.Version() == d.Base && v.Version() == d.Version {
 		in.Hits++
 
 		return v, nil
@@ -106,7 +71,7 @@ func (in *Interner) Apply(base *View, d *Delta) (*View, error) {
 	}
 
 	v = in.View(v)
-	in.applied.put(k, v)
+	in.applied.Put(k, v)
 
 	return v, nil
 }
@@ -115,7 +80,7 @@ func (in *Interner) Apply(base *View, d *Delta) (*View, error) {
 // returned delta is shared and must not be modified.
 func (in *Interner) Delta(encoded []byte) (*Delta, error) {
 	k := Digest(sha256.Sum256(encoded))
-	if d, ok := in.deltas.get(k); ok {
+	if d, ok := in.deltas.Get(k); ok {
 		in.Hits++
 
 		return d, nil
@@ -128,7 +93,7 @@ func (in *Interner) Delta(encoded []byte) (*Delta, error) {
 		return nil, err
 	}
 
-	in.deltas.put(k, d)
+	in.deltas.Put(k, d)
 
 	return d, nil
 }

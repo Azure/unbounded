@@ -25,14 +25,13 @@ type Shared struct {
 	// Interner shares views and decoded deltas.
 	Interner *view.Interner
 
-	enc   map[view.Digest][]byte
-	encQ  []view.Digest
-	snap  map[view.Digest][]byte
-	snapQ []view.Digest
-	cand  map[candKey][]uint64
-	candQ []candKey
-	size  int
+	enc  view.FIFO[view.Digest, []byte]
+	snap view.FIFO[view.Digest, []byte]
+	cand view.FIFO[candKey, []uint64]
 }
+
+// sharedSnapshots bounds the encoded snapshots a Shared cache holds.
+const sharedSnapshots = 64
 
 type candKey struct {
 	digest view.Digest
@@ -47,35 +46,21 @@ func NewShared(size int) *Shared {
 
 	return &Shared{
 		Interner: view.NewInterner(size),
-		enc:      map[view.Digest][]byte{},
-		snap:     map[view.Digest][]byte{},
-		cand:     map[candKey][]uint64{},
-		size:     size,
+		enc:      view.NewFIFO[view.Digest, []byte](size),
+		snap:     view.NewFIFO[view.Digest, []byte](sharedSnapshots),
+		cand:     view.NewFIFO[candKey, []uint64](size),
 	}
-}
-
-func fifoPut[K comparable, V any](m map[K]V, q *[]K, limit int, k K, v V) {
-	if _, ok := m[k]; !ok {
-		if len(*q) >= limit {
-			delete(m, (*q)[0])
-			*q = (*q)[1:]
-		}
-
-		*q = append(*q, k)
-	}
-
-	m[k] = v
 }
 
 // encoded returns a canonical copy of the encoded delta.
 func (n *Node) encoded(d *view.Delta, raw []byte) []byte {
 	if s := n.shared; s != nil {
-		if b, ok := s.enc[d.Digest]; ok {
+		if b, ok := s.enc.Get(d.Digest); ok {
 			return b
 		}
 
 		b := bytes.Clone(raw)
-		fifoPut(s.enc, &s.encQ, s.size, d.Digest, b)
+		s.enc.Put(d.Digest, b)
 
 		return b
 	}
@@ -108,11 +93,11 @@ func (n *Node) snapshot() []byte {
 	var b []byte
 
 	if s := n.shared; s != nil {
-		if c, ok := s.snap[d]; ok {
+		if c, ok := s.snap.Get(d); ok {
 			b = c
 		} else {
 			b = view.EncodeSnapshot(n.v)
-			fifoPut(s.snap, &s.snapQ, 64, d, b)
+			s.snap.Put(d, b)
 		}
 	} else {
 		b = view.EncodeSnapshot(n.v)
@@ -781,7 +766,7 @@ func (n *Node) isCandidate() bool {
 func (n *Node) topCandidates(ep uint64) []uint64 {
 	k := candKey{digest: n.v.Digest(), epoch: ep}
 	if s := n.shared; s != nil {
-		if t, ok := s.cand[k]; ok {
+		if t, ok := s.cand.Get(k); ok {
 			return t
 		}
 	}
@@ -806,7 +791,7 @@ func (n *Node) topCandidates(ep uint64) []uint64 {
 	top := elect.TopCandidates(LeaseSeed, keys, n.cfg.Elect.Candidates)
 
 	if s := n.shared; s != nil {
-		fifoPut(s.cand, &s.candQ, s.size, k, top)
+		s.cand.Put(k, top)
 	}
 
 	return top
