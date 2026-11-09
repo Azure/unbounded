@@ -6,6 +6,11 @@ license = "Apache-2.0"
 publish = false
 description = "Racer control plane embedded in racer: Lease seats, primary, and control API"
 
+[features]
+# Deterministic simulation support (the `simulation` module and the fake
+# Kubernetes API server). Enabled by racer-dst; never by the production binary.
+sim = []
+
 [dependencies]
 racer-wire = { path = "../wire" }
 racer-core = { path = "../core" }

@@ -54,6 +54,7 @@ pub mod rules;
 mod seat;
 mod server;
 mod shared;
+#[cfg(any(test, feature = "sim"))]
 pub mod simulation;
 mod sync;
 #[cfg(test)]

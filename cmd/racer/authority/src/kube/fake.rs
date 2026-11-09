@@ -5,24 +5,29 @@
 //! CAS, POST, merge and JSON PATCH, watch with compaction (410 Gone), field
 //! selectors, fault injection) over TLS on loopback.
 
-use super::{Kube, KubeConfig};
+#[cfg(test)]
+use super::Kube;
+use super::KubeConfig;
+#[cfg(test)]
+use crate::rt::Executor;
 use crate::{
     conn::{self as http, Conn},
-    rt::{self, Executor, Listener, Signal},
+    rt::{self, Listener, Signal},
     tls::TlsStream,
 };
 use serde_json::{Value, json};
 use std::{
     cell::RefCell,
     collections::{BTreeMap, VecDeque},
-    future::Future,
     rc::Rc,
     sync::{
         Arc,
-        atomic::{AtomicU64, AtomicUsize, Ordering::SeqCst},
+        atomic::{AtomicU64, Ordering::SeqCst},
     },
     time::Duration,
 };
+#[cfg(test)]
+use std::{future::Future, sync::atomic::AtomicUsize};
 
 /// Shared fake server state: a [`Store`] plus wakeups and test hooks.
 #[derive(Clone)]
@@ -53,18 +58,23 @@ impl FakeApi {
     }
 
     /// Accept only `token` as the bearer from now on.
+    #[cfg(test)]
     pub fn set_token(&self, token: &str) {
         *self.0.token.borrow_mut() = token.into();
     }
 
     /// Hold each PUT until it is `delay_ms` old; `u64::MAX` hangs PUTs as a
     /// stuck API server would.
+    #[cfg(test)]
+    #[cfg(test)]
     pub fn delay_puts(&self, delay_ms: Arc<AtomicU64>) {
         *self.0.put_delay.borrow_mut() = Some(delay_ms);
     }
 
     /// Answer each GET with the object as it was when the GET arrived, but
     /// only `delay_ms` later.
+    #[cfg(test)]
+    #[cfg(test)]
     pub fn delay_gets(&self, delay_ms: Arc<AtomicU64>) {
         *self.0.get_delay.borrow_mut() = Some(delay_ms);
     }
@@ -89,6 +99,7 @@ impl FakeApi {
         o
     }
 
+    #[cfg(test)]
     pub fn delete_object(&self, path: &str) {
         if self.0.store.borrow_mut().delete_object(path).is_some() {
             self.0.changed.notify();
@@ -110,6 +121,7 @@ impl FakeApi {
     }
 
     /// Fail the next requests with these statuses.
+    #[cfg(test)]
     pub fn fail_next(&self, statuses: &[u16]) {
         self.0.store.borrow_mut().fail_next(statuses);
     }
@@ -472,6 +484,7 @@ impl Store {
     }
 
     /// Fail the next requests with these statuses.
+    #[cfg(test)]
     pub fn fail_next(&mut self, statuses: &[u16]) {
         self.faults.extend(statuses.iter().copied());
     }

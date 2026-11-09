@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 racer = { path = "..", features = ["dst"] }
-racer-authority = { path = "../authority" }
+racer-authority = { path = "../authority", features = ["sim"] }
 racer-io = { path = "../io" }
 racer-core = { path = "../core" }
 racer-wire = { path = "../wire" }

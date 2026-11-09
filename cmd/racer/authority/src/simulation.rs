@@ -1,7 +1,7 @@
 //! Simulation support for deterministic harnesses outside this crate.
 //!
-//! Not a stable API and not a cargo feature: simulation is always compiled so
-//! deterministic harnesses need no feature flag. It exposes what a
+//! Not a stable API. Compiled only with the `sim` cargo feature, so the
+//! production binary does not carry it. It exposes what a
 //! deterministic simulation needs to run real [`Authority`](crate::Authority)
 //! instances against the in-memory Kubernetes API that this crate's own
 //! simulated tests use: [`FakeKube`] (the API server as a steppable role on the
