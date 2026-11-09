@@ -13,9 +13,7 @@
 The crate stores bytes and payload-agnostic index state. It does not know
 record headers, encryption, checksums, or object versions. Pages are known only
 as caller-interned `PageSlot` numbers in `disk_index::DiskIndex`; the caller
-maps its page identities to slots and owns every per-page payload field. Until
-`DiskIndex` is wired into the store, the store's catalog owns the page index
-and tells the crate how to remove entries when a segment is evicted.
+maps its page identities to slots and owns every per-page payload field.
 
 ## Goals and non-goals
 
@@ -92,6 +90,18 @@ are charged to a dedicated admission class through `PoolAccount`
 charge frees the storage instead. `Pool::shed` releases idle storage under
 memory pressure. A checkout must bring a charge covering the full capacity,
 and the charge rides in the `Buf`.
+
+Capacities round up to 4 KiB (or the alignment, if larger). A pool keeps up to
+`MAX_CLASSES` (16) capacities at once. Each class has a lock-free return stack
+that any thread pushes to and only the owner drains. When a new capacity
+arrives and every class is assigned, it takes over the least recently used
+class that holds no idle storage. Buffers of the old capacity that return
+later are freed. If every class holds idle storage, the buffer is unpooled
+(counted as `unpooled`). `Pool::shed` discards idle mappings with
+`MADV_DONTNEED` and keeps them pooled "cold" and uncharged. Heap storage is
+freed. A node-targeted take reuses only storage bound to that node, except for
+storage that cannot be bound (under 2 MiB, or after `mbind` was refused),
+where any idle storage is reused.
 
 ### Wiping and padding
 

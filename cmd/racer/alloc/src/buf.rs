@@ -34,13 +34,13 @@
 //!
 //! | Old | New |
 //! |---|---|
-//! | `AlignedBuffer<C>`, slab `BufferPool`, `Slab::allocate` free lists | [`Buf<C>`] from [`Pool::take`] |
+//! | `AlignedBuffer<C>`, slab `BufferPool`, `Slab::allocate` free lists (except disk write staging) | [`Buf<C>`] from [`Pool::take`] |
 //! | `FrozenBuffer<C>` | `Arc<Buf<C>>` |
 //! | `WorkerBufferPool`, `SharedPool`, `DetachedBuffer`, `give_back` | [`Pool`] with its cross-thread return stacks; a `Buf` is already `Send` |
 //! | flow `Recycler`/`Buffers`, `Charge::buffer`, `Charge::recycle`, `PoolDemand` sizing | [`Pool::take`] with the request's charge; [`Pool::shed`] for pressure |
 //! | `PoolCharge`, `AlignedBody`, `ChargedBytes`, `ChargedBuffer` (flow and `src`) | [`Buf<Charge<P>>`]; the charge rides in the buffer |
 //! | per-allocation `Charge::requires_wipe` | the `wipe` flag at [`Pool::take`] |
-//! | three idle charge rules (retained primary charge, recycler bytes, shared budget) | one [`PoolAccount`] class for idle bytes |
+//! | recycler bytes, shared budget | one [`PoolAccount`] class for idle bytes; idle write staging buffers (slab pool) still keep their primary admission charge |
 //!
 //! Wiring changes expected in `src`: `memory.rs` (`rehome` takes a pooled
 //! `Buf` at device alignment with padded capacity instead of copying twice),
