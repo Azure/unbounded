@@ -138,7 +138,17 @@ impl<V: 'static, B: 'static, S: ExecutionScope> Executor<V, B, S> {
                 }
             }
         }
-        if budget != 0 && mailbox.has_queued() {
+        // Entries left unvisited this turn sit at the front of the queue. A
+        // wake they received earlier was already consumed by this lane, so
+        // re-wake when any of them still needs a poll.
+        let unvisited = self.active.iter().take(remaining).any(|active| {
+            active.runnable.is_ready()
+                || (active.scope.check().is_ok()
+                    && (active.cancellation.is_err()
+                        || active.reply.is_abandoned()
+                        || active.caller.check().is_err()))
+        });
+        if budget != 0 && (unvisited || mailbox.has_queued()) {
             cx.waker().wake_by_ref();
         }
         Ok(())
@@ -464,7 +474,16 @@ mod tests {
             .poll(&mailbox, &mut cx, 0, Rc::new(Unused))
             .unwrap();
         assert!(order.borrow().is_empty());
-        for _ in 0..6 {
+        for _ in 0..3 {
+            executor
+                .poll(&mailbox, &mut cx, 1, Rc::new(Unused))
+                .unwrap();
+        }
+        assert_eq!(&*order.borrow(), &[0, 1, 2]);
+        // Unpolled entries were ready, so the first window re-woke the lane;
+        // once every entry has been polled, the lane stays quiet.
+        let initial = count.count();
+        for _ in 0..3 {
             executor
                 .poll(&mailbox, &mut cx, 1, Rc::new(Unused))
                 .unwrap();
@@ -472,7 +491,7 @@ mod tests {
         assert_eq!(&*order.borrow(), &[0, 1, 2]);
         assert_eq!(
             count.count(),
-            0,
+            initial,
             "active length does not imply runnable work"
         );
         for active in &executor.active {
@@ -482,6 +501,56 @@ mod tests {
             .poll(&mailbox, &mut cx, 64, Rc::new(Unused))
             .unwrap();
         assert_eq!(&*order.borrow(), &[0, 1, 2, 0, 1, 2]);
+        executor.active.clear(); // These fixture futures never submitted I/O.
+    }
+
+    /// A woken entry beyond the budgeted window re-wakes the lane so it is
+    /// polled on the next turn instead of waiting for an unrelated wake.
+    #[test]
+    fn ready_entry_beyond_budget_rewakes_lane() {
+        let mailbox = Mailbox::new(4).unwrap();
+        let mut executor = Executor::default();
+        let count = Arc::new(WakeCounter::default());
+        let waker = Waker::from(count.clone());
+        let mut cx = Context::from_waker(&waker);
+        let polls = Rc::new(RefCell::new(Vec::new()));
+        for id in 0..65 {
+            let polls = polls.clone();
+            let caller = scope();
+            executor.active.push_back(Active {
+                cancellation: Ok(caller.cancel_wait()),
+                runnable: Runnable::new(),
+                scope: scope(),
+                caller,
+                reply: Arc::new(Reply::new(id)),
+                future: Box::pin(std::future::poll_fn(move |_| {
+                    polls.borrow_mut().push(id);
+                    Poll::Pending
+                })),
+            });
+        }
+        // First polls consume the initial readiness of every entry.
+        executor
+            .poll(&mailbox, &mut cx, 64, Rc::new(Unused))
+            .unwrap();
+        executor
+            .poll(&mailbox, &mut cx, 64, Rc::new(Unused))
+            .unwrap();
+        assert_eq!(polls.borrow().len(), 65);
+        polls.borrow_mut().clear();
+        // Wake the entry at the back, which the next window will not reach.
+        let last = executor.active.back().unwrap().runnable.clone();
+        std::task::Wake::wake_by_ref(&last);
+        let before = count.count();
+        executor
+            .poll(&mailbox, &mut cx, 64, Rc::new(Unused))
+            .unwrap();
+        assert!(polls.borrow().is_empty());
+        assert!(count.count() > before, "lane must re-wake for ready work");
+        executor
+            .poll(&mailbox, &mut cx, 64, Rc::new(Unused))
+            .unwrap();
+        assert_eq!(polls.borrow().len(), 1, "only the woken entry runs");
         executor.active.clear(); // These fixture futures never submitted I/O.
     }
 }
