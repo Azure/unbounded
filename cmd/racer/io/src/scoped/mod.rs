@@ -32,7 +32,7 @@ use std::{
 
 pub use crate::ring::{
     Completion, IoBuffer, SendBuffer, SharedWriteBuffer, SocketAddress, VectoredCompletion,
-    ops::MessageCompletion,
+    ops::{MAX_RECEIVED_DESCRIPTORS, MessageCompletion, SOL_TLS, TLS_GET_RECORD_TYPE},
 };
 
 /// Worker-local I/O owner, explicitly driven by [`Self::poll_budgeted`].
@@ -162,15 +162,6 @@ impl ReactorWake {
         Ok(())
     }
 }
-
-/// Most `SCM_RIGHTS` descriptors one [`Reactor::recv_msg`] accepts.
-pub const MAX_RECEIVED_DESCRIPTORS: usize = 8;
-
-/// Linux `SOL_TLS` socket level.
-pub const SOL_TLS: i32 = 282;
-
-/// `TLS_GET_RECORD_TYPE` control message type.
-pub const TLS_GET_RECORD_TYPE: i32 = 2;
 
 /// Present exclusive storage to `racer-io` writes, which only read it.
 struct Exclusive<B>(B);

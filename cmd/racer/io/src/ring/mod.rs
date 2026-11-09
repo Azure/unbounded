@@ -21,7 +21,6 @@ pub(crate) mod fd;
 pub mod op;
 pub mod ops;
 pub(crate) mod owner;
-pub mod ready_set;
 pub(crate) mod uring;
 
 pub use buffer::{Completion, IoBuffer, SendBuffer, SharedWriteBuffer, VectoredCompletion};
