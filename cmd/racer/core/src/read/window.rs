@@ -634,6 +634,9 @@ impl ReadWindow {
 
     /// Feed one completion. `scope_live` is false once the read's scope ended: transient failures
     /// are then not retried.
+    ///
+    /// On `Err(Stale)` the window keeps nothing from `input`: the caller drops any buffer it
+    /// carries (for example a probe whose slot an [`Input::Offered`] page already filled).
     pub fn on(
         &mut self,
         input: Input,
