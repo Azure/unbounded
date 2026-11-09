@@ -196,14 +196,8 @@ async fn lead(shared: &Rc<Shared>, seat: &Rc<Seat>, object: Value, started: Inst
         if !t.alive.get() {
             break;
         }
-        if let Err(
-            StateError::StaleTerm
-            | StateError::LeaseReplaced
-            | StateError::Wiped
-            | StateError::Invalid
-            | StateError::Rollback
-            | StateError::ClusterMismatch,
-        ) = reconcile(&t).await
+        if let Err(e) = reconcile(&t).await
+            && e.fails_closed()
         {
             // Fenced or durable state is unusable. Stop writing for good.
             seat::fail_closed(shared);
@@ -660,6 +654,15 @@ async fn reconcile(t: &Rc<Term_>) -> Result<(), StateError> {
                     )?
                 };
                 log_rejected_caches(&plan.rejected_caches);
+                if plan.page_size != shared.config.page_size
+                    && !PAGE_SIZE_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
+                {
+                    eprintln!(
+                        "racer: RACER_PAGE_BYTES={} ignored; the cluster publishes its established page size {}",
+                        shared.config.page_size.get(),
+                        plan.page_size.get()
+                    );
+                }
                 if plan.evicted_roots > 0 {
                     eprintln!(
                         "racer: keyring full; evicted {} departed issuer root(s) early",
@@ -784,14 +787,17 @@ async fn update_discovery(
     }
     let webhooks = d.webhooks;
     let fresh = || t.alive.get() && t.shell.borrow().fresh(crate::rt::now());
-    let _ = reconcile_webhook(
+    if let Err(e) = reconcile_webhook(
         shared,
         &webhooks,
         &t.webhook_retired,
         crate::rt::now(),
         &fresh,
     )
-    .await;
+    .await
+    {
+        eprintln!("racer: webhook reconcile failed: {e:?}");
+    }
 }
 
 /// Whether a seat's READY sequence counts as serving. A seat at the current
@@ -886,6 +892,9 @@ async fn patch_ca_bundle(shared: &Shared, mwc: &Value, cas: &[Vec<u8>]) -> Resul
 /// How long webhook trust outlives the endpoint that used it. EndpointSlice
 /// propagation to every API server is not atomic with the slice write.
 pub const WEBHOOK_TRUST_GRACE: Duration = Duration::from_secs(120);
+
+/// Set once the page size mismatch warning was logged.
+static PAGE_SIZE_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Removed webhook CAs, by DER, with the time they left the endpoints.
 pub type RetiredTrust = RefCell<BTreeMap<Vec<u8>, Instant>>;
