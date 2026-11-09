@@ -907,14 +907,14 @@ const BASE: &[Var] = &[
         Group::Kubernetes,
         uint(1, racer_wire::control::MAX_RETAINED_PAGE_KEYS as u64, COUNT),
         Value("7"),
-        "Readable page keys per cache: the active key plus older decrypt keys. Read by the authority.",
+        "Readable page keys per cache: the active key plus older decrypt keys. Read by the authority. Lowering it never drops keys at once: extra decrypt keys are dropped at the next key rotation.",
     )),
     control(var(
         "RACER_PAGE_BYTES",
         Group::Kubernetes,
         uint(64 * 1024, 16 * 1024 * 1024, BYTES),
         Value("16777216"),
-        "Cluster-wide logical page size, a power of two. Read by the authority and published to every node.",
+        "Cluster-wide logical page size, a power of two. Fixed at cluster creation: the authority publishes the value of the primary that made the first publication, records it in the `racer-state` Secret, and ignores later changes with a warning in the primary's log. Running nodes reject a publication that changes it.",
     )),
     control(var(
         "RACER_KUBE_API_CA",
