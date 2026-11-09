@@ -1453,3 +1453,51 @@ fn fence_ids_waits_for_every_id_regardless_of_fence_order() {
     assert!(ids.iter().all(|id| reactor.is_fenced(*id)));
     drop(ops);
 }
+
+/// A waker that counts its wakes.
+struct CountWake(std::sync::atomic::AtomicUsize);
+
+impl std::task::Wake for CountWake {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn kernel_wake_rearm_on_full_sq_keeps_wakers_and_submits() {
+    let Some(reactor) = kernel(8) else {
+        return;
+    };
+    // The first turn submits the eventfd and stop polls.
+    reactor.reap(16).unwrap();
+    let counter = Arc::new(CountWake(std::sync::atomic::AtomicUsize::new(0)));
+    let waker = Waker::from(counter.clone());
+    let mut sleep = Box::pin(reactor.sleep_until(reactor.now() + Duration::from_millis(1)));
+    assert!(
+        sleep
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+    std::thread::sleep(Duration::from_millis(5));
+    // Fill the SQ with harmless SQEs (their CQEs are ignored like the stop
+    // poll's) and force a re-arm, so a direct push of the wake poll fails.
+    let filler = Op::Cancel { target: 0 };
+    let mut filled = 0;
+    {
+        let mut state = reactor.state();
+        state.wake_armed = false;
+        let Backend::Uring(ring) = &mut state.backend else {
+            unreachable!("kernel reactor");
+        };
+        while ring.push(STOP_TAG, &filler, false).is_ok() {
+            filled += 1;
+        }
+    }
+    assert!(filled > 0);
+    reactor.reap(16).expect("a full SQ must not fail the turn");
+    assert_eq!(counter.0.load(Ordering::SeqCst), 1, "expired timer woken");
+    assert!(reactor.state().wake_armed, "wake poll re-armed");
+    // Everything queued was submitted: the next idle turn has nothing to do.
+    reactor.reap(64).unwrap();
+}

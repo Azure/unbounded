@@ -691,9 +691,9 @@ impl Reactor {
             mask: libc::POLLIN as u32,
             multi: false,
         };
-        if let Backend::Uring(ring) = &mut self.state().backend {
-            ring.push(STOP_TAG, &op, false)
-                .map_err(|_| Error::Overloaded)?;
+        let mut state = self.state();
+        if matches!(state.backend, Backend::Uring(_)) {
+            Self::push(&mut state, STOP_TAG, &op, false)?;
         }
         Ok(())
     }
@@ -768,9 +768,11 @@ impl Reactor {
             mask: libc::POLLIN as u32,
             multi: true,
         };
-        if let Backend::Uring(ring) = &mut state.backend {
-            ring.push(WAKE_TAG, &op, false)
-                .map_err(|_| Error::Overloaded)?;
+        if matches!(state.backend, Backend::Uring(_)) {
+            // Flush a full SQ once rather than failing: the SQ also carries
+            // data and cancel SQEs, so it can be full when the multishot
+            // poll needs re-arming.
+            Self::push(&mut state, WAKE_TAG, &op, false)?;
             state.wake_armed = true;
         }
         Ok(())
@@ -1036,7 +1038,10 @@ impl Reactor {
         }
         if !state.wake_armed && !state.stopped {
             drop(state);
-            self.arm_wake()?;
+            // A failed re-arm leaves `wake_armed` false so the next turn
+            // retries; returning early here would drop the wakers of
+            // operations already marked done and skip the submit.
+            let _ = self.arm_wake();
             state = self.state();
         }
         let submitted = match &mut state.backend {
