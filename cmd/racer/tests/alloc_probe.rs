@@ -1,5 +1,6 @@
 //! Allocation probe binary: the production dataplane fixture with a counting
 //! global allocator. Run only the ignored `warm_page_allocations` probe:
+//! It is excluded from plain `cargo test` (`test = false` in Cargo.toml).
 //! `cargo test --release --test alloc_probe -- --ignored --exact production_dataplane::hotpath::warm_page_allocations`
 // Reuses the whole dataplane suite; only its allocation probe runs here.
 #[path = "production_dataplane.rs"]

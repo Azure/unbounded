@@ -96,3 +96,10 @@ opt-level = 1
 
 [profile.test.package."*"]
 opt-level = 3
+
+# The allocation probe recompiles the production dataplane suite under a
+# counting allocator; build it only when requested with `--test alloc_probe`.
+[[test]]
+name = "alloc_probe"
+path = "tests/alloc_probe.rs"
+test = false
