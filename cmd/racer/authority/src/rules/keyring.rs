@@ -5,6 +5,10 @@
 //! `prepare_for`. On activation the old active page key becomes a `decrypt`
 //! key, so pages sealed under it stay readable; a cache keeps at most
 //! [`Policy::retained_page_keys`]` - 1` decrypt keys and drops the oldest.
+//! Pruning happens only on activation: a pass that activates nothing never
+//! drops a decrypt key, so lowering the setting (for example a rollout or a
+//! failover to a primary with another value) takes effect at the next
+//! rotation instead of dropping keys pages may still be sealed under.
 //! Old origin credentials keys are dropped on activation. Caches are never
 //! evicted to make room. Every change gets a new bundle generation; exhausted
 //! generations fail.
@@ -295,6 +299,20 @@ impl Durable {
             .collect()
     }
 
+    /// Readable page keys (active plus decrypt) of the cache holding the
+    /// most. Retention only shrinks on activation, so this can exceed the
+    /// configured retention until the next rotation.
+    pub fn readable_page_keys(&self) -> usize {
+        let mut n: BTreeMap<&str, usize> = BTreeMap::new();
+        for k in self.keys.iter().filter(|k| {
+            k.key.purpose == CacheKeyPurpose::Page
+                && matches!(k.state, CacheKeyState::Active | CacheKeyState::Decrypt)
+        }) {
+            *n.entry(k.key.cache.0.as_str()).or_default() += 1;
+        }
+        n.into_values().max().unwrap_or(0)
+    }
+
     /// Caches with both active keys. This is the durable admission record.
     pub fn keyed_caches(&self) -> BTreeMap<String, bool> {
         let mut n: BTreeMap<String, usize> = BTreeMap::new();
@@ -522,6 +540,7 @@ pub fn plan_with(
         }
         d.activate_at = 0;
         d.next_rotation = now + (policy.interval - policy.prepare_for).as_secs();
+        prune_decrypt(&mut d.keys, policy.retained());
     } else if d.activate_at == 0 && now >= d.next_rotation && !d.keys.is_empty() {
         if creation == 0 {
             return Err(KeyringError::Unavailable);
@@ -539,7 +558,6 @@ pub fn plan_with(
         d.keys.extend(prepared);
         d.activate_at = now + policy.prepare_for.as_secs();
     }
-    prune_decrypt(&mut d.keys, policy.retained());
     sort_keys(&mut d.keys);
 
     // Roots.
@@ -1237,19 +1255,69 @@ pub(crate) mod tests {
                 1
             );
         }
-        // Lowering N prunes on the next pass.
+        // Lowering N keeps every key until the next activation.
         let one = Policy {
             retained_page_keys: 1,
             ..policy()
         };
-        let p = plan(&one, &d, &[cache(1)], &[], t).unwrap();
+        let p = plan(&one, &d, &[cache(1)], &[], d.next_rotation - 1).unwrap();
+        assert!(!p.changed);
+        assert_eq!(p.durable.keys, d.keys);
+        assert_eq!(d.readable_page_keys(), 3);
+        // Preparing does not prune either; activating does.
+        let d = plan(&one, &d, &[cache(1)], &[], d.next_rotation)
+            .unwrap()
+            .durable;
+        assert_eq!(d.readable_page_keys(), 3);
+        let p = plan(&one, &d, &[cache(1)], &[], d.activate_at).unwrap();
         assert!(p.changed);
+        assert_eq!(p.durable.readable_page_keys(), 1);
         assert!(
             p.durable
                 .keys
                 .iter()
                 .all(|k| k.state == CacheKeyState::Active)
         );
+    }
+
+    /// Six readable page keys and a retention of two: passes without an
+    /// activation keep all six; the next activation prunes to two.
+    #[test]
+    fn retention_shrinks_only_on_activation() {
+        let wide = Policy {
+            retained_page_keys: 6,
+            ..policy()
+        };
+        let mut d = plan(&wide, &Durable::default(), &[cache(1)], &[], now())
+            .unwrap()
+            .durable;
+        for _ in 0..5 {
+            d = plan(&wide, &d, &[cache(1)], &[], d.next_rotation)
+                .unwrap()
+                .durable;
+            d = plan(&wide, &d, &[cache(1)], &[], d.activate_at)
+                .unwrap()
+                .durable;
+        }
+        assert_eq!(d.readable_page_keys(), 6);
+        let two = Policy {
+            retained_page_keys: 2,
+            ..policy()
+        };
+        for t in [d.next_rotation - 2, d.next_rotation - 1] {
+            let p = plan(&two, &d, &[cache(1)], &[], t).unwrap();
+            assert!(!p.changed);
+            assert_eq!(p.durable.readable_page_keys(), 6);
+        }
+        let d = plan(&two, &d, &[cache(1)], &[], d.next_rotation)
+            .unwrap()
+            .durable;
+        assert_eq!(d.readable_page_keys(), 6);
+        let d = plan(&two, &d, &[cache(1)], &[], d.activate_at)
+            .unwrap()
+            .durable;
+        d.validate().unwrap();
+        assert_eq!(d.readable_page_keys(), 2);
     }
 
     #[test]
