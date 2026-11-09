@@ -124,41 +124,102 @@ func (n *Node) runFill(f *fill, req chunkReq, decide decider) {
 }
 
 func (n *Node) fillChunk(f *fill, req chunkReq, decide decider) error {
-	var (
-		lastErr error
-		alt     cachemesh.PeerRef
-		altHdr  cachemesh.Header
-	)
-
 	// The local containerd content store comes first: it needs no
 	// network and no routing.
 	if n.fillFromLocal(f, req) == nil {
 		return nil
 	}
 
+	self := func(attempt int, d cachemesh.Decision) error {
+		n.log.Debug("chunk fill from origin",
+			slog.String("self", n.mesh.ID()),
+			slog.String("owner", d.Owner.ID),
+			slog.String("prev_owner", d.PrevOwner.ID),
+			slog.Int("flags", int(d.Header.Flags)),
+			slog.Int64("chunk", req.key.index),
+		)
+
+		owner := d.Owner.ID == n.mesh.ID()
+		if owner {
+			f.owned.Store(true)
+		}
+
+		// Read through before going to the origin: from the previous
+		// owner during a handoff, and from the owner when standing in for
+		// it as a backup (an owner that is merely slow often has the
+		// chunk already). An owner whose memory no longer holds the chunk
+		// reads it from a member that recently pulled it into its own
+		// content store.
+		if attempt == 0 {
+			switch {
+			case !d.PrevOwner.IsZero() && n.fillFromPrev(f, req, d.PrevOwner, peekLocal, "prev_owner") == nil:
+				return nil
+			case !d.Owner.IsZero() && !owner && n.fillFromPrev(f, req, d.Owner, peekOwner, "owner") == nil:
+				return nil
+			case owner && n.fillFromHolders(f, req) == nil:
+				return nil
+			}
+		}
+
+		return n.fillFromOrigin(f, req)
+	}
+
+	peer := func(h hop) error {
+		err := n.fillFromPeer(f, req, h)
+		if err != nil && !terminal(err) {
+			n.log.Debug("chunk fill attempt failed",
+				slog.String("peer", h.to.ID),
+				slog.String("digest", req.key.digest),
+				slog.Int64("chunk", req.key.index),
+				slog.Int("attempt", h.attempt),
+				slog.Any("err", err),
+			)
+		}
+
+		return err
+	}
+
+	return n.route(decide, self, peer)
+}
+
+// hop is one routed attempt: the peer to ask with its header, and the
+// alternate to hedge to after hedgeAfter (zero when hedging is off).
+type hop struct {
+	attempt    int
+	to         cachemesh.PeerRef
+	hdr        cachemesh.Header
+	hedgeAfter time.Duration
+	hedgeTo    cachemesh.PeerRef
+	hedgeHdr   cachemesh.Header
+}
+
+// route runs up to tune.attempts attempts of a routed request, shared by
+// chunk fills and tag resolutions. Each attempt asks decide where to go: to
+// self (this member serves it, from the origin) or to a peer. A failed peer
+// attempt is retried at once on the decision's alternate, otherwise after a
+// backoff with a fresh decision. route stops at the first success or
+// terminal error and returns the last error.
+func (n *Node) route(decide decider, self func(attempt int, d cachemesh.Decision) error, peer func(hop) error) error {
+	var (
+		lastErr error
+		alt     hop
+	)
+
 	for attempt := range n.cfg.tune.attempts {
 		if n.ctx.Err() != nil {
 			return errClosed
 		}
 
-		if attempt > 0 && alt.IsZero() {
-			if err := sleepCtx(n.ctx, backoff(attempt)); err != nil {
-				return errClosed
+		h := alt
+		alt = hop{}
+
+		if h.to.IsZero() {
+			if attempt > 0 {
+				if err := sleepCtx(n.ctx, backoff(attempt)); err != nil {
+					return errClosed
+				}
 			}
-		}
 
-		var (
-			target     cachemesh.PeerRef
-			hdr        cachemesh.Header
-			hedgeAfter time.Duration
-			hedgeTo    cachemesh.PeerRef
-			hedgeHdr   cachemesh.Header
-		)
-
-		if attempt > 0 && !alt.IsZero() {
-			target, hdr = alt, altHdr
-			alt = cachemesh.PeerRef{}
-		} else {
 			d, err := decide()
 			if err != nil {
 				return err
@@ -168,38 +229,7 @@ func (n *Node) fillChunk(f *fill, req chunkReq, decide decider) error {
 			case cachemesh.KindNoRoute:
 				return errNoRoute
 			case cachemesh.KindSelf:
-				n.log.Debug("chunk fill from origin",
-					slog.String("self", n.mesh.ID()),
-					slog.String("owner", d.Owner.ID),
-					slog.String("prev_owner", d.PrevOwner.ID),
-					slog.Int("flags", int(d.Header.Flags)),
-					slog.Int64("chunk", req.key.index),
-				)
-
-				if d.Owner.ID == n.mesh.ID() {
-					n.store.markOwned(f)
-				}
-
-				// Read through before going to the origin: from the
-				// previous owner during a handoff, and from the owner
-				// when standing in for it as a backup (an owner that is
-				// merely slow often has the chunk already).
-				if attempt == 0 && !d.PrevOwner.IsZero() && n.fillFromPrev(f, req, d.PrevOwner, peekHandoff, "prev_owner") == nil {
-					return nil
-				}
-
-				if attempt == 0 && !d.Owner.IsZero() && d.Owner.ID != n.mesh.ID() && n.fillFromPrev(f, req, d.Owner, peekOwner, "owner") == nil {
-					return nil
-				}
-
-				// An owner whose memory no longer holds the chunk reads
-				// it from a member that recently pulled it into its own
-				// content store.
-				if attempt == 0 && d.Owner.ID == n.mesh.ID() && n.fillFromHolders(f, req) == nil {
-					return nil
-				}
-
-				err := n.fillFromOrigin(f, req)
+				err := self(attempt, d)
 				if err == nil || terminal(err) {
 					return err
 				}
@@ -209,38 +239,23 @@ func (n *Node) fillChunk(f *fill, req chunkReq, decide decider) error {
 				continue
 			}
 
-			target, hdr = d.Next, d.Header
-
-			if d.Kind == cachemesh.KindBackup {
-				n.log.Debug("chunk routed to backup",
-					slog.String("self", n.mesh.ID()),
-					slog.String("owner", d.Owner.ID),
-					slog.String("next", d.Next.ID),
-					slog.Int64("chunk", req.key.index),
-				)
-			}
+			h = hop{to: d.Next, hdr: d.Header}
 
 			if !d.Alternate.IsZero() {
-				alt, altHdr = d.Alternate, d.AlternateHeader()
+				alt = hop{to: d.Alternate, hdr: d.AlternateHeader()}
 
 				if !n.cfg.tune.noHedge {
-					hedgeAfter, hedgeTo, hedgeHdr = d.HedgeAfter, alt, altHdr
+					h.hedgeAfter, h.hedgeTo, h.hedgeHdr = d.HedgeAfter, alt.to, alt.hdr
 				}
 			}
 		}
 
-		err := n.fillFromPeer(f, req, target, hdr, hedgeAfter, hedgeTo, hedgeHdr)
+		h.attempt = attempt
+
+		err := peer(h)
 		if err == nil || terminal(err) {
 			return err
 		}
-
-		n.log.Debug("chunk fill attempt failed",
-			slog.String("peer", target.ID),
-			slog.String("digest", req.key.digest),
-			slog.Int64("chunk", req.key.index),
-			slog.Int("attempt", attempt),
-			slog.Any("err", err),
-		)
 
 		lastErr = err
 	}
@@ -265,94 +280,113 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 	}
 }
 
-// attemptCtx returns a context bounded by ChunkTimeout that is also
-// canceled when touch is not called for StallTimeout.
+// attemptCtx returns a context bounded by the chunk timeout that is also
+// canceled when touch is not called for the stall timeout.
 func (n *Node) attemptCtx() (ctx context.Context, touch func(), stalled func() bool, cancel func()) {
 	ctx, cancelCtx := context.WithTimeout(n.ctx, n.cfg.tune.chunkTimeout)
 
 	var fired atomic.Bool
 
-	timer := time.AfterFunc(n.cfg.tune.stallTimeout, func() {
+	stall := n.cfg.tune.stallTimeout
+	timer := time.AfterFunc(stall, func() {
 		fired.Store(true)
 		cancelCtx()
 	})
 
-	return ctx, func() { timer.Reset(n.cfg.tune.stallTimeout) }, fired.Load, func() {
+	return ctx, func() { timer.Reset(stall) }, fired.Load, func() {
 		timer.Stop()
 		cancelCtx()
 	}
 }
 
-func (n *Node) fillHook(source string, err error, bytes int64, start time.Time) {
+// fillAttempt is one attempt to read the rest of a chunk from one source.
+// off is the fill's progress when it starts.
+type fillAttempt struct {
+	ctx     context.Context
+	touch   func()
+	stalled func() bool
+	off     int
+}
+
+// attempt runs fn with an attempt context and reports it to OnFill with
+// the bytes it added to f.
+func (n *Node) attempt(f *fill, source string, fn func(a fillAttempt) error) error {
+	start := time.Now()
+	off, _ := f.progress()
+
+	ctx, touch, stalled, cancel := n.attemptCtx()
+	defer cancel()
+
+	err := fn(fillAttempt{ctx: ctx, touch: touch, stalled: stalled, off: off})
+
 	if h := n.cfg.Hooks.OnFill; h != nil {
 		outcome := "ok"
 		if err != nil {
 			outcome = "error"
 		}
 
-		h(source, outcome, bytes, time.Since(start))
+		now, _ := f.progress()
+		h(source, outcome, int64(now-off), time.Since(start))
 	}
+
+	return err
+}
+
+// setUpstream records where f reads from: a peer slot for loop detection,
+// or noSlot with fromOrigin set while it reads from the origin.
+func (f *fill) setUpstream(slot cachemesh.Slot, fromOrigin bool) {
+	f.mu.Lock()
+	f.upstream = slot
+	f.fromOrigin = fromOrigin
+	f.mu.Unlock()
 }
 
 // fillFromOrigin pulls the rest of the chunk from the origin registry.
-func (n *Node) fillFromOrigin(f *fill, req chunkReq) (err error) {
-	start := time.Now()
-	off, metaKnown := f.progress()
+func (n *Node) fillFromOrigin(f *fill, req chunkReq) error {
+	return n.attempt(f, "origin", func(a fillAttempt) error {
+		chunkStart := req.key.index * n.cfg.ChunkSize
+		length := n.cfg.ChunkSize - int64(a.off)
 
-	defer func() {
-		now, _ := f.progress()
-		n.fillHook("origin", err, int64(now-off), start)
-	}()
-
-	ctx, touch, _, cancel := n.attemptCtx()
-	defer cancel()
-
-	chunkStart := req.key.index * n.cfg.ChunkSize
-
-	length := n.cfg.ChunkSize - int64(off)
-
-	if metaKnown {
 		f.mu.Lock()
-		length = int64(f.chunkLen - off)
+		if f.metaKnown {
+			length = int64(f.chunkLen - a.off)
+		}
 		f.mu.Unlock()
-	}
 
-	if length == 0 {
-		return nil
-	}
+		if length == 0 {
+			return nil
+		}
 
-	ref := ifaces.OriginRef{
-		Registry:   req.registry,
-		Repository: req.repo,
-		Digest:     req.d,
-		Kind:       req.kind(),
-		Offset:     chunkStart + int64(off),
-	}
+		ref := ifaces.OriginRef{
+			Registry:   req.registry,
+			Repository: req.repo,
+			Digest:     req.d,
+			Kind:       req.kind(),
+			Offset:     chunkStart + int64(a.off),
+		}
 
-	f.mu.Lock()
-	f.fromOrigin = true
-	f.upstream = noSlot
-	f.mu.Unlock()
+		f.setUpstream(noSlot, true)
 
-	rc, total, ctype, err := n.cfg.Origin.PullRange(ctx, ref, length)
-	if err != nil {
-		return classifyOrigin(err)
-	}
+		rc, total, ctype, err := n.cfg.Origin.PullRange(a.ctx, ref, length)
+		if err != nil {
+			return classifyOrigin(err)
+		}
 
-	defer func() { _ = rc.Close() }() //nolint:errcheck // best-effort close
+		defer func() { _ = rc.Close() }() //nolint:errcheck // best-effort close
 
-	chunkLen := min(n.cfg.ChunkSize, total-chunkStart)
-	if chunkLen < 0 || (chunkLen == 0 && chunkStart != 0) {
-		return errRange
-	}
+		chunkLen := min(n.cfg.ChunkSize, total-chunkStart)
+		if chunkLen < 0 || (chunkLen == 0 && chunkStart != 0) {
+			return errRange
+		}
 
-	if err := f.setMeta(total, ctype, int(chunkLen)); err != nil {
-		return err
-	}
+		if err := f.setMeta(total, ctype, int(chunkLen)); err != nil {
+			return err
+		}
 
-	touch()
+		a.touch()
 
-	return f.readFrom(ctx, rc, touch)
+		return f.readFrom(a.ctx, rc, a.touch)
+	})
 }
 
 // contentReader reads blob d of src sequentially from off.
@@ -380,12 +414,11 @@ func (r *contentReader) Read(p []byte) (int, error) {
 // content store holds the whole chunk. Only blobs are read locally:
 // manifests need their content type, which the store does not keep.
 func (n *Node) localChunk(req chunkReq) (total int64, chunkLen int, ok bool) {
-	src := n.cfg.Content
 	if req.key.kind != kindBlob || !n.store.localOK(req.key.digest) {
 		return 0, 0, false
 	}
 
-	avail, total := src.Available(req.key.digest)
+	avail, total := n.cfg.Content.Available(req.key.digest)
 	if total <= 0 {
 		return 0, 0, false
 	}
@@ -402,66 +435,66 @@ func (n *Node) localChunk(req chunkReq) (total int64, chunkLen int, ok bool) {
 
 // fillFromLocal reads the chunk from the local content store when it
 // holds all of it.
-func (n *Node) fillFromLocal(f *fill, req chunkReq) (err error) {
+func (n *Node) fillFromLocal(f *fill, req chunkReq) error {
 	total, chunkLen, ok := n.localChunk(req)
 	if !ok {
 		return errNotFound
 	}
 
-	start := time.Now()
-	off, _ := f.progress()
+	return n.attempt(f, "local", func(a fillAttempt) error {
+		if err := f.setMeta(total, "", chunkLen); err != nil {
+			return err
+		}
 
-	defer func() {
-		now, _ := f.progress()
-		n.fillHook("local", err, int64(now-off), start)
-	}()
+		f.setUpstream(noSlot, false)
+		n.store.localFills.Add(1)
 
-	if err := f.setMeta(total, "", chunkLen); err != nil {
+		chunkStart := req.key.index * n.cfg.ChunkSize
+		r := &contentReader{src: n.cfg.Content, d: req.key.digest, off: chunkStart + int64(a.off), end: chunkStart + int64(chunkLen)}
+
+		err := f.readFrom(a.ctx, r, a.touch)
+		if err != nil {
+			n.store.localErrors.Add(1)
+		}
+
 		return err
-	}
-
-	ctx, touch, _, cancel := n.attemptCtx()
-	defer cancel()
-
-	f.mu.Lock()
-	f.fromOrigin = false
-	f.upstream = noSlot
-	off = f.n
-	f.mu.Unlock()
-
-	n.store.localFills.Add(1)
-
-	chunkStart := req.key.index * n.cfg.ChunkSize
-	r := &contentReader{src: n.cfg.Content, d: req.key.digest, off: chunkStart + int64(off), end: chunkStart + int64(chunkLen)}
-
-	if err = f.readFrom(ctx, r, touch); err != nil {
-		n.store.localErrors.Add(1)
-	}
-
-	return err
+	})
 }
 
-// holderPeekTimeout bounds the wait for response headers of a holder peek.
-const holderPeekTimeout = time.Second
+// Peek requests ask a member for a chunk it may already hold, without
+// routing. Values of the peek query parameter:
+const (
+	// peekLocal is served only from what the member already has: memory,
+	// a fill it reads from the origin, or its content store. New owners
+	// ask the previous owner during a handoff, and owners ask members
+	// that recently pulled the chunk (holders).
+	peekLocal = "local"
+	// peekOwner asks the owner on behalf of a backup standing in for it.
+	// An owner without the chunk starts its origin fill and serves it.
+	peekOwner = "owner"
+)
 
-// holderPeekMax bounds the holders an owner asks per chunk.
-const holderPeekMax = 2
+// Response header timeouts of peeks: a holder that is slow to answer is
+// skipped sooner.
+const (
+	peekHeaderTimeout = 2 * time.Second
+	holderPeekTimeout = time.Second
+	holderPeekMax     = 2
+	sourceHolder      = "holder"
+)
 
 // fillFromHolders reads the chunk from members that recently requested it
 // for their own containerd pull. They serve it only from memory or their
 // content store (peekLocal), never by fetching it.
 func (n *Node) fillFromHolders(f *fill, req chunkReq) error {
 	hs := n.holders.list(req.key, n.mesh.Addr())
-	if len(hs) == 0 {
-		return errNotFound
-	}
 
 	for i, h := range hs {
 		if i == holderPeekMax {
 			break
 		}
 
-		err := n.fillFromPrev(f, req, cachemesh.PeerRef{ID: h, Addr: h}, peekLocal, "holder")
+		err := n.fillFromPrev(f, req, cachemesh.PeerRef{ID: h, Addr: h}, peekLocal, sourceHolder)
 		if err == nil {
 			n.holderPeeks.Add(1)
 			return nil
@@ -494,106 +527,66 @@ func classifyOrigin(err error) error {
 	return err
 }
 
-// Values of the peek query parameter.
-const (
-	// peekHandoff asks the previous owner of a chunk during a handoff. It
-	// is served only from what the receiver already has.
-	peekHandoff = "1"
-	// peekOwner asks the owner on behalf of a backup standing in for it.
-	// An owner without the chunk starts its origin fill and serves it.
-	peekOwner = "owner"
-	// peekLocal asks a member that recently pulled the chunk into its
-	// content store. It is served only from memory or that store.
-	peekLocal = "local"
-)
-
-// peekHeaderTimeout bounds the wait for response headers of a peek.
-const peekHeaderTimeout = 2 * time.Second
-
 // fillFromPrev reads the chunk from another member that may already hold
-// it (a previous owner, or the owner a backup stands in for). That member
-// serves a complete chunk or one it is reading from the origin; for a
-// peekOwner request an owner without the chunk also starts its origin fill.
-func (n *Node) fillFromPrev(f *fill, req chunkReq, prev cachemesh.PeerRef, peek, source string) (err error) {
-	start := time.Now()
-	off, _ := f.progress()
-
-	defer func() {
-		now, _ := f.progress()
-		n.fillHook(source, err, int64(now-off), start)
-	}()
-
-	ctx, touch, _, cancel := n.attemptCtx()
-	defer cancel()
-
-	timeout := peekHeaderTimeout
-	if peek == peekLocal {
-		timeout = holderPeekTimeout
-	}
-
-	headers := time.AfterFunc(timeout, cancel)
-
-	resp, err := n.doChunk(ctx, prev, nil, peek, req, off)
-
-	headers.Stop()
-
-	if err != nil {
-		return err
-	}
-
-	defer func() { _ = resp.Body.Close() }() //nolint:errcheck // best-effort close
-
-	return n.readChunkResponse(ctx, f, req, resp, off, touch)
-}
-
-// fillFromPeer fetches the rest of the chunk from target, hedging to
-// hedgeTo after hedgeAfter when allowed.
-func (n *Node) fillFromPeer(f *fill, req chunkReq, target cachemesh.PeerRef, hdr cachemesh.Header,
-	hedgeAfter time.Duration, hedgeTo cachemesh.PeerRef, hedgeHdr cachemesh.Header,
-) (err error) {
-	start := time.Now()
-	off, _ := f.progress()
-
-	ctx, touch, stalled, cancel := n.attemptCtx()
-	defer cancel()
-
-	// Record the upstream before sending, so a request that comes back
-	// from it (a routing loop while views disagree) is refused at once.
-	f.mu.Lock()
-	f.upstream = target.Slot
-	f.fromOrigin = false
-	f.mu.Unlock()
-
-	resp, peer, err := n.sendChunk(ctx, stalled, req, off, target, hdr, hedgeAfter, hedgeTo, hedgeHdr)
-	if err != nil {
-		n.fillHook("peer", err, 0, start)
-		return err
-	}
-
-	defer func() { _ = resp.Body.Close() }() //nolint:errcheck // best-effort close
-
-	f.mu.Lock()
-	f.upstream = peer.Slot
-	f.fromOrigin = false
-	f.mu.Unlock()
-
-	err = n.readChunkResponse(ctx, f, req, resp, off, touch)
-
-	now, _ := f.progress()
-	n.fillHook("peer", err, int64(now-off), start)
-
-	if err != nil && !terminal(err) {
-		// Headers arrived but the body failed: the peer is unhealthy for
-		// this request even though Observe already saw a success.
-		r := cachemesh.Failure
-		if stalled() {
-			r = cachemesh.Timeout
+// it (a previous owner, a holder, or the owner a backup stands in for) with
+// a peek request. That member serves a complete chunk or one it is reading
+// from the origin; for peekOwner an owner without the chunk also starts its
+// origin fill.
+func (n *Node) fillFromPrev(f *fill, req chunkReq, prev cachemesh.PeerRef, peek, source string) error {
+	return n.attempt(f, source, func(a fillAttempt) error {
+		timeout := peekHeaderTimeout
+		if source == sourceHolder {
+			timeout = holderPeekTimeout
 		}
 
-		n.observe(peer, r, time.Since(start))
-	}
+		ctx, cancel := context.WithCancel(a.ctx)
+		defer cancel()
 
-	return err
+		headers := time.AfterFunc(timeout, cancel)
+
+		resp, err := n.doChunk(ctx, prev, nil, peek, req, a.off)
+
+		headers.Stop()
+
+		if err != nil {
+			return err
+		}
+
+		defer func() { _ = resp.Body.Close() }() //nolint:errcheck // best-effort close
+
+		return n.readChunkResponse(ctx, f, req, resp, a.off, a.touch)
+	})
+}
+
+// fillFromPeer fetches the rest of the chunk from h.to, hedging to
+// h.hedgeTo after h.hedgeAfter when allowed.
+func (n *Node) fillFromPeer(f *fill, req chunkReq, h hop) error {
+	return n.attempt(f, "peer", func(a fillAttempt) error {
+		start := time.Now()
+
+		// Record the upstream before sending, so a request that comes
+		// back from it (a routing loop while views disagree) is refused
+		// at once.
+		f.setUpstream(h.to.Slot, false)
+
+		resp, peer, err := n.sendChunk(a.ctx, a.stalled, req, a.off, h)
+		if err != nil {
+			return err
+		}
+
+		defer func() { _ = resp.Body.Close() }() //nolint:errcheck // best-effort close
+
+		f.setUpstream(peer.Slot, false)
+
+		err = n.readChunkResponse(a.ctx, f, req, resp, a.off, a.touch)
+		if err != nil && !terminal(err) {
+			// Headers arrived but the body failed: the peer is unhealthy
+			// for this request even though Observe already saw a success.
+			n.observeErr(a.ctx, peer, err, time.Since(start), a.stalled())
+		}
+
+		return err
+	})
 }
 
 // readChunkResponse validates a 200 chunk response and reads its body.
@@ -623,6 +616,27 @@ func (n *Node) readChunkResponse(ctx context.Context, f *fill, req chunkReq, res
 	return f.readFrom(ctx, resp.Body, touch)
 }
 
+// observeErr reports the outcome of a peer request to the health tracker:
+// success (also for a correct "not found"), overload, timeout (the deadline
+// passed or the attempt stalled), or failure. A request canceled by the
+// caller is not the peer's fault and is not reported.
+func (n *Node) observeErr(ctx context.Context, p cachemesh.PeerRef, err error, took time.Duration, stalled bool) {
+	r := cachemesh.Failure
+
+	switch {
+	case err == nil, errors.Is(err, errNotFound):
+		r = cachemesh.Success
+	case errors.Is(err, errOverload):
+		r = cachemesh.Overload
+	case errors.Is(err, context.DeadlineExceeded) || stalled:
+		r = cachemesh.Timeout
+	case ctx.Err() != nil:
+		return
+	}
+
+	n.observe(p, r, took)
+}
+
 type peerResult struct {
 	resp   *http.Response
 	err    error
@@ -631,35 +645,32 @@ type peerResult struct {
 	took   time.Duration
 }
 
-// sendChunk sends the chunk request to target and, after hedgeAfter, a
-// hedged copy to hedgeTo. It returns the first successful response; the
+// sendChunk sends the chunk request to h.to and, after h.hedgeAfter, a
+// hedged copy to h.hedgeTo. It returns the first successful response; the
 // caller closes its body. Every outcome except a canceled loser is
 // reported to Observe.
-func (n *Node) sendChunk(ctx context.Context, stalled func() bool, req chunkReq, off int,
-	target cachemesh.PeerRef, hdr cachemesh.Header,
-	hedgeAfter time.Duration, hedgeTo cachemesh.PeerRef, hedgeHdr cachemesh.Header,
-) (*http.Response, cachemesh.PeerRef, error) {
+func (n *Node) sendChunk(ctx context.Context, stalled func() bool, req chunkReq, off int, h hop) (*http.Response, cachemesh.PeerRef, error) {
 	results := make(chan peerResult, 2)
-	launch := func(p cachemesh.PeerRef, h cachemesh.Header) {
+	launch := func(p cachemesh.PeerRef, hdr cachemesh.Header) {
 		rctx, rcancel := context.WithCancel(ctx)
 
 		go func() {
 			t0 := time.Now()
 
-			resp, err := n.doChunk(rctx, p, &h, "", req, off)
+			resp, err := n.doChunk(rctx, p, &hdr, "", req, off)
 			results <- peerResult{resp: resp, err: err, peer: p, cancel: rcancel, took: time.Since(t0)}
 		}()
 	}
 
-	launch(target, hdr)
+	launch(h.to, h.hdr)
 
 	pending := 1
 	hedged := false
 
 	var hedgeC <-chan time.Time
 
-	if !hedgeTo.IsZero() && hedgeAfter > 0 {
-		t := time.NewTimer(hedgeAfter)
+	if !h.hedgeTo.IsZero() && h.hedgeAfter > 0 {
+		t := time.NewTimer(h.hedgeAfter)
 		defer t.Stop()
 
 		hedgeC = t.C
@@ -672,15 +683,15 @@ func (n *Node) sendChunk(ctx context.Context, stalled func() bool, req chunkReq,
 		case <-hedgeC:
 			hedgeC = nil
 
-			if !n.mesh.TryHedge(hdr) {
+			if !n.mesh.TryHedge(h.hdr) {
 				n.hook(n.cfg.Hooks.OnHedge, "denied")
 				continue
 			}
 
-			h := hedgeHdr
-			h.Flags |= cachemesh.FlagHedge
+			hdr := h.hedgeHdr
+			hdr.Flags |= cachemesh.FlagHedge
 
-			launch(hedgeTo, h)
+			launch(h.hedgeTo, hdr)
 
 			pending++
 			hedged = true
@@ -689,10 +700,10 @@ func (n *Node) sendChunk(ctx context.Context, stalled func() bool, req chunkReq,
 		case r := <-results:
 			pending--
 
-			if r.err == nil {
-				n.observe(r.peer, cachemesh.Success, r.took)
+			n.observeErr(ctx, r.peer, r.err, r.took, stalled())
 
-				if hedged && r.peer.ID == hedgeTo.ID {
+			if r.err == nil {
+				if hedged && r.peer.ID == h.hedgeTo.ID {
 					n.hook(n.cfg.Hooks.OnHedge, "won")
 				}
 
@@ -708,20 +719,6 @@ func (n *Node) sendChunk(ctx context.Context, stalled func() bool, req chunkReq,
 
 			r.cancel()
 
-			switch {
-			case errors.Is(r.err, errOverload):
-				n.observe(r.peer, cachemesh.Overload, r.took)
-			case errors.Is(r.err, context.DeadlineExceeded) || stalled():
-				n.observe(r.peer, cachemesh.Timeout, r.took)
-			case ctx.Err() != nil:
-				// Canceled by the caller: not the peer's fault.
-			case errors.Is(r.err, errNotFound):
-				// The peer answered correctly: the content is absent.
-				n.observe(r.peer, cachemesh.Success, r.took)
-			default:
-				n.observe(r.peer, cachemesh.Failure, r.took)
-			}
-
 			if firstErr == nil || terminal(r.err) {
 				firstErr = r.err
 			}
@@ -731,7 +728,7 @@ func (n *Node) sendChunk(ctx context.Context, stalled func() bool, req chunkReq,
 			}
 
 			if stalled() {
-				n.observe(target, cachemesh.Timeout, n.cfg.tune.stallTimeout)
+				n.observe(h.to, cachemesh.Timeout, n.cfg.tune.stallTimeout)
 			}
 
 			return nil, cachemesh.PeerRef{}, ctx.Err()
@@ -765,7 +762,7 @@ func (c cancelOnClose) Close() error {
 }
 
 // chunkQuery builds the query string of a chunk request.
-func (n *Node) chunkQuery(req chunkReq, off int, peek string) string {
+func (n *Node) chunkQuery(req chunkReq, off int, peek string) url.Values {
 	q := url.Values{}
 	q.Set("r", req.registry)
 	q.Set("n", req.repo)
@@ -782,32 +779,48 @@ func (n *Node) chunkQuery(req chunkReq, off int, peek string) string {
 		q.Set("peek", peek)
 	}
 
-	return q.Encode()
+	return q
 }
 
 // doChunk sends one chunk request. A nil hdr sends a peek request of kind
-// peek (peekHandoff or peekOwner). A non-200 status maps to an error.
+// peek. A non-200 status maps to an error.
 func (n *Node) doChunk(ctx context.Context, p cachemesh.PeerRef, hdr *cachemesh.Header, peek string, req chunkReq, off int) (*http.Response, error) {
+	h := http.Header{}
+
 	if hdr != nil {
 		peek = ""
+
+		h.Set(headerRoute, encodeHeader(*hdr))
+
+		if req.requester != "" {
+			h.Set(headerRequester, req.requester)
+		}
 	}
 
-	u := "http://" + n.cfg.DataAddr(p) + ChunkPath + "?" + n.chunkQuery(req, off, peek)
+	return n.get(ctx, p, ChunkPath, n.chunkQuery(req, off, peek), h)
+}
 
-	hreq, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+// get sends a data-plane GET to peer p and maps a non-200 status to an
+// error.
+func (n *Node) get(ctx context.Context, p cachemesh.PeerRef, path string, q url.Values, h http.Header) (*http.Response, error) {
+	u := "http://" + n.cfg.DataAddr(p) + path + "?" + q.Encode()
+
+	return send(ctx, n.client, http.MethodGet, u, nil, h, func(code int, _ string) error { return statusError(code, p) })
+}
+
+// send sends one request with client. A response other than 200 is drained
+// and closed, and bad maps its status to the returned error.
+func send(ctx context.Context, client *http.Client, method, u string, body io.Reader, h http.Header, bad func(code int, status string) error) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, method, u, body)
 	if err != nil {
 		return nil, err
 	}
 
-	if hdr != nil {
-		hreq.Header.Set(headerRoute, encodeHeader(*hdr))
-
-		if req.requester != "" {
-			hreq.Header.Set(headerRequester, req.requester)
-		}
+	for k, v := range h {
+		req.Header[k] = v
 	}
 
-	resp, err := n.client.Do(hreq)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -819,7 +832,7 @@ func (n *Node) doChunk(ctx context.Context, p cachemesh.PeerRef, hdr *cachemesh.
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096)) //nolint:errcheck // drain for reuse
 	_ = resp.Body.Close()                                       //nolint:errcheck // best-effort close
 
-	return nil, statusError(resp.StatusCode, p)
+	return nil, bad(resp.StatusCode, resp.Status)
 }
 
 func statusError(code int, p cachemesh.PeerRef) error {
@@ -1291,12 +1304,4 @@ func (h *holders) list(k chunkKey, self string) []string {
 	}
 
 	return out
-}
-
-// len returns the number of chunks with recorded requesters.
-func (h *holders) len() int {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	return len(h.m)
 }

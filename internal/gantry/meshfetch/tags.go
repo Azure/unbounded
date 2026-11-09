@@ -147,83 +147,42 @@ func (n *Node) resolveMeta(ctx context.Context, registry, repo, tag string, deci
 // fetchMeta resolves a tag at the owner: from the origin here, or through
 // the next hop.
 func (n *Node) fetchMeta(registry, repo, tag string, decide decider) (*metaEntry, error) {
-	var (
-		lastErr error
-		alt     cachemesh.PeerRef
-		altHdr  cachemesh.Header
-	)
+	var e *metaEntry
 
-	for attempt := range n.cfg.tune.attempts {
-		if attempt > 0 && alt.IsZero() {
-			if err := sleepCtx(n.ctx, backoff(attempt)); err != nil {
-				return nil, errClosed
-			}
+	self := func(int, cachemesh.Decision) error {
+		var err error
+
+		e, err = n.metaFromOrigin(registry, repo, tag)
+		if err == nil {
+			n.hook(n.cfg.Hooks.OnMeta, "origin")
 		}
 
-		var (
-			target cachemesh.PeerRef
-			hdr    cachemesh.Header
-		)
+		return err
+	}
 
-		if attempt > 0 && !alt.IsZero() {
-			target, hdr = alt, altHdr
-			alt = cachemesh.PeerRef{}
-		} else {
-			d, err := decide()
-			if err != nil {
-				return nil, err
-			}
-
-			switch d.Kind {
-			case cachemesh.KindNoRoute:
-				return nil, errNoRoute
-			case cachemesh.KindSelf:
-				e, err := n.metaFromOrigin(registry, repo, tag)
-				if err == nil {
-					n.hook(n.cfg.Hooks.OnMeta, "origin")
-					return e, nil
-				}
-
-				if terminal(err) {
-					return nil, err
-				}
-
-				lastErr = err
-
-				continue
-			}
-
-			target, hdr = d.Next, d.Header
-			if !d.Alternate.IsZero() {
-				alt, altHdr = d.Alternate, d.AlternateHeader()
-			}
-		}
+	peer := func(h hop) error {
+		ctx, cancel := context.WithTimeout(n.ctx, min(n.cfg.tune.chunkTimeout, n.cfg.tune.stallTimeout))
+		defer cancel()
 
 		t0 := time.Now()
 
-		e, err := n.metaFromPeer(target, hdr, registry, repo, tag)
+		var err error
 
-		switch {
-		case err == nil:
-			n.observe(target, cachemesh.Success, time.Since(t0))
+		e, err = n.metaFromPeer(ctx, h.to, h.hdr, registry, repo, tag)
+		n.observeErr(ctx, h.to, err, time.Since(t0), false)
+
+		if err == nil {
 			n.hook(n.cfg.Hooks.OnMeta, "peer")
-
-			return e, nil
-		case errors.Is(err, errOverload):
-			n.observe(target, cachemesh.Overload, time.Since(t0))
-		case errors.Is(err, errNotFound):
-			n.observe(target, cachemesh.Success, time.Since(t0))
-			return nil, err
-		case errors.Is(err, context.DeadlineExceeded):
-			n.observe(target, cachemesh.Timeout, time.Since(t0))
-		default:
-			n.observe(target, cachemesh.Failure, time.Since(t0))
 		}
 
-		lastErr = err
+		return err
 	}
 
-	return nil, lastErr
+	if err := n.route(decide, self, peer); err != nil {
+		return nil, err
+	}
+
+	return e, nil
 }
 
 func (n *Node) metaFromOrigin(registry, repo, tag string) (*metaEntry, error) {
@@ -242,32 +201,18 @@ func (n *Node) metaFromOrigin(registry, repo, tag string) (*metaEntry, error) {
 	return &metaEntry{body: body, ctype: ctype, digest: d, stamp: stamp}, nil
 }
 
-func (n *Node) metaFromPeer(p cachemesh.PeerRef, hdr cachemesh.Header, registry, repo, tag string) (*metaEntry, error) {
-	ctx, cancel := context.WithTimeout(n.ctx, min(n.cfg.tune.chunkTimeout, n.cfg.tune.stallTimeout))
-	defer cancel()
-
+func (n *Node) metaFromPeer(ctx context.Context, p cachemesh.PeerRef, hdr cachemesh.Header, registry, repo, tag string) (*metaEntry, error) {
 	q := url.Values{}
 	q.Set("r", registry)
 	q.Set("n", repo)
 	q.Set("t", tag)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+n.cfg.DataAddr(p)+MetaPath+"?"+q.Encode(), nil)
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Set(headerRoute, encodeHeader(hdr))
-
-	resp, err := n.client.Do(req)
+	resp, err := n.get(ctx, p, MetaPath, q, http.Header{headerRoute: {encodeHeader(hdr)}})
 	if err != nil {
 		return nil, err
 	}
 
 	defer func() { _ = resp.Body.Close() }() //nolint:errcheck // best-effort close
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, statusError(resp.StatusCode, p)
-	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxManifestSize+1))
 	if err != nil {
@@ -306,10 +251,7 @@ func (n *Node) metaFromPeer(p cachemesh.PeerRef, hdr cachemesh.Header, registry,
 
 // handleMeta serves GET MetaPath: a tag resolution for a peer.
 func (n *Node) handleMeta(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		w.Header().Set("Allow", http.MethodGet)
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-
+	if !allowMethod(w, r, http.MethodGet) {
 		return
 	}
 
@@ -321,15 +263,7 @@ func (n *Node) handleMeta(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h, err := decodeHeader(r.Header.Get(headerRoute))
-	if err != nil {
-		http.Error(w, "bad route header", http.StatusBadRequest)
-		return
-	}
-
-	d, err := n.mesh.Forward(h)
-
-	var decide decider
+	_, decide, err := n.forward(r)
 
 	switch {
 	case errors.Is(err, cachemesh.ErrTTLExhausted):
@@ -338,16 +272,6 @@ func (n *Node) handleMeta(w http.ResponseWriter, r *http.Request) {
 	case err != nil:
 		http.Error(w, "bad route header", http.StatusBadRequest)
 		return
-	default:
-		first := true
-		decide = func() (cachemesh.Decision, error) {
-			if first {
-				first = false
-				return d, nil
-			}
-
-			return n.mesh.Forward(h)
-		}
 	}
 
 	e, err := n.resolveMeta(r.Context(), registry, repo, tag, decide)

@@ -426,10 +426,7 @@ func (n *Node) serveHook(outcome string, bytes int64) {
 // from the local cache, an in-progress fill, or a new fill routed by
 // Mesh.Forward.
 func (n *Node) handleChunk(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		w.Header().Set("Allow", http.MethodGet)
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-
+	if !allowMethod(w, r, http.MethodGet) {
 		return
 	}
 
@@ -512,10 +509,10 @@ func (n *Node) shed(w http.ResponseWriter) {
 }
 
 // chunkForPeer finds or starts the fill for a peer request. peek is the
-// request's peek parameter: "" for a routed request, peekHandoff from a new
-// owner reading through the previous owner, peekOwner from a backup
-// reading through the owner, or peekLocal from an owner reading through a
-// recent requester. On failure it returns a nil fill with the status and
+// request's peek parameter: "" for a routed request, peekLocal from a new
+// owner reading through the previous owner or an owner reading through a
+// recent requester, or peekOwner from a backup reading through the owner.
+// On failure it returns a nil fill with the status and
 // outcome to report.
 func (n *Node) chunkForPeer(r *http.Request, peek string, req chunkReq, off int) (*reader, int, string) {
 	if peek != "" {
@@ -554,20 +551,16 @@ func (n *Node) chunkForPeer(r *http.Request, peek string, req chunkReq, off int)
 		return nil, http.StatusNotFound, "not_found"
 	}
 
-	h, err := decodeHeader(r.Header.Get(headerRoute))
-	if err != nil {
-		return nil, http.StatusBadRequest, "bad_request"
-	}
+	h, decide, err := n.forward(r)
+	exhausted := errors.Is(err, cachemesh.ErrTTLExhausted)
 
-	if a := r.Header.Get(headerRequester); validHolder(a) {
+	if a := r.Header.Get(headerRequester); (err == nil || exhausted) && validHolder(a) {
 		req.requester = a
 		n.holders.add(req.key, a)
 	}
 
-	d, err := n.mesh.Forward(h)
-
 	switch {
-	case errors.Is(err, cachemesh.ErrTTLExhausted):
+	case exhausted:
 		// The request may not travel further: serve only what is here.
 		if rd := n.store.get(req.key, off); rd != nil {
 			n.lookup("peer", "hit")
@@ -581,16 +574,6 @@ func (n *Node) chunkForPeer(r *http.Request, peek string, req chunkReq, off int)
 		return nil, http.StatusLoopDetected, "ttl"
 	case err != nil:
 		return nil, http.StatusBadRequest, "bad_request"
-	}
-
-	first := true
-	decide := func() (cachemesh.Decision, error) {
-		if first {
-			first = false
-			return d, nil
-		}
-
-		return n.mesh.Forward(h)
 	}
 
 	rd, err := n.obtain(r.Context(), req, off, decide, "peer", h.Sender)
@@ -647,6 +630,45 @@ func (n *Node) ownerFill(r *http.Request, req chunkReq, off int) *reader {
 	return rd
 }
 
+// forward decodes the route header of a peer request and returns it with
+// the decider for the request's fills: the first decision is the one
+// Mesh.Forward made here, later ones forward afresh. The error is
+// cachemesh.ErrTTLExhausted when the request may not travel further.
+func (n *Node) forward(r *http.Request) (cachemesh.Header, decider, error) {
+	h, err := decodeHeader(r.Header.Get(headerRoute))
+	if err != nil {
+		return h, nil, err
+	}
+
+	d, err := n.mesh.Forward(h)
+	if err != nil {
+		return h, nil, err
+	}
+
+	first := true
+
+	return h, func() (cachemesh.Decision, error) {
+		if first {
+			first = false
+			return d, nil
+		}
+
+		return n.mesh.Forward(h)
+	}, nil
+}
+
+// allowMethod answers 405 unless r uses method.
+func allowMethod(w http.ResponseWriter, r *http.Request, method string) bool {
+	if r.Method == method {
+		return true
+	}
+
+	w.Header().Set("Allow", method)
+	http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+
+	return false
+}
+
 // errStatus maps a fill error to the status sent to a peer.
 func errStatus(err error) (int, string) {
 	switch {
@@ -691,24 +713,16 @@ func NewControlTransport() ControlTransport {
 
 // Send implements cachemesh.ControlTransport.
 func (t ControlTransport) Send(ctx context.Context, addr cachemesh.Endpoint, msg []byte) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+addr+ControlPath, bytes.NewReader(msg))
-	if err != nil {
-		return nil, err
-	}
+	h := http.Header{"Content-Type": {"application/octet-stream"}}
 
-	req.Header.Set("Content-Type", "application/octet-stream")
-
-	resp, err := t.Client.Do(req)
+	resp, err := send(ctx, t.Client, http.MethodPost, "http://"+addr+ControlPath, bytes.NewReader(msg), h, func(_ int, status string) error {
+		return fmt.Errorf("cachemesh control %s: %s", addr, status)
+	})
 	if err != nil {
 		return nil, err
 	}
 
 	defer func() { _ = resp.Body.Close() }() //nolint:errcheck // best-effort close
-
-	if resp.StatusCode != http.StatusOK {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096)) //nolint:errcheck // drain for reuse
-		return nil, fmt.Errorf("cachemesh control %s: %s", addr, resp.Status)
-	}
 
 	return readBounded(resp.Body)
 }
@@ -727,10 +741,7 @@ func readBounded(r io.Reader) ([]byte, error) {
 // 400, which the sender treats as a transport failure.
 func ControlHandler(m *atomic.Pointer[cachemesh.Mesh]) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			w.Header().Set("Allow", http.MethodPost)
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-
+		if !allowMethod(w, r, http.MethodPost) {
 			return
 		}
 
