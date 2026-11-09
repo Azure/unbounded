@@ -418,30 +418,57 @@ func TestDiskPageReadsCoalesce(t *testing.T) {
 	}
 }
 
-func TestHotTierAdmitsOnlySharedPagesAndEvictsLRU(t *testing.T) {
-	s := newTestStore(t, func(c *storeConfig) { c.hotBudget = 2 * testPage })
-	data := pattern(2, testChunk)
-	completeFill(t, s, key(1), data, false)
-
+func TestHotTierAdmitsRepeatedPagesAndEvictsLRU(t *testing.T) {
 	pages := int64(testChunk / testPage)
+	data := pattern(2, testChunk)
 
-	// One reader at a time: nothing is retained, each read goes to disk.
-	for range 2 {
-		r := s.get(key(1), 0)
-		if got := readAll(t, r); !bytes.Equal(got, data) {
-			t.Fatal("data mismatch")
+	readFrom := func(s *store, off int) {
+		t.Helper()
+
+		r := s.get(key(1), off)
+		if got := readAll(t, r); !bytes.Equal(got, data[off:]) {
+			t.Fatalf("off %d: data mismatch", off)
 		}
 
 		r.close()
 	}
 
-	st := s.stats()
-	if st.HotBytes != 0 || st.DiskReads != 2*pages {
-		t.Fatalf("single readers: %+v", st)
+	// Sequential readers: the first read is not retained; a second read
+	// while the page is in the ghost list admits it, and the LRU keeps the
+	// last two pages within the budget.
+	s := newTestStore(t, func(c *storeConfig) { c.hotBudget = 2 * testPage })
+	completeFill(t, s, key(1), data, false)
+
+	readFrom(s, 0)
+
+	if st := s.stats(); st.HotBytes != 0 || st.DiskReads != pages || st.PageBytes != 0 {
+		t.Fatalf("single read retained pages: %+v", st)
 	}
 
-	// Two concurrent readers: shared pages are admitted, and the LRU keeps
-	// the last two within the budget.
+	readFrom(s, 0)
+
+	if st := s.stats(); st.HotBytes != 2*testPage || st.DiskReads != 2*pages {
+		t.Fatalf("second read: %+v", st)
+	}
+
+	// A later reader of the last two pages hits the hot tier.
+	readFrom(s, 2*testPage)
+
+	if got := s.stats().DiskReads; got != 2*pages {
+		t.Fatalf("hot pages read from disk again: %d reads", got)
+	}
+
+	// Evicting the chunk drops its hot pages.
+	s.evictDigest("sha256:x")
+
+	if st := s.stats(); st.HotBytes != 0 || st.PageBytes != 0 {
+		t.Fatalf("after evict: %+v", st)
+	}
+
+	// Concurrent readers admit pages on first use.
+	s = newTestStore(t, func(c *storeConfig) { c.hotBudget = 2 * testPage })
+	completeFill(t, s, key(1), data, false)
+
 	b := newBarrier(2)
 
 	var wg sync.WaitGroup
@@ -458,34 +485,18 @@ func TestHotTierAdmitsOnlySharedPagesAndEvictsLRU(t *testing.T) {
 
 	wg.Wait()
 
-	st = s.stats()
-	if st.HotBytes != 2*testPage || st.DiskReads != 3*pages {
+	if st := s.stats(); st.HotBytes != 2*testPage || st.DiskReads != pages {
 		t.Fatalf("after shared read: %+v", st)
 	}
 
-	// A later reader of the last two pages hits the hot tier.
-	r := s.get(key(1), 2*testPage)
+	// Without a hot tier nothing is retained.
+	s = newTestStore(t, func(c *storeConfig) { c.hotBudget = 0 })
+	completeFill(t, s, key(1), data, false)
+	readFrom(s, 0)
+	readFrom(s, 0)
 
-	var buf bytes.Buffer
-	if _, err := r.streamTo(context.Background(), &buf); err != nil {
-		t.Fatal(err)
-	}
-
-	r.close()
-
-	if !bytes.Equal(buf.Bytes(), data[2*testPage:]) {
-		t.Fatal("hot tier data mismatch")
-	}
-
-	if got := s.stats().DiskReads; got != 3*pages {
-		t.Fatalf("hot pages read from disk again: %d reads", got)
-	}
-
-	// Evicting the chunk drops its hot pages.
-	s.evictDigest("sha256:x")
-
-	if st := s.stats(); st.HotBytes != 0 || st.PageBytes != 0 {
-		t.Fatalf("after evict: %+v", st)
+	if st := s.stats(); st.HotBytes != 0 || st.DiskReads != 2*pages {
+		t.Fatalf("no hot tier: %+v", st)
 	}
 }
 

@@ -11,7 +11,10 @@ import (
 
 // page is a reference-counted page buffer. Its capacity is the page size
 // rounded up to dioAlign, and its start is dioAlign aligned, so it can be
-// used for O_DIRECT I/O.
+// used for O_DIRECT I/O. On Linux page buffers are anonymous mappings
+// outside the Go heap: their memory is exactly the live pages, it does not
+// inflate the garbage collector's heap goal, and it returns to the system
+// as soon as a buffer is unmapped.
 type page struct {
 	buf  []byte
 	refs atomic.Int32
@@ -57,7 +60,7 @@ func (pp *pagePool) get() *page {
 	}
 	pp.mu.Unlock()
 
-	p := &page{buf: alignedBuf(int(alignUp(int64(pp.size)))), pool: pp}
+	p := &page{buf: allocPage(int(alignUp(int64(pp.size)))), pool: pp}
 	p.refs.Store(1)
 
 	return p
@@ -67,11 +70,16 @@ func (pp *pagePool) put(p *page) {
 	pp.live.Add(-1)
 
 	pp.mu.Lock()
-	defer pp.mu.Unlock()
-
 	if len(pp.idle) < pp.maxIdle {
 		pp.idle = append(pp.idle, p)
+		pp.mu.Unlock()
+
+		return
 	}
+	pp.mu.Unlock()
+
+	freePage(p.buf)
+	p.buf = nil
 }
 
 func (pp *pagePool) stats() (live, idle int) {
@@ -83,9 +91,14 @@ func (pp *pagePool) stats() (live, idle int) {
 
 func (pp *pagePool) drain() {
 	pp.mu.Lock()
-	defer pp.mu.Unlock()
-
+	idle := pp.idle
 	pp.idle = nil
+	pp.mu.Unlock()
+
+	for _, p := range idle {
+		freePage(p.buf)
+		p.buf = nil
+	}
 }
 
 // alignedBuf returns n bytes starting at a dioAlign boundary.
@@ -126,21 +139,36 @@ type diskPage struct {
 }
 
 // pageCache coalesces disk page reads and keeps a small hot tier of pages
-// with concurrent demand.
+// with repeated demand: pages that had two or more concurrent readers, or
+// that are read again while their key is still in a small ghost list of
+// recently read pages.
 type pageCache struct {
 	pool   *pagePool
 	budget int64
 
-	mu    sync.Mutex
-	m     map[pageKey]*diskPage
-	head  diskPage // hot LRU sentinel: head.next is most recent
-	used  int64
-	reads atomic.Int64
-	hits  atomic.Int64
+	mu sync.Mutex
+	m  map[pageKey]*diskPage
+	// ghost remembers keys of recently dropped single-reader pages, in
+	// FIFO order, so a second read soon after admits the page.
+	ghost     map[pageKey]struct{}
+	ghostRing []pageKey
+	ghostNext int
+	head      diskPage // hot LRU sentinel: head.next is most recent
+	used      int64
+	reads     atomic.Int64
+	hits      atomic.Int64
 }
 
 func newPageCache(pool *pagePool, budget int64) *pageCache {
 	c := &pageCache{pool: pool, budget: budget, m: make(map[pageKey]*diskPage)}
+
+	if budget > 0 {
+		// Remember four times as many pages as the hot tier holds.
+		n := max(64, int(4*budget/alignUp(int64(pool.size))))
+		c.ghost = make(map[pageKey]struct{}, n)
+		c.ghostRing = make([]pageKey, n)
+	}
+
 	c.head.next = &c.head
 	c.head.prev = &c.head
 
@@ -171,6 +199,12 @@ func (c *pageCache) get(f *fill, file *chunkFile, idx, n int) (*diskPage, error)
 	}
 
 	e := &diskPage{key: k, ready: make(chan struct{}), readers: 1}
+	if _, ok := c.ghost[k]; ok {
+		delete(c.ghost, k)
+
+		e.shared = true
+	}
+
 	c.m[k] = e
 	c.mu.Unlock()
 
@@ -217,7 +251,26 @@ func (c *pageCache) put(e *diskPage) {
 		return
 	}
 
+	if !e.dead && e.err == nil {
+		c.remember(e.key)
+	}
+
 	c.drop(e)
+}
+
+// remember adds k to the ghost list. Caller holds c.mu.
+func (c *pageCache) remember(k pageKey) {
+	if len(c.ghostRing) == 0 {
+		return
+	}
+
+	if old := c.ghostRing[c.ghostNext]; old.f != nil {
+		delete(c.ghost, old)
+	}
+
+	c.ghostRing[c.ghostNext] = k
+	c.ghost[k] = struct{}{}
+	c.ghostNext = (c.ghostNext + 1) % len(c.ghostRing)
 }
 
 // trim evicts idle hot pages until the tier fits its budget.
@@ -258,6 +311,13 @@ func (c *pageCache) drop(e *diskPage) {
 func (c *pageCache) purge(f *fill) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	for i, k := range c.ghostRing {
+		if k.f == f {
+			delete(c.ghost, k)
+			c.ghostRing[i] = pageKey{}
+		}
+	}
 
 	for k, e := range c.m {
 		if k.f != f {
