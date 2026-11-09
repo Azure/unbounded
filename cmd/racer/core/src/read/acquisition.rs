@@ -496,10 +496,7 @@ impl<R: Clone, M, A> PageAcquisition<R, M, A> {
         let hints;
         let event = match input {
             Input::Start { local_hit } => Event::Start { local_hit },
-            Input::Cancel(error) => {
-                self.pending = None;
-                Event::Abort(error)
-            }
+            Input::Cancel(error) => Event::Abort(error),
             Input::Ranked { result, .. } => {
                 let Some(Pending::Rank(ranking)) = kind else {
                     unreachable!("checked by answers()");
@@ -556,10 +553,7 @@ impl<R: Clone, M, A> PageAcquisition<R, M, A> {
             },
             Input::Timer { result, .. } => match result {
                 Ok(()) => Event::Timer,
-                Err(error) => {
-                    self.finish(Err(error), Evidence::default(), budget, now, out);
-                    return Ok(());
-                }
+                Err(error) => Event::Abort(error),
             },
             Input::Origin { result, .. } => {
                 let authority = self.authority.expect("origin authority");

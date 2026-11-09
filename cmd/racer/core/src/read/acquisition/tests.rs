@@ -593,8 +593,7 @@ fn fallback_walks_the_previous_membership_and_swaps_rankings() {
     assert_eq!(h.acq.current(), Some(&"r4"));
 }
 
-#[test]
-fn a_stale_wait_sleeps_and_a_failed_sleep_is_terminal() {
+fn sleeping() -> Harness {
     let mut h = Harness::new(false);
     start(&mut h);
     h.ranked(5, None, "r5");
@@ -607,12 +606,23 @@ fn a_stale_wait_sleeps_and_a_failed_sleep_is_terminal() {
     });
     let until = h.now + Duration::from_secs(4);
     assert!(matches!(effects[..], [Effect::Sleep { until: u, .. }] if u == until));
+    h
+}
+
+#[test]
+fn a_stale_wait_sleeps_and_a_failed_sleep_is_terminal() {
+    let mut h = sleeping();
     let id = h.id();
     h.act(Input::Timer {
         id,
         result: Err(Error::Canceled),
     });
-    assert_eq!(h.done().result, Err(Error::Canceled));
+    let failed = h.done();
+    assert_eq!(failed.result, Err(Error::Canceled));
+    // A failed sleep ends through the walk exactly like a cancel does.
+    let mut canceled = sleeping();
+    canceled.act(Input::Cancel(Error::Canceled));
+    assert_eq!(failed, canceled.done());
 }
 
 #[test]
