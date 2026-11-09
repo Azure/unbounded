@@ -124,7 +124,9 @@ gantry:
     # In-flight pages per chunk fill (4).
     fillPages: 0
     # Memory fills borrow beyond fillPages when a reader lags behind a fill
-    # that peers also read; when exhausted such fills spill to disk (2GiB).
+    # that peers also read, and to keep chunks peers read in memory for
+    # later peers (up to 30s unused); when exhausted, fills with a lagging
+    # reader spill to disk (2GiB).
     inflightBytes: 0
     # Page cache use of chunk files: bypass (O_DIRECT), drop (buffered, then
     # fadvise DONTNEED), or keep ("bypass").

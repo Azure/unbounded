@@ -117,9 +117,10 @@ type Config struct {
 	// FillPages is the number of in-flight pages each fill holds. Zero
 	// uses 4.
 	FillPages int
-	// InflightBytes bounds pages that fills borrow beyond FillPages when a
-	// reader lags behind a fill that peers read. When it is exhausted the
-	// fill spills to disk. Zero disables borrowing.
+	// InflightBytes bounds pages that fills borrow beyond FillPages: for a
+	// reader that lags behind a fill that peers read, and to keep chunks
+	// that peers read in memory for later peers. When it is exhausted a
+	// fill with a lagging reader spills to disk. Zero disables borrowing.
 	InflightBytes int64
 	// LingerTTL drops a complete chunk held in borrowed pages once it is
 	// unused for this long. Zero uses 30s.

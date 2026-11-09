@@ -137,11 +137,12 @@ type CachemeshConfig struct {
 	// arrive; slower readers read from disk.
 	FillPages int `yaml:"fill_pages"`
 
-	// InflightBytes bounds memory that fills borrow beyond fill_pages when
+	// InflightBytes bounds memory that fills borrow beyond fill_pages: when
 	// a reader lags behind a fill that peers also read, so one slow reader
-	// does not slow the others down. When it is exhausted such a fill
-	// spills to disk; without disk the slowest reader paces it. Zero
-	// disables borrowing.
+	// does not slow the others down, and to keep chunks that peers read in
+	// memory for later peers (for at most 30s unused; reclaimed first).
+	// When it is exhausted a fill with a lagging reader spills to disk;
+	// without disk the slowest reader paces it. Zero disables borrowing.
 	InflightBytes int64 `yaml:"inflight_bytes"`
 
 	// PageCache selects how chunk files use the kernel page cache:
