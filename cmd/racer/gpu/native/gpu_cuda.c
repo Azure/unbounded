@@ -82,7 +82,8 @@ struct gpu_context {
     CUcontext ctx;
     CUdevice dev;
     int32_t ordinal;
-    int module_state; /* 0 untried, 1 loaded, -1 unavailable */
+    int module_state; /* 0 untried, 1 loaded, -1 unavailable; under load_lock */
+    int kernels_ready; /* atomic; 1 once every kernel function resolved */
     CUmodule module;
     CUfunction partials, finalize, ctr;
     uint64_t peers[RACER_GPU_MAX_PEER_ORDINAL / 64]; /* src ordinals enabled by racer_gpu_peer */
@@ -290,6 +291,7 @@ int racer_gpu_context_free(void *context) {
         pop();
         if (rc) return rc;
         c->module_state = 0;
+        __atomic_store_n(&c->kernels_ready, 0, __ATOMIC_RELAXED);
     }
     int rc = drv(cu.cuDevicePrimaryCtxRelease(c->dev));
     if (!rc) free(c);
@@ -300,7 +302,7 @@ static int kernels_locked(struct gpu_context *c);
 
 /* Load the decrypt kernels into a context. Context must be current. */
 static int kernels(struct gpu_context *c) {
-    if (__atomic_load_n(&c->module_state, __ATOMIC_ACQUIRE) == 1 && c->ctr) return RACER_GPU_OK;
+    if (__atomic_load_n(&c->kernels_ready, __ATOMIC_ACQUIRE)) return RACER_GPU_OK;
     pthread_mutex_lock(&load_lock);
     int rc = kernels_locked(c);
     pthread_mutex_unlock(&load_lock);
@@ -320,9 +322,10 @@ static int kernels_locked(struct gpu_context *c) {
             if (drv(cu.cuModuleUnload(c->module))) c->module_state = 1;
             return RACER_GPU_ENOKERNEL;
         }
-        __atomic_store_n(&c->module_state, 1, __ATOMIC_RELEASE);
+        c->module_state = 1;
+        __atomic_store_n(&c->kernels_ready, 1, __ATOMIC_RELEASE);
     }
-    return c->module_state == 1 && c->ctr ? RACER_GPU_OK : RACER_GPU_ENOKERNEL;
+    return __atomic_load_n(&c->kernels_ready, __ATOMIC_RELAXED) ? RACER_GPU_OK : RACER_GPU_ENOKERNEL;
 }
 
 int racer_gpu_stream(void *context, void **out) {
