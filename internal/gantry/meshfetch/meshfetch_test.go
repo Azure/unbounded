@@ -1093,3 +1093,30 @@ func TestResolveTagShedsWhenFetchesSaturated(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 }
+
+// An origin that sends no Content-Type must round-trip as empty between
+// peers: net/http would otherwise sniff a JSON body as text/plain and the
+// requesting peer would cache that guess, bypassing the mirror's own
+// media-type fallback.
+func TestEmptyContentTypeRoundTripsBetweenPeers(t *testing.T) {
+	c := newCluster(t, clusterOpts{n: 4, verify: true})
+
+	manifest := []byte(`{"schemaVersion":2,"config":{},"layers":[]}`)
+	d := c.origin.add(manifest, "")
+
+	c.origin.mu.Lock()
+	c.origin.tags["library/app:v1"] = d.String()
+	c.origin.mu.Unlock()
+
+	for _, n := range c.nodes {
+		started, _, ctype, body, err := fetch(n, d, ifaces.KindManifest, 0)
+		if err != nil || !started || !bytes.Equal(body, manifest) || ctype != "" {
+			t.Fatalf("%s fetch: started=%v ctype=%q err=%v", n.id, started, ctype, err)
+		}
+
+		body, ctype, _, err = n.node.ResolveTag(context.Background(), "reg", "library/app", "v1")
+		if err != nil || !bytes.Equal(body, manifest) || ctype != "" {
+			t.Fatalf("%s tag: ctype=%q err=%v", n.id, ctype, err)
+		}
+	}
+}

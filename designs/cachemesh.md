@@ -1107,15 +1107,18 @@ Request headers: `Gantry-Cachemesh-Route` carries the 32-byte route header
 node whose own containerd pull started the request, and relays forward it.
 
 Response: 200 with `Gantry-Blob-Size`, `Content-Length` of the rest of the
-chunk, and the upstream `Content-Type` when known. Errors: 400 bad request,
+chunk, and the upstream `Content-Type` when known. When the upstream sent
+none, the header is omitted (not sniffed) so the requester also records an
+empty type and the mirror applies its own fallback. Errors: 400 bad request,
 404 (peek miss), 416 offset beyond chunk, 429 shed (more than 512
 concurrent responses), 503 no route, 508 TTL exhausted or loop, 502 other
 fill errors. After the status line is sent, a failure aborts the response
 so the peer sees a short body.
 
 `GET /cachemesh/meta?r=<registry>&n=<repo>&t=<tag>` with the route header
-returns the manifest bytes with `Content-Type`, `Docker-Content-Digest`,
-`Gantry-Stamp-Expires`, and `Gantry-Stamp-Gen`.
+returns the manifest bytes with `Content-Type` (omitted when the upstream
+sent none, as above), `Docker-Content-Digest`, `Gantry-Stamp-Expires`, and
+`Gantry-Stamp-Gen`.
 
 ### Request flow
 

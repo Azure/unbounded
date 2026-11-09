@@ -360,13 +360,24 @@ func (n *Node) handleMeta(w http.ResponseWriter, r *http.Request) {
 	}
 
 	hd := w.Header()
-	if e.ctype != "" {
-		hd.Set("Content-Type", e.ctype)
-	}
+	setContentType(hd, e.ctype)
 
 	hd.Set(headerDigest, e.digest.String())
 	hd.Set(headerStampExpire, strconv.FormatUint(e.stamp.Expires, 10))
 	hd.Set(headerStampGen, strconv.FormatUint(uint64(e.stamp.Gen), 10))
 	hd.Set("Content-Length", strconv.Itoa(len(e.body)))
 	_, _ = w.Write(e.body) //nolint:errcheck // the peer detects a short body
+}
+
+// setContentType sets the Content-Type header, or, when the origin sent
+// none, suppresses net/http's sniffing so an empty type round-trips as
+// empty and the requesting peer does not cache a guessed media type.
+func setContentType(h http.Header, ctype string) {
+	if ctype == "" {
+		h["Content-Type"] = nil
+
+		return
+	}
+
+	h.Set("Content-Type", ctype)
 }

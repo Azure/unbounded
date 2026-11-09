@@ -478,9 +478,7 @@ func (n *Node) handleChunk(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h := w.Header()
-	if ctype != "" {
-		h.Set("Content-Type", ctype)
-	}
+	setContentType(h, ctype)
 
 	h.Set(headerBlobSize, strconv.FormatInt(total, 10))
 	h.Set("Content-Length", strconv.Itoa(chunkLen-off))
