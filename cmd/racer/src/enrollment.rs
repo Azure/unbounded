@@ -1526,7 +1526,14 @@ mod tests {
     /// Abandoned writes are fenced before retry and publication phases stay exact.
     #[test]
     fn persistence_faults_abandonment_and_reconciliation_preserve_errors() {
-        for case in ["write", "rename", "sync", "abandon", "cancel-rename"] {
+        for case in [
+            "write",
+            "rename",
+            "sync",
+            "abandon",
+            "cancel-before-rename",
+            "cancel-rename",
+        ] {
             let sim = Simulation::new();
             let env = racer_io::Env::sim(&sim, racer_io::WorkerCtx::host());
             let (files, e, scope) = fixture(&env);
@@ -1540,6 +1547,8 @@ mod tests {
             match case {
                 "write" => sim.inject("write", Fault::Errno(28)).unwrap(),
                 "rename" => sim.inject("rename", Fault::Errno(5)).unwrap(),
+                // Keep the rename submitted but unexecuted so the cancel wins.
+                "cancel-before-rename" => sim.inject("rename", Fault::Delay(1_000_000)).unwrap(),
                 _ => sim.inject("rename", Fault::HoldCompletion(20)).unwrap(),
             }
             let mut accept = e.accept_response(issue(&env, &request, &ca, &key, |_| {}), &scope);
@@ -1561,6 +1570,31 @@ mod tests {
                 }
                 assert!(published);
             }
+            if case == "cancel-before-rename" {
+                // Earlier setup may already have renamed other files.
+                let renames = || {
+                    sim.trace()
+                        .iter()
+                        .filter(|event| event.operation == "submit:rename")
+                        .count()
+                };
+                let before = renames();
+                for _ in 0..100 {
+                    assert!(
+                        accept
+                            .as_mut()
+                            .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
+                            .is_pending()
+                    );
+                    files.reactor.poll_budgeted(64).unwrap();
+                    files.reactor.wait(Duration::from_millis(1)).unwrap();
+                    if renames() > before {
+                        break;
+                    }
+                }
+                assert!(renames() > before);
+                assert!(sim.metadata(Path::new("/private/identity.json")).is_err());
+            }
             if case == "abandon" {
                 drop(accept);
                 assert!(drive(&files, e.load_identity(&scope)).unwrap().is_some());
@@ -1568,24 +1602,29 @@ mod tests {
                 if case == "sync" {
                     sim.inject("fsync", Fault::Errno(5)).unwrap();
                 }
-                if case == "cancel-rename" {
+                if matches!(case, "cancel-before-rename" | "cancel-rename") {
                     scope.cancellation.cancel().unwrap();
                 }
                 let expected = Failure {
-                    cause: Cause::Runtime(if case == "cancel-rename" {
-                        racer_io::Error::Canceled
-                    } else {
-                        racer_io::Error::Os(if case == "write" { 28 } else { 5 })
-                    }),
+                    cause: Cause::Runtime(
+                        if matches!(case, "cancel-before-rename" | "cancel-rename") {
+                            racer_io::Error::Canceled
+                        } else {
+                            racer_io::Error::Os(if case == "write" { 28 } else { 5 })
+                        },
+                    ),
                     phase: match case {
-                        "rename" | "cancel-rename" => 1,
-                        "sync" => 2,
+                        "rename" | "cancel-before-rename" => 1,
+                        // The rename already succeeded, so the cancel only stops the sync.
+                        "sync" | "cancel-rename" => 2,
                         _ => 0,
                     },
                 };
+                let actual = drive(&files, accept);
                 assert!(
-                    matches!(drive(&files, accept), Err(actual) if actual == expected),
-                    "{case}"
+                    matches!(actual, Err(ref actual) if *actual == expected),
+                    "{case}: {:?}",
+                    actual.as_ref().err()
                 );
                 let scope = Request {
                     id: 0,
