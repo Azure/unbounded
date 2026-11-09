@@ -1391,6 +1391,20 @@ pub(crate) mod tests {
             same.page_size = racer_wire::object::PageSize::new(64 << 10).unwrap();
             assert_eq!(store.apply(same).unwrap().page_size.get(), 64 << 10);
         }
+        /// A projection prepared before the first acceptance cannot commit a
+        /// page size that differs from the one accepted meanwhile.
+        #[test]
+        fn page_size_is_rechecked_at_commit() {
+            let env = racer_io::Env::host();
+            let store = store(&env, 2);
+            let mut small = publication(1);
+            small.page_size = racer_wire::object::PageSize::new(64 << 10).unwrap();
+            let small = store.project(small).unwrap();
+            let large = store.project(membership(2, 2)).unwrap();
+            store.accept(small, None).unwrap();
+            let r = store.accept(large, None);
+            assert_eq!(r.err(), Some(Error::InvalidConfiguration));
+        }
         #[test]
         fn cache_only_history_uses_one_slot_and_weak_registry_stays_bounded() {
             let env = racer_io::Env::host();

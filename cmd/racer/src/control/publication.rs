@@ -60,9 +60,14 @@ impl PublicationTarget {
         self.published.publish(
             snapshot,
             self.clock.now(),
-            |_, next| {
+            |old, next| {
                 if next.cluster != self.cluster {
                     return Err(Error::Unauthorized);
+                }
+                // Checked again under the cell lock: the projection compared
+                // against the snapshot current when it was prepared.
+                if old.is_some_and(|o| o.page_size != next.page_size) {
+                    return Err(Error::InvalidConfiguration);
                 }
                 Ok(())
             },
