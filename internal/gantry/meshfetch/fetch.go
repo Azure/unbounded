@@ -1057,10 +1057,12 @@ func (n *Node) streamChunks(ctx context.Context, w io.Writer, r0 *reader, c0, la
 	}
 }
 
-// copyChunk writes the chunk from r's position to w. When the fill fails
-// or no longer holds the bytes the reader needs, it obtains a new reader
-// (which may start a new fill that routes afresh) and continues where it
-// stopped. It closes r and any replacement.
+// copyChunk writes the chunk from r's position to w. The fill already
+// retries its sources, so a fill error ends the copy. When the reader
+// loses bytes the fill no longer holds (errLost: it fell too far behind,
+// or the local content store failed), copyChunk obtains a new reader,
+// which may start a new fill, and continues where it stopped, at most
+// tune.attempts times in all. It closes r and any replacement.
 func (n *Node) copyChunk(ctx context.Context, w io.Writer, r *reader, req chunkReq) error {
 	for attempt := 1; ; attempt++ {
 		r.f.mu.Lock()
@@ -1074,7 +1076,7 @@ func (n *Node) copyChunk(ctx context.Context, w io.Writer, r *reader, req chunkR
 			return nil
 		}
 
-		if ctx.Err() != nil || errors.Is(err, errDownstream) || terminal(err) || attempt >= n.cfg.tune.attempts {
+		if !errors.Is(err, errLost) || ctx.Err() != nil || attempt >= n.cfg.tune.attempts {
 			return err
 		}
 

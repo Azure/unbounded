@@ -294,6 +294,15 @@ func TestFetchBlobAbortsMidStream(t *testing.T) {
 	if len(body) >= len(blob2) {
 		t.Fatalf("body should be truncated, got %d bytes", len(body))
 	}
+
+	// The fill retries its sources and the copy does not retry a failed
+	// fill, so attempts do not compound per copy: the requester's fill
+	// tries at most twice, each reaching an owner fill that tries the
+	// origin at most twice, plus at most one owner peek fill. Retrying the
+	// copy as well pulled up to 12 times.
+	if got := c.origin.pullCount(d2, cs); got > 6 {
+		t.Fatalf("chunk 1 pulled from the origin %d times, want at most 6", got)
+	}
 }
 
 func TestFetchBlobVerifyFailureEvicts(t *testing.T) {
