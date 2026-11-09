@@ -511,6 +511,7 @@ fn percent_decode(value: &str) -> Result<String, PrefetchError> {
             b'%' => {
                 let hex = bytes
                     .get(i + 1..i + 3)
+                    .filter(|h| h.iter().all(u8::is_ascii_hexdigit))
                     .and_then(|h| std::str::from_utf8(h).ok())
                     .and_then(|h| u8::from_str_radix(h, 16).ok())
                     .ok_or_else(|| PrefetchError::invalid("invalid percent-encoding"))?;
@@ -812,6 +813,15 @@ mod tests {
             "refs=%zz",
         ] {
             assert!(parse_query(bad, &limits).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn percent_decode_requires_two_hex_digits() {
+        assert_eq!(percent_decode("a%2Fb+c").unwrap(), "a/b c");
+        assert_eq!(percent_decode("%61%6C").unwrap(), "al");
+        for bad in ["%+f", "%-1", "%f", "%", "%g0", "% f"] {
+            assert!(percent_decode(bad).is_err(), "{bad}");
         }
     }
 
