@@ -510,9 +510,11 @@ pub fn plan_with(
     d.retired.retain(|r| r.until > now);
     let offered: std::collections::HashSet<String> =
         offers.iter().map(|o| STANDARD.encode(&o.der)).collect();
-    // Expire unoffered roots first so eviction only happens when expiry
-    // alone does not free a slot.
-    expire_roots(&mut d, now, |r| offered.contains(&r.der));
+    // Expire unoffered roots, and offered roots past NotAfter, first so
+    // eviction only happens when expiry alone does not free a slot.
+    expire_roots(&mut d, now, |r| {
+        offered.contains(&r.der) && r.not_after > now
+    });
     let mut refused = 0;
     let mut evicted = 0;
     for offer in offers {
@@ -998,6 +1000,40 @@ pub(crate) mod tests {
         let p = plan(&policy(), &d, &[], &live[..2], t).unwrap();
         assert_eq!(p.evicted_roots, 0);
         assert!(p.durable.roots.contains(&d.roots[0]));
+    }
+
+    #[test]
+    fn expired_offered_root_frees_slot_before_eviction() {
+        let t = now();
+        let mut d = full_of_departed_roots(t);
+        for r in &mut d.roots {
+            r.retain_until += DAY;
+        }
+        // A holder still offers a root whose certificate is past NotAfter
+        // at plan time, while its retain deadline has not passed.
+        d.roots[5].der = STANDARD.encode(root(1));
+        d.roots[5].not_after = t + DAY;
+        d.roots[5].retain_until = t + 2 * DAY;
+        let stale = d.roots[5].clone();
+        let t = t + DAY + 1;
+        let mut live = vec![Offer {
+            der: STANDARD.decode(&stale.der).unwrap(),
+            seat: stale.seat,
+            holder: stale.holder.clone(),
+        }];
+        live.extend(offers(1));
+        let p = plan(&policy(), &d, &[], &live, t).unwrap();
+        assert_eq!(p.evicted_roots, 0);
+        assert_eq!(p.refused_roots, 0);
+        assert!(!p.durable.roots.contains(&stale));
+        assert!(p.durable.root_committed(&live[1].der));
+        // Every other root, all still valid, survives.
+        for (i, r) in d.roots.iter().enumerate() {
+            if i != 5 {
+                assert!(p.durable.roots.contains(r));
+            }
+        }
+        p.durable.validate().unwrap();
     }
 
     #[test]
