@@ -468,6 +468,21 @@ func summarizeStageExecution(
 		return signalv1.StageEvidenceSummary{}, errors.New("stage produced no invocation evidence")
 	}
 
+	observedCoverage := finishedAt.Sub(startedAt)
+	if observedCoverage < 0 {
+		return signalv1.StageEvidenceSummary{}, errors.New("stage finished before it started")
+	}
+
+	evidenceStartedAt := startedAt.UTC().Truncate(time.Second)
+	evidenceFinishedAt := finishedAt.UTC().Truncate(time.Second)
+	if !evidenceFinishedAt.Equal(finishedAt) {
+		evidenceFinishedAt = evidenceFinishedAt.Add(time.Second)
+	}
+
+	if maximumCoverage := evidenceFinishedAt.Sub(evidenceStartedAt); observedCoverage > maximumCoverage {
+		observedCoverage = maximumCoverage
+	}
+
 	summary := signalv1.StageEvidenceSummary{
 		PhaseOrder:             request.PhaseOrder,
 		StageOrder:             request.StageOrder,
@@ -475,9 +490,9 @@ func summarizeStageExecution(
 		Role:                   request.PhaseRole,
 		Test:                   request.Stage.Test.Identity,
 		Mode:                   request.Stage.Schedule.Mode,
-		StartedAt:              metav1.NewTime(startedAt),
-		FinishedAt:             metav1.NewTime(finishedAt),
-		ObservedCoverageWindow: metav1.Duration{Duration: finishedAt.Sub(startedAt)},
+		StartedAt:              metav1.NewTime(evidenceStartedAt),
+		FinishedAt:             metav1.NewTime(evidenceFinishedAt),
+		ObservedCoverageWindow: metav1.Duration{Duration: observedCoverage},
 		InvocationCount:        int32(len(envelopes)),
 		QualificationEligible:  request.Stage.QualificationEligible,
 		DiagnosticOnly:         request.Stage.DiagnosticOnly,

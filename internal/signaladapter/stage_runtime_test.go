@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -222,6 +223,41 @@ func TestStageRunnerPeriodicObservesFullCoverageWindow(t *testing.T) {
 
 	if got := summary.FinishedAt.Sub(summary.StartedAt.Time); got != 10*time.Second {
 		t.Fatalf("observed window = %s, want 10s", got)
+	}
+}
+
+func TestStageSummaryTimingSurvivesJSONRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	start := time.Date(2026, 1, 1, 0, 0, 0, int(900*time.Millisecond), time.UTC)
+	clock := &fakeStageClock{now: start}
+	executor := &fakeStageExecutor{clock: clock, duration: 200 * time.Millisecond}
+	request := stageExecutionRequest(signalv1.StageSchedule{
+		Mode:              signalv1.CheckExecutionModeRunOnce,
+		InvocationTimeout: metav1.Duration{Duration: time.Second},
+	})
+
+	summary, err := (StageRunner{Clock: clock, Executor: executor}).Execute(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	content, err := json.Marshal(summary)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var persisted signalv1.StageEvidenceSummary
+	if err := json.Unmarshal(content, &persisted); err != nil {
+		t.Fatal(err)
+	}
+
+	if maximum := persisted.FinishedAt.Sub(persisted.StartedAt.Time); persisted.ObservedCoverageWindow.Duration > maximum {
+		t.Fatalf(
+			"persisted observed coverage = %s, execution interval = %s",
+			persisted.ObservedCoverageWindow.Duration,
+			maximum,
+		)
 	}
 }
 
