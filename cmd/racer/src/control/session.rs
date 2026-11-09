@@ -568,6 +568,12 @@ impl Session {
     /// identity's renewal time or a scheduled retry, at least [`RENEWAL_MIN_WAIT`]
     /// and at most [`RENEWAL_MAX_WAIT`] from `now`. The cap bounds the effect of
     /// wall-clock steps on a monotonic sleep.
+    /// Whether a rejected fetch should start renewal now rather than at the
+    /// scheduled wake: only when no renewal retry backoff is pending.
+    fn rejection_renewal_ready(&self, now: Instant) -> bool {
+        self.auth.binding_check.get() && self.renewal_next.get().is_none_or(|next| next <= now)
+    }
+
     fn renewal_wake(&self, now: Instant) -> Instant {
         let wall = self.auth.enrollment.wall_now();
         let due = self.identity().map_or(Duration::ZERO, |identity| {
@@ -828,8 +834,10 @@ impl Session {
                     let sleep = io.sleep(wake, scope);
                     // A rejected fetch sets `binding_check` on this lane and wakes
                     // this select, so renewal starts without waiting for `wake`.
+                    // During renewal backoff the sleep alone wakes the loop, or
+                    // `renew_if_due` would no-op and this select would spin.
                     let rejected = std::future::poll_fn(|_| {
-                        if self.auth.binding_check.get() {
+                        if self.rejection_renewal_ready(scope.clock().now()) {
                             std::task::Poll::Ready(Ok(()))
                         } else {
                             std::task::Poll::Pending
@@ -1935,6 +1943,24 @@ pub(super) mod tests {
         assert_eq!(session.renewal_wake(now), now + RENEWAL_MAX_WAIT);
         session.renewal_next.set(Some(now));
         assert_eq!(session.renewal_wake(now), now + RENEWAL_MIN_WAIT);
+    }
+
+    #[test]
+    fn rejection_renewal_waits_for_backoff() {
+        let env = racer_io::Env::host();
+        let session = session(&env);
+        let now = Instant::now();
+        assert!(!session.rejection_renewal_ready(now));
+        session.auth.binding_check.set(true);
+        assert!(session.rejection_renewal_ready(now));
+        // A pending retry must not make the select ready, or the loop spins.
+        session
+            .renewal_next
+            .set(Some(now + Duration::from_secs(10)));
+        assert!(!session.rejection_renewal_ready(now));
+        assert!(session.rejection_renewal_ready(now + Duration::from_secs(10)));
+        session.renewal_next.set(Some(now));
+        assert!(session.rejection_renewal_ready(now));
     }
 
     /// Without any persisted rails, serving reports nothing (there is
