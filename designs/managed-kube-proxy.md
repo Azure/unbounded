@@ -105,10 +105,14 @@ anonymous access, follows pagination and safe redirects, and is bounded by a
 incomplete tag listings, and missing matching tags return errors and leave the
 managed kube-proxy controller unstarted rather than guessing an image.
 
-The image is worked out once, when the controller starts leading. Where the
-operator manages unbounded-net, `images.kubeProxy` in its overrides ConfigMap
-sets the same flag on the controller Deployment, so it takes precedence over
-the runtime setting and changing it restarts the controller.
+The image is worked out once, when the controller starts leading. Image
+discovery and managed kube-proxy startup run in a background goroutine under
+the leadership context, without blocking the other controllers or shared
+informer startup. The DaemonSet informer is requested before launching that
+goroutine so the shared factory starts it even when image discovery is slow.
+Where the operator manages unbounded-net, `images.kubeProxy` in its overrides
+ConfigMap sets the same flag on the controller Deployment, so it takes precedence
+over the runtime setting and changing it restarts the controller.
 
 Managed kube-proxy can be disabled with:
 

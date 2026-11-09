@@ -692,7 +692,11 @@ func run(cfg *config.Config, forceNotLeader bool) error {
 		}()
 
 		if cfg.ManagedKubeProxyEnabled {
-			startManagedKubeProxyController(ctx, clientset, dynamicInformerFactory, informerFactory, controllerNamespace, cfg.ManagedKubeProxyImage)
+			configuredImage := cfg.ManagedKubeProxyImage
+
+			startManagedKubeProxyController(ctx, clientset, dynamicInformerFactory, informerFactory, controllerNamespace, func(ctx context.Context) (string, error) {
+				return controller.ManagedKubeProxyImage(ctx, clientset, configuredImage)
+			})
 		} else {
 			klog.Info("Managed kube-proxy controller disabled")
 		}
@@ -768,37 +772,55 @@ func run(cfg *config.Config, forceNotLeader bool) error {
 	return nil
 }
 
-// startManagedKubeProxyController works out the managed kube-proxy image and
-// starts the controller that runs it. Failures are logged rather than returned:
-// managed kube-proxy is one controller among many, and the rest still run.
+// startManagedKubeProxyController discovers the image and runs managed kube-proxy
+// in the background so slow discovery cannot block the other controllers or
+// shared informer startup. Failures are logged rather than returned.
 func startManagedKubeProxyController(
 	ctx context.Context,
 	clientset kubernetes.Interface,
 	dynamicInformerFactory dynamicinformer.DynamicSharedInformerFactory,
 	informerFactory informers.SharedInformerFactory,
-	namespace, configuredImage string,
+	namespace string,
+	resolveImage func(context.Context) (string, error),
 ) {
-	image, err := controller.ManagedKubeProxyImage(ctx, clientset, configuredImage)
-	if err != nil {
-		klog.Errorf("Managed kube-proxy controller not started: %v", err)
-
-		return
-	}
-
-	klog.Infof("Managed kube-proxy image: %s", image)
-
-	kubeProxyCtrl, err := controller.NewManagedKubeProxyController(clientset, dynamicInformerFactory, informerFactory, controller.ManagedKubeProxyOptions{
-		Namespace: namespace,
-		Image:     image,
-	})
-	if err != nil {
-		klog.Errorf("Failed to create managed kube-proxy controller: %v", err)
-
-		return
-	}
+	// The Site controller has already requested Node and Site informers. Request
+	// DaemonSets before the caller starts the factories, even if discovery finishes
+	// after that. An informer first requested later would miss the caller's Start.
+	informerFactory.Apps().V1().DaemonSets().Informer()
 
 	go func() {
-		if err := kubeProxyCtrl.Run(ctx, 2); err != nil {
+		if ctx.Err() != nil {
+			return
+		}
+
+		image, err := resolveImage(ctx)
+		if err != nil {
+			if ctx.Err() == nil {
+				klog.Errorf("Managed kube-proxy controller not started: %v", err)
+			}
+
+			return
+		}
+
+		if ctx.Err() != nil {
+			return
+		}
+
+		klog.Infof("Managed kube-proxy image: %s", image)
+
+		kubeProxyCtrl, err := controller.NewManagedKubeProxyController(clientset, dynamicInformerFactory, informerFactory, controller.ManagedKubeProxyOptions{
+			Namespace: namespace,
+			Image:     image,
+		})
+		if err != nil {
+			if ctx.Err() == nil {
+				klog.Errorf("Failed to create managed kube-proxy controller: %v", err)
+			}
+
+			return
+		}
+
+		if err := kubeProxyCtrl.Run(ctx, 2); err != nil && ctx.Err() == nil {
 			klog.Errorf("Managed kube-proxy controller error: %v", err)
 		}
 	}()

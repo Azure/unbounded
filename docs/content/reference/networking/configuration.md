@@ -145,7 +145,9 @@ version or a provider tag. Failure to discover a valid API server version,
 complete the tag listing, or find a matching tag prevents the managed kube-proxy
 controller from starting instead of selecting an unverified image.
 
-The controller works out the image once, when it starts. When the operator
+The controller works out the image once, when it starts leading. Image discovery
+and managed kube-proxy startup run in the background; the other network
+controllers and shared informers do not wait for them. When the operator
 manages unbounded-net, the image can also be set through the operator's
 overrides ConfigMap, which validates it before anything is written and takes
 precedence over this setting. See
