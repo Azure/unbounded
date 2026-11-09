@@ -15,6 +15,8 @@ enum Reply {
     Response(u16, Vec<u8>),
     Error(Error, Option<Duration>),
     Wait,
+    /// Hold like a server long poll, then answer with no change.
+    Hold(Duration),
 }
 
 /// Observable request paths and delta digests.
@@ -78,6 +80,14 @@ impl Fetch for Script {
                     retry_after: None,
                 }),
                 Reply::Error(error, retry_after) => Err(FetchError { error, retry_after }),
+                Reply::Hold(wait) => {
+                    self.io.sleep(scope.clock().now() + wait, scope).await?;
+                    Ok(rest::Response {
+                        status: 204,
+                        body: Vec::new(),
+                        retry_after: None,
+                    })
+                }
                 Reply::Wait => {
                     let far = scope.clock().now() + Duration::from_secs(3600);
                     self.io.sleep(far, scope).await?;
@@ -1163,5 +1173,66 @@ fn deltas_apply_against_cached_digest_and_fall_back_to_full() {
             script.requests.borrow()[4].1.as_deref(),
             Some(wire::content_hash(&one).unwrap().as_str())
         );
+    });
+}
+
+/// Backoff longer than the turn's slack must not cut the next held poll short:
+/// the turn ends after the sleep and a fresh turn holds the poll in full.
+#[test]
+fn long_backoff_leaves_held_poll_its_full_wait() {
+    sim(41, |clock, env| {
+        let io = host(env);
+        let target = Installer::new();
+        let failures = 6;
+        let script = Script::new(
+            &io,
+            (0..failures)
+                .map(|_| Reply::Error(Error::Unavailable, None))
+                .chain([Reply::Hold(wire::POLL_WAIT)]),
+        );
+        let mut sync = Poll::new(
+            io.clone(),
+            Doc::Keyring,
+            Box::new(script.clone()),
+            Box::new(target),
+            Schedule::control(),
+        )
+        .unwrap();
+        sync.seed(key(1)).unwrap();
+        // Coarse simulated steps keep the 30 second hold fast on the host.
+        let fast = |sync: &mut Poll| {
+            // Each turn gets a fresh outer scope, as the app gives it.
+            let scope = RequestScope::on(
+                &env.ctx.clock,
+                crate::model::RequestId([11; 16]),
+                env.ctx.now() + Schedule::control().turn,
+            )
+            .unwrap();
+            let mut turn = Box::pin(sync.turn(&scope));
+            let until = Instant::now() + Duration::from_secs(10);
+            loop {
+                let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+                if let Ready::Ready(result) = turn.as_mut().poll(&mut cx) {
+                    return result;
+                }
+                assert!(Instant::now() < until, "turn stalled");
+                clock.advance(Duration::from_millis(50));
+            }
+        };
+        let mut results = Vec::new();
+        for _ in 0..20 {
+            let result = fast(&mut sync);
+            results.push(result);
+            if result.is_ok() && script.requests.borrow().len() > failures {
+                break;
+            }
+        }
+        let errors = results.iter().filter(|r| r.is_err()).count();
+        assert_eq!(errors, failures, "{results:?}");
+        assert_eq!(results.last(), Some(&Ok(())), "{results:?}");
+        assert_eq!(script.requests.borrow().len(), failures + 1);
+        assert!(script.replies.borrow().is_empty());
+        // Success reset the failure count: the next fetch is a tick away.
+        assert!(sync.status().next_fetch <= env.ctx.now() + Duration::from_secs(1));
     });
 }

@@ -302,6 +302,18 @@ pub struct Schedule {
     pub retry_max: Duration,
 }
 
+/// Turn time a fetch needs after backoff: the server's held wait plus margin.
+const HELD_FETCH: Duration = wire::POLL_WAIT.saturating_add(Duration::from_secs(5));
+
+/// The network half of one turn.
+enum Fetched {
+    /// Backoff consumed the turn; the fetch runs in the next turn.
+    Slept,
+
+    /// A completed fetch, with any newer document.
+    Document(Option<Document>),
+}
+
 impl Schedule {
     /// Production bounds: responsive during held polls and remote backoff.
     pub fn control() -> Self {
@@ -617,9 +629,23 @@ impl Poll {
         let next_fetch = self.state.borrow().fetch_at();
         let this = &*self;
         let state = &self.state;
+        // A held poll needs the server's full wait. When backoff leaves too
+        // little of this turn for it, end the turn after the sleep and fetch
+        // in the next, fresh turn instead of cutting the held GET short and
+        // counting that as another failure.
+        // Turns too short to hold a poll at all keep sleeping and fetching
+        // together.
+        let fetch_here = scope.deadline().is_none_or(|deadline| {
+            next_fetch <= now
+                || deadline.saturating_duration_since(now) < HELD_FETCH
+                || deadline.saturating_duration_since(next_fetch) >= HELD_FETCH
+        });
         let network = async {
             this.io.sleep(next_fetch, &scope).await?;
-            this.fetch(&scope).await
+            if !fetch_here {
+                return Ok(Fetched::Slept);
+            }
+            this.fetch(&scope).await.map(Fetched::Document)
         };
         futures::pin_mut!(network);
         loop {
@@ -641,7 +667,11 @@ impl Poll {
             };
             let mut progress = state.borrow_mut();
             match result {
-                Ok(document) => {
+                Ok(Fetched::Slept) => {
+                    progress.advance(this)?;
+                    return Ok(());
+                }
+                Ok(Fetched::Document(document)) => {
                     progress.failures = 0;
                     progress.next_fetch = this.now() + this.schedule.tick;
                     if let Some(document) = document

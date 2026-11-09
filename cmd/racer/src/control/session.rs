@@ -1624,7 +1624,15 @@ pub(super) mod tests {
             if pending {
                 drive(&clock, sync.turn(&scope)).unwrap();
             }
+            // A production turn spends a long backoff alone and fetches in
+            // the next turn, so the held poll keeps its full wait.
+            let backoff = |sync: &mut Poll| {
+                if sync.status().next_fetch > sim_ctx.clock.now() + Duration::from_secs(5) {
+                    drive(&clock, sync.turn(&scope)).unwrap();
+                }
+            };
             for error in [Error::Unavailable, Error::Overloaded] {
+                backoff(&mut sync);
                 assert_eq!(drive(&clock, sync.turn(&scope)), Err(error));
                 assert!(sync.status().next_fetch >= sim_ctx.clock.now() + Duration::from_secs(7));
                 assert_eq!(sync.status().accepted, Some(10));
@@ -1636,6 +1644,7 @@ pub(super) mod tests {
                 assert!(!session.auth.binding_check.get());
                 assert_eq!(session.renewal_error(), None);
             }
+            backoff(&mut sync);
             drive(&clock, sync.turn(&scope)).unwrap();
             assert!(
                 requests
