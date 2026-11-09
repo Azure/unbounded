@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/Azure/unbounded/internal/cachemesh"
+	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 )
 
@@ -1001,5 +1002,42 @@ func TestManifestNotServedFromLocalContent(t *testing.T) {
 
 	if c.origin.totalPulls() == 0 {
 		t.Fatal("manifest was served from local content")
+	}
+}
+
+// TestPeerRefusesManifestFromLocalContent checks the serving side: a peek
+// and the local-only path (also used once the TTL is exhausted) never serve
+// a manifest-kind chunk from the local content store, which has no media
+// type, while a blob chunk with the same digest is served.
+func TestPeerRefusesManifestFromLocalContent(t *testing.T) {
+	c := newCluster(t, clusterOpts{n: 1})
+	n := c.nodes[0]
+
+	index := []byte(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}`)
+	sum := sha256.Sum256(index)
+	d := digest.MustParse("sha256:" + hex.EncodeToString(sum[:])) // not at the origin
+	n.content.put(d.String(), index)
+
+	for _, tc := range []struct {
+		kind uint8
+		want int
+	}{{kindManifest, http.StatusNotFound}, {kindBlob, http.StatusOK}} {
+		req := chunkReq{registry: "reg", repo: "library/app", d: d, key: chunkKey{digest: d.String(), kind: tc.kind}}
+
+		rd := n.node.localOnly(req, 0)
+		if (rd != nil) != (tc.kind == kindBlob) {
+			t.Fatalf("kind %d: localOnly reader=%v", tc.kind, rd != nil)
+		}
+
+		if rd != nil {
+			rd.close()
+		}
+
+		rec := httptest.NewRecorder()
+		n.node.handleChunk(rec, httptest.NewRequest(http.MethodGet, ChunkPath+"?"+n.node.chunkQuery(req, 0, peekLocal).Encode(), nil))
+
+		if rec.Code != tc.want {
+			t.Fatalf("kind %d: peek status %d, want %d", tc.kind, rec.Code, tc.want)
+		}
 	}
 }
