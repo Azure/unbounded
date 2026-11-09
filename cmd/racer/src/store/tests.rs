@@ -1213,6 +1213,61 @@ fn failed_full_queue_replacement_keeps_the_victim() {
     assert_eq!(f.store.writer.discarded_count(), 0);
 }
 
+/// A staging callback that reclaims a queued page (as production reclaim
+/// does) must not make the full-queue replacement remove the wrong queue
+/// entry: every pending page stays queued, and the queue still drains.
+#[test]
+fn full_queue_replacement_survives_callback_reclaim() {
+    let env = racer_io::Env::host();
+    let f = Fixture::new(&env);
+    let _ = futures::executor::block_on(f.store.open()).unwrap();
+    f.reactor.init().unwrap();
+    let first = f.copy(1, 113);
+    let first_id = first.ciphertext.envelope().page.clone();
+    let second = f.copy(2, 113);
+    let preferred = f.copy(3, 113);
+    let owner = preferred.ciphertext.envelope().page.clone();
+    f.store
+        .writer
+        .retention()
+        .set_ownership(Rc::new(move |page| page == &owner));
+    f.enqueue(first).unwrap();
+    f.enqueue(second).unwrap();
+    let cache = preferred.metadata.version.object.cache.clone();
+    let dirty = f
+        .admission
+        .reserve(
+            Some(&cache),
+            ResourceClass::DirtyCiphertext,
+            preferred.ciphertext.bytes().len(),
+        )
+        .unwrap();
+    let writer = &f.store.writer;
+    writer
+        .enqueue_reclaiming(preferred, dirty, |length| {
+            // Reclaim the head of the queue, ahead of or equal to the victim.
+            let head = writer.queue.borrow_mut().pop_front().unwrap();
+            assert_eq!(head, first_id);
+            writer.pending.borrow_mut().remove(&head);
+            f.admission
+                .reserve(Some(&cache), ResourceClass::Ciphertext, length)
+                .map_err(Into::into)
+        })
+        .unwrap();
+    {
+        let queue = writer.queue.borrow();
+        let pending = writer.pending.borrow();
+        assert_eq!(queue.len(), pending.len());
+        for page in pending.keys() {
+            assert!(queue.contains(page), "pending page missing from queue");
+        }
+    }
+    let request = scope(&env);
+    drive(&f.reactor, writer.drain(&request)).unwrap();
+    assert!(writer.is_idle());
+    assert_eq!(writer.pending_count(), 0);
+}
+
 #[test]
 fn second_sight_pressure_never_discards_submitted_owner() {
     let env = racer_io::Env::host();

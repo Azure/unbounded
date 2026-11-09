@@ -1058,18 +1058,17 @@ impl StoreWriter {
                 .queue
                 .borrow()
                 .iter()
-                .enumerate()
                 .take(QUEUE_RECLAIM_CANDIDATES)
-                .filter(|(_, page)| !self.protected_pending(page))
-                .map(|(position, page)| (position, page.clone(), scoring.rank(page)))
-                .min_by_key(|(_, _, rank)| *rank);
-            let Some((position, victim, rank)) = victim else {
+                .filter(|page| !self.protected_pending(page))
+                .map(|page| (page.clone(), scoring.rank(page)))
+                .min_by_key(|(_, rank)| *rank);
+            let Some((victim, rank)) = victim else {
                 return Err(Error::Overloaded);
             };
             if !self.index.is_held(&id) && scoring.rank(&id) <= rank {
                 return Err(Error::Overloaded);
             }
-            displace = Some((position, victim));
+            displace = Some(victim);
         }
         // Reserve the staging persist will need before queue acceptance. Thus
         // accepted dirty copies never wait for ciphertext holders to release
@@ -1102,10 +1101,22 @@ impl StoreWriter {
             staging: Some(staging),
         };
         // Nothing below fails: commit the replacement.
-        if let Some((position, victim)) = displace {
-            self.queue.borrow_mut().remove(position);
-            self.pending.borrow_mut().remove(&victim);
-            self.note_discard(crate::telemetry::Event::DirtyDiscardDisplaced, 1);
+        // The staging callback may itself reclaim queued pages, shifting
+        // positions or freeing room: find the victim again by id, and displace
+        // it only while the queue is still full.
+        if let Some(victim) = displace
+            && self.pending.borrow().len() >= self.capacity.get()
+        {
+            let position = self
+                .queue
+                .borrow()
+                .iter()
+                .position(|queued| *queued == victim);
+            if let Some(position) = position {
+                self.queue.borrow_mut().remove(position);
+                self.pending.borrow_mut().remove(&victim);
+                self.note_discard(crate::telemetry::Event::DirtyDiscardDisplaced, 1);
+            }
         }
         self.next.set(next);
         self.pending.borrow_mut().insert(id.clone(), entry);
