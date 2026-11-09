@@ -31,6 +31,7 @@ const (
 	testAdapterImage    = "example.invalid/adapter@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	testRunnerImage     = "example.invalid/runner@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 	testResolverImage   = "example.invalid/resolver@sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+	testPrometheusImage = "example.invalid/prometheus@sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
 	testDigest          = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
 	testScriptDigest    = "sha256:e29ac9e1988d6c6c2837f2ab3e480c54854dd315f030c4aef994019659a7b635"
 	qualificationGuard  = "node-authorizer-node-restriction-rbac-verified"
@@ -114,6 +115,102 @@ func TestRenderedExecutionProvenanceIsPinnedAndDeterministic(t *testing.T) {
 		if !slices.Contains(controller.Args, argument) {
 			t.Fatalf("controller args do not contain %q: %v", argument, controller.Args)
 		}
+	}
+}
+
+func TestRenderedPrometheusScrapesSignalController(t *testing.T) {
+	t.Parallel()
+
+	output := renderSignal(t, signalRenderData())
+	documents := splitYAMLDocuments(string(readRenderedFile(t, output, "13-prometheus.yaml")))
+	if len(documents) != 4 {
+		t.Fatalf("Prometheus documents = %d, want 4", len(documents))
+	}
+
+	var metricsService corev1.Service
+	if err := yaml.Unmarshal([]byte(documents[0]), &metricsService); err != nil {
+		t.Fatalf("decode metrics Service: %v", err)
+	}
+
+	if metricsService.Annotations["prometheus.io/scrape"] != "true" ||
+		metricsService.Spec.Ports[0].TargetPort.StrVal != "metrics" {
+		t.Fatalf("metrics Service = %#v", metricsService)
+	}
+
+	var config corev1.ConfigMap
+	if err := yaml.Unmarshal([]byte(documents[1]), &config); err != nil {
+		t.Fatalf("decode Prometheus ConfigMap: %v", err)
+	}
+
+	assertContainsAll(
+		t,
+		config.Data["prometheus.yml"],
+		"scrape_interval: 15s",
+		"project-signal-controller-metrics.signal-ns.svc:8080",
+		"127.0.0.1:9090",
+	)
+
+	var deployment appsv1.Deployment
+	if err := yaml.Unmarshal([]byte(documents[2]), &deployment); err != nil {
+		t.Fatalf("decode Prometheus Deployment: %v", err)
+	}
+
+	container := deployment.Spec.Template.Spec.Containers[0]
+	if container.Image != testPrometheusImage ||
+		!slices.Contains(container.Args, "--storage.tsdb.retention.time=24h") ||
+		!slices.Contains(container.Args, "--storage.tsdb.retention.size=1GB") ||
+		deployment.Spec.Template.Spec.AutomountServiceAccountToken == nil ||
+		*deployment.Spec.Template.Spec.AutomountServiceAccountToken {
+		t.Fatalf("Prometheus Deployment = %#v", deployment.Spec.Template.Spec)
+	}
+
+	podSecurityContext := deployment.Spec.Template.Spec.SecurityContext
+	containerSecurityContext := container.SecurityContext
+	if podSecurityContext == nil ||
+		podSecurityContext.RunAsNonRoot == nil ||
+		!*podSecurityContext.RunAsNonRoot ||
+		podSecurityContext.RunAsUser == nil ||
+		*podSecurityContext.RunAsUser != 65534 ||
+		containerSecurityContext == nil ||
+		containerSecurityContext.AllowPrivilegeEscalation == nil ||
+		*containerSecurityContext.AllowPrivilegeEscalation ||
+		containerSecurityContext.ReadOnlyRootFilesystem == nil ||
+		!*containerSecurityContext.ReadOnlyRootFilesystem ||
+		!slices.Contains(containerSecurityContext.Capabilities.Drop, corev1.Capability("ALL")) {
+		t.Fatalf(
+			"Prometheus security contexts = pod %#v, container %#v",
+			podSecurityContext,
+			containerSecurityContext,
+		)
+	}
+
+	if deployment.Spec.Template.Spec.Volumes[1].EmptyDir == nil ||
+		deployment.Spec.Template.Spec.Volumes[1].EmptyDir.SizeLimit == nil ||
+		deployment.Spec.Template.Spec.Volumes[1].EmptyDir.SizeLimit.String() != "1Gi" {
+		t.Fatalf("Prometheus data volume = %#v", deployment.Spec.Template.Spec.Volumes)
+	}
+
+	var queryService corev1.Service
+	if err := yaml.Unmarshal([]byte(documents[3]), &queryService); err != nil {
+		t.Fatalf("decode Prometheus query Service: %v", err)
+	}
+
+	if queryService.Spec.Type != corev1.ServiceTypeClusterIP ||
+		queryService.Spec.Ports[0].Port != 9090 ||
+		queryService.Spec.Ports[0].TargetPort.StrVal != "web" {
+		t.Fatalf("Prometheus query Service = %#v", queryService.Spec)
+	}
+}
+
+func TestPrometheusRenderRejectsMutableImage(t *testing.T) {
+	t.Parallel()
+
+	data := signalRenderData()
+	data["PrometheusImage"] = "quay.io/prometheus/prometheus:latest"
+
+	err := render.Render(".", t.TempDir(), data)
+	if err == nil || !strings.Contains(err.Error(), "PrometheusImage must be an immutable sha256 digest reference") {
+		t.Fatalf("render error = %v", err)
 	}
 }
 
@@ -1676,6 +1773,7 @@ func signalRenderData() map[string]string {
 		"ControllerImage":              testControllerImage,
 		"AdapterImage":                 testAdapterImage,
 		"RunnerImage":                  testRunnerImage,
+		"PrometheusImage":              testPrometheusImage,
 		"ResolverImages":               testResolverImage,
 		"GPUInventoryScriptDigest":     testScriptDigest,
 		"VLLMCanaryEnabled":            "false",

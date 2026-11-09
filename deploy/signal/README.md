@@ -45,6 +45,8 @@ fleet scheduling are intentionally deferred.
 - `project-signal-participant-adapter` is the fixed controller-to-adapter
   WorkflowTemplate used by every legacy check and resolved stage. Profiles and
   Suites cannot replace that control-plane template.
+- `project-signal-prometheus` scrapes controller metrics every 15 seconds and
+  retains up to 24 hours or 1 GiB in namespace-local ephemeral storage.
 
 Argo Workflows is required. The Kubeflow MPI Operator is required only for
 legacy Suites that still contain an `MPIJob` check.
@@ -713,6 +715,12 @@ controller, adapter, runner, resolver, WorkflowTemplate, Test, plan, Node UID,
 and evidence digests, and credits only evidence that satisfies the Policy.
 
 ## Operations
+
+The static package deploys a namespace-local Prometheus scraper. Its in-cluster
+query API is available from the `project-signal-prometheus` Service on port
+`9090`. The scraper has no Kubernetes API token and no external ingress.
+Restarting its Pod discards the local time series; certification evidence
+remains durable in immutable evidence ConfigMaps independently of Prometheus.
 
 Inspect Runs and lifecycle conditions:
 

@@ -100,6 +100,7 @@ PROJECT_SIGNAL_ADAPTER_CMD=./cmd/project-signal-adapter
 SIGNAL_ADAPTER_IMAGE ?= example.invalid/project-signal-adapter@sha256:0000000000000000000000000000000000000000000000000000000000000000
 SIGNAL_ADAPTER_BUILD_IMAGE ?= example.invalid/project-signal-adapter:replace-me
 SIGNAL_CERTIFICATION_RUNNER_IMAGE ?= example.invalid/project-signal-runner@sha256:0000000000000000000000000000000000000000000000000000000000000000
+SIGNAL_PROMETHEUS_IMAGE ?= quay.io/prometheus/prometheus@sha256:49214755b6153f90a597adcbff0252cc61069f8ab69ce8411285cd4a560e8038
 SIGNAL_RESOLVER_IMAGES ?=
 PROJECT_SIGNAL_MODEL_CACHE_BIN=bin/project-signal-model-cache
 PROJECT_SIGNAL_MODEL_CACHE_CMD=./cmd/project-signal-model-cache
@@ -1366,6 +1367,7 @@ signal-manifests: ## Render Project Signal manifests into deploy/signal/rendered
 		--set ControllerImage=$(SIGNAL_CONTROLLER_IMAGE) \
 		--set AdapterImage=$(SIGNAL_ADAPTER_IMAGE) \
 		--set RunnerImage=$(SIGNAL_CERTIFICATION_RUNNER_IMAGE) \
+		--set PrometheusImage=$(SIGNAL_PROMETHEUS_IMAGE) \
 		--set ResolverImages=$(SIGNAL_RESOLVER_IMAGES) \
 		--set GPUInventoryScriptDigest=$(SIGNAL_GPU_INVENTORY_SCRIPT_DIGEST) \
 		--set VLLMCanaryEnabled=$(SIGNAL_VLLM_CANARY_ENABLED) \
@@ -1468,6 +1470,7 @@ signal-manifests: ## Render Project Signal manifests into deploy/signal/rendered
 		--set ControllerImage=$(SIGNAL_CONTROLLER_IMAGE) \
 		--set AdapterImage=$(SIGNAL_ADAPTER_IMAGE) \
 		--set RunnerImage=$(SIGNAL_CERTIFICATION_RUNNER_IMAGE) \
+		--set PrometheusImage=$(SIGNAL_PROMETHEUS_IMAGE) \
 		--set ResolverImages=$(SIGNAL_RESOLVER_IMAGES) \
 		--set GPUInventoryScriptDigest=$(SIGNAL_GPU_INVENTORY_SCRIPT_DIGEST) \
 		--set VLLMCanaryEnabled=$(SIGNAL_VLLM_CANARY_ENABLED) \
