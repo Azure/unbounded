@@ -274,6 +274,7 @@ func (f *fill) startDisk(spill bool) bool {
 	f.diskSize = alignUp(int64(f.chunkLen))
 
 	f.writeKick = make(chan struct{}, 1)
+
 	f.writing = true
 	go f.writeLoop(cf, f.writeKick)
 
