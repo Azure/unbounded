@@ -64,21 +64,6 @@ func (n *Notes) note(h *Header, ownTerm uint32, ownSeq uint64) {
 	}
 }
 
-// NoteHeader records h as if it had been received by a member whose view
-// is at version own.
-func (n *Notes) NoteHeader(h Header, own view.Version) {
-	n.note(&h, uint32(own.Term), own.Seq)
-}
-
-// Peek returns the recorded note without clearing it.
-func (n *Notes) Peek() (Note, bool) {
-	if p := n.p.Load(); p != nil {
-		return *p, true
-	}
-
-	return Note{}, false
-}
-
 // Take returns and clears the recorded note. Control path.
 func (n *Notes) Take() (Note, bool) {
 	p := n.p.Swap(nil)

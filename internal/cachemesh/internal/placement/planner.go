@@ -429,18 +429,6 @@ func (pl *Planner) Settled(t *Table, members []Member) (bool, error) {
 	return true, nil
 }
 
-// Targets returns each member's target load (indexed like members) under
-// the Planner rules; non-assignable members get 0.
-func (pl *Planner) Targets(bits uint8, members []Member) ([]int64, error) {
-	if _, err := pl.prepare(1<<bits, members); err != nil {
-		return nil, err
-	}
-
-	pl.members = nil
-
-	return slices.Clone(pl.target[:len(members)]), nil
-}
-
 func resize[T any](s []T, n int) []T {
 	if cap(s) < n {
 		return make([]T, n)
