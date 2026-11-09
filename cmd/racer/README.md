@@ -35,6 +35,7 @@ Renamed variables (no compatibility aliases):
 | `RACER_SERVICE_ACCOUNT_TOKEN` | `RACER_CONTROL_TOKEN` (also cluster control's token) |
 | `RACER_API_CA` | `RACER_KUBE_API_CA` |
 | `RACER_API_TOKEN` | `RACER_KUBE_API_TOKEN` |
+| `RACER_SEND_CRC_PAIR` | `RACER_SEND_TAG_PAIR` |
 | `RACER_PEER_PORT` | Removed; the port of `RACER_PEER_LISTEN` is published |
 | `RACER_DST_SEEDS`, `RACER_DST_STEPS`, `RACER_DST_FILTER` | `DST_SEEDS`, `DST_STEPS`, `DST_FILTER` |
 
@@ -70,9 +71,9 @@ TLS, load the module on the node (`modprobe tls`) or list it in
 
 - `RACER_ORIGIN_TRUST_BUNDLE`: PEM trust roots for origin and token endpoint
   HTTPS. Defaults to `/etc/ssl/certs/ca-certificates.crt`, which the Racer image
-  installs. Loaded on first HTTPS use, so nodes whose origins use only
-  plain HTTP never read it. If it cannot be loaded, HTTPS origin requests fail as
-  unavailable (retried after 30 seconds) and startup is unaffected.
+  installs. Loaded once at startup and never reloaded. If it cannot be loaded,
+  startup is unaffected but every HTTPS origin request fails as unavailable
+  until the process restarts with a usable bundle.
 - `RACER_AZURE_FEDERATED_TOKEN_FILE`: projected service account token for Azure
   workload identity; reread on every token exchange.
 - `RACER_AZURE_AUTHORITY_HOST`: Entra authority for workload identity. Defaults
