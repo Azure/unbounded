@@ -11,21 +11,18 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Azure/unbounded/internal/cachemesh/internal/hashing"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/placement"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/topology"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
 )
 
 // Options tune Build. The zero value builds an all-Active cluster with the
 // default partition bits, cell size 4, and 256 maximum neighbors.
 type Options struct {
-	// PartitionBits defaults to placement.DefaultBits.
+	// PartitionBits defaults to view.DefaultPartitionBits.
 	PartitionBits uint8
-	// CellSize and MaxNeighbors feed topology.Choose; defaults 4 and 256.
+	// CellSize and MaxNeighbors feed view.Choose; defaults 4 and 256.
 	CellSize, MaxNeighbors int
 	// Joining and Draining members are taken from the highest slots; the
-	// rest are Active with weight placement.MaxWeight.
+	// rest are Active with weight view.MaxWeight.
 	Joining, Draining int
 	// Seed varies member incarnations (and therefore keys).
 	Seed uint64
@@ -36,7 +33,7 @@ type Options struct {
 
 func (o *Options) defaults() {
 	if o.PartitionBits == 0 {
-		o.PartitionBits = placement.DefaultBits
+		o.PartitionBits = view.DefaultPartitionBits
 	}
 
 	if o.CellSize <= 0 {
@@ -61,7 +58,7 @@ func NewMember(id string, incarnation uint64) view.Member {
 	return view.Member{
 		ID:          id,
 		Incarnation: incarnation,
-		Key:         hashing.MemberKey(id, incarnation),
+		Key:         view.MemberKey(id, incarnation),
 		Addr:        id + ".example:7946",
 		Zone:        "zone-" + strconv.FormatUint(incarnation%3, 10),
 		State:       view.Joining,
@@ -72,8 +69,8 @@ func NewMember(id string, incarnation uint64) view.Member {
 const batch = 32768
 
 // Build returns a view at term 1 with n members in slots 0..n-1, leader slot
-// 0, a shape from topology.Choose with cells assigned by
-// topology.ReshapeCells, and every partition owned by an Active member
+// 0, a shape from view.Choose with cells assigned by
+// view.ReshapeCells, and every partition owned by an Active member
 // (round-robin by partition, so loads are within one of each other). If no
 // member is Active, partitions go to all members. n == 0 gives a configured
 // view at term 0 with no members. It fails tb on any error.
@@ -82,7 +79,7 @@ func Build(tb testing.TB, n int, opts Options) *view.View {
 	opts.defaults()
 
 	v := view.Genesis()
-	sh := topology.Choose(n, opts.CellSize, opts.MaxNeighbors)
+	sh := view.Choose(n, opts.CellSize, opts.MaxNeighbors)
 
 	ops := []view.Op{}
 	if n > 0 {
@@ -99,11 +96,11 @@ func Build(tb testing.TB, n int, opts Options) *view.View {
 	keys := make([]uint64, n)
 
 	for i := range members {
-		members[i] = NewMember("m-"+strconv.Itoa(i), hashing.Mix64(opts.Seed+uint64(i))|1)
+		members[i] = NewMember("m-"+strconv.Itoa(i), view.Mix64(opts.Seed+uint64(i))|1)
 		keys[i] = members[i].Key
 	}
 
-	cells := topology.ReshapeCells(sh, keys)
+	cells := view.ReshapeCells(sh, keys)
 
 	var active []uint32
 
@@ -117,7 +114,7 @@ func Build(tb testing.TB, n int, opts Options) *view.View {
 		case i >= n-opts.Draining-opts.Joining:
 			m.State = view.Joining
 		default:
-			m.State, m.Weight = view.Active, placement.MaxWeight
+			m.State, m.Weight = view.Active, view.MaxWeight
 
 			active = append(active, uint32(i))
 		}
@@ -241,8 +238,8 @@ func admitOps(v *view.View, k int, epoch uint64) []view.Op {
 
 	for i, s := range slots {
 		id := "a-" + v.Version().String() + "-" + strconv.Itoa(i)
-		m := NewMember(id, hashing.Mix64(v.Version().Seq<<20+uint64(i))|1)
-		m.Cell = topology.JoinCell(occ, m.Key)
+		m := NewMember(id, view.Mix64(v.Version().Seq<<20+uint64(i))|1)
+		m.Cell = view.JoinCell(occ, m.Key)
 		occ[m.Cell]++
 		ops = append(ops, view.OpAddMember(s, m))
 	}
@@ -340,7 +337,7 @@ func moveOps(v *view.View, k int, gone map[uint32]bool) []view.Op {
 	// Pseudo-random distinct partitions, like the rebalancer's scattered
 	// moves.
 	for i := uint64(0); len(seen) < k; i++ {
-		h := hashing.Mix64(i ^ v.Version().Seq<<32)
+		h := view.Mix64(i ^ v.Version().Seq<<32)
 		p := uint32(h & mask)
 
 		if seen[p] {

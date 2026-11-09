@@ -9,11 +9,6 @@ import (
 	"math"
 	"math/bits"
 	"time"
-
-	"github.com/Azure/unbounded/internal/cachemesh/internal/codec"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/hashing"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/placement"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/topology"
 )
 
 // Encoding format versions, the first byte of an encoded delta or snapshot.
@@ -27,9 +22,9 @@ var ErrFormat = errors.New("view: unknown encoding format")
 
 // appendSlot32 encodes a slot or cell with NoSlot (NoCell) as 0, so the
 // common sentinel takes one byte.
-func appendSlot32(b []byte, s uint32) []byte { return codec.AppendUvarint(b, uint64(s+1)) }
+func appendSlot32(b []byte, s uint32) []byte { return AppendUvarint(b, uint64(s+1)) }
 
-func readSlot32(r *codec.Reader) uint32 { return r.Uvarint32() - 1 }
+func readSlot32(r *Reader) uint32 { return r.Uvarint32() - 1 }
 
 func deltaSizeHint(d *Delta) int {
 	n := 48
@@ -66,7 +61,7 @@ func appendDeltaBody(b []byte, d *Delta) []byte {
 	b = append(b, DeltaFormat)
 	b = AppendVersion(b, d.Base)
 	b = AppendVersion(b, d.Version)
-	b = codec.AppendUvarint(b, uint64(len(d.Ops)))
+	b = AppendUvarint(b, uint64(len(d.Ops)))
 
 	for i := range d.Ops {
 		b = appendOp(b, &d.Ops[i])
@@ -80,97 +75,97 @@ func appendOp(b []byte, op *Op) []byte {
 
 	switch op.Kind {
 	case KindNewTerm:
-		b = codec.AppendUvarint(b, op.Term)
+		b = AppendUvarint(b, op.Term)
 		b = appendSlot32(b, op.Slot)
 	case KindConfig:
 		b = append(b, op.Config.PartitionBits)
 		b = appendSlot32(b, op.Config.InitialOwner)
-		b = codec.AppendUvarint(b, uint64(op.Config.SlotReuseEpochs))
-		b = codec.AppendUvarint(b, uint64(op.Config.HandoffEpochs))
+		b = AppendUvarint(b, uint64(op.Config.SlotReuseEpochs))
+		b = AppendUvarint(b, uint64(op.Config.HandoffEpochs))
 	case KindAddMember:
 		m := &op.Member
 		b = appendSlot32(b, op.Slot)
-		b = codec.AppendString(b, m.ID)
-		b = codec.AppendUvarint(b, m.Incarnation)
-		b = codec.AppendU64(b, m.Key)
-		b = codec.AppendString(b, m.Addr)
-		b = codec.AppendString(b, m.Zone)
+		b = AppendString(b, m.ID)
+		b = AppendUvarint(b, m.Incarnation)
+		b = AppendU64(b, m.Key)
+		b = AppendString(b, m.Addr)
+		b = AppendString(b, m.Zone)
 		b = append(b, byte(m.State))
-		b = codec.AppendUvarint(b, uint64(m.Weight))
+		b = AppendUvarint(b, uint64(m.Weight))
 		b = appendSlot32(b, m.Cell)
-		b = codec.AppendUvarint(b, m.Joined)
-		b = codec.AppendUvarint(b, m.Since)
+		b = AppendUvarint(b, m.Joined)
+		b = AppendUvarint(b, m.Since)
 	case KindRemoveMember:
 		b = appendSlot32(b, op.Slot)
 	case KindSetState:
 		b = appendSlot32(b, op.Slot)
 		b = append(b, byte(op.State))
-		b = codec.AppendUvarint(b, uint64(op.Weight))
+		b = AppendUvarint(b, uint64(op.Weight))
 	case KindSetCell:
 		b = appendSlot32(b, op.Slot)
 		b = appendSlot32(b, op.Cell)
 	case KindReshape:
 		b = appendShape(b, &op.Shape)
 
-		b = codec.AppendUvarint(b, uint64(len(op.Cells)))
+		b = AppendUvarint(b, uint64(len(op.Cells)))
 		for _, c := range op.Cells {
 			b = appendSlot32(b, c)
 		}
 	case KindAssign:
-		b = codec.AppendUvarint(b, uint64(len(op.Parts)))
+		b = AppendUvarint(b, uint64(len(op.Parts)))
 		for _, p := range op.Parts {
-			b = codec.AppendUvarint(b, uint64(p))
+			b = AppendUvarint(b, uint64(p))
 		}
 
 		// A length mismatch is encoded faithfully so Apply rejects it.
-		b = codec.AppendUvarint(b, uint64(len(op.Owners)))
+		b = AppendUvarint(b, uint64(len(op.Owners)))
 		for _, o := range op.Owners {
 			b = appendSlot32(b, o)
 		}
 	case KindEpoch:
-		b = codec.AppendUvarint(b, op.Epoch)
-		b = codec.AppendUvarint(b, uint64(op.Period)) //nolint:gosec // negative periods round-trip and are rejected by Apply.
+		b = AppendUvarint(b, op.Epoch)
+		b = AppendUvarint(b, uint64(op.Period)) //nolint:gosec // negative periods round-trip and are rejected by Apply.
 	case KindInvalidate:
-		b = codec.AppendU64(b, op.Seed)
-		b = codec.AppendUvarint(b, uint64(op.Gen))
+		b = AppendU64(b, op.Seed)
+		b = AppendUvarint(b, uint64(op.Gen))
 	}
 
 	return b
 }
 
-func appendShape(b []byte, s *topology.Shape) []byte {
+func appendShape(b []byte, s *Shape) []byte {
 	b = append(b, s.Dims)
-	for i := range int(min(s.Dims, topology.MaxDims)) {
-		b = codec.AppendUvarint(b, uint64(s.Size[i]))
+	for i := range int(min(s.Dims, MaxDims)) {
+		b = AppendUvarint(b, uint64(s.Size[i]))
 	}
 
 	return b
 }
 
-func readShape(r *codec.Reader) topology.Shape {
+func readShape(r *Reader) Shape {
 	d := r.U8()
 	if r.Err() != nil {
-		return topology.Shape{}
+		return Shape{}
 	}
 
-	if d == 0 || d > topology.MaxDims {
-		r.Fail(codec.ErrInvalid)
-		return topology.Shape{}
+	if d == 0 || d > MaxDims {
+		r.Fail(ErrInvalidValue)
+		return Shape{}
 	}
 
-	var sizes [topology.MaxDims]uint32
+	var sizes [MaxDims]uint32
 	for i := range int(d) {
 		sizes[i] = r.Uvarint32()
 	}
 
 	if r.Err() != nil {
-		return topology.Shape{}
+		return Shape{}
 	}
 
-	s, err := topology.NewShape(sizes[:d]...)
+	s, err := NewShape(sizes[:d]...)
 	if err != nil {
-		r.Fail(codec.ErrInvalid)
-		return topology.Shape{}
+		r.Fail(ErrInvalidValue)
+		return Shape{}
 	}
 
 	return s
@@ -180,7 +175,7 @@ func readShape(r *codec.Reader) topology.Shape {
 // by the input size and the package limits, and rejects non-canonical input.
 // It does not check that the delta applies; Apply does.
 func DecodeDelta(b []byte) (*Delta, error) {
-	r := codec.NewReader(b)
+	r := NewReader(b)
 	if f := r.U8(); r.Err() == nil && f != DeltaFormat {
 		return nil, fmt.Errorf("%w: delta format %d", ErrFormat, f)
 	}
@@ -211,7 +206,7 @@ func DecodeDelta(b []byte) (*Delta, error) {
 	return d, nil
 }
 
-func readOp(r *codec.Reader, op *Op) {
+func readOp(r *Reader, op *Op) {
 	op.Kind = OpKind(r.U8())
 
 	switch op.Kind {
@@ -256,7 +251,7 @@ func readOp(r *codec.Reader, op *Op) {
 			}
 		}
 	case KindAssign:
-		n := r.Len(1<<placement.MaxBits, 1)
+		n := r.Len(1<<MaxPartitionBits, 1)
 		if n > 0 {
 			op.Parts = make([]uint32, n)
 			for i := range op.Parts {
@@ -264,7 +259,7 @@ func readOp(r *codec.Reader, op *Op) {
 			}
 		}
 
-		n = r.Len(1<<placement.MaxBits, 1)
+		n = r.Len(1<<MaxPartitionBits, 1)
 		if n > 0 {
 			op.Owners = make([]uint32, n)
 			for i := range op.Owners {
@@ -276,7 +271,7 @@ func readOp(r *codec.Reader, op *Op) {
 
 		p := r.Uvarint()
 		if p > math.MaxInt64 {
-			r.Fail(codec.ErrInvalid)
+			r.Fail(ErrInvalidValue)
 		}
 
 		op.Period = time.Duration(p) //nolint:gosec // checked above.
@@ -284,7 +279,7 @@ func readOp(r *codec.Reader, op *Op) {
 		op.Seed = r.U64()
 		op.Gen = r.Uvarint32()
 	default:
-		r.Fail(fmt.Errorf("%w: op kind %d", codec.ErrInvalid, op.Kind))
+		r.Fail(fmt.Errorf("%w: op kind %d", ErrInvalidValue, op.Kind))
 	}
 }
 
@@ -295,16 +290,16 @@ func AppendSnapshot(b []byte, v *View) []byte {
 	b = AppendVersion(b, v.version)
 	b = append(b, v.digest[:]...)
 	b = appendSlot32(b, v.leader)
-	b = codec.AppendUvarint(b, v.epoch)
-	b = codec.AppendUvarint(b, uint64(v.period)) //nolint:gosec // periods are never negative in a view.
+	b = AppendUvarint(b, v.epoch)
+	b = AppendUvarint(b, uint64(v.period)) //nolint:gosec // periods are never negative in a view.
 
-	b = codec.AppendUvarint(b, uint64(len(v.gens)))
+	b = AppendUvarint(b, uint64(len(v.gens)))
 	for _, g := range v.gens {
-		b = codec.AppendU64(b, g.Seed)
-		b = codec.AppendUvarint(b, uint64(g.Gen))
+		b = AppendU64(b, g.Seed)
+		b = AppendUvarint(b, uint64(g.Gen))
 	}
 
-	b = codec.AppendBool(b, v.hasConfig)
+	b = AppendBool(b, v.hasConfig)
 	if !v.hasConfig {
 		return b
 	}
@@ -312,10 +307,10 @@ func AppendSnapshot(b []byte, v *View) []byte {
 	c := v.config
 	b = append(b, c.PartitionBits)
 	b = appendSlot32(b, c.InitialOwner)
-	b = codec.AppendUvarint(b, uint64(c.SlotReuseEpochs))
-	b = codec.AppendUvarint(b, uint64(c.HandoffEpochs))
+	b = AppendUvarint(b, uint64(c.SlotReuseEpochs))
+	b = AppendUvarint(b, uint64(c.HandoffEpochs))
 	b = appendShape(b, &v.shape)
-	b = codec.AppendUvarint(b, uint64(v.slotCap))
+	b = AppendUvarint(b, uint64(v.slotCap))
 
 	// Zones in order of first appearance.
 	var zones []string
@@ -331,26 +326,26 @@ func AppendSnapshot(b []byte, v *View) []byte {
 		return true
 	})
 
-	b = codec.AppendUvarint(b, uint64(len(zones)))
+	b = AppendUvarint(b, uint64(len(zones)))
 	for _, z := range zones {
-		b = codec.AppendString(b, z)
+		b = AppendString(b, z)
 	}
 
-	b = codec.AppendUvarint(b, uint64(v.n))
+	b = AppendUvarint(b, uint64(v.n))
 	next := Slot(0)
 
 	v.ForEachMember(func(s Slot, m *Member) bool {
-		b = codec.AppendUvarint(b, uint64(s-next))
+		b = AppendUvarint(b, uint64(s-next))
 		next = s + 1
-		b = codec.AppendString(b, m.ID)
-		b = codec.AppendUvarint(b, m.Incarnation)
-		b = codec.AppendString(b, m.Addr)
-		b = codec.AppendUvarint(b, zoneIdx[m.Zone])
+		b = AppendString(b, m.ID)
+		b = AppendUvarint(b, m.Incarnation)
+		b = AppendString(b, m.Addr)
+		b = AppendUvarint(b, zoneIdx[m.Zone])
 		b = append(b, byte(m.State))
-		b = codec.AppendUvarint(b, uint64(m.Weight))
-		b = codec.AppendUvarint(b, uint64(m.Cell))
-		b = codec.AppendUvarint(b, m.Joined)
-		b = codec.AppendUvarint(b, m.Since-m.Joined)
+		b = AppendUvarint(b, uint64(m.Weight))
+		b = AppendUvarint(b, uint64(m.Cell))
+		b = AppendUvarint(b, m.Joined)
+		b = AppendUvarint(b, m.Since-m.Joined)
 
 		return true
 	})
@@ -358,7 +353,7 @@ func AppendSnapshot(b []byte, v *View) []byte {
 	for s := range v.slotCap {
 		c := v.mem[s>>memShift]
 		if c.mem[s&memMask].State == 0 {
-			b = codec.AppendUvarint(b, c.reuse[s&memMask])
+			b = AppendUvarint(b, c.reuse[s&memMask])
 		}
 	}
 
@@ -374,7 +369,7 @@ func AppendSnapshot(b []byte, v *View) []byte {
 func EncodeSnapshot(v *View) []byte { return AppendSnapshot(nil, v) }
 
 // tableColumn returns column col (0 owner, 1 prev, 2 moved) of chunk ci.
-func tableColumn(t *placement.Table, ci, col int) []uint32 {
+func tableColumn(t *Table, ci, col int) []uint32 {
 	owner, prev, moved := t.Columns(ci)
 
 	switch col {
@@ -390,7 +385,7 @@ func tableColumn(t *placement.Table, ci, col int) []uint32 {
 // appendColumn writes table column col (see tableColumn), each value plus
 // add, as uvarint base, width byte, and a length-prefixed LSB-first
 // bit-packed array of value-base.
-func appendColumn(b []byte, t *placement.Table, col int, add uint32) []byte {
+func appendColumn(b []byte, t *Table, col int, add uint32) []byte {
 	lo, hi := uint32(math.MaxUint32), uint32(0)
 
 	for ci := range t.NumChunks() {
@@ -401,11 +396,11 @@ func appendColumn(b []byte, t *placement.Table, col int, add uint32) []byte {
 	}
 
 	w := bits.Len32(hi - lo)
-	b = codec.AppendUvarint(b, uint64(lo))
+	b = AppendUvarint(b, uint64(lo))
 	b = append(b, byte(w))
 
 	nbytes := (t.Len()*w + 7) / 8
-	b = codec.AppendUvarint(b, uint64(nbytes))
+	b = AppendUvarint(b, uint64(nbytes))
 
 	if w == 0 {
 		return b
@@ -445,26 +440,26 @@ type column struct {
 	have int
 }
 
-func readColumn(r *codec.Reader, n int) column {
+func readColumn(r *Reader, n int) column {
 	var c column
 
 	c.lo = r.Uvarint32()
 	c.w = int(r.U8())
 
 	if c.w > 32 {
-		r.Fail(codec.ErrInvalid)
+		r.Fail(ErrInvalidValue)
 		return c
 	}
 
 	c.data = r.Bytes(math.MaxInt32)
 	if r.Err() == nil && len(c.data) != (n*c.w+7)/8 {
-		r.Fail(codec.ErrInvalid)
+		r.Fail(ErrInvalidValue)
 	}
 
 	// Unused high bits of the last byte must be zero (canonical form).
 	if r.Err() == nil && c.w > 0 {
 		if extra := len(c.data)*8 - n*c.w; extra > 0 && c.data[len(c.data)-1]>>(8-extra) != 0 {
-			r.Fail(codec.ErrInvalid)
+			r.Fail(ErrInvalidValue)
 		}
 	}
 
@@ -502,7 +497,7 @@ func DecodeSnapshot(b []byte) (*View, error) {
 }
 
 func decodeSnapshot(b []byte) (*View, error) {
-	r := codec.NewReader(b)
+	r := NewReader(b)
 	if f := r.U8(); r.Err() == nil && f != SnapshotFormat {
 		return nil, fmt.Errorf("%w: snapshot format %d", ErrFormat, f)
 	}
@@ -515,7 +510,7 @@ func decodeSnapshot(b []byte) (*View, error) {
 
 	p := r.Uvarint()
 	if p > math.MaxInt64 {
-		r.Fail(codec.ErrInvalid)
+		r.Fail(ErrInvalidValue)
 	}
 
 	v.period = time.Duration(p) //nolint:gosec // checked above.
@@ -543,13 +538,13 @@ func decodeSnapshot(b []byte) (*View, error) {
 	c.HandoffEpochs = r.Uvarint32()
 	v.shape = readShape(&r)
 
-	if r.Err() == nil && (!placement.ValidBits(c.PartitionBits) || v.shape.Cells() > MaxCells) {
-		r.Fail(codec.ErrInvalid)
+	if r.Err() == nil && (!ValidPartitionBits(c.PartitionBits) || v.shape.Cells() > MaxCells) {
+		r.Fail(ErrInvalidValue)
 	}
 
 	slotCap := r.Uvarint()
 	if r.Err() == nil && slotCap > MaxSlots {
-		r.Fail(codec.ErrTooLarge)
+		r.Fail(ErrTooLarge)
 	}
 
 	zones := make([]string, r.Len(MaxSlots, 1))
@@ -564,7 +559,7 @@ func decodeSnapshot(b []byte) (*View, error) {
 	}
 
 	if slotCap-uint64(n) > uint64(r.Remaining()) {
-		return nil, codec.ErrTooLarge
+		return nil, ErrTooLarge
 	}
 
 	v.slotCap = uint32(slotCap)
@@ -612,14 +607,14 @@ func decodeSnapshot(b []byte) (*View, error) {
 	return v, nil
 }
 
-func readMembers(r *codec.Reader, v *View, zones []string) error {
+func readMembers(r *Reader, v *View, zones []string) error {
 	next := uint64(0)
 	usedZones := uint64(0)
 
 	for range v.n {
 		s := next + r.Uvarint()
 		if r.Err() == nil && s >= uint64(v.slotCap) {
-			r.Fail(codec.ErrInvalid)
+			r.Fail(ErrInvalidValue)
 		}
 
 		next = s + 1
@@ -638,7 +633,7 @@ func readMembers(r *codec.Reader, v *View, zones []string) error {
 			case z == usedZones && z < uint64(len(zones)):
 				usedZones++
 			default:
-				r.Fail(codec.ErrInvalid)
+				r.Fail(ErrInvalidValue)
 			}
 		}
 
@@ -654,22 +649,22 @@ func readMembers(r *codec.Reader, v *View, zones []string) error {
 
 		m.Since = m.Joined + since
 		if m.Since < m.Joined || !m.State.Valid() || m.Cell >= v.shape.Cells() {
-			return codec.ErrInvalid
+			return ErrInvalidValue
 		}
 
 		m.Zone = zones[z]
-		m.Key = hashing.MemberKey(m.ID, m.Incarnation)
+		m.Key = MemberKey(m.ID, m.Incarnation)
 		v.mem[s>>memShift].mem[s&memMask] = m
 	}
 
 	if usedZones != uint64(len(zones)) {
-		return codec.ErrInvalid
+		return ErrInvalidValue
 	}
 
 	return nil
 }
 
-func readTable(r *codec.Reader, v *View) error {
+func readTable(r *Reader, v *View) error {
 	n := 1 << v.config.PartitionBits
 	cols := [3]column{readColumn(r, n), readColumn(r, n), readColumn(r, n)}
 
@@ -683,14 +678,14 @@ func readTable(r *codec.Reader, v *View) error {
 	}
 
 	bad := false
-	v.table = placement.NewTableFunc(v.config.PartitionBits, func(uint32) placement.Entry {
+	v.table = NewTableFunc(v.config.PartitionBits, func(uint32) Entry {
 		var x [3]uint32
 		for i := range cols {
 			x[i] = cols[i].next()
 			lo[i], hi[i] = min(lo[i], x[i]), max(hi[i], x[i])
 		}
 
-		e := placement.Entry{Owner: x[0] - 1, Prev: x[1] - 1, Moved: x[2]}
+		e := Entry{Owner: x[0] - 1, Prev: x[1] - 1, Moved: x[2]}
 		if e.Owner != NoSlot && e.Owner >= MaxSlots || e.Prev != NoSlot && e.Prev >= MaxSlots {
 			bad = true
 		}
@@ -699,13 +694,13 @@ func readTable(r *codec.Reader, v *View) error {
 	})
 
 	if bad {
-		return codec.ErrInvalid
+		return ErrInvalidValue
 	}
 
 	// Canonical columns use the minimum as base and the minimal width.
 	for i := range cols {
 		if lo[i] != cols[i].lo || bits.Len32(hi[i]-lo[i]) != cols[i].w {
-			return codec.ErrInvalid
+			return ErrInvalidValue
 		}
 	}
 
@@ -736,13 +731,13 @@ func readTable(r *codec.Reader, v *View) error {
 
 // AppendVersion appends the encoding of v: Term then Seq, as uvarints.
 func AppendVersion(b []byte, v Version) []byte {
-	b = codec.AppendUvarint(b, v.Term)
+	b = AppendUvarint(b, v.Term)
 
-	return codec.AppendUvarint(b, v.Seq)
+	return AppendUvarint(b, v.Seq)
 }
 
 // ReadVersion reads a Version written by AppendVersion.
-func ReadVersion(r *codec.Reader) Version {
+func ReadVersion(r *Reader) Version {
 	t := r.Uvarint()
 
 	return Version{Term: t, Seq: r.Uvarint()}

@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Azure/unbounded/internal/cachemesh/internal/topology"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view/viewtest"
 )
@@ -295,7 +294,7 @@ func TestMonitoring(t *testing.T) {
 
 	for range 20 {
 		v := viewtest.Build(t, 30, viewtest.Options{PartitionBits: 6})
-		sh, _ := topology.NewShape(2, 3, 1+r.Uint32N(3))
+		sh, _ := view.NewShape(2, 3, 1+r.Uint32N(3))
 
 		cells := make([]uint32, v.SlotCap())
 		for i := range cells {
@@ -315,14 +314,14 @@ func TestMonitoringCounts(t *testing.T) {
 	// A balanced grid with every cell at occupancy 4: each member has
 	// exactly 3 + 2D observers in 1 + 2D cells (all sizes > 2).
 	v := viewtest.Build(t, 4*4*5*6, viewtest.Options{PartitionBits: 6})
-	sh, _ := topology.NewShape(4, 5, 6)
+	sh, _ := view.NewShape(4, 5, 6)
 
 	keys := make([]uint64, v.SlotCap())
 	for i := range keys {
 		keys[i] = v.Key(uint32(i))
 	}
 
-	v = mustApply(t, v, view.OpReshape(sh, topology.ReshapeCells(sh, keys)))
+	v = mustApply(t, v, view.OpReshape(sh, view.ReshapeCells(sh, keys)))
 	d := int(sh.Dims)
 
 	var obs []uint32

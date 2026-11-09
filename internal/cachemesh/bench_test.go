@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Azure/unbounded/internal/cachemesh/internal/hashing"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view/viewtest"
 )
@@ -303,7 +302,7 @@ func TestHotPathAllocs(t *testing.T) {
 	st := m.Stamp(ks)
 	out := make([]Decision, 1)
 	keys := [][]byte{key}
-	h := hashing.KeyHash(ks.Seed(), key)
+	h := view.KeyHash(ks.Seed(), key)
 
 	if n := testing.AllocsPerRun(100, func() {
 		_ = m.Route(ks, key)

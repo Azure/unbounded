@@ -12,11 +12,9 @@ import (
 	"time"
 
 	"github.com/Azure/unbounded/internal/cachemesh/internal/epoch"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/hashing"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/health"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/node"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/route"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/topology"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
 )
 
@@ -30,9 +28,9 @@ const MetaTTL = 5 * time.Minute
 // Data-plane keyspace seeds. Metadata uses four keyspaces "meta/0" to
 // "meta/3", the ones the KeyspaceInvalidation fault bumps.
 var (
-	seedBlob  = hashing.Seed("blob")
-	seedLayer = hashing.Seed("layer")
-	seedMeta  = [4]uint64{hashing.Seed("meta/0"), hashing.Seed("meta/1"), hashing.Seed("meta/2"), hashing.Seed("meta/3")}
+	seedBlob  = view.Seed("blob")
+	seedLayer = view.Seed("layer")
+	seedMeta  = [4]uint64{view.Seed("meta/0"), view.Seed("meta/1"), view.Seed("meta/2"), view.Seed("meta/3")}
 )
 
 // HealthVariant selects the neighbor health configuration of a run.
@@ -1252,7 +1250,7 @@ func (w *DataPlane) membershipSettled() bool {
 // bounds the hops (MaxDims+3 with a gateway hop), and a hedge starts
 // within HedgeMax.
 func (w *DataPlane) hangBound() int64 {
-	return int64(topology.MaxDims+3)*2*int64(w.cfg.HopTimeout) + int64(w.lim.HedgeMax)
+	return int64(view.MaxDims+3)*2*int64(w.cfg.HopTimeout) + int64(w.lim.HedgeMax)
 }
 
 // compact drops resolved requests and checks that none hangs.
@@ -1376,7 +1374,7 @@ func neighborBound(v *view.View, cellSize, maxNeighbors int) [2]int {
 	n := v.Len()
 	limit := maxNeighbors
 
-	if best := topology.Choose(n, cellSize, maxNeighbors); best.Cells() > 0 {
+	if best := view.Choose(n, cellSize, maxNeighbors); best.Cells() > 0 {
 		occ := (n + int(best.Cells()) - 1) / int(best.Cells())
 		limit = max(limit, best.EstimatedNeighbors(occ))
 	}

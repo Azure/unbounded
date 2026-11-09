@@ -6,9 +6,6 @@ package view
 import (
 	"fmt"
 	"slices"
-
-	"github.com/Azure/unbounded/internal/cachemesh/internal/placement"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/topology"
 )
 
 // Validate checks every structural invariant of v in O(members +
@@ -48,7 +45,7 @@ func validate(v *View) error {
 	}
 
 	if !v.hasConfig {
-		if v.n != 0 || v.slotCap != 0 || v.table != nil || v.config != (Config{}) || v.shape != (topology.Shape{}) {
+		if v.n != 0 || v.slotCap != 0 || v.table != nil || v.config != (Config{}) || v.shape != (Shape{}) {
 			return fmt.Errorf("members, table, or shape without config")
 		}
 
@@ -84,7 +81,7 @@ func validate(v *View) error {
 
 func validateLayout(v *View) error {
 	c := v.config
-	if !placement.ValidBits(c.PartitionBits) {
+	if !ValidPartitionBits(c.PartitionBits) {
 		return fmt.Errorf("partition bits %d", c.PartitionBits)
 	}
 
@@ -285,7 +282,7 @@ func Equal(a, b *View) bool {
 		return false
 	}
 
-	if (a.table == nil) != (b.table == nil) || a.table != nil && !placement.Equal(a.table, b.table) {
+	if (a.table == nil) != (b.table == nil) || a.table != nil && !EqualTables(a.table, b.table) {
 		return false
 	}
 

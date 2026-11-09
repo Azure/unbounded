@@ -50,9 +50,8 @@ import (
 	"math/rand/v2"
 	"time"
 
+	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
 	"github.com/zeebo/xxh3"
-
-	"github.com/Azure/unbounded/internal/cachemesh/internal/hashing"
 )
 
 // Target is an allocation-free event receiver. Fire is called with the two
@@ -131,7 +130,7 @@ func (s *Sim) Stream(name string) *rand.Rand {
 // NewRand returns a PCG generator derived from seed and name, independent
 // of any Sim.
 func NewRand(seed uint64, name string) *rand.Rand {
-	return rand.New(rand.NewPCG(hashing.Mix64(seed), hashing.Seed(name)))
+	return rand.New(rand.NewPCG(view.Mix64(seed), view.Seed(name)))
 }
 
 // At schedules fn at simulated time t. Times in the past run at Now.

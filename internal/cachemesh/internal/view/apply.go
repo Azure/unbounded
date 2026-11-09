@@ -8,10 +8,6 @@ import (
 	"fmt"
 	"math"
 	"slices"
-
-	"github.com/Azure/unbounded/internal/cachemesh/internal/hashing"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/placement"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/topology"
 )
 
 // Errors returned by Apply. Structural errors wrap ErrInvalid.
@@ -215,8 +211,8 @@ func checkStateWeight(s MemberState, w uint32) error {
 		return fmt.Errorf("invalid state %d", s)
 	}
 
-	if w > placement.MaxWeight {
-		return fmt.Errorf("weight %d above %d", w, placement.MaxWeight)
+	if w > MaxWeight {
+		return fmt.Errorf("weight %d above %d", w, MaxWeight)
 	}
 
 	if s != Active && w != 0 {
@@ -234,7 +230,7 @@ func checkMember(m *Member) error {
 		return fmt.Errorf("addr length %d", len(m.Addr))
 	case len(m.Zone) > MaxZoneLen:
 		return fmt.Errorf("zone length %d", len(m.Zone))
-	case m.Key != hashing.MemberKey(m.ID, m.Incarnation):
+	case m.Key != MemberKey(m.ID, m.Incarnation):
 		return fmt.Errorf("member %q: key does not match ID and incarnation", m.ID)
 	}
 
@@ -247,7 +243,7 @@ func (a *applier) config(c Config) error {
 		return errors.New("config already set")
 	}
 
-	if !placement.ValidBits(c.PartitionBits) {
+	if !ValidPartitionBits(c.PartitionBits) {
 		return fmt.Errorf("partition bits %d", c.PartitionBits)
 	}
 
@@ -255,13 +251,13 @@ func (a *applier) config(c Config) error {
 		return fmt.Errorf("initial owner %d", c.InitialOwner)
 	}
 
-	sh, err := topology.NewShape(1)
+	sh, err := NewShape(1)
 	if err != nil {
 		return err
 	}
 
 	v.config, v.hasConfig, v.shape = c, true, sh
-	v.table = placement.NewTable(c.PartitionBits, c.InitialOwner)
+	v.table = NewTable(c.PartitionBits, c.InitialOwner)
 	v.cells = make([][][]Slot, 1)
 	a.cellsFresh = true
 
@@ -371,7 +367,7 @@ func chunkMinReuse(v *View, ci uint32) uint64 {
 	return m
 }
 
-func (a *applier) reshape(sh *topology.Shape, cells []uint32) error {
+func (a *applier) reshape(sh *Shape, cells []uint32) error {
 	v := a.v
 
 	if err := sh.Validate(); err != nil {
@@ -392,7 +388,7 @@ func (a *applier) reshape(sh *topology.Shape, cells []uint32) error {
 			if c >= nc {
 				return fmt.Errorf("slot %d: cell %d out of range", s, c)
 			}
-		} else if c != topology.NoCell {
+		} else if c != NoCell {
 			return fmt.Errorf("slot %d: free slot with cell %d", s, c)
 		}
 	}
@@ -400,7 +396,7 @@ func (a *applier) reshape(sh *topology.Shape, cells []uint32) error {
 	v.shape = *sh
 
 	for s, c := range cells {
-		if c != topology.NoCell && v.mem[s>>memShift].mem[s&memMask].Cell != c {
+		if c != NoCell && v.mem[s>>memShift].mem[s&memMask].Cell != c {
 			a.memW(Slot(s)).Cell = c
 		}
 	}

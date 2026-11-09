@@ -1,8 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package codec holds the binary encoding primitives shared by the view and
-// wire packages.
+// Binary encoding primitives, shared by the view codecs and the control
+// package's wire messages.
 //
 // The encoding is canonical: fixed-width integers are little-endian, variable
 // integers are minimal unsigned LEB128 (the encoding/binary uvarint format),
@@ -13,7 +13,8 @@
 // Writers are plain append functions so callers control allocation. A Reader
 // records the first error and returns zero values afterwards, so decoders
 // can read a whole message and check Err once at the end.
-package codec
+
+package view
 
 import (
 	"encoding/binary"
@@ -24,16 +25,16 @@ import (
 // Errors returned by Reader.
 var (
 	// ErrShort means the input ended before a value was complete.
-	ErrShort = errors.New("codec: input too short")
+	ErrShort = errors.New("view: input too short")
 	// ErrVarint means a varint overflowed 64 bits or was not minimal.
-	ErrVarint = errors.New("codec: invalid varint")
+	ErrVarint = errors.New("view: invalid varint")
 	// ErrTooLarge means a length or count exceeded its limit or the
 	// remaining input.
-	ErrTooLarge = errors.New("codec: length too large")
+	ErrTooLarge = errors.New("view: length too large")
 	// ErrTrailing means bytes remained after the last value.
-	ErrTrailing = errors.New("codec: trailing bytes")
-	// ErrInvalid means a decoded value is outside its domain.
-	ErrInvalid = errors.New("codec: invalid value")
+	ErrTrailing = errors.New("view: trailing bytes")
+	// ErrInvalidValue means a decoded value is outside its domain.
+	ErrInvalidValue = errors.New("view: invalid value")
 )
 
 // AppendU8 appends one byte.
@@ -143,7 +144,7 @@ func (r *Reader) U8() uint8 {
 func (r *Reader) Bool() bool {
 	v := r.U8()
 	if v > 1 {
-		r.Fail(ErrInvalid)
+		r.Fail(ErrInvalidValue)
 		return false
 	}
 
@@ -196,7 +197,7 @@ func (r *Reader) Uvarint() uint64 {
 func (r *Reader) Uvarint32() uint32 {
 	v := r.Uvarint()
 	if v > math.MaxUint32 {
-		r.Fail(ErrInvalid)
+		r.Fail(ErrInvalidValue)
 		return 0
 	}
 

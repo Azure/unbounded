@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package topology is the arithmetic of the cachemesh grid.
+// Grid arithmetic.
 //
 // The leader places every member in one cell of a D-dimensional grid with
 // dimension sizes Size[0..D-1] (mixed radix, dimension 0 least significant,
@@ -21,7 +21,8 @@
 // The leader-side helpers (Choose, NeedsReshape, JoinCell, ReshapeCells,
 // BalanceMoves) are deterministic: identical inputs give identical outputs on
 // every member and architecture.
-package topology
+
+package view
 
 import (
 	"errors"
@@ -35,10 +36,10 @@ const MaxDims = 8
 // NoCell marks the absence of a cell.
 const NoCell = ^uint32(0)
 
-// MaxCells bounds the number of cells in a shape: it keeps cell arithmetic
-// within uint32. Views apply the stricter view.MaxCells (no more cells than
+// MaxGridCells bounds the number of cells in a shape: it keeps cell arithmetic
+// within uint32. Views apply the stricter view.MaxGridCells (no more cells than
 // slots), so this bound only matters to Shape and Choose on their own.
-const MaxCells = 1 << 30
+const MaxGridCells = 1 << 30
 
 // Shape is a grid shape. The zero value is invalid; build shapes with
 // NewShape or Choose. Shapes are comparable with ==: two shapes with the same
@@ -58,7 +59,7 @@ type Shape struct {
 }
 
 // ErrInvalidShape reports a shape that violates the size bounds.
-var ErrInvalidShape = errors.New("topology: invalid shape")
+var ErrInvalidShape = errors.New("view: invalid grid shape")
 
 // NewShape builds a shape from its dimension sizes.
 func NewShape(sizes ...uint32) (Shape, error) {
@@ -76,8 +77,8 @@ func NewShape(sizes ...uint32) (Shape, error) {
 		}
 
 		prod *= uint64(sz)
-		if prod > MaxCells {
-			return Shape{}, fmt.Errorf("%w: more than %d cells", ErrInvalidShape, MaxCells)
+		if prod > MaxGridCells {
+			return Shape{}, fmt.Errorf("%w: more than %d cells", ErrInvalidShape, MaxGridCells)
 		}
 	}
 

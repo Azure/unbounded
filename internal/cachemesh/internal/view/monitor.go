@@ -5,8 +5,6 @@ package view
 
 import (
 	"slices"
-
-	"github.com/Azure/unbounded/internal/cachemesh/internal/topology"
 )
 
 // The monitoring relation (designs/cachemesh.md, "Monitoring and failure
@@ -47,7 +45,7 @@ func forEachAdjacent(v *View, c uint32, fn func(a uint32)) {
 // -1) order. It appends nothing if slot is not a member.
 func Subjects(v *View, slot Slot, dst []Slot) []Slot {
 	c := v.Cell(slot)
-	if c == topology.NoCell {
+	if c == NoCell {
 		return dst
 	}
 
@@ -75,7 +73,7 @@ func Subjects(v *View, slot Slot, dst []Slot) []Slot {
 // equals slot's rank.
 func Observers(v *View, slot Slot, dst []Slot) []Slot {
 	c := v.Cell(slot)
-	if c == topology.NoCell {
+	if c == NoCell {
 		return dst
 	}
 
@@ -106,7 +104,7 @@ func Observers(v *View, slot Slot, dst []Slot) []Slot {
 // slot, which bounds the ObserverCells suspicion quorum.
 func ObserverCells(v *View, slot Slot) int {
 	c := v.Cell(slot)
-	if c == topology.NoCell {
+	if c == NoCell {
 		return 0
 	}
 
@@ -132,7 +130,7 @@ func ObserverCells(v *View, slot Slot) int {
 // nothing if slot is not a member.
 func Neighbors(v *View, slot Slot, dst []Slot) []Slot {
 	c := v.Cell(slot)
-	if c == topology.NoCell {
+	if c == NoCell {
 		return dst
 	}
 

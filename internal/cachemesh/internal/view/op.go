@@ -7,8 +7,6 @@ import (
 	"crypto/sha256"
 	"strconv"
 	"time"
-
-	"github.com/Azure/unbounded/internal/cachemesh/internal/topology"
 )
 
 // OpKind identifies the kind of an Op. Its numeric value is part of the
@@ -88,8 +86,8 @@ type Op struct {
 	// Config is the cluster constants (Config).
 	Config Config
 	// Shape is the new grid and Cells the new cell of every slot below
-	// SlotCap, topology.NoCell for slots without a member (Reshape).
-	Shape topology.Shape
+	// SlotCap, NoCell for slots without a member (Reshape).
+	Shape Shape
 	Cells []uint32
 	// Parts[i] moves to Owners[i] (Assign).
 	Parts, Owners []uint32
@@ -123,7 +121,7 @@ func OpSetCell(slot Slot, cell uint32) Op { return Op{Kind: KindSetCell, Slot: s
 
 // OpReshape replaces the grid. cells is indexed by slot. The slice is
 // retained.
-func OpReshape(s topology.Shape, cells []uint32) Op {
+func OpReshape(s Shape, cells []uint32) Op {
 	return Op{Kind: KindReshape, Shape: s, Cells: cells}
 }
 

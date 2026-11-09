@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Azure/unbounded/internal/cachemesh/internal/topology"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view/viewtest"
 )
@@ -18,7 +17,7 @@ func allOpsDelta(t testing.TB) (*view.View, *view.Delta) {
 	t.Helper()
 
 	v := boot(t, 3)
-	sh, _ := topology.NewShape(2, 2)
+	sh, _ := view.NewShape(2, 2)
 	d := view.NewDelta(v,
 		view.OpNewTerm(4, 1),
 		view.OpEpoch(11, 3*time.Second),

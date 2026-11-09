@@ -9,9 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Azure/unbounded/internal/cachemesh/internal/hashing"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/placement"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/topology"
+	"github.com/Azure/unbounded/internal/cachemesh/internal/control"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view/viewtest"
 )
@@ -124,14 +122,14 @@ func member(i int) Member {
 }
 
 func (h *harness) settled() bool {
-	pm := make([]placement.Member, 0, h.v.Len())
+	pm := make([]control.Member, 0, h.v.Len())
 	h.v.ForEachMember(func(s view.Slot, m *view.Member) bool {
-		pm = append(pm, placement.Member{Slot: s, Key: m.Key, Weight: m.Weight, Cell: m.Cell})
+		pm = append(pm, control.Member{Slot: s, Key: m.Key, Weight: m.Weight, Cell: m.Cell})
 
 		return true
 	})
 
-	ok, err := placement.NewPlanner(placement.Config{}).Settled(h.v.Table(), pm)
+	ok, err := control.NewPlanner(control.Config{}).Settled(h.v.Table(), pm)
 	if err != nil {
 		h.tb.Fatal(err)
 	}
@@ -165,7 +163,7 @@ func TestBootstrap(t *testing.T) {
 	}
 
 	m, _ := h.v.Member(0)
-	if m.State != view.Active || m.Weight != placement.MaxWeight || h.v.Load(0) != 1<<10 {
+	if m.State != view.Active || m.Weight != view.MaxWeight || h.v.Load(0) != 1<<10 {
 		t.Fatalf("self %+v load %d", m, h.v.Load(0))
 	}
 
@@ -227,7 +225,7 @@ func TestJoinQuarantineWarmup(t *testing.T) {
 
 	h.run(2 * DefaultWarmupStep)
 
-	if m, _ = h.v.Member(s); m.Weight != placement.MaxWeight {
+	if m, _ = h.v.Member(s); m.Weight != view.MaxWeight {
 		t.Fatalf("after warmup weight %d", m.Weight)
 	}
 
@@ -519,7 +517,7 @@ func TestReshapeOnGrowth(t *testing.T) {
 	reshapes := 0
 	cfg := smallCfg("a")
 	h := newHarness(t, cfg, nil)
-	h.l.SetHooks(Hooks{OnReshape: func(_, _ topology.Shape) { reshapes++ }})
+	h.l.SetHooks(Hooks{OnReshape: func(_, _ view.Shape) { reshapes++ }})
 	h.bootstrap()
 
 	for i := range 99 {
@@ -588,7 +586,7 @@ func TestFailoverContinuity(t *testing.T) {
 	}
 
 	h.v.ForEachMember(func(_ view.Slot, m *view.Member) bool {
-		if m.State != view.Active || m.Weight != placement.MaxWeight {
+		if m.State != view.Active || m.Weight != view.MaxWeight {
 			t.Fatalf("member %s %v %d", m.ID, m.State, m.Weight)
 		}
 
@@ -619,7 +617,7 @@ func TestFailoverContinuity(t *testing.T) {
 	h.now += sec
 	ops = h.tick(h.term)
 
-	if count(ops, view.KindRemoveMember) != 1 || h.v.Key(h.v.Leader()) != hashing.MemberKey("z", 4) {
+	if count(ops, view.KindRemoveMember) != 1 || h.v.Key(h.v.Leader()) != view.MemberKey("z", 4) {
 		t.Fatalf("restart: %v", kinds(ops))
 	}
 }

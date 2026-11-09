@@ -95,7 +95,7 @@ const (
 	MaxSlots = 1 << 22
 	// MaxCells bounds Shape().Cells() of a view. It equals MaxSlots (a view
 	// never needs more cells than members) and is stricter than
-	// topology.MaxCells, which only bounds Shape arithmetic.
+	// MaxCells, which only bounds Shape arithmetic.
 	MaxCells = MaxSlots
 	// MaxDeltaOps bounds the number of ops in one delta.
 	MaxDeltaOps = 1 << 16
@@ -110,7 +110,7 @@ type Member struct {
 	ID string
 	// Incarnation distinguishes restarts of the same ID.
 	Incarnation uint64
-	// Key is hashing.MemberKey(ID, Incarnation), the rendezvous key.
+	// Key is MemberKey(ID, Incarnation), the rendezvous key.
 	Key uint64
 	// Addr is the control and data endpoint chosen by the application.
 	Addr string
@@ -118,7 +118,7 @@ type Member struct {
 	Zone string
 	// State is the lifecycle state.
 	State MemberState
-	// Weight is 0..placement.MaxWeight and 0 unless State is Active.
+	// Weight is 0..MaxWeight and 0 unless State is Active.
 	Weight uint32
 	// Cell is the member's grid cell, below Shape().Cells().
 	Cell uint32

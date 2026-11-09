@@ -1,17 +1,13 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-package placement
+package control
 
 import (
 	"fmt"
+	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
 	"slices"
-
-	"github.com/Azure/unbounded/internal/cachemesh/internal/hashing"
 )
-
-// MaxWeight is the full weight of an active, warmed-up member.
-const MaxWeight = 1000
 
 // DefaultMaxMoves is the default cap on optional moves per plan.
 const DefaultMaxMoves = 4096
@@ -57,11 +53,11 @@ type Plan struct {
 //     floor(P*w_i/W); the remainder goes one each to assignable members in
 //     ascending Key order (ties by Slot). Assignable means listed, not Gone,
 //     and weight > 0. If no listed member that is not Gone has weight > 0
-//     (bootstrap), every such member is assignable with weight MaxWeight.
+//     (bootstrap), every such member is assignable with weight view.MaxWeight.
 //  2. Mandatory: every partition whose owner is not assignable (NoMember,
 //     unlisted, Gone, or weight 0) gets a new owner, in ascending partition
 //     order. If the old owner is listed, its assignable cell-mate with the
-//     best hashing.Score(Key, partition) (hashing.Better) whose load is below
+//     best view.Score(Key, partition) (view.Better) whose load is below
 //     its target wins. Otherwise the assignable member with the smallest
 //     load - target wins (ties by Key, then Slot).
 //  3. Optional: up to MaxMoves times, move one partition from the member with
@@ -119,8 +115,8 @@ func (pl *Planner) prepare(p int, members []Member) (int, error) {
 	maxSlot := -1
 
 	for _, m := range members {
-		if m.Slot == NoMember {
-			return 0, fmt.Errorf("%w: member slot NoMember", ErrInvalid)
+		if m.Slot == view.NoMember {
+			return 0, fmt.Errorf("%w: member slot NoMember", view.ErrInvalidTable)
 		}
 
 		maxSlot = max(maxSlot, int(m.Slot))
@@ -133,7 +129,7 @@ func (pl *Planner) prepare(p int, members []Member) (int, error) {
 
 	for i, m := range members {
 		if pl.slotIdx[m.Slot] >= 0 {
-			return 0, fmt.Errorf("%w: duplicate member slot %d", ErrInvalid, m.Slot)
+			return 0, fmt.Errorf("%w: duplicate member slot %d", view.ErrInvalidTable, m.Slot)
 		}
 
 		pl.slotIdx[m.Slot] = int32(i)
@@ -161,7 +157,7 @@ func (pl *Planner) prepare(p int, members []Member) (int, error) {
 	for i, m := range members {
 		w := uint64(m.Weight)
 		if bootstrap {
-			w = MaxWeight
+			w = view.MaxWeight
 		}
 
 		pl.assign[i] = !m.Gone && w > 0
@@ -232,7 +228,7 @@ func (pl *Planner) owner(o uint32) int32 {
 
 // Plan computes the moves for one tick. It returns an error for duplicate or
 // NoMember slots in members.
-func (pl *Planner) Plan(t *Table, members []Member) (Plan, error) {
+func (pl *Planner) Plan(t *view.Table, members []Member) (Plan, error) {
 	nAssign, err := pl.prepare(t.Len(), members)
 	if err != nil {
 		return Plan{}, err
@@ -287,12 +283,12 @@ func (pl *Planner) Plan(t *Table, members []Member) (Plan, error) {
 
 // scan computes loads, the orphan list, and each assignable member's
 // partitions in ascending order (pl.donated[pl.offs[i]:pl.offs[i+1]]).
-func (pl *Planner) scan(t *Table) {
+func (pl *Planner) scan(t *view.Table) {
 	n := len(pl.members)
 	pl.orphans = pl.orphans[:0]
 
 	for ci := range t.NumChunks() {
-		base := uint32(ci) << chunkShift
+		base := uint32(ci) * view.ChunkSize
 
 		owners, _, _ := t.Columns(ci)
 		for j, o := range owners {
@@ -317,7 +313,7 @@ func (pl *Planner) scan(t *Table) {
 	pl.donated = resize(pl.donated, int(pl.offs[n]))
 
 	for ci := range t.NumChunks() {
-		base := uint32(ci) << chunkShift
+		base := uint32(ci) * view.ChunkSize
 
 		owners, _, _ := t.Columns(ci)
 		for j, o := range owners {
@@ -382,8 +378,8 @@ func (pl *Planner) mandatoryOwner(old, p uint32) int32 {
 
 			k := pl.members[j].Key
 
-			sc := hashing.Score(k, uint64(p))
-			if best < 0 || hashing.Better(sc, k, bestScore, pl.members[best].Key) {
+			sc := view.Score(k, uint64(p))
+			if best < 0 || view.Better(sc, k, bestScore, pl.members[best].Key) {
 				best, bestScore = j, sc
 			}
 		}
@@ -399,7 +395,7 @@ func (pl *Planner) mandatoryOwner(old, p uint32) int32 {
 // Settled reports whether every assignable member's load is within one of
 // its target and no partition is owned by a non-assignable owner. It is
 // trivially true when there is nothing to assign to.
-func (pl *Planner) Settled(t *Table, members []Member) (bool, error) {
+func (pl *Planner) Settled(t *view.Table, members []Member) (bool, error) {
 	n, err := pl.prepare(t.Len(), members)
 
 	defer func() { pl.members = nil }()

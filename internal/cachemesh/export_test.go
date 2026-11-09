@@ -6,14 +6,13 @@ package cachemesh
 import (
 	"time"
 
-	"github.com/Azure/unbounded/internal/cachemesh/internal/hashing"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
 )
 
 // UnsafeKeyspace returns a keyspace with any TTL, bypassing MinTTL, so tests
 // can observe expiry quickly.
 func UnsafeKeyspace(name string, ttl time.Duration) Keyspace {
-	return Keyspace{name: name, ttl: ttl, seed: hashing.Seed(name)}
+	return Keyspace{name: name, ttl: ttl, seed: view.Seed(name)}
 }
 
 // SetInitial makes the member start from v.

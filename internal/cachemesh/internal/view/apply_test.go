@@ -9,8 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Azure/unbounded/internal/cachemesh/internal/placement"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/topology"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view/viewtest"
 )
@@ -23,7 +21,7 @@ func member(i int) view.Member {
 
 func active(i int, cell uint32) view.Member {
 	m := member(i)
-	m.State, m.Weight, m.Cell = view.Active, placement.MaxWeight, cell
+	m.State, m.Weight, m.Cell = view.Active, view.MaxWeight, cell
 
 	return m
 }
@@ -128,7 +126,7 @@ func TestBootstrap(t *testing.T) {
 		t.Fatal("lookup of absent ID")
 	}
 
-	if _, ok := v.Member(3); ok || v.Key(3) != 0 || v.Cell(3) != topology.NoCell || v.State(3) != 0 {
+	if _, ok := v.Member(3); ok || v.Key(3) != 0 || v.Cell(3) != view.NoCell || v.State(3) != 0 {
 		t.Fatal("absent member")
 	}
 
@@ -147,7 +145,7 @@ func TestBootstrap(t *testing.T) {
 	c.InitialOwner = view.NoSlot
 	e := mustApply(t, view.Genesis(), view.OpConfig(c))
 
-	if e.Len() != 0 || e.Table().Owner(0) != placement.NoMember {
+	if e.Len() != 0 || e.Table().Owner(0) != view.NoMember {
 		t.Fatal("empty configured view")
 	}
 }
@@ -238,7 +236,7 @@ func TestAddMember(t *testing.T) {
 	mustFail(t, v, view.ErrInvalid, bad(func(m *view.Member) { m.State = 0 }))
 	mustFail(t, v, view.ErrInvalid, bad(func(m *view.Member) { m.State = 4 }))
 	mustFail(t, v, view.ErrInvalid, bad(func(m *view.Member) {
-		m.State, m.Weight = view.Active, placement.MaxWeight+1
+		m.State, m.Weight = view.Active, view.MaxWeight+1
 	}))
 	mustFail(t, v, view.ErrInvalid, bad(func(m *view.Member) { *m = viewtest.NewMember("", 1) }))
 	mustFail(t, v, view.ErrInvalid, bad(func(m *view.Member) {
@@ -325,7 +323,7 @@ func TestSetStateAndCell(t *testing.T) {
 		t.Fatalf("state change: %+v", m)
 	}
 
-	sh, _ := topology.NewShape(2, 2)
+	sh, _ := view.NewShape(2, 2)
 
 	mustFail(t, v, view.ErrInvalid, view.OpSetCell(1, 1))
 	v = mustApply(t, v, view.OpReshape(sh, []uint32{0, 0}))
@@ -343,16 +341,16 @@ func TestReshape(t *testing.T) {
 	v = mustApply(t, v, view.OpNewTerm(2, 1), view.OpAssign([]uint32{0}, []uint32{1}))
 	v = mustApply(t, v, view.OpAssign(allParts(), fill(1)), view.OpRemoveMember(0))
 
-	sh, _ := topology.NewShape(3)
-	mustFail(t, v, view.ErrInvalid, view.OpReshape(sh, []uint32{topology.NoCell, 0, 1, 2, 0}))
+	sh, _ := view.NewShape(3)
+	mustFail(t, v, view.ErrInvalid, view.OpReshape(sh, []uint32{view.NoCell, 0, 1, 2, 0}))
 	mustFail(t, v, view.ErrInvalid, view.OpReshape(sh, []uint32{0, 0, 1, 2, 0, 1}))
-	mustFail(t, v, view.ErrInvalid, view.OpReshape(sh, []uint32{topology.NoCell, 0, 1, 3, 0, 1}))
-	mustFail(t, v, view.ErrInvalid, view.OpReshape(topology.Shape{}, []uint32{topology.NoCell, 0, 1, 2, 0, 1}))
+	mustFail(t, v, view.ErrInvalid, view.OpReshape(sh, []uint32{view.NoCell, 0, 1, 3, 0, 1}))
+	mustFail(t, v, view.ErrInvalid, view.OpReshape(view.Shape{}, []uint32{view.NoCell, 0, 1, 2, 0, 1}))
 
-	big, _ := topology.NewShape(1<<12, 1<<11)
-	mustFail(t, v, view.ErrInvalid, view.OpReshape(big, []uint32{topology.NoCell, 0, 1, 2, 0, 1}))
+	big, _ := view.NewShape(1<<12, 1<<11)
+	mustFail(t, v, view.ErrInvalid, view.OpReshape(big, []uint32{view.NoCell, 0, 1, 2, 0, 1}))
 
-	v = mustApply(t, v, view.OpReshape(sh, []uint32{topology.NoCell, 0, 1, 2, 0, 1}))
+	v = mustApply(t, v, view.OpReshape(sh, []uint32{view.NoCell, 0, 1, 2, 0, 1}))
 	if *v.Shape() != sh || v.Occupancy(0) != 2 || v.Occupancy(1) != 2 || v.Occupancy(2) != 1 {
 		t.Fatal("reshape occupancy")
 	}
@@ -363,7 +361,7 @@ func TestReshape(t *testing.T) {
 	}
 
 	// Ops after a reshape in the same delta use the new index.
-	v = mustApply(t, v, view.OpReshape(sh, []uint32{topology.NoCell, 2, 2, 2, 0, 1}), view.OpSetCell(1, 0),
+	v = mustApply(t, v, view.OpReshape(sh, []uint32{view.NoCell, 2, 2, 2, 0, 1}), view.OpSetCell(1, 0),
 		view.OpAddMember(6, active(40, 2)))
 	if v.Occupancy(0) != 2 || v.Occupancy(2) != 3 {
 		t.Fatal("ops after reshape")
@@ -405,7 +403,7 @@ func TestAssign(t *testing.T) {
 		t.Fatalf("entry %+v", e)
 	}
 
-	if e := v.Table().Get(3); e.Owner != 0 || e.Prev != placement.NoMember {
+	if e := v.Table().Get(3); e.Owner != 0 || e.Prev != view.NoMember {
 		t.Fatalf("unchanged entry %+v", e)
 	}
 }

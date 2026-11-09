@@ -10,7 +10,6 @@ import (
 
 	"github.com/Azure/unbounded/internal/cachemesh/internal/elect"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/epoch"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/hashing"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/health"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/route"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
@@ -132,7 +131,7 @@ func NewKeyspace(name string, ttl time.Duration) (Keyspace, error) {
 		return Keyspace{}, fmt.Errorf("cachemesh: keyspace %q: ttl %v must be 0 or at least %v", name, ttl, MinTTL)
 	}
 
-	return Keyspace{name: name, ttl: ttl, seed: hashing.Seed(name)}, nil
+	return Keyspace{name: name, ttl: ttl, seed: view.Seed(name)}, nil
 }
 
 // MustKeyspace is NewKeyspace that panics on error, for package-level
@@ -152,8 +151,8 @@ func (k Keyspace) Name() string { return k.name }
 // TTL returns the metadata TTL, or zero if values never expire.
 func (k Keyspace) TTL() time.Duration { return k.ttl }
 
-// Seed returns the hashing seed, hashing.Seed(Name()).
+// Seed returns the hashing seed, view.Seed(Name()).
 func (k Keyspace) Seed() uint64 { return k.seed }
 
 // Hash returns the key hash of key in this keyspace, for RouteHash.
-func (k Keyspace) Hash(key []byte) uint64 { return hashing.KeyHash(k.seed, key) }
+func (k Keyspace) Hash(key []byte) uint64 { return view.KeyHash(k.seed, key) }

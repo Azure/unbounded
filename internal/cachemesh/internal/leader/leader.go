@@ -39,8 +39,8 @@
 //     At most max(1, N/1000) per tick, or max(1, N/10000) when more than
 //     DampingFraction of the members are suspected.
 //  7. Cell balancing (SetCell, MaxCellMovesPerTick) or, when the shape
-//     violates its bounds (topology.NeedsReshape), one Reshape.
-//  8. Partition moves (Assign) from placement.Planner: mandatory moves for
+//     violates its bounds (view.NeedsReshape), one Reshape.
+//  8. Partition moves (Assign) from control.Planner: mandatory moves for
 //     removed and weight-0 owners, then optional moves up to MaxMoves.
 //  9. Epoch, when the leader's epoch is ahead of the view.
 //  10. Invalidations.
@@ -67,10 +67,8 @@ import (
 	"slices"
 	"time"
 
+	"github.com/Azure/unbounded/internal/cachemesh/internal/control"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/epoch"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/hashing"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/placement"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/topology"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
 )
 
@@ -83,11 +81,11 @@ const (
 	DefaultSuspicionWindow     = 30 * time.Second
 	DefaultObserverCells       = 3
 	DefaultDampingPercent      = 10
-	DefaultMaxMoves            = placement.DefaultMaxMoves
+	DefaultMaxMoves            = control.DefaultMaxMoves
 	DefaultMaxCellMovesPerTick = 32
 	DefaultCellSize            = 4
 	DefaultMaxNeighbors        = 256
-	DefaultPartitionBits       = placement.DefaultBits
+	DefaultPartitionBits       = view.DefaultPartitionBits
 	DefaultEpochPeriod         = epoch.DefaultPeriod
 	DefaultSlotReuseEpochs     = 16
 	DefaultHandoffEpochs       = 8
@@ -95,7 +93,7 @@ const (
 )
 
 // DefaultWarmupWeights are the Active weight steps.
-var DefaultWarmupWeights = []uint32{250, 500, placement.MaxWeight}
+var DefaultWarmupWeights = []uint32{250, 500, view.MaxWeight}
 
 // Member identifies a member to admit, including the leader itself.
 type Member struct {
@@ -200,7 +198,7 @@ type Hooks struct {
 	OnRemove    func(slot view.Slot, reason RemoveReason)
 	OnPromote   func(slot view.Slot, state view.MemberState, weight uint32)
 	OnDamped    func(suspected, members int)
-	OnReshape   func(from, to topology.Shape)
+	OnReshape   func(from, to view.Shape)
 	OnCellMove  func(n int)
 	OnPlan      func(mandatory, optional int)
 	OnDrop      func(queue string) // an input was dropped because its queue is full
@@ -235,12 +233,12 @@ type Leader struct {
 	suspects  map[view.Slot]*suspicion
 	invals    []uint64
 	stamps    []stamp // indexed by slot
-	planner   *placement.Planner
-	settledAt *placement.Table
+	planner   *control.Planner
+	settledAt *view.Table
 	settledH  uint64
 
 	// scratch
-	pm      []placement.Member
+	pm      []control.Member
 	occBuf  []uint32
 	obs     []view.Slot
 	targets []view.Slot
@@ -257,7 +255,7 @@ func New(cfg Config, rng *rand.Rand) *Leader {
 		joinIdx:  map[string]int{},
 		leaves:   map[string]uint64{},
 		suspects: map[view.Slot]*suspicion{},
-		planner:  placement.NewPlanner(placement.Config{MaxMoves: cfg.MaxMoves}),
+		planner:  control.NewPlanner(control.Config{MaxMoves: cfg.MaxMoves}),
 	}
 }
 
@@ -488,7 +486,7 @@ func (l *Leader) selfMember(epochNow uint64, state view.MemberState, w, cell uin
 	s := l.cfg.Self
 
 	return view.Member{
-		ID: s.ID, Incarnation: s.Incarnation, Key: hashing.MemberKey(s.ID, s.Incarnation),
+		ID: s.ID, Incarnation: s.Incarnation, Key: view.MemberKey(s.ID, s.Incarnation),
 		Addr: s.Addr, Zone: s.Zone, State: state, Weight: w, Cell: cell,
 	}
 }
@@ -502,7 +500,7 @@ func (l *Leader) bootstrap(st *state, epochNow uint64) {
 			PartitionBits: l.cfg.PartitionBits, InitialOwner: self,
 			SlotReuseEpochs: l.cfg.SlotReuseEpochs, HandoffEpochs: l.cfg.HandoffEpochs,
 		}),
-		view.OpAddMember(self, l.selfMember(epochNow, view.Active, placement.MaxWeight, 0)),
+		view.OpAddMember(self, l.selfMember(epochNow, view.Active, view.MaxWeight, 0)),
 	)
 
 	if epochNow > st.v.Epoch() || st.v.Period() != l.cfg.EpochPeriod {
@@ -518,7 +516,7 @@ func (l *Leader) bootstrap(st *state, epochNow uint64) {
 // the leader admits itself first (removing a stale incarnation).
 func (l *Leader) selfSlot(st *state, epochNow uint64, starting bool) {
 	v := st.v
-	key := hashing.MemberKey(l.cfg.Self.ID, l.cfg.Self.Incarnation)
+	key := view.MemberKey(l.cfg.Self.ID, l.cfg.Self.Incarnation)
 
 	if s, ok := v.Lookup(l.cfg.Self.ID); ok {
 		if v.Key(s) == key {
@@ -542,7 +540,7 @@ func (l *Leader) selfSlot(st *state, epochNow uint64, starting bool) {
 
 	_ = epochNow
 	occ := l.occupancy(st)
-	cell := topology.JoinCell(occ, key)
+	cell := view.JoinCell(occ, key)
 	s := l.nextSlots(st, 1)[0]
 	st.self = s
 	st.ops = append(st.ops, view.OpAddMember(s, l.selfMember(epochNow, view.Joining, 0, cell)))
@@ -633,7 +631,7 @@ func (l *Leader) admit(st *state, _ int64, epochNow uint64) {
 
 	batch := make([]Member, 0, k)
 	for _, j := range l.joins[:k] {
-		key := hashing.MemberKey(j.ID, j.Incarnation)
+		key := view.MemberKey(j.ID, j.Incarnation)
 		if s, ok := v.Lookup(j.ID); ok {
 			if v.Key(s) == key || s == st.self || st.removed[s] {
 				continue // already admitted, or the leader's own ID
@@ -666,8 +664,8 @@ func (l *Leader) admit(st *state, _ int64, epochNow uint64) {
 	slots := l.nextSlots(st, len(batch))
 
 	for i, j := range batch {
-		key := hashing.MemberKey(j.ID, j.Incarnation)
-		cell := topology.JoinCell(occ, key)
+		key := view.MemberKey(j.ID, j.Incarnation)
+		cell := view.JoinCell(occ, key)
 		occ[cell]++
 
 		m := view.Member{
@@ -955,7 +953,7 @@ func (l *Leader) cells(st *state) {
 		minOcc = min(minOcc, o)
 	}
 
-	if topology.NeedsReshape(sh, st.n, int(maxOcc), l.cfg.CellSize, l.cfg.MaxNeighbors) {
+	if view.NeedsReshape(sh, st.n, int(maxOcc), l.cfg.CellSize, l.cfg.MaxNeighbors) {
 		l.reshape(st, sh)
 
 		return
@@ -965,13 +963,13 @@ func (l *Leader) cells(st *state) {
 		return
 	}
 
-	cands := make([]topology.Candidate, 0, st.n)
+	cands := make([]view.Candidate, 0, st.n)
 
 	l.forEachLive(st, func(s view.Slot, key uint64, cell uint32, state view.MemberState) {
-		cands = append(cands, topology.Candidate{Member: s, Key: key, Cell: cell, Joining: state == view.Joining})
+		cands = append(cands, view.Candidate{Member: s, Key: key, Cell: cell, Joining: state == view.Joining})
 	})
 
-	moves := topology.BalanceMoves(occ, cands, l.cfg.MaxCellMovesPerTick)
+	moves := view.BalanceMoves(occ, cands, l.cfg.MaxCellMovesPerTick)
 	for _, mv := range moves {
 		st.ops = append(st.ops, view.OpSetCell(mv.Member, mv.To))
 		st.changed = true
@@ -1015,8 +1013,8 @@ func (l *Leader) forEachLive(st *state, fn func(s view.Slot, key uint64, cell ui
 	}
 }
 
-func (l *Leader) reshape(st *state, from topology.Shape) {
-	to := topology.Choose(st.n, l.cfg.CellSize, l.cfg.MaxNeighbors)
+func (l *Leader) reshape(st *state, from view.Shape) {
+	to := view.Choose(st.n, l.cfg.CellSize, l.cfg.MaxNeighbors)
 
 	var (
 		slots []view.Slot
@@ -1028,11 +1026,11 @@ func (l *Leader) reshape(st *state, from topology.Shape) {
 		keys = append(keys, key)
 	})
 
-	assigned := topology.ReshapeCells(to, keys)
+	assigned := view.ReshapeCells(to, keys)
 
 	cells := make([]uint32, st.slotCap)
 	for i := range cells {
-		cells[i] = topology.NoCell
+		cells[i] = view.NoCell
 	}
 
 	for i, s := range slots {
@@ -1062,7 +1060,7 @@ func (l *Leader) place(st *state) {
 			_, w = st.memberState(s)
 		}
 
-		pm = append(pm, placement.Member{Slot: s, Key: key, Weight: w, Cell: cell})
+		pm = append(pm, control.Member{Slot: s, Key: key, Weight: w, Cell: cell})
 	})
 
 	removed := make([]view.Slot, 0, len(st.removed))
@@ -1073,16 +1071,16 @@ func (l *Leader) place(st *state) {
 	slices.Sort(removed)
 
 	for _, s := range removed {
-		pm = append(pm, placement.Member{Slot: s, Key: v.Key(s), Cell: v.Cell(s), Gone: true})
+		pm = append(pm, control.Member{Slot: s, Key: v.Key(s), Cell: v.Cell(s), Gone: true})
 	}
 
 	l.pm = pm
 
 	h := uint64(len(pm))
 	for _, m := range pm {
-		h = hashing.Mix64(h ^ uint64(m.Slot)<<32 ^ uint64(m.Weight)<<1 ^ uint64(m.Cell)<<40 ^ m.Key)
+		h = view.Mix64(h ^ uint64(m.Slot)<<32 ^ uint64(m.Weight)<<1 ^ uint64(m.Cell)<<40 ^ m.Key)
 		if m.Gone {
-			h = hashing.Mix64(h + 1)
+			h = view.Mix64(h + 1)
 		}
 	}
 

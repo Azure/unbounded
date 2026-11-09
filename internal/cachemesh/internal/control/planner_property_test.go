@@ -1,9 +1,10 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-package placement
+package control
 
 import (
+	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
 	"math/rand/v2"
 	"slices"
 	"testing"
@@ -17,7 +18,7 @@ func TestPlanProperties(t *testing.T) {
 	r := rand.New(rand.NewPCG(3, 9))
 
 	for iter := range 200 {
-		bits := uint8(MinBits + r.IntN(4))
+		bits := uint8(view.MinPartitionBits + r.IntN(4))
 		n := 1 + r.IntN(30)
 		ms := make([]Member, n)
 
@@ -25,14 +26,14 @@ func TestPlanProperties(t *testing.T) {
 			ms[i] = Member{
 				Slot:   uint32(i * 2),
 				Key:    uint64(r.IntN(8)), // many duplicate keys
-				Weight: []uint32{0, 250, 500, MaxWeight}[r.IntN(4)],
+				Weight: []uint32{0, 250, 500, view.MaxWeight}[r.IntN(4)],
 				Cell:   uint32(r.IntN(4)),
 				Gone:   r.IntN(8) == 0,
 			}
 		}
 
-		tb := NewTableFunc(bits, func(uint32) Entry {
-			return Entry{Owner: uint32(r.IntN(2*n + 4)), Prev: NoMember}
+		tb := view.NewTableFunc(bits, func(uint32) view.Entry {
+			return view.Entry{Owner: uint32(r.IntN(2*n + 4)), Prev: view.NoMember}
 		})
 		maxMoves := r.IntN(64) - 1
 		pl := NewPlanner(Config{MaxMoves: maxMoves})

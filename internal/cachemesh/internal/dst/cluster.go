@@ -12,12 +12,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Azure/unbounded/internal/cachemesh/internal/control"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/elect"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/hashing"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/leader"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/node"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/placement"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/topology"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/wire"
 )
@@ -601,7 +599,7 @@ func (c *Cluster) hooks(m *member) node.Hooks {
 			OnRemove:    func(_ view.Slot, r leader.RemoveReason) { cov.Hit("leader-remove-" + strconv.Itoa(int(r))) },
 			OnPromote:   func(_ view.Slot, s view.MemberState, _ uint32) { cov.Hit("leader-promote-" + s.String()) },
 			OnDamped:    func(int, int) { cov.Hit("leader-damped") },
-			OnReshape:   func(_, _ topology.Shape) { cov.Hit("leader-reshape") },
+			OnReshape:   func(_, _ view.Shape) { cov.Hit("leader-reshape") },
 			OnCellMove:  func(int) { cov.Hit("leader-cell-move") },
 			OnPlan:      func(mand, opt int) { c.planHit(mand, opt) },
 			OnBootstrap: func() { cov.Hit("leader-bootstrap") },
@@ -819,14 +817,14 @@ func (c *Cluster) liveness() error {
 		return fmt.Errorf("liveness: %d of %d live members in view", inView, len(live))
 	}
 
-	pm := make([]placement.Member, 0, lv.Len())
+	pm := make([]control.Member, 0, lv.Len())
 	lv.ForEachMember(func(s view.Slot, mm *view.Member) bool {
-		pm = append(pm, placement.Member{Slot: s, Key: mm.Key, Weight: mm.Weight, Cell: mm.Cell})
+		pm = append(pm, control.Member{Slot: s, Key: mm.Key, Weight: mm.Weight, Cell: mm.Cell})
 
 		return true
 	})
 
-	if ok, err := placement.NewPlanner(placement.Config{}).Settled(lv.Table(), pm); err != nil || !ok {
+	if ok, err := control.NewPlanner(control.Config{}).Settled(lv.Table(), pm); err != nil || !ok {
 		return fmt.Errorf("liveness: placement not settled (%v)", err)
 	}
 
@@ -965,7 +963,7 @@ func (c *Cluster) apply(f Fault) {
 	case KeyspaceInvalidation:
 		if ps := c.pick(f, 1, false); len(ps) > 0 {
 			m := c.members[ps[0]]
-			m.n.Invalidate(m.clock.Mono(sim.Now()), hashing.Seed("meta/"+strconv.FormatUint(f.Seed%4, 10)))
+			m.n.Invalidate(m.clock.Mono(sim.Now()), view.Seed("meta/"+strconv.FormatUint(f.Seed%4, 10)))
 			m.after()
 		}
 	case LeaseConflicts:

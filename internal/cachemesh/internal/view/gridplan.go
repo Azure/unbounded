@@ -1,12 +1,10 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-package topology
+package view
 
 import (
 	"slices"
-
-	"github.com/Azure/unbounded/internal/cachemesh/internal/hashing"
 )
 
 // Choose returns the grid shape for n members.
@@ -30,7 +28,7 @@ func Choose(n, cellSize, maxNeighbors int) Shape {
 	// Factor may round the product up to just under twice cells, so cap
 	// cells at MaxCells/2 to keep every candidate shape valid.
 	cells := max(1, n/cellSize)
-	cells = min(cells, MaxCells/2)
+	cells = min(cells, MaxGridCells/2)
 
 	var (
 		s   Shape
@@ -141,7 +139,7 @@ func NeedsReshape(s Shape, n, maxOcc, cellSize, maxNeighbors int) bool {
 
 // JoinCell returns the cell for a joining member: the least occupied cell,
 // with ties going to the cell that ranks best for the member, that is the
-// largest hashing.Score(memberKey, cell) (hashing.Better semantics; distinct
+// largest Score(memberKey, cell) (Better semantics; distinct
 // cells give distinct scores, so the result is unique). Spreading ties by
 // score keeps a burst of joins from all landing in the lowest cell index. It
 // returns NoCell for an empty occupancy slice.
@@ -157,7 +155,7 @@ func JoinCell(occupancy []uint32, memberKey uint64) uint32 {
 			continue
 		}
 
-		sc := hashing.Score(memberKey, uint64(c))
+		sc := Score(memberKey, uint64(c))
 		if best == NoCell || o < bestOcc || sc > bestScore {
 			best, bestOcc, bestScore = uint32(c), o, sc
 		}

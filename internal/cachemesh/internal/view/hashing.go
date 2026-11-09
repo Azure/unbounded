@@ -1,14 +1,15 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package hashing holds the hash functions every cachemesh member must agree
+// Hashing. These are the hash functions every cachemesh member must agree
 // on: key hashing, partition selection, member keys, and rendezvous scores.
 //
 // Everything here is a pure function of its inputs and is stable across
 // processes, architectures, and releases. Changing any output is a wire
 // format change: members running different versions would disagree on owners
 // and routes. Nothing uses floating point or per-process seeds.
-package hashing
+
+package view
 
 import (
 	"encoding/binary"

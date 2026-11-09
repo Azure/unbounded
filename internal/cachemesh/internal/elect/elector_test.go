@@ -5,13 +5,12 @@ package elect
 
 import (
 	"errors"
+	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
 	"math/rand/v2"
 	"slices"
 	"strconv"
 	"testing"
 	"time"
-
-	"github.com/Azure/unbounded/internal/cachemesh/internal/hashing"
 )
 
 var epoch = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -70,7 +69,7 @@ func (m *memStore) store(r Record) {
 
 func self(i int) Self {
 	id := "m" + strconv.Itoa(i)
-	return Self{ID: id, Incarnation: uint64(i + 1), Key: hashing.MemberKey(id, uint64(i+1)), Addr: id + ":1"}
+	return Self{ID: id, Incarnation: uint64(i + 1), Key: view.MemberKey(id, uint64(i+1)), Addr: id + ":1"}
 }
 
 func newRNG(s uint64) *rand.Rand { return rand.New(rand.NewPCG(s, s^0x9e37)) }
@@ -170,12 +169,12 @@ func TestTopCandidates(t *testing.T) {
 
 		ref := slices.Clone(keys)
 		slices.SortFunc(ref, func(a, b uint64) int {
-			sa, sb := hashing.Score(seed, a), hashing.Score(seed, b)
-			if hashing.Better(sa, a, sb, b) {
+			sa, sb := view.Score(seed, a), view.Score(seed, b)
+			if view.Better(sa, a, sb, b) {
 				return -1
 			}
 
-			if hashing.Better(sb, b, sa, a) {
+			if view.Better(sb, b, sa, a) {
 				return 1
 			}
 

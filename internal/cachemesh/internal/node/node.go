@@ -22,7 +22,7 @@
 //     wire.LevelLeader. A member receiving level l forwards, using the
 //     post-apply view, to one member of every adjacent cell in each
 //     dimension j > l (level j), the member with the highest
-//     hashing.Score(member.Key, delta.Seq) that the health tracker deems
+//     view.Score(member.Key, delta.Seq) that the health tracker deems
 //     usable, and, unless l is wire.LevelLocal, to its cell-mates at
 //     LevelLocal. A failed forward is retried once with the next-ranked
 //     member of that cell.
@@ -78,7 +78,6 @@ import (
 
 	"github.com/Azure/unbounded/internal/cachemesh/internal/elect"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/epoch"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/hashing"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/health"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/leader"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
@@ -104,7 +103,7 @@ const (
 
 // LeaseSeed is the hashing seed for candidate selection
 // (elect.TopCandidates).
-var LeaseSeed = hashing.Seed("cachemesh/lease")
+var LeaseSeed = view.Seed("cachemesh/lease")
 
 // Config configures a Node. Zero values select defaults.
 type Config struct {
@@ -372,7 +371,7 @@ func New(cfg Config, rng *rand.Rand) *Node {
 	n := &Node{
 		cfg:    cfg,
 		rng:    rng,
-		key:    hashing.MemberKey(cfg.ID, cfg.Incarnation),
+		key:    view.MemberKey(cfg.ID, cfg.Incarnation),
 		v:      view.Genesis(),
 		log:    view.NewDeltaLog(cfg.DeltaLogSize),
 		slot:   view.NoSlot,
@@ -1022,7 +1021,7 @@ func (n *Node) leaderInput(now int64, m *wire.Message) {
 	case wire.KindLeave:
 		n.ld.Leave(now, m.Member.ID, m.Member.Incarnation)
 	case wire.KindSuspect:
-		n.ld.Suspect(now, m.Target.Slot, hashing.MemberKey(m.Target.ID, m.Target.Incarnation), m.Observer.Slot)
+		n.ld.Suspect(now, m.Target.Slot, view.MemberKey(m.Target.ID, m.Target.Incarnation), m.Observer.Slot)
 	case wire.KindInvalidate:
 		n.ld.Invalidate(m.Seed)
 	}

@@ -7,12 +7,11 @@ import (
 	"cmp"
 	"encoding/binary"
 	"fmt"
+	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
 	"math/rand/v2"
 	"slices"
 	"strconv"
 	"strings"
-
-	"github.com/Azure/unbounded/internal/cachemesh/internal/hashing"
 )
 
 // FaultKind is a kind of injected fault.
@@ -527,10 +526,10 @@ func (g *KeyGen) Next() ([]byte, KeyKind, uint64) {
 func (g *KeyGen) digest(rank uint64) {
 	g.buf = g.buf[:32]
 
-	x := hashing.Mix64(rank ^ 0x9e3779b97f4a7c15)
+	x := view.Mix64(rank ^ 0x9e3779b97f4a7c15)
 	for i := 0; i < 32; i += 8 {
 		binary.BigEndian.PutUint64(g.buf[i:], x)
-		x = hashing.Mix64(x)
+		x = view.Mix64(x)
 	}
 }
 

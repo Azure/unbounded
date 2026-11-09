@@ -10,7 +10,6 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/Azure/unbounded/internal/cachemesh/internal/codec"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
 )
 
@@ -216,29 +215,29 @@ func TestReject(t *testing.T) {
 		b    []byte
 		want error
 	}{
-		"empty":         {nil, codec.ErrShort},
-		"one-byte":      {ping[:1], codec.ErrShort},
-		"truncated":     {ping[:len(ping)-1], codec.ErrShort},
-		"trailing":      {append(append([]byte{}, ping...), 0), codec.ErrTrailing},
+		"empty":         {nil, view.ErrShort},
+		"one-byte":      {ping[:1], view.ErrShort},
+		"truncated":     {ping[:len(ping)-1], view.ErrShort},
+		"trailing":      {append(append([]byte{}, ping...), 0), view.ErrTrailing},
 		"bad-version":   {append([]byte{2}, ping[1:]...), ErrVersion},
 		"zero-kind":     {append([]byte{1, 0}, ping[2:]...), ErrUnknownKind},
 		"unknown-kind":  {append([]byte{1, 200}, ping[2:]...), ErrUnknownKind},
-		"long-id":       {mut("ping", func(m *Message) { m.From.ID = string(make([]byte, MaxIDLen+1)) }), codec.ErrTooLarge},
-		"long-addr":     {mut("pong", func(m *Message) { m.LeaderAddr = string(make([]byte, MaxAddrLen+1)) }), codec.ErrTooLarge},
-		"long-zone":     {mut("join", func(m *Message) { m.Zone = string(make([]byte, MaxZoneLen+1)) }), codec.ErrTooLarge},
-		"bad-pbits":     {mut("join", func(m *Message) { m.PartitionBits = MaxPartitionBits + 1 }), codec.ErrInvalid},
-		"level-low":     {mut("broadcasta", func(m *Message) { m.Level = -3 }), codec.ErrInvalid},
-		"level-high":    {mut("broadcasta", func(m *Message) { m.Level = MaxDimensions }), codec.ErrInvalid},
-		"nack-zero":     {mut("nack", func(m *Message) { m.Reason = 0 }), codec.ErrInvalid},
-		"nack-high":     {mut("nack", func(m *Message) { m.Reason = reasonMax + 1 }), codec.ErrInvalid},
-		"both":          {mut("catchup-snapshot", func(m *Message) { m.Deltas = [][]byte{{1}} }), codec.ErrInvalid},
-		"too-many":      {mut("catchup-deltas", func(m *Message) { m.Deltas = append(m.Deltas, nil) }), codec.ErrTooLarge},
-		"big-inner":     {mut("routed-target", func(m *Message) { m.Inner = make([]byte, MaxInnerSize+1) }), codec.ErrTooLarge},
-		"zero-deltas":   {append(enc(s["catchup-empty"])[:len(enc(s["catchup-empty"]))-1], 1, 0), codec.ErrInvalid},
-		"empty-snap":    {append(enc(s["catchup-empty"])[:len(enc(s["catchup-empty"]))-1], 2, 0), codec.ErrInvalid},
-		"bad-bool":      {badBool(enc(s["routed-leader"]), len(enc(s["ack"]))+7), codec.ErrInvalid},
+		"long-id":       {mut("ping", func(m *Message) { m.From.ID = string(make([]byte, MaxIDLen+1)) }), view.ErrTooLarge},
+		"long-addr":     {mut("pong", func(m *Message) { m.LeaderAddr = string(make([]byte, MaxAddrLen+1)) }), view.ErrTooLarge},
+		"long-zone":     {mut("join", func(m *Message) { m.Zone = string(make([]byte, MaxZoneLen+1)) }), view.ErrTooLarge},
+		"bad-pbits":     {mut("join", func(m *Message) { m.PartitionBits = MaxPartitionBits + 1 }), view.ErrInvalidValue},
+		"level-low":     {mut("broadcasta", func(m *Message) { m.Level = -3 }), view.ErrInvalidValue},
+		"level-high":    {mut("broadcasta", func(m *Message) { m.Level = MaxDimensions }), view.ErrInvalidValue},
+		"nack-zero":     {mut("nack", func(m *Message) { m.Reason = 0 }), view.ErrInvalidValue},
+		"nack-high":     {mut("nack", func(m *Message) { m.Reason = reasonMax + 1 }), view.ErrInvalidValue},
+		"both":          {mut("catchup-snapshot", func(m *Message) { m.Deltas = [][]byte{{1}} }), view.ErrInvalidValue},
+		"too-many":      {mut("catchup-deltas", func(m *Message) { m.Deltas = append(m.Deltas, nil) }), view.ErrTooLarge},
+		"big-inner":     {mut("routed-target", func(m *Message) { m.Inner = make([]byte, MaxInnerSize+1) }), view.ErrTooLarge},
+		"zero-deltas":   {append(enc(s["catchup-empty"])[:len(enc(s["catchup-empty"]))-1], 1, 0), view.ErrInvalidValue},
+		"empty-snap":    {append(enc(s["catchup-empty"])[:len(enc(s["catchup-empty"]))-1], 2, 0), view.ErrInvalidValue},
+		"bad-bool":      {badBool(enc(s["routed-leader"]), len(enc(s["ack"]))+7), view.ErrInvalidValue},
 		"oversize":      {append([]byte{1, 1}, make([]byte, MaxMessageSize)...), ErrTooLarge},
-		"maxdeltas-u33": {append(enc(s["catchup-req"])[:len(enc(s["catchup-req"]))-5], codec.AppendUvarint(nil, 1<<32)...), codec.ErrInvalid},
+		"maxdeltas-u33": {append(enc(s["catchup-req"])[:len(enc(s["catchup-req"]))-5], view.AppendUvarint(nil, 1<<32)...), view.ErrInvalidValue},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {

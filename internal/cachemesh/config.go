@@ -14,7 +14,6 @@ import (
 	"github.com/Azure/unbounded/internal/cachemesh/internal/health"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/leader"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/node"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/placement"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
 )
 
@@ -251,7 +250,7 @@ func (c *Config) validate() error {
 		errs = append(errs, errors.New("transport is required"))
 	}
 
-	if c.PartitionBits != 0 && !placement.ValidBits(c.PartitionBits) {
+	if c.PartitionBits != 0 && !view.ValidPartitionBits(c.PartitionBits) {
 		errs = append(errs, fmt.Errorf("invalid PartitionBits %d", c.PartitionBits))
 	}
 

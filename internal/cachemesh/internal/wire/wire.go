@@ -35,9 +35,6 @@ import (
 	"strconv"
 	"unsafe"
 
-	"github.com/Azure/unbounded/internal/cachemesh/internal/codec"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/placement"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/topology"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
 )
 
@@ -60,10 +57,10 @@ const (
 	MaxInnerSize = 64 << 10
 	// MaxPartitionBits bounds Join.PartitionBits: no cluster can use more
 	// bits than a placement table holds.
-	MaxPartitionBits = placement.MaxBits
+	MaxPartitionBits = view.MaxPartitionBits
 	// MaxDimensions is the number of grid dimensions a Broadcast level may
 	// name (levels 0..MaxDimensions-1).
-	MaxDimensions = topology.MaxDims
+	MaxDimensions = view.MaxDims
 )
 
 // Errors returned by Decode, in addition to wrapped codec errors.
@@ -261,7 +258,7 @@ func (m *Message) Validate() error {
 // version, without decoding the rest.
 func PeekKind(b []byte) (Kind, error) {
 	if len(b) < 2 {
-		return 0, fmt.Errorf("wire: %w", codec.ErrShort)
+		return 0, fmt.Errorf("wire: %w", view.ErrShort)
 	}
 
 	if b[0] != FormatVersion {
@@ -277,10 +274,10 @@ func PeekKind(b []byte) (Kind, error) {
 }
 
 func appendRef(b []byte, r *MemberRef) []byte {
-	b = codec.AppendString(b, r.ID)
-	b = codec.AppendUvarint(b, r.Incarnation)
+	b = view.AppendString(b, r.ID)
+	b = view.AppendUvarint(b, r.Incarnation)
 
-	return codec.AppendU32(b, r.Slot)
+	return view.AppendU32(b, r.Slot)
 }
 
 // Append appends the canonical encoding of m to b. Append does not validate
@@ -292,60 +289,60 @@ func Append(b []byte, m *Message) []byte {
 	b = appendRef(b, &m.From)
 	b = view.AppendVersion(b, m.Version)
 	b = append(b, m.Digest[:]...)
-	b = codec.AppendUvarint(b, m.Epoch)
-	b = codec.AppendU32(b, m.LeaderSlot)
+	b = view.AppendUvarint(b, m.Epoch)
+	b = view.AppendU32(b, m.LeaderSlot)
 
 	switch m.Kind {
 	case KindPong:
-		b = codec.AppendString(b, m.LeaderAddr)
+		b = view.AppendString(b, m.LeaderAddr)
 	case KindNack:
-		b = codec.AppendU8(b, uint8(m.Reason))
+		b = view.AppendU8(b, uint8(m.Reason))
 	case KindBroadcast:
-		b = codec.AppendU8(b, uint8(m.Level))
-		b = codec.AppendBytes(b, m.Delta)
+		b = view.AppendU8(b, uint8(m.Level))
+		b = view.AppendBytes(b, m.Delta)
 	case KindCatchUpRequest:
 		b = view.AppendVersion(b, m.Have)
 		b = append(b, m.HaveDigest[:]...)
-		b = codec.AppendUvarint(b, uint64(m.MaxDeltas))
+		b = view.AppendUvarint(b, uint64(m.MaxDeltas))
 	case KindCatchUpResponse:
 		switch {
 		case len(m.Deltas) > 0 && len(m.Snapshot) > 0:
-			b = codec.AppendU8(b, 3) // rejected by Decode
+			b = view.AppendU8(b, 3) // rejected by Decode
 		case len(m.Deltas) > 0:
-			b = codec.AppendU8(b, 1)
+			b = view.AppendU8(b, 1)
 
-			b = codec.AppendUvarint(b, uint64(len(m.Deltas)))
+			b = view.AppendUvarint(b, uint64(len(m.Deltas)))
 			for _, d := range m.Deltas {
-				b = codec.AppendBytes(b, d)
+				b = view.AppendBytes(b, d)
 			}
 		case len(m.Snapshot) > 0:
-			b = codec.AppendU8(b, 2)
-			b = codec.AppendBytes(b, m.Snapshot)
+			b = view.AppendU8(b, 2)
+			b = view.AppendBytes(b, m.Snapshot)
 		default:
-			b = codec.AppendU8(b, 0)
+			b = view.AppendU8(b, 0)
 		}
 	case KindRouted:
 		b = appendRef(b, &m.Origin)
 
-		b = codec.AppendBool(b, m.ToLeader)
+		b = view.AppendBool(b, m.ToLeader)
 		if !m.ToLeader {
 			b = appendRef(b, &m.Target)
 		}
 
 		b = append(b, m.TTL, m.Hops)
-		b = codec.AppendBytes(b, m.Inner)
+		b = view.AppendBytes(b, m.Inner)
 	case KindJoin:
 		b = appendRef(b, &m.Member)
-		b = codec.AppendString(b, m.Addr)
-		b = codec.AppendString(b, m.Zone)
-		b = codec.AppendU8(b, m.PartitionBits)
+		b = view.AppendString(b, m.Addr)
+		b = view.AppendString(b, m.Zone)
+		b = view.AppendU8(b, m.PartitionBits)
 	case KindLeave:
 		b = appendRef(b, &m.Member)
 	case KindSuspect:
 		b = appendRef(b, &m.Target)
 		b = appendRef(b, &m.Observer)
 	case KindInvalidate:
-		b = codec.AppendU64(b, m.Seed)
+		b = view.AppendU64(b, m.Seed)
 	case KindPing, KindAck:
 	}
 
@@ -361,7 +358,7 @@ func aliasString(p []byte) string {
 	return unsafe.String(unsafe.SliceData(p), len(p))
 }
 
-func readRef(r *codec.Reader, ref *MemberRef) {
+func readRef(r *view.Reader, ref *MemberRef) {
 	ref.ID = aliasString(r.Bytes(MaxIDLen))
 	ref.Incarnation = r.Uvarint()
 	ref.Slot = r.U32()
@@ -382,7 +379,7 @@ func Decode(b []byte, m *Message) error {
 
 	m.Reset()
 	m.Kind = k
-	r := codec.NewReader(b[2:])
+	r := view.NewReader(b[2:])
 	readRef(&r, &m.From)
 	m.Version = view.ReadVersion(&r)
 	r.Fixed(m.Digest[:])
@@ -395,12 +392,12 @@ func Decode(b []byte, m *Message) error {
 	case KindNack:
 		m.Reason = Reason(r.U8())
 		if r.Err() == nil && !m.Reason.Valid() {
-			r.Fail(codec.ErrInvalid)
+			r.Fail(view.ErrInvalidValue)
 		}
 	case KindBroadcast:
 		m.Level = int8(r.U8()) //nolint:gosec // two's complement reinterpretation.
 		if r.Err() == nil && !ValidLevel(m.Level) {
-			r.Fail(codec.ErrInvalid)
+			r.Fail(view.ErrInvalidValue)
 		}
 
 		m.Delta = r.Bytes(MaxMessageSize)
@@ -428,7 +425,7 @@ func Decode(b []byte, m *Message) error {
 
 		m.PartitionBits = r.U8()
 		if m.PartitionBits > MaxPartitionBits {
-			r.Fail(codec.ErrInvalid)
+			r.Fail(view.ErrInvalidValue)
 		}
 	case KindLeave:
 		readRef(&r, &m.Member)
@@ -447,13 +444,13 @@ func Decode(b []byte, m *Message) error {
 	return nil
 }
 
-func decodeCatchUp(r *codec.Reader, m *Message) {
+func decodeCatchUp(r *view.Reader, m *Message) {
 	switch r.U8() {
 	case 0:
 	case 1:
 		n := r.Len(MaxDeltas, 1)
 		if r.Err() == nil && n == 0 {
-			r.Fail(codec.ErrInvalid)
+			r.Fail(view.ErrInvalidValue)
 		}
 
 		for range n {
@@ -462,9 +459,9 @@ func decodeCatchUp(r *codec.Reader, m *Message) {
 	case 2:
 		m.Snapshot = r.Bytes(MaxMessageSize)
 		if r.Err() == nil && len(m.Snapshot) == 0 {
-			r.Fail(codec.ErrInvalid)
+			r.Fail(view.ErrInvalidValue)
 		}
 	default:
-		r.Fail(codec.ErrInvalid)
+		r.Fail(view.ErrInvalidValue)
 	}
 }

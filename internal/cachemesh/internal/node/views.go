@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/Azure/unbounded/internal/cachemesh/internal/elect"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/hashing"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/health"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/wire"
@@ -348,11 +347,11 @@ func (n *Node) forwardCell(enc []byte, seq uint64, l int8, cell uint32, attempt 
 		}
 
 		k := v.Key(s)
-		sc := hashing.Score(k, seq)
+		sc := view.Score(k, seq)
 		usable := n.hl.Usable(s) != health.Unusable
 
 		if best == view.NoSlot || (usable && !bestUsable) ||
-			(usable == bestUsable && hashing.Better(sc, k, bestScore, v.Key(best))) {
+			(usable == bestUsable && view.Better(sc, k, bestScore, v.Key(best))) {
 			best, bestScore, bestUsable = s, sc, usable
 		}
 	}

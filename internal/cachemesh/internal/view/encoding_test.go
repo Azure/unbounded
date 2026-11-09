@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-package codec
+package view
 
 import (
 	"bytes"
@@ -82,8 +82,8 @@ func TestErrors(t *testing.T) {
 		{"short varint", []byte{0x80}, func(r *Reader) { r.Uvarint() }, ErrShort},
 		{"non-minimal varint", []byte{0x80, 0x00}, func(r *Reader) { r.Uvarint() }, ErrVarint},
 		{"overflow varint", bytes.Repeat([]byte{0xff}, 11), func(r *Reader) { r.Uvarint() }, ErrVarint},
-		{"bad bool", []byte{2}, func(r *Reader) { r.Bool() }, ErrInvalid},
-		{"uvarint32 overflow", AppendUvarint(nil, math.MaxUint32+1), func(r *Reader) { r.Uvarint32() }, ErrInvalid},
+		{"bad bool", []byte{2}, func(r *Reader) { r.Bool() }, ErrInvalidValue},
+		{"uvarint32 overflow", AppendUvarint(nil, math.MaxUint32+1), func(r *Reader) { r.Uvarint32() }, ErrInvalidValue},
 		{"bytes over max", AppendBytes(nil, []byte("abcdef")), func(r *Reader) { r.Bytes(3) }, ErrTooLarge},
 		{"bytes over input", AppendUvarint(nil, 100), func(r *Reader) { r.Bytes(1000) }, ErrTooLarge},
 		{"len over input", append(AppendUvarint(nil, 3), 0, 0, 0, 0, 0), func(r *Reader) { r.Len(10, 2) }, ErrTooLarge},
@@ -110,7 +110,7 @@ func TestStickyError(t *testing.T) {
 		t.Fatalf("read after error = %d, want 0", got)
 	}
 
-	r.Fail(ErrInvalid)
+	r.Fail(ErrInvalidValue)
 
 	if !errors.Is(r.Err(), ErrShort) {
 		t.Fatalf("Err = %v, want first error", r.Err())

@@ -1,16 +1,23 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
+// Package view holds the immutable membership view that every cachemesh
+// member routes with: members by slot, the grid shape and cell index, the
+// partition table, the epoch anchor, and keyspace generations. Views change
+// only by applying leader-issued deltas, and each view is identified by a
+// Version and a content Digest. See designs/cachemesh.md, "Membership view".
+//
+// The package also holds what a view is built from and what every member
+// must agree on bit for bit: the grid arithmetic (Shape, Choose, cell
+// assignment), the partition Table, the hash functions, and the canonical
+// binary encoding (Reader and the Append functions) that the control
+// package's wire messages reuse.
 package view
 
 import (
 	"crypto/sha256"
 	"math"
 	"time"
-
-	"github.com/Azure/unbounded/internal/cachemesh/internal/hashing"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/placement"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/topology"
 )
 
 const (
@@ -48,8 +55,8 @@ type View struct {
 
 	config    Config
 	hasConfig bool
-	shape     topology.Shape
-	table     *placement.Table
+	shape     Shape
+	table     *Table
 
 	epoch  uint64
 	period time.Duration
@@ -98,10 +105,10 @@ func (v *View) PartitionBits() uint8 { return v.config.PartitionBits }
 
 // Shape returns the grid shape. It is the zero (invalid) shape without
 // config.
-func (v *View) Shape() *topology.Shape { return &v.shape }
+func (v *View) Shape() *Shape { return &v.shape }
 
 // Table returns the partition table, or nil without config.
-func (v *View) Table() *placement.Table { return v.table }
+func (v *View) Table() *Table { return v.table }
 
 // Epoch returns the epoch anchor.
 func (v *View) Epoch() uint64 { return v.epoch }
@@ -164,15 +171,15 @@ func (v *View) Key(s Slot) uint64 {
 	return v.mem[s>>memShift].mem[s&memMask].Key
 }
 
-// Cell returns the cell of the member at slot, or topology.NoCell.
+// Cell returns the cell of the member at slot, or NoCell.
 func (v *View) Cell(s Slot) uint32 {
 	if s >= v.slotCap {
-		return topology.NoCell
+		return NoCell
 	}
 
 	m := &v.mem[s>>memShift].mem[s&memMask]
 	if m.State == 0 {
-		return topology.NoCell
+		return NoCell
 	}
 
 	return m.Cell
@@ -272,7 +279,7 @@ func (v *View) Lookup(id string) (Slot, bool) {
 	return s, s != NoSlot
 }
 
-func idHash(id string) uint64 { return hashing.KeyHashString(idSeed, id) }
+func idHash(id string) uint64 { return KeyHashString(idSeed, id) }
 
 func (v *View) idSize() uint64 { return uint64(len(v.ids)) << idxShift }
 

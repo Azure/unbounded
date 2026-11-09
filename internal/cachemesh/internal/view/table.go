@@ -1,8 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package placement holds the cachemesh partition table and the leader's
-// rebalancer.
+// Partition table.
 //
 // A cluster hashes every key into P = 2^bits partitions. The Table maps each
 // partition to an Entry naming its owner slot, the previous owner (for
@@ -12,20 +11,17 @@
 // k chunks and every view keeps its own table cheaply. Get is a two-level
 // array lookup with no locks and no allocation; entries are stored as
 // per-chunk columns so that the owner lookup reads a dense array.
-//
-// The Planner is the deterministic rebalancer the leader runs each tick. Its
-// output depends only on the table contents and the member set (not on the
-// order members are listed in), so any leader computes the same plan. It
-// never reads clocks or randomness.
-package placement
+
+package view
 
 import (
 	"errors"
 	"fmt"
 	"slices"
-
-	"github.com/Azure/unbounded/internal/cachemesh/internal/hashing"
 )
+
+// MaxWeight is the full weight of an active, warmed-up member.
+const MaxWeight = 1000
 
 // NoMember marks a partition without an owner or an Entry without a previous
 // owner. It equals the cachemesh NoSlot value, ^uint32(0).
@@ -33,9 +29,9 @@ const NoMember = ^uint32(0)
 
 // Bit bounds for the partition count.
 const (
-	MinBits     = 1
-	MaxBits     = 24
-	DefaultBits = 20
+	MinPartitionBits     = 1
+	MaxPartitionBits     = 24
+	DefaultPartitionBits = 20
 )
 
 const (
@@ -101,15 +97,15 @@ func (c *chunk) equal(o *chunk) bool {
 	return slices.Equal(c.owner, o.owner) && slices.Equal(c.prev, o.prev) && slices.Equal(c.moved, o.moved)
 }
 
-// ErrInvalid reports invalid arguments to NewTable or Assign.
-var ErrInvalid = errors.New("placement: invalid argument")
+// ErrInvalidTable reports invalid arguments to NewTable or Assign.
+var ErrInvalidTable = errors.New("view: invalid argument")
 
 // NewTable returns a table of 2^bits partitions all owned by owner (which may
 // be NoMember) with Prev NoMember and Moved 0. It panics if bits is outside
 // MinBits..MaxBits; use ValidBits to check untrusted input first.
 func NewTable(bits uint8, owner uint32) *Table {
-	if !ValidBits(bits) {
-		panic(fmt.Sprintf("placement: bits %d outside %d..%d", bits, MinBits, MaxBits))
+	if !ValidPartitionBits(bits) {
+		panic(fmt.Sprintf("view: bits %d outside %d..%d", bits, MinPartitionBits, MaxPartitionBits))
 	}
 
 	n := 1 << bits
@@ -129,8 +125,8 @@ func NewTable(bits uint8, owner uint32) *Table {
 	return t
 }
 
-// ValidBits reports whether bits is an allowed partition bit count.
-func ValidBits(bits uint8) bool { return bits >= MinBits && bits <= MaxBits }
+// ValidPartitionBits reports whether bits is an allowed partition bit count.
+func ValidPartitionBits(bits uint8) bool { return bits >= MinPartitionBits && bits <= MaxPartitionBits }
 
 // Bits returns the partition bit count.
 func (t *Table) Bits() uint8 { return t.bits }
@@ -189,17 +185,17 @@ func (t *Table) ForEach(fn func(p uint32, e Entry)) {
 // a delta must name each partition at most once.
 func (t *Table) Assign(parts, owners []uint32, epoch uint32) (*Table, error) {
 	if len(parts) != len(owners) {
-		return nil, fmt.Errorf("%w: %d parts, %d owners", ErrInvalid, len(parts), len(owners))
+		return nil, fmt.Errorf("%w: %d parts, %d owners", ErrInvalidTable, len(parts), len(owners))
 	}
 
 	n := uint32(t.Len())
 	for i, p := range parts {
 		if p >= n {
-			return nil, fmt.Errorf("%w: partition %d >= %d", ErrInvalid, p, n)
+			return nil, fmt.Errorf("%w: partition %d >= %d", ErrInvalidTable, p, n)
 		}
 
 		if owners[i] == NoMember {
-			return nil, fmt.Errorf("%w: partition %d assigned to NoMember", ErrInvalid, p)
+			return nil, fmt.Errorf("%w: partition %d assigned to NoMember", ErrInvalidTable, p)
 		}
 	}
 
@@ -209,7 +205,7 @@ func (t *Table) Assign(parts, owners []uint32, epoch uint32) (*Table, error) {
 
 		for i := 1; i < len(s); i++ {
 			if s[i] == s[i-1] {
-				return nil, fmt.Errorf("%w: duplicate partition %d", ErrInvalid, s[i])
+				return nil, fmt.Errorf("%w: duplicate partition %d", ErrInvalidTable, s[i])
 			}
 		}
 	}
@@ -245,9 +241,9 @@ func (t *Table) Assign(parts, owners []uint32, epoch uint32) (*Table, error) {
 	return nt, nil
 }
 
-// Equal reports whether a and b have the same bits and entries. Shared
+// EqualTables reports whether a and b have the same bits and entries. Shared
 // chunks are compared by identity.
-func Equal(a, b *Table) bool {
+func EqualTables(a, b *Table) bool {
 	if a.bits != b.bits {
 		return false
 	}
@@ -268,11 +264,11 @@ func Equal(a, b *Table) bool {
 // Hash returns a 64-bit content hash of the table (bits and every entry).
 // Equal tables have equal hashes on every platform.
 func (t *Table) Hash() uint64 {
-	h := hashing.Mix64(uint64(t.bits) + 0x9e3779b97f4a7c15)
+	h := Mix64(uint64(t.bits) + 0x9e3779b97f4a7c15)
 	for _, c := range t.chunks {
 		for j := range c.owner {
-			h = hashing.Mix64(h ^ (uint64(c.owner[j]) | uint64(c.prev[j])<<32))
-			h = hashing.Mix64(h ^ uint64(c.moved[j]))
+			h = Mix64(h ^ (uint64(c.owner[j]) | uint64(c.prev[j])<<32))
+			h = Mix64(h ^ uint64(c.moved[j]))
 		}
 	}
 
@@ -307,8 +303,8 @@ func (t *Table) Loads(dst []uint32) []uint32 {
 // identical contents share storage, so a uniform table costs one chunk. It
 // panics if bits is outside MinBits..MaxBits.
 func NewTableFunc(bits uint8, fn func(p uint32) Entry) *Table {
-	if !ValidBits(bits) {
-		panic(fmt.Sprintf("placement: bits %d outside %d..%d", bits, MinBits, MaxBits))
+	if !ValidPartitionBits(bits) {
+		panic(fmt.Sprintf("view: bits %d outside %d..%d", bits, MinPartitionBits, MaxPartitionBits))
 	}
 
 	n := 1 << bits

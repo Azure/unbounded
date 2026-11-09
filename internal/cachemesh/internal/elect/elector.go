@@ -7,7 +7,7 @@
 //
 // One Kubernetes Lease names the cachemesh leader. Almost every member is a
 // Follower and makes no API calls at all. A handful of members (the top
-// Config.Candidates by hashing.Score(leaseSeed, member.Key) among Active
+// Config.Candidates by view.Score(leaseSeed, member.Key) among Active
 // members admitted at least MinCandidateAge ago, see TopCandidates) are
 // Candidates: they read the Lease with a consistent Get every RetryPeriod
 // (jittered) and take it with a compare-and-swap Update once it has not
@@ -17,7 +17,7 @@
 // per-elector jitter), or the member has no view at all, a non-candidate
 // enters the Lottery: in each LotteryRound it is eligible with probability
 // p = min(1, LotteryBudgetQPS*LotteryRound/N), decided by
-// hashing.Below(hashing.Score(self.Key, round), p64), and an eligible member
+// view.Below(view.Score(self.Key, round), p64), and an eligible member
 // issues one cached read. A live holder is reported with a Discovered event
 // so the node can catch up from its Addr and Seeds; a holder expired by
 // RenewTime+LeaseDuration+ClockSkewAllowance of wall time is taken with a
@@ -93,13 +93,12 @@ package elect
 
 import (
 	"errors"
+	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
 	"math"
 	"math/bits"
 	"math/rand/v2"
 	"slices"
 	"time"
-
-	"github.com/Azure/unbounded/internal/cachemesh/internal/hashing"
 )
 
 // Config tunes the Elector. Zero values select defaults.
@@ -216,7 +215,7 @@ func (c Config) Validate() error {
 type Self struct {
 	ID          string
 	Incarnation uint64
-	// Key is hashing.MemberKey(ID, Incarnation).
+	// Key is view.MemberKey(ID, Incarnation).
 	Key uint64
 	// Addr is the control-plane address published when leader.
 	Addr string
@@ -604,7 +603,7 @@ func (e *Elector) Tick(in Input) []Op {
 		}
 
 		p64 := LotteryP64(e.cfg.LotteryBudgetQPS, e.cfg.LotteryRound, n)
-		if !hashing.Below(hashing.Score(e.self.Key, round), p64) {
+		if !view.Below(view.Score(e.self.Key, round), p64) {
 			return nil
 		}
 
@@ -906,8 +905,8 @@ func (e *Elector) onRead(in Input, res Result) {
 	}
 }
 
-// TopCandidates returns the n best keys by hashing.Score(leaseSeed, key),
-// ordered best first with hashing.Better. The caller passes only eligible
+// TopCandidates returns the n best keys by view.Score(leaseSeed, key),
+// ordered best first with view.Better. The caller passes only eligible
 // keys (Active members admitted at least MinCandidateAge ago). keys is not
 // modified; duplicates are kept.
 func TopCandidates(leaseSeed uint64, keys []uint64, n int) []uint64 {
@@ -917,10 +916,10 @@ func TopCandidates(leaseSeed uint64, keys []uint64, n int) []uint64 {
 
 	out := make([]uint64, 0, min(n, len(keys)))
 	for _, k := range keys {
-		s := hashing.Score(leaseSeed, k)
+		s := view.Score(leaseSeed, k)
 
 		i := len(out)
-		for i > 0 && hashing.Better(s, k, hashing.Score(leaseSeed, out[i-1]), out[i-1]) {
+		for i > 0 && view.Better(s, k, view.Score(leaseSeed, out[i-1]), out[i-1]) {
 			i--
 		}
 

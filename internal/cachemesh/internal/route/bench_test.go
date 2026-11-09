@@ -7,7 +7,6 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/Azure/unbounded/internal/cachemesh/internal/hashing"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view/viewtest"
 )
@@ -97,7 +96,7 @@ func BenchmarkRoute(b *testing.B) {
 func BenchmarkFresh(b *testing.B) {
 	v := big(b)
 	st := NewState(v, 1, newEnv(nil, 1))
-	seed := hashing.Seed("ks")
+	seed := view.Seed("ks")
 	s := st.Stamp(seed, 0)
 
 	b.ReportAllocs()

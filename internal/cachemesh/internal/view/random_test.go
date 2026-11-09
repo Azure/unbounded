@@ -10,8 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Azure/unbounded/internal/cachemesh/internal/placement"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/topology"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view/viewtest"
 )
@@ -44,7 +42,7 @@ func (g *gen) newMember(v *view.View) view.Member {
 	case 0:
 		m.State = view.Joining
 	case 1:
-		m.State, m.Weight = view.Active, 1+g.r.Uint32N(placement.MaxWeight)
+		m.State, m.Weight = view.Active, 1+g.r.Uint32N(view.MaxWeight)
 	default:
 		m.State = view.Draining
 	}
@@ -134,7 +132,7 @@ func (g *gen) op(cur *view.View) []view.Op {
 
 		w := uint32(0)
 		if st == view.Active {
-			w = r.Uint32N(placement.MaxWeight + 1)
+			w = r.Uint32N(view.MaxWeight + 1)
 		}
 
 		return []view.Op{view.OpSetState(s, st, w)}
@@ -150,14 +148,14 @@ func (g *gen) op(cur *view.View) []view.Op {
 			sizes[i] = 1 + r.Uint32N(4)
 		}
 
-		sh, err := topology.NewShape(sizes...)
+		sh, err := view.NewShape(sizes...)
 		if err != nil {
 			g.t.Fatal(err)
 		}
 
 		cells := make([]uint32, cur.SlotCap())
 		for s := range cells {
-			cells[s] = topology.NoCell
+			cells[s] = view.NoCell
 			if cur.IsMember(uint32(s)) {
 				cells[s] = r.Uint32N(sh.Cells())
 			}

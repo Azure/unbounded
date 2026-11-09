@@ -8,9 +8,7 @@ import (
 	"testing"
 
 	"github.com/Azure/unbounded/internal/cachemesh/internal/epoch"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/hashing"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/health"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/placement"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view/viewtest"
 )
@@ -119,7 +117,7 @@ func TestRulesHealthy(t *testing.T) {
 				}
 
 				for _, m := range v.CellMembers(want) {
-					if m != d.Next.Slot && hashing.Better(hashing.Score(v.Key(m), uint64(p)), v.Key(m), hashing.Score(d.Next.Key, uint64(p)), d.Next.Key) {
+					if m != d.Next.Slot && view.Better(view.Score(v.Key(m), uint64(p)), v.Key(m), view.Score(d.Next.Key, uint64(p)), d.Next.Key) {
 						t.Fatalf("relay %d is not the best of its cell", d.Next.Slot)
 					}
 				}
@@ -258,7 +256,7 @@ func TestCellMateStandIn(t *testing.T) {
 
 			best := self
 			for _, m := range v.CellMembers(v.Cell(owner)) {
-				if m != owner && hashing.Better(hashing.Score(v.Key(m), uint64(p)), v.Key(m), hashing.Score(v.Key(best), uint64(p)), v.Key(best)) {
+				if m != owner && view.Better(view.Score(v.Key(m), uint64(p)), v.Key(m), view.Score(v.Key(best), uint64(p)), v.Key(best)) {
 					best = m
 				}
 			}
@@ -357,7 +355,7 @@ func removeCells(t testing.TB, v *view.View, heir view.Slot, cells ...uint32) *v
 
 	var parts, owners []uint32
 
-	v.Table().ForEach(func(p uint32, e placement.Entry) {
+	v.Table().ForEach(func(p uint32, e view.Entry) {
 		if gone[e.Owner] {
 			parts = append(parts, p)
 			owners = append(owners, heir)
@@ -474,7 +472,7 @@ func TestHandoffWindow(t *testing.T) {
 
 	var parts, owners []uint32
 
-	nv.Table().ForEach(func(q uint32, e placement.Entry) {
+	nv.Table().ForEach(func(q uint32, e view.Entry) {
 		if e.Owner == old {
 			parts = append(parts, q)
 			owners = append(owners, heir)
@@ -658,7 +656,7 @@ func TestStampFresh(t *testing.T) {
 	v := smallView(t)
 	env := newEnv(nil, 10)
 	st := NewState(v, 1, env)
-	seed := hashing.Seed("ks")
+	seed := view.Seed("ks")
 
 	s := st.Stamp(seed, 0)
 	if !st.Fresh(seed, s) {
@@ -704,11 +702,11 @@ func TestRouteManyAndHedge(t *testing.T) {
 		}
 	}
 
-	if out[0].Header.Partition != hashing.Partition(hashing.KeyHash(42, keys[0]), 12) {
+	if out[0].Header.Partition != view.Partition(view.KeyHash(42, keys[0]), 12) {
 		t.Fatal("partition hash")
 	}
 
-	if st.RouteHash(hashing.KeyHash(42, keys[1])) != out[1] {
+	if st.RouteHash(view.KeyHash(42, keys[1])) != out[1] {
 		t.Fatal("route hash")
 	}
 

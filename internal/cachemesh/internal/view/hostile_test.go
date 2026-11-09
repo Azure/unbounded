@@ -11,8 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Azure/unbounded/internal/cachemesh/internal/placement"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/topology"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view/viewtest"
 )
@@ -41,7 +39,7 @@ func (g *gen) mutate(cur *view.View, op view.Op) view.Op {
 		op.Cell = r.Uint32N(cur.Shape().Cells() + 2)
 	case 2:
 		op.State = view.MemberState(r.IntN(5))
-		op.Weight = r.Uint32N(placement.MaxWeight + 2)
+		op.Weight = r.Uint32N(view.MaxWeight + 2)
 	case 3:
 		// Duplicate ID of an existing member.
 		var m *view.Member
@@ -70,7 +68,7 @@ func (g *gen) mutate(cur *view.View, op view.Op) view.Op {
 		m.State = view.MemberState(r.IntN(4))
 		op = view.OpAddMember(anySlot(), m)
 	default:
-		sh, err := topology.NewShape(1 + r.Uint32N(3))
+		sh, err := view.NewShape(1 + r.Uint32N(3))
 		if err != nil {
 			g.t.Fatal(err)
 		}
@@ -79,7 +77,7 @@ func (g *gen) mutate(cur *view.View, op view.Op) view.Op {
 		for i := range cells {
 			cells[i] = r.Uint32N(sh.Cells() + 1)
 			if r.IntN(3) == 0 {
-				cells[i] = topology.NoCell
+				cells[i] = view.NoCell
 			}
 		}
 

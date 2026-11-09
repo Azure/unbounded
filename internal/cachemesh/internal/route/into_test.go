@@ -9,8 +9,7 @@ import (
 	"strconv"
 	"testing"
 
-	"github.com/Azure/unbounded/internal/cachemesh/internal/hashing"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/topology"
+	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view/viewtest"
 )
 
@@ -42,7 +41,7 @@ func TestInPlaceVariantsMatch(t *testing.T) {
 
 			var dh Decision
 
-			h := hashing.KeyHash(9, key)
+			h := view.KeyHash(9, key)
 			st.RouteHashTo(&dh, h)
 
 			if want := st.RouteHash(h); dh != want || dh != d {
@@ -71,12 +70,12 @@ func TestInPlaceVariantsMatch(t *testing.T) {
 }
 
 // TestDiffMaskMatchesShape checks State.diffMask and the relay cell
-// arithmetic against topology.Shape.
+// arithmetic against view.Shape.
 func TestDiffMaskMatchesShape(t *testing.T) {
 	rng := rand.New(rand.NewPCG(3, 4))
 
 	for _, sizes := range [][]uint32{{7}, {5, 3}, {4, 6, 5}, {2, 3, 2, 5, 3}} {
-		sh, err := topology.NewShape(sizes...)
+		sh, err := view.NewShape(sizes...)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -88,7 +87,7 @@ func TestDiffMaskMatchesShape(t *testing.T) {
 
 			c := rng.Uint32N(sh.Cells())
 
-			var oc [topology.MaxDims]uint32
+			var oc [view.MaxDims]uint32
 
 			if got, want := st.diffMask(&oc, c), sh.DiffMask(self, c); got != want {
 				t.Fatalf("%v: diffMask(%d, %d) = %b, want %b", sizes, self, c, got, want)

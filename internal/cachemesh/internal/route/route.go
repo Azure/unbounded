@@ -27,7 +27,7 @@
 //
 // # Routing
 //
-// A key hashes (hashing.KeyHash with the keyspace seed) to a partition (the
+// A key hashes (view.KeyHash with the keyspace seed) to a partition (the
 // top PartitionBits bits); the partition table names its owner. With self
 // the routing member and its cell cx, owner o in cell co:
 //
@@ -35,7 +35,7 @@
 //   - co == cx or co adjacent to cx (one coordinate differs): the owner is a
 //     neighbor and the hop is final. Backups are o's cell-mates ranked by
 //     usability (Healthy before Degraded, Unusable excluded) and then by
-//     hashing.Score(member.Key, partition) with hashing.Better tie-breaks.
+//     view.Score(member.Key, partition) with view.Better tie-breaks.
 //     If o is Healthy, or Degraded with no Healthy backup, or no backup is
 //     usable at all: KindOwner with Next = o and Alternate = best backup.
 //     Otherwise the best backup takes the request: KindBackup with
@@ -74,7 +74,7 @@
 //
 // A member that is not in its own view (joining, or removed) routes through
 // a gateway: KindGateway to the gateway with the highest
-// hashing.Score(Mix64(KeyHashString(0, addr)), partition), Alternate = the
+// view.Score(Mix64(KeyHashString(0, addr)), partition), Alternate = the
 // runner-up. Without gateways it falls back to KindDirect to the owner when
 // it has a configured view, and to KindNoRoute otherwise.
 //
@@ -95,10 +95,7 @@ import (
 	"time"
 
 	"github.com/Azure/unbounded/internal/cachemesh/internal/epoch"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/hashing"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/health"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/placement"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/topology"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
 )
 
@@ -209,7 +206,7 @@ type Config struct {
 	SelfID          string
 	SelfIncarnation uint64
 	// PartitionBits is used to compute partitions while there is no
-	// configured view. Default placement.DefaultBits.
+	// configured view. Default view.DefaultPartitionBits.
 	PartitionBits uint8
 }
 
@@ -253,13 +250,13 @@ func NewEnv(cfg Config) *Env {
 		e.notes = &Notes{}
 	}
 
-	if !placement.ValidBits(e.bits) {
-		e.bits = placement.DefaultBits
+	if !view.ValidPartitionBits(e.bits) {
+		e.bits = view.DefaultPartitionBits
 	}
 
 	for _, g := range cfg.Gateways {
 		if g.ID != "" {
-			e.gws = append(e.gws, gateway{ref: g, key: hashing.Mix64(hashing.KeyHashString(0, g.Addr))})
+			e.gws = append(e.gws, gateway{ref: g, key: view.Mix64(view.KeyHashString(0, g.Addr))})
 		}
 	}
 
@@ -281,13 +278,13 @@ type State struct {
 	env      *Env
 	h        *health.Tracker
 	e        *epoch.Tracker
-	shape    *topology.Shape
-	table    *placement.Table
+	shape    *view.Shape
+	table    *view.Table
 	self     view.Slot
 	selfCell uint32
 	// selfCoords are the coordinates of selfCell, so that decide divides
 	// only the owner's cell.
-	selfCoords [topology.MaxDims]uint32
+	selfCoords [view.MaxDims]uint32
 	member     bool
 	bits       uint8
 	ttl        uint8
@@ -315,7 +312,7 @@ func NewState(v *view.View, self view.Slot, env *Env) *State {
 		e:        env.epoch,
 		shape:    v.Shape(),
 		self:     self,
-		selfCell: topology.NoCell,
+		selfCell: view.NoCell,
 		bits:     env.bits,
 		term:     uint32(v.Term()),
 		seq:      v.Version().Seq,
@@ -340,7 +337,7 @@ func NewState(v *view.View, self view.Slot, env *Env) *State {
 	case s.table != nil:
 		s.ttl = s.shape.Dims + 3
 	default:
-		s.ttl = topology.MaxDims + 3
+		s.ttl = view.MaxDims + 3
 	}
 
 	if !s.member {
@@ -367,7 +364,7 @@ func (s *State) PartitionBits() uint8 { return s.bits }
 
 // Partition returns the partition of key in keyspace seed.
 func (s *State) Partition(seed uint64, key []byte) uint32 {
-	return hashing.Partition(hashing.KeyHash(seed, key), s.bits)
+	return view.Partition(view.KeyHash(seed, key), s.bits)
 }
 
 // Peer returns the PeerRef of the member at slot.
@@ -448,10 +445,10 @@ func (s *State) Route(seed uint64, key []byte) (d Decision) {
 // Decision. Filling the caller's Decision in place avoids copying a
 // freshly written Decision, which defeats store-to-load forwarding.
 func (s *State) RouteTo(d *Decision, seed uint64, key []byte) {
-	s.decide(d, hashing.Partition(hashing.KeyHash(seed, key), s.bits), view.NoSlot, 0)
+	s.decide(d, view.Partition(view.KeyHash(seed, key), s.bits), view.NoSlot, 0)
 }
 
-// RouteHash routes a key whose hashing.KeyHash is h.
+// RouteHash routes a key whose view.KeyHash is h.
 func (s *State) RouteHash(h uint64) (d Decision) {
 	s.RouteHashTo(&d, h)
 
@@ -461,7 +458,7 @@ func (s *State) RouteHash(h uint64) (d Decision) {
 // RouteHashTo is RouteHash writing the decision into *d, which must be the
 // zero Decision (see RouteTo).
 func (s *State) RouteHashTo(d *Decision, h uint64) {
-	s.decide(d, hashing.Partition(h, s.bits), view.NoSlot, 0)
+	s.decide(d, view.Partition(h, s.bits), view.NoSlot, 0)
 }
 
 // RoutePartition routes partition p. A p outside the table gives
@@ -484,7 +481,7 @@ func (s *State) RouteMany(seed uint64, keys [][]byte, out []Decision) {
 	out = out[:len(keys)]
 	for i, k := range keys {
 		out[i] = Decision{}
-		s.decide(&out[i], hashing.Partition(hashing.KeyHash(seed, k), s.bits), view.NoSlot, 0)
+		s.decide(&out[i], view.Partition(view.KeyHash(seed, k), s.bits), view.NoSlot, 0)
 	}
 }
 
@@ -546,7 +543,7 @@ func (a *cand) better(b *cand) bool {
 		return a.class > b.class
 	}
 
-	return hashing.Better(a.score, a.key, b.score, b.key)
+	return view.Better(a.score, a.key, b.score, b.key)
 }
 
 // top3 keeps the three best candidates.
@@ -586,7 +583,7 @@ func (s *State) best2(cell uint32, pm uint64, avoid view.Slot, ignore bool) (can
 		}
 
 		k := s.v.Key(m)
-		c := cand{slot: m, score: hashing.Mix64(k ^ pm), key: k, class: u}
+		c := cand{slot: m, score: view.Mix64(k ^ pm), key: k, class: u}
 
 		switch {
 		case c.better(&a):
@@ -636,7 +633,7 @@ func (s *State) decide(d *Decision, p uint32, avoid view.Slot, inFlags uint8) {
 		return
 	}
 
-	var oc [topology.MaxDims]uint32
+	var oc [view.MaxDims]uint32
 
 	mask := s.diffMask(&oc, om.Cell)
 	if mask&(mask-1) == 0 {
@@ -652,7 +649,7 @@ func (s *State) decide(d *Decision, p uint32, avoid view.Slot, inFlags uint8) {
 
 // diffMask writes the coordinates of cell into oc and returns the mask of
 // dimensions where they differ from selfCoords, as Shape.DiffMask.
-func (s *State) diffMask(oc *[topology.MaxDims]uint32, cell uint32) uint8 {
+func (s *State) diffMask(oc *[view.MaxDims]uint32, cell uint32) uint8 {
 	var m uint8
 
 	for i, x := range s.shape.Coords(oc, cell) {
@@ -673,7 +670,7 @@ func (s *State) prev(d *Decision, p uint32) {
 	// whose epoch tracker lags the leader's that stamped Moved (it applied
 	// the move before re-anchoring); without it such a member would drop
 	// PrevOwner for the freshest moves.
-	if ent.Prev == ent.Owner || ent.Prev == placement.NoMember ||
+	if ent.Prev == ent.Owner || ent.Prev == view.NoMember ||
 		uint32(s.e.Current())-ent.Moved+s.handoff >= 2*s.handoff {
 		return
 	}
@@ -690,7 +687,7 @@ func (s *State) final(d *Decision, p uint32, owner view.Slot, oc uint32, avoid v
 		ou = s.h.Usable(owner)
 	}
 
-	pm := hashing.Mix64(uint64(p))
+	pm := view.Mix64(uint64(p))
 
 	var t top3
 
@@ -705,7 +702,7 @@ func (s *State) final(d *Decision, p uint32, owner view.Slot, oc uint32, avoid v
 		}
 
 		k := s.v.Key(m)
-		t.add(cand{slot: m, score: hashing.Mix64(k ^ pm), key: k, class: u})
+		t.add(cand{slot: m, score: view.Mix64(k ^ pm), key: k, class: u})
 	}
 
 	// Backups other than self, best first.
@@ -757,8 +754,8 @@ func (s *State) final(d *Decision, p uint32, owner view.Slot, oc uint32, avoid v
 }
 
 // relay handles an owner more than one dimension away.
-func (s *State) relay(d *Decision, p uint32, owner view.Slot, oc *[topology.MaxDims]uint32, mask uint8, avoid view.Slot) {
-	pm := hashing.Mix64(uint64(p))
+func (s *State) relay(d *Decision, p uint32, owner view.Slot, oc *[view.MaxDims]uint32, mask uint8, avoid view.Slot) {
+	pm := view.Mix64(uint64(p))
 
 	for pass := range 2 {
 		// AllHealthy covers Panic: every peer is Healthy either way.
@@ -767,7 +764,7 @@ func (s *State) relay(d *Decision, p uint32, owner view.Slot, oc *[topology.MaxD
 		var first, alt cand
 
 		for m := mask; m != 0; m &= m - 1 {
-			dim := topology.FirstDiff(m)
+			dim := view.FirstDiff(m)
 			c := s.selfCell + (oc[dim]-s.selfCoords[dim])*s.shape.Stride(dim)
 			a, b := s.best2(c, pm, avoid, ignore)
 
@@ -836,13 +833,13 @@ func (s *State) gateway(d *Decision, p uint32) {
 
 	for i := range s.env.gws {
 		g := &s.env.gws[i]
-		sc := hashing.Score(g.key, uint64(p))
+		sc := view.Score(g.key, uint64(p))
 
 		switch {
-		case b0 < 0 || hashing.Better(sc, g.key, s0, s.env.gws[b0].key):
+		case b0 < 0 || view.Better(sc, g.key, s0, s.env.gws[b0].key):
 			b1, s1 = b0, s0
 			b0, s0 = i, sc
-		case b1 < 0 || hashing.Better(sc, g.key, s1, s.env.gws[b1].key):
+		case b1 < 0 || view.Better(sc, g.key, s1, s.env.gws[b1].key):
 			b1, s1 = i, sc
 		}
 	}
