@@ -144,7 +144,8 @@ type store struct {
 // diskFullBackoff is how long new fills skip the disk after ENOSPC.
 const diskFullBackoff = 10 * time.Second
 
-// defaultLingerTTL bounds how long an unused chunk stays in memory.
+// defaultLingerTTL bounds how long an unused chunk or hot page stays in
+// memory.
 const defaultLingerTTL = 30 * time.Second
 
 func newStore(cfg storeConfig) *store {
@@ -553,6 +554,7 @@ func (s *store) expireLoop() {
 			return
 		case now := <-t.C:
 			s.expire(now)
+			s.pages.expire(now.Add(-s.cfg.lingerTTL))
 		}
 	}
 }

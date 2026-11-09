@@ -458,6 +458,22 @@ func TestHotTierAdmitsRepeatedPagesAndEvictsLRU(t *testing.T) {
 		t.Fatalf("hot pages read from disk again: %d reads", got)
 	}
 
+	// Hot pages unused for the linger TTL are dropped.
+	s.pages.expire(time.Now().Add(-time.Hour))
+
+	if st := s.stats(); st.HotBytes != 2*testPage {
+		t.Fatalf("recent hot pages expired: %+v", st)
+	}
+
+	s.pages.expire(time.Now().Add(time.Hour))
+
+	if st := s.stats(); st.HotBytes != 0 || st.PageBytes != 0 {
+		t.Fatalf("idle hot pages kept: %+v", st)
+	}
+
+	readFrom(s, 0)
+	readFrom(s, 0)
+
 	// Evicting the chunk drops its hot pages.
 	s.evictDigest("sha256:x")
 

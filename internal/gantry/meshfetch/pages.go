@@ -6,6 +6,7 @@ package meshfetch
 import (
 	"sync"
 	"sync/atomic"
+	"time"
 	"unsafe"
 )
 
@@ -135,6 +136,7 @@ type diskPage struct {
 	shared     bool
 	hot        bool
 	dead       bool
+	lastUse    time.Time
 	prev, next *diskPage
 }
 
@@ -187,6 +189,7 @@ func (c *pageCache) get(f *fill, file *chunkFile, idx, n int) (*diskPage, error)
 		e.shared = true
 
 		if e.hot {
+			e.lastUse = time.Now()
 			c.unlink(e)
 			c.pushFront(e)
 		}
@@ -244,6 +247,7 @@ func (c *pageCache) put(e *diskPage) {
 
 	if !e.dead && e.err == nil && e.shared && int64(len(e.p.buf)) <= c.budget {
 		e.hot = true
+		e.lastUse = time.Now()
 		c.used += int64(len(e.p.buf))
 		c.pushFront(e)
 		c.trim()
@@ -271,6 +275,26 @@ func (c *pageCache) remember(k pageKey) {
 	c.ghostRing[c.ghostNext] = k
 	c.ghost[k] = struct{}{}
 	c.ghostNext = (c.ghostNext + 1) % len(c.ghostRing)
+}
+
+// expire drops idle hot pages last used before cutoff, so an idle agent
+// returns the hot tier's memory.
+func (c *pageCache) expire(cutoff time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for v := c.head.prev; v != &c.head; {
+		prev := v.prev
+		if !v.lastUse.Before(cutoff) {
+			return
+		}
+
+		if v.readers == 0 {
+			c.drop(v)
+		}
+
+		v = prev
+	}
 }
 
 // trim evicts idle hot pages until the tier fits its budget.
