@@ -612,6 +612,8 @@ func runAgent(args []string) error {
 
 		adapter := newLayerPrefetcher(realResolver, cstore, streamingReconciler, indexPrefetch, logger, layerProgress.observeManifest)
 
+		adapter = layerPrefetcherForMesh(adapter, meshAgent != nil)
+
 		layerPrefetcher = adapter
 		if streamingReconciler != nil {
 			pumpedManifestAdapter.Store(adapter)
@@ -625,10 +627,7 @@ func runAgent(args []string) error {
 		logger.Info("Lease-chair cold-start orchestrator disabled (no Kubernetes namespace configured)")
 	}
 
-	if layerPrefetcher == nil || meshAgent != nil {
-		// With cachemesh, layers move through the mesh; chair-seeded
-		// prefetch would add origin pulls of its own. Keep only the
-		// layer-progress tracking.
+	if layerPrefetcher == nil {
 		layerPrefetcher = newLayerPrefetcher(nil, cstore, nil, indexPrefetch, logger, layerProgress.observeManifest)
 	}
 
@@ -1662,6 +1661,24 @@ func newLayerPrefetcher(
 		logger:              logger.With(slog.String("subsystem", "prefetch")),
 		onManifest:          onManifest,
 	}
+}
+
+// layerPrefetcherForMesh adapts a chair-wired prefetcher for cachemesh.
+// With cachemesh, layers move through the mesh, so ordinary chair-seeded
+// prefetch would add origin pulls of its own and is dropped by clearing the
+// resolver. The Artifact Streaming reconciler is kept: its mount-critical
+// index prefetch is required for streaming mounts to work. Trade-off: its
+// whole-layer reconciliation may still pull streaming layers via chairs or
+// origin instead of the mesh.
+func layerPrefetcherForMesh(p *layerPrefetchAdapter, meshEnabled bool) *layerPrefetchAdapter {
+	if p == nil || !meshEnabled {
+		return p
+	}
+
+	out := *p
+	out.resolver = nil
+
+	return &out
 }
 
 // openManifest reads the manifest body from the shared content store. Under

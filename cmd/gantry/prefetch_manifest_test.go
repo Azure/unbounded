@@ -245,3 +245,33 @@ func TestLayerPrefetchAdapterDoesNotWarmIndexesForRegularManifest(t *testing.T) 
 		t.Fatal("regular manifest did not retain legacy chair prefetch")
 	}
 }
+
+func TestLayerPrefetcherForMeshKeepsStreamingReconciler(t *testing.T) {
+	t.Parallel()
+
+	rec := &streamingLayerReconciler{}
+	idx := &indexPrefetcher{}
+	resolver := &manifestPrefetchResolverStub{}
+	in := newLayerPrefetcher(resolver, nil, rec, idx, slog.Default(), nil)
+
+	got := layerPrefetcherForMesh(in, true)
+	if got.resolver != nil {
+		t.Fatal("resolver retained with cachemesh enabled")
+	}
+
+	if got.streamingReconciler != rec || got.indexes != idx {
+		t.Fatal("streaming reconciler or index prefetcher dropped with cachemesh enabled")
+	}
+
+	if in.resolver == nil {
+		t.Fatal("input adapter mutated")
+	}
+
+	if layerPrefetcherForMesh(in, false) != in {
+		t.Fatal("adapter changed with cachemesh disabled")
+	}
+
+	if layerPrefetcherForMesh(nil, true) != nil {
+		t.Fatal("nil adapter not passed through")
+	}
+}
