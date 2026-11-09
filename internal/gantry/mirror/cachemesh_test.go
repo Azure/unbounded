@@ -321,6 +321,13 @@ func TestMirrorBlobFetcherSniffsUntypedBody(t *testing.T) {
 	pad := strings.Repeat(" ", 600)
 	manifestBody := []byte(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{},"layers":[]}`)
 	indexBody := []byte(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}` + pad)
+	// Annotations push the top-level mediaType and manifests fields well past
+	// any short sniff prefix; a truncated read would see only schemaVersion 2
+	// and fall back to the single-manifest type.
+	lateIndexBody := []byte(`{"schemaVersion":2,"annotations":{"pad":"` + strings.Repeat("a", 8192) +
+		`"},"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}`)
+	lateShapeIndexBody := []byte(`{"schemaVersion":2,"annotations":{"pad":"` + strings.Repeat("a", 8192) +
+		`"},"manifests":[]}`)
 	layerBody := []byte(strings.Repeat("L", 4096))
 	shortLayer := []byte("tiny")
 
@@ -332,6 +339,8 @@ func TestMirrorBlobFetcherSniffsUntypedBody(t *testing.T) {
 	}{
 		{"manifest via blobs", "blobs", manifestBody, "application/vnd.oci.image.manifest.v1+json"},
 		{"index via manifests", "manifests", indexBody, "application/vnd.oci.image.index.v1+json"},
+		{"index with late mediaType", "manifests", lateIndexBody, "application/vnd.oci.image.index.v1+json"},
+		{"index with late manifests field", "manifests", lateShapeIndexBody, "application/vnd.oci.image.index.v1+json"},
 		{"layer", "blobs", layerBody, "application/octet-stream"},
 		{"short layer", "blobs", shortLayer, "application/octet-stream"},
 	}

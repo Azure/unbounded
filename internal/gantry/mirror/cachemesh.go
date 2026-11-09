@@ -4,6 +4,7 @@
 package mirror
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -197,13 +198,14 @@ func (s *Server) serveTag(w http.ResponseWriter, r *http.Request, upstream, repo
 	return true
 }
 
-// sniffMax is how much of the body is buffered to detect a media type,
-// matching the peek size of the other mirror paths.
-const sniffMax = 512
-
 // sniffWriter passes writes through unless headers have been deferred, in
-// which case it buffers up to sniffMax bytes, then writes the headers from
-// that prefix and flushes.
+// which case it buffers the body until it can be classified, then writes the
+// headers from that prefix and flushes. A body whose first non-whitespace
+// byte is not '{' cannot be a manifest and is released at once, so layers
+// keep streaming. A JSON object is buffered up to the detector's own limit
+// (or the end of the stream): an index may carry large annotations before
+// its top-level mediaType or manifests field, and a shorter prefix would be
+// misclassified as a single manifest.
 type sniffWriter struct {
 	w       io.Writer
 	headers func(prefix []byte)
@@ -219,13 +221,13 @@ func (s *sniffWriter) Write(p []byte) (int, error) {
 		return s.w.Write(p)
 	}
 
-	if len(s.buf)+len(p) < sniffMax {
-		s.buf = append(s.buf, p...)
+	s.buf = append(s.buf, p...)
 
+	trimmed := bytes.TrimLeft(s.buf, " \t\r\n")
+	if len(trimmed) == 0 || (trimmed[0] == '{' && int64(len(s.buf)) < manifest.MaxContentTypeDetectionBytes) {
 		return len(p), nil
 	}
 
-	s.buf = append(s.buf, p...)
 	if err := s.flush(); err != nil {
 		return 0, err
 	}
@@ -242,7 +244,7 @@ func (s *sniffWriter) flush() error {
 
 	headers := s.headers
 	s.headers = nil
-	headers(s.buf[:min(len(s.buf), sniffMax)])
+	headers(s.buf[:min(int64(len(s.buf)), manifest.MaxContentTypeDetectionBytes)])
 
 	buf := s.buf
 	s.buf = nil

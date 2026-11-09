@@ -30,9 +30,11 @@ const (
 	dockerManifestMediaType     = "application/vnd.docker.distribution.manifest.v2+json"
 )
 
-// Keep detection within the repository's 4 MiB manifest parsing bound so a
-// blob requested through a /manifests/ URL cannot force an unbounded scan.
-const maxContentTypeDetectionBytes int64 = 4 * 1024 * 1024
+// MaxContentTypeDetectionBytes keeps detection within the repository's 4 MiB
+// manifest parsing bound so a blob requested through a /manifests/ URL cannot
+// force an unbounded scan. Callers that buffer a prefix for DetectContentType
+// should buffer up to this many bytes so late top-level fields are seen.
+const MaxContentTypeDetectionBytes int64 = 4 * 1024 * 1024
 
 // schema is the subset of the OCI / Docker schema-2 manifest layout
 // the prefetch path needs.
@@ -92,7 +94,7 @@ func DetectContentType(prefix []byte) string {
 // JSON stream. It does not match nested extension fields or annotation values,
 // and it stops as soon as the top-level mediaType or object shape is known.
 func DetectContentTypeFromReader(body io.Reader) string {
-	decoder := json.NewDecoder(io.LimitReader(body, maxContentTypeDetectionBytes))
+	decoder := json.NewDecoder(io.LimitReader(body, MaxContentTypeDetectionBytes))
 
 	token, err := decoder.Token()
 	if err != nil || token != json.Delim('{') {
