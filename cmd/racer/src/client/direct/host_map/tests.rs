@@ -48,6 +48,17 @@ fn maps_only_shrink_sealed_read_write_memfds_that_cover_the_window() {
 }
 
 #[test]
+fn only_files_on_the_memfd_mount_count_as_memfds() {
+    let file = memfd(4096, libc::F_SEAL_SHRINK);
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    assert_eq!(unsafe { libc::fstat(file.as_raw_fd(), &mut stat) }, 0);
+    assert!(is_memfd(&stat));
+    // Another tmpfs mount, such as /dev/shm, has another device.
+    stat.st_dev = stat.st_dev.wrapping_add(1);
+    assert!(!is_memfd(&stat));
+}
+
+#[test]
 fn does_not_map_files_outside_tmpfs() {
     // The crate directory is on a disk filesystem, never tmpfs.
     let file = std::fs::File::open(env!("CARGO_MANIFEST_DIR").to_string() + "/Cargo.toml").unwrap();

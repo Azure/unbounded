@@ -16,8 +16,8 @@
 //! already defines as "the file may hold partial data".
 //!
 //! Mapping a client file is only safe when the client cannot make the
-//! dataplane fault: [`HostMapping::new`] accepts only a tmpfs file (a memfd)
-//! that carries `F_SEAL_SHRINK`, is at least as long as the window, and is
+//! dataplane fault: [`HostMapping::new`] accepts only a memfd (a file on the
+//! kernel's internal shmem mount) that carries `F_SEAL_SHRINK`, is at least as long as the window, and is
 //! open for reading and writing. Anything else keeps positioned writes.
 //!
 //! The authentication result covers the bytes the crypto worker read back
@@ -63,7 +63,9 @@ const REAPER_PERIOD: Duration = Duration::from_secs(1);
 
 /// One `MAP_SHARED` mapping of a whole client file, from offset 0. Unmapped
 /// on drop. The mapping holds a reference to the file, so its inode cannot be
-/// freed or reused while mapped.
+/// freed while mapped. Its inode number is not reused either: memfds share the
+/// internal shmem mount, whose inode numbers come from a 64-bit counter that
+/// does not wrap (Linux 5.9 and later), unlike a user tmpfs mount's.
 pub(crate) struct Region {
     base: NonNull<u8>,
 
@@ -167,7 +169,8 @@ impl Drop for Region {
     }
 }
 
-/// Identity of a client file: `st_dev` and `st_ino`.
+/// Identity of a client memfd: `st_dev` and `st_ino`, unique among live
+/// memfds (see [`Region`]).
 type FileKey = (u64, u64);
 
 struct Entry {
@@ -392,6 +395,33 @@ fn release(region: Arc<Region>) {
 /// a request that is dropped while a decrypt is still running. The region
 /// under it is shared with other requests for the same file through
 /// [`MappingCache`].
+/// Whether `stat` describes a file on the kernel's internal shmem mount, which
+/// holds every memfd. Files on a user tmpfs mount have another `st_dev`; their
+/// inode numbers can wrap, so they could alias a cached mapping's key.
+fn is_memfd(stat: &libc::stat) -> bool {
+    static DEV: OnceLock<Option<u64>> = OnceLock::new();
+    let dev = DEV.get_or_init(|| {
+        // SAFETY: memfd_create takes a NUL-terminated name; the descriptor is
+        // owned by the File, which closes it.
+        let fd = unsafe { libc::memfd_create(c"racer-memfd-dev".as_ptr(), libc::MFD_CLOEXEC) };
+        if fd < 0 {
+            return None;
+        }
+        // SAFETY: fd is a fresh descriptor owned by nothing else.
+        let probe = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: fstat writes only into the zeroed buffer.
+        if unsafe { libc::fstat(probe.as_raw_fd(), &mut stat) } != 0 {
+            return None;
+        }
+        #[allow(clippy::unnecessary_cast)]
+        Some(stat.st_dev as u64)
+    });
+    #[allow(clippy::unnecessary_cast)]
+    let presented = stat.st_dev as u64;
+    *dev == Some(presented)
+}
+
 pub(crate) struct HostMapping {
     /// Some until drop.
     region: Option<Arc<Region>>,
@@ -401,7 +431,7 @@ pub(crate) struct HostMapping {
 }
 
 impl HostMapping {
-    /// Map `window` of `file` when it is safe to: a tmpfs file sealed against
+    /// Map `window` of `file` when it is safe to: a memfd sealed against
     /// shrinking, not sealed against writes, open read-write, and at least
     /// `window.end()` bytes long. None means use positioned writes instead.
     /// Reuses a cached mapping of the same file when one covers the window.
@@ -440,6 +470,9 @@ impl HostMapping {
         if unsafe { libc::fstat(fd, &mut stat) } != 0
             || stat.st_mode & libc::S_IFMT != libc::S_IFREG
         {
+            return None;
+        }
+        if !is_memfd(&stat) {
             return None;
         }
         let size = u64::try_from(stat.st_size).ok()?;
