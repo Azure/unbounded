@@ -58,7 +58,7 @@ registry_pod() {
 target_nodes() {
   local all
   all="$(k get nodes -l "${TARGET_SELECTOR}" -o jsonpath='{range .items[*]}{.metadata.name}{" "}{range .status.conditions[?(@.type=="Ready")]}{.status}{end}{"\n"}{end}' |
-    awk '$2 == "True" {print $1}' | sort)"
+    awk '$2 == "True" {print $1}' | sort)" || return
 
   if [[ -z "${NODES:-}" ]]; then
     printf '%s\n' "${all}"
@@ -87,9 +87,11 @@ nodes_yaml_list() {
 # build_tool builds the static gantry-cluster-bench helper and prints its path.
 build_tool() {
   local out="${WORK_DIR}/bin/gantry-cluster-bench"
-  mkdir -p "$(dirname "${out}")"
+  mkdir -p "$(dirname "${out}")" || return
+  # errexit is disabled inside command substitution, so propagate a failed
+  # build explicitly instead of printing the path of a stale binary.
   (cd "${REPO_ROOT}" && CGO_ENABLED=0 GOTOOLCHAIN="${GOTOOLCHAIN:-go1.26.10}" \
-    timeout -s TERM 300 go build -trimpath -o "${out}" ./hack/cmd/gantry-cluster-bench) >&2
+    timeout -s TERM 300 go build -trimpath -o "${out}" ./hack/cmd/gantry-cluster-bench) >&2 || return
   printf '%s\n' "${out}"
 }
 
@@ -252,11 +254,11 @@ ds_oneshot() {
   mapfile -t nodes < <(target_nodes)
   ((${#nodes[@]} > 0)) || die "no target nodes"
   out="${WORK_DIR}/${name}-$(date -u +%Y%m%dT%H%M%SZ)"
-  mkdir -p "${out}"
+  mkdir -p "${out}" || return
   log "${name}: ${#nodes[@]} nodes, logs in ${out}"
   ds_delete "${name}"
   k -n "${BENCH_NS}" wait --for=delete pod -l "app=${name}" --timeout=120s >/dev/null 2>&1 || true
-  ds_apply "${name}" "${mode}" "${envy}" "${nodes[@]}"
+  ds_apply "${name}" "${mode}" "${envy}" "${nodes[@]}" || return
   local rc=0
   ds_wait_running "${name}" "${#nodes[@]}" 300 || rc=1
   ds_wait_done "${name}" "${ONESHOT_TIMEOUT:-900}" || rc=1
