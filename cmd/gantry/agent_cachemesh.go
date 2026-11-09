@@ -493,6 +493,10 @@ func (m *cachemeshMetrics) registerGauges(reg *metrics.Registry, a *cachemeshAge
 		Name: "gantry_cachemesh_inflight_borrowed_bytes",
 		Help: "Memory fills borrowed from the in-flight budget for lagging readers.",
 	}, func() float64 { return float64(a.node.Stats().ExtraPageBytes) })
+	reg.NewGaugeFunc(sub, prometheus.GaugeOpts{
+		Name: "gantry_cachemesh_memory_chunks",
+		Help: "Complete chunks peers read that linger in borrowed in-flight pages.",
+	}, func() float64 { return float64(a.node.Stats().MemoryChunks) })
 	reg.NewCounterFunc(sub, prometheus.CounterOpts{
 		Name: "gantry_cachemesh_spills_total",
 		Help: "Chunk fills that spilled to disk because the in-flight budget was exhausted.",

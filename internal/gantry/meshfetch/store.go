@@ -113,6 +113,10 @@ type store struct {
 	m         map[chunkKey]*fill
 	head      fill // LRU sentinel of other chunks: head.next is most recent
 	ownedHead fill // LRU sentinel of owned chunks
+	// memHead lists complete chunks held only in memory, in pages borrowed
+	// from the in-flight budget (lingering relay chunks).
+	memHead   fill
+	memN      int
 	ownedUsed int64
 	used      int64
 	inflight  int
@@ -176,6 +180,8 @@ func newStore(cfg storeConfig) *store {
 	s.head.prev = &s.head
 	s.ownedHead.next = &s.ownedHead
 	s.ownedHead.prev = &s.ownedHead
+	s.memHead.next = &s.memHead
+	s.memHead.prev = &s.memHead
 
 	if cfg.dir != "" && cfg.diskBudget > 0 {
 		d, err := openDiskDir(cfg.dir, cfg.pageCache)
@@ -434,7 +440,10 @@ func (s *store) detachLocked(f *fill) {
 	if f.listed {
 		s.unlink(f)
 
-		if f.owned {
+		switch {
+		case f.inMemory:
+			s.memN--
+		case f.owned:
 			s.ownedUsed -= f.charge
 		}
 	}
@@ -477,6 +486,9 @@ func (s *store) finished(f *fill, err error) {
 	f.mu.Lock()
 	onDisk := f.file != nil && !f.diskFailed && f.diskStart == 0
 	size := f.diskSize
+	// A fill peers read that still holds every page in memory lingers
+	// for later peers until the in-flight budget needs its pages.
+	inMemory := !onDisk && f.hadPeers && f.winStart == 0 && f.metaKnown && f.n == f.chunkLen
 	f.mu.Unlock()
 
 	s.mu.Lock()
@@ -485,9 +497,14 @@ func (s *store) finished(f *fill, err error) {
 	s.inflight--
 
 	if f.inMap {
-		if err != nil || !onDisk {
+		switch {
+		case err == nil && inMemory:
+			f.inMemory = true
+			s.memN++
+			s.pushFront(f)
+		case err != nil || !onDisk:
 			s.detachLocked(f)
-		} else {
+		default:
 			// Charge the real size: short final chunks and small
 			// manifests do not hold a full chunk.
 			if size < f.charge {
@@ -505,6 +522,23 @@ func (s *store) finished(f *fill, err error) {
 	}
 
 	s.signalSpace()
+}
+
+// evictLingering drops the least recently used chunk held only in memory,
+// so its pages return to the in-flight budget once its readers are done.
+// It reports whether there was one.
+func (s *store) evictLingering() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	victim := s.memHead.prev
+	if victim == &s.memHead {
+		return false
+	}
+
+	s.detachLocked(victim)
+
+	return true
 }
 
 // diskFailed records a failed disk operation. A full disk pauses disk
@@ -539,7 +573,11 @@ func (s *store) evictDigest(d string) {
 // pushFront makes f the most recent chunk of its list.
 func (s *store) pushFront(f *fill) {
 	h := &s.head
-	if f.owned {
+
+	switch {
+	case f.inMemory:
+		h = &s.memHead
+	case f.owned:
 		h = &s.ownedHead
 	}
 
@@ -599,11 +637,13 @@ type Stats struct {
 	// Spills counts fills that spilled to disk when the in-flight budget
 	// was exhausted.
 	Spills int64
+	// MemoryChunks is the number of complete chunks held only in memory.
+	MemoryChunks int
 }
 
 func (s *store) stats() Stats {
 	s.mu.Lock()
-	st := Stats{DiskBytes: s.used, Chunks: len(s.m), Inflight: s.inflight}
+	st := Stats{DiskBytes: s.used, Chunks: len(s.m), Inflight: s.inflight, MemoryChunks: s.memN}
 	s.mu.Unlock()
 
 	live, idle := s.pool.stats()

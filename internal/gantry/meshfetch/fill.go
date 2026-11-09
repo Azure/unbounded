@@ -63,8 +63,10 @@ type fill struct {
 	win      []*page
 	winStart int
 	// readers are the open readers and their positions.
-	readers       map[*reader]struct{}
-	peers         int
+	readers map[*reader]struct{}
+	peers   int
+	// hadPeers is set once a peer has read the fill.
+	hadPeers      bool
 	fillerWaiting bool
 	// extra counts window pages beyond the base window, charged to the
 	// store's in-flight budget.
@@ -90,6 +92,9 @@ type fill struct {
 	inMap      bool
 	listed     bool
 	charge     int64
+	// inMemory marks a complete chunk held only in memory, on the
+	// store's memory list.
+	inMemory bool
 	// owned marks a chunk this member filled as its owner. Owned chunks
 	// sit on their own LRU list and are evicted after the others, so an
 	// owner keeps serving them while transit copies churn.
@@ -163,6 +168,7 @@ func (f *fill) newReaderLocked(off int, peer bool) *reader {
 
 	if peer {
 		f.peers++
+		f.hadPeers = true
 	}
 
 	return r
@@ -501,13 +507,26 @@ func (f *fill) slot(ctx context.Context, n int, touch func()) (*page, error) {
 
 		oldEnd := (f.winStart + 1) * ps
 		if f.persisting() && f.durable >= oldEnd || !f.persisting() && f.minReaderLocked() >= oldEnd {
+			// A stream fill that peers read keeps its whole chunk in
+			// borrowed pages while the budget allows, so later peers can
+			// still join it (see store.finished).
+			if f.keepWholeLocked() {
+				if s.borrowExtra() || f.reclaimLocked() {
+					f.extra++
+					p := s.pool.get()
+					f.win = append(f.win, p)
+
+					return p, nil
+				}
+			}
+
 			f.dropOldestLocked()
 
 			continue
 		}
 
 		if f.persisting() || f.peers > 0 {
-			if s.borrowExtra() {
+			if s.borrowExtra() || f.reclaimLocked() {
 				f.extra++
 				p := s.pool.get()
 				f.win = append(f.win, p)
@@ -561,6 +580,32 @@ func (f *fill) slot(ctx context.Context, n int, touch func()) (*page, error) {
 		f.mu.Lock()
 		f.fillerWaiting = false
 	}
+}
+
+// keepWholeLocked reports whether f should keep every page in memory: a
+// stream fill that peers read and that still holds its first page. Caller
+// holds f.mu.
+func (f *fill) keepWholeLocked() bool {
+	return !f.persisting() && f.hadPeers && f.winStart == 0 && f.store.cfg.extraBudget > 0
+}
+
+// reclaimLocked evicts one lingering in-memory chunk and borrows a page
+// from the budget it returns. It drops f.mu while it takes the store lock.
+// Caller holds f.mu.
+func (f *fill) reclaimLocked() bool {
+	s := f.store
+
+	f.mu.Unlock()
+
+	ok := false
+
+	for !ok && s.evictLingering() {
+		ok = s.borrowExtra()
+	}
+
+	f.mu.Lock()
+
+	return ok
 }
 
 // dropOldestLocked frees the oldest window page and returns a borrowed

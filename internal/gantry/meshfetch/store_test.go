@@ -1091,8 +1091,75 @@ func TestFillBorrowsInflightPagesForPeers(t *testing.T) {
 		rd.close()
 	}
 
-	if st := s.stats(); st.ExtraPageBytes != 0 || st.PageBytes != 0 {
+	// The whole chunk is still in memory, so it lingers for later peers
+	// until its pages are needed.
+	if st := s.stats(); st.MemoryChunks != 1 {
+		t.Fatalf("chunk does not linger: %+v", st)
+	}
+
+	s.evictDigest("sha256:x")
+
+	if st := s.stats(); st.ExtraPageBytes != 0 || st.PageBytes != 0 || st.MemoryChunks != 0 {
 		t.Fatalf("pages not returned: %+v", st)
+	}
+}
+
+// A stream fill that peers read keeps its whole chunk in borrowed pages;
+// a later peer reads it from memory, and a fill that needs the budget
+// reclaims it.
+func TestPeerReadChunkLingersInMemory(t *testing.T) {
+	s := newTestStore(t, func(c *storeConfig) {
+		c.dir = ""
+		c.extraBudget = 2 * testPage
+	})
+
+	fillWithPeer := func(k chunkKey, data []byte) {
+		t.Helper()
+
+		r, _, err := s.acquire(context.Background(), k, 0, false, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		f := r.f
+		_ = f.setMeta(int64(len(data)), "", len(data))
+
+		go func() {
+			_ = f.readFrom(context.Background(), bytes.NewReader(data), nil)
+			f.finish(nil)
+			f.release()
+		}()
+
+		if got := readAll(t, r); !bytes.Equal(got, data) {
+			t.Fatal("data mismatch")
+		}
+
+		r.close()
+	}
+
+	a := pattern(15, testChunk)
+	fillWithPeer(key(1), a)
+
+	late := s.get(key(1), 0)
+	if late == nil {
+		t.Fatal("peer-read chunk does not linger")
+	}
+
+	if got := readAll(t, late); !bytes.Equal(got, a) {
+		t.Fatal("lingering data mismatch")
+	}
+
+	late.close()
+
+	// The next peer-read fill needs the budget: chunk 1 is reclaimed.
+	fillWithPeer(key(2), pattern(16, testChunk))
+
+	if cached(s, key(1)) || !cached(s, key(2)) {
+		t.Fatal("lingering chunk not reclaimed for the next fill")
+	}
+
+	if st := s.stats(); st.ExtraPageBytes > 2*testPage || st.MemoryChunks != 1 {
+		t.Fatalf("stats: %+v", st)
 	}
 }
 
