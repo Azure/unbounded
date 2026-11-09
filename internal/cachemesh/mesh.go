@@ -299,7 +299,7 @@ func (m *Mesh) onNeighbors(added, removed []view.Slot) {
 			continue
 		}
 
-		p := PeerRef{Slot: s, Key: mem.Key, ID: mem.ID, Addr: mem.Addr}
+		p := route.RefOf(s, mem)
 		if old, ok := m.peers[s]; ok {
 			if old == p {
 				continue
@@ -862,7 +862,7 @@ func (m *Mesh) Neighbors() []PeerRef {
 
 	for _, s := range m.n.Neighbors(nil) {
 		if mem, ok := v.Member(s); ok {
-			out = append(out, PeerRef{Slot: s, Key: mem.Key, ID: mem.ID, Addr: mem.Addr})
+			out = append(out, route.RefOf(s, mem))
 		}
 	}
 

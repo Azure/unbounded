@@ -377,7 +377,13 @@ func (s *State) Peer(slot view.Slot) (PeerRef, bool) {
 		return PeerRef{}, false
 	}
 
-	return PeerRef{Slot: slot, Key: m.Key, ID: m.ID, Addr: m.Addr}, true
+	return RefOf(slot, m), true
+}
+
+// RefOf returns the PeerRef of member m at slot. Hot-path code fills an
+// existing PeerRef with fillRef instead; see setRef.
+func RefOf(slot view.Slot, m *view.Member) PeerRef {
+	return PeerRef{Slot: slot, Key: m.Key, ID: m.ID, Addr: m.Addr}
 }
 
 // setRef fills *dst with the member at slot, or leaves it unchanged if
