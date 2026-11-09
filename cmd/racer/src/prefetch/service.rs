@@ -1105,6 +1105,34 @@ async fn handle_inner(
     }
 }
 
+/// Park a status long-poll until `done`, `until`, cancellation, or drain.
+pub(super) async fn wait_until(
+    prefetch: &Prefetch,
+    until: Instant,
+    scope: &RequestScope,
+    done: impl Fn() -> bool,
+) {
+    prefetch.wake_at(until);
+    let cancellation = scope.cancellation.subscribe().ok();
+    let waiter = prefetch.waiter();
+    std::future::poll_fn(|cx| {
+        if let Some(cancellation) = &cancellation {
+            cancellation.register(cx.waker());
+        }
+        waiter.register(cx.waker());
+        if done() || prefetch.now() >= until || scope.check().is_err() || prefetch.draining() {
+            Poll::Ready(())
+        } else {
+            // `wake_at` keeps only the earliest wake, and a tick drops it once
+            // past: re-arm this waiter's deadline on every poll so an earlier
+            // waiter's wake does not consume it.
+            prefetch.wake_at(until);
+            Poll::Pending
+        }
+    })
+    .await;
+}
+
 async fn get(
     local: &Coordinator,
     prefetch: &Prefetch,
@@ -1117,25 +1145,13 @@ async fn get(
     prefetch.with_registry(|r| r.status(cache, id, query.refs, query.cursor.as_deref()))?;
     if let Some(wait) = query.wait.filter(|w| !w.is_zero()) {
         let until = prefetch.now() + wait;
-        prefetch.wake_at(until);
-        let cancellation = scope.cancellation.subscribe().ok();
-        let waiter = prefetch.waiter();
-        std::future::poll_fn(|cx| {
-            if let Some(cancellation) = &cancellation {
-                cancellation.register(cx.waker());
-            }
-            waiter.register(cx.waker());
-            let settled = prefetch
+        wait_until(prefetch, until, scope, || {
+            prefetch
                 .registry
                 .lock()
                 .unwrap()
                 .settled(cache, id)
-                .unwrap_or(true);
-            if settled || prefetch.now() >= until || scope.check().is_err() || prefetch.draining() {
-                Poll::Ready(())
-            } else {
-                Poll::Pending
-            }
+                .unwrap_or(true)
         })
         .await;
     }

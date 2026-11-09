@@ -1224,3 +1224,43 @@ fn rotated_token_reopens_a_unit_whose_only_credential_was_refused() {
     assert!(r.fill_once(UnitOutcome::Admitted).is_none());
     assert_eq!(r.outcome("t").1, Some(RefError::Forbidden));
 }
+
+/// Two status long-polls with different waits each get woken at their own
+/// deadline: the earlier waiter's tick does not consume the later one's wake.
+#[test]
+fn status_waiters_each_keep_their_own_deadline() {
+    use std::future::Future;
+    use std::task::{Context, Poll};
+    let sim = racer_io::SimClock::new(1);
+    let ctx = sim.ctx(1);
+    let prefetch = super::service::Prefetch::new(ctx.clone());
+    let start = ctx.now();
+    let scope = crate::runtime::RequestScope::on(
+        &ctx.clock,
+        crate::model::RequestId([0; 16]),
+        start + Duration::from_secs(600),
+    )
+    .unwrap();
+    let early = start + Duration::from_secs(1);
+    let late = start + Duration::from_secs(5);
+    let mut first = Box::pin(super::service::wait_until(&prefetch, early, &scope, || {
+        false
+    }));
+    let mut second = Box::pin(super::service::wait_until(&prefetch, late, &scope, || {
+        false
+    }));
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    assert!(first.as_mut().poll(&mut cx).is_pending());
+    assert!(second.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(prefetch.next_wake(), Some(early));
+    sim.advance(Duration::from_secs(1));
+    prefetch.tick();
+    // Waiters woken by the tick poll again.
+    assert_eq!(first.as_mut().poll(&mut cx), Poll::Ready(()));
+    assert!(second.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(prefetch.next_wake(), Some(late));
+    sim.advance(Duration::from_secs(4));
+    assert_eq!(prefetch.next_wake(), Some(late));
+    prefetch.tick();
+    assert_eq!(second.as_mut().poll(&mut cx), Poll::Ready(()));
+}
