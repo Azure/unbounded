@@ -22,6 +22,8 @@ def _seal_shrink(fd: int) -> None:
     try:
         fcntl.fcntl(fd, _F_ADD_SEALS, _F_SEAL_SHRINK)
     except OSError:
+        # Older kernels or filesystems may refuse the seal. The dataplane then
+        # falls back to positional writes, so a failed seal is not an error.
         pass
 
 
