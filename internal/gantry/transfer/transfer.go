@@ -68,6 +68,9 @@ type Server struct {
 	// channel means the server is at capacity and further blob GETs are
 	// shed with 429 so the requester re-discovers another provider.
 	serveSem chan struct{}
+	// extraRoutes, when non-nil, registers additional peer-facing routes
+	// that bypass the /v2/ handler and its tracing.
+	extraRoutes func(*http.ServeMux)
 }
 
 // Describer is an optional capability that callers (typically the
@@ -143,6 +146,17 @@ func WithMaxConcurrentServes(n int) Option {
 	}
 }
 
+// WithExtraRoutes registers additional routes on the peer-facing listener,
+// such as the cachemesh control and chunk endpoints. register is called once
+// per Handler call with a fresh mux; its routes are served without the
+// otelhttp wrapper so bulk data paths do not pay per-request span costs. A
+// nil register adds nothing. Routes must not overlap /healthz or /v2/.
+func WithExtraRoutes(register func(*http.ServeMux)) Option {
+	return func(s *Server) {
+		s.extraRoutes = register
+	}
+}
+
 // New builds a Server bound to the given local content store.
 func New(store ifaces.LocalContentStore, opts ...Option) *Server {
 	s := &Server{
@@ -175,13 +189,23 @@ func (s *Server) Handler() http.Handler {
 
 	// /healthz is filtered out of spans for the same reason the mirror filters
 	// it: kubelet probe traffic would dominate the trace and the collector.
-	return otelhttp.NewHandler(
+	traced := otelhttp.NewHandler(
 		mux,
 		"gantry.transfer",
 		otelhttp.WithTracerProvider(tracing.Provider()),
 		otelhttp.WithSpanNameFormatter(transferSpanName),
 		otelhttp.WithFilter(isTransferTraceRequest),
 	)
+
+	if s.extraRoutes == nil {
+		return traced
+	}
+
+	outer := http.NewServeMux()
+	s.extraRoutes(outer)
+	outer.Handle("/", traced)
+
+	return outer
 }
 
 // isTransferTraceRequest reports whether a peer-facing request should produce a
