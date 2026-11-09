@@ -519,7 +519,7 @@ func (r *MachineOperationReconciler) reconcileTerminal(ctx context.Context, op *
 }
 
 func (r *MachineOperationReconciler) markInProgress(ctx context.Context, op *unboundedv1alpha3.MachineOperation, message string) error {
-	message = truncateUTF8Bytes(message, maxConditionMessageBytes)
+	message = TruncateUTF8Bytes(message, MaxConditionMessageBytes)
 
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var latest unboundedv1alpha3.MachineOperation
@@ -583,7 +583,7 @@ func (r *MachineOperationReconciler) finishOperation(
 	observedMachineGeneration int64,
 ) (ctrl.Result, error) {
 	reason = normalizeConditionReason(reason)
-	message = truncateUTF8Bytes(message, maxConditionMessageBytes)
+	message = TruncateUTF8Bytes(message, MaxConditionMessageBytes)
 
 	var updated unboundedv1alpha3.MachineOperation
 

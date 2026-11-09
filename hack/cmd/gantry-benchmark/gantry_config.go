@@ -13,14 +13,13 @@ import (
 	gantryconfig "github.com/Azure/unbounded/internal/gantry/config"
 )
 
-func validateDirectGantryRegistry(raw []byte, registryName string) error {
+func validateDirectGantryRegistry(raw []byte, registryName, expectedEndpoint string) error {
 	config := gantryconfig.NewDefault()
 	if err := config.LoadYAML(bytes.NewReader(raw)); err != nil {
 		return fmt.Errorf("load Gantry config: %w", err)
 	}
 
 	matches := 0
-	wantEndpoint := "https://" + registryName
 
 	for _, registry := range config.UpstreamRegistries {
 		if registry.Name != registryName {
@@ -29,8 +28,8 @@ func validateDirectGantryRegistry(raw []byte, registryName string) error {
 
 		matches++
 
-		if strings.TrimSuffix(registry.Endpoint, "/") != wantEndpoint {
-			return fmt.Errorf("gantry registry %q endpoint is %q, want %q", registryName, registry.Endpoint, wantEndpoint)
+		if strings.TrimSuffix(registry.Endpoint, "/") != expectedEndpoint {
+			return fmt.Errorf("gantry registry %q endpoint is %q, want %q", registryName, registry.Endpoint, expectedEndpoint)
 		}
 	}
 

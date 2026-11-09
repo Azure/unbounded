@@ -13,11 +13,18 @@ LOCATION=""
 SUBSCRIPTION=""
 RESOURCE_GROUP=""
 FLEX_COUNT=3
-VM_SIZE="Standard_D4s_v6"
+WORKER_ARCH="amd64"
+WORKER_IMAGE_SKU="server"
+VM_SIZE=""
 SYSTEM_VM_SIZE="Standard_D4s_v6"
 KUBERNETES_VERSION=""
 UNBOUNDED_VERSION="v0.8.0"
 AGENT_VERSION="v0.2.0"
+PLUGIN_BINARY=""
+PLUGIN_DIGEST=""
+IMAGE_REGISTRY=""
+OPERATOR_IMAGE=""
+ARTIFACT_STREAMING=false
 VNET_CIDR="10.91.0.0/16"
 CLUSTER_POD_CIDR="10.93.0.0/16"
 FLEX_POD_CIDR="10.96.0.0/14"
@@ -54,7 +61,8 @@ instances by default. All worker instances share one managed identity and one
 load-balancer public IP for outbound access and per-instance SSH NAT ports.
 New VMSS instances bootstrap automatically, including after a scale-out.
 Requires az >= 2.90.0, kubectl, jq, python3, curl, tar, openssl, and OpenSSH.
-Flex VM sizes must support x86_64; the host image and agent archive use amd64.
+Flex workers default to amd64; --worker-arch arm64 selects an ARM64 Ubuntu host
+and agent archive. The system node remains amd64 unless its VM size is changed.
 Uses the active Azure account unless --subscription is supplied. The selected
 subscription must support the Flex preview and publish the Flex Node Agent Role.
 Gantry is installed without registry-specific configuration or authentication setup.
@@ -65,11 +73,18 @@ Options:
   --subscription UUID         Azure subscription (default: active account)
   --resource-group NAME       Dedicated resource group (default: NAME)
   --flex-count N              Initial VMSS capacity (default: 3, range: 1-1000)
-  --vm-size SKU               Flex VM size (default: Standard_D4s_v6)
+  --worker-arch ARCH          Flex architecture: amd64 or arm64 (default: amd64)
+  --vm-size SKU               Flex VM size (default: Standard_D4s_v6 for amd64,
+                              Standard_D4ps_v6 for arm64)
   --system-vm-size SKU        AKS system VM size (default: Standard_D4s_v6)
   --kubernetes-version V      Initial AKS version (default: AKS default)
   --unbounded-version TAG     Pinned plugin/operator release (default: v0.8.0)
   --agent-version TAG         Pinned Flex agent release (default: v0.2.0)
+  --plugin-binary PATH        Use this local kubectl-unbounded instead of a release
+  --image-registry PREFIX     Operator/component image prefix, e.g. ghcr.io/myorg
+  --operator-image NAME:TAG   Operator name and tag, without a registry
+  --artifact-streaming       Enable Gantry streaming on Flex workers and preload
+                              NBD before nspawn starts (requires a compatible build)
   --vnet-cidr CIDR            IPv4 VNet, /16 through /20 (default: 10.91.0.0/16)
   --cluster-pod-cidr CIDR     System-site pods (default: 10.93.0.0/16)
   --flex-pod-cidr CIDR        Flex-site pods, /14 or larger (default: 10.96.0.0/14)
@@ -86,8 +101,10 @@ Keep the state directory and use the same provisioning arguments on reruns.
 Changing SSH source IP is supported; topology, keys, sizes, and release changes
 are rejected rather than silently replacing or downgrading existing resources.
 Scale the worker VMSS separately with az vmss scale; reruns retain its current
-capacity. ACR attachment is performed once with a compatible plugin/operator;
-future joined Linux Flex nodes inherit that policy without reattaching ACR.
+capacity. Custom installer/image selections are pinned in the saved intent.
+The compiled operator version must match the component image tags published
+under --image-registry. ACR attachment is performed once with a compatible
+plugin/operator; future Linux Flex nodes inherit that policy without reattaching ACR.
 This is not an upgrade, reset, or teardown tool. It never deletes Azure
 resources or resets an existing node. A partially bootstrapped host that needs a
 reset is reported, not automatically destroyed. See README.md for the quickstart.'
@@ -98,8 +115,9 @@ parse_args() {
     case "$1" in
       --plan) PLAN_ONLY=true; shift ;;
       --yes) ASSUME_YES=true; shift ;;
+      --artifact-streaming) ARTIFACT_STREAMING=true; shift ;;
       -h|--help) usage; exit 0 ;;
-      --name|--location|--subscription|--resource-group|--flex-count|--vm-size|--system-vm-size|--kubernetes-version|--unbounded-version|--agent-version|--vnet-cidr|--cluster-pod-cidr|--flex-pod-cidr|--service-cidr|--ssh-key|--ssh-source-ip|--state-dir|--timeout)
+      --name|--location|--subscription|--resource-group|--flex-count|--worker-arch|--vm-size|--system-vm-size|--kubernetes-version|--unbounded-version|--agent-version|--plugin-binary|--image-registry|--operator-image|--vnet-cidr|--cluster-pod-cidr|--flex-pod-cidr|--service-cidr|--ssh-key|--ssh-source-ip|--state-dir|--timeout)
         [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || die "$1 requires a value"
         case "$1" in
           --name) NAME="$2" ;;
@@ -107,11 +125,15 @@ parse_args() {
           --subscription) SUBSCRIPTION="$2" ;;
           --resource-group) RESOURCE_GROUP="$2" ;;
           --flex-count) FLEX_COUNT="$2" ;;
+          --worker-arch) WORKER_ARCH="$2" ;;
           --vm-size) VM_SIZE="$2" ;;
           --system-vm-size) SYSTEM_VM_SIZE="$2" ;;
           --kubernetes-version) KUBERNETES_VERSION="$2" ;;
           --unbounded-version) UNBOUNDED_VERSION="$2" ;;
           --agent-version) AGENT_VERSION="$2" ;;
+          --plugin-binary) PLUGIN_BINARY="$2" ;;
+          --image-registry) IMAGE_REGISTRY="$2" ;;
+          --operator-image) OPERATOR_IMAGE="$2" ;;
           --vnet-cidr) VNET_CIDR="$2" ;;
           --cluster-pod-cidr) CLUSTER_POD_CIDR="$2" ;;
           --flex-pod-cidr) FLEX_POD_CIDR="$2" ;;
@@ -135,7 +157,18 @@ validate_args() {
   [[ "$FLEX_COUNT" =~ ^[1-9][0-9]{0,3}$ ]] || die "--flex-count must be 1-1000"
   ((FLEX_COUNT <= MAX_FLEX_COUNT)) || die "--flex-count must be 1-1000"
   [[ "$TIMEOUT" =~ ^[1-9][0-9]{0,5}$ ]] || die "--timeout must be a positive integer of at most six digits"
+  case "$WORKER_ARCH" in
+    amd64) VM_SIZE="${VM_SIZE:-Standard_D4s_v6}"; WORKER_IMAGE_SKU="server" ;;
+    arm64) VM_SIZE="${VM_SIZE:-Standard_D4ps_v6}"; WORKER_IMAGE_SKU="server-arm64" ;;
+    *) die "--worker-arch must be amd64 or arm64" ;;
+  esac
   [[ "$VM_SIZE" =~ ^Standard_[a-zA-Z0-9_]+$ && "$SYSTEM_VM_SIZE" =~ ^Standard_[a-zA-Z0-9_]+$ ]] || die "invalid VM size"
+  if [[ -n "$PLUGIN_BINARY" ]]; then
+    [[ -f "$PLUGIN_BINARY" && -r "$PLUGIN_BINARY" && -x "$PLUGIN_BINARY" ]] || die "--plugin-binary must be a readable executable file"
+    PLUGIN_BINARY="$(cd "$(dirname "$PLUGIN_BINARY")" && pwd)/$(basename "$PLUGIN_BINARY")"
+  fi
+  [[ -z "$IMAGE_REGISTRY" || "$IMAGE_REGISTRY" =~ ^[a-z0-9][a-z0-9.-]*(:[0-9]+)?(/[a-z0-9]+([._-][a-z0-9]+)*)*$ ]] || die "--image-registry must be a registry/repository prefix without a scheme or tag"
+  [[ -z "$OPERATOR_IMAGE" || "$OPERATOR_IMAGE" =~ ^[a-z0-9][a-z0-9._-]*:[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$ ]] || die "--operator-image must be NAME:TAG without a registry"
   [[ -z "$KUBERNETES_VERSION" || "$KUBERNETES_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "--kubernetes-version must be a full x.y.z version"
   local tag
   for tag in "$UNBOUNDED_VERSION" "$AGENT_VERSION"; do
@@ -198,8 +231,13 @@ print_plan() {
   printf '  Subscription / region:   %s / %s\n' "${SUBSCRIPTION:-active account}" "$LOCATION"
   printf '  Nodes:                    1 system + %s Flex = %s total\n' "$FLEX_COUNT" "$((FLEX_COUNT + 1))"
   printf '  VM sizes:                 system=%s flex=%s\n' "$SYSTEM_VM_SIZE" "$VM_SIZE"
+  printf '  Flex architecture/image:  %s / Ubuntu 24.04 %s\n' "$WORKER_ARCH" "$WORKER_IMAGE_SKU"
   printf '  Initial Kubernetes:       %s\n' "${KUBERNETES_VERSION:-AKS default}"
   printf '  Operator / Flex agent:    %s / %s\n' "$UNBOUNDED_VERSION" "$AGENT_VERSION"
+  [[ -z "$PLUGIN_BINARY" ]] || printf '  Installer binary:         %s\n' "$PLUGIN_BINARY"
+  [[ -z "$IMAGE_REGISTRY" ]] || printf '  Image registry:           %s\n' "$IMAGE_REGISTRY"
+  [[ -z "$OPERATOR_IMAGE" ]] || printf '  Operator image:           %s\n' "$OPERATOR_IMAGE"
+  [[ "$ARTIFACT_STREAMING" != true ]] || printf '  Gantry streaming:         enabled on Flex workers (NBD preloaded)\n'
   printf '  Node subnets:             %s / %s\n' "$SYSTEM_NODE_CIDR" "$FLEX_NODE_CIDR"
   printf '  Pod CIDRs:                %s / %s\n' "$CLUSTER_POD_CIDR" "$FLEX_POD_CIDR"
   printf '  Services / DNS:           %s / %s\n' "$SERVICE_CIDR" "$DNS_SERVICE_IP"
@@ -247,10 +285,22 @@ preflight() {
   fi
   validate_subscription
   az_cmd account show -o none || die "cannot access the selected subscription"
+  validate_worker_architecture
   if [[ -z "$SSH_SOURCE_IP" ]]; then
     SSH_SOURCE_IP=$(curl -4 -fsS --connect-timeout 10 --max-time 30 https://api.ipify.org) || die "cannot detect public IPv4; pass --ssh-source-ip"
   fi
   validate_ssh_ip
+}
+
+validate_worker_architecture() {
+  local skus architecture="x64"
+  [[ "$WORKER_ARCH" != arm64 ]] || architecture="arm64"
+  skus=$(az_cmd vm list-skus --location "$LOCATION" --resource-type virtualMachines --size "$VM_SIZE" --all -o json) \
+    || die "cannot verify Flex VM architecture"
+  jq -e --arg size "$VM_SIZE" --arg arch "$architecture" \
+    'any(.[]; .name == $size and any(.capabilities[]?;
+      .name == "CpuArchitectureType" and (.value | ascii_downcase) == $arch))' <<<"$skus" >/dev/null \
+    || die "Flex VM size $VM_SIZE does not support --worker-arch $WORKER_ARCH in $LOCATION"
 }
 
 cleanup() {
@@ -272,6 +322,7 @@ prepare_state() {
   mkdir -p "$STATE_DIR"
   STATE_DIR="$(cd "$STATE_DIR" && pwd)"
   chmod 0700 "$STATE_DIR"
+  mkdir -p "$STATE_DIR/cache"
   mkdir "$STATE_DIR/.lock" 2>/dev/null || die "state directory is locked: $STATE_DIR/.lock; check for another run before removing a stale lock"
   LOCK_HELD=true
   trap on_exit EXIT
@@ -292,17 +343,26 @@ prepare_state() {
     BOOTSTRAP_TIMEOUT=$(jq -r '.bootstrapTimeout // empty' "$STATE_DIR/intent.json")
     [[ "$BOOTSTRAP_TIMEOUT" =~ ^[1-9][0-9]{0,5}$ ]] || die "saved intent is not a VMSS deployment; this script does not migrate standalone VMs"
   fi
+  [[ -z "$PLUGIN_BINARY" ]] || PLUGIN_DIGEST=$(sha256 "$PLUGIN_BINARY")
+  # Preserve default intent bytes so existing resource ownership hashes still match.
   jq -n --arg subscription "$SUBSCRIPTION" --arg name "$NAME" --arg rg "$RESOURCE_GROUP" \
     --arg location "$LOCATION" --argjson count "$FLEX_COUNT" --arg vm "$VM_SIZE" \
     --arg systemVM "$SYSTEM_VM_SIZE" --arg k8s "$KUBERNETES_VERSION" \
     --arg unbounded "$UNBOUNDED_VERSION" --arg agent "$AGENT_VERSION" \
+    --arg arch "$WORKER_ARCH" --arg plugin "$PLUGIN_DIGEST" --argjson streaming "$ARTIFACT_STREAMING" \
+    --arg registry "$IMAGE_REGISTRY" --arg operator "$OPERATOR_IMAGE" \
     --arg vnet "$VNET_CIDR" --arg clusterPods "$CLUSTER_POD_CIDR" \
     --arg flexPods "$FLEX_POD_CIDR" --arg services "$SERVICE_CIDR" \
     --rawfile sshKey "$STATE_DIR/ssh.pub" --argjson bootstrapTimeout "$BOOTSTRAP_TIMEOUT" \
     '{subscription:$subscription,name:$name,resourceGroup:$rg,location:$location,
       workerTopology:"vmss",bootstrapTimeout:$bootstrapTimeout,flexCount:$count,vmSize:$vm,systemVMSize:$systemVM,kubernetesVersion:$k8s,
       unboundedVersion:$unbounded,agentVersion:$agent,vnetCIDR:$vnet,
-      clusterPodCIDR:$clusterPods,flexPodCIDR:$flexPods,serviceCIDR:$services,sshKey:$sshKey}' \
+      clusterPodCIDR:$clusterPods,flexPodCIDR:$flexPods,serviceCIDR:$services,sshKey:$sshKey}
+      | if $arch == "amd64" then . else . + {workerArchitecture:$arch} end
+      | if $streaming then . + {artifactStreaming:true} else . end
+      | if $plugin == "" then . else . + {pluginSHA256:$plugin} end
+      | if $registry == "" then . else . + {imageRegistry:$registry} end
+      | if $operator == "" then . else . + {operatorImage:$operator} end' \
     > "$STATE_DIR/intent.next.json"
   if [[ -f "$STATE_DIR/intent.json" ]]; then
     cmp -s "$STATE_DIR/intent.json" "$STATE_DIR/intent.next.json" || die "provisioning arguments differ from $STATE_DIR/intent.json; this script does not migrate standalone VMs, resize, rotate keys, or upgrade existing clusters"
@@ -493,6 +553,17 @@ release_digest() {
 
 install_plugin() {
   local os arch asset archive digest bin_dir
+  if [[ -n "$PLUGIN_BINARY" ]]; then
+    bin_dir="$STATE_DIR/bin/custom-$PLUGIN_DIGEST"
+    mkdir -p "$bin_dir"
+    if [[ "$PLUGIN_BINARY" != "$bin_dir/kubectl-unbounded" ]]; then
+      cp "$PLUGIN_BINARY" "$bin_dir/kubectl-unbounded"
+    fi
+    [[ "$(sha256 "$bin_dir/kubectl-unbounded")" == "$PLUGIN_DIGEST" ]] || die "custom installer changed since the deployment intent was saved"
+    chmod 0700 "$bin_dir/kubectl-unbounded"
+    export PATH="$bin_dir:$PATH"
+    return
+  fi
   case "$(uname -s)" in Linux) os=linux ;; Darwin) os=darwin ;; *) die "unsupported workstation OS" ;; esac
   case "$(uname -m)" in x86_64) arch=amd64 ;; aarch64|arm64) arch=arm64 ;; *) die "unsupported workstation architecture" ;; esac
   mkdir -p "$STATE_DIR/cache"
@@ -527,10 +598,12 @@ setup_cni() {
   log "Installing Unbounded operator and private-L3 CNI topology"
   # Invoke the plugin explicitly so kubectl's plugin dispatch does not need to
   # interpret a --kubeconfig flag before the plugin name.
-  local deployments
+  local deployments install_args=()
+  [[ -z "$IMAGE_REGISTRY" ]] || install_args+=(--image-registry "$IMAGE_REGISTRY")
+  [[ -z "$OPERATOR_IMAGE" ]] || install_args+=(--operator-image "$OPERATOR_IMAGE")
   deployments=$(kube get deployments -A -o json)
   if ! jq -e 'any(.items[]; .metadata.name == "unbounded-operator" and .metadata.namespace == "unbounded-system")' <<<"$deployments" >/dev/null; then
-    kubectl-unbounded install --kubeconfig "$STATE_DIR/kubeconfig" --timeout "${TIMEOUT}s"
+    kubectl-unbounded install --kubeconfig "$STATE_DIR/kubeconfig" --timeout "${TIMEOUT}s" ${install_args[@]+"${install_args[@]}"}
   else
     # Retain an operator that has been upgraded since initial provisioning.
     # Replaying the pinned installer would otherwise downgrade its image.
@@ -539,6 +612,7 @@ setup_cni() {
   fi
   jq -n --arg system "$SYSTEM_NODE_CIDR" --arg flex "$FLEX_NODE_CIDR" \
     --arg clusterPods "$CLUSTER_POD_CIDR" --arg flexPods "$FLEX_POD_CIDR" \
+    --arg arch "$WORKER_ARCH" --arg pool "$FLEX_POOL" --argjson streaming "$ARTIFACT_STREAMING" \
     '{apiVersion:"v1",kind:"List",items:[
       {apiVersion:"unbounded-cloud.io/v1alpha3",kind:"Site",metadata:{name:"cluster"},
        spec:{nodeCidrs:[$system],manageCniPlugin:true,podCidrAssignments:[{assignmentEnabled:true,cidrBlocks:[$clusterPods]}],components:{machina:{enabled:true}}}},
@@ -546,7 +620,10 @@ setup_cni() {
        spec:{nodeCidrs:[$flex],manageCniPlugin:true,podCidrAssignments:[{assignmentEnabled:true,cidrBlocks:[$flexPods]}]}},
       {apiVersion:"net.unbounded-cloud.io/v1alpha1",kind:"SitePeering",metadata:{name:"cluster-flex-private-l3"},
        spec:{sites:["cluster","flex-site"],meshNodes:true,tunnelProtocol:"Auto"}}
-    ]}' > "$STATE_DIR/sites.json"
+    ]} | if $streaming then
+      (.items[] | select(.kind == "Site" and .metadata.name == "flex-site") | .spec.components.gantry) =
+        {enabled:true,artifactStreaming:{enabled:true,nodeSelector:{"kubernetes.io/arch":$arch,"kubernetes.azure.com/agentpool":$pool}}}
+      else . end' > "$STATE_DIR/sites.json"
   kube apply --server-side --field-manager=aks-flex-cluster -f "$STATE_DIR/sites.json"
   wait_component_rollout deployment/unbounded-net-controller
   wait_component_rollout daemonset/unbounded-net-node
@@ -652,6 +729,7 @@ ensure_vmss() {
   if [[ "$existing" == null ]]; then
     log "Creating Uniform Flex VMSS $VMSS_NAME with $FLEX_COUNT instances and one shared identity"
     jq -n --arg location "$LOCATION" --arg size "$VM_SIZE" --argjson count "$FLEX_COUNT" \
+      --arg imageSKU "$WORKER_IMAGE_SKU" \
       --arg owner "$NAME" --arg hash "$CONFIG_HASH" --arg bootstrap "$bootstrap_hash" \
       --arg prefix "${NAME:0:9}" --arg user "$ADMIN_USER" --rawfile key "$STATE_DIR/ssh.pub" \
       --arg data "$(base64 < "$STATE_DIR/vmss-custom-data.sh" | tr -d '\n')" \
@@ -664,7 +742,7 @@ ensure_vmss() {
             osProfile:{computerNamePrefix:$prefix,adminUsername:$user,customData:$data,
               linuxConfiguration:{disablePasswordAuthentication:true,
                 ssh:{publicKeys:[{path:("/home/"+$user+"/.ssh/authorized_keys"),keyData:($key | rtrimstr("\n"))}]}}},
-            storageProfile:{imageReference:{publisher:"Canonical",offer:"ubuntu-24_04-lts",sku:"server",version:"latest"},
+            storageProfile:{imageReference:{publisher:"Canonical",offer:"ubuntu-24_04-lts",sku:$imageSKU,version:"latest"},
               osDisk:{createOption:"FromImage",diskSizeGB:128,managedDisk:{storageAccountType:"StandardSSD_LRS"}}},
             networkProfile:{networkInterfaceConfigurations:[{name:"worker-nic",properties:{
               primary:true,enableIPForwarding:true,networkSecurityGroup:{id:$nsg},
@@ -678,6 +756,7 @@ ensure_vmss() {
     model=$(az_cmd rest --method get --url "https://management.azure.com$VMSS_ID?api-version=$VMSS_API_VERSION" -o json)
     assert_owned "$model" "worker VMSS"
     jq -e --arg size "$VM_SIZE" --arg subnet "$FLEX_SUBNET_ID" --arg backend "$WORKER_BACKEND_ID" \
+      --arg imageSKU "$WORKER_IMAGE_SKU" \
       --arg nsg "$NSG_ID" --arg bootstrap "$bootstrap_hash" --arg user "$ADMIN_USER" --arg prefix "${NAME:0:9}" --rawfile key "$STATE_DIR/ssh.pub" \
       '.sku.name == $size and .sku.capacity >= 1 and .sku.capacity <= 1000
        and .identity.type == "SystemAssigned" and ((.identity.userAssignedIdentities // {}) | length) == 0
@@ -690,7 +769,7 @@ ensure_vmss() {
        and (.properties.virtualMachineProfile.osProfile.linuxConfiguration.ssh.publicKeys[0].keyData | rtrimstr("\n")) == ($key | rtrimstr("\n"))
        and .properties.virtualMachineProfile.storageProfile.imageReference.publisher == "Canonical"
        and .properties.virtualMachineProfile.storageProfile.imageReference.offer == "ubuntu-24_04-lts"
-       and .properties.virtualMachineProfile.storageProfile.imageReference.sku == "server"
+       and .properties.virtualMachineProfile.storageProfile.imageReference.sku == $imageSKU
        and .properties.virtualMachineProfile.storageProfile.osDisk.diskSizeGB == 128
        and .properties.virtualMachineProfile.storageProfile.osDisk.managedDisk.storageAccountType == "StandardSSD_LRS"
        and (.properties.virtualMachineProfile.securityProfile.securityType // "Standard") == "Standard"
@@ -720,6 +799,10 @@ write_remote_script() {
     printf '#!/usr/bin/env bash\nset -euo pipefail\numask 077\n'
     printf 'AKS_ID=%q\nPOOL=%q\nVMSS_ID=%q\nVMSS_NAME=%q\nPREFIX=%q\nSUBNET=%q\nVERSION=%q\nDIGEST=%q\nWAIT_TIMEOUT=%q\n' \
       "$AKS_ID" "$FLEX_POOL" "$VMSS_ID" "$VMSS_NAME" "$NAME" "$FLEX_NODE_CIDR" "$AGENT_VERSION" "$AGENT_DIGEST" "${BOOTSTRAP_TIMEOUT:-$TIMEOUT}"
+    if [[ "$WORKER_ARCH" == arm64 ]]; then
+      # shellcheck disable=SC2016
+      printf '%s\n' '[[ "$(uname -m)" == aarch64 ]] || { echo "expected an ARM64 Flex host" >&2; exit 78; }'
+    fi
     cat <<'REMOTE'
 coordinates=$(python3 - "$VMSS_ID" "$VMSS_NAME" "$PREFIX" "$SUBNET" <<'PY'
 import ipaddress
@@ -780,6 +863,20 @@ case "$cloud_init_status" in
 esac
 apt-get update -qq
 DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl ca-certificates jq util-linux nftables systemd-container
+REMOTE
+    if [[ "$ARTIFACT_STREAMING" == true ]]; then
+      cat <<'REMOTE'
+DEBIAN_FRONTEND=noninteractive apt-get install -y -qq kmod
+printf 'nbd\n' > /etc/modules-load.d/gantry-nbd.conf
+printf 'options nbd nbds_max=1024\n' > /etc/modprobe.d/gantry-nbd.conf
+modprobe nbd nbds_max=1024
+if [[ "$(cat /sys/module/nbd/parameters/nbds_max)" -lt 64 ]]; then
+  echo 'Gantry streaming requires at least 64 NBD devices before Flex bootstrap' >&2
+  exit 78
+fi
+REMOTE
+    fi
+    cat <<'REMOTE'
 install -d -m 0700 /run/aks-flex-node-bootstrap
 # Role assignment presence in ARM does not mean that IMDS and the RP have
 # accepted it yet. Wait for an authorized Machine GET before changing the host
@@ -920,10 +1017,12 @@ validate_deployment() {
     done
     kube get nodes -l "kubernetes.azure.com/agentpool=$FLEX_POOL" -o json > "$STATE_DIR/worker-nodes.json"
     if jq -en --slurpfile expected "$STATE_DIR/expected-worker-nodes.json" \
-      --slurpfile machines "$STATE_DIR/worker-machines.jsonl" --slurpfile nodes "$STATE_DIR/worker-nodes.json" --arg pool "$FLEX_POOL" \
+      --slurpfile machines "$STATE_DIR/worker-machines.jsonl" --slurpfile nodes "$STATE_DIR/worker-nodes.json" --arg pool "$FLEX_POOL" --arg arch "$WORKER_ARCH" \
       '($machines | map({key: .name, value: .state}) | from_entries) as $states |
        ($nodes[0].items | map({key: .metadata.name, value:
          (.metadata.labels["kubernetes.azure.com/agentpool"] == $pool
+          and .metadata.labels["kubernetes.io/arch"] == $arch
+          and .status.nodeInfo.architecture == $arch
           and .metadata.labels["unbounded-cloud.io/site"] == "flex-site"
           and any(.status.conditions[]?; .type == "Ready" and .status == "True"))}) | from_entries) as $ready |
        all($expected[0][]; $states[.] == "Succeeded" and $ready[.] == true)' >/dev/null; then
@@ -934,6 +1033,10 @@ validate_deployment() {
   done
   wait_component_rollout daemonset/unbounded-net-node
   wait_component_rollout daemonset/unbounded-net-kube-proxy-flex-site
+  if [[ "$ARTIFACT_STREAMING" == true ]]; then
+    wait_component_rollout daemonset/gantry
+    wait_component_rollout daemonset/gantry-overlaybd-config
+  fi
 }
 
 smoke_test() {
@@ -984,6 +1087,9 @@ main() {
     [[ "$confirmation" == y || "$confirmation" == Y ]] || die "deployment canceled"
   fi
   prepare_state
+  AGENT_DIGEST=$(release_digest Azure/AKSFlexNode "$AGENT_VERSION" "aks-flex-node-linux-$WORKER_ARCH.tar.gz")
+  fetch_file "https://raw.githubusercontent.com/Azure/AKSFlexNode/$AGENT_VERSION/scripts/bootstrap.sh" "$STATE_DIR/cache/bootstrap-$AGENT_VERSION.sh"
+  bash -n "$STATE_DIR/cache/bootstrap-$AGENT_VERSION.sh"
   ensure_features
   ensure_group
   ensure_network
@@ -991,9 +1097,6 @@ main() {
   install_plugin
   setup_cni
   ensure_flex_pool
-  AGENT_DIGEST=$(release_digest Azure/AKSFlexNode "$AGENT_VERSION" aks-flex-node-linux-amd64.tar.gz)
-  fetch_file "https://raw.githubusercontent.com/Azure/AKSFlexNode/$AGENT_VERSION/scripts/bootstrap.sh" "$STATE_DIR/cache/bootstrap-$AGENT_VERSION.sh"
-  bash -n "$STATE_DIR/cache/bootstrap-$AGENT_VERSION.sh"
   ensure_worker_network
   ensure_vmss
   validate_deployment

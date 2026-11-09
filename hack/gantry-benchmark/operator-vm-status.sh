@@ -27,6 +27,71 @@ service_state=$(systemctl is-active gantry-benchmark-operator.service 2>/dev/nul
 service_state=${service_state:-unknown}
 service_started=$(systemctl show gantry-benchmark-operator.service --property=ActiveEnterTimestamp --value 2>/dev/null || true)
 
+if [[ "$service_state" != active && "$service_state" != activating ]]; then
+  latest_progress="$ARTIFACT_ROOT/progress.json"
+  active_progress=""
+  active_batches=0
+  for candidate in "$ARTIFACT_ROOT"/*/progress.json; do
+    [[ -f "$candidate" ]] || continue
+    [[ -L "${candidate%/progress.json}" ]] && continue
+    batch_id=$(jq -r '.batch_id // empty' "$candidate") || exit 1
+    [[ -n "$batch_id" ]] || continue
+    batch_directory=${candidate%/progress.json}
+    if [[ "$batch_id" != "${batch_directory##*/}" || ! "$batch_id" =~ ^[a-z0-9][a-z0-9-]*$ ]] ||
+      ! jq -e '.stage|type=="string"' "$candidate" >/dev/null ||
+      ! jq -e '(.planned_runs|type=="number") and .planned_runs>0 and (.completed_runs|type=="number") and (.run_index|type=="number")' "$candidate" >/dev/null; then
+      echo "invalid benchmark batch progress: $candidate" >&2
+      exit 1
+    fi
+    batch_state=$(systemctl is-active "gantry-$batch_id-worker.service" 2>/dev/null)
+    case "$batch_state" in
+      active|activating)
+        active_progress=$candidate
+        active_batches=$((active_batches + 1))
+        ;;
+      inactive|failed|unknown|deactivating) ;;
+      *)
+        echo "unable to determine benchmark batch service state: gantry-$batch_id-worker.service" >&2
+        exit 1
+        ;;
+    esac
+    if [[ "$candidate" -nt "$latest_progress" ]]; then
+      latest_progress=$candidate
+    fi
+  done
+  if ((active_batches > 1)); then
+    echo "multiple active benchmark batches; refusing to display an ambiguous lifecycle" >&2
+    exit 1
+  fi
+  selected_progress=$active_progress
+  if [[ -z "$selected_progress" && "$latest_progress" != "$ARTIFACT_ROOT/progress.json" ]]; then
+    selected_progress=$latest_progress
+  fi
+  if [[ -n "$selected_progress" ]]; then
+    batch_id=$(jq -er '.batch_id' "$selected_progress") || exit 1
+    batch_directory=${selected_progress%/progress.json}
+    service_state=$(systemctl is-active "gantry-$batch_id-worker.service" 2>/dev/null)
+    if ! recent_log=$(tail -n "$LOG_LINES" "$batch_directory/operator.log"); then
+      echo "unable to read benchmark batch log: $batch_directory/operator.log" >&2
+      exit 1
+    fi
+    printf '=== Recent batch log ===\n'
+    if ((${#recent_log} > 2800)); then
+      printf '%s\n' "$recent_log" | tail -c 2800 | sed '1d'
+    else
+      printf '%s\n' "$recent_log"
+    fi
+    printf '\n=== Gantry benchmark batch ===\n'
+    printf 'time: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf 'service: %s\n' "$service_state"
+    printf 'service unit: gantry-%s-worker.service\n' "$batch_id"
+    printf 'batch ID: %s\n' "$batch_id"
+    jq -r '"stage: \(.stage)\nrun: \(.run_index)/\(.planned_runs)\ncompleted runs: \(.completed_runs)/\(.planned_runs)\nupdated: \(.updated_at // "unknown")\nmessage: \(.message // "")"' \
+      "$selected_progress" || exit 1
+    exit 0
+  fi
+fi
+
 state_json=""
 if [[ -f "$KUBECONFIG" ]]; then
   state_json=$(kubectl -n "$NAMESPACE" get configmap gantry-benchmark-state \

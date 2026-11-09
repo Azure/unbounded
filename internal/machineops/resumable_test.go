@@ -307,7 +307,7 @@ func TestLongRunningOperationSanitizesProviderDiagnostics(t *testing.T) {
 	require.NotNil(t, completed)
 	require.Empty(t, metav1validation.ValidateCondition(*completed, field.NewPath("status", "conditions")))
 
-	require.LessOrEqual(t, len(updated.Status.Targets[0].Message), maxConditionMessageBytes)
+	require.LessOrEqual(t, len(updated.Status.Targets[0].Message), MaxConditionMessageBytes)
 	require.Equal(t, updated.Status.Targets[0].Message, strings.ToValidUTF8(updated.Status.Targets[0].Message, ""))
 }
 

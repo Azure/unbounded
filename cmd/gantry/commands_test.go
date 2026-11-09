@@ -176,9 +176,10 @@ func TestHelp(t *testing.T) {
 		args []string
 		want []string
 	}{
-		{name: "lists commands", args: []string{"help"}, want: []string{"agent", "init", "version"}},
+		{name: "lists commands", args: []string{"help"}, want: []string{"agent", "init", "snapshotter", "version"}},
 		// The agent parses its own flags, so its help must list them itself.
 		{name: "agent flags", args: []string{"help", "agent"}, want: []string{"Usage: gantry agent [flags]", "-config", "-libp2p-identity-path"}},
+		{name: "snapshotter flags", args: []string{"help", "snapshotter"}, want: []string{"Usage: gantry snapshotter [flags]", "-address", "-fallback-snapshotter"}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			fake := &fakeCommands{}

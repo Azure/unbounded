@@ -64,7 +64,7 @@ status_once() {
       -o BatchMode=yes \
       -o ConnectTimeout=20 \
       -T "$OPERATOR_SSH_TARGET" \
-      'sudo -n /opt/gantry-benchmark/unbounded/hack/gantry-benchmark/operator-vm-status.sh')
+      'sudo -n bash -s' < "$script_dir/operator-vm-status.sh")
   elif [[ -n "$OPERATOR_SSH_HOST" ]]; then
     : "${OPERATOR_SSH_KEY:?Set OPERATOR_SSH_KEY when OPERATOR_SSH_HOST is set}"
     output=$(ssh \
@@ -73,22 +73,41 @@ status_once() {
       -o ConnectTimeout=20 \
       -o ServerAliveInterval=30 \
       "$OPERATOR_SSH_USER@$OPERATOR_SSH_HOST" \
-      'sudo -n /opt/gantry-benchmark/unbounded/hack/gantry-benchmark/operator-vm-status.sh')
+      'sudo -n bash -s' < "$script_dir/operator-vm-status.sh")
   else
     : "${AZURE_RESOURCE_GROUP:?Set AZURE_RESOURCE_GROUP when OPERATOR_SSH_HOST is not set}"
     local run_command_lock_fd
     exec {run_command_lock_fd}>"$OPERATOR_RUN_COMMAND_LOCK"
     flock "$run_command_lock_fd"
-    output=$(az vm run-command invoke \
-      -g "$AZURE_RESOURCE_GROUP" \
-      -n "$OPERATOR_VM_NAME" \
-      --command-id RunShellScript \
-      --scripts @"$script_dir/operator-vm-status.sh" \
-      --only-show-errors \
-      --query 'value[0].message' \
-      -o tsv)
+    local attempt
+    local command_status=0
+    for attempt in {1..12}; do
+      if output=$(az vm run-command invoke \
+        -g "$AZURE_RESOURCE_GROUP" \
+        -n "$OPERATOR_VM_NAME" \
+        --command-id RunShellScript \
+        --scripts @"$script_dir/operator-vm-status.sh" \
+        --only-show-errors \
+        --query 'value[0].message' \
+        -o tsv 2>&1); then
+        command_status=0
+        break
+      else
+        command_status=$?
+      fi
+      if [[ "$output" != *"(Conflict)"* || "$output" != *"Run command extension execution is in progress"* ]] ||
+        ((attempt == 12)); then
+        break
+      fi
+      printf 'Another VM Run Command is active; retrying status in 5 seconds (%s/12).\n' "$attempt" >&2
+      sleep 5
+    done
     flock -u "$run_command_lock_fd"
     exec {run_command_lock_fd}>&-
+    if ((command_status != 0)); then
+      printf '%s\n' "$output" >&2
+      return "$command_status"
+    fi
   fi
 
   printf '%s\n' "$output" | sed \

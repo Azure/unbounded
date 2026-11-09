@@ -209,7 +209,7 @@ func (h *attachACRHandler) configureIdentityBinding(ctx context.Context, acrID *
 
 		switch binding.Properties.ProvisioningState {
 		case "Succeeded":
-			if err := h.discoverACRProxy(ctx, cfg); err != nil {
+			if err := h.waitForACRProxy(ctx, cfg); err != nil {
 				return err
 			}
 

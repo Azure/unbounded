@@ -209,8 +209,9 @@ func BuildAgentConfig(params BuildAgentConfigParams) UnboundedAgentConfig {
 				Labels:             labels,
 				RegisterWithTaints: taints,
 			},
-			OCIImage: ociImage,
-			LocalDNS: localDNS,
+			OCIImage:  ociImage,
+			Isolation: string(machine.Spec.Isolation),
+			LocalDNS:  localDNS,
 		},
 		Downloads: downloads,
 	}
