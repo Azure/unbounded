@@ -97,6 +97,7 @@ fn side_with(
         &racer_io::Rng::os(),
     )
     .unwrap();
+    link.post_receives().unwrap();
     Side {
         link,
         pool,

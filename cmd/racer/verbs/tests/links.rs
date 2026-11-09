@@ -913,6 +913,29 @@ fn failed_destroy_blocks_drain_or_leaks() {
 }
 
 #[test]
+/// A link whose setup fails after its QP exists is torn down through the
+/// retried dying path, so a first failed destroy does not leak the round
+/// and reopen still succeeds. Registration mode defers the QP and its
+/// receives to connection setup, so only window mode posts them here.
+fn half_built_link_is_retired_not_leaked() {
+    window_only(|| {
+        let mut w = world();
+        w.sim.fault(Operation::PostRecv, Fault::Reject);
+        w.sim.fault(Operation::Stop, Fault::Reject);
+        let opened = w.a.clients[0].open(TO_B);
+        assert!(wait(&mut w, &opened).is_err());
+        w.a.clients[0].close();
+        pump(&mut w);
+        assert_eq!(w.sim.pending_faults(), 0, "the first destroy failed");
+        assert!(w.a.clients[0].drained());
+        w.a.clients[0].reopen().unwrap();
+        let activation = w.a.clients[1].activate(config(&w.a.charge));
+        assert!(wait(&mut w, &activation).is_ok());
+        shutdown(w);
+    });
+}
+
+#[test]
 /// Dropping the owner fails outstanding ops, makes clients unavailable,
 /// and leaves held pages readable.
 fn owner_drop() {

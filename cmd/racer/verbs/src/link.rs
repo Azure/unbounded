@@ -543,8 +543,22 @@ pub(crate) struct Link {
 }
 
 impl Link {
-    /// Create the QP, its control region and windows, and post every
-    /// receive. The link is [`Phase::Created`].
+    /// Post every control receive. On failure the QP exists, so the caller
+    /// retires the link through its retried teardown path, never a drop.
+    pub(crate) fn post_receives(&self) -> Result<()> {
+        for slot in 0..self.recv_depth {
+            self.qp.post_recv(
+                wr(RECV_CTL, slot),
+                &self.control,
+                u64::from(slot) * CONTROL_LEN as u64,
+                CONTROL_LEN as u32,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Create the control region, windows, and QP. The link is
+    /// [`Phase::Created`]; the caller must then [`Link::post_receives`].
     pub(crate) fn new(
         epoch: Epoch,
         role: Role,
@@ -556,14 +570,8 @@ impl Link {
     ) -> Result<Self> {
         let (send_depth, recv_depth) = depths(limits.grants).ok_or(Error::InvalidConfiguration)?;
         let send_slots = recv_depth;
-        let qp = NativeQueuePair::new_with_depth(
-            device.clone(),
-            quota.clone(),
-            Arc::new(AtomicBool::new(false)),
-            send_depth,
-            recv_depth,
-            rng,
-        )?;
+        // Allocate everything that can fail before the QP, so those failures
+        // leave no QP to tear down.
         let control = NativeRegion::with_access(
             device.clone(),
             CONTROL_LEN * (recv_depth + send_slots) as usize,
@@ -573,15 +581,14 @@ impl Link {
         let windows = (0..limits.grants)
             .map(|_| MemoryWindow::new(device))
             .collect::<Result<Vec<_>>>()?;
-
-        for slot in 0..recv_depth {
-            qp.post_recv(
-                wr(RECV_CTL, slot),
-                &control,
-                u64::from(slot) * CONTROL_LEN as u64,
-                CONTROL_LEN as u32,
-            )?;
-        }
+        let qp = NativeQueuePair::new_with_depth(
+            device.clone(),
+            quota.clone(),
+            Arc::new(AtomicBool::new(false)),
+            send_depth,
+            recv_depth,
+            rng,
+        )?;
 
         Ok(Self {
             qp,

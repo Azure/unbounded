@@ -2179,7 +2179,7 @@ impl Owner {
         self.next_epoch += 1;
         let quota = self.quota.as_ref().ok_or(Error::Unavailable)?;
 
-        Link::new(
+        let link = Link::new(
             epoch,
             role,
             &device.device,
@@ -2187,7 +2187,14 @@ impl Owner {
             settings.limits,
             now,
             &self.ctx.rng,
-        )
+        )?;
+        if let Err(error) = link.post_receives() {
+            // The QP exists: retire it with retries, like a failed connect.
+            self.dying.push(Dying { key, link });
+            self.dirty = true;
+            return Err(error);
+        }
+        Ok(link)
     }
 
     fn open(&mut self, key: LinkKey, now: Instant) -> Result<Opened> {
