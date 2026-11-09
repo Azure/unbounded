@@ -255,13 +255,16 @@ the namespace and ingest ref, so the directory is listed (at most every
 100ms, on a miss) and each `ref` file is parsed for the digest (CRI uses
 `layer-sha256:<hex>`); the readable length is the size of `data`, capped at
 `total`. containerd writes ingests sequentially with plain `write` calls, so
-bytes below the file size are complete and in the page cache. Every page
-read opens the blob (committed, else its ingest, else committed again in
-case containerd renamed it in between), reads one page, and closes it, so a
-blob that containerd garbage collects never keeps its space; a page is
-1MiB, so the open is cheap next to the read. A short read (an ingest
-restarted with a truncate, or a deleted blob) loses the reader, which
-retries elsewhere. A permission error disables the source with one warning.
+bytes below the file size are complete and in the page cache. A blob is
+opened as committed, else as its ingest, else as committed again in case
+containerd renamed it in between. On commit containerd renames `data` into
+`blobs/`, so an open descriptor stays valid. Descriptors are shared per
+blob with a reference count and closed 2s after their last use by a timer,
+so a blob that containerd garbage collects does not keep its space for
+long (opening the file for every 1MiB page read made serving from the
+content store about a third slower). A short read (an ingest restarted
+with a truncate, or a deleted blob) drops the descriptor and loses the
+reader, which retries elsewhere. A permission error disables the source with one warning.
 Digests are validated as 64 lowercase hex characters before they become a
 path.
 
@@ -303,9 +306,11 @@ did not asked holders (312 holder reads, 2 misses).
 Content store reads go through a page cache keyed by (digest, absolute page
 index), so readers of different fills of the same chunk share pages.
 Concurrent readers of the same page share one read (singleflight). Each
-entry is a reference-counted page buffer, freed when its last reader is
-done; nothing is kept after that. Evicting a digest (failed verification)
-makes later readers read its pages afresh.
+entry is a reference-counted page buffer. When its last reader is done the
+page joins a ring of the 32 most recently released pages, so readers of a
+fan-out that trail a few pages behind share the read too; a page pushed
+out of the ring is freed. Evicting a digest (failed verification) frees
+its pages.
 
 ### Memory bound
 
@@ -315,7 +320,8 @@ Chunk memory is page buffers only:
   `max_concurrent_chunk_fills` fills (256MiB with the defaults);
 - borrowed pages, including lingering and owned chunks: at most
   `inflight_bytes`;
-- one page per active reader while it writes that page to its socket.
+- one page per active reader while it writes that page to its socket;
+- the recent page ring: 32 pages (32MiB).
 
 With the defaults that is about 2.3GiB plus the pages being sent. The
 benchmark, run with a 512MiB hot page tier that has since been removed,
@@ -491,8 +497,8 @@ allowed to pull. Use NetworkPolicy to limit the port to Gantry agents.
   permissions (directories 0755, blobs 0444, ingest files 0644).
 - containerd may garbage collect a blob at any time (immediately, with the
   default GC settings, once no image or lease references it). Readers then
-  get short reads and retry elsewhere. Every read opens and closes the file,
-  so no descriptor keeps the space.
+  get short reads and retry elsewhere; descriptors are closed after 2s idle
+  so the space is reclaimed.
 - A relay or owner that is not pulling an image keeps its chunks only in
   memory, for at most 30s unused and while the in-flight budget has room.
   After that its share is served from requesters' content stores (holder
