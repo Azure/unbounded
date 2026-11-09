@@ -13,6 +13,7 @@ func TestHoldersRecentFirstBounded(t *testing.T) {
 	h := newHolders(2)
 	now := time.Unix(1000, 0)
 	h.now = func() time.Time { return now }
+	h.minAge = 0
 
 	tick := func() { now = now.Add(time.Second) }
 
@@ -54,6 +55,20 @@ func TestHoldersRecentFirstBounded(t *testing.T) {
 
 	if h.list(key(1), "") != nil || h.len() != 2 {
 		t.Fatalf("oldest chunk kept: len %d", h.len())
+	}
+
+	// Requesters recorded less than minAge ago are not listed: they are
+	// most likely still pulling.
+	h.minAge = time.Minute
+
+	if got := h.list(key(3), ""); len(got) != 0 {
+		t.Fatalf("fresh entries listed: %v", got)
+	}
+
+	now = now.Add(time.Minute)
+
+	if got := h.list(key(3), ""); !slices.Equal(got, []string{"y:1"}) {
+		t.Fatalf("aged entries: %v", got)
 	}
 
 	// Entries expire.

@@ -13,6 +13,11 @@ import (
 // chunk.
 const holdersPerChunk = 4
 
+// holderMinAge is how long after its request a requester is assumed to
+// hold the chunk: a member that asked moments ago is most likely still
+// pulling it (often it is the very request being filled).
+const holderMinAge = 20 * time.Second
+
 // holderTTL bounds how long a requester is assumed to still hold a chunk
 // in its content store (containerd may garbage collect it).
 const holderTTL = 6 * time.Hour
@@ -27,6 +32,8 @@ type holders struct {
 	ring []chunkKey
 	next int
 	now  func() time.Time
+	// minAge skips requesters recorded less than this long ago.
+	minAge time.Duration
 }
 
 type holderSet struct {
@@ -37,9 +44,10 @@ type holderSet struct {
 
 func newHolders(capacity int) *holders {
 	return &holders{
-		m:    make(map[chunkKey]*holderSet, capacity),
-		ring: make([]chunkKey, max(capacity, 1)),
-		now:  time.Now,
+		m:      make(map[chunkKey]*holderSet, capacity),
+		ring:   make([]chunkKey, max(capacity, 1)),
+		now:    time.Now,
+		minAge: holderMinAge,
 	}
 }
 
@@ -103,13 +111,15 @@ func (h *holders) add(k chunkKey, addr string) {
 	set.addrs[i], set.at[i] = addr, now
 }
 
-// list returns the unexpired requesters of k other than self, most recent
-// first.
+// list returns the requesters of k other than self recorded between
+// holderTTL and minAge ago, most recent first.
 func (h *holders) list(k chunkKey, self string) []string {
-	cutoff := h.now().Add(-holderTTL)
+	now := h.now()
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
+
+	cutoff, newest := now.Add(-holderTTL), now.Add(-h.minAge)
 
 	set := h.m[k]
 	if set == nil {
@@ -124,7 +134,7 @@ func (h *holders) list(k chunkKey, self string) []string {
 	var es []entry
 
 	for i := range set.n {
-		if set.addrs[i] != self && set.at[i].After(cutoff) {
+		if set.addrs[i] != self && set.at[i].After(cutoff) && !set.at[i].After(newest) {
 			es = append(es, entry{set.addrs[i], set.at[i]})
 		}
 	}

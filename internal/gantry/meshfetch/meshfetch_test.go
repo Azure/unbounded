@@ -648,6 +648,13 @@ func TestSecondWaveServedFromContentStores(t *testing.T) {
 		}
 	}
 
+	// Holders recorded moments ago count as holders here.
+	for _, n := range c.nodes {
+		n.node.holders.mu.Lock()
+		n.node.holders.minAge = 0
+		n.node.holders.mu.Unlock()
+	}
+
 	pulls := c.origin.totalPulls()
 	if pulls != 12 {
 		t.Fatalf("wave 1 pulled %d chunks from the origin, want 12", pulls)
@@ -785,6 +792,12 @@ func TestRequesterRecordedAsHolder(t *testing.T) {
 
 	self := req.mesh.Addr()
 	recorded := 0
+
+	for _, n := range c.nodes {
+		n.node.holders.mu.Lock()
+		n.node.holders.minAge = 0
+		n.node.holders.mu.Unlock()
+	}
 
 	for i := range int64(8) {
 		k := chunkKey{digest: d.String(), kind: kindBlob, index: i}
