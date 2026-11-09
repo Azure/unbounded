@@ -235,6 +235,20 @@ jobs:
         run: |
           timeout --signal=TERM --kill-after=10s 600s cargo +1.96.0 clippy --locked --manifest-path cmd/racer/Cargo.toml -p page-alloc --all-targets --no-default-features -- -D warnings
 
+  # Fan-in under the original check name so branch protection that requires
+  # "Racer Rust Lint" keeps gating on both matrix legs.
+  racer-rust-lint-result:
+    name: Racer Rust Lint
+    if: always()
+    needs: racer-rust-lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every lint leg to pass
+        env:
+          RESULT: ${{ needs.racer-rust-lint.result }}
+        run: test "$RESULT" = success
+
   # ---------- racer-object Rust sidecar ----------
   # Standalone crate (not a member of the cmd/racer workspace) with its own
   # lock file, so it gets its own target directory and cache key.
@@ -321,6 +335,19 @@ jobs:
 
       - name: Test
         run: timeout --signal=TERM --kill-after=10s 1500s cargo +1.96.0 test --locked --manifest-path cmd/racer/Cargo.toml --workspace $FEATURES
+
+      # The fuzz crate is a standalone workspace with its own lock, so the
+      # workspace steps above never build it. Compile every target and check
+      # that the committed seeds still decode and match their encoders.
+      - name: Check fuzz targets
+        if: matrix.key == 'default'
+        run: timeout --signal=TERM --kill-after=10s 900s cargo +1.96.0 check --locked --manifest-path cmd/racer/fuzz/Cargo.toml --bins
+
+      - name: Fuzz seed corpora
+        if: matrix.key == 'default'
+        env:
+          RUSTC_BOOTSTRAP: "1"
+        run: timeout --signal=TERM --kill-after=10s 900s cargo +1.96.0 test --locked --manifest-path cmd/racer/fuzz/Cargo.toml --test seeds
 
   racer-rust-gates:
     name: Racer Rust Production Gates
