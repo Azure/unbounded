@@ -1159,24 +1159,35 @@ mod tests {
                 let (left, right) = UnixStream::pair().unwrap();
                 let left = Rc::new(Descriptor::from(left));
                 let right = Rc::new(Descriptor::from(right));
-                drive(&reactor, reactor.send(left, buffer(b"drain"), (), &scope)).unwrap();
+                // Keep the peer open so the drained socket does not report hangup.
+                drive(
+                    &reactor,
+                    reactor.send(left.clone(), buffer(b"drain"), (), &scope),
+                )
+                .unwrap();
                 let read = drive(
                     &reactor,
                     reactor.recv(right.clone(), buffer(&[0; 8]), (), &scope),
                 )
                 .unwrap();
                 assert_eq!(&read.buffer.bytes().unwrap()[..read.bytes], b"drain");
-                let mut pending = reactor.readiness(right, libc::POLLOUT as u32, &scope);
+                // The drained socket is not readable, so drain must cancel this.
+                let mut pending = reactor.readiness(right.clone(), libc::POLLIN as u32, &scope);
                 assert!(poll(&mut pending).is_pending());
+                // Writable at submission, so this completes before drain cancels;
+                // a success that already happened is delivered, not masked.
+                let mut ready = reactor.readiness(right, libc::POLLOUT as u32, &scope);
+                assert!(poll(&mut ready).is_pending());
                 drive(&reactor, reactor.drain()).unwrap();
                 assert_eq!(reactor.in_flight(), 0);
                 assert!(matches!(
                     poll(&mut pending),
                     Poll::Ready(Err(Error::Canceled))
                 ));
+                assert!(matches!(poll(&mut ready), Poll::Ready(Ok(_))));
                 assert_eq!(reactor.init(), Err(Error::Unavailable));
                 assert_eq!(reactor.admission.used(ResourceClass::ControlProgress), 2);
-                drop(control);
+                drop((control, left));
             }
 
             mod reserved_submission_tests {
