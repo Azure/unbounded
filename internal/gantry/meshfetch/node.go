@@ -193,7 +193,7 @@ func New(cfg Config) (*Node, error) {
 	}
 
 	switch cfg.Persist {
-	case "", PersistAll, PersistShared:
+	case "", PersistAll, PersistShared, PersistOwned:
 	default:
 		return nil, fmt.Errorf("meshfetch: unknown persist policy %q", cfg.Persist)
 	}

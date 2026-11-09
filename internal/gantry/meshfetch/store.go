@@ -56,6 +56,10 @@ const (
 	// peer. A chunk only this agent consumes streams through memory, with
 	// the fill paced by its slowest reader, and is never written.
 	PersistShared PersistPolicy = "shared"
+	// PersistOwned writes only chunks this agent owns. Every other chunk
+	// streams through memory; a peer that asks for one after its first
+	// page is gone gets a new fill, which refetches it from upstream.
+	PersistOwned PersistPolicy = "owned"
 )
 
 // storeConfig configures a store.
@@ -308,7 +312,7 @@ func (s *store) newFillLocked(k chunkKey, shared bool) *fill {
 	s.m[k] = f
 	s.inflight++
 
-	if s.cfg.persist == PersistAll || shared {
+	if s.cfg.persist == PersistAll || (shared && s.cfg.persist == PersistShared) {
 		s.reserveLocked(f)
 	}
 

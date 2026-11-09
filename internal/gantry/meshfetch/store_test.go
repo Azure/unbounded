@@ -1019,3 +1019,27 @@ func (t *trackingReader) Read(p []byte) (int, error) {
 	t.each()
 	return t.r.Read(p)
 }
+
+func TestPersistOwnedWritesOnlyOwnedChunks(t *testing.T) {
+	s := newTestStore(t, func(c *storeConfig) { c.persist = PersistOwned })
+
+	completeFill(t, s, key(1), pattern(1, testChunk), true)
+
+	if !cached(s, key(1)) {
+		t.Fatal("owned chunk not cached")
+	}
+
+	// A peer-initiated fill of a chunk this member does not own streams.
+	r, _, err := s.acquire(context.Background(), key(2), 0, false, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if r.f.wantDisk.Load() {
+		t.Fatal("peer fill of a chunk not owned wants disk")
+	}
+
+	r.f.finish(errors.New("done"))
+	r.f.release()
+	r.close()
+}

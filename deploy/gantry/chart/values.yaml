@@ -124,8 +124,8 @@ gantry:
     # Page cache use of chunk files: bypass (O_DIRECT), drop (buffered, then
     # fadvise DONTNEED), or keep ("bypass").
     pageCache: ""
-    # Chunks written to disk: all, or shared (only chunks this agent owns or
-    # serves to a peer) ("all").
+    # Chunks written to disk: all, shared (only chunks this agent owns or
+    # serves to a peer), or owned (only chunks this agent owns) ("all").
     persist: ""
     # Chunks of one blob fetched ahead of the one being written (8).
     lookahead: 0

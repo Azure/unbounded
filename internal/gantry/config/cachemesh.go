@@ -142,9 +142,11 @@ type CachemeshConfig struct {
 	// Page cache counts toward the container's working set.
 	PageCache string `yaml:"page_cache"`
 
-	// Persist selects which chunks are written to disk: "all", or
-	// "shared" (only chunks this agent owns or serves to a peer; chunks
-	// only this agent consumes stream through memory).
+	// Persist selects which chunks are written to disk: "all", "shared"
+	// (only chunks this agent owns or serves to a peer; chunks only this
+	// agent consumes stream through memory), or "owned" (only chunks this
+	// agent owns; relays keep nothing, and a late peer request refetches
+	// the chunk from upstream).
 	Persist string `yaml:"persist"`
 
 	// MaxConcurrentChunkFills caps chunks this agent fetches from a peer or
@@ -359,9 +361,9 @@ func (c *Config) validateCachemesh() []error {
 	}
 
 	switch m.Persist {
-	case "all", "shared":
+	case "all", "shared", "owned":
 	default:
-		bad("persist", "must be all or shared, got %q", m.Persist)
+		bad("persist", "must be all, shared, or owned, got %q", m.Persist)
 	}
 
 	if m.MaxConcurrentChunkFills < 1 {
