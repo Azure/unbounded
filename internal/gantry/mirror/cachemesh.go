@@ -210,6 +210,7 @@ type sniffWriter struct {
 	w       io.Writer
 	headers func(prefix []byte)
 	buf     []byte
+	lead    int // leading whitespace bytes of buf already scanned
 }
 
 func (s *sniffWriter) deferHeaders(headers func(prefix []byte)) {
@@ -223,9 +224,13 @@ func (s *sniffWriter) Write(p []byte) (int, error) {
 
 	s.buf = append(s.buf, p...)
 
-	trimmed := bytes.TrimLeft(s.buf, " \t\r\n")
-	if len(trimmed) == 0 || (trimmed[0] == '{' && int64(len(s.buf)) < manifest.MaxContentTypeDetectionBytes) {
-		return len(p), nil
+	// Leading whitespace is scanned once, and the buffer never grows past
+	// the detector's limit, whitespace or not.
+	if int64(len(s.buf)) < manifest.MaxContentTypeDetectionBytes {
+		s.lead += len(s.buf[s.lead:]) - len(bytes.TrimLeft(s.buf[s.lead:], " \t\r\n"))
+		if s.lead == len(s.buf) || s.buf[s.lead] == '{' {
+			return len(p), nil
+		}
 	}
 
 	if err := s.flush(); err != nil {
