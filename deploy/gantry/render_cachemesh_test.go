@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"gopkg.in/yaml.v3"
 
@@ -93,11 +92,11 @@ func TestRendersCachemeshContentRootMount(t *testing.T) {
 	}
 }
 
-// The chart rejects the removed private chunk store keys.
-func TestRejectsRemovedChunkStoreKeys(t *testing.T) {
+// The chart rejects a relative content root and keys it does not know.
+func TestRejectsBadCachemeshValues(t *testing.T) {
 	t.Parallel()
 
-	for _, kv := range []string{"diskCacheBytes: 1", "chunkDirSizeLimit: 1Gi", "pageCache: keep", "persist: all", "contentRoot: relative"} {
+	for _, kv := range []string{"contentRoot: relative", "pageSize: 1"} {
 		values := filepath.Join(t.TempDir(), "values.yaml")
 		if err := os.WriteFile(values, []byte("gantry:\n  cachemesh:\n    enabled: true\n    "+kv+"\n"), 0o600); err != nil {
 			t.Fatal(err)
@@ -106,20 +105,6 @@ func TestRejectsRemovedChunkStoreKeys(t *testing.T) {
 		if out, err := helmTemplate(t, "--values", values); err == nil {
 			t.Errorf("chart accepted %q:\n%s", kv, out)
 		}
-	}
-}
-
-// The chart rejects the removed in-memory budget key.
-func TestRejectsChunkCacheBytes(t *testing.T) {
-	t.Parallel()
-
-	values := filepath.Join(t.TempDir(), "values.yaml")
-	if err := os.WriteFile(values, []byte("gantry:\n  cachemesh:\n    enabled: true\n    chunkCacheBytes: 1\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	if out, err := helmTemplate(t, "--values", values); err == nil {
-		t.Fatalf("chart accepted chunkCacheBytes:\n%s", out)
 	}
 }
 
@@ -137,14 +122,9 @@ func TestRendersEnabledCachemesh(t *testing.T) {
     maxNeighbors: 32
     chunkSize: 33554432
     contentRoot: /data/containerd/io.containerd.content.v1.content
-    memoryCacheBytes: 134217728
-    pageSize: 2097152
-    fillPages: 6
     inflightBytes: 536870912
-    lookahead: 12
-    metadataTTL: 10m
+    maxConcurrentChunkFills: 32
     cacheTags: false
-    hedge: true
 `), 0o600)
 	if err != nil {
 		t.Fatal(err)
@@ -175,26 +155,21 @@ func TestRendersEnabledCachemesh(t *testing.T) {
 	for _, want := range []string{
 		"cachemesh:\n  enabled: true\n",
 		`  content_root: "/data/containerd/io.containerd.content.v1.content"`,
-		"  memory_cache_bytes: 134217728\n",
-		"  page_size: 2097152\n",
-		"  fill_pages: 6\n",
 		"  inflight_bytes: 536870912\n",
+		"  max_concurrent_chunk_fills: 32\n",
 		"  chunk_size: 33554432\n",
 		"  max_neighbors: 32\n",
 		"  expected_size: 150\n",
-		"  lookahead: 12\n",
-		`  metadata_ttl: "10m"`,
 		"  cache_tags: false\n",
-		"  hedge: true\n",
 	} {
 		if !strings.Contains(cfgText, want) {
 			t.Fatalf("rendered config lacks %q:\n%s", want, cfgText)
 		}
 	}
 
-	// Unset knobs are left to the agent defaults.
-	if strings.Contains(cfgText, "cell_size") || strings.Contains(cfgText, "chunk_timeout") {
-		t.Fatalf("unset knobs rendered:\n%s", cfgText)
+	// Removed knobs are never rendered.
+	if strings.Contains(cfgText, "lookahead") || strings.Contains(cfgText, "hedge") {
+		t.Fatalf("removed knobs rendered:\n%s", cfgText)
 	}
 
 	c := config.NewDefault()
@@ -203,9 +178,9 @@ func TestRendersEnabledCachemesh(t *testing.T) {
 	}
 
 	m := c.Cachemesh
-	if !m.Enabled || m.ContentRoot != "/data/containerd/io.containerd.content.v1.content" || m.MemoryCacheBytes != 128<<20 || m.PageSize != 2<<20 ||
-		m.FillPages != 6 || m.InflightBytes != 512<<20 || m.ChunkSize != 32<<20 || m.MaxNeighbors != 32 ||
-		m.ExpectedSize != 150 || m.Lookahead != 12 || m.MetadataTTL != 10*time.Minute || m.CacheTags {
+	if !m.Enabled || m.ContentRoot != "/data/containerd/io.containerd.content.v1.content" ||
+		m.InflightBytes != 512<<20 || m.MaxConcurrentChunkFills != 32 || m.ChunkSize != 32<<20 || m.MaxNeighbors != 32 ||
+		m.ExpectedSize != 150 || m.CacheTags || !m.VerifyDigest {
 		t.Fatalf("parsed cachemesh config: %+v", m)
 	}
 

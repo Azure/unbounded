@@ -38,3 +38,8 @@ app.kubernetes.io/name: gantry
 	capabilities = ["pull", "resolve"]
 	dial_timeout = "200ms"
 {{- end }}
+
+{{- /* containerd content store on the node, read by cachemesh. */ -}}
+{{- define "gantry.cachemeshContentRoot" -}}
+{{- .Values.gantry.cachemesh.contentRoot | default "/var/lib/containerd/io.containerd.content.v1.content" -}}
+{{- end }}

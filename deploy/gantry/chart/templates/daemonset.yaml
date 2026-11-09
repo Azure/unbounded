@@ -138,7 +138,7 @@ spec:
               mountPath: {{ .Values.containerd.mountPath }}
             {{- if and .Values.gantry.cachemesh .Values.gantry.cachemesh.enabled }}
             - name: containerd-content
-              mountPath: {{ .Values.gantry.cachemesh.contentRoot | default "/var/lib/containerd/io.containerd.content.v1.content" }}
+              mountPath: {{ include "gantry.cachemeshContentRoot" . }}
               readOnly: true
             {{- end }}
       volumes:
@@ -164,6 +164,6 @@ spec:
         # the blobs containerd writes and keeps no copy of its own.
         - name: containerd-content
           hostPath:
-            path: {{ .Values.gantry.cachemesh.contentRoot | default "/var/lib/containerd/io.containerd.content.v1.content" }}
+            path: {{ include "gantry.cachemeshContentRoot" . }}
             type: Directory
         {{- end }}

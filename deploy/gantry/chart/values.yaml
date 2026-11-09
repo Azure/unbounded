@@ -97,10 +97,6 @@ gantry:
     # for 100k nodes with 256, which at about 150 agents makes every agent a
     # direct neighbor of every other one (a 1-D grid); set 256 to get that.
     maxNeighbors: 0
-    # Agents per grid cell (4).
-    cellSize: 0
-    # log2 of the partition count (20).
-    partitionBits: 0
     # Stripe size in bytes, a power of two between 1MiB and 1GiB (64MiB).
     # Must be the same on every agent.
     chunkSize: 0
@@ -113,43 +109,20 @@ gantry:
     # defaults are). Empty uses
     # /var/lib/containerd/io.containerd.content.v1.content.
     contentRoot: ""
-    # Hot page tier in bytes: pages read from the content store by
-    # concurrent readers that stay in memory (512MiB). Chunk memory is at most about this plus
-    # inflightBytes plus pageSize x (fillPages x maxConcurrentChunkFills + one
-    # page per active reader), about 3.3GiB with the defaults; measured peaks
-    # were about 3GiB during a 142-node 40GB pull and about 0.6GiB idle. The
-    # default 8Gi memory limit is ample; 4Gi also held in the benchmark.
-    memoryCacheBytes: 0
-    # Unit of in-flight buffers, content store reads, read coalescing, and
-    # the hot tier (1MiB): a power of two between 64KiB and chunkSize.
-    pageSize: 0
-    # In-flight pages per chunk fill (4).
-    fillPages: 0
-    # Memory fills borrow beyond fillPages when a reader lags behind a fill
-    # that peers also read and the content store does not hold the bytes
-    # yet, and to keep chunks peers read (or this agent owns) in memory for
-    # later peers (up to 30s unused). When exhausted, the slowest such
-    # reader paces the fill (2GiB).
+    # Memory fills borrow beyond their 4MiB window when a reader lags behind
+    # a fill that peers also read and the content store does not hold the
+    # bytes yet, and to keep chunks peers read (or this agent owns) in
+    # memory for later peers (up to 30s unused). When exhausted, the slowest
+    # such reader paces the fill (2GiB). Chunk memory is at most about this
+    # plus 4MiB per concurrent fill plus 1MiB per active reader; measured
+    # peaks were about 3GiB during a 142-node 40GB pull and about 0.6GiB
+    # idle. The default 8Gi memory limit is ample; 4Gi also held in the
+    # benchmark.
     inflightBytes: 0
-    # Chunks of one blob fetched ahead of the one being written (8).
-    lookahead: 0
     # Concurrent chunk fills from peers or the origin (64).
     maxConcurrentChunkFills: 0
-    # Concurrent chunk responses to peers (512); more get 429.
-    maxConcurrentChunkServes: 0
-    # Per-attempt chunk timeout (5m) and no-progress timeout (30s).
-    chunkTimeout: ""
-    chunkStallTimeout: ""
-    # Attempts per chunk (4).
-    chunkAttempts: 0
-    # Freshness of cached tag resolutions, at least 5m (5m).
-    metadataTTL: ""
     # Serve anonymous manifest-by-tag requests from the mesh metadata cache.
     cacheTags: true
     # Hash every full blob served through the mesh; a mismatch aborts the
     # response before its last byte and drops the cached chunks.
     verifyDigest: true
-    # Hedge slow chunk requests to an alternate peer.
-    hedge: true
-    # Lease that elects the mesh leader ("gantry-cachemesh").
-    leaseName: ""

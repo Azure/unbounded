@@ -172,20 +172,18 @@ func newCachemeshAgent(c *config.Config, origin ifaces.OriginPuller, reg *metric
 		return nil, fmt.Errorf("cachemesh: %w", err)
 	}
 
-	lease := kubelease.New(client.CoordinationV1().Leases(c.CachemeshNamespace()), cm.LeaseName)
+	lease := kubelease.New(client.CoordinationV1().Leases(c.CachemeshNamespace()), config.CachemeshLeaseName)
 	logger = logger.With(slog.String("subsystem", "cachemesh"))
 	m := newCachemeshMetrics(reg)
 
 	mesh, err := cachemesh.New(cachemesh.Config{
-		ID:            cachemeshMemberID(c),
-		Addr:          addr,
-		Transport:     meshfetch.NewControlTransport(),
-		Lease:         lease,
-		Logger:        logger,
-		PartitionBits: uint8(cm.PartitionBits), //nolint:gosec // validated to 0..24
-		CellSize:      cm.CellSize,
-		MaxNeighbors:  cm.MaxNeighbors,
-		ExpectedSize:  cm.ExpectedSize,
+		ID:           cachemeshMemberID(c),
+		Addr:         addr,
+		Transport:    meshfetch.NewControlTransport(),
+		Lease:        lease,
+		Logger:       logger,
+		MaxNeighbors: cm.MaxNeighbors,
+		ExpectedSize: cm.ExpectedSize,
 		Hooks: cachemesh.Hooks{
 			OnControlError: func(cachemesh.Endpoint, error) { m.controlErrors.Inc() },
 			OnLeaseError:   func(op string, _ error) { m.leaseErrors.WithLabelValues(op).Inc() },
@@ -222,7 +220,7 @@ func newCachemeshAgent(c *config.Config, origin ifaces.OriginPuller, reg *metric
 	logger.Info("cachemesh configured",
 		slog.String("id", mesh.ID()),
 		slog.String("addr", addr),
-		slog.String("lease", c.CachemeshNamespace()+"/"+cm.LeaseName),
+		slog.String("lease", c.CachemeshNamespace()+"/"+config.CachemeshLeaseName),
 		slog.Int64("chunk_size", cm.ChunkSize),
 		slog.String("content_root", cm.ContentRoot),
 		slog.Bool("content_readable", content != nil),

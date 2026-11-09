@@ -20,7 +20,7 @@ gantry:
     # Chunk store: agent defaults (no private chunk files: containerd's
     # content store, mounted read-only from
     # /var/lib/containerd/io.containerd.content.v1.content, is the only disk
-    # copy; 2GiB in-flight budget, 512MiB hot page tier, 1MiB pages).
+    # copy; 2GiB in-flight budget, 1MiB pages).
     # Override with --set gantry.cachemesh.<key>=... to compare, for
     # example inflightBytes=1073741824.
     # containerd verifies every blob digest itself, so the agent does not hash
