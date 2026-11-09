@@ -32,8 +32,9 @@ pub(crate) fn default_disk_alignment() -> page_alloc::Alignment {
 
 /// Minimum idle buffers each worker's pool keeps per capacity class.
 ///
-/// The actual per-class cap is [`pool_idle_per_class`]: as many full pages as
-/// the [`ResourceClass::Pool`] budget covers, since idle storage stays charged
+/// The actual per-class cap is [`pool_idle_per_class`]: as many of the
+/// smallest pages as the [`ResourceClass::Pool`] budget covers (the published
+/// page size is not known when the pool is built), since idle storage stays charged
 /// to that class and its byte budget is the real bound. A small fixed count
 /// made every page past the first few under high concurrency map on take and
 /// unmap on return. The cap is a ceiling, not a steady state:
@@ -44,10 +45,10 @@ pub(crate) fn default_disk_alignment() -> page_alloc::Alignment {
 pub(crate) const POOL_IDLE_PER_CLASS: usize = 4;
 
 /// Per-class idle cap for a worker whose [`ResourceClass::Pool`] budget is
-/// `pool_bytes`: the number of full pages it covers, at least
+/// `pool_bytes`: the number of smallest pages it covers, at least
 /// [`POOL_IDLE_PER_CLASS`]. Idle bytes stay bounded by the budget itself.
 pub(crate) fn pool_idle_per_class(pool_bytes: usize) -> usize {
-    (pool_bytes / PAGE_BYTES as usize).max(POOL_IDLE_PER_CLASS)
+    (pool_bytes / racer_wire::object::PageSize::MIN.get() as usize).max(POOL_IDLE_PER_CLASS)
 }
 
 /// Writable aligned ciphertext storage from one worker's pool. Dropping it
@@ -4980,7 +4981,7 @@ pub(crate) mod tests {
 
     #[test]
     fn pool_idle_cap_follows_pool_budget() {
-        let page = PAGE_BYTES as usize;
+        let page = racer_wire::object::PageSize::MIN.get() as usize;
         assert_eq!(pool_idle_per_class(0), POOL_IDLE_PER_CLASS);
         assert_eq!(pool_idle_per_class(page * 2), POOL_IDLE_PER_CLASS);
         assert_eq!(pool_idle_per_class(page * 64 + page - 1), 64);
