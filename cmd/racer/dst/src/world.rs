@@ -677,6 +677,13 @@ impl<'s> World<'s> {
                 self.apply(fault)?;
             }
             if self.steps >= self.scenario.max_steps {
+                if self.scenario.step_budget_fails {
+                    return Err(self.fail(
+                        Class::Liveness,
+                        "step-budget",
+                        format!("step budget of {} exhausted", self.scenario.max_steps),
+                    ));
+                }
                 return Ok(false);
             }
             let now = self.engine.now();
@@ -754,7 +761,30 @@ impl<'s> World<'s> {
                 Some(at) if at <= end => self.advance(at)?,
                 Some(_) => {
                     self.advance(end)?;
+                    self.check(Class::Safety, false)?;
                     self.check(Class::Liveness, false)?;
+                    let expect = self.scenario.expect_quiescent
+                        || self
+                            .scenario
+                            .invariants
+                            .iter()
+                            .any(|i| i.class == Class::Resource);
+                    if expect {
+                        let busy: Vec<String> = self
+                            .roles()
+                            .into_iter()
+                            .filter(|r| r.next != Next::Done && r.next != Next::Idle)
+                            .map(|r| format!("node {} role {}", r.node, r.name))
+                            .collect();
+                        return Err(self.fail(
+                            Class::Liveness,
+                            "not-quiescent",
+                            format!(
+                                "reached end without going quiescent; still scheduled: {}",
+                                busy.join(", ")
+                            ),
+                        ));
+                    }
                     return Ok(false);
                 }
                 None => {

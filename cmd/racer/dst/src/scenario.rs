@@ -95,6 +95,13 @@ pub struct Scenario {
     pub max_steps: u64,
     /// Steps allowed without virtual time advancing (busy-loop detector).
     pub busy_limit: u64,
+    /// Whether exhausting `max_steps` fails the run (on by default). Off
+    /// lets ad-hoc short runs (`DST_STEPS`) stop early without failing.
+    pub step_budget_fails: bool,
+    /// Whether a Full-fidelity run must go quiescent before `end`. Implied
+    /// by any [`Class::Resource`](crate::invariants::Class) invariant, since
+    /// those only run at quiescence.
+    pub expect_quiescent: bool,
     /// Whether node operating systems draw operation delays, completion
     /// order and cancel order from [`Choices`] (on by default). Off keeps
     /// FIFO order.
@@ -145,6 +152,8 @@ impl Scenario {
             end: 10 * SECONDS,
             max_steps: 1_000_000,
             busy_limit: 100_000,
+            step_budget_fails: true,
+            expect_quiescent: false,
             seeded_os: true,
             charge_bytes: true,
             model: None,
@@ -234,6 +243,18 @@ impl Scenario {
     /// Step budget.
     pub fn max_steps(mut self, steps: u64) -> Self {
         self.max_steps = steps;
+        self
+    }
+
+    /// Let a run that exhausts `max_steps` stop without failing.
+    pub fn allow_truncation(mut self) -> Self {
+        self.step_budget_fails = false;
+        self
+    }
+
+    /// Fail a Full-fidelity run that reaches `end` without going quiescent.
+    pub fn expect_quiescent(mut self) -> Self {
+        self.expect_quiescent = true;
         self
     }
 

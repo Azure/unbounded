@@ -4,6 +4,7 @@ use std::{
     future::pending,
     path::Path,
     rc::Rc,
+    time::Duration,
 };
 
 use racer_dst::{
@@ -17,7 +18,7 @@ use racer_dst::{
     scenarios,
     world::{DoneFlag, Fault, LaneRole, SimRole, wall_nanos},
 };
-use racer_io::{exec::Lane, exec::Next, sim::SimOs};
+use racer_io::{ctx::VirtualClock, exec::Lane, exec::Next, sim::SimOs};
 
 fn counter(os: &SimOs) -> u64 {
     let bytes = os.read_file(Path::new("/state/counter")).unwrap();
@@ -160,7 +161,8 @@ fn clock_rate_and_jump_skew_monotonic_time() {
 fn os_operations_are_charged_from_the_cost_table() {
     let base = Scenario::new("t")
         .roles(|env| lane_pair(env, 2))
-        .with(all_roles_settled());
+        .with(all_roles_settled())
+        .end(60 * SECONDS);
     let mut costs = base.costs;
     costs.disk_latency_ns = SECONDS;
     let fast = run_twice(&base, &Source::Seed(5)).unwrap();
@@ -241,7 +243,88 @@ fn busy_loop_and_step_budget() {
         .busy_limit(1000)
         .max_steps(10)
         .run(Choices::seeded(1));
+    let failure = out.failure.unwrap();
+    assert_eq!(
+        (failure.class, failure.name.as_str(), out.steps),
+        (Class::Liveness, "step-budget", 10)
+    );
+    let out = s
+        .clone()
+        .busy_limit(1000)
+        .max_steps(10)
+        .allow_truncation()
+        .run(Choices::seeded(1));
     assert_eq!((out.failure, out.steps, out.quiescent), (None, 10, false));
+}
+
+/// Re-arms a 100 ms timer forever.
+struct Rearm(VirtualClock);
+
+impl SimRole for Rearm {
+    fn step(&mut self) -> racer_io::Result<Next> {
+        Ok(Next::WaitUntil(self.0.now() + Duration::from_millis(100)))
+    }
+
+    fn woken(&self) -> bool {
+        false
+    }
+
+    fn pending(&self) -> bool {
+        true
+    }
+}
+
+#[test]
+fn never_quiescent_run_fails_when_quiescence_is_expected() {
+    let s = Scenario::new("t").end(SECONDS).roles(|env| {
+        Ok(vec![(
+            "rearm".into(),
+            Box::new(Rearm(env.clock.clone())) as Box<dyn SimRole>,
+        )])
+    });
+    let out = s.run(Choices::seeded(1));
+    assert_eq!((out.failure, out.quiescent), (None, false));
+    let failure = s
+        .clone()
+        .expect_quiescent()
+        .run(Choices::seeded(1))
+        .failure
+        .unwrap();
+    assert_eq!(
+        (failure.class, failure.name.as_str()),
+        (Class::Liveness, "not-quiescent")
+    );
+    assert!(failure.message.contains("node 0 role rearm"), "{failure}");
+    let failure = s
+        .with(all_roles_settled())
+        .run(Choices::seeded(1))
+        .failure
+        .unwrap();
+    assert_eq!(failure.name, "not-quiescent");
+}
+
+#[test]
+fn safety_invariants_run_after_the_final_advance() {
+    let s = Scenario::new("t")
+        .end(SECONDS)
+        .roles(|env| {
+            Ok(vec![(
+                "rearm".into(),
+                Box::new(Rearm(env.clock.clone())) as Box<dyn SimRole>,
+            )])
+        })
+        .invariant("before-end", Class::Safety, |p| {
+            if p.now < SECONDS {
+                Ok(())
+            } else {
+                Err("reached end".into())
+            }
+        });
+    let failure = s.run(Choices::seeded(1)).failure.unwrap();
+    assert_eq!(
+        (failure.class, failure.name.as_str()),
+        (Class::Safety, "before-end")
+    );
 }
 
 #[test]
@@ -355,6 +438,9 @@ fn catalog_ci_seeds_pass_twice() {
         let s = scenarios::find(&entry.scenario).unwrap();
         let out = run_twice(&s, &entry.source).unwrap_or_else(|d| panic!("{entry}: {d}"));
         assert_eq!(out.failure, None, "{entry}");
+        if s.expect_quiescent {
+            assert!(out.quiescent, "{entry}");
+        }
     }
 }
 

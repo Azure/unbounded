@@ -121,7 +121,7 @@ fn main() -> ExitCode {
             continue;
         };
         if let Some(steps) = steps {
-            scenario = scenario.max_steps(steps);
+            scenario = scenario.max_steps(steps).allow_truncation();
         }
         ran += 1;
         match run_twice(&scenario, &entry.source) {

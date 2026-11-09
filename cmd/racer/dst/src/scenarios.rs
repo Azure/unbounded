@@ -1013,6 +1013,7 @@ pub fn catalog() -> Vec<Scenario> {
         Scenario::new("lane-pair")
             .roles(|env| lane_pair(env, 8))
             .with(all_roles_settled())
+            .expect_quiescent()
             .end(10 * SECONDS),
         Scenario::new("lane-pair-faults")
             .nodes(3)
@@ -1040,6 +1041,7 @@ pub fn catalog() -> Vec<Scenario> {
                 first_node: 0,
             })
             .with(all_roles_settled())
+            .expect_quiescent()
             .invariant("bounded-steps-per-node", Class::Safety, |probe| {
                 // Every node runs at most two roles.
                 let mut per = [0u32; 3];
