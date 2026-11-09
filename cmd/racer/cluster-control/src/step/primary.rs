@@ -67,6 +67,9 @@ pub struct PassInputs<'a> {
     pub current: Option<&'a StateRecord>,
     /// Image this process holds, if any.
     pub previous_image: Option<&'a Image>,
+    /// Every seat Lease was read or confirmed absent. When false, `live` may
+    /// miss a live seat, so keyring roots are not evicted.
+    pub seats_complete: bool,
     /// Live seats by index.
     pub live: &'a BTreeMap<usize, LeaseObservation>,
     pub writer: &'a Writer,
@@ -209,6 +212,7 @@ pub fn plan_pass(i: &PassInputs<'_>, rng: &mut dyn Entropy) -> Result<PassPlan, 
         &durable,
         catalog.as_deref(),
         &offers(i.live),
+        i.seats_complete,
         i.wall_unix,
         rng,
     )
@@ -507,6 +511,7 @@ mod tests {
                 live: &live,
                 writer: &w,
                 wall_unix: NOW,
+                seats_complete: true,
                 membership_changed_unix: changed,
             },
             rng,

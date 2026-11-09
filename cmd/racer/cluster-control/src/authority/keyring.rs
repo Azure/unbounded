@@ -18,7 +18,8 @@
 //! one offered longest ago. Leaves that root issued stop verifying before
 //! they expire: a live seat outranks them. Evicted roots are not retired,
 //! because the seat that offered one may still hold its issuer and offer it
-//! again.
+//! again. Eviction waits for a pass that read every seat Lease, since an
+//! unread seat may still offer its root.
 
 use crate::entropy::Entropy;
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -404,6 +405,7 @@ pub fn plan(
         current,
         Some(catalog),
         offers,
+        true,
         now,
         &mut crate::entropy::OsEntropy,
     )
@@ -433,11 +435,16 @@ fn expire_roots(d: &mut Durable, now: u64, skip: impl Fn(&Root) -> bool) {
 /// the ClusterCache watch synced or when it failed to build. Cache keys are
 /// then neither added nor removed: an unknown catalog is not an empty one,
 /// and dropping keys would give existing caches new keys later.
+///
+/// `evict` is false when `offers` may be incomplete, for example after a
+/// failed seat Lease read: a root missing from `offers` may then belong to a
+/// live seat, so full slots refuse new offers instead of evicting.
 pub fn plan_with(
     policy: &Policy,
     current: &Durable,
     catalog: Option<&[CacheDefinition]>,
     offers: &[Offer],
+    evict: bool,
     now: u64,
     rng: &mut dyn Entropy,
 ) -> Result<Plan, KeyringError> {
@@ -539,13 +546,16 @@ pub fn plan_with(
             // all seats unready until those roots expire. Evict the unoffered
             // root closest to its deadline. It is not retired, so a holder
             // that offers it again is admitted like a new one.
-            let victim = d
-                .roots
-                .iter()
-                .enumerate()
-                .filter(|(_, r)| !offered.contains(&r.der))
-                .min_by_key(|(_, r)| (r.retain_until, r.not_after))
-                .map(|(i, _)| i);
+            let victim = evict
+                .then(|| {
+                    d.roots
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, r)| !offered.contains(&r.der))
+                        .min_by_key(|(_, r)| (r.retain_until, r.not_after))
+                        .map(|(i, _)| i)
+                })
+                .flatten();
             let Some(victim) = victim else {
                 refused += 1;
                 continue;
@@ -765,17 +775,26 @@ pub(crate) mod tests {
         )
         .unwrap()
         .durable;
-        let p = plan_with(&policy(), &d, None, &[], t, &mut OsEntropy).unwrap();
+        let p = plan_with(&policy(), &d, None, &[], true, t, &mut OsEntropy).unwrap();
         assert_eq!(p.durable.keys, d.keys);
         assert_eq!(p.durable.generation, d.generation);
         assert!(!p.changed);
         // Rotation still proceeds on the existing keys.
-        let p = plan_with(&policy(), &d, None, &[], d.next_rotation, &mut OsEntropy).unwrap();
+        let p = plan_with(
+            &policy(),
+            &d,
+            None,
+            &[],
+            true,
+            d.next_rotation,
+            &mut OsEntropy,
+        )
+        .unwrap();
         assert_eq!(p.durable.keys.len(), 8);
         assert!(d.keys.iter().all(|k| p.durable.keys.contains(k)));
         // An empty known catalog does drop them.
         assert!(
-            plan_with(&policy(), &d, Some(&[]), &[], t, &mut OsEntropy)
+            plan_with(&policy(), &d, Some(&[]), &[], true, t, &mut OsEntropy)
                 .unwrap()
                 .durable
                 .keys
@@ -982,6 +1001,20 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn incomplete_seat_reads_defer_eviction() {
+        let t = now();
+        let d = full_of_departed_roots(t);
+        let live = offers(2);
+        let p = plan_with(&policy(), &d, Some(&[]), &live, false, t, &mut OsEntropy).unwrap();
+        assert_eq!(p.evicted_roots, 0);
+        assert_eq!(p.refused_roots, 2);
+        assert_eq!(p.durable.roots, d.roots);
+        for o in &live {
+            assert!(!p.durable.root_committed(&o.der));
+        }
+    }
+
+    #[test]
     fn offered_roots_are_never_evicted() {
         let t = now();
         let mut d = full_of_departed_roots(t);
@@ -1138,6 +1171,7 @@ pub(crate) mod tests {
             &d,
             Some(&catalog),
             &[],
+            true,
             t,
             &mut SplitMix64::new(5),
         )
@@ -1147,6 +1181,7 @@ pub(crate) mod tests {
             &d,
             Some(&catalog),
             &[],
+            true,
             t,
             &mut SplitMix64::new(5),
         )
@@ -1161,6 +1196,7 @@ pub(crate) mod tests {
             &d,
             Some(&catalog),
             &[],
+            true,
             t,
             &mut SplitMix64::new(6),
         )
@@ -1170,7 +1206,7 @@ pub(crate) mod tests {
             serde_json::to_vec(&c.durable).unwrap()
         );
         assert_eq!(
-            plan_with(&policy(), &d, Some(&catalog), &[], t, &mut Failing).err(),
+            plan_with(&policy(), &d, Some(&catalog), &[], true, t, &mut Failing).err(),
             Some(KeyringError::Entropy)
         );
     }

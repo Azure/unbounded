@@ -489,20 +489,34 @@ async fn read_state(shared: &Shared) -> Result<(Value, Option<StateRecord>), Sta
 /// Seats as seen by the primary.
 struct SeatSnapshot {
     holders: BTreeMap<usize, (LeaseObservation, Value)>,
+    /// Every seat Lease was read or is NotFound. A failed read hides a seat
+    /// that may be live, so its root must not be evicted.
+    complete: bool,
 }
 
 async fn read_seats(t: &Term_) -> SeatSnapshot {
     let ns = &t.shared.config.namespace;
     let mut holders = BTreeMap::new();
+    let mut complete = true;
     for i in 0..annotations::MAX_SEATS {
-        let Ok(v) = lease::get(&t.shared.lease_api, ns, &annotations::seat_lease(i)).await else {
-            continue;
+        let v = match lease::get(&t.shared.lease_api, ns, &annotations::seat_lease(i)).await {
+            Ok(v) => v,
+            Err(e) => {
+                complete &= seat_read_complete(&e);
+                continue;
+            }
         };
         let o = lease::observe(&v);
         t.seat_observer.borrow_mut().observe(&o, Instant::now());
         holders.insert(i, (o, v));
     }
-    SeatSnapshot { holders }
+    SeatSnapshot { holders, complete }
+}
+
+/// A seat Lease read that failed still leaves the snapshot complete only
+/// when the Lease does not exist.
+fn seat_read_complete(e: &KubeError) -> bool {
+    matches!(e, KubeError::NotFound)
 }
 
 fn live_seats(t: &Term_, s: &SeatSnapshot) -> BTreeMap<usize, LeaseObservation> {
@@ -592,6 +606,7 @@ async fn reconcile(t: &Rc<Term_>) -> Result<(), StateError> {
                     ownership: &ownership,
                     current: current.as_ref(),
                     previous_image: previous_image.as_ref(),
+                    seats_complete: seats.complete,
                     live: &live,
                     writer: &writer,
                     wall_unix: unix_now(),
@@ -924,6 +939,25 @@ pub async fn reconcile_webhook(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_not_found_seat_reads_are_complete() {
+        use super::seat_read_complete;
+        use crate::kube::KubeError;
+        assert!(seat_read_complete(&KubeError::NotFound));
+        for e in [
+            KubeError::Conflict,
+            KubeError::Gone,
+            KubeError::Unauthorized,
+            KubeError::Forbidden,
+            KubeError::Invalid,
+            KubeError::TooLarge,
+            KubeError::Throttled,
+            KubeError::Unavailable,
+        ] {
+            assert!(!seat_read_complete(&e));
+        }
+    }
+
     #[test]
     fn ready_floor_grace() {
         use super::ready_floor;

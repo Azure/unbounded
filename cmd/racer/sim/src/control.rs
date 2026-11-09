@@ -1949,6 +1949,7 @@ impl ControlSim {
                 live: &live,
                 writer: self.pods[pod as usize].primary.as_ref().expect("primary"),
                 wall_unix: self.wall_secs(),
+                seats_complete: true,
                 membership_changed_unix: self.membership_changed,
             },
             &mut self.rng,

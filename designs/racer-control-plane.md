@@ -76,7 +76,8 @@ encoded-byte limits apply during rotation as well as steady state. Each process
 start offers a new root, so restarts can fill the keyring. When it is full, the
 primary evicts the root that no seat offers and expires first. Leaves from an
 evicted root stop verifying early, but that is better than leaving live seats
-unready until old roots expire.
+unready until old roots expire. If any seat Lease read failed, the primary
+refuses the offer instead, since an unread seat may still offer its root.
 
 ## Membership
 
