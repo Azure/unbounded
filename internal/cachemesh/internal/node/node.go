@@ -405,6 +405,13 @@ func (n *Node) Self() view.Slot { return n.slot }
 // JoinRetry returns the defaulted join, leave, and catch-up retry interval.
 func (n *Node) JoinRetry() time.Duration { return n.cfg.JoinRetry }
 
+// Seeds appends the current join seeds to dst and returns it. They come
+// from Config.Seeds, the Lease record (leader address and published
+// seeds), and views and replies seen while joining; unresponsive seeds are
+// dropped while at least one is kept. The list stops changing once this
+// member is in a view.
+func (n *Node) Seeds(dst []string) []string { return append(dst, n.seeds...) }
+
 // Health returns the neighbor health tracker.
 func (n *Node) Health() *health.Tracker { return n.hl }
 
