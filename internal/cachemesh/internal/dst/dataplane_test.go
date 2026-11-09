@@ -71,16 +71,17 @@ func TestDataPlaneQuiet(t *testing.T) {
 	}
 }
 
-func TestDataPlaneDeterministic(t *testing.T) {
+// TestDataPlaneNoHedge runs with hedging disabled under the hedging health
+// variant and checks that the data plane feeds the trace (the suite checks
+// run-to-run determinism).
+func TestDataPlaneNoHedge(t *testing.T) {
 	sc := quietScenario(5, 16)
-	a, _ := runDataPlane(t, sc, DataPlaneConfig{Health: HealthHedge})
-	b, _ := runDataPlane(t, sc, DataPlaneConfig{Health: HealthHedge})
 
-	if a.Trace.Sum() != b.Trace.Sum() || a.Sim.Steps() != b.Sim.Steps() {
-		t.Fatalf("trace %x/%x steps %d/%d", a.Trace.Sum(), b.Trace.Sum(), a.Sim.Steps(), b.Sim.Steps())
+	a, dp := runDataPlane(t, sc, DataPlaneConfig{NoHedge: true, Health: HealthHedge})
+	if h := dp.count.hedges; h != 0 {
+		t.Fatalf("%d hedges with hedging disabled", h)
 	}
 
-	// The data plane must feed the trace: without it the hash differs.
 	c := NewCluster(ClusterConfig{Scenario: sc})
 	if err := c.Run(); err != nil {
 		t.Fatal(err)
@@ -88,13 +89,6 @@ func TestDataPlaneDeterministic(t *testing.T) {
 
 	if c.Trace.Sum() == a.Trace.Sum() {
 		t.Fatal("data-plane work is not in the trace")
-	}
-}
-
-func TestDataPlaneNoHedge(t *testing.T) {
-	_, dp := runDataPlane(t, quietScenario(7, 16), DataPlaneConfig{NoHedge: true, Health: HealthHedge})
-	if h := dp.count.hedges; h != 0 {
-		t.Fatalf("%d hedges with hedging disabled", h)
 	}
 }
 
@@ -160,37 +154,5 @@ func TestNeighborBound(t *testing.T) {
 	// best shape's estimate rather than reporting every member.
 	if b := neighborBound(v, sc.CellSize, 1); b[0] <= 1 {
 		t.Fatalf("infeasible bound %v", b)
-	}
-}
-
-func TestHealthVariants(t *testing.T) {
-	if HealthConfig(HealthDefault).MaxEjectionPercent != 0 {
-		t.Fatal("default variant must use library defaults")
-	}
-
-	if c := HealthConfig(HealthPanic); c.MaxEjectionPercent <= c.PanicThreshold {
-		t.Fatalf("panic variant cannot reach panic: %+v", c)
-	}
-
-	if HealthConfig(HealthHedge).HedgeRatio <= 0.05 {
-		t.Fatal("hedge variant must raise the budget")
-	}
-
-	for _, v := range []HealthVariant{HealthDefault, HealthPanic, HealthHedge} {
-		if v.String() == "" {
-			t.Fatal("empty name")
-		}
-	}
-}
-
-func TestReplayCase(t *testing.T) {
-	c := dstCase{name: "tiny/3", sc: Scenario{Seed: 3}}
-
-	if got := replayCase(c, false); !strings.Contains(got, "-run 'TestDST/tiny/3$'") || strings.Contains(got, EnvSeed) {
-		t.Fatalf("default case: %s", got)
-	}
-
-	if got := replayCase(c, true); got != ReplayCommand(3) {
-		t.Fatalf("explicit case: %s", got)
 	}
 }

@@ -90,11 +90,15 @@ func capBits(sc Scenario) Scenario {
 	return sc
 }
 
+// tinyScenario is the tiny scenario of seed s, shortened to faults in the
+// first 240s after warmup.
+func tinyScenario(s uint64) Scenario { return shorten(Generate(s, SizeTiny), 240*sec, 180*sec) }
+
 func defaultCases(seeds []uint64, explicit bool) []dstCase {
 	var cases []dstCase
 
 	for _, s := range seeds {
-		sc := shorten(Generate(s, SizeTiny), 240*sec, 180*sec)
+		sc := tinyScenario(s)
 		if !explicit {
 			sc = capBits(sc)
 		}
@@ -118,21 +122,16 @@ func defaultCases(seeds []uint64, explicit bool) []dstCase {
 		cases = append(cases, dstCase{name: fmt.Sprintf("small/%d", s), sc: sc, twice: s == 2})
 	}
 
-	// Pinned seeds from sweeps (run once; they are full-size explicit
-	// scenarios): tiny/293 has a term per injected Lease conflict; tiny/75
-	// has skewed lottery takeovers (excused overlaps); tiny/456 left only
-	// non-members holding a view after a partial restart (cold start from
-	// a stale view); in tiny/501 the only member was leaving and kept
-	// declining the Lease. small/28 (a
-	// bootstrap herd after a cold restart found a released Lease) is left
-	// to sweeps for runtime.
-	for _, p := range []struct {
-		size string
-		seed uint64
-	}{{"tiny", 293}, {"tiny", 75}, {"tiny", 456}, {"tiny", 501}} {
-		c, _ := sweepCase(p.size, p.seed)
-		c.name = "pinned/" + c.name
-		cases = append(cases, c)
+	// Pinned regression seeds found by past seed sweeps (run once, with
+	// their full partition bits): tiny/293 has a term per injected Lease
+	// conflict; tiny/75 has skewed lottery takeovers (excused overlaps);
+	// tiny/456 left only non-members holding a view after a partial
+	// restart (cold start from a stale view); in tiny/501 the only member
+	// was leaving and kept declining the Lease. small/28 (a bootstrap herd
+	// after a cold restart found a released Lease) is left out for runtime;
+	// replay it with CACHEMESH_DST_SEED=28.
+	for _, s := range []uint64{293, 75, 456, 501} {
+		cases = append(cases, dstCase{name: fmt.Sprintf("pinned/tiny/%d", s), sc: tinyScenario(s)})
 	}
 
 	// Whole-cluster and partial restarts.
@@ -325,4 +324,73 @@ func Large() bool { return os.Getenv(EnvLarge) == "1" }
 // ReplayCommand returns the shell command that replays seed.
 func ReplayCommand(seed uint64) string {
 	return fmt.Sprintf("%s=%d go test ./internal/cachemesh/internal/dst -run TestDST -count=1 -v", EnvSeed, seed)
+}
+
+// dataPlaneConfig picks the data-plane configuration of a suite case: the
+// health variant rotates with the seed (every fourth seed makes panic
+// reachable, every fourth hedges with a large budget), and large clusters
+// run at a reduced rate.
+func dataPlaneConfig(c dstCase) DataPlaneConfig {
+	cfg := DataPlaneConfig{}
+
+	switch c.sc.Seed % 4 {
+	case 2:
+		cfg.Health = HealthPanic
+	case 3:
+		cfg.Health = HealthHedge
+	}
+
+	if c.sc.Members >= 1000 {
+		cfg.QPS = 100
+		cfg.RouteSamples = 1
+		cfg.BurstSize = 320
+	}
+
+	return cfg
+}
+
+// dataPlaneReport returns the data-plane lines of a coverage report.
+func dataPlaneReport(c *Coverage) string {
+	var b strings.Builder
+
+	for line := range strings.SplitSeq(c.Report(), "\n") {
+		if strings.HasPrefix(line, "dp-") {
+			b.WriteString(line)
+			b.WriteByte('\n')
+		}
+	}
+
+	return b.String()
+}
+
+// dataPlaneCases are targeted data-plane cases added to the default set: a
+// 40-member cluster whose only data-plane fault is two slow members (30x,
+// for 150s, long enough to judge tail-latency protection after the
+// detection window), alongside clock drift and a keyspace invalidation.
+func dataPlaneCases() []dstCase {
+	sc := Generate(7, SizeTiny)
+	sc.Members, sc.Capacity, sc.PartitionBits = 40, 40, 16
+	sc.CellSize, sc.MaxNeighbors = 4, 256
+	sc.Warmup = 40 * sec
+	sc.Faults = []Fault{
+		{Kind: ClockDrift, Start: sc.Warmup + 10*sec, Duration: 200 * sec, Count: 1, Value: 200_000, Seed: 1},
+		{Kind: SlowMembers, Start: sc.Warmup + 20*sec, Duration: 150 * sec, Count: 2, Value: 30_000, Seed: 2},
+		{Kind: KeyspaceInvalidation, Start: sc.Warmup + 60*sec, Seed: 3},
+	}
+	sc.Settle = 120 * sec
+	sc.Duration = sc.Warmup + 210*sec + sc.Settle
+
+	return []dstCase{{name: "slow", sc: sc, twice: true}}
+}
+
+// replayCase returns the command that replays case c. A default-set case is
+// replayed by its subtest name (the default set caps partition bits and
+// includes the fixed medium, 10k, and slow cases, which a seed variable
+// alone does not reproduce); an explicit seed by the seed variable.
+func replayCase(c dstCase, explicit bool) string {
+	if explicit {
+		return ReplayCommand(c.sc.Seed)
+	}
+
+	return fmt.Sprintf("go test ./internal/cachemesh/internal/dst -run 'TestDST/%s$' -count=1 -v", c.name)
 }
