@@ -7,6 +7,7 @@
 //! so a fingerprint either resolves deterministically or is a protocol error.
 
 use crate::*;
+use racer_wire::codec::{Endian, Reader};
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
@@ -19,6 +20,12 @@ use std::{
 /// one KiB per certificate. This bound keeps eight such certificates with wide
 /// margin while bounding what a single message can attach.
 pub const MAX_CHAIN_BYTES: usize = 16 * 1024;
+
+/// Maximum certificates in one chain.
+pub const MAX_CHAIN_CERTS: usize = 8;
+
+/// Largest certificate that fits in a chain alone, after its 4-byte length.
+pub const MAX_CERT_BYTES: usize = MAX_CHAIN_BYTES - 4;
 
 /// Maximum distinct chains attached to one message: every proof signer of an
 /// envelope (original and [`MAX_HOPS`] hops) plus the outer session signer.
@@ -46,12 +53,12 @@ pub struct Chain {
 impl Chain {
     /// Encode and fingerprint an accepted chain, leaf first.
     pub fn new(certificates: &[Vec<u8>]) -> Result<Arc<Self>> {
-        if certificates.is_empty() || certificates.len() > 8 {
+        if certificates.is_empty() || certificates.len() > MAX_CHAIN_CERTS {
             return Err(Error::Unauthorized);
         }
         let mut encoded = Vec::new();
         for cert in certificates {
-            if cert.is_empty() || cert.len() > 16384 {
+            if cert.is_empty() || cert.len() > MAX_CERT_BYTES {
                 return Err(Error::Unauthorized);
             }
             encoded.extend_from_slice(&(cert.len() as u32).to_be_bytes());
@@ -68,20 +75,19 @@ impl Chain {
         if encoded.len() > MAX_CHAIN_BYTES {
             return Err(Error::Unauthorized);
         }
-        let mut rest = encoded;
+        let mut reader = Reader::new(encoded, Endian::Big);
         let mut certificates = Vec::new();
-        while !rest.is_empty() {
-            if rest.len() < 4 || certificates.len() == 8 {
+        while !reader.remaining().is_empty() {
+            if certificates.len() == MAX_CHAIN_CERTS {
                 return Err(Error::Unauthorized);
             }
-            let n =
-                u32::from_be_bytes(rest[..4].try_into().map_err(|_| Error::Unauthorized)?) as usize;
-            rest = &rest[4..];
-            if n == 0 || n > 16384 || rest.len() < n {
+            let cert = reader
+                .length_prefixed(MAX_CERT_BYTES)
+                .map_err(|_| Error::Unauthorized)?;
+            if cert.is_empty() {
                 return Err(Error::Unauthorized);
             }
-            certificates.push(rest[..n].to_vec());
-            rest = &rest[n..];
+            certificates.push(cert.to_vec());
         }
         if certificates.is_empty() {
             return Err(Error::Unauthorized);
@@ -164,24 +170,20 @@ pub(crate) fn decode_attachment(value: &[u8]) -> Result<Vec<Arc<Chain>>> {
     if binary(&bytes).as_bytes() != value {
         return Err(Error::InvalidRequest);
     }
-    let mut rest = bytes.as_slice();
+    let mut reader = Reader::new(&bytes, Endian::Big);
     let mut chains: Vec<Arc<Chain>> = Vec::new();
-    while !rest.is_empty() {
-        if rest.len() < 4 || chains.len() == MAX_CHAINS_PER_MESSAGE {
+    while !reader.remaining().is_empty() {
+        if chains.len() == MAX_CHAINS_PER_MESSAGE {
             return Err(Error::InvalidRequest);
         }
-        let n =
-            u32::from_be_bytes(rest[..4].try_into().map_err(|_| Error::InvalidRequest)?) as usize;
-        rest = &rest[4..];
-        if n > rest.len() {
-            return Err(Error::InvalidRequest);
-        }
-        let chain = Chain::decode(&rest[..n])?;
+        let encoded = reader
+            .length_prefixed(MAX_CHAIN_BYTES)
+            .map_err(|_| Error::InvalidRequest)?;
+        let chain = Chain::decode(encoded).map_err(|_| Error::InvalidRequest)?;
         if chains.iter().any(|c| c.fingerprint == chain.fingerprint) {
             return Err(Error::InvalidRequest);
         }
         chains.push(chain);
-        rest = &rest[n..];
     }
     if chains.is_empty() {
         return Err(Error::InvalidRequest);
@@ -285,6 +287,80 @@ impl SessionChains {
     #[cfg(feature = "test-util")]
     pub(crate) fn counts(&self) -> (usize, usize) {
         (self.sent.len(), self.received.len())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn framed(parts: &[&[u8]]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for part in parts {
+            bytes.extend_from_slice(&(part.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(part);
+        }
+        bytes
+    }
+
+    #[test]
+    fn chain_limits_agree_between_new_and_decode() {
+        let largest = vec![1; MAX_CERT_BYTES];
+        let chain = Chain::new(std::slice::from_ref(&largest)).unwrap();
+        assert_eq!(chain.encoded().len(), MAX_CHAIN_BYTES);
+        assert_eq!(
+            Chain::decode(chain.encoded()).unwrap().certificates(),
+            [largest]
+        );
+        assert!(Chain::new(&[vec![1; MAX_CERT_BYTES + 1]]).is_err());
+        let many = vec![vec![1]; MAX_CHAIN_CERTS];
+        assert!(Chain::decode(Chain::new(&many).unwrap().encoded()).is_ok());
+        let too_many = vec![vec![1]; MAX_CHAIN_CERTS + 1];
+        assert!(Chain::new(&too_many).is_err());
+        let parts: Vec<&[u8]> = too_many.iter().map(Vec::as_slice).collect();
+        assert!(Chain::decode(&framed(&parts)).is_err());
+    }
+
+    #[test]
+    fn chain_decode_rejects_bad_framing() {
+        let good = framed(&[b"ab", b"c"]);
+        assert_eq!(Chain::decode(&good).unwrap().certificates().len(), 2);
+        for end in (1..good.len()).filter(|&end| end != 6) {
+            assert_eq!(
+                Chain::decode(&good[..end]).err(),
+                Some(Error::Unauthorized),
+                "{end}"
+            );
+        }
+        assert!(Chain::decode(&[]).is_err());
+        assert!(Chain::decode(&framed(&[b""])).is_err());
+    }
+
+    #[test]
+    fn attachment_framing_errors_are_invalid_request() {
+        let chain = Chain::new(&[vec![1, 2, 3]]).unwrap();
+        let other = Chain::new(&[vec![4]]).unwrap();
+        let encoded = encode_attachment(&[chain.clone(), other]).unwrap();
+        assert_eq!(decode_attachment(encoded.as_bytes()).unwrap().len(), 2);
+        let bytes = STANDARD.decode(&encoded).unwrap();
+        // 11 bytes is the first framed chain alone: four of length, seven of chain.
+        for end in (1..bytes.len()).filter(|&end| end != 11) {
+            assert_eq!(
+                decode_attachment(binary(&bytes[..end]).as_bytes()).err(),
+                Some(Error::InvalidRequest),
+                "{end}"
+            );
+        }
+        // A malformed inner chain is the same fault class as bad outer framing.
+        assert_eq!(
+            decode_attachment(binary(&framed(&[&[0, 0, 0, 0]])).as_bytes()).err(),
+            Some(Error::InvalidRequest)
+        );
+        let duplicate = encode_attachment(&[chain.clone(), chain]).unwrap();
+        assert_eq!(
+            decode_attachment(duplicate.as_bytes()).err(),
+            Some(Error::InvalidRequest)
+        );
     }
 }
 

@@ -480,6 +480,33 @@ fn unique_node_lists_roundtrip_preserving_order_and_framing() {
 }
 
 #[test]
+fn node_list_decoding_rejects_truncated_and_empty_entries() {
+    let encoded = STANDARD
+        .decode(nodes(&[node(0), node(1)]).unwrap())
+        .unwrap();
+    for end in 1..encoded.len() {
+        if end == 40 {
+            continue;
+        }
+        assert_eq!(
+            decode_nodes(binary(&encoded[..end]).as_bytes()),
+            Err(Error::Unauthorized),
+            "{end}"
+        );
+    }
+    assert_eq!(
+        decode_nodes(binary(&[0; 4]).as_bytes()),
+        Err(Error::Unauthorized)
+    );
+    let mut oversize = 257u32.to_be_bytes().to_vec();
+    oversize.extend_from_slice(&[b'a'; 257]);
+    assert_eq!(
+        decode_nodes(binary(&oversize).as_bytes()),
+        Err(Error::Unauthorized)
+    );
+}
+
+#[test]
 fn node_list_encoding_rejects_duplicates_invalid_ids_and_excess_hops() {
     let mut maximum_duplicate: Vec<_> = (0..=MAX_HOPS).map(node).collect();
     maximum_duplicate[MAX_HOPS] = node(0);

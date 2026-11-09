@@ -710,26 +710,24 @@ pub fn nodes(nodes: &[NodeId]) -> Result<String> {
 /// Decode a canonical node list, rejecting duplicates and malformed framing.
 pub fn decode_nodes(value: &[u8]) -> Result<Vec<NodeId>> {
     let bytes = decode_binary(value)?;
-    let mut rest = bytes.as_slice();
+    let mut reader = racer_wire::codec::Reader::new(&bytes, racer_wire::codec::Endian::Big);
     let mut result = Vec::new();
-    while !rest.is_empty() {
-        if rest.len() < 4 || result.len() > MAX_HOPS {
+    while !reader.remaining().is_empty() {
+        if result.len() > MAX_HOPS {
             return Err(Error::Unauthorized);
         }
-        let length =
-            u32::from_be_bytes(rest[..4].try_into().map_err(|_| Error::Unauthorized)?) as usize;
-        rest = &rest[4..];
-        if length == 0 || length > 256 || rest.len() < length {
+        let node = reader
+            .length_prefixed(256)
+            .map_err(|_| Error::Unauthorized)?;
+        if node.is_empty() {
             return Err(Error::Unauthorized);
         }
-        let node =
-            NodeId(String::from_utf8(rest[..length].to_vec()).map_err(|_| Error::Unauthorized)?);
+        let node = NodeId(String::from_utf8(node.to_vec()).map_err(|_| Error::Unauthorized)?);
         uuid(&node.0)?;
         if result.contains(&node) {
             return Err(Error::Unauthorized);
         }
         result.push(node);
-        rest = &rest[length..];
     }
     Ok(result)
 }
