@@ -351,13 +351,22 @@ fn faults_naming_missing_nodes_and_model_fidelity_without_a_spec_are_rejected() 
 
 #[test]
 fn catalog_ci_seeds_pass_twice() {
-    let text =
-        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/seeds/ci.txt")).unwrap();
-    for entry in racer_dst::choices::parse_seeds(&text).unwrap() {
+    for entry in racer_dst::seeds::default_set().unwrap() {
         let s = scenarios::find(&entry.scenario).unwrap();
         let out = run_twice(&s, &entry.source).unwrap_or_else(|d| panic!("{entry}: {d}"));
         assert_eq!(out.failure, None, "{entry}");
     }
+}
+
+#[test]
+fn default_seed_set_covers_every_model_variant() {
+    let coverage = racer_dst::seeds::coverage(&racer_dst::seeds::default_set().unwrap());
+    assert!(
+        coverage.missing.is_empty() && coverage.stale.is_empty(),
+        "missing {:?}, exercised but exempt {:?}",
+        coverage.missing,
+        coverage.stale
+    );
 }
 
 /// Regression for a racer-io bug found by this harness: with `SimOs::seeded`,

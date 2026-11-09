@@ -158,7 +158,9 @@ without the first differing checkpoint.
 ## Seeds
 
 `DST_SEEDS`, `DST_STEPS` and `DST_FILTER` have their `racer-dst` meanings;
-seed file entries such as `app-generated seed=N` pick app seeds.
+seed file entries such as `app-generated seed=N` pick app seeds. A numeric
+`DST_SEEDS=N` runs no `app-*` scenario. A fixed scenario's digest folds the
+replay digest of every harness it ran.
 
 ## Remaining work
 

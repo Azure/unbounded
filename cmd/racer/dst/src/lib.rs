@@ -22,12 +22,14 @@
 //! | [`determinism`] | Double-run trace comparison and failure shrinking |
 //! | [`fixture`] | A minimal racer-io node (two lanes, sim disk, timers, mailbox) |
 //! | [`scenarios`] | Built-in scenario catalog run by `make racer-dst` |
+//! | [`seeds`] | The seed sets `make racer-dst` runs and their Model coverage check |
 //!
 //! # Running
 //!
-//! `make racer-dst` runs `dst/seeds/ci.txt` (each entry twice, comparing
-//! trace hashes). Environment: `DST_SEEDS` (a seed file path, or a count `N`
-//! to run seeds `1..=N` of every scenario), `DST_STEPS` (step budget per
+//! `make racer-dst` runs `dst/seeds/ci.txt` and `dst/seeds/regressions.txt`
+//! (each entry twice, comparing trace hashes). Environment: `DST_SEEDS` (a
+//! seed file path, or a count `N` to run seeds `1..=N` of every non-app
+//! scenario, then `regressions.txt`), `DST_STEPS` (step budget per
 //! run), `DST_FILTER` (scenario name substring). A failure prints a shrunk
 //! `words=` entry; check it into `dst/seeds/regressions.txt`.
 //!
@@ -95,6 +97,7 @@ pub mod model;
 pub mod resources;
 pub mod scenario;
 pub mod scenarios;
+pub mod seeds;
 pub mod world;
 
 pub use choices::Choices;

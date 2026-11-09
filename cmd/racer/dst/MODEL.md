@@ -181,6 +181,8 @@ way a page read does).
 
 - `make racer-dst` runs `dst/seeds/ci.txt` and `dst/seeds/regressions.txt`, each entry twice
   with trace hashes compared, then the coverage check (`DST_SEEDS`, `DST_STEPS`, `DST_FILTER`).
+  A numeric `DST_SEEDS` still appends `regressions.txt` and runs the coverage check over the
+  default set. `cargo test -p racer-dst --test world` runs both in CI.
 - `make racer-dst-report ARGS='--scenario full-failover --nodes 200'` runs one scenario in
   release and writes its JSON report. Options (`cli`): `--scenario`, `--nodes`, `--seed`,
   `--duration`, `--config FILE.json`, `--out PATH`. Scenarios are the control plans

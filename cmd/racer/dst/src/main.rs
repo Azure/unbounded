@@ -1,9 +1,10 @@
 //! `racer-dst` runner: every seed entry runs twice and must match.
 //!
 //! Environment: `DST_SEEDS` (a seed file path, or a count `N` to run seeds
-//! `1..=N` of every scenario; default `seeds/ci.txt` then
+//! `1..=N` of every non-app scenario, then `seeds/regressions.txt`; default `seeds/ci.txt` then
 //! `seeds/regressions.txt`), `DST_STEPS` (step budget per run) and
-//! `DST_FILTER` (scenario name substring).
+//! `DST_FILTER` (scenario name substring). Without a filter, the default and
+//! count sets end with the Model variant coverage check over the default set.
 //!
 //! With arguments it runs one scenario and writes its JSON report instead, using the
 //! `racer-dst` command line (`--scenario`, `--nodes`, `--seed`, `--duration`, `--config`,
@@ -12,69 +13,46 @@
 use std::process::ExitCode;
 
 use racer_dst::{
-    choices::{SeedEntry, Source, parse_seeds},
+    choices::{SeedEntry, Source},
     cli,
     determinism::{run_twice, shrink_failure},
-    model,
-    scenario::Fidelity,
-    scenarios,
+    scenarios, seeds,
 };
-
-const SEED_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/seeds");
 
 fn var(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.trim().is_empty())
 }
 
-fn entries() -> Result<Vec<SeedEntry>, String> {
-    let read = |path: &str| {
-        std::fs::read_to_string(path)
-            .map_err(|e| format!("{path}: {e}"))
-            .and_then(|text| parse_seeds(&text).map_err(|e| format!("{path}: {e}")))
-    };
+/// The entries to run and whether to run the coverage check after them.
+fn entries() -> Result<(Vec<SeedEntry>, bool), String> {
     match var("DST_SEEDS") {
         Some(spec) => match spec.trim().parse::<u64>() {
-            Ok(count) => Ok(scenarios::catalog()
-                .iter()
-                .flat_map(|s| {
-                    (1..=count).map(|seed| SeedEntry {
-                        scenario: s.name.clone(),
-                        source: Source::Seed(seed),
-                    })
-                })
-                .collect()),
-            Err(_) => read(spec.trim()),
+            Ok(count) => Ok((seeds::counted(count)?, true)),
+            Err(_) => Ok((seeds::read(spec.trim())?, false)),
         },
-        None => {
-            let mut all = read(&format!("{SEED_DIR}/ci.txt"))?;
-            all.extend(read(&format!("{SEED_DIR}/regressions.txt"))?);
-            Ok(all)
-        }
+        None => Ok((seeds::default_set()?, true)),
     }
 }
 
-/// Coverage check: the Model entries of the seed set together exercise every core effect and
-/// serve outcome variant ([`model::coverage`]). Returns 1 on a gap, 0 otherwise.
-fn coverage_check(entries: &[SeedEntry]) -> u32 {
-    let mut seen = std::collections::BTreeSet::new();
-    for entry in entries {
-        let Some(scenario) = scenarios::find(&entry.scenario) else {
-            continue;
-        };
-        if scenario.fidelity != Fidelity::Model {
-            continue;
+/// Coverage check over the default seed set (see [`seeds::coverage`]).
+/// Returns 1 on a gap, 0 otherwise.
+fn coverage_check() -> u32 {
+    let entries = match seeds::default_set() {
+        Ok(entries) => entries,
+        Err(e) => {
+            eprintln!("FAIL coverage: {e}");
+            return 1;
         }
-        let (_, report) = model::run(&scenario, entry.source.choices());
-        if let Some(coverage) = report["coverage"].as_object() {
-            seen.extend(coverage.keys().cloned());
-        }
-    }
-    let (missing, stale) = model::coverage::check(&seen);
-    if missing.is_empty() && stale.is_empty() {
-        println!("ok   coverage: {} variants seen", seen.len());
+    };
+    let coverage = seeds::coverage(&entries);
+    if coverage.missing.is_empty() && coverage.stale.is_empty() {
+        println!("ok   coverage: {} variants seen", coverage.seen.len());
         return 0;
     }
-    eprintln!("FAIL coverage: missing {missing:?}, exercised but exempt {stale:?}");
+    eprintln!(
+        "FAIL coverage: missing {:?}, exercised but exempt {:?}",
+        coverage.missing, coverage.stale
+    );
     1
 }
 
@@ -116,7 +94,7 @@ fn main() -> ExitCode {
     if !args.is_empty() {
         return report(&args);
     }
-    let entries = match entries() {
+    let (entries, check_coverage) = match entries() {
         Ok(entries) => entries,
         Err(e) => {
             eprintln!("racer-dst: {e}");
@@ -132,7 +110,6 @@ fn main() -> ExitCode {
         }
     };
     let filter = var("DST_FILTER").unwrap_or_default();
-    let entries_for_coverage = entries.clone();
     let (mut ran, mut failed) = (0u32, 0u32);
     for entry in entries {
         if !entry.scenario.contains(&filter) {
@@ -171,8 +148,8 @@ fn main() -> ExitCode {
             },
         }
     }
-    if filter.is_empty() && var("DST_SEEDS").is_none() {
-        failed += coverage_check(&entries_for_coverage);
+    if filter.is_empty() && check_coverage {
+        failed += coverage_check();
     }
     println!("racer-dst: {ran} entries, {failed} failed");
     if failed == 0 && ran > 0 {
