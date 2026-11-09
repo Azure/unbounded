@@ -164,7 +164,14 @@ own mirror or from a peer:
 `meshfetch.store` keeps chunks in memory under `chunk_cache_bytes`:
 
 - The budget covers cached chunks and fills in progress. A fill is never
-  evicted. Complete chunks are evicted least recently used first.
+  evicted. Complete chunks are evicted least recently used first, with one
+  exception: chunks this agent filled as their owner are kept on a separate
+  list and evicted only when no other complete chunk is left or when owned
+  chunks hold more than half of the budget. Every agent caches the transit
+  copies of everything it pulls or relays, so with a plain LRU an owner
+  evicted its own chunks while slower requesters still needed them and
+  refilled them from the origin (1.33x origin egress on a 142-node 40GB pull
+  with `maxNeighbors: 32`).
 - When fills alone use the budget (or `max_concurrent_chunk_fills` is
   reached), peer requests that need a new fill get 429 and local requests
   wait.

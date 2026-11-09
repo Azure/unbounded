@@ -78,6 +78,10 @@ type fill struct {
 	inMap      bool
 	listed     bool
 	charge     int64
+	// owned marks a chunk this member filled as its owner. Owned chunks
+	// sit on their own LRU list and are evicted after the others, so an
+	// owner keeps serving them while transit copies churn.
+	owned bool
 }
 
 func (f *fill) release() {
@@ -261,20 +265,25 @@ func (f *fill) streamTo(ctx context.Context, w io.Writer, off int) (int64, error
 	}
 }
 
-// store is the in-memory chunk cache: a map of fills plus an LRU list of
+// store is the in-memory chunk cache: a map of fills plus LRU lists of
 // complete ones, under a byte budget that also covers fills in progress.
+// Chunks this member owns are kept on a separate list and evicted only
+// when no other complete chunk is left, or when they hold more than half
+// of the budget.
 type store struct {
 	chunkSize int64
 	budget    int64
 	maxFills  int
 
-	mu       sync.Mutex
-	m        map[chunkKey]*fill
-	head     fill // LRU sentinel: head.next is most recent
-	used     int64
-	inflight int
-	space    chan struct{}
-	closed   bool
+	mu        sync.Mutex
+	m         map[chunkKey]*fill
+	head      fill // LRU sentinel of other chunks: head.next is most recent
+	ownedHead fill // LRU sentinel of owned chunks
+	ownedUsed int64
+	used      int64
+	inflight  int
+	space     chan struct{}
+	closed    bool
 
 	// poolMu guards pool. It is taken under store.mu and fill.mu, never
 	// the other way around.
@@ -294,6 +303,8 @@ func newStore(chunkSize, budget int64, maxFills int, onEvict func(int64)) *store
 	}
 	s.head.next = &s.head
 	s.head.prev = &s.head
+	s.ownedHead.next = &s.ownedHead
+	s.ownedHead.prev = &s.ownedHead
 
 	return s
 }
@@ -373,10 +384,17 @@ func (s *store) acquire(ctx context.Context, k chunkKey, wait bool) (f *fill, cr
 }
 
 // makeRoom evicts least recently used complete chunks until n more bytes
-// fit. Caller holds s.mu.
+// fit: other chunks first, owned chunks once no other one is left or they
+// exceed half of the budget. Caller holds s.mu.
 func (s *store) makeRoom(n int64) bool {
 	for s.used+n > s.budget {
 		victim := s.head.prev
+		if victim == &s.head || 2*s.ownedUsed > s.budget {
+			if o := s.ownedHead.prev; o != &s.ownedHead {
+				victim = o
+			}
+		}
+
 		if victim == &s.head {
 			return false
 		}
@@ -385,6 +403,14 @@ func (s *store) makeRoom(n int64) bool {
 	}
 
 	return true
+}
+
+// markOwned records that f is filled by this member as the chunk's owner.
+func (s *store) markOwned(f *fill) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	f.owned = true
 }
 
 func (s *store) evictLocked(f *fill) {
@@ -396,6 +422,10 @@ func (s *store) evictLocked(f *fill) {
 		delete(s.m, f.key)
 		f.inMap = false
 		s.used -= f.charge
+
+		if f.owned {
+			s.ownedUsed -= f.charge
+		}
 
 		if s.onEvict != nil {
 			s.onEvict(f.charge)
@@ -433,6 +463,10 @@ func (s *store) finished(f *fill, err error) {
 			s.used -= f.charge
 			f.release()
 		} else {
+			if f.owned {
+				s.ownedUsed += f.charge
+			}
+
 			s.pushFront(f)
 		}
 	}
@@ -453,11 +487,17 @@ func (s *store) evictDigest(d string) {
 	}
 }
 
+// pushFront makes f the most recent chunk of its list.
 func (s *store) pushFront(f *fill) {
-	f.prev = &s.head
-	f.next = s.head.next
-	s.head.next.prev = f
-	s.head.next = f
+	h := &s.head
+	if f.owned {
+		h = &s.ownedHead
+	}
+
+	f.prev = h
+	f.next = h.next
+	h.next.prev = f
+	h.next = f
 	f.listed = true
 }
 

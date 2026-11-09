@@ -585,6 +585,20 @@ func TestOwnerPeekStartsOneOriginFill(t *testing.T) {
 		t.Fatalf("origin pulls of chunk 1 = %d, want 1", got)
 	}
 
+	// The owner keeps the chunk on its owned list.
+	if f := owner.node.store.get(req.key); f == nil {
+		t.Fatal("owner does not cache chunk 1")
+	} else {
+		owner.node.store.mu.Lock()
+		owned := f.owned
+		owner.node.store.mu.Unlock()
+		f.release()
+
+		if !owned {
+			t.Fatal("owner's chunk 1 is not marked owned")
+		}
+	}
+
 	// A later routed fetch of the whole blob reuses the owner's chunk.
 	started, _, _, body, err := fetch(other, d, ifaces.KindBlob, 0)
 	if err != nil || !started || !bytes.Equal(body, blob) {

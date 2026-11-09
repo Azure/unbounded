@@ -158,6 +158,10 @@ func (n *Node) fillChunk(f *fill, req chunkReq, decide decider) error {
 					slog.Int64("chunk", req.key.index),
 				)
 
+				if d.Owner.ID == n.mesh.ID() {
+					n.store.markOwned(f)
+				}
+
 				// Read through before going to the origin: from the
 				// previous owner during a handoff, and from the owner
 				// when standing in for it as a backup (an owner that is

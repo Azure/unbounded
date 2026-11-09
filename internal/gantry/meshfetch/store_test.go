@@ -234,3 +234,114 @@ func TestObtainRefusesLoop(t *testing.T) {
 	f.release()
 	f.release()
 }
+
+// ownedFill completes a fill for k that this member owns.
+func ownedFill(t *testing.T, s *store, k chunkKey, data []byte) {
+	t.Helper()
+
+	f, created, err := s.acquire(context.Background(), k, false)
+	if err != nil || !created {
+		t.Fatalf("acquire %v: created=%v err=%v", k, created, err)
+	}
+
+	s.markOwned(f)
+
+	if err := f.setMeta(int64(len(data)), "", len(data)); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := f.readFrom(bytes.NewReader(data), nil); err != nil {
+		t.Fatal(err)
+	}
+
+	f.finish(nil)
+	f.release() // filler
+	f.release() // caller
+}
+
+func cached(s *store, k chunkKey) bool {
+	f := s.get(k)
+	if f == nil {
+		return false
+	}
+
+	f.release()
+
+	return true
+}
+
+func TestStoreEvictsOwnedChunksLast(t *testing.T) {
+	const cs = 1024
+
+	s := newStore(cs, 4*cs, 8, nil)
+
+	// Owned chunk 0 is the oldest; transit chunks 1-3 are newer.
+	ownedFill(t, s, key(0), make([]byte, cs))
+
+	for i := int64(1); i < 4; i++ {
+		completeFill(t, s, key(i), make([]byte, cs)).release()
+	}
+
+	// Two more transit chunks evict the two oldest transit chunks, not
+	// the older owned one.
+	completeFill(t, s, key(4), make([]byte, cs)).release()
+	completeFill(t, s, key(5), make([]byte, cs)).release()
+
+	if !cached(s, key(0)) {
+		t.Fatal("owned chunk evicted before transit chunks")
+	}
+
+	if cached(s, key(1)) || cached(s, key(2)) {
+		t.Fatal("oldest transit chunks should have been evicted")
+	}
+
+	if s.ownedUsed != cs {
+		t.Fatalf("ownedUsed = %d, want %d", s.ownedUsed, cs)
+	}
+}
+
+func TestStoreCapsOwnedChunksAtHalfTheBudget(t *testing.T) {
+	const cs = 1024
+
+	s := newStore(cs, 4*cs, 8, nil)
+
+	// Three owned chunks hold more than half of the budget.
+	for i := range int64(3) {
+		ownedFill(t, s, key(i), make([]byte, cs))
+	}
+
+	completeFill(t, s, key(10), make([]byte, cs)).release()
+
+	// The next chunk evicts the oldest owned chunk, since owned chunks are
+	// over their share, and keeps the transit chunk.
+	completeFill(t, s, key(11), make([]byte, cs)).release()
+
+	if cached(s, key(0)) {
+		t.Fatal("owned chunks over half the budget must yield first")
+	}
+
+	if !cached(s, key(10)) || !cached(s, key(1)) {
+		t.Fatal("unexpected eviction")
+	}
+
+	if s.ownedUsed != 2*cs {
+		t.Fatalf("ownedUsed = %d, want %d", s.ownedUsed, 2*cs)
+	}
+
+	// With only owned chunks left they are still evicted LRU.
+	s2 := newStore(cs, 2*cs, 8, nil)
+	ownedFill(t, s2, key(0), make([]byte, cs))
+	ownedFill(t, s2, key(1), make([]byte, cs))
+	ownedFill(t, s2, key(2), make([]byte, cs))
+
+	if cached(s2, key(0)) || !cached(s2, key(2)) {
+		t.Fatal("owned-only store must evict its oldest chunk")
+	}
+
+	// Evicting a whole digest clears owned accounting.
+	s2.evictDigest("sha256:x")
+
+	if s2.ownedUsed != 0 || s2.used != 0 {
+		t.Fatalf("after evictDigest: ownedUsed=%d used=%d", s2.ownedUsed, s2.used)
+	}
+}
