@@ -3,6 +3,13 @@
 
 package goalstates
 
+import (
+	"context"
+	"log/slog"
+
+	"github.com/Azure/unbounded/pkg/agent/isolation"
+)
+
 type NodeStart struct {
 	// MachineName is the local systemd-nspawn machine name (e.g. "kube1").
 	// Used by nspawn service management.
@@ -29,7 +36,28 @@ type NodeStart struct {
 	// symlinks inside the container's library path pointing into the
 	// bind-mounted /run/host-nvidia/ directories.
 	Nvidia NvidiaHost
+
+	// NvidiaToolkit locates the NVIDIA Container Toolkit tools on the host. It
+	// is set only for isolation mode none; the zero value is the default paths.
+	NvidiaToolkit NvidiaToolkit
+
+	// RootOverride replaces the nspawn machine root for backends that do not
+	// run the node stack in a machine, such as the none backend. Nil means the
+	// nspawn root.
+	RootOverride isolation.NodeRoot
+
+	// ExecOverride replaces nspawn.Exec for the same backends. Nil means
+	// commands run inside the nspawn machine.
+	ExecOverride func(ctx context.Context, log *slog.Logger, args ...string) (string, error)
 }
+
+// HostNative reports whether the node stack runs directly on the host, so
+// phases that write nspawn-only files or masquerade as the machine skip them.
+func (n *NodeStart) HostNative() bool { return n.RootOverride != nil }
+
+// NSpawnMachine reports whether the node stack runs in an nspawn machine, which
+// is the case when no backend replaced the machine root.
+func (n *NodeStart) NSpawnMachine() bool { return n.RootOverride == nil }
 
 type Gantry struct {
 	Disabled bool

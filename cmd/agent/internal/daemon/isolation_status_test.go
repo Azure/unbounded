@@ -346,16 +346,16 @@ func Test_decodeActiveMachine_Mode(t *testing.T) {
 		return data
 	}
 
-	for _, value := range []string{"", "nspawn"} {
+	for value, want := range map[string]isolation.Mode{"": isolation.ModeNSpawn, "nspawn": isolation.ModeNSpawn, "none": isolation.ModeNone} {
 		active, err := decodeActiveMachine(discardLogger(), "kube1", "/applied.json", encode(value))
 		require.NoError(t, err, value)
-		assert.Equal(t, isolation.ModeNSpawn, active.Mode, value)
+		assert.Equal(t, want, active.Mode, value)
 		assert.Equal(t, "kube1", active.Name)
 	}
 
 	// A mode this agent cannot operate fails closed rather than being treated
 	// as nspawn.
-	for _, value := range []string{"none", "microvm"} {
+	for _, value := range []string{"container", "microvm"} {
 		_, err := decodeActiveMachine(discardLogger(), "kube1", "/applied.json", encode(value))
 		require.ErrorContains(t, err, "unsupported isolation mode", value)
 	}
@@ -390,26 +390,34 @@ func repaveFixture(t *testing.T, spec api.IsolationMode, version string) (*repav
 }
 
 // A declared mode this agent cannot change to is refused and reported, and the
-// repave goes ahead in the current mode so a version rollout continues.
+// repave goes ahead in the current mode so a version rollout continues. A mode
+// this agent knows is refused too: it has no way to change a running node.
 func TestReconcileRepave_RefusesAModeChangeAndRepavesInTheCurrentMode(t *testing.T) {
-	r, op, c := repaveFixture(t, "none", "1.34.9")
+	for target, wantMsg := range map[string]string{
+		"none":      "cannot change the isolation mode of a running node",
+		"container": "cannot run isolation \"container\"",
+	} {
+		t.Run(target, func(t *testing.T) {
+			r, op, c := repaveFixture(t, api.IsolationMode(target), "1.34.9")
 
-	_, err := r.ReconcileRepave(t.Context(), "node-delete")
-	require.NoError(t, err)
+			_, err := r.ReconcileRepave(t.Context(), "node-delete")
+			require.NoError(t, err)
 
-	require.NotNil(t, op.repaveConfig, "the version change still repaves")
-	assert.Equal(t, "1.34.9", op.repaveConfig.Cluster.Version)
-	assert.Equal(t, baseConfig().Isolation, op.repaveConfig.Isolation, "the repave keeps the applied mode")
+			require.NotNil(t, op.repaveConfig, "the version change still repaves")
+			assert.Equal(t, "1.34.9", op.repaveConfig.Cluster.Version)
+			assert.Equal(t, baseConfig().Isolation, op.repaveConfig.Isolation, "the repave keeps the applied mode")
 
-	var got api.Machine
-	require.NoError(t, c.Get(t.Context(), client.ObjectKey{Name: "test-machine"}, &got))
-	assert.Equal(t, api.IsolationNSpawn, got.Status.Isolation)
-	require.NotNil(t, got.Status.IsolationChange)
-	assert.Equal(t, api.IsolationMode("none"), got.Status.IsolationChange.TargetMode)
-	assert.Equal(t, api.IsolationChangeFailed, got.Status.IsolationChange.Phase)
-	assert.Equal(t, api.IsolationChangeReasonUnsupportedMode, got.Status.IsolationChange.Reason)
-	assert.Contains(t, got.Status.IsolationChange.Message, "cannot run isolation \"none\"")
-	assert.False(t, got.Status.IsolationChange.LastTransitionTime.IsZero())
+			var got api.Machine
+			require.NoError(t, c.Get(t.Context(), client.ObjectKey{Name: "test-machine"}, &got))
+			assert.Equal(t, api.IsolationNSpawn, got.Status.Isolation)
+			require.NotNil(t, got.Status.IsolationChange)
+			assert.Equal(t, api.IsolationMode(target), got.Status.IsolationChange.TargetMode)
+			assert.Equal(t, api.IsolationChangeFailed, got.Status.IsolationChange.Phase)
+			assert.Equal(t, api.IsolationChangeReasonUnsupportedMode, got.Status.IsolationChange.Reason)
+			assert.Contains(t, got.Status.IsolationChange.Message, wantMsg)
+			assert.False(t, got.Status.IsolationChange.LastTransitionTime.IsZero())
+		})
+	}
 }
 
 // When the mode is the only difference, the refusal leaves nothing to repave.

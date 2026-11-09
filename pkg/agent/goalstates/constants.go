@@ -26,6 +26,12 @@ const (
 	// DaemonRecoveryUnit is the systemd recovery unit for the agent daemon.
 	DaemonRecoveryUnit = "unbounded-agent-daemon-recovery.service"
 
+	// NFTablesFlushUnit is the oneshot unit that flushes the host's nftables
+	// ruleset before the node starts, on every boot while it is enabled.
+	NFTablesFlushUnit = "nftables-flush.service"
+	// NFTablesClearPath is the rules file NFTablesFlushUnit loads.
+	NFTablesClearPath = ConfigDir + "/nftables-clear.nft"
+
 	// The agent's host-side files under hostroot.LegacyPath, where agents
 	// released before hostroot.Path installed them.
 	//

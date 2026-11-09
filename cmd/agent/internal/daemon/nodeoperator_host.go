@@ -22,11 +22,24 @@ type hostOperator struct{}
 
 var _ hostOperations = hostOperator{}
 
+// FindActiveMachine returns the running node, from its applied config, for
+// tools outside the daemon (exec, logs) that operate it the way the daemon
+// does.
+func FindActiveMachine(log *slog.Logger) (*ActiveMachine, error) {
+	return hostOperator{}.FindActiveMachine(log)
+}
+
 func (hostOperator) FindActiveMachine(log *slog.Logger) (*ActiveMachine, error) {
-	// Verify the SHA-256 sidecar before trusting the applied config. A missing
-	// sidecar is logged as a warning and not treated as an error.
-	for _, name := range []string{goalstates.NSpawnMachineKube1, goalstates.NSpawnMachineKube2} {
-		path := goalstates.AppliedConfigPath(name)
+	return findActiveMachineIn(log, goalstates.AppliedConfigPath)
+}
+
+// findActiveMachineIn searches every applied config location, with pathOf
+// mapping a location name to its file. Verify the SHA-256 sidecar before
+// trusting the applied config. A missing sidecar is logged as a warning and not
+// treated as an error.
+func findActiveMachineIn(log *slog.Logger, pathOf func(name string) string) (*ActiveMachine, error) {
+	for _, loc := range goalstates.AppliedConfigLocations() {
+		path := pathOf(loc.Name)
 
 		data, err := os.ReadFile(path)
 		if errors.Is(err, os.ErrNotExist) {
@@ -38,9 +51,9 @@ func (hostOperator) FindActiveMachine(log *slog.Logger) (*ActiveMachine, error) 
 		}
 
 		// Verify the sidecar checksum before trusting the config data.
-		checksumPath := goalstates.AppliedConfigChecksumPath(name)
+		checksumPath := path + ".sha256"
 		if err := goalstates.VerifyChecksum(data, checksumPath); err != nil {
-			return nil, fmt.Errorf("verify applied config checksum for %s: %w", name, err)
+			return nil, fmt.Errorf("verify applied config checksum for %s: %w", loc.Name, err)
 		}
 
 		// If the sidecar file is missing, log a warning so operators
@@ -52,7 +65,19 @@ func (hostOperator) FindActiveMachine(log *slog.Logger) (*ActiveMachine, error) 
 			)
 		}
 
-		return decodeActiveMachine(log, name, path, data)
+		active, err := decodeActiveMachine(log, loc.Slot, path, data)
+		if err != nil {
+			return nil, err
+		}
+
+		// The file name says which mode wrote it. A config that records
+		// another mode was not written by an agent, and neither mode's
+		// operations can be trusted with it.
+		if active.Mode != loc.Mode {
+			return nil, fmt.Errorf("applied config %s records isolation mode %q but is stored as the %q config", path, active.Mode, loc.Mode)
+		}
+
+		return active, nil
 	}
 
 	return nil, fmt.Errorf("no applied config found in %s", goalstates.AgentConfigDir)

@@ -114,7 +114,9 @@ Coupling points to abstract:
   keyed on `/etc/unbounded/agent/<m>-applied-config.json`
   (`goalstates.AppliedConfigPath`).
 - Uninstall: `internal/provision/assets/unbounded-agent-uninstall.sh`
-  hard-codes `machinectl`, `/etc/systemd/nspawn`, `/var/lib/machines`.
+  hard-coded `machinectl`, `/etc/systemd/nspawn`, `/var/lib/machines`. Nothing
+  ran it; it is removed, and `unbounded-agent reset` is the way to remove a
+  node in every mode.
 - Generated config and vendor data: `internal/provision/agent_config.go`,
   `images/netboot/assets/vendor-data.tmpl`, `hack/smoke-metalman.py`.
 
@@ -179,12 +181,28 @@ The applied-config file records `isolation`, `slot` and the owning backend. A
 missing `isolation` reads as `nspawn`. `FindActiveMachine` must handle both old
 and new files.
 
+An nspawn node keeps `<slot>-applied-config.json`. A node in any other mode
+stores it as `<mode>-<slot>-applied-config.json`
+(`goalstates.AppliedConfigName`), a name agents that predate the mode never
+read, so such an agent finds no node and refuses to operate it instead of
+running nspawn operations against it. The name and the recorded mode must
+agree, or discovery fails closed.
+
 ### 6.4 Version skew
 
 - The agent rejects any unrecognized `isolation` value with a clear error. An
   agent that predates the key does not reject it: the config is decoded with
   `encoding/json` (`cmd/agent/internal/cmd/config.go`), which ignores unknown
   keys, so that agent runs the node as `nspawn`.
+- An agent upgrade and the daemon recovery script ask the candidate (or the
+  last-good binary) `unbounded-agent supports-isolation <mode>` for every
+  non-nspawn mode whose applied config exists, and refuse a binary that fails
+  it. An agent that predates the subcommand fails it.
+- The netboot vendor-data template ships in the netboot image and is rendered
+  by whichever metalman serves it, so it references no field a metalman may
+  lack, and templates render from a map so an unknown field yields no value
+  instead of failing the render. The machined guards it writes are removed by
+  the agent at bootstrap in modes without an nspawn machine.
 - Machina passes `spec.isolation` through to generated agent config without
   checking the agent version. No release number is compiled into the code; the
   operator pins an agent version that supports the requested mode.
@@ -334,8 +352,12 @@ Everything runs directly on the host.
   versioned directories such as `/opt/unbounded/node/<version>/`, with a
   `current` symlink. No distro packages.
 - Units: agent-owned systemd units for containerd, kubelet and CoreDNS.
-- Safety: preflight refuses to start if it finds a kubelet or containerd it does
-  not own (unit, binary or running process).
+- Safety: bootstrap (`EnsureHostClean`, not only the optional `preflight`
+  subcommand) refuses a host with a kubelet or containerd it does not own
+  (unit, binary or running process). A unit masked to `/dev/null`, which an
+  nspawn host leaves, is not one. containerd runs with the agent-owned
+  `/etc/unbounded/containerd/config.toml`, never the distro's
+  `/etc/containerd/config.toml`.
 - Requirements: writable `/etc`, `/opt`, `/var`. `/usr` is never modified, so
   a read-only `/usr` is fine.
 - Network and paths: host native. Pods share the host netns trivially.
@@ -343,12 +365,25 @@ Everything runs directly on the host.
   a documented difference for eBPF CNIs such as Cilium.
 - Exec: runs on the host as the unit's environment. Logs: `journalctl` for the
   agent-owned units.
-- Upgrade: stop units, flip `current`, start units, wait for kubelet
-  Ready, flip back automatically on failure. The node is briefly down.
+- Upgrade: stop units, end the pods (the shims of the agent's containerd and
+  the pod cgroups) before host networking is cleaned, flip `current`, write the
+  new units, start units, wait for kubelet Ready, and on failure flip back and
+  start the previous version with its own units, configuration and host
+  networking. The node is briefly down. A soft reboot restarts the units and
+  leaves the pods running.
+- CNI plugins are versioned with the rest (`<version>/cni/bin`) and linked one
+  by one into `/opt/cni/bin` through `current`, so plugins cluster add-ons
+  install there (unbounded-net's IPAM plugin) keep working.
+- Crash safety: an upgrade journal (`none-upgrade-journal.json` in the agent
+  config directory) records the version being replaced before anything
+  changes, and the saved configuration is kept until the applied config is
+  persisted. The daemon finishes an interrupted upgrade at its next start:
+  rolled back, or committed if it had succeeded.
 
 **Status (WP1).** Implemented end to end: bootstrap, start, soft reboot,
-upgrade with rollback, reset, `exec`, `logs`, preflight and uninstall.
-Decisions: the applied config is recorded under the fixed slot `kube1` (the
+upgrade with rollback, reset, `exec`, `logs` and preflight. Decisions: the
+applied config is recorded under the fixed slot `kube1`, as
+`none-kube1-applied-config.json` (the
 version directory, named `<kubernetes version>-<digest of other artifact
 versions>`, is the unit of upgrade); same-path files are written by the existing
 nodestart phases through a goal-state `RootOverride`, and binaries land in
@@ -538,7 +573,11 @@ is untouched.
 - *Shared configuration.* `confsnap` saves, byte for byte, the host files both
   stacks write at the same paths before an in-place change, a `none` upgrade
   and a container upgrade, and restores them before the source starts again on
-  any failure, also after a restart mid-change.
+  any failure. It never overwrites a complete snapshot and syncs what it saved
+  before writing its manifest. After a restart mid-change the snapshot is
+  restored for an in-place change (through `migrate.Journal`) and for a `none`
+  upgrade (through the none upgrade journal); a container upgrade restores it
+  only within the same process.
 - *Preflight and tokens.* The `none` target's static preflight runs before the
   reset and the ownership half after. An attested host records its attestation
   URL at bootstrap and attests again on reprovision; any other host is checked
@@ -719,20 +758,19 @@ Acceptance:
 - Config tests: `spec.isolation` reaches the generated agent config, and an
   unset field leaves the output unchanged.
 
-### WP4: `exec`, `logs`, lifecycle and uninstall
+### WP4: `exec`, `logs` and lifecycle
 
 Depends on: WP0, plus WP1 and WP2 for their `Exec`/`Logs` implementations.
 
 Owns: new agent subcommands in `cmd/agent/internal/cmd/` (`exec`, `logs`),
-`internal/provision/assets/unbounded-agent-uninstall.sh`,
 `kubectl unbounded` help text referencing machine access.
 
-Steps: add backend-agnostic `exec` and `logs` subcommands. Make the uninstall
-script read the mode from applied-config and call mode-specific cleanup, with
-a fallback to nspawn cleanup when no applied-config exists.
+Steps: add backend-agnostic `exec` and `logs` subcommands. The uninstall
+script, which nothing ran, is removed; `unbounded-agent reset` removes a node
+in every mode: it always runs the idempotent nspawn teardown and adds a mode's
+teardown only where the host has that mode's own units or directory.
 
-Acceptance: command tests per backend with fakes; the uninstall script has a
-shell test for each mode and for a legacy host with no recorded mode.
+Acceptance: command tests per backend with fakes.
 
 ### WP5: Docs and e2e
 

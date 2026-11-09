@@ -36,6 +36,9 @@ func Run() {
 		newCmdNSpawnLifecycle(cmdCtx),
 		newCmdHostAgentUpgrade(cmdCtx),
 		newCmdRecordAgentUpgradeFailureSignal(),
+		newCmdExec(cmdCtx),
+		newCmdLogs(cmdCtx),
+		newCmdSupportsIsolation(),
 	)
 
 	if err := root.Execute(); err != nil {
