@@ -430,12 +430,14 @@ where
             .await
             {
                 Ok(bytes) => {
-                    // A record from another schema version is replaced without
-                    // the cluster check; the directory is already per cluster.
-                    if PersistedIdentity::decode(&bytes)?
-                        .current_response()?
-                        .is_some_and(|prior| prior.cluster != response.cluster)
-                    {
+                    // A record from another schema version keeps its cluster
+                    // binding through the schema-independent pending request.
+                    let prior = PersistedIdentity::decode(&bytes)?;
+                    let prior_cluster = match prior.current_response()? {
+                        Some(prior) => prior.cluster.0,
+                        None => prior.pending.cluster.clone(),
+                    };
+                    if prior_cluster != response.cluster.0 {
                         return Err(Error::Unauthorized.into());
                     }
                 }
@@ -1346,10 +1348,11 @@ mod tests {
     }
 
     /// An identity saved under an older control-wire schema, as after an
-    /// upgrade, is not fatal: the node enrolls again and replaces it, even when
-    /// the old record names another cluster.
+    /// upgrade, is not fatal: the node enrolls again and replaces it. An old
+    /// record bound to another cluster is still rejected and kept.
     #[test]
     fn identity_from_another_schema_version_is_replaced_by_enrollment() {
+        const OTHER: &str = "33333333-3333-4333-8333-333333333333";
         let current = format!("\"schema_version\":{}", racer_control_wire::SCHEMA_VERSION);
         let older = format!(
             "\"schema_version\":{}",
@@ -1372,15 +1375,23 @@ mod tests {
                 e.accept_response(issue(&first, &ca, &key, |_| {}), &scope),
             )
             .unwrap();
-            let stale = rewrite_saved_response(&sim, |json| {
+            let mut stale = rewrite_saved_response(&sim, |json| {
                 assert!(json.contains(&current));
                 let json = json.replace(&current, &older);
                 if other_cluster {
-                    json.replace(CLUSTER, "33333333-3333-4333-8333-333333333333")
+                    json.replace(CLUSTER, OTHER)
                 } else {
                     json
                 }
             });
+            if other_cluster {
+                // The pending request records the cluster outside the schema.
+                let path = Path::new("/private/identity.json");
+                let mut persisted = PersistedIdentity::decode(&stale).unwrap();
+                persisted.pending.cluster = OTHER.into();
+                stale = persisted.encode().unwrap().to_vec();
+                sim.write_file(path, &stale).unwrap();
+            }
 
             // Startup treats the node as not enrolled and keeps the old record.
             assert!(drive(&files, e.load_identity(&scope)).unwrap().is_none());
@@ -1398,8 +1409,17 @@ mod tests {
             let accepted = drive(
                 &files,
                 e.accept_response(issue(&request, &ca, &key, |_| {}), &scope),
-            )
-            .unwrap();
+            );
+            if other_cluster {
+                let expected: Failure = Error::Unauthorized.into();
+                assert!(matches!(accepted, Err(error) if error == expected));
+                assert_eq!(
+                    sim.read_file(Path::new("/private/identity.json")).unwrap(),
+                    stale
+                );
+                continue;
+            }
+            let accepted = accepted.unwrap();
             assert!(accepted.signing_identity(&roots).is_ok());
             assert!(sim.metadata(Path::new("/private/pending.json")).is_err());
             let saved = sim.read_file(Path::new("/private/identity.json")).unwrap();
