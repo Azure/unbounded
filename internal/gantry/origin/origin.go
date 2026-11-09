@@ -1605,7 +1605,12 @@ func (r *registry) classify(ref ifaces.OriginRef, resp *http.Response) error {
 	if class == ifaces.FailureAuth {
 		if challenge, err := validatedAuthenticationChallenge(resp); err == nil {
 			oe.Challenge = challenge
-			r.rememberAuthenticationChallenge(challenge)
+			// An anonymous lookup of a private repository is expected to be
+			// rejected; recording its challenge would make the mirror demand
+			// credentials for every repository on the registry.
+			if !registryauth.Anonymous(resp.Request.Context()) {
+				r.rememberAuthenticationChallenge(challenge)
+			}
 		}
 	}
 

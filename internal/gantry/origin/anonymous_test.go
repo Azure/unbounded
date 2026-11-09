@@ -158,3 +158,53 @@ func TestManifestByTagAnonymous(t *testing.T) {
 		}
 	})
 }
+
+func TestAnonymousFailureDoesNotPoisonAuthenticationChallenge(t *testing.T) {
+	var srv *httptest.Server
+
+	srv = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v2/" {
+			return
+		}
+
+		w.Header().Set("WWW-Authenticate", `Basic realm="`+srv.URL+`"`)
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	t.Cleanup(srv.Close)
+
+	c := newClient(t, config.UpstreamRegistry{Name: "reg", Endpoint: srv.URL})
+	c.registries["reg"].hc = srv.Client()
+
+	requireChallenge := func(want bool) {
+		t.Helper()
+
+		_, required, err := c.AuthenticationChallenge(context.Background(), "reg")
+		if err != nil {
+			t.Fatalf("AuthenticationChallenge: %v", err)
+		}
+
+		if required != want {
+			t.Fatalf("required = %v, want %v", required, want)
+		}
+	}
+
+	requireChallenge(false)
+
+	ctx := registryauth.WithAnonymous(context.Background())
+
+	_, _, _, err := c.ManifestByTag(ctx, "reg", "private/app", "v1")
+
+	var oe *ifaces.OriginError
+	if !errors.As(err, &oe) || oe.Class != ifaces.FailureAuth || oe.Challenge == "" {
+		t.Fatalf("want auth failure with challenge, got %v", err)
+	}
+
+	requireChallenge(false)
+
+	// A non-anonymous rejection still records the challenge.
+	if _, _, _, err := c.ManifestByTag(context.Background(), "reg", "private/app", "v1"); err == nil {
+		t.Fatal("want auth failure")
+	}
+
+	requireChallenge(true)
+}
