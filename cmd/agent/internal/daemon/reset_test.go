@@ -26,7 +26,9 @@ func TestResetResourcesIncludesBPFFSMountCleanup(t *testing.T) {
 	assert.Contains(t, taskName, "parallel(remove-bpffs-mount, remove-bpffs-mount)")
 	assert.Less(t, strings.Index(taskName, "parallel(remove-machine, remove-machine)"), strings.Index(taskName, "parallel(remove-bpffs-mount, remove-bpffs-mount)"))
 	assert.Less(t, strings.Index(taskName, "parallel(remove-bpffs-mount, remove-bpffs-mount)"), strings.Index(taskName, "cleanup-routes"))
-	assert.Less(t, strings.Index(taskName, "cleanup-routes"), strings.Index(taskName, "remove-first-boot-unit"))
+	assert.Less(t, strings.Index(taskName, "cleanup-routes"), strings.Index(taskName, "remove-nftables-flush"))
+	assert.Less(t, strings.Index(taskName, "remove-nftables-flush"), strings.Index(taskName, "remove-first-boot-unit"))
+	assert.Less(t, strings.Index(taskName, "remove-nftables-flush"), strings.Index(taskName, "reload-systemd"))
 	assert.Less(t, strings.Index(taskName, "remove-first-boot-unit"), strings.Index(taskName, "remove-agent-artifacts"))
 }
 

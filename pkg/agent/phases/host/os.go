@@ -14,6 +14,7 @@ import (
 	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
+	"github.com/Azure/unbounded/pkg/agent/isolation"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 )
 
@@ -37,6 +38,39 @@ var rpmRequiredPackages = []string{
 	"util-linux",
 }
 
+// systemdContainerPackage provides systemd-nspawn and machinectl. Only the
+// nspawn mode needs it.
+const systemdContainerPackage = "systemd-container"
+
+// packageSet is the packages a mode requires, per package manager family.
+type packageSet struct {
+	debian []string
+	rpm    []string
+}
+
+// packageSetFor returns the packages mode requires. The nspawn runtime package
+// is required only by the nspawn mode; every other mode runs the node stack
+// without a machine and must not install, or demand, systemd-container.
+func packageSetFor(mode isolation.Mode) packageSet {
+	if mode == "" || mode == isolation.ModeNSpawn {
+		return packageSet{debian: debianRequiredPackages, rpm: rpmRequiredPackages}
+	}
+
+	return packageSet{debian: withoutPackage(debianRequiredPackages, systemdContainerPackage), rpm: withoutPackage(rpmRequiredPackages, systemdContainerPackage)}
+}
+
+func withoutPackage(pkgs []string, drop string) []string {
+	out := make([]string, 0, len(pkgs))
+
+	for _, p := range pkgs {
+		if p != drop {
+			out = append(out, p)
+		}
+	}
+
+	return out
+}
+
 type hostPackageManager struct {
 	name             string
 	requiredPackages []string
@@ -47,7 +81,8 @@ type hostPackageManager struct {
 }
 
 type installPackages struct {
-	log *slog.Logger
+	log  *slog.Logger
+	mode isolation.Mode
 }
 
 // InstallPackages returns a task that installs the required OS packages on the host.
@@ -55,10 +90,16 @@ func InstallPackages(log *slog.Logger) phases.Task {
 	return &installPackages{log: log}
 }
 
+// InstallPackagesFor is InstallPackages for an isolation mode. Modes other than
+// nspawn do not require systemd-container.
+func InstallPackagesFor(log *slog.Logger, mode isolation.Mode) phases.Task {
+	return &installPackages{log: log, mode: mode}
+}
+
 func (ip *installPackages) Name() string { return "install-packages" }
 
 func (ip *installPackages) Do(ctx context.Context) error {
-	pm, err := detectHostPackageManager(exec.LookPath)
+	pm, err := detectHostPackageManager(exec.LookPath, goalstates.HostIsImageManaged(), ip.mode)
 	if err != nil {
 		return err
 	}
@@ -104,11 +145,15 @@ func (ip *installPackages) Do(ctx context.Context) error {
 	return nil
 }
 
-func detectHostPackageManager(lookupPath func(string) (string, error)) (*hostPackageManager, error) {
-	return detectHostPackageManagerFor(lookupPath, goalstates.HostIsImageManaged())
+// detectHostPackageManagerForMode binds detectHostPackageManager to an isolation
+// mode's package requirements.
+func detectHostPackageManagerForMode(mode isolation.Mode) func(func(string) (string, error)) (*hostPackageManager, error) {
+	return func(lookupPath func(string) (string, error)) (*hostPackageManager, error) {
+		return detectHostPackageManager(lookupPath, goalstates.HostIsImageManaged(), mode)
+	}
 }
 
-// detectHostPackageManagerFor selects how required tools are satisfied on a
+// detectHostPackageManager selects how required tools are satisfied on a
 // host whose OS content is, or is not, image-managed.
 //
 // The distinction is not cosmetic. Azure Container Linux ships tdnf, so keying
@@ -117,18 +162,24 @@ func detectHostPackageManager(lookupPath func(string) (string, error)) (*hostPac
 // delivery there, so a missing tool is a prerequisite to report rather than
 // something to remediate, and the presence of tdnf is not evidence that package
 // mutation is supported.
-func detectHostPackageManagerFor(
+//
+// The package requirements are those of the isolation mode; the empty mode is
+// nspawn.
+func detectHostPackageManager(
 	lookupPath func(string) (string, error),
 	imageManaged bool,
+	mode isolation.Mode,
 ) (*hostPackageManager, error) {
+	set := packageSetFor(mode)
+
 	if imageManaged {
-		return imageManagedPackageManager(lookupPath)
+		return imageManagedPackageManager(lookupPath, set.rpm)
 	}
 
 	if _, err := lookupPath("apt-get"); err == nil {
 		return &hostPackageManager{
 			name:             "apt-get",
-			requiredPackages: debianRequiredPackages,
+			requiredPackages: set.debian,
 			command:          executil.AptGet(),
 			refreshArgs:      []string{"update", "-y"},
 			installArgs:      []string{"install", "-y", "--no-install-recommends"},
@@ -139,7 +190,7 @@ func detectHostPackageManagerFor(
 	if _, err := lookupPath("tdnf"); err == nil {
 		return &hostPackageManager{
 			name:             "tdnf",
-			requiredPackages: rpmRequiredPackages,
+			requiredPackages: set.rpm,
 			command:          executil.Tdnf(),
 			refreshArgs:      []string{"makecache"},
 			installArgs:      []string{"install", "-y"},
@@ -150,7 +201,7 @@ func detectHostPackageManagerFor(
 	if _, err := lookupPath("dnf"); err == nil {
 		return &hostPackageManager{
 			name:             "dnf",
-			requiredPackages: rpmRequiredPackages,
+			requiredPackages: set.rpm,
 			command:          executil.Dnf(),
 			refreshArgs:      []string{"makecache"},
 			installArgs:      []string{"install", "-y"},
@@ -168,7 +219,7 @@ func detectHostPackageManagerFor(
 	// This is deliberately keyed on the capability rather than on the
 	// distribution: what matters is whether the tools resolve, not which OS is
 	// reporting.
-	return capabilityOnlyPackageManager(lookupPath)
+	return capabilityOnlyPackageManager(lookupPath, set.rpm)
 }
 
 // packageCapabilities maps each required package to the executable it exists to
@@ -197,15 +248,15 @@ func capabilitySatisfied(lookupPath func(string) (string, error), pkg string) bo
 // capabilityOnlyPackageManager returns a package manager for hosts that cannot
 // install anything, succeeding only when every required capability is already
 // present.
-func capabilityOnlyPackageManager(lookupPath func(string) (string, error)) (*hostPackageManager, error) {
-	if missing := missingCapabilities(lookupPath); len(missing) > 0 {
+func capabilityOnlyPackageManager(lookupPath func(string) (string, error), required []string) (*hostPackageManager, error) {
+	if missing := missingCapabilities(lookupPath, required); len(missing) > 0 {
 		return nil, fmt.Errorf(
 			"host has no supported package manager (apt-get, tdnf, or dnf) and is missing required tools: %s",
 			strings.Join(missing, ", "),
 		)
 	}
 
-	return capabilityManager(lookupPath), nil
+	return capabilityManager(lookupPath, required), nil
 }
 
 // imageManagedPackageManager validates that an image-managed host already
@@ -214,8 +265,8 @@ func capabilityOnlyPackageManager(lookupPath func(string) (string, error)) (*hos
 // The error deliberately does not mention installing anything: on this host
 // there is nothing to install with and nowhere to install to, so the actionable
 // remedy is a different image or a system extension.
-func imageManagedPackageManager(lookupPath func(string) (string, error)) (*hostPackageManager, error) {
-	if missing := missingCapabilities(lookupPath); len(missing) > 0 {
+func imageManagedPackageManager(lookupPath func(string) (string, error), required []string) (*hostPackageManager, error) {
+	if missing := missingCapabilities(lookupPath, required); len(missing) > 0 {
 		return nil, fmt.Errorf(
 			"host OS content is image-managed and its /usr is read-only, so these required tools "+
 				"must be supplied by the image or a system extension rather than installed: %s",
@@ -223,15 +274,15 @@ func imageManagedPackageManager(lookupPath func(string) (string, error)) (*hostP
 		)
 	}
 
-	return capabilityManager(lookupPath), nil
+	return capabilityManager(lookupPath, required), nil
 }
 
 // missingCapabilities returns the required packages whose capability does not
 // resolve, described so an operator knows what to supply.
-func missingCapabilities(lookupPath func(string) (string, error)) []string {
+func missingCapabilities(lookupPath func(string) (string, error), required []string) []string {
 	var missing []string
 
-	for _, pkg := range rpmRequiredPackages {
+	for _, pkg := range required {
 		binary, ok := packageCapabilities[pkg]
 		if !ok {
 			missing = append(missing, pkg)
@@ -248,11 +299,11 @@ func missingCapabilities(lookupPath func(string) (string, error)) []string {
 }
 
 // capabilityManager returns a package manager that can only report, never
-// install.
-func capabilityManager(lookupPath func(string) (string, error)) *hostPackageManager {
+// install, for an explicit package list.
+func capabilityManager(lookupPath func(string) (string, error), required []string) *hostPackageManager {
 	return &hostPackageManager{
 		name:             "none",
-		requiredPackages: rpmRequiredPackages,
+		requiredPackages: required,
 		installed: func(_ context.Context, _ *slog.Logger, pkg string) bool {
 			return capabilitySatisfied(lookupPath, pkg)
 		},

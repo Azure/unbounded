@@ -32,6 +32,9 @@ write_files:
 # Block unattended-upgrades from restarting systemd-machined and tearing down
 # the running systemd-nspawn container. The agent re-asserts this file during
 # start; cloud-init writes it first so the protection exists from first boot.
+# It is written for every isolation mode so this template does not depend on
+# the metalman that renders it; an agent in a mode without an nspawn machine
+# removes it at bootstrap.
 - path: /etc/apt/apt.conf.d/99-unbounded-no-restart-systemd
   permissions: '0644'
   content: |

@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -37,6 +38,16 @@ func (c *configureLocalDNS) Do(_ context.Context) error {
 	}
 
 	root := c.goalState.Root().Path("etc/unbounded/localdns")
+
+	if c.goalState.HostNative() {
+		// CoreDNS runs as a systemd DynamicUser on the host, so it must be able
+		// to traverse to its configuration. The default directory mode of the
+		// file writer (0750, root only) would lock it out.
+		if err := ensureTraversableDirs(c.goalState.Root().Path("etc/unbounded"), root); err != nil {
+			return fmt.Errorf("create LocalDNS config directory: %w", err)
+		}
+	}
+
 	if err := utilio.WriteFile(filepath.Join(root, "Corefile"), c.goalState.LocalDNS.Corefile, 0o644); err != nil {
 		return fmt.Errorf("write LocalDNS Corefile: %w", err)
 	}
@@ -83,10 +94,18 @@ func (c *configureLocalDNS) Do(_ context.Context) error {
 	resolverLines = append(resolverLines, "nameserver "+c.goalState.LocalDNS.NodeListenerIP.String())
 
 	resolverContent := []byte(strings.Join(resolverLines, "\n") + "\n")
-	for _, resolvPath := range []string{
+
+	resolvPaths := []string{
 		c.goalState.Root().Path("etc/resolv.conf"),
 		c.goalState.Root().Path(strings.TrimPrefix(goalstates.LocalDNSResolvConfPath, "/")),
-	} {
+	}
+	if c.goalState.HostNative() {
+		// The host keeps its own resolver configuration; only kubelet's
+		// dedicated resolver file carries the LocalDNS listener.
+		resolvPaths = resolvPaths[1:]
+	}
+
+	for _, resolvPath := range resolvPaths {
 		if err := utilio.WriteFile(resolvPath, resolverContent, 0o644); err != nil {
 			return fmt.Errorf("write machine resolver %s: %w", resolvPath, err)
 		}
@@ -163,6 +182,12 @@ func WriteLocalDNSNetworkFiles(goalState *goalstates.NodeStart) error {
 	unitPath := filepath.Join(goalstates.SystemdSystemDir, goalstates.LocalDNSNetworkUnit)
 	if err := utilio.WriteFile(unitPath, unit.Bytes(), 0o644); err != nil {
 		return fmt.Errorf("write LocalDNS network unit: %w", err)
+	}
+
+	if !goalState.NSpawnMachine() {
+		// No nspawn machine to order against; the host-native units and the
+		// container supervising unit order themselves after the network unit.
+		return nil
 	}
 
 	dropIn := []byte("[Unit]\nRequires=" + goalstates.LocalDNSNetworkUnit + "\nAfter=" + goalstates.LocalDNSNetworkUnit + "\n")
@@ -246,6 +271,23 @@ func localDNSReady(ctx context.Context, client *http.Client, addresses []string)
 
 		if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
 			return fmt.Errorf("readiness endpoint for %s returned %s", address, response.Status)
+		}
+	}
+
+	return nil
+}
+
+// ensureTraversableDirs creates each directory, in order, and makes it 0755 so
+// an unprivileged service can traverse it. Only the mode of the named
+// directories changes; their contents keep theirs.
+func ensureTraversableDirs(dirs ...string) error {
+	for _, dir := range dirs {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+
+		if err := os.Chmod(dir, 0o755); err != nil { //nolint:gosec // traversable by the CoreDNS service user, by design
+			return err
 		}
 	}
 

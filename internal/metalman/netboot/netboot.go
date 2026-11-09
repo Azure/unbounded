@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	pathpkg "path"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -310,6 +311,11 @@ func (f *FileResolver) resolveUserDataFromConfigMap(ctx context.Context, node *v
 	return nil, false, fmt.Errorf("key %q not found in ConfigMap %s/%s", key, ref.Namespace, ref.Name)
 }
 
+// templateData is the input of the netboot templates. Templates live in the
+// netboot image, which can be newer or older than this metalman, so they are
+// rendered from values() rather than from the struct: a template that names a
+// field this metalman does not have renders it as the zero value instead of
+// failing to render.
 type templateData struct {
 	Machine          *v1alpha3.Machine
 	BootLease        *v1alpha3.DHCPLease
@@ -454,6 +460,21 @@ func indentTemplateBlock(spaces int, value string) string {
 	return prefix + strings.ReplaceAll(value, "\n", "\n"+prefix)
 }
 
+// values returns the template data as a map keyed by field name. A map lets a
+// template reference a key that does not exist (it yields no value, which is
+// false and empty), where a struct fails the whole render.
+func (d templateData) values() map[string]any {
+	v := reflect.ValueOf(d)
+	t := v.Type()
+
+	m := make(map[string]any, t.NumField())
+	for i := range t.NumField() {
+		m[t.Field(i).Name] = v.Field(i).Interface()
+	}
+
+	return m
+}
+
 func renderTemplate(tmplStr string, data templateData) ([]byte, error) {
 	t, err := template.New("").Funcs(templateFuncMap).Parse(tmplStr)
 	if err != nil {
@@ -469,7 +490,7 @@ func renderTemplate(tmplStr string, data templateData) ([]byte, error) {
 
 	defer templatePool.Put(buf)
 
-	if err := t.Execute(buf, data); err != nil {
+	if err := t.Execute(buf, data.values()); err != nil {
 		return nil, fmt.Errorf("executing template: %w", err)
 	}
 
