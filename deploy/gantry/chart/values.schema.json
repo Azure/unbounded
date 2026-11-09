@@ -290,12 +290,9 @@
               "type": "integer",
               "minimum": 0
             },
-            "diskCacheBytes": {
-              "type": "integer",
-              "minimum": 0
-            },
-            "chunkDirSizeLimit": {
-              "type": "string"
+            "contentRoot": {
+              "type": "string",
+              "pattern": "^(/.*)?$"
             },
             "memoryCacheBytes": {
               "type": "integer",
@@ -312,14 +309,6 @@
             "inflightBytes": {
               "type": "integer",
               "minimum": 0
-            },
-            "pageCache": {
-              "type": "string",
-              "enum": ["", "bypass", "drop", "keep"]
-            },
-            "persist": {
-              "type": "string",
-              "enum": ["", "all", "shared", "owned"]
             },
             "lookahead": {
               "type": "integer",

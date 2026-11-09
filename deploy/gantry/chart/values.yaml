@@ -104,38 +104,33 @@ gantry:
     # Stripe size in bytes, a power of two between 1MiB and 1GiB (64MiB).
     # Must be the same on every agent.
     chunkSize: 0
-    # Chunks live in files in an emptyDir volume mounted at
-    # /var/lib/gantry/cachemesh (wiped at agent start). Disk budget in bytes
-    # for chunk files, including chunks being written (20GiB).
-    diskCacheBytes: 0
-    # Optional sizeLimit of the chunk emptyDir, for example "24Gi". Keep it
-    # above diskCacheBytes: the kubelet evicts the pod when it is exceeded.
-    chunkDirSizeLimit: ""
-    # Hot page tier in bytes: pages read from disk by concurrent readers that
-    # stay in memory (512MiB). Chunk memory is at most about this plus
+    # containerd content store directory on the node (holding blobs/ and
+    # ingest/). It is mounted read-only into the agent at the same path,
+    # and is the only on-disk copy of image data: agents keep chunks only
+    # in memory and serve peers from the blobs (and in-progress downloads)
+    # containerd writes there. The agent runs as a non-root user, so the
+    # directory and blobs/ and ingest/ must be world-readable (containerd's
+    # defaults are). Empty uses
+    # /var/lib/containerd/io.containerd.content.v1.content.
+    contentRoot: ""
+    # Hot page tier in bytes: pages read from the content store by
+    # concurrent readers that stay in memory (512MiB). Chunk memory is at most about this plus
     # inflightBytes plus pageSize x (fillPages x maxConcurrentChunkFills + one
     # page per active reader), about 3.3GiB with the defaults; measured peaks
     # were about 3GiB during a 142-node 40GB pull and about 0.6GiB idle. The
     # default 8Gi memory limit is ample; 4Gi also held in the benchmark.
     memoryCacheBytes: 0
-    # Unit of in-flight buffers, disk I/O, read coalescing, and the hot tier
-    # (1MiB): a power of two between 64KiB and chunkSize.
+    # Unit of in-flight buffers, content store reads, read coalescing, and
+    # the hot tier (1MiB): a power of two between 64KiB and chunkSize.
     pageSize: 0
     # In-flight pages per chunk fill (4).
     fillPages: 0
     # Memory fills borrow beyond fillPages when a reader lags behind a fill
-    # that peers also read, and to keep chunks peers read in memory for
-    # later peers (up to 30s unused); when exhausted, fills with a lagging
-    # reader spill to disk (2GiB).
+    # that peers also read and the content store does not hold the bytes
+    # yet, and to keep chunks peers read (or this agent owns) in memory for
+    # later peers (up to 30s unused). When exhausted, the slowest such
+    # reader paces the fill (2GiB).
     inflightBytes: 0
-    # Page cache use of chunk files: bypass (O_DIRECT), drop (buffered, then
-    # fadvise DONTNEED), or keep ("bypass").
-    pageCache: ""
-    # Chunks written to disk: all, shared (only chunks this agent owns or
-    # serves to a peer), or owned (only chunks this agent owns) ("owned").
-    # On nodes where containerd already saturates the disk during a pull,
-    # writing transit chunks slows pulls down (designs/gantry-cachemesh.md).
-    persist: ""
     # Chunks of one blob fetched ahead of the one being written (8).
     lookahead: 0
     # Concurrent chunk fills from peers or the origin (64).

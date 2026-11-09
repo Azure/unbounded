@@ -55,14 +55,15 @@ func TestDefaultRenderHasNoCachemesh(t *testing.T) {
 			t.Fatalf("operator=%v: default DaemonSet sets GANTRY_NODE_NAME", operator)
 		}
 
-		if bytes.Contains(ds, []byte("cachemesh-chunks")) {
-			t.Fatalf("operator=%v: default DaemonSet mounts the chunk dir", operator)
+		if bytes.Contains(ds, []byte("containerd-content")) || bytes.Contains(ds, []byte("io.containerd.content.v1.content")) {
+			t.Fatalf("operator=%v: default DaemonSet mounts the content store", operator)
 		}
 	}
 }
 
-// Without a sizeLimit the chunk emptyDir renders as an empty object.
-func TestRendersCachemeshChunkDirWithoutSizeLimit(t *testing.T) {
+// With cachemesh enabled the content store is mounted read-only from the
+// host at the agent's default content_root, and no chunk volume exists.
+func TestRendersCachemeshContentRootMount(t *testing.T) {
 	t.Parallel()
 
 	dir := renderChart(t, false, "--set", "gantry.cachemesh.enabled=true")
@@ -72,8 +73,39 @@ func TestRendersCachemeshChunkDirWithoutSizeLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if !bytes.Contains(ds, []byte("- name: cachemesh-chunks\n          emptyDir:\n            {}\n")) {
-		t.Fatalf("chunk emptyDir not rendered:\n%s", ds)
+	root := config.DefaultCachemeshContentRoot
+
+	for _, want := range []string{
+		"- name: containerd-content\n              mountPath: " + root + "\n              readOnly: true\n",
+		"- name: containerd-content\n          hostPath:\n            path: " + root + "\n            type: Directory\n",
+	} {
+		if !bytes.Contains(ds, []byte(want)) {
+			t.Fatalf("DaemonSet lacks %q:\n%s", want, ds)
+		}
+	}
+
+	if bytes.Contains(ds, []byte("cachemesh-chunks")) || bytes.Contains(ds, []byte("emptyDir:\n            {}")) {
+		t.Fatalf("DaemonSet still has a chunk volume:\n%s", ds)
+	}
+
+	if cfg := renderedAgentConfig(t, dir); !strings.Contains(cfg, `  content_root: "`+root+`"`) {
+		t.Fatalf("config lacks content_root:\n%s", cfg)
+	}
+}
+
+// The chart rejects the removed private chunk store keys.
+func TestRejectsRemovedChunkStoreKeys(t *testing.T) {
+	t.Parallel()
+
+	for _, kv := range []string{"diskCacheBytes: 1", "chunkDirSizeLimit: 1Gi", "pageCache: keep", "persist: all", "contentRoot: relative"} {
+		values := filepath.Join(t.TempDir(), "values.yaml")
+		if err := os.WriteFile(values, []byte("gantry:\n  cachemesh:\n    enabled: true\n    "+kv+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		if out, err := helmTemplate(t, "--values", values); err == nil {
+			t.Errorf("chart accepted %q:\n%s", kv, out)
+		}
 	}
 }
 
@@ -104,14 +136,11 @@ func TestRendersEnabledCachemesh(t *testing.T) {
     expectedSize: 150
     maxNeighbors: 32
     chunkSize: 33554432
-    diskCacheBytes: 8589934592
+    contentRoot: /data/containerd/io.containerd.content.v1.content
     memoryCacheBytes: 134217728
     pageSize: 2097152
     fillPages: 6
     inflightBytes: 536870912
-    pageCache: drop
-    persist: shared
-    chunkDirSizeLimit: 10Gi
     lookahead: 12
     metadataTTL: 10m
     cacheTags: false
@@ -133,10 +162,10 @@ func TestRendersEnabledCachemesh(t *testing.T) {
 		t.Fatal("DaemonSet lacks GANTRY_NODE_NAME from spec.nodeName with cachemesh enabled")
 	}
 
-	// The chunk directory is an emptyDir at the agent's default chunk_dir.
+	// A custom content root is mounted at the same path.
 	for _, want := range []string{
-		"- name: cachemesh-chunks\n              mountPath: " + config.DefaultCachemeshChunkDir + "\n",
-		"- name: cachemesh-chunks\n          emptyDir:\n            sizeLimit: 10Gi\n",
+		"mountPath: /data/containerd/io.containerd.content.v1.content\n              readOnly: true\n",
+		"path: /data/containerd/io.containerd.content.v1.content\n            type: Directory\n",
 	} {
 		if !bytes.Contains(ds, []byte(want)) {
 			t.Fatalf("DaemonSet lacks %q:\n%s", want, ds)
@@ -145,13 +174,11 @@ func TestRendersEnabledCachemesh(t *testing.T) {
 
 	for _, want := range []string{
 		"cachemesh:\n  enabled: true\n",
-		"  disk_cache_bytes: 8589934592\n",
+		`  content_root: "/data/containerd/io.containerd.content.v1.content"`,
 		"  memory_cache_bytes: 134217728\n",
 		"  page_size: 2097152\n",
 		"  fill_pages: 6\n",
 		"  inflight_bytes: 536870912\n",
-		`  page_cache: "drop"`,
-		`  persist: "shared"`,
 		"  chunk_size: 33554432\n",
 		"  max_neighbors: 32\n",
 		"  expected_size: 150\n",
@@ -176,8 +203,8 @@ func TestRendersEnabledCachemesh(t *testing.T) {
 	}
 
 	m := c.Cachemesh
-	if !m.Enabled || m.DiskCacheBytes != 8<<30 || m.MemoryCacheBytes != 128<<20 || m.PageSize != 2<<20 ||
-		m.FillPages != 6 || m.InflightBytes != 512<<20 || m.PageCache != "drop" || m.Persist != "shared" || m.ChunkSize != 32<<20 || m.MaxNeighbors != 32 ||
+	if !m.Enabled || m.ContentRoot != "/data/containerd/io.containerd.content.v1.content" || m.MemoryCacheBytes != 128<<20 || m.PageSize != 2<<20 ||
+		m.FillPages != 6 || m.InflightBytes != 512<<20 || m.ChunkSize != 32<<20 || m.MaxNeighbors != 32 ||
 		m.ExpectedSize != 150 || m.Lookahead != 12 || m.MetadataTTL != 10*time.Minute || m.CacheTags {
 		t.Fatalf("parsed cachemesh config: %+v", m)
 	}

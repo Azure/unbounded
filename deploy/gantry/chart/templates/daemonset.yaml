@@ -137,8 +137,9 @@ spec:
             - name: containerd-runtime
               mountPath: {{ .Values.containerd.mountPath }}
             {{- if and .Values.gantry.cachemesh .Values.gantry.cachemesh.enabled }}
-            - name: cachemesh-chunks
-              mountPath: /var/lib/gantry/cachemesh
+            - name: containerd-content
+              mountPath: {{ .Values.gantry.cachemesh.contentRoot | default "/var/lib/containerd/io.containerd.content.v1.content" }}
+              readOnly: true
             {{- end }}
       volumes:
         - name: libp2p
@@ -159,13 +160,10 @@ spec:
             path: {{ .Values.containerd.hostPath }}
             type: Directory
         {{- if and .Values.gantry.cachemesh .Values.gantry.cachemesh.enabled }}
-        # cachemesh chunk files. An emptyDir is writable by the non-root
-        # agent and is removed with the pod, so no chunk outlives it.
-        - name: cachemesh-chunks
-          emptyDir:
-            {{- with .Values.gantry.cachemesh.chunkDirSizeLimit }}
-            sizeLimit: {{ . }}
-            {{- else }}
-            {}
-            {{- end }}
+        # containerd's content store, read-only: cachemesh serves peers from
+        # the blobs containerd writes and keeps no copy of its own.
+        - name: containerd-content
+          hostPath:
+            path: {{ .Values.gantry.cachemesh.contentRoot | default "/var/lib/containerd/io.containerd.content.v1.content" }}
+            type: Directory
         {{- end }}
