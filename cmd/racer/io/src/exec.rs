@@ -130,7 +130,7 @@ pub struct LocalExecutor {
 
     live: Cell<usize>,
 
-    /// Spawns made while tasks run; queued after the batch.
+    /// Reused drain buffer for the ready ids run in one turn.
     batch: RefCell<Vec<u64>>,
 }
 

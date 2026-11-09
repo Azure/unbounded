@@ -162,7 +162,7 @@ impl CancelToken {
         }
         for child in children {
             if let Some(node) = child.upgrade() {
-                Self(node).cancel_with(reason_of(state));
+                Self(node).cancel_with(self::reason(state));
             }
         }
     }
@@ -254,10 +254,6 @@ fn reason(state: u8) -> Error {
     } else {
         Error::Canceled
     }
-}
-
-fn reason_of(state: u8) -> Error {
-    reason(state)
 }
 
 /// Future returned by [`CancelToken::canceled`].

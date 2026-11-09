@@ -928,12 +928,6 @@ impl Reactor {
         Poll::Ready(owner.finish(result, self))
     }
 
-    /// Request cancellation of an in-flight operation.
-    pub(crate) fn cancel(&self, id: IoId, reason: Error) {
-        let mut state = self.state();
-        Self::cancel_locked(&mut state, id, reason);
-    }
-
     fn cancel_locked(state: &mut State, id: IoId, reason: Error) {
         let Some(slot) = state.slab.lookup(id) else {
             return;
@@ -1319,7 +1313,7 @@ impl Reactor {
     /// Cancel one in-flight operation with `reason`, as if its context had
     /// been canceled. Unknown or fenced ids are ignored.
     pub fn cancel_op(&self, id: IoId, reason: Error) {
-        self.cancel(id, reason);
+        Self::cancel_locked(&mut self.state(), id, reason);
     }
 
     /// Wait until every operation in `ids` has fenced, without canceling
@@ -1407,7 +1401,6 @@ fn slot_retry_fd(slot: &mut Slot, op: &Op) {
     };
 }
 
-/// Erased [`sealed::OpOwner::prepare`].
 /// Erased [`sealed::OpOwner::discard`].
 unsafe fn discard_erased<O: sealed::OpOwner>(cell: &mut OwnerCell, result: i32) -> Deferred {
     // SAFETY: the caller passes the cell holding an O.
@@ -1423,6 +1416,7 @@ fn discard_slot(slot: &mut Slot, result: i32) -> Option<Deferred> {
     Some(unsafe { discard(&mut slot.owner, result) })
 }
 
+/// Erased [`sealed::OpOwner::prepare`].
 unsafe fn prepare_erased<O: sealed::OpOwner>(
     owner: *mut InlineBytes,
     scratch: *mut Scratch,
@@ -1549,7 +1543,7 @@ impl<O: sealed::OpOwner> Future for IoFuture<O> {
                 if let Some(token) = &this.ctx.cancel
                     && let Some(reason) = token.register(&mut this.key, cx.waker())
                 {
-                    this.reactor.cancel(id, reason);
+                    this.reactor.cancel_op(id, reason);
                 }
                 Poll::Pending
             }
