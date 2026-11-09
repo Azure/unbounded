@@ -72,6 +72,13 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            {{- if and .Values.gantry.cachemesh .Values.gantry.cachemesh.enabled }}
+            # cachemesh member ID.
+            - name: GANTRY_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            {{- end }}
           ports:
             - name: mirror
               containerPort: 5000

@@ -87,4 +87,26 @@ data:
 
     log_level: "debug"
     log_format: "json"
+    {{- with .Values.gantry.cachemesh }}
+    {{- if .enabled }}
+
+    cachemesh:
+      enabled: true
+      {{- range $key, $field := dict "expectedSize" "expected_size" "maxNeighbors" "max_neighbors" "cellSize" "cell_size" "partitionBits" "partition_bits" "chunkSize" "chunk_size" "chunkCacheBytes" "chunk_cache_bytes" "lookahead" "lookahead" "maxConcurrentChunkFills" "max_concurrent_chunk_fills" "maxConcurrentChunkServes" "max_concurrent_chunk_serves" "chunkAttempts" "chunk_attempts" }}
+      {{- with (index $ "Values" "gantry" "cachemesh" $key) }}
+      {{ $field }}: {{ . | int64 }}
+      {{- end }}
+      {{- end }}
+      {{- range $key, $field := dict "chunkTimeout" "chunk_timeout" "chunkStallTimeout" "chunk_stall_timeout" "metadataTTL" "metadata_ttl" "leaseName" "lease_name" }}
+      {{- with (index $ "Values" "gantry" "cachemesh" $key) }}
+      {{ $field }}: {{ . | quote }}
+      {{- end }}
+      {{- end }}
+      {{- range $key, $field := dict "cacheTags" "cache_tags" "verifyDigest" "verify_digest" "hedge" "hedge" }}
+      {{- if hasKey (index $ "Values" "gantry" "cachemesh") $key }}
+      {{ $field }}: {{ index $ "Values" "gantry" "cachemesh" $key }}
+      {{- end }}
+      {{- end }}
+    {{- end }}
+    {{- end }}
     {{- end }}

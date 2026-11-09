@@ -80,3 +80,52 @@ gantry:
       endpoint: https://registry.example.com
       credentialsPath: ""
       namespaceAlias: ""
+  # Optional cachemesh content path (designs/gantry-cachemesh.md). Off by
+  # default; when disabled nothing below is rendered and the agent behaves
+  # exactly as without it. When enabled, blobs are striped into chunks owned
+  # by individual agents, which pull each chunk from the origin once and relay
+  # it hop by hop through the cachemesh grid; tags are cached with a TTL.
+  # Zero or empty values use the agent defaults shown in parentheses.
+  cachemesh:
+    enabled: false
+    # Expected number of agents (cachemesh default 1000). Set it close to the
+    # node count: the first agent of a new mesh waits about expectedSize/20
+    # seconds before it bootstraps.
+    expectedSize: 0
+    # Data-plane neighbors per agent (256). At about 150 agents the default
+    # makes every agent a direct neighbor of every other one (a 1-D grid);
+    # 32 to 64 forces multi-hop relays that spread popular chunks over relay
+    # caches.
+    maxNeighbors: 0
+    # Agents per grid cell (4).
+    cellSize: 0
+    # log2 of the partition count (20).
+    partitionBits: 0
+    # Stripe size in bytes, a power of two between 1MiB and 1GiB (64MiB).
+    # Must be the same on every agent.
+    chunkSize: 0
+    # In-memory chunk budget in bytes, cached plus in-flight chunks (4GiB).
+    # resources.agent.limits.memory must leave room for it plus about 2GiB.
+    chunkCacheBytes: 0
+    # Chunks of one blob fetched ahead of the one being written (8).
+    lookahead: 0
+    # Concurrent chunk fills from peers or the origin (64).
+    maxConcurrentChunkFills: 0
+    # Concurrent chunk responses to peers (512); more get 429.
+    maxConcurrentChunkServes: 0
+    # Per-attempt chunk timeout (5m) and no-progress timeout (30s).
+    chunkTimeout: ""
+    chunkStallTimeout: ""
+    # Attempts per chunk (4).
+    chunkAttempts: 0
+    # Freshness of cached tag resolutions, at least 5m (5m).
+    metadataTTL: ""
+    # Serve anonymous manifest-by-tag requests from the mesh metadata cache.
+    cacheTags: true
+    # Hash every full blob served through the mesh; a mismatch aborts the
+    # response before its last byte and drops the cached chunks.
+    verifyDigest: true
+    # Hedge slow chunk requests to an alternate peer.
+    hedge: true
+    # Lease that elects the mesh leader ("gantry-cachemesh").
+    leaseName: ""

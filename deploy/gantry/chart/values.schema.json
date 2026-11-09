@@ -262,6 +262,81 @@
           "type": "integer",
           "minimum": 0
         },
+        "cachemesh": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "expectedSize": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "maxNeighbors": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "cellSize": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "partitionBits": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 24
+            },
+            "chunkSize": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "chunkCacheBytes": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "lookahead": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 256
+            },
+            "maxConcurrentChunkFills": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "maxConcurrentChunkServes": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "chunkTimeout": {
+              "type": "string",
+              "pattern": "^(|([0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h))+)$"
+            },
+            "chunkStallTimeout": {
+              "type": "string",
+              "pattern": "^(|([0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h))+)$"
+            },
+            "chunkAttempts": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "metadataTTL": {
+              "type": "string",
+              "pattern": "^(|([0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h))+)$"
+            },
+            "cacheTags": {
+              "type": "boolean"
+            },
+            "verifyDigest": {
+              "type": "boolean"
+            },
+            "hedge": {
+              "type": "boolean"
+            },
+            "leaseName": {
+              "type": "string"
+            }
+          }
+        },
         "upstreamRegistries": {
           "type": "array",
           "items": {
