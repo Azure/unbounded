@@ -105,10 +105,16 @@ impl Session {
     /// Fail closed on expiry, or when a session's chain sets could overflow on
     /// the next message, so pooled reuse reconnects instead.
     fn check(&self) -> Result<()> {
-        if self.state.signatures.ctx().clock.now() >= self.state.expires {
+        self.check_live()?;
+        if !self.state.chains.has_room() {
             return Err(Error::DeadlineExceeded);
         }
-        if !self.state.chains.has_room() {
+        Ok(())
+    }
+
+    /// Fail closed on expiry only.
+    fn check_live(&self) -> Result<()> {
+        if self.state.signatures.ctx().clock.now() >= self.state.expires {
             return Err(Error::DeadlineExceeded);
         }
         Ok(())
@@ -121,7 +127,12 @@ impl Session {
     /// as sent once signing succeeds: like the sequence number, a send that fails
     /// after this point leaves the connection unusable, never reused.
     pub fn sign(&mut self, mut head: MessageHead) -> Result<MessageHead> {
-        self.check()?;
+        // Only our own send set gates signing: a peer that filled our received
+        // set must still get the response to the request that filled it.
+        self.check_live()?;
+        if !self.state.chains.can_send() {
+            return Err(Error::DeadlineExceeded);
+        }
         let mut signers = Vec::new();
         if let Some(index) = head
             .headers
@@ -174,7 +185,9 @@ impl Session {
     /// new chain in the same frame, but they enter the session only after the
     /// frame authenticates.
     pub fn admit(&mut self, head: MessageHead) -> Result<MessageHead> {
-        self.check()?;
+        // SessionChains::admit enforces the received cap exactly; our send set
+        // never limits what we may receive.
+        self.check_live()?;
         let attached = match head.unique("racer-chains")? {
             Some(value) => crate::chains::decode_attachment(value)?,
             None => Vec::new(),
@@ -920,6 +933,32 @@ mod chain_tests {
                 "{name}: first={first_bytes}B steady={steady_bytes}B sign={sign:?} admit+decode={admit:?} verify-proof={verify:?}"
             );
         }
+    }
+
+    #[test]
+    fn full_received_set_still_allows_signing_the_response() {
+        let n = crate::tests::network(3, &racer_io::WorkerCtx::host());
+        let (mut client, mut server) = pair(&n);
+        let fake = |i: u32| {
+            let mut bytes = 4u32.to_be_bytes().to_vec();
+            bytes.extend_from_slice(&i.to_be_bytes());
+            Chain::decode(&bytes).unwrap()
+        };
+        let mut i = 0;
+        while server.state.chains.admit(vec![fake(i)]).is_ok() {
+            i += 1;
+        }
+        assert!(!server.state.chains.can_receive());
+        assert!(server.state.chains.can_send());
+        let request = client
+            .sign(envelope(proof(&n[1], n[2].node()), vec![]))
+            .unwrap();
+        server.admit(request).unwrap();
+        let response = server
+            .sign(envelope(proof(&n[2], n[1].node()), vec![]))
+            .expect("a full received set must not block the response");
+        client.admit(response).unwrap();
+        assert!(server.check().is_err(), "pooled reuse still stops");
     }
 
     #[test]

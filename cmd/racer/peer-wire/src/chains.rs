@@ -251,9 +251,19 @@ impl SessionChains {
     }
 
     /// Whether one more message may attach the most chains any message can need.
+    /// Pooled reuse needs room in both directions.
     pub(crate) fn has_room(&self) -> bool {
+        self.can_send() && self.can_receive()
+    }
+
+    /// Whether one more outgoing message may attach the most chains it can need.
+    pub(crate) fn can_send(&self) -> bool {
         self.sent.len() + MAX_CHAINS_PER_MESSAGE <= MAX_SESSION_CHAINS
-            && self.received.len() + MAX_CHAINS_PER_MESSAGE <= MAX_SESSION_CHAINS
+    }
+
+    /// Whether one more incoming message may attach the most chains it can carry.
+    pub(crate) fn can_receive(&self) -> bool {
+        self.received.len() + MAX_CHAINS_PER_MESSAGE <= MAX_SESSION_CHAINS
     }
 
     pub(crate) fn sent(&self, fingerprint: &[u8; 32]) -> bool {
