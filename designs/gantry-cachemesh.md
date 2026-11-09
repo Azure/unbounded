@@ -39,7 +39,14 @@ true.
 | `metadata_ttl` | `CACHEMESH_METADATA_TTL` | 5m | Tag cache freshness; at least 5m. |
 | `cache_tags` | `CACHEMESH_CACHE_TAGS` | `true` | Serve anonymous tag requests from the mesh. |
 | `verify_digest` | `CACHEMESH_VERIFY_DIGEST` | `true` | Hash full blobs before the last byte. |
-| `chunk_cache_bytes` | `CACHEMESH_CHUNK_CACHE_BYTES` | 4GiB | Memory for cached plus in-flight chunks. |
+| `chunk_dir` | `CACHEMESH_CHUNK_DIR` | `/var/lib/gantry/cachemesh` | Directory of chunk files; wiped at startup. |
+| `disk_cache_bytes` | `CACHEMESH_DISK_CACHE_BYTES` | 20GiB | Disk budget for chunk files; 0 disables the disk tier. |
+| `memory_cache_bytes` | `CACHEMESH_MEMORY_CACHE_BYTES` | 512MiB | Hot page tier in memory; 0 disables it. |
+| `inflight_bytes` | `CACHEMESH_INFLIGHT_BYTES` | 2GiB | Memory fills borrow for lagging readers and recent relay chunks. |
+| `page_size` | `CACHEMESH_PAGE_SIZE` | 1MiB | Unit of buffers, disk I/O, coalescing, and the hot tier. |
+| `fill_pages` | `CACHEMESH_FILL_PAGES` | 4 | In-flight pages per fill. |
+| `page_cache` | `CACHEMESH_PAGE_CACHE` | `bypass` | `bypass` (O_DIRECT), `drop` (fadvise DONTNEED), or `keep`. |
+| `persist` | `CACHEMESH_PERSIST` | `owned` | Chunks written to disk: `all`, `shared`, or `owned`. |
 | `max_concurrent_chunk_fills` | `CACHEMESH_MAX_CONCURRENT_CHUNK_FILLS` | 64 | Chunks fetched at once. |
 | `max_concurrent_chunk_serves` | `CACHEMESH_MAX_CONCURRENT_CHUNK_SERVES` | 512 | Chunk responses to peers at once. |
 | `lookahead` | `CACHEMESH_LOOKAHEAD` | 8 | Chunks of one blob fetched ahead. |
@@ -96,10 +103,10 @@ for the mesh; the mirror simply declines to use it until `Mesh.Ready()`. On
 shutdown the agent calls `Leave` (5s budget) before the transfer listener
 stops, so other members take over its partitions while it can still serve.
 
-When the chunk cache is enabled and `GOMEMLIMIT` is not set, the agent sets
-the Go soft memory limit to 90% of the cgroup memory limit, because gigabytes
-of live chunk buffers would otherwise let the heap grow past the container
-limit before a GC.
+When cachemesh is enabled and `GOMEMLIMIT` is not set, the agent sets the Go
+soft memory limit to 90% of the cgroup memory limit. Chunk page buffers are
+anonymous mappings outside the Go heap (see the chunk store), so the limit
+only governs the heap of the rest of the agent.
 
 ## Chunks and keys
 
@@ -167,26 +174,148 @@ own mirror or from a peer:
 
 ## Chunk store
 
-`meshfetch.store` keeps chunks in memory under `chunk_cache_bytes`:
+`meshfetch.store` (`internal/gantry/meshfetch/store.go`, `fill.go`,
+`pages.go`, `disk.go`) keeps chunk bytes in files on local disk and holds
+only a small, bounded amount in memory.
 
-- The budget covers cached chunks and fills in progress. A fill is never
-  evicted. Complete chunks are evicted least recently used first, with one
-  exception: chunks this agent filled as their owner are kept on a separate
-  list and evicted only when no other complete chunk is left or when owned
-  chunks hold more than half of the budget. Every agent caches the transit
-  copies of everything it pulls or relays, so with a plain LRU an owner
+### Fills and the in-flight window
+
+A fill is one chunk being fetched or already complete. The filler reads the
+chunk into a window of `fill_pages` page buffers (4 x 1MiB by default).
+Readers (the local blob stream and peers) that keep up copy bytes out of
+those pages as they arrive, so every hop is cut-through and a hot fan-out
+reads each byte from the network once. A page leaves the window when:
+
+- the fill is written to disk and the page is on disk, or
+- the fill is not written to disk and every reader has passed it.
+
+A reader that falls behind the window reads the page back from disk. If the
+page is not on disk either, the reader gets `errLost`; the local blob stream
+then starts a new fill from the same byte, and a peer request that needs
+bytes a fill has dropped detaches that fill from the map and starts a new
+one.
+
+When the window is full and a reader still needs its oldest page, the fill:
+
+1. borrows another page from the store-wide in-flight budget
+   (`inflight_bytes`) if peers read the fill or it is written to disk, so a
+   slow reader does not slow the others down;
+2. when the budget is used up, spills to disk: it starts a chunk file at its
+   oldest window page, and lagging readers read from it;
+3. otherwise waits for the slowest reader. A fill that only the local blob
+   stream reads always does this: nobody else is waiting, and it keeps the
+   lookahead fills from using memory. A reader that holds the fill back for
+   `chunk_stall_timeout` is dropped with `errLost`.
+
+### Lingering relay chunks
+
+A fill that a peer has read and that is not written to disk keeps every page
+in memory while the in-flight budget allows: instead of dropping a page that
+all readers have passed, it borrows a new one. When such a fill completes
+with the whole chunk still in memory, it stays in the map on a memory LRU
+list, so peers that ask later (in the relay grid, nodes reach a chunk a few
+seconds apart) join it instead of making the relay fetch it again. These
+chunks give their pages back:
+
+- when a fill needs to borrow and the budget is used up (least recently used
+  first; lagging readers and new relay chunks win over old ones), and
+- after 30s without use, so an idle agent returns the memory.
+
+Without this, relays kept nothing and late requests fetched each chunk
+again from upstream: about 80k extra chunk fills and 1.7x the bytes received
+per node on the 142-node benchmark, and a p50 of about 101s instead of 91s.
+
+### Disk tier
+
+- Chunk files live in `chunk_dir`, one file per chunk, created with
+  `O_DIRECT` and preallocated with `fallocate`. Pages are written in order
+  by one writer goroutine per fill with `pwrite` (`WriteAt`); the final
+  partial page is padded to the 4KiB `O_DIRECT` alignment.
+- The directory is wiped at startup. Chunks are not digest-verified one by
+  one, so files from an earlier process are never trusted.
+- `disk_cache_bytes` bounds chunk files, including fills being written.
+  Complete chunks are evicted least recently used first. Chunks this agent
+  filled as their owner are on a separate list and are evicted only when no
+  other complete chunk is left or when they hold more than half of the
+  budget. Every agent caches transit copies, so with a plain LRU an owner
   evicted its own chunks while slower requesters still needed them and
   refilled them from the origin (1.33x origin egress on a 142-node 40GB pull
   with `maxNeighbors: 32`).
-- When fills alone use the budget (or `max_concurrent_chunk_fills` is
-  reached), peer requests that need a new fill get 429 and local requests
-  wait.
-- A fill buffer is allocated once at full chunk length. Readers stream
-  `buf[off:n]` straight to the socket while the filler appends, so every hop
-  is cut-through with no extra copy and no disk I/O.
-- Buffers are reference counted and reused through a pool once no reader
-  holds them. A reader may keep an evicted chunk alive briefly, so actual
-  memory can exceed the budget by the chunks being written at that moment.
+- A fill that finds no disk budget, or whose file cannot be created
+  (`ENOSPC` pauses disk use for 10s), streams through memory. A failed
+  write turns the fill into a stream-through fill; a failed read drops the
+  chunk. A pull never fails because of the disk.
+- `persist` selects which chunks are written: `all`, `shared` (owned
+  chunks and chunks a peer asked for), or `owned` (default: only chunks this
+  agent owns). Spills happen with any policy.
+- The Helm chart mounts an `emptyDir` at `/var/lib/gantry/cachemesh`. It is
+  writable by the non-root agent and goes away with the pod, so no chunk
+  outlives it, and `gantry.cachemesh.chunkDirSizeLimit` can cap it. A
+  `hostPath` would survive pod restarts, but the agent wipes the directory
+  at startup anyway, and it would need ownership fixes for the non-root
+  agent.
+
+### Why `persist: owned` is the default
+
+On the benchmark nodes containerd alone writes about 86GB per 40GB pull to
+the OS disk, which sustains about 1.07GB/s of writes (`dd oflag=direct`),
+so the disk is already the limit during a pull. Writing transit chunks too
+made the 142-node pull 30-60% slower (`designs/gantry-cachemesh-benchmark.md`).
+With `owned`, each agent writes only its own share of the image (about 0.3GB
+of 43GB). Relays stream chunks through their windows and keep recent
+peer-read chunks in the in-flight budget (see above). `all` or `shared` suit
+nodes whose disk has room to spare or workloads where nodes pull at
+different times.
+
+### Page coalescing and the hot tier
+
+Disk reads go through a page cache keyed by (fill, page index). Concurrent
+readers of the same page share one disk read (singleflight). Each entry is a
+reference-counted page buffer. When the last reader is done the page is
+dropped, unless it showed repeated demand:
+
+- two or more readers held it at once, or
+- it was read again while its key was in a ghost list of recently dropped
+  pages (four times the hot tier's page count).
+
+Such pages stay in the hot tier, an LRU bounded by `memory_cache_bytes`.
+Pages read by one reader once are never kept. Hot pages unused for 30s are
+dropped, and evicting a chunk drops its hot pages.
+
+### Memory bound
+
+Chunk memory is page buffers only:
+
+- in-flight windows: `fill_pages x page_size` per fill, at most
+  `max_concurrent_chunk_fills` fills (256MiB with the defaults);
+- borrowed pages, including lingering relay chunks: at most
+  `inflight_bytes`;
+- the hot tier: at most `memory_cache_bytes`;
+- one page per active reader while it writes that page to its socket (a
+  reader holds a reference only during one `Write`, so a slow reader pins at
+  most one page and then falls back to disk).
+
+With the defaults that is about 3.3GiB at most. Page buffers are anonymous
+`mmap` mappings outside the Go heap: they do not raise the garbage
+collector's heap goal, and `munmap` returns them to the system as soon as
+they are freed (an idle pool keeps at most 64MiB).
+
+### Page cache
+
+Kubernetes counts active page cache in `container_memory_working_set_bytes`.
+`page_cache: bypass` (default) uses `O_DIRECT`, so chunk files never enter
+the page cache; the benchmark measured at most a few MiB of page cache in
+the agent cgroup. `drop` uses buffered I/O and calls `sync_file_range` plus
+`posix_fadvise(DONTNEED)` after each write and read. `keep` leaves caching to
+the kernel. `sendfile` was not used: pages are read into shared buffers so
+that concurrent readers coalesce, and the copy to the socket is cheap next to
+the disk.
+
+### Containerd duplication
+
+Every node also writes each blob to containerd's content store and unpacks
+it. The store does not try to serve completed blobs from containerd; with
+`persist: owned` the extra disk writes are small enough not to matter.
 
 ## Integrity
 
@@ -252,14 +381,22 @@ All in the `cachemesh` subsystem:
   `gantry_cachemesh_blob_bytes_total`,
   `gantry_cachemesh_blob_duration_seconds{outcome}`
 - `gantry_cachemesh_tag_lookups_total{outcome}`
-- `gantry_cachemesh_chunk_evicted_bytes_total`
+- `gantry_cachemesh_chunk_evicted_bytes_total` (disk chunk store)
 - `gantry_cachemesh_control_errors_total`,
   `gantry_cachemesh_lease_errors_total{op}`
 - Gauges: `gantry_cachemesh_members`, `gantry_cachemesh_view_term`,
   `gantry_cachemesh_view_seq`, `gantry_cachemesh_leading`,
   `gantry_cachemesh_ready`, `gantry_cachemesh_neighbors`,
-  `gantry_cachemesh_chunk_cache_bytes`, `gantry_cachemesh_chunk_cache_chunks`,
-  `gantry_cachemesh_chunk_fills_inflight`
+  `gantry_cachemesh_chunk_disk_bytes`, `gantry_cachemesh_chunk_store_chunks`,
+  `gantry_cachemesh_chunk_fills_inflight`,
+  `gantry_cachemesh_page_memory_bytes`, `gantry_cachemesh_hot_page_bytes`,
+  `gantry_cachemesh_inflight_borrowed_bytes`
+- Chunk store counters: `gantry_cachemesh_disk_page_reads_total`,
+  `gantry_cachemesh_disk_page_writes_total`,
+  `gantry_cachemesh_disk_errors_total`,
+  `gantry_cachemesh_shared_page_reads_total` (reads served by another
+  reader's disk read or the hot tier), `gantry_cachemesh_spills_total`,
+  `gantry_cachemesh_stream_fills_total`
 
 ## Transport choices
 
@@ -269,10 +406,14 @@ All in the `cachemesh` subsystem:
 - The cachemesh routes are registered with `transfer.WithExtraRoutes`, outside
   the otelhttp wrapper, so chunk traffic creates no spans.
 
-Benchmarks (`go test -bench . ./internal/gantry/meshfetch`, loopback, 16
-cores, 256MiB blob, 16MiB chunks): cold fetch through owners and an
-in-memory origin about 7 GB/s; fetch from a peer's cache about 13.6 GB/s;
-the same with digest verification about 1.8 GB/s (SHA-256 bound, per blob).
+Benchmarks (`go test -bench . ./internal/gantry/meshfetch`) cover a cold
+fetch through owners, a fetch from a peer's store with and without digest
+verification (SHA-256 caps one blob at about 1.8 GB/s), serving a chunk
+from disk in each page cache mode, fan-out of one chunk to 32 concurrent
+readers (about one disk read per page), and a fill followed by 8
+cut-through readers. Disk numbers depend on the device: on a busy
+development VM one `O_DIRECT` reader managed about 75MB/s at queue depth 1,
+against about 370MB/s with `drop` and page-cache speed with `keep`.
 
 ## Security
 
@@ -298,4 +439,13 @@ allowed to pull. Use NetworkPolicy to limit the port to Gantry agents.
   share a connection.
 - The chunk size must match on every node; a mixed rollout refuses requests
   between nodes with different sizes, and the mirror falls back.
-- Everything is in memory: a restarted node starts with an empty chunk cache.
+- The chunk directory is wiped at startup, so a restarted node starts with
+  an empty chunk store.
+- Chunks on disk are not digest-verified one by one; only whole blobs are
+  (`verify_digest`), so silent disk corruption is caught only at the blob
+  level.
+- With the default `persist: owned`, a relay keeps a chunk only in memory,
+  for at most 30s unused and only while the in-flight budget has room. A
+  peer that asks later makes the relay fetch the chunk again from upstream.
+- Disk reads are synchronous, one page at a time per reader (queue depth 1
+  per reader). There is no read-ahead.

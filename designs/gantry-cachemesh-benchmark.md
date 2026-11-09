@@ -23,8 +23,11 @@ every node pulls the same 40GB image at the same moment.
   26s alone) has any room left.
 - Two bugs in the cachemesh path caused duplicate origin reads (1.16x and
   1.33x egress). Both are fixed and covered by regression tests.
-- Cachemesh fills its chunk cache, so the agent's RSS rises to the configured
-  cache size (24GiB here) and stays there while idle. That is the main cost.
+- Cachemesh filled its in-memory chunk cache, so the agent's RSS rose to the
+  configured cache size (24GiB here) and stayed there while idle. The
+  disk-backed chunk store that replaced it (see "Disk-backed chunk store"
+  below) keeps the same pull time (p50 about 91s, makespan 97-102s) with
+  about 2.8GiB RSS at the peak and about 0.26GiB working set when idle.
 
 ## Setup
 
@@ -294,15 +297,13 @@ and the first node takes over 200s.
 
 ## Recommendations
 
-- For clusters of more than about 64 nodes, run cachemesh with
-  `maxNeighbors` around 32 rather than the library default of 256. The
-  default makes the grid 1-D up to about 256 agents, which serves each chunk
-  directly from its owner to every node.
-- Size `chunkCacheBytes` for what the node can spare and treat it as
-  resident memory: the cache fills up and is not released while idle. 24GiB
-  was enough for a 43GB image once owned chunks were protected. A smaller
-  cache has not been measured; owner protection should keep origin reads at
-  1x, but relays will hit their caches less often.
+- Run cachemesh with `maxNeighbors` around 32 rather than the library
+  default of 256, which makes the grid 1-D up to about 256 agents and serves
+  each chunk directly from its owner to every node. Gantry now defaults to
+  32; the library keeps 256 for 100k-node clusters.
+- `chunkCacheBytes` no longer exists. The chunk store defaults (persist
+  owned chunks, 2GiB in-flight budget, 512MiB hot tier) matched the
+  memory-only speed with a 4Gi memory limit; see "Disk-backed chunk store".
 - `verifyDigest` costs nothing measurable at these rates. Keep the default
   (`true`) unless a node must serve one blob faster than about 1.8GB/s.
   These runs used `false`, and the one `true` run gave the same results.
@@ -325,6 +326,157 @@ and the first node takes over 200s.
 - Lease API request counts come from the code and from observed Lease
   resourceVersion changes, not from API server metrics.
 
+## Disk-backed chunk store
+
+Later on 2026-11-09 the in-memory chunk cache was replaced with the
+disk-backed store described in `designs/gantry-cachemesh.md` (chunk store
+section): chunk files on disk, a small window of in-flight pages per fill, a
+store-wide in-flight budget, a hot page tier, and page read coalescing. The
+same 142 nodes pulled the same kind of 40GB image (4 x 10GiB layers, a fresh
+tag per run) with `values-cachemesh.yaml`, which now leaves `maxNeighbors`
+at the new gantry default of 32. The agent limits stayed at 32 CPU and 48Gi
+except in the 4Gi run.
+
+### Disk measurement
+
+Before deciding what to write to disk, a node's OS disk (`nvme0n1`, shared
+with containerd) was measured with `dd` on a temporary file under
+`/var/lib` (deleted afterwards):
+
+| test | throughput |
+|---|---|
+| write, 4MiB blocks, `oflag=direct`, 1 stream | 1.07GB/s |
+| write, 4 parallel streams, `oflag=direct` | 4 x 268MB/s (1.07GB/s) |
+| read, 4MiB blocks, `iflag=direct`, 1 stream | 1.8GB/s |
+| read, 4 parallel streams, `iflag=direct` | 4 x 536MB/s (2.1GB/s) |
+
+Containerd alone writes about 86GB to this disk per 40GB pull (content store
+plus unpacked snapshot, counted to 60s after the pull). In the memory-only
+runs that took about 91s, so containerd already ran the disk near its write
+limit. Any extra disk traffic from gantry therefore slows the pull down.
+
+### Builds and runs
+
+All builds come from the `gantry-mem` worktree. Every run was a full
+142-node pull, and all 142 nodes succeeded in every run.
+
+| run | build | chunk store settings | p50 | p99 | makespan | origin |
+|---|---|---|---|---|---|---|
+| mem1-all-r1 | mem1 | `persist: all` | 144.0 | 168.3 | 169.7 | 1.00x |
+| mem1-shared-r1 | mem1 | `persist: shared` | 120.8 | 151.3 | 151.9 | 1.00x |
+| mem2-owned-r1 | mem2 | `persist: owned`, no in-flight budget | 143.4 | 149.0 | 149.7 | 1.01x |
+| mem3-owned-r1 | mem3 | `owned`, 1GiB in-flight budget | deadlock | | | |
+| mem4-owned-r1 | mem4 | `owned`, 1GiB budget (deadlock fixed) | 107.0 | 133.9 | 135.3 | 1.01x |
+| mem5-owned-r1 | mem5 | + mmap pages, ghost admission | 111.4 | 137.5 | 140.2 | 1.01x |
+| mem5-owned-2g-r1 | mem5 | 2GiB budget, 512MiB hot tier | 99.1 | 112.0 | 118.1 | 1.00x |
+| mem6-default-r1 | mem6 | new defaults (same as above) | 101.3 | 112.2 | 114.8 | 1.01x |
+| mem6-default-r2 | mem6 | new defaults | 101.7 | 112.2 | 118.0 | 1.00x |
+| mem7-default-r1 | mem7 | + lingering relay chunks | 91.1 | 97.0 | 97.3 | 1.00x |
+| mem8-default-r1 | mem8 | + 30s linger TTL | 91.9 | 98.5 | 102.0 | 1.00x |
+| mem8-default-r2 | mem8 | same | 91.3 | 98.2 | 98.4 | 1.01x |
+| mem8-limit4g-r1 | mem8 | same, agent memory limit 4Gi | 90.7 | 97.5 | 98.8 | 1.00x |
+| mem9-default-r1 | mem9 | + 30s idle TTL for hot pages (final) | 91.9 | 98.7 | 99.3 | 1.00x |
+
+Times are seconds from the shared start to `crictl pull` returning.
+
+### Final build compared with memory-only mode C
+
+Output of `gantry-cluster-bench compare` (rows picked). `cm-c4-n32-run11`
+is memory-only mode C from the first campaign, with a 24GiB chunk cache.
+
+| metric | cm-c4-n32-run11 | mem8-default-r1 | mem8-default-r2 | mem8-limit4g-r1 | mem9-default-r1 |
+|---|---|---|---|---|---|
+| makespan s | 96.2 | 102.0 | 98.4 | 98.8 | 99.3 |
+| pull s p50 | 91.0 | 91.9 | 91.3 | 90.7 | 91.9 |
+| pull s p99 | 96.0 | 98.5 | 98.2 | 97.5 | 98.7 |
+| pull s max | 96.2 | 102.0 | 98.4 | 98.8 | 99.3 |
+| origin egress x image | 1.00 | 1.00 | 1.01 | 1.00 | 1.00 |
+| NIC rx avg MB/s p50 | 484.2 | 485.2 | 496.3 | 485.9 | 479.4 |
+| NIC tx avg MB/s p50 | 496.9 | 521.0 | 519.2 | 513.6 | 504.7 |
+| gantry CPU avg cores p50 | 1.4 | 0.8 | 0.9 | 0.8 | 0.8 |
+| gantry CPU peak cores p99 | 12.7 | 4.9 | 5.0 | 5.3 | 4.7 |
+| gantry RSS peak MiB p50 | 24993.7 | 2772.1 | 2782.0 | 2776.0 | 2784.8 |
+| gantry RSS peak MiB p99 | 25033.7 | 3032.6 | 3034.9 | 3036.0 | 3041.3 |
+| containerd CPU avg cores p50 | 1.0 | 0.9 | 0.9 | 1.0 | 0.9 |
+| disk read GB p50 | n/a | 0.5 | 0.5 | 0.5 | 0.5 |
+| gantry working set peak MiB p50 | n/a | 3267.3 | 3306.6 | 3259.1 | 3269.1 |
+| gantry working set peak MiB p99 | n/a | 3574.7 | 3617.4 | 3500.7 | 3612.4 |
+| gantry working set end MiB p50 | n/a | 514.6 | 513.7 | 518.0 | 255.5 |
+| gantry page cache peak MiB p50 | n/a | 0.1 | 0.1 | 0.1 | 0.1 |
+
+- Pull time matches memory-only mode C: p50 about 91s and makespan 97-102s,
+  against 91s and 96-99s.
+- Gantry memory dropped from about 24.4GiB RSS, held while idle, to about
+  2.8GiB RSS (3.3GiB working set) at the peak, and to about 0.26GiB working
+  set 60s after the pull with the final build (0.5GiB before hot pages got
+  an idle TTL).
+- The 4Gi memory limit run finished at the same speed with no restarts.
+- Gantry used less CPU: 0.8-0.9 cores on average against 1.4, and peaks of
+  about 5 cores against 13. Page buffers live outside the Go heap, so the
+  garbage collector has much less to do.
+- Gantry's own disk traffic is small: each agent writes only the chunks it
+  owns (about 0.3GB) and read about 0.5GB from disk. Page cache in the agent
+  cgroup stayed under 1MiB (`O_DIRECT`).
+- Origin egress stayed at 1.00x.
+- "disk write GB p50" is not comparable between the two: the new runs count
+  60s after the pull, the old ones 15s. Both are almost all containerd.
+
+### What did not work, and why
+
+- **Writing every chunk to disk (`persist: all`)** made the pull 58% slower
+  (p50 144s). Each node wrote about 42GB of chunks on top of containerd's
+  86GB and read back about 71GB. The local blob stream lags behind its
+  lookahead fills, so it read most chunks back from disk.
+- **Writing only chunks peers ask for (`persist: shared`)** cut chunk writes
+  to about 5GB per node but still read about 33GB back for later peers, and
+  the pull was 33% slower (p50 121s).
+- **Writing only owned chunks with no memory budget** removed nearly all
+  extra disk traffic, but a fill whose window was full waited for its
+  slowest reader. Relays were then held to the pace of their own containerd,
+  which chained across the grid (p50 143s).
+- **Adding a 1-2GiB in-flight budget** let fills that peers read run ahead
+  of a lagging reader (p50 99-111s). But relays kept nothing once a fill
+  finished, so peers that reached a chunk a few seconds later made the
+  relay fetch it again: about 70k extra fills and 1.7x the bytes received
+  per node.
+- **Keeping peer-read chunks in the same budget** (lingering relay chunks)
+  brought peer-initiated fills back to about 12k, as in mode C, and the p50
+  to 91s. A 30s idle TTL then returned that memory after the pull.
+
+### Bugs found
+
+1. **Deadlock when a fill spilled after borrowing pages** (mem3). The chunk
+   writer was fed through a channel sized to the base window, and pages
+   were queued while holding the fill lock. A fill that had borrowed pages
+   beyond its base window and then spilled queued more pages than the
+   channel held, blocked under the lock, and the writer needed the same lock.
+   Every pull on every node stopped (0/142 done after 13 minutes); a
+   goroutine dump (`kill -QUIT`) showed the filler blocked in `queueLocked`.
+   The writer now takes pages from the window in order and is woken by a
+   non-blocking signal. Test: `TestSpillQueuesBorrowedPages`.
+2. **Idle memory held by lingering chunks** (mem7). Lingering relay chunks
+   kept about 2.7GiB after the pull until something else needed the budget.
+   Fixed with a 30s idle TTL for lingering chunks (mem8) and hot pages
+   (mem9). Test:
+   `TestLingeringChunkExpires` and the expiry steps in
+   `TestHotTierAdmitsRepeatedPagesAndEvictsLRU`.
+
+### Caveats
+
+- Mode C was not rerun with the final build in the same session; the
+  comparison uses the earlier C runs (same cluster, image shape, and
+  harness, but `TAIL_SECONDS` 15 instead of 60).
+- Working set and page cache were not measured in the first campaign, only
+  RSS.
+- The runs used `verifyDigest: false`, like the first campaign.
+- The defaults favor nodes whose disk is already busy during a pull. On
+  nodes with faster disks, `persist: all` or `shared` keeps more chunks for
+  later pulls; that was not measured.
+- In every run the bench pod log of `joolshev-rdma-w0139` ends 50-80s
+  before its pull does, so its "working set at end of tail" (2.7-3.2GiB, the
+  max column) is a mid-pull value. On every other node the end-of-tail
+  working set was at most about 780MiB.
+
 ## Cluster end state
 
 - The gantry release is uninstalled, and the `gantry-system` namespace,
@@ -340,3 +492,10 @@ and the first node takes over 200s.
 - The `certs.d/10.224.16.40:5005/hosts.toml` files from `prep.sh` remain on
   every node, and were reapplied on w0134 after its restart.
 - Raw data is in `tmp/gantry-cluster-bench/` in the worktree (gitignored).
+
+After the chunk store runs the cluster is in the same state. The `mem1` to
+`mem9` gantry builds and every `bench/g40:mem*` image were deleted and
+garbage collected. Chunk files lived in the agent pods' `emptyDir` and went
+away with the pods. The `dd` test file on `joolshev-rdma-w0000` was removed
+by the same pod that wrote it. Raw data for these runs is in
+`tmp/gantry-cluster-bench/mem*` in the `gantry-mem` worktree (gitignored).

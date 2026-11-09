@@ -118,6 +118,9 @@ All commands run from `hack/gantry-cluster-bench/` with
    Add `--set gantry.cachemesh.maxNeighbors=256` for the 1-D direct grid
    (mode B).
 
+   The cachemesh chunk files live in the agent pod's `emptyDir`, so
+   `undeploy.sh` removes them; `clean.sh` does not need to.
+
    Use a different image tag per run: the origin registry is the only place
    bench images live, and a reused digest might still be cached somewhere.
    `clean.sh` removes leases, but gantry also keeps in-memory provider
