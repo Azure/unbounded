@@ -723,9 +723,13 @@ garbage collected. `gantry:cd2` (the measured build) remains next to
 ## Code changes since these runs
 
 After the runs above, `meshfetch` and its configuration were simplified
-without a cluster rerun. Local benchmarks (`go test -bench .
-./internal/gantry/meshfetch`) showed no regression; a cluster rerun has not
-been done. The changes:
+without a cluster rerun. In local benchmarks (`go test -bench .
+./internal/gantry/meshfetch`) the end-to-end fetches were unchanged (cold
+fetch +3%, peer fetches within noise), while serving from a warm content
+store got slower: one reader of a 16MiB chunk 1.4ms to 2.0ms per chunk
+(opening the file per page) and 32 concurrent readers about 15% slower
+(16 to 23 content store reads per chunk without the hot tier). Both stay
+well above per-node network rates (7.7GiB/s and 46GiB/s). The changes:
 
 - The hot page tier (`memory_cache_bytes`, 512MiB in every run above) was
   removed. Concurrent reads of one page are still coalesced; a page is
