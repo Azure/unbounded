@@ -129,8 +129,6 @@ type wireGuardState struct {
 	// healthFlapMaxBackoff is the node-level maximum backoff for health check flap dampening.
 	healthFlapMaxBackoff time.Duration
 
-	otherSitesNodeCIDRs []string
-
 	// lastGatewayAdvertSummary captures the previous Gateway-route-
 	// advertisement state so the periodic "Gateway route advertisement:
 	// ..." log line only fires on actual change instead of on every

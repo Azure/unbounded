@@ -299,6 +299,20 @@ kubectl unbounded machine register \
 
 ---
 
+### `kubectl unbounded machine manual-bootstrap`
+
+Generate the bootstrap script or cloud-init payload for a host. Run
+`kubectl unbounded machine manual-bootstrap --help` for all flags; the one that
+selects where the node stack runs is:
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--isolation` | string | empty (`nspawn`) | `nspawn`, the only mode in this release. Other values are rejected. |
+
+See [Isolation Modes]({{< relref "reference/agent/isolation" >}}).
+
+---
+
 ### `kubectl unbounded machine operation`
 
 Create and watch `MachineOperation` resources.

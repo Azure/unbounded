@@ -232,6 +232,38 @@ func (r *MachineReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, err
 	}
 
+	// Maintain the isolation drift condition for every Machine, including
+	// agent-registered ones without SSH config.
+	changed, recheck := syncIsolationConditions(&machine, time.Now())
+	if changed {
+		if err := r.Status().Update(ctx, &machine); err != nil {
+			if errors.IsConflict(err) {
+				// The agent patches status.isolation at the same time.
+				// Losing the race is expected; reconcile again on the new
+				// object.
+				return ctrl.Result{RequeueAfter: time.Second}, nil
+			}
+
+			logger.Error(err, "Failed to update isolation conditions")
+
+			return ctrl.Result{}, err
+		}
+	}
+
+	result, err := r.reconcileMachine(ctx, &machine)
+	if err == nil && recheck > 0 && (result.RequeueAfter == 0 || recheck < result.RequeueAfter) {
+		// An InProgress isolation change turns stale on time alone, with no
+		// event to trigger a reconcile.
+		result.RequeueAfter = recheck
+	}
+
+	return result, err
+}
+
+// reconcileMachine runs the SSH reachability and provisioning reconcile.
+func (r *MachineReconciler) reconcileMachine(ctx context.Context, machine *unboundedv1alpha3.Machine) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+
 	// Machines without SSH configuration are not managed by this controller.
 	if machine.Spec.SSH == nil {
 		logger.Info("Machine has no SSH config, skipping", "name", machine.Name)
@@ -248,7 +280,7 @@ func (r *MachineReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	// Check if we can reach the machine via TCP.
 	// When a bastion is configured the probe is routed through it.
-	if err := checker.CheckReachable(ctx, &machine); err != nil {
+	if err := checker.CheckReachable(ctx, machine); err != nil {
 		probeHost := machine.Spec.SSH.Host
 		if machine.Spec.SSH.Bastion != nil {
 			probeHost = machine.Spec.SSH.Bastion.Host + " -> " + machine.Spec.SSH.Host
@@ -256,17 +288,17 @@ func (r *MachineReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 		logger.Info("Machine is not reachable", "name", machine.Name, "host", probeHost, "error", err)
 
-		r.setSSHReachableCondition(&machine, metav1.ConditionFalse, "Unreachable", fmt.Sprintf("Machine is not reachable: %v", err))
+		r.setSSHReachableCondition(machine, metav1.ConditionFalse, "Unreachable", fmt.Sprintf("Machine is not reachable: %v", err))
 
-		return r.updateStatus(ctx, &machine, unboundedv1alpha3.MachinePhasePending,
+		return r.updateStatus(ctx, machine, unboundedv1alpha3.MachinePhasePending,
 			fmt.Sprintf("Machine is not reachable: %v", err))
 	}
 
-	r.setSSHReachableCondition(&machine, metav1.ConditionTrue, "Reachable", "Machine is reachable via SSH")
+	r.setSSHReachableCondition(machine, metav1.ConditionTrue, "Reachable", "Machine is reachable via SSH")
 
 	// If there is no kubernetes configuration we just mark it Ready.
 	if machine.Spec.Kubernetes == nil {
-		return r.updateStatus(ctx, &machine, unboundedv1alpha3.MachinePhaseReady, "Machine is reachable")
+		return r.updateStatus(ctx, machine, unboundedv1alpha3.MachinePhaseReady, "Machine is reachable")
 	}
 
 	// If the machine is in a Node-lifecycle phase and was previously
@@ -275,15 +307,15 @@ func (r *MachineReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// kubernetes config was added) needs to go through provisioning first.
 	switch machine.Status.Phase {
 	case unboundedv1alpha3.MachinePhaseJoining:
-		return r.reconcileNodeJoin(ctx, &machine)
+		return r.reconcileNodeJoin(ctx, machine)
 	case unboundedv1alpha3.MachinePhaseReady:
-		if wasProvisioned(&machine) {
-			return r.reconcileNodeJoin(ctx, &machine)
+		if wasProvisioned(machine) {
+			return r.reconcileNodeJoin(ctx, machine)
 		}
 	}
 
 	// Machine has kubernetes config - determine if provisioning is needed.
-	return r.reconcileProvisioning(ctx, &machine)
+	return r.reconcileProvisioning(ctx, machine)
 }
 
 // reconcileProvisioning handles the provisioning lifecycle for a machine that

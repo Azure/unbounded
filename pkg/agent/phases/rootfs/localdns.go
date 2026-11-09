@@ -52,7 +52,7 @@ func (c *configureLocalDNS) Do(ctx context.Context) error {
 		return err
 	}
 
-	machineDir := c.goalState.MachineDir
+	machineDir := c.goalState.Root().Path("/")
 
 	localDNSDir := filepath.Join(machineDir, "etc/unbounded/localdns")
 	if err := ensureWorldExecutableDir(localDNSDir); err != nil {
@@ -124,7 +124,7 @@ func (c *configureLocalDNS) Do(ctx context.Context) error {
 }
 
 func (c *configureLocalDNS) installCoreDNS(ctx context.Context) error {
-	destination := filepath.Join(c.goalState.MachineDir, strings.TrimPrefix(goalstates.LocalDNSCoreDNSBinaryPath, "/"))
+	destination := c.goalState.Root().Path(strings.TrimPrefix(goalstates.LocalDNSCoreDNSBinaryPath, "/"))
 	if err := ensureWorldExecutableDir(filepath.Dir(destination)); err != nil {
 		return fmt.Errorf("create CoreDNS binary directory: %w", err)
 	}

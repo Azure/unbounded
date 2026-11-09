@@ -5,14 +5,11 @@ package reset
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
-	"os"
-	"os/exec"
 
-	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/isolation/nspawn"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 )
 
@@ -30,12 +27,16 @@ func RemoveNSpawnConfig(log *slog.Logger, machineName string) phases.Task {
 func (t *removeNSpawnConfig) Name() string { return "remove-nspawn-config" }
 
 func (t *removeNSpawnConfig) Do(_ context.Context) error {
-	nspawnFile := fmt.Sprintf("%s/%s.nspawn", goalstates.SystemdNSpawnDir, t.machineName)
-	overrideDir := fmt.Sprintf("%s/systemd-nspawn@%s.service.d", goalstates.SystemdSystemDir, t.machineName)
-	configRegenerationUnit := fmt.Sprintf("%s/%s", goalstates.SystemdSystemDir, goalstates.ConfigRegenerationUnit(t.machineName))
-	t.log.Info("removing nspawn configuration", "nspawn_file", nspawnFile, "override_dir", overrideDir, "config_regeneration_unit", configRegenerationUnit)
+	return nspawn.RemoveConfig(t.log, nspawnConfigPaths(t.machineName))
+}
 
-	return errors.Join(removeFileIfExists(t.log, nspawnFile), removeAllIfExists(t.log, overrideDir), removeFileIfExists(t.log, configRegenerationUnit))
+func nspawnConfigPaths(machineName string) nspawn.ConfigPaths {
+	return nspawn.ConfigPaths{
+		NSpawnFile:             fmt.Sprintf("%s/%s.nspawn", goalstates.SystemdNSpawnDir, machineName),
+		OverrideDir:            fmt.Sprintf("%s/systemd-nspawn@%s.service.d", goalstates.SystemdSystemDir, machineName),
+		ConfigRegenerationUnit: fmt.Sprintf("%s/%s", goalstates.SystemdSystemDir, goalstates.ConfigRegenerationUnit(machineName)),
+		BPFFSMountPath:         goalstates.BPFFSMountPath(machineName),
+	}
 }
 
 type removeBPFFSMount struct {
@@ -52,28 +53,7 @@ func RemoveBPFFSMount(log *slog.Logger, machineName string) phases.Task {
 func (t *removeBPFFSMount) Name() string { return "remove-bpffs-mount" }
 
 func (t *removeBPFFSMount) Do(ctx context.Context) error {
-	mountPath := goalstates.BPFFSMountPath(t.machineName)
-	if _, err := os.Stat(mountPath); errors.Is(err, os.ErrNotExist) {
-		t.log.Info("bpffs mount path not present, nothing to remove", "path", mountPath)
-		return nil
-	} else if err != nil {
-		return fmt.Errorf("stat bpffs mount path %s: %w", mountPath, err)
-	}
-
-	// util-linux reserves exit 32 for a path that is not a mount point.
-	// Other failures do not authorize recursive removal.
-	if err := executil.RunCmdAt(ctx, t.log, slog.LevelDebug, executil.Mountpoint(), "-q", mountPath); err == nil {
-		if err := executil.RunCmd(ctx, t.log, executil.Umount(), mountPath); err != nil {
-			return fmt.Errorf("unmount bpffs %s: %w", mountPath, err)
-		}
-	} else {
-		var exitErr *exec.ExitError
-		if !errors.As(err, &exitErr) || exitErr.ExitCode() != 32 {
-			return fmt.Errorf("inspect bpffs mount %s: %w", mountPath, err)
-		}
-	}
-
-	return removeAllIfExists(t.log, mountPath)
+	return nspawn.RemoveBPFFSMount(ctx, t.log, goalstates.BPFFSMountPath(t.machineName))
 }
 
 // CleanupMachine returns a composite task that removes all artifacts of an

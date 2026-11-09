@@ -13,10 +13,13 @@
 # Environment:
 #   KERNEL_PACKAGE  kernel package to install (default: kernel)
 #   NVIDIA          set to 1 to install the NVIDIA open GPU driver
+#   MSHV            set to 1 to install the Microsoft Hypervisor and its
+#                   loaders so Linux boots as the root partition (amd64 only)
 set -eu
 
 KERNEL_PACKAGE="${KERNEL_PACKAGE:-kernel}"
 NVIDIA="${NVIDIA:-0}"
+MSHV="${MSHV:-0}"
 
 retry() {
   n=1
@@ -48,8 +51,19 @@ fi
 # Install the kernel first so that driver packages build against it.
 retry tdnf install -y "$KERNEL_PACKAGE"
 
+# shim 16 conflicts with mshv-bootloader-lx, so the hypervisor variant keeps
+# the newest shim 15 release.
+SHIM_PACKAGE=shim
+if [ "$MSHV" = 1 ]; then
+  SHIM_PACKAGE="shim < 16"
+  # The hypervisor (hvix64.exe, hvax64.exe), its Linux loader
+  # (lxhvloader.dll), and the UEFI application that starts them
+  # (HvLoader.efi) all install under /boot/efi.
+  retry tdnf install -y mshv mshv-bootloader-lx edk2-hvloader
+fi
+
 retry tdnf install -y \
-  shim grub2-efi-binary dracut \
+  "$SHIM_PACKAGE" grub2-efi-binary dracut \
   systemd systemd-udev systemd-networkd systemd-resolved systemd-container dbus \
   cloud-init cloud-utils-growpart gptfdisk e2fsprogs \
   openssh-server sudo shadow-utils \
@@ -76,6 +90,16 @@ dracut --force --no-hostonly --no-hostonly-cmdline \
   --omit-drivers "nvidia nvidia_modeset nvidia_uvm nvidia_drm nvidia_peermem" \
   --kver "$KVER" "/boot/initramfs-$KVER.img"
 chmod 0644 "/boot/vmlinuz-$KVER" "/boot/initramfs-$KVER.img"
+
+if [ "$MSHV" = 1 ]; then
+  for file in HvLoader.efi lxhvloader.dll Windows/System32/hvix64.exe \
+    Windows/System32/hvax64.exe; do
+    if [ ! -f "/boot/efi/$file" ]; then
+      echo "missing hypervisor component: /boot/efi/$file" >&2
+      exit 1
+    fi
+  done
+fi
 
 if [ "$NVIDIA" = 1 ]; then
   cat > /etc/modules-load.d/nvidia.conf <<'EOF'

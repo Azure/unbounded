@@ -26,6 +26,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/version"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/util/retry"
@@ -37,6 +38,8 @@ import (
 )
 
 const acrAttachManager = "unbounded-acr-attach"
+
+var errACRProxyNotReady = errors.New("AKS admission did not expose a supported identity-binding token proxy; verify feature availability")
 
 type attachACRHandler struct {
 	acrID, clusterID, authMode, namespace, kubeconfig string
@@ -263,6 +266,35 @@ func (h *attachACRHandler) azureJSON(ctx context.Context, output any, args ...st
 	return nil
 }
 
+func (h *attachACRHandler) waitForACRProxy(ctx context.Context, cfg *registryauth.Config) error {
+	var lastErr error
+
+	err := wait.PollUntilContextCancel(ctx, 5*time.Second, true, func(ctx context.Context) (bool, error) {
+		candidate := *cfg
+		candidate.SNIName, candidate.ProxyAddress, candidate.CACert, candidate.Audience = "", "", "", ""
+
+		lastErr = h.discoverACRProxy(ctx, &candidate)
+		if lastErr == nil {
+			*cfg = candidate
+
+			return true, nil
+		}
+
+		if errors.Is(lastErr, errACRProxyNotReady) || apierrors.IsServiceUnavailable(lastErr) ||
+			apierrors.IsTimeout(lastErr) || apierrors.IsServerTimeout(lastErr) ||
+			apierrors.IsTooManyRequests(lastErr) || apierrors.IsInternalError(lastErr) || apierrors.IsNotFound(lastErr) {
+			return false, nil
+		}
+
+		return false, lastErr
+	})
+	if err != nil {
+		return fmt.Errorf("wait for AKS identity-binding admission: %w", errors.Join(err, lastErr))
+	}
+
+	return nil
+}
+
 func (h *attachACRHandler) discoverACRProxy(ctx context.Context, cfg *registryauth.Config) error {
 	accounts := h.client.CoreV1().ServiceAccounts(h.namespace)
 	name := "gantry-acr-discovery"
@@ -321,6 +353,10 @@ func (h *attachACRHandler) discoverACRProxy(ctx context.Context, cfg *registryau
 
 			cfg.CACert = string(decoded)
 		}
+	}
+
+	if values["AZURE_KUBERNETES_TOKEN_PROXY"] == "" {
+		return errACRProxyNotReady
 	}
 
 	proxy, err := url.Parse(values["AZURE_KUBERNETES_TOKEN_PROXY"])

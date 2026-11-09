@@ -458,7 +458,7 @@ func VerifyDaemonInstalled(ctx context.Context, log *slog.Logger) error {
 // RepairDaemon requires the caller's installation lock. It uses current applied
 // configuration, never the original bootstrap input that may name a retired slot.
 func RepairDaemon(ctx context.Context, log *slog.Logger) error {
-	if _, err := (nspawnNodeOperator{}).FindActiveMachine(log); err != nil {
+	if _, err := (hostOperator{}).FindActiveMachine(log); err != nil {
 		return err
 	}
 

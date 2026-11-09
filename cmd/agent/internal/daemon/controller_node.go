@@ -21,6 +21,7 @@ import (
 	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
 	"github.com/Azure/unbounded/internal/machineconfigs"
 	"github.com/Azure/unbounded/internal/provision"
+	"github.com/Azure/unbounded/pkg/agent/isolation"
 )
 
 func (r *repaveReconciler) ReconcileRepave(ctx context.Context, _ string) (reconcile.Result, error) {
@@ -49,6 +50,14 @@ func (r *repaveReconciler) ReconcileRepave(ctx context.Context, _ string) (recon
 		}
 
 		return reconcile.Result{}, err
+	}
+
+	// A different declared mode is a mode change. This agent cannot change the
+	// mode of a running node: it reports the change as refused and repaves in
+	// the mode the node runs, so version and configuration rollouts continue.
+	if desiredMode := effectiveIsolation(&desiredConfig.AgentConfig); desiredMode != activeModeOf(active) {
+		r.refuseIsolationChange(ctx, active, desiredMode)
+		desiredConfig.Isolation = active.Config.Isolation
 	}
 
 	if !hasDrift(active.Config, &desiredConfig.AgentConfig) {
@@ -85,6 +94,12 @@ func resolveDesiredRepaveConfig(
 
 	desired := configFromApplied(applied)
 
+	// spec.isolation declares the mode the node moves to. Empty is no
+	// declaration: the node keeps the mode it runs in.
+	if machine.Spec.Isolation != "" {
+		desired.Isolation = string(machine.Spec.Isolation)
+	}
+
 	var appliedRef *v1alpha3.MachineConfigurationRefStatus
 
 	if machine.Spec.ConfigurationRef != nil {
@@ -102,6 +117,35 @@ func resolveDesiredRepaveConfig(
 	}
 
 	return &desired, appliedRef, nil
+}
+
+// refuseIsolationChange reports a mode change this agent will not make in
+// status.isolationChange, as Failed with reason UnsupportedMode. The report is
+// best effort: the repave in the current mode goes ahead whether or not it
+// lands.
+func (r *repaveReconciler) refuseIsolationChange(ctx context.Context, active *ActiveMachine, target isolation.Mode) {
+	current := activeModeOf(active)
+
+	message := fmt.Sprintf("this agent cannot change the isolation mode of a running node; it keeps running %q and the repave goes ahead in that mode", current)
+	if _, err := isolation.ParseMode(string(target)); err != nil {
+		message = fmt.Sprintf("this agent cannot run isolation %q (%v); it keeps running %q and the repave goes ahead in that mode", target, err, current)
+	}
+
+	r.log.Warn("refusing isolation mode change", "from", current, "to", target, "reason", message)
+
+	err := patchIsolationStatus(ctx, r.Client, r.machineName, isolationStatus{
+		Applied: v1alpha3.IsolationMode(current),
+		Change: &v1alpha3.IsolationChangeStatus{
+			TargetMode:         v1alpha3.IsolationMode(target),
+			Phase:              v1alpha3.IsolationChangeFailed,
+			Reason:             v1alpha3.IsolationChangeReasonUnsupportedMode,
+			Message:            message,
+			LastTransitionTime: metav1.Now(),
+		},
+	})
+	if err != nil {
+		r.log.Warn("could not report the refused isolation change", "error", err)
+	}
 }
 
 func getLocalMachine(ctx context.Context, c client.Reader, machineName string) (*v1alpha3.Machine, error) {

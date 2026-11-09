@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -17,6 +19,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/preflight"
 )
@@ -75,6 +78,79 @@ func preflightTestServer(t *testing.T) *httptest.Server {
 	}))
 }
 
+// testInstallStore is an empty install-state store in a temporary directory, so
+// admission never reads the host's record.
+func testInstallStore(t *testing.T) *installstate.Store {
+	t.Helper()
+
+	dir := t.TempDir()
+
+	return installstate.NewStore(filepath.Join(dir, "state"), filepath.Join(dir, "lock"))
+}
+
+// Admission reads the injected store, not the host's: a completed record for
+// this identity skips the checks, and one for another identity is refused.
+func TestPreflightAdmitsAgainstTheInjectedStore(t *testing.T) {
+	cfg := preflightConfig("https://127.0.0.1:1")
+	path := writeConfigFile(t, cfg)
+
+	id, err := bootstrapIdentity(&cfg)
+	require.NoError(t, err)
+
+	t.Run("complete record skips the checks", func(t *testing.T) {
+		store := testInstallStore(t)
+		r, err := installstate.NewRecord(id.MachineName, id.ConfigFingerprint)
+		require.NoError(t, err)
+		require.NoError(t, store.MarkComplete(r))
+
+		var out bytes.Buffer
+
+		h := &preflightHandler{
+			cmdCtx:       &CommandContext{LogFormat: "text"},
+			installation: store,
+			configPath:   path,
+			output:       "json",
+			writer:       &out,
+		}
+		require.NoError(t, h.execute(context.Background()))
+
+		var report preflight.Report
+		require.NoError(t, json.Unmarshal(out.Bytes(), &report))
+		assert.Empty(t, report.Checks)
+	})
+
+	t.Run("record for another identity is refused", func(t *testing.T) {
+		store := testInstallStore(t)
+		r, err := installstate.NewRecord("another-machine", id.ConfigFingerprint)
+		require.NoError(t, err)
+		require.NoError(t, store.Save(r))
+
+		h := &preflightHandler{
+			cmdCtx:       &CommandContext{LogFormat: "text"},
+			installation: store,
+			configPath:   path,
+			output:       "json",
+			writer:       &bytes.Buffer{},
+		}
+		require.ErrorContains(t, h.execute(context.Background()), "installation intent differs")
+	})
+
+	t.Run("unreadable record fails closed", func(t *testing.T) {
+		dir := t.TempDir()
+		// A directory where the record belongs cannot be read as one.
+		require.NoError(t, os.MkdirAll(filepath.Join(dir, "state", "install-state.json"), 0o755))
+
+		h := &preflightHandler{
+			cmdCtx:       &CommandContext{LogFormat: "text"},
+			installation: installstate.NewStore(filepath.Join(dir, "state"), filepath.Join(dir, "lock")),
+			configPath:   path,
+			output:       "json",
+			writer:       &bytes.Buffer{},
+		}
+		require.ErrorContains(t, h.execute(context.Background()), "cannot read installation ownership")
+	})
+}
+
 func TestNewCmdPreflight(t *testing.T) {
 	cmd := newCmdPreflight(&CommandContext{LogFormat: "text"})
 
@@ -95,6 +171,7 @@ func TestPreflightJSONOutput(t *testing.T) {
 
 	h := &preflightHandler{
 		cmdCtx:                &CommandContext{LogFormat: "text"},
+		installation:          testInstallStore(t),
 		configPath:            path,
 		ignorePreflightErrors: []string{"all"},
 		output:                "json",
@@ -121,10 +198,11 @@ func TestPreflightTextOutputError(t *testing.T) {
 	var out bytes.Buffer
 
 	h := &preflightHandler{
-		cmdCtx:     &CommandContext{LogFormat: "text"},
-		configPath: path,
-		output:     "text",
-		writer:     &out,
+		cmdCtx:       &CommandContext{LogFormat: "text"},
+		installation: testInstallStore(t),
+		configPath:   path,
+		output:       "text",
+		writer:       &out,
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -146,6 +224,7 @@ func TestPreflightTextOutputIncludesOK(t *testing.T) {
 
 	h := &preflightHandler{
 		cmdCtx:                &CommandContext{LogFormat: "text"},
+		installation:          testInstallStore(t),
 		configPath:            path,
 		ignorePreflightErrors: []string{"all"},
 		output:                "text",
@@ -192,8 +271,9 @@ func TestPreflightCLIReportsNVIDIAReadinessFailure(t *testing.T) {
 			}
 
 			h := &preflightHandler{
-				cmdCtx: &CommandContext{LogFormat: "text"},
-				writer: &out,
+				cmdCtx:       &CommandContext{LogFormat: "text"},
+				installation: testInstallStore(t),
+				writer:       &out,
 				checks: []preflight.Checker{
 					preflightResultChecker{result: preflight.Error("nvidia-driver", "NVIDIA diagnostic tooling",
 						"NVIDIA GPUs are not ready: nvidia-smi did not report valid NVIDIA GPU enumeration")},

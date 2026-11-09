@@ -45,7 +45,7 @@ func DownloadCRIBinaries(log *slog.Logger, goalState *goalstates.RootFS) phases.
 func (d *downloadCRIBinaries) Name() string { return "download-cri-binaries" }
 
 func (d *downloadCRIBinaries) Do(ctx context.Context) error {
-	destDir := filepath.Join(d.goalState.MachineDir, goalstates.BinDir)
+	destDir := d.goalState.Root().Path(goalstates.BinDir)
 	containerdOverride := containerdDownloadSource(d.goalState)
 	runcOverride := runcDownloadSource(d.goalState)
 	containerdVersion := downloadSourceVersion(d.goalState.ContainerdVersion, containerdOverride)

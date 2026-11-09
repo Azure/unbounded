@@ -167,6 +167,80 @@ func TestMachinaMachineOperationReconcilerSkipsTerminalAndIgnoresUnsupported(t *
 	}
 }
 
+func TestMachinaMachineOperationReconcilerIgnoresAllocationOperations(t *testing.T) {
+	t.Parallel()
+
+	for _, kind := range []machinav1alpha3.OperationKind{machinav1alpha3.OperationHostAllocate, machinav1alpha3.OperationHostRelease} {
+		t.Run(string(kind), func(t *testing.T) {
+			t.Parallel()
+
+			op := &machinav1alpha3.MachineOperation{
+				ObjectMeta: metav1.ObjectMeta{Name: "op-allocation"},
+				Spec: machinav1alpha3.MachineOperationSpec{
+					MachineRef:    "machine-1",
+					AllocationRef: &machinav1alpha3.UIDReference{Name: "alloc-1", UID: "alloc-1-uid"},
+					OperationKind: kind,
+				},
+			}
+			control := &machinav1alpha3.MachineOperation{
+				ObjectMeta: metav1.ObjectMeta{Name: "op-control"},
+				Spec: machinav1alpha3.MachineOperationSpec{
+					MachineRef:    "machine-1",
+					OperationKind: machinav1alpha3.OperationNodeReboot,
+				},
+			}
+			allocationTarget := &recordingMachineOperationTargetState{}
+			controlTarget := &recordingMachineOperationTargetState{}
+
+			reconciler, err := NewMachinaMachineOperationReconciler(
+				fakeMachineOperationClient(op, control),
+				"machine-1",
+				"node-1",
+				MachineOperationHandlers{
+					machinav1alpha3.OperationHostAllocate: allocationTarget.reconcile,
+					machinav1alpha3.OperationHostRelease:  allocationTarget.reconcile,
+					machinav1alpha3.OperationNodeReboot:   controlTarget.reconcile,
+				},
+			)
+			if err != nil {
+				t.Fatalf("NewMachinaMachineOperationReconciler: %v", err)
+			}
+
+			// A host operation for the same Machine is mapped, so the setup
+			// would enqueue an operation this reconciler handles.
+			if requests := reconciler.mapMachineOperation(context.Background(), control); len(requests) != 1 {
+				t.Fatalf("control requests = %v, want one", requests)
+			}
+
+			if requests := reconciler.mapMachineOperation(context.Background(), op); len(requests) != 0 {
+				t.Fatalf("requests = %v, want none", requests)
+			}
+
+			result, err := reconciler.ReconcileMachineOperation(context.Background(), op.Name)
+			if err != nil {
+				t.Fatalf("ReconcileMachineOperation: %v", err)
+			}
+
+			if result != (ctrl.Result{}) {
+				t.Fatalf("result = %v, want empty", result)
+			}
+
+			if allocationTarget.called {
+				t.Fatalf("handler called with %#v", allocationTarget.operation)
+			}
+
+			var updated machinav1alpha3.MachineOperation
+			if err := reconciler.client.Get(context.Background(), client.ObjectKey{Name: op.Name}, &updated); err != nil {
+				t.Fatalf("get MachineOperation: %v", err)
+			}
+
+			if updated.Status.Phase != "" {
+				t.Fatalf("phase = %s, want empty", updated.Status.Phase)
+			}
+		})
+	}
+}
+
 func TestMachinaMachineOperationReconcilerReturnsTargetError(t *testing.T) {
 	t.Parallel()
 

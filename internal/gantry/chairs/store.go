@@ -39,10 +39,32 @@ type LeaseClient interface {
 
 type Store struct {
 	leases LeaseClient
+	now    func() time.Time
 }
 
-func NewStore(leases LeaseClient) *Store {
-	return &Store{leases: leases}
+// StoreOption configures a Store.
+type StoreOption func(*Store)
+
+// WithStoreClock overrides the clock used to stamp snapshot fetch times.
+// Callers that drive the chair manager with an injected clock must use the
+// same one here, otherwise lease expiry is evaluated against a different
+// timeline than the one that issued the leases.
+func WithStoreClock(now func() time.Time) StoreOption {
+	return func(s *Store) {
+		if now != nil {
+			s.now = now
+		}
+	}
+}
+
+func NewStore(leases LeaseClient, opts ...StoreOption) *Store {
+	s := &Store{leases: leases, now: time.Now}
+
+	for _, opt := range opts {
+		opt(s)
+	}
+
+	return s
 }
 
 func (s *Store) Snapshot(ctx context.Context, epoch int64) (Snapshot, error) {
@@ -51,7 +73,7 @@ func (s *Store) Snapshot(ctx context.Context, epoch int64) (Snapshot, error) {
 		return Snapshot{}, fmt.Errorf("list chairs: %w", err)
 	}
 
-	snapshot := Snapshot{Epoch: epoch, FetchedAt: time.Now(), Chairs: make([]Chair, 0, DefaultCount)}
+	snapshot := Snapshot{Epoch: epoch, FetchedAt: s.now(), Chairs: make([]Chair, 0, DefaultCount)}
 
 	for index := range list.Items {
 		chair, err := DecodeLease(&list.Items[index])

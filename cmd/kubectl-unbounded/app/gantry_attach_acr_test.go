@@ -212,6 +212,90 @@ func managedAttachFixture(t *testing.T, bundles ...corev1.ClusterTrustBundleProj
 	return h, client, calls
 }
 
+func TestGantryAttachACRWaitsForAdmissionReadiness(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{name: "metadata not injected yet"},
+		{name: "webhook temporarily unavailable", err: apierrors.NewServiceUnavailable("webhook starting")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, client, _ := managedAttachFixture(t)
+			h.timeout = 15 * time.Second
+			attempts := 0
+
+			client.PrependReactor("create", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+				attempts++
+				if attempts == 1 {
+					return true, action.(k8stesting.CreateAction).GetObject(), tc.err
+				}
+
+				return false, nil, nil
+			})
+
+			require.NoError(t, h.execute(t.Context()))
+			require.Equal(t, 2, attempts)
+		})
+	}
+}
+
+func TestGantryAttachACRAdmissionWaitRejectsPermanentErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		proxy string
+		err   error
+	}{
+		{name: "forbidden", err: apierrors.NewForbidden(schema.GroupResource{Resource: "pods"}, "discover", errors.New("denied"))},
+		{name: "invalid proxy", proxy: "http://untrusted.example.com"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, client, _ := managedAttachFixture(t)
+			attempts := 0
+
+			client.PrependReactor("create", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+				attempts++
+				pod := action.(k8stesting.CreateAction).GetObject().(*corev1.Pod).DeepCopy()
+				pod.Spec.Containers[0].Env = []corev1.EnvVar{{Name: "AZURE_KUBERNETES_TOKEN_PROXY", Value: tc.proxy}}
+
+				return true, pod, tc.err
+			})
+
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			defer cancel()
+
+			cfg := registryauth.Config{Mode: registryauth.IdentityBindingMode, ClientID: attachClientID, TenantID: attachTenantID}
+			err := h.waitForACRProxy(ctx, &cfg)
+			require.Error(t, err)
+			require.NotErrorIs(t, err, context.DeadlineExceeded)
+			require.Equal(t, 1, attempts)
+		})
+	}
+}
+
+func TestGantryAttachACRAdmissionWaitHonorsCancellation(t *testing.T) {
+	h, client, _ := managedAttachFixture(t)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	attempts := 0
+
+	client.PrependReactor("create", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		attempts++
+
+		cancel()
+
+		return true, action.(k8stesting.CreateAction).GetObject(), nil
+	})
+
+	cfg := registryauth.Config{Mode: registryauth.IdentityBindingMode, SNIName: "original.example.com"}
+	original := cfg
+	require.ErrorIs(t, h.waitForACRProxy(ctx, &cfg), context.Canceled)
+	require.Equal(t, 1, attempts)
+	require.Equal(t, original, cfg)
+}
+
 func TestGantryAttachACRExternalPreservesCustomerAuthentication(t *testing.T) {
 	for _, tc := range []struct{ name, mode, policy string }{
 		{name: "default without policy"},

@@ -18,11 +18,9 @@ import (
 	"github.com/Azure/unbounded/internal/hostroot"
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/isolation"
 	"github.com/Azure/unbounded/pkg/agent/phases"
-	"github.com/Azure/unbounded/pkg/agent/phases/host"
 	"github.com/Azure/unbounded/pkg/agent/phases/nodestart"
-	"github.com/Azure/unbounded/pkg/agent/phases/reset"
-	"github.com/Azure/unbounded/pkg/agent/phases/rootfs"
 )
 
 type agentStages struct {
@@ -32,6 +30,11 @@ type agentStages struct {
 	archives         *goalstates.ContainerImageArchiveStaging
 	reporter         *daemon.BootstrapStatusReporter
 	credentialsReady bool
+
+	// stagePlan is the plan of the configured isolation mode; see
+	// stageplan.go. Nil is resolved from the mode composition table on first
+	// use. Tests set it to drive the stages with a plan of their own.
+	stagePlan stagePlan
 }
 
 // canonicalImageIdentity reduces an OCI image reference to the part that
@@ -65,54 +68,38 @@ func canonicalImageIdentity(image string) string {
 func bootstrapIdentity(cfg *provision.UnboundedAgentConfig) (bootstrap.Identity, error) {
 	// Keep identity tied to the cluster and installed rootfs, while allowing
 	// credentials and artifact locations to be refreshed for a retry.
-	data, err := json.Marshal(struct {
+	identity := struct {
 		KubernetesVersion string
 		OCIImage          string
 		APIServer         string
-	}{strings.TrimPrefix(cfg.Cluster.Version, "v"), canonicalImageIdentity(cfg.OCIImage), cfg.Kubelet.ApiServer})
+	}{strings.TrimPrefix(cfg.Cluster.Version, "v"), canonicalImageIdentity(cfg.OCIImage), cfg.Kubelet.ApiServer}
+
+	// The isolation mode is part of the identity only when it is not the
+	// default, so every nspawn installation, with the mode unset or set to
+	// nspawn, keeps its recorded fingerprint. A host installed in one mode then
+	// refuses a start in another until it is reset, instead of building a
+	// second node stack beside the first.
+	var (
+		data []byte
+		err  error
+	)
+
+	if mode, merr := cfg.IsolationMode(); merr == nil && mode != isolation.DefaultMode {
+		data, err = json.Marshal(struct {
+			KubernetesVersion string
+			OCIImage          string
+			APIServer         string
+			Isolation         string
+		}{identity.KubernetesVersion, identity.OCIImage, identity.APIServer, string(mode)})
+	} else {
+		data, err = json.Marshal(identity)
+	}
+
 	if err != nil {
 		return bootstrap.Identity{}, err
 	}
 
 	return bootstrap.Identity{MachineName: cfg.MachineName, ConfigFingerprint: installstate.Fingerprint(data)}, nil
-}
-
-func (s *agentStages) EnsureHostClean(ctx context.Context) error {
-	return host.EnsureNoExistingDeployment(ctx, s.log)
-}
-
-func (s *agentStages) ResolveInputs(ctx context.Context) error {
-	downloads, archives, err := provision.ResolveDownloadOverridesWithOfflineArtifacts(ctx, s.cfg)
-	if err != nil {
-		return err
-	}
-
-	s.archives = archives
-
-	s.gs, err = goalstates.ResolveMachine(s.log, &s.cfg.AgentConfig, goalstates.NSpawnMachineKube1, downloads)
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (s *agentStages) PrepareHost(ctx context.Context) error {
-	if err := hostroot.Prepare(ctx, s.log, "bin", "libexec"); err != nil {
-		return err
-	}
-
-	if err := daemon.InstallBootstrapBinary(); err != nil {
-		return err
-	}
-
-	if err := phases.Serial(s.log, host.InstallPackages(s.log), phases.Parallel(s.log,
-		host.ConfigureOS(s.log), host.ConfigureNFTables(s.log), phases.Serial(s.log, host.DisableDocker(s.log), host.ConfigureDocker(s.log)),
-		host.DisableContainerd(s.log), host.DisableKubelet(s.log), host.DisableSwap(s.log), host.HardenAPT(s.log))).Do(ctx); err != nil {
-		return err
-	}
-
-	return fsutil.SyncFilesystems("/etc", hostroot.Resolve(), installstate.DefaultDirectory)
 }
 
 // Credentials must be resolved on every unfinished attempt, but TPM prerequisites
@@ -144,42 +131,6 @@ func (s *agentStages) prepareCredentials(ctx context.Context) error {
 	return nil
 }
 
-func (s *agentStages) PrepareRootFS(ctx context.Context) error {
-	// ProvisionOwned rebuilds the rootfs in place and must never be pointed at
-	// a slot that has started a node, which would pull the filesystem out from
-	// under a running one. A registered machine means the rootfs this stage
-	// would build is already built and in use, so the requirement is met and
-	// there is nothing to do.
-	//
-	// This is a property of the host, not of how far a previous attempt got. It
-	// holds whether the machine was started by an earlier attempt of this
-	// installation or independently afterwards.
-	//
-	// Asked of the slot this bootstrap manages rather than of either slot.
-	// Bootstrap only ever builds gs.NodeStart.MachineName, so a machine in the
-	// other slot says nothing about whether this one needs a rootfs.
-	registered, err := reset.RegisteredMachine(ctx, s.log, s.gs.NodeStart.MachineName)
-	if err != nil {
-		return err
-	}
-
-	if registered {
-		s.log.Info("nspawn machine is registered; leaving its rootfs in place", "machine", s.gs.NodeStart.MachineName)
-
-		return nil
-	}
-
-	if err := s.prepareCredentials(ctx); err != nil {
-		return err
-	}
-
-	if err := phases.Serial(s.log, rootfs.DownloadContainerImageArchives(s.log, s.archives), rootfs.ProvisionOwned(s.log, s.gs.RootFS)).Do(ctx); err != nil {
-		return err
-	}
-
-	return fsutil.SyncFilesystems(s.gs.RootFS.MachineDir, hostroot.Resolve(), goalstates.SystemdSystemDir, goalstates.SystemdNSpawnDir)
-}
-
 // nodeStartTask composes the work that brings the node up.
 //
 // The applied config records what the running node was built from, and the
@@ -207,28 +158,6 @@ func (s *agentStages) nodeStartTask(nodeAlreadyBuilt bool) phases.Task {
 	}
 
 	return phases.Serial(s.log, tasks...)
-}
-
-func (s *agentStages) EnsureNodeStarted(ctx context.Context) error {
-	if err := s.prepareCredentials(ctx); err != nil {
-		return err
-	}
-
-	// Asked before the stage runs, because afterwards every answer is yes, and
-	// asked of the slot this bootstrap manages: a machine in the other slot was
-	// not built by this attempt either, but it is not the node being started.
-	registered, err := reset.RegisteredMachine(ctx, s.log, s.gs.NodeStart.MachineName)
-	if err != nil {
-		return err
-	}
-
-	if err := s.nodeStartTask(registered).Do(ctx); err != nil {
-		return err
-	}
-
-	// AgentConfigDir holds the applied config written above, so it must reach
-	// disk before this stage reports success.
-	return fsutil.SyncFilesystems(s.gs.RootFS.MachineDir, goalstates.AgentConfigDir, goalstates.SystemdSystemDir)
 }
 
 func (s *agentStages) daemonInstallTask() phases.Task {

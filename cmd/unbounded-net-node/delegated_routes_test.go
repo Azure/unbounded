@@ -36,7 +36,7 @@ func TestUnmanagedGatewayPoolsDoNotAttractThirdPartyTraffic(t *testing.T) {
 		}},
 	}
 
-	routing, err := collectSiteRoutingConfig(sites, "local", true)
+	routing, err := collectSiteRoutingConfig(sites, "local", true, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
