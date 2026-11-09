@@ -30,6 +30,9 @@ import (
 // span is an inclusive byte interval.
 type span struct{ start, end int64 }
 
+// ErrFull means a new blob was not admitted. Put leaves its reader untouched.
+var ErrFull = errors.New("rangecache: full")
+
 // spans is kept sorted and non-overlapping.
 type spans []span
 
@@ -180,7 +183,8 @@ func (c *Cache) HasAny(d digest.Digest) bool {
 
 // Put stores data read from r at start. total is the blob's full size, used for
 // Content-Range on later reads. Put reports the number of bytes stored; a
-// truncated read still records what landed.
+// truncated read still records what landed. ErrFull means no bytes were read
+// or stored, so the caller can serve r without caching.
 func (c *Cache) Put(d digest.Digest, total, start int64, r io.Reader) (int64, error) {
 	if start < 0 {
 		return 0, fmt.Errorf("rangecache: negative offset %d", start)
@@ -192,7 +196,7 @@ func (c *Cache) Put(d digest.Digest, total, start int64, r io.Reader) (int64, er
 	}
 
 	if e == nil {
-		return 0, nil // cache is full; caller still gets its bytes from r
+		return 0, ErrFull
 	}
 
 	written, err := copyAt(e.file, r, start)

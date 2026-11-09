@@ -736,7 +736,7 @@ func TestStandaloneProfileContinuouslyReconcilesNodeConfig(t *testing.T) {
 		"for source_file in /config/*/hosts.toml; do",
 		"relative_path=${source_file#/config/}",
 		"while true; do",
-		"if ! cmp -s \"$source_file\" \"$target_file\"; then",
+		"if ! cmp -s \"$managed_file\" \"$target_file\"; then",
 		"mv \"$temp_file\" \"$target_file\"",
 		"sleep 5",
 		"rm -f \"$target_file\"",
@@ -836,6 +836,163 @@ func TestStandaloneProfileContinuouslyReconcilesNodeConfig(t *testing.T) {
 	}
 
 	waitForFileContent(t, targetFile, hostsConfig)
+}
+
+func TestNodeConfigCleansOnlyUnmodifiedManagedRoutes(t *testing.T) {
+	t.Parallel()
+
+	raw, err := os.ReadFile(filepath.Join(renderStandaloneTemplates(t), "node-config.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var reconcileScript, stopScript string
+
+	decoder := yaml.NewDecoder(bytes.NewReader(raw))
+
+	for {
+		var object struct {
+			Kind string `yaml:"kind"`
+			Spec struct {
+				Template struct {
+					Spec struct {
+						Containers []struct {
+							Command   []string `yaml:"command"`
+							Lifecycle struct {
+								PreStop struct {
+									Exec struct {
+										Command []string `yaml:"command"`
+									} `yaml:"exec"`
+								} `yaml:"preStop"`
+							} `yaml:"lifecycle"`
+						} `yaml:"containers"`
+					} `yaml:"spec"`
+				} `yaml:"template"`
+			} `yaml:"spec"`
+		}
+		if err := decoder.Decode(&object); err != nil {
+			if err == io.EOF {
+				break
+			}
+
+			t.Fatal(err)
+		}
+
+		if object.Kind == "DaemonSet" {
+			container := object.Spec.Template.Spec.Containers[0]
+			reconcileScript = container.Command[2]
+			stopScript = container.Lifecycle.PreStop.Exec.Command[2]
+		}
+	}
+
+	if reconcileScript == "" || stopScript == "" {
+		t.Fatal("missing node configurator scripts")
+	}
+
+	for _, tc := range []struct {
+		name        string
+		replacement string
+		modified    bool
+	}{
+		{name: "removed registry"},
+		{name: "renamed registry", replacement: "new.example.com"},
+		{name: "switch to default", replacement: "_default"},
+		{name: "switch from default", replacement: "new.example.com"},
+		{name: "modified stale route", modified: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			hostRoot, sourceRoot := t.TempDir(), t.TempDir()
+			run := func(script string) {
+				t.Helper()
+
+				script = strings.ReplaceAll(script, "/host-certs", hostRoot)
+				script = strings.ReplaceAll(script, "/config", sourceRoot)
+				script = strings.ReplaceAll(script, "sleep 5", "break")
+
+				cmd := exec.Command("sh", "-c", script)
+				if output, err := cmd.CombinedOutput(); err != nil {
+					t.Fatalf("node configurator: %v\n%s", err, output)
+				}
+			}
+			write := func(path, contents string) {
+				t.Helper()
+
+				if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+					t.Fatal(err)
+				}
+
+				if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			assertAbsent := func(path string) {
+				t.Helper()
+
+				if _, err := os.Stat(path); !os.IsNotExist(err) {
+					t.Fatalf("%s still exists or cannot be checked: %v", path, err)
+				}
+			}
+
+			oldRegistry := "old.example.com"
+			if tc.name == "switch from default" {
+				oldRegistry = "_default"
+			}
+
+			source := filepath.Join(sourceRoot, oldRegistry, "hosts.toml")
+			target := filepath.Join(hostRoot, oldRegistry, "hosts.toml")
+			unowned := filepath.Join(hostRoot, "unowned.example.com", "hosts.toml")
+
+			write(source, "original route\n")
+			write(unowned, "unowned route\n")
+			run(reconcileScript)
+			waitForFileContent(t, target, "original route\n")
+
+			// A new process must retain the latest ownership contents.
+			write(source, "updated route\n")
+			run(reconcileScript)
+			waitForFileContent(t, target, "updated route\n")
+
+			if tc.modified {
+				write(target, "external override\n")
+			}
+
+			if err := os.Remove(source); err != nil {
+				t.Fatal(err)
+			}
+
+			if tc.replacement != "" {
+				write(filepath.Join(sourceRoot, tc.replacement, "hosts.toml"), "replacement route\n")
+			}
+
+			run(reconcileScript)
+
+			if tc.modified {
+				waitForFileContent(t, target, "external override\n")
+			} else {
+				assertAbsent(target)
+			}
+
+			assertAbsent(filepath.Join(hostRoot, ".gantry-managed", oldRegistry, "hosts.toml"))
+			waitForFileContent(t, unowned, "unowned route\n")
+
+			if tc.replacement != "" {
+				replacement := filepath.Join(hostRoot, tc.replacement, "hosts.toml")
+				waitForFileContent(t, replacement, "replacement route\n")
+
+				// Shutdown must use saved ownership even if the ConfigMap changed.
+				write(filepath.Join(sourceRoot, tc.replacement, "hosts.toml"), "new config payload\n")
+				run(stopScript)
+				assertAbsent(replacement)
+
+				run(reconcileScript)
+				write(replacement, "external override\n")
+				run(stopScript)
+				waitForFileContent(t, replacement, "external override\n")
+			}
+
+			waitForFileContent(t, unowned, "unowned route\n")
+		})
+	}
 }
 
 func TestArtifactStreamingUsesAKSMirrorChain(t *testing.T) {

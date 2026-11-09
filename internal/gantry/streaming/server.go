@@ -17,6 +17,7 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/httprange"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
+	"github.com/Azure/unbounded/internal/gantry/rangecache"
 )
 
 type LocalRangeStore interface {
@@ -39,6 +40,7 @@ type OriginRangeFetcher interface {
 // local or remote - does not have to leave the node for them.
 type RangeCache interface {
 	OpenRange(ctx context.Context, d digest.Digest, requested httprange.Range) (io.ReadCloser, int64, error)
+	// Put returns rangecache.ErrFull without consuming r when admission is refused.
 	Put(d digest.Digest, total, start int64, r io.Reader) (int64, error)
 }
 
@@ -318,6 +320,12 @@ func (s *Server) serveMaybeCaching(w http.ResponseWriter, r *http.Request, d dig
 	}
 
 	stored, err := s.opts.Cache.Put(d, total, requested.Start, io.LimitReader(body, requested.Length()))
+	if errors.Is(err, rangecache.ErrFull) {
+		s.writeResponse(w, body, total, contentType, requested, source, started)
+
+		return
+	}
+
 	_ = body.Close() //nolint:errcheck // best-effort close
 
 	if err != nil || stored != requested.Length() {

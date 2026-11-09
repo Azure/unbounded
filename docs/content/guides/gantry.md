@@ -141,6 +141,14 @@ the exact reduction in registry requests depends on image composition and
 rollout size. Large layers distributed to many nodes receive the greatest
 benefit.
 
+Manifest-child prefetch sends bounded requests to start pulls, rather than
+tracking them to completion. A failed or stale chair gets one refresh and
+retry; failed groups return a partial-prefetch error. Prefetch does not
+automatically redispatch when nodes crash or chair assignments change. A later
+manifest prefetch or pull retry reads a fresh chair snapshot and can restart
+work elsewhere. Once accepted, an origin pull runs independently of the
+request context and chair reassignment, but a process or node crash stops it.
+
 ## Failure recovery
 
 Gantry classifies failures so one bad provider does not restart the entire

@@ -57,12 +57,15 @@ spec:
                   - sh
                   - -c
                   - |
-                    for source_file in /config/*/hosts.toml; do
-                      relative_path=${source_file#/config/}
+                    set -eu
+                    for managed_file in /host-certs/.gantry-managed/*/hosts.toml; do
+                      [ -f "$managed_file" ] || continue
+                      relative_path=${managed_file#/host-certs/.gantry-managed/}
                       target_file=/host-certs/$relative_path
-                      if cmp -s "$source_file" "$target_file"; then
+                      if cmp -s "$managed_file" "$target_file"; then
                         rm -f "$target_file"
                       fi
+                      rm -f "$managed_file"
                     done
           command:
             - sh
@@ -71,15 +74,34 @@ spec:
               set -eu
 
               while true; do
+                for managed_file in /host-certs/.gantry-managed/*/hosts.toml; do
+                  [ -f "$managed_file" ] || continue
+                  relative_path=${managed_file#/host-certs/.gantry-managed/}
+                  [ ! -f "/config/$relative_path" ] || continue
+                  target_file=/host-certs/$relative_path
+                  if cmp -s "$managed_file" "$target_file"; then
+                    rm -f "$target_file"
+                    echo "removed stale $target_file"
+                  else
+                    echo "preserved modified or missing $target_file"
+                  fi
+                  rm -f "$managed_file"
+                done
                 for source_file in /config/*/hosts.toml; do
+                  [ -f "$source_file" ] || continue
                   relative_path=${source_file#/config/}
                   target_file=/host-certs/$relative_path
                   target_dir=$(dirname "$target_file")
                   temp_file="$target_dir/.hosts.toml.gantry.tmp"
+                  managed_file=/host-certs/.gantry-managed/$relative_path
 
-                  mkdir -p "$target_dir"
-                  if ! cmp -s "$source_file" "$target_file"; then
-                    cp "$source_file" "$temp_file"
+                  mkdir -p "$target_dir" "$(dirname "$managed_file")"
+                  if ! cmp -s "$source_file" "$managed_file"; then
+                    cp "$source_file" "$managed_file.tmp"
+                    mv "$managed_file.tmp" "$managed_file"
+                  fi
+                  if ! cmp -s "$managed_file" "$target_file"; then
+                    cp "$managed_file" "$temp_file"
                     chmod 0644 "$temp_file"
                     mv "$temp_file" "$target_file"
                     echo "reconciled $target_file"
@@ -94,6 +116,7 @@ spec:
                 - -c
                 - |
                   for source_file in /config/*/hosts.toml; do
+                    [ -f "$source_file" ] || continue
                     relative_path=${source_file#/config/}
                     cmp -s "$source_file" "/host-certs/$relative_path" || exit 1
                   done

@@ -173,8 +173,13 @@ for commands, managed-auth opt-in, compatible versions, and limitations.
 Standalone Helm installations run `DaemonSet/gantry-containerd-config`. Its
 resident reconciler checks its `hosts.toml` files every five seconds and
 atomically restores chart-owned payloads when they are missing or different,
-including after a node upgrade resets host configuration. Graceful shutdown
-removes a file only when it still matches the chart payload. Set
+including after a node upgrade resets host configuration. The reconciler saves
+the last managed contents under `/etc/containerd/certs.d/.gantry-managed/` so
+registry removal, renaming, and routing-mode changes can remove stale files
+even after a pod restart. Stale-route cleanup and graceful shutdown remove a
+file only when it still matches those saved contents; modified and unowned
+files are preserved. Routes left by older versions without saved ownership
+records are not removed automatically. Set
 `nodeConfig.enabled=false` when another node-management system owns these files.
 
 The default profile owns `_default/hosts.toml`. Artifact Streaming instead owns

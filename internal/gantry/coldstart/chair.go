@@ -412,12 +412,16 @@ func (r *ChairResolver) reportDispatch(kind ifaces.OriginRefKind, reason string)
 	}
 }
 
+// PrefetchManifestChildren dispatches bounded start requests, not completion
+// tracking. Failed or stale chairs get one refresh/retry; failed groups return
+// ErrPrefetchPartial and require a later prefetch or pull to retry.
 func (r *ChairResolver) PrefetchManifestChildren(ctx context.Context, manifestDigest digest.Digest, children []ChildDigest, registry, repository string) error {
 	return r.prefetchManifestChildren(ctx, manifestDigest, children, registry, repository, false)
 }
 
-// PrefetchStreamingManifestChildren coordinates durable streaming convergence
-// through a bounded subset of active chair holders.
+// PrefetchStreamingManifestChildren dispatches streaming prefetch through a
+// bounded subset of active chair holders, with the same retry limits as
+// PrefetchManifestChildren.
 func (r *ChairResolver) PrefetchStreamingManifestChildren(ctx context.Context, manifestDigest digest.Digest, children []ChildDigest, registry, repository string) error {
 	return r.prefetchManifestChildren(ctx, manifestDigest, children, registry, repository, true)
 }

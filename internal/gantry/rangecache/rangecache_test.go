@@ -138,9 +138,11 @@ func TestCacheStopsAdmittingNewBlobsAtCapacity(t *testing.T) {
 		t.Fatalf("Put first: %v", err)
 	}
 
-	n, err := c.Put(second, 64, 0, bytes.NewReader([]byte("xxxx")))
-	if err != nil {
-		t.Fatalf("Put second: %v", err)
+	reader := bytes.NewReader([]byte("xxxx"))
+
+	n, err := c.Put(second, 64, 0, reader)
+	if !errors.Is(err, ErrFull) {
+		t.Fatalf("Put second: %v, want ErrFull", err)
 	}
 
 	if n != 0 {
@@ -151,9 +153,46 @@ func TestCacheStopsAdmittingNewBlobsAtCapacity(t *testing.T) {
 		t.Error("Full() = false after hitting the cap")
 	}
 
+	if reader.Len() != 4 {
+		t.Error("full cache consumed the rejected reader")
+	}
+
+	if c.HasAny(second) {
+		t.Error("full cache admitted a new digest")
+	}
+
 	// The already-admitted blob keeps working.
 	if !c.Has(first, mustRange(t, 0, 7)) {
 		t.Error("existing entry lost after the cache filled")
+	}
+
+	if n, err := c.Put(first, 64, 8, bytes.NewReader([]byte("more"))); err != nil || n != 4 {
+		t.Fatalf("Put existing: (%d, %v), want (4, nil)", n, err)
+	}
+
+	if !c.Has(first, mustRange(t, 0, 11)) {
+		t.Error("existing entry did not accept another range after the cache filled")
+	}
+}
+
+type failingReader struct{ err error }
+
+func (r failingReader) Read(p []byte) (int, error) {
+	return copy(p, "ab"), r.err
+}
+
+func TestPutPreservesReaderFailure(t *testing.T) {
+	c := newTestCache(t, 0)
+	d := testDigest(t, "layer")
+	readErr := errors.New("remote read failed")
+
+	n, err := c.Put(d, 64, 10, failingReader{err: readErr})
+	if n != 2 || !errors.Is(err, readErr) || errors.Is(err, ErrFull) {
+		t.Fatalf("Put = (%d, %v), want (2, remote read failed)", n, err)
+	}
+
+	if !c.Has(d, mustRange(t, 10, 11)) || c.Has(d, mustRange(t, 10, 13)) {
+		t.Error("failed read did not preserve exactly the bytes received")
 	}
 }
 
