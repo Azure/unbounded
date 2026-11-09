@@ -40,7 +40,7 @@ func TestNetDeliveryAndCounters(t *testing.T) {
 		n.Send(Message{From: 0, To: 1, Kind: 7, Payload: make([]byte, i)})
 	}
 
-	s.Run(0)
+	drain(s)
 
 	if len(b.got) != 10 || s.Now() != 1000 {
 		t.Fatalf("got %d at %d", len(b.got), s.Now())
@@ -68,7 +68,7 @@ func TestNetJitterReorders(t *testing.T) {
 		n.Send(Message{From: 0, To: 1, ID: uint64(i)})
 	}
 
-	s.Run(0)
+	drain(s)
 
 	reordered := false
 
@@ -90,7 +90,7 @@ func TestNetLossAndDup(t *testing.T) {
 		n.Send(Message{From: 0, To: 1})
 	}
 
-	s.Run(0)
+	drain(s)
 
 	if got := len(b.got); got < 7500 || got > 8500 || uint64(10_000-got) != n.Stats().Lost {
 		t.Fatalf("delivered %d lost %d", got, n.Stats().Lost)
@@ -102,7 +102,7 @@ func TestNetLossAndDup(t *testing.T) {
 		n.Send(Message{From: 0, To: 1})
 	}
 
-	s.Run(0)
+	drain(s)
 
 	dups := 0
 
@@ -122,7 +122,7 @@ func TestNetPartition(t *testing.T) {
 	n.SetGroup(1, 1)
 	n.Send(Message{From: 0, To: 1})
 	n.Send(Message{From: 0, To: 2})
-	s.Run(0)
+	drain(s)
 
 	if len(b.got) != 1 || b.got[0].To != 2 || n.Stats().Partitioned != 1 {
 		t.Fatal("cross-group message delivered")
@@ -132,7 +132,7 @@ func TestNetPartition(t *testing.T) {
 	n.Heal()
 	n.Send(Message{From: 0, To: 1})
 	n.SetGroup(0, 5)
-	s.Run(0)
+	drain(s)
 
 	if len(b.got) != 1 {
 		t.Fatal("in-flight message crossed partition")
@@ -140,7 +140,7 @@ func TestNetPartition(t *testing.T) {
 
 	n.Heal()
 	n.Send(Message{From: 0, To: 1})
-	s.Run(0)
+	drain(s)
 
 	if len(b.got) != 2 || n.Group(0) != 0 {
 		t.Fatal("heal")
@@ -159,7 +159,7 @@ func TestNetPause(t *testing.T) {
 	}
 
 	n.Resume(1)
-	s.Run(0)
+	drain(s)
 
 	if len(b.got) != 2 {
 		t.Fatal("held messages not delivered")
@@ -168,9 +168,9 @@ func TestNetPause(t *testing.T) {
 	s, n, b = newTestNet(5, NetConfig{DropWhilePaused: true})
 	n.Pause(1)
 	n.Send(Message{From: 0, To: 1})
-	s.Run(0)
+	drain(s)
 	n.Resume(1)
-	s.Run(0)
+	drain(s)
 
 	if len(b.got) != 0 || n.Stats().Paused != 1 {
 		t.Fatal("drop while paused")
@@ -179,10 +179,10 @@ func TestNetPause(t *testing.T) {
 	s, n, b = newTestNet(5, NetConfig{})
 	n.Pause(1)
 	n.Send(Message{From: 0, To: 1})
-	s.Run(0)
+	drain(s)
 	n.DropHeld(1)
 	n.Resume(1)
-	s.Run(0)
+	drain(s)
 
 	if len(b.got) != 0 {
 		t.Fatal("DropHeld")
@@ -193,7 +193,7 @@ func TestNetSlowAndLink(t *testing.T) {
 	s, n, _ := newTestNet(6, NetConfig{Latency: 1000, NoJitter: true})
 	n.SetSlow(1, 3000)
 	n.Send(Message{From: 0, To: 1})
-	s.Run(0)
+	drain(s)
 
 	if s.Now() != 3000 {
 		t.Fatalf("slow latency %d", s.Now())
@@ -204,7 +204,7 @@ func TestNetSlowAndLink(t *testing.T) {
 	start := s.Now()
 
 	n.Send(Message{From: 0, To: 2})
-	s.Run(0)
+	drain(s)
 
 	if s.Now()-start != 50 {
 		t.Fatal("link override")
@@ -213,7 +213,7 @@ func TestNetSlowAndLink(t *testing.T) {
 	n.ClearLink(0, 2)
 	n.SetLink(0, 2, Link{Latency: 1, LossPPM: 1_000_000})
 	n.Send(Message{From: 0, To: 2})
-	s.Run(0)
+	drain(s)
 
 	if n.Stats().Lost != 1 {
 		t.Fatal("link loss")
@@ -246,7 +246,7 @@ func TestNetCallExactlyOnce(t *testing.T) {
 		calls = append(calls, n.Call(Message{From: 0, To: 1 + uint32(i%3)}, 2000+int64(i%5)*1000, c))
 	}
 
-	s.Run(0)
+	drain(s)
 
 	for _, id := range calls {
 		if c.n[id] != 1 {
@@ -265,7 +265,7 @@ func TestNetCallExactlyOnce(t *testing.T) {
 		t.Fatal("cancel call")
 	}
 
-	s.Run(0)
+	drain(s)
 
 	if c.n[id] != 0 {
 		t.Fatal("canceled call completed")
@@ -284,7 +284,7 @@ func TestNetDeterminism(t *testing.T) {
 			n.Send(Message{From: r.Uint32N(100), To: r.Uint32N(100), Kind: uint16(r.IntN(4))})
 		}
 
-		s.Run(0)
+		drain(s)
 
 		return tr.Sum()
 	}
@@ -478,7 +478,7 @@ func TestLeaseOutageConflictsAsync(t *testing.T) {
 	var got []elect.Result
 
 	l.Submit(1, elect.Op{Seq: 5, Kind: elect.OpGet}, func(r elect.Result) { got = append(got, r) })
-	s.Run(0)
+	drain(s)
 
 	if len(got) != 1 || got[0].Seq != 5 || s.Now() < 5_000_000 {
 		t.Fatalf("submit %v at %d", got, s.Now())

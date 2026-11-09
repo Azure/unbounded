@@ -12,6 +12,12 @@ type recTarget struct{ got []uint64 }
 
 func (r *recTarget) Fire(a, b uint64) { r.got = append(r.got, a*100+b) }
 
+// drain runs every pending event.
+func drain(s *Sim) {
+	for s.Step() {
+	}
+}
+
 func TestSimOrdering(t *testing.T) {
 	s := New(1)
 
@@ -28,11 +34,7 @@ func TestSimOrdering(t *testing.T) {
 	})
 	s.At(30, func() { got = append(got, 5) })
 
-	if s.Pending() != 5 {
-		t.Fatalf("pending = %d", s.Pending())
-	}
-
-	s.Run(0)
+	drain(s)
 
 	want := []int{1, 2, 3, 4, 5, 6, 7}
 	if len(got) != len(want) {
@@ -58,7 +60,7 @@ func TestSimStabilityManySameTime(t *testing.T) {
 		s.AtTarget(int64(i%3), tg, uint64(i), 0)
 	}
 
-	s.Run(0)
+	drain(s)
 
 	var want []uint64
 
@@ -90,10 +92,6 @@ func TestSimCancel(t *testing.T) {
 		t.Fatal("cancel should succeed once")
 	}
 
-	if s.Pending() != 2 {
-		t.Fatalf("pending = %d", s.Pending())
-	}
-
 	s.RunUntil(15)
 
 	if s.Cancel(h1) {
@@ -108,7 +106,7 @@ func TestSimCancel(t *testing.T) {
 
 	_ = h4
 
-	s.Run(0)
+	drain(s)
 
 	if len(ran) != 3 || ran[0] != 1 || ran[1] != 4 || ran[2] != 3 {
 		t.Fatalf("ran %v", ran)
@@ -124,13 +122,13 @@ func TestSimRunUntilAdvancesClock(t *testing.T) {
 	s.At(100, func() {})
 	s.RunFor(50)
 
-	if s.Now() != 50 || s.Pending() != 1 {
-		t.Fatalf("now %d pending %d", s.Now(), s.Pending())
+	if next, ok := s.Next(); s.Now() != 50 || !ok || next != 100 {
+		t.Fatalf("now %d next %d %v", s.Now(), next, ok)
 	}
 
 	s.RunUntil(100)
 
-	if s.Pending() != 0 || s.Steps() != 1 {
+	if s.Steps() != 1 {
 		t.Fatal("event at boundary should run")
 	}
 
@@ -163,9 +161,9 @@ func TestSimHeapRandom(t *testing.T) {
 		}
 	}
 
-	s.Run(0)
+	drain(s)
 
-	if s.Pending() != 0 {
+	if _, ok := s.Next(); ok {
 		t.Fatal("pending after run")
 	}
 }
@@ -179,7 +177,7 @@ func TestStreamsIndependent(t *testing.T) {
 		t.Fatal("draws on one stream perturbed another")
 	}
 
-	if New(9).Rand().Uint64() == New(10).Rand().Uint64() {
+	if New(9).Stream("sim").Uint64() == New(10).Stream("sim").Uint64() {
 		t.Fatal("different seeds gave the same draw")
 	}
 }
@@ -194,9 +192,7 @@ func TestTrace(t *testing.T) {
 			s.After(r.Int64N(1000), func() { tr.Add(1, uint64(i), uint64(s.Now()), 0) })
 		}
 
-		s.Run(0)
-		tr.AddBytes(2, []byte("end"))
-		tr.AddString(3, "x")
+		drain(s)
 
 		return tr.Sum()
 	}
