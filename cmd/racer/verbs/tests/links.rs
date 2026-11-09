@@ -148,6 +148,8 @@ fn world_with(grants_per_link: u32) -> World {
         let selected = ready(&activation).unwrap();
         assert_eq!(selected[0].tag, 7);
         assert_eq!(node.clients[0].buffers(7, BufferState::Free), Some(BUFFERS));
+        assert_eq!(node.clients[0].free_buffers(7), Some((BUFFERS, BUFFERS)));
+        assert_eq!(node.clients[0].free_buffers(8), None);
     }
     World { sim, clock, a, b }
 }
@@ -282,6 +284,8 @@ fn pages_flow_both_ways_over_one_link() {
         let deadline = w.now() + 5 * SECOND;
         let granted = w.b.clients[0].grant(TO_A, eb, [9; 16], 4, deadline);
         let granted = wait(&mut w, &granted).unwrap();
+        // The grant holds one buffer of the receiver's pool until it lands.
+        assert_eq!(w.b.clients[0].free_buffers(7), Some((BUFFERS - 1, BUFFERS)));
         let source = Source::new(Arc::new(ZERO));
         let written = w.a.clients[1].write(TO_B, ea, granted.tag, source, deadline);
         assert_eq!(w.a.clients[0].buffers(7, BufferState::Free), Some(BUFFERS));

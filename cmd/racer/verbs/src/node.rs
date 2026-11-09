@@ -986,6 +986,15 @@ impl Client {
         Some(pools.get(&rail)?.count_in(state))
     }
 
+    /// Free and total page buffers of `rail`'s host pool, a snapshot that may
+    /// be stale by the time it is used. `None` without that pool, or while
+    /// the pool table is being changed.
+    pub fn free_buffers(&self, rail: u16) -> Option<(usize, usize)> {
+        let pools = self.shared.pools.try_read().ok()?;
+        let pool = pools.get(&rail)?;
+        Some((pool.count_in(BufferState::Free), pool.count()))
+    }
+
     /// Page buffers of `rail`'s device pool `id` in `state`, for
     /// diagnostics. `None` without that device pool.
     pub fn device_buffers(&self, rail: u16, id: u32, state: BufferState) -> Option<usize> {
