@@ -41,7 +41,6 @@
 package epoch
 
 import (
-	"fmt"
 	"math"
 	"sync/atomic"
 	"time"
@@ -171,16 +170,6 @@ func StampFor(current uint64, ttl, period time.Duration, gen uint32) Stamp {
 	}
 
 	return Stamp{Expires: current + n + 1, Gen: gen}
-}
-
-// ValidateTTL reports whether ttl is allowed: zero (never expires) or at
-// least MinTTL.
-func ValidateTTL(ttl time.Duration) error {
-	if ttl != 0 && ttl < MinTTL {
-		return fmt.Errorf("epoch: ttl %v must be 0 or at least %v", ttl, MinTTL)
-	}
-
-	return nil
 }
 
 // Fresh reports whether a value with stamp s is still valid at epoch current

@@ -424,10 +424,11 @@ func (s *State) Fresh(seed uint64, st epoch.Stamp) bool {
 	return epoch.Fresh(st, s.e.Current(), s.v.Gen(seed))
 }
 
-// TryHedge admits a hedge of the request carrying h within the hedge
-// budget.
-func (s *State) TryHedge(h Header) bool {
-	return s.h.TryHedge(uint64(h.Partition))
+// TryHedge admits a hedge of the request carrying the header within the
+// hedge budget. The budget is per member, so the header does not affect the
+// result.
+func (s *State) TryHedge(Header) bool {
+	return s.h.TryHedge()
 }
 
 // Route routes key in keyspace seed from this member.
@@ -620,7 +621,7 @@ func (s *State) decide(d *Decision, p uint32, avoid view.Slot, inFlags uint8) {
 
 	fillRef(&d.Owner, owner, om)
 
-	s.h.NoteRouted(uint64(p))
+	s.h.NoteRouted()
 
 	if owner == s.self {
 		d.Kind = KindSelf

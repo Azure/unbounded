@@ -674,7 +674,7 @@ func (n *Node) pingSubjects(_ int64) {
 func (n *Node) pingDone(now int64, p *pending, ok bool, rtt time.Duration) {
 	i := slices.IndexFunc(n.subjects, func(s subject) bool { return s.slot == p.slot && s.key == p.key })
 
-	if n.hl != nil && n.v.Key(p.slot) == p.key {
+	if n.v.Key(p.slot) == p.key {
 		if ok {
 			n.hl.Observe(p.slot, health.Success, rtt)
 		} else {

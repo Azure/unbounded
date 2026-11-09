@@ -139,12 +139,6 @@ type Config struct {
 	HandoffEpochs uint32
 }
 
-// DefaultConfig returns the default cluster constants: 2^20 partitions
-// initially owned by slot 0, slot reuse after 16 epochs, handoff for 8.
-func DefaultConfig() Config {
-	return Config{PartitionBits: 20, InitialOwner: 0, SlotReuseEpochs: 16, HandoffEpochs: 8}
-}
-
 // FreeSlot is a slot below SlotCap without a member, reusable once the view
 // epoch reaches ReusableAt.
 type FreeSlot struct {

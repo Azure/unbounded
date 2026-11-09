@@ -223,7 +223,7 @@ type Call struct {
 	ID      uint64
 	To      string
 	Msg     []byte
-	Timeout time.Duration
+	Timeout time.Duration // always positive (a defaulted Config timeout)
 }
 
 type callKind uint8
@@ -402,8 +402,8 @@ func (n *Node) View() *view.View { return n.v }
 // Self returns this member's slot in the current view, or view.NoSlot.
 func (n *Node) Self() view.Slot { return n.slot }
 
-// Key returns this member's key.
-func (n *Node) Key() uint64 { return n.key }
+// JoinRetry returns the defaulted join, leave, and catch-up retry interval.
+func (n *Node) JoinRetry() time.Duration { return n.cfg.JoinRetry }
 
 // Health returns the neighbor health tracker.
 func (n *Node) Health() *health.Tracker { return n.hl }
@@ -417,9 +417,6 @@ func (n *Node) Elector() *elect.Elector { return n.el }
 // Leading reports whether this member currently publishes deltas, and the
 // term it publishes under.
 func (n *Node) Leading() (bool, uint64) { return n.leading, n.term }
-
-// Leaving reports whether Leave was called.
-func (n *Node) Leaving() bool { return n.leaving }
 
 // Left reports whether the member has left: it observed its removal after
 // Leave, or it had been removed from its view (after being a member) when
@@ -1093,7 +1090,7 @@ func (n *Node) OnReply(now int64, id uint64, resp []byte, err error) {
 			n.onCatchUp(now, m, p.addr)
 		}
 	case callBroadcast:
-		if p.slot != view.NoSlot && n.hl != nil {
+		if p.slot != view.NoSlot {
 			n.hl.Observe(p.slot, health.Success, time.Duration(now-p.sentAt))
 		}
 	case callRouted:

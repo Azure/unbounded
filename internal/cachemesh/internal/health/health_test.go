@@ -467,14 +467,14 @@ func TestHedgeBudget(t *testing.T) {
 	tr := newT(Config{})
 	tr.Tick(0)
 
-	for i := range uint64(16000) {
-		tr.NoteRouted(i)
+	for range 16000 {
+		tr.NoteRouted()
 	}
 
 	got := 0
 
-	for i := range uint64(16000) {
-		if tr.TryHedge(i) {
+	for range 16000 {
+		if tr.TryHedge() {
 			got++
 		}
 	}
@@ -485,15 +485,15 @@ func TestHedgeBudget(t *testing.T) {
 
 	tr.Tick(10 * sec)
 
-	if tr.TryHedge(0) {
+	if tr.TryHedge() {
 		t.Fatal("budget resets with routed count")
 	}
 
 	for range 20 {
-		tr.NoteRouted(0)
+		tr.NoteRouted()
 	}
 
-	if !tr.TryHedge(0) || tr.TryHedge(0) {
+	if !tr.TryHedge() || tr.TryHedge() {
 		t.Fatal("1 hedge per 20 routed")
 	}
 }
@@ -684,8 +684,8 @@ func BenchmarkHedge(b *testing.B) {
 	b.RunParallel(func(pb *testing.PB) {
 		h := rand.Uint64()
 		for pb.Next() {
-			tr.NoteRouted(h)
-			tr.TryHedge(h)
+			tr.NoteRouted()
+			tr.TryHedge()
 			h++
 		}
 	})
@@ -709,8 +709,8 @@ func TestConcurrentHotAndControl(t *testing.T) {
 				tr.Usable(s)
 				tr.TryProbe(s)
 				tr.HedgeAfter(s)
-				tr.NoteRouted(uint64(s))
-				tr.TryHedge(uint64(s))
+				tr.NoteRouted()
+				tr.TryHedge()
 			}
 		})
 	}

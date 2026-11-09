@@ -237,10 +237,10 @@ func TestHedgeBudgetAcrossGoroutines(t *testing.T) {
 
 	var wg sync.WaitGroup
 
-	for g := range 8 {
+	for range 8 {
 		wg.Go(func() {
-			for i := range 2000 {
-				tr.NoteRouted(uint64(g*2000 + i))
+			for range 2000 {
+				tr.NoteRouted()
 			}
 		})
 	}
@@ -249,8 +249,8 @@ func TestHedgeBudgetAcrossGoroutines(t *testing.T) {
 
 	got := 0
 
-	for i := range uint64(16000) {
-		if tr.TryHedge(i) {
+	for range 16000 {
+		if tr.TryHedge() {
 			got++
 		}
 	}

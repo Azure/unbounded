@@ -943,11 +943,8 @@ func (t *Tracker) HedgeAfter(slot uint32) time.Duration {
 // The count is spread over shards chosen by the calling goroutine's stack
 // address, so concurrent routers mostly write different cache lines even
 // when they route the same partition; TryHedge sums the shards, so which
-// shard a call lands in never affects a result. hint is unused; it is kept
-// so that callers need not change.
-func (t *Tracker) NoteRouted(hint uint64) {
-	_ = hint
-
+// shard a call lands in never affects a result.
+func (t *Tracker) NoteRouted() {
 	t.hedge[stackShard()].routed.Add(1)
 }
 
@@ -964,12 +961,9 @@ func stackShard() uint64 {
 
 // TryHedge admits a hedge if hedges in this interval stay within HedgeRatio
 // of the requests routed in this interval. The check and increment are not
-// atomic together, so concurrent callers may overshoot slightly. hint is
-// unused. Hot path, but called only for requests that are hedge candidates,
+// atomic together, so concurrent callers may overshoot slightly. Hot path, but called only for requests that are hedge candidates,
 // so it reads every shard.
-func (t *Tracker) TryHedge(hint uint64) bool {
-	_ = hint
-
+func (t *Tracker) TryHedge() bool {
 	// Sum the shards only until the budget covers one more hedge.
 	need := (t.hedged.Load() + 1) * 1e6
 

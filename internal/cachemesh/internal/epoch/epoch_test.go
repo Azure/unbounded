@@ -106,20 +106,6 @@ func TestStampFor(t *testing.T) {
 	}
 }
 
-func TestValidateTTL(t *testing.T) {
-	for _, ok := range []time.Duration{0, MinTTL, time.Hour} {
-		if err := ValidateTTL(ok); err != nil {
-			t.Errorf("%v: %v", ok, err)
-		}
-	}
-
-	for _, bad := range []time.Duration{1, MinTTL - 1, -time.Second} {
-		if err := ValidateTTL(bad); err == nil {
-			t.Errorf("%v: expected error", bad)
-		}
-	}
-}
-
 func TestFresh(t *testing.T) {
 	s := Stamp{Expires: 5, Gen: 1}
 	if !Fresh(s, 4, 1) || Fresh(s, 5, 1) || Fresh(s, 4, 2) {

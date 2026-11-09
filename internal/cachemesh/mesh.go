@@ -552,12 +552,7 @@ func (m *Mesh) dispatch(ctx context.Context, wg *sync.WaitGroup, calls []node.Ca
 			defer wg.Done()
 			defer func() { <-m.sem }()
 
-			timeout := c.Timeout
-			if timeout <= 0 {
-				timeout = node.DefaultCallTimeout
-			}
-
-			cctx, cancel := context.WithTimeout(ctx, timeout)
+			cctx, cancel := context.WithTimeout(ctx, c.Timeout)
 			resp, err := m.cfg.Transport.Send(cctx, c.To, c.Msg)
 
 			cancel()
@@ -768,10 +763,7 @@ func (m *Mesh) checkInvalidations(v *view.View) {
 // resendInvalidations sends due pending invalidations to the leader.
 // Callers hold mu.
 func (m *Mesh) resendInvalidations(now int64) {
-	retry := m.cfg.Tuning.JoinRetry
-	if retry <= 0 {
-		retry = node.DefaultJoinRetry
-	}
+	retry := m.n.JoinRetry()
 
 	for seed, inv := range m.inval {
 		if inv.haveBase && inv.next <= now {
