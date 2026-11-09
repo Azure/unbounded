@@ -143,7 +143,6 @@ impl Prefetch {
         }
     }
 
-    /// Apply `RACER_PREFETCH_*` settings.
     fn now(&self) -> Instant {
         self.ctx.now()
     }
@@ -160,10 +159,12 @@ impl Prefetch {
         RequestScope::with_clock(self.request_id(), deadline, self.ctx.clock.clone())
     }
 
+    /// Apply `RACER_PREFETCH_*` settings. The owner budget changes in place,
+    /// so fills admitted before keep their leases.
     pub fn configure(&self, config: Config) -> Result<()> {
         config.validate()?;
         self.registry.lock().unwrap().configure(config);
-        *self.owner.lock().unwrap() = OwnerBudget::new(
+        self.owner.lock().unwrap().set_limits(
             config.concurrent_fills as usize,
             config.origin_bytes_per_sec,
         );

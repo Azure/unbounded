@@ -261,6 +261,17 @@ impl<K: Eq + Hash + Clone> OwnerBudget<K> {
         }
     }
 
+    /// Change the slot count and rate in place. Live leases keep their entries
+    /// and lease numbering continues, so a lease admitted before the change
+    /// can never match, and release, one admitted after it. The bucket starts
+    /// full at the new rate, as in [`Self::new`].
+    pub fn set_limits(&mut self, concurrent: usize, rate: u64) {
+        self.concurrent = concurrent.max(1);
+        self.rate = rate;
+        self.tokens = rate as f64;
+        self.refilled = None;
+    }
+
     /// Replace the backstop lease lifetime ([`OWNER_LEASE_TTL`]).
     pub fn with_lease_ttl(mut self, ttl: Duration) -> Self {
         self.ttl = ttl;
@@ -411,6 +422,32 @@ impl<K: Eq + Hash + Clone> OwnerBudget<K> {
 #[allow(clippy::disallowed_methods)] // Tests build instants to feed the API.
 mod tests {
     use super::*;
+
+    #[test]
+    fn set_limits_keeps_live_leases_and_their_numbering() {
+        let now = Instant::now();
+        let mut owner = OwnerBudget::new(1, 0);
+        let old = owner.admit(1u8, 10, now).unwrap();
+        owner.set_limits(2, 0);
+        // The old fill still holds its slot under the new limits.
+        assert!(owner.holds(&1));
+        assert_eq!(owner.active(), 1);
+        let other = owner.admit(2u8, 10, now).unwrap();
+        assert_ne!(other.id(), old.id());
+        assert!(owner.admit(3u8, 10, now).is_err(), "two slots in use");
+        // Finishing the old lease releases only its own fill.
+        assert!(owner.finish(&1, old));
+        assert!(owner.holds(&2));
+        assert_eq!(owner.active(), 1);
+        // A lower limit defers new fills until live ones finish.
+        owner.set_limits(0, 100);
+        assert_eq!(
+            owner.admit(4u8, 10, now).unwrap_err().0,
+            Deferral::Concurrency
+        );
+        assert!(owner.finish(&2, other));
+        assert!(owner.admit(4u8, 10, now).is_ok());
+    }
 
     #[test]
     fn owner_leases_are_unique_and_finish_once() {
