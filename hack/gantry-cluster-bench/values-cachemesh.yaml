@@ -1,8 +1,20 @@
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 #
-# PLACEHOLDER: gantry cachemesh mode. Copy values-default.yaml here and add the
-# cachemesh config keys once the feature lands (the orchestrator fills this
-# in). deploy.sh accepts any values file, so both can be layered:
+# Gantry cachemesh mode. Layer it over values-default.yaml so that every
+# other setting (limits included) is identical between the two modes:
 #   ./deploy.sh values-default.yaml <image> -f values-cachemesh.yaml
-{}
+# For the multi-hop relay grid add: --set gantry.cachemesh.maxNeighbors=32
+
+gantry:
+  cachemesh:
+    enabled: true
+    # 142 Ready bench workers.
+    expectedSize: 142
+    # 0 = library default (256), which makes ~142 agents a 1-D fully-direct grid.
+    maxNeighbors: 0
+    # 24GiB chunk cache; the 48Gi pod limit (values-default.yaml) leaves headroom.
+    chunkCacheBytes: 25769803776
+    # containerd verifies every blob digest itself, so the agent does not hash
+    # again (SHA-256 caps one blob at ~1.8GB/s on the serving node).
+    verifyDigest: false

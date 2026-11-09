@@ -25,15 +25,16 @@ nodeConfig:
 
 # Raised from the 8 CPU / 8Gi defaults so a 40GB pull fanned out to peers is
 # not CPU-throttled or OOM-killed. Nodes have 64 CPU / 251GiB and nothing
-# else heavy runs on them during the bench.
+# else heavy runs on them during the bench. values-cachemesh.yaml keeps the
+# same limits so both modes get identical resources.
 resources:
   agent:
     requests:
       cpu: "1"
       memory: 1Gi
     limits:
-      cpu: "16"
-      memory: 64Gi
+      cpu: "32"
+      memory: 48Gi
 
 gantry:
   peerFetchTimeout: 15m
