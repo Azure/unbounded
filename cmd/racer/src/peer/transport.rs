@@ -1427,9 +1427,12 @@ impl CloseWatch {
         self.release();
     }
 
-    /// Record the error that ends the exchange.
+    /// Record the error that ends the exchange. The first one wins: a fault
+    /// recorded at its source is not relabeled by the error returned after it.
     fn fail(&self, error: Error) {
-        self.error.set(Some(error));
+        if self.error.get().is_none() {
+            self.error.set(Some(error));
+        }
     }
 
     fn record(&self, event: Event) {
@@ -1903,8 +1906,10 @@ impl Transfers {
                     // closing it here would park an ephemeral port in `TIME_WAIT` for every shed, and
                     // a hot holder's sheds would run this node out of ports for that holder.
                     let mut connection = received.connection;
-                    if connection.finish_exchange().is_ok() {
-                        watch.settle(&connection);
+                    match connection.finish_exchange() {
+                        Ok(()) => watch.settle(&connection),
+                        // The close is a framing or IO fault, not load.
+                        Err(error) => watch.fail(error),
                     }
                     drop(connection);
                     return Err(Error::Overloaded);
@@ -2242,6 +2247,16 @@ mod tests {
         let watch = CloseWatch::new(Some(metrics.clone()));
         watch.fail(Error::Overloaded);
         drop(watch);
+        assert_eq!(metrics.count(Event::PeerConnectionCloseOverloaded), 0);
+
+        // A fault recorded first is not relabeled by a later `Overloaded`.
+        let metrics = Metrics::default();
+        let watch = CloseWatch::new(Some(metrics.clone()));
+        watch.hold();
+        watch.fail(Error::Io);
+        watch.fail(Error::Overloaded);
+        drop(watch);
+        assert_eq!(metrics.count(Event::PeerConnectionCloseError), 1);
         assert_eq!(metrics.count(Event::PeerConnectionCloseOverloaded), 0);
     }
 
