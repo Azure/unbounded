@@ -1045,3 +1045,51 @@ func TestPeerRefusesManifestFromLocalContent(t *testing.T) {
 		}
 	}
 }
+
+func TestResolveTagShedsWhenFetchesSaturated(t *testing.T) {
+	c := newCluster(t, clusterOpts{n: 1})
+
+	manifest := []byte(`{"schemaVersion":2}`)
+	d := c.origin.add(manifest, "application/vnd.oci.image.manifest.v1+json")
+
+	c.origin.mu.Lock()
+	c.origin.tags["library/app:v1"] = d.String()
+	c.origin.mu.Unlock()
+
+	n := c.nodes[0].node
+	for range cap(n.meta.fetches) {
+		n.meta.fetches <- struct{}{}
+	}
+
+	if _, _, _, err := n.ResolveTag(context.Background(), "reg", "library/app", "v1"); !errors.Is(err, errOverload) {
+		t.Fatalf("saturated: err=%v, want errOverload", err)
+	}
+
+	if hits := c.origin.tagHits.Load(); hits != 0 {
+		t.Fatalf("saturated resolution reached the origin %d times", hits)
+	}
+
+	n.meta.mu.Lock()
+	inflight := len(n.meta.calls)
+	n.meta.mu.Unlock()
+
+	if inflight != 0 {
+		t.Fatalf("%d in-flight calls after shedding", inflight)
+	}
+
+	<-n.meta.fetches
+
+	if _, _, got, err := n.ResolveTag(context.Background(), "reg", "library/app", "v1"); err != nil || got != d {
+		t.Fatalf("after release: err=%v digest=%s", err, got)
+	}
+
+	// The slot is released just after waiters are woken.
+	deadline := time.Now().Add(5 * time.Second)
+	for len(n.meta.fetches) != cap(n.meta.fetches)-1 {
+		if time.Now().After(deadline) {
+			t.Fatalf("slot not released: %d held", len(n.meta.fetches))
+		}
+
+		time.Sleep(time.Millisecond)
+	}
+}

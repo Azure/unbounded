@@ -1346,6 +1346,9 @@ Tag resolutions use a separate keyspace, `gantry-meta`, with a 5m TTL
   resolution it just received from a peer or joined in flight; a stale one
   is rejected and not cached, and the mirror falls back. One resolution per
   key runs at a time on each node.
+- A resolution runs on the node's context, so it outlives a requester that
+  gives up. Each node runs at most 64 (`maxMetaFetches`) at once; a new key
+  beyond that is shed (`429` to a peer), and the mirror falls back.
 - Each node keeps at most 4096 entries and 64 MiB of manifest bodies
   (`metaCacheBytes`). An insert that would exceed either bound drops expired
   entries first, then arbitrary ones; a body larger than the byte budget is

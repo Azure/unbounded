@@ -48,6 +48,12 @@ type metaCall struct {
 // outside the chunk memory budget.
 const metaCacheBytes = 64 << 20
 
+// maxMetaFetches bounds concurrent tag resolutions. A resolution runs on
+// the node's context, not the requester's, so a requester that gives up
+// does not stop it; without a cap, a stream of distinct tags could start
+// unbounded origin and peer requests.
+const maxMetaFetches = 64
+
 // metaCache holds resolved tags with singleflight per key. It keeps at most
 // max entries and maxBytes of manifest bodies.
 type metaCache struct {
@@ -57,10 +63,11 @@ type metaCache struct {
 	bytes    int
 	m        map[string]*metaEntry
 	calls    map[string]*metaCall
+	fetches  chan struct{}
 }
 
 func newMetaCache(maxEntries, maxBytes int) *metaCache {
-	return &metaCache{max: maxEntries, maxBytes: maxBytes, m: make(map[string]*metaEntry), calls: make(map[string]*metaCall)}
+	return &metaCache{max: maxEntries, maxBytes: maxBytes, m: make(map[string]*metaEntry), calls: make(map[string]*metaCall), fetches: make(chan struct{}, maxMetaFetches)}
 }
 
 // remove drops key. The caller holds mu.
@@ -158,10 +165,21 @@ func (n *Node) resolveMeta(ctx context.Context, registry, repo, tag string, deci
 
 	call := c.calls[key]
 	if call == nil {
+		select {
+		case c.fetches <- struct{}{}:
+		default:
+			// Saturated: shed, and let the caller fall back.
+			c.mu.Unlock()
+
+			return nil, errOverload
+		}
+
 		call = &metaCall{done: make(chan struct{})}
 		c.calls[key] = call
 
 		go func() {
+			defer func() { <-c.fetches }()
+
 			call.e, call.err = n.fetchMeta(registry, repo, tag, decide)
 
 			c.mu.Lock()
