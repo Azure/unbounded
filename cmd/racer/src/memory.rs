@@ -561,7 +561,8 @@ impl BufferPool {
     }
     /// Idle and trimming counters of this worker's pool. `bytes` is the
     /// charged idle storage; `misses` are checkouts that mapped new storage
-    /// and `rejects` returns that were freed. `entries` is not tracked.
+    /// and `rejects` returns that were freed; `unpooled` checkouts found no
+    /// size class. `entries` is not tracked and not exported.
     pub(crate) fn pool_stats(&self) -> page_alloc::PoolStats {
         let demand = self.demand.get();
         let Ok(pool) = self.disk.try_borrow() else {
@@ -575,6 +576,7 @@ impl BufferPool {
             hits: counters.hits,
             misses: counters.misses,
             rejects: counters.rejects,
+            unpooled: counters.unpooled,
             trimmed: demand.trimmed,
             constrained: demand.constrained,
             ..Default::default()

@@ -111,7 +111,9 @@ const ADMISSION_CLASSES: [(crate::admission::ResourceClass, &str); 17] = {
 };
 
 /// Node-wide idle pool series: name suffix, Prometheus kind, and value.
-fn pool_series(stats: &flow_control::PoolStats) -> [(&'static str, &'static str, u64); 7] {
+/// `target` is a per-worker value, so its node-wide sum is the sum of the
+/// workers' caps.
+fn pool_series(stats: &flow_control::PoolStats) -> [(&'static str, &'static str, u64); 8] {
     [
         ("entries", "gauge", stats.entries as u64),
         ("bytes", "gauge", stats.bytes as u64),
@@ -120,7 +122,17 @@ fn pool_series(stats: &flow_control::PoolStats) -> [(&'static str, &'static str,
         ("misses_total", "counter", stats.misses),
         ("rejects_total", "counter", stats.rejects),
         ("trimmed_total", "counter", stats.trimmed),
+        ("unpooled_total", "counter", stats.unpooled),
     ]
+}
+
+/// Whether `family` tracks the series `suffix`: the buffer pool does not
+/// count entries, and the staging pool has no size classes.
+fn pool_tracks(family: &str, suffix: &str) -> bool {
+    !matches!(
+        (family, suffix),
+        ("buffer_pool", "entries") | ("staging_pool", "unpooled_total")
+    )
 }
 
 /// Write node-wide sums as `racer_{family}_*` and only retained bytes per
@@ -134,13 +146,16 @@ fn write_pools(
     if samples.is_empty() {
         return Ok(());
     }
-    let mut totals = [0u64; 7];
+    let mut totals = [0u64; 8];
     for (_, stats) in samples {
         for (total, (_, _, value)) in totals.iter_mut().zip(pool_series(stats)) {
             *total = total.saturating_add(value);
         }
     }
     for ((suffix, kind, _), total) in pool_series(&Default::default()).into_iter().zip(totals) {
+        if !pool_tracks(family, suffix) {
+            continue;
+        }
         writeln!(
             out,
             "# TYPE racer_{family}_{suffix} {kind}\nracer_{family}_{suffix} {total}"
@@ -1863,6 +1878,7 @@ mod tests {
                 rejects: counter + 2,
                 trimmed: counter + 3,
                 constrained: false,
+                unpooled: counter + 4,
             };
             metrics[0].observe_staging_pool(WorkerId(3), staging(2, 4096, 5));
             metrics[1].observe_staging_pool(WorkerId(4), staging(1, 1024, 10));
@@ -1902,6 +1918,8 @@ mod tests {
                 "# TYPE racer_buffer_pool_misses_total counter\nracer_buffer_pool_misses_total 302\n"
                     .to_string(),
                 "racer_buffer_pool_rejects_total 304\n".to_string(),
+                "# TYPE racer_buffer_pool_unpooled_total counter\nracer_buffer_pool_unpooled_total 308\n"
+                    .to_string(),
                 "racer_worker_buffer_pool_bytes{worker=\"3\"} 8192\n".to_string(),
                 // Compatibility series remain per worker.
                 "racer_worker_relay_used{worker=\"4\"} 1\n".to_string(),
@@ -1909,6 +1927,9 @@ mod tests {
                 assert!(output.contains(&expected), "missing {expected:?}");
             }
             assert!(!output.contains("recycler"));
+            // Series a family does not track are not exported.
+            assert!(!output.contains("racer_buffer_pool_entries"));
+            assert!(!output.contains("racer_staging_pool_unpooled_total"));
             assert_eq!(
                 output
                     .lines()

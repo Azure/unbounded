@@ -1855,6 +1855,7 @@ mod tests {
                             rejects: u64::MAX,
                             trimmed: u64::MAX,
                             constrained: true,
+                            unpooled: u64::MAX,
                         },
                     );
                     metrics.observe_retention(crate::retention::Snapshot {

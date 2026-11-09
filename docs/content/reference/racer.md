@@ -1567,16 +1567,19 @@ second:
 | Metric | Type | Meaning |
 |--------|------|---------|
 | `racer_buffer_pool_bytes` | gauge | Idle buffer bytes kept for reuse, charged to the `pool` admission class |
-| `racer_buffer_pool_target` | gauge | Per-worker cap on idle buffers of one size |
+| `racer_buffer_pool_target` | gauge | Sum over workers of each worker's cap on idle buffers of one size |
 | `racer_buffer_pool_hits_total` | counter | Buffers taken from idle storage |
 | `racer_buffer_pool_misses_total` | counter | Buffers that needed new memory (an `mmap` for page-sized buffers) |
 | `racer_buffer_pool_rejects_total` | counter | Returned buffers freed instead of kept (an `munmap` for page-sized buffers) |
 | `racer_buffer_pool_trimmed_total` | counter | Times idle buffers were released after an idle window or under memory pressure |
+| `racer_buffer_pool_unpooled_total` | counter | Buffers that could not be pooled because every size class held idle buffers of other sizes; each is also a miss |
 | `racer_worker_buffer_pool_bytes` | gauge | `racer_buffer_pool_bytes` per worker, labeled `worker` |
 
-`racer_buffer_pool_entries` is always 0. While load is steady, misses and
+While load is steady, misses and
 rejects should stay flat. If they keep rising, idle buffers do not fit the
-`pool` class budget, which equals the worker's ciphertext budget.
+`pool` class budget, which equals the worker's ciphertext budget. A rising
+`racer_buffer_pool_unpooled_total` means more buffer sizes are in use at
+once than a worker's pool has size classes.
 
 A failed client request also counts in one of
 `racer_request_errors_overloaded_total`, `racer_request_errors_unavailable_total`,
