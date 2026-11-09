@@ -2,13 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package health tracks the health of a member's data-plane neighbors:
-// consecutive-failure breakers with single-probe half-open, Envoy-style
+// consecutive-failure breakers with a half-open probing state, Envoy-style
 // outlier detection, peak-EWMA latency, overload ("busy") marking, ejection
 // limits, a panic threshold, and a hedge budget.
 //
 // # Hot and control paths
 //
-// Observe, Usable, TryProbe, HedgeAfter, NoteRouted, and TryHedge are the
+// Observe, Usable, HedgeAfter, NoteRouted, and TryHedge are the
 // hot path. They are safe for concurrent use, take no locks, never read the
 // clock, and never allocate. Track, Untrack, and Tick are the control path
 // and must be called from a single goroutine (the runtime tick, or a
@@ -52,11 +52,11 @@
 //
 // The breaker state of a peer is Healthy, Ejected, or Probing. Busy and
 // Degraded are overlays on a Healthy peer that make Usable return Degraded.
-// When an ejection ends the peer becomes Probing: Usable reports Unusable,
-// and exactly one caller may claim the probe with TryProbe. Any Success then
-// makes the peer Healthy; a Failure or Timeout ejects it again with a longer
-// ejection. A claimed probe whose result is never observed is released at
-// the next interval boundary.
+// When an ejection ends the peer becomes Probing: Usable still reports
+// Unusable, so routing sends it no requests. Probing peers are probed by the
+// control plane (neighbor pings and broadcast replies), whose results reach
+// Observe like any other: any Success makes the peer Healthy; a Failure or
+// Timeout ejects it again with a longer ejection.
 //
 // # Limits
 //
@@ -357,8 +357,7 @@ type Peer struct {
 	_       [64 - 48]byte
 
 	// Ejection and control.
-	until     atomic.Int64  // ejection end; 0 means not yet timed
-	probe     atomic.Uint32 // 1 when the probe token is claimed
+	until     atomic.Int64 // ejection end; 0 means not yet timed
 	ejections atomic.Int32
 	reason    atomic.Uint32
 	recent    atomic.Bool // ejected during the current interval
@@ -804,7 +803,6 @@ func (t *Tracker) Observe(slot uint32, r Result, latency time.Duration) {
 	if r == Overload {
 		until := t.now.Load() + int64(t.cfg.BusyFor)
 		p.busyUntil.Store(until)
-		p.probe.Store(0)
 
 		for {
 			m := t.busyMax.Load()
@@ -903,14 +901,6 @@ func (t *Tracker) AllHealthy() bool {
 	}
 
 	return t.panic.Load()
-}
-
-// TryProbe claims the single probe token of a Probing peer. It returns true
-// to exactly one caller per probe. Hot path.
-func (t *Tracker) TryProbe(slot uint32) bool {
-	p := t.tab.Load().lookup(slot)
-
-	return p != nil && p.state.Load() == bProbing && p.probe.CompareAndSwap(0, 1)
 }
 
 // Panic reports whether health filtering is disabled.
@@ -1099,10 +1089,6 @@ func (t *Tracker) interval(nt *table) {
 		if !recent && p.state.Load() == bHealthy && p.ejections.Load() > 0 {
 			p.ejections.Add(-1)
 		}
-
-		if p.state.Load() == bProbing {
-			p.probe.Store(0) // release a probe whose result was never observed
-		}
 	}
 
 	for i := range t.hedge {
@@ -1146,8 +1132,6 @@ func (t *Tracker) transitions(nt *table, now int64) {
 			}
 
 			if now >= u {
-				p.probe.Store(0)
-
 				if p.state.CompareAndSwap(bEjected, bProbing) {
 					// Only Tick times ejections, and it ignores until
 					// outside bEjected, so clearing it here means every

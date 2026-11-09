@@ -92,7 +92,7 @@ func TestEjectionBackoffProbeAndCap(t *testing.T) {
 		now += int64(d) - 1
 		tr.Tick(now)
 
-		if tr.Usable(0) != Unusable || tr.TryProbe(0) {
+		if s, _, _ := tr.PeerState(0); s != StateEjected || tr.Usable(0) != Unusable {
 			t.Fatal("must still be ejected")
 		}
 
@@ -101,10 +101,6 @@ func TestEjectionBackoffProbeAndCap(t *testing.T) {
 
 		if s, _, _ := tr.PeerState(0); s != StateProbing || tr.Usable(0) != Unusable {
 			t.Fatalf("want probing, got %v", s)
-		}
-
-		if !tr.TryProbe(0) || tr.TryProbe(0) {
-			t.Fatal("exactly one probe")
 		}
 
 		tr.Observe(0, Failure, time.Millisecond)
@@ -119,7 +115,6 @@ func TestEjectionBackoffProbeAndCap(t *testing.T) {
 	tr.Tick(now)
 	now += int64(durs[len(durs)-1])
 	tr.Tick(now)
-	tr.TryProbe(0)
 	tr.Observe(0, Success, time.Millisecond)
 
 	if tr.Usable(0) != Healthy {
@@ -142,38 +137,6 @@ func TestEjectionBackoffProbeAndCap(t *testing.T) {
 
 		if _, n, _ := tr.PeerState(0); n != n0-i-1 {
 			t.Fatalf("decay: %d want %d", n, n0-i-1)
-		}
-	}
-}
-
-func TestProbeClaimConcurrent(t *testing.T) {
-	for round := range 50 {
-		tr := newT(Config{})
-		trackN(tr, 20, 4)
-		tr.Tick(0)
-		fail(tr, 3, 5)
-		tr.Tick(1)
-		tr.Tick(400 * sec)
-
-		var (
-			wins atomic.Int32
-			wg   sync.WaitGroup
-		)
-
-		for range 8 {
-			wg.Go(func() {
-				for range 100 {
-					if tr.TryProbe(3) {
-						wins.Add(1)
-					}
-				}
-			})
-		}
-
-		wg.Wait()
-
-		if wins.Load() != 1 {
-			t.Fatalf("round %d: %d winners", round, wins.Load())
 		}
 	}
 }
@@ -529,8 +492,8 @@ func TestUntrackRetrack(t *testing.T) {
 
 	tr.Observe(3, Failure, 0) // no-op
 
-	if tr.TryProbe(3) {
-		t.Fatal("untracked cannot probe")
+	if tr.Usable(3) != Healthy {
+		t.Fatal("observe on untracked must be a no-op")
 	}
 }
 
@@ -599,8 +562,6 @@ func TestRandomizedInvariants(t *testing.T) {
 			case 2:
 				now += rng.Int64N(5 * sec)
 				tr.Tick(now)
-			case 3:
-				tr.TryProbe(rng.Uint32N(64))
 			default:
 				tr.Observe(rng.Uint32N(64), Result(rng.IntN(4)), time.Duration(rng.Int64N(int64(time.Second))))
 			}
@@ -683,9 +644,11 @@ func BenchmarkHedge(b *testing.B) {
 
 	b.RunParallel(func(pb *testing.PB) {
 		h := rand.Uint64()
+
 		for pb.Next() {
 			tr.NoteRouted()
 			tr.TryHedge()
+
 			h++
 		}
 	})
@@ -707,7 +670,6 @@ func TestConcurrentHotAndControl(t *testing.T) {
 				s := rng.Uint32N(120)
 				tr.Observe(s, Result(rng.IntN(4)), time.Duration(rng.Int64N(int64(time.Second))))
 				tr.Usable(s)
-				tr.TryProbe(s)
 				tr.HedgeAfter(s)
 				tr.NoteRouted()
 				tr.TryHedge()

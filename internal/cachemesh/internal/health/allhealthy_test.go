@@ -186,8 +186,6 @@ func TestAllHealthyRandomized(t *testing.T) {
 			if tr.AllHealthy() && !allUsableHealthy(tr, n) {
 				t.Fatalf("seed %d step %d: AllHealthy with an unhealthy peer", seed, step)
 			}
-
-			_ = tr.TryProbe(slot)
 		}
 	}
 }
