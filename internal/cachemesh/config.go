@@ -131,6 +131,8 @@ type Config struct {
 	// MaxNeighbors bounds data-plane neighbors per member. Default 256.
 	MaxNeighbors int
 	// EpochPeriod is the epoch length the leader publishes. Default 15s.
+	// It applies only when a new view is bootstrapped; leaders of an
+	// existing view keep its period, so stamps never outlive their TTL.
 	EpochPeriod time.Duration
 	// ExpectedSize is roughly how many members the cluster will have, for
 	// example the desired pod count of the DaemonSet. Default 1000.

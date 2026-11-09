@@ -463,7 +463,7 @@ func (l *Leader) Tick(now int64, epochNow uint64, v *view.View, newTerm uint64) 
 	l.place(st)
 
 	if epochNow > v.Epoch() {
-		st.ops = append(st.ops, view.OpEpoch(epochNow, l.cfg.EpochPeriod))
+		st.ops = append(st.ops, view.OpEpoch(epochNow, l.period(v)))
 	}
 
 	k := min(len(l.invals), maxInvalsPerTick)
@@ -502,8 +502,8 @@ func (l *Leader) bootstrap(st *state, epochNow uint64) {
 		view.OpAddMember(self, l.selfMember(epochNow, view.Active, view.MaxWeight, 0)),
 	)
 
-	if epochNow > st.v.Epoch() || st.v.Period() != l.cfg.EpochPeriod {
-		st.ops = append(st.ops, view.OpEpoch(max(epochNow, st.v.Epoch()), l.cfg.EpochPeriod))
+	if epochNow > st.v.Epoch() || st.v.Period() <= 0 {
+		st.ops = append(st.ops, view.OpEpoch(max(epochNow, st.v.Epoch()), l.period(st.v)))
 	}
 
 	if l.hooks.OnBootstrap != nil {
@@ -692,8 +692,21 @@ func (l *Leader) ensureStamps(v *view.View) {
 	}
 }
 
+// period returns the epoch period to publish. A lineage keeps the period
+// of its first Epoch op: stamps count epochs, so a leader whose configured
+// period is longer than the lineage's would stretch every live stamp past
+// its TTL (and a shorter one would cut it short). EpochPeriod only applies
+// to a view that has no period yet.
+func (l *Leader) period(v *view.View) time.Duration {
+	if p := v.Period(); p > 0 {
+		return p
+	}
+
+	return l.cfg.EpochPeriod
+}
+
 // since returns the local time at which member s entered its current state.
-func (l *Leader) since(s view.Slot, m *view.Member, now int64, epochNow uint64) int64 {
+func (l *Leader) since(v *view.View, s view.Slot, m *view.Member, now int64, epochNow uint64) int64 {
 	st := &l.stamps[s]
 	if st.key == m.Key && st.state == m.State {
 		return st.at
@@ -701,7 +714,7 @@ func (l *Leader) since(s view.Slot, m *view.Member, now int64, epochNow uint64) 
 
 	var elapsed int64
 	if epochNow > m.Since {
-		elapsed = int64(epochNow-m.Since) * int64(l.cfg.EpochPeriod)
+		elapsed = int64(epochNow-m.Since) * int64(l.period(v))
 	}
 
 	*st = stamp{key: m.Key, state: m.State, at: now - elapsed}
@@ -739,7 +752,7 @@ func (l *Leader) promote(st *state, now int64, epochNow uint64) {
 			return true
 		}
 
-		at := l.since(s, m, now, epochNow)
+		at := l.since(st.v, s, m, now, epochNow)
 
 		switch m.State {
 		case view.Joining:
@@ -807,7 +820,7 @@ func (l *Leader) drains(st *state, now int64, epochNow uint64) {
 			return true
 		}
 
-		if now-l.since(s, m, now, epochNow) >= int64(l.cfg.DrainFor) && st.budget() {
+		if now-l.since(st.v, s, m, now, epochNow) >= int64(l.cfg.DrainFor) && st.budget() {
 			l.remove(st, s, RemovedDrained)
 		}
 

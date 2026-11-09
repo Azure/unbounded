@@ -308,7 +308,12 @@ table as bit-packed columns; derived indexes are rebuilt and checked by
 ## Rolling cluster epoch
 
 - The leader owns `EpochPeriod` (default 15s) and publishes an `Epoch` op
-  every period as a heartbeat.
+  every period as a heartbeat. The period is fixed for a lineage: the first
+  `Epoch` op sets it, and later leaders republish the view's period even when
+  their own `EpochPeriod` differs. Stamps count epochs, so a period change
+  would rescale every live stamp (a longer period would keep values fresh
+  past their TTL). A new `EpochPeriod` takes effect only in a new lineage
+  (a whole-cluster cold restart).
 - `route.EpochTracker` maps local monotonic time to an epoch:
   `current = anchorEpoch + floor((now - anchorMono) / period)`, re-anchored on
   heartbeats received. It never decreases. A member cut off from the

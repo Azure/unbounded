@@ -39,7 +39,13 @@ func newLeaderHarness(tb testing.TB, cfg LeaderConfig, v *view.View) *leaderHarn
 }
 
 func (h *leaderHarness) epochNow() uint64 {
-	return max(h.v.Epoch(), uint64(h.now/int64(h.l.cfg.EpochPeriod)))
+	// Members count epochs with the view's period once it has one.
+	period := h.v.Period()
+	if period <= 0 {
+		period = h.l.cfg.EpochPeriod
+	}
+
+	return max(h.v.Epoch(), uint64(h.now/int64(period)))
 }
 
 // tick runs one leader tick, applies the delta, validates the result, and
@@ -1365,4 +1371,46 @@ func (pl *Planner) Targets(bits uint8, members []PlanMember) ([]int64, error) {
 	pl.members = nil
 
 	return slices.Clone(pl.target[:len(members)]), nil
+}
+
+// TestLeaderKeepsLineagePeriod checks that a leader configured with a
+// different EpochPeriod keeps publishing the lineage's period. Stamps count
+// epochs, so a longer period would keep values fresh past their TTL.
+func TestLeaderKeepsLineagePeriod(t *testing.T) {
+	for _, period := range []time.Duration{time.Minute, time.Second} {
+		h := newLeaderHarness(t, smallCfg("a"), nil)
+		h.bootstrap()
+		h.l.Join(h.now, member(1))
+		h.run(3 * time.Second)
+
+		if h.v.Period() != DefaultEpochPeriod {
+			t.Fatalf("bootstrap period %v", h.v.Period())
+		}
+
+		for _, self := range []Joiner{member(1), {ID: "z", Incarnation: 1, Addr: "z:1"}} {
+			h.l = NewLeader(LeaderConfig{Self: self, PartitionBits: 10, EpochPeriod: period}, nil)
+			h.term++
+			h.now += sec
+
+			ops := h.tick(h.term)
+			for end := h.now + int64(5*time.Minute); h.now < end; {
+				h.now += sec
+				ops = append(ops, h.tick(0)...)
+			}
+
+			if count(ops, view.KindEpoch) == 0 {
+				t.Fatalf("period %v leader %s: no heartbeat", period, self.ID)
+			}
+
+			for _, op := range ops {
+				if op.Kind == view.KindEpoch && op.Period != DefaultEpochPeriod {
+					t.Fatalf("period %v leader %s published %v", period, self.ID, op.Period)
+				}
+			}
+
+			if h.v.Period() != DefaultEpochPeriod {
+				t.Fatalf("view period %v", h.v.Period())
+			}
+		}
+	}
 }
