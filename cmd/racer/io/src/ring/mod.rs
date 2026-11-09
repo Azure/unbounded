@@ -913,16 +913,16 @@ impl Reactor {
         };
         // SAFETY: the slot holds the O submitted under this id.
         let owner = unsafe { slot.owner.take::<O>() };
-        let returns_fd = slot.returns_fd;
         let cancel = slot.cancel;
         state.release_slot(id);
         drop(state);
-        // Cancellation and deadline take precedence over a late success.
-        let reason = cancel.or_else(|| ctx.check(self.now()).err());
-        if let Some(reason) = reason {
-            if returns_fd && result >= 0 {
-                Self::close_raw(&mut self.state(), result);
-            }
+        // A success that already completed is delivered even if the future
+        // is polled after its deadline or a cancel that lost the race: its
+        // side effect happened and the caller must see it (and its byte
+        // count). Cancellation and deadline take precedence over failures.
+        if result < 0
+            && let Some(reason) = cancel.or_else(|| ctx.check(self.now()).err())
+        {
             owner.discard(result);
             return Poll::Ready(Err(reason));
         }

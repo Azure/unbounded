@@ -783,6 +783,32 @@ fn sim_deadline_advances_virtual_time_and_expires() {
     assert_eq!(clock.now() - start, Duration::from_secs(4));
 }
 
+#[test]
+fn sim_completed_success_survives_late_deadline_and_cancel() {
+    let os = SimOs::new();
+    let clock = crate::ctx::VirtualClock::new();
+    let reactor = simulated(&os, &clock);
+    let waker = std::task::Waker::noop();
+    let mut cx = Context::from_waker(waker);
+    let token = CancelToken::new();
+    let ctx =
+        OpCtx::with_cancel(&token).deadline(Deadline::after(clock.now(), Duration::from_secs(3)));
+    let (left, _right) = os.socket_pair();
+    let mut send = reactor.send(Rc::new(left), b"abc".to_vec(), (), &ctx);
+    assert!(Pin::new(&mut send).poll(&mut cx).is_pending());
+    let id = send.id().unwrap();
+    while !reactor.is_fenced(id) {
+        reactor.reap(16).unwrap();
+    }
+    // The send completed before its deadline; the future is polled late.
+    clock.advance(Duration::from_secs(5)).unwrap();
+    token.cancel();
+    let Poll::Ready(done) = Pin::new(&mut send).poll(&mut cx) else {
+        panic!("completed send must be ready");
+    };
+    assert_eq!(done.unwrap().bytes, 3);
+}
+
 /// Run a fixed workload on a seeded world and return its trace.
 fn seeded_trace(seed: u64) -> Vec<crate::sim::Event> {
     let os = SimOs::seeded(seed);

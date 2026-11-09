@@ -742,10 +742,8 @@ mod tests {
             }
             let result = drive(&r, future);
             if cancel {
-                assert_eq!(
-                    result,
-                    Err(ReplacementError::RenameUncertain(Error::Canceled))
-                );
+                // The rename completed, so the cancel only stops the sync.
+                assert_eq!(result, Err(ReplacementError::Published(Error::Canceled)));
             } else {
                 assert_eq!(
                     result,
