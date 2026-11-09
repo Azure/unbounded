@@ -487,7 +487,7 @@ type Stats struct {
 	// Inflight is the number of fills in progress.
 	Inflight int
 	// PageBytes is memory in page buffers in use: in-flight fill pages,
-	// pages being sent, and lingering chunks.
+	// pages being sent, lingering chunks, and recent content store pages.
 	PageBytes int64
 	// IdlePageBytes is memory in idle pooled page buffers.
 	IdlePageBytes int64
@@ -497,8 +497,8 @@ type Stats struct {
 	LocalErrors int64
 	// LocalFills counts fills read from the local content store.
 	LocalFills int64
-	// PageReadsShared counts page reads served by a concurrent reader's
-	// read.
+	// PageReadsShared counts page reads served by a concurrent or recent
+	// reader's read.
 	PageReadsShared int64
 	// ExtraPageBytes is memory borrowed from the in-flight budget by
 	// fills whose readers lag and by lingering chunks.
@@ -1322,25 +1322,38 @@ type pageKey struct {
 }
 
 // diskPage is a page read from the local content store, shared by every
-// concurrent reader of the same page (read coalescing). It is freed when
-// its last reader is done.
+// concurrent reader of the same page (read coalescing).
 type diskPage struct {
 	key   pageKey
 	p     *page
 	ready chan struct{}
 	err   error
 
-	// readers is guarded by pageCache.mu.
+	// Guarded by pageCache.mu.
 	readers int
+	// recent marks a page on the recent ring.
+	recent bool
 }
 
-// pageCache coalesces concurrent page reads from the local content store:
-// one read per page however many readers want it at once.
+// recentPages is how many just-read pages the page cache keeps after
+// their last reader is done, so readers of the same blob that trail behind
+// (a fan-out to many peers drifts apart by several pages) share the read
+// instead of repeating it. It bounds that memory to recentPages pages
+// (32MiB with 1MiB pages); 8 pages left a 32-reader fan-out of one 16MiB
+// chunk reading it about 1.5 times.
+const recentPages = 32
+
+// pageCache coalesces page reads from the local content store: one read
+// per page for concurrent readers and for readers that arrive while the
+// page is still among the recentPages most recently released ones.
 type pageCache struct {
 	pool *pagePool
 
-	mu    sync.Mutex
-	m     map[pageKey]*diskPage
+	mu sync.Mutex
+	m  map[pageKey]*diskPage
+	// ring holds the most recently released pages, oldest at next.
+	ring  [recentPages]*diskPage
+	next  int
 	reads atomic.Int64
 	hits  atomic.Int64
 }
@@ -1351,7 +1364,7 @@ func newPageCache(pool *pagePool) *pageCache {
 
 // get returns page idx (absolute, in units of the page size) of blob d
 // with n valid bytes, reading it from src unless another reader is reading
-// or holding it. The caller must call put.
+// or holding it, or it was released recently. The caller must call put.
 func (c *pageCache) get(src ContentSource, d string, idx int64, n int) (*diskPage, error) {
 	k := pageKey{digest: d, idx: idx}
 
@@ -1390,20 +1403,44 @@ func (c *pageCache) get(src ContentSource, d string, idx int64, n int) (*diskPag
 	return e, err
 }
 
-// put drops a reader of e and frees the page after the last one.
+// put drops a reader of e. After the last one a good page joins the
+// recent ring, pushing out the oldest; any other page is freed.
 func (c *pageCache) put(e *diskPage) {
 	c.mu.Lock()
-	e.readers--
-	last := e.readers == 0
+	defer c.mu.Unlock()
 
-	if last && c.m[e.key] == e {
+	e.readers--
+	if e.readers > 0 || e.recent {
+		return
+	}
+
+	if e.err != nil || c.m[e.key] != e {
+		c.freeLocked(e)
+		return
+	}
+
+	old := c.ring[c.next]
+	c.ring[c.next] = e
+	c.next = (c.next + 1) % recentPages
+	e.recent = true
+
+	if old != nil {
+		old.recent = false
+
+		if old.readers == 0 {
+			c.freeLocked(old)
+		}
+	}
+}
+
+// freeLocked forgets e and frees its page. Caller holds c.mu; e has no
+// readers and is not on the ring.
+func (c *pageCache) freeLocked(e *diskPage) {
+	if c.m[e.key] == e {
 		delete(c.m, e.key)
 	}
-	c.mu.Unlock()
 
-	if last {
-		e.p.release()
-	}
+	e.p.release()
 }
 
 // purge forgets every page of blob d, so later readers read it afresh.
@@ -1415,6 +1452,17 @@ func (c *pageCache) purge(d string) {
 	for k := range c.m {
 		if k.digest == d {
 			delete(c.m, k)
+		}
+	}
+
+	for i, e := range c.ring {
+		if e != nil && e.key.digest == d {
+			c.ring[i] = nil
+			e.recent = false
+
+			if e.readers == 0 {
+				c.freeLocked(e)
+			}
 		}
 	}
 }

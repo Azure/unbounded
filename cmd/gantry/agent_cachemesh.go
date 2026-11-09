@@ -378,7 +378,7 @@ var cachemeshStateMetrics = []cachemeshStateMetric{
 		func(_ *cachemeshAgent, st meshfetch.Stats) float64 { return float64(st.Inflight) },
 	},
 	{
-		"page_memory_bytes", "Memory in chunk page buffers in use: in-flight fill pages, pages being sent, and lingering chunks.", false,
+		"page_memory_bytes", "Memory in chunk page buffers in use: in-flight fill pages, pages being sent, lingering chunks, and recently read content store pages.", false,
 		func(_ *cachemeshAgent, st meshfetch.Stats) float64 { return float64(st.PageBytes) },
 	},
 	{
@@ -394,7 +394,7 @@ var cachemeshStateMetrics = []cachemeshStateMetric{
 		func(_ *cachemeshAgent, st meshfetch.Stats) float64 { return float64(st.LocalReads) },
 	},
 	{
-		"shared_page_reads_total", "Page reads served by a concurrent reader's read instead of the content store.", true,
+		"shared_page_reads_total", "Page reads served by a concurrent or recent reader's read instead of the content store.", true,
 		func(_ *cachemeshAgent, st meshfetch.Stats) float64 { return float64(st.PageReadsShared) },
 	},
 	{

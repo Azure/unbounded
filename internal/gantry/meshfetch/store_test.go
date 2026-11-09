@@ -696,14 +696,22 @@ func TestLocalPageReadsCoalesce(t *testing.T) {
 		t.Fatalf("shared reads = %d", st.PageReadsShared)
 	}
 
-	if st.PageBytes != 0 {
-		t.Fatalf("pages retained after the readers: %+v", st)
+	// The pages stay on the recent ring until pushed out or evicted.
+	if st.PageBytes != local*testPage {
+		t.Fatalf("recent pages: %+v", st)
+	}
+
+	s.evictDigest(testBlob)
+
+	if st := s.stats(); st.PageBytes != 0 {
+		t.Fatalf("pages retained after evict: %+v", st)
 	}
 }
 
 // Pages of one blob are shared across fills: they are keyed by digest and
-// absolute page, not by fill. Pages are freed once their readers are done,
-// and evicting the digest makes later readers read it afresh.
+// absolute page, not by fill. A reader that arrives after the others are
+// done shares their read through the recent ring, and evicting the digest
+// frees its pages.
 func TestLocalPagesSharedAcrossFills(t *testing.T) {
 	s := newTestStore(t, nil)
 	data := pattern(2, testChunk)
@@ -738,11 +746,11 @@ func TestLocalPagesSharedAcrossFills(t *testing.T) {
 	wg.Wait()
 
 	// Both fills read the same two pages behind their windows once.
-	if st := s.stats(); st.LocalReads != 2 || st.PageReadsShared != 2 || st.PageBytes != 0 {
+	if st := s.stats(); st.LocalReads != 2 || st.PageReadsShared != 2 || st.PageBytes != 2*testPage {
 		t.Fatalf("stats: %+v", st)
 	}
 
-	// A later reader reads the pages again: nothing is retained.
+	// A later reader shares the recent pages.
 	c := behind(t, s, key(1), data, 1)[0]
 	if got := readAll(t, c); !bytes.Equal(got, data) {
 		t.Fatal("data mismatch")
@@ -750,10 +758,46 @@ func TestLocalPagesSharedAcrossFills(t *testing.T) {
 
 	c.close()
 
+	if st := s.stats(); st.LocalReads != 2 {
+		t.Fatalf("recent pages read again: %+v", st)
+	}
+
+	// Evicting the digest frees its recent pages.
 	s.evictDigest(testBlob)
 
-	if st := s.stats(); st.LocalReads != 4 || st.PageBytes != 0 {
+	if st := s.stats(); st.PageBytes != 0 {
 		t.Fatalf("after evict: %+v", st)
+	}
+}
+
+// The recent ring holds at most recentPages released pages.
+func TestRecentPagesBounded(t *testing.T) {
+	s := newTestStore(t, nil)
+	mc := testContent(s)
+	mc.put(testBlob, pattern(5, 2*recentPages*testPage))
+
+	for i := range int64(2 * recentPages) {
+		e, err := s.pages.get(mc, testBlob, i, testPage)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		s.pages.put(e)
+	}
+
+	if st := s.stats(); st.PageBytes != recentPages*testPage || st.LocalReads != 2*recentPages {
+		t.Fatalf("stats: %+v", st)
+	}
+
+	// The newest pages are still shared; the oldest were freed.
+	e, _ := s.pages.get(mc, testBlob, 2*recentPages-1, testPage)
+	s.pages.put(e)
+
+	e, _ = s.pages.get(mc, testBlob, 0, testPage)
+	s.pages.put(e)
+
+	if st := s.stats(); st.LocalReads != 2*recentPages+1 || st.PageBytes != recentPages*testPage {
+		t.Fatalf("stats: %+v", st)
 	}
 }
 
