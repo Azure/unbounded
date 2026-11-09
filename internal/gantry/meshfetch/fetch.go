@@ -55,21 +55,23 @@ func (r *chunkReq) kind() ifaces.OriginRefKind {
 // decider returns the routing decision for the next fill attempt.
 type decider func() (cachemesh.Decision, error)
 
-// obtain returns a referenced fill for req: a cached or in-progress one, or
-// a new fill routed by decide. peer requests pass the sender slot for loop
-// detection and never wait for budget.
-func (n *Node) obtain(ctx context.Context, req chunkReq, decide decider, requester string, sender cachemesh.Slot) (*fill, error) {
-	f, created, err := n.store.acquire(ctx, req.key, requester == "local")
+// obtain returns a reader at byte off of the fill for req: a cached or
+// in-progress one, or a new fill routed by decide. peer requests pass the
+// sender slot for loop detection and never wait for the fill cap.
+func (n *Node) obtain(ctx context.Context, req chunkReq, off int, decide decider, requester string, sender cachemesh.Slot) (*reader, error) {
+	r, created, err := n.store.acquire(ctx, req.key, off, requester == "local", requester == "peer")
 	if err != nil {
 		return nil, err
 	}
+
+	f := r.f
 
 	if created {
 		n.lookup(requester, "fill")
 
 		go n.runFill(f, req, decide)
 
-		return f, nil
+		return r, nil
 	}
 
 	f.mu.Lock()
@@ -77,7 +79,7 @@ func (n *Node) obtain(ctx context.Context, req chunkReq, decide decider, request
 	f.mu.Unlock()
 
 	if !done && sender != noSlot && upstream == sender {
-		f.release()
+		r.close()
 		return nil, errLoop
 	}
 
@@ -87,7 +89,7 @@ func (n *Node) obtain(ctx context.Context, req chunkReq, decide decider, request
 		n.lookup(requester, "joined")
 	}
 
-	return f, nil
+	return r, nil
 }
 
 func (n *Node) lookup(requester, result string) {
@@ -288,7 +290,7 @@ func (n *Node) fillFromOrigin(f *fill, req chunkReq) (err error) {
 
 	if metaKnown {
 		f.mu.Lock()
-		length = int64(len(f.buf) - off)
+		length = int64(f.chunkLen - off)
 		f.mu.Unlock()
 	}
 
@@ -327,7 +329,7 @@ func (n *Node) fillFromOrigin(f *fill, req chunkReq) (err error) {
 
 	touch()
 
-	return f.readFrom(rc, touch)
+	return f.readFrom(ctx, rc, touch)
 }
 
 func classifyOrigin(err error) error {
@@ -388,7 +390,7 @@ func (n *Node) fillFromPrev(f *fill, req chunkReq, prev cachemesh.PeerRef, peek,
 
 	defer func() { _ = resp.Body.Close() }() //nolint:errcheck // best-effort close
 
-	return n.readChunkResponse(f, req, resp, off, touch)
+	return n.readChunkResponse(ctx, f, req, resp, off, touch)
 }
 
 // fillFromPeer fetches the rest of the chunk from target, hedging to
@@ -422,7 +424,7 @@ func (n *Node) fillFromPeer(f *fill, req chunkReq, target cachemesh.PeerRef, hdr
 	f.fromOrigin = false
 	f.mu.Unlock()
 
-	err = n.readChunkResponse(f, req, resp, off, touch)
+	err = n.readChunkResponse(ctx, f, req, resp, off, touch)
 
 	now, _ := f.progress()
 	n.fillHook("peer", err, int64(now-off), start)
@@ -442,7 +444,7 @@ func (n *Node) fillFromPeer(f *fill, req chunkReq, target cachemesh.PeerRef, hdr
 }
 
 // readChunkResponse validates a 200 chunk response and reads its body.
-func (n *Node) readChunkResponse(f *fill, req chunkReq, resp *http.Response, off int, touch func()) error {
+func (n *Node) readChunkResponse(ctx context.Context, f *fill, req chunkReq, resp *http.Response, off int, touch func()) error {
 	total, err := strconv.ParseInt(resp.Header.Get(headerBlobSize), 10, 64)
 	if err != nil || total < 0 {
 		return fmt.Errorf("meshfetch: bad %s header", headerBlobSize)
@@ -465,7 +467,7 @@ func (n *Node) readChunkResponse(f *fill, req chunkReq, resp *http.Response, off
 
 	touch()
 
-	return f.readFrom(resp.Body, touch)
+	return f.readFrom(ctx, resp.Body, touch)
 }
 
 type peerResult struct {

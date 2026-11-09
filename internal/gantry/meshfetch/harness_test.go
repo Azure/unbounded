@@ -218,7 +218,10 @@ type cluster struct {
 type clusterOpts struct {
 	n            int
 	chunkSize    int64
-	cacheBytes   int64
+	diskBytes    int64
+	memBytes     int64
+	noDisk       bool
+	persist      PersistPolicy
 	cellSize     int
 	maxNeighbors int
 	lookahead    int
@@ -236,8 +239,12 @@ func newCluster(t testing.TB, o clusterOpts) *cluster {
 		o.chunkSize = 64 << 10
 	}
 
-	if o.cacheBytes == 0 {
-		o.cacheBytes = 256 * o.chunkSize
+	if o.diskBytes == 0 {
+		o.diskBytes = 256 * o.chunkSize
+	}
+
+	if o.memBytes == 0 {
+		o.memBytes = 16 * o.chunkSize
 	}
 
 	if o.lookahead == 0 {
@@ -299,7 +306,10 @@ func newCluster(t testing.TB, o clusterOpts) *cluster {
 			Origin:       c.origin,
 			Tags:         c.origin,
 			ChunkSize:    o.chunkSize,
-			CacheBytes:   o.cacheBytes,
+			ChunkDir:     t.TempDir(),
+			DiskBytes:    o.diskBytes,
+			MemoryBytes:  o.memBytes,
+			Persist:      o.persist,
 			MaxFills:     1024,
 			MaxServes:    1024,
 			Lookahead:    o.lookahead,
@@ -312,6 +322,10 @@ func newCluster(t testing.TB, o clusterOpts) *cluster {
 			DataAddr:     c.dataAddr,
 			Logger:       logger,
 		}
+		if o.noDisk {
+			cfg.ChunkDir, cfg.DiskBytes = "", 0
+		}
+
 		if o.tweak != nil {
 			o.tweak(&cfg)
 		}

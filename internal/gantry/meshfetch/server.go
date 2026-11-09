@@ -101,20 +101,20 @@ func (n *Node) handleChunk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	f, status, outcome := n.chunkForPeer(r, q.Get("peek"), req)
-	if f == nil {
+	rd, status, outcome := n.chunkForPeer(r, q.Get("peek"), req, off)
+	if rd == nil {
 		n.serveHook(outcome, 0)
 		http.Error(w, outcome, status)
 
 		return
 	}
 
-	defer f.release()
+	defer rd.close()
 
 	ctx, cancel := context.WithTimeout(r.Context(), n.cfg.ChunkTimeout)
 	defer cancel()
 
-	total, ctype, chunkLen, err := f.meta(ctx)
+	total, ctype, chunkLen, err := rd.f.meta(ctx)
 	if err != nil {
 		status, outcome := errStatus(err)
 		n.serveHook(outcome, 0)
@@ -143,7 +143,7 @@ func (n *Node) handleChunk(w http.ResponseWriter, r *http.Request) {
 		fl.Flush()
 	}
 
-	written, err := f.streamTo(r.Context(), w, off)
+	written, err := rd.streamTo(r.Context(), w)
 	if err != nil {
 		n.serveHook("error", written)
 		// The status line is out: abort so the peer sees a truncated
@@ -166,22 +166,23 @@ func (n *Node) shed(w http.ResponseWriter) {
 // owner reading through the previous owner, or peekOwner from a backup
 // reading through the owner. On failure it returns a nil fill with the status
 // and outcome to report.
-func (n *Node) chunkForPeer(r *http.Request, peek string, req chunkReq) (*fill, int, string) {
+func (n *Node) chunkForPeer(r *http.Request, peek string, req chunkReq, off int) (*reader, int, string) {
 	if peek != "" {
 		// Serve only complete chunks and chunks read from the origin
 		// here: an in-progress fill from a peer may be waiting on the
 		// very member that is peeking (the new owner).
-		if f := n.store.get(req.key); f != nil {
+		if rd := n.store.get(req.key, off); rd != nil {
+			f := rd.f
 			f.mu.Lock()
 			ok := (f.done && f.err == nil) || (!f.done && f.fromOrigin)
 			f.mu.Unlock()
 
 			if ok {
 				n.lookup("peer", "hit")
-				return f, 0, ""
+				return rd, 0, ""
 			}
 
-			f.release()
+			rd.close()
 
 			return nil, http.StatusNotFound, "not_found"
 		}
@@ -192,8 +193,8 @@ func (n *Node) chunkForPeer(r *http.Request, peek string, req chunkReq) (*fill, 
 		// the origin once. The fill never forwards (the owner's own
 		// decision is KindSelf), so this cannot loop.
 		if peek == peekOwner {
-			if f := n.ownerFill(r, req); f != nil {
-				return f, 0, ""
+			if rd := n.ownerFill(r, req, off); rd != nil {
+				return rd, 0, ""
 			}
 		}
 
@@ -210,9 +211,9 @@ func (n *Node) chunkForPeer(r *http.Request, peek string, req chunkReq) (*fill, 
 	switch {
 	case errors.Is(err, cachemesh.ErrTTLExhausted):
 		// The request may not travel further: serve only what is here.
-		if f := n.store.get(req.key); f != nil {
+		if rd := n.store.get(req.key, off); rd != nil {
 			n.lookup("peer", "hit")
-			return f, 0, ""
+			return rd, 0, ""
 		}
 
 		return nil, http.StatusLoopDetected, "ttl"
@@ -230,19 +231,19 @@ func (n *Node) chunkForPeer(r *http.Request, peek string, req chunkReq) (*fill, 
 		return n.mesh.Forward(h)
 	}
 
-	f, err := n.obtain(r.Context(), req, decide, "peer", h.Sender)
+	rd, err := n.obtain(r.Context(), req, off, decide, "peer", h.Sender)
 	if err != nil {
 		status, outcome := errStatus(err)
 		return nil, status, outcome
 	}
 
-	return f, 0, ""
+	return rd, 0, ""
 }
 
 // ownerFill starts or joins the fill of req when this member is its owner
 // in its own view, for a backup reading through the owner. It returns nil
 // when this member is not the owner or the fill cannot start.
-func (n *Node) ownerFill(r *http.Request, req chunkReq) *fill {
+func (n *Node) ownerFill(r *http.Request, req chunkReq, off int) *reader {
 	key := req.key.routeKey(make([]byte, 0, 96))
 	decide := func() (cachemesh.Decision, error) {
 		return n.mesh.Route(n.blobKS, key), nil
@@ -253,12 +254,12 @@ func (n *Node) ownerFill(r *http.Request, req chunkReq) *fill {
 		return nil
 	}
 
-	f, err := n.obtain(r.Context(), req, decide, "peer", noSlot)
+	rd, err := n.obtain(r.Context(), req, off, decide, "peer", noSlot)
 	if err != nil {
 		return nil
 	}
 
-	return f
+	return rd
 }
 
 // errStatus maps a fill error to the status sent to a peer.

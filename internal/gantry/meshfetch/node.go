@@ -9,8 +9,9 @@
 // pulls it from the origin registry with a bounded Range request. Other
 // agents fetch chunks hop by hop through the cachemesh grid: each hop asks
 // Mesh.Forward where the request goes next, coalesces concurrent requests for
-// the same chunk into one upstream fetch, keeps the chunk in an in-memory
-// cache, and streams bytes downstream as they arrive (cut-through). Tag
+// the same chunk into one upstream fetch, keeps the chunk in a disk-backed
+// store with a small hot page tier in memory, and streams bytes downstream
+// as they arrive (cut-through). Tag
 // resolutions live in a separate "gantry-meta" keyspace with a TTL.
 //
 // The cachemesh library only routes; this package owns the data-plane
@@ -86,7 +87,7 @@ type Hooks struct {
 	OnBlob func(outcome string, bytes int64, d time.Duration)
 	// OnMeta reports a tag lookup: "hit", "origin", "peer", "error".
 	OnMeta func(outcome string)
-	// OnEvict reports bytes evicted from the chunk cache.
+	// OnEvict reports bytes evicted from the disk chunk store.
 	OnEvict func(bytes int64)
 }
 
@@ -99,8 +100,30 @@ type Config struct {
 	// Tags resolves tags this node owns. Nil disables tag resolution.
 	Tags TagOrigin
 
-	ChunkSize    int64
-	CacheBytes   int64
+	ChunkSize int64
+	// ChunkDir holds chunk files. It is wiped by New. Empty disables the
+	// disk tier: chunks then only stream through memory.
+	ChunkDir string
+	// DiskBytes bounds chunk files in ChunkDir. Zero disables the disk
+	// tier.
+	DiskBytes int64
+	// MemoryBytes bounds the hot page tier: pages read from disk by
+	// concurrent readers that stay in memory. Zero disables it.
+	MemoryBytes int64
+	// PageSize is the unit of in-flight buffers, disk I/O, read
+	// coalescing, and the hot tier. Zero uses min(1MiB, ChunkSize). It
+	// must divide ChunkSize.
+	PageSize int
+	// FillPages is the number of in-flight pages each fill holds. Zero
+	// uses 4.
+	FillPages int
+	// PageCache selects page cache handling of chunk files. Empty uses
+	// PageCacheBypass.
+	PageCache PageCacheMode
+	// Persist selects which chunks are written to disk. Empty uses
+	// PersistAll.
+	Persist PersistPolicy
+
 	MaxFills     int
 	MaxServes    int
 	Lookahead    int
@@ -143,12 +166,36 @@ func New(cfg Config) (*Node, error) {
 		return nil, errors.New("meshfetch: Mesh and Origin are required")
 	}
 
-	if cfg.ChunkSize <= 0 || cfg.CacheBytes < 2*cfg.ChunkSize {
-		return nil, fmt.Errorf("meshfetch: cache of %d bytes must hold two chunks of %d", cfg.CacheBytes, cfg.ChunkSize)
+	if cfg.ChunkSize <= 0 || cfg.ChunkSize > 1<<30 {
+		return nil, fmt.Errorf("meshfetch: bad chunk size %d", cfg.ChunkSize)
 	}
 
-	if cfg.ChunkSize > int64(^uint(0)>>1) {
-		return nil, errors.New("meshfetch: chunk size too large")
+	if cfg.DiskBytes < 0 || cfg.MemoryBytes < 0 || cfg.FillPages < 0 {
+		return nil, errors.New("meshfetch: negative cache size")
+	}
+
+	if cfg.DiskBytes > 0 && cfg.DiskBytes < 2*cfg.ChunkSize {
+		return nil, fmt.Errorf("meshfetch: disk budget of %d bytes must hold two chunks of %d", cfg.DiskBytes, cfg.ChunkSize)
+	}
+
+	if cfg.PageSize == 0 {
+		cfg.PageSize = int(min(cfg.ChunkSize, 1<<20))
+	}
+
+	if cfg.PageSize < 0 || int64(cfg.PageSize) > cfg.ChunkSize || cfg.ChunkSize%int64(cfg.PageSize) != 0 {
+		return nil, fmt.Errorf("meshfetch: page size %d must divide chunk size %d", cfg.PageSize, cfg.ChunkSize)
+	}
+
+	switch cfg.PageCache {
+	case "", PageCacheBypass, PageCacheDrop, PageCacheKeep:
+	default:
+		return nil, fmt.Errorf("meshfetch: unknown page cache mode %q", cfg.PageCache)
+	}
+
+	switch cfg.Persist {
+	case "", PersistAll, PersistShared:
+	default:
+		return nil, fmt.Errorf("meshfetch: unknown persist policy %q", cfg.Persist)
 	}
 
 	if cfg.MaxFills <= 0 || cfg.MaxServes <= 0 || cfg.Lookahead <= 0 || cfg.Attempts <= 0 ||
@@ -178,16 +225,32 @@ func New(cfg Config) (*Node, error) {
 		cfg.DataAddr = func(p cachemesh.PeerRef) string { return p.Addr }
 	}
 
+	log := cfg.Logger.With(slog.String("subsystem", "meshfetch"))
+	st := newStore(storeConfig{
+		chunkSize:    cfg.ChunkSize,
+		pageSize:     cfg.PageSize,
+		window:       cfg.FillPages,
+		maxFills:     cfg.MaxFills,
+		dir:          cfg.ChunkDir,
+		diskBudget:   cfg.DiskBytes,
+		hotBudget:    cfg.MemoryBytes,
+		pageCache:    cfg.PageCache,
+		persist:      cfg.Persist,
+		stallTimeout: cfg.StallTimeout,
+		onEvict:      cfg.Hooks.OnEvict,
+		logger:       log,
+	})
+
 	ctx, cancel := context.WithCancel(context.Background())
 	n := &Node{
 		cfg:    cfg,
 		mesh:   cfg.Mesh,
 		blobKS: cachemesh.MustKeyspace("gantry-blob", 0),
 		metaKS: metaKS,
-		store:  newStore(cfg.ChunkSize, cfg.CacheBytes, cfg.MaxFills, cfg.Hooks.OnEvict),
+		store:  st,
 		meta:   newMetaCache(4096),
 		client: cfg.Client,
-		log:    cfg.Logger.With(slog.String("subsystem", "meshfetch")),
+		log:    log,
 		serves: make(chan struct{}, cfg.MaxServes),
 		ctx:    ctx,
 		cancel: cancel,
@@ -202,7 +265,7 @@ func (n *Node) Close() {
 	n.store.close()
 }
 
-// Stats returns the chunk cache state.
+// Stats returns the chunk store state.
 func (n *Node) Stats() Stats { return n.store.stats() }
 
 // Register adds the chunk and metadata endpoints to mux.

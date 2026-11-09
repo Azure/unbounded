@@ -6,16 +6,23 @@ package config
 import (
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strconv"
 	"time"
 )
 
 // Cachemesh defaults.
 const (
-	DefaultCachemeshLeaseName       = "gantry-cachemesh"
-	DefaultCachemeshChunkSize       = 64 << 20
-	DefaultCachemeshChunkCacheBytes = 4 << 30
-	DefaultCachemeshMetadataTTL     = 5 * time.Minute
+	DefaultCachemeshLeaseName      = "gantry-cachemesh"
+	DefaultCachemeshChunkSize      = 64 << 20
+	DefaultCachemeshChunkDir       = "/var/lib/gantry/cachemesh"
+	DefaultCachemeshDiskCacheBytes = 20 << 30
+	DefaultCachemeshMemCacheBytes  = 256 << 20
+	DefaultCachemeshPageSize       = 1 << 20
+	DefaultCachemeshFillPages      = 4
+	DefaultCachemeshPageCache      = "bypass"
+	DefaultCachemeshPersist        = "all"
+	DefaultCachemeshMetadataTTL    = 5 * time.Minute
 
 	// DefaultCachemeshMaxNeighbors is gantry's data-plane fan-out. The
 	// cachemesh library defaults to 256, sized for 100k-member clusters.
@@ -26,11 +33,13 @@ const (
 	// a p50 of 91s against 104s with 256 (designs/gantry-cachemesh-benchmark.md).
 	DefaultCachemeshMaxNeighbors = 32
 
-	// MinCachemeshChunkSize and MaxCachemeshChunkSize bound chunk_size. Each
-	// chunk is held in memory while it is filled, so very large chunks make
-	// the in-flight budget coarse.
+	// MinCachemeshChunkSize and MaxCachemeshChunkSize bound chunk_size.
 	MinCachemeshChunkSize = 1 << 20
 	MaxCachemeshChunkSize = 1 << 30
+
+	// MinCachemeshPageSize bounds page_size from below; pages are the unit
+	// of O_DIRECT I/O, which needs 4KiB alignment.
+	MinCachemeshPageSize = 64 << 10
 
 	// MinCachemeshMetadataTTL matches cachemesh.MinTTL. It is repeated here
 	// so the config package does not import the routing library.
@@ -44,8 +53,9 @@ const (
 // With cachemesh enabled, blobs are split into ChunkSize chunks. Each chunk
 // is owned by one agent (the owner of its cachemesh partition), which pulls
 // it from the origin registry once; other agents fetch it hop by hop through
-// the cachemesh grid, and every hop may keep a copy in its in-memory chunk
-// cache. Tag and manifest metadata is cached separately with MetadataTTL.
+// the cachemesh grid, and every hop may keep a copy in its chunk store: chunk
+// files under ChunkDir, plus a small in-memory tier of hot pages. Tag and
+// manifest metadata is cached separately with MetadataTTL.
 // See designs/gantry-cachemesh.md.
 type CachemeshConfig struct {
 	// Enabled turns the cachemesh path on (GANTRY_CACHEMESH_ENABLED). The
@@ -98,12 +108,44 @@ type CachemeshConfig struct {
 	// evicting the cached chunks.
 	VerifyDigest bool `yaml:"verify_digest"`
 
-	// ChunkCacheBytes bounds all chunk memory in bytes: cached chunks plus
-	// chunks being filled, which are never evicted. When in-flight chunks
-	// alone reach the budget, peer requests that need a new fill get 429
-	// and local requests wait. The agent's memory limit must leave room
-	// for this budget plus normal agent overhead.
-	ChunkCacheBytes int64 `yaml:"chunk_cache_bytes"`
+	// ChunkDir holds chunk files. The agent removes everything in it at
+	// startup: chunks are not individually digest-verified, so files from
+	// an earlier run are never trusted.
+	ChunkDir string `yaml:"chunk_dir"`
+
+	// DiskCacheBytes bounds chunk files in ChunkDir, including chunks
+	// being written. Complete chunks are evicted least recently used
+	// first, chunks this agent owns last. Fills that find no room stream
+	// through memory without a disk copy. Zero disables the disk tier.
+	DiskCacheBytes int64 `yaml:"disk_cache_bytes"`
+
+	// MemoryCacheBytes bounds the hot page tier: pages read from disk by
+	// two or more concurrent readers that stay in memory for the next
+	// ones. Zero disables it. Total chunk memory is about this plus
+	// page_size * (fill_pages * max_concurrent_chunk_fills + one page per
+	// active reader).
+	MemoryCacheBytes int64 `yaml:"memory_cache_bytes"`
+
+	// PageSize is the unit of in-flight buffers, disk I/O, read
+	// coalescing, and the hot tier: a power of two between 64KiB and
+	// chunk_size.
+	PageSize int64 `yaml:"page_size"`
+
+	// FillPages is the number of in-flight pages each chunk fill holds in
+	// memory. Readers within this window get bytes from memory as they
+	// arrive; slower readers read from disk.
+	FillPages int `yaml:"fill_pages"`
+
+	// PageCache selects how chunk files use the kernel page cache:
+	// "bypass" (O_DIRECT, the default), "drop" (buffered I/O, then
+	// posix_fadvise DONTNEED), or "keep" (buffered, left to the kernel).
+	// Page cache counts toward the container's working set.
+	PageCache string `yaml:"page_cache"`
+
+	// Persist selects which chunks are written to disk: "all", or
+	// "shared" (only chunks this agent owns or serves to a peer; chunks
+	// only this agent consumes stream through memory).
+	Persist string `yaml:"persist"`
 
 	// MaxConcurrentChunkFills caps chunks this agent fetches from a peer or
 	// the origin at once. Peer requests over the cap get 429.
@@ -143,7 +185,13 @@ func defaultCachemeshConfig() CachemeshConfig {
 		MetadataTTL:              DefaultCachemeshMetadataTTL,
 		CacheTags:                true,
 		VerifyDigest:             true,
-		ChunkCacheBytes:          DefaultCachemeshChunkCacheBytes,
+		ChunkDir:                 DefaultCachemeshChunkDir,
+		DiskCacheBytes:           DefaultCachemeshDiskCacheBytes,
+		MemoryCacheBytes:         DefaultCachemeshMemCacheBytes,
+		PageSize:                 DefaultCachemeshPageSize,
+		FillPages:                DefaultCachemeshFillPages,
+		PageCache:                DefaultCachemeshPageCache,
+		Persist:                  DefaultCachemeshPersist,
 		MaxConcurrentChunkFills:  64,
 		MaxConcurrentChunkServes: 512,
 		Lookahead:                8,
@@ -218,7 +266,13 @@ func (c *Config) loadCachemeshEnv(env func(string) string) []error {
 	dur("CACHEMESH_METADATA_TTL", &m.MetadataTTL)
 	boolean("CACHEMESH_CACHE_TAGS", &m.CacheTags)
 	boolean("CACHEMESH_VERIFY_DIGEST", &m.VerifyDigest)
-	num("CACHEMESH_CHUNK_CACHE_BYTES", func(n int64) { m.ChunkCacheBytes = n })
+	str("CACHEMESH_CHUNK_DIR", &m.ChunkDir)
+	num("CACHEMESH_DISK_CACHE_BYTES", func(n int64) { m.DiskCacheBytes = n })
+	num("CACHEMESH_MEMORY_CACHE_BYTES", func(n int64) { m.MemoryCacheBytes = n })
+	num("CACHEMESH_PAGE_SIZE", func(n int64) { m.PageSize = n })
+	num("CACHEMESH_FILL_PAGES", setInt(&m.FillPages))
+	str("CACHEMESH_PAGE_CACHE", &m.PageCache)
+	str("CACHEMESH_PERSIST", &m.Persist)
 	num("CACHEMESH_MAX_CONCURRENT_CHUNK_FILLS", setInt(&m.MaxConcurrentChunkFills))
 	num("CACHEMESH_MAX_CONCURRENT_CHUNK_SERVES", setInt(&m.MaxConcurrentChunkServes))
 	num("CACHEMESH_LOOKAHEAD", setInt(&m.Lookahead))
@@ -278,8 +332,36 @@ func (c *Config) validateCachemesh() []error {
 		bad("metadata_ttl", "must be >= %v, got %v", MinCachemeshMetadataTTL, m.MetadataTTL)
 	}
 
-	if m.ChunkCacheBytes < 2*m.ChunkSize {
-		bad("chunk_cache_bytes", "must hold at least two chunks (%d), got %d", 2*m.ChunkSize, m.ChunkCacheBytes)
+	if m.DiskCacheBytes != 0 && m.DiskCacheBytes < 2*m.ChunkSize {
+		bad("disk_cache_bytes", "must be 0 (no disk tier) or hold at least two chunks (%d), got %d", 2*m.ChunkSize, m.DiskCacheBytes)
+	}
+
+	if m.DiskCacheBytes != 0 && !filepath.IsAbs(m.ChunkDir) {
+		bad("chunk_dir", "must be an absolute path when disk_cache_bytes is set, got %q", m.ChunkDir)
+	}
+
+	if m.MemoryCacheBytes < 0 {
+		bad("memory_cache_bytes", "must be >= 0, got %d", m.MemoryCacheBytes)
+	}
+
+	if m.PageSize < MinCachemeshPageSize || m.PageSize&(m.PageSize-1) != 0 || m.PageSize > m.ChunkSize {
+		bad("page_size", "must be a power of two between %d and chunk_size, got %d", MinCachemeshPageSize, m.PageSize)
+	}
+
+	if m.FillPages < 2 || m.FillPages > 256 {
+		bad("fill_pages", "must be between 2 and 256, got %d", m.FillPages)
+	}
+
+	switch m.PageCache {
+	case "bypass", "drop", "keep":
+	default:
+		bad("page_cache", "must be bypass, drop, or keep, got %q", m.PageCache)
+	}
+
+	switch m.Persist {
+	case "all", "shared":
+	default:
+		bad("persist", "must be all or shared, got %q", m.Persist)
 	}
 
 	if m.MaxConcurrentChunkFills < 1 {

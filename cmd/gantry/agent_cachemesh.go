@@ -50,9 +50,10 @@ type cachemeshAgent struct {
 const cachemeshMemoryLimitPercent = 90
 
 // setCachemeshMemoryLimit gives the Go runtime a soft memory limit below the
-// container limit unless GOMEMLIMIT is set. The chunk cache keeps gigabytes
-// live; without a limit the default GC target (twice the live heap) can
-// exceed the container limit before a collection runs.
+// container limit unless GOMEMLIMIT is set. Chunk data lives on disk, but
+// in-flight pages and the hot page tier churn hundreds of MiB of page
+// buffers; the soft limit makes the collector return them before the
+// container limit is reached.
 func setCachemeshMemoryLimit(logger *slog.Logger, getenv func(string) string, readFile func(string) ([]byte, error)) int64 {
 	if getenv("GOMEMLIMIT") != "" {
 		return 0
@@ -96,6 +97,15 @@ func cgroupMemoryLimit(readFile func(string) ([]byte, error)) int64 {
 	}
 
 	return 0
+}
+
+// chunkDir returns the chunk directory, or "" when the disk tier is off.
+func chunkDir(cm config.CachemeshConfig) string {
+	if cm.DiskCacheBytes == 0 {
+		return ""
+	}
+
+	return cm.ChunkDir
 }
 
 // cachemeshMemberID names this agent in the mesh: the Kubernetes node name,
@@ -180,7 +190,13 @@ func newCachemeshAgent(c *config.Config, origin ifaces.OriginPuller, reg *metric
 		Origin:       rangeOrigin,
 		Tags:         tagOrigin,
 		ChunkSize:    cm.ChunkSize,
-		CacheBytes:   cm.ChunkCacheBytes,
+		ChunkDir:     chunkDir(cm),
+		DiskBytes:    cm.DiskCacheBytes,
+		MemoryBytes:  cm.MemoryCacheBytes,
+		PageSize:     int(cm.PageSize),
+		FillPages:    cm.FillPages,
+		PageCache:    meshfetch.PageCacheMode(cm.PageCache),
+		Persist:      meshfetch.PersistPolicy(cm.Persist),
 		MaxFills:     cm.MaxConcurrentChunkFills,
 		MaxServes:    cm.MaxConcurrentChunkServes,
 		Lookahead:    cm.Lookahead,
@@ -208,7 +224,12 @@ func newCachemeshAgent(c *config.Config, origin ifaces.OriginPuller, reg *metric
 		slog.String("addr", addr),
 		slog.String("lease", c.CachemeshNamespace()+"/"+cm.LeaseName),
 		slog.Int64("chunk_size", cm.ChunkSize),
-		slog.Int64("chunk_cache_bytes", cm.ChunkCacheBytes),
+		slog.String("chunk_dir", cm.ChunkDir),
+		slog.Int64("disk_cache_bytes", cm.DiskCacheBytes),
+		slog.Int64("memory_cache_bytes", cm.MemoryCacheBytes),
+		slog.Int64("page_size", cm.PageSize),
+		slog.String("page_cache", cm.PageCache),
+		slog.String("persist", cm.Persist),
 		slog.Int("max_neighbors", cm.MaxNeighbors),
 		slog.Int("lookahead", cm.Lookahead),
 		slog.Bool("cache_tags", a.tags),
@@ -360,7 +381,7 @@ func newCachemeshMetrics(reg *metrics.Registry) *cachemeshMetrics {
 		}, []string{"outcome"}),
 		evicted: reg.NewCounter(sub, prometheus.CounterOpts{
 			Name: "gantry_cachemesh_chunk_evicted_bytes_total",
-			Help: "Bytes evicted from the in-memory chunk cache.",
+			Help: "Bytes evicted from the disk chunk store.",
 		}),
 		controlErrors: reg.NewCounter(sub, prometheus.CounterOpts{
 			Name: "gantry_cachemesh_control_errors_total",
@@ -436,13 +457,41 @@ func (m *cachemeshMetrics) registerGauges(reg *metrics.Registry, a *cachemeshAge
 		Help: "Data-plane neighbors of this agent in the cachemesh grid.",
 	}, func() float64 { return float64(len(a.mesh.Neighbors())) })
 	reg.NewGaugeFunc(sub, prometheus.GaugeOpts{
-		Name: "gantry_cachemesh_chunk_cache_bytes",
-		Help: "Bytes charged to the chunk cache budget: cached chunks plus fills in progress.",
-	}, func() float64 { return float64(a.node.Stats().Bytes) })
+		Name: "gantry_cachemesh_chunk_disk_bytes",
+		Help: "Bytes charged to the chunk disk budget: chunk files plus fills being written.",
+	}, func() float64 { return float64(a.node.Stats().DiskBytes) })
 	reg.NewGaugeFunc(sub, prometheus.GaugeOpts{
-		Name: "gantry_cachemesh_chunk_cache_chunks",
-		Help: "Chunks in the chunk cache, complete or in progress.",
+		Name: "gantry_cachemesh_chunk_store_chunks",
+		Help: "Chunks in the chunk store, complete or in progress.",
 	}, func() float64 { return float64(a.node.Stats().Chunks) })
+	reg.NewGaugeFunc(sub, prometheus.GaugeOpts{
+		Name: "gantry_cachemesh_page_memory_bytes",
+		Help: "Memory in chunk page buffers in use: in-flight fill pages, pages being sent, and the hot tier.",
+	}, func() float64 { return float64(a.node.Stats().PageBytes) })
+	reg.NewGaugeFunc(sub, prometheus.GaugeOpts{
+		Name: "gantry_cachemesh_hot_page_bytes",
+		Help: "Memory in the hot page tier.",
+	}, func() float64 { return float64(a.node.Stats().HotBytes) })
+	reg.NewCounterFunc(sub, prometheus.CounterOpts{
+		Name: "gantry_cachemesh_disk_page_reads_total",
+		Help: "Chunk pages read from disk.",
+	}, func() float64 { return float64(a.node.Stats().DiskReads) })
+	reg.NewCounterFunc(sub, prometheus.CounterOpts{
+		Name: "gantry_cachemesh_disk_page_writes_total",
+		Help: "Chunk pages written to disk.",
+	}, func() float64 { return float64(a.node.Stats().DiskWrites) })
+	reg.NewCounterFunc(sub, prometheus.CounterOpts{
+		Name: "gantry_cachemesh_disk_errors_total",
+		Help: "Failed chunk disk operations; the affected fills stream through memory.",
+	}, func() float64 { return float64(a.node.Stats().DiskErrors) })
+	reg.NewCounterFunc(sub, prometheus.CounterOpts{
+		Name: "gantry_cachemesh_shared_page_reads_total",
+		Help: "Page reads served by a concurrent reader's disk read or the hot tier instead of the disk.",
+	}, func() float64 { return float64(a.node.Stats().PageReadsShared) })
+	reg.NewCounterFunc(sub, prometheus.CounterOpts{
+		Name: "gantry_cachemesh_stream_fills_total",
+		Help: "Chunk fills not written to disk (stream-through).",
+	}, func() float64 { return float64(a.node.Stats().StreamFills) })
 	reg.NewGaugeFunc(sub, prometheus.GaugeOpts{
 		Name: "gantry_cachemesh_chunk_fills_inflight",
 		Help: "Chunk fills in progress.",

@@ -6,20 +6,18 @@ package meshfetch
 import (
 	"context"
 	"errors"
-	"io"
+	"log/slog"
 	"sync"
 	"sync/atomic"
-
-	"github.com/Azure/unbounded/internal/cachemesh"
+	"time"
 )
 
-// readStep bounds one read into a fill buffer, so readers of an in-progress
-// chunk see progress at least every readStep bytes (cut-through).
-const readStep = 1 << 20
-
 var (
-	errBusy   = errors.New("meshfetch: chunk budget exhausted")
+	errBusy   = errors.New("meshfetch: chunk fill limit reached")
 	errClosed = errors.New("meshfetch: node closed")
+	// errLost reports that a reader needs bytes the fill no longer holds:
+	// they were neither written to disk nor kept in memory.
+	errLost = errors.New("meshfetch: chunk bytes no longer available")
 )
 
 // chunkKey names one chunk of one blob.
@@ -48,232 +46,61 @@ func (k chunkKey) routeKey(buf []byte) []byte {
 	return append(buf, idx[:]...)
 }
 
-// fill is one chunk in memory, complete or being filled. Bytes buf[:n] are
-// immutable once published under mu, so readers copy them out without the
-// lock. One goroutine (the filler) writes buf[n:].
-type fill struct {
-	key   chunkKey
-	store *store
+// PersistPolicy selects which chunks are written to the chunk directory.
+type PersistPolicy string
 
-	// refs counts holders: the store map, the filler, and every reader.
-	// The buffer returns to the pool when it drops to zero.
-	refs atomic.Int32
+const (
+	// PersistAll writes every chunk to disk.
+	PersistAll PersistPolicy = "all"
+	// PersistShared writes only chunks this agent owns or serves to a
+	// peer. A chunk only this agent consumes streams through memory, with
+	// the fill paced by its slowest reader, and is never written.
+	PersistShared PersistPolicy = "shared"
+)
 
-	mu        sync.Mutex
-	wake      chan struct{}
-	buf       []byte
-	n         int
-	total     int64
-	ctype     string
-	metaKnown bool
-	done      bool
-	err       error
-	// upstream is the slot the fill reads from, for loop detection.
-	upstream cachemesh.Slot
-	// fromOrigin is set while the fill reads from the origin.
-	fromOrigin bool
-
-	// Guarded by store.mu.
-	prev, next *fill
-	inMap      bool
-	listed     bool
-	charge     int64
-	// owned marks a chunk this member filled as its owner. Owned chunks
-	// sit on their own LRU list and are evicted after the others, so an
-	// owner keeps serving them while transit copies churn.
-	owned bool
-}
-
-func (f *fill) release() {
-	if f.refs.Add(-1) == 0 {
-		f.store.recycle(f)
-	}
-}
-
-// broadcast wakes waiting readers. Caller holds f.mu.
-func (f *fill) broadcast() {
-	close(f.wake)
-	f.wake = make(chan struct{})
-}
-
-// setMeta records the blob size and content type and allocates the buffer.
-// It returns errMetaMismatch when an earlier attempt saw different values.
-func (f *fill) setMeta(total int64, ctype string, chunkLen int) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	if f.metaKnown {
-		if f.total != total || len(f.buf) != chunkLen {
-			return errMetaMismatch
-		}
-
-		return nil
-	}
-
-	f.buf = f.store.alloc(chunkLen)
-	f.total = total
-	f.ctype = ctype
-	f.metaKnown = true
-	f.broadcast()
-
-	return nil
-}
-
-var errMetaMismatch = errors.New("meshfetch: chunk size differs between sources")
-
-// progress returns the bytes filled so far and whether metadata is known.
-func (f *fill) progress() (int, bool) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	return f.n, f.metaKnown
-}
-
-// readFrom reads r into the buffer until the chunk is full. onRead runs
-// after every successful read (stall detection).
-func (f *fill) readFrom(r io.Reader, onRead func()) error {
-	f.mu.Lock()
-	n, buf := f.n, f.buf
-	f.mu.Unlock()
-
-	for n < len(buf) {
-		end := min(n+readStep, len(buf))
-
-		k, err := r.Read(buf[n:end])
-		if k > 0 {
-			n += k
-
-			f.mu.Lock()
-			f.n = n
-			f.broadcast()
-			f.mu.Unlock()
-
-			if onRead != nil {
-				onRead()
-			}
-		}
-
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				if n < len(buf) {
-					return io.ErrUnexpectedEOF
-				}
-
-				return nil
-			}
-
-			return err
-		}
-	}
-
-	return nil
-}
-
-// finish marks the fill complete (err == nil) or failed.
-func (f *fill) finish(err error) {
-	f.mu.Lock()
-	f.done = true
-	f.err = err
-	f.broadcast()
-	f.mu.Unlock()
-
-	f.store.finished(f, err)
-}
-
-// meta waits until the size is known or the fill fails.
-func (f *fill) meta(ctx context.Context) (total int64, ctype string, chunkLen int, err error) {
-	for {
-		f.mu.Lock()
-		if f.metaKnown {
-			total, ctype, chunkLen = f.total, f.ctype, len(f.buf)
-			f.mu.Unlock()
-
-			return total, ctype, chunkLen, nil
-		}
-
-		if f.done {
-			err = f.err
-			f.mu.Unlock()
-
-			return 0, "", 0, err
-		}
-
-		ch := f.wake
-		f.mu.Unlock()
-
-		select {
-		case <-ch:
-		case <-ctx.Done():
-			return 0, "", 0, ctx.Err()
-		}
-	}
-}
-
-// streamTo writes buf[off:] to w as it becomes available. It returns the
-// number of bytes written and the first error: the fill's, the writer's, or
-// ctx's.
-func (f *fill) streamTo(ctx context.Context, w io.Writer, off int) (int64, error) {
-	var written int64
-
-	for {
-		f.mu.Lock()
-
-		if f.metaKnown && off > len(f.buf) {
-			f.mu.Unlock()
-			return written, io.ErrShortBuffer
-		}
-
-		if f.n > off {
-			b := f.buf[off:f.n]
-			f.mu.Unlock()
-
-			k, err := w.Write(b)
-			written += int64(k)
-			off += k
-
-			if err != nil {
-				return written, err
-			}
-
-			continue
-		}
-
-		if f.metaKnown && off == len(f.buf) {
-			f.mu.Unlock()
-			return written, nil
-		}
-
-		if f.done {
-			err := f.err
-			f.mu.Unlock()
-
-			if err == nil {
-				err = io.ErrUnexpectedEOF
-			}
-
-			return written, err
-		}
-
-		ch := f.wake
-		f.mu.Unlock()
-
-		select {
-		case <-ch:
-		case <-ctx.Done():
-			return written, ctx.Err()
-		}
-	}
-}
-
-// store is the in-memory chunk cache: a map of fills plus LRU lists of
-// complete ones, under a byte budget that also covers fills in progress.
-// Chunks this member owns are kept on a separate list and evicted only
-// when no other complete chunk is left, or when they hold more than half
-// of the budget.
-type store struct {
+// storeConfig configures a store.
+type storeConfig struct {
 	chunkSize int64
-	budget    int64
-	maxFills  int
+	// pageSize is the unit of in-flight buffers, disk I/O, read
+	// coalescing, and the hot tier. It divides chunkSize.
+	pageSize int
+	// window is the number of in-flight pages a fill holds.
+	window int
+	// maxFills caps fills in progress.
+	maxFills int
+	// dir is the chunk directory; empty disables the disk tier.
+	dir string
+	// diskBudget bounds bytes in dir.
+	diskBudget int64
+	// hotBudget bounds the hot page tier in memory.
+	hotBudget int64
+	pageCache PageCacheMode
+	persist   PersistPolicy
+	// stallTimeout is how long a fill that is not written to disk waits
+	// for a reader before dropping it.
+	stallTimeout time.Duration
+	onEvict      func(bytes int64)
+	logger       *slog.Logger
+}
+
+// diskFaults injects disk errors in tests.
+type diskFaults struct {
+	create func() error
+	write  func(idx int) error
+	read   func(idx int) error
+}
+
+// store is the chunk store: a map of fills plus LRU lists of complete
+// chunks on disk, under a disk byte budget that also covers fills being
+// written. Chunks this member owns are kept on a separate list and
+// evicted only when no other complete chunk is left, or when they hold
+// more than half of the budget. Memory holds only in-flight pages of
+// fills, pages being sent, and the hot page tier.
+type store struct {
+	cfg   storeConfig
+	disk  *diskDir
+	pool  *pagePool
+	pages *pageCache
 
 	mu        sync.Mutex
 	m         map[chunkKey]*fill
@@ -284,33 +111,95 @@ type store struct {
 	inflight  int
 	space     chan struct{}
 	closed    bool
+	// diskFullUntil pauses disk writes after the file system ran out of
+	// space.
+	diskFullUntil time.Time
 
-	// poolMu guards pool. It is taken under store.mu and fill.mu, never
-	// the other way around.
-	poolMu  sync.Mutex
-	pool    [][]byte
-	onEvict func(bytes int64)
+	diskWrites  atomic.Int64
+	diskReads   atomic.Int64
+	diskErrors  atomic.Int64
+	streamFills atomic.Int64
+
+	faults *diskFaults
 }
 
-func newStore(chunkSize, budget int64, maxFills int, onEvict func(int64)) *store {
+// diskFullBackoff is how long new fills skip the disk after ENOSPC.
+const diskFullBackoff = 10 * time.Second
+
+func newStore(cfg storeConfig) *store {
+	if cfg.pageSize <= 0 || int64(cfg.pageSize) > cfg.chunkSize {
+		cfg.pageSize = int(min(cfg.chunkSize, 1<<20))
+	}
+
+	if cfg.window < 2 {
+		cfg.window = 4
+	}
+
+	if cfg.stallTimeout <= 0 {
+		cfg.stallTimeout = 30 * time.Second
+	}
+
+	if cfg.persist == "" {
+		cfg.persist = PersistAll
+	}
+
+	if cfg.pageCache == "" {
+		cfg.pageCache = PageCacheBypass
+	}
+
+	if cfg.logger == nil {
+		cfg.logger = slog.Default()
+	}
+
+	// Keep up to 64MiB of idle page buffers so steady churn does not
+	// allocate.
+	pool := newPagePool(cfg.pageSize, max(2*cfg.window, (64<<20)/cfg.pageSize))
+
 	s := &store{
-		chunkSize: chunkSize,
-		budget:    budget,
-		maxFills:  maxFills,
-		m:         make(map[chunkKey]*fill),
-		space:     make(chan struct{}),
-		onEvict:   onEvict,
+		cfg:   cfg,
+		pool:  pool,
+		pages: newPageCache(pool, cfg.hotBudget),
+		m:     make(map[chunkKey]*fill),
+		space: make(chan struct{}),
 	}
 	s.head.next = &s.head
 	s.head.prev = &s.head
 	s.ownedHead.next = &s.ownedHead
 	s.ownedHead.prev = &s.ownedHead
 
+	if cfg.dir != "" && cfg.diskBudget > 0 {
+		d, err := openDiskDir(cfg.dir, cfg.pageCache)
+		if err != nil {
+			cfg.logger.Warn("cachemesh chunk dir unusable; chunks stream through memory only",
+				slog.String("dir", cfg.dir), slog.Any("err", err))
+		} else {
+			s.disk = d
+		}
+	}
+
 	return s
 }
 
-// get returns a referenced fill for k, or nil.
-func (s *store) get(k chunkKey) *fill {
+// direct reports whether O_DIRECT is possible: pages must be aligned.
+func (s *store) direct() bool {
+	return s.cfg.pageCache == PageCacheBypass && s.cfg.pageSize%dioAlign == 0
+}
+
+func (s *store) readFile(cf *chunkFile, buf []byte, off int64, n int) error {
+	s.diskReads.Add(1)
+
+	if s.faults != nil && s.faults.read != nil {
+		if err := s.faults.read(int(off / int64(s.cfg.pageSize))); err != nil {
+			return err
+		}
+	}
+
+	return cf.readAt(buf, off, n)
+}
+
+// get returns a reader of the fill for k at byte off, or nil when there is
+// none that can serve from off.
+func (s *store) get(k chunkKey, off int) *reader {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -319,22 +208,41 @@ func (s *store) get(k chunkKey) *fill {
 		return nil
 	}
 
-	f.refs.Add(1)
+	f.mu.Lock()
+	ok := f.joinable(off)
 
+	var r *reader
+	if ok {
+		r = f.newReaderLocked(off)
+	}
+	f.mu.Unlock()
+
+	if !ok {
+		return nil
+	}
+
+	f.refs.Add(1)
+	s.touch(f)
+
+	return r
+}
+
+func (s *store) touch(f *fill) {
 	if f.listed {
 		s.unlink(f)
 		s.pushFront(f)
 	}
-
-	return f
 }
 
-// acquire returns the fill for k: an existing one (created == false) or a
-// new one charged to the budget (created == true). A new fill holds three
-// references: the map, the filler, and the caller. With wait false it
-// returns errBusy when the budget or fill cap is exhausted; with wait true
-// it blocks until space frees or ctx ends.
-func (s *store) acquire(ctx context.Context, k chunkKey, wait bool) (f *fill, created bool, err error) {
+// acquire returns a reader at byte off of the fill for k: an existing one
+// that can serve from off (created == false) or a new one (created ==
+// true). A new fill holds three references: the map, the filler, and the
+// returned reader. An existing fill that has dropped bytes before off is
+// detached from the map and replaced. shared marks a request from a peer:
+// under PersistShared the chunk is then written to disk. With wait false
+// acquire returns errBusy when the fill cap is reached; with wait true it
+// blocks until a fill ends or ctx ends.
+func (s *store) acquire(ctx context.Context, k chunkKey, off int, wait, shared bool) (r *reader, created bool, err error) {
 	for {
 		s.mu.Lock()
 
@@ -343,29 +251,39 @@ func (s *store) acquire(ctx context.Context, k chunkKey, wait bool) (f *fill, cr
 			return nil, false, errClosed
 		}
 
-		if f = s.m[k]; f != nil {
-			f.refs.Add(1)
+		if f := s.m[k]; f != nil {
+			f.mu.Lock()
+			if f.joinable(off) {
+				r = f.newReaderLocked(off)
+			}
+			f.mu.Unlock()
 
-			if f.listed {
-				s.unlink(f)
-				s.pushFront(f)
+			if r != nil {
+				f.refs.Add(1)
+
+				if shared {
+					f.share()
+				}
+
+				s.touch(f)
+				s.mu.Unlock()
+
+				if shared {
+					f.startDisk()
+				}
+
+				return r, false, nil
 			}
 
-			s.mu.Unlock()
-
-			return f, false, nil
+			s.detachLocked(f)
 		}
 
-		if s.inflight < s.maxFills && s.makeRoom(s.chunkSize) {
-			f = &fill{key: k, store: s, wake: make(chan struct{}), total: -1, charge: s.chunkSize, upstream: noSlot}
-			f.refs.Store(3)
-			f.inMap = true
-			s.m[k] = f
-			s.used += f.charge
-			s.inflight++
+		if s.inflight < s.cfg.maxFills {
+			f := s.newFillLocked(k, shared)
+			r = f.newReader(off)
 			s.mu.Unlock()
 
-			return f, true, nil
+			return r, true, nil
 		}
 
 		ch := s.space
@@ -383,13 +301,49 @@ func (s *store) acquire(ctx context.Context, k chunkKey, wait bool) (f *fill, cr
 	}
 }
 
+func (s *store) newFillLocked(k chunkKey, shared bool) *fill {
+	f := &fill{key: k, store: s, wake: make(chan struct{}), total: -1, upstream: noSlot}
+	f.refs.Store(3)
+	f.inMap = true
+	s.m[k] = f
+	s.inflight++
+
+	if s.cfg.persist == PersistAll || shared {
+		s.reserveLocked(f)
+	}
+
+	if !f.wantDisk.Load() {
+		s.streamFills.Add(1)
+	}
+
+	return f
+}
+
+// reserveLocked charges a full chunk of disk to f when the disk tier has
+// room, so f is written to disk once its size is known. Caller holds s.mu.
+func (s *store) reserveLocked(f *fill) bool {
+	if f.wantDisk.Load() {
+		return true
+	}
+
+	if s.disk == nil || time.Now().Before(s.diskFullUntil) || !s.makeRoom(s.cfg.chunkSize) {
+		return false
+	}
+
+	f.wantDisk.Store(true)
+	f.charge = s.cfg.chunkSize
+	s.used += f.charge
+
+	return true
+}
+
 // makeRoom evicts least recently used complete chunks until n more bytes
 // fit: other chunks first, owned chunks once no other one is left or they
 // exceed half of the budget. Caller holds s.mu.
 func (s *store) makeRoom(n int64) bool {
-	for s.used+n > s.budget {
+	for s.used+n > s.cfg.diskBudget {
 		victim := s.head.prev
-		if victim == &s.head || 2*s.ownedUsed > s.budget {
+		if victim == &s.head || 2*s.ownedUsed > s.cfg.diskBudget {
 			if o := s.ownedHead.prev; o != &s.ownedHead {
 				victim = o
 			}
@@ -406,35 +360,69 @@ func (s *store) makeRoom(n int64) bool {
 }
 
 // markOwned records that f is filled by this member as the chunk's owner.
+// Owned chunks are always written to disk when the disk tier has room.
 func (s *store) markOwned(f *fill) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	f.owned = true
+	reserved := s.reserveLocked(f)
+	s.mu.Unlock()
+
+	if reserved {
+		f.startDisk()
+	}
 }
 
+// evictLocked drops a complete chunk. Caller holds s.mu.
 func (s *store) evictLocked(f *fill) {
-	if f.listed {
-		s.unlink(f)
+	charge := f.charge
+	s.detachLocked(f)
+
+	if s.cfg.onEvict != nil && charge > 0 {
+		s.cfg.onEvict(charge)
+	}
+}
+
+// detachLocked removes f from the map and the LRU lists, returns its disk
+// charge, and unlinks its file. Readers holding f keep reading what it has.
+// Caller holds s.mu.
+func (s *store) detachLocked(f *fill) {
+	if !f.inMap {
+		return
 	}
 
-	if f.inMap {
-		delete(s.m, f.key)
-		f.inMap = false
-		s.used -= f.charge
+	if f.listed {
+		s.unlink(f)
 
 		if f.owned {
 			s.ownedUsed -= f.charge
 		}
-
-		if s.onEvict != nil {
-			s.onEvict(f.charge)
-		}
-
-		f.release()
 	}
 
+	delete(s.m, f.key)
+	f.inMap = false
+	s.used -= f.charge
+	f.charge = 0
+
+	f.mu.Lock()
+	f.detached = true
+	cf := f.file
+	f.mu.Unlock()
+
+	if cf != nil {
+		cf.remove()
+	}
+
+	s.pages.purge(f)
 	s.signalSpace()
+	f.release()
+}
+
+// detach drops f from the map if it is still there.
+func (s *store) detach(f *fill) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.detachLocked(f)
 }
 
 func (s *store) signalSpace() {
@@ -442,37 +430,57 @@ func (s *store) signalSpace() {
 	s.space = make(chan struct{})
 }
 
-// finished moves a complete fill to the LRU list or drops a failed one.
+// finished lists a complete fill that is on disk as a cached chunk, and
+// drops a failed fill or one that only streamed through memory.
 func (s *store) finished(f *fill, err error) {
+	f.mu.Lock()
+	onDisk := f.file != nil && !f.diskFailed
+	size := f.diskSize
+	f.mu.Unlock()
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	s.inflight--
 
 	if f.inMap {
-		// Charge the real size: short final chunks and small manifests
-		// do not hold a full chunk.
-		if c := int64(cap(f.buf)); err == nil && c < f.charge {
-			s.used -= f.charge - c
-			f.charge = c
-		}
-
-		if err != nil {
-			delete(s.m, f.key)
-			f.inMap = false
-			s.used -= f.charge
-			f.release()
+		if err != nil || !onDisk {
+			s.detachLocked(f)
 		} else {
+			// Charge the real size: short final chunks and small
+			// manifests do not hold a full chunk.
+			if size < f.charge {
+				s.used -= f.charge - size
+				f.charge = size
+			}
+
 			if f.owned {
 				s.ownedUsed += f.charge
 			}
 
 			s.pushFront(f)
+			s.makeRoom(0)
 		}
 	}
 
-	s.makeRoom(0)
 	s.signalSpace()
+}
+
+// diskFailed records a failed disk operation. A full disk pauses disk
+// writes for new fills for a while.
+func (s *store) diskFailed(err error) {
+	s.diskErrors.Add(1)
+
+	full := errors.Is(err, errDiskFull)
+
+	s.mu.Lock()
+	if full {
+		s.diskFullUntil = time.Now().Add(diskFullBackoff)
+	}
+	s.mu.Unlock()
+
+	s.cfg.logger.Warn("cachemesh chunk disk error; streaming through memory",
+		slog.Bool("disk_full", full), slog.Any("err", err))
 }
 
 // evictDigest drops every cached chunk of digest d.
@@ -508,47 +516,6 @@ func (s *store) unlink(f *fill) {
 	f.listed = false
 }
 
-// alloc returns a buffer of length n, reusing a pooled full-size chunk
-// buffer when n is the chunk size.
-func (s *store) alloc(n int) []byte {
-	if int64(n) != s.chunkSize {
-		return make([]byte, n)
-	}
-
-	s.poolMu.Lock()
-	if k := len(s.pool); k > 0 {
-		b := s.pool[k-1]
-		s.pool[k-1] = nil
-		s.pool = s.pool[:k-1]
-		s.poolMu.Unlock()
-
-		return b[:n]
-	}
-	s.poolMu.Unlock()
-
-	return make([]byte, n)
-}
-
-// recycle returns f's buffer to the pool once nothing references it.
-func (s *store) recycle(f *fill) {
-	f.mu.Lock()
-	b := f.buf
-	f.buf = nil
-	f.mu.Unlock()
-
-	if int64(cap(b)) != s.chunkSize {
-		return
-	}
-
-	s.poolMu.Lock()
-	defer s.poolMu.Unlock()
-
-	// Keep at most the budget's worth of idle buffers.
-	if int64(len(s.pool)+1)*s.chunkSize <= s.budget {
-		s.pool = append(s.pool, b[:cap(b)])
-	}
-}
-
 // close fails waiters and drops idle buffers.
 func (s *store) close() {
 	s.mu.Lock()
@@ -556,31 +523,52 @@ func (s *store) close() {
 
 	s.closed = true
 	s.signalSpace()
-
-	s.poolMu.Lock()
-	s.pool = nil
-	s.poolMu.Unlock()
+	s.pool.drain()
 }
 
-// Stats is a point-in-time view of the chunk cache.
+// Stats is a point-in-time view of the chunk store.
 type Stats struct {
-	// Bytes charged to the budget: cached chunks plus fills in progress.
-	Bytes int64
-	// Chunks in the cache, complete or in progress.
+	// DiskBytes is charged to the disk budget: chunks on disk plus fills
+	// being written.
+	DiskBytes int64
+	// Chunks in the store, complete or in progress.
 	Chunks int
 	// Inflight is the number of fills in progress.
 	Inflight int
-	// PooledBuffers is the number of idle chunk buffers kept for reuse.
-	PooledBuffers int
+	// PageBytes is memory in page buffers in use: in-flight fill pages,
+	// pages being sent, and the hot tier.
+	PageBytes int64
+	// HotBytes is memory in the hot page tier.
+	HotBytes int64
+	// IdlePageBytes is memory in idle pooled page buffers.
+	IdlePageBytes int64
+	// DiskReads and DiskWrites count page reads and writes.
+	DiskReads  int64
+	DiskWrites int64
+	// DiskErrors counts failed disk operations.
+	DiskErrors int64
+	// PageReadsShared counts page reads served by another reader's disk
+	// read or by the hot tier.
+	PageReadsShared int64
+	// StreamFills counts fills not written to disk.
+	StreamFills int64
 }
 
 func (s *store) stats() Stats {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	st := Stats{DiskBytes: s.used, Chunks: len(s.m), Inflight: s.inflight}
+	s.mu.Unlock()
 
-	s.poolMu.Lock()
-	pooled := len(s.pool)
-	s.poolMu.Unlock()
+	live, idle := s.pool.stats()
+	ps := alignUp(int64(s.cfg.pageSize))
+	st.PageBytes = int64(live) * ps
+	st.IdlePageBytes = int64(idle) * ps
+	st.HotBytes = s.pages.hotBytes()
+	st.DiskReads = s.diskReads.Load()
+	st.DiskWrites = s.diskWrites.Load()
+	st.DiskErrors = s.diskErrors.Load()
+	st.PageReadsShared = s.pages.hits.Load()
+	st.StreamFills = s.streamFills.Load()
 
-	return Stats{Bytes: s.used, Chunks: len(s.m), Inflight: s.inflight, PooledBuffers: pooled}
+	return st
 }

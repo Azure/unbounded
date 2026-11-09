@@ -103,6 +103,15 @@ func (r *Registry) NewCounterVec(subsystem string, opts prometheus.CounterOpts, 
 	return c
 }
 
+// NewCounterFunc registers a CounterFunc and records its ownership.
+func (r *Registry) NewCounterFunc(subsystem string, opts prometheus.CounterOpts, f func() float64) prometheus.CounterFunc {
+	c := prometheus.NewCounterFunc(opts, f)
+	r.record(subsystem, opts.Name)
+	r.reg.MustRegister(c)
+
+	return c
+}
+
 // NewGauge registers a Gauge and records its ownership.
 func (r *Registry) NewGauge(subsystem string, opts prometheus.GaugeOpts) prometheus.Gauge {
 	g := prometheus.NewGauge(opts)

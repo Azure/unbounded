@@ -231,7 +231,7 @@ func TestFetchBlobDeclinesBeforeHeaders(t *testing.T) {
 	}
 
 	n, err := New(Config{
-		Mesh: m, Origin: c.origin, ChunkSize: 1 << 16, CacheBytes: 1 << 20, MaxFills: 1, MaxServes: 1,
+		Mesh: m, Origin: c.origin, ChunkSize: 1 << 16, MaxFills: 1, MaxServes: 1,
 		Lookahead: 1, ChunkTimeout: time.Second, StallTimeout: time.Second, Attempts: 1,
 	})
 	if err != nil {
@@ -318,8 +318,8 @@ func TestFetchBlobVerifyFailureEvicts(t *testing.T) {
 
 	for _, n := range c.nodes[:1] {
 		for i := range int64(3) {
-			if f := n.node.store.get(chunkKey{digest: d.String(), index: i}); f != nil {
-				f.release()
+			if r := n.node.store.get(chunkKey{digest: d.String(), index: i}, 0); r != nil {
+				r.close()
 				t.Fatalf("%s still caches chunk %d of a bad blob", n.id, i)
 			}
 		}
@@ -586,13 +586,13 @@ func TestOwnerPeekStartsOneOriginFill(t *testing.T) {
 	}
 
 	// The owner keeps the chunk on its owned list.
-	if f := owner.node.store.get(req.key); f == nil {
+	if r := owner.node.store.get(req.key, 0); r == nil {
 		t.Fatal("owner does not cache chunk 1")
 	} else {
 		owner.node.store.mu.Lock()
-		owned := f.owned
+		owned := r.f.owned
 		owner.node.store.mu.Unlock()
-		f.release()
+		r.close()
 
 		if !owned {
 			t.Fatal("owner's chunk 1 is not marked owned")

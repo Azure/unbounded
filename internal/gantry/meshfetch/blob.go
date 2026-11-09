@@ -69,18 +69,18 @@ func (n *Node) FetchBlob(ctx context.Context, w io.Writer, ref ifaces.OriginRef,
 
 	c0 := ref.Offset / cs
 
-	f0, err := n.obtainLocal(ctx, mk(c0))
+	r0, err := n.obtainLocal(ctx, mk(c0), int(ref.Offset-c0*cs))
 	if err != nil {
 		return false, 0, nil
 	}
 
 	mctx, mcancel := context.WithTimeout(ctx, n.cfg.ChunkTimeout)
-	total, ctype, _, err := f0.meta(mctx)
+	total, ctype, _, err := r0.f.meta(mctx)
 
 	mcancel()
 
 	if err != nil || ref.Offset > total || (ref.Offset == total && total > 0) {
-		f0.release()
+		r0.close()
 		return false, 0, nil
 	}
 
@@ -107,7 +107,7 @@ func (n *Node) FetchBlob(ctx context.Context, w io.Writer, ref ifaces.OriginRef,
 		out = vw
 	}
 
-	err = n.streamChunks(ctx, out, f0, c0, last, ref.Offset-c0*cs, mk)
+	err = n.streamChunks(ctx, out, r0, c0, last, mk)
 
 	if err == nil && vw != nil {
 		if err = vw.finish(ref.Digest.Hex()); errors.Is(err, errVerify) {
@@ -132,14 +132,13 @@ func (n *Node) FetchBlob(ctx context.Context, w io.Writer, ref ifaces.OriginRef,
 }
 
 type pending struct {
-	f   *fill
+	r   *reader
 	err error
 }
 
-// streamChunks writes chunks c0..last to w in order, starting at byte
-// within of c0, while a producer keeps up to Lookahead later chunks in
-// flight.
-func (n *Node) streamChunks(ctx context.Context, w io.Writer, f0 *fill, c0, last, within int64, mk func(int64) chunkReq) error {
+// streamChunks writes chunks c0..last to w in order, starting with reader
+// r0 of c0, while a producer keeps up to Lookahead later chunks in flight.
+func (n *Node) streamChunks(ctx context.Context, w io.Writer, r0 *reader, c0, last int64, mk func(int64) chunkReq) error {
 	pctx, pcancel := context.WithCancel(ctx)
 	ch := make(chan pending, n.cfg.Lookahead)
 
@@ -147,13 +146,13 @@ func (n *Node) streamChunks(ctx context.Context, w io.Writer, f0 *fill, c0, last
 		defer close(ch)
 
 		for i := c0 + 1; i <= last; i++ {
-			f, err := n.obtainLocal(pctx, mk(i))
+			r, err := n.obtainLocal(pctx, mk(i), 0)
 
 			select {
-			case ch <- pending{f: f, err: err}:
+			case ch <- pending{r: r, err: err}:
 			case <-pctx.Done():
-				if f != nil {
-					f.release()
+				if r != nil {
+					r.close()
 				}
 
 				return
@@ -169,24 +168,22 @@ func (n *Node) streamChunks(ctx context.Context, w io.Writer, f0 *fill, c0, last
 		pcancel()
 
 		for p := range ch {
-			if p.f != nil {
-				p.f.release()
+			if p.r != nil {
+				p.r.close()
 			}
 		}
 	}()
 
-	cur := f0
+	cur := r0
 
 	for idx := c0; ; idx++ {
-		if err := n.copyChunk(ctx, w, cur, mk(idx), within); err != nil {
+		if err := n.copyChunk(ctx, w, cur, mk(idx)); err != nil {
 			return err
 		}
 
 		if idx == last {
 			return nil
 		}
-
-		within = 0
 
 		select {
 		case p, ok := <-ch:
@@ -198,22 +195,25 @@ func (n *Node) streamChunks(ctx context.Context, w io.Writer, f0 *fill, c0, last
 				return p.err
 			}
 
-			cur = p.f
+			cur = p.r
 		case <-ctx.Done():
 			return ctx.Err()
 		}
 	}
 }
 
-// copyChunk writes chunk f from byte pos to w. When the fill fails it
-// starts a new fill (which routes afresh) and continues where it stopped.
-// It releases f and any replacement.
-func (n *Node) copyChunk(ctx context.Context, w io.Writer, f *fill, req chunkReq, pos int64) error {
+// copyChunk writes the chunk from r's position to w. When the fill fails
+// or no longer holds the bytes the reader needs, it obtains a new reader
+// (which may start a new fill that routes afresh) and continues where it
+// stopped. It closes r and any replacement.
+func (n *Node) copyChunk(ctx context.Context, w io.Writer, r *reader, req chunkReq) error {
 	for attempt := 1; ; attempt++ {
-		k, err := f.streamTo(ctx, w, int(pos))
-		f.release()
+		r.f.mu.Lock()
+		pos := r.pos
+		r.f.mu.Unlock()
 
-		pos += k
+		k, err := r.streamTo(ctx, w)
+		r.close()
 
 		if err == nil {
 			return nil
@@ -223,21 +223,21 @@ func (n *Node) copyChunk(ctx context.Context, w io.Writer, f *fill, req chunkReq
 			return err
 		}
 
-		f, err = n.obtainLocal(ctx, req)
+		r, err = n.obtainLocal(ctx, req, pos+int(k))
 		if err != nil {
 			return err
 		}
 	}
 }
 
-// obtainLocal returns the fill for a chunk this agent needs.
-func (n *Node) obtainLocal(ctx context.Context, req chunkReq) (*fill, error) {
+// obtainLocal returns a reader at byte off of a chunk this agent needs.
+func (n *Node) obtainLocal(ctx context.Context, req chunkReq, off int) (*reader, error) {
 	key := req.key.routeKey(make([]byte, 0, 96))
 	decide := func() (cachemesh.Decision, error) {
 		return n.mesh.Route(n.blobKS, key), nil
 	}
 
-	return n.obtain(ctx, req, decide, "local", noSlot)
+	return n.obtain(ctx, req, off, decide, "local", noSlot)
 }
 
 type countWriter struct {
