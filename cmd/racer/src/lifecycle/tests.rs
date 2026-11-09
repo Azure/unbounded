@@ -876,3 +876,24 @@ fn driver_preserves_ready_value_and_does_not_wait() {
         );
     }
 }
+
+/// A repeated failure from an expired teardown scope must not wake every
+/// subscriber again; otherwise each poll rewakes all lanes and cores spin.
+#[test]
+fn repeated_failure_does_not_rewake_subscribers() {
+    let control = Control::<Error>::new(1, 1, false);
+    let counter = Arc::new(DriveWakeCounter::default());
+    control.subscribe(&Waker::from(counter.clone()));
+    control.fail(Error::DeadlineExceeded);
+    control.request_stop(StopReason::Signal);
+    assert_eq!(counter.count(), 2);
+    for _ in 0..100 {
+        control.fail(Error::DeadlineExceeded);
+        control.set_phase(Phase::Drain);
+        control.request_stop(StopReason::Signal);
+    }
+    assert_eq!(counter.count(), 2, "unchanged state must not wake");
+    control.set_phase(Phase::Shutdown);
+    assert_eq!(counter.count(), 3);
+    assert_eq!(control.result(), Err(Error::DeadlineExceeded));
+}

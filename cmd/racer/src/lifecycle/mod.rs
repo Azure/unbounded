@@ -575,21 +575,29 @@ impl<E: Copy + PartialEq + From<Error>> Control<E> {
     /// Record a stop request (the first reason is kept) and begin draining.
     fn request_stop(&self, reason: StopReason) {
         let mut state = self.lock();
+        let changed = state.stop.is_none() || state.phase < Phase::Drain;
         state.stop.get_or_insert(reason);
         state.phase = state.phase.max(Phase::Drain);
         self.stopping.store(true, Ordering::Release);
         drop(state);
-        self.notify();
+        // Repeated requests change nothing; waking every subscriber again
+        // would make all lanes spin while they re-request the same stop.
+        if changed {
+            self.notify();
+        }
     }
 
     /// Advance the lifecycle request without allowing it to move backward.
     fn set_phase(&self, phase: Phase) {
         let mut state = self.lock();
+        let changed = state.phase < phase;
         state.phase = state.phase.max(phase);
         self.stopping
             .store(state.phase != Phase::Running, Ordering::Release);
         drop(state);
-        self.notify();
+        if changed {
+            self.notify();
+        }
     }
 
     /// Retain the first error and notify all threads to begin draining.
@@ -612,11 +620,17 @@ impl<E: Copy + PartialEq + From<Error>> Control<E> {
                 return;
             }
         }
+        // An expired scope reports the same error on every poll. Only a
+        // real state change may wake subscribers, or every wake would wake
+        // every lane again and all cores would spin until teardown ends.
+        let changed = state.error.is_none() || state.phase < Phase::Drain;
         state.error.get_or_insert(error);
         state.phase = state.phase.max(Phase::Drain);
         self.stopping.store(true, Ordering::Release);
         drop(state);
-        self.notify();
+        if changed {
+            self.notify();
+        }
     }
 
     /// Announce that a lane has closed its helper submissions.
