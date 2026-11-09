@@ -1260,7 +1260,7 @@ func (in *Interner) Delta(encoded []byte) (*Delta, error) {
 }
 
 // FIFO is a bounded map that evicts the oldest insertion. It backs the
-// simulation-wide caches (Interner and the node package's Shared). It is not
+// simulation-wide caches (Interner and control.Shared). It is not
 // safe for concurrent use.
 type FIFO[K comparable, V any] struct {
 	m     map[K]V

@@ -10,7 +10,7 @@
 // followed by a kind-specific body. Deltas and snapshots are opaque byte
 // strings produced by the view package.
 //
-// Layout (all integers per package codec):
+// Layout (all integers per the view package encoding):
 //
 //	u8      format version (FormatVersion)
 //	u8      kind

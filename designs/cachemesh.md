@@ -74,21 +74,21 @@ binary codec with fuzz tests instead.
           |                                                                     |
  Route ---+--> atomic.Pointer[route.State] --> view, health, epoch (lock-free)   |
  Forward  |                                                                     |
- Observe -+--> health.Tracker (atomics)                                         |
+ Observe -+--> route.HealthTracker (atomics)                                         |
           |                                                                     |
- ServeControl --> inbox --> node.Node (single goroutine, deterministic) --> outbox --> ControlTransport
-          |                    |  elect.Elector --> LeaseOp --> kubelease.Store  |
-          |                    |  leader.Leader (when elected) --> deltas         |
+ ServeControl --> inbox --> control.Node (single goroutine, deterministic) --> outbox --> ControlTransport
+          |                    |  control.Elector --> LeaseOp --> kubelease.Store  |
+          |                    |  control.Leader (when elected) --> deltas         |
           +---------------------------------------------------------------------+
 ```
 
 The control plane is a deterministic, single-threaded state machine
-(`node.Node`) with no I/O, no goroutines, no wall clock, and no global
+(`control.Node`) with no I/O, no goroutines, no wall clock, and no global
 randomness. Everything it needs comes in through method arguments (time,
 messages, lease results, a seeded random source) and everything it does comes
 out through an outbox. `cachemesh.Mesh` is a thin concurrent runtime around it.
 The deterministic simulation test suite (`internal/dst`) drives thousands of
-`node.Node` instances directly on a simulated clock and network.
+`control.Node` instances directly on a simulated clock and network.
 
 Rules every package under `internal/cachemesh` follows so that simulation is
 deterministic:
@@ -107,39 +107,32 @@ deterministic:
 
 | Package | Purpose | Imports |
 |---|---|---|
-| `internal/cachemesh` | Public API (`Mesh`, `Config`, aliases of route types), concurrent runtime | all internal |
-| `internal/cachemesh/kubelease` | `elect.Store` over client-go `coordination/v1` Leases | `internal/elect` |
+| `internal/cachemesh` | Public API (`Mesh`, `Config`, aliases of internal types), concurrent runtime | `control`, `route`, `view` |
+| `internal/cachemesh/kubelease` | `control.Store` over client-go `coordination/v1` Leases | `internal/control` |
 | `internal/cachemesh/memtransport` | In-process `ControlTransport` and `LeaseStore` for tests and examples | `internal/cachemesh` |
-| `internal/cachemesh/internal/hashing` | Key hashing, mixing, rendezvous scores | `zeebo/xxh3` |
-| `internal/cachemesh/internal/topology` | Grid shapes, cells, neighbor cells, next-hop cells | `hashing` |
-| `internal/cachemesh/internal/placement` | Partition table (chunked copy-on-write), leader rebalancer | `hashing` |
-| `internal/cachemesh/internal/view` | Immutable membership view, deltas, apply, validation, digests, snapshots, delta log, interning | `hashing`, `topology`, `placement` |
-| `internal/cachemesh/internal/epoch` | Rolling cluster epoch tracker, stamps | none |
-| `internal/cachemesh/internal/health` | Per-neighbor breakers, outlier detection, peak-EWMA, hedge budget | none |
-| `internal/cachemesh/internal/route` | Hot-path routing state, `Decision`, `Header` | `view`, `health`, `epoch`, `topology`, `placement`, `hashing` |
-| `internal/cachemesh/internal/wire` | Control messages and binary codec | `view` |
-| `internal/cachemesh/internal/elect` | Lease election state machine (candidates, lottery, fencing) | `hashing` |
-| `internal/cachemesh/internal/leader` | Leader logic: admission, suspicion, removal, rebalance, cells, epochs | `view`, `placement`, `topology` |
-| `internal/cachemesh/internal/node` | Per-member control-plane state machine | all of the above |
-| `internal/cachemesh/internal/dst` | Deterministic simulator and the DST suite | `node` and below |
+| `internal/cachemesh/internal/view` | Immutable membership view, deltas, apply, validation, digests, snapshots, delta log, interning; the grid (shapes, cells, next hops, `Choose`, cell assignment), the partition `Table` (chunked copy-on-write), hashing (key hashing, mixing, rendezvous scores), and the canonical binary encoding | `zeebo/xxh3` |
+| `internal/cachemesh/internal/route` | Hot path: routing `State`, `Decision`, `Header`, `Notes`, the per-neighbor `HealthTracker` (breakers, outlier detection, peak-EWMA, hedge budget), and the `EpochTracker` and stamps | `view` |
+| `internal/cachemesh/internal/control` | Control plane: the per-member `Node` state machine, Lease election (`Elector`, `Store`), the `Leader` (admission, suspicion, removal, rebalance with the partition `Planner`, cells, epochs), wire messages, and the `Router` that keeps a member's `route.State` current | `route`, `view` |
+| `internal/cachemesh/internal/dst` | Deterministic simulator and the DST suite | `control` and below |
+| `internal/cachemesh/internal/view/viewtest` | View builders for tests | `view` |
 
 ## Identity and hashing
 
 - `MemberID` is a string supplied by the application, unique per member (for
   example the Kubernetes node name). `Incarnation` is a `uint64` chosen at
   process start (random, nonzero); a restart with the same ID gets a new one.
-- `Member.Key = hashing.MemberKey(id, incarnation)` is a 64-bit hash used in
+- `Member.Key = view.MemberKey(id, incarnation)` is a 64-bit hash used in
   every rendezvous score. Scores never use slot numbers, so they do not change
   when slots are reused.
 - `Slot` is a dense `uint32` index assigned by the leader for the life of a
   member record. `NoSlot = ^uint32(0)`. A freed slot is not reused for
   `SlotReuseEpochs` (default 16) epochs, which exceeds the handoff window.
-- `hashing.KeyHash(seed uint64, key []byte) uint64` is `xxh3.HashSeed`.
-  A keyspace seed is `hashing.Seed(name)`; each keyspace hashes into the same
+- `view.KeyHash(seed uint64, key []byte) uint64` is `xxh3.HashSeed`.
+  A keyspace seed is `view.Seed(name)`; each keyspace hashes into the same
   partition table with a different seed, so blob and metadata placement are
   independent.
-- `hashing.Partition(h uint64, bits uint8) uint32` takes the top `bits` bits.
-- `hashing.Mix64` is the SplitMix64 finalizer. `hashing.Score(a, b uint64)`
+- `view.Partition(h uint64, bits uint8) uint32` takes the top `bits` bits.
+- `view.Mix64` is the SplitMix64 finalizer. `view.Score(a, b uint64)`
   is `Mix64(a ^ Mix64(b))`; larger wins, ties broken by the larger `a`.
 - No floating point in any value that two members must agree on.
 
@@ -154,7 +147,7 @@ neighbors are every other member in its own cell or an adjacent cell.
 neighbors ~= occ * (1 + sum(s[i] - 1)) - 1      where occ = members per cell
 ```
 
-`topology.Choose(n, cellSize, maxNeighbors)` returns the shape with the
+`view.Choose(n, cellSize, maxNeighbors)` returns the shape with the
 smallest D (1..`MaxDims`=8) such that `ceil(n/cells) * (1 + sum(s[i]-1)) - 1
 <= maxNeighbors`, with `cells = max(1, floor(n/cellSize))` spread as evenly as
 possible across dimensions (sizes differ by at most one): every size starts
@@ -214,7 +207,7 @@ out through a tree about 50 wide, and the caller can cache at each hop.
 - `P = 2^PartitionBits` partitions (default 20 bits, 1,048,576). Every member
   of a cluster must use the same value; it is part of the view and a joiner
   with a different value is rejected.
-- `placement.Table` maps partition to `Entry{Owner, Prev uint32; Moved
+- `view.Table` maps partition to `Entry{Owner, Prev uint32; Moved
   uint32}` (`Moved` is the epoch of the last move). It is stored in 1024-entry
   chunks, copied on write, so a delta that moves k partitions copies at most k
   chunks. Each chunk keeps its entries as three columns (owners, previous
@@ -241,7 +234,7 @@ members in order of `Member.Key`. Each leader tick:
    (ties by `Member.Key`). `Assign` always records the old owner in `Prev`;
   consumers ignore a `Prev` that is no longer a member (slots are not reused
   within the handoff window). A removed member's cell is known to the
-  rebalancer only if the leader lists it (`placement.Member.Gone`).
+  rebalancer only if the leader lists it (`control.PlanMember.Gone`).
 2. Optional, up to `MaxMovesPerTick` (4096): move partitions from the most
    over-target members to the most under-target members, setting `Prev`.
 3. Settled invariant: every assignable member's load is within one of its
@@ -263,7 +256,7 @@ If no member has weight > 0 (bootstrap), all members are treated as weight
   (mono-independent epoch number), Since (epoch of last state change)}`.
   `State` is `Joining`, `Active`, or `Draining`. Removed members are absent.
 - Cell index: cell to member slots (sorted by `Member.Key`).
-- `topology.Shape`, `PartitionBits`, `placement.Table`.
+- `view.Shape`, `PartitionBits`, `view.Table`.
 - Epoch anchor: `Epoch uint64` and `EpochPeriod time.Duration` as of this
   version.
 - Keyspace generations: `map[seed]uint32`, bumped by invalidation.
@@ -332,7 +325,7 @@ table as bit-packed columns; derived indexes are rebuilt and checked by
 
 - The leader owns `EpochPeriod` (default 15s) and publishes an `Epoch` op
   every period as a heartbeat.
-- `epoch.Tracker` maps local monotonic time to an epoch:
+- `route.EpochTracker` maps local monotonic time to an epoch:
   `current = anchorEpoch + floor((now - anchorMono) / period)`, re-anchored on
   heartbeats received. It never decreases. A member cut off from the
   leader keeps advancing on its own clock, so expiry is never suspended.
@@ -378,7 +371,7 @@ Health is tracked only for neighbors (and, briefly, for lingering former
 neighbors), so state is bounded by the connection budget. Health never changes
 membership; it only filters routing choices and feeds monitoring.
 
-`health.Tracker` holds one `Peer` per slot with atomic fields. Defaults follow
+`route.HealthTracker` holds one `Peer` per slot with atomic fields. Defaults follow
 Envoy and gRPC A50:
 
 - **Breaker**: `ConsecutiveFailures` (5) failures eject the peer for
@@ -410,7 +403,7 @@ Envoy and gRPC A50:
   line; `TryHedge` (called only for hedge candidates) sums the shards, so the
   shard choice never changes a result.
 
-Implementation notes (`health` package): the per-tracker slot index is a small
+Implementation notes (`route.HealthTracker`): the per-tracker slot index is a small
 copy-on-write open-addressing table, so memory is O(tracked peers), not
 O(max slot); `Sync` replaces the tracked set with one rebuild (the node calls
 it on every neighbor change) and `TrackMany` adds a batch the same way.
@@ -469,7 +462,7 @@ cannot empty the cluster quickly.
 
 Every control message carries the sender's `MemberRef{ID, Incarnation,
 Slot}`, `Version`, `Digest`, `Epoch`, and the slot of the leader it knows
-(`NoSlot` if none). All are encoded by `internal/wire`. Every message is a
+(`NoSlot` if none). All are encoded by `internal/control`. Every message is a
 request answered by one response; `Ack` and `Nack{Reason}` are the generic
 responses.
 
@@ -535,7 +528,7 @@ cell balancing or reshape, epoch, invalidations. A new leader starts from its
 own view, so no state is rebuilt from scratch; pending joins and suspicions
 are simply retried by their senders.
 
-Implementation notes (`leader` package):
+Implementation notes (`control.Leader`):
 
 - Within a delta, cell balancing or reshape comes before the partition moves
   (`Assign`), so the planner prefers the final cell-mates of removed owners.
@@ -558,7 +551,7 @@ Implementation notes (`leader` package):
 - Input queues (joins, leaves, suspected targets, invalidations) are bounded
   by `MaxPending` (4096); suspicion reports per target by 64.
 
-Implementation notes (`node` package):
+Implementation notes (`control.Node`):
 
 - `Routed` messages are relayed straight to the leader address the relay
   knows (from its view, the Lease, or a `Pong` hint) rather than hop by hop
@@ -569,7 +562,7 @@ Implementation notes (`node` package):
   one without seeds, it bootstraps: it takes part in the lottery until it
   has a view (not as a candidate, so members that all start at once without
   seeds make about `LotteryBudgetQPS` Lease calls rather than one each per
-  `RetryPeriod`; set `ExpectedClusterSize` near the real size, since a
+  `RetryPeriod`; set `ExpectedSize` near the real size, since a
   single member with the default of 1000 is eligible in about one round in
   50). A member without a view that wins the Lease and is neither a
   bootstrapper nor cold-starting releases it instead of publishing a second
@@ -631,7 +624,7 @@ Implementation notes (`node` package):
   term no longer matches. The release record carries the highest term the
   member has seen, so the next holder starts above both lineages even if
   the Lease term annotation was lost (read as 0). Terms at or above
-  `elect.MaxSaneTerm` (2^62) are garbage and ignored, so terms cannot
+  `control.MaxSaneTerm` (2^62) are garbage and ignored, so terms cannot
   overflow. `NoteVersion`, fed from data-plane headers whose term is
   truncated to 32 bits, may trigger a catch-up but never a step-down, so
   terms that differ only above bit 32 cannot cause a regression.
@@ -682,13 +675,13 @@ Implementation notes (`node` package):
 - A failed `Broadcast` forward is retried once with the next-ranked member
   of the same cell.
 - Elector and health ticks run every `TickInterval` (1s).
-- `node.Shared` (simulation only) shares interned views, encoded deltas,
+- `control.Shared` (simulation only) shares interned views, encoded deltas,
   snapshots, and candidate lists across nodes in one process.
 
 ## Leader election
 
-`elect.Elector` is a state machine. It emits `LeaseOp`s (`Get`, `GetCached`,
-`Create`, `Update`) for the runtime to execute against an `elect.Store`, and
+`control.Elector` is a state machine. It emits `LeaseOp`s (`Get`, `GetCached`,
+`Create`, `Update`) for the runtime to execute against an `control.Store`, and
 receives results. `kubelease.Store` implements `Store` with the typed
 client-go `CoordinationV1().Leases(ns)`; the simulator implements it in
 memory.
@@ -729,7 +722,7 @@ States:
   view at all, a member enters rounds of `LotteryRound` (1s). In round r it is
   eligible if `Score(member.Key, r) < p * 2^64` with
   `p = min(1, LotteryBudgetQPS * LotteryRound / N)`, where N is the larger
-  of the member count of its last view and `ExpectedClusterSize`. An eligible member reads
+  of the member count of its last view and `ExpectedSize`. An eligible member reads
   the Lease once: if a live leader holds it, the member records the leader's
   address and seeds and catches up from a seed; if it is expired by more than
   `LeaseDuration + ClockSkewAllowance` (5s) of wall time, the member tries to
@@ -805,7 +798,7 @@ case); `BenchmarkRouteWide` routes 1M distinct keys, where the owner lookup
 and the owner's member record usually miss every cache level and the cost is
 a few DRAM latencies, and routes from 16 different members in turn.
 
-The route package keeps the per-request work small: when `health.AllHealthy`
+The route package keeps the per-request work small: when `route.HealthTracker.AllHealthy`
 holds it ranks candidates without per-peer `Usable` lookups, it keeps this
 member's cell coordinates in the `State` so only the owner's cell is divided,
 the table lookup reads only the owner column, and decisions are filled in
@@ -820,12 +813,12 @@ converted on the hot path: `Decision`, `Kind` and the `Kind*` constants,
 `PeerRef`, `Header` (with `HeaderSize`, the `Flag*` constants, `ParseHeader`,
 `ErrTTLExhausted`, `ErrBadHeader`), `Result` (`Success`, `Failure`, `Timeout`,
 `Overload`), `Stamp`, `Version`, `Slot`/`NoSlot`, and for election
-`LeaseStore` (`elect.Store`), `LeaseRecord`, `ErrLeaseNotFound`,
-`ErrLeaseConflict`, `ElectionConfig` (`elect.Config`), and `HealthConfig`
-(`health.Config`).
+`LeaseStore` (`control.Store`), `LeaseRecord`, `ErrLeaseNotFound`,
+`ErrLeaseConflict`, `ElectionConfig` (`control.ElectionConfig`), and `HealthConfig`
+(`route.HealthConfig`).
 
 `NewKeyspace(name, ttl)` returns a `Keyspace` value with `Name`, `TTL`,
-`Seed` (`hashing.Seed(name)`), and `Hash(key)`. A zero TTL never expires;
+`Seed` (`view.Seed(name)`), and `Hash(key)`. A zero TTL never expires;
 otherwise the TTL must be at least `MinTTL` (5m). `MustKeyspace` panics on
 error.
 
@@ -835,8 +828,7 @@ error.
 bootstraps or leads), `Neighbors`, `Logger` (`log/slog`), `Hooks`
 (`OnView`, `OnLeadership`, `OnControlError`, `OnLeaseError`), and the common
 cluster knobs `PartitionBits`, `CellSize`, `MaxNeighbors`, `EpochPeriod`, and
-`ExpectedSize`. `ExpectedSize` sets `Election.ExpectedClusterSize` (setting
-both to different values is an error). It is the lottery floor on N, so it
+`ExpectedSize`. `ExpectedSize` is the lottery floor on N, so it
 trades bootstrap latency for API server protection: the lone first member of
 a new cluster waits about `ExpectedSize / LotteryBudgetQPS` seconds (about
 50s at the default 1000, under a second at 20 or less), while members
@@ -848,13 +840,16 @@ call timeout, linger, leader and elector ticks), `EpochAdvance` (100ms, the
 longest the runtime waits between ticks, bounding epoch staleness),
 `MaxInFlight` (64 concurrent control calls; excess calls fail at once with
 `ErrTooManyCalls` and the protocol retries them), `LeaseTimeout` (default
-`Election.OpTimeout`), and the nested `Election`, `Health`, and `Leader`
-(`LeaderTuning`) settings. Zero values select defaults; `New` returns
+`Election.OpTimeout`), the leader knobs (admission, quarantine, warmup,
+drain, suspicion, move limits, slot reuse, handoff), and the nested
+`Election` and `Health` settings. `Tuning` is an alias of `control.Tuning`
+and is embedded in the node configuration as is. Zero values select defaults; `New` returns
 validation errors.
 
 Runtime (`Mesh`):
 
-- `New` builds the `node.Node` and a `route.Env` holding the node's health
+- `New` builds the `control.Node` and a `control.Router`, which keeps a
+  `route.Env` holding the node's health
   and epoch trackers, a `route.Notes`, the self ID and incarnation, and the
   node's join seeds (other than its own address) as gateways
   (`PeerRef{Slot: NoSlot, ID: addr, Addr: addr}`). While the member is not
@@ -892,7 +887,7 @@ Runtime (`Mesh`):
   meanwhile is never reported), and one view event, the latest, after it. `OnControlError` runs on the failed call's goroutine and
   `OnLeaseError` on the Lease goroutine, neither under the lock.
 - `ServeControl` rejects messages over `MaxControlMessageSize`
-  (`wire.MaxMessageSize`) with `ErrMessageTooLarge`; other malformed input
+  (`control.MaxMessageSize`) with `ErrMessageTooLarge`; other malformed input
   gets an encoded rejection.
 - `Invalidate` queues a request per keyspace seed (at most
   `MaxPendingInvalidations`, 1024; beyond that `ErrTooManyInvalidations`),
@@ -917,7 +912,7 @@ on `ResourceVersion`, create conflicts, not-found, injectable errors).
 
 `route.State` is an immutable snapshot of one view and the self slot;
 `route.NewState(v, self, env)` is O(1). `route.Env` (built once per member)
-holds the shared `health.Tracker`, `epoch.Tracker`, `Notes`, the gateway
+holds the shared `route.HealthTracker`, `route.EpochTracker`, `Notes`, the gateway
 list, and optionally the self ID and incarnation, so a reused slot that now
 holds another member is not taken as self. Choices the code makes beyond the
 rules above:
@@ -1043,10 +1038,10 @@ command: the subtest name for default-set cases, `CACHEMESH_DST_SEED` for
 explicit seeds.
 
 Implementation notes (control-plane suite, `dst.Cluster` and
-`suite_test.go`): each member is a `node.Node` with its own `dst.Clock`,
+`suite_test.go`): each member is a `control.Node` with its own `dst.Clock`,
 ticked at its `NextDeadline`; outbox calls go through `Net.Call` and Lease
 operations through `LeaseServer.Submit`. Large clusters start from a view
-prebuilt by running the leader logic offline (`node.Config.Initial`), so the
+prebuilt by running the leader logic offline (`control.Config.Initial`), so the
 first leader is elected over an existing view. The default set is 16 tiny
 and 2 small generated scenarios, the targeted 40-member `slow` scenario,
 four pinned regression seeds (`pinned/tiny/293`, `75`, `456`, and `501`,
@@ -1089,7 +1084,7 @@ Control-plane invariants (`dst/cluster.go`):
   per `RetryPeriod` of injected Lease conflicts, each of which can fail a
   renewal and end a term) and a
   view sequence number no larger than the elapsed seconds.
-- Bounded state: every 10s every member's `node.Stats` are checked against
+- Bounded state: every 10s every member's `control.Stats` are checked against
   their caps (pending calls, ahead queue, seeds, delta log, leader queues),
   and no removed neighbor may linger past its expiry.
 - Scenarios draw `ColdRestart` and `PartialRestart` (each in about one in
@@ -1110,9 +1105,10 @@ Implementation notes (data-plane workload, `dst.DataPlane` in
 
 - Routing state: each running member routes with its own `route.State`
   over a `route.Env` holding its node's `Health()` and `Epoch()` trackers,
-  its own `route.Notes`, its node's join seeds (`node.Node.Seeds`: configured,
+  its own `route.Notes`, its node's join seeds (`control.Node.Seeds`: configured,
   learned from the Lease and from views, other than its own address) as
-  gateways, and its ID and incarnation, as `Mesh` does. The state is rebuilt
+  gateways, and its ID and incarnation, built by the same `control.Router`
+  as `Mesh` uses. The state is rebuilt
   (O(1)) when the member's view pointer or slot changed, and the `Env` too
   when a non-member's seed list changed; members not in their view route
   through those seeds or `Direct`.
@@ -1140,8 +1136,9 @@ Implementation notes (data-plane workload, `dst.DataPlane` in
   both tracked. The origin hedges to the `Alternate` (with `FlagHedge`)
   when its first hop is unanswered after `HedgeAfter` and `TryHedge`
   allows it; the first served branch wins. A receiver that sees a newer
-  version in a header calls `node.NoteVersion` from `Notes.Take`, as
-  `Mesh` does. Every terminal result goes into the trace hash.
+  version in a header passes it to its node through
+  `control.Router.TakeNote` (which widens the 32-bit header term with
+  `control.ExpandVersion`), as `Mesh` does. Every terminal result goes into the trace hash.
 - Phases: a request is steady when membership was settled at the last
   5-second check (a leader, every running member at its version and in it,
   no member paused) and no fault was active within 30s; otherwise it is a
