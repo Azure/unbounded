@@ -458,6 +458,8 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::HostReadFusedSkippedNotRegistered => "racer_host_read_fused_skipped_total" { "reason=\"not_registered\"" },
             Self::HostReadFusedSkippedRetained => "racer_host_read_fused_skipped_total" { "reason=\"retained\"" },
             Self::HostReadFusedSkippedReservation => "racer_host_read_fused_skipped_total" { "reason=\"reservation\"" },
+            Self::HostReadFusedSkippedPoolLow => "racer_host_read_fused_skipped_total" { "reason=\"pool_low\"" },
+            Self::HostReadAheadRegisteredDropped => "racer_host_read_ahead_registered_dropped_total",
             Self::HostReadFusedNumaRegisteredLocal => "racer_host_read_fused_numa_pages_total" { "buffer=\"registered\",locality=\"local\"" },
             Self::HostReadFusedNumaRegisteredRemote => "racer_host_read_fused_numa_pages_total" { "buffer=\"registered\",locality=\"remote\"" },
             Self::HostReadFusedNumaRegisteredUnknown => "racer_host_read_fused_numa_pages_total" { "buffer=\"registered\",locality=\"unknown\"" },

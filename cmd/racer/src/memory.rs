@@ -1280,6 +1280,14 @@ impl CiphertextPage {
     pub(crate) fn is_registered(&self) -> bool {
         matches!(self.inner.storage, CiphertextStorage::Registered { .. })
     }
+    /// For a page still in a registered RDMA buffer, the free and total
+    /// buffer counts of that buffer's pool. None for any other page.
+    pub(crate) fn registered_pool_free(&self) -> Option<(usize, usize)> {
+        match &self.inner.storage {
+            CiphertextStorage::Registered { page, .. } => Some(page.pool_free()),
+            _ => None,
+        }
+    }
 }
 // SAFETY: shared ciphertext backing is immutable and retained by the owner.
 unsafe impl racer_io::ring::SendBuffer for CiphertextPage {

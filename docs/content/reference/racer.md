@@ -734,8 +734,18 @@ Racer-Destination-Length: <length>
   came from memory, disk, or HTTP rather than an RDMA receive buffer, which
   is expected for local hits), `retained` (another reader already copied the
   page out of the receive buffer, for example a plaintext or GPU read of the
-  same page), or `reservation` (ciphertext admission refused the copy, so the
-  page is copied out before the decrypt instead).
+  same page), `reservation` (ciphertext admission refused the copy, so the
+  page is copied out before the decrypt instead), or `pool_low` (see below).
+  Pages of a host read are delivered in order, so a page fetched ahead of
+  the first undelivered page of its window waits there, and a fused page
+  holds its receive buffer while it waits. So that such pages cannot take
+  every receive buffer and leave the window heads none, a page ahead of its
+  head is copied out of its receive buffer as soon as it arrives, rather than
+  fused, while fewer than a quarter of the buffers of that rail's pool are
+  free. These pages count as `pool_low`. If ciphertext admission also refuses
+  that copy, the page is dropped, which frees its buffer, and the window
+  fetches it again later; `racer_host_read_ahead_registered_dropped_total`
+  counts these drops.
   Each page of a host read is fetched by the page's owning worker, which may
   be on the other NUMA node from the requesting worker. The decrypt writes
   two buffers, the ciphertext cache copy and the client's `memfd`, and

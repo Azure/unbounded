@@ -3288,6 +3288,118 @@ fn host_read_acquisition_defers_registered_publish_so_the_sink_fuses() {
     );
 }
 
+/// A host-read page ahead of its window's head is fused only while its
+/// receive buffer's pool keeps a reserve free for heads. Below it, the page
+/// is copied out at once so it never waits for its head in a receive buffer,
+/// and when even the copy is refused it fails `Overloaded`, returning the
+/// buffer. A head is still fused. Without this, ahead pages fill the pool
+/// and every head waits for a buffer until request deadlines.
+#[test]
+fn ahead_host_read_page_leaves_its_receive_buffer_when_the_pool_is_low() {
+    let env = racer_io::Env::host();
+    let mut f = fixture_with(&env, 3, None);
+    let mut w = crate::rdma::links::tests::world_for(
+        [
+            crate::rdma::links::tests::node_id(1),
+            crate::rdma::links::tests::node_id(2),
+        ],
+        false,
+    );
+    let env = w.env.clone();
+    crate::rdma::links::tests::link_up(&env, &mut w);
+    let good = encrypted_copy(&mut f);
+    let bytes = good.ciphertext.bytes().to_vec();
+    let mut host = f.fill.clone();
+    host.defer_registered_publish = true;
+    let receive = |w: &mut crate::rdma::links::tests::World| crate::memory::UnverifiedPage {
+        copy: registered_copy(&env, &f, w, &good, bytes.clone()),
+        disk_token: None,
+    };
+    let low = |host: &Fill| host.metrics.count(Event::HostReadFusedSkippedPoolLow);
+
+    // Plenty free: an ahead page is fused like a head.
+    let page = receive(&mut w);
+    let (free, total) = page.copy.ciphertext.registered_pool_free().unwrap();
+    let reserve = ahead_registered_reserve(total);
+    assert!(free >= reserve, "free {free} of {total}");
+    let sealed = host.seal_for(&f.page, page, Some(None), true).unwrap();
+    assert!(sealed.fused_store.is_some());
+    assert_eq!(low(&host), 0);
+    drop(sealed);
+
+    // Hold buffers, as ahead pages waiting for their heads do, until the
+    // next page leaves fewer than the reserve free.
+    let mut held = Vec::new();
+    loop {
+        let page = receive(&mut w);
+        let (free, _) = page.copy.ciphertext.registered_pool_free().unwrap();
+        if free < reserve {
+            held.push(page);
+            break;
+        }
+        held.push(page);
+    }
+    let page = held.pop().unwrap();
+    let (free, _) = page.copy.ciphertext.registered_pool_free().unwrap();
+
+    // A head is still fused.
+    let head = host.seal_for(&f.page, page, Some(None), false).unwrap();
+    assert!(head.fused_store.is_some());
+    assert_eq!(low(&host), 0);
+    drop(head);
+
+    // An ahead page is copied out, returning its buffer at once.
+    let page = receive(&mut w);
+    let copies = crate::memory::registered_copy_outs();
+    let sealed = host.seal_for(&f.page, page, Some(None), true).unwrap();
+    assert!(sealed.fused_store.is_none());
+    assert_eq!(low(&host), 1);
+    assert_eq!(crate::memory::registered_copy_outs(), copies + 1);
+    let crate::read::sealed::SealedSource::Host(copy) = &sealed.source else {
+        panic!("host source");
+    };
+    assert!(!copy.copy.ciphertext.is_registered());
+    let probe = receive(&mut w);
+    assert_eq!(
+        probe.copy.ciphertext.registered_pool_free().unwrap().0,
+        free,
+        "the ahead page's buffer is free again"
+    );
+    drop(probe);
+    drop(sealed);
+
+    // A non-host (GPU) seal ignores the ahead flag.
+    let page = receive(&mut w);
+    let sealed = host.seal_for(&f.page, page, None, true).unwrap();
+    assert!(sealed.fused_store.is_none());
+    assert_eq!(low(&host), 1);
+    drop(sealed);
+
+    // With the copy refused as well, the ahead page fails Overloaded and
+    // drops its buffer, so the window retries it later.
+    let page = receive(&mut w);
+    let admission = f.fill.dependencies.admission.clone();
+    let cache = f.context.object.cache.clone();
+    let mut charges = Vec::new();
+    for amount in [65536, 4096, 1] {
+        while let Ok(charge) = admission.reserve(Some(&cache), ResourceClass::Ciphertext, amount) {
+            charges.push(charge);
+        }
+    }
+    let result = host.seal_for(&f.page, page, Some(None), true);
+    assert!(matches!(result, Err(Error::Overloaded)));
+    assert_eq!(low(&host), 2);
+    assert_eq!(host.metrics.count(Event::HostReadAheadRegisteredDropped), 1);
+    drop(charges);
+    let probe = receive(&mut w);
+    assert_eq!(
+        probe.copy.ciphertext.registered_pool_free().unwrap().0,
+        free
+    );
+    drop(probe);
+    drop(held);
+}
+
 /// A rejected host-read page is never cached by its verdict.
 #[test]
 fn rejected_host_read_page_is_not_cached() {

@@ -102,6 +102,14 @@ pub(super) fn plaintext_wait(seed: u64, count: u8) -> Duration {
     half + Duration::from_nanos(mix % span)
 }
 
+/// The free receive buffers a pool of `total` keeps for window heads: a
+/// host-read page ahead of its head is fused (keeping its buffer until its
+/// head is delivered) only while at least this many are free. A quarter of
+/// the pool, and at least one buffer.
+pub(crate) fn ahead_registered_reserve(total: usize) -> usize {
+    (total / 4).max(1)
+}
+
 /// A host descriptor to hand to cuFile, or None for simulated descriptors.
 fn host_descriptor(descriptor: &racer_io::ring::Descriptor) -> Option<std::os::fd::OwnedFd> {
     use std::os::fd::AsFd;
@@ -1147,12 +1155,16 @@ impl Fill {
             .await?;
         match acquired {
             AcquiredPage::Plaintext(result) => Ok(Fetched::Page(result)),
-            AcquiredPage::Ciphertext(copy) => match self.seal(
+            AcquiredPage::Ciphertext(copy) => match self.seal_for(
                 &page,
                 copy,
                 target.helper.is_none().then_some(scope.reader_numa),
+                scope.ahead,
             ) {
                 Ok(sealed) => Ok(Fetched::Sealed(sealed)),
+                // An ahead page that could not leave its receive buffer: the
+                // window retries it later, by then possibly as its head.
+                Err(Error::Overloaded) => Err(Error::Overloaded),
                 // A key the GPU cannot use, or an AAD too long for it: the
                 // CPU authenticates the page as for a Get.
                 Err(_) => self
@@ -1471,13 +1483,51 @@ impl Fill {
     pub(super) fn seal(
         &self,
         page: &PageId,
-        mut copy: UnverifiedPage,
+        copy: UnverifiedPage,
         host: Option<Option<u16>>,
     ) -> Result<Box<super::sealed::SealedPage>> {
+        self.seal_for(page, copy, host, false)
+    }
+
+    /// As [`Self::seal`], for a page `ahead` of its window's head (see
+    /// [`RequestScope::ahead`]).
+    ///
+    /// A host-read page waits in its window until every page before it is
+    /// delivered, and a fused page holds its RDMA receive buffer all that
+    /// time. Heads need receive buffers too, so ahead pages holding them all
+    /// stall every read until request deadlines free them. While its
+    /// buffer's pool has fewer than [`ahead_registered_reserve`] free
+    /// buffers, an ahead page is therefore copied out at once instead of
+    /// fused, counted as `pool_low` in `racer_host_read_fused_skipped_total`.
+    /// If even that copy is refused, the page fails `Overloaded`, which
+    /// returns its buffer, and the window retries it later.
+    pub(super) fn seal_for(
+        &self,
+        page: &PageId,
+        mut copy: UnverifiedPage,
+        host: Option<Option<u16>>,
+        ahead: bool,
+    ) -> Result<Box<super::sealed::SealedPage>> {
         validate_copy(&copy.copy, page, self.page_size()?)?;
+        let pool_low = host.is_some()
+            && ahead
+            && copy
+                .copy
+                .ciphertext
+                .registered_pool_free()
+                .is_some_and(|(free, total)| free < ahead_registered_reserve(total));
+        if pool_low {
+            self.metrics.record(Event::HostReadFusedSkippedPoolLow, 1);
+            copy.copy.ciphertext = self.detach_registered(copy.copy.ciphertext);
+            if copy.copy.ciphertext.is_registered() {
+                self.metrics
+                    .record(Event::HostReadAheadRegisteredDropped, 1);
+                return Err(Error::Overloaded);
+            }
+        }
         let fused_store = match host {
-            Some(node) => self.fused_store(&copy.copy.ciphertext, node),
-            None => None,
+            Some(node) if !pool_low => self.fused_store(&copy.copy.ciphertext, node),
+            _ => None,
         };
         if fused_store.is_none() {
             copy.copy.ciphertext = self.detach_registered(copy.copy.ciphertext);

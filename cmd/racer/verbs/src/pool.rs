@@ -518,6 +518,13 @@ impl RegisteredPage {
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
+
+    /// The free and total buffer counts of the pool this page came from, a
+    /// snapshot that may be stale by the time it is used. This page is not
+    /// free, so `free < total`.
+    pub fn pool_free(&self) -> (usize, usize) {
+        (lock(&self.shared.free).len(), self.shared.count())
+    }
 }
 
 impl std::fmt::Debug for RegisteredPage {
