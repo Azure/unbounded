@@ -64,7 +64,20 @@ func (s *Server) serveFromFetcher(ctx context.Context, w http.ResponseWriter, d 
 
 	ref := ifaces.OriginRef{Registry: upstream, Repository: repo, Digest: d, Kind: kind, Offset: offset}
 
-	started, written, err := s.blobFetcher.FetchBlob(ctx, w, ref, func(total int64, contentType string) {
+	// The local content store keeps no media type, so a peer can serve a
+	// manifest for a /blobs/ request (or an index under /manifests/) with
+	// an empty type. Parity with the other paths: hold back the headers
+	// until the first body bytes are seen and sniff them. Ranges and
+	// typed responses stream straight through.
+	var sw *sniffWriter
+
+	out := io.Writer(w)
+	if offset == 0 && (kind == ifaces.KindBlob || kind == ifaces.KindManifest) {
+		sw = &sniffWriter{w: w}
+		out = sw
+	}
+
+	started, written, err := s.blobFetcher.FetchBlob(ctx, out, ref, func(total int64, contentType string) {
 		// Keep any known type whatever the requested kind: the origin can
 		// serve a /blobs/ request from /manifests/ and report its media type.
 		if contentType != "" {
@@ -81,9 +94,24 @@ func (s *Server) serveFromFetcher(ctx context.Context, w http.ResponseWriter, d 
 			return
 		}
 
+		if sw != nil && contentType == "" {
+			sw.deferHeaders(func(prefix []byte) {
+				writeBlobHeadersWithPrefix(w, d, total, kind, prefix)
+				w.WriteHeader(http.StatusOK)
+			})
+
+			return
+		}
+
 		writeBlobHeaders(w, d, total, kind)
 		w.WriteHeader(http.StatusOK)
 	})
+	if started && sw != nil {
+		if ferr := sw.flush(); err == nil {
+			err = ferr
+		}
+	}
+
 	if !started {
 		return false
 	}
@@ -167,4 +195,75 @@ func (s *Server) serveTag(w http.ResponseWriter, r *http.Request, upstream, repo
 	s.fireMirrorBytesServed(ctx, ifaces.KindManifest, sourceCachemesh, int64(n))
 
 	return true
+}
+
+// sniffMax is how much of the body is buffered to detect a media type,
+// matching the peek size of the other mirror paths.
+const sniffMax = 512
+
+// sniffWriter passes writes through unless headers have been deferred, in
+// which case it buffers up to sniffMax bytes, then writes the headers from
+// that prefix and flushes.
+type sniffWriter struct {
+	w       io.Writer
+	headers func(prefix []byte)
+	buf     []byte
+}
+
+func (s *sniffWriter) deferHeaders(headers func(prefix []byte)) {
+	s.headers = headers
+}
+
+func (s *sniffWriter) Write(p []byte) (int, error) {
+	if s.headers == nil {
+		return s.w.Write(p)
+	}
+
+	if len(s.buf)+len(p) < sniffMax {
+		s.buf = append(s.buf, p...)
+
+		return len(p), nil
+	}
+
+	s.buf = append(s.buf, p...)
+	if err := s.flush(); err != nil {
+		return 0, err
+	}
+
+	return len(p), nil
+}
+
+// flush writes deferred headers and any buffered bytes. It is a no-op once
+// the headers are out.
+func (s *sniffWriter) flush() error {
+	if s.headers == nil {
+		return nil
+	}
+
+	headers := s.headers
+	s.headers = nil
+	headers(s.buf[:min(len(s.buf), sniffMax)])
+
+	buf := s.buf
+	s.buf = nil
+
+	if len(buf) == 0 {
+		return nil
+	}
+
+	_, err := s.w.Write(buf)
+
+	return err
+}
+
+// Flush forwards to the response once the headers are out, so the
+// fetcher's early flush still reaches the client on typed streams.
+func (s *sniffWriter) Flush() {
+	if s.headers != nil {
+		return
+	}
+
+	if fl, ok := s.w.(http.Flusher); ok {
+		fl.Flush()
+	}
 }

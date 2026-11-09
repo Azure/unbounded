@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -311,5 +312,67 @@ func TestMirrorBlobFetcherKeepsContentTypeForBlobKind(t *testing.T) {
 
 	if ct := resp.Header.Get("Content-Type"); ct != ctype {
 		t.Fatalf("Content-Type %q, want %q", ct, ctype)
+	}
+}
+
+// A peer serving from its content store reports no media type, so the
+// mirror must sniff the body like its other paths do.
+func TestMirrorBlobFetcherSniffsUntypedBody(t *testing.T) {
+	pad := strings.Repeat(" ", 600)
+	manifestBody := []byte(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{},"layers":[]}`)
+	indexBody := []byte(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}` + pad)
+	layerBody := []byte(strings.Repeat("L", 4096))
+	shortLayer := []byte("tiny")
+
+	cases := []struct {
+		name string
+		path string
+		body []byte
+		want string
+	}{
+		{"manifest via blobs", "blobs", manifestBody, "application/vnd.oci.image.manifest.v1+json"},
+		{"index via manifests", "manifests", indexBody, "application/vnd.oci.image.index.v1+json"},
+		{"layer", "blobs", layerBody, "application/octet-stream"},
+		{"short layer", "blobs", shortLayer, "application/octet-stream"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d := digestOf(tc.body)
+			fetcher := &fakeFetcher{blobs: map[digest.Digest][]byte{d: tc.body}}
+			srv, hits, _ := cachemeshFixture(t, nil, mirror.WithBlobFetcher(fetcher))
+
+			resp, got, err := get(t, srv.URL+"/v2/library/app/"+tc.path+"/"+d.String(), nil)
+			if err != nil || resp.StatusCode != http.StatusOK || string(got) != string(tc.body) {
+				t.Fatalf("GET: resp=%v err=%v len=%d", resp, err, len(got))
+			}
+
+			if ct := resp.Header.Get("Content-Type"); ct != tc.want {
+				t.Fatalf("Content-Type %q, want %q", ct, tc.want)
+			}
+
+			if resp.Header.Get("Content-Length") != strconv.Itoa(len(tc.body)) {
+				t.Fatalf("Content-Length %q", resp.Header.Get("Content-Length"))
+			}
+
+			if atomic.LoadInt32(hits) != 0 {
+				t.Fatal("origin hit")
+			}
+		})
+	}
+}
+
+func TestMirrorBlobFetcherSniffAbortsShortStream(t *testing.T) {
+	body := []byte(strings.Repeat("x", 100))
+	d := digestOf(body)
+	fetcher := &fakeFetcher{blobs: map[digest.Digest][]byte{d: body}, failAfter: 10}
+	srv, hits, _ := cachemeshFixture(t, nil, mirror.WithBlobFetcher(fetcher))
+
+	if _, got, err := get(t, srv.URL+"/v2/library/app/blobs/"+d.String(), nil); err == nil {
+		t.Fatalf("want a broken body, got %d bytes", len(got))
+	}
+
+	if atomic.LoadInt32(hits) != 0 {
+		t.Fatal("origin hit")
 	}
 }
