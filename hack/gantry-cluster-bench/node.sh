@@ -147,6 +147,33 @@ cg_stats() {
   printf '%s %s %s %s %s %s %s' "${cur}" "${anon}" "${file}" "${af}" "${inf}" "${dirty}" "${wb}"
 }
 
+# io_stats prints "cg_rbytes cg_wbytes proc_read_bytes proc_write_bytes"
+# for cgroup v2 directory $1 (io.stat summed over devices) and process $2
+# (/proc/<pid>/io), with dashes for what is unreadable.
+io_stats() {
+  local dir="$1" pid="$2" line kv rb=0 wb=0 cg="- -" pr=- pw=- k v
+  if [[ -n "${dir}" && -r "${dir}/io.stat" ]]; then
+    while read -r line; do
+      for kv in ${line}; do
+        case "${kv}" in
+          rbytes=*) rb=$((rb + ${kv#rbytes=})) ;;
+          wbytes=*) wb=$((wb + ${kv#wbytes=})) ;;
+        esac
+      done
+    done <"${dir}/io.stat"
+    cg="${rb} ${wb}"
+  fi
+  if [[ -n "${pid}" && -r "/proc/${pid}/io" ]]; then
+    while read -r k v; do
+      case "${k}" in
+        read_bytes:) pr="${v}" ;;
+        write_bytes:) pw="${v}" ;;
+      esac
+    done <"/proc/${pid}/io"
+  fi
+  printf '%s %s %s' "${cg}" "${pr}" "${pw}"
+}
+
 sampler() {
   local gpid="" cpid="" line rx tx dw dr busy total memt mema a gcg="" gcgpid=""
   while :; do
@@ -188,6 +215,7 @@ sampler() {
     echo "SAMPLE ${NODE} $(now_ns) ${rx} ${tx} ${dw} ${busy} ${total} ${memt} ${mema} $(proc_stats "${gpid}") $(proc_stats "${cpid}")"
     [[ -n "${gpid}" ]] || gcg=""
     echo "MEMSAMPLE ${NODE} $(now_ns) ${dr} $(cg_stats "${gcg}")"
+    echo "IOSAMPLE ${NODE} $(now_ns) $(io_stats "${gcg}" "${gpid}")"
     sleep "${INTERVAL}"
   done
 }

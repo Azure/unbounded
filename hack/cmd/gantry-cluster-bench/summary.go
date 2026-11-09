@@ -49,6 +49,16 @@ type memSample struct {
 // it: usage minus inactive file pages.
 func (m memSample) workingSet() int64 { return max(m.current-m.inactiveFile, 0) }
 
+// ioSample is one IOSAMPLE line: the gantry container's cgroup v2 io.stat
+// read and write bytes (summed over devices) and the gantry process's
+// /proc/<pid>/io read_bytes and write_bytes.
+type ioSample struct {
+	ts                    int64
+	cgRead, cgWrite       int64
+	procRead, procWrite   int64
+	hasCgroup, hasProcess bool
+}
+
 type nodeResult struct {
 	Node    string `json:"node"`
 	StartNS int64  `json:"start_ns"`
@@ -56,6 +66,7 @@ type nodeResult struct {
 	RC      int    `json:"rc"`
 	samples []sample
 	mem     []memSample
+	io      []ioSample
 }
 
 func (n nodeResult) ok() bool { return n.RC == 0 && n.EndNS > n.StartNS }
@@ -133,7 +144,95 @@ func parseMemSampleLine(fields []string) (string, memSample, error) {
 	return fields[1], m, nil
 }
 
-// parseNodeLog reads RESULT, SAMPLE, and MEMSAMPLE lines from one pod log.
+// parseIOSampleLine parses "IOSAMPLE node ts cgRead cgWrite procRead
+// procWrite". Missing values are "-".
+func parseIOSampleLine(fields []string) (string, ioSample, error) {
+	if len(fields) != 7 {
+		return "", ioSample{}, fmt.Errorf("IOSAMPLE: want 7 fields, got %d", len(fields))
+	}
+
+	var (
+		vals    [5]int64
+		present [5]bool
+	)
+
+	for i, f := range fields[2:] {
+		if f == "-" {
+			continue
+		}
+
+		v, err := strconv.ParseInt(f, 10, 64)
+		if err != nil {
+			return "", ioSample{}, fmt.Errorf("IOSAMPLE field %d: %w", i+2, err)
+		}
+
+		vals[i], present[i] = v, true
+	}
+
+	if !present[0] {
+		return "", ioSample{}, errors.New("IOSAMPLE: missing timestamp")
+	}
+
+	return fields[1], ioSample{
+		ts: vals[0], cgRead: vals[1], cgWrite: vals[2], procRead: vals[3], procWrite: vals[4],
+		hasCgroup: present[1] && present[2], hasProcess: present[3] && present[4],
+	}, nil
+}
+
+// ioStats is the gantry I/O within a window: last minus first sample.
+type ioStats struct {
+	cgRead, cgWrite       float64 // bytes
+	procRead, procWrite   float64 // bytes
+	hasCgroup, hasProcess bool
+}
+
+func computeIO(samples []ioSample, from, to int64) ioStats {
+	var (
+		st                  ioStats
+		firstCg, lastCg     *ioSample
+		firstProc, lastProc *ioSample
+	)
+
+	for i := range samples {
+		m := &samples[i]
+		if m.ts < from || m.ts > to {
+			continue
+		}
+
+		if m.hasCgroup {
+			if firstCg == nil {
+				firstCg = m
+			}
+
+			lastCg = m
+		}
+
+		if m.hasProcess {
+			if firstProc == nil {
+				firstProc = m
+			}
+
+			lastProc = m
+		}
+	}
+
+	if firstCg != nil && lastCg != firstCg {
+		st.hasCgroup = true
+		st.cgRead = float64(max(lastCg.cgRead-firstCg.cgRead, 0))
+		st.cgWrite = float64(max(lastCg.cgWrite-firstCg.cgWrite, 0))
+	}
+
+	if firstProc != nil && lastProc != firstProc {
+		st.hasProcess = true
+		st.procRead = float64(max(lastProc.procRead-firstProc.procRead, 0))
+		st.procWrite = float64(max(lastProc.procWrite-firstProc.procWrite, 0))
+	}
+
+	return st
+}
+
+// parseNodeLog reads RESULT, SAMPLE, MEMSAMPLE, and IOSAMPLE lines from one
+// pod log.
 func parseNodeLog(r io.Reader, fallbackNode string) (nodeResult, bool, error) {
 	res := nodeResult{Node: fallbackNode, RC: -1}
 	found := false
@@ -181,6 +280,13 @@ func parseNodeLog(r io.Reader, fallbackNode string) (nodeResult, bool, error) {
 			}
 
 			res.mem = append(res.mem, m)
+		case "IOSAMPLE":
+			_, m, err := parseIOSampleLine(f)
+			if err != nil {
+				continue // tolerate a truncated last line
+			}
+
+			res.io = append(res.io, m)
 		}
 	}
 
@@ -416,6 +522,10 @@ type Summary struct {
 	GantryFilePeakMiB  *Dist              `json:"gantry_page_cache_peak_mib,omitempty"`
 	GantryFileEndMiB   *Dist              `json:"gantry_page_cache_end_mib,omitempty"`
 	GantryDirtyPeakMiB *Dist              `json:"gantry_dirty_peak_mib,omitempty"`
+	GantryCgReadMiB    *Dist              `json:"gantry_cgroup_read_mib,omitempty"`
+	GantryCgWriteMiB   *Dist              `json:"gantry_cgroup_write_mib,omitempty"`
+	GantryProcReadMiB  *Dist              `json:"gantry_process_read_mib,omitempty"`
+	GantryProcWriteMiB *Dist              `json:"gantry_process_write_mib,omitempty"`
 	MetricDeltas       map[string]float64 `json:"metric_deltas,omitempty"`
 	MetricPodsPre      int                `json:"metric_pods_pre"`
 	MetricPodsPost     int                `json:"metric_pods_post"`
@@ -610,6 +720,7 @@ func summarize(dir string) (*Summary, []nodeResult, error) {
 		memP                               []float64
 		gA, gP, gRA, gRP, cA, cP, cRA, cRP []float64
 		dr, wsP, wsE, anP, fP, fE, dP      []float64
+		ioCR, ioCW, ioPR, ioPW             []float64
 	)
 
 	tail := atoi64(meta["TAIL_SECONDS"])
@@ -649,6 +760,17 @@ func summarize(dir string) (*Summary, []nodeResult, error) {
 				wsP, wsE = append(wsP, ms.wsPeak/(1<<20)), append(wsE, ms.wsEnd/(1<<20))
 				anP, dP = append(anP, ms.anonPeak/(1<<20)), append(dP, ms.dirtyPeak/(1<<20))
 				fP, fE = append(fP, ms.filePeak/(1<<20)), append(fE, ms.fileEnd/(1<<20))
+			}
+		}
+
+		// Disk I/O of the gantry container covers the pull and the tail.
+		if is := computeIO(r.io, r.StartNS-1e9, r.EndNS+tail*1e9); is.hasCgroup || is.hasProcess {
+			if is.hasCgroup {
+				ioCR, ioCW = append(ioCR, is.cgRead/(1<<20)), append(ioCW, is.cgWrite/(1<<20))
+			}
+
+			if is.hasProcess {
+				ioPR, ioPW = append(ioPR, is.procRead/(1<<20)), append(ioPW, is.procWrite/(1<<20))
 			}
 		}
 
@@ -695,6 +817,14 @@ func summarize(dir string) (*Summary, []nodeResult, error) {
 		s.GantryWSPeakMiB, s.GantryWSEndMiB = ptr(dist(wsP)), ptr(dist(wsE))
 		s.GantryAnonPeakMiB, s.GantryDirtyPeakMiB = ptr(dist(anP)), ptr(dist(dP))
 		s.GantryFilePeakMiB, s.GantryFileEndMiB = ptr(dist(fP)), ptr(dist(fE))
+	}
+
+	if len(ioCR) > 0 {
+		s.GantryCgReadMiB, s.GantryCgWriteMiB = ptr(dist(ioCR)), ptr(dist(ioCW))
+	}
+
+	if len(ioPR) > 0 {
+		s.GantryProcReadMiB, s.GantryProcWriteMiB = ptr(dist(ioPR)), ptr(dist(ioPW))
 	}
 
 	if len(gA) > 0 {
@@ -855,6 +985,10 @@ func writeMarkdown(w io.Writer, s *Summary) {
 		{"gantry page cache peak (MiB)", fmtDistPtr(s.GantryFilePeakMiB)},
 		{"gantry page cache at end of tail (MiB)", fmtDistPtr(s.GantryFileEndMiB)},
 		{"gantry dirty page cache peak (MiB)", fmtDistPtr(s.GantryDirtyPeakMiB)},
+		{"gantry cgroup disk read incl. tail (MiB)", fmtDistPtr(s.GantryCgReadMiB)},
+		{"gantry cgroup disk write incl. tail (MiB)", fmtDistPtr(s.GantryCgWriteMiB)},
+		{"gantry process disk read incl. tail (MiB)", fmtDistPtr(s.GantryProcReadMiB)},
+		{"gantry process disk write incl. tail (MiB)", fmtDistPtr(s.GantryProcWriteMiB)},
 		{"containerd CPU avg (cores)", fmtDistPtr(s.CtrdCPUAvgCores)},
 		{"containerd CPU peak (cores)", fmtDistPtr(s.CtrdCPUPeakCores)},
 		{"containerd RSS avg (MiB)", fmtDistPtr(s.CtrdRSSAvgMiB)},
@@ -1035,6 +1169,10 @@ func writeCompare(w io.Writer, sums []*Summary) {
 	row("gantry anon peak MiB p50", dp(func(s *Summary) *Dist { return s.GantryAnonPeakMiB }, p50))
 	row("gantry page cache peak MiB p50", dp(func(s *Summary) *Dist { return s.GantryFilePeakMiB }, p50))
 	row("gantry page cache end MiB p50", dp(func(s *Summary) *Dist { return s.GantryFileEndMiB }, p50))
+	row("gantry cgroup disk write MiB p50", dp(func(s *Summary) *Dist { return s.GantryCgWriteMiB }, p50))
+	row("gantry cgroup disk write MiB max", dp(func(s *Summary) *Dist { return s.GantryCgWriteMiB }, mx))
+	row("gantry cgroup disk read MiB p50", dp(func(s *Summary) *Dist { return s.GantryCgReadMiB }, p50))
+	row("gantry process disk write MiB max", dp(func(s *Summary) *Dist { return s.GantryProcWriteMiB }, mx))
 
 	keys := map[string]bool{}
 

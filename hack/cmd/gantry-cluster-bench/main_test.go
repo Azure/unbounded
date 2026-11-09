@@ -365,7 +365,12 @@ func TestSummarizeMemSamples(t *testing.T) {
 		}
 
 		fmt.Fprintf(&b, "MEMSAMPLE n1 %d %d %d %d %d 0 %d 0 0\n", (100+i)*1e9, i*2048, cur, 50<<20, file, inactive)
+		// 1MiB read and 4KiB written per second (cgroup); the process
+		// counters are absent.
+		fmt.Fprintf(&b, "IOSAMPLE n1 %d %d %d - -\n", (100+i)*1e9, i<<20, i*4096)
 	}
+
+	b.WriteString("IOSAMPLE n1 truncated\n")
 
 	b.WriteString("MEMSAMPLE n1 truncated\n")
 	b.WriteString("RESULT n1 100000000000 110000000000 0\n")
@@ -396,8 +401,47 @@ func TestSummarizeMemSamples(t *testing.T) {
 		t.Fatalf("page cache: %+v %+v", s.GantryFilePeakMiB, s.GantryFileEndMiB)
 	}
 
+	if s.GantryCgReadMiB == nil || s.GantryCgReadMiB.N != 1 || s.GantryCgReadMiB.Max != 12 ||
+		math.Abs(s.GantryCgWriteMiB.Max-12*4096.0/(1<<20)) > 1e-9 {
+		t.Fatalf("gantry cgroup io: %+v %+v", s.GantryCgReadMiB, s.GantryCgWriteMiB)
+	}
+
+	if s.GantryProcReadMiB != nil || s.GantryProcWriteMiB != nil {
+		t.Fatalf("process io without data: %+v", s.GantryProcReadMiB)
+	}
+
 	// Samples at 100..112 s are in the window: 12 intervals of 2048 sectors.
 	if want := float64(12*2048*512) / 1e9; s.DiskReadGB == nil || math.Abs(s.DiskReadGB.Max-want) > 1e-9 {
 		t.Fatalf("disk read: %+v, want %v", s.DiskReadGB, want)
+	}
+}
+
+func TestParseIOSampleLine(t *testing.T) {
+	node, m, err := parseIOSampleLine(strings.Fields("IOSAMPLE n1 5 10 20 30 40"))
+	if err != nil || node != "n1" || m.ts != 5 || m.cgRead != 10 || m.cgWrite != 20 || m.procRead != 30 || m.procWrite != 40 ||
+		!m.hasCgroup || !m.hasProcess {
+		t.Fatalf("parse: %q %+v %v", node, m, err)
+	}
+
+	_, m, err = parseIOSampleLine(strings.Fields("IOSAMPLE n1 5 - - 1 2"))
+	if err != nil || m.hasCgroup || !m.hasProcess {
+		t.Fatalf("dashes: %+v %v", m, err)
+	}
+
+	for _, bad := range []string{"IOSAMPLE n1 5 1", "IOSAMPLE n1 - 1 2 3 4", "IOSAMPLE n1 5 x 2 3 4"} {
+		if _, _, err := parseIOSampleLine(strings.Fields(bad)); err == nil {
+			t.Errorf("%q: want error", bad)
+		}
+	}
+
+	// Deltas cover only samples in the window; a counter that goes
+	// backwards (a restarted container) counts as zero.
+	st := computeIO([]ioSample{
+		{ts: 1, cgRead: 100, cgWrite: 100, hasCgroup: true},
+		{ts: 5, cgRead: 150, cgWrite: 50, hasCgroup: true},
+		{ts: 99, cgRead: 1000, cgWrite: 1000, hasCgroup: true},
+	}, 0, 10)
+	if !st.hasCgroup || st.cgRead != 50 || st.cgWrite != 0 || st.hasProcess {
+		t.Fatalf("computeIO: %+v", st)
 	}
 }

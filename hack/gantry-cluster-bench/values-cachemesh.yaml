@@ -17,10 +17,12 @@ gantry:
     # 0 = agent default (32), the multi-hop relay grid. 256 (the cachemesh
     # library default) makes ~142 agents a 1-D fully direct grid.
     maxNeighbors: 0
-    # Chunk store: agent defaults (persist owned, 20GiB of chunk files in
-    # the pod's emptyDir, 2GiB in-flight budget, 512MiB hot page tier, 1MiB
-    # pages, O_DIRECT). Override with --set gantry.cachemesh.<key>=... to
-    # compare, for example persist=all or inflightBytes=1073741824.
+    # Chunk store: agent defaults (no private chunk files: containerd's
+    # content store, mounted read-only from
+    # /var/lib/containerd/io.containerd.content.v1.content, is the only disk
+    # copy; 2GiB in-flight budget, 512MiB hot page tier, 1MiB pages).
+    # Override with --set gantry.cachemesh.<key>=... to compare, for
+    # example inflightBytes=1073741824.
     # containerd verifies every blob digest itself, so the agent does not hash
     # again (SHA-256 caps one blob at ~1.8GB/s on the serving node).
     verifyDigest: false
