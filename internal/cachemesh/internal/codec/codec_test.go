@@ -16,12 +16,9 @@ func TestRoundTrip(t *testing.T) {
 	b = AppendU8(b, 7)
 	b = AppendBool(b, true)
 	b = AppendBool(b, false)
-	b = AppendU16(b, 0xbeef)
 	b = AppendU32(b, 0xdeadbeef)
 	b = AppendU64(b, math.MaxUint64-1)
 	b = AppendUvarint(b, 300)
-	b = AppendVarint(b, -12345)
-	b = AppendVarint(b, math.MinInt64)
 	b = AppendBytes(b, []byte("abc"))
 	b = AppendString(b, "")
 	b = AppendString(b, "hello")
@@ -36,10 +33,6 @@ func TestRoundTrip(t *testing.T) {
 		t.Fatal("Bool mismatch")
 	}
 
-	if got := r.U16(); got != 0xbeef {
-		t.Fatalf("U16 = %x", got)
-	}
-
 	if got := r.U32(); got != 0xdeadbeef {
 		t.Fatalf("U32 = %x", got)
 	}
@@ -50,14 +43,6 @@ func TestRoundTrip(t *testing.T) {
 
 	if got := r.Uvarint(); got != 300 {
 		t.Fatalf("Uvarint = %d", got)
-	}
-
-	if got := r.Varint(); got != -12345 {
-		t.Fatalf("Varint = %d", got)
-	}
-
-	if got := r.Varint(); got != math.MinInt64 {
-		t.Fatalf("Varint = %d", got)
 	}
 
 	if got := r.Bytes(10); !bytes.Equal(got, []byte("abc")) {
@@ -82,14 +67,6 @@ func TestRoundTrip(t *testing.T) {
 
 	if err := r.Done(); err != nil {
 		t.Fatalf("Done = %v", err)
-	}
-}
-
-func TestUvarintLen(t *testing.T) {
-	for _, v := range []uint64{0, 1, 127, 128, 16383, 16384, math.MaxUint32, math.MaxUint64} {
-		if got, want := UvarintLen(v), len(AppendUvarint(nil, v)); got != want {
-			t.Fatalf("UvarintLen(%d) = %d, want %d", v, got, want)
-		}
 	}
 }
 

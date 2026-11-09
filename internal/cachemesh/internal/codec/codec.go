@@ -48,9 +48,6 @@ func AppendBool(b []byte, v bool) []byte {
 	return append(b, 0)
 }
 
-// AppendU16 appends v as 2 little-endian bytes.
-func AppendU16(b []byte, v uint16) []byte { return binary.LittleEndian.AppendUint16(b, v) }
-
 // AppendU32 appends v as 4 little-endian bytes.
 func AppendU32(b []byte, v uint32) []byte { return binary.LittleEndian.AppendUint32(b, v) }
 
@@ -59,9 +56,6 @@ func AppendU64(b []byte, v uint64) []byte { return binary.LittleEndian.AppendUin
 
 // AppendUvarint appends v as a minimal unsigned varint.
 func AppendUvarint(b []byte, v uint64) []byte { return binary.AppendUvarint(b, v) }
-
-// AppendVarint appends v as a zig-zag signed varint.
-func AppendVarint(b []byte, v int64) []byte { return binary.AppendVarint(b, v) }
 
 // AppendBytes appends a uvarint length followed by p.
 func AppendBytes(b, p []byte) []byte {
@@ -75,18 +69,6 @@ func AppendString(b []byte, s string) []byte {
 	b = binary.AppendUvarint(b, uint64(len(s)))
 
 	return append(b, s...)
-}
-
-// UvarintLen returns the number of bytes AppendUvarint writes for v.
-func UvarintLen(v uint64) int {
-	n := 1
-
-	for v >= 0x80 {
-		v >>= 7
-		n++
-	}
-
-	return n
 }
 
 // Reader decodes values from a byte slice. The zero value reads nothing and
@@ -168,16 +150,6 @@ func (r *Reader) Bool() bool {
 	return v == 1
 }
 
-// U16 reads 2 little-endian bytes.
-func (r *Reader) U16() uint16 {
-	p := r.take(2)
-	if p == nil {
-		return 0
-	}
-
-	return binary.LittleEndian.Uint16(p)
-}
-
 // U32 reads 4 little-endian bytes.
 func (r *Reader) U32() uint32 {
 	p := r.take(4)
@@ -216,18 +188,6 @@ func (r *Reader) Uvarint() uint64 {
 	}
 
 	r.off += n
-
-	return v
-}
-
-// Varint reads a minimal zig-zag signed varint.
-func (r *Reader) Varint() int64 {
-	u := r.Uvarint()
-
-	v := int64(u >> 1) //nolint:gosec // zig-zag decoding reinterprets the bits.
-	if u&1 != 0 {
-		v = ^v
-	}
 
 	return v
 }
