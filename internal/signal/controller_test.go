@@ -220,6 +220,11 @@ func TestBuildResolvedWorkflowOrdersPhasesAndConcurrentStages(t *testing.T) {
 	optional := dagTasks[1].(map[string]any)
 	validation := dagTasks[2].(map[string]any)
 
+	templateRef := startup["templateRef"].(map[string]any)
+	if templateRef["name"] != adapterWorkflowTemplateName || templateRef["template"] != "certification" {
+		t.Fatalf("resolved stage templateRef = %#v", templateRef)
+	}
+
 	if _, exists := startup["depends"]; exists {
 		t.Fatal("first phase startup stage unexpectedly depends on another task")
 	}

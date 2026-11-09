@@ -2898,7 +2898,7 @@ func buildResolvedWorkflow(run *signalv1.CertificationRun) (*unstructured.Unstru
 				"name": taskName,
 				"templateRef": map[string]any{
 					"name":     adapterWorkflowTemplateName,
-					"template": "certification-stage",
+					"template": "certification",
 				},
 				"arguments": map[string]any{
 					"parameters": stageWorkflowParameters(
