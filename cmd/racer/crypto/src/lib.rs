@@ -1263,29 +1263,10 @@ pub mod identity {
             message: &[u8],
             signature: &[u8],
         ) -> Result<VerifiedPeer> {
-            self.verify_signed_fingerprint(
-                &chain_fingerprint(chain),
-                chain,
-                expected,
-                message,
-                signature,
-            )
-        }
-
-        /// Like [`Self::verify_signed`], reusing validation by a fingerprint that the
-        /// caller computed from `chain` with a collision-resistant digest.
-        pub fn verify_signed_fingerprint(
-            &self,
-            fingerprint: &[u8; 32],
-            chain: &[Vec<u8>],
-            expected: &NodeId,
-            message: &[u8],
-            signature: &[u8],
-        ) -> Result<VerifiedPeer> {
             if &self.cluster != self.keys.cluster() {
                 return Err(Error::Unauthorized);
             }
-            let key = self.key(fingerprint, chain, expected)?;
+            let key = self.key(&chain_fingerprint(chain), chain, expected)?;
             key.verify_strict(message, signature)
                 .map_err(|_| Error::Unauthorized)?;
             Ok(VerifiedPeer {

@@ -381,13 +381,7 @@ impl Signatures {
             return Err(Error::Replay);
         }
         self.certificates
-            .verify_signed_fingerprint(
-                chain.fingerprint(),
-                chain.certificates(),
-                &signer,
-                &base,
-                signature,
-            )
+            .verify_signed(chain.certificates(), &signer, &base, signature)
             .map_err(Into::into)
     }
 }
