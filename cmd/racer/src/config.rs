@@ -651,6 +651,17 @@ impl Config {
                 }
             }
         }
+        // Managed mode withholds one thread for control; the rest must still
+        // hold an I/O worker, a crypto helper, and the RDMA owner when enabled.
+        if self.managed()
+            && self.max_threads != DEFAULT_MAX_THREADS
+            && self.max_threads < MANAGED_MIN_THREADS + usize::from(self.enable_rdma)
+        {
+            return rule(
+                "RACER_MAX_THREADS",
+                "managed deployments need at least 3 threads, or 4 with RDMA enabled",
+            );
+        }
         if self.prefetch.default_pending_bytes > self.prefetch.max_pending_bytes {
             return rule(
                 "RACER_PREFETCH_DEFAULT_PENDING_BYTES, RACER_PREFETCH_MAX_PENDING_BYTES",
@@ -861,7 +872,8 @@ impl Config {
     /// The control thread is unpinned and mostly blocked on network I/O. With
     /// no explicit cap, worker sizing is already bounded by eligible CPUs, so
     /// nothing is withheld. An explicit cap must leave at least one I/O and one
-    /// crypto thread, so managed mode requires a cap of at least three.
+    /// crypto thread, plus the RDMA owner when RDMA is enabled, so managed mode
+    /// requires a cap of at least three, or four with RDMA.
     pub fn reserve_control_thread(&mut self) -> Result<()> {
         if !self.managed() {
             return Err(Error::InvalidConfiguration);
@@ -869,7 +881,7 @@ impl Config {
         if self.max_threads == DEFAULT_MAX_THREADS {
             return Ok(());
         }
-        if self.max_threads < MANAGED_MIN_THREADS {
+        if self.max_threads < MANAGED_MIN_THREADS + usize::from(self.enable_rdma) {
             return Err(Error::InvalidConfiguration);
         }
         let reserved = self.max_threads - 1;
@@ -2053,9 +2065,8 @@ mod tests {
         let mut capped = parse_managed(&[("RACER_MAX_THREADS", "3")]).unwrap();
         capped.reserve_control_thread().unwrap();
         assert_eq!(capped.max_threads, 2);
-        let mut minimal = parse_managed(&[("RACER_MAX_THREADS", "2")]).unwrap();
-        assert!(minimal.reserve_control_thread().is_err());
-        assert_eq!(minimal.max_threads, 2);
+        // Too small a managed cap is a configuration error before startup.
+        assert!(parse_managed(&[("RACER_MAX_THREADS", "2")]).is_err());
         // An exact pair that no longer fits after reservation is rejected unchanged.
         let mut exact = parse_managed(&[
             ("RACER_MAX_THREADS", "4"),
@@ -2084,6 +2095,25 @@ mod tests {
         rdma.reserve_control_thread().unwrap();
         assert_eq!(rdma.max_threads, 5);
         assert!(parse(&[]).unwrap().reserve_control_thread().is_err());
+    }
+
+    /// The RDMA owner needs a thread beside I/O, crypto, and managed control.
+    #[test]
+    fn managed_rdma_needs_four_threads() {
+        let Err(error) =
+            parse_managed(&[("RACER_MAX_THREADS", "3"), ("RACER_ENABLE_RDMA", "true")])
+        else {
+            panic!("managed RDMA with three threads must be rejected");
+        };
+        assert_eq!(error.name, "RACER_MAX_THREADS");
+        let mut rdma =
+            parse_managed(&[("RACER_MAX_THREADS", "4"), ("RACER_ENABLE_RDMA", "true")]).unwrap();
+        rdma.reserve_control_thread().unwrap();
+        assert_eq!(rdma.max_threads, 3);
+        let mut plain =
+            parse_managed(&[("RACER_MAX_THREADS", "3"), ("RACER_ENABLE_RDMA", "false")]).unwrap();
+        plain.reserve_control_thread().unwrap();
+        assert_eq!(plain.max_threads, 2);
     }
 
     fn parse(overrides: &[(&str, &str)]) -> Parsed {
