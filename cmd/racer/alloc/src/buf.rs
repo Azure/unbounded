@@ -58,7 +58,9 @@ use std::alloc::{Layout, dealloc};
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 
-/// Number of distinct capacities a pool can keep; later sizes are unpooled.
+/// Number of distinct capacities a pool keeps at once. When every class is
+/// in use, a new size takes over the least recently used class with no idle
+/// storage; if every class holds idle storage, the new size is unpooled.
 pub const MAX_CLASSES: usize = 16;
 
 /// Capacity granule. Capacities round up to this or the alignment, whichever
@@ -379,7 +381,12 @@ impl Shared {
         if self.closed.load(Ordering::Acquire) {
             return Some(region);
         }
-        if class.idle.fetch_add(1, Ordering::AcqRel) >= self.max_idle {
+        if class.idle.fetch_add(1, Ordering::AcqRel) >= self.max_idle
+            || class.capacity.load(Ordering::Acquire) != region.capacity
+        {
+            // Full, or the owner reassigned this class to another size while
+            // the buffer was out. The owner also drops mismatched regions on
+            // drain, which covers a reassignment racing this check.
             class.idle.fetch_sub(1, Ordering::AcqRel);
             self.rejects.fetch_add(1, Ordering::Relaxed);
             return Some(region);
@@ -433,6 +440,17 @@ pub struct Pool {
 
     // Checkouts that allocated (mapped) new storage.
     misses: u64,
+
+    // Checkouts unpooled because every class held idle storage.
+    unpooled: u64,
+
+    // Value of `takes` at each class's last checkout, to reassign the least
+    // recently used empty class.
+    last_take: [u64; MAX_CLASSES],
+
+    // Set after `mbind` refuses a mapping; node-targeted takes then reuse
+    // unbound storage.
+    bind_refused: bool,
 }
 
 /// Lifetime counters of a [`Pool`].
@@ -445,6 +463,9 @@ pub struct PoolCounters {
     /// Returned buffers the pool refused and freed (an `munmap` for large
     /// buffers): its idle cap or idle budget was full, or it was closed.
     pub rejects: u64,
+    /// Checkouts that could not be pooled because every size class held idle
+    /// storage of another size. Each one also counts as a miss.
+    pub unpooled: u64,
 }
 
 impl fmt::Debug for Pool {
@@ -476,6 +497,9 @@ impl Pool {
             granule: config.alignment.max(GRANULE),
             takes: 0,
             misses: 0,
+            unpooled: 0,
+            last_take: [0; MAX_CLASSES],
+            bind_refused: false,
         })
     }
 
@@ -485,6 +509,7 @@ impl Pool {
             hits: self.takes.wrapping_sub(self.misses),
             misses: self.misses,
             rejects: self.shared.rejects.load(Ordering::Relaxed) as u64,
+            unpooled: self.unpooled,
         }
     }
 
@@ -512,7 +537,7 @@ impl Pool {
             .ok_or(Error::InvalidConfiguration)
     }
 
-    fn class_for(&self, capacity: usize) -> u8 {
+    fn class_for(&mut self, capacity: usize) -> u8 {
         let mut free = None;
         for (index, class) in self.shared.classes.iter().enumerate() {
             match class.capacity.load(Ordering::Relaxed) {
@@ -521,22 +546,52 @@ impl Pool {
                 _ => {}
             }
         }
-        match free {
-            Some(index) => {
-                self.shared.classes[index]
-                    .capacity
-                    .store(capacity, Ordering::Relaxed);
-                index as u8
+        // Reassign the least recently used class without idle storage, so
+        // arrival order cannot pin the classes to stale sizes. Buffers of the
+        // old size still out are freed when they return.
+        let free = free.or_else(|| {
+            (0..MAX_CLASSES)
+                .filter(|&index| self.shared.classes[index].idle.load(Ordering::Acquire) == 0)
+                .min_by_key(|&index| self.last_take[index])
+        });
+        let Some(index) = free else {
+            return NO_CLASS;
+        };
+        self.drop_mismatched(index);
+        self.shared.classes[index]
+            .capacity
+            .store(capacity, Ordering::Release);
+        index as u8
+    }
+
+    /// Move class `index`'s return stack to the owner's list, freeing regions
+    /// of another capacity (returned around a reassignment of the class).
+    fn drain_class(&mut self, index: usize) {
+        let class = &self.shared.classes[index];
+        let local = &mut self.local[index];
+        class.take_all(|region| local.push(region));
+        self.drop_mismatched(index);
+    }
+
+    fn drop_mismatched(&mut self, index: usize) {
+        let class = &self.shared.classes[index];
+        let capacity = class.capacity.load(Ordering::Relaxed);
+        let shared = &self.shared;
+        self.local[index].retain_mut(|region| {
+            if region.capacity == capacity {
+                return true;
             }
-            None => NO_CLASS,
-        }
+            class.idle.fetch_sub(1, Ordering::AcqRel);
+            shared.uncharge(region);
+            false
+        });
     }
 
     fn pop(&mut self, class: u8, node: Option<u16>) -> Option<Box<Region>> {
         let index = usize::from(class);
+        self.last_take[index] = self.takes;
         if self.local[index].is_empty() || node.is_some() {
-            let local = &mut self.local[index];
-            self.shared.classes[index].take_all(|region| local.push(region));
+            self.drain_class(index);
         }
         let mut region = match node {
             None => self.local[index].pop()?,
@@ -569,8 +624,10 @@ impl Pool {
     /// new storage with that node as its preferred policy, so its pages
     /// land there whichever CPU first writes them. Storage the kernel will
     /// not bind (heap storage under 2 MiB, or a refused `mbind`) is still
-    /// returned, without a node. Idle storage bound to another node stays
-    /// pooled for its own node's takes until trimmed.
+    /// returned, without a node. Such storage can never be bound, so for
+    /// those sizes, and once `mbind` has been refused, `node` is ignored
+    /// and any idle storage is reused. Idle storage bound to another node
+    /// stays pooled for its own node's takes until trimmed.
     pub fn take_on<C: Charge>(
         &mut self,
         len: usize,
@@ -582,14 +639,20 @@ impl Pool {
         if !charge.covers(capacity) {
             return Err(Error::InvalidConfiguration);
         }
+        let node = node.filter(|_| capacity >= crate::HUGE_PAGE_BYTES && !self.bind_refused);
         let class = self.class_for(capacity);
         self.takes = self.takes.wrapping_add(1);
+        if class == NO_CLASS {
+            self.unpooled = self.unpooled.wrapping_add(1);
+        }
         let region = match (class != NO_CLASS).then(|| self.pop(class, node)).flatten() {
             Some(region) => region,
             None => {
                 let mut region = Region::allocate(capacity, self.alignment, class)?;
-                if let Some(node) = node {
-                    region.prefer_node(node);
+                if let Some(node) = node
+                    && !region.prefer_node(node)
+                {
+                    self.bind_refused = true;
                 }
                 self.misses = self.misses.wrapping_add(1);
                 region
@@ -612,9 +675,8 @@ impl Pool {
     }
 
     fn drain_returns(&mut self) {
-        for (index, class) in self.shared.classes.iter().enumerate() {
-            let local = &mut self.local[index];
-            class.take_all(|region| local.push(region));
+        for index in 0..MAX_CLASSES {
+            self.drain_class(index);
         }
     }
 
@@ -1078,6 +1140,7 @@ mod tests {
                 hits: 0,
                 misses: 3,
                 rejects: 1,
+                unpooled: 0,
             }
         );
         // Steady reuse within the idle budget allocates nothing new.
@@ -1092,6 +1155,7 @@ mod tests {
                 hits: 20,
                 misses: 3,
                 rejects: 1,
+                unpooled: 0,
             }
         );
         // The per-class cap refuses past four idle buffers.
@@ -1101,6 +1165,91 @@ mod tests {
             .collect();
         drop(held);
         assert_eq!(wide.counters().rejects, 1);
+    }
+
+    fn plain_pool() -> Pool {
+        Pool::new(
+            PoolConfig {
+                alignment: 4096,
+                max_idle_per_class: 4,
+            },
+            (),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn new_size_reclaims_empty_class() {
+        let mut pool = plain_pool();
+        // Distinct tail sizes claim every class and each keeps idle storage.
+        for i in 0..MAX_CLASSES {
+            drop(pool.take(1000 + i * GRANULE, (), false).unwrap());
+        }
+        // Every class holds idle storage: a new size cannot be pooled.
+        let big = 64 * GRANULE;
+        drop(pool.take(big, (), false).unwrap());
+        assert_eq!(pool.counters().unpooled, 1);
+        // Once a class is empty, a new size takes it over and is reused.
+        pool.clear();
+        let before = pool.counters();
+        for _ in 0..10 {
+            drop(pool.take(big, (), false).unwrap());
+            drop(pool.take(big + 16, (), false).unwrap());
+        }
+        let after = pool.counters();
+        assert_eq!(after.misses - before.misses, 2);
+        assert_eq!(after.unpooled, 1);
+    }
+
+    #[test]
+    fn reclaim_takes_least_recently_used_class() {
+        let mut pool = plain_pool();
+        let held: Vec<_> = (0..MAX_CLASSES)
+            .map(|i| pool.take(1000 + i * GRANULE, (), false).unwrap())
+            .collect();
+        // All classes are empty while buffers are out; class 0 is oldest.
+        let keep = pool
+            .take(1000 + (MAX_CLASSES - 1) * GRANULE, (), false)
+            .unwrap();
+        let fresh = pool.take(100 * GRANULE, (), false).unwrap();
+        assert_eq!(fresh.region().class, 0);
+        // The buffer of the old size returns to a reassigned class and is freed.
+        let rejects = pool.counters().rejects;
+        drop(held);
+        assert_eq!(pool.counters().rejects, rejects + 1);
+        drop((keep, fresh));
+        // The reassigned class serves its new size.
+        let before = pool.counters().misses;
+        drop(pool.take(100 * GRANULE, (), false).unwrap());
+        assert_eq!(pool.counters().misses, before);
+    }
+
+    #[test]
+    fn mismatched_return_is_dropped_on_drain() {
+        let mut pool = plain_pool();
+        let buf = pool.take(GRANULE, (), false).unwrap();
+        // Simulate a return that passed the capacity check just before the
+        // owner reassigned the class.
+        let region = Region::allocate(2 * GRANULE, 4096, 0).unwrap();
+        pool.shared.classes[0].idle.fetch_add(1, Ordering::AcqRel);
+        pool.shared.classes[0].push(region);
+        drop(buf);
+        let taken = pool.take(GRANULE, (), false).unwrap();
+        assert_eq!(taken.capacity(), GRANULE);
+        drop(taken);
+        pool.clear();
+        assert_eq!(pool.shared.classes[0].idle.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn node_take_reuses_storage_that_cannot_bind() {
+        let mut pool = plain_pool();
+        for _ in 0..5 {
+            drop(pool.take_on(1 << 20, (), false, Some(0)).unwrap());
+        }
+        let counters = pool.counters();
+        assert_eq!((counters.hits, counters.misses), (4, 1));
+        assert_eq!(pool.idle_bytes(), 1 << 20);
     }
 
     #[test]
