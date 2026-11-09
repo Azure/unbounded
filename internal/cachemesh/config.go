@@ -78,18 +78,19 @@ type Hooks struct {
 	OnLeaseError func(op string, err error)
 }
 
-// ElectionConfig tunes leader election. See the field documentation; zero
-// values select defaults.
-type ElectionConfig = control.ElectionConfig
-
-// HealthConfig tunes circuit breakers, outlier detection, latency
-// tracking, and the hedge budget. Zero values select defaults.
-type HealthConfig = route.HealthConfig
-
-// Tuning holds advanced knobs: control-plane timers, runtime limits,
-// leader work limits, and the Election and Health sub-configurations. Zero
-// values select defaults; production code usually leaves it zero.
-type Tuning = control.Tuning
+// Tuning types. They are aliases of the internal control-plane and
+// routing configuration, so Tuning passes to the control plane unchanged.
+type (
+	// Tuning holds advanced knobs: control-plane timers, runtime limits,
+	// leader work limits, and the Election and Health sub-configurations.
+	// Zero values select defaults; production code usually leaves it zero.
+	Tuning = control.Tuning
+	// ElectionConfig tunes leader election. Zero values select defaults.
+	ElectionConfig = control.ElectionConfig
+	// HealthConfig tunes circuit breakers, outlier detection, latency
+	// tracking, and the hedge budget. Zero values select defaults.
+	HealthConfig = route.HealthConfig
+)
 
 // Config configures a Mesh. Zero values select defaults.
 type Config struct {

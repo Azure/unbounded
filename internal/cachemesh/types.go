@@ -13,8 +13,8 @@ import (
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
 )
 
-// Routing types. They are aliases of the internal types, so values pass
-// between the public API and the routing core without conversion.
+// Routing and Lease types. They are aliases of the internal types, so
+// values pass between the public API and the core without conversion.
 type (
 	// Decision is the result of routing one request. See route.Decision.
 	Decision = route.Decision
@@ -32,11 +32,9 @@ type (
 	Version = view.Version
 	// Slot is a dense member index in a view. NoSlot means none.
 	Slot = view.Slot
-)
 
-// Lease types. kubelease.Store implements LeaseStore.
-type (
 	// LeaseStore executes Lease operations for leader election.
+	// kubelease.Store implements it.
 	LeaseStore = control.Store
 	// LeaseRecord is the cachemesh view of the leader Lease.
 	LeaseRecord = control.Record
