@@ -549,7 +549,11 @@ impl Registry {
                             .iter()
                             .any(|c| same_credential(c, &ticket.authorization)) =>
                 {
-                    unit.interest.remove(&key);
+                    // Dropping the last interest must release the unit the
+                    // same way a window shrink does, or a queued unit with no
+                    // interest is never dispatched and its page stays in
+                    // `pending_bytes` forever.
+                    self.drop_interest(&key, &unit_key);
                     ticket.rejected.insert(unit_key);
                 }
                 Some(unit) => {

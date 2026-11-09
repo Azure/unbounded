@@ -1065,6 +1065,50 @@ fn rejected_credentials_fail_only_their_tickets() {
     assert!(r.fill_once(UnitOutcome::Admitted).is_none());
 }
 
+/// A re-PUT that moves a ticket onto a credential the origin already refused
+/// for a shared unit drops the ticket's interest; when it was the last
+/// interest, the queued unit is removed and its page released.
+#[test]
+fn rejected_reput_releases_an_unwanted_unit() {
+    let mut r = rig(Config::default());
+    let page = pages(KEY_A, 0, 1);
+    r.put_with(
+        "a",
+        auth_spec(
+            "\"priority\":\"high\",\"generation\":1,\"sequence\":1,",
+            &[&page],
+        ),
+        token("Bearer one"),
+    )
+    .unwrap();
+    r.put_with(
+        "b",
+        auth_spec(
+            "\"priority\":\"low\",\"generation\":1,\"sequence\":1,",
+            &[&page],
+        ),
+        token("Bearer two"),
+    )
+    .unwrap();
+    let forbidden = UnitOutcome::Failed(RefError::Forbidden);
+    assert_eq!(r.fill_once(forbidden), Some(Some(b"Bearer one".to_vec())));
+    assert_eq!(r.outcome("a").1, Some(RefError::Forbidden));
+    assert_ne!(r.registry.pending_bytes(), 0);
+    // B moves onto the refused credential with a new spec for the same unit.
+    r.put_with(
+        "b",
+        auth_spec(
+            "\"priority\":\"normal\",\"generation\":1,\"sequence\":2,",
+            &[&page],
+        ),
+        token("Bearer one"),
+    )
+    .unwrap();
+    assert_eq!(r.outcome("b").1, Some(RefError::Forbidden));
+    assert_eq!(r.registry.pending_bytes(), 0);
+    assert!(r.fill_once(UnitOutcome::Admitted).is_none());
+}
+
 /// Every accepted PUT replaces the credential, including a same-body replay
 /// with a rotated token, and a refused ticket is filled again with its new one.
 #[test]
