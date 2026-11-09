@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"maps"
 	"slices"
 	"strconv"
 	"sync"
@@ -50,10 +49,13 @@ func fastTuning() cachemesh.Tuning {
 
 const epochPeriod = 200 * time.Millisecond
 
-// neighborLog checks that a member's watcher sees consistent sets.
+// neighborLog checks that a member's watcher sees consistent sets. Peers
+// are keyed by PeerRef, the identity the NeighborWatcher contract uses: a
+// member that is removed and rejoins gets a new slot, so the same ID can
+// be added at the new slot while the old slot still lingers.
 type neighborLog struct {
 	mu   sync.Mutex
-	set  map[string]cachemesh.PeerRef
+	set  map[cachemesh.PeerRef]struct{}
 	errs []string
 }
 
@@ -62,19 +64,19 @@ func (l *neighborLog) OnNeighbors(added, removed []cachemesh.PeerRef) {
 	defer l.mu.Unlock()
 
 	for _, p := range removed {
-		if l.set[p.ID] != p {
-			l.errs = append(l.errs, "removed unknown "+p.ID)
+		if _, ok := l.set[p]; !ok {
+			l.errs = append(l.errs, fmt.Sprintf("removed unknown %+v", p))
 		}
 
-		delete(l.set, p.ID)
+		delete(l.set, p)
 	}
 
 	for _, p := range added {
-		if _, ok := l.set[p.ID]; ok {
-			l.errs = append(l.errs, "added twice "+p.ID)
+		if _, ok := l.set[p]; ok {
+			l.errs = append(l.errs, fmt.Sprintf("added twice %+v", p))
 		}
 
-		l.set[p.ID] = p
+		l.set[p] = struct{}{}
 	}
 }
 
@@ -82,8 +84,17 @@ func (l *neighborLog) ids() []string {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	return slices.Sorted(maps.Keys(l.set))
+	ids := make([]string, 0, len(l.set))
+	for p := range l.set {
+		ids = append(ids, refString(p))
+	}
+
+	slices.Sort(ids)
+
+	return ids
 }
+
+func refString(p cachemesh.PeerRef) string { return fmt.Sprintf("%+v", p) }
 
 type member struct {
 	m      *cachemesh.Mesh
@@ -120,7 +131,7 @@ func newCluster(t *testing.T, n int) *cluster {
 			seeds = []string{"m0", "m" + strconv.Itoa(i/2)}
 		}
 
-		nb := &neighborLog{set: map[string]cachemesh.PeerRef{}}
+		nb := &neighborLog{set: map[cachemesh.PeerRef]struct{}{}}
 
 		m, err := cachemesh.New(cachemesh.Config{
 			ID: addr, Addr: addr, Transport: c.net.Transport(addr), Seeds: seeds,
@@ -306,7 +317,7 @@ func (c *cluster) checkNeighbors() error {
 
 		var want []string
 		for _, p := range m.m.Neighbors() {
-			want = append(want, p.ID)
+			want = append(want, refString(p))
 		}
 
 		slices.Sort(want)
@@ -462,4 +473,31 @@ func TestCluster(t *testing.T) {
 		c.waitFor(t, "routes after leave", 10*time.Second, func() error { return c.checkRoutes(blobs, 32) })
 		c.waitFor(t, "neighbors after leave", 10*time.Second, c.checkNeighbors)
 	})
+}
+
+// TestNeighborLogRejoin checks the harness accepts a member that rejoins
+// at a new slot while its old slot still lingers, as the NeighborWatcher
+// contract allows: removals match additions by PeerRef, not by ID.
+func TestNeighborLogRejoin(t *testing.T) {
+	l := &neighborLog{set: map[cachemesh.PeerRef]struct{}{}}
+	old := cachemesh.PeerRef{Slot: 3, ID: "m1", Addr: "m1"}
+	rejoined := cachemesh.PeerRef{Slot: 9, ID: "m1", Addr: "m1"}
+
+	l.OnNeighbors([]cachemesh.PeerRef{old}, nil)
+	l.OnNeighbors([]cachemesh.PeerRef{rejoined}, nil)
+	l.OnNeighbors(nil, []cachemesh.PeerRef{old})
+
+	if len(l.errs) > 0 {
+		t.Fatalf("unexpected errors: %v", l.errs)
+	}
+
+	if got, want := l.ids(), []string{refString(rejoined)}; !slices.Equal(got, want) {
+		t.Fatalf("set = %v, want %v", got, want)
+	}
+
+	l.OnNeighbors(nil, []cachemesh.PeerRef{old})
+
+	if len(l.errs) != 1 {
+		t.Fatalf("errs = %v, want one removed-unknown error", l.errs)
+	}
 }
