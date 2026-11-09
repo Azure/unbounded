@@ -1545,3 +1545,30 @@ fn sim_cancel_during_eagain_poll_reports_canceled_not_mask() {
         assert_eq!(reactor.in_flight(), 0);
     }
 }
+
+/// A failed in-reactor resubmission surfaces the push error itself, not an
+/// errno substitute.
+#[test]
+fn sim_failed_retry_resubmission_reports_overloaded() {
+    let os = SimOs::new();
+    let clock = crate::ctx::VirtualClock::new();
+    let reactor = simulated(&os, &clock);
+    let (_left, right) = os.socket_pair();
+    let drops = Rc::new(Cell::new(0));
+    os.inject("recv", Fault::Errno(libc::EAGAIN)).unwrap();
+    let mut recv = reactor.recv(
+        Rc::new(right),
+        vec![0; 8],
+        Lease(drops.clone()),
+        &OpCtx::none(),
+    );
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(Pin::new(&mut recv).poll(&mut cx).is_pending());
+    // The recv is published; reject the readiness poll that retries it.
+    os.reject_submissions(1).unwrap();
+    let executor = LocalExecutor::new(Some(reactor.wake_handle()));
+    let result = executor.block_on(&reactor, recv).unwrap();
+    assert_eq!(result.unwrap_err(), Error::Overloaded);
+    assert_eq!(drops.get(), 1);
+    assert_eq!(reactor.in_flight(), 0);
+}

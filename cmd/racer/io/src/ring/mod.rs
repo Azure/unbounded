@@ -394,6 +394,9 @@ struct Slot {
 
     polling: bool,
 
+    /// Error from a failed in-reactor resubmission, delivered as-is.
+    retry_error: Option<Error>,
+
     prepare: Option<Prepare>,
 
     discard: Option<Discard>,
@@ -422,6 +425,7 @@ impl Slot {
             retry_fd: -1,
             attempts: 0,
             polling: false,
+            retry_error: None,
             prepare: None,
             discard: None,
             scratch: Scratch::new(),
@@ -492,6 +496,7 @@ impl Slab {
         slot.waker = None;
         slot.attempts = 0;
         slot.polling = false;
+        slot.retry_error = None;
         let generation = slot.generation;
         self.live += 1;
         Some(IoId::new(index, generation))
@@ -915,6 +920,7 @@ impl Reactor {
         // SAFETY: the slot holds the O submitted under this id.
         let owner = unsafe { slot.owner.take::<O>() };
         let cancel = slot.cancel;
+        let retry_error = slot.retry_error.take();
         state.release_slot(id);
         drop(state);
         // A success that already completed is delivered even if the future
@@ -926,6 +932,10 @@ impl Reactor {
         {
             owner.discard(result);
             return Poll::Ready(Err(reason));
+        }
+        if let Some(error) = retry_error {
+            owner.discard(result);
+            return Poll::Ready(Err(error));
         }
         Poll::Ready(owner.finish(result, self))
     }
@@ -1156,12 +1166,9 @@ impl Reactor {
                     Err(error) => {
                         let slot = state.slab.lookup(id).expect("retried slot");
                         slot.fence = Fence::Retired;
-                        return Self::finish(
-                            state,
-                            id,
-                            -error.errno().unwrap_or(libc::EBUSY),
-                            wakers,
-                        );
+                        let errno = -error.errno().unwrap_or(libc::EBUSY);
+                        slot.retry_error = Some(error);
+                        return Self::finish(state, id, errno, wakers);
                     }
                 }
             }
