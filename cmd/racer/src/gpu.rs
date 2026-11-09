@@ -89,8 +89,8 @@
 //! bouncing it through host memory. Each GPU still verifies the tag
 //! itself. A failed peer copy turns that GPU pair off for the life of the
 //! process. A peer copy is queued on the page's stream with no host wait. A
-//! bounce copies into the lane's pinned host slot on the source GPU's
-//! utility stream, and the page's stream waits on that fence
+//! bounce copies into the lane's pinned host slot on the executor's own
+//! utility stream for the source GPU, and the page's stream waits on that fence
 //! ([`racer_gpu::Stream::wait_for`]) before copying it in. The page holds the
 //! source `Arc` until it is answered, so the source slot is never reused
 //! while a copy may read it.
@@ -1383,10 +1383,6 @@ struct Device {
     context: racer_gpu::Context,
     /// The staging buffer, allocated on first use.
     staging: Mutex<Option<Arc<racer_gpu::StagingBuffer>>>,
-    /// A stream for reading ciphertext back to the host when it moves to a
-    /// GPU without a peer path. Made on first use; any executor may queue
-    /// on it.
-    utility: Mutex<Option<Arc<racer_gpu::Stream>>>,
     /// Events for fences on this GPU's streams.
     events: racer_gpu::EventPool,
     queue: Arc<Queue>,
@@ -1428,19 +1424,6 @@ impl Engine {
         Ok(buffer)
     }
 
-    /// GPU `ordinal`'s utility stream, made on first use.
-    fn utility(&self, ordinal: i32) -> Result<Arc<racer_gpu::Stream>> {
-        let device = self.device(ordinal)?;
-        let mut utility = device.utility.lock().map_err(|_| Error::Internal)?;
-        if let Some(stream) = utility.as_ref() {
-            return Ok(stream.clone());
-        }
-        let stream = Arc::new(device.context.stream().map_err(gpu_error)?);
-        self.state.streams.fetch_add(1, Ordering::Relaxed);
-        *utility = Some(stream.clone());
-        Ok(stream)
-    }
-
     /// The buffer that holds ciphertext on another GPU.
     fn source_buffer(&self, source: &Remote) -> Result<Arc<racer_gpu::StagingBuffer>> {
         match source.landed {
@@ -1479,20 +1462,14 @@ impl Engine {
     /// and the slot goes back for another cuFile read or NIC write. The
     /// streams retain the GPU allocation, not the slot. If no fence
     /// succeeds, the slot is quarantined for the life of the process.
-    /// `fenced` says whether the request stream synchronized.
-    fn fence_source(&self, mut fenced: bool, source: &SealedSource) {
+    /// `fenced` says whether the request stream and the calling executor's
+    /// utility stream for the source GPU (if any) synchronized.
+    fn fence_source(&self, fenced: bool, source: &SealedSource) {
         let ordinal = match source {
             SealedSource::Host(_) => return,
             SealedSource::Staged { staged, .. } => staged.ordinal(),
             SealedSource::Landed(landed) => landed.ordinal(),
         };
-        let utility = self
-            .device(ordinal)
-            .ok()
-            .and_then(|device| device.utility.lock().ok()?.clone());
-        if let Some(utility) = utility {
-            fenced &= utility.synchronize().is_ok();
-        }
         if fenced {
             return;
         }
@@ -1585,7 +1562,6 @@ fn coordinator_main(
                         events: context.event_pool(IDLE_EVENTS),
                         context,
                         staging: Mutex::new(None),
-                        utility: Mutex::new(None),
                         queue: Arc::new(Queue::new(state.queue_depth)),
                     })
                 })
@@ -1666,6 +1642,7 @@ fn spawn_executor(
         waiting: std::collections::VecDeque::new(),
         requests: HashMap::new(),
         tainted: Vec::new(),
+        utility: HashMap::new(),
     };
     let spawned = std::thread::Builder::new()
         .name(format!("racer-gpu-{}", device.ordinal))
@@ -2262,6 +2239,10 @@ struct Executor {
     waiting: std::collections::VecDeque<WriteTask>,
     requests: HashMap<u64, Owned>,
     tainted: Vec<Tainted>,
+    /// This executor's streams for reading ciphertext back to the host from
+    /// another GPU without a peer path, by source GPU ordinal. Made on first
+    /// use and driven only by this executor's thread.
+    utility: HashMap<i32, racer_gpu::Stream>,
 }
 
 /// Offsets of scratch pair `pair`: ciphertext, then partial plaintext.
@@ -2517,6 +2498,13 @@ impl Executor {
             self.tainted.push(Tainted { stream, pair });
         }
         if let Work::Sealed(sealed) = &task.work {
+            let ordinal = match &sealed.page.source {
+                SealedSource::Host(_) => None,
+                SealedSource::Staged { staged, .. } => Some(staged.ordinal()),
+                SealedSource::Landed(landed) => Some(landed.ordinal()),
+            };
+            let utility = ordinal.and_then(|ordinal| self.utility.get(&ordinal));
+            let fenced = fenced && utility.is_none_or(|stream| stream.synchronize().is_ok());
             self.engine.fence_source(fenced, &sealed.page.source);
         }
         self.engine.note_leaks();
@@ -2880,9 +2868,21 @@ impl Executor {
         ciphertext: u64,
         length: u64,
     ) -> Result<Option<racer_gpu::Fence>> {
-        let utility = self.engine.utility(remote.ordinal)?;
-        let events = self.engine.device(remote.ordinal)?.events.clone();
         let pinned = self.pinned_slot(index).filter(|pinned| !pinned.in_flight());
+        let utility = match self.utility.entry(remote.ordinal) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let stream = self
+                    .engine
+                    .device(remote.ordinal)?
+                    .context
+                    .stream()
+                    .map_err(gpu_error)?;
+                self.engine.state.streams.fetch_add(1, Ordering::Relaxed);
+                entry.insert(stream)
+            }
+        };
+        let events = self.engine.device(remote.ordinal)?.events.clone();
         let stream = self.lanes[index].stream.as_ref().ok_or(Error::Internal)?;
         let destination = racer_gpu::Destination::Staging(staging);
         if let Some(pinned) = pinned {
@@ -2920,6 +2920,10 @@ impl Executor {
         }
         for tainted in self.tainted.drain(..) {
             drop(tainted.stream);
+            streams.fetch_sub(1, Ordering::Relaxed);
+        }
+        for (_, stream) in self.utility.drain() {
+            drop(stream);
             streams.fetch_sub(1, Ordering::Relaxed);
         }
         self.engine.note_leaks();
@@ -4155,6 +4159,40 @@ mod tests {
             assert!(helper.run(|| simulation().take_violations()).is_empty());
             assert_eq!(helper.leaked(), 0);
         }
+    }
+
+    #[test]
+    /// Two executors that bounce ciphertext from the same source GPU each
+    /// use their own utility stream, so neither syncs or clears the other's
+    /// queued copies.
+    fn executors_bounce_through_their_own_utility_streams() {
+        let options = GpuOptions {
+            peer: false,
+            ..GpuOptions::default()
+        };
+        let helper = helper_with_options(&[None, None, None], options, |_| {});
+        let plaintext = plaintext();
+        let fds: Vec<(u64, OwnedFd)> = (1..=2u64)
+            .map(|id| (id, import(&helper, id, id as i32)))
+            .collect();
+        helper.run(|| simulation().set_query_delay(10));
+        let pending = fds
+            .iter()
+            .map(|(id, _)| submit(&helper, *id, staged(&helper, 0, &plaintext), 0..5000).unwrap())
+            .collect();
+        assert!(answers(pending).into_iter().all(|result| result.is_ok()));
+        for (_, fd) in &fds {
+            assert_eq!(
+                racer_gpu::simulation::read_allocation(fd, 0, 5000),
+                plaintext
+            );
+        }
+        assert_eq!(counter(&helper.counters().peer_bounces), 2);
+        // One request stream on each destination GPU, plus one utility
+        // stream per executor for source GPU 0.
+        assert_eq!(helper.executor_streams(), 4);
+        assert!(helper.run(|| simulation().take_violations()).is_empty());
+        assert_eq!(helper.leaked(), 0);
     }
 
     #[test]

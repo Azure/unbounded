@@ -2,7 +2,8 @@
 //!
 //! Every CUDA, NVML and cuFile call goes through a small C shim,
 //! `libracer_gpu_cuda.so.1` (`native/gpu_cuda.c`), loaded with `dlopen` and
-//! checked with `racer_gpu_abi()`. The types here are `Send` and `Sync`, so
+//! checked with `racer_gpu_abi()`. The types here are `Send` and `Sync`
+//! (except [`Stream`], which is only `Send`), so
 //! the dataplane can run one executor thread per GPU and still reach another
 //! GPU's buffers for peer copies, but every call may block on the driver:
 //! use them on GPU executor threads, never on I/O threads. [`FileReader`]
@@ -428,8 +429,9 @@ unsafe impl Send for ImportInner {}
 unsafe impl Sync for ImportInner {}
 unsafe impl Send for StagingInner {}
 unsafe impl Sync for StagingInner {}
+// A stream is not `Sync`: the shim drives one stream from one thread at a
+// time, and its fence bookkeeping assumes no other thread queues work on it.
 unsafe impl Send for Stream {}
-unsafe impl Sync for Stream {}
 unsafe impl Send for GpuFile {}
 unsafe impl Sync for GpuFile {}
 unsafe impl Send for PinnedInner {}
@@ -1126,6 +1128,18 @@ unsafe extern "C" fn host_callback(data: *mut c_void) {
 }
 
 /// A CUDA stream. Work is visible only after [`Stream::synchronize`].
+///
+/// A stream is `Send` but not `Sync`: one thread drives it at a time.
+///
+/// ```compile_fail
+/// fn sync<T: Sync>() {}
+/// sync::<racer_gpu::Stream>();
+/// ```
+///
+/// ```
+/// fn send<T: Send>() {}
+/// send::<racer_gpu::Stream>();
+/// ```
 pub struct Stream {
     context: Context,
 
