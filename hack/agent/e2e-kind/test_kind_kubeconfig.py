@@ -8,7 +8,6 @@ import textwrap
 import threading
 import unittest
 from pathlib import Path
-from unittest import mock
 
 import e2e
 import isolation_plan as plan
