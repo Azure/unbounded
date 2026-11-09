@@ -11,9 +11,9 @@ import (
 	"time"
 
 	"github.com/Azure/unbounded/internal/cachemesh/internal/elect"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/health"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/leader"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/node"
+	"github.com/Azure/unbounded/internal/cachemesh/internal/route"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
 )
 
@@ -86,7 +86,7 @@ type ElectionConfig = elect.Config
 
 // HealthConfig tunes circuit breakers, outlier detection, latency
 // tracking, and the hedge budget. Zero values select defaults.
-type HealthConfig = health.Config
+type HealthConfig = route.HealthConfig
 
 // LeaderTuning tunes the work of the elected leader. Zero values select
 // defaults. Every member should use the same values, since any member may

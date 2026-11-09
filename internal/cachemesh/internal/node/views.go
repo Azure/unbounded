@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/Azure/unbounded/internal/cachemesh/internal/elect"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/health"
+	"github.com/Azure/unbounded/internal/cachemesh/internal/route"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/wire"
 )
@@ -348,7 +348,7 @@ func (n *Node) forwardCell(enc []byte, seq uint64, l int8, cell uint32, attempt 
 
 		k := v.Key(s)
 		sc := view.Score(k, seq)
-		usable := n.hl.Usable(s) != health.Unusable
+		usable := n.hl.Usable(s) != route.Unusable
 
 		if best == view.NoSlot || (usable && !bestUsable) ||
 			(usable == bestUsable && view.Better(sc, k, bestScore, v.Key(best))) {
@@ -562,9 +562,9 @@ func (n *Node) updateNeighbors(now int64) {
 // syncHealth makes the health tracker track exactly the current and
 // lingering neighbors.
 func (n *Node) syncHealth() {
-	ps := make([]health.Ref, len(n.neighbors))
+	ps := make([]route.TrackRef, len(n.neighbors))
 	for i, nb := range n.neighbors {
-		ps[i] = health.Ref{Slot: nb.slot, Key: nb.key, Cell: nb.cell}
+		ps[i] = route.TrackRef{Slot: nb.slot, Key: nb.key, Cell: nb.cell}
 	}
 
 	n.hl.Sync(ps)
@@ -660,9 +660,9 @@ func (n *Node) pingDone(now int64, p *pending, ok bool, rtt time.Duration) {
 
 	if n.v.Key(p.slot) == p.key {
 		if ok {
-			n.hl.Observe(p.slot, health.Success, rtt)
+			n.hl.Observe(p.slot, route.Success, rtt)
 		} else {
-			n.hl.Observe(p.slot, health.Timeout, 0)
+			n.hl.Observe(p.slot, route.Timeout, 0)
 		}
 	}
 

@@ -9,8 +9,6 @@ import (
 	"time"
 
 	"github.com/Azure/unbounded/internal/cachemesh/internal/elect"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/epoch"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/health"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/route"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
 )
@@ -27,9 +25,9 @@ type (
 	// Header is the fixed-size data-plane header sent with every request.
 	Header = route.Header
 	// Result is the outcome of a request reported to Observe.
-	Result = health.Result
+	Result = route.Result
 	// Stamp is an expiry stamp carried with a cached metadata value.
-	Stamp = epoch.Stamp
+	Stamp = route.Stamp
 	// Version is a membership view version, ordered by term then seq.
 	Version = view.Version
 	// Slot is a dense member index in a view. NoSlot means none.
@@ -66,10 +64,10 @@ const (
 
 // Request outcomes for Observe.
 const (
-	Success  = health.Success
-	Failure  = health.Failure
-	Timeout  = health.Timeout
-	Overload = health.Overload
+	Success  = route.Success
+	Failure  = route.Failure
+	Timeout  = route.Timeout
+	Overload = route.Overload
 )
 
 // Header constants.
@@ -107,7 +105,7 @@ var (
 func ParseHeader(b []byte) (Header, error) { return route.ParseHeader(b) }
 
 // MinTTL is the smallest nonzero metadata TTL.
-const MinTTL = epoch.MinTTL
+const MinTTL = route.MinTTL
 
 // Keyspace names an independent set of keys. Each keyspace hashes into the
 // shared partition table with its own seed, so placements of different

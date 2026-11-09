@@ -11,8 +11,6 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/Azure/unbounded/internal/cachemesh/internal/epoch"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/health"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/node"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/route"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
@@ -133,14 +131,14 @@ func (c *DataPlaneConfig) defaults(members int) {
 }
 
 // HealthConfig returns the health configuration of variant v.
-func HealthConfig(v HealthVariant) health.Config {
+func HealthConfig(v HealthVariant) route.HealthConfig {
 	switch v {
 	case HealthPanic:
-		return health.Config{MaxEjectionPercent: 60, PanicThreshold: 20}
+		return route.HealthConfig{MaxEjectionPercent: 60, PanicThreshold: 20}
 	case HealthHedge:
-		return health.Config{HedgeRatio: 0.5}
+		return route.HealthConfig{HedgeRatio: 0.5}
 	default:
-		return health.Config{}
+		return route.HealthConfig{}
 	}
 }
 
@@ -176,7 +174,7 @@ const (
 
 // withHealthDefaults fills in the health defaults the data-plane checks
 // read.
-func withHealthDefaults(c health.Config) health.Config {
+func withHealthDefaults(c route.HealthConfig) route.HealthConfig {
 	if c.HedgeMax <= 0 {
 		c.HedgeMax = healthHedgeMax
 	}
@@ -332,7 +330,7 @@ type dpStamp struct {
 	n      *node.Node
 	at     int64
 	seed   uint64
-	st     epoch.Stamp
+	st     route.Stamp
 }
 
 // DataPlane is the data-plane Workload: it routes requests hop by hop over
@@ -346,8 +344,8 @@ type DataPlane struct {
 	mem  []dpMember
 	trk  []trackRing
 	gen  uint64
-	hcfg health.Config // the variant's health configuration
-	lim  health.Config // hcfg with the defaults the checks read
+	hcfg route.HealthConfig // the variant's health configuration
+	lim  route.HealthConfig // hcfg with the defaults the checks read
 
 	clients  []uint32 // hot members that issue half of the requests
 	open     []*dpReq
@@ -446,7 +444,7 @@ func (w *DataPlane) Attach(c *Cluster) {
 	w.keys = NewKeyGen(c.Sim.Stream("dataplane/keys"), 100_000)
 	w.mem = make([]dpMember, len(c.members))
 	w.trk = make([]trackRing, len(c.members))
-	w.period = epoch.DefaultPeriod
+	w.period = route.DefaultEpochPeriod
 	w.driftPPB = scenarioDriftPPB(c.sc)
 
 	for k := range w.cov.kinds {
@@ -459,7 +457,7 @@ func (w *DataPlane) Attach(c *Cluster) {
 	w.cov.expired, w.cov.invalidated, w.cov.over = h("stamp-expired"), h("stamp-invalidated"), h("overload")
 
 	for s := range w.cov.health {
-		w.cov.health[s] = h("health-" + health.State(s).String())
+		w.cov.health[s] = h("health-" + route.PeerHealth(s).String())
 	}
 }
 
@@ -1009,19 +1007,19 @@ func (h *dpHop) Complete(_ uint64, resp *Message, err error) {
 
 	switch code {
 	case ackSuccess:
-		hl.Observe(h.toSlot, health.Success, lat)
+		hl.Observe(h.toSlot, route.Success, lat)
 		w.branchEnd(r, resOpen)
 
 		return
 	case ackOverload:
-		hl.Observe(h.toSlot, health.Overload, lat)
+		hl.Observe(h.toSlot, route.Overload, lat)
 	case 0:
-		hl.Observe(h.toSlot, health.Timeout, lat)
+		hl.Observe(h.toSlot, route.Timeout, lat)
 	default:
-		hl.Observe(h.toSlot, health.Failure, lat)
+		hl.Observe(h.toSlot, route.Failure, lat)
 	}
 
-	if s, _, _ := hl.PeerState(h.toSlot); s != health.StateHealthy {
+	if s, _, _ := hl.PeerState(h.toSlot); s != route.StateHealthy {
 		w.cov.health[s].Hit()
 	}
 
@@ -1342,25 +1340,25 @@ func (w *DataPlane) checkMembers() {
 }
 
 // healthCov records the health states present in cts.
-func (w *DataPlane) healthCov(cts health.Counts) {
+func (w *DataPlane) healthCov(cts route.Counts) {
 	if cts.Healthy > 0 {
-		w.cov.health[health.StateHealthy].Hit()
+		w.cov.health[route.StateHealthy].Hit()
 	}
 
 	if cts.Degraded > 0 {
-		w.cov.health[health.StateDegraded].Hit()
+		w.cov.health[route.StateDegraded].Hit()
 	}
 
 	if cts.Busy > 0 {
-		w.cov.health[health.StateBusy].Hit()
+		w.cov.health[route.StateBusy].Hit()
 	}
 
 	if cts.Ejected > 0 {
-		w.cov.health[health.StateEjected].Hit()
+		w.cov.health[route.StateEjected].Hit()
 	}
 
 	if cts.Probing > 0 {
-		w.cov.health[health.StateProbing].Hit()
+		w.cov.health[route.StateProbing].Hit()
 	}
 }
 
@@ -1610,7 +1608,7 @@ func (w *DataPlane) walk(from, p uint32, dims int) error {
 		}
 
 		if d.Kind == route.KindOwner || d.Kind == route.KindBackup {
-			if d.Kind == route.KindBackup && st.Env().Health().Usable(d.Owner.Slot) == health.Healthy {
+			if d.Kind == route.KindBackup && st.Env().Health().Usable(d.Owner.Slot) == route.Healthy {
 				return fmt.Errorf("backup chosen at member %d with a healthy owner", at)
 			}
 

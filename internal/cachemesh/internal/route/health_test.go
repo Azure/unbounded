@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-package health
+package route
 
 import (
 	"math/rand/v2"
@@ -13,31 +13,31 @@ import (
 
 const sec = int64(time.Second)
 
-func newT(cfg Config) *Tracker {
-	return NewTracker(cfg, rand.New(rand.NewPCG(1, 2)))
+func newT(cfg HealthConfig) *HealthTracker {
+	return NewHealthTracker(cfg, rand.New(rand.NewPCG(1, 2)))
 }
 
 // trackN tracks n peers, slots 0..n-1, each in its own group of cellSize.
-func trackN(t *Tracker, n, cellSize int) {
+func trackN(t *HealthTracker, n, cellSize int) {
 	for i := range n {
 		t.Track(uint32(i), uint64(1000+i), uint32(i/cellSize))
 	}
 }
 
-func fail(t *Tracker, slot uint32, n int) {
+func failN(t *HealthTracker, slot uint32, n int) {
 	for range n {
 		t.Observe(slot, Failure, time.Millisecond)
 	}
 }
 
 func TestBreakerTrips(t *testing.T) {
-	tr := newT(Config{})
+	tr := newT(HealthConfig{})
 	trackN(tr, 20, 4)
 	tr.Tick(0)
 
-	fail(tr, 1, 4)
+	failN(tr, 1, 4)
 	tr.Observe(1, Success, time.Millisecond)
-	fail(tr, 1, 4)
+	failN(tr, 1, 4)
 
 	if tr.Usable(1) != Healthy {
 		t.Fatal("4 failures + success + 4 failures must not trip")
@@ -60,7 +60,7 @@ func TestEjectionBackoffProbeAndCap(t *testing.T) {
 		durs   []time.Duration
 	)
 
-	tr := newT(Config{Hooks: Hooks{
+	tr := newT(HealthConfig{Hooks: HealthHooks{
 		OnEject: func(_ uint32, r Reason, n int, d time.Duration) {
 			events = append(events, r.String())
 			durs = append(durs, d)
@@ -72,7 +72,7 @@ func TestEjectionBackoffProbeAndCap(t *testing.T) {
 
 	now := int64(0)
 	tr.Tick(now)
-	fail(tr, 0, 5)
+	failN(tr, 0, 5)
 
 	for i := 1; i <= 12; i++ {
 		now += sec / 10
@@ -142,12 +142,12 @@ func TestEjectionBackoffProbeAndCap(t *testing.T) {
 }
 
 func TestMaxEjectionPercent(t *testing.T) {
-	tr := newT(Config{})
+	tr := newT(HealthConfig{})
 	trackN(tr, 50, 1000) // one cell, so only the percent limit applies
 	tr.Tick(0)
 
 	for i := range 50 {
-		fail(tr, uint32(i), 5)
+		failN(tr, uint32(i), 5)
 	}
 
 	if c := tr.Counts(); c.Ejected != 5 {
@@ -155,10 +155,10 @@ func TestMaxEjectionPercent(t *testing.T) {
 	}
 
 	// At least one may always be ejected.
-	small := newT(Config{})
+	small := newT(HealthConfig{})
 	trackN(small, 3, 3)
-	fail(small, 0, 5)
-	fail(small, 1, 5)
+	failN(small, 0, 5)
+	failN(small, 1, 5)
 
 	if c := small.Counts(); c.Ejected != 1 {
 		t.Fatalf("small: ejected %d want 1", c.Ejected)
@@ -166,10 +166,10 @@ func TestMaxEjectionPercent(t *testing.T) {
 }
 
 func TestLastUsableInCell(t *testing.T) {
-	tr := newT(Config{MaxEjectionPercent: 100, PanicThreshold: 100})
+	tr := newT(HealthConfig{MaxEjectionPercent: 100, PanicThreshold: 100})
 	trackN(tr, 8, 2) // cells of 2
-	fail(tr, 0, 5)
-	fail(tr, 1, 5)
+	failN(tr, 0, 5)
+	failN(tr, 1, 5)
 
 	if tr.Usable(0) != Unusable || tr.Usable(1) != Healthy {
 		t.Fatal("last member of a cell must not be ejected")
@@ -178,14 +178,14 @@ func TestLastUsableInCell(t *testing.T) {
 	// Move slot 1 (same key) into cell 1, which then has three usable
 	// members; two of them may be ejected.
 	tr.Track(1, 1001, 1)
-	fail(tr, 1, 5)
+	failN(tr, 1, 5)
 
 	if tr.Usable(1) != Unusable {
 		t.Fatal("slot 1 has peers in its new cell")
 	}
 
-	fail(tr, 2, 5)
-	fail(tr, 3, 5)
+	failN(tr, 2, 5)
+	failN(tr, 3, 5)
 
 	if c := tr.Counts(); c.Ejected != 3 || tr.Usable(3) != Healthy {
 		t.Fatalf("ejected %d want 3", c.Ejected)
@@ -195,7 +195,7 @@ func TestLastUsableInCell(t *testing.T) {
 func TestSuccessRate(t *testing.T) {
 	var reasons []Reason
 
-	tr := newT(Config{ConsecutiveFailures: 1000, Hooks: Hooks{OnEject: func(_ uint32, r Reason, _ int, _ time.Duration) {
+	tr := newT(HealthConfig{ConsecutiveFailures: 1000, Hooks: HealthHooks{OnEject: func(_ uint32, r Reason, _ int, _ time.Duration) {
 		reasons = append(reasons, r)
 	}}})
 	trackN(tr, 10, 10)
@@ -232,7 +232,7 @@ func TestSuccessRate(t *testing.T) {
 }
 
 func TestSuccessRateMinHosts(t *testing.T) {
-	tr := newT(Config{FailurePercentageThreshold: 100})
+	tr := newT(HealthConfig{FailurePercentageThreshold: 100})
 	trackN(tr, 4, 4)
 	tr.Tick(0)
 
@@ -255,7 +255,7 @@ func TestSuccessRateMinHosts(t *testing.T) {
 }
 
 func TestFailurePercentage(t *testing.T) {
-	tr := newT(Config{ConsecutiveFailures: 1000})
+	tr := newT(HealthConfig{ConsecutiveFailures: 1000})
 	trackN(tr, 20, 4)
 	tr.Tick(0)
 
@@ -264,7 +264,7 @@ func TestFailurePercentage(t *testing.T) {
 			tr.Observe(slot, Success, 0)
 		}
 
-		fail(tr, slot, fails)
+		failN(tr, slot, fails)
 	}
 	obs(0, 7, 43)  // 86% of 50: eject
 	obs(4, 8, 42)  // 84%: keep
@@ -284,11 +284,11 @@ func TestFailurePercentage(t *testing.T) {
 func TestPanicThreshold(t *testing.T) {
 	var panics []bool
 
-	tr := newT(Config{MaxEjectionPercent: 100, Hooks: Hooks{OnPanic: func(p bool) { panics = append(panics, p) }}})
+	tr := newT(HealthConfig{MaxEjectionPercent: 100, Hooks: HealthHooks{OnPanic: func(p bool) { panics = append(panics, p) }}})
 	trackN(tr, 10, 10)
 
 	for i := range 5 {
-		fail(tr, uint32(i), 5)
+		failN(tr, uint32(i), 5)
 	}
 
 	tr.Tick(0)
@@ -297,7 +297,7 @@ func TestPanicThreshold(t *testing.T) {
 		t.Fatal("5/10 is not more than 50%")
 	}
 
-	fail(tr, 5, 5)
+	failN(tr, 5, 5)
 	tr.Tick(1)
 
 	if !tr.Panic() || tr.Usable(0) != Healthy {
@@ -322,7 +322,7 @@ func TestPanicThreshold(t *testing.T) {
 func TestDegradedByEWMA(t *testing.T) {
 	var flips int
 
-	tr := newT(Config{Hooks: Hooks{OnDegraded: func(uint32, bool) { flips++ }}})
+	tr := newT(HealthConfig{Hooks: HealthHooks{OnDegraded: func(uint32, bool) { flips++ }}})
 	trackN(tr, 5, 5)
 	tr.Tick(0)
 
@@ -366,7 +366,7 @@ func TestDegradedByEWMA(t *testing.T) {
 	}
 
 	// Floor: everything fast, 3x median below floor is not degraded.
-	tr2 := newT(Config{})
+	tr2 := newT(HealthConfig{})
 	trackN(tr2, 3, 3)
 	tr2.Observe(0, Success, time.Millisecond)
 	tr2.Observe(1, Success, time.Millisecond)
@@ -379,7 +379,7 @@ func TestDegradedByEWMA(t *testing.T) {
 }
 
 func TestBusy(t *testing.T) {
-	tr := newT(Config{})
+	tr := newT(HealthConfig{})
 	trackN(tr, 10, 2)
 	tr.Tick(0)
 
@@ -409,7 +409,7 @@ func TestBusy(t *testing.T) {
 }
 
 func TestHedgeAfter(t *testing.T) {
-	tr := newT(Config{})
+	tr := newT(HealthConfig{})
 	trackN(tr, 3, 3)
 
 	if tr.HedgeAfter(0) != time.Second || tr.HedgeAfter(99) != time.Second {
@@ -427,7 +427,7 @@ func TestHedgeAfter(t *testing.T) {
 }
 
 func TestHedgeBudget(t *testing.T) {
-	tr := newT(Config{})
+	tr := newT(HealthConfig{})
 	tr.Tick(0)
 
 	for range 16000 {
@@ -462,10 +462,10 @@ func TestHedgeBudget(t *testing.T) {
 }
 
 func TestUntrackRetrack(t *testing.T) {
-	tr := newT(Config{})
+	tr := newT(HealthConfig{})
 	trackN(tr, 20, 4)
 	tr.Observe(3, Success, 40*time.Millisecond)
-	fail(tr, 3, 5)
+	failN(tr, 3, 5)
 
 	if tr.Usable(3) != Unusable {
 		t.Fatal("ejected")
@@ -499,7 +499,7 @@ func TestUntrackRetrack(t *testing.T) {
 
 func TestTableManySlots(t *testing.T) {
 	rng := rand.New(rand.NewPCG(7, 7))
-	tr := newT(Config{})
+	tr := newT(HealthConfig{})
 	want := map[uint32]uint64{}
 
 	for range 5000 {
@@ -549,7 +549,7 @@ func TestTableManySlots(t *testing.T) {
 func TestRandomizedInvariants(t *testing.T) {
 	for seed := range uint64(20) {
 		rng := rand.New(rand.NewPCG(seed, 1))
-		tr := NewTracker(Config{MaxEjectionPercent: 30}, rand.New(rand.NewPCG(seed, 2)))
+		tr := NewHealthTracker(HealthConfig{MaxEjectionPercent: 30}, rand.New(rand.NewPCG(seed, 2)))
 		now := int64(0)
 
 		for step := range 3000 {
@@ -595,7 +595,7 @@ func TestRandomizedInvariants(t *testing.T) {
 }
 
 func BenchmarkObserve(b *testing.B) {
-	tr := newT(Config{})
+	tr := newT(HealthConfig{})
 	trackN(tr, 250, 4)
 	tr.Tick(0)
 
@@ -607,7 +607,7 @@ func BenchmarkObserve(b *testing.B) {
 }
 
 func BenchmarkObserveParallel(b *testing.B) {
-	tr := newT(Config{})
+	tr := newT(HealthConfig{})
 	trackN(tr, 250, 4)
 	tr.Tick(0)
 	b.ResetTimer()
@@ -621,7 +621,7 @@ func BenchmarkObserveParallel(b *testing.B) {
 }
 
 func BenchmarkUsable(b *testing.B) {
-	tr := newT(Config{})
+	tr := newT(HealthConfig{})
 	trackN(tr, 250, 4)
 	tr.Tick(0)
 
@@ -640,7 +640,7 @@ func BenchmarkUsable(b *testing.B) {
 }
 
 func BenchmarkHedge(b *testing.B) {
-	tr := newT(Config{})
+	tr := newT(HealthConfig{})
 
 	b.RunParallel(func(pb *testing.PB) {
 		h := rand.Uint64()
@@ -655,7 +655,7 @@ func BenchmarkHedge(b *testing.B) {
 }
 
 func TestConcurrentHotAndControl(t *testing.T) {
-	tr := newT(Config{})
+	tr := newT(HealthConfig{})
 	trackN(tr, 100, 4)
 
 	var (
@@ -699,11 +699,11 @@ func TestConcurrentHotAndControl(t *testing.T) {
 }
 
 func TestSyncReplacesTrackedSet(t *testing.T) {
-	tr := newT(Config{})
+	tr := newT(HealthConfig{})
 	trackN(tr, 20, 4)
 	tr.Tick(0)
-	fail(tr, 0, 5)
-	fail(tr, 1, 5)
+	failN(tr, 0, 5)
+	failN(tr, 1, 5)
 
 	if tr.Usable(0) != Unusable || tr.Usable(1) != Unusable {
 		t.Fatal("setup: slots 0 and 1 not ejected")
@@ -711,14 +711,14 @@ func TestSyncReplacesTrackedSet(t *testing.T) {
 
 	// Keep 0..9 (slot 1 with a new key, slot 3 in a new cell), add 30, drop
 	// the rest; slot 5 appears twice and the last entry wins.
-	var peers []Ref
+	var peers []TrackRef
 	for i := range uint32(10) {
-		peers = append(peers, Ref{Slot: i, Key: uint64(1000 + i), Cell: i / 4})
+		peers = append(peers, TrackRef{Slot: i, Key: uint64(1000 + i), Cell: i / 4})
 	}
 
 	peers[1].Key = 7
 	peers[3].Cell = 9
-	peers = append(peers, Ref{Slot: 30, Key: 30, Cell: 9}, Ref{Slot: 5, Key: 1005, Cell: 2})
+	peers = append(peers, TrackRef{Slot: 30, Key: 30, Cell: 9}, TrackRef{Slot: 5, Key: 1005, Cell: 2})
 	tr.Sync(peers)
 
 	if tr.Tracked() != 11 {

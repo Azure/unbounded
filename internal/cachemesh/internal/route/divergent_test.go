@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Azure/unbounded/internal/cachemesh/internal/health"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view/viewtest"
 )
@@ -40,11 +39,11 @@ func TestDivergentHealthViews(t *testing.T) {
 			tr := newTracker(tc.panicP)
 			perm := rng.Perm(tc.n)[:tc.bad]
 
-			refs := make([]health.Ref, 0, len(perm))
+			refs := make([]TrackRef, 0, len(perm))
 
 			for _, s := range perm {
 				if s != i {
-					refs = append(refs, health.Ref{Slot: view.Slot(s), Key: v.Key(view.Slot(s)), Cell: fakeCell})
+					refs = append(refs, TrackRef{Slot: view.Slot(s), Key: v.Key(view.Slot(s)), Cell: fakeCell})
 				}
 			}
 
@@ -52,7 +51,7 @@ func TestDivergentHealthViews(t *testing.T) {
 
 			for k, r := range refs {
 				if k%3 == 0 {
-					tr.Observe(r.Slot, health.Overload, 0)
+					tr.Observe(r.Slot, Overload, 0)
 				} else {
 					fail(tr, r.Slot)
 				}
@@ -97,8 +96,8 @@ func TestDivergentHealthViews(t *testing.T) {
 	}
 }
 
-func fail(tr *health.Tracker, s view.Slot) {
+func fail(tr *HealthTracker, s view.Slot) {
 	for range 5 {
-		tr.Observe(s, health.Failure, time.Millisecond)
+		tr.Observe(s, Failure, time.Millisecond)
 	}
 }

@@ -1,11 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package epoch implements the rolling cluster epoch and the expiry stamps
+// Epochs. This file implements the rolling cluster epoch and the expiry stamps
 // built on it.
 //
 // The leader publishes an epoch number every period as a heartbeat. Each
-// member maps its own monotonic clock onto that epoch with a Tracker:
+// member maps its own monotonic clock onto that epoch with a EpochTracker:
 //
 //	current = max(previous, anchorEpoch + floor((now - anchorMono) / period))
 //
@@ -38,7 +38,8 @@
 // at most ceil(T/period)*period + period of the issuing clock: T + period
 // when T is a multiple of the period, always less than T + 2*period. A TTL of zero never expires.
 // Nothing here uses floating point; members compare stamps exactly.
-package epoch
+
+package route
 
 import (
 	"math"
@@ -49,15 +50,15 @@ import (
 const (
 	// MinTTL is the smallest nonzero TTL a metadata keyspace may use.
 	MinTTL = 5 * time.Minute
-	// DefaultPeriod is the default epoch period.
-	DefaultPeriod = 15 * time.Second
+	// DefaultEpochPeriod is the default epoch period.
+	DefaultEpochPeriod = 15 * time.Second
 	// Never is the Expires value of a stamp that never expires.
 	Never = math.MaxUint64
 )
 
-// Tracker maps local monotonic time to the cluster epoch. The zero value is
+// EpochTracker maps local monotonic time to the cluster epoch. The zero value is
 // ready to use with epoch 0 anchored at mono 0 and DefaultPeriod.
-type Tracker struct {
+type EpochTracker struct {
 	cur atomic.Uint64
 
 	// Writer-only fields.
@@ -71,15 +72,15 @@ type Tracker struct {
 }
 
 // Current returns the current epoch. Safe for concurrent use.
-func (t *Tracker) Current() uint64 { return t.cur.Load() }
+func (t *EpochTracker) Current() uint64 { return t.cur.Load() }
 
 // Period returns the period of the latest anchor.
-func (t *Tracker) Period() time.Duration {
+func (t *EpochTracker) Period() time.Duration {
 	if p := time.Duration(t.period.Load()); p > 0 {
 		return p
 	}
 
-	return DefaultPeriod
+	return DefaultEpochPeriod
 }
 
 // Anchor records that epoch began (or was observed) at local time now with
@@ -88,9 +89,9 @@ func (t *Tracker) Period() time.Duration {
 // unchanged period, is ignored (see the package documentation). The
 // returned value is the current epoch, which may exceed epoch if this
 // member is already ahead.
-func (t *Tracker) Anchor(epoch uint64, period time.Duration, now int64) uint64 {
+func (t *EpochTracker) Anchor(epoch uint64, period time.Duration, now int64) uint64 {
 	if period <= 0 {
-		period = DefaultPeriod
+		period = DefaultEpochPeriod
 	}
 
 	if t.anchored && period == t.Period() && epoch <= t.at(now) {
@@ -106,7 +107,7 @@ func (t *Tracker) Anchor(epoch uint64, period time.Duration, now int64) uint64 {
 }
 
 // at returns the epoch the current anchor gives for local time now.
-func (t *Tracker) at(now int64) uint64 {
+func (t *EpochTracker) at(now int64) uint64 {
 	e := t.anchorEpoch
 	if d := now - t.anchorMono; d > 0 {
 		n := uint64(d / int64(t.Period()))
@@ -122,7 +123,7 @@ func (t *Tracker) at(now int64) uint64 {
 
 // Advance recomputes the epoch for local time now and returns it. It never
 // decreases the epoch.
-func (t *Tracker) Advance(now int64) uint64 {
+func (t *EpochTracker) Advance(now int64) uint64 {
 	e := t.at(now)
 
 	if prev := t.cur.Load(); e <= prev {
@@ -151,7 +152,7 @@ func StampFor(current uint64, ttl, period time.Duration, gen uint32) Stamp {
 	}
 
 	if period <= 0 {
-		period = DefaultPeriod
+		period = DefaultEpochPeriod
 	}
 
 	if ttl < 0 {

@@ -8,7 +8,7 @@
 // A Node owns everything one member knows about the cluster: its current
 // membership view and a view.DeltaLog for serving catch-up, an
 // elect.Elector, a leader.Leader that plans deltas while this member leads,
-// an epoch.Tracker, and a health.Tracker for its data-plane neighbors.
+// an route.EpochTracker, and a route.HealthTracker for its data-plane neighbors.
 //
 //   - Views. Deltas arrive in Broadcast messages and catch-up responses.
 //     A delta whose base is the current version is applied; one that is
@@ -77,9 +77,8 @@ import (
 	"time"
 
 	"github.com/Azure/unbounded/internal/cachemesh/internal/elect"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/epoch"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/health"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/leader"
+	"github.com/Azure/unbounded/internal/cachemesh/internal/route"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/wire"
 )
@@ -117,7 +116,7 @@ type Config struct {
 
 	Elect  elect.Config
 	Leader leader.Config
-	Health health.Config
+	Health route.HealthConfig
 
 	EpochPeriod      time.Duration
 	PingInterval     time.Duration
@@ -164,7 +163,7 @@ func (c *Config) defaults() {
 		c.PartitionBits = leader.DefaultPartitionBits
 	}
 
-	dur(&c.EpochPeriod, epoch.DefaultPeriod)
+	dur(&c.EpochPeriod, route.DefaultEpochPeriod)
 	dur(&c.PingInterval, DefaultPingInterval)
 	dur(&c.PingTimeout, DefaultPingTimeout)
 	num(&c.SuspectAfter, DefaultSuspectAfter)
@@ -283,8 +282,8 @@ type Node struct {
 
 	el     *elect.Elector
 	ld     *leader.Leader
-	ep     epoch.Tracker
-	hl     *health.Tracker
+	ep     route.EpochTracker
+	hl     *route.HealthTracker
 	shared *Shared
 
 	started  bool
@@ -384,7 +383,7 @@ func New(cfg Config, rng *rand.Rand) *Node {
 	n.el.SetHooks(cfg.Hooks.Elect)
 	n.ld = leader.New(cfg.Leader, rng)
 	n.ld.SetHooks(cfg.Hooks.Leader)
-	n.hl = health.NewTracker(cfg.Health, rng)
+	n.hl = route.NewHealthTracker(cfg.Health, rng)
 
 	return n
 }
@@ -412,10 +411,10 @@ func (n *Node) JoinRetry() time.Duration { return n.cfg.JoinRetry }
 func (n *Node) Seeds(dst []string) []string { return append(dst, n.seeds...) }
 
 // Health returns the neighbor health tracker.
-func (n *Node) Health() *health.Tracker { return n.hl }
+func (n *Node) Health() *route.HealthTracker { return n.hl }
 
 // Epoch returns the epoch tracker.
-func (n *Node) Epoch() *epoch.Tracker { return &n.ep }
+func (n *Node) Epoch() *route.EpochTracker { return &n.ep }
 
 // Elector returns the elector (read-only use).
 func (n *Node) Elector() *elect.Elector { return n.el }
@@ -1097,7 +1096,7 @@ func (n *Node) OnReply(now int64, id uint64, resp []byte, err error) {
 		}
 	case callBroadcast:
 		if p.slot != view.NoSlot {
-			n.hl.Observe(p.slot, health.Success, time.Duration(now-p.sentAt))
+			n.hl.Observe(p.slot, route.Success, time.Duration(now-p.sentAt))
 		}
 	case callRouted:
 	}

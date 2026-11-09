@@ -68,7 +68,7 @@ import (
 	"time"
 
 	"github.com/Azure/unbounded/internal/cachemesh/internal/control"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/epoch"
+	"github.com/Azure/unbounded/internal/cachemesh/internal/route"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
 )
 
@@ -86,7 +86,7 @@ const (
 	DefaultCellSize            = 4
 	DefaultMaxNeighbors        = 256
 	DefaultPartitionBits       = view.DefaultPartitionBits
-	DefaultEpochPeriod         = epoch.DefaultPeriod
+	DefaultEpochPeriod         = route.DefaultEpochPeriod
 	DefaultSlotReuseEpochs     = 16
 	DefaultHandoffEpochs       = 8
 	DefaultMaxPending          = 4096

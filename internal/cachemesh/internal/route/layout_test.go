@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-package health
+package route
 
 import (
 	"testing"
@@ -11,7 +11,7 @@ import (
 // TestPeerLayout checks that the three access groups of Peer each fill one
 // 64-byte line.
 func TestPeerLayout(t *testing.T) {
-	var p Peer
+	var p healthPeer
 
 	if got := unsafe.Sizeof(p); got != 192 {
 		t.Fatalf("sizeof(Peer) = %d, want 192", got)

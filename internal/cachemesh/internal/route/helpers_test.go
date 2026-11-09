@@ -9,8 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Azure/unbounded/internal/cachemesh/internal/epoch"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/health"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
 )
 
@@ -24,18 +22,18 @@ const (
 
 // newTracker returns a tracker that can eject any number of peers and
 // never panics unless panicAt is set.
-func newTracker(panicAt int) *health.Tracker {
+func newTracker(panicAt int) *HealthTracker {
 	if panicAt <= 0 {
 		panicAt = 100
 	}
 
-	tr := health.NewTracker(health.Config{MaxEjectionPercent: 100, PanicThreshold: panicAt}, rand.New(rand.NewPCG(1, 2)))
+	tr := NewHealthTracker(HealthConfig{MaxEjectionPercent: 100, PanicThreshold: panicAt}, rand.New(rand.NewPCG(1, 2)))
 	tr.Track(dummySlot, 1, fakeCell)
 
 	return tr
 }
 
-func eject(t testing.TB, tr *health.Tracker, v *view.View, slots ...view.Slot) {
+func eject(t testing.TB, tr *HealthTracker, v *view.View, slots ...view.Slot) {
 	t.Helper()
 
 	for _, s := range slots {
@@ -44,21 +42,21 @@ func eject(t testing.TB, tr *health.Tracker, v *view.View, slots ...view.Slot) {
 
 	for _, s := range slots {
 		for range 5 {
-			tr.Observe(s, health.Failure, time.Millisecond)
+			tr.Observe(s, Failure, time.Millisecond)
 		}
 
-		if tr.Usable(s) != health.Unusable {
+		if tr.Usable(s) != Unusable {
 			t.Fatalf("slot %d not ejected", s)
 		}
 	}
 }
 
-func degrade(t testing.TB, tr *health.Tracker, v *view.View, s view.Slot) {
+func degrade(t testing.TB, tr *HealthTracker, v *view.View, s view.Slot) {
 	t.Helper()
 	tr.Track(s, v.Key(s), fakeCell)
-	tr.Observe(s, health.Overload, 0)
+	tr.Observe(s, Overload, 0)
 
-	if tr.Usable(s) != health.Degraded {
+	if tr.Usable(s) != Degraded {
 		t.Fatalf("slot %d not degraded", s)
 	}
 }
@@ -78,8 +76,8 @@ func newFixture(v *view.View, env *Env) *fixture {
 	return f
 }
 
-func newEnv(tr *health.Tracker, cur uint64) *Env {
-	e := &epoch.Tracker{}
+func newEnv(tr *HealthTracker, cur uint64) *Env {
+	e := &EpochTracker{}
 	e.Anchor(cur, 15*time.Second, 0)
 
 	return NewEnv(Config{Health: tr, Epoch: e})

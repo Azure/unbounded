@@ -3,15 +3,18 @@
 
 // Package route is the cachemesh request hot path: given a key, or the
 // header of a request received from another member, it decides where the
-// request goes next.
+// request goes next. It also holds the hot-path state routing reads: the
+// neighbor HealthTracker (health.go), the EpochTracker and expiry stamps
+// (epoch.go), and the request Header and version Notes (header.go,
+// notes.go).
 //
 // # Contract
 //
 // A State is an immutable snapshot of everything routing needs from the
 // control plane: one *view.View and the slot of this member in it. It also
 // points at the long-lived, concurrently updated pieces shared by all states
-// of one member, bundled in an Env: the health.Tracker (atomics), the
-// epoch.Tracker, the gateway list used while this member is not in the view,
+// of one member, bundled in an Env: the HealthTracker (atomics), the
+// EpochTracker, the gateway list used while this member is not in the view,
 // and the Notes that collect view versions seen in incoming headers.
 //
 // The runtime keeps the current *State in an atomic.Pointer and replaces it
@@ -94,8 +97,6 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/Azure/unbounded/internal/cachemesh/internal/epoch"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/health"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
 )
 
@@ -191,10 +192,10 @@ func (d *Decision) AlternateHeader() Header {
 type Config struct {
 	// Health tracks neighbor health. Nil means a private default tracker
 	// with nothing tracked, so every peer is Healthy.
-	Health *health.Tracker
+	Health *HealthTracker
 	// Epoch is the member's epoch tracker. Nil means a private tracker
 	// fixed at epoch 0.
-	Epoch *epoch.Tracker
+	Epoch *EpochTracker
 	// Notes receives versions seen in headers. Nil means a private Notes.
 	Notes *Notes
 	// Gateways are used while this member is not in its view. Entries
@@ -218,8 +219,8 @@ type gateway struct {
 // Env holds the long-lived routing dependencies shared by every State of
 // one member. Build it once with NewEnv.
 type Env struct {
-	health  *health.Tracker
-	epoch   *epoch.Tracker
+	health  *HealthTracker
+	epoch   *EpochTracker
 	notes   *Notes
 	gws     []gateway
 	selfID  string
@@ -239,11 +240,11 @@ func NewEnv(cfg Config) *Env {
 	}
 
 	if e.health == nil {
-		e.health = health.NewTracker(health.Config{}, rand.New(rand.NewPCG(0, 0)))
+		e.health = NewHealthTracker(HealthConfig{}, rand.New(rand.NewPCG(0, 0)))
 	}
 
 	if e.epoch == nil {
-		e.epoch = &epoch.Tracker{}
+		e.epoch = &EpochTracker{}
 	}
 
 	if e.notes == nil {
@@ -264,10 +265,10 @@ func NewEnv(cfg Config) *Env {
 }
 
 // Health returns the health tracker.
-func (e *Env) Health() *health.Tracker { return e.health }
+func (e *Env) Health() *HealthTracker { return e.health }
 
 // Epoch returns the epoch tracker.
-func (e *Env) Epoch() *epoch.Tracker { return e.epoch }
+func (e *Env) Epoch() *EpochTracker { return e.epoch }
 
 // Notes returns the notes.
 func (e *Env) Notes() *Notes { return e.notes }
@@ -276,8 +277,8 @@ func (e *Env) Notes() *Notes { return e.notes }
 type State struct {
 	v        *view.View
 	env      *Env
-	h        *health.Tracker
-	e        *epoch.Tracker
+	h        *HealthTracker
+	e        *EpochTracker
 	shape    *view.Shape
 	table    *view.Table
 	self     view.Slot
@@ -406,25 +407,25 @@ func fillRef(dst *PeerRef, slot view.Slot, m *view.Member) {
 
 // Stamp returns the expiry stamp for a value of keyspace seed with ttl,
 // issued now.
-func (s *State) Stamp(seed uint64, ttl time.Duration) epoch.Stamp {
+func (s *State) Stamp(seed uint64, ttl time.Duration) Stamp {
 	period := s.v.Period()
 	if period <= 0 {
 		period = s.e.Period()
 	}
 
-	return epoch.StampFor(s.e.Current(), ttl, period, s.v.Gen(seed))
+	return StampFor(s.e.Current(), ttl, period, s.v.Gen(seed))
 }
 
 // Fresh reports whether a value of keyspace seed with stamp st is fresh.
 // Without a configured view this member has not heard the cluster epoch
 // (its tracker counts from its own start), so only stamps that never
 // expire are fresh.
-func (s *State) Fresh(seed uint64, st epoch.Stamp) bool {
-	if s.table == nil && st.Expires != epoch.Never {
+func (s *State) Fresh(seed uint64, st Stamp) bool {
+	if s.table == nil && st.Expires != Never {
 		return false
 	}
 
-	return epoch.Fresh(st, s.e.Current(), s.v.Gen(seed))
+	return Fresh(st, s.e.Current(), s.v.Gen(seed))
 }
 
 // TryHedge admits a hedge of the request carrying the header within the
@@ -527,16 +528,16 @@ func (s *State) ForwardTo(d *Decision, h Header) error {
 	return nil
 }
 
-// cand is a ranked candidate. class is a health.Usability; the zero value
+// cand is a ranked candidate. class is a Usability; the zero value
 // (class Unusable) is an empty candidate that every usable one beats.
 type cand struct {
 	score uint64
 	key   uint64
 	slot  view.Slot
-	class health.Usability
+	class Usability
 }
 
-func (c *cand) ok() bool { return c.class != health.Unusable }
+func (c *cand) ok() bool { return c.class != Unusable }
 
 func (a *cand) better(b *cand) bool {
 	if a.class != b.class {
@@ -560,9 +561,9 @@ func (t *top3) add(c cand) {
 	}
 }
 
-func (s *State) usable(slot view.Slot, ignore bool) health.Usability {
+func (s *State) usable(slot view.Slot, ignore bool) Usability {
 	if ignore || slot == s.self {
-		return health.Healthy
+		return Healthy
 	}
 
 	return s.h.Usable(slot)
@@ -578,7 +579,7 @@ func (s *State) best2(cell uint32, pm uint64, avoid view.Slot, ignore bool) (can
 		}
 
 		u := s.usable(m, ignore)
-		if u == health.Unusable {
+		if u == Unusable {
 			continue
 		}
 
@@ -682,7 +683,7 @@ func (s *State) prev(d *Decision, p uint32) {
 func (s *State) final(d *Decision, p uint32, owner view.Slot, oc uint32, avoid view.Slot, standin bool) {
 	all := s.h.AllHealthy()
 
-	ou := health.Healthy
+	ou := Healthy
 	if !all {
 		ou = s.h.Usable(owner)
 	}
@@ -697,7 +698,7 @@ func (s *State) final(d *Decision, p uint32, owner view.Slot, oc uint32, avoid v
 		}
 
 		u := s.usable(m, all)
-		if u == health.Unusable {
+		if u == Unusable {
 			continue
 		}
 
@@ -717,7 +718,7 @@ func (s *State) final(d *Decision, p uint32, owner view.Slot, oc uint32, avoid v
 		}
 	}
 
-	toOwner := ou == health.Healthy || !t[0].ok() || (ou == health.Degraded && t[0].class < health.Healthy)
+	toOwner := ou == Healthy || !t[0].ok() || (ou == Degraded && t[0].class < Healthy)
 	if standin && s.selfCell == oc {
 		// The sender already judged the owner unusable (or saw it fail):
 		// serve as its stand-in. Sending back to an owner this member
@@ -747,7 +748,7 @@ func (s *State) final(d *Decision, p uint32, owner view.Slot, oc uint32, avoid v
 		switch {
 		case nb > 1:
 			s.setRef(&d.Alternate, bk[1])
-		case ou != health.Unusable:
+		case ou != Unusable:
 			s.setRef(&d.Alternate, owner)
 		}
 	}

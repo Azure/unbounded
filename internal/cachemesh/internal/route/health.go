@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package health tracks the health of a member's data-plane neighbors:
+// Neighbor health. This file tracks the health of a member's data-plane neighbors:
 // consecutive-failure breakers with a half-open probing state, Envoy-style
 // outlier detection, peak-EWMA latency, overload ("busy") marking, ejection
 // limits, a panic threshold, and a hedge budget.
@@ -12,10 +12,10 @@
 // hot path. They are safe for concurrent use, take no locks, never read the
 // clock, and never allocate. Track, Untrack, and Tick are the control path
 // and must be called from a single goroutine (the runtime tick, or a
-// simulated node). Hooks are invoked only from Tick and Track/Untrack.
+// simulated node). HealthHooks are invoked only from Tick and Track/Untrack.
 //
 // Peers are identified by a dense slot number plus a member key. Slots can
-// reach about 1M, but a Tracker follows only a few hundred neighbors and the
+// reach about 1M, but a HealthTracker follows only a few hundred neighbors and the
 // simulator runs up to 100k Trackers in one process, so per-tracker memory is
 // O(tracked), never O(max slot): a small open-addressing table (slot to
 // *Peer) is rebuilt copy-on-write on Track/Untrack and published through an
@@ -78,7 +78,8 @@
 // fixed order (by slot), so given the same inputs and seed the outputs are
 // identical. Concurrent Observe calls are inherently unordered; simulations
 // that need determinism call Observe from one goroutine.
-package health
+
+package route
 
 import (
 	"math"
@@ -111,19 +112,19 @@ const (
 	Healthy
 )
 
-// State is a peer state for reporting and coverage.
-type State uint8
+// PeerHealth is a peer state for reporting and coverage.
+type PeerHealth uint8
 
 // States.
 const (
-	StateHealthy State = iota
+	StateHealthy PeerHealth = iota
 	StateDegraded
 	StateBusy
 	StateEjected
 	StateProbing
 )
 
-func (s State) String() string {
+func (s PeerHealth) String() string {
 	switch s {
 	case StateHealthy:
 		return "healthy"
@@ -166,9 +167,9 @@ func (r Reason) String() string {
 	return "unknown"
 }
 
-// Config tunes a Tracker. Zero values select the documented defaults;
+// HealthConfig tunes a HealthTracker. Zero values select the documented defaults;
 // a feature cannot be disabled by setting zero.
-type Config struct {
+type HealthConfig struct {
 	// ConsecutiveFailures ejects a peer after this many Failure or Timeout
 	// results in a row. Default 5.
 	ConsecutiveFailures uint32
@@ -221,12 +222,12 @@ type Config struct {
 	// HedgeFactor multiplies the EWMA for HedgeAfter. Default 3.
 	HedgeFactor int64
 	// Hooks receive state change notifications.
-	Hooks Hooks
+	Hooks HealthHooks
 }
 
-// Hooks are optional callbacks, invoked only from the control path (Tick,
+// HealthHooks are optional callbacks, invoked only from the control path (Tick,
 // Track, Untrack). Nil fields are skipped.
-type Hooks struct {
+type HealthHooks struct {
 	// OnEject is called when a peer's ejection is timed (at the first Tick
 	// after it was ejected).
 	OnEject func(slot uint32, reason Reason, ejections int, d time.Duration)
@@ -240,7 +241,7 @@ type Hooks struct {
 	OnPanic func(panic bool)
 }
 
-func (c *Config) setDefaults() {
+func (c *HealthConfig) setDefaults() {
 	def := func(v *time.Duration, d time.Duration) {
 		if *v <= 0 {
 			*v = d
@@ -315,7 +316,7 @@ const (
 	bProbing
 	// bRetired marks a peer dropped from the table (untracked or replaced
 	// by a new key). It never changes again, so a caller still holding an
-	// old table cannot eject it, and it is not counted in Tracker.bad.
+	// old table cannot eject it, and it is not counted in HealthTracker.bad.
 	bRetired
 )
 
@@ -330,15 +331,15 @@ type cellCounter struct {
 	tmp    int32        // control-only scratch
 }
 
-// Peer is the health state of one tracked neighbor.
+// healthPeer is the health state of one tracked neighbor.
 //
-// The fields are grouped by access pattern on three 64-byte lines (a Peer
+// The fields are grouped by access pattern on three 64-byte lines (a healthPeer
 // is 192 bytes, a size class whose objects are 64-byte aligned): fields
 // read by every routing decision and rarely written, the counters every
 // Observe writes, and fields used only on ejection and by the control path.
 // Keeping the counters off the first line means a peer hammered by
 // concurrent Observe calls does not slow down Usable for it.
-type Peer struct {
+type healthPeer struct {
 	// Read-mostly.
 	slot      uint32
 	state     atomic.Uint32
@@ -370,18 +371,18 @@ type Peer struct {
 
 type entry struct {
 	slot uint32
-	p    *Peer
+	p    *healthPeer
 }
 
 // table is an immutable slot index. peers is sorted by slot.
 type table struct {
 	entries []entry // power-of-two open addressing; p == nil is empty
 	shift   uint32
-	peers   []*Peer
+	peers   []*healthPeer
 	cells   []*cellCounter // sorted by cell
 }
 
-func (t *table) lookup(slot uint32) *Peer {
+func (t *table) lookup(slot uint32) *healthPeer {
 	mask := uint32(len(t.entries) - 1)
 
 	for i := (slot * 0x9E3779B1) >> t.shift; ; i = (i + 1) & mask {
@@ -409,9 +410,9 @@ type hedgeShard struct {
 	_      [128 - 8]byte // avoid false sharing (adjacent-line prefetch)
 }
 
-// Tracker tracks the health of a set of peers.
-type Tracker struct {
-	cfg Config
+// HealthTracker tracks the health of a set of peers.
+type HealthTracker struct {
+	cfg HealthConfig
 	rng *rand.Rand
 
 	tab        atomic.Pointer[table]
@@ -446,20 +447,20 @@ type Tracker struct {
 }
 
 type vol struct {
-	p          *Peer
+	p          *healthPeer
 	succ, fail uint64
 }
 
-// NewTracker returns a Tracker. rng is used only on the control path, for
+// NewHealthTracker returns a HealthTracker. rng is used only on the control path, for
 // ejection jitter; nil means a fixed-seed PCG source.
-func NewTracker(cfg Config, rng *rand.Rand) *Tracker {
+func NewHealthTracker(cfg HealthConfig, rng *rand.Rand) *HealthTracker {
 	cfg.setDefaults()
 
 	if rng == nil {
 		rng = rand.New(rand.NewPCG(0, 0))
 	}
 
-	t := &Tracker{
+	t := &HealthTracker{
 		cfg:     cfg,
 		rng:     rng,
 		hedgePM: uint64(math.Round(cfg.HedgeRatio * 1e6)),
@@ -474,7 +475,7 @@ func NewTracker(cfg Config, rng *rand.Rand) *Tracker {
 // Track starts tracking slot with member key and cell, or updates the cell
 // of an already tracked slot with the same key. A different key resets the
 // slot's state. Control path.
-func (t *Tracker) Track(slot uint32, key uint64, cell uint32) {
+func (t *HealthTracker) Track(slot uint32, key uint64, cell uint32) {
 	old := t.tab.Load()
 	if p := old.lookup(slot); p != nil && p.key == key {
 		if p.cc.Load().cell != cell {
@@ -485,17 +486,17 @@ func (t *Tracker) Track(slot uint32, key uint64, cell uint32) {
 		return
 	}
 
-	p := &Peer{slot: slot, key: key}
+	p := &healthPeer{slot: slot, key: key}
 	p.cc.Store(t.cellFor(cell))
 
-	peers := make([]*Peer, 0, len(old.peers)+1)
+	peers := make([]*healthPeer, 0, len(old.peers)+1)
 	for _, q := range old.peers {
 		if q.slot != slot {
 			peers = append(peers, q)
 		}
 	}
 
-	i, _ := slices.BinarySearchFunc(peers, slot, func(q *Peer, s uint32) int {
+	i, _ := slices.BinarySearchFunc(peers, slot, func(q *healthPeer, s uint32) int {
 		return cmpU32(q.slot, s)
 	})
 	peers = slices.Insert(peers, i, p)
@@ -503,13 +504,13 @@ func (t *Tracker) Track(slot uint32, key uint64, cell uint32) {
 }
 
 // Untrack stops tracking slot. Control path.
-func (t *Tracker) Untrack(slot uint32) {
+func (t *HealthTracker) Untrack(slot uint32) {
 	old := t.tab.Load()
 	if old.lookup(slot) == nil {
 		return
 	}
 
-	peers := make([]*Peer, 0, len(old.peers)-1)
+	peers := make([]*healthPeer, 0, len(old.peers)-1)
 	for _, q := range old.peers {
 		if q.slot != slot {
 			peers = append(peers, q)
@@ -519,8 +520,8 @@ func (t *Tracker) Untrack(slot uint32) {
 	t.rebuild(peers)
 }
 
-// Ref names a peer for TrackMany and Sync.
-type Ref struct {
+// TrackRef names a peer for TrackMany and Sync.
+type TrackRef struct {
 	Slot uint32
 	Key  uint64
 	Cell uint32
@@ -529,7 +530,7 @@ type Ref struct {
 // TrackMany is Track for every ref with a single table rebuild, so tracking
 // n peers costs O(n log n + tracked) instead of O(n * tracked). Refs are
 // applied in order; a later ref for the same slot wins. Control path.
-func (t *Tracker) TrackMany(refs []Ref) {
+func (t *HealthTracker) TrackMany(refs []TrackRef) {
 	t.merge(refs, false)
 }
 
@@ -537,17 +538,17 @@ func (t *Tracker) TrackMany(refs []Ref) {
 // untracked, and refs are applied as by TrackMany. Peers whose slot and key
 // are unchanged keep their state. It rebuilds the table at most once.
 // Control path.
-func (t *Tracker) Sync(refs []Ref) {
+func (t *HealthTracker) Sync(refs []TrackRef) {
 	t.merge(refs, true)
 }
 
-func (t *Tracker) merge(refs []Ref, exact bool) {
+func (t *HealthTracker) merge(refs []TrackRef, exact bool) {
 	old := t.tab.Load()
 
 	// Sort a copy by slot, last ref per slot wins (stable sort keeps
 	// input order among equal slots).
 	rs := slices.Clone(refs)
-	slices.SortStableFunc(rs, func(a, b Ref) int { return cmpU32(a.Slot, b.Slot) })
+	slices.SortStableFunc(rs, func(a, b TrackRef) int { return cmpU32(a.Slot, b.Slot) })
 
 	w := 0
 
@@ -562,7 +563,7 @@ func (t *Tracker) merge(refs []Ref, exact bool) {
 
 	rs = rs[:w]
 
-	peers := make([]*Peer, 0, max(len(rs), len(old.peers)))
+	peers := make([]*healthPeer, 0, max(len(rs), len(old.peers)))
 	changed := false
 	i, j := 0, 0
 
@@ -602,15 +603,15 @@ func (t *Tracker) merge(refs []Ref, exact bool) {
 	}
 }
 
-func (t *Tracker) newPeer(r Ref) *Peer {
-	p := &Peer{slot: r.Slot, key: r.Key}
+func (t *HealthTracker) newPeer(r TrackRef) *healthPeer {
+	p := &healthPeer{slot: r.Slot, key: r.Key}
 	p.cc.Store(t.cellFor(r.Cell))
 
 	return p
 }
 
 // Tracked returns the number of tracked peers.
-func (t *Tracker) Tracked() int { return len(t.tab.Load().peers) }
+func (t *HealthTracker) Tracked() int { return len(t.tab.Load().peers) }
 
 func cmpU32(a, b uint32) int {
 	switch {
@@ -623,7 +624,7 @@ func cmpU32(a, b uint32) int {
 	return 0
 }
 
-func (t *Tracker) cellFor(cell uint32) *cellCounter {
+func (t *HealthTracker) cellFor(cell uint32) *cellCounter {
 	c := t.cells[cell]
 	if c == nil {
 		c = &cellCounter{cell: cell}
@@ -633,7 +634,7 @@ func (t *Tracker) cellFor(cell uint32) *cellCounter {
 	return c
 }
 
-func (t *Tracker) rebuild(peers []*Peer) {
+func (t *HealthTracker) rebuild(peers []*healthPeer) {
 	size := 8
 	for size < 2*len(peers) {
 		size *= 2
@@ -681,9 +682,9 @@ func (t *Tracker) rebuild(peers []*Peer) {
 }
 
 // retireDropped moves every peer of the current table that is not in peers
-// to bRetired, keeping Tracker.bad equal to the number of tracked-or-held
+// to bRetired, keeping HealthTracker.bad equal to the number of tracked-or-held
 // peers in bEjected or bProbing.
-func (t *Tracker) retireDropped(peers []*Peer) {
+func (t *HealthTracker) retireDropped(peers []*healthPeer) {
 	old := t.tab.Load()
 
 	for _, p := range old.peers {
@@ -714,7 +715,7 @@ func (t *Tracker) retireDropped(peers []*Peer) {
 
 // reconcile recomputes the ejection and per-cell usable counters from peer
 // states.
-func (t *Tracker) reconcile(nt *table) {
+func (t *HealthTracker) reconcile(nt *table) {
 	for _, c := range nt.cells {
 		c.tmp = 0
 	}
@@ -736,7 +737,7 @@ func (t *Tracker) reconcile(nt *table) {
 	t.ejected.Store(ej)
 }
 
-func (t *Tracker) updatePanic(nt *table) {
+func (t *HealthTracker) updatePanic(nt *table) {
 	n := len(nt.peers)
 	p := n > 0 && int(t.ejected.Load())*100 > n*t.cfg.PanicThreshold
 
@@ -747,7 +748,7 @@ func (t *Tracker) updatePanic(nt *table) {
 
 // tryEject moves p from state from to bEjected, respecting limits when
 // from is bHealthy. Safe for concurrent use.
-func (t *Tracker) tryEject(p *Peer, from uint32, reason Reason) bool {
+func (t *HealthTracker) tryEject(p *healthPeer, from uint32, reason Reason) bool {
 	// p.until is already 0: it is cleared when an ejection ends (see
 	// transitions), so a concurrent loser of the CAS below never clobbers
 	// the timing of an ejection another caller just made.
@@ -794,7 +795,7 @@ func (t *Tracker) tryEject(p *Peer, from uint32, reason Reason) bool {
 }
 
 // Observe records the result and latency of a request to slot. Hot path.
-func (t *Tracker) Observe(slot uint32, r Result, latency time.Duration) {
+func (t *HealthTracker) Observe(slot uint32, r Result, latency time.Duration) {
 	p := t.tab.Load().lookup(slot)
 	if p == nil {
 		return
@@ -871,7 +872,7 @@ func (t *Tracker) Observe(slot uint32, r Result, latency time.Duration) {
 
 // Usable reports how usable slot is for routing. Untracked slots are
 // Healthy. Hot path.
-func (t *Tracker) Usable(slot uint32) Usability {
+func (t *HealthTracker) Usable(slot uint32) Usability {
 	p := t.tab.Load().lookup(slot)
 	if p == nil || t.panic.Load() {
 		return Healthy
@@ -895,7 +896,7 @@ func (t *Tracker) Usable(slot uint32) Usability {
 // that changes state concurrently may be reported either way, as with
 // Usable; after a peer is dropped from the tracked set it may keep
 // AllHealthy false until the next Tick. Hot path.
-func (t *Tracker) AllHealthy() bool {
+func (t *HealthTracker) AllHealthy() bool {
 	if t.bad.Load() == 0 && t.nDegraded.Load() == 0 && t.busyMax.Load() <= t.now.Load() {
 		return true
 	}
@@ -904,12 +905,12 @@ func (t *Tracker) AllHealthy() bool {
 }
 
 // Panic reports whether health filtering is disabled.
-func (t *Tracker) Panic() bool { return t.panic.Load() }
+func (t *HealthTracker) Panic() bool { return t.panic.Load() }
 
 // HedgeAfter returns clamp(HedgeFactor*EWMA, HedgeMin, HedgeMax). A peer
 // without latency data, or an untracked slot, returns HedgeMax so that
 // hedging is conservative until there is data. Hot path.
-func (t *Tracker) HedgeAfter(slot uint32) time.Duration {
+func (t *HealthTracker) HedgeAfter(slot uint32) time.Duration {
 	p := t.tab.Load().lookup(slot)
 	if p == nil {
 		return t.cfg.HedgeMax
@@ -934,7 +935,7 @@ func (t *Tracker) HedgeAfter(slot uint32) time.Duration {
 // address, so concurrent routers mostly write different cache lines even
 // when they route the same partition; TryHedge sums the shards, so which
 // shard a call lands in never affects a result.
-func (t *Tracker) NoteRouted() {
+func (t *HealthTracker) NoteRouted() {
 	t.hedge[stackShard()].routed.Add(1)
 }
 
@@ -953,7 +954,7 @@ func stackShard() uint64 {
 // of the requests routed in this interval. The check and increment are not
 // atomic together, so concurrent callers may overshoot slightly. Hot path, but called only for requests that are hedge candidates,
 // so it reads every shard.
-func (t *Tracker) TryHedge() bool {
+func (t *HealthTracker) TryHedge() bool {
 	// Sum the shards only until the budget covers one more hedge.
 	need := (t.hedged.Load() + 1) * 1e6
 
@@ -973,7 +974,7 @@ func (t *Tracker) TryHedge() bool {
 
 // Tick advances the control clock to now (node-local monotonic ns). Call it
 // regularly (for example every 100ms) from the control goroutine.
-func (t *Tracker) Tick(now int64) {
+func (t *HealthTracker) Tick(now int64) {
 	t.now.Store(now)
 
 	if !t.started {
@@ -998,7 +999,7 @@ func (t *Tracker) Tick(now int64) {
 	t.updatePanic(nt)
 }
 
-func (t *Tracker) decayEWMA(nt *table, dt int64) {
+func (t *HealthTracker) decayEWMA(nt *table, dt int64) {
 	if dt <= 0 {
 		return
 	}
@@ -1036,7 +1037,7 @@ func (t *Tracker) decayEWMA(nt *table, dt int64) {
 	}
 }
 
-func (t *Tracker) interval(nt *table) {
+func (t *HealthTracker) interval(nt *table) {
 	old := t.active.Load() & 1
 	t.active.Store(old ^ 1)
 
@@ -1099,7 +1100,7 @@ func (t *Tracker) interval(nt *table) {
 }
 
 // ejectionFor returns the ejection time for count n, with jitter.
-func (t *Tracker) ejectionFor(n int32) time.Duration {
+func (t *HealthTracker) ejectionFor(n int32) time.Duration {
 	d := t.cfg.MaxEjection
 	if n > 0 && int64(t.cfg.BaseEjection) <= int64(t.cfg.MaxEjection)/int64(n) {
 		d = t.cfg.BaseEjection * time.Duration(n)
@@ -1110,7 +1111,7 @@ func (t *Tracker) ejectionFor(n int32) time.Duration {
 	return d + time.Duration(t.rng.Int64N(j+1))
 }
 
-func (t *Tracker) transitions(nt *table, now int64) {
+func (t *HealthTracker) transitions(nt *table, now int64) {
 	h := &t.cfg.Hooks
 
 	for _, p := range nt.peers {
@@ -1156,7 +1157,7 @@ func (t *Tracker) transitions(nt *table, now int64) {
 	}
 }
 
-func (t *Tracker) degrade(nt *table) {
+func (t *HealthTracker) degrade(nt *table) {
 	t.scratch = t.scratch[:0]
 
 	for _, p := range nt.peers {
@@ -1198,7 +1199,7 @@ func (t *Tracker) degrade(nt *table) {
 
 // PeerState reports the state, ejection count, and EWMA latency of slot.
 // Untracked slots report StateHealthy with zero values.
-func (t *Tracker) PeerState(slot uint32) (State, int, time.Duration) {
+func (t *HealthTracker) PeerState(slot uint32) (PeerHealth, int, time.Duration) {
 	p := t.tab.Load().lookup(slot)
 	if p == nil {
 		return StateHealthy, 0, 0
@@ -1207,7 +1208,7 @@ func (t *Tracker) PeerState(slot uint32) (State, int, time.Duration) {
 	return t.peerState(p), int(p.ejections.Load()), time.Duration(p.ewma.Load())
 }
 
-func (t *Tracker) peerState(p *Peer) State {
+func (t *HealthTracker) peerState(p *healthPeer) PeerHealth {
 	switch {
 	case p.state.Load() == bEjected:
 		return StateEjected
@@ -1228,7 +1229,7 @@ type Counts struct {
 }
 
 // Counts returns a summary of tracked peers by state.
-func (t *Tracker) Counts() Counts {
+func (t *HealthTracker) Counts() Counts {
 	nt := t.tab.Load()
 	c := Counts{Tracked: len(nt.peers)}
 

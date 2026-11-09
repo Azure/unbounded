@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-package epoch
+package route
 
 import (
 	"math"
@@ -12,8 +12,8 @@ import (
 )
 
 func TestZeroValue(t *testing.T) {
-	var tr Tracker
-	if tr.Current() != 0 || tr.Period() != DefaultPeriod {
+	var tr EpochTracker
+	if tr.Current() != 0 || tr.Period() != DefaultEpochPeriod {
 		t.Fatalf("zero value: %d %v", tr.Current(), tr.Period())
 	}
 
@@ -27,7 +27,7 @@ func TestZeroValue(t *testing.T) {
 }
 
 func TestAnchorForwardAndBackward(t *testing.T) {
-	var tr Tracker
+	var tr EpochTracker
 
 	p := 10 * time.Second
 	if got := tr.Anchor(100, p, 0); got != 100 {
@@ -66,7 +66,7 @@ func TestAnchorForwardAndBackward(t *testing.T) {
 }
 
 func TestPeriodChange(t *testing.T) {
-	var tr Tracker
+	var tr EpochTracker
 
 	tr.Anchor(0, 10*time.Second, 0)
 	tr.Advance(int64(20 * time.Second))
@@ -82,7 +82,7 @@ func TestPeriodChange(t *testing.T) {
 
 	tr.Anchor(7, 0, int64(25*time.Second))
 
-	if tr.Period() != DefaultPeriod {
+	if tr.Period() != DefaultEpochPeriod {
 		t.Fatal("non-positive period must default")
 	}
 }
@@ -127,7 +127,7 @@ func TestLifetimeBounds(t *testing.T) {
 		period := time.Duration(1+rng.IntN(30)) * time.Second
 		ttl := MinTTL + time.Duration(rng.Int64N(int64(time.Hour)))
 
-		var tr Tracker
+		var tr EpochTracker
 
 		anchor := rng.Int64N(int64(time.Hour))
 		tr.Anchor(rng.Uint64N(1<<40), period, anchor)
@@ -137,7 +137,7 @@ func TestLifetimeBounds(t *testing.T) {
 		// First instant (on a 1ns grid) at which the stamp is stale.
 		stale := anchor + int64(s.Expires-tr.anchorEpoch)*int64(period)
 
-		var probe Tracker
+		var probe EpochTracker
 
 		probe.Anchor(tr.anchorEpoch, period, anchor)
 
@@ -160,7 +160,7 @@ func TestLifetimeBounds(t *testing.T) {
 
 func TestConcurrentReaders(t *testing.T) {
 	var (
-		tr Tracker
+		tr EpochTracker
 		wg sync.WaitGroup
 	)
 
@@ -201,10 +201,10 @@ func TestConcurrentReaders(t *testing.T) {
 	wg.Wait()
 }
 
-func BenchmarkFresh(b *testing.B) {
+func BenchmarkEpochFresh(b *testing.B) {
 	s := Stamp{Expires: 100, Gen: 1}
 
-	var tr Tracker
+	var tr EpochTracker
 
 	n := 0
 
@@ -218,7 +218,7 @@ func BenchmarkFresh(b *testing.B) {
 }
 
 func BenchmarkAdvance(b *testing.B) {
-	var tr Tracker
+	var tr EpochTracker
 
 	i := int64(0)
 	for b.Loop() {
@@ -230,22 +230,22 @@ func BenchmarkAdvance(b *testing.B) {
 func TestStampForExtremes(t *testing.T) {
 	// A TTL near MaxInt64 must not overflow ttl+period-1 into a tiny or
 	// wrapped stamp.
-	s := StampFor(10, time.Duration(math.MaxInt64), DefaultPeriod, 0)
-	if want := uint64(10 + math.MaxInt64/int64(DefaultPeriod) + 2); s.Expires != want {
+	s := StampFor(10, time.Duration(math.MaxInt64), DefaultEpochPeriod, 0)
+	if want := uint64(10 + math.MaxInt64/int64(DefaultEpochPeriod) + 2); s.Expires != want {
 		t.Fatalf("huge ttl: Expires = %d, want %d", s.Expires, want)
 	}
 
-	if s := StampFor(5, -time.Second, DefaultPeriod, 0); Fresh(s, 5, 0) {
+	if s := StampFor(5, -time.Second, DefaultEpochPeriod, 0); Fresh(s, 5, 0) {
 		t.Fatalf("negative ttl must not be fresh: %+v", s)
 	}
 
-	if s := StampFor(Never-3, MinTTL, DefaultPeriod, 0); s.Expires != Never {
+	if s := StampFor(Never-3, MinTTL, DefaultEpochPeriod, 0); s.Expires != Never {
 		t.Fatalf("saturation: Expires = %d", s.Expires)
 	}
 }
 
 func TestAdvanceSaturates(t *testing.T) {
-	var tr Tracker
+	var tr EpochTracker
 
 	tr.Anchor(Never-1, time.Nanosecond, 0)
 
@@ -258,7 +258,7 @@ func TestAdvanceSaturates(t *testing.T) {
 // request path while the tick goroutine anchors.
 func TestPeriodConcurrent(t *testing.T) {
 	var (
-		tr Tracker
+		tr EpochTracker
 		wg sync.WaitGroup
 	)
 
@@ -286,7 +286,7 @@ func TestPeriodConcurrent(t *testing.T) {
 func TestStaleAnchorsDoNotStretchEpochs(t *testing.T) {
 	const p = 15 * time.Second
 
-	var tr Tracker
+	var tr EpochTracker
 
 	tr.Anchor(0, p, 0)
 
@@ -304,7 +304,7 @@ func TestStaleAnchorsDoNotStretchEpochs(t *testing.T) {
 	}
 
 	// A member that is behind still catches up at once.
-	var lag Tracker
+	var lag EpochTracker
 
 	lag.Anchor(0, p, 0)
 

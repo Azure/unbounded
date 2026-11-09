@@ -7,8 +7,6 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/Azure/unbounded/internal/cachemesh/internal/epoch"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/health"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view/viewtest"
 )
@@ -737,7 +735,7 @@ func TestRouteManyAndHedge(t *testing.T) {
 		t.Fatalf("%+v", p)
 	}
 
-	if st.Env().Health().Usable(4) != health.Healthy {
+	if st.Env().Health().Usable(4) != Healthy {
 		t.Fatal("untracked not healthy")
 	}
 }
@@ -817,11 +815,11 @@ func TestFreshWithoutView(t *testing.T) {
 	st := NewState(nil, view.NoSlot, env)
 	seed := uint64(7)
 
-	if st.Fresh(seed, epoch.Stamp{Expires: 25}) {
+	if st.Fresh(seed, Stamp{Expires: 25}) {
 		t.Fatal("expiring stamp fresh without a view")
 	}
 
-	if !st.Fresh(seed, epoch.StampFor(0, 0, 0, 0)) {
+	if !st.Fresh(seed, StampFor(0, 0, 0, 0)) {
 		t.Fatal("never-expiring stamp must stay fresh")
 	}
 }

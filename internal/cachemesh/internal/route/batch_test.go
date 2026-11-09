@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-package health
+package route
 
 import (
 	"math/rand/v2"
@@ -17,7 +17,7 @@ type peerSnap struct {
 	cell uint32
 }
 
-func snap(t *Tracker) []peerSnap {
+func snap(t *HealthTracker) []peerSnap {
 	var out []peerSnap
 
 	for _, p := range t.tab.Load().peers {
@@ -27,7 +27,7 @@ func snap(t *Tracker) []peerSnap {
 	return out
 }
 
-func cellSnap(t *Tracker) []uint32 {
+func cellSnap(t *HealthTracker) []uint32 {
 	var out []uint32
 
 	for _, c := range t.tab.Load().cells {
@@ -43,12 +43,12 @@ func TestTrackManySyncMatchTrack(t *testing.T) {
 	rng := rand.New(rand.NewPCG(7, 7))
 
 	for iter := range 300 {
-		a, b := newT(Config{}), newT(Config{})
+		a, b := newT(HealthConfig{}), newT(HealthConfig{})
 
 		for range 1 + rng.IntN(4) {
-			refs := make([]Ref, rng.IntN(40))
+			refs := make([]TrackRef, rng.IntN(40))
 			for i := range refs {
-				refs[i] = Ref{Slot: rng.Uint32N(50), Key: uint64(rng.IntN(3)), Cell: rng.Uint32N(5)}
+				refs[i] = TrackRef{Slot: rng.Uint32N(50), Key: uint64(rng.IntN(3)), Cell: rng.Uint32N(5)}
 			}
 
 			if rng.IntN(2) == 0 {
@@ -92,15 +92,15 @@ func TestTrackManySyncMatchTrack(t *testing.T) {
 }
 
 func TestSyncKeepsState(t *testing.T) {
-	tr := newT(Config{})
+	tr := newT(HealthConfig{})
 
-	var refs []Ref
+	var refs []TrackRef
 	for i := range 20 {
-		refs = append(refs, Ref{Slot: uint32(i), Key: uint64(100 + i), Cell: uint32(i / 4)})
+		refs = append(refs, TrackRef{Slot: uint32(i), Key: uint64(100 + i), Cell: uint32(i / 4)})
 	}
 
 	tr.Sync(refs)
-	fail(tr, 3, 5)
+	failN(tr, 3, 5)
 	tr.Tick(0)
 
 	if s, _, _ := tr.PeerState(3); s != StateEjected {
@@ -139,10 +139,10 @@ func TestSyncKeepsState(t *testing.T) {
 func TestEjectLoserKeepsTiming(t *testing.T) {
 	var ejects int
 
-	tr := newT(Config{Hooks: Hooks{OnEject: func(uint32, Reason, int, time.Duration) { ejects++ }}})
+	tr := newT(HealthConfig{Hooks: HealthHooks{OnEject: func(uint32, Reason, int, time.Duration) { ejects++ }}})
 	trackN(tr, 20, 4)
 	tr.Tick(0)
-	fail(tr, 1, 5)
+	failN(tr, 1, 5)
 	tr.Tick(sec)
 
 	p := tr.tab.Load().lookup(1)
@@ -166,7 +166,7 @@ func TestEjectLoserKeepsTiming(t *testing.T) {
 // TestIdleDegradedRecovers: a Degraded peer gets no traffic, so its EWMA
 // must decay without observations or it would stay Degraded forever.
 func TestIdleDegradedRecovers(t *testing.T) {
-	tr := newT(Config{})
+	tr := newT(HealthConfig{})
 	trackN(tr, 5, 5)
 	tr.Tick(0)
 
@@ -210,7 +210,7 @@ func TestIdleDegradedRecovers(t *testing.T) {
 }
 
 func TestLatencyClamp(t *testing.T) {
-	tr := newT(Config{})
+	tr := newT(HealthConfig{})
 	trackN(tr, 1, 1)
 
 	for range 10 {
@@ -227,14 +227,14 @@ func TestLatencyClamp(t *testing.T) {
 
 func BenchmarkTrackBootstrap(b *testing.B) {
 	for _, n := range []int{256, 4096} {
-		refs := make([]Ref, n)
+		refs := make([]TrackRef, n)
 		for i := range refs {
-			refs[i] = Ref{Slot: uint32(i * 7), Key: uint64(i), Cell: uint32(i / 4)}
+			refs[i] = TrackRef{Slot: uint32(i * 7), Key: uint64(i), Cell: uint32(i / 4)}
 		}
 
 		b.Run("Track/"+strconv.Itoa(n), func(b *testing.B) {
 			for b.Loop() {
-				tr := newT(Config{})
+				tr := newT(HealthConfig{})
 				for _, r := range refs {
 					tr.Track(r.Slot, r.Key, r.Cell)
 				}
@@ -242,7 +242,7 @@ func BenchmarkTrackBootstrap(b *testing.B) {
 		})
 		b.Run("Sync/"+strconv.Itoa(n), func(b *testing.B) {
 			for b.Loop() {
-				newT(Config{}).Sync(refs)
+				newT(HealthConfig{}).Sync(refs)
 			}
 		})
 	}

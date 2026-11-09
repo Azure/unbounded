@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"github.com/Azure/unbounded/internal/cachemesh/internal/elect"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/health"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/node"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/route"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
@@ -66,7 +65,7 @@ type Mesh struct {
 
 	// Hot path, lock-free.
 	st     atomic.Pointer[route.State]
-	health *health.Tracker
+	health *route.HealthTracker
 	notes  *route.Notes
 
 	leading atomic.Bool

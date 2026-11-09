@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-package health
+package route
 
 import (
 	"math/rand/v2"
@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-func allUsableHealthy(tr *Tracker, n int) bool {
+func allUsableHealthy(tr *HealthTracker, n int) bool {
 	for s := range uint32(n) {
 		if tr.Usable(s) != Healthy {
 			return false
@@ -21,7 +21,7 @@ func allUsableHealthy(tr *Tracker, n int) bool {
 }
 
 func TestAllHealthyTransitions(t *testing.T) {
-	tr := newT(Config{})
+	tr := newT(HealthConfig{})
 	trackN(tr, 20, 4)
 	tr.Tick(0)
 
@@ -30,7 +30,7 @@ func TestAllHealthyTransitions(t *testing.T) {
 	}
 
 	// Ejection clears it; probing keeps it clear; a probe success sets it.
-	fail(tr, 3, 5)
+	failN(tr, 3, 5)
 
 	if tr.AllHealthy() {
 		t.Fatal("ejected peer must clear AllHealthy")
@@ -67,7 +67,7 @@ func TestAllHealthyTransitions(t *testing.T) {
 	}
 
 	// Untracking an ejected peer restores it without a Tick.
-	fail(tr, 7, 5)
+	failN(tr, 7, 5)
 
 	if tr.AllHealthy() {
 		t.Fatal("ejected peer must clear AllHealthy")
@@ -88,7 +88,7 @@ func TestAllHealthyTransitions(t *testing.T) {
 }
 
 func TestAllHealthyRetiredPeer(t *testing.T) {
-	tr := newT(Config{})
+	tr := newT(HealthConfig{})
 	trackN(tr, 10, 2)
 	tr.Tick(0)
 
@@ -112,7 +112,7 @@ func TestAllHealthyRetiredPeer(t *testing.T) {
 }
 
 func TestAllHealthyDegraded(t *testing.T) {
-	tr := newT(Config{})
+	tr := newT(HealthConfig{})
 	trackN(tr, 10, 2)
 	tr.Tick(0)
 
@@ -134,11 +134,11 @@ func TestAllHealthyDegraded(t *testing.T) {
 
 func TestAllHealthyPanic(t *testing.T) {
 	// The last usable member of a cell is never ejected, so use cells of 5.
-	tr := newT(Config{MaxEjectionPercent: 100, PanicThreshold: 10})
+	tr := newT(HealthConfig{MaxEjectionPercent: 100, PanicThreshold: 10})
 	trackN(tr, 10, 5)
 	tr.Tick(0)
-	fail(tr, 0, 5)
-	fail(tr, 5, 5)
+	failN(tr, 0, 5)
+	failN(tr, 5, 5)
 	tr.Tick(1)
 
 	if !tr.Panic() {
@@ -155,7 +155,7 @@ func TestAllHealthyPanic(t *testing.T) {
 func TestAllHealthyRandomized(t *testing.T) {
 	for seed := range uint64(30) {
 		rng := rand.New(rand.NewPCG(seed, 7))
-		tr := newT(Config{ConsecutiveFailures: 2, BaseEjection: time.Second, MaxEjection: 4 * time.Second})
+		tr := newT(HealthConfig{ConsecutiveFailures: 2, BaseEjection: time.Second, MaxEjection: 4 * time.Second})
 
 		const n = 24
 
@@ -194,7 +194,7 @@ func TestAllHealthyRandomized(t *testing.T) {
 // to latSampleAll per interval and one in latSampleEvery after that, and
 // every failure.
 func TestLatencySampling(t *testing.T) {
-	tr := newT(Config{})
+	tr := newT(HealthConfig{})
 	trackN(tr, 1, 1)
 	tr.Tick(0)
 
@@ -230,7 +230,7 @@ func TestLatencySampling(t *testing.T) {
 // TestHedgeBudgetAcrossGoroutines checks that the budget counts requests
 // routed from any goroutine, whichever shard they land in.
 func TestHedgeBudgetAcrossGoroutines(t *testing.T) {
-	tr := newT(Config{})
+	tr := newT(HealthConfig{})
 	tr.Tick(0)
 
 	var wg sync.WaitGroup
