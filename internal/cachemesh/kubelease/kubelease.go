@@ -6,7 +6,7 @@
 //
 // # Mapping
 //
-// elect.Record fields map onto the Lease as follows:
+// control.Record fields map onto the Lease as follows:
 //
 //	Holder          spec.holderIdentity
 //	LeaseDuration   spec.leaseDurationSeconds (rounded up to whole seconds)
@@ -24,21 +24,21 @@
 //
 // Get is a consistent read. GetCached passes resourceVersion "0" so the API
 // server may answer from its watch cache. Create maps AlreadyExists (and
-// Conflict) to elect.ErrConflict. Update is a compare-and-swap on the
-// record's ResourceVersion and maps Conflict to elect.ErrConflict and
-// NotFound to elect.ErrNotFound. Errors are wrapped with %w.
+// Conflict) to control.ErrConflict. Update is a compare-and-swap on the
+// record's ResourceVersion and maps Conflict to control.ErrConflict and
+// NotFound to control.ErrNotFound. Errors are wrapped with %w.
 //
 // Update does not drop fields it does not own. The Store remembers the last
 // Lease object it read or wrote; when the record's ResourceVersion matches
 // it, Update starts from a copy of that object. Otherwise it reads the Lease
 // first and, if the stored ResourceVersion differs from the record's, fails
-// with elect.ErrConflict without writing. Labels, other annotations, owner
+// with control.ErrConflict without writing. Labels, other annotations, owner
 // references, and spec fields cachemesh does not use are preserved.
 //
 // Malformed cachemesh annotations, written by hand or by a different
 // version, are tolerated rather than failing reads: an unparsable
 // incarnation or term reads as 0, and seeds that are empty or contain
-// whitespace are dropped, keeping at most elect.MaxSeeds. A term read as 0
+// whitespace are dropped, keeping at most control.MaxSeeds. A term read as 0
 // is safe because a new leader takes max(record term, view term)+1.
 package kubelease
 
@@ -51,11 +51,10 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/Azure/unbounded/internal/cachemesh/internal/control"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
-	"github.com/Azure/unbounded/internal/cachemesh/internal/elect"
 )
 
 // Annotation keys.
@@ -75,7 +74,7 @@ type LeaseClient interface {
 	Update(ctx context.Context, lease *coordinationv1.Lease, opts metav1.UpdateOptions) (*coordinationv1.Lease, error)
 }
 
-// Store implements elect.Store for one named Lease. It is safe for
+// Store implements control.Store for one named Lease. It is safe for
 // concurrent use.
 type Store struct {
 	client LeaseClient
@@ -85,7 +84,7 @@ type Store struct {
 	last *coordinationv1.Lease
 }
 
-var _ elect.Store = (*Store)(nil)
+var _ control.Store = (*Store)(nil)
 
 // New returns a Store for the Lease called name.
 func New(client LeaseClient, name string) *Store {
@@ -98,10 +97,10 @@ func (s *Store) remember(l *coordinationv1.Lease) {
 	s.mu.Unlock()
 }
 
-func (s *Store) get(ctx context.Context, opts metav1.GetOptions) (elect.Record, error) {
+func (s *Store) get(ctx context.Context, opts metav1.GetOptions) (control.Record, error) {
 	l, err := s.client.Get(ctx, s.name, opts)
 	if err != nil {
-		return elect.Record{}, mapErr("get", s.name, err)
+		return control.Record{}, mapErr("get", s.name, err)
 	}
 
 	s.remember(l)
@@ -110,24 +109,24 @@ func (s *Store) get(ctx context.Context, opts metav1.GetOptions) (elect.Record, 
 }
 
 // Get reads the Lease with a consistent read.
-func (s *Store) Get(ctx context.Context) (elect.Record, error) {
+func (s *Store) Get(ctx context.Context) (control.Record, error) {
 	return s.get(ctx, metav1.GetOptions{})
 }
 
 // GetCached reads the Lease with resourceVersion "0".
-func (s *Store) GetCached(ctx context.Context) (elect.Record, error) {
+func (s *Store) GetCached(ctx context.Context) (control.Record, error) {
 	return s.get(ctx, metav1.GetOptions{ResourceVersion: "0"})
 }
 
 // Create creates the Lease.
-func (s *Store) Create(ctx context.Context, r elect.Record) (elect.Record, error) {
+func (s *Store) Create(ctx context.Context, r control.Record) (control.Record, error) {
 	l := &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: s.name}}
 	Encode(l, r)
 	l.ResourceVersion = ""
 
 	out, err := s.client.Create(ctx, l, metav1.CreateOptions{})
 	if err != nil {
-		return elect.Record{}, mapErr("create", s.name, err)
+		return control.Record{}, mapErr("create", s.name, err)
 	}
 
 	s.remember(out)
@@ -136,9 +135,9 @@ func (s *Store) Create(ctx context.Context, r elect.Record) (elect.Record, error
 }
 
 // Update replaces the Lease if r.ResourceVersion matches.
-func (s *Store) Update(ctx context.Context, r elect.Record) (elect.Record, error) {
+func (s *Store) Update(ctx context.Context, r control.Record) (control.Record, error) {
 	if r.ResourceVersion == "" {
-		return elect.Record{}, fmt.Errorf("update lease %s: empty resourceVersion: %w", s.name, elect.ErrConflict)
+		return control.Record{}, fmt.Errorf("update lease %s: empty resourceVersion: %w", s.name, control.ErrConflict)
 	}
 
 	s.mu.Lock()
@@ -153,14 +152,14 @@ func (s *Store) Update(ctx context.Context, r elect.Record) (elect.Record, error
 	if base == nil {
 		cur, err := s.client.Get(ctx, s.name, metav1.GetOptions{})
 		if err != nil {
-			return elect.Record{}, mapErr("update", s.name, err)
+			return control.Record{}, mapErr("update", s.name, err)
 		}
 
 		s.remember(cur)
 
 		if cur.ResourceVersion != r.ResourceVersion {
-			return elect.Record{}, fmt.Errorf("update lease %s: resourceVersion %s != %s: %w",
-				s.name, cur.ResourceVersion, r.ResourceVersion, elect.ErrConflict)
+			return control.Record{}, fmt.Errorf("update lease %s: resourceVersion %s != %s: %w",
+				s.name, cur.ResourceVersion, r.ResourceVersion, control.ErrConflict)
 		}
 
 		base = cur
@@ -170,7 +169,7 @@ func (s *Store) Update(ctx context.Context, r elect.Record) (elect.Record, error
 
 	out, err := s.client.Update(ctx, base, metav1.UpdateOptions{})
 	if err != nil {
-		return elect.Record{}, mapErr("update", s.name, err)
+		return control.Record{}, mapErr("update", s.name, err)
 	}
 
 	s.remember(out)
@@ -181,9 +180,9 @@ func (s *Store) Update(ctx context.Context, r elect.Record) (elect.Record, error
 func mapErr(op, name string, err error) error {
 	switch {
 	case apierrors.IsNotFound(err):
-		return fmt.Errorf("%s lease %s: %w: %w", op, name, elect.ErrNotFound, err)
+		return fmt.Errorf("%s lease %s: %w: %w", op, name, control.ErrNotFound, err)
 	case apierrors.IsConflict(err) || apierrors.IsAlreadyExists(err):
-		return fmt.Errorf("%s lease %s: %w: %w", op, name, elect.ErrConflict, err)
+		return fmt.Errorf("%s lease %s: %w: %w", op, name, control.ErrConflict, err)
 	default:
 		return fmt.Errorf("%s lease %s: %w", op, name, err)
 	}
@@ -191,8 +190,8 @@ func mapErr(op, name string, err error) error {
 
 // Decode converts a Lease into a Record. It never fails; see the package
 // documentation for how malformed annotations are read.
-func Decode(l *coordinationv1.Lease) elect.Record {
-	r := elect.Record{ResourceVersion: l.ResourceVersion, UID: string(l.UID)}
+func Decode(l *coordinationv1.Lease) control.Record {
+	r := control.Record{ResourceVersion: l.ResourceVersion, UID: string(l.UID)}
 
 	if l.Spec.HolderIdentity != nil {
 		r.Holder = *l.Spec.HolderIdentity
@@ -224,7 +223,7 @@ func Decode(l *coordinationv1.Lease) elect.Record {
 }
 
 // Encode writes r into l, leaving fields cachemesh does not own untouched.
-func Encode(l *coordinationv1.Lease, r elect.Record) {
+func Encode(l *coordinationv1.Lease, r control.Record) {
 	holder := r.Holder
 	l.Spec.HolderIdentity = &holder
 
@@ -263,12 +262,12 @@ func validSeed(s string) bool {
 }
 
 // ParseSeeds splits a seeds annotation, dropping invalid entries and keeping
-// at most elect.MaxSeeds.
+// at most control.MaxSeeds.
 func ParseSeeds(v string) []string {
 	var out []string
 
 	for s := range strings.SplitSeq(v, ",") {
-		if len(out) == elect.MaxSeeds {
+		if len(out) == control.MaxSeeds {
 			break
 		}
 
@@ -281,12 +280,12 @@ func ParseSeeds(v string) []string {
 }
 
 // FormatSeeds joins seeds for the annotation, dropping invalid entries and
-// keeping at most elect.MaxSeeds.
+// keeping at most control.MaxSeeds.
 func FormatSeeds(seeds []string) string {
-	kept := make([]string, 0, min(len(seeds), elect.MaxSeeds))
+	kept := make([]string, 0, min(len(seeds), control.MaxSeeds))
 
 	for _, s := range seeds {
-		if len(kept) == elect.MaxSeeds {
+		if len(kept) == control.MaxSeeds {
 			break
 		}
 

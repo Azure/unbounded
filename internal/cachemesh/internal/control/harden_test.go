@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-package node
+package control
 
 import (
 	"bytes"
@@ -12,9 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Azure/unbounded/internal/cachemesh/internal/elect"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/wire"
 )
 
 // forgeSnapshot encodes v as a snapshot whose seq is raised by bump and
@@ -53,27 +51,27 @@ func forgeSnapshot(t *testing.T, v *view.View, bump uint64) ([]byte, view.Versio
 // catch-up request and acknowledges everything else.
 func evilSeed(t *testing.T, c *cluster, bump uint64, served *int) func(string, []byte) []byte {
 	return func(_ string, msg []byte) []byte {
-		var in, out wire.Message
-		if wire.Decode(msg, &in) != nil {
+		var in, out Message
+		if Decode(msg, &in) != nil {
 			return nil
 		}
 
-		out.From = wire.MemberRef{ID: "evil", Incarnation: 1, Slot: view.NoSlot}
+		out.From = MemberRef{ID: "evil", Incarnation: 1, Slot: view.NoSlot}
 		out.LeaderSlot = view.NoSlot
 
-		if in.Kind != wire.KindCatchUpRequest {
-			out.Kind = wire.KindAck
+		if in.Kind != KindCatchUpRequest {
+			out.Kind = KindAck
 
-			return wire.Append(nil, &out)
+			return Append(nil, &out)
 		}
 
 		*served++
 		snap, ver := forgeSnapshot(t, c.nodes[c.leader()].View(), bump)
-		out.Kind = wire.KindCatchUpResponse
+		out.Kind = KindCatchUpResponse
 		out.Version = ver
 		out.Snapshot = snap
 
-		return wire.Append(nil, &out)
+		return Append(nil, &out)
 	}
 }
 
@@ -140,14 +138,14 @@ func TestCorruptSnapshotSeed(t *testing.T) {
 
 	before := served
 
-	var b wire.Message
+	var b Message
 
-	b.Kind = wire.KindBroadcast
-	b.From = wire.MemberRef{ID: c.nodes[l].cfg.ID, Incarnation: c.nodes[l].cfg.Incarnation, Slot: lv.Leader()}
+	b.Kind = KindBroadcast
+	b.From = MemberRef{ID: c.nodes[l].cfg.ID, Incarnation: c.nodes[l].cfg.Incarnation, Slot: lv.Leader()}
 	b.Version = lv.Version()
-	b.Level = wire.LevelLocal
+	b.Level = LevelLocal
 	b.Delta = raw
-	c.nodes[j].Handle(c.now, addr(l), wire.Append(nil, &b))
+	c.nodes[j].Handle(c.now, addr(l), Append(nil, &b))
 	c.flush(j)
 
 	if !slices.Contains(*evs, "bad-base") {
@@ -195,12 +193,12 @@ func TestSuspectViewNotServed(t *testing.T) {
 	n := c.nodes[1]
 	n.unconfirmed = true
 
-	var q, m wire.Message
+	var q, m Message
 
-	q.Kind = wire.KindCatchUpRequest
-	q.From = wire.MemberRef{ID: "x", Slot: view.NoSlot}
+	q.Kind = KindCatchUpRequest
+	q.From = MemberRef{ID: "x", Slot: view.NoSlot}
 
-	if err := wire.Decode(n.Handle(c.now, "x", wire.Append(nil, &q)), &m); err != nil || len(m.Snapshot) != 0 || len(m.Deltas) != 0 {
+	if err := Decode(n.Handle(c.now, "x", Append(nil, &q)), &m); err != nil || len(m.Snapshot) != 0 || len(m.Deltas) != 0 {
 		t.Fatalf("served an unconfirmed view: %v snapshot %d deltas %d", err, len(m.Snapshot), len(m.Deltas))
 	}
 }
@@ -208,7 +206,7 @@ func TestSuspectViewNotServed(t *testing.T) {
 // soloStart starts a single member without seeds and drives its Lease
 // operations against l until it has issued an acquire, which it returns
 // unexecuted.
-func soloStart(t *testing.T, l *memLease) (*Node, elect.Op, int64) {
+func soloStart(t *testing.T, l *memLease) (*Node, Op, int64) {
 	t.Helper()
 
 	now := 1000 * sec
@@ -218,7 +216,7 @@ func soloStart(t *testing.T, l *memLease) (*Node, elect.Op, int64) {
 
 	for range 50 {
 		for _, op := range n.LeaseOps() {
-			if op.Kind == elect.OpCreate || op.Kind == elect.OpUpdate {
+			if op.Kind == OpCreate || op.Kind == OpUpdate {
 				return n, op, now
 			}
 
@@ -231,7 +229,7 @@ func soloStart(t *testing.T, l *memLease) (*Node, elect.Op, int64) {
 
 	t.Fatal("no acquire issued")
 
-	return nil, elect.Op{}, 0
+	return nil, Op{}, 0
 }
 
 // TestLeaveDuringAcquire: Leave while a Lease acquire is in flight; when the
@@ -253,14 +251,14 @@ func TestLeaveDuringAcquire(t *testing.T) {
 		t.Fatal("a leaving member started a term")
 	}
 
-	if n.Elector().State() == elect.Leader {
+	if n.Elector().State() == StateLeader {
 		t.Fatal("elector still leader")
 	}
 
 	released := false
 
 	for _, op := range n.LeaseOps() {
-		if op.Kind == elect.OpUpdate && op.Record.Holder == "" {
+		if op.Kind == OpUpdate && op.Record.Holder == "" {
 			released = true
 
 			l.do(op, time.Unix(0, now))
@@ -282,8 +280,8 @@ func TestLeaveDuringAcquireCluster(t *testing.T) {
 	old := c.leader()
 	leaver := -1
 
-	c.onLeaseOp = func(i int, op elect.Op) {
-		if leaver < 0 && i != old && op.Record.Holder != "" && (op.Kind == elect.OpUpdate || op.Kind == elect.OpCreate) {
+	c.onLeaseOp = func(i int, op Op) {
+		if leaver < 0 && i != old && op.Record.Holder != "" && (op.Kind == OpUpdate || op.Kind == OpCreate) {
 			leaver = i
 
 			c.nodes[i].Leave(c.now)
@@ -332,19 +330,19 @@ func TestHigherTermStepsDown(t *testing.T) {
 		t.Fatal("stepped down on a data-plane note")
 	}
 
-	var p wire.Message
+	var p Message
 
-	p.Kind = wire.KindPing
-	p.From = wire.MemberRef{ID: "n1", Incarnation: 1, Slot: view.NoSlot}
+	p.Kind = KindPing
+	p.From = MemberRef{ID: "n1", Incarnation: 1, Slot: view.NoSlot}
 	p.Version = view.Version{Term: high, Seq: 1}
 	p.LeaderSlot = view.NoSlot
-	c.nodes[l].Handle(c.now, "nowhere:1", wire.Append(nil, &p))
+	c.nodes[l].Handle(c.now, "nowhere:1", Append(nil, &p))
 
 	if ok, _ := c.nodes[l].Leading(); ok {
 		t.Fatal("still leading after a higher term")
 	}
 
-	if c.nodes[l].Elector().State() == elect.Leader {
+	if c.nodes[l].Elector().State() == StateLeader {
 		t.Fatal("elector still leader")
 	}
 
@@ -356,18 +354,18 @@ func TestHigherTermStepsDown(t *testing.T) {
 	}
 }
 
-// TestAbsurdTermIgnored: a term at or above elect.MaxSaneTerm is garbage.
+// TestAbsurdTermIgnored: a term at or above MaxSaneTerm is garbage.
 func TestAbsurdTermIgnored(t *testing.T) {
 	c := grow(t, 3)
 	l := c.leader()
 
-	var p wire.Message
+	var p Message
 
-	p.Kind = wire.KindPing
-	p.From = wire.MemberRef{ID: "x", Slot: view.NoSlot}
+	p.Kind = KindPing
+	p.From = MemberRef{ID: "x", Slot: view.NoSlot}
 	p.Version = view.Version{Term: ^uint64(0), Seq: 1}
 	p.LeaderSlot = view.NoSlot
-	c.nodes[l].Handle(c.now, "x", wire.Append(nil, &p))
+	c.nodes[l].Handle(c.now, "x", Append(nil, &p))
 
 	if ok, _ := c.nodes[l].Leading(); !ok {
 		t.Fatal("stepped down on an absurd term")
@@ -476,15 +474,15 @@ func TestPendingCallsBounded(t *testing.T) {
 		c.cut[[2]int{1, i}] = true
 	}
 
-	var j, r wire.Message
+	var j, r Message
 
-	j.Kind = wire.KindJoin
-	j.Member = wire.MemberRef{ID: "x", Incarnation: 1, Slot: view.NoSlot}
-	r.Kind = wire.KindRouted
+	j.Kind = KindJoin
+	j.Member = MemberRef{ID: "x", Incarnation: 1, Slot: view.NoSlot}
+	r.Kind = KindRouted
 	r.ToLeader = true
 	r.TTL = 4
-	r.Inner = wire.Append(nil, &j)
-	msg := wire.Append(nil, &r)
+	r.Inner = Append(nil, &j)
+	msg := Append(nil, &r)
 
 	for range 3 * MaxPendingCalls {
 		n.Handle(c.now, "x", msg)
@@ -508,14 +506,14 @@ func TestSeedsBounded(t *testing.T) {
 	n := New(Config{ID: "j", Incarnation: 1, Addr: "j:1", Seeds: []string{"s:1"}, PartitionBits: 8}, rand.New(rand.NewPCG(1, 1)))
 	n.Start(sec, time.Unix(1, 0))
 
-	var b wire.Message
+	var b Message
 
-	b.Kind = wire.KindBroadcast
-	b.From = wire.MemberRef{ID: "p", Slot: view.NoSlot}
+	b.Kind = KindBroadcast
+	b.From = MemberRef{ID: "p", Slot: view.NoSlot}
 	b.Delta = []byte{1}
 
 	for i := range 1000 {
-		n.Handle(sec, "p"+strconv.Itoa(i), wire.Append(nil, &b))
+		n.Handle(sec, "p"+strconv.Itoa(i), Append(nil, &b))
 	}
 
 	if s := n.Stats().Seeds; s > maxSeeds {

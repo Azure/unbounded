@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-package node
+package control
 
 import (
 	"errors"
@@ -12,9 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Azure/unbounded/internal/cachemesh/internal/elect"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/wire"
 )
 
 const sec = int64(time.Second)
@@ -23,24 +21,24 @@ var errDown = errors.New("down")
 
 // memLease is a minimal in-memory Lease store.
 type memLease struct {
-	rec    elect.Record
+	rec    Record
 	exists bool
 	rv     int
 }
 
-func (l *memLease) do(op elect.Op, wall time.Time) elect.Result {
-	res := elect.Result{Seq: op.Seq, Kind: op.Kind}
+func (l *memLease) do(op Op, wall time.Time) Result {
+	res := Result{Seq: op.Seq, Kind: op.Kind}
 
 	switch op.Kind {
-	case elect.OpGet, elect.OpGetCached:
+	case OpGet, OpGetCached:
 		if !l.exists {
-			res.Err = elect.ErrNotFound
+			res.Err = ErrNotFound
 		} else {
 			res.Record = l.rec.Clone()
 		}
-	case elect.OpCreate:
+	case OpCreate:
 		if l.exists {
-			res.Err = elect.ErrConflict
+			res.Err = ErrConflict
 
 			return res
 		}
@@ -50,12 +48,12 @@ func (l *memLease) do(op elect.Op, wall time.Time) elect.Result {
 		l.rec = op.Record.Clone()
 		l.rec.ResourceVersion = strconv.Itoa(l.rv)
 		res.Record = l.rec.Clone()
-	case elect.OpUpdate:
+	case OpUpdate:
 		switch {
 		case !l.exists:
-			res.Err = elect.ErrNotFound
+			res.Err = ErrNotFound
 		case op.Record.ResourceVersion != l.rec.ResourceVersion:
-			res.Err = elect.ErrConflict
+			res.Err = ErrConflict
 		default:
 			l.rv++
 			l.rec = op.Record.Clone()
@@ -96,7 +94,7 @@ type cluster struct {
 	// skew offsets the wall clock of a node index.
 	skew map[int]time.Duration
 	// onLeaseOp, if set, sees every Lease op as a node emits it.
-	onLeaseOp func(i int, op elect.Op)
+	onLeaseOp func(i int, op Op)
 }
 
 func (c *cluster) wallOf(i int) time.Time { return c.wall().Add(c.skew[i]) }
@@ -117,7 +115,7 @@ func (c *cluster) cfg(i int, seeds []string) Config {
 	return Config{
 		ID: "n" + strconv.Itoa(i), Incarnation: uint64(1000 + len(c.nodes)), Addr: addr(i), Zone: "z",
 		Seeds: seeds, PartitionBits: 10, Shared: c.shared,
-		Elect:        elect.Config{ExpectedClusterSize: 10, MinCandidateAge: 20 * time.Second},
+		Elect:        ElectionConfig{ExpectedClusterSize: 10, MinCandidateAge: 20 * time.Second},
 		DeltaLogSize: 32,
 	}
 }
@@ -614,32 +612,32 @@ func TestHandleBadInput(t *testing.T) {
 
 	n := c.nodes[0]
 
-	var m wire.Message
-	if err := wire.Decode(n.Handle(c.now, "x", []byte{1, 2, 3}), &m); err != nil || m.Kind != wire.KindNack {
+	var m Message
+	if err := Decode(n.Handle(c.now, "x", []byte{1, 2, 3}), &m); err != nil || m.Kind != KindNack {
 		t.Fatalf("garbage: %v %v", err, m.Kind)
 	}
 
 	// A routed message whose inner bytes are garbage is rejected.
-	var r wire.Message
+	var r Message
 
-	r.Kind = wire.KindRouted
+	r.Kind = KindRouted
 	r.ToLeader = true
 	r.TTL = 3
 	r.Inner = []byte{9, 9}
 
-	if err := wire.Decode(n.Handle(c.now, "x", wire.Append(nil, &r)), &m); err != nil || m.Kind != wire.KindNack {
+	if err := Decode(n.Handle(c.now, "x", Append(nil, &r)), &m); err != nil || m.Kind != KindNack {
 		t.Fatalf("bad inner: %v %v", err, m.Kind)
 	}
 
 	// A join with the wrong partition bits is ignored.
-	var j wire.Message
+	var j Message
 
-	j.Kind = wire.KindJoin
-	j.Member = wire.MemberRef{ID: "bad", Incarnation: 1, Slot: view.NoSlot}
+	j.Kind = KindJoin
+	j.Member = MemberRef{ID: "bad", Incarnation: 1, Slot: view.NoSlot}
 	j.Addr = "bad:1"
 	j.PartitionBits = 12
 
-	n.Handle(c.now, "x", wire.Append(nil, &j))
+	n.Handle(c.now, "x", Append(nil, &j))
 	c.run(3 * time.Second)
 
 	if _, ok := n.View().Lookup("bad"); ok {
@@ -647,13 +645,13 @@ func TestHandleBadInput(t *testing.T) {
 	}
 
 	// A catch-up from a member at our version is empty.
-	var q wire.Message
+	var q Message
 
-	q.Kind = wire.KindCatchUpRequest
+	q.Kind = KindCatchUpRequest
 	q.Have, q.HaveDigest = n.View().Version(), n.View().Digest()
 
-	if err := wire.Decode(n.Handle(c.now, "x", wire.Append(nil, &q)), &m); err != nil ||
-		m.Kind != wire.KindCatchUpResponse || len(m.Deltas) != 0 || len(m.Snapshot) != 0 {
+	if err := Decode(n.Handle(c.now, "x", Append(nil, &q)), &m); err != nil ||
+		m.Kind != KindCatchUpResponse || len(m.Deltas) != 0 || len(m.Snapshot) != 0 {
 		t.Fatalf("catch-up at head: %v", err)
 	}
 }
@@ -834,19 +832,19 @@ func TestPingEpochAntiEntropy(t *testing.T) {
 
 	b.ep.Anchor(10, 15*time.Second, c.now)
 
-	var m wire.Message
+	var m Message
 
-	b.header(&m, wire.KindPing)
-	a.Handle(c.now+sec, b.cfg.Addr, wire.Append(nil, &m))
+	b.header(&m, KindPing)
+	a.Handle(c.now+sec, b.cfg.Addr, Append(nil, &m))
 
 	if got := a.Epoch().Current(); got != 10 {
 		t.Fatalf("epoch after ping from a peer at 10: %d", got)
 	}
 
 	// A peer behind does not pull it back or move its phase.
-	a.header(&m, wire.KindPing)
+	a.header(&m, KindPing)
 	m.Epoch = 3
-	a.Handle(c.now+2*sec, b.cfg.Addr, wire.Append(nil, &m))
+	a.Handle(c.now+2*sec, b.cfg.Addr, Append(nil, &m))
 
 	if got := a.Epoch().Advance(c.now + 16*sec); got != 11 {
 		t.Fatalf("epoch 15s after the anchor: %d, want 11", got)
@@ -932,17 +930,17 @@ func hasJoin(t *testing.T, calls []Call) bool {
 	t.Helper()
 
 	for _, call := range calls {
-		var m wire.Message
-		if err := wire.Decode(call.Msg, &m); err != nil {
+		var m Message
+		if err := Decode(call.Msg, &m); err != nil {
 			t.Fatal(err)
 		}
 
-		if m.Kind == wire.KindJoin {
+		if m.Kind == KindJoin {
 			return true
 		}
 
-		if m.Kind == wire.KindRouted && len(m.Inner) > 0 {
-			if k, err := wire.PeekKind(m.Inner); err == nil && k == wire.KindJoin {
+		if m.Kind == KindRouted && len(m.Inner) > 0 {
+			if k, err := PeekKind(m.Inner); err == nil && k == KindJoin {
 				return true
 			}
 		}

@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package leader is the cachemesh leader logic: a pure, deterministic delta
+// Leader logic. This file is the cachemesh leader logic: a pure, deterministic delta
 // planner run by the elected leader.
 //
 // # Design
@@ -60,14 +60,14 @@
 // view: they apply with view.Apply (after the caller wraps them in a delta)
 // and the result passes view.Validate. The returned slice is owned by the
 // caller.
-package leader
+
+package control
 
 import (
 	"math/rand/v2"
 	"slices"
 	"time"
 
-	"github.com/Azure/unbounded/internal/cachemesh/internal/control"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/route"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
 )
@@ -81,7 +81,6 @@ const (
 	DefaultSuspicionWindow     = 30 * time.Second
 	DefaultObserverCells       = 3
 	DefaultDampingPercent      = 10
-	DefaultMaxMoves            = control.DefaultMaxMoves
 	DefaultMaxCellMovesPerTick = 32
 	DefaultCellSize            = 4
 	DefaultMaxNeighbors        = 256
@@ -95,18 +94,18 @@ const (
 // DefaultWarmupWeights are the Active weight steps.
 var DefaultWarmupWeights = []uint32{250, 500, view.MaxWeight}
 
-// Member identifies a member to admit, including the leader itself.
-type Member struct {
+// Joiner identifies a member to admit, including the leader itself.
+type Joiner struct {
 	ID          string
 	Incarnation uint64
 	Addr, Zone  string
 }
 
-// Config tunes a Leader. Zero values select defaults.
-type Config struct {
+// LeaderConfig tunes a Leader. Zero values select defaults.
+type LeaderConfig struct {
 	// Self is the leader's own identity. It is admitted when the leader is
 	// not a member of the view it leads (bootstrap or a lottery winner).
-	Self Member
+	Self Joiner
 
 	MaxJoinsPerTick int
 	QuarantineFor   time.Duration
@@ -138,7 +137,7 @@ type Config struct {
 }
 
 // WithDefaults returns c with zero fields replaced by defaults.
-func (c Config) WithDefaults() Config {
+func (c LeaderConfig) WithDefaults() LeaderConfig {
 	def := func(v *int, d int) {
 		if *v == 0 {
 			*v = d
@@ -192,8 +191,8 @@ const (
 	RemovedSuspected                         // failure detection
 )
 
-// Hooks observe the Leader for metrics and coverage. Nil fields are skipped.
-type Hooks struct {
+// LeaderHooks observe the Leader for metrics and coverage. Nil fields are skipped.
+type LeaderHooks struct {
 	OnAdmit     func(slot view.Slot, id string)
 	OnRemove    func(slot view.Slot, reason RemoveReason)
 	OnPromote   func(slot view.Slot, state view.MemberState, weight uint32)
@@ -223,30 +222,30 @@ type stamp struct {
 
 // Leader plans deltas. Create one with New.
 type Leader struct {
-	cfg   Config
+	cfg   LeaderConfig
 	rng   *rand.Rand
-	hooks Hooks
+	hooks LeaderHooks
 
-	joins     []Member
+	joins     []Joiner
 	joinIdx   map[string]int
 	leaves    map[string]uint64
 	suspects  map[view.Slot]*suspicion
 	invals    []uint64
 	stamps    []stamp // indexed by slot
-	planner   *control.Planner
+	planner   *Planner
 	settledAt *view.Table
 	settledH  uint64
 
 	// scratch
-	pm      []control.Member
+	pm      []PlanMember
 	occBuf  []uint32
 	obs     []view.Slot
 	targets []view.Slot
 }
 
-// New returns a Leader. rng is used only for tie breaking that does not
+// NewLeader returns a Leader. rng is used only for tie breaking that does not
 // need to agree across members; it may be nil.
-func New(cfg Config, rng *rand.Rand) *Leader {
+func NewLeader(cfg LeaderConfig, rng *rand.Rand) *Leader {
 	cfg = cfg.WithDefaults()
 
 	return &Leader{
@@ -255,15 +254,15 @@ func New(cfg Config, rng *rand.Rand) *Leader {
 		joinIdx:  map[string]int{},
 		leaves:   map[string]uint64{},
 		suspects: map[view.Slot]*suspicion{},
-		planner:  control.NewPlanner(control.Config{MaxMoves: cfg.MaxMoves}),
+		planner:  NewPlanner(PlannerConfig{MaxMoves: cfg.MaxMoves}),
 	}
 }
 
 // SetHooks installs hooks.
-func (l *Leader) SetHooks(h Hooks) { l.hooks = h }
+func (l *Leader) SetHooks(h LeaderHooks) { l.hooks = h }
 
 // Config returns the effective configuration.
-func (l *Leader) Config() Config { return l.cfg }
+func (l *Leader) Config() LeaderConfig { return l.cfg }
 
 // Reset drops all queued inputs and timing state. Call it when gaining
 // leadership.
@@ -291,7 +290,7 @@ func (l *Leader) drop(q string) {
 
 // Join queues an admission request. A later request with the same ID
 // replaces an earlier one.
-func (l *Leader) Join(_ int64, j Member) {
+func (l *Leader) Join(_ int64, j Joiner) {
 	if j.ID == "" || len(j.ID) > view.MaxIDLen || len(j.Addr) > view.MaxAddrLen || len(j.Zone) > view.MaxZoneLen {
 		return
 	}
@@ -629,7 +628,7 @@ func (l *Leader) admit(st *state, _ int64, epochNow uint64) {
 	v := st.v
 	k := min(len(l.joins), l.cfg.MaxJoinsPerTick, max(0, (maxMemberOps-len(st.ops))/2))
 
-	batch := make([]Member, 0, k)
+	batch := make([]Joiner, 0, k)
 	for _, j := range l.joins[:k] {
 		key := view.MemberKey(j.ID, j.Incarnation)
 		if s, ok := v.Lookup(j.ID); ok {
@@ -1060,7 +1059,7 @@ func (l *Leader) place(st *state) {
 			_, w = st.memberState(s)
 		}
 
-		pm = append(pm, control.Member{Slot: s, Key: key, Weight: w, Cell: cell})
+		pm = append(pm, PlanMember{Slot: s, Key: key, Weight: w, Cell: cell})
 	})
 
 	removed := make([]view.Slot, 0, len(st.removed))
@@ -1071,7 +1070,7 @@ func (l *Leader) place(st *state) {
 	slices.Sort(removed)
 
 	for _, s := range removed {
-		pm = append(pm, control.Member{Slot: s, Key: v.Key(s), Cell: v.Cell(s), Gone: true})
+		pm = append(pm, PlanMember{Slot: s, Key: v.Key(s), Cell: v.Cell(s), Gone: true})
 	}
 
 	l.pm = pm

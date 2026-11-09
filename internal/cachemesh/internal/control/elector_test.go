@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-package elect
+package control
 
 import (
 	"errors"
@@ -74,22 +74,22 @@ func self(i int) Self {
 
 func newRNG(s uint64) *rand.Rand { return rand.New(rand.NewPCG(s, s^0x9e37)) }
 
-func sec(n float64) int64 { return int64(n * float64(time.Second)) }
+func secs(n float64) int64 { return int64(n * float64(time.Second)) }
 
 func TestConfigValidate(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
 		name string
-		cfg  Config
+		cfg  ElectionConfig
 		ok   bool
 	}{
-		{"defaults", Config{}, true},
-		{"renew>=lease", Config{LeaseDuration: 5 * time.Second, RenewDeadline: 5 * time.Second}, false},
-		{"retry too big", Config{RetryPeriod: 9 * time.Second}, false},
-		{"negative", Config{LotteryRound: -1}, false},
-		{"jitter", Config{RetryJitterPercent: 101}, false},
-		{"custom", Config{LeaseDuration: 3 * time.Second, RenewDeadline: 2 * time.Second, RetryPeriod: time.Second}, true},
+		{"defaults", ElectionConfig{}, true},
+		{"renew>=lease", ElectionConfig{LeaseDuration: 5 * time.Second, RenewDeadline: 5 * time.Second}, false},
+		{"retry too big", ElectionConfig{RetryPeriod: 9 * time.Second}, false},
+		{"negative", ElectionConfig{LotteryRound: -1}, false},
+		{"jitter", ElectionConfig{RetryJitterPercent: 101}, false},
+		{"custom", ElectionConfig{LeaseDuration: 3 * time.Second, RenewDeadline: 2 * time.Second, RetryPeriod: time.Second}, true},
 	}
 
 	for _, c := range cases {
@@ -98,7 +98,7 @@ func TestConfigValidate(t *testing.T) {
 		}
 	}
 
-	d := Config{}.WithDefaults()
+	d := ElectionConfig{}.WithDefaults()
 	if d.LeaseDuration != DefaultLeaseDuration || d.OpTimeout != DefaultRetryPeriod || d.Candidates != 3 {
 		t.Errorf("defaults: %+v", d)
 	}
@@ -109,13 +109,13 @@ func TestConfigValidate(t *testing.T) {
 		}
 	}()
 
-	New(Config{RetryPeriod: time.Hour}, self(0), newRNG(1))
+	NewElector(ElectionConfig{RetryPeriod: time.Hour}, self(0), newRNG(1))
 }
 
 func TestStateStrings(t *testing.T) {
 	t.Parallel()
 
-	for s, want := range map[State]string{Follower: "follower", Candidate: "candidate", Leader: "leader", Lottery: "lottery", 9: "unknown"} {
+	for s, want := range map[ElectorState]string{StateFollower: "follower", StateCandidate: "candidate", StateLeader: "leader", StateLottery: "lottery", 9: "unknown"} {
 		if s.String() != want {
 			t.Errorf("%d: %q", s, s.String())
 		}
@@ -199,8 +199,8 @@ func TestTopCandidates(t *testing.T) {
 	}
 }
 
-// harness drives one elector synchronously against a memStore.
-type harness struct {
+// electHarness drives one elector synchronously against a memStore.
+type electHarness struct {
 	t   *testing.T
 	e   *Elector
 	s   *memStore
@@ -208,23 +208,23 @@ type harness struct {
 	ops int
 }
 
-func newHarness(t *testing.T, s *memStore, i int) *harness {
+func newElectHarness(t *testing.T, s *memStore, i int) *electHarness {
 	t.Helper()
 
-	h := &harness{t: t, s: s, e: New(Config{ExpectedClusterSize: 1}, self(i), newRNG(uint64(i)))}
-	h.e.SetHooks(Hooks{OnOp: func(OpKind) { h.ops++ }})
+	h := &electHarness{t: t, s: s, e: NewElector(ElectionConfig{ExpectedClusterSize: 1}, self(i), newRNG(uint64(i)))}
+	h.e.SetHooks(ElectorHooks{OnOp: func(OpKind) { h.ops++ }})
 	h.in = Input{Wall: epoch, HaveView: true, ClusterSize: 10, IsCandidate: true}
 
 	return h
 }
 
-func (h *harness) advance(d int64) {
+func (h *electHarness) advance(d int64) {
 	h.in.Now += d
 	h.in.Wall = h.in.Wall.Add(time.Duration(d))
 }
 
 // step ticks once and executes any op synchronously.
-func (h *harness) step() []Op {
+func (h *electHarness) step() []Op {
 	ops := h.e.Tick(h.in)
 	for _, op := range ops {
 		h.e.OnResult(h.in, h.s.apply(op))
@@ -233,14 +233,14 @@ func (h *harness) step() []Op {
 	return ops
 }
 
-func (h *harness) run(until int64) {
+func (h *electHarness) run(until int64) {
 	for h.in.Now < until {
-		h.advance(sec(0.1))
+		h.advance(secs(0.1))
 		h.step()
 	}
 }
 
-func kinds(ev []Event) []EventKind {
+func eventKinds(ev []Event) []EventKind {
 	var out []EventKind
 	for _, e := range ev {
 		out = append(out, e.Kind)
@@ -252,11 +252,11 @@ func kinds(ev []Event) []EventKind {
 func TestCandidateCreatesMissingLease(t *testing.T) {
 	t.Parallel()
 
-	h := newHarness(t, &memStore{}, 0)
+	h := newElectHarness(t, &memStore{}, 0)
 	h.in.ViewTerm = 7
-	h.run(sec(1))
+	h.run(secs(1))
 
-	if h.e.State() != Leader || h.e.Term() != 8 {
+	if h.e.State() != StateLeader || h.e.Term() != 8 {
 		t.Fatalf("state %v term %d", h.e.State(), h.e.Term())
 	}
 
@@ -264,7 +264,7 @@ func TestCandidateCreatesMissingLease(t *testing.T) {
 		t.Fatalf("record %+v", h.s.rec)
 	}
 
-	if ev := h.e.Events(); !slices.Equal(kinds(ev), []EventKind{Acquired}) || ev[0].Term != 8 {
+	if ev := h.e.Events(); !slices.Equal(eventKinds(ev), []EventKind{Acquired}) || ev[0].Term != 8 {
 		t.Fatalf("events %+v", ev)
 	}
 
@@ -274,9 +274,9 @@ func TestCandidateCreatesMissingLease(t *testing.T) {
 
 	// Renewals keep it.
 	h.in.Seeds = []string{"a", "b"}
-	h.run(sec(60))
+	h.run(secs(60))
 
-	if h.e.State() != Leader || len(h.e.Events()) != 0 || !slices.Equal(h.s.rec.Seeds, []string{"a", "b"}) {
+	if h.e.State() != StateLeader || len(h.e.Events()) != 0 || !slices.Equal(h.s.rec.Seeds, []string{"a", "b"}) {
 		t.Fatalf("lost leadership: %v %+v", h.e.State(), h.s.rec)
 	}
 
@@ -291,14 +291,14 @@ func TestCandidateWaitsLeaseDurationForStaleHolder(t *testing.T) {
 	s := &memStore{}
 	s.store(Record{Holder: "other", Incarnation: 1, Term: 4, RenewTime: epoch, LeaseDuration: DefaultLeaseDuration})
 
-	h := newHarness(t, s, 0)
-	h.run(sec(14))
+	h := newElectHarness(t, s, 0)
+	h.run(secs(14))
 
-	if h.e.State() != Candidate {
+	if h.e.State() != StateCandidate {
 		t.Fatalf("took over early: %v", h.e.State())
 	}
 
-	if ev := h.e.Events(); !slices.Equal(kinds(ev), []EventKind{Discovered}) {
+	if ev := h.e.Events(); !slices.Equal(eventKinds(ev), []EventKind{Discovered}) {
 		t.Fatalf("events %+v", ev)
 	}
 
@@ -306,9 +306,9 @@ func TestCandidateWaitsLeaseDurationForStaleHolder(t *testing.T) {
 		t.Fatalf("leader %+v", li)
 	}
 
-	h.run(sec(20))
+	h.run(secs(20))
 
-	if h.e.State() != Leader || h.e.Term() != 5 || s.rec.Transitions != 1 {
+	if h.e.State() != StateLeader || h.e.Term() != 5 || s.rec.Transitions != 1 {
 		t.Fatalf("state %v term %d rec %+v", h.e.State(), h.e.Term(), s.rec)
 	}
 }
@@ -319,16 +319,16 @@ func TestSameIDOtherIncarnationWaits(t *testing.T) {
 	s := &memStore{}
 	s.store(Record{Holder: "m0", Incarnation: 99, Term: 1, RenewTime: epoch})
 
-	h := newHarness(t, s, 0)
-	h.run(sec(10))
+	h := newElectHarness(t, s, 0)
+	h.run(secs(10))
 
-	if h.e.State() == Leader {
+	if h.e.State() == StateLeader {
 		t.Fatal("took over a different incarnation without waiting")
 	}
 
-	h.run(sec(25))
+	h.run(secs(25))
 
-	if h.e.State() != Leader {
+	if h.e.State() != StateLeader {
 		t.Fatal("never took over")
 	}
 }
@@ -339,10 +339,10 @@ func TestSameIncarnationRetakesImmediately(t *testing.T) {
 	s := &memStore{}
 	s.store(Record{Holder: "m0", Incarnation: 1, Term: 3, RenewTime: epoch})
 
-	h := newHarness(t, s, 0)
-	h.run(sec(1))
+	h := newElectHarness(t, s, 0)
+	h.run(secs(1))
 
-	if h.e.State() != Leader || h.e.Term() != 4 || s.rec.Transitions != 0 {
+	if h.e.State() != StateLeader || h.e.Term() != 4 || s.rec.Transitions != 0 {
 		t.Fatalf("state %v term %d rec %+v", h.e.State(), h.e.Term(), s.rec)
 	}
 }
@@ -353,10 +353,10 @@ func TestReleasedLeaseTakenImmediately(t *testing.T) {
 	s := &memStore{}
 	s.store(Record{Holder: "", Term: 9, RenewTime: epoch})
 
-	h := newHarness(t, s, 0)
-	h.run(sec(1))
+	h := newElectHarness(t, s, 0)
+	h.run(secs(1))
 
-	if h.e.State() != Leader || h.e.Term() != 10 {
+	if h.e.State() != StateLeader || h.e.Term() != 10 {
 		t.Fatalf("state %v term %d", h.e.State(), h.e.Term())
 	}
 }
@@ -365,14 +365,14 @@ func TestReleaseAndHandoff(t *testing.T) {
 	t.Parallel()
 
 	s := &memStore{}
-	a := newHarness(t, s, 0)
-	a.run(sec(1))
+	a := newElectHarness(t, s, 0)
+	a.run(secs(1))
 
-	b := newHarness(t, s, 1)
+	b := newElectHarness(t, s, 1)
 	b.in = a.in
-	b.run(a.in.Now + sec(5))
+	b.run(a.in.Now + secs(5))
 
-	if b.e.State() != Candidate {
+	if b.e.State() != StateCandidate {
 		t.Fatalf("b %v", b.e.State())
 	}
 
@@ -385,7 +385,7 @@ func TestReleaseAndHandoff(t *testing.T) {
 		t.Fatalf("release ops %+v", ops)
 	}
 
-	if a.e.State() != Follower || a.e.CanPublish(a.in.Now) {
+	if a.e.State() != StateFollower || a.e.CanPublish(a.in.Now) {
 		t.Fatal("still leader after release")
 	}
 
@@ -396,12 +396,12 @@ func TestReleaseAndHandoff(t *testing.T) {
 	a.e.OnResult(a.in, s.apply(ops[0]))
 
 	start := b.in.Now
-	for b.e.State() != Leader && b.in.Now-start < sec(10) {
-		b.advance(sec(0.1))
+	for b.e.State() != StateLeader && b.in.Now-start < secs(10) {
+		b.advance(secs(0.1))
 		b.step()
 	}
 
-	if got := b.in.Now - start; got > int64(DefaultRetryPeriod)*6/5+sec(0.2) {
+	if got := b.in.Now - start; got > int64(DefaultRetryPeriod)*6/5+secs(0.2) {
 		t.Fatalf("handoff took %v", time.Duration(got))
 	}
 
@@ -413,21 +413,21 @@ func TestReleaseAndHandoff(t *testing.T) {
 func TestLeaderStepsDownOnOutage(t *testing.T) {
 	t.Parallel()
 
-	h := newHarness(t, &memStore{}, 0)
-	h.run(sec(1))
+	h := newElectHarness(t, &memStore{}, 0)
+	h.run(secs(1))
 	h.e.Events()
 
 	acquiredAt := h.in.Now
 	// Outage: every op fails.
-	for h.e.State() == Leader {
-		h.advance(sec(0.1))
+	for h.e.State() == StateLeader {
+		h.advance(secs(0.1))
 
 		for _, op := range h.e.Tick(h.in) {
 			h.e.OnResult(h.in, Result{Seq: op.Seq, Kind: op.Kind, Err: errors.New("outage")})
 		}
 	}
 
-	if d := h.in.Now - acquiredAt; d > int64(DefaultRenewDeadline)+sec(0.1) {
+	if d := h.in.Now - acquiredAt; d > int64(DefaultRenewDeadline)+secs(0.1) {
 		t.Fatalf("stepped down after %v", time.Duration(d))
 	}
 
@@ -440,13 +440,13 @@ func TestLeaderStepsDownWithOpOutstandingAndIgnoresLateResult(t *testing.T) {
 	t.Parallel()
 
 	s := &memStore{}
-	h := newHarness(t, s, 0)
-	h.run(sec(1))
+	h := newElectHarness(t, s, 0)
+	h.run(secs(1))
 
 	var pending []Op
 
-	for h.e.State() == Leader {
-		h.advance(sec(0.1))
+	for h.e.State() == StateLeader {
+		h.advance(secs(0.1))
 		pending = append(pending, h.e.Tick(h.in)...)
 	}
 
@@ -458,7 +458,7 @@ func TestLeaderStepsDownWithOpOutstandingAndIgnoresLateResult(t *testing.T) {
 		h.e.OnResult(h.in, s.apply(op))
 	}
 
-	if h.e.State() == Leader || h.e.CanPublish(h.in.Now) {
+	if h.e.State() == StateLeader || h.e.CanPublish(h.in.Now) {
 		t.Fatal("late result restored leadership")
 	}
 }
@@ -466,10 +466,10 @@ func TestLeaderStepsDownWithOpOutstandingAndIgnoresLateResult(t *testing.T) {
 func TestPausedLeaderCannotPublishOnWake(t *testing.T) {
 	t.Parallel()
 
-	h := newHarness(t, &memStore{}, 0)
-	h.run(sec(1))
+	h := newElectHarness(t, &memStore{}, 0)
+	h.run(secs(1))
 
-	h.advance(sec(30)) // stop the world
+	h.advance(secs(30)) // stop the world
 
 	if h.e.CanPublish(h.in.Now) {
 		t.Fatal("paused leader may publish")
@@ -477,7 +477,7 @@ func TestPausedLeaderCannotPublishOnWake(t *testing.T) {
 
 	h.step()
 
-	if h.e.State() == Leader {
+	if h.e.State() == StateLeader {
 		t.Fatal("still leader after pause")
 	}
 }
@@ -486,18 +486,18 @@ func TestLeaderConflictStepsDown(t *testing.T) {
 	t.Parallel()
 
 	s := &memStore{}
-	h := newHarness(t, s, 0)
-	h.run(sec(1))
+	h := newElectHarness(t, s, 0)
+	h.run(secs(1))
 	h.e.Events()
 
 	s.store(Record{Holder: "thief", Incarnation: 1, Term: 50, RenewTime: epoch})
-	h.run(h.in.Now + sec(3))
+	h.run(h.in.Now + secs(3))
 
 	if ev := h.e.Events(); len(ev) < 1 || ev[0].Kind != Lost || ev[0].Reason != LostConflict {
 		t.Fatalf("events %+v", ev)
 	}
 
-	if h.e.State() != Candidate {
+	if h.e.State() != StateCandidate {
 		t.Fatalf("state %v", h.e.State())
 	}
 
@@ -510,9 +510,9 @@ func TestStaleResultsIgnored(t *testing.T) {
 	t.Parallel()
 
 	s := &memStore{}
-	h := newHarness(t, s, 0)
+	h := newElectHarness(t, s, 0)
 
-	h.advance(sec(0.1))
+	h.advance(secs(0.1))
 
 	ops := h.e.Tick(h.in)
 	if len(ops) != 1 || ops[0].Kind != OpGet {
@@ -548,16 +548,16 @@ func TestStaleResultsIgnored(t *testing.T) {
 func TestFollowerMakesNoOps(t *testing.T) {
 	t.Parallel()
 
-	h := newHarness(t, &memStore{}, 0)
+	h := newElectHarness(t, &memStore{}, 0)
 	h.in.IsCandidate = false
 
-	for h.in.Now < sec(300) {
-		h.advance(sec(0.1))
+	for h.in.Now < secs(300) {
+		h.advance(secs(0.1))
 		h.in.LeaderHeardAt = h.in.Now
 		h.step()
 	}
 
-	if h.ops != 0 || h.e.State() != Follower {
+	if h.ops != 0 || h.e.State() != StateFollower {
 		t.Fatalf("ops %d state %v", h.ops, h.e.State())
 	}
 }
@@ -568,18 +568,18 @@ func TestLotteryDiscoversLiveLeader(t *testing.T) {
 	s := &memStore{}
 	s.store(Record{Holder: "L", Incarnation: 1, Term: 3, Addr: "l:1", Seeds: []string{"s1"}, RenewTime: epoch.Add(time.Hour), LeaseDuration: DefaultLeaseDuration})
 
-	h := newHarness(t, s, 0)
+	h := newElectHarness(t, s, 0)
 	h.in.IsCandidate = false
 	h.in.HaveView = false
 	h.in.Wall = epoch.Add(time.Hour)
-	h.run(sec(2))
+	h.run(secs(2))
 
-	if h.e.State() != Lottery {
+	if h.e.State() != StateLottery {
 		t.Fatalf("state %v", h.e.State())
 	}
 
 	ev := h.e.Events()
-	if !slices.Equal(kinds(ev), []EventKind{Discovered}) || ev[0].Record.Addr != "l:1" {
+	if !slices.Equal(eventKinds(ev), []EventKind{Discovered}) || ev[0].Record.Addr != "l:1" {
 		t.Fatalf("events %+v", ev)
 	}
 
@@ -587,7 +587,7 @@ func TestLotteryDiscoversLiveLeader(t *testing.T) {
 	h.in.LeaderHeardAt = h.in.Now
 	h.step()
 
-	if h.e.State() != Follower {
+	if h.e.State() != StateFollower {
 		t.Fatalf("state %v", h.e.State())
 	}
 }
@@ -598,20 +598,20 @@ func TestLotteryTakesExpiredLease(t *testing.T) {
 	s := &memStore{}
 	s.store(Record{Holder: "L", Incarnation: 1, Term: 3, RenewTime: epoch, LeaseDuration: DefaultLeaseDuration})
 
-	h := newHarness(t, s, 0)
+	h := newElectHarness(t, s, 0)
 	h.in.IsCandidate = false
 	h.in.HaveView = false
 	h.in.Wall = epoch.Add(DefaultLeaseDuration + DefaultClockSkewAllowance - 3*time.Second)
-	h.run(sec(1.5))
+	h.run(secs(1.5))
 
-	if h.e.State() != Lottery {
+	if h.e.State() != StateLottery {
 		t.Fatalf("took a lease within skew allowance: %v", h.e.State())
 	}
 
 	h.in.Wall = epoch.Add(DefaultLeaseDuration + DefaultClockSkewAllowance + time.Second)
-	h.run(sec(3))
+	h.run(secs(3))
 
-	if h.e.State() != Leader || h.e.Term() != 4 {
+	if h.e.State() != StateLeader || h.e.Term() != 4 {
 		t.Fatalf("state %v term %d", h.e.State(), h.e.Term())
 	}
 }
@@ -619,18 +619,18 @@ func TestLotteryTakesExpiredLease(t *testing.T) {
 func TestLotteryEntryAfterNoLeaderTimeout(t *testing.T) {
 	t.Parallel()
 
-	h := newHarness(t, &memStore{}, 0)
+	h := newElectHarness(t, &memStore{}, 0)
 	h.in.IsCandidate = false
 	h.in.LeaderHeardAt = 1
-	h.run(sec(30))
+	h.run(secs(30))
 
-	if h.e.State() != Follower || h.ops != 0 {
+	if h.e.State() != StateFollower || h.ops != 0 {
 		t.Fatalf("state %v ops %d", h.e.State(), h.ops)
 	}
 
-	h.run(sec(46))
+	h.run(secs(46))
 
-	if h.e.State() == Follower {
+	if h.e.State() == StateFollower {
 		t.Fatal("never entered lottery")
 	}
 }
@@ -648,12 +648,12 @@ func TestLotteryBudget(t *testing.T) {
 	total := 0
 
 	for i := range n {
-		e := New(Config{ExpectedClusterSize: n}, self(i), newRNG(uint64(i)))
-		e.SetHooks(Hooks{OnOp: func(OpKind) { total++ }})
+		e := NewElector(ElectionConfig{ExpectedClusterSize: n}, self(i), newRNG(uint64(i)))
+		e.SetHooks(ElectorHooks{OnOp: func(OpKind) { total++ }})
 
 		in := Input{Wall: epoch}
 		for r := range rounds * 10 {
-			in.Now = sec(100) + int64(r)*sec(0.1)
+			in.Now = secs(100) + int64(r)*secs(0.1)
 			for _, op := range e.Tick(in) {
 				e.OnResult(in, s.apply(op))
 			}
@@ -709,15 +709,15 @@ func runSim(t *testing.T, seed uint64) {
 
 	for i := range members {
 		m := &simMember{
-			off:   rng.Int64N(sec(1000)),
-			skew:  time.Duration(rng.Int64N(sec(4)) - sec(2)),
+			off:   rng.Int64N(secs(1000)),
+			skew:  time.Duration(rng.Int64N(secs(4)) - secs(2)),
 			cand:  i < 3 && seed%4 != 0, // every fourth seed elects by lottery only
 			alive: true,
 		}
-		m.e = New(Config{}, self(i), newRNG(seed*100+uint64(i)))
-		m.e.SetHooks(Hooks{OnOp: func(OpKind) {
+		m.e = NewElector(ElectionConfig{}, self(i), newRNG(seed*100+uint64(i)))
+		m.e.SetHooks(ElectorHooks{OnOp: func(OpKind) {
 			m.ops++
-			if m.e.State() == Follower {
+			if m.e.State() == StateFollower {
 				m.opsAsFoll++
 			}
 		}})
@@ -739,11 +739,11 @@ func runSim(t *testing.T, seed uint64) {
 
 	const step = int64(100 * time.Millisecond)
 
-	end := sec(600)
+	end := secs(600)
 	lossP := rng.IntN(20)
 	conflictP := rng.IntN(5)
-	outage[0] = sec(100) + rng.Int64N(sec(300))
-	outage[1] = outage[0] + rng.Int64N(sec(30))
+	outage[0] = secs(100) + rng.Int64N(secs(300))
+	outage[1] = outage[0] + rng.Int64N(secs(30))
 
 	lastLeader := -1
 
@@ -769,14 +769,14 @@ func runSim(t *testing.T, seed uint64) {
 		// Random faults.
 		if rng.IntN(2000) == 0 {
 			i := rng.IntN(nm)
-			members[i].pausedTil = now + rng.Int64N(sec(40))
+			members[i].pausedTil = now + rng.Int64N(secs(40))
 		}
 
 		if rng.IntN(3000) == 0 && lastLeader >= 0 {
 			// Graceful release by the leader.
 			m := members[lastLeader]
 			for _, op := range m.e.Release(input(lastLeader, now)) {
-				push(simEvent{at: now + rng.Int64N(sec(0.2)), member: lastLeader, op: op, server: true})
+				push(simEvent{at: now + rng.Int64N(secs(0.2)), member: lastLeader, op: op, server: true})
 			}
 		}
 
@@ -808,7 +808,7 @@ func runSim(t *testing.T, seed uint64) {
 				}
 
 				if rng.IntN(100) >= lossP {
-					push(simEvent{at: now + rng.Int64N(sec(1)), member: ev.member, res: res})
+					push(simEvent{at: now + rng.Int64N(secs(1)), member: ev.member, res: res})
 				}
 
 				continue
@@ -838,7 +838,7 @@ func runSim(t *testing.T, seed uint64) {
 			m.queued = nil
 
 			for _, op := range m.e.Tick(in) {
-				push(simEvent{at: now + rng.Int64N(sec(1)), member: i, op: op, server: true})
+				push(simEvent{at: now + rng.Int64N(secs(1)), member: i, op: op, server: true})
 			}
 
 			for _, ev := range m.e.Events() {
@@ -878,7 +878,7 @@ func runSim(t *testing.T, seed uint64) {
 
 		if m.cand && seed%4 != 0 {
 			// Reads every RetryPeriod (+20%) plus acquisition attempts.
-			if limit := int(end/int64(DefaultRetryPeriod)) + 20; m.ops > limit && m.e.State() != Leader {
+			if limit := int(end/int64(DefaultRetryPeriod)) + 20; m.ops > limit && m.e.State() != StateLeader {
 				t.Fatalf("seed %d: candidate %d made %d ops > %d", seed, i, m.ops, limit)
 			}
 		}
@@ -900,17 +900,17 @@ func TestLotteryZeroClusterSize(t *testing.T) {
 	total := 0
 
 	for i := range n {
-		e := New(Config{ExpectedClusterSize: n}, self(i), newRNG(uint64(i)))
+		e := NewElector(ElectionConfig{ExpectedClusterSize: n}, self(i), newRNG(uint64(i)))
 		in := Input{Wall: epoch, HaveView: true, ClusterSize: 0}
 
-		e.SetHooks(Hooks{OnOp: func(OpKind) {
-			if in.Now >= sec(50) {
+		e.SetHooks(ElectorHooks{OnOp: func(OpKind) {
+			if in.Now >= secs(50) {
 				total++
 			}
 		}})
 
 		for r := range (50 + rounds) * 10 {
-			in.Now = int64(r) * sec(0.1)
+			in.Now = int64(r) * secs(0.1)
 			for _, op := range e.Tick(in) {
 				e.OnResult(in, s.apply(op))
 			}
@@ -934,10 +934,10 @@ func TestReleaseKeepsClusterSeeds(t *testing.T) {
 	s := &memStore{}
 	s.store(Record{Holder: "", Term: 9, RenewTime: epoch, Seeds: []string{"a", "b"}})
 
-	h := newHarness(t, s, 0)
-	h.run(sec(1))
+	h := newElectHarness(t, s, 0)
+	h.run(secs(1))
 
-	if h.e.State() != Leader || !slices.Equal(s.rec.Seeds, []string{"a", "b"}) {
+	if h.e.State() != StateLeader || !slices.Equal(s.rec.Seeds, []string{"a", "b"}) {
 		t.Fatalf("acquire without seeds: state %v seeds %v", h.e.State(), s.rec.Seeds)
 	}
 
@@ -954,10 +954,10 @@ func TestReleaseSeedsExcludeSelf(t *testing.T) {
 	t.Parallel()
 
 	s := &memStore{}
-	h := newHarness(t, s, 0)
+	h := newElectHarness(t, s, 0)
 	me := self(0).Addr
 	h.in.Seeds = []string{me, "c"}
-	h.run(sec(1))
+	h.run(secs(1))
 
 	if !slices.Equal(s.rec.Seeds, []string{me, "c"}) {
 		t.Fatalf("acquire seeds %v", s.rec.Seeds)
@@ -974,9 +974,9 @@ func TestReleaseSeedsExcludeSelf(t *testing.T) {
 
 	// The last member leaving clears them, so a later cluster can start.
 	s2 := &memStore{}
-	h2 := newHarness(t, s2, 0)
+	h2 := newElectHarness(t, s2, 0)
 	h2.in.Seeds = []string{me}
-	h2.run(sec(1))
+	h2.run(secs(1))
 
 	for _, op := range h2.e.Release(h2.in) {
 		h2.e.OnResult(h2.in, s2.apply(op))

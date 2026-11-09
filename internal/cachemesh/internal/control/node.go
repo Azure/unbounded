@@ -1,14 +1,17 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package node is the per-member cachemesh control-plane state machine.
+// Package control is the cachemesh control plane. Node, the per-member
+// control-plane state machine, ties together the Elector (leader election
+// over a Lease Store), the Leader (delta planning while this member leads,
+// with the partition Planner), and the wire messages members exchange.
 //
 // # Design
 //
 // A Node owns everything one member knows about the cluster: its current
 // membership view and a view.DeltaLog for serving catch-up, an
-// elect.Elector, a leader.Leader that plans deltas while this member leads,
-// an route.EpochTracker, and a route.HealthTracker for its data-plane neighbors.
+// Elector, a Leader that plans deltas while this member leads,
+// a route.EpochTracker, and a route.HealthTracker for its data-plane neighbors.
 //
 //   - Views. Deltas arrive in Broadcast messages and catch-up responses.
 //     A delta whose base is the current version is applied; one that is
@@ -19,11 +22,11 @@
 //     or at the same version with a different digest when it comes from
 //     the leader (fork repair).
 //   - Dissemination. The leader applies its delta and sends Broadcast at
-//     wire.LevelLeader. A member receiving level l forwards, using the
+//     LevelLeader. A member receiving level l forwards, using the
 //     post-apply view, to one member of every adjacent cell in each
 //     dimension j > l (level j), the member with the highest
 //     view.Score(member.Key, delta.Seq) that the health tracker deems
-//     usable, and, unless l is wire.LevelLocal, to its cell-mates at
+//     usable, and, unless l is LevelLocal, to its cell-mates at
 //     LevelLocal. A failed forward is retried once with the next-ranked
 //     member of that cell.
 //   - Anti-entropy. Pings carry versions; a member that sees a newer
@@ -42,9 +45,9 @@
 //     wrapped in wire Routed{ToLeader}. They are sent straight to the
 //     leader's address when known; a receiver that is not the leader
 //     acknowledges and relays to the leader it knows (TTL bounded).
-//   - Leadership. On elect.Acquired the node resets its leader.Leader and
+//   - Leadership. On Acquired the node resets its Leader and
 //     publishes a delta starting the new term. Every LeaderTick it asks the
-//     leader for a delta and publishes it, only while elect.CanPublish
+//     leader for a delta and publishes it, only while CanPublish
 //     holds and its view is still at its own term.
 //   - Leaving. Leave sends Leave to the leader until the member observes
 //     itself Draining; the leader removes it after DrainFor. A leader that
@@ -62,12 +65,12 @@
 //     returned response;
 //   - drains Outbox, sends each Call, and reports the reply or error (for
 //     example a timeout after Call.Timeout) exactly once with OnReply;
-//   - drains LeaseOps, executes them against an elect.Store, and reports
+//   - drains LeaseOps, executes them against an Store, and reports
 //     results with OnLease.
 //
 // Slices returned by Handle, Outbox, and LeaseOps are owned by the caller.
 // Work per call and the size of every queue are bounded.
-package node
+package control
 
 import (
 	"bytes"
@@ -76,11 +79,8 @@ import (
 	"slices"
 	"time"
 
-	"github.com/Azure/unbounded/internal/cachemesh/internal/elect"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/leader"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/route"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/wire"
 )
 
 // Defaults.
@@ -101,7 +101,7 @@ const (
 )
 
 // LeaseSeed is the hashing seed for candidate selection
-// (elect.TopCandidates).
+// (TopCandidates).
 var LeaseSeed = view.Seed("cachemesh/lease")
 
 // Config configures a Node. Zero values select defaults.
@@ -114,8 +114,8 @@ type Config struct {
 	// PartitionBits must match the cluster. Default 20.
 	PartitionBits uint8
 
-	Elect  elect.Config
-	Leader leader.Config
+	Elect  ElectionConfig
+	Leader LeaderConfig
 	Health route.HealthConfig
 
 	EpochPeriod      time.Duration
@@ -160,7 +160,7 @@ func (c *Config) defaults() {
 	}
 
 	if c.PartitionBits == 0 {
-		c.PartitionBits = leader.DefaultPartitionBits
+		c.PartitionBits = DefaultPartitionBits
 	}
 
 	dur(&c.EpochPeriod, route.DefaultEpochPeriod)
@@ -178,7 +178,7 @@ func (c *Config) defaults() {
 	num(&c.MaxAhead, DefaultMaxAhead)
 
 	c.Elect = c.Elect.WithDefaults()
-	c.Leader.Self = leader.Member{ID: c.ID, Incarnation: c.Incarnation, Addr: c.Addr, Zone: c.Zone}
+	c.Leader.Self = Joiner{ID: c.ID, Incarnation: c.Incarnation, Addr: c.Addr, Zone: c.Zone}
 	c.Leader.PartitionBits = c.PartitionBits
 	c.Leader.EpochPeriod = c.EpochPeriod
 }
@@ -207,13 +207,13 @@ type Hooks struct {
 	// OnCatchUp is called when a catch-up response is applied.
 	OnCatchUp func(kind CatchUpKind)
 	// OnMessage is called for every handled inbound message kind.
-	OnMessage func(kind wire.Kind)
+	OnMessage func(kind Kind)
 	// OnEvent reports named internal events (for coverage), for example
 	// "join-sent", "suspect-sent", "fork", "ahead-queued", "relay".
 	OnEvent func(name string)
 	// Leader and Elect are installed on the embedded leader and elector.
-	Leader leader.Hooks
-	Elect  elect.Hooks
+	Leader LeaderHooks
+	Elect  ElectorHooks
 }
 
 // Call is an outbound control request.
@@ -274,14 +274,14 @@ type Node struct {
 	cfg  Config
 	rng  *rand.Rand
 	key  uint64
-	self wire.MemberRef
+	self MemberRef
 
 	v    *view.View
 	log  *view.DeltaLog
 	slot view.Slot
 
-	el     *elect.Elector
-	ld     *leader.Leader
+	el     *Elector
+	ld     *Leader
 	ep     route.EpochTracker
 	hl     *route.HealthTracker
 	shared *Shared
@@ -352,14 +352,14 @@ type Node struct {
 	nextCall uint64
 	calls    map[uint64]*pending
 	outbox   []Call
-	leaseOps []elect.Op
+	leaseOps []Op
 
 	// Snapshot cache.
 	snapDigest view.Digest
 	snapBytes  []byte
 
-	msg  wire.Message
-	resp wire.Message
+	msg  Message
+	resp Message
 	buf  []view.Slot
 }
 
@@ -378,10 +378,10 @@ func New(cfg Config, rng *rand.Rand) *Node {
 		calls:  map[uint64]*pending{},
 		seeds:  slices.Clone(cfg.Seeds),
 	}
-	n.self = wire.MemberRef{ID: cfg.ID, Incarnation: cfg.Incarnation, Slot: view.NoSlot}
-	n.el = elect.New(cfg.Elect, elect.Self{ID: cfg.ID, Incarnation: cfg.Incarnation, Key: n.key, Addr: cfg.Addr}, rng)
+	n.self = MemberRef{ID: cfg.ID, Incarnation: cfg.Incarnation, Slot: view.NoSlot}
+	n.el = NewElector(cfg.Elect, Self{ID: cfg.ID, Incarnation: cfg.Incarnation, Key: n.key, Addr: cfg.Addr}, rng)
 	n.el.SetHooks(cfg.Hooks.Elect)
-	n.ld = leader.New(cfg.Leader, rng)
+	n.ld = NewLeader(cfg.Leader, rng)
 	n.ld.SetHooks(cfg.Hooks.Leader)
 	n.hl = route.NewHealthTracker(cfg.Health, rng)
 
@@ -417,7 +417,7 @@ func (n *Node) Health() *route.HealthTracker { return n.hl }
 func (n *Node) Epoch() *route.EpochTracker { return &n.ep }
 
 // Elector returns the elector (read-only use).
-func (n *Node) Elector() *elect.Elector { return n.el }
+func (n *Node) Elector() *Elector { return n.el }
 
 // Leading reports whether this member currently publishes deltas, and the
 // term it publishes under.
@@ -452,7 +452,7 @@ func (n *Node) Outbox() []Call {
 }
 
 // LeaseOps drains queued Lease operations.
-func (n *Node) LeaseOps() []elect.Op {
+func (n *Node) LeaseOps() []Op {
 	out := n.leaseOps
 	n.leaseOps = nil
 
@@ -517,7 +517,7 @@ func (n *Node) Start(now int64, wall time.Time) {
 
 	if len(n.seeds) == 0 && !n.joined {
 		n.ownReadSeq = ownLeaseBit | 1
-		n.leaseOps = append(n.leaseOps, elect.Op{Seq: n.ownReadSeq, Kind: elect.OpGetCached})
+		n.leaseOps = append(n.leaseOps, Op{Seq: n.ownReadSeq, Kind: OpGetCached})
 		n.event("lease-seed-read")
 	}
 
@@ -619,7 +619,7 @@ func (n *Node) expireCalls(now int64) {
 
 // --- Outbound ---
 
-func (n *Node) header(m *wire.Message, k wire.Kind) {
+func (n *Node) header(m *Message, k Kind) {
 	m.Reset()
 	m.Kind = k
 	m.From = n.self
@@ -635,7 +635,7 @@ func (n *Node) header(m *wire.Message, k wire.Kind) {
 // bound.
 const MaxPendingCalls = 4096
 
-func (n *Node) send(to string, m *wire.Message, p *pending, timeout time.Duration) bool {
+func (n *Node) send(to string, m *Message, p *pending, timeout time.Duration) bool {
 	if to == "" || to == n.cfg.Addr {
 		return false
 	}
@@ -650,7 +650,7 @@ func (n *Node) send(to string, m *wire.Message, p *pending, timeout time.Duratio
 	id := n.nextCall
 	p.sentAt = n.now
 	n.calls[id] = p
-	n.outbox = append(n.outbox, Call{ID: id, To: to, Msg: wire.Append(nil, m), Timeout: timeout})
+	n.outbox = append(n.outbox, Call{ID: id, To: to, Msg: Append(nil, m), Timeout: timeout})
 
 	return true
 }
@@ -690,19 +690,19 @@ func (n *Node) leaderTarget() (string, bool) {
 
 // toLeader routes inner (an encoded Join, Leave, Suspect, or Invalidate)
 // to the leader via addr, handling it locally when leading.
-func (n *Node) toLeader(now int64, addr string, inner *wire.Message) {
+func (n *Node) toLeader(now int64, addr string, inner *Message) {
 	if n.leading && addr == "" {
 		n.leaderInput(now, inner)
 
 		return
 	}
 
-	var r wire.Message
-	n.header(&r, wire.KindRouted)
+	var r Message
+	n.header(&r, KindRouted)
 	r.Origin = n.self
 	r.ToLeader = true
 	r.TTL = DefaultRoutedTTL
-	r.Inner = wire.Append(nil, inner)
+	r.Inner = Append(nil, inner)
 	n.send(addr, &r, &pending{kind: callRouted}, n.cfg.CallTimeout)
 }
 
@@ -719,8 +719,8 @@ func (n *Node) sendJoin(now int64) {
 
 	n.joinTries++
 
-	var j wire.Message
-	n.header(&j, wire.KindJoin)
+	var j Message
+	n.header(&j, KindJoin)
 	j.Member = n.self
 	j.Addr, j.Zone, j.PartitionBits = n.cfg.Addr, n.cfg.Zone, n.cfg.PartitionBits
 
@@ -781,7 +781,7 @@ func (n *Node) addSeed(addr string) {
 func (n *Node) rereadLease() {
 	n.ownReadSeq = (n.ownReadSeq + 1) | ownLeaseBit
 	n.ownReadDone = false
-	n.leaseOps = append(n.leaseOps, elect.Op{Seq: n.ownReadSeq, Kind: elect.OpGetCached})
+	n.leaseOps = append(n.leaseOps, Op{Seq: n.ownReadSeq, Kind: OpGetCached})
 	n.event("lease-seed-read")
 }
 
@@ -803,8 +803,8 @@ func (n *Node) sendLeave(now int64) {
 		return
 	}
 
-	var m wire.Message
-	n.header(&m, wire.KindLeave)
+	var m Message
+	n.header(&m, KindLeave)
 	m.Member = n.self
 
 	addr, ok := n.leaderTarget()
@@ -817,8 +817,8 @@ func (n *Node) sendLeave(now int64) {
 
 // Invalidate asks the leader to bump the generation of keyspace seed.
 func (n *Node) Invalidate(now int64, seed uint64) {
-	var m wire.Message
-	n.header(&m, wire.KindInvalidate)
+	var m Message
+	n.header(&m, KindInvalidate)
 	m.Seed = seed
 
 	addr, ok := n.leaderTarget()
@@ -837,8 +837,8 @@ func (n *Node) catchUp(now int64, addr string, force bool) {
 		return
 	}
 
-	var m wire.Message
-	n.header(&m, wire.KindCatchUpRequest)
+	var m Message
+	n.header(&m, KindCatchUpRequest)
 	m.Have, m.HaveDigest = n.v.Version(), n.v.Digest()
 	m.MaxDeltas = uint32(n.cfg.CatchUpMaxDeltas)
 
@@ -867,8 +867,8 @@ func (n *Node) Handle(now int64, from string, msg []byte) []byte {
 	now = n.now
 
 	m := &n.msg
-	if err := wire.Decode(msg, m); err != nil {
-		return n.nack(wire.ReasonBadRequest)
+	if err := Decode(msg, m); err != nil {
+		return n.nack(ReasonBadRequest)
 	}
 
 	if n.cfg.Hooks.OnMessage != nil {
@@ -878,11 +878,11 @@ func (n *Node) Handle(now int64, from string, msg []byte) []byte {
 	n.observeTerm(now, m.Version.Term, from)
 
 	switch m.Kind {
-	case wire.KindPing:
+	case KindPing:
 		n.noteRemote(now, from, m)
 
-		var r wire.Message
-		n.header(&r, wire.KindPong)
+		var r Message
+		n.header(&r, KindPong)
 
 		if addr, ok := n.leaderTarget(); ok {
 			if addr == "" {
@@ -892,44 +892,44 @@ func (n *Node) Handle(now int64, from string, msg []byte) []byte {
 			r.LeaderAddr = addr
 		}
 
-		return wire.Append(nil, &r)
-	case wire.KindBroadcast:
+		return Append(nil, &r)
+	case KindBroadcast:
 		n.onBroadcast(now, from, m)
 
 		return n.ack()
-	case wire.KindCatchUpRequest:
+	case KindCatchUpRequest:
 		return n.serveCatchUp(m)
-	case wire.KindRouted:
+	case KindRouted:
 		return n.onRouted(now, m)
-	case wire.KindJoin, wire.KindLeave, wire.KindSuspect, wire.KindInvalidate:
+	case KindJoin, KindLeave, KindSuspect, KindInvalidate:
 		// Sent directly rather than routed: treat like a routed message.
 		inner := *m
 		inner.Detach()
 
 		addr, ok := n.leaderTarget()
 		if !ok {
-			return n.nack(wire.ReasonNotLeader)
+			return n.nack(ReasonNotLeader)
 		}
 
 		n.toLeader(now, addr, &inner)
 
 		return n.ack()
 	default:
-		return n.nack(wire.ReasonBadRequest)
+		return n.nack(ReasonBadRequest)
 	}
 }
 
 func (n *Node) ack() []byte {
-	n.header(&n.resp, wire.KindAck)
+	n.header(&n.resp, KindAck)
 
-	return wire.Append(nil, &n.resp)
+	return Append(nil, &n.resp)
 }
 
-func (n *Node) nack(r wire.Reason) []byte {
-	n.header(&n.resp, wire.KindNack)
+func (n *Node) nack(r Reason) []byte {
+	n.header(&n.resp, KindNack)
 	n.resp.Reason = r
 
-	return wire.Append(nil, &n.resp)
+	return Append(nil, &n.resp)
 }
 
 // noteEpoch moves this member's epoch forward to a peer's when the peer is
@@ -946,7 +946,7 @@ func (n *Node) noteEpoch(now int64, e uint64) {
 
 // noteRemote compares a peer's version with ours and catches up if the
 // peer is ahead.
-func (n *Node) noteRemote(now int64, addr string, m *wire.Message) {
+func (n *Node) noteRemote(now int64, addr string, m *Message) {
 	n.noteEpoch(now, m.Epoch)
 
 	mine := n.v.Version()
@@ -964,14 +964,14 @@ func (n *Node) noteRemote(now int64, addr string, m *wire.Message) {
 	}
 }
 
-func (n *Node) onRouted(now int64, m *wire.Message) []byte {
+func (n *Node) onRouted(now int64, m *Message) []byte {
 	if !m.ToLeader {
-		return n.nack(wire.ReasonNoRoute)
+		return n.nack(ReasonNoRoute)
 	}
 
-	var inner wire.Message
-	if err := wire.Decode(m.Inner, &inner); err != nil {
-		return n.nack(wire.ReasonBadRequest)
+	var inner Message
+	if err := Decode(m.Inner, &inner); err != nil {
+		return n.nack(ReasonBadRequest)
 	}
 
 	if n.leading {
@@ -981,16 +981,16 @@ func (n *Node) onRouted(now int64, m *wire.Message) []byte {
 	}
 
 	if m.TTL <= 1 {
-		return n.nack(wire.ReasonTTLExhausted)
+		return n.nack(ReasonTTLExhausted)
 	}
 
 	addr, ok := n.leaderTarget()
 	if !ok {
-		return n.nack(wire.ReasonNotLeader)
+		return n.nack(ReasonNotLeader)
 	}
 
-	var r wire.Message
-	n.header(&r, wire.KindRouted)
+	var r Message
+	n.header(&r, KindRouted)
 	r.Origin = m.Origin
 	r.ToLeader = true
 	r.TTL = m.TTL - 1
@@ -1003,25 +1003,25 @@ func (n *Node) onRouted(now int64, m *wire.Message) []byte {
 }
 
 // leaderInput feeds a leader-bound message to the leader logic.
-func (n *Node) leaderInput(now int64, m *wire.Message) {
+func (n *Node) leaderInput(now int64, m *Message) {
 	if n.cfg.Hooks.OnEvent != nil {
 		n.event("leader-input-" + m.Kind.String())
 	}
 
 	switch m.Kind {
-	case wire.KindJoin:
+	case KindJoin:
 		if m.PartitionBits != n.cfg.PartitionBits {
 			n.event("join-rejected")
 
 			return
 		}
 
-		n.ld.Join(now, leader.Member{ID: m.Member.ID, Incarnation: m.Member.Incarnation, Addr: m.Addr, Zone: m.Zone})
-	case wire.KindLeave:
+		n.ld.Join(now, Joiner{ID: m.Member.ID, Incarnation: m.Member.Incarnation, Addr: m.Addr, Zone: m.Zone})
+	case KindLeave:
 		n.ld.Leave(now, m.Member.ID, m.Member.Incarnation)
-	case wire.KindSuspect:
+	case KindSuspect:
 		n.ld.Suspect(now, m.Target.Slot, view.MemberKey(m.Target.ID, m.Target.Incarnation), m.Observer.Slot)
-	case wire.KindInvalidate:
+	case KindInvalidate:
 		n.ld.Invalidate(m.Seed)
 	}
 }
@@ -1038,11 +1038,11 @@ func (n *Node) OnReply(now int64, id uint64, resp []byte, err error) {
 
 	delete(n.calls, id)
 
-	var m *wire.Message
+	var m *Message
 
 	if err == nil {
 		m = &n.msg
-		if wire.Decode(resp, m) != nil {
+		if Decode(resp, m) != nil {
 			m = nil
 		}
 	}
@@ -1064,7 +1064,7 @@ func (n *Node) OnReply(now int64, id uint64, resp []byte, err error) {
 		n.observeTerm(now, m.Version.Term, addr)
 	}
 
-	if m == nil || m.Kind == wire.KindNack {
+	if m == nil || m.Kind == KindNack {
 		if m != nil && p.kind == callCatchUp {
 			n.catchUpInFlight = false
 			n.event("catchup-nack")
@@ -1081,7 +1081,7 @@ func (n *Node) OnReply(now int64, id uint64, resp []byte, err error) {
 	case callPing:
 		n.pingDone(now, p, true, time.Duration(now-p.sentAt))
 
-		if m.Kind == wire.KindPong {
+		if m.Kind == KindPong {
 			if m.LeaderAddr != "" && !n.isMember() {
 				n.leaderAddr = string([]byte(m.LeaderAddr))
 			}
@@ -1091,7 +1091,7 @@ func (n *Node) OnReply(now int64, id uint64, resp []byte, err error) {
 	case callCatchUp:
 		n.catchUpInFlight = false
 
-		if m.Kind == wire.KindCatchUpResponse {
+		if m.Kind == KindCatchUpResponse {
 			n.onCatchUp(now, m, p.addr)
 		}
 	case callBroadcast:
@@ -1112,7 +1112,7 @@ func (n *Node) fail(p *pending) {
 		n.event("catchup-failed")
 		n.dropSeed(p.addr)
 	case callBroadcast:
-		if p.attempt == 0 && p.level != wire.LevelLocal {
+		if p.attempt == 0 && p.level != LevelLocal {
 			n.event("broadcast-retry")
 			n.forwardCell(p.enc, p.seq, p.level, p.cell, 1, p.slot)
 		}
@@ -1170,7 +1170,7 @@ func (n *Node) observeTerm(now int64, term uint64, addr string) {
 		return
 	}
 
-	if term >= elect.MaxSaneTerm {
+	if term >= MaxSaneTerm {
 		n.event("absurd-term")
 
 		return
@@ -1203,12 +1203,12 @@ func (n *Node) resign(now int64, reason string) {
 // a member of its view arrived for LeaseDuration. Requiring an
 // unchanged resourceVersion on the local monotonic clock, as candidates do,
 // keeps a member with a skewed wall clock from stealing a live Lease.
-func (n *Node) noteColdRead(now int64, wall time.Time, r elect.Result) {
+func (n *Node) noteColdRead(now int64, wall time.Time, r Result) {
 	if n.isMember() || n.coldStart || n.bootstrapper || n.leaving {
 		return
 	}
 
-	notFound := errors.Is(r.Err, elect.ErrNotFound)
+	notFound := errors.Is(r.Err, ErrNotFound)
 	if r.Err != nil && !notFound {
 		return
 	}

@@ -7,7 +7,7 @@ import "slices"
 
 // Targets returns each member's target load (indexed like members) under
 // the Planner rules; non-assignable members get 0.
-func (pl *Planner) Targets(bits uint8, members []Member) ([]int64, error) {
+func (pl *Planner) Targets(bits uint8, members []PlanMember) ([]int64, error) {
 	if _, err := pl.prepare(1<<bits, members); err != nil {
 		return nil, err
 	}

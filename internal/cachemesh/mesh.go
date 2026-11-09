@@ -16,11 +16,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/Azure/unbounded/internal/cachemesh/internal/elect"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/node"
+	"github.com/Azure/unbounded/internal/cachemesh/internal/control"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/route"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/wire"
 )
 
 var (
@@ -47,7 +45,7 @@ const (
 	// MaxControlMessageSize bounds a control message (request or
 	// response), including view snapshots. Transports may use it to bound
 	// the bodies they read.
-	MaxControlMessageSize = wire.MaxMessageSize
+	MaxControlMessageSize = control.MaxMessageSize
 	// MaxPendingInvalidations bounds the keyspaces with an invalidation
 	// pending at once.
 	MaxPendingInvalidations = 1024
@@ -74,7 +72,7 @@ type Mesh struct {
 
 	// Control plane, guarded by mu.
 	mu       sync.Mutex
-	n        *node.Node
+	n        *control.Node
 	lastView *view.View
 	lastSelf view.Slot
 	isLeader bool
@@ -89,7 +87,7 @@ type Mesh struct {
 	leftOnce sync.Once
 	done     chan struct{}
 	sem      chan struct{}
-	leaseQ   chan elect.Op
+	leaseQ   chan control.Op
 
 	evMu   sync.Mutex
 	evQ    []event
@@ -163,7 +161,7 @@ func New(cfg Config) (*Mesh, error) {
 		left:     make(chan struct{}),
 		done:     make(chan struct{}),
 		sem:      make(chan struct{}, t.MaxInFlight),
-		leaseQ:   make(chan elect.Op, leaseQueue),
+		leaseQ:   make(chan control.Op, leaseQueue),
 		evWake:   make(chan struct{}, 1),
 	}
 
@@ -175,7 +173,7 @@ func New(cfg Config) (*Mesh, error) {
 		}
 	}
 
-	m.n = node.New(nc, rand.New(rand.NewPCG(randUint64(), randUint64())))
+	m.n = control.New(nc, rand.New(rand.NewPCG(randUint64(), randUint64())))
 	m.health = m.n.Health()
 	m.gwSeeds = m.n.Seeds(nil)
 	m.env = m.newEnv(m.gwSeeds)
@@ -534,8 +532,8 @@ func expandVersion(own view.Version, n route.Note) view.Version {
 	return view.Version{Term: t, Seq: n.Seq}
 }
 
-func (m *Mesh) dispatch(ctx context.Context, wg *sync.WaitGroup, calls []node.Call) {
-	var refused []node.Call
+func (m *Mesh) dispatch(ctx context.Context, wg *sync.WaitGroup, calls []control.Call) {
+	var refused []control.Call
 
 	for _, c := range calls {
 		select {
@@ -547,7 +545,7 @@ func (m *Mesh) dispatch(ctx context.Context, wg *sync.WaitGroup, calls []node.Ca
 
 		wg.Add(1)
 
-		go func(c node.Call) {
+		go func(c control.Call) {
 			defer wg.Done()
 			defer func() { <-m.sem }()
 
@@ -594,8 +592,8 @@ func (m *Mesh) controlError(addr string, err error) {
 	m.log.Debug("cachemesh control call failed", "to", addr, "err", err)
 }
 
-func (m *Mesh) submitLease(ops []elect.Op) {
-	var refused []elect.Op
+func (m *Mesh) submitLease(ops []control.Op) {
+	var refused []control.Op
 
 	for _, op := range ops {
 		if m.cfg.Lease == nil {
@@ -616,7 +614,7 @@ func (m *Mesh) submitLease(ops []elect.Op) {
 
 	m.mu.Lock()
 	for _, op := range refused {
-		m.n.OnLease(m.mono(), time.Now(), elect.Result{Seq: op.Seq, Kind: op.Kind, Err: ErrNoLease})
+		m.n.OnLease(m.mono(), time.Now(), control.Result{Seq: op.Seq, Kind: op.Kind, Err: ErrNoLease})
 	}
 
 	m.afterLocked()
@@ -626,7 +624,7 @@ func (m *Mesh) submitLease(ops []elect.Op) {
 // leaseLoop runs Lease operations one at a time.
 func (m *Mesh) leaseLoop(ctx context.Context) {
 	for {
-		var op elect.Op
+		var op control.Op
 
 		select {
 		case <-ctx.Done():
@@ -635,11 +633,11 @@ func (m *Mesh) leaseLoop(ctx context.Context) {
 		}
 
 		lctx, cancel := context.WithTimeout(ctx, m.cfg.Tuning.LeaseTimeout)
-		r := elect.Execute(lctx, m.cfg.Lease, op)
+		r := control.Execute(lctx, m.cfg.Lease, op)
 
 		cancel()
 
-		if r.Err != nil && !errors.Is(r.Err, elect.ErrConflict) && !errors.Is(r.Err, elect.ErrNotFound) {
+		if r.Err != nil && !errors.Is(r.Err, control.ErrConflict) && !errors.Is(r.Err, control.ErrNotFound) {
 			if h := m.cfg.Hooks.OnLeaseError; h != nil {
 				h(op.Kind.String(), r.Err)
 			}

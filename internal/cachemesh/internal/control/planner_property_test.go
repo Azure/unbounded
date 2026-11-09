@@ -20,10 +20,10 @@ func TestPlanProperties(t *testing.T) {
 	for iter := range 200 {
 		bits := uint8(view.MinPartitionBits + r.IntN(4))
 		n := 1 + r.IntN(30)
-		ms := make([]Member, n)
+		ms := make([]PlanMember, n)
 
 		for i := range ms {
-			ms[i] = Member{
+			ms[i] = PlanMember{
 				Slot:   uint32(i * 2),
 				Key:    uint64(r.IntN(8)), // many duplicate keys
 				Weight: []uint32{0, 250, 500, view.MaxWeight}[r.IntN(4)],
@@ -36,7 +36,7 @@ func TestPlanProperties(t *testing.T) {
 			return view.Entry{Owner: uint32(r.IntN(2*n + 4)), Prev: view.NoMember}
 		})
 		maxMoves := r.IntN(64) - 1
-		pl := NewPlanner(Config{MaxMoves: maxMoves})
+		pl := NewPlanner(PlannerConfig{MaxMoves: maxMoves})
 
 		plan, err := pl.Plan(tb, ms)
 		if err != nil {
@@ -105,7 +105,7 @@ func TestPlanProperties(t *testing.T) {
 		sh := slices.Clone(ms)
 		r.Shuffle(len(sh), func(i, j int) { sh[i], sh[j] = sh[j], sh[i] })
 
-		p2, _ := NewPlanner(Config{MaxMoves: maxMoves}).Plan(tb, sh)
+		p2, _ := NewPlanner(PlannerConfig{MaxMoves: maxMoves}).Plan(tb, sh)
 		if !slices.Equal(parts, p2.Parts) || !slices.Equal(owners, p2.Owners) {
 			t.Fatalf("iter %d: plan depends on member order", iter)
 		}

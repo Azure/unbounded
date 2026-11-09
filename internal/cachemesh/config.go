@@ -10,9 +10,7 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/Azure/unbounded/internal/cachemesh/internal/elect"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/leader"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/node"
+	"github.com/Azure/unbounded/internal/cachemesh/internal/control"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/route"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
 )
@@ -82,7 +80,7 @@ type Hooks struct {
 
 // ElectionConfig tunes leader election. See the field documentation; zero
 // values select defaults.
-type ElectionConfig = elect.Config
+type ElectionConfig = control.ElectionConfig
 
 // HealthConfig tunes circuit breakers, outlier detection, latency
 // tracking, and the hedge budget. Zero values select defaults.
@@ -295,7 +293,7 @@ func (c *Config) validate() error {
 	return nil
 }
 
-func (c *Config) nodeConfig() node.Config {
+func (c *Config) nodeConfig() control.Config {
 	t := &c.Tuning
 	lt := &t.Leader
 
@@ -304,7 +302,7 @@ func (c *Config) nodeConfig() node.Config {
 		ec.ExpectedClusterSize = c.ExpectedSize
 	}
 
-	return node.Config{
+	return control.Config{
 		ID:            c.ID,
 		Incarnation:   c.Incarnation,
 		Addr:          c.Addr,
@@ -313,7 +311,7 @@ func (c *Config) nodeConfig() node.Config {
 		PartitionBits: c.PartitionBits,
 		Elect:         ec,
 		Health:        t.Health,
-		Leader: leader.Config{
+		Leader: control.LeaderConfig{
 			MaxJoinsPerTick:     lt.MaxJoinsPerTick,
 			QuarantineFor:       lt.QuarantineFor,
 			WarmupStep:          lt.WarmupStep,

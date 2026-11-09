@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Azure/unbounded/internal/cachemesh/internal/control"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -20,8 +21,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
-
-	"github.com/Azure/unbounded/internal/cachemesh/internal/elect"
 )
 
 const (
@@ -31,10 +30,10 @@ const (
 
 var leasesGR = schema.GroupResource{Group: "coordination.k8s.io", Resource: "leases"}
 
-func sample() elect.Record {
+func sample() control.Record {
 	now := time.Date(2026, 3, 4, 5, 6, 7, 123456000, time.UTC)
 
-	return elect.Record{
+	return control.Record{
 		Holder:        "node-a",
 		Incarnation:   42,
 		Term:          7,
@@ -81,7 +80,7 @@ func newStore(objs ...runtime.Object) (*fake.Clientset, *Store) {
 	return c, New(c.CoordinationV1().Leases(ns), name)
 }
 
-func eqRecord(t *testing.T, got, want elect.Record) {
+func eqRecord(t *testing.T, got, want control.Record) {
 	t.Helper()
 
 	if got.Holder != want.Holder || got.Incarnation != want.Incarnation || got.Term != want.Term ||
@@ -97,7 +96,7 @@ func TestRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	_, s := newStore()
 
-	if _, err := s.Get(ctx); !errors.Is(err, elect.ErrNotFound) {
+	if _, err := s.Get(ctx); !errors.Is(err, control.ErrNotFound) {
 		t.Fatalf("get missing: %v", err)
 	}
 
@@ -132,7 +131,7 @@ func TestRoundTrip(t *testing.T) {
 
 	eqRecord(t, upd, got)
 
-	if _, err := s.Create(ctx, want); !errors.Is(err, elect.ErrConflict) {
+	if _, err := s.Create(ctx, want); !errors.Is(err, control.ErrConflict) {
 		t.Fatalf("create existing: %v", err)
 	}
 }
@@ -167,7 +166,7 @@ func TestUpdateConflictAndNotFound(t *testing.T) {
 	r := sample()
 	r.ResourceVersion = "5"
 
-	if _, err := s.Update(ctx, r); !errors.Is(err, elect.ErrNotFound) {
+	if _, err := s.Update(ctx, r); !errors.Is(err, control.ErrNotFound) {
 		t.Fatalf("update missing: %v", err)
 	}
 
@@ -180,14 +179,14 @@ func TestUpdateConflictAndNotFound(t *testing.T) {
 	stale := created
 	stale.ResourceVersion = "stale"
 
-	if _, err := s.Update(ctx, stale); !errors.Is(err, elect.ErrConflict) {
+	if _, err := s.Update(ctx, stale); !errors.Is(err, control.ErrConflict) {
 		t.Fatalf("stale update: %v", err)
 	}
 
 	empty := created
 	empty.ResourceVersion = ""
 
-	if _, err := s.Update(ctx, empty); !errors.Is(err, elect.ErrConflict) {
+	if _, err := s.Update(ctx, empty); !errors.Is(err, control.ErrConflict) {
 		t.Fatalf("empty rv update: %v", err)
 	}
 }
@@ -231,7 +230,7 @@ func TestServerErrorsMapped(t *testing.T) {
 	cases := []struct {
 		transitions int32
 		want        error
-	}{{100, elect.ErrConflict}, {101, elect.ErrNotFound}, {102, nil}}
+	}{{100, control.ErrConflict}, {101, control.ErrNotFound}, {102, nil}}
 
 	for _, tc := range cases {
 		r := created
@@ -239,7 +238,7 @@ func TestServerErrorsMapped(t *testing.T) {
 
 		_, err := s.Update(ctx, r)
 		if err == nil || (tc.want != nil && !errors.Is(err, tc.want)) ||
-			(tc.want == nil && (errors.Is(err, elect.ErrConflict) || errors.Is(err, elect.ErrNotFound))) {
+			(tc.want == nil && (errors.Is(err, control.ErrConflict) || errors.Is(err, control.ErrNotFound))) {
 			t.Fatalf("transitions %d: %v", tc.transitions, err)
 		}
 
@@ -248,7 +247,7 @@ func TestServerErrorsMapped(t *testing.T) {
 		}
 	}
 
-	if _, err := s.Create(ctx, sample()); !errors.Is(err, elect.ErrConflict) {
+	if _, err := s.Create(ctx, sample()); !errors.Is(err, control.ErrConflict) {
 		t.Fatalf("create conflict: %v", err)
 	}
 }
@@ -350,12 +349,12 @@ func TestMalformedAnnotationsTolerated(t *testing.T) {
 		t.Fatalf("decoded %+v", r)
 	}
 
-	if len(r.Seeds) != elect.MaxSeeds || r.Seeds[0] != "a" || r.Seeds[1] != "s0" {
+	if len(r.Seeds) != control.MaxSeeds || r.Seeds[0] != "a" || r.Seeds[1] != "s0" {
 		t.Fatalf("seeds %q", r.Seeds)
 	}
 
 	if got := FormatSeeds(append([]string{"", "x y", "a,b", "ok"}, many...)); !strings.HasPrefix(got, "ok,s0,") ||
-		len(ParseSeeds(got)) != elect.MaxSeeds {
+		len(ParseSeeds(got)) != control.MaxSeeds {
 		t.Fatalf("format %q", got)
 	}
 
@@ -370,15 +369,15 @@ func TestElectorOverKubelease(t *testing.T) {
 
 	ctx := context.Background()
 	_, s := newStore()
-	e := elect.New(elect.Config{}, elect.Self{ID: "a", Incarnation: 1, Key: 1, Addr: "a:1"}, newRand())
+	e := control.NewElector(control.ElectionConfig{}, control.Self{ID: "a", Incarnation: 1, Key: 1, Addr: "a:1"}, newRand())
 
-	in := elect.Input{Wall: time.Unix(1e9, 0), HaveView: true, ClusterSize: 3, IsCandidate: true, Seeds: []string{"b:1"}}
+	in := control.Input{Wall: time.Unix(1e9, 0), HaveView: true, ClusterSize: 3, IsCandidate: true, Seeds: []string{"b:1"}}
 	for range 100 {
 		in.Now += int64(100 * time.Millisecond)
 		in.Wall = in.Wall.Add(100 * time.Millisecond)
 
 		for _, op := range e.Tick(in) {
-			e.OnResult(in, elect.Execute(ctx, s, op))
+			e.OnResult(in, control.Execute(ctx, s, op))
 		}
 	}
 
@@ -387,7 +386,7 @@ func TestElectorOverKubelease(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if e.State() != elect.Leader || r.Holder != "a" || r.Term != e.Term() || !slices.Equal(r.Seeds, []string{"b:1"}) {
+	if e.State() != control.StateLeader || r.Holder != "a" || r.Term != e.Term() || !slices.Equal(r.Seeds, []string{"b:1"}) {
 		t.Fatalf("state %v record %+v", e.State(), r)
 	}
 }
@@ -415,7 +414,7 @@ func TestUpdateCachedBaseServerConflict(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := s.Update(ctx, created); !errors.Is(err, elect.ErrConflict) {
+	if _, err := s.Update(ctx, created); !errors.Is(err, control.ErrConflict) {
 		t.Fatalf("update with cached base: %v", err)
 	}
 }

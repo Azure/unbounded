@@ -13,11 +13,7 @@ import (
 	"time"
 
 	"github.com/Azure/unbounded/internal/cachemesh/internal/control"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/elect"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/leader"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/node"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/wire"
 )
 
 // Workload is the data-plane hook of a Cluster. Attach is called once when
@@ -39,14 +35,14 @@ type ClusterConfig struct {
 	// bootstrap member. Use it for large clusters.
 	Prebuilt bool
 	// Node, if set, adjusts each member's node configuration.
-	Node func(member uint32, cfg *node.Config)
+	Node func(member uint32, cfg *control.Config)
 	// Workload is the optional data-plane workload.
 	Workload Workload
 	// Coverage collects reached states; nil allocates one.
 	Coverage *Coverage
 }
 
-// Cluster runs simulated cachemesh members, each a node.Node with its own
+// Cluster runs simulated cachemesh members, each a control.Node with its own
 // clock, on a Sim, Net, LeaseServer, and Processes.
 type Cluster struct {
 	Sim   *Sim
@@ -60,7 +56,7 @@ type Cluster struct {
 
 	cfg     ClusterConfig
 	sc      Scenario
-	shared  *node.Shared
+	shared  *control.Shared
 	members []*member
 	rng     *rand.Rand
 	initial *view.View
@@ -100,7 +96,7 @@ type member struct {
 	idx     uint32
 	inc     uint64
 	addr    string
-	n       *node.Node
+	n       *control.Node
 	clock   *Clock
 	tick    Handle
 	tickAt  int64
@@ -151,7 +147,7 @@ func NewCluster(cfg ClusterConfig) *Cluster {
 	c := &Cluster{
 		Sim: sim, cfg: cfg, sc: sc,
 		Trace:     NewTrace(),
-		shared:    node.NewShared(4096),
+		shared:    control.NewShared(4096),
 		rng:       sim.Stream("cluster"),
 		terms:     map[uint64]string{},
 		versions:  map[view.Version]view.Digest{},
@@ -171,7 +167,7 @@ func NewCluster(cfg ClusterConfig) *Cluster {
 	}
 
 	for k := range c.cov.msg {
-		c.cov.msg[k] = c.Cov.Handle("msg-" + wire.Kind(k).String())
+		c.cov.msg[k] = c.Cov.Handle("msg-" + control.Kind(k).String())
 	}
 
 	c.Net = NewNet(sim, sc.Capacity, c, NetConfig{Latency: 2_000_000})
@@ -217,7 +213,7 @@ func (c *Cluster) Fail(err error) {
 }
 
 // Node returns member i's node, or nil if it is not running.
-func (c *Cluster) Node(i uint32) *node.Node {
+func (c *Cluster) Node(i uint32) *control.Node {
 	if m := c.members[i]; m != nil && !m.dead {
 		return m.n
 	}
@@ -297,7 +293,7 @@ const (
 const minSettle = 60 * sec
 
 func (c *Cluster) rebalanceBound() int64 {
-	return int64(1)<<c.sc.PartitionBits/int64(leader.DefaultMaxMoves)*sec + 60*sec
+	return int64(1)<<c.sc.PartitionBits/int64(control.DefaultMaxMoves)*sec + 60*sec
 }
 
 // --- Prebuilt views ---
@@ -306,8 +302,8 @@ func (c *Cluster) rebalanceBound() int64 {
 // assigned by Processes.Start are unknown here, so prebuilt members use
 // incarnation 1 on their first start).
 func (c *Cluster) prebuild(n int) *view.View {
-	self := leader.Member{ID: memberID(0), Incarnation: 1, Addr: memberAddr(0)}
-	l := leader.New(c.leaderConfig(self, n), nil)
+	self := control.Joiner{ID: memberID(0), Incarnation: 1, Addr: memberAddr(0)}
+	l := control.NewLeader(c.leaderConfig(self, n), nil)
 	v := view.Genesis()
 	now := int64(0)
 	apply := func(ops []view.Op) {
@@ -326,10 +322,10 @@ func (c *Cluster) prebuild(n int) *view.View {
 	apply(l.Tick(now, 0, v, 1))
 
 	for i := uint32(1); i < uint32(n); i++ {
-		l.Join(now, leader.Member{ID: memberID(i), Incarnation: 1, Addr: memberAddr(i), Zone: "z"})
+		l.Join(now, control.Joiner{ID: memberID(i), Incarnation: 1, Addr: memberAddr(i), Zone: "z"})
 	}
 
-	period := int64(leader.DefaultEpochPeriod)
+	period := int64(control.DefaultEpochPeriod)
 
 	for step := 0; step < 600; step++ {
 		now += 5 * sec
@@ -344,11 +340,11 @@ func (c *Cluster) prebuild(n int) *view.View {
 	return v
 }
 
-func (c *Cluster) leaderConfig(self leader.Member, n int) leader.Config {
-	return leader.Config{
+func (c *Cluster) leaderConfig(self control.Joiner, n int) control.LeaderConfig {
+	return control.LeaderConfig{
 		Self: self, PartitionBits: c.sc.PartitionBits, CellSize: c.sc.CellSize,
-		MaxNeighbors: c.sc.MaxNeighbors, MaxJoinsPerTick: max(leader.DefaultMaxJoinsPerTick, n),
-		MaxPending: max(leader.DefaultMaxPending, n),
+		MaxNeighbors: c.sc.MaxNeighbors, MaxJoinsPerTick: max(control.DefaultMaxJoinsPerTick, n),
+		MaxPending: max(control.DefaultMaxPending, n),
 	}
 }
 
@@ -369,11 +365,11 @@ func (c *Cluster) OnStart(i uint32, inc uint64) {
 		m.inc = 1
 	}
 
-	cfg := node.Config{
+	cfg := control.Config{
 		ID: memberID(i), Incarnation: m.inc, Addr: m.addr, Zone: "z" + strconv.Itoa(int(i%3)),
 		PartitionBits: c.sc.PartitionBits,
-		Elect:         elect.Config{ExpectedClusterSize: c.sc.Members},
-		Leader:        c.leaderConfig(leader.Member{}, 0),
+		Elect:         control.ElectionConfig{ExpectedClusterSize: c.sc.Members},
+		Leader:        c.leaderConfig(control.Joiner{}, 0),
 		Shared:        c.shared,
 		Hooks:         c.hooks(m),
 	}
@@ -400,7 +396,7 @@ func (c *Cluster) OnStart(i uint32, inc uint64) {
 		c.cfg.Node(i, &cfg)
 	}
 
-	m.n = node.New(cfg, c.Sim.Stream("node/"+strconv.FormatUint(uint64(i), 10)+"/"+strconv.FormatUint(inc, 10)))
+	m.n = control.New(cfg, c.Sim.Stream("node/"+strconv.FormatUint(uint64(i), 10)+"/"+strconv.FormatUint(inc, 10)))
 	c.members[i] = m
 	c.Net.Resume(i)
 	c.Trace.Add(1, uint64(i), inc, 0)
@@ -480,7 +476,7 @@ func (m *member) after() {
 
 	for _, op := range m.n.LeaseOps() {
 		c.leaseOp(m, op)
-		c.Lease.Submit(m.idx, op, func(r elect.Result) { m.leaseResult(r) })
+		c.Lease.Submit(m.idx, op, func(r control.Result) { m.leaseResult(r) })
 	}
 
 	if m.paused {
@@ -516,7 +512,7 @@ func (m *member) complete(id uint64, resp []byte, err error) {
 	m.after()
 }
 
-func (m *member) leaseResult(r elect.Result) {
+func (m *member) leaseResult(r control.Result) {
 	if m.dead {
 		return
 	}
@@ -535,7 +531,7 @@ func (m *member) leaseResult(r elect.Result) {
 // peekKind returns the wire kind of an encoded message for traffic stats,
 // 0 if it is malformed.
 func peekKind(b []byte) uint16 {
-	k, err := wire.PeekKind(b)
+	k, err := control.PeekKind(b)
 	if err != nil {
 		return 0
 	}
@@ -572,31 +568,31 @@ func (c *Cluster) Deliver(msg *Message) {
 
 // --- Hooks and safety invariants ---
 
-func (c *Cluster) hooks(m *member) node.Hooks {
+func (c *Cluster) hooks(m *member) control.Hooks {
 	cov := c.Cov
 
-	return node.Hooks{
+	return control.Hooks{
 		OnView: func(v *view.View) {
 			c.onView(m, v)
 		},
 		OnPublish: func(d *view.Delta) {
 			c.onPublish(m, d)
 		},
-		OnCatchUp: func(k node.CatchUpKind) {
+		OnCatchUp: func(k control.CatchUpKind) {
 			switch k {
-			case node.CatchUpDeltas:
+			case control.CatchUpDeltas:
 				c.cov.viewDeltas.Hit()
-			case node.CatchUpSnapshot:
+			case control.CatchUpSnapshot:
 				c.cov.viewSnap.Hit()
-			case node.CatchUpEmpty:
+			case control.CatchUpEmpty:
 				c.cov.viewEmpty.Hit()
 			}
 		},
-		OnMessage: func(k wire.Kind) { c.cov.msg[k%32].Hit() },
+		OnMessage: func(k control.Kind) { c.cov.msg[k%32].Hit() },
 		OnEvent:   func(name string) { c.nodeEvent(name) },
-		Leader: leader.Hooks{
+		Leader: control.LeaderHooks{
 			OnAdmit:     func(view.Slot, string) { cov.Hit("leader-admit") },
-			OnRemove:    func(_ view.Slot, r leader.RemoveReason) { cov.Hit("leader-remove-" + strconv.Itoa(int(r))) },
+			OnRemove:    func(_ view.Slot, r control.RemoveReason) { cov.Hit("leader-remove-" + strconv.Itoa(int(r))) },
 			OnPromote:   func(_ view.Slot, s view.MemberState, _ uint32) { cov.Hit("leader-promote-" + s.String()) },
 			OnDamped:    func(int, int) { cov.Hit("leader-damped") },
 			OnReshape:   func(_, _ view.Shape) { cov.Hit("leader-reshape") },
@@ -605,9 +601,9 @@ func (c *Cluster) hooks(m *member) node.Hooks {
 			OnBootstrap: func() { cov.Hit("leader-bootstrap") },
 			OnDrop:      func(q string) { cov.Hit("leader-drop-" + q) },
 		},
-		Elect: elect.Hooks{
-			OnState: func(_, to elect.State) { cov.Hit("elect-" + to.String()) },
-			OnOp:    func(k elect.OpKind) { cov.Hit("lease-op-" + k.String()) },
+		Elect: control.ElectorHooks{
+			OnState: func(_, to control.ElectorState) { cov.Hit("elect-" + to.String()) },
+			OnOp:    func(k control.OpKind) { cov.Hit("lease-op-" + k.String()) },
 		},
 	}
 }
@@ -703,7 +699,7 @@ func (c *Cluster) checkPeriodic() {
 			c.Fail(fmt.Errorf("member %d: %d pending calls", m.idx, p))
 		}
 
-		if el := m.n.Elector().State(); el == elect.Leader {
+		if el := m.n.Elector().State(); el == control.StateLeader {
 			c.Cov.Hit("elect-leader-held")
 		}
 	}
@@ -817,14 +813,14 @@ func (c *Cluster) liveness() error {
 		return fmt.Errorf("liveness: %d of %d live members in view", inView, len(live))
 	}
 
-	pm := make([]control.Member, 0, lv.Len())
+	pm := make([]control.PlanMember, 0, lv.Len())
 	lv.ForEachMember(func(s view.Slot, mm *view.Member) bool {
-		pm = append(pm, control.Member{Slot: s, Key: mm.Key, Weight: mm.Weight, Cell: mm.Cell})
+		pm = append(pm, control.PlanMember{Slot: s, Key: mm.Key, Weight: mm.Weight, Cell: mm.Cell})
 
 		return true
 	})
 
-	if ok, err := control.NewPlanner(control.Config{}).Settled(lv.Table(), pm); err != nil || !ok {
+	if ok, err := control.NewPlanner(control.PlannerConfig{}).Settled(lv.Table(), pm); err != nil || !ok {
 		return fmt.Errorf("liveness: placement not settled (%v)", err)
 	}
 
@@ -839,7 +835,7 @@ func (c *Cluster) liveness() error {
 	}
 
 	// The epoch restarts at zero with a new cluster (after a cold restart).
-	if want := uint64((c.Sim.Now()-c.ctl.genesisAt)/int64(leader.DefaultEpochPeriod)) / 2; lv.Epoch() < want {
+	if want := uint64((c.Sim.Now()-c.ctl.genesisAt)/int64(control.DefaultEpochPeriod)) / 2; lv.Epoch() < want {
 		return fmt.Errorf("liveness: epoch %d below %d", lv.Epoch(), want)
 	}
 
@@ -986,9 +982,9 @@ func (c *Cluster) apply(f Fault) {
 
 // Lease budgets, from the elect defaults the simulated members use.
 const (
-	candidates    = elect.DefaultCandidates
-	retryPeriod   = int64(elect.DefaultRetryPeriod)
-	lotteryBudget = elect.DefaultLotteryBudgetQPS
+	candidates    = control.DefaultCandidates
+	retryPeriod   = int64(control.DefaultRetryPeriod)
+	lotteryBudget = control.DefaultLotteryBudgetQPS
 
 	// quietPeakPerSecond bounds elector Lease calls in any one second of a
 	// quiet period: each candidate and the leader call at most once per
@@ -1026,7 +1022,7 @@ type controlState struct {
 	noSeeds    []bool
 	ownReadAt  []int64
 	electOps   []uint32 // elector ops per member in the current window
-	electState []elect.State
+	electState []control.ElectorState
 	perSec     []uint32 // elector ops per simulated second
 	peak       uint32
 	quietPeak  uint32
@@ -1037,14 +1033,14 @@ type controlState struct {
 	coldRestartAt int64
 	overlaps      int // overlaps excused by clocks outside the safety bounds
 
-	maxStats node.Stats
+	maxStats control.Stats
 }
 
 func (s *controlState) init(capacity int) {
 	s.noSeeds = make([]bool, capacity)
 	s.ownReadAt = make([]int64, capacity)
 	s.electOps = make([]uint32, capacity)
-	s.electState = make([]elect.State, capacity)
+	s.electState = make([]control.ElectorState, capacity)
 
 	for i := range s.ownReadAt {
 		s.ownReadAt[i] = -1
@@ -1058,7 +1054,7 @@ func (c *Cluster) ControlStats() string {
 }
 
 // onStartControl adjusts a starting member's configuration.
-func (c *Cluster) onStartControl(i uint32, cfg *node.Config) {
+func (c *Cluster) onStartControl(i uint32, cfg *control.Config) {
 	if c.ctl.noSeeds[i] {
 		c.ctl.noSeeds[i] = false
 		cfg.Seeds = nil
@@ -1068,7 +1064,7 @@ func (c *Cluster) onStartControl(i uint32, cfg *node.Config) {
 }
 
 // leaseOp accounts one Lease operation as member m emits it.
-func (c *Cluster) leaseOp(m *member, op elect.Op) {
+func (c *Cluster) leaseOp(m *member, op control.Op) {
 	now := c.Sim.Now()
 
 	if op.Seq>>63 == 1 {
@@ -1108,7 +1104,7 @@ func (c *Cluster) checkLease(now int64, quiet bool) {
 			if m != nil && !m.dead {
 				c.ctl.electState[i] = m.n.Elector().State()
 			} else {
-				c.ctl.electState[i] = elect.Follower
+				c.ctl.electState[i] = control.StateFollower
 			}
 		}
 	}()
@@ -1149,7 +1145,7 @@ func (c *Cluster) checkLease(now int64, quiet bool) {
 		// Followers make no calls: a caller must have been a candidate or
 		// the leader at one end of the window.
 		was, is := c.ctl.electState[i], m.n.Elector().State()
-		active := func(s elect.State) bool { return s == elect.Candidate || s == elect.Leader }
+		active := func(s control.ElectorState) bool { return s == control.StateCandidate || s == control.StateLeader }
 
 		if !active(was) && !active(is) {
 			c.Fail(fmt.Errorf("steady state: member %d (elector %v -> %v) made %d Lease calls", i, was, is, ops))
@@ -1174,7 +1170,7 @@ func (c *Cluster) clocksInBounds() bool {
 		lo, hi     int64
 		dlo, dhi   int64
 		first      = true
-		skewBudget = int64(elect.DefaultClockSkewAllowance)
+		skewBudget = int64(control.DefaultClockSkewAllowance)
 	)
 
 	for _, m := range c.members {
@@ -1199,7 +1195,7 @@ func (c *Cluster) clocksInBounds() bool {
 	}
 
 	// (1+dhi)/(1+dlo) < LeaseDuration/RenewDeadline.
-	ld, rd := int64(elect.DefaultLeaseDuration/1e6), int64(elect.DefaultRenewDeadline/1e6)
+	ld, rd := int64(control.DefaultLeaseDuration/1e6), int64(control.DefaultRenewDeadline/1e6)
 
 	return (nsPerSec+dhi)*rd < (nsPerSec+dlo)*ld
 }
@@ -1265,20 +1261,20 @@ func (c *Cluster) checkBounded() {
 		var bad string
 
 		switch {
-		case s.Calls > node.MaxPendingCalls:
+		case s.Calls > control.MaxPendingCalls:
 			bad = "pending calls"
-		case s.Ahead > node.DefaultMaxAhead:
+		case s.Ahead > control.DefaultMaxAhead:
 			bad = "queued deltas"
-		case s.Seeds > 4*elect.MaxSeeds:
+		case s.Seeds > 4*control.MaxSeeds:
 			bad = "seeds"
-		case s.LeaseSeeds > elect.MaxSeeds:
+		case s.LeaseSeeds > control.MaxSeeds:
 			bad = "Lease seeds"
 		case s.Log > view.DefaultDeltaLogSize:
 			bad = "delta log"
 		case s.LingerOverdue, s.Neighbors-s.Lingering > c.sc.Capacity:
 			bad = "neighbors"
-		case s.Joins > leader.DefaultMaxPending, s.Leaves > leader.DefaultMaxPending,
-			s.Suspects > leader.DefaultMaxPending, s.Invals > leader.DefaultMaxPending:
+		case s.Joins > control.DefaultMaxPending, s.Leaves > control.DefaultMaxPending,
+			s.Suspects > control.DefaultMaxPending, s.Invals > control.DefaultMaxPending:
 			bad = "leader queues"
 		}
 
@@ -1359,7 +1355,7 @@ func (c *Cluster) checkSane() {
 	}
 
 	v := c.members[l].n.View()
-	if maxSeq := uint64(c.Sim.Now()/int64(node.DefaultLeaderTick)) + 1; v.Version().Seq > maxSeq {
+	if maxSeq := uint64(c.Sim.Now()/int64(control.DefaultLeaderTick)) + 1; v.Version().Seq > maxSeq {
 		c.Fail(fmt.Errorf("view seq %d above %d", v.Version().Seq, maxSeq))
 	}
 

@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package wire defines the cachemesh control-plane messages and their
+// Wire messages. This file defines the cachemesh control-plane messages and their
 // canonical binary encoding.
 //
 // Every message is a request or a response carried by one
@@ -27,7 +27,8 @@
 // and Leave when decoding into a reused Message: string and byte-string fields
 // alias the input buffer. Call Message.Detach before the input is reused or
 // modified if the message is retained.
-package wire
+
+package control
 
 import (
 	"errors"

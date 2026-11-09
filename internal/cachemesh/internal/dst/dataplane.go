@@ -11,13 +11,13 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/Azure/unbounded/internal/cachemesh/internal/node"
+	"github.com/Azure/unbounded/internal/cachemesh/internal/control"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/route"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
 )
 
 // KindData is the Net message kind of data-plane requests and replies. It
-// is above every wire.Kind, so control traffic statistics stay separate.
+// is above every control.Kind, so control traffic statistics stay separate.
 const KindData uint16 = 60
 
 // MetaTTL is the TTL of the metadata keyspaces.
@@ -264,7 +264,7 @@ type dpHop struct {
 	w        *DataPlane
 	cp       *dpCopy
 	from     uint32
-	fromN    *node.Node
+	fromN    *control.Node
 	to       uint32
 	toSlot   view.Slot
 	toGen    uint64
@@ -281,7 +281,7 @@ type dpHop struct {
 }
 
 type dpMember struct {
-	n         *node.Node
+	n         *control.Node
 	gen       uint64
 	env       *route.Env
 	st        *route.State
@@ -327,7 +327,7 @@ func (r *trackRing) peak(now int64) int {
 
 type dpStamp struct {
 	issuer uint32
-	n      *node.Node
+	n      *control.Node
 	at     int64
 	seed   uint64
 	st     route.Stamp
@@ -397,7 +397,7 @@ var DataPlaneCoverage = []string{
 
 // ConfigureNode installs the variant's health configuration and coverage
 // hooks. Use it as ClusterConfig.Node.
-func (w *DataPlane) ConfigureNode(member uint32, cfg *node.Config) {
+func (w *DataPlane) ConfigureNode(member uint32, cfg *control.Config) {
 	hc := w.hcfg
 	cov := func(name string) func() {
 		return func() {
@@ -1404,7 +1404,7 @@ func neighborBound(v *view.View, cellSize, maxNeighbors int) [2]int {
 func (w *DataPlane) stampSlack(age int64) int64 {
 	drift := age * w.driftPPB / 1_000_000_000
 
-	return int64(w.period) + 2*int64(node.DefaultTickInterval) + sec + 2*drift
+	return int64(w.period) + 2*int64(control.DefaultTickInterval) + sec + 2*drift
 }
 
 // MinDriftPPB is the drift stampSlack allows for even when a scenario

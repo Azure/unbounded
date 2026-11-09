@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-package node
+package control
 
 import (
 	"bytes"
@@ -9,10 +9,8 @@ import (
 	"slices"
 	"time"
 
-	"github.com/Azure/unbounded/internal/cachemesh/internal/elect"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/route"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/wire"
 )
 
 // --- Shared caches (simulation) ---
@@ -211,7 +209,7 @@ func (n *Node) adoptSnapshotFrom(now int64, nv *view.View, from string) {
 	n.setView(now, nv)
 }
 
-func (n *Node) onBroadcast(now int64, from string, m *wire.Message) {
+func (n *Node) onBroadcast(now int64, from string, m *Message) {
 	n.addSeed(from)
 
 	d, err := n.decodeDelta(m.Delta)
@@ -302,7 +300,7 @@ func (n *Node) forward(d *view.Delta, enc []byte, l int8) {
 // fanOut sends enc to one member of every adjacent cell in each dimension
 // above l and, unless l is LevelLocal, to every cell-mate.
 func (n *Node) fanOut(enc []byte, seq uint64, l int8) {
-	if l == wire.LevelLocal {
+	if l == LevelLocal {
 		return
 	}
 
@@ -324,7 +322,7 @@ func (n *Node) fanOut(enc []byte, seq uint64, l int8) {
 
 	for _, s := range v.CellMembers(mine) {
 		if s != n.slot {
-			n.sendBroadcast(enc, seq, wire.LevelLocal, mine, s, 0)
+			n.sendBroadcast(enc, seq, LevelLocal, mine, s, 0)
 		}
 	}
 }
@@ -362,16 +360,16 @@ func (n *Node) forwardCell(enc []byte, seq uint64, l int8, cell uint32, attempt 
 }
 
 func (n *Node) sendBroadcast(enc []byte, seq uint64, l int8, cell uint32, to view.Slot, attempt uint8) {
-	var m wire.Message
-	n.header(&m, wire.KindBroadcast)
+	var m Message
+	n.header(&m, KindBroadcast)
 	m.Level = l
 	m.Delta = enc
 	n.send(n.addrOf(to), &m, &pending{kind: callBroadcast, slot: to, level: l, cell: cell, attempt: attempt, enc: enc, seq: seq}, n.cfg.CallTimeout)
 }
 
-func (n *Node) serveCatchUp(m *wire.Message) []byte {
-	var r wire.Message
-	n.header(&r, wire.KindCatchUpResponse)
+func (n *Node) serveCatchUp(m *Message) []byte {
+	var r Message
+	n.header(&r, KindCatchUpResponse)
 
 	mine := n.v.Version()
 
@@ -399,10 +397,10 @@ func (n *Node) serveCatchUp(m *wire.Message) []byte {
 		}
 	}
 
-	return wire.Append(nil, &r)
+	return Append(nil, &r)
 }
 
-func (n *Node) onCatchUp(now int64, m *wire.Message, from string) {
+func (n *Node) onCatchUp(now int64, m *Message, from string) {
 	switch {
 	case len(m.Deltas) > 0:
 		applied := 0
@@ -485,7 +483,7 @@ func (n *Node) onCatchUp(now int64, m *wire.Message, from string) {
 	}
 }
 
-func (n *Node) respAddr(m *wire.Message) string {
+func (n *Node) respAddr(m *Message) string {
 	if m.From.Slot != view.NoSlot {
 		if mm, ok := n.v.Member(m.From.Slot); ok && mm.ID == m.From.ID {
 			return mm.Addr
@@ -648,8 +646,8 @@ func (n *Node) pingSubjects(_ int64) {
 			continue
 		}
 
-		var m wire.Message
-		n.header(&m, wire.KindPing)
+		var m Message
+		n.header(&m, KindPing)
 
 		sb.inflight = n.send(n.addrOf(sb.slot), &m, &pending{kind: callPing, slot: sb.slot, key: sb.key}, n.cfg.PingTimeout)
 	}
@@ -692,9 +690,9 @@ func (n *Node) pingDone(now int64, p *pending, ok bool, rtt time.Duration) {
 	sb.lastSuspect = now
 	m, _ := n.v.Member(sb.slot)
 
-	var s wire.Message
-	n.header(&s, wire.KindSuspect)
-	s.Target = wire.MemberRef{ID: m.ID, Incarnation: m.Incarnation, Slot: sb.slot}
+	var s Message
+	n.header(&s, KindSuspect)
+	s.Target = MemberRef{ID: m.ID, Incarnation: m.Incarnation, Slot: sb.slot}
 	s.Observer = n.self
 	n.toLeader(now, addr, &s)
 	n.event("suspect-sent")
@@ -702,9 +700,9 @@ func (n *Node) pingDone(now int64, p *pending, ok bool, rtt time.Duration) {
 
 // --- Election and leadership ---
 
-func (n *Node) electInput(now int64, wall time.Time) elect.Input {
+func (n *Node) electInput(now int64, wall time.Time) Input {
 	_, has := n.v.Config()
-	in := elect.Input{
+	in := Input{
 		Now: now, Wall: wall,
 		ViewTerm:    n.v.Term(),
 		HaveView:    has,
@@ -787,7 +785,7 @@ func (n *Node) topCandidates(ep uint64) []uint64 {
 		return true
 	})
 
-	top := elect.TopCandidates(LeaseSeed, keys, n.cfg.Elect.Candidates)
+	top := TopCandidates(LeaseSeed, keys, n.cfg.Elect.Candidates)
 
 	if s := n.shared; s != nil {
 		s.cand.Put(k, top)
@@ -829,7 +827,7 @@ func (n *Node) seedsFromView() {
 // maxSeeds bounds the join seed list.
 const maxSeeds = 32
 
-// pickSeeds chooses up to elect.MaxSeeds random member addresses for the
+// pickSeeds chooses up to MaxSeeds random member addresses for the
 // Lease.
 func (n *Node) pickSeeds() {
 	n.leaseSeeds = n.leaseSeeds[:0]
@@ -839,8 +837,8 @@ func (n *Node) pickSeeds() {
 		return
 	}
 
-	for range 4 * elect.MaxSeeds {
-		if len(n.leaseSeeds) == elect.MaxSeeds {
+	for range 4 * MaxSeeds {
+		if len(n.leaseSeeds) == MaxSeeds {
 			break
 		}
 
@@ -852,7 +850,7 @@ func (n *Node) pickSeeds() {
 }
 
 // OnLease reports the result of a Lease operation from LeaseOps.
-func (n *Node) OnLease(now int64, wall time.Time, r elect.Result) {
+func (n *Node) OnLease(now int64, wall time.Time, r Result) {
 	n.now = max(n.now, now)
 	now = n.now
 
@@ -874,7 +872,7 @@ func (n *Node) OnLease(now int64, wall time.Time, r elect.Result) {
 
 		switch {
 		case len(n.seeds) > 0:
-		case r.Err == nil || errors.Is(r.Err, elect.ErrNotFound):
+		case r.Err == nil || errors.Is(r.Err, ErrNotFound):
 			if _, has := n.v.Config(); !has && len(n.cfg.Seeds) == 0 && !n.joined {
 				n.bootstrapper = true
 				n.event("bootstrap-candidate")
@@ -898,7 +896,7 @@ func (n *Node) learnSeeds(addr string, seeds []string) {
 	}
 
 	for _, s := range append([]string{addr}, seeds...) {
-		if s != "" && s != n.cfg.Addr && !slices.Contains(n.seeds, s) && len(n.seeds) < 4*elect.MaxSeeds {
+		if s != "" && s != n.cfg.Addr && !slices.Contains(n.seeds, s) && len(n.seeds) < 4*MaxSeeds {
 			n.seeds = append(n.seeds, s)
 		}
 	}
@@ -909,11 +907,11 @@ func (n *Node) learnSeeds(addr string, seeds []string) {
 func (n *Node) electEvents(now int64) {
 	for _, e := range n.el.Events() {
 		switch e.Kind {
-		case elect.Acquired:
+		case Acquired:
 			n.startLeading(now, e.Term)
-		case elect.Lost:
+		case Lost:
 			n.stopLeading("lost")
-		case elect.Discovered:
+		case Discovered:
 			// A live holder: join it rather than cold start.
 			n.coldStart = false
 			n.learnSeeds(e.Record.Addr, e.Record.Seeds)
@@ -1005,5 +1003,5 @@ func (n *Node) leaderTick(now int64) {
 		n.cfg.Hooks.OnPublish(d)
 	}
 
-	n.forward(d, n.encoded(d, raw), wire.LevelLeader)
+	n.forward(d, n.encoded(d, raw), LevelLeader)
 }

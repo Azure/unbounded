@@ -6,12 +6,11 @@ package dst
 import (
 	"bytes"
 	"errors"
+	"github.com/Azure/unbounded/internal/cachemesh/internal/control"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/Azure/unbounded/internal/cachemesh/internal/elect"
 )
 
 type recTarget struct{ got []uint64 }
@@ -598,33 +597,33 @@ func TestLeaseCAS(t *testing.T) {
 	s := New(1)
 	l := NewLeaseServer(s, LeaseConfig{})
 
-	if r := l.Do(NoMember, elect.Op{Kind: elect.OpGet}, 0); !errors.Is(r.Err, elect.ErrNotFound) {
+	if r := l.Do(NoMember, control.Op{Kind: control.OpGet}, 0); !errors.Is(r.Err, control.ErrNotFound) {
 		t.Fatal("get missing")
 	}
 
-	if r := l.Do(NoMember, elect.Op{Kind: elect.OpUpdate}, 0); !errors.Is(r.Err, elect.ErrNotFound) {
+	if r := l.Do(NoMember, control.Op{Kind: control.OpUpdate}, 0); !errors.Is(r.Err, control.ErrNotFound) {
 		t.Fatal("update missing")
 	}
 
-	c := l.Do(3, elect.Op{Seq: 9, Kind: elect.OpCreate, Record: elect.Record{Holder: "a", Term: 1, Incarnation: 1}}, 10)
+	c := l.Do(3, control.Op{Seq: 9, Kind: control.OpCreate, Record: control.Record{Holder: "a", Term: 1, Incarnation: 1}}, 10)
 	if c.Err != nil || c.Seq != 9 || c.Record.ResourceVersion != "1" || c.Record.UID == "" {
 		t.Fatalf("create %+v", c)
 	}
 
-	if r := l.Do(NoMember, elect.Op{Kind: elect.OpCreate}, 11); !errors.Is(r.Err, elect.ErrConflict) {
+	if r := l.Do(NoMember, control.Op{Kind: control.OpCreate}, 11); !errors.Is(r.Err, control.ErrConflict) {
 		t.Fatal("double create")
 	}
 
 	upd := c.Record
 	upd.Holder = "b"
 	upd.Term = 2
-	u := l.Do(NoMember, elect.Op{Kind: elect.OpUpdate, Record: upd}, 20)
+	u := l.Do(NoMember, control.Op{Kind: control.OpUpdate, Record: upd}, 20)
 
 	if u.Err != nil || u.Record.ResourceVersion != "2" || u.Record.UID != c.Record.UID {
 		t.Fatalf("update %+v", u)
 	}
 
-	if r := l.Do(NoMember, elect.Op{Kind: elect.OpUpdate, Record: upd}, 21); !errors.Is(r.Err, elect.ErrConflict) {
+	if r := l.Do(NoMember, control.Op{Kind: control.OpUpdate, Record: upd}, 21); !errors.Is(r.Err, control.ErrConflict) {
 		t.Fatal("stale rv accepted")
 	}
 
@@ -635,7 +634,7 @@ func TestLeaseCAS(t *testing.T) {
 	// Returned records are copies.
 	u.Record.Seeds = append(u.Record.Seeds, "x")
 
-	if cur := l.Do(NoMember, elect.Op{Kind: elect.OpGetCached}, 22); cur.Err != nil || len(cur.Record.Seeds) != 0 {
+	if cur := l.Do(NoMember, control.Op{Kind: control.OpGetCached}, 22); cur.Err != nil || len(cur.Record.Seeds) != 0 {
 		t.Fatal("aliasing")
 	}
 }
@@ -645,14 +644,14 @@ func TestLeaseOutageConflictsAsync(t *testing.T) {
 	l := NewLeaseServer(s, LeaseConfig{ConflictPPM: 500_000})
 	l.AddOutage(100, 200)
 
-	if r := l.Do(NoMember, elect.Op{Kind: elect.OpGet}, 150); !errors.Is(r.Err, ErrUnavailable) {
+	if r := l.Do(NoMember, control.Op{Kind: control.OpGet}, 150); !errors.Is(r.Err, ErrUnavailable) {
 		t.Fatal("outage")
 	}
 
 	conflicts := 0
 
 	for i := range 100 {
-		if r := l.Do(NoMember, elect.Op{Kind: elect.OpCreate}, int64(300+i)); errors.Is(r.Err, elect.ErrConflict) {
+		if r := l.Do(NoMember, control.Op{Kind: control.OpCreate}, int64(300+i)); errors.Is(r.Err, control.ErrConflict) {
 			conflicts++
 		}
 	}
@@ -663,9 +662,9 @@ func TestLeaseOutageConflictsAsync(t *testing.T) {
 
 	l.SetConflictPPM(0)
 
-	var got []elect.Result
+	var got []control.Result
 
-	l.Submit(1, elect.Op{Seq: 5, Kind: elect.OpGet}, func(r elect.Result) { got = append(got, r) })
+	l.Submit(1, control.Op{Seq: 5, Kind: control.OpGet}, func(r control.Result) { got = append(got, r) })
 	drain(s)
 
 	if len(got) != 1 || got[0].Seq != 5 || s.Now() < 5_000_000 {

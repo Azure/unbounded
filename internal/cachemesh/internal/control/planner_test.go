@@ -12,17 +12,17 @@ import (
 	"testing"
 )
 
-func randomMembers(r *rand.Rand, n int, slot0 uint32) []Member {
-	ms := make([]Member, n)
+func randomMembers(r *rand.Rand, n int, slot0 uint32) []PlanMember {
+	ms := make([]PlanMember, n)
 	for i := range ms {
-		ms[i] = Member{Slot: slot0 + uint32(i), Key: r.Uint64(), Weight: view.MaxWeight, Cell: uint32(r.IntN(max(1, n/4)))}
+		ms[i] = PlanMember{Slot: slot0 + uint32(i), Key: r.Uint64(), Weight: view.MaxWeight, Cell: uint32(r.IntN(max(1, n/4)))}
 	}
 
 	return ms
 }
 
 // step applies one plan and checks its invariants.
-func step(t *testing.T, pl *Planner, tb *view.Table, ms []Member, epoch uint32) (*view.Table, Plan) {
+func step(t *testing.T, pl *Planner, tb *view.Table, ms []PlanMember, epoch uint32) (*view.Table, Plan) {
 	t.Helper()
 
 	plan, err := pl.Plan(tb, ms)
@@ -65,7 +65,7 @@ func step(t *testing.T, pl *Planner, tb *view.Table, ms []Member, epoch uint32) 
 
 func TestPlannerConverges(t *testing.T) {
 	r := rand.New(rand.NewPCG(42, 1))
-	pl := NewPlanner(Config{MaxMoves: 512})
+	pl := NewPlanner(PlannerConfig{MaxMoves: 512})
 
 	const bits = 14
 
@@ -114,7 +114,7 @@ func TestPlannerConverges(t *testing.T) {
 		switch r.IntN(4) {
 		case 0: // add joiners and ramp them
 			for range r.IntN(5) + 1 {
-				m := Member{Slot: nextSlot, Key: r.Uint64(), Cell: uint32(r.IntN(10))}
+				m := PlanMember{Slot: nextSlot, Key: r.Uint64(), Cell: uint32(r.IntN(10))}
 				nextSlot++
 
 				ms = append(ms, m)
@@ -149,13 +149,13 @@ func TestPlannerConverges(t *testing.T) {
 
 		settle("round")
 
-		ms = slices.DeleteFunc(ms, func(m Member) bool { return m.Gone })
+		ms = slices.DeleteFunc(ms, func(m PlanMember) bool { return m.Gone })
 	}
 }
 
 func TestPlannerCellMatePreference(t *testing.T) {
-	pl := NewPlanner(Config{MaxMoves: -1})
-	ms := []Member{
+	pl := NewPlanner(PlannerConfig{MaxMoves: -1})
+	ms := []PlanMember{
 		{Slot: 0, Key: 10, Weight: 1000, Cell: 0},
 		{Slot: 1, Key: 20, Weight: 1000, Cell: 0},
 		{Slot: 2, Key: 30, Weight: 1000, Cell: 0},
@@ -224,20 +224,20 @@ func TestPlannerDeterministic(t *testing.T) {
 	ms := randomMembers(r, 200, 5)
 	tb := view.NewTable(12, view.NoMember)
 
-	tb, _ = step(t, NewPlanner(Config{}), tb, ms, 1)
+	tb, _ = step(t, NewPlanner(PlannerConfig{}), tb, ms, 1)
 
 	for i := range 20 {
 		ms[i*3].Weight = 0
 	}
 
 	ms = ms[:190]
-	p1, _ := NewPlanner(Config{MaxMoves: 100}).Plan(tb, ms)
+	p1, _ := NewPlanner(PlannerConfig{MaxMoves: 100}).Plan(tb, ms)
 	p1 = Plan{Parts: slices.Clone(p1.Parts), Owners: slices.Clone(p1.Owners), Mandatory: p1.Mandatory}
 
 	sh := slices.Clone(ms)
 	r.Shuffle(len(sh), func(i, j int) { sh[i], sh[j] = sh[j], sh[i] })
 
-	pl := NewPlanner(Config{MaxMoves: 100})
+	pl := NewPlanner(PlannerConfig{MaxMoves: 100})
 	_, _ = pl.Plan(view.NewTable(3, 0), sh[:3]) // dirty the buffers
 
 	p2, _ := pl.Plan(tb, sh)
@@ -247,14 +247,14 @@ func TestPlannerDeterministic(t *testing.T) {
 }
 
 func TestPlannerErrorsAndEmpty(t *testing.T) {
-	pl := NewPlanner(Config{})
+	pl := NewPlanner(PlannerConfig{})
 	tb := view.NewTable(4, 1)
 
-	if _, err := pl.Plan(tb, []Member{{Slot: 1}, {Slot: 1}}); !errors.Is(err, view.ErrInvalidTable) {
+	if _, err := pl.Plan(tb, []PlanMember{{Slot: 1}, {Slot: 1}}); !errors.Is(err, view.ErrInvalidTable) {
 		t.Fatal("duplicate slot")
 	}
 
-	if _, err := pl.Plan(tb, []Member{{Slot: view.NoMember}}); !errors.Is(err, view.ErrInvalidTable) {
+	if _, err := pl.Plan(tb, []PlanMember{{Slot: view.NoMember}}); !errors.Is(err, view.ErrInvalidTable) {
 		t.Fatal("NoMember slot")
 	}
 
@@ -267,20 +267,20 @@ func TestPlannerErrorsAndEmpty(t *testing.T) {
 		t.Fatal("empty membership is settled")
 	}
 
-	if ok, _ := pl.Settled(tb, []Member{{Slot: 2, Weight: 1}}); ok {
+	if ok, _ := pl.Settled(tb, []PlanMember{{Slot: 2, Weight: 1}}); ok {
 		t.Fatal("orphans are not settled")
 	}
 
 	// All Gone: nothing to assign to.
-	p, _ = pl.Plan(tb, []Member{{Slot: 1, Gone: true}})
+	p, _ = pl.Plan(tb, []PlanMember{{Slot: 1, Gone: true}})
 	if len(p.Parts) != 0 {
 		t.Fatal("gone-only membership must plan nothing")
 	}
 }
 
 func TestTargets(t *testing.T) {
-	pl := NewPlanner(Config{})
-	ms := []Member{
+	pl := NewPlanner(PlannerConfig{})
+	ms := []PlanMember{
 		{Slot: 0, Key: 3, Weight: 1000},
 		{Slot: 1, Key: 1, Weight: 1000},
 		{Slot: 2, Key: 2, Weight: 1000},
@@ -305,7 +305,7 @@ func BenchmarkPlan(b *testing.B) {
 		b.Run("removed="+strconv.Itoa(removed), func(b *testing.B) {
 			r := rand.New(rand.NewPCG(3, 4))
 			ms := randomMembers(r, 100_000, 0)
-			pl := NewPlanner(Config{})
+			pl := NewPlanner(PlannerConfig{})
 			tb := view.NewTable(20, view.NoMember)
 
 			for {

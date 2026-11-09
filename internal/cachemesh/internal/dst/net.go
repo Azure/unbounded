@@ -6,10 +6,9 @@ package dst
 import (
 	"errors"
 	"fmt"
+	"github.com/Azure/unbounded/internal/cachemesh/internal/control"
 	"math/rand/v2"
 	"strconv"
-
-	"github.com/Azure/unbounded/internal/cachemesh/internal/elect"
 )
 
 // ErrTimeout completes a Call whose response did not arrive in time.
@@ -377,7 +376,7 @@ type Window struct{ Start, End int64 }
 type Write struct {
 	Time        int64
 	Member      uint32
-	Kind        elect.OpKind
+	Kind        control.OpKind
 	Holder      string
 	Incarnation uint64
 	Term        uint64
@@ -393,7 +392,7 @@ type LeaseServer struct {
 	rng     *rand.Rand
 	cfg     LeaseConfig
 	exists  bool
-	cur     elect.Record
+	cur     control.Record
 	rv      uint64
 	uids    uint64
 	outages []Window
@@ -439,8 +438,8 @@ func (l *LeaseServer) down(now int64) bool {
 func (l *LeaseServer) Audit() []Write { return l.audit }
 
 // Do executes op at simulated time now on behalf of member.
-func (l *LeaseServer) Do(member uint32, op elect.Op, now int64) elect.Result {
-	res := elect.Result{Seq: op.Seq, Kind: op.Kind}
+func (l *LeaseServer) Do(member uint32, op control.Op, now int64) control.Result {
+	res := control.Result{Seq: op.Seq, Kind: op.Kind}
 
 	if l.down(now) {
 		res.Err = ErrUnavailable
@@ -449,17 +448,17 @@ func (l *LeaseServer) Do(member uint32, op elect.Op, now int64) elect.Result {
 	}
 
 	switch op.Kind {
-	case elect.OpGet, elect.OpGetCached:
+	case control.OpGet, control.OpGetCached:
 		if !l.exists {
-			res.Err = elect.ErrNotFound
+			res.Err = control.ErrNotFound
 
 			return res
 		}
 
 		res.Record = l.cur.Clone()
-	case elect.OpCreate:
+	case control.OpCreate:
 		if l.exists || l.injectConflict() {
-			res.Err = elect.ErrConflict
+			res.Err = control.ErrConflict
 
 			return res
 		}
@@ -468,16 +467,16 @@ func (l *LeaseServer) Do(member uint32, op elect.Op, now int64) elect.Result {
 		r := op.Record.Clone()
 		r.UID = "uid-" + strconv.FormatUint(l.uids, 10)
 		res.Record = l.write(now, member, op.Kind, r)
-	case elect.OpUpdate:
+	case control.OpUpdate:
 		if !l.exists {
-			res.Err = elect.ErrNotFound
+			res.Err = control.ErrNotFound
 
 			return res
 		}
 
 		if op.Record.ResourceVersion != l.cur.ResourceVersion ||
 			(op.Record.UID != "" && op.Record.UID != l.cur.UID) || l.injectConflict() {
-			res.Err = elect.ErrConflict
+			res.Err = control.ErrConflict
 
 			return res
 		}
@@ -496,7 +495,7 @@ func (l *LeaseServer) injectConflict() bool {
 	return l.cfg.ConflictPPM > 0 && l.rng.Uint32N(1_000_000) < l.cfg.ConflictPPM
 }
 
-func (l *LeaseServer) write(now int64, member uint32, kind elect.OpKind, r elect.Record) elect.Record {
+func (l *LeaseServer) write(now int64, member uint32, kind control.OpKind, r control.Record) control.Record {
 	l.rv++
 	r.ResourceVersion = strconv.FormatUint(l.rv, 10)
 	l.exists, l.cur = true, r
@@ -511,7 +510,7 @@ func (l *LeaseServer) write(now int64, member uint32, kind elect.OpKind, r elect
 // Submit executes op after a random latency on behalf of member and passes
 // the result to done. The operation takes effect at the server at the
 // midpoint of the latency, and the response arrives at the end.
-func (l *LeaseServer) Submit(member uint32, op elect.Op, done func(elect.Result)) {
+func (l *LeaseServer) Submit(member uint32, op control.Op, done func(control.Result)) {
 	lat := l.cfg.Latency + l.rng.Int64N(l.cfg.Jitter+1)
 	l.sim.After(lat/2, func() {
 		res := l.Do(member, op, l.sim.Now())

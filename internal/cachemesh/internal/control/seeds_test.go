@@ -1,15 +1,13 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-package node
+package control
 
 import (
 	"math/rand/v2"
 	"slices"
 	"testing"
 	"time"
-
-	"github.com/Azure/unbounded/internal/cachemesh/internal/elect"
 )
 
 func TestSeedsAccessor(t *testing.T) {
@@ -27,7 +25,7 @@ func TestSeedsAccessor(t *testing.T) {
 		t.Fatal("no lease read")
 	}
 
-	n.OnLease(2, time.Now(), elect.Result{Seq: ops[0].Seq, Kind: ops[0].Kind, Record: elect.Record{
+	n.OnLease(2, time.Now(), Result{Seq: ops[0].Seq, Kind: ops[0].Kind, Record: Record{
 		Holder: "l", Addr: "l:1", Seeds: []string{"x:1", "a:1"},
 	}})
 

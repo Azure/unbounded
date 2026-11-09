@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-package leader
+package control
 
 import (
 	"math/rand/v2"
@@ -9,15 +9,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Azure/unbounded/internal/cachemesh/internal/control"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view/viewtest"
 )
 
-const sec = int64(time.Second)
-
-// harness applies the leader's deltas to a view on a simulated clock.
-type harness struct {
+// leaderHarness applies the leader's deltas to a view on a simulated clock.
+type leaderHarness struct {
 	tb   testing.TB
 	l    *Leader
 	v    *view.View
@@ -25,27 +22,27 @@ type harness struct {
 	term uint64
 }
 
-func smallCfg(id string) Config {
-	return Config{Self: Member{ID: id, Incarnation: 1, Addr: id + ":1"}, PartitionBits: 10}
+func smallCfg(id string) LeaderConfig {
+	return LeaderConfig{Self: Joiner{ID: id, Incarnation: 1, Addr: id + ":1"}, PartitionBits: 10}
 }
 
-func newHarness(tb testing.TB, cfg Config, v *view.View) *harness {
+func newLeaderHarness(tb testing.TB, cfg LeaderConfig, v *view.View) *leaderHarness {
 	tb.Helper()
 
 	if v == nil {
 		v = view.Genesis()
 	}
 
-	return &harness{tb: tb, l: New(cfg, rand.New(rand.NewPCG(1, 2))), v: v, now: 100 * sec}
+	return &leaderHarness{tb: tb, l: NewLeader(cfg, rand.New(rand.NewPCG(1, 2))), v: v, now: 100 * sec}
 }
 
-func (h *harness) epochNow() uint64 {
+func (h *leaderHarness) epochNow() uint64 {
 	return max(h.v.Epoch(), uint64(h.now/int64(h.l.cfg.EpochPeriod)))
 }
 
 // tick runs one leader tick, applies the delta, validates the result, and
 // returns the ops (nil when there was nothing to do).
-func (h *harness) tick(newTerm uint64) []view.Op {
+func (h *leaderHarness) tick(newTerm uint64) []view.Op {
 	h.tb.Helper()
 
 	ops := h.l.Tick(h.now, h.epochNow(), h.v, newTerm)
@@ -60,24 +57,24 @@ func (h *harness) tick(newTerm uint64) []view.Op {
 	return ops
 }
 
-func (h *harness) apply(ops []view.Op) {
+func (h *leaderHarness) apply(ops []view.Op) {
 	h.tb.Helper()
 
 	d := view.NewDelta(h.v, ops...)
 
 	nv, err := view.Apply(h.v, d)
 	if err != nil {
-		h.tb.Fatalf("apply %v: %v", kinds(ops), err)
+		h.tb.Fatalf("apply %v: %v", opKinds(ops), err)
 	}
 
 	if err := view.Validate(nv); err != nil {
-		h.tb.Fatalf("validate after %v: %v", kinds(ops), err)
+		h.tb.Fatalf("validate after %v: %v", opKinds(ops), err)
 	}
 
 	h.v = nv
 }
 
-func kinds(ops []view.Op) []string {
+func opKinds(ops []view.Op) []string {
 	out := make([]string, len(ops))
 	for i, op := range ops {
 		out[i] = op.Kind.String()
@@ -99,7 +96,7 @@ func count(ops []view.Op, k view.OpKind) int {
 }
 
 // run ticks every second for d.
-func (h *harness) run(d time.Duration) {
+func (h *leaderHarness) run(d time.Duration) {
 	h.tb.Helper()
 
 	for end := h.now + int64(d); h.now < end; {
@@ -108,28 +105,28 @@ func (h *harness) run(d time.Duration) {
 	}
 }
 
-func (h *harness) bootstrap() {
+func (h *leaderHarness) bootstrap() {
 	h.tb.Helper()
 
 	h.term++
 	h.tick(h.term)
 }
 
-func member(i int) Member {
+func member(i int) Joiner {
 	id := "m" + strconv.Itoa(i)
 
-	return Member{ID: id, Incarnation: 7, Addr: id + ":1", Zone: "z"}
+	return Joiner{ID: id, Incarnation: 7, Addr: id + ":1", Zone: "z"}
 }
 
-func (h *harness) settled() bool {
-	pm := make([]control.Member, 0, h.v.Len())
+func (h *leaderHarness) settled() bool {
+	pm := make([]PlanMember, 0, h.v.Len())
 	h.v.ForEachMember(func(s view.Slot, m *view.Member) bool {
-		pm = append(pm, control.Member{Slot: s, Key: m.Key, Weight: m.Weight, Cell: m.Cell})
+		pm = append(pm, PlanMember{Slot: s, Key: m.Key, Weight: m.Weight, Cell: m.Cell})
 
 		return true
 	})
 
-	ok, err := control.NewPlanner(control.Config{}).Settled(h.v.Table(), pm)
+	ok, err := NewPlanner(PlannerConfig{}).Settled(h.v.Table(), pm)
 	if err != nil {
 		h.tb.Fatal(err)
 	}
@@ -137,7 +134,7 @@ func (h *harness) settled() bool {
 	return ok
 }
 
-func (h *harness) cellsBalanced() bool {
+func (h *leaderHarness) cellsBalanced() bool {
 	sh := h.v.Shape()
 	lo, hi := h.v.Len(), 0
 
@@ -150,10 +147,10 @@ func (h *harness) cellsBalanced() bool {
 }
 
 func TestBootstrap(t *testing.T) {
-	h := newHarness(t, smallCfg("a"), nil)
+	h := newLeaderHarness(t, smallCfg("a"), nil)
 
 	if ops := h.l.Tick(h.now, 0, h.v, 0); ops != nil {
-		t.Fatalf("ops without a term on an unconfigured view: %v", kinds(ops))
+		t.Fatalf("ops without a term on an unconfigured view: %v", opKinds(ops))
 	}
 
 	h.bootstrap()
@@ -173,17 +170,17 @@ func TestBootstrap(t *testing.T) {
 
 	// Nothing else to do until the epoch advances.
 	if ops := h.tick(0); ops != nil {
-		t.Fatalf("idle tick produced %v", kinds(ops))
+		t.Fatalf("idle tick produced %v", opKinds(ops))
 	}
 
 	h.now += int64(DefaultEpochPeriod)
 	if ops := h.tick(0); count(ops, view.KindEpoch) != 1 {
-		t.Fatalf("epoch heartbeat missing: %v", kinds(ops))
+		t.Fatalf("epoch heartbeat missing: %v", opKinds(ops))
 	}
 }
 
 func TestJoinQuarantineWarmup(t *testing.T) {
-	h := newHarness(t, smallCfg("a"), nil)
+	h := newLeaderHarness(t, smallCfg("a"), nil)
 	h.bootstrap()
 
 	for i := range 5 {
@@ -207,7 +204,7 @@ func TestJoinQuarantineWarmup(t *testing.T) {
 	h.now += sec
 
 	if ops := h.tick(0); count(ops, view.KindAddMember) != 0 {
-		t.Fatalf("readmitted: %v", kinds(ops))
+		t.Fatalf("readmitted: %v", opKinds(ops))
 	}
 
 	h.run(DefaultQuarantineFor)
@@ -243,7 +240,7 @@ func TestJoinQuarantineWarmup(t *testing.T) {
 func TestJoinCap(t *testing.T) {
 	cfg := smallCfg("a")
 	cfg.MaxJoinsPerTick = 3
-	h := newHarness(t, cfg, nil)
+	h := newLeaderHarness(t, cfg, nil)
 	h.bootstrap()
 
 	for i := range 7 {
@@ -262,8 +259,8 @@ func TestJoinQueueBound(t *testing.T) {
 	cfg := smallCfg("a")
 	cfg.MaxPending = 2
 	drops := 0
-	l := New(cfg, nil)
-	l.SetHooks(Hooks{OnDrop: func(string) { drops++ }})
+	l := NewLeader(cfg, nil)
+	l.SetHooks(LeaderHooks{OnDrop: func(string) { drops++ }})
 
 	for i := range 4 {
 		l.Join(0, member(i))
@@ -275,7 +272,7 @@ func TestJoinQueueBound(t *testing.T) {
 		t.Fatalf("pending %d drops %d", j, drops)
 	}
 
-	l.Join(0, Member{}) // invalid
+	l.Join(0, Joiner{}) // invalid
 
 	if j, _, _, _ := l.Pending(); j != 2 {
 		t.Fatalf("invalid join queued")
@@ -283,7 +280,7 @@ func TestJoinQueueBound(t *testing.T) {
 }
 
 func TestRejoinReplacesIncarnation(t *testing.T) {
-	h := newHarness(t, smallCfg("a"), nil)
+	h := newLeaderHarness(t, smallCfg("a"), nil)
 	h.bootstrap()
 	h.l.Join(h.now, member(1))
 	h.run(2 * time.Minute)
@@ -300,7 +297,7 @@ func TestRejoinReplacesIncarnation(t *testing.T) {
 	ops := h.tick(0)
 
 	if count(ops, view.KindRemoveMember) != 1 || count(ops, view.KindAddMember) != 1 || count(ops, view.KindAssign) != 1 {
-		t.Fatalf("ops %v", kinds(ops))
+		t.Fatalf("ops %v", opKinds(ops))
 	}
 
 	s, _ := h.v.Lookup("m1")
@@ -311,16 +308,16 @@ func TestRejoinReplacesIncarnation(t *testing.T) {
 	}
 
 	// The leader's own ID from another process is never admitted.
-	h.l.Join(h.now, Member{ID: "a", Incarnation: 99})
+	h.l.Join(h.now, Joiner{ID: "a", Incarnation: 99})
 	h.now += sec
 
 	if ops := h.tick(0); count(ops, view.KindAddMember) != 0 {
-		t.Fatalf("admitted own ID: %v", kinds(ops))
+		t.Fatalf("admitted own ID: %v", opKinds(ops))
 	}
 }
 
 func TestLeaveDrain(t *testing.T) {
-	h := newHarness(t, smallCfg("a"), nil)
+	h := newLeaderHarness(t, smallCfg("a"), nil)
 	h.bootstrap()
 
 	for i := range 3 {
@@ -369,11 +366,11 @@ func TestLeaveDrain(t *testing.T) {
 	}
 }
 
-// grow builds a cluster of n members through the leader and lets it settle.
-func grow(t *testing.T, cfg Config, n int) *harness {
+// growLeader builds a cluster of n members through the leader and lets it settle.
+func growLeader(t *testing.T, cfg LeaderConfig, n int) *leaderHarness {
 	t.Helper()
 
-	h := newHarness(t, cfg, nil)
+	h := newLeaderHarness(t, cfg, nil)
 	h.bootstrap()
 
 	for i := range n - 1 {
@@ -390,7 +387,7 @@ func grow(t *testing.T, cfg Config, n int) *harness {
 }
 
 func TestSuspicionRemoval(t *testing.T) {
-	h := grow(t, smallCfg("a"), 40)
+	h := growLeader(t, smallCfg("a"), 40)
 
 	if h.v.Shape().Cells() < 4 {
 		t.Fatalf("shape %v", h.v.Shape().Sizes())
@@ -449,7 +446,7 @@ func TestSuspicionRemoval(t *testing.T) {
 	ops := h.tick(0)
 
 	if h.v.IsMember(target) || count(ops, view.KindAssign) != 1 {
-		t.Fatalf("not removed: %v", kinds(ops))
+		t.Fatalf("not removed: %v", opKinds(ops))
 	}
 
 	// Expired reports do not count.
@@ -485,10 +482,10 @@ func contains(s []view.Slot, x view.Slot) bool {
 func TestSuspicionDamping(t *testing.T) {
 	cfg := smallCfg("a")
 	cfg.CellSize = 2
-	h := grow(t, cfg, 60)
+	h := growLeader(t, cfg, 60)
 	damped := 0
 
-	h.l.SetHooks(Hooks{OnDamped: func(int, int) { damped++ }})
+	h.l.SetHooks(LeaderHooks{OnDamped: func(int, int) { damped++ }})
 
 	// Suspect 10 of 60 members (more than 10%), each fully observed.
 	suspectAll := func() {
@@ -516,8 +513,8 @@ func TestSuspicionDamping(t *testing.T) {
 func TestReshapeOnGrowth(t *testing.T) {
 	reshapes := 0
 	cfg := smallCfg("a")
-	h := newHarness(t, cfg, nil)
-	h.l.SetHooks(Hooks{OnReshape: func(_, _ view.Shape) { reshapes++ }})
+	h := newLeaderHarness(t, cfg, nil)
+	h.l.SetHooks(LeaderHooks{OnReshape: func(_, _ view.Shape) { reshapes++ }})
 	h.bootstrap()
 
 	for i := range 99 {
@@ -536,7 +533,7 @@ func TestReshapeOnGrowth(t *testing.T) {
 }
 
 func TestCellBalance(t *testing.T) {
-	h := grow(t, smallCfg("a"), 64)
+	h := growLeader(t, smallCfg("a"), 64)
 
 	// Unbalance: move several members into cell 0 by hand.
 	var ops []view.Op
@@ -559,7 +556,7 @@ func TestCellBalance(t *testing.T) {
 }
 
 func TestFailoverContinuity(t *testing.T) {
-	h := newHarness(t, smallCfg("a"), nil)
+	h := newLeaderHarness(t, smallCfg("a"), nil)
 	h.bootstrap()
 
 	for i := range 8 {
@@ -569,14 +566,14 @@ func TestFailoverContinuity(t *testing.T) {
 	h.run(3 * time.Second)
 
 	// Hand over to m3 (a member) mid-quarantine.
-	h.l = New(Config{Self: member(3), PartitionBits: 10}, nil)
+	h.l = NewLeader(LeaderConfig{Self: member(3), PartitionBits: 10}, nil)
 	h.term++
 	h.now += sec
 	ops := h.tick(h.term)
 
 	s3, _ := h.v.Lookup("m3")
 	if ops[0].Kind != view.KindNewTerm || ops[0].Slot != s3 || h.v.Leader() != s3 {
-		t.Fatalf("ops %v leader %d", kinds(ops), h.v.Leader())
+		t.Fatalf("ops %v leader %d", opKinds(ops), h.v.Leader())
 	}
 
 	h.run(3 * time.Minute)
@@ -594,11 +591,11 @@ func TestFailoverContinuity(t *testing.T) {
 	})
 
 	// A non-member leader admits itself in the NewTerm delta.
-	outsider := Member{ID: "z", Incarnation: 3, Addr: "z:1"}
-	h.l = New(Config{Self: outsider, PartitionBits: 10}, nil)
+	outsider := Joiner{ID: "z", Incarnation: 3, Addr: "z:1"}
+	h.l = NewLeader(LeaderConfig{Self: outsider, PartitionBits: 10}, nil)
 
 	if early := h.l.Tick(h.now, h.epochNow(), h.v, 0); early != nil {
-		t.Fatalf("non-member published outside a term start: %v", kinds(early))
+		t.Fatalf("non-member published outside a term start: %v", opKinds(early))
 	}
 
 	h.term++
@@ -607,23 +604,23 @@ func TestFailoverContinuity(t *testing.T) {
 
 	sz, ok := h.v.Lookup("z")
 	if !ok || h.v.Leader() != sz || count(ops, view.KindAddMember) != 1 {
-		t.Fatalf("outsider not admitted: %v", kinds(ops))
+		t.Fatalf("outsider not admitted: %v", opKinds(ops))
 	}
 
 	// A restarted leader process (new incarnation) replaces its old record.
 	outsider.Incarnation = 4
-	h.l = New(Config{Self: outsider, PartitionBits: 10}, nil)
+	h.l = NewLeader(LeaderConfig{Self: outsider, PartitionBits: 10}, nil)
 	h.term++
 	h.now += sec
 	ops = h.tick(h.term)
 
 	if count(ops, view.KindRemoveMember) != 1 || h.v.Key(h.v.Leader()) != view.MemberKey("z", 4) {
-		t.Fatalf("restart: %v", kinds(ops))
+		t.Fatalf("restart: %v", opKinds(ops))
 	}
 }
 
 func TestInvalidate(t *testing.T) {
-	h := newHarness(t, smallCfg("a"), nil)
+	h := newLeaderHarness(t, smallCfg("a"), nil)
 	h.bootstrap()
 	h.l.Invalidate(42)
 	h.l.Invalidate(42)
@@ -662,7 +659,7 @@ func TestConvergenceProperty(t *testing.T) {
 			cfg.MaxCellMovesPerTick = 1 + r.IntN(8)
 			cfg.MaxMoves = 1 + r.IntN(300)
 			cfg.MaxJoinsPerTick = 1 + r.IntN(40)
-			h := newHarness(t, cfg, nil)
+			h := newLeaderHarness(t, cfg, nil)
 			h.bootstrap()
 
 			next := 0
@@ -710,7 +707,7 @@ func TestConvergenceProperty(t *testing.T) {
 			}
 
 			if ops := h.l.Tick(h.now, h.epochNow(), h.v, 0); ops != nil {
-				t.Fatalf("not quiescent: %v", kinds(ops))
+				t.Fatalf("not quiescent: %v", opKinds(ops))
 			}
 		})
 	}
@@ -722,11 +719,11 @@ func TestLargeChurn(t *testing.T) {
 	}
 
 	v := viewtest.Build(t, 10000, viewtest.Options{Seed: 3})
-	cfg := Config{Self: Member{ID: "x"}, PartitionBits: v.PartitionBits()}
+	cfg := LeaderConfig{Self: Joiner{ID: "x"}, PartitionBits: v.PartitionBits()}
 	// Slot 0 is the viewtest leader; take over as its identity.
 	m0, _ := v.Member(0)
-	cfg.Self = Member{ID: m0.ID, Incarnation: m0.Incarnation, Addr: m0.Addr}
-	h := newHarness(t, cfg, v)
+	cfg.Self = Joiner{ID: m0.ID, Incarnation: m0.Incarnation, Addr: m0.Addr}
+	h := newLeaderHarness(t, cfg, v)
 	h.term = v.Term()
 
 	h.term++
@@ -756,7 +753,7 @@ func TestLargeChurn(t *testing.T) {
 func benchTick(b *testing.B, n int, churn bool) {
 	v := viewtest.Build(b, n, viewtest.Options{Seed: 3})
 	m0, _ := v.Member(0)
-	l := New(Config{Self: Member{ID: m0.ID, Incarnation: m0.Incarnation}, PartitionBits: v.PartitionBits()}, nil)
+	l := NewLeader(LeaderConfig{Self: Joiner{ID: m0.ID, Incarnation: m0.Incarnation}, PartitionBits: v.PartitionBits()}, nil)
 	now := 1000 * sec
 	ep := v.Epoch()
 
@@ -811,7 +808,7 @@ func BenchmarkTickJoin100k(b *testing.B) { benchTick(b, 100000, true) }
 // other: the suspected observer's cell does not count towards the cells
 // required.
 func TestSuspicionMutualObservers(t *testing.T) {
-	h := grow(t, smallCfg("a"), 40)
+	h := growLeader(t, smallCfg("a"), 40)
 	v := h.v
 
 	cellsOf := func(slots []view.Slot) map[uint32]int {
@@ -876,7 +873,7 @@ func TestOpBudget(t *testing.T) {
 
 	v := viewtest.Build(t, n, viewtest.Options{Seed: 5, Joining: n - 100, PartitionBits: 12})
 	m0, _ := v.Member(0)
-	h := newHarness(t, Config{Self: Member{ID: m0.ID, Incarnation: m0.Incarnation}, PartitionBits: 12}, v)
+	h := newLeaderHarness(t, LeaderConfig{Self: Joiner{ID: m0.ID, Incarnation: m0.Incarnation}, PartitionBits: 12}, v)
 	h.now = 1000 * sec
 
 	ops := h.tick(0)

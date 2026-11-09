@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-package elect
+package control
 
 import (
 	"testing"
@@ -17,12 +17,12 @@ func TestObserveTermRaisesNextTerm(t *testing.T) {
 	s := &memStore{}
 	s.store(Record{Holder: "", Term: 0})
 
-	h := newHarness(t, s, 0)
+	h := newElectHarness(t, s, 0)
 	h.in.ViewTerm = 3
 	h.e.ObserveTerm(1<<32 + 3)
-	h.run(sec(1))
+	h.run(secs(1))
 
-	if h.e.State() != Leader || h.e.Term() != 1<<32+4 {
+	if h.e.State() != StateLeader || h.e.Term() != 1<<32+4 {
 		t.Fatalf("state %v term %d", h.e.State(), h.e.Term())
 	}
 }
@@ -35,13 +35,13 @@ func TestObserveTermIgnoresAbsurd(t *testing.T) {
 	s := &memStore{}
 	s.store(Record{Holder: "", Term: ^uint64(0)})
 
-	h := newHarness(t, s, 0)
+	h := newElectHarness(t, s, 0)
 	h.in.ViewTerm = 5
 	h.e.ObserveTerm(MaxSaneTerm)
 	h.e.ObserveTerm(^uint64(0))
-	h.run(sec(1))
+	h.run(secs(1))
 
-	if h.e.State() != Leader || h.e.Term() != 6 {
+	if h.e.State() != StateLeader || h.e.Term() != 6 {
 		t.Fatalf("state %v term %d", h.e.State(), h.e.Term())
 	}
 
@@ -57,10 +57,10 @@ func TestReleaseCarriesObservedTerm(t *testing.T) {
 	t.Parallel()
 
 	s := &memStore{}
-	h := newHarness(t, s, 0)
-	h.run(sec(1))
+	h := newElectHarness(t, s, 0)
+	h.run(secs(1))
 
-	if h.e.State() != Leader {
+	if h.e.State() != StateLeader {
 		t.Fatal("not leader")
 	}
 
@@ -74,10 +74,10 @@ func TestReleaseCarriesObservedTerm(t *testing.T) {
 		t.Fatalf("record %+v", s.rec)
 	}
 
-	h2 := newHarness(t, s, 1)
-	h2.run(sec(1))
+	h2 := newElectHarness(t, s, 1)
+	h2.run(secs(1))
 
-	if h2.e.State() != Leader || h2.e.Term() != 41 {
+	if h2.e.State() != StateLeader || h2.e.Term() != 41 {
 		t.Fatalf("next leader %v term %d", h2.e.State(), h2.e.Term())
 	}
 }
@@ -94,11 +94,11 @@ func TestLotteryNFloor(t *testing.T) {
 		s := &memStore{}
 		s.store(Record{Holder: "other", Incarnation: 1, Term: 9, RenewTime: epoch.Add(time.Hour), LeaseDuration: time.Hour})
 
-		e := New(Config{ExpectedClusterSize: 1000}, self(i), newRNG(uint64(i)))
+		e := NewElector(ElectionConfig{ExpectedClusterSize: 1000}, self(i), newRNG(uint64(i)))
 		in := Input{Wall: epoch, HaveView: true, ClusterSize: 5, ViewTerm: 9}
 
 		for r := range 200 {
-			in.Now = sec(60 + float64(r))
+			in.Now = secs(60 + float64(r))
 			for _, op := range e.Tick(in) {
 				reads++
 

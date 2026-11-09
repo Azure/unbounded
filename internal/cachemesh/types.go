@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/Azure/unbounded/internal/cachemesh/internal/elect"
+	"github.com/Azure/unbounded/internal/cachemesh/internal/control"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/route"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
 )
@@ -37,9 +37,9 @@ type (
 // Lease types. kubelease.Store implements LeaseStore.
 type (
 	// LeaseStore executes Lease operations for leader election.
-	LeaseStore = elect.Store
+	LeaseStore = control.Store
 	// LeaseRecord is the cachemesh view of the leader Lease.
-	LeaseRecord = elect.Record
+	LeaseRecord = control.Record
 )
 
 // Decision kinds.
@@ -95,10 +95,10 @@ var (
 	ErrTTLExhausted = route.ErrTTLExhausted
 	// ErrLeaseNotFound is what a LeaseStore returns when the Lease does not
 	// exist.
-	ErrLeaseNotFound = elect.ErrNotFound
+	ErrLeaseNotFound = control.ErrNotFound
 	// ErrLeaseConflict is what a LeaseStore returns on a failed
 	// compare-and-swap or a create of an existing Lease.
-	ErrLeaseConflict = elect.ErrConflict
+	ErrLeaseConflict = control.ErrConflict
 )
 
 // ParseHeader decodes a header from b.

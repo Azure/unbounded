@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package elect is the cachemesh leader election state machine.
+// Leader election. This file is the cachemesh leader election state machine.
 //
 // # Design
 //
@@ -89,7 +89,8 @@
 // abandoned an Update whose result was lost) may be retaken immediately,
 // because the only process that could publish under it is this one, and it is
 // not publishing.
-package elect
+
+package control
 
 import (
 	"errors"
@@ -101,8 +102,8 @@ import (
 	"time"
 )
 
-// Config tunes the Elector. Zero values select defaults.
-type Config struct {
+// ElectionConfig tunes the Elector. Zero values select defaults.
+type ElectionConfig struct {
 	// LeaseDuration is how long a record stays valid after a renewal.
 	// Default 15s.
 	LeaseDuration time.Duration
@@ -161,7 +162,7 @@ const (
 )
 
 // WithDefaults returns c with zero fields replaced by defaults.
-func (c Config) WithDefaults() Config {
+func (c ElectionConfig) WithDefaults() ElectionConfig {
 	setDur := func(v *time.Duration, d time.Duration) {
 		if *v == 0 {
 			*v = d
@@ -191,7 +192,7 @@ func (c Config) WithDefaults() Config {
 }
 
 // Validate checks c after defaults are applied.
-func (c Config) Validate() error {
+func (c ElectionConfig) Validate() error {
 	c = c.WithDefaults()
 
 	switch {
@@ -221,27 +222,27 @@ type Self struct {
 	Addr string
 }
 
-// State is the elector state.
-type State uint8
+// ElectorState is the elector state.
+type ElectorState uint8
 
 // States.
 const (
-	Follower State = iota
-	Candidate
-	Leader
-	Lottery
+	StateFollower ElectorState = iota
+	StateCandidate
+	StateLeader
+	StateLottery
 )
 
 // String returns the state name.
-func (s State) String() string {
+func (s ElectorState) String() string {
 	switch s {
-	case Follower:
+	case StateFollower:
 		return "follower"
-	case Candidate:
+	case StateCandidate:
 		return "candidate"
-	case Leader:
+	case StateLeader:
 		return "leader"
-	case Lottery:
+	case StateLottery:
 		return "lottery"
 	default:
 		return "unknown"
@@ -330,9 +331,9 @@ type Event struct {
 	Record Record
 }
 
-// Hooks observe the Elector for metrics and coverage. Nil fields are skipped.
-type Hooks struct {
-	OnState func(from, to State)
+// ElectorHooks observe the Elector for metrics and coverage. Nil fields are skipped.
+type ElectorHooks struct {
+	OnState func(from, to ElectorState)
 	OnOp    func(kind OpKind)
 }
 
@@ -347,12 +348,12 @@ const (
 
 // Elector is the election state machine. It is not safe for concurrent use.
 type Elector struct {
-	cfg   Config
+	cfg   ElectionConfig
 	self  Self
 	rng   *rand.Rand
-	hooks Hooks
+	hooks ElectorHooks
 
-	state   State
+	state   ElectorState
 	started bool
 	startAt int64
 
@@ -385,9 +386,9 @@ type Elector struct {
 	events []Event
 }
 
-// New returns an Elector. It panics if cfg is invalid (see Config.Validate)
+// NewElector returns an Elector. It panics if cfg is invalid (see Config.Validate)
 // or rng is nil.
-func New(cfg Config, self Self, rng *rand.Rand) *Elector {
+func NewElector(cfg ElectionConfig, self Self, rng *rand.Rand) *Elector {
 	if err := cfg.Validate(); err != nil {
 		panic(err)
 	}
@@ -404,14 +405,14 @@ func New(cfg Config, self Self, rng *rand.Rand) *Elector {
 }
 
 // SetHooks installs hooks.
-func (e *Elector) SetHooks(h Hooks) { e.hooks = h }
+func (e *Elector) SetHooks(h ElectorHooks) { e.hooks = h }
 
 // State returns the current state.
-func (e *Elector) State() State { return e.state }
+func (e *Elector) State() ElectorState { return e.state }
 
 // Term returns the term while leader, 0 otherwise.
 func (e *Elector) Term() uint64 {
-	if e.state != Leader {
+	if e.state != StateLeader {
 		return 0
 	}
 
@@ -438,7 +439,7 @@ func (e *Elector) Events() []Event {
 // CanPublish reports whether the member is leader and may publish at local
 // monotonic time now. It does not change state; Tick does.
 func (e *Elector) CanPublish(now int64) bool {
-	return e.state == Leader && now-e.anchor < int64(e.cfg.RenewDeadline)
+	return e.state == StateLeader && now-e.anchor < int64(e.cfg.RenewDeadline)
 }
 
 func jitter(rng *rand.Rand, d int64, percent int) int64 {
@@ -454,7 +455,7 @@ func (e *Elector) retryAt(now int64) int64 {
 	return now + p + jitter(e.rng, p, e.cfg.RetryJitterPercent)
 }
 
-func (e *Elector) setState(to State) {
+func (e *Elector) setState(to ElectorState) {
 	if e.state == to {
 		return
 	}
@@ -470,7 +471,7 @@ func (e *Elector) setState(to State) {
 func (e *Elector) stepDown(reason LostReason) {
 	e.events = append(e.events, Event{Kind: Lost, Term: e.term, Reason: reason})
 	e.outstanding = false
-	e.setState(Follower)
+	e.setState(StateFollower)
 }
 
 func (e *Elector) issue(now int64, kind OpKind, purpose opPurpose, r Record) []Op {
@@ -510,17 +511,17 @@ func LotteryP64(qps int, round time.Duration, n int) uint64 {
 	return q
 }
 
-func (e *Elector) desiredState(in Input) State {
+func (e *Elector) desiredState(in Input) ElectorState {
 	if in.IsCandidate {
-		return Candidate
+		return StateCandidate
 	}
 
 	heard := max(in.LeaderHeardAt, e.startAt)
 	if !in.HaveView || in.Now-heard > int64(e.cfg.NoLeaderTimeout)+e.lotteryJitter {
-		return Lottery
+		return StateLottery
 	}
 
-	return Follower
+	return StateFollower
 }
 
 // Tick advances the Elector to in.Now and returns at most one Op to execute.
@@ -534,7 +535,7 @@ func (e *Elector) Tick(in Input) []Op {
 		e.outstanding = false
 	}
 
-	if e.state == Leader {
+	if e.state == StateLeader {
 		if !e.CanPublish(in.Now) {
 			e.stepDown(LostDeadline)
 		} else {
@@ -550,11 +551,11 @@ func (e *Elector) Tick(in Input) []Op {
 
 	to := e.desiredState(in)
 	if to != e.state {
-		if to == Lottery {
+		if to == StateLottery {
 			e.roundDone = false
 		}
 
-		if to == Candidate {
+		if to == StateCandidate {
 			e.nextOpAt = in.Now
 		}
 
@@ -566,7 +567,7 @@ func (e *Elector) Tick(in Input) []Op {
 	}
 
 	switch e.state {
-	case Candidate:
+	case StateCandidate:
 		if in.Now < e.nextOpAt {
 			return nil
 		}
@@ -579,7 +580,7 @@ func (e *Elector) Tick(in Input) []Op {
 		e.nextOpAt = e.retryAt(in.Now)
 
 		return e.issue(in.Now, OpGet, purposeRead, Record{})
-	case Lottery:
+	case StateLottery:
 		if e.takeNow {
 			e.takeNow = false
 			return e.acquire(in, e.observed, e.observedNotFound)
@@ -730,7 +731,7 @@ func (e *Elector) MaxTerm() uint64 { return max(e.maxTerm, e.term) }
 // the lottery and declined) let a fresh member bootstrap a second cluster
 // next to the existing one.
 func (e *Elector) Release(in Input) []Op {
-	if e.state != Leader {
+	if e.state != StateLeader {
 		return nil
 	}
 
@@ -751,7 +752,7 @@ func (e *Elector) Release(in Input) []Op {
 
 	ops := e.issue(in.Now, OpUpdate, purposeRelease, r)
 	e.events = append(e.events, Event{Kind: Lost, Term: e.term, Reason: LostReleased})
-	e.setState(Follower)
+	e.setState(StateFollower)
 
 	return ops
 }
@@ -811,7 +812,7 @@ func (e *Elector) OnResult(in Input, res Result) {
 }
 
 func (e *Elector) onRenew(in Input, res Result) {
-	if e.state != Leader {
+	if e.state != StateLeader {
 		return
 	}
 
@@ -849,13 +850,13 @@ func (e *Elector) onAcquire(in Input, res Result) {
 	e.anchor = e.outSentAt
 	e.noteHolder(res.Record)
 	e.haveObserved = false
-	e.setState(Leader)
+	e.setState(StateLeader)
 	e.events = append(e.events, Event{Kind: Acquired, Term: e.term})
 	e.nextOpAt = e.retryAt(in.Now)
 }
 
 func (e *Elector) onRead(in Input, res Result) {
-	if e.state != Candidate && e.state != Lottery {
+	if e.state != StateCandidate && e.state != StateLottery {
 		return
 	}
 
@@ -886,7 +887,7 @@ func (e *Elector) onRead(in Input, res Result) {
 	ld := max(r.LeaseDuration, e.cfg.LeaseDuration)
 	self := r.Holder == e.self.ID && r.Incarnation == e.self.Incarnation
 
-	if e.state == Lottery {
+	if e.state == StateLottery {
 		live := r.Holder != "" && in.Wall.Before(r.RenewTime.Add(ld+e.cfg.ClockSkewAllowance))
 		if live {
 			e.noteHolder(r)

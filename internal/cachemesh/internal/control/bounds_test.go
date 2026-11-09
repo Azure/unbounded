@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-package leader
+package control
 
 import (
 	"testing"
@@ -14,7 +14,7 @@ import (
 func TestInputQueuesBounded(t *testing.T) {
 	cfg := smallCfg("a")
 	cfg.MaxPending = 8
-	l := New(cfg, nil)
+	l := NewLeader(cfg, nil)
 
 	for i := range 10_000 {
 		l.Join(0, member(i))

@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-package node
+package control
 
 import (
 	"bytes"
@@ -12,9 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Azure/unbounded/internal/cachemesh/internal/elect"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/wire"
 )
 
 // fuzzFixture is a small real cluster's history: a view, the deltas
@@ -130,20 +128,20 @@ func (r *fuzzReader) mutate(b []byte) []byte {
 	return b
 }
 
-func (r *fuzzReader) ref() wire.MemberRef {
+func (r *fuzzReader) ref() MemberRef {
 	i := int(r.u8()) % (len(fixture.ids) + 1)
 	if i == len(fixture.ids) {
-		return wire.MemberRef{ID: string(r.bytes(int(r.u8() % 16))), Incarnation: r.u64(), Slot: view.Slot(r.u8())}
+		return MemberRef{ID: string(r.bytes(int(r.u8() % 16))), Incarnation: r.u64(), Slot: view.Slot(r.u8())}
 	}
 
-	return wire.MemberRef{ID: fixture.ids[i], Incarnation: fixture.incs[i], Slot: view.Slot(r.u8() % 8)}
+	return MemberRef{ID: fixture.ids[i], Incarnation: fixture.incs[i], Slot: view.Slot(r.u8() % 8)}
 }
 
 // message builds a mostly valid control message from fuzz bytes.
 func (r *fuzzReader) message() []byte {
-	var m wire.Message
+	var m Message
 
-	m.Kind = wire.Kind(1 + r.u8()%16)
+	m.Kind = Kind(1 + r.u8()%16)
 	m.From = r.ref()
 	m.Version = view.Version{Term: r.term(), Seq: uint64(r.u8())}
 	m.Epoch = uint64(r.u8())
@@ -154,15 +152,15 @@ func (r *fuzzReader) message() []byte {
 	}
 
 	switch m.Kind {
-	case wire.KindBroadcast:
+	case KindBroadcast:
 		m.Level = int8(r.u8()%6) - 2
 		if len(fixture.deltas) > 0 {
 			m.Delta = r.mutate(fixture.deltas[int(r.u8())%len(fixture.deltas)])
 		}
-	case wire.KindCatchUpRequest:
+	case KindCatchUpRequest:
 		m.Have = view.Version{Term: r.term(), Seq: uint64(r.u8())}
 		m.MaxDeltas = uint32(r.u8())
-	case wire.KindCatchUpResponse:
+	case KindCatchUpResponse:
 		if r.u8()%2 == 0 {
 			m.Snapshot = r.mutate(fixture.snap)
 		} else {
@@ -172,24 +170,24 @@ func (r *fuzzReader) message() []byte {
 				}
 			}
 		}
-	case wire.KindRouted:
+	case KindRouted:
 		m.Origin = r.ref()
 		m.ToLeader = r.u8()%4 != 0
 		m.TTL = r.u8() % 6
 		m.Inner = r.message()
-	case wire.KindJoin, wire.KindLeave:
+	case KindJoin, KindLeave:
 		m.Member = r.ref()
 		m.Addr = "f" + strconv.Itoa(int(r.u8()))
 		m.PartitionBits = 10 - r.u8()%2
-	case wire.KindSuspect:
+	case KindSuspect:
 		m.Target, m.Observer = r.ref(), r.ref()
-	case wire.KindInvalidate:
+	case KindInvalidate:
 		m.Seed = uint64(r.u8())
-	case wire.KindPong:
+	case KindPong:
 		m.LeaderAddr = "f" + strconv.Itoa(int(r.u8()))
 	}
 
-	return wire.Append(nil, &m)
+	return Append(nil, &m)
 }
 
 // fuzzNode starts a node in one of three states: a joiner with a seed, a
@@ -198,7 +196,7 @@ func (r *fuzzReader) message() []byte {
 func fuzzNode(state byte) (*Node, *memLease, int64) {
 	l := &memLease{}
 	now := 1000 * sec
-	cfg := Config{PartitionBits: 10, Elect: elect.Config{ExpectedClusterSize: 10}, DeltaLogSize: 32}
+	cfg := Config{PartitionBits: 10, Elect: ElectionConfig{ExpectedClusterSize: 10}, DeltaLogSize: 32}
 
 	switch state % 3 {
 	case 0:
@@ -256,7 +254,7 @@ func runFuzzOne(t *testing.T, data []byte) {
 
 		var (
 			calls  []uint64
-			ops    []elect.Op
+			ops    []Op
 			valid  = map[*view.View]bool{}
 			floods int
 		)
@@ -274,8 +272,8 @@ func runFuzzOne(t *testing.T, data []byte) {
 			}
 
 			s := n.Stats()
-			if s.Calls > MaxPendingCalls || s.Ahead > n.cfg.MaxAhead || s.Seeds > 4*elect.MaxSeeds ||
-				s.Log > n.cfg.DeltaLogSize || s.LeaseSeeds > elect.MaxSeeds {
+			if s.Calls > MaxPendingCalls || s.Ahead > n.cfg.MaxAhead || s.Seeds > 4*MaxSeeds ||
+				s.Log > n.cfg.DeltaLogSize || s.LeaseSeeds > MaxSeeds {
 				t.Fatalf("unbounded state: %+v", s)
 			}
 

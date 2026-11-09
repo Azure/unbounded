@@ -12,8 +12,8 @@ import (
 // DefaultMaxMoves is the default cap on optional moves per plan.
 const DefaultMaxMoves = 4096
 
-// Member is a cluster member as seen by the rebalancer.
-type Member struct {
+// PlanMember is a cluster member as seen by the rebalancer.
+type PlanMember struct {
 	Slot   uint32 // owner value in the table; must be unique and not NoMember
 	Key    uint64 // Member.Key, used for ranking and tie breaks
 	Weight uint32 // 0..MaxWeight; 0 means the member must own nothing
@@ -25,8 +25,8 @@ type Member struct {
 	Gone bool
 }
 
-// Config tunes the Planner. The zero value is valid.
-type Config struct {
+// PlannerConfig tunes the Planner. The zero value is valid.
+type PlannerConfig struct {
 	// MaxMoves caps optional moves per plan. Zero means DefaultMaxMoves;
 	// negative disables optional moves.
 	MaxMoves int
@@ -67,7 +67,7 @@ type Plan struct {
 //
 // After enough ticks every assignable member's load equals its target.
 type Planner struct {
-	cfg Config
+	cfg PlannerConfig
 
 	slotIdx    []int32
 	assign     []bool
@@ -87,11 +87,11 @@ type Planner struct {
 	over       heap
 	parts      []uint32
 	owners     []uint32
-	members    []Member
+	members    []PlanMember
 }
 
 // NewPlanner returns a Planner.
-func NewPlanner(cfg Config) *Planner {
+func NewPlanner(cfg PlannerConfig) *Planner {
 	return &Planner{cfg: cfg}
 }
 
@@ -108,7 +108,7 @@ func (pl *Planner) maxMoves() int {
 
 // prepare indexes members and computes targets. It returns the number of
 // assignable members.
-func (pl *Planner) prepare(p int, members []Member) (int, error) {
+func (pl *Planner) prepare(p int, members []PlanMember) (int, error) {
 	n := len(members)
 	pl.members = members
 
@@ -228,7 +228,7 @@ func (pl *Planner) owner(o uint32) int32 {
 
 // Plan computes the moves for one tick. It returns an error for duplicate or
 // NoMember slots in members.
-func (pl *Planner) Plan(t *view.Table, members []Member) (Plan, error) {
+func (pl *Planner) Plan(t *view.Table, members []PlanMember) (Plan, error) {
 	nAssign, err := pl.prepare(t.Len(), members)
 	if err != nil {
 		return Plan{}, err
@@ -395,7 +395,7 @@ func (pl *Planner) mandatoryOwner(old, p uint32) int32 {
 // Settled reports whether every assignable member's load is within one of
 // its target and no partition is owned by a non-assignable owner. It is
 // trivially true when there is nothing to assign to.
-func (pl *Planner) Settled(t *view.Table, members []Member) (bool, error) {
+func (pl *Planner) Settled(t *view.Table, members []PlanMember) (bool, error) {
 	n, err := pl.prepare(t.Len(), members)
 
 	defer func() { pl.members = nil }()
