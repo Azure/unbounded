@@ -177,6 +177,42 @@ mod adapter {
     }
 
     #[test]
+    fn budgeted_scan_rotates_past_long_lived_operations() {
+        let (sim, _environment, r) = sim_reactor(16);
+        let mut sockets = Vec::new();
+        let idle = scope();
+        let mut idle_recvs: Vec<_> = (0..10)
+            .map(|_| {
+                let (left, right) = sim.socket_pair();
+                sockets.push(left);
+                r.recv(Rc::new(right), vec![0; 1], (), &idle)
+            })
+            .collect();
+        for recv in &mut idle_recvs {
+            assert!(poll(recv).is_pending());
+        }
+        let (_left, right) = sim.socket_pair();
+        let late = scope();
+        let mut recv = r.recv(Rc::new(right), vec![0; 1], (), &late);
+        assert!(poll(&mut recv).is_pending());
+        late.cancel();
+        // Budget 4 over 11 records: a busy lane reaches the newest record
+        // within a bounded number of turns instead of rechecking the oldest.
+        let mut result = None;
+        for _ in 0..8 {
+            r.poll_budgeted(4).unwrap();
+            if let Poll::Ready(done) = poll(&mut recv) {
+                result = Some(done);
+                break;
+            }
+        }
+        assert!(matches!(result, Some(Err(Error::Canceled))));
+        for recv in &mut idle_recvs {
+            assert!(poll(recv).is_pending());
+        }
+    }
+
+    #[test]
     fn fence_matching_cancels_only_matching_scopes() {
         let (sim, _environment, r) = sim_reactor(4);
         let (_a, left) = sim.socket_pair();

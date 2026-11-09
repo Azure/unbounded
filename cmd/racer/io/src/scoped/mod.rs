@@ -55,6 +55,9 @@ pub struct Reactor<S: Scope> {
 
     records: RefCell<Vec<Rc<Record<S>>>>,
 
+    /// Round-robin position of the next budgeted scope check in `records`.
+    scan_cursor: Cell<usize>,
+
     /// Admissions of abandoned operations, released once `racer-io` reports
     /// their kernel fences.
     parked: RefCell<Vec<(IoId, Admission<S>)>>,
@@ -215,6 +218,7 @@ impl<S: Scope> Reactor<S> {
             foreign_clock: Cell::new(false),
             stopped: Cell::new(false),
             records: RefCell::new(Vec::new()),
+            scan_cursor: Cell::new(0),
             parked: RefCell::new(Vec::new()),
             reserved: RefCell::default(),
         }
@@ -814,22 +818,36 @@ impl<S: Scope> Reactor<S> {
     }
 
     /// Drop finished records and cancel up to `budget` operations whose
-    /// scope check fails. Checks run outside the records borrow.
+    /// scope check fails. Only in-flight operations whose check is not
+    /// covered by the ring (polled checks or a foreign clock) are checked,
+    /// round-robin from where the previous scan stopped. Checks run outside
+    /// the records borrow.
     fn scan(&self, io: &crate::Reactor, budget: usize) {
+        let foreign = self.foreign_clock.get();
         let mut checks = Vec::new();
-        self.records.borrow_mut().retain(|record| {
-            let waiting = Rc::strong_count(record) > 1;
-            match record.id.get() {
-                None => waiting,
-                Some(id) if io.is_fenced(id) => waiting,
-                Some(id) => {
-                    if checks.len() < budget {
-                        checks.push((id, record.clone()));
-                    }
-                    true
+        {
+            let mut records = self.records.borrow_mut();
+            records.retain(|record| match record.id.get() {
+                Some(id) if !io.is_fenced(id) => true,
+                _ => Rc::strong_count(record) > 1,
+            });
+            let len = records.len();
+            let start = self.scan_cursor.get() % len.max(1);
+            let mut next = start;
+            for offset in 0..len {
+                if checks.len() == budget {
+                    break;
+                }
+                let index = (start + offset) % len;
+                next = (index + 1) % len;
+                let record = &records[index];
+                let Some(id) = record.id.get() else { continue };
+                if !io.is_fenced(id) && (foreign || record.scope.polled_checks()) {
+                    checks.push((id, record.clone()));
                 }
             }
-        });
+            self.scan_cursor.set(next);
+        }
         self.release_parked(io);
         for (id, record) in checks {
             if record.scope.check().is_err() {
