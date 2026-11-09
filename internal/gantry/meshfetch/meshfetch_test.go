@@ -978,3 +978,28 @@ func TestResolveTagRejectsStalePeerStamp(t *testing.T) {
 		t.Fatalf("stale resolution cached: %d entries", cached)
 	}
 }
+
+// A manifest held in local content is not served from it, because the
+// store does not keep its media type. The fetch goes to the origin, which
+// supplies the index type instead of an empty one.
+func TestManifestNotServedFromLocalContent(t *testing.T) {
+	c := newCluster(t, clusterOpts{n: 2})
+
+	const indexType = "application/vnd.oci.image.index.v1+json"
+
+	index := []byte(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}`)
+	d := c.origin.add(index, indexType)
+
+	for _, m := range c.nodes {
+		m.content.put(d.String(), index)
+	}
+
+	started, _, ctype, body, err := fetch(c.nodes[0], d, ifaces.KindManifest, 0)
+	if err != nil || !started || !bytes.Equal(body, index) || ctype != indexType {
+		t.Fatalf("index: started=%v ctype=%q err=%v", started, ctype, err)
+	}
+
+	if c.origin.totalPulls() == 0 {
+		t.Fatal("manifest was served from local content")
+	}
+}
