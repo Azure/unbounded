@@ -425,8 +425,10 @@ impl MetadataService {
     ) -> Operation<'a, ObjectMetadata> {
         Box::pin(async move {
             let mut budget = super::default_budget(scope);
-            self.resolve_with_budget(selector, membership, context, scope, &mut budget)
-                .await
+            Ok(self
+                .resolve_inner(selector.into(), membership, context, scope, &mut budget)
+                .await?
+                .metadata)
         })
     }
 
@@ -461,140 +463,138 @@ impl MetadataService {
     }
 
     /// Admit a cache hit or join the cohort for exactly the requested purpose.
-    fn resolve_inner<'a>(
-        &'a self,
+    async fn resolve_inner(
+        &self,
         purpose: RefreshPurpose,
         membership: std::sync::Arc<crate::topology::Membership>,
-        context: &'a OriginContext,
-        scope: &'a RequestScope,
-        budget: &'a mut AcquisitionBudget,
-    ) -> Operation<'a, RefreshOutput> {
-        Box::pin(async move {
-            let mut bounded_scope = scope.clone();
-            bounded_scope.deadline.0 = scope.deadline.0.min(budget.deadline());
-            let scope = &bounded_scope;
-            scope.check()?;
-            if let Some(metadata) = self.copy_only(purpose.selector(), context, scope).await? {
-                return Ok(RefreshOutput {
-                    metadata,
-                    page: None,
-                });
+        context: &OriginContext,
+        scope: &RequestScope,
+        budget: &mut AcquisitionBudget,
+    ) -> Result<RefreshOutput> {
+        let mut bounded_scope = scope.clone();
+        bounded_scope.deadline.0 = scope.deadline.0.min(budget.deadline());
+        let scope = &bounded_scope;
+        scope.check()?;
+        if let Some(metadata) = self.copy_only(purpose.selector(), context, scope).await? {
+            return Ok(RefreshOutput {
+                metadata,
+                page: None,
+            });
+        }
+        // HEAD cannot join a body-fetching bootstrap leader or elect one.
+        let key = refresh_key(&context.object, &purpose);
+        let registration = self.refreshes.join(key)?;
+        let deadline = self.deadlines.register(scope.deadline.0)?;
+        let cancellation = scope.cancellation.subscribe()?;
+        let event = poll_fn(|cx| {
+            self.candidates.drivers().poll(cx, 64);
+            cancellation.register(cx.waker());
+            if let Err(error) = deadline.check(scope, cx.waker()) {
+                return Poll::Ready(Err(error));
             }
-            // HEAD cannot join a body-fetching bootstrap leader or elect one.
-            let key = refresh_key(&context.object, &purpose);
-            let registration = self.refreshes.join(key)?;
-            let deadline = self.deadlines.register(scope.deadline.0)?;
-            let cancellation = scope.cancellation.subscribe()?;
-            let event = poll_fn(|cx| {
-                self.candidates.drivers().poll(cx, 64);
-                cancellation.register(cx.waker());
-                if let Err(error) = deadline.check(scope, cx.waker()) {
-                    return Poll::Ready(Err(error));
-                }
-                match registration.event(cx.waker()) {
-                    Poll::Ready(event) => Poll::Ready(Ok(event)),
-                    // Completion/re-election, cancellation, and the worker's
-                    // metadata deadline hook notify this specific child.
-                    Poll::Pending => Poll::Pending,
-                }
-            })
-            .await?;
-            match event {
-                RefreshEvent::Complete(result) => result,
-                RefreshEvent::Lead => {
-                    if budget.remaining_attempts() == 0 {
-                        return Err(Error::Unavailable);
-                    }
-                    let driver_permit = self.candidates.drivers().reserve().map_err(Error::from)?;
-                    let mut nonce = [0; 16];
-                    self.candidates
-                        .ctx()
-                        .rng
-                        .fill(&mut nonce)
-                        .map_err(|_| Error::Unavailable)?;
-                    let attempt = crate::model::AttemptId(nonce);
-                    let sealed = self.credentials.seal(context, attempt, scope)?;
-                    let owned_context =
-                        self.credentials
-                            .open_charged(sealed, scope.request, attempt)?;
-                    let service = self.clone();
-                    let driver_registration = registration.clone();
-                    // Detaching one refresh must not cancel the shared peer
-                    // ingress scope. Parent cancellation still reaches its work.
-                    let caller_scope = scope.clone();
-                    let caller_cancellation = caller_scope.cancellation.subscribe()?;
-                    let owned_scope =
-                        caller_scope.child(caller_scope.request, caller_scope.deadline.0)?;
-                    let mut owned_budget = budget.transfer();
-                    let (send, mut receive) = futures::channel::oneshot::channel();
-                    driver_permit.submit_detached(Box::pin(async move {
-                        let mut work = Box::pin(service.refresh(
-                            purpose,
-                            membership,
-                            &owned_context,
-                            &owned_scope,
-                            &mut owned_budget,
-                        ));
-                        let result = poll_fn(|cx| {
-                            if !caller_scope.cancellation.is_canceled() {
-                                caller_cancellation.register(cx.waker());
-                            }
-                            if !owned_scope.cancellation.is_canceled()
-                                && (caller_scope.check().is_err()
-                                    || driver_registration.is_only_handle())
-                            {
-                                let _ = owned_scope.cancel();
-                            }
-                            work.as_mut().poll(cx)
-                        })
-                        .await;
-                        drop(work);
-                        let result = match result {
-                            Ok(output) => {
-                                driver_registration.finish(Ok(output.clone()));
-                                Ok(output)
-                            }
-                            Err(RefreshFailure::Rejected(error)) => {
-                                driver_registration.retry(error);
-                                Err(error)
-                            }
-                            Err(RefreshFailure::Terminal(error)) => {
-                                if caller_budget_failure(error, &owned_budget) {
-                                    driver_registration.retry(error);
-                                } else {
-                                    driver_registration.finish(Err(error));
-                                }
-                                Err(error)
-                            }
-                        };
-                        // Completion, not receiver lifetime, releases this context
-                        // and registration. The original budget is returned intact.
-                        let _ = send.send((result, owned_budget));
-                        Ok::<_, Error>(())
-                    }));
-                    let (result, remaining) = poll_fn(|cx| {
-                        cancellation.register(cx.waker());
-                        deadline.check(scope, cx.waker())?;
-                        self.candidates.drivers().poll(cx, 64);
-                        match Pin::new(&mut receive).poll(cx) {
-                            Poll::Ready(Ok(value)) => Poll::Ready(Ok(value)),
-                            Poll::Ready(Err(_)) => Poll::Ready(Err(Error::Unavailable)),
-                            Poll::Pending => {
-                                if let Err(error) = scope.check() {
-                                    return Poll::Ready(Err(error));
-                                }
-                                // The same ingress deadline guard spans both waits.
-                                Poll::Pending
-                            }
-                        }
-                    })
-                    .await?;
-                    *budget = remaining;
-                    scope.check()?;
-                    result
-                }
+            match registration.event(cx.waker()) {
+                Poll::Ready(event) => Poll::Ready(Ok(event)),
+                // Completion/re-election, cancellation, and the worker's
+                // metadata deadline hook notify this specific child.
+                Poll::Pending => Poll::Pending,
             }
         })
+        .await?;
+        match event {
+            RefreshEvent::Complete(result) => result,
+            RefreshEvent::Lead => {
+                if budget.remaining_attempts() == 0 {
+                    return Err(Error::Unavailable);
+                }
+                let driver_permit = self.candidates.drivers().reserve().map_err(Error::from)?;
+                let mut nonce = [0; 16];
+                self.candidates
+                    .ctx()
+                    .rng
+                    .fill(&mut nonce)
+                    .map_err(|_| Error::Unavailable)?;
+                let attempt = crate::model::AttemptId(nonce);
+                let sealed = self.credentials.seal(context, attempt, scope)?;
+                let owned_context =
+                    self.credentials
+                        .open_charged(sealed, scope.request, attempt)?;
+                let service = self.clone();
+                let driver_registration = registration.clone();
+                // Detaching one refresh must not cancel the shared peer
+                // ingress scope. Parent cancellation still reaches its work.
+                let caller_scope = scope.clone();
+                let caller_cancellation = caller_scope.cancellation.subscribe()?;
+                let owned_scope =
+                    caller_scope.child(caller_scope.request, caller_scope.deadline.0)?;
+                let mut owned_budget = budget.transfer();
+                let (send, mut receive) = futures::channel::oneshot::channel();
+                driver_permit.submit_detached(Box::pin(async move {
+                    let mut work = Box::pin(service.refresh(
+                        purpose,
+                        membership,
+                        &owned_context,
+                        &owned_scope,
+                        &mut owned_budget,
+                    ));
+                    let result = poll_fn(|cx| {
+                        if !caller_scope.cancellation.is_canceled() {
+                            caller_cancellation.register(cx.waker());
+                        }
+                        if !owned_scope.cancellation.is_canceled()
+                            && (caller_scope.check().is_err()
+                                || driver_registration.is_only_handle())
+                        {
+                            let _ = owned_scope.cancel();
+                        }
+                        work.as_mut().poll(cx)
+                    })
+                    .await;
+                    drop(work);
+                    let result = match result {
+                        Ok(output) => {
+                            driver_registration.finish(Ok(output.clone()));
+                            Ok(output)
+                        }
+                        Err(RefreshFailure::Rejected(error)) => {
+                            driver_registration.retry(error);
+                            Err(error)
+                        }
+                        Err(RefreshFailure::Terminal(error)) => {
+                            if caller_budget_failure(error, &owned_budget) {
+                                driver_registration.retry(error);
+                            } else {
+                                driver_registration.finish(Err(error));
+                            }
+                            Err(error)
+                        }
+                    };
+                    // Completion, not receiver lifetime, releases this context
+                    // and registration. The original budget is returned intact.
+                    let _ = send.send((result, owned_budget));
+                    Ok::<_, Error>(())
+                }));
+                let (result, remaining) = poll_fn(|cx| {
+                    cancellation.register(cx.waker());
+                    deadline.check(scope, cx.waker())?;
+                    self.candidates.drivers().poll(cx, 64);
+                    match Pin::new(&mut receive).poll(cx) {
+                        Poll::Ready(Ok(value)) => Poll::Ready(Ok(value)),
+                        Poll::Ready(Err(_)) => Poll::Ready(Err(Error::Unavailable)),
+                        Poll::Pending => {
+                            if let Err(error) = scope.check() {
+                                return Poll::Ready(Err(error));
+                            }
+                            // The same ingress deadline guard spans both waits.
+                            Poll::Pending
+                        }
+                    }
+                })
+                .await?;
+                *budget = remaining;
+                scope.check()?;
+                result
+            }
+        }
     }
 
     /// Acquire one observation and publish current freshness only in its clock epoch.
