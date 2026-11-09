@@ -556,6 +556,48 @@ impl Registry {
                     self.drop_interest(&key, &unit_key);
                     ticket.rejected.insert(unit_key);
                 }
+                // Every credential so far was refused, and this PUT brings a
+                // new one: queue the unit again for it.
+                Some(unit)
+                    if unit.state == UnitState::Failed(RefError::Forbidden)
+                        && !unit.rejected.is_empty()
+                        && !unit
+                            .rejected
+                            .iter()
+                            .any(|c| same_credential(c, &ticket.authorization)) =>
+                {
+                    unit.state = UnitState::Queued;
+                    unit.attempts = 0;
+                    unit.not_before = None;
+                    unit.owner = None;
+                    // Tickets still holding a refused credential stay failed
+                    // for this unit rather than waiting on the new fill.
+                    let stale: Vec<TicketKey> = unit
+                        .interest
+                        .iter()
+                        .filter(|other| {
+                            self.tickets.get(*other).is_none_or(|t| {
+                                t.released
+                                    || unit
+                                        .rejected
+                                        .iter()
+                                        .any(|c| same_credential(c, &t.authorization))
+                            })
+                        })
+                        .cloned()
+                        .collect();
+                    for other in &stale {
+                        unit.interest.remove(other);
+                    }
+                    unit.interest.insert(key.clone());
+                    for other in stale {
+                        if let Some(t) = self.tickets.get_mut(&other) {
+                            t.rejected.insert(unit_key.clone());
+                        }
+                    }
+                    self.pending_bytes += self.page.get();
+                    ticket.open += 1;
+                }
                 Some(unit) => {
                     unit.interest.insert(key.clone());
                     if unit.state.open() {
@@ -825,10 +867,12 @@ impl Registry {
             })
             .cloned()
             .collect();
+        // Remember the refused credential even when it was the last one, so
+        // a later PUT with another credential can reopen the failed unit.
+        unit.rejected.push(used);
         if refused.len() == unit.interest.len() {
             return false;
         }
-        unit.rejected.push(used);
         for key in &refused {
             unit.interest.remove(key);
         }

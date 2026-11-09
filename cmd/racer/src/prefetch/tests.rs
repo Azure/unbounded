@@ -1183,3 +1183,44 @@ fn status_wait_wake_survives_registry_changes() {
     prefetch.tick();
     assert_eq!(prefetch.next_wake(), Some(until));
 }
+
+/// A unit failed because its only credential was refused is reopened by a
+/// same-body PUT with a rotated token, and filled with the new token.
+#[test]
+fn rotated_token_reopens_a_unit_whose_only_credential_was_refused() {
+    let mut r = rig(Config::default());
+    let page = pages(KEY_A, 0, 1);
+    let body = auth_spec("\"generation\":1,\"sequence\":1,", &[&page]);
+    r.put_with("t", body.clone(), token("Bearer old")).unwrap();
+    assert_eq!(
+        r.fill_once(UnitOutcome::Failed(RefError::Forbidden)),
+        Some(Some(b"Bearer old".to_vec()))
+    );
+    assert_eq!(
+        r.outcome("t"),
+        (RefOutcome::Failed, Some(RefError::Forbidden))
+    );
+    assert_eq!(r.registry.pending_bytes(), 0);
+    assert_eq!(
+        r.put_with("t", body.clone(), token("Bearer new"))
+            .unwrap()
+            .0,
+        200
+    );
+    assert_ne!(r.registry.pending_bytes(), 0);
+    assert_eq!(
+        r.fill_once(UnitOutcome::Admitted),
+        Some(Some(b"Bearer new".to_vec()))
+    );
+    assert_eq!(r.outcome("t").0, RefOutcome::Succeeded);
+    assert!(r.status("t").settled);
+    assert_eq!(r.registry.pending_bytes(), 0);
+    // The refused token itself does not reopen the unit.
+    let mut r = rig(Config::default());
+    r.put_with("t", body.clone(), token("Bearer old")).unwrap();
+    r.fill_once(UnitOutcome::Failed(RefError::Forbidden));
+    let again = auth_spec("\"generation\":1,\"sequence\":2,", &[&page]);
+    r.put_with("t", again, token("Bearer old")).unwrap();
+    assert!(r.fill_once(UnitOutcome::Admitted).is_none());
+    assert_eq!(r.outcome("t").1, Some(RefError::Forbidden));
+}
