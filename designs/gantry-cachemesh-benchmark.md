@@ -28,6 +28,12 @@ every node pulls the same 40GB image at the same moment.
   disk-backed chunk store that replaced it (see "Disk-backed chunk store"
   below) keeps the same pull time (p50 about 91s, makespan 97-102s) with
   about 2.8GiB RSS at the peak and about 0.26GiB working set when idle.
+- The final design (see "Containerd content store as the only disk tier")
+  drops gantry's private chunk files: containerd's content store is the
+  only disk copy. It keeps the pull time (p50 91.8-92.3s, makespan
+  97.8-101.8s, 1.00x egress) with 0 bytes of gantry disk writes, about
+  2.5GiB RSS at the peak and 0.26GiB working set 15s after the pull, and serves a second wave of nodes from the first
+  wave's content stores with 0.00x origin egress.
 
 ## Setup
 
@@ -477,6 +483,150 @@ is memory-only mode C from the first campaign, with a 24GiB chunk cache.
   max column) is a mid-pull value. On every other node the end-of-tail
   working set was at most about 780MiB.
 
+## Containerd content store as the only disk tier
+
+The disk-backed store above still kept a second copy of every owned chunk in
+the agent's own files, next to containerd's copy of the same blob. The
+final design removes the private chunk files: containerd's content store is
+the only disk copy, and agents read it back (committed blobs and
+in-progress ingests) to serve peers. See "Chunk store" in
+`designs/gantry-cachemesh.md`. Measured on 2026-11-09 on the same cluster.
+
+### Method
+
+- Build `gantry:cd2` from the `gantry-cd` worktree, deployed with
+  `values-default.yaml` plus `values-cachemesh.yaml` (agent defaults:
+  `maxNeighbors` 32, 2GiB in-flight budget, 512MiB hot tier,
+  `verifyDigest: false`). The chart mounts
+  `/var/lib/containerd/io.containerd.content.v1.content` read-only; the
+  agent logged `content_source: dir`. During a pull the agent (uid 65532)
+  listed and read `ingest/<key>/{ref,total,data}` (directories 0755, files
+  0644).
+- Between runs: `undeploy.sh` (which deletes the namespace and the
+  `gantry-cachemesh` Lease), `DROP_CACHES=1 clean.sh`, delete the previous
+  image and garbage collect the registry, redeploy, generate a fresh
+  never-pulled 40GB image (4 x 10GiB layers), wait 4 minutes, run.
+- `run.sh` now also samples the gantry container's cgroup `io.stat` and the
+  gantry process's `/proc/<pid>/io` every second (`IOSAMPLE`), to show that
+  gantry writes nothing to disk.
+- Two-wave test: after the same reset, the odd-numbered half of the 142
+  sorted nodes (71) pulled, then 3 minutes later (after every 30s linger
+  window and hot page TTL expired) the even-numbered half pulled the same
+  image. The second run's origin egress counts only the second wave.
+- A 4-node smoke pull of a 4GB image ran first to check the mount, the
+  fallback logging, and the I/O sampling.
+
+### Results
+
+| run | nodes | p50 | p90 | p99 | max | makespan | origin egress |
+|---|---|---|---|---|---|---|---|
+| cd-g40-r1 | 142 | 92.3 | 94.6 | 97.6 | 101.8 | 101.8 | 1.00x |
+| cd-g40-r2 | 142 | 91.8 | 96.5 | 97.6 | 97.8 | 97.8 | 1.00x |
+| cd-g40-r3 | 142 | 91.9 | 96.0 | 97.3 | 97.8 | 97.8 | 1.00x |
+| cd-wave1-w1 | 71 (wave 1) | 91.5 | 95.1 | 96.4 | 96.4 | 96.4 | 1.00x |
+| cd-wave1-w2 | 71 (wave 2, 3 min later) | 86.8 | 89.2 | 92.6 | 92.6 | 92.6 | 0.00x (875 bytes) |
+
+Seconds from the shared start to `crictl pull` returning; all nodes
+succeeded in every run.
+
+Output of `gantry-cluster-bench compare` (rows picked):
+
+| metric | cd-g40-r1 | cd-g40-r2 | cd-g40-r3 | cd-wave1-w1 | cd-wave1-w2 |
+|---|---|---|---|---|---|
+| NIC rx avg MB/s p50 | 473.9 | 475.3 | 474.9 | 474.3 | 500.3 |
+| NIC rx peak MB/s p99 | 2522.4 | 2676.4 | 2647.1 | 2569.4 | 3543.8 |
+| NIC tx avg MB/s p50 | 499.8 | 510.2 | 496.6 | 268.3 | 260.1 |
+| NIC tx peak MB/s p99 | 3623.2 | 3623.9 | 3642.2 | 3638.8 | 3573.2 |
+| node disk write GB p50 (incl. 15s tail) | 64.2 | 64.2 | 64.2 | 64.2 | 64.1 |
+| node disk read GB p50 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 |
+| gantry cgroup disk write MiB max | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 |
+| gantry process disk write MiB max | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 |
+| gantry cgroup disk read MiB p50 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 |
+| gantry CPU avg cores p50 | 0.8 | 0.8 | 0.8 | 0.7 | 0.6 |
+| gantry CPU peak cores p99 | 5.1 | 5.1 | 5.3 | 4.8 | 4.7 |
+| gantry RSS peak MiB p50 | 2539.5 | 2536.2 | 2539.3 | 2528.0 | 2517.3 |
+| gantry RSS peak MiB p99 | 2912.7 | 2823.4 | 2807.7 | 2823.6 | 2936.3 |
+| gantry working set peak MiB p50 | 2961.9 | 2935.1 | 2957.2 | 2741.3 | 2806.1 |
+| gantry working set peak MiB p99 | 3128.1 | 3062.7 | 3090.8 | 2918.8 | 3021.0 |
+| gantry working set end MiB p50 | 258.9 | 263.2 | 266.1 | 257.5 | 249.4 |
+| gantry page cache peak MiB p50 | 0.1 | 0.1 | 0.1 | 0.1 | 0.1 |
+| containerd CPU avg cores p50 | 0.9 | 0.9 | 0.9 | 0.9 | 1.0 |
+| origin chunk fills | 646 | 646 | 646 | 646 | 1 |
+| local (content store) chunk fills | 3195 | 2140 | 2075 | 873 | 12054 |
+| content store page reads (1MiB) | 64560 | 46595 | 41188 | 19525 | 289626 |
+| holder reads ok / failed | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 | 312 / 2 |
+| peer chunk fills | 92550 | 92160 | 91847 | 51419 | 46116 |
+
+The image has 644 chunks of 64MiB (plus the manifest and config), so 646
+origin fills is one per chunk. Disk free on `/var/lib/containerd` was about
+256GB on every node after each `clean.sh` and 169.6-170.0GB after each pull
+(the `DISK` line of every bench pod): 86GB per node, the image in the
+content store plus its unpacked snapshot, as in the direct-origin baseline,
+and nothing else. The 64.2GB of node disk writes within 15s of the pull is
+containerd alone (gantry wrote 0 bytes).
+
+### Compared with the disk-backed store
+
+| metric | disk-backed (mem8/mem9, 4 runs) | content store only (cd2, 3 runs) |
+|---|---|---|
+| pull p50 | 90.7-91.9s | 91.8-92.3s |
+| pull p99 | 97.5-98.7s | 97.3-97.6s |
+| makespan | 98.4-102.0s | 97.8-101.8s |
+| origin egress | 1.00-1.01x | 1.00x |
+| gantry disk writes per node | about 0.3GB (owned chunks) | 0 bytes |
+| gantry disk reads per node | about 0.5GB | 0 bytes (page cache hits only) |
+| gantry RSS peak p50 | 2772-2785MiB | 2536-2540MiB |
+| gantry working set peak p50 | 3259-3307MiB | 2935-2962MiB |
+| gantry working set at end of tail (p50) | 256MiB (mem9, 60s tail) | 259-266MiB (15s tail) |
+| gantry CPU avg / peak p99 | 0.8-0.9 / 4.7-5.3 cores | 0.8 / 5.1-5.3 cores |
+
+- Pull time is the same within noise: the p50 is up to 1s higher, the p99
+  and makespan are the same or lower. The disk-backed baseline was not
+  rerun: the image shape, cluster, harness, and the direct and default-mode
+  numbers have not changed, and the new p50 sits within the old runs' spread
+  plus about 0.4s.
+- Gantry writes nothing to disk: the agent cgroup's `io.stat` and the
+  process's `write_bytes` stayed at 0 on all 142 nodes in every run. Agents
+  read 180-280GB per run from containerd's content stores, all of it from
+  the page cache (node disk reads 0.0GB).
+- Memory is lower than with the disk-backed store (about 2.5GiB RSS and
+  2.9-3.0GiB working set at the peak, about 0.26GiB 15s after the pull).
+  Lingering owned chunks replace the owned chunk files, and pages behind a
+  fill's window leave memory as soon as containerd has written them.
+- The second wave pulled with 0.00x origin egress (875 bytes: one manifest
+  fill) and faster than the first (p50 86.8s against 91.5s): relays and
+  owners that pulled in the first wave served from their content stores
+  (12k local fills, 290k page reads), and owners that had not pulled read
+  their chunks from first-wave requesters (312 holder reads, 2 misses).
+
+### Bugs found
+
+1. **Owned chunks dropped before peers asked.** With no chunk files, a
+   fill that only the owner's own pull read was dropped when it finished,
+   and a peer asking later made the owner pull the chunk from the origin a
+   second time. Found by `TestFetchBlobStripesAcrossOwnersAndDedupesOrigin`
+   under `-race` before the cluster runs. Owned chunks now linger in the
+   in-flight budget like chunks peers read.
+2. **Holder reads of the requester being served.** The smoke run showed 73
+   failed holder reads in a single pull: the owner recorded a requester and
+   then immediately asked it for the chunk it was itself requesting.
+   Requesters recorded less than 20s ago are now skipped
+   (`TestHoldersRecentFirstBounded`); the 142-node runs had no holder reads,
+   and the second wave had 2 misses in 314.
+
+### Caveats
+
+- Every node in the main runs pulled the image, so the content store
+  covered most reads behind fill windows. Owners that do not pull an image
+  keep their chunks only in memory (30s unused); a much later pull then
+  depends on holders that still have the blob, else the origin.
+- containerd's GC ran with its defaults; the bench never deleted an image
+  while another node was reading it. GC during a read shows up as a lost
+  reader and a retry, covered by unit tests only.
+- `serveLocalHit` (a local hit served to containerd from its own store over
+  the content API) was not changed; it does not occur in these runs.
+- The runs used `verifyDigest: false`, like the earlier campaigns.
+
 ## Cluster end state
 
 - The gantry release is uninstalled, and the `gantry-system` namespace,
@@ -499,3 +649,12 @@ garbage collected. Chunk files lived in the agent pods' `emptyDir` and went
 away with the pods. The `dd` test file on `joolshev-rdma-w0000` was removed
 by the same pod that wrote it. Raw data for these runs is in
 `tmp/gantry-cluster-bench/mem*` in the `gantry-mem` worktree (gitignored).
+
+After the content store runs the cluster is again in the same state: the
+gantry release, the `gantry-system` namespace, and the `gantry-cachemesh`
+Lease are gone, `clean.sh` with `DROP_CACHES=1` ran on all 142 nodes (about
+256GB free on each), and the `bench/g40:cdrun*` and `cdwave1` images, the
+`bench/smoke:cdsmoke1` image, and the `gantry:cd1` build were deleted and
+garbage collected. `gantry:cd2` (the measured build) remains next to
+`gantry:bench-base` and `gantry:cm3`. Raw data is in
+`tmp/gantry-cluster-bench/cd-*` in the `gantry-cd` worktree (gitignored).

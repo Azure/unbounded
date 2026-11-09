@@ -39,14 +39,11 @@ true.
 | `metadata_ttl` | `CACHEMESH_METADATA_TTL` | 5m | Tag cache freshness; at least 5m. |
 | `cache_tags` | `CACHEMESH_CACHE_TAGS` | `true` | Serve anonymous tag requests from the mesh. |
 | `verify_digest` | `CACHEMESH_VERIFY_DIGEST` | `true` | Hash full blobs before the last byte. |
-| `chunk_dir` | `CACHEMESH_CHUNK_DIR` | `/var/lib/gantry/cachemesh` | Directory of chunk files; wiped at startup. |
-| `disk_cache_bytes` | `CACHEMESH_DISK_CACHE_BYTES` | 20GiB | Disk budget for chunk files; 0 disables the disk tier. |
+| `content_root` | `CACHEMESH_CONTENT_ROOT` | `/var/lib/containerd/io.containerd.content.v1.content` | containerd content store directory, mounted read-only; the only disk tier. Empty or unreadable: committed blobs over the containerd content API. |
 | `memory_cache_bytes` | `CACHEMESH_MEMORY_CACHE_BYTES` | 512MiB | Hot page tier in memory; 0 disables it. |
-| `inflight_bytes` | `CACHEMESH_INFLIGHT_BYTES` | 2GiB | Memory fills borrow for lagging readers and recent relay chunks. |
-| `page_size` | `CACHEMESH_PAGE_SIZE` | 1MiB | Unit of buffers, disk I/O, coalescing, and the hot tier. |
+| `inflight_bytes` | `CACHEMESH_INFLIGHT_BYTES` | 2GiB | Memory fills borrow for lagging readers, recent relay chunks, and owned chunks. |
+| `page_size` | `CACHEMESH_PAGE_SIZE` | 1MiB | Unit of buffers, content store reads, coalescing, and the hot tier. |
 | `fill_pages` | `CACHEMESH_FILL_PAGES` | 4 | In-flight pages per fill. |
-| `page_cache` | `CACHEMESH_PAGE_CACHE` | `bypass` | `bypass` (O_DIRECT), `drop` (fadvise DONTNEED), or `keep`. |
-| `persist` | `CACHEMESH_PERSIST` | `owned` | Chunks written to disk: `all`, `shared`, or `owned`. |
 | `max_concurrent_chunk_fills` | `CACHEMESH_MAX_CONCURRENT_CHUNK_FILLS` | 64 | Chunks fetched at once. |
 | `max_concurrent_chunk_serves` | `CACHEMESH_MAX_CONCURRENT_CHUNK_SERVES` | 512 | Chunk responses to peers at once. |
 | `lookahead` | `CACHEMESH_LOOKAHEAD` | 8 | Chunks of one blob fetched ahead. |
@@ -56,7 +53,10 @@ true.
 | `hedge` | `CACHEMESH_HEDGE` | `true` | Hedge slow chunk requests. |
 
 Validation requires a Lease namespace and `pod_ip`. The Racer backend
-ignores the block.
+ignores the block. The keys of the removed private chunk store
+(`chunk_dir`, `disk_cache_bytes`, `page_cache`, `persist`) are rejected:
+in YAML as unknown fields, and as environment variables with an explicit
+error, so a stale config fails at startup instead of being ignored.
 
 Grid shape: gantry defaults `max_neighbors` to 32, unlike the cachemesh
 library, which defaults to 256 because it is sized for clusters of up to 100k
@@ -150,9 +150,12 @@ on open-ended `Range: bytes=N-` requests, which containerd uses to resume):
 Every node handles a chunk request the same way, whether it came from its
 own mirror or from a peer:
 
-- If the chunk is in the local store (complete or still filling), stream it
-  from there. Concurrent requests for one chunk share one fill.
-- Otherwise start a fill. The decision comes from `Route` (local request) or
+- If the chunk is in memory (a fill in progress, or a complete chunk
+  lingering), stream it from there. Concurrent requests for one chunk share
+  one fill.
+- Otherwise start a fill. If the local containerd content store holds the
+  whole chunk (a committed blob, or an ingest containerd is still writing),
+  the fill reads it from there. Otherwise the fill is routed. The decision comes from `Route` (local request) or
   `Forward` with the request header (peer request):
   - `KindSelf`: this node owns the chunk (or stands in as a backup). It first
     reads through from `PrevOwner` during a handoff, and from the owner when
@@ -162,7 +165,10 @@ own mirror or from a peer:
     view start its origin fill and serve it, so a hedge to a backup does not
     read the chunk from the origin a second time; a handoff peek (`peek=1`)
     never starts a fill, since the previous owner's own fill may be waiting
-    on the new owner. Otherwise it pulls the chunk from the origin.
+    on the new owner. Every peek is also served from the peer's content
+    store when it holds the whole chunk. The owner then asks recent
+    requesters of the chunk (the holder directory, below) with
+    `peek=local`. Otherwise it pulls the chunk from the origin.
   - Relay, owner, backup, gateway, direct: send to `Next` with the decision
     header. After `HedgeAfter`, if `TryHedge` allows, send a copy with
     `FlagHedge` to `Alternate` using `AlternateHeader`; the first response
@@ -170,13 +176,16 @@ own mirror or from a peer:
   - No route: fail.
 - Every peer outcome is reported with `Observe` (latency to headers).
   429 and 503 count as `Overload`; stalls as `Timeout`.
-- `ErrTTLExhausted`: serve only from the local store, else 508.
+- `ErrTTLExhausted`: serve only from memory or the content store, else 508.
 
 ## Chunk store
 
-`meshfetch.store` (`internal/gantry/meshfetch/store.go`, `fill.go`,
-`pages.go`, `disk.go`) keeps chunk bytes in files on local disk and holds
-only a small, bounded amount in memory.
+Gantry keeps no copy of image data on disk. The only disk copy is
+containerd's own content store: containerd writes every blob while it
+pulls through the gantry mirror, and the snapshotter unpacks from that same
+blob. `meshfetch` (`internal/gantry/meshfetch/store.go`, `fill.go`,
+`pages.go`, `content.go`, `holders.go`) holds chunks in bounded memory and
+reads the content store back to serve peers.
 
 ### Fills and the in-flight window
 
@@ -184,95 +193,126 @@ A fill is one chunk being fetched or already complete. The filler reads the
 chunk into a window of `fill_pages` page buffers (4 x 1MiB by default).
 Readers (the local blob stream and peers) that keep up copy bytes out of
 those pages as they arrive, so every hop is cut-through and a hot fan-out
-reads each byte from the network once. A page leaves the window when:
+reads each byte from the network once.
 
-- the fill is written to disk and the page is on disk, or
-- the fill is not written to disk and every reader has passed it.
+A page leaves the window once no reader needs it from memory. A reader needs
+memory from `max(position, local floor)` on, where the local floor is the
+end of the whole pages of the chunk that the content store held when last
+asked (`fill.needLocked`, `fill.localFloorLocked` in `fill.go`). So a page
+is dropped when every reader has passed it, or when containerd has written
+it and lagging readers can read it back. A reader that falls behind the
+window reads the page from the content store through the page cache below;
+if the content store does not have it either, the reader gets `errLost`, the
+local blob stream starts a new fill from the same byte, and a peer request
+that needs bytes a fill has dropped starts a new fill.
 
-A reader that falls behind the window reads the page back from disk. If the
-page is not on disk either, the reader gets `errLost`; the local blob stream
-then starts a new fill from the same byte, and a peer request that needs
-bytes a fill has dropped detaches that fill from the map and starts a new
-one.
+The fill asks the content store how much of its chunk it holds
+(`fill.refreshLocal`) at most every 10ms, and only when it matters: when its
+window is full and a reader holds it back, every 40ms while it waits, and
+when a reader finds its page gone.
 
-When the window is full and a reader still needs its oldest page, the fill:
+When the window is full and a reader the content store does not cover still
+needs the oldest page, the fill:
 
 1. borrows another page from the store-wide in-flight budget
-   (`inflight_bytes`) if peers read the fill or it is written to disk, so a
-   slow reader does not slow the others down;
-2. when the budget is used up, spills to disk: it starts a chunk file at its
-   oldest window page, and lagging readers read from it;
-3. otherwise waits for the slowest reader. A fill that only the local blob
-   stream reads always does this: nobody else is waiting, and it keeps the
-   lookahead fills from using memory. A reader that holds the fill back for
-   `chunk_stall_timeout` is dropped with `errLost`.
+   (`inflight_bytes`) if peers read the fill, so a slow reader does not
+   slow the others down;
+2. otherwise waits for the slowest reader. A fill that only the local blob
+   stream reads always does this: nobody else is waiting, and containerd
+   writes those bytes right after the reader passes them. A reader that
+   holds the fill back for `chunk_stall_timeout` is dropped with `errLost`.
 
-### Lingering relay chunks
+There is no spill: the previous design spilled lagging fills to private
+chunk files. With the content store covering everything the local pull has
+written, the only readers that can still exhaust the budget are peers of a
+chunk this node is not pulling itself, and those pace the fill.
 
-A fill that a peer has read and that is not written to disk keeps every page
-in memory while the in-flight budget allows: instead of dropping a page that
-all readers have passed, it borrows a new one. When such a fill completes
-with the whole chunk still in memory, it stays in the map on a memory LRU
-list, so peers that ask later (in the relay grid, nodes reach a chunk a few
-seconds apart) join it instead of making the relay fetch it again. These
-chunks give their pages back:
+### Lingering and owned chunks
+
+A fill that a peer has read, or that this node fills as the chunk's owner,
+keeps every page in memory while the in-flight budget allows, unless the
+content store already holds the chunk: instead of dropping a page that all
+readers have passed, it borrows a new one. When such a fill completes with
+the whole chunk in memory, it stays in the map on a memory LRU list, so
+peers that ask later (in the relay grid, nodes reach a chunk a few seconds
+apart) join it instead of fetching it again. These chunks give their pages
+back:
 
 - when a fill needs to borrow and the budget is used up (least recently used
-  first; lagging readers and new relay chunks win over old ones), and
+  first, chunks this node does not own before owned ones), and
 - after 30s without use, so an idle agent returns the memory.
 
-Without this, relays kept nothing and late requests fetched each chunk
-again from upstream: about 80k extra chunk fills and 1.7x the bytes received
-per node on the 142-node benchmark, and a p50 of about 101s instead of 91s.
+Owned chunks linger because the owner's own pull reaches a given chunk at
+an arbitrary time: without it, an owner whose fill completed before any
+peer asked dropped the chunk, and a later peer request made it pull the
+chunk from the origin again (seen as duplicate origin pulls in the tests).
+Each node owns about `image size / nodes` of an image (0.3GB of 43GB on 142
+nodes), so this fits the budget.
 
-### Disk tier
+A complete chunk that left memory is served again from the content store:
+a new fill reads it (`Node.fillFromLocal`), and concurrent requests share
+that fill.
 
-- Chunk files live in `chunk_dir`, one file per chunk, created with
-  `O_DIRECT` and preallocated with `fallocate`. Pages are written in order
-  by one writer goroutine per fill with `pwrite` (`WriteAt`); the final
-  partial page is padded to the 4KiB `O_DIRECT` alignment.
-- The directory is wiped at startup. Chunks are not digest-verified one by
-  one, so files from an earlier process are never trusted.
-- `disk_cache_bytes` bounds chunk files, including fills being written.
-  Complete chunks are evicted least recently used first. Chunks this agent
-  filled as their owner are on a separate list and are evicted only when no
-  other complete chunk is left or when they hold more than half of the
-  budget. Every agent caches transit copies, so with a plain LRU an owner
-  evicted its own chunks while slower requesters still needed them and
-  refilled them from the origin (1.33x origin egress on a 142-node 40GB pull
-  with `maxNeighbors: 32`).
-- A fill that finds no disk budget, or whose file cannot be created
-  (`ENOSPC` pauses disk use for 10s), streams through memory. A failed
-  write turns the fill into a stream-through fill; a failed read drops the
-  chunk. A pull never fails because of the disk.
-- `persist` selects which chunks are written: `all`, `shared` (owned
-  chunks and chunks a peer asked for), or `owned` (default: only chunks this
-  agent owns). Spills happen with any policy.
-- The Helm chart mounts an `emptyDir` at `/var/lib/gantry/cachemesh`. It is
-  writable by the non-root agent and goes away with the pod, so no chunk
-  outlives it, and `gantry.cachemesh.chunkDirSizeLimit` can cap it. A
-  `hostPath` would survive pod restarts, but the agent wipes the directory
-  at startup anyway, and it would need ownership fixes for the non-root
-  agent.
+### Reading the content store
 
-### Why `persist: owned` is the default
+`ContentSource` (`content.go`) has two implementations:
 
-On the benchmark nodes containerd alone writes about 86GB per 40GB pull to
-the OS disk, which sustains about 1.07GB/s of writes (`dd oflag=direct`),
-so the disk is already the limit during a pull. Writing transit chunks too
-made the 142-node pull 30-60% slower (`designs/gantry-cachemesh-benchmark.md`).
-With `owned`, each agent writes only its own share of the image (about 0.3GB
-of 43GB). Relays stream chunks through their windows and keep recent
-peer-read chunks in the in-flight budget (see above). `all` or `shared` suit
-nodes whose disk has room to spare or workloads where nodes pull at
-different times.
+- `DirContent` reads the content root directly. Committed blobs are at
+  `blobs/sha256/<hex>`. In-progress downloads are at `ingest/<key>/data`,
+  where `<key>` is a hash of the namespace and ingest ref, so the directory
+  is listed (at most every 100ms, on a miss) and each `ref` file is parsed
+  for the digest (CRI uses `layer-sha256:<hex>`); the readable length is the
+  size of `data`, capped at `total`. containerd writes ingests sequentially
+  with plain `write` calls, so bytes below the file size are complete and
+  in the page cache. On commit containerd renames `data` into `blobs/`, so
+  an open descriptor stays valid. Descriptors are cached per blob and
+  closed after 2s idle, so a blob that containerd garbage collects does not
+  keep its space. A short read (an ingest restarted with a truncate, or a
+  deleted blob) drops the descriptor and loses the reader, which retries
+  elsewhere. A permission error disables the source with one warning.
+  Digests are validated as 64 lowercase hex characters before they become a
+  path.
+- `OpenerContent` reads committed blobs over the containerd content API
+  (`containerdstore.Store.Open`). It is the fallback when the content root
+  is not mounted or not readable (`cachemeshContent` in
+  `cmd/gantry/agent_cachemesh.go`). It cannot see ingests, and every page
+  read opens a stream, so it is slower; it keeps cachemesh working on nodes
+  with a different containerd layout.
+
+Reads are buffered (`pread`), not `O_DIRECT`: the point is to hit the page
+cache that containerd has just filled. On the 142-node benchmark agents read
+180-280GB per run from the content stores (41k-65k page reads behind fill
+windows plus 2.1k-3.2k chunk fills) while node disk reads stayed at 0.0GB,
+so every read came from the page cache. The page cache belongs to containerd's cgroup (it wrote
+the pages), so it does not count against the agent: the agent cgroup's page
+cache stayed at about 0.1MiB. Since buffered reads did not touch the disk at
+all, there is no `O_DIRECT` knob.
+
+### Holder directory
+
+Chunk requests made for a node's own containerd pull carry that node's
+member address in `Gantry-Cachemesh-Requester`; relays forward it. Every
+node remembers the last four requesters of each chunk (`holders.go`; at most
+32k chunks, entries expire after 6h). When the owner has the chunk neither
+in memory nor in its own content store, it asks up to two of those
+requesters with `peek=local`, which they serve only from memory or their
+content store, before it goes to the origin. Requesters recorded less than
+20s ago are skipped: they are most likely still pulling the chunk,
+typically in the very request the owner is filling. A requester that no
+longer has the blob answers 404 quickly (1s header timeout).
+
+In a two-wave test (71 nodes, then the other 71 three minutes later) the
+second wave pulled 0.00x the image from the origin: relays and owners that
+pulled in the first wave served from their content stores, and owners that
+did not asked holders (312 holder reads, 2 misses).
 
 ### Page coalescing and the hot tier
 
-Disk reads go through a page cache keyed by (fill, page index). Concurrent
-readers of the same page share one disk read (singleflight). Each entry is a
-reference-counted page buffer. When the last reader is done the page is
-dropped, unless it showed repeated demand:
+Content store reads go through a page cache keyed by (digest, absolute page
+index), so readers of different fills of the same chunk share pages.
+Concurrent readers of the same page share one read (singleflight). Each
+entry is a reference-counted page buffer. When the last reader is done the
+page is dropped, unless it showed repeated demand:
 
 - two or more readers held it at once, or
 - it was read again while its key was in a ghost list of recently dropped
@@ -280,7 +320,7 @@ dropped, unless it showed repeated demand:
 
 Such pages stay in the hot tier, an LRU bounded by `memory_cache_bytes`.
 Pages read by one reader once are never kept. Hot pages unused for 30s are
-dropped, and evicting a chunk drops its hot pages.
+dropped, and evicting a digest (failed verification) drops its pages.
 
 ### Memory bound
 
@@ -288,34 +328,41 @@ Chunk memory is page buffers only:
 
 - in-flight windows: `fill_pages x page_size` per fill, at most
   `max_concurrent_chunk_fills` fills (256MiB with the defaults);
-- borrowed pages, including lingering relay chunks: at most
+- borrowed pages, including lingering and owned chunks: at most
   `inflight_bytes`;
 - the hot tier: at most `memory_cache_bytes`;
-- one page per active reader while it writes that page to its socket (a
-  reader holds a reference only during one `Write`, so a slow reader pins at
-  most one page and then falls back to disk).
+- one page per active reader while it writes that page to its socket.
 
-With the defaults that is about 3.3GiB at most. Page buffers are anonymous
-`mmap` mappings outside the Go heap: they do not raise the garbage
-collector's heap goal, and `munmap` returns them to the system as soon as
-they are freed (an idle pool keeps at most 64MiB).
+With the defaults that is about 3.3GiB at most; the benchmark measured a
+working set peak of about 3.0GiB and about 0.26GiB 15s after the pull. Page
+buffers are anonymous `mmap` mappings outside the Go heap: they do not raise
+the garbage collector's heap goal, and `munmap` returns them to the system
+as soon as they are freed (an idle pool keeps at most 64MiB).
 
-### Page cache
+### Alternative: write the blob on behalf of containerd
 
-Kubernetes counts active page cache in `container_memory_working_set_bytes`.
-`page_cache: bypass` (default) uses `O_DIRECT`, so chunk files never enter
-the page cache; the benchmark measured at most a few MiB of page cache in
-the agent cgroup. `drop` uses buffered I/O and calls `sync_file_range` plus
-`posix_fadvise(DONTNEED)` after each write and read. `keep` leaves caching to
-the kernel. `sendfile` was not used: pages are read into shared buffers so
-that concurrent readers coalesce, and the copy to the socket is cheap next to
-the disk.
+Gantry could claim CRI's ingest ref (`layer-sha256:<hex>` in namespace
+`k8s.io`) before CRI does, write the blob into the content store itself
+from the mesh, and commit it, so that CRI's `OpenWriter` returns
+`AlreadyExists` and CRI skips the download. That would let owners assemble
+blobs they are not pulling, and avoid the stream-through hop. It was not
+chosen:
 
-### Containerd duplication
+- While gantry holds the ref, CRI's `OpenWriter` retries with random backoff
+  capped at about 2s (`core/content/helpers.go` in containerd 2.1), so every
+  layer could start unpacking up to 2s late, and unpack only starts after
+  the commit anyway.
+- A gantry writer that hangs or crashes holds the ref until its lease or
+  the ingest expires, blocking the pull; the stream-through path can always
+  fall back to the origin.
+- It relies on CRI's internal ref naming and namespace, which is not an API.
+- Gantry would have to learn the layer list from the manifest before CRI
+  opens its writers, racing CRI on every layer.
 
-Every node also writes each blob to containerd's content store and unpacks
-it. The store does not try to serve completed blobs from containerd; with
-`persist: owned` the extra disk writes are small enough not to matter.
+It may be worth revisiting for owners that are not pulling an image (they
+could keep owned chunks in a committed blob instead of memory), behind a
+knob, if memory ever limits chunk lingering. The measured design matched
+the previous disk-backed results without it.
 
 ## Integrity
 
@@ -325,8 +372,14 @@ blob. Containerd checks the full digest when it commits. With
 and holds back the last byte until the hash matches. On a mismatch it drops
 every cached chunk of the blob and aborts the response, so a bad chunk from
 a peer or the origin cannot be committed and is not served again from this
-node's cache. Other nodes that cached the bad chunk find out on their own
-verification.
+node's cache. It also stops reading that blob from the content store for
+10 minutes: the bad bytes may still sit in containerd's ingest. Other nodes
+that cached the bad chunk find out on their own verification.
+
+The content store serves ingests before containerd has verified them. The
+bytes there are exactly what this node's gantry served to containerd, so
+they are as trustworthy as the chunks in memory; containerd still verifies
+the full digest before commit on every node.
 
 ## Tags and metadata
 
@@ -381,22 +434,24 @@ All in the `cachemesh` subsystem:
   `gantry_cachemesh_blob_bytes_total`,
   `gantry_cachemesh_blob_duration_seconds{outcome}`
 - `gantry_cachemesh_tag_lookups_total{outcome}`
-- `gantry_cachemesh_chunk_evicted_bytes_total` (disk chunk store)
 - `gantry_cachemesh_control_errors_total`,
   `gantry_cachemesh_lease_errors_total{op}`
 - Gauges: `gantry_cachemesh_members`, `gantry_cachemesh_view_term`,
   `gantry_cachemesh_view_seq`, `gantry_cachemesh_leading`,
   `gantry_cachemesh_ready`, `gantry_cachemesh_neighbors`,
-  `gantry_cachemesh_chunk_disk_bytes`, `gantry_cachemesh_chunk_store_chunks`,
+  `gantry_cachemesh_chunk_store_chunks`, `gantry_cachemesh_memory_chunks`,
   `gantry_cachemesh_chunk_fills_inflight`,
   `gantry_cachemesh_page_memory_bytes`, `gantry_cachemesh_hot_page_bytes`,
   `gantry_cachemesh_inflight_borrowed_bytes`
-- Chunk store counters: `gantry_cachemesh_disk_page_reads_total`,
-  `gantry_cachemesh_disk_page_writes_total`,
-  `gantry_cachemesh_disk_errors_total`,
+- Chunk store counters: `gantry_cachemesh_local_page_reads_total` (pages
+  read from the content store), `gantry_cachemesh_local_fills_total`,
+  `gantry_cachemesh_local_errors_total`,
   `gantry_cachemesh_shared_page_reads_total` (reads served by another
-  reader's disk read or the hot tier), `gantry_cachemesh_spills_total`,
-  `gantry_cachemesh_stream_fills_total`
+  reader's read or the hot tier), `gantry_cachemesh_holder_peeks_total`,
+  `gantry_cachemesh_holder_misses_total`
+- Fill sources (`source` label): `origin`, `peer`, `prev_owner`, `owner`,
+  `local` (the content store), `holder` (a recent requester's content
+  store).
 
 ## Transport choices
 
@@ -409,11 +464,9 @@ All in the `cachemesh` subsystem:
 Benchmarks (`go test -bench . ./internal/gantry/meshfetch`) cover a cold
 fetch through owners, a fetch from a peer's store with and without digest
 verification (SHA-256 caps one blob at about 1.8 GB/s), serving a chunk
-from disk in each page cache mode, fan-out of one chunk to 32 concurrent
-readers (about one disk read per page), and a fill followed by 8
-cut-through readers. Disk numbers depend on the device: on a busy
-development VM one `O_DIRECT` reader managed about 75MB/s at queue depth 1,
-against about 370MB/s with `drop` and page-cache speed with `keep`.
+from a content store on disk (page cache warm), fan-out of one chunk to 32
+concurrent readers (one content store read per page), and a fill followed
+by 8 cut-through readers.
 
 ## Security
 
@@ -439,13 +492,25 @@ allowed to pull. Use NetworkPolicy to limit the port to Gantry agents.
   share a connection.
 - The chunk size must match on every node; a mixed rollout refuses requests
   between nodes with different sizes, and the mirror falls back.
-- The chunk directory is wiped at startup, so a restarted node starts with
-  an empty chunk store.
-- Chunks on disk are not digest-verified one by one; only whole blobs are
-  (`verify_digest`), so silent disk corruption is caught only at the blob
-  level.
-- With the default `persist: owned`, a relay keeps a chunk only in memory,
-  for at most 30s unused and only while the in-flight budget has room. A
-  peer that asks later makes the relay fetch the chunk again from upstream.
-- Disk reads are synchronous, one page at a time per reader (queue depth 1
-  per reader). There is no read-ahead.
+- Reading the content store relies on containerd's on-disk layout
+  (`blobs/sha256/<hex>`, `ingest/<key>/{ref,total,data}`, rename on commit,
+  sequential ingest writes), verified against containerd 2.1. A layout
+  change makes the directory reader find nothing (or a permission error
+  disables it), and cachemesh falls back to memory and the origin; it does
+  not serve wrong bytes unless a file under a blob's path holds other data.
+- The agent must be able to read the content root: the chart mounts it
+  read-only, and the non-root agent relies on containerd's default
+  permissions (directories 0755, blobs 0444, ingest files 0644).
+- containerd may garbage collect a blob at any time (immediately, with the
+  default GC settings, once no image or lease references it). Readers then
+  get short reads and retry elsewhere; descriptors are closed after 2s idle
+  so the space is reclaimed.
+- A relay or owner that is not pulling an image keeps its chunks only in
+  memory, for at most 30s unused and while the in-flight budget has room.
+  After that its share is served from requesters' content stores (holder
+  directory) or, if none still has the blob, from the origin.
+- The holder directory only knows requesters whose requests reached this
+  node: with relays, a coalesced relay fill carries one requester. It is
+  lost on restart.
+- Content store reads are synchronous, one page at a time per reader. There
+  is no read-ahead.
