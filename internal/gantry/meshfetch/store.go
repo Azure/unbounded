@@ -78,8 +78,11 @@ type storeConfig struct {
 	diskBudget int64
 	// hotBudget bounds the hot page tier in memory.
 	hotBudget int64
-	pageCache PageCacheMode
-	persist   PersistPolicy
+	// extraBudget bounds window pages beyond the base windows of all
+	// fills, borrowed by fills whose readers lag.
+	extraBudget int64
+	pageCache   PageCacheMode
+	persist     PersistPolicy
 	// stallTimeout is how long a fill that is not written to disk waits
 	// for a reader before dropping it.
 	stallTimeout time.Duration
@@ -118,6 +121,9 @@ type store struct {
 	// diskFullUntil pauses disk writes after the file system ran out of
 	// space.
 	diskFullUntil time.Time
+
+	extraPages atomic.Int64
+	spills     atomic.Int64
 
 	diskWrites  atomic.Int64
 	diskReads   atomic.Int64
@@ -189,6 +195,37 @@ func (s *store) direct() bool {
 	return s.cfg.pageCache == PageCacheBypass && s.cfg.pageSize%dioAlign == 0
 }
 
+// borrowExtra charges one page to the in-flight budget if it has room.
+func (s *store) borrowExtra() bool {
+	limit := s.cfg.extraBudget / int64(s.cfg.pageSize)
+
+	for {
+		n := s.extraPages.Load()
+		if n >= limit {
+			return false
+		}
+
+		if s.extraPages.CompareAndSwap(n, n+1) {
+			return true
+		}
+	}
+}
+
+func (s *store) releaseExtra(pages int) {
+	if pages > 0 {
+		s.extraPages.Add(-int64(pages))
+	}
+}
+
+// reserveSpill reserves disk for a fill that spills while it is in the
+// map. Detached fills do not spill: nothing would return the charge.
+func (s *store) reserveSpill(f *fill) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return f.inMap && !s.closed && s.reserveLocked(f)
+}
+
 func (s *store) readFile(cf *chunkFile, buf []byte, off int64, n int) error {
 	s.diskReads.Add(1)
 
@@ -217,7 +254,7 @@ func (s *store) get(k chunkKey, off int) *reader {
 
 	var r *reader
 	if ok {
-		r = f.newReaderLocked(off)
+		r = f.newReaderLocked(off, true)
 	}
 	f.mu.Unlock()
 
@@ -258,7 +295,7 @@ func (s *store) acquire(ctx context.Context, k chunkKey, off int, wait, shared b
 		if f := s.m[k]; f != nil {
 			f.mu.Lock()
 			if f.joinable(off) {
-				r = f.newReaderLocked(off)
+				r = f.newReaderLocked(off, shared)
 			}
 			f.mu.Unlock()
 
@@ -273,7 +310,7 @@ func (s *store) acquire(ctx context.Context, k chunkKey, off int, wait, shared b
 				s.mu.Unlock()
 
 				if shared {
-					f.startDisk()
+					f.startDisk(false)
 				}
 
 				return r, false, nil
@@ -284,7 +321,7 @@ func (s *store) acquire(ctx context.Context, k chunkKey, off int, wait, shared b
 
 		if s.inflight < s.cfg.maxFills {
 			f := s.newFillLocked(k, shared)
-			r = f.newReader(off)
+			r = f.newReader(off, shared)
 			s.mu.Unlock()
 
 			return r, true, nil
@@ -372,7 +409,7 @@ func (s *store) markOwned(f *fill) {
 	s.mu.Unlock()
 
 	if reserved {
-		f.startDisk()
+		f.startDisk(false)
 	}
 }
 
@@ -438,7 +475,7 @@ func (s *store) signalSpace() {
 // drops a failed fill or one that only streamed through memory.
 func (s *store) finished(f *fill, err error) {
 	f.mu.Lock()
-	onDisk := f.file != nil && !f.diskFailed
+	onDisk := f.file != nil && !f.diskFailed && f.diskStart == 0
 	size := f.diskSize
 	f.mu.Unlock()
 
@@ -554,8 +591,14 @@ type Stats struct {
 	// PageReadsShared counts page reads served by another reader's disk
 	// read or by the hot tier.
 	PageReadsShared int64
-	// StreamFills counts fills not written to disk.
+	// StreamFills counts fills not written to disk from their start.
 	StreamFills int64
+	// ExtraPageBytes is memory borrowed from the in-flight budget by
+	// fills whose readers lag.
+	ExtraPageBytes int64
+	// Spills counts fills that spilled to disk when the in-flight budget
+	// was exhausted.
+	Spills int64
 }
 
 func (s *store) stats() Stats {
@@ -573,6 +616,8 @@ func (s *store) stats() Stats {
 	st.DiskErrors = s.diskErrors.Load()
 	st.PageReadsShared = s.pages.hits.Load()
 	st.StreamFills = s.streamFills.Load()
+	st.ExtraPageBytes = s.extraPages.Load() * int64(s.cfg.pageSize)
+	st.Spills = s.spills.Load()
 
 	return st
 }

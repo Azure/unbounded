@@ -30,8 +30,12 @@ var errMetaMismatch = errors.New("meshfetch: chunk size differs between sources"
 // window read the page back from disk through the store's page cache,
 // which coalesces concurrent reads of the same page. A fill that is not
 // written to disk (stream-through) drops a page only once every reader has
-// passed it, so its slowest reader paces it; a reader stuck for longer
-// than the stall timeout is dropped and gets errLost.
+// passed it. When a reader lags behind a full window of a fill that peers
+// read, the fill borrows extra pages from the store's in-flight budget so
+// the peers are not slowed down; when the budget is exhausted the fill
+// spills to disk from its oldest page on. Otherwise (no peers, or no budget
+// and no disk) the slowest reader paces the fill, and a reader stuck for
+// longer than the stall timeout is dropped and gets errLost.
 type fill struct {
 	key   chunkKey
 	store *store
@@ -60,16 +64,23 @@ type fill struct {
 	winStart int
 	// readers are the open readers and their positions.
 	readers       map[*reader]struct{}
+	peers         int
 	fillerWaiting bool
+	// extra counts window pages beyond the base window, charged to the
+	// store's in-flight budget.
+	extra int
 
 	file       *chunkFile
 	diskFailed bool
 	diskSize   int64
 	writes     chan int
 	queued     int
-	// durable bytes of the chunk are on disk.
-	durable  int
-	detached bool
+	// Bytes [diskStart, durable) of the chunk are on disk. diskStart is
+	// nonzero for a fill that spilled to disk after dropping its first
+	// pages.
+	diskStart int
+	durable   int
+	detached  bool
 
 	// Guarded by store.mu.
 	prev, next *fill
@@ -85,7 +96,8 @@ type fill struct {
 // reader is one consumer of a fill. Its position holds back the window of
 // a fill that is not written to disk.
 type reader struct {
-	f *fill
+	f    *fill
+	peer bool
 	// Guarded by f.mu.
 	pos    int
 	kicked bool
@@ -103,7 +115,11 @@ func (f *fill) recycle() {
 	win := f.win
 	f.win = nil
 	cf := f.file
+	extra := f.extra
+	f.extra = 0
 	f.mu.Unlock()
+
+	f.store.releaseExtra(extra)
 
 	for _, p := range win {
 		p.release()
@@ -126,28 +142,48 @@ func (f *fill) broadcast() {
 // joinable reports whether f can serve a reader starting at off. Caller
 // holds f.mu.
 func (f *fill) joinable(off int) bool {
-	return !f.detached && (off >= f.winStart*f.store.cfg.pageSize || off < f.durable)
+	return !f.detached && (off >= f.winStart*f.store.cfg.pageSize || f.onDiskAt(off))
 }
 
-// newReaderLocked registers a reader at off. Caller holds f.mu and a
-// reference for the reader.
-func (f *fill) newReaderLocked(off int) *reader {
-	r := &reader{f: f, pos: off}
+// onDiskAt reports whether byte off is on disk. Caller holds f.mu.
+func (f *fill) onDiskAt(off int) bool { return off >= f.diskStart && off < f.durable }
+
+// newReaderLocked registers a reader at off; peer marks a reader serving
+// another member. Caller holds f.mu and a reference for the reader.
+func (f *fill) newReaderLocked(off int, peer bool) *reader {
+	r := &reader{f: f, pos: off, peer: peer}
 	if f.readers == nil {
 		f.readers = make(map[*reader]struct{})
 	}
 
 	f.readers[r] = struct{}{}
 
+	if peer {
+		f.peers++
+	}
+
 	return r
 }
 
 // newReader registers a reader at off for a reference the caller holds.
-func (f *fill) newReader(off int) *reader {
+func (f *fill) newReader(off int, peer bool) *reader {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	return f.newReaderLocked(off)
+	return f.newReaderLocked(off, peer)
+}
+
+// dropReaderLocked unregisters r. Caller holds f.mu.
+func (f *fill) dropReaderLocked(r *reader) {
+	if _, ok := f.readers[r]; !ok {
+		return
+	}
+
+	delete(f.readers, r)
+
+	if r.peer {
+		f.peers--
+	}
 }
 
 // close unregisters r and drops its reference.
@@ -155,7 +191,7 @@ func (r *reader) close() {
 	f := r.f
 
 	f.mu.Lock()
-	delete(f.readers, r)
+	f.dropReaderLocked(r)
 
 	if f.fillerWaiting {
 		f.broadcast()
@@ -176,26 +212,30 @@ func (f *fill) share() {
 
 // startDisk creates the chunk file and starts the writer once disk is
 // reserved and the size is known. A fill whose first page is gone is not
-// written: its reservation is returned.
-func (f *fill) startDisk() {
+// written, and its reservation is returned, unless spill is set: a
+// spilling fill writes from its oldest window page on. It reports whether
+// the fill is now written to disk.
+func (f *fill) startDisk(spill bool) bool {
 	if !f.wantDisk.Load() {
-		return
+		return false
 	}
 
 	s := f.store
 
 	f.mu.Lock()
 	if f.file != nil || f.diskFailed || !f.metaKnown || f.detached || (f.done && f.err != nil) {
+		ok := f.file != nil && !f.diskFailed
 		f.mu.Unlock()
-		return
+
+		return ok
 	}
 
-	if f.winStart > 0 {
+	if f.winStart > 0 && !spill {
 		f.diskFailed = true
 		f.mu.Unlock()
 		s.unreserve(f)
 
-		return
+		return false
 	}
 
 	var (
@@ -217,7 +257,14 @@ func (f *fill) startDisk() {
 		s.diskFailed(err)
 		s.unreserve(f)
 
-		return
+		return false
+	}
+
+	if spill {
+		f.diskStart = f.winStart * s.cfg.pageSize
+		f.queued, f.durable = f.diskStart, f.diskStart
+
+		s.spills.Add(1)
 	}
 
 	f.file = cf
@@ -228,6 +275,8 @@ func (f *fill) startDisk() {
 
 	f.queueLocked()
 	f.mu.Unlock()
+
+	return true
 }
 
 // unreserve returns f's disk reservation.
@@ -315,15 +364,20 @@ func (f *fill) writeLoop(cf *chunkFile, ch <-chan int) {
 
 	f.mu.Lock()
 
-	var win []*page
+	var (
+		win   []*page
+		extra int
+	)
 
 	if !f.diskFailed && f.done && f.err == nil && f.durable == f.chunkLen {
-		win = f.win
+		win, extra = f.win, f.extra
 		f.winStart += len(f.win)
-		f.win = nil
+		f.win, f.extra = nil, 0
 		f.broadcast()
 	}
 	f.mu.Unlock()
+
+	s.releaseExtra(extra)
 
 	for _, p := range win {
 		p.release()
@@ -353,7 +407,7 @@ func (f *fill) setMeta(total int64, ctype string, chunkLen int) error {
 	f.broadcast()
 	f.mu.Unlock()
 
-	f.startDisk()
+	f.startDisk(false)
 
 	return nil
 }
@@ -368,16 +422,20 @@ func (f *fill) progress() (int, bool) {
 
 // slot returns the window page holding byte n, waiting for room in the
 // window: a page leaves it once it is on disk, or for a fill not written
-// to disk, once every reader has passed it. touch is called while waiting
-// so a slow reader does not count as a stalled upstream.
+// to disk, once every reader has passed it. A fill that peers read, or
+// that is written to disk, borrows pages from the in-flight budget rather
+// than wait, and spills to disk when the budget is exhausted. touch is
+// called while waiting so a slow reader does not count as a stalled
+// upstream.
 func (f *fill) slot(ctx context.Context, n int, touch func()) (*page, error) {
 	s := f.store
 	ps := s.cfg.pageSize
 	pi := n / ps
 
 	var (
-		kick  <-chan time.Time
-		timer *time.Timer
+		kick       <-chan time.Time
+		timer      *time.Timer
+		spillTried bool
 	)
 
 	defer func() {
@@ -403,13 +461,31 @@ func (f *fill) slot(ctx context.Context, n int, touch func()) (*page, error) {
 
 		oldEnd := (f.winStart + 1) * ps
 		if f.persisting() && f.durable >= oldEnd || !f.persisting() && f.minReaderLocked() >= oldEnd {
-			f.win[0].release()
-			copy(f.win, f.win[1:])
-			f.win[len(f.win)-1] = nil
-			f.win = f.win[:len(f.win)-1]
-			f.winStart++
+			f.dropOldestLocked()
 
 			continue
+		}
+
+		if f.persisting() || f.peers > 0 {
+			if s.borrowExtra() {
+				f.extra++
+				p := s.pool.get()
+				f.win = append(f.win, p)
+
+				return p, nil
+			}
+
+			if !f.persisting() && !spillTried && s.disk != nil && !f.diskFailed {
+				spillTried = true
+
+				f.mu.Unlock()
+				ok := s.reserveSpill(f) && f.startDisk(true)
+				f.mu.Lock()
+
+				if ok {
+					continue
+				}
+			}
 		}
 
 		if timer == nil {
@@ -430,7 +506,9 @@ func (f *fill) slot(ctx context.Context, n int, touch func()) (*page, error) {
 			return nil, ctx.Err()
 		case <-kick:
 			f.mu.Lock()
-			f.kickLocked(oldEnd)
+			if !f.persisting() {
+				f.kickLocked(oldEnd)
+			}
 			f.mu.Unlock()
 
 			timer.Reset(s.cfg.stallTimeout)
@@ -445,6 +523,21 @@ func (f *fill) slot(ctx context.Context, n int, touch func()) (*page, error) {
 	}
 }
 
+// dropOldestLocked frees the oldest window page and returns a borrowed
+// page to the in-flight budget. Caller holds f.mu.
+func (f *fill) dropOldestLocked() {
+	f.win[0].release()
+	copy(f.win, f.win[1:])
+	f.win[len(f.win)-1] = nil
+	f.win = f.win[:len(f.win)-1]
+	f.winStart++
+
+	if f.extra > 0 {
+		f.extra--
+		f.store.releaseExtra(1)
+	}
+}
+
 // minReaderLocked returns the lowest position of a reader that still
 // needs the window. Readers before durable read from disk. Caller holds
 // f.mu.
@@ -452,7 +545,7 @@ func (f *fill) minReaderLocked() int {
 	low := int(^uint(0) >> 1)
 
 	for r := range f.readers {
-		if r.pos >= f.durable && r.pos < low {
+		if !f.onDiskAt(r.pos) && r.pos < low {
 			low = r.pos
 		}
 	}
@@ -464,9 +557,9 @@ func (f *fill) minReaderLocked() int {
 // get errLost and start over with a new fill. Caller holds f.mu.
 func (f *fill) kickLocked(end int) {
 	for r := range f.readers {
-		if r.pos >= f.durable && r.pos < end {
+		if !f.onDiskAt(r.pos) && r.pos < end {
 			r.kicked = true
-			delete(f.readers, r)
+			f.dropReaderLocked(r)
 		}
 	}
 
@@ -617,7 +710,7 @@ func (r *reader) streamTo(ctx context.Context, w io.Writer) (int64, error) {
 				f.mu.Unlock()
 
 				b, done = p.buf[off-pi*ps:end-pi*ps], p.release
-			case off < f.durable:
+			case f.onDiskAt(off):
 				cf, n := f.file, min(ps, f.chunkLen-pi*ps)
 				f.mu.Unlock()
 

@@ -108,6 +108,7 @@ func TestRendersEnabledCachemesh(t *testing.T) {
     memoryCacheBytes: 134217728
     pageSize: 2097152
     fillPages: 6
+    inflightBytes: 536870912
     pageCache: drop
     persist: shared
     chunkDirSizeLimit: 10Gi
@@ -148,6 +149,7 @@ func TestRendersEnabledCachemesh(t *testing.T) {
 		"  memory_cache_bytes: 134217728\n",
 		"  page_size: 2097152\n",
 		"  fill_pages: 6\n",
+		"  inflight_bytes: 536870912\n",
 		`  page_cache: "drop"`,
 		`  persist: "shared"`,
 		"  chunk_size: 33554432\n",
@@ -175,7 +177,7 @@ func TestRendersEnabledCachemesh(t *testing.T) {
 
 	m := c.Cachemesh
 	if !m.Enabled || m.DiskCacheBytes != 8<<30 || m.MemoryCacheBytes != 128<<20 || m.PageSize != 2<<20 ||
-		m.FillPages != 6 || m.PageCache != "drop" || m.Persist != "shared" || m.ChunkSize != 32<<20 || m.MaxNeighbors != 32 ||
+		m.FillPages != 6 || m.InflightBytes != 512<<20 || m.PageCache != "drop" || m.Persist != "shared" || m.ChunkSize != 32<<20 || m.MaxNeighbors != 32 ||
 		m.ExpectedSize != 150 || m.Lookahead != 12 || m.MetadataTTL != 10*time.Minute || m.CacheTags {
 		t.Fatalf("parsed cachemesh config: %+v", m)
 	}

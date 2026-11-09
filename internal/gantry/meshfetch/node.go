@@ -117,6 +117,10 @@ type Config struct {
 	// FillPages is the number of in-flight pages each fill holds. Zero
 	// uses 4.
 	FillPages int
+	// InflightBytes bounds pages that fills borrow beyond FillPages when a
+	// reader lags behind a fill that peers read. When it is exhausted the
+	// fill spills to disk. Zero disables borrowing.
+	InflightBytes int64
 	// PageCache selects page cache handling of chunk files. Empty uses
 	// PageCacheBypass.
 	PageCache PageCacheMode
@@ -170,7 +174,7 @@ func New(cfg Config) (*Node, error) {
 		return nil, fmt.Errorf("meshfetch: bad chunk size %d", cfg.ChunkSize)
 	}
 
-	if cfg.DiskBytes < 0 || cfg.MemoryBytes < 0 || cfg.FillPages < 0 {
+	if cfg.DiskBytes < 0 || cfg.MemoryBytes < 0 || cfg.FillPages < 0 || cfg.InflightBytes < 0 {
 		return nil, errors.New("meshfetch: negative cache size")
 	}
 
@@ -234,6 +238,7 @@ func New(cfg Config) (*Node, error) {
 		dir:          cfg.ChunkDir,
 		diskBudget:   cfg.DiskBytes,
 		hotBudget:    cfg.MemoryBytes,
+		extraBudget:  cfg.InflightBytes,
 		pageCache:    cfg.PageCache,
 		persist:      cfg.Persist,
 		stallTimeout: cfg.StallTimeout,

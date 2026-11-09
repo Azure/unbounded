@@ -92,7 +92,7 @@ data:
 
     cachemesh:
       enabled: true
-      {{- range $key, $field := dict "expectedSize" "expected_size" "maxNeighbors" "max_neighbors" "cellSize" "cell_size" "partitionBits" "partition_bits" "chunkSize" "chunk_size" "diskCacheBytes" "disk_cache_bytes" "memoryCacheBytes" "memory_cache_bytes" "pageSize" "page_size" "fillPages" "fill_pages" "lookahead" "lookahead" "maxConcurrentChunkFills" "max_concurrent_chunk_fills" "maxConcurrentChunkServes" "max_concurrent_chunk_serves" "chunkAttempts" "chunk_attempts" }}
+      {{- range $key, $field := dict "expectedSize" "expected_size" "maxNeighbors" "max_neighbors" "cellSize" "cell_size" "partitionBits" "partition_bits" "chunkSize" "chunk_size" "diskCacheBytes" "disk_cache_bytes" "memoryCacheBytes" "memory_cache_bytes" "pageSize" "page_size" "fillPages" "fill_pages" "inflightBytes" "inflight_bytes" "lookahead" "lookahead" "maxConcurrentChunkFills" "max_concurrent_chunk_fills" "maxConcurrentChunkServes" "max_concurrent_chunk_serves" "chunkAttempts" "chunk_attempts" }}
       {{- with (index $ "Values" "gantry" "cachemesh" $key) }}
       {{ $field }}: {{ . | int64 }}
       {{- end }}

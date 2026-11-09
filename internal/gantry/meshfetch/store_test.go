@@ -1043,3 +1043,134 @@ func TestPersistOwnedWritesOnlyOwnedChunks(t *testing.T) {
 	r.f.release()
 	r.close()
 }
+
+// A fill that a peer reads borrows pages from the in-flight budget instead
+// of waiting for a lagging reader, and returns them when it is done.
+func TestFillBorrowsInflightPagesForPeers(t *testing.T) {
+	s := newTestStore(t, func(c *storeConfig) {
+		c.dir = ""
+		c.extraBudget = 2 * testPage
+	})
+	data := pattern(11, testChunk)
+
+	r, _, _ := s.acquire(context.Background(), key(1), 0, false, false)
+	f := r.f
+	peer := s.get(key(1), 0)
+
+	_ = f.setMeta(int64(len(data)), "", len(data))
+
+	// Neither reader reads: the four-page chunk fits the two-page window
+	// plus two borrowed pages, so the fill never waits.
+	if err := f.readFrom(context.Background(), bytes.NewReader(data), nil); err != nil {
+		t.Fatal(err)
+	}
+
+	if st := s.stats(); st.ExtraPageBytes != 2*testPage {
+		t.Fatalf("borrowed %d bytes, want %d", st.ExtraPageBytes, 2*testPage)
+	}
+
+	f.finish(nil)
+	f.release()
+
+	for _, rd := range []*reader{r, peer} {
+		if got := readAll(t, rd); !bytes.Equal(got, data) {
+			t.Fatal("data mismatch")
+		}
+
+		rd.close()
+	}
+
+	if st := s.stats(); st.ExtraPageBytes != 0 || st.PageBytes != 0 {
+		t.Fatalf("pages not returned: %+v", st)
+	}
+}
+
+// Without a peer reader a lagging local reader paces the fill rather than
+// borrowing memory.
+func TestLocalOnlyFillDoesNotBorrow(t *testing.T) {
+	s := newTestStore(t, func(c *storeConfig) {
+		c.dir = ""
+		c.extraBudget = 8 * testPage
+	})
+	data := pattern(12, testChunk)
+
+	r, _, _ := s.acquire(context.Background(), key(1), 0, false, false)
+	f := r.f
+	_ = f.setMeta(int64(len(data)), "", len(data))
+
+	done := make(chan error, 1)
+
+	go func() { done <- f.readFrom(context.Background(), bytes.NewReader(data), nil) }()
+
+	waitFor(t, "fill paced", func() bool {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+
+		return f.fillerWaiting && f.n == 2*testPage
+	})
+
+	if st := s.stats(); st.ExtraPageBytes != 0 {
+		t.Fatalf("local-only fill borrowed: %+v", st)
+	}
+
+	if got := readAll(t, r); !bytes.Equal(got, data) {
+		t.Fatal("data mismatch")
+	}
+
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+
+	f.finish(nil)
+	f.release()
+	r.close()
+}
+
+// When the in-flight budget is exhausted a fill with a lagging peer spills
+// to disk from its oldest window page; the reader then reads from disk.
+func TestFillSpillsWhenBudgetExhausted(t *testing.T) {
+	s := newTestStore(t, func(c *storeConfig) {
+		c.chunkSize = 16 * testPage
+		c.persist = PersistOwned
+		c.extraBudget = testPage
+	})
+	data := pattern(13, 16*testPage)
+
+	r, _, _ := s.acquire(context.Background(), key(1), 3*testPage, false, true)
+	f := r.f
+
+	if f.wantDisk.Load() {
+		t.Fatal("PersistOwned fill wants disk before spilling")
+	}
+
+	_ = f.setMeta(int64(len(data)), "", len(data))
+
+	if err := f.readFrom(context.Background(), bytes.NewReader(data), nil); err != nil {
+		t.Fatal(err)
+	}
+
+	f.finish(nil)
+	f.release()
+
+	waitFor(t, "spilled pages on disk", func() bool { return onDisk(f) })
+
+	st := s.stats()
+	if st.Spills != 1 || st.DiskWrites != 13 {
+		t.Fatalf("stats: %+v", st)
+	}
+
+	if got := readAll(t, r); !bytes.Equal(got, data[3*testPage:]) {
+		t.Fatal("spilled data mismatch")
+	}
+
+	r.close()
+
+	// A spilled chunk lacks its first pages: it is not cached.
+	if cached(s, key(1)) {
+		t.Fatal("partial chunk cached")
+	}
+
+	if st := s.stats(); st.ExtraPageBytes != 0 || st.DiskBytes != 0 {
+		t.Fatalf("after close: %+v", st)
+	}
+}

@@ -20,6 +20,7 @@ const (
 	DefaultCachemeshMemCacheBytes  = 256 << 20
 	DefaultCachemeshPageSize       = 1 << 20
 	DefaultCachemeshFillPages      = 4
+	DefaultCachemeshInflightBytes  = 1 << 30
 	DefaultCachemeshPageCache      = "bypass"
 	DefaultCachemeshPersist        = "all"
 	DefaultCachemeshMetadataTTL    = 5 * time.Minute
@@ -122,8 +123,8 @@ type CachemeshConfig struct {
 	// MemoryCacheBytes bounds the hot page tier: pages read from disk by
 	// two or more concurrent readers that stay in memory for the next
 	// ones. Zero disables it. Total chunk memory is about this plus
-	// page_size * (fill_pages * max_concurrent_chunk_fills + one page per
-	// active reader).
+	// inflight_bytes plus page_size * (fill_pages *
+	// max_concurrent_chunk_fills + one page per active reader).
 	MemoryCacheBytes int64 `yaml:"memory_cache_bytes"`
 
 	// PageSize is the unit of in-flight buffers, disk I/O, read
@@ -135,6 +136,13 @@ type CachemeshConfig struct {
 	// memory. Readers within this window get bytes from memory as they
 	// arrive; slower readers read from disk.
 	FillPages int `yaml:"fill_pages"`
+
+	// InflightBytes bounds memory that fills borrow beyond fill_pages when
+	// a reader lags behind a fill that peers also read, so one slow reader
+	// does not slow the others down. When it is exhausted such a fill
+	// spills to disk; without disk the slowest reader paces it. Zero
+	// disables borrowing.
+	InflightBytes int64 `yaml:"inflight_bytes"`
 
 	// PageCache selects how chunk files use the kernel page cache:
 	// "bypass" (O_DIRECT, the default), "drop" (buffered I/O, then
@@ -192,6 +200,7 @@ func defaultCachemeshConfig() CachemeshConfig {
 		MemoryCacheBytes:         DefaultCachemeshMemCacheBytes,
 		PageSize:                 DefaultCachemeshPageSize,
 		FillPages:                DefaultCachemeshFillPages,
+		InflightBytes:            DefaultCachemeshInflightBytes,
 		PageCache:                DefaultCachemeshPageCache,
 		Persist:                  DefaultCachemeshPersist,
 		MaxConcurrentChunkFills:  64,
@@ -273,6 +282,7 @@ func (c *Config) loadCachemeshEnv(env func(string) string) []error {
 	num("CACHEMESH_MEMORY_CACHE_BYTES", func(n int64) { m.MemoryCacheBytes = n })
 	num("CACHEMESH_PAGE_SIZE", func(n int64) { m.PageSize = n })
 	num("CACHEMESH_FILL_PAGES", setInt(&m.FillPages))
+	num("CACHEMESH_INFLIGHT_BYTES", func(n int64) { m.InflightBytes = n })
 	str("CACHEMESH_PAGE_CACHE", &m.PageCache)
 	str("CACHEMESH_PERSIST", &m.Persist)
 	num("CACHEMESH_MAX_CONCURRENT_CHUNK_FILLS", setInt(&m.MaxConcurrentChunkFills))
@@ -348,6 +358,10 @@ func (c *Config) validateCachemesh() []error {
 
 	if m.PageSize < MinCachemeshPageSize || m.PageSize&(m.PageSize-1) != 0 || m.PageSize > m.ChunkSize {
 		bad("page_size", "must be a power of two between %d and chunk_size, got %d", MinCachemeshPageSize, m.PageSize)
+	}
+
+	if m.InflightBytes < 0 {
+		bad("inflight_bytes", "must be >= 0, got %d", m.InflightBytes)
 	}
 
 	if m.FillPages < 2 || m.FillPages > 256 {

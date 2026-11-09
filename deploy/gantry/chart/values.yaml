@@ -112,15 +112,19 @@ gantry:
     # above diskCacheBytes: the kubelet evicts the pod when it is exceeded.
     chunkDirSizeLimit: ""
     # Hot page tier in bytes: pages read from disk by concurrent readers that
-    # stay in memory (256MiB). Chunk memory is about this plus pageSize x
-    # (fillPages x maxConcurrentChunkFills + one page per active reader), so
-    # the defaults stay under 1GiB and the default 8Gi memory limit is ample.
+    # stay in memory (256MiB). Chunk memory is about this plus inflightBytes
+    # plus pageSize x (fillPages x maxConcurrentChunkFills + one page per
+    # active reader), so the defaults stay under 2GiB and the default 8Gi
+    # memory limit is ample.
     memoryCacheBytes: 0
     # Unit of in-flight buffers, disk I/O, read coalescing, and the hot tier
     # (1MiB): a power of two between 64KiB and chunkSize.
     pageSize: 0
     # In-flight pages per chunk fill (4).
     fillPages: 0
+    # Memory fills borrow beyond fillPages when a reader lags behind a fill
+    # that peers also read; when exhausted such fills spill to disk (1GiB).
+    inflightBytes: 0
     # Page cache use of chunk files: bypass (O_DIRECT), drop (buffered, then
     # fadvise DONTNEED), or keep ("bypass").
     pageCache: ""

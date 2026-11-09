@@ -29,7 +29,7 @@ func TestCachemeshDefaultsDisabled(t *testing.T) {
 
 	if m.ChunkSize != 64<<20 || m.MetadataTTL != 5*time.Minute || m.LeaseName != "gantry-cachemesh" ||
 		m.DiskCacheBytes != 20<<30 || m.MemoryCacheBytes != 256<<20 || m.ChunkDir != "/var/lib/gantry/cachemesh" ||
-		m.PageSize != 1<<20 || m.FillPages != 4 || m.PageCache != "bypass" || m.Persist != "all" || m.MaxNeighbors != 32 || !m.CacheTags || !m.VerifyDigest || m.Lookahead != 8 {
+		m.PageSize != 1<<20 || m.FillPages != 4 || m.InflightBytes != 1<<30 || m.PageCache != "bypass" || m.Persist != "all" || m.MaxNeighbors != 32 || !m.CacheTags || !m.VerifyDigest || m.Lookahead != 8 {
 		t.Fatalf("unexpected defaults: %+v", m)
 	}
 
@@ -77,6 +77,7 @@ func TestCachemeshValidateEnabled(t *testing.T) {
 		"cachemesh.page_size too small":        func(c *Config) { c.Cachemesh.PageSize = 4096 },
 		"cachemesh.page_size over chunk":       func(c *Config) { c.Cachemesh.PageSize = 2 * c.Cachemesh.ChunkSize },
 		"cachemesh.fill_pages":                 func(c *Config) { c.Cachemesh.FillPages = 1 },
+		"cachemesh.inflight_bytes":             func(c *Config) { c.Cachemesh.InflightBytes = -1 },
 		"cachemesh.page_cache":                 func(c *Config) { c.Cachemesh.PageCache = "sometimes" },
 		"cachemesh.persist":                    func(c *Config) { c.Cachemesh.Persist = "never" },
 		"cachemesh.lookahead":                  func(c *Config) { c.Cachemesh.Lookahead = 0 },
@@ -159,6 +160,7 @@ cachemesh:
 		"GANTRY_CACHEMESH_CHUNK_DIR":          "/data/mesh",
 		"GANTRY_CACHEMESH_PAGE_SIZE":          "2097152",
 		"GANTRY_CACHEMESH_FILL_PAGES":         "8",
+		"GANTRY_CACHEMESH_INFLIGHT_BYTES":     "4096",
 		"GANTRY_CACHEMESH_PAGE_CACHE":         "drop",
 		"GANTRY_CACHEMESH_PERSIST":            "shared",
 		"GANTRY_CACHEMESH_LOOKAHEAD":          "16",
@@ -172,7 +174,7 @@ cachemesh:
 
 	m := c.Cachemesh
 	if m.Enabled || m.ChunkSize != 32<<20 || m.MaxNeighbors != 48 || m.DiskCacheBytes != 1<<30 ||
-		m.MemoryCacheBytes != 0 || m.ChunkDir != "/data/mesh" || m.PageSize != 2<<20 || m.FillPages != 8 ||
+		m.MemoryCacheBytes != 0 || m.ChunkDir != "/data/mesh" || m.PageSize != 2<<20 || m.FillPages != 8 || m.InflightBytes != 4096 ||
 		m.PageCache != "drop" || m.Persist != "shared" ||
 		m.Lookahead != 16 || m.Hedge || m.ChunkTimeout != time.Minute {
 		t.Fatalf("env not applied: %+v", m)

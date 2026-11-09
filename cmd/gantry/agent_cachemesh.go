@@ -186,28 +186,29 @@ func newCachemeshAgent(c *config.Config, origin ifaces.OriginPuller, reg *metric
 	}
 
 	node, err := meshfetch.New(meshfetch.Config{
-		Mesh:         mesh,
-		Origin:       rangeOrigin,
-		Tags:         tagOrigin,
-		ChunkSize:    cm.ChunkSize,
-		ChunkDir:     chunkDir(cm),
-		DiskBytes:    cm.DiskCacheBytes,
-		MemoryBytes:  cm.MemoryCacheBytes,
-		PageSize:     int(cm.PageSize),
-		FillPages:    cm.FillPages,
-		PageCache:    meshfetch.PageCacheMode(cm.PageCache),
-		Persist:      meshfetch.PersistPolicy(cm.Persist),
-		MaxFills:     cm.MaxConcurrentChunkFills,
-		MaxServes:    cm.MaxConcurrentChunkServes,
-		Lookahead:    cm.Lookahead,
-		ChunkTimeout: cm.ChunkTimeout,
-		StallTimeout: cm.ChunkStallTimeout,
-		Attempts:     cm.ChunkAttempts,
-		Hedge:        cm.Hedge,
-		Verify:       cm.VerifyDigest,
-		MetadataTTL:  cm.MetadataTTL,
-		Logger:       logger,
-		Hooks:        m.hooks(),
+		Mesh:          mesh,
+		Origin:        rangeOrigin,
+		Tags:          tagOrigin,
+		ChunkSize:     cm.ChunkSize,
+		ChunkDir:      chunkDir(cm),
+		DiskBytes:     cm.DiskCacheBytes,
+		MemoryBytes:   cm.MemoryCacheBytes,
+		PageSize:      int(cm.PageSize),
+		FillPages:     cm.FillPages,
+		InflightBytes: cm.InflightBytes,
+		PageCache:     meshfetch.PageCacheMode(cm.PageCache),
+		Persist:       meshfetch.PersistPolicy(cm.Persist),
+		MaxFills:      cm.MaxConcurrentChunkFills,
+		MaxServes:     cm.MaxConcurrentChunkServes,
+		Lookahead:     cm.Lookahead,
+		ChunkTimeout:  cm.ChunkTimeout,
+		StallTimeout:  cm.ChunkStallTimeout,
+		Attempts:      cm.ChunkAttempts,
+		Hedge:         cm.Hedge,
+		Verify:        cm.VerifyDigest,
+		MetadataTTL:   cm.MetadataTTL,
+		Logger:        logger,
+		Hooks:         m.hooks(),
 	})
 	if err != nil {
 		return nil, err
@@ -488,6 +489,14 @@ func (m *cachemeshMetrics) registerGauges(reg *metrics.Registry, a *cachemeshAge
 		Name: "gantry_cachemesh_shared_page_reads_total",
 		Help: "Page reads served by a concurrent reader's disk read or the hot tier instead of the disk.",
 	}, func() float64 { return float64(a.node.Stats().PageReadsShared) })
+	reg.NewGaugeFunc(sub, prometheus.GaugeOpts{
+		Name: "gantry_cachemesh_inflight_borrowed_bytes",
+		Help: "Memory fills borrowed from the in-flight budget for lagging readers.",
+	}, func() float64 { return float64(a.node.Stats().ExtraPageBytes) })
+	reg.NewCounterFunc(sub, prometheus.CounterOpts{
+		Name: "gantry_cachemesh_spills_total",
+		Help: "Chunk fills that spilled to disk because the in-flight budget was exhausted.",
+	}, func() float64 { return float64(a.node.Stats().Spills) })
 	reg.NewCounterFunc(sub, prometheus.CounterOpts{
 		Name: "gantry_cachemesh_stream_fills_total",
 		Help: "Chunk fills not written to disk (stream-through).",
