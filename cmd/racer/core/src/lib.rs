@@ -1,7 +1,7 @@
 //! Sans-IO Racer decision logic.
 //!
 //! The production dataplane and `racer-dst` both call this crate. Callers pass time and an explicit
-//! RNG ([`time::SplitMix64`]) in; the crate never reads clocks, spawns threads, or reads OS
+//! RNG ([`rng::SplitMix64`]) in; the crate never reads clocks, spawns threads, or reads OS
 //! randomness (`tests/purity.rs` and `clippy.toml` enforce this).
 
 pub mod admission;
@@ -13,6 +13,6 @@ pub use racer_flow_core as flow;
 pub mod liveness;
 pub mod prefetch;
 pub mod read;
+pub mod rng;
 pub mod route;
 pub mod subscriptions;
-pub mod time;

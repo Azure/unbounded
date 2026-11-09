@@ -33,7 +33,7 @@ use racer_authority::{
         state::{StateError, StateRecord, Term},
     },
 };
-use racer_core::time::SplitMix64;
+use racer_core::rng::SplitMix64;
 use racer_wire::control::ProtocolFailure;
 use serde_json::{Value, json};
 

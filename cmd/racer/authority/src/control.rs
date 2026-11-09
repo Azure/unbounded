@@ -182,7 +182,7 @@ impl Authority {
     ) -> Result<Self, Error> {
         config.validate()?;
         let executor = Executor::simulated(os, clock, seed, MAX_TASKS).map_err(|_| Error::Io)?;
-        let rng = Box::new(racer_core::time::SplitMix64::new(seed));
+        let rng = Box::new(racer_core::rng::SplitMix64::new(seed));
         Self::build(config, executor, rng, Outer::new())
     }
 

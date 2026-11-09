@@ -4,7 +4,7 @@
 //! [`SplitMix64`], so key ids, key material, jitter, and claim delays
 //! replay exactly. `SplitMix64` is not for production key material.
 
-use racer_core::time::SplitMix64;
+use racer_core::rng::SplitMix64;
 
 /// Entropy failed. Production callers fail closed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

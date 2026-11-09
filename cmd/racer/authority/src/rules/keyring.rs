@@ -657,7 +657,7 @@ pub fn plan_with(
 pub(crate) mod tests {
     use super::*;
     use crate::entropy::{Failing, OsEntropy};
-    use racer_core::time::SplitMix64;
+    use racer_core::rng::SplitMix64;
 
     const CLUSTER: &str = "11111111-1111-4111-8111-111111111111";
     const DAY: u64 = 86400;

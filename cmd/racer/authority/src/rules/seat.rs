@@ -385,7 +385,7 @@ pub fn need_image(record: &StateRecord, image: Option<&Record>, is_primary: bool
 mod tests {
     use super::*;
     use crate::{annotations, entropy::Failing, limits, rules::election::LeaseSpec};
-    use racer_core::time::SplitMix64;
+    use racer_core::rng::SplitMix64;
 
     #[test]
     fn jitter_is_bounded_and_seeded() {

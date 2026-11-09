@@ -431,7 +431,7 @@ impl Contend {
 mod tests {
     use super::*;
     use crate::{entropy::Failing, rules::state::Term};
-    use racer_core::time::SplitMix64;
+    use racer_core::rng::SplitMix64;
     use serde_json::json;
 
     const C: &str = "c1c1c1c1-0000-4000-8000-000000000001";

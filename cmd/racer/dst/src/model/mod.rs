@@ -78,7 +78,7 @@ use topology::{Exhaustive, PathQuery, Paths, Placement, REPLICAS};
 
 pub use report::{Counters, Report};
 
-use racer_core::time::SplitMix64;
+use racer_core::rng::SplitMix64;
 
 use crate::{
     choices::Choices,
