@@ -257,14 +257,26 @@ fn checkpoints_alternate_slots_and_decode_newest_first() {
                 .unwrap();
             let (slot, next) = SLOTS.next_publication(Some((0, 1))).unwrap();
             assert_eq!((slot, next), (1, 2));
+            let mark = r.sim_os().map(|os| os.trace().len());
             SLOTS
                 .publish(&r, &dir, slot, &image(next, b"two"), chunk, &ctx)
                 .await
                 .unwrap();
+            // Publishing into an existing directory issues no fsync at all.
+            if let (Some(os), Some(mark)) = (r.sim_os(), mark) {
+                let trace = os.trace();
+                assert!(trace[mark..].iter().any(|e| e.operation == "submit:rename"));
+                assert!(!trace[mark..].iter().any(|e| e.operation == "submit:fsync"));
+            }
             let mut found = SLOTS
                 .candidates(&r, &dir, 64, sequence, decode, &ctx)
                 .await
                 .unwrap();
+            // Short reads resume in place inside the single image buffer.
+            if let Some(os) = r.sim_os() {
+                os.inject("read", crate::sim::Fault::Short(1)).unwrap();
+                os.inject("read", crate::sim::Fault::Short(1)).unwrap();
+            }
             assert_eq!(found.next(&r, &ctx).await, Some((1, b"two".to_vec())));
             assert_eq!(found.next(&r, &ctx).await, Some((0, b"one".to_vec())));
             assert!(found.next(&r, &ctx).await.is_none());

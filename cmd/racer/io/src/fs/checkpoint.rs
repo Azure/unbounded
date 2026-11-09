@@ -4,7 +4,7 @@
 //! Callers serialize publication and decide whether a decoded image can be
 //! installed. Slot failures are disposable (the slot is skipped); an
 //! inaccessible directory is an error.
-use super::{Durability, Replacement, ReplacementError, check_regular_size};
+use super::{BENEATH, Durability, NO_SYMLINKS, Replacement, ReplacementError, check_regular_size};
 use crate::{
     Error, Reactor, Result,
     ring::{Descriptor, OpCtx},
@@ -138,7 +138,7 @@ impl<const HEADER: usize> Slots<HEADER> {
         if stat.stx_size < self.minimum_bytes as u64 {
             return Err(Error::InvalidInput);
         }
-        let header = read_exact(reactor, &file, 0, vec![0; HEADER], ctx).await?;
+        let header = read_exact(reactor, &file, 0, vec![0; HEADER], 0, ctx).await?;
         Ok(Candidate {
             slot,
             sequence: sequence(&header)?,
@@ -158,7 +158,8 @@ impl<const HEADER: usize> Slots<HEADER> {
     }
 
     /// Publish `bytes` into `slot` through a fixed stage with bounded scratch
-    /// and no fsync (a periodic hint). Creates the directory if needed.
+    /// and no fsync (a periodic hint). Opens an existing directory without
+    /// syncing; only a missing directory is created (and its parents synced).
     pub async fn publish(
         &self,
         reactor: &Reactor,
@@ -174,21 +175,39 @@ impl<const HEADER: usize> Slots<HEADER> {
             .names
             .get(slot)
             .ok_or(BeforeRename(Error::InvalidInput))?;
-        let dir = reactor
-            .open_directory(directory, true, false, ctx)
-            .await
-            .map_err(BeforeRename)?;
+        let dir = match reactor.open_directory(directory, false, false, ctx).await {
+            Err(Error::NotFound) => reactor.open_directory(directory, true, false, ctx).await,
+            other => other,
+        }
+        .map_err(BeforeRename)?;
         let temporary = ".checkpoint.stage";
-        let staged = reactor
-            .create_stage(dir.clone(), temporary.as_ref(), ctx)
+        let stage = CString::new(temporary).unwrap();
+        // A stale stage is disposable: unlink it without a directory fsync.
+        reactor
+            .unlink(dir.clone(), stage.clone(), 0, true, ctx)
+            .map_err(BeforeRename)?
             .await
             .map_err(BeforeRename)?;
+        let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL;
+        let staged = Rc::new(
+            reactor
+                .open(
+                    Some(dir.clone()),
+                    stage.clone(),
+                    flags,
+                    BENEATH | NO_SYMLINKS,
+                    ctx,
+                )
+                .map_err(BeforeRename)?
+                .await
+                .map_err(BeforeRename)?,
+        );
         reactor
             .replace(
                 Replacement {
                     directory: dir,
                     staged,
-                    temporary: CString::new(temporary).unwrap(),
+                    temporary: stage,
                     target: CString::new(*name).map_err(|_| BeforeRename(Error::InvalidInput))?,
                     durability: Durability::Publish,
                 },
@@ -200,28 +219,47 @@ impl<const HEADER: usize> Slots<HEADER> {
     }
 }
 
-/// Read exactly `buffer.len()` bytes at `offset`.
+/// Exclusive read target: the tail of a vector from `from` on. The heap
+/// allocation is never resized while it is owned by an operation.
+struct Tail {
+    bytes: Vec<u8>,
+    from: usize,
+}
+
+// SAFETY: the Vec is owned by the operation and never resized while pending,
+// so its heap allocation is stable across moves of the header.
+unsafe impl crate::ring::IoBuffer for Tail {
+    fn bytes(&self) -> Result<&[u8]> {
+        self.bytes.get(self.from..).ok_or(Error::InvalidInput)
+    }
+
+    fn bytes_mut(&mut self) -> Result<&mut [u8]> {
+        self.bytes.get_mut(self.from..).ok_or(Error::InvalidInput)
+    }
+}
+
+/// Fill `bytes[from..]` from the file at `offset + (position - from)`, in place.
 async fn read_exact(
     reactor: &Reactor,
     file: &Rc<Descriptor>,
     offset: u64,
-    buffer: Vec<u8>,
+    bytes: Vec<u8>,
+    from: usize,
     ctx: &OpCtx,
 ) -> Result<Vec<u8>> {
-    let mut out = buffer;
-    let mut filled = 0;
-    while filled < out.len() {
-        let chunk = vec![0; out.len() - filled];
+    let mut tail = Tail { bytes, from };
+    while tail.from < tail.bytes.len() {
+        let position = offset + (tail.from - from) as u64;
         let done = reactor
-            .read_at(file.clone(), offset + filled as u64, chunk, (), ctx)
+            .read_at(file.clone(), position, tail, (), ctx)
             .await?;
         if done.bytes == 0 {
             return Err(Error::InvalidInput);
         }
-        out[filled..filled + done.bytes].copy_from_slice(&done.buffer[..done.bytes]);
-        filled += done.bytes;
+        tail = done.buffer;
+        tail.from += done.bytes;
     }
-    Ok(out)
+    Ok(tail.bytes)
 }
 
 impl<T, const HEADER: usize> Candidates<T, HEADER> {
@@ -246,18 +284,11 @@ impl<T, const HEADER: usize> Candidates<T, HEADER> {
     ) -> Result<T> {
         let mut bytes = Vec::new();
         bytes
-            .try_reserve_exact(candidate.length + 1)
+            .try_reserve_exact(candidate.length)
             .map_err(|_| Error::Overloaded)?;
         bytes.extend_from_slice(&candidate.header);
-        let rest = read_exact(
-            reactor,
-            &candidate.file,
-            HEADER as u64,
-            vec![0; candidate.length - HEADER],
-            ctx,
-        )
-        .await?;
-        bytes.extend_from_slice(&rest);
+        bytes.resize(candidate.length, 0);
+        let bytes = read_exact(reactor, &candidate.file, HEADER as u64, bytes, HEADER, ctx).await?;
         // Never grow the allocation if the file grew after probing.
         let probe = reactor
             .read_at(candidate.file, candidate.length as u64, vec![0; 1], (), ctx)
