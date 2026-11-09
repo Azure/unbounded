@@ -1550,10 +1550,16 @@ fn device_removal_breaks_rail_and_recovers_after_reopen() {
     let granted = w.a.clients[0].grant(TO_B, ea, [1; 16], 10, deadline);
     let granted = wait(&mut w, &granted).unwrap();
     assert_eq!(w.a.clients[0].device_losses(), 0);
+    assert_eq!(
+        w.a.owner().poll_fds().len(),
+        2,
+        "completion and CM channels"
+    );
     assert!(w.sim.remove_device("sim1") >= 2, "listener and link ids");
     pump(&mut w);
-    assert!(
-        w.a.owner().poll_fds().is_empty(),
+    assert_eq!(
+        w.a.owner().poll_fds(),
+        [],
         "a lost device's channels are no longer waited on"
     );
     assert_eq!(ready(&granted.arrival).err(), Some(Error::Unavailable));
