@@ -76,7 +76,7 @@ func (n *Node) FetchBlob(ctx context.Context, w io.Writer, ref ifaces.OriginRef,
 		return false, 0, nil
 	}
 
-	mctx, mcancel := context.WithTimeout(ctx, n.cfg.ChunkTimeout)
+	mctx, mcancel := context.WithTimeout(ctx, n.cfg.tune.chunkTimeout)
 	total, ctype, _, err := r0.f.meta(mctx)
 
 	mcancel()
@@ -142,7 +142,7 @@ type pending struct {
 // r0 of c0, while a producer keeps up to Lookahead later chunks in flight.
 func (n *Node) streamChunks(ctx context.Context, w io.Writer, r0 *reader, c0, last int64, mk func(int64) chunkReq) error {
 	pctx, pcancel := context.WithCancel(ctx)
-	ch := make(chan pending, n.cfg.Lookahead)
+	ch := make(chan pending, n.cfg.tune.lookahead)
 
 	go func() {
 		defer close(ch)
@@ -221,7 +221,7 @@ func (n *Node) copyChunk(ctx context.Context, w io.Writer, r *reader, req chunkR
 			return nil
 		}
 
-		if ctx.Err() != nil || errors.Is(err, errDownstream) || terminal(err) || attempt >= n.cfg.Attempts {
+		if ctx.Err() != nil || errors.Is(err, errDownstream) || terminal(err) || attempt >= n.cfg.tune.attempts {
 			return err
 		}
 

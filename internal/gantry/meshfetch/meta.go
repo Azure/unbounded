@@ -153,7 +153,7 @@ func (n *Node) fetchMeta(registry, repo, tag string, decide decider) (*metaEntry
 		altHdr  cachemesh.Header
 	)
 
-	for attempt := range n.cfg.Attempts {
+	for attempt := range n.cfg.tune.attempts {
 		if attempt > 0 && alt.IsZero() {
 			if err := sleepCtx(n.ctx, backoff(attempt)); err != nil {
 				return nil, errClosed
@@ -227,7 +227,7 @@ func (n *Node) fetchMeta(registry, repo, tag string, decide decider) (*metaEntry
 }
 
 func (n *Node) metaFromOrigin(registry, repo, tag string) (*metaEntry, error) {
-	ctx, cancel := context.WithTimeout(n.ctx, n.cfg.ChunkTimeout)
+	ctx, cancel := context.WithTimeout(n.ctx, n.cfg.tune.chunkTimeout)
 	defer cancel()
 
 	// Stamp before asking the origin, so the value cannot outlive the TTL
@@ -243,7 +243,7 @@ func (n *Node) metaFromOrigin(registry, repo, tag string) (*metaEntry, error) {
 }
 
 func (n *Node) metaFromPeer(p cachemesh.PeerRef, hdr cachemesh.Header, registry, repo, tag string) (*metaEntry, error) {
-	ctx, cancel := context.WithTimeout(n.ctx, min(n.cfg.ChunkTimeout, n.cfg.StallTimeout))
+	ctx, cancel := context.WithTimeout(n.ctx, min(n.cfg.tune.chunkTimeout, n.cfg.tune.stallTimeout))
 	defer cancel()
 
 	q := url.Values{}

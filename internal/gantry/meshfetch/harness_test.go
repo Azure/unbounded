@@ -362,7 +362,7 @@ func newCluster(t testing.TB, o clusterOpts) *cluster {
 			seeds = []string{c.nodes[0].id + ":1"}
 		}
 
-		tuning := fastTuning()
+		meshTuning := fastTuning()
 
 		m, err := cachemesh.New(cachemesh.Config{
 			ID:            id,
@@ -376,28 +376,29 @@ func newCluster(t testing.TB, o clusterOpts) *cluster {
 			CellSize:      o.cellSize,
 			MaxNeighbors:  o.maxNeighbors,
 			EpochPeriod:   200 * time.Millisecond,
-			Tuning:        tuning,
+			Tuning:        meshTuning,
 		})
 		if err != nil {
 			t.Fatal(err)
 		}
 
 		cfg := Config{
-			Mesh:         m,
-			Origin:       c.origin,
-			Tags:         c.origin,
-			ChunkSize:    o.chunkSize,
-			MaxFills:     1024,
-			MaxServes:    1024,
-			Lookahead:    o.lookahead,
-			ChunkTimeout: 20 * time.Second,
-			StallTimeout: o.stall,
-			Attempts:     o.attempts,
-			Hedge:        o.hedge,
-			Verify:       o.verify,
-			MetadataTTL:  cachemesh.MinTTL,
-			DataAddr:     c.dataAddr,
-			Logger:       logger,
+			Mesh:      m,
+			Origin:    c.origin,
+			Tags:      c.origin,
+			ChunkSize: o.chunkSize,
+			MaxFills:  1024,
+			Verify:    o.verify,
+			DataAddr:  c.dataAddr,
+			Logger:    logger,
+			tune: tuning{
+				maxServes:    1024,
+				lookahead:    o.lookahead,
+				chunkTimeout: 20 * time.Second,
+				stallTimeout: o.stall,
+				attempts:     o.attempts,
+				noHedge:      !o.hedge,
+			},
 		}
 
 		content := newMemContent()

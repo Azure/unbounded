@@ -232,8 +232,8 @@ func TestFetchBlobDeclinesBeforeHeaders(t *testing.T) {
 	}
 
 	n, err := New(Config{
-		Mesh: m, Origin: c.origin, ChunkSize: 1 << 16, MaxFills: 1, MaxServes: 1,
-		Lookahead: 1, ChunkTimeout: time.Second, StallTimeout: time.Second, Attempts: 1,
+		Mesh: m, Origin: c.origin, ChunkSize: 1 << 16, MaxFills: 1,
+		tune: tuning{maxServes: 1, lookahead: 1, chunkTimeout: time.Second, stallTimeout: time.Second, attempts: 1},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -367,7 +367,7 @@ func TestFetchBlobRetriesAroundDeadOwner(t *testing.T) {
 }
 
 func TestChunkHandlerShedsAndValidates(t *testing.T) {
-	c := newCluster(t, clusterOpts{n: 1, tweak: func(cfg *Config) { cfg.MaxServes = 1 }})
+	c := newCluster(t, clusterOpts{n: 1, tweak: func(cfg *Config) { cfg.tune.maxServes = 1 }})
 	n := c.nodes[0]
 
 	d := c.origin.add(randomBlob(8, 1000), "")

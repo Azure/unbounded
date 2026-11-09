@@ -131,7 +131,7 @@ func (n *Node) fillChunk(f *fill, req chunkReq, decide decider) error {
 		return nil
 	}
 
-	for attempt := range n.cfg.Attempts {
+	for attempt := range n.cfg.tune.attempts {
 		if n.ctx.Err() != nil {
 			return errClosed
 		}
@@ -218,7 +218,7 @@ func (n *Node) fillChunk(f *fill, req chunkReq, decide decider) error {
 			if !d.Alternate.IsZero() {
 				alt, altHdr = d.Alternate, d.AlternateHeader()
 
-				if n.cfg.Hedge {
+				if !n.cfg.tune.noHedge {
 					hedgeAfter, hedgeTo, hedgeHdr = d.HedgeAfter, alt, altHdr
 				}
 			}
@@ -263,16 +263,16 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 // attemptCtx returns a context bounded by ChunkTimeout that is also
 // canceled when touch is not called for StallTimeout.
 func (n *Node) attemptCtx() (ctx context.Context, touch func(), stalled func() bool, cancel func()) {
-	ctx, cancelCtx := context.WithTimeout(n.ctx, n.cfg.ChunkTimeout)
+	ctx, cancelCtx := context.WithTimeout(n.ctx, n.cfg.tune.chunkTimeout)
 
 	var fired atomic.Bool
 
-	timer := time.AfterFunc(n.cfg.StallTimeout, func() {
+	timer := time.AfterFunc(n.cfg.tune.stallTimeout, func() {
 		fired.Store(true)
 		cancelCtx()
 	})
 
-	return ctx, func() { timer.Reset(n.cfg.StallTimeout) }, fired.Load, func() {
+	return ctx, func() { timer.Reset(n.cfg.tune.stallTimeout) }, fired.Load, func() {
 		timer.Stop()
 		cancelCtx()
 	}
@@ -726,7 +726,7 @@ func (n *Node) sendChunk(ctx context.Context, stalled func() bool, req chunkReq,
 			}
 
 			if stalled() {
-				n.observe(target, cachemesh.Timeout, n.cfg.StallTimeout)
+				n.observe(target, cachemesh.Timeout, n.cfg.tune.stallTimeout)
 			}
 
 			return nil, cachemesh.PeerRef{}, ctx.Err()

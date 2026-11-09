@@ -103,36 +103,22 @@ type Config struct {
 	// Tags resolves tags this node owns. Nil disables tag resolution.
 	Tags TagOrigin
 
+	// ChunkSize is the stripe size. Required; every member must agree.
 	ChunkSize int64
 	// Content is the local containerd content store, the only disk tier:
 	// chunks behind a fill's window and chunks no longer in memory are
 	// read from it. Nil serves peers from memory only.
 	Content ContentSource
-	// PageSize is the unit of in-flight buffers, content store reads,
-	// and read coalescing. Zero uses min(1MiB, ChunkSize). It
-	// must divide ChunkSize.
-	PageSize int
-	// FillPages is the number of in-flight pages each fill holds. Zero
-	// uses 4.
-	FillPages int
-	// InflightBytes bounds pages that fills borrow beyond FillPages: for a
-	// reader that lags behind a fill that peers read, and to keep chunks
-	// that peers read in memory for later peers. When it is exhausted the
-	// slowest reader the content store does not cover paces the fill.
-	// Zero disables borrowing.
+	// InflightBytes bounds pages that fills borrow beyond their window:
+	// for a reader that lags behind a fill that peers read, and to keep
+	// chunks that peers read in memory for later peers. When it is
+	// exhausted the slowest reader the content store does not cover paces
+	// the fill. Zero disables borrowing.
 	InflightBytes int64
-	// LingerTTL drops a complete chunk held in borrowed pages once it is
-	// unused for this long. Zero uses 30s.
-	LingerTTL    time.Duration
-	MaxFills     int
-	MaxServes    int
-	Lookahead    int
-	ChunkTimeout time.Duration
-	StallTimeout time.Duration
-	Attempts     int
-	Hedge        bool
-	Verify       bool
-	MetadataTTL  time.Duration
+	// MaxFills caps chunk fills in progress. Zero uses 64.
+	MaxFills int
+	// Verify hashes every full blob FetchBlob serves.
+	Verify bool
 
 	// Client sends data-plane requests. Nil uses NewDataClient().
 	Client *http.Client
@@ -142,6 +128,69 @@ type Config struct {
 
 	Logger *slog.Logger
 	Hooks  Hooks
+
+	// tune overrides internal limits in tests. Zero fields use defaults.
+	tune tuning
+}
+
+// tuning holds internal limits. Production uses the defaults; tests shrink
+// them.
+type tuning struct {
+	// pageSize is the unit of in-flight buffers, content store reads, and
+	// read coalescing. It divides ChunkSize.
+	pageSize int
+	// fillPages is the number of in-flight pages each fill holds.
+	fillPages int
+	// lingerTTL drops a complete chunk held in borrowed pages once it is
+	// unused for this long.
+	lingerTTL time.Duration
+	// maxServes caps concurrent chunk responses to peers.
+	maxServes int
+	// lookahead is the number of chunks of one blob in flight ahead of
+	// the one being written.
+	lookahead int
+	// chunkTimeout bounds one fill attempt.
+	chunkTimeout time.Duration
+	// stallTimeout fails a fill attempt without progress for this long.
+	stallTimeout time.Duration
+	// attempts bounds fill attempts per chunk.
+	attempts int
+	// noHedge disables hedged chunk requests.
+	noHedge bool
+}
+
+// Defaults of the internal limits.
+const (
+	defaultPageSize     = 1 << 20
+	defaultFillPages    = 4
+	defaultMaxFills     = 64
+	defaultMaxServes    = 512
+	defaultLookahead    = 8
+	defaultChunkTimeout = 5 * time.Minute
+	defaultStallTimeout = 30 * time.Second
+	defaultAttempts     = 4
+)
+
+func (t *tuning) setDefaults(chunkSize int64) {
+	def := func(v *int, d int) {
+		if *v <= 0 {
+			*v = d
+		}
+	}
+	defDur := func(v *time.Duration, d time.Duration) {
+		if *v <= 0 {
+			*v = d
+		}
+	}
+
+	def(&t.pageSize, int(min(chunkSize, defaultPageSize)))
+	def(&t.fillPages, defaultFillPages)
+	def(&t.maxServes, defaultMaxServes)
+	def(&t.lookahead, defaultLookahead)
+	def(&t.attempts, defaultAttempts)
+	defDur(&t.lingerTTL, defaultLingerTTL)
+	defDur(&t.chunkTimeout, defaultChunkTimeout)
+	defDur(&t.stallTimeout, defaultStallTimeout)
 }
 
 // Node serves and fetches chunks and metadata for one agent.
@@ -174,29 +223,21 @@ func New(cfg Config) (*Node, error) {
 		return nil, fmt.Errorf("meshfetch: bad chunk size %d", cfg.ChunkSize)
 	}
 
-	if cfg.FillPages < 0 || cfg.InflightBytes < 0 {
-		return nil, errors.New("meshfetch: negative cache size")
+	if cfg.InflightBytes < 0 {
+		return nil, errors.New("meshfetch: negative in-flight budget")
 	}
 
-	if cfg.PageSize == 0 {
-		cfg.PageSize = int(min(cfg.ChunkSize, 1<<20))
+	if cfg.MaxFills <= 0 {
+		cfg.MaxFills = defaultMaxFills
 	}
 
-	if cfg.PageSize < 0 || int64(cfg.PageSize) > cfg.ChunkSize || cfg.ChunkSize%int64(cfg.PageSize) != 0 {
-		return nil, fmt.Errorf("meshfetch: page size %d must divide chunk size %d", cfg.PageSize, cfg.ChunkSize)
+	cfg.tune.setDefaults(cfg.ChunkSize)
+
+	if cfg.ChunkSize%int64(cfg.tune.pageSize) != 0 {
+		return nil, fmt.Errorf("meshfetch: page size %d must divide chunk size %d", cfg.tune.pageSize, cfg.ChunkSize)
 	}
 
-	if cfg.MaxFills <= 0 || cfg.MaxServes <= 0 || cfg.Lookahead <= 0 || cfg.Attempts <= 0 ||
-		cfg.ChunkTimeout <= 0 || cfg.StallTimeout <= 0 {
-		return nil, errors.New("meshfetch: limits and timeouts must be positive")
-	}
-
-	ttl := cfg.MetadataTTL
-	if ttl == 0 {
-		ttl = cachemesh.MinTTL
-	}
-
-	metaKS, err := cachemesh.NewKeyspace("gantry-meta", ttl)
+	metaKS, err := cachemesh.NewKeyspace("gantry-meta", cachemesh.MinTTL)
 	if err != nil {
 		return nil, err
 	}
@@ -216,13 +257,13 @@ func New(cfg Config) (*Node, error) {
 	log := cfg.Logger.With(slog.String("subsystem", "meshfetch"))
 	st := newStore(storeConfig{
 		chunkSize:    cfg.ChunkSize,
-		pageSize:     cfg.PageSize,
-		window:       cfg.FillPages,
+		pageSize:     cfg.tune.pageSize,
+		window:       cfg.tune.fillPages,
 		maxFills:     cfg.MaxFills,
 		extraBudget:  cfg.InflightBytes,
-		lingerTTL:    cfg.LingerTTL,
+		lingerTTL:    cfg.tune.lingerTTL,
 		content:      cfg.Content,
-		stallTimeout: cfg.StallTimeout,
+		stallTimeout: cfg.tune.stallTimeout,
 		logger:       log,
 	})
 
@@ -237,7 +278,7 @@ func New(cfg Config) (*Node, error) {
 		meta:    newMetaCache(4096),
 		client:  cfg.Client,
 		log:     log,
-		serves:  make(chan struct{}, cfg.MaxServes),
+		serves:  make(chan struct{}, cfg.tune.maxServes),
 		ctx:     ctx,
 		cancel:  cancel,
 	}

@@ -111,7 +111,7 @@ func (n *Node) handleChunk(w http.ResponseWriter, r *http.Request) {
 
 	defer rd.close()
 
-	ctx, cancel := context.WithTimeout(r.Context(), n.cfg.ChunkTimeout)
+	ctx, cancel := context.WithTimeout(r.Context(), n.cfg.tune.chunkTimeout)
 	defer cancel()
 
 	total, ctype, chunkLen, err := rd.f.meta(ctx)
