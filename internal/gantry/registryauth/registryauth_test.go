@@ -51,3 +51,22 @@ func TestDetachRetainsOnlyAuthorization(t *testing.T) {
 		t.Fatalf("unrelated context value retained: %v", got)
 	}
 }
+
+func TestWithAnonymous(t *testing.T) {
+	if Anonymous(context.Background()) {
+		t.Fatal("background context is anonymous")
+	}
+
+	ctx := WithAnonymous(WithAuthorization(context.Background(), "Bearer tok"))
+	if !Anonymous(ctx) {
+		t.Fatal("WithAnonymous not reported")
+	}
+
+	if got := Authorization(ctx); got != "" {
+		t.Fatalf("delegated authorization survived: %q", got)
+	}
+
+	if Anonymous(nil) { //nolint:staticcheck // nil context is handled explicitly
+		t.Fatal("nil context is anonymous")
+	}
+}

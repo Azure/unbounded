@@ -17,6 +17,8 @@ const MaxAuthorizationBytes = 64 * 1024
 
 type contextKey struct{}
 
+type anonymousKey struct{}
+
 // Normalize validates and normalizes an Authorization header value for
 // delegation. Basic and Bearer are supported; other schemes are rejected.
 // The returned value is empty for an absent, malformed, unsupported, or
@@ -88,4 +90,24 @@ func WithoutAuthorization(ctx context.Context) context.Context {
 // mirror or coordination request without retaining unrelated request values.
 func Detach(ctx context.Context) context.Context {
 	return WithAuthorization(context.Background(), Authorization(ctx))
+}
+
+// WithAnonymous returns a child context that asks the origin client to make
+// the request with no identity at all: no delegated authorization, no
+// configured credentials, and no token obtained with them. It is used when
+// the result is shared with requesters whose own authority is unknown, so it
+// must only be what an anonymous client could fetch.
+func WithAnonymous(ctx context.Context) context.Context {
+	return context.WithValue(WithoutAuthorization(ctx), anonymousKey{}, true)
+}
+
+// Anonymous reports whether ctx requires an identity-free origin request.
+func Anonymous(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+
+	v, _ := ctx.Value(anonymousKey{}).(bool) //nolint:errcheck // ok is irrelevant: absent means false
+
+	return v
 }

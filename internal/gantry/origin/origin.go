@@ -1207,6 +1207,10 @@ const manifestAccept = "application/vnd.oci.image.manifest.v1+json, " +
 	"application/vnd.docker.distribution.manifest.list.v2+json"
 
 func (r *registry) doRange(ctx context.Context, method, urlStr, rangeValue string) (*http.Response, error) {
+	if registryauth.Anonymous(ctx) {
+		return r.doAnonymous(ctx, method, urlStr, rangeValue)
+	}
+
 	delegatedAuthorization := registryauth.Authorization(ctx)
 	if delegatedAuthorization != "" && !r.canSendBasicAuth() {
 		return nil, &tokenError{
@@ -1302,6 +1306,80 @@ func (r *registry) doRange(ctx context.Context, method, urlStr, rangeValue strin
 	return r.hc.Do(req2)
 }
 
+// doAnonymous issues a request with no identity: no delegated or cached
+// authorization, no configured Basic credentials, and no URL user
+// information. A Bearer challenge is answered with an anonymous token that is
+// not cached, so it cannot be reused by credentialed requests and a
+// credentialed token cannot be reused here. An endpoint configured with a
+// query string is refused, because the query may carry a credential that
+// cannot be told apart from routing parameters.
+func (r *registry) doAnonymous(ctx context.Context, method, urlStr, rangeValue string) (*http.Response, error) {
+	u, err := url.Parse(urlStr)
+	if err != nil {
+		return nil, err
+	}
+
+	if r.base != nil && r.base.RawQuery != "" {
+		return nil, &tokenError{
+			class: ifaces.FailureAuth,
+			err:   errors.New("anonymous request refused: registry endpoint has a query string"),
+		}
+	}
+
+	u.User = nil
+	urlStr = u.String()
+
+	build := func(authorization string) (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, method, urlStr, nil)
+		if err != nil {
+			return nil, err
+		}
+
+		if strings.Contains(urlStr, "/manifests/") {
+			req.Header.Set("Accept", manifestAccept)
+		}
+
+		if authorization != "" {
+			req.Header.Set("Authorization", authorization)
+		}
+
+		if rangeValue != "" {
+			req.Header.Set("Range", rangeValue)
+		}
+
+		return req, nil
+	}
+
+	req, err := build("")
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := r.hc.Do(req)
+	if err != nil || resp.StatusCode != http.StatusUnauthorized {
+		return resp, err
+	}
+
+	challenge := resp.Header.Get("WWW-Authenticate")
+	if !strings.HasPrefix(strings.ToLower(challenge), "bearer ") {
+		return resp, nil
+	}
+
+	_ = resp.Body.Close() //nolint:errcheck // best-effort body close
+
+	tok, _, err := r.fetchBearerToken(ctx, challenge)
+	if err != nil {
+		return nil, err
+	}
+
+	req2, err := build("Bearer " + tok)
+	if err != nil {
+		return nil, err
+	}
+
+	return r.hc.Do(req2)
+}
+
 func parseOriginContentRange(value string) (start, end, size int64, ok bool) {
 	if !strings.HasPrefix(value, "bytes ") {
 		return 0, 0, 0, false
@@ -1378,7 +1456,7 @@ func (r *registry) fetchBearerToken(ctx context.Context, challenge string) (stri
 		return "", 0, err
 	}
 
-	if r.canSendBasicAuth() && r.username != "" {
+	if r.canSendBasicAuth() && r.username != "" && !registryauth.Anonymous(ctx) {
 		req.SetBasicAuth(r.username, r.password)
 	}
 
