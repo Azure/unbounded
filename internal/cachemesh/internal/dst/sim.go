@@ -50,8 +50,9 @@ import (
 	"math/rand/v2"
 	"time"
 
-	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
 	"github.com/zeebo/xxh3"
+
+	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
 )
 
 // Target is an allocation-free event receiver. Fire is called with the two

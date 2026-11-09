@@ -4,7 +4,10 @@
 package view_test
 
 import (
+	"bytes"
 	"errors"
+	"math"
+	"math/rand/v2"
 	"strconv"
 	"testing"
 	"time"
@@ -477,5 +480,523 @@ func TestCopyOnWrite(t *testing.T) {
 		}
 
 		v, snap = nv, view.EncodeSnapshot(nv)
+	}
+}
+
+// mutate returns a possibly invalid variant of op on cur.
+func (g *gen) mutate(cur *view.View, op view.Op) view.Op {
+	r := g.r
+	ms := g.members(cur)
+	anySlot := func() uint32 {
+		switch r.IntN(4) {
+		case 0:
+			return ms[r.IntN(len(ms))]
+		case 1:
+			return cur.SlotCap() + uint32(r.IntN(3))
+		case 2:
+			return view.NoSlot
+		default:
+			return r.Uint32N(cur.SlotCap() + 1)
+		}
+	}
+
+	switch r.IntN(14) {
+	case 0:
+		op.Slot = anySlot()
+	case 1:
+		op.Cell = r.Uint32N(cur.Shape().Cells() + 2)
+	case 2:
+		op.State = view.MemberState(r.IntN(5))
+		op.Weight = r.Uint32N(view.MaxWeight + 2)
+	case 3:
+		// Duplicate ID of an existing member.
+		var m *view.Member
+
+		m, _ = cur.Member(ms[r.IntN(len(ms))])
+		op = view.OpAddMember(cur.NextSlot(), *m)
+	case 4:
+		op = view.OpNewTerm(cur.Term()+uint64(r.IntN(2)), anySlot())
+	case 5:
+		op = view.OpRemoveMember(anySlot())
+	case 6:
+		op = view.OpAssign([]uint32{0, 0}, []uint32{ms[0], ms[0]})
+	case 7:
+		op = view.OpAssign([]uint32{uint32(cur.Table().Len())}, []uint32{ms[0]})
+	case 8:
+		op = view.OpAssign([]uint32{0}, []uint32{anySlot()})
+	case 9:
+		op = view.OpEpoch(cur.Epoch()-uint64(r.IntN(2)), time.Duration(r.IntN(3))*time.Second)
+	case 10:
+		op = view.OpConfig(view.Config{PartitionBits: uint8(r.IntN(30))})
+	case 11:
+		op = view.OpInvalidate(r.Uint64N(3), cur.Gen(0)+uint32(r.IntN(2)))
+	case 12:
+		m := viewtest.NewMember("x-"+strconv.Itoa(r.IntN(1000)), r.Uint64())
+		m.Key ^= uint64(r.IntN(2))
+		m.State = view.MemberState(r.IntN(4))
+		op = view.OpAddMember(anySlot(), m)
+	default:
+		sh, err := view.NewShape(1 + r.Uint32N(3))
+		if err != nil {
+			g.t.Fatal(err)
+		}
+
+		cells := make([]uint32, int(cur.SlotCap())+r.IntN(3)-1)
+		for i := range cells {
+			cells[i] = r.Uint32N(sh.Cells() + 1)
+			if r.IntN(3) == 0 {
+				cells[i] = view.NoCell
+			}
+		}
+
+		op = view.OpReshape(sh, cells)
+	}
+
+	return op
+}
+
+// TestHostileDeltas applies random, often invalid deltas: Apply must either
+// fail and leave base untouched, or return a view that passes Validate.
+// Every retained old view must keep its content across later applies.
+func TestHostileDeltas(t *testing.T) {
+	seeds, steps := 30, 300
+	if testing.Short() {
+		seeds, steps = 4, 80
+	}
+
+	type kept struct {
+		v    *view.View
+		snap []byte
+	}
+
+	for seed := range uint64(seeds) {
+		g := &gen{t: t, r: rand.New(rand.NewPCG(seed, 0xbad))}
+
+		v, err := view.Apply(view.Genesis(), g.first())
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		var old []kept
+
+		accepted := 0
+
+		for i := range steps {
+			var ops []view.Op
+
+			cur := v
+			for range 1 + g.r.IntN(4) {
+				o := g.op(cur)
+				if len(o) == 0 {
+					continue
+				}
+
+				if g.r.IntN(3) == 0 {
+					j := g.r.IntN(len(o))
+					o[j] = g.mutate(cur, o[j])
+				}
+
+				ops = append(ops, o...)
+
+				if nv, err := view.Apply(cur, view.NewDelta(cur, o...)); err == nil {
+					cur = nv
+				}
+			}
+
+			before := view.EncodeSnapshot(v)
+
+			nv, err := view.Apply(v, view.NewDelta(v, ops...))
+			if !bytes.Equal(view.EncodeSnapshot(v), before) {
+				t.Fatalf("seed %d step %d: base changed by Apply (err %v)", seed, i, err)
+			}
+
+			if err != nil {
+				continue
+			}
+
+			if err := view.Validate(nv); err != nil {
+				t.Fatalf("seed %d step %d: accepted invalid view: %v", seed, i, err)
+			}
+
+			accepted++
+
+			if i%10 == 0 {
+				// Random shapes include dimensions of size 1 and 2 and
+				// sparse cells.
+				checkMonitoring(t, nv)
+			}
+
+			if g.r.IntN(4) == 0 {
+				old = append(old, kept{v, before})
+			}
+
+			v = nv
+		}
+
+		for _, k := range old {
+			if !bytes.Equal(view.EncodeSnapshot(k.v), k.snap) {
+				t.Fatalf("seed %d: retained view %v changed", seed, k.v.Version())
+			}
+
+			if err := view.Validate(k.v); err != nil {
+				t.Fatalf("seed %d: retained view %v: %v", seed, k.v.Version(), err)
+			}
+		}
+
+		if accepted < steps/4 {
+			t.Fatalf("seed %d: only %d of %d deltas accepted", seed, accepted, steps)
+		}
+	}
+}
+
+// TestEpochOverflow checks that a removal at a huge epoch does not wrap the
+// slot reuse epoch around and make the slot reusable at once.
+func TestEpochOverflow(t *testing.T) {
+	v := boot(t, 3)
+	v = mustApply(t, v, view.OpEpoch(math.MaxUint64-1, time.Second))
+
+	c, _ := v.Config()
+	if c.SlotReuseEpochs == 0 {
+		t.Skip("boot config has no reuse delay")
+	}
+
+	victim := uint32(2)
+	if v.Leader() == victim {
+		victim = 1
+	}
+
+	var parts, owners []uint32
+
+	tb := v.Table()
+	for p := range uint32(tb.Len()) {
+		if tb.Owner(p) == victim {
+			parts, owners = append(parts, p), append(owners, v.Leader())
+		}
+	}
+
+	var ops []view.Op
+	if len(parts) > 0 {
+		ops = append(ops, view.OpAssign(parts, owners))
+	}
+
+	v = mustApply(t, v, append(ops, view.OpRemoveMember(victim))...)
+	mustFail(t, v, view.ErrInvalid, view.OpAddMember(victim, active(99, 0)))
+}
+
+// TestDeltaLogAheadAndFork checks that Since refuses a view ahead of the
+// head and a view on a fork created by a different leader of the same term
+// and seq.
+func TestDeltaLogAheadAndFork(t *testing.T) {
+	vs, ds := chain(t, 6)
+
+	l := view.NewDeltaLog(8)
+	l.Reset(vs[0])
+
+	for _, d := range ds {
+		if err := l.Append(d, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	head := vs[len(vs)-1]
+
+	ahead := mustApply(t, head, view.OpEpoch(head.Epoch()+1, time.Second))
+	if _, ok := l.Since(ahead.Version(), ahead.Digest(), 0); ok {
+		t.Fatal("served a view ahead of the head")
+	}
+
+	newTerm := mustApply(t, head, view.OpNewTerm(head.Term()+1, head.Leader()))
+	if _, ok := l.Since(newTerm.Version(), newTerm.Digest(), 0); ok {
+		t.Fatal("served a view in a later term")
+	}
+
+	// A fork off vs[2] with the same version as vs[3] but another digest.
+	fork := mustApply(t, vs[2], view.OpEpoch(vs[2].Epoch()+5, time.Second))
+	if fork.Version() != vs[3].Version() || fork.Digest() == vs[3].Digest() {
+		t.Fatal("fork setup")
+	}
+
+	if _, ok := l.Since(fork.Version(), fork.Digest(), 0); ok {
+		t.Fatal("served a forked view")
+	}
+
+	if got, ok := l.Since(vs[3].Version(), vs[3].Digest(), 0); !ok || len(got) != 3 {
+		t.Fatalf("got %d entries, ok %v", len(got), ok)
+	}
+}
+
+// gen generates random valid deltas. It plans each op on a scratch view
+// that has every earlier op of the delta applied.
+type gen struct {
+	t      *testing.T
+	r      *rand.Rand
+	nextID int
+}
+
+func (g *gen) members(v *view.View) []uint32 {
+	var out []uint32
+
+	v.ForEachMember(func(s uint32, _ *view.Member) bool {
+		out = append(out, s)
+		return true
+	})
+
+	return out
+}
+
+func (g *gen) newMember(v *view.View) view.Member {
+	g.nextID++
+	m := viewtest.NewMember("g-"+strconv.Itoa(g.nextID), g.r.Uint64())
+	m.Cell = g.r.Uint32N(v.Shape().Cells())
+
+	switch g.r.IntN(3) {
+	case 0:
+		m.State = view.Joining
+	case 1:
+		m.State, m.Weight = view.Active, 1+g.r.Uint32N(view.MaxWeight)
+	default:
+		m.State = view.Draining
+	}
+
+	return m
+}
+
+func (g *gen) first() *view.Delta {
+	c := view.Config{
+		PartitionBits:   uint8(4 + g.r.IntN(7)),
+		InitialOwner:    0,
+		SlotReuseEpochs: uint32(g.r.IntN(5)),
+		HandoffEpochs:   2,
+	}
+
+	ops := []view.Op{view.OpNewTerm(1, 0), view.OpConfig(c), view.OpEpoch(1, time.Second)}
+
+	g.nextID++
+
+	m := viewtest.NewMember("g-"+strconv.Itoa(g.nextID), 1)
+	m.State = view.Active
+
+	ops = append(ops, view.OpAddMember(0, m))
+
+	return view.NewDelta(view.Genesis(), ops...)
+}
+
+// op returns a random op valid on cur, or ops (assign then remove).
+func (g *gen) op(cur *view.View) []view.Op {
+	r := g.r
+	ms := g.members(cur)
+	leader := cur.Leader()
+
+	switch r.IntN(10) {
+	case 0:
+		return []view.Op{view.OpEpoch(cur.Epoch()+uint64(r.IntN(6)), time.Duration(1+r.IntN(3))*time.Second)}
+	case 1:
+		seed := uint64(r.IntN(4))
+		return []view.Op{view.OpInvalidate(seed, cur.Gen(seed)+1+uint32(r.IntN(2)))}
+	case 2, 3:
+		slot := cur.SlotCap()
+		if r.IntN(2) == 0 {
+			slot = cur.NextSlot()
+		}
+
+		return []view.Op{view.OpAddMember(slot, g.newMember(cur))}
+	case 4:
+		cand := make([]uint32, 0, len(ms))
+		for _, s := range ms {
+			if s != leader {
+				cand = append(cand, s)
+			}
+		}
+
+		if len(cand) == 0 {
+			return nil
+		}
+
+		victim := cand[r.IntN(len(cand))]
+
+		var parts, owners []uint32
+
+		t := cur.Table()
+		for p := range uint32(t.Len()) {
+			if t.Owner(p) == victim {
+				parts = append(parts, p)
+				owners = append(owners, cand[r.IntN(len(cand))])
+			}
+		}
+
+		for i, o := range owners {
+			if o == victim {
+				owners[i] = leader
+			}
+		}
+
+		var ops []view.Op
+		if len(parts) > 0 {
+			ops = append(ops, view.OpAssign(parts, owners))
+		}
+
+		return append(ops, view.OpRemoveMember(victim))
+	case 5:
+		s := ms[r.IntN(len(ms))]
+
+		st := view.MemberState(1 + r.IntN(3))
+
+		w := uint32(0)
+		if st == view.Active {
+			w = r.Uint32N(view.MaxWeight + 1)
+		}
+
+		return []view.Op{view.OpSetState(s, st, w)}
+	case 6:
+		return []view.Op{view.OpSetCell(ms[r.IntN(len(ms))], r.Uint32N(cur.Shape().Cells()))}
+	case 7:
+		if r.IntN(3) != 0 {
+			return nil
+		}
+
+		sizes := make([]uint32, 1+r.IntN(3))
+		for i := range sizes {
+			sizes[i] = 1 + r.Uint32N(4)
+		}
+
+		sh, err := view.NewShape(sizes...)
+		if err != nil {
+			g.t.Fatal(err)
+		}
+
+		cells := make([]uint32, cur.SlotCap())
+		for s := range cells {
+			cells[s] = view.NoCell
+			if cur.IsMember(uint32(s)) {
+				cells[s] = r.Uint32N(sh.Cells())
+			}
+		}
+
+		return []view.Op{view.OpReshape(sh, cells)}
+	default:
+		n := 1 + r.IntN(40)
+		perm := r.Perm(cur.Table().Len())[:min(n, cur.Table().Len())]
+		parts := make([]uint32, len(perm))
+		owners := make([]uint32, len(perm))
+
+		for i, p := range perm {
+			parts[i], owners[i] = uint32(p), ms[r.IntN(len(ms))]
+		}
+
+		return []view.Op{view.OpAssign(parts, owners)}
+	}
+}
+
+func (g *gen) delta(base *view.View) *view.Delta {
+	var ops []view.Op
+
+	cur := base
+	if g.r.IntN(15) == 0 {
+		ms := g.members(base)
+		ops = append(ops, view.OpNewTerm(base.Term()+1+uint64(g.r.IntN(2)), ms[g.r.IntN(len(ms))]))
+		cur = g.step(cur, ops)
+	}
+
+	for range 1 + g.r.IntN(6) {
+		o := g.op(cur)
+		if len(o) == 0 {
+			continue
+		}
+
+		for _, op := range o {
+			cur = g.step(cur, []view.Op{op})
+		}
+
+		ops = append(ops, o...)
+	}
+
+	return view.NewDelta(base, ops...)
+}
+
+func (g *gen) step(v *view.View, ops []view.Op) *view.View {
+	nv, err := view.Apply(v, view.NewDelta(v, ops...))
+	if err != nil {
+		g.t.Fatalf("generator produced an invalid op %v: %v", ops[0].Kind, err)
+	}
+
+	return nv
+}
+
+func checkRoundTrips(t *testing.T, base, v *view.View, d *view.Delta) {
+	t.Helper()
+
+	enc := view.EncodeDelta(d)
+
+	dd, err := view.DecodeDelta(enc)
+	if err != nil {
+		t.Fatalf("decode delta: %v", err)
+	}
+
+	if !bytes.Equal(view.EncodeDelta(dd), enc) {
+		t.Fatal("delta re-encoding differs")
+	}
+
+	v2, err := view.Apply(base, dd)
+	if err != nil || !view.Equal(v, v2) {
+		t.Fatalf("decoded delta applies differently: %v", err)
+	}
+
+	snap := view.EncodeSnapshot(v)
+
+	sv, err := view.DecodeSnapshot(snap)
+	if err != nil {
+		t.Fatalf("decode snapshot: %v", err)
+	}
+
+	if !view.Equal(v, sv) {
+		t.Fatal("snapshot round trip not equal")
+	}
+
+	if !bytes.Equal(view.EncodeSnapshot(sv), snap) {
+		t.Fatal("snapshot re-encoding differs")
+	}
+}
+
+func TestRandomDeltas(t *testing.T) {
+	seeds := 20
+	steps := 150
+
+	if testing.Short() {
+		seeds, steps = 4, 60
+	}
+
+	for seed := range uint64(seeds) {
+		g := &gen{t: t, r: rand.New(rand.NewPCG(seed, 0x5eed))}
+		v := view.Genesis()
+
+		d := g.first()
+
+		nv, err := view.Apply(v, d)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		checkRoundTrips(t, v, nv, d)
+		v = nv
+
+		for i := range steps {
+			d := g.delta(v)
+
+			nv, err := view.Apply(v, d)
+			if err != nil {
+				t.Fatalf("seed %d step %d: %v", seed, i, err)
+			}
+
+			if err := view.Validate(nv); err != nil {
+				t.Fatalf("seed %d step %d: %v", seed, i, err)
+			}
+
+			if err := view.Validate(v); err != nil {
+				t.Fatalf("seed %d step %d: base changed: %v", seed, i, err)
+			}
+
+			checkRoundTrips(t, v, nv, d)
+			v = nv
+		}
 	}
 }

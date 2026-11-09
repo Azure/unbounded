@@ -16,7 +16,10 @@ package view
 
 import (
 	"crypto/sha256"
+	"encoding/hex"
 	"math"
+	"slices"
+	"strconv"
 	"time"
 )
 
@@ -301,4 +304,466 @@ func (v *View) lookupID(id string) Slot {
 			return s
 		}
 	}
+}
+
+// Slot is a member's index in a view. Slots are dense, reused only after
+// Config.SlotReuseEpochs epochs, and stable for the lifetime of a member.
+type Slot = uint32
+
+// NoSlot means no member.
+const NoSlot Slot = math.MaxUint32
+
+// Version orders views. Versions compare by Term, then Seq. The zero Version
+// is the genesis view, which has no members.
+type Version struct {
+	Term uint64
+	Seq  uint64
+}
+
+// Less reports whether v orders before o.
+func (v Version) Less(o Version) bool {
+	if v.Term != o.Term {
+		return v.Term < o.Term
+	}
+
+	return v.Seq < o.Seq
+}
+
+// IsZero reports whether v is the genesis version.
+func (v Version) IsZero() bool { return v == Version{} }
+
+// String formats v as "term.seq".
+func (v Version) String() string {
+	return strconv.FormatUint(v.Term, 10) + "." + strconv.FormatUint(v.Seq, 10)
+}
+
+// DigestSize is the size of a view digest in bytes.
+const DigestSize = 32
+
+// Digest identifies the content of a view. Two views with the same Version
+// and a different Digest are a safety violation.
+type Digest [DigestSize]byte
+
+// String returns the first 8 bytes of d in hex, enough for logs.
+func (d Digest) String() string { return hex.EncodeToString(d[:8]) }
+
+// MemberState is a member's lifecycle state in a view.
+type MemberState uint8
+
+// Member states. The zero value is invalid so that a missing state is caught
+// by Validate.
+const (
+	// Joining members are admitted but own no partitions (weight 0) until
+	// they leave quarantine.
+	Joining MemberState = 1
+	// Active members own partitions according to their weight.
+	Active MemberState = 2
+	// Draining members are leaving: weight 0, removed after the drain period.
+	Draining MemberState = 3
+)
+
+// Valid reports whether s is a defined state.
+func (s MemberState) Valid() bool { return s >= Joining && s <= Draining }
+
+// String returns the state name.
+func (s MemberState) String() string {
+	switch s {
+	case Joining:
+		return "Joining"
+	case Active:
+		return "Active"
+	case Draining:
+		return "Draining"
+	default:
+		return "MemberState(" + strconv.Itoa(int(s)) + ")"
+	}
+}
+
+// Limits on view contents. Apply rejects values beyond them and the decoders
+// use them to bound allocation on hostile input.
+const (
+	// MaxIDLen bounds Member.ID (a DNS subdomain name fits).
+	MaxIDLen = 253
+	// MaxAddrLen bounds Member.Addr.
+	MaxAddrLen = 1024
+	// MaxZoneLen bounds Member.Zone.
+	MaxZoneLen = 128
+	// MaxSlots bounds SlotCap and any slot number in a view.
+	MaxSlots = 1 << 22
+	// MaxCells bounds Shape().Cells() of a view. It equals MaxSlots (a view
+	// never needs more cells than members) and is stricter than
+	// MaxCells, which only bounds Shape arithmetic.
+	MaxCells = MaxSlots
+	// MaxDeltaOps bounds the number of ops in one delta.
+	MaxDeltaOps = 1 << 16
+	// MaxGens bounds the number of keyspace generations in a view.
+	MaxGens = 1 << 16
+)
+
+// Member is one member record of a view. Members returned by a View are
+// shared and must not be modified.
+type Member struct {
+	// ID is the application-supplied member name, unique in a view.
+	ID string
+	// Incarnation distinguishes restarts of the same ID.
+	Incarnation uint64
+	// Key is MemberKey(ID, Incarnation), the rendezvous key.
+	Key uint64
+	// Addr is the control and data endpoint chosen by the application.
+	Addr string
+	// Zone is an application-defined failure domain label.
+	Zone string
+	// State is the lifecycle state.
+	State MemberState
+	// Weight is 0..MaxWeight and 0 unless State is Active.
+	Weight uint32
+	// Cell is the member's grid cell, below Shape().Cells().
+	Cell uint32
+	// Joined is the view epoch at which the member was admitted.
+	Joined uint64
+	// Since is the view epoch of the member's last state change.
+	Since uint64
+}
+
+// Config holds the cluster constants, set once by the Config op of the
+// first delta of a cluster.
+type Config struct {
+	// PartitionBits is log2 of the partition count.
+	PartitionBits uint8
+	// InitialOwner owns every partition of the initial table, or NoSlot.
+	InitialOwner Slot
+	// SlotReuseEpochs is how many epochs a freed slot stays unused.
+	SlotReuseEpochs uint32
+	// HandoffEpochs is how long a moved partition reads through from Prev.
+	HandoffEpochs uint32
+}
+
+// FreeSlot is a slot below SlotCap without a member, reusable once the view
+// epoch reaches ReusableAt.
+type FreeSlot struct {
+	Slot       Slot
+	ReusableAt uint64
+}
+
+// KeyspaceGen is the generation of the keyspace with the given seed.
+// Keyspaces not listed have generation 0.
+type KeyspaceGen struct {
+	Seed uint64
+	Gen  uint32
+}
+
+// OpKind identifies the kind of an Op. Its numeric value is part of the
+// encoding.
+type OpKind uint8
+
+// Op kinds. See Op for the fields each kind uses.
+const (
+	// KindNewTerm starts a leader term: Term, Slot (the leader).
+	KindNewTerm OpKind = 1
+	// KindConfig sets the cluster constants: Config.
+	KindConfig OpKind = 2
+	// KindAddMember admits a member: Slot, Member.
+	KindAddMember OpKind = 3
+	// KindRemoveMember removes a member and frees its slot: Slot.
+	KindRemoveMember OpKind = 4
+	// KindSetState changes state and weight: Slot, State, Weight.
+	KindSetState OpKind = 5
+	// KindSetCell moves a member to another cell: Slot, Cell.
+	KindSetCell OpKind = 6
+	// KindReshape replaces the grid: Shape, Cells (indexed by slot).
+	KindReshape OpKind = 7
+	// KindAssign moves partitions: Parts, Owners.
+	KindAssign OpKind = 8
+	// KindEpoch sets the epoch anchor: Epoch, Period.
+	KindEpoch OpKind = 9
+	// KindInvalidate bumps a keyspace generation: Seed, Gen.
+	KindInvalidate OpKind = 10
+)
+
+// String returns the kind name.
+func (k OpKind) String() string {
+	switch k {
+	case KindNewTerm:
+		return "NewTerm"
+	case KindConfig:
+		return "Config"
+	case KindAddMember:
+		return "AddMember"
+	case KindRemoveMember:
+		return "RemoveMember"
+	case KindSetState:
+		return "SetState"
+	case KindSetCell:
+		return "SetCell"
+	case KindReshape:
+		return "Reshape"
+	case KindAssign:
+		return "Assign"
+	case KindEpoch:
+		return "Epoch"
+	case KindInvalidate:
+		return "Invalidate"
+	default:
+		return "OpKind(" + strconv.Itoa(int(k)) + ")"
+	}
+}
+
+// Op is one change in a Delta. It is a tagged struct: Kind selects which
+// fields are meaningful, and the others are ignored by Apply and by the
+// encoding. Build ops with the Op* constructors.
+type Op struct {
+	Kind OpKind
+	// Slot is the leader (NewTerm) or the subject member (AddMember,
+	// RemoveMember, SetState, SetCell).
+	Slot Slot
+	// Term is the new term (NewTerm).
+	Term uint64
+	// Member is the admitted member (AddMember). Joined and Since are
+	// ignored and set from the view epoch.
+	Member Member
+	// State and Weight are the new state and weight (SetState).
+	State  MemberState
+	Weight uint32
+	// Cell is the new cell (SetCell).
+	Cell uint32
+	// Config is the cluster constants (Config).
+	Config Config
+	// Shape is the new grid and Cells the new cell of every slot below
+	// SlotCap, NoCell for slots without a member (Reshape).
+	Shape Shape
+	Cells []uint32
+	// Parts[i] moves to Owners[i] (Assign).
+	Parts, Owners []uint32
+	// Epoch and Period are the new epoch anchor (Epoch).
+	Epoch  uint64
+	Period time.Duration
+	// Seed and Gen are the keyspace and its new generation (Invalidate).
+	Seed uint64
+	Gen  uint32
+}
+
+// OpNewTerm starts term with the given leader slot.
+func OpNewTerm(term uint64, leader Slot) Op { return Op{Kind: KindNewTerm, Term: term, Slot: leader} }
+
+// OpConfig sets the cluster constants.
+func OpConfig(c Config) Op { return Op{Kind: KindConfig, Config: c} }
+
+// OpAddMember admits m at slot.
+func OpAddMember(slot Slot, m Member) Op { return Op{Kind: KindAddMember, Slot: slot, Member: m} }
+
+// OpRemoveMember removes the member at slot.
+func OpRemoveMember(slot Slot) Op { return Op{Kind: KindRemoveMember, Slot: slot} }
+
+// OpSetState sets the state and weight of the member at slot.
+func OpSetState(slot Slot, s MemberState, weight uint32) Op {
+	return Op{Kind: KindSetState, Slot: slot, State: s, Weight: weight}
+}
+
+// OpSetCell moves the member at slot to cell.
+func OpSetCell(slot Slot, cell uint32) Op { return Op{Kind: KindSetCell, Slot: slot, Cell: cell} }
+
+// OpReshape replaces the grid. cells is indexed by slot. The slice is
+// retained.
+func OpReshape(s Shape, cells []uint32) Op {
+	return Op{Kind: KindReshape, Shape: s, Cells: cells}
+}
+
+// OpAssign moves parts[i] to owners[i]. The slices are retained.
+func OpAssign(parts, owners []uint32) Op { return Op{Kind: KindAssign, Parts: parts, Owners: owners} }
+
+// OpEpoch sets the epoch anchor.
+func OpEpoch(epoch uint64, period time.Duration) Op {
+	return Op{Kind: KindEpoch, Epoch: epoch, Period: period}
+}
+
+// OpInvalidate sets the generation of keyspace seed to gen.
+func OpInvalidate(seed uint64, gen uint32) Op { return Op{Kind: KindInvalidate, Seed: seed, Gen: gen} }
+
+// Delta changes a view from Base to Version. Digest is the digest of the
+// resulting view, sha256(base digest || canonical encoding of the delta
+// without its digest); fill it with Seal or NewDelta.
+type Delta struct {
+	Base, Version Version
+	Digest        Digest
+	Ops           []Op
+}
+
+// NextVersion returns the version of a delta on base: {Term, 1} if ops start
+// with NewTerm, otherwise {base.Term, base.Seq + 1}.
+func NextVersion(base Version, ops []Op) Version {
+	if len(ops) > 0 && ops[0].Kind == KindNewTerm {
+		return Version{Term: ops[0].Term, Seq: 1}
+	}
+
+	return Version{Term: base.Term, Seq: base.Seq + 1}
+}
+
+// NewDelta returns a sealed delta of ops on base with the next version.
+// The ops slice is retained.
+func NewDelta(base *View, ops ...Op) *Delta {
+	d := &Delta{Base: base.Version(), Version: NextVersion(base.Version(), ops), Ops: ops}
+	Seal(base, d)
+
+	return d
+}
+
+// Seal sets d.Digest for applying d on base.
+func Seal(base *View, d *Delta) { d.Digest = DeltaDigest(base.Digest(), d) }
+
+// DeltaDigest returns the digest of the view that results from applying d on
+// a view with digest base. It ignores d.Digest.
+func DeltaDigest(base Digest, d *Delta) Digest {
+	h := sha256.New()
+	_, _ = h.Write(base[:])
+	_, _ = h.Write(appendDeltaBody(make([]byte, 0, deltaSizeHint(d)), d))
+
+	var out Digest
+
+	h.Sum(out[:0])
+
+	return out
+}
+
+// The monitoring relation (designs/cachemesh.md, "Monitoring and failure
+// detection"). A member s in cell c with rank r (its index in
+// CellMembers(c)) monitors:
+//
+//   - every other member of c, and
+//   - for each dimension j with Size[j] > 1 and direction +1 and -1
+//     (wrapping, counted once when both directions reach the same cell), the
+//     member of the adjacent cell a with rank r mod Occupancy(a), if a is
+//     not empty.
+//
+// Observers is the exact inverse of Subjects.
+
+// rank returns the index of s in its cell, or -1.
+func rank(cs []Slot, s Slot) int { return slices.Index(cs, s) }
+
+// forEachAdjacent calls fn with each distinct cell adjacent to c along a
+// dimension of size > 1, one per (dimension, direction) pair.
+func forEachAdjacent(v *View, c uint32, fn func(a uint32)) {
+	sh := &v.shape
+	for j := range int(sh.Dims) {
+		if sh.Size[j] < 2 {
+			continue
+		}
+
+		up := sh.Step(c, j, 1)
+		fn(up)
+
+		if down := sh.Step(c, j, -1); down != up {
+			fn(down)
+		}
+	}
+}
+
+// Subjects appends to dst the members slot monitors: its cell-mates in rank
+// order, then one member per adjacent cell in dimension then direction (+1,
+// -1) order. It appends nothing if slot is not a member.
+func Subjects(v *View, slot Slot, dst []Slot) []Slot {
+	c := v.Cell(slot)
+	if c == NoCell {
+		return dst
+	}
+
+	cs := v.CellMembers(c)
+	r := rank(cs, slot)
+
+	for _, s := range cs {
+		if s != slot {
+			dst = append(dst, s)
+		}
+	}
+
+	forEachAdjacent(v, c, func(a uint32) {
+		if as := v.CellMembers(a); len(as) > 0 {
+			dst = append(dst, as[r%len(as)])
+		}
+	})
+
+	return dst
+}
+
+// Observers appends to dst the members that monitor slot, the exact inverse
+// of Subjects: its cell-mates, then for each adjacent cell a (in the order
+// Subjects uses) the members of a whose rank mod Occupancy(cell of slot)
+// equals slot's rank.
+func Observers(v *View, slot Slot, dst []Slot) []Slot {
+	c := v.Cell(slot)
+	if c == NoCell {
+		return dst
+	}
+
+	cs := v.CellMembers(c)
+	r := rank(cs, slot)
+
+	for _, s := range cs {
+		if s != slot {
+			dst = append(dst, s)
+		}
+	}
+
+	occ := len(cs)
+
+	// Members of a reach c in the opposite direction; the set of cells is
+	// the same either way, and each is visited once.
+	forEachAdjacent(v, c, func(a uint32) {
+		as := v.CellMembers(a)
+		for i := r; i < len(as); i += occ {
+			dst = append(dst, as[i])
+		}
+	})
+
+	return dst
+}
+
+// ObserverCells returns the number of distinct cells holding observers of
+// slot, which bounds the ObserverCells suspicion quorum.
+func ObserverCells(v *View, slot Slot) int {
+	c := v.Cell(slot)
+	if c == NoCell {
+		return 0
+	}
+
+	cs := v.CellMembers(c)
+	r := rank(cs, slot)
+
+	n := 0
+	if len(cs) > 1 {
+		n++
+	}
+
+	forEachAdjacent(v, c, func(a uint32) {
+		if r < v.Occupancy(a) {
+			n++
+		}
+	})
+
+	return n
+}
+
+// Neighbors appends to dst every other member in slot's cell or a cell
+// adjacent to it, the data-plane neighbor set, in slot order. It appends
+// nothing if slot is not a member.
+func Neighbors(v *View, slot Slot, dst []Slot) []Slot {
+	c := v.Cell(slot)
+	if c == NoCell {
+		return dst
+	}
+
+	start := len(dst)
+
+	var buf [64]uint32
+
+	for _, nc := range v.shape.AppendNeighborCells(buf[:0], c) {
+		for _, s := range v.CellMembers(nc) {
+			if s != slot {
+				dst = append(dst, s)
+			}
+		}
+	}
+
+	slices.Sort(dst[start:])
+
+	return dst
 }

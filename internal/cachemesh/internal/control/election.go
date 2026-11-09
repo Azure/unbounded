@@ -89,17 +89,18 @@
 // abandoned an Update whose result was lost) may be retaken immediately,
 // because the only process that could publish under it is this one, and it is
 // not publishing.
-
 package control
 
 import (
+	"context"
 	"errors"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
 	"math"
 	"math/bits"
 	"math/rand/v2"
 	"slices"
 	"time"
+
+	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
 )
 
 // ElectionConfig tunes the Elector. Zero values select defaults.
@@ -937,4 +938,447 @@ func TopCandidates(leaseSeed uint64, keys []uint64, n int) []uint64 {
 	}
 
 	return out
+}
+
+// Record is the cachemesh view of the leader Lease. kubelease maps it onto a
+// coordination/v1 Lease: Holder, LeaseDuration, AcquireTime, RenewTime and
+// Transitions live in the Lease spec; Incarnation, Term, Addr and Seeds live
+// in annotations; ResourceVersion and UID come from object metadata.
+type Record struct {
+	// Holder is the MemberID of the leader, empty if the Lease was released.
+	Holder string
+	// Incarnation of the holder process.
+	Incarnation uint64
+	// Term is the cachemesh leader term the holder publishes under.
+	Term uint64
+	// Addr is the holder's control-plane address.
+	Addr string
+	// Seeds are up to MaxSeeds control addresses of members chosen by the
+	// leader for joiners to contact.
+	Seeds []string
+	// LeaseDuration is how long the record stays valid after RenewTime.
+	LeaseDuration time.Duration
+	// AcquireTime is the wall time the holder took the Lease.
+	AcquireTime time.Time
+	// RenewTime is the wall time of the last renewal.
+	RenewTime time.Time
+	// Transitions counts holder changes.
+	Transitions int32
+	// ResourceVersion is the server-assigned version used for compare-and-swap.
+	ResourceVersion string
+	// UID is the server-assigned object identity. A Lease that is deleted and
+	// recreated gets a new UID.
+	UID string
+}
+
+// MaxSeeds bounds Record.Seeds.
+const MaxSeeds = 16
+
+// Clone returns a deep copy of r.
+func (r Record) Clone() Record {
+	r.Seeds = slices.Clone(r.Seeds)
+	return r
+}
+
+// OpKind identifies a Lease operation.
+type OpKind uint8
+
+const (
+	// OpGet is a consistent (quorum) read.
+	OpGet OpKind = iota + 1
+	// OpGetCached is a read that may be served from the API server's watch
+	// cache (resourceVersion=0). It may return stale data.
+	OpGetCached
+	// OpCreate creates the Lease. It fails with ErrConflict if it exists.
+	OpCreate
+	// OpUpdate replaces the Lease if its ResourceVersion still equals
+	// Op.Record.ResourceVersion. It fails with ErrConflict on mismatch and
+	// ErrNotFound if the Lease does not exist.
+	OpUpdate
+)
+
+// String returns the operation name.
+func (k OpKind) String() string {
+	switch k {
+	case OpGet:
+		return "get"
+	case OpGetCached:
+		return "get-cached"
+	case OpCreate:
+		return "create"
+	case OpUpdate:
+		return "update"
+	default:
+		return "unknown"
+	}
+}
+
+// Op is a Lease operation requested by the Elector. The runtime executes it
+// against a Store and feeds the Result back with the same Seq.
+type Op struct {
+	// Seq identifies the operation; results with a stale Seq are ignored.
+	Seq  uint64
+	Kind OpKind
+	// Record is the desired state for OpCreate and OpUpdate.
+	Record Record
+}
+
+// Result is the outcome of an Op.
+type Result struct {
+	Seq  uint64
+	Kind OpKind
+	// Record is the Lease as stored after the operation, valid when Err is nil.
+	Record Record
+	// Err is nil, ErrNotFound, ErrConflict, or any other (transient) error.
+	Err error
+}
+
+var (
+	// ErrNotFound reports that the Lease does not exist.
+	ErrNotFound = errors.New("cachemesh: lease not found")
+	// ErrConflict reports a failed compare-and-swap or a create of an
+	// existing Lease.
+	ErrConflict = errors.New("cachemesh: lease conflict")
+)
+
+// Store executes Lease operations. Implementations must map "not found" to
+// ErrNotFound and optimistic-concurrency failures to ErrConflict (wrapping is
+// allowed; callers use errors.Is).
+type Store interface {
+	// Get reads the Lease with a consistent read.
+	Get(ctx context.Context) (Record, error)
+	// GetCached reads the Lease from the API server cache.
+	GetCached(ctx context.Context) (Record, error)
+	// Create creates the Lease and returns the stored record.
+	Create(ctx context.Context, r Record) (Record, error)
+	// Update replaces the Lease if r.ResourceVersion matches.
+	Update(ctx context.Context, r Record) (Record, error)
+}
+
+// Execute runs op against s.
+func Execute(ctx context.Context, s Store, op Op) Result {
+	res := Result{Seq: op.Seq, Kind: op.Kind}
+
+	switch op.Kind {
+	case OpGet:
+		res.Record, res.Err = s.Get(ctx)
+	case OpGetCached:
+		res.Record, res.Err = s.GetCached(ctx)
+	case OpCreate:
+		res.Record, res.Err = s.Create(ctx, op.Record)
+	case OpUpdate:
+		res.Record, res.Err = s.Update(ctx, op.Record)
+	default:
+		res.Err = errors.New("cachemesh: unknown lease op")
+	}
+
+	return res
+}
+
+// --- Election and leadership ---
+
+func (n *Node) electInput(now int64, wall time.Time) Input {
+	_, has := n.v.Config()
+	in := Input{
+		Now: now, Wall: wall,
+		ViewTerm:    n.v.Term(),
+		HaveView:    has,
+		ClusterSize: n.v.Len(),
+		// A bootstrapper (no seeds, no Lease) is not a candidate: it takes
+		// the Lease through the lottery, so a cluster whose members all
+		// start at once without seeds makes about LotteryBudgetQPS Lease
+		// calls, not one per member per RetryPeriod.
+		IsCandidate:   n.isCandidate(),
+		LeaderHeardAt: n.heardAt,
+		Seeds:         n.leaseSeeds,
+	}
+
+	// A joiner that has seeds is in contact with the cluster and needs no
+	// Lease reads: keep it a follower. Otherwise a joiner without a view
+	// would sit in the lottery and, with a skewed wall clock, take a live
+	// leader's Lease only to give it back. A joiner that holds a configured
+	// view reports when it last heard the leader (heardAt is refreshed by
+	// every version it applies, heartbeats included), so if the whole
+	// membership of its lineage is gone (every member restarted with a new
+	// incarnation while no leader could be elected) it enters the lottery
+	// after NoLeaderTimeout and the winner admits itself into that lineage.
+	if !n.isMember() && len(n.seeds) > 0 && !n.bootstrapper && !n.coldStart && !n.leading {
+		in.HaveView, in.LeaderHeardAt = true, now
+
+		if has {
+			in.LeaderHeardAt = n.heardAt // zero counts from the elector's start
+		}
+	}
+
+	// Likewise while this member's own Lease read is outstanding: its
+	// result decides whether to join, bootstrap, or cold start, and a
+	// lottery read in the meantime would only duplicate it.
+	if !n.isMember() && n.ownReadSeq != 0 && !n.ownReadDone && !n.bootstrapper && !n.coldStart && !n.leading {
+		in.HaveView, in.LeaderHeardAt = true, now
+	}
+
+	return in
+}
+
+func (n *Node) isCandidate() bool {
+	if !n.isMember() || n.leaving {
+		return false
+	}
+
+	ep := n.ep.Current()
+	if n.candKey == n.v.Digest() && n.candEpoch == ep {
+		return n.candidate
+	}
+
+	n.candKey, n.candEpoch = n.v.Digest(), ep
+	top := n.topCandidates(ep)
+	n.candidate = slices.Contains(top, n.key)
+
+	return n.candidate
+}
+
+func (n *Node) topCandidates(ep uint64) []uint64 {
+	k := candKey{digest: n.v.Digest(), epoch: ep}
+	if s := n.shared; s != nil {
+		if t, ok := s.cand.Get(k); ok {
+			return t
+		}
+	}
+
+	per := n.v.Period()
+	if per <= 0 {
+		per = n.cfg.EpochPeriod
+	}
+
+	minAge := uint64(n.cfg.Elect.MinCandidateAge / per)
+
+	var keys []uint64
+
+	n.v.ForEachMember(func(_ view.Slot, m *view.Member) bool {
+		if m.State == view.Active && m.Joined+minAge <= ep {
+			keys = append(keys, m.Key)
+		}
+
+		return true
+	})
+
+	top := TopCandidates(LeaseSeed, keys, n.cfg.Elect.Candidates)
+
+	if s := n.shared; s != nil {
+		s.cand.Put(k, top)
+	}
+
+	return top
+}
+
+func (n *Node) tickElector(now int64, wall time.Time) {
+	if n.leading && now >= n.nextSeedsAt {
+		n.nextSeedsAt = now + int64(DefaultSeedRefresh)
+		n.pickSeeds()
+	}
+
+	n.leaseOps = append(n.leaseOps, n.el.Tick(n.electInput(now, wall))...)
+	n.electEvents(now)
+
+	// The Lease names a leader of a later term than our view (for example
+	// after a partition healed into two lineages): catch up from it. This
+	// costs no API calls; the elector already read the Lease.
+	if li, ok := n.el.Leader(); ok && !n.leading && li.Term > n.v.Term() && li.Addr != "" && li.Addr != n.cfg.Addr {
+		n.event("lease-newer-term")
+		n.catchUp(now, li.Addr, false)
+	}
+}
+
+// seedsFromView uses the leader and a few random members of the current
+// view as join seeds.
+func (n *Node) seedsFromView() {
+	n.addSeed(n.addrOf(n.v.Leader()))
+
+	if c := n.v.SlotCap(); c > 0 {
+		for range 4 {
+			n.addSeed(n.addrOf(view.Slot(n.rng.Uint32N(c))))
+		}
+	}
+}
+
+// maxSeeds bounds the join seed list.
+const maxSeeds = 32
+
+// pickSeeds chooses up to MaxSeeds random member addresses for the
+// Lease.
+func (n *Node) pickSeeds() {
+	n.leaseSeeds = n.leaseSeeds[:0]
+
+	cap := n.v.SlotCap()
+	if cap == 0 {
+		return
+	}
+
+	for range 4 * MaxSeeds {
+		if len(n.leaseSeeds) == MaxSeeds {
+			break
+		}
+
+		s := view.Slot(n.rng.Uint32N(cap))
+		if m, ok := n.v.Member(s); ok && m.State == view.Active && !slices.Contains(n.leaseSeeds, m.Addr) {
+			n.leaseSeeds = append(n.leaseSeeds, m.Addr)
+		}
+	}
+}
+
+// OnLease reports the result of a Lease operation from LeaseOps.
+func (n *Node) OnLease(now int64, wall time.Time, r Result) {
+	n.now = max(n.now, now)
+	now = n.now
+
+	if r.Seq&ownLeaseBit != 0 {
+		if r.Seq != n.ownReadSeq || n.ownReadDone {
+			return
+		}
+
+		n.ownReadDone = true
+		defer n.noteColdRead(now, wall, r)
+
+		// Any record that names a holder or seeds means a cluster exists
+		// (or existed): join through it rather than judging liveness with
+		// a possibly skewed wall clock. Only a missing Lease, or a released
+		// one without seeds, makes this member bootstrap a cluster.
+		if r.Err == nil && (r.Record.Holder != "" || len(r.Record.Seeds) > 0) {
+			n.learnSeeds(r.Record.Addr, r.Record.Seeds)
+		}
+
+		switch {
+		case len(n.seeds) > 0:
+		case r.Err == nil || errors.Is(r.Err, ErrNotFound):
+			if _, has := n.v.Config(); !has && len(n.cfg.Seeds) == 0 && !n.joined {
+				n.bootstrapper = true
+				n.event("bootstrap-candidate")
+			}
+		}
+
+		return
+	}
+
+	n.el.OnResult(n.electInput(now, wall), r)
+	n.electEvents(now)
+}
+
+func (n *Node) learnSeeds(addr string, seeds []string) {
+	if addr != "" && addr != n.cfg.Addr {
+		n.leaderAddr = addr
+	}
+
+	if n.isMember() {
+		return
+	}
+
+	for _, s := range append([]string{addr}, seeds...) {
+		if s != "" && s != n.cfg.Addr && !slices.Contains(n.seeds, s) && len(n.seeds) < 4*MaxSeeds {
+			n.seeds = append(n.seeds, s)
+		}
+	}
+
+	n.bootstrapper = false
+}
+
+func (n *Node) electEvents(now int64) {
+	for _, e := range n.el.Events() {
+		switch e.Kind {
+		case Acquired:
+			n.startLeading(now, e.Term)
+		case Lost:
+			n.stopLeading("lost")
+		case Discovered:
+			// A live holder: join it rather than cold start.
+			n.coldStart = false
+			n.learnSeeds(e.Record.Addr, e.Record.Seeds)
+
+			if n.isMember() && n.v.Term() < e.Record.Term {
+				n.catchUp(now, e.Record.Addr, false)
+			}
+		}
+	}
+}
+
+func (n *Node) startLeading(now int64, term uint64) {
+	_, has := n.v.Config()
+	if n.leaving && (!n.isMember() || !n.handedOff) {
+		// The acquire was in flight when Leave was called (or a lottery
+		// read found the Lease free): a leaving member hands leadership
+		// off once by giving the Lease straight back, which any candidate
+		// takes at once. If it wins the Lease again, nobody else could
+		// take it, so it leads (while still a member) rather than leave
+		// the cluster without a leader; see sendLeave for when it lets go.
+		n.handedOff = true
+		n.event("acquire-declined-leaving")
+		n.leaseOps = append(n.leaseOps, n.el.Release(n.electInput(now, n.wall))...)
+
+		return
+	}
+
+	if term <= n.v.Term() || (!has && !n.bootstrapper && !n.coldStart) {
+		// Cannot start this term from our view (or must not bootstrap a
+		// second cluster): give the Lease back.
+		n.event("acquire-declined")
+		n.leaseOps = append(n.leaseOps, n.el.Release(n.electInput(now, n.wall))...)
+
+		return
+	}
+
+	n.leading, n.term, n.startTerm = true, term, true
+	n.releasing = false
+	n.ld.Reset()
+	n.nextLeader = now
+	n.nextSeedsAt = now
+	n.event("term-start")
+}
+
+func (n *Node) stopLeading(reason string) {
+	if !n.leading {
+		return
+	}
+
+	n.leading, n.startTerm = false, false
+	n.event("leader-stop-" + reason)
+}
+
+func (n *Node) leaderTick(now int64) {
+	if !n.el.CanPublish(now) {
+		n.stopLeading("deadline")
+
+		return
+	}
+
+	var newTerm uint64
+
+	if n.startTerm {
+		newTerm = n.term
+	} else if n.v.Term() != n.term {
+		n.resign(now, "fenced")
+
+		return
+	}
+
+	ops := n.ld.Tick(now, n.ep.Advance(now), n.v, newTerm)
+	if ops == nil {
+		return
+	}
+
+	d := view.NewDelta(n.v, ops...)
+	raw := view.EncodeDelta(d)
+
+	if err := n.applyOne(now, d, raw); err != nil {
+		// A bug in the leader logic; never publish an invalid delta.
+		n.event("leader-invalid-delta")
+
+		return
+	}
+
+	n.startTerm = false
+
+	if n.cfg.Hooks.OnPublish != nil {
+		n.cfg.Hooks.OnPublish(d)
+	}
+
+	n.forward(d, n.encoded(d, raw), LevelLeader)
 }

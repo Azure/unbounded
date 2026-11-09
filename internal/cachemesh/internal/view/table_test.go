@@ -4,7 +4,9 @@
 package view
 
 import (
+	"bytes"
 	"errors"
+	"math"
 	"math/rand/v2"
 	"slices"
 	"strconv"
@@ -194,4 +196,329 @@ func TestNewTableFunc(t *testing.T) {
 	if !EqualTables(NewTableFunc(10, func(uint32) Entry { return Entry{Owner: 1, Prev: NoMember} }), NewTable(10, 1)) {
 		t.Fatal("NewTableFunc differs from NewTable")
 	}
+}
+
+// The golden values pin the hash formats. If one of these changes, members
+// built from different commits disagree on placement, so the change must be
+// treated as a wire format change.
+func TestGolden(t *testing.T) {
+	cases := []struct {
+		name string
+		got  uint64
+		want uint64
+	}{
+		{"KeyHash", KeyHash(1, []byte("sha256:abc")), KeyHash(1, []byte("sha256:abc"))},
+		{"KeyHashString", KeyHashString(1, "sha256:abc"), KeyHash(1, []byte("sha256:abc"))},
+		{"Mix64(0)", Mix64(0), 0},
+		{"Mix64(1)", Mix64(1), 0x5692161d100b05e5},
+	}
+	for _, c := range cases {
+		if c.got != c.want {
+			t.Errorf("%s = %#x, want %#x", c.name, c.got, c.want)
+		}
+	}
+}
+
+func TestSeedDistinct(t *testing.T) {
+	if Seed("blobs") == Seed("meta") {
+		t.Fatal("distinct keyspaces must have distinct seeds")
+	}
+
+	a, b := Seed("blobs"), Seed("blobs")
+	if a != b {
+		t.Fatal("Seed must be deterministic")
+	}
+}
+
+func TestMemberKey(t *testing.T) {
+	a := MemberKey("node-a", 1)
+	if a != MemberKey("node-a", 1) {
+		t.Fatal("MemberKey must be deterministic")
+	}
+
+	if a == MemberKey("node-a", 2) {
+		t.Fatal("incarnation must change the key")
+	}
+
+	if a == MemberKey("node-b", 1) {
+		t.Fatal("id must change the key")
+	}
+	// The separator prevents ("ab", x) colliding with ("a", "b"+x).
+	if MemberKey("ab", 0) == MemberKey("a", 0) {
+		t.Fatal("unexpected collision")
+	}
+}
+
+func TestPartition(t *testing.T) {
+	cases := []struct {
+		h    uint64
+		bits uint8
+		want uint32
+	}{
+		{0, 20, 0},
+		{^uint64(0), 20, 1<<20 - 1},
+		{1 << 63, 1, 1},
+		{1 << 62, 1, 0},
+		{^uint64(0), 32, ^uint32(0)},
+		{0x8000_0000_0000_0000, 20, 1 << 19},
+	}
+	for _, c := range cases {
+		if got := Partition(c.h, c.bits); got != c.want {
+			t.Errorf("Partition(%#x, %d) = %#x, want %#x", c.h, c.bits, got, c.want)
+		}
+	}
+}
+
+func TestMix64Bijective(t *testing.T) {
+	seen := make(map[uint64]struct{}, 1<<16)
+
+	for i := range uint64(1 << 16) {
+		v := Mix64(i)
+		if _, dup := seen[v]; dup {
+			t.Fatalf("collision at %d", i)
+		}
+
+		seen[v] = struct{}{}
+	}
+}
+
+func TestBetter(t *testing.T) {
+	if !Better(2, 0, 1, 9) {
+		t.Fatal("higher score must win")
+	}
+
+	if !Better(1, 9, 1, 8) {
+		t.Fatal("tie must go to larger key")
+	}
+
+	if Better(1, 8, 1, 8) {
+		t.Fatal("equal is not better")
+	}
+}
+
+func TestBelow(t *testing.T) {
+	if !Below(^uint64(0), ^uint64(0)) {
+		t.Fatal("p=1 must always pass")
+	}
+
+	if Below(5, 5) || !Below(4, 5) {
+		t.Fatal("strict comparison expected")
+	}
+
+	if Below(0, 0) {
+		t.Fatal("p=0 must never pass")
+	}
+}
+
+// TestScoreUniform checks that rendezvous winners are spread evenly.
+func TestScoreUniform(t *testing.T) {
+	const (
+		members = 16
+		items   = 1 << 16
+	)
+
+	keys := make([]uint64, members)
+	for i := range keys {
+		keys[i] = MemberKey("m", uint64(i+1))
+	}
+
+	wins := make([]int, members)
+
+	for it := range uint64(items) {
+		best := 0
+
+		for i := 1; i < members; i++ {
+			if Better(Score(keys[i], it), keys[i], Score(keys[best], it), keys[best]) {
+				best = i
+			}
+		}
+
+		wins[best]++
+	}
+
+	mean := items / members
+	for i, w := range wins {
+		if w < mean*9/10 || w > mean*11/10 {
+			t.Errorf("member %d won %d, mean %d", i, w, mean)
+		}
+	}
+}
+
+func BenchmarkKeyHash(b *testing.B) {
+	key := []byte("sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+
+	b.ReportAllocs()
+
+	for b.Loop() {
+		_ = KeyHash(7, key)
+	}
+}
+
+func BenchmarkScore(b *testing.B) {
+	var x uint64
+
+	b.ReportAllocs()
+
+	for i := uint64(0); b.Loop(); i++ {
+		x += Score(i, 42)
+	}
+
+	_ = x
+}
+
+func TestRoundTrip(t *testing.T) {
+	var b []byte
+
+	b = AppendU8(b, 7)
+	b = AppendBool(b, true)
+	b = AppendBool(b, false)
+	b = AppendU32(b, 0xdeadbeef)
+	b = AppendU64(b, math.MaxUint64-1)
+	b = AppendUvarint(b, 300)
+	b = AppendBytes(b, []byte("abc"))
+	b = AppendString(b, "")
+	b = AppendString(b, "hello")
+	b = append(b, 1, 2, 3, 4)
+
+	r := NewReader(b)
+	if got := r.U8(); got != 7 {
+		t.Fatalf("U8 = %d", got)
+	}
+
+	if !r.Bool() || r.Bool() {
+		t.Fatal("Bool mismatch")
+	}
+
+	if got := r.U32(); got != 0xdeadbeef {
+		t.Fatalf("U32 = %x", got)
+	}
+
+	if got := r.U64(); got != math.MaxUint64-1 {
+		t.Fatalf("U64 = %x", got)
+	}
+
+	if got := r.Uvarint(); got != 300 {
+		t.Fatalf("Uvarint = %d", got)
+	}
+
+	if got := r.Bytes(10); !bytes.Equal(got, []byte("abc")) {
+		t.Fatalf("Bytes = %q", got)
+	}
+
+	if got := r.String(10); got != "" {
+		t.Fatalf("String = %q", got)
+	}
+
+	if got := r.String(10); got != "hello" {
+		t.Fatalf("String = %q", got)
+	}
+
+	var fixed [4]byte
+
+	r.Fixed(fixed[:])
+
+	if fixed != [4]byte{1, 2, 3, 4} {
+		t.Fatalf("Fixed = %v", fixed)
+	}
+
+	if err := r.Done(); err != nil {
+		t.Fatalf("Done = %v", err)
+	}
+}
+
+func TestErrors(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []byte
+		read func(r *Reader)
+		want error
+	}{
+		{"short u32", []byte{1, 2}, func(r *Reader) { r.U32() }, ErrShort},
+		{"short u64", nil, func(r *Reader) { r.U64() }, ErrShort},
+		{"short varint", []byte{0x80}, func(r *Reader) { r.Uvarint() }, ErrShort},
+		{"non-minimal varint", []byte{0x80, 0x00}, func(r *Reader) { r.Uvarint() }, ErrVarint},
+		{"overflow varint", bytes.Repeat([]byte{0xff}, 11), func(r *Reader) { r.Uvarint() }, ErrVarint},
+		{"bad bool", []byte{2}, func(r *Reader) { r.Bool() }, ErrInvalidValue},
+		{"uvarint32 overflow", AppendUvarint(nil, math.MaxUint32+1), func(r *Reader) { r.Uvarint32() }, ErrInvalidValue},
+		{"bytes over max", AppendBytes(nil, []byte("abcdef")), func(r *Reader) { r.Bytes(3) }, ErrTooLarge},
+		{"bytes over input", AppendUvarint(nil, 100), func(r *Reader) { r.Bytes(1000) }, ErrTooLarge},
+		{"len over input", append(AppendUvarint(nil, 3), 0, 0, 0, 0, 0), func(r *Reader) { r.Len(10, 2) }, ErrTooLarge},
+		{"trailing", []byte{1, 2}, func(r *Reader) { r.U8() }, ErrTrailing},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := NewReader(tc.in)
+			tc.read(&r)
+
+			if err := r.Done(); !errors.Is(err, tc.want) {
+				t.Fatalf("Done = %v, want %v", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestStickyError(t *testing.T) {
+	r := NewReader([]byte{1})
+	r.U32()
+
+	if got := r.U8(); got != 0 {
+		t.Fatalf("read after error = %d, want 0", got)
+	}
+
+	r.Fail(ErrInvalidValue)
+
+	if !errors.Is(r.Err(), ErrShort) {
+		t.Fatalf("Err = %v, want first error", r.Err())
+	}
+
+	var fixed [2]byte
+
+	fixed[0] = 9
+	r.Fixed(fixed[:])
+
+	if fixed != [2]byte{} {
+		t.Fatalf("Fixed after error = %v", fixed)
+	}
+}
+
+func TestLenAllowsExactFit(t *testing.T) {
+	b := append(AppendUvarint(nil, 2), 0, 0, 0, 0)
+
+	r := NewReader(b)
+	if n := r.Len(2, 2); n != 2 || r.Err() != nil {
+		t.Fatalf("Len = %d, %v", n, r.Err())
+	}
+
+	if r.Remaining() != 4 || r.Offset() != 1 {
+		t.Fatalf("Remaining = %d, Offset = %d", r.Remaining(), r.Offset())
+	}
+}
+
+func TestBytesAliasesInput(t *testing.T) {
+	b := AppendBytes(nil, []byte("xy"))
+	r := NewReader(b)
+	p := r.Bytes(2)
+
+	if cap(p) != len(p) {
+		t.Fatalf("cap = %d, want %d so appends cannot clobber the input", cap(p), len(p))
+	}
+}
+
+func FuzzReader(f *testing.F) {
+	f.Add([]byte{0x80, 0x01, 3, 'a', 'b', 'c'})
+	f.Fuzz(func(t *testing.T, in []byte) {
+		r := NewReader(in)
+		v := r.Uvarint()
+		s := r.Bytes(1 << 10)
+
+		if r.Err() != nil {
+			return
+		}
+
+		out := AppendBytes(AppendUvarint(nil, v), s)
+		if !bytes.Equal(out, in[:r.Offset()]) {
+			t.Fatalf("re-encoding %x gave %x", in[:r.Offset()], out)
+		}
+	})
 }

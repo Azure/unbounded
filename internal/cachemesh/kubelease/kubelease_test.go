@@ -13,7 +13,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Azure/unbounded/internal/cachemesh/internal/control"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -21,6 +20,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
+
+	"github.com/Azure/unbounded/internal/cachemesh/internal/control"
 )
 
 const (

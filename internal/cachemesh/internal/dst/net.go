@@ -6,9 +6,10 @@ package dst
 import (
 	"errors"
 	"fmt"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/control"
 	"math/rand/v2"
 	"strconv"
+
+	"github.com/Azure/unbounded/internal/cachemesh/internal/control"
 )
 
 // ErrTimeout completes a Call whose response did not arrive in time.

@@ -5,10 +5,13 @@ package route
 
 import (
 	"math/rand/v2"
+	"slices"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+	"unsafe"
 )
 
 const sec = int64(time.Second)
@@ -737,5 +740,512 @@ func TestSyncReplacesTrackedSet(t *testing.T) {
 
 	if tr.Tracked() != 0 {
 		t.Fatalf("tracked %d after empty Sync", tr.Tracked())
+	}
+}
+
+func allUsableHealthy(tr *HealthTracker, n int) bool {
+	for s := range uint32(n) {
+		if tr.Usable(s) != Healthy {
+			return false
+		}
+	}
+
+	return true
+}
+
+func TestAllHealthyTransitions(t *testing.T) {
+	tr := newT(HealthConfig{})
+	trackN(tr, 20, 4)
+	tr.Tick(0)
+
+	if !tr.AllHealthy() {
+		t.Fatal("fresh tracker must be all healthy")
+	}
+
+	// Ejection clears it; probing keeps it clear; a probe success sets it.
+	failN(tr, 3, 5)
+
+	if tr.AllHealthy() {
+		t.Fatal("ejected peer must clear AllHealthy")
+	}
+
+	tr.Tick(sec)
+	tr.Tick(40 * sec)
+
+	if s, _, _ := tr.PeerState(3); s != StateProbing {
+		t.Fatalf("state %v, want probing", s)
+	}
+
+	if tr.AllHealthy() {
+		t.Fatal("probing peer must clear AllHealthy")
+	}
+
+	tr.Observe(3, Success, time.Millisecond)
+
+	if !tr.AllHealthy() {
+		t.Fatal("recovered peer must set AllHealthy")
+	}
+
+	// Busy lasts until the deadline passes.
+	tr.Observe(5, Overload, 0)
+
+	if tr.AllHealthy() {
+		t.Fatal("busy peer must clear AllHealthy")
+	}
+
+	tr.Tick(40*sec + int64(time.Second))
+
+	if !tr.AllHealthy() {
+		t.Fatal("expired busy must set AllHealthy")
+	}
+
+	// Untracking an ejected peer restores it without a Tick.
+	failN(tr, 7, 5)
+
+	if tr.AllHealthy() {
+		t.Fatal("ejected peer must clear AllHealthy")
+	}
+
+	tr.Untrack(7)
+
+	if !tr.AllHealthy() {
+		t.Fatal("untracked ejected peer must not count")
+	}
+
+	// A stale holder of the dropped peer cannot eject or revive it.
+	tr.Track(7, 1007, 1)
+
+	if !tr.AllHealthy() || tr.Usable(7) != Healthy {
+		t.Fatal("retracked peer must start healthy")
+	}
+}
+
+func TestAllHealthyRetiredPeer(t *testing.T) {
+	tr := newT(HealthConfig{})
+	trackN(tr, 10, 2)
+	tr.Tick(0)
+
+	p := tr.tab.Load().lookup(4)
+	tr.Track(4, 9999, 2) // new key replaces the peer
+
+	if p.state.Load() != bRetired {
+		t.Fatalf("dropped peer state %d, want retired", p.state.Load())
+	}
+
+	// An Observe through the dropped peer (as by a caller holding the old
+	// table) must not change any counter.
+	for range 10 {
+		p.state.Load()
+		tr.tryEject(p, bHealthy, ReasonConsecutiveFailures)
+	}
+
+	if !tr.AllHealthy() || tr.ejected.Load() != 0 {
+		t.Fatalf("retired peer ejected: all=%v ejected=%d", tr.AllHealthy(), tr.ejected.Load())
+	}
+}
+
+func TestAllHealthyDegraded(t *testing.T) {
+	tr := newT(HealthConfig{})
+	trackN(tr, 10, 2)
+	tr.Tick(0)
+
+	for s := range uint32(10) {
+		tr.Observe(s, Success, time.Millisecond)
+	}
+
+	tr.Observe(2, Success, time.Second)
+	tr.Tick(1)
+
+	if tr.Usable(2) != Degraded {
+		t.Fatal("slow peer must be degraded")
+	}
+
+	if tr.AllHealthy() {
+		t.Fatal("degraded peer must clear AllHealthy")
+	}
+}
+
+func TestAllHealthyPanic(t *testing.T) {
+	// The last usable member of a cell is never ejected, so use cells of 5.
+	tr := newT(HealthConfig{MaxEjectionPercent: 100, PanicThreshold: 10})
+	trackN(tr, 10, 5)
+	tr.Tick(0)
+	failN(tr, 0, 5)
+	failN(tr, 5, 5)
+	tr.Tick(1)
+
+	if !tr.Panic() {
+		t.Fatal("expected panic")
+	}
+
+	if !tr.AllHealthy() || !allUsableHealthy(tr, 10) {
+		t.Fatal("panic must report all healthy")
+	}
+}
+
+// TestAllHealthyRandomized checks that AllHealthy never claims health when a
+// tracked peer is not Healthy, and that after a Tick it is exact.
+func TestAllHealthyRandomized(t *testing.T) {
+	for seed := range uint64(30) {
+		rng := rand.New(rand.NewPCG(seed, 7))
+		tr := newT(HealthConfig{ConsecutiveFailures: 2, BaseEjection: time.Second, MaxEjection: 4 * time.Second})
+
+		const n = 24
+
+		trackN(tr, n, 3)
+
+		now := int64(0)
+		tr.Tick(now)
+
+		for step := range 3000 {
+			slot := uint32(rng.IntN(n))
+
+			switch op := rng.IntN(10); {
+			case op < 5:
+				tr.Observe(slot, Success, time.Duration(1+rng.IntN(5))*time.Millisecond)
+			case op < 8:
+				tr.Observe(slot, Result(1+rng.IntN(2)), time.Millisecond)
+			case op < 9:
+				tr.Observe(slot, Overload, 0)
+			default:
+				now += int64(time.Duration(rng.IntN(800)) * time.Millisecond)
+				tr.Tick(now)
+
+				if got, want := tr.AllHealthy(), allUsableHealthy(tr, n); got != want {
+					t.Fatalf("seed %d step %d: after Tick AllHealthy=%v, all usable healthy=%v", seed, step, got, want)
+				}
+			}
+
+			if tr.AllHealthy() && !allUsableHealthy(tr, n) {
+				t.Fatalf("seed %d step %d: AllHealthy with an unhealthy peer", seed, step)
+			}
+		}
+	}
+}
+
+// TestLatencySampling checks that the latency mean counts every success up
+// to latSampleAll per interval and one in latSampleEvery after that, and
+// every failure.
+func TestLatencySampling(t *testing.T) {
+	tr := newT(HealthConfig{})
+	trackN(tr, 1, 1)
+	tr.Tick(0)
+
+	for range 2 * latSampleAll {
+		tr.Observe(0, Success, 2*time.Millisecond)
+	}
+
+	p := tr.tab.Load().lookup(0)
+	want := int64(latSampleAll + latSampleAll/latSampleEvery)
+
+	if got := p.latN.Load(); got != want {
+		t.Fatalf("latN = %d, want %d", got, want)
+	}
+
+	if got := p.latSum.Load(); got != want*int64(2*time.Millisecond) {
+		t.Fatalf("latSum = %d", got)
+	}
+
+	tr.Observe(0, Failure, time.Millisecond)
+
+	if got := p.latN.Load(); got != want+1 {
+		t.Fatalf("failure not counted: latN = %d", got)
+	}
+
+	// Zero latency is never counted.
+	tr.Observe(0, Failure, 0)
+
+	if got := p.latN.Load(); got != want+1 {
+		t.Fatalf("zero latency counted: latN = %d", got)
+	}
+}
+
+// TestHedgeBudgetAcrossGoroutines checks that the budget counts requests
+// routed from any goroutine, whichever shard they land in.
+func TestHedgeBudgetAcrossGoroutines(t *testing.T) {
+	tr := newT(HealthConfig{})
+	tr.Tick(0)
+
+	var wg sync.WaitGroup
+
+	for range 8 {
+		wg.Go(func() {
+			for range 2000 {
+				tr.NoteRouted()
+			}
+		})
+	}
+
+	wg.Wait()
+
+	got := 0
+
+	for range 16000 {
+		if tr.TryHedge() {
+			got++
+		}
+	}
+
+	if got != 800 {
+		t.Fatalf("hedges %d want 800", got)
+	}
+}
+
+type peerSnap struct {
+	slot uint32
+	key  uint64
+	cell uint32
+}
+
+func snap(t *HealthTracker) []peerSnap {
+	var out []peerSnap
+
+	for _, p := range t.tab.Load().peers {
+		out = append(out, peerSnap{p.slot, p.key, p.cc.Load().cell})
+	}
+
+	return out
+}
+
+func cellSnap(t *HealthTracker) []uint32 {
+	var out []uint32
+
+	for _, c := range t.tab.Load().cells {
+		out = append(out, c.cell, uint32(c.n))
+	}
+
+	return out
+}
+
+// TestTrackManySyncMatchTrack checks that the batch APIs produce the same
+// table as the equivalent sequence of Track and Untrack calls.
+func TestTrackManySyncMatchTrack(t *testing.T) {
+	rng := rand.New(rand.NewPCG(7, 7))
+
+	for iter := range 300 {
+		a, b := newT(HealthConfig{}), newT(HealthConfig{})
+
+		for range 1 + rng.IntN(4) {
+			refs := make([]TrackRef, rng.IntN(40))
+			for i := range refs {
+				refs[i] = TrackRef{Slot: rng.Uint32N(50), Key: uint64(rng.IntN(3)), Cell: rng.Uint32N(5)}
+			}
+
+			if rng.IntN(2) == 0 {
+				for _, r := range refs {
+					a.Track(r.Slot, r.Key, r.Cell)
+				}
+
+				b.TrackMany(refs)
+			} else {
+				keep := map[uint32]bool{}
+
+				for _, r := range refs {
+					a.Track(r.Slot, r.Key, r.Cell)
+					keep[r.Slot] = true
+				}
+
+				for _, p := range slices.Clone(a.tab.Load().peers) {
+					if !keep[p.slot] {
+						a.Untrack(p.slot)
+					}
+				}
+
+				b.Sync(refs)
+			}
+
+			if !slices.Equal(snap(a), snap(b)) || !slices.Equal(cellSnap(a), cellSnap(b)) {
+				t.Fatalf("iter %d: track %v\nbatch %v", iter, snap(a), snap(b))
+			}
+
+			for s := range uint32(50) {
+				if (a.tab.Load().lookup(s) == nil) != (b.tab.Load().lookup(s) == nil) {
+					t.Fatalf("iter %d: lookup %d differs", iter, s)
+				}
+			}
+
+			if a.maxEjected.Load() != b.maxEjected.Load() {
+				t.Fatalf("iter %d: maxEjected", iter)
+			}
+		}
+	}
+}
+
+func TestSyncKeepsState(t *testing.T) {
+	tr := newT(HealthConfig{})
+
+	var refs []TrackRef
+	for i := range 20 {
+		refs = append(refs, TrackRef{Slot: uint32(i), Key: uint64(100 + i), Cell: uint32(i / 4)})
+	}
+
+	tr.Sync(refs)
+	failN(tr, 3, 5)
+	tr.Tick(0)
+
+	if s, _, _ := tr.PeerState(3); s != StateEjected {
+		t.Fatalf("state %v", s)
+	}
+
+	// Same set, slot 5 with a new key, slot 19 removed.
+	refs[5].Key = 999
+	tr.Sync(refs[:19])
+
+	if s, n, _ := tr.PeerState(3); s != StateEjected || n != 1 {
+		t.Fatalf("sync must keep state: %v %d", s, n)
+	}
+
+	if tr.Tracked() != 19 {
+		t.Fatalf("tracked %d", tr.Tracked())
+	}
+
+	// No-op Sync must not rebuild.
+	before := tr.tab.Load()
+	tr.Sync(refs[:19])
+
+	if tr.tab.Load() != before {
+		t.Fatal("no-op Sync rebuilt the table")
+	}
+
+	tr.Sync(nil)
+
+	if tr.Tracked() != 0 || len(tr.cells) != 0 {
+		t.Fatalf("Sync(nil): tracked %d cells %d", tr.Tracked(), len(tr.cells))
+	}
+}
+
+// TestEjectLoserKeepsTiming: a tryEject that loses the race against
+// another ejection must not reset the winner's ejection timing.
+func TestEjectLoserKeepsTiming(t *testing.T) {
+	var ejects int
+
+	tr := newT(HealthConfig{Hooks: HealthHooks{OnEject: func(uint32, Reason, int, time.Duration) { ejects++ }}})
+	trackN(tr, 20, 4)
+	tr.Tick(0)
+	failN(tr, 1, 5)
+	tr.Tick(sec)
+
+	p := tr.tab.Load().lookup(1)
+	until := p.until.Load()
+
+	if until == 0 || ejects != 1 {
+		t.Fatalf("not timed: %d %d", until, ejects)
+	}
+
+	if tr.tryEject(p, bHealthy, ReasonSuccessRate) {
+		t.Fatal("second ejection must fail")
+	}
+
+	tr.Tick(2 * sec)
+
+	if p.until.Load() != until || ejects != 1 {
+		t.Fatalf("loser re-timed the ejection: until %d -> %d, ejects %d", until, p.until.Load(), ejects)
+	}
+}
+
+// TestIdleDegradedRecovers: a Degraded peer gets no traffic, so its EWMA
+// must decay without observations or it would stay Degraded forever.
+func TestIdleDegradedRecovers(t *testing.T) {
+	tr := newT(HealthConfig{})
+	trackN(tr, 5, 5)
+	tr.Tick(0)
+
+	for i := range 5 {
+		lat := 5 * time.Millisecond
+		if i == 2 {
+			lat = 200 * time.Millisecond
+		}
+
+		tr.Observe(uint32(i), Success, lat)
+	}
+
+	now := sec / 10
+	tr.Tick(now)
+
+	if tr.Usable(2) != Degraded {
+		t.Fatal("slow peer must be degraded")
+	}
+
+	// Others keep getting traffic; peer 2 gets none.
+	for range 600 {
+		now += sec / 10
+
+		for _, s := range []uint32{0, 1, 3, 4} {
+			tr.Observe(s, Success, 5*time.Millisecond)
+		}
+
+		tr.Tick(now)
+	}
+
+	if tr.Usable(2) != Healthy {
+		_, _, e := tr.PeerState(2)
+		t.Fatalf("idle degraded peer never recovered, ewma %v", e)
+	}
+
+	// Idle peers do not decay below the median, so they do not drag it
+	// down and make normal peers look slow.
+	if _, _, e := tr.PeerState(2); e < 4*time.Millisecond {
+		t.Fatalf("idle ewma decayed below the median: %v", e)
+	}
+}
+
+func TestLatencyClamp(t *testing.T) {
+	tr := newT(HealthConfig{})
+	trackN(tr, 1, 1)
+
+	for range 10 {
+		tr.Observe(0, Success, time.Duration(1<<62))
+	}
+
+	tr.Tick(0)
+	tr.Tick(sec)
+
+	if _, _, e := tr.PeerState(0); e <= 0 || e > time.Hour {
+		t.Fatalf("ewma %v", e)
+	}
+}
+
+func BenchmarkTrackBootstrap(b *testing.B) {
+	for _, n := range []int{256, 4096} {
+		refs := make([]TrackRef, n)
+		for i := range refs {
+			refs[i] = TrackRef{Slot: uint32(i * 7), Key: uint64(i), Cell: uint32(i / 4)}
+		}
+
+		b.Run("Track/"+strconv.Itoa(n), func(b *testing.B) {
+			for b.Loop() {
+				tr := newT(HealthConfig{})
+				for _, r := range refs {
+					tr.Track(r.Slot, r.Key, r.Cell)
+				}
+			}
+		})
+		b.Run("Sync/"+strconv.Itoa(n), func(b *testing.B) {
+			for b.Loop() {
+				newT(HealthConfig{}).Sync(refs)
+			}
+		})
+	}
+}
+
+// TestPeerLayout checks that the three access groups of Peer each fill one
+// 64-byte line.
+func TestPeerLayout(t *testing.T) {
+	var p healthPeer
+
+	if got := unsafe.Sizeof(p); got != 192 {
+		t.Fatalf("sizeof(Peer) = %d, want 192", got)
+	}
+
+	if got := unsafe.Offsetof(p.latSum); got != 64 {
+		t.Fatalf("offset of latSum = %d, want 64", got)
+	}
+
+	if got := unsafe.Offsetof(p.until); got != 128 {
+		t.Fatalf("offset of until = %d, want 128", got)
+	}
+
+	if got := unsafe.Offsetof(p.degraded); got >= 64 {
+		t.Fatalf("offset of degraded = %d, want < 64", got)
 	}
 }

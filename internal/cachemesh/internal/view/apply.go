@@ -4,6 +4,7 @@
 package view
 
 import (
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"math"
@@ -758,4 +759,543 @@ func idSizeFor(n int) uint64 {
 	}
 
 	return size
+}
+
+// Validate checks every structural invariant of v in O(members +
+// partitions + cells): member records (keys match IDs and incarnations,
+// unique IDs, states, weights, cells in range), the ID index, the cell index
+// (matches members, sorted by key then slot), free slots, per-slot loads
+// against the table, that owners are members while the view has members,
+// that the table matches the config, the shape, the leader, and the sorted
+// keyspace generations. Errors wrap ErrInvalid.
+func Validate(v *View) error {
+	if err := validate(v); err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalid, err)
+	}
+
+	return nil
+}
+
+func validate(v *View) error {
+	for i := 1; i < len(v.gens); i++ {
+		if v.gens[i-1].Seed >= v.gens[i].Seed {
+			return fmt.Errorf("generations not sorted at %d", i)
+		}
+	}
+
+	for _, g := range v.gens {
+		if g.Gen == 0 {
+			return fmt.Errorf("zero generation for seed %x", g.Seed)
+		}
+	}
+
+	if len(v.gens) > MaxGens {
+		return fmt.Errorf("%d generations", len(v.gens))
+	}
+
+	if v.period < 0 {
+		return fmt.Errorf("negative period")
+	}
+
+	if !v.hasConfig {
+		if v.n != 0 || v.slotCap != 0 || v.table != nil || v.config != (Config{}) || v.shape != (Shape{}) {
+			return fmt.Errorf("members, table, or shape without config")
+		}
+
+		if v.version.Term > 0 {
+			return fmt.Errorf("term %d without a leader member", v.version.Term)
+		}
+
+		return nil
+	}
+
+	if err := validateLayout(v); err != nil {
+		return err
+	}
+
+	if err := validateMembers(v); err != nil {
+		return err
+	}
+
+	if err := validateCells(v); err != nil {
+		return err
+	}
+
+	if err := validateLoads(v); err != nil {
+		return err
+	}
+
+	if v.version.Term > 0 && !v.IsMember(v.leader) {
+		return fmt.Errorf("leader slot %d is not a member", v.leader)
+	}
+
+	return nil
+}
+
+func validateLayout(v *View) error {
+	c := v.config
+	if !ValidPartitionBits(c.PartitionBits) {
+		return fmt.Errorf("partition bits %d", c.PartitionBits)
+	}
+
+	if c.InitialOwner != NoSlot && c.InitialOwner >= MaxSlots {
+		return fmt.Errorf("initial owner %d", c.InitialOwner)
+	}
+
+	if v.table == nil || v.table.Bits() != c.PartitionBits {
+		return fmt.Errorf("table does not match %d partition bits", c.PartitionBits)
+	}
+
+	if err := v.shape.Validate(); err != nil {
+		return err
+	}
+
+	if v.shape.Cells() > MaxCells {
+		return fmt.Errorf("%d cells", v.shape.Cells())
+	}
+
+	if want := (v.shape.Cells() + cellChunk - 1) / cellChunk; len(v.cells) != int(want) {
+		return fmt.Errorf("cell index has %d chunks, want %d", len(v.cells), want)
+	}
+
+	if v.slotCap > MaxSlots {
+		return fmt.Errorf("slot cap %d", v.slotCap)
+	}
+
+	if want := (int(v.slotCap) + memChunk - 1) / memChunk; len(v.mem) != want || len(v.minReuse) != want {
+		return fmt.Errorf("member storage has %d chunks, want %d", len(v.mem), want)
+	}
+
+	if len(v.ids) != 0 && v.idSize() < idxChunk || v.idSize()&(v.idSize()-1) != 0 {
+		return fmt.Errorf("ID index size %d", v.idSize())
+	}
+
+	if uint64(v.n)*2 > v.idSize() && v.n > 0 {
+		return fmt.Errorf("ID index too small")
+	}
+
+	return nil
+}
+
+func validateMembers(v *View) error {
+	n := 0
+	ids := make(map[string]Slot, v.n)
+
+	for ci, c := range v.mem {
+		minR := uint64(noReuse)
+
+		for j := range memChunk {
+			s := Slot(ci<<memShift + j)
+			m := &c.mem[j]
+
+			if s >= v.slotCap {
+				if *m != (Member{}) || c.reuse[j] != 0 {
+					return fmt.Errorf("slot %d beyond cap is not empty", s)
+				}
+
+				continue
+			}
+
+			if m.State == 0 {
+				if *m != (Member{}) {
+					return fmt.Errorf("free slot %d has member data", s)
+				}
+
+				minR = min(minR, c.reuse[j])
+
+				continue
+			}
+
+			if c.reuse[j] != 0 {
+				return fmt.Errorf("slot %d: member with reuse epoch", s)
+			}
+
+			if err := checkMember(m); err != nil {
+				return fmt.Errorf("slot %d: %w", s, err)
+			}
+
+			if m.Cell >= v.shape.Cells() {
+				return fmt.Errorf("slot %d: cell %d out of range", s, m.Cell)
+			}
+
+			if m.Joined > m.Since {
+				return fmt.Errorf("slot %d: joined %d after since %d", s, m.Joined, m.Since)
+			}
+
+			if prev, dup := ids[m.ID]; dup {
+				return fmt.Errorf("ID %q at slots %d and %d", m.ID, prev, s)
+			}
+
+			ids[m.ID] = s
+
+			if got := v.lookupID(m.ID); got != s {
+				return fmt.Errorf("ID index maps %q to %d, want %d", m.ID, got, s)
+			}
+
+			n++
+		}
+
+		if v.minReuse[ci] != minR {
+			return fmt.Errorf("chunk %d: min reuse %d, want %d", ci, v.minReuse[ci], minR)
+		}
+	}
+
+	if n != v.n || v.idCount != n {
+		return fmt.Errorf("member count %d, recorded %d, indexed %d", n, v.n, v.idCount)
+	}
+
+	return nil
+}
+
+func validateCells(v *View) error {
+	total := 0
+
+	for ci, ch := range v.cells {
+		if ch == nil {
+			continue
+		}
+
+		if len(ch) != cellChunk {
+			return fmt.Errorf("cell chunk %d has %d cells", ci, len(ch))
+		}
+
+		for j, cs := range ch {
+			c := uint32(ci<<cellShift + j)
+			if c >= v.shape.Cells() && len(cs) > 0 {
+				return fmt.Errorf("members in cell %d beyond shape", c)
+			}
+
+			for i, s := range cs {
+				if v.Cell(s) != c {
+					return fmt.Errorf("cell %d lists slot %d in cell %d", c, s, v.Cell(s))
+				}
+
+				if i > 0 {
+					p := cs[i-1]
+					if kp, ks := v.Key(p), v.Key(s); kp > ks || kp == ks && p >= s {
+						return fmt.Errorf("cell %d not sorted at %d", c, i)
+					}
+				}
+			}
+
+			total += len(cs)
+		}
+	}
+
+	if total != v.n {
+		return fmt.Errorf("cell index holds %d slots, want %d", total, v.n)
+	}
+
+	return nil
+}
+
+func validateLoads(v *View) error {
+	loads := v.table.Loads(nil)
+	orphans := uint64(0)
+
+	for s, l := range loads {
+		if l > 0 && !v.IsMember(Slot(s)) {
+			orphans += uint64(l)
+		}
+	}
+
+	for s := range max(len(loads), len(v.loads)<<loadShift) {
+		want := uint32(0)
+		if s < len(loads) {
+			want = loads[s]
+		}
+
+		if got := v.Load(Slot(s)); got != want {
+			return fmt.Errorf("slot %d: load %d, table has %d", s, got, want)
+		}
+	}
+
+	if orphans != v.orphans {
+		return fmt.Errorf("orphaned partitions %d, recorded %d", orphans, v.orphans)
+	}
+
+	if v.n > 0 && orphans > 0 {
+		return fmt.Errorf("%d partitions owned by non-members", orphans)
+	}
+
+	return nil
+}
+
+// Equal reports whether a and b have identical content, including version
+// and digest. Storage sharing is irrelevant.
+func Equal(a, b *View) bool {
+	if a == b {
+		return true
+	}
+
+	if a.version != b.version || a.digest != b.digest || a.leader != b.leader ||
+		a.config != b.config || a.hasConfig != b.hasConfig || a.shape != b.shape ||
+		a.epoch != b.epoch || a.period != b.period || a.n != b.n || a.slotCap != b.slotCap ||
+		!slices.Equal(a.gens, b.gens) {
+		return false
+	}
+
+	if (a.table == nil) != (b.table == nil) || a.table != nil && !EqualTables(a.table, b.table) {
+		return false
+	}
+
+	for ci := range a.mem {
+		if a.mem[ci] != b.mem[ci] && *a.mem[ci] != *b.mem[ci] {
+			return false
+		}
+	}
+
+	return true
+}
+
+// DefaultDeltaLogSize is the default number of deltas a DeltaLog keeps.
+const DefaultDeltaLogSize = 512
+
+// LogEntry is a logged delta and its canonical encoding.
+type LogEntry struct {
+	Delta   *Delta
+	Encoded []byte
+}
+
+type logEntry struct {
+	LogEntry
+
+	baseDigest Digest
+}
+
+// DeltaLog is a bounded chain of the most recent deltas a node applied, kept
+// with their encodings so serving catch-up does not re-encode. It is not
+// safe for concurrent use.
+type DeltaLog struct {
+	ring  []logEntry
+	start int // index of the oldest entry
+	n     int
+
+	// head is the version and digest at the end of the chain (or the anchor
+	// when the log is empty).
+	head       Version
+	headDigest Digest
+}
+
+// NewDeltaLog returns a log holding up to size deltas (DefaultDeltaLogSize
+// if size <= 0), anchored at the genesis view.
+func NewDeltaLog(size int) *DeltaLog {
+	if size <= 0 {
+		size = DefaultDeltaLogSize
+	}
+
+	l := &DeltaLog{ring: make([]logEntry, size)}
+	l.Reset(Genesis())
+
+	return l
+}
+
+// Reset empties the log and anchors it at v, for example after installing a
+// snapshot.
+func (l *DeltaLog) Reset(v *View) {
+	clear(l.ring)
+	l.start, l.n = 0, 0
+	l.head, l.headDigest = v.Version(), v.Digest()
+}
+
+// Len returns the number of logged deltas.
+func (l *DeltaLog) Len() int { return l.n }
+
+// Head returns the version and digest at the end of the chain.
+func (l *DeltaLog) Head() (Version, Digest) { return l.head, l.headDigest }
+
+// Append adds d, which must have been applied to the log head (d.Base equals
+// the head version), evicting the oldest delta when full. encoded is the
+// canonical encoding of d; if nil it is computed. The log retains d and
+// encoded.
+func (l *DeltaLog) Append(d *Delta, encoded []byte) error {
+	if d.Base != l.head {
+		return fmt.Errorf("%w: log head %v, delta base %v", ErrBase, l.head, d.Base)
+	}
+
+	if encoded == nil {
+		encoded = EncodeDelta(d)
+	}
+
+	i := (l.start + l.n) % len(l.ring)
+	if l.n == len(l.ring) {
+		l.start = (l.start + 1) % len(l.ring)
+	} else {
+		l.n++
+	}
+
+	l.ring[i] = logEntry{LogEntry: LogEntry{Delta: d, Encoded: encoded}, baseDigest: l.headDigest}
+	l.head, l.headDigest = d.Version, d.Digest
+
+	return nil
+}
+
+// Since returns up to limit deltas (all if max <= 0) that follow the view
+// (have, haveDigest), oldest first, and true, when that view is the head or
+// the base of a logged delta. It returns nil and true when have is the head
+// and false when the log cannot serve the request (the caller sends a
+// snapshot). The returned entries are shared.
+func (l *DeltaLog) Since(have Version, haveDigest Digest, limit int) ([]LogEntry, bool) {
+	if have == l.head {
+		return nil, haveDigest == l.headDigest
+	}
+
+	for k := range l.n {
+		e := &l.ring[(l.start+k)%len(l.ring)]
+		if e.Delta.Base != have {
+			continue
+		}
+
+		if e.baseDigest != haveDigest {
+			return nil, false
+		}
+
+		cnt := l.n - k
+		if limit > 0 {
+			cnt = min(cnt, limit)
+		}
+
+		out := make([]LogEntry, cnt)
+		for j := range out {
+			out[j] = l.ring[(l.start+k+j)%len(l.ring)].LogEntry
+		}
+
+		return out, true
+	}
+
+	return nil, false
+}
+
+// DefaultInternerSize is the default number of entries per Interner table.
+const DefaultInternerSize = 4096
+
+type applyKey struct {
+	base  Digest
+	delta Digest
+}
+
+// Interner shares identical views and decoded deltas, for example across
+// thousands of simulated members that apply the same deltas. It is only a
+// cache: results equal those of Apply and DecodeDelta. Each table is bounded
+// and evicts in insertion order. It is not safe for concurrent use.
+// Production code does not use it.
+type Interner struct {
+	byID    FIFO[Digest, *View]
+	deltas  FIFO[Digest, *Delta]
+	applied FIFO[applyKey, *View]
+
+	// Hits and Misses count Apply and Delta cache lookups.
+	Hits, Misses uint64
+}
+
+// NewInterner returns an interner keeping up to size entries per table
+// (DefaultInternerSize if size <= 0).
+func NewInterner(size int) *Interner {
+	if size <= 0 {
+		size = DefaultInternerSize
+	}
+
+	return &Interner{
+		byID:    NewFIFO[Digest, *View](size),
+		deltas:  NewFIFO[Digest, *Delta](size),
+		applied: NewFIFO[applyKey, *View](size),
+	}
+}
+
+// View returns the interned view with v's digest, interning v if there is
+// none. Views with equal digests are assumed equal.
+func (in *Interner) View(v *View) *View {
+	if w, ok := in.byID.Get(v.Digest()); ok && w.Version() == v.Version() {
+		return w
+	}
+
+	in.byID.Put(v.Digest(), v)
+
+	return v
+}
+
+// Apply is Apply(base, d) memoized on (base digest, delta digest). The
+// result is interned.
+func (in *Interner) Apply(base *View, d *Delta) (*View, error) {
+	k := applyKey{base: base.Digest(), delta: d.Digest}
+	if v, ok := in.applied.Get(k); ok && base.Version() == d.Base && v.Version() == d.Version {
+		in.Hits++
+
+		return v, nil
+	}
+
+	in.Misses++
+
+	v, err := Apply(base, d)
+	if err != nil {
+		return nil, err
+	}
+
+	v = in.View(v)
+	in.applied.Put(k, v)
+
+	return v, nil
+}
+
+// Delta is DecodeDelta(encoded) memoized on the content of encoded. The
+// returned delta is shared and must not be modified.
+func (in *Interner) Delta(encoded []byte) (*Delta, error) {
+	k := Digest(sha256.Sum256(encoded))
+	if d, ok := in.deltas.Get(k); ok {
+		in.Hits++
+
+		return d, nil
+	}
+
+	in.Misses++
+
+	d, err := DecodeDelta(encoded)
+	if err != nil {
+		return nil, err
+	}
+
+	in.deltas.Put(k, d)
+
+	return d, nil
+}
+
+// FIFO is a bounded map that evicts the oldest insertion. It backs the
+// simulation-wide caches (Interner and the node package's Shared). It is not
+// safe for concurrent use.
+type FIFO[K comparable, V any] struct {
+	m     map[K]V
+	order []K
+	next  int
+}
+
+// NewFIFO returns a FIFO holding at most n entries.
+func NewFIFO[K comparable, V any](n int) FIFO[K, V] {
+	return FIFO[K, V]{m: make(map[K]V, n), order: make([]K, 0, n)}
+}
+
+// Get returns the value stored for k.
+func (f *FIFO[K, V]) Get(k K) (V, bool) {
+	v, ok := f.m[k]
+
+	return v, ok
+}
+
+// Put stores v for k. Replacing an existing key keeps its eviction order;
+// inserting a new key into a full FIFO evicts the oldest key.
+func (f *FIFO[K, V]) Put(k K, v V) {
+	if _, ok := f.m[k]; ok {
+		f.m[k] = v
+
+		return
+	}
+
+	if len(f.order) < cap(f.order) {
+		f.order = append(f.order, k)
+	} else {
+		delete(f.m, f.order[f.next])
+		f.order[f.next] = k
+		f.next = (f.next + 1) % len(f.order)
+	}
+
+	f.m[k] = v
 }

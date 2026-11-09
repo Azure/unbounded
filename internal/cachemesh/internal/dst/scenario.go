@@ -7,11 +7,12 @@ import (
 	"cmp"
 	"encoding/binary"
 	"fmt"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
 	"math/rand/v2"
 	"slices"
 	"strconv"
 	"strings"
+
+	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
 )
 
 // FaultKind is a kind of injected fault.

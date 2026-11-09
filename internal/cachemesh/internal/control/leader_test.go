@@ -4,7 +4,9 @@
 package control
 
 import (
+	"errors"
 	"math/rand/v2"
+	"slices"
 	"strconv"
 	"testing"
 	"time"
@@ -897,4 +899,470 @@ func TestOpBudget(t *testing.T) {
 	if joining != 0 {
 		t.Fatalf("%d members still joining", joining)
 	}
+}
+
+// TestInputQueuesBounded floods every input queue: each stays within
+// MaxPending, and per-target suspicion reports within 64.
+func TestInputQueuesBounded(t *testing.T) {
+	cfg := smallCfg("a")
+	cfg.MaxPending = 8
+	l := NewLeader(cfg, nil)
+
+	for i := range 10_000 {
+		l.Join(0, member(i))
+		l.Leave(0, member(i).ID, 1)
+		l.Suspect(0, view.Slot(i), uint64(i), view.Slot(i+1))
+		l.Invalidate(uint64(i))
+	}
+
+	for o := range 10_000 {
+		l.Suspect(int64(o), 0, 0, view.Slot(o))
+	}
+
+	if j, lv, s, i := l.Pending(); j > 8 || lv > 8 || s > 8 || i > 8 {
+		t.Fatalf("pending %d %d %d %d", j, lv, s, i)
+	}
+
+	if n := len(l.suspects[0].reports); n > 64 {
+		t.Fatalf("%d reports for one target", n)
+	}
+
+	l.Reset()
+
+	if j, lv, s, i := l.Pending(); j+lv+s+i != 0 {
+		t.Fatal("Reset left queued inputs")
+	}
+}
+
+func randomMembers(r *rand.Rand, n int, slot0 uint32) []PlanMember {
+	ms := make([]PlanMember, n)
+	for i := range ms {
+		ms[i] = PlanMember{Slot: slot0 + uint32(i), Key: r.Uint64(), Weight: view.MaxWeight, Cell: uint32(r.IntN(max(1, n/4)))}
+	}
+
+	return ms
+}
+
+// step applies one plan and checks its invariants.
+func step(t *testing.T, pl *Planner, tb *view.Table, ms []PlanMember, epoch uint32) (*view.Table, Plan) {
+	t.Helper()
+
+	plan, err := pl.Plan(tb, ms)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	parts, owners := slices.Clone(plan.Parts), slices.Clone(plan.Owners)
+
+	nt, err := tb.Assign(parts, owners, epoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assignable := map[uint32]bool{}
+	anyW := false
+
+	for _, m := range ms {
+		if !m.Gone && m.Weight > 0 {
+			anyW = true
+		}
+	}
+
+	for _, m := range ms {
+		if !m.Gone && (m.Weight > 0 || !anyW) {
+			assignable[m.Slot] = true
+		}
+	}
+
+	if len(assignable) > 0 {
+		nt.ForEach(func(p uint32, e view.Entry) {
+			if !assignable[e.Owner] {
+				t.Fatalf("partition %d left on non-assignable owner %d", p, e.Owner)
+			}
+		})
+	}
+
+	return nt, plan
+}
+
+func TestPlannerConverges(t *testing.T) {
+	r := rand.New(rand.NewPCG(42, 1))
+	pl := NewPlanner(PlannerConfig{MaxMoves: 512})
+
+	const bits = 14
+
+	tb := view.NewTable(bits, view.NoMember)
+	ms := randomMembers(r, 40, 0)
+
+	for i := range ms {
+		ms[i].Weight = 0 // bootstrap
+	}
+
+	nextSlot := uint32(len(ms))
+	epoch := uint32(1)
+
+	settle := func(label string) {
+		t.Helper()
+
+		for range 200 {
+			var plan Plan
+
+			tb, plan = step(t, pl, tb, ms, epoch)
+			epoch++
+
+			if len(plan.Parts) == 0 {
+				break
+			}
+		}
+
+		ok, err := pl.Settled(tb, ms)
+		if err != nil || !ok {
+			t.Fatalf("%s: not settled", label)
+		}
+
+		tg, _ := pl.Targets(bits, ms)
+		loads := tb.Loads(nil)
+
+		for i, m := range ms {
+			if !m.Gone && int(m.Slot) < len(loads) && int64(loads[m.Slot]) != tg[i] {
+				t.Fatalf("%s: member %d load %d target %d", label, m.Slot, loads[m.Slot], tg[i])
+			}
+		}
+	}
+
+	settle("bootstrap")
+
+	for range 30 {
+		switch r.IntN(4) {
+		case 0: // add joiners and ramp them
+			for range r.IntN(5) + 1 {
+				m := PlanMember{Slot: nextSlot, Key: r.Uint64(), Cell: uint32(r.IntN(10))}
+				nextSlot++
+
+				ms = append(ms, m)
+			}
+		case 1: // remove some, sometimes listing them as Gone
+			for range r.IntN(5) + 1 {
+				if len(ms) < 3 {
+					break
+				}
+
+				i := r.IntN(len(ms))
+				if r.IntN(2) == 0 {
+					ms[i].Gone = true
+				} else {
+					ms = slices.Delete(ms, i, i+1)
+				}
+			}
+		case 2: // drain
+			ms[r.IntN(len(ms))].Weight = 0
+		case 3: // ramp
+			for i := range ms {
+				switch ms[i].Weight {
+				case 0:
+					ms[i].Weight = 250
+				case 250:
+					ms[i].Weight = 500
+				case 500:
+					ms[i].Weight = 1000
+				}
+			}
+		}
+
+		settle("round")
+
+		ms = slices.DeleteFunc(ms, func(m PlanMember) bool { return m.Gone })
+	}
+}
+
+func TestPlannerCellMatePreference(t *testing.T) {
+	pl := NewPlanner(PlannerConfig{MaxMoves: -1})
+	ms := []PlanMember{
+		{Slot: 0, Key: 10, Weight: 1000, Cell: 0},
+		{Slot: 1, Key: 20, Weight: 1000, Cell: 0},
+		{Slot: 2, Key: 30, Weight: 1000, Cell: 0},
+		{Slot: 3, Key: 40, Weight: 1000, Cell: 1},
+		{Slot: 4, Key: 50, Weight: 1000, Cell: 1},
+	}
+
+	tb := view.NewTable(10, view.NoMember)
+
+	tb, _ = step(t, pl, tb, ms, 1)
+
+	// Slot 0 leaves (drains): its partitions go to cell-mates 1 and 2 while
+	// they are under target, ranked by score.
+	ms[0].Weight = 0
+	before := tb
+
+	tb, plan := step(t, pl, tb, ms, 2)
+	if plan.Mandatory != len(plan.Parts) {
+		t.Fatal("optional moves disabled")
+	}
+
+	tg, _ := pl.Targets(10, ms)
+	used := map[uint32]int64{}
+
+	for _, s := range []uint32{1, 2, 3, 4} {
+		used[s] = int64(before.Loads(nil)[s])
+	}
+
+	for i, p := range plan.Parts {
+		o := plan.Owners[i]
+
+		if before.Owner(p) != 0 {
+			t.Fatal("moved a partition not owned by slot 0")
+		}
+
+		// Expected: best-scored cell-mate with room, else under-target fallback.
+		best := view.NoMember
+
+		var bs uint64
+
+		for _, j := range []uint32{1, 2} {
+			if used[j] >= tg[j] {
+				continue
+			}
+
+			sc := view.Score(ms[j].Key, uint64(p))
+			if best == view.NoMember || view.Better(sc, ms[j].Key, bs, ms[best].Key) {
+				best, bs = j, sc
+			}
+		}
+
+		if best != view.NoMember && o != best {
+			t.Fatalf("partition %d went to %d, want cell-mate %d", p, o, best)
+		}
+
+		used[o]++
+	}
+
+	if tb.Get(plan.Parts[0]).Prev != 0 {
+		t.Fatal("Prev must be set")
+	}
+}
+
+func TestPlannerDeterministic(t *testing.T) {
+	r := rand.New(rand.NewPCG(7, 7))
+	ms := randomMembers(r, 200, 5)
+	tb := view.NewTable(12, view.NoMember)
+
+	tb, _ = step(t, NewPlanner(PlannerConfig{}), tb, ms, 1)
+
+	for i := range 20 {
+		ms[i*3].Weight = 0
+	}
+
+	ms = ms[:190]
+	p1, _ := NewPlanner(PlannerConfig{MaxMoves: 100}).Plan(tb, ms)
+	p1 = Plan{Parts: slices.Clone(p1.Parts), Owners: slices.Clone(p1.Owners), Mandatory: p1.Mandatory}
+
+	sh := slices.Clone(ms)
+	r.Shuffle(len(sh), func(i, j int) { sh[i], sh[j] = sh[j], sh[i] })
+
+	pl := NewPlanner(PlannerConfig{MaxMoves: 100})
+	_, _ = pl.Plan(view.NewTable(3, 0), sh[:3]) // dirty the buffers
+
+	p2, _ := pl.Plan(tb, sh)
+	if !slices.Equal(p1.Parts, p2.Parts) || !slices.Equal(p1.Owners, p2.Owners) || p1.Mandatory != p2.Mandatory {
+		t.Fatal("plan depends on member order or planner history")
+	}
+}
+
+func TestPlannerErrorsAndEmpty(t *testing.T) {
+	pl := NewPlanner(PlannerConfig{})
+	tb := view.NewTable(4, 1)
+
+	if _, err := pl.Plan(tb, []PlanMember{{Slot: 1}, {Slot: 1}}); !errors.Is(err, view.ErrInvalidTable) {
+		t.Fatal("duplicate slot")
+	}
+
+	if _, err := pl.Plan(tb, []PlanMember{{Slot: view.NoMember}}); !errors.Is(err, view.ErrInvalidTable) {
+		t.Fatal("NoMember slot")
+	}
+
+	p, err := pl.Plan(tb, nil)
+	if err != nil || len(p.Parts) != 0 {
+		t.Fatal("empty membership must plan nothing")
+	}
+
+	if ok, _ := pl.Settled(tb, nil); !ok {
+		t.Fatal("empty membership is settled")
+	}
+
+	if ok, _ := pl.Settled(tb, []PlanMember{{Slot: 2, Weight: 1}}); ok {
+		t.Fatal("orphans are not settled")
+	}
+
+	// All Gone: nothing to assign to.
+	p, _ = pl.Plan(tb, []PlanMember{{Slot: 1, Gone: true}})
+	if len(p.Parts) != 0 {
+		t.Fatal("gone-only membership must plan nothing")
+	}
+}
+
+func TestTargets(t *testing.T) {
+	pl := NewPlanner(PlannerConfig{})
+	ms := []PlanMember{
+		{Slot: 0, Key: 3, Weight: 1000},
+		{Slot: 1, Key: 1, Weight: 1000},
+		{Slot: 2, Key: 2, Weight: 1000},
+		{Slot: 3, Key: 0, Weight: 0},
+	}
+
+	tg, _ := pl.Targets(4, ms) // 16 / 3 = 5 rem 1 -> key 1 (slot 1)
+	if !slices.Equal(tg, []int64{5, 6, 5, 0}) {
+		t.Fatalf("targets %v", tg)
+	}
+
+	ms[0].Weight = 250 // W=2250: 16*250/2250=1, 16*1000/2250=7,7 -> rem 1
+	tg, _ = pl.Targets(4, ms)
+
+	if !slices.Equal(tg, []int64{1, 8, 7, 0}) {
+		t.Fatalf("weighted targets %v", tg)
+	}
+}
+
+func BenchmarkPlan(b *testing.B) {
+	for _, removed := range []int{0, 1, 10} {
+		b.Run("removed="+strconv.Itoa(removed), func(b *testing.B) {
+			r := rand.New(rand.NewPCG(3, 4))
+			ms := randomMembers(r, 100_000, 0)
+			pl := NewPlanner(PlannerConfig{})
+			tb := view.NewTable(20, view.NoMember)
+
+			for {
+				plan, _ := pl.Plan(tb, ms)
+				if len(plan.Parts) == 0 {
+					break
+				}
+
+				tb, _ = tb.Assign(plan.Parts, plan.Owners, 1)
+			}
+
+			ms = ms[removed:]
+
+			b.ReportAllocs()
+			b.ResetTimer()
+
+			for range b.N {
+				if _, err := pl.Plan(tb, ms); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+// TestPlanProperties checks per-plan invariants on random member sets with
+// duplicate keys, Gone members, weight-0 members, and random tables: moves
+// are bounded, partitions are unique, owners are assignable, no member is
+// pushed above its target, and the plan does not depend on member order.
+func TestPlanProperties(t *testing.T) {
+	r := rand.New(rand.NewPCG(3, 9))
+
+	for iter := range 200 {
+		bits := uint8(view.MinPartitionBits + r.IntN(4))
+		n := 1 + r.IntN(30)
+		ms := make([]PlanMember, n)
+
+		for i := range ms {
+			ms[i] = PlanMember{
+				Slot:   uint32(i * 2),
+				Key:    uint64(r.IntN(8)), // many duplicate keys
+				Weight: []uint32{0, 250, 500, view.MaxWeight}[r.IntN(4)],
+				Cell:   uint32(r.IntN(4)),
+				Gone:   r.IntN(8) == 0,
+			}
+		}
+
+		tb := view.NewTableFunc(bits, func(uint32) view.Entry {
+			return view.Entry{Owner: uint32(r.IntN(2*n + 4)), Prev: view.NoMember}
+		})
+		maxMoves := r.IntN(64) - 1
+		pl := NewPlanner(PlannerConfig{MaxMoves: maxMoves})
+
+		plan, err := pl.Plan(tb, ms)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		parts, owners := slices.Clone(plan.Parts), slices.Clone(plan.Owners)
+
+		limit := maxMoves
+		if maxMoves == 0 {
+			limit = DefaultMaxMoves
+		} else if maxMoves < 0 {
+			limit = 0
+		}
+
+		if len(parts)-plan.Mandatory > limit {
+			t.Fatalf("iter %d: %d optional moves > %d", iter, len(parts)-plan.Mandatory, limit)
+		}
+
+		tg, _ := pl.Targets(bits, ms)
+		idx := map[uint32]int{}
+
+		for i, m := range ms {
+			idx[m.Slot] = i
+		}
+
+		loads := tb.Loads(nil)
+		grow := func(s uint32) int64 {
+			if int(s) < len(loads) {
+				return int64(loads[s])
+			}
+
+			return 0
+		}
+		after := map[uint32]int64{}
+
+		for i, p := range parts {
+			o := owners[i]
+
+			j, ok := idx[o]
+			if !ok || ms[j].Gone || tg[j] == 0 {
+				t.Fatalf("iter %d: partition %d to non-assignable %d", iter, p, o)
+			}
+
+			if _, seen := after[o]; !seen {
+				after[o] = grow(o)
+			}
+
+			after[o]++
+			if after[o] > tg[j] && grow(o) < after[o] {
+				t.Fatalf("iter %d: member %d pushed to %d above target %d", iter, o, after[o], tg[j])
+			}
+		}
+
+		sorted := slices.Clone(parts)
+		slices.Sort(sorted)
+
+		if len(slices.Compact(sorted)) != len(parts) {
+			t.Fatalf("iter %d: duplicate partitions", iter)
+		}
+
+		if _, err := tb.Assign(parts, owners, 1); err != nil {
+			t.Fatalf("iter %d: %v", iter, err)
+		}
+
+		sh := slices.Clone(ms)
+		r.Shuffle(len(sh), func(i, j int) { sh[i], sh[j] = sh[j], sh[i] })
+
+		p2, _ := NewPlanner(PlannerConfig{MaxMoves: maxMoves}).Plan(tb, sh)
+		if !slices.Equal(parts, p2.Parts) || !slices.Equal(owners, p2.Owners) {
+			t.Fatalf("iter %d: plan depends on member order", iter)
+		}
+	}
+}
+
+// Targets returns each member's target load (indexed like members) under
+// the Planner rules; non-assignable members get 0.
+func (pl *Planner) Targets(bits uint8, members []PlanMember) ([]int64, error) {
+	if _, err := pl.prepare(1<<bits, members); err != nil {
+		return nil, err
+	}
+
+	pl.members = nil
+
+	return slices.Clone(pl.target[:len(members)]), nil
 }

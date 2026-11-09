@@ -5,7 +5,12 @@ package route
 
 import (
 	"errors"
+	"math/bits"
+	"math/rand/v2"
+	"strconv"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view"
 	"github.com/Azure/unbounded/internal/cachemesh/internal/view/viewtest"
@@ -822,4 +827,658 @@ func TestFreshWithoutView(t *testing.T) {
 	if !st.Fresh(seed, StampFor(0, 0, 0, 0)) {
 		t.Fatal("never-expiring stamp must stay fresh")
 	}
+}
+
+// TestDivergentHealthViews gives every member its own health tracker with
+// different opinions (random ejected and degraded peers, each member's
+// opinion drawn independently). Requests must still be loop-free, finish
+// within the TTL, take at most D hops plus one failover, and end at the
+// owner or at a member of the owner's cell serving as a backup. Relay hops
+// fix one coordinate each regardless of health, and the backup rule never
+// chains, so differing opinions cannot bounce a request between members.
+func TestDivergentHealthViews(t *testing.T) {
+	for _, tc := range []struct {
+		n, maxN int
+		bad     int
+		panicP  int
+	}{
+		{n: 300, maxN: 256, bad: 30},
+		{n: 1500, maxN: 90, bad: 150},
+		{n: 2000, maxN: 20, bad: 200},
+		{n: 1500, maxN: 40, bad: 600, panicP: 30},
+	} {
+		v := viewtest.Build(t, tc.n, viewtest.Options{Seed: uint64(tc.n + tc.bad), MaxNeighbors: tc.maxN})
+		d := int(v.Shape().Dims)
+		rng := rand.New(rand.NewPCG(uint64(tc.n), uint64(tc.bad)))
+
+		f := &fixture{v: v, st: make([]*State, v.SlotCap())}
+		for i := range f.st {
+			tr := newTracker(tc.panicP)
+			perm := rng.Perm(tc.n)[:tc.bad]
+
+			refs := make([]TrackRef, 0, len(perm))
+
+			for _, s := range perm {
+				if s != i {
+					refs = append(refs, TrackRef{Slot: view.Slot(s), Key: v.Key(view.Slot(s)), Cell: fakeCell})
+				}
+			}
+
+			tr.TrackMany(refs)
+
+			for k, r := range refs {
+				if k%3 == 0 {
+					tr.Observe(r.Slot, Overload, 0)
+				} else {
+					fail(tr, r.Slot)
+				}
+			}
+
+			tr.Tick(0)
+
+			f.st[i] = NewState(v, view.Slot(i), newEnv(tr, 1))
+		}
+
+		hist := make([]int, d+3)
+		bits := v.PartitionBits()
+
+		for o := range tc.n {
+			for range 8 {
+				p := rng.Uint32() >> (32 - bits)
+				path, dec := walk(t, f, view.Slot(o), p)
+
+				if dec.Kind != KindSelf {
+					t.Fatalf("n=%d: ended with %v", tc.n, dec.Kind)
+				}
+
+				if len(path) > d+1 {
+					t.Fatalf("n=%d: %d hops > D+1=%d: %v", tc.n, len(path), d+1, path)
+				}
+
+				last := view.Slot(o)
+				if len(path) > 0 {
+					last = path[len(path)-1]
+				}
+
+				owner := v.Table().Owner(p)
+				if last != owner && (dec.Header.Flags&FlagBackup == 0 || v.Cell(last) != v.Cell(owner)) {
+					t.Fatalf("n=%d: ended at %d (cell %d), owner %d (cell %d)", tc.n, last, v.Cell(last), owner, v.Cell(owner))
+				}
+
+				hist[len(path)]++
+			}
+		}
+
+		t.Logf("n=%d D=%d bad=%d hops: %v", tc.n, d, tc.bad, hist)
+	}
+}
+
+func fail(tr *HealthTracker, s view.Slot) {
+	for range 5 {
+		tr.Observe(s, Failure, time.Millisecond)
+	}
+}
+
+// TestInPlaceVariantsMatch checks that RouteTo, RouteHashTo, and ForwardTo
+// produce exactly what Route, RouteHash, and Forward return, with and
+// without filtered peers.
+func TestInPlaceVariantsMatch(t *testing.T) {
+	v := viewtest.Build(t, 400, viewtest.Options{PartitionBits: 12})
+
+	for _, filtered := range []bool{false, true} {
+		tr := newTracker(0)
+		if filtered {
+			eject(t, tr, v, 3, 50, 77)
+			degrade(t, tr, v, 120)
+		}
+
+		st := NewState(v, 7, newEnv(tr, 1))
+
+		for i := range 2000 {
+			key := []byte("k" + strconv.Itoa(i))
+
+			var d Decision
+
+			st.RouteTo(&d, 9, key)
+
+			if want := st.Route(9, key); d != want {
+				t.Fatalf("RouteTo %q: %+v, want %+v", key, d, want)
+			}
+
+			var dh Decision
+
+			h := view.KeyHash(9, key)
+			st.RouteHashTo(&dh, h)
+
+			if want := st.RouteHash(h); dh != want || dh != d {
+				t.Fatalf("RouteHashTo %q: %+v, want %+v", key, dh, want)
+			}
+
+			in := d.Header
+			in.Sender = 11
+
+			var df Decision
+
+			err := st.ForwardTo(&df, in)
+
+			want, werr := st.Forward(in)
+			if df != want || !errors.Is(err, werr) {
+				t.Fatalf("ForwardTo %q: %+v %v, want %+v %v", key, df, err, want, werr)
+			}
+		}
+
+		var d Decision
+
+		if err := st.ForwardTo(&d, Header{}); err == nil || d != (Decision{}) {
+			t.Fatalf("bad header: %v %+v", err, d)
+		}
+	}
+}
+
+// TestDiffMaskMatchesShape checks State.diffMask and the relay cell
+// arithmetic against view.Shape.
+func TestDiffMaskMatchesShape(t *testing.T) {
+	rng := rand.New(rand.NewPCG(3, 4))
+
+	for _, sizes := range [][]uint32{{7}, {5, 3}, {4, 6, 5}, {2, 3, 2, 5, 3}} {
+		sh, err := view.NewShape(sizes...)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		for range 500 {
+			self := rng.Uint32N(sh.Cells())
+			st := &State{shape: &sh, selfCell: self}
+			sh.Coords(&st.selfCoords, self)
+
+			c := rng.Uint32N(sh.Cells())
+
+			var oc [view.MaxDims]uint32
+
+			if got, want := st.diffMask(&oc, c), sh.DiffMask(self, c); got != want {
+				t.Fatalf("%v: diffMask(%d, %d) = %b, want %b", sizes, self, c, got, want)
+			}
+
+			for dim := range int(sh.Dims) {
+				got := self + (oc[dim]-st.selfCoords[dim])*sh.Stride(dim)
+				if want := sh.Replace(self, dim, sh.Coord(c, dim)); got != want {
+					t.Fatalf("%v: replace dim %d: %d, want %d", sizes, dim, got, want)
+				}
+			}
+		}
+	}
+}
+
+func TestHeaderRoundTrip(t *testing.T) {
+	h := Header{
+		Format: HeaderFormat, Flags: FlagHedge | FlagBackup, Hops: 2, TTL: 6,
+		Partition: 0xdeadbeef, Sender: 12345, Term: 7, Seq: 1<<40 + 3, Epoch: 1<<63 + 9,
+	}
+
+	b := h.Append([]byte("x"))
+	if len(b) != 1+HeaderSize || b[0] != 'x' {
+		t.Fatalf("len %d", len(b))
+	}
+
+	got, err := ParseHeader(b[1:])
+	if err != nil || got != h {
+		t.Fatalf("%+v %v", got, err)
+	}
+
+	var a [HeaderSize]byte
+
+	h.Put(&a)
+
+	if string(a[:]) != string(b[1:]) {
+		t.Fatal("Put and Append differ")
+	}
+
+	// Big-endian partition at offset 4.
+	if a[4] != 0xde || a[7] != 0xef {
+		t.Fatalf("% x", a)
+	}
+}
+
+func TestParseHeaderMalformed(t *testing.T) {
+	good := Header{Format: HeaderFormat, TTL: 4}.Append(nil)
+
+	for name, mut := range map[string]func([]byte) []byte{
+		"short":  func(b []byte) []byte { return b[:HeaderSize-1] },
+		"empty":  func([]byte) []byte { return nil },
+		"format": func(b []byte) []byte { b[0] = 0; return b },
+		"flags":  func(b []byte) []byte { b[1] = 0x40; return b },
+		"hops":   func(b []byte) []byte { b[2] = 5; return b },
+	} {
+		b := mut(append([]byte(nil), good...))
+		if _, err := ParseHeader(b); !errors.Is(err, ErrBadHeader) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+}
+
+func FuzzParseHeader(f *testing.F) {
+	f.Add(Header{Format: HeaderFormat, TTL: 4, Partition: 3}.Append(nil))
+	f.Add([]byte{1, 2, 3})
+	f.Fuzz(func(t *testing.T, b []byte) {
+		h, err := ParseHeader(b)
+		if err != nil {
+			return
+		}
+
+		if h.Hops > h.TTL || h.Format != HeaderFormat {
+			t.Fatalf("accepted %+v", h)
+		}
+
+		if got, err := ParseHeader(h.Append(nil)); err != nil || got != h {
+			t.Fatalf("round trip %+v %v", got, err)
+		}
+
+		if string(h.Append(nil)) != string(b[:HeaderSize]) {
+			t.Fatal("not canonical")
+		}
+	})
+}
+
+// propertyWalk walks every origin in origins to sampled partitions and
+// returns the hop count histogram.
+func propertyWalk(t *testing.T, f *fixture, origins []view.Slot, parts int, rng *rand.Rand, maxHops int) []int {
+	t.Helper()
+
+	hist := make([]int, 16)
+	bits := f.v.PartitionBits()
+
+	for _, o := range origins {
+		for range parts {
+			p := rng.Uint32() >> (32 - bits)
+			path, d := walk(t, f, o, p)
+
+			if d.Kind != KindSelf {
+				t.Fatalf("ended with %v", d.Kind)
+			}
+
+			last := o
+			if len(path) > 0 {
+				last = path[len(path)-1]
+			}
+
+			owner := f.v.Table().Owner(p)
+			if last != owner && d.Header.Flags&FlagBackup == 0 {
+				t.Fatalf("ended at %d, owner %d", last, owner)
+			}
+
+			if len(path) > maxHops {
+				t.Fatalf("%d hops > %d: %v", len(path), maxHops, path)
+			}
+
+			hist[len(path)]++
+		}
+	}
+
+	return hist
+}
+
+func testProperty(t *testing.T, n, originStep int) {
+	t.Helper()
+
+	v := viewtest.Build(t, n, viewtest.Options{Seed: uint64(n)})
+	d := int(v.Shape().Dims)
+	rng := rand.New(rand.NewPCG(uint64(n), 7))
+
+	var origins []view.Slot
+	for o := 0; o < n; o += originStep {
+		origins = append(origins, view.Slot(o))
+	}
+
+	f := newFixture(v, newEnv(nil, 1))
+	hist := propertyWalk(t, f, origins, 4, rng, d)
+	t.Logf("n=%d D=%d healthy hops: %v", n, d, hist[:d+2])
+
+	// Random unusable members (10%, at most 2000 to keep tracking cheap):
+	// loop-free and within TTL.
+	tr := newTracker(0)
+	bad := make([]view.Slot, 0, min(n/10, 2000))
+
+	for _, s := range rng.Perm(n)[:cap(bad)] {
+		bad = append(bad, view.Slot(s))
+	}
+
+	eject(t, tr, v, bad...)
+
+	f = newFixture(v, newEnv(tr, 1))
+	hist = propertyWalk(t, f, origins, 4, rng, d+2)
+	t.Logf("n=%d D=%d with %d unusable hops: %v", n, d, len(bad), hist[:d+3])
+}
+
+func TestPropertyHops10k(t *testing.T) {
+	testProperty(t, 10_000, 1)
+}
+
+func TestPropertyHops100k(t *testing.T) {
+	if testing.Short() {
+		t.Skip("large")
+	}
+
+	testProperty(t, 100_000, 10)
+}
+
+var (
+	fuzzOnce sync.Once
+	fuzzFix  *fixture
+)
+
+// FuzzForward feeds arbitrary headers to Forward on every member of a small
+// view: it must never panic, accept only well-formed in-range headers, never
+// route to itself, and keep the hop accounting consistent.
+func FuzzForward(f *testing.F) {
+	f.Add(Header{Format: HeaderFormat, TTL: 4, Partition: 3, Sender: 1}.Append(nil), uint16(0))
+	f.Add(Header{Format: HeaderFormat, Flags: FlagBackup, Hops: 3, TTL: 4, Partition: 99, Sender: 7, Term: 9, Seq: 1 << 40}.Append(nil), uint16(5))
+	f.Fuzz(func(t *testing.T, b []byte, self uint16) {
+		fuzzOnce.Do(func() {
+			v := viewtest.Build(t, 200, viewtest.Options{PartitionBits: 12, MaxNeighbors: 30})
+			tr := newTracker(0)
+			eject(t, tr, v, 3, 50, 77)
+			fuzzFix = newFixture(v, newEnv(tr, 1))
+		})
+
+		h, err := ParseHeader(b)
+		if err != nil {
+			return
+		}
+
+		st := fuzzFix.st[int(self)%len(fuzzFix.st)]
+
+		d, err := st.Forward(h)
+		if err != nil {
+			if !errors.Is(err, ErrBadHeader) && !errors.Is(err, ErrTTLExhausted) {
+				t.Fatalf("unexpected error %v", err)
+			}
+
+			if errors.Is(err, ErrBadHeader) && h.Partition < 1<<12 {
+				t.Fatalf("in-range header rejected: %+v", h)
+			}
+
+			return
+		}
+
+		if h.Partition >= 1<<12 {
+			t.Fatalf("out-of-range partition accepted: %+v", h)
+		}
+
+		if !d.Next.IsZero() && d.Next.Slot == st.Self() {
+			t.Fatalf("routed to self: %+v", d)
+		}
+
+		if d.Header.Hops != h.Hops+1 || d.Header.TTL != h.TTL || d.Header.Flags&FlagHedge != h.Flags&FlagHedge {
+			t.Fatalf("header %+v from %+v", d.Header, h)
+		}
+
+		if !d.Next.IsZero() && d.Next.Slot == h.Sender && d.Next.Slot != d.Owner.Slot && h.Sender != view.NoSlot {
+			t.Fatalf("sent back to sender %d: %+v", h.Sender, d)
+		}
+	})
+}
+
+// fakeCell groups every peer a test ejects into one health cell together
+// with a never-ejected dummy, so the tracker's last-usable-in-cell rule does
+// not get in the way.
+const (
+	fakeCell  = 1 << 30
+	dummySlot = 1 << 30
+)
+
+// newTracker returns a tracker that can eject any number of peers and
+// never panics unless panicAt is set.
+func newTracker(panicAt int) *HealthTracker {
+	if panicAt <= 0 {
+		panicAt = 100
+	}
+
+	tr := NewHealthTracker(HealthConfig{MaxEjectionPercent: 100, PanicThreshold: panicAt}, rand.New(rand.NewPCG(1, 2)))
+	tr.Track(dummySlot, 1, fakeCell)
+
+	return tr
+}
+
+func eject(t testing.TB, tr *HealthTracker, v *view.View, slots ...view.Slot) {
+	t.Helper()
+
+	for _, s := range slots {
+		tr.Track(s, v.Key(s), fakeCell)
+	}
+
+	for _, s := range slots {
+		for range 5 {
+			tr.Observe(s, Failure, time.Millisecond)
+		}
+
+		if tr.Usable(s) != Unusable {
+			t.Fatalf("slot %d not ejected", s)
+		}
+	}
+}
+
+func degrade(t testing.TB, tr *HealthTracker, v *view.View, s view.Slot) {
+	t.Helper()
+	tr.Track(s, v.Key(s), fakeCell)
+	tr.Observe(s, Overload, 0)
+
+	if tr.Usable(s) != Degraded {
+		t.Fatalf("slot %d not degraded", s)
+	}
+}
+
+type fixture struct {
+	v   *view.View
+	env *Env
+	st  []*State
+}
+
+func newFixture(v *view.View, env *Env) *fixture {
+	f := &fixture{v: v, env: env, st: make([]*State, v.SlotCap())}
+	for i := range f.st {
+		f.st[i] = NewState(v, view.Slot(i), env)
+	}
+
+	return f
+}
+
+func newEnv(tr *HealthTracker, cur uint64) *Env {
+	e := &EpochTracker{}
+	e.Anchor(cur, 15*time.Second, 0)
+
+	return NewEnv(Config{Health: tr, Epoch: e})
+}
+
+// findKind returns a partition for which st routes with kind k.
+func findKind(t testing.TB, st *State, k Kind) uint32 {
+	t.Helper()
+
+	n := uint32(1) << st.PartitionBits()
+	for p := range n {
+		if st.RoutePartition(p).Kind == k {
+			return p
+		}
+	}
+
+	t.Fatalf("no partition with kind %v", k)
+
+	return 0
+}
+
+func diffDims(v *view.View, a, b view.Slot) int {
+	return bits.OnesCount8(v.Shape().DiffMask(v.Cell(a), v.Cell(b)))
+}
+
+// walk follows a request for partition p from origin hop by hop. It returns
+// the slots visited after the origin and the final decision.
+func walk(t testing.TB, f *fixture, origin view.Slot, p uint32) ([]view.Slot, Decision) {
+	t.Helper()
+
+	d := f.st[origin].RoutePartition(p)
+
+	var path []view.Slot
+
+	for !d.Next.IsZero() {
+		next := d.Next.Slot
+		for _, s := range path {
+			if s == next {
+				t.Fatalf("loop at %d for p=%d from %d: %v", next, p, origin, path)
+			}
+		}
+
+		if next == origin {
+			t.Fatalf("routed back to origin %d", origin)
+		}
+
+		path = append(path, next)
+
+		var err error
+
+		d, err = f.st[next].Forward(d.Header)
+		if err != nil {
+			t.Fatalf("forward at %d (p=%d from %d, path %v): %v", next, p, origin, path, err)
+		}
+	}
+
+	return path, d
+}
+
+var (
+	benchOnce sync.Once
+	benchView *view.View
+)
+
+// big returns a shared 100k-member view with 2^20 partitions.
+func big(b *testing.B) *view.View {
+	b.Helper()
+	benchOnce.Do(func() { benchView = viewtest.Build(b, 100_000, viewtest.Options{}) })
+
+	return benchView
+}
+
+func BenchmarkRoute(b *testing.B) {
+	v := big(b)
+	tr := newTracker(0)
+	env := newEnv(tr, 1)
+	self := view.Slot(12345)
+	st := NewState(v, self, env)
+
+	// Pick a partition per kind; the backup case ejects an adjacent owner.
+	parts := map[Kind]uint32{}
+	for _, k := range []Kind{KindSelf, KindOwner, KindRelay} {
+		parts[k] = findKind(b, st, k)
+	}
+
+	for p := range uint32(1) << 20 {
+		o := v.Table().Owner(p)
+		if o != self && v.Cell(o) != v.Cell(self) && diffDims(v, self, o) == 1 && o != v.Table().Owner(parts[KindOwner]) {
+			eject(b, tr, v, o)
+
+			parts[KindBackup] = p
+
+			break
+		}
+	}
+
+	for _, k := range []Kind{KindSelf, KindOwner, KindRelay, KindBackup} {
+		p := parts[k]
+		if got := st.RoutePartition(p).Kind; got != k {
+			b.Fatalf("%v: got %v", k, got)
+		}
+
+		// Find a key that hashes to the partition's kind, to include
+		// hashing in the measurement.
+		var key [8]byte
+
+		seed := uint64(7)
+
+		for i := uint64(0); ; i++ {
+			key = [8]byte{byte(i), byte(i >> 8), byte(i >> 16), byte(i >> 24), byte(i >> 32)}
+			if st.Route(seed, key[:]).Kind == k {
+				break
+			}
+		}
+
+		b.Run("Route/"+k.String(), func(b *testing.B) {
+			b.ReportAllocs()
+
+			for b.Loop() {
+				_ = st.Route(seed, key[:])
+			}
+		})
+
+		d := st.RoutePartition(p)
+		if d.Next.IsZero() {
+			continue
+		}
+
+		next := NewState(v, d.Next.Slot, env)
+		h := d.Header
+
+		b.Run("Forward/"+k.String(), func(b *testing.B) {
+			b.ReportAllocs()
+
+			for b.Loop() {
+				_, _ = next.Forward(h)
+			}
+		})
+	}
+}
+
+func BenchmarkFresh(b *testing.B) {
+	v := big(b)
+	st := NewState(v, 1, newEnv(nil, 1))
+	seed := view.Seed("ks")
+	s := st.Stamp(seed, 0)
+
+	b.ReportAllocs()
+
+	for b.Loop() {
+		if !st.Fresh(seed, s) {
+			b.Fatal("stale")
+		}
+	}
+}
+
+func BenchmarkNewState(b *testing.B) {
+	v := big(b)
+	env := newEnv(nil, 1)
+
+	b.ReportAllocs()
+
+	for b.Loop() {
+		_ = NewState(v, 777, env)
+	}
+}
+
+func BenchmarkRouteParallel(b *testing.B) {
+	v := big(b)
+	st := NewState(v, 12345, newEnv(nil, 1))
+
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		var k [8]byte
+
+		i := uint64(0)
+		for pb.Next() {
+			i++
+			k[0], k[1], k[2] = byte(i), byte(i>>8), byte(i>>16)
+			_ = st.Route(3, k[:])
+		}
+	})
+}
+
+// NoteHeader records h as if it had been received by a member whose view
+// is at version own.
+func (n *Notes) NoteHeader(h Header, own view.Version) {
+	n.note(&h, uint32(own.Term), own.Seq)
+}
+
+// Peek returns the recorded note without clearing it.
+func (n *Notes) Peek() (Note, bool) {
+	if p := n.p.Load(); p != nil {
+		return *p, true
+	}
+
+	return Note{}, false
 }

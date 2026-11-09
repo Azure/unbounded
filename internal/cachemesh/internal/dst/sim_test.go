@@ -6,11 +6,12 @@ package dst
 import (
 	"bytes"
 	"errors"
-	"github.com/Azure/unbounded/internal/cachemesh/internal/control"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Azure/unbounded/internal/cachemesh/internal/control"
 )
 
 type recTarget struct{ got []uint64 }
