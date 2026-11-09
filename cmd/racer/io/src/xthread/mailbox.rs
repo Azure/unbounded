@@ -216,7 +216,13 @@ impl<Req, Resp> Sender<Req, Resp> {
             Err(Error::Overloaded) => (),
             result => return Poll::Ready(result),
         }
-        lock(&self.shared.credits.waiters).push(cx.waker().clone());
+        {
+            // A task re-polled while starved registers once, not per poll.
+            let mut waiters = lock(&self.shared.credits.waiters);
+            if !waiters.iter().any(|w| w.will_wake(cx.waker())) {
+                waiters.push(cx.waker().clone());
+            }
+        }
         // Close the race with a credit returned before registration.
         match self.try_credit() {
             Err(Error::Overloaded) => Poll::Pending,
@@ -514,6 +520,22 @@ mod tests {
         assert_eq!(sender.outstanding(), 1);
         drop(envelope);
         assert_eq!(sender.outstanding(), 0);
+    }
+
+    #[test]
+    fn starved_credit_polls_register_one_waker() {
+        let (sender, receiver) = channel::<u32, u32>(1).unwrap();
+        let _held = sender.try_call(1).unwrap();
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        for _ in 0..3 {
+            assert!(sender.poll_credit(&mut cx).is_pending());
+        }
+        assert_eq!(lock(&sender.shared.credits.waiters).len(), 1);
+        // Returning the credit wakes and clears the waiter.
+        drop(receiver.try_recv().unwrap());
+        assert!(lock(&sender.shared.credits.waiters).is_empty());
+        assert!(matches!(sender.poll_credit(&mut cx), Poll::Ready(Ok(_))));
     }
 
     #[test]
