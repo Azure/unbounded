@@ -29,7 +29,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
 use std::{
     cell::{Cell, RefCell},
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     net::IpAddr,
     rc::Rc,
     time::{Duration, Instant, UNIX_EPOCH},
@@ -514,20 +514,28 @@ async fn read_state(shared: &Shared) -> Result<(Value, Option<StateRecord>), Sta
 /// Seats as seen by the primary.
 struct SeatSnapshot {
     holders: BTreeMap<usize, (LeaseObservation, Value)>,
+    /// Seats whose Lease GET failed with anything but NotFound.
+    unread: BTreeSet<usize>,
 }
 
 async fn read_seats(t: &Term_) -> SeatSnapshot {
     let ns = &t.shared.config.namespace;
     let mut holders = BTreeMap::new();
+    let mut unread = BTreeSet::new();
     for i in 0..annotations::MAX_SEATS {
-        let Ok(v) = lease::get(&t.shared.lease_api, ns, &annotations::seat_lease(i)).await else {
-            continue;
+        let v = match lease::get(&t.shared.lease_api, ns, &annotations::seat_lease(i)).await {
+            Ok(v) => v,
+            Err(KubeError::NotFound) => continue,
+            Err(_) => {
+                unread.insert(i);
+                continue;
+            }
         };
         let o = lease::observe(&v);
         t.seat_observer.borrow_mut().observe(&o, crate::rt::now());
         holders.insert(i, (o, v));
     }
-    SeatSnapshot { holders }
+    SeatSnapshot { holders, unread }
 }
 
 fn live_seats(t: &Term_, s: &SeatSnapshot) -> BTreeMap<usize, LeaseObservation> {
@@ -646,6 +654,7 @@ async fn reconcile(t: &Rc<Term_>) -> Result<(), StateError> {
                             current: shell.current(),
                             previous_image: previous_image.as_ref(),
                             live: &live,
+                            unread: &seats.unread,
                             writer: shell.writer(),
                             wall_unix: unix_now(),
                             membership_changed_unix: t.membership_changed.get(),

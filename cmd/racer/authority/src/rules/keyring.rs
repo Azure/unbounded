@@ -483,6 +483,21 @@ pub fn plan_with(
     now: u64,
     rng: &mut dyn Entropy,
 ) -> Result<Plan, KeyringError> {
+    plan_unread(policy, current, catalog, offers, &BTreeSet::new(), now, rng)
+}
+
+/// Like [`plan_with`], but `unread` lists seats whose Lease could not be
+/// read this pass. Their roots are not known to be departed, so they are
+/// never evicted early to make room for a new offer.
+pub fn plan_unread(
+    policy: &Policy,
+    current: &Durable,
+    catalog: Option<&[CacheDefinition]>,
+    offers: &[Offer],
+    unread: &BTreeSet<usize>,
+    now: u64,
+    rng: &mut dyn Entropy,
+) -> Result<Plan, KeyringError> {
     let mut d = current.clone();
     // A key created now belongs to the next generation.
     let next = current.generation.checked_add(1);
@@ -597,7 +612,7 @@ pub fn plan_with(
                 .roots
                 .iter()
                 .enumerate()
-                .filter(|(_, r)| !offered.contains(&r.der))
+                .filter(|(_, r)| !offered.contains(&r.der) && !unread.contains(&(r.seat as usize)))
                 .min_by_key(|(_, r)| r.retain_until)
                 .map(|(i, _)| i);
             let Some(i) = victim else {
@@ -984,6 +999,54 @@ pub(crate) mod tests {
         let p = plan(&policy(), &Durable::default(), &[], &offers, t).unwrap();
         assert_eq!(p.durable.roots.len(), MAX_ROOTS);
         assert_eq!(p.refused_roots, 2);
+    }
+
+    #[test]
+    fn full_keyring_does_not_evict_unread_seat_roots() {
+        let t = now();
+        let stale: Vec<_> = (0..MAX_ROOTS)
+            .map(|i| Offer {
+                der: root(7 + i as u64),
+                seat: (i % 16) as u8,
+                holder: format!("old-{i}"),
+            })
+            .collect();
+        let full = plan(&policy(), &Durable::default(), &[], &stale, t).unwrap();
+        assert_eq!(full.durable.roots.len(), MAX_ROOTS);
+        // Seat 0's roots would be the oldest victims; its Lease was not read.
+        let fresh = Offer {
+            der: root(40),
+            seat: 5,
+            holder: "new".into(),
+        };
+        let unread = BTreeSet::from([0usize]);
+        let p = plan_unread(
+            &policy(),
+            &full.durable,
+            None,
+            std::slice::from_ref(&fresh),
+            &unread,
+            t + 1,
+            &mut crate::entropy::OsEntropy,
+        )
+        .unwrap();
+        assert_eq!(p.evicted_roots, 1);
+        let seat0 = |d: &Durable| d.roots.iter().filter(|r| r.seat == 0).count();
+        assert_eq!(seat0(&p.durable), seat0(&full.durable));
+        assert!(p.durable.roots.iter().any(|r| r.holder == "new"));
+        // With every root on an unread seat the offer is refused instead.
+        let all: BTreeSet<usize> = (0..16).collect();
+        let p = plan_unread(
+            &policy(),
+            &full.durable,
+            None,
+            std::slice::from_ref(&fresh),
+            &all,
+            t + 1,
+            &mut crate::entropy::OsEntropy,
+        )
+        .unwrap();
+        assert_eq!((p.evicted_roots, p.refused_roots), (0, 1));
     }
 
     #[test]

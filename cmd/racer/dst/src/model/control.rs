@@ -2153,6 +2153,7 @@ impl ControlSim {
                 current: shell.current(),
                 previous_image: p.follower_image.as_ref(),
                 live: &pass.live,
+                unread: &std::collections::BTreeSet::new(),
                 writer: shell.writer(),
                 wall_unix: self.wall_secs(),
                 membership_changed_unix: self.membership_changed,

@@ -26,7 +26,7 @@ use crate::{
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     time::{Duration, Instant},
 };
 
@@ -70,6 +70,8 @@ pub struct PassInputs<'a> {
     pub previous_image: Option<&'a Image>,
     /// Live seats by index.
     pub live: &'a BTreeMap<usize, LeaseObservation>,
+    /// Seats whose Lease could not be read this pass.
+    pub unread: &'a BTreeSet<usize>,
     pub writer: &'a Writer,
     /// Wall clock, Unix seconds.
     pub wall_unix: u64,
@@ -212,11 +214,12 @@ pub fn plan_pass(i: &PassInputs<'_>, rng: &mut dyn Entropy) -> Result<PassPlan, 
         .as_ref()
         .map(|(caches, _)| caches.clone())
         .or_else(|| previous_image.map(|im| im.publication.caches.clone()));
-    let plan = keyring::plan_with(
+    let plan = keyring::plan_unread(
         i.policy,
         &durable,
         catalog.as_deref(),
         &offers(i.live),
+        i.unread,
         i.wall_unix,
         rng,
     )
@@ -548,6 +551,7 @@ mod tests {
                 current,
                 previous_image: image,
                 live: &live,
+                unread: &BTreeSet::new(),
                 writer: &w,
                 wall_unix: NOW,
                 membership_changed_unix: changed,
