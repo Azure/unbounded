@@ -6,6 +6,8 @@
 #   ./deploy.sh values-default.yaml <image> -f values-cachemesh.yaml
 # For the 1-D fully direct grid (library sizing) add:
 #   --set gantry.cachemesh.maxNeighbors=256
+# For a tight memory bound add, for example:
+#   --set resources.agent.limits.memory=3Gi
 
 gantry:
   cachemesh:
@@ -15,8 +17,9 @@ gantry:
     # 0 = agent default (32), the multi-hop relay grid. 256 (the cachemesh
     # library default) makes ~142 agents a 1-D fully direct grid.
     maxNeighbors: 0
-    # 24GiB chunk cache; the 48Gi pod limit (values-default.yaml) leaves headroom.
-    chunkCacheBytes: 25769803776
+    # Chunk store: agent defaults (20GiB of chunk files in the pod's
+    # emptyDir, 256MiB hot page tier, 1MiB pages, O_DIRECT). Override with
+    # --set gantry.cachemesh.<key>=... to compare.
     # containerd verifies every blob digest itself, so the agent does not hash
     # again (SHA-256 caps one blob at ~1.8GB/s on the serving node).
     verifyDigest: false

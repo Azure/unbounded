@@ -125,10 +125,39 @@ proc_stats() {
   printf '%s %s' "$((f[11] + f[12]))" "${rss:--}"
 }
 
+# cg_stats prints "current anon file active_file inactive_file file_dirty
+# file_writeback" in bytes for cgroup v2 directory $1, or dashes. The pod
+# sees the host cgroup namespace (privileged, hostPID).
+cg_stats() {
+  local dir="$1" cur="" k v anon=- file=- af=- inf=- dirty=- wb=-
+  if [[ -z "${dir}" ]] || ! read -r cur <"${dir}/memory.current" 2>/dev/null; then
+    printf -- '- - - - - - -'
+    return
+  fi
+  while read -r k v; do
+    case "${k}" in
+      anon) anon="${v}" ;;
+      file) file="${v}" ;;
+      active_file) af="${v}" ;;
+      inactive_file) inf="${v}" ;;
+      file_dirty) dirty="${v}" ;;
+      file_writeback) wb="${v}" ;;
+    esac
+  done <"${dir}/memory.stat"
+  printf '%s %s %s %s %s %s %s' "${cur}" "${anon}" "${file}" "${af}" "${inf}" "${dirty}" "${wb}"
+}
+
 sampler() {
-  local gpid="" cpid="" line rx tx dw busy total memt mema a
+  local gpid="" cpid="" line rx tx dw dr busy total memt mema a gcg="" gcgpid=""
   while :; do
     [[ -n "${gpid}" && -d "/proc/${gpid}" ]] || gpid="$(find_pid gantry || true)"
+    if [[ -n "${gpid}" && "${gcgpid}" != "${gpid}" ]]; then
+      gcg=""
+      while read -r line; do
+        if [[ "${line}" == 0::* ]]; then gcg="/sys/fs/cgroup${line#0::}"; break; fi
+      done <"/proc/${gpid}/cgroup" 2>/dev/null || true
+      gcgpid="${gpid}"
+    fi
     [[ -n "${cpid}" && -d "/proc/${cpid}" ]] || cpid="$(find_pid containerd || true)"
 
     rx=- tx=-
@@ -138,10 +167,10 @@ sampler() {
       if [[ "${a[0]}" == "${NIC}" ]]; then rx="${a[1]}" tx="${a[9]}"; break; fi
     done </proc/net/dev
 
-    dw=-
+    dw=- dr=-
     while read -r line; do
       read -ra a <<<"${line}"
-      if [[ "${a[2]}" == "${DISK}" ]]; then dw="${a[9]}"; break; fi
+      if [[ "${a[2]}" == "${DISK}" ]]; then dr="${a[5]}" dw="${a[9]}"; break; fi
     done </proc/diskstats
 
     read -ra a </proc/stat
@@ -157,6 +186,8 @@ sampler() {
     done </proc/meminfo
 
     echo "SAMPLE ${NODE} $(now_ns) ${rx} ${tx} ${dw} ${busy} ${total} ${memt} ${mema} $(proc_stats "${gpid}") $(proc_stats "${cpid}")"
+    [[ -n "${gpid}" ]] || gcg=""
+    echo "MEMSAMPLE ${NODE} $(now_ns) ${dr} $(cg_stats "${gcg}")"
     sleep "${INTERVAL}"
   done
 }

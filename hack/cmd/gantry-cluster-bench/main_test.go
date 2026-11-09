@@ -325,3 +325,79 @@ func TestSummarizeMissingMeta(t *testing.T) {
 		t.Fatal("want error without meta.env")
 	}
 }
+
+func TestParseMemSampleLine(t *testing.T) {
+	node, m, err := parseMemSampleLine(strings.Fields("MEMSAMPLE n1 5 100 1000 300 600 200 400 10 20"))
+	if err != nil || node != "n1" {
+		t.Fatalf("parse: %q %v", node, err)
+	}
+
+	if !m.hasDisk || !m.hasCgroup || m.diskRdSectors != 100 || m.workingSet() != 600 || m.dirty != 10 {
+		t.Fatalf("sample: %+v", m)
+	}
+
+	_, m, err = parseMemSampleLine(strings.Fields("MEMSAMPLE n1 5 - - - - - - - -"))
+	if err != nil || m.hasDisk || m.hasCgroup {
+		t.Fatalf("dashes: %+v %v", m, err)
+	}
+
+	for _, bad := range []string{"MEMSAMPLE n1 5 1", "MEMSAMPLE n1 - 1 2 3 4 5 6 7 8", "MEMSAMPLE n1 5 x 2 3 4 5 6 7 8"} {
+		if _, _, err := parseMemSampleLine(strings.Fields(bad)); err == nil {
+			t.Fatalf("accepted %q", bad)
+		}
+	}
+}
+
+func TestSummarizeMemSamples(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "meta.env"), "LABEL=t1\nIMAGE=reg/x:y\nIMAGE_BYTES=1000000000\nTARGET_NODES=n1 n2\nTAIL_SECONDS=2\n")
+
+	// n1: working set (current - inactive_file) peaks at 300MiB during the
+	// pull and is 100MiB at the end of the tail; 2048 sectors read per s.
+	var b strings.Builder
+
+	for i := int64(0); i <= 12; i++ {
+		b.WriteString(sampleLine("n1", 100+i, i*100e6, 0, i*50, i*100, i*100))
+
+		cur, inactive, file := int64(200<<20), int64(100<<20), int64(150<<20)
+		if i == 5 {
+			cur, file = 400<<20, 250<<20
+		}
+
+		fmt.Fprintf(&b, "MEMSAMPLE n1 %d %d %d %d %d 0 %d 0 0\n", (100+i)*1e9, i*2048, cur, 50<<20, file, inactive)
+	}
+
+	b.WriteString("MEMSAMPLE n1 truncated\n")
+	b.WriteString("RESULT n1 100000000000 110000000000 0\n")
+	writeFile(t, filepath.Join(dir, "pods", "n1.log"), b.String())
+
+	// n2 has no MEMSAMPLE lines.
+	b.Reset()
+
+	for i := int64(0); i <= 12; i++ {
+		b.WriteString(sampleLine("n2", 100+i, i*100e6, 0, i*50, i*100, i*100))
+	}
+
+	b.WriteString("RESULT n2 100000000000 110000000000 0\n")
+	writeFile(t, filepath.Join(dir, "pods", "n2.log"), b.String())
+	writeFile(t, filepath.Join(dir, "origin-pre.txt"), "0 0\n")
+	writeFile(t, filepath.Join(dir, "origin-post.txt"), "0 1000000000\n")
+
+	s, _, err := summarize(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if s.GantryWSPeakMiB == nil || s.GantryWSPeakMiB.N != 1 || s.GantryWSPeakMiB.Max != 300 || s.GantryWSEndMiB.Max != 100 {
+		t.Fatalf("working set: %+v %+v", s.GantryWSPeakMiB, s.GantryWSEndMiB)
+	}
+
+	if s.GantryFilePeakMiB.Max != 250 || s.GantryFileEndMiB.Max != 150 || s.GantryAnonPeakMiB.Max != 50 {
+		t.Fatalf("page cache: %+v %+v", s.GantryFilePeakMiB, s.GantryFileEndMiB)
+	}
+
+	// Samples at 100..112 s are in the window: 12 intervals of 2048 sectors.
+	if want := float64(12*2048*512) / 1e9; s.DiskReadGB == nil || math.Abs(s.DiskReadGB.Max-want) > 1e-9 {
+		t.Fatalf("disk read: %+v, want %v", s.DiskReadGB, want)
+	}
+}

@@ -34,12 +34,28 @@ type sample struct {
 	hasGantry, hasContainerd, hasValid bool
 }
 
+// memSample is one MEMSAMPLE line: disk reads and the gantry container's
+// cgroup v2 memory.
+type memSample struct {
+	ts            int64
+	diskRdSectors int64
+	hasDisk       bool
+	// cgroup memory.current and memory.stat values in bytes.
+	current, anon, file, activeFile, inactiveFile, dirty, writeback int64
+	hasCgroup                                                       bool
+}
+
+// workingSet is container_memory_working_set_bytes as cAdvisor computes
+// it: usage minus inactive file pages.
+func (m memSample) workingSet() int64 { return max(m.current-m.inactiveFile, 0) }
+
 type nodeResult struct {
 	Node    string `json:"node"`
 	StartNS int64  `json:"start_ns"`
 	EndNS   int64  `json:"end_ns"`
 	RC      int    `json:"rc"`
 	samples []sample
+	mem     []memSample
 }
 
 func (n nodeResult) ok() bool { return n.RC == 0 && n.EndNS > n.StartNS }
@@ -82,7 +98,42 @@ func parseSampleLine(fields []string) (string, sample, error) {
 	return fields[1], s, nil
 }
 
-// parseNodeLog reads RESULT and SAMPLE lines from one pod log.
+// parseMemSampleLine parses "MEMSAMPLE node ts diskRd current anon file
+// activeFile inactiveFile dirty writeback". Missing values are "-".
+func parseMemSampleLine(fields []string) (string, memSample, error) {
+	if len(fields) != 11 {
+		return "", memSample{}, fmt.Errorf("MEMSAMPLE: want 11 fields, got %d", len(fields))
+	}
+
+	vals := make([]int64, 9)
+	present := make([]bool, 9)
+
+	for i, f := range fields[2:] {
+		if f == "-" {
+			continue
+		}
+
+		v, err := strconv.ParseInt(f, 10, 64)
+		if err != nil {
+			return "", memSample{}, fmt.Errorf("MEMSAMPLE field %d: %w", i+2, err)
+		}
+
+		vals[i], present[i] = v, true
+	}
+
+	if !present[0] {
+		return "", memSample{}, errors.New("MEMSAMPLE: missing timestamp")
+	}
+
+	m := memSample{ts: vals[0], diskRdSectors: vals[1], hasDisk: present[1]}
+	m.current, m.anon, m.file, m.activeFile = vals[2], vals[3], vals[4], vals[5]
+	m.inactiveFile, m.dirty, m.writeback = vals[6], vals[7], vals[8]
+	m.hasCgroup = present[2] && present[3] && present[4] && present[5] && present[6]
+
+	return fields[1], m, nil
+}
+
+// parseNodeLog reads RESULT, SAMPLE, and MEMSAMPLE lines from one pod log.
 func parseNodeLog(r io.Reader, fallbackNode string) (nodeResult, bool, error) {
 	res := nodeResult{Node: fallbackNode, RC: -1}
 	found := false
@@ -123,6 +174,13 @@ func parseNodeLog(r io.Reader, fallbackNode string) (nodeResult, bool, error) {
 			if s.hasValid {
 				res.samples = append(res.samples, s)
 			}
+		case "MEMSAMPLE":
+			_, m, err := parseMemSampleLine(f)
+			if err != nil {
+				continue // tolerate a truncated last line
+			}
+
+			res.mem = append(res.mem, m)
 		}
 	}
 
@@ -263,6 +321,59 @@ func computeWindow(samples []sample, from, to int64) windowStats {
 	return w
 }
 
+// memStats summarizes MEMSAMPLE lines within a window.
+type memStats struct {
+	diskRdBytes                  float64
+	hasDisk                      bool
+	wsPeak, wsEnd, anonPeak      float64 // bytes
+	filePeak, fileEnd, dirtyPeak float64 // bytes
+	hasCgroup                    bool
+}
+
+func computeMem(mem []memSample, from, to int64) memStats {
+	var (
+		ms        memStats
+		firstDisk *memSample
+		lastDisk  *memSample
+		lastCg    *memSample
+	)
+
+	for i := range mem {
+		m := &mem[i]
+		if m.ts < from || m.ts > to {
+			continue
+		}
+
+		if m.hasDisk {
+			if firstDisk == nil {
+				firstDisk = m
+			}
+
+			lastDisk = m
+		}
+
+		if m.hasCgroup {
+			ms.hasCgroup = true
+			ms.wsPeak = math.Max(ms.wsPeak, float64(m.workingSet()))
+			ms.anonPeak = math.Max(ms.anonPeak, float64(m.anon))
+			ms.filePeak = math.Max(ms.filePeak, float64(m.file))
+			ms.dirtyPeak = math.Max(ms.dirtyPeak, float64(m.dirty))
+			lastCg = m
+		}
+	}
+
+	if firstDisk != nil && lastDisk != firstDisk {
+		ms.hasDisk = true
+		ms.diskRdBytes = float64(lastDisk.diskRdSectors-firstDisk.diskRdSectors) * 512
+	}
+
+	if lastCg != nil {
+		ms.wsEnd, ms.fileEnd = float64(lastCg.workingSet()), float64(lastCg.file)
+	}
+
+	return ms
+}
+
 // Summary is the machine-readable result of one benchmark run.
 type Summary struct {
 	Label              string             `json:"label"`
@@ -298,6 +409,13 @@ type Summary struct {
 	CtrdCPUPeakCores   *Dist              `json:"containerd_cpu_peak_cores,omitempty"`
 	CtrdRSSAvgMiB      *Dist              `json:"containerd_rss_avg_mib,omitempty"`
 	CtrdRSSPeakMiB     *Dist              `json:"containerd_rss_peak_mib,omitempty"`
+	DiskReadGB         *Dist              `json:"disk_read_gb,omitempty"`
+	GantryWSPeakMiB    *Dist              `json:"gantry_working_set_peak_mib,omitempty"`
+	GantryWSEndMiB     *Dist              `json:"gantry_working_set_end_mib,omitempty"`
+	GantryAnonPeakMiB  *Dist              `json:"gantry_anon_peak_mib,omitempty"`
+	GantryFilePeakMiB  *Dist              `json:"gantry_page_cache_peak_mib,omitempty"`
+	GantryFileEndMiB   *Dist              `json:"gantry_page_cache_end_mib,omitempty"`
+	GantryDirtyPeakMiB *Dist              `json:"gantry_dirty_peak_mib,omitempty"`
 	MetricDeltas       map[string]float64 `json:"metric_deltas,omitempty"`
 	MetricPodsPre      int                `json:"metric_pods_pre"`
 	MetricPodsPost     int                `json:"metric_pods_post"`
@@ -491,6 +609,7 @@ func summarize(dir string) (*Summary, []nodeResult, error) {
 		rxA, rxP, txA, txP, dw, cuA, cuP   []float64
 		memP                               []float64
 		gA, gP, gRA, gRP, cA, cP, cRA, cRP []float64
+		dr, wsP, wsE, anP, fP, fE, dP      []float64
 	)
 
 	tail := atoi64(meta["TAIL_SECONDS"])
@@ -518,6 +637,20 @@ func summarize(dir string) (*Summary, []nodeResult, error) {
 		// that unpacking finished after the pull returns is counted.
 		w := computeWindow(r.samples, r.StartNS-1e9, r.EndNS+1e9)
 		wt := computeWindow(r.samples, r.StartNS-1e9, r.EndNS+tail*1e9)
+
+		// Memory covers the pull and the idle tail; the end value is the
+		// last sample of the tail.
+		if ms := computeMem(r.mem, r.StartNS-1e9, r.EndNS+tail*1e9); ms.hasDisk || ms.hasCgroup {
+			if ms.hasDisk {
+				dr = append(dr, ms.diskRdBytes/1e9)
+			}
+
+			if ms.hasCgroup {
+				wsP, wsE = append(wsP, ms.wsPeak/(1<<20)), append(wsE, ms.wsEnd/(1<<20))
+				anP, dP = append(anP, ms.anonPeak/(1<<20)), append(dP, ms.dirtyPeak/(1<<20))
+				fP, fE = append(fP, ms.filePeak/(1<<20)), append(fE, ms.fileEnd/(1<<20))
+			}
+		}
 
 		if !w.hasRates {
 			continue
@@ -553,6 +686,16 @@ func summarize(dir string) (*Summary, []nodeResult, error) {
 	s.DiskWriteGB = dist(dw)
 	s.NodeCPUUtilAvgPct, s.NodeCPUUtilPeakPct = dist(cuA), dist(cuP)
 	s.NodeMemUsedPeakGiB = dist(memP)
+
+	if len(dr) > 0 {
+		s.DiskReadGB = ptr(dist(dr))
+	}
+
+	if len(wsP) > 0 {
+		s.GantryWSPeakMiB, s.GantryWSEndMiB = ptr(dist(wsP)), ptr(dist(wsE))
+		s.GantryAnonPeakMiB, s.GantryDirtyPeakMiB = ptr(dist(anP)), ptr(dist(dP))
+		s.GantryFilePeakMiB, s.GantryFileEndMiB = ptr(dist(fP)), ptr(dist(fE))
+	}
 
 	if len(gA) > 0 {
 		s.GantryCPUAvgCores, s.GantryCPUPeakCores = ptr(dist(gA)), ptr(dist(gP))
@@ -705,6 +848,13 @@ func writeMarkdown(w io.Writer, s *Summary) {
 		{"gantry CPU peak (cores)", fmtDistPtr(s.GantryCPUPeakCores)},
 		{"gantry RSS avg (MiB)", fmtDistPtr(s.GantryRSSAvgMiB)},
 		{"gantry RSS peak (MiB)", fmtDistPtr(s.GantryRSSPeakMiB)},
+		{"disk read incl. tail (GB)", fmtDistPtr(s.DiskReadGB)},
+		{"gantry working set peak (MiB)", fmtDistPtr(s.GantryWSPeakMiB)},
+		{"gantry working set at end of tail (MiB)", fmtDistPtr(s.GantryWSEndMiB)},
+		{"gantry anon peak (MiB)", fmtDistPtr(s.GantryAnonPeakMiB)},
+		{"gantry page cache peak (MiB)", fmtDistPtr(s.GantryFilePeakMiB)},
+		{"gantry page cache at end of tail (MiB)", fmtDistPtr(s.GantryFileEndMiB)},
+		{"gantry dirty page cache peak (MiB)", fmtDistPtr(s.GantryDirtyPeakMiB)},
 		{"containerd CPU avg (cores)", fmtDistPtr(s.CtrdCPUAvgCores)},
 		{"containerd CPU peak (cores)", fmtDistPtr(s.CtrdCPUPeakCores)},
 		{"containerd RSS avg (MiB)", fmtDistPtr(s.CtrdRSSAvgMiB)},
@@ -878,6 +1028,13 @@ func writeCompare(w io.Writer, sums []*Summary) {
 	row("gantry RSS peak MiB p99", dp(func(s *Summary) *Dist { return s.GantryRSSPeakMiB }, p99))
 	row("containerd CPU avg cores p50", dp(func(s *Summary) *Dist { return s.CtrdCPUAvgCores }, p50))
 	row("containerd RSS peak MiB p99", dp(func(s *Summary) *Dist { return s.CtrdRSSPeakMiB }, p99))
+	row("disk read GB p50", dp(func(s *Summary) *Dist { return s.DiskReadGB }, p50))
+	row("gantry working set peak MiB p50", dp(func(s *Summary) *Dist { return s.GantryWSPeakMiB }, p50))
+	row("gantry working set peak MiB p99", dp(func(s *Summary) *Dist { return s.GantryWSPeakMiB }, p99))
+	row("gantry working set end MiB p50", dp(func(s *Summary) *Dist { return s.GantryWSEndMiB }, p50))
+	row("gantry anon peak MiB p50", dp(func(s *Summary) *Dist { return s.GantryAnonPeakMiB }, p50))
+	row("gantry page cache peak MiB p50", dp(func(s *Summary) *Dist { return s.GantryFilePeakMiB }, p50))
+	row("gantry page cache end MiB p50", dp(func(s *Summary) *Dist { return s.GantryFileEndMiB }, p50))
 
 	keys := map[string]bool{}
 

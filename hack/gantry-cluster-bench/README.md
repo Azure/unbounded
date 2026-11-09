@@ -154,7 +154,11 @@ Raw output in `tmp/gantry-cluster-bench/<label>/`:
 - `pods/<node>.log`: `RESULT <node> <start_ns> <end_ns> <rc>`, `PULLOUT` lines
   (crictl output), and once per interval
   `SAMPLE <node> <ts_ns> <rx> <tx> <disk_wr_sectors> <cpu_busy> <cpu_total> <mem_total_kb> <mem_avail_kb> <gantry_ticks> <gantry_rss_kb> <containerd_ticks> <containerd_rss_kb>`
-  (`-` when a process is absent).
+  (`-` when a process is absent), and
+  `MEMSAMPLE <node> <ts_ns> <disk_rd_sectors> <cg_current> <cg_anon> <cg_file> <cg_active_file> <cg_inactive_file> <cg_file_dirty> <cg_file_writeback>`
+  with the gantry container's cgroup v2 `memory.current` and `memory.stat`
+  values in bytes. The working set (`container_memory_working_set_bytes`) is
+  `cg_current - cg_inactive_file`.
 - `origin.log`: the same SAMPLE lines for w0007.
 - `origin-pre.txt` / `origin-post.txt`: `rx tx` bytes of w0007 `eth0`.
 - `metrics-pre/`, `metrics-post/`: one Prometheus text file per gantry pod.
@@ -164,7 +168,9 @@ Raw output in `tmp/gantry-cluster-bench/<label>/`:
 The summary reports pull duration distribution, makespan, success counts,
 aggregate throughput (image bytes x succeeded / makespan), per-node MB/s, origin
 egress (bytes and multiple of image size), NIC rx/tx average and peak, disk
-writes, node CPU and memory, gantry and containerd CPU and RSS (each as min, p50,
+writes and reads, node CPU and memory, gantry and containerd CPU and RSS, the
+gantry container's working set, anon memory, and page cache (peak, and at the
+end of the idle tail) (each as min, p50,
 p90, p99, and max across nodes), and the sum across pods of every changed
 `gantry_*_total` counter and any `gantry_cachemesh_*` series. Rates use the
 node's own pull window; disk writes include the tail.
