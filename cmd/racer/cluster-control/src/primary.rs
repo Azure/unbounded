@@ -607,13 +607,10 @@ async fn reconcile(t: &Rc<Term_>) -> Result<(), StateError> {
                 plan.evicted_roots
             );
         }
+        log_refused_roots(plan.refused_roots);
         if plan.refused_roots > 0 {
             // Offered roots fill every slot. Those seats stay unready until
             // slots free up.
-            eprintln!(
-                "racer: keyring root slots full; refused {} offered root(s)",
-                plan.refused_roots
-            );
             shared.last_error.set(Some(crate::Error::Unavailable));
         }
         let PassPlan {
@@ -1223,6 +1220,17 @@ mod seat_ready_tests {
 
 /// Report ClusterCaches left out for an invalid `spec.nodeSelector`, once per
 /// change of the set so a steady state does not repeat on every pass.
+/// Logs refused roots when the count changes; refusal persists across passes
+/// while every slot is offered.
+fn log_refused_roots(refused: usize) {
+    thread_local! {
+        static LAST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+    if LAST.replace(refused) != refused && refused > 0 {
+        eprintln!("racer: keyring root slots full; refused {refused} offered root(s)");
+    }
+}
+
 fn log_rejected_caches(rejected: &[String]) {
     thread_local! {
         static LAST: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
