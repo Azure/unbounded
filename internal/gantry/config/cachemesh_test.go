@@ -28,7 +28,7 @@ func TestCachemeshDefaultsDisabled(t *testing.T) {
 	}
 
 	if m.ChunkSize != 64<<20 || m.MetadataTTL != 5*time.Minute || m.LeaseName != "gantry-cachemesh" ||
-		m.ChunkCacheBytes != 4<<30 || !m.CacheTags || !m.VerifyDigest || m.Lookahead != 8 {
+		m.ChunkCacheBytes != 4<<30 || m.MaxNeighbors != 32 || !m.CacheTags || !m.VerifyDigest || m.Lookahead != 8 {
 		t.Fatalf("unexpected defaults: %+v", m)
 	}
 
@@ -39,6 +39,22 @@ func TestCachemeshDefaultsDisabled(t *testing.T) {
 
 	if err := c.Validate(); err != nil {
 		t.Fatalf("Validate with disabled cachemesh: %v", err)
+	}
+}
+
+// An explicit zero max_neighbors selects the cachemesh library default.
+func TestCachemeshMaxNeighborsZeroAllowed(t *testing.T) {
+	c := cachemeshBase()
+	if err := c.LoadYAML(strings.NewReader("cachemesh:\n  enabled: true\n  max_neighbors: 0\n")); err != nil {
+		t.Fatalf("LoadYAML: %v", err)
+	}
+
+	if c.Cachemesh.MaxNeighbors != 0 {
+		t.Fatalf("MaxNeighbors = %d, want 0", c.Cachemesh.MaxNeighbors)
+	}
+
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
 	}
 }
 

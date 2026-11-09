@@ -17,6 +17,15 @@ const (
 	DefaultCachemeshChunkCacheBytes = 4 << 30
 	DefaultCachemeshMetadataTTL     = 5 * time.Minute
 
+	// DefaultCachemeshMaxNeighbors is gantry's data-plane fan-out. The
+	// cachemesh library defaults to 256, sized for 100k-member clusters.
+	// In a cluster of a few hundred agents 256 makes every agent a direct
+	// neighbor of every other one, so the owner of a popular chunk serves
+	// every agent itself. 32 forces a multi-hop relay grid that spreads
+	// that load over relay caches; on 142 nodes it pulled a 40GB image in
+	// a p50 of 91s against 104s with 256 (designs/gantry-cachemesh-benchmark.md).
+	DefaultCachemeshMaxNeighbors = 32
+
 	// MinCachemeshChunkSize and MaxCachemeshChunkSize bound chunk_size. Each
 	// chunk is held in memory while it is filled, so very large chunks make
 	// the in-flight budget coarse.
@@ -62,11 +71,12 @@ type CachemeshConfig struct {
 	// default.
 	CellSize int `yaml:"cell_size"`
 
-	// MaxNeighbors bounds each agent's data-plane neighbors. Zero uses the
-	// library default (256): at about 150 agents that makes every agent a
-	// neighbor of every other one (a 1-D, fully direct grid). A smaller
-	// value such as 32 or 64 forces multi-hop relays, which spread the load
-	// of popular chunks over relay caches.
+	// MaxNeighbors bounds each agent's data-plane neighbors. The default is
+	// DefaultCachemeshMaxNeighbors (32), which forces multi-hop relays that
+	// spread the load of popular chunks over relay caches. An explicit zero
+	// uses the cachemesh library default (256), which at about 150 agents
+	// makes every agent a neighbor of every other one (a 1-D, fully direct
+	// grid).
 	MaxNeighbors int `yaml:"max_neighbors"`
 
 	// PartitionBits sets the number of cachemesh partitions (2^bits). Zero
@@ -129,6 +139,7 @@ func defaultCachemeshConfig() CachemeshConfig {
 		Enabled:                  false,
 		LeaseName:                DefaultCachemeshLeaseName,
 		ChunkSize:                DefaultCachemeshChunkSize,
+		MaxNeighbors:             DefaultCachemeshMaxNeighbors,
 		MetadataTTL:              DefaultCachemeshMetadataTTL,
 		CacheTags:                true,
 		VerifyDigest:             true,

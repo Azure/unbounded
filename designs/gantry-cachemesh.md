@@ -34,7 +34,7 @@ true.
 | `chunk_size` | `CACHEMESH_CHUNK_SIZE` | 64MiB | Stripe size; power of two, 1MiB to 1GiB, same on every node. |
 | `expected_size` | `CACHEMESH_EXPECTED_SIZE` | 0 (library: 1000) | Expected node count. |
 | `cell_size` | `CACHEMESH_CELL_SIZE` | 0 (library: 4) | Nodes per grid cell. |
-| `max_neighbors` | `CACHEMESH_MAX_NEIGHBORS` | 0 (library: 256) | Data-plane neighbors per node. |
+| `max_neighbors` | `CACHEMESH_MAX_NEIGHBORS` | 32 (explicit 0: library default 256) | Data-plane neighbors per node. |
 | `partition_bits` | `CACHEMESH_PARTITION_BITS` | 0 (library: 20) | log2 of the partition count. |
 | `metadata_ttl` | `CACHEMESH_METADATA_TTL` | 5m | Tag cache freshness; at least 5m. |
 | `cache_tags` | `CACHEMESH_CACHE_TAGS` | `true` | Serve anonymous tag requests from the mesh. |
@@ -51,10 +51,17 @@ true.
 Validation requires a Lease namespace and `pod_ip`. The Racer backend
 ignores the block.
 
-Grid shape: with about 150 nodes and the default `max_neighbors` of 256,
+Grid shape: gantry defaults `max_neighbors` to 32, unlike the cachemesh
+library, which defaults to 256 because it is sized for clusters of up to 100k
+members (`designs/cachemesh.md`). With about 150 nodes and 256 neighbors,
 every node is a neighbor of every other node, so every request goes straight
-to the owner. A value of 32 to 64 makes the grid two-dimensional, so requests
-relay through one intermediate node that caches the chunk on the way.
+to the owner, and the owner of a popular chunk serves every node itself.
+With 32 the grid is two-dimensional, so requests relay through one
+intermediate node that caches the chunk on the way and spreads the fan-out.
+On 142 nodes pulling a 40GB image, 32 gave a p50 of about 91s against about
+104s with 256 (`designs/gantry-cachemesh-benchmark.md`). An explicit
+`max_neighbors: 0` in the agent config selects the library default. The
+chart omits zero values, so to get 256 through the chart set it explicitly.
 
 The Helm chart exposes the same knobs as `gantry.cachemesh.*` (camelCase).
 It renders the block, and the `GANTRY_NODE_NAME` env var, only when
@@ -65,7 +72,6 @@ gantry:
   cachemesh:
     enabled: true
     expectedSize: 150
-    maxNeighbors: 32
 resources:
   agent:
     limits:

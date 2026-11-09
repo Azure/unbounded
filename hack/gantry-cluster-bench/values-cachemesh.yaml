@@ -4,14 +4,16 @@
 # Gantry cachemesh mode. Layer it over values-default.yaml so that every
 # other setting (limits included) is identical between the two modes:
 #   ./deploy.sh values-default.yaml <image> -f values-cachemesh.yaml
-# For the multi-hop relay grid add: --set gantry.cachemesh.maxNeighbors=32
+# For the 1-D fully direct grid (library sizing) add:
+#   --set gantry.cachemesh.maxNeighbors=256
 
 gantry:
   cachemesh:
     enabled: true
     # 142 Ready bench workers.
     expectedSize: 142
-    # 0 = library default (256), which makes ~142 agents a 1-D fully-direct grid.
+    # 0 = agent default (32), the multi-hop relay grid. 256 (the cachemesh
+    # library default) makes ~142 agents a 1-D fully direct grid.
     maxNeighbors: 0
     # 24GiB chunk cache; the 48Gi pod limit (values-default.yaml) leaves headroom.
     chunkCacheBytes: 25769803776

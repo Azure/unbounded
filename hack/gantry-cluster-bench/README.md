@@ -113,6 +113,11 @@ All commands run from `hack/gantry-cluster-bench/` with
    ./run.sh gantry-cachemesh-run2 10.224.16.40:5005/bench/g40:run2
    ```
 
+   `values-cachemesh.yaml` leaves `maxNeighbors` at the agent default of 32
+   (the multi-hop relay grid, mode C in `designs/gantry-cachemesh-benchmark.md`).
+   Add `--set gantry.cachemesh.maxNeighbors=256` for the 1-D direct grid
+   (mode B).
+
    Use a different image tag per run: the origin registry is the only place
    bench images live, and a reused digest might still be cached somewhere.
    `clean.sh` removes leases, but gantry also keeps in-memory provider
