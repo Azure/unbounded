@@ -1174,3 +1174,48 @@ func TestFillSpillsWhenBudgetExhausted(t *testing.T) {
 		t.Fatalf("after close: %+v", st)
 	}
 }
+
+// A fill that borrowed pages beyond its base window and then spills
+// queues more pages than the base window to its writer without blocking
+// (a regression: the writer queue was sized to the base window).
+func TestSpillQueuesBorrowedPages(t *testing.T) {
+	s := newTestStore(t, func(c *storeConfig) {
+		c.chunkSize = 32 * testPage
+		c.diskBudget = 4 * 32 * testPage
+		c.persist = PersistOwned
+		c.extraBudget = 8 * testPage
+	})
+	data := pattern(14, 32*testPage)
+
+	// A peer reader stuck at the start: the fill borrows eight pages,
+	// then spills with ten pages in its window.
+	r, _, _ := s.acquire(context.Background(), key(1), 0, false, true)
+	f := r.f
+	_ = f.setMeta(int64(len(data)), "", len(data))
+
+	done := make(chan error, 1)
+
+	go func() { done <- f.readFrom(context.Background(), bytes.NewReader(data), nil) }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("fill blocked queueing pages to the writer")
+	}
+
+	f.finish(nil)
+	f.release()
+
+	if st := s.stats(); st.Spills != 1 {
+		t.Fatalf("spills = %d, want 1", st.Spills)
+	}
+
+	if got := readAll(t, r); !bytes.Equal(got, data) {
+		t.Fatal("data mismatch")
+	}
+
+	r.close()
+}

@@ -73,8 +73,11 @@ type fill struct {
 	file       *chunkFile
 	diskFailed bool
 	diskSize   int64
-	writes     chan int
-	queued     int
+	// writeKick wakes the writer after queued grows or the fill ends.
+	writeKick chan struct{}
+	// writing is set while the writer runs.
+	writing bool
+	queued  int
 	// Bytes [diskStart, durable) of the chunk are on disk. diskStart is
 	// nonzero for a fill that spilled to disk after dropping its first
 	// pages.
@@ -270,8 +273,9 @@ func (f *fill) startDisk(spill bool) bool {
 	f.file = cf
 	f.diskSize = alignUp(int64(f.chunkLen))
 
-	f.writes = make(chan int, s.cfg.window+1)
-	go f.writeLoop(cf, f.writes)
+	f.writeKick = make(chan struct{}, 1)
+	f.writing = true
+	go f.writeLoop(cf, f.writeKick)
 
 	f.queueLocked()
 	f.mu.Unlock()
@@ -295,32 +299,65 @@ func (s *store) unreserve(f *fill) {
 // persisting reports whether completed pages go to disk. Caller holds f.mu.
 func (f *fill) persisting() bool { return f.file != nil && !f.diskFailed }
 
-// queueLocked hands completed pages to the writer. Caller holds f.mu.
+// queueLocked marks completed pages for the writer. Caller holds f.mu.
+// It never blocks: the writer picks pages up from the window in order.
 func (f *fill) queueLocked() {
+	if !f.writing {
+		return
+	}
+
 	ps := f.store.cfg.pageSize
-	for f.writes != nil && f.queued < f.n {
+	queued := f.queued
+
+	for f.queued < f.n {
 		end := min(f.queued+ps, f.chunkLen)
 		if end > f.n {
-			return
+			break
 		}
-
-		f.writes <- f.queued / ps
 
 		f.queued = end
 	}
+
+	if f.queued != queued || f.done {
+		f.kickWriterLocked()
+	}
 }
 
-// writeLoop writes queued pages to cf in order. When the fill is complete
-// and on disk, it frees the window so readers read from disk.
-func (f *fill) writeLoop(cf *chunkFile, ch <-chan int) {
+func (f *fill) kickWriterLocked() {
+	select {
+	case f.writeKick <- struct{}{}:
+	default:
+	}
+}
+
+// writeLoop writes queued pages to cf in order until the fill ends or a
+// write fails. When the fill is complete and on disk, it frees the window
+// so readers read from disk.
+func (f *fill) writeLoop(cf *chunkFile, kick <-chan struct{}) {
 	s := f.store
 	ps := s.cfg.pageSize
 
-	for idx := range ch {
+	for {
 		f.mu.Lock()
-		if f.diskFailed || idx < f.winStart || idx >= f.winStart+len(f.win) {
+
+		if f.diskFailed || (f.done && (f.err != nil || f.durable >= f.queued)) {
+			break
+		}
+
+		if f.durable >= f.queued {
 			f.mu.Unlock()
+			<-kick
+
 			continue
+		}
+
+		idx := f.durable / ps
+		if idx < f.winStart || idx >= f.winStart+len(f.win) {
+			// Unreachable: pages leave the window only once on disk.
+			f.diskFailed = true
+			f.broadcast()
+
+			break
 		}
 
 		p := f.win[idx-f.winStart]
@@ -353,7 +390,9 @@ func (f *fill) writeLoop(cf *chunkFile, ch <-chan int) {
 				s.detach(f)
 			}
 
-			continue
+			f.mu.Lock()
+
+			break
 		}
 
 		f.durable = end
@@ -362,7 +401,7 @@ func (f *fill) writeLoop(cf *chunkFile, ch <-chan int) {
 		s.diskWrites.Add(1)
 	}
 
-	f.mu.Lock()
+	f.writing = false
 
 	var (
 		win   []*page
@@ -622,9 +661,8 @@ func (f *fill) finish(err error) {
 	f.done = true
 	f.err = err
 
-	if f.writes != nil {
-		close(f.writes)
-		f.writes = nil
+	if f.writing {
+		f.kickWriterLocked()
 	}
 
 	f.broadcast()
