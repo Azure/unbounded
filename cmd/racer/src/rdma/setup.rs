@@ -67,6 +67,9 @@ pub(crate) enum Opened {
     Superseded,
 }
 
+/// Fewest admitted entries that trigger a sweep of expired ones.
+const MIN_PRUNE: usize = 64;
+
 /// Every key's setup state, plus the responder rate limit.
 #[derive(Debug, Default)]
 pub(crate) struct SetupTable {
@@ -74,6 +77,10 @@ pub(crate) struct SetupTable {
 
     /// Last admitted incoming offer per key.
     admitted: HashMap<LinkKey, Instant>,
+
+    /// Size of `admitted` that triggers the next sweep of expired entries:
+    /// sweeping on every admission would scan the whole map each time.
+    prune_at: usize,
 
     next_token: u64,
 }
@@ -143,7 +150,10 @@ impl SetupTable {
         {
             return SetupAdmission::Busy;
         }
-        self.admitted.retain(|_, last| now < *last + interval);
+        if self.admitted.len() >= self.prune_at {
+            self.admitted.retain(|_, last| now < *last + interval);
+            self.prune_at = (self.admitted.len() * 2).max(MIN_PRUNE);
+        }
         self.admitted.insert(key, now);
         SetupAdmission::Accept
     }
@@ -258,8 +268,46 @@ mod tests {
             SetupAdmission::Accept,
             "the interval passed"
         );
-        // Expired entries are pruned on admission.
-        table.admit(OTHER, false, now + 3 * SECOND, SECOND);
-        assert_eq!(table.admitted.len(), 1);
+    }
+
+    #[test]
+    /// Expired admissions are swept once the map grows, so it stays bounded
+    /// by recent offers without a scan on every admission.
+    fn admitted_entries_are_swept_as_the_map_grows() {
+        let mut table = SetupTable::default();
+        let now = Instant::now();
+        let key = |i: usize| LinkKey {
+            peer: [1; 32],
+            rail: i as u16,
+        };
+        for i in 0..MIN_PRUNE - 1 {
+            assert_eq!(
+                table.admit(key(i), false, now, SECOND),
+                SetupAdmission::Accept
+            );
+        }
+        // Below the threshold nothing is swept, even when expired.
+        let later = now + 2 * SECOND;
+        assert_eq!(
+            table.admit(key(1000), false, later, SECOND),
+            SetupAdmission::Accept
+        );
+        assert_eq!(table.admitted.len(), MIN_PRUNE);
+        // At the threshold the expired ones go; the fresh ones stay.
+        assert_eq!(
+            table.admit(key(1001), false, later, SECOND),
+            SetupAdmission::Accept
+        );
+        assert_eq!(table.admitted.len(), 2);
+        assert_eq!(
+            table.admit(key(1000), false, later, SECOND),
+            SetupAdmission::Busy
+        );
+        // Thousands of keys over time stay bounded.
+        for i in 0..10_000 {
+            let at = later + SECOND * (i as u32 / 100);
+            table.admit(key(2000 + i), false, at, SECOND);
+        }
+        assert!(table.admitted.len() <= 2 * MIN_PRUNE + 200);
     }
 }
