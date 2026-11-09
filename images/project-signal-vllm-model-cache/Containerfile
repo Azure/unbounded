@@ -10,27 +10,36 @@ RUN go mod download
 COPY cmd/project-signal-model-cache ./cmd/project-signal-model-cache
 RUN CGO_ENABLED=0 go build -trimpath -o /out/project-signal-model-cache ./cmd/project-signal-model-cache
 
-FROM scratch
+FROM ${GO_IMAGE} AS model
 
 ARG MODEL_REVISION=e93a9faa9c77e5d09219f6c868bfc7a1bd65593c
 ARG MODEL_BASE_URL=https://huggingface.co/EleutherAI/pythia-70m-deduped/resolve
+
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY images/project-signal-vllm-model-cache/model-manifest.tsv /tmp/model-manifest.tsv
+
+RUN set -eu; \
+    mkdir -p /model; \
+    while IFS="$(printf '\t')" read -r name digest size; do \
+        curl --fail --location --retry 3 --proto '=https' --tlsv1.2 \
+            "${MODEL_BASE_URL}/${MODEL_REVISION}/${name}" \
+            --output "/model/${name}"; \
+        printf '%s  %s\n' "${digest#sha256:}" "/model/${name}" | sha256sum --check --strict; \
+        actual_size="$(wc -c < "/model/${name}")"; \
+        test "${actual_size}" = "${size}"; \
+        chmod 0444 "/model/${name}"; \
+    done < /tmp/model-manifest.tsv
+
+FROM scratch
 
 COPY --from=builder /out/project-signal-model-cache /project-signal-model-cache
 COPY images/project-signal-vllm-model-cache/model-manifest.tsv /model/model-manifest.tsv
 COPY images/project-signal-vllm-model-cache/model-provenance.json /licenses/model-provenance.json
 COPY LICENSE /licenses/EleutherAI-pythia-70m-deduped-LICENSE
 COPY NOTICE /licenses/unbounded-NOTICE
-
-ADD --chmod=0444 --checksum=sha256:002050231a9b1ec3ac77aa6b9b3bbdc4d923f4068a7dd33b8da72a9bd6ad9a43 \
-    ${MODEL_BASE_URL}/${MODEL_REVISION}/config.json /model/config.json
-ADD --chmod=0444 --checksum=sha256:3da388330e4549156d76b58d6d268c63cd005e9336b4f4d2d378421e7b7a33fd \
-    ${MODEL_BASE_URL}/${MODEL_REVISION}/model.safetensors /model/model.safetensors
-ADD --chmod=0444 --checksum=sha256:6f50ab5a5a509a1c309d6171f339b196a900dc9c99ad0408ff23bb615fdae7ad \
-    ${MODEL_BASE_URL}/${MODEL_REVISION}/special_tokens_map.json /model/special_tokens_map.json
-ADD --chmod=0444 --checksum=sha256:c24618a1b3e6a38167beff1c72cffd126c3a66254347304b50547d12c5f25624 \
-    ${MODEL_BASE_URL}/${MODEL_REVISION}/tokenizer.json /model/tokenizer.json
-ADD --chmod=0444 --checksum=sha256:70e38394e494931c6f773ba41e19460dd4436526b852207367f04341b4066d3f \
-    ${MODEL_BASE_URL}/${MODEL_REVISION}/tokenizer_config.json /model/tokenizer_config.json
+COPY --from=model /model/ /model/
 
 USER 65532:65532
 ENTRYPOINT ["/project-signal-model-cache"]
