@@ -104,6 +104,10 @@ ds_wait_running "${ORIGIN_DS}" 1 60 || log "WARNING: origin sampler not Running"
 
 snap_metrics "${out}/metrics-pre"
 "${BENCH_DIR}/registry.sh" egress >"${out}/origin-pre.txt" || log "origin egress pre failed"
+# Pulls must not begin before the baselines exist, or origin traffic and
+# metrics are undercounted. Abort rather than record a skewed run.
+((EPOCHSECONDS < start_at)) ||
+  die "baseline capture finished $((EPOCHSECONDS - start_at))s after START_AT; increase START_DELAY (now ${START_DELAY}) and rerun"
 log "START_AT in $((start_at - EPOCHSECONDS))s"
 
 rc=0
