@@ -1520,7 +1520,10 @@ mod hedge {
         pub fn delay(&self, now: Instant, cx: &mut Context<'_>) -> Poll<()> {
             // Waker clone and drop callbacks may reenter the hedge registry.
             let wake = cx.waker().clone();
-            let mut state = self.owner.state.lock().expect("hedge alarm lock");
+            // A poisoned registry hedges now, like the module's other degraded paths.
+            let Ok(mut state) = self.owner.state.lock() else {
+                return Poll::Ready(());
+            };
             let alarm = state.alarms.get_mut(&self.id).expect("live hedge alarm");
             let (result, previous) = if now >= alarm.due {
                 (Poll::Ready(()), alarm.wake.take())
@@ -1725,6 +1728,25 @@ mod hedge {
         }
 
         /// Slots and bytes stay charged after an alarm fires and across threads.
+        /// A poisoned registry hedges at once instead of panicking.
+        #[test]
+        fn hedge_delay_poison_is_ready() {
+            let now = Instant::now();
+            let owner = Hedges::new(1, 1);
+            let permit = owner.acquire(1, now + Duration::from_secs(1)).unwrap();
+            let poisoner = owner.clone();
+            let _ = std::thread::spawn(move || {
+                let _guard = poisoner.state.lock().unwrap();
+                panic!("poison");
+            })
+            .join();
+            assert!(
+                permit
+                    .delay(now, &mut Context::from_waker(Waker::noop()))
+                    .is_ready()
+            );
+        }
+
         #[test]
         fn hedge_shared_slots_costs_and_release_are_independent_of_alarm() {
             /// Require shared ownership at compile time.
