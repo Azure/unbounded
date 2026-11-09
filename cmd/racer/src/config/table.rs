@@ -319,7 +319,7 @@ const BASE: &[Var] = &[
         Group::Threads,
         uint(2, u64::MAX, COUNT),
         Unset("no cap"),
-        "Total I/O, crypto, RDMA owner (when RDMA is enabled), and managed control threads. Managed deployments need at least 3, or 4 with RDMA enabled. Kernel io_uring workers are not counted.",
+        "Total I/O, crypto, RDMA owner (when RDMA is enabled), and managed control threads. Managed deployments need at least 4, or 3 when `RACER_ENABLE_RDMA` is `false`. Kernel io_uring workers are not counted.",
     ),
     var(
         "RACER_IO_WORKERS",

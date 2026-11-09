@@ -656,7 +656,7 @@ func TestDataplaneConfig(t *testing.T) {
 	require.NotContains(t, config.Data, "RACER_MAX_THREADS")
 
 	config.Data["RACER_SHARES"] = "8"
-	config.Data["RACER_MAX_THREADS"] = "3"
+	config.Data["RACER_MAX_THREADS"] = "4"
 	require.NoError(t, env.Client.Update(t.Context(), config))
 
 	plan := planPass(t, env)
@@ -665,7 +665,7 @@ func TestDataplaneConfig(t *testing.T) {
 	require.Equal(t, "8", config.Data["RACER_SHARES"], "administrator edits survive")
 	require.NotEqual(t, before, liveDataplane(t, env).Spec.Template.Annotations[dataplaneConfigHash])
 
-	for _, value := range []string{"2", "x", "-1"} {
+	for _, value := range []string{"2", "3", "x", "-1"} {
 		config.Data["RACER_MAX_THREADS"] = value
 		require.NoError(t, env.Client.Update(t.Context(), config))
 

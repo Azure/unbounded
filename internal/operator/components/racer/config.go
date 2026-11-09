@@ -196,8 +196,16 @@ func validateDataplaneConfig(data map[string]string) error {
 	}
 
 	if value, ok := data["RACER_MAX_THREADS"]; ok {
-		if threads, valid := dataplaneDecimal(value); !valid || threads < minThreads {
-			add("RACER_MAX_THREADS", fmt.Sprintf("must be an integer of at least %d, including the control plane thread", minThreads))
+		// RACER_ENABLE_RDMA defaults to auto, which reserves an RDMA owner
+		// thread on any node with RDMA hardware, so only an explicit false
+		// lowers the floor.
+		required, reason := uint64(minThreadsRDMA), "including the control plane thread and the RDMA owner thread (set RACER_ENABLE_RDMA=false to allow 3)"
+		if data["RACER_ENABLE_RDMA"] == "false" {
+			required, reason = minThreads, "including the control plane thread"
+		}
+
+		if threads, valid := dataplaneDecimal(value); !valid || threads < required {
+			add("RACER_MAX_THREADS", fmt.Sprintf("must be an integer of at least %d, %s", required, reason))
 		}
 	}
 

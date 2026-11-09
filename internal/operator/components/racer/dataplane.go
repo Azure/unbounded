@@ -30,8 +30,14 @@ const (
 	dataplaneConfigHash    = "unbounded-cloud.io/racer-settings-hash"
 
 	// minThreads covers one I/O worker, one crypto helper, and the
-	// dedicated control plane thread.
+	// dedicated control plane thread. It applies only when
+	// RACER_ENABLE_RDMA is false.
 	minThreads = 3
+
+	// minThreadsRDMA adds the RDMA owner thread, which the dataplane
+	// reserves whenever RACER_ENABLE_RDMA is auto (with hardware present)
+	// or true.
+	minThreadsRDMA = minThreads + 1
 )
 
 // planDataplaneConfig creates racer-settings when it is absent, seeded

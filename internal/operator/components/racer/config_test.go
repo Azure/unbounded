@@ -182,6 +182,42 @@ func TestValidateDataplaneConfigRejects(t *testing.T) {
 	}
 }
 
+func TestValidateDataplaneMaxThreadsRDMAOwner(t *testing.T) {
+	for _, tc := range []struct {
+		rdma, threads string
+		ok            bool
+	}{
+		{"", "3", false},
+		{"auto", "3", false},
+		{"true", "3", false},
+		{"false", "3", true},
+		{"false", "2", false},
+		{"", "4", true},
+		{"auto", "4", true},
+		{"true", "4", true},
+	} {
+		t.Run(tc.rdma+"/"+tc.threads, func(t *testing.T) {
+			data := map[string]string{"RACER_MAX_THREADS": tc.threads}
+			if tc.rdma != "" {
+				data["RACER_ENABLE_RDMA"] = tc.rdma
+			}
+
+			err := validateDataplaneConfig(data)
+			if tc.ok {
+				require.NoError(t, err)
+
+				return
+			}
+
+			require.ErrorContains(t, err, "RACER_MAX_THREADS")
+
+			if tc.rdma != "false" {
+				require.ErrorContains(t, err, "RDMA owner")
+			}
+		})
+	}
+}
+
 func TestValidateDataplaneConfigReportsEveryProblem(t *testing.T) {
 	err := validateDataplaneConfig(map[string]string{
 		"RACER_ENABLE_GPU": "maybe", "RACER_GPU_STAGING_BYTES": "1", "RACER_IO_WORKERS": "4",
