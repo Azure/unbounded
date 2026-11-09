@@ -33,7 +33,6 @@
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::collections::BinaryHeap;
-use std::collections::HashMap;
 use std::collections::VecDeque;
 
 use racer_core::admission::Floors;
@@ -197,9 +196,9 @@ pub struct Stats {
 pub struct Connections {
     config: Config,
     next: ConnId,
-    conns: HashMap<ConnId, Conn>,
-    pools: HashMap<(u32, u8), Pool>,
-    listeners: HashMap<u32, Listener>,
+    conns: BTreeMap<ConnId, Conn>,
+    pools: BTreeMap<(u32, u8), Pool>,
+    listeners: BTreeMap<u32, Listener>,
     expiries: BinaryHeap<Reverse<(u64, ConnId)>>,
     admitted: Vec<ConnId>,
     stats: Stats,
@@ -210,9 +209,9 @@ impl Connections {
         Self {
             config,
             next: 0,
-            conns: HashMap::new(),
-            pools: HashMap::new(),
-            listeners: HashMap::new(),
+            conns: BTreeMap::new(),
+            pools: BTreeMap::new(),
+            listeners: BTreeMap::new(),
             expiries: BinaryHeap::new(),
             admitted: Vec::new(),
             stats: Stats::default(),
