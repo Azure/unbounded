@@ -288,7 +288,7 @@ fn membership_churn_refreshes_falls_back_and_waits() {
     }
 }
 
-/// Peer connection slots on the 400-node cold start (`racer_core::connections`). With the
+/// Peer connection slots on the 400-node cold start (`model::connections`). With the
 /// legacy limits (`ConnectionConfig::legacy`: 45 ingress slots per worker, a full listener
 /// leaves connections in its accept queue) hot nodes' ingress slots stay held by idle
 /// connections their peers keep pooled (30 s on both sides), so later connections wait in the

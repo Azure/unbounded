@@ -113,7 +113,7 @@ pub struct Counters {
     pub relay_sheds: u64,
     /// Requests whose verification found the crypto queue full.
     pub verify_sheds: u64,
-    /// Links that reused an idle connection (`racer_core::connections::Stats`).
+    /// Links that reused an idle connection (`model::connections::Stats`).
     pub conn_reused: u64,
     /// Links whose new connection was accepted at once.
     pub conn_accepted: u64,

@@ -453,7 +453,7 @@ impl<'s> Model<'s> {
             };
             self.note_cut(mid, why);
         }
-        // The sender's pool hands out a connection before any I/O (`racer_core::connections`).
+        // The sender's pool hands out a connection before any I/O (`model::connections`).
         let acquired = (!cut && self.spec.connections != PeerConnections::Off)
             .then(|| self.conns.acquire(now, holder, conn, next));
         match acquired {

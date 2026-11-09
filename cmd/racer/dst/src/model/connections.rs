@@ -36,10 +36,10 @@ use std::collections::BinaryHeap;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 
-use crate::admission::Floors;
-use crate::admission::Limits;
-use crate::admission::ResourceClass;
-use crate::admission::Rules;
+use racer_core::admission::Floors;
+use racer_core::admission::Limits;
+use racer_core::admission::ResourceClass;
+use racer_core::admission::Rules;
 
 /// The listener's accept backlog: `std::net::TcpListener::bind` passes 128 to `listen`
 /// (`io/src/ring/fd.rs` `tcp_listener`; rust-lang/rust issue 94406). An inference for any host
@@ -94,6 +94,7 @@ impl Config {
         }
     }
 
+    /// Slots from production admission `limits`: ingress summed over `workers`, outbound per worker.
     pub fn from_limits(limits: &Limits, workers: u32) -> Self {
         let rules = Rules::new(limits.clone(), Floors::for_page(4096, 0));
         let workers = workers.max(1) as usize;
@@ -218,28 +219,18 @@ impl Connections {
         }
     }
 
-    pub fn config(&self) -> Config {
-        self.config
-    }
-
     pub fn stats(&self) -> Stats {
         self.stats
     }
 
     /// Connections open now, busy or idle.
+    #[cfg(test)]
     pub fn open(&self) -> usize {
         self.conns.len()
     }
 
-    /// Connections running an exchange now.
-    pub fn busy(&self) -> usize {
-        self.conns
-            .values()
-            .filter(|c| c.state == State::Busy)
-            .count()
-    }
-
     /// Ingress slots `node` holds and connections waiting in its accept queue.
+    #[cfg(test)]
     pub fn ingress(&self, node: u32) -> (usize, usize) {
         self.listeners
             .get(&node)

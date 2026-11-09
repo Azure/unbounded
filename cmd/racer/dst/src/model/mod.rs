@@ -11,6 +11,7 @@
 mod client;
 mod combined;
 mod completion;
+mod connections;
 pub mod control;
 pub mod coverage;
 #[allow(missing_docs)]
@@ -36,9 +37,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub use racer_core::connections::Config as ConnectionConfig;
+pub use connections::Config as ConnectionConfig;
+use connections::{Acquire, ConnId, Connections};
 use racer_core::{
-    connections::{Acquire, ConnId, Connections},
     flow::Circuits,
     liveness::{Detours, LINK_TIMEOUTS},
     liveness::{MAX_PINGS_IN_FLIGHT, SILENCE_CAPACITY, Silence},
@@ -503,7 +504,7 @@ struct Model<'s> {
     /// node cold start unchanged (130 against 134 failures, 0 search sheds) at 18 KB more per
     /// node. Searches run synchronously, so the search queue never fills.
     paths: Paths<Exhaustive>,
-    /// Peer connection slots of every node (`racer_core::connections`).
+    /// Peer connection slots of every node (`connections`).
     conns: Connections,
     /// The connections each request holds, one per link in route order.
     msg_conns: BTreeMap<u64, Vec<ConnId>>,

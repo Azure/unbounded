@@ -193,7 +193,7 @@ pub struct ModelSpec {
     /// and the server answers the unsigned overload head;
     /// zero is unbounded.
     pub crypto_queue: usize,
-    /// Peer connection slots (`racer_core::connections`): per-worker outbound pools, per-node
+    /// Peer connection slots (`model::connections`): per-worker outbound pools, per-node
     /// ingress, and idle reuse. Production's by default (see `dst/MODEL.md`).
     pub connections: PeerConnections,
     /// Link circuits (production `LinkHealth` in `src/topology.rs`, one per worker): a link

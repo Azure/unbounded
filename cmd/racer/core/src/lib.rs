@@ -6,7 +6,6 @@
 
 pub mod admission;
 pub mod cache;
-pub mod connections;
 /// Pure flow-control mechanisms (re-exported from `racer-flow-core`). The former core -> wire ->
 /// http1 -> flow-control edge is gone now that core depends on the pure `racer-wire`, so the
 /// crate can fold into this module.
