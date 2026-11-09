@@ -306,6 +306,25 @@ func TestApplyObject(t *testing.T) {
 	}
 }
 
+// Exercise enough payloads to catch invalid base64url boundary characters.
+func TestAppliedPayloadHashIsAlwaysAValidLabelValue(t *testing.T) {
+	for i := range 2000 {
+		desired := &appsv1.Deployment{
+			TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
+			ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("test-%d", i), Namespace: "default"},
+		}
+
+		hash, err := AppliedPayloadHash(ToUnstructured(desired))
+		if err != nil {
+			t.Fatalf("appliedPayloadHash: %v", err)
+		}
+
+		if errs := validation.IsValidLabelValue(hash); len(errs) > 0 {
+			t.Fatalf("hash %q for %s is not a valid label value: %v", hash, desired.Name, errs)
+		}
+	}
+}
+
 func TestApplyObjectSkipsMatchingPayload(t *testing.T) {
 	scheme := testScheme(t)
 	desired := &appsv1.Deployment{
@@ -322,8 +341,8 @@ func TestApplyObjectSkipsMatchingPayload(t *testing.T) {
 		t.Fatalf("appliedPayloadHash: %v", err)
 	}
 
-	if errors := validation.IsValidLabelValue(hash); len(errors) != 0 {
-		t.Fatalf("applied payload hash %q is not a valid label value", hash)
+	if errs := validation.IsValidLabelValue(hash); len(errs) > 0 {
+		t.Fatalf("applied payload hash %q is not a valid label value: %v", hash, errs)
 	}
 
 	current := desired.DeepCopy()

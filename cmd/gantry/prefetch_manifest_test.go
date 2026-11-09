@@ -8,15 +8,33 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"os"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/Azure/unbounded/internal/gantry/coldstart"
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/manifest"
+	"github.com/Azure/unbounded/internal/gantry/rangecache"
 )
+
+type manifestPrefetchResolverStub struct {
+	registry   string
+	repository string
+	children   []coldstart.ChildDigest
+}
+
+func (s *manifestPrefetchResolverStub) PrefetchManifestChildren(_ context.Context, _ digest.Digest, children []coldstart.ChildDigest, registry, repository string) error {
+	s.registry = registry
+	s.repository = repository
+
+	s.children = append([]coldstart.ChildDigest(nil), children...)
+
+	return nil
+}
 
 // delayedManifestStore returns ErrNotFound until availableAfter opens, which
 // models containerd committing the streamed manifest a moment after the mirror
@@ -144,5 +162,86 @@ func TestLayerPrefetchAdapterReportsManifestChildrenWithoutResolver(t *testing.T
 
 	if gotManifest != manifestDigest || gotChildren != 3 {
 		t.Fatalf("manifest callback = %s with %d children, want %s with 3", gotManifest, gotChildren, manifestDigest)
+	}
+}
+
+func TestLayerPrefetchAdapterDispatchesStreamingManifestChildren(t *testing.T) {
+	manifestDigest := testDigest(t, "a")
+	configDigest := testDigest(t, "b")
+	layer0 := testDigest(t, "c")
+	layer1 := testDigest(t, "d")
+
+	body, err := os.ReadFile("testdata/acr-streaming-manifest.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resolver := &manifestPrefetchResolverStub{}
+	adapter := &layerPrefetchAdapter{
+		cache:    &delayedManifestStore{body: string(body), ready: true},
+		logger:   slog.Default(),
+		resolver: resolver,
+	}
+
+	adapter.OnManifestServed(context.Background(), "app.azurecr.io", "team/app", manifestDigest)
+
+	if resolver.registry != "app.azurecr.io" || resolver.repository != "team/app" {
+		t.Fatalf("origin = %s/%s, want app.azurecr.io/team/app", resolver.registry, resolver.repository)
+	}
+
+	want := []coldstart.ChildDigest{
+		{Digest: configDigest, Kind: ifaces.KindConfig},
+		{Digest: layer0, Kind: ifaces.KindBlob},
+		{Digest: layer1, Kind: ifaces.KindBlob},
+	}
+	if len(resolver.children) != len(want) {
+		t.Fatalf("children = %+v, want %+v", resolver.children, want)
+	}
+
+	for index := range want {
+		if resolver.children[index] != want[index] {
+			t.Fatalf("child %d = %+v, want %+v", index, resolver.children[index], want[index])
+		}
+	}
+}
+
+func TestLayerPrefetchAdapterDoesNotWarmIndexesForRegularManifest(t *testing.T) {
+	body, err := os.ReadFile("testdata/acr-streaming-manifest.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cache, err := rangecache.New(t.TempDir()+"/ranges", 0)
+	if err != nil {
+		t.Fatalf("rangecache.New: %v", err)
+	}
+
+	t.Cleanup(func() { _ = cache.Close() })
+
+	origin := &prefetchOriginStub{}
+	indexes := newIndexPrefetcher(indexPrefetchOptions{
+		Cache:     cache,
+		DHT:       prefetchProviderStub{},
+		Peer:      &prefetchPeerStub{fail: true},
+		Origin:    origin,
+		HeadBytes: 4096,
+		TailBytes: 4096,
+	})
+	resolver := &manifestPrefetchResolverStub{}
+	adapter := &layerPrefetchAdapter{
+		cache:    &delayedManifestStore{body: string(body), ready: true},
+		indexes:  indexes,
+		logger:   slog.Default(),
+		resolver: resolver,
+	}
+
+	adapter.OnManifestServed(t.Context(), "registry.example.com", "team/app", testDigest(t, "e"))
+
+	if origin.calls.Load() != 0 {
+		t.Fatalf("regular manifest index origin calls = %d, want 0", origin.calls.Load())
+	}
+
+	if len(resolver.children) == 0 {
+		t.Fatal("regular manifest did not retain legacy chair prefetch")
 	}
 }

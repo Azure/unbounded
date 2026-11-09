@@ -11,3 +11,8 @@ manager: unbounded-operator
 
 nodeConfig:
   enabled: false
+
+overlaybdConfig:
+  # Internal render switch. The operator mutator removes this workload unless
+  # a Site explicitly enables Artifact Streaming.
+  renderOnly: true
