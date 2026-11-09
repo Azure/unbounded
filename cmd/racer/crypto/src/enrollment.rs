@@ -162,6 +162,19 @@ impl PersistedIdentity {
         )?)
     }
 
+    /// Like [`Self::response`], but `None` when the saved response was written
+    /// under another control-wire schema version, for example by the release
+    /// before an upgrade. Such a record cannot be revalidated, so the node
+    /// enrolls again instead of failing at every start. The response decoder
+    /// reports a schema mismatch, and only that, as `IncompatibleMembership`.
+    fn current_response(&self) -> Result<Option<EnrollmentResponse>, Error> {
+        match self.response() {
+            Ok(response) => Ok(Some(response)),
+            Err(Error::Wire(wire::Error::IncompatibleMembership)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Keep serialized private material in zeroizing storage until submission.
     fn encode(&self) -> Result<Zeroizing<Vec<u8>>, Error> {
         encode_private(self, wire::MAX_ENROLLMENT_BYTES * 3)
@@ -417,7 +430,12 @@ where
             .await
             {
                 Ok(bytes) => {
-                    if PersistedIdentity::decode(&bytes)?.response()?.cluster != response.cluster {
+                    // A record from another schema version is replaced without
+                    // the cluster check; the directory is already per cluster.
+                    if PersistedIdentity::decode(&bytes)?
+                        .current_response()?
+                        .is_some_and(|prior| prior.cluster != response.cluster)
+                    {
                         return Err(Error::Unauthorized.into());
                     }
                 }
@@ -470,7 +488,11 @@ where
                 Err(e) => return Err(e),
             };
             let persisted = PersistedIdentity::decode(&bytes)?;
-            let response = persisted.response()?;
+            // An identity from another schema version is left in place for
+            // accept_response to replace once the node enrolls again.
+            let Some(response) = persisted.current_response()? else {
+                return Ok(None);
+            };
             match self.validate(&persisted.pending, &response) {
                 Ok(identity) => {
                     r.file_sync(dir.clone(), &scope).await?;
@@ -1309,6 +1331,161 @@ mod tests {
         .unwrap();
         assert!(accepted.signing_identity(&roots).is_ok());
         assert!(sim.metadata(Path::new("/private/pending.json")).is_err());
+    }
+
+    /// Rewrite the saved response of a persisted identity with `edit`, the way
+    /// a record written by another release or a damaged one would look.
+    fn rewrite_saved_response(sim: &Simulation, edit: impl FnOnce(String) -> String) -> Vec<u8> {
+        let path = Path::new("/private/identity.json");
+        let mut persisted = PersistedIdentity::decode(&sim.read_file(path).unwrap()).unwrap();
+        let json = String::from_utf8(STANDARD.decode(&persisted.response).unwrap()).unwrap();
+        persisted.response = STANDARD.encode(edit(json));
+        let bytes = persisted.encode().unwrap().to_vec();
+        sim.write_file(path, &bytes).unwrap();
+        bytes
+    }
+
+    /// An identity saved under an older control-wire schema, as after an
+    /// upgrade, is not fatal: the node enrolls again and replaces it, even when
+    /// the old record names another cluster.
+    #[test]
+    fn identity_from_another_schema_version_is_replaced_by_enrollment() {
+        let current = format!("\"schema_version\":{}", racer_control_wire::SCHEMA_VERSION);
+        let older = format!(
+            "\"schema_version\":{}",
+            racer_control_wire::SCHEMA_VERSION - 1
+        );
+        for other_cluster in [false, true] {
+            let sim = Simulation::new();
+            let _environment = sim.enter();
+            let (files, e, scope) = fixture();
+            let (ca, key) = identity::test_util::ca();
+            let roots = vec![ca.der().to_vec()];
+            e.set_peer_trust_roots(roots.clone()).unwrap();
+            let first = drive(
+                &files,
+                e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope),
+            )
+            .unwrap();
+            drive(
+                &files,
+                e.accept_response(issue(&first, &ca, &key, |_| {}), &scope),
+            )
+            .unwrap();
+            let stale = rewrite_saved_response(&sim, |json| {
+                assert!(json.contains(&current));
+                let json = json.replace(&current, &older);
+                if other_cluster {
+                    json.replace(CLUSTER, "33333333-3333-4333-8333-333333333333")
+                } else {
+                    json
+                }
+            });
+
+            // Startup treats the node as not enrolled and keeps the old record.
+            assert!(drive(&files, e.load_identity(&scope)).unwrap().is_none());
+            assert_eq!(
+                sim.read_file(Path::new("/private/identity.json")).unwrap(),
+                stale
+            );
+
+            // Enrolling again replaces it with a current-schema identity.
+            let request = drive(
+                &files,
+                e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope),
+            )
+            .unwrap();
+            let accepted = drive(
+                &files,
+                e.accept_response(issue(&request, &ca, &key, |_| {}), &scope),
+            )
+            .unwrap();
+            assert!(accepted.signing_identity(&roots).is_ok());
+            assert!(sim.metadata(Path::new("/private/pending.json")).is_err());
+            let saved = sim.read_file(Path::new("/private/identity.json")).unwrap();
+            assert_ne!(saved, stale);
+            assert_eq!(
+                PersistedIdentity::decode(&saved)
+                    .unwrap()
+                    .response()
+                    .unwrap()
+                    .schema_version,
+                racer_control_wire::SCHEMA_VERSION
+            );
+            let recovered = drive(&files, e.load_identity(&scope)).unwrap().unwrap();
+            assert_eq!(recovered.certificate_chain(), accepted.certificate_chain());
+        }
+    }
+
+    /// Only a schema mismatch is recoverable: other invalid saved responses and
+    /// saved responses for another cluster still fail closed and are kept.
+    #[test]
+    fn invalid_or_foreign_current_schema_identity_still_fails_closed() {
+        for case in ["invalid-node", "invalid-base64", "other-cluster"] {
+            let sim = Simulation::new();
+            let _environment = sim.enter();
+            let (files, e, scope) = fixture();
+            let (ca, key) = identity::test_util::ca();
+            e.set_peer_trust_roots(vec![ca.der().to_vec()]).unwrap();
+            let first = drive(
+                &files,
+                e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope),
+            )
+            .unwrap();
+            drive(
+                &files,
+                e.accept_response(issue(&first, &ca, &key, |_| {}), &scope),
+            )
+            .unwrap();
+            let saved = match case {
+                "invalid-node" => {
+                    rewrite_saved_response(&sim, |json| json.replace(NODE, "not-a-uuid"))
+                }
+                "other-cluster" => rewrite_saved_response(&sim, |json| {
+                    json.replace(CLUSTER, "33333333-3333-4333-8333-333333333333")
+                }),
+                "invalid-base64" => {
+                    let path = Path::new("/private/identity.json");
+                    let mut persisted =
+                        PersistedIdentity::decode(&sim.read_file(path).unwrap()).unwrap();
+                    persisted.response = "!".into();
+                    let bytes = persisted.encode().unwrap().to_vec();
+                    sim.write_file(path, &bytes).unwrap();
+                    bytes
+                }
+                _ => unreachable!(),
+            };
+            let request = drive(
+                &files,
+                e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope),
+            )
+            .unwrap();
+            let expected: Failure = match case {
+                "invalid-node" => Error::Wire(wire::Error::InvalidRequest).into(),
+                "invalid-base64" => Error::CorruptRecord.into(),
+                "other-cluster" => Error::Unauthorized.into(),
+                _ => unreachable!(),
+            };
+            let accepted = drive(
+                &files,
+                e.accept_response(issue(&request, &ca, &key, |_| {}), &scope),
+            );
+            assert!(
+                matches!(accepted, Err(error) if error == expected),
+                "{case}"
+            );
+            if case != "other-cluster" {
+                assert!(
+                    matches!(drive(&files, e.load_identity(&scope)), Err(error) if error == expected),
+                    "{case}"
+                );
+            }
+            assert_eq!(
+                sim.read_file(Path::new("/private/identity.json")).unwrap(),
+                saved,
+                "{case}"
+            );
+        }
     }
 
     /// Every root is checked before configuration and again before persistence/load.
