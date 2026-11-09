@@ -120,6 +120,12 @@ pub struct RequestScope {
     /// local to the decrypt. None means the fetching worker's own node.
     /// Children inherit it.
     pub(crate) reader_numa: Option<u16>,
+    /// The work fetches a page for a host read that decrypts it straight out
+    /// of its RDMA receive buffer, so the page keeps that buffer until it is
+    /// delivered. With [`Self::ahead`], its grant is deferred while the
+    /// rail's pool is low (see [`crate::read::fill::ahead_grant_reserve`]).
+    /// Children inherit it.
+    pub(crate) holds_receive: bool,
 }
 impl RequestScope {
     /// The scope's clock.
@@ -234,6 +240,7 @@ impl RequestScope {
             clock,
             ahead: false,
             reader_numa: None,
+            holds_receive: false,
         })
     }
 
@@ -267,6 +274,7 @@ impl RequestScope {
         let mut child = Self::with_clock(request, deadline, self.clock.clone())?;
         child.ahead = self.ahead;
         child.reader_numa = self.reader_numa;
+        child.holds_receive = self.holds_receive;
         Ok(child)
     }
 
@@ -522,9 +530,11 @@ mod tests {
                 );
                 scope.reader_numa = Some(1);
                 scope.ahead = true;
+                scope.holds_receive = true;
                 let child = scope.child(RequestId([4; 16]), deadline).unwrap();
                 assert_eq!(child.reader_numa, Some(1));
                 assert!(child.ahead);
+                assert!(child.holds_receive);
                 assert_eq!(child.request, RequestId([4; 16]));
                 assert_eq!(child.deadline_at(), Some(deadline));
             }

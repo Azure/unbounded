@@ -1137,6 +1137,31 @@ pub(crate) mod send_in_place {
         assert!(out.contains("racer_rdma_grant_wait_granted_total 1"));
     }
 
+    /// An ahead host-read grant is deferred only while the rail's pool has
+    /// fewer free buffers than the grant reserve, and each deferral counts.
+    /// A rail without a pool never defers.
+    #[test]
+    fn ahead_grant_defers_only_while_the_pool_is_low() {
+        let mut w = world();
+        let env = w.env.clone();
+        let b = w.b.links.local().clone();
+        link_up(&env, &mut w);
+        let (mut w, ma, _) = metered(w);
+        let scope = scope(&env);
+        let deferred = || ma.count(Event::RdmaGrantAheadDeferred);
+        assert_eq!(crate::read::fill::ahead_grant_reserve(2), 1);
+        assert!(!w.a.links.defer_ahead_grant(RAIL));
+        let first = drive!(w, w.a.links.grant(&b, RAIL, TransferId([1; 16]), &scope)).unwrap();
+        assert!(!w.a.links.defer_ahead_grant(RAIL), "one of two still free");
+        let second = drive!(w, w.a.links.grant(&b, RAIL, TransferId([2; 16]), &scope)).unwrap();
+        assert!(w.a.links.defer_ahead_grant(RAIL), "none free");
+        assert_eq!(deferred(), 1);
+        assert!(!w.a.links.defer_ahead_grant(RailId(99)), "no such pool");
+        assert_eq!(deferred(), 1);
+        drop((first, second));
+        drop(w);
+    }
+
     /// A receiver parked on an exhausted rail is woken by the release that
     /// frees a slot, with no polling: the request is pending until the sender
     /// declines a grant, then granted and reported as waited. One whose wait

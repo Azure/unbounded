@@ -612,6 +612,22 @@ impl Transfers {
             rail,
             &self.io.reactor().ctx().rng,
         )?;
+        // A host-read page ahead of its window's head keeps its receive
+        // buffer until the head is delivered. While the rail's pool is low it
+        // takes no buffer and does not park behind heads for one: it fails
+        // `Overloaded` before anything is sent, and the window fetches it
+        // again later, by then possibly as its head.
+        if landing.is_none()
+            && scope.ahead
+            && scope.holds_receive
+            && matches!(
+                request.request.operation,
+                crate::peer::protocol::Operation::Page { .. }
+            )
+            && links.defer_ahead_grant(rail)
+        {
+            return Err(Error::Overloaded);
+        }
         let landed = match landing {
             Some(ordinal)
                 if matches!(
@@ -3680,6 +3696,97 @@ mod tests {
                 links.breaker_admit(&peer, RailId(7)),
                 crate::rdma::breaker::Admit::Rdma
             );
+        }
+
+        /// A host-read page ahead of its window's head takes no receive
+        /// buffer while the rail's pool is below the grant reserve: its
+        /// grant fails `Overloaded` at once, without parking or taking a
+        /// buffer, and is counted. A head still parks for a buffer, and an
+        /// ahead page whose fetch does not hold its buffer is granted as usual.
+        #[test]
+        fn ahead_host_read_grant_is_deferred_while_the_pool_is_low() {
+            use crate::rdma::links::tests::link_up;
+            use crate::rdma::links::tests::world_for;
+            let env = racer_io::Env::host();
+            let signers = crate::peer::tests::signers(&env);
+            let w = world_for(
+                [signers[0].node().clone(), signers[2].node().clone()],
+                false,
+            );
+            let (mut w, metrics, _) = crate::rdma::links::tests::send_in_place::metered(w);
+            let env = w.env.clone();
+            link_up(&env, &mut w);
+            let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+                crate::test_support::cluster::config(true).limits,
+            )));
+            let reactor = Rc::new(Reactor::new(admission.clone(), &env));
+            let receiver =
+                transfers(signers[0].clone(), &admission, &reactor).with_links(w.a.links.clone());
+            let membership = page_membership(&signers, None);
+            let mut request = crate::peer::tests::request(&env, &admission, 0);
+            request.operation = crate::peer::protocol::Operation::Page {
+                page: PageId {
+                    version: ObjectVersion {
+                        object: request.origin.object.clone(),
+                        etag: StrongEtag::test_value("ahead"),
+                    },
+                    number: PageNumber(1),
+                },
+                mode: crate::peer::protocol::FetchMode::CopyOnly,
+            };
+            let (signed, _) = crate::peer::forwarding::Forwarding::new(signers[0].clone())
+                .sign_request(request)
+                .unwrap();
+            let head = signed.request.origin.scope().clone();
+            let mut ahead = head.clone();
+            ahead.ahead = true;
+            ahead.holds_receive = true;
+            let mut ahead_plain = head.clone();
+            ahead_plain.ahead = true;
+            let links = w.a.links.clone();
+            let plan = TransportPlan::Rdma { rail: RailId(7) };
+            let free = || links.buffers(RailId(7), rdma_verbs::BufferState::Free);
+            let deferred = || metrics.count(crate::telemetry::Event::RdmaGrantAheadDeferred);
+            let accept = |w: &mut crate::rdma::links::tests::World, scope: &RequestScope| {
+                crate::rdma::links::tests::drive(&mut w.a.owner, &mut w.b.owner, async {
+                    receiver
+                        .accept_native(&signed, plan, &membership, None, scope)
+                        .await
+                        .map(|native| native.map(|(_, _, _, pending)| pending))
+                })
+            };
+            // Two of two free: an ahead page is granted.
+            let first = accept(&mut w, &ahead).unwrap();
+            assert!(first.is_some());
+            assert_eq!((free(), deferred()), (Some(1), 0));
+            // One free, the reserve: still granted.
+            let second = accept(&mut w, &ahead).unwrap();
+            assert!(second.is_some());
+            assert_eq!((free(), deferred()), (Some(0), 0));
+            // None free: deferred without parking or taking a buffer.
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            let mut deferred_accept =
+                Box::pin(receiver.accept_native(&signed, plan, &membership, None, &ahead));
+            let Poll::Ready(result) = deferred_accept.as_mut().poll(&mut cx) else {
+                panic!("an ahead page must not park while the pool is low");
+            };
+            assert!(matches!(result, Err(Error::Overloaded)));
+            drop(deferred_accept);
+            assert_eq!(deferred(), 1);
+            assert_eq!(links.grant_waiters(), 0);
+            // A head parks for a buffer instead.
+            let mut parked =
+                Box::pin(receiver.accept_native(&signed, plan, &membership, None, &head));
+            assert!(parked.as_mut().poll(&mut cx).is_pending());
+            drop(parked);
+            // So does an ahead page that would not hold its buffer.
+            let mut plain =
+                Box::pin(receiver.accept_native(&signed, plan, &membership, None, &ahead_plain));
+            assert!(plain.as_mut().poll(&mut cx).is_pending());
+            drop(plain);
+            assert_eq!(deferred(), 1);
+            drop((first, second));
+            crate::rdma::links::tests::pump(&mut w.a.owner, &mut w.b.owner);
         }
 
         /// A receiver whose owner is backed up (its command queue to the

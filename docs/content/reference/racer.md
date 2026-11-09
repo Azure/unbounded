@@ -740,9 +740,18 @@ Racer-Destination-Length: <length>
   the first undelivered page of its window waits there, and a fused page
   holds its receive buffer while it waits. So that such pages cannot take
   every receive buffer and leave the window heads none, a page ahead of its
-  head is copied out of its receive buffer as soon as it arrives, rather than
-  fused, while fewer than a quarter of the buffers of that rail's pool are
-  free. These pages count as `pool_low`. If ciphertext admission also refuses
+  head is not granted a receive buffer while fewer than a quarter of the
+  buffers of the rail's pool are free: its request fails before anything is
+  sent, without waiting for a buffer, and the window fetches it again after
+  a short backoff, by then possibly as its head. Window heads still wait for
+  a buffer as usual. `racer_rdma_grant_ahead_deferred_total` counts these
+  deferred grants. A page granted just before the pool ran low can still
+  arrive when it is lower: a page ahead of its head is copied out of its
+  receive buffer as soon as it arrives, rather than fused, while fewer than
+  an eighth of the buffers of that rail's pool are free. These pages count
+  as `pool_low`, and that copy costs an extra pass over the page in memory,
+  so a `pool_low` count that keeps growing means the grant reserve is not
+  keeping up. If ciphertext admission also refuses
   that copy, the page is dropped, which frees its buffer, and the window
   fetches it again later; `racer_host_read_ahead_registered_dropped_total`
   counts these drops.

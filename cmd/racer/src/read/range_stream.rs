@@ -1048,6 +1048,7 @@ impl RangeStream {
         // node, so the owning worker should land the page (and its fused
         // store) on that node.
         if let Some(target) = self.sealed.as_ref().filter(|t| t.helper.is_none()) {
+            child_scope.holds_receive = true;
             child_scope.reader_numa = target.destination_node(&self.range, number).or_else(|| {
                 crate::affinity::current_numa_node().and_then(|n| u16::try_from(n).ok())
             });

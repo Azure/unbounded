@@ -788,6 +788,22 @@ impl Links {
         );
     }
 
+    /// Whether to refuse a grant on `rail` to a host-read page ahead of its
+    /// window's head (see [`crate::runtime::RequestScope::holds_receive`]): the rail's
+    /// pool has fewer than [`crate::read::fill::ahead_grant_reserve`] buffers
+    /// free. Such a page keeps its buffer until its head is delivered, and
+    /// heads must always find one. Counts the refusal.
+    pub fn defer_ahead_grant(&self, rail: RailId) -> bool {
+        let low = self
+            .client
+            .free_buffers(rail.0)
+            .is_some_and(|(free, total)| free < crate::read::fill::ahead_grant_reserve(total));
+        if low {
+            self.record(crate::telemetry::Event::RdmaGrantAheadDeferred, 1);
+        }
+        low
+    }
+
     /// Free page buffers across the active rails.
     pub fn free_buffers(&self) -> usize {
         self.active()

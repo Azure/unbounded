@@ -1208,6 +1208,7 @@ pub(crate) mod tests {
                 clock: racer_io::Clock::host(),
                 ahead: false,
                 reader_numa: None,
+                holds_receive: false,
             }
         }
         fn page(admission: &flow_control::Quotas<AdmissionPolicy>, bytes: Vec<u8>) -> VerifiedPage {

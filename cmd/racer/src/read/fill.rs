@@ -102,12 +102,24 @@ pub(super) fn plaintext_wait(seed: u64, count: u8) -> Duration {
     half + Duration::from_nanos(mix % span)
 }
 
-/// The free receive buffers a pool of `total` keeps for window heads: a
-/// host-read page ahead of its head is fused (keeping its buffer until its
-/// head is delivered) only while at least this many are free. A quarter of
-/// the pool, and at least one buffer.
-pub(crate) fn ahead_registered_reserve(total: usize) -> usize {
+/// The free receive buffers a pool of `total` keeps for window heads before
+/// any host-read page ahead of its head is granted one: such a page keeps its
+/// buffer until its head is delivered, so while fewer than this many are
+/// free its grant is refused `Overloaded` before anything is sent, and the
+/// window fetches it again later. A quarter of the pool, and at least one
+/// buffer.
+pub(crate) fn ahead_grant_reserve(total: usize) -> usize {
     (total / 4).max(1)
+}
+
+/// The free receive buffers a pool of `total` keeps for window heads after a
+/// host-read page ahead of its head has landed: such a page is fused (keeping
+/// its buffer until its head is delivered) only while at least this many are
+/// free, and is copied out otherwise. Grants already stop at
+/// [`ahead_grant_reserve`], so this is a last resort for pages granted just
+/// before the pool ran low. An eighth of the pool, and at least one buffer.
+pub(crate) fn ahead_registered_reserve(total: usize) -> usize {
+    (total / 8).max(1)
 }
 
 /// A host descriptor to hand to cuFile, or None for simulated descriptors.

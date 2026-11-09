@@ -346,6 +346,7 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::RdmaGrantWaitGranted => "racer_rdma_grant_wait_granted_total",
             Self::RdmaGrantBackpressure => "racer_rdma_grant_backpressure_total",
             Self::RdmaGrantOwnerQueueFull => "racer_rdma_grant_owner_queue_full_total",
+            Self::RdmaGrantAheadDeferred => "racer_rdma_grant_ahead_deferred_total",
             Self::RdmaOwnerPasses => "racer_rdma_owner_passes_total",
             Self::RdmaOwnerCommands => "racer_rdma_owner_commands_total",
             Self::RdmaOwnerWakeCommands => "racer_rdma_owner_immediate_wakes_total" { "reason=\"commands\"" },
