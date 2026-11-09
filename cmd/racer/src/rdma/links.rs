@@ -1199,11 +1199,16 @@ impl Links {
         };
         // Read: the caller now owns the epoch.
         reservation.pending = None;
-        // A responder-side accept may have superseded the attempt; then the
-        // owner already replaced this epoch and `connect` fails on it.
-        let _: Opened =
-            LinkNode::lock(&self.node.setup).opened(key, reservation.token, opened.epoch);
+        let state = LinkNode::lock(&self.node.setup).opened(key, reservation.token, opened.epoch);
         drop(reservation);
+        if state == Opened::Superseded {
+            // A responder-side accept replaced the attempt: sending the offer
+            // would only make the peer replace the link it just accepted.
+            // Declining is scoped to our epoch, so it leaves the accepted
+            // link alone, and it does not escalate the backoff.
+            self.client.decline_link(key, opened.epoch);
+            return Err(Error::Overloaded);
+        }
         let setup = link_setup::Setup::new(
             rail,
             opened.setup.endpoint.to_bytes(),

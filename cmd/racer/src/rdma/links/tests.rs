@@ -540,6 +540,44 @@ fn tie_break_rate_limit_and_bad_response() {
 }
 
 #[test]
+/// An offer accepted while our own open waits on the owner supersedes the
+/// attempt: our offer is never returned for sending, and the accepted link
+/// is kept.
+fn open_superseded_by_an_accept_sends_no_offer() {
+    let mut w = world();
+    let env = w.env.clone();
+    let (a, b) = (node_id(1), node_id(2));
+    let scope = scope(&env);
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let mut open_b = std::pin::pin!(w.b.links.open(&a, RAIL, &scope));
+    assert!(open_b.as_mut().poll(&mut cx).is_pending());
+    let (epoch_a, ours_a) = drive!(w, w.a.links.open(&b, RAIL, &scope)).unwrap();
+    assert_eq!(w.b.links.admit_setup(&a, RAIL), SetupAdmission::Accept);
+    let theirs = drive!(w, w.b.links.accept(&a, RAIL, &ours_a, &scope)).unwrap();
+    assert_eq!(
+        open_b.as_mut().poll(&mut cx),
+        Poll::Ready(Err(Error::Overloaded))
+    );
+    assert_eq!(LinkNode::lock(&w.b.links.node.setup).len(), 0);
+    drive!(
+        w,
+        w.a.links.connect(
+            &b,
+            RAIL,
+            epoch_a,
+            &ours_a,
+            &theirs,
+            &link_setup::binding(&ours_a),
+            &scope,
+        )
+    )
+    .unwrap();
+    pump!(w);
+    assert!(w.a.links.ready(&b, RAIL).is_some());
+    assert!(w.b.links.ready(&a, RAIL).is_some());
+}
+
+#[test]
 fn canceled_open_clears_its_reservation() {
     let mut w = world();
     let env = w.env.clone();
