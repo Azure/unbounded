@@ -4,10 +4,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -15,7 +20,9 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	"github.com/Azure/unbounded/internal/gantry/config"
+	gdigest "github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
+	"github.com/Azure/unbounded/internal/gantry/meshfetch"
 	"github.com/Azure/unbounded/internal/gantry/metrics"
 )
 
@@ -69,7 +76,7 @@ func TestNewCachemeshAgentRequiresRangeOrigin(t *testing.T) {
 	c := config.NewDefault()
 	c.Cachemesh.Enabled = true
 
-	_, err := newCachemeshAgent(c, pullOnlyOrigin{}, metrics.New(), slog.New(slog.DiscardHandler))
+	_, err := newCachemeshAgent(c, pullOnlyOrigin{}, nil, metrics.New(), slog.New(slog.DiscardHandler))
 	if err == nil || !strings.Contains(err.Error(), "range") {
 		t.Fatalf("want range capability error, got %v", err)
 	}
@@ -91,7 +98,6 @@ func TestCachemeshMetricsHooks(t *testing.T) {
 	h.OnServe("ok", 50)
 	h.OnBlob("served", 200, time.Second)
 	h.OnMeta("hit")
-	h.OnEvict(10)
 
 	if got := testutil.ToFloat64(m.fillBytes.WithLabelValues("origin")); got != 100 {
 		t.Fatalf("fill bytes = %v", got)
@@ -150,5 +156,86 @@ func TestCgroupMemoryLimit(t *testing.T) {
 	}
 	if got := setCachemeshMemoryLimit(slog.New(slog.DiscardHandler), env, read); got != 0 {
 		t.Fatalf("GOMEMLIMIT set: applied %d", got)
+	}
+}
+
+// cachemeshContent reads the content root directly when it is readable,
+// falls back to the containerd API otherwise, and has no source when
+// neither is available.
+func TestCachemeshContentSelection(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+	root := t.TempDir()
+
+	if err := os.MkdirAll(filepath.Join(root, "blobs", "sha256"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	blob := []byte("hello content")
+	sum := sha256.Sum256(blob)
+	hexd := hex.EncodeToString(sum[:])
+
+	if err := os.WriteFile(filepath.Join(root, "blobs", "sha256", hexd), blob, 0o444); err != nil {
+		t.Fatal(err)
+	}
+
+	open := func(_ context.Context, d gdigest.Digest) (io.ReadCloser, int64, error) {
+		if d.Hex() != hexd {
+			return nil, 0, errors.New("not found")
+		}
+
+		r := bytes.NewReader(blob)
+
+		return struct {
+			io.Reader
+			io.ReaderAt
+			io.Closer
+		}{r, r, io.NopCloser(nil)}, int64(len(blob)), nil
+	}
+
+	cm := config.NewDefault().Cachemesh
+	cm.ContentRoot = root
+
+	src, kind, closeFn := cachemeshContent(cm, open, logger)
+	defer closeFn()
+
+	if kind != "dir" {
+		t.Fatalf("kind = %q, want dir", kind)
+	}
+
+	cm.ContentRoot = filepath.Join(root, "missing")
+
+	src2, kind, closeFn2 := cachemeshContent(cm, open, logger)
+	defer closeFn2()
+
+	if kind != "api" {
+		t.Fatalf("kind = %q, want api", kind)
+	}
+
+	for _, s := range []meshfetch.ContentSource{src, src2} {
+		avail, total := s.Available("sha256:" + hexd)
+		if avail != int64(len(blob)) || total != avail {
+			t.Fatalf("Available = %d/%d", avail, total)
+		}
+
+		buf := make([]byte, 7)
+		if _, err := s.ReadAt("sha256:"+hexd, buf, 6); err != nil || string(buf) != "content" {
+			t.Fatalf("ReadAt = %q, %v", buf, err)
+		}
+	}
+
+	if _, kind, _ := cachemeshContent(cm, nil, logger); kind != "none" {
+		t.Fatalf("kind = %q, want none", kind)
+	}
+
+	// A reader without ReadAt is refused.
+	o := blobOpener{open: func(context.Context, gdigest.Digest) (io.ReadCloser, int64, error) {
+		return io.NopCloser(bytes.NewReader(blob)), int64(len(blob)), nil
+	}}
+	if _, _, _, err := o.Open(context.Background(), "sha256:"+hexd); err == nil {
+		t.Fatal("want ReadAt error")
+	}
+
+	if _, _, _, err := o.Open(context.Background(), "bad"); err == nil {
+		t.Fatal("want digest parse error")
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -23,6 +24,7 @@ import (
 	"github.com/Azure/unbounded/internal/cachemesh/kubelease"
 	"github.com/Azure/unbounded/internal/gantry/chairs"
 	"github.com/Azure/unbounded/internal/gantry/config"
+	gdigest "github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/meshfetch"
 	"github.com/Azure/unbounded/internal/gantry/metrics"
@@ -43,6 +45,8 @@ type cachemeshAgent struct {
 	cancel  context.CancelFunc
 	done    chan error
 	tags    bool
+	// closeContent releases the local content source.
+	closeContent func()
 }
 
 // cachemeshMemoryLimitPercent is the share of the container memory limit
@@ -99,13 +103,52 @@ func cgroupMemoryLimit(readFile func(string) ([]byte, error)) int64 {
 	return 0
 }
 
-// chunkDir returns the chunk directory, or "" when the disk tier is off.
-func chunkDir(cm config.CachemeshConfig) string {
-	if cm.DiskCacheBytes == 0 {
-		return ""
+// blobOpener adapts the containerd content API store to
+// meshfetch.BlobOpener (committed blobs only).
+type blobOpener struct {
+	open func(ctx context.Context, d gdigest.Digest) (io.ReadCloser, int64, error)
+}
+
+func (o blobOpener) Open(ctx context.Context, d string) (io.ReaderAt, int64, io.Closer, error) {
+	dg, err := gdigest.Parse(d)
+	if err != nil {
+		return nil, 0, nil, err
 	}
 
-	return cm.ChunkDir
+	rc, size, err := o.open(ctx, dg)
+	if err != nil {
+		return nil, 0, nil, err
+	}
+
+	ra, ok := rc.(io.ReaderAt)
+	if !ok {
+		_ = rc.Close() //nolint:errcheck // read-only handle
+		return nil, 0, nil, errors.New("cachemesh: content reader does not support ReadAt")
+	}
+
+	return ra, size, rc, nil
+}
+
+// cachemeshContent returns the local content source: the content root read
+// directly when it is mounted and readable, else committed blobs over the
+// containerd content API (open may be nil: no local content). The returned
+// close func releases the source.
+func cachemeshContent(cm config.CachemeshConfig, open func(ctx context.Context, d gdigest.Digest) (io.ReadCloser, int64, error), logger *slog.Logger) (meshfetch.ContentSource, string, func()) {
+	if cm.ContentRoot != "" {
+		dc, err := meshfetch.NewDirContent(meshfetch.DirContentOptions{Root: cm.ContentRoot, Logger: logger})
+		if err == nil {
+			return dc, "dir", dc.Close
+		}
+
+		logger.Warn("cachemesh content root unreadable; reading committed blobs over the containerd API",
+			slog.String("content_root", cm.ContentRoot), slog.Any("err", err))
+	}
+
+	if open == nil {
+		return nil, "none", func() {}
+	}
+
+	return &meshfetch.OpenerContent{Opener: blobOpener{open: open}}, "api", func() {}
 }
 
 // cachemeshMemberID names this agent in the mesh: the Kubernetes node name,
@@ -136,7 +179,11 @@ func cachemeshAddr(c *config.Config) (string, error) {
 }
 
 // newCachemeshAgent builds the cachemesh member. It does not start it.
-func newCachemeshAgent(c *config.Config, origin ifaces.OriginPuller, reg *metrics.Registry, logger *slog.Logger) (*cachemeshAgent, error) {
+//
+// open reads committed blobs over the containerd content API; it is the
+// fallback local content source when the content root is not readable.
+// Nil leaves only the content root.
+func newCachemeshAgent(c *config.Config, origin ifaces.OriginPuller, open func(ctx context.Context, d gdigest.Digest) (io.ReadCloser, int64, error), reg *metrics.Registry, logger *slog.Logger) (*cachemeshAgent, error) {
 	cm := c.Cachemesh
 
 	rangeOrigin, ok := origin.(meshfetch.Origin)
@@ -185,19 +232,18 @@ func newCachemeshAgent(c *config.Config, origin ifaces.OriginPuller, reg *metric
 		return nil, err
 	}
 
+	content, contentKind, closeContent := cachemeshContent(cm, open, logger)
+
 	node, err := meshfetch.New(meshfetch.Config{
 		Mesh:          mesh,
 		Origin:        rangeOrigin,
 		Tags:          tagOrigin,
 		ChunkSize:     cm.ChunkSize,
-		ChunkDir:      chunkDir(cm),
-		DiskBytes:     cm.DiskCacheBytes,
+		Content:       content,
 		MemoryBytes:   cm.MemoryCacheBytes,
 		PageSize:      int(cm.PageSize),
 		FillPages:     cm.FillPages,
 		InflightBytes: cm.InflightBytes,
-		PageCache:     meshfetch.PageCacheMode(cm.PageCache),
-		Persist:       meshfetch.PersistPolicy(cm.Persist),
 		MaxFills:      cm.MaxConcurrentChunkFills,
 		MaxServes:     cm.MaxConcurrentChunkServes,
 		Lookahead:     cm.Lookahead,
@@ -211,12 +257,13 @@ func newCachemeshAgent(c *config.Config, origin ifaces.OriginPuller, reg *metric
 		Hooks:         m.hooks(),
 	})
 	if err != nil {
+		closeContent()
 		return nil, err
 	}
 
 	setCachemeshMemoryLimit(logger, os.Getenv, os.ReadFile)
 
-	a := &cachemeshAgent{mesh: mesh, node: node, logger: logger, tags: tagOrigin != nil}
+	a := &cachemeshAgent{mesh: mesh, node: node, logger: logger, tags: tagOrigin != nil, closeContent: closeContent}
 	a.meshPtr.Store(mesh)
 	m.registerGauges(reg, a)
 
@@ -225,12 +272,10 @@ func newCachemeshAgent(c *config.Config, origin ifaces.OriginPuller, reg *metric
 		slog.String("addr", addr),
 		slog.String("lease", c.CachemeshNamespace()+"/"+cm.LeaseName),
 		slog.Int64("chunk_size", cm.ChunkSize),
-		slog.String("chunk_dir", cm.ChunkDir),
-		slog.Int64("disk_cache_bytes", cm.DiskCacheBytes),
+		slog.String("content_root", cm.ContentRoot),
+		slog.String("content_source", contentKind),
 		slog.Int64("memory_cache_bytes", cm.MemoryCacheBytes),
 		slog.Int64("page_size", cm.PageSize),
-		slog.String("page_cache", cm.PageCache),
-		slog.String("persist", cm.Persist),
 		slog.Int("max_neighbors", cm.MaxNeighbors),
 		slog.Int("lookahead", cm.Lookahead),
 		slog.Bool("cache_tags", a.tags),
@@ -300,6 +345,10 @@ func (a *cachemeshAgent) stop() {
 	}
 
 	a.node.Close()
+
+	if a.closeContent != nil {
+		a.closeContent()
+	}
 }
 
 type cachemeshMetrics struct {
@@ -316,7 +365,6 @@ type cachemeshMetrics struct {
 	blobBytes     prometheus.Counter
 	blobSeconds   *prometheus.HistogramVec
 	tags          *prometheus.CounterVec
-	evicted       prometheus.Counter
 	controlErrors prometheus.Counter
 	leaseErrors   *prometheus.CounterVec
 }
@@ -327,15 +375,15 @@ func newCachemeshMetrics(reg *metrics.Registry) *cachemeshMetrics {
 	return &cachemeshMetrics{
 		lookups: reg.NewCounterVec(sub, prometheus.CounterOpts{
 			Name: "gantry_cachemesh_chunk_lookups_total",
-			Help: "Chunk lookups by requester (local mirror request or peer) and result: hit (complete in the chunk cache), joined (an in-progress fill), or fill (a new fill).",
+			Help: "Chunk lookups by requester (local mirror request or peer) and result: hit (complete in memory), joined (an in-progress fill), fill (a new fill), or local (a peek served from the local content store).",
 		}, []string{"requester", "result"}),
 		fills: reg.NewCounterVec(sub, prometheus.CounterOpts{
 			Name: "gantry_cachemesh_chunk_fills_total",
-			Help: "Chunk fill attempts by source (origin, peer, prev_owner, owner) and outcome (ok, error).",
+			Help: "Chunk fill attempts by source (origin, peer, prev_owner, owner, local, holder) and outcome (ok, error).",
 		}, []string{"source", "outcome"}),
 		fillBytes: reg.NewCounterVec(sub, prometheus.CounterOpts{
 			Name: "gantry_cachemesh_chunk_fill_bytes_total",
-			Help: "Bytes read into the chunk cache, by source.",
+			Help: "Bytes read into chunk fills, by source.",
 		}, []string{"source"}),
 		fillSeconds: reg.NewHistogramVec(sub, prometheus.HistogramOpts{
 			Name:    "gantry_cachemesh_chunk_fill_duration_seconds",
@@ -380,10 +428,6 @@ func newCachemeshMetrics(reg *metrics.Registry) *cachemeshMetrics {
 			Name: "gantry_cachemesh_tag_lookups_total",
 			Help: "Tag resolutions by outcome: hit (fresh local copy), origin (resolved here as owner), peer, error.",
 		}, []string{"outcome"}),
-		evicted: reg.NewCounter(sub, prometheus.CounterOpts{
-			Name: "gantry_cachemesh_chunk_evicted_bytes_total",
-			Help: "Bytes evicted from the disk chunk store.",
-		}),
 		controlErrors: reg.NewCounter(sub, prometheus.CounterOpts{
 			Name: "gantry_cachemesh_control_errors_total",
 			Help: "Failed cachemesh control-plane calls to other members.",
@@ -417,8 +461,7 @@ func (m *cachemeshMetrics) hooks() meshfetch.Hooks {
 			m.blobBytes.Add(float64(bytes))
 			m.blobSeconds.WithLabelValues(outcome).Observe(d.Seconds())
 		},
-		OnMeta:  func(outcome string) { m.tags.WithLabelValues(outcome).Inc() },
-		OnEvict: func(bytes int64) { m.evicted.Add(float64(bytes)) },
+		OnMeta: func(outcome string) { m.tags.WithLabelValues(outcome).Inc() },
 	}
 }
 
@@ -458,10 +501,6 @@ func (m *cachemeshMetrics) registerGauges(reg *metrics.Registry, a *cachemeshAge
 		Help: "Data-plane neighbors of this agent in the cachemesh grid.",
 	}, func() float64 { return float64(len(a.mesh.Neighbors())) })
 	reg.NewGaugeFunc(sub, prometheus.GaugeOpts{
-		Name: "gantry_cachemesh_chunk_disk_bytes",
-		Help: "Bytes charged to the chunk disk budget: chunk files plus fills being written.",
-	}, func() float64 { return float64(a.node.Stats().DiskBytes) })
-	reg.NewGaugeFunc(sub, prometheus.GaugeOpts{
 		Name: "gantry_cachemesh_chunk_store_chunks",
 		Help: "Chunks in the chunk store, complete or in progress.",
 	}, func() float64 { return float64(a.node.Stats().Chunks) })
@@ -474,20 +513,28 @@ func (m *cachemeshMetrics) registerGauges(reg *metrics.Registry, a *cachemeshAge
 		Help: "Memory in the hot page tier.",
 	}, func() float64 { return float64(a.node.Stats().HotBytes) })
 	reg.NewCounterFunc(sub, prometheus.CounterOpts{
-		Name: "gantry_cachemesh_disk_page_reads_total",
-		Help: "Chunk pages read from disk.",
-	}, func() float64 { return float64(a.node.Stats().DiskReads) })
+		Name: "gantry_cachemesh_local_page_reads_total",
+		Help: "Chunk pages read from the local containerd content store for readers behind a fill's window.",
+	}, func() float64 { return float64(a.node.Stats().LocalReads) })
 	reg.NewCounterFunc(sub, prometheus.CounterOpts{
-		Name: "gantry_cachemesh_disk_page_writes_total",
-		Help: "Chunk pages written to disk.",
-	}, func() float64 { return float64(a.node.Stats().DiskWrites) })
+		Name: "gantry_cachemesh_local_errors_total",
+		Help: "Failed reads of the local containerd content store; the affected readers retry elsewhere.",
+	}, func() float64 { return float64(a.node.Stats().LocalErrors) })
 	reg.NewCounterFunc(sub, prometheus.CounterOpts{
-		Name: "gantry_cachemesh_disk_errors_total",
-		Help: "Failed chunk disk operations; the affected fills stream through memory.",
-	}, func() float64 { return float64(a.node.Stats().DiskErrors) })
+		Name: "gantry_cachemesh_local_fills_total",
+		Help: "Chunk fills read from the local containerd content store.",
+	}, func() float64 { return float64(a.node.Stats().LocalFills) })
+	reg.NewCounterFunc(sub, prometheus.CounterOpts{
+		Name: "gantry_cachemesh_holder_peeks_total",
+		Help: "Owner reads of a chunk from a recent requester's content store that succeeded.",
+	}, func() float64 { return float64(a.node.Stats().HolderPeeks) })
+	reg.NewCounterFunc(sub, prometheus.CounterOpts{
+		Name: "gantry_cachemesh_holder_misses_total",
+		Help: "Owner reads of a chunk from a recent requester's content store that failed.",
+	}, func() float64 { return float64(a.node.Stats().HolderMisses) })
 	reg.NewCounterFunc(sub, prometheus.CounterOpts{
 		Name: "gantry_cachemesh_shared_page_reads_total",
-		Help: "Page reads served by a concurrent reader's disk read or the hot tier instead of the disk.",
+		Help: "Page reads served by a concurrent reader's read or the hot tier instead of the content store.",
 	}, func() float64 { return float64(a.node.Stats().PageReadsShared) })
 	reg.NewGaugeFunc(sub, prometheus.GaugeOpts{
 		Name: "gantry_cachemesh_inflight_borrowed_bytes",
@@ -497,14 +544,6 @@ func (m *cachemeshMetrics) registerGauges(reg *metrics.Registry, a *cachemeshAge
 		Name: "gantry_cachemesh_memory_chunks",
 		Help: "Complete chunks peers read that linger in borrowed in-flight pages.",
 	}, func() float64 { return float64(a.node.Stats().MemoryChunks) })
-	reg.NewCounterFunc(sub, prometheus.CounterOpts{
-		Name: "gantry_cachemesh_spills_total",
-		Help: "Chunk fills that spilled to disk because the in-flight budget was exhausted.",
-	}, func() float64 { return float64(a.node.Stats().Spills) })
-	reg.NewCounterFunc(sub, prometheus.CounterOpts{
-		Name: "gantry_cachemesh_stream_fills_total",
-		Help: "Chunk fills not written to disk (stream-through).",
-	}, func() float64 { return float64(a.node.Stats().StreamFills) })
 	reg.NewGaugeFunc(sub, prometheus.GaugeOpts{
 		Name: "gantry_cachemesh_chunk_fills_inflight",
 		Help: "Chunk fills in progress.",

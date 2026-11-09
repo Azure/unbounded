@@ -13,17 +13,14 @@ import (
 
 // Cachemesh defaults.
 const (
-	DefaultCachemeshLeaseName      = "gantry-cachemesh"
-	DefaultCachemeshChunkSize      = 64 << 20
-	DefaultCachemeshChunkDir       = "/var/lib/gantry/cachemesh"
-	DefaultCachemeshDiskCacheBytes = 20 << 30
-	DefaultCachemeshMemCacheBytes  = 512 << 20
-	DefaultCachemeshPageSize       = 1 << 20
-	DefaultCachemeshFillPages      = 4
-	DefaultCachemeshInflightBytes  = 2 << 30
-	DefaultCachemeshPageCache      = "bypass"
-	DefaultCachemeshPersist        = "owned"
-	DefaultCachemeshMetadataTTL    = 5 * time.Minute
+	DefaultCachemeshLeaseName     = "gantry-cachemesh"
+	DefaultCachemeshChunkSize     = 64 << 20
+	DefaultCachemeshContentRoot   = "/var/lib/containerd/io.containerd.content.v1.content"
+	DefaultCachemeshMemCacheBytes = 512 << 20
+	DefaultCachemeshPageSize      = 1 << 20
+	DefaultCachemeshFillPages     = 4
+	DefaultCachemeshInflightBytes = 2 << 30
+	DefaultCachemeshMetadataTTL   = 5 * time.Minute
 
 	// DefaultCachemeshMaxNeighbors is gantry's data-plane fan-out. The
 	// cachemesh library defaults to 256, sized for 100k-member clusters.
@@ -38,8 +35,7 @@ const (
 	MinCachemeshChunkSize = 1 << 20
 	MaxCachemeshChunkSize = 1 << 30
 
-	// MinCachemeshPageSize bounds page_size from below; pages are the unit
-	// of O_DIRECT I/O, which needs 4KiB alignment.
+	// MinCachemeshPageSize bounds page_size from below.
 	MinCachemeshPageSize = 64 << 10
 
 	// MinCachemeshMetadataTTL matches cachemesh.MinTTL. It is repeated here
@@ -54,9 +50,10 @@ const (
 // With cachemesh enabled, blobs are split into ChunkSize chunks. Each chunk
 // is owned by one agent (the owner of its cachemesh partition), which pulls
 // it from the origin registry once; other agents fetch it hop by hop through
-// the cachemesh grid, and every hop may keep a copy in its chunk store: chunk
-// files under ChunkDir, plus a small in-memory tier of hot pages. Tag and
-// manifest metadata is cached separately with MetadataTTL.
+// the cachemesh grid. Agents keep chunks only in bounded memory; the only
+// on-disk copy is containerd's content store (ContentRoot), which agents
+// read back to serve peers. Tag and manifest metadata is cached separately
+// with MetadataTTL.
 // See designs/gantry-cachemesh.md.
 type CachemeshConfig struct {
 	// Enabled turns the cachemesh path on (GANTRY_CACHEMESH_ENABLED). The
@@ -109,54 +106,39 @@ type CachemeshConfig struct {
 	// evicting the cached chunks.
 	VerifyDigest bool `yaml:"verify_digest"`
 
-	// ChunkDir holds chunk files. The agent removes everything in it at
-	// startup: chunks are not individually digest-verified, so files from
-	// an earlier run are never trusted.
-	ChunkDir string `yaml:"chunk_dir"`
+	// ContentRoot is the containerd content store directory (holding
+	// blobs/ and ingest/), mounted read-only into the agent. Chunks are
+	// served to peers from the blobs and in-progress downloads there; the
+	// agent never writes image bytes to disk itself. Empty, or a root the
+	// agent cannot read, falls back to reading committed blobs over the
+	// containerd content API.
+	ContentRoot string `yaml:"content_root"`
 
-	// DiskCacheBytes bounds chunk files in ChunkDir, including chunks
-	// being written. Complete chunks are evicted least recently used
-	// first, chunks this agent owns last. Fills that find no room stream
-	// through memory without a disk copy. Zero disables the disk tier.
-	DiskCacheBytes int64 `yaml:"disk_cache_bytes"`
-
-	// MemoryCacheBytes bounds the hot page tier: pages read from disk by
-	// two or more concurrent readers that stay in memory for the next
-	// ones. Zero disables it. Total chunk memory is about this plus
+	// MemoryCacheBytes bounds the hot page tier: pages read from the
+	// content store by two or more concurrent readers that stay in memory
+	// for the next ones. Zero disables it. Total chunk memory is about this plus
 	// inflight_bytes plus page_size * (fill_pages *
 	// max_concurrent_chunk_fills + one page per active reader).
 	MemoryCacheBytes int64 `yaml:"memory_cache_bytes"`
 
-	// PageSize is the unit of in-flight buffers, disk I/O, read
+	// PageSize is the unit of in-flight buffers, content store reads, read
 	// coalescing, and the hot tier: a power of two between 64KiB and
 	// chunk_size.
 	PageSize int64 `yaml:"page_size"`
 
 	// FillPages is the number of in-flight pages each chunk fill holds in
 	// memory. Readers within this window get bytes from memory as they
-	// arrive; slower readers read from disk.
+	// arrive; slower readers read from the content store once containerd
+	// has written the bytes there.
 	FillPages int `yaml:"fill_pages"`
 
 	// InflightBytes bounds memory that fills borrow beyond fill_pages: when
 	// a reader lags behind a fill that peers also read, so one slow reader
 	// does not slow the others down, and to keep chunks that peers read in
 	// memory for later peers (for at most 30s unused; reclaimed first).
-	// When it is exhausted a fill with a lagging reader spills to disk;
-	// without disk the slowest reader paces it. Zero disables borrowing.
+	// When it is exhausted the slowest reader the content store does not
+	// cover paces the fill. Zero disables borrowing.
 	InflightBytes int64 `yaml:"inflight_bytes"`
-
-	// PageCache selects how chunk files use the kernel page cache:
-	// "bypass" (O_DIRECT, the default), "drop" (buffered I/O, then
-	// posix_fadvise DONTNEED), or "keep" (buffered, left to the kernel).
-	// Page cache counts toward the container's working set.
-	PageCache string `yaml:"page_cache"`
-
-	// Persist selects which chunks are written to disk: "all", "shared"
-	// (only chunks this agent owns or serves to a peer; chunks only this
-	// agent consumes stream through memory), or "owned" (only chunks this
-	// agent owns; relays keep nothing, and a late peer request refetches
-	// the chunk from upstream).
-	Persist string `yaml:"persist"`
 
 	// MaxConcurrentChunkFills caps chunks this agent fetches from a peer or
 	// the origin at once. Peer requests over the cap get 429.
@@ -196,14 +178,11 @@ func defaultCachemeshConfig() CachemeshConfig {
 		MetadataTTL:              DefaultCachemeshMetadataTTL,
 		CacheTags:                true,
 		VerifyDigest:             true,
-		ChunkDir:                 DefaultCachemeshChunkDir,
-		DiskCacheBytes:           DefaultCachemeshDiskCacheBytes,
+		ContentRoot:              DefaultCachemeshContentRoot,
 		MemoryCacheBytes:         DefaultCachemeshMemCacheBytes,
 		PageSize:                 DefaultCachemeshPageSize,
 		FillPages:                DefaultCachemeshFillPages,
 		InflightBytes:            DefaultCachemeshInflightBytes,
-		PageCache:                DefaultCachemeshPageCache,
-		Persist:                  DefaultCachemeshPersist,
 		MaxConcurrentChunkFills:  64,
 		MaxConcurrentChunkServes: 512,
 		Lookahead:                8,
@@ -221,6 +200,12 @@ func (c *Config) CachemeshNamespace() string {
 	}
 
 	return c.ChairNamespace
+}
+
+// removedCachemeshEnv lists environment keys of the removed private chunk
+// store. The YAML keys fail through KnownFields.
+var removedCachemeshEnv = []string{
+	"CACHEMESH_CHUNK_DIR", "CACHEMESH_DISK_CACHE_BYTES", "CACHEMESH_PAGE_CACHE", "CACHEMESH_PERSIST",
 }
 
 func (c *Config) loadCachemeshEnv(env func(string) string) []error {
@@ -278,14 +263,11 @@ func (c *Config) loadCachemeshEnv(env func(string) string) []error {
 	dur("CACHEMESH_METADATA_TTL", &m.MetadataTTL)
 	boolean("CACHEMESH_CACHE_TAGS", &m.CacheTags)
 	boolean("CACHEMESH_VERIFY_DIGEST", &m.VerifyDigest)
-	str("CACHEMESH_CHUNK_DIR", &m.ChunkDir)
-	num("CACHEMESH_DISK_CACHE_BYTES", func(n int64) { m.DiskCacheBytes = n })
+	str("CACHEMESH_CONTENT_ROOT", &m.ContentRoot)
 	num("CACHEMESH_MEMORY_CACHE_BYTES", func(n int64) { m.MemoryCacheBytes = n })
 	num("CACHEMESH_PAGE_SIZE", func(n int64) { m.PageSize = n })
 	num("CACHEMESH_FILL_PAGES", setInt(&m.FillPages))
 	num("CACHEMESH_INFLIGHT_BYTES", func(n int64) { m.InflightBytes = n })
-	str("CACHEMESH_PAGE_CACHE", &m.PageCache)
-	str("CACHEMESH_PERSIST", &m.Persist)
 	num("CACHEMESH_MAX_CONCURRENT_CHUNK_FILLS", setInt(&m.MaxConcurrentChunkFills))
 	num("CACHEMESH_MAX_CONCURRENT_CHUNK_SERVES", setInt(&m.MaxConcurrentChunkServes))
 	num("CACHEMESH_LOOKAHEAD", setInt(&m.Lookahead))
@@ -293,6 +275,14 @@ func (c *Config) loadCachemeshEnv(env func(string) string) []error {
 	dur("CACHEMESH_CHUNK_STALL_TIMEOUT", &m.ChunkStallTimeout)
 	num("CACHEMESH_CHUNK_ATTEMPTS", setInt(&m.ChunkAttempts))
 	boolean("CACHEMESH_HEDGE", &m.Hedge)
+
+	// The private chunk store was removed: containerd's content store is
+	// the only disk copy. Fail loudly rather than ignore its settings.
+	for _, key := range removedCachemeshEnv {
+		if _, ok := lookup(env, key); ok {
+			errs = append(errs, fmt.Errorf("env GANTRY_%s: removed; cachemesh no longer keeps a private chunk store (see content_root)", key))
+		}
+	}
 
 	return errs
 }
@@ -345,12 +335,8 @@ func (c *Config) validateCachemesh() []error {
 		bad("metadata_ttl", "must be >= %v, got %v", MinCachemeshMetadataTTL, m.MetadataTTL)
 	}
 
-	if m.DiskCacheBytes != 0 && m.DiskCacheBytes < 2*m.ChunkSize {
-		bad("disk_cache_bytes", "must be 0 (no disk tier) or hold at least two chunks (%d), got %d", 2*m.ChunkSize, m.DiskCacheBytes)
-	}
-
-	if m.DiskCacheBytes != 0 && !filepath.IsAbs(m.ChunkDir) {
-		bad("chunk_dir", "must be an absolute path when disk_cache_bytes is set, got %q", m.ChunkDir)
+	if m.ContentRoot != "" && !filepath.IsAbs(m.ContentRoot) {
+		bad("content_root", "must be empty or an absolute path, got %q", m.ContentRoot)
 	}
 
 	if m.MemoryCacheBytes < 0 {
@@ -367,18 +353,6 @@ func (c *Config) validateCachemesh() []error {
 
 	if m.FillPages < 2 || m.FillPages > 256 {
 		bad("fill_pages", "must be between 2 and 256, got %d", m.FillPages)
-	}
-
-	switch m.PageCache {
-	case "bypass", "drop", "keep":
-	default:
-		bad("page_cache", "must be bypass, drop, or keep, got %q", m.PageCache)
-	}
-
-	switch m.Persist {
-	case "all", "shared", "owned":
-	default:
-		bad("persist", "must be all, shared, or owned, got %q", m.Persist)
 	}
 
 	if m.MaxConcurrentChunkFills < 1 {

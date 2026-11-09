@@ -28,8 +28,8 @@ func TestCachemeshDefaultsDisabled(t *testing.T) {
 	}
 
 	if m.ChunkSize != 64<<20 || m.MetadataTTL != 5*time.Minute || m.LeaseName != "gantry-cachemesh" ||
-		m.DiskCacheBytes != 20<<30 || m.MemoryCacheBytes != 512<<20 || m.ChunkDir != "/var/lib/gantry/cachemesh" ||
-		m.PageSize != 1<<20 || m.FillPages != 4 || m.InflightBytes != 2<<30 || m.PageCache != "bypass" || m.Persist != "owned" || m.MaxNeighbors != 32 || !m.CacheTags || !m.VerifyDigest || m.Lookahead != 8 {
+		m.MemoryCacheBytes != 512<<20 || m.ContentRoot != "/var/lib/containerd/io.containerd.content.v1.content" ||
+		m.PageSize != 1<<20 || m.FillPages != 4 || m.InflightBytes != 2<<30 || m.MaxNeighbors != 32 || !m.CacheTags || !m.VerifyDigest || m.Lookahead != 8 {
 		t.Fatalf("unexpected defaults: %+v", m)
 	}
 
@@ -70,16 +70,13 @@ func TestCachemeshValidateEnabled(t *testing.T) {
 		"cachemesh.lease_name":                 func(c *Config) { c.Cachemesh.LeaseName = "" },
 		"cachemesh.chunk_size":                 func(c *Config) { c.Cachemesh.ChunkSize = 3 << 20 },
 		"cachemesh.metadata_ttl":               func(c *Config) { c.Cachemesh.MetadataTTL = time.Minute },
-		"cachemesh.disk_cache_bytes":           func(c *Config) { c.Cachemesh.DiskCacheBytes = c.Cachemesh.ChunkSize },
-		"cachemesh.chunk_dir":                  func(c *Config) { c.Cachemesh.ChunkDir = "rel/dir" },
+		"cachemesh.content_root":               func(c *Config) { c.Cachemesh.ContentRoot = "rel/dir" },
 		"cachemesh.memory_cache_bytes":         func(c *Config) { c.Cachemesh.MemoryCacheBytes = -1 },
 		"cachemesh.page_size":                  func(c *Config) { c.Cachemesh.PageSize = 3 << 20 },
 		"cachemesh.page_size too small":        func(c *Config) { c.Cachemesh.PageSize = 4096 },
 		"cachemesh.page_size over chunk":       func(c *Config) { c.Cachemesh.PageSize = 2 * c.Cachemesh.ChunkSize },
 		"cachemesh.fill_pages":                 func(c *Config) { c.Cachemesh.FillPages = 1 },
 		"cachemesh.inflight_bytes":             func(c *Config) { c.Cachemesh.InflightBytes = -1 },
-		"cachemesh.page_cache":                 func(c *Config) { c.Cachemesh.PageCache = "sometimes" },
-		"cachemesh.persist":                    func(c *Config) { c.Cachemesh.Persist = "never" },
 		"cachemesh.lookahead":                  func(c *Config) { c.Cachemesh.Lookahead = 0 },
 		"cachemesh.max_neighbors":              func(c *Config) { c.Cachemesh.MaxNeighbors = -1 },
 		"cachemesh.partition_bits":             func(c *Config) { c.Cachemesh.PartitionBits = 30 },
@@ -101,14 +98,34 @@ func TestCachemeshValidateEnabled(t *testing.T) {
 	}
 }
 
-// disk_cache_bytes 0 disables the disk tier; chunk_dir is then unused.
-func TestCachemeshDiskTierOptional(t *testing.T) {
+// An empty content_root selects the containerd content API fallback.
+func TestCachemeshContentRootOptional(t *testing.T) {
 	c := cachemeshBase()
-	c.Cachemesh.DiskCacheBytes = 0
-	c.Cachemesh.ChunkDir = ""
+	c.Cachemesh.ContentRoot = ""
 
 	if err := c.Validate(); err != nil {
 		t.Fatalf("Validate: %v", err)
+	}
+}
+
+// Settings of the removed private chunk store fail instead of being
+// silently ignored.
+func TestCachemeshRemovedChunkStoreKeysRejected(t *testing.T) {
+	for _, key := range []string{"chunk_dir: /x", "disk_cache_bytes: 1", "page_cache: keep", "persist: all"} {
+		c := NewDefault()
+		if err := c.LoadYAML(strings.NewReader("cachemesh:\n  " + key + "\n")); err == nil {
+			t.Errorf("YAML %q: want unknown-field error", key)
+		}
+	}
+
+	for _, key := range removedCachemeshEnv {
+		c := NewDefault()
+		env := map[string]string{"GANTRY_" + key: "1"}
+
+		err := c.LoadEnv(func(k string) string { return env[k] })
+		if err == nil || !strings.Contains(err.Error(), key) {
+			t.Errorf("env %s: want removed error, got %v", key, err)
+		}
 	}
 }
 
@@ -155,14 +172,11 @@ cachemesh:
 		"GANTRY_CACHEMESH_ENABLED":            "false",
 		"GANTRY_CACHEMESH_CHUNK_SIZE":         "33554432",
 		"GANTRY_CACHEMESH_MAX_NEIGHBORS":      "48",
-		"GANTRY_CACHEMESH_DISK_CACHE_BYTES":   "1073741824",
 		"GANTRY_CACHEMESH_MEMORY_CACHE_BYTES": "0",
-		"GANTRY_CACHEMESH_CHUNK_DIR":          "/data/mesh",
+		"GANTRY_CACHEMESH_CONTENT_ROOT":       "/data/content",
 		"GANTRY_CACHEMESH_PAGE_SIZE":          "2097152",
 		"GANTRY_CACHEMESH_FILL_PAGES":         "8",
 		"GANTRY_CACHEMESH_INFLIGHT_BYTES":     "4096",
-		"GANTRY_CACHEMESH_PAGE_CACHE":         "drop",
-		"GANTRY_CACHEMESH_PERSIST":            "shared",
 		"GANTRY_CACHEMESH_LOOKAHEAD":          "16",
 		"GANTRY_CACHEMESH_HEDGE":              "false",
 		"GANTRY_CACHEMESH_CHUNK_TIMEOUT":      "1m",
@@ -173,9 +187,8 @@ cachemesh:
 	}
 
 	m := c.Cachemesh
-	if m.Enabled || m.ChunkSize != 32<<20 || m.MaxNeighbors != 48 || m.DiskCacheBytes != 1<<30 ||
-		m.MemoryCacheBytes != 0 || m.ChunkDir != "/data/mesh" || m.PageSize != 2<<20 || m.FillPages != 8 || m.InflightBytes != 4096 ||
-		m.PageCache != "drop" || m.Persist != "shared" ||
+	if m.Enabled || m.ChunkSize != 32<<20 || m.MaxNeighbors != 48 ||
+		m.MemoryCacheBytes != 0 || m.ContentRoot != "/data/content" || m.PageSize != 2<<20 || m.FillPages != 8 || m.InflightBytes != 4096 ||
 		m.Lookahead != 16 || m.Hedge || m.ChunkTimeout != time.Minute {
 		t.Fatalf("env not applied: %+v", m)
 	}
