@@ -57,7 +57,7 @@ func runCase(c dstCase) dstResult {
 
 	return dstResult{
 		trace: cl.Trace.Sum(), steps: cl.Sim.Steps(), cov: cov, err: err,
-		stats: fmt.Sprintf("deltas=%d net=%+v %s\n%s", cl.Stats.Get("deltas"), cl.Net.Stats(), cl.ControlStats(), dp.Summary()),
+		stats: fmt.Sprintf("deltas=%d net=%+v %s\n%s", cl.Deltas, cl.Net.Stats(), cl.ControlStats(), dp.Summary()),
 	}
 }
 

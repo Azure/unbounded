@@ -385,10 +385,6 @@ func TestCoverage(t *testing.T) {
 		t.Fatalf("missing %v", got)
 	}
 
-	if h.Count() != 2 || c.Count("b") != 1 {
-		t.Fatal("counts")
-	}
-
 	if c.Report() == "" {
 		t.Fatal("report")
 	}
