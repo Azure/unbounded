@@ -225,6 +225,41 @@ fn native_scope_within(scope: &RequestScope, limit: Duration) -> RequestScope {
 /// `scope` bounded by the RDMA page timeout of `links`, for one page's grant
 /// or write: past it the page goes over HTTP and the breaker counts a soft
 /// failure.
+/// A native (RDMA) exchange the receiver granted: its binding, verified
+/// accept head, and grant. Dropped without [`Self::take`], it releases the
+/// grant, so a request that fails or answers over HTTP before
+/// [`Transfers::send_native`] runs does not leave the receiver's grant to
+/// expire and break its link.
+pub(super) struct AdmittedNative<'a> {
+    binding: Binding,
+    accept: VerifiedHead,
+    grant: GrantRelease<'a>,
+}
+
+impl AdmittedNative<'_> {
+    /// Hand the grant to [`Transfers::send_native`], which releases it.
+    pub(super) fn take(self) -> (Binding, VerifiedHead, AuthenticatedGrant) {
+        let mut guard = self.grant;
+        let grant = guard.grant.take().expect("an admitted grant is taken once");
+        (self.binding, self.accept, grant)
+    }
+}
+
+/// Releases a peer's grant on drop unless taken.
+struct GrantRelease<'a> {
+    links: &'a crate::rdma::Links,
+    peer: NodeId,
+    grant: Option<AuthenticatedGrant>,
+}
+
+impl Drop for GrantRelease<'_> {
+    fn drop(&mut self) {
+        if let Some(grant) = self.grant.take() {
+            self.links.release(&self.peer, &grant);
+        }
+    }
+}
+
 fn page_scope(links: &crate::rdma::Links, scope: &RequestScope) -> RequestScope {
     native_scope_within(scope, links.page_timeout())
 }
@@ -425,8 +460,18 @@ impl Transfers {
             links.record_send_declined(false);
             return Ok((connection, false));
         }
-        binding.response = envelope_digest(&response.authentication)?;
-        let previous = signed_digest(&accept.signed)?;
+        let digests = envelope_digest(&response.authentication)
+            .and_then(|response| Ok((response, signed_digest(&accept.signed)?)));
+        let previous = match digests {
+            Ok((response, previous)) => {
+                binding.response = response;
+                previous
+            }
+            Err(error) => {
+                links.release(peer, &grant);
+                return Err(error);
+            }
+        };
         // An open breaker sends the body over HTTP at once instead of
         // writing over a link that recently failed.
         if links.breaker_admit(peer, binding.rail) == crate::rdma::breaker::Admit::Http {
@@ -741,10 +786,10 @@ impl Transfers {
         request: &SignedRequest,
         control: SignedHead,
         scope: &RequestScope,
-    ) -> Result<Option<(Binding, VerifiedHead, AuthenticatedGrant)>> {
-        if self.links.is_none() {
+    ) -> Result<Option<AdmittedNative<'_>>> {
+        let Some(links) = &self.links else {
             return Ok(None);
-        }
+        };
         let signatures = &self.signatures;
         let binding = Binding::parse_accept(&control)?;
         if binding.request != envelope_digest(&request.authentication)?
@@ -777,7 +822,15 @@ impl Transfers {
             scope,
         )?;
         let grant = AuthenticatedGrant::from_verified(&verified, binding.rail, binding.transfer)?;
-        Ok(Some((binding, verified, grant)))
+        Ok(Some(AdmittedNative {
+            grant: GrantRelease {
+                links,
+                peer: verified.peer.node().clone(),
+                grant: Some(grant),
+            },
+            binding,
+            accept: verified,
+        }))
     }
     async fn read_ciphertext(
         &self,
@@ -2891,6 +2944,24 @@ mod tests {
             let (_, ours) = w.a.links.ready(&peer, RailId(7)).expect("initiator ready");
             let (_, theirs) = w.b.links.ready(&local, RailId(7)).expect("responder ready");
             assert_eq!(ours, theirs);
+        }
+
+        /// An admitted grant dropped before `send_native` takes it (the
+        /// request failed, was shed, or answers over HTTP) is released, so
+        /// the receiver's grant does not expire and break its link.
+        #[test]
+        fn dropped_admitted_grant_is_released() {
+            use crate::rdma::links::tests::{grant_to_b, link_up, was_released, world};
+            let mut w = world();
+            let env = w.env.clone();
+            link_up(&env, &mut w);
+            let (pending, grant) = grant_to_b(&env, &mut w, 3);
+            drop(GrantRelease {
+                links: &w.b.links,
+                peer: w.a.links.local().clone(),
+                grant: Some(grant),
+            });
+            assert!(was_released(&mut w, &pending));
         }
 
         #[test]

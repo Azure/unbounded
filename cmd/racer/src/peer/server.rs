@@ -761,7 +761,13 @@ impl PeerServer {
                 let streaming = self.page_streaming(&response.response);
                 let (returned, sent) = self
                     .transfers
-                    .send_native(connection, &response, admitted, membership, &request_scope)
+                    .send_native(
+                        connection,
+                        &response,
+                        admitted.take(),
+                        membership,
+                        &request_scope,
+                    )
                     .await?;
                 drop(streaming);
                 connection = returned;

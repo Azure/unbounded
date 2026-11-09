@@ -172,6 +172,30 @@ pub(crate) fn receive_registered(
     }
 }
 
+/// Node A grants node B `transfer` on [`RAIL`]: the pending receive and the
+/// grant B holds.
+pub(crate) fn grant_to_b(
+    env: &racer_io::Env,
+    w: &mut World,
+    transfer: u8,
+) -> (PendingReceive, AuthenticatedGrant) {
+    let b = w.b.links.local().clone();
+    let scope = scope(env);
+    let transfer = TransferId([transfer; 16]);
+    let pending = drive!(w, w.a.links.grant(&b, RAIL, transfer, &scope)).unwrap();
+    let header = STANDARD.decode(pending.header_value()).unwrap();
+    let grant = AuthenticatedGrant::decode(&header, RAIL, transfer).unwrap();
+    (pending, grant)
+}
+
+/// Whether `pending` resolves as released once both owners run.
+pub(crate) fn was_released(w: &mut World, pending: &PendingReceive) -> bool {
+    matches!(
+        drive!(w, poll_fn(|cx| pending.arrival.poll(cx))),
+        Ok(Arrival::Released)
+    )
+}
+
 pub(crate) fn world() -> World {
     world_for([node_id(1), node_id(2)], true)
 }
