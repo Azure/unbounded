@@ -700,7 +700,7 @@ pub mod identity {
     use std::collections::{HashMap, HashSet};
     use std::{
         cell::{Cell, RefCell},
-        collections::VecDeque,
+        collections::BTreeMap,
         rc::Rc,
         sync::{
             Arc, Mutex, Weak,
@@ -950,14 +950,14 @@ pub mod identity {
 
         keys: Rc<Keyring>,
 
-        cache: Arc<Mutex<VecDeque<CachedPeer>>>,
+        cache: Arc<Mutex<PeerCache>>,
     }
 
     /// Sendable verifier state. Current epochs remain shared, not snapshotted.
     pub struct CertificateVerifier {
         cluster: ClusterId,
         keys: Keyring,
-        cache: Arc<Mutex<VecDeque<CachedPeer>>>,
+        cache: Arc<Mutex<PeerCache>>,
     }
 
     impl CertificateVerifier {
@@ -1166,6 +1166,73 @@ pub mod identity {
         checked: u64,
     }
 
+    /// Validated chains kept per worker. Sized above the topology's largest
+    /// peer sets (FULL_MESH_MAX and RDMA_PEERS, 256 each in racer-topology,
+    /// which crypto must not depend on) so steady-state signers stay cached.
+    const PEER_CACHE_CAPACITY: usize = 512;
+
+    /// Least-recently-used validated chains with O(log n) lookup and eviction.
+    #[derive(Default)]
+    struct PeerCache {
+        entries: HashMap<[u8; 32], (CachedPeer, u64)>,
+
+        order: BTreeMap<u64, [u8; 32]>,
+
+        tick: u64,
+
+        #[cfg(test)]
+        hits: u64,
+    }
+
+    impl PeerCache {
+        /// Return a still-valid key and mark it most recently used. Entries
+        /// for stale roots or time are dropped on sight.
+        fn get(
+            &mut self,
+            fingerprint: &[u8; 32],
+            expected: &NodeId,
+            roots: &Arc<Vec<Vec<u8>>>,
+            now: u64,
+        ) -> Option<VerifyingKey> {
+            let (entry, used) = self.entries.get_mut(fingerprint)?;
+            if !Arc::ptr_eq(&entry.roots, roots) || now < entry.checked || now >= entry.until {
+                let used = *used;
+                self.entries.remove(fingerprint);
+                self.order.remove(&used);
+                return None;
+            }
+            if &entry.node != expected {
+                return None;
+            }
+            let key = entry.key;
+            self.order.remove(used);
+            self.tick += 1;
+            *used = self.tick;
+            self.order.insert(self.tick, *fingerprint);
+            #[cfg(test)]
+            {
+                self.hits += 1;
+            }
+            Some(key)
+        }
+
+        /// Insert or replace an entry, evicting the least recently used.
+        fn insert(&mut self, peer: CachedPeer) {
+            if let Some((_, used)) = self.entries.remove(&peer.fingerprint) {
+                self.order.remove(&used);
+            }
+            while self.entries.len() >= PEER_CACHE_CAPACITY {
+                let Some((_, oldest)) = self.order.pop_first() else {
+                    break;
+                };
+                self.entries.remove(&oldest);
+            }
+            self.tick += 1;
+            self.order.insert(self.tick, peer.fingerprint);
+            self.entries.insert(peer.fingerprint, (peer, self.tick));
+        }
+    }
+
     /// Length-prefixed digest of an exact chain for the validation cache.
     fn chain_fingerprint(chain: &[Vec<u8>]) -> [u8; 32] {
         let mut hash = Sha256::new();
@@ -1190,7 +1257,7 @@ pub mod identity {
             Self {
                 cluster,
                 keys,
-                cache: Arc::new(Mutex::new(VecDeque::new())),
+                cache: Arc::new(Mutex::new(PeerCache::default())),
             }
         }
 
@@ -1216,23 +1283,13 @@ pub mod identity {
             let clock = self.keys.epochs.clock();
             let now = clock.unix_time().as_secs();
             let mut cache = self.cache.lock().map_err(|_| Error::Unavailable)?;
-            cache.retain(|entry| {
-                Arc::ptr_eq(&entry.roots, &roots) && now >= entry.checked && now < entry.until
-            });
-            if let Some(entry) = cache
-                .iter()
-                .find(|entry| &entry.node == expected && &entry.fingerprint == fingerprint)
-            {
-                return Ok(entry.key);
+            if let Some(key) = cache.get(fingerprint, expected, &roots, now) {
+                return Ok(key);
             }
             drop(cache);
             let verified = verify_chain(clock, &roots, chain, &self.cluster, expected)?;
             let mut cache = self.cache.lock().map_err(|_| Error::Unavailable)?;
-            // At most 64 validated chain fingerprints.
-            if cache.len() == 64 {
-                cache.pop_front();
-            }
-            cache.push_back(CachedPeer {
+            cache.insert(CachedPeer {
                 roots,
                 fingerprint: *fingerprint,
                 node: expected.clone(),
@@ -2481,6 +2538,51 @@ pub mod identity {
             let (_, _, replacement) = issued();
             keys.install(bundle(2, replacement)).unwrap();
             assert!(certs.verify(&chain, &node).is_err());
+        }
+
+        /// More active signers than the old 64-entry cache still hit after
+        /// warmup, and LRU keeps a hot entry while cold ones rotate out.
+        #[test]
+        fn peer_cache_holds_full_mesh_and_evicts_least_recent() {
+            let roots = Arc::new(vec![vec![1u8]]);
+            let key = crate::SigningKey::from_seed(&[7; 32]).verifying_key();
+            let node = NodeId(NODE.into());
+            let peer = |i: u32| {
+                let mut fingerprint = [0u8; 32];
+                fingerprint[..4].copy_from_slice(&i.to_be_bytes());
+                CachedPeer {
+                    roots: roots.clone(),
+                    fingerprint,
+                    node: node.clone(),
+                    key,
+                    until: 100,
+                    checked: 1,
+                }
+            };
+            let mut cache = PeerCache::default();
+            let signers = 257u32;
+            for i in 0..signers {
+                cache.insert(peer(i));
+            }
+            for _ in 0..3 {
+                for i in 0..signers {
+                    let p = peer(i);
+                    assert!(cache.get(&p.fingerprint, &node, &roots, 2).is_some());
+                }
+            }
+            assert_eq!(cache.hits, 3 * u64::from(signers));
+            let mut cache = PeerCache::default();
+            let hot = peer(u32::MAX);
+            cache.insert(peer(u32::MAX));
+            for i in 0..(PEER_CACHE_CAPACITY as u32 * 3) {
+                cache.insert(peer(i));
+                assert!(cache.get(&hot.fingerprint, &node, &roots, 2).is_some());
+            }
+            assert_eq!(cache.entries.len(), PEER_CACHE_CAPACITY);
+            assert_eq!(cache.order.len(), PEER_CACHE_CAPACITY);
+            assert!(cache.get(&peer(0).fingerprint, &node, &roots, 2).is_none());
+            assert!(cache.get(&hot.fingerprint, &node, &roots, 100).is_none());
+            assert!(!cache.entries.contains_key(&hot.fingerprint));
         }
 
         /// Reject alternate spellings that could alias a canonical node identity.
