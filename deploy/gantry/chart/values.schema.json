@@ -290,9 +290,32 @@
               "type": "integer",
               "minimum": 0
             },
-            "chunkCacheBytes": {
+            "diskCacheBytes": {
               "type": "integer",
               "minimum": 0
+            },
+            "chunkDirSizeLimit": {
+              "type": "string"
+            },
+            "memoryCacheBytes": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "pageSize": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "fillPages": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "pageCache": {
+              "type": "string",
+              "enum": ["", "bypass", "drop", "keep"]
+            },
+            "persist": {
+              "type": "string",
+              "enum": ["", "all", "shared"]
             },
             "lookahead": {
               "type": "integer",

@@ -136,6 +136,10 @@ spec:
               mountPath: /tmp
             - name: containerd-runtime
               mountPath: {{ .Values.containerd.mountPath }}
+            {{- if and .Values.gantry.cachemesh .Values.gantry.cachemesh.enabled }}
+            - name: cachemesh-chunks
+              mountPath: /var/lib/gantry/cachemesh
+            {{- end }}
       volumes:
         - name: libp2p
           hostPath:
@@ -154,3 +158,14 @@ spec:
           hostPath:
             path: {{ .Values.containerd.hostPath }}
             type: Directory
+        {{- if and .Values.gantry.cachemesh .Values.gantry.cachemesh.enabled }}
+        # cachemesh chunk files. An emptyDir is writable by the non-root
+        # agent and is removed with the pod, so no chunk outlives it.
+        - name: cachemesh-chunks
+          emptyDir:
+            {{- with .Values.gantry.cachemesh.chunkDirSizeLimit }}
+            sizeLimit: {{ . }}
+            {{- else }}
+            {}
+            {{- end }}
+        {{- end }}
