@@ -97,14 +97,33 @@ func planDataplaneConfig(ctx context.Context, env *component.Env, plan *componen
 	// old keys through envFrom. The patch carries the observed
 	// resourceVersion, so a concurrent edit conflicts and the pass retries.
 	if migrated, changed := migrateRetiredSettings(config.Data); changed {
+		observed := config.Data
+
 		if err := validateDataplaneConfig(migrated); err != nil {
 			return nil, err
 		}
 
-		base := component.ToUnstructured(config.DeepCopy())
 		config.Data = migrated
+		ref := component.RefOf(component.ToUnstructured(config))
 
-		plan.Add(component.Operation{Kind: component.OpMergePatch, Object: component.ToUnstructured(config), Base: base, Component: name})
+		// Legacy migration may already patch this ConfigMap from the same
+		// resourceVersion to drop its stamp. Fold the data into that patch,
+		// since a second patch from the same version would conflict.
+		for i := range plan.Operations {
+			op := &plan.Operations[i]
+			if op.Kind == component.OpMergePatch && op.Ref() == ref {
+				if err := unstructured.SetNestedStringMap(op.Object.Object, migrated, "data"); err != nil {
+					return nil, err
+				}
+
+				return config, nil
+			}
+		}
+
+		base := config.DeepCopy()
+		base.Data = observed
+
+		plan.Add(component.Operation{Kind: component.OpMergePatch, Object: component.ToUnstructured(config), Base: component.ToUnstructured(base), Component: name})
 
 		return config, nil
 	}
@@ -155,10 +174,23 @@ func planDataplane(ctx context.Context, env *component.Env, plan *component.Plan
 	// Explicit env wiring wins over these imports.
 	container.EnvFrom = []corev1.EnvFromSource{{ConfigMapRef: &corev1.ConfigMapEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: dataplaneConfigName}}}}
 
+	dependsOn := append(append([]component.ObjectRef(nil), dependencies...), op.Ref())
+
+	// The Pod template hash covers the migrated payload, so roll Pods only
+	// after the ConfigMap patch that writes it lands.
+	configRef := component.RefOf(component.ToUnstructured(config))
+	for _, planned := range plan.Operations {
+		if planned.Kind == component.OpMergePatch && planned.Ref() == configRef {
+			dependsOn = append(dependsOn, configRef)
+
+			break
+		}
+	}
+
 	op, err = ownedOperation(ctx, env, component.Operation{
 		Kind: component.OpApply, Object: component.ToUnstructured(ds), Component: name,
 		Overridable: true, ValidateOverride: ValidateDataplaneOverride,
-		DependsOn: append(append([]component.ObjectRef(nil), dependencies...), op.Ref()),
+		DependsOn: dependsOn,
 	})
 	if err != nil {
 		return err

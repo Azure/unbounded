@@ -156,7 +156,11 @@ func validateDataplaneConfig(data map[string]string) error {
 		setting, known := dataplaneSettings[key]
 		if !known {
 			if retired, ok := retiredSettings[key]; ok {
-				add(key, "is retired; set "+retired.replacement+" instead (check its units and default before copying the value)")
+				if _, conflict := data[retired.replacement]; conflict && retired.rename {
+					add(key, "is retired and conflicts with "+retired.replacement+"; remove one of them")
+				} else {
+					add(key, "is retired; set "+retired.replacement+" instead")
+				}
 
 				continue
 			}
@@ -227,57 +231,94 @@ func dataplaneDecimal(value string) (uint64, bool) {
 // retiredSetting describes a RACER_* key that an earlier release accepted
 // and the current dataplane rejects at startup.
 type retiredSetting struct {
-	// replacement names the key that took over, for error messages.
+	// replacement names the key that took over, or how to replace the
+	// setting when no key did, for error messages.
 	replacement string
 
-	// shippedDefault is the value the earlier racer-settings template wrote,
-	// or empty when the template never wrote the key.
-	shippedDefault string
+	// rename marks a key whose replacement has the same meaning and units,
+	// so migration moves the value to the replacement key unchanged.
+	rename bool
+
+	// drop marks a key that never had an effect, so migration deletes it.
+	drop bool
 }
 
 // retiredSettings lists retired keys an administrator or an earlier template
 // may have left in racer-settings (see the rename table in cmd/racer/README.md).
 //
-// The budget keys are not renamed automatically: the old keys were node-wide
-// totals, while their replacements are per-worker amounts multiplied by the
-// worker count, so copying a value would silently change its meaning. Only a
-// value equal to what the earlier template shipped is migrated, by dropping
-// it so the new default applies; that default replaced the old one. Any other
-// value fails validation with a message naming the replacement, so the
-// administrator chooses the new value.
+// The budget renames keep their meaning: the old keys were already
+// per-worker amounts (each I/O worker had its own slab of RACER_SLAB_BYTES,
+// for example), so migration carries the value over to the _PER_WORKER key.
+// Dropping them instead would fall back to the new defaults, which differ
+// (RACER_SLAB_BYTES_PER_WORKER defaults to 16 GiB, the old template shipped
+// 1 GiB). The other renames are the same setting under a new name.
+//
+// The RACER_WARM_* keys were seeded by earlier templates but no released
+// dataplane read them, so migration drops them.
+//
+// RACER_PEER_PORT has no replacement key: the published port is now the
+// port of RACER_PEER_LISTEN, so the administrator must move it by hand.
 var retiredSettings = map[string]retiredSetting{
-	"RACER_SLAB_BYTES":                   {replacement: "RACER_SLAB_BYTES_PER_WORKER", shippedDefault: "1073741824"},
-	"RACER_FREE_SEGMENT_RESERVE":         {replacement: "RACER_FREE_SEGMENT_RESERVE_PER_WORKER", shippedDefault: "2"},
-	"RACER_ACTIVE_PATH_SEARCHES":         {replacement: "RACER_ACTIVE_PATH_SEARCHES_PER_WORKER"},
-	"RACER_CONNECTIONS_PER_NEIGHBOR":     {replacement: "RACER_NEIGHBOR_CONNECTIONS_PER_WORKER"},
-	"RACER_ORIGIN_CONNECTIONS_PER_CACHE": {replacement: "RACER_CACHE_ORIGIN_CONNECTIONS_PER_WORKER"},
-	"RACER_SEND_CRC_PAIR":                {replacement: "RACER_SEND_TAG_PAIR"},
+	"RACER_SLAB_BYTES":                   {replacement: "RACER_SLAB_BYTES_PER_WORKER", rename: true},
+	"RACER_FREE_SEGMENT_RESERVE":         {replacement: "RACER_FREE_SEGMENT_RESERVE_PER_WORKER", rename: true},
+	"RACER_ACTIVE_PATH_SEARCHES":         {replacement: "RACER_ACTIVE_PATH_SEARCHES_PER_WORKER", rename: true},
+	"RACER_CONNECTIONS_PER_NEIGHBOR":     {replacement: "RACER_NEIGHBOR_CONNECTIONS_PER_WORKER", rename: true},
+	"RACER_ORIGIN_CONNECTIONS_PER_CACHE": {replacement: "RACER_CACHE_ORIGIN_CONNECTIONS_PER_WORKER", rename: true},
+	"RACER_SEND_CRC_PAIR":                {replacement: "RACER_SEND_TAG_PAIR", rename: true},
+	"RACER_TRUST_BUNDLE":                 {replacement: "RACER_CONTROL_TRUST_BUNDLE", rename: true},
+	"RACER_SERVICE_ACCOUNT_TOKEN":        {replacement: "RACER_CONTROL_TOKEN", rename: true},
+	"RACER_API_CA":                       {replacement: "RACER_KUBE_API_CA", rename: true},
+	"RACER_API_TOKEN":                    {replacement: "RACER_KUBE_API_TOKEN", rename: true},
+	"RACER_PEER_PORT":                    {replacement: "the port of RACER_PEER_LISTEN"},
+	"RACER_WARM_MAX_TTL_SECS":            {replacement: "nothing (it had no effect)", drop: true},
+	"RACER_WARM_FILL_TIMEOUT_SECS":       {replacement: "nothing (it had no effect)", drop: true},
+	"RACER_WARM_MAX_JOBS":                {replacement: "nothing (it had no effect)", drop: true},
+	"RACER_WARM_WINDOW_PAGES":            {replacement: "nothing (it had no effect)", drop: true},
 }
 
-// migrateRetiredSettings returns data without retired keys that still hold
-// the earlier template's default, and whether it removed any. The input is
-// not modified. Other retired keys are kept so validation reports them.
+// migrateRetiredSettings returns data with retired keys migrated, and
+// whether it changed anything. The input is not modified. A renamed key
+// moves its value to the replacement; when the replacement is already set
+// to the same value the old key is dropped, and when it is set to a
+// different value both are kept so validation reports the conflict rather
+// than silently picking one. Keys that never had an effect are dropped.
+// Keys without an automatic migration are kept so validation reports them.
 func migrateRetiredSettings(data map[string]string) (map[string]string, bool) {
-	changed := false
+	var out map[string]string
 
-	for key, retired := range retiredSettings {
-		if value, ok := data[key]; ok && retired.shippedDefault != "" && value == retired.shippedDefault {
-			changed = true
+	clone := func() {
+		if out == nil {
+			out = make(map[string]string, len(data))
+			for key, value := range data {
+				out[key] = value
+			}
 		}
 	}
 
-	if !changed {
-		return data, false
-	}
-
-	out := make(map[string]string, len(data))
-
-	for key, value := range data {
-		if retired, ok := retiredSettings[key]; ok && retired.shippedDefault != "" && value == retired.shippedDefault {
+	for key, retired := range retiredSettings {
+		value, ok := data[key]
+		if !ok {
 			continue
 		}
 
-		out[key] = value
+		switch {
+		case retired.drop:
+			clone()
+			delete(out, key)
+		case retired.rename:
+			existing, set := data[retired.replacement]
+			if set && existing != value {
+				continue
+			}
+
+			clone()
+			delete(out, key)
+			out[retired.replacement] = value
+		}
+	}
+
+	if out == nil {
+		return data, false
 	}
 
 	return out, true
