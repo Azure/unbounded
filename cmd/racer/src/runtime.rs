@@ -516,7 +516,10 @@ mod tests {
                 let mut scope =
                     RequestScope::untimed(RequestId([3; 16]), clock.clone().into()).unwrap();
                 let deadline = scope.clock().now() + Duration::from_secs(5);
-                assert_eq!(scope.child(scope.request, deadline).unwrap().reader_numa, None);
+                assert_eq!(
+                    scope.child(scope.request, deadline).unwrap().reader_numa,
+                    None
+                );
                 scope.reader_numa = Some(1);
                 scope.ahead = true;
                 let child = scope.child(RequestId([4; 16]), deadline).unwrap();
