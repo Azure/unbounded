@@ -796,11 +796,22 @@ func (t *HealthTracker) tryEject(p *healthPeer, from uint32, reason Reason) bool
 
 // Observe records the result and latency of a request to slot. Hot path.
 func (t *HealthTracker) Observe(slot uint32, r Result, latency time.Duration) {
-	p := t.tab.Load().lookup(slot)
-	if p == nil {
-		return
+	if p := t.tab.Load().lookup(slot); p != nil {
+		t.observe(p, r, latency)
 	}
+}
 
+// ObserveKey is Observe for a request to the member with key at slot. The
+// observation is dropped when slot is now tracked for a different key, so a
+// late result for a request to a slot's previous occupant does not affect
+// the member that reused the slot. Hot path.
+func (t *HealthTracker) ObserveKey(slot uint32, key uint64, r Result, latency time.Duration) {
+	if p := t.tab.Load().lookup(slot); p != nil && p.key == key {
+		t.observe(p, r, latency)
+	}
+}
+
+func (t *HealthTracker) observe(p *healthPeer, r Result, latency time.Duration) {
 	if r == Overload {
 		until := t.now.Load() + int64(t.cfg.BusyFor)
 		p.busyUntil.Store(until)

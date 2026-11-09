@@ -53,7 +53,7 @@ func (m *Mesh) Forward(h Header) (d Decision, err error) {
 // breakers, outlier detection, and latency tracking. Report every request
 // sent to a peer from a Decision, including hedges.
 func (m *Mesh) Observe(p PeerRef, r Result, latency time.Duration) {
-	m.health.Observe(p.Slot, r, latency)
+	m.health.ObserveKey(uint32(p.Slot), p.Key, r, latency)
 }
 
 // TryHedge reports whether a hedge of the request carrying h fits the hedge

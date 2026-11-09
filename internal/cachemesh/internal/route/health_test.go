@@ -701,6 +701,47 @@ func TestConcurrentHotAndControl(t *testing.T) {
 	}
 }
 
+// TestObserveKeyIgnoresReusedSlot checks that a late result for a request
+// to a slot's previous occupant does not affect the member that reused it.
+func TestObserveKeyIgnoresReusedSlot(t *testing.T) {
+	tr := newT(HealthConfig{})
+	trackN(tr, 20, 4)
+	tr.Tick(0)
+
+	// Slot 1 is reused by a new member; late failures for the old key are
+	// dropped.
+	tr.Track(1, 7, 0)
+
+	for range 10 {
+		tr.ObserveKey(1, 1001, Failure, time.Millisecond)
+	}
+
+	if tr.Usable(1) != Healthy {
+		t.Fatal("late failures for the old key ejected the replacement")
+	}
+
+	// The replacement is ejected by its own failures, and late successes for
+	// the old key do not close its breaker.
+	for range 5 {
+		tr.ObserveKey(1, 7, Failure, time.Millisecond)
+	}
+
+	if tr.Usable(1) != Unusable {
+		t.Fatal("failures for the current key did not eject")
+	}
+
+	for range 10 {
+		tr.ObserveKey(1, 1001, Success, time.Millisecond)
+	}
+
+	if tr.Usable(1) != Unusable {
+		t.Fatal("late successes for the old key restored the replacement")
+	}
+
+	// Untracked slots are ignored.
+	tr.ObserveKey(99, 0, Failure, time.Millisecond)
+}
+
 func TestSyncReplacesTrackedSet(t *testing.T) {
 	tr := newT(HealthConfig{})
 	trackN(tr, 20, 4)
