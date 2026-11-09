@@ -142,6 +142,7 @@ func Example() {
 			}),
 			Logger:        slog.New(slog.DiscardHandler),
 			PartitionBits: 12,
+			ExpectedSize:  1,            // a tiny cluster: bootstrap at once
 			Tuning:        fastTuning(), // short timers for the example
 		})
 		if err != nil {

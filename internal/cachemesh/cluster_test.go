@@ -40,16 +40,11 @@ func fastTuning() cachemesh.Tuning {
 			LotteryRound:       100 * time.Millisecond,
 			ClockSkewAllowance: 100 * time.Millisecond,
 			MinCandidateAge:    300 * time.Millisecond,
-			// Tiny clusters bootstrap through the lottery; a small
-			// expected size makes every round eligible.
-			ExpectedClusterSize: 1,
 		},
-		Leader: cachemesh.LeaderTuning{
-			QuarantineFor:   100 * time.Millisecond,
-			WarmupStep:      100 * time.Millisecond,
-			DrainFor:        300 * time.Millisecond,
-			SuspicionWindow: 3 * time.Second,
-		},
+		QuarantineFor:   100 * time.Millisecond,
+		WarmupStep:      100 * time.Millisecond,
+		DrainFor:        300 * time.Millisecond,
+		SuspicionWindow: 3 * time.Second,
 	}
 }
 
@@ -130,7 +125,7 @@ func newCluster(t *testing.T, n int) *cluster {
 		m, err := cachemesh.New(cachemesh.Config{
 			ID: addr, Addr: addr, Transport: c.net.Transport(addr), Seeds: seeds,
 			Lease: c.lease, Neighbors: nb, Logger: logger,
-			PartitionBits: 12, EpochPeriod: epochPeriod, Tuning: fastTuning(),
+			PartitionBits: 12, EpochPeriod: epochPeriod, ExpectedSize: 1, Tuning: fastTuning(),
 		})
 		if err != nil {
 			t.Fatal(err)

@@ -536,7 +536,7 @@ func (r *fuzzReader) message() []byte {
 func fuzzNode(state byte) (*Node, *memLease, int64) {
 	l := &memLease{}
 	now := 1000 * sec
-	cfg := Config{PartitionBits: 10, Elect: ElectionConfig{ExpectedClusterSize: 10}, DeltaLogSize: 32}
+	cfg := Config{PartitionBits: 10, ExpectedSize: 10, Tuning: Tuning{DeltaLogSize: 32}}
 
 	switch state % 3 {
 	case 0:

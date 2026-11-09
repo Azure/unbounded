@@ -212,7 +212,7 @@ type electHarness struct {
 func newElectHarness(t *testing.T, s *memStore, i int) *electHarness {
 	t.Helper()
 
-	h := &electHarness{t: t, s: s, e: NewElector(ElectionConfig{ExpectedClusterSize: 1}, self(i), newRNG(uint64(i)))}
+	h := &electHarness{t: t, s: s, e: NewElector(ElectionConfig{expectedSize: 1}, self(i), newRNG(uint64(i)))}
 	h.e.SetHooks(ElectorHooks{OnOp: func(OpKind) { h.ops++ }})
 	h.in = Input{Wall: epoch, HaveView: true, ClusterSize: 10, IsCandidate: true}
 
@@ -649,7 +649,7 @@ func TestLotteryBudget(t *testing.T) {
 	total := 0
 
 	for i := range n {
-		e := NewElector(ElectionConfig{ExpectedClusterSize: n}, self(i), newRNG(uint64(i)))
+		e := NewElector(ElectionConfig{expectedSize: n}, self(i), newRNG(uint64(i)))
 		e.SetHooks(ElectorHooks{OnOp: func(OpKind) { total++ }})
 
 		in := Input{Wall: epoch}
@@ -901,7 +901,7 @@ func TestLotteryZeroClusterSize(t *testing.T) {
 	total := 0
 
 	for i := range n {
-		e := NewElector(ElectionConfig{ExpectedClusterSize: n}, self(i), newRNG(uint64(i)))
+		e := NewElector(ElectionConfig{expectedSize: n}, self(i), newRNG(uint64(i)))
 		in := Input{Wall: epoch, HaveView: true, ClusterSize: 0}
 
 		e.SetHooks(ElectorHooks{OnOp: func(OpKind) {
@@ -1063,7 +1063,7 @@ func TestReleaseCarriesObservedTerm(t *testing.T) {
 }
 
 // TestLotteryNFloor: a member whose view is far smaller than the cluster
-// still uses ExpectedClusterSize for N, so a small lineage cannot make
+// still uses expectedSize for N, so a small lineage cannot make
 // every member read every round.
 func TestLotteryNFloor(t *testing.T) {
 	t.Parallel()
@@ -1074,7 +1074,7 @@ func TestLotteryNFloor(t *testing.T) {
 		s := &memStore{}
 		s.store(Record{Holder: "other", Incarnation: 1, Term: 9, RenewTime: epoch.Add(time.Hour), LeaseDuration: time.Hour})
 
-		e := NewElector(ElectionConfig{ExpectedClusterSize: 1000}, self(i), newRNG(uint64(i)))
+		e := NewElector(ElectionConfig{expectedSize: 1000}, self(i), newRNG(uint64(i)))
 		in := Input{Wall: epoch, HaveView: true, ClusterSize: 5, ViewTerm: 9}
 
 		for r := range 200 {

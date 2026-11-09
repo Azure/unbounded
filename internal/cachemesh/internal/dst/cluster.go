@@ -367,14 +367,12 @@ func (c *Cluster) OnStart(i uint32, inc uint64) {
 
 	cfg := control.Config{
 		ID: memberID(i), Incarnation: m.inc, Addr: m.addr, Zone: "z" + strconv.Itoa(int(i%3)),
-		PartitionBits: c.sc.PartitionBits,
-		Elect:         control.ElectionConfig{ExpectedClusterSize: c.sc.Members},
-		Leader:        c.leaderConfig(control.Joiner{}, 0),
-		Shared:        c.shared,
-		Hooks:         c.hooks(m),
+		PartitionBits: c.sc.PartitionBits, CellSize: c.sc.CellSize, MaxNeighbors: c.sc.MaxNeighbors,
+		ExpectedSize: c.sc.Members,
+		Tuning:       control.Tuning{DeltaLogSize: c.sc.DeltaLogSize},
+		Shared:       c.shared,
+		Hooks:        c.hooks(m),
 	}
-	cfg.Leader.MaxJoinsPerTick, cfg.Leader.MaxPending = 0, 0
-	cfg.DeltaLogSize = c.sc.DeltaLogSize
 
 	if c.initial != nil && m.inc == 1 {
 		cfg.Initial = c.initial
@@ -998,7 +996,7 @@ const (
 	// lossPeakPerSecond bounds elector Lease calls in any one second once a
 	// cluster exists. During leader loss each lottery round admits about
 	// Binomial(N, Budget/N) members (mean LotteryBudgetQPS, N at least
-	// ExpectedClusterSize), each making one read and, if the Lease is
+	// ExpectedSize), each making one read and, if the Lease is
 	// expired, one acquiring write at its next tick, so one second can hold
 	// a round's reads and the previous round's writes: mean
 	// 2*LotteryBudgetQPS, standard deviation about sqrt(2*Budget) (6.3).

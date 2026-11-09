@@ -164,10 +164,7 @@ func Example_httpTransport() {
 // exampleTuning shortens the timers so examples finish quickly. Production
 // code leaves Tuning zero.
 func exampleTuning() cachemesh.Tuning {
-	t := fastTuning()
-	t.Election.ExpectedClusterSize = 0 // use Config.ExpectedSize
-
-	return t
+	return fastTuning()
 }
 
 func waitUntil(f func() bool) {

@@ -139,11 +139,10 @@ type ElectionConfig struct {
 	// MinCandidateAge is how long a member must have been admitted before it
 	// can be a candidate. The caller applies it. Default 60s.
 	MinCandidateAge time.Duration
-	// ExpectedClusterSize is the least N for the lottery (see Tick). Set it
-	// near the real cluster size: smaller values let more members read per
-	// round, larger ones slow the lottery down.
-	// Default 1000.
-	ExpectedClusterSize int
+
+	// expectedSize is the least N for the lottery (see Tick). The Node sets
+	// it from Config.ExpectedSize. Default 1000.
+	expectedSize int
 }
 
 // Defaults.
@@ -159,7 +158,7 @@ const (
 	DefaultClockSkewAllowance    = 5 * time.Second
 	DefaultCandidates            = 3
 	DefaultMinCandidateAge       = 60 * time.Second
-	DefaultExpectedClusterSize   = 1000
+	DefaultExpectedSize          = 1000
 )
 
 // WithDefaults returns c with zero fields replaced by defaults.
@@ -187,7 +186,7 @@ func (c ElectionConfig) WithDefaults() ElectionConfig {
 	setDur(&c.ClockSkewAllowance, DefaultClockSkewAllowance)
 	setInt(&c.Candidates, DefaultCandidates)
 	setDur(&c.MinCandidateAge, DefaultMinCandidateAge)
-	setInt(&c.ExpectedClusterSize, DefaultExpectedClusterSize)
+	setInt(&c.expectedSize, DefaultExpectedSize)
 
 	return c
 }
@@ -204,7 +203,7 @@ func (c ElectionConfig) Validate() error {
 		return errors.New("elect: RenewDeadline must be less than LeaseDuration")
 	case c.RetryPeriod*6/5 >= c.RenewDeadline:
 		return errors.New("elect: RetryPeriod*1.2 must be less than RenewDeadline")
-	case c.LotteryBudgetQPS < 0 || c.Candidates < 0 || c.ExpectedClusterSize < 0:
+	case c.LotteryBudgetQPS < 0 || c.Candidates < 0 || c.expectedSize < 0:
 		return errors.New("elect: counts must not be negative")
 	case c.RetryJitterPercent > 100 || c.NoLeaderJitterPercent > 100:
 		return errors.New("elect: jitter percentages must be at most 100")
@@ -261,7 +260,7 @@ type Input struct {
 	// HaveView reports whether the member has a view.
 	HaveView bool
 	// ClusterSize is the member count of the view. The lottery uses the
-	// larger of it and Config.ExpectedClusterSize.
+	// larger of it and Config.ExpectedSize.
 	ClusterSize int
 	// IsCandidate reports whether the member is a candidate in its view
 	// (see TopCandidates).
@@ -594,12 +593,12 @@ func (e *Elector) Tick(in Input) []Op {
 
 		e.lastRound, e.roundDone = round, true
 
-		// N is the larger of the view's size and ExpectedClusterSize. A
+		// N is the larger of the view's size and expectedSize. A
 		// view can be far smaller than the cluster (a fresh lineage after
 		// a cold restart or a partition, a member that missed joins), and
 		// with N from it alone every member of such a view would read every
 		// round.
-		n := e.cfg.ExpectedClusterSize
+		n := e.cfg.expectedSize
 		if in.HaveView {
 			n = max(n, in.ClusterSize)
 		}
@@ -1150,7 +1149,7 @@ func (n *Node) topCandidates(ep uint64) []uint64 {
 		per = n.cfg.EpochPeriod
 	}
 
-	minAge := uint64(n.cfg.Elect.MinCandidateAge / per)
+	minAge := uint64(n.cfg.Election.MinCandidateAge / per)
 
 	var keys []uint64
 
@@ -1162,7 +1161,7 @@ func (n *Node) topCandidates(ep uint64) []uint64 {
 		return true
 	})
 
-	top := TopCandidates(LeaseSeed, keys, n.cfg.Elect.Candidates)
+	top := TopCandidates(LeaseSeed, keys, n.cfg.Election.Candidates)
 
 	if s := n.shared; s != nil {
 		s.cand.Put(k, top)

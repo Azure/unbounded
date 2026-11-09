@@ -109,20 +109,15 @@ func leaderOf(t *testing.T, net *memtransport.Network, lease cachemesh.LeaseStor
 		cfg.Tuning = fastTuning()
 	}
 
+	if cfg.ExpectedSize == 0 {
+		cfg.ExpectedSize = 1
+	}
+
 	r := start(t, cfg)
 	net.Register(cfg.Addr, r.m.ServeControl)
 	eventually(t, "bootstrap", 10*time.Second, func() bool { return r.m.Leading() && r.m.Ready() })
 
 	return r
-}
-
-// smallTuning is fastTuning with the lottery floor left at its default, so
-// tests can set it through Config.ExpectedSize.
-func smallTuning() cachemesh.Tuning {
-	tu := fastTuning()
-	tu.Election.ExpectedClusterSize = 0
-
-	return tu
 }
 
 func TestExpectedSizeBootstrapsQuickly(t *testing.T) {
@@ -132,7 +127,7 @@ func TestExpectedSizeBootstrapsQuickly(t *testing.T) {
 	// LotteryRound is 100ms: with ExpectedSize 2 every round is eligible,
 	// so the lone member bootstraps within a few rounds.
 	began := time.Now()
-	r := leaderOf(t, net, lease, cachemesh.Config{ExpectedSize: 2, Tuning: smallTuning()})
+	r := leaderOf(t, net, lease, cachemesh.Config{ExpectedSize: 2, Tuning: fastTuning()})
 
 	if d := time.Since(began); d > 3*time.Second {
 		t.Fatalf("bootstrap took %v", d)
@@ -152,19 +147,6 @@ func TestExpectedSizeValidation(t *testing.T) {
 	if _, err := cachemesh.New(cfg); err == nil {
 		t.Fatal("negative ExpectedSize accepted")
 	}
-
-	cfg = base
-	cfg.ExpectedSize = 5
-	cfg.Tuning.Election.ExpectedClusterSize = 6
-
-	if _, err := cachemesh.New(cfg); err == nil {
-		t.Fatal("conflicting sizes accepted")
-	}
-
-	cfg.Tuning.Election.ExpectedClusterSize = 5
-	if _, err := cachemesh.New(cfg); err != nil {
-		t.Fatalf("equal sizes rejected: %v", err)
-	}
 }
 
 func TestLeaseSeedsAreGateways(t *testing.T) {
@@ -178,7 +160,7 @@ func TestLeaseSeedsAreGateways(t *testing.T) {
 	g := &gate{inner: net.Transport("joiner")}
 	j := start(t, cachemesh.Config{
 		ID: "joiner", Addr: "joiner", Transport: g, Lease: lease,
-		PartitionBits: 12, Tuning: fastTuning(),
+		PartitionBits: 12, ExpectedSize: 1, Tuning: fastTuning(),
 	})
 	net.Register("joiner", j.m.ServeControl)
 
@@ -228,7 +210,7 @@ func TestInvalidate(t *testing.T) {
 		g := &gate{inner: net.Transport("f")}
 		f := start(t, cachemesh.Config{
 			ID: "f", Addr: "f", Transport: g, Seeds: []string{"leader"},
-			PartitionBits: 12, Tuning: fastTuning(),
+			PartitionBits: 12, ExpectedSize: 1, Tuning: fastTuning(),
 		})
 		net.Register("f", f.m.ServeControl)
 		g.open.Store(true)
@@ -289,7 +271,7 @@ func TestInvalidate(t *testing.T) {
 	t.Run("Bounded", func(t *testing.T) {
 		r := start(t, cachemesh.Config{
 			ID: "lonely", Addr: "lonely", Transport: &blockingTransport{}, Seeds: []string{"nowhere"},
-			Tuning: fastTuning(),
+			ExpectedSize: 1, Tuning: fastTuning(),
 		})
 		eventually(t, "running", 5*time.Second, func() bool {
 			_, err := r.m.ServeControl(context.Background(), "x", nil)
@@ -354,7 +336,7 @@ func TestHooksReenter(t *testing.T) {
 
 	cfg := cachemesh.Config{
 		ID: "leader", Addr: "leader", Transport: net.Transport("leader"), Lease: lease,
-		Logger: slog.New(slog.DiscardHandler), PartitionBits: 12, Tuning: fastTuning(),
+		Logger: slog.New(slog.DiscardHandler), PartitionBits: 12, ExpectedSize: 1, Tuning: fastTuning(),
 		Neighbors: cachemesh.NeighborFunc(func(_, _ []cachemesh.PeerRef) {
 			nbs.Add(1)
 			touch()
@@ -403,7 +385,7 @@ func TestHooksReenter(t *testing.T) {
 	// is killed.
 	f := start(t, cachemesh.Config{
 		ID: "f", Addr: "f", Transport: net.Transport("f"), Seeds: []string{"leader"},
-		PartitionBits: 12, Tuning: fastTuning(),
+		PartitionBits: 12, ExpectedSize: 1, Tuning: fastTuning(),
 	})
 	net.Register("f", f.m.ServeControl)
 	eventually(t, "neighbor events", 10*time.Second, func() bool { return nbs.Load() > 0 && f.m.Ready() })
@@ -429,7 +411,7 @@ func TestHooksReenter(t *testing.T) {
 }
 
 func TestServeControlHostile(t *testing.T) {
-	r := start(t, cachemesh.Config{ID: "a", Addr: "a", Transport: &blockingTransport{}, Seeds: []string{"s"}, Tuning: fastTuning()})
+	r := start(t, cachemesh.Config{ID: "a", Addr: "a", Transport: &blockingTransport{}, Seeds: []string{"s"}, ExpectedSize: 1, Tuning: fastTuning()})
 	eventually(t, "running", 5*time.Second, func() bool {
 		_, err := r.m.ServeControl(context.Background(), "x", nil)
 		return err == nil
@@ -495,7 +477,7 @@ func TestSlowTransport(t *testing.T) {
 }
 
 func TestLeaveContext(t *testing.T) {
-	r := start(t, cachemesh.Config{ID: "a", Addr: "a", Transport: &blockingTransport{}, Seeds: []string{"s"}, Tuning: fastTuning()})
+	r := start(t, cachemesh.Config{ID: "a", Addr: "a", Transport: &blockingTransport{}, Seeds: []string{"s"}, ExpectedSize: 1, Tuning: fastTuning()})
 	eventually(t, "running", 5*time.Second, func() bool {
 		_, err := r.m.ServeControl(context.Background(), "x", nil)
 		return err == nil
@@ -545,7 +527,7 @@ func TestNoGoroutineLeak(t *testing.T) {
 
 			m, err := cachemesh.New(cachemesh.Config{
 				ID: addr, Addr: addr, Transport: net.Transport(addr), Seeds: seeds, Lease: lease,
-				Logger: slog.New(slog.DiscardHandler), PartitionBits: 12, Tuning: fastTuning(),
+				Logger: slog.New(slog.DiscardHandler), PartitionBits: 12, ExpectedSize: 1, Tuning: fastTuning(),
 				Neighbors: cachemesh.NeighborFunc(func(_, _ []cachemesh.PeerRef) {}),
 				Hooks:     cachemesh.Hooks{OnView: func(cachemesh.Version, int) {}},
 			})

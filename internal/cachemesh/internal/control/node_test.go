@@ -117,8 +117,8 @@ func (c *cluster) cfg(i int, seeds []string) Config {
 	return Config{
 		ID: "n" + strconv.Itoa(i), Incarnation: uint64(1000 + len(c.nodes)), Addr: addr(i), Zone: "z",
 		Seeds: seeds, PartitionBits: 10, Shared: c.shared,
-		Elect:        ElectionConfig{ExpectedClusterSize: 10, MinCandidateAge: 20 * time.Second},
-		DeltaLogSize: 32,
+		ExpectedSize: 10,
+		Tuning:       Tuning{Election: ElectionConfig{MinCandidateAge: 20 * time.Second}, DeltaLogSize: 32},
 	}
 }
 

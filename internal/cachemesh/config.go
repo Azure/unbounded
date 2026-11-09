@@ -86,77 +86,10 @@ type ElectionConfig = control.ElectionConfig
 // tracking, and the hedge budget. Zero values select defaults.
 type HealthConfig = route.HealthConfig
 
-// LeaderTuning tunes the work of the elected leader. Zero values select
-// defaults. Every member should use the same values, since any member may
-// become leader.
-type LeaderTuning struct {
-	// MaxJoinsPerTick bounds admissions per leader tick. Default 256.
-	MaxJoinsPerTick int
-	// QuarantineFor is how long a new member stays Joining. Default 10s.
-	QuarantineFor time.Duration
-	// WarmupStep is the time between weight steps of a new Active member.
-	// Default 20s.
-	WarmupStep time.Duration
-	// DrainFor is how long a leaving member stays Draining before removal.
-	// Default 30s.
-	DrainFor time.Duration
-	// SuspicionWindow is how long suspicion reports count. Default 30s.
-	SuspicionWindow time.Duration
-	// ObserverCells is the number of distinct observer cells needed to
-	// remove a suspected member. Default 3.
-	ObserverCells int
-	// DampingPercent is the suspected share above which removals slow down.
-	// Default 10.
-	DampingPercent int
-	// MaxMovesPerTick caps optional partition moves per tick. Default 4096;
-	// negative disables optional moves.
-	MaxMovesPerTick int
-	// MaxCellMovesPerTick caps cell balancing moves per tick. Default 32.
-	MaxCellMovesPerTick int
-	// HandoffEpochs and SlotReuseEpochs are cluster constants written in
-	// the first view. Defaults 8 and 16.
-	HandoffEpochs, SlotReuseEpochs uint32
-	// MaxPending bounds each leader input queue. Default 4096.
-	MaxPending int
-}
-
-// Tuning holds advanced knobs. Zero values select defaults.
-type Tuning struct {
-	// PingInterval and PingTimeout pace failure detection. Defaults 2s, 1s.
-	PingInterval, PingTimeout time.Duration
-	// SuspectAfter is the number of failed pings before a suspicion
-	// report. Default 3.
-	SuspectAfter int
-	// SuspectRefresh repeats a suspicion report. Default 5s.
-	SuspectRefresh time.Duration
-	// JoinRetry paces joins, leaves, and catch-up from seeds. Default 2s.
-	JoinRetry time.Duration
-	// CallTimeout bounds control calls. Default 2s.
-	CallTimeout time.Duration
-	// NeighborLinger delays neighbor removals. Default 30s.
-	NeighborLinger time.Duration
-	// LeaderTick is the leader's delta cadence. Default 1s.
-	LeaderTick time.Duration
-	// TickInterval is the elector and health tick cadence. Default 1s.
-	TickInterval time.Duration
-	// EpochAdvance is the longest the runtime waits between ticks, which
-	// bounds how stale the epoch read by Fresh can be. Default 100ms.
-	EpochAdvance time.Duration
-	// CatchUpMaxDeltas, DeltaLogSize, and MaxAhead bound catch-up batches,
-	// the served delta log, and queued future deltas. Defaults 256, 512,
-	// 64.
-	CatchUpMaxDeltas, DeltaLogSize, MaxAhead int
-	// MaxInFlight bounds concurrent outbound control calls; calls beyond
-	// it fail at once and are retried by the protocol. Default 64.
-	MaxInFlight int
-	// LeaseTimeout bounds each Lease operation. Default
-	// Election.OpTimeout (which defaults to Election.RetryPeriod).
-	LeaseTimeout time.Duration
-
-	Election ElectionConfig
-	Health   HealthConfig
-	Leader   LeaderTuning
-}
+// Tuning holds advanced knobs: control-plane timers, runtime limits,
+// leader work limits, and the Election and Health sub-configurations. Zero
+// values select defaults; production code usually leaves it zero.
+type Tuning = control.Tuning
 
 // Config configures a Mesh. Zero values select defaults.
 type Config struct {
@@ -199,9 +132,7 @@ type Config struct {
 	// EpochPeriod is the epoch length the leader publishes. Default 15s.
 	EpochPeriod time.Duration
 	// ExpectedSize is roughly how many members the cluster will have, for
-	// example the desired pod count of the DaemonSet. It sets
-	// Tuning.Election.ExpectedClusterSize (it is an error to set both to
-	// different values). Default 1000.
+	// example the desired pod count of the DaemonSet. Default 1000.
 	//
 	// A member that has no view yet, or has heard from no leader for a
 	// while, reads the Lease in rounds of a lottery: in each round it reads
@@ -275,11 +206,8 @@ func (c *Config) validate() error {
 		errs = append(errs, errors.New("counts must not be negative"))
 	}
 
-	switch {
-	case c.ExpectedSize < 0:
+	if c.ExpectedSize < 0 {
 		errs = append(errs, errors.New("ExpectedSize must not be negative"))
-	case c.ExpectedSize > 0 && t.Election.ExpectedClusterSize > 0 && c.ExpectedSize != t.Election.ExpectedClusterSize:
-		errs = append(errs, errors.New("ExpectedSize and Tuning.Election.ExpectedClusterSize differ"))
 	}
 
 	if err := t.Election.Validate(); err != nil {
@@ -294,14 +222,6 @@ func (c *Config) validate() error {
 }
 
 func (c *Config) nodeConfig() control.Config {
-	t := &c.Tuning
-	lt := &t.Leader
-
-	ec := t.Election
-	if ec.ExpectedClusterSize == 0 {
-		ec.ExpectedClusterSize = c.ExpectedSize
-	}
-
 	return control.Config{
 		ID:            c.ID,
 		Incarnation:   c.Incarnation,
@@ -309,37 +229,11 @@ func (c *Config) nodeConfig() control.Config {
 		Zone:          c.Zone,
 		Seeds:         append([]string(nil), c.Seeds...),
 		PartitionBits: c.PartitionBits,
-		Elect:         ec,
-		Health:        t.Health,
-		Leader: control.LeaderConfig{
-			MaxJoinsPerTick:     lt.MaxJoinsPerTick,
-			QuarantineFor:       lt.QuarantineFor,
-			WarmupStep:          lt.WarmupStep,
-			DrainFor:            lt.DrainFor,
-			SuspicionWindow:     lt.SuspicionWindow,
-			ObserverCells:       lt.ObserverCells,
-			DampingPercent:      lt.DampingPercent,
-			MaxMoves:            lt.MaxMovesPerTick,
-			MaxCellMovesPerTick: lt.MaxCellMovesPerTick,
-			CellSize:            c.CellSize,
-			MaxNeighbors:        c.MaxNeighbors,
-			SlotReuseEpochs:     lt.SlotReuseEpochs,
-			HandoffEpochs:       lt.HandoffEpochs,
-			MaxPending:          lt.MaxPending,
-		},
-		EpochPeriod:      c.EpochPeriod,
-		PingInterval:     t.PingInterval,
-		PingTimeout:      t.PingTimeout,
-		SuspectAfter:     t.SuspectAfter,
-		SuspectRefresh:   t.SuspectRefresh,
-		JoinRetry:        t.JoinRetry,
-		CatchUpMaxDeltas: t.CatchUpMaxDeltas,
-		CallTimeout:      t.CallTimeout,
-		DeltaLogSize:     t.DeltaLogSize,
-		NeighborLinger:   t.NeighborLinger,
-		LeaderTick:       t.LeaderTick,
-		TickInterval:     t.TickInterval,
-		MaxAhead:         t.MaxAhead,
-		Initial:          c.initial,
+		CellSize:      c.CellSize,
+		MaxNeighbors:  c.MaxNeighbors,
+		EpochPeriod:   c.EpochPeriod,
+		ExpectedSize:  c.ExpectedSize,
+		Tuning:        c.Tuning,
+		Initial:       c.initial,
 	}
 }

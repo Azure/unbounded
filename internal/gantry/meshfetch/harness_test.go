@@ -50,12 +50,10 @@ func fastTuning() cachemesh.Tuning {
 			ClockSkewAllowance: 100 * time.Millisecond,
 			MinCandidateAge:    300 * time.Millisecond,
 		},
-		Leader: cachemesh.LeaderTuning{
-			QuarantineFor:   100 * time.Millisecond,
-			WarmupStep:      100 * time.Millisecond,
-			DrainFor:        300 * time.Millisecond,
-			SuspicionWindow: 3 * time.Second,
-		},
+		QuarantineFor:   100 * time.Millisecond,
+		WarmupStep:      100 * time.Millisecond,
+		DrainFor:        300 * time.Millisecond,
+		SuspicionWindow: 3 * time.Second,
 	}
 }
 

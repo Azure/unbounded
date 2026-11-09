@@ -104,6 +104,84 @@ const (
 // (TopCandidates).
 var LeaseSeed = view.Seed("cachemesh/lease")
 
+// Tuning holds the advanced knobs of a member. Zero values select defaults.
+// The public cachemesh.Tuning is an alias of this type.
+type Tuning struct {
+	// PingInterval and PingTimeout pace failure detection. Defaults 2s, 1s.
+	PingInterval, PingTimeout time.Duration
+	// SuspectAfter is the number of failed pings before a suspicion
+	// report. Default 3.
+	SuspectAfter int
+	// SuspectRefresh repeats a suspicion report. Default 5s.
+	SuspectRefresh time.Duration
+	// JoinRetry paces joins, leaves, and catch-up from seeds. Default 2s.
+	JoinRetry time.Duration
+	// CallTimeout bounds control calls. Default 2s.
+	CallTimeout time.Duration
+	// NeighborLinger delays neighbor removals. Default 30s.
+	NeighborLinger time.Duration
+	// LeaderTick is the leader's delta cadence. Default 1s.
+	LeaderTick time.Duration
+	// TickInterval is the elector and health tick cadence. Default 1s.
+	TickInterval time.Duration
+	// CatchUpMaxDeltas, DeltaLogSize, and MaxAhead bound catch-up batches,
+	// the served delta log, and queued future deltas. Defaults 256, 512,
+	// 64.
+	CatchUpMaxDeltas, DeltaLogSize, MaxAhead int
+
+	// EpochAdvance, MaxInFlight, and LeaseTimeout tune the cachemesh
+	// runtime around the Node, which ignores them.
+	//
+	// EpochAdvance is the longest the runtime waits between ticks, which
+	// bounds how stale the epoch read by Fresh can be. Default 100ms.
+	EpochAdvance time.Duration
+	// MaxInFlight bounds concurrent outbound control calls; calls beyond
+	// it fail at once and are retried by the protocol. Default 64.
+	MaxInFlight int
+	// LeaseTimeout bounds each Lease operation. Default
+	// Election.OpTimeout (which defaults to Election.RetryPeriod).
+	LeaseTimeout time.Duration
+
+	// The leader knobs below tune the work of the elected leader. Every
+	// member should use the same values, since any member may become
+	// leader.
+	//
+	// MaxJoinsPerTick bounds admissions per leader tick. Default 256.
+	MaxJoinsPerTick int
+	// QuarantineFor is how long a new member stays Joining. Default 10s.
+	QuarantineFor time.Duration
+	// WarmupStep is the time between weight steps of a new Active member.
+	// Default 20s.
+	WarmupStep time.Duration
+	// DrainFor is how long a leaving member stays Draining before removal.
+	// Default 30s.
+	DrainFor time.Duration
+	// SuspicionWindow is how long suspicion reports count. Default 30s.
+	SuspicionWindow time.Duration
+	// ObserverCells is the number of distinct observer cells needed to
+	// remove a suspected member. Default 3.
+	ObserverCells int
+	// DampingPercent is the suspected share above which removals slow down.
+	// Default 10.
+	DampingPercent int
+	// MaxMovesPerTick caps optional partition moves per tick. Default 4096;
+	// negative disables optional moves.
+	MaxMovesPerTick int
+	// MaxCellMovesPerTick caps cell balancing moves per tick. Default 32.
+	MaxCellMovesPerTick int
+	// HandoffEpochs and SlotReuseEpochs are cluster constants written in
+	// the first view. Defaults 8 and 16.
+	HandoffEpochs, SlotReuseEpochs uint32
+	// MaxPending bounds each leader input queue. Default 4096.
+	MaxPending int
+
+	// Election tunes leader election.
+	Election ElectionConfig
+	// Health tunes circuit breakers, outlier detection, latency tracking,
+	// and the hedge budget of the data plane.
+	Health route.HealthConfig
+}
+
 // Config configures a Node. Zero values select defaults.
 type Config struct {
 	ID          string
@@ -113,26 +191,16 @@ type Config struct {
 	Seeds []string
 	// PartitionBits must match the cluster. Default 20.
 	PartitionBits uint8
+	// CellSize and MaxNeighbors shape the grid the leader builds. Defaults
+	// 4 and 256.
+	CellSize, MaxNeighbors int
+	// EpochPeriod is the epoch length the leader publishes. Default 15s.
+	EpochPeriod time.Duration
+	// ExpectedSize is the least cluster size the election lottery assumes.
+	// Default 1000.
+	ExpectedSize int
 
-	Elect  ElectionConfig
-	Leader LeaderConfig
-	Health route.HealthConfig
-
-	EpochPeriod      time.Duration
-	PingInterval     time.Duration
-	PingTimeout      time.Duration
-	SuspectAfter     int
-	SuspectRefresh   time.Duration
-	JoinRetry        time.Duration
-	CatchUpMaxDeltas int
-	CallTimeout      time.Duration
-	DeltaLogSize     int
-	NeighborLinger   time.Duration
-	LeaderTick       time.Duration
-	// TickInterval is the cadence of elector and health ticks.
-	TickInterval time.Duration
-	// MaxAhead bounds queued deltas that are ahead of the view.
-	MaxAhead int
+	Tuning
 
 	// Initial, when set, is the view the member starts from, as if it had
 	// adopted it from a snapshot (for example a persisted view, or a view
@@ -145,6 +213,29 @@ type Config struct {
 	Shared *Shared
 
 	Hooks Hooks
+}
+
+// leaderConfig returns the configuration of this member's Leader.
+func (c *Config) leaderConfig() LeaderConfig {
+	return LeaderConfig{
+		Self:                Joiner{ID: c.ID, Incarnation: c.Incarnation, Addr: c.Addr, Zone: c.Zone},
+		MaxJoinsPerTick:     c.MaxJoinsPerTick,
+		QuarantineFor:       c.QuarantineFor,
+		WarmupStep:          c.WarmupStep,
+		DrainFor:            c.DrainFor,
+		SuspicionWindow:     c.SuspicionWindow,
+		ObserverCells:       c.ObserverCells,
+		DampingPercent:      c.DampingPercent,
+		MaxMoves:            c.MaxMovesPerTick,
+		MaxCellMovesPerTick: c.MaxCellMovesPerTick,
+		CellSize:            c.CellSize,
+		MaxNeighbors:        c.MaxNeighbors,
+		PartitionBits:       c.PartitionBits,
+		SlotReuseEpochs:     c.SlotReuseEpochs,
+		HandoffEpochs:       c.HandoffEpochs,
+		EpochPeriod:         c.EpochPeriod,
+		MaxPending:          c.MaxPending,
+	}
 }
 
 func (c *Config) defaults() {
@@ -177,10 +268,8 @@ func (c *Config) defaults() {
 	dur(&c.TickInterval, DefaultTickInterval)
 	num(&c.MaxAhead, DefaultMaxAhead)
 
-	c.Elect = c.Elect.WithDefaults()
-	c.Leader.Self = Joiner{ID: c.ID, Incarnation: c.Incarnation, Addr: c.Addr, Zone: c.Zone}
-	c.Leader.PartitionBits = c.PartitionBits
-	c.Leader.EpochPeriod = c.EpochPeriod
+	c.Election.expectedSize = c.ExpectedSize
+	c.Election = c.Election.WithDefaults()
 }
 
 // CatchUpKind says how a catch-up was served.
@@ -379,9 +468,9 @@ func New(cfg Config, rng *rand.Rand) *Node {
 		seeds:  slices.Clone(cfg.Seeds),
 	}
 	n.self = MemberRef{ID: cfg.ID, Incarnation: cfg.Incarnation, Slot: view.NoSlot}
-	n.el = NewElector(cfg.Elect, Self{ID: cfg.ID, Incarnation: cfg.Incarnation, Key: n.key, Addr: cfg.Addr}, rng)
+	n.el = NewElector(cfg.Election, Self{ID: cfg.ID, Incarnation: cfg.Incarnation, Key: n.key, Addr: cfg.Addr}, rng)
 	n.el.SetHooks(cfg.Hooks.Elect)
-	n.ld = NewLeader(cfg.Leader, rng)
+	n.ld = NewLeader(cfg.leaderConfig(), rng)
 	n.ld.SetHooks(cfg.Hooks.Leader)
 	n.hl = route.NewHealthTracker(cfg.Health, rng)
 
@@ -1224,7 +1313,7 @@ func (n *Node) noteColdRead(now int64, wall time.Time, r Result) {
 		return
 	}
 
-	ld := n.cfg.Elect.LeaseDuration
+	ld := n.cfg.Election.LeaseDuration
 	if !notFound {
 		ld = max(ld, r.Record.LeaseDuration)
 	}
@@ -1232,7 +1321,7 @@ func (n *Node) noteColdRead(now int64, wall time.Time, r Result) {
 	switch {
 	case now-n.coldSince < int64(ld), now-n.lastContact < int64(ld):
 		return
-	case !notFound && r.Record.Holder != "" && !wall.After(r.Record.RenewTime.Add(ld+n.cfg.Elect.ClockSkewAllowance)):
+	case !notFound && r.Record.Holder != "" && !wall.After(r.Record.RenewTime.Add(ld+n.cfg.Election.ClockSkewAllowance)):
 		return
 	}
 
