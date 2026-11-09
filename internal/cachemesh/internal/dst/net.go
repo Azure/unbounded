@@ -5,7 +5,11 @@ package dst
 
 import (
 	"errors"
+	"fmt"
 	"math/rand/v2"
+	"strconv"
+
+	"github.com/Azure/unbounded/internal/cachemesh/internal/elect"
 )
 
 // ErrTimeout completes a Call whose response did not arrive in time.
@@ -29,8 +33,6 @@ type Message struct {
 	ReplyTo uint64
 	Payload []byte
 	Data    any
-	// Size is the accounted size in bytes; zero means len(Payload).
-	Size int
 	// Sent is the simulated send time.
 	Sent int64
 	Dup  bool
@@ -66,40 +68,12 @@ type NetConfig struct {
 	// probabilities in parts per million.
 	LossPPM uint32
 	DupPPM  uint32
-	// DropWhilePaused drops messages to a paused member instead of holding
-	// them until it resumes.
-	DropWhilePaused bool
-}
-
-// Link overrides the latency and loss of one directed link.
-type Link struct {
-	Latency int64
-	Jitter  int64
-	LossPPM uint32
-}
-
-// TrafficStats counts messages and bytes.
-type TrafficStats struct {
-	Msgs  uint64
-	Bytes uint64
-}
-
-func (t *TrafficStats) add(size int) {
-	t.Msgs++
-	t.Bytes += uint64(size)
-}
-
-// KindStats counts traffic of one message kind.
-type KindStats struct {
-	Sent      TrafficStats
-	Delivered TrafficStats
-	Dropped   TrafficStats
 }
 
 // NetStats counts network-wide drops.
 type NetStats struct {
 	Sent, Delivered            uint64
-	Lost, Partitioned, Paused  uint64
+	Lost, Partitioned          uint64
 	Duplicated, LateResponses  uint64
 	Timeouts, CallsCompleted   uint64
 	HeldWhilePaused, Unhandled uint64
@@ -117,7 +91,6 @@ type Net struct {
 	rng     *rand.Rand
 	h       Handler
 	cfg     NetConfig
-	links   map[uint64]Link
 	slow    []uint32 // permille, 0 means 1000
 	group   []uint32
 	paused  []bool
@@ -128,10 +101,7 @@ type Net struct {
 	nextCal uint64
 	calls   map[uint64]pendingCall
 	timeout *netTimeout
-
-	sent, recv []TrafficStats
-	kinds      []KindStats
-	stats      NetStats
+	stats   NetStats
 }
 
 type netTimeout struct{ n *Net }
@@ -155,46 +125,22 @@ func NewNet(sim *Sim, members int, h Handler, cfg NetConfig) *Net {
 		rng:   sim.Stream("net"),
 		h:     h,
 		cfg:   cfg,
-		links: make(map[uint64]Link),
 		calls: make(map[uint64]pendingCall),
 	}
 	n.timeout = &netTimeout{n: n}
-	n.Grow(members)
+	n.slow = make([]uint32, members)
+	n.group = make([]uint32, members)
+	n.paused = make([]bool, members)
+	n.held = make([][]uint32, members)
 
 	return n
 }
-
-// Grow makes room for members [0, members).
-func (n *Net) Grow(members int) {
-	for len(n.slow) < members {
-		n.slow = append(n.slow, 0)
-		n.group = append(n.group, 0)
-		n.paused = append(n.paused, false)
-		n.held = append(n.held, nil)
-		n.sent = append(n.sent, TrafficStats{})
-		n.recv = append(n.recv, TrafficStats{})
-	}
-}
-
-// Members returns the number of member slots.
-func (n *Net) Members() int { return len(n.slow) }
 
 // SetLoss sets the default loss probability in parts per million.
 func (n *Net) SetLoss(ppm uint32) { n.cfg.LossPPM = ppm }
 
 // SetDup sets the default duplication probability in parts per million.
 func (n *Net) SetDup(ppm uint32) { n.cfg.DupPPM = ppm }
-
-// SetLatency sets the default base latency and jitter.
-func (n *Net) SetLatency(latency, jitter int64) {
-	n.cfg.Latency, n.cfg.Jitter = latency, jitter
-}
-
-// SetLink overrides one directed link.
-func (n *Net) SetLink(from, to uint32, l Link) { n.links[uint64(from)<<32|uint64(to)] = l }
-
-// ClearLink removes a link override.
-func (n *Net) ClearLink(from, to uint32) { delete(n.links, uint64(from)<<32|uint64(to)) }
 
 // SetSlow multiplies the latency of every message to or from member by
 // permille/1000. 1000 (or 0) is normal speed.
@@ -214,7 +160,7 @@ func (n *Net) Heal() { clear(n.group) }
 func (n *Net) Paused(member uint32) bool { return n.paused[member] }
 
 // Pause stops deliveries to member. Messages that arrive while it is paused
-// are held (or dropped with DropWhilePaused).
+// are held until it resumes.
 func (n *Net) Pause(member uint32) { n.paused[member] = true }
 
 // Resume delivers held messages to member, in arrival order, at the current
@@ -244,22 +190,6 @@ func (n *Net) DropHeld(member uint32) {
 	n.held[member] = nil
 }
 
-func (n *Net) kind(k uint16) *KindStats {
-	for int(k) >= len(n.kinds) {
-		n.kinds = append(n.kinds, KindStats{})
-	}
-
-	return &n.kinds[k]
-}
-
-func size(m *Message) int {
-	if m.Size > 0 {
-		return m.Size
-	}
-
-	return len(m.Payload)
-}
-
 func (n *Net) alloc(m *Message) uint32 {
 	if k := len(n.free); k > 0 {
 		slot := n.free[k-1]
@@ -279,24 +209,12 @@ func (n *Net) release(slot uint32) {
 	n.free = append(n.free, slot)
 }
 
-func (n *Net) drop(slot uint32) {
-	m := &n.msgs[slot]
-	n.kind(m.Kind).Dropped.add(size(m))
-	n.release(slot)
-}
+func (n *Net) drop(slot uint32) { n.release(slot) }
 
-func (n *Net) latency(from, to uint32) (int64, uint32) {
-	base, jitter, loss := n.cfg.Latency, n.cfg.Jitter, n.cfg.LossPPM
-
-	if len(n.links) > 0 {
-		if l, ok := n.links[uint64(from)<<32|uint64(to)]; ok {
-			base, jitter, loss = l.Latency, l.Jitter, l.LossPPM
-		}
-	}
-
-	lat := base
-	if jitter > 0 {
-		lat += n.rng.Int64N(jitter + 1)
+func (n *Net) latency(from, to uint32) int64 {
+	lat := n.cfg.Latency
+	if n.cfg.Jitter > 0 {
+		lat += n.rng.Int64N(n.cfg.Jitter + 1)
 	}
 
 	if s := n.slow[from]; s != 0 && s != 1000 {
@@ -307,7 +225,7 @@ func (n *Net) latency(from, to uint32) (int64, uint32) {
 		lat = lat * int64(s) / 1000
 	}
 
-	return lat, loss
+	return lat
 }
 
 func (n *Net) chance(ppm uint32) bool {
@@ -320,11 +238,7 @@ func (n *Net) Send(m Message) uint64 {
 	m.ID = n.nextID
 	m.Sent = n.sim.Now()
 	m.Dup = false
-	sz := size(&m)
-
 	n.stats.Sent++
-	n.sent[m.From].add(sz)
-	n.kind(m.Kind).Sent.add(sz)
 
 	n.transmit(&m)
 
@@ -338,10 +252,9 @@ func (n *Net) Send(m Message) uint64 {
 }
 
 func (n *Net) transmit(m *Message) {
-	lat, loss := n.latency(m.From, m.To)
-	if n.chance(loss) {
+	lat := n.latency(m.From, m.To)
+	if n.chance(n.cfg.LossPPM) {
 		n.stats.Lost++
-		n.kind(m.Kind).Dropped.add(size(m))
 
 		return
 	}
@@ -364,23 +277,13 @@ func (n *Net) Fire(a, _ uint64) {
 	}
 
 	if n.paused[m.To] {
-		if n.cfg.DropWhilePaused {
-			n.stats.Paused++
-			n.drop(slot)
-
-			return
-		}
-
 		n.stats.HeldWhilePaused++
 		n.held[m.To] = append(n.held[m.To], slot)
 
 		return
 	}
 
-	sz := size(m)
 	n.stats.Delivered++
-	n.recv[m.To].add(sz)
-	n.kind(m.Kind).Delivered.add(sz)
 
 	if m.ReplyTo != 0 {
 		pc, ok := n.calls[m.ReplyTo]
@@ -430,20 +333,6 @@ func (n *Net) Reply(req *Message, resp Message) {
 	n.Send(resp)
 }
 
-// CancelCall abandons a pending call without completing it. It reports
-// whether the call was pending.
-func (n *Net) CancelCall(call uint64) bool {
-	pc, ok := n.calls[call]
-	if !ok {
-		return false
-	}
-
-	delete(n.calls, call)
-	n.sim.Cancel(pc.timer)
-
-	return true
-}
-
 func (n *Net) expire(call uint64) {
 	pc, ok := n.calls[call]
 	if !ok {
@@ -462,33 +351,440 @@ func (n *Net) PendingCalls() int { return len(n.calls) }
 // Stats returns network-wide counters.
 func (n *Net) Stats() NetStats { return n.stats }
 
-// Sent returns traffic sent by member.
-func (n *Net) Sent(member uint32) TrafficStats { return n.sent[member] }
+// ErrUnavailable is the transient error returned during an API server
+// outage.
+var ErrUnavailable = errors.New("dst: lease server unavailable")
 
-// Received returns traffic delivered to member.
-func (n *Net) Received(member uint32) TrafficStats { return n.recv[member] }
+// NoMember attributes a Lease operation to no member.
+const NoMember = ^uint32(0)
 
-// Kind returns traffic counters for one message kind.
-func (n *Net) Kind(k uint16) KindStats {
-	if int(k) < len(n.kinds) {
-		return n.kinds[k]
-	}
-
-	return KindStats{}
+// LeaseConfig configures a LeaseServer. Zero values select defaults.
+type LeaseConfig struct {
+	// Latency is the base latency of an asynchronous operation. Default 5ms.
+	Latency int64
+	// Jitter is the maximum extra latency, drawn uniformly. Default
+	// Latency.
+	Jitter int64
+	// ConflictPPM is the probability, in parts per million, that a create or
+	// update fails with an injected ErrConflict.
+	ConflictPPM uint32
 }
 
-// MaxSent returns the member that sent the most bytes and its counters.
-func (n *Net) MaxSent() (uint32, TrafficStats) {
-	var (
-		best uint32
-		bs   TrafficStats
-	)
+// Window is a half-open simulated time interval [Start, End).
+type Window struct{ Start, End int64 }
 
-	for i, s := range n.sent {
-		if s.Bytes > bs.Bytes {
-			best, bs = uint32(i), s
+// Write is one successful Lease write, for invariant checks.
+type Write struct {
+	Time        int64
+	Member      uint32
+	Kind        elect.OpKind
+	Holder      string
+	Incarnation uint64
+	Term        uint64
+	RV          uint64
+}
+
+// LeaseServer is an in-memory Lease with API server semantics: reads,
+// create, compare-and-swap update, server-assigned resourceVersion and UID,
+// latency, outages, and injected conflicts. Cached reads are always fresh.
+// Callers keep their own operation counts (see control.go).
+type LeaseServer struct {
+	sim     *Sim
+	rng     *rand.Rand
+	cfg     LeaseConfig
+	exists  bool
+	cur     elect.Record
+	rv      uint64
+	uids    uint64
+	outages []Window
+	audit   []Write
+}
+
+// NewLeaseServer returns a server whose Lease does not exist yet.
+func NewLeaseServer(sim *Sim, cfg LeaseConfig) *LeaseServer {
+	if cfg.Latency <= 0 {
+		cfg.Latency = 5_000_000
+	}
+
+	if cfg.Jitter <= 0 {
+		cfg.Jitter = cfg.Latency
+	}
+
+	return &LeaseServer{
+		sim: sim,
+		rng: sim.Stream("lease"),
+		cfg: cfg,
+	}
+}
+
+// SetConflictPPM changes the injected conflict probability.
+func (l *LeaseServer) SetConflictPPM(ppm uint32) { l.cfg.ConflictPPM = ppm }
+
+// AddOutage makes every operation in [start, end) fail with ErrUnavailable.
+func (l *LeaseServer) AddOutage(start, end int64) {
+	l.outages = append(l.outages, Window{start, end})
+}
+
+func (l *LeaseServer) down(now int64) bool {
+	for _, w := range l.outages {
+		if now >= w.Start && now < w.End {
+			return true
 		}
 	}
 
-	return best, bs
+	return false
+}
+
+// Audit returns the successful writes in order.
+func (l *LeaseServer) Audit() []Write { return l.audit }
+
+// Do executes op at simulated time now on behalf of member.
+func (l *LeaseServer) Do(member uint32, op elect.Op, now int64) elect.Result {
+	res := elect.Result{Seq: op.Seq, Kind: op.Kind}
+
+	if l.down(now) {
+		res.Err = ErrUnavailable
+
+		return res
+	}
+
+	switch op.Kind {
+	case elect.OpGet, elect.OpGetCached:
+		if !l.exists {
+			res.Err = elect.ErrNotFound
+
+			return res
+		}
+
+		res.Record = l.cur.Clone()
+	case elect.OpCreate:
+		if l.exists || l.injectConflict() {
+			res.Err = elect.ErrConflict
+
+			return res
+		}
+
+		l.uids++
+		r := op.Record.Clone()
+		r.UID = "uid-" + strconv.FormatUint(l.uids, 10)
+		res.Record = l.write(now, member, op.Kind, r)
+	case elect.OpUpdate:
+		if !l.exists {
+			res.Err = elect.ErrNotFound
+
+			return res
+		}
+
+		if op.Record.ResourceVersion != l.cur.ResourceVersion ||
+			(op.Record.UID != "" && op.Record.UID != l.cur.UID) || l.injectConflict() {
+			res.Err = elect.ErrConflict
+
+			return res
+		}
+
+		r := op.Record.Clone()
+		r.UID = l.cur.UID
+		res.Record = l.write(now, member, op.Kind, r)
+	default:
+		res.Err = errors.New("dst: unknown lease op")
+	}
+
+	return res
+}
+
+func (l *LeaseServer) injectConflict() bool {
+	return l.cfg.ConflictPPM > 0 && l.rng.Uint32N(1_000_000) < l.cfg.ConflictPPM
+}
+
+func (l *LeaseServer) write(now int64, member uint32, kind elect.OpKind, r elect.Record) elect.Record {
+	l.rv++
+	r.ResourceVersion = strconv.FormatUint(l.rv, 10)
+	l.exists, l.cur = true, r
+	l.audit = append(l.audit, Write{
+		Time: now, Member: member, Kind: kind,
+		Holder: r.Holder, Incarnation: r.Incarnation, Term: r.Term, RV: l.rv,
+	})
+	return r.Clone()
+}
+
+// Submit executes op after a random latency on behalf of member and passes
+// the result to done. The operation takes effect at the server at the
+// midpoint of the latency, and the response arrives at the end.
+func (l *LeaseServer) Submit(member uint32, op elect.Op, done func(elect.Result)) {
+	lat := l.cfg.Latency + l.rng.Int64N(l.cfg.Jitter+1)
+	l.sim.After(lat/2, func() {
+		res := l.Do(member, op, l.sim.Now())
+		l.sim.After(lat-lat/2, func() { done(res) })
+	})
+}
+
+// CheckAudit verifies the write log: terms never decrease, a change of
+// holder or incarnation strictly increases the term, and no term has two
+// holders. Releases (empty Holder) are allowed at the current term.
+func CheckAudit(ws []Write) error {
+	type who struct {
+		holder string
+		inc    uint64
+	}
+
+	owner := make(map[uint64]who)
+
+	var prev *Write
+
+	for i := range ws {
+		w := &ws[i]
+		if w.Holder != "" {
+			cur := who{w.Holder, w.Incarnation}
+			if o, ok := owner[w.Term]; ok && o != cur {
+				return fmt.Errorf("term %d held by %s/%d and %s/%d (rv %d)",
+					w.Term, o.holder, o.inc, w.Holder, w.Incarnation, w.RV)
+			}
+
+			owner[w.Term] = cur
+		}
+
+		if prev != nil {
+			if w.Term < prev.Term {
+				return fmt.Errorf("term decreased from %d to %d at rv %d", prev.Term, w.Term, w.RV)
+			}
+
+			changed := w.Holder != "" && prev.Holder != "" &&
+				(w.Holder != prev.Holder || w.Incarnation != prev.Incarnation)
+			if changed && w.Term <= prev.Term {
+				return fmt.Errorf("holder changed %s/%d -> %s/%d without a new term at rv %d",
+					prev.Holder, prev.Incarnation, w.Holder, w.Incarnation, w.RV)
+			}
+		}
+
+		prev = w
+	}
+
+	return nil
+}
+
+// State is a simulated process's lifecycle state.
+type State uint8
+
+const (
+	// Down means the process has never started or has finished leaving.
+	Down State = iota
+	// Starting means the process has started but not yet reported ready.
+	Starting
+	// Up means the process is running.
+	Up
+	// Paused means the process is frozen (stop the world).
+	Paused
+	// Leaving means the process is draining before a graceful exit.
+	Leaving
+	// Crashed means the process died without cleanup.
+	Crashed
+)
+
+// String returns the state name.
+func (s State) String() string {
+	switch s {
+	case Down:
+		return "down"
+	case Starting:
+		return "starting"
+	case Up:
+		return "up"
+	case Paused:
+		return "paused"
+	case Leaving:
+		return "leaving"
+	case Crashed:
+		return "crashed"
+	default:
+		return "unknown"
+	}
+}
+
+// Alive reports whether the process is running (possibly paused).
+func (s State) Alive() bool { return s == Starting || s == Up || s == Paused || s == Leaving }
+
+// Hooks are called by Processes on lifecycle transitions. The harness uses
+// them to build or tear down the member under test.
+type Hooks interface {
+	// OnStart is called when member starts with a new incarnation.
+	OnStart(member uint32, incarnation uint64)
+	// OnCrash is called when member dies without cleanup.
+	OnCrash(member uint32)
+	// OnLeave is called when member begins a graceful exit.
+	OnLeave(member uint32)
+	// OnPause and OnResume freeze and unfreeze member.
+	OnPause(member uint32)
+	OnResume(member uint32)
+}
+
+// Process is one member's lifecycle record.
+type Process struct {
+	State       State
+	Incarnation uint64
+	// Starts counts how many times the process started.
+	Starts uint32
+	// Since is the simulated time of the last transition.
+	Since int64
+	// pausedFrom is the state to return to on Resume.
+	pausedFrom State
+}
+
+// Processes is a table of simulated processes keyed by member index.
+type Processes struct {
+	sim   *Sim
+	rng   *rand.Rand
+	hooks Hooks
+	procs []Process
+}
+
+// NewProcesses returns a table of members processes, all Down.
+func NewProcesses(sim *Sim, members int, hooks Hooks) *Processes {
+	return &Processes{sim: sim, rng: sim.Stream("process"), hooks: hooks, procs: make([]Process, members)}
+}
+
+// Get returns member's record.
+func (p *Processes) Get(member uint32) Process { return p.procs[member] }
+
+// State returns member's state.
+func (p *Processes) State(member uint32) State { return p.procs[member].State }
+
+func (p *Processes) set(m uint32, s State) {
+	p.procs[m].State = s
+	p.procs[m].Since = p.sim.Now()
+}
+
+// Start starts a Down or Crashed member with a fresh nonzero incarnation
+// and calls OnStart. It reports whether the member started.
+func (p *Processes) Start(member uint32) bool {
+	pr := &p.procs[member]
+	if pr.State != Down && pr.State != Crashed {
+		return false
+	}
+
+	inc := p.rng.Uint64()
+	for inc == 0 || inc == pr.Incarnation {
+		inc = p.rng.Uint64()
+	}
+
+	pr.Incarnation = inc
+	pr.Starts++
+
+	p.set(member, Starting)
+
+	if p.hooks != nil {
+		p.hooks.OnStart(member, inc)
+	}
+
+	return true
+}
+
+// MarkUp moves a Starting member to Up.
+func (p *Processes) MarkUp(member uint32) bool {
+	if p.procs[member].State != Starting {
+		return false
+	}
+
+	p.set(member, Up)
+
+	return true
+}
+
+// Crash kills a live member and calls OnCrash.
+func (p *Processes) Crash(member uint32) bool {
+	if !p.procs[member].State.Alive() {
+		return false
+	}
+
+	p.set(member, Crashed)
+
+	if p.hooks != nil {
+		p.hooks.OnCrash(member)
+	}
+
+	return true
+}
+
+// Leave begins a graceful exit of a Starting or Up member and calls
+// OnLeave. Call Exited when it finishes.
+func (p *Processes) Leave(member uint32) bool {
+	s := p.procs[member].State
+	if s != Up && s != Starting {
+		return false
+	}
+
+	p.set(member, Leaving)
+
+	if p.hooks != nil {
+		p.hooks.OnLeave(member)
+	}
+
+	return true
+}
+
+// Exited moves a Leaving member to Down.
+func (p *Processes) Exited(member uint32) bool {
+	if p.procs[member].State != Leaving {
+		return false
+	}
+
+	p.set(member, Down)
+
+	return true
+}
+
+// Pause freezes a Starting, Up or Leaving member and calls OnPause.
+func (p *Processes) Pause(member uint32) bool {
+	pr := &p.procs[member]
+	if pr.State != Up && pr.State != Starting && pr.State != Leaving {
+		return false
+	}
+
+	pr.pausedFrom = pr.State
+
+	p.set(member, Paused)
+
+	if p.hooks != nil {
+		p.hooks.OnPause(member)
+	}
+
+	return true
+}
+
+// Resume unfreezes a Paused member and calls OnResume.
+func (p *Processes) Resume(member uint32) bool {
+	pr := &p.procs[member]
+	if pr.State != Paused {
+		return false
+	}
+
+	p.set(member, pr.pausedFrom)
+
+	if p.hooks != nil {
+		p.hooks.OnResume(member)
+	}
+
+	return true
+}
+
+// Live appends the members that are alive (Starting, Up, Paused, or
+// Leaving) to dst in index order and returns it.
+func (p *Processes) Live(dst []uint32) []uint32 {
+	for i := range p.procs {
+		if p.procs[i].State.Alive() {
+			dst = append(dst, uint32(i))
+		}
+	}
+
+	return dst
+}
+
+// InState appends the members in state s to dst in index order.
+func (p *Processes) InState(dst []uint32, s State) []uint32 {
+	for i := range p.procs {
+		if p.procs[i].State == s {
+			dst = append(dst, uint32(i))
+		}
+	}
+
+	return dst
 }

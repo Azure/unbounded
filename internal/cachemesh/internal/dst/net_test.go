@@ -4,7 +4,6 @@
 package dst
 
 import (
-	"context"
 	"errors"
 	"testing"
 
@@ -52,12 +51,8 @@ func TestNetDeliveryAndCounters(t *testing.T) {
 		}
 	}
 
-	if n.Sent(0).Msgs != 10 || n.Sent(0).Bytes != 45 || n.Received(1).Bytes != 45 || n.Kind(7).Delivered.Msgs != 10 {
-		t.Fatal("counters")
-	}
-
-	if m, st := n.MaxSent(); m != 0 || st.Msgs != 10 {
-		t.Fatal("max sent")
+	if st := n.Stats(); st.Sent != 10 || st.Delivered != 10 {
+		t.Fatalf("counters %+v", st)
 	}
 }
 
@@ -165,17 +160,6 @@ func TestNetPause(t *testing.T) {
 		t.Fatal("held messages not delivered")
 	}
 
-	s, n, b = newTestNet(5, NetConfig{DropWhilePaused: true})
-	n.Pause(1)
-	n.Send(Message{From: 0, To: 1})
-	drain(s)
-	n.Resume(1)
-	drain(s)
-
-	if len(b.got) != 0 || n.Stats().Paused != 1 {
-		t.Fatal("drop while paused")
-	}
-
 	s, n, b = newTestNet(5, NetConfig{})
 	n.Pause(1)
 	n.Send(Message{From: 0, To: 1})
@@ -189,7 +173,7 @@ func TestNetPause(t *testing.T) {
 	}
 }
 
-func TestNetSlowAndLink(t *testing.T) {
+func TestNetSlow(t *testing.T) {
 	s, n, _ := newTestNet(6, NetConfig{Latency: 1000, NoJitter: true})
 	n.SetSlow(1, 3000)
 	n.Send(Message{From: 0, To: 1})
@@ -197,26 +181,6 @@ func TestNetSlowAndLink(t *testing.T) {
 
 	if s.Now() != 3000 {
 		t.Fatalf("slow latency %d", s.Now())
-	}
-
-	n.SetLink(0, 2, Link{Latency: 50})
-
-	start := s.Now()
-
-	n.Send(Message{From: 0, To: 2})
-	drain(s)
-
-	if s.Now()-start != 50 {
-		t.Fatal("link override")
-	}
-
-	n.ClearLink(0, 2)
-	n.SetLink(0, 2, Link{Latency: 1, LossPPM: 1_000_000})
-	n.Send(Message{From: 0, To: 2})
-	drain(s)
-
-	if n.Stats().Lost != 1 {
-		t.Fatal("link loss")
 	}
 }
 
@@ -257,18 +221,6 @@ func TestNetCallExactlyOnce(t *testing.T) {
 	st := n.Stats()
 	if c.errs == 0 || c.errs == len(calls) || st.LateResponses == 0 || n.PendingCalls() != 0 {
 		t.Fatalf("errs %d late %d", c.errs, st.LateResponses)
-	}
-
-	// CancelCall suppresses completion.
-	id := n.Call(Message{From: 0, To: 1}, 10, c)
-	if !n.CancelCall(id) || n.CancelCall(id) {
-		t.Fatal("cancel call")
-	}
-
-	drain(s)
-
-	if c.n[id] != 0 {
-		t.Fatal("canceled call completed")
 	}
 }
 
@@ -311,33 +263,33 @@ func TestLeaseCAS(t *testing.T) {
 	s := New(1)
 	l := NewLeaseServer(s, LeaseConfig{})
 
-	if r := l.Do(elect.Op{Kind: elect.OpGet}, 0); !errors.Is(r.Err, elect.ErrNotFound) {
+	if r := l.Do(NoMember, elect.Op{Kind: elect.OpGet}, 0); !errors.Is(r.Err, elect.ErrNotFound) {
 		t.Fatal("get missing")
 	}
 
-	if r := l.Do(elect.Op{Kind: elect.OpUpdate}, 0); !errors.Is(r.Err, elect.ErrNotFound) {
+	if r := l.Do(NoMember, elect.Op{Kind: elect.OpUpdate}, 0); !errors.Is(r.Err, elect.ErrNotFound) {
 		t.Fatal("update missing")
 	}
 
-	c := l.DoAs(3, elect.Op{Seq: 9, Kind: elect.OpCreate, Record: elect.Record{Holder: "a", Term: 1, Incarnation: 1}}, 10)
+	c := l.Do(3, elect.Op{Seq: 9, Kind: elect.OpCreate, Record: elect.Record{Holder: "a", Term: 1, Incarnation: 1}}, 10)
 	if c.Err != nil || c.Seq != 9 || c.Record.ResourceVersion != "1" || c.Record.UID == "" {
 		t.Fatalf("create %+v", c)
 	}
 
-	if r := l.Do(elect.Op{Kind: elect.OpCreate}, 11); !errors.Is(r.Err, elect.ErrConflict) {
+	if r := l.Do(NoMember, elect.Op{Kind: elect.OpCreate}, 11); !errors.Is(r.Err, elect.ErrConflict) {
 		t.Fatal("double create")
 	}
 
 	upd := c.Record
 	upd.Holder = "b"
 	upd.Term = 2
-	u := l.Do(elect.Op{Kind: elect.OpUpdate, Record: upd}, 20)
+	u := l.Do(NoMember, elect.Op{Kind: elect.OpUpdate, Record: upd}, 20)
 
 	if u.Err != nil || u.Record.ResourceVersion != "2" || u.Record.UID != c.Record.UID {
 		t.Fatalf("update %+v", u)
 	}
 
-	if r := l.Do(elect.Op{Kind: elect.OpUpdate, Record: upd}, 21); !errors.Is(r.Err, elect.ErrConflict) {
+	if r := l.Do(NoMember, elect.Op{Kind: elect.OpUpdate, Record: upd}, 21); !errors.Is(r.Err, elect.ErrConflict) {
 		t.Fatal("stale rv accepted")
 	}
 
@@ -348,107 +300,8 @@ func TestLeaseCAS(t *testing.T) {
 	// Returned records are copies.
 	u.Record.Seeds = append(u.Record.Seeds, "x")
 
-	if cur, ok := l.Current(); !ok || len(cur.Seeds) != 0 {
+	if cur := l.Do(NoMember, elect.Op{Kind: elect.OpGetCached}, 22); cur.Err != nil || len(cur.Record.Seeds) != 0 {
 		t.Fatal("aliasing")
-	}
-
-	st := l.Store(1)
-	ctx := context.Background()
-
-	got, err := st.Get(ctx)
-	if err != nil || got.Holder != "b" {
-		t.Fatal("store get")
-	}
-
-	got.Holder = "c"
-	got.Term = 3
-
-	if _, err := st.Update(ctx, got); err != nil {
-		t.Fatal(err)
-	}
-
-	if _, err := st.Create(ctx, got); !errors.Is(err, elect.ErrConflict) {
-		t.Fatal("store create")
-	}
-
-	if _, err := st.GetCached(ctx); err != nil {
-		t.Fatal(err)
-	}
-
-	cctx, cancel := context.WithCancel(ctx)
-	cancel()
-
-	if _, err := st.Get(cctx); err == nil {
-		t.Fatal("canceled ctx")
-	}
-
-	if res := elect.Execute(ctx, st, elect.Op{Seq: 4, Kind: elect.OpGet}); res.Err != nil || res.Seq != 4 {
-		t.Fatal("execute")
-	}
-}
-
-func TestLeaseCachedStale(t *testing.T) {
-	s := New(2)
-	l := NewLeaseServer(s, LeaseConfig{CacheLag: 1000})
-	c := l.Do(elect.Op{Kind: elect.OpCreate, Record: elect.Record{Holder: "a"}}, 0)
-	r := c.Record
-
-	for i := int64(1); i <= 10; i++ {
-		r.Term = uint64(i)
-		r = l.Do(elect.Op{Kind: elect.OpUpdate, Record: r}, i*100).Record
-	}
-
-	stale, fresh := 0, 0
-
-	for range 200 {
-		g := l.Do(elect.Op{Kind: elect.OpGetCached}, 1500)
-		if g.Err != nil {
-			t.Fatal(g.Err)
-		}
-
-		if g.Record.Term < 10 {
-			stale++
-		} else {
-			fresh++
-		}
-	}
-
-	if stale == 0 || fresh == 0 {
-		t.Fatalf("stale %d fresh %d", stale, fresh)
-	}
-
-	if g := l.Do(elect.Op{Kind: elect.OpGet}, 1000); g.Record.Term != 10 {
-		t.Fatal("consistent read stale")
-	}
-
-	// Much later the cache has caught up and history was trimmed.
-	r.Term = 11
-	l.Do(elect.Op{Kind: elect.OpUpdate, Record: r}, 100_000)
-
-	for range 50 {
-		if g := l.Do(elect.Op{Kind: elect.OpGetCached}, 200_000); g.Record.Term != 11 {
-			t.Fatal("cache never caught up")
-		}
-	}
-
-	if len(l.hist) > 2 {
-		t.Fatalf("history not trimmed: %d", len(l.hist))
-	}
-
-	// A cached read before creation sees not-found.
-	l2 := NewLeaseServer(s, LeaseConfig{CacheLag: 1_000_000})
-	l2.Do(elect.Op{Kind: elect.OpCreate}, 10)
-
-	seenMissing := false
-
-	for range 50 {
-		if g := l2.Do(elect.Op{Kind: elect.OpGetCached}, 20); errors.Is(g.Err, elect.ErrNotFound) {
-			seenMissing = true
-		}
-	}
-
-	if !seenMissing {
-		t.Fatal("cached read never stale before create")
 	}
 }
 
@@ -457,14 +310,14 @@ func TestLeaseOutageConflictsAsync(t *testing.T) {
 	l := NewLeaseServer(s, LeaseConfig{ConflictPPM: 500_000})
 	l.AddOutage(100, 200)
 
-	if r := l.Do(elect.Op{Kind: elect.OpGet}, 150); !errors.Is(r.Err, ErrUnavailable) {
+	if r := l.Do(NoMember, elect.Op{Kind: elect.OpGet}, 150); !errors.Is(r.Err, ErrUnavailable) {
 		t.Fatal("outage")
 	}
 
 	conflicts := 0
 
 	for i := range 100 {
-		if r := l.Do(elect.Op{Kind: elect.OpCreate}, int64(300+i)); errors.Is(r.Err, elect.ErrConflict) {
+		if r := l.Do(NoMember, elect.Op{Kind: elect.OpCreate}, int64(300+i)); errors.Is(r.Err, elect.ErrConflict) {
 			conflicts++
 		}
 	}
@@ -482,48 +335,6 @@ func TestLeaseOutageConflictsAsync(t *testing.T) {
 
 	if len(got) != 1 || got[0].Seq != 5 || s.Now() < 5_000_000 {
 		t.Fatalf("submit %v at %d", got, s.Now())
-	}
-}
-
-func TestLeaseQPS(t *testing.T) {
-	s := New(4)
-	l := NewLeaseServer(s, LeaseConfig{})
-
-	// Member 1: 10 ops spread over 10s. Member 2: 30 ops within 0.5s
-	// straddling a second boundary.
-	for i := range int64(10) {
-		l.DoAs(1, elect.Op{Kind: elect.OpGetCached}, i*nsPerSec)
-	}
-
-	for i := range int64(30) {
-		l.DoAs(2, elect.Op{Kind: elect.OpGet}, 4_800_000_000+i*15_000_000)
-	}
-
-	q := l.QPS()
-	if q.Member(1).Max != 1 || q.Member(1).Total != 10 {
-		t.Fatalf("member 1 %+v", q.Member(1))
-	}
-
-	if q.Member(2).Max != 30 || q.Kind(elect.OpGet).Total != 30 {
-		t.Fatalf("member 2 %+v", q.Member(2))
-	}
-
-	if q.All().Max != 31 || q.All().Total != 40 {
-		t.Fatalf("all %+v", q.All())
-	}
-
-	if m := q.Members(); len(m) != 2 || m[0] != 1 {
-		t.Fatal("members")
-	}
-
-	series, first := q.Series(3)
-	if first != 7 || len(series) != 3 || series[0] != 1 {
-		t.Fatalf("series %v from %d", series, first)
-	}
-
-	all, first := q.Series(0)
-	if first != 0 || all[4] != 15 || all[5] != 17 {
-		t.Fatalf("series %v", all)
 	}
 }
 
@@ -583,7 +394,7 @@ func TestProcesses(t *testing.T) {
 		t.Fatal("resume")
 	}
 
-	if !p.Restart(0) || p.Get(0).Incarnation == inc || p.Get(0).Starts != 2 {
+	if !p.Crash(0) || !p.Start(0) || p.Get(0).Incarnation == inc || p.Get(0).Starts != 2 {
 		t.Fatal("restart")
 	}
 
@@ -603,7 +414,7 @@ func TestProcesses(t *testing.T) {
 		t.Fatalf("live %v", live)
 	}
 
-	if p.Count(Crashed) != 1 || len(p.InState(nil, Crashed)) != 1 || !Starting.Alive() || Crashed.Alive() {
+	if len(p.InState(nil, Crashed)) != 1 || !Starting.Alive() || Crashed.Alive() {
 		t.Fatal("count")
 	}
 

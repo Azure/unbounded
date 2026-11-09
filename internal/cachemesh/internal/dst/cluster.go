@@ -71,7 +71,6 @@ type Cluster struct {
 	versions  map[view.Version]view.Digest
 	validated map[*view.View]bool
 	faultEnd  int64
-	leaseQPS  int // peak steady-state lease QPS observed
 	ctl       controlState
 
 	cov covHandles
@@ -714,13 +713,6 @@ func (c *Cluster) checkPeriodic() {
 	// fault within the last 90s, after warmup).
 	now := c.Sim.Now()
 	quiet := now > max(c.sc.Warmup, startupQuiet) && !c.faultActive(now-30*sec, now)
-
-	if quiet {
-		series, _ := c.Lease.QPS().Series(10)
-		for _, q := range series {
-			c.leaseQPS = max(c.leaseQPS, int(q))
-		}
-	}
 
 	c.checkLease(now, quiet)
 	c.checkBounded()
