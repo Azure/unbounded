@@ -38,6 +38,21 @@ Renamed variables (no compatibility aliases):
 | `RACER_PEER_PORT` | Removed; the port of `RACER_PEER_LISTEN` is published |
 | `RACER_DST_SEEDS`, `RACER_DST_STEPS`, `RACER_DST_FILTER` | `DST_SEEDS`, `DST_STEPS`, `DST_FILTER` |
 
+Renamed and removed Prometheus metrics (no compatibility aliases). Update
+dashboards and alerts that use the old names:
+
+| Old | New |
+| --- | --- |
+| `racer_recycler_bytes` | `racer_buffer_pool_bytes` |
+| `racer_recycler_entries` | Removed; see `racer_buffer_pool_misses_total` and `racer_buffer_pool_rejects_total` |
+| `racer_worker_recycler_bytes` | `racer_worker_buffer_pool_bytes` |
+| `racer_fill_checksum_nanoseconds_{sum,count}` | `racer_fill_tag_check_nanoseconds_{sum,count}` |
+| `racer_crypto_decrypt_crc_rejected_total` | Removed; use `racer_crypto_decrypt_aead_rejected_total` |
+| `racer_crypto_decrypt_failure_corrupt_crc_total` | Removed; use `racer_crypto_decrypt_failure_corrupt_aead_total` |
+| `racer_disk_class_index_evicted_pages_total` | Removed |
+| `racer_disk_class_index_evicted_payload_bytes_total` | Removed |
+| `racer_retention_heat_entries` | Removed |
+
 
 ## Origin HTTPS
 
