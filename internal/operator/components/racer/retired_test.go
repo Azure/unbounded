@@ -193,6 +193,7 @@ func TestDataplaneWaitsForConfigMigration(t *testing.T) {
 	require.NoError(t, env.Client.Update(t.Context(), config))
 
 	op := dataplaneOp(t, planPass(t, env))
+
 	config.SetGroupVersionKind(corev1.SchemeGroupVersion.WithKind("ConfigMap"))
 	require.Contains(t, op.DependsOn, component.RefOf(component.ToUnstructured(config)))
 }
