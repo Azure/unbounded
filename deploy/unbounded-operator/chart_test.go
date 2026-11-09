@@ -184,7 +184,7 @@ func TestChartRejectsInvalidValues(t *testing.T) {
 	for name, set := range map[string]string{
 		"image name with registry": "image.name=ghcr.io/azure/unbounded-operator",
 		"malformed digest":         "image.digest=latest",
-		"unknown value":            "operatorImage=foo",
+		"unknown image field":      "image.repository=foo",
 		"chart-owned namespace":    "namespace.create=true",
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -198,8 +198,9 @@ func TestChartRejectsInvalidValues(t *testing.T) {
 	}
 }
 
-// TestChartAcceptsExtensionManagerValues checks that the values AKS cluster
-// extensions inject (Azure.Cluster.*) pass the schema.
+// TestChartAcceptsExtensionManagerValues checks that the platform values an AKS
+// cluster extension injects pass the schema. The keys are the ones Extension
+// Manager sent on a real install; a strict root rejected them.
 func TestChartAcceptsExtensionManagerValues(t *testing.T) {
 	t.Parallel()
 
@@ -209,6 +210,13 @@ func TestChartAcceptsExtensionManagerValues(t *testing.T) {
 		"--set-string", "Azure.Cluster.ResourceId=/subscriptions/0000/resourceGroups/rg/providers/Microsoft.ContainerService/managedClusters/c",
 		"--set-string", "Azure.Cluster.Region=eastus2euap",
 		"--set-string", "Azure.Cluster.Distribution=aks",
+		"--set-string", "IdentityClientId=00000000-0000-0000-0000-000000000000",
+		"--set-string", "IdentityPrincipalId=00000000-0000-0000-0000-000000000000",
+		"--set-string", "IdentityTenantId=00000000-0000-0000-0000-000000000000",
+		"--set-string", "IdentityType=SystemAssigned",
+		"--set", "IsWorkloadIdentityEnabled=false",
+		"--set-string", "DataBoundary=Global",
+		"--set-string", "scope=cluster",
 	)
 }
 

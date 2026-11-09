@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "The root accepts extra keys: AKS cluster extensions inject platform values (Azure.Cluster.*, IdentityClientId, DataBoundary, scope, ...) that this chart ignores. The chart's own objects stay strict.",
   "type": "object",
-  "additionalProperties": false,
   "required": ["imageRegistry", "image", "apiServerEndpoint", "reapLegacyResources", "resources", "namespace"],
   "properties": {
     "imageRegistry": {"type": "string", "minLength": 1},
@@ -25,11 +25,6 @@
       "additionalProperties": false,
       "required": ["create"],
       "properties": {"create": {"const": false}}
-    },
-    "global": {"type": "object"},
-    "Azure": {
-      "description": "Platform metadata injected by AKS cluster extensions (Azure.Cluster.*). Accepted and ignored.",
-      "type": "object"
     }
   }
 }
