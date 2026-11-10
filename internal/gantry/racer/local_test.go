@@ -193,7 +193,36 @@ func TestNonLocalRequestIgnoresLocalStore(t *testing.T) {
 	metadata, _, err := Origin(testConfig(), upstream, WithLocalStore(store))(t.Context(), racersdk.OriginRequest{
 		Request: requestFor(t, ref, ""), Head: true,
 	})
-	if err != nil || metadata.ContentType != "application/x-registry" || upstream.heads.Load() != 1 {
+	if err != nil || metadata.ContentType != "application/octet-stream" || metadata.Size != 13 || upstream.heads.Load() != 1 {
 		t.Fatalf("metadata=%+v err=%v heads=%d", metadata, err, upstream.heads.Load())
+	}
+}
+
+func TestLocalAndRegistryBlobMetadataAgree(t *testing.T) {
+	data := []byte("same bytes")
+	store, ref := localFixture(t, data, ifaces.KindBlob)
+	upstream := &testUpstream{head: func(context.Context, ifaces.OriginRef) (int64, string, error) {
+		return int64(len(data)), "application/vnd.oci.image.layer.v1.tar+gzip", nil
+	}}
+	origin := Origin(testConfig(), upstream, WithLocalStore(store))
+
+	remote, _, err := origin(t.Context(), racersdk.OriginRequest{Request: requestFor(t, ref, ""), Head: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	local, body, found, err := serveLocal(t.Context(), store, ref, racersdk.OriginRequest{
+		Request: requestFor(t, ref, ""), Head: true,
+	}, true)
+	if body != nil {
+		_ = body.Close()
+	}
+
+	if err != nil || !found {
+		t.Fatalf("local head: found=%v err=%v", found, err)
+	}
+
+	if remote.Size != local.Size || remote.ETag != local.ETag || remote.ContentType != local.ContentType {
+		t.Fatalf("registry %+v and local %+v metadata disagree", remote, local)
 	}
 }

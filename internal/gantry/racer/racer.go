@@ -268,11 +268,24 @@ func open(ctx context.Context, source upstream, ref ifaces.OriginRef, request ra
 
 	metadata := racersdk.Metadata{
 		Size: size, ETag: tag,
-		ContentType: contentType,
+		ContentType: originContentType(ref.Kind, contentType),
 		ExpiresAt:   time.Now().Add(metadataTTL).Truncate(time.Millisecond),
 	}
 
 	return metadata, nil, nil
+}
+
+// originContentType reports every non-manifest object as
+// application/octet-stream. Blob bytes are typed by the manifest that
+// references them, and registries disagree on the header they send, so a fixed
+// type keeps registry pages and pages served from the local content store
+// (see localContentType) on the same version metadata.
+func originContentType(kind ifaces.OriginRefKind, contentType string) string {
+	if kind != ifaces.KindManifest {
+		return "application/octet-stream"
+	}
+
+	return contentType
 }
 
 func openRange(ctx context.Context, source ifaces.OriginRangePuller, ref ifaces.OriginRef, tag string, offset, length int64) (racersdk.Metadata, io.ReadCloser, error) {
@@ -284,7 +297,7 @@ func openRange(ctx context.Context, source ifaces.OriginRangePuller, ref ifaces.
 	}
 
 	metadata := racersdk.Metadata{
-		Size: size, ETag: tag, ContentType: contentType,
+		Size: size, ETag: tag, ContentType: originContentType(ref.Kind, contentType),
 		ExpiresAt: time.Now().Add(metadataTTL).Truncate(time.Millisecond),
 	}
 	if size < 0 {

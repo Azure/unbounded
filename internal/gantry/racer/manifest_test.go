@@ -81,7 +81,9 @@ func TestRacerRegistryContentType(t *testing.T) {
 						metadata, body, err := origin(ctx, req)
 
 						wantType := ""
-						if supplied {
+						if tc.route == "blobs" {
+							wantType = "application/octet-stream"
+						} else if supplied {
 							wantType = tc.contentType
 						}
 
@@ -122,7 +124,7 @@ func TestRacerRegistryContentType(t *testing.T) {
 					}
 
 					wantType := tc.contentType
-					if !supplied {
+					if !supplied || tc.route == "blobs" {
 						wantType = "application/octet-stream"
 					}
 

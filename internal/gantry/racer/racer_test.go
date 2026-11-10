@@ -856,8 +856,10 @@ func TestRegistryOriginManifestContinuation(t *testing.T) {
 
 	value := adapterGet(t, client, ref, "")
 
-	if value.Metadata().ContentType != "application/vnd.oci.image.manifest.v1+json; charset=utf-8" {
-		t.Fatalf("manifest media type lost: %q", value.Metadata().ContentType)
+	// A blob-route request that falls back to the manifest route still
+	// reports the normalized blob type, matching local content store pages.
+	if value.Metadata().ContentType != "application/octet-stream" {
+		t.Fatalf("blob-route content type not normalized: %q", value.Metadata().ContentType)
 	}
 
 	got, err := io.ReadAll(value)
@@ -898,6 +900,16 @@ func TestOriginPinnedMetadataConsistency(t *testing.T) {
 			value := adapterGet(t, client, testRef(), "")
 
 			n, err := io.Copy(io.Discard, value)
+			if change == "content type" {
+				// Blob content types are normalized, so a registry that changes
+				// the header between ranges still yields one consistent version.
+				if err != nil || n != size || value.Metadata().ContentType != "application/octet-stream" {
+					t.Fatalf("normalized blob content type: bytes=%d err=%v metadata=%+v", n, err, value.Metadata())
+				}
+
+				return
+			}
+
 			if err == nil || n >= size {
 				t.Fatalf("changed pinned metadata accepted: bytes=%d err=%v", n, err)
 			}
@@ -974,7 +986,12 @@ func TestRegistryOriginDistributionManifest(t *testing.T) {
 					wantGets++
 				}
 
-				if metadata.Size != int64(len(data)) || metadata.ContentType != contentType || gets.Load() != wantGets || heads.Load() != 0 {
+				wantType := contentType
+				if kind == ifaces.KindBlob {
+					wantType = "application/octet-stream"
+				}
+
+				if metadata.Size != int64(len(data)) || metadata.ContentType != wantType || gets.Load() != wantGets || heads.Load() != 0 {
 					t.Fatalf("metadata=%+v gets=%d heads=%d", metadata, gets.Load(), heads.Load())
 				}
 			})
