@@ -322,6 +322,17 @@ impl From<Error> for RefreshFailure {
     }
 }
 
+/// Whether an origin `404` under `authority` proves an object of a cache with
+/// writes absent. A written object is known only to its coordinator, page
+/// zero's rank 0, until it uploads: the absence is proven when this node is
+/// rank 0 or rank 0 answered that it holds no copy. A rank 0 skipped as
+/// silent or unreachable (stale link health after churn) proves nothing.
+fn absence_is_authoritative(authority: &super::candidates::OriginAuthority) -> bool {
+    authority.rank() == 0
+        || authority.predecessor_evidence().first()
+            == Some(&racer_core::read::ProbeOutcome::CopyMiss)
+}
+
 fn caller_budget_failure(error: Error, budget: &AcquisitionBudget) -> bool {
     // Rejections are classified separately by RefreshFailure; for the rest,
     // racer-core's settlement rule decides whether another waiter retries.
@@ -707,7 +718,20 @@ impl MetadataService {
             CandidateResolution::Origin(authority) => {
                 let output = self
                     .refresh_origin(&authority, &purpose, membership, context, scope, budget)
-                    .await?;
+                    .await
+                    .map_err(|failure| match failure {
+                        RefreshFailure::Terminal(Error::NotFound)
+                            if self.storage.fill.writes(&context.object.cache)
+                                && !absence_is_authoritative(&authority) =>
+                        {
+                            // The origin does not know a written object
+                            // until it uploads, and only page zero's rank 0
+                            // coordinates writes. Without its answer the
+                            // object may exist: retryable, not 404.
+                            RefreshFailure::Terminal(Error::Unavailable)
+                        }
+                        failure => failure,
+                    })?;
                 bootstrap_page = output.page;
                 output.metadata
             }
@@ -972,6 +996,18 @@ impl MetadataService {
             let now = self.observe_clock()?;
             match selector {
                 MetadataSelector::Fresh => {
+                    // A written object this worker coordinates is current
+                    // whether or not a read published it to the catalog
+                    // (the published pointer lapses after METADATA_TTL).
+                    // Answering a miss here would make the asking reader
+                    // treat the coordinator's miss as authority and get
+                    // the origin's `404`.
+                    if let Some(metadata) = self
+                        .writes
+                        .current(&context.object, self.candidates.ctx().clock.wall_now())
+                    {
+                        return Ok(Some(metadata));
+                    }
                     let Some(current) = self.storage.index.current(&context.object)? else {
                         return Ok(None);
                     };

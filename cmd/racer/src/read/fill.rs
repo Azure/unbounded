@@ -228,6 +228,15 @@ impl Fill {
         self.dependencies.memory.availability().mode(cache)
     }
 
+    /// Whether `cache` is published with writes enabled.
+    pub(crate) fn writes(&self, cache: &racer_wire::control::CacheId) -> bool {
+        self.dependencies
+            .memory
+            .availability()
+            .writes(cache)
+            .is_some()
+    }
+
     /// Whether `cache` retains no pages or metadata on this node.
     pub(crate) fn passthrough(&self, cache: &racer_wire::control::CacheId) -> bool {
         self.mode(cache).passthrough()
