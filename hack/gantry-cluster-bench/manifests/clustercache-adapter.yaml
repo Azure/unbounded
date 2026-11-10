@@ -1,0 +1,15 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Racer mode with adapter persistence: Racer never writes gantry pages to its
+# slab disks. Pages live in memory only, and containerd's content store is the
+# only disk copy; gantry serves local-only origin requests from it. Applied by
+# deploy.sh adapter.
+apiVersion: racer.unbounded-cloud.io/v1alpha1
+kind: ClusterCache
+metadata:
+  name: gantry
+  labels:
+    gantry-cluster-bench: "true"
+spec:
+  persistence: Adapter
