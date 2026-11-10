@@ -872,10 +872,12 @@ Node settings (`cmd/racer/src/config.rs`; the entries live in
 generated reference table in `docs/content/reference/racer.md` and the
 operator's `dataplane-settings.json` are regenerated from the table.
 
-As implemented (WP7): `UploadMode` is defined in `racer_wire::control`
-(`cmd/racer/wire/src/control/writes.rs`) next to `WriteDefinition`, with
-`as_str`/`parse` for the `auto|manual|never` spelling. WP1 should reuse it
-(`pub use crate::control::UploadMode`) instead of defining a second enum. The
+As implemented: `racer_wire::control` re-exports the single `UploadMode`
+from `racer_wire::object::write` (see "WP1 and WP2 as built"), so the catalog
+and the `Racer-Upload` header share one type and spelling.
+`MAX_WRITE_REPLICAS` and `MAX_WRITE_HOLD_TTL` in
+`cmd/racer/wire/src/control/writes.rs` derive from `object::write::MAX_REPLICAS`
+and `MAX_HOLD_SECONDS`, which the store's `MAX_HOLD_TTL` also uses. The
 CRD uses a typed `UploadMode` string (`Auto`, `Manual`, `Never`) rather than
 `*string`, and `WriteUpload.MaxConcurrentBlocks` is bounded 1..1024 and
 `MaxBytesPerSecond` at least 0; the wire enforces the same bounds.
@@ -973,7 +975,7 @@ The code refined these interfaces; the code is authoritative.
 - `UploadMode`, `Durability`, and `UploadState` live in
   `cmd/racer/wire/src/object/write.rs` (the response heads need
   `UploadState`); `racer_core::write` re-exports them with `MIN_REPLICAS` and
-  `MAX_REPLICAS`.
+  `MAX_REPLICAS`, and `racer_wire::control` re-exports `UploadMode`.
 - `parse_write(head, header_limit, page_size: PageSize) -> WriteResult<WriteRequest>`.
   The shared `object::Error` has no `411`, `413`, or `428` variant, so writes
   return `WriteError::{Object(Error), LengthRequired, PayloadTooLarge,
