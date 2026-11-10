@@ -4,10 +4,9 @@
 //! upload faults. Every check is a panic, which [`super::run`] reports as a
 //! failed scenario.
 //!
-//! Faults here always leave at least one acknowledged holder and the
-//! coordinator recoverable (a crashed node restarts from its disk; a
-//! partition heals). Scenarios that need repair after permanent holder loss
-//! or coordinator failover are in [`GATED`] until WP8 lands.
+//! Crashes restart from disk and partitions heal; the holder-loss and
+//! membership-churn scenarios also remove and add nodes, which exercises
+//! repair, rank-0 rebalancing, and coordinator failover (WP8).
 
 use super::*;
 use crate::origin::upload::CommitConflict;
@@ -19,11 +18,9 @@ use racer_wire::control::WriteDefinition;
 use racer_wire::object::write::UploadMode;
 use std::collections::BTreeSet;
 
-/// Write scenarios that need WP8 (repair after permanent holder loss,
-/// coordinator failover, rekey after membership churn). They are runnable
-/// by name but are not in [`super::SCENARIOS`], so the default run and CI
-/// skip them. Enable after WP8: move them into `SCENARIOS` and add seeds to
-/// `cmd/racer/dst/seeds/ci.txt`.
+/// Write scenarios that need unfinished features: runnable by name, but
+/// not in [`super::SCENARIOS`], so the default run and CI skip them. Empty
+/// since WP8 landed.
 pub const GATED: &[&str] = &[];
 
 /// Orphan age the simulated nodes use (production default: one hour).
