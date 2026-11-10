@@ -7,9 +7,12 @@
 //!   coordinator lost the session: a lost abort, a coordinator that lost its
 //!   journal, a release that never arrived) is dropped once it stayed
 //!   unknown for `RACER_WRITE_ORPHAN_SECS`. Members are asked with `status`
-//!   at most every [`check_interval`]; a version is unknown only when a
-//!   member answered and none knows it, so an unreachable coordinator never
-//!   counts as a vote.
+//!   at most every [`check_interval`]; a version is unknown only when every
+//!   member answered and none knows it, so an unreachable coordinator or
+//!   replica blocks the vote.
+//! - Missed releases: a version its coordinator reports uploaded is
+//!   unpinned (kept readable) at the next check, in case the coordinator's
+//!   one-shot background release never reached this holder.
 //! - Removed caches: written pages and sessions of a cache that is no
 //!   longer published are dropped once the cache stayed absent for
 //!   [`REMOVED_CACHE_GRACE`]. A cache ID is never reused for another
@@ -175,6 +178,19 @@ async fn orphans(
     let writer = &local.fill.dependencies.writer;
     for version in due {
         let knowledge = known(local, membership, &version, scope).await?;
+        if matches!(
+            knowledge,
+            Knowledge::Known(racer_wire::object::write::UploadState::Committed)
+        ) {
+            // Uploaded: the coordinator's release (sent once, in the
+            // background) missed this holder. Unpin; the pages stay
+            // readable as ordinary cache pages.
+            for page in by_version.get(&version).into_iter().flatten() {
+                writer.release_written(page).await?;
+            }
+            local.writes.gc.borrow_mut().versions.remove(&version);
+            continue;
+        }
         let expired = {
             let mut gc = local.writes.gc.borrow_mut();
             let Some(probe) = gc.versions.get_mut(&version) else {
@@ -218,17 +234,20 @@ async fn known(
     if let Some((Role::Coordinator | Role::Replica, state)) = local_entry {
         return Ok(Knowledge::Known(state));
     }
-    let mut answered = false;
+    // Every member must answer: a silent one may be the coordinator or a
+    // manifest replica that knows the version (a partition or a stale link
+    // must never turn a live write into an orphan).
+    let mut silent = false;
     for node in page_zero_members(local, membership, &version.object, scope).await? {
         match probe(local, membership, &node, version, scope).await {
             Knowledge::Known(state) => return Ok(Knowledge::Known(state)),
-            Knowledge::Unknown => answered = true,
-            Knowledge::Silent => {}
+            Knowledge::Unknown => {}
+            Knowledge::Silent => silent = true,
         }
     }
-    Ok(if answered {
-        Knowledge::Unknown
-    } else {
+    Ok(if silent {
         Knowledge::Silent
+    } else {
+        Knowledge::Unknown
     })
 }
