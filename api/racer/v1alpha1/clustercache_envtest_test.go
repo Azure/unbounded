@@ -539,3 +539,90 @@ func TestEnvtestClusterCachePassthroughValidation(t *testing.T) {
 		require.NoError(t, update(t, name, nil))
 	})
 }
+
+func TestEnvtestClusterCachePersistenceValidation(t *testing.T) {
+	assets := os.Getenv("KUBEBUILDER_ASSETS")
+	if assets == "" {
+		t.Skip("set KUBEBUILDER_ASSETS for real API validation tests")
+	}
+
+	environment := &envtest.Environment{BinaryAssetsDirectory: assets, CRDDirectoryPaths: []string{"crd"}, ErrorIfCRDPathMissing: true}
+	rc, err := environment.Start()
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, environment.Stop()) })
+
+	scheme := runtime.NewScheme()
+	require.NoError(t, AddToScheme(scheme))
+	c, err := client.New(rc, client.Options{Scheme: scheme})
+	require.NoError(t, err)
+
+	n := 0
+	create := func(spec map[string]any) (string, error) {
+		n++
+		name := fmt.Sprintf("persistence-%d", n)
+		obj := &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": GroupVersion.String(),
+			"kind":       "ClusterCache",
+			"metadata":   map[string]any{"name": name},
+			"spec":       spec,
+		}}
+
+		return name, c.Create(t.Context(), obj)
+	}
+
+	for name, spec := range map[string]map[string]any{
+		"unset":                  {},
+		"racer":                  {"persistence": "Racer"},
+		"adapter":                {"persistence": "Adapter"},
+		"racer with passthrough": {"persistence": "Racer", "passthrough": map[string]any{}},
+		"racer with origin":      {"persistence": "Racer", "origin": azureCredential(map[string]any{"default": map[string]any{}})},
+	} {
+		t.Run("accepts "+name, func(t *testing.T) {
+			_, err := create(spec)
+			require.NoError(t, err)
+		})
+	}
+
+	for name, tc := range map[string]struct {
+		spec    map[string]any
+		message string
+	}{
+		"unknown":          {map[string]any{"persistence": "Disk"}, "spec.persistence"},
+		"lowercase":        {map[string]any{"persistence": "adapter"}, "spec.persistence"},
+		"with passthrough": {map[string]any{"persistence": "Adapter", "passthrough": map[string]any{"route": "Local"}}, "cannot be combined with passthrough"},
+		"with origin":      {map[string]any{"persistence": "Adapter", "origin": azureCredential(map[string]any{"default": map[string]any{}})}, "cannot be combined with origin"},
+	} {
+		t.Run("rejects "+name, func(t *testing.T) {
+			_, err := create(tc.spec)
+			require.True(t, apierrors.IsInvalid(err), "%v", err)
+			require.ErrorContains(t, err, tc.message)
+		})
+	}
+
+	t.Run("allows switching persistence but not adding passthrough to Adapter", func(t *testing.T) {
+		name, err := create(map[string]any{})
+		require.NoError(t, err)
+
+		set := func(path string, value any) error {
+			obj := &unstructured.Unstructured{}
+			obj.SetGroupVersionKind(GroupVersion.WithKind("ClusterCache"))
+			require.NoError(t, c.Get(t.Context(), client.ObjectKey{Name: name}, obj))
+
+			if value == nil {
+				unstructured.RemoveNestedField(obj.Object, "spec", path)
+			} else {
+				require.NoError(t, unstructured.SetNestedField(obj.Object, value, "spec", path))
+			}
+
+			return c.Update(t.Context(), obj)
+		}
+
+		require.NoError(t, set("persistence", "Adapter"))
+
+		err = set("passthrough", map[string]any{})
+		require.True(t, apierrors.IsInvalid(err), "%v", err)
+		require.NoError(t, set("persistence", "Racer"))
+		require.NoError(t, set("persistence", nil))
+		require.NoError(t, set("persistence", "Adapter"))
+	})
+}

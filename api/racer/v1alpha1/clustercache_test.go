@@ -136,3 +136,18 @@ func TestClusterCachePassthroughJSONDeepCopyAndDefault(t *testing.T) {
 	require.NoError(t, err)
 	require.NotContains(t, string(data), "passthrough")
 }
+
+func TestClusterCachePersistenceJSONAndDefault(t *testing.T) {
+	require.Equal(t, PersistenceRacer, ClusterCacheSpec{}.EffectivePersistence())
+	require.Equal(t, PersistenceRacer, ClusterCacheSpec{Persistence: PersistenceRacer}.EffectivePersistence())
+	require.Equal(t, PersistenceAdapter, ClusterCacheSpec{Persistence: PersistenceAdapter}.EffectivePersistence())
+
+	data, err := json.Marshal(&ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: "cache"}, Spec: ClusterCacheSpec{Persistence: PersistenceAdapter}})
+	require.NoError(t, err)
+	require.JSONEq(t, `{"metadata":{"name":"cache"},"spec":{"persistence":"Adapter"}}`, string(data))
+
+	// An unset persistence is omitted, so existing caches keep their encoding.
+	data, err = json.Marshal(&ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: "cache"}})
+	require.NoError(t, err)
+	require.NotContains(t, string(data), "persistence")
+}

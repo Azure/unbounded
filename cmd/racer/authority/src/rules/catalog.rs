@@ -19,6 +19,9 @@ pub struct CacheInfo {
     /// spec.origin as written; None when unset. Parsed by `build` like
     /// passthrough, so an invalid origin fails the catalog.
     pub origin: Option<Value>,
+    /// spec.persistence as written; None when unset. Parsed by `build` like
+    /// passthrough, so an invalid value fails the catalog.
+    pub persistence: Option<Value>,
     /// spec.nodeSelector as written; None when unset. Parsed by `build` so an
     /// invalid selector drops only this cache.
     pub node_selector: Option<Value>,
@@ -35,6 +38,10 @@ impl CacheInfo {
                 .filter(|p| !p.is_null())
                 .cloned(),
             origin: v.pointer("/spec/origin").filter(|o| !o.is_null()).cloned(),
+            persistence: v
+                .pointer("/spec/persistence")
+                .filter(|p| !p.is_null())
+                .cloned(),
             node_selector: v
                 .pointer("/spec/nodeSelector")
                 .filter(|p| !p.is_null())
@@ -53,9 +60,28 @@ pub struct Catalog {
     pub rejected: Vec<String>,
 }
 
-/// Map spec.passthrough to a cache mode. Absence caches; an object without a
-/// route uses the CRD default, Peers. Anything else is invalid.
-fn mode(passthrough: Option<&Value>) -> Result<wire::CacheMode, wire::Error> {
+/// Map spec.persistence and spec.passthrough to a cache mode. Absence caches;
+/// a passthrough object without a route uses the CRD default, Peers.
+/// Persistence Adapter maps to the adapter mode and, as the CRD enforces,
+/// cannot be combined with passthrough or a native origin. Anything else is
+/// invalid.
+fn mode(
+    passthrough: Option<&Value>,
+    persistence: Option<&Value>,
+    origin: bool,
+) -> Result<wire::CacheMode, wire::Error> {
+    let adapter = match persistence {
+        None => false,
+        Some(Value::String(p)) if p == "Racer" => false,
+        Some(Value::String(p)) if p == "Adapter" => true,
+        Some(_) => return Err(wire::Error::InvalidRequest),
+    };
+    if adapter {
+        if passthrough.is_some() || origin {
+            return Err(wire::Error::InvalidRequest);
+        }
+        return Ok(wire::CacheMode::Adapter);
+    }
     let Some(passthrough) = passthrough else {
         return Ok(wire::CacheMode::Cached);
     };
@@ -256,7 +282,11 @@ pub fn build(caches: &[CacheInfo]) -> Result<Catalog, wire::Error> {
             client_socket: client,
             origin_socket: origin,
             priority: priority as u16,
-            mode: mode(c.passthrough.as_ref())?,
+            mode: mode(
+                c.passthrough.as_ref(),
+                c.persistence.as_ref(),
+                c.origin.is_some(),
+            )?,
             origin: origin_definition(c.origin.as_ref())?,
         });
         if let Some(s) = selector {
@@ -283,6 +313,7 @@ mod tests {
             priority: None,
             passthrough: None,
             origin: None,
+            persistence: None,
             node_selector: None,
         }
     }
@@ -398,6 +429,56 @@ mod tests {
                 parse(serde_json::json!({"passthrough":bad.clone()})).is_err(),
                 "{bad}"
             );
+        }
+    }
+
+    #[test]
+    fn persistence_maps_to_mode() {
+        let u = "11111111-1111-4111-8111-111111111111";
+        let parse = |spec: Value| {
+            let info = CacheInfo::from_json(
+                &serde_json::json!({"metadata":{"uid":u,"name":"a"},"spec":spec}),
+            );
+            build(&[info]).map(|out| out.caches[0].mode)
+        };
+        let origin = serde_json::json!({"azure":{"containerURL":"https://acct.blob.core.windows.net/models"}});
+        for (spec, mode) in [
+            (
+                serde_json::json!({"persistence":null}),
+                wire::CacheMode::Cached,
+            ),
+            (
+                serde_json::json!({"persistence":"Racer"}),
+                wire::CacheMode::Cached,
+            ),
+            (
+                serde_json::json!({"persistence":"Racer","passthrough":{"route":"Local"}}),
+                wire::CacheMode::PassthroughLocal,
+            ),
+            (
+                serde_json::json!({"persistence":"Racer","origin":origin.clone()}),
+                wire::CacheMode::Cached,
+            ),
+            (
+                serde_json::json!({"persistence":"Adapter"}),
+                wire::CacheMode::Adapter,
+            ),
+            (
+                serde_json::json!({"persistence":"Adapter","passthrough":null}),
+                wire::CacheMode::Adapter,
+            ),
+        ] {
+            assert_eq!(parse(spec.clone()), Ok(mode), "{spec}");
+        }
+        for bad in [
+            serde_json::json!({"persistence":"adapter"}),
+            serde_json::json!({"persistence":""}),
+            serde_json::json!({"persistence":"Disk"}),
+            serde_json::json!({"persistence":1}),
+            serde_json::json!({"persistence":"Adapter","passthrough":{}}),
+            serde_json::json!({"persistence":"Adapter","origin":origin.clone()}),
+        ] {
+            assert!(parse(bad.clone()).is_err(), "{bad}");
         }
     }
 

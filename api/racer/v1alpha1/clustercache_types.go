@@ -30,6 +30,8 @@ type ClusterCache struct {
 }
 
 // ClusterCacheSpec configures optional cache features.
+// +kubebuilder:validation:XValidation:rule="!has(self.persistence) || self.persistence != 'Adapter' || !has(self.passthrough)",message="persistence Adapter cannot be combined with passthrough"
+// +kubebuilder:validation:XValidation:rule="!has(self.persistence) || self.persistence != 'Adapter' || !has(self.origin)",message="persistence Adapter requires an origin adapter and cannot be combined with origin"
 type ClusterCacheSpec struct {
 	// Origin makes the Racer dataplane read this cache's objects directly from
 	// object storage, with no separate origin process. Origin can be set only
@@ -66,6 +68,20 @@ type ClusterCacheSpec struct {
 	// +optional
 	Passthrough *Passthrough `json:"passthrough,omitempty"`
 
+	// Persistence selects where this cache's pages are kept on disk. Racer,
+	// the default when unset, writes pages to Racer's own local disk. With
+	// Adapter, Racer never writes this cache's pages to its own disk: pages
+	// live in memory only, and on a memory miss Racer first asks the node's
+	// local origin adapter for a local copy with a local-only origin request,
+	// one the adapter must answer without contacting its remote source,
+	// before it asks peers and the remote origin. Use Adapter when the origin
+	// adapter already keeps a durable local copy of the objects it serves.
+	// Adapter cannot be combined with passthrough or origin. Persistence may
+	// be changed at any time; when a cache switches to Adapter, pages
+	// previously written to Racer's disk for it are dropped.
+	// +optional
+	Persistence Persistence `json:"persistence,omitempty"`
+
 	// NodeSelector selects, by Node labels, the Racer nodes that store, serve,
 	// and read this cache. When unset or empty, every Racer node does.
 	// Changing it moves the cache to a new pool of nodes with no migration:
@@ -73,6 +89,27 @@ type ClusterCacheSpec struct {
 	// restricts client pods that use this cache to matching nodes.
 	// +optional
 	NodeSelector *metav1.LabelSelector `json:"nodeSelector,omitempty"`
+}
+
+// Persistence selects where a cache's pages are kept on disk.
+// +kubebuilder:validation:Enum=Racer;Adapter
+type Persistence string
+
+const (
+	// PersistenceRacer writes pages to Racer's own local disk.
+	PersistenceRacer Persistence = "Racer"
+	// PersistenceAdapter keeps pages in Racer memory only and relies on the
+	// origin adapter's local copies for durability on each node.
+	PersistenceAdapter Persistence = "Adapter"
+)
+
+// EffectivePersistence returns spec.persistence, or PersistenceRacer when unset.
+func (s ClusterCacheSpec) EffectivePersistence() Persistence {
+	if s.Persistence == "" {
+		return PersistenceRacer
+	}
+
+	return s.Persistence
 }
 
 // PassthroughRoute selects which node's origin serves a passthrough read.

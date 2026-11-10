@@ -309,10 +309,12 @@ mod tests {
             .unwrap()
             .record;
         let mut hashes = vec![record.content_hash.clone()];
-        // Into each passthrough route, between them, and back to cached.
+        // Into each passthrough route, between them, to adapter persistence,
+        // and back to cached.
         for mode in [
             wire::CacheMode::PassthroughPeers,
             wire::CacheMode::PassthroughLocal,
+            wire::CacheMode::Adapter,
             wire::CacheMode::Cached,
         ] {
             let mut edited = cache();
@@ -327,7 +329,7 @@ mod tests {
             record = next.record;
         }
         // Returning to cached restores the original canonical content.
-        assert_eq!(hashes[0], hashes[3]);
+        assert_eq!(hashes[0], hashes[4]);
     }
 
     #[test]

@@ -255,6 +255,23 @@ spec:
                     - Local
                     type: string
                 type: object
+              persistence:
+                description: |-
+                  Persistence selects where this cache's pages are kept on disk. Racer,
+                  the default when unset, writes pages to Racer's own local disk. With
+                  Adapter, Racer never writes this cache's pages to its own disk: pages
+                  live in memory only, and on a memory miss Racer first asks the node's
+                  local origin adapter for a local copy with a local-only origin request,
+                  one the adapter must answer without contacting its remote source,
+                  before it asks peers and the remote origin. Use Adapter when the origin
+                  adapter already keeps a durable local copy of the objects it serves.
+                  Adapter cannot be combined with passthrough or origin. Persistence may
+                  be changed at any time; when a cache switches to Adapter, pages
+                  previously written to Racer's disk for it are dropped.
+                enum:
+                - Racer
+                - Adapter
+                type: string
               priority:
                 description: |-
                   Priority is the relative weight used to share node cache capacity among
@@ -273,6 +290,14 @@ spec:
                 minimum: 0
                 type: integer
             type: object
+            x-kubernetes-validations:
+            - message: persistence Adapter cannot be combined with passthrough
+              rule: '!has(self.persistence) || self.persistence != ''Adapter'' ||
+                !has(self.passthrough)'
+            - message: persistence Adapter requires an origin adapter and cannot be
+                combined with origin
+              rule: '!has(self.persistence) || self.persistence != ''Adapter'' ||
+                !has(self.origin)'
         type: object
         x-kubernetes-validations:
         - message: name must fit the canonical Unix socket path

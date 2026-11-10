@@ -683,7 +683,8 @@ mod definitions {
         Ok(())
     }
 
-    /// How a cache treats object data. Only `Cached` retains pages or metadata.
+    /// How a cache treats object data. `Cached` and `Adapter` retain pages and
+    /// metadata; only `Cached` writes pages to Racer's own disk.
     #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
     pub enum CacheMode {
         /// Retain pages in memory and on disk under the usual admission policy.
@@ -697,12 +698,29 @@ mod definitions {
         /// Retain nothing; each reading node calls its own local origin socket
         /// and never asks peers.
         PassthroughLocal,
+
+        /// Retain pages in memory only, never on Racer's disk. The origin
+        /// adapter holds the durable local copies: on a memory miss a node
+        /// first asks its own adapter for a local-only copy before peers and
+        /// the remote origin. Never combined with a native origin.
+        Adapter,
     }
 
     impl CacheMode {
         /// Whether pages and metadata of this cache are never retained.
         pub fn passthrough(self) -> bool {
-            self != Self::Cached
+            matches!(self, Self::PassthroughPeers | Self::PassthroughLocal)
+        }
+
+        /// Whether pages of this cache may be written to Racer's own disk.
+        pub fn disk(self) -> bool {
+            self == Self::Cached
+        }
+
+        /// Whether a memory miss first asks the local origin adapter for a
+        /// local-only copy.
+        pub fn adapter(self) -> bool {
+            self == Self::Adapter
         }
     }
 
@@ -787,6 +805,10 @@ mod definitions {
                 return Err(Error::InvalidRequest);
             }
             if let Some(origin) = &d.origin {
+                // A native origin has no adapter to hold local copies.
+                if d.mode.adapter() {
+                    return Err(Error::InvalidRequest);
+                }
                 origin.validate()?;
             }
             let (client, origin) = canonical_socket_paths(&d.name)?;
@@ -1478,6 +1500,8 @@ mod codec {
         PassthroughPeers,
 
         PassthroughLocal,
+
+        Adapter,
     }
 
     impl ModeDto {
@@ -1492,6 +1516,7 @@ mod codec {
                 ModeDto::Cached => Self::Cached,
                 ModeDto::PassthroughPeers => Self::PassthroughPeers,
                 ModeDto::PassthroughLocal => Self::PassthroughLocal,
+                ModeDto::Adapter => Self::Adapter,
             }
         }
     }
@@ -1502,6 +1527,7 @@ mod codec {
                 CacheMode::Cached => Self::Cached,
                 CacheMode::PassthroughPeers => Self::PassthroughPeers,
                 CacheMode::PassthroughLocal => Self::PassthroughLocal,
+                CacheMode::Adapter => Self::Adapter,
             }
         }
     }
@@ -2416,6 +2442,59 @@ mod codec {
             assert_eq!(mh, hashes["membership"]);
             let b = encode_publication(&p).unwrap();
             assert_eq!(b, round_trip("publication.json", &b).unwrap());
+        }
+
+        /// Cache modes round trip with their wire spelling; cached omits the
+        /// field, and adapter persistence is never combined with a native origin.
+        #[test]
+        fn cache_mode_round_trip_and_adapter_origin_rejection() {
+            let p = decode_publication(&fixture("publication.json")).unwrap();
+            assert!(
+                p.caches
+                    .iter()
+                    .all(|c| c.mode == crate::control::CacheMode::Cached)
+            );
+            let base = encode_publication(&p).unwrap();
+            assert!(
+                !String::from_utf8(base.clone())
+                    .unwrap()
+                    .contains("\"mode\"")
+            );
+            for (mode, spelling) in [
+                (
+                    crate::control::CacheMode::PassthroughPeers,
+                    "passthroughPeers",
+                ),
+                (
+                    crate::control::CacheMode::PassthroughLocal,
+                    "passthroughLocal",
+                ),
+                (crate::control::CacheMode::Adapter, "adapter"),
+            ] {
+                let mut next = p.clone();
+                next.caches[0].mode = mode;
+                let b = encode_publication(&next).unwrap();
+                let text = String::from_utf8(b.clone()).unwrap();
+                assert!(text.contains(&format!("\"mode\":\"{spelling}\"")), "{text}");
+                assert_eq!(decode_publication(&b).unwrap().caches, next.caches);
+            }
+            assert!(crate::control::CacheMode::Adapter.adapter());
+            assert!(!crate::control::CacheMode::Adapter.passthrough());
+            assert!(!crate::control::CacheMode::Adapter.disk());
+            assert!(crate::control::CacheMode::Cached.disk());
+            assert!(!crate::control::CacheMode::PassthroughPeers.disk());
+
+            let mut bad = p.clone();
+            bad.caches[0].mode = crate::control::CacheMode::Adapter;
+            bad.caches[0].origin = Some(crate::control::OriginDefinition::azure(
+                crate::control::AzureContainerUrl::parse(
+                    "https://acct.blob.core.windows.net/models",
+                )
+                .unwrap(),
+                crate::control::AzureCredential::Anonymous,
+            ));
+            assert!(encode_publication(&bad).is_err());
+            assert!(validate_publication(&bad).is_err());
         }
 
         /// Origins round trip, are omitted when absent, and are validated on decode.
