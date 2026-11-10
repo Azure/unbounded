@@ -26,6 +26,9 @@ use std::collections::BTreeSet;
 /// `cmd/racer/dst/seeds/ci.txt`.
 pub const GATED: &[&str] = &["writes-holder-loss", "writes-membership-churn"];
 
+/// Orphan age the simulated nodes use (production default: one hour).
+const ORPHAN_AFTER: Duration = Duration::from_secs(8);
+
 /// Generated actions per run when the caller passes 0 steps.
 const DEFAULT_STEPS: usize = 24;
 /// Written keys start here, away from the read corpus objects.
@@ -405,6 +408,11 @@ impl World {
                 let writes = worker.app.coordinator.writes();
                 writes.set_sink(Some(self.sink.clone() as Rc<dyn UploadSink>));
                 writes.set_test_origin(Some(Rc::new(FixtureOrigin(self.existing.clone()))));
+                // Short orphan checks (every 2 s) so garbage collection and
+                // missed-release recovery run inside a run.
+                let mut settings = writes.settings();
+                settings.orphan_after = ORPHAN_AFTER;
+                writes.set_settings(settings);
             }
         }
     }
@@ -729,7 +737,12 @@ impl World {
                         // The stream failed after its head: a failed read.
                         let mut diagnostics = String::new();
                         for worker in &self.harness.nodes[node].workers {
-                            worker.app.telemetry.failures.write(&mut diagnostics).unwrap();
+                            worker
+                                .app
+                                .telemetry
+                                .failures
+                                .write(&mut diagnostics)
+                                .unwrap();
                         }
                         if std::env::var_os("RACER_DST_WRITES_TRACE").is_some() {
                             eprintln!("incomplete read attempt {attempt}: {diagnostics}");
@@ -814,12 +827,7 @@ impl World {
                         .rank(membership.clone(), &version.object, PageNumber(number))
                         .ordered
                         .iter()
-                        .map(|id| {
-                            self.harness
-                                .nodes
-                                .iter()
-                                .position(|n| &n.config.node == id)
-                        })
+                        .map(|id| self.harness.nodes.iter().position(|n| &n.config.node == id))
                         .collect();
                     format!("page {number}: holders {holders:?} owners {owners:?}")
                 })
@@ -1193,8 +1201,10 @@ impl World {
     /// End of run: let uploads finish, then check upload and holder
     /// invariants across the whole oracle.
     fn finish(&mut self) {
-        self.wait(Duration::from_secs(5));
-        self.wait(Duration::from_secs(5));
+        // Long enough for uploads, one orphan age, and missed-release checks.
+        for _ in 0..6 {
+            self.wait(Duration::from_secs(3));
+        }
         let commits = self.sink.commits.borrow().clone();
         for (key, count) in &commits {
             assert_eq!(
@@ -1249,6 +1259,30 @@ impl World {
             );
         }
         if !self.profile.holder_loss && !self.profile.churn {
+            if self.written_pages() != self.expected_pages() {
+                for (i, n) in self.harness.nodes.iter().enumerate() {
+                    for w in &n.workers {
+                        for (page, entry) in w.app.store.writer.written_pages() {
+                            let live = self
+                                .live
+                                .iter()
+                                .find(|(o, _)| self.object(**o) == page.version.object);
+                            eprintln!(
+                                "node {i} page {:?} {:?} {} live={:?} entry={entry:?}",
+                                page.version.object.key,
+                                page.version.etag,
+                                page.number.0,
+                                live.map(|(_, w)| (
+                                    w.etag.clone(),
+                                    w.uploading,
+                                    w.replicas,
+                                    w.mode
+                                ))
+                            );
+                        }
+                    }
+                }
+            }
             assert_eq!(
                 self.written_pages(),
                 self.expected_pages(),
