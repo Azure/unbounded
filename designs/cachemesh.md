@@ -639,8 +639,9 @@ Implementation notes (`control.Node`):
   from a live cluster never cold-starts: the live leader's renewals keep
   changing the record. A `Discovered` live holder cancels a cold start.
 - Higher terms. Every control message and delta carries a full 64-bit term.
-  Messages are not authenticated, so a term in a message is a claim that
-  only the Lease can confirm (see Lease corroboration below). A member that
+  The library does not authenticate messages itself (gantry's transport
+  only admits holders of the peer key, see Security), so a term in a
+  message is a claim that only the Lease can confirm (see Lease corroboration below). A member that
   sees a term above its view's records it (`Elector.ObserveTerm`), so its
   next acquisition and any release start above it. A higher term in a
   message never makes a leader step down: a leader stops publishing only

@@ -1269,7 +1269,7 @@ func (n *Node) repairSource(from string) string {
 }
 
 // observeTerm handles a full 64-bit term seen in a control message or
-// delta from addr. Messages are not authenticated, so the term is only a
+// delta from addr. This package does not authenticate messages, so the term is only a
 // hint: it never makes a leader step down (its Lease renewals do that).
 // Every member remembers a sane term so its next acquisition starts above
 // it. A member whose view the Lease backs reads the Lease rather than

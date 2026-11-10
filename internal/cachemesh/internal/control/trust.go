@@ -11,8 +11,9 @@ import (
 
 // Lease corroboration.
 //
-// Control messages, deltas, and snapshots are not signed: any peer that can
-// send a message can claim any term, leader, or version. The Lease is the
+// Control messages, deltas, and snapshots are not signed by this package.
+// The transport may authenticate peers, but any peer that can send a
+// message can still claim any term, leader, or version. The Lease is the
 // only source of truth for who leads at which term, so a claim of a later
 // term (or of leadership) is believed only when the Lease, as last read by
 // this member's elector, backs it:
