@@ -93,12 +93,8 @@ if [[ -z "${cache_manifest}" ]]; then
   k delete clustercache gantry --ignore-not-found --wait=true --timeout=280s >/dev/null
   want_racer=""
 else
-  # Persistence may not be changeable in place, so recreate on a change.
-  if k get clustercache gantry >/dev/null 2>&1 &&
-    ! k diff -f "${cache_manifest}" >/dev/null 2>&1; then
-    log "replacing ClusterCache/gantry"
-    k delete clustercache gantry --wait=true --timeout=280s >/dev/null
-  fi
+  # spec.persistence is mutable, so apply in place. Switching to Adapter
+  # makes Racer drop the cache's pages from its disks.
   k apply -f "${cache_manifest}" >/dev/null
   want_racer="true"
 fi

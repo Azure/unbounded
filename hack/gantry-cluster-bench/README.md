@@ -133,8 +133,10 @@ All commands run from `hack/gantry-cluster-bench/`.
    ```
 
    Racer keeps cached pages after a run. A new tag gives new digests, so
-   earlier pages are never hit. Switching modes recreates
-   `ClusterCache/gantry`, which drops its data.
+   earlier pages are never hit. `spec.persistence` is mutable, so switching
+   between `racer` and `adapter` updates `ClusterCache/gantry` in place;
+   switching to `adapter` drops the pages Racer wrote to its disks. `default`
+   deletes `ClusterCache/gantry`, which drops all its data.
 
 4. Compare:
 
