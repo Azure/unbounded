@@ -68,6 +68,7 @@ pub enum TextKind {
 pub enum Unit {
     None,
     Bytes,
+    Micros,
     Millis,
     Seconds,
     Percent,
@@ -118,6 +119,7 @@ pub enum Group {
     Network,
     Origin,
     Prefetch,
+    Writes,
     Timeouts,
     Diagnostics,
     Kubernetes,
@@ -137,6 +139,7 @@ impl Group {
             Self::Network => "Listeners and peers",
             Self::Origin => "Origins",
             Self::Prefetch => "Prefetch",
+            Self::Writes => "Writes",
             Self::Timeouts => "Timeouts",
             Self::Diagnostics => "Diagnostics",
             Self::Kubernetes => "Cluster control (managed mode)",
@@ -393,6 +396,7 @@ pub fn accepted(var: &Var) -> String {
             let unit = match unit {
                 Unit::None => "",
                 Unit::Bytes => " bytes",
+                Unit::Micros => " us",
                 Unit::Millis => " ms",
                 Unit::Seconds => " s",
                 Unit::Percent => " %",

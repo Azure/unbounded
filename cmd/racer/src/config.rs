@@ -114,9 +114,45 @@ impl Default for OriginSettings {
     }
 }
 
+/// Node-wide write settings. Per-cache settings (replicas, dirty cap, hold,
+/// upload mode and rate) come from the catalog's
+/// `racer_wire::control::CacheDefinition::writes`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WriteSettings {
+    /// Pages one write keeps in flight (`RACER_WRITE_WINDOW_PAGES`).
+    pub window_pages: u32,
+    /// Write session lease (`RACER_WRITE_LEASE_SECS`).
+    pub lease: Duration,
+    /// Longest group commit wait (`RACER_WRITE_GROUP_COMMIT_MICROS`); zero syncs each page alone.
+    pub group_commit: Duration,
+    /// Journal size per I/O worker that triggers compaction (`RACER_WRITE_JOURNAL_BYTES`).
+    pub journal_bytes: u64,
+    /// Age after which an orphaned written page is released (`RACER_WRITE_ORPHAN_SECS`).
+    pub orphan_after: Duration,
+    /// Lifetime of an origin version alias (`RACER_WRITE_ALIAS_SECS`).
+    pub alias_ttl: Duration,
+    /// Upload tries per written object (`RACER_WRITE_UPLOAD_ATTEMPTS`).
+    pub upload_attempts: u32,
+}
+
+impl Default for WriteSettings {
+    fn default() -> Self {
+        Self {
+            window_pages: 8,
+            lease: Duration::from_secs(60),
+            group_commit: Duration::from_micros(500),
+            journal_bytes: 64 << 20,
+            orphan_after: Duration::from_secs(3600),
+            alias_ttl: Duration::from_secs(604_800),
+            upload_attempts: 10,
+        }
+    }
+}
+
 pub struct Config {
     pub spill: crate::read::spill::Config,
     pub prefetch: crate::prefetch::Config,
+    pub writes: WriteSettings,
     pub send_tag_pair: Option<crate::telemetry::Pair>,
     pub page_hedge: crate::read::candidates::HedgeConfig,
     /// Order in which a non-owner requester visits a page's ranked owners.
@@ -431,6 +467,16 @@ impl Config {
                 concurrent_fills: u("RACER_PREFETCH_CONCURRENT_FILLS"),
                 origin_bytes_per_sec: u("RACER_PREFETCH_ORIGIN_BYTES_PER_SEC"),
                 max_attempts: u("RACER_PREFETCH_MAX_ATTEMPTS"),
+            },
+            writes: WriteSettings {
+                // The table bounds both counts well inside u32.
+                window_pages: u("RACER_WRITE_WINDOW_PAGES") as u32,
+                lease: Duration::from_secs(u("RACER_WRITE_LEASE_SECS")),
+                group_commit: Duration::from_micros(u("RACER_WRITE_GROUP_COMMIT_MICROS")),
+                journal_bytes: u("RACER_WRITE_JOURNAL_BYTES"),
+                orphan_after: Duration::from_secs(u("RACER_WRITE_ORPHAN_SECS")),
+                alias_ttl: Duration::from_secs(u("RACER_WRITE_ALIAS_SECS")),
+                upload_attempts: u("RACER_WRITE_UPLOAD_ATTEMPTS") as u32,
             },
             send_tag_pair: v
                 .text("RACER_SEND_TAG_PAIR")
@@ -2222,6 +2268,80 @@ mod tests {
         .unwrap()
         .prefetch;
         assert_eq!(prefetch.max_pending_bytes, 33554432);
+    }
+
+    #[test]
+    fn write_defaults_and_bounds() {
+        let writes = parse(&[]).unwrap().writes;
+        assert_eq!(writes, WriteSettings::default());
+        assert_eq!(writes.window_pages, 8);
+        assert_eq!(writes.lease, Duration::from_secs(60));
+        assert_eq!(writes.group_commit, Duration::from_micros(500));
+        assert_eq!(writes.journal_bytes, 64 << 20);
+        assert_eq!(writes.orphan_after, Duration::from_secs(3600));
+        assert_eq!(writes.alias_ttl, Duration::from_secs(604_800));
+        assert_eq!(writes.upload_attempts, 10);
+        // Inclusive bounds are accepted.
+        for (name, value) in [
+            ("RACER_WRITE_WINDOW_PAGES", "1"),
+            ("RACER_WRITE_WINDOW_PAGES", "64"),
+            ("RACER_WRITE_LEASE_SECS", "5"),
+            ("RACER_WRITE_LEASE_SECS", "3600"),
+            ("RACER_WRITE_GROUP_COMMIT_MICROS", "0"),
+            ("RACER_WRITE_GROUP_COMMIT_MICROS", "100000"),
+            ("RACER_WRITE_JOURNAL_BYTES", "1048576"),
+            ("RACER_WRITE_JOURNAL_BYTES", "17179869184"),
+            ("RACER_WRITE_ORPHAN_SECS", "60"),
+            ("RACER_WRITE_ORPHAN_SECS", "604800"),
+            ("RACER_WRITE_ALIAS_SECS", "3600"),
+            ("RACER_WRITE_ALIAS_SECS", "2592000"),
+            ("RACER_WRITE_UPLOAD_ATTEMPTS", "1"),
+            ("RACER_WRITE_UPLOAD_ATTEMPTS", "100"),
+        ] {
+            assert!(parse(&[(name, value)]).is_ok(), "{name}={value}");
+        }
+        let writes = parse(&[
+            ("RACER_WRITE_WINDOW_PAGES", "3"),
+            ("RACER_WRITE_LEASE_SECS", "7"),
+            ("RACER_WRITE_GROUP_COMMIT_MICROS", "0"),
+            ("RACER_WRITE_JOURNAL_BYTES", "2097152"),
+            ("RACER_WRITE_ORPHAN_SECS", "61"),
+            ("RACER_WRITE_ALIAS_SECS", "3601"),
+            ("RACER_WRITE_UPLOAD_ATTEMPTS", "2"),
+        ])
+        .unwrap()
+        .writes;
+        assert_eq!(
+            writes,
+            WriteSettings {
+                window_pages: 3,
+                lease: Duration::from_secs(7),
+                group_commit: Duration::ZERO,
+                journal_bytes: 2 << 20,
+                orphan_after: Duration::from_secs(61),
+                alias_ttl: Duration::from_secs(3601),
+                upload_attempts: 2,
+            }
+        );
+        for (name, value) in [
+            ("RACER_WRITE_WINDOW_PAGES", "0"),
+            ("RACER_WRITE_WINDOW_PAGES", "65"),
+            ("RACER_WRITE_LEASE_SECS", "4"),
+            ("RACER_WRITE_LEASE_SECS", "3601"),
+            ("RACER_WRITE_GROUP_COMMIT_MICROS", "100001"),
+            ("RACER_WRITE_GROUP_COMMIT_MICROS", "-1"),
+            ("RACER_WRITE_JOURNAL_BYTES", "1048575"),
+            ("RACER_WRITE_JOURNAL_BYTES", "17179869185"),
+            ("RACER_WRITE_ORPHAN_SECS", "59"),
+            ("RACER_WRITE_ORPHAN_SECS", "604801"),
+            ("RACER_WRITE_ALIAS_SECS", "3599"),
+            ("RACER_WRITE_ALIAS_SECS", "2592001"),
+            ("RACER_WRITE_UPLOAD_ATTEMPTS", "0"),
+            ("RACER_WRITE_UPLOAD_ATTEMPTS", "101"),
+            ("RACER_WRITE_UPLOAD_ATTEMPTS", ""),
+        ] {
+            assert!(parse(&[(name, value)]).is_err(), "{name}={value}");
+        }
     }
 
     #[test]

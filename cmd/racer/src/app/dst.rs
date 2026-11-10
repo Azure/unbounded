@@ -100,6 +100,7 @@ pub mod cluster {
         Config {
             spill: Default::default(),
             prefetch: Default::default(),
+            writes: Default::default(),
             send_tag_pair: None,
             page_hedge: Default::default(),
             replica_selection: Default::default(),

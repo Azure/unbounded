@@ -787,6 +787,56 @@ const BASE: &[Var] = &[
         Value("5"),
         "Tries per page.",
     ),
+    // Writes.
+    var(
+        "RACER_WRITE_WINDOW_PAGES",
+        Group::Writes,
+        uint(1, 64, COUNT),
+        Value("8"),
+        "Pages one write keeps in flight to their owners.",
+    ),
+    var(
+        "RACER_WRITE_LEASE_SECS",
+        Group::Writes,
+        uint(5, 3600, SECS),
+        Value("60"),
+        "Write session lease; the writer renews it every third of the lease, and an expired session is aborted.",
+    ),
+    var(
+        "RACER_WRITE_GROUP_COMMIT_MICROS",
+        Group::Writes,
+        uint(0, 100_000, Unit::Micros),
+        Value("500"),
+        "Longest wait to batch written pages into one durability barrier; `0` syncs each page alone.",
+    ),
+    var(
+        "RACER_WRITE_JOURNAL_BYTES",
+        Group::Writes,
+        uint(MIB, 1 << 34, BYTES),
+        Value("67108864"),
+        "Write journal size per I/O worker that triggers compaction.",
+    ),
+    var(
+        "RACER_WRITE_ORPHAN_SECS",
+        Group::Writes,
+        uint(60, 604_800, SECS),
+        Value("3600"),
+        "Age after which a held written page whose session is unknown to its coordinator is released.",
+    ),
+    var(
+        "RACER_WRITE_ALIAS_SECS",
+        Group::Writes,
+        uint(3600, 2_592_000, SECS),
+        Value("604800"),
+        "How long an uploaded object's origin version stays mapped to its Racer version.",
+    ),
+    var(
+        "RACER_WRITE_UPLOAD_ATTEMPTS",
+        Group::Writes,
+        uint(1, 100, COUNT),
+        Value("10"),
+        "Upload tries per written object before it is marked `failed`.",
+    ),
     // Timeouts.
     var(
         "RACER_REQUEST_TIMEOUT_MS",

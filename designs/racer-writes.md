@@ -861,11 +861,28 @@ Authority mapping in `authority/src/rules/catalog.rs` (`CacheInfo` gains
 `origin_definition` at `catalog.rs:74`; an invalid `writes` fails the cache like
 an invalid origin).
 
-Node settings (`cmd/racer/src/config.rs` and `config/spec.rs`):
-`RACER_WRITE_WINDOW_PAGES` (8), `RACER_WRITE_LEASE_SECS` (60),
-`RACER_WRITE_GROUP_COMMIT_MICROS` (500), `RACER_WRITE_JOURNAL_BYTES` (64 MiB),
-`RACER_WRITE_ORPHAN_SECS` (3600), `RACER_WRITE_ALIAS_SECS` (604800),
-`RACER_WRITE_UPLOAD_ATTEMPTS` (10).
+Node settings (`cmd/racer/src/config.rs`; the entries live in
+`config/table.rs`, with a new `Writes` group and `Micros` unit in
+`config/spec.rs`), parsed into `Config::writes: WriteSettings`:
+`RACER_WRITE_WINDOW_PAGES` (8, 1..64), `RACER_WRITE_LEASE_SECS` (60, 5..3600),
+`RACER_WRITE_GROUP_COMMIT_MICROS` (500, 0..100000),
+`RACER_WRITE_JOURNAL_BYTES` (64 MiB, 1 MiB..16 GiB),
+`RACER_WRITE_ORPHAN_SECS` (3600, 60..604800), `RACER_WRITE_ALIAS_SECS`
+(604800, 3600..2592000), `RACER_WRITE_UPLOAD_ATTEMPTS` (10, 1..100). The
+generated reference table in `docs/content/reference/racer.md` and the
+operator's `dataplane-settings.json` are regenerated from the table.
+
+As implemented (WP7): `UploadMode` is defined in `racer_wire::control`
+(`cmd/racer/wire/src/control/writes.rs`) next to `WriteDefinition`, with
+`as_str`/`parse` for the `auto|manual|never` spelling. WP1 should reuse it
+(`pub use crate::control::UploadMode`) instead of defining a second enum. The
+CRD uses a typed `UploadMode` string (`Auto`, `Manual`, `Never`) rather than
+`*string`, and `WriteUpload.MaxConcurrentBlocks` is bounded 1..1024 and
+`MaxBytesPerSecond` at least 0; the wire enforces the same bounds.
+`validate_definitions` rejects `writes` on a passthrough cache and an upload
+mode other than `never` without a native origin, so these rules hold on decode
+as well as in the CRD and authority. `CacheDefinition::writes()` returns the
+cache's settings to the dataplane.
 
 ## Implementation plan
 

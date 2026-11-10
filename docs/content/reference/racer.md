@@ -491,6 +491,18 @@ each worker and are never divided.
 | `RACER_PREFETCH_ORIGIN_BYTES_PER_SEC` | `0` | Node | 0..1,099,511,627,776 bytes/s | Prefetch origin read rate per owner; `0` turns the limit off. |
 | `RACER_PREFETCH_MAX_ATTEMPTS` | `5` | Node | 1..32 | Tries per page. |
 
+#### Writes
+
+| Variable | Default | Scope | Accepted | Description |
+| --- | --- | --- | --- | --- |
+| `RACER_WRITE_WINDOW_PAGES` | `8` | Node | 1..64 | Pages one write keeps in flight to their owners. |
+| `RACER_WRITE_LEASE_SECS` | `60` | Node | 5..3,600 s | Write session lease; the writer renews it every third of the lease, and an expired session is aborted. |
+| `RACER_WRITE_GROUP_COMMIT_MICROS` | `500` | Node | 0..100,000 us | Longest wait to batch written pages into one durability barrier; `0` syncs each page alone. |
+| `RACER_WRITE_JOURNAL_BYTES` | `67108864` (64 MiB) | Node | 1,048,576..17,179,869,184 bytes | Write journal size per I/O worker that triggers compaction. |
+| `RACER_WRITE_ORPHAN_SECS` | `3600` | Node | 60..604,800 s | Age after which a held written page whose session is unknown to its coordinator is released. |
+| `RACER_WRITE_ALIAS_SECS` | `604800` | Node | 3,600..2,592,000 s | How long an uploaded object's origin version stays mapped to its Racer version. |
+| `RACER_WRITE_UPLOAD_ATTEMPTS` | `10` | Node | 1..100 | Upload tries per written object before it is marked `failed`. |
+
 #### Timeouts
 
 | Variable | Default | Scope | Accepted | Description |
