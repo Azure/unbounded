@@ -205,10 +205,14 @@ struct Cluster {
 
 impl Cluster {
     fn new(seed: u64, nodes: usize, writes: Option<WriteDefinition>) -> Self {
+        Self::build(seed, nodes, writes, false)
+    }
+
+    fn build(seed: u64, nodes: usize, writes: Option<WriteDefinition>, native: bool) -> Self {
         let sim = SimOs::new();
         let clock = racer_io::SimClock::new(seed);
         let env = racer_io::Env::sim(&sim, clock.ctx(0));
-        let mut harness = Harness::new(seed, sim, clock, false);
+        let mut harness = Harness::new(seed, sim, clock, native);
         harness.writes = writes;
         harness.page_size = small_pages();
         // A fixed worker count keeps each node's storage layout, and so its
@@ -758,4 +762,31 @@ fn written_objects_survive_a_crash_restart() {
             assert!(read.object() == body, "restarted {index}, reader {reader}");
         }
     }
+}
+
+/// Store targets pull written pages with the same directed copy-only page
+/// request reads use, so a pull rides an RDMA link when one is up.
+#[test]
+fn store_targets_pull_over_rdma_links() {
+    let mut c = Cluster::build(22, 3, Some(writes(2)), true);
+    for a in 0..3 {
+        for b in 0..3 {
+            if a != b {
+                c.harness.connect_links(&c.env.clone(), a, b);
+            }
+        }
+    }
+    let before = c.harness.coverage.native_writes;
+    let body = bytes(13, 200_000);
+    let created = c.put(0, OBJECT, &body, "Racer-Durability: replicas=3\r\n");
+    assert_eq!(created.status, 201);
+    // Two remote targets pulled every page from the writer over RDMA.
+    assert!(
+        c.harness.coverage.native_writes >= before + 2 * pages(body.len()) as usize,
+        "{} -> {}",
+        before,
+        c.harness.coverage.native_writes
+    );
+    let read = c.get(1, OBJECT, body.len());
+    assert!(read.object() == body);
 }
