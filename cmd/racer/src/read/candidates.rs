@@ -2617,6 +2617,11 @@ impl CandidatePolicy {
         self.holders.borrow_mut().forget(page, node);
     }
 
+    /// Drop every holder of `page`, after the page was invalidated.
+    pub(crate) fn forget_holders(&self, page: &crate::model::PageId) {
+        self.holders.borrow_mut().remove(page);
+    }
+
     /// Ask holder `node` for `page` with a holder probe (mode `holder`): it
     /// answers from its memory or its own adapter, or `Miss`, and never
     /// acquires. The probe runs on its own short deadline and a fresh grant

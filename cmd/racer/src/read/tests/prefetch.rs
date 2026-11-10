@@ -604,6 +604,22 @@ fn peer_invalidate_drops_adapter_pages_from_memory() {
     let index = f.fill.dependencies.writer.index().clone();
     assert_eq!(f.fill.dependencies.writer.pending_count(), 0);
     assert!(index.lookup(&page(&version, 0)).unwrap().is_none());
+    let holder = crate::rdma::links::tests::node_id(9);
+    for n in 0..3 {
+        local
+            .fill
+            .dependencies
+            .candidates
+            .record_holder(&page(&version, n), &holder);
+    }
+    assert_eq!(
+        local
+            .fill
+            .dependencies
+            .candidates
+            .holder_candidates(&page(&version, 1)),
+        vec![holder.clone()]
+    );
     let context = crate::security::OriginContext {
         object: f.context.object.clone(),
         metadata: None,
@@ -638,6 +654,16 @@ fn peer_invalidate_drops_adapter_pages_from_memory() {
     assert_eq!(in_memory(&f), 0);
     assert_eq!(f.fill.dependencies.writer.pending_count(), 0);
     assert!(index.version(&version).unwrap().is_none());
+    for n in 0..3 {
+        assert!(
+            local
+                .fill
+                .dependencies
+                .candidates
+                .holder_candidates(&page(&version, n))
+                .is_empty()
+        );
+    }
     endpoint.uninstall().unwrap();
 }
 

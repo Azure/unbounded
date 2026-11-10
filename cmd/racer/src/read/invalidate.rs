@@ -238,6 +238,7 @@ impl Coordinator {
             dependencies.writer.discard_queued(&page);
             index.invalidate_page(&page);
             self.fill.gpu_copies.forget(&page);
+            dependencies.candidates.forget_holders(&page);
         }
     }
 }

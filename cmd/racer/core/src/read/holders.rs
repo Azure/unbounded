@@ -148,6 +148,12 @@ impl<K: Eq + Hash + Clone, N: Eq + Clone> Holders<K, N> {
             }
         }
     }
+
+    /// Drop every holder of `page`, after the page was invalidated. Its
+    /// stale queue position is skipped by eviction and compaction.
+    pub fn remove(&mut self, page: &K) {
+        self.entries.remove(page);
+    }
 }
 
 #[cfg(test)]
@@ -190,6 +196,26 @@ mod tests {
         assert_eq!(h.candidates(&PAGE, &0, now), vec![1, 2]);
         h.forget(&PAGE, &1);
         assert_eq!(h.candidates(&PAGE, &0, now), vec![2]);
+    }
+
+    #[test]
+    fn remove_drops_every_holder_of_one_page() {
+        let (mut h, now) = table(2);
+        let other: Key = ("cache/key", "etag-1", 1);
+        h.record(&PAGE, 1, now);
+        h.record(&PAGE, 2, now);
+        h.record(&other, 3, now);
+        h.remove(&PAGE);
+        assert!(h.candidates(&PAGE, &0, now).is_empty());
+        assert_eq!(h.candidates(&other, &0, now), vec![3]);
+        // The stale queue position of the removed page does not evict it
+        // once re-recorded: the older page goes first.
+        h.record(&PAGE, 4, now);
+        h.record(&("x", "y", 9), 5, now);
+        assert_eq!(h.candidates(&PAGE, &0, now), vec![4]);
+        assert!(h.candidates(&other, &0, now).is_empty());
+        assert_eq!(h.candidates(&("x", "y", 9), &0, now), vec![5]);
+        h.remove(&("absent", "", 0));
     }
 
     #[test]
