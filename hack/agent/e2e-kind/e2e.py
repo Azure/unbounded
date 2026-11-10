@@ -1797,7 +1797,12 @@ def _serve_agent_upgrade_tarball(tarball: Path, operation_name: str, expect_comp
 
 
 def _build_agent_upgrade_tarball(tarball: Path) -> None:
-    """Build the current repo agent binary and package it as a working upgrade tarball."""
+    """Build the current repo agent binary and package it as a working upgrade tarball.
+
+    It holds only the agent: the migration suite has the legacy release's
+    daemon install it, and agents before the fix for #1093 reject any other
+    file in the archive.
+    """
 
     build_dir = tarball.parent / "agent-upgrade-good"
     shutil.rmtree(build_dir, ignore_errors=True)
@@ -6180,8 +6185,11 @@ def run_legacy_agent(node_config: NodeConfig) -> None:
 
 
 def _download_legacy_agent_tarball() -> Path:
-    """Return an AgentUpgrade archive holding the legacy release's agent binary
-    alone, as AgentUpgrade requires; the release also ships its license files.
+    """Return the legacy release's published agent archive, checksum verified.
+
+    It holds LICENSE and NOTICE beside the agent, as published, so the
+    downgrade also checks that this build's AgentUpgrade accepts a release
+    archive with other files in it.
     """
 
     _check_legacy_agent_version()
@@ -6195,14 +6203,7 @@ def _download_legacy_agent_tarball() -> Path:
     download_file(f"{LEGACY_AGENT_RELEASE_URL}/{LEGACY_AGENT_TARBALL}", tarball)
     verify_sha256(tarball, want)
 
-    build_dir = VM_DIR / "agent-upgrade-legacy-release"
-    shutil.rmtree(build_dir, ignore_errors=True)
-    build_dir.mkdir(parents=True)
-    run(["tar", "-xzf", str(tarball), "-C", str(build_dir), "unbounded-agent"])
-    upgrade = VM_DIR / f"unbounded-agent-{LEGACY_AGENT_VERSION}-upgrade.tar.gz"
-    run(["tar", "-czf", str(upgrade), "-C", str(build_dir), "unbounded-agent"])
-
-    return upgrade
+    return tarball
 
 
 def validate_agent_downgrade_to_legacy() -> None:

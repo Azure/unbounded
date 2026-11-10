@@ -46,7 +46,8 @@ active at a time.
 **Staging:**
 
 1. Downloads the release tarball from `downloadURL` and verifies `sha256` when provided.
-2. Requires the bounded archive to contain only the exact `unbounded-agent` member.
+2. Takes the `unbounded-agent` file at the root of the archive and ignores
+   everything else.
 3. Runs `unbounded-agent version` against the staged binary as a binary
    validation check. If this fails, the operation is marked `Failed` and the
    current binary is unchanged.
