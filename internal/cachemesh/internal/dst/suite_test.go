@@ -76,7 +76,7 @@ var requiredCoverage = []string{
 	"leader-plan-mandatory", "leader-plan-optional",
 	"new-term", "member-left", "converged",
 	"fault-cold-restart", "fault-partial-restart", "checkpoint-converged", "node-cold-start",
-	"node-leader-stop-higher-term",
+	"node-term-unverified", "node-lease-verify",
 }
 
 // capBits keeps the default suite fast: 2^20 partitions make every leader

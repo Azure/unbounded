@@ -1274,48 +1274,6 @@ func TestLeaveDuringAcquireCluster(t *testing.T) {
 	}
 }
 
-// TestHigherTermStepsDown: a leader that sees a control message with a
-// higher term steps down and releases at once, even when the terms differ
-// only above 32 bits; the cluster then elects a leader above both.
-func TestHigherTermStepsDown(t *testing.T) {
-	c := grow(t, 5)
-	c.run(2 * time.Minute)
-
-	l := c.leader()
-	_, term := c.nodes[l].Leading()
-	high := term + 1<<32
-
-	// A data-plane note carries a truncated term: never a step-down.
-	c.nodes[l].NoteVersion(c.now, 0, view.Version{Term: uint64(uint32(high)) + 1, Seq: 1})
-
-	if ok, _ := c.nodes[l].Leading(); !ok {
-		t.Fatal("stepped down on a data-plane note")
-	}
-
-	var p Message
-
-	p.Kind = KindPing
-	p.From = MemberRef{ID: "n1", Incarnation: 1, Slot: view.NoSlot}
-	p.Version = view.Version{Term: high, Seq: 1}
-	p.LeaderSlot = view.NoSlot
-	c.nodes[l].Handle(c.now, "nowhere:1", Append(nil, &p))
-
-	if ok, _ := c.nodes[l].Leading(); ok {
-		t.Fatal("still leading after a higher term")
-	}
-
-	if c.nodes[l].Elector().State() == StateLeader {
-		t.Fatal("elector still leader")
-	}
-
-	c.flush(l)
-	c.waitConverged(3 * time.Minute)
-
-	if _, nt := c.nodes[c.leader()].Leading(); nt <= high {
-		t.Fatalf("new term %d not above observed %d", nt, high)
-	}
-}
-
 // TestAbsurdTermIgnored: a term at or above MaxSaneTerm is garbage.
 func TestAbsurdTermIgnored(t *testing.T) {
 	c := grow(t, 3)

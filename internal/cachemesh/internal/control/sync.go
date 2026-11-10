@@ -161,6 +161,10 @@ func (n *Node) setView(now int64, nv *view.View) {
 
 // applyOne applies d (encoded as raw) on top of the current view.
 func (n *Node) applyOne(now int64, d *view.Delta, raw []byte) error {
+	if !n.admitTerm(now, d.Version.Term) {
+		return errTermRefused
+	}
+
 	nv, err := n.applyDelta(d)
 	if err != nil {
 		return err
@@ -227,6 +231,14 @@ func (n *Node) onBroadcast(now int64, from string, m *Message) {
 	case d.Version.Term < cur.Term:
 		n.event("fenced-delta")
 
+		// Two terms are live. If the Lease does not back this view, it
+		// may be the forged or stale one: check the Lease.
+		if !n.viewBacked() {
+			n.verifyLease(now)
+		}
+
+		return
+	case d.Version.Term > cur.Term && !n.admitTerm(now, d.Version.Term):
 		return
 	case d.Base == cur:
 		enc := n.encoded(d, m.Delta)
@@ -374,9 +386,10 @@ func (n *Node) serveCatchUp(m *Message) []byte {
 	mine := n.v.Version()
 
 	switch {
-	case n.leading && m.Have.Term == n.term && mine.Less(m.Have):
-		// Only this member publishes this term, so a requester ahead of it
-		// holds a forged or corrupt view: send ours so it can repair.
+	case n.leading && m.Have.Term >= n.term && mine.Less(m.Have):
+		// Only this member publishes this term, and it holds the Lease, so
+		// a requester ahead of it (in this term or a later one) holds a
+		// forged or corrupt view: send ours so it can repair.
 		r.Snapshot = n.snapshot()
 	case n.unconfirmed || n.badBase:
 		// Do not spread a view that may be corrupt.
@@ -446,16 +459,34 @@ func (n *Node) onCatchUp(now int64, m *Message, from string) {
 			return
 		}
 
+		if !n.saneTerm(nv.Term()) {
+			return
+		}
+
 		cur := n.v.Version()
-		fromLeader := nv.Leader() == m.From.Slot && nv.Version() == m.Version
+		// Only a snapshot served by the Lease holder of its term is
+		// trusted; the leader a snapshot names and the responder's
+		// identity are both claims of the (unauthenticated) responder.
+		fromLeader := n.vouched(nv, m)
+		// A snapshot from a responder that claims to lead it, which the
+		// Lease does not contradict. It may roll back an unconfirmed
+		// view (below) but is adopted unconfirmed unless vouched.
+		claimsLeader := fromLeader || nv.Leader() == m.From.Slot && nv.Version() == m.Version && !n.viewBacked()
 		// A repair source is any peer other than the one that served the
 		// current (suspect) view.
 		repair := (n.badBase || n.unconfirmed) && from != n.snapFrom
 		differs := nv.Digest() != n.v.Digest()
 
 		switch {
+		case nv.Term() > cur.Term && !n.admitTerm(now, nv.Term()):
+			return
 		case cur.Less(nv.Version()), cur == nv.Version() && differs && (fromLeader || repair):
-		case n.unconfirmed && fromLeader && from != n.snapFrom && differs && nv.Term() >= cur.Term:
+		case fromLeader && differs && !n.viewBacked():
+			// The Lease holder of the snapshot's term serves it, and the
+			// Lease does not back the current view: the current view is
+			// forged or stale. Adopt the holder's view even if lower.
+			n.event("lease-rollback")
+		case n.unconfirmed && claimsLeader && from != n.snapFrom && differs && nv.Term() >= cur.Term:
 			// The leader of the term is behind a snapshot nobody has
 			// built on: that snapshot claimed a version that was never
 			// published. Roll back to the leader's view.

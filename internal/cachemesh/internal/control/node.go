@@ -416,6 +416,10 @@ type Node struct {
 	nextLeave   int64
 	leaderAddr  string // last known leader address hint
 
+	// Lease verification (see trust.go).
+	verifiedAt int64
+	verifySeq  uint64
+
 	// Catch-up.
 	catchUpInFlight bool
 	catchUpSentAt   int64
@@ -761,6 +765,11 @@ func (n *Node) leaderTarget() (string, bool) {
 		return "", true
 	}
 
+	// The Lease outranks a view it does not back.
+	if li, ok := n.el.Leader(); ok && !n.viewBacked() && li.Term >= n.v.Term() && li.Addr != "" && li.Addr != n.cfg.Addr {
+		return li.Addr, true
+	}
+
 	if l := n.v.Leader(); l != view.NoSlot && l != n.slot {
 		if a := n.addrOf(l); a != "" {
 			return a, true
@@ -1049,6 +1058,9 @@ func (n *Node) noteRemote(now int64, addr string, m *Message) {
 	mine := n.v.Version()
 
 	switch {
+	case m.Version.Term > mine.Term && n.viewBacked():
+		// A later term the Lease does not show yet: observeTerm reads the
+		// Lease instead of trusting the peer.
 	case mine.Less(m.Version):
 		n.catchUp(now, addr, false)
 	case mine == m.Version && m.Digest != n.v.Digest() && !mine.IsZero():
@@ -1257,31 +1269,41 @@ func (n *Node) repairSource(from string) string {
 }
 
 // observeTerm handles a full 64-bit term seen in a control message or
-// delta from addr. A leader that sees a term above its own steps down at
-// once and gives the Lease back; every member remembers the term so its
-// next acquisition starts above it, and catches up from addr when the term
-// is above its view's. Data-plane notes, whose terms are truncated to 32
+// delta from addr. Messages are not authenticated, so the term is only a
+// hint: it never makes a leader step down (its Lease renewals do that).
+// Every member remembers a sane term so its next acquisition starts above
+// it. A member whose view the Lease backs reads the Lease rather than
+// catching up from addr; any other member catches up from addr when the
+// term is above its view's, and what it adopts is checked against the
+// Lease (see trust.go). Data-plane notes, whose terms are truncated to 32
 // bits, never come here.
 func (n *Node) observeTerm(now int64, term uint64, addr string) {
 	if term <= n.v.Term() && (!n.leading || term <= n.term) {
 		return
 	}
 
-	if term >= MaxSaneTerm {
-		n.event("absurd-term")
+	if term >= MaxSaneTerm || !n.saneTerm(term) {
+		if term >= MaxSaneTerm {
+			n.event("absurd-term")
+		}
 
 		return
 	}
 
 	n.el.ObserveTerm(term)
 
-	if n.leading && term > n.term {
-		n.resign(now, "higher-term")
+	if term <= n.v.Term() {
+		return
 	}
 
-	if term > n.v.Term() {
-		n.catchUp(now, addr, false)
+	if n.viewBacked() {
+		n.event("term-unverified")
+		n.verifyLease(now)
+
+		return
 	}
+
+	n.catchUp(now, addr, false)
 }
 
 // resign stops publishing and releases the Lease if the elector holds it.

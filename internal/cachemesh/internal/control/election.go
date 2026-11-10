@@ -344,6 +344,7 @@ const (
 	purposeAcquire
 	purposeRenew
 	purposeRelease
+	purposeVerify
 )
 
 // Elector is the election state machine. It is not safe for concurrent use.
@@ -376,12 +377,16 @@ type Elector struct {
 	roundDone     bool
 
 	// Leadership.
-	term     uint64
-	maxTerm  uint64
-	anchor   int64
-	held     Record
-	leader   LeaderInfo
-	haveLead bool
+	term    uint64
+	maxTerm uint64
+	// leaseTerm is the highest sane term read from or written to the
+	// Lease. Unlike maxTerm it is never raised by unverified terms seen
+	// in messages.
+	leaseTerm uint64
+	anchor    int64
+	held      Record
+	leader    LeaderInfo
+	haveLead  bool
 
 	events []Event
 }
@@ -717,6 +722,25 @@ func (e *Elector) ObserveTerm(t uint64) {
 // MaxTerm returns the highest term seen in the Lease, held, or observed.
 func (e *Elector) MaxTerm() uint64 { return max(e.maxTerm, e.term) }
 
+// LeaseTerm returns the highest term read from or written to the Lease. It
+// ignores terms passed to ObserveTerm, so a peer that only sends messages
+// cannot raise it.
+func (e *Elector) LeaseTerm() uint64 { return max(e.leaseTerm, e.term) }
+
+// Verify reads the Lease once to check a claim made by a peer (for
+// example a view of a later term than the Lease is known to hold) and
+// returns the read, or nil when another operation is outstanding or this
+// member leads (a leader's renewals already detect a lost Lease). The
+// result only updates Leader; it never starts an acquisition. It uses a
+// consistent read so a stale watch cache cannot confirm an old holder.
+func (e *Elector) Verify(in Input) []Op {
+	if e.outstanding || e.state == StateLeader {
+		return nil
+	}
+
+	return e.issue(in.Now, OpGet, purposeVerify, Record{})
+}
+
 // Release gives up leadership for a graceful leave. If leader, it steps down
 // at once (emitting Lost{LostReleased}) and returns an Update that clears
 // Holder so candidates can take the Lease without waiting. Otherwise it
@@ -782,6 +806,7 @@ func (e *Elector) noteHolder(r Record) {
 
 	if r.Term < MaxSaneTerm {
 		e.maxTerm = max(e.maxTerm, r.Term)
+		e.leaseTerm = max(e.leaseTerm, r.Term)
 	}
 
 	if changed && (r.Holder != e.self.ID || r.Incarnation != e.self.Incarnation) {
@@ -808,6 +833,27 @@ func (e *Elector) OnResult(in Input, res Result) {
 		e.onAcquire(in, res)
 	case purposeRead:
 		e.onRead(in, res)
+	case purposeVerify:
+		e.onVerify(in, res)
+	}
+}
+
+// onVerify records the holder of a Verify read: a live holder, or none
+// when the Lease is released, missing, or expired.
+func (e *Elector) onVerify(in Input, res Result) {
+	switch {
+	case errors.Is(res.Err, ErrNotFound):
+		e.noteHolder(Record{})
+	case res.Err != nil:
+	default:
+		r := res.Record
+		ld := max(r.LeaseDuration, e.cfg.LeaseDuration)
+
+		if r.Holder != "" && !in.Wall.Before(r.RenewTime.Add(ld+e.cfg.ClockSkewAllowance)) {
+			r.Holder = ""
+		}
+
+		e.noteHolder(r)
 	}
 }
 
@@ -1260,6 +1306,11 @@ func (n *Node) OnLease(now int64, wall time.Time, r Result) {
 
 	n.el.OnResult(n.electInput(now, wall), r)
 	n.electEvents(now)
+
+	if n.verifySeq != 0 && r.Seq == n.verifySeq {
+		n.verifySeq = 0
+		n.afterVerify(now)
+	}
 }
 
 func (n *Node) learnSeeds(addr string, seeds []string) {
