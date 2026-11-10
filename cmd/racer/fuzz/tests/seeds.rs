@@ -102,6 +102,94 @@ fn unhex(hex: &str) -> Vec<u8> {
         .collect()
 }
 
+/// Field sets of the write peer operations and a write reply, by seed name.
+fn write_proofs() -> Vec<(&'static str, &'static str, Vec<(&'static str, String)>)> {
+    let session = base64(&[9; 16]);
+    let pages = base64(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    let object = vec![
+        ("racer-cache", CLUSTER.to_string()),
+        ("racer-key", "07".repeat(32)),
+        ("racer-etag", "\"racer-1\"".to_string()),
+    ];
+    let with = |operation: &str, mode: &str, extra: Vec<(&'static str, String)>| {
+        let mut fields = object.clone();
+        fields.push(("racer-operation", operation.to_string()));
+        fields.extend(extra);
+        fields.push(("racer-mode", mode.to_string()));
+        fields
+    };
+    vec![
+        (
+            "seed-write-session-open",
+            "original",
+            with(
+                "write-session",
+                "acquire",
+                vec![
+                    ("racer-write-action", "open".into()),
+                    ("racer-write-session", session.clone()),
+                    ("racer-object-length", "16777217".into()),
+                    ("racer-page-size", "16777216".into()),
+                    ("racer-content-type", "application/octet-stream".into()),
+                    ("racer-write-replicas", "2".into()),
+                    ("racer-write-durability", "replicas=2".into()),
+                    ("racer-write-upload", "auto".into()),
+                    ("racer-write-hold-until", "1900000000000".into()),
+                ],
+            ),
+        ),
+        (
+            "seed-write-store",
+            "original",
+            with(
+                "write-store",
+                "copy",
+                vec![
+                    ("racer-write-pages", pages.clone()),
+                    ("racer-object-length", "50331649".into()),
+                    ("racer-page-size", "16777216".into()),
+                    ("racer-write-source", CLUSTER.to_string()),
+                    ("racer-write-session", session.clone()),
+                    ("racer-write-hold-until", "1900000000000".into()),
+                ],
+            ),
+        ),
+        (
+            "seed-write-release",
+            "original",
+            with(
+                "write-release",
+                "copy",
+                vec![
+                    ("racer-write-pages", pages.clone()),
+                    ("racer-write-session", session.clone()),
+                ],
+            ),
+        ),
+        (
+            "seed-write-upload",
+            "original",
+            with(
+                "write-upload",
+                "acquire",
+                vec![
+                    ("racer-write-pages", pages.clone()),
+                    ("racer-write-session", session),
+                ],
+            ),
+        ),
+        (
+            "seed-write-reply",
+            "response",
+            vec![
+                ("racer-outcome", "write".into()),
+                ("racer-write-result", "stored".into()),
+                ("racer-write-stored", pages),
+            ],
+        ),
+    ]
+}
+
 /// Generated seeds, by target and file name.
 fn generated() -> Vec<(&'static str, &'static str, Vec<u8>)> {
     let testdata = |name: &str| {
@@ -161,6 +249,22 @@ fn generated() -> Vec<(&'static str, &'static str, Vec<u8>)> {
         "seed-signed",
         peer_wire::encode_signed(&auth.original).unwrap(),
     ));
+    // Signed proofs of the write operations and a write reply (field shape
+    // only; the signature bytes are fixed).
+    for (name, kind, fields) in write_proofs() {
+        let mut signed = proof(kind);
+        for (field, value) in fields {
+            signed
+                .head
+                .headers
+                .push(Header::new(field, value.as_bytes()));
+        }
+        out.push((
+            "peer_envelope",
+            name,
+            peer_wire::encode_signed(&signed).unwrap(),
+        ));
+    }
     let chain = Chain::new(&[vec![0x30, 0x03, 0x02, 0x01, 0x01]]).unwrap();
     out.push(("peer_envelope", "seed-chain", chain.encoded().to_vec()));
     out.push((

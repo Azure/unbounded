@@ -7,7 +7,7 @@ Racer parsers. Every target must return normally on any input; a panic is a bug.
 | ------------------- | ------------------------------------------------------------------------ |
 | `http_head`         | `http1::Codec::decode_head` (default and `trim_ows`, with opaque fields) |
 | `small_body`        | `http1::small::Decoder` (chunked, close-delimited, fixed length)         |
-| `peer_envelope`     | `peer_wire::decode_signed`, `decode_envelope`, `decode_attachment`, and related decoders |
+| `peer_envelope`     | `peer_wire::decode_signed`, `decode_envelope`, `decode_attachment`, and related decoders (seeds include write operation proofs) |
 | `control_documents` | `racer_wire::control` publication, keyring bundle, and enrollment decode  |
 | `store_record`      | `racer::store::parse_bytes` and `parse_prefix` (disk record headers)     |
 | `checkpoint`        | `racer::store::checkpoint::decode`                                       |
