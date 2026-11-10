@@ -114,7 +114,8 @@ Racer runs as one **DaemonSet**, `racer`. Each pod runs the same Rust
 binary. It:
 
 - Serves app reads on per-cache Unix sockets under `/run/racer/<cache>/`.
-- Keeps pages in memory and on local disk.
+- Keeps pages in memory and on local disk. A cache with `persistence: Adapter`
+  keeps pages in memory only and reads local copies from its origin adapter.
 - Fetches pages from other nodes over TCP, or over RDMA within the same Site
   when both nodes have compatible RDMA devices and rails (network paths).
   RDMA is not a cross-Site transport.
@@ -244,7 +245,8 @@ combines their requests and share the result.
 The disk policy makes owner pages eligible for retention on the first
 read. Other nodes' pages become eligible after a second read. This reduces the
 chance of one-off reads pushing out useful data. This policy is called
-**second-sight**. Eligibility does not guarantee retention: admission limits,
+**second-sight**. It does not apply to caches with `persistence: Adapter`,
+which never write pages to Racer's disk. Eligibility does not guarantee retention: admission limits,
 available capacity, and eviction still apply.
 
 When caches compete for space, each gets a share of the node's capacity in

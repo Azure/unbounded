@@ -473,7 +473,8 @@ The installation and distribution flow above describe Gantry's default container
 backend. In Racer mode, Racer caches image content and shares it between nodes.
 Gantry still serves the local registry mirror, and it reads from upstream
 registries when Racer asks for content it does not have. Gantry does not use
-containerd storage or its own peer network in this mode.
+its own peer network in this mode. It reads containerd's content store only to
+serve local copies to Racer, and never writes to it.
 
 Racer mode gives image distribution the same benefits as other Racer caches:
 
@@ -501,7 +502,17 @@ standalone Helm chart does not support Racer mode.
    kind: ClusterCache
    metadata:
      name: gantry
+   spec:
+     persistence: Adapter
    ```
+
+   `persistence: Adapter` is recommended. Containerd already keeps every pulled
+   layer on disk, so Racer keeps image pages in memory only and asks the local
+   Gantry for a page first. Gantry serves it from containerd's content store if
+   the blob is there, and Racer goes to peers or the registry only on a miss.
+   With the default, `persistence: Racer`, Racer also writes image pages to its
+   own disk, so each layer can be stored twice on a node. See
+   [Adapter persistence]({{< relref "reference/racer" >}}#adapter-persistence).
 
    Do not set `spec.origin` on this cache. Gantry is its origin. If
    `spec.origin` is set, the operator keeps Gantry in default mode and reports
@@ -514,6 +525,9 @@ DaemonSet in `unbounded-system`:
 - It sets `GANTRY_RACER_ENABLED=true`.
 - It mounts the Racer sockets from `/run/racer/gantry/client` and
   `/run/racer/gantry/origin`.
+- It mounts containerd's content store,
+  `/var/lib/containerd/io.containerd.content.v1.content`, read-only at the same
+  path and sets `GANTRY_RACER_CONTENT_ROOT` to it.
 - It copies node affinity, node selector, and tolerations from the
   `racer` DaemonSet. Gantry then runs on every Racer node, so each
   node can serve origin reads for the cache.
@@ -544,7 +558,21 @@ In Racer mode:
 - Gantry uses only requester-delegated credentials. It ignores
   `credentials_path`. Delegated credentials need an `https` endpoint; `http`
   endpoints work only for anonymous registries.
-- Containerd and the transfer listener are not used.
+- The transfer listener is not used. Gantry reads containerd's content store
+  only to answer Racer's local-only requests.
+- `racer_content_root` (env `GANTRY_RACER_CONTENT_ROOT`, flag
+  `--racer-content-root`) sets the content store path. The default is
+  `/var/lib/containerd/io.containerd.content.v1.content`. An empty value turns
+  off local reads, and every local-only request is a miss.
+- Before Gantry serves content that Racer already has, it sends a `HEAD` to the
+  upstream registry with the caller's credentials. This keeps a node from
+  reading an image it could not pull itself. Gantry caches an allowed result
+  for 60 seconds and a denied one for 10 seconds. A `401`, `403`, or `404` from
+  the registry goes back to containerd. A `5xx` or network error returns `503`,
+  so containerd tries its next host.
+- Gantry checks the sha256 digest while it streams a full blob. On a mismatch
+  it aborts the response, so containerd does not accept the blob, and asks
+  Racer to drop the cached version.
 
 Use the same `gantry-config` on every node. Any node can be asked to read from
 an upstream registry.
@@ -571,6 +599,10 @@ an image from a configured registry and check these metrics:
 | `gantry_racer_mirror_duration_seconds` | Shows mirror request latency. |
 | `gantry_racer_origin_requests_total{method,status}` | Increases when Racer asks this node to read from an upstream registry. Stays flat when Racer already has the content. |
 | `gantry_racer_origin_bytes_total{kind}` | Counts bytes read from upstream registries. |
+| `gantry_racer_mirror_digest_mismatches_total` | Stays at zero. An increase means Racer returned bytes that did not match the digest. |
+| `racer_adapter_local_hits_total` | With `persistence: Adapter`, increases when Gantry serves a page from containerd's content store. |
+| `racer_adapter_local_misses_total` | Increases when containerd does not have the blob yet. |
+| `racer_adapter_local_failures_total` | Stays near zero. An increase means local reads fail; check the content store mount. |
 
 ### Troubleshooting
 
