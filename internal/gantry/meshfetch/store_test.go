@@ -1069,3 +1069,69 @@ func TestEvictLingeringPrefersNotOwned(t *testing.T) {
 		t.Fatal("want the least recently used owned chunk evicted")
 	}
 }
+
+// Closing the store frees every page it retains: lingering chunks, recent
+// local pages, and idle buffers. A page a reader still holds survives the
+// close and is freed, not pooled, when the reader is done.
+func TestCloseFreesRetainedPages(t *testing.T) {
+	s := newTestStore(t, func(c *storeConfig) {
+		c.extraBudget = 2 * testPage
+	})
+	mc := testContent(s)
+	mc.put(testBlob, pattern(5, 4*testPage))
+
+	// A recent local page and one still held by a reader.
+	e, err := s.pages.get(mc, testBlob, 0, testPage)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s.pages.put(e)
+
+	held, err := s.pages.get(mc, testBlob, 1, testPage)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A lingering chunk read by a peer.
+	r, _, err := s.acquire(context.Background(), key(7), 0, false, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	data := pattern(9, testChunk)
+	f := r.f
+	_ = f.setMeta(int64(len(data)), "", len(data))
+
+	go func() {
+		_ = f.readFrom(context.Background(), bytes.NewReader(data), nil)
+		f.finish(nil)
+		f.release()
+	}()
+
+	if got := readAll(t, r); !bytes.Equal(got, data) {
+		t.Fatal("data mismatch")
+	}
+
+	r.close()
+
+	if !cached(s, key(7)) {
+		t.Fatal("peer-read chunk does not linger")
+	}
+
+	s.close()
+
+	if live, idle := s.pool.stats(); live != 1 || idle != 0 {
+		t.Fatalf("after close: live=%d idle=%d, want 1 0", live, idle)
+	}
+
+	if !bytes.Equal(held.p.buf, pattern(5, 2*testPage)[testPage:]) {
+		t.Fatal("held page changed by close")
+	}
+
+	s.pages.put(held)
+
+	if live, idle := s.pool.stats(); live != 0 || idle != 0 {
+		t.Fatalf("after last release: live=%d idle=%d, want 0 0", live, idle)
+	}
+}

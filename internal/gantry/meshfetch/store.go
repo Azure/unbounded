@@ -371,7 +371,7 @@ func (s *store) finished(f *fill, err error) {
 	s.inflight--
 
 	if f.inMap {
-		if err == nil && inMemory {
+		if err == nil && inMemory && !s.closed {
 			f.inMemory = true
 			f.lastUse = time.Now()
 			s.memN++
@@ -477,18 +477,27 @@ func (s *store) unlink(f *fill) {
 	f.listed = false
 }
 
-// close fails waiters and drops idle buffers.
+// close fails waiters and drops every chunk and page buffer the store
+// retains. Pages still held by fillers and readers are freed when the last
+// one releases them: the pool frees rather than keeps pages once closed.
 func (s *store) close() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	if !s.closed {
 		close(s.stop)
 	}
 
 	s.closed = true
+
+	for _, f := range s.m {
+		s.detachLocked(f)
+	}
+
 	s.signalSpace()
-	s.pool.drain()
+	s.mu.Unlock()
+
+	s.pages.clear()
+	s.pool.close()
 }
 
 // Stats is a point-in-time view of the chunk store.
@@ -1259,6 +1268,8 @@ type pagePool struct {
 
 	mu   sync.Mutex
 	idle []*page
+	// closed makes put free pages instead of keeping them idle.
+	closed bool
 	// live counts allocated pages that are not idle.
 	live atomic.Int64
 }
@@ -1293,7 +1304,7 @@ func (pp *pagePool) put(p *page) {
 	pp.live.Add(-1)
 
 	pp.mu.Lock()
-	if len(pp.idle) < pp.maxIdle {
+	if !pp.closed && len(pp.idle) < pp.maxIdle {
 		pp.idle = append(pp.idle, p)
 		pp.mu.Unlock()
 
@@ -1312,8 +1323,10 @@ func (pp *pagePool) stats() (live, idle int) {
 	return int(pp.live.Load()), len(pp.idle)
 }
 
-func (pp *pagePool) drain() {
+// close frees the idle pages and makes later puts free theirs.
+func (pp *pagePool) close() {
 	pp.mu.Lock()
+	pp.closed = true
 	idle := pp.idle
 	pp.idle = nil
 	pp.mu.Unlock()
@@ -1363,10 +1376,12 @@ type pageCache struct {
 	mu sync.Mutex
 	m  map[pageKey]*diskPage
 	// ring holds the most recently released pages, oldest at next.
-	ring  [recentPages]*diskPage
-	next  int
-	reads atomic.Int64
-	hits  atomic.Int64
+	ring [recentPages]*diskPage
+	next int
+	// closed makes put free pages instead of keeping them on the ring.
+	closed bool
+	reads  atomic.Int64
+	hits   atomic.Int64
 }
 
 func newPageCache(pool *pagePool) *pageCache {
@@ -1425,7 +1440,7 @@ func (c *pageCache) put(e *diskPage) {
 		return
 	}
 
-	if e.err != nil || c.m[e.key] != e {
+	if e.err != nil || c.m[e.key] != e || c.closed {
 		c.freeLocked(e)
 		return
 	}
@@ -1452,6 +1467,28 @@ func (c *pageCache) freeLocked(e *diskPage) {
 	}
 
 	e.p.release()
+}
+
+// clear frees every page on the recent ring and stops keeping pages. Pages
+// with readers are freed when the last one is done.
+func (c *pageCache) clear() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.closed = true
+
+	for i, e := range c.ring {
+		if e == nil {
+			continue
+		}
+
+		c.ring[i] = nil
+		e.recent = false
+
+		if e.readers == 0 {
+			c.freeLocked(e)
+		}
+	}
 }
 
 // purge forgets every page of blob d, so later readers read it afresh.
