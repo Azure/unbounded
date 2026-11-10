@@ -7,9 +7,11 @@
 #
 # Environment:
 #   TARGETARCH  amd64 or arm64
+#   MSHV        set to 1 to start the Microsoft Hypervisor before Linux
 set -eu
 
 : "${TARGETARCH:?TARGETARCH is required}"
+MSHV="${MSHV:-0}"
 
 WORK=/tmp/disk
 ROOT="$WORK/root"
@@ -22,6 +24,11 @@ case "$TARGETARCH" in
   arm64) CONSOLE="" ;;
   *) echo "unsupported architecture: $TARGETARCH" >&2; exit 1 ;;
 esac
+
+if [ "$MSHV" = 1 ] && [ "$TARGETARCH" != amd64 ]; then
+  echo "MSHV images support amd64 only, not $TARGETARCH" >&2
+  exit 1
+fi
 
 KVER=$(cat /rootfs.kver)
 mkdir -p "$ROOT"
@@ -43,8 +50,19 @@ EOF
 
 # The ESP holds shim and GRUB. The signed Azure Linux GRUB reads
 # /boot/grub2/grub.cfg from the partition it was loaded from.
-cat > "$WORK/grub.cfg" <<EOF
-set timeout=0
+echo "set timeout=0" > "$WORK/grub.cfg"
+if [ "$MSHV" = 1 ]; then
+  # HvLoader.efi starts the hypervisor through lxhvloader.dll and returns to
+  # GRUB, which then boots Linux as the root partition. This matches the
+  # "Dom0" entry that the kernel-mshv package adds to grub2-mkconfig. GRUB
+  # unescapes "\\Windows" to "\Windows", the hypervisor directory on the ESP.
+  cat >> "$WORK/grub.cfg" <<EOF
+search --no-floppy --fs-uuid --set=root $ESP_UUID
+chainloader /HvLoader.efi lxhvloader.dll MSHV_ROOT=\\\\Windows MSHV_ENABLE=TRUE MSHV_SCHEDULER_TYPE=ROOT MSHV_X2APIC_POLICY=ENABLE MSHV_SEV_SNP=TRUE MSHV_LOAD_OPTION=INCLUDETRACEMETADATA=1
+boot
+EOF
+fi
+cat >> "$WORK/grub.cfg" <<EOF
 search --no-floppy --fs-uuid --set=root $ROOT_UUID
 linux /boot/vmlinuz-$KVER root=UUID=$ROOT_UUID rw $CONSOLE
 initrd /boot/initramfs-$KVER.img
@@ -55,8 +73,10 @@ ESP_IMG="$WORK/esp.img"
 truncate -s "${ESP_MIB}M" "$ESP_IMG"
 mkfs.vfat -F 32 -i "$ESP_ID" -n EFI "$ESP_IMG" >/dev/null
 export MTOOLS_SKIP_CHECK=1
-mmd -i "$ESP_IMG" ::/EFI ::/boot ::/boot/grub2
-mcopy -s -i "$ESP_IMG" "$ROOT/boot/efi/EFI/"* ::/EFI/
+# Copy everything the packages installed on the ESP: shim and GRUB under
+# EFI/, plus the hypervisor and its loaders on MSHV images.
+mcopy -s -i "$ESP_IMG" "$ROOT/boot/efi/"* ::/
+mmd -i "$ESP_IMG" ::/boot ::/boot/grub2
 mcopy -i "$ESP_IMG" "$WORK/grub.cfg" ::/boot/grub2/grub.cfg
 mcopy -i "$ESP_IMG" "$WORK/grub.cfg" ::/EFI/BOOT/grub.cfg
 # The ESP is mounted at /boot/efi, so keep the root copy empty.

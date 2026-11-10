@@ -22,10 +22,12 @@ use crate::control::CacheTransition;
 use crate::control::ControlEndpoint;
 use crate::control::ReactorControlIo;
 use crate::control::Snapshot;
+use crate::control::cell::PublicationCell;
 use crate::control::publication::PublicationTarget;
 use crate::control::rails::RailJournal;
 use crate::control::session::Session;
 use crate::control::transient;
+use crate::enrollment::Enrollment;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
@@ -47,6 +49,7 @@ use crate::peer::transport::Transfers;
 use crate::rdma::Links;
 use crate::read::Coordinator;
 use crate::read::candidates::CandidatePolicy;
+use crate::read::dispatch::NodeDirectory;
 use crate::read::dispatch::WorkerDirectory;
 use crate::read::dispatch::WorkerEndpoint;
 use crate::read::dispatch::WorkerMap;
@@ -84,21 +87,18 @@ use crate::worker::AffinityPlan;
 use crate::worker::CryptoRuntime;
 use crate::worker::WorkerGroup;
 use crate::worker::WorkerRuntime;
-use controlplane::Published;
-use racer_control_wire::CacheDefinition;
-use racer_control_wire::NodeId;
-use racer_crypto::enrollment::Enrollment;
 use racer_crypto::identity::BundleInstaller;
 use racer_crypto::identity::Certificates;
 use racer_crypto::identity::KeyEpochs;
 use racer_crypto::identity::KeyPurpose;
 use racer_crypto::identity::Keyring;
+use racer_wire::control::CacheDefinition;
+use racer_wire::control::NodeId;
 use std::cell::RefCell;
 use std::num::NonZeroUsize;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::task::Context;
@@ -106,11 +106,17 @@ use std::task::Poll;
 use std::time::Duration;
 use std::time::UNIX_EPOCH;
 
-use uring_runtime::drivers::poll_task;
+use crate::drivers::poll_task;
 
 mod devices;
+/// Whole-application deterministic simulation harness: real worker graphs on
+/// `Driver::Sim`, driven by `racer-dst` (test support only, not a public API).
+#[cfg(any(test, feature = "dst"))]
+#[doc(hidden)]
+pub mod dst;
 mod native;
 mod recovery;
+pub(crate) mod rollout;
 
 use recovery::CheckpointCut;
 
@@ -124,7 +130,10 @@ pub struct Application {
 
     limits: Limits,
 
-    discovered_nics: Vec<racer_control_wire::RailMapping>,
+    discovered_nics: Vec<racer_wire::control::RailMapping>,
+
+    /// Worker context every lane, helper, and lifecycle scope runs on.
+    ctx: racer_io::WorkerCtx,
 }
 
 /// Shared immutable-publication and partitioned-admission roots. No Rc worker
@@ -142,7 +151,7 @@ pub struct NodeState {
     /// the report's own copy is still charged against the walk budget.
     hardware: Arc<crate::hardware::Context>,
 
-    send_crc: crate::telemetry::Samples,
+    send_tag: crate::telemetry::Samples,
 
     profiling: std::sync::OnceLock<Arc<crate::profiling::ProfilingController>>,
 
@@ -156,17 +165,20 @@ pub struct NodeState {
 
     ingress: Arc<crate::admission::Ingress>,
 
+    /// Inbound peer sockets, admitted against `PeerIngressConnection`.
+    peer_ingress: Arc<crate::admission::Ingress>,
+
     metrics: Vec<(WorkerId, crate::telemetry::Metrics)>,
 
     failures: crate::telemetry::Failures,
 
-    publications: Arc<Published<Snapshot>>,
+    publications: Arc<PublicationCell<Snapshot>>,
 
     keys: Arc<KeyEpochs>,
 
     control_worker: WorkerId,
 
-    workers: Arc<WorkerDirectory>,
+    workers: Arc<NodeDirectory>,
 
     count: usize,
 
@@ -182,25 +194,36 @@ pub struct NodeState {
 
     native: native::NativeNode,
 
-    cache_rollout: controlplane::Rollout<WorkerId, Vec<CacheDefinition>>,
+    cache_rollout: crate::app::rollout::Rollout<WorkerId, Vec<CacheDefinition>>,
 
     /// Process-wide memory-pressure level, written only by the control worker.
     pressure: crate::pressure::SharedPressure,
 
     /// Native Azure origin limits, token caches, and TLS trust roots.
     azure: crate::origin::azure::AzureNode,
+
+    /// Node-wide monotonic and wall time.
+    clock: racer_io::Clock,
 }
 
 impl Default for NodeState {
     fn default() -> Self {
-        Self::new(vec![WorkerId(0), WorkerId(1)], 16).expect("valid default worker map")
+        // Production replaces the default node before running workers.
+        let ctx = racer_io::WorkerCtx::host();
+        Self::new(vec![WorkerId(0), WorkerId(1)], 16, ctx).expect("valid default worker map")
     }
 }
 
 impl NodeState {
+    /// The default two-worker node on a test role's time and entropy.
+    #[cfg(test)]
+    pub(crate) fn on(ctx: racer_io::WorkerCtx) -> Self {
+        Self::new(vec![WorkerId(0), WorkerId(1)], 16, ctx).expect("valid default worker map")
+    }
+
     /// Allocate shared state with default peer admission for the registered workers.
-    fn new(workers: Vec<WorkerId>, capacity: usize) -> Result<Self> {
-        Self::with_peer_admission(workers, capacity, Default::default())
+    fn new(workers: Vec<WorkerId>, capacity: usize, ctx: racer_io::WorkerCtx) -> Result<Self> {
+        Self::with_peer_admission(workers, capacity, Default::default(), ctx)
     }
 
     /// Allocate node-wide authorities and partitioned metrics for the worker set.
@@ -208,11 +231,14 @@ impl NodeState {
         workers: Vec<WorkerId>,
         capacity: usize,
         peer_config: crate::peer::Config,
+        ctx: racer_io::WorkerCtx,
     ) -> Result<Self> {
+        let clock = ctx.clock.clone();
         let count = workers.len();
         let map = Arc::new(WorkerMap::new(workers.clone())?);
         let metrics = crate::telemetry::Metrics::for_workers(count)?;
-        let peer_admission = crate::peer::AdaptivePeers::new(peer_config, metrics[0].clone())?;
+        let peer_admission =
+            crate::peer::AdaptivePeers::new(peer_config, metrics[0].clone(), clock.clone())?;
         Ok(Self {
             peer_admission,
             devices: None,
@@ -220,20 +246,21 @@ impl NodeState {
             peer_receive: Default::default(),
             inventory: Arc::new(crate::rdma::Inventory::default()),
             hardware: Default::default(),
-            send_crc: Default::default(),
+            send_tag: Default::default(),
             profiling: Default::default(),
             hedges: std::sync::OnceLock::new(),
             ingress: Arc::new(crate::admission::Ingress::new(&workers)),
+            peer_ingress: Arc::new(crate::admission::Ingress::for_peers(&workers)),
             subscriptions: Arc::new(crate::peer::subscriptions::Subscriptions::new(
                 Default::default(),
             )?),
-            publications: Arc::new(Published::new(Snapshot::retention(2))),
+            publications: Arc::new(PublicationCell::new(Snapshot::retention(2))),
             metrics: workers.iter().copied().zip(metrics).collect(),
-            failures: crate::telemetry::Failures::default(),
-            keys: Arc::new(KeyEpochs::default()),
+            failures: crate::telemetry::Failures::with_clock(clock.clone()),
+            keys: Arc::new(KeyEpochs::with_clock(crate::enrollment::wall_clock(&clock))),
             control_worker: WorkerId(0),
-            cache_rollout: controlplane::Rollout::new(workers.iter().copied()),
-            workers: Arc::new(WorkerDirectory::new(map, workers, capacity)?),
+            cache_rollout: crate::app::rollout::Rollout::new(workers.iter().copied()),
+            workers: Arc::new(NodeDirectory::new(map, workers, capacity, ctx)?),
             count,
             prepared: AtomicUsize::new(0),
             checkpoint: Mutex::new(CheckpointCut::default()),
@@ -241,7 +268,8 @@ impl NodeState {
             recovery: Mutex::new(recovery::RecoveryCut::default()),
             observations: Observations::default(),
             native: native::NativeNode::default(),
-            azure: crate::origin::azure::AzureNode::from_env(),
+            clock: clock.clone(),
+            azure: crate::origin::azure::AzureNode::unconfigured(),
             pressure: Default::default(),
         })
     }
@@ -439,12 +467,12 @@ impl Application {
             config: Arc::new(config),
             node: Arc::new(NodeState::default()),
             discovered_nics: Vec::new(),
+            ctx: racer_io::WorkerCtx::host(),
         })
     }
 
     /// Discover resources, enroll the node, and run its worker group until shutdown.
     pub fn run(mut self) -> Result<()> {
-        self.config.validate()?;
         self.discovered_nics = crate::rdma::inventory();
         let mut plan = AffinityPlan::discover(&self.config)?;
         log_worker_plan("planned", &plan);
@@ -462,17 +490,22 @@ impl Application {
             self.config.io_workers.is_some(),
         )?;
         self.config.admission_history_per_worker(plan.pairs.len())?;
+        // Every admitted connection and pipe is a descriptor; check before any opens.
+        crate::fd_limit::ensure(&self.config.limits, plan.pairs.len())?;
         log_worker_plan("final", &plan);
-        self.node = Arc::new(NodeState::with_peer_admission(
+        let mut node = NodeState::with_peer_admission(
             plan.pairs.iter().map(|p| p.worker).collect(),
             self.limits.queue_entries.get(),
             self.config.peer_admission,
-        )?);
+            self.ctx.clone(),
+        )?;
+        node.azure = crate::origin::azure::AzureNode::new(&self.config.origin);
+        self.node = Arc::new(node);
         self.node.workers.configure_spill(self.config.spill)?;
         self.node.workers.prefetch.configure(self.config.prefetch)?;
         Arc::get_mut(&mut self.node)
             .ok_or(Error::Internal)?
-            .publications = Arc::new(Published::new(Snapshot::retention(
+            .publications = Arc::new(PublicationCell::new(Snapshot::retention(
             self.config.limits.retained_snapshots.get(),
         )));
         self.node.inventory.update(self.discovered_nics.clone())?;
@@ -497,10 +530,10 @@ impl Application {
             // embedded control alive and retry bounded attempts until stopped.
             let enrolled = retry_enrollment(
                 || {
-                    let attempt = scope(MANAGED_ENROLLMENT_ATTEMPT)?;
-                    bootstrap(&self.config, &self.node, &self.limits, &attempt)
+                    let attempt = scope(&self.node.clock, MANAGED_ENROLLMENT_ATTEMPT)?;
+                    bootstrap(&self.config, &self.node, &self.limits, &attempt, &self.ctx)
                 },
-                || STOP_REQUESTED.load(Ordering::Relaxed),
+                stop_requested,
                 MANAGED_ENROLLMENT_PACE,
             );
             match enrolled {
@@ -510,8 +543,8 @@ impl Application {
                 Err(error) => return Err(error),
             }
         } else {
-            let scope = scope(self.config.request_timeout)?;
-            bootstrap(&self.config, &self.node, &self.limits, &scope)?
+            let scope = scope(&self.node.clock, self.config.request_timeout)?;
+            bootstrap(&self.config, &self.node, &self.limits, &scope, &self.ctx)?
         };
         let selector = self
             .config
@@ -542,43 +575,54 @@ impl Application {
         Arc::get_mut(&mut self.config)
             .ok_or(Error::InvalidConfiguration)?
             .node = identity;
-        self.prepare_workers()?;
-        let mut workers = WorkerGroup::new(plan);
+        self.prepare_workers(Some(&plan))?;
+        // The owner thread outlives the worker group: lanes and crypto jobs
+        // return its page buffers while they drain, and dropping it after the
+        // group joins waits for the owner to drain.
+        // A spare CPU keeps grant latency off busy crypto helpers.
+        let owner = match plan.owner_cpu() {
+            Some(cpu) if self.config.enable_rdma => {
+                self.node.native.start_owner(cpu, self.ctx.clone())?
+            }
+            _ => None,
+        };
+        let mut workers = WorkerGroup::new(plan, self.ctx.clone());
+        // A stop signal is a clean stop, not an error; failures recorded
+        // before or after it still fail the run.
+        workers.observe_stop_signal();
         let result = if self.config.managed() {
-            workers.run_with_startup(&self, MANAGED_STARTUP)
+            workers.run_with_startup(&self, None)
         } else {
             workers.run(&self)
         };
-        match result {
-            Err(error) if signal_stop(error, signals.requested()) => Ok(()),
-            result => result,
-        }
+        drop(workers);
+        let stopped = owner.map_or(Ok(()), native::OwnerThread::shutdown);
+        drop(signals);
+        result.and(stopped)
     }
 }
 
 /// Whether `error` is the cancellation a requested SIGTERM/SIGINT produces, so the
 /// process stops cleanly instead of reporting a fatal failure.
 fn signal_stop(error: Error, requested: bool) -> bool {
-    requested && error == Error::Cancelled
+    requested && error == Error::Canceled
 }
 
 /// Budget for one managed enrollment attempt, independent of data request deadlines.
 const MANAGED_ENROLLMENT_ATTEMPT: Duration = Duration::from_secs(60);
 
-/// Managed worker startup waits on election and the first publication until
-/// stopped; each control turn inside it stays bounded by [`CONTROL_TURN`].
-const MANAGED_STARTUP: Duration = Duration::from_secs(365 * 24 * 3600);
-
 /// Bound for one startup control turn (enrollment attempt or publication poll).
-const CONTROL_TURN: Duration = Duration::from_secs(racer_control_wire::POLL_WAIT.as_secs() + 30);
+const CONTROL_TURN: Duration = Duration::from_secs(racer_wire::control::POLL_WAIT.as_secs() + 30);
 
 /// A fresh scope for one control turn, never outliving `startup`.
 ///
 /// The turn owns its own cancellation so its expiry never cancels startup.
 fn control_turn(startup: &RequestScope, limit: Duration) -> Result<RequestScope> {
-    let mut turn = scope(limit)?;
-    if startup.deadline.0 < turn.deadline.0 {
-        turn.deadline = startup.deadline;
+    let mut turn = scope(startup.clock(), limit)?;
+    if let Some(deadline) = startup.deadline_at()
+        && deadline < turn.deadline.0
+    {
+        turn.deadline.0 = deadline;
     }
     Ok(turn)
 }
@@ -598,7 +642,7 @@ fn retry_enrollment<T>(
     let mut attempts = 0u64;
     loop {
         if stop() {
-            return Err(Error::Cancelled);
+            return Err(Error::Canceled);
         }
         let started = std::time::Instant::now();
         match attempt() {
@@ -610,7 +654,7 @@ fn retry_enrollment<T>(
                 );
             }
             Err(error) if stop() && crate::control::transient(error) => {
-                return Err(Error::Cancelled);
+                return Err(Error::Canceled);
             }
             Err(error) => return Err(error),
         }
@@ -618,7 +662,7 @@ fn retry_enrollment<T>(
         let resume = started + pace;
         while std::time::Instant::now() < resume {
             if stop() {
-                return Err(Error::Cancelled);
+                return Err(Error::Canceled);
             }
             std::thread::sleep(
                 resume
@@ -630,11 +674,12 @@ fn retry_enrollment<T>(
 }
 
 /// Create a bounded scope for application-owned lifecycle operations.
-fn scope(timeout: Duration) -> Result<RequestScope> {
-    RequestScope::new(
-        RequestId([0; 16]),
-        uring_runtime::environment::now() + timeout,
-    )
+fn scope(clock: &racer_io::Clock, timeout: Duration) -> Result<RequestScope> {
+    RequestScope::with_clock(RequestId([0; 16]), clock.now() + timeout, clock.clone())
+}
+
+fn untimed(clock: &racer_io::Clock) -> Result<RequestScope> {
+    RequestScope::untimed(RequestId([0; 16]), clock.clone())
 }
 
 /// Retry enrollment under the original startup scope and the session's backoff.
@@ -642,7 +687,7 @@ async fn start_control(
     control: &Session,
     reactor: Rc<Reactor>,
     startup: &RequestScope,
-) -> Result<racer_crypto::enrollment::LocalSigningIdentity> {
+) -> Result<crate::enrollment::LocalSigningIdentity> {
     loop {
         startup.check()?;
         let turn = control_turn(startup, CONTROL_TURN)?;
@@ -654,7 +699,7 @@ async fn start_control(
                     .sleep(
                         control
                             .next_attempt()
-                            .unwrap_or_else(uring_runtime::environment::now),
+                            .unwrap_or_else(|| reactor.ctx().now()),
                         startup,
                     )
                     .await?;
@@ -669,7 +714,7 @@ async fn start_control(
 /// failure cannot be attributed. Cancellation is the normal stop path.
 fn stage_result<T>(worker: WorkerId, stage: &str, result: Result<T>) -> Result<T> {
     if let Err(error) = &result
-        && *error != Error::Cancelled
+        && *error != Error::Canceled
     {
         eprintln!(
             "racer: worker={} stage={stage} fatal error={error:?}",
@@ -698,7 +743,7 @@ fn listener_completion(
         return Err(Error::Unavailable);
     }
     match result {
-        Ok(()) | Err(Error::Cancelled | Error::DeadlineExceeded) => Ok(()),
+        Ok(()) | Err(Error::Canceled | Error::DeadlineExceeded) => Ok(()),
         Err(error) => Err(error),
     }
 }
@@ -717,11 +762,15 @@ fn bootstrap(
     node: &NodeState,
     limits: &Limits,
     startup: &RequestScope,
+    ctx: &racer_io::WorkerCtx,
 ) -> Result<(NodeId, Option<String>)> {
     let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
         limits.clone(),
     )));
-    let reactor = Rc::new(Reactor::new(admission));
+    let reactor = Rc::new(Reactor::new(
+        admission,
+        &racer_io::Env::new(racer_io::Driver::Uring, ctx.clone()),
+    ));
     let unresolved = Rc::new(Keyring::new(
         config.cluster.clone(),
         NodeId(String::new()),
@@ -734,6 +783,7 @@ fn bootstrap(
         Rc::new(PublicationTarget::new(
             config.cluster.clone(),
             node.publications.clone(),
+            reactor.ctx().clock.clone(),
         )),
         node.inventory.clone(),
     );
@@ -747,80 +797,91 @@ fn bootstrap(
         control.bind_keyring(keys)?;
         Ok((identity.node().clone(), control.block_devices()))
     });
-    let waker = futures::task::noop_waker();
-    let mut cx = Context::from_waker(&waker);
-    let result = loop {
-        if STOP_REQUESTED.load(Ordering::Relaxed) {
-            break Err(Error::Cancelled);
-        }
-        if let Err(error) = startup
-            .check()
-            .and_then(|()| reactor.poll_budgeted(64).map(|_| ()))
-        {
-            break Err(error);
-        }
-        if let Poll::Ready(result) = operation.as_mut().poll(&mut cx) {
-            break result;
-        }
-        if let Err(error) = reactor.wait(Duration::from_millis(1)) {
-            break Err(error);
-        }
-    };
+    let result = drive_bootstrap(&reactor, Some(startup), true, operation.as_mut());
     drop(operation);
     // Fence CPU preparation before draining the reactor, on success and failure.
-    let shutdown_scope = scope(config.shutdown_timeout)?;
+    let shutdown_scope = scope(&reactor.ctx().clock, config.shutdown_timeout)?;
     let mut shutdown = control.shutdown(&shutdown_scope);
-    let shutdown_result = loop {
-        if let Poll::Ready(result) = shutdown.as_mut().poll(&mut cx) {
-            break result;
-        }
-        reactor.poll_budgeted(64)?;
-        reactor.wait(Duration::from_millis(1))?;
-    };
+    let shutdown_result = drive_bootstrap(&reactor, None, false, shutdown.as_mut());
     drop(shutdown);
     // Dropped TLS waits can still own CQEs. Cancellation is not their fence.
     let _ = startup.cancel();
     let mut drain = reactor.drain();
-    loop {
-        reactor.poll_budgeted(64)?;
-        if let Poll::Ready(fenced) = drain.as_mut().poll(&mut cx) {
-            fenced?;
-            break;
-        }
-        reactor.wait(Duration::from_millis(1))?;
-    }
+    drive_bootstrap(&reactor, None, false, drain.as_mut())?;
     result.and_then(|identity| shutdown_result.map(|()| identity))
 }
 
-/// End `operation` with `Cancelled` as soon as a process stop is requested.
+/// Drive one bootstrap `operation` on `reactor` until it completes, parking on
+/// the reactor's wake sources (completions, its wake handle, the process stop
+/// eventfd, ring deadlines, and this thread's alarms) and on `scope`'s
+/// deadline. With `stoppable`, a process stop ends it with `Canceled`; a
+/// failed `scope` check or reactor turn ends it with that error.
+fn drive_bootstrap<T>(
+    reactor: &Reactor,
+    scope: Option<&RequestScope>,
+    stoppable: bool,
+    mut operation: std::pin::Pin<&mut (dyn std::future::Future<Output = Result<T>> + '_)>,
+) -> Result<T> {
+    let waker = crate::drivers::thread_waker(Some(reactor.waker()?));
+    let mut cx = Context::from_waker(&waker);
+    loop {
+        if stoppable && stop_requested() {
+            return Err(Error::Canceled);
+        }
+        if let Some(scope) = scope {
+            scope.check()?;
+        }
+        reactor.poll_budgeted(64)?;
+        if let Poll::Ready(result) = operation.as_mut().poll(&mut cx) {
+            return result;
+        }
+        let mut wait = reactor.next_deadline().map_or(BOOTSTRAP_MAX_PARK, |at| {
+            at.saturating_duration_since(reactor.ctx().clock.now())
+        });
+        if let Some(recheck) = scope.and_then(racer_io::Scope::recheck_within) {
+            wait = wait.min(recheck);
+        }
+        reactor.wait(wait.min(BOOTSTRAP_MAX_PARK))?;
+    }
+}
+
+/// Longest bootstrap park; it bounds only the arithmetic, since every
+/// bootstrap wait ends on a wake source or deadline first.
+const BOOTSTRAP_MAX_PARK: Duration = Duration::from_secs(3600);
+
+/// End `operation` with `Canceled` as soon as a process stop is requested.
 ///
 /// The lifecycle driver re-polls startup periodically, so a stop request is
 /// observed promptly even while the operation waits on a long control turn.
 /// Dropping the operation leaves reactor and CQE fencing to normal teardown.
 async fn stoppable<T>(operation: impl std::future::Future<Output = Result<T>>) -> Result<T> {
-    stoppable_by(&STOP_REQUESTED, operation).await
+    stoppable_by(stop_requested, operation).await
 }
 
 /// [`stoppable`] with an explicit stop flag.
 async fn stoppable_by<T>(
-    stop: &AtomicBool,
+    stop: impl Fn() -> bool,
     operation: impl std::future::Future<Output = Result<T>>,
 ) -> Result<T> {
     let mut operation = std::pin::pin!(operation);
     std::future::poll_fn(|cx| {
-        if stop.load(Ordering::Relaxed) {
-            return Poll::Ready(Err(Error::Cancelled));
+        if stop() {
+            return Poll::Ready(Err(Error::Canceled));
         }
         operation.as_mut().poll(cx)
     })
     .await
 }
 
-static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+/// Whether a process stop was requested since the stop handlers were installed.
+fn stop_requested() -> bool {
+    racer_io::signal::stop_raised()
+}
 
-/// Record a process stop request using only a signal-safe atomic store.
+/// Record a process stop request and wake parked lanes, using only a
+/// signal-safe atomic store and an eventfd write.
 extern "C" fn request_stop(_: libc::c_int) {
-    STOP_REQUESTED.store(true, Ordering::Relaxed);
+    racer_io::signal::raise_stop();
 }
 
 /// Installed handler state shared by every live [`StopSignals`] guard.
@@ -851,7 +912,8 @@ impl StopSignals {
     pub fn install() -> Result<Self> {
         let mut installed = INSTALLED.lock().map_err(|_| Error::Internal)?;
         if installed.guards == 0 {
-            STOP_REQUESTED.store(false, Ordering::Relaxed);
+            racer_io::signal::stop_fd()?;
+            racer_io::signal::reset_stop();
             let mut previous = Vec::new();
             for signal in [libc::SIGINT, libc::SIGTERM] {
                 // SAFETY: initialized sigaction records and a signal-safe atomic handler.
@@ -875,18 +937,20 @@ impl StopSignals {
 
     /// Check whether a handled process signal requested shutdown.
     pub fn requested(&self) -> bool {
-        STOP_REQUESTED.load(Ordering::Relaxed)
+        stop_requested()
     }
 }
 
 impl Drop for WorkerApplication {
     /// Break the `Links` task cycle when the worker is dropped without a drain
     /// (crash, failed startup, or an aborted group), so setup tasks release
-    /// their connections and admission charges.
+    /// their connections and admission charges, and release detached drivers.
     fn drop(&mut self) {
         if let Some(links) = &self.links {
             links.abandon_setups();
         }
+        // Detached drivers retain worker services that retain this queue.
+        self.drivers.abandon();
     }
 }
 
@@ -925,11 +989,12 @@ pub struct WorkerApplication {
 
     next_health: std::time::Instant,
 
+    /// Next ciphertext holder sample (`racer_ciphertext_holder_bytes`).
+    next_holder_sample: std::time::Instant,
+
     pressure: WorkerPressure,
 
-    environment: uring_runtime::environment::Environment,
-
-    drivers: Rc<uring_runtime::drivers::DriverQueue>,
+    drivers: Rc<crate::drivers::DriverQueue>,
 
     http: Rc<HttpPool>,
 
@@ -959,15 +1024,18 @@ pub struct WorkerApplication {
 
     links: Option<Rc<Links>>,
 
-    discovered_nics: Vec<racer_control_wire::RailMapping>,
+    discovered_nics: Vec<racer_wire::control::RailMapping>,
 
-    actual_rails: Vec<racer_control_wire::RailMapping>,
+    actual_rails: Vec<racer_wire::control::RailMapping>,
 
     inventory_generation: u64,
 
-    native_task: Option<Operation<'static, Vec<racer_control_wire::RailMapping>>>,
+    native_task: Option<Operation<'static, Vec<racer_wire::control::RailMapping>>>,
 
     native_retry: std::time::Instant,
+
+    /// Consecutive failed activations, for the retry backoff.
+    native_failures: u32,
 
     /// Managed-mode report sink and shares, so a failed native activation can
     /// withdraw this node's RDMA rails instead of advertising rails it cannot
@@ -977,9 +1045,65 @@ pub struct WorkerApplication {
     /// The rails were withdrawn after a failed activation.
     rdma_withdrawn: bool,
 
+    /// The rails were advertised again after a withdrawal, and membership
+    /// may still list none for this node until the controller republishes.
+    rdma_readvertised: bool,
+
+    /// Device losses the owner reported so far (see
+    /// `rdma_verbs::Client::device_losses`), so only new ones close the round.
+    rdma_losses_seen: u64,
+
+    /// Rails lost to a removed device, as `(device, hardware key)`, until
+    /// RDMA reactivates. While set, activation waits for every key to be
+    /// back in sysfs and for the old round to drain.
+    rdma_lost: Option<Vec<(String, String)>>,
+
+    /// What reactivation after a device loss last waited for, as logged, so
+    /// each change logs once.
+    rdma_waiting: Option<String>,
+    /// The native task attaches GPU landings, not activates.
+    attaching_landings: bool,
+
+    /// Since when, and as which names per lost device, sysfs has shown the
+    /// lost devices back unchanged (see `RAIL_SETTLE`).
+    rdma_settle: Option<(std::time::Instant, Vec<Vec<String>>)>,
+
+    /// Reactivation attempts that found the lost devices back but unusable.
+    rdma_attempts: u32,
+
+    /// `RAIL_SETTLE`, shortened by tests.
+    rail_settle: std::time::Duration,
+
+    /// Verbs character devices in sysfs and where to create fresh nodes for
+    /// them before reactivating (see `crate::rdma::refresh_char_devices`).
+    /// `None` in tests, which must not create device nodes on the host.
+    rdma_char_devices: Option<(std::path::PathBuf, std::path::PathBuf)>,
+
+    /// The sysfs `(major, minor)` numbers the nodes were last refreshed for
+    /// since the last device loss; `None` before the first refresh. A device
+    /// that comes back with other numbers, or whose node went missing, is
+    /// refreshed again. The flag records whether that refresh succeeded.
+    rdma_char_refreshed: Option<(Vec<(u32, u32)>, bool)>,
+
+    /// Next sysfs presence probe of the active rails.
+    rail_probe: std::time::Instant,
+
+    /// Where the presence probe reads RDMA devices (sysfs, or a test tree).
+    rdma_sysfs: std::path::PathBuf,
+
+    /// Next sysfs rescan for RDMA devices while none is discovered.
+    rdma_rescan: std::time::Instant,
+
+    /// Discoverable devices the last rescan saw, so each change logs once.
+    rdma_rescan_seen: Option<Vec<String>>,
+
+    /// When the rescan last saw the discoverable devices change; they are
+    /// opened only once unchanged for the settle time.
+    rdma_rescan_changed: std::time::Instant,
+
     telemetry: Rc<Telemetry>,
 
-    directory: Arc<WorkerDirectory>,
+    directory: std::rc::Rc<WorkerDirectory>,
 
     node: Arc<NodeState>,
 
@@ -996,7 +1120,7 @@ pub struct WorkerApplication {
     writer_task: Option<Operation<'static, ()>>,
 
     /// Successful I/O returns its reserved slot instead of toggling shared state blindly.
-    checkpoint_task: Option<Operation<'static, recovery::Publication>>,
+    checkpoint_task: Option<Operation<'static, recovery::PeriodicOutcome>>,
 
     checkpoint_snapshot: Option<Operation<'static, ShardImage>>,
 
@@ -1039,11 +1163,11 @@ pub struct WorkerApplication {
 
     stopping: bool,
 
-    snapshot_sequence: Option<racer_control_wire::PublicationSequence>,
+    snapshot_sequence: Option<racer_wire::control::PublicationSequence>,
 
     memory: Rc<MemoryCache>,
 
-    caches: Vec<racer_control_wire::CacheDefinition>,
+    caches: Vec<racer_wire::control::CacheDefinition>,
 
     slab_directory: std::path::PathBuf,
 
@@ -1064,27 +1188,65 @@ pub struct WorkerApplication {
 
 /// Ownership is optional eviction guidance. Even Progress may mean the ranking
 /// cache is pinned, so do not self-wake continuously or retry within one turn.
+///
+/// After two consecutive idle passes under the same membership the retry backs
+/// off to [`OWNERSHIP_SETTLED_RETRY`]; a membership change runs the next turn
+/// at once and resets the backoff.
 struct OwnershipMaintenance {
     next: std::time::Instant,
+
+    /// Membership identity observed at the last idle pass, if any.
+    settled: Option<usize>,
 }
 
+/// Retry after an idle pass while membership is unchanged or unknown.
+const OWNERSHIP_IDLE_RETRY: Duration = Duration::from_millis(100);
+
+/// Retry after repeated idle passes under one membership. Recovered and newly
+/// appended residents are still revisited, only less often.
+const OWNERSHIP_SETTLED_RETRY: Duration = Duration::from_secs(1);
+
 impl OwnershipMaintenance {
+    /// Maintenance starting at `next` with no settled membership.
+    fn new(next: std::time::Instant) -> Self {
+        Self {
+            next,
+            settled: None,
+        }
+    }
+
     /// Advance eviction guidance at most once per scheduled maintenance turn.
+    /// `membership` identifies the current published membership, if any.
     fn poll(
         &mut self,
         now: std::time::Instant,
         stopping: bool,
+        membership: Option<usize>,
         refresh: impl FnOnce() -> Result<crate::topology::Maintenance>,
     ) {
-        if stopping || now < self.next {
+        if stopping {
+            return;
+        }
+        let changed = self.settled.is_some() && membership != self.settled;
+        if changed {
+            self.settled = None;
+        } else if now < self.next {
             return;
         }
         let delay = match refresh() {
             Ok(crate::topology::Maintenance::Progress) => Duration::from_millis(1),
             // Missing publications and unavailable capacity must not fail reads
             // or permanently prevent a later pass over idle/recovered residents.
-            Ok(crate::topology::Maintenance::Idle | crate::topology::Maintenance::Blocked)
-            | Err(_) => Duration::from_millis(100),
+            Ok(crate::topology::Maintenance::Idle | crate::topology::Maintenance::Blocked) => {
+                let settled = membership.is_some() && self.settled == membership;
+                self.settled = membership;
+                if settled {
+                    OWNERSHIP_SETTLED_RETRY
+                } else {
+                    OWNERSHIP_IDLE_RETRY
+                }
+            }
+            Err(_) => OWNERSHIP_IDLE_RETRY,
         };
         self.next = now + delay;
     }
@@ -1107,9 +1269,35 @@ mod ownership_maintenance_tests {
     use crate::topology::Maintenance;
 
     #[test]
+    fn ownership_maintenance_backs_off_when_settled_and_resumes_on_membership_change() {
+        let start = std::time::Instant::now();
+        let mut maintenance = OwnershipMaintenance::new(start);
+        let idle = || Ok(Maintenance::Idle);
+        maintenance.poll(start, false, Some(1), idle);
+        assert_eq!(maintenance.next, start + OWNERSHIP_IDLE_RETRY);
+        let now = maintenance.next;
+        maintenance.poll(now, false, Some(1), idle);
+        assert_eq!(maintenance.next, now + OWNERSHIP_SETTLED_RETRY);
+        // Unchanged membership waits for the settled retry.
+        maintenance.poll(now, false, Some(1), || panic!("settled refresh"));
+        // A membership change refreshes at once and restarts the backoff.
+        let calls = std::cell::Cell::new(0);
+        maintenance.poll(now, false, Some(2), || {
+            calls.set(calls.get() + 1);
+            Ok(Maintenance::Idle)
+        });
+        assert_eq!(calls.get(), 1);
+        assert_eq!(maintenance.next, now + OWNERSHIP_IDLE_RETRY);
+        // Errors keep the short retry.
+        let now = maintenance.next;
+        maintenance.poll(now, false, Some(2), || Err(Error::Unavailable));
+        assert_eq!(maintenance.next, now + OWNERSHIP_IDLE_RETRY);
+    }
+
+    #[test]
     fn ownership_maintenance_bounds_progress_and_retries_idle_and_errors() {
         let start = std::time::Instant::now();
-        let mut maintenance = OwnershipMaintenance { next: start };
+        let mut maintenance = OwnershipMaintenance::new(start);
         let calls = std::cell::Cell::new(0);
         for status in [
             Ok(Maintenance::Progress),
@@ -1119,7 +1307,7 @@ mod ownership_maintenance_tests {
             Err(Error::Overloaded),
         ] {
             let now = maintenance.next;
-            maintenance.poll(now, false, || {
+            maintenance.poll(now, false, None, || {
                 calls.set(calls.get() + 1);
                 status
             });
@@ -1133,13 +1321,18 @@ mod ownership_maintenance_tests {
                 maintenance.wait_timeout(now, false, Duration::from_secs(1)),
                 expected
             );
-            maintenance.poll(now, false, || panic!("same-turn refresh"));
-            maintenance.poll(maintenance.next - Duration::from_nanos(1), false, || {
-                panic!("early refresh")
-            });
+            maintenance.poll(now, false, None, || panic!("same-turn refresh"));
+            maintenance.poll(
+                maintenance.next - Duration::from_nanos(1),
+                false,
+                None,
+                || panic!("early refresh"),
+            );
         }
         assert_eq!(calls.get(), 5);
-        maintenance.poll(maintenance.next, true, || panic!("refresh during shutdown"));
+        maintenance.poll(maintenance.next, true, None, || {
+            panic!("refresh during shutdown")
+        });
         assert_eq!(
             maintenance.wait_timeout(maintenance.next, true, Duration::from_secs(1)),
             Duration::from_secs(1)
@@ -1151,7 +1344,37 @@ mod ownership_maintenance_tests {
     }
 }
 
+/// Spacing of ciphertext holder samples; each walks the memory cache and
+/// the writer's pending pages once.
+const HOLDER_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Record one ciphertext holder sample for the worker `admission` admits for.
+fn sample_ciphertext_holders(
+    admission: &flow_control::Quotas<AdmissionPolicy>,
+    memory: &MemoryCache,
+    writer: &StoreWriter,
+) {
+    let (cache_idle, cache_pinned, cache_writer) =
+        memory.ciphertext_held(|page, ciphertext| writer.pins_only_writer(page, ciphertext));
+    let (writer_staging, writer_exclusive) = writer.ciphertext_held();
+    admission
+        .policy()
+        .holders()
+        .store(crate::admission::HolderSample {
+            cache_idle,
+            cache_pinned,
+            cache_writer,
+            writer_staging,
+            writer_exclusive,
+        });
+}
+
 impl WorkerApplication {
+    /// This worker's time and entropy.
+    fn ctx(&self) -> &racer_io::WorkerCtx {
+        self.runtime.reactor.ctx()
+    }
+
     /// All constructors below only connect dependencies. Runtime commands route
     /// listener work to page/metadata owners before any acquisition is dispatched.
     pub fn assemble(
@@ -1159,9 +1382,9 @@ impl WorkerApplication {
         node: Arc<NodeState>,
         worker: WorkerId,
         runtime: WorkerRuntime,
-        discovered_nics: Vec<racer_control_wire::RailMapping>,
+        discovered_nics: Vec<racer_wire::control::RailMapping>,
     ) -> Result<Self> {
-        let environment = uring_runtime::environment::Environment::current();
+        let started = runtime.reactor.ctx().now();
         let metrics = node
             .metrics
             .iter()
@@ -1172,15 +1395,18 @@ impl WorkerApplication {
         runtime
             .crypto
             .set_failure_observer(node.failures.observer(worker));
-        let drivers = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
-        let _queue = drivers.enter();
+        let drivers = Rc::new(crate::drivers::DriverQueue::new(1024));
         let admission = runtime.admission.clone();
         config.page_hedge.validate()?;
         let hedges = node
             .hedges
             .get_or_init(|| {
-                crate::read::candidates::Hedges::new(config.page_hedge, node.metrics[0].1.clone())
-                    .expect("validated hedge config")
+                crate::read::candidates::Hedges::new(
+                    config.page_hedge,
+                    node.metrics[0].1.clone(),
+                    node.clock.clone(),
+                )
+                .expect("validated hedge config")
             })
             .for_worker(metrics.clone());
         admission
@@ -1188,11 +1414,13 @@ impl WorkerApplication {
             .set_observer(node.failures.observer(worker));
         metrics.observe_admission(worker, admission.shared())?;
         node.ingress.install(worker, &admission)?;
+        node.peer_ingress.install(worker, &admission)?;
         let reactor = runtime.reactor.clone();
         let limits = admission.policy().limits();
         let snapshots = Rc::new(PublicationTarget::new(
             config.cluster.clone(),
             node.publications.clone(),
+            reactor.ctx().clock.clone(),
         ));
         let keys = Rc::new(Keyring::new(
             config.cluster.clone(),
@@ -1204,13 +1432,24 @@ impl WorkerApplication {
             node.publications.clone(),
             keys.clone(),
         ));
-        let signatures = Rc::new(Signatures::new(keys.clone(), certificates.clone()));
+        let signatures = Rc::new(Signatures::new(
+            keys.clone(),
+            certificates.clone(),
+            reactor.ctx().clone(),
+        ));
         let forwarding = Rc::new(Forwarding::with_crypto(
             signatures.clone(),
             runtime.crypto.clone(),
         ));
-        let credentials = Rc::new(CredentialCrypto::new(keys.clone(), admission.clone()));
+        let credentials = Rc::new(CredentialCrypto::new(
+            keys.clone(),
+            admission.clone(),
+            reactor.ctx().rng.clone(),
+        ));
         let is_sampler = worker == node.control_worker;
+        // This worker's own view of the node directory; it binds this worker's
+        // coordinator when the endpoint installs.
+        let directory = std::rc::Rc::new(node.workers.view());
         let node_pressure = node.pressure.clone();
         let control = if worker == node.control_worker {
             Some(Self::assemble_control(
@@ -1241,21 +1480,25 @@ impl WorkerApplication {
             admission.clone(),
             crate::model::PAGE_BYTES + 16,
         ));
-        // Aligned ciphertext matches this worker's store devices so pages can
-        // be written without copying; file-backed slabs use the 4 KiB default.
+        // Aligned ciphertext matches this worker's store records (device
+        // alignment padded to the record unit) so pages can be written without
+        // copying; file-backed slabs use the 4 KiB default.
         let buffers = BufferPool::with_alignment(
             admission.clone(),
-            node.devices
-                .as_ref()
-                .map_or_else(crate::memory::default_disk_alignment, |plan| {
-                    plan.workers[worker.0 as usize].alignment
-                }),
+            match node.devices.as_ref() {
+                Some(plan) => {
+                    crate::store::record_alignment(plan.workers[worker.0 as usize].alignment)?
+                }
+                None => crate::memory::default_disk_alignment(),
+            },
         );
         let memory = Rc::new(MemoryCache::new(buffers.clone(), availability.clone()));
-        let crypto = Rc::new(
-            PageCrypto::new(keys.clone(), runtime.crypto.clone()).with_buffers(buffers.clone()),
-        );
-        let pipes = Rc::new(new_pipe_pool(admission.clone()));
+        let crypto = Rc::new(PageCrypto::new(
+            keys.clone(),
+            runtime.crypto.clone(),
+            buffers.clone(),
+        ));
+        let pipes = Rc::new(new_pipe_pool(admission.clone(), reactor.sim_os()));
         let delivery = Rc::new(
             Delivery::new(reactor.clone(), config.reader_stall_timeout)
                 .with_metrics(metrics.clone()),
@@ -1274,15 +1517,18 @@ impl WorkerApplication {
         let writer = store.writer.clone();
 
         let links = if config.enable_rdma {
+            let numa = node.native.numa(worker)?.and_then(|p| p.numa_node);
             node.native.client(worker)?.map(|client| {
                 Rc::new(
                     Links::new(
                         client,
                         node.native.link_node(),
                         config.node.clone(),
-                        limits.connections_per_neighbor.get(),
                         Some(reactor.clone()),
+                        reactor.ctx().clone(),
                     )
+                    .with_numa(numa)
+                    .with_breaker(config.rdma_breaker)
                     .with_metrics(metrics.clone()),
                 )
             })
@@ -1295,13 +1541,19 @@ impl WorkerApplication {
                 // Silence: the rank 0 watch's
                 // allowance, and one peer attempt per ping.
                 Rc::new(
-                    LinkHealth::default()
-                        .with_silence(config.request_timeout / 2, config.peer_attempt_timeout),
+                    LinkHealth::new(
+                        crate::topology::LINK_HEALTH_CAPACITY,
+                        runtime.reactor.ctx().clock.clone(),
+                    )
+                    .with_silence(config.request_timeout / 2, config.peer_attempt_timeout),
                 ),
                 limits.cached_paths.get(),
                 limits.path_cache_bytes.get(),
                 limits.active_path_searches.get(),
             )
+            // A cold start bursts past the search slots; a short queue keeps those reads from
+            // failing `Overloaded` (dst/MODEL.md, "Peer connection slots").
+            .with_queue(::topology::DEFAULT_SEARCH_QUEUE)
             .with_peer_admission(node.peer_admission.for_worker(&metrics)),
         );
         let placement = Rc::new(Placement::with_memory_budget(
@@ -1310,6 +1562,7 @@ impl WorkerApplication {
         let network = Rc::new(crate::peer::PeerNetwork::new(
             config.node.clone(),
             node.publications.clone(),
+            reactor.ctx().clock.clone(),
         )?);
         let wire = Rc::new(crate::peer::protocol::SecurityCodec::new(
             admission.clone(),
@@ -1335,7 +1588,8 @@ impl WorkerApplication {
             admission.clone(),
             memory.clone(),
             writer.clone(),
-        ));
+        ))
+        .with_metrics(metrics.clone());
         let transfers = Rc::new(match &links {
             Some(links) => transfers.with_links(links.clone()),
             None => transfers,
@@ -1357,6 +1611,8 @@ impl WorkerApplication {
                 requester.clone(),
                 credentials.clone(),
                 node.publications.clone(),
+                reactor.ctx().clone(),
+                drivers.clone(),
             )
             .with_hedges(hedges)
             .with_reactor(reactor.clone())
@@ -1405,10 +1661,14 @@ impl WorkerApplication {
             adapter,
             Some(azure),
         ));
-        let flights = Rc::new(Flights::new(admission.clone(), availability.clone()));
+        let flights = Rc::new(Flights::new(
+            admission.clone(),
+            availability.clone(),
+            reactor.ctx().clock.clone(),
+            drivers.clone(),
+        ));
         let (coordinator, metadata) = Self::assemble_reads(
             config,
-            &node,
             snapshots.clone(),
             availability,
             delivery.clone(),
@@ -1424,7 +1684,7 @@ impl WorkerApplication {
                 crypto: crypto.clone(),
                 credentials: credentials.clone(),
                 admission: admission.clone(),
-                metadata_owner: node.workers.clone(),
+                metadata_owner: directory.clone(),
             },
         );
         let relay = Rc::new(Relay::new(
@@ -1434,15 +1694,15 @@ impl WorkerApplication {
             admission.clone(),
             network.clone(),
         ));
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "dst")))]
         let distributed = true;
-        #[cfg(test)]
-        let distributed = uring_runtime::reactor::simulation::Simulation::current().is_none();
+        #[cfg(any(test, feature = "dst"))]
+        let distributed = runtime.reactor.sim_os().is_none();
         let peers = PeerServer::new(
             io.clone(),
             forwarding,
             admission.clone(),
-            Rc::new(node.workers.clone()),
+            Rc::new(directory.clone()),
             relay,
             wire,
             signatures,
@@ -1452,18 +1712,20 @@ impl WorkerApplication {
             crate::peer::server::Settings {
                 tcp_nodelay: config.peer_tcp_nodelay,
                 accept: if distributed {
-                    crate::peer::server::AcceptMode::Distributed(node.ingress.clone())
+                    crate::peer::server::AcceptMode::Distributed(node.peer_ingress.clone())
                 } else {
                     crate::peer::server::AcceptMode::Local
                 },
                 request_timeout: config.request_timeout,
                 opaque_relay: config.opaque_relay,
             },
+            drivers.clone(),
         )
+        .with_page_size(origin.clone())
         .with_metrics(metrics.clone());
-        let peers = Rc::new(peers.with_send_crc(
-            config.send_crc_pair.clone(),
-            node.send_crc.clone(),
+        let peers = Rc::new(peers.with_send_tag(
+            config.send_tag_pair.clone(),
+            node.send_tag.clone(),
             crypto,
         ));
         let clients = Self::assemble_clients(
@@ -1477,7 +1739,7 @@ impl WorkerApplication {
         );
 
         let mut telemetry = Telemetry::default();
-        telemetry.send_crc = node.send_crc.clone();
+        telemetry.send_tag = node.send_tag.clone();
         telemetry.failures = node.failures.clone();
         telemetry.metrics = metrics;
         telemetry.health = node.observations.health.clone();
@@ -1495,7 +1757,6 @@ impl WorkerApplication {
             #[cfg(test)]
             peer_requester: requester,
             http,
-            environment,
             drivers,
             worker,
             runtime,
@@ -1513,14 +1774,35 @@ impl WorkerApplication {
             actual_rails: Vec::new(),
             inventory_generation: 0,
             native_task: None,
-            native_retry: uring_runtime::environment::now(),
+            native_retry: started,
+            native_failures: 0,
             rdma_report: config
                 .managed_control
                 .as_ref()
                 .map(|managed| (managed.report.clone(), config.shares.get())),
             rdma_withdrawn: false,
+            rdma_readvertised: false,
+            rdma_losses_seen: 0,
+            rdma_lost: None,
+            rdma_waiting: None,
+            attaching_landings: false,
+            rdma_settle: None,
+            rdma_attempts: 0,
+            rail_settle: native::RAIL_SETTLE,
+            rdma_char_devices: (!cfg!(test)).then(|| {
+                (
+                    crate::rdma::SYSFS_INFINIBAND_VERBS.into(),
+                    crate::rdma::DEV_CHAR.into(),
+                )
+            }),
+            rdma_char_refreshed: None,
+            rail_probe: started,
+            rdma_sysfs: crate::rdma::SYSFS_INFINIBAND.into(),
+            rdma_rescan: started,
+            rdma_rescan_seen: None,
+            rdma_rescan_changed: started,
             telemetry: Rc::new(telemetry),
-            directory: node.workers.clone(),
+            directory: directory.clone(),
             node,
             endpoint: None,
             control_task: None,
@@ -1535,10 +1817,8 @@ impl WorkerApplication {
             checkpoint_budget: config.checkpoint_bytes.get(),
             placement,
             candidates,
-            ownership_maintenance: OwnershipMaintenance {
-                next: uring_runtime::environment::now(),
-            },
-            placement_retry: uring_runtime::environment::now(),
+            ownership_maintenance: OwnershipMaintenance::new(started),
+            placement_retry: started,
             placement_warning: None,
             diagnostic_task: None,
             diagnostic_scope: None,
@@ -1561,27 +1841,38 @@ impl WorkerApplication {
             cache_prepare_task: None,
             cache_preparing_generation: 0,
             control_scope: None,
-            next_health: uring_runtime::environment::now(),
-            pressure: WorkerPressure::new(config.memory_pressure, &node_pressure, is_sampler),
+            next_health: started,
+            next_holder_sample: started,
+            pressure: WorkerPressure::new(
+                config.memory_pressure,
+                &node_pressure,
+                is_sampler,
+                started,
+            ),
         })
     }
 
     /// Connect shared publication state to worker-local read and metadata services.
     fn assemble_reads(
         config: &Config,
-        node: &NodeState,
         snapshots: Rc<PublicationTarget>,
         availability: Rc<crate::control::Availability>,
         delivery: Rc<Delivery>,
         metrics: &crate::telemetry::Metrics,
         dependencies: FillDependencies,
     ) -> (Rc<Coordinator>, Rc<MetadataService>) {
+        let directory = dependencies.metadata_owner.clone();
         let candidates = dependencies.candidates.clone();
+        let drivers = candidates.drivers().clone();
         let origin = dependencies.origin.clone();
         let credentials = dependencies.credentials.clone();
         let index = dependencies.writer.index().clone();
         let admission = dependencies.admission.clone();
-        let fill = Rc::new(Fill::new(dependencies).with_metrics(metrics.clone()));
+        let fill = Rc::new(
+            Fill::new(dependencies)
+                .with_metrics(metrics.clone())
+                .with_plaintext_wait(delivery.reactor().clone()),
+        );
         let metadata = Rc::new(MetadataService::new(
             candidates,
             origin,
@@ -1590,13 +1881,14 @@ impl WorkerApplication {
             MetadataDependencies {
                 index,
                 fill: fill.clone(),
-                owners: node.workers.clone(),
+                owners: directory.clone(),
             },
         ));
         let streams = Rc::new(RangeStreams::new(
-            node.workers.clone(),
+            directory.clone(),
             delivery,
             config.limits.range_window_pages.get(),
+            drivers,
         ));
         let coordinator = Rc::new(Coordinator::new(
             snapshots.published.clone(),
@@ -1625,7 +1917,8 @@ impl WorkerApplication {
             admission.clone(),
         ));
         let mut responses = Responses::new(io.clone(), delivery)
-            .with_observer(admission.policy().observer().clone());
+            .with_observer(admission.policy().observer().clone())
+            .with_host_crypto(runtime.crypto.clone());
         if let Some(gpu) = node.gpu.get() {
             responses = responses.with_gpu(Rc::new(crate::gpu::GpuClient::new(gpu.clone())));
         } else if node.gpu.standby() {
@@ -1708,7 +2001,9 @@ impl WorkerApplication {
             worker,
             limits.metadata_entries.get(),
             availability.clone(),
+            runtime.reactor.ctx().clock.clone(),
         ));
+        index.seed_page_hash(&runtime.reactor.ctx().rng)?;
         let segments = Rc::new(page_alloc::Segments::new(config.segment_bytes));
         let eviction = Rc::new(SegmentClock::with_budget(
             index.clone(),
@@ -1751,9 +2046,12 @@ impl WorkerApplication {
             // checkpoint that outlives its payload.
             .reset_mismatched_size()
         });
+        #[cfg(any(test, feature = "dst"))]
+        if let Some(sim) = runtime.reactor.sim_os() {
+            slabs.simulate_in(sim);
+        }
         let reader = Rc::new(
             StoreReader::new(
-                eviction.clone(),
                 index.clone(),
                 segments.clone(),
                 slabs.clone(),
@@ -1797,11 +2095,9 @@ impl WorkerApplication {
         // writer, index, and segment clock all consult this same worker policy.
         writer.set_retention(Rc::new(crate::retention::Retention::configured(
             config.admission_history_per_worker(node.count)?,
-            disk_page_entries
-                .checked_add(limits.queue_entries.get())
-                .ok_or(Error::InvalidConfiguration)?,
             config.admission_period,
             config.admission_mode == crate::config::AdmissionMode::SecondSight,
+            runtime.reactor.ctx().clock.clone(),
         )?));
         // Disk shares use the same priority table as memory flow control.
         writer
@@ -1831,7 +2127,7 @@ impl WorkerApplication {
         admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
         memory: Rc<MemoryCache>,
         writer: Rc<StoreWriter>,
-    ) -> impl Fn(&racer_control_wire::CacheId, usize) {
+    ) -> impl Fn(&racer_wire::control::CacheId, usize) {
         move |cache, amount| {
             let class = crate::admission::ResourceClass::Ciphertext;
             for _ in 0..2 {
@@ -1880,10 +2176,13 @@ impl WorkerApplication {
         if self.snapshot_sequence == Some(snapshot.sequence) {
             return Ok(());
         }
+        if let Some(links) = &self.links {
+            links.retain_edges(&snapshot.membership);
+        }
         let removed: std::collections::HashSet<_> = self
             .caches
             .iter()
-            .filter(|old| !snapshot.caches.iter().any(|new| new.id == old.id))
+            .filter(|old| !snapshot.caches.contains(&old.id))
             .map(|old| old.id.clone())
             .collect();
         self.memory.remove_caches(&removed)?;
@@ -1919,7 +2218,7 @@ impl WorkerApplication {
         if admission.policy().weights().update(&snapshot.caches) {
             admission.reweigh();
         }
-        self.caches = snapshot.caches.clone();
+        self.caches = snapshot.caches.to_vec();
         self.snapshot_sequence = Some(snapshot.sequence);
         Ok(())
     }
@@ -1928,8 +2227,6 @@ impl WorkerApplication {
     /// Any error here ends the worker group and the process, so each stage names
     /// itself in the log before the error propagates.
     fn poll_services(&mut self, cx: &mut Context<'_>, work_budget: usize) -> Result<()> {
-        let _environment = self.environment.enter();
-        let _queue = self.drivers.enter();
         if work_budget == 0 {
             return Ok(());
         }
@@ -1939,7 +2236,7 @@ impl WorkerApplication {
         let worker = self.worker;
         let budget = work_budget.min(64);
         stage_result(worker, "native", self.poll_native(cx))?;
-        let now = uring_runtime::environment::now();
+        let now = self.ctx().now();
         if !self.stopping
             && now >= self.placement_retry
             && let Ok(snapshot) = self.snapshots.current()
@@ -1949,9 +2246,15 @@ impl WorkerApplication {
         }
         // Independent of placement.maintain being Idle: recovered residents and
         // changed membership need periodic refresh even without foreground reads.
-        self.ownership_maintenance.poll(now, self.stopping, || {
-            self.candidates.refresh_ownership(self.store.writer.index())
-        });
+        let membership = self
+            .snapshots
+            .current()
+            .ok()
+            .map(|snapshot| std::sync::Arc::as_ptr(&snapshot.membership) as usize);
+        self.ownership_maintenance
+            .poll(now, self.stopping, membership, || {
+                self.candidates.refresh_ownership(self.store.writer.index())
+            });
         if !self.stopping {
             self.coordinator.poll_offers(now);
         }
@@ -1964,8 +2267,7 @@ impl WorkerApplication {
             gate.poll_deadlines(budget);
         }
         // Expire metadata before advancing peer/listener tasks.
-        self.metadata
-            .poll_deadlines(uring_runtime::environment::now(), budget);
+        self.metadata.poll_deadlines(self.ctx().now(), budget);
         if !self.stopping {
             let prepared = self.poll_cache_preparation(cx);
             stage_result(worker, "cache-preparation", prepared)?;
@@ -1974,12 +2276,14 @@ impl WorkerApplication {
         stage_result(worker, "writer", self.poll_writer(cx))?;
         if !self.stopping {
             stage_result(worker, "control", self.poll_control(cx))?;
-            let refreshed = scope(self.timeout).and_then(|turn| self.refresh_snapshot(&turn));
+            let refreshed = scope(&self.ctx().clock, self.timeout)
+                .and_then(|turn| self.refresh_snapshot(&turn));
             stage_result(worker, "snapshot-refresh", refreshed)?;
         }
-        let now = uring_runtime::environment::now();
+        let now = self.ctx().now();
         if now >= self.next_health {
             self.observe_memory(now);
+            self.sample_ciphertext_holders(now);
             self.reclaim_cache_under_pressure();
             stage_result(worker, "health", self.observe_health())?;
             self.next_health = now + Duration::from_millis(100);
@@ -1987,14 +2291,24 @@ impl WorkerApplication {
         Ok(())
     }
 
-    /// Advance demand sizing of the idle recycler, staging, and aligned pools.
+    /// Advance demand sizing of the idle staging and aligned pools.
     /// Each pool is O(1) until its observation window elapses.
     fn maintain_pools(&self, now: std::time::Instant) {
-        self.runtime.admission.maintain_buffers(now);
         self.store.writer.maintain_staging(now);
-        // Expire idle cache entries first so their buffers reach the pools
-        // before those decay.
-        self.memory.expire_idle(now);
+        // Under memory pressure, expire idle cache entries first so their
+        // buffers reach the pools before those decay. At Normal, entries stay
+        // until reservation, headroom, or pressure reclaim needs their space.
+        let level = self.pressure.responder.level();
+        if crate::pressure::pressure_actions(level).expire_idle_cache {
+            self.memory.expire_idle(now);
+        }
+        // Drop pages whose key left the keyring, a bounded batch per turn.
+        self.memory
+            .sweep_unavailable(racer_core::cache::EXPIRY_BATCH);
+        let index = self.store.writer.index();
+        index.sweep_unavailable(racer_core::cache::EXPIRY_BATCH);
+        // Release expired hard holds, a bounded batch per turn.
+        index.expire_holds(racer_core::cache::EXPIRY_BATCH);
         self.memory.buffers().maintain_idle_buffers(now);
     }
 
@@ -2075,11 +2389,23 @@ impl WorkerApplication {
         self.memory.buffers().reclaim_idle_buffers();
     }
 
-    /// Publish this worker's staging pool and, on the sampling worker, the
+    /// Attribute this worker's ciphertext charges to the memory cache and
+    /// disk writer at most once per [`HOLDER_SAMPLE_INTERVAL`]. Admission
+    /// rejections and `/metrics` read the latest sample.
+    fn sample_ciphertext_holders(&mut self, now: std::time::Instant) {
+        if now < self.next_holder_sample {
+            return;
+        }
+        self.next_holder_sample = now + HOLDER_SAMPLE_INTERVAL;
+        sample_ciphertext_holders(&self.runtime.admission, &self.memory, &self.store.writer);
+    }
+
+    /// Publish this worker's staging and page buffer pools and, on the sampling worker, the
     /// process memory sample at most once per second.
     fn observe_memory(&mut self, now: std::time::Instant) {
         let metrics = &self.telemetry.metrics;
         metrics.observe_staging_pool(self.worker, self.store.writer.staging_pool_stats());
+        metrics.observe_buffer_pool(self.worker, self.memory.buffers().pool_stats());
         if !self.pressure.samples_memory || now < self.pressure.next_memory_sample {
             return;
         }
@@ -2096,24 +2422,20 @@ impl WorkerApplication {
 
     /// Hold every idle pool at its minimum while memory is constrained.
     pub(crate) fn constrain_pools(&self, constrained: bool) {
-        self.runtime.admission.constrain_buffers(constrained);
         self.store.writer.constrain_staging(constrained);
         self.memory.buffers().constrain_idle_buffers(constrained);
     }
 
-    /// Idle pool statistics as `(recycler, staging slab)`.
+    /// Idle statistics of the staging slab pool.
     #[cfg(test)]
-    pub(crate) fn pool_stats(&self) -> (flow_control::PoolStats, flow_control::PoolStats) {
-        (
-            self.runtime.admission.buffer_pool_stats(),
-            self.store.writer.staging_pool_stats(),
-        )
+    pub(crate) fn staging_pool_stats(&self) -> flow_control::PoolStats {
+        self.store.writer.staging_pool_stats()
     }
 
-    /// Demand counters of this worker's aligned ciphertext pool.
+    /// Idle and trimming counters of this worker's buffer pool.
     #[cfg(test)]
-    pub(crate) fn aligned_pool_stats(&self) -> page_alloc::PoolStats {
-        self.memory.buffers().aligned_pool_stats()
+    pub(crate) fn buffer_pool_stats(&self) -> page_alloc::PoolStats {
+        self.memory.buffers().pool_stats()
     }
 
     /// Schedule placement progress or back off pinned capacity with a bounded warning rate.
@@ -2147,12 +2469,20 @@ impl WorkerApplication {
     /// Admit a bounded batch of handed-off connections and poll active peer work.
     fn poll_ingress(&mut self, cx: &mut Context<'_>, budget: usize) -> Result<()> {
         if !self.stopping {
-            for accepted in self
+            let mut clients = self
                 .node
                 .ingress
-                .pop_batch::<64>(self.worker, cx.waker(), budget)?
-                .into_iter()
-                .flatten()
+                .pop_batch::<64>(self.worker, cx.waker(), budget)?;
+            let mut peers =
+                self.node
+                    .peer_ingress
+                    .pop_batch::<64>(self.worker, cx.waker(), budget)?;
+            // Take items in place: moving whole batches through iterator adapters
+            // copies both arrays on every poll, even when the queues are empty.
+            for accepted in clients
+                .iter_mut()
+                .chain(peers.iter_mut())
+                .filter_map(Option::take)
             {
                 let connection =
                     crate::http::from_reserved(accepted.fd.into(), accepted.reservation);
@@ -2240,6 +2570,8 @@ impl WorkerApplication {
 
     /// Drive queued writes unless a periodic checkpoint is waiting for its cut.
     fn poll_writer(&mut self, cx: &mut Context<'_>) -> Result<()> {
+        // `Error::FlightFull` is not listed: it comes only from peer responses,
+        // which the store writer never issues.
         if let Some(result) = poll_task(&mut self.writer_task, cx)
             && !matches!(
                 result,
@@ -2248,26 +2580,38 @@ impl WorkerApplication {
                     | Error::Unavailable
                     | Error::Overloaded
                     | Error::MissingKey
-                    | Error::Cancelled
+                    | Error::Canceled
                     | Error::DeadlineExceeded)
             )
         {
             result?;
         }
-        let checkpoint_waiting = self
-            .node
-            .periodic_checkpoint
-            .lock()
-            .is_ok_and(|cut| cut.blocks_writer());
+        // A periodic cut fences new batches only until this worker's own
+        // snapshot is taken: the snapshot then thaws appends while segment
+        // reuse stays frozen through publication.
+        let checkpoint_waiting = self.node.periodic_checkpoint.lock().is_ok_and(|cut| {
+            cut.blocks_writer_before(self.checkpoint_generation)
+                || self.checkpoint_snapshot.is_some()
+        });
+        // A pending cut also stops an active batch from refilling, so this
+        // worker can vote once its in-flight writes drain.
+        self.store.writer.set_refill_fence(checkpoint_waiting);
         if !checkpoint_waiting
             && self.writer_task.is_none()
             && self.store.writer.can_start_progress()
             && self.store.writer.pending_count() != 0
         {
             let writer = self.store.writer.clone();
-            let write_scope = scope(self.timeout)?;
+            let write_scope = scope(&self.ctx().clock, self.timeout)?;
             self.writer_task = Some(Box::pin(async move {
-                writer.progress(8, &write_scope).await.map(|_| ())
+                writer
+                    .progress_pipelined(
+                        crate::store::WRITER_WINDOW,
+                        crate::store::WRITER_CALL_WRITES,
+                        &write_scope,
+                    )
+                    .await
+                    .map(|_| ())
             }));
         }
         Ok(())
@@ -2287,7 +2631,10 @@ impl WorkerApplication {
             && let Some(control) = &self.control
         {
             let control = control.clone();
-            let turn = scope(racer_control_wire::POLL_WAIT + Duration::from_secs(10))?;
+            let turn = scope(
+                &self.ctx().clock,
+                racer_wire::control::POLL_WAIT + Duration::from_secs(10),
+            )?;
             self.control_scope = Some(turn.clone());
             self.control_task = Some(Box::pin(async move { control.progress(&turn).await }));
         }
@@ -2305,7 +2652,7 @@ impl WorkerApplication {
             && let Some(control) = &self.control
         {
             let control = control.clone();
-            let turn = scope(Duration::from_secs(80))?;
+            let turn = scope(&self.ctx().clock, Duration::from_secs(80))?;
             self.keyring_scope = Some(turn.clone());
             self.keyring_task = Some(Box::pin(
                 async move { control.keyring_progress(&turn).await },
@@ -2316,9 +2663,7 @@ impl WorkerApplication {
 
     /// Fence control preparation and release this worker's remaining service owners.
     pub fn shutdown<'a>(&'a mut self, shutdown_scope: &'a RequestScope) -> Operation<'a, ()> {
-        let environment = self.environment.clone();
-        let drivers = self.drivers.clone();
-        Box::pin(environment.scope(drivers.scope(async move {
+        Box::pin(async move {
             self.stop_profiling(shutdown_scope).await?;
             self.control_task.take();
             self.keyring_task.take();
@@ -2333,9 +2678,9 @@ impl WorkerApplication {
             self.started = false;
             self.telemetry
                 .health
-                .transition(crate::telemetry::State::Stopped)?;
+                .transition_at(crate::telemetry::State::Stopped, self.node.clock.now())?;
             Ok(())
-        })))
+        })
     }
 
     async fn stop_profiling(&self, deadline: &RequestScope) -> Result<()> {
@@ -2348,10 +2693,7 @@ impl WorkerApplication {
                 // Notification can precede thread exit. Recheck the join fence
                 // with a bounded kernel timer, not a blocking join or self-wake.
                 timer
-                    .sleep(
-                        uring_runtime::environment::now() + Duration::from_millis(10),
-                        deadline,
-                    )
+                    .sleep(self.ctx().now() + Duration::from_millis(10), deadline)
                     .await?;
             }
         }
@@ -2375,7 +2717,8 @@ impl Application {
     }
 
     /// Allocate paired worker resources once before building service lanes.
-    fn prepare_workers(&self) -> Result<()> {
+    /// With a plan, crypto helpers on one NUMA node share their queued jobs.
+    fn prepare_workers(&self, plan: Option<&AffinityPlan>) -> Result<()> {
         let resources = crate::worker::Resources::new(
             self.limits.clone(),
             self.node
@@ -2384,7 +2727,11 @@ impl Application {
                 .map(|(worker, _)| *worker)
                 .collect(),
             1,
+            self.ctx.clone(),
         )?;
+        if let Some(plan) = plan {
+            resources.share_crypto(plan.crypto_share_keys())?;
+        }
         self.resources
             .set(resources)
             .map_err(|_| Error::InvalidConfiguration)
@@ -2395,7 +2742,7 @@ impl Application {
         &self,
         worker: WorkerId,
         runtime: WorkerRuntime,
-    ) -> Result<Box<dyn uring_runtime::group::Service<RequestScope>>> {
+    ) -> Result<Box<dyn crate::lifecycle::Service<RequestScope>>> {
         let application = WorkerApplication::assemble(
             &self.config,
             self.node.clone(),
@@ -2406,23 +2753,25 @@ impl Application {
         Ok(Box::new(application))
     }
 
-    /// Build the crypto service and attach any configured native resources.
+    /// Build the crypto service. The RDMA owner runs on its own thread.
     fn build_crypto(
         &self,
-        worker: WorkerId,
+        _worker: WorkerId,
         runtime: CryptoRuntime,
-    ) -> Result<Box<dyn uring_runtime::group::Service<RequestScope>>> {
-        self.node
-            .native
-            .crypto(worker, PageCryptoEngine::new(runtime))
+    ) -> Result<Box<dyn crate::lifecycle::Service<RequestScope>>> {
+        Ok(Box::new(PageCryptoEngine::new(runtime)))
     }
 }
 
-impl uring_runtime::group::Factory<RequestScope> for Application {
-    fn build_lane(
-        &self,
-        lane: usize,
-    ) -> Result<Box<dyn uring_runtime::group::Service<RequestScope>>> {
+/// Teardown runs the configured drain, then control shutdown, fences, and
+/// the shutdown phase, so it gets the drain budget plus the fixed lifecycle
+/// budget. A shorter fixed deadline would fail a drain the operator allowed.
+fn teardown_budget(shutdown_timeout: Duration) -> Duration {
+    shutdown_timeout.saturating_add(crate::worker::LIFECYCLE_TIMEOUT)
+}
+
+impl crate::lifecycle::Factory<RequestScope> for Application {
+    fn build_lane(&self, lane: usize) -> Result<Box<dyn crate::lifecycle::Service<RequestScope>>> {
         self.resources
             .get()
             .ok_or(Error::InvalidConfiguration)?
@@ -2432,7 +2781,7 @@ impl uring_runtime::group::Factory<RequestScope> for Application {
     fn build_helper(
         &self,
         lane: usize,
-    ) -> Result<Box<dyn uring_runtime::group::Service<RequestScope>>> {
+    ) -> Result<Box<dyn crate::lifecycle::Service<RequestScope>>> {
         self.resources
             .get()
             .ok_or(Error::InvalidConfiguration)?
@@ -2447,25 +2796,31 @@ impl uring_runtime::group::Factory<RequestScope> for Application {
     }
 
     fn teardown_scope(&self, startup: &RequestScope) -> RequestScope {
-        scope(Duration::from_secs(30)).unwrap_or_else(|_| startup.clone())
+        scope(
+            startup.clock(),
+            teardown_budget(self.config.shutdown_timeout),
+        )
+        .unwrap_or_else(|_| startup.clone())
     }
 }
 
-impl uring_runtime::group::Service<RequestScope> for WorkerApplication {
+impl crate::lifecycle::Service<RequestScope> for WorkerApplication {
     fn wait_timeout(&self, maximum: Duration) -> Duration {
-        let _environment = self.environment.enter();
-        let maximum = self.ownership_maintenance.wait_timeout(
-            uring_runtime::environment::now(),
-            self.stopping,
-            maximum,
-        );
+        let maximum =
+            self.ownership_maintenance
+                .wait_timeout(self.ctx().now(), self.stopping, maximum);
         self.metadata
             .next_deadline()
             .into_iter()
             .chain(self.flights.next_deadline())
+            .chain(
+                self.endpoint
+                    .as_ref()
+                    .and_then(WorkerEndpoint::next_deadline),
+            )
             .min()
             .map_or(maximum, |deadline| {
-                maximum.min(deadline.saturating_duration_since(uring_runtime::environment::now()))
+                maximum.min(deadline.saturating_duration_since(self.ctx().now()))
             })
     }
 
@@ -2477,29 +2832,26 @@ impl uring_runtime::group::Service<RequestScope> for WorkerApplication {
         if !self.started {
             return Err(Error::Unavailable);
         }
-        if STOP_REQUESTED.load(Ordering::Relaxed) {
-            return Err(Error::Cancelled);
-        }
         self.poll_services(cx, work_budget)
     }
 
     fn stop_admission(&mut self) -> Result<()> {
-        let _environment = self.environment.enter();
-        let _queue = self.drivers.enter();
         self.stopping = true;
         if let Some(profiling) = self.node.profiling.get() {
             profiling.stop();
         }
         self.node.ingress.close(self.worker);
+        self.node.peer_ingress.close(self.worker);
         if let Some(scope) = &self.task_scope {
             scope.cancel()?;
         }
         self.cache_prepare_task.take();
         self.prepared_listeners.borrow_mut().take();
-        if self.telemetry.health.state()? != crate::telemetry::State::Stopped {
+        let now = self.node.clock.now();
+        if self.telemetry.health.state_at(now)? != crate::telemetry::State::Stopped {
             self.telemetry
                 .health
-                .transition(crate::telemetry::State::Draining)?;
+                .transition_at(crate::telemetry::State::Draining, now)?;
         }
         self.clients.stop_admission();
         if let Some(endpoint) = &self.endpoint {
@@ -2520,18 +2872,16 @@ impl uring_runtime::group::Service<RequestScope> for WorkerApplication {
     }
 
     fn drain<'a>(&'a mut self, _scope: &'a RequestScope) -> Operation<'a, ()> {
-        let environment = self.environment.clone();
-        let drivers = self.drivers.clone();
-        Box::pin(environment.scope(drivers.scope(async move {
+        Box::pin(async move {
             self.stop_admission()?;
-            let deadline = scope(self.shutdown_timeout)?;
+            let deadline = scope(&self.ctx().clock, self.shutdown_timeout)?;
             self.stop_profiling(&deadline).await?;
             if let Some(control) = &self.control {
                 control.shutdown(&deadline).await?;
             }
             let clients = self.clients.clone();
             let flights = self.flights.clone();
-            let fence_scope = scope(Duration::from_secs(365 * 24 * 3600))?;
+            let fence_scope = untimed(&self.ctx().clock)?;
             let mut client_drain = clients.drain(&deadline);
             let mut flight_drain = flights.drain(&fence_scope);
             let mut clients_done = false;
@@ -2593,7 +2943,7 @@ impl uring_runtime::group::Service<RequestScope> for WorkerApplication {
                 scope.cancel()?;
             }
             std::future::poll_fn(|cx| match poll_task(&mut self.diagnostic_task, cx) {
-                Some(Ok(()) | Err(Error::Cancelled | Error::DeadlineExceeded)) | None
+                Some(Ok(()) | Err(Error::Canceled | Error::DeadlineExceeded)) | None
                     if self.diagnostic_task.is_none() =>
                 {
                     Poll::Ready(Ok(()))
@@ -2614,7 +2964,7 @@ impl uring_runtime::group::Service<RequestScope> for WorkerApplication {
                 self.checkpoint(&deadline).await?;
             }
             Ok(())
-        })))
+        })
     }
 
     fn shutdown<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
@@ -2649,7 +2999,7 @@ pub(crate) type ServedCaches = Rc<RefCell<Option<Arc<Vec<CacheDefinition>>>>>;
 
 /// Reserved worker barrier and the control worker's prepared listeners.
 struct Transition<'a> {
-    guard: Option<controlplane::rollout::Guard<'a, WorkerId, Vec<CacheDefinition>>>,
+    guard: Option<crate::app::rollout::Guard<'a, WorkerId, Vec<CacheDefinition>>>,
 
     listeners: Option<PreparedListeners>,
 }
@@ -2667,7 +3017,7 @@ impl CacheTransition for Transition<'_> {
 
 impl CachePublication {
     /// Propose changed definitions or reserve the acknowledged cut for atomic commit.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "dst"))]
     pub(crate) fn stage(
         &self,
         definitions: &[CacheDefinition],
@@ -2683,7 +3033,7 @@ impl CachePublication {
         definitions: &[CacheDefinition],
         membership: Option<&crate::topology::Membership>,
     ) -> Result<Box<dyn CacheTransition + '_>> {
-        racer_control_wire::validate_definitions(definitions)?;
+        racer_wire::control::validate_definitions(definitions)?;
         let served: Vec<CacheDefinition> = match (&self.local, membership) {
             (Some(local), Some(membership)) => definitions
                 .iter()
@@ -2735,9 +3085,9 @@ impl CachePublication {
 fn prefetch_keeps(
     snapshot: &crate::control::Snapshot,
     local: &NodeId,
-    cache: &racer_control_wire::CacheId,
+    cache: &racer_wire::control::CacheId,
 ) -> bool {
-    snapshot.caches.iter().any(|new| &new.id == cache) && snapshot.membership.serves(cache, local)
+    snapshot.caches.contains(cache) && snapshot.membership.serves(cache, local)
 }
 
 impl WorkerApplication {
@@ -2790,7 +3140,7 @@ impl WorkerApplication {
             if self.cache_prepare_task.is_none() {
                 let clients = self.clients.clone();
                 let prepared = self.prepared_listeners.clone();
-                let startup = scope(self.timeout)?;
+                let startup = scope(&self.ctx().clock, self.timeout)?;
                 // Bind only the caches whose pool has this node.
                 let served = self
                     .served_caches
@@ -2814,8 +3164,8 @@ impl WorkerApplication {
             }
         }
         match node.cache_rollout.ack(self.worker, generation) {
-            Ok(()) | Err(controlplane::Error::Stale) => (),
-            Err(error) => return Err(error.into()),
+            Ok(()) | Err(Error::StaleFlight) => (),
+            Err(error) => return Err(error),
         }
         Ok(())
     }
@@ -2826,14 +3176,21 @@ impl WorkerApplication {
 struct Observations {
     pub health: Health,
 
-    workers: Mutex<HashMap<WorkerId, (Resources, Option<racer_control_wire::PublicationSequence>)>>,
+    workers:
+        Mutex<HashMap<WorkerId, (Resources, Option<racer_wire::control::PublicationSequence>)>>,
 }
 
 impl Observations {
     /// Record fixture readiness without an accepted publication cursor.
     #[cfg(test)]
     fn record(&self, worker: WorkerId, resources: Resources, count: usize) -> Result<()> {
-        self.record_snapshot(worker, resources, count, None)
+        self.record_snapshot(
+            worker,
+            resources,
+            count,
+            None,
+            racer_io::Clock::host().now(),
+        )
     }
 
     /// Combine fresh worker observations into node-wide readiness.
@@ -2842,11 +3199,12 @@ impl Observations {
         worker: WorkerId,
         resources: Resources,
         count: usize,
-        sequence: Option<racer_control_wire::PublicationSequence>,
+        sequence: Option<racer_wire::control::PublicationSequence>,
+        now: std::time::Instant,
     ) -> Result<()> {
         let mut workers = self.workers.lock().map_err(|_| Error::Unavailable)?;
         workers.insert(worker, (resources, sequence));
-        let now = uring_runtime::environment::now();
+
         let complete = workers.len() == count;
         let all = |test: fn(&Resources) -> bool| {
             complete
@@ -2884,9 +3242,10 @@ impl Observations {
         &self,
         diagnostic: &mut crate::telemetry::MembershipDiagnostic,
         count: usize,
+        now: std::time::Instant,
     ) -> Result<()> {
         let workers = self.workers.lock().map_err(|_| Error::Unavailable)?;
-        let now = uring_runtime::environment::now();
+
         diagnostic.expected_workers = count;
         diagnostic.matching_workers = workers
             .values()
@@ -2908,12 +3267,13 @@ impl WorkerApplication {
         }
         let control = self.control.as_ref().unwrap().clone();
         let node = self.node.clone();
+        let clock = self.ctx().clock.clone();
         self.telemetry
             .membership
             .set(Rc::new(move || {
                 let mut diagnostic = control.membership_diagnostic()?;
                 node.observations
-                    .membership_workers(&mut diagnostic, node.count)?;
+                    .membership_workers(&mut diagnostic, node.count, clock.now())?;
                 Ok(diagnostic)
             }))
             .map_err(|_| Error::InvalidConfiguration)?;
@@ -2942,7 +3302,7 @@ impl WorkerApplication {
             .map_err(|_| Error::InvalidConfiguration)?;
         self.telemetry
             .attach_io(self.runtime.reactor.clone(), self.runtime.admission.clone())?;
-        let diagnostic_scope = scope(Duration::from_secs(365 * 24 * 3600))?;
+        let diagnostic_scope = untimed(&self.ctx().clock)?;
         let task_scope = diagnostic_scope.clone();
         let telemetry = self.telemetry.clone();
         let address = self.diagnostics_address;
@@ -2968,7 +3328,7 @@ impl WorkerApplication {
         self.telemetry
             .metrics
             .observe_retention(self.store.writer.retention().snapshot());
-        let now = uring_runtime::environment::now();
+        let now = self.ctx().now();
         if self.control.is_some() {
             self.telemetry.metrics.set_gauge(
                 crate::telemetry::Gauge::KeyringGeneration,
@@ -2983,7 +3343,7 @@ impl WorkerApplication {
                     .set_gauge(crate::telemetry::Gauge::IdentityExpiresAtSeconds, expiry);
             }
             let remaining = (UNIX_EPOCH + Duration::from_secs(expiry))
-                .duration_since(uring_runtime::environment::wall_now())
+                .duration_since(self.ctx().clock.wall_now())
                 .ok()?;
             now.checked_add(remaining)
         });
@@ -3003,6 +3363,7 @@ impl WorkerApplication {
             },
             node.count,
             self.snapshot_sequence,
+            now,
         )
     }
 
@@ -3019,9 +3380,7 @@ impl WorkerApplication {
 
     /// Recover storage and accept initial control state before opening listeners.
     pub fn start<'a>(&'a mut self, startup: &'a RequestScope) -> Operation<'a, ()> {
-        let environment = self.environment.clone();
-        let drivers = self.drivers.clone();
-        Box::pin(environment.scope(drivers.scope(stoppable(async move {
+        Box::pin(stoppable(async move {
             startup.check()?;
             if self.started || self.stopping {
                 return Err(Error::InvalidConfiguration);
@@ -3055,7 +3414,7 @@ impl WorkerApplication {
             self.started = true;
             self.observe_health()?;
             Ok(())
-        }))))
+        }))
     }
 
     /// Open storage and publish the effective disk capacity metrics.
@@ -3116,7 +3475,7 @@ impl WorkerApplication {
                         let io = ReactorControlIo::new(self.runtime.reactor.clone());
                         ReactorControlIo::sleep(
                             &io,
-                            uring_runtime::environment::now() + Duration::from_millis(100),
+                            self.ctx().now() + Duration::from_millis(100),
                             startup,
                         )
                         .await?;
@@ -3134,8 +3493,8 @@ impl WorkerApplication {
         std::future::poll_fn(|cx| {
             startup.check()?;
             self.poll_cache_preparation(cx)?;
-            if STOP_REQUESTED.load(Ordering::Relaxed) {
-                return Poll::Ready(Err(Error::Cancelled));
+            if stop_requested() {
+                return Poll::Ready(Err(Error::Canceled));
             }
             if node.prepared.load(Ordering::Acquire) == node.count
                 && self.snapshots.current().is_ok()
@@ -3152,9 +3511,9 @@ impl WorkerApplication {
     /// Start diagnostics and bind the control worker's peer listener before readiness.
     async fn start_listeners(&mut self) -> Result<()> {
         std::future::poll_fn(|cx| Poll::Ready(self.start_diagnostics(cx))).await?;
-        self.task_scope = Some(scope(Duration::from_secs(365 * 24 * 3600))?);
+        self.task_scope = Some(untimed(&self.ctx().clock)?);
         if self.control.is_some() {
-            let listener_scope = scope(Duration::from_secs(365 * 24 * 3600))?;
+            let listener_scope = untimed(&self.ctx().clock)?;
             let peers = self.peers.clone();
             let peer_scope = listener_scope.clone();
             let address = self.peer_address;
@@ -3194,6 +3553,8 @@ fn partition_limits_with_cause(
         ("flights", &mut limits.flights),
         ("queue_entries", &mut limits.queue_entries),
         ("client_connections", &mut limits.client_connections),
+        ("peer_connections", &mut limits.peer_connections),
+        ("outbound_connections", &mut limits.outbound_connections),
         ("pipes", &mut limits.pipes),
         ("placement_cache_bytes", &mut limits.placement_cache_bytes),
         ("cached_paths", &mut limits.cached_paths),
@@ -3214,8 +3575,8 @@ fn partition_limits_with_cause(
         ),
         (
             "ciphertext_bytes",
-            limits.ciphertext_bytes.get()
-                < (window + 1) * (page + 16) + crate::store::MAX_HEADER_BYTES,
+            (limits.ciphertext_bytes.get() as u64)
+                < crate::config::min_ciphertext_bytes(window as u64),
         ),
         ("dirty_bytes", limits.dirty_bytes.get() < page + 16),
         (
@@ -3240,8 +3601,8 @@ fn partition_limits_with_cause(
             limits.queue_entries.get() < crate::telemetry::CONTROL_SLOTS + 2,
         ),
         (
-            "client_connections",
-            limits.client_connections < limits.connections_per_neighbor,
+            "outbound_connections",
+            limits.outbound_connections < limits.connections_per_neighbor,
         ),
     ] {
         if insufficient {
@@ -3315,8 +3676,8 @@ fn size_workers_policy(
     loop {
         let partition = partition_limits_with_cause(node, count, rdma).and_then(|limits| {
             if profiling {
-                let extra = ::telemetry::server::BINARY_CONTROL_SLOTS
-                    * uring_runtime::reactor::SUBMISSION_BYTES;
+                let extra = crate::telemetry::primitives::server::BINARY_CONTROL_SLOTS
+                    * racer_io::scoped::SUBMISSION_BYTES;
                 let floor = crate::telemetry::RESERVED_BYTES
                     + crate::peer::protocol::MIN_REQUEST_CONTEXT_BYTES
                     + 4 * limits.header_bytes.get().max(crate::model::MAX_FIELD_BYTES);
@@ -3325,7 +3686,7 @@ fn size_workers_policy(
                 }
                 if limits.queue_entries.get()
                     < crate::telemetry::CONTROL_SLOTS
-                        + ::telemetry::server::BINARY_CONTROL_SLOTS
+                        + crate::telemetry::primitives::server::BINARY_CONTROL_SLOTS
                         + 2
                 {
                     return Err(("pprof_queue_entries", Error::InvalidConfiguration));
@@ -3375,7 +3736,7 @@ mod lifecycle_policy_tests {
             || {
                 attempts.set(attempts.get() + 1);
                 // Each attempt runs under its own deadline that expires first.
-                let attempt = scope(Duration::from_millis(1))?;
+                let attempt = scope(&racer_io::Clock::host(), Duration::from_millis(1))?;
                 std::thread::sleep(Duration::from_millis(2));
                 if attempts.get() < 4 {
                     attempt.check()?;
@@ -3408,35 +3769,39 @@ mod lifecycle_policy_tests {
 
     #[test]
     fn control_turns_are_bounded_and_never_outlive_startup() {
-        let long = scope(MANAGED_STARTUP).unwrap();
+        // Managed startup is untimed and ends only when stopped.
+        let long = RequestScope::untimed(RequestId([0; 16]), racer_io::Clock::host()).unwrap();
+        assert_eq!(long.deadline_at(), None);
         let turn = control_turn(&long, CONTROL_TURN).unwrap();
-        let now = uring_runtime::environment::now();
+        let now = racer_io::Clock::host().now();
         assert!(turn.deadline.0 <= now + CONTROL_TURN);
-        assert!(turn.deadline.0 > now + racer_control_wire::POLL_WAIT);
+        assert!(turn.deadline.0 > now + racer_wire::control::POLL_WAIT);
         // Expiry of a turn must not cancel startup.
         let _ = turn.cancel();
         assert_eq!(long.check(), Ok(()));
-        let short = scope(Duration::from_millis(5)).unwrap();
+        let short = scope(&racer_io::Clock::host(), Duration::from_millis(5)).unwrap();
         let turn = control_turn(&short, CONTROL_TURN).unwrap();
         assert_eq!(turn.deadline.0, short.deadline.0);
-        // Managed startup outlives the fixed lifecycle policy.
-        assert!(MANAGED_STARTUP > crate::worker::LIFECYCLE_TIMEOUT * 100);
     }
 
     #[test]
     fn stoppable_startup_ends_promptly_and_passes_results() {
+        use std::sync::atomic::AtomicBool;
         let stop = AtomicBool::new(false);
         let waker = futures::task::noop_waker();
         let mut cx = Context::from_waker(&waker);
-        let mut pending = Box::pin(stoppable_by(&stop, std::future::pending::<Result<()>>()));
+        let mut pending = Box::pin(stoppable_by(
+            || stop.load(Ordering::Relaxed),
+            std::future::pending::<Result<()>>(),
+        ));
         assert!(pending.as_mut().poll(&mut cx).is_pending());
         stop.store(true, Ordering::Relaxed);
         assert_eq!(
             pending.as_mut().poll(&mut cx),
-            Poll::Ready(Err(Error::Cancelled))
+            Poll::Ready(Err(Error::Canceled))
         );
         let clear = AtomicBool::new(false);
-        let mut done = Box::pin(stoppable_by(&clear, async {
+        let mut done = Box::pin(stoppable_by(|| clear.load(Ordering::Relaxed), async {
             Err::<(), _>(Error::Unauthorized)
         }));
         assert_eq!(
@@ -3472,9 +3837,9 @@ mod lifecycle_policy_tests {
         let result: Result<()> = retry_enrollment(|| unreachable!(), || true, Duration::ZERO);
         // Only a signal-requested cancellation is a clean stop; other errors stay fatal.
         assert!(signal_stop(result.unwrap_err(), true));
-        assert!(!signal_stop(Error::Cancelled, false));
+        assert!(!signal_stop(Error::Canceled, false));
         assert!(!signal_stop(Error::Unavailable, true));
-        assert_eq!(result, Err(Error::Cancelled));
+        assert_eq!(result, Err(Error::Canceled));
         // Stop during a long pace is observed within a short slice.
         let begun = std::time::Instant::now();
         let calls = std::cell::Cell::new(0);
@@ -3486,7 +3851,7 @@ mod lifecycle_policy_tests {
             || begun.elapsed() > Duration::from_millis(100),
             Duration::from_secs(3600),
         );
-        assert_eq!((result, calls.get()), (Err(Error::Cancelled), 1));
+        assert_eq!((result, calls.get()), (Err(Error::Canceled), 1));
         assert!(begun.elapsed() < Duration::from_secs(2));
     }
 
@@ -3526,9 +3891,9 @@ mod lifecycle_policy_tests {
         config.max_threads = 40;
         let mut plan = AffinityPlan::from_topology(
             &config,
-            uring_runtime::group::affinity::EffectiveTopology {
+            crate::affinity::EffectiveTopology {
                 cpus: (0..72)
-                    .map(|cpu| uring_runtime::group::affinity::CpuLocation {
+                    .map(|cpu| crate::affinity::CpuLocation {
                         cpu,
                         package: 0,
                         core: cpu,
@@ -3566,10 +3931,12 @@ mod lifecycle_policy_tests {
                     "RACER_PLAINTEXT_BYTES" => Some("4294967296".into()),
                     "RACER_CIPHERTEXT_BYTES" => Some("8589934592".into()),
                     "RACER_DIRTY_BYTES" => Some("1073741824".into()),
-                    "RACER_REQUEST_CONTEXT_BYTES" => Some("268435456".into()),
-                    "RACER_QUEUE_ENTRIES" | "RACER_CLIENT_CONNECTIONS" | "RACER_PIPES" => {
-                        Some("1024".into())
-                    }
+                    // Each worker funds the 1 MiB diagnostic response buffers.
+                    "RACER_REQUEST_CONTEXT_BYTES" => Some("536870912".into()),
+                    "RACER_QUEUE_ENTRIES"
+                    | "RACER_CLIENT_CONNECTIONS"
+                    | "RACER_OUTBOUND_CONNECTIONS"
+                    | "RACER_PIPES" => Some("1024".into()),
                     "RACER_RELAY_TRANSFERS" => Some("64".into()),
                     _ => None,
                 })
@@ -3577,9 +3944,9 @@ mod lifecycle_policy_tests {
             .unwrap();
             let mut plan = AffinityPlan::from_topology(
                 &config,
-                uring_runtime::group::affinity::EffectiveTopology {
+                crate::affinity::EffectiveTopology {
                     cpus: (0..144)
-                        .map(|cpu| uring_runtime::group::affinity::CpuLocation {
+                        .map(|cpu| crate::affinity::CpuLocation {
                             cpu,
                             package: 0,
                             core: cpu,
@@ -3619,9 +3986,9 @@ mod lifecycle_policy_tests {
         .unwrap();
         let mut plan = AffinityPlan::from_topology(
             &config,
-            uring_runtime::group::affinity::EffectiveTopology {
+            crate::affinity::EffectiveTopology {
                 cpus: (0..16)
-                    .map(|cpu| uring_runtime::group::affinity::CpuLocation {
+                    .map(|cpu| crate::affinity::CpuLocation {
                         cpu,
                         package: 0,
                         core: cpu,
@@ -3637,6 +4004,7 @@ mod lifecycle_policy_tests {
         let mut ordinary_plan = AffinityPlan {
             pairs: plan.pairs.clone(),
             max_threads: plan.max_threads,
+            owner_cpu: None,
         };
         config.scale_limits(plan.pairs.len()).unwrap();
         let limits = size_workers_configured(&config.limits, &mut plan, false, true).unwrap();
@@ -3648,7 +4016,9 @@ mod lifecycle_policy_tests {
         );
         assert!(
             limits.queue_entries.get()
-                >= crate::telemetry::CONTROL_SLOTS + ::telemetry::server::BINARY_CONTROL_SLOTS + 2
+                >= crate::telemetry::CONTROL_SLOTS
+                    + crate::telemetry::primitives::server::BINARY_CONTROL_SLOTS
+                    + 2
         );
         let mut small = config.limits.clone();
         small.queue_entries = NonZeroUsize::new(8).unwrap();
@@ -3675,9 +4045,9 @@ mod lifecycle_policy_tests {
         .unwrap();
         let mut enabled = AffinityPlan::from_topology(
             &config,
-            uring_runtime::group::affinity::EffectiveTopology {
+            crate::affinity::EffectiveTopology {
                 cpus: (0..15)
-                    .map(|cpu| uring_runtime::group::affinity::CpuLocation {
+                    .map(|cpu| crate::affinity::CpuLocation {
                         cpu,
                         core: cpu,
                         package: 0,
@@ -3693,6 +4063,7 @@ mod lifecycle_policy_tests {
         let mut disabled = AffinityPlan {
             pairs: enabled.pairs.clone(),
             max_threads: enabled.max_threads,
+            owner_cpu: None,
         };
         config.scale_limits(enabled.pairs.len()).unwrap();
         size_workers_configured(&config.limits, &mut enabled, false, true).unwrap();
@@ -3711,7 +4082,7 @@ mod lifecycle_policy_tests {
     fn listener_completion_preserves_serving_and_shutdown_errors() {
         for result in [
             Ok(()),
-            Err(Error::Cancelled),
+            Err(Error::Canceled),
             Err(Error::DeadlineExceeded),
             Err(Error::Io),
             Err(Error::Unavailable),
@@ -3724,7 +4095,7 @@ mod lifecycle_policy_tests {
                 result.and(Err(Error::Unavailable)),
             );
             let expected = match result {
-                Ok(()) | Err(Error::Cancelled | Error::DeadlineExceeded) => Ok(()),
+                Ok(()) | Err(Error::Canceled | Error::DeadlineExceeded) => Ok(()),
                 other => other,
             };
             assert_eq!(
@@ -3764,7 +4135,12 @@ struct WorkerPressure {
 }
 
 impl WorkerPressure {
-    fn new(enabled: bool, shared: &crate::pressure::SharedPressure, sampler: bool) -> Self {
+    fn new(
+        enabled: bool,
+        shared: &crate::pressure::SharedPressure,
+        sampler: bool,
+        now: std::time::Instant,
+    ) -> Self {
         Self {
             shared: enabled.then(|| shared.clone()),
             responder: Default::default(),
@@ -3772,7 +4148,7 @@ impl WorkerPressure {
                 .then(|| crate::pressure::PressureMonitor::new(shared.clone())),
             trims: Default::default(),
             samples_memory: sampler,
-            next_memory_sample: uring_runtime::environment::now(),
+            next_memory_sample: now,
         }
     }
 }
@@ -3807,7 +4183,7 @@ pub(crate) fn gpu_slot(
         telemetry.attach_helper(gpu.clone());
         if let Some(links) = links {
             links.set_gpu_landing(gpu.clone(), landing_bytes);
-            telemetry.attach_links(links);
+            telemetry.attach_landing(links.gpu_landing().clone());
         }
     };
     let mode = config.enable_gpu;
@@ -3815,6 +4191,7 @@ pub(crate) fn gpu_slot(
         staging_bytes: config.gpu_staging_bytes,
         pci_p2pdma: config.gpu_pci_p2pdma,
         peer: config.gpu_peer,
+        ..crate::gpu::GpuOptions::default()
     };
     if mode == GpuMode::Auto && built {
         eprintln!("racer: stage=gpu state=standby start=first-gpu-read");

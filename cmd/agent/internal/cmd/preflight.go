@@ -30,6 +30,10 @@ type preflightHandler struct {
 	output                string
 	writer                io.Writer
 	checks                []preflight.Checker
+	overrides             *configOverrides
+	// installation is the install-state store admission reads. Nil means the
+	// host's default store; tests point it at a temporary directory.
+	installation *installstate.Store
 }
 
 func newCmdPreflight(cmdCtx *CommandContext) *cobra.Command {
@@ -49,6 +53,7 @@ func (handler *preflightHandler) command() *cobra.Command {
 	}
 
 	cmd.Flags().StringVar(&handler.configPath, "config", "", "Path to agent config file")
+	handler.overrides = addIsolationFlag(cmd)
 	cmd.Flags().StringSliceVar(
 		&handler.ignorePreflightErrors,
 		"ignore-preflight-errors",
@@ -74,7 +79,12 @@ func (h *preflightHandler) execute(ctx context.Context) error {
 		}
 	}
 
-	cfg, err := loadConfig(logger)
+	var overrides configOverrides
+	if h.overrides != nil {
+		overrides = *h.overrides
+	}
+
+	cfg, err := loadConfigWith(logger, overrides)
 	if err != nil {
 		return err
 	}
@@ -88,7 +98,12 @@ func (h *preflightHandler) execute(ctx context.Context) error {
 		return err
 	}
 
-	_, disposition, err := installstate.Admit(installstate.DefaultStore(), id.MachineName, id.ConfigFingerprint)
+	installation := h.installation
+	if installation == nil {
+		installation = installstate.DefaultStore()
+	}
+
+	_, disposition, err := installstate.Admit(installation, id.MachineName, id.ConfigFingerprint)
 	if err != nil {
 		return err
 	}

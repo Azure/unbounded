@@ -27,6 +27,7 @@ func TestTaskNames(t *testing.T) {
 		{"remove-bpffs-mount", RemoveBPFFSMount(log, "test")},
 		{"cleanup-routes", CleanupRoutes(log)},
 		{"reload-systemd", ReloadSystemd(log)},
+		{"remove-nftables-flush", RemoveNFTablesFlush(log)},
 	}
 
 	for _, tt := range tests {

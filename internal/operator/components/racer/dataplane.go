@@ -30,8 +30,14 @@ const (
 	dataplaneConfigHash    = "unbounded-cloud.io/racer-settings-hash"
 
 	// minThreads covers one I/O worker, one crypto helper, and the
-	// dedicated control plane thread.
+	// dedicated control plane thread. It applies only when
+	// RACER_ENABLE_RDMA is false.
 	minThreads = 3
+
+	// minThreadsRDMA adds the RDMA owner thread, which the dataplane
+	// reserves whenever RACER_ENABLE_RDMA is auto (with hardware present)
+	// or true.
+	minThreadsRDMA = minThreads + 1
 )
 
 // planDataplaneConfig creates racer-settings when it is absent, seeded
@@ -65,6 +71,9 @@ func planDataplaneConfig(ctx context.Context, env *component.Env, plan *componen
 		}
 
 		if renamed != nil {
+			// Drop retired keys the earlier template seeded with defaults.
+			renamed, _ = migrateRetiredSettings(renamed)
+
 			// Reject bad carried-over values before the new DaemonSet rolls
 			// out, as for an existing racer-settings.
 			if err := validateDataplaneConfig(renamed); err != nil {
@@ -87,6 +96,42 @@ func planDataplaneConfig(ctx context.Context, env *component.Env, plan *componen
 
 	if err := validateAdoptable(ctx, env, config); err != nil {
 		return nil, err
+	}
+
+	// Earlier templates seeded retired keys with defaults the dataplane now
+	// rejects. Drop them and write the result back, so Pods never import the
+	// old keys through envFrom. The patch carries the observed
+	// resourceVersion, so a concurrent edit conflicts and the pass retries.
+	if migrated, changed := migrateRetiredSettings(config.Data); changed {
+		observed := config.Data
+
+		if err := validateDataplaneConfig(migrated); err != nil {
+			return nil, err
+		}
+
+		config.Data = migrated
+		ref := component.RefOf(component.ToUnstructured(config))
+
+		// Legacy migration may already patch this ConfigMap from the same
+		// resourceVersion to drop its stamp. Fold the data into that patch,
+		// since a second patch from the same version would conflict.
+		for i := range plan.Operations {
+			op := &plan.Operations[i]
+			if op.Kind == component.OpMergePatch && op.Ref() == ref {
+				if err := unstructured.SetNestedStringMap(op.Object.Object, migrated, "data"); err != nil {
+					return nil, err
+				}
+
+				return config, nil
+			}
+		}
+
+		base := config.DeepCopy()
+		base.Data = observed
+
+		plan.Add(component.Operation{Kind: component.OpMergePatch, Object: component.ToUnstructured(config), Base: component.ToUnstructured(base), Component: name})
+
+		return config, nil
 	}
 
 	if err := validateDataplaneConfig(config.Data); err != nil {
@@ -135,10 +180,23 @@ func planDataplane(ctx context.Context, env *component.Env, plan *component.Plan
 	// Explicit env wiring wins over these imports.
 	container.EnvFrom = []corev1.EnvFromSource{{ConfigMapRef: &corev1.ConfigMapEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: dataplaneConfigName}}}}
 
+	dependsOn := append(append([]component.ObjectRef(nil), dependencies...), op.Ref())
+
+	// The Pod template hash covers the migrated payload, so roll Pods only
+	// after the ConfigMap patch that writes it lands.
+	configRef := component.RefOf(component.ToUnstructured(config))
+	for _, planned := range plan.Operations {
+		if planned.Kind == component.OpMergePatch && planned.Ref() == configRef {
+			dependsOn = append(dependsOn, configRef)
+
+			break
+		}
+	}
+
 	op, err = ownedOperation(ctx, env, component.Operation{
 		Kind: component.OpApply, Object: component.ToUnstructured(ds), Component: name,
 		Overridable: true, ValidateOverride: ValidateDataplaneOverride,
-		DependsOn: append(append([]component.ObjectRef(nil), dependencies...), op.Ref()),
+		DependsOn: dependsOn,
 	})
 	if err != nil {
 		return err

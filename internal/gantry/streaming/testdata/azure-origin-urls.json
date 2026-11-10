@@ -1,0 +1,20 @@
+[
+  {
+    "name": "acr-data-query",
+    "url": "https://example.eastus.data.azurecr.io/?t=REDACTED&h=example.azurecr.io&c=REDACTED&r=team/app&d=sha256:dd5ad9c9c29f04b41a0155c720cf5ccab28ef6d353f1fe17a06c579c70054f0a&p=REDACTED&s=REDACTED&v=1",
+    "digest": "sha256:dd5ad9c9c29f04b41a0155c720cf5ccab28ef6d353f1fe17a06c579c70054f0a",
+    "allowed_host_suffix": ".data.azurecr.io"
+  },
+  {
+    "name": "mcr-data-path",
+    "url": "https://westus2.data.mcr.microsoft.com/REDACTED//docker/registry/v2/blobs/sha256/1b/1b930d010525941c1d56ec53b97bd057a67ae1865eebf042686d2a2d18271ced/data?se=REDACTED&sig=REDACTED&sp=r&spr=https&sr=b&sv=2018-03-28&regid=REDACTED",
+    "digest": "sha256:1b930d010525941c1d56ec53b97bd057a67ae1865eebf042686d2a2d18271ced",
+    "allowed_host_suffix": ".data.mcr.microsoft.com"
+  },
+  {
+    "name": "azure-blob-data-path",
+    "url": "https://example.blob.core.windows.net/REDACTED//docker/registry/v2/blobs/sha256/dd/dd5ad9c9c29f04b41a0155c720cf5ccab28ef6d353f1fe17a06c579c70054f0a/data?se=REDACTED&sig=REDACTED&sp=r&spr=https&sr=b&sv=2018-03-28&regid=REDACTED",
+    "digest": "sha256:dd5ad9c9c29f04b41a0155c720cf5ccab28ef6d353f1fe17a06c579c70054f0a",
+    "allowed_host_suffix": ".blob.core.windows.net"
+  }
+]

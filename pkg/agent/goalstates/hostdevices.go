@@ -18,7 +18,11 @@ import (
 )
 
 const (
-	kvmDevicePath      = "/dev/kvm"
+	kvmDevicePath = "/dev/kvm"
+	// mshvDevicePath is the Microsoft Hypervisor root partition device. It
+	// exists only when Linux boots as the root partition of MSHV, for
+	// example on the host-azurelinux3-mshv machine image.
+	mshvDevicePath     = "/dev/mshv"
 	tunDevicePath      = "/dev/net/tun"
 	vhostNetDevicePath = "/dev/vhost-net"
 	// sysClassBlockDir is the canonical kernel listing of block devices.
@@ -64,6 +68,10 @@ var excludedBlockDevicePrefixes = []string{
 type HostDevices struct {
 	// KVM holds the KVM character device path (/dev/kvm) when present.
 	KVM []string
+	// MSHV holds the Microsoft Hypervisor device path (/dev/mshv) when
+	// present. Virtual machine monitors such as Cloud Hypervisor use it in
+	// place of /dev/kvm when Linux runs as the MSHV root partition.
+	MSHV []string
 	// Network holds host networking device paths used by virtualization
 	// workloads (for example /dev/net/tun and /dev/vhost-net) when present.
 	Network []string
@@ -88,7 +96,7 @@ func (d HostDevices) Paths() []string {
 
 	var paths []string
 
-	for _, group := range [][]string{d.KVM, d.Network, d.Block, d.Additional} {
+	for _, group := range [][]string{d.KVM, d.MSHV, d.Network, d.Block, d.Additional} {
 		for _, p := range group {
 			if config.IsSystemdDeviceGroupSpecifier(p) {
 				continue
@@ -129,19 +137,53 @@ func (d HostDevices) DeviceGroupSpecifiers() []string {
 	return specifiers
 }
 
+// hostDeviceProbe names the host paths that DiscoverHostDevices inspects.
+// Tests point it at a temporary directory.
+type hostDeviceProbe struct {
+	kvm              string
+	mshv             string
+	tun              string
+	vhostNet         string
+	sysClassBlockDir string
+	devDir           string
+	infinibandDir    string
+	rdmaCMMiscDev    string
+	// loadRDMACM allows discovery to load the rdma_ucm module and create the
+	// /dev/infiniband/rdma_cm node when it is missing.
+	loadRDMACM bool
+}
+
+// defaultHostDeviceProbe inspects the real host device paths.
+var defaultHostDeviceProbe = hostDeviceProbe{
+	kvm:              kvmDevicePath,
+	mshv:             mshvDevicePath,
+	tun:              tunDevicePath,
+	vhostNet:         vhostNetDevicePath,
+	sysClassBlockDir: sysClassBlockDir,
+	devDir:           devDir,
+	infinibandDir:    infinibandDir,
+	rdmaCMMiscDev:    rdmaCMMiscDevPath,
+	loadRDMACM:       true,
+}
+
 // DiscoverHostDevices probes the host for device nodes that should be
 // bind-mounted into the nspawn container, grouped by category. Repeated calls
 // produce the same output because each group is returned in a stable order.
 func DiscoverHostDevices(additional []string) HostDevices {
+	return discoverHostDevices(defaultHostDeviceProbe, additional)
+}
+
+func discoverHostDevices(probe hostDeviceProbe, additional []string) HostDevices {
 	var devices HostDevices
 
-	if p := discoverKVMDevicePath(kvmDevicePath); p != "" {
+	if p := discoverKVMDevicePath(probe.kvm); p != "" {
 		devices.KVM = append(devices.KVM, p)
 	}
 
-	devices.Network = discoverExistingDevicePaths(tunDevicePath, vhostNetDevicePath)
-	devices.Block = discoverBlockDevicePaths(sysClassBlockDir, devDir)
-	devices.DeviceDirectories = discoverInfinibandDeviceDirectories(infinibandDir, rdmaCMMiscDevPath, true)
+	devices.MSHV = discoverExistingDevicePaths(probe.mshv)
+	devices.Network = discoverExistingDevicePaths(probe.tun, probe.vhostNet)
+	devices.Block = discoverBlockDevicePaths(probe.sysClassBlockDir, probe.devDir)
+	devices.DeviceDirectories = discoverInfinibandDeviceDirectories(probe.infinibandDir, probe.rdmaCMMiscDev, probe.loadRDMACM)
 	devices.Additional = additional
 
 	return devices

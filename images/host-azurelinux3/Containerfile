@@ -2,17 +2,20 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Metalman machine image for Azure Linux 3.0. Works on amd64 and arm64.
-# images/host-azurelinux3-nvidia builds the GPU variant from the same scripts.
+# images/host-azurelinux3-nvidia and images/host-azurelinux3-mshv build the
+# GPU and Microsoft Hypervisor variants from the same scripts.
 
 FROM mcr.microsoft.com/azurelinux/base/core:3.0 AS rootfs
 ARG KERNEL_PACKAGE=kernel
 ARG NVIDIA=0
+ARG MSHV=0
 COPY images/host-azurelinux3/assets/rootfs.sh /usr/local/bin/build-rootfs
-RUN KERNEL_PACKAGE="${KERNEL_PACKAGE}" NVIDIA="${NVIDIA}" sh /usr/local/bin/build-rootfs install
-RUN KERNEL_PACKAGE="${KERNEL_PACKAGE}" NVIDIA="${NVIDIA}" sh /usr/local/bin/build-rootfs finish
+RUN KERNEL_PACKAGE="${KERNEL_PACKAGE}" NVIDIA="${NVIDIA}" MSHV="${MSHV}" sh /usr/local/bin/build-rootfs install
+RUN KERNEL_PACKAGE="${KERNEL_PACKAGE}" NVIDIA="${NVIDIA}" MSHV="${MSHV}" sh /usr/local/bin/build-rootfs finish
 
 FROM --platform=$BUILDPLATFORM docker.io/library/ubuntu:24.04 AS build
 ARG TARGETARCH
+ARG MSHV=0
 RUN apt-get update && \
     ok=false && \
     for attempt in 1 2 3 4 5; do \
@@ -27,7 +30,7 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 COPY --from=rootfs /rootfs.tar /rootfs.kver /
 COPY images/host-azurelinux3/assets/disk.sh /usr/local/bin/build-disk
-RUN TARGETARCH="${TARGETARCH}" sh /usr/local/bin/build-disk && rm /rootfs.tar
+RUN TARGETARCH="${TARGETARCH}" MSHV="${MSHV}" sh /usr/local/bin/build-disk && rm /rootfs.tar
 
 FROM scratch
 LABEL org.opencontainers.image.source="https://github.com/Azure/unbounded" \

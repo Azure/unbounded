@@ -2,8 +2,8 @@
 //! classification, fill/serve policy, and the candidate walk.
 
 pub use budget::AcquisitionBudget;
-use racer_control_wire::NodeId;
-use racer_object_wire::model::{
+use racer_wire::control::NodeId;
+use racer_wire::object::model::{
     MetadataSelector, ObjectId, ObjectMetadata, PageNumber, StrongEtag, WorkerId,
 };
 use sha2::{Digest, Sha256};
@@ -11,10 +11,17 @@ use std::collections::BTreeSet;
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
+pub mod acquisition;
 pub mod budget;
+pub mod cohort;
+pub mod effect;
+pub mod errors;
 pub mod flight;
 pub mod hints;
+pub mod serve;
 pub mod walk;
+pub mod window;
+pub mod worker;
 
 // Read-path decision errors: a subset of the dataplane's, so core decisions never widen what the
 // dataplane can observe.
@@ -30,8 +37,11 @@ pub enum Error {
     VersionUnavailable,
     Unavailable,
     Overloaded,
+    /// The page's flight is fetching and holds its waiter cap: busy, but proof the destination is
+    /// acquiring the page, unlike [`Error::Overloaded`].
+    FlightFull,
     DeadlineExceeded,
-    Cancelled,
+    Canceled,
     Unauthorized,
     OriginRejected,
     OriginForbidden,
@@ -102,8 +112,8 @@ impl WorkerMap {
 #[allow(clippy::disallowed_methods)] // Tests build instants to feed the API.
 mod worker_tests {
     use super::*;
-    use racer_control_wire::CacheId;
-    use racer_object_wire::model::CacheKey;
+    use racer_wire::control::CacheId;
+    use racer_wire::object::model::CacheKey;
 
     #[test]
     fn rejects_empty_and_duplicates_and_is_order_independent() {
@@ -152,6 +162,8 @@ pub enum PeerResponse<P, G> {
     VersionUnavailable,
     Unavailable,
     Overloaded,
+    /// The page's flight is fetching and holds its waiter cap.
+    FlightFull,
     OriginRejected,
     OriginForbidden,
     /// Authenticated peer no longer retains the requested routing epoch.
@@ -173,6 +185,7 @@ impl<P, G> PeerResponse<P, G> {
             Self::VersionUnavailable => ResponseKind::VersionUnavailable,
             Self::Unavailable => ResponseKind::Unavailable,
             Self::Overloaded => ResponseKind::Overloaded,
+            Self::FlightFull => ResponseKind::FlightFull,
             Self::OriginRejected => ResponseKind::OriginRejected,
             Self::OriginForbidden => ResponseKind::OriginForbidden,
             Self::StaleMembership => ResponseKind::StaleMembership,
@@ -254,7 +267,7 @@ pub fn refresh_settlement(error: Error, remaining_attempts: u32) -> Settlement {
     let rejected = matches!(error, Error::OriginRejected | Error::OriginForbidden);
     let caller_budget = matches!(
         error,
-        Error::Cancelled | Error::DeadlineExceeded | Error::HopBudgetExhausted
+        Error::Canceled | Error::DeadlineExceeded | Error::HopBudgetExhausted
     ) || (error == Error::Unavailable && remaining_attempts == 0);
     if rejected || caller_budget {
         Settlement::Retry
@@ -272,7 +285,7 @@ mod metadata_tests {
         for error in [
             Error::OriginRejected,
             Error::OriginForbidden,
-            Error::Cancelled,
+            Error::Canceled,
             Error::DeadlineExceeded,
             Error::HopBudgetExhausted,
         ] {
@@ -466,9 +479,10 @@ pub fn recoverable(error: Error) -> bool {
             | Error::Io
             | Error::Os(_)
             | Error::Overloaded
+            | Error::FlightFull
             | Error::CorruptRecord
             | Error::MissingKey
-            | Error::Cancelled
+            | Error::Canceled
             | Error::InvalidRequest
             | Error::HeaderTooLarge
     )
@@ -477,17 +491,7 @@ pub fn recoverable(error: Error) -> bool {
 /// Translate an expected acquisition failure into the peer response that
 /// reports it. `None` means the error is internal and must propagate.
 pub fn peer_error(error: Error) -> Option<ResponseKind> {
-    Some(match error {
-        Error::NotFound => ResponseKind::NotFound,
-        Error::VersionUnavailable => ResponseKind::VersionUnavailable,
-        Error::Overloaded => ResponseKind::Overloaded,
-        Error::OriginRejected => ResponseKind::OriginRejected,
-        Error::OriginForbidden => ResponseKind::OriginForbidden,
-        Error::Unavailable | Error::HopBudgetExhausted | Error::DeadlineExceeded => {
-            ResponseKind::Unavailable
-        }
-        _ => return None,
-    })
+    errors::disposition(error).peer
 }
 
 /// Optional writes may use half of the aggregate class budget, with a floor sufficient for one
@@ -572,9 +576,10 @@ mod policy_tests {
             Error::Io,
             Error::Os(5),
             Error::Overloaded,
+            Error::FlightFull,
             Error::CorruptRecord,
             Error::MissingKey,
-            Error::Cancelled,
+            Error::Canceled,
             Error::InvalidRequest,
             Error::HeaderTooLarge,
         ] {
@@ -720,8 +725,21 @@ pub fn direct_fills(
     direct_ahead: usize,
     elsewhere: impl Fn(usize) -> bool,
 ) -> Vec<usize> {
-    let limit = first_failure(slots).unwrap_or(slots.len());
     let mut plan = Vec::new();
+    direct_fills_into(slots, direct_ahead, elsewhere, &mut plan);
+    plan
+}
+
+/// [`direct_fills`] into a caller-owned buffer, which is cleared first, so a hot caller can reuse
+/// its allocation.
+pub fn direct_fills_into(
+    slots: &[SlotKind],
+    direct_ahead: usize,
+    elsewhere: impl Fn(usize) -> bool,
+    plan: &mut Vec<usize>,
+) {
+    plan.clear();
+    let limit = first_failure(slots).unwrap_or(slots.len());
     if limit > 0 && matches!(slots[0], SlotKind::Missing { .. } | SlotKind::Selecting) {
         plan.push(0);
     }
@@ -738,7 +756,6 @@ pub fn direct_fills(
         }
         index += 1;
     }
-    plan
 }
 
 /// Position of the first failed slot; admission stops there.
@@ -860,6 +877,13 @@ mod range_tests {
             [1]
         );
         assert!(direct_fills(&[], DIRECT_AHEAD, |_| false).is_empty());
+        // The buffer form clears stale contents and matches the allocating form.
+        let mut plan = vec![7, 8, 9];
+        direct_fills_into(&[HOLE, HOLE, HOLE], DIRECT_AHEAD, |i| i == 1, &mut plan);
+        assert_eq!(
+            plan,
+            direct_fills(&[HOLE, HOLE, HOLE], DIRECT_AHEAD, |i| i == 1)
+        );
         assert_eq!(direct_fills(&[HOLE, HOLE, HOLE], 2, |_| false), [0, 1, 2]);
     }
 
@@ -986,7 +1010,7 @@ pub fn acquisition_failure(error: Error) -> FailureKind {
 pub fn ciphertext_publish_tolerated(error: Error) -> bool {
     matches!(
         error,
-        Error::Overloaded | Error::MissingKey | Error::Unavailable
+        Error::Overloaded | Error::FlightFull | Error::MissingKey | Error::Unavailable
     )
 }
 
@@ -1231,6 +1255,8 @@ pub enum ResponseKind {
     VersionUnavailable,
     Unavailable,
     Overloaded,
+    /// The destination's flight for the page is fetching and full ([`Error::FlightFull`]).
+    FlightFull,
     OriginRejected,
     OriginForbidden,
     StaleMembership,
@@ -1287,7 +1313,7 @@ pub fn classify<E: From<Error>>(
         }
         ResponseKind::VersionUnavailable => ProbeOutcome::VersionUnavailable,
         ResponseKind::Unavailable => ProbeOutcome::Unreachable,
-        ResponseKind::Overloaded => ProbeOutcome::Overloaded,
+        ResponseKind::Overloaded | ResponseKind::FlightFull => ProbeOutcome::Overloaded,
         ResponseKind::OriginRejected => return Err(Error::OriginRejected.into()),
         ResponseKind::OriginForbidden => return Err(Error::OriginForbidden.into()),
         ResponseKind::StaleMembership => return Err(Error::IncompatibleMembership.into()),
@@ -1374,8 +1400,8 @@ mod candidates_tests {
     }
 
     use super::*;
-    use racer_control_wire::CacheId;
-    use racer_object_wire::model::CacheKey;
+    use racer_wire::control::CacheId;
+    use racer_wire::object::model::CacheKey;
 
     fn ranks(order: VisitOrder) -> Vec<usize> {
         order.ranks().collect()
@@ -1568,6 +1594,10 @@ mod candidates_tests {
         );
         assert_eq!(
             classify(R::Overloaded, O::Page, true, ok),
+            Ok(Some(ProbeOutcome::Overloaded))
+        );
+        assert_eq!(
+            classify(R::FlightFull, O::Page, true, ok),
             Ok(Some(ProbeOutcome::Overloaded))
         );
         assert_eq!(

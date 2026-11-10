@@ -56,6 +56,7 @@ func pullTestMetrics() *loadMetrics {
 		appliedConcurrency: prometheus.NewGauge(prometheus.GaugeOpts{Name: "test_applied_concurrency"}),
 		receivedBytes:      prometheus.NewCounter(prometheus.CounterOpts{Name: "test_received_bytes_total"}),
 		verifiedBytes:      prometheus.NewCounter(prometheus.CounterOpts{Name: "test_verified_bytes_total"}),
+		rangeResumes:       prometheus.NewCounter(prometheus.CounterOpts{Name: "test_range_resumes_total"}),
 		requests: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "test_requests_total",
 		}, []string{"kind", "result"}),

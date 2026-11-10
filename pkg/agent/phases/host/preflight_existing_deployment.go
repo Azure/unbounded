@@ -13,6 +13,9 @@ import (
 	"strings"
 
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/isolation"
+	"github.com/Azure/unbounded/pkg/agent/isolation/container"
+	"github.com/Azure/unbounded/pkg/agent/isolation/none"
 	"github.com/Azure/unbounded/pkg/agent/preflight"
 )
 
@@ -20,16 +23,26 @@ import (
 // resumed installation intentionally skips.
 const CheckExistingDeploymentName = "existing-deployment"
 
-// CheckExistingDeployment verifies the host does not already contain
-// node deployment artifacts. Bootstrap must start from a clean host;
-// otherwise partial state from a prior run can be reused accidentally.
+// CheckExistingDeployment verifies the host does not already contain nspawn
+// node deployment artifacts.
+//
+// Deprecated: use CheckExistingDeploymentFor. This wrapper is kept for one
+// release and checks for the nspawn mode.
 func CheckExistingDeployment(log *slog.Logger) preflight.Checker {
-	return checkExistingDeployment(log, defaultHostCheckDeps())
+	return CheckExistingDeploymentFor(log, isolation.ModeNSpawn)
 }
 
-func checkExistingDeployment(log *slog.Logger, deps hostCheckDeps) preflight.Checker {
+// CheckExistingDeploymentFor verifies the host does not already contain node
+// deployment artifacts. Bootstrap must start from a clean host; otherwise
+// partial state from a prior run can be reused accidentally. Modes other than
+// nspawn also look for the artifacts of a host-native node.
+func CheckExistingDeploymentFor(log *slog.Logger, mode isolation.Mode) preflight.Checker {
+	return checkExistingDeployment(log, defaultHostCheckDeps(), mode)
+}
+
+func checkExistingDeployment(log *slog.Logger, deps hostCheckDeps, mode isolation.Mode) preflight.Checker {
 	return simpleHostChecker{name: CheckExistingDeploymentName, check: func(ctx context.Context) []preflight.Result {
-		results := existingDeploymentResults(ctx, log, deps)
+		results := existingDeploymentResultsFor(ctx, log, deps, mode)
 		if len(results) > 0 {
 			return results
 		}
@@ -46,11 +59,17 @@ func checkExistingDeployment(log *slog.Logger, deps hostCheckDeps) preflight.Che
 // node deployment artifacts. It is used by start before any
 // bootstrap task mutates host state.
 func EnsureNoExistingDeployment(ctx context.Context, log *slog.Logger) error {
-	return ensureNoExistingDeployment(ctx, log, defaultHostCheckDeps())
+	return ensureNoExistingDeployment(ctx, log, defaultHostCheckDeps(), isolation.DefaultMode)
 }
 
-func ensureNoExistingDeployment(ctx context.Context, log *slog.Logger, deps hostCheckDeps) error {
-	results := existingDeploymentResults(ctx, log, deps)
+// EnsureNoExistingDeploymentFor is EnsureNoExistingDeployment for an isolation
+// mode.
+func EnsureNoExistingDeploymentFor(ctx context.Context, log *slog.Logger, mode isolation.Mode) error {
+	return ensureNoExistingDeployment(ctx, log, defaultHostCheckDeps(), mode)
+}
+
+func ensureNoExistingDeployment(ctx context.Context, log *slog.Logger, deps hostCheckDeps, mode isolation.Mode) error {
+	results := existingDeploymentResultsFor(ctx, log, deps, mode)
 	if len(results) == 0 {
 		return nil
 	}
@@ -71,7 +90,54 @@ func ensureNoExistingDeployment(ctx context.Context, log *slog.Logger, deps host
 	)
 }
 
-func existingDeploymentResults(ctx context.Context, log *slog.Logger, deps hostCheckDeps) []preflight.Result {
+// existingDeploymentResultsFor adds the artifacts of a host-native node for
+// modes other than nspawn. The nspawn list is unchanged: those paths are absent
+// on a host-native node and the host-native paths are absent on an nspawn one.
+func existingDeploymentResultsFor(ctx context.Context, log *slog.Logger, deps hostCheckDeps, mode isolation.Mode) []preflight.Result {
+	results := baseExistingDeploymentResults(ctx, log, deps)
+
+	if mode == "" || mode == isolation.ModeNSpawn {
+		return results
+	}
+
+	for _, artifact := range existingDeploymentNoneArtifacts() {
+		results = appendExistingDeploymentArtifactResult(results, deps, artifact)
+	}
+
+	if mode == isolation.ModeContainer {
+		for _, artifact := range existingDeploymentContainerArtifacts() {
+			results = appendExistingDeploymentArtifactResult(results, deps, artifact)
+		}
+	}
+
+	return results
+}
+
+func existingDeploymentContainerArtifacts() []existingDeploymentArtifact {
+	artifacts := []existingDeploymentArtifact{
+		{description: "container node directory", path: container.DefaultBase},
+	}
+
+	for _, slot := range []string{goalstates.NSpawnMachineKube1, goalstates.NSpawnMachineKube2} {
+		artifacts = append(artifacts, existingDeploymentArtifact{
+			description: "container node unit",
+			path:        filepath.Join(goalstates.SystemdSystemDir, container.UnitName(slot)),
+		})
+	}
+
+	return artifacts
+}
+
+func existingDeploymentNoneArtifacts() []existingDeploymentArtifact {
+	return []existingDeploymentArtifact{
+		{description: "host-native node directory", path: none.DefaultBase},
+		{description: "host-native containerd unit", path: filepath.Join(goalstates.SystemdSystemDir, none.UnitContainerd)},
+		{description: "host-native kubelet unit", path: filepath.Join(goalstates.SystemdSystemDir, none.UnitKubelet)},
+		{description: "host-native LocalDNS unit", path: filepath.Join(goalstates.SystemdSystemDir, none.UnitLocalDNS)},
+	}
+}
+
+func baseExistingDeploymentResults(ctx context.Context, log *slog.Logger, deps hostCheckDeps) []preflight.Result {
 	var results []preflight.Result
 
 	for _, machineName := range []string{goalstates.NSpawnMachineKube1, goalstates.NSpawnMachineKube2} {

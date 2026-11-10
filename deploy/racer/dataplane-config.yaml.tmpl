@@ -70,21 +70,24 @@ data:
   RACER_METADATA_ENTRIES: "4096"
   RACER_DISK_PAGE_ENTRIES: "65536"
   RACER_CHECKPOINT_BYTES: "67108864"
-  # Byte admission budgets default to per-I/O-worker amounts that are multiplied
-  # by the final I/O worker count, so automatic sizing works on any core count:
-  # plaintext 64 MiB, ciphertext 128 MiB, dirty 160 MiB, request context 32 MiB,
-  # and registered 384 MiB (native RDMA only) per worker. Setting a key below
-  # makes it an authoritative node-wide value that is divided across workers;
-  # startup fails if it cannot fund at least half of the planned I/O workers.
-  # Each worker needs roughly 115 MiB of these byte budgets at minimum
-  # (plaintext and ciphertext about 48 MiB each, dirty 16 MiB, plus request
-  # context) with the default range window of two pages.
+  # Shared admission budgets come in two forms. RACER_<NAME>_PER_WORKER, which
+  # carries the default, is multiplied by the final I/O worker count, so
+  # automatic sizing works on any core count: plaintext 128 MiB, ciphertext
+  # 128 MiB, dirty 160 MiB, request context 32 MiB, and registered 384 MiB
+  # (native RDMA only, capped at 8 GiB per node by default) per worker. The plain RACER_<NAME> is a node-wide total
+  # divided across workers; startup fails if it cannot fund at least half of the
+  # planned I/O workers. Set at most one form of each budget.
+  # Each worker needs roughly 210 MiB of these byte budgets at minimum
+  # (plaintext about 80 MiB, ciphertext about 96 MiB, dirty 16 MiB, plus
+  # request context) with the default range window of four pages.
   # Budgets are admission ceilings, not reservations: resident memory grows
-  # toward them under load. Unset defaults therefore scale with core count.
+  # toward them under load, so per-worker defaults scale with core count.
   # To bound memory, cap total threads with RACER_MAX_THREADS, or set
-  # RACER_IO_WORKERS with RACER_CRYPTO_HELPERS, or set explicit node-wide
-  # values below. RACER_METADATA_ENTRIES above is set explicitly, so it is a
-  # node-wide total, not the per-worker default of 4096.
+  # RACER_IO_WORKERS with RACER_CRYPTO_HELPERS, or set node-wide totals below.
+  # RACER_METADATA_ENTRIES above is a node-wide total, not the per-worker
+  # default of 4096 (RACER_METADATA_ENTRIES_PER_WORKER).
+  # Any RACER_* key the dataplane does not recognize fails the operator plan
+  # and dataplane startup; see the configuration reference for every name.
   # RACER_PLAINTEXT_BYTES: "268435456"
   # RACER_CIPHERTEXT_BYTES: "268435456"
   # RACER_DIRTY_BYTES: "134217728"
@@ -94,8 +97,7 @@ data:
   # Spill holds charge one whole segment per page to stay safe under fragmentation.
   # Existing local copies are not rewritten. Free-segment reserves still apply.
   RACER_RETAINED_SEGMENT_PERCENT: "50"
-  # File slab size is per worker. Byte admission budgets above are node-wide
-  # only when set explicitly; unset ones are per-worker defaults scaled up.
+  # Slab size and the free-segment reserve are per I/O worker.
   # Optional Node annotation racer.unbounded-cloud.io/block-devices selects raw
   # devices by regex on /host/dev/disk/by-id basenames. Use ^ and $ anchors.
   # The 1 KiB selector must compile in Rust. Invalid/no usable matches
@@ -107,10 +109,12 @@ data:
   # Host /dev is mounted read-only at /host/dev, but raw writes are intentional.
   # Device mode splits all whole segments across workers, subject to hard caps;
   # subsegment tails are unusable. Reserves, headers, AEAD, and alignment still apply.
-  # RACER_SLAB_BYTES does not limit device capacity; keep it valid for fallback.
+  # RACER_SLAB_BYTES_PER_WORKER does not limit device capacity; keep it valid for fallback.
   # RACER_SLAB_DIRECTORY still holds checkpoints and must remain writable.
   # Cluster-bound checkpoints restore completed-page holds, not jobs or credentials.
   # Older formats and incompatible layouts start cold; no fsync crash guarantee.
-  RACER_SLAB_BYTES: "1073741824"
-  RACER_SEGMENT_BYTES: "67108864"
-  RACER_FREE_SEGMENT_RESERVE: "2"
+  # 1 GiB segments keep per-segment tail waste small with 16 MiB pages; a slab
+  # must hold more whole segments than the free reserve.
+  RACER_SLAB_BYTES_PER_WORKER: "4294967296"
+  RACER_SEGMENT_BYTES: "1073741824"
+  RACER_FREE_SEGMENT_RESERVE_PER_WORKER: "2"

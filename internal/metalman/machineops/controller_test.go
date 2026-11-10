@@ -659,6 +659,65 @@ func TestReconcilerIgnoresHostOSReboot(t *testing.T) {
 	require.Empty(t, updated.Status.Phase)
 }
 
+func TestReconcilerIgnoresAllocationOperations(t *testing.T) {
+	t.Parallel()
+
+	for _, kind := range []v1alpha3.OperationKind{v1alpha3.OperationHostAllocate, v1alpha3.OperationHostRelease} {
+		t.Run(string(kind), func(t *testing.T) {
+			t.Parallel()
+
+			require.False(t, isHostOperation(kind))
+
+			ttl := int32(0)
+			completedAt := metav1.NewTime(fixedNow().Add(-time.Minute))
+			newAllocationOperation := func(name string) *v1alpha3.MachineOperation {
+				op := testOperation(name, kind)
+				op.Spec.MachineRef = "machine-1"
+				op.Spec.AllocationRef = &v1alpha3.UIDReference{Name: "alloc-1", UID: "alloc-1-uid"}
+
+				return op
+			}
+
+			pending := newAllocationOperation("op-pending")
+			require.False(t, shouldReconcile(pending), "non-terminal")
+
+			terminal := newAllocationOperation("op-terminal")
+			terminal.Spec.TTLSecondsAfterFinished = &ttl
+			terminal.Status.Phase = v1alpha3.OperationPhaseComplete
+			terminal.Status.CompletedAt = &completedAt
+			require.False(t, shouldReconcile(terminal), "terminal with ttl")
+
+			s := testScheme(t)
+			machine := testBareMetalMachine("machine-1", "rack-a")
+			c := fake.NewClientBuilder().
+				WithScheme(s).
+				WithObjects(machine, pending, terminal, testRedfishSecret()).
+				WithStatusSubresource(pending, terminal).
+				Build()
+			power := &recordingPowerClient{}
+			reconciler := testReconciler(c, power, "rack-a")
+
+			result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: pending.Name}})
+			require.NoError(t, err)
+			require.Equal(t, ctrl.Result{}, result)
+			require.Empty(t, power.calls)
+
+			var updated v1alpha3.MachineOperation
+			require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: pending.Name}, &updated))
+			require.Equal(t, v1alpha3.MachineOperationStatus{}, updated.Status)
+
+			result, err = reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: terminal.Name}})
+			require.NoError(t, err)
+			require.Equal(t, ctrl.Result{}, result)
+			require.Empty(t, power.calls)
+
+			var kept v1alpha3.MachineOperation
+			require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: terminal.Name}, &kept))
+			require.Equal(t, v1alpha3.OperationPhaseComplete, kept.Status.Phase)
+		})
+	}
+}
+
 func TestReconcilerRequestsHostReplaceOnceAndCompletesAfterRepave(t *testing.T) {
 	t.Parallel()
 
@@ -715,6 +774,49 @@ func TestReconcilerRequestsHostReplaceOnceAndCompletesAfterRepave(t *testing.T) 
 	var completed v1alpha3.MachineOperation
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &completed))
 	require.Equal(t, v1alpha3.OperationPhaseComplete, completed.Status.Phase)
+}
+
+func TestReconcilerHostReplaceHonorsExperimentalContainerIsolation(t *testing.T) {
+	t.Parallel()
+
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("enabled=%t", enabled), func(t *testing.T) {
+			t.Parallel()
+
+			s := testScheme(t)
+			machine := testBareMetalMachine("machine-1", "rack-a")
+			machine.Spec.Isolation = v1alpha3.IsolationContainer
+			op := testOperation("op-replace-container", v1alpha3.OperationHostReplace)
+			op.Spec.MachineRef = machine.Name
+
+			c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, testRedfishSecret()).WithStatusSubresource(op, machine).Build()
+			power := &recordingPowerClient{}
+			reconciler := testReconciler(c, power, "rack-a")
+			reconciler.ExperimentalContainerIsolation = enabled
+
+			_, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
+			require.NoError(t, err)
+
+			var got v1alpha3.MachineOperation
+			require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &got))
+			require.Len(t, got.Status.Targets, 1)
+
+			if enabled {
+				// The replace starts as for any other mode.
+				require.Equal(t, v1alpha3.OperationStageWaitingOff, got.Status.Targets[0].Stage)
+				require.Equal(t, []string{"machine-1:ForceOff"}, power.calls)
+
+				return
+			}
+
+			// Refused before any power action.
+			require.Empty(t, power.calls)
+			require.Equal(t, v1alpha3.OperationPhaseFailed, got.Status.Targets[0].Phase)
+			require.Contains(t, got.Status.Targets[0].Message, reasonExperimentalModeDisabled)
+			require.Contains(t, got.Status.Targets[0].Message, "--experimental-container-isolation")
+			require.Equal(t, v1alpha3.OperationPhaseFailed, got.Status.Phase)
+		})
+	}
 }
 
 func TestReconcilerPowersOnHostReplaceTargetWhenOff(t *testing.T) {

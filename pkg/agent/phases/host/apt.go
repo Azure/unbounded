@@ -6,8 +6,10 @@ package host
 import (
 	"context"
 	_ "embed"
+	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"os/exec"
 
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
@@ -92,4 +94,42 @@ func (h *hardenAPT) Do(_ context.Context) error {
 	)
 
 	return nil
+}
+
+type removeAPTHardening struct {
+	log *slog.Logger
+
+	aptDropInPath         string
+	needrestartDropInPath string
+}
+
+// RemoveAPTHardening returns a task that removes the drop-ins HardenAPT writes.
+// They exist only to keep a package upgrade from restarting systemd-machined
+// under a running nspawn machine, so a mode without one removes them: they
+// would otherwise hold back systemd and libcap security upgrades and disable
+// needrestart for no reason. First-boot provisioning writes them for every
+// mode, which is why bootstrap removes them rather than never writing them.
+// Missing files are not an error.
+func RemoveAPTHardening(log *slog.Logger) phases.Task {
+	return &removeAPTHardening{log: log, aptDropInPath: aptDropInPath, needrestartDropInPath: needrestartDropInPath}
+}
+
+func (r *removeAPTHardening) Name() string { return "remove-apt-hardening" }
+
+func (r *removeAPTHardening) Do(_ context.Context) error {
+	var errs []error
+
+	for _, path := range []string{r.aptDropInPath, r.needrestartDropInPath} {
+		err := os.Remove(path)
+
+		switch {
+		case err == nil:
+			r.log.Info("removed the systemd-machined restart guard, which only an nspawn machine needs", "path", path)
+		case errors.Is(err, os.ErrNotExist):
+		default:
+			errs = append(errs, fmt.Errorf("remove %s: %w", path, err))
+		}
+	}
+
+	return errors.Join(errs...)
 }

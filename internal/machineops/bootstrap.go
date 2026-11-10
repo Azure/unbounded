@@ -104,6 +104,11 @@ func (r *MachineOperationReconciler) buildReplaceAgentConfig(ctx context.Context
 		return provision.UnboundedAgentConfig{}, fmt.Errorf("machine spec.kubernetes is required for HostReplace")
 	}
 
+	if err := provision.CheckIsolationEnabled(machine.Spec.Isolation, r.ExperimentalContainerIsolation, "machine-ops-controller",
+		"start machine-ops-controller with --experimental-container-isolation"); err != nil {
+		return provision.UnboundedAgentConfig{}, err
+	}
+
 	clusterInfo, err := r.clusterInfo(ctx)
 	if err != nil {
 		return provision.UnboundedAgentConfig{}, err
@@ -130,6 +135,8 @@ func (r *MachineOperationReconciler) buildReplaceAgentConfig(ctx context.Context
 		ProviderLabels: clusterInfo.ProviderLabels,
 		BootstrapToken: bootstrapToken,
 		NodeName:       machine.Name,
+
+		ExperimentalContainerIsolation: r.ExperimentalContainerIsolation,
 	}), nil
 }
 

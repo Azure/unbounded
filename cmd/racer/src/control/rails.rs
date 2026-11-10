@@ -5,9 +5,9 @@ use crate::{
     error::{Error, Operation},
     runtime::RequestScope,
 };
-use racer_control_wire::RailMapping;
+use racer_io::scoped::fs::secure::{self, Attempts, Host};
+use racer_wire::control::RailMapping;
 use std::{cell::Cell, path::PathBuf, rc::Rc, sync::Arc};
-use uring_runtime::reactor::filesystem::secure::{self, Attempts, Host};
 
 /// Own one journal namespace and fence abandoned writes before reusing its stage name.
 pub struct RailJournal {
@@ -85,27 +85,30 @@ mod tests {
     //! Journal durability and abandoned-attempt fencing before enrollment.
 
     use super::*;
+    use crate::enrollment::Enrollment;
     use crate::test_support::enrollment::drive;
-    use racer_crypto::enrollment::Enrollment;
+    use racer_io::sim::{Fault, SimOs as Simulation};
     use std::{
         num::NonZeroU32,
         path::Path,
         task::{Context, Poll},
         time::Duration,
     };
-    use uring_runtime::reactor::simulation::{Fault, Simulation};
 
     /// Failed durability never reaches crypto preparation, including a renewal CSR.
     #[test]
     fn journal_durability_precedes_every_crypto_prepare_and_preserves_phase() {
         for renewal in [false, true] {
             let sim = Simulation::new();
-            let _os = sim.enter();
-            let reactor = Rc::new(crate::runtime::Reactor::new(Rc::new(
-                flow_control::Quotas::new(crate::admission::AdmissionPolicy::new(
-                    crate::test_support::cluster::config(false).limits,
+            let env = racer_io::Env::sim(&sim, racer_io::WorkerCtx::host());
+            let reactor = Rc::new(crate::runtime::Reactor::new(
+                Rc::new(flow_control::Quotas::new(
+                    crate::admission::AdmissionPolicy::new(
+                        crate::test_support::cluster::config(false).limits,
+                    ),
                 )),
-            )));
+                &env,
+            ));
             let io = Rc::new(ReactorControlIo::new(reactor.clone()));
             let journal =
                 RailJournal::new(Arc::new(Default::default()), "/identity".into(), io.clone());
@@ -166,12 +169,15 @@ mod tests {
     #[test]
     fn abandoned_journal_write_is_fenced_before_retry_and_crypto_submission() {
         let sim = Simulation::new();
-        let _os = sim.enter();
-        let reactor = Rc::new(crate::runtime::Reactor::new(Rc::new(
-            flow_control::Quotas::new(crate::admission::AdmissionPolicy::new(
-                crate::test_support::cluster::config(false).limits,
+        let env = racer_io::Env::sim(&sim, racer_io::WorkerCtx::host());
+        let reactor = Rc::new(crate::runtime::Reactor::new(
+            Rc::new(flow_control::Quotas::new(
+                crate::admission::AdmissionPolicy::new(
+                    crate::test_support::cluster::config(false).limits,
+                ),
             )),
-        )));
+            &env,
+        ));
         let io = Rc::new(ReactorControlIo::new(reactor.clone()));
         let journal =
             RailJournal::new(Arc::new(Default::default()), "/identity".into(), io.clone());

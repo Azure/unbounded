@@ -7,9 +7,11 @@ description: "Validate a host and agent configuration before unbounded-agent boo
 `unbounded-agent preflight` validates that a host and the loaded agent
 configuration are ready for bootstrap before the agent mutates host state or
 joins the cluster. It loads the same config used by `unbounded-agent start`,
-resolves the expected nspawn rootfs and download inputs, and runs non-mutating
-checks against the host, cluster API server, artifact sources, and GPU driver
-state.
+resolves the expected download inputs for the configured
+[isolation mode]({{< relref "reference/agent/isolation" >}}), and runs
+non-mutating checks against the host, cluster API server, artifact sources, and
+GPU driver state. Some checks run only for certain modes; the tables below say
+which.
 
 Preflight is safe to run repeatedly before bootstrap and after failed bootstrap
 attempts. It is expected to run as a privileged user on the host because several
@@ -33,8 +35,8 @@ UNBOUNDED_AGENT_CONFIG_FILE=/etc/unbounded/agent.json \
 ```
 
 Preflight does not install packages, pull the rootfs image, download full
-binary artifacts, create the nspawn machine, start kubelet, or join the
-cluster.
+binary artifacts, create the node's machine, start kubelet, or
+join the cluster.
 
 Generated install and bootstrap scripts run preflight by default before
 `unbounded-agent start`. Set `AGENT_PREFLIGHT=false` in the target host
@@ -45,6 +47,7 @@ environment to skip that automatic preflight step.
 | Flag | Description |
 |---|---|
 | `--config` | Path to the agent config file. When omitted, the agent uses its normal config loading behavior. |
+| `--isolation` | Isolation mode to check: `nspawn`, `none`, or `container`. Overrides `Isolation` from the config file. When omitted, the config file decides, and an empty value is `nspawn`. |
 | `--ignore-preflight-errors` | Comma-separated check names whose errors should be reported as warnings. Use `all` to ignore all fatal checks. |
 | `--fail-on-warnings` | Exit non-zero when any warning is returned, even if there are no fatal errors. |
 | `--output` | Output format. Supported values are `text` and `json`. Default: `text`. |
@@ -164,12 +167,15 @@ set is organized around the same bootstrap phases as `unbounded-agent start`.
 | `is-privileged-user` | Error | Preflight is running as root. Bootstrap requires root privileges. |
 | `host-packages` | Error or warning | A supported package manager is available (`apt-get`, `tdnf`, or `dnf`) and required host packages are installed. Missing package manager support is fatal. Missing packages are warnings because bootstrap may install them. |
 | `host-os-configuration` | Error | Host OS configuration paths are writable, including the sysctl config directory and systemd unit directory. |
-| `nspawn-runtime` | Warning | Required nspawn runtime tools are available: `systemctl`, `machinectl`, and `systemd-nspawn`. It also checks that `/run/systemd/system` is available. Missing tools are warnings because bootstrap may install them. |
+| `existing-deployment` | Error | The host has no leftover node deployment from a previous run. In `nspawn` mode it looks for registered `kube1` and `kube2` machines and their files. In `none` mode it also looks for the host-native node directory and units, and in `container` mode for the container node directory and units. A resumed installation skips this check. |
+| `nspawn-runtime` | Warning | `nspawn` mode only. Required nspawn runtime tools are available: `systemctl`, `machinectl`, and `systemd-nspawn`. It also checks that `/run/systemd/system` is available. Missing tools are warnings because bootstrap may install them. |
+| `container-backend` | Error | `container` mode only (experimental). cgroup v2 is available, the SELinux `spc_t` label is accepted when SELinux is enforcing, and `/etc`, `/opt`, and `/var` are writable. A missing `runc` is not an error because bootstrap installs it. |
+| `none-backend` | Error | `none` mode only. No kubelet or containerd that the agent does not own is present (unit file other than one masked to `/dev/null`, executable, or running process), and `/etc`, `/opt/unbounded/node`, and `/var` are writable. The failure names the mode to use instead. Bootstrap runs the ownership half of this check itself, so a host with such a kubelet or containerd is refused even without `preflight`. |
 | `docker-active` | Warning | Docker is active. Bootstrap will disable Docker when needed. |
 | `containerd-active` | Warning | The host containerd service is active. Bootstrap will disable it before starting the node. |
 | `kubelet-active` | Warning | The host kubelet service is active. Bootstrap will disable it before starting the node. |
 | `swap-active` | Warning | Swap is active or swap state cannot be determined. Bootstrap will disable active swap. |
-| `disk-space` | Error | At least 8 GiB is available under `/var/lib` for machine rootfs and artifacts. |
+| `disk-space` | Error | At least 8 GiB is available under `/var/lib` for rootfs and artifacts. |
 | `cgroups` | Error | The cgroup filesystem exists at `/sys/fs/cgroup`. |
 | `nvidia-driver` | Error or warning | If NVIDIA GPU hardware or device nodes are detected, validates the host NVIDIA driver stack. Hosts without NVIDIA GPUs pass this check. |
 
@@ -203,11 +209,11 @@ verify that `nvidia-smi -L` lists GPUs before retrying bootstrap.
 
 | Check | Severity when failing | What it validates |
 |---|---|---|
-| `oci-image-reachable` | Error | The selected rootfs OCI image is configured and its registry manifest, local layout, or HTTPS layout archive is reachable without pulling image contents. |
+| `oci-image-reachable` | Error | Not run in `none` mode, which has no OS image. The selected rootfs OCI image is configured and its registry manifest, local layout, or HTTPS layout archive is reachable without pulling image contents. |
 | `kubernetes-artifacts` | Error | Required Kubernetes binary sources are reachable without downloading full artifacts: kubelet, kubectl, and kube-proxy. |
 | `cri-artifacts` | Error | Required CRI artifact sources are reachable without downloading or extracting full artifacts: containerd, runc, and crictl. |
 | `cni-artifacts` | Error | The CNI plugins artifact source is reachable without downloading or extracting the full artifact. |
-| `nspawn-machine-provisioning` | Error or warning | The nspawn machine directory and provisioning paths are usable. Invalid or unreadable paths are fatal. Existing machine directory permissions that are too restrictive are warnings. |
+| `nspawn-machine-provisioning` | Error or warning | `nspawn` mode only. The nspawn machine directory and provisioning paths are usable. Invalid or unreadable paths are fatal. Existing machine directory permissions that are too restrictive are warnings. |
 
 HTTP artifact checks probe each resolved URL without downloading the full
 artifact. OCI registry checks resolve the image manifest without pulling
@@ -223,5 +229,6 @@ certificate data, URLs, image references, or file contents.
 ## Related Pages
 
 - [Agent Configuration]({{< relref "reference/agent/configuration" >}})
+- [Isolation Modes]({{< relref "reference/agent/isolation" >}})
 - [systemd-nspawn Isolation]({{< relref "reference/agent/nspawn" >}})
 - [Agent Guide]({{< relref "guides/agent" >}})

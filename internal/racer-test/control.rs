@@ -1,7 +1,6 @@
 //! Minimal real TLS controller fixture: bearer enrollment, then mTLS publication.
 use super::*;
-use base64::{Engine, engine::general_purpose::STANDARD};
-use racer_control_wire::{
+use racer_wire::control::{
     self as wire, CacheDefinition, CacheId, ClusterId, Member, MembershipVersion, NodeId,
     canonical_socket_paths,
 };
@@ -13,6 +12,9 @@ pub struct Control {
     pub enrollments: Arc<AtomicUsize>,
     pub polls: Arc<AtomicUsize>,
     pub blocked: Arc<AtomicBool>,
+    /// How long an unchanged snapshot or keyring poll is held before 204,
+    /// in milliseconds. Production holds `POLL_WAIT`; the default keeps tests fast.
+    pub hold_ms: Arc<AtomicUsize>,
     pub publication: Arc<Mutex<wire::Publication>>,
     stop: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
@@ -58,17 +60,42 @@ impl Control {
         fs::write(root.join("trust.pem"), ca.pem()).unwrap();
         fs::write(root.join("token"), "fixture.token").unwrap();
         // Runtime-generated test material, distinct for the two encryption purposes.
-        let keys: Vec<_> = caches.iter().flat_map(|(cache, _)| [("page", 7u8), ("origin_credentials", 8u8)].into_iter().map(move |(purpose, id)| {
-            let mut material = [0; 32];
-            getrandom::getrandom(&mut material).unwrap();
-            serde_json::json!({"cache": cache, "id": STANDARD.encode(wire::KeyId::from_generation(1, id as u32).unwrap().0), "purpose": purpose, "state": "active", "material": STANDARD.encode(material)})
-        })).collect();
-        let bundle = serde_json::json!({"schema_version": racer_control_wire::SCHEMA_VERSION, "cluster": CLUSTER, "generation": "1", "peer_trust_roots": [STANDARD.encode(ca.der())], "cache_keys": keys});
-        let bundle_bytes = serde_json::to_vec(&bundle).unwrap();
+        let keys: Vec<_> = caches
+            .iter()
+            .flat_map(|(cache, _)| {
+                [
+                    (wire::CacheKeyPurpose::Page, 7u32),
+                    (wire::CacheKeyPurpose::OriginCredentials, 8u32),
+                ]
+                .into_iter()
+                .map(move |(purpose, id)| {
+                    let mut material = zeroize::Zeroizing::new([0; 32]);
+                    getrandom::getrandom(&mut *material).unwrap();
+                    wire::CacheEncryptionKey::new(
+                        wire::CacheKeyRef {
+                            cache: CacheId(cache.clone()),
+                            id: wire::KeyId::from_generation(1, id).unwrap(),
+                            purpose,
+                        },
+                        wire::CacheKeyState::Active,
+                        material,
+                    )
+                })
+            })
+            .collect();
+        let bundle = wire::encode_bundle(&wire::KeyringBundle {
+            schema_version: racer_wire::control::KEYRING_SCHEMA_VERSION,
+            cluster: ClusterId(CLUSTER.into()),
+            generation: wire::BundleGeneration(1),
+            peer_trust_roots: vec![ca.der().to_vec()],
+            cache_keys: keys,
+        })
+        .unwrap();
+        let bundle_bytes = bundle.clone();
         let publication = Arc::new(Mutex::new(
             wire::Publication {
                 pools: Vec::new(),
-                schema_version: racer_control_wire::SCHEMA_VERSION,
+                schema_version: racer_wire::control::SCHEMA_VERSION,
                 cluster: ClusterId(CLUSTER.into()),
                 sequence: wire::PublicationSequence(1),
                 membership_version: MembershipVersion(1),
@@ -88,12 +115,13 @@ impl Control {
                             name,
                             client_socket,
                             origin_socket,
-                            priority: racer_control_wire::DEFAULT_PRIORITY,
-                            mode: racer_control_wire::CacheMode::Cached,
+                            priority: racer_wire::control::DEFAULT_PRIORITY,
+                            mode: racer_wire::control::CacheMode::Cached,
                             origin: None,
                         }
                     })
                     .collect(),
+                page_size: racer_wire::object::PageSize::DEFAULT,
             }
             .with_default_pool(),
         ));
@@ -105,6 +133,8 @@ impl Control {
         let enrollments = Arc::new(AtomicUsize::new(0));
         let polls = Arc::new(AtomicUsize::new(0));
         let blocked = Arc::new(AtomicBool::new(false));
+        let hold_ms = Arc::new(AtomicUsize::new(0));
+        let holding = hold_ms.clone();
         let (observed, paused) = (polls.clone(), blocked.clone());
         let (stopping, issued) = (stop.clone(), enrollments.clone());
         let ca = Arc::new(ca);
@@ -126,6 +156,7 @@ impl Control {
                 socket
                     .set_write_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
+                let holding = holding.clone();
                 let (tls, published, observed, paused, stopping, issued) = (
                     tls.clone(),
                     published.clone(),
@@ -155,9 +186,12 @@ impl Control {
                 let (status, body) = if head.starts_with("GET /v1/keyring") {
                     assert!(stream.conn.peer_certificates().is_some() || fields["authorization"].starts_with("Bearer fixture.token"));
                     if head.starts_with("GET /v1/keyring?after=1 ") {
+                        // Production holds an unchanged poll open. Hold briefly so
+                        // idle clients are not measured against a busy loop.
+                        hold(&holding, &stopping, Duration::from_secs(1));
                         (204, Vec::new())
                     } else {
-                        (200, serde_json::to_vec(&bundle).unwrap())
+                        (200, bundle.to_vec())
                     }
                 } else if head.starts_with("POST /v1/bootstrap ") {
                     let binding = fields["authorization"]
@@ -198,7 +232,7 @@ impl Control {
                         200,
                         wire::encode_enrollment_response(&wire::EnrollmentResponse {
                             block_devices: None,
-                            schema_version: racer_control_wire::SCHEMA_VERSION,
+                            schema_version: racer_wire::control::SCHEMA_VERSION,
                             cluster: request.cluster,
                             node: NodeId(node.into()),
                             enrollment: request.enrollment,
@@ -220,7 +254,8 @@ impl Control {
                         .unwrap()
                         .contains(&format!("?after={} ", publication.sequence.0))
                     {
-                        thread::sleep(Duration::from_millis(20));
+                        drop(publication);
+                        hold(&holding, &stopping, Duration::from_millis(20));
                         (204, Vec::new())
                     } else {
                         (200, wire::encode_publication(&publication).unwrap())
@@ -254,10 +289,27 @@ impl Control {
             enrollments,
             polls,
             blocked,
+            hold_ms,
             publication,
             stop,
             thread: Some(thread),
         }
+    }
+}
+/// Hold an unchanged long poll for the configured time, or `default` when unset.
+fn hold(hold_ms: &AtomicUsize, stopping: &AtomicBool, default: Duration) {
+    let configured = hold_ms.load(Ordering::Acquire);
+    let until = std::time::Instant::now()
+        + if configured == 0 {
+            default
+        } else {
+            Duration::from_millis(configured as u64)
+        };
+    while std::time::Instant::now() < until && !stopping.load(Ordering::Acquire) {
+        thread::sleep(
+            Duration::from_millis(20)
+                .min(until.saturating_duration_since(std::time::Instant::now())),
+        );
     }
 }
 impl Drop for Control {

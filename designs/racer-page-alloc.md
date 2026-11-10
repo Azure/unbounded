@@ -8,11 +8,12 @@
 1. Memory buffers aligned for direct I/O, with caller-selected wiping rules.
 2. A table of fixed-size segments in a sparse cache file or caller-opened files
    or devices, with leases that stop reuse while I/O still points at a segment.
-3. Async read and write of that storage through the `uring-runtime` reactor.
+3. Async read and write of that storage through the `racer-io` reactor.
 
-The crate stores bytes only. It does not know about page keys, record headers,
-encryption, checksums, or versions. The caller owns the page index and
-tells the crate how to remove entries when a segment is evicted.
+The crate stores bytes and payload-agnostic index state. It does not know
+record headers, encryption, checksums, or object versions. Pages are known only
+as caller-interned `PageSlot` numbers in `disk_index::DiskIndex`; the caller
+maps its page identities to slots and owns every per-page payload field.
 
 ## Goals and non-goals
 
@@ -38,13 +39,11 @@ Disk allocation and I/O authority is worker-local. `Segments`, `Slab`,
 worker-local state and cannot move to another worker. See `alloc/src/segments.rs`,
 `alloc/src/slab.rs`, and `alloc/src/lib.rs`.
 
-`WorkerBufferPool` is a separate, mutex-protected pool. Its `DetachedBuffer`
-can move to a crypto thread for filling. Freezing produces a `FrozenBuffer`
-with immutable bytes; it can be shared across threads when its charge allows
-it. Dropping either buffer returns storage to its original pool, if that pool
-still exists. Freezing an `AlignedBuffer` instead detaches it from the
-worker-local slab pool and rejects retained `Rc` guards. This does not transfer
-disk allocation or I/O authority.
+`buf::Pool` (`alloc/src/buf.rs`) is owned by one worker, but its `Buf`
+buffers are `Send` and may be filled or dropped on any thread, such as a crypto
+thread. A dropped `Buf` returns to its pool through a lock-free per-class
+return stack that only the owner drains. `Arc<Buf<C>>` is the shared immutable
+form. This does not transfer disk allocation or I/O authority.
 
 ## Buffers
 
@@ -79,25 +78,30 @@ when allocations missed and returns were refused for depth, the target grows by
 half the misses (at least 1); entries that stayed unused for the whole window
 are halved, oldest first; after 10 miss-free windows the target drops by 1.
 `Slab::constrain_idle` refuses returns and trims to the minimum depth, which
-defaults to zero. The flow
-recycler (`Quotas::maintain_buffers` in `flow/src/lib.rs`) uses the same
-controller and also retains at most half of each class limit. Workers drive
-both from `poll_services`. Idle slab buffers keep their admission charges.
+defaults to zero. Workers drive it from `poll_services`. Idle slab buffers keep
+their admission charges.
 
 ### Cross-thread buffer pool
 
-`WorkerBufferPool` groups storage into 64 KiB capacity classes. It keeps at
-most eight idle buffers per class and a caller-set byte budget, 128 MiB by
-default. It reuses the most recently returned buffer in a matching class.
-This pool does not use `PoolDemand`; `clear` frees its idle storage. Wiping
-and charge destructors run outside the mutex.
+`buf::Pool` groups storage into capacity classes and serves aligned
+ciphertext, pooled plaintext, copied ciphertext, and peer receives. Idle bytes
+are charged to a dedicated admission class through `PoolAccount`
+(`flow_control::QuotaPoolAccount`), so admission sees them; a failed idle
+charge frees the storage instead. `Pool::shed` releases idle storage under
+memory pressure. A checkout must bring a charge covering the full capacity,
+and the charge rides in the `Buf`.
 
-Racer uses this pool for aligned ciphertext. Its `PoolCharge` releases live
-ciphertext admission before parking idle storage, so Racer sets a separate
-idle budget of four maximum-page capacity classes (`src/memory.rs`). A new
-checkout must bring a charge covering the full capacity. Encryption and HTTP
-receive can fill this storage, and a frozen page can be sent or written to
-disk without another body allocation.
+Capacities round up to 4 KiB (or the alignment, if larger). A pool keeps up to
+`MAX_CLASSES` (16) capacities at once. Each class has a lock-free return stack
+that any thread pushes to and only the owner drains. When a new capacity
+arrives and every class is assigned, it takes over the least recently used
+class that holds no idle storage. Buffers of the old capacity that return
+later are freed. If every class holds idle storage, the buffer is unpooled
+(counted as `unpooled`). `Pool::shed` discards idle mappings with
+`MADV_DONTNEED` and keeps them pooled "cold" and uncharged. Heap storage is
+freed. A node-targeted take reuses only storage bound to that node, except for
+storage that cannot be bound (under 2 MiB, or after `mbind` was refused),
+where any idle storage is reused.
 
 ### Wiping and padding
 
@@ -107,11 +111,11 @@ pooling or freeing it. Clean allocations skip the wipe. See
 `Allocation::wipe` and the buffer `Drop` implementations in `alloc/src/lib.rs`.
 
 The worker-local slab pool also clears non-secret storage before reuse, using
-`MADV_DONTNEED` for mappings when possible and zero filling otherwise. The
-cross-thread pool deliberately does not clear non-secret storage. Its producers
-must overwrite every requested byte. `DetachedBuffer::freeze` clears only the
-padding up to the direct-I/O length unit. This rule allows ciphertext reuse
-without weakening plaintext wiping.
+`MADV_DONTNEED` for mappings when possible and zero filling otherwise. `buf::Pool`
+deliberately does not clear non-secret storage. Its producers must overwrite
+every requested byte. Storage taken with the `wipe` flag is erased before it
+is pooled or freed. This rule allows ciphertext reuse without weakening
+plaintext wiping.
 
 ## Segments
 
@@ -153,17 +157,24 @@ table keeps the image generations, so recovered mappings stay valid.
 
 ## Reclaim
 
-`SegmentClock::reclaim` in `alloc/src/segments.rs` is a bounded clock
-(second-chance) sweep over sealed segments. The caller calls `mark_read` when it
-serves a read from a segment. The sweep clears that mark once before it picks the
-segment. Each call has limits on the number of segments it visits and the number
-of index entries it removes.
-For a nonzero reserve, `reclaim` and `reclaim_scored` succeed only when the reserve
-(capped at the slot count) is met and no evictions remain. They intentionally
-return `Busy` while evictions remain, even if enough slots are already free.
-Callers should use `Segments::free_count` to check capacity and keep retrying
-bounded reclamation later to drain pending evictions. A zero reserve is a no-op,
-not a drain request.
+`SegmentClock::reclaim_scored` in `alloc/src/segments.rs` is the only
+reclaim. It visits at most `min(slot count, max_visits, 64)` slots from a shared
+cursor, ranks eligible Sealed and Evicting slots (Evicting first, then the
+lowest caller score), and removes at most `max_entries` index entries per call.
+There is no second-chance read mark; the caller's score carries heat and cache
+priority (over-share caches score lower, so they lose space first).
+For a nonzero reserve, the call returns early with success only when the reserve
+(capped at the slot count) is met and no evictions remain. After a sweep it
+succeeds whenever the reserve is met, even with evictions still draining, and
+returns `Busy` otherwise. Success is not a drain guarantee: callers use
+`Segments::free_count` to check capacity and retry bounded reclamation later.
+A zero reserve is a no-op, not a drain request.
+
+The store also reclaims when its page index is full rather than when slab
+space is low: it asks for one more free segment than is currently free or
+evicting, so the lowest-scored whole segment goes. If every reclaimable record
+is in the open segment, `Segments::seal_open` seals it first. There is no
+per-page eviction.
 
 Evicting a segment happens in this order:
 
@@ -240,8 +251,8 @@ and it does not flush to disk.
 
 ## Simulation
 
-For file-backed slabs, the `simulation` feature routes open, lock, stat, and sizing to the
-`uring-runtime` simulated filesystem. Buffers, leases, and segment rules do not
+For file-backed slabs, `Slab::simulate_in` routes open, lock, stat, and sizing to the
+`racer-io` simulated filesystem (`SimOs`). Buffers, leases, and segment rules do not
 change, so the same workflow tests run in both modes.
 
 ## Testing
@@ -265,4 +276,4 @@ change, so the same workflow tests run in both modes.
   commands, so feature unification cannot hide one from the other. The
   production run sets `PAGE_ALLOC_REQUIRE_REAL_IO=1`, so a host without
   io_uring or direct I/O fails instead of skipping. Miri runs only on
-  `uring-runtime`, not on this crate.
+  the worker-runtime allowlist in `hack/scripts/racer-io-miri.py`, not on this crate.

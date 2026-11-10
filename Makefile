@@ -154,6 +154,7 @@ GANTRY_CHART_APP_VERSION ?= $(VERSION_TAG)
 GANTRY_CHART_PACKAGE_DIR := build/charts
 GANTRY_CHART_STAGE_DIR := tmp/gantry-chart-package
 GANTRY_CHART_IMAGE_REPOSITORY ?= $(CONTAINER_REGISTRY)/gantry
+GANTRY_NODE_CONFIG_IMAGE ?= $(CONTAINER_REGISTRY)/gantry-node-config:$(VERSION_TAG)
 
 # Version is derived from the latest git tag. Override with: make VERSION=v1.0.0
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
@@ -233,7 +234,7 @@ NET_FRONTEND_CACHE_FILE    := $(NET_FRONTEND_DIST_DIR)/.frontend-build-key
 # Frontend build toggle (dev builds produce unminified output with sourcemaps).
 REACT_DEV ?= false
 
-.PHONY: all help fmt lint lint-actions test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc install-helm generate kubectl-unbounded forge relctl relctl-build agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests playpen-manifests e2e-gantry e2e-playpen e2e-racer gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build license-check notice notice-check gantry gantry-build gantry-manifests inventory-manifests
+.PHONY: all help fmt lint lint-actions test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc install-helm install-kind generate kubectl-unbounded forge relctl relctl-build agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests playpen-manifests e2e-gantry e2e-playpen e2e-racer gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build license-check notice notice-check gantry gantry-build gantry-manifests inventory-manifests
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests gantry-chart-lint gantry-chart-package release-bom release-manifests unbounded-operator-release-manifest
 .PHONY: image-machina-local image-token-refresher-local image-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-unbounded-operator-push image-playpen-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
@@ -252,6 +253,7 @@ help: ## Show this help
 	@echo "  install-tools                    Install gofumpt, golangci-lint, protoc-gen-go, protoc-gen-go-grpc, controller-gen, actionlint"
 	@echo "  install-protoc                   Download pinned protoc into bin/protoc/"
 	@echo "  install-helm                     Download pinned Helm into bin/"
+	@echo "  install-kind                     Install pinned kind into bin/"
 	@echo ""
 	@echo "Development:"
 	@echo "  fmt                              Format Go source (gofumpt + wsl_v5)"
@@ -366,15 +368,20 @@ help: ## Show this help
 	@echo ""
 	@echo "Racer:"
 	@echo "  racer-test                       Test the Rust Racer workspace and Go Racer API and wire contracts"
+	@echo "  racer-fmt                        Format the Rust Racer workspace"
+	@echo "  racer-lint                       Check Rust formatting, workspace Clippy, and Racer purity"
+	@echo "  racer-purity-graph               Fail when a pure Racer crate depends on an IO crate"
 	@echo "  racer-gpu-test                   Build the CUDA shim with kernels and run GPU hardware tests"
-	@echo "  racer-sim                        Run the Racer simulator (ARGS='--scenario smoke --nodes 16')"
+	@echo "  racer-fuzz                       Run each Racer libFuzzer target briefly (FUZZ_SECONDS, default 30)"
+	@echo "  racer-dst                        Run the Racer DST seed set twice each (DST_SEEDS, DST_STEPS, DST_FILTER)"
+	@echo "  racer-dst-report                 Write one Model scenario's JSON report (ARGS='--scenario full-failover --nodes 200')"
 	@echo "  racer-envtest                    Run Racer API-server tests with KUBEBUILDER_ASSETS"
 	@echo "  racer-envtest-ci                 Provision pinned assets and run Racer API-server tests"
 	@echo "  racer-generate                   Generate Racer deepcopy and CRD artifacts"
 	@echo "  racer-loadgen | racer-loadgen-build  Build loadgen (with/without focused tests)"
 	@echo "  racer-loadgen-test                Race-test racer-loadgen"
-	@echo "  racer-object | racer-object-build  Build racer-object (with/without focused tests)"
-	@echo "  racer-object-test                 Race-test racer-object"
+	@echo "  racer-object | racer-object-build  Build the Rust racer-object sidecar (with/without tests)"
+	@echo "  racer-object-test                 Check formatting, lint, and test the racer-object crate"
 	@echo "  image-racer-local       Build the racer container image"
 	@echo "  image-racer-loadgen-local         Build the loadgen container image"
 	@echo "  image-racer-object-local          Build the racer-object container image"
@@ -403,6 +410,10 @@ ACTIONLINT_VERSION ?= v1.7.12
 HELM_VERSION ?= 3.21.3
 HELM ?= $(CURDIR)/bin/helm
 HELM_STAMP := $(CURDIR)/bin/.helm-v$(HELM_VERSION)
+KIND_VERSION ?= v0.30.0
+KIND ?= $(CURDIR)/bin/kind
+KIND_STAMP := $(CURDIR)/bin/.kind-$(KIND_VERSION)
+GANTRY_E2E_RUN ?= .
 
 HELM_UNAME_S := $(shell uname -s)
 HELM_UNAME_M := $(shell uname -m)
@@ -467,6 +478,17 @@ install-tools: ## Install development tools (gofumpt, golangci-lint, protoc-gen-
 install-protoc: $(PROTOC) ## Download pinned protoc into bin/protoc/
 
 install-helm: $(HELM) ## Download pinned Helm into bin/
+
+install-kind: $(KIND) ## Install pinned kind into bin/
+
+$(KIND_STAMP):
+	@mkdir -p $(dir $(KIND))
+	GOBIN=$(CURDIR)/bin $(GOCMD) install sigs.k8s.io/kind@$(KIND_VERSION)
+	@$(KIND) version
+	@touch $(KIND_STAMP)
+
+$(KIND): $(KIND_STAMP)
+	@test -x $(KIND) || { rm -f $(KIND_STAMP); $(MAKE) $(KIND_STAMP); }
 
 $(HELM_STAMP):
 	@test -n "$(HELM_SHA256)" || { echo "unsupported Helm platform $(HELM_OS)-$(HELM_ARCH)" >&2; exit 1; }
@@ -557,9 +579,16 @@ test: lint machina-manifests token-refresher-manifests machine-ops-manifests pla
 
 endif
 
-e2e-gantry: $(HELM) ## Run the kind-based Gantry e2e suite
-	CONTAINER_ENGINE="$(CONTAINER_ENGINE)" KIND_EXPERIMENTAL_PROVIDER="$(CONTAINER_ENGINE)" PATH="$(CURDIR)/bin:$$PATH" \
-		$(GOTEST) -tags=e2e -count=1 -timeout=120m -v ./e2e/gantry
+e2e-gantry: $(HELM) $(KIND) ## Run the kind-based Gantry e2e suite
+	@set -eu; \
+	if [ "$(CONTAINER_ENGINE)" = "podman" ] && [ "$$($(CONTAINER_ENGINE) info --format '{{.Host.Security.Rootless}}')" = "true" ]; then \
+		command -v systemd-run >/dev/null 2>&1 || { echo "rootless Podman requires systemd-run" >&2; exit 1; }; \
+		exec systemd-run --user --scope --quiet -p Delegate=yes \
+			env CONTAINER_ENGINE="$(CONTAINER_ENGINE)" KIND_EXPERIMENTAL_PROVIDER="$(CONTAINER_ENGINE)" PATH="$(CURDIR)/bin:$$PATH" \
+			$(GOTEST) -tags=e2e -count=1 -timeout=120m -run '$(GANTRY_E2E_RUN)' -v ./e2e/gantry; \
+	fi; \
+	exec env CONTAINER_ENGINE="$(CONTAINER_ENGINE)" KIND_EXPERIMENTAL_PROVIDER="$(CONTAINER_ENGINE)" PATH="$(CURDIR)/bin:$$PATH" \
+		$(GOTEST) -tags=e2e -count=1 -timeout=120m -run '$(GANTRY_E2E_RUN)' -v ./e2e/gantry
 
 e2e-racer: ## Run the kind-based Racer e2e suite (object caching and the Gantry Racer backend)
 	timeout --signal=TERM --kill-after=30s 7200s $(GOTEST) -tags=e2e -count=1 -timeout=110m -v ./e2e/racer
@@ -576,6 +605,29 @@ racer-rust-test: ## Test the Rust Racer workspace, including the embedded cluste
 	timeout --signal=TERM --kill-after=10s 1500s cargo test --locked --manifest-path cmd/racer/Cargo.toml --workspace
 
 racer-test: racer-go-test racer-rust-test ## Check Racer
+
+RACER_RUST_TOOLCHAIN ?= 1.96.0
+
+.PHONY: racer-fmt racer-lint racer-purity-graph
+racer-fmt: ## Format the Rust Racer workspace
+	timeout --signal=TERM --kill-after=10s 300s cargo +$(RACER_RUST_TOOLCHAIN) fmt --manifest-path cmd/racer/Cargo.toml --all
+
+racer-purity-graph: ## Fail when a pure Racer crate depends on an IO crate
+	timeout --signal=TERM --kill-after=10s 300s python3 hack/scripts/racer-purity-graph.py --manifest-path cmd/racer/Cargo.toml --strict
+
+racer-lint: racer-purity-graph ## Check Rust formatting, workspace Clippy, and Racer purity
+	timeout --signal=TERM --kill-after=10s 300s cargo +$(RACER_RUST_TOOLCHAIN) fmt --manifest-path cmd/racer/Cargo.toml --all --check
+	timeout --signal=TERM --kill-after=10s 1200s cargo +$(RACER_RUST_TOOLCHAIN) clippy --locked --manifest-path cmd/racer/Cargo.toml --workspace --all-targets -- -D warnings
+	timeout --signal=TERM --kill-after=10s 600s cargo +$(RACER_RUST_TOOLCHAIN) test --locked --manifest-path cmd/racer/Cargo.toml -p racer-core --test purity
+
+FUZZ_SECONDS ?= 30
+RACER_FUZZ_TARGETS ?= http_head small_body peer_envelope control_documents store_record checkpoint
+
+.PHONY: racer-fuzz
+racer-fuzz: ## Run each Racer libFuzzer target for FUZZ_SECONDS (default 30)
+	cd cmd/racer/fuzz && for target in $(RACER_FUZZ_TARGETS); do \
+		timeout --signal=TERM --kill-after=10s 1500s env RUSTC_BOOTSTRAP=1 cargo +$(RACER_RUST_TOOLCHAIN) fuzz run "$$target" "corpus/$$target" -- -max_total_time=$(FUZZ_SECONDS) || exit 1; \
+	done
 
 RACER_GPU_NATIVE ?= $(CURDIR)/bin/racer-gpu-native
 # 1 skips when no GPU is found; require fails instead (dedicated GPU runners).
@@ -611,11 +663,20 @@ racer-python-dist: ## Build sdists and wheels for racer-client and racer-vllm in
 	timeout --signal=TERM --kill-after=10s 300s "$(RACER_PY_VENV)/bin/python" -m build -o tmp/racer-python-dist clients/python/racer
 	timeout --signal=TERM --kill-after=10s 300s "$(RACER_PY_VENV)/bin/python" -m build -o tmp/racer-python-dist clients/python/racer-vllm
 
-RACER_SIM_TIMEOUT ?= 7200s
+RACER_DST_TIMEOUT ?= 1200s
 
-.PHONY: racer-sim
-racer-sim: ## Run the Racer discrete-event simulator; pass options with ARGS='--nodes 50000 --seed 1'
-	timeout --signal=TERM --kill-after=10s $(RACER_SIM_TIMEOUT) cargo run --release --locked --manifest-path cmd/racer/Cargo.toml -p racer-sim -- $(ARGS)
+# DST_SEEDS: seed file or count N (seeds 1..=N per scenario); default dst/seeds/{ci,regressions}.txt.
+# DST_STEPS: step budget per run. DST_FILTER: scenario name substring. Each entry runs twice.
+.PHONY: racer-dst
+racer-dst: ## Run the Racer deterministic simulation tests; every seed runs twice and must match
+	DST_SEEDS="$(DST_SEEDS)" DST_STEPS="$(DST_STEPS)" DST_FILTER="$(DST_FILTER)" timeout --signal=TERM --kill-after=10s $(RACER_DST_TIMEOUT) cargo +$(RACER_RUST_TOOLCHAIN) run --locked --profile test --manifest-path cmd/racer/Cargo.toml -p racer-dst --bin racer-dst
+
+RACER_DST_REPORT_TIMEOUT ?= 7200s
+
+# One Model scenario's JSON report: --scenario, --nodes, --seed, --duration, --config, --out.
+.PHONY: racer-dst-report
+racer-dst-report: ## Write one Racer Model scenario's JSON report; pass options with ARGS='--scenario full-failover --nodes 200'
+	timeout --signal=TERM --kill-after=10s $(RACER_DST_REPORT_TIMEOUT) cargo +$(RACER_RUST_TOOLCHAIN) run --release --locked --manifest-path cmd/racer/Cargo.toml -p racer-dst --bin racer-dst -- $(ARGS)
 
 $(SETUP_ENVTEST):
 	@mkdir -p bin tmp/envtest-tools
@@ -665,18 +726,24 @@ image-racer-loadgen-local: ## Build the loadgen container image locally (single-
 	$(call trivy-maybe,$(RACER_LOADGEN_IMAGE))
 
 RACER_OBJECT_BIN=bin/racer-object
-RACER_OBJECT_CMD=./cmd/racer-object
+RACER_OBJECT_MANIFEST=cmd/racer-object/Cargo.toml
+RACER_OBJECT_CARGO_TARGET_DIR ?= $(CURDIR)/bin/racer-object-cargo
 RACER_OBJECT_IMAGE ?= $(CONTAINER_REGISTRY)/racer-object:$(VERSION_TAG)
 
 .PHONY: racer-object racer-object-build racer-object-test image-racer-object-local
-racer-object: racer-object-test racer-object-build ## Test and build racer-object
+racer-object: racer-object-test racer-object-build ## Test and build the Rust racer-object sidecar
 
-racer-object-build: ## Build racer-object without lint/test
+racer-object-build: ## Build the Rust racer-object sidecar (release) into bin/racer-object without tests
 	@mkdir -p bin
-	timeout --signal=TERM --kill-after=10s 300s $(GOBUILD) -trimpath -ldflags '$(STAMP_LDFLAGS)' -o $(RACER_OBJECT_BIN) $(RACER_OBJECT_CMD)
+	CARGO_TARGET_DIR="$(RACER_OBJECT_CARGO_TARGET_DIR)" \
+		RACER_OBJECT_VERSION="$(VERSION)" RACER_OBJECT_GIT_COMMIT="$(GIT_COMMIT)" RACER_OBJECT_BUILD_TIME="$(BUILD_TIME)" \
+		timeout --signal=TERM --kill-after=10s 600s cargo build --locked --release --manifest-path $(RACER_OBJECT_MANIFEST)
+	install -m 0755 "$(RACER_OBJECT_CARGO_TARGET_DIR)/release/racer-object" $(RACER_OBJECT_BIN)
 
-racer-object-test: ## Race-test racer-object
-	timeout --signal=TERM --kill-after=10s 300s $(GOTEST) -timeout=5m -race $(RACER_OBJECT_CMD)/...
+racer-object-test: ## Check formatting, run Clippy, and test the racer-object crate
+	timeout --signal=TERM --kill-after=10s 300s cargo fmt --manifest-path $(RACER_OBJECT_MANIFEST) --all --check
+	CARGO_TARGET_DIR="$(RACER_OBJECT_CARGO_TARGET_DIR)" timeout --signal=TERM --kill-after=10s 600s cargo clippy --locked --manifest-path $(RACER_OBJECT_MANIFEST) --all-targets -- -D warnings
+	CARGO_TARGET_DIR="$(RACER_OBJECT_CARGO_TARGET_DIR)" timeout --signal=TERM --kill-after=10s 600s cargo test --locked --manifest-path $(RACER_OBJECT_MANIFEST)
 
 image-racer-object-local: ## Build the racer-object container image locally (single-arch)
 	$(CONTAINER_ENGINE) build \
@@ -1113,10 +1180,12 @@ machine-ops-controller-oci-push: machine-ops-controller-oci ## Build and push th
 
 MACHINA_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
 MACHINA_API_SERVER_ENDPOINT ?=
+MACHINA_EXPERIMENTAL_CONTAINER_ISOLATION ?= false
 MACHINA_MANIFEST_TEMPLATES_DIR := deploy/machina
 MACHINA_MANIFEST_RENDERED_DIR  := deploy/machina/rendered
 MACHINE_OPS_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
 MACHINE_OPS_API_SERVER_ENDPOINT ?=
+MACHINE_OPS_EXPERIMENTAL_CONTAINER_ISOLATION ?= false
 MACHINE_OPS_MANIFEST_TEMPLATES_DIR := deploy/machine-ops
 MACHINE_OPS_MANIFEST_RENDERED_DIR  := deploy/machine-ops/rendered
 PLAYPEN_NAMESPACE ?= playpen
@@ -1141,7 +1210,8 @@ machina-manifests: ## Render machina deployment manifests into deploy/machina/re
 		--output-dir $(MACHINA_MANIFEST_RENDERED_DIR) \
 		--set Namespace=$(MACHINA_NAMESPACE) \
 		--set ControllerImage=$(MACHINA_IMAGE) \
-		--set APIServerEndpoint=$(MACHINA_API_SERVER_ENDPOINT)
+		--set APIServerEndpoint=$(MACHINA_API_SERVER_ENDPOINT) \
+		--set ExperimentalContainerIsolation=$(MACHINA_EXPERIMENTAL_CONTAINER_ISOLATION)
 	@cp $(MACHINA_MANIFEST_TEMPLATES_DIR)/crd/*.yaml $(MACHINA_MANIFEST_RENDERED_DIR)/crd/
 	@echo "Rendered machina manifests into $(MACHINA_MANIFEST_RENDERED_DIR) (image: $(MACHINA_IMAGE))"
 
@@ -1180,7 +1250,8 @@ machine-ops-manifests: ## Render machine-ops-controller manifests into deploy/ma
 		--set ControllerImage=$(MACHINE_OPS_CONTROLLER_IMAGE) \
 		--set Provider=$(MACHINE_OPS_PROVIDER) \
 		--set Site=$(MACHINE_OPS_SITE) \
-		--set APIServerEndpoint=$(MACHINE_OPS_API_SERVER_ENDPOINT)
+		--set APIServerEndpoint=$(MACHINE_OPS_API_SERVER_ENDPOINT) \
+		--set ExperimentalContainerIsolation=$(MACHINE_OPS_EXPERIMENTAL_CONTAINER_ISOLATION)
 	@echo "Rendered machine-ops manifests into $(MACHINE_OPS_MANIFEST_RENDERED_DIR) (image: $(MACHINE_OPS_CONTROLLER_IMAGE))"
 
 playpen-manifests: ## Render playpen operator and runner manifests into deploy/playpen/rendered
@@ -1254,6 +1325,16 @@ image-gantry-local: ## Build the gantry container image locally (single-arch)
 
 image-gantry-push: image-gantry-local ## Build and push the gantry container image
 	$(CONTAINER_ENGINE) push $(GANTRY_IMAGE)
+
+.PHONY: image-gantry-node-config-local image-gantry-node-config-push
+image-gantry-node-config-local: ## Build the Gantry OverlayBD node configurator image locally
+	$(CONTAINER_ENGINE) build \
+		-t gantry-node-config:$(VERSION_TAG) -t $(GANTRY_NODE_CONFIG_IMAGE) \
+		-f ./images/gantry-node-config/Containerfile .
+	$(call trivy-maybe,$(GANTRY_NODE_CONFIG_IMAGE))
+
+image-gantry-node-config-push: image-gantry-node-config-local ## Build and push the Gantry OverlayBD node configurator image
+	$(CONTAINER_ENGINE) push $(GANTRY_NODE_CONFIG_IMAGE)
 
 ##@ Orca
 
@@ -1384,7 +1465,7 @@ images-net-all: image-net-controller-local image-net-node-local ## Build all unb
 
 images-net-all-push: image-net-controller-push image-net-node-push ## Build and push all unbounded-net container images
 
-images-local: image-machina-local image-token-refresher-local image-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-net-controller-local image-net-node-local image-gantry-local ## Build all container images locally
+images-local: image-machina-local image-token-refresher-local image-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-node-config-local ## Build all container images locally
 
 ##@ Net Frontend
 

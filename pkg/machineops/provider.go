@@ -47,6 +47,7 @@ type Provider struct {
 	name                string
 	providerMachineKind *schema.GroupKind
 	operations          map[unboundedv1alpha3.OperationKind]*Operation
+	capacity            *Capacity
 }
 
 // WithProviderMachineKind declares the provider-owned Machine GroupKind
@@ -107,6 +108,8 @@ func (f operationOptionFunc) applyOperation(operation *Operation) error {
 }
 
 // NewProvider validates and constructs an immutable provider registration.
+// Capacity is all or nothing: WithCapacity requires long-running HostAllocate
+// and HostRelease registrations, and those kinds require WithCapacity.
 func NewProvider(name string, options ...ProviderOption) (*Provider, error) {
 	if strings.TrimSpace(name) == "" {
 		return nil, fmt.Errorf("provider name is required")
@@ -125,6 +128,10 @@ func NewProvider(name string, options ...ProviderOption) (*Provider, error) {
 		if err := option.applyProvider(provider); err != nil {
 			return nil, err
 		}
+	}
+
+	if err := validateCapacity(provider); err != nil {
+		return nil, err
 	}
 
 	if len(provider.operations) == 0 {
@@ -335,6 +342,10 @@ func configureOperation(
 
 	if operation.requiresReplaceUserData && kind != unboundedv1alpha3.OperationHostReplace {
 		return fmt.Errorf("replacement user data is valid only for HostReplace, not %q", kind)
+	}
+
+	if operation.cleanup != nil && kind.IsAllocationOperation() {
+		return fmt.Errorf("cleanup is not valid for allocation operation %q", kind)
 	}
 
 	return nil

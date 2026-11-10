@@ -2,10 +2,13 @@
 //! expiry, caps, and admission for the sans-IO page flight table.
 
 // The attribute below also marks this file as test-only for tests/purity.rs.
+use super::table::Waiter;
 #[cfg(test)]
 use super::*;
-use racer_control_wire::CacheId;
-use racer_object_wire::model::{CacheKey, ObjectId, ObjectVersion, PageNumber, StrongEtag};
+use racer_wire::control::CacheId;
+use racer_wire::object::model::{
+    CacheKey, ObjectId, ObjectVersion, PageId, PageNumber, StrongEtag,
+};
 use std::cell::Cell;
 use std::collections::hash_map::RandomState;
 use std::rc::Rc;
@@ -51,9 +54,10 @@ fn terminal(error: Error) -> std::result::Result<Acquired, FailureKind> {
 /// A flight table at `now` with admission `admit`, and its wake list. Times
 /// are whole seconds after `now`; pages are numbers.
 struct Fx<R> {
-    t: PageFlights<u32, u32, Acquired, R, RandomState>,
+    t: FlightTable<PageId, u32, u32, Acquired, R, RandomState>,
     now: Instant,
     wakes: Vec<u64>,
+    ops: Vec<Operation>,
     admit: Box<dyn FnMut(Reserve) -> Result<R>>,
 }
 
@@ -68,9 +72,10 @@ fn limited(limits: FlightLimits) -> Fx<()> {
 fn admitted<R>(limits: FlightLimits, admit: Box<dyn FnMut(Reserve) -> Result<R>>) -> Fx<R> {
     let now = Instant::now();
     Fx {
-        t: PageFlights::new(limits, split, now, RandomState::new()),
+        t: FlightTable::new(limits, split, now, RandomState::new()),
         now,
         wakes: Vec::new(),
+        ops: Vec::new(),
         admit,
     }
 }
@@ -135,11 +140,19 @@ impl<R> Fx<R> {
     }
 
     fn retain(&mut self, p: u64, id: u64) -> Result<()> {
-        self.t.retain_operation(&page(p), id, &mut self.wakes)
+        let op = self.t.retain_operation(&page(p), id, &mut self.wakes)?;
+        self.ops.push(op);
+        Ok(())
     }
 
     fn complete(&mut self, p: u64) -> Result<()> {
-        self.t.complete_operation(&page(p), &mut self.wakes)
+        // Without a retained operation, complete a handle no table issued.
+        let op = self.ops.pop().unwrap_or(Operation {
+            fence: Fence(u64::MAX),
+            incarnation: 0,
+            id: 0,
+        });
+        self.t.complete_operation(&page(p), op, &mut self.wakes)
     }
 
     fn handover(&mut self, p: u64, id: u64) {
@@ -272,7 +285,7 @@ fn canceled_leader_is_revoked_and_follower_takes_over() {
     assert_eq!(f.poll(4, b, 0, 2), Ok(Wait::Pending));
     assert!(f.woken(|f| f.cancel(4, a)).contains(&2));
     assert_eq!(f.poll(4, b, 0, 2), Ok(Wait::Lead));
-    assert_eq!(f.poll(4, a, 0, 1), failed(Error::Cancelled));
+    assert_eq!(f.poll(4, a, 0, 1), failed(Error::Canceled));
 }
 
 #[test]
@@ -297,7 +310,8 @@ fn gates_follow_production_order() {
     assert_eq!(f.join_at(6, 10, 10, 2, true), Err(Error::DeadlineExceeded));
     assert_eq!(f.join(6, 0, true), Err(Error::Unavailable));
     f.waiter(6);
-    assert_eq!(f.join(6, 2, true), Err(Error::Overloaded));
+    // A full flight proves its fetch; a full table proves nothing.
+    assert_eq!(f.join(6, 2, true), Err(Error::FlightFull));
     assert_eq!(f.join(7, 2, true), Err(Error::Overloaded));
     // One generation: the first election succeeds, a retry cannot elect another waiter and fails
     // the cohort.
@@ -326,7 +340,7 @@ fn budget_gates() {
     );
     assert_eq!(join_budget_gate(now, later, 0, true), Ok(()));
     let limits = FlightLimits::default();
-    assert_eq!(Error::from(JoinReject::WaiterCap), Error::Overloaded);
+    assert_eq!(Error::from(JoinReject::WaiterCap), Error::FlightFull);
     assert_eq!(Error::from(JoinReject::Failed(Error::Io)), Error::Io);
     assert_eq!(entry_cap_gate(1023, &limits), Ok(()));
     assert_eq!(entry_cap_gate(1024, &limits), Err(Error::Overloaded));
@@ -459,7 +473,7 @@ fn operation_errors_and_completed_operation_settles_published_result() {
 }
 
 /// Production checks a waiter's scope before its recorded error: a rejected leader polled after
-/// its deadline reports `DeadlineExceeded`, and a canceled waiter stays `Cancelled`.
+/// its deadline reports `DeadlineExceeded`, and a canceled waiter stays `Canceled`.
 #[test]
 fn deadline_takes_precedence_over_recorded_rejection() {
     let mut f = fx();
@@ -469,7 +483,7 @@ fn deadline_takes_precedence_over_recorded_rejection() {
     f.cancel(23, b);
     assert_eq!(f.poll(23, a, 0, 1), failed(Error::OriginRejected));
     assert_eq!(f.poll(23, a, 1, 1), failed(Error::DeadlineExceeded));
-    assert_eq!(f.poll(23, b, 1, 2), failed(Error::Cancelled));
+    assert_eq!(f.poll(23, b, 1, 2), failed(Error::Canceled));
 }
 
 /// With handover allowed, an expired leader's running fill continues for the live waiter with the
@@ -545,10 +559,10 @@ fn handed_over_fill_deadline_retries_and_last_expiry_revokes() {
 fn handover_failure_retries_only_caller_scope_failures() {
     for (handed_over, failure, retry) in [
         (true, FailureKind::Terminal(Error::DeadlineExceeded), true),
-        (true, FailureKind::Terminal(Error::Cancelled), true),
+        (true, FailureKind::Terminal(Error::Canceled), true),
         (true, FailureKind::Terminal(Error::Io), false),
         (false, FailureKind::Terminal(Error::DeadlineExceeded), false),
-        (false, FailureKind::Terminal(Error::Cancelled), false),
+        (false, FailureKind::Terminal(Error::Canceled), false),
         (false, FailureKind::OriginRejected, true),
     ] {
         let now = Rc::new(Cell::new(Instant::now()));
@@ -633,7 +647,7 @@ fn copy_joins() {
     let a = f.waiter(3);
     assert_eq!(f.poll(3, a, 0, 1), Ok(Wait::Lead));
     let c = waiter(f.copy(3));
-    assert_eq!(f.copy(3), Err(Error::Overloaded));
+    assert_eq!(f.copy(3), Err(Error::FlightFull));
     assert_eq!(f.poll(3, c, 0, 2), Ok(Wait::Pending));
     // The leader goes away; the copy waiter cannot adopt or lead.
     f.t.abandon(&page(3), a, &mut f.wakes);

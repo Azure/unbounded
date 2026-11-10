@@ -61,7 +61,7 @@ func TestDaemonSetRuntimeContract(t *testing.T) {
 		"RACER_PEER_LISTEN":                "[$(RACER_POD_IP)]:8082",
 		"RACER_DIAGNOSTICS_LISTEN":         "[$(RACER_POD_IP)]:9090",
 		"RACER_OBJECT_IMAGE":               "registry.test/racer-object:v1",
-		"RACER_SERVICE_ACCOUNT_TOKEN":      "/var/run/racer-token/token",
+		"RACER_CONTROL_TOKEN":              "/var/run/racer-token/token",
 		"RACER_AZURE_FEDERATED_TOKEN_FILE": "/var/run/secrets/azure/tokens/azure-identity-token",
 	} {
 		if env[name].Value != value {
@@ -71,7 +71,7 @@ func TestDaemonSetRuntimeContract(t *testing.T) {
 
 	// The runtime derives the cluster from the state Secret and discovers
 	// seats through Leases; no controller wiring may remain.
-	for _, name := range []string{ControlSeatsKey, "RACER_CLUSTER_ID", "RACER_CONTROL_ENDPOINT", "RACER_TRUST_BUNDLE"} {
+	for _, name := range []string{ControlSeatsKey, "RACER_CLUSTER_ID", "RACER_CONTROL_ENDPOINT", "RACER_CONTROL_TRUST_BUNDLE"} {
 		if _, ok := env[name]; ok {
 			t.Fatalf("obsolete env %s present", name)
 		}

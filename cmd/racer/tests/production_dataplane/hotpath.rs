@@ -53,6 +53,7 @@ fn owned_plan(plan: &AffinityPlan) -> AffinityPlan {
         // Automatic mode already has room for the driver; finite caps need one
         // extra slot without changing any I/O-to-crypto assignments.
         max_threads: plan.max_threads.saturating_add(1),
+        owner_cpu: None,
     }
 }
 
@@ -110,7 +111,7 @@ struct Factory {
     resources: Resources,
     root: PathBuf,
     commands: Mutex<BTreeMap<u16, mpsc::Receiver<Command>>>,
-    directory: Arc<WorkerDirectory>,
+    directory: Arc<racer::read::dispatch::NodeDirectory>,
     slab_bytes: u64,
 }
 fn budgets() -> Limits {
@@ -128,7 +129,7 @@ impl Factory {
         &self,
         worker: WorkerId,
         runtime: WorkerRuntime,
-    ) -> Result<Box<dyn uring_runtime::group::Service<RequestScope>>> {
+    ) -> Result<Box<dyn racer::lifecycle::Service<RequestScope>>> {
         let rig = Rc::new(Rig::assemble(
             P,
             false,
@@ -138,7 +139,7 @@ impl Factory {
                 scratch: Scratch::under(&self.root),
                 runtime,
                 worker,
-                directory: self.directory.clone(),
+                directory: Rc::new(self.directory.view()),
                 slab_bytes: self.slab_bytes,
             }),
         ));
@@ -155,22 +156,19 @@ impl Factory {
         &self,
         _: WorkerId,
         runtime: CryptoRuntime,
-    ) -> Result<Box<dyn uring_runtime::group::Service<RequestScope>>> {
+    ) -> Result<Box<dyn racer::lifecycle::Service<RequestScope>>> {
         Ok(Box::new(PageCryptoEngine::new(runtime)))
     }
 }
-impl uring_runtime::group::Factory<RequestScope> for Factory {
-    fn build_lane(
-        &self,
-        lane: usize,
-    ) -> Result<Box<dyn uring_runtime::group::Service<RequestScope>>> {
+impl racer::lifecycle::Factory<RequestScope> for Factory {
+    fn build_lane(&self, lane: usize) -> Result<Box<dyn racer::lifecycle::Service<RequestScope>>> {
         self.resources
             .build_lane(lane, |worker, runtime| self.build(worker, runtime))
     }
     fn build_helper(
         &self,
         lane: usize,
-    ) -> Result<Box<dyn uring_runtime::group::Service<RequestScope>>> {
+    ) -> Result<Box<dyn racer::lifecycle::Service<RequestScope>>> {
         self.resources
             .build_helper(lane, |worker, runtime| self.build_crypto(worker, runtime))
     }
@@ -191,7 +189,6 @@ struct Service {
 }
 impl Service {
     fn poll(&mut self, cx: &mut Context<'_>) -> Result<()> {
-        let _queue = self.rig.drivers.enter();
         // WorkerGroup polls the reactor and crypto completions with its real waker.
         self.rig.endpoint.borrow_mut().poll(cx, 64)?;
         self.rig.flights.poll_with_context(cx, 64)?;
@@ -276,7 +273,9 @@ impl Service {
             && let Some((evict, reply)) = self.inspection.take()
         {
             if evict {
-                self.rig.memory.evict_idle(usize::MAX)?;
+                // Keep idle pooled buffers: shedding them would make every
+                // measured disk hit allocate fresh page storage.
+                self.rig.memory.evict_idle_entries(usize::MAX)?;
                 assert_eq!(self.rig.admission.used(ResourceClass::Plaintext), 0);
             }
             let entries = self.rig.writer.index().snapshot()?.entries.len();
@@ -291,12 +290,16 @@ impl Service {
         Ok(())
     }
 }
-impl uring_runtime::group::Service<RequestScope> for Service {
+impl racer::lifecycle::Service<RequestScope> for Service {
     fn start<'a>(&'a mut self, _: &'a RequestScope) -> Operation<'a, ()> {
         Box::pin(async { Ok(()) })
     }
     fn poll_budgeted(&mut self, cx: &mut Context<'_>, _: usize) -> Result<()> {
         self.poll(cx)
+    }
+    /// Fixture commands arrive on a std channel without a lane wake.
+    fn wait_timeout(&self, maximum: std::time::Duration) -> std::time::Duration {
+        maximum.min(std::time::Duration::from_millis(1))
     }
     fn stop_admission(&mut self) -> Result<()> {
         Ok(())
@@ -432,7 +435,7 @@ fn balanced_workload_covers_owners_without_multiplying_pages() {
 
 #[test]
 fn automatic_and_capped_plans_preserve_shared_and_explicit_paired_crypto() {
-    use uring_runtime::group::affinity::CpuLocation;
+    use racer::affinity::CpuLocation;
     let mut config = default_config();
     let topology = EffectiveTopology {
         cpus: (0..12)
@@ -505,13 +508,16 @@ fn shared_directory_routes_cold_and_offline_reads_to_both_owners() {
         })
         .collect();
     let factory = Arc::new(Factory {
-        resources: Resources::new(budgets(), ids.clone(), 1).unwrap(),
+        resources: Resources::new(budgets(), ids.clone(), 1, racer_io::WorkerCtx::host()).unwrap(),
         root: scratch.path.clone(),
         commands: Mutex::new(receivers),
-        directory: Arc::new(WorkerDirectory::new(map, ids, 256).unwrap()),
+        directory: Arc::new(
+            racer::read::dispatch::NodeDirectory::new(map, ids, 256, racer_io::WorkerCtx::host())
+                .unwrap(),
+        ),
         slab_bytes: 256 * MIB,
     });
-    let mut group = WorkerGroup::new(plan);
+    let mut group = WorkerGroup::new(plan, racer_io::WorkerCtx::host());
     group.start(factory, &scope()).unwrap();
     for (owner, key) in keys.iter().enumerate() {
         let mut client = connect(&commands[1 - owner]);
@@ -559,12 +565,119 @@ fn hotpath() {
     if std::env::var_os("RACER_BENCH_FAIL_SETUP").is_some() {
         panic!("requested cleanup probe");
     }
+    // Optional comma-separated `mode:concurrency` filter, e.g. `memory:32,disk:32`.
+    let cases = std::env::var("RACER_HOTPATH_CASES").ok();
     for mode in ["memory", "disk", "fill"] {
         for concurrency in [1, 32, 128] {
+            if let Some(cases) = &cases
+                && !cases
+                    .split(',')
+                    .any(|case| case == format!("{mode}:{concurrency}"))
+            {
+                continue;
+            }
             run_case(&disk.mount(), &plan, mode, concurrency);
         }
     }
     assert!(disk.close(), "brd teardown failed");
+}
+
+/// Allocations made by dataplane threads per warm memory hit and warm disk hit.
+///
+/// Counts are only meaningful in the `alloc_probe` test binary, which installs
+/// the counting global allocator. Client and driver threads are excluded. Each
+/// measured window is one GET plus one Inspect fence; the mean cost of a bare
+/// Inspect is measured separately and subtracted.
+#[test]
+#[ignore = "release-only allocation probe; run via the alloc_probe test binary"]
+fn warm_page_allocations() {
+    #[allow(clippy::assertions_on_constants)]
+    {
+        assert!(!cfg!(debug_assertions), "run with --release");
+    }
+    use super::counting_alloc;
+    counting_alloc::exclude_current_thread();
+    let rounds: usize = std::env::var("RACER_ALLOC_PROBE_ROUNDS")
+        .map_or(8, |value| value.parse().expect("unsigned rounds"));
+    const KEYS: usize = 8;
+    let mut plan = default_plan();
+    plan.pairs.truncate(1);
+    plan.max_threads = 3; // One I/O thread, one crypto thread, and the caller.
+    let ids = vec![WorkerId(0)];
+    let map = Arc::new(WorkerMap::new(ids.clone()).unwrap());
+    let keys = balanced_keys(&map, 1, KEYS);
+    let scratch = Scratch::new();
+    let (send, receive) = mpsc::sync_channel(256);
+    let commands = vec![send];
+    let factory = Arc::new(Factory {
+        resources: Resources::new(budgets(), ids.clone(), 1, racer_io::WorkerCtx::host()).unwrap(),
+        root: scratch.path.clone(),
+        commands: Mutex::new(BTreeMap::from([(0, receive)])),
+        directory: Arc::new(
+            racer::read::dispatch::NodeDirectory::new(map, ids, 256, racer_io::WorkerCtx::host())
+                .unwrap(),
+        ),
+        slab_bytes: 256 * MIB,
+    });
+    let mut group = WorkerGroup::new(plan, racer_io::WorkerCtx::host());
+    group.start(factory, &scope()).unwrap();
+    for key in &keys {
+        assert_eq!(get(&mut connect(&commands[0]), *key, true).unwrap(), 200);
+        inspect_all(&commands, false);
+    }
+    commands[0].send(Command::Offline).unwrap();
+    inspect_all(&commands, false);
+    let origin = inspect(&commands[0], false).origin_calls;
+    // One unmeasured warm sweep per mode settles lazily grown structures.
+    for key in &keys {
+        assert_eq!(get(&mut connect(&commands[0]), *key, false).unwrap(), 200);
+        inspect(&commands[0], true);
+        assert_eq!(get(&mut connect(&commands[0]), *key, false).unwrap(), 200);
+        inspect(&commands[0], false);
+    }
+    let window = |evict: bool, read: bool| {
+        let mut total = (0u64, 0u64);
+        for _ in 0..rounds {
+            for key in &keys {
+                if evict {
+                    inspect(&commands[0], true);
+                }
+                let before = counting_alloc::snapshot();
+                if read {
+                    assert_eq!(get(&mut connect(&commands[0]), *key, false).unwrap(), 200);
+                }
+                inspect(&commands[0], false);
+                let after = counting_alloc::snapshot();
+                total.0 += after.0 - before.0;
+                total.1 += after.1 - before.1;
+            }
+        }
+        let n = (rounds * KEYS) as f64;
+        (total.0 as f64 / n, total.1 as f64 / n)
+    };
+    let fence = window(false, false);
+    let memory = window(false, true);
+    let disk = window(true, true);
+    let stats = inspect(&commands[0], false);
+    assert_eq!(stats.origin_calls, origin, "warm probe contacted origin");
+    assert!(stats.failures.is_empty(), "{:?}", stats.failures);
+    assert!(
+        memory.0 > 0.0,
+        "counting allocator not installed; run the alloc_probe test binary"
+    );
+    println!(
+        "ALLOC_PROBE {{\"page_bytes\":{P},\"pages_per_mode\":{},\"fence_allocs\":{:.2},\"fence_bytes\":{:.1},\"memory_hit_allocs\":{:.2},\"memory_hit_bytes\":{:.1},\"disk_hit_allocs\":{:.2},\"disk_hit_bytes\":{:.1}}}",
+        rounds * KEYS,
+        fence.0,
+        fence.1,
+        memory.0 - fence.0,
+        memory.1 - fence.1,
+        disk.0 - fence.0,
+        disk.1 - fence.1,
+    );
+    group.drain(&scope()).unwrap();
+    group.shutdown(&scope()).unwrap();
+    group.join().unwrap();
 }
 
 fn run_case(root: &std::path::Path, default: &AffinityPlan, mode: &str, concurrency: usize) {
@@ -573,7 +686,15 @@ fn run_case(root: &std::path::Path, default: &AffinityPlan, mode: &str, concurre
     let ids: Vec<_> = default.pairs.iter().map(|pair| pair.worker).collect();
     let map = Arc::new(WorkerMap::new(ids.clone()).unwrap());
     let keys = balanced_keys(&map, workers, REQUESTS + workers);
-    let directory = Arc::new(WorkerDirectory::new(map, ids.clone(), 256).unwrap());
+    let directory = Arc::new(
+        racer::read::dispatch::NodeDirectory::new(
+            map,
+            ids.clone(),
+            256,
+            racer_io::WorkerCtx::host(),
+        )
+        .unwrap(),
+    );
     let mut receivers = BTreeMap::new();
     let commands: Vec<_> = ids
         .iter()
@@ -588,13 +709,13 @@ fn run_case(root: &std::path::Path, default: &AffinityPlan, mode: &str, concurre
     let plan = owned_plan(default);
     let crypto_threads = plan.crypto_groups().len();
     let factory = Arc::new(Factory {
-        resources: Resources::new(budgets(), ids.clone(), 1).unwrap(),
+        resources: Resources::new(budgets(), ids.clone(), 1, racer_io::WorkerCtx::host()).unwrap(),
         root: root.into(),
         commands: Mutex::new(receivers),
         directory,
         slab_bytes: slab_bytes(workers),
     });
-    let mut group = WorkerGroup::new(plan);
+    let mut group = WorkerGroup::new(plan, racer_io::WorkerCtx::host());
     group.start(factory, &scope()).unwrap();
     println!(
         "case={mode} concurrency={concurrency} io_shards={workers} crypto_threads={crypto_threads} worker_threads={} driver_threads=1 plaintext_MiB_per_worker=256 ciphertext_MiB_per_worker=512 dirty_MiB_per_worker=128 page_MiB=16",
@@ -963,4 +1084,4 @@ impl Drop for Brd {
         }
     }
 }
-use uring_runtime::group::affinity::EffectiveTopology;
+use racer::affinity::EffectiveTopology;

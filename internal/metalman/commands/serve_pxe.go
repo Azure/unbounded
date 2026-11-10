@@ -59,6 +59,7 @@ func ServePXECmd() *cobra.Command {
 		operationPollInterval          time.Duration
 		defaultNetbootImage            string
 		defaultNetbootPullSecret       string
+		experimentalContainerIsolation bool
 	)
 
 	cmd := &cobra.Command{
@@ -233,6 +234,8 @@ func ServePXECmd() *cobra.Command {
 				KubernetesVersion: kubeVersion,
 				ClusterDNS:        clusterDNS,
 				ProviderLabels:    providerLabels,
+
+				ExperimentalContainerIsolation: experimentalContainerIsolation,
 			}
 
 			directClient, err := client.New(cfg, client.Options{Scheme: mgr.GetScheme()})
@@ -264,6 +267,8 @@ func ServePXECmd() *cobra.Command {
 				MaxConcurrentMachines: operationMaxConcurrentMachines,
 				MaxAttempts:           operationMaxAttempts,
 				PollInterval:          operationPollInterval,
+
+				ExperimentalContainerIsolation: experimentalContainerIsolation,
 			}).SetupWithManager(mgr); err != nil {
 				return fmt.Errorf("setting up MachineOperation reconciler: %w", err)
 			}
@@ -362,6 +367,7 @@ func ServePXECmd() *cobra.Command {
 			PrintConfig("cache-dir", cacheDir)
 			PrintConfig("dhcp-interface", dhcpInterface)
 			PrintConfig("dhcp-port", fmt.Sprintf("%d", dhcpPort))
+			PrintConfig("experimental-container-isolation", fmt.Sprintf("%t", experimentalContainerIsolation))
 			fmt.Println()
 
 			if dhcpInterface != "" {
@@ -397,6 +403,9 @@ func ServePXECmd() *cobra.Command {
 	cmd.Flags().DurationVar(&operationPollInterval, "operation-poll-interval", 5*time.Second, "Poll interval for in-progress MachineOperations")
 	cmd.Flags().StringVar(&defaultNetbootImage, "default-netboot-image", DefaultNetbootImage, "Default OCI image containing PXE netboot artifacts")
 	cmd.Flags().StringVar(&defaultNetbootPullSecret, "default-netboot-pull-secret", "", "Namespaced Secret reference (namespace/name) for pulling the default netboot OCI image")
+	cmd.Flags().BoolVar(&experimentalContainerIsolation, "experimental-container-isolation", false,
+		"Enable the experimental container isolation mode: opt every agent configuration in (Experimental.ContainerIsolation); "+
+			"without it a Machine that declares spec.isolation container is not provisioned")
 
 	return cmd
 }

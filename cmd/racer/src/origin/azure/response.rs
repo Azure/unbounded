@@ -86,7 +86,7 @@ pub fn transport_error(error: Error) -> Error {
     match error {
         Error::Io | Error::Os(_) | Error::Unavailable => Error::Unavailable,
         Error::DeadlineExceeded
-        | Error::Cancelled
+        | Error::Canceled
         | Error::Overloaded
         | Error::OriginRejected
         | Error::OriginForbidden => error,
@@ -130,11 +130,12 @@ pub fn blob(head: &MessageHead, object: &AzureObject) -> Result<Blob> {
     {
         return Err(Error::Internal);
     }
-    let etag = StrongEtag::parse(field(head, "ETag")?.ok_or(Error::Internal)?)
-        .map_err(|_| Error::Internal)?;
+    // A missing or unparsable field is a malformed upstream response.
+    let etag = StrongEtag::parse(field(head, "ETag")?.ok_or(Error::BadGateway)?)
+        .map_err(|_| Error::BadGateway)?;
     let content_type = match field(head, "Content-Type")? {
         None | Some(b"") => None,
-        Some(value) => Some(ContentType::parse(value).map_err(|_| Error::Internal)?),
+        Some(value) => Some(ContentType::parse(value).map_err(|_| Error::BadGateway)?),
     };
     Ok(Blob {
         etag,
@@ -143,9 +144,10 @@ pub fn blob(head: &MessageHead, object: &AzureObject) -> Result<Blob> {
     })
 }
 
-/// Parse `Content-Range: bytes F-L/S` exactly as Go formats it.
+/// Parse `Content-Range: bytes F-L/S` exactly as Go formats it. A missing
+/// or malformed value is `BadGateway`.
 pub fn content_range(head: &MessageHead) -> Result<(u64, u64, u64)> {
-    let value = field(head, "Content-Range")?.ok_or(Error::Internal)?;
+    let value = field(head, "Content-Range")?.ok_or(Error::BadGateway)?;
     let parse = || -> Option<(u64, u64, u64)> {
         let value = value.strip_prefix(b"bytes ")?;
         let dash = value.iter().position(|b| *b == b'-')?;
@@ -158,7 +160,7 @@ pub fn content_range(head: &MessageHead) -> Result<(u64, u64, u64)> {
         let total = parse_decimal(&value[slash + 1..]).ok()?;
         (first <= last && last < total).then_some((first, last, total))
     };
-    parse().ok_or(Error::Internal)
+    parse().ok_or(Error::BadGateway)
 }
 
 #[cfg(test)]
@@ -267,7 +269,7 @@ mod tests {
         for error in [Error::Io, Error::Os(104), Error::Unavailable] {
             assert_eq!(transport_error(error), Error::Unavailable);
         }
-        for error in [Error::DeadlineExceeded, Error::Cancelled] {
+        for error in [Error::DeadlineExceeded, Error::Canceled] {
             assert_eq!(transport_error(error), error);
         }
         for error in [
@@ -313,10 +315,6 @@ mod tests {
                 "x-ms-blob-type",
                 "",
             ),
-            (&[], "ETag", ""),
-            (&[("ETag", b"W/\"weak\"")], "ETag", ""),
-            (&[("ETag", b"\"bad\"x\"")], "ETag", ""),
-            (&[("ETag", b"\"\"\"")], "ETag", ""),
             (&[("x-ms-access-tier", b"Archive")], "", ""),
             (
                 &[("x-ms-archive-status", b"rehydrate-pending-to-hot")],
@@ -324,7 +322,6 @@ mod tests {
                 "",
             ),
             (&[("Content-Encoding", b"gzip")], "", ""),
-            (&[("Content-Type", b"not a type")], "Content-Type", ""),
             (&[], "", "v1"),
             (&[("x-ms-version-id", b"v2")], "", "v1"),
         ] {
@@ -341,6 +338,11 @@ mod tests {
             (&[("Content-Length", b"5")], ""),
             (&[("Transfer-Encoding", b"chunked")], ""),
             (&[("ETag", b"\"other\"")], ""),
+            (&[], "ETag"),
+            (&[("ETag", b"W/\"weak\"")], "ETag"),
+            (&[("ETag", b"\"bad\"x\"")], "ETag"),
+            (&[("ETag", b"\"\"\"")], "ETag"),
+            (&[("Content-Type", b"not a type")], "Content-Type"),
         ] {
             assert_eq!(
                 super::blob(&with(extra, drop), &object("")).map(|_| ()),
@@ -373,11 +375,11 @@ mod tests {
         ] {
             assert_eq!(
                 range(bad),
-                Err(Error::Internal),
+                Err(Error::BadGateway),
                 "{}",
                 String::from_utf8_lossy(bad)
             );
         }
-        assert_eq!(content_range(&response(206, &[])), Err(Error::Internal));
+        assert_eq!(content_range(&response(206, &[])), Err(Error::BadGateway));
     }
 }

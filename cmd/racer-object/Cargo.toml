@@ -1,0 +1,31 @@
+[package]
+name = "racer-object"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96.0"
+license = "Apache-2.0"
+publish = false
+description = "S3 and Azure Blob compatible read-only sidecar that serves objects from a Racer cache"
+
+# A standalone workspace keeps this crate out of cmd/racer's workspace and
+# out of any parent manifest.
+[workspace]
+
+[lib]
+name = "racer_object"
+path = "src/lib.rs"
+
+[[bin]]
+name = "racer-object"
+path = "src/main.rs"
+
+[dependencies]
+httparse = "1.10"
+libc = "0.2"
+sha2 = "0.10"
+tokio = { version = "1.54", features = ["io-util", "macros", "net", "rt", "signal", "sync", "time"] }
+
+[profile.release]
+debug = 1
+lto = "fat"
+codegen-units = 1

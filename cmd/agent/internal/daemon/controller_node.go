@@ -21,8 +21,14 @@ import (
 	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
 	"github.com/Azure/unbounded/internal/machineconfigs"
 	"github.com/Azure/unbounded/internal/provision"
+	"github.com/Azure/unbounded/pkg/agent/isolation"
+	"github.com/Azure/unbounded/pkg/agent/isolation/migrate"
 )
 
+// ReconcileRepave brings the node to the desired configuration when its Node
+// is deleted. That includes the isolation mode the Machine declares in
+// spec.isolation: setting the field declares intent and takes effect here, at
+// the next repave, never immediately.
 func (r *repaveReconciler) ReconcileRepave(ctx context.Context, _ string) (reconcile.Result, error) {
 	lock, err := r.installation.AcquireMutationLock()
 	if errors.Is(err, installstate.ErrLockHeld) {
@@ -40,6 +46,23 @@ func (r *repaveReconciler) ReconcileRepave(ctx context.Context, _ string) (recon
 		return reconcile.Result{}, fmt.Errorf("find active machine: %w", err)
 	}
 
+	// A reprovision runs without this daemon, which it is about to remove.
+	// Nothing new starts until the daemon it installs takes over.
+	if r.handoff.active() {
+		r.log.Info("repave deferred: an isolation reprovision is resetting this host")
+
+		return reconcile.Result{}, nil
+	}
+
+	// A mode change an earlier daemon or reconcile left unfinished is settled
+	// and reported first.
+	if result, done := r.settleBeforeRepave(ctx); done {
+		return result, nil
+	}
+
+	skipChangeTo := r.skipChangeTo
+	r.skipChangeTo = ""
+
 	desiredConfig, appliedRef, err := resolveDesiredRepaveConfig(ctx, r.Client, r.machineName, active.Config)
 	if err != nil {
 		if apierrors.IsNotFound(err) || apimeta.IsNoMatchError(err) {
@@ -51,8 +74,46 @@ func (r *repaveReconciler) ReconcileRepave(ctx context.Context, _ string) (recon
 		return reconcile.Result{}, err
 	}
 
+	// One live check before anything this reconcile can start: a mode change,
+	// a repave in either mode, or the restart of a repave that keeps the mode.
+	// A declared mode change is drift, so it is checked too. A refusal leaves
+	// the running node alone and changes no mode. In the nspawn and none modes
+	// the unit guards check every start again. The experimental container mode
+	// has no unit guard, so its starts are checked only here, at NodeReboot and
+	// at bootstrap; it needs one before it leaves experimental.
+	if hasDrift(active.Config, &desiredConfig.AgentConfig) {
+		if err := verifyAllocationMachine(ctx, r.log, r.apiReader, active.Config, r.allocationLaunch); err != nil {
+			if errors.Is(err, errAllocationLaunchUnconfirmed) {
+				return reconcile.Result{RequeueAfter: allocationLaunchCheckTimeout}, nil
+			}
+
+			return reconcile.Result{}, nil
+		}
+	}
+
+	// A different declared mode is a mode change. When the change is not made
+	// now, the repave goes ahead in the mode the node runs, so version and
+	// configuration rollouts continue.
+	keptMode := false
+
+	if desiredMode := effectiveIsolation(&desiredConfig.AgentConfig); desiredMode != activeModeOf(active) {
+		strategy, ok := r.planIsolationChange(ctx, active, desiredMode, skipChangeTo)
+		if ok {
+			return r.changeIsolation(ctx, active, desiredConfig, strategy, appliedRef)
+		}
+
+		desiredConfig.Isolation = active.Config.Isolation
+		keptMode = true
+	}
+
 	if !hasDrift(active.Config, &desiredConfig.AgentConfig) {
 		r.log.Info("repave skipped because no desired configuration drift exists")
+
+		if keptMode {
+			// The Node was deleted for a change that is not being made, and no
+			// repave restarts the node stack, so make sure it registers again.
+			r.restoreNodeRegistration(ctx, active)
+		}
 
 		if err := markAppliedConfiguration(ctx, r.Client, r.machineName, appliedRef); err != nil {
 			return reconcile.Result{}, fmt.Errorf("mark applied configuration: %w", err)
@@ -85,6 +146,20 @@ func resolveDesiredRepaveConfig(
 
 	desired := configFromApplied(applied)
 
+	// spec.isolation declares the mode the node moves to. Empty is no
+	// declaration: the node keeps the mode it runs in.
+	if machine.Spec.Isolation != "" {
+		desired.Isolation = string(machine.Spec.Isolation)
+	}
+
+	// The download sources are not part of the applied agent config, so they
+	// come from the Machine every time: without them a repave, and the
+	// bootstrap after a reprovision, would fetch from the upstream defaults on
+	// a host that can only reach the mirrors the Machine names.
+	if machine.Spec.Agent != nil {
+		desired.Downloads = provision.AgentDownloadsFromSpec(machine.Spec.Agent.Downloads)
+	}
+
 	var appliedRef *v1alpha3.MachineConfigurationRefStatus
 
 	if machine.Spec.ConfigurationRef != nil {
@@ -102,6 +177,97 @@ func resolveDesiredRepaveConfig(
 	}
 
 	return &desired, appliedRef, nil
+}
+
+// planIsolationChange decides whether the declared mode change is made at this
+// repave and with which strategy. It reports false, after recording why in
+// status.isolationChange, when the change is not made: the target is a mode
+// this agent cannot run or cannot change a running node to, or the change
+// needs a reprovision and the Machine does not carry the allow-reprovision
+// opt-in. skipChangeTo is the target of a change that just failed, which is
+// not tried again in the same repave and is not reported again.
+func (r *repaveReconciler) planIsolationChange(ctx context.Context, active *ActiveMachine, target, skipChangeTo isolation.Mode) (migrate.Strategy, bool) {
+	current := activeModeOf(active)
+	keeps := fmt.Sprintf("it keeps running %q and the repave goes ahead in that mode", current)
+
+	if target == skipChangeTo {
+		r.log.Info("not trying the failed isolation change again in the same repave", "from", current, "to", target)
+
+		return "", false
+	}
+
+	if _, err := isolation.ParseMode(string(target)); err != nil {
+		r.refuseIsolationChange(ctx, current, target, "", v1alpha3.IsolationChangeReasonUnsupportedMode,
+			fmt.Sprintf("this agent cannot run isolation %q (%v); %s", target, err, keeps))
+
+		return "", false
+	}
+
+	// An experimental mode is reached only on a host whose applied agent
+	// configuration opts in to it.
+	if active.Config != nil {
+		if err := active.Config.CheckModeEnabled(target); err != nil {
+			r.refuseIsolationChange(ctx, current, target, "", v1alpha3.IsolationChangeReasonExperimentalNotEnabled,
+				fmt.Sprintf("%v; %s", err, keeps))
+
+			return "", false
+		}
+	}
+
+	strategy, err := migrate.Plan(current, target)
+	if err != nil {
+		r.refuseIsolationChange(ctx, current, target, "", v1alpha3.IsolationChangeReasonUnsupportedMode,
+			fmt.Sprintf("this agent cannot change the node to isolation %q (%v); %s", target, err, keeps))
+
+		return "", false
+	}
+
+	if strategy == migrate.Reprovision {
+		machine, err := getLocalMachine(ctx, r.Client, r.machineName)
+		if err != nil {
+			r.log.Warn("could not read the Machine to check the reprovision opt-in; not changing the isolation mode", "error", err)
+
+			return "", false
+		}
+
+		if !allowsReprovision(machine) {
+			r.refuseIsolationChange(ctx, current, target, v1alpha3.IsolationChangeReprovision, v1alpha3.IsolationChangeReasonReprovisionNotAllowed,
+				fmt.Sprintf("changing isolation mode %s to %s resets the host and bootstraps it again, which is not allowed on this Machine; "+
+					"set the annotation %s: \"true\" to allow it, then delete the Node to repave. Until then %s",
+					current, target, v1alpha3.AnnotationAllowReprovision, keeps))
+
+			return "", false
+		}
+	}
+
+	return strategy, true
+}
+
+// refuseIsolationChange reports a mode change that is not made in
+// status.isolationChange, as Failed with reason. The report is best effort:
+// the repave in the current mode goes ahead whether or not it lands.
+func (r *repaveReconciler) refuseIsolationChange(
+	ctx context.Context,
+	current, target isolation.Mode,
+	strategy v1alpha3.IsolationChangeStrategy,
+	reason, message string,
+) {
+	r.log.Warn("refusing isolation mode change", "from", current, "to", target, "reason", reason, "message", message)
+
+	err := patchIsolationStatus(ctx, r.Client, r.machineName, isolationStatus{
+		Applied: v1alpha3.IsolationMode(current),
+		Change: &v1alpha3.IsolationChangeStatus{
+			TargetMode:         v1alpha3.IsolationMode(target),
+			Phase:              v1alpha3.IsolationChangeFailed,
+			Strategy:           strategy,
+			Reason:             reason,
+			Message:            message,
+			LastTransitionTime: metav1.Now(),
+		},
+	})
+	if err != nil {
+		r.log.Warn("could not report the refused isolation change", "error", err)
+	}
 }
 
 func getLocalMachine(ctx context.Context, c client.Reader, machineName string) (*v1alpha3.Machine, error) {

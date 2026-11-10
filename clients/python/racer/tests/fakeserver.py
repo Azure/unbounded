@@ -174,7 +174,7 @@ class FakeRacer:
             self._error(conn, 400)
             return
         # Order follows the dataplane: RequestParser::parse
-        # (object-wire/src/client.rs), then direct::open_sink and
+        # (wire/src/object/client.rs), then direct::open_sink and
         # HostSink::open (src/client/direct.rs), then the object read.
         if mode and method != "POST":
             self._error(conn, 405)

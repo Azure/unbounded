@@ -170,9 +170,9 @@ func resolveMachine(
 		containerdVersion = ContainerdVersion
 	}
 
-	runcVersion := cfg.CRI.Runc.Version
-	if runcVersion == "" {
-		runcVersion = RunCVersion
+	runcVersion, err := resolveRunCVersion(log, kernel, cfg.CRI.Runc.Version, downloads)
+	if err != nil {
+		return nil, err
 	}
 
 	cniVersion := cfg.CNI.PluginVersion
@@ -202,9 +202,12 @@ func resolveMachine(
 		NSpawnLifecycle:        nspawnConfig.NSpawnLifecycle,
 	}
 
+	toolkit := nvidiaToolkitFor(cfg)
+
 	containerd := ResolveContainerd(ContainerdOptions{
 		SandboxImage:   sandboxImage,
 		NvidiaRequired: nspawnConfig.Nvidia.Required,
+		NvidiaToolkit:  toolkit,
 	})
 
 	nodeStart := &NodeStart{
@@ -217,6 +220,7 @@ func resolveMachine(
 		Kubelet:         kubelet,
 		LocalDNS:        localDNS,
 		Nvidia:          nvidia,
+		NvidiaToolkit:   toolkit,
 	}
 
 	return &MachineGoalState{

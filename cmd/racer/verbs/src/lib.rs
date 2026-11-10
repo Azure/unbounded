@@ -1,11 +1,19 @@
 //! Persistent RDMA links for a two-thread runtime: an I/O thread and a
 //! native thread.
 //!
-//! All RDMA (libibverbs) calls run on the native thread. The I/O thread never
-//! touches RDMA. It talks to the native thread through bounded command queues.
+//! All RDMA (libibverbs) calls run on the native thread, except pool memory
+//! registration (see below). The I/O thread never touches RDMA. It talks to
+//! the native thread through bounded command queues.
 //!
-//! This crate spawns no threads and runs no executor. Time and randomness come
-//! from the current `uring-runtime` environment.
+//! This crate runs no executor. Its only threads are short-lived helpers
+//! that pin and register page and device pools (`ibv_reg_mr`,
+//! `ibv_reg_dmabuf_mr`) so the owner keeps serving meanwhile, and a few
+//! reaper threads that destroy queue pairs and connection manager ids, paced,
+//! because those calls can hang in the kernel on a failing device (see
+//! `reaper.rs`); the RDMA
+//! connection manager is an event-driven state machine the owner advances
+//! when polled. Time and randomness come from the explicit
+//! `racer_io::WorkerCtx` passed to `Owner::new`.
 //!
 //! # Basics
 //!
@@ -13,8 +21,8 @@
 //! and one node-wide pool of registered page buffers per rail.
 //!
 //! 1. Call [`node()`] to get one [`Client`] per I/O worker and an [`OwnerPort`].
-//! 2. On the native thread, build the [`Owner`] and poll it, or host it in a
-//!    `uring-runtime` service with [`WithNative::with_host`].
+//! 2. On the native thread, build the [`Owner`] and poll it, or run it as
+//!    its own thread's role with [`OwnerRole`].
 //! 3. Call [`Client::activate`] with a [`NodeConfig`]. The owner finds RDMA
 //!    ports, your selector picks some, and each picked port gets a page pool.
 //! 4. Set up a link with [`Client::open`] and [`Client::accept`], exchanging
@@ -28,13 +36,26 @@
 //!
 //! # Direct sends
 //!
-//! Each device gets one implicit on-demand paging (ODP) MR over the whole
-//! address space. A [`Source`] write posts the caller's memory directly as
-//! its SGE; the owner holds the source `Arc` until the send completion, or
-//! until the QP is destroyed if the link breaks, and leaks it if destroy
-//! fails. Page buffers only receive. Activation fails with
-//! [`Error::Unavailable`] if a selected device lacks implicit ODP, and
-//! releases everything it built.
+//! A [`Source`] write posts the caller's memory directly; the owner holds the
+//! source `Arc` until the send completion, or until the QP is destroyed if
+//! the link breaks, and leaks it if destroy fails. Page buffers only receive.
+//!
+//! - Window mode (devices with memory windows, such as mlx5): each device
+//!   gets one implicit on-demand paging (ODP) MR over the whole address
+//!   space, and writes use it as their SGE. A source the NIC has not mapped
+//!   yet takes NIC page faults that stall its queue pair, so senders call
+//!   [`Client::prefetch`] first, on their own thread, to map it in one
+//!   kernel call. Activation fails with
+//!   [`Error::Unavailable`] if a selected device lacks implicit ODP, and
+//!   releases everything it built.
+//! - Registration mode (devices without memory windows or ODP, such as Azure
+//!   MANA): no ODP is needed. Each write registers its source while in
+//!   flight, each grant registers its buffer, and QPs connect through the
+//!   RDMA connection manager. [`NodeConfig::buffer_len`] must be a multiple
+//!   of 2 MiB.
+//!
+//! [`Owner::poll_fds`] returns the nonblocking completion and connection
+//! manager channel fds, for an owner thread that waits on them.
 //!
 //! # Stopping is the only fence
 //!
@@ -43,12 +64,22 @@
 //! it on purpose instead of freeing memory the NIC might still use. The
 //! [`NodeConfig`] guard leaks with it, so the leak counts against your limits.
 //!
+//! # Device loss
+//!
+//! A connection manager `DEVICE_REMOVAL` event (registration mode) breaks
+//! every link on the device's rail with [`BreakReason::DeviceLost`], fails
+//! their ops at once, and refuses new links on the rail for the rest of the
+//! round. [`Client::device_losses`] and [`Client::lost_rails`] report it; the
+//! caller closes the round and activates again once the device is back.
+//!
 //! # Shutdown and reuse
 //!
 //! [`Client::close`] breaks every link. The owner frees everything once no
 //! page is held. Once it has drained, [`Client::reopen`] can start a new
-//! round. [`WithNative`] adds a native host to a `uring-runtime` service so
-//! drain and fence also finish the native side.
+//! round. [`OwnerRole`] runs the owner on a dedicated thread, parked on its
+//! wake sources, and finishes once [`OwnerStop::stop`] was called and the
+//! owner drained. Drain waits for every page buffer to come back, however
+//! long that takes: the NIC may still own memory that is freed early.
 //!
 //! # Backends
 //!
@@ -58,7 +89,9 @@
 //!
 //! # Limits
 //!
-//! - At most 64 ports. Uses GID index 0.
+//! - At most 64 ports. Window mode uses GID index 0; registration mode uses
+//!   the port's IPv4-mapped RoCE GID, whose address the connection manager
+//!   listens on (port `RACER_RDMA_CM_PORT`, else 18515).
 //! - Poll budgets count steps, not time. A slow NIC call blocks the thread.
 //! - The caller owns auth, topology, admission sizing, retries, and timeouts.
 //!
@@ -69,15 +102,19 @@ mod ffi;
 mod link;
 mod node;
 mod pool;
+mod reaper;
+mod role;
 
 pub use channel::Op;
 pub use ffi::Endpoint;
 pub use link::{Arrival, DirectBytes, Epoch, Granted, Source};
 pub use node::{
-    BACKOFF_MAX, BACKOFF_MIN, BACKOFF_RESET, COMMAND_QUEUE, Client, LinkKey, LinkSelector,
-    LinkState, NodeConfig, Opened, Owner, OwnerPort, SETUP_TIMEOUT, Setup, node,
+    BACKOFF_MAX, BACKOFF_MIN, BACKOFF_RESET, BreakReason, COMMAND_QUEUE, Client, DrainBlocker,
+    EXPOSED_GRACE, ImmediateWake, LinkCounts, LinkKey, LinkSelector, LinkState, NodeConfig, Opened,
+    Owner, OwnerLoop, OwnerPort, SETUP_TIMEOUT, Setup, node,
 };
 pub use pool::{BufferState, DevicePage, RegisteredPage};
+pub use role::{DRAIN_REPORT, OwnerRole, OwnerStop};
 
 #[cfg(any(test, feature = "simulation"))]
 pub use ffi::simulation;
@@ -86,10 +123,14 @@ pub mod discovery;
 
 /// List RDMA ports on this host. Opens and closes devices on this thread.
 ///
+/// Starts no connection manager listener, so it lists a registration-mode
+/// port that an active owner on this host is listening on, too.
+///
 /// Returns [`Error::Unavailable`] with no RDMA backend. Use
-/// [`discovery::inventory_at`] to fill in NUMA info.
+/// [`discovery::inventory_at`] to fill in NUMA info. Rail labels and port
+/// selection are the caller's policy.
 pub fn inventory() -> Result<Vec<PortInfo>> {
-    Ok(ffi::discover()?
+    Ok(ffi::discover_ports()?
         .iter()
         .map(|device| PortInfo {
             device: device.name.clone(),
@@ -161,7 +202,7 @@ pub enum Error {
     DeadlineExceeded,
 
     /// Canceled before it finished.
-    Cancelled,
+    Canceled,
 
     /// An RDMA call failed, or a lock was poisoned.
     Io,
@@ -205,38 +246,6 @@ pub struct Selection {
     pub port: PortInfo,
 }
 
-/// A `uring-runtime` service with a [`NativeHost`] attached.
-///
-/// - Poll: polls both with the same budget.
-/// - Stop admission: only the inner service. Native work keeps going.
-/// - Drain and fence: close the native side, then drive it and the inner
-///   drain or fence together until both finish. The native side always
-///   drains fully, even if the scope has expired or the inner side failed.
-///   Driving them together matters: inner work (such as a queued crypto job)
-///   can own a pool buffer the native side waits for.
-/// - Close: closes both, native first.
-pub struct WithNative<T, N> {
-    inner: T,
-
-    native: N,
-}
-
-/// A native-thread service [`WithNative`] can host, such as the link
-/// [`Owner`].
-pub trait NativeHost {
-    /// Wake `waker` when the I/O side has work.
-    fn register_driver(&self, waker: &Waker);
-
-    /// Do up to `budget` steps of work.
-    fn poll_budgeted(&mut self, budget: usize) -> Result<()>;
-
-    /// Start shutdown. Does not wait.
-    fn close(&self);
-
-    /// True once shutdown finished.
-    fn drained(&self) -> bool;
-}
-
 impl Endpoint {
     /// Size of the wire encoding.
     pub const ENCODED_LEN: usize = 32;
@@ -273,131 +282,10 @@ impl Endpoint {
     }
 }
 
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    task::{Context, Poll, Waker},
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
 };
-
-use uring_runtime::{
-    Operation, Scope,
-    group::{FailureReporter, Service},
-};
-
-impl<T, N: NativeHost> WithNative<T, N> {
-    /// Wrap `inner` with an already built native host, for example an
-    /// [`Owner`]. Call on the native thread.
-    pub fn with_host(inner: T, native: N) -> Self {
-        Self { inner, native }
-    }
-}
-
-impl<S: Scope, T: Service<S>, N: NativeHost> Service<S> for WithNative<T, N>
-where
-    S::Error: From<Error>,
-{
-    /// Pass through to the inner service.
-    fn set_failure_reporter(&mut self, reporter: FailureReporter<S::Error>) {
-        self.inner.set_failure_reporter(reporter);
-    }
-
-    /// Pass through to the inner service.
-    fn waker(&self) -> std::result::Result<Waker, S::Error> {
-        self.inner.waker()
-    }
-
-    /// Register `waker` with both.
-    fn register_driver(&self, waker: &Waker) {
-        self.inner.register_driver(waker);
-        self.native.register_driver(waker);
-    }
-
-    /// Drive native activation while the inner service starts.
-    fn start<'a>(&'a mut self, scope: &'a S) -> Operation<'a, (), S::Error> {
-        let mut startup = self.inner.start(scope);
-        let native = &mut self.native;
-        Box::pin(std::future::poll_fn(move |cx| {
-            native.register_driver(cx.waker());
-            native.poll_budgeted(1)?;
-            startup.as_mut().poll(cx)
-        }))
-    }
-
-    /// Poll the inner service, then the native side, each with `budget`.
-    fn poll_budgeted(
-        &mut self,
-        cx: &mut Context<'_>,
-        budget: usize,
-    ) -> std::result::Result<(), S::Error> {
-        self.inner.poll_budgeted(cx, budget)?;
-        self.native.poll_budgeted(budget).map_err(Into::into)
-    }
-
-    /// Pass through to the inner service.
-    fn wait_timeout(&self, maximum: std::time::Duration) -> std::time::Duration {
-        self.inner.wait_timeout(maximum)
-    }
-
-    /// Stop the inner service only. Native work keeps going.
-    fn stop_admission(&mut self) -> std::result::Result<(), S::Error> {
-        self.inner.stop_admission()
-    }
-
-    /// Drain the native side and the inner service together.
-    fn drain<'a>(&'a mut self, scope: &'a S) -> Operation<'a, (), S::Error> {
-        let inner = self.inner.drain(scope);
-        close_alongside(&mut self.native, inner)
-    }
-
-    /// Close the native side, then the inner service.
-    fn close(&mut self) -> std::result::Result<(), S::Error> {
-        self.native.close();
-        self.inner.close()
-    }
-
-    /// Drain the native side and fence the inner service together.
-    fn fence<'a>(&'a mut self, scope: &'a S) -> Operation<'a, (), S::Error> {
-        let inner = self.inner.fence(scope);
-        close_alongside(&mut self.native, inner)
-    }
-
-    /// Pass through to the inner service.
-    fn shutdown<'a>(&'a mut self, scope: &'a S) -> Operation<'a, (), S::Error> {
-        self.inner.shutdown(scope)
-    }
-}
-
-/// Close `native`, then poll it and `inner` until both finish. Ignores scope
-/// deadlines for the native side: the NIC must be stopped before memory is
-/// freed, so an inner error is held until the native side has drained. A
-/// native error returns at once, as before.
-fn close_alongside<'a, N: NativeHost, E: From<Error> + 'a>(
-    native: &'a mut N,
-    mut inner: Operation<'a, (), E>,
-) -> Operation<'a, (), E> {
-    native.close();
-    let mut outcome: Option<std::result::Result<(), E>> = None;
-    Box::pin(std::future::poll_fn(move |cx| {
-        native.register_driver(cx.waker());
-        if outcome.is_none()
-            && let Poll::Ready(result) = inner.as_mut().poll(cx)
-        {
-            outcome = Some(result);
-        }
-        // Poll after the inner side so buffers it just returned count.
-        native.poll_budgeted(1)?;
-        if !native.drained() {
-            // Relies on the runtime's periodic ticks to retry.
-            return Poll::Pending;
-        }
-        match outcome.take() {
-            Some(result) => Poll::Ready(result),
-            None => Poll::Pending,
-        }
-    }))
-}
 
 /// Our own `Arc` around a caller's [`Guard`].
 ///

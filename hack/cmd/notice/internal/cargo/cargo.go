@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package cargo implements a notice.Collector for direct non-development
-// dependencies of cmd/racer.
+// dependencies of the Rust crates under cmd/ (the cmd/racer workspace and the
+// standalone cmd/racer-object crate).
 package cargo
 
 import (
@@ -25,6 +26,19 @@ const (
 	cratePath = "cmd/racer"
 	crateName = "racer"
 )
+
+// crateRoot is one Cargo workspace or standalone crate with its own lock file.
+type crateRoot struct {
+	path string
+	name string
+}
+
+// crateRoots lists every Cargo root whose direct dependencies ship in an image.
+// A root with neither Cargo.toml nor Cargo.lock is skipped.
+var crateRoots = []crateRoot{
+	{path: cratePath, name: crateName},
+	{path: "cmd/racer-object", name: "racer-object"},
+}
 
 // Collector reads Cargo.toml and Cargo.lock locally and obtains license text
 // from Cargo's populated registry source cache.
@@ -53,18 +67,9 @@ func (c *Collector) Name() string { return "cargo" }
 
 // Precheck implements notice.Collector.
 func (c *Collector) Precheck(root string) error {
-	present, err := cargoFilesPresent(root)
-	if err != nil || !present {
+	versions, err := allVersions(root)
+	if err != nil || len(versions) == 0 {
 		return err
-	}
-
-	versions, err := workspaceVersions(root)
-	if err != nil {
-		return err
-	}
-
-	if len(versions) == 0 {
-		return nil
 	}
 
 	home, err := c.home()
@@ -73,7 +78,7 @@ func (c *Collector) Precheck(root string) error {
 	}
 
 	if _, err := os.Stat(filepath.Join(home, "registry", "src")); err != nil {
-		return fmt.Errorf("cargo registry source cache not found; run 'cargo fetch --manifest-path %s/Cargo.toml --locked' first (%w)", cratePath, err)
+		return fmt.Errorf("cargo registry source cache not found; run 'cargo fetch --locked --manifest-path <crate>/Cargo.toml' for %s first (%w)", rootPaths(), err)
 	}
 
 	return nil
@@ -81,21 +86,16 @@ func (c *Collector) Precheck(root string) error {
 
 // Collect implements notice.Collector.
 func (c *Collector) Collect(root string) ([]notice.Entry, error) {
-	present, err := cargoFilesPresent(root)
-	if err != nil || !present {
-		return nil, err
-	}
-
-	versions, err := workspaceVersions(root)
+	versions, err := allVersions(root)
 	if err != nil {
 		return nil, err
 	}
 
 	entries := make([]notice.Entry, 0, len(versions))
-	for name, version := range versions {
-		entry, err := c.buildEntry(name, version)
+	for _, v := range versions {
+		entry, err := c.buildEntry(v.name, v.version)
 		if err != nil {
-			return nil, fmt.Errorf("crate %s@%s: %w", name, version, err)
+			return nil, fmt.Errorf("crate %s@%s: %w", v.name, v.version, err)
 		}
 
 		entries = append(entries, entry)
@@ -104,8 +104,65 @@ func (c *Collector) Collect(root string) ([]notice.Entry, error) {
 	return entries, nil
 }
 
-// cargoFilesPresent reports whether Cargo inputs exist, and rejects incomplete inputs.
-func cargoFilesPresent(root string) (bool, error) {
+type crateVersion struct {
+	name    string
+	version string
+}
+
+func rootPaths() string {
+	paths := make([]string, 0, len(crateRoots))
+	for _, r := range crateRoots {
+		paths = append(paths, r.path)
+	}
+
+	return strings.Join(paths, ", ")
+}
+
+// allVersions merges the direct dependencies of every present crate root,
+// deduplicated by name and version. A crate locked at different versions in
+// different roots yields one entry per version.
+func allVersions(root string) ([]crateVersion, error) {
+	seen := map[crateVersion]bool{}
+
+	var out []crateVersion
+
+	for _, r := range crateRoots {
+		present, err := cargoFilesPresentAt(root, r.path)
+		if err != nil {
+			return nil, err
+		}
+
+		if !present {
+			continue
+		}
+
+		versions, err := workspaceVersionsAt(root, r.path, r.name)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", r.path, err)
+		}
+
+		names := make([]string, 0, len(versions))
+		for name := range versions {
+			names = append(names, name)
+		}
+
+		sort.Strings(names)
+
+		for _, name := range names {
+			v := crateVersion{name: name, version: versions[name]}
+			if !seen[v] {
+				seen[v] = true
+				out = append(out, v)
+			}
+		}
+	}
+
+	return out, nil
+}
+
+// cargoFilesPresentAt reports whether the Cargo inputs of the crate at cratePath exist, and rejects
+// incomplete inputs.
+func cargoFilesPresentAt(root, cratePath string) (bool, error) {
 	missing := make([]string, 0, 2)
 
 	for _, name := range []string{"Cargo.toml", "Cargo.lock"} {

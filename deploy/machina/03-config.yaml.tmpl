@@ -24,3 +24,9 @@ data:
     # both reachability probes and SSH provisioning, so when workers are busy
     # provisioning, reachability probes for other machines are delayed.
     maxConcurrentReconciles: 50
+
+    # Enable the experimental container isolation mode (spec.isolation:
+    # container). When false, machina refuses to provision a Machine that
+    # declares it. When true, every agent configuration machina provisions
+    # opts in to the mode.
+    experimentalContainerIsolation: {{ default "false" .ExperimentalContainerIsolation }}

@@ -39,6 +39,38 @@ notices:
         link: https://docs.rs/crate/aes/0.9.3/source/LICENSE-APACHE
       - name: MIT License
         link: https://docs.rs/crate/aes/0.9.3/source/LICENSE-MIT
+  - dependency: aws-lc-rs
+    ecosystem: cargo
+    copyright:
+      - See LICENSE file
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/aws-lc-rs/1.19.0/source/LICENSE
+      - name: ISC License
+        link: https://docs.rs/crate/aws-lc-rs/1.19.0/source/LICENSE
+  - dependency: aws-lc-sys
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2014-2024 Google Inc.
+      - Copyright (c) 2025-2026 Google Inc.
+      - Copyright (c) 1998-2011 The OpenSSL Project. All rights reserved.
+      - Copyright (c) 1995-1998 Eric Young (eay@cryptsoft.com). All rights reserved.
+      - Copyright (c) The mlkem-native project authors.
+      - Copyright (c) The mldsa-native project authors.
+      - Copyright (c) 2015-2020 the fiat-crypto authors.
+      - Copyright 2008 Google Inc.
+      - Copyright (c) The Go Authors. All rights reserved.
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/aws-lc-sys/0.47.0/source/LICENSE
+      - name: ISC License
+        link: https://docs.rs/crate/aws-lc-sys/0.47.0/source/LICENSE
+      - name: MIT License
+        link: https://docs.rs/crate/aws-lc-sys/0.47.0/source/LICENSE
+      - name: BSD 3-Clause License
+        link: https://docs.rs/crate/aws-lc-sys/0.47.0/source/LICENSE
+      - name: MIT No Attribution License
+        link: https://docs.rs/crate/aws-lc-sys/0.47.0/source/LICENSE
   - dependency: base64
     ecosystem: cargo
     copyright:
@@ -75,15 +107,6 @@ notices:
         link: https://docs.rs/crate/cipher/0.5.2/source/LICENSE-APACHE
       - name: MIT License
         link: https://docs.rs/crate/cipher/0.5.2/source/LICENSE-MIT
-  - dependency: crc64fast
-    ecosystem: cargo
-    copyright:
-      - Copyright 2019 TiKV Project Authors
-    license:
-      - name: Apache License, Version 2.0
-        link: https://docs.rs/crate/crc64fast/1.1.0/source/LICENSE-Apache
-      - name: MIT License
-        link: https://docs.rs/crate/crc64fast/1.1.0/source/LICENSE-MIT
   - dependency: d3-scale
     ecosystem: npm
     copyright:
@@ -98,13 +121,6 @@ notices:
     license:
       - name: BSD 3-Clause License
         link: https://docs.rs/crate/ed25519-dalek/2.2.0/source/LICENSE
-  - dependency: envy
-    ecosystem: cargo
-    copyright:
-      - Copyright (c) 2016-2019 Doug Tangren
-    license:
-      - name: MIT License
-        link: https://docs.rs/crate/envy/0.4.2/source/LICENSE
   - dependency: futures
     ecosystem: cargo
     copyright:
@@ -125,6 +141,15 @@ notices:
         link: https://docs.rs/crate/getrandom/0.2.17/source/LICENSE-APACHE
       - name: MIT License
         link: https://docs.rs/crate/getrandom/0.2.17/source/LICENSE-MIT
+  - dependency: ghash
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2019-2026 The RustCrypto Project Developers
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/ghash/0.6.0/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/ghash/0.6.0/source/LICENSE-MIT
   - dependency: github.com/Azure/azure-sdk-for-go/sdk/azcore
     ecosystem: go
     copyright:
@@ -265,35 +290,35 @@ notices:
       - Copyright 2014-2015 Stripe, Inc.
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/aws/aws-sdk-go-v2/blob/v1.47.4/LICENSE.txt
+        link: https://github.com/aws/aws-sdk-go-v2/blob/v1.47.5/LICENSE.txt
   - dependency: github.com/aws/aws-sdk-go-v2/config
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/aws/aws-sdk-go-v2/blob/config/v1.33.10/LICENSE.txt
+        link: https://github.com/aws/aws-sdk-go-v2/blob/config/v1.33.13/LICENSE.txt
   - dependency: github.com/aws/aws-sdk-go-v2/credentials
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/aws/aws-sdk-go-v2/blob/credentials/v1.20.10/LICENSE.txt
+        link: https://github.com/aws/aws-sdk-go-v2/blob/credentials/v1.20.13/LICENSE.txt
   - dependency: github.com/aws/aws-sdk-go-v2/service/s3
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/aws/aws-sdk-go-v2/blob/service/s3/v1.114.5/LICENSE.txt
+        link: https://github.com/aws/aws-sdk-go-v2/blob/service/s3/v1.114.6/LICENSE.txt
   - dependency: github.com/aws/smithy-go
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/aws/smithy-go/blob/v1.28.6/LICENSE
+        link: https://github.com/aws/smithy-go/blob/v1.28.7/LICENSE
   - dependency: github.com/bougou/go-ipmi
     ecosystem: go
     copyright:
@@ -331,6 +356,13 @@ notices:
     license:
       - name: Apache License, Version 2.0
         link: https://github.com/containerd/containerd/blob/v2.4.2/LICENSE
+  - dependency: github.com/containerd/continuity
+    ecosystem: go
+    copyright:
+      - See LICENSE file
+    license:
+      - name: Apache License, Version 2.0
+        link: https://github.com/containerd/continuity/blob/v0.5.0/LICENSE
   - dependency: github.com/containerd/errdefs
     ecosystem: go
     copyright:
@@ -373,6 +405,13 @@ notices:
     license:
       - name: Apache License, Version 2.0
         link: https://github.com/coreos/go-iptables/blob/v0.8.0/LICENSE
+  - dependency: github.com/distribution/reference
+    ecosystem: go
+    copyright:
+      - See LICENSE file
+    license:
+      - name: Apache License, Version 2.0
+        link: https://github.com/distribution/reference/blob/v0.6.0/LICENSE
   - dependency: github.com/dustin/go-humanize
     ecosystem: go
     copyright:
@@ -500,6 +539,22 @@ notices:
     license:
       - name: MIT License
         link: https://github.com/ipfs/go-datastore/blob/v0.9.2/LICENSE
+  - dependency: github.com/klauspost/compress
+    ecosystem: go
+    copyright:
+      - Copyright (c) 2012 The Go Authors. All rights reserved.
+      - Copyright (c) 2019 Klaus Post. All rights reserved.
+      - Copyright 2016-2017 The New York Times Company
+      - Copyright (c) 2015 Klaus Post
+      - Copyright (c) 2011 The Snappy-Go Authors. All rights reserved.
+      - Copyright 2016 The filepathx Authors
+    license:
+      - name: BSD 3-Clause License
+        link: https://github.com/klauspost/compress/blob/v1.20.2/LICENSE
+      - name: Apache License, Version 2.0
+        link: https://github.com/klauspost/compress/blob/v1.20.2/LICENSE
+      - name: MIT License
+        link: https://github.com/klauspost/compress/blob/v1.20.2/LICENSE
   - dependency: github.com/lib/pq
     ecosystem: go
     copyright:
@@ -513,14 +568,14 @@ notices:
       - Copyright (c) 2014 Juan Batiz-Benet
     license:
       - name: MIT License
-        link: https://github.com/libp2p/go-libp2p/blob/v0.49.0/LICENSE
+        link: https://github.com/libp2p/go-libp2p/blob/v0.50.0/LICENSE
   - dependency: github.com/libp2p/go-libp2p-kad-dht
     ecosystem: go
     copyright:
       - Copyright (c) 2016 Protocol Labs, Inc.
     license:
       - name: MIT License
-        link: https://github.com/libp2p/go-libp2p-kad-dht/blob/v0.42.2/LICENSE
+        link: https://github.com/libp2p/go-libp2p-kad-dht/blob/v0.43.0/LICENSE
   - dependency: github.com/libp2p/go-msgio
     ecosystem: go
     copyright:
@@ -571,6 +626,13 @@ notices:
     license:
       - name: MIT License
         link: https://github.com/pelletier/go-toml/blob/v2.4.3/LICENSE
+  - dependency: github.com/pierrec/lz4/v4
+    ecosystem: go
+    copyright:
+      - Copyright (c) 2015, Pierre Curto
+    license:
+      - name: BSD 3-Clause License
+        link: https://github.com/pierrec/lz4/blob/v4.1.28/LICENSE
   - dependency: github.com/pin/tftp/v3
     ecosystem: go
     copyright:
@@ -607,7 +669,7 @@ notices:
       - Copyright 2015 The Prometheus Authors
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/prometheus/common/blob/v0.72.1/LICENSE
+        link: https://github.com/prometheus/common/blob/v0.73.1/LICENSE
   - dependency: github.com/spf13/cobra
     ecosystem: go
     copyright:
@@ -659,45 +721,45 @@ notices:
       - Copyright 2009 The Go Authors.
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/open-telemetry/opentelemetry-go-contrib/blob/instrumentation/net/http/otelhttp/v0.71.0/LICENSE
+        link: https://github.com/open-telemetry/opentelemetry-go-contrib/blob/instrumentation/net/http/otelhttp/v0.72.0/LICENSE
       - name: BSD 3-Clause License
-        link: https://github.com/open-telemetry/opentelemetry-go-contrib/blob/instrumentation/net/http/otelhttp/v0.71.0/LICENSE
+        link: https://github.com/open-telemetry/opentelemetry-go-contrib/blob/instrumentation/net/http/otelhttp/v0.72.0/LICENSE
   - dependency: go.opentelemetry.io/otel
     ecosystem: go
     copyright:
       - Copyright 2009 The Go Authors.
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/open-telemetry/opentelemetry-go/blob/v1.46.0/LICENSE
+        link: https://github.com/open-telemetry/opentelemetry-go/blob/v1.47.0/LICENSE
       - name: BSD 3-Clause License
-        link: https://github.com/open-telemetry/opentelemetry-go/blob/v1.46.0/LICENSE
+        link: https://github.com/open-telemetry/opentelemetry-go/blob/v1.47.0/LICENSE
   - dependency: go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc
     ecosystem: go
     copyright:
       - Copyright 2009 The Go Authors.
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/open-telemetry/opentelemetry-go/blob/exporters/otlp/otlptrace/otlptracegrpc/v1.46.0/LICENSE
+        link: https://github.com/open-telemetry/opentelemetry-go/blob/exporters/otlp/otlptrace/otlptracegrpc/v1.47.0/LICENSE
       - name: BSD 3-Clause License
-        link: https://github.com/open-telemetry/opentelemetry-go/blob/exporters/otlp/otlptrace/otlptracegrpc/v1.46.0/LICENSE
+        link: https://github.com/open-telemetry/opentelemetry-go/blob/exporters/otlp/otlptrace/otlptracegrpc/v1.47.0/LICENSE
   - dependency: go.opentelemetry.io/otel/sdk
     ecosystem: go
     copyright:
       - Copyright 2009 The Go Authors.
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/open-telemetry/opentelemetry-go/blob/sdk/v1.46.0/LICENSE
+        link: https://github.com/open-telemetry/opentelemetry-go/blob/sdk/v1.47.0/LICENSE
       - name: BSD 3-Clause License
-        link: https://github.com/open-telemetry/opentelemetry-go/blob/sdk/v1.46.0/LICENSE
+        link: https://github.com/open-telemetry/opentelemetry-go/blob/sdk/v1.47.0/LICENSE
   - dependency: go.opentelemetry.io/otel/trace
     ecosystem: go
     copyright:
       - Copyright 2009 The Go Authors.
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/open-telemetry/opentelemetry-go/blob/trace/v1.46.0/LICENSE
+        link: https://github.com/open-telemetry/opentelemetry-go/blob/trace/v1.47.0/LICENSE
       - name: BSD 3-Clause License
-        link: https://github.com/open-telemetry/opentelemetry-go/blob/trace/v1.46.0/LICENSE
+        link: https://github.com/open-telemetry/opentelemetry-go/blob/trace/v1.47.0/LICENSE
   - dependency: golang.org/x/crypto
     ecosystem: go
     copyright:
@@ -753,7 +815,7 @@ notices:
       - Copyright 2014 gRPC authors.
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/grpc/grpc-go/blob/v1.84.0/LICENSE
+        link: https://github.com/grpc/grpc-go/blob/v1.85.0/LICENSE
   - dependency: google.golang.org/protobuf
     ecosystem: go
     copyright:
@@ -797,35 +859,42 @@ notices:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/kubernetes/api/blob/v0.37.1/LICENSE
+        link: https://github.com/kubernetes/api/blob/v0.37.2/LICENSE
   - dependency: k8s.io/apiextensions-apiserver
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/kubernetes/apiextensions-apiserver/blob/v0.37.1/LICENSE
+        link: https://github.com/kubernetes/apiextensions-apiserver/blob/v0.37.2/LICENSE
   - dependency: k8s.io/apimachinery
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/kubernetes/apimachinery/blob/v0.37.1/LICENSE
+        link: https://github.com/kubernetes/apimachinery/blob/v0.37.2/LICENSE
+  - dependency: k8s.io/apiserver
+    ecosystem: go
+    copyright:
+      - See LICENSE file
+    license:
+      - name: Apache License, Version 2.0
+        link: https://github.com/kubernetes/apiserver/blob/v0.37.2/LICENSE
   - dependency: k8s.io/cli-runtime
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/kubernetes/cli-runtime/blob/v0.37.1/LICENSE
+        link: https://github.com/kubernetes/cli-runtime/blob/v0.37.2/LICENSE
   - dependency: k8s.io/client-go
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/kubernetes/client-go/blob/v0.37.1/LICENSE
+        link: https://github.com/kubernetes/client-go/blob/v0.37.2/LICENSE
   - dependency: k8s.io/klog/v2
     ecosystem: go
     copyright:
@@ -839,7 +908,7 @@ notices:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/kubernetes/kube-aggregator/blob/v0.37.1/LICENSE
+        link: https://github.com/kubernetes/kube-aggregator/blob/v0.37.2/LICENSE
   - dependency: k8s.io/utils
     ecosystem: go
     copyright:
@@ -856,13 +925,22 @@ notices:
         link: https://docs.rs/crate/libc/0.2.190/source/LICENSE-APACHE
       - name: MIT License
         link: https://docs.rs/crate/libc/0.2.190/source/LICENSE-MIT
+  - dependency: libc
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) The Rust Project Developers
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/libc/0.2.191/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/libc/0.2.191/source/LICENSE-MIT
   - dependency: modernc.org/sqlite
     ecosystem: go
     copyright:
       - Copyright (c) 2017 The Sqlite Authors. All rights reserved.
     license:
       - name: BSD 3-Clause License
-        link: https://gitlab.com/cznic/sqlite/-/blob/v1.61.0/LICENSE
+        link: https://gitlab.com/cznic/sqlite/-/blob/v1.61.1/LICENSE
   - dependency: oras.land/oras-go/v2
     ecosystem: go
     copyright:
@@ -918,21 +996,6 @@ notices:
         link: https://docs.rs/crate/regex/1.13.1/source/LICENSE-APACHE
       - name: MIT License
         link: https://docs.rs/crate/regex/1.13.1/source/LICENSE-MIT
-  - dependency: ring
-    ecosystem: cargo
-    copyright:
-      - Copyright (c) 2009 The Go Authors. All rights reserved.
-      - Copyright 2015 The Chromium Authors. All rights reserved.
-      - Copyright 2015-2025 Brian Smith.
-    license:
-      - name: Apache License, Version 2.0
-        link: https://docs.rs/crate/ring/0.17.14/source/LICENSE-BoringSSL
-      - name: BSD 3-Clause License
-        link: https://docs.rs/crate/ring/0.17.14/source/LICENSE-BoringSSL
-      - name: ISC License
-        link: https://docs.rs/crate/ring/0.17.14/source/LICENSE-other-bits
-      - name: MIT License
-        link: https://docs.rs/crate/ring/0.17.14/source/src/polyfill/once_cell/LICENSE-MIT
   - dependency: rustls
     ecosystem: cargo
     copyright:
@@ -992,7 +1055,7 @@ notices:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/kubernetes-sigs/controller-runtime/blob/v0.25.1/LICENSE
+        link: https://github.com/kubernetes-sigs/controller-runtime/blob/v0.25.2/LICENSE
   - dependency: sigs.k8s.io/yaml
     ecosystem: go
     copyright:
@@ -1008,6 +1071,13 @@ notices:
         link: https://github.com/kubernetes-sigs/yaml/blob/v1.6.0/LICENSE
       - name: Apache License, Version 2.0
         link: https://github.com/kubernetes-sigs/yaml/blob/v1.6.0/LICENSE
+  - dependency: tokio
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) Tokio Contributors
+    license:
+      - name: MIT License
+        link: https://docs.rs/crate/tokio/1.54.1/source/LICENSE
   - dependency: x509-parser
     ecosystem: cargo
     copyright:

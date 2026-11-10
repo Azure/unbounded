@@ -230,3 +230,46 @@ func TestHostReplaceRefusesUnsupportedFormatBeforeProvider(t *testing.T) {
 		})
 	}
 }
+
+func TestReplaceAgentConfigHonorsExperimentalContainerIsolation(t *testing.T) {
+	t.Parallel()
+	scheme := newOperationTestScheme(t)
+	require.NoError(t, corev1.AddToScheme(scheme))
+
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "bootstrap-token-test", Namespace: metav1.NamespaceSystem}, Data: map[string][]byte{"token-id": []byte("abc123"), "token-secret": []byte("secret456")}}
+
+	build := func(t *testing.T, mode api.IsolationMode, enabled bool) error {
+		t.Helper()
+
+		r := &MachineOperationReconciler{
+			Client:                         fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret.DeepCopy()).Build(),
+			ClusterInfo:                    testClusterInfo(),
+			ExperimentalContainerIsolation: enabled,
+		}
+		m := newExternalMachine("worker", api.ExternalProviderAzureVM)
+		m.Spec.Isolation = mode
+		m.Spec.Kubernetes = &api.KubernetesSpec{BootstrapTokenRef: &api.LocalObjectReference{Name: secret.Name}}
+
+		cfg, err := r.buildReplaceAgentConfig(t.Context(), m)
+		if err != nil {
+			return err
+		}
+
+		require.Equal(t, string(mode), cfg.Isolation)
+		require.Equal(t, enabled, cfg.ContainerIsolationEnabled())
+
+		return nil
+	}
+
+	for _, mode := range []api.IsolationMode{"", api.IsolationNSpawn, api.IsolationNone} {
+		require.NoError(t, build(t, mode, false), mode)
+	}
+
+	for _, mode := range []api.IsolationMode{"", api.IsolationNSpawn, api.IsolationContainer} {
+		require.NoError(t, build(t, mode, true), mode)
+	}
+
+	err := build(t, api.IsolationContainer, false)
+	require.ErrorContains(t, err, `spec.isolation "container" is experimental and not enabled on this machine-ops-controller`)
+	require.ErrorContains(t, err, "--experimental-container-isolation")
+}

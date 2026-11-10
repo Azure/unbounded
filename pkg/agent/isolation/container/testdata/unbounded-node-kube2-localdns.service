@@ -1,0 +1,35 @@
+[Unit]
+Description=Unbounded node container (kube2)
+Wants=network-online.target
+Requires=unbounded-localdns-network.service
+After=network-online.target local-fs.target unbounded-localdns-network.service
+Conflicts=unbounded-node-kube1.service
+StartLimitIntervalSec=3600
+StartLimitBurst=10
+
+[Service]
+Type=simple
+Slice=system.slice
+Delegate=yes
+DelegateSubgroup=supervisor
+KillMode=mixed
+KillSignal=SIGRTMIN+3
+TimeoutStartSec=360
+TimeoutStopSec=120
+Restart=always
+RestartSec=1
+RestartMaxDelaySec=60
+RestartSteps=10
+ExecStartPre=-/opt/unbounded/runtime/runc delete --force unbounded-kube2
+ExecStartPre=/usr/bin/mkdir -p /run/bpffs/kube2
+ExecStartPre=/bin/sh -c '/usr/bin/mountpoint -q /run/bpffs/kube2 || /usr/bin/mount -t bpf bpf /run/bpffs/kube2'
+ExecStartPre=/usr/bin/mkdir -p /var/lib/kubelet
+ExecStartPre=/bin/sh -c '/usr/bin/mountpoint -q /var/lib/kubelet || /usr/bin/mount --bind /var/lib/kubelet /var/lib/kubelet'
+ExecStartPre=/usr/bin/mount --make-rshared /var/lib/kubelet
+ExecStartPre=/opt/unbounded/agent/bin/unbounded-agent-lifecycle node-lifecycle pre-start kube2
+ExecStart=/opt/unbounded/runtime/runc run --bundle /var/lib/unbounded/containers/bundles/kube2 unbounded-kube2
+ExecStartPost=/opt/unbounded/agent/bin/unbounded-agent-lifecycle node-lifecycle post-start kube2
+ExecStopPost=-/opt/unbounded/runtime/runc delete --force unbounded-kube2
+
+[Install]
+WantedBy=multi-user.target

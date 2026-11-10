@@ -55,6 +55,9 @@ func (c nspawnMachineProvisioningChecker) Name() string {
 	return checkNSpawnMachineProvisioningName
 }
 
+// Check inspects the nspawn machine directory directly. It is nspawn-only
+// preflight, the rootfs counterpart of the host preflight machine checks, so
+// the MachineDir references here are intentional.
 func (c nspawnMachineProvisioningChecker) Check(context.Context) []preflight.Result {
 	if c.gs == nil || c.gs.MachineDir == "" {
 		return preflight.ResultsError(

@@ -1,0 +1,14 @@
+[package]
+name = "racer-io"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+description = "Racer worker-local io_uring reactor, executor, and cross-thread primitives"
+
+[dependencies]
+futures = "0.3"
+getrandom = "0.2"
+io-uring = "0.7"
+libc = "0.2"
+zeroize = "1"

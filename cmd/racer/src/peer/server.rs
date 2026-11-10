@@ -11,6 +11,7 @@ use crate::error::Operation;
 use crate::peer::forwarding::Forwarding;
 use crate::peer::forwarding::VerifiedRequest;
 use crate::runtime::RequestScope;
+use racer_core::read::serve::{Body, ServeDecision};
 use std::rc::Rc;
 use std::time::Duration;
 use std::time::Instant;
@@ -50,9 +51,11 @@ pub(crate) struct Settings {
 }
 
 pub struct PeerServer {
+    /// This worker's detached driver queue for diagnostic samples.
+    drivers: std::rc::Rc<crate::drivers::DriverQueue>,
     tcp_nodelay: bool,
     metrics: crate::telemetry::Metrics,
-    send_crc: Option<(
+    send_tag: Option<(
         crate::telemetry::Pair,
         crate::telemetry::Samples,
         Rc<crate::security::PageCrypto>,
@@ -71,44 +74,45 @@ pub struct PeerServer {
     signatures: Rc<crate::peer::protocol::Signatures>,
     transfers: Rc<super::transport::Transfers>,
     request_timeout: Duration,
-    /// Page response bodies this server is writing, per page
-    /// (`racer_core::read::budget::shed_hot_page`).
-    streaming: Rc<std::cell::RefCell<std::collections::HashMap<crate::model::PageId, usize>>>,
+    /// Hot-page shedding over the page response bodies this server is
+    /// writing ([`ServeDecision`]).
+    serve: Rc<std::cell::RefCell<ServeDecision<crate::model::PageId>>>,
+    /// The encoded unsigned overload head a full listener answers with ([`Self::refuse`]).
+    refusal: Rc<[u8]>,
+    /// The published cluster page size, which sizes the hot-page threshold.
+    /// Without one, `serve` keeps the largest page's threshold.
+    page_size: Option<Rc<dyn crate::origin::Origin>>,
 }
 
 /// Bodies of one page an owner writes before it may shed readers of that page:
 /// `racer_core::read::budget::HOT_PAGE_QUEUE_BYTES` of production pages.
+#[cfg(test)]
 pub(crate) const fn hot_page_threshold() -> usize {
     racer_core::read::budget::hot_page_bodies(crate::model::PAGE_BYTES)
 }
 
+type Serve = Rc<std::cell::RefCell<ServeDecision<crate::model::PageId>>>;
+
 /// Counts one page body being written until dropped.
 struct Streaming {
-    pages: Rc<std::cell::RefCell<std::collections::HashMap<crate::model::PageId, usize>>>,
-    page: crate::model::PageId,
+    serve: Serve,
+    body: Option<Body<crate::model::PageId>>,
 }
 
 impl Streaming {
-    fn new(
-        pages: &Rc<std::cell::RefCell<std::collections::HashMap<crate::model::PageId, usize>>>,
-        page: crate::model::PageId,
-    ) -> Self {
-        *pages.borrow_mut().entry(page.clone()).or_default() += 1;
+    fn new(serve: &Serve, page: crate::model::PageId) -> Self {
+        let body = serve.borrow_mut().begin_body(page);
         Self {
-            pages: pages.clone(),
-            page,
+            serve: serve.clone(),
+            body: Some(body),
         }
     }
 }
 
 impl Drop for Streaming {
     fn drop(&mut self) {
-        let mut pages = self.pages.borrow_mut();
-        if let Some(count) = pages.get_mut(&self.page) {
-            *count -= 1;
-            if *count == 0 {
-                pages.remove(&self.page);
-            }
+        if let Some(body) = self.body.take() {
+            self.serve.borrow_mut().end_body(body);
         }
     }
 }
@@ -116,25 +120,44 @@ impl Drop for Streaming {
 impl PeerServer {
     pub(crate) fn configure_accepted(
         &self,
-        fd: uring_runtime::reactor::descriptor::Descriptor,
-    ) -> crate::error::Result<uring_runtime::reactor::descriptor::Descriptor> {
+        fd: racer_io::ring::Descriptor,
+    ) -> crate::error::Result<racer_io::ring::Descriptor> {
         // False preserves the accepted socket's existing application policy.
         if self.tcp_nodelay {
-            fd.enable_tcp_nodelay(true)?;
+            fd.enable_tcp_nodelay(true).map_err(|_| Error::Io)?;
         }
         Ok(fd)
+    }
+    /// Answer a connection the listener has no peer ingress slot for with the unsigned overload
+    /// head (`peer_wire::overloaded_head`), then close it. The sender reads it in place of the
+    /// handshake's first answer and fails `Overloaded` at once (`peer_wire::connect`), so it asks
+    /// elsewhere. The head is written without waiting; a full send buffer (it never is on a new
+    /// socket) only closes the connection, which the sender sees as a failed handshake.
+    pub(crate) fn refuse(&self, accepted: &racer_io::ring::Descriptor) {
+        self.metrics.record(crate::telemetry::Event::Overload, 1);
+        let _ = accepted.try_send(&self.refusal);
+        // Reading what the sender already wrote keeps the close a FIN rather than a reset that
+        // could discard the head before the sender reads it.
+        let mut discard = [0u8; 512];
+        let _ = accepted.try_recv(&mut discard);
+        let _ = accepted.shutdown(libc::SHUT_WR);
+    }
+    /// Size the hot-page threshold by `origin`'s published page size.
+    pub(crate) fn with_page_size(mut self, origin: Rc<dyn crate::origin::Origin>) -> Self {
+        self.page_size = Some(origin);
+        self
     }
     pub(crate) fn with_metrics(mut self, metrics: crate::telemetry::Metrics) -> Self {
         self.metrics = metrics;
         self
     }
-    pub(crate) fn with_send_crc(
+    pub(crate) fn with_send_tag(
         mut self,
         pair: Option<crate::telemetry::Pair>,
         samples: crate::telemetry::Samples,
         crypto: Rc<crate::security::PageCrypto>,
     ) -> Self {
-        self.send_crc = pair.map(|pair| (pair, samples, crypto));
+        self.send_tag = pair.map(|pair| (pair, samples, crypto));
         self
     }
     fn begin_send_sample(
@@ -143,7 +166,7 @@ impl PeerServer {
         response: &SignedResponse,
         scope: &RequestScope,
     ) -> Option<crate::telemetry::Ticket> {
-        let (pair, samples, crypto) = self.send_crc.as_ref()?;
+        let (pair, samples, crypto) = self.send_tag.as_ref()?;
         let ciphertext = match &response.response {
             PeerResponse::Page { ciphertext, .. }
             | PeerResponse::Selected { ciphertext, .. }
@@ -155,8 +178,9 @@ impl PeerServer {
         };
         ciphertext.provenance?;
         let receiver = connection.state().session.as_ref()?.peer();
-        let (ticket, sample) = samples.begin(pair, self.signatures.node(), receiver)?;
-        let permit = match uring_runtime::drivers::reserve().map_err(Error::from) {
+        let (ticket, sample) =
+            samples.begin(pair, self.signatures.node(), receiver, scope.clock().now())?;
+        let permit = match self.drivers.reserve().map_err(Error::from) {
             Ok(p) => p,
             Err(error) => {
                 sample.finish(Some(error));
@@ -166,8 +190,8 @@ impl PeerServer {
         let deadline = scope
             .deadline
             .0
-            .min(uring_runtime::environment::now() + Duration::from_secs(2));
-        let diagnostic_scope = match RequestScope::new(scope.request, deadline) {
+            .min(scope.clock().now() + Duration::from_secs(2));
+        let diagnostic_scope = match scope.child(scope.request, deadline) {
             Ok(s) => s,
             Err(error) => {
                 sample.finish(Some(error));
@@ -194,7 +218,10 @@ impl PeerServer {
         wire: Rc<super::protocol::SecurityCodec>,
         signatures: Rc<crate::peer::protocol::Signatures>,
     ) -> Self {
-        let pipes = Rc::new(crate::http::new_pipe_pool(admission.clone()));
+        let pipes = Rc::new(crate::http::new_pipe_pool(
+            admission.clone(),
+            io.reactor().sim_os(),
+        ));
         let transfers = Rc::new(super::transport::Transfers::new(
             Rc::new(crate::http::new_pool(
                 io.reactor().clone(),
@@ -225,6 +252,7 @@ impl PeerServer {
                 request_timeout: Duration::from_secs(30),
                 opaque_relay: false,
             },
+            Rc::new(crate::drivers::DriverQueue::new(1024)),
         )
     }
     #[cfg(test)]
@@ -249,8 +277,10 @@ impl PeerServer {
             use futures::stream::FuturesUnordered;
             scope.check()?;
             let reactor = self.io.reactor();
-            let fd =
-                Rc::new(uring_runtime::reactor::descriptor::Descriptor::tcp_listener(address)?);
+            let fd = Rc::new(racer_io::scoped::descriptor::tcp_listener(
+                reactor.sim_os().as_ref(),
+                address,
+            )?);
             let mut active = FuturesUnordered::new();
             let maximum = self
                 .admission
@@ -258,23 +288,32 @@ impl PeerServer {
             loop {
                 scope.check()?;
                 if let AcceptMode::Distributed(ingress) = &self.accept {
-                    uring_runtime::drivers::retry_listener(scope, || {
-                        reactor.readiness_with_lease(fd.clone(), libc::POLLIN as u32, (), scope)
-                    })
-                    .await?;
-                    let cancellation = scope.cancellation.subscribe()?;
-                    let offer = std::future::poll_fn(|cx| {
-                        cancellation.register(cx.waker());
-                        if let Err(error) = scope.check() {
-                            return std::task::Poll::Ready(Err(error));
+                    reactor
+                        .retry_overloaded(scope, || {
+                            reactor.readiness_with_lease(fd.clone(), libc::POLLIN as u32, (), scope)
+                        })
+                        .await?;
+                    scope.check()?;
+                    // With every worker's peer ingress in use, accept the connection only to
+                    // refuse it, rather than leave it in the kernel accept queue until the
+                    // sender's attempt times out (`refuse`).
+                    let offer = match ingress.reserve(futures::task::noop_waker_ref()) {
+                        Ok(offer) => offer,
+                        Err(Error::Overloaded) => {
+                            match fd.try_accept() {
+                                Ok(accepted) => self.refuse(&accepted),
+                                Err(error)
+                                    if matches!(
+                                        error.kind(),
+                                        std::io::ErrorKind::WouldBlock
+                                            | std::io::ErrorKind::Interrupted
+                                    ) => {}
+                                Err(_) => return Err(Error::Io),
+                            }
+                            continue;
                         }
-                        match ingress.reserve(cx.waker()) {
-                            Ok(offer) => std::task::Poll::Ready(Ok(offer)),
-                            Err(Error::Overloaded) => std::task::Poll::Pending,
-                            Err(error) => std::task::Poll::Ready(Err(error)),
-                        }
-                    })
-                    .await?;
+                        Err(error) => return Err(error),
+                    };
                     let accepted = match fd.try_accept() {
                         Ok(fd) => fd,
                         Err(error)
@@ -300,9 +339,7 @@ impl PeerServer {
                     continue;
                 }
                 let accepted = next_accepted(
-                    uring_runtime::drivers::retry_listener(scope, || {
-                        reactor.accept(fd.clone(), scope)
-                    }),
+                    reactor.retry_overloaded(scope, || reactor.accept(fd.clone(), scope)),
                     &mut active,
                     scope,
                 )
@@ -341,12 +378,14 @@ impl PeerServer {
         pipes: Rc<flow_control::PipePool<AdmissionPolicy>>,
         transfers: Rc<super::transport::Transfers>,
         settings: Settings,
+        drivers: std::rc::Rc<crate::drivers::DriverQueue>,
     ) -> Self {
         Self {
+            drivers,
             subscriptions,
             metrics: crate::telemetry::Metrics::default(),
             tcp_nodelay: settings.tcp_nodelay,
-            send_crc: None,
+            send_tag: None,
             placement: crate::topology::Placement::new(64),
             opaque_relay: settings.opaque_relay,
             pipes,
@@ -360,14 +399,22 @@ impl PeerServer {
             signatures,
             transfers,
             request_timeout: settings.request_timeout,
-            streaming: Rc::default(),
+            // The largest page until `with_page_size` supplies the published one.
+            serve: Rc::new(std::cell::RefCell::new(ServeDecision::new(
+                crate::model::PAGE_BYTES,
+            ))),
+            refusal: crate::http::Codec::new(peer_wire::MAX_ENVELOPE_HEAD)
+                .encode_head(&peer_wire::overloaded_head())
+                .expect("the overload head encodes")
+                .into(),
+            page_size: None,
         }
     }
 
     /// Bodies of `page` this server is writing now, and of all pages.
+    #[cfg(test)]
     pub(crate) fn streaming(&self, page: &crate::model::PageId) -> (usize, usize) {
-        let pages = self.streaming.borrow();
-        (pages.get(page).copied().unwrap_or(0), pages.values().sum())
+        self.serve.borrow().streaming(page)
     }
 
     /// Count a page response's body as being written until the result drops
@@ -375,10 +422,18 @@ impl PeerServer {
     pub(crate) fn page_streaming(&self, response: &PeerResponse) -> Option<impl Sized + use<>> {
         match response {
             PeerResponse::Page { ciphertext, .. } if !ciphertext.bytes().is_empty() => Some(
-                Streaming::new(&self.streaming, ciphertext.envelope().page.clone()),
+                Streaming::new(&self.serve, ciphertext.envelope().page.clone()),
             ),
             _ => None,
         }
+    }
+
+    /// The hot-page counters, for tests that observe them while a request is served.
+    #[cfg(test)]
+    pub(crate) fn serve_counters(
+        &self,
+    ) -> Rc<std::cell::RefCell<ServeDecision<crate::model::PageId>>> {
+        self.serve.clone()
     }
 
     /// Count `n` bodies of `page` as being written until the result drops.
@@ -389,12 +444,12 @@ impl PeerServer {
         n: usize,
     ) -> impl Sized + use<> {
         (0..n)
-            .map(|_| Streaming::new(&self.streaming, page.clone()))
+            .map(|_| Streaming::new(&self.serve, page.clone()))
             .collect::<Vec<_>>()
     }
 
     /// Whether to answer a page request with `Overloaded` because this node owns the page and is
-    /// already writing [`hot_page_threshold`] bodies of it to other requesters, at least half of
+    /// already writing `hot_page_threshold()` bodies of it to other requesters, at least half of
     /// all the bodies it is writing. The page's other owners are never shed. This node's column
     /// mates in the page's pool (the helpers shed readers ask) are shed only past
     /// `hot_page_exempt_bodies`, so owner fan-in for one page stays near the threshold whatever
@@ -403,28 +458,22 @@ impl PeerServer {
     fn shed_hot_page(
         &self,
         page: &crate::model::PageId,
-        requester: &racer_control_wire::NodeId,
+        requester: &racer_wire::control::NodeId,
         membership: &std::sync::Arc<crate::topology::Membership>,
     ) -> bool {
-        use racer_core::read::budget::{HotPageLimits, shed_hot_page};
-        let threshold = hot_page_threshold();
-        let (streaming, all) = self.streaming(page);
-        if streaming < threshold {
+        if let Some(size) = self.page_size.as_ref().and_then(|o| o.page_size().ok()) {
+            self.serve.borrow_mut().set_page_bytes(size.get());
+        }
+        if !self.serve.borrow().hot(page) {
             return false;
         }
         let (object, number) = (&page.version.object, page.number);
         let owners = self.placement.rank(membership.clone(), object, number);
         let local = &self.relay.network.local;
         let column_mate = || membership.same_column(&object.cache, local, requester);
-        shed_hot_page(
-            &owners.ordered,
-            local,
-            requester,
-            column_mate,
-            streaming,
-            all,
-            HotPageLimits::mesh(threshold),
-        )
+        self.serve
+            .borrow()
+            .shed(page, &owners.ordered, local, requester, column_mate)
     }
     /// Bound incoming heads and the complete connection handshake, including writes.
     /// Authenticated page dispatch and transfer retain their signed request deadline.
@@ -433,7 +482,7 @@ impl PeerServer {
         self.request_timeout = timeout;
         self
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "dst"))]
     pub(crate) fn transfers(&self) -> &Rc<super::transport::Transfers> {
         &self.transfers
     }
@@ -458,11 +507,7 @@ impl PeerServer {
             // One fixed budget for handshake reads, verification, signing, writes,
             // and the incoming application head. Partial progress never renews it.
             // Only application dispatch/response I/O use the signed deadline below.
-            let header_scope = header_scope(
-                scope,
-                self.request_timeout,
-                uring_runtime::environment::now(),
-            )?;
+            let header_scope = header_scope(scope, self.request_timeout, scope.clock().now())?;
             let connection = self
                 .authenticate_connection(connection, &header_scope)
                 .await?;
@@ -480,8 +525,15 @@ impl PeerServer {
                     .ok_or(Error::InvalidRequest)?
                     .max(1),
             )?;
-            let native_control = super::transport::detach(&mut received.value)?;
-            let (authentication, length) = decode_envelope(received.value, false)?;
+            let native_control = super::transport::detach(
+                &mut received.value,
+                crate::peer::protocol::chains(&received.connection)?,
+            )?;
+            let (authentication, length) = decode_envelope(
+                received.value,
+                false,
+                crate::peer::protocol::chains(&received.connection)?,
+            )?;
             if length != 0 {
                 return Err(Error::InvalidRequest);
             }
@@ -516,10 +568,34 @@ impl PeerServer {
                     .admit_native(&request, control, &request_scope)?,
                 _ => None,
             };
-            let request = self
+            let request = match self
                 .forwarding
                 .verify_request_async(request, &request_scope)
-                .await?;
+                .await
+            {
+                Ok(request) => request,
+                // Shed before verification (for example, the crypto queue is full): answer the
+                // unsigned overload head, which costs no key work and carries nothing from the
+                // request, so the sender asks elsewhere instead of reading a dead link.
+                Err(error)
+                    if admitted.is_none()
+                        && racer_core::route::unverified_failure(error.fault())
+                            == racer_core::route::UnverifiedFailure::Overloaded =>
+                {
+                    let mut connection = self
+                        .io
+                        .send_head(
+                            received.connection,
+                            peer_wire::overloaded_head(),
+                            &request_scope,
+                        )
+                        .await?
+                        .connection;
+                    connection.finish_exchange()?;
+                    return Ok(connection);
+                }
+                Err(error) => return Err(error),
+            };
             let membership = self
                 .relay
                 .network
@@ -551,8 +627,8 @@ impl PeerServer {
                                 Some(reservation.clone());
                             // Cancel only this downstream exchange on upstream FIN.
                             // Fence its I/O and disconnect watch before streaming.
-                            let exchange =
-                                RequestScope::new(request_scope.request, request_scope.deadline.0)?;
+                            let exchange = request_scope
+                                .child(request_scope.request, request_scope.deadline.0)?;
                             disconnect_fenced_exchange(
                                 &self.io,
                                 &received.connection,
@@ -659,7 +735,7 @@ impl PeerServer {
                         // this HTTP exchange may be canceled, including its local
                         // destination waiter, never independent shared-flight work.
                         let exchange =
-                            RequestScope::new(request_scope.request, request_scope.deadline.0)?;
+                            request_scope.child(request_scope.request, request_scope.deadline.0)?;
                         disconnect_fenced_exchange(
                             &self.io,
                             &received.connection,
@@ -685,7 +761,13 @@ impl PeerServer {
                 let streaming = self.page_streaming(&response.response);
                 let (returned, sent) = self
                     .transfers
-                    .send_native(connection, &response, admitted, membership, &request_scope)
+                    .send_native(
+                        connection,
+                        &response,
+                        admitted.take(),
+                        membership,
+                        &request_scope,
+                    )
                     .await?;
                 drop(streaming);
                 connection = returned;
@@ -875,11 +957,18 @@ impl PeerServer {
             let binding = request.binding().clone();
             // A copy offer or a silence ping carries no body, so hot-page
             // shedding does not apply.
-            if let super::protocol::Operation::Page { page, mode } = &request.request().operation
-                && !matches!(
-                    mode,
-                    super::protocol::FetchMode::Offer | super::protocol::FetchMode::Ping
-                )
+            let body = match &request.request().operation {
+                super::protocol::Operation::Page { page, mode }
+                    if !matches!(
+                        mode,
+                        super::protocol::FetchMode::Offer | super::protocol::FetchMode::Ping
+                    ) =>
+                {
+                    Some(page)
+                }
+                _ => None,
+            };
+            if let Some(page) = body
                 && self.shed_hot_page(page, request.origin().node(), &membership)
             {
                 self.metrics.record(crate::telemetry::Event::Overload, 1);
@@ -887,6 +976,13 @@ impl PeerServer {
                     .forwarding
                     .sign_response(&binding, PeerResponse::Overloaded);
             }
+            // An admitted body request counts toward the page's hot-page fan-in while it waits
+            // (for example on the running fill), not only once its body is written: otherwise
+            // every request admitted while the page is cold streams at once when the fill lands,
+            // past `hot_page_exempt_bodies`. It ends when the response is ready, and
+            // `page_streaming` counts the body from its head (the exchange's disconnect fence
+            // may run in between).
+            let _admitted = body.map(|page| Streaming::new(&self.serve, page.clone()));
             let reservation = self
                 .admission
                 .reserve(None, ResourceClass::Waiter, 1)
@@ -941,8 +1037,8 @@ impl PeerServer {
                     subscription.clone(),
                     membership.version,
                     request.origin().node().clone(),
-                    encode_deadline(scope.deadline)?,
-                    millis(uring_runtime::environment::wall_now())?,
+                    encode_deadline(scope.clock(), scope.deadline)?,
+                    millis(scope.clock().wall_now())?,
                 )?
             } else {
                 self.subscriptions
@@ -982,7 +1078,7 @@ impl PeerServer {
                                     metadata,
                                     ciphertext,
                                 },
-                                millis(uring_runtime::environment::wall_now())?,
+                                millis(scope.clock().wall_now())?,
                             )?;
                         }
                         Ok(other) => {
@@ -1004,7 +1100,7 @@ impl PeerServer {
                     if let Err(error) = scope.check() {
                         return std::task::Poll::Ready(Err(error));
                     }
-                    let now = match millis(uring_runtime::environment::wall_now()) {
+                    let now = match millis(scope.clock().wall_now()) {
                         Ok(now) => now,
                         Err(error) => return std::task::Poll::Ready(Err(error)),
                     };
@@ -1048,7 +1144,7 @@ async fn disconnect_fenced_exchange<T>(
         io,
         connection,
         parent,
-        || RequestScope::new(exchange.request, exchange.deadline.0),
+        || exchange.child(exchange.request, exchange.deadline.0),
         || {
             let _ = exchange.cancel();
         },
@@ -1112,7 +1208,6 @@ mod tests {
     use std::pin::Pin;
     use std::task::Context;
     use std::task::Poll;
-    use uring_runtime::environment::SimulationClock;
 
     #[derive(Default)]
     struct AcceptCounts {
@@ -1134,8 +1229,8 @@ mod tests {
             }
         }
     }
-    impl<F: Future<Output = crate::error::Result<uring_runtime::reactor::descriptor::Descriptor>>>
-        Future for CountedAccept<F>
+    impl<F: Future<Output = crate::error::Result<racer_io::ring::Descriptor>>> Future
+        for CountedAccept<F>
     {
         type Output = F::Output;
         fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -1156,7 +1251,7 @@ mod tests {
         future.poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
     }
     fn listener_scope() -> RequestScope {
-        RequestScope::new(RequestId([6; 16]), Instant::now() + Duration::from_secs(60)).unwrap()
+        RequestScope::host(RequestId([6; 16]), Instant::now() + Duration::from_secs(60)).unwrap()
     }
     fn assert_counts(counts: &AcceptCounts, dropped: usize, consumed: usize) {
         assert_eq!(counts.created.get(), 1);
@@ -1172,18 +1267,19 @@ mod tests {
         use std::net::Shutdown;
         use std::net::TcpListener;
         use std::net::TcpStream;
+        let env = racer_io::Env::host();
 
         for body in [false, true] {
             for cancel_parent in [false, true] {
                 let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                     crate::test_support::cluster::config(false).limits,
                 )));
-                let reactor = Rc::new(Reactor::new(admission.clone()));
+                let reactor = Rc::new(Reactor::new(admission.clone(), &env));
                 reactor.init().unwrap();
                 let io =
                     crate::http::new_io(reactor.clone(), Codec::new(4096), admission.clone(), 4096);
                 let parent = listener_scope();
-                let exchange = RequestScope::new(
+                let exchange = RequestScope::host(
                     RequestId([7; 16]),
                     parent.deadline.0 - Duration::from_secs(10),
                 )
@@ -1214,7 +1310,7 @@ mod tests {
                             connection = read.lease;
                             buffer = read.buffer;
                         }
-                        Ok(crate::peer::tests::signed_fixture_response())
+                        Ok(crate::peer::tests::signed_fixture_response(&env))
                     }
                     .await;
                     completed.set(true);
@@ -1251,7 +1347,7 @@ mod tests {
                 }
                 assert!(matches!(
                     drive(&reactor, work.as_mut()),
-                    Err(Error::Cancelled)
+                    Err(Error::Canceled)
                 ));
                 assert!(start.elapsed() < Duration::from_secs(2));
                 assert!(
@@ -1260,7 +1356,7 @@ mod tests {
                 );
                 assert_eq!(reactor.in_flight(), 0, "both IO and watch must be fenced");
                 assert_eq!(admission.used(ResourceClass::Relay), 0);
-                assert_eq!(parent.cancellation.is_cancelled(), cancel_parent);
+                assert_eq!(parent.cancellation.is_canceled(), cancel_parent);
                 drop(work);
                 downstream
                     .set_read_timeout(Some(Duration::from_secs(1)))
@@ -1282,10 +1378,11 @@ mod tests {
     fn materialized_transit_success_fences_watch_before_keepalive() {
         use crate::http::Codec;
         use crate::runtime::Reactor;
+        let env = racer_io::Env::host();
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         )));
-        let reactor = Rc::new(Reactor::new(admission.clone()));
+        let reactor = Rc::new(Reactor::new(admission.clone(), &env));
         reactor.init().unwrap();
         let io = crate::http::new_io(reactor.clone(), Codec::new(4096), admission.clone(), 4096);
         let parent = listener_scope();
@@ -1296,9 +1393,9 @@ mod tests {
                 .unwrap();
             let received = drive(&reactor, io.receive_head(connection, &parent)).unwrap();
             connection = received.connection;
-            let exchange = RequestScope::new(RequestId([7; 16]), parent.deadline.0).unwrap();
+            let exchange = RequestScope::host(RequestId([7; 16]), parent.deadline.0).unwrap();
             let mut pending_once = true;
-            let mut signed = Some(crate::peer::tests::signed_fixture_response());
+            let mut signed = Some(crate::peer::tests::signed_fixture_response(&env));
             let signature = signed
                 .as_ref()
                 .unwrap()
@@ -1443,7 +1540,7 @@ mod tests {
                     send_completion.send(()).unwrap();
                     assert!(matches!(
                         poll(work.as_mut()),
-                        Poll::Ready(Err(Error::Cancelled))
+                        Poll::Ready(Err(Error::Canceled))
                     ));
                 }
                 drop(work);
@@ -1472,22 +1569,21 @@ mod tests {
         use crate::runtime::Reactor;
         use std::net::TcpListener;
         use std::net::TcpStream;
+        let env = racer_io::Env::host();
 
         for ready in [false, true] {
             for end in ["consume", "cancel", "drop"] {
                 let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                     crate::test_support::cluster::config(false).limits,
                 )));
-                let reactor = Reactor::new(admission.clone());
+                let reactor = Reactor::new(admission.clone(), &env);
                 reactor.init().unwrap();
                 let baseline = admission.used(ResourceClass::RequestContext);
                 let scope = listener_scope();
                 let listener = TcpListener::bind("127.0.0.1:0").unwrap();
                 listener.set_nonblocking(true).unwrap();
                 let address = listener.local_addr().unwrap();
-                let fd = Rc::new(uring_runtime::reactor::descriptor::Descriptor::from(
-                    listener,
-                ));
+                let fd = Rc::new(racer_io::ring::Descriptor::from(listener));
                 let weak = Rc::downgrade(&fd);
                 let counts = Rc::new(AcceptCounts::default());
                 let accept = CountedAccept::new(reactor.accept(fd, &scope), &counts);
@@ -1533,7 +1629,7 @@ mod tests {
                 } else if end == "cancel" {
                     assert!(matches!(
                         poll(work.as_mut()),
-                        Poll::Ready(Err(Error::Cancelled))
+                        Poll::Ready(Err(Error::Canceled))
                     ));
                 }
                 drop(work);
@@ -1541,7 +1637,6 @@ mod tests {
                 if !ready && end != "consume" {
                     assert_eq!(reactor.in_flight(), 1);
                     assert!(weak.upgrade().is_some());
-                    assert!(admission.used(ResourceClass::RequestContext) > baseline);
                 }
                 drive(&reactor, reactor.drain()).unwrap();
                 assert_eq!(reactor.in_flight(), 0);
@@ -1561,7 +1656,7 @@ mod tests {
         let clock = Clock::default();
         let timeout = Duration::from_secs(10);
         let listener =
-            RequestScope::new(RequestId([9; 16]), clock.now() + Duration::from_secs(60)).unwrap();
+            RequestScope::host(RequestId([9; 16]), clock.now() + Duration::from_secs(60)).unwrap();
         let first = header_scope(&listener, timeout, clock.now()).unwrap();
         assert_eq!(first.request, listener.request);
         assert_eq!(first.deadline.0, clock.now() + timeout);
@@ -1575,15 +1670,15 @@ mod tests {
         assert_eq!(clock.check_deadline(next.deadline), Ok(()));
         assert_eq!(clock.check_deadline(listener.deadline), Ok(()));
         listener.cancel().unwrap();
-        assert_eq!(first.check(), Err(Error::Cancelled));
-        assert_eq!(next.check(), Err(Error::Cancelled));
+        assert_eq!(first.check(), Err(Error::Canceled));
+        assert_eq!(next.check(), Err(Error::Canceled));
     }
 
     #[test]
     fn header_budget_never_extends_listener_deadline_and_rejects_overflow() {
         let clock = Clock::default();
         let listener =
-            RequestScope::new(RequestId([8; 16]), clock.now() + Duration::from_secs(1)).unwrap();
+            RequestScope::host(RequestId([8; 16]), clock.now() + Duration::from_secs(1)).unwrap();
         let header = header_scope(&listener, Duration::from_secs(30), clock.now()).unwrap();
         assert_eq!(header.deadline.0, listener.deadline.0);
         clock.advance(Duration::from_secs(1)).unwrap();
@@ -1671,14 +1766,14 @@ mod tests {
             for end in ["expiry", "handshake-cap", "cancel", "drop", "resume"] {
                 // Only the clock is virtual: socket buffers and CQEs are real.
                 let clock =
-                    SimulationClock::new_at(83, Instant::now(), std::time::SystemTime::now());
-                let environment = clock.environment(0);
-                let _guard = environment.enter();
-                let signers = crate::test_support::security::network(2);
+                    racer_io::SimClock::new_at(83, Instant::now(), std::time::SystemTime::now());
+                let environment = clock.ctx(0);
+                let env = racer_io::Env::new(racer_io::Driver::Uring, environment.clone());
+                let signers = crate::test_support::security::network(&env, 2);
                 let mut limits = crate::test_support::cluster::config(false).limits;
                 limits.client_connections = std::num::NonZeroUsize::new(1).unwrap();
                 let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
-                let reactor = Rc::new(Reactor::new(admission.clone()));
+                let reactor = Rc::new(Reactor::new(admission.clone(), &env));
                 reactor.init().unwrap();
                 let baseline = admission.used(ResourceClass::RequestContext);
                 let io = Rc::new(crate::http::new_io(
@@ -1689,28 +1784,34 @@ mod tests {
                 ));
                 let forwarding = Rc::new(Forwarding::new(signers[1].clone()));
                 let outbound = crate::peer::tests::NoOutbound::new(
+                    &env,
                     signers[1].clone(),
                     Rc::new(
                         super::super::PeerNetwork::new(
                             signers[1].node().clone(),
-                            std::sync::Arc::new(controlplane::Published::new(
+                            std::sync::Arc::new(crate::control::cell::PublicationCell::new(
                                 crate::control::Snapshot::retention(2),
                             )),
+                            env.ctx.clock.clone(),
                         )
                         .unwrap(),
                     ),
                 );
                 let relay = Rc::new(Relay::new(
-                    Rc::new(Paths::new(Rc::new(LinkHealth::default()), 4)),
+                    Rc::new(Paths::new(
+                        Rc::new(LinkHealth::on(env.ctx.clock.clone())),
+                        4,
+                    )),
                     forwarding.clone(),
                     outbound.requester.clone(),
                     admission.clone(),
                     Rc::new(
                         super::super::PeerNetwork::new(
                             signers[1].node().clone(),
-                            std::sync::Arc::new(controlplane::Published::new(
+                            std::sync::Arc::new(crate::control::cell::PublicationCell::new(
                                 crate::control::Snapshot::retention(2),
                             )),
+                            env.ctx.clock.clone(),
                         )
                         .unwrap(),
                     ),
@@ -1730,11 +1831,8 @@ mod tests {
                 .with_request_timeout(Duration::from_secs(
                     if end == "handshake-cap" { 60 } else { 4 },
                 ));
-                let scope = RequestScope::new(
-                    RequestId([5; 16]),
-                    uring_runtime::environment::now() + Duration::from_secs(365 * 24 * 3600),
-                )
-                .unwrap();
+                let scope =
+                    RequestScope::untimed(RequestId([5; 16]), env.ctx.clock.clone()).unwrap();
                 let (socket, mut peer) = UnixStream::pair().unwrap();
                 let mut writer = socket.try_clone().unwrap();
                 peer.set_nonblocking(true).unwrap();
@@ -1794,7 +1892,7 @@ mod tests {
                 assert_eq!(admission.used(ResourceClass::ControlProgress), 1);
                 assert!(admission.used(ResourceClass::RequestContext) > baseline);
                 assert!(matches!(
-                    admission.reserve(None, ResourceClass::Connection, 1),
+                    admission.reserve(None, ResourceClass::IngressConnection, 1),
                     Err(flow_control::Error::Overloaded)
                 ));
 
@@ -1849,7 +1947,7 @@ mod tests {
                     let expected = if matches!(end, "expiry" | "handshake-cap") {
                         Error::DeadlineExceeded
                     } else {
-                        Error::Cancelled
+                        Error::Canceled
                     };
                     assert!(
                         matches!(result, Err(error) if error == expected),

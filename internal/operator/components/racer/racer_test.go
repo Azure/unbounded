@@ -612,7 +612,7 @@ func TestLegacyControllerMigration(t *testing.T) {
 	require.NotContains(t, ds.Annotations, "unbounded-cloud.io/racer-installation-uid")
 
 	for _, e := range ds.Spec.Template.Spec.Containers[0].Env {
-		require.NotContains(t, []string{"RACER_CLUSTER_ID", "RACER_CONTROL_ENDPOINT", "RACER_TRUST_BUNDLE"}, e.Name)
+		require.NotContains(t, []string{"RACER_CLUSTER_ID", "RACER_CONTROL_ENDPOINT", "RACER_CONTROL_TRUST_BUNDLE"}, e.Name)
 	}
 
 	for _, v := range ds.Spec.Template.Spec.Volumes {
@@ -656,7 +656,7 @@ func TestDataplaneConfig(t *testing.T) {
 	require.NotContains(t, config.Data, "RACER_MAX_THREADS")
 
 	config.Data["RACER_SHARES"] = "8"
-	config.Data["RACER_MAX_THREADS"] = "3"
+	config.Data["RACER_MAX_THREADS"] = "4"
 	require.NoError(t, env.Client.Update(t.Context(), config))
 
 	plan := planPass(t, env)
@@ -665,7 +665,7 @@ func TestDataplaneConfig(t *testing.T) {
 	require.Equal(t, "8", config.Data["RACER_SHARES"], "administrator edits survive")
 	require.NotEqual(t, before, liveDataplane(t, env).Spec.Template.Annotations[dataplaneConfigHash])
 
-	for _, value := range []string{"2", "x", "-1"} {
+	for _, value := range []string{"2", "3", "x", "-1"} {
 		config.Data["RACER_MAX_THREADS"] = value
 		require.NoError(t, env.Client.Update(t.Context(), config))
 

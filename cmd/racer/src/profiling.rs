@@ -60,7 +60,7 @@ fn memory_plan(limit: usize) -> Result<(), ProfileError> {
 
 fn check(cancel: &AtomicBool, deadline: std::time::Instant) -> Result<(), ProfileError> {
     if cancel.load(Ordering::Acquire) || std::time::Instant::now() >= deadline {
-        Err(ProfileError::Cancelled)
+        Err(ProfileError::Canceled)
     } else {
         Ok(())
     }
@@ -79,7 +79,7 @@ pub enum ProfileError {
     MalformedRecord,
     SampleLoss,
     MappingChanged,
-    Cancelled,
+    Canceled,
     Empty,
 }
 
@@ -96,7 +96,8 @@ impl ProfileError {
             Self::MalformedRecord => "malformed_record",
             Self::SampleLoss => "sample_loss",
             Self::MappingChanged => "mapping_changed",
-            Self::Cancelled => "cancelled",
+            // Published error code; keeps the British spelling.
+            Self::Canceled => "cancelled",
             Self::Empty => "no_samples",
         }
     }
@@ -155,7 +156,7 @@ impl ProfilingController {
         // acquires this lock, and joins below only touch already-finished threads.
         let mut control = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if self.stopped.load(Ordering::Acquire) {
-            return Err(ProfileError::Cancelled);
+            return Err(ProfileError::Canceled);
         }
         if control.helper.as_ref().is_some_and(|h| !h.is_finished()) {
             return Err(ProfileError::Busy);
@@ -173,7 +174,7 @@ impl ProfilingController {
             _lease: lease,
             // SAFETY: raw is a new, successful eventfd descriptor.
             completion: unsafe { OwnedFd::from_raw_fd(raw) },
-            cancelled: AtomicBool::new(false),
+            canceled: AtomicBool::new(false),
             result: Mutex::new(None),
         });
         let helper = state.clone();
@@ -182,13 +183,13 @@ impl ProfilingController {
             .name("racer-profiler".into())
             .stack_size(2 * 1024 * 1024)
             .spawn(move || {
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let result = {
                     #[cfg(all(
                         target_os = "linux",
                         any(target_arch = "x86_64", target_arch = "aarch64")
                     ))]
                     {
-                        perf::capture(duration, &helper.cancelled)
+                        perf::capture(duration, &helper.canceled)
                     }
                     #[cfg(not(all(
                         target_os = "linux",
@@ -197,8 +198,7 @@ impl ProfilingController {
                     {
                         Err(ProfileError::Unsupported)
                     }
-                }))
-                .unwrap_or(Err(ProfileError::Io));
+                };
                 *helper.result.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
                 let one = 1u64;
                 // SAFETY: the descriptor and eight-byte value remain live during write.
@@ -226,7 +226,7 @@ impl ProfilingController {
     pub fn cancel_active(&self) {
         let control = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(state) = control.active.as_ref().and_then(std::sync::Weak::upgrade) {
-            state.cancelled.store(true, Ordering::Release);
+            state.canceled.store(true, Ordering::Release);
         }
     }
 
@@ -253,7 +253,7 @@ impl ProfilingController {
 
 struct SessionState {
     completion: OwnedFd,
-    cancelled: AtomicBool,
+    canceled: AtomicBool,
     result: Mutex<Option<Result<Vec<u8>, ProfileError>>>,
     // Drop the budget last, after any retained result bytes and descriptor.
     _lease: ProcessReservation,
@@ -272,7 +272,7 @@ impl ProfileSession {
         self.state.result.try_lock().ok()?.take()
     }
     pub fn cancel(&self) {
-        self.state.cancelled.store(true, Ordering::Release);
+        self.state.canceled.store(true, Ordering::Release);
     }
 }
 impl Drop for ProfileSession {
@@ -353,7 +353,7 @@ mod tests {
         };
         assert!(matches!(
             result,
-            Err(ProfileError::Cancelled | ProfileError::PermissionDenied)
+            Err(ProfileError::Canceled | ProfileError::PermissionDenied)
         ));
         assert!(session.result().is_none());
         assert!(matches!(
@@ -388,7 +388,7 @@ mod tests {
                     session.cancel();
                     drop(session);
                 }
-                Err(error) => assert_eq!(error, ProfileError::Cancelled),
+                Err(error) => assert_eq!(error, ProfileError::Canceled),
             }
             let until = std::time::Instant::now() + Duration::from_secs(2);
             while !controller.poll_stopped() {
@@ -397,7 +397,7 @@ mod tests {
             }
             assert!(matches!(
                 controller.start(Duration::from_secs(1)),
-                Err(ProfileError::Cancelled)
+                Err(ProfileError::Canceled)
             ));
             assert_eq!(RESERVED_BYTES.load(Ordering::Acquire), 0);
         }

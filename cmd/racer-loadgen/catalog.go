@@ -11,6 +11,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"sort"
+	"sync/atomic"
 
 	"github.com/opencontainers/go-digest"
 )
@@ -20,12 +21,13 @@ const maxCatalogImages = 512
 const (
 	profileShuffle      = "shuffle"
 	profileZipf         = "zipf"
+	profileSweep        = "sweep"
 	defaultZipfExponent = 1.2
 )
 
 func validateProfile(profile string, exponent float64) error {
-	if profile != profileShuffle && profile != profileZipf {
-		return fmt.Errorf("profile must be shuffle or zipf, got %q", profile)
+	if profile != profileShuffle && profile != profileZipf && profile != profileSweep {
+		return fmt.Errorf("profile must be shuffle, zipf, or sweep, got %q", profile)
 	}
 
 	if math.IsNaN(exponent) || math.IsInf(exponent, 0) || exponent <= 0 {
@@ -130,10 +132,14 @@ func catalogImageOptions(opts imageOptions, index int) imageOptions {
 
 // The zero value independently shuffles a complete pass, preserving the baseline.
 // Zipf draws with replacement on every attempt, including after failures.
+// Sweep shares one cursor across all workers in the process, so each pass
+// reads every entry exactly once in catalog order. Use it to measure first-touch
+// (cold) reads without the repeats that independent shuffles produce.
 // Randomness affects only traversal, not catalog content or popularity rank.
 type catalogTraversal struct {
 	order         []int
 	next          int
+	sweep         *atomic.Uint64
 	zipfCDF       []float64
 	randomFloat64 func() float64
 }
@@ -142,14 +148,21 @@ type catalogTraversal struct {
 // RNG are shared, while shuffle order and progress remain local to the worker.
 func (p *puller) newTraversal() catalogTraversal {
 	traversal := catalogTraversal{randomFloat64: p.randomFloat64}
-	if p.opts.Profile == profileZipf {
+	switch p.opts.Profile {
+	case profileZipf:
 		traversal.zipfCDF = newZipfCDF(p.batchCount(), p.opts.ZipfExponent)
+	case profileSweep:
+		traversal.sweep = &p.sweep
 	}
 
 	return traversal
 }
 
 func (t *catalogTraversal) nextIndex(count int) int {
+	if t.sweep != nil {
+		return int((t.sweep.Add(1) - 1) % uint64(count))
+	}
+
 	if len(t.zipfCDF) != 0 {
 		return zipfIndex(t.zipfCDF, t.randomFloat64())
 	}

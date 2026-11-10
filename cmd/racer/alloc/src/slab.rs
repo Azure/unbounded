@@ -10,6 +10,9 @@ use crate::{
     AlignedBuffer, Alignment, Charge, Error, Extent, Result, SegmentGeometry, SegmentLease,
     Segments,
 };
+use racer_io::ring::SharedWriteBuffer;
+use racer_io::scoped::{Reactor, descriptor::Descriptor};
+use racer_io::{Operation, Scope};
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
@@ -25,10 +28,6 @@ use std::{
     rc::Rc,
     sync::Arc,
     task::{Context, Poll, Waker},
-};
-use uring_runtime::{
-    Budget, Operation, Scope,
-    reactor::{Reactor, SharedWriteBuffer, descriptor::Descriptor},
 };
 
 /// One logical segment's range on a caller-opened device.
@@ -67,6 +66,9 @@ pub struct Slab<C: Charge> {
     /// Recreate a regular slab file whose size differs from the configured capacity.
     reset_mismatched: bool,
 
+    /// Simulated filesystem for file-mode backing; `None` opens real files.
+    sim: RefCell<Option<racer_io::sim::SimOs>>,
+
     opened: RefCell<Option<OpenSlab>>,
 
     writes: Rc<WriteState>,
@@ -88,6 +90,7 @@ impl<C: Charge> Slab<C> {
             segment_bytes,
             max_record_bytes,
             reset_mismatched: false,
+            sim: RefCell::new(None),
             opened: RefCell::new(None),
             writes: Rc::new(WriteState::default()),
             idle_buffer: Rc::new(RefCell::new(crate::BufferPool::default())),
@@ -102,6 +105,13 @@ impl<C: Charge> Slab<C> {
     pub fn reset_mismatched_size(mut self) -> Self {
         self.reset_mismatched = true;
         self
+    }
+
+    /// Test support: open file-mode backing in `os` instead of the host
+    /// filesystem. Must be called before the slab is opened.
+    #[doc(hidden)]
+    pub fn simulate_in(&self, os: racer_io::sim::SimOs) {
+        *self.sim.borrow_mut() = Some(os);
     }
 
     /// Describe device ranges in logical segment order, without creating, sizing,
@@ -294,7 +304,7 @@ impl<C: Charge> Slab<C> {
 
     /// Configure an empty table, or validate an already configured partial table,
     /// and permanently bind this slab to that table's identity.
-    #[cfg(any(test, feature = "simulation"))]
+    #[doc(hidden)]
     pub fn configure_segments(&self, segments: &Segments) -> Result<()> {
         self.bind(segments)
     }
@@ -352,7 +362,7 @@ impl<C: Charge> Slab<C> {
     /// rename/unlink by other users. Linux traversal rejects symlinks and `..`;
     /// newly created directories are private. Existing files must be owned by the
     /// effective user, regular, singly linked, and mode 0600.
-    #[cfg(any(test, feature = "simulation"))]
+    #[doc(hidden)]
     pub fn open_now(&self) -> Result<Alignment> {
         self.open_file()
     }
@@ -408,8 +418,8 @@ impl<C: Charge> Slab<C> {
         {
             return Err(Error::InvalidConfiguration);
         }
-        #[cfg(feature = "simulation")]
-        if let Some(sim) = uring_runtime::reactor::simulation::Simulation::current() {
+        let sim = self.sim.borrow().clone();
+        if let Some(sim) = sim {
             if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
                 sim.create_dir_all(parent)
                     .map_err(|e| system_error("mkdir", e))?;
@@ -653,9 +663,9 @@ impl<C: Charge> Slab<C> {
     /// generation. Append only reserves space; recycled bytes may come from an
     /// earlier generation or a different cache. Before exposing a valid record,
     /// the caller must check its integrity, authentication, and cache identity.
-    pub fn read<'a, S: Scope, B: Budget>(
+    pub fn read<'a, S: Scope>(
         &'a self,
-        reactor: &'a Reactor<S, B>,
+        reactor: &'a Reactor<S>,
         extent: Extent,
         buffer: AlignedBuffer<C>,
         lease: SegmentLease,
@@ -671,15 +681,54 @@ impl<C: Charge> Slab<C> {
         })
     }
 
+    /// Read exactly one checked extent into a pooled [`crate::buf::Buf`].
+    ///
+    /// Ownership rules match [`Self::read`]: the buffer and lease stay with the
+    /// kernel until completion, and the bytes prove nothing until the caller
+    /// validates them. The buffer's length must equal the extent length and its
+    /// first byte must meet the slab's memory alignment. Unlike [`Self::read`],
+    /// dropping the returned buffer returns its storage to the owning pool.
+    pub fn read_buf<'a, D: Charge, S: Scope>(
+        &'a self,
+        reactor: &'a Reactor<S>,
+        extent: Extent,
+        buffer: crate::buf::Buf<D>,
+        lease: SegmentLease,
+        scope: &'a S,
+    ) -> Operation<'a, crate::buf::Buf<D>, S::Error>
+    where
+        S::Error: From<Error>,
+    {
+        Box::pin(async move {
+            let (file, extent) = self.locate_checked(extent, &lease, |alignment, extent| {
+                if !(buffer.as_ptr() as usize).is_multiple_of(alignment.memory())
+                    || !extent.offset().is_multiple_of(alignment.offset())
+                    || !extent.length().is_multiple_of(alignment.length())
+                    || buffer.len() != extent.length()
+                {
+                    return Err(Error::InvalidConfiguration);
+                }
+                Ok(())
+            })?;
+            let completion = reactor
+                .read_at(file, extent.offset(), buffer, lease, scope)
+                .await?;
+            if completion.bytes != extent.length() {
+                return Err(Error::Io.into());
+            }
+            Ok(completion.buffer)
+        })
+    }
+
     /// Write exactly one checked extent with completion-owned accounting and lease.
     /// Failed writes do not roll back the space reserved by append.
     /// Any lease permits writes within its captured prefix, including a lease from
     /// [`Segments::lease`]; it does not grant exclusive record ownership. The trusted
     /// caller must write only reserved extents it owns, never overwrite published or
     /// readable records, and publish a mapping only after the write succeeds.
-    pub fn write<'a, S: Scope, B: Budget>(
+    pub fn write<'a, S: Scope>(
         &'a self,
-        reactor: &'a Reactor<S, B>,
+        reactor: &'a Reactor<S>,
         extent: Extent,
         buffer: AlignedBuffer<C>,
         lease: SegmentLease,
@@ -703,9 +752,9 @@ impl<C: Charge> Slab<C> {
     /// sum to the extent length. Fencing, lease ownership, and the caller
     /// obligations match [`Self::write`]. A short or failed completion is an
     /// error and drops both owners after completion; success returns them.
-    pub fn write_vectored<'a, S: Scope, B: Budget, T: SharedWriteBuffer>(
+    pub fn write_vectored<'a, S: Scope, T: SharedWriteBuffer>(
         &'a self,
-        reactor: &'a Reactor<S, B>,
+        reactor: &'a Reactor<S>,
         extent: Extent,
         header: AlignedBuffer<C>,
         body: T,
@@ -713,7 +762,7 @@ impl<C: Charge> Slab<C> {
         scope: &'a S,
     ) -> Operation<'a, (AlignedBuffer<C>, T), S::Error>
     where
-        S::Error: From<Error> + From<T::Error>,
+        S::Error: From<Error>,
     {
         Box::pin(async move {
             let (file, extent) = {
@@ -764,14 +813,12 @@ impl<C: Charge> Slab<C> {
     }
 
     /// Replace file-mode backing for fault tests; device mode is rejected.
-    #[cfg(feature = "simulation")]
     #[doc(hidden)]
     pub fn replace_file_for_test(&self, file: File) -> Result<()> {
         self.replace_descriptor_for_test(file.into())
     }
 
     /// Accept a virtual descriptor for file-mode fault tests; geometry stays unchanged.
-    #[cfg(feature = "simulation")]
     #[doc(hidden)]
     pub fn replace_descriptor_for_test(&self, file: Descriptor) -> Result<()> {
         if self.writes_in_flight() != 0 {
@@ -839,9 +886,9 @@ struct Submission<C: Charge> {
 
 impl<C: Charge> Submission<C> {
     /// Move the complete read capability into the reactor's completion ownership.
-    async fn read<S: Scope, B: Budget>(
+    async fn read<S: Scope>(
         self,
-        reactor: &Reactor<S, B>,
+        reactor: &Reactor<S>,
         scope: &S,
     ) -> std::result::Result<AlignedBuffer<C>, S::Error>
     where
@@ -860,9 +907,9 @@ impl<C: Charge> Submission<C> {
     }
 
     /// Move the write capability and its counter guard into completion ownership.
-    async fn write<S: Scope, B: Budget>(
+    async fn write<S: Scope>(
         self,
-        reactor: &Reactor<S, B>,
+        reactor: &Reactor<S>,
         scope: &S,
         fence: WriteFence,
     ) -> std::result::Result<AlignedBuffer<C>, S::Error>
@@ -1616,23 +1663,22 @@ mod tests {
     }
 
     /// Device submissions keep completion error handling and release their fences.
-    #[cfg(feature = "simulation")]
     #[test]
     fn device_io_faults_release_completion_resources() {
-        use uring_runtime::reactor::simulation::{Fault, Simulation};
+        use racer_io::sim::Fault;
 
         #[derive(Clone, Copy, Debug, PartialEq)]
         enum TestError {
             Alloc(Error),
-            Runtime(uring_runtime::Error),
+            Runtime(racer_io::Error),
         }
         impl From<Error> for TestError {
             fn from(error: Error) -> Self {
                 Self::Alloc(error)
             }
         }
-        impl From<uring_runtime::Error> for TestError {
-            fn from(error: uring_runtime::Error) -> Self {
+        impl From<racer_io::Error> for TestError {
+            fn from(error: racer_io::Error) -> Self {
                 Self::Runtime(error)
             }
         }
@@ -1656,8 +1702,8 @@ mod tests {
         let _ = slab.open_configured(&segments).unwrap();
         let (lease, extent) = segments.append(4096).unwrap();
         drop(lease);
-        let sim = Simulation::new();
-        let _environment = sim.enter();
+        let sim = racer_io::sim::SimOs::new();
+        let env = racer_io::Env::sim(&sim, racer_io::WorkerCtx::host());
         let descriptor = sim
             .open(
                 None,
@@ -1672,13 +1718,13 @@ mod tests {
         };
         placements[0].file = Rc::new(descriptor);
         drop(opened);
-        let reactor = Reactor::<TestScope, ()>::new(16, ());
+        let reactor = Reactor::<TestScope>::new(16, &env);
         for write in [false, true] {
             for (fault, expected) in [
                 (Fault::Short(512), TestError::Alloc(Error::Io)),
                 (
                     Fault::Errno(libc::EIO),
-                    TestError::Runtime(uring_runtime::Error::Os(libc::EIO)),
+                    TestError::Runtime(racer_io::Error::Os(libc::EIO)),
                 ),
             ] {
                 sim.inject(if write { "write" } else { "read" }, fault)
@@ -2055,7 +2101,7 @@ mod tests {
         let old = Arc::new(WakeCount::default());
         let current = Arc::new(WakeCount::default());
         let other = Arc::new(WakeCount::default());
-        let cancelled = Arc::new(WakeCount::default());
+        let canceled = Arc::new(WakeCount::default());
         let poll = |op: &mut Operation<'_, (), Error>, wakes: &Arc<WakeCount>| {
             op.as_mut()
                 .poll(&mut Context::from_waker(&Waker::from(wakes.clone())))
@@ -2066,17 +2112,17 @@ mod tests {
         assert!(poll(&mut one, &old).is_pending());
         assert!(poll(&mut one, &current).is_pending());
         assert!(poll(&mut two, &other).is_pending());
-        assert!(poll(&mut abandoned, &cancelled).is_pending());
+        assert!(poll(&mut abandoned, &canceled).is_pending());
         assert_eq!(slab.writes.waiters.borrow().len(), 3);
         drop(abandoned);
         assert_eq!(slab.writes.waiters.borrow().len(), 2);
         drop(first_write);
-        for count in [&old, &current, &other, &cancelled] {
+        for count in [&old, &current, &other, &canceled] {
             assert_eq!(count.0.load(Ordering::Relaxed), 0);
         }
         drop(last_write);
         assert_eq!(old.0.load(Ordering::Relaxed), 0);
-        assert_eq!(cancelled.0.load(Ordering::Relaxed), 0);
+        assert_eq!(canceled.0.load(Ordering::Relaxed), 0);
         assert_eq!(current.0.load(Ordering::Relaxed), 1);
         assert_eq!(other.0.load(Ordering::Relaxed), 1);
         assert!(slab.writes.waiters.borrow().is_empty());

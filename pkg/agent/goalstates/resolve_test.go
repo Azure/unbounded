@@ -80,6 +80,46 @@ func TestResolveMachineUsesCurrentNVIDIAHostDiscovery(t *testing.T) {
 	})
 }
 
+func TestResolveMachineNvidiaToolkit(t *testing.T) {
+	t.Parallel()
+
+	toolkit := &config.NvidiaToolkitConfig{CTKPath: "/opt/tk/nvidia-ctk", ContainerRuntimePath: "/opt/tk/nvidia-container-runtime"}
+	resolve := func(t *testing.T, cfg *config.AgentConfig) *MachineGoalState {
+		t.Helper()
+
+		gs, err := resolveMachine(
+			discardLogger(), cfg, NSpawnMachineKube1, nil,
+			func(string) (NvidiaHost, error) { return completeResolvedNVIDIA(), nil }, true,
+		)
+		require.NoError(t, err)
+
+		return gs
+	}
+
+	t.Run("mode none uses the configured paths", func(t *testing.T) {
+		gs := resolve(t, &config.AgentConfig{Isolation: "none", NvidiaToolkit: toolkit})
+		require.Equal(t, "/opt/tk/nvidia-ctk", gs.NodeStart.NvidiaToolkit.CTK())
+		require.Equal(t, "/opt/tk/nvidia-container-runtime", gs.NodeStart.NvidiaToolkit.ContainerRuntime())
+		require.Equal(t, "/opt/tk/nvidia-container-runtime", gs.NodeStart.Containerd.NvidiaRuntime.RuntimePath)
+	})
+
+	t.Run("no setting is the default for every mode", func(t *testing.T) {
+		for _, mode := range []string{"", "nspawn", "none", "container"} {
+			gs := resolve(t, &config.AgentConfig{Isolation: mode})
+			require.Equal(t, NvidiaToolkit{}, gs.NodeStart.NvidiaToolkit, mode)
+			require.Equal(t, NvidiaContainerRuntimePath, gs.NodeStart.Containerd.NvidiaRuntime.RuntimePath, mode)
+		}
+	})
+
+	t.Run("the other modes ignore it", func(t *testing.T) {
+		for _, mode := range []string{"", "nspawn", "container"} {
+			gs := resolve(t, &config.AgentConfig{Isolation: mode, NvidiaToolkit: toolkit})
+			require.Equal(t, NvidiaToolkit{}, gs.NodeStart.NvidiaToolkit, mode)
+			require.Equal(t, NvidiaContainerRuntimePath, gs.NodeStart.Containerd.NvidiaRuntime.RuntimePath, mode)
+		}
+	})
+}
+
 func completeResolvedNVIDIA() NvidiaHost {
 	return NvidiaHost{
 		GPUDevicePaths: []string{"/dev/nvidia0"},

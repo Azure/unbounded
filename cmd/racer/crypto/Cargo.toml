@@ -14,14 +14,20 @@ test-util = []
 base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-racer-control-wire = { path = "../control-wire" }
-uring-runtime = { path = "../runtime" }
+racer-wire = { path = "../wire" }
+getrandom = "0.2"
 rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 x509-parser = { version = "0.16", features = ["verify"] }
 chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc", "zeroize"] }
 aes = { version = "0.9", features = ["zeroize"] }
-ring = "0.17"
+# Page AES-256-GCM. Unlike ring it opens out of place, so a page decrypts
+# straight from the ciphertext buffer into its destination. The default cc
+# builder needs only a C compiler: no cmake, bindgen, Go, or FIPS module.
+aws-lc-rs = { version = "1.19", default-features = false, features = ["aws-lc-sys"] }
+# Streaming AES-256-GCM (EVP) for the fused copy-and-open; the same library
+# aws-lc-rs links, with the same features.
+aws-lc-sys = { version = "0.47", default-features = false }
 # Wipe the buffered stream cipher wrapper as well as the ChaCha20 core.
 cipher = { version = "0.5", features = ["zeroize"] }
 # chacha20poly1305/zeroize does not forward Poly1305 state wiping.
@@ -29,10 +35,15 @@ poly1305 = { version = "0.9", features = ["zeroize"] }
 ed25519-dalek = { version = "2", features = ["pkcs8"] }
 sha2 = "0.10"
 zeroize = "1"
-crc64fast = "1.1.0"
+# Tag-only page verification (GHASH without decrypting).
+ghash = { version = "0.6", features = ["zeroize"] }
 
 [dev-dependencies]
 # Reference implementation used only as a test oracle for the page cipher.
+# Previous page AEAD backend, kept as an interoperability oracle.
+ring = "0.17"
 xaes-256-gcm = { version = "0.1", default-features = false, features = ["zeroize"] }
 futures = "0.3"
-uring-runtime = { path = "../runtime", features = ["simulation"] }
+# NUMA binding and the production non-temporal copy for the fused_numa bench.
+libc = "0.2"
+page-alloc = { path = "../alloc" }

@@ -12,7 +12,6 @@
 use crate::error::Error;
 use crate::gpu::CufileDisable;
 use crate::gpu::GpuHelper;
-use crate::rdma::LinkNode;
 use std::fmt::Write;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -73,17 +72,16 @@ impl GpuReadOutcome {
     }
 }
 
-/// Samples written without a GPU helper: one per request outcome, plus
-/// `racer_gpu_enabled` and `racer_gpu_standby`.
-pub const BASE_SERIES: usize = GpuReadOutcome::ALL.len() + 2;
+/// Samples written without a GPU helper: `racer_gpu_enabled` and
+/// `racer_gpu_standby`. Request outcomes are worker-sharded `Event` counters.
+pub const BASE_SERIES: usize = 2;
 
 /// GPU metric sources shared by every worker's metrics handle.
 #[derive(Default)]
 pub struct GpuTelemetry {
     helper: OnceLock<Arc<GpuHelper>>,
     slot: OnceLock<Arc<crate::gpu_slot::GpuSlot>>,
-    links: OnceLock<Arc<LinkNode>>,
-    requests: [AtomicU64; GpuReadOutcome::ALL.len()],
+    landing: OnceLock<Arc<crate::gpu_landing::GpuLandingRegistry>>,
 }
 
 impl GpuTelemetry {
@@ -99,35 +97,13 @@ impl GpuTelemetry {
         let _ = self.slot.set(slot);
     }
 
-    /// Report GPU landing state from this link node. Later calls are ignored.
-    pub fn attach_links(&self, links: Arc<LinkNode>) {
-        let _ = self.links.set(links);
-    }
-
-    /// Count one `gpu-read` request head.
-    pub fn record_request(&self, outcome: GpuReadOutcome) {
-        let counter = &self.requests[outcome as usize];
-        let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-            Some(v.saturating_add(1))
-        });
-    }
-
-    /// Requests counted with `outcome`.
-    pub fn requests(&self, outcome: GpuReadOutcome) -> u64 {
-        self.requests[outcome as usize].load(Ordering::Relaxed)
+    /// Report GPU landing state from this registry. Later calls are ignored.
+    pub fn attach_landing(&self, landing: Arc<crate::gpu_landing::GpuLandingRegistry>) {
+        let _ = self.landing.set(landing);
     }
 
     /// Write every GPU series in Prometheus text format.
     pub fn write(&self, out: &mut impl Write) -> std::fmt::Result {
-        writeln!(out, "# TYPE racer_gpu_read_requests_total counter")?;
-        for outcome in GpuReadOutcome::ALL {
-            writeln!(
-                out,
-                "racer_gpu_read_requests_total{{outcome=\"{}\"}} {}",
-                outcome.label(),
-                self.requests(outcome)
-            )?;
-        }
         let slot = self.slot.get();
         let helper = self
             .helper
@@ -154,7 +130,7 @@ impl GpuTelemetry {
                 out,
                 "racer_gpu_decrypt_available{{ordinal=\"{}\",uuid=\"{}\"}} {}",
                 device.ordinal,
-                device.uuid_string(),
+                device.display_id(),
                 u8::from(helper.decrypts(device.ordinal))
             )?;
         }
@@ -165,6 +141,15 @@ impl GpuTelemetry {
                 "racer_gpu_staging_slots_free{{ordinal=\"{}\"}} {}",
                 device.ordinal,
                 helper.free_slots(device.ordinal)
+            )?;
+        }
+        writeln!(out, "# TYPE racer_gpu_executor_queued gauge")?;
+        for device in helper.devices() {
+            writeln!(
+                out,
+                "racer_gpu_executor_queued{{ordinal=\"{}\"}} {}",
+                device.ordinal,
+                helper.queued(device.ordinal)
             )?;
         }
         let counters = helper.counters();
@@ -245,6 +230,11 @@ impl GpuTelemetry {
                 load(&counters.peer_bounces),
             ),
             (
+                "racer_gpu_executor_queue_full_total",
+                "counter",
+                load(&counters.queue_full),
+            ),
+            (
                 "racer_gpu_open_requests",
                 "gauge",
                 helper.open_requests() as u64,
@@ -253,10 +243,10 @@ impl GpuTelemetry {
         ] {
             writeln!(out, "# TYPE {name} {kind}\n{name} {value}")?;
         }
-        if let Some(links) = self.links.get()
-            && links.gpu_landing_configured()
+        if let Some(landing) = self.landing.get()
+            && landing.configured()
         {
-            let rails = links.landing_state();
+            let rails = landing.state();
             writeln!(out, "# TYPE racer_gpu_landing_enabled gauge")?;
             for (rail, state) in &rails {
                 writeln!(
@@ -275,7 +265,7 @@ impl GpuTelemetry {
                 }
             }
             writeln!(out, "# TYPE racer_gpu_landing_exhausted_total counter")?;
-            for ((rail, ordinal), count) in links.landing_exhausted() {
+            for ((rail, ordinal), count) in landing.exhausted() {
                 writeln!(
                     out,
                     "racer_gpu_landing_exhausted_total{{rail=\"{rail}\",ordinal=\"{ordinal}\"}} {count}"
@@ -315,18 +305,15 @@ mod tests {
     }
 
     #[test]
-    fn without_a_helper_only_requests_and_enabled_render() {
+    fn without_a_helper_only_enabled_and_standby_render() {
         let telemetry = GpuTelemetry::default();
-        telemetry.record_request(GpuReadOutcome::NotEnabled);
-        telemetry.record_request(GpuReadOutcome::NotEnabled);
         let text = render(&telemetry);
-        assert!(text.contains("racer_gpu_read_requests_total{outcome=\"not_enabled\"} 2\n"));
-        assert!(text.contains("racer_gpu_read_requests_total{outcome=\"gpu\"} 0\n"));
+        assert!(!text.contains("racer_gpu_read_requests_total"));
         assert!(text.contains("racer_gpu_enabled 0\n"));
         assert!(text.contains("racer_gpu_standby 0\n"));
         assert!(!text.contains("racer_gpu_cufile_enabled"));
         assert!(!text.contains("racer_gpu_landing"));
-        assert_eq!(text.matches("# TYPE").count(), 3);
+        assert_eq!(text.matches("# TYPE").count(), 2);
         assert_eq!(
             text.lines().filter(|l| !l.starts_with('#')).count(),
             BASE_SERIES
@@ -366,11 +353,30 @@ mod tests {
     }
 
     #[test]
-    fn request_counter_saturates() {
-        let telemetry = GpuTelemetry::default();
-        telemetry.requests[0].store(u64::MAX, Ordering::Relaxed);
-        telemetry.record_request(GpuReadOutcome::Gpu);
-        assert_eq!(telemetry.requests(GpuReadOutcome::Gpu), u64::MAX);
+    fn request_outcomes_are_labeled_worker_counters_that_wrap() {
+        let workers = crate::telemetry::Metrics::for_workers(2).unwrap();
+        for outcome in GpuReadOutcome::ALL {
+            workers[0].record_gpu_request(outcome);
+            workers[1].record_gpu_request(outcome);
+            workers[1].record_gpu_request(outcome);
+        }
+        let mut text = String::new();
+        workers[0].write_prometheus(&mut text).unwrap();
+        assert_eq!(
+            text.matches("# TYPE racer_gpu_read_requests_total counter\n")
+                .count(),
+            1
+        );
+        for outcome in GpuReadOutcome::ALL {
+            assert_eq!(workers[0].gpu_requests(outcome), 3);
+            assert!(text.contains(&format!(
+                "racer_gpu_read_requests_total{{outcome=\"{}\"}} 3\n",
+                outcome.label()
+            )));
+        }
+        workers[0].record_gpu_request(GpuReadOutcome::Busy);
+        workers[1].record(crate::telemetry::Event::GpuReadBusy, u64::MAX - 3);
+        assert_eq!(workers[0].gpu_requests(GpuReadOutcome::Busy), 0);
     }
 
     #[test]
@@ -381,15 +387,16 @@ mod tests {
         helper.counters().cufile_disabled(CufileDisable::FileOpen);
         let telemetry = GpuTelemetry::default();
         telemetry.attach_helper(helper.clone());
-        let links = Arc::new(LinkNode::default());
-        telemetry.attach_links(links.clone());
+        let links = Arc::new(crate::rdma::LinkNode::default());
+        telemetry.attach_landing(links.gpu_landing().clone());
         let text = render(&telemetry);
         for name in [
-            "racer_gpu_read_requests_total",
             "racer_gpu_enabled",
             "racer_gpu_standby",
             "racer_gpu_decrypt_available",
             "racer_gpu_staging_slots_free",
+            "racer_gpu_executor_queued",
+            "racer_gpu_executor_queue_full_total",
             "racer_gpu_cufile_enabled",
             "racer_gpu_cufile_disabled_total",
             "racer_gpu_read_pages_total",
@@ -420,7 +427,7 @@ mod tests {
             1
         );
         assert!(!text.contains("racer_gpu_joined"));
-        let uuid = helper.devices()[0].uuid_string();
+        let uuid = helper.devices()[0].display_id();
         assert!(text.contains(&format!(
             "racer_gpu_decrypt_available{{ordinal=\"0\",uuid=\"{uuid}\"}} 1\n"
         )));
@@ -431,9 +438,9 @@ mod tests {
         assert!(text.contains("# TYPE racer_gpu_landing_enabled gauge\n"));
         assert!(text.contains("# TYPE racer_gpu_landing_slots gauge\n"));
         assert!(text.contains("# TYPE racer_gpu_landing_exhausted_total counter\n"));
-        links.count_landing_exhausted(racer_control_wire::RailId(2), 0);
-        links.count_landing_exhausted(racer_control_wire::RailId(2), 0);
-        links.count_landing_exhausted(racer_control_wire::RailId(1), 3);
+        links.count_landing_exhausted(racer_wire::control::RailId(2), 0);
+        links.count_landing_exhausted(racer_wire::control::RailId(2), 0);
+        links.count_landing_exhausted(racer_wire::control::RailId(1), 3);
         let text = render(&telemetry);
         assert!(text.contains(
             "racer_gpu_landing_exhausted_total{rail=\"1\",ordinal=\"3\"} 1\n\

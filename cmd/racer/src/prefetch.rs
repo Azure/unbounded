@@ -79,8 +79,8 @@ impl Config {
     }
 
     /// Bounds the client-socket parser enforces before reading a body.
-    pub fn limits(&self) -> racer_object_wire::prefetch::Limits {
-        racer_object_wire::prefetch::Limits {
+    pub fn limits(&self) -> racer_wire::object::prefetch::Limits {
+        racer_wire::object::prefetch::Limits {
             max_body_bytes: self.max_body_bytes,
             max_wait: std::time::Duration::from_secs(self.max_wait_secs),
         }

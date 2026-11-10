@@ -1,0 +1,13 @@
+[package]
+name = "racer-flow-core"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+description = "Pure flow-control mechanisms shared by racer-core and flow-control"
+
+[lib]
+name = "racer_flow_core"
+
+[dependencies]
+futures = "0.3"

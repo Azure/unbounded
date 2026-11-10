@@ -2,6 +2,8 @@
 use super::*;
 use crate::admission::AdmissionPolicy;
 use crate::admission::ResourceClass;
+#[cfg(test)]
+use crate::lifecycle::Service;
 use crate::memory::BufferPool;
 use crate::model::MetadataSelector;
 use crate::model::Nonce;
@@ -19,20 +21,17 @@ use crate::runtime::RequestScope;
 use crate::security::EncryptedAuthorization;
 use crate::security::PeerOriginContext;
 use crate::topology::RouteBudget;
-use racer_control_wire::CacheId;
-use racer_control_wire::ClusterId;
-use racer_control_wire::KeyId;
 use racer_crypto::identity::Certificates;
 use racer_crypto::identity::Keyring;
+use racer_io::deadline::Deadline;
+use racer_io::ring::IoBuffer;
+use racer_wire::control::CacheId;
+use racer_wire::control::ClusterId;
+use racer_wire::control::KeyId;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
-use uring_runtime::environment::Deadline;
-use uring_runtime::environment::SimulationClock;
-#[cfg(test)]
-use uring_runtime::group::Service;
-use uring_runtime::reactor::IoBuffer;
 
 mod body_progress {
     use super::*;
@@ -52,27 +51,31 @@ mod body_progress {
 
     #[test]
     fn progressing_body_diagnostics_success_share_expiry_cancel_and_eof() {
-        body_cases(&["success", "share", "cancel", "eof"]);
+        let env = racer_io::Env::host();
+        body_cases(&env, &["success", "share", "cancel", "eof"]);
     }
 
     #[test]
     fn progressing_body_completes_past_share_stall_and_trickle_are_bounded() {
-        body_cases(&["progress", "stall", "hard", "idle_cancel"]);
+        let env = racer_io::Env::host();
+        body_cases(&env, &["progress", "stall", "hard", "idle_cancel"]);
     }
 
     #[test]
     fn known_body_reserve_keeps_healthy_progress_but_bounds_slow_progress() {
-        body_cases(&["reserved_progress", "reserved_slow"]);
+        let env = racer_io::Env::host();
+        body_cases(&env, &["reserved_progress", "reserved_slow"]);
     }
 
     #[test]
     fn local_total_cap_bounds_progress_and_pending_body_without_shortening_wire_authority() {
-        body_cases(&["capped_progress", "capped_trickle", "capped_stall"]);
+        let env = racer_io::Env::host();
+        body_cases(&env, &["capped_progress", "capped_trickle", "capped_stall"]);
     }
 
-    fn body_cases(cases: &[&str]) {
+    fn body_cases(env: &racer_io::Env, cases: &[&str]) {
         for &case in cases {
-            BodyFixture::new(case).run(case);
+            BodyFixture::new(env, case).run(case);
         }
     }
 
@@ -98,7 +101,7 @@ mod body_progress {
     }
 
     impl BodyFixture {
-        fn new(case: &str) -> Self {
+        fn new(env: &racer_io::Env, case: &str) -> Self {
             let idle = matches!(
                 case,
                 "progress"
@@ -118,7 +121,7 @@ mod body_progress {
             admission
                 .policy()
                 .set_observer(telemetry.failures.observer(WorkerId(2)));
-            let reactor = Rc::new(Reactor::new(admission.clone()));
+            let reactor = Rc::new(Reactor::new(admission.clone(), env));
             let io = Rc::new(crate::http::new_io(
                 reactor.clone(),
                 Codec::new(protocol::MAX_ENVELOPE_HEAD),
@@ -126,7 +129,7 @@ mod body_progress {
                 crate::model::PAGE_BYTES + 16,
             ));
             let pool = Rc::new(crate::http::new_pool(reactor.clone(), admission.clone(), 1));
-            let signers = signers();
+            let signers = signers(env);
             let transfers = transport::Transfers::new(
                 pool.clone(),
                 io.clone(),
@@ -142,8 +145,17 @@ mod body_progress {
                 } else {
                     Duration::from_secs(3)
                 };
-            let share = start + Duration::from_millis(250);
-            let mut local = request(&admission, 9);
+            // Only cases that assert on the share's expiry use the short share.
+            // Success, cancel, and EOF end on their own terms, so their share is
+            // far enough out that setup and paced writes on a loaded host cannot
+            // reach it and turn the expected outcome into `DeadlineExceeded`.
+            let share = start
+                + if matches!(case, "success" | "cancel" | "eof") {
+                    Duration::from_millis(2500)
+                } else {
+                    Duration::from_millis(250)
+                };
+            let mut local = request(env, &admission, 9);
             let signed_deadline = if idle { original } else { share };
             local.route.deadline = Deadline(signed_deadline);
             local.origin.scope.deadline = Deadline(signed_deadline);
@@ -180,7 +192,7 @@ mod body_progress {
             // alive until the outer watchdog so crossing that deadline between
             // client and server polls cannot fail an otherwise valid assertion.
             let server_scope =
-                RequestScope::new(scope.request, start + Duration::from_secs(5)).unwrap();
+                RequestScope::host(scope.request, start + Duration::from_secs(5)).unwrap();
             Self {
                 idle,
                 telemetry,
@@ -224,7 +236,8 @@ mod body_progress {
                 signed,
                 binding,
             } = self;
-            let mut timing = super::super::PageTiming::new(&telemetry.metrics);
+            let mut timing =
+                super::super::PageTiming::new(&telemetry.metrics, racer_io::Clock::host());
             let address = listener.local_addr().unwrap();
             let fixture_end = start + Duration::from_secs(5);
             let sent = Cell::new(0usize);
@@ -237,7 +250,11 @@ mod body_progress {
                     crate::peer::protocol::accept(&io, conn, signers[2].clone(), &server_scope)
                         .await?;
                 let received = io.receive_head(conn, &server_scope).await?;
-                let (head, _) = decode_envelope(received.value, false)?;
+                let (head, _) = decode_envelope(
+                    received.value,
+                    false,
+                    crate::peer::protocol::chains(&received.connection)?,
+                )?;
                 let remote_auth = Forwarding::new(signers[2].clone());
                 let req =
                     remote_auth.verify_request(codec(&admission).request(head, &server_scope)?)?;
@@ -270,6 +287,7 @@ mod body_progress {
                         bytes.len(),
                     )?,
                     PageEnvelope {
+                        page_size: racer_wire::object::PageSize::DEFAULT,
                         cipher: crate::model::PageCipher::Xaes256Gcm,
                         page: page.clone(),
                         key_id: KeyId([1; 16]),
@@ -386,7 +404,7 @@ mod body_progress {
                 }
             } else {
                 assert!(
-                    matches!(result, Err(e) if e == match case { "share" | "stall" | "hard" | "reserved_slow" | "capped_trickle" | "capped_stall" => Error::DeadlineExceeded, "cancel" | "idle_cancel" => Error::Cancelled, _ => Error::Io }),
+                    matches!(result, Err(e) if e == match case { "share" | "stall" | "hard" | "reserved_slow" | "capped_trickle" | "capped_stall" => Error::DeadlineExceeded, "cancel" | "idle_cancel" => Error::Canceled, _ => Error::Io }),
                     "{case}"
                 );
             }
@@ -475,7 +493,6 @@ mod body_progress {
             drop(drain);
             drop(io);
             drop(binding);
-            admission.reclaim_buffers();
             assert_eq!(reactor.in_flight(), 0);
             drop(reactor);
             for class in [
@@ -579,23 +596,26 @@ mod destination_disconnect {
 
     #[test]
     fn destination_fin_detaches_only_its_waiter_from_pending_acquisition() {
-        destination_exchange(CompletionOrder::FailureAfterFin);
+        let env = racer_io::Env::host();
+        destination_exchange(&env, CompletionOrder::FailureAfterFin);
     }
 
     #[test]
     fn destination_success_fences_watch_and_delivers_shared_page() {
-        destination_exchange(CompletionOrder::Success);
+        let env = racer_io::Env::host();
+        destination_exchange(&env, CompletionOrder::Success);
     }
 
     #[test]
     fn destination_completion_fin_race_preserves_independent_callers() {
+        let env = racer_io::Env::host();
         for order in [
             CompletionOrder::FinThenComplete,
             CompletionOrder::CompleteThenFin,
             CompletionOrder::FinWhileCompletionFences,
             CompletionOrder::SuccessAfterFin,
         ] {
-            destination_exchange(order);
+            destination_exchange(&env, order);
         }
     }
 
@@ -630,19 +650,16 @@ mod destination_disconnect {
             plaintext: VerifiedPage {
                 inner: Arc::new(VerifiedBytes {
                     page: page.clone(),
-                    storage: flow_control::ChargedBytes {
-                        bytes: vec![1, 2, 3],
-                        reservation: admission
-                            .reserve(None, ResourceClass::Plaintext, 3)
-                            .unwrap(),
-                    },
+                    storage: crate::memory::fixture_plaintext(admission, None, &[1, 2, 3]),
                 }),
             },
             ciphertext: CiphertextPage {
+                pinned: true,
                 provenance: None,
                 inner: Arc::new(CiphertextBytes {
-                    checksum: std::sync::OnceLock::new(),
+                    pins: Default::default(),
                     envelope: PageEnvelope {
+                        page_size: racer_wire::object::PageSize::DEFAULT,
                         cipher: crate::model::PageCipher::Xaes256Gcm,
                         page: page.clone(),
                         key_id: KeyId([1; 16]),
@@ -650,20 +667,14 @@ mod destination_disconnect {
                         plaintext_length: 3,
                         ciphertext_length: 19,
                     },
-                    storage: flow_control::ChargedBytes {
-                        bytes: vec![7; 19],
-                        reservation: admission
-                            .reserve(None, ResourceClass::Ciphertext, 19)
-                            .unwrap(),
-                    }
-                    .into(),
+                    storage: crate::memory::fixture_ciphertext_storage(admission, None, &[7; 19]),
                 }),
             },
         }
     }
 
-    fn destination_exchange(order: CompletionOrder) {
-        DestinationFixture::new().run(order);
+    fn destination_exchange(env: &racer_io::Env, order: CompletionOrder) {
+        DestinationFixture::new(env).run(env, order);
     }
 
     struct DestinationFixture {
@@ -681,11 +692,11 @@ mod destination_disconnect {
     }
 
     impl DestinationFixture {
-        fn new() -> Self {
+        fn new(env: &racer_io::Env) -> Self {
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(false).limits,
             )));
-            let reactor = Rc::new(Reactor::new(admission.clone()));
+            let reactor = Rc::new(Reactor::new(admission.clone(), env));
             reactor.init().unwrap();
             let io = Rc::new(crate::http::new_io(
                 reactor.clone(),
@@ -693,7 +704,7 @@ mod destination_disconnect {
                 admission.clone(),
                 crate::model::PAGE_BYTES + 16,
             ));
-            let signers = signers();
+            let signers = signers(env);
             let forwarding = Rc::new(Forwarding::new(signers[2].clone()));
             let membership = Arc::new(
                 Membership::validate(
@@ -716,6 +727,7 @@ mod destination_disconnect {
                 PeerNetwork::new(
                     NodeId(C.into()),
                     crate::test_support::published_membership(membership.clone()),
+                    racer_io::Clock::host(),
                 )
                 .unwrap(),
             );
@@ -731,16 +743,21 @@ mod destination_disconnect {
             };
             let flights = Rc::new(Flights::new(
                 admission.clone(),
-                crate::test_support::availability_for(vec![CacheId(CACHE.into())]),
+                crate::test_support::availability_for(env, vec![CacheId(CACHE.into())]),
+                racer_io::Clock::host(),
+                Rc::new(crate::drivers::DriverQueue::new(1024)),
             ));
             let service = Rc::new(PendingPage {
                 flights: flights.clone(),
                 page: page.clone(),
                 entered: Cell::new(0),
             });
-            let outbound = NoOutbound::new(signers[2].clone(), network.clone());
+            let outbound = NoOutbound::new(env, signers[2].clone(), network.clone());
             let relay = Rc::new(Relay::new(
-                Rc::new(Paths::new(Rc::new(LinkHealth::default()), 4)),
+                Rc::new(Paths::new(
+                    Rc::new(LinkHealth::on(env.ctx.clock.clone())),
+                    4,
+                )),
                 forwarding.clone(),
                 outbound.requester.clone(),
                 admission.clone(),
@@ -756,7 +773,7 @@ mod destination_disconnect {
                 signers[2].clone(),
             );
             let parent =
-                RequestScope::new(RequestId([9; 16]), Instant::now() + Duration::from_secs(60))
+                RequestScope::host(RequestId([9; 16]), Instant::now() + Duration::from_secs(60))
                     .unwrap();
             Self {
                 outbound,
@@ -773,7 +790,7 @@ mod destination_disconnect {
             }
         }
 
-        fn run(self, order: CompletionOrder) {
+        fn run(self, env: &racer_io::Env, order: CompletionOrder) {
             let Self {
                 outbound: _outbound,
                 admission,
@@ -787,7 +804,7 @@ mod destination_disconnect {
                 server,
                 parent,
             } = self;
-            let independent = RequestScope::new(RequestId([8; 16]), parent.deadline.0).unwrap();
+            let independent = RequestScope::host(RequestId([8; 16]), parent.deadline.0).unwrap();
             let origin = OriginContext {
                 object: page.version.object.clone(),
                 metadata: None,
@@ -826,7 +843,7 @@ mod destination_disconnect {
             let connection = crate::http::from_accepted(socket.into(), &admission).unwrap();
             let mut work = server.serve_connection(connection, &parent);
             let sender = Forwarding::new(signers[0].clone());
-            let mut request = request(&admission, 41);
+            let mut request = request(env, &admission, 41);
             request.operation = Operation::Page {
                 page: page.clone(),
                 mode: FetchMode::CopyOnly,
@@ -895,7 +912,7 @@ mod destination_disconnect {
                         upstream.shutdown(Shutdown::Write).unwrap();
                         assert!(matches!(
                             drive(&reactor, work.as_mut()),
-                            Err(Error::Cancelled)
+                            Err(Error::Canceled)
                         ));
                         assert_eq!(admission.used(ResourceClass::Waiter), 2);
                         assert_eq!(admission.used(ResourceClass::Flight), 1);
@@ -913,7 +930,12 @@ mod destination_disconnect {
                     assert_eq!(reactor.in_flight(), 0, "success must fence the FIN watch");
                     let received =
                         drive(&reactor, io.receive_head(client.connection, &parent)).unwrap();
-                    let (head, length) = decode_envelope(received.value, true).unwrap();
+                    let (head, length) = decode_envelope(
+                        received.value,
+                        true,
+                        crate::peer::protocol::chains(&received.connection).unwrap(),
+                    )
+                    .unwrap();
                     assert_eq!(length, result.ciphertext.bytes().len());
                     let mut connection = received.connection;
                     let mut bytes = Vec::new();
@@ -949,7 +971,7 @@ mod destination_disconnect {
                     if !matches!(order, CompletionOrder::SuccessAfterFin) {
                         assert!(matches!(
                             drive(&reactor, work.as_mut()),
-                            Err(Error::Cancelled)
+                            Err(Error::Canceled)
                         ));
                     }
                     drop(client);
@@ -989,7 +1011,7 @@ mod destination_disconnect {
             upstream.shutdown(Shutdown::Write).unwrap();
             assert!(matches!(
                 drive(&reactor, work.as_mut()),
-                Err(Error::Cancelled)
+                Err(Error::Canceled)
             ));
             drop(work);
             assert_eq!(parent.check(), Ok(()));
@@ -1034,10 +1056,10 @@ mod encrypted_http {
     use crate::security::PageCryptoEngine;
     use crate::telemetry::Event;
     use crate::telemetry::Metrics;
-    use racer_control_wire::CacheEncryptionKey;
-    use racer_control_wire::CacheKeyPurpose;
-    use racer_control_wire::CacheKeyRef;
-    use racer_control_wire::CacheKeyState;
+    use racer_wire::control::CacheEncryptionKey;
+    use racer_wire::control::CacheKeyPurpose;
+    use racer_wire::control::CacheKeyRef;
+    use racer_wire::control::CacheKeyState;
     use std::cell::Cell;
     use std::future::Future;
     use std::net::TcpListener;
@@ -1072,8 +1094,10 @@ mod encrypted_http {
 
     #[test]
     fn production_aad_http_roundtrip_cancel_reuse_and_mismatched_body() {
+        let env = racer_io::Env::host();
         // Each identity owns a different KeyEpochs store, populated from equal bundles.
         let identities = crate::test_support::security::identities(
+            &env,
             ClusterId(CLUSTER.into()),
             &[NodeId(A.into()), NodeId(C.into())],
             || {
@@ -1098,7 +1122,7 @@ mod encrypted_http {
                 )))
             })
             .collect();
-        let reactor = Rc::new(Reactor::new(admissions[0].clone()));
+        let reactor = Rc::new(Reactor::new(admissions[0].clone(), &env));
         let mut engines = Vec::new();
         let mut clients = Vec::new();
         let mut cryptos = Vec::new();
@@ -1113,9 +1137,16 @@ mod encrypted_http {
             if i == 0 {
                 client.set_metrics(metrics.clone());
             }
-            cryptos.push(PageCrypto::new(identity.keys.clone(), client.clone()));
+            cryptos.push(PageCrypto::new(
+                identity.keys.clone(),
+                client.clone(),
+                BufferPool::new(admissions[i].clone()),
+            ));
             clients.push(client);
-            engines.push(PageCryptoEngine::new(CryptoRuntime { port }));
+            engines.push(PageCryptoEngine::new(CryptoRuntime {
+                port,
+                ctx: racer_io::WorkerCtx::host(),
+            }));
         }
         let ios: Vec<_> = admissions
             .iter()
@@ -1140,8 +1171,9 @@ mod encrypted_http {
             Rc::new(codec(&admissions[0])),
             identities[0].signatures.clone(),
         );
-        let scope = RequestScope::new(RequestId([8; 16]), Instant::now() + Duration::from_secs(20))
-            .unwrap();
+        let scope =
+            RequestScope::host(RequestId([8; 16]), Instant::now() + Duration::from_secs(20))
+                .unwrap();
         let length = 1 << 20; // Enter the production recycled-payload pool.
         let mut pages: Vec<CiphertextPage> = Vec::new();
         let mut expected = Vec::new();
@@ -1178,7 +1210,13 @@ mod encrypted_http {
                 .reserve(Some(cache), ResourceClass::Ciphertext, length + 16)
                 .unwrap();
             let (verified, ciphertext) = drive(
-                cryptos[1].encrypt(page, plaintext, output, &scope),
+                cryptos[1].encrypt(
+                    page,
+                    racer_wire::object::PageSize::DEFAULT,
+                    plaintext,
+                    output,
+                    &scope,
+                ),
                 &reactor,
                 &mut engines,
                 &clients,
@@ -1192,10 +1230,8 @@ mod encrypted_http {
         assert_ne!(pages[0].envelope().nonce, pages[1].envelope().nonce);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = Endpoint::Peer(listener.local_addr().unwrap().to_string());
-        let listener = Rc::new(uring_runtime::reactor::descriptor::Descriptor::from(
-            listener,
-        ));
-        let canceled = RequestScope::new(RequestId([9; 16]), scope.deadline.0).unwrap();
+        let listener = Rc::new(racer_io::ring::Descriptor::from(listener));
+        let canceled = RequestScope::host(RequestId([9; 16]), scope.deadline.0).unwrap();
         let accepts = Cell::new(0);
         let prefix_sent = Cell::new(false);
         let server = async {
@@ -1218,7 +1254,11 @@ mod encrypted_http {
                     }
                 };
                 let received = ios[1].receive_head(conn, &scope).await?;
-                let (head, _) = decode_envelope(received.value, false)?;
+                let (head, _) = decode_envelope(
+                    received.value,
+                    false,
+                    crate::peer::protocol::chains(&received.connection)?,
+                )?;
                 let request = auth.verify_request(codec(&admissions[1]).request(head, &scope)?)?;
                 let index = usize::from(attempt == 2 || attempt == 4);
                 let ciphertext = &pages[index];
@@ -1257,11 +1297,10 @@ mod encrypted_http {
                         prefix_sent.set(true);
                         // Do not let cancellation race ahead of receive admission:
                         // the partial exchange must own a full aligned ciphertext
-                        // allocation, charged for its whole pooled size class.
+                        // allocation, charged for its whole granule-rounded capacity.
                         futures::future::poll_fn(|_| {
                             if admissions[0].used(ResourceClass::Ciphertext)
-                                == page_alloc::buffer_capacity((length + 16).next_multiple_of(4096))
-                                    .unwrap()
+                                == (length + 16).next_multiple_of(page_alloc::buf::GRANULE)
                             {
                                 Poll::Ready(())
                             } else {
@@ -1286,7 +1325,7 @@ mod encrypted_http {
             for attempt in 0..5u8 {
                 let index = usize::from(attempt == 2 || attempt == 4);
                 let page = &pages[index];
-                let mut request = request(&admissions[0], attempt);
+                let mut request = request(&env, &admissions[0], attempt);
                 request.origin.authorization = None;
                 request.origin.object = page.envelope().page.version.object.clone();
                 request.operation = Operation::Page {
@@ -1316,7 +1355,7 @@ mod encrypted_http {
                     .await;
                 if attempt == 0 {
                     assert!(prefix_sent.get());
-                    assert!(matches!(response, Err(Error::Cancelled)));
+                    assert!(matches!(response, Err(Error::Canceled)));
                     assert_eq!(metrics.count(Event::CryptoDecryptStarted), 0);
                     continue;
                 }
@@ -1342,17 +1381,15 @@ mod encrypted_http {
                     );
                 }
                 reused = Some(pointer);
-                // A receiver-computed CRC succeeds even for the wrong valid body.
-                assert_eq!(ciphertext.verify_checksum(), Ok(()));
                 let successes = metrics.count(Event::CryptoDecryptSuccess);
                 let clear = cryptos[0]
                     .decrypt(
                         ciphertext.clone(),
-                        admissions[0].reserve(
+                        crate::memory::fixture_plaintext(
+                            &admissions[0],
                             Some(&CacheId(CACHE.into())),
-                            ResourceClass::Plaintext,
-                            length,
-                        )?,
+                            &vec![0; length],
+                        ),
                         turn,
                     )
                     .await;
@@ -1364,7 +1401,6 @@ mod encrypted_http {
                         "mismatch cannot produce publishable plaintext"
                     );
                     assert_eq!(metrics.count(Event::CryptoDecryptAeadRejected), 1);
-                    assert_eq!(metrics.count(Event::CryptoDecryptCrcRejected), 0);
                 } else {
                     let clear = clear?;
                     assert_eq!(clear.page(), &page.envelope().page);
@@ -1389,7 +1425,6 @@ mod encrypted_http {
         );
         assert_eq!(metrics.count(Event::CryptoDecryptSuccess), 3);
         assert_eq!(metrics.count(Event::CryptoDecryptAeadRejected), 1);
-        assert_eq!(metrics.count(Event::CryptoDecryptCrcRejected), 0);
         assert!(clients.iter().all(|client| client.outstanding() == 0));
         drive(reactor.drain(), &reactor, &mut engines, &clients).unwrap();
         assert_eq!(reactor.in_flight(), 0);
@@ -1417,7 +1452,7 @@ mod requester_safety {
     use crate::topology::LinkHealth;
     use crate::topology::Member;
     use crate::topology::Membership;
-    use racer_control_wire::MembershipVersion;
+    use racer_wire::control::MembershipVersion;
     use std::sync::Arc;
     use std::task::Context;
     use std::task::Poll;
@@ -1426,26 +1461,29 @@ mod requester_safety {
 
     #[test]
     fn attached_requester_verification_and_opaque_outcome_gate_real_probe_recovery() {
+        let env = racer_io::Env::host();
         for opaque in [false, true] {
             for case in ["overloaded", "corrupt", "miss"] {
-                probe_exchange(opaque, case);
+                probe_exchange(&env, opaque, case);
             }
         }
     }
 
     #[test]
     fn direct_page_hedge_transport_pins_receiver_and_uses_shared_admission() {
-        probe_exchange(false, "direct");
+        let env = racer_io::Env::host();
+        probe_exchange(&env, false, "direct");
     }
 
     #[test]
     fn page_hedge_does_not_treat_multihop_destination_as_independent_first_hop() {
+        let env = racer_io::Env::host();
         let members = Arc::new(
             Membership::validate(
                 MembershipVersion(1),
                 (0..1500)
                     .map(|i| Member {
-                        node: racer_control_wire::NodeId(format!(
+                        node: racer_wire::control::NodeId(format!(
                             "{i:08x}-1111-4111-8111-111111111111"
                         )),
                         shares: std::num::NonZeroU32::new(1).unwrap(),
@@ -1462,6 +1500,7 @@ mod requester_safety {
             crate::peer::PeerNetwork::new(
                 local.clone(),
                 crate::test_support::published_membership(members.clone()),
+                racer_io::Clock::host(),
             )
             .unwrap(),
         );
@@ -1473,7 +1512,7 @@ mod requester_safety {
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         )));
-        let reactor = Rc::new(Reactor::new(admission.clone()));
+        let reactor = Rc::new(Reactor::new(admission.clone(), &env));
         let io = Rc::new(crate::http::new_io(
             reactor.clone(),
             Codec::new(crate::peer::protocol::MAX_ENVELOPE_HEAD),
@@ -1481,10 +1520,18 @@ mod requester_safety {
             0,
         ));
         let pool = Rc::new(crate::http::new_pool(reactor, admission.clone(), 2));
-        let adaptive = AdaptivePeers::new(Default::default(), Metrics::default()).unwrap();
-        let signers = crate::peer::tests::signers();
+        let adaptive = AdaptivePeers::new(
+            Default::default(),
+            Metrics::default(),
+            racer_io::Clock::host(),
+        )
+        .unwrap();
+        let signers = crate::peer::tests::signers(&env);
         let requester = Requester::new(
-            Rc::new(Paths::new(Rc::new(LinkHealth::default()), 4).with_peer_admission(adaptive)),
+            Rc::new(
+                Paths::new(Rc::new(LinkHealth::on(env.ctx.clock.clone())), 4)
+                    .with_peer_admission(adaptive),
+            ),
             Rc::new(Forwarding::new(signers[0].clone())),
             Rc::new(Transfers::new(
                 pool,
@@ -1498,9 +1545,9 @@ mod requester_safety {
         assert!(!requester.direct_hedge_available(&members, &nonneighbor.node));
     }
 
-    fn probe_exchange(opaque: bool, case: &str) {
-        let signers = crate::peer::tests::signers();
-        let fixture = super::SocketFixture::with_body_limit(2, 0);
+    fn probe_exchange(env: &racer_io::Env, opaque: bool, case: &str) {
+        let signers = crate::peer::tests::signers(env);
+        let fixture = super::SocketFixture::with_body_limit(env, 2, 0);
         let receive_metrics = Metrics::default();
         let receive_gate = crate::peer::receive::Gate::with_metrics(
             crate::peer::receive::Config {
@@ -1549,6 +1596,7 @@ mod requester_safety {
                 ..Default::default()
             },
             metrics.clone(),
+            racer_io::Clock::host(),
         )
         .unwrap();
         let node = signers[2].node().clone();
@@ -1559,7 +1607,8 @@ mod requester_safety {
             std::thread::sleep(Duration::from_millis(260));
         }
         let paths = Rc::new(
-            Paths::new(Rc::new(LinkHealth::default()), 4).with_peer_admission(adaptive.clone()),
+            Paths::new(Rc::new(LinkHealth::on(env.ctx.clock.clone())), 4)
+                .with_peer_admission(adaptive.clone()),
         );
         let forwarding = Rc::new(Forwarding::new(signers[0].clone()));
         let requester = Requester::new(
@@ -1570,12 +1619,13 @@ mod requester_safety {
                 crate::peer::PeerNetwork::new(
                     signers[0].node().clone(),
                     crate::test_support::published_membership(membership.clone()),
+                    racer_io::Clock::host(),
                 )
                 .unwrap(),
             ),
         );
-        let mut request = crate::peer::tests::request(&admission, 91);
-        let scope = RequestScope::new(
+        let mut request = crate::peer::tests::request(env, &admission, 91);
+        let scope = RequestScope::host(
             request.route.request,
             Instant::now() + Duration::from_secs(3),
         )
@@ -1609,17 +1659,16 @@ mod requester_safety {
         };
         let server = async {
             let fd = reactor
-                .accept(
-                    Rc::new(uring_runtime::reactor::descriptor::Descriptor::from(
-                        listener,
-                    )),
-                    &scope,
-                )
+                .accept(Rc::new(racer_io::ring::Descriptor::from(listener)), &scope)
                 .await?;
             let conn = crate::http::from_accepted(fd, &admission)?;
             let conn = connection::accept(&io, conn, signers[2].clone(), &scope).await?;
             let received = io.receive_head(conn, &scope).await?;
-            let (head, length) = decode_envelope(received.value, false)?;
+            let (head, length) = decode_envelope(
+                received.value,
+                false,
+                crate::peer::protocol::chains(&received.connection)?,
+            )?;
             assert_eq!(length, 0);
             let auth = Forwarding::new(signers[2].clone());
             let request = auth.verify_request(codec.request(head, &scope)?)?;
@@ -1651,7 +1700,7 @@ mod requester_safety {
                 requester
                     .request_direct(request, membership, &scope)
                     .await
-                    .map(|r| RelayResponse::Complete(r.into_signed()))
+                    .map(RelayResponse::Complete)
             } else if opaque {
                 requester
                     .exchange_inner(
@@ -1668,6 +1717,7 @@ mod requester_safety {
                     .map(RelayResponse::Complete)
             }
         };
+        crate::peer::forwarding::ENVELOPE_VERIFICATIONS.with(|count| count.set(0));
         let mut work = Box::pin(async { futures::join!(client, server) });
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         let (result, served) = loop {
@@ -1683,6 +1733,13 @@ mod requester_safety {
         };
         served.unwrap();
         drop(work);
+        // Each direct, materialized, and opaque response is verified exactly once,
+        // including the tampered response, which still fails.
+        assert_eq!(
+            crate::peer::forwarding::ENVELOPE_VERIFICATIONS.with(std::cell::Cell::get),
+            1,
+            "{case} response verifications"
+        );
         if case == "corrupt" {
             assert!(result.is_err());
         } else {
@@ -1708,7 +1765,7 @@ mod requester_safety {
                     drop(connection);
                 }
                 RelayResponse::Complete(response) => assert_eq!(
-                    matches!(response.response, PeerResponse::Overloaded),
+                    matches!(response.response(), PeerResponse::Overloaded),
                     case == "overloaded"
                 ),
                 RelayResponse::Landed(_) => panic!("nothing asked for landing"),
@@ -1743,22 +1800,22 @@ mod subscriptions {
     use crate::topology::Membership;
     use crate::topology::Paths;
     use flow_control::subscriptions::Interval;
-    use racer_control_wire::BundleGeneration;
-    use racer_control_wire::KeyringBundle;
-    use racer_control_wire::SCHEMA_VERSION;
     use racer_core::subscriptions::Demand;
+    use racer_wire::control::BundleGeneration;
+    use racer_wire::control::KeyringBundle;
     use std::cell::Cell;
     use std::task::Context;
     use std::task::Poll;
     use std::time::UNIX_EPOCH;
     fn subscribe(
+        env: &racer_io::Env,
         admission: &flow_control::Quotas<AdmissionPolicy>,
         sender: &str,
         id: u8,
         start: u64,
         mode: FetchMode,
     ) -> PeerRequest {
-        let mut request = request(admission, id);
+        let mut request = request(env, admission, id);
         request.origin.authorization = None;
         request.route.visited = vec![NodeId(sender.into())];
         request.route.remaining_attempts = if matches!(mode, FetchMode::Acquire) {
@@ -1795,6 +1852,7 @@ mod subscriptions {
                     )
                     .unwrap(),
                 PageEnvelope {
+                    page_size: racer_wire::object::PageSize::DEFAULT,
                     cipher: crate::model::PageCipher::Xaes256Gcm,
                     page: page.clone(),
                     key_id: KeyId([1; 16]),
@@ -1817,6 +1875,7 @@ mod subscriptions {
     }
     #[test]
     fn signed_subscription_selects_hot_page_fans_out_and_isolates_credential_failures() {
+        let env = racer_io::Env::host();
         struct Service {
             admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
             ready: Cell<bool>,
@@ -1858,7 +1917,7 @@ mod subscriptions {
             }
         }
         for reject in [false, true] {
-            let signers = signers();
+            let signers = signers(&env);
             let senders: Vec<_> = signers.iter().map(|s| Forwarding::new(s.clone())).collect();
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(false).limits,
@@ -1884,13 +1943,17 @@ mod subscriptions {
                 PeerNetwork::new(
                     NodeId(C.into()),
                     crate::test_support::published_membership(membership),
+                    racer_io::Clock::host(),
                 )
                 .unwrap(),
             );
             let destination = Rc::new(Forwarding::new(signers[2].clone()));
-            let outbound = NoOutbound::new(signers[2].clone(), network.clone());
+            let outbound = NoOutbound::new(&env, signers[2].clone(), network.clone());
             let relay = Rc::new(Relay::new(
-                Rc::new(Paths::new(Rc::new(LinkHealth::default()), 4)),
+                Rc::new(Paths::new(
+                    Rc::new(LinkHealth::on(env.ctx.clock.clone())),
+                    4,
+                )),
                 destination.clone(),
                 outbound.requester.clone(),
                 admission.clone(),
@@ -1904,7 +1967,7 @@ mod subscriptions {
             });
             let server = server::PeerServer::for_test(
                 Rc::new(crate::http::new_io(
-                    Rc::new(Reactor::new(admission.clone())),
+                    Rc::new(Reactor::new(admission.clone(), &env)),
                     Codec::new(protocol::MAX_ENVELOPE_HEAD),
                     admission.clone(),
                     crate::model::PAGE_BYTES + 16,
@@ -1917,13 +1980,14 @@ mod subscriptions {
                 signers[2].clone(),
             );
             let codec = codec(&admission);
-            let first = subscribe(&admission, A, 1, 8, FetchMode::Acquire);
+            let first = subscribe(&env, &admission, A, 1, 8, FetchMode::Acquire);
             let first_scope = first.origin.scope().clone();
             let (first, first_binding) = senders[0].sign_request(first).unwrap();
             // Exercise the actual versioned wire and canonical logical decoding.
             let (first, _) = decode_envelope(
                 encode_envelope(&first.authentication, false, 0).unwrap(),
                 false,
+                &peer_wire::test_util::AnyChain,
             )
             .unwrap();
             let mut first =
@@ -1931,7 +1995,7 @@ mod subscriptions {
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
             assert!(first.as_mut().poll(&mut cx).is_pending());
             assert!(first.as_mut().poll(&mut cx).is_pending());
-            let second = subscribe(&admission, B, 2, 0, FetchMode::Acquire);
+            let second = subscribe(&env, &admission, B, 2, 0, FetchMode::Acquire);
             let second_scope = second.origin.scope().clone();
             let (second, second_binding) = senders[1].sign_request(second).unwrap();
             let mut second = server.dispatch(second, &second_scope);
@@ -1965,6 +2029,7 @@ mod subscriptions {
             let (encoded, length) = decode_envelope(
                 encode_envelope(&second.authentication, true, body.len()).unwrap(),
                 true,
+                &peer_wire::test_util::AnyChain,
             )
             .unwrap();
             assert_eq!(length, 19);
@@ -1988,6 +2053,7 @@ mod subscriptions {
     fn signed_ingress_cold_selection_is_bounded_cancellable_and_does_not_block_other_workers() {
         use crate::peer::subscriptions::Selection;
         use crate::topology::scored_members;
+        let env = racer_io::Env::host();
         struct Never;
         impl server::LocalPageService for Never {
             fn serve_peer<'a>(
@@ -1999,7 +2065,7 @@ mod subscriptions {
                 Box::pin(async { panic!("all demand endpoints must be ineligible") })
             }
         }
-        let signers = signers();
+        let signers = signers(&env);
         let sender = Forwarding::new(signers[0].clone());
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
@@ -2079,12 +2145,16 @@ mod subscriptions {
             PeerNetwork::new(
                 NodeId(C.into()),
                 crate::test_support::published_membership(membership),
+                racer_io::Clock::host(),
             )
             .unwrap(),
         );
-        let outbound = NoOutbound::new(signers[2].clone(), network.clone());
+        let outbound = NoOutbound::new(&env, signers[2].clone(), network.clone());
         let relay = Rc::new(Relay::new(
-            Rc::new(Paths::new(Rc::new(LinkHealth::default()), 4)),
+            Rc::new(Paths::new(
+                Rc::new(LinkHealth::on(env.ctx.clock.clone())),
+                4,
+            )),
             destination.clone(),
             outbound.requester.clone(),
             admission.clone(),
@@ -2092,7 +2162,7 @@ mod subscriptions {
         ));
         let server = server::PeerServer::for_test(
             Rc::new(crate::http::new_io(
-                Rc::new(Reactor::new(admission.clone())),
+                Rc::new(Reactor::new(admission.clone(), &env)),
                 Codec::new(protocol::MAX_ENVELOPE_HEAD),
                 admission.clone(),
                 crate::model::PAGE_BYTES + 16,
@@ -2104,8 +2174,8 @@ mod subscriptions {
             Rc::new(codec(&admission)),
             signers[2].clone(),
         );
-        let mut request = subscribe(&admission, A, 70, 0, FetchMode::Acquire);
-        let scope = RequestScope::new(
+        let mut request = subscribe(&env, &admission, A, 70, 0, FetchMode::Acquire);
+        let scope = RequestScope::host(
             RequestId([70; 16]),
             Instant::now() + Duration::from_secs(240),
         )
@@ -2131,6 +2201,7 @@ mod subscriptions {
         let (wire, _) = decode_envelope(
             encode_envelope(&signed.authentication, false, 0).unwrap(),
             false,
+            &peer_wire::test_util::AnyChain,
         )
         .unwrap();
         let mut work = server.dispatch(codec(&admission).request(wire, &scope).unwrap(), &scope);
@@ -2172,7 +2243,7 @@ mod subscriptions {
         let before = scored_members();
         assert!(matches!(
             work.as_mut().poll(&mut cx),
-            Poll::Ready(Err(Error::Cancelled))
+            Poll::Ready(Err(Error::Canceled))
         ));
         assert_eq!(
             scored_members(),
@@ -2184,8 +2255,8 @@ mod subscriptions {
         // Resume the accepted contract with a new signed sequence and the original
         // deadline, then traverse every ineligible interval. Every poll is measured,
         // including rank completion and transition to the next endpoint.
-        let mut request = subscribe(&admission, A, 72, 0, FetchMode::Acquire);
-        let resume_scope = RequestScope::new(scope.request, scope.deadline.0).unwrap();
+        let mut request = subscribe(&env, &admission, A, 72, 0, FetchMode::Acquire);
+        let resume_scope = RequestScope::host(scope.request, scope.deadline.0).unwrap();
         request.origin.scope = resume_scope.clone();
         request.origin.request = resume_scope.request;
         request.route.request = resume_scope.request;
@@ -2200,6 +2271,7 @@ mod subscriptions {
         let (wire, _) = decode_envelope(
             encode_envelope(&signed.authentication, false, 0).unwrap(),
             false,
+            &peer_wire::test_util::AnyChain,
         )
         .unwrap();
         let mut work = server.dispatch(
@@ -2239,7 +2311,7 @@ mod subscriptions {
         ));
         // Persistent cache avoids another full membership traversal for later updates.
         drop(work);
-        let mut request = subscribe(&admission, A, 73, 0, FetchMode::Acquire);
+        let mut request = subscribe(&env, &admission, A, 73, 0, FetchMode::Acquire);
         request.origin.scope = resume_scope.clone();
         request.origin.request = resume_scope.request;
         request.route.request = resume_scope.request;
@@ -2273,13 +2345,14 @@ mod subscriptions {
     }
     #[test]
     fn subscription_selection_is_canonical_signed_and_bound_to_exact_grant() {
-        let signers = signers();
+        let env = racer_io::Env::host();
+        let signers = signers(&env);
         let sender = Forwarding::new(signers[0].clone());
         let destination = Forwarding::new(signers[2].clone());
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         )));
-        let local = subscribe(&admission, A, 1, 0, FetchMode::CopyOnly);
+        let local = subscribe(&env, &admission, A, 1, 0, FetchMode::CopyOnly);
         let (signed, binding) = sender.sign_request(local).unwrap();
         let admitted = destination.verify_request(signed).unwrap();
         let Operation::Subscribe { subscription, .. } = &admitted.request().operation else {
@@ -2295,8 +2368,11 @@ mod subscriptions {
             page: page.clone(),
             membership: MembershipVersion(1),
             receiver: NodeId(A.into()),
-            deadline: crate::peer::protocol::encode_deadline(admitted.request().route.deadline)
-                .unwrap(),
+            deadline: crate::peer::protocol::encode_deadline(
+                &env.ctx.clock,
+                admitted.request().route.deadline,
+            )
+            .unwrap(),
             remaining_page_budget: 1,
             remaining_byte_budget: subscription.byte_budget - 19,
             flights: None,
@@ -2343,7 +2419,7 @@ mod subscriptions {
                 "case {case}"
             );
         }
-        let mut bad = subscribe(&admission, A, 3, 0, FetchMode::CopyOnly);
+        let mut bad = subscribe(&env, &admission, A, 3, 0, FetchMode::CopyOnly);
         bad.origin.authorization = Some(EncryptedAuthorization {
             key_id: KeyId([1; 16]),
             nonce: Nonce([1; 24]),
@@ -2351,7 +2427,7 @@ mod subscriptions {
         });
         assert!(sender.sign_request(bad).is_err());
         let mut signed = sender
-            .sign_request(subscribe(&admission, A, 4, 0, FetchMode::CopyOnly))
+            .sign_request(subscribe(&env, &admission, A, 4, 0, FetchMode::CopyOnly))
             .unwrap()
             .0;
         let Operation::Subscribe { subscription, .. } = &mut signed.request.operation else {
@@ -2365,7 +2441,8 @@ mod subscriptions {
     }
     #[test]
     fn multi_flight_subscription_is_signed_and_grant_flights_bound_to_request() {
-        let signers = signers();
+        let env = racer_io::Env::host();
+        let signers = signers(&env);
         let sender = Forwarding::new(signers[0].clone());
         let destination = Forwarding::new(signers[2].clone());
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
@@ -2378,9 +2455,9 @@ mod subscriptions {
                 };
                 subscription.flights = flights;
             };
-            let mut local = subscribe(&admission, A, 1, 0, FetchMode::CopyOnly);
+            let mut local = subscribe(&env, &admission, A, 1, 0, FetchMode::CopyOnly);
             set(&mut local, requested);
-            let head = protocol::request_head(&local).unwrap();
+            let head = protocol::request_head(&env.ctx.clock, &local).unwrap();
             assert_eq!(
                 head.unique(protocol::SUBSCRIPTION_FLIGHTS).unwrap(),
                 requested.map(|_| b"4".as_slice()),
@@ -2390,7 +2467,7 @@ mod subscriptions {
                 // An older provider decodes without the field and re-encodes,
                 // so its exact agreement check refuses the request.
                 set(&mut local, None);
-                let older = protocol::request_head(&local).unwrap();
+                let older = protocol::request_head(&env.ctx.clock, &local).unwrap();
                 assert!(matches!(
                     protocol::agrees(&head, &older, false),
                     Err(Error::Unauthorized)
@@ -2415,6 +2492,7 @@ mod subscriptions {
                     membership: MembershipVersion(1),
                     receiver: NodeId(A.into()),
                     deadline: crate::peer::protocol::encode_deadline(
+                        &env.ctx.clock,
                         admitted.request().route.deadline,
                     )
                     .unwrap(),
@@ -2462,6 +2540,7 @@ mod subscriptions {
     }
     #[test]
     fn subscription_runs_through_real_tcp_requester_session_and_provider() {
+        let env = racer_io::Env::host();
         struct Local(Rc<flow_control::Quotas<AdmissionPolicy>>);
         impl server::LocalPageService for Local {
             fn serve_peer<'a>(
@@ -2488,8 +2567,8 @@ mod subscriptions {
                 })
             }
         }
-        let signers = signers();
-        let fixture = SocketFixture::new(2);
+        let signers = signers(&env);
+        let fixture = SocketFixture::new(&env, 2);
         let transfers = fixture.transfers(signers[0].clone());
         let SocketFixture {
             admission,
@@ -2527,14 +2606,18 @@ mod subscriptions {
                 PeerNetwork::new(
                     NodeId(node.into()),
                     crate::test_support::published_membership(membership.clone()),
+                    racer_io::Clock::host(),
                 )
                 .unwrap(),
             )
         };
-        let paths = Rc::new(Paths::new(Rc::new(LinkHealth::default()), 4));
+        let paths = Rc::new(Paths::new(
+            Rc::new(LinkHealth::on(env.ctx.clock.clone())),
+            4,
+        ));
         let destination = Rc::new(Forwarding::new(signers[2].clone()));
         let local = Rc::new(Local(admission.clone()));
-        let outbound = NoOutbound::new(signers[2].clone(), network(C));
+        let outbound = NoOutbound::new(&env, signers[2].clone(), network(C));
         let relay = Rc::new(Relay::new(
             paths.clone(),
             destination.clone(),
@@ -2557,16 +2640,11 @@ mod subscriptions {
             transfers,
             network(A),
         );
-        let request = subscribe(&admission, A, 1, 8, FetchMode::CopyOnly);
+        let request = subscribe(&env, &admission, A, 1, 8, FetchMode::CopyOnly);
         let scope = request.origin.scope().clone();
         let server_work = async {
             let fd = reactor
-                .accept(
-                    Rc::new(uring_runtime::reactor::descriptor::Descriptor::from(
-                        listener,
-                    )),
-                    &scope,
-                )
+                .accept(Rc::new(racer_io::ring::Descriptor::from(listener)), &scope)
                 .await?;
             server
                 .serve_connection(crate::http::from_accepted(fd, &admission)?, &scope)
@@ -2601,14 +2679,15 @@ mod subscriptions {
     }
     #[test]
     fn retained_subscription_cannot_complete_after_request_mac_key_retirement() {
-        let (signers, discovery) = identities();
+        let env = racer_io::Env::host();
+        let (signers, discovery) = identities(&env);
         let sender = Forwarding::new(signers[0].clone());
         let destination = Forwarding::new(signers[2].clone());
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         )));
         let (request, _) = sender
-            .sign_request(subscribe(&admission, A, 1, 0, FetchMode::CopyOnly))
+            .sign_request(subscribe(&env, &admission, A, 1, 0, FetchMode::CopyOnly))
             .unwrap();
         let admitted = destination.verify_request(request).unwrap();
         let keys = &discovery[2].0;
@@ -2617,10 +2696,10 @@ mod subscriptions {
             key.key.id.0[4..12].copy_from_slice(&2u64.to_be_bytes());
             let (reference, state, mut material) = key.clone().into_installation();
             material[0] ^= 1;
-            *key = racer_control_wire::CacheEncryptionKey::new(reference, state, material);
+            *key = racer_wire::control::CacheEncryptionKey::new(reference, state, material);
         }
         keys.install(KeyringBundle {
-            schema_version: SCHEMA_VERSION,
+            schema_version: racer_wire::control::KEYRING_SCHEMA_VERSION,
             cluster: ClusterId(CLUSTER.into()),
             generation: BundleGeneration(2),
             peer_trust_roots: (*keys.peer_trust_roots().unwrap()).clone(),
@@ -2641,10 +2720,14 @@ mod timing {
     use crate::rdma::TransportPlan;
     use crate::telemetry::Event;
     use crate::telemetry::Metrics;
-    use racer_control_wire::RailId;
+    use racer_wire::control::RailId;
 
-    fn page_request(admission: &flow_control::Quotas<AdmissionPolicy>, attempt: u8) -> PeerRequest {
-        let mut local = request(admission, attempt);
+    fn page_request(
+        env: &racer_io::Env,
+        admission: &flow_control::Quotas<AdmissionPolicy>,
+        attempt: u8,
+    ) -> PeerRequest {
+        let mut local = request(env, admission, attempt);
         local.operation = Operation::Page {
             page: PageId {
                 version: ObjectVersion {
@@ -2659,6 +2742,7 @@ mod timing {
     }
 
     fn page_response(
+        env: &racer_io::Env,
         admission: &Rc<flow_control::Quotas<AdmissionPolicy>>,
         request: &PeerRequest,
     ) -> PeerResponse {
@@ -2671,7 +2755,7 @@ mod timing {
                 version: page.version.clone(),
                 length: 3,
                 expires_at: crate::model::ExpiresAt::test_time(
-                    uring_runtime::environment::wall_now() + Duration::from_secs(60),
+                    env.ctx.clock.wall_now() + Duration::from_secs(60),
                 ),
             },
             // Intentionally not AEAD-valid: forwarding verification does not decrypt.
@@ -2685,6 +2769,7 @@ mod timing {
                         )
                         .unwrap(),
                     crate::model::PageEnvelope {
+                        page_size: racer_wire::object::PageSize::DEFAULT,
                         cipher: crate::model::PageCipher::Xaes256Gcm,
                         page: page.clone(),
                         key_id: KeyId([1; 16]),
@@ -2700,17 +2785,20 @@ mod timing {
 
     #[test]
     fn page_timing_deterministic_delays_publish_once_only_after_verified_page() {
-        let signers = signers();
+        let env = racer_io::Env::host();
+        let signers = signers(&env);
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         )));
         let sender = Forwarding::new(signers[0].clone());
         let receiver = Forwarding::new(signers[2].clone());
-        let local = page_request(&admission, 1);
+        let local = page_request(&env, &admission, 1);
         let metrics = Metrics::default();
-        let clock = SimulationClock::new_at(7, Instant::now(), std::time::SystemTime::now());
-        let _environment = clock.environment(1).enter();
-        let mut timing = PageTiming::new(&metrics);
+        let clock = racer_io::SimClock::new_at(7, Instant::now(), std::time::SystemTime::now());
+        let sim_env = clock.ctx(1);
+        let env = racer_io::Env::new(env.driver.clone(), sim_env.clone());
+        let sim_ctx = sim_env.clone();
+        let mut timing = PageTiming::new(&metrics, sim_ctx.clock.clone());
         timing.enable(&local, TransportPlan::Http, false);
         for stage in 0..4 {
             if stage > 0 {
@@ -2728,7 +2816,7 @@ mod timing {
         let response = receiver
             .sign_response(
                 admitted.binding(),
-                page_response(&admission, admitted.request()),
+                page_response(&env, &admission, admitted.request()),
             )
             .unwrap();
         let verified = sender.verify_response(response, &binding).unwrap();
@@ -2744,14 +2832,15 @@ mod timing {
 
     #[test]
     fn page_timing_excludes_metadata_transit_native_and_opaque() {
+        let env = racer_io::Env::host();
         let admission = flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         ));
         let metrics = Metrics::default();
         for case in ["metadata", "bootstrap", "transit", "native", "opaque"] {
-            let mut local = page_request(&admission, 1);
+            let mut local = page_request(&env, &admission, 1);
             if case == "metadata" {
-                local = request(&admission, 1);
+                local = request(&env, &admission, 1);
             }
             if case == "bootstrap" {
                 local.operation = Operation::Bootstrap {
@@ -2767,7 +2856,7 @@ mod timing {
             } else {
                 TransportPlan::Http
             };
-            let mut timing = PageTiming::new(&metrics);
+            let mut timing = PageTiming::new(&metrics, racer_io::Clock::host());
             timing.enable(&local, plan, case == "opaque");
             for stage in 0..4 {
                 timing.begin();
@@ -2786,15 +2875,17 @@ mod timing {
     fn page_timing_pending_future_drop_counts_once_without_partial_samples() {
         use std::task::Context;
         use std::task::Poll;
+        let env = racer_io::Env::host();
         let admission = flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         ));
         let metrics = Metrics::default();
-        let local = page_request(&admission, 1);
-        let clock = SimulationClock::new_at(8, Instant::now(), std::time::SystemTime::now());
-        let _environment = clock.environment(1).enter();
+        let local = page_request(&env, &admission, 1);
+        let clock = racer_io::SimClock::new_at(8, Instant::now(), std::time::SystemTime::now());
+        let sim_env = clock.ctx(1);
+        let sim_ctx = sim_env.clone();
         let mut work = Box::pin(async {
-            let mut timing = PageTiming::new(&metrics);
+            let mut timing = PageTiming::new(&metrics, sim_ctx.clock.clone());
             timing.enable(&local, TransportPlan::Http, false);
             clock.advance(Duration::from_nanos(17));
             timing.end(0);
@@ -2816,7 +2907,8 @@ mod timing {
 
     #[test]
     fn page_timing_invalid_signature_miss_and_drop_censor_without_partial_success() {
-        let signers = signers();
+        let env = racer_io::Env::host();
+        let signers = signers(&env);
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         )));
@@ -2824,8 +2916,8 @@ mod timing {
         let receiver = Forwarding::new(signers[2].clone());
         let metrics = Metrics::default();
         for (attempt, case) in ["invalid", "miss", "drop"].into_iter().enumerate() {
-            let local = page_request(&admission, attempt as u8);
-            let mut timing = PageTiming::new(&metrics);
+            let local = page_request(&env, &admission, attempt as u8);
+            let mut timing = PageTiming::new(&metrics, racer_io::Clock::host());
             timing.enable(&local, TransportPlan::Http, false);
             for stage in 0..4 {
                 timing.begin();
@@ -2836,7 +2928,7 @@ mod timing {
             let response = if case == "miss" {
                 PeerResponse::Miss
             } else {
-                page_response(&admission, admitted.request())
+                page_response(&env, &admission, admitted.request())
             };
             let mut response = receiver
                 .sign_response(admitted.binding(), response)
@@ -2867,8 +2959,9 @@ mod timing {
         use std::net::TcpListener;
         use std::task::Context;
         use std::task::Poll;
-        let signers = signers();
-        let fixture = SocketFixture::new(1);
+        let env = racer_io::Env::host();
+        let signers = signers(&env);
+        let fixture = SocketFixture::new(&env, 1);
         let receive_metrics = Metrics::default();
         let gate = crate::peer::receive::Gate::with_metrics(
             crate::peer::receive::Config {
@@ -2912,8 +3005,13 @@ mod timing {
         let metrics = Metrics::default();
         let requester = Requester::new(
             Rc::new(
-                Paths::new(Rc::new(LinkHealth::default()), 4).with_peer_admission(
-                    crate::peer::AdaptivePeers::new(Default::default(), metrics.clone()).unwrap(),
+                Paths::new(Rc::new(LinkHealth::on(env.ctx.clock.clone())), 4).with_peer_admission(
+                    crate::peer::AdaptivePeers::new(
+                        Default::default(),
+                        metrics.clone(),
+                        racer_io::Clock::host(),
+                    )
+                    .unwrap(),
                 ),
             ),
             Rc::new(Forwarding::new(signers[0].clone())),
@@ -2922,22 +3020,31 @@ mod timing {
                 PeerNetwork::new(
                     NodeId(A.into()),
                     crate::test_support::published_membership(members.clone()),
+                    racer_io::Clock::host(),
                 )
                 .unwrap(),
             ),
         )
         .with_metrics(metrics.clone());
-        let scope =
-            RequestScope::new(RequestId([1; 16]), Instant::now() + Duration::from_secs(5)).unwrap();
+        let scope = RequestScope::host(RequestId([1; 16]), Instant::now() + Duration::from_secs(5))
+            .unwrap();
         let client = async {
             for attempt in 0..3 {
                 let response = if attempt == 1 {
                     requester
-                        .request_direct(page_request(&admission, attempt), members.clone(), &scope)
+                        .request_direct(
+                            page_request(&env, &admission, attempt),
+                            members.clone(),
+                            &scope,
+                        )
                         .await
                 } else {
                     requester
-                        .request(page_request(&admission, attempt), members.clone(), &scope)
+                        .request(
+                            page_request(&env, &admission, attempt),
+                            members.clone(),
+                            &scope,
+                        )
                         .await
                 };
                 assert_eq!(
@@ -2973,11 +3080,15 @@ mod timing {
             let auth = Forwarding::new(signers[2].clone());
             for attempt in 0..3 {
                 let received = io.receive_head(connection, &scope).await?;
-                let (head, _) = decode_envelope(received.value, false)?;
+                let (head, _) = decode_envelope(
+                    received.value,
+                    false,
+                    crate::peer::protocol::chains(&received.connection)?,
+                )?;
                 let request = auth.verify_request(codec(&admission).request(head, &scope)?)?;
                 let mut response = auth.sign_response(
                     request.binding(),
-                    page_response(&admission, request.request()),
+                    page_response(&env, &admission, request.request()),
                 )?;
                 if attempt == 2 {
                     Arc::get_mut(&mut response.authentication.original)
@@ -3025,7 +3136,6 @@ mod timing {
         assert_eq!(reactor.in_flight(), 0);
         drop(io);
         drop(reactor);
-        admission.reclaim_buffers();
         for class in [
             ResourceClass::Connection,
             ResourceClass::IngressConnection,
@@ -3044,8 +3154,9 @@ const C: &str = "00000003-1111-4111-8111-111111111111";
 const CACHE: &str = "cccccccc-1111-4111-8111-111111111111";
 const CLUSTER: &str = "dddddddd-1111-4111-8111-111111111111";
 type Discovery = (Rc<Keyring>, Rc<Certificates>);
-fn identities() -> (Vec<Rc<Signatures>>, Vec<Discovery>) {
+fn identities(env: &racer_io::Env) -> (Vec<Rc<Signatures>>, Vec<Discovery>) {
     crate::test_support::security::identities(
+        env,
         ClusterId(CLUSTER.into()),
         &[A, B, C].map(|name| NodeId(name.into())),
         || crate::test_support::security::mac_test_key(CACHE),
@@ -3054,16 +3165,21 @@ fn identities() -> (Vec<Rc<Signatures>>, Vec<Discovery>) {
     .map(|identity| (identity.signatures, (identity.keys, identity.certificates)))
     .unzip()
 }
-pub(super) fn signers() -> Vec<Rc<Signatures>> {
-    let (signers, _) = identities();
+pub(super) fn signers(env: &racer_io::Env) -> Vec<Rc<Signatures>> {
+    let (signers, _) = identities(env);
     signers
 }
 pub(super) fn request(
+    env: &racer_io::Env,
     admission: &flow_control::Quotas<AdmissionPolicy>,
     attempt: u8,
 ) -> PeerRequest {
-    let scope =
-        RequestScope::new(RequestId([1; 16]), Instant::now() + Duration::from_secs(30)).unwrap();
+    let scope = RequestScope::on(
+        &env.ctx.clock,
+        RequestId([1; 16]),
+        Instant::now() + Duration::from_secs(30),
+    )
+    .unwrap();
     let object = ObjectId {
         cache: CacheId(CACHE.into()),
         key: CacheKey([3; 32]),
@@ -3110,9 +3226,11 @@ pub(super) fn codec(admission: &Rc<flow_control::Quotas<AdmissionPolicy>>) -> Se
 #[test]
 fn receive_gate_operation_bypass_and_chained_small_caps_expire_and_recover() {
     use crate::telemetry::{Gauge, Metrics};
-    let clock = uring_runtime::environment::SimulationClock::new(920);
-    let _env = clock.environment(0).enter();
-    let fixtures = [SocketFixture::new(1), SocketFixture::new(1)];
+    let clock = racer_io::SimClock::new(920);
+    let sim_env = clock.ctx(0);
+    let env = racer_io::Env::new(racer_io::Driver::Uring, sim_env.clone());
+    let sim_ctx = sim_env.clone();
+    let fixtures = [SocketFixture::new(&env, 1), SocketFixture::new(&env, 1)];
     let metrics = [Metrics::default(), Metrics::default()];
     let gates: Vec<_> = metrics
         .iter()
@@ -3128,7 +3246,7 @@ fn receive_gate_operation_bypass_and_chained_small_caps_expire_and_recover() {
             .unwrap()
         })
         .collect();
-    let signers = signers();
+    let signers = signers(&env);
     let transfers: Vec<_> = fixtures
         .iter()
         .zip(&gates)
@@ -3139,12 +3257,16 @@ fn receive_gate_operation_bypass_and_chained_small_caps_expire_and_recover() {
                 .with_receive_gate(g.clone())
         })
         .collect();
-    let scope = RequestScope::new(
+    let scope = RequestScope::on(
+        &sim_ctx.clock,
         RequestId([20; 16]),
-        uring_runtime::environment::now() + Duration::from_secs(1),
+        sim_ctx.clock.now() + Duration::from_secs(1),
     )
     .unwrap();
-    let mut requests: Vec<_> = fixtures.iter().map(|f| request(&f.admission, 20)).collect();
+    let mut requests: Vec<_> = fixtures
+        .iter()
+        .map(|f| request(&env, &f.admission, 20))
+        .collect();
     let original = (
         requests[0].route.remaining_links,
         requests[0].route.remaining_attempts,
@@ -3198,7 +3320,7 @@ fn receive_gate_operation_bypass_and_chained_small_caps_expire_and_recover() {
         assert!(p.as_mut().poll(&mut cx).is_pending());
     }
     for (f, t) in fixtures.iter().zip(&transfers) {
-        let metadata = request(&f.admission, 21);
+        let metadata = request(&env, &f.admission, 21);
         assert!(
             futures::executor::block_on(t.admit_receive(&metadata, &scope))
                 .unwrap()
@@ -3209,7 +3331,7 @@ fn receive_gate_operation_bypass_and_chained_small_caps_expire_and_recover() {
     // Bodyless page modes bypass too; a body-carrying page still queues.
     for mode in 0..3 {
         for (f, t) in fixtures.iter().zip(&transfers) {
-            let mut page = request(&f.admission, 22);
+            let mut page = request(&env, &f.admission, 22);
             page.operation = Operation::Page {
                 page: PageId {
                     version: ObjectVersion {
@@ -3279,14 +3401,14 @@ pub(crate) struct SocketFixture {
 }
 
 impl SocketFixture {
-    pub fn new(pool_limit: usize) -> Self {
-        Self::with_body_limit(pool_limit, PAGE_BYTES + 16)
+    pub fn new(env: &racer_io::Env, pool_limit: usize) -> Self {
+        Self::with_body_limit(env, pool_limit, PAGE_BYTES + 16)
     }
-    pub fn with_body_limit(pool_limit: usize, body_limit: u64) -> Self {
+    pub fn with_body_limit(env: &racer_io::Env, pool_limit: usize, body_limit: u64) -> Self {
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         )));
-        let reactor = Rc::new(crate::runtime::Reactor::new(admission.clone()));
+        let reactor = Rc::new(crate::runtime::Reactor::new(admission.clone(), env));
         let io = Rc::new(crate::http::new_io(
             reactor.clone(),
             crate::http::Codec::new(protocol::MAX_ENVELOPE_HEAD),
@@ -3323,25 +3445,25 @@ pub(crate) struct NoOutbound {
     pub requester: Rc<Requester>,
     _socket: SocketFixture,
 }
-pub(crate) fn signed_fixture_response() -> protocol::SignedResponse {
+pub(crate) fn signed_fixture_response(env: &racer_io::Env) -> protocol::SignedResponse {
     let admission = flow_control::Quotas::new(AdmissionPolicy::new(
         crate::test_support::cluster::config(false).limits,
     ));
-    let signers = signers();
+    let signers = signers(env);
     let sender = Forwarding::new(signers[0].clone());
     let receiver = Forwarding::new(signers[2].clone());
-    let (signed, _) = sender.sign_request(request(&admission, 42)).unwrap();
+    let (signed, _) = sender.sign_request(request(env, &admission, 42)).unwrap();
     let admitted = receiver.verify_request(signed).unwrap();
     receiver
         .sign_response(admitted.binding(), PeerResponse::Miss)
         .unwrap()
 }
 impl NoOutbound {
-    pub fn new(signer: Rc<Signatures>, network: Rc<PeerNetwork>) -> Self {
-        let socket = SocketFixture::new(2);
+    pub fn new(env: &racer_io::Env, signer: Rc<Signatures>, network: Rc<PeerNetwork>) -> Self {
+        let socket = SocketFixture::new(env, 2);
         let requester = Rc::new(Requester::new(
             Rc::new(crate::topology::Paths::new(
-                Rc::new(crate::topology::LinkHealth::default()),
+                Rc::new(crate::topology::LinkHealth::on(env.ctx.clock.clone())),
                 4,
             )),
             Rc::new(Forwarding::new(signer.clone())),
@@ -3378,19 +3500,19 @@ fn page_timing_duration_conversion_saturates_and_reversed_clock_is_zero() {
     use crate::peer::Event;
     use crate::peer::Metrics;
     use crate::peer::PageTiming;
-    use crate::peer::now;
+
     use std::time::Duration;
-    use uring_runtime::environment::SimulationClock;
     let metrics = Metrics::default();
-    let clock = SimulationClock::new(9);
-    let _environment = clock.environment(1).enter();
-    let mut timing = PageTiming::new(&metrics);
+    let clock = racer_io::SimClock::new(9);
+    let sim_env = clock.ctx(1);
+    let sim_ctx = sim_env.clone();
+    let mut timing = PageTiming::new(&metrics, sim_ctx.clock.clone());
     timing.active = true;
     timing.begin();
     clock.advance(Duration::from_secs(u64::MAX / 1_000_000_000 + 1));
     timing.end(0);
     assert_eq!(timing.durations[0], u64::MAX);
-    timing.start = Some(now() + Duration::from_secs(1));
+    timing.start = Some(timing.clock.now() + Duration::from_secs(1));
     timing.end(1);
     assert_eq!(timing.durations[1], 0);
     drop(timing);
@@ -3400,9 +3522,10 @@ fn page_timing_duration_conversion_saturates_and_reversed_clock_is_zero() {
 mod adaptive {
     use crate::peer::*;
     #[test]
-    fn hedges_require_spare_capacity_and_no_local_or_peer_pressure() {
-        let clock = uring_runtime::environment::SimulationClock::new(905);
-        let _env = clock.environment(0).enter();
+    fn hedges_require_spare_capacity_and_no_peer_pressure() {
+        let clock = racer_io::SimClock::new(905);
+        let sim_env = clock.ctx(0);
+        let sim_ctx = sim_env.clone();
         let owner = AdaptivePeers::new(
             Config {
                 total: 4,
@@ -3410,15 +3533,19 @@ mod adaptive {
                 ..Default::default()
             },
             Metrics::default(),
+            sim_ctx.clock.clone(),
         )
         .unwrap();
         let node = NodeId("a".into());
         assert!(owner.hedge_available(&node));
+        let other = NodeId("b".into());
+        let held: Vec<_> = (0..2).map(|_| owner.acquire(&other).unwrap()).collect();
+        assert!(owner.hedge_available(&node));
         let permit = owner.acquire(&node).unwrap();
-        clock.advance(BACKOFF);
-        permit.observe(Outcome::LocalPressure);
+        // A hedge needs a slot beyond the next one under the total cap.
         assert!(!owner.hedge_available(&node));
-        drop(permit);
+        drop((permit, held));
+        assert!(owner.hedge_available(&node));
         let owner = AdaptivePeers::new(
             Config {
                 total: 4,
@@ -3426,6 +3553,7 @@ mod adaptive {
                 ..Default::default()
             },
             Metrics::default(),
+            sim_ctx.clock.clone(),
         )
         .unwrap();
         let permit = owner.acquire(&node).unwrap();
@@ -3434,8 +3562,9 @@ mod adaptive {
     }
     #[test]
     fn churn_cannot_evict_neutral_probe_backoff_with_old_update_time() {
-        let clock = uring_runtime::environment::SimulationClock::new(783);
-        let _env = clock.environment(0).enter();
+        let clock = racer_io::SimClock::new(783);
+        let sim_env = clock.ctx(0);
+        let sim_ctx = sim_env.clone();
         let owner = AdaptivePeers::new(
             Config {
                 total: 2 * CAPACITY,
@@ -3443,6 +3572,7 @@ mod adaptive {
                 ..Default::default()
             },
             Metrics::default(),
+            sim_ctx.clock.clone(),
         )
         .unwrap();
         let node = NodeId("000-circuit".into());
@@ -3470,7 +3600,7 @@ mod adaptive {
         drop(held);
     }
     #[test]
-    fn shared_caps_local_pressure_and_completion_fences() {
+    fn shared_caps_and_completion_fences() {
         let metrics = Metrics::default();
         let owner = AdaptivePeers::new(
             Config {
@@ -3479,6 +3609,7 @@ mod adaptive {
                 ..Default::default()
             },
             metrics.clone(),
+            racer_io::Clock::host(),
         )
         .unwrap();
         let worker = owner.clone();
@@ -3487,7 +3618,6 @@ mod adaptive {
         let permit = owner.acquire(&a).unwrap();
         assert!(matches!(worker.acquire(&a), Err(Error::Overloaded)));
         let io = permit.clone();
-        permit.observe(Outcome::LocalPressure);
         drop(permit);
         assert!(matches!(worker.acquire(&a), Err(Error::Overloaded)));
         let second = worker.acquire(&b).unwrap();
@@ -3499,13 +3629,13 @@ mod adaptive {
         drop((io, second));
         assert_eq!(metrics.gauge(Gauge::PeerExchanges), 0);
         assert!(owner.available(&a));
-        assert_eq!(metrics.count(Event::PeerLocalPressure), 1);
         assert_eq!(metrics.count(Event::PeerLinkFailure), 0);
     }
     #[test]
     fn recovery_requires_exclusive_verified_probe_and_old_success_cannot_clear_failure() {
-        let clock = uring_runtime::environment::SimulationClock::new(779);
-        let _env = clock.environment(0).enter();
+        let clock = racer_io::SimClock::new(779);
+        let sim_env = clock.ctx(0);
+        let sim_ctx = sim_env.clone();
         let owner = AdaptivePeers::new(
             Config {
                 total: 4,
@@ -3513,6 +3643,7 @@ mod adaptive {
                 ..Default::default()
             },
             Metrics::default(),
+            sim_ctx.clock.clone(),
         )
         .unwrap();
         let node = NodeId("a".into());
@@ -3540,8 +3671,9 @@ mod adaptive {
     }
     #[test]
     fn state_capacity_never_evicts_live_permits_and_ages_retired_entries() {
-        let clock = uring_runtime::environment::SimulationClock::new(780);
-        let _env = clock.environment(0).enter();
+        let clock = racer_io::SimClock::new(780);
+        let sim_env = clock.ctx(0);
+        let sim_ctx = sim_env.clone();
         let owner = AdaptivePeers::new(
             Config {
                 total: 2 * CAPACITY,
@@ -3549,6 +3681,7 @@ mod adaptive {
                 ..Default::default()
             },
             Metrics::default(),
+            sim_ctx.clock.clone(),
         )
         .unwrap();
         let permits: Vec<_> = (0..CAPACITY)
@@ -3578,40 +3711,6 @@ mod adaptive {
         ));
         drop(held);
     }
-    #[test]
-    fn local_pressure_shrinks_node_limit_without_revoking_work_or_blame() {
-        let clock = uring_runtime::environment::SimulationClock::new(781);
-        let _env = clock.environment(0).enter();
-        let metrics = Metrics::default();
-        let owner = AdaptivePeers::new(
-            Config {
-                total: 4,
-                per_peer: 4,
-                ..Default::default()
-            },
-            metrics.clone(),
-        )
-        .unwrap();
-        let node = NodeId("a".into());
-        let permits: Vec<_> = (0..4).map(|_| owner.acquire(&node).unwrap()).collect();
-        clock.advance(BACKOFF);
-        for permit in &permits {
-            permit.observe(Outcome::LocalPressure);
-        }
-        assert_eq!(metrics.gauge(Gauge::PeerAdmissionLimit), 2);
-        assert_eq!(metrics.gauge(Gauge::PeerExchanges), 4);
-        assert!(owner.available(&node));
-        assert_eq!(metrics.count(Event::PeerLinkFailure), 0);
-        assert!(matches!(
-            owner.acquire(&NodeId("other".into())),
-            Err(Error::Overloaded)
-        ));
-        clock.advance(RECOVERY);
-        permits[0].observe(Outcome::Verified);
-        assert_eq!(metrics.gauge(Gauge::PeerAdmissionLimit), 3);
-        drop(permits);
-        assert_eq!(metrics.gauge(Gauge::PeerExchanges), 0);
-    }
 }
 mod explicit_clock {
     //! Adaptive admission and link circuits read only the time they are given.
@@ -3619,8 +3718,8 @@ mod explicit_clock {
     use crate::peer::Outcome;
     use crate::telemetry::Metrics;
     use crate::topology::LinkHealth;
-    use racer_control_wire::NodeId;
     use racer_core::route::LinkOutcome;
+    use racer_wire::control::NodeId;
     use std::sync::OnceLock;
     use std::sync::atomic::AtomicU64;
     use std::sync::atomic::Ordering;
@@ -3656,7 +3755,7 @@ mod explicit_clock {
 
     #[test]
     fn link_health_acquires_at_the_supplied_time() {
-        let health = LinkHealth::new(1);
+        let health = LinkHealth::new(1, racer_io::Clock::host());
         let node = NodeId("b".into());
         let start = Instant::now();
         health

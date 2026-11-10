@@ -13,15 +13,15 @@ use crate::topology::Member;
 use crate::topology::Membership;
 use crate::topology::Paths;
 use http1::connection::BufferRange;
-use racer_control_wire::CacheId;
-use racer_control_wire::ClusterId;
 use racer_crypto::{TAG_LEN, open, seal};
+use racer_io::ring::IoBuffer;
+use racer_wire::control::CacheId;
+use racer_wire::control::ClusterId;
 use std::cell::Cell;
 use std::net::TcpListener;
 use std::net::TcpStream;
 use std::task::Context;
 use std::task::Poll;
-use uring_runtime::reactor::IoBuffer;
 
 mod materialized_pairing {
     //! Distinct bodies make cross-exchange substitution visible across relay reuse.
@@ -85,6 +85,7 @@ mod materialized_pairing {
 
     #[test]
     fn materialized_pairing_survives_concurrent_short_reads_cancel_and_pool_reuse() {
+        let env = racer_io::Env::host();
         let RelayFixture {
             signers,
             admissions,
@@ -98,7 +99,7 @@ mod materialized_pairing {
             scope,
             mut metadata,
             ..
-        } = RelayFixture::with_pool_limit(true, 2);
+        } = RelayFixture::with_pool_limit(&env, true, 2);
         assert!(!server.opaque_relay());
         metadata.length = 3 * crate::model::PAGE_BYTES;
         metadata.expires_at = ExpiresAt::test_time(
@@ -134,6 +135,7 @@ mod materialized_pairing {
                             )
                             .unwrap(),
                         PageEnvelope {
+                            page_size: racer_wire::object::PageSize::DEFAULT,
                             cipher: crate::model::PageCipher::Xaes256Gcm,
                             page: PageId {
                                 version: metadata.version.clone(),
@@ -168,8 +170,8 @@ mod materialized_pairing {
         let downstream_closed = Cell::new(false);
         let healthy_first = Cell::new(false);
         let overlapped = Cell::new(false);
-        let listener: Rc<uring_runtime::reactor::descriptor::Descriptor> = Rc::new(listener.into());
-        let destination = |listener: Rc<uring_runtime::reactor::descriptor::Descriptor>| async {
+        let listener: Rc<racer_io::ring::Descriptor> = Rc::new(listener.into());
+        let destination = |listener: Rc<racer_io::ring::Descriptor>| async {
             let fd = reactors[2].accept(listener, &scope).await?;
             accepted.set(accepted.get() + 1);
             let conn = crate::http::from_accepted(fd, &admissions[2])?;
@@ -178,7 +180,11 @@ mod materialized_pairing {
             let mut previous = None;
             loop {
                 let received = ios[2].receive_head(conn, &scope).await?;
-                let (head, length) = decode_envelope(received.value, false)?;
+                let (head, length) = decode_envelope(
+                    received.value,
+                    false,
+                    crate::peer::protocol::chains(&received.connection)?,
+                )?;
                 assert_eq!(length, 0);
                 let request = auth.verify_request(codec(&admissions[2]).request(head, &scope)?)?;
                 let protocol::Operation::Page { page, .. } = &request.request().operation else {
@@ -247,7 +253,7 @@ mod materialized_pairing {
             let conn = crate::http::from_accepted(relay_socket.into(), &admissions[1])?;
             assert!(matches!(
                 server.serve_connection(conn, &scope).await,
-                Err(Error::Cancelled)
+                Err(Error::Canceled)
             ));
             canceled.set(true);
             Ok::<_, Error>(())
@@ -261,7 +267,7 @@ mod materialized_pairing {
             Ok::<_, Error>(())
         };
         let signed_request = |number: usize| {
-            let mut request = request(&admissions[0], number as u8 + 1);
+            let mut request = request(&env, &admissions[0], number as u8 + 1);
             request.operation = protocol::Operation::Page {
                 page: pages[number].envelope().page.clone(),
                 mode: protocol::FetchMode::CopyOnly,
@@ -312,7 +318,11 @@ mod materialized_pairing {
                         &scope,
                     )
                     .await?;
-                let (head, length) = decode_envelope(received.value, true)?;
+                let (head, length) = decode_envelope(
+                    received.value,
+                    true,
+                    crate::peer::protocol::chains(&received.connection)?,
+                )?;
                 assert_eq!(head.hops.len(), 1);
                 assert_eq!(length, pages[number].bytes().len());
                 conn = received.connection;
@@ -366,10 +376,10 @@ mod materialized_pairing {
             || {
                 if prefixes.get() == 2
                     && admissions[1].used(ResourceClass::Ciphertext)
-                        == 2 * page_alloc::buffer_capacity(
-                            pages[0].bytes().len().next_multiple_of(4096),
-                        )
-                        .unwrap()
+                        == 2 * pages[0]
+                            .bytes()
+                            .len()
+                            .next_multiple_of(page_alloc::buf::GRANULE)
                 {
                     overlapped.set(true);
                 }
@@ -403,30 +413,33 @@ mod safety {
     use crate::security::PageCryptoEngine;
     use crate::telemetry::Event;
     use crate::telemetry::Metrics;
-    use racer_control_wire::CacheEncryptionKey;
-    use racer_control_wire::CacheKeyPurpose;
-    use racer_control_wire::CacheKeyRef;
-    use racer_control_wire::CacheKeyState;
+    use racer_wire::control::CacheEncryptionKey;
+    use racer_wire::control::CacheKeyPurpose;
+    use racer_wire::control::CacheKeyRef;
+    use racer_wire::control::CacheKeyState;
     use std::cell::RefCell;
     use std::net::Shutdown;
 
     #[test]
     fn upstream_fin_before_response_head_recovers_quota_by_signed_deadline() {
-        abandoned_head(false, false);
+        let env = racer_io::Env::host();
+        abandoned_head(&env, false, false);
     }
 
     #[test]
     fn upstream_fin_before_response_head_promptly_releases_relay() {
-        abandoned_head(true, false);
+        let env = racer_io::Env::host();
+        abandoned_head(&env, true, false);
     }
 
     #[test]
     fn parent_cancel_before_response_head_promptly_releases_relay() {
-        abandoned_head(true, true);
+        let env = racer_io::Env::host();
+        abandoned_head(&env, true, true);
     }
 
-    fn abandoned_head(prompt: bool, cancel_parent: bool) {
-        let mut f = RelayFixture::new(false);
+    fn abandoned_head(env: &racer_io::Env, prompt: bool, cancel_parent: bool) {
+        let mut f = RelayFixture::new(env, false);
         let metrics = Metrics::default();
         f.server = f.server.with_metrics(metrics.clone());
         f.reactors[1].init().unwrap();
@@ -436,7 +449,7 @@ mod safety {
         let finished = Cell::new(false);
         let deadline = Cell::new(None);
         let abandoned = Cell::new(None);
-        let relay_scope = RequestScope::new(f.scope.request, f.scope.deadline.0).unwrap();
+        let relay_scope = RequestScope::host(f.scope.request, f.scope.deadline.0).unwrap();
         let shutdown = f.requester_socket.try_clone().unwrap();
         let destination = async {
             let fd = f.reactors[2]
@@ -445,7 +458,11 @@ mod safety {
             let conn = crate::http::from_accepted(fd, &f.admissions[2])?;
             let conn = connection::accept(&f.ios[2], conn, f.signers[2].clone(), &f.scope).await?;
             let received = f.ios[2].receive_head(conn, &f.scope).await?;
-            let (head, length) = decode_envelope(received.value, false)?;
+            let (head, length) = decode_envelope(
+                received.value,
+                false,
+                crate::peer::protocol::chains(&received.connection)?,
+            )?;
             assert_eq!(length, 0);
             let request = Forwarding::new(f.signers[2].clone())
                 .verify_request(codec(&f.admissions[2]).request(head, &f.scope)?)?;
@@ -472,7 +489,7 @@ mod safety {
             let result = f.server.serve_connection(conn, &relay_scope).await;
             assert!(matches!(
                 result,
-                Err(Error::DeadlineExceeded | Error::Cancelled | Error::Io)
+                Err(Error::DeadlineExceeded | Error::Canceled | Error::Io)
             ));
             assert!(Instant::now() <= deadline.get().unwrap() + Duration::from_secs(1));
             if prompt {
@@ -502,7 +519,7 @@ mod safety {
                 &f.scope,
             )
             .await?;
-            let mut request = request(&f.admissions[0], 11);
+            let mut request = request(env, &f.admissions[0], 11);
             let end = Instant::now()
                 + if prompt {
                     Duration::from_secs(5)
@@ -549,7 +566,7 @@ mod safety {
         )
         .unwrap();
         assert!(admitted.get() && finished.get());
-        assert_eq!(relay_scope.cancellation.is_cancelled(), cancel_parent);
+        assert_eq!(relay_scope.cancellation.is_canceled(), cancel_parent);
         assert!(
             f.scope.check().is_ok(),
             "unrelated listener scope remains usable"
@@ -570,7 +587,6 @@ mod safety {
             drive(&f.reactors, reactor.drain(), || {}).unwrap();
         }
         f.ios[1].reclaim_buffer();
-        f.admissions[1].reclaim_buffers();
         for class in [
             ResourceClass::Connection,
             ResourceClass::Relay,
@@ -590,11 +606,13 @@ mod safety {
 
     #[test]
     fn wrong_equal_length_body_through_opaque_relay_fails_aead_then_recovers() {
-        let mut f = RelayFixture::new(false);
+        let env = racer_io::Env::host();
+        let mut f = RelayFixture::new(&env, false);
         let relay_metrics = Metrics::default();
         f.server = f.server.with_metrics(relay_metrics.clone());
         assert!(f.server.opaque_relay());
         let identities = crate::test_support::security::identities(
+            &env,
             ClusterId(CLUSTER.into()),
             &[NodeId(A.into()), NodeId(C.into())],
             || {
@@ -625,15 +643,22 @@ mod safety {
             if index == 0 {
                 client.set_metrics(metrics.clone());
             }
-            cryptos.push(PageCrypto::new(identity.keys.clone(), client.clone()));
+            cryptos.push(PageCrypto::new(
+                identity.keys.clone(),
+                client.clone(),
+                BufferPool::new(f.admissions[2].clone()),
+            ));
             clients.push(client);
             engines
                 .borrow_mut()
-                .push(PageCryptoEngine::new(CryptoRuntime { port }));
+                .push(PageCryptoEngine::new(CryptoRuntime {
+                    port,
+                    ctx: racer_io::WorkerCtx::host(),
+                }));
         }
         let poll_crypto = || {
             for engine in engines.borrow_mut().iter_mut() {
-                uring_runtime::group::Service::poll_budgeted(
+                crate::lifecycle::Service::poll_budgeted(
                     engine,
                     &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
                     8,
@@ -665,7 +690,13 @@ mod safety {
                 .unwrap();
             let (verified, encrypted) = drive(
                 &f.reactors,
-                cryptos[1].encrypt(page, plain, output, &f.scope),
+                cryptos[1].encrypt(
+                    page,
+                    racer_wire::object::PageSize::DEFAULT,
+                    plain,
+                    output,
+                    &f.scope,
+                ),
                 poll_crypto,
             )
             .unwrap();
@@ -683,7 +714,11 @@ mod safety {
                 connection::accept(&f.ios[2], conn, f.signers[2].clone(), &f.scope).await?;
             for wrong in [true, false] {
                 let received = f.ios[2].receive_head(conn, &f.scope).await?;
-                let (head, _) = decode_envelope(received.value, false)?;
+                let (head, _) = decode_envelope(
+                    received.value,
+                    false,
+                    crate::peer::protocol::chains(&received.connection)?,
+                )?;
                 let auth = Forwarding::new(f.signers[2].clone());
                 let request =
                     auth.verify_request(codec(&f.admissions[2]).request(head, &f.scope)?)?;
@@ -733,7 +768,7 @@ mod safety {
             )
             .await?;
             for (attempt, wrong) in [true, false].into_iter().enumerate() {
-                let mut request = request(&f.admissions[0], attempt as u8 + 1);
+                let mut request = request(&env, &f.admissions[0], attempt as u8 + 1);
                 request.operation = protocol::Operation::Page {
                     page: pages[0].envelope().page.clone(),
                     mode: protocol::FetchMode::CopyOnly,
@@ -747,7 +782,11 @@ mod safety {
                         &f.scope,
                     )
                     .await?;
-                let (head, size) = decode_envelope(received.value, true)?;
+                let (head, size) = decode_envelope(
+                    received.value,
+                    true,
+                    crate::peer::protocol::chains(&received.connection)?,
+                )?;
                 assert_eq!(head.hops.len(), 1);
                 assert_eq!(size, length + 16);
                 conn = received.connection;
@@ -772,11 +811,11 @@ mod safety {
                 let clear = cryptos[0]
                     .decrypt(
                         ciphertext.clone(),
-                        f.admissions[0].reserve(
+                        crate::memory::fixture_plaintext(
+                            &f.admissions[0],
                             Some(&CacheId(CACHE.into())),
-                            ResourceClass::Plaintext,
-                            length,
-                        )?,
+                            &vec![0; length],
+                        ),
                         &f.scope,
                     )
                     .await;
@@ -788,7 +827,6 @@ mod safety {
                         "no publishable plaintext"
                     );
                     assert_eq!(metrics.count(Event::CryptoDecryptAeadRejected), 1);
-                    assert_eq!(metrics.count(Event::CryptoDecryptCrcRejected), 0);
                 } else {
                     let clear = clear?;
                     assert!(clear.bytes().iter().all(|b| *b == 31));
@@ -819,7 +857,6 @@ mod safety {
             2 * (length + 16) as u64
         );
         assert_eq!(relay_metrics.count(Event::OpaqueRelayBodyFailed), 0);
-        f.admissions[0].reclaim_buffers();
         assert_eq!(f.admissions[1].used(ResourceClass::Connection), 0);
         assert_eq!(f.admissions[1].used(ResourceClass::Relay), 0);
         assert_eq!(f.admissions[0].used(ResourceClass::Plaintext), 0);
@@ -829,7 +866,14 @@ mod safety {
 // These opaque-transport fixtures intentionally use empty AAD, not page AAD.
 fn seal_fixture(nonce: &[u8; 24], plaintext: &[u8]) -> Vec<u8> {
     let mut output = vec![0; plaintext.len() + TAG_LEN];
-    seal(&[7; 32], nonce, &[], plaintext, &mut output).unwrap();
+    seal(
+        &crate::test_support::test_vector([7; 32]),
+        nonce,
+        &[],
+        plaintext,
+        &mut output,
+    )
+    .unwrap();
     output
 }
 
@@ -838,7 +882,13 @@ fn open_fixture(
     sealed: &[u8],
 ) -> std::result::Result<Vec<u8>, racer_crypto::Error> {
     let mut output = vec![0; sealed.len().saturating_sub(TAG_LEN)];
-    open(&[7; 32], nonce, &[], sealed, &mut output)?;
+    open(
+        &crate::test_support::test_vector([7; 32]),
+        nonce,
+        &[],
+        sealed,
+        &mut output,
+    )?;
     Ok(output)
 }
 
@@ -859,7 +909,9 @@ fn drive<T>(
     inspect: impl Fn(),
 ) -> T {
     let mut work = std::pin::pin!(work);
-    let deadline = Instant::now() + Duration::from_secs(25);
+    // A hang detector, not a throughput bound: it trips only after reactors
+    // make no progress for the whole window, so a starved host cannot fail it.
+    let mut deadline = Instant::now() + Duration::from_secs(25);
     loop {
         if let Poll::Ready(result) = work
             .as_mut()
@@ -875,6 +927,8 @@ fn drive<T>(
         }
         if progress == 0 {
             std::thread::yield_now();
+        } else {
+            deadline = Instant::now() + Duration::from_secs(25);
         }
     }
 }
@@ -882,13 +936,21 @@ fn drive<T>(
 // Wall and thread CPU include all three roles. The same signed fixture can
 // execute the materialized relay path for a local mechanism A/B.
 fn exchange(
+    env: &racer_io::Env,
     materialized: bool,
     fallback: bool,
     rounds: usize,
     fragmented: bool,
     truncated: bool,
 ) -> (Duration, Duration) {
-    RelayFixture::new(materialized).run(materialized, fallback, rounds, fragmented, truncated)
+    RelayFixture::new(env, materialized).run(
+        env,
+        materialized,
+        fallback,
+        rounds,
+        fragmented,
+        truncated,
+    )
 }
 
 struct RelayFixture {
@@ -916,7 +978,8 @@ struct RelayFixture {
 /// and nothing for any other response.
 #[test]
 fn page_bodies_count_toward_the_hot_page_shed_on_every_transport() {
-    let f = RelayFixture::new(true);
+    let env = racer_io::Env::host();
+    let f = RelayFixture::new(&env, true);
     let id = f.page.envelope().page.clone();
     let page = PeerResponse::Page {
         metadata: f.metadata.clone(),
@@ -941,17 +1004,16 @@ fn page_bodies_count_toward_the_hot_page_shed_on_every_transport() {
 }
 
 #[test]
-fn send_crc_http_success_failure_drop_do_not_wait_for_crypto() {
+fn send_tag_http_success_failure_drop_do_not_wait_for_crypto() {
     use crate::security::CryptoClient;
     use crate::security::PageCrypto;
     use crate::security::pair;
     use crate::telemetry::Pair;
     use crate::telemetry::Samples;
+    let env = racer_io::Env::host();
     for mode in ["success", "failure", "drop"] {
-        let f = RelayFixture::new(true);
-        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
-        let _guard = queue.enter();
-        let (_, ids) = identities();
+        let f = RelayFixture::new(&env, true);
+        let (_, ids) = identities(&env);
         let (io, _engine) = pair(
             crate::model::WorkerId(0),
             1,
@@ -960,9 +1022,10 @@ fn send_crc_http_success_failure_drop_do_not_wait_for_crypto() {
         let crypto = Rc::new(PageCrypto::new(
             ids[1].0.clone(),
             Rc::new(CryptoClient::new(io)),
+            crate::memory::fixture_buffer_pool(),
         ));
         let samples = Samples::default();
-        let server = f.server.with_send_crc(
+        let server = f.server.with_send_tag(
             Some(Pair {
                 sender: NodeId(B.into()),
                 receiver: NodeId(A.into()),
@@ -996,7 +1059,7 @@ fn send_crc_http_success_failure_drop_do_not_wait_for_crypto() {
         server_conn.set_framing(Some(0), server_conn.send_remaining(), false);
         let a = Forwarding::new(f.signers[0].clone());
         let b = Forwarding::new(f.signers[1].clone());
-        let mut local = request(&f.admissions[0], 9);
+        let mut local = request(&env, &f.admissions[0], 9);
         local.route.destination = NodeId(B.into());
         local.operation = protocol::Operation::Bootstrap {
             object: f.metadata.version.object.clone(),
@@ -1078,18 +1141,16 @@ fn send_crc_http_success_failure_drop_do_not_wait_for_crypto() {
             "{text}"
         );
         assert!(text.contains("status=pending"));
-        drop(queue);
-        drop(_guard);
     }
 }
 
 impl RelayFixture {
-    fn new(materialized: bool) -> Self {
-        Self::with_pool_limit(materialized, 1)
+    fn new(env: &racer_io::Env, materialized: bool) -> Self {
+        Self::with_pool_limit(env, materialized, 1)
     }
 
-    fn with_pool_limit(materialized: bool, limit: usize) -> Self {
-        let signers = signers();
+    fn with_pool_limit(env: &racer_io::Env, materialized: bool, limit: usize) -> Self {
+        let signers = signers(env);
         let admissions: Vec<_> = (0..3)
             .map(|_| {
                 Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
@@ -1099,7 +1160,7 @@ impl RelayFixture {
             .collect();
         let reactors: Vec<_> = admissions
             .iter()
-            .map(|a| Rc::new(Reactor::new(a.clone())))
+            .map(|a| Rc::new(Reactor::new(a.clone(), env)))
             .collect();
         let ios: Vec<_> = reactors
             .iter()
@@ -1143,6 +1204,7 @@ impl RelayFixture {
             PeerNetwork::new(
                 NodeId(B.into()),
                 crate::test_support::published_membership(membership),
+                racer_io::Clock::host(),
             )
             .unwrap(),
         );
@@ -1159,7 +1221,10 @@ impl RelayFixture {
             Rc::new(codec(&admissions[1])),
             signers[1].clone(),
         ));
-        let paths = Rc::new(Paths::new(Rc::new(LinkHealth::default()), 4));
+        let paths = Rc::new(Paths::new(
+            Rc::new(LinkHealth::on(env.ctx.clock.clone())),
+            4,
+        ));
         let requester = Rc::new(Requester::new(
             paths.clone(),
             auth.clone(),
@@ -1184,12 +1249,16 @@ impl RelayFixture {
         )
         .with_transfers(transfers)
         .with_opaque_relay(!materialized);
-        let scope = RequestScope::new(RequestId([1; 16]), Instant::now() + Duration::from_secs(25))
-            .unwrap();
+        let scope = RequestScope::with_clock(
+            RequestId([1; 16]),
+            env.ctx.now() + Duration::from_secs(25),
+            env.ctx.clock.clone(),
+        )
+        .unwrap();
         let plaintext: Vec<_> = (0..crate::model::PAGE_BYTES as usize)
             .map(|i| (i % 251) as u8)
             .collect();
-        let body = seal_fixture(&[8; 24], &plaintext);
+        let body = seal_fixture(&crate::test_support::test_vector([8; 24]), &plaintext);
         assert_eq!(body.len(), 16 * 1024 * 1024 + 16);
         let metadata = ObjectMetadata {
             content_type: None,
@@ -1206,6 +1275,7 @@ impl RelayFixture {
             ),
         };
         let envelope = PageEnvelope {
+            page_size: racer_wire::object::PageSize::DEFAULT,
             cipher: crate::model::PageCipher::Xaes256Gcm,
             page: PageId {
                 version: metadata.version.clone(),
@@ -1249,6 +1319,7 @@ impl RelayFixture {
 
     fn run(
         self,
+        env: &racer_io::Env,
         materialized: bool,
         fallback: bool,
         rounds: usize,
@@ -1283,7 +1354,11 @@ impl RelayFixture {
             let mut conn = connection::accept(&ios[2], conn, signers[2].clone(), &scope).await?;
             for i in 0..rounds {
                 let received = ios[2].receive_head(conn, &scope).await?;
-                let (head, length) = decode_envelope(received.value, false)?;
+                let (head, length) = decode_envelope(
+                    received.value,
+                    false,
+                    crate::peer::protocol::chains(&received.connection)?,
+                )?;
                 assert_eq!(length, 0);
                 let request = codec(&admissions[2]).request(head, &scope)?;
                 let auth = Forwarding::new(signers[2].clone());
@@ -1381,7 +1456,7 @@ impl RelayFixture {
                 connection::connect(&ios[0], conn, signers[0].clone(), signers[1].node(), &scope)
                     .await?;
             for i in 0..rounds {
-                let mut request = request(&admissions[0], i as u8);
+                let mut request = request(env, &admissions[0], i as u8);
                 request.operation = if i % 2 == 0 {
                     protocol::Operation::Bootstrap {
                         object: metadata.version.object.clone(),
@@ -1402,7 +1477,11 @@ impl RelayFixture {
                         &scope,
                     )
                     .await?;
-                let (head, length) = decode_envelope(received.value, true)?;
+                let (head, length) = decode_envelope(
+                    received.value,
+                    true,
+                    crate::peer::protocol::chains(&received.connection)?,
+                )?;
                 assert_eq!(head.hops.len(), 1);
                 assert_eq!(length, body.len());
                 conn = received.connection;
@@ -1443,7 +1522,11 @@ impl RelayFixture {
                     _ => panic!("page required"),
                 };
                 assert_eq!(
-                    open_fixture(&[8; 24], ciphertext.bytes()).unwrap(),
+                    open_fixture(
+                        &crate::test_support::test_vector([8; 24]),
+                        ciphertext.bytes()
+                    )
+                    .unwrap(),
                     plaintext
                 );
                 conn.finish_exchange()?;
@@ -1494,29 +1577,41 @@ fn cpu() -> Duration {
 }
 #[test]
 fn signed_full_page_bootstrap_and_page_stream_without_transit_allocation() {
+    // Sixty-four MiB through fragmented reads is CPU-bound, so a loaded host
+    // can exceed any wall-clock request budget. Freeze the request clock; the
+    // drive watchdog still catches a stalled relay.
+    let clock = racer_io::ctx::VirtualClock::new();
+    let env = racer_io::Env::new(
+        racer_io::Driver::Uring,
+        racer_io::WorkerCtx::simulated(&clock, 0, 0),
+    );
     for fallback in [false, true] {
-        exchange(false, fallback, 2, true, false);
+        exchange(&env, false, fallback, 2, true, false);
     }
 }
 #[test]
 fn signed_materialized_full_page_bootstrap_and_page_keepalive() {
-    exchange(true, false, 2, true, false);
+    let env = racer_io::Env::host();
+    exchange(&env, true, false, 2, true, false);
 }
 #[test]
 fn signed_success_truncation_closes_relay_and_pooled_destination() {
-    exchange(false, false, 2, false, true);
+    let env = racer_io::Env::host();
+    exchange(&env, false, false, 2, false, true);
 }
 #[test]
 fn opaque_truncation_without_prior_success_credits_no_complete_bytes() {
+    let env = racer_io::Env::host();
     for fallback in [false, true] {
-        exchange(false, fallback, 1, false, true);
+        exchange(&env, false, fallback, 1, false, true);
     }
 }
 #[test]
 #[ignore = "local bounded before/after benchmark; run explicitly"]
 fn opaque_relay_benchmark() {
+    let env = racer_io::Env::host();
     for materialized in [true, false, false, true] {
-        let (wall, cpu) = exchange(materialized, false, 8, false, false);
+        let (wall, cpu) = exchange(&env, materialized, false, 8, false, false);
         eprintln!(
             "materialized={materialized} bytes={} wall_ms={:.3} cpu_ms={:.3}",
             8 * (16 * 1024 * 1024 + 16),
@@ -1530,6 +1625,7 @@ fn opaque_relay_benchmark() {
 fn opaque_head_rejects_binding_length_authority_and_reverse_proof_substitution() {
     use crate::peer::forwarding::ForwardedHead;
     use crate::peer::protocol;
+    let env = racer_io::Env::host();
     fn copy(head: &http1::MessageHead) -> http1::MessageHead {
         let codec = Codec::new(crate::peer::protocol::MAX_SIGNED_HEAD);
         let mut head = codec
@@ -1552,14 +1648,14 @@ fn opaque_head_rejects_binding_length_authority_and_reverse_proof_substitution()
         "hop",
         "deadline",
     ] {
-        let signers = signers();
+        let signers = signers(&env);
         let a = Forwarding::new(signers[0].clone());
         let b = Forwarding::new(signers[1].clone());
         let c = Forwarding::new(signers[2].clone());
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         )));
-        let local = request(&admission, 1);
+        let local = request(&env, &admission, 1);
         let (signed, _) = a.sign_request_to(local, signers[1].node()).unwrap();
         let verified = b.verify_request(signed).unwrap();
         let binding = verified.binding().clone();
@@ -1614,13 +1710,14 @@ fn opaque_head_rejects_binding_length_authority_and_reverse_proof_substitution()
         if attack == "deadline" {
             // The binding retains its signed monotonic deadline; scope changes
             // cannot make a stale head eligible for reverse forwarding.
-            let clock = uring_runtime::environment::SimulationClock::new_at(
+            let clock = racer_io::SimClock::new_at(
                 91,
                 Instant::now() + Duration::from_secs(60),
                 std::time::SystemTime::now() + Duration::from_secs(60),
             );
-            let environment = clock.environment(0);
-            let _guard = environment.enter();
+            let environment = clock.ctx(0);
+            // The forwarder reads time from its own context, now the later one.
+            let b = Forwarding::new(Rc::new(signers[1].with_ctx(environment.clone())));
             assert!(
                 b.forward_opaque(response, 0, &binding, signers[0].node())
                     .is_err()
@@ -1635,5 +1732,71 @@ fn opaque_head_rejects_binding_length_authority_and_reverse_proof_substitution()
             assert_eq!(result.is_ok(), attack == "valid", "{attack}");
         }
         assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+    }
+}
+
+/// Per-operation cost of the peer request crypto path, the source of racer-dst's `[crypto]`
+/// `sign_ns` / `verify_ns` constants (`dst/costs.toml`). Run with
+/// `cargo test --release -p racer --lib peer_crypto_cost_benchmark -- --ignored --nocapture`.
+#[test]
+#[ignore = "release-only peer sign/verify cost benchmark; run explicitly"]
+fn peer_crypto_cost_benchmark() {
+    use std::hint::black_box;
+    let env = racer_io::Env::host();
+    #[allow(clippy::assertions_on_constants)]
+    {
+        assert!(!cfg!(debug_assertions), "run with --release");
+    }
+    let signers = signers(&env);
+    let a = Forwarding::new(signers[0].clone());
+    let b = Forwarding::new(signers[1].clone());
+    let c = Forwarding::new(signers[2].clone());
+    let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+        crate::test_support::cluster::config(false).limits,
+    )));
+    const ITERATIONS: u32 = 400;
+    let mut totals = [Duration::ZERO; 5];
+    for _ in 0..ITERATIONS {
+        let local = request(&env, &admission, 1);
+        let start = Instant::now();
+        let (signed, _) = a.sign_request_to(local, signers[1].node()).unwrap();
+        let t1 = Instant::now();
+        let verified = b.verify_request(signed).unwrap();
+        let t2 = Instant::now();
+        let mut budget = verified.request().route.clone();
+        budget.visited.push(signers[1].node().clone());
+        budget.remaining_links -= 1;
+        let t3 = Instant::now();
+        let outbound = b
+            .append_request(verified, signers[2].node(), budget)
+            .unwrap();
+        let t4 = Instant::now();
+        let verified = c.verify_request(outbound).unwrap();
+        let t5 = Instant::now();
+        black_box(
+            c.sign_response(verified.binding(), PeerResponse::Miss)
+                .unwrap(),
+        );
+        let t6 = Instant::now();
+        totals[0] += t1 - start;
+        totals[1] += t2 - t1;
+        totals[2] += t4 - t3;
+        totals[3] += t5 - t4;
+        totals[4] += t6 - t5;
+    }
+    for (name, total) in [
+        "sign_direct",
+        "verify_direct",
+        "sign_relayed",
+        "verify_relayed",
+        "sign_response",
+    ]
+    .into_iter()
+    .zip(totals)
+    {
+        eprintln!(
+            "peer_crypto op={name} us_per_op={:.1}",
+            total.as_secs_f64() * 1e6 / f64::from(ITERATIONS)
+        );
     }
 }

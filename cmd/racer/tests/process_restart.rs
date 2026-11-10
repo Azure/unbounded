@@ -807,8 +807,8 @@ impl Process {
             ("RACER_DIAGNOSTICS_LISTEN", diagnostics.to_string()),
         ]);
         for (name, path) in [
-            ("RACER_TRUST_BUNDLE", "trust.pem"),
-            ("RACER_SERVICE_ACCOUNT_TOKEN", "token"),
+            ("RACER_CONTROL_TRUST_BUNDLE", "trust.pem"),
+            ("RACER_CONTROL_TOKEN", "token"),
             ("RACER_IDENTITY_DIRECTORY", "identity"),
             ("RACER_SLAB_DIRECTORY", "slabs"),
         ] {
@@ -826,13 +826,13 @@ impl Process {
                 ("RACER_REGISTERED_BYTES", "1"),
                 // Current signed-peer envelope progress floor exceeds 1 MiB.
                 ("RACER_REQUEST_CONTEXT_BYTES", "16777216"),
-                ("RACER_SLAB_BYTES", "268435456"),
+                ("RACER_SLAB_BYTES_PER_WORKER", "268435456"),
                 ("RACER_SEGMENT_BYTES", "67108864"),
-                ("RACER_FREE_SEGMENT_RESERVE", "1"),
+                ("RACER_FREE_SEGMENT_RESERVE_PER_WORKER", "1"),
                 ("RACER_QUEUE_ENTRIES", "16"),
                 // Three independent control slots require twelve total connections.
                 ("RACER_CLIENT_CONNECTIONS", "12"),
-                ("RACER_ORIGIN_CONNECTIONS_PER_CACHE", "2"),
+                ("RACER_CACHE_ORIGIN_CONNECTIONS_PER_WORKER", "2"),
                 ("RACER_METADATA_ENTRIES", "32"),
                 ("RACER_FLIGHTS", "8"),
                 ("RACER_PIPES", "2"),
@@ -1076,9 +1076,9 @@ fn enrolled_identity(
     scratch: &Scratch,
     control: &control::Control,
     processes: usize,
-) -> racer_crypto::enrollment::LocalSigningIdentity {
-    use racer_control_wire::ClusterId;
-    use racer_crypto::enrollment::Enrollment;
+) -> racer::enrollment::LocalSigningIdentity {
+    use racer::enrollment::Enrollment;
+    use racer_wire::control::ClusterId;
     assert_eq!(
         control.enrollments.load(Ordering::Acquire),
         2 * processes,
@@ -1095,15 +1095,16 @@ fn enrolled_identity(
         scratch.0.join("identity"),
         std::rc::Rc::new(racer::control::ReactorControlIo::new(reactor.clone())),
     );
-    let bundle = racer_control_wire::decode_bundle(&control.bundle).unwrap();
+    let bundle = racer_wire::control::decode_bundle(&control.bundle).unwrap();
     enrollment
         .set_peer_trust_roots(bundle.peer_trust_roots)
         .unwrap();
     // Verify the persisted certificate's chain, SAN, validity, request correlation,
     // and local key pairing rather than comparing opaque identity.json bytes.
-    let scope = racer::runtime::RequestScope::new(
+    let scope = racer::runtime::RequestScope::with_clock(
         racer::model::RequestId([9; 16]),
         Instant::now() + Duration::from_secs(15),
+        racer_io::Clock::host(),
     )
     .unwrap();
     let identity = enrollment_io::drive(&reactor, enrollment.load_identity(&scope))
@@ -1111,7 +1112,7 @@ fn enrolled_identity(
         .unwrap();
     assert_eq!(identity.cluster().0, CLUSTER);
     assert_eq!(identity.node().0, NODE);
-    assert!(identity.valid_now());
+    assert!(identity.valid_at(std::time::SystemTime::now()));
     identity
 }
 
@@ -1453,5 +1454,5 @@ fn periodic_checkpoint_sigkill_recovers_older_pages_and_bounds_recent_loss() {
     );
     assert!(second.stop(libc::SIGTERM).success(), "{}", second.logs());
 }
-use uring_runtime::group::affinity::CpuLocation;
-use uring_runtime::group::affinity::EffectiveTopology;
+use racer::affinity::CpuLocation;
+use racer::affinity::EffectiveTopology;

@@ -13,6 +13,10 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/Azure/unbounded/pkg/agent/isolation"
+	"github.com/Azure/unbounded/pkg/agent/isolation/container"
+	"github.com/Azure/unbounded/pkg/agent/isolation/none"
 )
 
 func nftablesTask(registered bool, err error) *configureNFTables {
@@ -115,4 +119,108 @@ func TestNFTablesFlushUnitOutranksTheImageFirewall(t *testing.T) {
 	for _, dependency := range []string{"Wants=", "Requires=", "BindsTo="} {
 		assert.NotContains(t, unit, dependency+"iptables.service")
 	}
+}
+
+// The nspawn flush unit is rendered from the unchanged template. Before the
+// isolation modes existed that was the only unit; nspawn and the default mode must keep producing it.
+func TestConfigureNFTablesForNSpawnRendersTheOriginalUnit(t *testing.T) {
+	t.Parallel()
+
+	var want bytes.Buffer
+	require.NoError(t, nftablesFlushServiceTemplate.Execute(&want, map[string]string{"NFTablesClearPath": nftablesClearPath}))
+
+	for _, mode := range []isolation.Mode{"", isolation.ModeNSpawn} {
+		c, ok := ConfigureNFTablesFor(slog.New(slog.DiscardHandler), mode).(*configureNFTables)
+		require.True(t, ok)
+		assert.Empty(t, c.nodeUnits)
+
+		got, err := c.renderFlushUnit()
+		require.NoError(t, err)
+		assert.Equal(t, want.String(), got.String())
+		assert.Contains(t, got.String(), "RequiredBy=systemd-nspawn@.service")
+	}
+
+	plain, ok := ConfigureNFTables(slog.New(slog.DiscardHandler)).(*configureNFTables)
+	require.True(t, ok)
+	assert.Empty(t, plain.nodeUnits)
+}
+
+func TestConfigureNFTablesForHostModesOrdersTheFlushBeforeTheNodeUnits(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		mode  isolation.Mode
+		units []string
+	}{
+		{isolation.ModeNone, []string{none.UnitContainerd, none.UnitKubelet}},
+		{isolation.ModeContainer, []string{container.UnitName("kube1"), container.UnitName("kube2")}},
+	}
+
+	for _, tt := range tests {
+		c, ok := ConfigureNFTablesFor(slog.New(slog.DiscardHandler), tt.mode).(*configureNFTables)
+		require.True(t, ok)
+		assert.Equal(t, tt.units, c.nodeUnits)
+
+		got, err := c.renderFlushUnit()
+		require.NoError(t, err)
+
+		unit := got.String()
+		assert.Contains(t, unit, "Before="+strings.Join(tt.units, " "))
+		assert.Contains(t, unit, "WantedBy=multi-user.target")
+		assert.Contains(t, unit, "After=iptables.service ip6tables.service nftables.service")
+		assert.Contains(t, unit, "ExecStart=/usr/sbin/nft -f "+nftablesClearPath)
+		assert.NotContains(t, unit, "systemd-nspawn")
+	}
+}
+
+// The host modes cannot ask machined: their hosts do not install
+// systemd-container, which is what failed the none bootstrap. They look at the
+// node units instead, and no units active means a fresh host that may flush.
+func TestConfigureNFTablesForHostModesDoesNotNeedMachinectl(t *testing.T) {
+	for _, mode := range []isolation.Mode{isolation.ModeNone, isolation.ModeContainer} {
+		c, ok := ConfigureNFTablesFor(slog.New(slog.DiscardHandler), mode).(*configureNFTables)
+		require.True(t, ok)
+
+		c.machineRegistered = anyUnitActiveWith(c.nodeUnits, func(context.Context, string) (string, error) {
+			return "inactive\n", errors.New("exit status 3")
+		})
+
+		start, err := c.shouldStartFlush(t.Context())
+		require.NoError(t, err)
+		assert.True(t, start, "nothing in the node units is active on a fresh host")
+	}
+}
+
+// Only inactive and failed mean "not running". An active unit, or a systemctl
+// that gives no usable answer, keeps the ruleset: the check fails closed.
+func TestAnyUnitActiveFailsClosed(t *testing.T) {
+	log := slog.New(slog.DiscardHandler)
+	units := []string{"a.service", "b.service"}
+
+	answer := func(states map[string]string, errs map[string]error) unitStateFunc {
+		return func(_ context.Context, unit string) (string, error) { return states[unit], errs[unit] }
+	}
+
+	exit3 := errors.New("exit status 3")
+
+	running, err := anyUnitActiveWith(units, answer(map[string]string{"a.service": "inactive\n", "b.service": "failed\n"}, map[string]error{"a.service": exit3, "b.service": exit3}))(t.Context(), log)
+	require.NoError(t, err)
+	assert.False(t, running)
+
+	for _, state := range []string{"active", "activating", "deactivating", "reloading"} {
+		running, err = anyUnitActiveWith(units, answer(map[string]string{"a.service": "inactive", "b.service": state + "\n"}, map[string]error{"a.service": exit3}))(t.Context(), log)
+		require.NoError(t, err, state)
+		assert.True(t, running, state)
+	}
+
+	// systemctl could not be run, or could not reach systemd.
+	_, err = anyUnitActiveWith(units, answer(nil, map[string]error{"a.service": errors.New("exec: not found")}))(t.Context(), log)
+	require.ErrorContains(t, err, "a.service")
+
+	_, err = anyUnitActiveWith(units, answer(map[string]string{"a.service": "unknown"}, map[string]error{"a.service": errors.New("exit status 4")}))(t.Context(), log)
+	require.ErrorContains(t, err, "unknown")
+
+	// An answer that is not a state is an error even with a zero exit.
+	_, err = anyUnitActiveWith(units, answer(map[string]string{"a.service": "maybe"}, nil))(t.Context(), log)
+	require.Error(t, err)
 }

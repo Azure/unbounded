@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strconv"
 
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
@@ -48,10 +49,36 @@ type schema struct {
 }
 
 type descriptor struct {
-	MediaType string   `json:"mediaType"`
-	Digest    string   `json:"digest"`
-	Size      int64    `json:"size"`
-	URLs      []string `json:"urls"`
+	MediaType   string            `json:"mediaType"`
+	Digest      string            `json:"digest"`
+	Size        int64             `json:"size"`
+	URLs        []string          `json:"urls"`
+	Annotations map[string]string `json:"annotations"`
+}
+
+const (
+	overlayBDBlobDigestAnnotation = "containerd.io/snapshot/overlaybd/blob-digest"
+	overlayBDBlobSizeAnnotation   = "containerd.io/snapshot/overlaybd/blob-size"
+)
+
+// IsOverlayBDStreamingManifest reports whether every layer is an ACR
+// Artifact Streaming descriptor. Requiring matching digest and size
+// annotations keeps ordinary OCI manifests on the existing pull path and makes
+// partially annotated manifests fail closed.
+func IsOverlayBDStreamingManifest(body []byte) bool {
+	var m schema
+	if err := json.Unmarshal(body, &m); err != nil || len(m.Layers) == 0 {
+		return false
+	}
+
+	for _, layer := range m.Layers {
+		if len(layer.URLs) > 0 || layer.Annotations[overlayBDBlobDigestAnnotation] != layer.Digest ||
+			layer.Annotations[overlayBDBlobSizeAnnotation] != strconv.FormatInt(layer.Size, 10) {
+			return false
+		}
+	}
+
+	return true
 }
 
 // DetectContentType returns the OCI/Docker Content-Type described by a
@@ -247,6 +274,9 @@ func ChildDigests(body []byte) ([]digest.Digest, error) {
 type TypedChild struct {
 	Digest digest.Digest
 	Kind   ifaces.OriginRefKind
+	// Size is the descriptor's byte length, or 0 when absent. Locating a
+	// layer's trailing index requires it.
+	Size int64
 }
 
 // TypedChildren is the kind-preserving cousin of ChildDigests. Source
@@ -274,7 +304,7 @@ func TypedChildren(body []byte) ([]TypedChild, error) {
 	out := make([]TypedChild, 0, 1+len(m.Layers))
 	if m.Config.Digest != "" {
 		if d, err := digest.Parse(m.Config.Digest); err == nil {
-			out = append(out, TypedChild{Digest: d, Kind: ifaces.KindConfig})
+			out = append(out, TypedChild{Digest: d, Kind: ifaces.KindConfig, Size: m.Config.Size})
 		}
 	}
 
@@ -289,7 +319,7 @@ func TypedChildren(body []byte) ([]TypedChild, error) {
 		}
 
 		if d, err := digest.Parse(l.Digest); err == nil {
-			out = append(out, TypedChild{Digest: d, Kind: ifaces.KindBlob})
+			out = append(out, TypedChild{Digest: d, Kind: ifaces.KindBlob, Size: l.Size})
 		}
 	}
 

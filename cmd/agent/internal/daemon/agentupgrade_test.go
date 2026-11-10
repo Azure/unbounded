@@ -7,6 +7,8 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -19,6 +21,7 @@ import (
 
 	"github.com/Azure/unbounded/pkg/agent/agentbinary"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/isolation"
 )
 
 func TestParseAgentUpgradeRequest(t *testing.T) {
@@ -176,4 +179,58 @@ func TestAgentUpgradePathsInitialDaemonBinaryTarget(t *testing.T) {
 	require.NoError(t, os.Chmod(paths.BinaryPath, 0o644))
 	_, err = paths.InitialDaemonBinaryTarget()
 	require.Error(t, err)
+}
+
+// The modes an agent upgrade candidate must support are found from which
+// applied config files exist, like the recovery script does.
+func TestHostIsolationModes(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	pathOf := func(name string) string { return filepath.Join(dir, name+"-applied-config.json") }
+
+	require.Empty(t, hostIsolationModes(pathOf), "a host with no applied config has nothing to check")
+
+	require.NoError(t, os.WriteFile(pathOf("kube1"), []byte("{}"), 0o600))
+	require.Empty(t, hostIsolationModes(pathOf), "every agent operates nspawn")
+
+	require.NoError(t, os.WriteFile(pathOf("none-kube1"), []byte("not even json"), 0o600))
+	require.Equal(t, []isolation.Mode{isolation.ModeNone}, hostIsolationModes(pathOf))
+}
+
+func TestCandidateCheck(t *testing.T) {
+	t.Parallel()
+
+	var asked []string
+
+	supports := func(_ context.Context, path string, mode isolation.Mode) error {
+		asked = append(asked, path+" "+string(mode))
+		if mode == isolation.ModeNone {
+			return errors.New("unknown command \"supports-isolation\"")
+		}
+
+		return nil
+	}
+
+	require.NoError(t, candidateCheck(nil, supports)(t.Context(), "/agent"))
+	require.Empty(t, asked, "an nspawn host asks nothing")
+
+	require.ErrorContains(t, candidateCheck([]isolation.Mode{isolation.ModeNone}, supports)(t.Context(), "/agent"), "unknown command")
+	require.Equal(t, []string{"/agent none"}, asked)
+}
+
+// runSupportsIsolation runs the candidate with the subcommand; a candidate
+// that does not know it is refused.
+func TestRunSupportsIsolation(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	newer := filepath.Join(dir, "newer")
+	require.NoError(t, os.WriteFile(newer, []byte("#!/bin/sh\ntest \"$1 $2\" = \"supports-isolation none\"\n"), 0o755))
+	require.NoError(t, runSupportsIsolation(t.Context(), newer, isolation.ModeNone))
+
+	older := filepath.Join(dir, "older")
+	require.NoError(t, os.WriteFile(older, []byte("#!/bin/sh\necho 'unknown command' >&2\nexit 1\n"), 0o755))
+	require.ErrorContains(t, runSupportsIsolation(t.Context(), older, isolation.ModeNone), `cannot operate isolation mode "none"`)
 }

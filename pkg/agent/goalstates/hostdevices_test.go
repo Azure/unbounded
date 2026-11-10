@@ -228,6 +228,7 @@ func TestHostDevices_Paths_MergesDedupesSorts(t *testing.T) {
 
 	d := HostDevices{
 		KVM:               []string{"/dev/kvm"},
+		MSHV:              []string{"/dev/mshv", "/dev/kvm"},
 		Network:           []string{"/dev/net/tun", "/dev/vhost-net"},
 		Block:             []string{"/dev/sdb", "/dev/sda", "/dev/kvm"},
 		DeviceDirectories: []config.AdditionalHostMount{{Source: "/dev/infiniband"}},
@@ -236,6 +237,7 @@ func TestHostDevices_Paths_MergesDedupesSorts(t *testing.T) {
 
 	want := []string{
 		"/dev/kvm",
+		"/dev/mshv",
 		"/dev/net/tun",
 		"/dev/sda",
 		"/dev/sdb",
@@ -271,4 +273,76 @@ func TestHostDevices_Paths_Empty(t *testing.T) {
 	t.Parallel()
 
 	require.Nil(t, HostDevices{}.Paths())
+}
+
+// newTestHostDeviceProbe returns a probe rooted at a fresh temporary
+// directory. No device nodes exist until the test creates them.
+func newTestHostDeviceProbe(t *testing.T) hostDeviceProbe {
+	t.Helper()
+
+	root := t.TempDir()
+
+	return hostDeviceProbe{
+		kvm:              filepath.Join(root, "dev", "kvm"),
+		mshv:             filepath.Join(root, "dev", "mshv"),
+		tun:              filepath.Join(root, "dev", "net", "tun"),
+		vhostNet:         filepath.Join(root, "dev", "vhost-net"),
+		sysClassBlockDir: filepath.Join(root, "sys", "class", "block"),
+		devDir:           filepath.Join(root, "dev"),
+		infinibandDir:    filepath.Join(root, "dev", "infiniband"),
+		rdmaCMMiscDev:    filepath.Join(root, "sys", "class", "misc", "rdma_cm", "dev"),
+	}
+}
+
+func createFakeDevice(t *testing.T, path string) {
+	t.Helper()
+
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+
+	f, err := os.Create(path)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+}
+
+func TestDiscoverHostDevices_MSHVPresent(t *testing.T) {
+	t.Parallel()
+
+	probe := newTestHostDeviceProbe(t)
+	createFakeDevice(t, probe.mshv)
+
+	got := discoverHostDevices(probe, nil)
+
+	require.Equal(t, []string{probe.mshv}, got.MSHV)
+	require.Nil(t, got.KVM, "an MSHV root partition does not expose /dev/kvm")
+	require.Equal(t, []string{probe.mshv}, got.Paths())
+}
+
+func TestDiscoverHostDevices_MSHVAbsent(t *testing.T) {
+	t.Parallel()
+
+	probe := newTestHostDeviceProbe(t)
+	createFakeDevice(t, probe.kvm)
+
+	got := discoverHostDevices(probe, nil)
+
+	require.Nil(t, got.MSHV)
+	require.Equal(t, []string{probe.kvm}, got.KVM)
+	require.NotContains(t, got.Paths(), probe.mshv)
+}
+
+func TestDiscoverHostDevices_MSHVWithKVMAndNetwork(t *testing.T) {
+	t.Parallel()
+
+	probe := newTestHostDeviceProbe(t)
+	for _, path := range []string{probe.kvm, probe.mshv, probe.tun, probe.vhostNet} {
+		createFakeDevice(t, path)
+	}
+
+	got := discoverHostDevices(probe, []string{probe.mshv})
+
+	require.Equal(t, []string{probe.kvm}, got.KVM)
+	require.Equal(t, []string{probe.mshv}, got.MSHV)
+	require.Equal(t, []string{probe.tun, probe.vhostNet}, got.Network)
+	// /dev/mshv also listed in Additional is bind-mounted only once.
+	require.Equal(t, []string{probe.kvm, probe.mshv, probe.tun, probe.vhostNet}, got.Paths())
 }

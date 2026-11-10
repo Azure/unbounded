@@ -3,9 +3,7 @@
 
 pub use crate::liveness::Rank0State;
 use crate::read::budget::{AcquisitionBudget, MAX_ROUTE_LINKS};
-use crate::read::budget::{
-    HELPER_ATTEMPTS, HELPER_FLOOR_ATTEMPTS, HELPER_FLOOR_LINKS, HELPER_LINKS, HELPER_MIN_ATTEMPTS,
-};
+use crate::read::budget::{HELPER_ATTEMPTS, HELPER_LINKS, HELPER_MIN_ATTEMPTS};
 use crate::read::{
     Error, OperationKind, ProbeOutcome, ResponseKind, Result, Source, VisitOrder, classify,
     origin_miss_error, unusable_copy,
@@ -100,6 +98,13 @@ const REPLICAS_BELOW: usize = MAX_HANDOFF - 1;
 /// The fresh grant a granted probe spends.
 pub fn granted_budget(deadline: Instant) -> AcquisitionBudget {
     AcquisitionBudget::new(deadline, SUCCESSOR_GRANT_ATTEMPTS, SUCCESSOR_GRANT_LINKS)
+}
+
+/// The overflow helper's own grant: one detour per walk ([`HELPER_ATTEMPTS`] is below
+/// [`HELPER_MIN_ATTEMPTS`], so a helper never asks another), funded apart from the walk so it
+/// cannot spend the links and attempts the remaining owners need.
+pub fn helper_grant(deadline: Instant) -> AcquisitionBudget {
+    AcquisitionBudget::new(deadline, HELPER_ATTEMPTS, HELPER_LINKS)
 }
 
 /// Fewest attempts a non-owner funds an out-of-order Acquire to `canonical`
@@ -364,14 +369,80 @@ pub enum Outcome {
     /// transient evidence, not a route failure.
     StaleDestination,
     /// The destination itself (not a relay) answered `Overloaded`. Like
-    /// `Probe(Overloaded)` without a route failure; asks a reader's helper.
+    /// `Probe(Overloaded)` without a route failure; both ask a reader's helper.
     Shed,
+    /// The destination itself answered `FlightFull`: like [`Outcome::Shed`], but it proved it is
+    /// fetching the page. An owner's probe of rank 0 then withholds origin authority, so ranks 1
+    /// and 2 leave the fetch to rank 0 instead of asking origin a second time.
+    Fetching,
     /// Unanswered within the attempt's time bound. Like `Transport(Unreachable)`, except that an
     /// owner's probe of rank 0 withholds origin authority unless rank 0 is `Overdue`.
     TimedOut,
     /// Rank 0 itself answered an owner's probe `Unavailable`. Like `Probe(Unreachable)`, except
     /// that it withholds authority when this owner's own origin request failed recently.
     Failed,
+}
+
+/// Why an owner's walk gave it origin authority: what its probe of the page's rank 0 showed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OriginReason {
+    /// This node is the page's rank 0.
+    Rank0Self,
+    /// Rank 0 answered that it holds no copy (or not this version).
+    Rank0Miss,
+    /// Rank 0 timed out or was refused for load, and its watch is overdue.
+    Rank0Overdue,
+    /// Rank 0 answered that its own acquisition failed.
+    Rank0Failed,
+    /// Rank 0 itself shed the probe.
+    Rank0Shed,
+    /// The exchange with rank 0 failed (route, connection, or an unsigned `Unavailable`).
+    Rank0Unreachable,
+    /// Rank 0's copy could not be used.
+    Rank0Unusable,
+    /// Rank 0 was behind this node's membership.
+    Rank0Stale,
+    /// The walk never probed rank 0 (not a page walk, or the probe was consumed earlier).
+    Rank0NotAsked,
+}
+
+impl OriginReason {
+    /// The `reason` label of `racer_origin_walk_reasons_total`.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Rank0Self => "rank0_self",
+            Self::Rank0Miss => "rank0_miss",
+            Self::Rank0Overdue => "rank0_overdue",
+            Self::Rank0Failed => "rank0_failed",
+            Self::Rank0Shed => "rank0_shed",
+            Self::Rank0Unreachable => "rank0_unreachable",
+            Self::Rank0Unusable => "rank0_unusable",
+            Self::Rank0Stale => "rank0_stale",
+            Self::Rank0NotAsked => "rank0_not_asked",
+        }
+    }
+
+    /// The reason a rank 0 probe ending in `outcome` gives, before the walk normalizes it.
+    fn of(outcome: Outcome) -> Self {
+        match outcome {
+            Outcome::TimedOut
+            | Outcome::Fetching
+            | Outcome::Probe(ProbeOutcome::Overloaded)
+            | Outcome::Transport(ProbeOutcome::Overloaded) => Self::Rank0Overdue,
+            Outcome::Failed => Self::Rank0Failed,
+            Outcome::Shed => Self::Rank0Shed,
+            Outcome::Copy
+            | Outcome::Probe(ProbeOutcome::CopyMiss | ProbeOutcome::VersionUnavailable)
+            | Outcome::Transport(ProbeOutcome::CopyMiss | ProbeOutcome::VersionUnavailable) => {
+                Self::Rank0Miss
+            }
+            Outcome::Probe(ProbeOutcome::Unreachable)
+            | Outcome::Transport(ProbeOutcome::Unreachable) => Self::Rank0Unreachable,
+            Outcome::Probe(ProbeOutcome::UnusableCopy)
+            | Outcome::Transport(ProbeOutcome::UnusableCopy) => Self::Rank0Unusable,
+            Outcome::StaleMembership | Outcome::StaleDestination => Self::Rank0Stale,
+        }
+    }
 }
 
 /// How the epoch ended.
@@ -424,6 +495,8 @@ pub(crate) struct CandidateWalk {
     /// An earlier owner was busy ([`Outcome::Shed`], [`Outcome::TimedOut`],
     /// `Overloaded`), so it is likely fetching ([`shared_share_short`]).
     saw_busy: bool,
+    /// What the last probe of rank 0 showed ([`CandidateWalk::origin_reason`]).
+    rank0_seen: Option<OriginReason>,
 }
 
 /// Overflow helper state of a non-owner page walk.
@@ -493,6 +566,7 @@ impl CandidateWalk {
             helper: Helper::Unset,
             rank0_unanswered: false,
             saw_busy: false,
+            rank0_seen: None,
         }
     }
 
@@ -516,11 +590,10 @@ impl CandidateWalk {
         }
     }
 
-    /// Ask the page's helper, funded from what is left.
-    fn helper_probe(&mut self, budget: &mut AcquisitionBudget) -> Result<Step> {
-        let attempts = budget.remaining_attempts().min(HELPER_ATTEMPTS);
-        let links = budget.remaining_links().min(HELPER_LINKS);
-        let mut child = budget.partition(attempts, links)?;
+    /// Ask the page's helper on its own grant ([`helper_grant`]), never the walk's credits, so a
+    /// helper that fails at once still leaves every remaining owner funded.
+    fn helper_probe(&mut self, budget: &AcquisitionBudget) -> Step {
+        let mut child = helper_grant(budget.deadline());
         // Forward every funded link: fewer cannot reach rank 0 through a relay.
         child.note_route_failure();
         self.pending = Some(Pending {
@@ -532,14 +605,14 @@ impl CandidateWalk {
             previous: false,
             granted: false,
         });
-        Ok(Step::Probe(Probe {
+        Step::Probe(Probe {
             index: self.index,
             canonical: self.config.owners,
             mode: Mode::Acquire,
             remaining_opportunities: (self.count.saturating_sub(self.index) + 1) as u32,
             route: RouteMode::FundedRoute,
             previous: false,
-        }))
+        })
     }
 
     /// Minimum credits the funded visits after `index` need.
@@ -578,11 +651,7 @@ impl CandidateWalk {
         }
         if self.helper == Helper::Due {
             self.helper = Helper::Used;
-            if budget.remaining_attempts() >= HELPER_FLOOR_ATTEMPTS
-                && budget.remaining_links() >= HELPER_FLOOR_LINKS
-            {
-                return self.helper_probe(budget);
-            }
+            return Ok(self.helper_probe(budget));
         }
         let rank = self.config.rank;
         let continuation = self.config.continuation;
@@ -895,8 +964,13 @@ impl CandidateWalk {
         outcome: Outcome,
     ) -> Result<Option<End>> {
         let pending = self.pending.take().expect("no pending probe");
+        if pending.rank0 {
+            self.rank0_seen = Some(OriginReason::of(outcome));
+        }
+        // A successor's or the helper's grant is dropped: the walk's budget never grows.
         if let Some(bounded) = pending.bounded
             && !pending.granted
+            && !pending.helper
         {
             budget.reunite(bounded)?;
         }
@@ -945,7 +1019,18 @@ impl CandidateWalk {
             };
         }
         self.index += 1;
-        if self.helper == Helper::Armed && outcome == Outcome::Shed {
+        // A busy owner, or a busy hop before it (a relay's `Overloaded`, or a holder that shed the
+        // request before verifying it, `route::unverified_failure`), sends a reader to its
+        // helper. Either way the helper is the way around the hot owner.
+        if self.helper == Helper::Armed
+            && matches!(
+                outcome,
+                Outcome::Shed
+                    | Outcome::Fetching
+                    | Outcome::Probe(ProbeOutcome::Overloaded)
+                    | Outcome::Transport(ProbeOutcome::Overloaded)
+            )
+        {
             self.helper = Helper::Due;
         }
         match outcome {
@@ -957,7 +1042,10 @@ impl CandidateWalk {
             }
             // A previous owner that lags or leads this membership is only a
             // missing copy: never refresh the owner's walk for it.
-            Outcome::StaleMembership | Outcome::StaleDestination | Outcome::Shed
+            Outcome::StaleMembership
+            | Outcome::StaleDestination
+            | Outcome::Shed
+            | Outcome::Fetching
                 if pending.handoff =>
             {
                 Ok(None)
@@ -994,7 +1082,10 @@ impl CandidateWalk {
                 Ok(None)
             }
             // The route worked; the destination is busy.
-            Outcome::Shed => {
+            Outcome::Shed | Outcome::Fetching => {
+                // Rank 0 proved its fetch is running: leave it to rank 0, whatever its watch
+                // says (`Overdue` is about silence, which this answer disproves).
+                self.rank0_unanswered |= outcome == Outcome::Fetching && pending.rank0;
                 self.saw_busy = true;
                 self.saw_transient = true;
                 self.evidence.push(ProbeOutcome::Overloaded);
@@ -1014,6 +1105,15 @@ impl CandidateWalk {
                 }
                 Ok(None)
             }
+        }
+    }
+
+    /// Why an [`End::Origin`] of this walk had authority.
+    pub fn origin_reason(&self) -> OriginReason {
+        match (self.config.rank, self.rank0_seen) {
+            (Some(0), _) => OriginReason::Rank0Self,
+            (_, Some(reason)) => reason,
+            (_, None) => OriginReason::Rank0NotAsked,
         }
     }
 
@@ -1098,7 +1198,7 @@ impl RemainingWalk {
         match outcome {
             Outcome::Copy => return Some(RemainingEnd::Copy),
             Outcome::Probe(outcome) => self.transient |= transient(outcome),
-            Outcome::Shed | Outcome::Failed => self.transient = true,
+            Outcome::Shed | Outcome::Fetching | Outcome::Failed => self.transient = true,
             Outcome::Transport(_) | Outcome::TimedOut => {
                 self.transient = true;
                 budget.note_route_failure();
@@ -1116,16 +1216,28 @@ fn transient(outcome: ProbeOutcome) -> bool {
     )
 }
 
-/// Map a transport error to walk evidence; `None` is terminal.
-/// `HopBudgetExhausted` is local: the owner is unreachable within budget.
+/// Map a failed peer exchange to walk evidence; `None` is terminal for the read.
+///
+/// One owner's failure must not end a read that other owners can still serve, so only
+/// errors that say the read itself is over, or that every owner would answer the same
+/// way, are terminal:
+///
+/// | Error | Outcome |
+/// |---|---|
+/// | `Unavailable`, `Io`, `Os`, `HopBudgetExhausted` | `Unreachable` (next owner) |
+/// | `Overloaded` | `Overloaded` (next owner) |
+/// | `Unauthorized`, `InvalidRequest`, `HeaderTooLarge`, `CorruptRecord`, `MissingKey`, `Internal` | `UnusableCopy` (next owner) |
+/// | `Canceled`, `DeadlineExceeded` | terminal: the caller's scope is over |
+/// | `OriginRejected`, `OriginForbidden` | terminal: the caller's credential is refused |
+/// | `NotFound`, `VersionUnavailable` | terminal: an authoritative answer |
+/// | `IncompatibleMembership`, `InvalidConfiguration` | terminal: local state is unusable |
+///
+/// `HopBudgetExhausted` is local: the owner is unreachable within budget. `Unauthorized`
+/// here is a peer response that failed verification (or a protocol mismatch), which says
+/// nothing about other owners. The dataplane maps its errors without a core counterpart
+/// (replay, stale flight, batch mismatch) to `Internal` first.
 pub fn transport_outcome(error: Error) -> Option<ProbeOutcome> {
-    match error {
-        Error::Unavailable | Error::Io | Error::Os(_) | Error::HopBudgetExhausted => {
-            Some(ProbeOutcome::Unreachable)
-        }
-        Error::Overloaded => Some(ProbeOutcome::Overloaded),
-        _ => None,
-    }
+    super::errors::disposition(error).probe
 }
 
 /// What to do after a peer answered `StaleMembership`.
@@ -1273,10 +1385,13 @@ pub fn hedge_fallback(error: Error) -> bool {
             | Error::Io
             | Error::Os(_)
             | Error::Overloaded
+            | Error::FlightFull
             | Error::CorruptRecord
             | Error::MissingKey
             | Error::InvalidRequest
             | Error::HeaderTooLarge
+            | Error::Unauthorized
+            | Error::Internal
     )
 }
 
@@ -1591,6 +1706,12 @@ pub enum Rank0Note {
     Answered,
     Failed,
     TimedOut,
+    /// The exchange with rank 0 was refused for load (this node's peer admission or
+    /// connection cap, receive memory, or a relay's `Overloaded`). Like `TimedOut` for this page,
+    /// so a page refused past its deadline still reaches origin, but never evidence that rank 0
+    /// itself is silent: it must not mark rank 0 overdue for every other page
+    /// ([`crate::liveness::Rank0Watch::busy`]).
+    Busy,
 }
 
 /// Facts from one [`Fill::on`] call for the caller's own state and counters.
@@ -1696,6 +1817,14 @@ pub struct Fill {
     source: Source,
     pub funding: bool,
     pub remaining_end: Option<RemainingEnd>,
+    /// Why the last walk that ended at origin had authority.
+    pub origin_reason: Option<OriginReason>,
+    /// Exchanges that failed `Overloaded` (saturated peer admission, receive
+    /// memory, or a refusing route), and probes with any other outcome. A walk
+    /// that ran out of candidates having only been refused for load is busy, not
+    /// unavailable ([`Fill::exhausted_error`]).
+    busy: u32,
+    other: u32,
     out: Evidence,
 }
 
@@ -1737,7 +1866,24 @@ impl Fill {
             source: Source::Peer,
             funding: false,
             remaining_end: None,
+            origin_reason: None,
+            busy: 0,
+            other: 0,
             out: Evidence::default(),
+        }
+    }
+
+    /// The error of a walk that ran out of candidates. When every exchange of the
+    /// read failed `Overloaded` (for example this node's own peer admission hit
+    /// its per-neighbor or inflight caps), no peer was shown down and the read is
+    /// merely contended: report
+    /// `Overloaded`, local pressure the caller retries with backoff until its
+    /// scope ends. Any other evidence, or none, keeps `Unavailable`.
+    fn exhausted_error(&self) -> Error {
+        if self.busy > 0 && self.other == 0 {
+            Error::Overloaded
+        } else {
+            Error::Unavailable
         }
     }
 
@@ -1877,6 +2023,8 @@ impl Fill {
                         {
                             return Err(error);
                         }
+                        // The lost race is evidence about the peers it asked.
+                        self.other = self.other.saturating_add(1);
                         self.continuation = Continuation {
                             primary_consumed: !stale,
                             primary_outcome: (!stale)
@@ -2118,7 +2266,8 @@ impl Fill {
                 if signed {
                     // The destination answered this node: it is not hung. One that shed the request
                     // is busy.
-                    self.out.silence = Some(if kind == ResponseKind::Overloaded && page {
+                    let busy = matches!(kind, ResponseKind::Overloaded | ResponseKind::FlightFull);
+                    self.out.silence = Some(if busy && page {
                         SilenceNote::Shed
                     } else {
                         SilenceNote::Answered
@@ -2128,6 +2277,8 @@ impl Fill {
                     // The destination itself, not a relay, shed the request (for example a hot-page
                     // owner): the walk may ask the page's helper.
                     ResponseKind::Overloaded if signed => Outcome::Shed,
+                    // The destination is fetching the page and its flight is full.
+                    ResponseKind::FlightFull if signed => Outcome::Fetching,
                     ResponseKind::StaleMembership if remaining => {
                         self.out.outcome = Some(Err(Error::IncompatibleMembership));
                         return Err(Error::IncompatibleMembership);
@@ -2198,13 +2349,26 @@ impl Fill {
                         return Err(error);
                     }
                 };
+                // The exchange failed `Overloaded`: this node's peer admission (per-neighbor or
+                // inflight caps), its receive memory, or a route refusing the connection is
+                // saturated. Busy, not down.
+                let busy = outcome == ProbeOutcome::Overloaded;
+                if busy {
+                    self.busy = self.busy.saturating_add(1);
+                }
                 if !sent {
+                    if !busy {
+                        self.other = self.other.saturating_add(1);
+                    }
                     // Never sent: no evidence about the destination.
                     self.out = Evidence {
                         notes: self.out.notes,
                         ..Evidence::default()
                     };
                     return self.walk_complete(Outcome::Transport(outcome), budget);
+                }
+                if busy {
+                    return self.complete_busy(Outcome::Transport(outcome), budget);
                 }
                 Outcome::Transport(outcome)
             }
@@ -2227,8 +2391,29 @@ impl Fill {
         }
     }
 
-    /// Record the outstanding probe's outcome and its evidence.
+    /// Record the outstanding probe's outcome and its evidence. A destination's shed or full flight,
+    /// or a relay's `Overloaded` answer, is load, like a local refusal: a walk refused only for load ends
+    /// `Overloaded` ([`Fill::exhausted_error`]), so the read restarts the page once load clears
+    /// instead of spending its capped `Unavailable` restarts.
     fn complete(&mut self, outcome: Outcome, budget: &mut AcquisitionBudget) -> Result<Action> {
+        if matches!(
+            outcome,
+            Outcome::Shed | Outcome::Fetching | Outcome::Probe(ProbeOutcome::Overloaded)
+        ) {
+            self.busy = self.busy.saturating_add(1);
+        } else {
+            self.other = self.other.saturating_add(1);
+        }
+        self.complete_busy(outcome, budget)
+    }
+
+    /// [`Fill::complete`] without counting the outcome as evidence against the
+    /// peers ([`Fill::exhausted_error`]).
+    fn complete_busy(
+        &mut self,
+        outcome: Outcome,
+        budget: &mut AcquisitionBudget,
+    ) -> Result<Action> {
         self.pending();
         self.out.outcome = Some(Ok(outcome));
         // Only rank 0's own answer (or its silence) says anything about rank 0. An overload on
@@ -2247,8 +2432,10 @@ impl Fill {
             self.out.rank0 = match outcome {
                 Outcome::TimedOut => Some(Rank0Note::TimedOut),
                 Outcome::Probe(ProbeOutcome::Overloaded)
-                | Outcome::Transport(ProbeOutcome::Overloaded) => Some(Rank0Note::TimedOut),
+                | Outcome::Transport(ProbeOutcome::Overloaded) => Some(Rank0Note::Busy),
                 Outcome::Failed => Some(Rank0Note::Failed),
+                // Rank 0 answered and is fetching: alive.
+                Outcome::Fetching => Some(Rank0Note::Answered),
                 Outcome::Copy
                 | Outcome::Probe(
                     ProbeOutcome::CopyMiss
@@ -2441,7 +2628,9 @@ impl Fill {
 
     /// The candidate walk ended.
     fn end(&mut self, end: End) -> Result<Action> {
+        let mut reason = None;
         if let Walking::Candidates(walk) = &self.walk {
+            reason = Some(walk.origin_reason());
             self.funding = walk.funding;
             if walk.rank0_unanswered {
                 // Rank 0 has not answered this owner's probe within the attempt; the owner does not
@@ -2468,6 +2657,7 @@ impl Fill {
             }
             End::Origin { rank, evidence } => {
                 // Only a ranked owner may fetch: rank again before origin.
+                self.origin_reason = reason;
                 self.evidence = evidence;
                 self.origin_rank = rank;
                 Ok(self.rank_next(Ranking::Authority, Some(self.version)))
@@ -2482,7 +2672,7 @@ impl Fill {
                 if self.stale > 0 {
                     self.note(Notes::EXHAUSTED_STALE);
                 }
-                Err(Error::Unavailable)
+                Err(self.exhausted_error())
             }
         }
     }
@@ -2493,7 +2683,7 @@ impl Fill {
         match end {
             RemainingEnd::Copy => Ok(self.publish(Source::Peer)),
             RemainingEnd::None => Err(origin_miss_error(&self.evidence)),
-            RemainingEnd::Unavailable => Err(Error::Unavailable),
+            RemainingEnd::Unavailable => Err(self.exhausted_error()),
         }
     }
 

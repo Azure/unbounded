@@ -1,0 +1,18 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+
+[Unit]
+Description=Regenerate configuration for {{.MachineName}}
+Wants=systemd-udev-settle.service
+After=systemd-udev-settle.service
+
+[Service]
+Type=oneshot
+ExecStart={{.PreStartCommand}}
+Restart=on-failure
+RestartMode=direct
+RestartSec=10s
+{{- if .PreStartRefusedExitCode}}
+# A final allocation launch refusal must fail the start rather than loop.
+RestartPreventExitStatus={{.PreStartRefusedExitCode}}
+{{- end}}

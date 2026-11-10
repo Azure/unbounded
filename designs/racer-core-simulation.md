@@ -4,9 +4,11 @@
 
 Racer's decision logic (read path, peer routing, placement, caches, admission, and control-plane
 steps) lives in a sans-IO crate, `racer-core`. The production dataplane and cluster control call
-it. A discrete-event simulator, `racer-sim`, calls the same code for up to 50,000 nodes in one
-process and one thread, and checks invariants on every run. Runs are deterministic: a scenario,
-node count, and seed always give the same trace hash.
+it. The deterministic simulation harness, `racer-dst` (`cmd/racer/dst`), calls the same code: at
+Full fidelity it runs the real application on simulated I/O, and at Model fidelity it drives the
+real `racer-core` machines for up to 50,000 nodes in one process and one thread. Every run checks
+invariants. Runs are deterministic: a scenario and a choice stream (seed) always give the same
+trace hash.
 
 ## Goals
 
@@ -14,28 +16,30 @@ node count, and seed always give the same trace hash.
 - 50,000 nodes, 2 workers per node, one thread, at most 32 GiB RSS.
 - Deterministic replay from a seed.
 - Report latency, origin load, peer traffic, cache behavior, control-plane load, and memory.
-- A small smoke run in `cargo test`. Large runs with `make racer-sim ARGS=...`.
+- Small runs in `cargo test -p racer-dst` and `make racer-dst`. Large runs with
+  `make racer-dst-report ARGS=...`.
 
 ## Non-goals
 
 - Simulating payload bytes, crypto output, or real disk contents.
 - Replacing the dataplane deterministic tests (`src/app/tests/dst.rs`).
-- Changing production behavior through the simulator. Generic code has defaults that compile to
+- Changing production behavior through the simulation. Generic code has defaults that compile to
   the production types (for example `Placement<R: Rankings = Scored>`, `TickLru<.., G = Ungrouped>`).
 
 ## racer-core
 
 Path: `cmd/racer/core`, crate `racer-core`, lib `racer_core`.
 
-Depends only on `topology`, `racer-object-wire`, `racer-control-wire`, `flow-control`, and `sha2`.
+Depends only on `topology`, `racer-wire`, `racer-flow-core` (re-exported as `racer_core::flow`),
+and `sha2`.
 
 ### Purity rules
 
-- No I/O, clocks, threads, or OS randomness. Callers pass time in (`racer_core::time::Now`: a
-  monotonic `Instant` plus `wall_ms`) and randomness as an explicit RNG (`time::SplitMix64`).
+- No I/O, clocks, threads, or OS randomness. Callers pass time in (a monotonic `Instant`, and
+  wall time where a rule needs it) and randomness as an explicit RNG (`rng::SplitMix64`).
 - `core/clippy.toml` disallows `Instant::now`, `SystemTime::now`, and `thread::spawn`.
 - `core/tests/purity.rs` scans non-test code in `core/src/**/*.rs` and fails on `Instant::now`,
-  `SystemTime::now`, `uring_runtime`, `environment::now`, `getrandom`, and `thread::spawn`.
+  `SystemTime::now`, `racer_io`, `environment::now`, `getrandom`, and `thread::spawn`.
 
 ### Modules
 
@@ -43,201 +47,132 @@ Depends only on `topology`, `racer-object-wire`, `racer-control-wire`, `flow-con
 | --- | --- |
 | `admission` | `ResourceClass`, `Limits`, `Floors`, and `Rules` (progress and weighted admission) |
 | `cache` | `TickLru`, `OrderedLru`, per-cache reclaim lanes (`Grouping`, `Lanes`), segment value and retention scoring |
+| `prefetch` | Prefetch priorities, owner peer-operation pages and result records, the owner fill budget (`OwnerBudget`), retry backoff |
+| `rng` | `SplitMix64`, the explicit deterministic RNG |
 | `liveness` | `Silence` (silent next hops and pings) and `Rank0Watch` (rank 0 owners that hang or fail) |
 | `route` | Route budget rules shared by app and wire (`forward`, `relay`, `search_budget`, `validate`), `decide_hop`, relay plans, exchange outcomes, and response validity rules |
 | `subscriptions` | Sans-IO subscription scheduler |
 | `read` | Errors, worker map, peer responses, metadata refresh, serve and persist policy, range slots, candidate order and response classes |
 | `read::budget` | `AcquisitionBudget`, route link limits, hot page shedding (`shed_hot_page`) and helper fanout |
-| `read::walk` | `Fill`: one read's acquisition as a sans-IO state machine (owner targets, the candidate walk, hedges, stale membership refresh, fallback and waits, origin, the post-412 walk, publication), driven by both the dataplane and the simulator |
+| `read::walk` | `Fill`: one read's acquisition as a sans-IO state machine (owner targets, the candidate walk, hedges, stale membership refresh, fallback and waits, origin, the post-412 walk, publication), driven by both the dataplane and racer-dst |
+| `read::acquisition` | `PageAcquisition`: the walk plus the rankings, memberships and answers the dataplane keeps beside it, as effects (`Effect::Io`, `Report`, `Done`) and inputs |
+| `read::effect` | `EffectId`s that pair each machine effect with its answer |
+| `read::errors` | The retry/terminal table over the closed `Error` enum |
+| `read::window` | `ReadWindow`: one range read's window of pages (probes, fills, spill holds) |
+| `read::serve` | `ServeDecision`: per-page streaming counters, hot page shedding and the serve dispatch |
+| `read::cohort` | `MetadataCohort`: metadata refresh cohorts on a flight table |
 | `read::hints` | Orphan copy notices and successor hints |
-| `read::flight` | Singleflight step functions (join gates, wait/elect, handover, publish, fail) used by production `src/read/flight.rs`, and the `PageFlights` table the simulator uses |
+| `read::flight` | Singleflight step functions (join gates, wait/elect, handover, publish, fail) used by production `src/read/flight.rs` and by `read::worker` |
+| `read::worker` | `WorkerCore`: one worker's flights, acquisitions and serve decisions as events in and effects out, which racer-dst's Model interprets |
 
 ### Production callers
 
 - The dataplane (`cmd/racer/src`) calls `racer_core` directly. Page fills drive
-  `racer_core::read::walk::Fill` (`CandidatePolicy::drive` in `src/read/candidates.rs`, called
-  from `acquire_once` in `src/read/fill.rs`). The simulator drives the same machine
-  (`NodeWorld::drive` in `sim/src/node/world.rs`). Range reads use `racer_core::read` range slots
-  (`src/read/range_stream.rs`). The memory cache uses `racer_core::cache` with `ByCache` grouping
-  (`src/memory.rs`). Peer serving sheds hot pages with `racer_core::read::budget::shed_hot_page`
-  (`src/peer/server.rs`), as does the simulator.
-- Production and the simulator use the same ping and copy offer caps (`MAX_PINGS_IN_FLIGHT`,
+  `racer_core::read::acquisition::PageAcquisition`, which wraps `racer_core::read::walk::Fill`
+  (built by `CandidatePolicy::acquisition` in `src/read/candidates.rs`, driven from `acquire_once`
+  in `src/read/fill.rs`). racer-dst's Model drives the same machine through
+  `WorkerCore` (`core/src/read/worker.rs`, interpreted by `dst/src/model/mod.rs`). Range reads use `racer_core::read::window::ReadWindow`
+  (`src/read/range_stream.rs`), and metadata refreshes use `racer_core::read::cohort`
+  (`src/read/metadata.rs`). The memory cache uses `racer_core::cache` with `ByCache` grouping
+  (`src/memory.rs`). Peer serving decides and sheds hot pages with `racer_core::read::serve::ServeDecision`
+  (`src/peer/server.rs`), as does `WorkerCore::serve`.
+- Production and `WorkerCore` use the same ping and copy offer caps (`MAX_PINGS_IN_FLIGHT`,
   `MAX_OFFERS_IN_FLIGHT` in `racer_core::liveness`).
-- The wire hop limit comes from core: `peer-wire/src/lib.rs:505` sets
-  `MAX_HOPS = racer_core::route::MAX_LINKS`.
-- `racer-cluster-control` exposes pure step functions in `cluster-control/src/step/` (seat
+- The wire hop limit and the route budget share one constant: `peer-wire/src/lib.rs` sets
+  `MAX_HOPS = racer_wire::route::MAX_LINKS`.
+- `racer-authority` exposes pure rule functions in `authority/src/rules/` (seat
   lottery and renewal, primary contention and plan pass, seat admission, authorization). Wall
   time and entropy are inputs: `now_micro` takes a
-  `SystemTime` (`cluster-control/src/authority/election.rs:126`) and `new_key` takes an `Entropy`
-  (`cluster-control/src/authority/keyring.rs:352`).
+  `SystemTime` (`authority/src/rules/election.rs:126`) and `new_key` takes an `Entropy`
+  (`authority/src/rules/keyring.rs` `new_key`).
 
-## Phantom caches
+## racer-dst
 
-A phantom cache makes the same decisions as the real cache but stores no payload.
-
-- Placement: `Placement<R: Rankings>` (`topology/src/placement.rs`). The simulator plugs in
-  `Phantom` (`sim/src/phantom.rs`), a ranking backed by a shared memo keyed by membership and slot.
-  CLOCK, pinning, and `Overloaded` behavior are the real code.
-- Disk: real `Segments` and `SegmentClock` from `page-alloc` over `PhantomEntries`
-  (`alloc/src/segments.rs`), a phantom entry index that exists only with the `simulation` feature.
-- Memory: `TickLru` with a small value type and `Ungrouped` lanes.
-- Routes: `Paths<S: Searches>` (`topology/src/paths.rs`) with `SharedRoutes`
-  (`sim/src/phantom.rs`), a shared route memo.
-- `sim/tests/phantom_memory.rs` measures the per-node heap cost of all three phantom caches.
-
-## racer-sim
-
-Path: `cmd/racer/sim`, crate and binary `racer-sim`.
+Path: `cmd/racer/dst`, crate and binary `racer-dst`. One engine, one choice stream, one cost
+model (`dst/costs.toml`) and one invariant set serve two fidelities (`dst/src/lib.rs`).
 
 | Module | Role |
 | --- | --- |
-| `engine` | Event queue ordered by `(time, seq)`, `u64` ns time, per-role seeded RNG streams, trace hash |
-| `resources` | FIFO servers for NIC send and receive (cut-through per chunk), disk, CPU workers, crypto helper, site RTT matrix, origin |
-| `workload`, `faults` | Poisson, Zipf, range reads, cold-start storms, churn; partitions, crashes, slow nodes, hung peers, origin 412, 403, 5xx |
-| `node` | Real node logic for every node (below) |
-| `phantom` | Shared-memo `Phantom` rankings and `SharedRoutes` searches for every node's caches |
-| `config` | `Config` and its `node` knobs (`NodeConfig`), parsed from `--config` JSON and validated |
-| `control` | `ControlSim`: every Pod runs the `cluster-control` steps, plus one client per Pod, on one event queue |
-| `combined` | Control plane and data plane on one timeline |
-| `report` | Histograms, counters, invariants, memory accounting, JSON output |
+| `engine` | Virtual time in `u64` ns, event queue with deterministic ties, trace hash |
+| `choices` | The choice stream: seeded PRNG, fuzzer bytes, record and replay, shrinking, seed files |
+| `costs`, `resources` | The cost table and FIFO servers for NIC, disk, CPU, crypto, origin and the site RTT matrix |
+| `world`, `fixture` | Full fidelity: nodes, roles, the one-thread scheduler and faults over simulated `racer-io` |
+| `authority` | Full fidelity control plane: real `racer-authority` authorities against the fake API |
+| `model` | Model fidelity: a byte-free interpreter over real `WorkerCore`s, `topology::Placement` with `Phantom` rankings, the control plane (`model/control.rs`, driving `authority` rules) and combined runs |
+| `invariants`, `determinism` | Invariant registration, double-run trace comparison and failure shrinking |
+| `scenario`, `scenarios`, `cli` | Scenario builder, the catalog run by `make racer-dst`, and the one-scenario command line |
 
-### Node model
+### Full fidelity
 
-Node state is in `sim/src/node/state.rs`; the event handlers are in `sim/src/node/world.rs`.
+Real application code runs on the simulated driver. `dst/FULL.md` describes the control plane
+world (real authorities against `simulation::FakeKube`, built with racer-authority's `sim`
+feature), its fault model and invariants.
 
-Per worker (2 by default): a phantom `Placement`, a `racer_core` `PageFlights` table, a `TickLru` memory index,
-and its own `flow_control::Quotas`. `WorkerMap::select` picks the worker for a page. Per node: a
-`Paths` route cache, `flow_control::Circuits` link health, a phantom disk, and retention history
-(`SecondSight`, `Heat`).
+### Model fidelity
 
-A read checks memory, then disk, then joins a flight. The leader drives the same `Fill` machine as
-production: it performs each action (rank, probe, wait, origin, publish) as a scheduled event.
-By default the walk runs with the same rules as `Features::PRODUCTION`. Probes go hop by hop and every hop runs `decide_hop`. Relays take a `Relay` quota
-and search their own route. The destination applies the serve action. Before origin, the leader
-checks origin authority. Admission uses `racer_core::admission::Rules`.
+Interpreters are dispatch-only: every decision comes from `racer-core` (`WorkerCore`, the walk,
+flights, serve, liveness, route budgets) and `topology`; the interpreter prices each effect with
+`resources` and completes it as an engine event. `dst/MODEL.md` lists what is modeled, what is
+not, the scenario families and their checks, and the accepted divergences from production.
 
-Differences from production:
+### Phantom caches
 
-- Smaller capacities to save memory: placement 256 entries per worker, route cache 128 entries.
-  Flight, waiter, relay, and fill quota limits use production defaults. All are set under `"node"`
-  in `--config`.
-- One cache identity, so cache priority weights have no effect.
-- Ablation switches under `"node"` (for example `fanout`, `flight_handover`, `stale_wait`,
-  `rank0_watch`, `silence`) turn off one production rule each. All default to on. Tests use them
-  to show the simulator detects the problem each rule fixes.
-- Hedges are off by default (`node.hedge_slots` 0), as in production.
-- Standalone scenarios batch membership churn every 250 ms and keep 2 older versions per node.
-- The simulator does not model quota-driven idle eviction, per-cache fair-share reclaim, or
-  client cancellation. Production tests cover these (`src/read/tests/`, `src/memory.rs`).
+A phantom cache makes the same decisions as the real cache but stores no payload. Placement is
+`Placement<R: Rankings>` (`topology/src/placement.rs`) with `Phantom` rankings backed by a shared
+memo keyed by membership and slot (`dst/src/model/phantom.rs`); CLOCK, pinning and `Overloaded`
+behavior are the real code.
 
-### Control model
+### Scenarios and command line
 
-`ControlSim` (`sim/src/control.rs`) runs every Pod's lottery, seat, primary, and commit steps from
-`cluster-control` and one client per Pod on a single event queue and RNG stream. Clients enroll
-through seat bootstrap slots. Authorization API calls share one token bucket (`api_qps`,
-`api_burst`) that stands in for the Kubernetes API server. Clients then long poll snapshots with the real seat admission
-steps (write slots, a bounded FIFO, delta or full bodies). Clients send the base hash they hold.
-See the header of `sim/src/control.rs` for details.
+`make racer-dst` runs `dst/seeds/ci.txt` (each entry twice, comparing trace hashes); the catalog
+is `dst/src/scenarios.rs`. `make racer-dst-report ARGS=...` runs one scenario and writes its JSON
+report:
 
-### Combined mode
+```sh
+make racer-dst-report ARGS='--scenario full-churn --nodes 200 --seed 7 --duration 300s'
+make racer-dst-report ARGS='--scenario full-cold-start --nodes 50000 --config cfg.json --out r.json'
+```
 
-Pod `i` is data-plane node `i`. Before the data plane runs an event at time `t`, every control
-event at or before `t` runs, control first. Each node uses exactly the membership version its
-control client applied, so lagging clients cause real data-plane skew. A node whose client has
-applied nothing does not read or accept peer links. Pod crash, restart, and removal map to the
-node.
-
-### Scenarios
-
-| Scenario | What it runs |
-| --- | --- |
-| `smoke`, `caches-only`, `empty` | Small sanity runs; `empty` must produce no events |
-| `zipf`, `storm`, `churn`, `faults` | Data plane with synthetic membership |
-| `enrollment-storm`, `failover`, `ctl-churn`, `lagging` | Control plane only |
-| `full-cold-start`, `full-failover`, `full-churn`, `full-lagging` | Combined, using the control plan of the matching control scenario plus a Zipf read load |
-| `mesh`, `mesh-selector` | Topology only: the mesh v2 default pool (plus a 256 member selector pool) of `--nodes` members, no traffic |
-
-`sim/tests/contention_scenarios.rs` holds pressure and ablation tests (cold origin contention,
-warm fanout, shared NIC bandwidth, slow disk, partition recovery, hot pages, hung peers, stale
-membership, hedging, seed replay). Combined-mode ablation tests are in `sim/src/combined.rs`.
-`sim/tests/mesh_scenarios.rs` holds the mesh v2 scenarios (see below).
+Names are the control plans (`enrollment-storm`, `failover`, `ctl-churn`, `lagging`), the
+combined scenarios (`full-cold-start`, `full-failover`, `full-churn`, `full-lagging`), short
+aliases mapped to Model scenarios (`dst/src/cli.rs` `ALIASES`) and every catalog name.
+`--config` takes a JSON object of the keys in `dst/src/cli.rs` `KEYS` and `NODE_KEYS` (see
+`dst/MODEL.md`, Running); unknown keys are errors. `RACER_DST_REPORT_TIMEOUT` (default 7200s) bounds the make target.
 
 ### Mesh v2 metrics
 
-Every node run reports a `mesh` section (`sim/src/mesh.rs`, `NodeWorld::mesh_report`):
-
-- `degree`: peers per node (min, mean, max) of the newest membership; `default_pool`: its
-  column count and target column size.
-- `owner_peak_fanin`: most page bodies one node streamed at once. `page_peak_fanin` (and
-  `_at`): most bodies of one page one owner streamed at once. Histogram `page_fanin`.
-- `owner_peak_egress_bytes_per_s`: most page bytes one node sent (as owner or relay) in one
-  1 s window. `page_peak_egress_bytes_per_s`: the same for one page from its owner.
-- `links_rdma`, `links_tcp`, `rdma_fraction`, and histograms `hops_rdma_only` and
-  `hops_with_tcp` (links per page body by transport). An edge is RDMA when both ends share a
-  Site (one rail per node) and both took it among their `RDMA_PEERS` best ranked edges
-  (`Membership::rdma_peers`).
-- `edges_changed_per_publication` and `edges_changed_per_event`: edges added plus removed by
-  a membership change, for clusters up to 8,192 members and the first 32 changes of a run.
-
-`node.mesh_helpers` (default on) models the mesh v2 hot key rule: an owner never sheds a
-requester in its own column, and a shed reader asks `Pool::helper(reader, owner)`. Off gives
-the v1 rule (`is_helper`, `fanout_helper`).
-
-The topology-only scenarios report the same degree, sampled routes per pool (production
-`Paths::route`, no failures) by transport, routes that left the pool, and edges changed by one
-join and one leave. They build 20k member clusters in seconds:
-`make racer-sim ARGS='--scenario mesh --nodes 20000 --config sites1.json'` with
-`{"sites": 1}` in `sites1.json`.
+Topology-only mesh measurements (peers per node, route links by transport, edges changed by
+churn, selector pools, failover rebuilds) are `topology/tests/mesh_scenarios.rs`; the hot page
+storm with mesh helpers is `model-hot-page-storm-512` (and the ignored 2,048-node test in
+`dst/tests/model_scenarios.rs`).
 
 ## Memory budget
 
-32 GiB / 50,000 nodes is about 671 KiB per node. The target is at most 640 KiB per node, leaving
-room for shared state (ranking and route memos, event heap, RTT matrix, report). To fit, per-node
-state holds no payloads and no per-node copies of shareable data. The report lists accounted
-bytes per component and peak RSS so the budget can be checked. Measured runs at 50,000 nodes stay
-far below the limit; the cold-start storm is the largest, driven by the route memo and in-flight
-state.
+32 GiB / 50,000 nodes is about 671 KiB per node. Model per-node state holds no payloads and no
+per-node copies of shareable data. `dst/tests/model_scenarios.rs` `model_memory_per_node` measures it
+(`dst/MODEL.md`, Running, has the command). Measured peak RSS: `full-cold-start` at 50,000 nodes peaks at
+3.10 GB (62 KB per node).
 
 ## Determinism and replay
 
-- All time comes from the event clock. All randomness comes from `SplitMix64` streams derived from
-  the seed, one per role. Simulator hash maps use a fixed-key hasher (`engine::Fixed`).
-- Each recorded event feeds an order-sensitive trace hash. In combined mode `trace_hash` mixes
-  both timelines and `data_trace_hash` is the data plane alone.
-- Tests check that a replay gives the same hash and report: `lib.rs` `replay_is_deterministic`,
-  `control` `replays_exactly_and_seed_matters`, `combined` `replays_exactly`, and
-  `contention_scenarios` `same_seed_replays_and_seeds_differ` and
-  `seed_matrix_replays_identical_reports`.
+- All time comes from the engine clock. All randomness comes from the choice stream
+  (`dst/src/choices.rs`); `dst/tests/no_random_state.rs` rejects randomly seeded hash maps.
+- Each recorded event feeds an order-sensitive trace hash. `make racer-dst` runs every seed entry
+  twice and fails when the hashes differ; `dst/tests/model.rs`
+  `model_runs_are_deterministic_and_seed_dependent` and `dst/tests/combined.rs` `replays_exactly`
+  check the Model.
 
-To reproduce a run, use the same scenario, node count, seed, duration, and config:
-
-```sh
-make racer-sim ARGS='--scenario full-churn --nodes 200 --seed 7 --duration 300s'
-make racer-sim ARGS='--scenario zipf --nodes 50000 --config cfg.json --out zipf.json'
-```
-
-`--config` takes a JSON object of `Config` fields (unknown keys are errors), with `"node"` and
-`"control"` sub-objects. `RACER_SIM_TIMEOUT` (default 7200s) bounds the make target.
+To reproduce a run, use the same scenario, node count, seed, duration and config with
+`make racer-dst-report`, or a seed file entry with `DST_SEEDS`.
 
 ## Invariants
 
-Every run checks these. A failure is reported with time, node, and detail. The report API
-supports marking an invariant relaxed with a reason; none is relaxed today.
+Every run checks its scenario's invariants and checks (`dst/src/invariants.rs`, `ModelSpec::check`
+in `dst/src/scenarios.rs`); a failure is reported with time, node and detail. The Model report
+classifies every repeated origin request (`dst/src/model/repeats.rs`) and counts unexplained
+repeats, which the ported tests require to be zero.
 
-Data plane (`sim/src/node/world.rs`):
-
-- `budget_never_grows`: attempt plans, relays, and inherited budgets.
-- `route_within_hop_limit`: at most 8 links.
-- `relay_route_valid`.
-- `only_owner_hits_origin`: rank, owner, and authority on the walk's membership version.
-- `origin_within_scope` and `origin_for_live_waiter`: origin requests only while a waiter wants
-  the page.
-- `origin_repeat_explained`: repeat origin fetches of a page that another owner still holds must
-  fall into a known class.
-- `membership_version_monotonic` per node.
-- `flight_leader_valid`.
-
-Control plane (`sim/src/control.rs`):
+Control plane (`dst/src/model/control.rs`):
 
 - `ctl_single_primary`, `ctl_terms_monotonic`, `ctl_sequence_monotonic`.
 - `ctl_client_membership_monotonic` per client.
@@ -246,14 +181,15 @@ Control plane (`sim/src/control.rs`):
 
 ## Design decisions found through simulation
 
-These are production rules that the simulator motivated. Code comments refer to them by name.
+These are production rules that simulation (first racer-sim, now racer-dst) motivated. Code
+comments refer to them by name.
 
 ### Joining members
 
 A new member is added to the membership only after it reports that it serves peer links
 (`src/control/session.rs` `mark_serving`). Before that, a listed member would refuse every link
 and reads toward it would fail. Joins are batched by a hold that grows with membership size
-(`join_hold_secs` in `cluster-control/src/step/primary.rs`), so clients stay within one version
+(`join_hold_secs` in `authority/src/rules/primary.rs`), so clients stay within one version
 during large enrollments instead of falling back to full images.
 
 ### Hot page fanout
@@ -261,12 +197,12 @@ during large enrollments instead of falling back to full images.
 An owner with more than `HOT_PAGE_QUEUE_BYTES` of queued egress for one page sheds further readers
 with `Overloaded`, and readers fetch from the page's helpers instead
 (`core/src/read/budget.rs`). The limit is in bytes so it means the same backlog for 1 MiB
-simulator pages and 16 MiB production pages. A page is sent by at most `REPLICAS` owners plus
+simulated pages and 16 MiB production pages. A page is sent by at most `REPLICAS` owners plus
 `fanout_width` helpers.
 
 ### Route budget
 
-App and wire share one rule: a route carries at most 8 links (`racer_core::route::MAX_LINKS`,
+App and wire share one rule: a route carries at most 8 links (`racer_wire::route::MAX_LINKS`,
 also `MAX_ROUTE_LINKS` in `core/src/read/budget.rs`).
 
 ## Known limitations
@@ -274,12 +210,14 @@ also `MAX_ROUTE_LINKS` in `core/src/read/budget.rs`).
 These are bounded behaviors, not bugs, and are covered by tests or the invariants above.
 
 - Origin requests per page can exceed one when rank 0 changes, a copy is lost, or origin returns
-  5xx and the client retries. Repeats while another owner holds the page must be explained
-  (`origin_repeat_explained`).
+  5xx and the client retries. Repeats while another owner holds the page are classified
+  (`dst/src/model/repeats.rs`).
 - A relay-signed `Overloaded` on the route to rank 0 can give an owner above rank 0 origin
   authority, allowing at most one overlapping origin request per such walk.
-- A minimum-funded walk cannot fund both a helper probe (`HELPER_FLOOR_ATTEMPTS`) and an
-  out-of-order rank 1 probe. When the helper misses, the read retries.
+- A helper probe spends its own grant (`walk::helper_grant`: `HELPER_ATTEMPTS`, `HELPER_LINKS`),
+  never the walk's, once per walk, so a helper that fails still leaves the remaining owners
+  funded. A page read that asks a helper may therefore send up to `HELPER_ATTEMPTS` attempts and
+  `HELPER_LINKS` links beyond its page budget.
 - Silence pings add peer messages under many probe timeouts. Each ping follows a timeout or a
   recheck, and a node has at most `MAX_PINGS_IN_FLIGHT` pings and `MAX_OFFERS_IN_FLIGHT` copy
   offers in flight, as in production.

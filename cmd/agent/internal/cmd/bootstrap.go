@@ -6,6 +6,7 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/url"
 	"strings"
@@ -18,11 +19,9 @@ import (
 	"github.com/Azure/unbounded/internal/hostroot"
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/isolation"
 	"github.com/Azure/unbounded/pkg/agent/phases"
-	"github.com/Azure/unbounded/pkg/agent/phases/host"
 	"github.com/Azure/unbounded/pkg/agent/phases/nodestart"
-	"github.com/Azure/unbounded/pkg/agent/phases/reset"
-	"github.com/Azure/unbounded/pkg/agent/phases/rootfs"
 )
 
 type agentStages struct {
@@ -32,6 +31,16 @@ type agentStages struct {
 	archives         *goalstates.ContainerImageArchiveStaging
 	reporter         *daemon.BootstrapStatusReporter
 	credentialsReady bool
+
+	// stagePlan is the plan of the configured isolation mode; see
+	// stageplan.go. Nil is resolved from the mode composition table on first
+	// use. Tests set it to drive the stages with a plan of their own.
+	stagePlan stagePlan
+
+	// persistAttest records the attestation settings for a later
+	// reprovision. Nil is daemon.PersistAttestConfig; tests set it to keep
+	// off the host's agent configuration directory.
+	persistAttest func(*slog.Logger, *provision.AgentAttestConfig) phases.Task
 }
 
 // canonicalImageIdentity reduces an OCI image reference to the part that
@@ -65,54 +74,38 @@ func canonicalImageIdentity(image string) string {
 func bootstrapIdentity(cfg *provision.UnboundedAgentConfig) (bootstrap.Identity, error) {
 	// Keep identity tied to the cluster and installed rootfs, while allowing
 	// credentials and artifact locations to be refreshed for a retry.
-	data, err := json.Marshal(struct {
+	identity := struct {
 		KubernetesVersion string
 		OCIImage          string
 		APIServer         string
-	}{strings.TrimPrefix(cfg.Cluster.Version, "v"), canonicalImageIdentity(cfg.OCIImage), cfg.Kubelet.ApiServer})
+	}{strings.TrimPrefix(cfg.Cluster.Version, "v"), canonicalImageIdentity(cfg.OCIImage), cfg.Kubelet.ApiServer}
+
+	// The isolation mode is part of the identity only when it is not the
+	// default, so every nspawn installation, with the mode unset or set to
+	// nspawn, keeps its recorded fingerprint. A host installed in one mode then
+	// refuses a start in another until it is reset, instead of building a
+	// second node stack beside the first.
+	var (
+		data []byte
+		err  error
+	)
+
+	if mode, merr := cfg.IsolationMode(); merr == nil && mode != isolation.DefaultMode {
+		data, err = json.Marshal(struct {
+			KubernetesVersion string
+			OCIImage          string
+			APIServer         string
+			Isolation         string
+		}{identity.KubernetesVersion, identity.OCIImage, identity.APIServer, string(mode)})
+	} else {
+		data, err = json.Marshal(identity)
+	}
+
 	if err != nil {
 		return bootstrap.Identity{}, err
 	}
 
 	return bootstrap.Identity{MachineName: cfg.MachineName, ConfigFingerprint: installstate.Fingerprint(data)}, nil
-}
-
-func (s *agentStages) EnsureHostClean(ctx context.Context) error {
-	return host.EnsureNoExistingDeployment(ctx, s.log)
-}
-
-func (s *agentStages) ResolveInputs(ctx context.Context) error {
-	downloads, archives, err := provision.ResolveDownloadOverridesWithOfflineArtifacts(ctx, s.cfg)
-	if err != nil {
-		return err
-	}
-
-	s.archives = archives
-
-	s.gs, err = goalstates.ResolveMachine(s.log, &s.cfg.AgentConfig, goalstates.NSpawnMachineKube1, downloads)
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (s *agentStages) PrepareHost(ctx context.Context) error {
-	if err := hostroot.Prepare(ctx, s.log, "bin", "libexec"); err != nil {
-		return err
-	}
-
-	if err := daemon.InstallBootstrapBinary(); err != nil {
-		return err
-	}
-
-	if err := phases.Serial(s.log, host.InstallPackages(s.log), phases.Parallel(s.log,
-		host.ConfigureOS(s.log), host.ConfigureNFTables(s.log), phases.Serial(s.log, host.DisableDocker(s.log), host.ConfigureDocker(s.log)),
-		host.DisableContainerd(s.log), host.DisableKubelet(s.log), host.DisableSwap(s.log), host.HardenAPT(s.log))).Do(ctx); err != nil {
-		return err
-	}
-
-	return fsutil.SyncFilesystems("/etc", hostroot.Resolve(), installstate.DefaultDirectory)
 }
 
 // Credentials must be resolved on every unfinished attempt, but TPM prerequisites
@@ -127,6 +120,10 @@ func (s *agentStages) prepareCredentials(ctx context.Context) error {
 	}
 
 	syncAttestedKubeletConfig(&s.cfg.AgentConfig, s.gs.NodeStart)
+
+	if err := s.recordAttestation(ctx); err != nil {
+		return err
+	}
 
 	// The reporter is built here rather than in the constructor because it
 	// captures credentials at construction: an empty bootstrap token makes it a
@@ -144,40 +141,34 @@ func (s *agentStages) prepareCredentials(ctx context.Context) error {
 	return nil
 }
 
-func (s *agentStages) PrepareRootFS(ctx context.Context) error {
-	// ProvisionOwned rebuilds the rootfs in place and must never be pointed at
-	// a slot that has started a node, which would pull the filesystem out from
-	// under a running one. A registered machine means the rootfs this stage
-	// would build is already built and in use, so the requirement is met and
-	// there is nothing to do.
-	//
-	// This is a property of the host, not of how far a previous attempt got. It
-	// holds whether the machine was started by an earlier attempt of this
-	// installation or independently afterwards.
-	//
-	// Asked of the slot this bootstrap manages rather than of either slot.
-	// Bootstrap only ever builds gs.NodeStart.MachineName, so a machine in the
-	// other slot says nothing about whether this one needs a rootfs.
-	registered, err := reset.RegisteredMachine(ctx, s.log, s.gs.NodeStart.MachineName)
-	if err != nil {
-		return err
+// recordAttestation records the attestation settings so a reprovision can
+// attest again instead of reusing a token that has expired by then. It is
+// recorded in every mode, because a reprovision can start from any of them,
+// but only for a host that attests: with no attestation URL nothing is
+// written, so a host that does not attest is bootstrapped exactly as before.
+//
+// An nspawn host is bootstrapped as it was before the record existed, so a
+// record it cannot write is a warning there: a later reprovision from it
+// reuses the stored bootstrap token. The other modes fail, since a host must
+// not go on believing a reprovision can attest again when it cannot.
+func (s *agentStages) recordAttestation(ctx context.Context) error {
+	persist := s.persistAttest
+	if persist == nil {
+		persist = daemon.PersistAttestConfig
 	}
 
-	if registered {
-		s.log.Info("nspawn machine is registered; leaving its rootfs in place", "machine", s.gs.NodeStart.MachineName)
-
+	err := persist(s.log, s.cfg.Attest).Do(ctx)
+	if err == nil {
 		return nil
 	}
 
-	if err := s.prepareCredentials(ctx); err != nil {
+	if mode, modeErr := s.cfg.IsolationMode(); modeErr != nil || mode != isolation.ModeNSpawn {
 		return err
 	}
 
-	if err := phases.Serial(s.log, rootfs.DownloadContainerImageArchives(s.log, s.archives), rootfs.ProvisionOwned(s.log, s.gs.RootFS)).Do(ctx); err != nil {
-		return err
-	}
+	s.log.Warn("could not record the attestation settings; a later reprovision will reuse the bootstrap token", "error", err)
 
-	return fsutil.SyncFilesystems(s.gs.RootFS.MachineDir, hostroot.Resolve(), goalstates.SystemdSystemDir, goalstates.SystemdNSpawnDir)
+	return nil
 }
 
 // nodeStartTask composes the work that brings the node up.
@@ -209,26 +200,30 @@ func (s *agentStages) nodeStartTask(nodeAlreadyBuilt bool) phases.Task {
 	return phases.Serial(s.log, tasks...)
 }
 
-func (s *agentStages) EnsureNodeStarted(ctx context.Context) error {
-	if err := s.prepareCredentials(ctx); err != nil {
-		return err
+// guardNodeStart starts the node of an allocation-backed host only once its
+// allocation is confirmed. It writes the allocation launch record first, so
+// every later start of the node checks the allocation too, even before the
+// applied config exists. The check runs even when the node is already
+// registered. Any other host starts as before.
+func guardNodeStart(
+	ctx context.Context,
+	log *slog.Logger,
+	cfg *provision.AgentConfig,
+	persist func(*provision.AgentConfig) error,
+	verify func(context.Context, *slog.Logger, *provision.AgentConfig) error,
+	start func(context.Context) error,
+) error {
+	if _, backed := daemon.AllocationUID(cfg); backed {
+		if err := persist(cfg); err != nil {
+			return fmt.Errorf("persist allocation launch config: %w", err)
+		}
+
+		if err := verify(ctx, log, cfg); err != nil {
+			return err
+		}
 	}
 
-	// Asked before the stage runs, because afterwards every answer is yes, and
-	// asked of the slot this bootstrap manages: a machine in the other slot was
-	// not built by this attempt either, but it is not the node being started.
-	registered, err := reset.RegisteredMachine(ctx, s.log, s.gs.NodeStart.MachineName)
-	if err != nil {
-		return err
-	}
-
-	if err := s.nodeStartTask(registered).Do(ctx); err != nil {
-		return err
-	}
-
-	// AgentConfigDir holds the applied config written above, so it must reach
-	// disk before this stage reports success.
-	return fsutil.SyncFilesystems(s.gs.RootFS.MachineDir, goalstates.AgentConfigDir, goalstates.SystemdSystemDir)
+	return start(ctx)
 }
 
 func (s *agentStages) daemonInstallTask() phases.Task {
@@ -251,7 +246,14 @@ func (s *agentStages) VerifyInstalled(ctx context.Context) error {
 	return daemon.VerifyDaemonInstalled(ctx, s.log)
 }
 
-func (s *agentStages) RepairDaemon(ctx context.Context) error { return daemon.RepairDaemon(ctx, s.log) }
+func (s *agentStages) RepairDaemon(ctx context.Context) error {
+	backends, err := agentModes().backends()
+	if err != nil {
+		return err
+	}
+
+	return daemon.RepairDaemon(ctx, s.log, backends)
+}
 
 func (s *agentStages) StageStarted(_ context.Context, stage bootstrap.Stage) {
 	s.log.Info("bootstrap stage", "stage", stage)
