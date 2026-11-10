@@ -140,6 +140,7 @@ impl HolderRanks {
     pub fn decode(bytes: &[u8]) -> Result<Self, HolderError> {
         let (&depth, mut rest) = bytes.split_first().ok_or(HolderError::Truncated)?;
         let mut out = Self::new(depth)?;
+        let mut total = 0u64;
         while !rest.is_empty() {
             let mut count = 0u64;
             let mut shift = 0u32;
@@ -167,6 +168,12 @@ impl HolderRanks {
             {
                 return Err(HolderError::Malformed);
             }
+            // Bound every run and the total by the largest object, so a
+            // hostile table cannot wrap `pages()` or blow up `masks()`.
+            total = total
+                .checked_add(count)
+                .filter(|&t| t <= super::MAX_PAGES)
+                .ok_or(HolderError::Malformed)?;
             out.runs.push((count, mask));
         }
         Ok(out)
@@ -268,5 +275,46 @@ mod tests {
             Err(HolderError::Malformed)
         );
         assert_eq!(HolderRanks::decode(&[5]).unwrap().pages(), 0);
+    }
+
+    fn leb(mut v: u64, out: &mut Vec<u8>) {
+        loop {
+            let b = (v & 0x7f) as u8;
+            v >>= 7;
+            if v == 0 {
+                out.push(b);
+                return;
+            }
+            out.push(b | 0x80);
+        }
+    }
+
+    #[test]
+    fn rejects_oversized_counts() {
+        // Two runs whose counts wrap u64 to a small total.
+        let mut bytes = vec![5];
+        leb(1 << 63, &mut bytes);
+        bytes.push(1);
+        leb((1 << 63) + 5, &mut bytes);
+        bytes.push(3);
+        assert_eq!(HolderRanks::decode(&bytes), Err(HolderError::Malformed));
+        // One run past the object limit, and a total past it.
+        let mut one = vec![5];
+        leb(crate::write::MAX_PAGES + 1, &mut one);
+        one.push(1);
+        assert_eq!(HolderRanks::decode(&one), Err(HolderError::Malformed));
+        let mut two = vec![5];
+        leb(crate::write::MAX_PAGES, &mut two);
+        two.push(1);
+        leb(1, &mut two);
+        two.push(3);
+        assert_eq!(HolderRanks::decode(&two), Err(HolderError::Malformed));
+        let mut max = vec![5];
+        leb(crate::write::MAX_PAGES, &mut max);
+        max.push(1);
+        assert_eq!(
+            HolderRanks::decode(&max).unwrap().pages(),
+            crate::write::MAX_PAGES
+        );
     }
 }
