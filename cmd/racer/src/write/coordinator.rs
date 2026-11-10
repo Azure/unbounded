@@ -302,7 +302,11 @@ async fn open(
     ) {
         return Ok(WriteReply::Exists);
     }
-    if super::native_origin(local, &object.cache) {
+    // Create-once against the origin only matters when the object can reach
+    // it. A `never` write without `Racer-Metadata` cannot (the client check
+    // requires metadata for every other mode), so only the cache-level
+    // create-once above applies.
+    if super::native_origin(local, &object.cache) && context.metadata.is_some() {
         match origin_has(local, context, membership, scope).await {
             Ok(false) => {}
             Ok(true) => {

@@ -536,6 +536,38 @@ fn create_once_conflicts_are_412() {
 }
 
 #[test]
+fn never_writes_without_metadata_skip_the_origin_check() {
+    let mut c = Cluster::new(14, 3, Some(writes(2)));
+    let body = bytes(3, 70_000);
+    // The origin reports both keys as existing.
+    for object in [OBJECT, OBJECT + 1] {
+        c.existing.0.borrow_mut().insert(c.object(object).key);
+    }
+    // Without `Racer-Metadata` a `never` write cannot reach the origin, so
+    // the origin create-once check is skipped.
+    let request = |object| {
+        let mut request = format!(
+            "PUT /v1/objects/{} HTTP/1.1\r\nHost: racer\r\nContent-Length: {}\r\nIf-None-Match: *\r\nRacer-Upload: never\r\nConnection: close\r\n\r\n",
+            key(object),
+            body.len()
+        )
+        .into_bytes();
+        request.extend_from_slice(&body);
+        request
+    };
+    assert_eq!(c.exchange(0, request(OBJECT)).status, 201);
+    // Cache-level create-once still applies.
+    assert_eq!(c.exchange(1, request(OBJECT)).status, 412);
+    // With metadata, the origin check runs.
+    assert_eq!(
+        c.put(2, OBJECT + 1, &body, "Racer-Upload: never\r\n")
+            .status,
+        412
+    );
+    assert_eq!(c.written(), 2 * pages(body.len()) as usize);
+}
+
+#[test]
 fn writes_disabled_or_passthrough_are_405() {
     for passthrough in [false, true] {
         let sim = SimOs::new();
