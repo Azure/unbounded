@@ -134,6 +134,15 @@ func TestHostNetworkMachineCreate(t *testing.T) {
 			want:   []string{"network requires a dhcpLeases entry"},
 		},
 		{
+			name:   "network rejects holdLease",
+			mutate: setFirstLeaseHold(true),
+			want:   []string{"network does not support dhcpLeases[0].holdLease"},
+		},
+		{
+			name:   "network accepts holdLease false",
+			mutate: setFirstLeaseHold(false),
+		},
+		{
 			name:   "network requires a non-empty dhcpLeases",
 			mutate: setMachineField([]any{}, "spec", "host", "netboot", "dhcpLeases"),
 			want:   []string{"network requires a dhcpLeases entry"},
@@ -409,4 +418,12 @@ status:
 
 		assertErrors(t, v.validateCreate(obj), []string{"network requires a dhcpLeases entry"})
 	})
+}
+
+func setFirstLeaseHold(hold bool) func(*testing.T, map[string]any) {
+	return func(t *testing.T, obj map[string]any) {
+		leases, _, _ := unstructured.NestedSlice(obj, "spec", "host", "netboot", "dhcpLeases")
+		leases[0].(map[string]any)["holdLease"] = hold
+		setField(t, obj, leases, "spec", "host", "netboot", "dhcpLeases")
+	}
 }

@@ -146,7 +146,7 @@ Store BMC passwords in a Secret referenced by `passwordRef`. `passwordRef.key` n
 Set `spec.host.netboot.network` to give a host bonds, VLANs, static addresses,
 routes, and DNS. Metalman uses this config both while it installs the host and
 on the installed OS. It needs `bootProtocol: VirtualMedia` and a `dhcpLeases`
-entry.
+entry. It does not support `holdLease` on that lease.
 
 ```yaml
 spec:

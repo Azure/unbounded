@@ -130,6 +130,12 @@ func (t *topology) sourceIface(ip netip.Addr) (*iface, netip.Prefix) {
 // lease. Errors name the offending field path, for example
 // "network.bonds[0].interfaces[1]".
 func Validate(n *v1alpha3.HostNetworkSpec, lease v1alpha3.DHCPLease) error {
+	// Lease holding only applies to the legacy single-NIC config. The
+	// declared network is authoritative, so reject it rather than ignore it.
+	if lease.HoldLease {
+		return fmt.Errorf("dhcpLeases[0].holdLease: not supported with network")
+	}
+
 	_, err := build(n, lease)
 
 	return err

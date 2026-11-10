@@ -365,6 +365,7 @@ func TestValidateRejects(t *testing.T) {
 			n.Ethernets = append(n.Ethernets, v1alpha3.EthernetSpec{Name: "eth2", MACAddress: "02:00:00:00:00:03"})
 			l.MAC = "02:00:00:00:00:03"
 		}, "dhcpLeases[0].mac"},
+		{"lease hold", func(_ *v1alpha3.HostNetworkSpec, l *v1alpha3.DHCPLease) { l.HoldLease = true }, "dhcpLeases[0].holdLease"},
 		{"lease gateway mismatch", func(_ *v1alpha3.HostNetworkSpec, l *v1alpha3.DHCPLease) {
 			l.Gateway = "192.0.2.2"
 		}, "dhcpLeases[0].gateway"},

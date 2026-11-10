@@ -896,6 +896,10 @@ spec:
                         address
                       rule: '!has(self.network) || (has(self.dhcpLeases) && size(self.dhcpLeases)
                         > 0)'
+                    - fieldPath: .dhcpLeases
+                      message: network does not support dhcpLeases[0].holdLease
+                      rule: '!has(self.network) || !has(self.dhcpLeases) || size(self.dhcpLeases)
+                        == 0 || !has(self.dhcpLeases[0].holdLease) || !self.dhcpLeases[0].holdLease'
                   provisioningFormat:
                     description: |-
                       ProvisioningFormat declares the first-boot format for the desired host
@@ -1512,6 +1516,10 @@ spec:
                     address
                   rule: '!has(self.network) || (has(self.dhcpLeases) && size(self.dhcpLeases)
                     > 0)'
+                - fieldPath: .dhcpLeases
+                  message: network does not support dhcpLeases[0].holdLease
+                  rule: '!has(self.network) || !has(self.dhcpLeases) || size(self.dhcpLeases)
+                    == 0 || !has(self.dhcpLeases[0].holdLease) || !self.dhcpLeases[0].holdLease'
               ssh:
                 description: |-
                   SSH contains the SSH connection and credential details for the

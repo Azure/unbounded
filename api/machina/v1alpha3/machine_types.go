@@ -454,6 +454,7 @@ type RedfishSpec struct {
 // +kubebuilder:validation:XValidation:rule="!has(self.bootProtocol) || self.bootProtocol != 'VirtualMedia' || has(self.redfish)",message="VirtualMedia requires redfish"
 // +kubebuilder:validation:XValidation:rule="!has(self.network) || (has(self.bootProtocol) && self.bootProtocol == 'VirtualMedia')",message="network requires bootProtocol VirtualMedia"
 // +kubebuilder:validation:XValidation:rule="!has(self.network) || (has(self.dhcpLeases) && size(self.dhcpLeases) > 0)",message="network requires a dhcpLeases entry for the provisioning address"
+// +kubebuilder:validation:XValidation:rule="!has(self.network) || !has(self.dhcpLeases) || size(self.dhcpLeases) == 0 || !has(self.dhcpLeases[0].holdLease) || !self.dhcpLeases[0].holdLease",message="network does not support dhcpLeases[0].holdLease",fieldPath=".dhcpLeases"
 type PXESpec struct {
 	// Image is an OCI image reference containing the machine disk image.
 	// The image must contain /disk/disk.img.gz.

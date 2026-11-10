@@ -47,6 +47,9 @@ Rules enforced by CRD CEL:
 
 - `network` requires `bootProtocol: VirtualMedia` and at least one `dhcpLeases`
   entry.
+- `network` rejects `dhcpLeases[0].holdLease: true`. Lease holding only
+  applies to the single-NIC config; the declared network is authoritative and
+  does not run DHCP. Go validation enforces the same rule.
 - Bond members must name declared ethernets; VLAN links must name a declared
   ethernet or bond; `lacpRate` requires 802.3ad.
 
