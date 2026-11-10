@@ -172,3 +172,28 @@ fn directory_serves_committed_versions_until_their_hold() {
     assert!(directory.remove(&object()).is_some());
     assert!(directory.is_empty());
 }
+
+#[test]
+fn orphan_checks_run_four_times_per_orphan_age_within_bounds() {
+    use std::time::Duration;
+    assert_eq!(
+        gc::check_interval(Duration::from_secs(3600)),
+        Duration::from_secs(300)
+    );
+    assert_eq!(
+        gc::check_interval(Duration::from_secs(600)),
+        Duration::from_secs(150)
+    );
+    assert_eq!(
+        gc::check_interval(Duration::from_secs(2)),
+        Duration::from_secs(1)
+    );
+}
+
+#[test]
+fn new_entries_have_no_repair_and_no_role_decision() {
+    let entry = committed_entry(1_800_000_000_000);
+    assert!(!entry.repairing);
+    assert!(entry.role_checked.is_none());
+    assert_eq!(entry.commit_attempts, 0);
+}

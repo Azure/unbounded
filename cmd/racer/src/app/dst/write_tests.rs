@@ -1364,3 +1364,41 @@ fn a_removed_cache_releases_its_written_pages() {
     assert_eq!(c.written(), 0);
     assert_eq!(c.sessions(), 0);
 }
+
+/// With no spare member, repair waits: the object stays committed and
+/// readable with fewer copies, and a member that joins later receives them.
+#[test]
+fn repair_waits_for_a_spare_member() {
+    let mut c = Cluster::new(39, 3, Some(writes(3)));
+    let body = bytes(39, 200_000);
+    let created = c.put(0, OBJECT, &body, "Racer-Durability: replicas=3\r\n");
+    assert_eq!(created.status, 201);
+    let etag = created.header("etag").unwrap().to_owned();
+    let version = c.version(OBJECT, &created);
+    let count = pages(body.len());
+    let coordinator = c.coordinator().unwrap();
+    c.crash((coordinator + 1) % 3);
+    c.wait(Duration::from_secs(2));
+    assert!(c.holders(&version, count).iter().all(|h| h.len() == 2));
+    assert!(
+        c.roles()
+            .iter()
+            .all(|r| r.3 == racer_core::write::UploadState::Never),
+        "{:?}",
+        c.roles()
+    );
+    c.read_everywhere(OBJECT, &body, &etag);
+    let env = c.env.clone();
+    c.harness.add(&env, None);
+    c.configure();
+    c.harness.publish();
+    c.harness.settle();
+    c.wait(Duration::from_secs(2));
+    c.wait(Duration::from_secs(2));
+    assert!(
+        c.holders(&version, count).iter().all(|h| h.len() == 3),
+        "{:?}",
+        c.holders(&version, count)
+    );
+    c.read_everywhere(OBJECT, &body, &etag);
+}
