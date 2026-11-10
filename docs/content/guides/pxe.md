@@ -267,6 +267,7 @@ spec:
         subnetMask: "255.255.255.0"
         gateway: "10.10.0.1"
         dns: ["8.8.8.8"]
+        holdLease: true # optional: keep the site DHCP lease for this address
       cloudInit:
         userDataConfigMapRef:
           name: my-cloud-init
@@ -285,7 +286,7 @@ If the referenced ConfigMap does not exist, metalman falls back to the default m
    With `network` set, the ISO's GRUB does not use the network. It boots the installer from the ISO. The installer sets up the bond and VLANs, then gets its install instructions from `/bootmedia/<id>/install`.
 4. **Installer (initrd overlay).** An init script in the initrd:
    - Loads storage and network drivers, selects the provisioning NIC by MAC, and configures the static IP and DNS from kernel cmdline.
-   - Writes matching MAC-based static netplan configuration into the installed system before reboot and disables cloud-init network rendering so fallback DHCP configuration cannot conflict with it. The default netboot image also serves the selected lease as NoCloud `network-config`.
+   - Writes matching MAC-based static netplan configuration into the installed system before reboot and disables cloud-init network rendering so fallback DHCP configuration cannot conflict with it. Set `holdLease: true` on a `dhcpLeases` entry to also run a DHCPv4 client on the provisioning NIC so the site DHCP server keeps the lease for the static address and does not hand it to another host; routes, DNS, NTP, hostname, and domains from DHCP are ignored. The client identifies with the NIC MAC so reservations keyed by MAC match. Metalman answers only PXE and HTTP boot firmware for a held lease, not the installed OS, so the OS holds the lease with the site DHCP server. Reserve the address for its MAC on the site DHCP server. Leave `holdLease` unset where there is no DHCP server. The default netboot image also serves the selected lease as NoCloud `network-config`.
    - Downloads the gzip-compressed raw disk image from the machine image over HTTP (retries up to 120 times).
    - Writes the image to `spec.host.netboot.targetDisk` when set, otherwise to an automatically selected block device.
    - Mounts the root filesystem and injects cloud-init config and the agent configuration.

@@ -711,6 +711,7 @@ else
     DNS_SERVERS=$(get_param unbounded.dns || true)
     VIRTUAL_MEDIA=$(get_param unbounded.virtual_media || true)
     MEDIA_CALLBACK=$(get_param unbounded.media_callback || true)
+    DHCP_HOLD=$(get_param unbounded.dhcp_hold || true)
     if [ "$VIRTUAL_MEDIA" = 1 ]; then
         case "$MEDIA_CALLBACK" in
             http://*/bootmedia/*) ;;
@@ -913,7 +914,10 @@ if [ -n "$DS_URL" ] || [ -n "$IP_PARAM" ] || [ -n "$HOST_NETPLAN" ]; then
         # Images without netplan (for example Azure Linux) use
         # systemd-networkd directly. The lower file name sorts before the
         # image's default DHCP file, which is removed so that other NICs do
-        # not add competing default routes.
+        # not add competing default routes. When unbounded.dhcp_hold=1, DHCP
+        # also runs on the provisioning NIC only to hold the site lease for
+        # the static address; routes, DNS, NTP, hostname, and domains from
+        # the lease are ignored.
         log "persisting static network configuration for systemd-networkd"
         rm -f /mnt/etc/systemd/network/90-unbounded-dhcp.network
         {
@@ -921,7 +925,11 @@ if [ -n "$DS_URL" ] || [ -n "$IP_PARAM" ] || [ -n "$HOST_NETPLAN" ]; then
             echo "MACAddress=${BOOT_MAC}"
             echo ""
             echo "[Network]"
-            echo "DHCP=no"
+            if [ "$DHCP_HOLD" = "1" ]; then
+                echo "DHCP=ipv4"
+            else
+                echo "DHCP=no"
+            fi
             echo "IPv6AcceptRA=no"
             echo "Address=${CLIENT_IP}/${PREFIX}"
             [ -z "$GW" ] || echo "Gateway=${GW}"
@@ -931,9 +939,37 @@ if [ -n "$DS_URL" ] || [ -n "$IP_PARAM" ] || [ -n "$HOST_NETPLAN" ]; then
                 echo "DNS=${dns}"
             done
             IFS=$old_ifs
+            if [ "$DHCP_HOLD" = "1" ]; then
+                echo ""
+                echo "[DHCPv4]"
+                echo "ClientIdentifier=mac"
+                echo "UseRoutes=no"
+                echo "UseGateway=no"
+                echo "UseDNS=no"
+                echo "UseNTP=no"
+                echo "UseHostname=no"
+                echo "UseDomains=no"
+            fi
         } > /mnt/etc/systemd/network/10-unbounded-metal.network
         chmod 644 /mnt/etc/systemd/network/10-unbounded-metal.network
     elif [ -n "$IP_PARAM" ]; then
+        # When unbounded.dhcp_hold=1, DHCP runs alongside the static address
+        # only to hold the site lease for it, so the DHCP server does not
+        # hand the address to another host. Routes, DNS, NTP, hostname, and
+        # domains from the lease are ignored. The client identifies with the
+        # NIC MAC so site reservations keyed by MAC match.
+        if [ "$DHCP_HOLD" = "1" ]; then
+            DHCP4_CONFIG='      dhcp4: true
+      dhcp-identifier: mac
+      dhcp4-overrides:
+        use-routes: false
+        use-dns: false
+        use-ntp: false
+        use-hostname: false
+        use-domains: false'
+        else
+            DHCP4_CONFIG='      dhcp4: false'
+        fi
         log "persisting static network configuration"
         mkdir -p /mnt/etc/netplan
         rm -f /mnt/etc/netplan/50-cloud-init.yaml
@@ -944,7 +980,7 @@ network:
     provisioning:
       match:
         macaddress: "${BOOT_MAC}"
-      dhcp4: false
+${DHCP4_CONFIG}
       dhcp6: false
       addresses:
         - "${CLIENT_IP}/${PREFIX}"

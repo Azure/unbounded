@@ -72,6 +72,7 @@ func checkConflicts(contributors []SourcedEntry) []error {
 	problems = append(problems, patchConflicts(contributors)...)
 	problems = append(problems, addContainerConflicts(contributors)...)
 	problems = append(problems, extraArgsConflicts(contributors)...)
+	problems = append(problems, kubeProxyImageConflicts(contributors)...)
 
 	return problems
 }
