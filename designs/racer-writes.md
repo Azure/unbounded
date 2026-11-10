@@ -1572,6 +1572,148 @@ Tests: unit tests with a scripted membership; integration test killing one of
 two holders before upload and observing restore to two holders; rekey test
 driven by forced key rotation; orphan GC timeout.
 
+### WP8 as built
+
+The code refined these interfaces; the code is authoritative.
+
+Modules `cmd/racer/src/write/{repair,failover,rekey,gc}.rs`, all driven by
+the per-worker maintenance turn (`coordinator::maintain`, every `TICK`):
+rekey, then (with a membership) garbage collection, role decisions, and per
+object repair and upload resumption. Each step is best effort.
+
+Core (`racer_core::write::session`):
+
+- `SessionEvent::NodesLost(Vec<NodeIdBytes>)` drops every listed holder from
+  every page with one journaled `Commit` record, and emits one
+  `Restore { page, from }` per page left with a survivor; a page with none
+  fails the object. `HolderLost` stays for single-page reports.
+- `SessionEvent::HoldersMerged(Holders)` unions holders into the table (one
+  record); repair and coordinator merges use it instead of per-page
+  `HolderRestored`, which journals the whole manifest each time.
+- `SessionEvent::UploadedElsewhere { blob_etag: Option<String> }` moves any
+  committed, not yet uploaded state (including `failed`) to `committed` and
+  releases the holders.
+- `Session::under_replicated() -> Vec<(page, survivor)>`: pages with at least
+  one and fewer than `replicas` holders while the object is committed, not
+  uploaded, and not failed.
+
+Store: `StoreWriter::rekey_written(copy, scope) -> Operation<Option<WrittenEntry>>`
+writes the copy as a new record with the old session and hold, journals it,
+moves the pin, and leaves the old record as evictable cache. `None` when the
+page is not written here, or was released while the new record was written
+(it then journals a release, so the pin is not resurrected);
+`InvalidRequest` when the copy uses the record's current key.
+`Availability::active_page_key(&CacheId) -> Option<KeyId>` was added.
+
+Repair (`repair.rs`): `maintain_object` runs on coordinators of committed,
+not uploaded, not failed objects. Holders that `Membership::serves` no longer
+lists are dropped with `NodesLost`, and the manifest is sent to the replicas
+again. `spawn` starts one background task per object (`Entry::repairing`):
+for each `under_replicated` page it tries the page's ranked owners (first
+`RANKED_DEPTH`, pool members, not silent, not already holders) in rounds,
+batching `write-store` per (target, source) with `source` set to the
+survivor; the target pulls and verifies the envelope and AEAD tag exactly
+as for a writer's store. Stored pages are merged with one `HoldersMerged`,
+counted in `racer_write_repairs_total`, and the manifest is replicated.
+Pages no target stored are retried on later turns, so a member that joins
+later receives them. The `Restore` effect now starts this task.
+
+Failover (`failover.rs`): a worker coordinates a committed version exactly
+when no pool member ranked ahead of it among the first `RANKED_DEPTH` of the
+page-zero placement answers `status` with the same ETag. Roles are decided
+again when the membership version changes and every `ROLE_RECHECK` (30 s)
+otherwise, and never for open sessions or past the hold. A promoted replica
+re-replicates the manifest and resumes a `pending` upload when it has the
+credentials (`failover::resume`, also run every turn). A coordinator that
+finds a member ahead of it demotes itself and sends that member its manifest.
+`replicate` of the same version to a coordinator merges (`HoldersMerged`,
+and `UploadedElsewhere` if the sender's upload committed); to a replica it
+replaces the manifest but keeps an upload it saw commit and its credentials.
+`replicate` refuses manifests past their hold.
+
+Credentials: `replicate` is an `acquire` operation, so the coordinator now
+sends the writer's origin context with the manifest (sealed to the
+destination like any acquire context), and replicas keep it in memory. Origin
+contexts are still never journaled: a replica that restarts loses them, and
+its upload waits for a client `persist`, as for a restarted coordinator.
+
+Exactly-once commit: two coordinators of one version can overlap (a
+partition, or a restarted coordinator that missed the takeover). Put Block of
+one block ID writes the same bytes, and Put Block List uses
+`If-None-Match: *`, so at most one block list commits. On a conflict the
+loser asks the other page-zero members (`upload::conflict_outcome`, up to 5
+probes 200 ms apart while one still reports `uploading`); one that knows the
+version as `committed` turns the conflict into `UploadedElsewhere` instead of
+`failed`. Every transition to `committed` also pushes the manifest to the
+replicas, and merges converge the others.
+
+Rekey (`rekey.rs`): each worker rekeys every written page whose catalog key
+is not its cache's active page key, up to `BATCH` (8) pages per turn,
+rescanning when the keyring generation changes and every `RESCAN` (60 s).
+The threshold is "not active" rather than "among the two oldest retained
+keys": the node cannot see the authority's `retained_page_keys`, which may be
+1 (no decrypt keys) or 2, and only "not active" is safe for every setting.
+The cost is one decrypt, encrypt, and record write per written page per
+rotation (daily by default). A page sealed under a key that was dropped
+before its holder rekeyed it stays unreadable, as before.
+
+Garbage collection (`gc.rs`, per worker, over the pages it holds):
+
+- Orphans: a written version that no page-zero member knows is dropped once
+  it stayed unknown for `RACER_WRITE_ORPHAN_SECS`. Members are asked at most
+  every `check_interval(orphan_after)` (a quarter, clamped to 1 s..300 s),
+  16 versions per turn; a version is unknown only when some member answered
+  and none knows it, so unreachable members never vote. The design's
+  "ask the coordinator" became "ask the page-zero members", because after a
+  failover the coordinator is not necessarily the first ranked member.
+- Removed caches: written pages and directory entries of a cache that is no
+  longer published are dropped (catalog entry removed, `Delete` journaled for
+  sessions) after `REMOVED_CACHE_GRACE` (30 s).
+
+Aliases: not built. After Put Block List commits, fresh reads go to the
+origin under the Blob ETag and refill from it; the pages cached under the
+Racer version are evicted normally. An alias would save that refill, but it
+changes what a fresh read publishes for an origin object (the Racer version
+instead of the origin version) on every page-zero owner, which belongs with
+the read-path work in WP11. `RACER_WRITE_ALIAS_SECS` is kept, documented as
+reserved, and has no effect.
+
+Harness: `Harness::cache_recreate` now sets the publication page size, which
+tests with non-default page sizes need.
+
+Tests: `racer-core` session tests for `NodesLost`, `HoldersMerged`,
+`UploadedElsewhere`, `under_replicated`, and those events in the random
+sequence test; `store::tests::written::rekey_replaces_the_record_and_moves_the_pin`;
+`write::tests` for `gc::check_interval` and entry defaults; and in
+`app::dst::write_tests`: `a_lost_holder_is_repaired_before_upload` (5 nodes,
+holder crash, two copies restored, coordinator table matches, repair metric,
+reads everywhere, upload), `losing_every_holder_of_a_page_fails_the_object`,
+`repair_waits_for_a_spare_member`, `a_manifest_replica_takes_over_a_lost_coordinator`
+(coordinator crashes mid-upload with Put Block List faults; the replica
+finishes with forwarded credentials, one commit; the old coordinator restarts
+with a stale journal and roles converge to one coordinator, all `committed`),
+`persist_after_a_coordinator_takeover_uploads_once`,
+`rekeying_keeps_written_pages_readable_past_key_retention` (three rotations
+keeping one decrypt key; fails without rekey),
+`orphaned_written_pages_are_collected`, and
+`a_removed_cache_releases_its_written_pages`.
+
+Left undone:
+
+- Lost-record reports from holders: a holder that lost a page without leaving
+  the membership (for example, recovery reported it `Corrupt`) is not
+  reported to the coordinator; uploads fall back to other holders, and the
+  page is repaired only if the holder later leaves. Reporting needs a new
+  reply carrying missing pages.
+- A holder that leaves and rejoins the membership keeps its pinned copies,
+  which are no longer in the holder table, until its hold expires or orphan
+  GC finds the version gone.
+- Role checks cost one `status` probe per committed object per replica per
+  membership change and every 30 s; many concurrent written objects make this
+  noticeable, and a batched status operation would reduce it.
+- A restarted coordinator that missed a `DELETE` reloads the deleted session
+  and serves it until its hold, as in WP5.
+
 ### WP9: SDKs (Python and Go)
 
 Files (Python): `clients/python/racer/src/racer/client.py` (`write`,
