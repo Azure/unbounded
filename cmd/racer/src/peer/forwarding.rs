@@ -226,7 +226,9 @@ impl VerifiedRequest {
         let mode = match mode {
             FetchMode::Acquire => FetchMode::Acquire,
             FetchMode::CopyOnly => FetchMode::CopyOnly,
-            FetchMode::Offer | FetchMode::Ping => return Err(Error::InvalidRequest),
+            FetchMode::Offer | FetchMode::Ping | FetchMode::Holder => {
+                return Err(Error::InvalidRequest);
+            }
         };
         self.signed.request.operation = Operation::Page { page, mode };
         Ok(self)

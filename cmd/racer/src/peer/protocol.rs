@@ -65,6 +65,14 @@ pub enum FetchMode {
     /// on work. Receivers that predate it reject the request, which still
     /// signs an answer and proves them alive.
     Ping,
+    /// A holder probe (`racer_core::read::holders`): an owner of an
+    /// adapter-persistence page asks a node it served the page to for a copy
+    /// from that node's memory or its own origin adapter, never acquiring,
+    /// forwarding, or contacting the remote origin. Page requests only, with
+    /// no origin credentials and no remote attempts, like [`Self::Offer`];
+    /// the receiver answers the page or `Miss`. Receivers that predate it
+    /// reject the request, which the sender treats as a miss.
+    Holder,
 }
 
 /// Retained HTTP provenance and exclusively socket-owned ordered sessions.
@@ -605,7 +613,7 @@ pub fn request_head(clock: &racer_io::Clock, request: &PeerRequest) -> Result<Me
     if !matches!(mode, FetchMode::Acquire) && request.route.remaining_attempts != 0 {
         return Err(Error::InvalidRequest);
     }
-    if matches!(mode, FetchMode::Offer | FetchMode::Ping)
+    if matches!(mode, FetchMode::Offer | FetchMode::Ping | FetchMode::Holder)
         && (!matches!(request.operation, Operation::Page { .. })
             || request.origin.authorization.is_some()
             || request.origin.metadata.is_some())
@@ -620,6 +628,7 @@ pub fn request_head(clock: &racer_io::Clock, request: &PeerRequest) -> Result<Me
             FetchMode::Acquire => "acquire",
             FetchMode::Offer => "offer",
             FetchMode::Ping => "ping",
+            FetchMode::Holder => "holder",
         },
     );
     push_binary(&mut head, "racer-request", &request.origin.request.0);
@@ -1232,6 +1241,7 @@ impl SecurityCodec {
             "acquire" => FetchMode::Acquire,
             "offer" => FetchMode::Offer,
             "ping" => FetchMode::Ping,
+            "holder" => FetchMode::Holder,
             _ => return Err(Error::InvalidRequest),
         };
         let object = object(head)?;
