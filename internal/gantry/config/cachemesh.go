@@ -79,8 +79,10 @@ type CachemeshConfig struct {
 
 	// CacheTags serves manifest-by-tag requests through the cachemesh
 	// metadata cache. Only anonymous requests to registries that do not
-	// require authentication are served this way; see the design doc for
-	// the tag-binding caveat.
+	// require authentication are served this way. Off by default: a tag
+	// binding cannot be verified against content, so enabling it trusts
+	// every agent that holds the peer key to resolve tags honestly; see
+	// the design doc for the tag-binding caveat.
 	CacheTags bool `yaml:"cache_tags"`
 
 	// VerifyDigest hashes every full-blob response the cachemesh path
@@ -112,7 +114,7 @@ func defaultCachemeshConfig() CachemeshConfig {
 	return CachemeshConfig{
 		ChunkSize:               DefaultCachemeshChunkSize,
 		MaxNeighbors:            DefaultCachemeshMaxNeighbors,
-		CacheTags:               true,
+		CacheTags:               false,
 		VerifyDigest:            true,
 		ContentRoot:             DefaultCachemeshContentRoot,
 		InflightBytes:           DefaultCachemeshInflightBytes,

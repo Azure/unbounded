@@ -164,6 +164,11 @@ rollout before the next one.
 The key protects against other pods on the pod network. Any holder of the
 key, such as a compromised gantry pod, is trusted as a mesh member.
 
+`gantry.cachemesh.cacheTags` (default `false`) lets agents answer anonymous
+manifest-by-tag requests from each other. A tag cannot be checked against
+content, so with it on, one compromised agent can point every node at a
+different image for that tag. Leave it off unless you accept that trust.
+
 ## Operator Profile
 
 ```sh

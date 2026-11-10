@@ -1007,7 +1007,7 @@ true.
 | `content_root` | `CACHEMESH_CONTENT_ROOT` | `/var/lib/containerd/io.containerd.content.v1.content` | containerd content store directory, mounted read-only; the only disk tier. Empty or unreadable: serve peers from memory only. |
 | `inflight_bytes` | `CACHEMESH_INFLIGHT_BYTES` | 2GiB | Memory fills borrow for lagging readers, recent relay chunks, and owned chunks. |
 | `max_concurrent_chunk_fills` | `CACHEMESH_MAX_CONCURRENT_CHUNK_FILLS` | 64 | Chunks fetched at once. |
-| `cache_tags` | `CACHEMESH_CACHE_TAGS` | `true` | Serve anonymous tag requests from the mesh. |
+| `cache_tags` | `CACHEMESH_CACHE_TAGS` | `false` | Serve anonymous tag requests from the mesh. Trusts every peer-key holder to resolve tags honestly. |
 | `verify_digest` | `CACHEMESH_VERIFY_DIGEST` | `true` | Hash full blobs before the last byte. |
 
 Validation requires a Lease namespace and `pod_ip`. The Racer backend
@@ -1379,7 +1379,9 @@ resolution. A tag cannot be verified
 against content, so a node that lies about a tag can point other nodes at
 the wrong image for up to the TTL (see the tag-binding note in
 `designs/gantry-detailed-design.md`). Manifests by digest are safe because
-containerd verifies them.
+containerd verifies them. Because one compromised member could redirect a
+tag for the whole cluster, `cache_tags` is off by default; turn it on only
+when every holder of the peer key is trusted to that degree.
 
 ### Interaction with the default path
 

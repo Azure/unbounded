@@ -28,7 +28,7 @@ func TestCachemeshDefaultsDisabled(t *testing.T) {
 	}
 
 	if m.ChunkSize != 64<<20 || m.ContentRoot != "/var/lib/containerd/io.containerd.content.v1.content" ||
-		m.InflightBytes != 2<<30 || m.MaxNeighbors != 32 || m.MaxConcurrentChunkFills != 64 || !m.CacheTags || !m.VerifyDigest {
+		m.InflightBytes != 2<<30 || m.MaxNeighbors != 32 || m.MaxConcurrentChunkFills != 64 || m.CacheTags || !m.VerifyDigest {
 		t.Fatalf("unexpected defaults: %+v", m)
 	}
 
@@ -106,13 +106,13 @@ cachemesh:
   chunk_size: 16777216
   peer_key_file: /keys/a
   max_neighbors: 48
-  cache_tags: false
+  cache_tags: true
 `
 	if err := c.LoadYAML(strings.NewReader(yaml)); err != nil {
 		t.Fatalf("LoadYAML: %v", err)
 	}
 
-	if !c.Cachemesh.Enabled || c.Cachemesh.ChunkSize != 16<<20 || c.Cachemesh.MaxNeighbors != 48 || c.Cachemesh.CacheTags ||
+	if !c.Cachemesh.Enabled || c.Cachemesh.ChunkSize != 16<<20 || c.Cachemesh.MaxNeighbors != 48 || !c.Cachemesh.CacheTags ||
 		c.Cachemesh.PeerKeyFile != "/keys/a" {
 		t.Fatalf("YAML not applied: %+v", c.Cachemesh)
 	}

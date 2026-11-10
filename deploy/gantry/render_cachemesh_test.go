@@ -97,8 +97,15 @@ func TestRendersCachemeshContentRootMount(t *testing.T) {
 		t.Fatalf("DaemonSet still has a chunk volume:\n%s", ds)
 	}
 
-	if cfg := renderedAgentConfig(t, dir); !strings.Contains(cfg, `  content_root: "`+root+`"`) {
+	cfg := renderedAgentConfig(t, dir)
+	if !strings.Contains(cfg, `  content_root: "`+root+`"`) {
 		t.Fatalf("config lacks content_root:\n%s", cfg)
+	}
+
+	// Tag caching trusts every peer-key holder, so it stays off unless
+	// asked for.
+	if !strings.Contains(cfg, "  cache_tags: false\n") {
+		t.Fatalf("config does not disable cache_tags by default:\n%s", cfg)
 	}
 }
 
@@ -134,7 +141,7 @@ func TestRendersEnabledCachemesh(t *testing.T) {
     contentRoot: /data/containerd/io.containerd.content.v1.content
     inflightBytes: 536870912
     maxConcurrentChunkFills: 32
-    cacheTags: false
+    cacheTags: true
 `), 0o600)
 	if err != nil {
 		t.Fatal(err)
@@ -170,7 +177,7 @@ func TestRendersEnabledCachemesh(t *testing.T) {
 		"  chunk_size: 33554432\n",
 		"  max_neighbors: 32\n",
 		"  expected_size: 150\n",
-		"  cache_tags: false\n",
+		"  cache_tags: true\n",
 	} {
 		if !strings.Contains(cfgText, want) {
 			t.Fatalf("rendered config lacks %q:\n%s", want, cfgText)
@@ -190,7 +197,7 @@ func TestRendersEnabledCachemesh(t *testing.T) {
 	m := c.Cachemesh
 	if !m.Enabled || m.ContentRoot != "/data/containerd/io.containerd.content.v1.content" ||
 		m.InflightBytes != 512<<20 || m.MaxConcurrentChunkFills != 32 || m.ChunkSize != 32<<20 || m.MaxNeighbors != 32 ||
-		m.ExpectedSize != 150 || m.CacheTags || !m.VerifyDigest {
+		m.ExpectedSize != 150 || !m.CacheTags || !m.VerifyDigest {
 		t.Fatalf("parsed cachemesh config: %+v", m)
 	}
 

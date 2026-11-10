@@ -161,7 +161,10 @@ gantry:
     # Concurrent chunk fills from peers or the origin (64).
     maxConcurrentChunkFills: 0
     # Serve anonymous manifest-by-tag requests from the mesh metadata cache.
-    cacheTags: true
+    # Off by default: a tag binding cannot be verified against content, so
+    # enabling this trusts every agent that holds the peer key to resolve
+    # tags honestly.
+    cacheTags: false
     # Hash every full blob served through the mesh; a mismatch aborts the
     # response before its last byte and drops the cached chunks.
     verifyDigest: true
