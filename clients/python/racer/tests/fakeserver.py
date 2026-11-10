@@ -27,6 +27,20 @@ class Obj:
 
 
 @dataclass
+class Written:
+    """Write options and state of an object created through the write API."""
+
+    state: str
+    replicas: int | None
+    origin: bool
+    upload: str
+    hold_seconds: int | None
+    metadata: str | None
+    kind: str
+    seq: int = 0
+
+
+@dataclass
 class Seen:
     method: str
     target: str
@@ -59,6 +73,17 @@ class FakeRacer:
         self.truncate = False
         self.seen: list[Seen] = []
         self.prefetches = FakePrefetches()
+        # Writes: enabled unless writes_enabled is False. write_reject, when
+        # set, is called as write_reject(kind, key, headers) after header
+        # checks and may return (status, code, retry_after) to fail the write.
+        # origin_keys are keys the "origin" already has (create-once 412).
+        self.writes_enabled = True
+        self.default_upload = "auto"
+        self.written: dict[str, Written] = {}
+        self.write_reject = None
+        self.origin_keys: set[str] = set()
+        self.write_seq = 0
+        self._lock = threading.Lock()
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.sock.bind(path)
         self.sock.listen(16)
@@ -170,6 +195,16 @@ class FakeRacer:
             return
         tail = target[len(wire.OBJECT_PREFIX) :]
         key, _, mode = tail.partition("/")
+        write_kind = None
+        if not mode and method == "PUT":
+            write_kind = "put"
+        elif not mode and method == "DELETE":
+            write_kind = "delete"
+        elif mode in ("host-write", "persist") and method == "POST":
+            write_kind = mode
+        if write_kind is not None:
+            self._write(conn, write_kind, key, headers, fds, rest)
+            return
         if mode and (self.old or mode not in ("host-read", "gpu-read")):
             self._error(conn, 400)
             return
@@ -222,8 +257,11 @@ class FakeRacer:
             meta.append(("Racer-Content-Type", obj.content_type))
         size = len(obj.data)
         if method == "HEAD":
+            extra = []
+            if key in self.written:
+                extra.append(("Racer-Upload-State", self.written[key].state))
             self._send(
-                conn, 200, meta + [("Content-Length", str(size)), ("Content-Type", "application/octet-stream")]
+                conn, 200, meta + extra + [("Content-Length", str(size)), ("Content-Type", "application/octet-stream")]
             )
             return
         if method != "POST":
@@ -288,6 +326,150 @@ class FakeRacer:
         if self.truncate:
             return
         conn.sendall(wire.encode_frame(wire.COMPLETE_FRAME, pages, end - first, 0))
+
+    # Writes ------------------------------------------------------------
+
+    def _write_error(self, conn, status, code="", retry_after=None):
+        h = [("Content-Length", "0")]
+        if status == 405:
+            h.append(("Allow", "HEAD, POST"))
+        if code:
+            h.append(("Racer-Write-Error", code))
+        if retry_after is not None:
+            h.append(("Retry-After", str(retry_after)))
+        self._send(conn, status, h)
+
+    def _write_spec(self, headers):
+        """Check PUT/host-write headers like the dataplane; return (status, spec)."""
+        if headers.get("if-none-match") != "*":
+            return 428, None
+        upload = headers.get("racer-upload", self.default_upload)
+        if upload not in wire.UPLOAD_MODES:
+            return 400, None
+        durability = headers.get("racer-durability")
+        replicas, origin = None, False
+        if durability == "origin":
+            origin = True
+        elif durability is not None:
+            if durability not in ("replicas=1", "replicas=2", "replicas=3"):
+                return 400, None
+            replicas = int(durability[-1])
+        if origin and upload != "auto":
+            return 400, None
+        hold = headers.get("racer-hold-seconds")
+        if hold is not None:
+            try:
+                hold = wire.decimal(hold)
+            except racer.RacerError:
+                return 400, None
+            if not 0 < hold <= wire.MAX_HOLD_SECONDS:
+                return 400, None
+        metadata = headers.get("racer-metadata")
+        if upload != "never" and not metadata:
+            return 400, None
+        return 0, (replicas, origin, upload, hold, metadata)
+
+    def _write(self, conn, kind, key, headers, fds, rest):
+        if not self.writes_enabled:
+            self._write_error(conn, 405)
+            return
+        metadata = headers.get("racer-metadata")
+        if headers.get("host") != "racer" or len(key) != 64 or (metadata and wire.has_version_id(metadata)):
+            self._write_error(conn, 400)
+            return
+        spec = None
+        if kind in ("put", "host-write"):
+            status, spec = self._write_spec(headers)
+            length = 0
+            if status == 0 and kind == "put":
+                cl = headers.get("content-length")
+                if cl is None:
+                    status = 411
+                else:
+                    length = wire.decimal(cl)
+                    if length == 0:
+                        status = 400
+                    elif length > wire.max_object_bytes():
+                        status = 413
+            if status == 0 and kind == "host-write":
+                if headers.get("content-length") != "0" or len(fds) != 1:
+                    status = 400
+            if status:
+                self._write_error(conn, status)
+                return
+        elif headers.get("content-length", "0") != "0":
+            self._write_error(conn, 400)
+            return
+        if self.write_reject is not None:
+            reply = self.write_reject(kind, key, headers)
+            if reply is not None:
+                self._write_error(conn, *reply)
+                return
+        if kind == "persist":
+            self._persist(conn, key)
+            return
+        if kind == "delete":
+            self._delete(conn, key)
+            return
+        if key in self.written or key in self.origin_keys or key in self.objects:
+            self._write_error(conn, 412)
+            return
+        if kind == "put":
+            data = bytearray(rest or b"")
+            while len(data) < length:
+                got = conn.recv(min(1 << 20, length - len(data)))
+                if not got:
+                    return
+                data += got
+            data = bytes(data[:length])
+        else:
+            try:
+                off = wire.decimal(headers.get("racer-source-offset"))
+                n = wire.decimal(headers.get("racer-source-length"))
+            except racer.RacerError:
+                self._write_error(conn, 400)
+                return
+            st = os.fstat(fds[0])
+            if n == 0 or not stat.S_ISREG(st.st_mode) or off + n > st.st_size:
+                self._write_error(conn, 400)
+                return
+            data = os.pread(fds[0], n, off)
+        replicas, origin, upload, hold, metadata = spec
+        state = "committed" if origin else {"auto": "pending", "manual": "manual", "never": "never"}[upload]
+        etag = '"racer-' + os.urandom(16).hex() + '"'
+        with self._lock:
+            if key in self.written:
+                self._write_error(conn, 412)
+                return
+            self.write_seq += 1
+            self.written[key] = Written(state, replicas, origin, upload, hold, metadata, kind, self.write_seq)
+            self.objects[key] = Obj(data, etag, headers.get("racer-content-type"))
+        self._send(conn, 201, [("ETag", etag), ("Racer-Upload-State", state), ("Content-Length", "0")])
+
+    def _persist(self, conn, key):
+        w = self.written.get(key)
+        if w is None:
+            self._write_error(conn, 404)
+            return
+        if w.state in ("never", "committed"):
+            self._write_error(conn, 409, "not-manual")
+            return
+        if w.state == "manual":
+            w.state = "pending"
+        self._send(conn, 204, [("Racer-Upload-State", w.state)])
+
+    def _delete(self, conn, key):
+        w = self.written.get(key)
+        if w is None:
+            self._write_error(conn, 404)
+            return
+        if w.state == "committed":
+            self._write_error(conn, 409, "uploaded")
+            return
+        with self._lock:
+            del self.written[key]
+            self.objects.pop(key, None)
+        self._send(conn, 204, [])
 
     def _credit(self, conn, buf, seen):
         while len(buf) < wire.CREDIT_SIZE:

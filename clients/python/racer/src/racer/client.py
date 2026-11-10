@@ -20,11 +20,19 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Callable, Optional
+from typing import BinaryIO, Callable, Optional, Union
 
 from . import _wire as wire
 from . import prefetch as _prefetch
-from .errors import PrefetchError, ProtocolError, RacerError, StatusError, TruncatedError, UnsatisfiableRange
+from .errors import (
+    PrefetchError,
+    ProtocolError,
+    RacerError,
+    StatusError,
+    TruncatedError,
+    UnsatisfiableRange,
+    write_error,
+)
 from .prefetch import PrefetchSpec, PrefetchStatus
 from .keys import Request
 
@@ -137,6 +145,21 @@ class Metadata:
     size: int
     expires_at_ms: int
     content_type: str | None = None
+    # Racer-Upload-State of a written object from stat(); None otherwise.
+    upload_state: str | None = None
+
+
+@dataclass(frozen=True)
+class WriteResult:
+    """A completed write: the minted Racer version and its upload state."""
+
+    etag: str
+    upload_state: str
+
+
+WriteData = Union[bytes, bytearray, memoryview, BinaryIO]
+
+_WRITE_CHUNK = 1 << 20
 
 
 @dataclass(frozen=True)
@@ -391,7 +414,185 @@ class Client:
         m = _response_metadata(h)
         if m is None or (if_match and m.etag != if_match):
             raise ProtocolError("bad HEAD metadata")
-        return Metadata(etag=m.etag, size=size, expires_at_ms=m.expires_at_ms, content_type=m.content_type)
+        state = h.get("racer-upload-state")
+        if state is not None and state not in wire.UPLOAD_STATES:
+            raise ProtocolError("bad Racer-Upload-State")
+        return Metadata(
+            etag=m.etag, size=size, expires_at_ms=m.expires_at_ms, content_type=m.content_type, upload_state=state
+        )
+
+    # Writes ----------------------------------------------------------------
+
+    def write(
+        self,
+        request: Request,
+        data: WriteData,
+        *,
+        length: int | None = None,
+        replicas: int | None = None,
+        durability_origin: bool = False,
+        upload: str | None = None,
+        hold_seconds: int | None = None,
+        content_type: str | None = None,
+        retry_busy: float = 0.0,
+    ) -> WriteResult:
+        """Create an object from data (designs/racer-writes.md, Client API).
+
+        data is bytes-like or a binary file object. length defaults to the
+        size of bytes-like data, or to the bytes left in a seekable file.
+        Writes are create-once: an existing key raises Exists. Returns once
+        Racer reports the object durable at the requested level (replicas
+        copies, or the origin upload with durability_origin=True) and
+        visible to readers. retry_busy > 0 retries Busy (503) for up to that
+        many seconds when data can be replayed (bytes-like or seekable).
+        """
+        start: int | None = None
+        if isinstance(data, (bytes, bytearray, memoryview)):
+            view = memoryview(data).cast("B")
+            if length is None:
+                length = len(view)
+            elif length > len(view):
+                raise RacerError("length exceeds data")
+        else:
+            view = None
+            try:
+                start = data.tell() if data.seekable() else None
+            except (AttributeError, OSError):
+                start = None
+            if length is None:
+                if start is None:
+                    raise RacerError("length is required for unseekable data")
+                end = data.seek(0, os.SEEK_END)
+                data.seek(start)
+                length = end - start
+        head = wire.write_head(
+            wire.PUT,
+            request.hex,
+            length=length,
+            replicas=replicas,
+            durability_origin=durability_origin,
+            upload=upload,
+            hold_seconds=hold_seconds,
+            content_type=content_type,
+            metadata=request.metadata,
+            authorization=request.authorization,
+        )
+
+        def body(conn: _Conn) -> None:
+            if view is not None:
+                for pos in range(0, length, _WRITE_CHUNK):
+                    conn.sock.sendall(view[pos : min(length, pos + _WRITE_CHUNK)])
+                return
+            sent = 0
+            while sent < length:
+                chunk = data.read(min(_WRITE_CHUNK, length - sent))
+                if not chunk:
+                    raise _BodyError("data is shorter than length")
+                conn.sock.sendall(chunk)
+                sent += len(chunk)
+
+        def rewind() -> bool:
+            if view is not None:
+                return True
+            if start is None:
+                return False
+            data.seek(start)
+            return True
+
+        r = self._write_call(wire.PUT, head, None, body, durability_origin, retry_busy, rewind)
+        return WriteResult(r.etag or "", r.upload_state or "")
+
+    def host_write(
+        self,
+        request: Request,
+        fd: int,
+        src_offset: int,
+        src_length: int,
+        *,
+        replicas: int | None = None,
+        durability_origin: bool = False,
+        upload: str | None = None,
+        hold_seconds: int | None = None,
+        content_type: str | None = None,
+        retry_busy: float = 0.0,
+    ) -> WriteResult:
+        """Create an object from [src_offset, src_offset + src_length) of fd.
+
+        fd (a regular file or memfd, normally a HostBuffer) is passed to
+        Racer with SCM_RIGHTS, so Racer reads it without a socket copy. The
+        bytes must not change until host_write returns. Options and errors
+        are as for write().
+        """
+        head = wire.write_head(
+            wire.HOST_WRITE,
+            request.hex,
+            length=src_length,
+            source_offset=src_offset,
+            replicas=replicas,
+            durability_origin=durability_origin,
+            upload=upload,
+            hold_seconds=hold_seconds,
+            content_type=content_type,
+            metadata=request.metadata,
+            authorization=request.authorization,
+        )
+        r = self._write_call(wire.HOST_WRITE, head, fd, None, durability_origin, retry_busy, lambda: True)
+        return WriteResult(r.etag or "", r.upload_state or "")
+
+    def persist(self, request: Request) -> str:
+        """Start the upload of a manual object and return its upload state."""
+        head = wire.write_head(
+            wire.PERSIST, request.hex, metadata=request.metadata, authorization=request.authorization
+        )
+        return self._write_call(wire.PERSIST, head, None, None, False, 0.0, None).upload_state or ""
+
+    def delete(self, request: Request) -> None:
+        """Remove a written object from the cache. Origin objects are never deleted."""
+        head = wire.write_head(wire.DELETE, request.hex, metadata=request.metadata, authorization=request.authorization)
+        self._write_call(wire.DELETE, head, None, None, False, 0.0, None)
+
+    def _write_call(self, kind, head, fd, body, durability_origin, retry_busy, rewind) -> wire.WriteResponse:
+        if retry_busy < 0:
+            raise RacerError("retry_busy must not be negative")
+        deadline = self._clock() + retry_busy
+        while True:
+            try:
+                return self._write_once(kind, head, fd, body, durability_origin)
+            except StatusError as exc:
+                retry = getattr(exc, "retry_after", None)
+                if exc.status != 503 or retry_busy <= 0 or rewind is None:
+                    raise
+                wait = max(retry or 0.0, 1.0)
+                if self._clock() + wait > deadline or not rewind():
+                    raise
+                time.sleep(wait)
+
+    def _write_once(self, kind, head, fd, body, durability_origin) -> wire.WriteResponse:
+        # Origin durability waits for the upload; only the caller bounds it.
+        conn = _Conn(self.socket_path, None if durability_origin else self.timeout)
+        try:
+            send_err: BaseException | None = None
+            try:
+                conn.send_head(head, fd)
+                if body is not None:
+                    body(conn)
+            except (BrokenPipeError, ConnectionResetError) as exc:
+                # Racer may reject a write before reading its body.
+                send_err = exc
+            try:
+                h = wire.parse_response_head(conn.read_head())
+            except (TruncatedError, OSError):
+                if send_err is not None:
+                    raise TruncatedError("connection closed during the write") from send_err
+                raise
+        finally:
+            conn.close()
+        r = wire.parse_write_response(h, kind)
+        if r.status in (201, 204):
+            if send_err is not None:
+                raise TruncatedError("connection closed during the write") from send_err
+            return r
+        raise write_error(r.status, r.error, r.retry_after, kind)
 
     # Prefetch --------------------------------------------------------------
 
@@ -947,6 +1148,10 @@ class Client:
             return self._stream(request, offset, length, if_match, staging.view, write, on_page, window, ok)
         finally:
             self._give_staging(staging)
+
+
+class _BodyError(RacerError):
+    """The caller's data ended early or failed; the write is abandoned."""
 
 
 class _Skip(Exception):

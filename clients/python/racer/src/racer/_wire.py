@@ -27,6 +27,21 @@ MAX_WIRE_INTEGER = (1 << 63) - 1
 PAGE_CREDITS = 2
 BYTE_CREDITS = PAGE_CREDITS * PAGE_SIZE
 
+# Writes (designs/racer-writes.md, Client API).
+MAX_OBJECT_PAGES = 50_000
+MAX_HOLD_SECONDS = 2_592_000
+UPLOAD_MODES = frozenset({"auto", "manual", "never"})
+UPLOAD_STATES = frozenset({"pending", "uploading", "committed", "failed", "never", "manual"})
+PUT = "put"
+HOST_WRITE = "host-write"
+PERSIST = "persist"
+DELETE = "delete"
+
+
+def max_object_bytes() -> int:
+    return MAX_OBJECT_PAGES * PAGE_SIZE
+
+
 _FRAME = struct.Struct(">BQQI")
 _CREDIT = struct.Struct(">QI")
 
@@ -165,6 +180,9 @@ _SINGLETONS = {
     "racer-range-start",
     "racer-range-end",
     "racer-delivery",
+    "racer-upload-state",
+    "racer-write-error",
+    "retry-after",
 }
 
 
@@ -218,3 +236,122 @@ def check_error_status(h: ResponseHead) -> None:
     elif h.get("content-range") is not None:
         raise ProtocolError("unexpected Content-Range")
     raise status_error(h.status)
+
+
+def has_version_id(metadata: str) -> bool:
+    """Report whether opaque metadata is a JSON object naming a versionId."""
+    import json
+
+    try:
+        value = json.loads(metadata)
+    except ValueError:
+        return False
+    return isinstance(value, dict) and "versionId" in value
+
+
+def write_head(
+    kind: str,
+    key_hex: str,
+    *,
+    length: int = 0,
+    source_offset: int = 0,
+    replicas: int | None = None,
+    durability_origin: bool = False,
+    upload: str | None = None,
+    hold_seconds: int | None = None,
+    content_type: str | None = None,
+    metadata: str | None = None,
+    authorization: str | None = None,
+) -> bytes:
+    """Build the request head of a write, like wire.WriteHead in the Go SDK."""
+    if metadata and has_version_id(metadata):
+        raise RacerError("writes must not name a versionId")
+    target = OBJECT_PREFIX + key_hex
+    if kind == PUT:
+        if not 0 < length <= max_object_bytes():
+            raise RacerError("invalid object length")
+        head = f"PUT {target} HTTP/1.1\r\nHost: racer\r\nContent-Length: {length}\r\nIf-None-Match: *\r\n"
+    elif kind == HOST_WRITE:
+        if not 0 < length <= max_object_bytes() or source_offset < 0 or source_offset > MAX_WIRE_INTEGER - length:
+            raise RacerError("invalid source window")
+        head = (
+            f"POST {target}/host-write HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\nIf-None-Match: *\r\n"
+            f"Racer-Source-Offset: {source_offset}\r\nRacer-Source-Length: {length}\r\n"
+        )
+    elif kind == PERSIST:
+        head = f"POST {target}/persist HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\n"
+    elif kind == DELETE:
+        head = f"DELETE {target} HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\n"
+    else:
+        raise RacerError("unknown write kind")
+    if kind in (PUT, HOST_WRITE):
+        if replicas is not None and (isinstance(replicas, bool) or replicas not in (1, 2, 3)):
+            raise RacerError("replicas must be 1, 2, or 3")
+        if durability_origin and replicas is not None:
+            raise RacerError("origin durability excludes replicas")
+        if upload is not None and upload not in UPLOAD_MODES:
+            raise RacerError("invalid upload mode")
+        if durability_origin and upload in ("manual", "never"):
+            raise RacerError("origin durability needs auto upload")
+        if hold_seconds is not None and (isinstance(hold_seconds, bool) or not 0 < hold_seconds <= MAX_HOLD_SECONDS):
+            raise RacerError("invalid hold")
+        if durability_origin:
+            head += "Racer-Durability: origin\r\n"
+        elif replicas is not None:
+            head += f"Racer-Durability: replicas={replicas}\r\n"
+        if upload is not None:
+            head += f"Racer-Upload: {upload}\r\n"
+        if hold_seconds is not None:
+            head += f"Racer-Hold-Seconds: {hold_seconds}\r\n"
+        if content_type is not None:
+            if not validate_content_type(content_type):
+                raise RacerError("invalid content type")
+            head += f"Racer-Content-Type: {content_type}\r\n"
+    if metadata:
+        validate_opaque(metadata)
+        head += "Racer-Metadata: " + metadata + "\r\n"
+    if authorization:
+        validate_opaque(authorization)
+        head += "Authorization: " + authorization + "\r\n"
+    raw = (head + "\r\n").encode()
+    if len(raw) > MAX_HEAD_BYTES:
+        raise RacerError("request head too large")
+    return raw
+
+
+@dataclass(frozen=True)
+class WriteResponse:
+    status: int
+    etag: str | None
+    upload_state: str | None
+    error: str
+    retry_after: float | None
+
+
+def parse_write_response(h: ResponseHead, kind: str) -> WriteResponse:
+    """Validate a write response head. Non-success statuses are returned for the caller to raise."""
+    if h.get("transfer-encoding") is not None:
+        raise ProtocolError("unexpected Transfer-Encoding")
+    cl = h.get("content-length")
+    if cl is not None or h.status != 204:
+        if decimal(cl) != 0:
+            raise ProtocolError("write response with a body")
+    state = h.get("racer-upload-state")
+    if state is not None and state not in UPLOAD_STATES:
+        raise ProtocolError("bad Racer-Upload-State")
+    retry = None
+    value = (h.get("retry-after") or "").strip()
+    if value.isascii() and value.isdigit() and len(value) <= 19:
+        retry = float(int(value))
+    etag = h.get("etag")
+    if h.status == 201:
+        if kind not in (PUT, HOST_WRITE) or state is None or etag is None:
+            raise ProtocolError("bad write response")
+        try:
+            validate_etag(etag)
+        except RacerError as exc:
+            raise ProtocolError("bad ETag") from exc
+    elif h.status == 204:
+        if kind in (PUT, HOST_WRITE) or (kind == PERSIST and state is None):
+            raise ProtocolError("bad write response")
+    return WriteResponse(h.status, etag, state, h.get("racer-write-error") or "", retry)
