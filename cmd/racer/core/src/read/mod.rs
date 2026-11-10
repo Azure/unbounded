@@ -518,6 +518,36 @@ pub fn retention_score(heat: u8, owned: bool, enabled: bool) -> u8 {
     if enabled { heat + u8::from(owned) } else { 0 }
 }
 
+/// A source a fill asks after this node's memory and pending copies, and
+/// before the ranked owner walk and the remote origin.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalSource {
+    /// A copy the node's own origin adapter holds, read with a local-only
+    /// origin request that never contacts the remote origin.
+    AdapterReplica,
+}
+
+/// Facts that select the local sources of one fill.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LocalSourceFacts {
+    /// The cache keeps pages in memory only and its origin adapter holds
+    /// local copies (persistence Adapter).
+    pub adapter: bool,
+}
+
+/// The local sources of one fill, in visit order. A miss or failure of one
+/// falls through to the next, and after the last to the ranked walk; only
+/// cancellation ends the fill. Further sources that are cheaper than ranked
+/// owners, such as nodes that recently read the page, belong after
+/// [`LocalSource::AdapterReplica`].
+pub fn local_sources(facts: LocalSourceFacts) -> &'static [LocalSource] {
+    if facts.adapter {
+        &[LocalSource::AdapterReplica]
+    } else {
+        &[]
+    }
+}
+
 /// Why a verified page is or is not persisted to local disk.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Persist {
@@ -568,6 +598,15 @@ pub fn persist(facts: PersistFacts) -> Persist {
 #[allow(clippy::disallowed_methods)] // Tests build instants to feed the API.
 mod policy_tests {
     use super::*;
+
+    #[test]
+    fn only_adapter_caches_ask_the_adapter_replica_first() {
+        assert!(local_sources(LocalSourceFacts::default()).is_empty());
+        assert_eq!(
+            local_sources(LocalSourceFacts { adapter: true }),
+            &[LocalSource::AdapterReplica]
+        );
+    }
 
     #[test]
     fn recoverable_errors() {

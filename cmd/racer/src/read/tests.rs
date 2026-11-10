@@ -23,6 +23,7 @@ pub(super) fn admission_coordinator(env: &racer_io::Env) -> (Rc<Coordinator>, im
     );
     (local, (endpoint, f))
 }
+mod adapter;
 mod hot_reads;
 mod passthrough;
 mod peer_copies;

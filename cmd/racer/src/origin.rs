@@ -72,6 +72,26 @@ pub trait Origin {
         selector: MetadataSelector,
         scope: &'a RequestScope,
     ) -> Operation<'a, MetadataReply>;
+    /// Ask the cache's local origin adapter for `page` from a copy of the
+    /// pinned version that it already holds, without contacting its remote
+    /// source. `Ok(None)` is a local miss: the adapter holds no such copy.
+    /// Needs no candidate authority, since nothing leaves the node. Callers
+    /// send this only for adapter-persistence caches, whose adapters
+    /// understand the request; an adapter that ignored it would contact its
+    /// remote source. Origins without adapter-held copies always miss.
+    fn local_page_reserved<'a>(
+        &'a self,
+        context: &'a OriginContext,
+        page: &'a PageId,
+        reservation: flow_control::Charge<AdmissionPolicy>,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, Option<OriginPage>> {
+        let _ = (context, page, reservation);
+        Box::pin(async move {
+            scope.check()?;
+            Ok(None)
+        })
+    }
     /// The published cluster page size that sizes one page's plaintext reservation. Adapters
     /// without a publication (test doubles) keep the default.
     fn page_size(&self) -> Result<PageSize> {
@@ -290,6 +310,60 @@ impl OriginClient {
         })
     }
 
+    /// A local-only page GET. Its 404 or 412 is a local miss; the exchange
+    /// finishes so the connection can be reused.
+    async fn local_page_reserved_at(
+        &self,
+        endpoint: &Endpoint,
+        context: &OriginContext,
+        page: &PageId,
+        reservation: flow_control::Charge<AdmissionPolicy>,
+        scope: &RequestScope,
+    ) -> Result<Option<OriginPage>> {
+        scope.check()?;
+        if page.version.object != context.object {
+            return Err(Error::Unauthorized);
+        }
+        let size = self.page_size()?;
+        let mut head = racer_wire::object::origin::local_page_request(
+            page,
+            size,
+            context.metadata.as_ref().map(|value| value.as_header()),
+            context
+                .authorization
+                .as_ref()
+                .map(|value| value.expose_for_origin()),
+        )?;
+        head.headers.push(Header::new(
+            "Racer-Cache",
+            context.object.cache.0.as_bytes(),
+        ));
+        self.validate_reservation(&reservation, context)?;
+        let mut response = self.exchange_head(endpoint, false, head, scope).await?;
+        let Some((_, length)) =
+            racer_wire::object::origin::validate_local_page_head(&response.value, page, size)?
+        else {
+            scope.check()?;
+            response
+                .connection
+                .finish_exchange()
+                .map_err(|_| Error::BadGateway)?;
+            return Ok(None);
+        };
+        let buffer = self.buffers.plaintext(reservation, length as usize)?;
+        let mut body = self.read_page(response.connection, buffer, scope).await?;
+        let metadata = validate_page(&response.value, page, size, body.bytes)?;
+        scope.check()?;
+        body.lease
+            .finish_exchange()
+            .map_err(|_| Error::BadGateway)?;
+        Ok(Some(OriginPage {
+            metadata,
+            plaintext: body.buffer,
+            page_size: size,
+        }))
+    }
+
     /// Check the supplied full-page plaintext charge without taking ownership.
     fn validate_reservation(
         &self,
@@ -415,6 +489,26 @@ impl Origin for OriginClient {
                     &self.health_key(&endpoint),
                     self.page_reserved_at(&endpoint, context, page, reservation, scope),
                 )
+                .await
+        })
+    }
+    /// Local-only reads are outside origin link health: a local miss or a
+    /// failed local read is not evidence that the remote origin is unhealthy,
+    /// and an unhealthy remote origin does not stop local reads.
+    fn local_page_reserved<'a>(
+        &'a self,
+        context: &'a OriginContext,
+        page: &'a PageId,
+        reservation: flow_control::Charge<AdmissionPolicy>,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, Option<OriginPage>> {
+        Box::pin(async move {
+            scope.check()?;
+            if context.object != page.version.object {
+                return Err(Error::Unauthorized);
+            }
+            let endpoint = self.endpoint(context)?;
+            self.local_page_reserved_at(&endpoint, context, page, reservation, scope)
                 .await
         })
     }

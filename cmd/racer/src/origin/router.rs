@@ -116,6 +116,27 @@ impl<U: Origin, T: AzureTransport, K: AzureTokenSource> Origin for OriginRouter<
         })
     }
 
+    /// Native origins hold no adapter copies, so a local-only read of a cache
+    /// with one is a miss; the publication never combines them anyway.
+    fn local_page_reserved<'a>(
+        &'a self,
+        context: &'a OriginContext,
+        page: &'a PageId,
+        reservation: flow_control::Charge<AdmissionPolicy>,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, Option<OriginPage>> {
+        if self.native(&context.object).is_none() {
+            return self
+                .adapter
+                .local_page_reserved(context, page, reservation, scope);
+        }
+        drop(reservation);
+        Box::pin(async move {
+            scope.check()?;
+            Ok(None)
+        })
+    }
+
     fn metadata<'a>(
         &'a self,
         authority: &'a OriginAuthority,

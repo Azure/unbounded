@@ -76,6 +76,22 @@ impl OriginClient {
             .await
     }
 
+    async fn local_page_at(
+        &self,
+        endpoint: &Endpoint,
+        context: &OriginContext,
+        page: &PageId,
+        scope: &RequestScope,
+    ) -> Result<Option<OriginPage>> {
+        let reservation = self.admission.reserve(
+            Some(&context.object.cache),
+            ResourceClass::Plaintext,
+            PAGE_BYTES as usize,
+        )?;
+        self.local_page_reserved_at(endpoint, context, page, reservation, scope)
+            .await
+    }
+
     async fn page_at(
         &self,
         endpoint: &Endpoint,
@@ -476,6 +492,65 @@ fn shared_adapter_controls_real_head_bootstrap_pin_and_rejection() {
     assert_eq!(adapter.count(RequestKind::Head), 2);
     assert_eq!(adapter.count(RequestKind::InitialGet), 1);
     assert_eq!(adapter.count(RequestKind::PinnedGet), 2);
+    assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+}
+
+/// Local-only reads send `Racer-Source: local` on a pinned page GET. A miss
+/// (404) or another local version (412) is `None` and releases its budget;
+/// a hit is validated like a pinned page; failures keep their meaning; and
+/// none of it reaches the remote-origin request kinds.
+#[test]
+fn real_uds_local_only_reads_miss_cheaply_and_serve_held_copies() {
+    use crate::model::ExpiresAt;
+    use crate::model::ObjectMetadata;
+    use crate::model::ObjectVersion;
+    use crate::test_support::origin::AdapterOrigin;
+    use crate::test_support::origin::RequestKind;
+    let env = racer_io::Env::host();
+    let (client, admission, reactor, snapshot) = published_client(&env);
+    let mut context = context();
+    context.object.cache = snapshot.caches[0].id.clone();
+    let mut metadata = ObjectMetadata {
+        version: ObjectVersion {
+            object: context.object.clone(),
+            etag: StrongEtag::test_value("v1"),
+        },
+        length: 3,
+        content_type: None,
+        expires_at: ExpiresAt::from_system_time(std::time::UNIX_EPOCH + Duration::from_secs(1234))
+            .unwrap(),
+    };
+    let adapter = AdapterOrigin::new("cache-a", metadata.clone());
+    let client = remap(client, adapter.root.clone()).unwrap();
+    let endpoint = client.endpoint(&context).unwrap();
+    let scope = scope();
+    let page = PageId {
+        version: metadata.version.clone(),
+        number: PageNumber(0),
+    };
+    let local = || {
+        drive(
+            &reactor,
+            client.local_page_at(&endpoint, &context, &page, &scope),
+        )
+    };
+    assert!(local().unwrap().is_none());
+    assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+    adapter.hold_local(0);
+    adapter.set_body(b"xyz".to_vec());
+    let hit = local().unwrap().unwrap();
+    assert_eq!(hit.plaintext.bytes().unwrap(), b"xyz");
+    assert_eq!(hit.metadata, metadata);
+    drop(hit);
+    adapter.reject_next(RequestKind::LocalGet, 500);
+    assert!(matches!(local(), Err(Error::Internal)));
+    // The held copy is another version: a local miss, not a failure.
+    metadata.version.etag = StrongEtag::test_value("v2");
+    adapter.set_version(metadata);
+    assert!(local().unwrap().is_none());
+    assert_eq!(adapter.count(RequestKind::LocalGet), 4);
+    assert_eq!(adapter.count(RequestKind::PinnedGet), 0);
+    assert_eq!(adapter.count(RequestKind::InitialGet), 0);
     assert_eq!(admission.used(ResourceClass::Plaintext), 0);
 }
 

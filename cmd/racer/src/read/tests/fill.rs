@@ -3192,8 +3192,57 @@ pub(super) struct TestOrigin {
     pub(super) started_pages: RefCell<Vec<u64>>,
     /// Answer metadata refreshes with `metadata` instead of panicking.
     pub(super) serve_metadata: Cell<bool>,
+    /// How local-only (adapter replica) page requests are answered.
+    pub(super) local: Cell<LocalReplica>,
+    /// Local-only page requests received.
+    pub(super) local_calls: Cell<usize>,
+}
+
+/// A [`TestOrigin`]'s answer to a local-only page request.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum LocalReplica {
+    /// No local copy: a cheap miss.
+    #[default]
+    Miss,
+    /// Serve the page from a local copy.
+    Hit,
+    /// Fail with this error.
+    Fail(Error),
+    /// Serve a page one byte short of its length.
+    Short,
 }
 impl Origin for TestOrigin {
+    fn local_page_reserved<'a>(
+        &'a self,
+        context: &'a OriginContext,
+        page: &'a PageId,
+        reservation: flow_control::Charge<AdmissionPolicy>,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, Option<OriginPage>> {
+        Box::pin(async move {
+            scope.check()?;
+            assert_eq!(context.object, page.version.object);
+            self.local_calls.set(self.local_calls.get() + 1);
+            let length = self.metadata.immutable().page_length(page)? as usize;
+            let length = match self.local.get() {
+                LocalReplica::Miss => return Ok(None),
+                LocalReplica::Fail(error) => return Err(error),
+                LocalReplica::Hit => length,
+                LocalReplica::Short => length - 1,
+            };
+            let mut plaintext = self.buffers.plaintext(reservation, length)?;
+            if self.metadata.length == 3 {
+                plaintext.bytes_mut()?.copy_from_slice(&b"abc"[..length]);
+            } else {
+                plaintext.bytes_mut()?.fill(page.number.0 as u8);
+            }
+            Ok(Some(OriginPage {
+                page_size: racer_wire::object::PageSize::DEFAULT,
+                metadata: self.metadata.clone(),
+                plaintext,
+            }))
+        })
+    }
     fn bootstrap_reserved<'a>(
         &'a self,
         _: &'a super::super::candidates::OriginAuthority,
@@ -3641,6 +3690,8 @@ fn fixture_with_flight_clock(
         version_unavailable: Cell::new(false),
         blocked_pages: RefCell::new(Default::default()),
         serve_metadata: Cell::new(false),
+        local: Cell::new(LocalReplica::Miss),
+        local_calls: Cell::new(0),
         started_pages: RefCell::new(Vec::new()),
     });
     let (port, engine) = security::pair(worker, 0, config.limits.queue_entries);

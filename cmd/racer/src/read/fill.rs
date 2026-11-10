@@ -2567,6 +2567,22 @@ impl Fill {
         if let Some(local) = self.acquire_local_copy(page, scope, want_plaintext).await? {
             return Ok(local);
         }
+        // Sources cheaper than ranked owners, in racer-core's order. Each miss
+        // or failure falls through to the walk below.
+        let facts = racer_core::read::LocalSourceFacts {
+            adapter: mode.adapter(),
+        };
+        for source in racer_core::read::local_sources(facts) {
+            let found = match source {
+                racer_core::read::LocalSource::AdapterReplica => {
+                    self.acquire_adapter_replica(page, context, scope, want_plaintext)
+                        .await?
+                }
+            };
+            if let Some(found) = found {
+                return Ok(found);
+            }
+        }
         let candidates = self
             .timed(
                 Event::FillCandidatesCount,
@@ -2900,6 +2916,83 @@ impl Fill {
         self.metrics.record(Event::OriginFill, 1);
         self.metrics.record(Event::PassthroughLocalOrigin, 1);
         Ok(result.into())
+    }
+
+    /// Ask this node's own origin adapter for `page` from a copy it holds
+    /// locally (persistence Adapter). A hit is encrypted and published to
+    /// memory exactly like an origin page. A miss, and any failure other than
+    /// cancellation, returns `None` so the fill falls through to peers and the
+    /// remote origin: neither is evidence about the remote origin, so neither
+    /// feeds origin failure notes, link health, or a cached miss.
+    async fn acquire_adapter_replica(
+        &self,
+        page: &PageId,
+        context: &OriginContext,
+        scope: &RequestScope,
+        want_plaintext: bool,
+    ) -> Result<Option<AcquiredPage>> {
+        let attempt = async {
+            scope.check()?;
+            if context.object != page.version.object {
+                return Err(Error::Unauthorized);
+            }
+            let plaintext = if want_plaintext {
+                self.call(
+                    DriverStage::PlaintextReclaim,
+                    self.reserve_network_plaintext(scope, page),
+                )
+                .await?
+            } else {
+                self.observe_reservation(scope, page, FillAdmissionSite::OriginPlaintext, || {
+                    self.reserve_bootstrap(&context.object.cache)
+                })?
+            };
+            let ciphertext =
+                self.observe_reservation(scope, page, FillAdmissionSite::OriginCiphertext, || {
+                    self.reserve_with_reclamation(
+                        &context.object.cache,
+                        ResourceClass::Ciphertext,
+                        self.page_plaintext_bytes()? + 16,
+                    )
+                })?;
+            let Some(origin) = self
+                .call(
+                    DriverStage::OriginCall,
+                    self.dependencies
+                        .origin
+                        .local_page_reserved(context, page, plaintext, scope),
+                )
+                .await?
+            else {
+                return Ok(None);
+            };
+            let result = self
+                .encrypt_origin_page(page, origin, ciphertext, scope)
+                .await?;
+            result.validate_for(page)?;
+            Ok(Some(result))
+        };
+        match attempt.await {
+            Ok(Some(result)) => {
+                self.call(
+                    DriverStage::PublishCall,
+                    self.publish(result.clone(), None, scope),
+                )
+                .await?;
+                self.metrics.record(Event::AdapterLocalHit, 1);
+                Ok(Some(result.into()))
+            }
+            Ok(None) => {
+                self.metrics.record(Event::AdapterLocalMiss, 1);
+                Ok(None)
+            }
+            Err(error @ (Error::Canceled | Error::DeadlineExceeded)) => Err(error),
+            Err(_) => {
+                scope.check()?;
+                self.metrics.record(Event::AdapterLocalFailure, 1);
+                Ok(None)
+            }
+        }
     }
 
     async fn encrypt_origin_page(
