@@ -436,6 +436,7 @@ impl Coordinator {
                         snapshot.page_size,
                     )?;
                     let passthrough = self.fill.passthrough(&origin.object.cache);
+                    let disk = self.fill.disk(&origin.object.cache);
                     let mut body = self.streams.open(
                         metadata.clone(),
                         range,
@@ -445,6 +446,8 @@ impl Coordinator {
                     )?;
                     if passthrough {
                         body.set_passthrough();
+                    } else if !disk {
+                        body.set_no_spill();
                     }
                     body.configure_subscription(page_credits, byte_credits)?;
                     Ok(ReadResponse {

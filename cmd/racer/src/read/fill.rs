@@ -233,9 +233,15 @@ impl Fill {
         self.mode(cache).passthrough()
     }
 
+    /// Whether pages of `cache` may be written to or read from Racer's own
+    /// disk. Passthrough and adapter-persistence caches never use it.
+    pub(crate) fn disk(&self, cache: &racer_wire::control::CacheId) -> bool {
+        self.mode(cache).disk()
+    }
+
     /// The reader's retention decision for `page`: second-sight history when
-    /// `observe`, else ownership only. Passthrough caches never persist and do
-    /// not record history.
+    /// `observe`, else ownership only. Passthrough and adapter-persistence
+    /// caches never persist and do not record history.
     fn retention_observation(
         &self,
         page: &PageId,
@@ -243,7 +249,7 @@ impl Fill {
         observe: bool,
     ) -> crate::retention::Observation {
         let retention = self.dependencies.writer.retention();
-        if self.passthrough(&page.version.object.cache) {
+        if !self.disk(&page.version.object.cache) {
             crate::retention::Observation::never()
         } else if observe {
             retention.observe(page, interest)
@@ -927,6 +933,11 @@ impl Fill {
         scope: &RequestScope,
         reserve: impl Fn(usize) -> Result<flow_control::Charge<AdmissionPolicy>>,
     ) -> Result<Option<(crate::memory::CiphertextCopy, crate::store::ReadToken)>> {
+        // Caches that never write to Racer's disk skip the lookup; a residual
+        // record awaiting the snapshot purge is never served.
+        if !self.disk(&page.version.object.cache) {
+            return Ok(None);
+        }
         let rejected = std::cell::Cell::new(None::<Detail>);
         let result = self
             .dependencies
@@ -1314,7 +1325,7 @@ impl Fill {
         budget: &mut AcquisitionBudget,
         target: &super::sealed::SealedTarget,
     ) -> Result<Option<super::sealed::Fetched>> {
-        if !self.passthrough(&page.version.object.cache)
+        if self.disk(&page.version.object.cache)
             && target.helper()?.cufile()
             && self
                 .dependencies
@@ -3135,7 +3146,7 @@ impl Fill {
         observation: crate::retention::Observation,
         scope: &RequestScope,
     ) {
-        if self.passthrough(&result.metadata.version.object.cache)
+        if !self.disk(&result.metadata.version.object.cache)
             || self
                 .dependencies
                 .writer
@@ -3196,9 +3207,9 @@ impl Fill {
         if !observation.eligible() || copy.validate_metadata().is_err() {
             return;
         }
-        // Defense in depth: a passthrough cache never writes to disk, even
-        // under a decision latched before its mode changed.
-        if self.passthrough(&copy.metadata.version.object.cache) {
+        // Defense in depth: passthrough and adapter-persistence caches never
+        // write to disk, even under a decision latched before a mode change.
+        if !self.disk(&copy.metadata.version.object.cache) {
             return;
         }
         let id = &copy.ciphertext.envelope().page.clone();
@@ -3439,7 +3450,10 @@ impl Fill {
             Ok(()) | Err(Error::Overloaded | Error::Unavailable) => {}
             Err(error) => return Err(error),
         }
-        if let Some(dirty) = dirty {
+        // Adapter-persistence pages stay in memory only.
+        if let Some(dirty) = dirty
+            && self.disk(&result.metadata.version.object.cache)
+        {
             let _ = self
                 .dependencies
                 .writer

@@ -763,13 +763,14 @@ impl StoreWriter {
         Ok(self.segments.lease(location.segment, location.generation)?)
     }
     /// Whether `page` may be queued, published, or served from pending work.
-    /// A passthrough cache retains nothing, so this is rechecked at enqueue
-    /// and again at index publication: a fill that resumes after the
-    /// snapshot purge, or a write in flight across it, never lands on disk.
+    /// Passthrough and adapter-persistence caches never write to Racer's
+    /// disk, so this is rechecked at enqueue and again at index publication:
+    /// a fill that resumes after the snapshot purge, or a write in flight
+    /// across it, never lands on disk.
     fn allowed(&self, page: &CiphertextCopy) -> bool {
         let e = page.ciphertext.envelope();
         let cache = &e.page.version.object.cache;
-        self.availability.page(cache, e.key_id) && !self.availability.passthrough(cache)
+        self.availability.page(cache, e.key_id) && self.availability.disk(cache)
     }
     pub fn enqueue(
         &self,
@@ -987,10 +988,7 @@ impl StoreWriter {
         {
             return Err(Error::InvalidConfiguration);
         }
-        if self
-            .availability
-            .passthrough(&page.metadata.version.object.cache)
-        {
+        if !self.availability.disk(&page.metadata.version.object.cache) {
             return Err(Error::Unavailable);
         }
         if !self.allowed(&page) {
@@ -1140,9 +1138,7 @@ impl StoreWriter {
         };
         let cache = &version.object.cache;
         let allowed = match entry.key {
-            Some(key) => {
-                self.availability.page(cache, key) && !self.availability.passthrough(cache)
-            }
+            Some(key) => self.availability.page(cache, key) && self.availability.disk(cache),
             None => pending
                 .pages
                 .iter()

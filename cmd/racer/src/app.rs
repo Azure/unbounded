@@ -2203,6 +2203,16 @@ impl WorkerApplication {
             .collect();
         self.memory.remove_caches(&passthrough)?;
         self.store.writer.remove_caches(&passthrough)?;
+        // Adapter-persistence caches keep pages in memory only. Like the
+        // passthrough purge, drop their disk records on every changed
+        // snapshot; the purge is idempotent and their fills never write.
+        let adapter: std::collections::HashSet<_> = snapshot
+            .caches
+            .iter()
+            .filter(|new| new.mode.adapter())
+            .map(|new| new.id.clone())
+            .collect();
+        self.store.writer.remove_caches(&adapter)?;
         // Prefetch tickets end with their cache: a passthrough switch cancels
         // them with `passthrough`, and removal, a UID change (a new cache
         // id), or this node leaving the cache's pool with `cache_removed`.

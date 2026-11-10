@@ -1083,11 +1083,12 @@ async fn execute(
 ) -> Result<Value> {
     scope.check()?;
     match work {
-        // Holds and spill fills retain pages, which a passthrough cache never does.
-        Work::Hold(version, ..) if local.fill.passthrough(&version.object.cache) => {
+        // Holds and spill fills retain pages on disk, which passthrough and
+        // adapter-persistence caches never do.
+        Work::Hold(version, ..) if !local.fill.disk(&version.object.cache) => {
             Err(Error::Unavailable)
         }
-        Work::SpillFill(page, ..) if local.fill.passthrough(&page.version.object.cache) => {
+        Work::SpillFill(page, ..) if !local.fill.disk(&page.version.object.cache) => {
             Err(Error::Unavailable)
         }
         Work::PrefetchFill(page, ..) if local.fill.passthrough(&page.version.object.cache) => {
@@ -1137,12 +1138,16 @@ async fn execute(
                     racer_core::prefetch::FailCode::VersionChanged,
                 )));
             }
-            local
-                .fill
-                .dependencies
-                .writer
-                .persist_prefetched(result.copy(), scope)
-                .await?;
+            // An adapter-persistence page is admitted once the fill has
+            // published it to memory; it is never written to Racer's disk.
+            if local.fill.disk(&result.metadata.version.object.cache) {
+                local
+                    .fill
+                    .dependencies
+                    .writer
+                    .persist_prefetched(result.copy(), scope)
+                    .await?;
+            }
             Ok(Value::Prefetched(
                 racer_core::prefetch::PageResult::Admitted,
             ))

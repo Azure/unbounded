@@ -240,6 +240,12 @@ impl Availability {
         self.mode(cache).passthrough()
     }
 
+    /// Whether pages of this cache may be written to or read from Racer's own
+    /// disk. Passthrough and adapter-persistence caches never use it.
+    pub fn disk(&self, cache: &CacheId) -> bool {
+        self.mode(cache).disk()
+    }
+
     /// Require both cache admission and an active page key for metadata reads.
     pub fn metadata(&self, cache: &CacheId) -> bool {
         self.cache(cache) && self.keys.has_active(cache, KeyPurpose::Page)

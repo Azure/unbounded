@@ -6240,6 +6240,34 @@ fn passthrough_cache_never_enqueues_or_publishes_to_disk() {
         assert!(index.lookup(&id).unwrap().is_none(), "{mode:?}");
     }
 }
+/// An adapter-persistence cache keeps pages in memory only: like
+/// passthrough, a write queued before the switch never publishes, and a
+/// later fill cannot enqueue.
+#[test]
+fn adapter_cache_never_enqueues_or_publishes_to_disk() {
+    use racer_wire::control::CacheMode;
+    let simulation = racer_io::sim::SimOs::new();
+    let env = racer_io::Env::sim(&simulation, racer_io::WorkerCtx::host());
+    let availability = crate::test_support::availability(&env);
+    let f = Fixture::assemble(&env, Directory::new(), availability.clone());
+    let _ = futures::executor::block_on(f.store.open()).unwrap();
+    f.reactor.init().unwrap();
+    let index = f.store.writer.index().clone();
+    let copy = f.copy(1, 113);
+    let id = copy.ciphertext.envelope().page.clone();
+    let cache = id.version.object.cache.clone();
+    availability.publish_modes(&env, vec![(cache.clone(), CacheMode::Cached)]);
+    f.enqueue(copy.clone()).unwrap();
+    availability.publish_modes(&env, vec![(cache.clone(), CacheMode::Adapter)]);
+    assert!(f.store.writer.copy_only(&id).unwrap().is_none());
+    assert!(f.store.writer.metadata(&id.version).unwrap().is_none());
+    drive(&f.reactor, f.store.writer.progress(8, &scope(&env))).unwrap();
+    assert!(index.lookup(&id).unwrap().is_none());
+    f.store.writer.remove_cache(&cache).unwrap();
+    assert_eq!(f.enqueue(copy), Err(Error::Unavailable));
+    assert_eq!(f.store.writer.pending_count(), 0);
+    assert!(index.lookup(&id).unwrap().is_none());
+}
 #[test]
 fn warm_disk_reads_reuse_pooled_buffers_charged_to_pool_class() {
     let env = racer_io::Env::host();

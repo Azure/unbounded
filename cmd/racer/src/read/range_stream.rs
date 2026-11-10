@@ -555,6 +555,10 @@ pub struct RangeStream {
     /// The cache retains nothing: no peer selections and no spill holds.
     passthrough: bool,
 
+    /// The cache never writes to Racer's disk, so the read never spills
+    /// early pages to disk holds; its in-memory window still selects.
+    no_spill: bool,
+
     error: Option<Error>,
 
     lease: Option<WindowLease>,
@@ -678,6 +682,7 @@ impl RangeStreams {
         Ok(RangeStream {
             drivers: self.drivers.clone(),
             passthrough: false,
+            no_spill: false,
             error: None,
             lease: None,
             credits: None,
@@ -725,6 +730,14 @@ impl RangeStream {
         self.window = None;
     }
 
+    /// Never spill pages past the window to disk holds, for a cache whose
+    /// pages stay in memory only. Pages past the window are then fetched as
+    /// the window advances, as with spill disabled by configuration. Call
+    /// before the subscription is configured.
+    pub(crate) fn set_no_spill(&mut self) {
+        self.no_spill = true;
+    }
+
     /// Install exact page/byte release credits once, before delivery. The fetch
     /// window is the configured `range_window_pages`, further limited by the
     /// client's unreleased credits.
@@ -748,7 +761,11 @@ impl RangeStream {
         self.lease = Some(lease);
         self.facts.leased = true;
         let limit = self.directory.spill_config().range_spill_pages;
-        self.spill = if self.passthrough { 0 } else { limit };
+        self.spill = if self.passthrough || self.no_spill {
+            0
+        } else {
+            limit
+        };
         self.window = None;
         Ok(())
     }
