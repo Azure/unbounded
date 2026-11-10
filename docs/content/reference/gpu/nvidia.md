@@ -22,7 +22,10 @@ Before the agent can expose GPUs, the **host VM** must have:
 3. **Fabric Manager running** (NVSwitch-based GPUs only). H100, H200, and
    multi-GPU ND A100 systems require the `nvidia-fabricmanager` service.
    Without it, CUDA initialization fails with error 802
-   (`SYSTEM_DRIVER_MISMATCH`).
+   (`SYSTEM_DRIVER_MISMATCH`). B200 and later NVSwitch systems also need
+   NVLSM and the `ib_umad` module. The
+   [NVSwitch host image]({{< relref "reference/gpu/nvswitch-host-image" >}})
+   ships all of these for bare metal.
 4. **Persistence mode enabled.** `nvidia-smi -pm 1` keeps the driver loaded
    between GPU process invocations and avoids cold-start latency.
 
@@ -188,12 +191,16 @@ open flavor supports Turing and later GPUs only.
 - **GPUDirect RDMA (dma-buf).** Needs the open kernel module, Linux 5.12 or
   later, and rdma-core 34 or later. No extra module is needed. The Azure Linux
   NVIDIA host image (`host-azurelinux3-nvidia`) installs `cuda-open-hwe`,
-  which is the open flavor.
+  which is the open flavor. The Ubuntu NVSwitch host image
+  (`host-ubuntu2404-nvidia`) installs `nvidia-headless-open`, also the open
+  flavor.
 - **GPUDirect Storage.** On local NVMe with ext4 or xfs, prefer the kernel's
   PCI P2PDMA path: Linux 6.2 or later, the open driver, and cuFile 1.13
   (CUDA 12.8) or later. It needs no `nvidia-fs`. The `nvidia-fs` path to local
   NVMe also needs NVMe patches from MLNX_OFED or DOCA. The Azure Linux host
   images do not install `nvidia-fs`; its repository has no package for it.
+  The Ubuntu NVSwitch host image does not install it either; see
+  [GPUDirect Storage]({{< relref "reference/gpu/nvswitch-host-image#gpudirect-storage" >}}).
   cuFile uses P2PDMA only when asked: for Racer, set
   `RACER_GPU_PCI_P2PDMA=true` in `racer-settings`.
 
@@ -234,6 +241,10 @@ multi-GPU systems (H100, H200, ND A100):
 sudo systemctl status nvidia-fabricmanager
 sudo systemctl start nvidia-fabricmanager
 ```
+
+On B200 and later systems, Fabric Manager also starts NVLSM. If it fails, check
+that `ib_umad` is loaded and that `ibstat` lists the NVSwitch ports. See
+[Smoke tests]({{< relref "reference/gpu/nvswitch-host-image#smoke-tests" >}}).
 
 ### `nvidia-ctk cdi generate` fails with `ERROR_LIBRARY_NOT_FOUND`
 
