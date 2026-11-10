@@ -450,6 +450,60 @@ impl StoreWriter {
         scope: &'a RequestScope,
     ) -> Operation<'a, WrittenEntry> {
         Box::pin(async move {
+            self.persist_inner(page, session, hold_until, None, scope)
+                .await?
+                .ok_or(Error::Unavailable)
+        })
+    }
+
+    /// Replace the record of written page `page` with `page` (the same
+    /// plaintext sealed under another key), keeping its session and hold:
+    /// write and journal the new record, then unpin the old one, which stays
+    /// on disk as evictable cache. Used by rekeying (WP8). Returns `None` when
+    /// the page is not written here, or was released while the new record
+    /// was written (the new record is then released too).
+    ///
+    /// Errors as [`Self::persist_written`]; `InvalidRequest` when the copy
+    /// uses the key the current record already uses.
+    pub fn rekey_written<'a>(
+        &'a self,
+        page: CiphertextCopy,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, Option<WrittenEntry>> {
+        Box::pin(async move {
+            let id = page.ciphertext.envelope().page.clone();
+            let Some(existing) = self.writes.get(&id) else {
+                return Ok(None);
+            };
+            if self
+                .index
+                .lookup(&id)?
+                .is_some_and(|indexed| indexed.key_id == page.ciphertext.envelope().key_id)
+            {
+                return Err(Error::InvalidRequest);
+            }
+            self.persist_inner(
+                page,
+                existing.session,
+                existing.hold_until,
+                Some(existing.location),
+                scope,
+            )
+            .await
+        })
+    }
+
+    /// [`Self::persist_written`], or with `replace` (the location of the
+    /// record being replaced) a forced rewrite for [`Self::rekey_written`].
+    async fn persist_inner(
+        &self,
+        page: CiphertextCopy,
+        session: SessionId,
+        hold_until: SystemTime,
+        replace: Option<RecordLocation>,
+        scope: &RequestScope,
+    ) -> Result<Option<WrittenEntry>> {
+        {
             scope.check()?;
             super::logical_length(&page)?;
             let journal = self.writes.journal()?;
@@ -465,7 +519,8 @@ impl StoreWriter {
                 return Err(Error::MissingKey);
             }
             let key = page_key(&id)?;
-            if let Some(existing) = self.writes.get(&id)
+            if replace.is_none()
+                && let Some(existing) = self.writes.get(&id)
                 && let Some(indexed) = self.index.lookup(&id)?
                 && indexed.location == existing.location
             {
@@ -475,7 +530,7 @@ impl StoreWriter {
                 if hold_until > existing.hold_until {
                     self.set_written_hold(&id, hold_until).await?;
                 }
-                return self.writes.get(&id).ok_or(Error::Unavailable);
+                return self.writes.get(&id).ok_or(Error::Unavailable).map(Some);
             }
             let _persisting = self.writes.begin(&id)?;
             let alignment = self.slabs.alignment()?;
@@ -545,6 +600,29 @@ impl StoreWriter {
                     Some(descriptor),
                 )
                 .await?;
+            if let Some(replaced) = &replace
+                && self
+                    .writes
+                    .get(&id)
+                    .is_none_or(|current| current.location != *replaced)
+            {
+                // Released (or replaced) while this record was written: the
+                // new Page record must not resurrect the pin.
+                let key = page_key(&id)?;
+                journal
+                    .append(
+                        JournalRecord::PageRelease {
+                            cache: key.cache,
+                            key: key.key,
+                            etag: key.etag,
+                            page: key.page,
+                        },
+                        None,
+                    )
+                    .await?;
+                drop(ticket);
+                return Ok(None);
+            }
             // Durable: pin before anything else can fail.
             self.index
                 .pin_segment(location.segment, self.segments.count())?;
@@ -577,8 +655,8 @@ impl StoreWriter {
             self.retention()
                 .published(&id, u64::from(envelope.plaintext_length));
             drop(sync_lease);
-            Ok(entry)
-        })
+            Ok(Some(entry))
+        }
     }
 
     /// Release a written page once its object is uploaded or committed

@@ -6552,6 +6552,90 @@ mod written {
 
     use std::time::UNIX_EPOCH;
 
+    /// A rekey writes the page under the new key as a new record, keeps its
+    /// session and hold, moves the pin, and survives a restart; it refuses a
+    /// copy under the current key and pages not written here.
+    #[test]
+    fn rekey_replaces_the_record_and_moves_the_pin() {
+        use crate::test_support::security::keys;
+        use crate::test_support::security::rotation_bundle;
+        use racer_wire::control::CacheKeyPurpose;
+        use racer_wire::control::CacheKeyState;
+        let (simulation, env) = sim();
+        let keys = Rc::new(keys(&env));
+        let roots = (*keys.peer_trust_roots().unwrap()).clone();
+        let cache = CacheId(crate::test_support::security::CACHE.into());
+        let availability = crate::control::for_caches(&env, keys.clone(), vec![cache.clone()]);
+        let f = Fixture::assemble(&env, Directory::new(), availability);
+        open(&f);
+        recover(&f, &env, LAYOUT, COMPACT);
+        let copy = f.copy(1, 100);
+        let page = id(&copy);
+        let old_key = copy.ciphertext.envelope().key_id;
+        let before = persist(&f, &env, copy.clone()).unwrap();
+        let rekey = |copy: CiphertextCopy| {
+            drive(&f.reactor, f.store.writer.rekey_written(copy, &scope(&env)))
+        };
+        // The current key: nothing to do.
+        assert_eq!(rekey(copy.clone()).err(), Some(Error::InvalidRequest));
+        // Rotate: generation 2 is active, generation 1 decrypt-only.
+        let mut bundle = rotation_bundle(2, roots);
+        let mut old = None;
+        for record in &bundle.cache_keys {
+            if record.key.purpose == CacheKeyPurpose::Page {
+                old = Some(record.key.clone());
+            }
+        }
+        let new_key = old.unwrap().id;
+        bundle
+            .cache_keys
+            .push(racer_wire::control::CacheEncryptionKey::new(
+                racer_wire::control::CacheKeyRef {
+                    cache: cache.clone(),
+                    id: old_key,
+                    purpose: CacheKeyPurpose::Page,
+                },
+                CacheKeyState::Decrypt,
+                zeroize::Zeroizing::new([7; 32]),
+            ));
+        keys.install(bundle).unwrap();
+        let mut fresh = f.copy(1, 100);
+        std::sync::Arc::get_mut(&mut fresh.ciphertext.inner)
+            .unwrap()
+            .envelope
+            .key_id = new_key;
+        let after = rekey(fresh.clone()).unwrap().unwrap();
+        assert_ne!(after.location, before.location);
+        assert_eq!(after.session, before.session);
+        assert_eq!(after.hold_until, before.hold_until);
+        let index = f.store.writer.index();
+        let indexed = index.lookup(&page).unwrap().unwrap();
+        assert_eq!(indexed.location, after.location);
+        assert_eq!(indexed.key_id, new_key);
+        assert_eq!(f.store.writer.written(&page), Some(after.clone()));
+        if after.location.segment != before.location.segment {
+            assert_eq!(index.segment_pins(before.location.segment), 0);
+        }
+        assert_eq!(index.segment_pins(after.location.segment), 1);
+        assert_eq!(f.store.writer.written_pages().len(), 1);
+        // A page not written here is not rekeyed.
+        let mut other = f.copy(2, 100);
+        std::sync::Arc::get_mut(&mut other.ciphertext.inner)
+            .unwrap()
+            .envelope
+            .key_id = new_key;
+        assert_eq!(rekey(other).unwrap(), None);
+        // The journal replays the new record.
+        let f = f.restart_after(&env, || simulation.disk().crash().unwrap());
+        open(&f);
+        let recovered = recover(&f, &env, LAYOUT, COMPACT);
+        assert!(recovered.lost.is_empty(), "{:?}", recovered.lost);
+        assert_eq!(
+            f.store.writer.written(&page).map(|e| e.location),
+            Some(after.location)
+        );
+    }
+
     #[test]
     fn writes_need_a_recovered_journal() {
         let (_simulation, env) = sim();
