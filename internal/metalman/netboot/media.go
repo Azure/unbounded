@@ -594,22 +594,47 @@ func writeMediaTree(root string, files []mediaFile) error {
 			return err
 		}
 
-		data := f.Data
 		if f.From != "" {
-			var err error
-
-			data, err = os.ReadFile(f.From)
-			if err != nil {
+			if err := copyMediaFile(dst, f.From); err != nil {
 				return err
 			}
+
+			continue
 		}
 
-		if err := os.WriteFile(dst, data, 0o600); err != nil {
+		if err := os.WriteFile(dst, f.Data, 0o600); err != nil {
 			return err
 		}
 	}
 
 	return nil
+}
+
+// copyMediaFile streams src into dst so memory use stays bounded regardless
+// of artifact size (kernels and initrds can be ~100 MB).
+func copyMediaFile(dst, src string) (err error) {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close() //nolint:errcheck // Read-only source.
+
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+
+	defer func() {
+		if cerr := out.Close(); err == nil {
+			err = cerr
+		}
+	}()
+
+	if _, err := io.Copy(out, in); err != nil {
+		return fmt.Errorf("copy %s: %w", src, err)
+	}
+
+	return out.Sync()
 }
 
 // normalizeMediaFAT removes wall-clock directory timestamps, without touching
