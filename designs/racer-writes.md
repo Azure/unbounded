@@ -1343,6 +1343,17 @@ Tests: with torch installed, save and load a small state dict through the fake
 server; `.metadata` written strictly after all data files; upload mode selection
 by step; incomplete checkpoint detection.
 
+As implemented: the constructor is `RacerStorageWriter(client, bucket, prefix,
+checkpoint_id=None, *, step, persist_every=0, replicas=2, hold_seconds=None,
+retry_busy=0.0)`; `checkpoint_id` may come from `dcp.save(checkpoint_id=...)`
+through `reset`. Each rank writes one data object, `__<rank>_0.distcp`, with
+`host_write` from a memfd (tensors are serialized with `torch.save`, as
+`FileSystemWriter` does). `.metadata` is a pickled DCP `Metadata` sent with
+`write`. The reader reads each item's byte range pinned to the data object's
+ETag, raises `IncompleteCheckpoint` (a `RacerError` and `FileNotFoundError`)
+when `.metadata` is missing, and offers `is_complete()`. Re-saving an existing
+`checkpoint_id` fails with `Exists` (create-once).
+
 ### WP11: simulation and e2e
 
 Files: new `cmd/racer/src/app/dst/writes.rs` (traffic and faults);

@@ -77,6 +77,42 @@ limits into tickets `<id>.0`, `<id>.1`, and so on. Rejections raise
 `PrefetchError` with `status`, `code` (for example `stale_sequence`),
 `message`, and `retry_after`.
 
+## Writing
+
+```python
+request = racer.object_request("ckpt", "runs/a/step-100/weights.bin")
+result = client.write(request, data, replicas=2, upload="never", hold_seconds=3600)
+result = client.host_write(request, buf.fileno(), 0, buf.size)  # SCM_RIGHTS, no socket copy
+state = client.persist(request)  # start the upload of a "manual" object
+client.delete(request)
+```
+
+On a cache with writes enabled, `write` creates an object from bytes or a
+binary file. `host_write` creates one from a window of a memfd or regular
+file. Writes are create-once: an existing key raises `Exists`. The call
+returns after Racer has `replicas` durable cache copies, or after the origin
+upload with `durability_origin=True`. `upload` is `auto`, `manual`, or
+`never`. `stat` reports `upload_state` for written objects. Failures raise
+`WriteError` subclasses: `Exists`, `WritesDisabled`, `Busy` (pass
+`retry_busy=seconds` to retry), `UploadFailed`, and `Conflict`. Write
+requests must not name a `version_id`.
+
+### PyTorch Distributed Checkpoint
+
+```python
+from racer.dcp import RacerStorageReader, RacerStorageWriter
+
+writer = RacerStorageWriter(client, "ckpt", "runs/a", step=step, persist_every=10)
+dcp.save(state_dict, checkpoint_id=f"step-{step}", storage_writer=writer)
+dcp.load(state_dict, checkpoint_id=f"step-{step}", storage_reader=RacerStorageReader(client, "ckpt", "runs/a"))
+```
+
+Install with the `dcp` extra (`torch>=2.4`). Each rank writes one data
+object with `replicas=2`, and the coordinator writes `.metadata` last.
+Every `persist_every`-th step is uploaded to the origin, and other steps
+stay cache-only. A checkpoint without `.metadata` is incomplete:
+`RacerStorageReader` raises `IncompleteCheckpoint`.
+
 ## Object keys
 
 `object_key(bucket, key, version_id)` gives the same 64-hex key as

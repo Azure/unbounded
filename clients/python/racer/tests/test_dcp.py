@@ -1,0 +1,192 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+"""DCP storage plug-in tests (designs/racer-writes.md, WP10). Skipped without torch."""
+
+import subprocess
+import sys
+import warnings
+
+import pytest
+
+import racer
+
+
+def test_racer_does_not_import_torch():
+    code = "import sys, racer; assert 'torch' not in sys.modules and 'racer.dcp' not in sys.modules"
+    subprocess.run([sys.executable, "-c", code], check=True, timeout=60)
+
+
+torch = pytest.importorskip("torch")
+dcp = pytest.importorskip("torch.distributed.checkpoint")
+
+from torch.distributed.checkpoint.api import CheckpointException  # noqa: E402
+
+from racer import dcp as rdcp  # noqa: E402
+
+
+def rank0_failure(call):
+    """Run a DCP call that must fail and return rank 0's exception."""
+    with pytest.raises(CheckpointException) as e:
+        call()
+    return e.value.failures[0][0]
+
+BUCKET = "ckpt"
+PREFIX = "runs/a"
+
+
+@pytest.fixture
+def client(server):
+    return racer.Client(socket_path=server.path, timeout=10)
+
+
+def state():
+    base = torch.arange(64, dtype=torch.float32).reshape(8, 8)
+    return {
+        "w": torch.randn(16, 4),
+        "b": torch.arange(10, dtype=torch.int64),
+        "h": torch.ones(3, dtype=torch.bfloat16),
+        "view": base[2:4],  # a view of a larger storage
+        "t": base.t(),  # non-contiguous
+        "step": 7,
+        "name": "model",
+    }
+
+
+def blank(s):
+    return {k: torch.zeros_like(v) if isinstance(v, torch.Tensor) else None for k, v in s.items()}
+
+
+def save(client, sd, checkpoint_id, **kw):
+    kw.setdefault("step", 1)
+    writer = rdcp.RacerStorageWriter(client, BUCKET, PREFIX, **kw)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        dcp.save(sd, checkpoint_id=checkpoint_id, storage_writer=writer)
+    return writer
+
+
+def load(client, sd, checkpoint_id):
+    reader = rdcp.RacerStorageReader(client, BUCKET, PREFIX)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        dcp.load(sd, checkpoint_id=checkpoint_id, storage_reader=reader)
+    return reader
+
+
+def key(name, checkpoint_id="c1"):
+    return rdcp.checkpoint_request(BUCKET, PREFIX, checkpoint_id, name).hex
+
+
+def test_save_load_round_trip(server, client):
+    sd = state()
+    writer = save(client, sd, "c1")
+    assert writer.written == ["__0_0.distcp", ".metadata"]
+    out = blank(sd)
+    load(client, out, "c1")
+    for k, v in sd.items():
+        if isinstance(v, torch.Tensor):
+            assert torch.equal(out[k], v), k
+        else:
+            assert out[k] == v, k
+
+
+def test_metadata_is_written_last_with_replicas_2(server, client):
+    save(client, state(), "c1")
+    data = server.written[key("__0_0.distcp")]
+    meta = server.written[key(".metadata")]
+    assert meta.seq > data.seq
+    assert max(w.seq for w in server.written.values()) == meta.seq
+    assert data.replicas == meta.replicas == 2
+    assert data.kind == "host-write" and meta.kind == "put"
+    metadata = server.written[key(".metadata")].metadata
+    assert metadata == racer.canonical_json(BUCKET, f"{PREFIX}/c1/.metadata")
+
+
+@pytest.mark.parametrize(
+    "step,every,mode",
+    [(0, 0, "never"), (3, 0, "never"), (3, 3, "auto"), (4, 3, "never"), (6, 3, "auto"), (5, 1, "auto")],
+)
+def test_upload_mode_by_step(server, client, step, every, mode):
+    assert rdcp.upload_mode(step, every) == mode
+    cid = f"s{step}-{every}"
+    save(client, state(), cid, step=step, persist_every=every, hold_seconds=600)
+    for name in ("__0_0.distcp", ".metadata"):
+        w = server.written[key(name, cid)]
+        assert w.upload == mode and w.hold_seconds == 600
+        assert w.state == ("pending" if mode == "auto" else "never")
+
+
+def test_upload_mode_rejects_negative():
+    with pytest.raises(racer.RacerError):
+        rdcp.upload_mode(1, -1)
+
+
+def test_incomplete_checkpoint(server, client):
+    save(client, state(), "c1")
+    reader = rdcp.RacerStorageReader(client, BUCKET, PREFIX, "c1")
+    assert reader.is_complete()
+    client.delete(rdcp.checkpoint_request(BUCKET, PREFIX, "c1", ".metadata"))
+    assert not reader.is_complete()
+    err = rank0_failure(lambda: load(client, blank(state()), "c1"))
+    assert "has no .metadata" in str(err)
+    with pytest.raises(rdcp.IncompleteCheckpoint):
+        reader.read_metadata()
+    with pytest.raises(FileNotFoundError):
+        reader.read_metadata()
+
+
+def test_failed_data_write_leaves_no_metadata(server, client):
+    def reject(kind, k, headers):
+        return (503, "dirty-cap", 1) if kind == "host-write" else None
+
+    server.write_reject = reject
+    assert isinstance(rank0_failure(lambda: save(client, state(), "c1")), racer.Busy)
+    assert key(".metadata") not in server.written
+    assert not rdcp.RacerStorageReader(client, BUCKET, PREFIX, "c1").is_complete()
+
+
+def test_checkpoints_are_create_once(server, client):
+    save(client, state(), "c1")
+    assert isinstance(rank0_failure(lambda: save(client, state(), "c1")), racer.Exists)
+
+
+def test_separate_checkpoints_do_not_collide(server, client):
+    a, b = state(), state()
+    save(client, a, "c1")
+    save(client, b, "c2", step=2)
+    out = blank(b)
+    load(client, out, "c2")
+    assert torch.equal(out["w"], b["w"]) and not torch.equal(out["w"], a["w"])
+
+
+def test_writer_needs_checkpoint_id(client):
+    writer = rdcp.RacerStorageWriter(client, BUCKET, PREFIX, step=0)
+    with pytest.raises(racer.RacerError):
+        writer.request(".metadata")
+    assert not rdcp.RacerStorageWriter.validate_checkpoint_id("c1")
+    assert not rdcp.RacerStorageReader.validate_checkpoint_id("c1")
+
+
+def test_checkpoint_request_paths():
+    assert rdcp.checkpoint_request("b", "/p/", "c", "x").metadata == racer.canonical_json("b", "p/c/x")
+    assert rdcp.checkpoint_request("b", "", "c", "x").metadata == racer.canonical_json("b", "c/x")
+
+
+def test_multi_rank_save_load(server, tmp_path, small_pages):
+    # torch.distributed object collectives need numpy.
+    pytest.importorskip("numpy")
+    import torch.multiprocessing as mp
+
+    import dcp_worker
+
+    mp.spawn(
+        dcp_worker.save_and_load,
+        args=(2, str(tmp_path / "store"), server.path, small_pages),
+        nprocs=2,
+        join=True,
+    )
+    names = {rdcp.checkpoint_request(BUCKET, "runs/m", "multi", n).hex: n for n in ("__0_0.distcp", "__1_0.distcp", ".metadata")}
+    seqs = {names[k]: w.seq for k, w in server.written.items() if k in names}
+    assert set(seqs) == set(names.values())
+    assert seqs[".metadata"] > max(seqs["__0_0.distcp"], seqs["__1_0.distcp"])
+    assert all(server.written[k].upload == "auto" for k in names)
