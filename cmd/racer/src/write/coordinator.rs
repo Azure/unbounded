@@ -300,7 +300,7 @@ async fn open(
     ) {
         return Ok(WriteReply::Exists);
     }
-    if local.availability.native_origin(&object.cache) {
+    if super::native_origin(local, &object.cache) {
         match origin_has(local, context, membership, scope).await {
             Ok(false) => {}
             Ok(true) => {
@@ -332,10 +332,7 @@ async fn origin_has(
         &context.object,
         PageNumber(0),
     )?;
-    match local
-        .fill
-        .dependencies
-        .origin
+    match super::origin(local)
         .metadata(&authority, context, MetadataSelector::Fresh, scope)
         .await
     {

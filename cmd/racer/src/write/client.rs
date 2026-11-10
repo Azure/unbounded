@@ -55,6 +55,16 @@ use std::time::Duration;
 /// Smallest request budget of a write; large objects stream for a while.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(3600);
 
+/// Retries of a store refused by a busy target or link (peer admission or
+/// connection limits, which shed rather than queue).
+const BUSY_RETRIES: u32 = 30;
+
+/// First wait between those retries; it doubles up to [`BUSY_WAIT_MAX`].
+const BUSY_WAIT: Duration = Duration::from_millis(2);
+
+/// Longest wait between those retries.
+const BUSY_WAIT_MAX: Duration = Duration::from_millis(100);
+
 /// Longest `status` long poll of an `origin`-durability write.
 const STATUS_WAIT_MILLIS: u32 = 30_000;
 
@@ -432,7 +442,7 @@ fn spec(
     };
     if options.length == 0
         || (durability == Durability::Origin && upload != UploadMode::Auto)
-        || (upload != UploadMode::Never && !local.availability.native_origin(&object.cache))
+        || (upload != UploadMode::Never && !super::native_origin(local, &object.cache))
     {
         return Err(Reject::new(400));
     }
@@ -475,8 +485,9 @@ struct Write<'a> {
     store: WriteStore,
 }
 
-/// A page's placement: its holders, or why it could not be placed.
-type Placed = (u64, std::result::Result<Vec<NodeId>, Reject>);
+/// A page's placement: the targets that stored it, and why it could not be
+/// placed on enough of them.
+type Placed = (u64, Vec<NodeId>, Option<Reject>);
 
 #[allow(clippy::too_many_arguments)]
 async fn create(
@@ -611,51 +622,82 @@ impl Write<'_> {
         placed: &mut Vec<Vec<NodeId>>,
         scope: &RequestScope,
     ) -> std::result::Result<(), Reject> {
+        let mut slots: Vec<Vec<NodeId>> = vec![Vec::new(); self.spec.pages() as usize];
+        let result = self
+            .stream_into(source, coordinator, context, &mut slots, scope)
+            .await;
+        // Every started placement finished; its targets are known even when
+        // the write failed, so an abort releases them.
+        placed.extend(slots);
+        result
+    }
+
+    async fn stream_into(
+        &self,
+        source: &mut Source<'_>,
+        coordinator: &NodeId,
+        context: &OriginContext,
+        slots: &mut [Vec<NodeId>],
+        scope: &RequestScope,
+    ) -> std::result::Result<(), Reject> {
         let pages = self.spec.pages();
         let window = self.local.writes.settings().window_pages.max(1) as usize;
         let lease = self.local.writes.settings().lease;
         let clock = scope.clock().clone();
         let mut renewed = clock.now();
-        let mut slots: Vec<Option<Vec<NodeId>>> = vec![None; pages as usize];
         let mut inflight: FuturesUnordered<Pin<Box<dyn Future<Output = Placed> + '_>>> =
             FuturesUnordered::new();
         let mut failure = None;
         for page in 0..pages {
             while inflight.len() >= window {
                 if let Some(done) = inflight.next().await {
-                    settle(done, &mut failure, &mut slots);
+                    settle(done, &mut failure, slots);
                 }
             }
-            if let Some(reject) = failure {
-                return Err(reject);
+            if failure.is_some() {
+                break;
             }
             let length = self.page_length(page);
-            let plaintext = self.plaintext(length)?;
+            let plaintext = match self.plaintext(length) {
+                Ok(plaintext) => plaintext,
+                Err(reject) => {
+                    failure.get_or_insert(reject);
+                    break;
+                }
+            };
             // Read the page while placed pages keep moving.
             let read = read_page(source, plaintext, page, self.spec.page_size, scope);
             let mut read = std::pin::pin!(read);
             let plaintext = std::future::poll_fn(|cx| {
                 while let Poll::Ready(Some(done)) = inflight.poll_next_unpin(cx) {
-                    settle(done, &mut failure, &mut slots);
+                    settle(done, &mut failure, slots);
                 }
                 read.as_mut().poll(cx)
             })
-            .await
-            .map_err(|_| Reject::new(400))?;
+            .await;
+            let plaintext = match plaintext {
+                Ok(plaintext) => plaintext,
+                Err(_) => {
+                    failure.get_or_insert(Reject::new(400));
+                    break;
+                }
+            };
             inflight.push(Box::pin(self.place(page, plaintext, scope)));
             if clock.now().saturating_duration_since(renewed) >= lease / 3 {
                 renewed = clock.now();
-                self.renew(coordinator, context, scope).await?;
+                if let Err(reject) = self.renew(coordinator, context, scope).await {
+                    failure.get_or_insert(reject);
+                    break;
+                }
             }
         }
         while let Some(done) = inflight.next().await {
-            settle(done, &mut failure, &mut slots);
+            settle(done, &mut failure, slots);
         }
-        if let Some(reject) = failure {
-            return Err(reject);
+        match failure {
+            Some(reject) => Err(reject),
+            None => Ok(()),
         }
-        placed.extend(slots.into_iter().map(Option::unwrap_or_default));
-        Ok(())
     }
 
     fn page_length(&self, page: u64) -> usize {
@@ -710,15 +752,21 @@ impl Write<'_> {
     /// Encrypt and stage one page, then place it on `replicas` ranked
     /// targets, trying deeper ranks when one cannot store it.
     async fn place(&self, page: u64, plaintext: PlaintextBuffer, scope: &RequestScope) -> Placed {
-        (page, self.place_inner(page, plaintext, scope).await)
+        let mut holders = Vec::new();
+        let failure = self
+            .place_inner(page, plaintext, &mut holders, scope)
+            .await
+            .err();
+        (page, holders, failure)
     }
 
     async fn place_inner(
         &self,
         page: u64,
         plaintext: PlaintextBuffer,
+        holders: &mut Vec<NodeId>,
         scope: &RequestScope,
-    ) -> std::result::Result<Vec<NodeId>, Reject> {
+    ) -> std::result::Result<(), Reject> {
         let deps = &self.local.fill.dependencies;
         let id = page_id(&self.version, page);
         let length = racer_io::ring::IoBuffer::bytes(&plaintext)
@@ -762,7 +810,6 @@ impl Write<'_> {
             .take(RANKED_DEPTH)
             .collect();
         let replicas = usize::from(self.spec.replicas);
-        let mut holders = Vec::new();
         let mut full = false;
         let first = candidates.len().min(replicas);
         let outcomes =
@@ -793,7 +840,7 @@ impl Write<'_> {
                 error_token::OWNERS
             }));
         }
-        Ok(holders)
+        Ok(())
     }
 
     /// Ask `node` to store `page`: `Ok(true)` stored, `Ok(false)` full.
@@ -811,19 +858,45 @@ impl Write<'_> {
             }),
         };
         let context = super::bare_context(&self.version.object);
-        match send(
-            self.local,
-            &self.membership,
-            node,
-            operation,
-            &context,
-            scope,
-        )
-        .await
-        {
-            Ok(WriteReply::Stored { pages }) if pages.contains(&page) => Ok(true),
-            Ok(WriteReply::Full) | Err(Error::Overloaded) => Ok(false),
-            _ => Err(()),
+        let clock = scope.clock().clone();
+        let mut attempt = 0;
+        loop {
+            let reply = send(
+                self.local,
+                &self.membership,
+                node,
+                Self::copy_store(&operation),
+                &context,
+                scope,
+            )
+            .await;
+            match reply {
+                Ok(WriteReply::Stored { pages }) if pages.contains(&page) => return Ok(true),
+                Ok(WriteReply::Full) => return Ok(false),
+                // A busy target or link (peer admission, connection limits):
+                // back off briefly and ask again.
+                Err(Error::Overloaded | Error::FlightFull) if attempt < BUSY_RETRIES => {
+                    attempt += 1;
+                    let Some(reactor) = self.local.writes.reactor() else {
+                        return Err(());
+                    };
+                    let until = clock.now() + (BUSY_WAIT * (1 << attempt.min(6))).min(BUSY_WAIT_MAX);
+                    if reactor.sleep_until(until, scope).await.is_err() {
+                        return Err(());
+                    }
+                }
+                _ => return Err(()),
+            }
+        }
+    }
+
+    fn copy_store(operation: &PeerOperation) -> PeerOperation {
+        match operation {
+            PeerOperation::WriteStore { version, store } => PeerOperation::WriteStore {
+                version: version.clone(),
+                store: store.clone(),
+            },
+            _ => unreachable!("only write-store is retried"),
         }
     }
 
@@ -973,13 +1046,12 @@ impl Write<'_> {
     }
 }
 
-/// Record one placed page, or the first failure.
-fn settle(done: Placed, failure: &mut Option<Reject>, slots: &mut [Option<Vec<NodeId>>]) {
-    match done.1 {
-        Ok(holders) => slots[done.0 as usize] = Some(holders),
-        Err(reject) => {
-            failure.get_or_insert(reject);
-        }
+/// Record one placed page's targets, and the first failure.
+fn settle(done: Placed, failure: &mut Option<Reject>, slots: &mut [Vec<NodeId>]) {
+    let (page, holders, reject) = done;
+    slots[page as usize] = holders;
+    if let Some(reject) = reject {
+        failure.get_or_insert(reject);
     }
 }
 

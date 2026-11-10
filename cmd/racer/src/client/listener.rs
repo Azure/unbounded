@@ -1008,6 +1008,16 @@ async fn serve_connection(
                 )
                 .await;
             }
+            // A cache without writes answers every write route like a node
+            // that predates writes: 405 with `Allow: HEAD, POST`.
+            Ok(request) if racer_wire::object::write::is_write(&request.head) => {
+                drop(request.descriptors);
+                observation.fail(Error::MethodNotAllowed);
+                responses
+                    .send_error(connection, Error::MethodNotAllowed, scope)
+                    .await?;
+                return Ok(());
+            }
             other => other,
         };
         // Every descriptor must be claimed by a direct read; the rest close here.

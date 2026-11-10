@@ -131,6 +131,10 @@ pub struct WriteService {
     loaded: Cell<bool>,
     next_tick: Cell<Option<Instant>>,
     ticking: Rc<Cell<bool>>,
+    /// Test override of the origin used for create-once checks; with it,
+    /// every cache counts as having a native origin.
+    #[cfg(test)]
+    origin: RefCell<Option<Rc<dyn crate::origin::Origin>>>,
 }
 
 impl WriteService {
@@ -146,7 +150,16 @@ impl WriteService {
             loaded: Cell::new(false),
             next_tick: Cell::new(None),
             ticking: Rc::new(Cell::new(false)),
+            #[cfg(test)]
+            origin: RefCell::new(None),
         }
+    }
+
+    /// Use `origin` for create-once checks and treat every cache as having
+    /// a native origin (simulation tests have no Azure endpoint).
+    #[cfg(test)]
+    pub(crate) fn set_test_origin(&self, origin: Option<Rc<dyn crate::origin::Origin>>) {
+        *self.origin.borrow_mut() = origin;
     }
 
     /// Install the node settings, the upload sink, the node-wide upload
@@ -232,6 +245,25 @@ impl WriteService {
     pub(crate) fn set_loaded(&self) {
         self.loaded.set(true);
     }
+}
+
+/// Whether `cache` uploads to (and checks create-once against) a native
+/// origin.
+pub(crate) fn native_origin(local: &Coordinator, cache: &racer_wire::control::CacheId) -> bool {
+    #[cfg(test)]
+    if local.writes.origin.borrow().is_some() {
+        return true;
+    }
+    local.availability.native_origin(cache)
+}
+
+/// The origin create-once checks ask.
+pub(crate) fn origin(local: &Coordinator) -> Rc<dyn crate::origin::Origin> {
+    #[cfg(test)]
+    if let Some(origin) = local.writes.origin.borrow().clone() {
+        return origin;
+    }
+    local.fill.dependencies.origin.clone()
 }
 
 /// Copy `context` into independently owned storage, for an upload that

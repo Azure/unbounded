@@ -426,6 +426,8 @@ fn racer_entropy_replay_bytes_are_stable() {
 mod faults;
 mod scenarios;
 mod traffic;
+#[cfg(test)]
+mod write_tests;
 
 #[derive(Clone, Copy, Debug)]
 enum Action {
@@ -933,6 +935,14 @@ struct Harness {
     payload_regression: bool,
     opaque_relay: bool,
     concurrent_layers: bool,
+    /// Write settings published for the cache (`None`: writes disabled).
+    writes: Option<racer_wire::control::WriteDefinition>,
+    /// Published cache mode.
+    mode: racer_wire::control::CacheMode,
+    /// Published cluster page size.
+    page_size: racer_wire::object::PageSize,
+    /// Workers per added node (`None`: one or two, at random).
+    workers: Option<usize>,
 }
 thread_local! {
     /// While a fixed scenario runs, every dropped [`Harness`] folds its replay
@@ -995,6 +1005,10 @@ impl Harness {
             payload_regression: false,
             opaque_relay: false,
             concurrent_layers: false,
+            writes: None,
+            mode: racer_wire::control::CacheMode::Cached,
+            page_size: racer_wire::object::PageSize::DEFAULT,
+            workers: None,
         }
     }
     fn update(&mut self, object: usize) {
@@ -1086,7 +1100,10 @@ impl Harness {
             config.limits.client_connections = NonZeroUsize::new(512).unwrap();
             config.limits.connections_per_neighbor = NonZeroUsize::new(16).unwrap();
         }
-        let worker_count = 1 + self.rng.pick(2);
+        let worker_count = match self.workers {
+            Some(count) => count,
+            None => 1 + self.rng.pick(2),
+        };
         self.coverage.trace.record(format!(
             "node:{id}:{restart:?}:{worker_count}:{}",
             self.generation
@@ -1131,6 +1148,7 @@ impl Harness {
         let control = app.control.take();
         self.generation += 1;
         let mut publication = publication(&config, self.generation, vec![self.definition(id)]);
+        publication.page_size = self.page_size;
         publication.membership_version = MembershipVersion(self.generation);
         publication.members = self.members().into_iter().map(Into::into).collect();
         publication.members.push(member(&config).into());
@@ -1247,6 +1265,8 @@ impl Harness {
     fn definition(&self, id: usize) -> CacheDefinition {
         let mut definition = cache(id);
         definition.id = CacheId(format!("33333333-3333-4333-8333-{:012x}", self.cache_epoch));
+        definition.writes = self.writes.clone();
+        definition.mode = self.mode;
         definition
     }
     fn bundle(&self, config: &Config, _generation: u64) -> wire::KeyringBundle {
@@ -1285,6 +1305,7 @@ impl Harness {
         let definitions: Vec<_> = self.nodes.iter().map(|n| self.definition(n.id)).collect();
         for (node, definition) in self.nodes.iter_mut().zip(definitions) {
             let mut p = publication(&node.config, self.generation, vec![definition]);
+            p.page_size = self.page_size;
             p.membership_version = MembershipVersion(self.generation);
             p.members = members.iter().cloned().map(Into::into).collect();
             node.workers[0].app.snapshots.apply(p).unwrap();

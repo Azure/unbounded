@@ -21,6 +21,12 @@ use racer_core::write::SessionId;
 use racer_core::write::WriteReply;
 use std::sync::Arc;
 
+/// Retries of a store refused for a transient reason.
+const TRANSIENT_RETRIES: u32 = 8;
+
+/// Base wait between those retries.
+const TRANSIENT_WAIT: std::time::Duration = std::time::Duration::from_millis(5);
+
 /// Serve `write-store` on the object's metadata worker: each page is stored
 /// on its owning worker. Replies `stored` with the pages made durable, or
 /// `full` when none were and a target was over its dirty cap.
@@ -101,7 +107,34 @@ pub async fn store_page(
     let hold = crate::store::writes::from_unix_millis(store.hold_until_millis);
     let clock = local.fill.dependencies.candidates.ctx().clock.clone();
     let start = clock.now();
-    match writer.persist_written(copy, store.session, hold, scope).await {
+    let cache = page.version.object.cache.clone();
+    let bytes = copy.ciphertext.bytes().len() as u64;
+    let mut attempt = 0;
+    let result = loop {
+        match writer
+            .persist_written(copy.clone(), store.session, hold, scope)
+            .await
+        {
+            // `Overloaded` is either the dirty cap (final) or a transient
+            // condition: a checkpoint froze appends, or the written tail is
+            // rolling to a new segment. Retry the transient ones briefly.
+            Err(Error::Overloaded)
+                if attempt < TRANSIENT_RETRIES
+                    && writer.dirty_bytes(&cache).saturating_add(bytes)
+                        <= writer.dirty_limit(&cache) =>
+            {
+                attempt += 1;
+                let Some(reactor) = local.writes.reactor() else {
+                    break Err(Error::Overloaded);
+                };
+                reactor
+                    .sleep_until(clock.now() + TRANSIENT_WAIT * attempt, scope)
+                    .await?;
+            }
+            result => break result,
+        }
+    };
+    match result {
         Ok(_) => {
             local
                 .fill
