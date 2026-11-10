@@ -1107,6 +1107,86 @@ missing/duplicate headers, out-of-range replicas, page lists outside the object;
 signed request verification still binds every new header (extend the existing
 signature tests in `peer/tests.rs`); fuzz corpus seeds for each new operation.
 
+### WP4 as built
+
+The code refined these interfaces; the code is authoritative.
+
+- Operations (`cmd/racer/src/peer/protocol.rs`), re-exporting
+  `racer_core::write::{SessionId, WriteAction, WriteReply}`:
+  ```rust
+  Operation::WriteSession { object: ObjectId, etag: Option<StrongEtag>, action: Box<WriteAction> }
+  Operation::WriteStore { version: ObjectVersion, store: Box<WriteStore> }
+  Operation::WriteRelease { version: ObjectVersion, session: SessionId, pages: Vec<u64> }
+  Operation::WriteUpload { version: ObjectVersion, session: SessionId, pages: Vec<u64> }
+  impl Operation { pub fn is_write(&self) -> bool; pub fn write_object(&self) -> Option<&ObjectId>; }
+  ```
+  `action` and `store` are boxed to keep `Operation` small. `WriteSession`
+  takes an object and an optional ETag instead of an `ObjectVersion`, because
+  `status`, `delete`, and `persist` come from client requests that do not
+  know the Racer version. The ETag (`racer-etag`) is required for `open`,
+  `renew`, `commit`, `abort`, and `replicate`
+  (`write::action_requires_etag`), and `replicate` requires it to equal the
+  manifest ETag.
+- Codec module `cmd/racer/src/peer/protocol/write.rs` (`protocol::write`):
+  ```rust
+  pub struct WriteStore { pub session: SessionId, pub pages: Vec<u64>, pub length: u64,
+      pub page_size: PageSize, pub content_type: Option<ContentType>, pub source: NodeId,
+      pub hold_until_millis: u64 }
+  pub fn action_name(&WriteAction) -> &'static str;
+  pub fn action_requires_etag(&WriteAction) -> bool;
+  pub fn pages_in_object(pages: &[u64], length: u64, page_size: u64) -> bool;
+  ```
+  plus `pub const` header names (`WRITE_ACTION`, `WRITE_SESSION`,
+  `WRITE_PAGES`, `WRITE_SOURCE`, `WRITE_HOLD_UNTIL`, `WRITE_REPLICAS`,
+  `WRITE_DURABILITY`, `WRITE_UPLOAD`, `WRITE_HOLDERS`, `WRITE_WAIT_MILLIS`,
+  `WRITE_MANIFEST`, `WRITE_RESULT`, `WRITE_LEASE_UNTIL`,
+  `WRITE_UPLOAD_STATE`, `WRITE_STORED`, `WRITE_ETAG`). `request_head` and
+  `SecurityCodec::request` encode and decode them; `response_head` and the
+  response decoder handle `racer-outcome: write`.
+- Wire details that differ from the table above: `racer-write-durability`
+  uses the client header form (`replicas=N` or `origin`), and must agree
+  with `racer-write-replicas` (`WriteSpec::validate`). `delete` and
+  `persist` carry no session, matching `WriteAction` (WP2).
+  `racer-write-wait-millis` is omitted when zero, so an explicit `0` is
+  rejected as non-canonical. `WriteReply::Status` carries its ETag in
+  `racer-write-etag` (a strong ETag). Page lists use the prefetch encoding,
+  so every list has 1..=256 ascending, unique pages; `Stored` and
+  `Uploaded` cannot be empty.
+- Validation: `open` and `replicate` specs pass `WriteSpec::validate`, a page
+  size `PageSize::from_wire` accepts, and a valid content type. `write-store`
+  pages must lie inside `length` at `page_size`. A `commit` holder table must
+  name at least one page and one holder per page; the page count and replica
+  floor are left to the coordinator (`Holders::validate`). Modes are fixed:
+  `write-session` and `write-upload` are `acquire`; `write-store` and
+  `write-release` are `copy`, carry no origin metadata or authorization, and
+  spend no route attempts.
+- Size limit: a write request head, including the `commit` holder table and
+  the `replicate` manifest, must fit the peer head limit
+  (`peer_wire::MAX_HEAD`, 64 KiB, and `MAX_SIGNED_HEAD` once signed). A
+  holder table for many pages does not fit; WP5 must split large commits or
+  send a smaller holder encoding.
+- Responses: `PeerResponse::Write(WriteReply)` and `ResponseKind::Write` in
+  `core/src/read/mod.rs`; `response_error(Write)` is `None`.
+  `racer_core::route::Outcome::Write` asserts success (only the destination
+  may sign it). `forwarding::write_response_matches` accepts a write reply
+  only for a write operation, `stored` only for `write-store`, and
+  `uploaded` only for `write-upload`, with pages a subset of the request.
+  Finer per-action result rules are left to WP5.
+- Dispatch: `OperationKind::Write` (core), which `serve_action` rejects.
+  `Coordinator::serve_peer` (`read.rs`) returns `Err(Error::InvalidRequest)`
+  for any write operation before other dispatch, and the dispatcher routes
+  write operations to the object's metadata worker. WP5 replaces the early
+  return.
+- Tests: `cmd/racer/src/peer/forwarding/tests/write.rs` (round trips of
+  every action and reply through the signed envelope, encode and decode
+  rejections, signature binding of every write header, reply binding), and
+  `read::tests::peer_copies::write_operations_are_rejected_until_writes_are_served`.
+  Fuzz: `peer_envelope` seeds `seed-write-*` (generated in `fuzz/tests/seeds.rs`).
+- The Azure origin's duplicate block ID and XML helpers are gone:
+  `racer_core::write::block_list_xml_from_ids(&[[u8; 64]]) -> Vec<u8>` builds
+  the body, `block_list_xml(version_hex, pages)` calls it, and
+  `origin::azure::request::block_list_xml` validates IDs and calls it.
+
 ### WP5: write service (integration)
 
 Files: new `cmd/racer/src/write.rs` and `cmd/racer/src/write/{service.rs,staging.rs,coordinator.rs,store_target.rs,directory.rs,client.rs}`;
