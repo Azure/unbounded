@@ -46,6 +46,7 @@ Select it as described in
 | `/etc/systemd/system/unbounded-containerd.service` | containerd, agent-owned. |
 | `/etc/systemd/system/unbounded-kubelet.service` | kubelet, agent-owned. Wants and starts after the containerd unit. |
 | `/etc/systemd/system/unbounded-localdns.service` | CoreDNS, agent-owned, when LocalDNS is enabled. Starts before containerd and kubelet. |
+| `/etc/systemd/system/unbounded-kubelet-launch-check.service` and `/etc/systemd/system/unbounded-kubelet.service.d/10-launch-check.conf` | The allocation launch check and the kubelet drop-in that requires it. Written only on an allocation host; every kubelet start runs the check first. See [`spec.allocationRef` and `spec.fenced`]({{< relref "reference/machina-crd" >}}#specallocationref-and-specfenced). |
 | `/etc/systemd/system/<unit>.d/` | Drop-ins for the agent-owned units: `PATH` with the active version first, kubelet environment, LocalDNS ordering. |
 | `/opt/unbounded/node/<version>/libexec/` | The LocalDNS supervisor script for that version. |
 | `/opt/cni/bin/<plugin>` | A symlink per plugin of the active version, through `current`. Plugins other components install here (for example unbounded-net's IPAM plugin) are left alone. |
@@ -134,4 +135,5 @@ The same-path contract holds, as in every mode; see
 | Preflight reports a path is not writable | `/etc`, `/opt/unbounded/node`, and `/var` must be writable. Check for a read-only mount. |
 | Node not Ready after an upgrade | `sudo unbounded-agent logs --unit kubelet --lines 200`. The agent flips `current` back automatically; `readlink /opt/unbounded/node/current` shows which version is active. |
 | A unit is down | `systemctl status unbounded-kubelet.service unbounded-containerd.service`. |
+| On an allocation host, the kubelet does not start | `systemctl status unbounded-kubelet-launch-check.service`. Status `77` means the allocation launch check refused for good. |
 | Cilium or another eBPF CNI cannot find its bpffs | Expected difference: `none` uses the host `/sys/fs/bpf`. |

@@ -218,8 +218,9 @@ The API server enforces these rules:
 An agent whose kubelet `providerID` starts with
 `unbounded:///machineallocations/` treats the rest of it as its allocation UID
 and checks before every node start: at bootstrap, at every start of the nspawn
-machine (including after a host reboot), before a Node Recreation, and before a
-`NodeReboot`. Once the agent holds its daemon-controller certificate, it reads
+machine (including after a host reboot), at every start of the kubelet in
+isolation mode `none`, including a restart after the kubelet exits, before a
+Node Recreation, and before a `NodeReboot`. Once the agent holds its daemon-controller certificate, it reads
 the Machine live with it and allows the start only when the Machine's
 `allocationRef.uid` is this allocation's UID, `fenced` is not set, and the
 Machine is not being deleted. Before that certificate exists, it checks that
@@ -247,6 +248,26 @@ Every start of the nspawn machine runs the check in its pre-start, the
   `NodeReboot`, or a Node Recreation. Each such start checks again.
 - The agent daemon still starts, so `HostSoftReboot` and `AgentReset` still
   complete on such a host.
+
+In isolation mode `none`, every start of `unbounded-kubelet.service` runs the
+check in `unbounded-kubelet-launch-check.service`, which the kubelet unit
+requires. That unit exists only on an allocation host.
+
+- Transient and final refusals behave as for nspawn: a transient refusal is
+  retried every 10 seconds, and a final refusal exits with status `77`, leaves
+  the launch-check unit failed, and fails the kubelet's start without a restart.
+- The kubelet stays down until something starts it again: a host reboot, a
+  `NodeReboot`, a Node Recreation, or the kubelet's own restart. Each such start
+  checks again.
+- Pods that were already running when the kubelet stopped are not stopped by
+  the check.
+
+For a repave that changes the isolation mode, the agent checks before it hands
+the host to the reprovision. A refusal leaves the node as it is and changes no
+mode. The reset removes the daemon-controller certificate, so the bootstrap in
+the new mode checks with the bootstrap token, before the node starts. A final
+refusal there ends the reprovision at once, and the host stays reset with no
+node.
 
 The agent does not register a Machine for an allocation host. Fencing only
 stops new starts: a node that is already running is not stopped.
