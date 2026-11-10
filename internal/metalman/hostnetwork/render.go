@@ -57,8 +57,13 @@ func (w *yamlWriter) common(t *topology, i *iface) {
 	w.line(2, "dhcp4: false")
 	w.line(2, "dhcp6: false")
 
+	// Unaddressed links get no link-local addresses at all. Addressed links
+	// keep IPv6 link-local but ignore router advertisements, so only the
+	// declared static configuration applies.
 	if unaddressed(i) {
 		w.line(2, "link-local: []")
+	} else {
+		w.line(2, "accept-ra: false")
 	}
 
 	if i.mtu != nil {
@@ -307,6 +312,8 @@ func networkFile(t *topology, i *iface) []byte {
 
 	if unaddressed(i) {
 		u.kv("LinkLocalAddressing", "no")
+	} else {
+		u.kv("IPv6AcceptRA", "no")
 	}
 
 	for _, v := range i.vlans {

@@ -43,6 +43,7 @@ bonds:
       transmit-hash-policy: "layer3+4"
     dhcp4: false
     dhcp6: false
+    accept-ra: false
     mtu: 1500
     addresses:
       - "192.0.2.30/24"
@@ -59,6 +60,7 @@ vlans:
     link: "bond0"
     dhcp4: false
     dhcp6: false
+    accept-ra: false
     addresses:
       - "198.51.100.30/24"
     routes:
@@ -73,9 +75,9 @@ var referenceNetworkd = []File{
 	{"10-unbounded-enp49s0f1np1.link", []byte("[Match]\nPermanentMACAddress=02:00:00:00:00:02\n\n[Link]\nName=enp49s0f1np1\n")},
 	{"20-unbounded-bond0.64.netdev", []byte("[NetDev]\nName=bond0.64\nKind=vlan\n\n[VLAN]\nId=64\n")},
 	{"20-unbounded-bond0.netdev", []byte("[NetDev]\nName=bond0\nKind=bond\nMTUBytes=1500\n\n[Bond]\nMode=802.3ad\nMIIMonitorSec=100ms\nTransmitHashPolicy=layer3+4\n")},
-	{"30-unbounded-bond0.64.network", []byte("[Match]\nName=bond0.64\n\n[Network]\nAddress=198.51.100.30/24\n\n" +
+	{"30-unbounded-bond0.64.network", []byte("[Match]\nName=bond0.64\n\n[Network]\nIPv6AcceptRA=no\nAddress=198.51.100.30/24\n\n" +
 		"[Route]\nDestination=203.0.113.0/24\nGateway=198.51.100.1\n\n[Route]\nDestination=100.64.0.0/16\nGateway=198.51.100.1\n")},
-	{"30-unbounded-bond0.network", []byte("[Match]\nName=bond0\n\n[Network]\nVLAN=bond0.64\nAddress=192.0.2.30/24\nGateway=192.0.2.1\nDNS=192.0.2.53\nDNS=192.0.2.54\n")},
+	{"30-unbounded-bond0.network", []byte("[Match]\nName=bond0\n\n[Network]\nIPv6AcceptRA=no\nVLAN=bond0.64\nAddress=192.0.2.30/24\nGateway=192.0.2.1\nDNS=192.0.2.53\nDNS=192.0.2.54\n")},
 	{"30-unbounded-enp49s0f0np0.network", []byte("[Match]\nPermanentMACAddress=02:00:00:00:00:01\n\n[Network]\nBond=bond0\nLinkLocalAddressing=no\n")},
 	{"30-unbounded-enp49s0f1np1.network", []byte("[Match]\nPermanentMACAddress=02:00:00:00:00:02\n\n[Network]\nBond=bond0\nLinkLocalAddressing=no\n")},
 }
@@ -231,6 +233,7 @@ ethernets:
     set-name: "eth0"
     dhcp4: false
     dhcp6: false
+    accept-ra: false
     addresses:
       - "192.0.2.10/24"
     routes:
@@ -319,7 +322,7 @@ func TestRenderNetworkdOptionals(t *testing.T) {
 		"30-unbounded-eno1.10.network":  "[Match]\nName=eno1.10\n\n[Network]\nLinkLocalAddressing=no\n",
 		"10-unbounded-eno1.link":        "[Match]\nPermanentMACAddress=02:00:00:00:00:03\n\n[Link]\nName=eno1\n",
 		"20-unbounded-eno1.10.netdev":   "[NetDev]\nName=eno1.10\nKind=vlan\n\n[VLAN]\nId=10\n",
-		"30-unbounded-bond0.64.network": "[Match]\nName=bond0.64\n\n[Network]\nAddress=198.51.100.30/24\n\n[Route]\nDestination=203.0.113.0/24\nGateway=198.51.100.1\n\n[Route]\nDestination=100.64.0.0/16\nGateway=198.51.100.1\n",
+		"30-unbounded-bond0.64.network": "[Match]\nName=bond0.64\n\n[Network]\nIPv6AcceptRA=no\nAddress=198.51.100.30/24\n\n[Route]\nDestination=203.0.113.0/24\nGateway=198.51.100.1\n\n[Route]\nDestination=100.64.0.0/16\nGateway=198.51.100.1\n",
 	}
 	for name, want := range checks {
 		if byName[name] != want {

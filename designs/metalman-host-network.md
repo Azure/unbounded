@@ -189,6 +189,8 @@ than not found) return `503 Service Unavailable`. Other failures, including
 
 - Interfaces without addresses (bond members, VLAN-only links) disable
   link-local addressing (`link-local: []`, `LinkLocalAddressing=no`).
+  Addressed interfaces ignore IPv6 router advertisements (`accept-ra: false`,
+  `IPv6AcceptRA=no`), matching the legacy single-NIC networkd file.
   Nameservers go on the gateway interface, or on the first addressed
   interface when no gateway is declared. Bonds get no explicit MAC; networkd
   assigns its stable generated MAC.
