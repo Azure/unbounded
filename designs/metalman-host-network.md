@@ -98,6 +98,11 @@ The legacy VirtualMedia flow (no `network`) is unchanged.
    - `/unbounded/vmlinuz`, `/unbounded/initrd`, `/unbounded/init.cpio`: copied
      from the netboot image (`vmlinuz`, `initrd`, `init.cpio`).
    - `/unbounded/media.cpio`: per-operation newc archive (below).
+
+   The media identity hash uses `unbounded-uefi-local-v1` in place of the
+   legacy ISO format, so local and legacy media never share cached bytes.
+   Metalman also runs `hostnetwork.Validate` and checks that the serve URL is
+   plain `http://` before it builds the ISO.
 2. The ESP GRUB config boots locally, with no network access:
 
    ```
@@ -115,7 +120,10 @@ The legacy VirtualMedia flow (no `network`) is unchanged.
    source IP equals frozen `dhcpLeases[0].ipv4`, the live operation still owns
    the media and is in `PoweringOn` or `Installing`, and `LoaderStartedAt` is
    recorded with an optimistic lock before instructions are returned. Media
-   built without `network` answer 404.
+   built without `network` answer 404. As with every bootmedia callback, an
+   unknown media ID or a wrong source IP also answers 404, and a non-GET
+   request answers 405. Media built with `network` answer 404 to `grub.cfg`,
+   so a network installer config is never served for them.
 5. The installer writes the image, persists networking, and uses the existing
    `complete` and `ready` callbacks.
 

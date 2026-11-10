@@ -550,7 +550,10 @@ under `/disk/`. This follows the kubevirt containerDisk convention.
 Files with a `.tmpl` suffix in the netboot image are Go templates rendered
 per-machine at serve time; other files are served verbatim. A `metadata.yaml`
 file in the netboot image provides image-level configuration such as
-`dhcpBootImageName` and `httpBootPath`.
+`dhcpBootImageName` and `httpBootPath`. VirtualMedia needs
+`mediaFormat: unbounded-uefi-v1`. Machines that set `network` also need
+`localInstaller: unbounded-local-installer-v1`; Metalman will not build media
+from a netboot image without it.
 
 ### Image layout
 
@@ -568,6 +571,7 @@ Templates receive the following data object:
 | `.ServeURL` | string | External metalman HTTP URL. |
 | `.KubernetesVersion` | string | Resolved Kubernetes version for the machine. |
 | `.ClusterDNS` | string | Cluster DNS service IP. |
+| `.HostNetplan` | string | The declared `network` as a netplan version 2 document, without the top-level `network:` key. Empty when `network` is not set. The default `network-config` template uses it in place of the single-NIC config. |
 
 The default netboot template passes `.BootLease.MAC` as `unbounded.boot_mac`.
 The installer initrd uses that MAC address to configure the provisioning
