@@ -29,8 +29,9 @@ import (
 // the SHA-256 of the body (of the empty body for GET). The headers are
 // bound because handlers act on them: headerRoute steers forwarding and
 // headerRequester registers a holder the owner later fills from, so a
-// replayed request must not be able to change them. The first key signs; every key verifies, so keys rotate by adding
-// the new key second, then moving it first, then dropping the old one.
+// replayed request must not be able to change them. The first key signs;
+// every key verifies, so keys rotate by adding the new key second, then
+// moving it first, then dropping the old one.
 const (
 	headerAuth = "Gantry-Cachemesh-Auth"
 	authDomain = "gantry-cachemesh-auth"
