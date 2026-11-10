@@ -78,7 +78,9 @@ impl WriteMetrics {
 
     fn cache<'a>(state: &'a mut State, cache: &str) -> &'a mut CacheMetrics {
         if !state.caches.contains_key(cache) {
-            state.caches.insert(cache.to_owned(), CacheMetrics::default());
+            state
+                .caches
+                .insert(cache.to_owned(), CacheMetrics::default());
         }
         state.caches.get_mut(cache).expect("inserted")
     }

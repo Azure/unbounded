@@ -21,7 +21,10 @@ fn minted_etags_are_racer_versions() {
         b"\"racer-abababababababababababababababab\""
     );
     assert!(is_written_etag(&etag));
-    assert_eq!(version_hex(&etag), Some([b'a', b'b'].repeat(16).try_into().unwrap()));
+    assert_eq!(
+        version_hex(&etag),
+        Some([b'a', b'b'].repeat(16).try_into().unwrap())
+    );
     for other in [
         &b"\"object-1\""[..],
         b"\"racer-ABABABABABABABABABABABABABABABAB\"",
@@ -110,7 +113,10 @@ fn committed_entry(hold_until_millis: u64) -> directory::Entry {
         0,
         60_000,
     );
-    let effects = session.on_event(SessionEvent::Committed(Holders(vec![vec![b"n".to_vec()]])), 1);
+    let effects = session.on_event(
+        SessionEvent::Committed(Holders(vec![vec![b"n".to_vec()]])),
+        1,
+    );
     assert!(!effects.is_empty());
     directory::Entry {
         role: directory::Role::Coordinator,
@@ -134,7 +140,10 @@ fn directory_serves_committed_versions_until_their_hold() {
     let now = std::time::UNIX_EPOCH + std::time::Duration::from_nanos(1_700_000_000_123_456_789);
     let current = directory.current(&object(), now).expect("visible");
     assert_eq!(current.length, 10);
-    assert_eq!(current.expires_at.to_unix_millis().unwrap(), 1_700_000_001_123);
+    assert_eq!(
+        current.expires_at.to_unix_millis().unwrap(),
+        1_700_000_001_123
+    );
     // The reader TTL never passes the hold.
     let late = crate::store::writes::from_unix_millis(hold - 10);
     assert_eq!(

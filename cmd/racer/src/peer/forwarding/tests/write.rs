@@ -139,7 +139,9 @@ fn actions() -> Vec<(WriteAction, bool)> {
 fn ranks(pages: u64) -> racer_core::write::HolderRanks {
     let mut ranks = racer_core::write::HolderRanks::new(5).unwrap();
     for page in 0..pages {
-        ranks.push(if page % 2 == 0 { 0b011 } else { 0b101 }).unwrap();
+        ranks
+            .push(if page % 2 == 0 { 0b011 } else { 0b101 })
+            .unwrap();
     }
     ranks
 }
@@ -1022,7 +1024,8 @@ fn ranked_holder_tables_reject_malformed_and_mixed_forms() {
     let zero_run = crate::peer::protocol::binary(&[5, 0, 1]).into_bytes();
     let wide = crate::peer::protocol::binary(&[5, 1, 32]).into_bytes();
     let empty = crate::peer::protocol::binary(&[5]).into_bytes();
-    let changes: Vec<Box<dyn Fn(&mut Vec<http1::Header>)>> = vec![
+    type Change = Box<dyn Fn(&mut Vec<http1::Header>)>;
+    let changes: Vec<Change> = vec![
         Box::new(set(write::WRITE_HOLDER_RANKS, &zero_run)),
         Box::new(set(write::WRITE_HOLDER_RANKS, &wide)),
         Box::new(set(write::WRITE_HOLDER_RANKS, &empty)),

@@ -25,7 +25,9 @@ pub struct WriteStaging {
 
 impl WriteStaging {
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<PageId, CiphertextCopy>> {
-        self.pages.lock().unwrap_or_else(|poison| poison.into_inner())
+        self.pages
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
     }
 
     /// Stage `copy` under its envelope's page. A page already staged (the

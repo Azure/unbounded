@@ -40,7 +40,13 @@ fn retry_policy(local: &Coordinator) -> RetryPolicy {
 
 fn entropy(local: &Coordinator) -> u64 {
     let mut bytes = [0; 8];
-    let _ = local.fill.dependencies.candidates.ctx().rng.fill(&mut bytes);
+    let _ = local
+        .fill
+        .dependencies
+        .candidates
+        .ctx()
+        .rng
+        .fill(&mut bytes);
     u64::from_le_bytes(bytes)
 }
 
@@ -273,7 +279,11 @@ pub fn spawn_commit(local: &Coordinator, object: &ObjectId, membership: &Arc<Mem
         else {
             return Ok(());
         };
-        let event = match (local.writes.sink(), context, super::version_hex(&version.etag)) {
+        let event = match (
+            local.writes.sink(),
+            context,
+            super::version_hex(&version.etag),
+        ) {
             (Some(sink), Some(context), Some(hex)) => {
                 let ids: Vec<[u8; 64]> = (0..pages)
                     .map(|p| racer_core::write::block_id(&hex, p))

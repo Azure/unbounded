@@ -341,7 +341,9 @@ pub fn send<'a>(
     context: &'a OriginContext,
     scope: &'a RequestScope,
 ) -> crate::error::Operation<'a, WriteReply> {
-    Box::pin(send_inner(local, membership, node, operation, context, scope))
+    Box::pin(send_inner(
+        local, membership, node, operation, context, scope,
+    ))
 }
 
 async fn send_inner(

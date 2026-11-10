@@ -178,7 +178,9 @@ mod tests {
     use super::*;
 
     fn ranked(page: u64) -> Vec<NodeIdBytes> {
-        (0..5).map(|r| format!("n{}", (page + r) % 7).into_bytes()).collect()
+        (0..5)
+            .map(|r| format!("n{}", (page + r) % 7).into_bytes())
+            .collect()
     }
 
     #[test]
@@ -253,7 +255,10 @@ mod tests {
         // Zero count, zero mask, mask too wide, non-canonical runs and counts.
         assert_eq!(HolderRanks::decode(&[5, 0, 1]), Err(HolderError::Malformed));
         assert_eq!(HolderRanks::decode(&[5, 1, 0]), Err(HolderError::Malformed));
-        assert_eq!(HolderRanks::decode(&[5, 1, 32]), Err(HolderError::Malformed));
+        assert_eq!(
+            HolderRanks::decode(&[5, 1, 32]),
+            Err(HolderError::Malformed)
+        );
         assert_eq!(
             HolderRanks::decode(&[5, 1, 3, 1, 3]),
             Err(HolderError::Malformed)

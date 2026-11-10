@@ -2177,9 +2177,21 @@ fn put_then_read_through_the_production_graph() {
     // A fresh read resolves the written version without the origin.
     rig.adapter.offline();
     let head = rig.request("HEAD", "");
-    assert_eq!(head.status, 200, "{:?} {:?}", head.fields, rig.adapter.calls());
+    assert_eq!(
+        head.status,
+        200,
+        "{:?} {:?}",
+        head.fields,
+        rig.adapter.calls()
+    );
     let reply = rig.subscribe("");
-    assert_eq!(reply.status, 200, "{:?} {:?}", reply.fields, rig.adapter.calls());
+    assert_eq!(
+        reply.status,
+        200,
+        "{:?} {:?}",
+        reply.fields,
+        rig.adapter.calls()
+    );
     assert_eq!(reply.fields["etag"], etag);
     assert_eq!(reply.fields["racer-object-length"], length.to_string());
     assert!(reply.body == body);

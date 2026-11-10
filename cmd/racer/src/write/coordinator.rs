@@ -67,7 +67,9 @@ pub fn serve<'a>(
     membership: Arc<Membership>,
     scope: &'a RequestScope,
 ) -> crate::error::Operation<'a, WriteReply> {
-    Box::pin(serve_inner(local, requester, operation, context, membership, scope))
+    Box::pin(serve_inner(
+        local, requester, operation, context, membership, scope,
+    ))
 }
 
 async fn serve_inner(
@@ -501,9 +503,7 @@ async fn resolve_ranks(
     let mut holders = Vec::with_capacity(ranks.pages() as usize);
     for (page, mask) in ranks.masks().enumerate() {
         let ordered = node_bytes(&ranked(local, membership, object, page as u64, scope).await?);
-        holders.push(
-            HolderRanks::resolve_page(mask, &ordered).map_err(|_| Error::InvalidRequest)?,
-        );
+        holders.push(HolderRanks::resolve_page(mask, &ordered).map_err(|_| Error::InvalidRequest)?);
     }
     Ok(Holders(holders))
 }
@@ -830,17 +830,19 @@ fn spawn_release(
     membership: &Arc<Membership>,
     nodes: Option<Vec<NodeIdBytes>>,
 ) {
-    let Some((version, session, holders, pages, keep)) = local.writes.directory().with(object, |e| {
-        e.map(|e| {
-            (
-                e.version.clone(),
-                e.session.identity().session,
-                e.session.holders().clone(),
-                e.session.spec().pages(),
-                e.session.state() == UploadState::Committed,
-            )
+    let Some((version, session, holders, pages, keep)) =
+        local.writes.directory().with(object, |e| {
+            e.map(|e| {
+                (
+                    e.version.clone(),
+                    e.session.identity().session,
+                    e.session.holders().clone(),
+                    e.session.spec().pages(),
+                    e.session.state() == UploadState::Committed,
+                )
+            })
         })
-    }) else {
+    else {
         return;
     };
     let Ok(local) = local.prefetch_directory().local_coordinator() else {
@@ -903,7 +905,8 @@ pub(crate) async fn background_event(
 ) -> Result<()> {
     let Some(effects) = local.writes.directory().with(object, |e| {
         let e = e?;
-        (e.session.identity().session == session).then(|| e.session.on_event(event, now_millis(local)))
+        (e.session.identity().session == session)
+            .then(|| e.session.on_event(event, now_millis(local)))
     }) else {
         return Ok(());
     };

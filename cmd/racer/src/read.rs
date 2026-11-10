@@ -700,7 +700,9 @@ impl LocalPageService for Coordinator {
             // Write operations are served by the write service on this,
             // the object's metadata worker (`WorkerDirectory::peer`).
             if request.operation.is_write() {
-                return self.serve_write_peer(&requester, request, membership, scope).await;
+                return self
+                    .serve_write_peer(&requester, request, membership, scope)
+                    .await;
             }
             if let PeerOperation::Page {
                 page,

@@ -1349,6 +1349,101 @@ Tests:
   `cmd/racer/src/rdma/links/tests.rs`) that a store-target pull uses an RDMA link
   when available.
 
+### WP5 as built
+
+The code refined these interfaces; the code is authoritative.
+
+Module `cmd/racer/src/write.rs` with `write/{client,coordinator,directory,metrics,staging,store_target,upload,tests}.rs`:
+
+```rust
+pub struct WriteService;            // per worker, field `Coordinator::writes`
+impl WriteService {
+    pub fn new(directory: Rc<Directory>) -> Self;
+    pub fn configure(&self, WriteSettings, Option<Rc<dyn UploadSink>>, Arc<UploadLimits>, Rc<Reactor>);
+    pub fn set_sink(&self, ..); pub fn set_settings(&self, ..); pub fn settings(&self) -> WriteSettings;
+    pub fn directory(&self) -> &Rc<Directory>;
+    pub fn poll(&self, local: &Coordinator, now: Instant);   // maintenance every TICK (200 ms)
+    pub fn next_deadline(&self) -> Option<Instant>;
+}
+pub enum WriteWork { Serve{..}, Store{..}, Release{page, session, keep}, Upload{..} } // Work::Write
+pub enum WriteValue { Reply(WriteReply), Page(PageOutcome) }
+pub enum PageOutcome { Done, Full, Failed }
+pub fn send(local, membership, node, PeerOperation, &OriginContext, scope) -> Operation<WriteReply>;
+pub async fn execute(local, WriteWork, scope) -> Result<WriteValue>;
+pub fn mint_etag([u8; 16]) -> Result<StrongEtag>; pub fn version_hex(&StrongEtag) -> Option<[u8; 32]>;
+pub fn duplicate_context(&OriginContext) -> Result<OriginContext>; pub fn bare_context(&ObjectId) -> OriginContext;
+coordinator::serve(local, requester, PeerOperation, &OriginContext, membership, scope) -> Operation<WriteReply>;
+coordinator::{apply, journal, ranked, rank_holders, upload_state, load, maintain, background_event};
+client::{routes, serve};             // listener entry points
+directory::{Directory, Entry, Role, METADATA_TTL};
+```
+
+Wiring: `Coordinator::serve_peer` serves every write operation on the
+object's metadata worker (`serve_write_peer`); per-page work moves to the
+page owner with `WorkerDirectory::write_page`, and in-process sends to the
+local node use `WorkerDirectory::write_serve` (no network hop).
+`NodeDirectory` holds the node-wide `write_staging` and `upload_limits`.
+`Fill::copy_only_joining` answers staged pages before any cache lookup, which
+is how store targets pull (also over RDMA; see the test below). The listener
+routes `is_write` heads to `write::client::serve` when the cache has writes,
+and answers `405 Allow: HEAD, POST` for every write route otherwise.
+`MetadataService::refresh` consults the worker's write directory before
+peers and origin. `ReadResponse::upload_state` carries `Racer-Upload-State`
+for HEAD (the coordinator is asked with `status`). `OriginRouter` implements
+`UploadSink` (native origins only). `Availability::native_origin`,
+`Index::invalidate_current`, `CandidatePolicy::write_authority`,
+`telemetry::Metrics::writes()` were added.
+
+Deviations from the plan above:
+
+- Large holder tables: `racer_core::write::HolderRanks` (rank masks,
+  run-length encoded) and `WriteAction::{CommitRanked, ReplicateRanked}`
+  (header `racer-write-holder-ranks`; ranked `replicate` sends the manifest
+  without holders via `journal::encode_manifest_head`). A signed head is
+  32 KiB (`MAX_SIGNED_HEAD`), so explicit tables over 12 KiB use ranks; a
+  50,000-page object with default placement encodes in a few bytes (tested).
+  A table that fits neither fails the write with `503 owners`.
+- `WriteRelease` gained `keep` (`racer-write-keep: 1`): after an upload holders
+  `release_written` (pages stay readable); delete, abort and expiry
+  `drop_written`.
+- `SessionEvent::UploadResumed` restarts a `Pending` upload after a
+  coordinator restart. Origin contexts are memory-only (never journaled), so
+  a restarted coordinator resumes an upload only when a client `persist`
+  supplies the context again.
+- Readers revalidate written objects every `METADATA_TTL` (1 s, capped at the
+  hold) instead of caching the current pointer until the hold, so `DELETE`
+  and upload become visible cluster-wide within a second. After Put Block
+  List commits, the current pointer is dropped and fresh reads go to the
+  origin (Blob ETag); no alias is kept (alias handling is WP8).
+- Reply mapping: `delete` of an uploaded object and `persist` of a
+  non-manual object answer `Status{state, etag}` (writer: `409 uploaded` /
+  `409 not-manual`); accepted `persist` answers `Committed{state}`.
+- No `ResourceClass::{WriteStaging, WritePlaintext}`: staging uses the
+  existing `Plaintext`/`Ciphertext` classes and is bounded by the window.
+- Store targets retry a transient `Overloaded` from `persist_written`
+  (checkpoint freeze, tail roll) while under the dirty cap; writers retry
+  busy targets (peer admission, connection limits) with backoff.
+- Reloaded journal sessions all act as coordinators (role is not
+  journaled); a reloaded manifest replica's releases are idempotent.
+- `racer_write_fsync_seconds` times `persist_written` on targets and session
+  journal appends on coordinators. Metrics are labeled by cache ID.
+- Write tests live in `cmd/racer/src/app/dst/write_tests.rs` (the
+  whole-application simulated cluster) rather than `write/tests.rs`, which
+  holds unit tests. `persist` on a disabled cache answers `405` (explicitly
+  routed) instead of the read parser's `400`.
+
+Left for WP8/WP11: repair (`SessionEffect::Restore` is ignored), coordinator
+failover from manifest replicas, orphan GC, alias records, rekey; written
+pages of removed caches. Known read-path limitation: a reader that sees every
+page-zero owner as silent (link health after churn) becomes its own origin
+authority and gets `404` for a written object until links recover.
+Tests: `app::dst::write_tests` (round trip, replicas 1..3, writer as target,
+412, 405, dirty-cap 503, disconnect abort, lease expiry, upload states and
+uploads, origin durability, delete, hold expiry, crash restart, RDMA pulls),
+`tests/production_dataplane.rs::put_then_read_through_the_production_graph`,
+`tests/process_restart.rs::sigkill_restart_recovers_written_pages_from_the_journal`
+(ignored like its siblings: needs root; compiled, not run here).
+
 ### WP6: Azure upload
 
 Files: `cmd/racer/src/origin/azure/request.rs` (`AzureMethod::{PutBlock,

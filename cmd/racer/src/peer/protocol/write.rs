@@ -206,8 +206,8 @@ fn encode_ranks(ranks: &HolderRanks) -> Result<Vec<u8>> {
 }
 
 fn decode_ranks(head: &MessageHead) -> Result<HolderRanks> {
-    let ranks =
-        HolderRanks::decode(&bytes(head, WRITE_HOLDER_RANKS)?).map_err(|_| Error::InvalidRequest)?;
+    let ranks = HolderRanks::decode(&bytes(head, WRITE_HOLDER_RANKS)?)
+        .map_err(|_| Error::InvalidRequest)?;
     encode_ranks(&ranks)?;
     Ok(ranks)
 }

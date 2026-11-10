@@ -324,7 +324,10 @@ async fn coordinator_node(
         .ok_or(Reject::busy(error_token::COORDINATOR))
 }
 
-fn membership(local: &Coordinator, cache: &CacheId) -> std::result::Result<Arc<Membership>, Reject> {
+fn membership(
+    local: &Coordinator,
+    cache: &CacheId,
+) -> std::result::Result<Arc<Membership>, Reject> {
     local
         .cache_membership(cache)
         .map_err(|_| Reject::busy(error_token::OWNERS))
@@ -400,6 +403,7 @@ struct Options {
 }
 
 /// Where a creating write's bytes come from.
+#[allow(clippy::large_enum_variant)] // One per request, on its stack.
 enum Source<'a> {
     Body {
         connection: Option<ConnectionLease>,
@@ -459,7 +463,9 @@ fn spec(
         .hold_seconds
         .map(Duration::from_secs)
         .unwrap_or(definition.hold_ttl)
-        .min(Duration::from_secs(racer_wire::object::write::MAX_HOLD_SECONDS));
+        .min(Duration::from_secs(
+            racer_wire::object::write::MAX_HOLD_SECONDS,
+        ));
     let now = super::wall_now(local);
     let spec = WriteSpec {
         length: options.length,
@@ -812,9 +818,12 @@ impl Write<'_> {
         let replicas = usize::from(self.spec.replicas);
         let mut full = false;
         let first = candidates.len().min(replicas);
-        let outcomes =
-            futures::future::join_all(candidates[..first].iter().map(|node| self.store(node, page, scope)))
-                .await;
+        let outcomes = futures::future::join_all(
+            candidates[..first]
+                .iter()
+                .map(|node| self.store(node, page, scope)),
+        )
+        .await;
         for (node, outcome) in candidates[..first].iter().zip(outcomes) {
             match outcome {
                 Ok(true) => holders.push(node.clone()),
@@ -880,7 +889,8 @@ impl Write<'_> {
                     let Some(reactor) = self.local.writes.reactor() else {
                         return Err(());
                     };
-                    let until = clock.now() + (BUSY_WAIT * (1 << attempt.min(6))).min(BUSY_WAIT_MAX);
+                    let until =
+                        clock.now() + (BUSY_WAIT * (1 << attempt.min(6))).min(BUSY_WAIT_MAX);
                     if reactor.sleep_until(until, scope).await.is_err() {
                         return Err(());
                     }
@@ -1082,4 +1092,3 @@ async fn read_page(
         }
     }
 }
-

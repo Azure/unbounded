@@ -136,9 +136,9 @@ impl Raw {
         if h.contains_key("racer-range-start") {
             let mut cursor = self.cursor.unwrap_or(end);
             while cursor + 21 <= self.response.len() {
-                let count = u32::from_be_bytes(
-                    self.response[cursor + 17..cursor + 21].try_into().unwrap(),
-                ) as usize;
+                let count =
+                    u32::from_be_bytes(self.response[cursor + 17..cursor + 21].try_into().unwrap())
+                        as usize;
                 if cursor + 21 + count > self.response.len() {
                     break;
                 }
@@ -174,8 +174,8 @@ impl Response {
         let mut cursor = 0;
         while cursor + 21 <= self.body.len() {
             let kind = self.body[cursor];
-            let count =
-                u32::from_be_bytes(self.body[cursor + 17..cursor + 21].try_into().unwrap()) as usize;
+            let count = u32::from_be_bytes(self.body[cursor + 17..cursor + 21].try_into().unwrap())
+                as usize;
             cursor += 21;
             if kind == 2 {
                 break;
@@ -411,7 +411,12 @@ fn pages(length: usize) -> u64 {
 fn put_then_read_round_trips_on_every_node() {
     let mut c = Cluster::new(11, 3, Some(writes(2)));
     let body = bytes(1, 200_000);
-    let created = c.put(0, OBJECT, &body, "Racer-Content-Type: application/x-test\r\n");
+    let created = c.put(
+        0,
+        OBJECT,
+        &body,
+        "Racer-Content-Type: application/x-test\r\n",
+    );
     assert_eq!(created.status, 201, "{:?}", created.headers);
     let etag = created.header("etag").unwrap().to_owned();
     assert!(etag.starts_with("\"racer-"), "{etag}");
@@ -423,13 +428,21 @@ fn put_then_read_round_trips_on_every_node() {
         let read = c.get(node, OBJECT, body.len());
         assert_eq!(read.status, 200, "node {node}");
         assert_eq!(read.header("etag"), Some(etag.as_str()));
-        assert_eq!(read.header("content-type"), Some("application/octet-stream"));
+        assert_eq!(
+            read.header("content-type"),
+            Some("application/octet-stream")
+        );
         let got = read.object();
         if got != body {
             let mut diagnostics = String::new();
             for node in &c.harness.nodes {
                 for worker in &node.workers {
-                    worker.app.telemetry.failures.write(&mut diagnostics).unwrap();
+                    worker
+                        .app
+                        .telemetry
+                        .failures
+                        .write(&mut diagnostics)
+                        .unwrap();
                 }
             }
             eprintln!("{diagnostics}");
@@ -447,12 +460,23 @@ fn put_then_read_round_trips_on_every_node() {
         assert_eq!(head.status, 200);
         assert_eq!(head.header("etag"), Some(etag.as_str()));
         assert_eq!(head.header("content-length"), Some("200000"));
-        assert_eq!(head.header("racer-content-type"), Some("application/x-test"));
+        assert_eq!(
+            head.header("racer-content-type"),
+            Some("application/x-test")
+        );
         assert_eq!(head.header("racer-upload-state"), Some("never"));
     }
-    let metrics = c.harness.nodes[0].workers[0].app.telemetry.metrics.writes().clone();
+    let metrics = c.harness.nodes[0].workers[0]
+        .app
+        .telemetry
+        .metrics
+        .writes()
+        .clone();
     assert_eq!(
-        metrics.requests(&c.object(OBJECT).cache.0, crate::write::metrics::Outcome::Created),
+        metrics.requests(
+            &c.object(OBJECT).cache.0,
+            crate::write::metrics::Outcome::Created
+        ),
         1
     );
 }
@@ -469,7 +493,11 @@ fn replicas_place_exactly_that_many_holders() {
             &body,
             &format!("Racer-Durability: replicas={replicas}\r\n"),
         );
-        assert_eq!(created.status, 201, "replicas={replicas}: {:?}", created.headers);
+        assert_eq!(
+            created.status, 201,
+            "replicas={replicas}: {:?}",
+            created.headers
+        );
         let version = c.version(object, &created);
         let holders = c.holders(&version, pages(body.len()));
         assert!(
@@ -655,9 +683,16 @@ fn head_reports_upload_states_and_uploads_commit() {
     let created = c.put(0, OBJECT, &manual, "Racer-Upload: manual\r\n");
     assert_eq!(created.status, 201);
     assert_eq!(created.header("racer-upload-state"), Some("manual"));
-    assert_eq!(c.head(1, OBJECT).header("racer-upload-state"), Some("manual"));
+    assert_eq!(
+        c.head(1, OBJECT).header("racer-upload-state"),
+        Some("manual")
+    );
     // A never object refuses persist.
-    assert_eq!(c.put(0, OBJECT + 1, &manual, "Racer-Upload: never\r\n").status, 201);
+    assert_eq!(
+        c.put(0, OBJECT + 1, &manual, "Racer-Upload: never\r\n")
+            .status,
+        201
+    );
     let refused = c.persist(2, OBJECT + 1);
     assert_eq!(refused.status, 409);
     assert_eq!(refused.header("racer-write-error"), Some("not-manual"));
@@ -672,7 +707,11 @@ fn head_reports_upload_states_and_uploads_commit() {
     // After the upload the holders keep no write pins and the object is not
     // deletable.
     let version = c.version(OBJECT, &created);
-    assert!(c.holders(&version, pages(manual.len())).iter().all(Vec::is_empty));
+    assert!(
+        c.holders(&version, pages(manual.len()))
+            .iter()
+            .all(Vec::is_empty)
+    );
     let refused = c.delete(1, OBJECT);
     assert_eq!(refused.status, 409);
     assert_eq!(refused.header("racer-write-error"), Some("uploaded"));
@@ -681,7 +720,13 @@ fn head_reports_upload_states_and_uploads_commit() {
     let created = c.put(1, OBJECT + 2, &auto, "Racer-Upload: auto\r\n");
     assert_eq!(created.status, 201);
     c.wait(Duration::from_secs(1));
-    assert!(c.sink.committed(&c.object(OBJECT + 2)).expect("auto blob").data == auto);
+    assert!(
+        c.sink
+            .committed(&c.object(OBJECT + 2))
+            .expect("auto blob")
+            .data
+            == auto
+    );
     // `origin` durability acknowledges after the commit.
     let origin = bytes(9, 70_000);
     let created = c.put(
@@ -692,7 +737,13 @@ fn head_reports_upload_states_and_uploads_commit() {
     );
     assert_eq!(created.status, 201);
     assert_eq!(created.header("racer-upload-state"), Some("committed"));
-    assert!(c.sink.committed(&c.object(OBJECT + 3)).expect("origin blob").data == origin);
+    assert!(
+        c.sink
+            .committed(&c.object(OBJECT + 3))
+            .expect("origin blob")
+            .data
+            == origin
+    );
 }
 
 #[test]
@@ -717,7 +768,10 @@ fn delete_releases_holders() {
 fn holds_expire() {
     let mut c = Cluster::new(20, 3, Some(writes(2)));
     let body = bytes(11, 100_000);
-    assert_eq!(c.put(0, OBJECT, &body, "Racer-Hold-Seconds: 30\r\n").status, 201);
+    assert_eq!(
+        c.put(0, OBJECT, &body, "Racer-Hold-Seconds: 30\r\n").status,
+        201
+    );
     assert!(c.written() > 0);
     c.wait(Duration::from_secs(31));
     c.wait(Duration::from_secs(1));
@@ -745,7 +799,11 @@ fn written_objects_survive_a_crash_restart() {
         c.harness.publish();
         c.harness.settle();
         // The journal restored every durable copy the node held.
-        assert_eq!(c.holders(&version, pages(body.len())), holders, "node {index}");
+        assert_eq!(
+            c.holders(&version, pages(body.len())),
+            holders,
+            "node {index}"
+        );
         // Readers on the restarted node, then everywhere, see the object
         // once peers answer the restarted node again.
         for reader in [index, (index + 1) % 3, (index + 2) % 3] {
