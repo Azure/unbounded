@@ -561,6 +561,39 @@ impl WorkerApplication {
                 .failure = Some(error);
             return Err(error);
         }
+        // Written pages are restored from the write journal whether or not a
+        // checkpoint was accepted, before the writer can reuse any segment.
+        let layout = crate::store::writes::journal_layout(&geometry, node.count as u64);
+        match self
+            .store
+            .writer
+            .recover_written(
+                &self.slab_directory,
+                layout,
+                self.write_journal_bytes,
+                startup,
+            )
+            .await
+        {
+            Ok(recovered) => {
+                if !recovered.lost.is_empty() || !recovered.unindexed.is_empty() {
+                    eprintln!(
+                        "racer: worker {}: write journal restored {} pages, {} unindexed, {} lost",
+                        self.worker.0,
+                        recovered.restored.len(),
+                        recovered.unindexed.len(),
+                        recovered.lost.len()
+                    );
+                }
+            }
+            Err(error) => {
+                node.recovery
+                    .lock()
+                    .map_err(|_| Error::Unavailable)?
+                    .failure = Some(error);
+                return Err(error);
+            }
+        }
         node.recovery
             .lock()
             .map_err(|_| Error::Unavailable)?

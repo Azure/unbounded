@@ -1171,6 +1171,9 @@ pub struct WorkerApplication {
 
     slab_directory: std::path::PathBuf,
 
+    /// Write journal size that triggers compaction (`RACER_WRITE_JOURNAL_BYTES`).
+    write_journal_bytes: u64,
+
     prepared_listeners: Rc<std::cell::RefCell<Option<crate::client::listener::PreparedListeners>>>,
 
     /// Caches whose sockets this node binds ([`CachePublication`]).
@@ -1835,6 +1838,7 @@ impl WorkerApplication {
             memory,
             caches: Vec::new(),
             slab_directory: config.slab_directory.clone(),
+            write_journal_bytes: config.writes.journal_bytes,
             prepared_listeners: Rc::new(std::cell::RefCell::new(None)),
             served_caches: Rc::new(RefCell::new(None)),
             local: config.node.clone(),
