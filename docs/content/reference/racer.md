@@ -6,7 +6,9 @@ description: "Racer resources, configuration, diagnostics, Go SDK, and RDMA requ
 
 {{< callout type="warning" >}}
 Racer is pre-release. Its APIs, flags, and on-disk formats may change without a
-migration path. Cached data is disposable; Racer is not durable storage. Start
+migration path. Cached data is disposable; Racer is not durable storage.
+[Written objects](#writes) are kept on several node disks, but they are not safe
+from loss until they are uploaded to the origin. Start
 with the [Azure Blob cache guide]({{< relref "guides/azure-blob-cache" >}}).
 {{< /callout >}}
 
@@ -19,7 +21,7 @@ See [Racer concepts]({{< relref "concepts/racer" >}}) and the [Azure Blob cache 
 | API | `racer.unbounded-cloud.io/v1alpha1`, kind `ClusterCache` |
 | Resource / short name | `clustercaches` / `ccache` |
 | Scope | Cluster-scoped |
-| Fields | Optional `spec.origin` for an Azure Blob origin that the dataplane reads directly; optional `spec.priority` for the cache's share of node capacity; optional `spec.passthrough` to proxy reads without caching; optional `spec.nodeSelector` to limit the cache to some nodes; no `status` |
+| Fields | Optional `spec.origin` for an Azure Blob origin that the dataplane reads directly; optional `spec.priority` for the cache's share of node capacity; optional `spec.passthrough` to proxy reads without caching; optional `spec.nodeSelector` to limit the cache to some nodes; optional `spec.writes` to accept object writes (see [Writes](#writes)); no `status` |
 | Name | DNS subdomain, at most 82 characters total and 63 per dot-separated label |
 | Identity | Kubernetes UID, not name; deleting and recreating a cache creates a new identity |
 
@@ -32,10 +34,12 @@ metadata:
 
 Any ClusterCache triggers installation by the Unbounded operator, not a Site
 component flag. This resource is not a Kubernetes PersistentVolume or
-PersistentVolumeClaim (PVC), does not set absolute capacity, and makes no
-durability promise. `spec.priority` sets only its relative share of each node's
+PersistentVolumeClaim (PVC), and does not set absolute capacity. It makes no
+durability promise for read data. With `spec.writes`, it promises only that a
+written object has the requested number of disk copies, or is in the origin
+(see [Writes](#writes)). `spec.priority` sets only its relative share of each node's
 cache capacity (see [Priority](#priority)). It configures an origin only when `spec.origin` is set (see
-[Azure origin](#azure-origin)). Cached data is disposable. A cache's Kubernetes UID is its
+[Azure origin](#azure-origin)). Cached read data is disposable. A cache's Kubernetes UID is its
 wire cache identity (`CacheID`).
 
 | Path on the node | Owner and purpose |
