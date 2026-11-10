@@ -1336,6 +1336,70 @@ func TestInstallRequestedBeforeBootImageWritten(t *testing.T) {
 	require.True(t, installRequested)
 }
 
+func TestPreservesImageUsers(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		image string
+		want  bool
+	}{
+		{"tag from one registry", "registry.example.com/images/" + preservedImageUsersRepository + ":candidate", true},
+		{"digest from another registry", "mirror.example.net/team/" + preservedImageUsersRepository + "@sha256:abc", true},
+		{"tag and digest", "registry.example.org/" + preservedImageUsersRepository + ":candidate@sha256:abc", true},
+		{"repository suffix near miss", "registry.example.com/images/" + preservedImageUsersRepository + "-other:latest", false},
+		{"repository prefix near miss", "registry.example.com/images/pre-" + preservedImageUsersRepository + ":latest", false},
+		{"generic image", "registry.example.com/images/host-ubuntu2404:latest", false},
+		{"access image", "registry.example.com/images/host-ubuntu2404-gb200-access:latest", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			require.Equal(t, tt.want, preservesImageUsers(tt.image))
+		})
+	}
+}
+
+func TestVendorDataTemplateUserPreservationOnlyChangesUsers(t *testing.T) {
+	t.Parallel()
+
+	vendorDataTmpl, err := os.ReadFile(filepath.Join("..", "..", "..", "images", "netboot", "assets", "vendor-data.tmpl"))
+	require.NoError(t, err)
+
+	renderConfig := func(image string) map[string]any {
+		t.Helper()
+
+		machine := &v1alpha3.Machine{
+			Spec: v1alpha3.MachineSpec{
+				Host: &v1alpha3.HostSpec{
+					Netboot: &v1alpha3.PXESpec{Image: image},
+				},
+			},
+		}
+		data := newTemplateData(machine, ClusterInfo{}, "https://example.invalid", "{}", "", false)
+		result, err := renderTemplate(string(vendorDataTmpl), data)
+		require.NoError(t, err)
+
+		var config map[string]any
+		require.NoError(t, yaml.Unmarshal(result, &config))
+
+		return config
+	}
+
+	generic := renderConfig("registry.example.com/images/host-ubuntu2404:latest")
+	preserved := renderConfig("mirror.example.net/team/" + preservedImageUsersRepository + ":candidate")
+
+	require.Contains(t, generic, "users")
+	require.Contains(t, generic["users"], map[string]any{"name": "unbounded-metal", "lock_passwd": true, "shell": "/bin/bash", "sudo": "ALL=(ALL) NOPASSWD:ALL"})
+	require.NotContains(t, preserved, "users")
+
+	for _, key := range []string{"reporting", "write_files", "runcmd"} {
+		require.Equal(t, generic[key], preserved[key], key)
+	}
+}
+
 func TestVendorDataTemplate_WithAgentImage(t *testing.T) {
 	vendorDataTmpl, err := os.ReadFile(filepath.Join("..", "..", "..", "images", "netboot", "assets", "vendor-data.tmpl"))
 	if err != nil {
