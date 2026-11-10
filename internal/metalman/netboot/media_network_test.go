@@ -118,13 +118,20 @@ func TestMediaLocalInstallerISO(t *testing.T) {
 
 			wantCPIO, err := hostnetwork.MediaCPIO(testHostNetwork(), m.Spec.Netboot().DHCPLeases[0])
 			require.NoError(t, err)
-			require.Equal(t, map[string][]byte{
+			// The ISO9660 tree carries the GRUB config too, because a CD-ROM
+			// boot roots GRUB there, for example at (cd0)/grub.
+			wantTree := map[string][]byte{
 				"unbounded/" + id:      {},
 				"unbounded/vmlinuz":    []byte("kernel " + arch),
 				"unbounded/initrd":     []byte("initrd " + arch),
 				"unbounded/init.cpio":  []byte("init " + arch),
 				"unbounded/media.cpio": wantCPIO,
-			}, tree)
+			}
+			for _, path := range []string{"EFI/BOOT/grub.cfg", "EFI/ubuntu/grub.cfg", "boot/grub/grub.cfg", "grub/grub.cfg", "grub.cfg"} {
+				wantTree[path] = config
+			}
+
+			require.Equal(t, wantTree, tree)
 
 			console := " console=tty0 console=ttyS0,115200n8"
 			if arch == "arm64" {

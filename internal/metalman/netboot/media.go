@@ -511,6 +511,11 @@ func localBootConfig(u *url.URL, id, arch string) ([]byte, error) {
 	return fmt.Appendf(nil, "search --no-floppy --file --set=root /unbounded/%s\nlinux /unbounded/vmlinuz unbounded.install_url=%s%s\ninitrd /unbounded/initrd /unbounded/init.cpio /unbounded/media.cpio\nboot\n", id, installURL, console), nil
 }
 
+// mediaGrubConfigPaths lists where the media carries its GRUB config, both in
+// the FAT image and in the ISO9660 tree. Ubuntu GRUB builds use different
+// compiled prefixes.
+var mediaGrubConfigPaths = []string{"/EFI/BOOT/grub.cfg", "/EFI/ubuntu/grub.cfg", "/boot/grub/grub.cfg", "/grub/grub.cfg", "/grub.cfg"}
+
 func (p *MediaProvider) buildISO(ctx context.Context, stage, boot, shim, grub string, config []byte, files []mediaFile) error {
 	dir, err := os.MkdirTemp(filepath.Dir(stage), ".iso-")
 	if err != nil {
@@ -523,7 +528,16 @@ func (p *MediaProvider) buildISO(ctx context.Context, stage, boot, shim, grub st
 		return err
 	}
 
-	if err := writeMediaTree(root, files); err != nil {
+	// When firmware boots the El Torito image from a CD-ROM, Ubuntu GRUB
+	// sets its root to the ISO9660 file system, for example (cd0)/grub, not
+	// to the FAT image. Place the same config in the ISO9660 tree so GRUB
+	// finds it there too.
+	tree := append([]mediaFile(nil), files...)
+	for _, dst := range mediaGrubConfigPaths {
+		tree = append(tree, mediaFile{Path: strings.TrimPrefix(dst, "/"), Data: config})
+	}
+
+	if err := writeMediaTree(root, tree); err != nil {
 		return err
 	}
 
@@ -570,7 +584,7 @@ func (p *MediaProvider) buildISO(ctx context.Context, stage, boot, shim, grub st
 	// only the same live config handoff, never install intent or credentials.
 	// On rack manager USB media, GRUB sees (hd0,gpt2) and finds its config next
 	// to the EFI binary.
-	for _, dst := range []string{"/EFI/BOOT/grub.cfg", "/EFI/ubuntu/grub.cfg", "/boot/grub/grub.cfg", "/grub/grub.cfg", "/grub.cfg"} {
+	for _, dst := range mediaGrubConfigPaths {
 		if err := run(ctx, "mcopy", "-i", fat, configPath, "::"+dst); err != nil {
 			return err
 		}
