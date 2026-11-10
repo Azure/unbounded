@@ -425,8 +425,8 @@ type Node struct {
 	catchUpSentAt   int64
 	ahead           []aheadDelta
 	// snapFrom is the peer the current view's snapshot came from ("" if
-	// it came from the leader of that view, or the view was built from
-	// deltas). unconfirmed is set while such a snapshot has had no delta
+	// it came from the leader of that view as named by the Lease, or the
+	// view was built from deltas). unconfirmed is set while such a snapshot has had no delta
 	// applied on top of it, since its version and digest are trusted on
 	// decode; badBase is set when a delta failed its digest check against
 	// the current view.

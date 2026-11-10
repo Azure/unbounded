@@ -194,7 +194,8 @@ func (n *Node) adoptSnapshot(now int64, nv *view.View) {
 }
 
 // adoptSnapshotFrom installs a snapshot served by the peer at from ("" when
-// the source is trusted: the leader of the snapshot, or the local config).
+// the source is trusted: the leader of the snapshot as named by the Lease
+// at its term, or the local config).
 func (n *Node) adoptSnapshotFrom(now int64, nv *view.View, from string) {
 	n.snapFrom = from
 	n.unconfirmed, n.unconfirmedAt, n.badBase = from != "", now, false
