@@ -255,8 +255,50 @@ beyond its share.
 
 The default storage is slab files under `/var/lib/racer/slabs`, with
 raw block devices as an alternative. Checkpoints let a node
-recover cached pages after a restart. The cache is not durable storage; keep
-the source available to refill missing pages.
+recover cached pages after a restart. Read data is not durable; keep the
+source available to refill missing pages.
+
+Written pages that are not yet uploaded are pinned and cannot be evicted. They
+live in separate write segments and are recorded in a journal that the node
+replays when it starts. Each cache limits how much of its disk share such pages
+may use (`spec.writes.maxDirtyPercent`).
+
+## How a Write Works
+
+A cache with writes turned on can act as a fast checkpoint store. A training
+job writes a checkpoint to Racer at disk and network speed and goes back to
+work. Racer uploads it to object storage in the background.
+
+1. The app sends `PUT` to the cache's client socket.
+2. The local dataplane cuts the body into pages, encrypts them, and asks each
+   page's top owners to copy it.
+3. Each owner writes the page to disk, flushes it with `fdatasync`, and
+   records it in a journal.
+4. When every page has enough copies (2 by default), the object becomes
+   visible to readers and the app gets `201 Created`.
+5. Later, the owners upload the pages to the origin, and one node commits the
+   blob. After that, the pages are ordinary cached pages.
+
+Key rules:
+
+- **Create-once.** An object cannot be overwritten. Each checkpoint uses new
+  keys, so a write that fails halfway never corrupts an older checkpoint.
+- **Manifest last.** A checkpoint is complete only when its metadata object
+  exists. Write data objects first and the metadata object last. A reader that
+  finds no metadata object treats the checkpoint as incomplete.
+- **Choose what to upload.** Each write picks an upload mode: `auto` uploads
+  in the background, `manual` waits for a `persist` call, and `never` keeps it
+  only in the cache. Keep most checkpoints cache-only and upload every Nth one.
+- **Drop old checkpoints early.** Deleting a checkpoint before upload frees its
+  space with no upload cost. Cache-only checkpoints are removed when their hold
+  time ends.
+- **Copies, not a system of record.** Until its upload commits, a written
+  object survives only while one of its copies survives. Racer copies pages
+  again when a node leaves, but losing every copy before upload loses the
+  object. Use `Racer-Durability: origin` to wait for the upload instead.
+
+See [Object writes]({{< relref "reference/racer#object-writes" >}}) and
+[Save PyTorch Checkpoints to Racer]({{< relref "guides/racer-checkpoints" >}}).
 
 ## Security
 
