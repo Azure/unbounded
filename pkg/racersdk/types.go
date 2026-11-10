@@ -94,6 +94,9 @@ type Metadata struct {
 	// ExpiresAt is when Racer must stop serving this version from cache. It
 	// is required and kept at millisecond precision.
 	ExpiresAt time.Time
+	// UploadState is set by [Client.Stat] for objects written to the cache
+	// and is empty otherwise. Origins leave it empty.
+	UploadState UploadState
 }
 
 func (m Metadata) wire() wire.Metadata {

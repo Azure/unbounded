@@ -949,6 +949,8 @@ type Response struct {
 	First, Last uint64
 	Length      int64
 	Close       bool
+	// UploadState is Racer-Upload-State on a client HEAD of a written object.
+	UploadState string
 }
 
 // ParseResponseHead validates a success or empty protocol error against the exact
@@ -965,7 +967,20 @@ func ParseClientHeadResponse(head []byte, request Request) (Response, error) {
 		return Response{}, failure(ErrorProtocol, "response", nil)
 	}
 
-	return parseResponseHead(head, request, nil, "HEAD, POST")
+	result, err := parseResponseHead(head, request, nil, "HEAD, POST")
+	if err != nil {
+		return result, err
+	}
+
+	if values, ok := HeadHeaders(head)["Racer-Upload-State"]; ok {
+		if len(values) != 1 || !ValidUploadState(values[0]) {
+			return Response{}, failure(ErrorProtocol, "response", nil)
+		}
+
+		result.UploadState = values[0]
+	}
+
+	return result, nil
 }
 
 func parseResponseHead(head []byte, request Request, snapshot *Metadata, allow string) (Response, error) {

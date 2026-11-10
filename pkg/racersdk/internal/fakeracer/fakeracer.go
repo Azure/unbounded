@@ -33,9 +33,38 @@ func NewHandler(transport http.RoundTripper) http.Handler {
 
 // NewHandlerWithPrefetch serves prefetch requests from prefetches.
 func NewHandlerWithPrefetch(transport http.RoundTripper, prefetches *Prefetches) http.Handler {
+	return NewHandlerWithWrites(transport, prefetches, nil)
+}
+
+// NewHandlerWithWrites also serves the write API from writes. A nil writes
+// answers every write with 405, like a cache without writes. Host-write
+// needs the server to use [FileListener] and [ConnContext].
+func NewHandlerWithWrites(transport http.RoundTripper, prefetches *Prefetches, writes *Writes) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == wire.PrefetchPath || strings.HasPrefix(r.URL.Path, wire.PrefetchPath+"/") {
 			prefetches.ServeHTTP(w, r)
+			return
+		}
+
+		if IsWrite(r) {
+			files := takeFiles(r.Context())
+			defer func() {
+				for _, f := range files {
+					closeBody(f)
+				}
+			}()
+
+			if writes == nil {
+				writeFailure(w, WriteReply{Status: 405})
+				return
+			}
+
+			writes.ServeWrite(w, r, files)
+
+			return
+		}
+
+		if writes != nil && writes.ServeHead(w, r) {
 			return
 		}
 

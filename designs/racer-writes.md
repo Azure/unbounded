@@ -1293,6 +1293,27 @@ Errors map to typed errors: `ErrExists` (412), `ErrWritesDisabled` (405),
 computed without `versionId` (`keys.py:59-86`); passing a version ID is a client
 error. Both SDKs retry `503 dirty-cap` only when the caller opts in.
 
+As implemented (WP9), the SDKs refine this API:
+
+- Go: a rejected write returns `*WriteError{Op, Status, Code, RetryAfter}`,
+  whose `Is` matches the sentinels above plus `ErrConflict` (409),
+  `ErrNotFound` (404), `ErrInvalidRequest` (400, 411, 413, 428, 431), and
+  `ErrUnavailable` (503, 504). `WriteOptions.RetryBusy time.Duration` is the
+  opt-in: it retries `503` for up to that long, waiting `Retry-After` (at least
+  1 s), and `Put` retries only when `body` is an `io.ReadSeeker`.
+  `UploadState` constants are `UploadStatePending`, `UploadStateUploading`,
+  `UploadStateCommitted`, `UploadStateFailed`, `UploadStateNever`,
+  `UploadStateManual`. `Metadata.UploadState` carries `Racer-Upload-State`
+  from `Stat`. `racersdktest.NewClientWithWrites(t, origin)` returns a client
+  and a `*Writes` fake directory (`Object`, `Calls`, `Reject`, `SetEnabled`,
+  `SetDefaultUpload`, `SetUploadState`); `HostWrite` descriptors arrive via
+  `SCM_RIGHTS` in the fake.
+- Python: `write` and `host_write` take `retry_busy: float = 0.0` (seconds,
+  same rule; `write` retries only bytes-like or seekable data). Errors are
+  `WriteError(StatusError)` subclasses `Exists`, `WritesDisabled`, `Busy`
+  (also an `Unavailable`), `UploadFailed`, `Conflict`, with `code` and
+  `retry_after`. `Metadata.upload_state` carries `Racer-Upload-State`.
+
 Tests: golden heads; fake-server round trips for each status; `SCM_RIGHTS`
 descriptor passing for `host_write` (mirror `pkg/racersdk/hostread_test.go`).
 
