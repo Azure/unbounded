@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/Azure/unbounded/internal/gantry/config"
+	"github.com/Azure/unbounded/internal/gantry/contentstore"
 	"github.com/Azure/unbounded/internal/gantry/metrics"
 	"github.com/Azure/unbounded/internal/gantry/mirror"
 	"github.com/Azure/unbounded/internal/gantry/origin"
@@ -70,6 +71,11 @@ func serveRacerAgent(ctx context.Context, c *config.Config, logger *slog.Logger,
 		return fmt.Errorf("racer origin client: %w", err)
 	}
 
+	originOptions, err := racerOriginOptions(c)
+	if err != nil {
+		return err
+	}
+
 	// Signal cancellation starts draining; cancelOrigin runs after HTTP drain.
 	originCtx, cancelOrigin := context.WithCancel(context.WithoutCancel(ctx))
 	originDone := make(chan struct{})
@@ -79,13 +85,16 @@ func serveRacerAgent(ctx context.Context, c *config.Config, logger *slog.Logger,
 	go func() {
 		defer close(originDone)
 
-		originErr = deps.serveOrigin(originCtx, racer.OriginConfig(c, cache), racer.Origin(c, originClient))
+		originErr = deps.serveOrigin(originCtx, racer.OriginConfig(c, cache), racer.Origin(c, originClient, originOptions...))
 	}()
 
 	// Always install the handler, even without a client, so unavailable requests
 	// retain Racer correlation headers and rate-limited failure diagnostics.
 	mirrorSrv := mirror.New(c, nil, originClient,
-		mirror.WithContentBackend(racer.NewHandler(deps.client, originClient, logger, racer.WithRetryBudget(c.RacerRetryBudget), racer.WithRetryObserver(telemetry.MirrorRetry), racer.WithAccessCheck(originClient))), mirror.WithLogger(logger), mirror.WithStartupReadinessGate())
+		mirror.WithContentBackend(racer.NewHandler(deps.client, originClient, logger, racer.WithRetryBudget(c.RacerRetryBudget), racer.WithRetryObserver(telemetry.MirrorRetry), racer.WithAccessCheck(originClient),
+			// Integration seam: add racer.WithInvalidator(deps.client) once
+			// racersdk.Client implements Invalidate.
+			racer.WithDigestMismatchObserver(telemetry.DigestMismatch))), mirror.WithLogger(logger), mirror.WithStartupReadinessGate())
 
 	var (
 		ready   atomic.Bool
@@ -259,4 +268,19 @@ func shutdownRacerAgent(servers []*http.Server, cancelOrigin context.CancelFunc,
 	}
 
 	return retErr
+}
+
+// racerOriginOptions serves Racer local-only page requests from the node's
+// containerd content store unless racer_content_root is empty.
+func racerOriginOptions(c *config.Config) ([]racer.OriginOption, error) {
+	if c.RacerContentRoot == "" {
+		return nil, nil
+	}
+
+	store, err := contentstore.New(c.RacerContentRoot)
+	if err != nil {
+		return nil, fmt.Errorf("racer content store: %w", err)
+	}
+
+	return []racer.OriginOption{racer.WithLocalStore(racer.ContentStore(store))}, nil
 }

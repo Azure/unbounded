@@ -286,3 +286,52 @@ func TestRacerDisabledPreservesLegacyValidation(t *testing.T) {
 		})
 	}
 }
+
+func TestRacerContentRoot(t *testing.T) {
+	c := NewDefault()
+	c.RacerEnabled = true
+	c.UpstreamRegistries = []UpstreamRegistry{{Name: "registry.example", Endpoint: "https://registry.example"}}
+
+	if c.RacerContentRoot != "/var/lib/containerd/io.containerd.content.v1.content" {
+		t.Fatalf("default = %q", c.RacerContentRoot)
+	}
+
+	if err := c.LoadYAML(strings.NewReader("racer_content_root: /yaml/content")); err != nil || c.RacerContentRoot != "/yaml/content" {
+		t.Fatalf("YAML = %q, err = %v", c.RacerContentRoot, err)
+	}
+
+	env := func(key string) string {
+		if key == "GANTRY_RACER_CONTENT_ROOT" {
+			return "/env/content"
+		}
+
+		return ""
+	}
+
+	if err := c.LoadEnv(env); err != nil || c.RacerContentRoot != "/env/content" {
+		t.Fatalf("env = %q, err = %v", c.RacerContentRoot, err)
+	}
+
+	flags := flag.NewFlagSet("test", flag.ContinueOnError)
+	c.BindFlags(flags)
+
+	if err := flags.Parse([]string{"--racer-content-root=/flag/content"}); err != nil || c.RacerContentRoot != "/flag/content" {
+		t.Fatalf("flag = %q, err = %v", c.RacerContentRoot, err)
+	}
+
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
+	}
+
+	c.RacerContentRoot = ""
+	if err := c.Validate(); err != nil {
+		t.Fatalf("empty must disable local replicas: %v", err)
+	}
+
+	for _, bad := range []string{"relative", "/a/../b", "/a/"} {
+		c.RacerContentRoot = bad
+		if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "racer_content_root") {
+			t.Fatalf("%q validation = %v", bad, err)
+		}
+	}
+}

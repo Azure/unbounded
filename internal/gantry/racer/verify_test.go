@@ -14,7 +14,10 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
+	"github.com/Azure/unbounded/internal/gantry/metrics"
 	"github.com/Azure/unbounded/pkg/racersdk"
 )
 
@@ -180,5 +183,15 @@ func TestVerifyingWriterRejectsExcess(t *testing.T) {
 
 	if n, err := v.Write([]byte("b")); n != 1 || err != nil || !v.verify() {
 		t.Fatalf("final Write = %d, %v", n, err)
+	}
+}
+
+func TestDigestMismatchMetric(t *testing.T) {
+	m := NewMetrics(metrics.New())
+	m.DigestMismatch()
+	m.DigestMismatch()
+
+	if got := testutil.ToFloat64(m.mismatches); got != 2 {
+		t.Fatalf("mismatches = %v, want 2", got)
 	}
 }

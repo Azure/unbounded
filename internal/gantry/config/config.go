@@ -30,11 +30,14 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/Azure/unbounded/internal/gantry/contentstore"
 )
 
 // Recognized StorageMode values.
@@ -70,6 +73,13 @@ type Config struct {
 	// retrying transient Racer failures, including resuming a response body
 	// after a mid-stream failure. Zero disables retries; negative is invalid.
 	RacerRetryBudget time.Duration `yaml:"racer_retry_budget"`
+
+	// RacerContentRoot is the node's containerd content store directory, read
+	// only to serve Racer local-only page requests when the ClusterCache keeps
+	// no copy of its own (adapter persistence). Empty disables local replicas;
+	// because empty environment values are ignored, disable it through YAML or
+	// the flag rather than GANTRY_RACER_CONTENT_ROOT.
+	RacerContentRoot string `yaml:"racer_content_root"`
 
 	// ---------- Listeners ----------
 
@@ -567,6 +577,7 @@ func NewDefault() *Config {
 		RacerMaxConnections:           64,
 		RacerOriginConcurrentRequests: 64,
 		RacerRetryBudget:              30 * time.Second,
+		RacerContentRoot:              contentstore.DefaultRoot,
 		MirrorListen:                  "127.0.0.1:5000",
 		MirrorBindAllowNonLoopback:    false,
 		ArtifactStreamingEnabled:      false,
@@ -799,6 +810,7 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setInt("RACER_MAX_CONNECTIONS", &c.RacerMaxConnections)
 	setInt("RACER_ORIGIN_CONCURRENT_REQUESTS", &c.RacerOriginConcurrentRequests)
 	setDur("RACER_RETRY_BUDGET", &c.RacerRetryBudget)
+	setStr("RACER_CONTENT_ROOT", &c.RacerContentRoot)
 	setStr("MIRROR_LISTEN", &c.MirrorListen)
 	setBool("MIRROR_BIND_ALLOW_NON_LOOPBACK", &c.MirrorBindAllowNonLoopback)
 	setBool("ARTIFACT_STREAMING_ENABLED", &c.ArtifactStreamingEnabled)
@@ -912,6 +924,7 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.IntVar(&c.RacerMaxConnections, "racer-max-connections", c.RacerMaxConnections, "Racer bulk connection and live value limit (0 uses 64)")
 	fs.IntVar(&c.RacerOriginConcurrentRequests, "racer-origin-concurrent-requests", c.RacerOriginConcurrentRequests, "Racer origin concurrent GET callback and body limit (0 uses 64)")
 	fs.DurationVar(&c.RacerRetryBudget, "racer-retry-budget", c.RacerRetryBudget, "Total backoff per mirror request for retrying transient Racer failures (0 disables retries)")
+	fs.StringVar(&c.RacerContentRoot, "racer-content-root", c.RacerContentRoot, "containerd content store root for Racer local replicas (empty disables)")
 	fs.StringVar(&c.MirrorListen, "mirror-listen", c.MirrorListen, "address for the containerd-facing mirror endpoint (loopback)")
 	fs.BoolVar(&c.MirrorBindAllowNonLoopback, "mirror-bind-allow-non-loopback", c.MirrorBindAllowNonLoopback, "opt in to a non-loopback mirror bind (e.g. when using hostPort + hostIP=127.0.0.1 in Kubernetes)")
 	fs.BoolVar(&c.ArtifactStreamingEnabled, "artifact-streaming-enabled", c.ArtifactStreamingEnabled, "enable the node-local OverlayBD /blobs/ range endpoint")
@@ -1247,6 +1260,10 @@ func (c *Config) Validate() error {
 
 		if c.RacerRetryBudget < 0 {
 			errs = append(errs, fmt.Errorf("racer_retry_budget: must be >= 0 (zero disables retries), got %v", c.RacerRetryBudget))
+		}
+
+		if root := c.RacerContentRoot; root != "" && (!filepath.IsAbs(root) || filepath.Clean(root) != root) {
+			errs = append(errs, fmt.Errorf("racer_content_root: must be an absolute clean path or empty, got %q", root))
 		}
 
 		return errors.Join(errs...)

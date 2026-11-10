@@ -386,3 +386,22 @@ func TestRacerIgnoresSharedCredentialFile(t *testing.T) {
 		t.Fatalf("Racer loaded p2p credentials or leaked client: %v", err)
 	}
 }
+
+func TestRacerOriginOptions(t *testing.T) {
+	c := config.NewDefault()
+
+	opts, err := racerOriginOptions(c)
+	if err != nil || len(opts) != 1 {
+		t.Fatalf("default root: opts=%d err=%v", len(opts), err)
+	}
+
+	c.RacerContentRoot = ""
+	if opts, err := racerOriginOptions(c); err != nil || len(opts) != 0 {
+		t.Fatalf("empty root must disable local replicas: opts=%d err=%v", len(opts), err)
+	}
+
+	c.RacerContentRoot = "relative"
+	if _, err := racerOriginOptions(c); err == nil {
+		t.Fatal("relative root accepted")
+	}
+}

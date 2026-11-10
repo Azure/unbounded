@@ -1400,6 +1400,7 @@ type Metrics struct {
 	originRequests  *prometheus.CounterVec
 	originBodyBytes *prometheus.CounterVec
 	retries         *prometheus.CounterVec
+	mismatches      prometheus.Counter
 }
 
 // NewMetrics registers mirror and origin metrics.
@@ -1411,6 +1412,7 @@ func NewMetrics(reg *metrics.Registry) *Metrics {
 		originRequests:  reg.NewCounterVec("racer", prometheus.CounterOpts{Name: "gantry_racer_origin_requests_total", Help: "Upstream HTTP round trips, including HEAD, GET, and authentication; status zero denotes transport failure."}, []string{"method", "status"}),
 		originBodyBytes: reg.NewCounterVec("racer", prometheus.CounterOpts{Name: "gantry_racer_origin_bytes_total", Help: "Upstream GET body bytes read, including partial transfers."}, []string{"kind"}),
 		retries:         reg.NewCounterVec("racer", prometheus.CounterOpts{Name: "gantry_racer_mirror_retries_total", Help: "Racer mirror retries of transient failures by stage (stat, get, write_body)."}, []string{"stage"}),
+		mismatches:      reg.NewCounter("racer", prometheus.CounterOpts{Name: "gantry_racer_mirror_digest_mismatches_total", Help: "Full Racer mirror responses aborted because the bytes did not match the digest."}),
 	}
 
 	return m
@@ -1458,4 +1460,9 @@ func (m *Metrics) MirrorRetry(stage string) {
 	}
 
 	m.retries.WithLabelValues(stage).Inc()
+}
+
+// DigestMismatch records one full response aborted by digest verification.
+func (m *Metrics) DigestMismatch() {
+	m.mismatches.Inc()
 }
