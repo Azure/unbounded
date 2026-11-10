@@ -68,6 +68,7 @@ type Cluster struct {
 	validated map[*view.View]bool
 	faultEnd  int64
 	ctl       controlState
+	adv       *adversary
 
 	cov covHandles
 }
@@ -454,6 +455,12 @@ func (m *member) after() {
 	now := c.Sim.Now()
 
 	for _, call := range m.n.Outbox() {
+		if call.To == adversaryAddr && c.adv != nil {
+			c.adv.serve(m, call.ID, call.Msg)
+
+			continue
+		}
+
 		to, ok := c.member(call.To)
 		if !ok {
 			m.complete(call.ID, nil, errors.New("bad address"))
@@ -641,6 +648,15 @@ func (c *Cluster) onPublish(m *member, d *view.Delta) {
 
 func (c *Cluster) onView(m *member, v *view.View) {
 	ver := v.Version()
+
+	if c.forgedView(v) {
+		// A forged view was never published, so it is exempt from the
+		// version invariants, and leaving it (a rollback) is no
+		// regression: m.last keeps the last published version.
+		c.Cov.Hit("forgery-adopted")
+
+		return
+	}
 
 	if old, ok := c.versions[ver]; ok && old != v.Digest() {
 		c.Fail(fmt.Errorf("version %v has two digests %v and %v", ver, old, v.Digest()))
@@ -1320,6 +1336,8 @@ func (c *Cluster) applyControl(f Fault) {
 		}
 	case Checkpoint:
 		c.checkpoint(f.Start + f.Duration)
+	case Forgery:
+		c.startForgery(f)
 	default:
 	}
 }

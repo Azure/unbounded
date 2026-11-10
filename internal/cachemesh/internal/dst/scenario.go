@@ -67,6 +67,11 @@ const (
 	PartialRestart
 	// Checkpoint requires the cluster to have converged by Start+Duration.
 	Checkpoint
+	// Forgery runs a peer that sends forged control messages (later terms,
+	// NewTerm deltas, and snapshots led by members the Lease does not
+	// name) to Count random members every Value nanoseconds for Duration.
+	// It is never generated at random; scenarios add it explicitly.
+	Forgery
 
 	// numFaultKinds counts the kinds Generate draws from its main stream;
 	// later kinds come from a separate stream so adding them did not
@@ -79,7 +84,7 @@ var faultNames = [...]string{
 	"network-partition", "leader-crash", "apiserver-outage", "slow-members",
 	"clock-skew", "clock-drift", "message-loss", "message-duplication",
 	"graceful-drain", "keyspace-invalidation", "lease-conflicts", "pause",
-	"cold-restart", "partial-restart", "checkpoint",
+	"cold-restart", "partial-restart", "checkpoint", "forgery",
 }
 
 // String returns the kind's name.
