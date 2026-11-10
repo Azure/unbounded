@@ -334,6 +334,8 @@ struct World {
     live: BTreeMap<usize, Written>,
     /// Etags of deleted or expired versions; never uploaded.
     gone: BTreeSet<String>,
+    /// The current faulted read may answer 404 (see `crash_restart`).
+    tolerate_404: bool,
     /// Keys whose only copies were lost with a removed node: their state
     /// is `failed` and reads may answer anything but their old bytes.
     lost: BTreeSet<usize>,
@@ -380,6 +382,7 @@ impl World {
             live: BTreeMap::new(),
             gone: BTreeSet::new(),
             lost: BTreeSet::new(),
+            tolerate_404: false,
             acked: BTreeSet::new(),
             upload_faults: 0,
             profile,
@@ -1009,15 +1012,19 @@ impl World {
         let nodes = self.harness.nodes.len();
         let index = self.pick(nodes);
         self.note("crash-restart");
+        let object = FIRST + self.pick(KEYS);
+        // With `replicas=1` the coordinator keeps the only manifest: while
+        // it is down, no member knows the object, and 404 is the design's
+        // answer (`replicate_manifest` sends `replicas - 1` copies).
+        let sole_manifest = self.live.get(&object).is_some_and(|w| w.replicas == 1)
+            && self.harness.ranked_nodes(&self.object(object)).first() == Some(&index);
         let id = self.harness.retire(&self.env, index, true);
-        if std::env::var_os("RACER_DST_WRITES_TRACE").is_some() {
-            eprintln!("crashed index {index}");
-        }
         if self.pick(2) == 0 {
             // Readers during the outage: correct bytes or retryable.
-            let object = FIRST + self.pick(KEYS);
             let reader = self.pick(nodes - 1);
+            self.tolerate_404 = sole_manifest;
             self.read_during_fault(reader, object);
+            self.tolerate_404 = false;
         }
         self.harness.add(&self.env, Some(id));
         let restarted = self.harness.nodes.pop().unwrap();
@@ -1078,7 +1085,10 @@ impl World {
                 );
             }
             self.note("faulted-read-hit");
-        } else if response.status == 404 && want.as_ref().is_some_and(|w| !w.uploading) {
+        } else if response.status == 404
+            && want.as_ref().is_some_and(|w| !w.uploading)
+            && !self.tolerate_404
+        {
             // The read-path gap WP11 fixed: a reader that skips a silent
             // coordinator must not answer an authoritative 404.
             let ranked = self.harness.ranked_nodes(&self.object(object));
@@ -1087,6 +1097,8 @@ impl World {
                 self.harness.seed,
                 self.harness.nodes.len()
             );
+        } else if response.status == 404 && self.tolerate_404 {
+            self.note("faulted-read-404-sole-manifest");
         }
     }
 
@@ -1567,6 +1579,21 @@ mod tests {
                     world.read(reader, object);
                 }
                 world.check_holders(object);
+            }
+            // A delete reaches every member that may coordinate or serve
+            // the manifest after the joins; none keeps serving the version.
+            for object in world.live.keys().copied().collect::<Vec<_>>() {
+                let node = object % world.harness.nodes.len();
+                let deleted = world.simple(node, "DELETE", &key(object)).unwrap();
+                assert_eq!(deleted.status, 204, "seed {seed}");
+                let written = world.live.remove(&object).unwrap();
+                world.gone.insert(written.etag);
+            }
+            world.wait(Duration::from_secs(2));
+            for object in FIRST..FIRST + 4 {
+                for reader in 0..world.harness.nodes.len() {
+                    world.read(reader, object);
+                }
             }
         }
     }
