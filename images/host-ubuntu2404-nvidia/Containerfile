@@ -45,10 +45,10 @@ ARG NVIDIA_DRIVER_VERSION=595.71.05
 ARG NVLSM_VERSION=2025.10.12-1
 COPY --from=fetch /rootfs/ /
 COPY images/host-ubuntu2404-nvidia/assets/rootfs.sh /usr/local/bin/build-rootfs
+# install and finish share one RUN so the DKMS signing key, which finish
+# deletes, is never committed to a layer that the build cache exports.
 RUN KERNEL_PACKAGE="${KERNEL_PACKAGE}" NVIDIA_DRIVER_VERSION="${NVIDIA_DRIVER_VERSION}" \
-    NVLSM_VERSION="${NVLSM_VERSION}" sh /usr/local/bin/build-rootfs install
-RUN KERNEL_PACKAGE="${KERNEL_PACKAGE}" NVIDIA_DRIVER_VERSION="${NVIDIA_DRIVER_VERSION}" \
-    NVLSM_VERSION="${NVLSM_VERSION}" sh /usr/local/bin/build-rootfs finish
+    NVLSM_VERSION="${NVLSM_VERSION}" sh -c 'sh /usr/local/bin/build-rootfs install && sh /usr/local/bin/build-rootfs finish'
 
 FROM --platform=$BUILDPLATFORM docker.io/library/ubuntu:24.04 AS build
 ARG TARGETARCH
