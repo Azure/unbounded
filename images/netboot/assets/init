@@ -410,6 +410,7 @@ if [ -n "$DS_URL" ] || [ -n "$IP_PARAM" ]; then
             if [ "$DHCP_HOLD" = "1" ]; then
                 echo ""
                 echo "[DHCPv4]"
+                echo "ClientIdentifier=mac"
                 echo "UseRoutes=no"
                 echo "UseGateway=no"
                 echo "UseDNS=no"
@@ -423,9 +424,11 @@ if [ -n "$DS_URL" ] || [ -n "$IP_PARAM" ]; then
         # When unbounded.dhcp_hold=1, DHCP runs alongside the static address
         # only to hold the site lease for it, so the DHCP server does not
         # hand the address to another host. Routes, DNS, NTP, hostname, and
-        # domains from the lease are ignored.
+        # domains from the lease are ignored. The client identifies with the
+        # NIC MAC so site reservations keyed by MAC match.
         if [ "$DHCP_HOLD" = "1" ]; then
             DHCP4_CONFIG='      dhcp4: true
+      dhcp-identifier: mac
       dhcp4-overrides:
         use-routes: false
         use-dns: false

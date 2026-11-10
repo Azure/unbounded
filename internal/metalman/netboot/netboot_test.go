@@ -1115,6 +1115,7 @@ func renderNetworkConfigForLease(t *testing.T, holdLease bool) []byte {
 type parsedNetworkConfig struct {
 	Ethernets map[string]struct {
 		DHCP4          bool            `yaml:"dhcp4"`
+		DHCPIdentifier string          `yaml:"dhcp-identifier"`
 		DHCP4Overrides map[string]bool `yaml:"dhcp4-overrides"`
 		Addresses      []string        `yaml:"addresses"`
 	} `yaml:"ethernets"`
@@ -1132,6 +1133,7 @@ func TestNetworkConfigTemplate_SelectsBootLease(t *testing.T) {
 	require.Contains(t, body, "dhcp4: false")
 	require.Contains(t, body, "dhcp6: false")
 	require.NotContains(t, body, "dhcp4-overrides")
+	require.NotContains(t, body, "dhcp-identifier")
 	require.NotContains(t, body, "dhcp4: true")
 	require.NotContains(t, body, "10.0.1.20")
 
@@ -1155,6 +1157,7 @@ func TestNetworkConfigTemplate_HoldLeaseEnablesDHCP4WithOverrides(t *testing.T) 
 	require.NoError(t, yaml.Unmarshal(result, &parsed))
 	provisioning := parsed.Ethernets["provisioning"]
 	require.True(t, provisioning.DHCP4)
+	require.Equal(t, "mac", provisioning.DHCPIdentifier)
 	require.Equal(t, []string{"10.0.2.21/23"}, provisioning.Addresses)
 	require.Equal(t, map[string]bool{
 		"use-routes":   false,
@@ -4380,4 +4383,5 @@ func TestTemplates_OlderControllerWithoutDHCPHoldLease(t *testing.T) {
 	require.Contains(t, network, "dhcp4: false")
 	require.NotContains(t, network, "dhcp4: true")
 	require.NotContains(t, network, "dhcp4-overrides")
+	require.NotContains(t, network, "dhcp-identifier")
 }

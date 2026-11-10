@@ -242,7 +242,8 @@ cloud-init network rendering so fallback DHCP configuration cannot conflict with
 that file. Set `holdLease: true` on a `dhcpLeases` entry to also run a DHCPv4
 client on the provisioning NIC so the site DHCP server keeps the lease for the
 static address and does not hand it to another host. Routes, DNS, NTP, hostname,
-and domains from DHCP are ignored. Leave it unset for DHCP-free provisioning.
+and domains from DHCP are ignored. The client identifies with the NIC MAC so
+reservations keyed by MAC match. Leave it unset for DHCP-free provisioning.
 The default netboot image serves the same lease as NoCloud
 `network-config`. If `spec.host.netboot.targetDisk` is
 set, the installer writes the image to that disk; otherwise it falls back to
