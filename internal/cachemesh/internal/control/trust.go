@@ -118,16 +118,18 @@ func (n *Node) admitTerm(now int64, t uint64) bool {
 	return false
 }
 
-// vouched reports whether snapshot nv, served in response m, comes from the
-// Lease holder of its term: the last Lease read names nv's leader at nv's
-// term, and that leader is the responder.
-func (n *Node) vouched(nv *view.View, m *Message) bool {
+// vouched reports whether snapshot nv, served in response m by the peer at
+// from, comes from the Lease holder of its term: the last Lease read names
+// nv's leader at nv's term, that leader is the responder, and the response
+// came from the address the Lease records. The responder's identity in m is
+// only a claim, so the address is what ties the response to the holder.
+func (n *Node) vouched(nv *view.View, m *Message, from string) bool {
 	if nv.Leader() != m.From.Slot || nv.Version() != m.Version {
 		return false
 	}
 
 	li, ok := n.el.Leader()
-	if !ok || li.ID != m.From.ID || !leaseNames(li, nv, nv.Term()) {
+	if !ok || li.ID != m.From.ID || li.Addr == "" || li.Addr != from || !leaseNames(li, nv, nv.Term()) {
 		return false
 	}
 

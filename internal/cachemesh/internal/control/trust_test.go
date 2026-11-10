@@ -322,6 +322,31 @@ func TestForgedSnapshotUnbackedRollsBack(t *testing.T) {
 	}
 }
 
+// TestImpersonatedLeaderSnapshotUnconfirmed: a response that claims to come
+// from the Lease holder (its identity and slot) but arrives from another
+// address is not vouched for, so it is adopted only as unconfirmed.
+func TestImpersonatedLeaderSnapshotUnconfirmed(t *testing.T) {
+	c := grow(t, 4)
+	l := c.leader()
+	cfg := c.cfg(4, []string{addr(l)})
+	j := c.add(cfg)
+	n := c.nodes[j]
+
+	li, _ := c.nodes[l].Elector().Leader()
+	n.el.noteHolder(Record{Holder: li.ID, Incarnation: li.Incarnation, Term: li.Term, Addr: li.Addr})
+
+	var m Message
+	if err := Decode(c.nodes[l].serveCatchUp(&Message{Kind: KindCatchUpRequest}), &m); err != nil {
+		t.Fatal(err)
+	}
+
+	n.onCatchUp(c.now, &m, "evil:1")
+
+	if !n.unconfirmed || n.snapFrom != "evil:1" {
+		t.Fatalf("impersonated leader snapshot adopted as confirmed (unconfirmed %v, from %q)", n.unconfirmed, n.snapFrom)
+	}
+}
+
 // TestVouchedSnapshotConfirmed: a snapshot served by the Lease holder of its
 // term is adopted as confirmed; the same snapshot without Lease knowledge
 // is adopted unconfirmed.

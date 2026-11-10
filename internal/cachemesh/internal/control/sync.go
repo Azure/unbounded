@@ -468,7 +468,7 @@ func (n *Node) onCatchUp(now int64, m *Message, from string) {
 		// Only a snapshot served by the Lease holder of its term is
 		// trusted; the leader a snapshot names and the responder's
 		// identity are both claims of the (unauthenticated) responder.
-		fromLeader := n.vouched(nv, m)
+		fromLeader := n.vouched(nv, m, from)
 		// A snapshot from a responder that claims to lead it, which the
 		// Lease does not contradict. It may roll back an unconfirmed
 		// view (below) but is adopted unconfirmed unless vouched.
