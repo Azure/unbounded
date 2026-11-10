@@ -208,6 +208,33 @@ route replace 203.0.113.0/24 via 198.51.100.1 dev bond0.64
 	}
 }
 
+func TestLocalMediaParseDistinctDottedNames(t *testing.T) {
+	// "." in a name must not act as a wildcard: e0-64 and e0.64 are distinct.
+	network := "ethernet e0 02:00:00:00:00:01 -\n" +
+		"vlan e0-64 e0 64 -\n" +
+		"vlan e0.64 e0 65 -\n" +
+		"address e0.64 192.0.2.10/24\n" +
+		"source e0.64 192.0.2.10\n"
+
+	for _, shell := range shells(t) {
+		t.Run(shell[0], func(t *testing.T) {
+			f := newFixture(t)
+			f.write(t, "media/network", network)
+
+			out, err := f.run(t, shell, `
+parse_network_file "$UB_MEDIA/network" || exit 1
+net_declared e0-64 || exit 2
+net_declared e0.64 || exit 3
+net_declared e0x64 && exit 4
+exit 0
+`)
+			if err != nil {
+				t.Fatalf("%v: %s", err, out)
+			}
+		})
+	}
+}
+
 func TestLocalMediaParseRejects(t *testing.T) {
 	base := "ethernet e0 02:00:00:00:00:01 -\naddress e0 192.0.2.10/24\nsource e0 192.0.2.10\n"
 	cases := map[string]string{
@@ -231,6 +258,7 @@ func TestLocalMediaParseRejects(t *testing.T) {
 		"too many arguments":   base + "dns 192.0.2.53 192.0.2.54\n",
 		"duplicate source":     base + "source e0 192.0.2.10\n",
 		"route bad next hop":   base + "route e0 default gateway\n",
+		"source dot wildcard":  "ethernet e0 02:00:00:00:00:01 -\naddress e0 192.0.2.10/24\nsource e0 192.0.2x10\n",
 		"no ethernet declared": "address e0 192.0.2.10/24\nsource e0 192.0.2.10\n",
 	}
 

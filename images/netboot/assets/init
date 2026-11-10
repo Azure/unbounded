@@ -227,7 +227,7 @@ net_cidr_ok() {
 }
 
 net_declared() {
-    grep -qx "$1" "$UB_WORK/names" 2>/dev/null
+    grep -Fqx -- "$1" "$UB_WORK/names" 2>/dev/null
 }
 
 net_declare() {
@@ -269,7 +269,7 @@ parse_network_file() {
                 [ "$#" -eq 3 ] || { log "network line $pn_lineno: ethernet needs 3 arguments"; return 1; }
                 net_declare "$1" || return 1
                 net_mac_ok "$2" || { log "network line $pn_lineno: invalid MAC $2"; return 1; }
-                if cut -d' ' -f2 "$UB_WORK/ethernet" | grep -qx "$2"; then
+                if cut -d' ' -f2 "$UB_WORK/ethernet" | grep -Fqx -- "$2"; then
                     log "network line $pn_lineno: duplicate MAC $2"
                     return 1
                 fi
@@ -329,7 +329,7 @@ net_check_references() {
         IFS=,
         for cr_member in $cr_members; do
             IFS=$cr_ifs
-            if ! cut -d' ' -f1 "$UB_WORK/ethernet" | grep -qx "$cr_member"; then
+            if ! cut -d' ' -f1 "$UB_WORK/ethernet" | grep -Fqx -- "$cr_member"; then
                 log "bond $cr_name member $cr_member is not a declared ethernet"
                 return 1
             fi
@@ -343,7 +343,7 @@ net_check_references() {
         return 1
     fi
     while read -r cr_name cr_link _; do
-        if ! cut -d' ' -f1 "$UB_WORK/ethernet" "$UB_WORK/bond" | grep -qx "$cr_link"; then
+        if ! cut -d' ' -f1 "$UB_WORK/ethernet" "$UB_WORK/bond" | grep -Fqx -- "$cr_link"; then
             log "vlan $cr_name link $cr_link is not a declared ethernet or bond"
             return 1
         fi
@@ -357,7 +357,7 @@ net_check_references() {
     [ -s "$UB_WORK/ethernet" ] || { log "network declares no ethernets"; return 1; }
     [ -s "$UB_WORK/source" ] || { log "network declares no source"; return 1; }
     read -r cr_name cr_ip < "$UB_WORK/source"
-    if ! grep -q "^$cr_name $cr_ip/" "$UB_WORK/address"; then
+    if ! cut -d/ -f1 "$UB_WORK/address" | grep -Fqx -- "$cr_name $cr_ip"; then
         log "source address $cr_ip is not declared on $cr_name"
         return 1
     fi

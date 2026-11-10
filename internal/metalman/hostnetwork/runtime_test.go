@@ -6,6 +6,8 @@ package hostnetwork
 import (
 	"strings"
 	"testing"
+
+	"github.com/Azure/unbounded/api/machina/v1alpha3"
 )
 
 const referenceRuntime = `ethernet enp49s0f0np0 02:00:00:00:00:01 -
@@ -128,5 +130,24 @@ func TestRenderRuntimeValidates(t *testing.T) {
 
 	if _, err := RenderRuntime(nil, l); err == nil {
 		t.Fatal("expected error for nil network")
+	}
+}
+
+func TestRenderRuntimeDistinctDottedNames(t *testing.T) {
+	n, l := single()
+	n.VLANs = []v1alpha3.VLANSpec{
+		{Name: "eth0-64", ID: 64, Link: "eth0"},
+		{Name: "eth0.64", ID: 65, Link: "eth0"},
+	}
+
+	got, err := RenderRuntime(n, l)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, want := range []string{"vlan eth0-64 eth0 64 -\n", "vlan eth0.64 eth0 65 -\n"} {
+		if !strings.Contains(string(got), want) {
+			t.Errorf("missing %q in:\n%s", want, got)
+		}
 	}
 }
