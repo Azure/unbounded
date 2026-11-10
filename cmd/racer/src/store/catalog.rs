@@ -3017,6 +3017,7 @@ mod priority_tests {
             priority,
             mode: racer_wire::control::CacheMode::Cached,
             origin: None,
+            writes: None,
         }
     }
 

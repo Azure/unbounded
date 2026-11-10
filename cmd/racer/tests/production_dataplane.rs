@@ -920,6 +920,7 @@ fn fixture_publication() -> Publication {
             priority: racer_wire::control::DEFAULT_PRIORITY,
             mode: racer_wire::control::CacheMode::Cached,
             origin: None,
+            writes: None,
         }],
         page_size: FIXTURE_PAGE_SIZE.get(),
     }

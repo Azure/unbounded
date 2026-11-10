@@ -3248,6 +3248,7 @@ pub(crate) mod tests {
                             priority,
                             mode: racer_wire::control::CacheMode::Cached,
                             origin: None,
+                            writes: None,
                         };
                     let weigh = |low_priority, high_priority| {
                         admission.policy().weights().update(&[

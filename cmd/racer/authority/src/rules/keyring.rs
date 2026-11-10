@@ -753,6 +753,7 @@ pub(crate) mod tests {
             mode: wire::CacheMode::Cached,
             origin: None,
             origin_socket: origin,
+            writes: None,
         }
     }
 

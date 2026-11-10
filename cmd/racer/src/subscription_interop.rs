@@ -257,6 +257,7 @@ impl SubscriptionFixture {
             priority: racer_wire::control::DEFAULT_PRIORITY,
             mode: racer_wire::control::CacheMode::Cached,
             origin: None,
+            writes: None,
         };
         snapshots
             .apply(Publication {

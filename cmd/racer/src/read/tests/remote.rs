@@ -320,6 +320,7 @@ fn remote_candidate_with_churn(
             priority: racer_wire::control::DEFAULT_PRIORITY,
             mode: racer_wire::control::CacheMode::Cached,
             origin: None,
+            writes: None,
         }],
         members: (0..4)
             .map(|i| racer_wire::control::Member {
@@ -969,6 +970,7 @@ fn metadata_coordinator_with_newer_publication(
             priority: racer_wire::control::DEFAULT_PRIORITY,
             mode: racer_wire::control::CacheMode::Cached,
             origin: None,
+            writes: None,
         }],
         page_size: racer_wire::object::PageSize::DEFAULT,
     }

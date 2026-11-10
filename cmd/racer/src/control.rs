@@ -393,6 +393,7 @@ impl Availability {
                             priority: racer_wire::control::DEFAULT_PRIORITY,
                             mode,
                             origin: None,
+                            writes: None,
                         }
                     })
                     .collect(),
@@ -3361,6 +3362,7 @@ mod caches_tests {
             priority,
             mode: racer_wire::control::CacheMode::default(),
             origin: None,
+            writes: None,
         }
     }
 

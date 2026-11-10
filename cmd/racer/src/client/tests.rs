@@ -978,6 +978,7 @@ fn definition() -> CacheDefinition {
         priority: racer_wire::control::DEFAULT_PRIORITY,
         mode: racer_wire::control::CacheMode::Cached,
         origin: None,
+        writes: None,
     }
 }
 fn scope() -> RequestScope {
@@ -3002,6 +3003,7 @@ fn priority_only_changes_reuse_listeners_beyond_retirement_bound() {
                 priority: racer_wire::control::DEFAULT_PRIORITY,
                 mode: racer_wire::control::CacheMode::Cached,
                 origin: None,
+                writes: None,
             }
         })
         .collect();

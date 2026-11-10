@@ -3272,6 +3272,7 @@ pub(super) mod tests {
                     priority: racer_wire::control::DEFAULT_PRIORITY,
                     mode: racer_wire::control::CacheMode::Cached,
                     origin: None,
+                    writes: None,
                 },
                 metadata.clone(),
                 admission.clone(),
