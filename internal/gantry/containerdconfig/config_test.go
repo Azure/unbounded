@@ -59,6 +59,85 @@ func TestApplyIsIdempotentAndRestoreIsExact(t *testing.T) {
 	}
 }
 
+func TestApplyUpdatesLegacyFilesystemReportingAndPreservesRestore(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, "config.toml")
+
+	original := []byte("version = 2\n")
+	if err := os.WriteFile(configPath, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	manager := Manager{
+		ConfigPath: configPath, DropInPath: filepath.Join(root, "conf.d/gantry.toml"),
+		StateDir: filepath.Join(root, "state"), Address: "/run/gantry.sock", SnapshotterName: "gantry-overlaybd",
+	}
+	if _, err := manager.Apply(); err != nil {
+		t.Fatal(err)
+	}
+
+	legacy := []byte("version = 2\n[proxy_plugins.gantry-overlaybd]\ntype = 'snapshot'\naddress = '/run/gantry.sock'\n")
+	for _, path := range []string{manager.DropInPath, manager.statePath("managed-drop-in.toml")} {
+		if err := os.WriteFile(path, legacy, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	manager.SnapshotterRoot = "/mnt/image-disk/gantry"
+
+	result, err := manager.Apply()
+	if err != nil || !result.Changed {
+		t.Fatalf("upgrade Apply = %+v, %v", result, err)
+	}
+
+	data, err := os.ReadFile(manager.DropInPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var document struct {
+		ProxyPlugins map[string]struct {
+			Exports map[string]string `toml:"exports"`
+		} `toml:"proxy_plugins"`
+	}
+	if err := toml.Unmarshal(data, &document); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := document.ProxyPlugins["gantry-overlaybd"].Exports["root"]; got != manager.SnapshotterRoot {
+		t.Fatalf("filesystem root = %q, want %q", got, manager.SnapshotterRoot)
+	}
+
+	if result, err := manager.Apply(); err != nil || result.Changed {
+		t.Fatalf("second Apply = %+v, %v", result, err)
+	}
+
+	if _, err := manager.Restore(); err != nil {
+		t.Fatal(err)
+	}
+
+	if data, err := os.ReadFile(configPath); err != nil || string(data) != string(original) {
+		t.Fatalf("restore = %q, %v", data, err)
+	}
+}
+
+func TestApplyRejectsRelativeSnapshotterRoot(t *testing.T) {
+	root := t.TempDir()
+
+	manager := Manager{
+		ConfigPath: filepath.Join(root, "config.toml"), DropInPath: filepath.Join(root, "gantry.toml"),
+		StateDir: filepath.Join(root, "state"), Address: "/run/gantry.sock",
+		SnapshotterName: "gantry-overlaybd", SnapshotterRoot: "relative/data",
+	}
+	if _, err := manager.Apply(); err == nil {
+		t.Fatal("relative snapshotter filesystem root accepted")
+	}
+
+	if _, err := os.Stat(manager.StateDir); !os.IsNotExist(err) {
+		t.Fatalf("invalid root changed managed state: %v", err)
+	}
+}
+
 func TestRestorePreservesConcurrentChanges(t *testing.T) {
 	root := t.TempDir()
 	configPath := filepath.Join(root, "config.toml")
@@ -155,8 +234,9 @@ func assertManagedConfig(t *testing.T, configPath, dropInPath string) {
 	var dropIn struct {
 		Version      int `toml:"version"`
 		ProxyPlugins map[string]struct {
-			Type    string `toml:"type"`
-			Address string `toml:"address"`
+			Type    string            `toml:"type"`
+			Address string            `toml:"address"`
+			Exports map[string]string `toml:"exports"`
 		} `toml:"proxy_plugins"`
 		Plugins map[string]struct {
 			Containerd struct {
@@ -173,7 +253,8 @@ func assertManagedConfig(t *testing.T, configPath, dropInPath string) {
 	}
 
 	plugin := dropIn.ProxyPlugins["gantry-overlaybd"]
-	if plugin.Type != "snapshot" || plugin.Address != "/run/gantry-overlaybd/gantry-overlaybd.sock" {
+	if plugin.Type != "snapshot" || plugin.Address != "/run/gantry-overlaybd/gantry-overlaybd.sock" ||
+		plugin.Exports["root"] != DefaultSnapshotterRoot {
 		t.Fatalf("managed drop-in = %+v", dropIn)
 	}
 
@@ -183,7 +264,7 @@ func assertManagedConfig(t *testing.T, configPath, dropInPath string) {
 }
 
 func TestMarshalDropInVersion3(t *testing.T) {
-	data, err := marshalDropIn([]byte("version = 3\n"), "/run/adapter.sock", "gantry-overlaybd")
+	data, err := marshalDropIn([]byte("version = 3\n"), "/run/adapter.sock", "gantry-overlaybd", DefaultSnapshotterRoot)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -213,7 +294,7 @@ func TestMarshalDropInVersion2WithCRIImagesPlugin(t *testing.T) {
 snapshotter = "overlaybd"
 `)
 
-	data, err := marshalDropIn(config, "/run/adapter.sock", "gantry-overlaybd")
+	data, err := marshalDropIn(config, "/run/adapter.sock", "gantry-overlaybd", DefaultSnapshotterRoot)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -248,12 +329,15 @@ func TestMarshalDropInEnablesRemoteSnapshotPulls(t *testing.T) {
 		{name: "modern plugin in legacy config", config: "version = 2\n[plugins.'io.containerd.cri.v1.images']\nsnapshotter = 'overlayfs'\n"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			data, err := marshalDropIn([]byte(tc.config), "/run/adapter.sock", "gantry-overlaybd")
+			data, err := marshalDropIn([]byte(tc.config), "/run/adapter.sock", "gantry-overlaybd", "/mnt/image-disk/gantry")
 			if err != nil {
 				t.Fatal(err)
 			}
 
 			var dropIn struct {
+				ProxyPlugins map[string]struct {
+					Exports map[string]string `toml:"exports"`
+				} `toml:"proxy_plugins"`
 				Plugins map[string]struct {
 					DisableAnnotations *bool `toml:"disable_snapshot_annotations"`
 					LocalPull          *bool `toml:"use_local_image_pull"`
@@ -264,6 +348,10 @@ func TestMarshalDropInEnablesRemoteSnapshotPulls(t *testing.T) {
 			}
 			if err := toml.Unmarshal(data, &dropIn); err != nil {
 				t.Fatal(err)
+			}
+
+			if got := dropIn.ProxyPlugins["gantry-overlaybd"].Exports["root"]; got != "/mnt/image-disk/gantry" {
+				t.Fatalf("image filesystem root = %q, want the actual snapshotter disk", got)
 			}
 
 			images := dropIn.Plugins["io.containerd.cri.v1.images"]

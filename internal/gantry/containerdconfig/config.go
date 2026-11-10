@@ -16,6 +16,8 @@ import (
 
 const importPattern = "/etc/containerd/conf.d/*.toml"
 
+const DefaultSnapshotterRoot = "/var/lib/gantry/snapshotter"
+
 type Result struct {
 	Changed   bool
 	Preserved bool
@@ -27,6 +29,7 @@ type Manager struct {
 	StateDir        string
 	Address         string
 	SnapshotterName string
+	SnapshotterRoot string
 }
 
 func (m Manager) Apply() (Result, error) {
@@ -76,7 +79,7 @@ func (m Manager) Apply() (Result, error) {
 		return Result{}, err
 	}
 
-	desiredDropIn, err := marshalDropIn(currentConfig, m.Address, m.SnapshotterName)
+	desiredDropIn, err := marshalDropIn(currentConfig, m.Address, m.SnapshotterName, m.SnapshotterRoot)
 	if err != nil {
 		return Result{}, err
 	}
@@ -255,6 +258,10 @@ func (m Manager) validate() error {
 		return errors.New("containerd config: config, drop-in, state, snapshotter name, and absolute socket address are required")
 	}
 
+	if m.SnapshotterRoot != "" && !filepath.IsAbs(m.SnapshotterRoot) {
+		return errors.New("containerd config: snapshotter root must be an absolute host path")
+	}
+
 	return nil
 }
 
@@ -312,7 +319,11 @@ func stringSlice(value any) ([]string, error) {
 	}
 }
 
-func marshalDropIn(config []byte, address, snapshotterName string) ([]byte, error) {
+func marshalDropIn(config []byte, address, snapshotterName, snapshotterRoot string) ([]byte, error) {
+	if snapshotterRoot == "" {
+		snapshotterRoot = DefaultSnapshotterRoot
+	}
+
 	var source struct {
 		Version int            `toml:"version"`
 		Plugins map[string]any `toml:"plugins"`
@@ -347,6 +358,7 @@ func marshalDropIn(config []byte, address, snapshotterName string) ([]byte, erro
 			snapshotterName: map[string]any{
 				"type":    "snapshot",
 				"address": address,
+				"exports": map[string]string{"root": snapshotterRoot},
 			},
 		},
 		"plugins": plugins,

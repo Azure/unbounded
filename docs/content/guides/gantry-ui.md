@@ -141,6 +141,15 @@ usage percentage is used bytes divided by used plus available bytes.
 Storage requires upgraded agents. Missing first observations stay unknown;
 agent timeouts retain the last reading without reachability warnings.
 
+If unused images accumulate and node events report `ImageGCFailed` for
+`io.containerd.snapshotter.v1.gantry-overlaybd`, the proxy snapshotter must
+export its actual host data root. The node configurator writes
+`proxy_plugins.gantry-overlaybd.exports.root` from
+`overlaybdConfig.snapshotterRoot`, rather than relying on containerd's
+in-process snapshotter directory default. Applying a changed registration
+requires restarting containerd. Update the OnDelete configurator only on
+drained nodes; do not replace snapshotter Pods supporting live workloads.
+
 Live byte availability requires Gantry agents built with the read-only
 `GET /v1/progress?digest=sha256:...,...` operations endpoint on port 9095.
 Released agents without this endpoint report **unknown** byte progress, with

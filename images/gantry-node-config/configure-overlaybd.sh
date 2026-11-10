@@ -8,6 +8,7 @@ set -eu
 : "${CONFIG_TOOL:=/usr/local/bin/gantry-node-config}"
 : "${GANTRY_STREAMING_READYZ:=http://localhost:5000/artifact-streaming/readyz}"
 : "${GANTRY_SNAPSHOTTER_ADDRESS:=/run/gantry-overlaybd/gantry-overlaybd.sock}"
+: "${GANTRY_SNAPSHOTTER_ROOT:=/var/lib/gantry/snapshotter}"
 : "${GANTRY_READY_TIMEOUT_SECONDS:=120}"
 : "${GANTRY_NBD_MAX_DEVICES:=1024}"
 : "${GANTRY_NBD_MIN_DEVICES:=64}"
@@ -70,7 +71,8 @@ configure() {
 		--config "$HOST_ROOT/etc/containerd/config.toml" \
 		--drop-in "$HOST_ROOT/etc/containerd/conf.d/99-gantry-overlaybd.toml" \
 		--state "$STATE_DIR" \
-		--address "$GANTRY_SNAPSHOTTER_ADDRESS"
+		--address "$GANTRY_SNAPSHOTTER_ADDRESS" \
+		--snapshotter-root "$GANTRY_SNAPSHOTTER_ROOT"
 }
 
 restart_containerd() {
