@@ -227,3 +227,90 @@ func TestHandlersRejectUnauthenticated(t *testing.T) {
 		t.Fatalf("tampered control body: status %d, want 401", resp.StatusCode)
 	}
 }
+
+func TestHandlersRejectAlteredSignedHeaders(t *testing.T) {
+	c := newCluster(t, clusterOpts{n: 1})
+
+	mux := http.NewServeMux()
+	c.nodes[0].node.Register(mux)
+
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	type edit func(h http.Header)
+
+	cases := []struct {
+		name       string
+		path       string
+		edit       edit
+		wantUnauth bool
+	}{
+		{"chunk unaltered", ChunkPath + "?d=x", nil, false},
+		{"meta unaltered", MetaPath + "?r=reg", nil, false},
+		{"requester changed", ChunkPath + "?d=x", func(h http.Header) { h.Set(headerRequester, "10.0.0.9:1") }, true},
+		{"requester removed", ChunkPath + "?d=x", func(h http.Header) { h.Del(headerRequester) }, true},
+		{"requester added twice", ChunkPath + "?d=x", func(h http.Header) { h.Add(headerRequester, "10.0.0.9:1") }, true},
+		{"route changed", ChunkPath + "?d=x", func(h http.Header) { h.Set(headerRoute, "AAAA") }, true},
+		{"route removed", MetaPath + "?r=reg", func(h http.Header) { h.Del(headerRoute) }, true},
+		{"route emptied", MetaPath + "?r=reg", func(h http.Header) { h.Set(headerRoute, "") }, true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r, err := http.NewRequest(http.MethodGet, srv.URL+tc.path, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			r.Header.Set(headerRequester, "10.0.0.1:5000")
+			r.Header.Set(headerRoute, "x")
+			testAuth.Sign(r, nil)
+
+			if tc.edit != nil {
+				tc.edit(r.Header)
+			}
+
+			resp, err := http.DefaultClient.Do(r)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			_ = resp.Body.Close()
+
+			if got := resp.StatusCode == http.StatusUnauthorized; got != tc.wantUnauth {
+				t.Fatalf("status %d, want 401=%v", resp.StatusCode, tc.wantUnauth)
+			}
+		})
+	}
+}
+
+func TestPeerAuthHeaderEncoding(t *testing.T) {
+	// Absent, empty, and split values must not collide.
+	variants := []http.Header{
+		{},
+		{headerRoute: {""}},
+		{headerRoute: {"ab"}},
+		{headerRoute: {"a", "b"}},
+		{headerRoute: {"a"}, headerRequester: {"b"}},
+	}
+
+	seen := map[string]int{}
+
+	for i, h := range variants {
+		r := httptest.NewRequest(http.MethodGet, ChunkPath+"?d=x", nil)
+		r.Header = h.Clone()
+		mac := string(testAuth.mac(testAuth.keys[0], r, 1, nil))
+
+		if j, ok := seen[mac]; ok {
+			t.Fatalf("variants %d and %d share a MAC", j, i)
+		}
+
+		seen[mac] = i
+
+		testAuth.Sign(r, nil)
+
+		if err := testAuth.Verify(r, nil); err != nil {
+			t.Fatalf("variant %d: %v", i, err)
+		}
+	}
+}
