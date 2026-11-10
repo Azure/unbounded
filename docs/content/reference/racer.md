@@ -1166,6 +1166,42 @@ All prefetch metrics have a `priority` label.
 | `racer_prefetch_tickets` | gauge | Tickets on the node |
 | `racer_prefetch_tickets_finished_total` | counter | Tickets that finished, by outcome |
 
+### Invalidation
+
+A client that finds a cached version corrupt, for example by a digest
+mismatch, can drop it so the next read fetches it from the origin again:
+
+```http
+DELETE /v1/objects/<key> HTTP/1.1
+Host: racer
+If-Match: "<etag>"
+```
+
+`If-Match` is required and must be the strong ETag a read reported. Racer
+answers `204 No Content` and closes the connection, whether or not anything was
+cached, so the request is safe to retry. A newer version of the same key is
+never dropped. A malformed request gets `400`. Like reads, it needs no
+credentials beyond access to the socket.
+
+The receiving node drops the version's metadata and its pages from memory, the
+disk write queue, and the disk index. It then tells the three ranked owners of
+each page, best effort, with a signed peer operation; page zero's owners also
+drop the metadata. Receivers drop local state only and never forward the
+operation. Peer failures do not fail the request, and Racer waits for peers for
+at most 5 seconds. Limits:
+
+- Only the first 1024 pages are named, so a larger object keeps its later
+  pages until they are evicted.
+- When the node does not know the version's length, only page zero and the
+  metadata are named.
+- A page in a live spill hold, or a disk write already in progress, is kept.
+- At most 8 invalidations run at once on a node; more get `503`.
+
+`racer_invalidate_requests_total`, `racer_invalidate_rejected_total`,
+`racer_invalidate_truncated_total`, `racer_invalidate_peer_requests_total`,
+`racer_invalidate_peer_failures_total`, and
+`racer_invalidate_peer_served_total` count invalidations.
+
 ### Spill holds
 
 Spill (`RACER_RANGE_SPILL_PAGES`) keeps pages on local disk under a short hard
