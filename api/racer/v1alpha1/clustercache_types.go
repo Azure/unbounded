@@ -110,9 +110,10 @@ type Writes struct {
 	// +optional
 	Replicas *int32 `json:"replicas,omitempty"`
 
-	// MaxDirtyPercent bounds the share of this cache's disk share on a node
-	// that may hold written data not yet uploaded. Writes beyond it are
-	// refused until uploads catch up. When unset, 30.
+	// MaxDirtyPercent bounds, as a percent of each storage worker's
+	// write-capable segment capacity, how much of a node's cache storage
+	// this cache's written data not yet uploaded may pin. Writes beyond it
+	// are refused until uploads catch up. When unset, 30.
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=90
 	// +kubebuilder:default=30
