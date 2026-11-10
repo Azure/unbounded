@@ -165,6 +165,18 @@ func TestValidateRejects(t *testing.T) {
 		{"bad vlan name", func(n *v1alpha3.HostNetworkSpec, _ *v1alpha3.DHCPLease) {
 			n.VLANs[0].Name = "bond0 64"
 		}, "network.vlans[0].name"},
+		{"reserved ethernet name lo", func(n *v1alpha3.HostNetworkSpec, _ *v1alpha3.DHCPLease) {
+			n.Ethernets[0].Name = "lo"
+		}, "network.ethernets[0].name"},
+		{"reserved ethernet name all", func(n *v1alpha3.HostNetworkSpec, _ *v1alpha3.DHCPLease) {
+			n.Ethernets[1].Name = "all"
+		}, "network.ethernets[1].name"},
+		{"reserved bond name bonding_masters", func(n *v1alpha3.HostNetworkSpec, _ *v1alpha3.DHCPLease) {
+			n.Bonds[0].Name = "bonding_masters"
+		}, "network.bonds[0].name"},
+		{"reserved vlan name default", func(n *v1alpha3.HostNetworkSpec, _ *v1alpha3.DHCPLease) {
+			n.VLANs[0].Name = "default"
+		}, "network.vlans[0].name"},
 		{"duplicate name across kinds", func(n *v1alpha3.HostNetworkSpec, _ *v1alpha3.DHCPLease) {
 			n.VLANs[0].Name = "bond0"
 		}, "network.vlans[0].name"},

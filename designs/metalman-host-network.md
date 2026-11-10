@@ -63,6 +63,9 @@ violation fails the operation with a message naming the field:
 
 - Interface names are unique across ethernets, bonds, and VLANs; MACs are
   unique, lowercase, colon-separated.
+- Interface names may not be `lo`, `all`, `default`, or `bonding_masters`,
+  which collide with the loopback device, the per-protocol `conf/all` and
+  `conf/default` sysctl entries, and the bonding driver control file.
 - An ethernet belongs to at most one bond; bond members carry no addresses,
   gateway, or routes, and are not VLAN links.
 - VLAN links are ethernets or bonds (no VLAN-on-VLAN); `(link, id)` is unique.

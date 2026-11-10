@@ -30,6 +30,10 @@ var (
 	bondModes       = []string{v1alpha3.BondMode8023AD, v1alpha3.BondModeActiveBackup, v1alpha3.BondModeBalanceXOR}
 	hashPolicies    = []string{"layer2", "layer2+3", "layer3+4", "encap2+3", "encap3+4"}
 	lacpRates       = []string{"slow", "fast"}
+	// reservedNames collide with kernel-owned names: lo is the loopback
+	// device, all and default are /proc/sys/net/ipv{4,6}/conf entries, and
+	// bonding_masters is the /sys/class/net control file of the bonding driver.
+	reservedNames   = []string{"lo", "all", "default", "bonding_masters"}
 	hashPolicyModes = []string{v1alpha3.BondMode8023AD, v1alpha3.BondModeBalanceXOR}
 	errNilNetwork   = fmt.Errorf("network: host network is not set")
 )
@@ -178,6 +182,10 @@ func buildTopology(n *v1alpha3.HostNetworkSpec) (*topology, error) {
 func (t *topology) add(i *iface, namePattern *regexp.Regexp) error {
 	if !namePattern.MatchString(i.name) {
 		return fmt.Errorf("%s.name: invalid interface name %q", i.path, i.name)
+	}
+
+	if slices.Contains(reservedNames, i.name) {
+		return fmt.Errorf("%s.name: interface name %q is reserved", i.path, i.name)
 	}
 
 	if prev, ok := t.byName[i.name]; ok {
