@@ -2263,6 +2263,13 @@ mod tests {
                 // A fill never reports code 0.
                 PeerResponse::Prefetch(vec![PageResult::Failed(FailCode::NotResident)]),
             ),
+            (
+                24,
+                PrefetchAction::Invalidate { pages: vec![0, 7] },
+                PeerResponse::Prefetch(vec![PageResult::Admitted; 2]),
+                // Too few results.
+                PeerResponse::Prefetch(vec![PageResult::Admitted]),
+            ),
         ] {
             let (signed, binding) = f[0]
                 .sign_request_to(prefetch_request(&env, id, action.clone()), &node(1))
@@ -2341,6 +2348,10 @@ mod tests {
             fill((0..257).collect(), 257 * PAGE_BYTES),
             PrefetchAction::Probe { pages: vec![] },
             PrefetchAction::Probe { pages: vec![4, 4] },
+            PrefetchAction::Invalidate { pages: vec![] },
+            PrefetchAction::Invalidate {
+                pages: (0..257).collect(),
+            },
         ] {
             assert!(
                 request_head(&env.ctx.clock, &prefetch_request(&env, 31, action.clone())).is_err(),

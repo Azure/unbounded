@@ -595,6 +595,13 @@ pub(crate) async fn serve(
     context: &OriginContext,
     scope: &RequestScope,
 ) -> Result<PeerResponse> {
+    // Invalidation drops local state only, whatever this node's pool or
+    // drain state, and is never sent on to another node.
+    if let PrefetchAction::Invalidate { pages } = &action {
+        return Ok(PeerResponse::Prefetch(
+            local.serve_invalidate(&version, pages, scope).await,
+        ));
+    }
     if local.prefetch_directory().prefetch.draining() {
         return Ok(PeerResponse::Unavailable);
     }
@@ -611,6 +618,9 @@ pub(crate) async fn serve(
     }
     Ok(PeerResponse::Prefetch(match action {
         PrefetchAction::Probe { pages } => serve_probe(local, &version, &pages, scope).await,
+        PrefetchAction::Invalidate { pages } => {
+            local.serve_invalidate(&version, &pages, scope).await
+        }
         PrefetchAction::Fill {
             pages,
             length,

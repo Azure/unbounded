@@ -36,6 +36,7 @@ pub mod dispatch;
 pub mod fill;
 pub mod flight;
 pub(crate) mod gpu_copies;
+pub(crate) mod invalidate;
 pub mod metadata;
 pub mod range_stream;
 pub mod sealed;

@@ -378,7 +378,6 @@ impl MetadataService {
     }
 
     /// The catalog this service publishes into.
-    #[cfg(test)]
     pub(crate) fn catalog(&self) -> &Rc<Index> {
         &self.storage.index
     }

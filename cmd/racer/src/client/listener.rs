@@ -985,6 +985,23 @@ async fn serve_connection(
                 )
                 .await;
             }
+            // Invalidation has its own route and closes the connection.
+            Ok(request) if super::invalidate::is_invalidate(&request.head) => {
+                let head = request.head;
+                drop(request.descriptors);
+                return super::invalidate::serve(
+                    connection,
+                    head,
+                    cache,
+                    parser.header_limit(),
+                    reads,
+                    responses,
+                    io,
+                    timeout,
+                    cancellation.clone(),
+                )
+                .await;
+            }
             other => other,
         };
         // Every descriptor must be claimed by a direct read; the rest close here.

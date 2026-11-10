@@ -1720,6 +1720,13 @@ impl MemoryCache {
             |_, _| 0,
         );
     }
+    /// Drop every cached copy of `page`, authenticated or not. Live leases
+    /// keep their bytes; later lookups miss. Returns whether any was removed.
+    pub(crate) fn invalidate_page(&self, page: &PageId) -> bool {
+        let unverified = self.ciphertext_entries.borrow_mut().remove(page).is_some();
+        let verified = self.entries.borrow_mut().remove(page).is_some();
+        unverified || verified
+    }
     pub(crate) fn invalidate_ciphertext(&self, page: &UnverifiedPage) {
         let id = &page.copy.ciphertext.envelope().page;
         // A registered page was copied out on publish, so match its contents.

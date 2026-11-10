@@ -1246,6 +1246,23 @@ impl StoreWriter {
         self.note_discard(crate::telemetry::Event::DirtyDiscardCanceled, removed);
         removed
     }
+    /// Drop a queued, not yet submitted write of `page`, unless a hold owns
+    /// it. A write already submitted completes and is indexed normally.
+    /// Returns whether a queued write was dropped.
+    pub fn discard_queued(&self, page: &PageId) -> bool {
+        if self.protected_pending(page) {
+            return false;
+        }
+        let mut queue = self.queue.borrow_mut();
+        let Some(position) = queue.iter().position(|queued| queued == page) else {
+            return false;
+        };
+        queue.remove(position);
+        drop(queue);
+        let removed = self.pending.borrow_mut().remove(page).is_some();
+        self.note_discard(crate::telemetry::Event::DirtyDiscardCanceled, 1);
+        removed
+    }
     /// Whether the only pins on `ciphertext` besides the caller's are this
     /// writer's queued or submitted copy of `id`.
     pub(crate) fn pins_only_writer(

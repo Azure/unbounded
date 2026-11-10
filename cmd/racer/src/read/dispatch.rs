@@ -129,6 +129,9 @@ pub struct NodeDirectory {
     ctx: racer_io::WorkerCtx,
     mailboxes: Vec<Arc<Mailbox>>,
     sequence: AtomicU64,
+    /// Client invalidations running on this node, bounded by
+    /// [`super::invalidate::MAX_CONCURRENT`].
+    pub(crate) invalidations: std::sync::atomic::AtomicUsize,
 }
 
 enum Work {
@@ -191,6 +194,8 @@ enum Work {
     Publish(VersionMetadata),
     Retained(ObjectVersion),
     Peer(VerifiedRequest, std::sync::Arc<crate::topology::Membership>),
+    /// Drop a version's metadata (when `true`) and listed pages on this worker.
+    Invalidate(ObjectVersion, Vec<u64>, bool),
 }
 enum Value {
     Held(HoldEpoch),
@@ -623,6 +628,42 @@ impl WorkerDirectory {
     }
 
     /// Whether the page's owning worker has it on disk.
+    /// Drop `version`'s metadata on its metadata worker and each listed page
+    /// on its owning worker. Local only: nothing is sent to other nodes.
+    pub(crate) async fn invalidate_version(
+        &self,
+        version: &ObjectVersion,
+        pages: &[u64],
+        scope: &RequestScope,
+    ) -> Result<()> {
+        let metadata = self.metadata_owner(&version.object)?;
+        let mut owners: Vec<(WorkerId, Vec<u64>)> = vec![(metadata, Vec::new())];
+        for &number in pages {
+            let owner = self.page_owner(&PageId {
+                version: version.clone(),
+                number: PageNumber(number),
+            })?;
+            match owners.iter_mut().find(|(worker, _)| *worker == owner) {
+                Some((_, list)) => list.push(number),
+                None => owners.push((owner, vec![number])),
+            }
+        }
+        for (owner, list) in owners {
+            let with_metadata = owner == metadata;
+            if self.is_local(owner) {
+                self.local()?
+                    .invalidate_worker(version, &list, with_metadata);
+                continue;
+            }
+            let work = Work::Invalidate(version.clone(), list, with_metadata);
+            match self.submit(owner, work, scope, None)?.await?.value? {
+                Value::Published => {}
+                _ => return Err(Error::StaleFlight),
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) async fn probe_page(&self, page: PageId, scope: &RequestScope) -> Result<bool> {
         let owner = self.page_owner(&page)?;
         if self.is_local(owner) {
@@ -1300,6 +1341,10 @@ async fn execute(
             .serve_peer(request, membership, scope)
             .await
             .map(Value::Peer),
+        Work::Invalidate(version, pages, metadata) => {
+            local.invalidate_worker(&version, &pages, metadata);
+            Ok(Value::Published)
+        }
     }
 }
 
@@ -1340,6 +1385,7 @@ impl NodeDirectory {
                 })
                 .collect(),
             sequence: AtomicU64::new(1),
+            invalidations: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 

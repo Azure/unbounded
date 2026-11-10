@@ -1141,6 +1141,33 @@ impl Index {
         }
         removed
     }
+    /// Drop `version`'s standalone descriptor, and the object's fresh pointer
+    /// when it names this exact version. Another version is never touched.
+    /// Returns whether anything was removed.
+    pub fn invalidate_version(&self, version: &ObjectVersion) -> bool {
+        let mut s = self.state_mut();
+        let mut removed = s.metadata.remove(version).is_some();
+        if removed {
+            s.order.retain(|v| v != version);
+        }
+        if s.current
+            .get(&version.object)
+            .is_some_and(|current| &current.version == version)
+        {
+            s.current.remove(&version.object);
+            removed = true;
+        }
+        removed
+    }
+    /// Drop `page` from the disk index so it is never served again. A page in
+    /// a live hold is kept: the hold owns its record until it expires.
+    /// Returns whether the page was removed.
+    pub fn invalidate_page(&self, page: &PageId) -> bool {
+        if self.is_held(page) {
+            return false;
+        }
+        self.state_mut().pages.remove(page, None)
+    }
     pub fn remove_if_matches(&self, page: &PageId, location: &RecordLocation) {
         let mut s = self.state_mut();
         s.pages.remove(page, Some(location));

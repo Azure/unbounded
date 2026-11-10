@@ -4404,3 +4404,52 @@ fn prefetch_put_bodies_stay_charged_while_versions_resolve() {
         assert!(output.starts_with(b"HTTP/1.1 "), "{output:?}");
     }
 }
+
+#[test]
+fn actual_uds_invalidate_drops_only_the_named_version_and_refetches() {
+    let env = racer_io::Env::host();
+    let fixture = Fixture::new(&env);
+    fixture.reconcile(&[definition()]).unwrap();
+    let exchange = |raw: &[u8]| {
+        let mut socket = fixture.connect();
+        socket.write_all(raw).unwrap();
+        let output = fixture.receive(&mut socket, true);
+        String::from_utf8(output).unwrap().to_ascii_lowercase()
+    };
+    let head = |etag: &str| {
+        request(
+            "HEAD",
+            &format!("If-Match: \"{etag}\"\r\nConnection: close\r\n"),
+        )
+    };
+    let delete = |fields: &str| request("DELETE", fields);
+    assert!(exchange(&head("v1")).starts_with("http/1.1 200"));
+    assert!(exchange(&head("v1")).starts_with("http/1.1 200"));
+    let cached = fixture.completed_heads();
+    assert_eq!(cached, 1, "a pinned HEAD is served from cache");
+    // Another version's tag leaves the cached version in place.
+    let text = exchange(&delete("If-Match: \"v2\"\r\n"));
+    assert!(text.starts_with("http/1.1 204"), "{text}");
+    assert!(text.contains("connection: close\r\n"), "{text}");
+    assert!(!text.contains("content-length"), "{text}");
+    assert!(exchange(&head("v1")).starts_with("http/1.1 200"));
+    assert_eq!(fixture.completed_heads(), cached);
+    // Malformed requests are refused without touching the cache.
+    for fields in [
+        "",
+        "If-Match: W/\"v1\"\r\n",
+        "If-Match: \"v1\"\r\nRange: bytes=0-1\r\n",
+    ] {
+        let text = exchange(&delete(fields));
+        assert!(text.starts_with("http/1.1 400"), "{fields}: {text}");
+    }
+    assert!(exchange(&head("v1")).starts_with("http/1.1 200"));
+    assert_eq!(fixture.completed_heads(), cached);
+    // The named version is dropped, idempotently, and the next read refetches.
+    for _ in 0..2 {
+        let text = exchange(&delete("If-Match: \"v1\"\r\n"));
+        assert!(text.starts_with("http/1.1 204"), "{text}");
+    }
+    assert!(exchange(&head("v1")).starts_with("http/1.1 200"));
+    assert_eq!(fixture.completed_heads(), cached + 1);
+}

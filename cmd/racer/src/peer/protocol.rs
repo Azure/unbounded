@@ -310,6 +310,9 @@ pub enum PrefetchAction {
     },
     /// Report which pages are resident, without filling.
     Probe { pages: Vec<u64> },
+    /// Drop the version's metadata and these pages from the receiver's
+    /// memory and disk index. The receiver never propagates it further.
+    Invalidate { pages: Vec<u64> },
 }
 
 impl PrefetchAction {
@@ -317,13 +320,14 @@ impl PrefetchAction {
         match self {
             Self::Fill { .. } => "fill",
             Self::Probe { .. } => "probe",
+            Self::Invalidate { .. } => "invalidate",
         }
     }
 
     /// The requested pages.
     pub fn pages(&self) -> &[u64] {
         match self {
-            Self::Fill { pages, .. } | Self::Probe { pages } => pages,
+            Self::Fill { pages, .. } | Self::Probe { pages } | Self::Invalidate { pages } => pages,
         }
     }
 
@@ -672,6 +676,7 @@ fn prefetch_action(head: &MessageHead) -> Result<PrefetchAction> {
             }
         }
         "probe" => PrefetchAction::Probe { pages },
+        "invalidate" => PrefetchAction::Invalidate { pages },
         _ => return Err(Error::InvalidRequest),
     })
 }
