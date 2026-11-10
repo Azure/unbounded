@@ -15,6 +15,7 @@
 //! and a controllable Unix-socket origin. It does not enable application policy.
 
 pub mod client;
+pub mod invalidate;
 pub mod model;
 pub mod origin;
 pub mod prefetch;
