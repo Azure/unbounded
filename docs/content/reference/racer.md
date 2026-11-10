@@ -149,7 +149,8 @@ spec:
   local-only request for the page: the usual pinned page `GET` with the
   `Racer-Source: local` header. The adapter serves the page only from a copy
   of the pinned version that it holds locally and never contacts its remote
-  source; without one it answers `404`. A hit is encrypted and kept in memory
+  source; without one it answers `404`, and for another version `412`. Racer
+  treats both as a miss. A hit is encrypted and kept in memory
   like any origin page. A miss or a failed local read falls through to peers
   and then the remote origin, and never counts as an origin failure.
 - Both the reading node and an owner that fills a page for a peer ask their own
@@ -1191,7 +1192,8 @@ never dropped. A malformed request gets `400`. Like reads, it needs no
 credentials beyond access to the socket.
 
 The receiving node drops the version's metadata and its pages from memory, the
-disk write queue, and the disk index. It then tells the three ranked owners of
+disk write queue, and the disk index, and forgets the nodes recorded as
+holding those pages. It then tells the three ranked owners of
 each page, best effort, with a signed peer operation; page zero's owners also
 drop the metadata. Receivers drop local state only and never forward the
 operation. Peer failures do not fail the request, and Racer waits for peers for

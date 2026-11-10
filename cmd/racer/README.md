@@ -108,7 +108,7 @@ failure. `racer_holder_records_total`, `racer_holder_probes_served_total`,
 
 `DELETE /v1/objects/<key>` with a strong `If-Match` ETag on the client socket
 drops that version (`src/client/invalidate.rs`, `src/read/invalidate.rs`). The
-node drops its metadata and pages, then sends a `prefetch` peer operation with
+node drops its metadata, pages, and holder records, then sends a `prefetch` peer operation with
 action `invalidate` to each page's ranked owners. Receivers drop local state
 only and never forward it. See "Invalidation" in
 `docs/content/reference/racer.md` for limits.
