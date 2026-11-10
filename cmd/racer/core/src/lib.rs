@@ -16,3 +16,4 @@ pub mod read;
 pub mod rng;
 pub mod route;
 pub mod subscriptions;
+pub mod write;
