@@ -643,28 +643,22 @@ async fn delete(
     Ok(WriteReply::Released)
 }
 
-/// The manifest replicas of `object` other than this node.
+/// Every member that may hold a manifest of `object`, other than this node:
+/// the serving page-zero members among the first `RANKED_DEPTH`. Besides the
+/// `replicas - 1` manifest replicas, a member that joined ahead of this
+/// coordinator got the manifest (`replicate_manifest`), and a coordinator
+/// that this one took over from may still act as one until its next role
+/// check; a delete must reach them all, or they keep serving the version.
 async fn replica_nodes(
     local: &Coordinator,
     membership: &Arc<Membership>,
     object: &ObjectId,
     scope: &RequestScope,
 ) -> Vec<NodeId> {
-    let replicas = local
-        .writes
-        .directory()
-        .with(object, |e| e.map(|e| e.session.spec().replicas))
-        .unwrap_or(1);
     let me = local.local_node();
-    ranked(local, membership, object, 0, scope)
+    super::failover::page_zero_members(local, membership, object, scope)
         .await
-        .map(|ranked| {
-            ranked
-                .into_iter()
-                .filter(|node| *node != me)
-                .take(usize::from(replicas.saturating_sub(1)))
-                .collect()
-        })
+        .map(|members| members.into_iter().filter(|node| *node != me).collect())
         .unwrap_or_default()
 }
 
