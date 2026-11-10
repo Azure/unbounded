@@ -235,6 +235,11 @@ impl Availability {
         self.with_cache(cache, |c| c.map(|c| c.mode).unwrap_or_default())
     }
 
+    /// Published write settings of this cache, when it accepts writes.
+    pub fn writes(&self, cache: &CacheId) -> Option<racer_wire::control::WriteDefinition> {
+        self.with_cache(cache, |c| c.and_then(|c| c.writes().cloned()))
+    }
+
     /// Whether this cache retains no pages or metadata.
     pub fn passthrough(&self, cache: &CacheId) -> bool {
         self.mode(cache).passthrough()

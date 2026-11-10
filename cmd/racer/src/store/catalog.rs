@@ -145,6 +145,23 @@ impl PageTicket {
             .append(segments, length)
     }
 
+    /// [`Self::append`] into the dedicated written-record tail, so the record
+    /// shares its segment only with other written records.
+    pub fn append_written(
+        &mut self,
+        page: &PageId,
+        segments: &Segments,
+        length: usize,
+    ) -> Result<(page_alloc::SegmentLease, RecordLocation)> {
+        if self.reservation.is_none() {
+            self.reservation = Some(self.index.state_mut().pages.reserve(page)?);
+        }
+        self.reservation
+            .as_mut()
+            .expect("reserved page")
+            .append_written(segments, length)
+    }
+
     /// Publish the completed write at the location [`Self::append`] returned.
     pub fn publish(mut self, page: PageId, entry: IndexedPage) -> Result<()> {
         if std::mem::take(&mut self.counted) {
@@ -1331,6 +1348,19 @@ impl Index {
     pub fn segment_empty(&self, segment: SegmentId) -> bool {
         self.state.borrow().pages.segment_empty(segment)
     }
+    /// Keep `segment` from eviction for one live written record. Pins do not
+    /// change checkpoint content: the write journal restores them.
+    pub fn pin_segment(&self, segment: SegmentId, count: usize) -> Result<()> {
+        self.state_cursor().pages.pin_segment(segment, count)
+    }
+    /// Drop one written-record pin of `segment`.
+    pub fn unpin_segment(&self, segment: SegmentId) -> Result<()> {
+        self.state_cursor().pages.unpin_segment(segment)
+    }
+    /// Written-record pins on `segment`.
+    pub fn segment_pins(&self, segment: SegmentId) -> u32 {
+        self.state.borrow().pages.segment_pins(segment)
+    }
     /// Sum live payload value, not padded disk size. At most 256 mappings are
     /// inspected per segment. Larger segments use a conservative upper bound for
     /// the unseen suffix; this is a preference, never an eviction exemption.
@@ -1476,7 +1506,9 @@ impl Index {
     #[cfg(test)]
     pub(crate) fn can_evict(&self, segment: SegmentId) -> bool {
         let state = self.state.borrow();
-        state.pages.can_reclaim(segment) && !state.pages.segment_held(segment)
+        state.pages.can_reclaim(segment)
+            && !state.pages.segment_held(segment)
+            && state.pages.segment_pins(segment) == 0
     }
     /// Test helper: remove up to `budget` pages of an evictable `segment`.
     #[cfg(test)]
