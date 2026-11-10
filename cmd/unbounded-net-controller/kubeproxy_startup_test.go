@@ -8,14 +8,17 @@ import (
 	"errors"
 	"testing"
 	"testing/synctest"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/dynamic/dynamicinformer"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/informers"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
+	clienttesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
@@ -49,8 +52,8 @@ func TestStartManagedKubeProxyControllerDoesNotBlockStartup(t *testing.T) {
 			t.Fatal("image discovery did not start in the background")
 		}
 
-		// Start only once, while discovery is blocked. This also catches a
-		// DaemonSet informer that was not requested before factory startup.
+		// Start unrelated informers while discovery is blocked. None of the
+		// managed kube-proxy controller's informers have been requested yet.
 		fixture.startInformers(t)
 
 		if got := fixture.daemonSets(t); len(got) != 0 {
@@ -58,10 +61,14 @@ func TestStartManagedKubeProxyControllerDoesNotBlockStartup(t *testing.T) {
 		}
 
 		close(releaseDiscovery)
-		synctest.Wait()
 
-		got := fixture.daemonSets(t)
-		if len(got) != 1 || got[0].Name != "unbounded-net-kube-proxy-test" {
+		var got []appsv1.DaemonSet
+
+		err := wait.PollUntilContextTimeout(fixture.ctx, 10*time.Millisecond, time.Second, true, func(context.Context) (bool, error) {
+			got = fixture.daemonSets(t)
+			return len(got) == 1, nil
+		})
+		if err != nil || len(got) != 1 || got[0].Name != "unbounded-net-kube-proxy-test" {
 			t.Fatalf("DaemonSets = %v, want the managed DaemonSet after delayed discovery", got)
 		}
 
@@ -71,6 +78,25 @@ func TestStartManagedKubeProxyControllerDoesNotBlockStartup(t *testing.T) {
 
 		if image := got[0].Spec.Template.Spec.InitContainers[0].Image; image != managedKubeProxyStartupImage {
 			t.Fatalf("bootstrap image = %q, want %q", image, managedKubeProxyStartupImage)
+		}
+
+		synctest.Wait()
+
+		for resource, actions := range map[string][]clienttesting.Action{
+			"pods":     fixture.clientset.Actions(),
+			"machines": fixture.dynamicClient.Actions(),
+		} {
+			watches := 0
+
+			for _, action := range actions {
+				if action.GetVerb() == "watch" && action.GetResource().Resource == resource {
+					watches++
+				}
+			}
+
+			if watches != 1 {
+				t.Fatalf("%s watches = %d, want the existing informer to stay running without restarting", resource, watches)
+			}
 		}
 	})
 }
@@ -139,10 +165,11 @@ type managedKubeProxyStartupFixture struct {
 	ctx            context.Context
 	cancel         context.CancelFunc
 	clientset      *k8sfake.Clientset
+	dynamicClient  *dynamicfake.FakeDynamicClient
 	factory        informers.SharedInformerFactory
 	dynamicFactory dynamicinformer.DynamicSharedInformerFactory
-	nodes          cache.SharedIndexInformer
-	sites          cache.SharedIndexInformer
+	pods           cache.SharedIndexInformer
+	machines       cache.SharedIndexInformer
 }
 
 func newManagedKubeProxyStartupFixture(t *testing.T) *managedKubeProxyStartupFixture {
@@ -166,11 +193,11 @@ func newManagedKubeProxyStartupFixture(t *testing.T) *managedKubeProxyStartupFix
 	ctx, cancel := context.WithCancel(t.Context())
 
 	return &managedKubeProxyStartupFixture{
-		ctx: ctx, cancel: cancel, clientset: clientset, factory: factory, dynamicFactory: dynamicFactory,
-		// Match the informers already requested by the Site controller, but do
-		// not request DaemonSets here: the startup helper must do that itself.
-		nodes: factory.Core().V1().Nodes().Informer(),
-		sites: dynamicFactory.ForResource(unboundedv1alpha3.GroupVersion.WithResource("sites")).Informer(),
+		ctx: ctx, cancel: cancel, clientset: clientset, dynamicClient: dynamicClient, factory: factory, dynamicFactory: dynamicFactory,
+		// Start with unrelated informers, not the Node, Site, or DaemonSet
+		// informers that the managed kube-proxy constructor must request itself.
+		pods:     factory.Core().V1().Pods().Informer(),
+		machines: dynamicFactory.ForResource(unboundedv1alpha3.GroupVersion.WithResource("machines")).Informer(),
 	}
 }
 
@@ -197,11 +224,10 @@ func (f *managedKubeProxyStartupFixture) startInformers(t *testing.T) {
 	t.Helper()
 	f.factory.Start(f.ctx.Done())
 	f.dynamicFactory.Start(f.ctx.Done())
-	daemonSets := f.factory.Apps().V1().DaemonSets().Informer()
 
 	synctest.Wait()
 
-	for name, informer := range map[string]cache.SharedIndexInformer{"nodes": f.nodes, "sites": f.sites, "daemonsets": daemonSets} {
+	for name, informer := range map[string]cache.SharedIndexInformer{"pods": f.pods, "machines": f.machines} {
 		if !informer.HasSynced() {
 			t.Fatalf("%s informer did not sync while image discovery was blocked", name)
 		}

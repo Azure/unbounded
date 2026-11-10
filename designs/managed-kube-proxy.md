@@ -112,8 +112,10 @@ managed kube-proxy controller unstarted rather than guessing an image.
 The image is worked out once, when the controller starts leading. Image
 discovery and managed kube-proxy startup run in a background goroutine under
 the leadership context, without blocking the other controllers or shared
-informer startup. The DaemonSet informer is requested before launching that
-goroutine so the shared factory starts it even when image discovery is slow.
+informer startup. After constructing the managed kube-proxy controller, the
+goroutine calls Start on both shared informer factories again. These calls are
+idempotent and start any newly requested informers, without relying on another
+controller to request the same resources or factories first.
 Where the operator manages unbounded-net, `images.kubeProxy` in its overrides
 ConfigMap sets the same flag on the controller Deployment, so it takes precedence
 over the runtime setting and changing it restarts the controller.

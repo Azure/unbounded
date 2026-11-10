@@ -740,7 +740,8 @@ func run(cfg *config.Config, forceNotLeader bool) error {
 			}()
 		}
 
-		// Start informers after all informers are created.
+		// Start the informers requested so far. Managed kube-proxy also starts
+		// any informers it requests after image discovery completes.
 		informerFactory.Start(ctx.Done())
 		dynamicInformerFactory.Start(ctx.Done())
 
@@ -783,11 +784,6 @@ func startManagedKubeProxyController(
 	namespace string,
 	resolveImage func(context.Context) (string, error),
 ) {
-	// The Site controller has already requested Node and Site informers. Request
-	// DaemonSets before the caller starts the factories, even if discovery finishes
-	// after that. An informer first requested later would miss the caller's Start.
-	informerFactory.Apps().V1().DaemonSets().Informer()
-
 	go func() {
 		if ctx.Err() != nil {
 			return
@@ -819,6 +815,12 @@ func startManagedKubeProxyController(
 
 			return
 		}
+
+		// Discovery may outlast the factories' initial Start. Start is
+		// idempotent and also launches any informers the constructor just
+		// requested, without depending on another controller's registrations.
+		informerFactory.Start(ctx.Done())
+		dynamicInformerFactory.Start(ctx.Done())
 
 		if err := kubeProxyCtrl.Run(ctx, 2); err != nil && ctx.Err() == nil {
 			klog.Errorf("Managed kube-proxy controller error: %v", err)
