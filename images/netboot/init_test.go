@@ -288,16 +288,16 @@ func TestLocalMediaMapEthernetFailures(t *testing.T) {
 func TestLocalMediaValidInstallURL(t *testing.T) {
 	id := strings.Repeat("0123456789abcdef", 2)
 	cases := map[string]bool{
-		"http://192.0.2.1:8880/bootmedia/" + id:            true,
-		"http://metalman.example/bootmedia/" + id:          true,
-		"https://192.0.2.1/bootmedia/" + id:                false,
-		"http://192.0.2.1/bootmedia/" + id[:31]:            false,
-		"http://192.0.2.1/bootmedia/" + id + "0":           false,
+		"http://192.0.2.1:8880/bootmedia/" + id:             true,
+		"http://metalman.example/bootmedia/" + id:           true,
+		"https://192.0.2.1/bootmedia/" + id:                 false,
+		"http://192.0.2.1/bootmedia/" + id[:31]:             false,
+		"http://192.0.2.1/bootmedia/" + id + "0":            false,
 		"http://192.0.2.1/bootmedia/" + strings.ToUpper(id): false,
-		"http://192.0.2.1/x/bootmedia/" + id:               false,
-		"http:///bootmedia/" + id:                          false,
-		"http://192.0.2.1/bootmedia/" + id + "/install":    false,
-		"http://a$(x)/bootmedia/" + id:                     false,
+		"http://192.0.2.1/x/bootmedia/" + id:                false,
+		"http:///bootmedia/" + id:                           false,
+		"http://192.0.2.1/bootmedia/" + id + "/install":     false,
+		"http://a$(x)/bootmedia/" + id:                      false,
 	}
 
 	for _, shell := range shells(t) {

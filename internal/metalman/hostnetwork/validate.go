@@ -403,6 +403,7 @@ func (t *topology) checkAddressing() error {
 			}
 
 			addrs[ip] = path
+
 			i.prefixes = append(i.prefixes, p)
 		}
 

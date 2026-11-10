@@ -144,6 +144,7 @@ func renderNetplan(n *v1alpha3.HostNetworkSpec, wrap bool) ([]byte, error) {
 				w.line(2, "set-name: %s", quote(i.name))
 			case kindBond:
 				b := i.bond
+
 				w.line(2, "interfaces:")
 
 				for _, m := range b.Interfaces {

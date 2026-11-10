@@ -67,6 +67,7 @@ func WriteCPIO(w io.Writer, files []CPIOFile) error {
 		parts := strings.Split(f.Path, "/")
 		for j := 1; j < len(parts); j++ {
 			dir := strings.Join(parts[:j], "/")
+
 			isDir, ok := seen[dir]
 			if ok && !isDir {
 				return fmt.Errorf("cpio entry %q: parent %q is a file", f.Path, dir)
