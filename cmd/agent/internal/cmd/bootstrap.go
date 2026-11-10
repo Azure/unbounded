@@ -6,6 +6,7 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/url"
 	"strings"
@@ -197,6 +198,32 @@ func (s *agentStages) nodeStartTask(nodeAlreadyBuilt bool) phases.Task {
 	}
 
 	return phases.Serial(s.log, tasks...)
+}
+
+// guardNodeStart starts the node of an allocation-backed host only once its
+// allocation is confirmed. It writes the allocation launch record first, so
+// every later start of the node checks the allocation too, even before the
+// applied config exists. The check runs even when the node is already
+// registered. Any other host starts as before.
+func guardNodeStart(
+	ctx context.Context,
+	log *slog.Logger,
+	cfg *provision.AgentConfig,
+	persist func(*provision.AgentConfig) error,
+	verify func(context.Context, *slog.Logger, *provision.AgentConfig) error,
+	start func(context.Context) error,
+) error {
+	if _, backed := daemon.AllocationUID(cfg); backed {
+		if err := persist(cfg); err != nil {
+			return fmt.Errorf("persist allocation launch config: %w", err)
+		}
+
+		if err := verify(ctx, log, cfg); err != nil {
+			return err
+		}
+	}
+
+	return start(ctx)
 }
 
 func (s *agentStages) daemonInstallTask() phases.Task {

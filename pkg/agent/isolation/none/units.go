@@ -19,7 +19,14 @@ import (
 const (
 	UnitContainerd = "unbounded-containerd.service"
 	UnitKubelet    = "unbounded-kubelet.service"
+	// UnitKubeletLaunchCheck is the allocation launch check the kubelet
+	// requires on an allocation host; see RenderKubeletLaunchCheck.
+	UnitKubeletLaunchCheck = "unbounded-kubelet-launch-check.service"
 )
+
+// kubeletLaunchCheckDropIn is the kubelet drop-in that requires the launch
+// check.
+const kubeletLaunchCheckDropIn = "10-launch-check.conf"
 
 // ContainerdConfigPath is the agent-owned containerd configuration the
 // containerd unit runs with. It is not the distro's /etc/containerd/config.toml,
@@ -48,6 +55,11 @@ type UnitSpec struct {
 	// is regenerated whenever the stack starts, a boot included, not only when
 	// the agent starts it. Empty, on a node without GPUs, writes no drop-in.
 	GPUSetup [][]string
+	// LaunchCheckCommand is the command the launch-check oneshot runs before
+	// every kubelet start, set only on an allocation host. It is a separate
+	// oneshot so a final refusal fails the kubelet's start rather than loops
+	// under the kubelet's Restart=always. Empty writes no launch check.
+	LaunchCheckCommand string
 }
 
 // DefaultKubeletConfigPath is where the node-start phases write the kubelet
@@ -117,6 +129,40 @@ WantedBy=multi-user.target
 `, s.BinDir, s.KubeletConfigPath, UnitContainerd)
 }
 
+// RenderKubeletLaunchCheck returns the oneshot that runs the allocation launch
+// check before every kubelet start on an allocation host. The kubelet requires
+// it through RenderKubeletLaunchCheckDropIn. It is a separate unit, not an
+// ExecStartPre, because RestartPreventExitStatus= applies only to a unit's main
+// process: a final refusal must fail the kubelet's start rather than loop under
+// its Restart=always. It has no [Install] section; only the kubelet pulls it in.
+func RenderKubeletLaunchCheck(command string) []byte {
+	return fmt.Appendf(nil, `# Managed by unbounded-agent. Do not edit directly.
+[Unit]
+Description=Allocation launch check for the kubelet (unbounded agent)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%s
+Restart=on-failure
+RestartMode=direct
+RestartSec=10s
+# A final allocation launch refusal must fail the start rather than loop.
+RestartPreventExitStatus=%d
+`, command, goalstates.AllocationLaunchRefusedExitCode)
+}
+
+// RenderKubeletLaunchCheckDropIn returns the kubelet drop-in that makes every
+// kubelet start wait for, and depend on, the launch check.
+func RenderKubeletLaunchCheckDropIn() []byte {
+	return fmt.Appendf(nil, `# Managed by unbounded-agent. Do not edit directly.
+[Unit]
+Requires=%[1]s
+After=%[1]s
+`, UnitKubeletLaunchCheck)
+}
+
 // WriteUnits writes both units into dir and returns their paths. Writes are
 // atomic so a crash never leaves a half written unit.
 func WriteUnits(dir string, s UnitSpec) ([]string, error) {
@@ -182,6 +228,16 @@ func WriteDropIns(dir string, s UnitSpec) ([]string, error) {
 		for _, u := range []string{UnitContainerd, UnitKubelet} {
 			files = append(files, file{filepath.Join(DropInDir(dir, u), "05-localdns.conf"), RenderLocalDNSDropIn()})
 		}
+	}
+
+	// Without a command nothing is written and nothing is removed: a spec that
+	// lacks it never takes the check away from a host that has it. Only
+	// Destroy removes it.
+	if s.LaunchCheckCommand != "" {
+		files = append(files,
+			file{filepath.Join(dir, UnitKubeletLaunchCheck), RenderKubeletLaunchCheck(s.LaunchCheckCommand)},
+			file{filepath.Join(DropInDir(dir, UnitKubelet), kubeletLaunchCheckDropIn), RenderKubeletLaunchCheckDropIn()},
+		)
 	}
 
 	gpuDropIn := filepath.Join(DropInDir(dir, UnitContainerd), "10-gpu-setup.conf")

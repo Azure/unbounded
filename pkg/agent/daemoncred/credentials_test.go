@@ -12,6 +12,10 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"math/big"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -100,6 +104,12 @@ const testDaemonGroup = "test-daemon-group"
 func testCertificate(t *testing.T, commonName string) ([]byte, []byte) {
 	t.Helper()
 
+	return testCertificateValidUntil(t, commonName, time.Now().Add(time.Hour))
+}
+
+func testCertificateValidUntil(t *testing.T, commonName string, notAfter time.Time) ([]byte, []byte) {
+	t.Helper()
+
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	require.NoError(t, err)
 
@@ -108,8 +118,8 @@ func testCertificate(t *testing.T, commonName string) ([]byte, []byte) {
 		Subject: pkix.Name{
 			CommonName: commonName,
 		},
-		NotBefore: time.Now().Add(-time.Minute),
-		NotAfter:  time.Now().Add(time.Hour),
+		NotBefore: notAfter.Add(-2 * time.Hour),
+		NotAfter:  notAfter,
 	}
 	certDER, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
 	require.NoError(t, err)
@@ -118,4 +128,96 @@ func testCertificate(t *testing.T, commonName string) ([]byte, []byte) {
 
 	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER}),
 		pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+}
+
+func TestStoredRESTConfig(t *testing.T) {
+	validCert, validKey := testCertificate(t, "valid")
+	expiredCert, expiredKey := testCertificateValidUntil(t, "expired", time.Now().Add(-time.Minute))
+
+	for _, tc := range []struct {
+		name      string
+		store     func(t *testing.T, opts ControllerCertificateOptions)
+		wantFound bool
+		wantErr   bool
+	}{
+		{
+			name: "stored valid certificate",
+			store: func(t *testing.T, opts ControllerCertificateOptions) {
+				storeControllerCertificateForTest(t, opts, validCert, validKey)
+			},
+			wantFound: true,
+		},
+		{
+			name:  "empty directory",
+			store: func(*testing.T, ControllerCertificateOptions) {},
+		},
+		{
+			name: "missing directory",
+			store: func(t *testing.T, opts ControllerCertificateOptions) {
+				require.NoError(t, os.Remove(opts.CredentialDir))
+			},
+		},
+		{
+			name: "expired certificate",
+			store: func(t *testing.T, opts ControllerCertificateOptions) {
+				storeControllerCertificateForTest(t, opts, expiredCert, expiredKey)
+			},
+		},
+		{
+			name: "corrupt certificate file",
+			store: func(t *testing.T, opts ControllerCertificateOptions) {
+				path := filepath.Join(opts.CredentialDir, controllerCertificateStorePrefix+"-current.pem")
+				require.NoError(t, os.WriteFile(path, []byte("not a certificate"), 0o600))
+			},
+			wantErr: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+				t.Errorf("unexpected request to the API server: %s %s", r.Method, r.URL.Path)
+			}))
+			defer server.Close()
+
+			opts := testControllerCertificateOptions(t)
+			tc.store(t, opts)
+
+			base := &rest.Config{
+				Host:            server.URL,
+				BearerToken:     "bootstrap-token",
+				TLSClientConfig: rest.TLSClientConfig{CAData: validCert},
+			}
+
+			cfg, found, err := StoredRESTConfig(base, "node-a", opts)
+			if tc.wantErr {
+				require.Error(t, err)
+				assert.False(t, found)
+				assert.Nil(t, cfg)
+
+				return
+			}
+
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantFound, found)
+
+			if !tc.wantFound {
+				assert.Nil(t, cfg)
+
+				return
+			}
+
+			require.NotNil(t, cfg)
+			assert.Equal(t, server.URL, cfg.Host)
+			assert.Empty(t, cfg.BearerToken)
+			assert.NotNil(t, cfg.Transport)
+		})
+	}
+}
+
+func TestStoredRESTConfigValidatesOptions(t *testing.T) {
+	opts := testControllerCertificateOptions(t)
+	opts.DaemonGroup = ""
+
+	_, found, err := StoredRESTConfig(&rest.Config{Host: "https://example.test"}, "node-a", opts)
+	require.ErrorContains(t, err, "daemon group is required")
+	assert.False(t, found)
 }

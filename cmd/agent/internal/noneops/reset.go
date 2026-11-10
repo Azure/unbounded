@@ -81,7 +81,7 @@ func (t *Teardown) Present() bool {
 		dir = none.SystemdDir
 	}
 
-	for _, u := range []string{none.UnitContainerd, none.UnitKubelet, none.UnitLocalDNS} {
+	for _, u := range []string{none.UnitContainerd, none.UnitKubelet, none.UnitLocalDNS, none.UnitKubeletLaunchCheck} {
 		if _, err := os.Lstat(filepath.Join(dir, u)); err == nil {
 			return true
 		}

@@ -34,6 +34,7 @@ import (
 
 	"github.com/Azure/unbounded/cmd/agent/internal/hostnode"
 	"github.com/Azure/unbounded/internal/fsutil"
+	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/config"
 	"github.com/Azure/unbounded/pkg/agent/confsnap"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
@@ -46,6 +47,10 @@ import (
 
 // Slot is the slot name a none node records its applied config under.
 const Slot = goalstates.NSpawnMachineKube1
+
+// LaunchCheckCommand is the agent command the kubelet's allocation launch
+// check runs on an allocation host.
+const LaunchCheckCommand = "allocation-launch-check"
 
 // Params bind a Node to one agent configuration.
 type Params struct {
@@ -156,7 +161,12 @@ func (n *Node) resolve() error {
 		}
 
 		n.version = VersionFor(n.gs.RootFS)
-		n.backend = n.newBackend()
+
+		n.backend, n.err = n.newBackend()
+		if n.err != nil {
+			return
+		}
+
 		n.applyOverrides()
 	})
 
@@ -244,7 +254,12 @@ func (n *Node) waitKubelet(ctx context.Context) error {
 	return nodestart.WaitForKubeletOnHost(n.p.Log, n.gs.NodeStart, none.UnitKubelet).Do(ctx)
 }
 
-func (n *Node) newBackend() *none.Backend {
+func (n *Node) newBackend() (*none.Backend, error) {
+	launchCheck, err := n.launchCheckCommand()
+	if err != nil {
+		return nil, err
+	}
+
 	proc, cgroups := n.p.Proc, n.p.CgroupRoot
 	if proc == "" {
 		proc = "/proc"
@@ -265,6 +280,10 @@ func (n *Node) newBackend() *none.Backend {
 			KubeletConfigPath: goalstates.KubeletConfigurationPath,
 			LocalDNS:          n.gs.NodeStart.LocalDNS.Enabled,
 			GPUSetup:          n.gpuSetup(),
+			// Every unit write on an allocation host carries the check: a
+			// rollback's units come from the previous config and a recovery's
+			// from the applied one, and each is decided from its own config.
+			LaunchCheckCommand: launchCheck,
 		},
 		Install: n.install,
 		// The stack is the host: GPU devices and libraries are already visible,
@@ -282,7 +301,23 @@ func (n *Node) newBackend() *none.Backend {
 		AfterRestart: map[string]func(context.Context) error{
 			none.UnitLocalDNS: n.waitLocalDNS,
 		},
+	}, nil
+}
+
+// launchCheckCommand returns the command the kubelet's allocation launch check
+// runs before every kubelet start on an allocation host, and "" on any other
+// host, whose units stay as they are.
+func (n *Node) launchCheckCommand() (string, error) {
+	if _, backed := provision.AllocationUID(n.p.Config); !backed {
+		return "", nil
 	}
+
+	paths, err := goalstates.ResolvedAgentUpgradePaths()
+	if err != nil {
+		return "", fmt.Errorf("resolve the agent binary for the allocation launch check: %w", err)
+	}
+
+	return paths.BinaryPath + " " + LaunchCheckCommand, nil
 }
 
 // install places the version's artifacts: the same Kubernetes, CRI, CNI and

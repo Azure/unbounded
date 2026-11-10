@@ -195,6 +195,83 @@ spec:
       name: remote-example-auth
 ```
 
+### spec.allocationRef and spec.fenced
+
+A Machine created for a `MachineAllocation` names it in `allocationRef`, and
+`fenced` forbids the agent from starting that Machine's node again.
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `allocationRef` | UIDReference | No | - | The `MachineAllocation` this Machine was created for. Can be set only when the Machine is created. |
+| `allocationRef.name` | string | Yes | - | Allocation name. |
+| `allocationRef.uid` | string | Yes | - | Allocation UID. |
+| `fenced` | bool | No | `false` | Forbids the agent from starting this Machine's node again. Can only change from `false` to `true`. Requires `allocationRef`. |
+
+The API server enforces these rules:
+
+| Rule | Message |
+|------|---------|
+| `allocationRef` cannot be added, removed, or changed after create, including by an update that drops the whole `spec`. | `allocationRef is immutable` |
+| `fenced` cannot go from `true` back to `false` or be removed, including by an update that drops the whole `spec`. | `fenced cannot be unset` |
+| `fenced: true` needs `allocationRef`, on create and on update. | `fenced requires allocationRef` |
+
+An agent whose kubelet `providerID` starts with
+`unbounded:///machineallocations/` treats the rest of it as its allocation UID
+and checks before every node start: at bootstrap, at every start of the nspawn
+machine (including after a host reboot), at every start of the kubelet in
+isolation mode `none`, including a restart after the kubelet exits, before a
+Node Recreation, and before a `NodeReboot`. Once the agent holds its daemon-controller certificate, it reads
+the Machine live with it and allows the start only when the Machine's
+`allocationRef.uid` is this allocation's UID, `fenced` is not set, and the
+Machine is not being deleted. Before that certificate exists, it checks that
+the API server still accepts its bootstrap token. It never falls back from the
+certificate to the token. The agent picks the credential again
+before every read, so a certificate that expires while the agent is still
+checking moves the check to the bootstrap token.
+
+The agent refuses closed. A fenced, deleting, missing, or foreign Machine, or a
+rejected credential, refuses at once. Other failures are read again every 10
+seconds for up to 5 minutes, then refuse. A refused bootstrap reports Reason
+`AllocationLaunchRefused` on the `AgentBootstrapped` condition, and a refused
+`NodeReboot` finishes `Failed` with Reason `AllocationLaunchRefused`. A Node
+Recreation refused for a transient failure is tried again after 5 minutes.
+
+Every start of the nspawn machine runs the check in its pre-start, the
+`unbounded-agent-regenerate-config@<slot>` unit:
+
+- A transient refusal is retried every 10 seconds.
+- A final refusal exits with status `77`. systemd does not retry it, the
+  `unbounded-agent-regenerate-config@<slot>` unit is left failed, and so is the
+  start of the nspawn machine. A `NodeReboot` whose restart is refused this way
+  finishes `Failed` with Reason `ExecutionFailed`.
+- The node stays down until something starts it again: a host reboot, a
+  `NodeReboot`, or a Node Recreation. Each such start checks again.
+- The agent daemon still starts, so `HostSoftReboot` and `AgentReset` still
+  complete on such a host.
+
+In isolation mode `none`, every start of `unbounded-kubelet.service` runs the
+check in `unbounded-kubelet-launch-check.service`, which the kubelet unit
+requires. That unit exists only on an allocation host.
+
+- Transient and final refusals behave as for nspawn: a transient refusal is
+  retried every 10 seconds, and a final refusal exits with status `77`, leaves
+  the launch-check unit failed, and fails the kubelet's start without a restart.
+- The kubelet stays down until something starts it again: a host reboot, a
+  `NodeReboot`, a Node Recreation, or the kubelet's own restart. Each such start
+  checks again.
+- Pods that were already running when the kubelet stopped are not stopped by
+  the check.
+
+For a repave that changes the isolation mode, the agent checks before it hands
+the host to the reprovision. A refusal leaves the node as it is and changes no
+mode. The reset removes the daemon-controller certificate, so the bootstrap in
+the new mode checks with the bootstrap token, before the node starts. A final
+refusal there ends the reprovision at once, and the host stays reset with no
+node.
+
+The agent does not register a Machine for an allocation host. Fencing only
+stops new starts: a node that is already running is not stopped.
+
 ## MachineOperation
 
 | Property | Value |
