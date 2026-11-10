@@ -108,50 +108,85 @@ covered by the provider-managed kube-proxy. Each DaemonSet uses the Site's pod
 CIDR and runs only on nodes labeled for that Site and for unbounded-managed
 kube-proxy.
 
-The image setting defaults to an empty string. When it is empty, the controller
-copies a versioned image from the `kube-system/kube-proxy` DaemonSet as-is,
-including any digest. An unversioned provider image supplies only the registry
-and repository. Without a provider image, the final fallback repository is
-`registry.k8s.io/kube-proxy`.
-
 Set `controller.managedKubeProxy.image` to override the image for all
 unbounded-managed kube-proxy DaemonSets, for example when pulling kube-proxy
-through a private registry. It takes one of two forms:
+through a private registry. The setting defaults to an empty string. When the
+operator manages unbounded-net, its overrides ConfigMap can set the same image
+and takes precedence over this runtime setting. See
+[Overriding the managed kube-proxy image]({{< relref "reference/workload-overrides#overriding-the-managed-kube-proxy-image" >}}).
 
-- A reference with a tag or digest, such as
-  `myregistry.example.com/kube-proxy:v1.34.2`, is used as-is.
-- A reference without one, such as `myregistry.example.com/kube-proxy`, takes
-  the tag of the image `kube-system/kube-proxy` runs, so a mirror of the
-  provider's kube-proxy keeps the provider's version. Only the tag carries over,
-  not its digest. If there is no provider tag, the controller searches the
-  selected repository as described below. A registry port, as in
-  `localhost:5000/kube-proxy`, is not a tag.
+#### Image selection
 
-When the version is still missing, the controller uses the API server's
-major.minor.patch version to search that repository's tags. It selects the
-highest numeric `-N` maintenance suffix for that exact version: for a `1.36.2`
-cluster, `v1.36.2-2` wins over `v1.36.2-1` and `v1.36.2`. If no maintenance tag
-exists, it uses the exact matching tag. Other patch/minor versions, prereleases
-such as `rc` or `beta`, and architecture-specific suffixes are not candidates.
+The net controller selects the registry, repository, and version as follows:
+
+1. **An override includes a tag or digest:** use the complete reference as-is,
+   without Kubernetes image discovery or registry lookup. For example,
+   `myregistry.example.com/kube-proxy:v1.36.2-1` remains unchanged even if a
+   newer maintenance tag exists.
+2. **An override supplies only a registry/repository:** keep that path and take
+   the tag from the `kube-proxy` container in the `kube-system/kube-proxy`
+   DaemonSet. Only its tag carries over, not its digest. If the DaemonSet or
+   container is missing, or its image has no tag (including when it is pinned
+   by digest alone), continue with step 4. A registry port, as in
+   `localhost:5000/kube-proxy`, is not a version tag.
+3. **There is no image override:** copy a versioned provider image from
+   `kube-system/kube-proxy` as-is, including any digest. An unversioned provider
+   image supplies only its registry/repository and continues with step 4.
+   Without a provider image, use `registry.k8s.io/kube-proxy` as the final
+   fallback repository.
+4. **The version is still missing:** read the Kubernetes API server version,
+   normalize it to major.minor.patch without vendor or build metadata, and
+   search the selected repository's tags. Choose the highest numeric `-N`
+   maintenance suffix for that exact release. For a `1.36.2` cluster,
+   `v1.36.2-2` wins over `v1.36.2-1` and `v1.36.2`; `v1.36.2-10` wins over
+   `v1.36.2-2`. If no maintenance tag exists, use the exact matching tag.
+   Other patch/minor versions, prereleases such as `rc` or `beta`, and
+   architecture-specific suffixes are not candidates.
+
 Explicit and provider-supplied versions are not changed or searched for newer
-maintenance tags. The controller never chooses `latest` as an automatic fallback;
-an explicitly supplied `:latest` reference is still used as-is.
+maintenance tags. Automatic selection never chooses `latest`; an explicitly
+supplied `:latest` reference is still used as-is.
 
-Provider discovery stops immediately on NotFound. Other read errors get ten
-additional attempts at ten-second intervals before fallback version selection.
-Registry searches use anonymous access and have a 30-second total timeout. A
-private registry that requires credentials for tag listing needs an explicit
-version or a provider tag. Failure to discover a valid API server version,
-complete the tag listing, or find a matching tag prevents the managed kube-proxy
-controller from starting instead of selecting an unverified image.
+#### Registry access for API-server-version discovery
+
+**The net controller Pod needs access to the selected image repository when
+step 4 is required.** The Kubernetes API server only supplies the version; it
+does not search the registry on the controller's behalf. The net controller
+queries the registry's tag-list API itself without pulling the image.
+
+Allow DNS resolution and outbound connectivity from the controller Pod to the
+selected registry and any redirected registry backends or anonymous token-service
+endpoints. This is separate from worker-node image pulls: nodes being able to
+pull the image does not establish that the controller can reach or list tags in
+the repository.
+
+Registry tag searches use anonymous access and do not reuse worker-node
+image-pull credentials. If a private registry requires credentials for tag
+listing, supply an explicit tag or digest, or ensure a provider tag can be
+inherited. These paths avoid a controller-side registry query for image
+selection; the nodes still need access and any credentials required to pull
+the chosen image.
+
+| Version source | Net controller queries the image repository? |
+|----------------|--------------------------------------------|
+| Override includes a tag or digest | No. |
+| Versioned provider image is copied, or its tag is inherited | No. |
+| API server version is used to discover a tag | Yes; anonymous tag-list access is required. |
+
+#### Startup and failure handling
 
 The controller works out the image once, when it starts leading. Image discovery
 and managed kube-proxy startup run in the background; the other network
-controllers and shared informers do not wait for them. When the operator
-manages unbounded-net, the image can also be set through the operator's
-overrides ConfigMap, which validates it before anything is written and takes
-precedence over this setting. See
-[Overriding the managed kube-proxy image]({{< relref "reference/workload-overrides#overriding-the-managed-kube-proxy-image" >}}).
+controllers and shared informers do not wait for them.
+
+Provider discovery stops immediately on NotFound. Other read errors get ten
+additional attempts at ten-second intervals before fallback version selection.
+Registry searches have a 30-second total timeout and a limit of 100 pages.
+Failure to discover a valid API server version, complete the registry tag
+listing, or find a matching tag is logged and leaves the managed kube-proxy
+controller unstarted instead of guessing an image or falling back to `latest`.
+This includes registry connectivity or access failures. The rest of the net
+controller continues running.
 
 Set `controller.managedKubeProxy.enabled` to `false` to disable their creation.
 
