@@ -236,9 +236,7 @@ pub mod error_token {
     pub const LEASE: &str = "lease";
     pub const UPLOAD: &str = "upload";
     pub const UPLOADED: &str = "uploaded";
-    pub const CONFLICT: &str = "conflict";
     pub const NOT_MANUAL: &str = "not-manual";
-    pub const LOST: &str = "lost";
 }
 
 /// A write operation.

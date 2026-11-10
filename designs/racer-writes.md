@@ -381,7 +381,7 @@ When writes are enabled, `405` responses on `/v1/objects/<key>` carry
 | `504` | Request deadline elapsed before durability | |
 
 `Racer-Write-Error` is a diagnostic token: `dirty-cap`, `owners`, `coordinator`,
-`lease`, `upload`, `uploaded`, `conflict`, `not-manual`. Bodies stay empty.
+`lease`, `upload`, `uploaded`, `not-manual`. Bodies stay empty.
 
 `Racer-Upload-State` values: `pending` (waiting to upload), `uploading`,
 `committed`, `failed`, `never` (cache-only), `manual` (waiting for `persist`).
