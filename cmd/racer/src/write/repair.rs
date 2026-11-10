@@ -376,6 +376,7 @@ async fn rebalance(
     let health = local.fill.dependencies.candidates.link_health();
     let me = local.local_node();
     let mut plans = Vec::new();
+    let mut complete = true;
     for page in 0..holders.pages() {
         let held = holders.page(page);
         let Some(source) = held.first().and_then(|s| String::from_utf8(s.clone()).ok()) else {
@@ -388,7 +389,12 @@ async fn rebalance(
         else {
             continue;
         };
-        if held.contains(&owner.0.clone().into_bytes()) || (owner != me && health.silent(&owner)) {
+        if held.contains(&owner.0.clone().into_bytes()) {
+            continue;
+        }
+        if owner != me && health.silent(&owner) {
+            // Retried on a later turn, once the owner answers again.
+            complete = false;
             continue;
         }
         plans.push(Plan {
@@ -399,8 +405,19 @@ async fn rebalance(
             want: 1,
         });
     }
+    // Page zero's rank-0 member learns the manifest even when it already
+    // holds every page it owns, so failover hands it the coordinator role
+    // and the deletes and persists clients send it find the object.
+    if ranked(local, membership, object, 0, scope)
+        .await?
+        .into_iter()
+        .find(|node| membership.serves(&object.cache, node))
+        .is_some_and(|first| first != me)
+    {
+        replicate_manifest(local, object, membership, scope).await;
+    }
     if plans.is_empty() {
-        return Ok(true);
+        return Ok(complete);
     }
     let wanted = plans.len() as u64;
     let (restored, copies) = execute(
@@ -426,7 +443,7 @@ async fn rebalance(
         .await?;
         replicate_manifest(local, object, membership, scope).await;
     }
-    Ok(copies == wanted)
+    Ok(complete && copies == wanted)
 }
 
 /// The `write-store` request every copy of this session shares.

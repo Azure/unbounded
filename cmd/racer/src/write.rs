@@ -69,6 +69,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 pub use directory::Directory;
+pub use directory::Role;
 pub use metrics::WriteMetrics;
 pub use staging::WriteStaging;
 

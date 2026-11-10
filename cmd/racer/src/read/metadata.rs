@@ -635,7 +635,19 @@ impl MetadataService {
         // deleted, expires, or uploads; the origin does not know it yet.
         if let Some(metadata) = self
             .writes
-            .current(&context.object, self.candidates.ctx().clock.wall_now())
+            .current_role(&context.object, self.candidates.ctx().clock.wall_now())
+            .filter(|(_, role)| {
+                // A manifest replica that membership changes pushed out of
+                // page zero's ranked members no longer hears deletes (they
+                // go to those members); it must not answer for the object.
+                *role == crate::write::Role::Coordinator
+                    || self.candidates.is_candidate(&self.candidates.candidates(
+                        membership.clone(),
+                        &context.object,
+                        PageNumber(0),
+                    ))
+            })
+            .map(|(metadata, _)| metadata)
             && match &purpose {
                 RefreshPurpose::Pinned(etag) => *etag == metadata.version.etag,
                 _ => true,

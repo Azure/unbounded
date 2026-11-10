@@ -132,6 +132,20 @@ impl Directory {
         entry.metadata(now)
     }
 
+    /// [`Self::current`], with the role this worker tracks it in.
+    pub fn current_role(
+        &self,
+        object: &ObjectId,
+        now: SystemTime,
+    ) -> Option<(ObjectMetadata, Role)> {
+        let entries = self.entries.borrow();
+        let entry = entries.get(object)?;
+        if !entry.visible(now) {
+            return None;
+        }
+        Some((entry.metadata(now)?, entry.role))
+    }
+
     /// Run `f` on the entry of `object`.
     pub fn with<R>(&self, object: &ObjectId, f: impl FnOnce(Option<&mut Entry>) -> R) -> R {
         f(self.entries.borrow_mut().get_mut(object))

@@ -128,6 +128,9 @@ pub(crate) async fn check_roles(
         let Some((role, version)) = due else {
             continue;
         };
+        let member = page_zero_members(local, membership, &object, scope)
+            .await?
+            .contains(&local.local_node());
         let decided = decide(local, membership, &version, scope).await?;
         directory.with(&object, |e| {
             if let Some(e) = e.filter(|e| e.version == version) {
@@ -135,7 +138,25 @@ pub(crate) async fn check_roles(
             }
         });
         match (role, decided) {
-            (Role::Replica, None) => promote(local, &object, &version, membership, scope).await,
+            // Only a page-zero member may take over: deletes and readers
+            // reach those members, not a replica the placement moved away.
+            (Role::Replica, None) if member => {
+                promote(local, &object, &version, membership, scope).await;
+            }
+            // A member knows it: this displaced copy is not needed.
+            (Role::Replica, Some(_)) if !member => {
+                if local.writes.directory().remove_version(&version).is_some() {
+                    local
+                        .fill
+                        .dependencies
+                        .writer
+                        .index()
+                        .invalidate_current(&object);
+                    if let Ok(record) = super::coordinator::delete_record(&version) {
+                        let _ = super::coordinator::journal(local, record).await;
+                    }
+                }
+            }
             (Role::Coordinator, Some(leader)) => {
                 demote(local, &object, &version, &leader, membership, scope).await;
             }
