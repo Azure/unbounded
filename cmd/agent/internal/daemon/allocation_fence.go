@@ -11,7 +11,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	authenticationv1 "k8s.io/api/authentication/v1"
@@ -74,21 +73,9 @@ func IsFinalAllocationLaunchRefusal(err error) bool {
 }
 
 // AllocationUID reports whether cfg belongs to a host launched for a
-// MachineAllocation, and that allocation's UID. A host is allocation-backed
-// when its kubelet providerID carries v1alpha3.AllocationProviderIDPrefix. A
-// backed config with an empty uid is a malformed identity.
+// MachineAllocation, and that allocation's UID; see provision.AllocationUID.
 func AllocationUID(cfg *provision.AgentConfig) (uid string, backed bool) {
-	providerID, ok := cfg.Kubelet.Configuration["providerID"].(string)
-	if !ok {
-		return "", false
-	}
-
-	uid, backed = strings.CutPrefix(providerID, v1alpha3.AllocationProviderIDPrefix)
-	if !backed {
-		return "", false
-	}
-
-	return uid, true
+	return provision.AllocationUID(cfg)
 }
 
 // PersistAllocationLaunchConfig writes the allocation launch record for an
