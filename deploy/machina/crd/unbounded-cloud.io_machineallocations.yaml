@@ -887,6 +887,16 @@ spec:
           message: providerID is immutable once set
           rule: '!has(oldSelf.status) || !has(oldSelf.status.providerID) || (has(self.status)
             && has(self.status.providerID) && self.status.providerID == oldSelf.status.providerID)'
+        - fieldPath: .status.operations.allocate
+          message: operations.allocate is immutable once set
+          rule: '!has(oldSelf.status) || !has(oldSelf.status.operations) || !has(oldSelf.status.operations.allocate)
+            || (has(self.status) && has(self.status.operations) && has(self.status.operations.allocate)
+            && self.status.operations.allocate == oldSelf.status.operations.allocate)'
+        - fieldPath: .status.operations.release
+          message: operations.release is immutable once set
+          rule: '!has(oldSelf.status) || !has(oldSelf.status.operations) || !has(oldSelf.status.operations.release)
+            || (has(self.status) && has(self.status.operations) && has(self.status.operations.release)
+            && self.status.operations.release == oldSelf.status.operations.release)'
     served: true
     storage: true
     subresources:

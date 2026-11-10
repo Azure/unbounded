@@ -16,6 +16,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	v1 "k8s.io/client-go/applyconfigurations/core/v1"
 	"k8s.io/client-go/kubernetes"
+
+	"github.com/Azure/unbounded/api/machina/v1alpha3"
 )
 
 const (
@@ -69,24 +71,30 @@ func ApplyBootstrapToken(ctx context.Context, kubeCli kubernetes.Interface, fiel
 		FieldManager: fieldManager,
 	}
 
+	s := v1.Secret(bootstrapTokenName(token), metav1.NamespaceSystem).
+		WithType(corev1.SecretTypeBootstrapToken).
+		WithLabels(token.Labels).
+		WithData(BootstrapTokenSecretData(token))
+
+	return ApplySecret(ctx, kubeCli, s, ao)
+}
+
+// BootstrapTokenSecretData returns the data of the bootstrap token Secret for
+// token. A zero ExpiresAt expires DefaultBootstrapTokenTTL from now.
+func BootstrapTokenSecretData(token *BootstrapToken) map[string][]byte {
 	expiresAt := token.ExpiresAt
 	if expiresAt.IsZero() {
 		expiresAt = time.Now().UTC().Add(DefaultBootstrapTokenTTL)
 	}
 
-	s := v1.Secret(bootstrapTokenName(token), metav1.NamespaceSystem).
-		WithType(corev1.SecretTypeBootstrapToken).
-		WithLabels(token.Labels).
-		WithData(map[string][]byte{
-			"auth-extra-groups":              []byte("system:bootstrappers:unbounded-agent-daemons"),
-			"expiration":                     []byte(expiresAt.UTC().Format(time.RFC3339)),
-			"token-id":                       []byte(token.ID),
-			"token-secret":                   []byte(token.Secret),
-			"usage-bootstrap-authentication": []byte("true"),
-			"usage-bootstrap-signing":        []byte("true"),
-		})
-
-	return ApplySecret(ctx, kubeCli, s, ao)
+	return map[string][]byte{
+		"auth-extra-groups":              []byte("system:bootstrappers:unbounded-agent-daemons"),
+		"expiration":                     []byte(expiresAt.UTC().Format(time.RFC3339)),
+		"token-id":                       []byte(token.ID),
+		"token-secret":                   []byte(token.Secret),
+		"usage-bootstrap-authentication": []byte("true"),
+		"usage-bootstrap-signing":        []byte("true"),
+	}
 }
 
 func GetBootstrapTokenForSite(ctx context.Context, kubeCli kubernetes.Interface, siteName string) (*BootstrapToken, error) {
@@ -124,13 +132,20 @@ func GetBootstrapTokenForSite(ctx context.Context, kubeCli kubernetes.Interface,
 }
 
 // ValidBootstrapTokenSecretForSite reports whether secret contains a usable,
-// unexpired bootstrap token scoped to siteName.
+// unexpired bootstrap token scoped to siteName. A MachineAllocation's token
+// carries the site label too, but belongs to that allocation alone and is
+// revoked with it, so a Secret with the allocation UID label is never a site
+// token.
 func ValidBootstrapTokenSecretForSite(secret *corev1.Secret, siteName string, now time.Time) bool {
 	if secret == nil || secret.Type != corev1.SecretTypeBootstrapToken {
 		return false
 	}
 
 	if secret.Labels["unbounded-cloud.io/site"] != siteName {
+		return false
+	}
+
+	if _, allocation := secret.Labels[v1alpha3.LabelAllocationUID]; allocation {
 		return false
 	}
 

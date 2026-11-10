@@ -4,6 +4,11 @@
 package provision
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -105,4 +110,83 @@ func TestUnboundedAgentInstallScriptSeed(t *testing.T) {
 	out, err := cmd.CombinedOutput()
 	require.NoError(t, err, "%s", out)
 	require.Contains(t, string(out), "Not seeding")
+}
+
+// TestUnboundedAgentInstallScriptVerifiesDigest runs the download block with a
+// stand-in curl. With AGENT_SHA256 set the tarball is saved, checked and only
+// then extracted. Without it the script streams the tarball as before.
+func TestUnboundedAgentInstallScriptVerifiesDigest(t *testing.T) {
+	t.Parallel()
+
+	script := UnboundedAgentInstallScript()
+	start := strings.Index(script, `if [ -n "${AGENT_SHA256:-}" ]; then`)
+	require.GreaterOrEqual(t, start, 0)
+
+	const end = "\nfi\n"
+
+	length := strings.Index(script[start:], end)
+	require.Positive(t, length)
+
+	block := script[start : start+length+len(end)]
+	require.Contains(t, block, `curl -fsSL "${AGENT_URL}" | tar -xz -C "${tmp_dir}" unbounded-agent`)
+	require.Contains(t, block, "sha256sum -c")
+
+	var archive bytes.Buffer
+
+	gz := gzip.NewWriter(&archive)
+	tw := tar.NewWriter(gz)
+	content := []byte("#!/bin/sh\necho agent\n")
+	require.NoError(t, tw.WriteHeader(&tar.Header{Name: "unbounded-agent", Mode: 0o755, Size: int64(len(content))}))
+	_, err := tw.Write(content)
+	require.NoError(t, err)
+	require.NoError(t, tw.Close())
+	require.NoError(t, gz.Close())
+
+	source := filepath.Join(t.TempDir(), "agent.tar.gz")
+	require.NoError(t, os.WriteFile(source, archive.Bytes(), 0o600))
+
+	sum := sha256.Sum256(archive.Bytes())
+	digest := hex.EncodeToString(sum[:])
+
+	// The stand-in curl writes to the -o file when given one and otherwise
+	// streams to stdout, the two ways the block calls it.
+	const fakeCurl = `curl() { if [ "$2" = "-o" ]; then cp "$4" "$3"; else cat "$2"; fi; }` + "\n"
+
+	run := func(t *testing.T, sha string) (string, []byte, error) {
+		t.Helper()
+
+		tmpDir := t.TempDir()
+		cmd := exec.Command("bash", "-eo", "pipefail", "-c", fakeCurl+block)
+
+		cmd.Env = append(os.Environ(), "AGENT_URL="+source, "tmp_dir="+tmpDir, "AGENT_SHA256="+sha)
+		out, err := cmd.CombinedOutput()
+
+		return tmpDir, out, err
+	}
+
+	t.Run("matching digest", func(t *testing.T) {
+		t.Parallel()
+
+		tmpDir, out, err := run(t, digest)
+		require.NoError(t, err, "%s", out)
+		require.FileExists(t, filepath.Join(tmpDir, "unbounded-agent"))
+		require.FileExists(t, filepath.Join(tmpDir, "unbounded-agent.tar.gz"))
+	})
+
+	t.Run("mismatched digest", func(t *testing.T) {
+		t.Parallel()
+
+		tmpDir, out, err := run(t, strings.Repeat("0", 64))
+		require.Error(t, err, "%s", out)
+		require.NoFileExists(t, filepath.Join(tmpDir, "unbounded-agent"))
+	})
+
+	t.Run("digest unset", func(t *testing.T) {
+		t.Parallel()
+
+		tmpDir, out, err := run(t, "")
+		require.NoError(t, err, "%s", out)
+		require.FileExists(t, filepath.Join(tmpDir, "unbounded-agent"))
+		require.NoFileExists(t, filepath.Join(tmpDir, "unbounded-agent.tar.gz"))
+	})
 }
