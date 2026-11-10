@@ -33,14 +33,22 @@ pub fn block_id(version_hex: &[u8; 32], page: u64) -> [u8; BLOCK_ID_BYTES] {
 /// `<?xml version="1.0" encoding="utf-8"?><BlockList><Latest>id</Latest>...</BlockList>`.
 /// Block IDs contain only base64 characters, so no XML escaping is needed.
 pub fn block_list_xml(version_hex: &[u8; 32], pages: u64) -> Vec<u8> {
+    let ids: Vec<_> = (0..pages).map(|page| block_id(version_hex, page)).collect();
+    block_list_xml_from_ids(&ids)
+}
+
+/// Put Block List body committing `ids` in order, each as `Latest`. The
+/// caller supplies base64 IDs (for example from [`block_id`]); they are
+/// written verbatim, since base64 needs no XML escaping.
+pub fn block_list_xml_from_ids(ids: &[[u8; BLOCK_ID_BYTES]]) -> Vec<u8> {
     const OPEN: &[u8] = b"<?xml version=\"1.0\" encoding=\"utf-8\"?><BlockList>";
     const CLOSE: &[u8] = b"</BlockList>";
     let per = b"<Latest></Latest>".len() + BLOCK_ID_BYTES;
-    let mut out = Vec::with_capacity(OPEN.len() + CLOSE.len() + per * pages as usize);
+    let mut out = Vec::with_capacity(OPEN.len() + CLOSE.len() + per * ids.len());
     out.extend_from_slice(OPEN);
-    for page in 0..pages {
+    for id in ids {
         out.extend_from_slice(b"<Latest>");
-        out.extend_from_slice(&block_id(version_hex, page));
+        out.extend_from_slice(id);
         out.extend_from_slice(b"</Latest>");
     }
     out.extend_from_slice(CLOSE);
@@ -137,6 +145,9 @@ mod tests {
                 "<?xml version=\"1.0\" encoding=\"utf-8\"?><BlockList><Latest>{id0}</Latest><Latest>{id1}</Latest></BlockList>"
             )
         );
+        let ids = [block_id(VERSION, 0), block_id(VERSION, 1)];
+        assert_eq!(block_list_xml_from_ids(&ids), xml.as_bytes());
+        assert_eq!(block_list_xml_from_ids(&[]), block_list_xml(VERSION, 0));
         assert_eq!(
             block_list_xml(VERSION, 0),
             b"<?xml version=\"1.0\" encoding=\"utf-8\"?><BlockList></BlockList>"

@@ -15,7 +15,7 @@ pub use racer_wire::object::write::{
     Durability, MAX_REPLICAS, MIN_REPLICAS, UploadMode, UploadState,
 };
 pub use session::{Phase, Rejection, Session, SessionEffect, SessionEvent, WriteIdentity};
-pub use upload::{UploadPlan, block_id, block_list_xml};
+pub use upload::{UploadPlan, block_id, block_list_xml, block_list_xml_from_ids};
 
 /// Azure Blob allows at most this many committed blocks per blob, and writes
 /// use one block per page.

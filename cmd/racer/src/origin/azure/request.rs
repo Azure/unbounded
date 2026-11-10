@@ -301,22 +301,14 @@ pub fn put_block_list_head(
 /// Put Block List body committing `block_ids` in order, each as `Latest`:
 /// `<?xml version="1.0" encoding="utf-8"?><BlockList><Latest>id</Latest>...</BlockList>`.
 /// IDs are base64, so no XML escaping is needed; invalid IDs are rejected.
-// WP2 provides the canonical version; switch on merge.
-pub fn block_list_xml(block_ids: &[[u8; 64]]) -> Result<Vec<u8>> {
-    const HEAD: &[u8] = b"<?xml version=\"1.0\" encoding=\"utf-8\"?><BlockList>";
-    const TAIL: &[u8] = b"</BlockList>";
-    let mut body = Vec::with_capacity(HEAD.len() + TAIL.len() + block_ids.len() * 81);
-    body.extend_from_slice(HEAD);
-    for id in block_ids {
-        if !valid_block_id(id) {
-            return Err(Error::InvalidRequest);
-        }
-        body.extend_from_slice(b"<Latest>");
-        body.extend_from_slice(id);
-        body.extend_from_slice(b"</Latest>");
+/// The body itself is [`racer_core::write::block_list_xml_from_ids`].
+pub fn block_list_xml(
+    block_ids: &[[u8; racer_core::write::upload::BLOCK_ID_BYTES]],
+) -> Result<Vec<u8>> {
+    if !block_ids.iter().all(|id| valid_block_id(id)) {
+        return Err(Error::InvalidRequest);
     }
-    body.extend_from_slice(TAIL);
-    Ok(body)
+    Ok(racer_core::write::block_list_xml_from_ids(block_ids))
 }
 
 #[cfg(test)]

@@ -162,22 +162,8 @@ impl<T: AzureTransport, K: AzureTokenSource> UploadSink for AzureOrigin<T, K> {
     }
 }
 
-/// Block ID for `page` of the Racer version `version_hex`: base64 of the 48
-/// ASCII bytes `"{version_hex}{page:016x}"`, always 64 characters.
-// WP2 provides the canonical version; switch on merge.
 #[cfg(test)]
-pub(crate) fn block_id(version_hex: &[u8; 32], page: u64) -> [u8; 64] {
-    use base64::Engine;
-    let mut raw = [0u8; 48];
-    raw[..32].copy_from_slice(version_hex);
-    raw[32..].copy_from_slice(format!("{page:016x}").as_bytes());
-    let mut id = [0u8; 64];
-    let written = base64::engine::general_purpose::STANDARD
-        .encode_slice(raw, &mut id)
-        .unwrap_or_default();
-    debug_assert_eq!(written, 64);
-    id
-}
+pub(crate) use racer_core::write::block_id;
 
 #[cfg(test)]
 mod tests;
