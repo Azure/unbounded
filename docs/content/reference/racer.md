@@ -2040,6 +2040,33 @@ status = client.prefetch_status("epoch-17", wait=30, refs="failed")
 For tests, `github.com/Azure/unbounded/pkg/racersdk/racersdktest` runs a
 noncaching fake Racer. It does not test distributed or RDMA behavior.
 
+### Writes
+
+The Go SDK wraps the [write API](#object-writes):
+
+```go
+func (c *Client) Put(ctx context.Context, request Request, body io.Reader, length int64, options WriteOptions) (WriteResult, error)
+func (c *Client) HostWrite(ctx context.Context, request Request, file *os.File, offset, length int64, options WriteOptions) (WriteResult, error)
+func (c *Client) Persist(ctx context.Context, request Request) (UploadState, error)
+func (c *Client) Delete(ctx context.Context, request Request) error
+```
+
+```go
+result, err := client.Put(ctx, request, bytes.NewReader(data), int64(len(data)),
+	racersdk.WriteOptions{Replicas: 2, Upload: racersdk.UploadNever, Hold: time.Hour})
+if errors.Is(err, racersdk.ErrExists) {
+	// The key exists; writes are create-once.
+}
+```
+
+The zero `WriteOptions` uses the cache defaults. `OriginDurable` waits for the
+upload to commit. `RetryBusy` retries `503` answers for up to that long; `Put`
+retries only when the body is an `io.ReadSeeker`. `Request.Metadata` must not
+name a version. Errors match `ErrExists` (`412`), `ErrWritesDisabled` (`405`),
+`ErrBusy` (`503`), `ErrUploadFailed` (`502`), and `ErrConflict` (`409`). Use
+`errors.As` with `*WriteError` to read the status, `Racer-Write-Error` token,
+and `Retry-After`.
+
 ## Client socket mount
 
 Pods that talk to the dataplane socket directly, such as the Python client,
