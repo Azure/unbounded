@@ -27,6 +27,17 @@ pub(super) struct CheckpointCut {
 
     /// Last successful slot, or the initial periodic slot-selection baseline.
     last_slot: usize,
+
+    /// Fingerprint of the last periodic cut this process wrote, if any. An
+    /// identical cut is not rewritten.
+    last_fingerprint: Option<[u8; 32]>,
+
+    /// Each worker's checkpoint generation for the current periodic cut,
+    /// read before its writer pauses. `None` when it has holds.
+    votes: HashMap<WorkerId, Option<u64>>,
+
+    /// Each worker's generation as of the last successful periodic cut.
+    published_generations: HashMap<WorkerId, u64>,
 }
 
 /// Publication ownership survives its result until every worker acknowledges it.
@@ -41,6 +52,10 @@ enum CutPhase {
 
     Published(Result<()>),
 }
+
+/// A periodic publication and the fingerprint it wrote, or `None` when the cut
+/// matched the previous one and no I/O was issued.
+pub(super) type PeriodicOutcome = (Publication, Option<[u8; 32]>);
 
 /// The two callers deliberately choose different slots for their first cold cut.
 #[derive(Clone, Copy)]
@@ -120,7 +135,31 @@ impl CheckpointCut {
             return Err(Error::Unavailable);
         }
         self.last_slot = publication.slot;
+        // Only a periodic write records its fingerprint, after this returns.
+        self.last_fingerprint = None;
+        self.published_generations.clear();
         Ok(())
+    }
+
+    /// Settle a periodic reservation: record a written cut's fingerprint and
+    /// slot, or release an unwritten reservation so slot alternation is unchanged.
+    fn settled(&mut self, (publication, written): PeriodicOutcome) -> Result<()> {
+        match written {
+            Some(fingerprint) => {
+                self.published(publication)?;
+                self.last_fingerprint = Some(fingerprint);
+                self.record_published_generations();
+                Ok(())
+            }
+            // No byte of this sequence reached disk, so reusing it is safe.
+            // The cut matched the one on disk, so its generations are current.
+            None if publication.sequence == self.last_sequence => {
+                self.last_sequence -= 1;
+                self.record_published_generations();
+                Ok(())
+            }
+            None => Err(Error::Unavailable),
+        }
     }
 
     /// Start a new periodic collection after the caller checks timing and acknowledgments.
@@ -133,13 +172,58 @@ impl CheckpointCut {
         self.periodic_started = Some(now);
         self.periodic_finished = 0;
         self.shards.clear();
+        self.votes.clear();
         self.phase = CutPhase::Collecting;
         Ok(())
+    }
+
+    /// Record `worker`'s generation for this cut once, before it snapshots.
+    fn vote(&mut self, worker: WorkerId, generation: Option<u64>) {
+        self.votes.entry(worker).or_insert(generation);
+    }
+
+    /// Whether every one of `count` workers has voted in this cut.
+    fn votes_complete(&self, count: usize) -> bool {
+        self.votes.len() >= count
+    }
+
+    /// Whether every voting worker is unchanged since the last successful
+    /// periodic cut and has no holds, so this cut would match the one on disk.
+    fn unchanged(&self) -> bool {
+        !self.votes.is_empty()
+            && self.votes.iter().all(|(worker, generation)| {
+                generation.is_some_and(|generation| {
+                    self.published_generations.get(worker) == Some(&generation)
+                })
+            })
+    }
+
+    /// Complete this cut without snapshotting or publishing anything.
+    fn skip(&mut self) {
+        debug_assert!(matches!(self.phase, CutPhase::Collecting));
+        self.shards.clear();
+        self.phase = CutPhase::Published(Ok(()));
+    }
+
+    /// Remember this cut's votes as published; a worker with holds keeps none.
+    fn record_published_generations(&mut self) {
+        self.published_generations = self
+            .votes
+            .iter()
+            .filter_map(|(worker, generation)| generation.map(|generation| (*worker, generation)))
+            .collect();
     }
 
     /// Fence new write batches while a periodic cut still owns its snapshots.
     pub(super) fn blocks_writer(&self) -> bool {
         self.periodic_generation != 0 && self.result().is_none()
+    }
+
+    /// Whether a worker whose last snapshot belongs to `snapshotted` must
+    /// still hold back new write batches. Once the worker has snapshotted
+    /// this cut, appends are safe: segment reuse stays frozen instead.
+    pub(super) fn blocks_writer_before(&self, snapshotted: u64) -> bool {
+        self.blocks_writer() && snapshotted != self.periodic_generation
     }
 }
 
@@ -273,7 +357,7 @@ impl WorkerApplication {
         if !self.started {
             return Ok(());
         }
-        let now = uring_runtime::environment::now();
+        let now = self.ctx().now();
         if let Some(task) = self.checkpoint_task.as_mut()
             && let Poll::Ready(result) = task.as_mut().poll(cx)
         {
@@ -282,7 +366,7 @@ impl WorkerApplication {
                 .periodic_checkpoint
                 .lock()
                 .map_err(|_| Error::Unavailable)?;
-            let result = result.and_then(|publication| cut.published(publication));
+            let result = result.and_then(|outcome| cut.settled(outcome));
             cut.finish(result);
         }
         let mut cut = node
@@ -304,7 +388,7 @@ impl WorkerApplication {
         }
         let generation = cut.periodic_generation;
         if self.stopping && !cut.publication_started() {
-            cut.fail(Error::Cancelled);
+            cut.fail(Error::Canceled);
         }
         if cut.result().is_some() {
             self.checkpoint_snapshot.take();
@@ -320,6 +404,17 @@ impl WorkerApplication {
             // Stop starting batches while existing SQEs drain, then freeze only
             // this shard. No queue-idle requirement can starve a busy checkpoint.
             if self.writer_task.is_some() {
+                return Ok(());
+            }
+            // Vote before pausing the writer. If every worker is unchanged
+            // since the last successful cut and holds nothing, the cut would
+            // only rewrite (and re-hash) an identical image, so skip it.
+            cut.vote(self.worker, self.store.checkpoint.generation());
+            if !cut.votes_complete(node.count) {
+                return Ok(());
+            }
+            if cut.unchanged() {
+                cut.skip();
                 return Ok(());
             }
             self.checkpoint_generation = generation;
@@ -353,6 +448,7 @@ impl WorkerApplication {
             && !cut.publication_started()
         {
             let shards = cut.start_publication();
+            let previous = cut.last_fingerprint;
             let publication = match cut.reserve(CheckpointPolicy::Periodic) {
                 Ok(publication) => publication,
                 Err(error) => {
@@ -361,21 +457,24 @@ impl WorkerApplication {
                 }
             };
             drop(cut);
-            match self.store.checkpoint.publish_async(
+            match self.store.checkpoint.publish_changed_async(
                 self.keys.cluster().clone(),
                 shards,
                 self.runtime.reactor.clone(),
-                scope(self.timeout)?,
+                scope(&self.ctx().clock, self.timeout)?,
                 publication.sequence,
                 publication.slot,
                 self.checkpoint_budget,
+                previous,
             ) {
                 Ok(task) => {
                     let metrics = self.telemetry.metrics.clone();
                     self.checkpoint_task = Some(Box::pin(async move {
-                        task.await?;
-                        metrics.set_gauge(Gauge::CheckpointSequence, publication.sequence);
-                        Ok(publication)
+                        let written = task.await?;
+                        if written.is_some() {
+                            metrics.set_gauge(Gauge::CheckpointSequence, publication.sequence);
+                        }
+                        Ok((publication, written))
                     }));
                 }
                 Err(error) => node
@@ -402,8 +501,8 @@ impl WorkerApplication {
             .insert(self.worker, geometry);
         std::future::poll_fn(|cx| {
             startup.check()?;
-            if STOP_REQUESTED.load(Ordering::Relaxed) {
-                return Poll::Ready(Err(Error::Cancelled));
+            if super::stop_requested() {
+                return Poll::Ready(Err(Error::Canceled));
             }
             let cut = node.recovery.lock().map_err(|_| Error::Unavailable)?;
             if let Some(error) = cut.failure {
@@ -418,45 +517,10 @@ impl WorkerApplication {
         })
         .await?;
         if self.worker == node.control_worker {
-            let candidates =
-                crate::store::checkpoint::candidates(&self.slab_directory, self.checkpoint_budget);
+            let scanned = self.scan_checkpoints(startup).await;
             let mut cut = node.recovery.lock().map_err(|_| Error::Unavailable)?;
-            match candidates {
-                Ok(candidates) => {
-                    let mut newest = None;
-                    let images = candidates
-                        .map(|(slot, image)| {
-                            newest.get_or_insert((slot, image.sequence));
-                            image
-                        })
-                        .filter(|image| {
-                            node.devices.as_ref().is_none_or(|plan| {
-                                image.shards.iter().all(|shard| {
-                                    plan.workers.get(shard.worker.0 as usize).is_some_and(
-                                        |worker| {
-                                            shard
-                                                .index
-                                                .validate_capacity(
-                                                    worker.page_entries,
-                                                    self.store.writer.index().metadata_capacity(),
-                                                )
-                                                .is_ok()
-                                        },
-                                    )
-                                })
-                            })
-                        });
-                    let selected = select(
-                        images,
-                        &cut.geometry,
-                        &node.workers,
-                        (
-                            self.store.writer.index().page_capacity(),
-                            self.store.writer.index().metadata_capacity(),
-                        ),
-                        &self.keys,
-                        &self.snapshots.current()?.caches,
-                    );
+            match scanned {
+                Ok((newest, selected)) => {
                     if let Some((slot, sequence)) = newest {
                         let mut periodic = node
                             .periodic_checkpoint
@@ -520,19 +584,110 @@ impl WorkerApplication {
     }
 }
 
+impl WorkerApplication {
+    /// Scan checkpoint slots newest first on the worker reactor, keeping at
+    /// most one decoded image while validating it. Returns the newest decoded
+    /// slot and sequence, and the first compatible image.
+    async fn scan_checkpoints(
+        &self,
+        startup: &RequestScope,
+    ) -> Result<(Option<(usize, u64)>, Option<CheckpointImage>)> {
+        let node = &self.node;
+        let geometry = node
+            .recovery
+            .lock()
+            .map_err(|_| Error::Unavailable)?
+            .geometry
+            .clone();
+        let snapshot = self.snapshots.current()?;
+        let capacity = (
+            self.store.writer.index().page_capacity(),
+            self.store.writer.index().metadata_capacity(),
+        );
+        let directory = &self.slab_directory;
+        let budget = self.checkpoint_budget;
+        let (geometry, snapshot) = (&geometry, &snapshot);
+        self.runtime
+            .reactor
+            .run(
+                startup,
+                None,
+                racer_io::scoped::SubmissionKind::OtherIo,
+                move |io, ctx| {
+                    let (io, ctx) = (io.clone(), ctx.clone());
+                    Box::pin(async move {
+                        let scan = async {
+                            let mut found =
+                                crate::store::checkpoint::candidates(&io, directory, budget, &ctx)
+                                    .await?;
+                            let mut newest = None;
+                            while let Some((slot, image)) =
+                                crate::store::checkpoint::next_candidate(&mut found, &io, &ctx)
+                                    .await
+                            {
+                                newest.get_or_insert((slot, image.sequence));
+                                let fits = node.devices.as_ref().is_none_or(|plan| {
+                                    image.shards.iter().all(|shard| {
+                                        plan.workers.get(shard.worker.0 as usize).is_some_and(
+                                            |worker| {
+                                                shard
+                                                    .index
+                                                    .validate_capacity(
+                                                        worker.page_entries,
+                                                        capacity.1,
+                                                    )
+                                                    .is_ok()
+                                            },
+                                        )
+                                    })
+                                });
+                                if !fits {
+                                    continue;
+                                }
+                                let selected = select(
+                                    std::iter::once(image),
+                                    geometry,
+                                    &node.workers,
+                                    capacity,
+                                    &self.keys,
+                                    &snapshot.caches,
+                                    snapshot.page_size,
+                                );
+                                if selected.is_some() {
+                                    return Ok((newest, selected));
+                                }
+                            }
+                            Ok((newest, None))
+                        };
+                        Ok(scan.await)
+                    }) as racer_io::Operation<'_, Result<_>>
+                },
+                |_| None,
+            )
+            .await?
+    }
+}
+
 /// Select the newest compatible candidate without retaining two decoded images.
 fn select(
     candidates: impl IntoIterator<Item = CheckpointImage>,
     geometry: &HashMap<WorkerId, CheckpointGeometry>,
-    workers: &WorkerDirectory,
+    workers: &crate::read::dispatch::NodeDirectory,
     (page_capacity, metadata_capacity): (usize, usize),
     keys: &Keyring,
-    caches: &[racer_control_wire::CacheDefinition],
+    caches: &[racer_wire::control::CacheDefinition],
+    page_size: racer_wire::object::PageSize,
 ) -> Option<CheckpointImage> {
     // The disk scanner supplies newest-first images, never retaining a second
     // decoded candidate while validating the first.
     candidates.into_iter().find_map(|image| {
         let sequence = image.sequence;
+        // A cut taken under another published page size cuts every page at
+        // the wrong offsets: start cold rather than serve it.
+        if image.page_size != page_size {
+            eprintln!("racer: skipping checkpoint sequence {sequence} cut at another page size");
+            return None;
+        }
         let selected = validate_candidate(
             image,
             geometry,
@@ -552,10 +707,10 @@ fn select(
 fn validate_candidate(
     mut image: CheckpointImage,
     geometry: &HashMap<WorkerId, CheckpointGeometry>,
-    workers: &WorkerDirectory,
+    workers: &crate::read::dispatch::NodeDirectory,
     (page_capacity, metadata_capacity): (usize, usize),
     keys: &Keyring,
-    caches: &[racer_control_wire::CacheDefinition],
+    caches: &[racer_wire::control::CacheDefinition],
 ) -> Option<CheckpointImage> {
     // Key and cache IDs can repeat across clusters, so a foreign cut is only a stale hint.
     if &image.cluster != keys.cluster() {
@@ -565,7 +720,7 @@ fn validate_candidate(
     if ids.len() != image.shards.len() || ids != geometry.keys().copied().collect() {
         return None;
     }
-    let available = |cache: &racer_control_wire::CacheId| caches.iter().any(|c| &c.id == cache);
+    let available = |cache: &racer_wire::control::CacheId| caches.iter().any(|c| &c.id == cache);
     Recovery::filter_available(
         &mut image,
         |cache| available(cache) && keys.active(cache, KeyPurpose::Page).is_ok(),
@@ -606,6 +761,158 @@ mod tests {
     use crate::store::checkpoint::CHECKPOINT_VERSION;
     use page_alloc::Alignment;
     use page_alloc::Segments;
+
+    /// A periodic cut fences a worker's writer only until that worker has
+    /// snapshotted the cut; a settled cut fences nobody.
+    #[test]
+    fn periodic_cut_fences_writer_until_worker_snapshot() {
+        let mut cut = CheckpointCut::default();
+        assert!(!cut.blocks_writer_before(0));
+        cut.restart(std::time::Instant::now()).unwrap();
+        assert!(cut.blocks_writer());
+        // Not yet snapshotted this generation (or an older one).
+        assert!(cut.blocks_writer_before(0));
+        // Snapshotted this generation: appends may resume.
+        assert!(!cut.blocks_writer_before(cut.periodic_generation));
+        cut.restart(std::time::Instant::now()).unwrap();
+        assert!(cut.blocks_writer_before(cut.periodic_generation - 1));
+        cut.skip();
+        assert!(!cut.blocks_writer_before(0));
+    }
+
+    /// A written periodic cut records its fingerprint; a skipped one releases
+    /// its reservation without moving the slot.
+    #[test]
+    fn periodic_settlement_records_written_cuts_and_releases_skipped_ones() {
+        let mut cut = CheckpointCut {
+            last_sequence: 9,
+            last_slot: 1,
+            ..Default::default()
+        };
+        let publication = cut.reserve(CheckpointPolicy::Periodic).unwrap();
+        cut.settled((publication, Some([3; 32]))).unwrap();
+        assert_eq!((cut.last_sequence, cut.last_slot), (10, 0));
+        assert_eq!(cut.last_fingerprint, Some([3; 32]));
+        let publication = cut.reserve(CheckpointPolicy::Periodic).unwrap();
+        assert_eq!(publication.slot, 1);
+        cut.settled((publication, None)).unwrap();
+        assert_eq!((cut.last_sequence, cut.last_slot), (10, 0));
+        assert_eq!(cut.last_fingerprint, Some([3; 32]));
+        // The next write reuses the released sequence and the same slot.
+        let publication = cut.reserve(CheckpointPolicy::Periodic).unwrap();
+        assert_eq!(
+            publication,
+            Publication {
+                sequence: 11,
+                slot: 1
+            }
+        );
+        // A stale skipped reservation cannot roll back a newer one.
+        let stale = Publication {
+            sequence: 10,
+            slot: 1,
+        };
+        assert_eq!(cut.settled((stale, None)), Err(Error::Unavailable));
+        assert_eq!(cut.last_sequence, 11);
+        // Shutdown publication invalidates the periodic fingerprint.
+        cut.published(publication).unwrap();
+        assert_eq!(cut.last_fingerprint, None);
+    }
+
+    /// Vote both workers of a fresh periodic cut.
+    fn voted(cut: &mut CheckpointCut, votes: [Option<u64>; 2]) {
+        cut.restart(std::time::Instant::now()).unwrap();
+        for (worker, generation) in votes.into_iter().enumerate() {
+            cut.vote(crate::model::WorkerId(worker as u16), generation);
+        }
+        assert!(cut.votes_complete(2));
+    }
+
+    /// Publish the current cut through `settled` with a written fingerprint.
+    fn publish_written(cut: &mut CheckpointCut) {
+        let publication = cut.reserve(CheckpointPolicy::Periodic).unwrap();
+        cut.settled((publication, Some([1; 32]))).unwrap();
+    }
+
+    /// An unchanged node with no holds skips; the first cut never does.
+    #[test]
+    fn periodic_cut_skips_when_every_worker_is_unchanged() {
+        let mut cut = CheckpointCut::default();
+        voted(&mut cut, [Some(4), Some(7)]);
+        assert!(!cut.unchanged(), "nothing published yet");
+        publish_written(&mut cut);
+        voted(&mut cut, [Some(4), Some(7)]);
+        assert!(cut.unchanged());
+        cut.skip();
+        assert_eq!(cut.result(), Some(Ok(())));
+        assert!(!cut.blocks_writer());
+        // A later cut stays skippable without another write.
+        voted(&mut cut, [Some(4), Some(7)]);
+        assert!(cut.unchanged());
+        // Only the first vote of a worker counts in one cut.
+        cut.vote(crate::model::WorkerId(0), Some(5));
+        assert!(cut.unchanged());
+        // Votes are incomplete until every worker reported.
+        cut.restart(std::time::Instant::now()).unwrap();
+        cut.vote(crate::model::WorkerId(0), Some(4));
+        assert!(!cut.votes_complete(2));
+    }
+
+    /// A mutation on any worker forces a full cut.
+    #[test]
+    fn periodic_cut_does_not_skip_after_a_mutation() {
+        let mut cut = CheckpointCut::default();
+        voted(&mut cut, [Some(4), Some(7)]);
+        publish_written(&mut cut);
+        voted(&mut cut, [Some(4), Some(8)]);
+        assert!(!cut.unchanged());
+        // An identical-fingerprint settlement still records the new state.
+        let publication = cut.reserve(CheckpointPolicy::Periodic).unwrap();
+        cut.settled((publication, None)).unwrap();
+        voted(&mut cut, [Some(4), Some(8)]);
+        assert!(cut.unchanged());
+    }
+
+    /// A worker with holds always forces a full cut, before and after one.
+    #[test]
+    fn periodic_cut_does_not_skip_with_holds() {
+        let mut cut = CheckpointCut::default();
+        voted(&mut cut, [Some(4), None]);
+        assert!(!cut.unchanged());
+        publish_written(&mut cut);
+        voted(&mut cut, [Some(4), None]);
+        assert!(!cut.unchanged());
+        // Holds that ended need one full cut before skipping resumes.
+        voted(&mut cut, [Some(4), Some(9)]);
+        assert!(!cut.unchanged());
+    }
+
+    /// A failed publication, or a shutdown cut, records nothing to skip against.
+    #[test]
+    fn periodic_cut_does_not_skip_after_a_failed_publish() {
+        let mut cut = CheckpointCut::default();
+        voted(&mut cut, [Some(4), Some(7)]);
+        publish_written(&mut cut);
+        voted(&mut cut, [Some(5), Some(7)]);
+        let _failed = cut.reserve(CheckpointPolicy::Periodic).unwrap();
+        cut.fail(Error::Unavailable);
+        voted(&mut cut, [Some(5), Some(7)]);
+        assert!(!cut.unchanged(), "the failed cut's state is not on disk");
+        // A stale settlement fails and records nothing either.
+        let stale = Publication {
+            sequence: 1,
+            slot: 1,
+        };
+        assert_eq!(cut.settled((stale, None)), Err(Error::Unavailable));
+        assert!(!cut.unchanged());
+        // A shutdown cut forgets the periodic state.
+        voted(&mut cut, [Some(5), Some(7)]);
+        publish_written(&mut cut);
+        let shutdown = cut.reserve(CheckpointPolicy::Shutdown).unwrap();
+        cut.published(shutdown).unwrap();
+        voted(&mut cut, [Some(5), Some(7)]);
+        assert!(!cut.unchanged());
+    }
 
     /// Cold cuts keep their distinct slot policy; later cuts alternate after success.
     #[test]
@@ -731,9 +1038,9 @@ mod tests {
         assert!(!cut.blocks_writer());
         assert!(!cut.publication_started());
         assert_eq!(cut.result(), Some(Err(Error::Overloaded)));
-        cut.finish(Err(Error::Cancelled));
-        assert_eq!(cut.result(), Some(Err(Error::Cancelled)));
-        for result in [Ok(()), Err(Error::Io), Err(Error::Cancelled)] {
+        cut.finish(Err(Error::Canceled));
+        assert_eq!(cut.result(), Some(Err(Error::Canceled)));
+        for result in [Ok(()), Err(Error::Io), Err(Error::Canceled)] {
             cut.restart(now).unwrap();
             cut.shards = image(1, &[WorkerId(0)]).shards;
             assert_eq!(cut.start_publication().len(), 1);
@@ -752,7 +1059,7 @@ mod tests {
     fn checkpoint_close_error_preserves_phase_ownership_and_original_error() {
         for phase in [
             CutPhase::Collecting,
-            CutPhase::Aborted(Error::Cancelled),
+            CutPhase::Aborted(Error::Canceled),
             CutPhase::Publishing,
             CutPhase::Published(Ok(())),
             CutPhase::Published(Err(Error::Overloaded)),
@@ -798,7 +1105,7 @@ mod tests {
             ..Default::default()
         };
         cut.shards = image(1, &[WorkerId(0)]).shards;
-        cut.finish(Err(Error::Cancelled));
+        cut.finish(Err(Error::Canceled));
         cut.restart(now).unwrap();
         assert_eq!(cut.periodic_generation, 1);
         assert_eq!(cut.periodic_started, Some(now));
@@ -822,14 +1129,15 @@ mod tests {
     fn geometry() -> CheckpointGeometry {
         CheckpointGeometry::new(8192, 4096, 2, Alignment::new(4096, 4096, 4096).unwrap()).unwrap()
     }
-    fn caches() -> Vec<racer_control_wire::CacheDefinition> {
+    fn caches() -> Vec<racer_wire::control::CacheDefinition> {
         let mut cache = crate::app::tests::definition();
-        cache.id = racer_control_wire::CacheId(crate::test_support::security::CACHE.into());
+        cache.id = racer_wire::control::CacheId(crate::test_support::security::CACHE.into());
         vec![cache]
     }
     fn image(sequence: u64, ids: &[WorkerId]) -> CheckpointImage {
         CheckpointImage {
             version: CHECKPOINT_VERSION,
+            page_size: racer_wire::object::PageSize::DEFAULT,
             cluster: crate::store::checkpoint::test_cluster(),
             sequence,
             shards: ids
@@ -852,6 +1160,7 @@ mod tests {
                             metadata: vec![],
                         },
                         segments: segments.snapshot(),
+                        holds: vec![],
                     }
                 })
                 .collect(),
@@ -859,8 +1168,9 @@ mod tests {
     }
     #[test]
     fn layout_digest_rejects_mismatched_cuts_and_one_mismatched_worker() {
-        let node = NodeState::default();
-        let keys = crate::test_support::security::keys();
+        let env = racer_io::Env::host();
+        let node = NodeState::on(env.ctx.clone());
+        let keys = crate::test_support::security::keys(&env);
         let ids = [WorkerId(0), WorkerId(1)];
         let layouts = super::super::devices::recovery_layout_fixture();
         let guarded = [layouts[0].layout_digest, layouts[1].layout_digest];
@@ -895,7 +1205,15 @@ mod tests {
                 .collect()
         };
         let choose = |cuts, geometry: &HashMap<WorkerId, CheckpointGeometry>| {
-            select(cuts, geometry, &node.workers, (4, 4), &keys, &caches())
+            select(
+                cuts,
+                geometry,
+                &node.workers,
+                (4, 4),
+                &keys,
+                &caches(),
+                racer_wire::object::PageSize::DEFAULT,
+            )
         };
         let g = live(guarded);
         assert!(choose(vec![candidate(2, mismatched), candidate(1, mismatched)], &g).is_none());
@@ -910,13 +1228,23 @@ mod tests {
                 .sequence,
             2
         );
+        // A cut taken under another published page size starts cold.
+        let mut resized = candidate(4, guarded);
+        resized.page_size = racer_wire::object::PageSize::new(64 << 10).unwrap();
+        assert_eq!(
+            choose(vec![resized, candidate(2, guarded)], &g)
+                .unwrap()
+                .sequence,
+            2
+        );
         let install = |cut: CheckpointImage, reset: bool| {
             assert_eq!(cut.shards.len(), 2);
             for shard in cut.shards {
                 let index = Rc::new(crate::store::catalog::Index::new(
                     shard.worker,
                     4,
-                    crate::test_support::availability(),
+                    crate::test_support::availability(&env),
+                    racer_io::Clock::host(),
                 ));
                 let segments = Rc::new(Segments::new(shard.geometry.segment_bytes));
                 segments
@@ -951,6 +1279,7 @@ mod tests {
                             number: crate::model::PageNumber(0),
                         },
                         crate::store::catalog::IndexedPage {
+                            page_size: racer_wire::object::PageSize::DEFAULT,
                             location: crate::store::catalog::RecordLocation {
                                 segment: allocated.id,
                                 generation: allocated.generation,
@@ -1004,13 +1333,22 @@ mod tests {
     /// checkpoints and starts cold instead of failing node recovery.
     #[test]
     fn changed_slab_size_or_worker_count_skips_stale_checkpoint() {
-        let node = NodeState::default();
-        let keys = crate::test_support::security::keys();
+        let env = racer_io::Env::host();
+        let node = NodeState::on(env.ctx.clone());
+        let keys = crate::test_support::security::keys(&env);
         let live = |ids: &[WorkerId], g: CheckpointGeometry| -> HashMap<_, _> {
             ids.iter().map(|id| (*id, g)).collect()
         };
         let choose = |cuts: Vec<CheckpointImage>, g: &HashMap<WorkerId, CheckpointGeometry>| {
-            select(cuts, g, &node.workers, (4, 4), &keys, &caches())
+            select(
+                cuts,
+                g,
+                &node.workers,
+                (4, 4),
+                &keys,
+                &caches(),
+                racer_wire::object::PageSize::DEFAULT,
+            )
         };
         let three = [WorkerId(0), WorkerId(1), WorkerId(2)];
         let five = [
@@ -1051,8 +1389,9 @@ mod tests {
 
     #[test]
     fn newest_complete_cut_wins_and_partial_duplicate_or_foreign_workers_fall_back() {
-        let node = NodeState::default();
-        let keys = crate::test_support::security::keys();
+        let env = racer_io::Env::host();
+        let node = NodeState::on(env.ctx.clone());
+        let keys = crate::test_support::security::keys(&env);
         let geometry = [(WorkerId(0), geometry()), (WorkerId(1), geometry())]
             .into_iter()
             .collect();
@@ -1069,7 +1408,8 @@ mod tests {
                 &node.workers,
                 (4, 4),
                 &keys,
-                &caches()
+                &caches(),
+                racer_wire::object::PageSize::DEFAULT
             )
             .unwrap()
             .sequence,
@@ -1077,7 +1417,7 @@ mod tests {
         );
         let mut oversized = image(3, &[WorkerId(0), WorkerId(1)]);
         let object = crate::model::ObjectId {
-            cache: racer_control_wire::CacheId(crate::test_support::security::CACHE.into()),
+            cache: racer_wire::control::CacheId(crate::test_support::security::CACHE.into()),
             key: crate::model::CacheKey([9; 32]),
         };
         let owner = node.workers.metadata_owner(&object).unwrap();
@@ -1103,7 +1443,8 @@ mod tests {
                 &node.workers,
                 (4, 4),
                 &keys,
-                &caches()
+                &caches(),
+                racer_wire::object::PageSize::DEFAULT
             )
             .unwrap()
             .sequence,
@@ -1116,7 +1457,8 @@ mod tests {
                 &node.workers,
                 (4, 4),
                 &keys,
-                &caches()
+                &caches(),
+                racer_wire::object::PageSize::DEFAULT
             )
             .is_none()
         );
@@ -1129,8 +1471,9 @@ mod tests {
         use crate::store::catalog::IndexedPage;
         use crate::store::catalog::RecordLocation;
         use crate::store::checkpoint;
-        let node = NodeState::new(vec![WorkerId(0)], 16).unwrap();
-        let keys = crate::test_support::security::keys();
+        let env = racer_io::Env::host();
+        let node = NodeState::new(vec![WorkerId(0)], 16, racer_io::WorkerCtx::host()).unwrap();
+        let keys = crate::test_support::security::keys(&env);
         let caches = caches();
         let cache = caches[0].id.clone();
         let g = geometry();
@@ -1163,6 +1506,7 @@ mod tests {
         old.shards[0].index.entries.push((
             page.clone(),
             IndexedPage {
+                page_size: racer_wire::object::PageSize::DEFAULT,
                 location: RecordLocation {
                     segment: append.0.id(),
                     generation: append.0.generation(),
@@ -1188,6 +1532,7 @@ mod tests {
             (16, 16),
             &keys,
             &[],
+            racer_wire::object::PageSize::DEFAULT,
         )
         .unwrap();
         assert!(removed.shards[0].index.entries.is_empty());
@@ -1199,12 +1544,13 @@ mod tests {
             (16, 16),
             &keys,
             &caches,
+            racer_wire::object::PageSize::DEFAULT,
         )
         .unwrap();
         assert_eq!(retained.shards[0].index.entries.len(), 1);
         assert_eq!(retained.shards[0].index.metadata, vec![standalone]);
         let mut missing_page = decoded();
-        missing_page.shards[0].index.entries[0].1.key_id = racer_control_wire::KeyId([99; 16]);
+        missing_page.shards[0].index.entries[0].1.key_id = racer_wire::control::KeyId([99; 16]);
         let filtered = select(
             vec![missing_page],
             &geometry,
@@ -1212,14 +1558,15 @@ mod tests {
             (16, 16),
             &keys,
             &caches,
+            racer_wire::object::PageSize::DEFAULT,
         )
         .unwrap();
         assert!(filtered.shards[0].index.entries.is_empty());
         assert_eq!(filtered.shards[0].index.metadata.len(), 1);
-        keys.install(racer_control_wire::KeyringBundle {
-            schema_version: racer_control_wire::SCHEMA_VERSION,
+        keys.install(racer_wire::control::KeyringBundle {
+            schema_version: racer_wire::control::KEYRING_SCHEMA_VERSION,
             cluster: keys.cluster().clone(),
-            generation: racer_control_wire::BundleGeneration(2),
+            generation: racer_wire::control::BundleGeneration(2),
             peer_trust_roots: (*keys.peer_trust_roots().unwrap()).clone(),
             cache_keys: vec![],
         })
@@ -1231,6 +1578,7 @@ mod tests {
             (16, 16),
             &keys,
             &caches,
+            racer_wire::object::PageSize::DEFAULT,
         )
         .unwrap();
         assert!(keyless.shards[0].index.entries.is_empty());
@@ -1238,7 +1586,8 @@ mod tests {
         let index = Rc::new(Index::new(
             WorkerId(0),
             16,
-            crate::test_support::availability(),
+            crate::test_support::availability(&env),
+            racer_io::Clock::host(),
         ));
         let segments = Rc::new(Segments::new(g.segment_bytes));
         segments
@@ -1267,8 +1616,9 @@ mod tests {
         use crate::store::catalog::IndexedPage;
         use crate::store::catalog::RecordLocation;
         use crate::store::checkpoint;
-        let node = NodeState::new(vec![WorkerId(0)], 16).unwrap();
-        let keys = crate::test_support::security::keys();
+        let env = racer_io::Env::host();
+        let node = NodeState::new(vec![WorkerId(0)], 16, racer_io::WorkerCtx::host()).unwrap();
+        let keys = crate::test_support::security::keys(&env);
         let caches = caches();
         let g = geometry();
         let geometry = [(WorkerId(0), g)].into_iter().collect();
@@ -1304,6 +1654,7 @@ mod tests {
                 number: PageNumber(0),
             },
             IndexedPage {
+                page_size: racer_wire::object::PageSize::DEFAULT,
                 location: RecordLocation {
                     segment: append.0.id(),
                     generation: append.0.generation(),
@@ -1318,7 +1669,7 @@ mod tests {
         let same = checkpoint::encode(&cut).unwrap();
         let mut foreign_cut = checkpoint::decode(&same).unwrap();
         foreign_cut.cluster =
-            racer_control_wire::ClusterId("44444444-4444-4444-8444-444444444444".into());
+            racer_wire::control::ClusterId("44444444-4444-4444-8444-444444444444".into());
         foreign_cut.sequence = 6;
         let foreign = checkpoint::encode(&foreign_cut).unwrap();
         let decode = |bytes: &[u8]| checkpoint::decode(bytes).unwrap();
@@ -1330,6 +1681,7 @@ mod tests {
                 (16, 16),
                 &keys,
                 &caches,
+                racer_wire::object::PageSize::DEFAULT,
             )
         };
 
@@ -1354,13 +1706,14 @@ mod tests {
         use crate::model::ObjectVersion;
         use crate::model::StrongEtag;
         use crate::model::VersionMetadata;
-        let node = NodeState::default();
-        let keys = crate::test_support::security::keys();
+        let env = racer_io::Env::host();
+        let node = NodeState::on(env.ctx.clone());
+        let keys = crate::test_support::security::keys(&env);
         let geometry = [(WorkerId(0), geometry()), (WorkerId(1), geometry())]
             .into_iter()
             .collect();
         let object = ObjectId {
-            cache: racer_control_wire::CacheId(crate::test_support::security::CACHE.into()),
+            cache: racer_wire::control::CacheId(crate::test_support::security::CACHE.into()),
             key: CacheKey([3; 32]),
         };
         let owner = node.workers.metadata_owner(&object).unwrap();
@@ -1387,7 +1740,8 @@ mod tests {
                 &node.workers,
                 (4, 4),
                 &keys,
-                &caches()
+                &caches(),
+                racer_wire::object::PageSize::DEFAULT
             )
             .unwrap()
             .sequence,
@@ -1400,12 +1754,15 @@ mod tests {
         use crate::app::tests::ControlFixture;
         use crate::app::tests::local_worker;
         use crate::app::tests::publication;
+        let env = racer_io::Env::host();
         for budget in [1, 64 * 1024 * 1024] {
             let mut fixture = ControlFixture::new();
             let mut config = fixture.config.take().unwrap();
             config.checkpoint_bytes = std::num::NonZeroUsize::new(budget).unwrap();
-            let node = Arc::new(NodeState::new(vec![WorkerId(0)], 16).unwrap());
-            let (app, _runtime, _crypto) = local_worker(&config, &node, 0);
+            let node = Arc::new(
+                NodeState::new(vec![WorkerId(0)], 16, racer_io::WorkerCtx::host()).unwrap(),
+            );
+            let (app, _runtime, _crypto) = local_worker(&env, &config, &node, 0);
             app.snapshots
                 .apply(publication(&config, 1, vec![]))
                 .unwrap();
@@ -1415,16 +1772,31 @@ mod tests {
             app.store.checkpoint.finish_snapshot();
             let bytes = crate::store::checkpoint::encode(&CheckpointImage {
                 version: CHECKPOINT_VERSION,
+                page_size: racer_wire::object::PageSize::DEFAULT,
                 cluster: config.cluster.clone(),
                 sequence: 9,
                 shards: vec![shard],
             })
             .unwrap();
             std::fs::write(config.slab_directory.join("checkpoint.0"), bytes).unwrap();
-            futures::executor::block_on(
-                app.recover_node(geometry, &scope(Duration::from_secs(5)).unwrap()),
-            )
-            .unwrap();
+            let startup = scope(&racer_io::Clock::host(), Duration::from_secs(5)).unwrap();
+            let mut recovering = std::pin::pin!(app.recover_node(geometry, &startup));
+            let until = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                app.runtime.reactor.poll_budgeted(64).unwrap();
+                if let Poll::Ready(result) = recovering
+                    .as_mut()
+                    .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
+                {
+                    result.unwrap();
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < until,
+                    "recovery made no progress"
+                );
+                app.runtime.reactor.wait(Duration::from_millis(1)).unwrap();
+            }
             let cut = node.recovery.lock().unwrap();
             assert!(cut.selected && cut.installed.contains(&WorkerId(0)));
             assert!(cut.failure.is_none());
@@ -1446,8 +1818,9 @@ mod tests {
 
     #[test]
     fn distinct_live_catalog_and_page_capacities_select_an_installable_cut() {
-        let node = NodeState::new(vec![WorkerId(0)], 16).unwrap();
-        let keys = crate::test_support::security::keys();
+        let env = racer_io::Env::host();
+        let node = NodeState::new(vec![WorkerId(0)], 16, racer_io::WorkerCtx::host()).unwrap();
+        let keys = crate::test_support::security::keys(&env);
         let geometry = [(WorkerId(0), geometry())].into_iter().collect();
         let candidate = |sequence, count| {
             let mut cut = image(sequence, &[WorkerId(0)]);
@@ -1478,10 +1851,16 @@ mod tests {
             (16, 1),
             &keys,
             &caches(),
+            racer_wire::object::PageSize::DEFAULT,
         )
         .unwrap();
         assert_eq!(chosen.sequence, 1);
-        let live = Index::new(WorkerId(0), 1, crate::test_support::availability());
+        let live = Index::new(
+            WorkerId(0),
+            1,
+            crate::test_support::availability(&env),
+            racer_io::Clock::host(),
+        );
         live.set_page_capacity(16).unwrap();
         live.restore(chosen.shards.into_iter().next().unwrap().index)
             .unwrap();
@@ -1494,7 +1873,8 @@ mod tests {
                 &node.workers,
                 (1, 2),
                 &keys,
-                &caches()
+                &caches(),
+                racer_wire::object::PageSize::DEFAULT
             )
             .unwrap()
             .sequence,
@@ -1507,7 +1887,8 @@ mod tests {
                 &node.workers,
                 (16, 0),
                 &keys,
-                &caches()
+                &caches(),
+                racer_wire::object::PageSize::DEFAULT
             )
             .is_none()
         );
@@ -1518,7 +1899,8 @@ mod tests {
                 &node.workers,
                 (16, 0),
                 &keys,
-                &caches()
+                &caches(),
+                racer_wire::object::PageSize::DEFAULT
             )
             .is_some()
         );

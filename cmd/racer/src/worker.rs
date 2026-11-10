@@ -11,21 +11,33 @@
 //! must permit progress when both threads share one CPU.
 
 use crate::admission::AdmissionPolicy;
+use crate::affinity::CpuLocation;
+use crate::affinity::EffectiveTopology;
+use crate::affinity::NicLocality;
+#[cfg(test)]
+use crate::affinity::current_cpus;
 use crate::config::Config;
 use crate::config::Limits;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
+use crate::lifecycle::Factory;
+use crate::lifecycle::FailureReporter;
+use crate::lifecycle::Group;
+use crate::lifecycle::Helper;
+use crate::lifecycle::Lane;
+use crate::lifecycle::Plan;
+use crate::lifecycle::Service;
+use crate::lifecycle::drive_local_with;
 use crate::model::RequestId;
 use crate::model::WorkerId;
-use crate::runtime::Cancellation;
 use crate::runtime::Reactor;
 use crate::runtime::RequestScope;
 use crate::security;
 use crate::security::CryptoClient;
 use crate::security::CryptoPort;
 use crate::security::IoCryptoPort;
-use racer_control_wire::RailMapping;
+use racer_wire::control::RailMapping;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -39,27 +51,40 @@ use std::sync::Mutex;
 use std::task::Context;
 use std::task::Poll;
 use std::task::Waker;
-use std::thread;
 use std::time::Duration;
 #[cfg(test)]
 use std::time::Instant;
-use uring_runtime::drivers::drive_local_with;
-use uring_runtime::environment::Deadline;
-use uring_runtime::group::Factory;
-use uring_runtime::group::FailureReporter;
-use uring_runtime::group::Group;
-use uring_runtime::group::Helper;
-use uring_runtime::group::Lane;
-use uring_runtime::group::Plan;
-use uring_runtime::group::Service;
-use uring_runtime::group::affinity::CpuLocation;
-use uring_runtime::group::affinity::EffectiveTopology;
-use uring_runtime::group::affinity::NicLocality;
-#[cfg(test)]
-use uring_runtime::group::affinity::current_cpus;
 
-const WORK_BUDGET: usize = 64;
-const IDLE_WAIT: Duration = Duration::from_millis(1);
+#[cfg(test)]
+use crate::lifecycle::IDLE_WAIT;
+use crate::lifecycle::WORK_BUDGET;
+/// An allowed CPU that no lane or helper in `pairs` runs on, so the RDMA
+/// owner's grant and completion work does not queue behind a busy worker.
+/// Prefers a physical core no worker uses (not an SMT sibling of one), then
+/// the first helper's NUMA node, then the lowest CPU. `None` when every
+/// allowed CPU is taken.
+fn spare_cpu(cpus: &[CpuLocation], pairs: &[WorkerPair]) -> Option<CpuLocation> {
+    let used: HashSet<usize> = pairs
+        .iter()
+        .flat_map(|pair| [pair.io.cpu, pair.crypto.cpu])
+        .collect();
+    let cores: HashSet<(usize, usize)> = pairs
+        .iter()
+        .flat_map(|pair| [&pair.io, &pair.crypto])
+        .map(|location| (location.package, location.core))
+        .collect();
+    let anchor = pairs.first().map(|pair| pair.crypto.numa_node);
+    cpus.iter()
+        .filter(|location| !used.contains(&location.cpu))
+        .min_by_key(|location| {
+            (
+                cores.contains(&(location.package, location.core)),
+                anchor.is_some_and(|node| node != location.numa_node),
+                location.cpu,
+            )
+        })
+        .cloned()
+}
 /// One I/O shard and its crypto execution placement. Equal crypto CPU IDs identify
 /// the same execution thread. NIC locality never overrides the end-to-end rail.
 #[derive(Clone, Debug)]
@@ -74,6 +99,8 @@ pub struct AffinityPlan {
     pub pairs: Vec<WorkerPair>,
     /// Includes the caller. Owned startup reserves an additional coordinator slot.
     pub max_threads: usize,
+    /// Allowed CPU no lane or helper uses, for the RDMA owner thread.
+    pub owner_cpu: Option<CpuLocation>,
 }
 #[cfg(test)]
 fn pair_count(max_threads: usize, topology: &EffectiveTopology) -> Result<usize> {
@@ -103,42 +130,70 @@ impl AffinityPlan {
     /// Plan from discovered constraints and accepted rails. NIC/NUMA compatibility
     /// never changes membership or page-to-rail selection; unavailable hardware
     /// preserves HTTP fallback. No extra control/diagnostic threads are created.
+    /// With RDMA enabled, one thread of `max_threads` is kept for the RDMA
+    /// owner, which runs outside the worker group.
     pub fn from_topology(
         config: &Config,
+        topology: EffectiveTopology,
+        rails: &[RailMapping],
+    ) -> Result<Self> {
+        let max_threads = config
+            .max_threads
+            .checked_sub(usize::from(config.enable_rdma))
+            .ok_or(Error::InvalidConfiguration)?;
+        let cpus = topology.cpus.clone();
+        let mut plan = Self::place_configured(config, max_threads, topology, rails)?;
+        if config.enable_rdma {
+            plan.owner_cpu = spare_cpu(&cpus, &plan.pairs);
+        }
+        Ok(plan)
+    }
+    /// CPU for the RDMA owner thread: a spare from planning when one exists,
+    /// else the first crypto helper's CPU.
+    pub fn owner_cpu(&self) -> Option<usize> {
+        self.owner_cpu
+            .as_ref()
+            .or_else(|| self.pairs.first().map(|pair| &pair.crypto))
+            .map(|location| location.cpu)
+    }
+    fn place_configured(
+        config: &Config,
+        max_threads: usize,
         mut topology: EffectiveTopology,
         rails: &[RailMapping],
     ) -> Result<Self> {
-        if config.io_workers.is_some() || config.crypto_helpers.is_some() {
-            config.validate()?;
-        }
         if let (Some(io), Some(helpers)) = (config.io_workers, config.crypto_helpers) {
             topology.nics.retain(|nic| {
                 nic.numa_node.is_some()
                     && (rails.is_empty()
                         || rails.iter().any(|rail| rail.numa_node == nic.numa_node))
             });
-            let pairs = uring_runtime::group::affinity::place_exact(
-                topology,
-                config.max_threads,
-                io,
-                helpers,
-                config.allow_smt,
-            )?
-            .into_iter()
-            .enumerate()
-            .map(|(index, placement)| WorkerPair {
-                worker: WorkerId(index as u16),
-                io: placement.lane,
-                crypto: placement.helper,
-                nic: placement.nic,
-            })
-            .collect();
+            let pairs =
+                crate::affinity::place_exact(topology, max_threads, io, helpers, config.allow_smt)
+                    .map_err(|error| {
+                        eprintln!("racer: affinity placement failed: {error}");
+                        Error::InvalidConfiguration
+                    })?
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, placement)| {
+                        Ok(WorkerPair {
+                            worker: WorkerId(
+                                u16::try_from(index).map_err(|_| Error::InvalidConfiguration)?,
+                            ),
+                            io: placement.lane,
+                            crypto: placement.helper,
+                            nic: placement.nic,
+                        })
+                    })
+                    .collect::<Result<_>>()?;
             return Ok(Self {
                 pairs,
-                max_threads: config.max_threads,
+                max_threads,
+                owner_cpu: None,
             });
         }
-        Self::place_with_policy(config.max_threads, topology, rails, config.allow_smt)
+        Self::place_with_policy(max_threads, topology, rails, config.allow_smt)
     }
     #[cfg(test)]
     fn place(
@@ -159,22 +214,30 @@ impl AffinityPlan {
             nic.numa_node.is_some()
                 && (rails.is_empty() || rails.iter().any(|rail| rail.numa_node == nic.numa_node))
         });
-        let pairs = uring_runtime::group::affinity::place(
-            topology,
+        let pairs =
+            crate::affinity::place(topology, max_threads, usize::from(u16::MAX) + 1, allow_smt)?
+                .into_iter()
+                .enumerate()
+                .map(|(index, placement)| WorkerPair {
+                    worker: WorkerId(index as u16),
+                    io: placement.lane,
+                    crypto: placement.helper,
+                    nic: placement.nic,
+                })
+                .collect();
+        Ok(Self {
+            pairs,
             max_threads,
-            usize::from(u16::MAX) + 1,
-            allow_smt,
-        )?
-        .into_iter()
-        .enumerate()
-        .map(|(index, placement)| WorkerPair {
-            worker: WorkerId(index as u16),
-            io: placement.lane,
-            crypto: placement.helper,
-            nic: placement.nic,
+            owner_cpu: None,
         })
-        .collect();
-        Ok(Self { pairs, max_threads })
+    }
+    /// Per-lane key of the helpers that may run each other's crypto jobs: the
+    /// crypto NUMA node, so stolen work never crosses a known NUMA boundary.
+    pub fn crypto_share_keys(&self) -> Vec<Option<usize>> {
+        self.pairs
+            .iter()
+            .map(|pair| pair.crypto.numa_node)
+            .collect()
     }
     /// Deterministic execution groups ordered by crypto CPU, then pair index.
     pub fn crypto_groups(&self) -> Vec<Vec<usize>> {
@@ -228,7 +291,7 @@ pub use crate::security::CryptoRuntime;
 /// ```compile_fail
 /// use std::rc::Rc;
 /// use racer::{error::Result, runtime::RequestScope};
-/// use uring_runtime::group::{Factory, Service};
+/// use racer::lifecycle::{Factory, Service};
 /// struct LocalFactory(Rc<()>);
 /// impl Factory<RequestScope> for LocalFactory {
 ///     fn build_lane(&self, _: usize) -> Result<Box<dyn Service<RequestScope>>> { todo!() }
@@ -238,6 +301,8 @@ pub struct WorkerGroup {
     plan: AffinityPlan,
     runtime: Group<RequestScope>,
     generation: u64,
+    ctx: racer_io::WorkerCtx,
+    observe_signal: bool,
 }
 
 #[cfg(test)]
@@ -258,6 +323,8 @@ trait FaultRecipe: Sync {
             queue_entries: n(64),
             connections_per_neighbor: n(2),
             client_connections: n(128),
+            peer_connections: n(128),
+            outbound_connections: n(128),
             pipes: n(16),
             range_window_pages: n(2),
             header_bytes: n(32768),
@@ -283,12 +350,22 @@ trait FaultRecipe: Sync {
 }
 
 impl WorkerGroup {
-    pub fn new(plan: AffinityPlan) -> Self {
+    pub fn new(plan: AffinityPlan, ctx: racer_io::WorkerCtx) -> Self {
         Self {
             runtime: Group::new(runtime_plan(&plan)),
             plan,
             generation: 0,
+            ctx,
+            observe_signal: false,
         }
+    }
+    /// Stop cleanly (not as an error) when the process stop signal is raised.
+    pub fn observe_stop_signal(&mut self) {
+        self.observe_signal = true;
+    }
+    /// Why the last run stopped without failing, if it did.
+    pub fn stop_reason(&self) -> Option<crate::lifecycle::StopReason> {
+        self.runtime.stop_reason()
     }
     /// Driver-controlled adapter over the same scoped execution used by `run`.
     /// The coordinator becomes the first I/O worker, not an extra helper thread.
@@ -302,19 +379,23 @@ impl WorkerGroup {
         self.runtime.start(factory, scope)
     }
     pub fn run(&mut self, factory: &dyn Factory<RequestScope>) -> Result<()> {
-        self.run_with_startup(factory, LIFECYCLE_TIMEOUT)
+        self.run_with_startup(factory, Some(LIFECYCLE_TIMEOUT))
     }
-    /// Like `run`, with an explicit budget for service startup only.
+    /// Like `run`, with an explicit budget for service startup only; `None`
+    /// waits until stopped.
     ///
     /// Managed startup waits on cluster election and the first publication, so
-    /// it needs more than the fixed lifecycle budget. Services bound their own
+    /// it has no startup deadline and ends only by success or stop. Services bound their own
     /// I/O and control turns; teardown keeps the fixed lifecycle budget.
     pub fn run_with_startup(
         &mut self,
         factory: &dyn Factory<RequestScope>,
-        startup: Duration,
+        startup: Option<Duration>,
     ) -> Result<()> {
-        let scope = startup_scope(startup)?;
+        let scope = match startup {
+            Some(budget) => startup_scope(budget, &self.ctx.clock)?,
+            None => RequestScope::untimed(RequestId([0; 16]), self.ctx.clock.clone())?,
+        };
         self.prepare(true)?;
         self.runtime.run(factory, &scope)
     }
@@ -366,7 +447,7 @@ impl WorkerGroup {
     /// Ordered start, budgeted drive, drain, shutdown, and join (also on failure).
     #[cfg(test)]
     fn run_recipe(&mut self, factory: &dyn FaultRecipe) -> Result<()> {
-        let scope = lifecycle_scope()?;
+        let scope = lifecycle_scope(&self.ctx.clock)?;
         self.run_inner(factory, &scope, false)
     }
 
@@ -406,6 +487,9 @@ impl WorkerGroup {
             }
         }
         self.runtime = Group::new(runtime_plan(&self.plan));
+        if self.observe_signal {
+            self.runtime.observe_stop_signal();
+        }
         self.runtime.validate(caller_is_worker)?;
         self.generation = self
             .generation
@@ -420,17 +504,14 @@ impl WorkerGroup {
         factory: &dyn FaultRecipe,
         mut allocate: impl FnMut(WorkerId, u64, NonZeroUsize) -> Result<(IoCryptoPort, CryptoPort)>,
     ) -> Result<Resources> {
-        // Allocate every endpoint before spawning even the coordinator. Panics
-        // in caller policy and fallible queue allocation have identical rollback.
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            Resources::with_allocator(
-                factory.limits(),
-                self.plan.pairs.iter().map(|pair| pair.worker).collect(),
-                self.generation,
-                &mut allocate,
-            )
-        }))
-        .unwrap_or(Err(Error::Io))
+        // Allocate every endpoint before spawning even the coordinator.
+        Resources::with_allocator(
+            factory.limits(),
+            self.plan.pairs.iter().map(|pair| pair.worker).collect(),
+            self.generation,
+            self.ctx.clone(),
+            &mut allocate,
+        )
     }
 
     #[cfg(test)]
@@ -470,7 +551,7 @@ impl Drop for WorkerGroup {
 
 fn driver_waker(runtime: Option<&WorkerRuntime>) -> Result<Waker> {
     let reactor = runtime.map(|runtime| runtime.reactor.waker()).transpose()?;
-    Ok(uring_runtime::drivers::thread_waker(reactor))
+    Ok(crate::drivers::thread_waker(reactor))
 }
 
 /// Independently drive resource completions while a service future borrows its
@@ -480,21 +561,35 @@ fn drive_local<'a>(
     runtime: &'a WorkerRuntime,
     reporter: Option<&'a FailureReporter<Error>>,
 ) -> Operation<'a, ()> {
-    drive_local_with(
-        operation,
-        reporter,
-        move |waker| {
-            runtime.crypto.register_driver(waker);
-            poll_runtime(runtime)
-        },
-        move || runtime.reactor.wait(IDLE_WAIT),
-    )
+    drive_local_with(operation, reporter, move |waker| {
+        runtime.crypto.register_driver(waker);
+        poll_runtime(runtime)
+    })
+}
+
+/// Parks a lifecycle driver in the worker's reactor: completions, its wake
+/// handle (cross-thread and phase-change wakes), and its timers.
+struct ReactorPark(Rc<Reactor>);
+
+impl crate::lifecycle::Park<Error> for ReactorPark {
+    fn wait_timeout(&self, maximum: Duration) -> Duration {
+        self.0.next_deadline().map_or(maximum, |at| {
+            maximum.min(at.saturating_duration_since(self.0.ctx().clock.now()))
+        })
+    }
+
+    fn park(&mut self, timeout: Duration) -> Result<()> {
+        // Even a zero wait submits SQEs queued during the lifecycle poll.
+        self.0
+            .wait(timeout)
+            .inspect_err(|error| log_fatal("io-reactor-wait", *error))
+    }
 }
 
 /// Attribute a runtime error that is about to end the worker group. The process
 /// exit message carries only the error, so name the failing stage first.
 fn log_fatal(stage: &str, error: Error) {
-    if error != Error::Cancelled {
+    if error != Error::Canceled {
         eprintln!("racer: stage={stage} fatal error={error:?}");
     }
 }
@@ -502,23 +597,23 @@ fn log_fatal(stage: &str, error: Error) {
 /// Fixed budget for lifecycle phases: standalone startup and every teardown.
 pub(crate) const LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-fn lifecycle_scope() -> Result<RequestScope> {
-    startup_scope(LIFECYCLE_TIMEOUT)
+fn lifecycle_scope(clock: &racer_io::Clock) -> Result<RequestScope> {
+    startup_scope(LIFECYCLE_TIMEOUT, clock)
 }
 
-fn startup_scope(budget: Duration) -> Result<RequestScope> {
-    Ok(RequestScope {
-        body_deadlines: None,
-        request: RequestId([0; 16]),
-        deadline: Deadline(uring_runtime::environment::now() + budget),
-        cancellation: Cancellation::new()?,
-    })
+fn startup_scope(budget: Duration, clock: &racer_io::Clock) -> Result<RequestScope> {
+    RequestScope::with_clock(RequestId([0; 16]), clock.now() + budget, clock.clone())
 }
 
 fn poll_runtime(runtime: &WorkerRuntime) -> Result<()> {
-    let crypto = runtime.crypto.poll_budgeted(WORK_BUDGET);
+    // Reap before draining crypto. The reap consumes the lane's eventfd wake
+    // and clears its coalescing flag, so a completion published before that
+    // clear may not have written the eventfd. Draining crypto afterwards
+    // receives it; any later completion sees the cleared flag and wakes the
+    // park itself.
     let reactor = runtime.reactor.poll_budgeted(WORK_BUDGET);
-    crypto.and(reactor.map(|_| ()))
+    let crypto = runtime.crypto.poll_budgeted(WORK_BUDGET);
+    reactor.map(|_| ()).and(crypto)
 }
 
 fn fence_runtime<'a>(
@@ -529,8 +624,8 @@ fn fence_runtime<'a>(
     // Service drain has ended: detach any delivery waiters it left behind, while
     // still retaining every accepted job until the engine returns its completion.
     Box::pin(async move {
-        let fence_scope = lifecycle_scope().unwrap_or_else(|_| scope.clone());
-        let cancelled = fence_scope.cancel();
+        let fence_scope = lifecycle_scope(scope.clock()).unwrap_or_else(|_| scope.clone());
+        let canceled = fence_scope.cancel();
         let drained = drive_local(
             Box::pin(async {
                 let (crypto, reactor) =
@@ -559,7 +654,7 @@ fn fence_runtime<'a>(
             }
         })
         .await;
-        cancelled.and(drained).and(error.map_or(Ok(()), Err))
+        canceled.and(drained).and(error.map_or(Ok(()), Err))
     })
 }
 
@@ -595,12 +690,19 @@ pub struct Resources {
     workers: Vec<WorkerId>,
 
     ports: Vec<Mutex<(Option<IoCryptoPort>, Option<CryptoPort>)>>,
+
+    ctx: racer_io::WorkerCtx,
 }
 
 impl Resources {
     /// Allocate all paired endpoints before any service thread starts.
-    pub fn new(limits: Limits, workers: Vec<WorkerId>, generation: u64) -> Result<Self> {
-        Self::with_allocator(limits, workers, generation, security::try_pair)
+    pub fn new(
+        limits: Limits,
+        workers: Vec<WorkerId>,
+        generation: u64,
+        ctx: racer_io::WorkerCtx,
+    ) -> Result<Self> {
+        Self::with_allocator(limits, workers, generation, ctx, security::try_pair)
     }
 
     /// Share transactional endpoint construction with fault-injected startup tests.
@@ -608,6 +710,7 @@ impl Resources {
         limits: Limits,
         workers: Vec<WorkerId>,
         generation: u64,
+        ctx: racer_io::WorkerCtx,
         mut allocate: impl FnMut(
             WorkerId,
             u64,
@@ -630,7 +733,35 @@ impl Resources {
             limits,
             workers,
             ports,
+            ctx,
         })
+    }
+
+    /// Let crypto helpers run queued jobs of other lanes with the same key,
+    /// the NUMA node of the lane's crypto helper. `keys` holds one key per
+    /// lane. Shares of different known nodes are linked, so a job for memory
+    /// on another node can run on that node's helpers.
+    pub fn share_crypto(&self, keys: impl IntoIterator<Item = Option<usize>>) -> Result<()> {
+        let keys = keys.into_iter().collect::<Vec<_>>();
+        if keys.len() != self.ports.len() {
+            return Err(Error::InvalidConfiguration);
+        }
+        let mut groups = BTreeMap::<Option<usize>, Vec<usize>>::new();
+        for (lane, key) in keys.iter().enumerate() {
+            groups.entry(*key).or_default().push(lane);
+        }
+        let mut shares = Vec::new();
+        for (node, lanes) in groups {
+            let share = security::CryptoShare::on_node(lanes.len(), node);
+            for (index, lane) in lanes.into_iter().enumerate() {
+                if let Some(port) = self.ports[lane].lock().map_err(|_| Error::Io)?.1.as_mut() {
+                    port.share(share.clone(), index);
+                }
+            }
+            shares.push(share);
+        }
+        security::CryptoShare::link(&shares);
+        Ok(())
     }
 
     pub fn abandon_lane(&self, lane: usize) -> Result<()> {
@@ -648,7 +779,7 @@ impl Resources {
         Ok(())
     }
     /// Construct on the owning I/O thread. Retain resources even when graph
-    /// construction fails or panics so group teardown closes and fences them.
+    /// construction fails so group teardown closes and fences them.
     pub fn build_lane(
         &self,
         lane: usize,
@@ -667,21 +798,21 @@ impl Resources {
             self.limits.clone(),
         )));
         let runtime = WorkerRuntime {
-            reactor: Rc::new(Reactor::new(admission.clone())),
+            reactor: Rc::new(Reactor::new(
+                admission.clone(),
+                &racer_io::Env::new(racer_io::Driver::Uring, self.ctx.clone()),
+            )),
             admission,
             crypto: Rc::new(CryptoClient::new(port)),
         };
-        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            build(
-                self.workers[lane],
-                WorkerRuntime {
-                    reactor: runtime.reactor.clone(),
-                    admission: runtime.admission.clone(),
-                    crypto: runtime.crypto.clone(),
-                },
-            )
-        }))
-        .unwrap_or(Err(Error::Io));
+        let built = build(
+            self.workers[lane],
+            WorkerRuntime {
+                reactor: runtime.reactor.clone(),
+                admission: runtime.admission.clone(),
+                crypto: runtime.crypto.clone(),
+            },
+        );
         Ok(Box::new(IoService {
             runtime,
             built,
@@ -702,7 +833,13 @@ impl Resources {
             .1
             .take()
             .ok_or(Error::Io)?;
-        build(self.workers[lane], CryptoRuntime { port })
+        build(
+            self.workers[lane],
+            CryptoRuntime {
+                port,
+                ctx: self.ctx.clone(),
+            },
+        )
     }
 }
 #[cfg(test)]
@@ -729,7 +866,7 @@ where
         })
     }
     fn teardown_scope(&self, startup: &RequestScope) -> RequestScope {
-        lifecycle_scope().unwrap_or_else(|_| startup.clone())
+        lifecycle_scope(startup.clock()).unwrap_or_else(|_| startup.clone())
     }
 }
 struct IoService {
@@ -768,18 +905,18 @@ impl Service<RequestScope> for IoService {
         if let Ok(service) = &mut self.built {
             service.poll_budgeted(cx, budget)?;
         }
-        // Even a zero wait submits SQEs queued during the service turn.
-        self.runtime
-            .reactor
-            .wait(self.wait_timeout(IDLE_WAIT))
-            .inspect_err(|error| log_fatal("io-reactor-wait", *error))?;
-        thread::current().unpark();
         Ok(())
     }
     fn wait_timeout(&self, maximum: Duration) -> Duration {
+        let maximum = self.runtime.reactor.next_deadline().map_or(maximum, |at| {
+            maximum.min(at.saturating_duration_since(self.runtime.reactor.ctx().clock.now()))
+        });
         self.built.as_ref().map_or(maximum, |service| {
             service.wait_timeout(maximum).min(maximum)
         })
+    }
+    fn parker(&self) -> Box<dyn crate::lifecycle::Park<Error>> {
+        Box::new(ReactorPark(self.runtime.reactor.clone()))
     }
     fn stop_admission(&mut self) -> Result<()> {
         self.runtime.admission.stop();
@@ -832,7 +969,7 @@ impl Service<RequestScope> for IoService {
 
 #[cfg(test)]
 fn colocated_plan(max_threads: usize, workers: u16) -> AffinityPlan {
-    let location = uring_runtime::group::affinity::CpuLocation {
+    let location = crate::affinity::CpuLocation {
         cpu: *current_cpus().unwrap().first().unwrap(),
         package: 0,
         core: 0,
@@ -848,18 +985,54 @@ fn colocated_plan(max_threads: usize, workers: u16) -> AffinityPlan {
             })
             .collect(),
         max_threads,
+        owner_cpu: None,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use racer_control_wire::CacheId;
+    use racer_wire::control::CacheId;
+    use std::thread;
+
+    /// Lanes with the same key share one crypto group with dense lane slots.
+    #[test]
+    fn crypto_sharing_groups_lanes_by_key() {
+        let env = racer_io::Env::host();
+        let limits = crate::test_support::cluster::config(false).limits;
+        let resources =
+            Resources::new(limits, (0..4).map(WorkerId).collect(), 1, env.ctx.clone()).unwrap();
+        assert_eq!(
+            resources.share_crypto([Some(0)]),
+            Err(Error::InvalidConfiguration)
+        );
+        resources
+            .share_crypto([Some(0), Some(1), Some(0), None])
+            .unwrap();
+        let ports = resources
+            .ports
+            .iter()
+            .map(|ports| ports.lock().unwrap().1.take().unwrap())
+            .collect::<Vec<_>>();
+        let shared = ports
+            .iter()
+            .map(|port| port.shared().unwrap())
+            .collect::<Vec<_>>();
+        assert!(Arc::ptr_eq(shared[0].0, shared[2].0));
+        assert!(!Arc::ptr_eq(shared[0].0, shared[1].0));
+        assert!(!Arc::ptr_eq(shared[0].0, shared[3].0));
+        assert_eq!(
+            (shared[0].1, shared[2].1, shared[1].1, shared[3].1),
+            (0, 1, 0, 0)
+        );
+    }
 
     #[test]
     fn exact_twenty_endpoint_pairs_close_independently() {
+        let env = racer_io::Env::host();
         let limits = crate::test_support::cluster::config(false).limits;
-        let resources = Resources::new(limits, (0..20).map(WorkerId).collect(), 42).unwrap();
+        let resources =
+            Resources::new(limits, (0..20).map(WorkerId).collect(), 42, env.ctx.clone()).unwrap();
         let mut peers = resources
             .ports
             .iter()
@@ -885,12 +1058,17 @@ mod tests {
     /// Validate before allocation and stop at the first failed endpoint pair.
     #[test]
     fn endpoint_allocator_preserves_order_generation_and_failure_boundary() {
+        let env = racer_io::Env::host();
         let limits = crate::test_support::cluster::config(false).limits;
         for workers in [vec![], vec![WorkerId(7), WorkerId(7)]] {
             assert!(matches!(
-                Resources::with_allocator(limits.clone(), workers, 9, |_, _, _| {
-                    panic!("invalid worker set reached allocator")
-                }),
+                Resources::with_allocator(
+                    limits.clone(),
+                    workers,
+                    9,
+                    env.ctx.clone(),
+                    |_, _, _| { panic!("invalid worker set reached allocator") }
+                ),
                 Err(Error::InvalidConfiguration)
             ));
         }
@@ -900,6 +1078,7 @@ mod tests {
                 limits.clone(),
                 vec![WorkerId(7), WorkerId(3), WorkerId(9)],
                 42,
+                env.ctx.clone(),
                 |worker, generation, capacity| {
                     calls.push(worker);
                     assert_eq!(generation, 42);
@@ -925,12 +1104,14 @@ mod tests {
     /// A later failure drops previously allocated I/O endpoints, closing their peers.
     #[test]
     fn endpoint_allocator_failure_releases_earlier_ports() {
+        let env = racer_io::Env::host();
         let limits = crate::test_support::cluster::config(false).limits;
         let mut retained_peer = None;
         let result = Resources::with_allocator(
             limits,
             vec![WorkerId(0), WorkerId(1)],
             42,
+            env.ctx.clone(),
             |worker, generation, capacity| {
                 if worker == WorkerId(1) {
                     return Err(Error::Overloaded);
@@ -953,6 +1134,7 @@ mod tests {
     #[test]
     fn io_wait_forwards_and_observes_post_poll_policy() {
         use std::cell::Cell;
+        let env = racer_io::Env::host();
         struct Waiting {
             polled: Rc<Cell<bool>>,
             observed: Rc<Cell<usize>>,
@@ -987,7 +1169,7 @@ mod tests {
         let observed = Rc::new(Cell::new(0));
         let mut service = IoService {
             runtime: WorkerRuntime {
-                reactor: Rc::new(Reactor::new(admission.clone())),
+                reactor: Rc::new(Reactor::new(admission.clone(), &env)),
                 admission,
                 crypto: Rc::new(CryptoClient::new(port)),
             },
@@ -1003,23 +1185,26 @@ mod tests {
             .poll_budgeted(&mut Context::from_waker(Waker::noop()), 1)
             .unwrap();
         assert!(polled.get());
-        assert_eq!(observed.get(), 2, "the reactor wait queries after polling");
+        assert_eq!(observed.get(), 1, "polling does not wait");
         assert_eq!(service.wait_timeout(IDLE_WAIT), Duration::ZERO);
+        assert_eq!(observed.get(), 2);
         service.built = Err(Error::Unavailable);
         assert_eq!(service.wait_timeout(IDLE_WAIT), IDLE_WAIT);
     }
 
     #[test]
     fn direct_factory_resources_validate_sets_consume_once_and_fence() {
-        use uring_runtime::group::Factory;
+        use crate::lifecycle::Factory;
+        let env = racer_io::Env::host();
         let limits = crate::test_support::cluster::config(false).limits;
         for workers in [vec![], vec![WorkerId(7), WorkerId(7)]] {
             assert!(matches!(
-                Resources::new(limits.clone(), workers, 9),
+                Resources::new(limits.clone(), workers, 9, env.ctx.clone()),
                 Err(Error::InvalidConfiguration)
             ));
         }
-        let resources = Resources::new(limits.clone(), vec![WorkerId(7)], 9).unwrap();
+        let resources =
+            Resources::new(limits.clone(), vec![WorkerId(7)], 9, env.ctx.clone()).unwrap();
         assert_eq!(resources.abandon_lane(1), Err(Error::InvalidConfiguration));
         resources.abandon_lane(0).unwrap();
         resources.abandon_lane(0).unwrap();
@@ -1057,7 +1242,7 @@ mod tests {
                 self.0.abandon_lane(lane)
             }
             fn teardown_scope(&self, _: &RequestScope) -> RequestScope {
-                lifecycle_scope().unwrap()
+                lifecycle_scope(&racer_io::Clock::host()).unwrap()
             }
         }
         struct Local;
@@ -1075,11 +1260,11 @@ mod tests {
                 Box::pin(async { Ok(()) })
             }
         }
-        let mut group = WorkerGroup::new(colocated_plan(3, 1));
+        let mut group = WorkerGroup::new(colocated_plan(3, 1), env.ctx.clone());
         let factory = Arc::new(DirectFactory(
-            Resources::new(limits, vec![WorkerId(0)], 10).unwrap(),
+            Resources::new(limits, vec![WorkerId(0)], 10, env.ctx.clone()).unwrap(),
         ));
-        let scope = lifecycle_scope().unwrap();
+        let scope = lifecycle_scope(&env.ctx.clock).unwrap();
         group.start(factory, &scope).unwrap();
         group.drain(&scope).unwrap();
         group.shutdown(&scope).unwrap();
@@ -1095,12 +1280,12 @@ mod tests {
         //! across nodes; local pair placement must not change the page's selected rail.
         //! Opt-in SMT counts allowed logical CPUs. Reactors prefer distinct physical cores.
 
-        use crate::worker::*;
         #[cfg(test)]
-        use uring_runtime::group::affinity::CpuQuota;
-        use uring_runtime::group::affinity::current_cpus;
-        use uring_runtime::group::affinity::pin_cpu;
-        use uring_runtime::group::affinity::set_cpus;
+        use crate::affinity::CpuQuota;
+        use crate::affinity::current_cpus;
+        use crate::affinity::pin_cpu;
+        use crate::affinity::set_cpus;
+        use crate::worker::*;
 
         #[cfg(test)]
         mod tests {
@@ -1125,6 +1310,74 @@ mod tests {
                     }),
                     nics: vec![],
                 }
+            }
+
+            #[test]
+            fn rdma_owner_gets_a_spare_cpu_off_busy_cores() {
+                let mut config = crate::test_support::cluster::config(false);
+                config.enable_rdma = true;
+                config.max_threads = 31;
+                let plan = AffinityPlan::from_topology(&config, topology(72, None), &[]).unwrap();
+                let owner = plan.owner_cpu().unwrap();
+                assert!(
+                    plan.pairs
+                        .iter()
+                        .all(|pair| pair.io.cpu != owner && pair.crypto.cpu != owner),
+                    "owner {owner} shares a worker CPU"
+                );
+                // Without RDMA no owner CPU is planned.
+                config.enable_rdma = false;
+                let plan = AffinityPlan::from_topology(&config, topology(72, None), &[]).unwrap();
+                assert!(plan.owner_cpu.is_none());
+            }
+
+            #[test]
+            fn spare_cpu_prefers_unused_core_then_local_node() {
+                let at = |cpu, core, numa| CpuLocation {
+                    cpu,
+                    package: 0,
+                    core,
+                    numa_node: Some(numa),
+                };
+                let pair = WorkerPair {
+                    worker: WorkerId(0),
+                    io: at(0, 0, 0),
+                    crypto: at(1, 1, 0),
+                    nic: None,
+                };
+                // CPU 2 is an SMT sibling of the busy core 0; CPU 3 is a free
+                // core on a remote node; CPU 4 is a free local core.
+                let cpus = [
+                    at(0, 0, 0),
+                    at(1, 1, 0),
+                    at(2, 0, 0),
+                    at(3, 5, 1),
+                    at(4, 6, 0),
+                ];
+                assert_eq!(
+                    spare_cpu(&cpus, std::slice::from_ref(&pair)).unwrap().cpu,
+                    4
+                );
+                assert_eq!(
+                    spare_cpu(&cpus[..4], std::slice::from_ref(&pair))
+                        .unwrap()
+                        .cpu,
+                    3
+                );
+                assert_eq!(
+                    spare_cpu(&cpus[..3], std::slice::from_ref(&pair))
+                        .unwrap()
+                        .cpu,
+                    2
+                );
+                assert!(spare_cpu(&cpus[..2], std::slice::from_ref(&pair)).is_none());
+                // With no spare, the owner falls back to the first helper.
+                let plan = AffinityPlan {
+                    pairs: vec![pair],
+                    max_threads: 2,
+                    owner_cpu: None,
+                };
+                assert_eq!(plan.owner_cpu(), Some(1));
             }
 
             #[test]
@@ -1193,7 +1446,7 @@ mod tests {
 
             #[test]
             fn exact_placement_rejects_insufficient_or_unknown_local_capacity() {
-                use uring_runtime::group::affinity::place_exact;
+                use crate::affinity::place_exact;
                 assert!(place_exact(topology(72, None), 30, 20, 20, false).is_err());
                 assert!(place_exact(topology(39, None), 40, 20, 20, false).is_err());
                 assert!(place_exact(topology(72, Some((39, 1))), 40, 20, 20, false).is_err());
@@ -1206,7 +1459,10 @@ mod tests {
                 for cpu in &mut split.cpus {
                     cpu.numa_node = Some(usize::from(cpu.cpu >= 20));
                 }
-                assert!(place_exact(split, 40, 20, 20, false).is_err());
+                // Spilling to a second node keeps every helper local to its lanes.
+                let plan = place_exact(split, 40, 20, 20, false).unwrap();
+                assert_eq!(plan.len(), 20);
+                assert!(plan.iter().all(|p| p.lane.numa_node == p.helper.numa_node));
                 let mut duplicate = topology(72, None);
                 duplicate.cpus[1].cpu = 0;
                 assert!(place_exact(duplicate, 40, 20, 20, false).is_err());
@@ -1214,7 +1470,7 @@ mod tests {
 
             #[test]
             fn exact_smt_requires_opt_in_and_keeps_io_on_distinct_cores() {
-                use uring_runtime::group::affinity::place_exact;
+                use crate::affinity::place_exact;
                 let mut hardware = topology(8, None);
                 for cpu in &mut hardware.cpus {
                     cpu.core = cpu.cpu % 4;
@@ -1228,8 +1484,8 @@ mod tests {
             }
 
             #[test]
-            fn exact_nic_preference_selects_one_node_without_capacity_fallback() {
-                use uring_runtime::group::affinity::place_exact;
+            fn exact_nic_preference_selects_nic_node_then_spills_locally() {
+                use crate::affinity::place_exact;
                 let mut hardware = topology(16, None);
                 for cpu in &mut hardware.cpus {
                     cpu.numa_node = Some(cpu.cpu / 8);
@@ -1244,8 +1500,11 @@ mod tests {
                     assert_eq!(pair.helper.cpu, index + 12);
                     assert_eq!(pair.nic.as_ref().unwrap().device, "nic1");
                 }
+                // Too few NIC-local CPUs: spill to node 0, helpers stay local.
                 hardware.cpus.retain(|cpu| cpu.cpu < 12);
-                assert!(place_exact(hardware, 8, 4, 4, false).is_err());
+                let plan = place_exact(hardware, 8, 4, 4, false).unwrap();
+                assert_eq!(plan.len(), 4);
+                assert!(plan.iter().all(|p| p.lane.numa_node == p.helper.numa_node));
             }
 
             #[test]
@@ -1668,7 +1927,6 @@ mod tests {
             io_draining: AtomicUsize,
             shutdown: AtomicUsize,
             completed: AtomicUsize,
-            native: Mutex<Vec<rdma_verbs::Client>>,
         }
         impl Observed {
             fn event(&self, worker: WorkerId, name: &'static str) {
@@ -1699,7 +1957,6 @@ mod tests {
             roundtrip: bool,
             cpu: usize,
             second_crypto_cpu: usize,
-            native: bool,
         }
 
         fn fixture(cap: usize, failure: Failure, jobs: bool) -> (AffinityPlan, Factory) {
@@ -1714,7 +1971,6 @@ mod tests {
                     roundtrip: false,
                     cpu,
                     second_crypto_cpu: cpu,
-                    native: false,
                 },
             )
         }
@@ -1742,7 +1998,7 @@ mod tests {
                     worker,
                     runtime,
                     observed: self.observed.clone(),
-                    keys: crate::test_support::security::keys(),
+                    keys: crate::test_support::security::keys(&racer_io::Env::host()),
                     failure: self.failure,
                     jobs: self.jobs,
                     roundtrip: self.roundtrip,
@@ -1766,17 +2022,8 @@ mod tests {
                 if worker.0 == 1 && self.failure == Failure::BuildCrypto {
                     return Err(Error::Unauthorized);
                 }
-                let page = PageCryptoEngine::new(runtime);
-                let engine: Box<dyn Service<RequestScope>> = if self.native {
-                    let (mut clients, port) = rdma_verbs::node(1)?;
-                    self.observed.native.lock().unwrap().push(clients.remove(0));
-                    Box::new(rdma_verbs::WithNative::with_host(
-                        page,
-                        rdma_verbs::Owner::new(port),
-                    ))
-                } else {
-                    Box::new(page)
-                };
+                let engine: Box<dyn Service<RequestScope>> =
+                    Box::new(PageCryptoEngine::new(runtime));
                 Ok(Box::new(Engine {
                     worker,
                     engine: Some(engine),
@@ -1801,6 +2048,7 @@ mod tests {
             fn input(&self) -> CryptoInput {
                 let cache = CacheId(crate::test_support::security::CACHE.into());
                 CryptoInput::Encrypt {
+                    page_size: racer_wire::object::PageSize::DEFAULT,
                     page: PageId {
                         version: ObjectVersion {
                             object: ObjectId {
@@ -1820,12 +2068,13 @@ mod tests {
                             1,
                         )
                         .unwrap(),
-                    ciphertext: self
-                        .runtime
-                        .admission
-                        .reserve(Some(&cache), ResourceClass::Ciphertext, 17)
-                        .unwrap()
-                        .into(),
+                    ciphertext: crate::memory::fixture_encrypt_output(
+                        &self.runtime.admission,
+                        self.runtime
+                            .admission
+                            .reserve(Some(&cache), ResourceClass::Ciphertext, 17)
+                            .unwrap(),
+                    ),
                 }
             }
         }
@@ -1849,11 +2098,11 @@ mod tests {
                         let key = self.keys.active(&cache, KeyPurpose::Page)?;
                         let input = CryptoInput::Decrypt {
                             ciphertext,
-                            plaintext: self.runtime.admission.reserve(
+                            plaintext: crate::memory::fixture_plaintext(
+                                &self.runtime.admission,
                                 Some(&cache),
-                                ResourceClass::Plaintext,
-                                1,
-                            )?,
+                                &[0; 1],
+                            ),
                         };
                         let CryptoOutput::Decrypted(plain, _) =
                             self.runtime.crypto.execute(input, key, scope).await?
@@ -1980,7 +2229,9 @@ mod tests {
                     self.observed.event(self.worker, "crypto-drain");
                     // A pending drain of one shard needs the other shard to drain. This
                     // deadlocks if the shared thread blocks on lifecycle futures in order.
-                    std::future::poll_fn(|_| {
+                    // The sibling may run on another helper thread without a wake
+                    // source here, so ask to be polled again.
+                    std::future::poll_fn(|cx| {
                         let sibling_entered =
                             self.observed
                                 .events
@@ -1994,6 +2245,7 @@ mod tests {
                             && self.failure != Failure::BuildCrypto
                             && !sibling_entered
                         {
+                            cx.waker().wake_by_ref();
                             Poll::Pending
                         } else {
                             Poll::Ready(())
@@ -2012,7 +2264,8 @@ mod tests {
                 Box::pin(async move {
                     self.observed.event(self.worker, "crypto-shutdown");
                     self.observed.shutdown.fetch_add(1, Ordering::SeqCst);
-                    std::future::poll_fn(|_| {
+                    // The sibling shard may be on another helper thread.
+                    std::future::poll_fn(|cx| {
                         let expected = if self.failure == Failure::BuildCrypto {
                             1
                         } else {
@@ -2021,6 +2274,7 @@ mod tests {
                         if self.observed.shutdown.load(Ordering::SeqCst) == expected {
                             Poll::Ready(())
                         } else {
+                            cx.waker().wake_by_ref();
                             Poll::Pending
                         }
                     })
@@ -2036,14 +2290,15 @@ mod tests {
         }
 
         fn scope() -> RequestScope {
-            RequestScope::new(RequestId([7; 16]), Instant::now() + Duration::from_secs(3)).unwrap()
+            RequestScope::host(RequestId([7; 16]), Instant::now() + Duration::from_secs(3)).unwrap()
         }
 
         #[test]
         fn two_io_share_one_actual_crypto_thread_and_drain_outstanding_jobs() {
+            let env = racer_io::Env::host();
             let (plan, factory) = fixture(4, Failure::None, true);
             let observed = factory.observed.clone();
-            let mut group = WorkerGroup::new(plan);
+            let mut group = WorkerGroup::new(plan, env.ctx.clone());
             let scope = scope();
             group.start_recipe(Arc::new(factory), &scope).unwrap();
             assert_eq!(
@@ -2087,20 +2342,28 @@ mod tests {
             }
             // While both shards remain active, every pass grants each a single page and
             // reverses its starting order on the next pass, even with saturated queues.
+            // Passes after one shard leaves the steady state are excluded.
             let polls = observed.polls.lock().unwrap();
-            assert!(polls.len() >= 8);
-            assert_eq!(&polls[..8], &[0, 1, 1, 0, 0, 1, 1, 0]);
+            let pairs: Vec<_> = polls
+                .chunks_exact(2)
+                .take_while(|pair| pair[0] != pair[1])
+                .collect();
+            assert!(pairs.len() >= 2, "{polls:?}");
+            for (pass, pair) in pairs.iter().enumerate() {
+                assert_eq!(pair[0], (pass % 2) as u16, "{polls:?}");
+            }
         }
 
         #[test]
         fn shared_crypto_borrowed_run_counts_caller_and_restores_affinity() {
+            let env = racer_io::Env::host();
             let (plan, factory) = fixture(3, Failure::None, true);
-            let mut group = WorkerGroup::new(plan);
+            let mut group = WorkerGroup::new(plan, env.ctx.clone());
             let before = current_cpus().unwrap();
             let mut scope = scope();
             // Leave startup enough room under concurrent builds: this scenario checks
             // deadline-driven teardown after all eight jobs, not startup latency.
-            scope.deadline = Deadline(Instant::now() + Duration::from_secs(1));
+            scope.deadline = racer_io::deadline::Deadline(Instant::now() + Duration::from_secs(1));
             assert_eq!(
                 group.run_recipe_with_scope(&factory, &scope),
                 Err(Error::DeadlineExceeded)
@@ -2110,13 +2373,14 @@ mod tests {
             assert_eq!(factory.observed.submitted.load(Ordering::SeqCst), 8);
             let (plan, factory) = fixture(3, Failure::None, false);
             assert_eq!(
-                WorkerGroup::new(plan).start_recipe(Arc::new(factory), &scope),
+                WorkerGroup::new(plan, env.ctx.clone()).start_recipe(Arc::new(factory), &scope),
                 Err(Error::InvalidConfiguration)
             );
         }
 
         #[test]
         fn partial_group_build_start_and_pending_start_failures_teardown_every_built_service() {
+            let env = racer_io::Env::host();
             for failure in [
                 Failure::BuildCrypto,
                 Failure::StartCrypto,
@@ -2127,10 +2391,12 @@ mod tests {
                 for borrowed in [false, true] {
                     let (plan, factory) = fixture(if borrowed { 3 } else { 4 }, failure, true);
                     let observed = factory.observed.clone();
-                    let mut group = WorkerGroup::new(plan);
+                    let mut group = WorkerGroup::new(plan, env.ctx.clone());
                     let mut scope = scope();
                     if failure == Failure::PendingStart {
-                        scope.deadline = Deadline(Instant::now() + Duration::from_millis(30));
+                        scope.deadline = racer_io::deadline::Deadline(
+                            Instant::now() + Duration::from_millis(30),
+                        );
                     }
                     let expected = match failure {
                         Failure::PendingStart => Error::DeadlineExceeded,
@@ -2168,6 +2434,7 @@ mod tests {
 
         #[test]
         fn shared_crypto_errors_do_not_skip_sibling_drain_or_shutdown() {
+            let env = racer_io::Env::host();
             for failure in [
                 Failure::PollCrypto,
                 Failure::DrainCrypto,
@@ -2175,7 +2442,7 @@ mod tests {
             ] {
                 let (plan, factory) = fixture(4, failure, false);
                 let observed = factory.observed.clone();
-                let mut group = WorkerGroup::new(plan);
+                let mut group = WorkerGroup::new(plan, env.ctx.clone());
                 let scope = scope();
                 let started = group.start_recipe(Arc::new(factory), &scope);
                 if failure == Failure::PollCrypto {
@@ -2194,11 +2461,12 @@ mod tests {
 
         #[test]
         fn shared_services_deliver_independent_real_encrypt_decrypt_results() {
+            let env = racer_io::Env::host();
             let (plan, mut factory) = fixture(4, Failure::None, false);
             factory.roundtrip = true;
             let observed = factory.observed.clone();
             observed.release.store(true, Ordering::SeqCst);
-            let mut group = WorkerGroup::new(plan);
+            let mut group = WorkerGroup::new(plan, env.ctx.clone());
             let scope = scope();
             group.start_recipe(Arc::new(factory), &scope).unwrap();
             assert_eq!(observed.completed.load(Ordering::SeqCst), 2);
@@ -2209,38 +2477,64 @@ mod tests {
 
         #[test]
         fn shared_group_cancellation_during_live_jobs_fences_before_join() {
+            let env = racer_io::Env::host();
             let (plan, factory) = fixture(4, Failure::None, true);
-            let mut group = WorkerGroup::new(plan);
+            let mut group = WorkerGroup::new(plan, env.ctx.clone());
             let scope = scope();
             group.start_recipe(Arc::new(factory), &scope).unwrap();
             scope.cancel().unwrap();
             // A canceled drain wait may return immediately, but join must still run the
             // real crypto engines and fence every abandoned accepted job.
             let drained = group.drain(&scope);
-            assert!(drained == Err(Error::Cancelled) || drained == Ok(()));
+            assert!(drained == Err(Error::Canceled) || drained == Ok(()));
             group.join().unwrap();
             assert_eq!(group.runtime.stats().done, 3);
         }
 
         #[test]
         fn pending_shard_start_does_not_block_ready_sibling_crypto_work() {
+            let env = racer_io::Env::host();
             let (plan, mut factory) = fixture(4, Failure::PendingStart, false);
             factory.roundtrip = true;
             let observed = factory.observed.clone();
             observed.release.store(true, Ordering::SeqCst);
-            let mut group = WorkerGroup::new(plan);
-            let mut scope = scope();
-            scope.deadline = Deadline(Instant::now() + Duration::from_millis(100));
+            let mut group = WorkerGroup::new(plan, env.ctx.clone());
+            // The startup deadline runs on a virtual clock that expires only
+            // after the ready sibling's crypto roundtrip is observed, so a
+            // slow host cannot expire it first.
+            let clock = racer_io::ctx::VirtualClock::new();
+            let scope = RequestScope::with_clock(
+                RequestId([7; 16]),
+                clock.now() + Duration::from_millis(100),
+                clock.clone().into(),
+            )
+            .unwrap();
+            let expire = {
+                let observed = observed.clone();
+                std::thread::spawn(move || {
+                    let watchdog = Instant::now() + Duration::from_secs(30);
+                    // Expire regardless after the watchdog; the assertion
+                    // below then reports the missing completion.
+                    while observed.completed.load(Ordering::SeqCst) == 0
+                        && Instant::now() < watchdog
+                    {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    clock.advance(Duration::from_millis(100)).unwrap();
+                })
+            };
             assert_eq!(
                 group.start_recipe(Arc::new(factory), &scope),
                 Err(Error::DeadlineExceeded)
             );
+            expire.join().unwrap();
             assert_eq!(observed.completed.load(Ordering::SeqCst), 1);
             assert_eq!(group.runtime.stats().done, 3);
         }
 
         #[test]
         fn later_crypto_group_allocation_failure_rolls_back_live_first_group() {
+            let env = racer_io::Env::host();
             let allowed = current_cpus().unwrap();
             let Some(&second_cpu) = allowed.iter().nth(1) else {
                 return;
@@ -2253,7 +2547,7 @@ mod tests {
                 plan.pairs[1].crypto.cpu = second_cpu;
                 factory.second_crypto_cpu = second_cpu;
                 let observed = factory.observed.clone();
-                let mut group = WorkerGroup::new(plan);
+                let mut group = WorkerGroup::new(plan, env.ctx.clone());
                 let scope = scope();
                 let allocator_observed = observed.clone();
                 let allocate = move |worker, generation, capacity| {
@@ -2279,6 +2573,7 @@ mod tests {
 
         #[test]
         fn distinct_crypto_cpus_create_distinct_execution_threads() {
+            let env = racer_io::Env::host();
             let allowed = current_cpus().unwrap();
             let Some(&second_cpu) = allowed.iter().nth(1) else {
                 return;
@@ -2287,7 +2582,7 @@ mod tests {
             plan.pairs[1].crypto.cpu = second_cpu;
             factory.second_crypto_cpu = second_cpu;
             let observed = factory.observed.clone();
-            let mut group = WorkerGroup::new(plan);
+            let mut group = WorkerGroup::new(plan, env.ctx.clone());
             let scope = scope();
             group.start_recipe(Arc::new(factory), &scope).unwrap();
             assert_eq!(group.runtime.stats().coordinators, 1);
@@ -2303,54 +2598,6 @@ mod tests {
                 .collect::<HashSet<_>>();
             assert_eq!(crypto.len(), 2);
         }
-
-        #[test]
-        fn shared_native_wrappers_are_drained_and_destroyed_on_owner_thread() {
-            let (plan, mut factory) = fixture(4, Failure::None, true);
-            factory.native = true;
-            let observed = factory.observed.clone();
-            let mut group = WorkerGroup::new(plan);
-            let scope = scope();
-            group.start_recipe(Arc::new(factory), &scope).unwrap();
-            assert_eq!(observed.native.lock().unwrap().len(), 2);
-            group.drain(&scope).unwrap();
-            for io in observed.native.lock().unwrap().iter() {
-                assert!(io.closed());
-                assert!(io.drained());
-            }
-            group.shutdown(&scope).unwrap();
-            group.join().unwrap();
-            for io in observed.native.lock().unwrap().iter() {
-                assert_eq!(
-                    io.reopen().map_err(Error::from),
-                    Err(Error::Unavailable),
-                    "native owner was destroyed"
-                );
-            }
-            assert_eq!(observed.shutdown.load(Ordering::SeqCst), 2);
-            assert_eq!(group.runtime.stats().done, 3);
-            let events = observed.events.lock().unwrap();
-            for worker in 0..2 {
-                let event = |name| {
-                    events
-                        .iter()
-                        .enumerate()
-                        .find(|(_, (id, kind, _))| *id == worker && *kind == name)
-                        .unwrap()
-                };
-                let (built, (_, _, owner)) = event("crypto-build");
-                let (drained, (_, _, drain_thread)) = event("crypto-drain");
-                let (shutdown, (_, _, shutdown_thread)) = event("crypto-shutdown");
-                let (dropped, (_, _, drop_thread)) = event("crypto-drop");
-                assert!(built < drained && drained < shutdown && shutdown < dropped);
-                assert_eq!(owner, drain_thread);
-                assert_eq!(owner, shutdown_thread);
-                assert_eq!(
-                    owner, drop_thread,
-                    "outer observer records completed native destruction"
-                );
-            }
-        }
     }
 
     mod lifecycle {
@@ -2360,7 +2607,7 @@ mod tests {
         fn factory_and_crypto_runtime_have_cross_thread_bounds() {
             fn sync<T: Sync + ?Sized>() {}
             fn send<T: Send + 'static>() {}
-            sync::<dyn uring_runtime::group::Factory<RequestScope>>();
+            sync::<dyn crate::lifecycle::Factory<RequestScope>>();
             send::<CryptoRuntime>();
         }
 
@@ -2378,6 +2625,7 @@ mod tests {
             factory: TestFactory,
             local: Rc<()>,
             driver: Option<Waker>,
+            reporter: Option<FailureReporter<Error>>,
         }
         struct TestCrypto {
             factory: TestFactory,
@@ -2406,6 +2654,7 @@ mod tests {
                     factory: self.clone(),
                     local: Rc::new(()),
                     driver: None,
+                    reporter: None,
                 }))
             }
             fn build_crypto(
@@ -2428,6 +2677,9 @@ mod tests {
             }
         }
         impl Service<RequestScope> for TestIo {
+            fn set_failure_reporter(&mut self, reporter: FailureReporter<Error>) {
+                self.reporter = Some(reporter);
+            }
             fn start<'a>(&'a mut self, _: &'a RequestScope) -> Operation<'a, ()> {
                 let ready = Instant::now() + self.factory.start_delay;
                 Box::pin(std::future::poll_fn(move |cx| {
@@ -2449,7 +2701,8 @@ mod tests {
                 assert!(budget <= WORK_BUDGET);
                 assert_eq!(Rc::strong_count(&self.local), 1);
                 if self.factory.stop_on_poll {
-                    Err(Error::Cancelled)
+                    self.reporter.as_ref().unwrap().request_stop();
+                    Err(Error::Canceled)
                 } else {
                     Ok(())
                 }
@@ -2502,6 +2755,10 @@ mod tests {
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Ok(())
             }
+            /// The I/O drain observes helper polls, so ask to be polled.
+            fn wait_timeout(&self, maximum: Duration) -> Duration {
+                maximum.min(IDLE_WAIT)
+            }
             fn drain<'a>(&'a mut self, _: &'a RequestScope) -> Operation<'a, ()> {
                 Box::pin(async move {
                     self.factory.event("crypto-drain");
@@ -2515,11 +2772,11 @@ mod tests {
                 })
             }
         }
-        fn fixture(max_threads: usize) -> (WorkerGroup, TestFactory) {
+        fn fixture(env: &racer_io::Env, max_threads: usize) -> (WorkerGroup, TestFactory) {
             let plan = colocated_plan(max_threads, 1);
             let cpu = plan.pairs[0].io.cpu;
             (
-                WorkerGroup::new(plan),
+                WorkerGroup::new(plan, env.ctx.clone()),
                 TestFactory {
                     events: Arc::new(Mutex::new(Vec::new())),
                     crypto_polls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -2534,7 +2791,8 @@ mod tests {
 
         #[test]
         fn prepare_rejects_known_numa_mismatch() {
-            let (mut group, _) = fixture(3);
+            let env = racer_io::Env::host();
+            let (mut group, _) = fixture(&env, 3);
             group.plan.pairs[0].io.numa_node = Some(0);
             group.plan.pairs[0].crypto.numa_node = Some(1);
             assert_eq!(group.prepare(false), Err(Error::InvalidConfiguration));
@@ -2543,8 +2801,9 @@ mod tests {
 
         #[test]
         fn prepare_rejects_contradictory_shared_crypto_metadata() {
+            let env = racer_io::Env::host();
             for dimension in 0..3 {
-                let (mut group, _) = fixture(4);
+                let (mut group, _) = fixture(&env, 4);
                 let mut second = group.plan.pairs[0].clone();
                 second.worker = WorkerId(1);
                 match dimension {
@@ -2560,13 +2819,14 @@ mod tests {
 
         #[test]
         fn prepare_accepts_colocated_io_and_unknown_numa() {
+            let env = racer_io::Env::host();
             for (io, crypto) in [
                 (None, None),
                 (Some(0), None),
                 (None, Some(0)),
                 (Some(0), Some(0)),
             ] {
-                let (mut group, _) = fixture(4);
+                let (mut group, _) = fixture(&env, 4);
                 group.plan.pairs[0].io.numa_node = io;
                 group.plan.pairs[0].crypto.numa_node = crypto;
                 let mut second = group.plan.pairs[0].clone();
@@ -2582,9 +2842,10 @@ mod tests {
 
         #[test]
         fn owned_start_drains_and_joins_both_pinned_local_services() {
-            let (mut group, factory) = fixture(3);
+            let env = racer_io::Env::host();
+            let (mut group, factory) = fixture(&env, 3);
             let events = factory.events.clone();
-            let scope = lifecycle_scope().unwrap();
+            let scope = lifecycle_scope(&env.ctx.clock).unwrap();
             group.start_recipe(Arc::new(factory), &scope).unwrap();
             group.drain(&scope).unwrap();
             group.shutdown(&scope).unwrap();
@@ -2598,43 +2859,20 @@ mod tests {
             assert!(events.contains(&"io-shutdown"));
             assert_eq!(group.runtime.stats().done, 2);
             // Completed workers cannot retain cancellation slots in the caller's scope.
-            let registrations = (0..1024)
-                .map(|_| scope.cancellation.subscribe().unwrap())
-                .collect::<Vec<_>>();
-            assert!(matches!(
-                scope.cancellation.subscribe(),
-                Err(Error::Overloaded)
-            ));
-            drop(registrations);
-        }
-
-        #[test]
-        fn cancellation_subscription_failure_tears_down_built_services() {
-            let (mut group, factory) = fixture(3);
-            let events = factory.events.clone();
-            let scope = lifecycle_scope().unwrap();
-            let _registrations = (0..1024)
-                .map(|_| scope.cancellation.subscribe().unwrap())
-                .collect::<Vec<_>>();
-            assert_eq!(
-                group.start_recipe(Arc::new(factory), &scope),
-                Err(Error::Overloaded)
-            );
-            assert_eq!(group.runtime.stats().coordinators, 0);
-            assert_eq!(group.runtime.stats().done, 2);
-            assert!(events.lock().unwrap().contains(&"crypto-shutdown"));
+            assert_eq!(scope.cancellation.waiters(), 0);
         }
 
         #[test]
         fn startup_failure_rolls_back_and_owned_start_counts_caller() {
-            let scope = lifecycle_scope().unwrap();
-            let (mut group, factory) = fixture(2);
+            let env = racer_io::Env::host();
+            let scope = lifecycle_scope(&env.ctx.clock).unwrap();
+            let (mut group, factory) = fixture(&env, 2);
             assert_eq!(
                 group.start_recipe(Arc::new(factory), &scope),
                 Err(Error::InvalidConfiguration)
             );
             for fail_crypto in [false, true] {
-                let (mut group, mut factory) = fixture(3);
+                let (mut group, mut factory) = fixture(&env, 3);
                 factory.fail_crypto = fail_crypto;
                 factory.fail_io = !fail_crypto;
                 let expected = if fail_crypto {
@@ -2650,16 +2888,23 @@ mod tests {
 
         #[test]
         fn borrowed_run_uses_caller_and_restores_affinity_on_failure() {
-            let (group, mut factory) = fixture(2);
+            let env = racer_io::Env::host();
+            let (group, mut factory) = fixture(&env, 2);
             // Reconstruct to infer the borrowed factory lifetime instead of 'static.
             let plan = AffinityPlan {
                 pairs: group.plan.pairs.clone(),
                 max_threads: 2,
+                owner_cpu: None,
             };
             factory.stop_on_poll = true;
             let before = current_cpus().unwrap();
-            let mut group = WorkerGroup::new(plan);
-            assert_eq!(group.run_recipe(&factory), Err(Error::Cancelled));
+            let mut group = WorkerGroup::new(plan, env.ctx.clone());
+            // A requested stop is a clean exit with a recorded reason.
+            assert_eq!(group.run_recipe(&factory), Ok(()));
+            assert_eq!(
+                group.stop_reason(),
+                Some(crate::lifecycle::StopReason::Requested)
+            );
             assert_eq!(current_cpus().unwrap(), before);
             assert_eq!(group.runtime.stats().done, 2);
             assert!(factory.events.lock().unwrap().contains(&"crypto-shutdown"));
@@ -2667,20 +2912,22 @@ mod tests {
 
         #[test]
         fn startup_budget_outlives_lifecycle_and_still_bounds_startup() {
+            let env = racer_io::Env::host();
             assert!(crate::worker::LIFECYCLE_TIMEOUT == Duration::from_secs(30));
             for (budget, expected) in [
                 (Duration::from_millis(50), Err(Error::DeadlineExceeded)),
-                (Duration::from_secs(3600), Err(Error::Cancelled)),
+                (Duration::from_secs(3600), Ok(())),
             ] {
-                let (group, mut factory) = fixture(2);
+                let (group, mut factory) = fixture(&env, 2);
                 let plan = AffinityPlan {
                     pairs: group.plan.pairs.clone(),
                     max_threads: 2,
+                    owner_cpu: None,
                 };
                 factory.stop_on_poll = true;
                 factory.start_delay = Duration::from_millis(300);
-                let mut group = WorkerGroup::new(plan);
-                let scope = startup_scope(budget).unwrap();
+                let mut group = WorkerGroup::new(plan, env.ctx.clone());
+                let scope = startup_scope(budget, &env.ctx.clock).unwrap();
                 let result = group.run_inner(&factory, &scope, false);
                 // A long budget reaches steady state (which this fixture stops);
                 // a short one fails startup. Both fully join every service.
@@ -2692,13 +2939,19 @@ mod tests {
 
         #[test]
         fn borrowed_run_scope_stops_and_joins_on_deadline() {
-            let (group, factory) = fixture(2);
-            let mut scoped = WorkerGroup::new(AffinityPlan {
-                pairs: group.plan.pairs.clone(),
-                max_threads: 2,
-            });
-            let mut scope = lifecycle_scope().unwrap();
-            scope.deadline = Deadline(Instant::now() + Duration::from_millis(50));
+            let env = racer_io::Env::host();
+            let (group, factory) = fixture(&env, 2);
+            let mut scoped = WorkerGroup::new(
+                AffinityPlan {
+                    pairs: group.plan.pairs.clone(),
+                    max_threads: 2,
+                    owner_cpu: None,
+                },
+                env.ctx.clone(),
+            );
+            let mut scope = lifecycle_scope(&env.ctx.clock).unwrap();
+            scope.deadline =
+                racer_io::deadline::Deadline(Instant::now() + Duration::from_millis(50));
             assert_eq!(
                 scoped.run_recipe_with_scope(&factory, &scope),
                 Err(Error::DeadlineExceeded)
@@ -2708,8 +2961,9 @@ mod tests {
 
         #[test]
         fn engine_driver_wake_survives_noop_operation_poll() {
-            use uring_runtime::test_util::WakeCounter;
-            let (_, factory) = fixture(3);
+            use crate::test_support::WakeCounter;
+            let env = racer_io::Env::host();
+            let (_, factory) = fixture(&env, 3);
             let (io, port) = security::pair(WorkerId(0), 1, NonZeroUsize::new(1).unwrap());
             let mut engine = TestCrypto {
                 factory,
@@ -2728,80 +2982,17 @@ mod tests {
         }
 
         #[test]
-        fn coordinator_panic_reports_failure_and_joins_without_waiting_for_startup_deadline() {
-            let (mut group, factory) = fixture(3);
-            let scope = lifecycle_scope().unwrap();
-            assert_eq!(
-                group.start_with_allocator(Arc::new(factory), &scope, |_, _, _| {
-                    panic!("injected allocation panic")
-                }),
-                Err(Error::Io)
-            );
-            assert_eq!(group.runtime.stats().coordinators, 0);
-            assert_eq!(group.runtime.stats().done, 0);
-            let factory = fixture(3).1;
-            let mut borrowed = WorkerGroup::new(colocated_plan(2, 1));
-            let before = current_cpus().unwrap();
-            assert_eq!(
-                borrowed.run_with_allocator(&factory, &scope, false, |_, _, _| {
-                    panic!("injected borrowed allocation panic")
-                }),
-                Err(Error::Io)
-            );
-            assert_eq!(borrowed.runtime.stats().done, 0);
-            assert_eq!(current_cpus().unwrap(), before);
-        }
-
-        #[test]
-        fn limits_panic_starts_no_owned_or_borrowed_threads() {
-            struct PanicLimits;
-            impl FaultRecipe for PanicLimits {
-                fn limits(&self) -> Limits {
-                    panic!("injected limits panic")
-                }
-                fn build(
-                    &self,
-                    _: WorkerId,
-                    _: WorkerRuntime,
-                ) -> Result<Box<dyn Service<RequestScope>>> {
-                    panic!("must not build")
-                }
-                fn build_crypto(
-                    &self,
-                    _: WorkerId,
-                    _: CryptoRuntime,
-                ) -> Result<Box<dyn Service<RequestScope>>> {
-                    panic!("must not build")
-                }
-            }
-            let before = current_cpus().unwrap();
-            let scope = lifecycle_scope().unwrap();
-            let mut group = WorkerGroup::new(colocated_plan(3, 1));
-            assert_eq!(
-                group.start_recipe(Arc::new(PanicLimits), &scope),
-                Err(Error::Io)
-            );
-            assert_eq!(group.runtime.stats().done, 0);
-            assert_eq!(group.runtime.stats().coordinators, 0);
-            assert_eq!(
-                group.run_recipe_with_scope(&PanicLimits, &scope),
-                Err(Error::Io)
-            );
-            assert_eq!(group.runtime.stats().done, 0);
-            assert_eq!(current_cpus().unwrap(), before);
-        }
-
-        #[test]
         fn pending_start_backend_failure_notifies_group_before_deadline() {
             use std::sync::atomic::AtomicBool;
             use std::sync::atomic::AtomicUsize;
             use std::sync::atomic::Ordering;
+            let env = racer_io::Env::host();
             struct BackendFactory {
                 resources: Resources,
                 sibling_started: Arc<AtomicBool>,
                 sibling_drained: Arc<AtomicBool>,
                 fences: Arc<AtomicUsize>,
-                fail_wait: bool,
+                wake: Arc<std::sync::Mutex<Option<Waker>>>,
             }
             struct BackendService {
                 sibling_started: Arc<AtomicBool>,
@@ -2809,7 +3000,7 @@ mod tests {
                 reporter: Option<FailureReporter<Error>>,
                 sibling_drained: Arc<AtomicBool>,
                 fences: Arc<AtomicUsize>,
-                fail_wait: bool,
+                wake: Arc<std::sync::Mutex<Option<Waker>>>,
             }
             impl Factory<RequestScope> for BackendFactory {
                 fn build_lane(&self, lane: usize) -> Result<Box<dyn Service<RequestScope>>> {
@@ -2820,7 +3011,7 @@ mod tests {
                             reporter: None,
                             sibling_drained: self.sibling_drained.clone(),
                             fences: self.fences.clone(),
-                            fail_wait: self.fail_wait,
+                            wake: self.wake.clone(),
                         }))
                     })
                 }
@@ -2837,25 +3028,22 @@ mod tests {
                 fn start<'a>(&'a mut self, _: &'a RequestScope) -> Operation<'a, ()> {
                     if self.lane != 0 {
                         self.sibling_started.store(true, Ordering::SeqCst);
+                        if let Some(waker) = self.wake.lock().unwrap().take() {
+                            waker.wake();
+                        }
                         return Box::pin(async { Ok(()) });
                     }
-                    let fail_wait = self.fail_wait;
                     let poll_ready = self.sibling_started.clone();
-                    let wait_ready = self.sibling_started.clone();
+                    let wake = self.wake.clone();
                     // Exercise the exact resource-driver wrapper with a permanently
-                    // pending application future and either backend failure site.
+                    // pending application future; the backend fails once the sibling
+                    // starts, and the sibling's start is this lane's wake source.
                     drive_local_with(
                         Box::pin(std::future::pending()),
                         self.reporter.as_ref(),
-                        move |_| {
-                            if !fail_wait && poll_ready.load(Ordering::SeqCst) {
-                                Err(Error::Io)
-                            } else {
-                                Ok(())
-                            }
-                        },
-                        move || {
-                            if fail_wait && wait_ready.load(Ordering::SeqCst) {
+                        move |waker| {
+                            *wake.lock().unwrap() = Some(waker.clone());
+                            if poll_ready.load(Ordering::SeqCst) {
                                 Err(Error::Io)
                             } else {
                                 Ok(())
@@ -2889,19 +3077,20 @@ mod tests {
                     Box::pin(async { Ok(()) })
                 }
             }
-            for fail_wait in [false, true] {
+            {
                 let cpu = *current_cpus().unwrap().first().unwrap();
                 let factory = Arc::new(BackendFactory {
                     resources: Resources::new(
                         crate::test_support::cluster::config(false).limits,
                         vec![WorkerId(0), WorkerId(1)],
                         1,
+                        env.ctx.clone(),
                     )
                     .unwrap(),
                     sibling_started: Arc::default(),
                     sibling_drained: Arc::default(),
                     fences: Arc::default(),
-                    fail_wait,
+                    wake: Arc::default(),
                 });
                 let mut group = Group::new(Plan {
                     lanes: (0..2)
@@ -2918,7 +3107,7 @@ mod tests {
                     max_threads: 4,
                 });
                 let scope =
-                    RequestScope::new(RequestId([0; 16]), Instant::now() + Duration::from_secs(3))
+                    RequestScope::host(RequestId([0; 16]), Instant::now() + Duration::from_secs(3))
                         .unwrap();
                 let started = Instant::now();
                 assert_eq!(group.start(factory.clone(), &scope), Err(Error::Io));
@@ -2936,6 +3125,7 @@ mod tests {
             use std::sync::atomic::AtomicBool;
             use std::sync::atomic::AtomicUsize;
             use std::sync::atomic::Ordering;
+            let env = racer_io::Env::host();
             struct PendingFactory {
                 resources: Resources,
                 release: Arc<AtomicBool>,
@@ -2944,6 +3134,7 @@ mod tests {
                 drivers: Arc<AtomicUsize>,
                 drops: Arc<AtomicUsize>,
                 pending_fence: bool,
+                wake: Arc<std::sync::Mutex<Option<Waker>>>,
             }
             struct PendingDrain {
                 owner: thread::ThreadId,
@@ -2954,6 +3145,7 @@ mod tests {
                 drivers: Arc<AtomicUsize>,
                 drops: Arc<AtomicUsize>,
                 pending_fence: bool,
+                wake: Arc<std::sync::Mutex<Option<Waker>>>,
             }
             impl Factory<RequestScope> for PendingFactory {
                 fn build_lane(&self, lane: usize) -> Result<Box<dyn Service<RequestScope>>> {
@@ -2967,6 +3159,7 @@ mod tests {
                             drivers: self.drivers.clone(),
                             drops: self.drops.clone(),
                             pending_fence: self.pending_fence,
+                            wake: self.wake.clone(),
                         }))
                     })
                 }
@@ -3001,8 +3194,10 @@ mod tests {
                         return Box::pin(async { Ok(()) });
                     }
                     let release = self.release.clone();
+                    let wake = self.wake.clone();
                     drive_local_with(
-                        Box::pin(std::future::poll_fn(move |_| {
+                        Box::pin(std::future::poll_fn(move |cx| {
+                            *wake.lock().unwrap() = Some(cx.waker().clone());
                             if release.load(Ordering::SeqCst) {
                                 Poll::Ready(Ok(()))
                             } else {
@@ -3011,7 +3206,6 @@ mod tests {
                         })),
                         self.reporter.as_ref(),
                         |_| Err(Error::Io),
-                        || Ok(()),
                     )
                 }
                 fn fence<'a>(&'a mut self, _: &'a RequestScope) -> Operation<'a, ()> {
@@ -3019,7 +3213,9 @@ mod tests {
                         let release = self.release.clone();
                         let fences = self.fences.clone();
                         let reporter = self.reporter.clone();
-                        return Box::pin(std::future::poll_fn(move |_| {
+                        let wake = self.wake.clone();
+                        return Box::pin(std::future::poll_fn(move |cx| {
+                            *wake.lock().unwrap() = Some(cx.waker().clone());
                             if release.load(Ordering::SeqCst) {
                                 fences.fetch_add(1, Ordering::SeqCst);
                                 Poll::Ready(Ok(()))
@@ -3058,6 +3254,7 @@ mod tests {
                         crate::test_support::cluster::config(false).limits,
                         vec![WorkerId(0)],
                         1,
+                        env.ctx.clone(),
                     )
                     .unwrap(),
                     release: Arc::default(),
@@ -3066,6 +3263,7 @@ mod tests {
                     drivers: Arc::default(),
                     drops: Arc::default(),
                     pending_fence,
+                    wake: Arc::default(),
                 });
                 let mut group = Group::new(Plan {
                     lanes: vec![Lane {
@@ -3080,7 +3278,7 @@ mod tests {
                     max_threads: 3,
                 });
                 let scope =
-                    RequestScope::new(RequestId([0; 16]), Instant::now() + Duration::from_secs(3))
+                    RequestScope::host(RequestId([0; 16]), Instant::now() + Duration::from_secs(3))
                         .unwrap();
                 group.start(factory.clone(), &scope).unwrap();
                 // Startup completion can precede the first serving-loop turn.
@@ -3098,6 +3296,9 @@ mod tests {
                 let drops_before = factory.drops.load(Ordering::SeqCst);
                 // Release before assertions so a failed regression cannot hang Drop.
                 factory.release.store(true, Ordering::SeqCst);
+                if let Some(waker) = factory.wake.lock().unwrap().take() {
+                    waker.wake();
+                }
                 let joined = group.join();
                 assert_eq!(result, Err(Error::Io));
                 assert!(elapsed < Duration::from_secs(1));
@@ -3116,12 +3317,13 @@ mod tests {
 
         #[test]
         fn later_pair_allocation_failure_stops_and_joins_started_pair() {
-            let (mut group, factory) = fixture(5);
+            let env = racer_io::Env::host();
+            let (mut group, factory) = fixture(&env, 5);
             let events = factory.events.clone();
             let mut second = group.plan.pairs[0].clone();
             second.worker = WorkerId(1);
             group.plan.pairs.push(second);
-            let scope = lifecycle_scope().unwrap();
+            let scope = lifecycle_scope(&env.ctx.clock).unwrap();
             let result = group.start_with_allocator(
                 Arc::new(factory),
                 &scope,
@@ -3142,16 +3344,18 @@ mod tests {
 
         #[test]
         fn scoped_allocation_failure_joins_started_crypto_and_restores_affinity() {
-            let (group, factory) = fixture(4);
+            let env = racer_io::Env::host();
+            let (group, factory) = fixture(&env, 4);
             let mut plan = AffinityPlan {
                 pairs: group.plan.pairs.clone(),
                 max_threads: 4,
+                owner_cpu: None,
             };
             let mut second = plan.pairs[0].clone();
             second.worker = WorkerId(1);
             plan.pairs.push(second);
-            let mut scoped = WorkerGroup::new(plan);
-            let scope = lifecycle_scope().unwrap();
+            let mut scoped = WorkerGroup::new(plan, env.ctx.clone());
+            let scope = lifecycle_scope(&env.ctx.clock).unwrap();
             let before = current_cpus().unwrap();
             let result = scoped.run_with_allocator(
                 &factory,

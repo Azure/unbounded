@@ -5,7 +5,7 @@ use std::fmt;
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Worker-local future: deliberately not `Send`, and never drives a hidden executor.
-pub type Operation<'a, T> = uring_runtime::Operation<'a, T, Error>;
+pub type Operation<'a, T> = racer_io::Operation<'a, T, Error>;
 
 /// Declare root failures once, keeping publication phases out of their own causes.
 macro_rules! boundary_errors {
@@ -51,8 +51,10 @@ boundary_errors! {
     VersionUnavailable,
     Unavailable,
     Overloaded,
+    /// The page's flight is fetching and holds its waiter cap: busy, and proof of the fetch.
+    FlightFull,
     DeadlineExceeded,
-    Cancelled,
+    Canceled,
     StaleFlight,
     Unauthorized,
     /// Authenticated Node binding changed; drain the entire graph and restart.
@@ -93,8 +95,9 @@ impl From<racer_core::read::Error> for Error {
             Core::VersionUnavailable => Self::VersionUnavailable,
             Core::Unavailable => Self::Unavailable,
             Core::Overloaded => Self::Overloaded,
+            Core::FlightFull => Self::FlightFull,
             Core::DeadlineExceeded => Self::DeadlineExceeded,
-            Core::Cancelled => Self::Cancelled,
+            Core::Canceled => Self::Canceled,
             Core::Unauthorized => Self::Unauthorized,
             Core::OriginRejected => Self::OriginRejected,
             Core::OriginForbidden => Self::OriginForbidden,
@@ -124,8 +127,9 @@ impl TryFrom<Error> for racer_core::read::Error {
             Error::VersionUnavailable => Core::VersionUnavailable,
             Error::Unavailable => Core::Unavailable,
             Error::Overloaded => Core::Overloaded,
+            Error::FlightFull => Core::FlightFull,
             Error::DeadlineExceeded => Core::DeadlineExceeded,
-            Error::Cancelled => Core::Cancelled,
+            Error::Canceled => Core::Canceled,
             Error::Unauthorized => Core::Unauthorized,
             Error::OriginRejected => Core::OriginRejected,
             Error::OriginForbidden => Core::OriginForbidden,
@@ -140,19 +144,6 @@ impl TryFrom<Error> for racer_core::read::Error {
     }
 }
 
-impl From<controlplane::Error> for Error {
-    fn from(error: controlplane::Error) -> Self {
-        match error {
-            controlplane::Error::Replay => Self::Replay,
-            controlplane::Error::Conflict => Self::IncompatibleMembership,
-            controlplane::Error::Capacity => Self::Overloaded,
-            controlplane::Error::Stale => Self::StaleFlight,
-            controlplane::Error::Pending => Self::Unavailable,
-            controlplane::Error::Internal => Self::Internal,
-        }
-    }
-}
-
 impl From<racer_crypto::identity::BundleError> for Error {
     fn from(error: racer_crypto::identity::BundleError) -> Self {
         match error {
@@ -163,21 +154,21 @@ impl From<racer_crypto::identity::BundleError> for Error {
     }
 }
 
-impl From<racer_crypto::enrollment::Error> for Error {
-    fn from(error: racer_crypto::enrollment::Error) -> Self {
+impl From<crate::enrollment::Error> for Error {
+    fn from(error: crate::enrollment::Error) -> Self {
         match error {
-            racer_crypto::enrollment::Error::Unauthorized => Self::Unauthorized,
-            racer_crypto::enrollment::Error::CorruptRecord => Self::CorruptRecord,
-            racer_crypto::enrollment::Error::InvalidConfiguration => Self::InvalidConfiguration,
-            racer_crypto::enrollment::Error::Io => Self::Io,
-            racer_crypto::enrollment::Error::Wire(error) => error.into(),
+            crate::enrollment::Error::Unauthorized => Self::Unauthorized,
+            crate::enrollment::Error::CorruptRecord => Self::CorruptRecord,
+            crate::enrollment::Error::InvalidConfiguration => Self::InvalidConfiguration,
+            crate::enrollment::Error::Io => Self::Io,
+            crate::enrollment::Error::Wire(error) => error.into(),
         }
     }
 }
 
-impl From<uring_runtime::reactor::filesystem::secure::AccessError> for Error {
-    fn from(error: uring_runtime::reactor::filesystem::secure::AccessError) -> Self {
-        use uring_runtime::reactor::filesystem::secure::AccessError;
+impl From<racer_io::scoped::fs::secure::AccessError> for Error {
+    fn from(error: racer_io::scoped::fs::secure::AccessError) -> Self {
+        use racer_io::scoped::fs::secure::AccessError;
         match error {
             AccessError::MissingMetadata => Self::Io,
             AccessError::PermissionDenied => Self::Unauthorized,
@@ -185,9 +176,9 @@ impl From<uring_runtime::reactor::filesystem::secure::AccessError> for Error {
     }
 }
 
-impl From<racer_object_wire::Error> for Error {
-    fn from(error: racer_object_wire::Error) -> Self {
-        use racer_object_wire::Error as Wire;
+impl From<racer_wire::object::Error> for Error {
+    fn from(error: racer_wire::object::Error) -> Self {
+        use racer_wire::object::Error as Wire;
         match error {
             Wire::InvalidRequest => Self::InvalidRequest,
             Wire::MethodNotAllowed => Self::MethodNotAllowed,
@@ -220,16 +211,16 @@ impl From<flow_control::Error> for Error {
     }
 }
 
-impl From<wire_codec::rest::Error> for Error {
-    fn from(error: wire_codec::rest::Error) -> Self {
+impl From<crate::control::rest::Error> for Error {
+    fn from(error: crate::control::rest::Error) -> Self {
         match error {
-            wire_codec::rest::Error::InvalidConfiguration => Self::InvalidConfiguration,
-            wire_codec::rest::Error::InvalidRequest => Self::InvalidRequest,
-            wire_codec::rest::Error::Unauthorized => Self::Unauthorized,
-            wire_codec::rest::Error::Unavailable => Self::Unavailable,
-            wire_codec::rest::Error::Overloaded => Self::Overloaded,
-            wire_codec::rest::Error::Io => Self::Io,
-            wire_codec::rest::Error::Internal => Self::Internal,
+            crate::control::rest::Error::InvalidConfiguration => Self::InvalidConfiguration,
+            crate::control::rest::Error::InvalidRequest => Self::InvalidRequest,
+            crate::control::rest::Error::Unauthorized => Self::Unauthorized,
+            crate::control::rest::Error::Unavailable => Self::Unavailable,
+            crate::control::rest::Error::Overloaded => Self::Overloaded,
+            crate::control::rest::Error::Io => Self::Io,
+            crate::control::rest::Error::Internal => Self::Internal,
         }
     }
 }
@@ -243,7 +234,7 @@ impl From<rdma_verbs::Error> for Error {
             rdma_verbs::Error::Unavailable => Self::Unavailable,
             rdma_verbs::Error::Overloaded => Self::Overloaded,
             rdma_verbs::Error::DeadlineExceeded => Self::DeadlineExceeded,
-            rdma_verbs::Error::Cancelled => Self::Cancelled,
+            rdma_verbs::Error::Canceled => Self::Canceled,
             rdma_verbs::Error::Io => Self::Io,
         }
     }
@@ -276,28 +267,41 @@ impl From<page_alloc::Error> for Error {
     }
 }
 
-impl From<uring_runtime::Error> for Error {
-    fn from(error: uring_runtime::Error) -> Self {
+impl From<racer_io::Error> for Error {
+    fn from(error: racer_io::Error) -> Self {
         match error {
-            uring_runtime::Error::Cancelled => Self::Cancelled,
-            uring_runtime::Error::DeadlineExceeded => Self::DeadlineExceeded,
-            uring_runtime::Error::Overloaded => Self::Overloaded,
-            uring_runtime::Error::Unavailable => Self::Unavailable,
-            uring_runtime::Error::InvalidConfiguration => Self::InvalidConfiguration,
-            uring_runtime::Error::InvalidInput => Self::InvalidRequest,
-            uring_runtime::Error::NotFound => Self::MissingKey,
-            uring_runtime::Error::AlreadyExists => Self::Replay,
-            uring_runtime::Error::Io => Self::Io,
-            uring_runtime::Error::Os(errno) => Self::Os(errno),
+            racer_io::Error::Canceled => Self::Canceled,
+            racer_io::Error::DeadlineExceeded => Self::DeadlineExceeded,
+            racer_io::Error::Overloaded => Self::Overloaded,
+            racer_io::Error::Unavailable => Self::Unavailable,
+            racer_io::Error::InvalidConfiguration => Self::InvalidConfiguration,
+            racer_io::Error::InvalidInput => Self::InvalidRequest,
+            racer_io::Error::NotFound => Self::MissingKey,
+            racer_io::Error::AlreadyExists => Self::Replay,
+            racer_io::Error::Io => Self::Io,
+            racer_io::Error::Os(errno) => Self::Os(errno),
         }
     }
 }
 
-impl From<uring_runtime::reactor::filesystem::operations::ReplacementError<Error>> for Error {
-    fn from(
-        error: uring_runtime::reactor::filesystem::operations::ReplacementError<Error>,
-    ) -> Self {
-        use uring_runtime::reactor::filesystem::operations::ReplacementError;
+impl From<racer_io::fs::ReplacementError> for Error {
+    fn from(error: racer_io::fs::ReplacementError) -> Self {
+        use racer_io::fs::ReplacementError;
+        match error {
+            ReplacementError::BeforeRename(cause) => cause.into(),
+            ReplacementError::RenameUncertain(cause) => {
+                Self::RenameUncertain(Error::from(cause).into())
+            }
+            ReplacementError::Published(cause) => {
+                Self::PublishedNotDurable(Error::from(cause).into())
+            }
+        }
+    }
+}
+
+impl From<racer_io::scoped::fs::operations::ReplacementError<Error>> for Error {
+    fn from(error: racer_io::scoped::fs::operations::ReplacementError<Error>) -> Self {
+        use racer_io::scoped::fs::operations::ReplacementError;
         match error {
             ReplacementError::BeforeRename(cause) => cause,
             ReplacementError::RenameUncertain(cause) => Self::RenameUncertain(cause.into()),
@@ -325,7 +329,7 @@ mod tests {
     fn publication_causes_and_display_preserve_payloads() {
         use super::{Error, PublicationCause};
         for (error, cause, text) in [
-            (Error::Cancelled, PublicationCause::Cancelled, "Cancelled"),
+            (Error::Canceled, PublicationCause::Canceled, "Canceled"),
             (Error::Os(-1), PublicationCause::Os(-1), "Os(-1)"),
             (
                 Error::UnsatisfiableRangeWithLength(u64::MAX),
@@ -356,19 +360,9 @@ mod tests {
     /// Foundation errors retain authentication and wire distinctions.
     #[test]
     fn control_foundation_errors_preserve_boundary_meanings() {
-        use racer_crypto::enrollment::Error as Enrollment;
+        use crate::enrollment::Error as Enrollment;
         use racer_crypto::identity::BundleError;
-        use uring_runtime::reactor::filesystem::secure::AccessError;
-        for (source, expected) in [
-            (controlplane::Error::Replay, Error::Replay),
-            (controlplane::Error::Conflict, Error::IncompatibleMembership),
-            (controlplane::Error::Capacity, Error::Overloaded),
-            (controlplane::Error::Stale, Error::StaleFlight),
-            (controlplane::Error::Pending, Error::Unavailable),
-            (controlplane::Error::Internal, Error::Internal),
-        ] {
-            assert_eq!(Error::from(source), expected);
-        }
+        use racer_io::scoped::fs::secure::AccessError;
         for (source, expected) in [
             (Enrollment::Unauthorized, Error::Unauthorized),
             (Enrollment::CorruptRecord, Error::CorruptRecord),
@@ -381,10 +375,10 @@ mod tests {
             assert_eq!(Error::from(source), expected);
         }
         for wire in [
-            racer_control_wire::Error::InvalidRequest,
-            racer_control_wire::Error::IncompatibleMembership,
-            racer_control_wire::Error::Overloaded,
-            racer_control_wire::Error::Replay,
+            racer_wire::control::Error::InvalidRequest,
+            racer_wire::control::Error::IncompatibleMembership,
+            racer_wire::control::Error::Overloaded,
+            racer_wire::control::Error::Replay,
         ] {
             assert_eq!(Error::from(Enrollment::Wire(wire)), Error::from(wire));
             assert_eq!(Error::from(BundleError::Wire(wire)), Error::from(wire));
@@ -406,7 +400,7 @@ mod tests {
     /// Wire failures retain their exact application taxonomy at the adapter boundary.
     #[test]
     fn object_wire_errors_keep_racer_boundary_meanings() {
-        use racer_object_wire::Error as Wire;
+        use racer_wire::object::Error as Wire;
         for (wire, app) in [
             (Wire::InvalidRequest, Error::InvalidRequest),
             (Wire::MethodNotAllowed, Error::MethodNotAllowed),
@@ -442,7 +436,7 @@ mod tests {
     fn operation_preserves_local_borrows_and_racer_results() {
         let value = std::rc::Rc::new(7);
         let operation: Operation<'_, _> = Box::pin(async { Ok(*value) });
-        let operation: uring_runtime::Operation<'_, _, Error> = operation;
+        let operation: racer_io::Operation<'_, _, Error> = operation;
         assert_eq!(futures::executor::block_on(operation), Ok(7));
         let operation: Operation<'_, ()> = Box::pin(async { Err(Error::HopBudgetExhausted) });
         assert_eq!(
@@ -476,7 +470,7 @@ mod tests {
             (Verbs::Unavailable, Error::Unavailable),
             (Verbs::Overloaded, Error::Overloaded),
             (Verbs::DeadlineExceeded, Error::DeadlineExceeded),
-            (Verbs::Cancelled, Error::Cancelled),
+            (Verbs::Canceled, Error::Canceled),
             (Verbs::Io, Error::Io),
         ] {
             assert_eq!(Error::from(verbs), racer);
@@ -518,9 +512,9 @@ mod tests {
 
     #[test]
     fn runtime_errors_keep_racer_boundary_meanings() {
-        use uring_runtime::Error as RuntimeError;
+        use racer_io::Error as RuntimeError;
         for (runtime, racer) in [
-            (RuntimeError::Cancelled, Error::Cancelled),
+            (RuntimeError::Canceled, Error::Canceled),
             (RuntimeError::DeadlineExceeded, Error::DeadlineExceeded),
             (RuntimeError::Overloaded, Error::Overloaded),
             (RuntimeError::Unavailable, Error::Unavailable),
@@ -540,14 +534,14 @@ mod tests {
 
     #[test]
     fn replacement_outcomes_preserve_publication_phase() {
-        use uring_runtime::reactor::filesystem::operations::ReplacementError;
+        use racer_io::scoped::fs::operations::ReplacementError;
         assert_eq!(
             Error::from(ReplacementError::BeforeRename(Error::Os(libc::ENOSPC))),
             Error::Os(libc::ENOSPC)
         );
         assert_eq!(
-            Error::from(ReplacementError::RenameUncertain(Error::Cancelled)),
-            Error::RenameUncertain(super::PublicationCause::Cancelled)
+            Error::from(ReplacementError::RenameUncertain(Error::Canceled)),
+            Error::RenameUncertain(super::PublicationCause::Canceled)
         );
         assert_eq!(
             Error::from(ReplacementError::Published(Error::Os(libc::EIO))),

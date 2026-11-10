@@ -27,8 +27,11 @@ use crate::memory::UnverifiedPage;
 use crate::model::PageId;
 use crate::runtime::RequestScope;
 use crate::security::OriginContext;
-use flow_control::coalesce;
+use flow_control::coalesce::flight::state::{
+    Outcome as StateOutcome, Phase as StatePhase, Published,
+};
 use racer_core::read::flight;
+use racer_core::read::flight::{Ticket, WakeTarget};
 use std::cell::RefCell;
 use std::future::poll_fn;
 use std::rc::Rc;
@@ -38,21 +41,25 @@ use std::task::Waker;
 use std::time::Instant;
 
 pub struct Flights {
+    /// This worker's detached driver queue, polled during flight turns.
+    drivers: Rc<crate::drivers::DriverQueue>,
+
     pub(super) admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
 
     availability: Rc<crate::control::Availability>,
-
-    owner: Rc<()>,
 
     limits: FlightLimits,
 
     pub(super) table: RefCell<Table>,
 
-    waiting: uring_runtime::offload::AdmissionQueue<PageId>,
+    waiting: racer_io::xthread::offload::AdmissionQueue<PageId>,
 
-    admission_deadlines: Rc<uring_runtime::environment::Registry>,
+    admission_deadlines: Rc<racer_io::deadline::Registry>,
 
     capacity_wake: CapacityWake,
+
+    /// Flight ages, budget gates, and driver diagnostics.
+    clock: racer_io::Clock,
 }
 
 /// The current FIFO head alone owns this notification.
@@ -60,7 +67,7 @@ type CapacityWake = Rc<RefCell<Option<(u64, Waker)>>>;
 
 /// Retire only this ticket's wake before its queue guard can wake a successor.
 struct AdmissionTicket<'a> {
-    ticket: Option<uring_runtime::offload::CapacityWaiter<'a, PageId>>,
+    ticket: Option<racer_io::xthread::offload::CapacityWaiter<'a, PageId>>,
 
     wake: CapacityWake,
 
@@ -107,23 +114,76 @@ impl Drop for FlightCharge {
 /// Local caps in addition to shared admission quotas.
 pub use flight::FlightLimits;
 
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "dst")))]
 type FlightHashState = std::collections::hash_map::RandomState;
-#[cfg(test)]
+#[cfg(any(test, feature = "dst"))]
 type FlightHashState = crate::runtime::HashState;
-pub(super) type Table = coalesce::flight::Table<PageId, Entry, FlightHashState>;
-pub(super) struct Entry {
+/// Production page flight payloads; the same [`flight::PageFlightTable`] family the core
+/// `WorkerCore` owns, instantiated with real pages, wakers, and admission charges.
+pub(super) struct ProductionFlights;
+
+impl flight::PageFlightTypes for ProductionFlights {
+    type Page = PageId;
+    type Complete = PageResult;
+    type Partial = UnverifiedPage;
+    type Outcome = AcquiredPage;
+    type Result = ();
+    type Hash = FlightHashState;
+    type Wake = WakeTarget;
+    type Waiter = WaiterRecord;
+    type Ext = EntryExt;
+    type Retained = Retained;
+}
+
+pub(super) type Table = flight::PageFlightTable<ProductionFlights>;
+type Entry = flight::FlightEntry<
+    PageResult,
+    UnverifiedPage,
+    AcquiredPage,
+    (),
+    WakeTarget,
+    WaiterRecord,
+    EntryExt,
+    Retained,
+>;
+
+/// What production keeps per page flight beyond the shared table state.
+pub(super) struct EntryExt {
     created: Instant,
 
     diagnostic: Option<DriverDiagnostic>,
 
-    fence: Fence,
-    state: FlightCore,
     /// Driver polling a handover-enabled operation, woken when a waiter detaches or is canceled so
     /// it re-evaluates whether any live waiter still needs the work.
     driver_waker: Option<Waker>,
-    operations: coalesce::flight::Operations<Retained, FlightHashState>,
+
     _reservation: FlightCharge,
+}
+
+/// Every `Flights` gets its own table fence, so capabilities never cross tables.
+fn next_fence() -> flight::Fence {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    flight::Fence(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Table-level stale capabilities are `StaleFlight` here.
+fn stale(error: racer_core::read::Error) -> Error {
+    if error == racer_core::read::Error::Internal {
+        Error::StaleFlight
+    } else {
+        error.into()
+    }
+}
+
+/// Park `waker` in `slot`, returning a replaced target to drop outside the table borrow.
+fn store_waker(slot: &mut Option<WakeTarget>, waker: &Waker) -> Option<WakeTarget> {
+    if slot
+        .as_ref()
+        .is_some_and(|current| current.0.will_wake(waker))
+    {
+        return None;
+    }
+    slot.replace(WakeTarget(waker.clone()))
 }
 
 /// Driver-owned call boundary, not a backend execution state.
@@ -137,8 +197,8 @@ pub(crate) enum DriverStage {
     DiskReadCall,
     /// Serial decrypt call, including admission and completion delivery.
     DecryptCall,
-    /// Serial checksum call, including admission and completion delivery.
-    ChecksumCall,
+    /// Serial tag check call, including admission and completion delivery.
+    TagCheckCall,
     /// Composite candidate work, including concurrent hedges and nested validation.
     CandidateCompositeCall,
     /// Plaintext reservation and bounded reclamation.
@@ -155,7 +215,7 @@ pub(crate) enum DriverStage {
 
 /// One generation's scalar observation, allocated once at driver handoff.
 #[derive(Clone)]
-pub(super) struct DriverDiagnostic(Rc<std::cell::Cell<DriverObservation>>);
+pub(super) struct DriverDiagnostic(Rc<std::cell::Cell<DriverObservation>>, racer_io::Clock);
 
 /// Facts observed by this driver only, never inferred from lifecycle state.
 #[derive(Clone, Copy)]
@@ -204,7 +264,7 @@ impl DriverDiagnostic {
     pub(super) fn set(&self, stage: DriverStage) {
         let mut state = self.0.get();
         state.stage = stage;
-        state.since = uring_runtime::environment::now();
+        state.since = self.1.now();
         self.0.set(state);
     }
 
@@ -220,9 +280,7 @@ impl DriverDiagnostic {
     /// Latch the first observed request to cancel this driver's owned scope.
     pub(super) fn cancellation_seen(&self) {
         let mut state = self.0.get();
-        state
-            .cancel_seen
-            .get_or_insert_with(uring_runtime::environment::now);
+        state.cancel_seen.get_or_insert_with(|| self.1.now());
         self.0.set(state);
     }
 
@@ -231,42 +289,28 @@ impl DriverDiagnostic {
         DriverLifetime(diagnostic)
     }
 }
-type FlightCore =
-    coalesce::flight::state::State<PageResult, UnverifiedPage, AcquiredPage, WaiterRecord>;
-impl std::ops::Deref for Entry {
-    type Target = FlightCore;
-    fn deref(&self) -> &Self::Target {
-        &self.state
-    }
-}
-impl std::ops::DerefMut for Entry {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.state
-    }
-}
 pub(super) struct WaiterRecord {
     scope: RequestScope,
     pub(super) budget_deadline: Instant,
     _reservation: flow_control::Charge<AdmissionPolicy>,
 }
-impl coalesce::flight::state::WaiterPolicy for WaiterRecord {
+impl flow_control::coalesce::flight::state::WaiterPolicy for WaiterRecord {
     type Error = Error;
     fn check(&self) -> Option<Error> {
         self.scope.check().err().or_else(|| {
-            (uring_runtime::environment::now() >= self.budget_deadline)
-                .then_some(Error::DeadlineExceeded)
+            (self.scope.clock().now() >= self.budget_deadline).then_some(Error::DeadlineExceeded)
         })
     }
     fn deadline(&self) -> Instant {
         self.scope.deadline.0.min(self.budget_deadline)
     }
 }
-struct Retained {
-    _resources: telemetry::Lease,
+pub(super) struct Retained {
+    _resources: crate::telemetry::primitives::Lease,
     _reservation: flow_control::Charge<AdmissionPolicy>,
 }
-pub(super) type Outcome = coalesce::flight::state::Outcome<AcquiredPage, Error>;
-pub(super) type Phase = coalesce::flight::state::Phase<PageResult, AcquiredPage, Error>;
+pub(super) type Outcome = StateOutcome<AcquiredPage, Error>;
+pub(super) type Phase = StatePhase<PageResult, AcquiredPage, Error>;
 pub(super) trait PhaseState {
     fn state(&self) -> FlightState;
 }
@@ -289,15 +333,15 @@ impl PhaseState for Phase {
 /// must continue owning the table until `drain` succeeds.
 pub struct FlightOperation {
     flights: Rc<Flights>,
-    pub(super) fence: Fence,
-    pub(super) id: u64,
+    pub(super) page: PageId,
+    pub(super) operation: flight::Operation,
     /// Wake at the deadline of the waiter the operation currently serves, so
     /// a handed-over operation observes the end of its last adopter.
-    alarm: Option<(Instant, uring_runtime::environment::Registration)>,
+    alarm: Option<(Instant, racer_io::deadline::Registration)>,
 }
 impl FlightOperation {
     pub fn complete(self) -> Result<()> {
-        self.flights.complete_operation(&self.fence, self.id)
+        self.flights.complete_operation(&self.page, self.operation)
     }
 
     /// Allows a completion owner to observe revoked leadership and request actual
@@ -312,23 +356,22 @@ impl FlightOperation {
     /// the acquisition was revoked, settled, or stopped.
     fn leader_deadline(&self, waker: Option<&Waker>) -> Option<Instant> {
         self.flights.update(|table, wakes| {
-            if table.is_stopping() {
+            if table.is_stopping() || !table.owns(&self.page, &self.operation) {
                 return None;
             }
-            let entry = table.get_mut(&self.fence.page)?;
-            self.fence.validate(&entry.fence).ok()?;
-            refresh(entry, wakes);
+            let entry = table.refresh_entry(&self.page, wakes)?;
             if let Some(waker) = waker {
-                match &mut entry.driver_waker {
+                match &mut entry.ext_mut().driver_waker {
                     Some(current) if current.will_wake(waker) => {}
                     slot => *slot = Some(waker.clone()),
                 }
             }
-            let waiter = entry.leader.and_then(|id| entry.waiters.get(&id))?;
-            if !matches!(entry.phase, Phase::Acquiring) || waiter.scope.check().is_err() {
+            let state = entry.state();
+            let waiter = state.leader.and_then(|id| state.waiters.get(&id))?;
+            if !matches!(state.phase, Phase::Acquiring) || waiter.scope.check().is_err() {
                 return None;
             }
-            entry.state.leader_deadline()
+            state.leader_deadline()
         })
     }
 
@@ -363,36 +406,6 @@ impl FlightOperation {
 /// ```
 pub use racer_core::read::AcquisitionBudget;
 
-/// Includes table identity to reject tokens from another worker/table, plus entry
-/// incarnation and acquisition generation to fence remove/rejoin and retry races.
-/// Counters must never wrap; drain/restart the owner before exhaustion.
-#[derive(Clone)]
-pub(super) struct Fence {
-    pub(super) page: PageId,
-    pub(super) identity: coalesce::flight::Identity,
-}
-impl std::ops::Deref for Fence {
-    type Target = coalesce::flight::Identity;
-    fn deref(&self) -> &Self::Target {
-        &self.identity
-    }
-}
-impl std::ops::DerefMut for Fence {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.identity
-    }
-}
-impl Fence {
-    pub(super) fn validate(&self, current: &Self) -> Result<()> {
-        if self.page != current.page {
-            return Err(Error::StaleFlight);
-        }
-        self.identity
-            .validate(&current.identity)
-            .map_err(|_| Error::StaleFlight)
-    }
-}
-
 /// Unique publication capability. Resources live in the worker table, not here.
 /// Membership/authority are acquisition state, never part of the flight key.
 /// ```compile_fail
@@ -401,8 +414,9 @@ impl Fence {
 /// ```
 pub struct FlightLeader {
     pub(super) flights: Rc<Flights>,
-    pub(super) fence: Fence,
-    pub(super) caller: u64,
+    pub(super) page: PageId,
+    /// Table fence, entry incarnation, acquisition generation, and elected waiter.
+    pub(super) ticket: Ticket,
     pub(super) active: bool,
 }
 
@@ -425,10 +439,10 @@ pub struct AcquisitionWaiter<'a> {
 
 pub(super) struct Registration {
     flights: Rc<Flights>,
-    cancellation: uring_runtime::environment::CancellationRegistration,
-    // Waiters survive acquisition generations. Match owner/page/incarnation/id
-    // for registration, then refresh this generation only on a new election.
-    fence: Fence,
+    cancellation: racer_io::CancelWait,
+    // Waiters survive acquisition generations: match page, incarnation, and id.
+    page: PageId,
+    incarnation: u64,
     pub(super) id: u64,
     attached: bool,
 }
@@ -470,7 +484,7 @@ pub enum AcquisitionEvent {
 pub struct AcquisitionContext<'a> {
     pub origin: &'a OriginContext,
     pub scope: &'a RequestScope,
-    pub(crate) cancellation: &'a uring_runtime::environment::CancellationRegistration,
+    pub(crate) cancellation: &'a racer_io::CancelWait,
     pub membership: &'a std::sync::Arc<crate::topology::Membership>,
     pub budget: &'a mut AcquisitionBudget,
 }
@@ -493,18 +507,19 @@ impl AcquisitionWaiter<'_> {
         poll_fn(|cx| {
             let flights = self.registration.flights.clone();
             let mut retired = None;
+            let registration = &self.registration;
             let result = flights.update(|table, _wakes| {
-                let entry = match registered(table, &self.registration) {
-                    Ok(entry) => entry,
+                match registered(table, registration) {
+                    Ok(()) => {}
                     Err(Error::StaleFlight) => return Poll::Ready(Ok(())),
                     Err(error) => return Poll::Ready(Err(error)),
-                };
-                if entry.operations.is_empty() {
+                }
+                if table.operations(&registration.page) == 0 {
                     return Poll::Ready(Ok(()));
                 }
-                let waiter = entry.state.waiters.get_mut(&self.registration.id).unwrap();
-                retired =
-                    coalesce::flight::state::store_waker(&mut waiter.waker, cx.waker().clone());
+                table.park(&registration.page, registration.id, |slot| {
+                    retired = store_waker(slot, cx.waker());
+                });
                 Poll::Pending
             });
             drop(retired);
@@ -524,30 +539,24 @@ impl AcquisitionWaiter<'_> {
                 return Poll::Ready(Ok(AcquisitionEvent::Failed(error)));
             }
             let flights = self.registration.flights.clone();
-            let mut waker = Some(cx.waker().clone());
             let mut retired = None;
+            let (page, id) = (&self.registration.page, self.registration.id);
+            let budget = &self.budget;
             let result = flights.update(|table, wakes| {
-                let entry = match registered(table, &self.registration) {
-                    Ok(entry) => entry,
-                    Err(error) => return Poll::Ready(Err(error)),
-                };
-                refresh(entry, wakes);
-                let idle = entry.operations.is_empty();
-                let event = flight::wait(
-                    &mut entry.state,
-                    self.registration.id,
-                    &mut entry.fence.identity,
-                    flights.limits.generations_per_flight,
-                    self.budget.deadline(),
-                    self.budget.remaining_attempts(),
-                    idle,
-                    uring_runtime::environment::now,
-                    split_result,
+                if let Err(error) = registered(table, &self.registration) {
+                    return Poll::Ready(Err(error));
+                }
+                let event = match table.wait(
+                    page,
+                    id,
+                    budget.deadline(),
+                    budget.remaining_attempts(),
                     wakes,
-                    |slot| {
-                        retired = coalesce::flight::state::store_waker(slot, waker.take().unwrap())
-                    },
-                );
+                    |slot| retired = store_waker(slot, cx.waker()),
+                ) {
+                    Ok(event) => event,
+                    Err(error) => return Poll::Ready(Err(stale(error))),
+                };
                 Poll::Ready(Ok(match event {
                     flight::Wait::Pending => return Poll::Pending,
                     flight::Wait::Ready(flight::Settled::Complete(result)) => {
@@ -558,12 +567,14 @@ impl AcquisitionWaiter<'_> {
                     }
                     flight::Wait::Failed(error) => AcquisitionEvent::Failed(error),
                     flight::Wait::Lead => {
-                        self.registration.fence.generation = entry.fence.generation;
-                        entry.diagnostic = None;
+                        let ticket = table.ticket(page, id).expect("elected leader");
+                        if let Some(entry) = table.entry_mut(page) {
+                            entry.ext_mut().diagnostic = None;
+                        }
                         AcquisitionEvent::Lead(FlightLeader {
                             flights: flights.clone(),
-                            fence: entry.fence.clone(),
-                            caller: self.registration.id,
+                            page: page.clone(),
+                            ticket,
                             active: true,
                         })
                     }
@@ -576,15 +587,19 @@ impl AcquisitionWaiter<'_> {
 
     pub fn acquisition<'a>(&'a mut self, leader: &FlightLeader) -> Result<AcquisitionContext<'a>> {
         self.scope.check()?;
-        validate_context(&leader.fence.page, self.context)?;
-        if self.registration.id != leader.caller {
+        validate_context(&leader.page, self.context)?;
+        if self.registration.id != leader.ticket.waiter
+            || self.registration.page != leader.page
+            || self.registration.incarnation != leader.ticket.incarnation
+        {
             return Err(Error::StaleFlight);
         }
-        self.registration.fence.validate(&leader.fence)?;
         self.registration.flights.update(|table, wakes| {
-            let entry = registered(table, &self.registration)?;
-            refresh(entry, wakes);
-            validate_leader(entry, leader)
+            registered(table, &self.registration)?;
+            table
+                .leader_entry(&leader.page, &leader.ticket, wakes)
+                .map(drop)
+                .map_err(stale)
         })?;
         Ok(AcquisitionContext {
             origin: self.context,
@@ -612,17 +627,19 @@ impl CopyWaiter<'_> {
                 self.registration.cancel(error);
                 return Poll::Ready(Err(error));
             }
-            let mut waker = Some(cx.waker().clone());
             let mut retired = None;
-            let result = self.registration.flights.update(|table, wakes| {
-                let entry = match registered(table, &self.registration) {
-                    Ok(entry) => entry,
-                    Err(error) => return Poll::Ready(Err(error)),
-                };
-                refresh(entry, wakes);
-                let parked = flight::copy_wait(&mut entry.state, self.registration.id, |slot| {
-                    retired = coalesce::flight::state::store_waker(slot, waker.take().unwrap());
-                });
+            let registration = &self.registration;
+            let result = registration.flights.update(|table, wakes| {
+                if let Err(error) = registered(table, registration) {
+                    return Poll::Ready(Err(error));
+                }
+                let parked =
+                    match table.copy_wait(&registration.page, registration.id, wakes, |slot| {
+                        retired = store_waker(slot, cx.waker());
+                    }) {
+                        Ok(parked) => parked,
+                        Err(error) => return Poll::Ready(Err(stale(error))),
+                    };
                 match parked {
                     None => Poll::Pending,
                     Some(result) => Poll::Ready(result.map(|settled| match settled {
@@ -638,24 +655,33 @@ impl CopyWaiter<'_> {
 }
 
 impl Flights {
+    /// The flights' clock.
+    pub(crate) fn clock(&self) -> &racer_io::Clock {
+        &self.clock
+    }
+
     /// Attach a fresh generation without refreshing state or touching wake ownership.
     pub(super) fn driver_diagnostic(&self, leader: &FlightLeader) -> Option<DriverDiagnostic> {
-        let diagnostic = DriverDiagnostic(Rc::new(std::cell::Cell::new(DriverObservation {
-            stage: DriverStage::Starting,
-            since: uring_runtime::environment::now(),
-            cancel_seen: None,
-            abandoned: false,
-        })));
+        let diagnostic = DriverDiagnostic(
+            Rc::new(std::cell::Cell::new(DriverObservation {
+                stage: DriverStage::Starting,
+                since: self.clock.now(),
+                cancel_seen: None,
+                abandoned: false,
+            })),
+            self.clock.clone(),
+        );
         let mut table = self.table.borrow_mut();
-        let entry = table.get_mut(&leader.fence.page)?;
-        validate_leader(entry, leader).ok()?;
-        entry.diagnostic = Some(diagnostic.clone());
+        table.validate(&leader.page, &leader.ticket).ok()?;
+        table.entry_mut(&leader.page)?.ext_mut().diagnostic = Some(diagnostic.clone());
         Some(diagnostic)
     }
 
     pub fn new(
         admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
         availability: Rc<crate::control::Availability>,
+        clock: racer_io::Clock,
+        drivers: Rc<crate::drivers::DriverQueue>,
     ) -> Self {
         let limits = FlightLimits {
             entries: admission.policy().limits().flights.get(),
@@ -664,16 +690,23 @@ impl Flights {
             generations_per_flight: 1024,
         };
         Self {
+            drivers,
             admission: admission.clone(),
             availability,
-            owner: Rc::new(()),
             limits,
-            table: RefCell::new(Table::default()),
-            waiting: uring_runtime::offload::AdmissionQueue::new(
+            table: RefCell::new(Table::with_fence(
+                next_fence(),
+                limits,
+                split_result,
+                clock.now(),
+                FlightHashState::default(),
+            )),
+            waiting: racer_io::xthread::offload::AdmissionQueue::new(
                 admission.policy().limits().queue_entries,
             ),
             admission_deadlines: Rc::default(),
             capacity_wake: Rc::default(),
+            clock,
         }
     }
 
@@ -681,6 +714,8 @@ impl Flights {
         admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
         availability: Rc<crate::control::Availability>,
         limits: FlightLimits,
+        clock: racer_io::Clock,
+        drivers: Rc<crate::drivers::DriverQueue>,
     ) -> Result<Self> {
         if limits.entries == 0
             || limits.waiters_per_flight == 0
@@ -690,16 +725,23 @@ impl Flights {
             return Err(Error::InvalidConfiguration);
         }
         Ok(Self {
+            drivers,
             admission: admission.clone(),
             availability,
-            owner: Rc::new(()),
             limits,
-            table: RefCell::new(Table::default()),
-            waiting: uring_runtime::offload::AdmissionQueue::new(
+            table: RefCell::new(Table::with_fence(
+                next_fence(),
+                limits,
+                split_result,
+                clock.now(),
+                FlightHashState::default(),
+            )),
+            waiting: racer_io::xthread::offload::AdmissionQueue::new(
                 admission.policy().limits().queue_entries,
             ),
             admission_deadlines: Rc::default(),
             capacity_wake: Rc::default(),
+            clock,
         })
     }
 
@@ -711,14 +753,15 @@ impl Flights {
             return Err(Error::Unavailable);
         }
         let result = entry.and_then(|entry| {
-            if let Phase::Complete(result) = &entry.phase {
+            let state = entry.state();
+            if let Phase::Complete(result) = &state.phase {
                 return Some(result.copy());
             }
-            entry
+            state
                 .partial
                 .as_ref()
                 .map(|p| p.copy.clone())
-                .or_else(|| match &entry.phase {
+                .or_else(|| match &state.phase {
                     Phase::Draining(Outcome::Published(result)) => Some(result.copy()),
                     _ => None,
                 })
@@ -740,7 +783,7 @@ impl Flights {
     pub(super) fn admit_local(
         &self,
         page: &PageId,
-        key: Option<racer_control_wire::KeyId>,
+        key: Option<racer_wire::control::KeyId>,
     ) -> Result<()> {
         let cache = &page.version.object.cache;
         if !self.availability.cache(cache) {
@@ -752,8 +795,18 @@ impl Flights {
         Ok(())
     }
 
-    fn update<T>(&self, f: impl FnOnce(&mut Table, &mut Vec<Waker>) -> T) -> T {
-        coalesce::flight::update(&self.table, f)
+    /// Run one table transaction at the current time, then wake outside the borrow.
+    fn update<T>(&self, f: impl FnOnce(&mut Table, &mut Vec<WakeTarget>) -> T) -> T {
+        let mut wakes = Vec::new();
+        let result = {
+            let mut table = self.table.borrow_mut();
+            table.set_now(self.clock.now());
+            f(&mut table, &mut wakes)
+        };
+        for wake in wakes {
+            wake.wake();
+        }
+        result
     }
 
     /// Validate context.object against page.version.object before registration.
@@ -783,10 +836,10 @@ impl Flights {
         validate_context(&page, context)?;
         scope.check()?;
         if self.table.borrow().is_stopping() {
-            return Err(Error::Cancelled);
+            return Err(Error::Canceled);
         }
-        if !self.table.borrow().contains_key(&page) {
-            if uring_runtime::environment::now() >= budget.deadline() {
+        if !self.table.borrow().contains(&page) {
+            if self.clock.now() >= budget.deadline() {
                 return Err(Error::DeadlineExceeded);
             }
             if budget.remaining_attempts() == 0 {
@@ -824,45 +877,43 @@ impl Flights {
     ) -> Result<JoinedFlight<'a>> {
         validate_context(&page, context)?;
         scope.check()?;
-        let mut rejected = None;
         let mut gate = crate::telemetry::JoinGate::Unclassified;
         let mut occupancy = (None, None);
         let mut quota_detail = None;
         let page_number = page.number.0;
         let result = self.update(|table, wakes| {
             if table.is_stopping() {
-                return Err(Error::Cancelled);
+                return Err(Error::Canceled);
             }
-            self.admit_join(&page, table.get(&page))?;
-            if let Some(entry) = table.get_mut(&page) {
-                refresh(entry, wakes);
-                match flight::join_existing(&entry.state, plaintext, &self.limits) {
-                    Ok(None) => {}
-                    Ok(Some(flight::Settled::Complete(result))) => {
-                        return Ok(JoinedFlight::Complete(result));
+            self.admit_join(&page, table.entry(&page))?;
+            match table.join_existing(&page, plaintext, wakes) {
+                Ok(None) => {}
+                Ok(Some(flight::Settled::Complete(result))) => {
+                    return Ok(JoinedFlight::Complete(result));
+                }
+                Ok(Some(flight::Settled::Partial(copy))) => {
+                    return Ok(JoinedFlight::Ciphertext(copy));
+                }
+                Err(reject) => {
+                    if reject == flight::JoinReject::WaiterCap {
+                        gate = crate::telemetry::JoinGate::WaiterCap;
+                        occupancy = (
+                            Some(table.waiters(&page)),
+                            Some(self.limits.waiters_per_flight),
+                        );
+                    } else {
+                        gate = crate::telemetry::JoinGate::ExistingFailed;
                     }
-                    Ok(Some(flight::Settled::Partial(copy))) => {
-                        return Ok(JoinedFlight::Ciphertext(copy));
-                    }
-                    Err(reject) => {
-                        if reject == flight::JoinReject::WaiterCap {
-                            gate = crate::telemetry::JoinGate::WaiterCap;
-                            occupancy = (
-                                Some(entry.waiters.len()),
-                                Some(self.limits.waiters_per_flight),
-                            );
-                        } else {
-                            gate = crate::telemetry::JoinGate::ExistingFailed;
-                        }
-                        return Err(reject.error());
-                    }
+                    return Err(reject.error());
                 }
             }
             flight::join_budget_gate(
-                uring_runtime::environment::now(),
+                self.clock.now(),
                 budget.deadline(),
                 budget.remaining_attempts(),
-                table.get(&page).is_some_and(|e| e.partial.is_some()),
+                table
+                    .entry(&page)
+                    .is_some_and(|e| e.state().partial.is_some()),
             )?;
             let cancellation = scope.cancellation.subscribe()?;
             let (reservation, detail) =
@@ -878,20 +929,13 @@ impl Flights {
                 gate = crate::telemetry::JoinGate::WaiterQuota;
                 quota_detail = detail;
             })?;
-            let id = table.next_waiter_id().map_err(|_| {
-                gate = crate::telemetry::JoinGate::WaiterId;
-                Error::Overloaded
-            })?;
-            if !table.contains_key(&page) {
-                if flight::entry_cap_gate(table.len(), &self.limits).is_err() {
+            let id = table.next_waiter_id();
+            if !table.contains(&page) {
+                if table.entry_capacity().is_err() {
                     gate = crate::telemetry::JoinGate::EntryCap;
                     occupancy = (Some(table.len()), Some(self.limits.entries));
                     return Err(Error::Overloaded);
                 }
-                let identity = table.identity(self.owner.clone()).map_err(|_| {
-                    gate = crate::telemetry::JoinGate::Identity;
-                    Error::Overloaded
-                })?;
                 let (flight, detail) = crate::admission::capture_rejection(&self.admission, || {
                     if let Some(flight) = prepared_flight.take() {
                         return Ok(flight);
@@ -905,28 +949,16 @@ impl Flights {
                     gate = crate::telemetry::JoinGate::FlightQuota;
                     quota_detail = detail;
                 })?;
-                if let Err(owned) = table.insert(
-                    page.clone(),
-                    Entry {
-                        created: uring_runtime::environment::now(),
-                        diagnostic: None,
-                        fence: Fence {
-                            page: page.clone(),
-                            identity,
-                        },
-                        state: FlightCore::default(),
-                        driver_waker: None,
-                        operations: coalesce::flight::Operations::default(),
-                        _reservation: flight,
-                    },
-                ) {
-                    rejected = Some(owned);
-                    gate = crate::telemetry::JoinGate::Insert;
-                    return Err(Error::Overloaded);
-                }
+                let ext = EntryExt {
+                    created: self.clock.now(),
+                    diagnostic: None,
+                    driver_waker: None,
+                    _reservation: flight,
+                };
+                table.insert(page.clone(), ext, ());
             }
-            let entry = table.get_mut(&page).unwrap();
-            entry.state.register(
+            table.register_as(
+                &page,
                 id,
                 WaiterRecord {
                     scope: scope.clone(),
@@ -936,11 +968,13 @@ impl Flights {
                 true,
                 plaintext,
             );
+            let incarnation = table.entry(&page).expect("registered").incarnation();
             Ok(JoinedFlight::Waiter(AcquisitionWaiter {
                 registration: Registration {
                     flights: self.clone(),
                     cancellation,
-                    fence: entry.fence.clone(),
+                    page: page.clone(),
+                    incarnation,
                     id,
                     attached: true,
                 },
@@ -950,14 +984,13 @@ impl Flights {
                 budget,
             }))
         });
-        drop(rejected);
         if result.is_ok() {
             self.waiting.wake_if(
                 self.admission.policy().limits().queue_entries.get(),
                 |waiting| waiting == &page,
             );
         }
-        if matches!(result, Err(Error::Overloaded)) {
+        if matches!(result, Err(Error::Overloaded | Error::FlightFull)) {
             self.admission.policy().observer().gate_rejection(
                 scope,
                 Some(page_number),
@@ -984,14 +1017,14 @@ impl Flights {
     ) -> Result<JoinedFlight<'a>> {
         validate_context(&page, context)?;
         scope.check()?;
-        if self.table.borrow().contains_key(&page) {
+        if self.table.borrow().contains(&page) {
             return self.join(page, membership, context, scope, budget);
         }
         if self.table.borrow().is_stopping() {
-            return Err(Error::Cancelled);
+            return Err(Error::Canceled);
         }
         self.admit_join(&page, None)?;
-        if uring_runtime::environment::now() >= budget.deadline() {
+        if self.clock.now() >= budget.deadline() {
             return Err(Error::DeadlineExceeded);
         }
         if budget.remaining_attempts() == 0 {
@@ -1006,7 +1039,7 @@ impl Flights {
         {
             return self.join(page, membership, context, scope, budget);
         }
-        let cutoff = uring_runtime::environment::now() + std::time::Duration::from_millis(100);
+        let cutoff = self.clock.now() + std::time::Duration::from_millis(100);
         let deadline = cutoff.min(scope.deadline.0).min(budget.deadline());
         let (reservation, detail) = crate::admission::capture_rejection(&self.admission, || {
             self.admission
@@ -1037,14 +1070,14 @@ impl Flights {
             cancellation.register(cx.waker());
             let _ = expiry.poll_expired(cx);
             if let Err(error) = scope.check() {
-                reason = if error == Error::Cancelled {
-                    crate::telemetry::WaitGate::Cancelled
+                reason = if error == Error::Canceled {
+                    crate::telemetry::WaitGate::Canceled
                 } else {
                     crate::telemetry::WaitGate::ScopeDeadline
                 };
                 return Poll::Ready(Err(error));
             }
-            let now = uring_runtime::environment::now();
+            let now = self.clock.now();
             if now >= budget.deadline() {
                 reason = crate::telemetry::WaitGate::BudgetDeadline;
                 return Poll::Ready(Err(Error::DeadlineExceeded));
@@ -1055,21 +1088,21 @@ impl Flights {
                 return Poll::Ready(Err(Error::Overloaded));
             }
             if self.table.borrow().is_stopping() {
-                reason = crate::telemetry::WaitGate::Cancelled;
-                return Poll::Ready(Err(Error::Cancelled));
+                reason = crate::telemetry::WaitGate::Canceled;
+                return Poll::Ready(Err(Error::Canceled));
             }
-            self.admit_join(&page, self.table.borrow().get(&page))?;
-            if self.table.borrow().contains_key(&page) {
+            self.admit_join(&page, self.table.borrow().entry(&page))?;
+            if self.table.borrow().contains(&page) {
                 return Poll::Ready(Ok(None));
             }
             if budget.remaining_attempts() == 0 {
                 return Poll::Ready(Err(Error::Unavailable));
             }
             if ticket.is_none() {
-                let entered = match self.waiting.enter(page.clone(), cx) {
+                let entered = match self.waiting.enter(page.clone(), self.clock.now(), cx) {
                     Ok(ticket) => ticket,
                     Err(error) => {
-                        reason = if error == uring_runtime::Error::Overloaded {
+                        reason = if error == racer_io::Error::Overloaded {
                             crate::telemetry::WaitGate::QueueFull
                         } else {
                             crate::telemetry::WaitGate::QueueAdmissionRejected
@@ -1172,31 +1205,35 @@ impl Flights {
         let table = self.table.borrow();
         let entries = table.sample::<6>().map(|entry| {
             entry.map(|entry| crate::telemetry::FlightExpiryEntry {
-                age_us: age(entry.created),
-                lifecycle: entry.phase.state(),
+                age_us: age(entry.ext().created),
+                lifecycle: entry.state().phase.state(),
                 stage: entry
+                    .ext()
                     .diagnostic
                     .as_ref()
                     .map(|diagnostic| diagnostic.0.get().stage),
                 stage_age_us: entry
+                    .ext()
                     .diagnostic
                     .as_ref()
                     .map(|diagnostic| age(diagnostic.0.get().since)),
                 cancel_request_seen_age_us: entry
+                    .ext()
                     .diagnostic
                     .as_ref()
                     .and_then(|diagnostic| diagnostic.0.get().cancel_seen.map(age)),
                 driver_abandoned: entry
+                    .ext()
                     .diagnostic
                     .as_ref()
                     .is_some_and(|diagnostic| diagnostic.0.get().abandoned),
-                waiters: entry.waiters.len(),
-                operations: entry.operations.len(),
-                completing: entry.operations.completing(),
+                waiters: entry.state().waiters.len(),
+                operations: entry.operations(),
+                completing: entry.completing(),
             })
         });
         crate::telemetry::FlightExpiry {
-            observed_unix_ms: crate::telemetry::timestamp(now),
+            observed_unix_ms: crate::telemetry::timestamp(&self.clock, now),
             overshoot_us: age(cutoff),
             queue,
             caller_head: ticket.map(|ticket| Some(ticket.sequence()) == queue.head),
@@ -1304,16 +1341,15 @@ impl Flights {
         let mut quota_detail = None;
         let result = self.update(|table, wakes| {
             if table.is_stopping() {
-                return Err(Error::Cancelled);
+                return Err(Error::Canceled);
             }
-            let Some(entry) = table.get_mut(page) else {
+            let Some(entry) = table.entry(page) else {
                 return Ok(JoinedCopy::Miss);
             };
             if self.admit_join(page, Some(entry)).is_err() {
                 return Ok(JoinedCopy::Miss);
             }
-            refresh(entry, wakes);
-            match flight::join_copy_existing(&entry.state, &self.limits) {
+            match table.join_copy_existing(page, wakes) {
                 Ok(flight::CopyJoin::Register) => {}
                 Ok(flight::CopyJoin::Miss) => return Ok(JoinedCopy::Miss),
                 Ok(flight::CopyJoin::Settled(flight::Settled::Complete(result))) => {
@@ -1325,7 +1361,7 @@ impl Flights {
                 Err(error) => {
                     gate = crate::telemetry::JoinGate::WaiterCap;
                     occupancy = (
-                        Some(entry.waiters.len()),
+                        Some(table.waiters(page)),
                         Some(self.limits.waiters_per_flight),
                     );
                     return Err(error);
@@ -1342,12 +1378,9 @@ impl Flights {
                 gate = crate::telemetry::JoinGate::WaiterQuota;
                 quota_detail = detail;
             })?;
-            let id = table.next_waiter_id().map_err(|_| {
-                gate = crate::telemetry::JoinGate::WaiterId;
-                Error::Overloaded
-            })?;
-            let entry = table.get_mut(page).expect("existing copy flight");
-            entry.state.register(
+            let id = table.next_waiter_id();
+            table.register_as(
+                page,
                 id,
                 WaiterRecord {
                     scope: scope.clone(),
@@ -1357,18 +1390,23 @@ impl Flights {
                 false,
                 false,
             );
+            let incarnation = table
+                .entry(page)
+                .expect("existing copy flight")
+                .incarnation();
             Ok(JoinedCopy::Waiter(CopyWaiter {
                 registration: Registration {
                     flights: self.clone(),
                     cancellation,
-                    fence: entry.fence.clone(),
+                    page: page.clone(),
+                    incarnation,
                     id,
                     attached: true,
                 },
                 scope,
             }))
         });
-        if matches!(result, Err(Error::Overloaded)) {
+        if matches!(result, Err(Error::Overloaded | Error::FlightFull)) {
             self.admission.policy().observer().gate_rejection(
                 scope,
                 Some(page.number.0),
@@ -1395,30 +1433,27 @@ impl Flights {
     /// Whether `page` has an acquisition running on this worker, so a new
     /// waiter would join it (successor hints, `racer_core::read::hints`).
     pub(crate) fn acquiring(&self, page: &PageId) -> bool {
-        self.table
-            .borrow()
-            .get(page)
-            .is_some_and(|entry| matches!(entry.state.phase, Phase::Acquiring))
+        self.table.borrow().acquiring(page)
     }
 
     /// Let `leader`'s running operation continue for another live acquisition waiter when `leader`
     /// expires or is canceled. Only for drivers whose caller does not fence on the operation.
     pub(crate) fn allow_handover(&self, leader: &FlightLeader) -> Result<()> {
         self.update(|table, wakes| {
-            self.leader_entry(table, leader, wakes)?
-                .state
-                .allow_handover();
-            Ok(())
+            leader_entry(table, leader, wakes)?;
+            table
+                .allow_handover(&leader.page, leader.ticket.waiter, wakes)
+                .map_err(stale)
         })
     }
 
     pub(crate) fn ciphertext_for(&self, leader: &FlightLeader) -> Result<Option<UnverifiedPage>> {
-        self.update(|table, wakes| Ok(self.leader_entry(table, leader, wakes)?.partial.clone()))
+        self.update(|table, wakes| Ok(leader_entry(table, leader, wakes)?.state().partial.clone()))
     }
 
     pub(crate) fn discard_ciphertext(&self, leader: &FlightLeader) -> Result<()> {
         self.update(|table, wakes| {
-            self.leader_entry(table, leader, wakes)?.partial = None;
+            *leader_entry(table, leader, wakes)?.partial_mut() = None;
             Ok(())
         })
     }
@@ -1429,12 +1464,10 @@ impl Flights {
         page: AcquiredPage,
     ) -> Result<FlightState> {
         self.update(|table, wakes| {
-            let entry = self.leader_entry(table, &leader, wakes)?;
-            page.validate_for(&entry.fence.page)?;
+            leader_entry(table, &leader, wakes)?;
+            page.validate_for(&leader.page)?;
             leader.active = false;
-            let idle = entry.operations.is_empty();
-            flight::publish(&mut entry.state, page, idle, split_result, wakes);
-            Ok(entry.phase.state())
+            settle_leader(table, &leader, Ok(page), wakes)
         })
     }
 
@@ -1450,18 +1483,9 @@ impl Flights {
         failure: AcquisitionFailure,
     ) -> Result<FlightState> {
         self.update(|table, wakes| {
-            let entry = self.leader_entry(table, &leader, wakes)?;
+            leader_entry(table, &leader, wakes)?;
             leader.active = false;
-            let idle = entry.operations.is_empty();
-            flight::fail(
-                &mut entry.state,
-                leader.caller,
-                failure,
-                idle,
-                split_result,
-                wakes,
-            );
-            Ok(entry.phase.state())
+            settle_leader(table, &leader, Err(failure), wakes)
         })
     }
 
@@ -1478,10 +1502,15 @@ impl Flights {
 
     /// Reactor-facing variant registers its real waker with owned drivers. The
     /// worker must also poll at request deadlines to expire parked waiters.
+    /// This worker's detached driver queue.
+    #[cfg(test)]
+    pub(crate) fn drivers(&self) -> &Rc<crate::drivers::DriverQueue> {
+        &self.drivers
+    }
+
     pub fn poll_with_context(&self, cx: &mut Context<'_>, work_budget: usize) -> Result<()> {
-        uring_runtime::drivers::poll(cx, work_budget);
-        self.admission_deadlines
-            .poll(uring_runtime::environment::now(), work_budget);
+        self.drivers.poll(cx, work_budget);
+        self.admission_deadlines.poll(self.clock.now(), work_budget);
         self.sweep_budgeted(work_budget)
     }
 
@@ -1490,13 +1519,8 @@ impl Flights {
     pub fn next_deadline(&self) -> Option<Instant> {
         self.table
             .borrow()
-            .values()
-            .filter_map(|entry| {
-                entry
-                    .deadlines
-                    .first_key_value()
-                    .map(|((deadline, _), _)| *deadline)
-            })
+            .next_deadline()
+            .into_iter()
             .chain(self.admission_deadlines.next_deadline())
             .min()
     }
@@ -1511,12 +1535,7 @@ impl Flights {
     pub fn drain<'a>(&'a self, scope: &'a RequestScope) -> Operation<'a, ()> {
         // Initiate shutdown synchronously: dropping the returned future cannot
         // reopen admission or discard accepted work.
-        self.update(|table, wakes| {
-            table.stop(wakes, |entry, wakes| {
-                entry.state.stop(Error::Cancelled, wakes);
-                settle(entry, wakes);
-            });
-        });
+        self.update(|table, wakes| table.stop(wakes));
         self.waiting
             .wake_if(self.admission.policy().limits().queue_entries.get(), |_| {
                 true
@@ -1526,12 +1545,9 @@ impl Flights {
             poll_fn(move |cx| {
                 cancellation.register(cx.waker());
                 self.poll_with_context(cx, self.limits.entries)?;
-                let waker = cx.waker().clone();
+                let waker = WakeTarget(cx.waker().clone());
                 let mut table = self.table.borrow_mut();
-                if table.is_empty()
-                    && self.waiting.is_empty()
-                    && uring_runtime::drivers::pending() == 0
-                {
+                if table.is_empty() && self.waiting.is_empty() && self.drivers.pending() == 0 {
                     return Poll::Ready(Ok(()));
                 }
                 scope.check()?;
@@ -1549,30 +1565,30 @@ impl Flights {
     pub fn retain_operation(
         self: &Rc<Self>,
         leader: &FlightLeader,
-        resources: telemetry::Lease,
+        resources: crate::telemetry::primitives::Lease,
     ) -> Result<FlightOperation> {
         self.update(|table, wakes| {
-            let id = table.next_operation_id().map_err(|_| Error::Overloaded)?;
-            let entry = self.leader_entry(table, leader, wakes)?;
-            if entry.operations.len() >= self.limits.operations_per_flight {
-                return Err(Error::Overloaded);
-            }
-            let reservation = self.admission.reserve(
-                Some(&entry.fence.page.version.object.cache),
-                ResourceClass::ControlProgress,
-                1,
-            )?;
-            entry.operations.insert(
-                id,
-                Retained {
-                    _resources: resources,
-                    _reservation: reservation,
+            leader_entry(table, leader, wakes)?;
+            let operation = table.retain_operation_with(
+                &leader.page,
+                leader.ticket.waiter,
+                || {
+                    let reservation = self.admission.reserve(
+                        Some(&leader.page.version.object.cache),
+                        ResourceClass::ControlProgress,
+                        1,
+                    )?;
+                    Ok(Retained {
+                        _resources: resources,
+                        _reservation: reservation,
+                    })
                 },
-            );
+                wakes,
+            )?;
             Ok(FlightOperation {
                 flights: self.clone(),
-                fence: entry.fence.clone(),
-                id,
+                page: leader.page.clone(),
+                operation,
                 alarm: None,
             })
         })
@@ -1588,7 +1604,7 @@ impl Flights {
     pub(crate) fn retain_driver_operation(
         self: &Rc<Self>,
         leader: &FlightLeader,
-        resources: telemetry::Lease,
+        resources: crate::telemetry::primitives::Lease,
         handover: bool,
     ) -> Result<FlightOperation> {
         if handover {
@@ -1597,152 +1613,103 @@ impl Flights {
         self.retain_operation(leader, resources)
     }
 
-    pub(super) fn complete_operation(&self, fence: &Fence, id: u64) -> Result<()> {
-        // Drop caller-owned resource bundles outside the table borrow.
-        let resources = self.update(|table, _wakes| {
-            let entry = table.get_mut(&fence.page).ok_or(Error::StaleFlight)?;
-            fence.validate(&entry.fence)?;
-            entry.operations.take(id).map_err(|_| Error::StaleFlight)
-        })?;
-        drop(resources);
-        self.update(|table, wakes| -> Result<()> {
-            let entry = table.get_mut(&fence.page).ok_or(Error::StaleFlight)?;
-            fence.validate(&entry.fence)?;
-            // Keep the slot occupied while resource destructors run: they may
-            // reenter the worker, but cannot cause an overlapping election.
-            entry
-                .operations
-                .complete(id)
-                .map_err(|_| Error::StaleFlight)?;
-            refresh(entry, wakes);
-            notify(entry, wakes);
-            table.notify_drain(wakes);
-            Ok(())
-        })?;
-        drop(self.update(|table, _wakes| table.remove_quiescent(&fence.page)));
+    pub(super) fn complete_operation(
+        &self,
+        page: &PageId,
+        operation: flight::Operation,
+    ) -> Result<()> {
+        // Drop caller-owned resource bundles outside the table borrow. The slot stays occupied
+        // while their destructors run: they may reenter the worker, but cannot cause an
+        // overlapping election.
+        let resources = self.update(|table, _wakes| table.take_operation(page, &operation));
+        drop(resources.map_err(stale)?);
+        let removed = self.update(|table, wakes| table.finish_operation(page, operation, wakes));
+        drop(removed.map_err(stale)?);
         Ok(())
     }
-
-    fn leader_entry<'a>(
-        &self,
-        table: &'a mut Table,
-        leader: &FlightLeader,
-        wakes: &mut Vec<Waker>,
-    ) -> Result<&'a mut Entry> {
-        if !Rc::ptr_eq(&self.owner, &leader.fence.owner) {
-            return Err(Error::StaleFlight);
-        }
-        let entry = table
-            .get_mut(&leader.fence.page)
-            .ok_or(Error::StaleFlight)?;
-        refresh(entry, wakes);
-        validate_leader(entry, leader)?;
-        Ok(entry)
-    }
 }
 
-impl coalesce::flight::Entry for Entry {
-    fn refresh(&mut self, wakes: &mut Vec<Waker>) {
-        // One cancellation candidate per entry, independent of fan-in.
-        self.state.sweep_waiter(wakes);
-        refresh(self, wakes);
-    }
+/// The refreshed entry `leader` still leads, or `StaleFlight`.
+fn leader_entry<'a>(
+    table: &'a mut Table,
+    leader: &FlightLeader,
+    wakes: &mut Vec<WakeTarget>,
+) -> Result<&'a mut Entry> {
+    table
+        .leader_entry(&leader.page, &leader.ticket, wakes)
+        .map_err(stale)
+}
 
-    fn quiescent(&self) -> bool {
-        self.waiters.is_empty() && self.operations.is_empty()
-    }
+/// Publish or fail the validated `leader`'s acquisition and report the resulting lifecycle.
+fn settle_leader(
+    table: &mut Table,
+    leader: &FlightLeader,
+    result: std::result::Result<AcquiredPage, AcquisitionFailure>,
+    wakes: &mut Vec<WakeTarget>,
+) -> Result<FlightState> {
+    table
+        .finish(&leader.page, leader.ticket.waiter, result, wakes)
+        .map_err(stale)?;
+    Ok(table
+        .entry(&leader.page)
+        .map_or(FlightState::Removed, |entry| entry.state().phase.state()))
 }
-fn notify(entry: &mut Entry, wakes: &mut Vec<Waker>) {
-    entry.state.notify(wakes);
-}
-fn settle(entry: &mut Entry, wakes: &mut Vec<Waker>) {
-    entry.state.settle(
-        entry.operations.is_empty(),
-        Error::Unavailable,
-        split_result,
-        wakes,
-    );
-}
-fn split_result(
-    page: AcquiredPage,
-) -> coalesce::flight::state::Published<PageResult, UnverifiedPage> {
+
+fn split_result(page: AcquiredPage) -> Published<PageResult, UnverifiedPage> {
     match page {
-        AcquiredPage::Plaintext(page) => coalesce::flight::state::Published::Complete(page),
-        AcquiredPage::Ciphertext(page) => coalesce::flight::state::Published::Partial(page),
+        AcquiredPage::Plaintext(page) => Published::Complete(page),
+        AcquiredPage::Ciphertext(page) => Published::Partial(page),
     }
 }
-fn revoke(entry: &mut Entry, error: Error, wakes: &mut Vec<Waker>) {
-    entry.state.revoke(error, wakes);
-    settle(entry, wakes);
-}
-fn refresh(entry: &mut Entry, wakes: &mut Vec<Waker>) {
-    entry.state.refresh(
-        entry.operations.is_empty(),
-        Error::Unavailable,
-        Error::Cancelled,
-        uring_runtime::environment::now,
-        split_result,
-        wakes,
-    );
-}
+
 /// A detached or canceled waiter may have been the last one the running
 /// driver serves; let it re-check instead of waiting for its alarm or I/O.
-fn wake_driver(entry: &mut Entry, wakes: &mut Vec<Waker>) {
-    if !entry.operations.is_empty()
-        && let Some(waker) = entry.driver_waker.take()
+fn wake_driver(entry: &mut Entry, wakes: &mut Vec<WakeTarget>) {
+    if entry.operations() > 0
+        && let Some(waker) = entry.ext_mut().driver_waker.take()
     {
-        wakes.push(waker);
+        wakes.push(WakeTarget(waker));
     }
 }
-fn validate_leader(entry: &Entry, leader: &FlightLeader) -> Result<()> {
-    leader.fence.validate(&entry.fence)?;
-    entry
-        .state
-        .validate_leader(leader.caller, leader.active)
-        .map_err(|_| Error::StaleFlight)
-}
-fn registered<'a>(table: &'a mut Table, registration: &Registration) -> Result<&'a mut Entry> {
+
+fn registered(table: &Table, registration: &Registration) -> Result<()> {
     if table.is_stopping() {
-        return Err(Error::Cancelled);
+        return Err(Error::Canceled);
     }
-    let entry = table
-        .get_mut(&registration.fence.page)
-        .ok_or(Error::StaleFlight)?;
-    entry
-        .state
-        .validate_registration(
+    if !registration.attached
+        || !table.registered(
+            &registration.page,
+            registration.incarnation,
             registration.id,
-            registration.attached,
-            &registration.fence.identity,
-            &entry.fence.identity,
         )
-        .map_err(|_| Error::StaleFlight)?;
-    Ok(entry)
+    {
+        return Err(Error::StaleFlight);
+    }
+    Ok(())
 }
+
 impl Registration {
     fn cancel(&self, error: Error) {
         self.flights.update(|table, wakes| {
-            if let Ok(entry) = registered(table, self) {
-                entry.state.cancel(self.id, error);
-                refresh(entry, wakes);
-                wake_driver(entry, wakes);
+            if registered(table, self).is_ok() {
+                table.cancel_with(&self.page, self.id, error, wakes);
+                if let Some(entry) = table.entry_mut(&self.page) {
+                    wake_driver(entry, wakes);
+                }
             }
         });
     }
+
     fn detach(&mut self) -> Result<FlightState> {
         let state = self.flights.update(|table, wakes| {
-            let entry = registered(table, self)?;
-            entry.state.detach(self.id);
-            refresh(entry, wakes);
-            wake_driver(entry, wakes);
-            let state = entry.phase.state();
-            let removed = table.remove_quiescent(&self.fence.page);
+            registered(table, self)?;
+            let removed = table.detach(&self.page, self.id, wakes);
             if removed.is_some() {
-                table.notify_drain(wakes);
-                Ok((FlightState::Removed, removed))
-            } else {
-                Ok((state, removed))
+                return Ok((FlightState::Removed, removed));
             }
+            let entry = table.entry_mut(&self.page).expect("kept entry");
+            wake_driver(entry, wakes);
+            Ok((entry.state().phase.state(), None))
         });
         self.attached = false;
         state.map(|(state, removed)| {
@@ -1751,6 +1718,7 @@ impl Registration {
         })
     }
 }
+
 impl Drop for Registration {
     fn drop(&mut self) {
         if self.attached {
@@ -1758,14 +1726,13 @@ impl Drop for Registration {
         }
     }
 }
+
 impl Drop for FlightLeader {
     fn drop(&mut self) {
         if self.active {
             self.flights.update(|table, wakes| {
-                if let Some(entry) = table.get_mut(&self.fence.page)
-                    && validate_leader(entry, self).is_ok()
-                {
-                    revoke(entry, Error::Cancelled, wakes);
+                if table.validate(&self.page, &self.ticket).is_ok() {
+                    table.abandon(&self.page, self.ticket.waiter, wakes);
                 }
             });
         }
@@ -1786,15 +1753,19 @@ mod admission_wake_tests {
     /// Serial completion, error, abandonment, and old cells cannot invent an outcome.
     #[test]
     fn expiry_snapshot_call_guards_and_generation_cells() {
-        let clock = uring_runtime::environment::SimulationClock::new(920);
-        let _environment = clock.environment(0).enter();
+        let clock = racer_io::SimClock::new(920);
+        let sim_env = clock.ctx(0);
+        let sim_ctx = sim_env.clone();
         let make = || {
-            DriverDiagnostic(Rc::new(std::cell::Cell::new(DriverObservation {
-                stage: DriverStage::Starting,
-                since: uring_runtime::environment::now(),
-                cancel_seen: None,
-                abandoned: false,
-            })))
+            DriverDiagnostic(
+                Rc::new(std::cell::Cell::new(DriverObservation {
+                    stage: DriverStage::Starting,
+                    since: sim_ctx.clock.now(),
+                    cancel_seen: None,
+                    abandoned: false,
+                })),
+                sim_ctx.clock.clone(),
+            )
         };
         let old = make();
         for success in [false, true] {
@@ -1831,6 +1802,7 @@ mod admission_wake_tests {
     /// A successor can install its notification synchronously during ticket removal.
     #[test]
     fn bounded_admission_reentrant_successor_registration_survives_head_drop() {
+        let env = racer_io::Env::host();
         thread_local! {
             static CALLBACK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
         }
@@ -1851,14 +1823,16 @@ mod admission_wake_tests {
         )));
         let flights = Rc::new(Flights::new(
             admission.clone(),
-            crate::test_support::availability(),
+            crate::test_support::availability(&env),
+            racer_io::Clock::host(),
+            std::rc::Rc::new(crate::drivers::DriverQueue::new(1024)),
         ));
         let page = crate::memory::tests::bundle_for(
             &admission,
             crate::model::VersionMetadata {
                 version: crate::model::ObjectVersion {
                     object: crate::model::ObjectId {
-                        cache: racer_control_wire::CacheId(
+                        cache: racer_wire::control::CacheId(
                             crate::test_support::security::CACHE.into(),
                         ),
                         key: crate::model::CacheKey([0; 32]),
@@ -1874,13 +1848,21 @@ mod admission_wake_tests {
         .clone();
         let head = flights
             .waiting
-            .enter(page.clone(), &Context::from_waker(Waker::noop()))
+            .enter(
+                page.clone(),
+                flights.clock().now(),
+                &Context::from_waker(Waker::noop()),
+            )
             .unwrap();
         let head_id = head.sequence();
         let reentrant = Waker::from(std::sync::Arc::new(Reenter));
         let tail = flights
             .waiting
-            .enter(page, &Context::from_waker(&reentrant))
+            .enter(
+                page,
+                flights.clock().now(),
+                &Context::from_waker(&reentrant),
+            )
             .unwrap();
         let tail_id = tail.sequence();
         let count = std::sync::Arc::new(crate::test_support::WakeCounter::default());

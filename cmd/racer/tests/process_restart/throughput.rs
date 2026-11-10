@@ -77,9 +77,10 @@ fn counters(process: &Process) -> BTreeMap<String, u64> {
         .unwrap()
         .lines()
         .filter(|line| !line.starts_with('#'))
-        .map(|line| {
-            let (name, value) = line.split_once(' ').unwrap();
-            (name.into(), value.parse().unwrap())
+        // Labeled or non-integer samples (gauges, floats) are not counters.
+        .filter_map(|line| {
+            let (name, value) = line.rsplit_once(' ').unwrap();
+            Some((name.into(), value.parse().ok()?))
         })
         .collect()
 }
@@ -742,7 +743,7 @@ fn owner_key(cache: &str, page: u64, owner: u16) -> u64 {
     use racer::model::StrongEtag;
     use racer::model::WorkerId;
     use racer::read::dispatch::WorkerMap;
-    use racer_control_wire::CacheId;
+    use racer_wire::control::CacheId;
     let map = WorkerMap::new((0..4).map(WorkerId).collect()).unwrap();
     (0..10000)
         .find(|key| {
@@ -766,7 +767,7 @@ fn owner_key(cache: &str, page: u64, owner: u16) -> u64 {
 #[test]
 #[ignore = "requires root, mount namespaces, io_uring and O_DIRECT; blocked listener publication and recovery"]
 fn production_blocked_listener_publication() {
-    use racer_control_wire::PublicationSequence;
+    use racer_wire::control::PublicationSequence;
     let scratch = Scratch::new();
     let profile = Profile::new(2, 113, 2);
     let control = control::Control::start_with(&scratch.0, profile.caches.clone());
@@ -897,9 +898,9 @@ fn production_peer_and_failed_neighbor_progress() {
     use racer::topology::Member;
     use racer::topology::Membership;
     use racer::topology::Placement;
-    use racer_control_wire::CacheId;
-    use racer_control_wire::MembershipVersion;
-    use racer_control_wire::NodeId;
+    use racer_wire::control::CacheId;
+    use racer_wire::control::MembershipVersion;
+    use racer_wire::control::NodeId;
     const OTHER: &str = "33333333-3333-4333-8333-333333333333";
     for pairs in [1, 2, 4] {
         let first_root = Scratch::new();
@@ -1004,7 +1005,7 @@ fn production_peer_and_failed_neighbor_progress() {
         // Preserve failed neighbor membership: deletion would hide the failure.
         assert_eq!(
             control.publication.lock().unwrap().sequence,
-            racer_control_wire::PublicationSequence(1)
+            racer_wire::control::PublicationSequence(1)
         );
         for origin in &origins[receiver] {
             origin.offline.store(false, Ordering::Release);
@@ -1036,9 +1037,9 @@ fn production_remote_bootstrap_one_get_and_empty() {
     use racer::topology::Member;
     use racer::topology::Membership;
     use racer::topology::Placement;
-    use racer_control_wire::CacheId;
-    use racer_control_wire::MembershipVersion;
-    use racer_control_wire::NodeId;
+    use racer_wire::control::CacheId;
+    use racer_wire::control::MembershipVersion;
+    use racer_wire::control::NodeId;
     for length in [0, 113] {
         let roots: Vec<_> = (0..4).map(|_| Scratch::new()).collect();
         let profile = Profile::new(1, length, 1);
@@ -1163,4 +1164,92 @@ fn production_remote_bootstrap_one_get_and_empty() {
             assert!(process.stop(libc::SIGTERM).success());
         }
     }
+}
+
+fn context_switches(pid: u32) -> BTreeMap<String, (u64, u64)> {
+    let mut result = BTreeMap::new();
+    for task in fs::read_dir(format!("/proc/{pid}/task")).unwrap() {
+        let task = task.unwrap();
+        let Ok(status) = fs::read_to_string(task.path().join("status")) else {
+            continue;
+        };
+        let field = |name: &str| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix(name))
+                .map_or(0, |value| value.trim().parse().unwrap())
+        };
+        let name = status
+            .lines()
+            .find_map(|line| line.strip_prefix("Name:"))
+            .unwrap()
+            .trim();
+        result.insert(
+            format!("{name}:{}", task.file_name().to_string_lossy()),
+            (
+                field("voluntary_ctxt_switches:"),
+                field("nonvoluntary_ctxt_switches:"),
+            ),
+        );
+    }
+    result
+}
+
+/// Idle wake baseline: context switches per thread per second of an idle process.
+#[test]
+#[ignore = "requires root, mount namespaces, io_uring and O_DIRECT; idle wake baseline"]
+fn production_idle_wakes() {
+    let number = |name: &str, default: u64| {
+        std::env::var(name).map_or(default, |value| value.parse().expect("unsigned"))
+    };
+    let pairs = number("RACER_THROUGHPUT_PAIRS", 4) as usize;
+    let seconds = number("RACER_IDLE_SECONDS", 10);
+    let scratch = Scratch::new();
+    let profile = Profile::new(pairs, 113, 1);
+    let control = control::Control::start_with(&scratch.0, profile.caches.clone());
+    // Hold unchanged polls like production (`POLL_WAIT`) unless overridden; the
+    // fixture's short default hold would measure re-poll churn, not idleness.
+    let hold = number(
+        "RACER_IDLE_HOLD_MS",
+        racer_wire::control::POLL_WAIT.as_millis() as u64,
+    );
+    control.hold_ms.store(hold as usize, Ordering::Release);
+    let (mut process, _origins) = Process::start_profile(&scratch, &control, 0, Some(&profile));
+    let pid = process.child.id();
+    // Let startup traffic settle before sampling.
+    thread::sleep(Duration::from_secs(3));
+    let before = context_switches(pid);
+    let polls_before = control.polls.load(Ordering::Acquire);
+    let cpu_before = observe(pid);
+    let start = Instant::now();
+    thread::sleep(Duration::from_secs(seconds));
+    let elapsed = start.elapsed().as_secs_f64();
+    let after = context_switches(pid);
+    let snapshot_polls = control.polls.load(Ordering::Acquire) - polls_before;
+    let cpu_after = observe(pid);
+    let per_thread: BTreeMap<_, _> = after
+        .iter()
+        .map(|(name, (voluntary, involuntary))| {
+            let (v0, i0) = before.get(name).copied().unwrap_or((0, 0));
+            let cpu = cpu_after.threads.get(name).copied().unwrap_or(0)
+                - cpu_before.threads.get(name).copied().unwrap_or(0);
+            (
+                name.clone(),
+                json!({
+                    "voluntary_per_s": (voluntary - v0) as f64 / elapsed,
+                    "involuntary_per_s": (involuntary - i0) as f64 / elapsed,
+                    "cpu_fraction": cpu as f64 / 1e9 / elapsed,
+                }),
+            )
+        })
+        .collect();
+    let report = json!({"pairs": pairs, "hold_ms": hold, "snapshot_polls": snapshot_polls, "seconds": elapsed, "pid": pid, "threads": per_thread});
+    println!("IDLE_WAKES {report}");
+    let mut output = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(Path::new(env!("CARGO_MANIFEST_DIR")).join("target/idle-wakes.jsonl"))
+        .unwrap();
+    writeln!(output, "{report}").unwrap();
+    assert!(process.stop(libc::SIGTERM).success());
 }

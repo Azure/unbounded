@@ -3,7 +3,7 @@
 """Racer client socket wire format.
 
 This mirrors the Go SDK in pkg/racersdk/internal/wire/wire.go and the
-dataplane in cmd/racer/object-wire/src/client.rs.
+dataplane in cmd/racer/wire/src/object/client.rs.
 """
 
 from __future__ import annotations

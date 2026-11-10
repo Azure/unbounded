@@ -3,7 +3,7 @@
 //! Serves caches whose publication carries `CacheDefinition::origin` directly
 //! from Azure Blob Storage. Request plan:
 //!
-//! - bootstrap: one `GET` with `x-ms-range: bytes=0-<PAGE_BYTES-1>`. A 206
+//! - bootstrap: one `GET` with `x-ms-range: bytes=0-<page size - 1>`. A 206
 //!   carries metadata, the size (from `Content-Range`), and page 0. An empty
 //!   blob answers 416, so a `HEAD` follows to read its metadata.
 //! - page: one `GET` with `x-ms-range` and `If-Match: <pinned ETag>`.
@@ -33,25 +33,25 @@ use self::response::{classify, content_range, status, transport_error};
 use super::{MetadataReply, Origin, OriginPage};
 use crate::admission::{AdmissionPolicy, ResourceClass};
 use crate::control::Snapshot;
+use crate::control::cell::PublicationCell;
 use crate::error::{Error, Operation, Result};
 use crate::memory::{BufferPool, PlaintextBuffer};
 use crate::model::{
-    ExpiresAt, MetadataSelector, ObjectId, ObjectMetadata, ObjectVersion, PAGE_BYTES, PageId,
-    PageNumber, StrongEtag,
+    ExpiresAt, MetadataSelector, ObjectId, ObjectMetadata, ObjectVersion, PageId, PageNumber,
+    StrongEtag,
 };
 use crate::read::candidates::OriginAuthority;
 use crate::runtime::RequestScope;
 use crate::security::OriginContext;
-use controlplane::Published;
 use http1::MessageHead;
-use racer_control_wire::{AzureContainerUrl, AzureCredential, CacheId, OriginDefinition};
+use racer_io::deadline::Deadline;
+use racer_wire::control::{AzureContainerUrl, AzureCredential, CacheId, OriginDefinition};
 use std::collections::HashMap;
 use std::fmt;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
-use uring_runtime::environment::Deadline;
 use zeroize::Zeroizing;
 
 /// An OAuth access token for `https://storage.azure.com/`. Zeroized on drop
@@ -256,7 +256,7 @@ impl AzureLimits {
 }
 
 /// Process-wide Azure origin state shared by every worker: the concurrency
-/// limits, the token caches, and the lazily loaded TLS trust roots.
+/// limits, the token caches, and the TLS trust roots loaded at assembly.
 #[derive(Clone, Debug)]
 pub struct AzureNode {
     pub limits: Arc<AzureLimits>,
@@ -265,13 +265,32 @@ pub struct AzureNode {
 }
 
 impl AzureNode {
-    /// Token endpoints and the trust bundle path come from the environment.
-    /// Nothing is read from disk or the network until a cache needs it.
-    pub fn from_env() -> Self {
+    /// Token endpoints come from configuration, and the trust bundle is
+    /// loaded now (see [`transport::TrustRoots`]): call this at node
+    /// assembly, never on a worker reactor. Nothing touches the network until
+    /// a cache needs it.
+    pub fn new(settings: &crate::config::OriginSettings) -> Self {
+        Self::with_trust(
+            settings,
+            transport::TrustRoots::load(settings.trust_bundle.clone()),
+        )
+    }
+
+    /// Default settings with no trust roots and no file I/O; HTTPS origins
+    /// fail with `Unavailable`.
+    pub fn unconfigured() -> Self {
+        let settings = crate::config::OriginSettings::default();
+        let trust = transport::TrustRoots::unavailable(settings.trust_bundle.clone());
+        Self::with_trust(&settings, trust)
+    }
+
+    fn with_trust(settings: &crate::config::OriginSettings, trust: transport::TrustRoots) -> Self {
         Self {
             limits: Arc::default(),
-            tokens: Arc::new(tokens::AzureTokenCaches::from_env()),
-            trust: Arc::new(transport::TrustRoots::from_env()),
+            tokens: Arc::new(tokens::AzureTokenCaches::new(
+                crate::origin::azure_auth::AuthEndpoints::new(settings, trust.config().ok()),
+            )),
+            trust: Arc::new(trust),
         }
     }
 }
@@ -280,7 +299,7 @@ impl AzureNode {
 pub struct AzureOrigin<T, K> {
     transport: T,
     tokens: K,
-    snapshots: Arc<Published<Snapshot>>,
+    snapshots: Arc<PublicationCell<Snapshot>>,
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
     buffers: BufferPool,
     limits: Arc<AzureLimits>,
@@ -293,7 +312,7 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
     pub fn new(
         transport: T,
         tokens: K,
-        snapshots: Arc<Published<Snapshot>>,
+        snapshots: Arc<PublicationCell<Snapshot>>,
         admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
         buffers: BufferPool,
         limits: Arc<AzureLimits>,
@@ -333,10 +352,20 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
         self.observe(&snapshot);
         let index = snapshot
             .caches
-            .iter()
-            .position(|cache| cache.id == object.cache && cache.origin.is_some())
+            .position(&object.cache)
+            .filter(|i| snapshot.caches[*i].origin.is_some())
             .ok_or(Error::Unavailable)?;
         Ok((snapshot, index))
+    }
+
+    /// The published cluster page size; the default before any publication.
+    pub(crate) fn published_page_size(&self) -> Result<racer_wire::object::PageSize> {
+        Ok(self
+            .snapshots
+            .current()?
+            .map_or(racer_wire::object::PageSize::DEFAULT, |snapshot| {
+                snapshot.page_size
+            }))
     }
 
     /// Check the supplied full-page plaintext charge without taking ownership.
@@ -345,7 +374,10 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
         reservation: &flow_control::Charge<AdmissionPolicy>,
         object: &ObjectId,
     ) -> Result<()> {
-        reservation.validate(ResourceClass::Plaintext, PAGE_BYTES as usize)?;
+        reservation.validate(
+            ResourceClass::Plaintext,
+            self.published_page_size()?.get() as usize,
+        )?;
         if !self.admission.owns(reservation) || reservation.key() != Some(&object.cache) {
             return Err(Error::InvalidConfiguration);
         }
@@ -370,7 +402,9 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
             .limits
             .acquire(&context.object.cache, definition.max_concurrent_requests)?;
         let mut scope = scope.clone();
-        let limit = uring_runtime::environment::now()
+        let limit = scope
+            .clock()
+            .now()
             .checked_add(definition.request_timeout)
             .unwrap_or(scope.deadline.0);
         scope.deadline = Deadline(scope.deadline.0.min(limit));
@@ -402,6 +436,7 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
                 range,
                 if_match,
                 token.as_ref().map(BearerToken::as_bytes),
+                begun.scope.clock().wall_now(),
             )?;
             let exchange = self
                 .transport
@@ -459,10 +494,12 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
         scope: &RequestScope,
     ) -> Result<MetadataReply> {
         self.validate_reservation(&reservation, &context.object)?;
+        let page_size = self.published_page_size()?;
+        let size = page_size.get();
         let begun = self.begin(definition, context, scope).await?;
         let range = ByteRange {
             first: 0,
-            last: PAGE_BYTES - 1,
+            last: size - 1,
         };
         let exchange = self
             .send(definition, &begun, AzureMethod::Get, Some(range), None)
@@ -474,19 +511,17 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
                 let (first, last, total) = content_range(head)?;
                 if first != 0
                     || blob.content_length != last + 1
-                    || blob.content_length != total.min(PAGE_BYTES)
+                    || blob.content_length != total.min(size)
                 {
-                    return Err(Error::Internal);
+                    return Err(Error::BadGateway);
                 }
                 (blob, total)
             }
             // Defensive: a service that ignores the range must still fit page 0.
             200 => {
                 let blob = response::blob(head, &begun.object)?;
-                if response::field(head, "Content-Range")?.is_some()
-                    || blob.content_length > PAGE_BYTES
-                {
-                    return Err(Error::Internal);
+                if response::field(head, "Content-Range")?.is_some() || blob.content_length > size {
+                    return Err(Error::BadGateway);
                 }
                 let total = blob.content_length;
                 (blob, total)
@@ -512,6 +547,7 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
             blob.content_type,
             total,
             definition,
+            begun.scope.clock().wall_now(),
         )?;
         if blob.content_length == 0 {
             exchange.finish().map_err(transport_error)?;
@@ -527,6 +563,7 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
             page_zero: Some(OriginPage {
                 metadata: metadata.clone(),
                 plaintext,
+                page_size,
             }),
             metadata,
         })
@@ -559,6 +596,7 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
             blob.content_type,
             blob.content_length,
             definition,
+            begun.scope.clock().wall_now(),
         )
     }
 
@@ -594,13 +632,11 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
         if page.version.object != context.object {
             return Err(Error::Unauthorized);
         }
-        let first = page
-            .number
-            .0
-            .checked_mul(PAGE_BYTES)
-            .ok_or(Error::InvalidRange)?;
+        let page_size = self.published_page_size()?;
+        let size = page_size.get();
+        let first = page.number.0.checked_mul(size).ok_or(Error::InvalidRange)?;
         let last = first
-            .checked_add(PAGE_BYTES - 1)
+            .checked_add(size - 1)
             .filter(|last| *last <= i64::MAX as u64)
             .ok_or(Error::InvalidRange)?;
         self.validate_reservation(&reservation, &context.object)?;
@@ -617,7 +653,8 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
         let head = exchange.head();
         match status(head)? {
             206 => {}
-            200 => return Err(Error::Internal),
+            // The service ignored the page range.
+            200 => return Err(Error::BadGateway),
             _ => return Err(self.reject(exchange, true, &begun.scope).await),
         }
         let blob = response::blob(head, &begun.object)?;
@@ -627,9 +664,9 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
         let (got_first, got_last, total) = content_range(head)?;
         if got_first != first
             || blob.content_length != got_last - got_first + 1
-            || blob.content_length != (total - first).min(PAGE_BYTES)
+            || blob.content_length != (total - first).min(size)
         {
-            return Err(Error::Internal);
+            return Err(Error::BadGateway);
         }
         let metadata = metadata(
             &context.object,
@@ -637,6 +674,7 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
             blob.content_type,
             total,
             definition,
+            begun.scope.clock().wall_now(),
         )?;
         let plaintext = self
             .read(exchange, reservation, blob.content_length, &begun.scope)
@@ -644,6 +682,7 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
         Ok(OriginPage {
             metadata,
             plaintext,
+            page_size,
         })
     }
 }
@@ -662,8 +701,9 @@ fn metadata(
     content_type: Option<crate::model::ContentType>,
     length: u64,
     definition: &OriginDefinition,
+    now: SystemTime,
 ) -> Result<ObjectMetadata> {
-    let expires = SystemTime::now()
+    let expires = now
         .checked_add(definition.metadata_ttl)
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
         .ok_or(Error::Internal)?;
@@ -680,6 +720,10 @@ fn metadata(
 }
 
 impl<T: AzureTransport, K: AzureTokenSource> Origin for AzureOrigin<T, K> {
+    fn page_size(&self) -> Result<racer_wire::object::PageSize> {
+        self.published_page_size()
+    }
+
     fn bootstrap_reserved<'a>(
         &'a self,
         authority: &'a OriginAuthority,

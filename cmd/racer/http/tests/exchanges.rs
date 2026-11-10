@@ -4,6 +4,9 @@ use http1::{
     Codec, Error, Header, MessageHead, StartLine,
     connection::{ConnectionLease, Context, Endpoint, HttpIo, OwnedBuffer},
 };
+use racer_io::Scope;
+use racer_io::ring::IoBuffer;
+use racer_io::scoped::{Reactor, SocketAddress};
 use std::{
     future::Future,
     os::unix::net::UnixStream,
@@ -11,17 +14,13 @@ use std::{
     task::{Poll, Waker},
     time::{Duration, Instant},
 };
-use uring_runtime::{
-    Scope,
-    reactor::{IoBuffer, Reactor, SocketAddress},
-};
 
 /// Keeps HTTP syntax failures distinct from transport failures.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Failure {
     Http(Error),
 
-    Runtime(uring_runtime::Error),
+    Runtime(racer_io::Error),
 }
 
 impl From<Error> for Failure {
@@ -31,9 +30,9 @@ impl From<Error> for Failure {
     }
 }
 
-impl From<uring_runtime::Error> for Failure {
+impl From<racer_io::Error> for Failure {
     /// Preserve the runtime failure without mapping it to HTTP syntax.
-    fn from(error: uring_runtime::Error) -> Self {
+    fn from(error: racer_io::Error) -> Self {
         Self::Runtime(error)
     }
 }
@@ -70,9 +69,7 @@ impl Context for Caller {
 
     type Scope = RequestScope;
 
-    type Budget = ();
-
-    type Reactor = Rc<Reactor<RequestScope, ()>>;
+    type Reactor = Rc<Reactor<RequestScope>>;
 
     type Charge = ();
 
@@ -103,7 +100,7 @@ impl Context for Caller {
 /// Build a small reactor and explicit head and body limits.
 fn io() -> HttpIo<Caller> {
     HttpIo::new(
-        Rc::new(Rc::new(Reactor::new(16, ()))),
+        Rc::new(Rc::new(Reactor::new(16, &racer_io::Env::host()))),
         Codec::new(256),
         Rc::new(Caller),
         16,
@@ -160,7 +157,7 @@ fn accept_retains_one_future_across_completions_and_preserves_errors() {
     }
     let mut active = FuturesUnordered::new();
     active.push(std::future::ready(()));
-    let failure = Failure::Runtime(uring_runtime::Error::Io);
+    let failure = Failure::Runtime(racer_io::Error::Io);
     assert_eq!(
         futures::executor::block_on(http1::connection::next_accepted(
             std::future::ready(Err::<(), _>(failure)),
@@ -207,10 +204,7 @@ fn disconnect_waits_for_work_cleanup_before_returning_failure() {
             work,
         ),
     );
-    assert_eq!(
-        result,
-        Err(Failure::Runtime(uring_runtime::Error::Cancelled))
-    );
+    assert_eq!(result, Err(Failure::Runtime(racer_io::Error::Canceled)));
     assert!(canceled.get() && cleaned.get() && watch_canceled.get());
     assert_eq!(io.reactor().in_flight(), 0);
 }
@@ -218,8 +212,8 @@ fn disconnect_waits_for_work_cleanup_before_returning_failure() {
 /// Independent caller scopes exercise cancellation and watch fencing without Racer.
 mod disconnect_scopes {
     use super::*;
+    use racer_io::cancel::Cancellation;
     use std::cell::Cell;
-    use uring_runtime::environment::Cancellation;
 
     /// A cancellable caller scope, independent of wall time.
     #[derive(Clone)]
@@ -229,15 +223,15 @@ mod disconnect_scopes {
         type Error = Failure;
 
         fn check(&self) -> Result<(), Failure> {
-            if self.0.is_cancelled() {
-                Err(uring_runtime::Error::Cancelled.into())
+            if self.0.is_canceled() {
+                Err(racer_io::Error::Canceled.into())
             } else {
                 Ok(())
             }
         }
 
-        fn cancellation(&self) -> Option<&Cancellation> {
-            Some(&self.0)
+        fn cancel_token(&self) -> Option<&racer_io::CancelToken> {
+            Some(self.0.token())
         }
     }
 
@@ -249,9 +243,7 @@ mod disconnect_scopes {
 
         type Scope = CancelScope;
 
-        type Budget = ();
-
-        type Reactor = Rc<Reactor<CancelScope, ()>>;
+        type Reactor = Rc<Reactor<CancelScope>>;
 
         type Charge = ();
 
@@ -281,7 +273,7 @@ mod disconnect_scopes {
     fn success_and_parent_cancel_fence_watch_and_keep_parent_independent() {
         for cancel in [false, true] {
             let io = HttpIo::new(
-                Rc::new(Rc::new(Reactor::new(16, ()))),
+                Rc::new(Rc::new(Reactor::new(16, &racer_io::Env::host()))),
                 Codec::new(256),
                 Rc::new(ScopedCaller),
                 16,
@@ -295,7 +287,7 @@ mod disconnect_scopes {
             let watch = CancelScope(Cancellation::new().unwrap());
             let cleanup_turns = Cell::new(0);
             let work = std::future::poll_fn(|cx| {
-                if cancel && !exchange.0.is_cancelled() {
+                if cancel && !exchange.0.is_canceled() {
                     return Poll::Pending;
                 }
                 cleanup_turns.set(cleanup_turns.get() + 1);
@@ -331,14 +323,14 @@ mod disconnect_scopes {
             assert_eq!(
                 result,
                 if cancel {
-                    Err(Failure::Runtime(uring_runtime::Error::Cancelled))
+                    Err(Failure::Runtime(racer_io::Error::Canceled))
                 } else {
                     Ok(7)
                 }
             );
-            assert!(watch.0.is_cancelled());
-            assert_eq!(parent.0.is_cancelled(), cancel);
-            assert_eq!(exchange.0.is_cancelled(), cancel);
+            assert!(watch.0.is_canceled());
+            assert_eq!(parent.0.is_canceled(), cancel);
+            assert_eq!(exchange.0.is_canceled(), cancel);
             assert_eq!(cleanup_turns.get(), 2);
             assert_eq!(io.reactor().in_flight(), 0);
         }
@@ -348,7 +340,7 @@ mod disconnect_scopes {
     #[test]
     fn failed_watch_scope_preserves_error_without_polling_work() {
         let io = HttpIo::new(
-            Rc::new(Rc::new(Reactor::new(16, ()))),
+            Rc::new(Rc::new(Reactor::new(16, &racer_io::Env::host()))),
             Codec::new(256),
             Rc::new(ScopedCaller),
             16,
@@ -357,7 +349,7 @@ mod disconnect_scopes {
         let (socket, _peer) = UnixStream::pair().unwrap();
         let connection = ConnectionLease::from_reserved(socket.into(), (), ()).unwrap();
         let parent = CancelScope(Cancellation::new().unwrap());
-        let error = Failure::Runtime(uring_runtime::Error::Overloaded);
+        let error = Failure::Runtime(racer_io::Error::Overloaded);
         let result = futures::executor::block_on(http1::connection::disconnect_fenced(
             &io,
             &connection,
@@ -369,7 +361,7 @@ mod disconnect_scopes {
         ));
         assert_eq!(result, Err(error));
         assert_eq!(io.reactor().in_flight(), 0);
-        assert!(!parent.0.is_cancelled());
+        assert!(!parent.0.is_canceled());
     }
 }
 /// Poll one operation and its reactor under a fixed progress deadline.
@@ -441,7 +433,7 @@ fn head_has_no_body_even_with_large_representation_length() {
 fn real_partial_sends_preserve_owned_subrange() {
     use std::{io::Read, os::fd::AsRawFd};
     let io = HttpIo::new(
-        Rc::new(Rc::new(Reactor::new(16, ()))),
+        Rc::new(Rc::new(Reactor::new(16, &racer_io::Env::host()))),
         Codec::new(256),
         Rc::new(Caller),
         2 * 1024 * 1024,

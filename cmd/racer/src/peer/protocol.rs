@@ -32,22 +32,22 @@ use base64::engine::general_purpose::STANDARD;
 use http1::Header;
 use http1::MessageHead;
 use http1::StartLine;
-use racer_control_wire::CacheId;
-use racer_control_wire::KeyId;
-use racer_control_wire::MembershipVersion;
-use racer_control_wire::NodeId;
 use racer_crypto::identity::Certificates;
 use racer_crypto::identity::Keyring;
 use racer_crypto::identity::VerifiedPeer;
+use racer_io::deadline::Deadline;
+use racer_wire::control::CacheId;
+use racer_wire::control::KeyId;
+use racer_wire::control::MembershipVersion;
+use racer_wire::control::NodeId;
 use std::rc::Rc;
 #[cfg(test)]
 use std::sync::Arc;
-#[cfg(test)]
 use std::time::Duration;
+use std::time::Instant;
 use std::time::SystemTime;
 #[cfg(test)]
 use std::time::UNIX_EPOCH;
-use uring_runtime::environment::Deadline;
 
 pub enum FetchMode {
     CopyOnly,
@@ -91,7 +91,11 @@ impl Signatures {
         peer_wire::test_util::sign_fields(&self.inner, head).map_err(Into::into)
     }
 
-    pub fn new(keys: Rc<Keyring>, certificates: Rc<Certificates>) -> Self {
+    pub fn new(
+        keys: Rc<Keyring>,
+        certificates: Rc<Certificates>,
+        ctx: racer_io::WorkerCtx,
+    ) -> Self {
         Self {
             keys: keys.clone(),
             certificates: certificates.clone(),
@@ -99,11 +103,21 @@ impl Signatures {
                 keys,
                 certificates,
                 Rc::new(RequestMac),
+                ctx,
             )),
         }
     }
     pub fn node(&self) -> &NodeId {
         self.inner.node()
+    }
+    /// The same identity on another worker context.
+    #[cfg(test)]
+    pub(crate) fn with_ctx(&self, ctx: racer_io::WorkerCtx) -> Self {
+        Self::new(self.keys.clone(), self.certificates.clone(), ctx)
+    }
+    /// The worker's time and entropy.
+    pub fn ctx(&self) -> &racer_io::WorkerCtx {
+        self.inner.ctx()
     }
     pub(crate) fn for_offload(&self) -> (Keyring, racer_crypto::identity::CertificateVerifier) {
         ((*self.keys).clone(), self.certificates.for_offload())
@@ -129,7 +143,7 @@ impl Signatures {
         &self,
         binding: &super::forwarding::RequestBinding,
     ) -> Result<VerifiedPeer> {
-        let signed = binding.retained_proof()?;
+        let signed = binding.retained_proof(&self.ctx().clock)?;
         self.inner
             .verify_retained_request(signed, number(&signed.head, "racer-route-deadline")?)
             .map_err(Into::into)
@@ -291,6 +305,8 @@ pub enum PrefetchAction {
         length: u64,
         content_type: Option<crate::model::ContentType>,
         priority: racer_core::prefetch::Priority,
+        /// Page size the requester cut `pages` at; the owner refuses another.
+        page_size: crate::model::PageSize,
     },
     /// Report which pages are resident, without filling.
     Probe { pages: Vec<u64> },
@@ -316,10 +332,10 @@ impl PrefetchAction {
     }
 }
 
-/// Every filled page must exist in a nonempty object.
-fn prefetch_fill_in_range(pages: &[u64], length: u64) -> bool {
+/// Every filled page, cut at `size`, must exist in a nonempty object.
+fn prefetch_fill_in_range(pages: &[u64], length: u64, size: crate::model::PageSize) -> bool {
     pages.last().is_some_and(|last| {
-        last.checked_mul(PAGE_BYTES)
+        last.checked_mul(size.get())
             .is_some_and(|start| start < length)
     })
 }
@@ -383,11 +399,26 @@ pub fn millis(time: SystemTime) -> Result<u64> {
 }
 /// Stable environment clock mapping. Decode wire deadlines with `decode_deadline`,
 /// never reconstruct them from a new relative timeout at each hop.
-pub fn encode_deadline(deadline: Deadline) -> Result<u64> {
-    peer_wire::encode_deadline(deadline).map_err(Into::into)
+///
+/// Deadlines farther than [`MAX_WIRE_DEADLINE_HORIZON`] from now are clamped:
+/// an untimed scope's placeholder deadline (about a century out) must never
+/// grant a peer unbounded authority.
+pub fn encode_deadline(clock: &racer_io::Clock, deadline: Deadline) -> Result<u64> {
+    peer_wire::encode_deadline(clock, clamp_wire_deadline(deadline, clock.now()).0)
+        .map_err(Into::into)
 }
-pub fn decode_deadline(value: u64) -> Result<Deadline> {
-    peer_wire::decode_deadline(value).map_err(Into::into)
+/// Longest deadline horizon ever placed on the wire.
+pub const MAX_WIRE_DEADLINE_HORIZON: Duration = Duration::from_secs(24 * 3600);
+fn clamp_wire_deadline(deadline: Deadline, now: Instant) -> Deadline {
+    match now.checked_add(MAX_WIRE_DEADLINE_HORIZON) {
+        Some(bound) if deadline.0 > bound => Deadline(bound),
+        _ => deadline,
+    }
+}
+pub fn decode_deadline(clock: &racer_io::Clock, value: u64) -> Result<Deadline> {
+    peer_wire::decode_deadline(clock, value)
+        .map(Deadline)
+        .map_err(Into::into)
 }
 /// Canonical node-list encoding: concatenated u32 big-endian length + UTF-8 ID,
 /// then padded base64. Empty lists encode as an empty header value.
@@ -400,7 +431,11 @@ pub fn decode_nodes(value: &[u8]) -> Result<Vec<NodeId>> {
 fn object_fields(head: &mut MessageHead, object: &ObjectId) -> Result<()> {
     uuid(&object.cache.0)?;
     push(head, "racer-cache", &object.cache.0);
-    push(head, "racer-key", wire_codec::encode_hex(&object.key.0));
+    push(
+        head,
+        "racer-key",
+        racer_wire::codec::encode_hex(&object.key.0),
+    );
     Ok(())
 }
 fn version_fields(head: &mut MessageHead, version: &ObjectVersion) -> Result<()> {
@@ -408,7 +443,11 @@ fn version_fields(head: &mut MessageHead, version: &ObjectVersion) -> Result<()>
     push(head, "racer-etag", version.etag.as_str());
     Ok(())
 }
-pub fn route_headers(head: &mut MessageHead, route: &RouteBudget) -> Result<()> {
+pub fn route_headers(
+    clock: &racer_io::Clock,
+    head: &mut MessageHead,
+    route: &RouteBudget,
+) -> Result<()> {
     if route.membership.0 == 0 {
         return Err(Error::InvalidRequest);
     }
@@ -423,13 +462,13 @@ pub fn route_headers(head: &mut MessageHead, route: &RouteBudget) -> Result<()> 
     push(
         head,
         "racer-route-deadline",
-        encode_deadline(route.deadline)?,
+        encode_deadline(clock, route.deadline)?,
     );
     Ok(())
 }
 /// Encode every logical request field, including absent/present opaque context.
 /// Authentication headers are added only by `Signatures`.
-pub fn request_head(request: &PeerRequest) -> Result<MessageHead> {
+pub fn request_head(clock: &racer_io::Clock, request: &PeerRequest) -> Result<MessageHead> {
     if request
         .origin
         .metadata
@@ -498,6 +537,9 @@ pub fn request_head(request: &PeerRequest) -> Result<MessageHead> {
             push(&mut head, "racer-operation", "page");
             version_fields(&mut head, &page.version)?;
             push(&mut head, "racer-page", page.number.0);
+            // Informational only: no decoder reads it, the provider cuts the
+            // page at the published page size. It spans the largest page so
+            // request heads keep their size whatever the cluster page size.
             let start = page
                 .number
                 .0
@@ -537,12 +579,14 @@ pub fn request_head(request: &PeerRequest) -> Result<MessageHead> {
                 length,
                 content_type,
                 priority,
+                page_size,
             } = action
             {
-                if !prefetch_fill_in_range(pages, *length) {
+                if !prefetch_fill_in_range(pages, *length, *page_size) {
                     return Err(Error::InvalidRequest);
                 }
                 push(&mut head, "racer-object-length", *length);
+                push(&mut head, "racer-page-size", page_size.get());
                 if let Some(content_type) = content_type {
                     push(&mut head, "racer-content-type", content_type.as_str());
                 }
@@ -597,7 +641,7 @@ pub fn request_head(request: &PeerRequest) -> Result<MessageHead> {
         push_binary(&mut head, "racer-authorization-nonce", &auth.nonce.0);
         push_binary(&mut head, "racer-authorization", &auth.ciphertext);
     }
-    route_headers(&mut head, &request.route)?;
+    route_headers(clock, &mut head, &request.route)?;
     Ok(head)
 }
 /// Prefetch operations carry origin credentials for the owner's fill.
@@ -609,12 +653,16 @@ fn prefetch_action(head: &MessageHead) -> Result<PrefetchAction> {
     Ok(match field(head, "racer-prefetch-action")?.as_str() {
         "fill" => {
             let length = number(head, "racer-object-length")?;
-            if !prefetch_fill_in_range(&pages, length) {
+            let page_size =
+                racer_wire::object::PageSize::from_wire(number(head, "racer-page-size")?)
+                    .map_err(|_| Error::InvalidRequest)?;
+            if !prefetch_fill_in_range(&pages, length, page_size) {
                 return Err(Error::InvalidRequest);
             }
             PrefetchAction::Fill {
                 pages,
                 length,
+                page_size,
                 content_type: head
                     .unique("racer-content-type")?
                     .map(crate::model::ContentType::parse)
@@ -701,6 +749,7 @@ pub fn response_head(
         PeerResponse::VersionUnavailable => ("version-unavailable", 0),
         PeerResponse::Unavailable => ("unavailable", 0),
         PeerResponse::Overloaded => ("overloaded", 0),
+        PeerResponse::FlightFull => ("flight-full", 0),
         PeerResponse::OriginRejected => ("origin-rejected", 0),
         PeerResponse::OriginForbidden => ("origin-forbidden", 0),
         PeerResponse::StaleMembership => ("stale-membership", 0),
@@ -808,6 +857,7 @@ fn page_fields(
     push(head, "racer-page", e.page.number.0);
     push_binary(head, "racer-page-key", &e.key_id.0);
     push(head, "racer-page-cipher", e.cipher as u32);
+    push(head, "racer-page-size", e.page_size.get());
     push_binary(head, "racer-page-nonce", &e.nonce.0);
     push(head, "racer-plaintext-length", e.plaintext_length);
     push(head, "racer-ciphertext-length", e.ciphertext_length);
@@ -815,7 +865,7 @@ fn page_fields(
         .page
         .number
         .0
-        .checked_mul(PAGE_BYTES)
+        .checked_mul(e.page_size.get())
         .ok_or(Error::InvalidRange)?;
     let end = start
         .checked_add(u64::from(e.plaintext_length))
@@ -883,9 +933,23 @@ pub fn encode_envelope(
 ) -> Result<MessageHead> {
     peer_wire::encode_envelope(authentication, response, body_length).map_err(Into::into)
 }
-/// Decode framing only; proof verification and socket replay admission are separate.
-pub fn decode_envelope(head: MessageHead, response: bool) -> Result<(ForwardedHead, usize)> {
-    peer_wire::decode_envelope(head, response).map_err(Into::into)
+/// Decode framing and resolve each proof's chain from the carrying session, which
+/// admitted the head; proof verification is separate.
+pub fn decode_envelope(
+    head: MessageHead,
+    response: bool,
+    chains: &dyn peer_wire::Chains,
+) -> Result<(ForwardedHead, usize)> {
+    peer_wire::decode_envelope(head, response, chains).map_err(Into::into)
+}
+/// The session of a connection that delivered a head, which resolves its chains.
+/// Every production peer exchange runs on a session; a missing one is a fault.
+pub(crate) fn chains(connection: &crate::http::ConnectionLease) -> Result<&Session> {
+    connection
+        .state()
+        .session
+        .as_ref()
+        .ok_or(Error::Unauthorized)
 }
 pub(crate) fn encode_signed(head: &SignedHead) -> Result<Vec<u8>> {
     peer_wire::encode_signed(head).map_err(Into::into)
@@ -911,18 +975,16 @@ impl SecurityCodec {
 
 /// A received response body and the admission that charged its staging.
 pub(crate) enum ResponseBody {
-    /// Vector staging. Without a reservation, the decoder charges the page.
-    Owned {
-        bytes: Vec<u8>,
-        reservation: Option<flow_control::Charge<AdmissionPolicy>>,
-    },
+    /// No body.
+    Empty,
     /// Aligned staging from the receiving worker's pool, already charged.
+    /// An unkeyed charge is swapped for one keyed to the page's cache.
     Aligned(crate::memory::CiphertextBuffer),
 }
 impl ResponseBody {
     fn len(&self) -> usize {
         match self {
-            Self::Owned { bytes, .. } => bytes.len(),
+            Self::Empty => 0,
             Self::Aligned(buffer) => buffer.len(),
         }
     }
@@ -942,7 +1004,8 @@ fn object(head: &MessageHead) -> Result<ObjectId> {
         return Err(Error::InvalidRequest);
     }
     let key = field(head, "racer-key")?;
-    let decoded = wire_codec::decode_hex(key.as_bytes()).map_err(|_| Error::InvalidRequest)?;
+    let decoded =
+        racer_wire::codec::decode_hex(key.as_bytes()).map_err(|_| Error::InvalidRequest)?;
     Ok(ObjectId {
         cache: CacheId(cache),
         key: CacheKey(decoded),
@@ -1032,6 +1095,8 @@ pub(crate) fn page_descriptor(head: &MessageHead) -> Result<(ObjectMetadata, Pag
             u32::try_from(number(head, "racer-page-cipher")?).map_err(|_| Error::InvalidRequest)?,
         )
         .map_err(|_| Error::InvalidRequest)?,
+        page_size: racer_wire::object::PageSize::from_wire(number(head, "racer-page-size")?)
+            .map_err(|_| Error::InvalidRequest)?,
         page: PageId {
             version: metadata.version.clone(),
             number: PageNumber(number(head, "racer-page")?),
@@ -1106,6 +1171,7 @@ fn bodyless_response(head: &MessageHead, outcome: &str) -> Result<PeerResponse> 
         "version-unavailable" => PeerResponse::VersionUnavailable,
         "unavailable" => PeerResponse::Unavailable,
         "overloaded" => PeerResponse::Overloaded,
+        "flight-full" => PeerResponse::FlightFull,
         "origin-rejected" => PeerResponse::OriginRejected,
         "origin-forbidden" => PeerResponse::OriginForbidden,
         "stale-membership" => PeerResponse::StaleMembership,
@@ -1117,7 +1183,7 @@ fn bodyless_response(head: &MessageHead, outcome: &str) -> Result<PeerResponse> 
         _ => return Err(Error::InvalidRequest),
     })
 }
-fn route(head: &MessageHead) -> Result<RouteBudget> {
+fn route(clock: &racer_io::Clock, head: &MessageHead) -> Result<RouteBudget> {
     let remaining_links = number(head, "racer-route-links")?
         .try_into()
         .map_err(|_| Error::InvalidRequest)?;
@@ -1135,7 +1201,7 @@ fn route(head: &MessageHead) -> Result<RouteBudget> {
         remaining_attempts: number(head, "racer-route-attempts")?
             .try_into()
             .map_err(|_| Error::InvalidRequest)?,
-        deadline: decode_deadline(number(head, "racer-route-deadline")?)?,
+        deadline: decode_deadline(clock, number(head, "racer-route-deadline")?)?,
     })
 }
 impl SecurityCodec {
@@ -1215,8 +1281,12 @@ impl SecurityCodec {
             }
             _ => return Err(Error::InvalidRequest),
         };
-        let original_route = route(head)?;
-        let effective_route = route(authentication.hops.last().map(|h| &h.head).unwrap_or(head))?;
+        let clock = scope.clock();
+        let original_route = route(clock, head)?;
+        let effective_route = route(
+            clock,
+            authentication.hops.last().map(|h| &h.head).unwrap_or(head),
+        )?;
         let mut origin_scope = scope.clone();
         origin_scope.request = original_route.request;
         origin_scope.deadline.0 = origin_scope.deadline.0.min(effective_route.deadline.0);
@@ -1249,7 +1319,7 @@ impl SecurityCodec {
             origin,
             route: original_route,
         };
-        agrees(head, &request_head(&request)?, false)?;
+        agrees(head, &request_head(clock, &request)?, false)?;
         request.route = effective_route;
         Ok(SignedRequest {
             authentication,
@@ -1262,24 +1332,33 @@ impl SecurityCodec {
         body: Vec<u8>,
         scope: &RequestScope,
     ) -> Result<SignedResponse> {
-        self.response_reserved(authentication, body, None, scope)
+        let body = if body.is_empty() {
+            ResponseBody::Empty
+        } else {
+            // Unkeyed staging; the decoder recharges it to the page's cache.
+            let reservation = self.admission.reserve(
+                None,
+                ResourceClass::Ciphertext,
+                self.buffers.aligned_capacity(body.len())?,
+            )?;
+            let mut buffer = self.buffers.aligned_ciphertext(reservation, body.len())?;
+            buffer.as_mut_slice().copy_from_slice(&body);
+            ResponseBody::Aligned(buffer)
+        };
+        self.response_body(authentication, body, scope)
     }
-    /// Transfer the completed receive allocation's charge into the decoded page.
-    pub fn response_reserved(
+    /// Decode `body` staged under a caller's keyed Ciphertext `reservation`.
+    #[cfg(test)]
+    pub(crate) fn response_reserved(
         &self,
         authentication: ForwardedHead,
         body: Vec<u8>,
-        reservation: Option<flow_control::Charge<AdmissionPolicy>>,
+        reservation: flow_control::Charge<AdmissionPolicy>,
         scope: &RequestScope,
     ) -> Result<SignedResponse> {
-        self.response_body(
-            authentication,
-            ResponseBody::Owned {
-                bytes: body,
-                reservation,
-            },
-            scope,
-        )
+        let mut buffer = self.buffers.encryption_output(reservation, body.len())?;
+        buffer.as_mut_slice().copy_from_slice(&body);
+        self.response_body(authentication, ResponseBody::Aligned(buffer), scope)
     }
     /// Decode a response, keeping an aligned body in place as the page.
     pub(crate) fn response_body(
@@ -1300,29 +1379,21 @@ impl SecurityCodec {
                     return Err(Error::InvalidRequest);
                 }
                 let ciphertext = match body {
-                    ResponseBody::Owned {
-                        bytes: body,
-                        reservation,
-                    } => {
-                        let reservation = match reservation {
-                            Some(reservation) => {
-                                reservation.validate(ResourceClass::Ciphertext, body.capacity())?;
-                                if !self.admission.owns(&reservation)
-                                    || reservation.key() != Some(&metadata.version.object.cache)
-                                {
-                                    return Err(Error::InvalidRequest);
-                                }
-                                reservation
-                            }
-                            None => self.admission.reserve(
+                    ResponseBody::Empty => return Err(Error::InvalidRequest),
+                    ResponseBody::Aligned(mut buffer) => {
+                        if buffer.charge().key().is_none() && self.admission.owns(buffer.charge()) {
+                            let keyed = self.admission.reserve(
                                 Some(&metadata.version.object.cache),
                                 ResourceClass::Ciphertext,
-                                body.capacity(),
-                            )?,
-                        };
-                        self.buffers.ciphertext(reservation, envelope, body)?
-                    }
-                    ResponseBody::Aligned(buffer) => {
+                                buffer.capacity(),
+                            )?;
+                            // The unkeyed staging charge is released here.
+                            drop(
+                                buffer
+                                    .replace_charge(keyed)
+                                    .map_err(|_| Error::InvalidConfiguration)?,
+                            );
+                        }
                         let reservation = buffer.charge();
                         reservation.validate(ResourceClass::Ciphertext, buffer.capacity())?;
                         if !self.admission.owns(reservation)
@@ -1330,8 +1401,7 @@ impl SecurityCodec {
                         {
                             return Err(Error::InvalidRequest);
                         }
-                        self.buffers
-                            .aligned_ciphertext_page(buffer, envelope, None)?
+                        self.buffers.aligned_ciphertext_page(buffer, envelope)?
                     }
                 };
                 if outcome == "selected" {
@@ -1391,6 +1461,7 @@ pub(crate) mod tests {
             expires_at: ExpiresAt::from_system_time(UNIX_EPOCH).unwrap(),
         };
         let envelope = PageEnvelope {
+            page_size: racer_wire::object::PageSize::DEFAULT,
             cipher: crate::model::PageCipher::Xaes256Gcm,
             page: PageId {
                 version,
@@ -1445,6 +1516,7 @@ pub(crate) mod tests {
             expires_at: ExpiresAt::from_system_time(UNIX_EPOCH).unwrap(),
         };
         let envelope = PageEnvelope {
+            page_size: racer_wire::object::PageSize::DEFAULT,
             cipher: crate::model::PageCipher::Xaes256Gcm,
             page: PageId {
                 version: metadata.version.clone(),
@@ -1500,6 +1572,7 @@ pub(crate) mod tests {
             ("racer-page", "0"),
             ("racer-page-key", "AAAAAAAAAAAAAAAAAAAAAA=="),
             ("racer-page-cipher", "1"),
+            ("racer-page-size", "16777216"),
             ("racer-page-nonce", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
             ("racer-plaintext-length", "3"),
             ("racer-ciphertext-length", "19"),
@@ -1618,12 +1691,16 @@ pub(crate) mod tests {
             ),
             Err(Error::InvalidRequest)
         ));
-        assert_eq!(admission.used(ResourceClass::Ciphertext), 19);
+        assert_eq!(
+            admission.used(ResourceClass::Ciphertext),
+            page_alloc::buf::GRANULE
+        );
         for (response, status, outcome) in [
             (PeerResponse::NotFound, 404, "not-found"),
             (PeerResponse::OriginRejected, 401, "origin-rejected"),
             (PeerResponse::OriginForbidden, 403, "origin-forbidden"),
             (PeerResponse::Overloaded, 200, "overloaded"),
+            (PeerResponse::FlightFull, 200, "flight-full"),
         ] {
             let head = response_head(&response, &[0; 32], &[]).unwrap();
             assert!(
@@ -1650,7 +1727,7 @@ pub(crate) mod tests {
             opaque_page_response(&metadata, &invalid, PageOutcome::Page, &[0; 32], &[]).is_err()
         );
         let mut page = page;
-        Arc::get_mut(&mut page.inner).unwrap().bytes.pop();
+        Arc::get_mut(&mut page.inner).unwrap().fixture_pop();
         assert!(matches!(
             response_head(
                 &PeerResponse::Bootstrap {
@@ -1668,10 +1745,13 @@ pub(crate) mod tests {
         use super::*;
         #[test]
         fn received_page_keeps_one_charge_and_rejects_foreign_reservations() {
-            let signers = crate::peer::tests::signers();
+            let env = racer_io::Env::host();
+            let signers = crate::peer::tests::signers(&env);
             let cache = CacheId("cccccccc-1111-4111-8111-111111111111".into());
             let mut limits = crate::test_support::cluster::config(false).limits;
-            limits.ciphertext_bytes = std::num::NonZeroUsize::new(19).unwrap();
+            // One pooled page: a second charge would exceed the limit.
+            limits.ciphertext_bytes =
+                std::num::NonZeroUsize::new(page_alloc::buf::GRANULE).unwrap();
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 limits.clone(),
             )));
@@ -1696,6 +1776,7 @@ pub(crate) mod tests {
                         .reserve(Some(&cache), ResourceClass::Ciphertext, 19)
                         .unwrap(),
                     PageEnvelope {
+                        page_size: racer_wire::object::PageSize::DEFAULT,
                         cipher: crate::model::PageCipher::Xaes256Gcm,
                         page: PageId {
                             version: metadata.version.clone(),
@@ -1725,9 +1806,9 @@ pub(crate) mod tests {
                 hops: vec![],
             };
             drop(response);
-            let scope = RequestScope::new(
+            let scope = RequestScope::host(
                 RequestId([1; 16]),
-                uring_runtime::environment::now() + Duration::from_secs(30),
+                racer_io::Clock::host().now() + Duration::from_secs(30),
             )
             .unwrap();
             for case in 0..5 {
@@ -1747,10 +1828,13 @@ pub(crate) mod tests {
                     original: authentication.original.clone(),
                     hops: vec![],
                 };
-                let result = codec.response_reserved(auth, vec![9; 19], Some(reservation), &scope);
+                let result = codec.response_reserved(auth, vec![9; 19], reservation, &scope);
                 if case == 0 {
                     let result = result.unwrap();
-                    assert_eq!(admission.used(ResourceClass::Ciphertext), 19);
+                    assert_eq!(
+                        admission.used(ResourceClass::Ciphertext),
+                        page_alloc::buf::GRANULE
+                    );
                     let PeerResponse::Page { ciphertext, .. } = result.response else {
                         panic!("page required")
                     };
@@ -1769,7 +1853,8 @@ pub(crate) mod tests {
         }
         #[test]
         fn received_aligned_body_becomes_disk_aligned_page_and_rejects_mismatches() {
-            let signers = crate::peer::tests::signers();
+            let env = racer_io::Env::host();
+            let signers = crate::peer::tests::signers(&env);
             let cache = CacheId("cccccccc-1111-4111-8111-111111111111".into());
             let limits = crate::test_support::cluster::config(false).limits;
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
@@ -1797,6 +1882,7 @@ pub(crate) mod tests {
                         .reserve(Some(&cache), ResourceClass::Ciphertext, 19)
                         .unwrap(),
                     PageEnvelope {
+                        page_size: racer_wire::object::PageSize::DEFAULT,
                         cipher: crate::model::PageCipher::Xaes256Gcm,
                         page: PageId {
                             version: metadata.version.clone(),
@@ -1823,9 +1909,9 @@ pub(crate) mod tests {
             push(&mut head, "racer-receiver", &signers[0].node().0);
             let original = std::sync::Arc::new(signers[2].sign(head).unwrap());
             drop(response);
-            let scope = RequestScope::new(
+            let scope = RequestScope::host(
                 RequestId([1; 16]),
-                uring_runtime::environment::now() + Duration::from_secs(30),
+                racer_io::Clock::host().now() + Duration::from_secs(30),
             )
             .unwrap();
             let alignment = crate::memory::default_disk_alignment();
@@ -1933,17 +2019,27 @@ pub(crate) mod tests {
 
     mod envelope_tests {
         use super::*;
+        fn fixture_chain() -> Arc<peer_wire::Chain> {
+            peer_wire::Chain::decode(&[0, 0, 0, 1, 0]).unwrap()
+        }
         fn envelope() -> ForwardedHead {
             ForwardedHead {
                 original: Arc::new(SignedHead {
                     head: MessageHead {
                         start: StartLine::Response { status: 404 },
-                        headers: vec![Header {
-                            name: "racer-opaque".into(),
-                            value: b"AAEC/w==".to_vec(),
-                        }],
+                        headers: vec![
+                            Header {
+                                name: "racer-opaque".into(),
+                                value: b"AAEC/w==".to_vec(),
+                            },
+                            Header {
+                                name: "racer-certificate".into(),
+                                value: binary(fixture_chain().fingerprint()).into_bytes(),
+                            },
+                        ],
                     },
                     signature: vec![7; 64],
+                    chain: None,
                 }),
                 hops: vec![],
             }
@@ -1951,31 +2047,35 @@ pub(crate) mod tests {
         #[test]
         fn envelope_preserves_signature_and_opaque_headers() {
             let original = envelope();
-            let (decoded, length) =
-                decode_envelope(encode_envelope(&original, true, 27).unwrap(), true).unwrap();
+            let (decoded, length) = decode_envelope(
+                encode_envelope(&original, true, 27).unwrap(),
+                true,
+                &peer_wire::test_util::AnyChain,
+            )
+            .unwrap();
             assert_eq!(length, 27);
             assert_eq!(decoded.original.signature, original.original.signature);
             assert_eq!(decoded.original.head.headers[0].value, b"AAEC/w==");
         }
         #[test]
         fn rejects_versions_duplicates_holes_and_request_bodies() {
-            for version in ["0", "2", "3", "10"] {
+            for version in ["0", "1", "3", "10"] {
                 let mut head = encode_envelope(&envelope(), false, 0).unwrap();
                 head.headers[0].value = version.as_bytes().to_vec();
-                assert!(decode_envelope(head, false).is_err());
+                assert!(decode_envelope(head, false, &peer_wire::test_util::AnyChain).is_err());
             }
             let mut head = encode_envelope(&envelope(), false, 0).unwrap();
             head.headers.push(Header {
                 name: "Content-Length".into(),
                 value: b"0".to_vec(),
             });
-            assert!(decode_envelope(head, false).is_err());
+            assert!(decode_envelope(head, false, &peer_wire::test_util::AnyChain).is_err());
             let mut head = encode_envelope(&envelope(), false, 0).unwrap();
             head.headers.push(Header {
                 name: "racer-hop-1".into(),
                 value: encode_signed(&envelope().original).unwrap(),
             });
-            assert!(decode_envelope(head, false).is_err());
+            assert!(decode_envelope(head, false, &peer_wire::test_util::AnyChain).is_err());
             assert!(encode_envelope(&envelope(), false, 1).is_err());
             assert!(encode_envelope(&envelope(), true, usize::MAX).is_err());
         }
@@ -1990,7 +2090,8 @@ pub(crate) mod tests {
         }
         #[test]
         fn maximum_signed_heads_and_hop_count_fit_outer_signature_profile() {
-            let signers = crate::test_support::security::network(2);
+            let env = racer_io::Env::host();
+            let signers = crate::test_support::security::network(&env, 2);
             let mut head = MessageHead {
                 start: StartLine::Response { status: 200 },
                 headers: vec![
@@ -2065,7 +2166,6 @@ pub(crate) mod tests {
         use std::future::Future;
         use std::task::Context;
         use std::task::Poll;
-        use std::time::Instant;
         fn frame() -> MessageHead {
             MessageHead {
                 start: StartLine::Request {
@@ -2086,12 +2186,12 @@ pub(crate) mod tests {
                 .unwrap()
                 .0
         }
-        pub(crate) fn pair() -> (Session, Session) {
-            let n = crate::test_support::security::network(3);
+        pub(crate) fn pair(env: &racer_io::Env) -> (Session, Session) {
+            let n = crate::test_support::security::network(env, 3);
             let id = random().unwrap();
             (
-                peer_wire::test_util::session(n[0].inner.clone(), n[1].node().clone(), id, 0),
-                peer_wire::test_util::session(n[1].inner.clone(), n[0].node().clone(), id, 1),
+                peer_wire::test_util::session(n[0].inner.clone(), &n[1].inner, id, 0),
+                peer_wire::test_util::session(n[1].inner.clone(), &n[0].inner, id, 1),
             )
         }
         pub(crate) fn signer(session: &Session) -> Rc<Signatures> {
@@ -2130,7 +2230,8 @@ pub(crate) mod tests {
         }
         #[test]
         fn historical_proof_requires_fresh_head_and_session_cannot_be_reinstalled() {
-            let (mut a, mut b) = pair();
+            let env = racer_io::Env::host();
+            let (mut a, mut b) = pair(&env);
             let mut original = frame();
             push(&mut original, "racer-receiver", &a.peer.0);
             let proof = std::sync::Arc::new(a.signatures.sign(original).unwrap());
@@ -2143,7 +2244,8 @@ pub(crate) mod tests {
                 let wire = a.sign(encode_envelope(&auth, false, 0).unwrap()).unwrap();
                 let copy = clone_head(&wire);
                 let decoded = b.admit(wire).unwrap();
-                let (retained, _) = decode_envelope(decoded, false).unwrap();
+                let (retained, _) =
+                    decode_envelope(decoded, false, &peer_wire::test_util::AnyChain).unwrap();
                 assert_eq!(retained.original.signature, proof.signature);
                 assert_eq!(b.rx, sequence);
                 if let Some(old) = previous {
@@ -2165,26 +2267,23 @@ pub(crate) mod tests {
         }
         #[test]
         fn parallel_connections_isolate_counters_and_wall_rollback_cannot_resurrect_frames() {
-            let clock = uring_runtime::environment::SimulationClock::new_at(
-                92,
-                Instant::now(),
-                std::time::SystemTime::now(),
-            );
-            let environment = clock.environment(1);
-            let _guard = environment.enter();
-            let (mut a, mut b) = pair();
+            let clock =
+                racer_io::SimClock::new_at(92, Instant::now(), std::time::SystemTime::now());
+            let environment = clock.ctx(1);
+            let env = racer_io::Env::new(racer_io::Driver::Uring, environment.clone());
+            let (mut a, mut b) = pair(&env);
             let id = random().unwrap();
             let mut other_a =
-                peer_wire::test_util::session(a.signatures.clone(), a.peer.clone(), id, 0);
+                peer_wire::test_util::session(a.signatures.clone(), &b.signatures, id, 0);
             let mut other_b =
-                peer_wire::test_util::session(b.signatures.clone(), b.peer.clone(), id, 1);
+                peer_wire::test_util::session(b.signatures.clone(), &a.signatures, id, 1);
             let old = a.sign(frame()).unwrap();
             b.admit(clone_head(&old)).unwrap();
             assert!(other_b.admit(clone_head(&old)).is_err());
             assert_eq!(other_b.rx, 0);
             other_b.admit(other_a.sign(frame()).unwrap()).unwrap();
             clock.advance(Duration::from_secs(61));
-            clock.set_wall_time(uring_runtime::environment::wall_now() - Duration::from_secs(61));
+            clock.set_wall_time(env.ctx.clock.wall_now() - Duration::from_secs(61));
             assert!(b.admit(old).is_err());
             assert_eq!(b.rx, 1);
             b.admit(a.sign(frame()).unwrap()).unwrap();
@@ -2192,15 +2291,12 @@ pub(crate) mod tests {
         }
         #[test]
         pub(crate) fn more_than_4096_frames_at_fixed_time_have_constant_session_storage() {
-            let clock = uring_runtime::environment::SimulationClock::new_at(
-                71,
-                Instant::now(),
-                std::time::SystemTime::now(),
-            );
-            let environment = clock.environment(0);
-            let _guard = environment.enter();
-            let (mut a, mut b) = pair();
-            let now = uring_runtime::environment::wall_now();
+            let clock =
+                racer_io::SimClock::new_at(71, Instant::now(), std::time::SystemTime::now());
+            let environment = clock.ctx(0);
+            let env = racer_io::Env::new(racer_io::Driver::Uring, environment.clone());
+            let (mut a, mut b) = pair(&env);
+            let now = env.ctx.clock.wall_now();
             let bytes = std::mem::size_of_val(&a) + std::mem::size_of_val(&b);
             for sequence in 1..=5000 {
                 let h = a.sign(frame()).unwrap();
@@ -2227,11 +2323,12 @@ pub(crate) mod tests {
         }
         #[test]
         fn loopback_mutual_authentication_pool_reuse_and_fresh_reconnect() {
-            let n = crate::test_support::security::network(2);
+            let env = racer_io::Env::host();
+            let n = crate::test_support::security::network(&env, 2);
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(false).limits,
             )));
-            let reactor = Rc::new(Reactor::new(admission.clone()));
+            let reactor = Rc::new(Reactor::new(admission.clone(), &env));
             let io = crate::http::new_io(
                 reactor.clone(),
                 Codec::new(MAX_ENVELOPE_HEAD),
@@ -2241,11 +2338,9 @@ pub(crate) mod tests {
             let pool = crate::http::new_pool(reactor.clone(), admission.clone(), 2);
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let endpoint = Endpoint::Peer(listener.local_addr().unwrap().to_string());
-            let listener = Rc::new(uring_runtime::reactor::descriptor::Descriptor::from(
-                listener,
-            ));
+            let listener = Rc::new(racer_io::ring::Descriptor::from(listener));
             let scope =
-                RequestScope::new(RequestId([1; 16]), Instant::now() + Duration::from_secs(30))
+                RequestScope::host(RequestId([1; 16]), Instant::now() + Duration::from_secs(30))
                     .unwrap();
             let mut previous_id = None;
             for _ in 0..2 {
@@ -2299,7 +2394,8 @@ pub(crate) mod tests {
         }
         #[test]
         pub(crate) fn signed_challenges_bind_both_identities_protocol_and_fresh_randomness() {
-            let n = crate::test_support::security::network(3);
+            let env = racer_io::Env::host();
+            let n = crate::test_support::security::network(&env, 3);
             let a = random().unwrap();
             let b = random().unwrap();
             assert_ne!(a, random().unwrap());
@@ -2348,7 +2444,8 @@ pub(crate) mod tests {
         }
         #[test]
         fn handshake_codec_bounds() {
-            let n = crate::test_support::security::network(2);
+            let env = racer_io::Env::host();
+            let n = crate::test_support::security::network(&env, 2);
             let h = session_head(
                 &n[1],
                 n[0].node(),
@@ -2378,15 +2475,16 @@ pub(crate) mod tests {
         }
         #[test]
         fn socket_admission_rejects_replay_before_dispatch_and_closes_pool_slot() {
-            use uring_runtime::reactor::IoBuffer;
-            let n = crate::test_support::security::network(2);
+            use racer_io::ring::IoBuffer;
+            let env = racer_io::Env::host();
+            let n = crate::test_support::security::network(&env, 2);
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(false).limits,
             )));
-            let reactor = Rc::new(Reactor::new(admission.clone()));
+            let reactor = Rc::new(Reactor::new(admission.clone(), &env));
             let io = crate::http::new_io(reactor.clone(), Codec::new(65536), admission.clone(), 0);
             let scope =
-                RequestScope::new(RequestId([2; 16]), Instant::now() + Duration::from_secs(10))
+                RequestScope::host(RequestId([2; 16]), Instant::now() + Duration::from_secs(10))
                     .unwrap();
             let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
             let a = crate::http::from_accepted(a.into(), &admission).unwrap();
@@ -2425,18 +2523,56 @@ pub(crate) mod tests {
             drop(a);
             assert_eq!(admission.used(ResourceClass::Connection), 0);
         }
+        /// A listener with no peer ingress slot answers the overload head in place of the
+        /// challenge (`PeerServer::refuse`): the sender's handshake fails `Overloaded` at once
+        /// and the connection is not pooled. Any other unsigned answer fails otherwise.
+        #[test]
+        fn handshake_reads_a_refusal_as_overloaded() {
+            use std::io::Write;
+            let env = racer_io::Env::host();
+            let n = crate::test_support::security::network(&env, 2);
+            let overloaded = Codec::new(65536)
+                .encode_head(&peer_wire::overloaded_head())
+                .unwrap();
+            let mut other = peer_wire::overloaded_head();
+            other.headers[0].value = b"1".to_vec();
+            let other = Codec::new(65536).encode_head(&other).unwrap();
+            for (answer, refused) in [(overloaded, true), (other, false)] {
+                let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+                    crate::test_support::cluster::config(false).limits,
+                )));
+                let reactor = Rc::new(Reactor::new(admission.clone(), &env));
+                let io =
+                    crate::http::new_io(reactor.clone(), Codec::new(65536), admission.clone(), 0);
+                let scope = RequestScope::host(
+                    RequestId([4; 16]),
+                    Instant::now() + Duration::from_secs(10),
+                )
+                .unwrap();
+                let (a, mut b) = std::os::unix::net::UnixStream::pair().unwrap();
+                b.write_all(&answer).unwrap();
+                let a = crate::http::from_accepted(a.into(), &admission).unwrap();
+                let result = drive(&reactor, connect(&io, a, n[0].clone(), n[1].node(), &scope));
+                let error = result.err().unwrap();
+                assert_eq!(error == Error::Overloaded, refused, "{error:?}");
+                drive(&reactor, reactor.drain()).unwrap();
+                assert_eq!(admission.used(ResourceClass::Connection), 0);
+                drop(b);
+            }
+        }
         #[test]
         fn handshake_cancel_expiry_and_abandonment_retain_only_fenced_admissions() {
-            let n = crate::test_support::security::network(2);
+            let env = racer_io::Env::host();
+            let n = crate::test_support::security::network(&env, 2);
             for end in ["cancel", "expiry", "drop"] {
                 let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                     crate::test_support::cluster::config(false).limits,
                 )));
-                let reactor = Rc::new(Reactor::new(admission.clone()));
+                let reactor = Rc::new(Reactor::new(admission.clone(), &env));
                 reactor.init().unwrap();
                 let io =
                     crate::http::new_io(reactor.clone(), Codec::new(65536), admission.clone(), 0);
-                let scope = RequestScope::new(
+                let scope = RequestScope::host(
                     RequestId([3; 16]),
                     Instant::now()
                         + if end == "expiry" {
@@ -2459,7 +2595,7 @@ pub(crate) mod tests {
                     let result = drive(&reactor, work.as_mut());
                     assert!(matches!(
                         result,
-                        Err(Error::Cancelled | Error::DeadlineExceeded)
+                        Err(Error::Canceled | Error::DeadlineExceeded)
                     ));
                 }
                 drop(work);
@@ -2605,8 +2741,9 @@ pub(crate) mod tests {
         }
         #[test]
         fn request_mac_rotates_and_rejects_missing_retired_or_mutated_tags() {
-            use racer_control_wire::*;
-            let network = network(2);
+            use racer_wire::control::*;
+            let env = racer_io::Env::host();
+            let network = network(&env, 2);
             let make = || {
                 let mut request = head(1);
                 request
@@ -2641,12 +2778,12 @@ pub(crate) mod tests {
                     key.key.id.0[4..12].copy_from_slice(&2u64.to_be_bytes());
                     let (reference, state, mut material) = key.clone().into_installation();
                     material[0] ^= 1;
-                    *key = racer_control_wire::CacheEncryptionKey::new(reference, state, material);
+                    *key = racer_wire::control::CacheEncryptionKey::new(reference, state, material);
                 }
                 signer
                     .keys
                     .install(KeyringBundle {
-                        schema_version: SCHEMA_VERSION,
+                        schema_version: racer_wire::control::KEYRING_SCHEMA_VERSION,
                         cluster: signer.keys.cluster().clone(),
                         generation: BundleGeneration(2),
                         peer_trust_roots: (*signer.keys.peer_trust_roots().unwrap()).clone(),
@@ -2663,7 +2800,8 @@ pub(crate) mod tests {
         }
         #[test]
         pub(crate) fn malformed_fields_unknown_algorithm_and_historical_expiry() {
-            let n = network(2);
+            let env = racer_io::Env::host();
+            let n = network(&env, 2);
             let original = n[0].sign(head(1)).unwrap();
             let mut duplicate = clone_head(&original);
             push(&mut duplicate.head, "Racer-Kind", "test");
@@ -2746,7 +2884,22 @@ pub(crate) mod tests {
         }
 
         #[test]
+        fn untimed_scope_wire_deadline_is_bounded() {
+            let env = racer_io::Env::host();
+            let scope =
+                crate::runtime::RequestScope::untimed(RequestId([7; 16]), racer_io::Clock::host())
+                    .unwrap();
+            let before = Instant::now();
+            let encoded = encode_deadline(scope.clock(), scope.deadline).unwrap();
+            let decoded = decode_deadline(&env.ctx.clock, encoded).unwrap();
+            assert!(decoded.0 <= Instant::now() + MAX_WIRE_DEADLINE_HORIZON);
+            assert!(decoded.0 + Duration::from_secs(1) >= before + MAX_WIRE_DEADLINE_HORIZON);
+            let near = Deadline(before + Duration::from_secs(30));
+            assert_eq!(clamp_wire_deadline(near, before).0, near.0);
+        }
+        #[test]
         fn canonical_binary_numbers_node_lists_and_deadline_round_trip() {
+            let env = racer_io::Env::host();
             assert_eq!(binary(&[0, 1, 255]), "AAH/");
             assert!(decode_binary(b"YQ").is_err());
             assert!(decode_binary(b"YR==").is_err());
@@ -2776,11 +2929,11 @@ pub(crate) mod tests {
             }
             assert!(decode_nodes(binary(&duplicate).as_bytes()).is_err());
             let deadline = Deadline(Instant::now() + Duration::from_secs(30));
-            let encoded = encode_deadline(deadline).unwrap();
-            let decoded = decode_deadline(encoded).unwrap();
-            assert_eq!(encode_deadline(decoded).unwrap(), encoded);
+            let encoded = encode_deadline(&env.ctx.clock, deadline).unwrap();
+            let decoded = decode_deadline(&env.ctx.clock, encoded).unwrap();
+            assert_eq!(encode_deadline(&env.ctx.clock, decoded).unwrap(), encoded);
             assert!(decoded.0 <= deadline.0);
-            assert_eq!(MAX_HEAD, MAX_SIGNED_HEAD);
+            const { assert!(MAX_SIGNED_HEAD <= MAX_HEAD) };
         }
     }
 

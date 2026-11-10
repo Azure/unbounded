@@ -10,6 +10,7 @@ pub mod router;
 use crate::admission::AdmissionPolicy;
 use crate::admission::ResourceClass;
 use crate::control::Snapshot;
+use crate::control::cell::PublicationCell;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
@@ -24,25 +25,24 @@ use crate::model::ObjectId;
 use crate::model::ObjectMetadata;
 #[cfg(test)]
 use crate::model::ObjectVersion;
-use crate::model::PAGE_BYTES;
 use crate::model::PageId;
 use crate::model::PageNumber;
+use crate::model::PageSize;
 use crate::read::candidates::OriginAuthority;
 use crate::runtime::RequestScope;
 use crate::security::OriginContext;
-use controlplane::Published;
 use http1::Header;
 use http1::MessageHead;
 #[cfg(test)]
 use http1::StartLine;
-use racer_control_wire::CacheDefinition;
-use racer_control_wire::canonical_socket_paths;
+use racer_io::ring::Completion;
+#[cfg(test)]
+use racer_io::ring::IoBuffer;
+use racer_wire::control::CacheDefinition;
+use racer_wire::control::canonical_socket_paths;
 use std::path::Path;
 use std::path::PathBuf;
 use std::rc::Rc;
-use uring_runtime::reactor::Completion;
-#[cfg(test)]
-use uring_runtime::reactor::IoBuffer;
 
 /// OriginClient is the shipping adapter implementation. Scripted implementations
 /// remain for poll-exact cancellation, wake ordering, and reservation-fence tests;
@@ -72,10 +72,20 @@ pub trait Origin {
         selector: MetadataSelector,
         scope: &'a RequestScope,
     ) -> Operation<'a, MetadataReply>;
+    /// The published cluster page size that sizes one page's plaintext reservation. Adapters
+    /// without a publication (test doubles) keep the default.
+    fn page_size(&self) -> Result<PageSize> {
+        Ok(PageSize::DEFAULT)
+    }
 }
+type NodeIdKey = racer_wire::control::NodeId;
+/// Bound on cached health keys; the cache is cleared when it fills.
+const HEALTH_KEY_CACHE: usize = 256;
 pub struct OriginClient {
     health: crate::topology::LinkHealth,
-    snapshots: std::sync::Arc<Published<Snapshot>>,
+    /// Health keys by endpoint, so each call does not re-format its Debug key.
+    health_keys: std::cell::RefCell<std::collections::HashMap<Endpoint, Rc<NodeIdKey>>>,
+    snapshots: std::sync::Arc<PublicationCell<Snapshot>>,
     pool: Rc<HttpPool>,
     io: Rc<HttpIo>,
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
@@ -90,7 +100,7 @@ impl OriginClient {
     /// the caller provisions and owns the directories (including any symlink policy).
     /// The complete resolved endpoint is checked against Linux's 107-byte UDS cap.
     pub fn new(
-        snapshots: std::sync::Arc<Published<Snapshot>>,
+        snapshots: std::sync::Arc<PublicationCell<Snapshot>>,
         pool: Rc<HttpPool>,
         io: Rc<HttpIo>,
         admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
@@ -110,7 +120,8 @@ impl OriginClient {
             return Err(Error::InvalidConfiguration);
         }
         Ok(Self {
-            health: crate::topology::LinkHealth::new(64),
+            health: crate::topology::LinkHealth::new(64, io.reactor().ctx().clock.clone()),
+            health_keys: Default::default(),
             snapshots,
             pool,
             io,
@@ -129,15 +140,15 @@ impl OriginClient {
     ) -> Result<MetadataReply> {
         scope.check()?;
         self.validate_reservation(&reservation, context)?;
+        let size = self.page_size()?;
         let mut head = request(context, "GET")?;
-        head.headers.push(Header::new("Range", b"bytes=0-16777215"));
-        let connection = self
-            .pool
-            .checkout_wait(endpoint, scope)
-            .await
-            .map_err(response_error)?;
-        let mut response = self.exchange_head(connection, head, scope).await?;
-        let (metadata, length) = validate_bootstrap(&response.value, &context.object)?;
+        // The first page, as the page fetch below would request it.
+        head.headers.push(Header::new(
+            "Range",
+            format!("bytes=0-{}", size.get() - 1).as_bytes(),
+        ));
+        let mut response = self.exchange_head(endpoint, false, head, scope).await?;
+        let (metadata, length) = validate_bootstrap(&response.value, &context.object, size)?;
         if length == 0 {
             scope.check()?;
             response
@@ -155,7 +166,7 @@ impl OriginClient {
             version: metadata.version.clone(),
             number: PageNumber(0),
         };
-        validate_page(&response.value, &page, body.bytes)?;
+        validate_page(&response.value, &page, size, body.bytes)?;
         scope.check()?;
         body.lease
             .finish_exchange()
@@ -164,17 +175,31 @@ impl OriginClient {
             page_zero: Some(OriginPage {
                 metadata: metadata.clone(),
                 plaintext: body.buffer,
+                page_size: size,
             }),
             metadata,
         })
+    }
+
+    /// The link-health key for `endpoint`: its `Debug` form, formatted once.
+    fn health_key(&self, endpoint: &Endpoint) -> Rc<NodeIdKey> {
+        let mut keys = self.health_keys.borrow_mut();
+        if let Some(key) = keys.get(endpoint) {
+            return key.clone();
+        }
+        if keys.len() >= HEALTH_KEY_CACHE {
+            keys.clear();
+        }
+        let key = Rc::new(racer_wire::control::NodeId(format!("{endpoint:?}")));
+        keys.insert(endpoint.clone(), key.clone());
+        key
     }
 
     fn endpoint(&self, context: &OriginContext) -> Result<Endpoint> {
         let snapshot = self.snapshots.current()?.ok_or(Error::Unavailable)?;
         let cache = snapshot
             .caches
-            .iter()
-            .find(|cache| cache.id == context.object.cache)
+            .find(&context.object.cache)
             .ok_or(Error::Unavailable)?;
         Ok(Endpoint::Origin {
             cache: cache.id.clone(),
@@ -196,12 +221,7 @@ impl OriginClient {
         }
         // HEAD has no plaintext reservation and uses metadata connection admission.
         // Where the endpoint cap permits, GETs leave a slot available for HEAD.
-        let connection = self
-            .pool
-            .checkout_metadata(endpoint, scope)
-            .await
-            .map_err(response_error)?;
-        let mut response = self.exchange_head(connection, head, scope).await?;
+        let mut response = self.exchange_head(endpoint, true, head, scope).await?;
         // A pinned 404 is a broken origin contract, not permission to refresh.
         validate_response(
             &response.value,
@@ -236,13 +256,14 @@ impl OriginClient {
         if page.version.object != context.object {
             return Err(Error::Unauthorized);
         }
+        let size = self.page_size()?;
         let first = page
             .number
             .0
-            .checked_mul(PAGE_BYTES)
+            .checked_mul(size.get())
             .ok_or(Error::InvalidRange)?;
         let last = first
-            .checked_add(PAGE_BYTES - 1)
+            .checked_add(size.get() - 1)
             .filter(|last| *last <= i64::MAX as u64)
             .ok_or(Error::InvalidRange)?;
         let mut head = request(context, "GET")?;
@@ -253,16 +274,11 @@ impl OriginClient {
         head.headers
             .push(Header::new("If-Match", page.version.etag.as_bytes()));
         self.validate_reservation(&reservation, context)?;
-        let connection = self
-            .pool
-            .checkout_wait(endpoint, scope)
-            .await
-            .map_err(response_error)?;
-        let response = self.exchange_head(connection, head, scope).await?;
-        let (_, length) = validate_page_head(&response.value, page)?;
+        let response = self.exchange_head(endpoint, false, head, scope).await?;
+        let (_, length) = validate_page_head(&response.value, page, size)?;
         let buffer = self.buffers.plaintext(reservation, length as usize)?;
         let mut body = self.read_page(response.connection, buffer, scope).await?;
-        let metadata = validate_page(&response.value, page, body.bytes)?;
+        let metadata = validate_page(&response.value, page, size, body.bytes)?;
         scope.check()?;
         body.lease
             .finish_exchange()
@@ -270,6 +286,7 @@ impl OriginClient {
         Ok(OriginPage {
             metadata,
             plaintext: body.buffer,
+            page_size: size,
         })
     }
 
@@ -279,29 +296,46 @@ impl OriginClient {
         reservation: &flow_control::Charge<AdmissionPolicy>,
         context: &OriginContext,
     ) -> Result<()> {
-        reservation.validate(ResourceClass::Plaintext, PAGE_BYTES as usize)?;
+        reservation.validate(ResourceClass::Plaintext, self.page_size()?.get() as usize)?;
         if !self.admission.owns(reservation) || reservation.key() != Some(&context.object.cache) {
             return Err(Error::InvalidConfiguration);
         }
         Ok(())
     }
 
-    /// Exchange bounded heads after the caller selects metadata or body admission.
+    /// Check out a connection under metadata or body admission and exchange
+    /// bounded heads. A request that fails on a reused idle connection before
+    /// any response byte retries once after dropping the endpoint's idle
+    /// connections, so it runs on a fresh one: the adapter most likely closed
+    /// the idle socket and never saw the request.
     async fn exchange_head(
         &self,
-        connection: ConnectionLease,
+        endpoint: &Endpoint,
+        metadata: bool,
         head: MessageHead,
         scope: &RequestScope,
-    ) -> Result<http1::connection::HeadCompletion<crate::http::HttpContext, MessageHead>> {
-        let sent = self
-            .io
-            .send_head(connection, head, scope)
-            .await
+    ) -> Result<crate::http::HeadExchange> {
+        let mut retry = Some(crate::http::copy_head(&head));
+        let mut head = head;
+        loop {
+            let connection = if metadata {
+                self.pool.checkout_metadata(endpoint, scope).await
+            } else {
+                self.pool.checkout_wait(endpoint, scope).await
+            }
             .map_err(response_error)?;
-        self.io
-            .receive_head_limited(sent.connection, scope, 32 * 1024)
-            .await
-            .map_err(response_error)
+            match crate::http::exchange_head(&self.io, connection, head, scope, 32 * 1024).await {
+                Ok(response) => return Ok(response),
+                Err(failure) if failure.stale && scope.check().is_ok() => {
+                    let Some(again) = retry.take() else {
+                        return Err(response_error(failure.error));
+                    };
+                    self.pool.discard_idle(endpoint);
+                    head = again;
+                }
+                Err(failure) => return Err(response_error(failure.error)),
+            }
+        }
     }
 
     async fn read_page(
@@ -333,6 +367,15 @@ fn resolve_socket(root: &Path, cache: &CacheDefinition) -> Result<PathBuf> {
     Ok(endpoint)
 }
 impl Origin for OriginClient {
+    /// The published cluster page size; the default before any publication (callers that pass
+    /// an explicit endpoint may run without one).
+    fn page_size(&self) -> Result<PageSize> {
+        Ok(self
+            .snapshots
+            .current()?
+            .map_or(PageSize::DEFAULT, |snapshot| snapshot.page_size))
+    }
+
     fn bootstrap_reserved<'a>(
         &'a self,
         authority: &'a OriginAuthority,
@@ -346,7 +389,7 @@ impl Origin for OriginClient {
             let endpoint = self.endpoint(context)?;
             self.health
                 .run(
-                    &racer_control_wire::NodeId(format!("{endpoint:?}")),
+                    &self.health_key(&endpoint),
                     self.bootstrap_reserved_at(&endpoint, context, reservation, scope),
                 )
                 .await
@@ -369,7 +412,7 @@ impl Origin for OriginClient {
             let endpoint = self.endpoint(context)?;
             self.health
                 .run(
-                    &racer_control_wire::NodeId(format!("{endpoint:?}")),
+                    &self.health_key(&endpoint),
                     self.page_reserved_at(&endpoint, context, page, reservation, scope),
                 )
                 .await
@@ -388,7 +431,7 @@ impl Origin for OriginClient {
             let endpoint = self.endpoint(context)?;
             self.health
                 .run(
-                    &racer_control_wire::NodeId(format!("{endpoint:?}")),
+                    &self.health_key(&endpoint),
                     self.metadata_at(&endpoint, context, selector, scope),
                 )
                 .await
@@ -413,7 +456,7 @@ fn response_error(error: Error) -> Error {
 /// name, so after a ClusterCache is deleted and recreated an origin for the old
 /// UID can still be listening; a UID-bound origin refuses mismatched requests.
 fn request(context: &OriginContext, method: &str) -> Result<MessageHead> {
-    let mut head = racer_object_wire::origin::request(
+    let mut head = racer_wire::object::origin::request(
         &context.object.key,
         method,
         context.metadata.as_ref().map(|value| value.as_header()),
@@ -431,7 +474,7 @@ fn request(context: &OriginContext, method: &str) -> Result<MessageHead> {
 
 #[cfg(test)]
 fn opaque(bytes: &[u8]) -> Result<()> {
-    racer_object_wire::origin::opaque(bytes).map_err(Into::into)
+    racer_wire::object::origin::opaque(bytes).map_err(Into::into)
 }
 
 /// HEAD/initial-GET validation; empty objects produce metadata without a page.
@@ -441,36 +484,47 @@ pub struct MetadataReply {
 }
 
 /// The initial GET selects metadata and page zero atomically at the adapter.
-pub fn validate_bootstrap(head: &MessageHead, object: &ObjectId) -> Result<(ObjectMetadata, u64)> {
-    racer_object_wire::origin::validate_bootstrap(head, object).map_err(Into::into)
+pub fn validate_bootstrap(
+    head: &MessageHead,
+    object: &ObjectId,
+    size: PageSize,
+) -> Result<(ObjectMetadata, u64)> {
+    racer_wire::object::origin::validate_bootstrap(head, object, size).map_err(Into::into)
 }
 pub fn validate_metadata(head: &MessageHead, object: &ObjectId) -> Result<ObjectMetadata> {
-    racer_object_wire::origin::validate_metadata(head, object).map_err(Into::into)
+    racer_wire::object::origin::validate_metadata(head, object).map_err(Into::into)
 }
 
 /// Conditional full-page GET validation before authenticated publication.
 pub struct OriginPage {
     pub metadata: ObjectMetadata,
     pub plaintext: PlaintextBuffer,
+    /// Page size the plaintext was cut at.
+    pub page_size: PageSize,
 }
 /// Require exact If-Match, Content-Range, whole-page length, and final-page bounds.
 /// Reject multipart, short/overlong bodies, and unexpected versions.
 pub fn validate_page(
     head: &MessageHead,
     page: &PageId,
+    size: PageSize,
     received_bytes: usize,
 ) -> Result<ObjectMetadata> {
-    racer_object_wire::origin::validate_page(head, page, received_bytes).map_err(Into::into)
+    racer_wire::object::origin::validate_page(head, page, size, received_bytes).map_err(Into::into)
 }
 
 /// Validate before allocating or receiving any payload.
-fn validate_page_head(head: &MessageHead, page: &PageId) -> Result<(ObjectMetadata, u64)> {
-    racer_object_wire::origin::validate_page_head(head, page).map_err(Into::into)
+fn validate_page_head(
+    head: &MessageHead,
+    page: &PageId,
+    size: PageSize,
+) -> Result<(ObjectMetadata, u64)> {
+    racer_wire::object::origin::validate_page_head(head, page, size).map_err(Into::into)
 }
 
 /// Validate framing before interpreting status; malformed errors are never miss proof.
 fn validate_response(head: &MessageHead, pinned: bool) -> Result<(u16, u64)> {
-    racer_object_wire::origin::validate_response(head, pinned).map_err(Into::into)
+    racer_wire::object::origin::validate_response(head, pinned).map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -478,10 +532,10 @@ mod tests;
 
 #[cfg(test)]
 fn decimal(bytes: &[u8]) -> Result<u64> {
-    racer_object_wire::parse_decimal(bytes).map_err(|_| Error::BadGateway)
+    racer_wire::object::parse_decimal(bytes).map_err(|_| Error::BadGateway)
 }
 
 #[cfg(test)]
 fn metadata(head: &MessageHead, object: &ObjectId, length: u64) -> Result<ObjectMetadata> {
-    racer_object_wire::origin::metadata(head, object, length).map_err(Into::into)
+    racer_wire::object::origin::metadata(head, object, length).map_err(Into::into)
 }

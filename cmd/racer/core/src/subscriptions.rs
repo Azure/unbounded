@@ -5,7 +5,7 @@
 //! it. Dataplane handle drops map to [`Scheduler::cancel_work`], [`Scheduler::cancel_waiter`], and
 //! [`Scheduler::release`].
 
-use flow_control::subscriptions::{Fanout, Interval, include as include_page};
+use crate::flow::subscriptions::{Fanout, Interval, include as include_page};
 use std::collections::HashMap;
 use std::hash::Hash;
 
@@ -14,7 +14,10 @@ use std::hash::Hash;
 pub const MAX_SUBSCRIPTION_FLIGHTS: u16 = 64;
 
 /// Bytes the requester debits per selection when it issues a request.
-const RESERVE: u64 = racer_object_wire::PAGE_BYTES + 16;
+/// Deliberately the largest page whatever the published page size: it is a
+/// contract both ends must apply identically, and requesters open contracts
+/// with a budget of `u32::MAX` such selections, so it never binds.
+const RESERVE: u64 = racer_wire::object::PAGE_BYTES + 16;
 
 /// Retained spent contracts outlive their deadline by the signature freshness
 /// window, so replaying one cannot renew it.
@@ -78,7 +81,7 @@ pub struct Demand(Vec<Interval>);
 impl Demand {
     /// `None` unless `intervals` is canonical and within [`MAX_DEMAND_INTERVALS`].
     pub fn new(intervals: Vec<Interval>) -> Option<Self> {
-        flow_control::subscriptions::canonical(&intervals, MAX_DEMAND_INTERVALS)
+        crate::flow::subscriptions::canonical(&intervals, MAX_DEMAND_INTERVALS)
             .then_some(Self(intervals))
     }
 
@@ -87,7 +90,7 @@ impl Demand {
     }
 
     pub fn contains(&self, page: u64) -> bool {
-        flow_control::subscriptions::contains(&self.0, page)
+        crate::flow::subscriptions::contains(&self.0, page)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -104,7 +107,7 @@ impl Demand {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     DeadlineExceeded,
-    Cancelled,
+    Canceled,
     Overloaded,
     Unavailable,
     StaleFlight,
@@ -244,7 +247,7 @@ struct FlightKey<M, V> {
 type Slots<M, R, V, P, E> = Fanout<FlightKey<M, V>, EntryKey<M, R>, Delivery<P, M, R, V>, E, u64>;
 
 type Slot<M, R, V, P, E> =
-    flow_control::subscriptions::Pending<EntryKey<M, R>, Delivery<P, M, R, V>, E, u64>;
+    crate::flow::subscriptions::Pending<EntryKey<M, R>, Delivery<P, M, R, V>, E, u64>;
 
 /// Sans-IO subscription scheduler. See the module documentation.
 pub struct Scheduler<M, R, V, P, E> {
@@ -648,7 +651,7 @@ where
                 return Some((
                     &key.receiver,
                     false,
-                    flow_control::subscriptions::outstanding(
+                    crate::flow::subscriptions::outstanding(
                         &entry.subscription.demand.0,
                         &entry.completed,
                     ),
@@ -661,10 +664,10 @@ where
             Some((
                 &key.receiver,
                 true,
-                flow_control::subscriptions::outstanding(demand, &done),
+                crate::flow::subscriptions::outstanding(demand, &done),
             ))
         });
-        flow_control::subscriptions::select(demands, eligible)
+        crate::flow::subscriptions::select(demands, eligible)
     }
 
     fn remove_pending(&mut self, token: u64) -> Option<Slot<M, R, V, P, E>> {
@@ -699,7 +702,7 @@ where
 
     /// Abandon acquisition `work` (the dataplane drops `Work` unfinished).
     pub fn cancel_work(&mut self, work: u64) {
-        self.finish(work, Err(E::from(Kind::Cancelled)), false);
+        self.finish(work, Err(E::from(Kind::Canceled)), false);
     }
 
     fn finish(&mut self, flight: u64, result: Result<(P, u64), E>, promote: bool) {
@@ -811,7 +814,7 @@ where
     }
 
     /// Abandon a response slot (the dataplane drops `Waiter`). An elected but
-    /// untaken acquisition is cancelled with it.
+    /// untaken acquisition is canceled with it.
     pub fn cancel_waiter(&mut self, waiter: u64) {
         if let Some(pending) = self.remove_pending(waiter)
             && pending.promoted
@@ -967,7 +970,7 @@ mod tests {
         s.cancel_work(work);
         assert_eq!(
             ready(s.poll(follow.waiter, 1)).unwrap_err(),
-            Err::Kind(Kind::Cancelled)
+            Err::Kind(Kind::Canceled)
         );
         assert_eq!(s.flight_count(), 0);
     }

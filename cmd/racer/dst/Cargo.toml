@@ -1,0 +1,20 @@
+[package]
+name = "racer-dst"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+description = "Unified deterministic simulation test harness for Racer"
+
+[[bin]]
+name = "racer-dst"
+path = "src/main.rs"
+
+[dependencies]
+racer = { path = "..", features = ["dst"] }
+racer-authority = { path = "../authority", features = ["sim"] }
+racer-io = { path = "../io" }
+racer-core = { path = "../core" }
+racer-wire = { path = "../wire" }
+topology = { path = "../topology" }
+serde_json = "1"

@@ -1,20 +1,38 @@
-//! `gpu-read` backend: one GPU helper thread owns every CUDA object.
+//! `gpu-read` backend: a coordinator thread and one executor thread per GPU.
 //!
-//! `racer_gpu` types are `!Send`, so all GPU state lives on a single native
-//! helper thread started once per process. I/O threads talk to it through a
-//! job channel and get answers on one-shot channels, so they never block on
-//! CUDA. The helper may block: it synchronizes the request's stream after each
-//! page before it answers, which is what makes a page visible to the client.
+//! The coordinator (`racer-gpu`) loads the backend, discovers GPUs, imports
+//! client allocations, registers files with cuFile and hands reads to the
+//! cuFile reader threads, and allocates landing buffers. Each GPU's executor
+//! (`racer-gpu-N`) runs the page jobs of requests whose allocation is on that
+//! GPU. I/O threads talk to both through queues and get answers on one-shot
+//! channels, so they never block on CUDA. Every GPU thread enters the
+//! backend with [`racer_gpu::Gpu::enter_thread`], which is how tests run on
+//! the simulated backend.
 //!
-//! Each request gets its own stream and import. Jobs for one request run in
-//! order, and a request has at most one job in flight, because the client path
-//! awaits each page before the next. [`MAX_OPEN`] bounds requests.
+//! # Executors
+//!
+//! An executor keeps up to [`STREAMS`] pages in flight, each on its own
+//! stream (a lane), and learns that a page's work completed by polling the
+//! fence recorded after it ([`racer_gpu::Fence::poll`], `cuEventQuery`). It
+//! never synchronizes a stream on the success path. Fence events come from a
+//! per-GPU [`racer_gpu::EventPool`]. With nothing in flight it sleeps on its
+//! queue's condition variable; with fences pending it naps between polls,
+//! from [`POLL_MIN`] doubling to [`POLL_MAX`], and a new page wakes it at
+//! once.
+//!
+//! Each executor's queue is bounded: at most `queue_depth` page jobs
+//! ([`QUEUE_DEPTH`] by default) may be queued or running on one GPU; more
+//! are refused with [`Error::Overloaded`]. A request has at most one page
+//! running at a time, so its pages land in order. [`MAX_OPEN`] bounds
+//! requests.
 //!
 //! When a request ends without [`DirectSink::finish`] (for example the client
-//! disconnected), dropping its sink queues a release job behind any page copy
-//! still running. The helper releases the stream first, which synchronizes it,
-//! then the import. `racer_gpu` leaks and counts anything whose release fails,
-//! so memory a GPU may still write is never freed.
+//! disconnected), dropping its sink queues a release behind its pages. The
+//! executor drops the import once they are answered; a fence still holding
+//! it keeps the mapping until the GPU is done. `racer_gpu` leaks and counts
+//! anything whose release fails, so memory a GPU may still write is never
+//! freed. When the helper is dropped, the executors finish and answer every
+//! queued page before they exit.
 //!
 //! # Sealed pages
 //!
@@ -23,18 +41,26 @@
 //! them. Each GPU has one staging buffer of [`SLOT_BYTES`] slots, allocated on
 //! first use and capped by `RACER_GPU_STAGING_BYTES`:
 //!
-//! - Slot 0 holds host ciphertext copied in for the current job.
-//! - Slot 1 holds plaintext when a range covers only part of a page: the GPU
-//!   decrypts the whole page there (the tag covers all of it), checks the
-//!   verdict, then copies only the requested bytes into the import.
+//! - The first [`scratch_slots`] slots are scratch pairs, one pair per
+//!   stream when staging is large. A page takes a pair when it needs one:
+//!   host or other-GPU ciphertext is copied into the pair's ciphertext slot,
+//!   and a range that covers only part of a page is decrypted whole into the
+//!   pair's plaintext slot (the tag covers all of it). That copy out to the
+//!   import is queued only after the verdict passed, so a failed page never
+//!   exposes scratch bytes. A page that needs a pair while none is free
+//!   waits; pages behind it may pass.
 //! - The other slots hold ciphertext that a page's owning worker read from a
 //!   local v2 disk record with cuFile ([`GpuHelper::stage_file`]). A
 //!   [`StagedCiphertext`] owns its slot and returns it on drop. When every
 //!   slot is taken, the owner reads the record through host memory instead.
 //!
-//! The helper runs one job at a time and synchronizes before it answers, so the
-//! two scratch slots are never shared by two jobs and no staged slot is in use
-//! by a stream between jobs, which [`racer_gpu::GpuFile::read`] requires.
+//! Every source a decrypt reads (a staged or landed slot, or a scratch slot)
+//! stays unchanged until the page is answered: the page owns the staged or
+//! landed slot, the scratch pair is the page's until its last fence
+//! completes, and the fence holds every buffer and host source. After a
+//! failed page, the lane's stream is synchronized; if that fails, the stream
+//! and its scratch pair are set aside and the GPU refuses sealed pages until
+//! they synchronize.
 //!
 //! # RDMA landing
 //!
@@ -57,16 +83,20 @@
 //! Staged and landed ciphertext is reference counted
 //! ([`SealedSource`] holds an `Arc`), so several requests may decrypt the
 //! same bytes. A request on the same GPU decrypts straight from the slot. A
-//! request on another GPU first copies the ciphertext into its own scratch
-//! slot 0: over NVLink or PCIe peer-to-peer when [`GpuHelper::peers`] allows
+//! request on another GPU first copies the ciphertext into the ciphertext slot of
+//! its scratch pair: over NVLink or PCIe peer-to-peer when [`GpuHelper::peers`] allows
 //! it (`RACER_GPU_PEER=auto`), otherwise, or after a failed peer copy, by
-//! bouncing it through host memory. Each GPU still verifies the CRC and tag
+//! bouncing it through host memory. Each GPU still verifies the tag
 //! itself. A failed peer copy turns that GPU pair off for the life of the
-//! process. The job holds the source `Arc` until it has synchronized, so the
-//! source slot is never reused while a copy may read it.
+//! process. A peer copy is queued on the page's stream with no host wait. A
+//! bounce copies into the lane's pinned host slot on the executor's own
+//! utility stream for the source GPU, and the page's stream waits on that fence
+//! ([`racer_gpu::Stream::wait_for`]) before copying it in. The page holds the
+//! source `Arc` until it is answered, so the source slot is never reused
+//! while a copy may read it.
 //!
-//! At startup the helper probes each GPU with a zero-length decrypt. A GPU
-//! whose shim has no decrypt kernels, or whose staging cap cannot hold the two
+//! At startup the coordinator probes each GPU with a zero-length decrypt. A GPU
+//! whose shim has no decrypt kernels, or whose staging cap cannot hold its
 //! scratch slots, gets plaintext pages only: the CPU decrypts as for a Get.
 
 use crate::client::direct::Destination;
@@ -102,23 +132,56 @@ use std::task::Poll;
 pub const MAX_OPEN: usize = 256;
 
 /// Bytes per staging slot: one sealed page (plaintext and tag), rounded up
-/// to whole 4 KiB blocks so cuFile reads land block aligned.
+/// to whole 4 KiB blocks so cuFile reads land block aligned. Sized for the
+/// largest page (`PAGE_BYTES`), so one slot holds a sealed page at any
+/// cluster page size; a smaller page uses a prefix of its slot.
 pub const SLOT_BYTES: u64 = (PAGE_BYTES + 16).next_multiple_of(4096);
 
-/// Scratch slots each job may use: host ciphertext and partial plaintext.
-const SCRATCH_SLOTS: u64 = 2;
+/// Streams each GPU executor keeps in flight: at most this many pages run
+/// on one GPU at once, each with at most one decrypt outstanding on its
+/// stream (the shim allows one decrypt per stream until its verdict is read).
+const STREAMS: usize = 4;
 
-/// Offset of the host ciphertext scratch slot.
-const CIPHERTEXT_SCRATCH: u64 = 0;
+/// Default bound on page jobs per GPU, queued or running. More get
+/// [`Error::Overloaded`]. Each open request has at most one page in flight,
+/// so this only trips when many requests target one GPU.
+pub const QUEUE_DEPTH: usize = 128;
 
-/// Offset of the partial plaintext scratch slot.
-const PLAINTEXT_SCRATCH: u64 = SLOT_BYTES;
+/// Idle CUDA events each GPU keeps for fences: enough for every stream's
+/// page fence and a bounce fence, with a little slack.
+const IDLE_EVENTS: usize = 2 * STREAMS + 4;
+
+/// Shortest and longest nap between fence polls while pages are in flight.
+/// The executor sleeps on its queue's condition variable instead, so a new
+/// page wakes it at once; with nothing in flight it sleeps without a
+/// timeout. `POLL_MAX` bounds the extra latency a completed page can wait
+/// before the executor notices its fence, so it stays near 100us.
+const POLL_MIN: std::time::Duration = std::time::Duration::from_micros(20);
+const POLL_MAX: std::time::Duration = std::time::Duration::from_micros(100);
+
+/// Scratch pairs (ciphertext and partial plaintext slots) per GPU with
+/// `slots` staging slots: one per stream when staging is large, at least
+/// one. The rest of the slots hold cuFile reads.
+fn scratch_pairs(slots: u64) -> u64 {
+    (slots / 32).clamp(1, STREAMS as u64)
+}
+
+/// Scratch slots per GPU with `slots` staging slots.
+fn scratch_slots_for(slots: u64) -> u64 {
+    2 * scratch_pairs(slots)
+}
+
+/// Scratch slots per GPU for a `RACER_GPU_STAGING_BYTES` cap. A GPU whose
+/// cap holds fewer gets plaintext pages only.
+pub fn scratch_slots(staging_bytes: u64) -> usize {
+    scratch_slots_for(staging_bytes / SLOT_BYTES) as usize
+}
 
 /// Registered cuFile handles kept per process; more are reopened on demand.
 const MAX_FILES: usize = 64;
 
 /// Threads that run cuFile reads. One synchronous read keeps an NVMe drive
-/// far from busy, and reads on the helper thread would stall decryption.
+/// far from busy, and reads on the coordinator would stall imports and stages.
 const FILE_READERS: usize = 4;
 
 /// A shared ciphertext page the GPU stream holds until its copy completes.
@@ -130,7 +193,7 @@ impl AsRef<[u8]> for HostCiphertext {
     }
 }
 
-/// Builds the GPU backend on the helper thread.
+/// Builds the GPU backend on the coordinator thread.
 pub type Loader = Box<dyn FnOnce() -> racer_gpu::Result<racer_gpu::Gpu> + Send>;
 
 /// Plaintext bytes handed to the helper. The page is immutable and its
@@ -193,7 +256,7 @@ impl SlotPool {
 }
 
 /// Ciphertext in one staging slot of one GPU, read there by cuFile. Owns the
-/// slot until dropped. Only the helper thread touches the bytes.
+/// slot until dropped. Only GPU threads touch the bytes.
 pub struct StagedCiphertext {
     pool: Arc<SlotPool>,
     ordinal: i32,
@@ -371,7 +434,7 @@ pub struct GpuCounters {
     /// Sealed pages the GPU verified and wrote.
     pub decrypted: AtomicU64,
 
-    /// Sealed pages the GPU rejected (CRC or tag mismatch).
+    /// Sealed pages the GPU rejected (tag mismatch).
     pub rejected: AtomicU64,
 
     /// Pages cuFile read straight into staging.
@@ -414,6 +477,9 @@ pub struct GpuCounters {
     /// Sealed fetches that reused GPU ciphertext another request already
     /// had, instead of fetching it again. See [`GpuHelper::record_joined`].
     pub joined: AtomicU64,
+
+    /// Pages refused because their GPU's executor queue was full.
+    pub queue_full: AtomicU64,
 }
 
 /// Why cuFile was turned off.
@@ -449,7 +515,7 @@ impl GpuCounters {
 
 /// Which GPU pairs may copy from each other over a peer path. Indexed by
 /// position in the usable GPU list, because ordinals need not be dense.
-/// Written once by the helper thread at startup; entries only turn off after.
+/// Written once by the coordinator at startup; entries only turn off after.
 struct PeerMatrix {
     ordinals: Vec<i32>,
     /// `allowed[dst * n + src]`.
@@ -473,6 +539,9 @@ pub struct GpuOptions {
     pub pci_p2pdma: bool,
     /// Enable GPU peer access (`RACER_GPU_PEER=auto`).
     pub peer: bool,
+    /// Page jobs each GPU executor accepts, queued or running, before
+    /// [`Error::Overloaded`]. See [`QUEUE_DEPTH`].
+    pub queue_depth: usize,
 }
 
 impl Default for GpuOptions {
@@ -481,6 +550,7 @@ impl Default for GpuOptions {
             staging_bytes: crate::config::DEFAULT_GPU_STAGING_BYTES,
             pci_p2pdma: false,
             peer: true,
+            queue_depth: QUEUE_DEPTH,
         }
     }
 }
@@ -493,9 +563,12 @@ struct DeviceShared {
     decrypt: bool,
 
     slots: Arc<SlotPool>,
+
+    /// The GPU's executor queue.
+    queue: Arc<Queue>,
 }
 
-/// A message to the helper thread.
+/// A message to the coordinator thread.
 enum Job {
     Import {
         id: u64,
@@ -514,12 +587,8 @@ enum Job {
         length: u64,
         reply: oneshot::Sender<Result<StagedCiphertext>>,
     },
-    Write {
-        id: u64,
-        offset: u64,
-        work: Work,
-        reply: oneshot::Sender<(Work, Result<()>)>,
-    },
+    /// Release a request whose GPU was not known when it ended. Forwarded
+    /// to that GPU's executor once the import has answered.
     Release {
         id: u64,
         reply: Option<oneshot::Sender<Result<()>>>,
@@ -537,7 +606,147 @@ enum Job {
     Run(Box<dyn FnOnce() + Send>),
 }
 
-/// Handle to the GPU helper thread. Shared by every worker.
+/// One page for a request, run by its GPU's executor.
+struct WriteTask {
+    id: u64,
+    offset: u64,
+    work: Work,
+    reply: oneshot::Sender<(Work, Result<()>)>,
+}
+
+/// A message to a GPU executor.
+enum Task {
+    /// Request `id` imported its allocation on this GPU.
+    Adopt {
+        id: u64,
+        import: Arc<racer_gpu::ImportedAllocation>,
+    },
+    Write(WriteTask),
+    /// Release request `id` once its queued and running pages are done.
+    Release {
+        id: u64,
+        reply: Option<oneshot::Sender<Result<()>>>,
+    },
+}
+
+/// A GPU executor's inbox. Page jobs are bounded by `depth`, counted from
+/// submission until their answer; control messages are not, because each
+/// request sends at most two. The executor sleeps on the condition variable
+/// while it has nothing in flight.
+struct Queue {
+    state: Mutex<QueueState>,
+    ready: std::sync::Condvar,
+    depth: usize,
+    /// Page jobs submitted and not yet answered.
+    pending: AtomicUsize,
+    /// Set by a CUDA host callback when a fence's work completed, so the
+    /// executor polls at once instead of finishing its nap.
+    woken: AtomicBool,
+}
+
+#[derive(Default)]
+struct QueueState {
+    tasks: std::collections::VecDeque<Task>,
+    closed: bool,
+}
+
+impl Queue {
+    fn new(depth: usize) -> Self {
+        Self {
+            state: Mutex::new(QueueState::default()),
+            ready: std::sync::Condvar::new(),
+            depth,
+            pending: AtomicUsize::new(0),
+            woken: AtomicBool::new(false),
+        }
+    }
+
+    /// Wake the executor to poll its fences. Called on CUDA's completion
+    /// thread, so it takes no lock: an executor that holds the queue lock
+    /// can then never stall CUDA. A wakeup that races the executor going to
+    /// sleep may be missed; the executor's poll nap still bounds that.
+    fn wake(&self) {
+        self.woken.store(true, Ordering::Release);
+        self.ready.notify_one();
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, QueueState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Queue a control message. [`Error::Unavailable`] once closed.
+    fn control(&self, task: Task) -> Result<()> {
+        let mut state = self.lock();
+        if state.closed {
+            return Err(Error::Unavailable);
+        }
+        state.tasks.push_back(task);
+        self.ready.notify_one();
+        Ok(())
+    }
+
+    /// Queue a page job. [`Error::Overloaded`] when `depth` jobs are already
+    /// queued or running, [`Error::Unavailable`] once closed.
+    fn write(&self, task: WriteTask) -> Result<()> {
+        let mut state = self.lock();
+        if state.closed {
+            return Err(Error::Unavailable);
+        }
+        if self.pending.load(Ordering::Acquire) >= self.depth {
+            return Err(Error::Overloaded);
+        }
+        self.pending.fetch_add(1, Ordering::AcqRel);
+        state.tasks.push_back(Task::Write(task));
+        self.ready.notify_one();
+        Ok(())
+    }
+
+    /// A page job was answered.
+    fn finished(&self) {
+        self.pending.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    /// Take every queued message. With nothing queued, wait for one: up to
+    /// `wait`, or until one arrives or the queue closes when `wait` is
+    /// `None`. Also returns whether the queue is closed.
+    fn take(&self, wait: Option<std::time::Duration>) -> (Vec<Task>, bool) {
+        let mut state = self.lock();
+        let woken = wait.is_some() && self.woken.swap(false, Ordering::AcqRel);
+        if state.tasks.is_empty() && !state.closed && !woken {
+            state = match wait {
+                None => self
+                    .ready
+                    .wait_while(state, |state| state.tasks.is_empty() && !state.closed)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                Some(wait) => {
+                    let state = self
+                        .ready
+                        .wait_timeout_while(state, wait, |state| {
+                            state.tasks.is_empty()
+                                && !state.closed
+                                && !self.woken.load(Ordering::Acquire)
+                        })
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .0;
+                    self.woken.store(false, Ordering::Release);
+                    state
+                }
+            };
+        }
+        let closed = state.closed;
+        (state.tasks.drain(..).collect(), closed)
+    }
+
+    /// Refuse new messages; the executor drains what is queued and exits.
+    fn close(&self) {
+        self.lock().closed = true;
+        self.ready.notify_all();
+    }
+}
+
+/// Handle to the GPU threads. Shared by every worker.
 pub struct GpuHelper {
     jobs: mpsc::Sender<Job>,
     devices: Vec<DeviceInfo>,
@@ -554,6 +763,10 @@ pub struct GpuHelper {
     landings: Mutex<HashMap<i32, Weak<GpuLanding>>>,
     /// GPU pairs with a working peer path. Set before startup answers.
     peers: Arc<std::sync::OnceLock<PeerMatrix>>,
+    /// The GPU each imported request is on, until its executor releases it.
+    owners: Arc<Mutex<HashMap<u64, i32>>>,
+    /// Streams the executors hold between requests.
+    streams: Arc<AtomicUsize>,
 }
 
 impl GpuHelper {
@@ -622,6 +835,8 @@ impl GpuHelper {
         let slots = staging_bytes / SLOT_BYTES;
         let kernels_off = Arc::new(Mutex::new(std::collections::HashSet::new()));
         let peers = Arc::new(std::sync::OnceLock::new());
+        let owners = Arc::new(Mutex::new(HashMap::new()));
+        let streams = Arc::new(AtomicUsize::new(0));
         let state = HelperState {
             peer: options.peer,
             peers: peers.clone(),
@@ -631,14 +846,17 @@ impl GpuHelper {
             kernels_off: kernels_off.clone(),
             slots,
             pci_p2pdma,
+            queue_depth: options.queue_depth.max(1),
+            owners: owners.clone(),
+            streams: streams.clone(),
         };
         std::thread::Builder::new()
             .name("racer-gpu".into())
-            .spawn(move || helper_main(loader, receiver, ready, state))
+            .spawn(move || coordinator_main(loader, receiver, ready, state))
             .map_err(|_| Error::Unavailable)?;
         let found = started.recv().map_err(|_| Error::Unavailable)?;
-        let (devices, decrypt) = match found {
-            Ok((devices, decrypt)) if !devices.is_empty() => (devices, decrypt),
+        let (devices, decrypt, queues) = match found {
+            Ok((devices, decrypt, queues)) if !devices.is_empty() => (devices, decrypt, queues),
             outcome => {
                 let reason = match outcome {
                     Err(error) => error.to_string(),
@@ -652,24 +870,28 @@ impl GpuHelper {
                 };
             }
         };
-        // Two scratch slots per job; the rest hold cuFile reads.
-        let decrypting = slots >= SCRATCH_SLOTS;
+        let scratch = scratch_slots(staging_bytes) as u64;
+        let decrypting = slots >= scratch;
         let shared = devices
             .iter()
-            .zip(&decrypt)
-            .map(|(device, kernels)| DeviceShared {
+            .zip(decrypt.iter().zip(queues))
+            .map(|(device, (kernels, queue))| DeviceShared {
                 ordinal: device.ordinal,
                 decrypt: *kernels && decrypting,
                 slots: Arc::new(SlotPool {
-                    free: Mutex::new((SCRATCH_SLOTS..slots.max(SCRATCH_SLOTS)).rev().collect()),
+                    free: Mutex::new((scratch..slots.max(scratch)).rev().collect()),
                 }),
+                queue,
             })
             .collect::<Vec<_>>();
         eprintln!(
-            "racer: stage=gpu state=enabled usable={} decrypt={} staging_slots={} pci_p2pdma={}",
+            "racer: stage=gpu state=enabled usable={} decrypt={} staging_slots={} scratch_slots={} streams={} queue_depth={} pci_p2pdma={}",
             devices.len(),
             shared.iter().filter(|device| device.decrypt).count(),
             slots,
+            scratch,
+            STREAMS,
+            options.queue_depth.max(1),
             pci_p2pdma,
         );
         Ok(Some(Arc::new(Self {
@@ -684,6 +906,8 @@ impl GpuHelper {
             kernels_off,
             landings: Mutex::new(HashMap::new()),
             peers,
+            owners,
+            streams,
         })))
     }
 
@@ -691,7 +915,7 @@ impl GpuHelper {
     /// path. True when they are the same GPU. False when
     /// `RACER_GPU_PEER=off`, when the pair has no peer path, or after a peer
     /// copy between them failed. Ciphertext on another GPU still works when
-    /// this is false: the helper moves it through host memory.
+    /// this is false: the executor moves it through host memory.
     pub fn peers(&self, dst: i32, src: i32) -> bool {
         dst == src
             || self
@@ -729,6 +953,19 @@ impl GpuHelper {
     pub fn free_slots(&self, ordinal: i32) -> usize {
         self.device(ordinal)
             .map_or(0, |device| device.slots.available())
+    }
+
+    /// Page jobs queued or running on GPU `ordinal`'s executor.
+    pub fn queued(&self, ordinal: i32) -> usize {
+        self.device(ordinal)
+            .map_or(0, |device| device.queue.pending.load(Ordering::Relaxed))
+    }
+
+    /// Streams the executors hold now: their request streams, the utility
+    /// streams used to bounce ciphertext, and streams kept after a failed
+    /// fence. None of them belongs to a request.
+    pub fn executor_streams(&self) -> usize {
+        self.streams.load(Ordering::Relaxed)
     }
 
     /// Whether a cuFile read is worth trying.
@@ -771,8 +1008,8 @@ impl GpuHelper {
             length,
             reply,
         })?;
-        // On cancellation the helper still runs the read; the staged slot
-        // then drops with the unread answer and returns to the pool.
+        // On cancellation the read still runs; the staged slot then drops
+        // with the unread answer and returns to the pool.
         answer(&mut receiver, scope).await?
     }
 
@@ -828,10 +1065,8 @@ impl GpuHelper {
     /// Where a request on GPU `ordinal` should have sealed pages delivered,
     /// or None to get plaintext only.
     pub fn sealed_target(self: &Arc<Self>, ordinal: i32) -> Option<SealedTarget> {
-        self.decrypts(ordinal).then(|| SealedTarget {
-            helper: self.clone(),
-            ordinal,
-        })
+        self.decrypts(ordinal)
+            .then(|| SealedTarget::gpu(self.clone(), ordinal))
     }
 
     /// Usable GPUs found at startup.
@@ -853,8 +1088,32 @@ impl GpuHelper {
         self.jobs.send(job).map_err(|_| Error::Unavailable)
     }
 
-    /// Run `f` on the helper thread and wait for it. Tests use this to reach
-    /// thread-local simulation state.
+    /// Queue a page for request `id` on GPU `ordinal`'s executor.
+    fn submit(&self, ordinal: i32, task: WriteTask) -> Result<()> {
+        let device = self.device(ordinal).ok_or(Error::Internal)?;
+        let result = device.queue.write(task);
+        if result == Err(Error::Overloaded) {
+            self.counters.queue_full.fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+
+    /// Release request `id`: on its executor, behind its pages, or through
+    /// the coordinator when its import has not answered yet.
+    fn release(&self, id: u64, reply: Option<oneshot::Sender<Result<()>>>) -> Result<()> {
+        let owner = self
+            .owners
+            .lock()
+            .ok()
+            .and_then(|owners| owners.get(&id).copied());
+        match owner.and_then(|ordinal| self.device(ordinal)) {
+            Some(device) => device.queue.control(Task::Release { id, reply }),
+            None => self.send(Job::Release { id, reply }),
+        }
+    }
+
+    /// Run `f` on the coordinator thread and wait for it. Tests use this to
+    /// reach thread-local simulation state.
     #[cfg(test)]
     pub(crate) fn run<R: Send + 'static>(&self, f: impl FnOnce() -> R + Send + 'static) -> R {
         let (tx, rx) = mpsc::channel();
@@ -916,7 +1175,7 @@ impl GpuService for GpuClient {
     }
 }
 
-/// One `gpu-read` request's view of its import on the helper.
+/// One `gpu-read` request's view of its import.
 struct GpuSink {
     helper: Arc<GpuHelper>,
     id: u64,
@@ -928,8 +1187,8 @@ struct GpuSink {
     released: bool,
 }
 
-/// Wait for a helper answer, or stop early when the request is canceled.
-/// Abandoning the wait never abandons the job: the helper still runs it.
+/// Wait for an answer, or stop early when the request is canceled.
+/// Abandoning the wait never abandons the job: it still runs.
 async fn answer<T>(receiver: &mut oneshot::Receiver<T>, scope: &RequestScope) -> Result<T> {
     let registration = scope.cancellation.subscribe()?;
     std::future::poll_fn(|cx| {
@@ -975,6 +1234,7 @@ impl DirectSink for GpuSink {
                 return Err(Error::InvalidRange);
             }
             self.imported(scope).await?;
+            let ordinal = self.ordinal.ok_or(Error::Internal)?;
             let work = match page {
                 DirectPage::Plaintext(reader) => {
                     let slice = reader.slice();
@@ -987,12 +1247,15 @@ impl DirectSink for GpuSink {
                 DirectPage::Sealed { page, range } => Work::Sealed(Sealed { page, range }),
             };
             let (reply, mut receiver) = oneshot::channel();
-            self.helper.send(Job::Write {
-                id: self.id,
-                offset: destination_offset,
-                work,
-                reply,
-            })?;
+            self.helper.submit(
+                ordinal,
+                WriteTask {
+                    id: self.id,
+                    offset: destination_offset,
+                    work,
+                    reply,
+                },
+            )?;
             let (work, result) = answer(&mut receiver, scope).await?;
             drop(work);
             result
@@ -1009,10 +1272,7 @@ impl DirectSink for GpuSink {
                 return Ok(());
             }
             let (reply, mut receiver) = oneshot::channel();
-            self.helper.send(Job::Release {
-                id: self.id,
-                reply: Some(reply),
-            })?;
+            self.helper.release(self.id, Some(reply))?;
             self.released = true;
             answer(&mut receiver, scope).await?
         })
@@ -1022,22 +1282,11 @@ impl DirectSink for GpuSink {
 impl Drop for GpuSink {
     fn drop(&mut self) {
         if !self.released {
-            // Queued behind any copy still running; the helper syncs first.
-            let _ = self.helper.send(Job::Release {
-                id: self.id,
-                reply: None,
-            });
+            // Queued behind any page still running on the executor.
+            let _ = self.helper.release(self.id, None);
         }
         self.helper.open.fetch_sub(1, Ordering::AcqRel);
     }
-}
-
-/// One request's GPU objects. Field order matters: the stream drops first,
-/// which synchronizes it, then the import.
-struct Request {
-    /// Shared with [`Helper::tainted`] while a failed write on it is unfenced.
-    stream: std::rc::Rc<racer_gpu::Stream>,
-    import: racer_gpu::ImportedAllocation,
 }
 
 /// Ciphertext on a GPU other than the request's.
@@ -1048,7 +1297,7 @@ struct Remote {
     offset: u64,
 }
 
-/// Shared handles the helper thread starts with.
+/// Shared handles the GPU threads start with.
 struct HelperState {
     /// `RACER_GPU_PEER=auto`: try to enable peer access between GPUs.
     peer: bool,
@@ -1062,6 +1311,10 @@ struct HelperState {
     slots: u64,
     /// Ask cuFile to use PCI P2PDMA.
     pci_p2pdma: bool,
+    /// Page jobs per executor queue.
+    queue_depth: usize,
+    owners: Arc<Mutex<HashMap<u64, i32>>>,
+    streams: Arc<AtomicUsize>,
 }
 
 /// A registered cuFile handle and the reads using it.
@@ -1069,7 +1322,7 @@ struct OpenFile {
     file: racer_gpu::GpuFile,
     /// Reads queued or running on a reader thread.
     reads: usize,
-    /// No longer in [`Helper::files`]: free it once `reads` is zero.
+    /// No longer in [`Coordinator::files`]: free it once `reads` is zero.
     retired: bool,
 }
 
@@ -1078,6 +1331,8 @@ struct FileJob {
     read: racer_gpu::FileRead,
     file: u64,
     staged: StagedCiphertext,
+    /// Keeps the staging buffer the read writes alive until it returns.
+    _staging: Arc<racer_gpu::StagingBuffer>,
     reply: oneshot::Sender<Result<StagedCiphertext>>,
 }
 
@@ -1087,8 +1342,8 @@ struct FileDone {
     failed: bool,
 }
 
-/// Run cuFile reads until the helper stops sending them. Reports each read
-/// to the helper before answering, so a later stage sees a failed handle gone.
+/// Run cuFile reads until the coordinator stops sending them. Reports each
+/// read before answering, so a later stage sees a failed handle gone.
 fn reader_main(
     reader: racer_gpu::FileReader,
     jobs: Arc<Mutex<mpsc::Receiver<FileJob>>>,
@@ -1122,14 +1377,125 @@ fn reader_main(
     }
 }
 
-/// State owned by the helper thread.
-struct Helper {
+/// One GPU, shared by the coordinator and every executor.
+struct Device {
+    ordinal: i32,
+    context: racer_gpu::Context,
+    /// The staging buffer, allocated on first use.
+    staging: Mutex<Option<Arc<racer_gpu::StagingBuffer>>>,
+    /// Events for fences on this GPU's streams.
+    events: racer_gpu::EventPool,
+    queue: Arc<Queue>,
+}
+
+/// GPU state the coordinator and the executors share.
+struct Engine {
     gpu: racer_gpu::Gpu,
-    contexts: Vec<racer_gpu::Context>,
-    /// Each context's GPU UUID, in the same order as `contexts`.
+    devices: Vec<Arc<Device>>,
+    /// RDMA landing buffers by allocation id. Freed by `FreeLanding` once
+    /// nothing refers to them; leaked if still referenced at exit, because
+    /// a NIC may hold a registration over them.
+    landing: Mutex<HashMap<u64, Arc<racer_gpu::StagingBuffer>>>,
+    state: HelperState,
+}
+
+impl Engine {
+    fn device(&self, ordinal: i32) -> Result<&Arc<Device>> {
+        self.devices
+            .iter()
+            .find(|device| device.ordinal == ordinal)
+            .ok_or(Error::Internal)
+    }
+
+    /// GPU `ordinal`'s staging buffer, allocated on first use.
+    fn staging(&self, ordinal: i32) -> Result<Arc<racer_gpu::StagingBuffer>> {
+        let device = self.device(ordinal)?;
+        let mut staging = device.staging.lock().map_err(|_| Error::Internal)?;
+        if let Some(buffer) = staging.as_ref() {
+            return Ok(buffer.clone());
+        }
+        let size = self.state.slots.max(scratch_slots_for(self.state.slots)) * SLOT_BYTES;
+        let buffer = device.context.staging(size).map_err(|error| {
+            eprintln!("racer: stage=gpu ordinal={ordinal} state=staging-failed reason={error}");
+            Error::Overloaded
+        })?;
+        let buffer = Arc::new(buffer);
+        *staging = Some(buffer.clone());
+        Ok(buffer)
+    }
+
+    /// The buffer that holds ciphertext on another GPU.
+    fn source_buffer(&self, source: &Remote) -> Result<Arc<racer_gpu::StagingBuffer>> {
+        match source.landed {
+            Some(allocation) => self
+                .landing
+                .lock()
+                .map_err(|_| Error::Internal)?
+                .get(&allocation)
+                .cloned()
+                .ok_or(Error::Internal),
+            None => self.staging(source.ordinal),
+        }
+    }
+
+    /// Make a NIC's writes into landed ciphertext on GPU `owner` visible
+    /// before the GPU (or, for `remote`, another GPU's peer copy) reads it.
+    fn flush_landed(&self, owner: i32, remote: bool) -> Result<()> {
+        let scope = if remote {
+            racer_gpu::RdmaScope::AllDevices
+        } else {
+            racer_gpu::RdmaScope::Owner
+        };
+        self.device(owner)?
+            .context
+            .flush_rdma_writes(scope)
+            .map_err(|error| {
+                eprintln!(
+                    "racer: stage=gpu ordinal={owner} state=rdma-flush-failed reason={error}"
+                );
+                Error::Unavailable
+            })
+    }
+
+    /// After a failed sealed write, make sure no queued GPU work still reads
+    /// the ciphertext's staged slot or landing page before the page drops
+    /// and the slot goes back for another cuFile read or NIC write. The
+    /// streams retain the GPU allocation, not the slot. If no fence
+    /// succeeds, the slot is quarantined for the life of the process.
+    /// `fenced` says whether the request stream and the calling executor's
+    /// utility stream for the source GPU (if any) synchronized.
+    fn fence_source(&self, fenced: bool, source: &SealedSource) {
+        let ordinal = match source {
+            SealedSource::Host(_) => return,
+            SealedSource::Staged { staged, .. } => staged.ordinal(),
+            SealedSource::Landed(landed) => landed.ordinal(),
+        };
+        if fenced {
+            return;
+        }
+        eprintln!("racer: stage=gpu ordinal={ordinal} state=ciphertext-quarantined");
+        match source {
+            SealedSource::Host(_) => {}
+            SealedSource::Staged { staged, .. } => std::mem::forget(staged.clone()),
+            SealedSource::Landed(landed) => std::mem::forget(landed.clone()),
+        }
+    }
+
+    fn note_leaks(&self) {
+        let leaked = self.gpu.leaked();
+        if self.state.leaked.swap(leaked, Ordering::Relaxed) != leaked {
+            eprintln!("racer: stage=gpu state=leaked total={leaked}");
+        }
+    }
+}
+
+/// State owned by the coordinator thread: discovery, imports, cuFile
+/// registrations and reads, and landing buffers. Page work runs on the
+/// executors.
+struct Coordinator {
+    engine: Arc<Engine>,
+    /// Each device's GPU UUID, in the same order as `engine.devices`.
     uuids: Vec<[u8; 16]>,
-    /// Each GPU's staging buffer, allocated on first sealed page.
-    staging: HashMap<i32, racer_gpu::StagingBuffer>,
     /// Registered files by (device, inode). The slab descriptors are few and
     /// long lived, so one registration serves many reads.
     files: HashMap<(u64, u64), u64>,
@@ -1146,32 +1512,18 @@ struct Helper {
     readers: Vec<std::thread::JoinHandle<()>>,
     /// Opens the cuFile driver ahead of the first sealed page.
     opener: Option<std::thread::JoinHandle<()>>,
-    requests: HashMap<u64, Request>,
-    /// RDMA landing buffers by allocation id. Freed by `FreeLanding` once
-    /// nothing refers to them; leaked if still referenced at exit, because
-    /// a NIC may hold a registration over them.
-    landing: HashMap<u64, racer_gpu::StagingBuffer>,
-    /// A stream per GPU for reading ciphertext back to the host when it
-    /// moves between GPUs without a peer path. Made on first use.
-    utility: HashMap<i32, racer_gpu::Stream>,
-    /// Request streams, by the GPU they write, whose failed sealed write
-    /// could not be fenced. Their queued copies or decrypts may still write
-    /// that GPU's scratch slots, so sealed writes there are refused until
-    /// every one of them synchronizes. Held here, a stream outlives its
-    /// request's release.
-    tainted: HashMap<i32, Vec<std::rc::Rc<racer_gpu::Stream>>>,
-    state: HelperState,
+    executors: Vec<std::thread::JoinHandle<()>>,
 }
 
-type Started = racer_gpu::Result<(Vec<DeviceInfo>, Vec<bool>)>;
+type Started = racer_gpu::Result<(Vec<DeviceInfo>, Vec<bool>, Vec<Arc<Queue>>)>;
 
-fn helper_main(
+fn coordinator_main(
     loader: Loader,
     jobs: mpsc::Receiver<Job>,
     ready: mpsc::SyncSender<Started>,
     state: HelperState,
 ) {
-    let mut helper = match discover(loader) {
+    let mut coordinator = match discover(loader) {
         Ok((gpu, contexts, usable)) => {
             // Before any reader or open: the flag applies only to the open
             // that loads cuFile.
@@ -1198,13 +1550,38 @@ fn helper_main(
                 }
             }
             let opener = open_cufile(&gpu, &state.cufile, &state.counters);
-            let uuids = usable.iter().map(|device| device.uuid).collect();
-            let _ = ready.send(Ok((usable, decrypt)));
-            Helper {
+            let uuids = usable
+                .iter()
+                .map(|device: &DeviceInfo| device.uuid)
+                .collect();
+            let devices: Vec<Arc<Device>> = contexts
+                .into_iter()
+                .map(|context| {
+                    Arc::new(Device {
+                        ordinal: context.ordinal(),
+                        events: context.event_pool(IDLE_EVENTS),
+                        context,
+                        staging: Mutex::new(None),
+                        queue: Arc::new(Queue::new(state.queue_depth)),
+                    })
+                })
+                .collect();
+            let queues = devices.iter().map(|device| device.queue.clone()).collect();
+            let engine = Arc::new(Engine {
                 gpu,
-                contexts,
+                devices,
+                landing: Mutex::new(HashMap::new()),
+                state,
+            });
+            let executors = engine
+                .devices
+                .iter()
+                .filter_map(|device| spawn_executor(&engine, device))
+                .collect();
+            let _ = ready.send(Ok((usable, decrypt, queues)));
+            Coordinator {
+                engine,
                 uuids,
-                staging: HashMap::new(),
                 files: HashMap::new(),
                 open: HashMap::new(),
                 next_file: 0,
@@ -1213,11 +1590,7 @@ fn helper_main(
                 done,
                 readers,
                 opener,
-                requests: HashMap::new(),
-                landing: HashMap::new(),
-                utility: HashMap::new(),
-                tainted: HashMap::new(),
-                state,
+                executors,
             }
         }
         Err(error) => {
@@ -1227,27 +1600,61 @@ fn helper_main(
     };
     drop(ready);
     while let Ok(job) = jobs.recv() {
-        helper.finish_reads();
-        helper.run(job);
+        coordinator.finish_reads();
+        coordinator.run(job);
     }
-    // Every sender is gone: let queued reads finish, then release their files.
-    helper.reads = None;
-    for reader in std::mem::take(&mut helper.readers) {
+    // Every sender is gone: drain the executors, then let queued reads
+    // finish and release their files.
+    for device in &coordinator.engine.devices {
+        device.queue.close();
+    }
+    for executor in std::mem::take(&mut coordinator.executors) {
+        let _ = executor.join();
+    }
+    coordinator.reads = None;
+    for reader in std::mem::take(&mut coordinator.readers) {
         let _ = reader.join();
     }
-    if let Some(opener) = helper.opener.take() {
+    if let Some(opener) = coordinator.opener.take() {
         let _ = opener.join();
     }
-    helper.finish_reads();
-    // Release what is left, stream first.
-    let ids: Vec<u64> = helper.requests.keys().copied().collect();
-    for id in ids {
-        let _ = helper.release(id);
-    }
+    coordinator.finish_reads();
     // A NIC registration may still cover landing memory: never free it.
-    for (_, buffer) in helper.landing.drain() {
-        std::mem::forget(buffer);
+    if let Ok(mut landing) = coordinator.engine.landing.lock() {
+        for (_, buffer) in landing.drain() {
+            std::mem::forget(buffer);
+        }
     }
+    coordinator.engine.note_leaks();
+}
+
+/// Start GPU `device`'s executor thread. If the thread cannot start, the
+/// queue closes and pages for that GPU fail as unavailable.
+fn spawn_executor(
+    engine: &Arc<Engine>,
+    device: &Arc<Device>,
+) -> Option<std::thread::JoinHandle<()>> {
+    let executor = Executor {
+        engine: engine.clone(),
+        device: device.clone(),
+        lanes: (0..STREAMS).map(|_| Lane::default()).collect(),
+        free_pairs: (0..scratch_pairs(engine.state.slots)).rev().collect(),
+        waiting: std::collections::VecDeque::new(),
+        requests: HashMap::new(),
+        tainted: Vec::new(),
+        utility: HashMap::new(),
+    };
+    let spawned = std::thread::Builder::new()
+        .name(format!("racer-gpu-{}", device.ordinal))
+        .spawn(move || executor.run());
+    if spawned.is_err() {
+        eprintln!(
+            "racer: stage=gpu ordinal={} state=executor-failed",
+            device.ordinal
+        );
+        device.queue.close();
+    }
+    spawned.ok()
 }
 
 /// Open the cuFile driver on its own thread. Opening probes every GPU and can
@@ -1321,7 +1728,6 @@ fn probe_decrypt(context: &racer_gpu::Context) -> bool {
         nonce: &[0; 12],
         aad: &[],
         length: 0,
-        expected_crc: None,
     };
     let queued = stream.decrypt(
         &request,
@@ -1354,7 +1760,7 @@ fn discover(loader: Loader) -> racer_gpu::Result<Discovered> {
         eprintln!(
             "racer: stage=gpu ordinal={} uuid={} pci_bus_id={} numa_node={} compute_mode={:?} usable={}",
             device.ordinal,
-            device.uuid_string(),
+            device.display_id(),
             device.pci_bus_id,
             device.numa_node.map_or("unknown".into(), |n| n.to_string()),
             device.compute_mode,
@@ -1408,7 +1814,7 @@ fn import_error(error: racer_gpu::Error) -> Error {
     }
 }
 
-impl Helper {
+impl Coordinator {
     fn run(&mut self, job: Job) {
         match job {
             Job::Import {
@@ -1420,7 +1826,7 @@ impl Helper {
                 reply,
             } => {
                 let result = self.import(id, fd, allocation_size, window, gpu_uuid);
-                self.note_leaks();
+                self.engine.note_leaks();
                 let _ = reply.send(result);
             }
             Job::Stage {
@@ -1431,28 +1837,37 @@ impl Helper {
                 reply,
             } => {
                 let result = self.stage(staged, fd, file_offset, length, reply);
-                self.note_leaks();
+                self.engine.note_leaks();
                 // A dropped receiver drops the slot, which frees it.
                 if let Err((error, reply)) = result {
                     let _ = reply.send(Err(error));
                 }
             }
-            Job::Write {
-                id,
-                offset,
-                work,
-                reply,
-            } => {
-                let result = self.write(id, offset, &work);
-                self.note_leaks();
-                // If the I/O side stopped waiting, the page drops here. Its
-                // storage is shared and thread safe, so that is fine.
-                let _ = reply.send((work, result));
-            }
             Job::Release { id, reply } => {
-                let result = self.release(id);
-                if let Some(reply) = reply {
-                    let _ = reply.send(result);
+                let owner = self
+                    .engine
+                    .state
+                    .owners
+                    .lock()
+                    .ok()
+                    .and_then(|owners| owners.get(&id).copied());
+                let forwarded = owner
+                    .and_then(|ordinal| self.engine.device(ordinal).ok())
+                    .map(|device| device.queue.clone());
+                match forwarded {
+                    Some(queue) => {
+                        if let Err(error) = queue.control(Task::Release { id, reply }) {
+                            eprintln!(
+                                "racer: stage=gpu request={id} state=release-lost reason={error}"
+                            );
+                        }
+                    }
+                    // The import failed: there is nothing to release.
+                    None => {
+                        if let Some(reply) = reply {
+                            let _ = reply.send(Ok(()));
+                        }
+                    }
                 }
             }
             Job::Landing {
@@ -1462,23 +1877,36 @@ impl Helper {
                 reply,
             } => {
                 let result = self.landing(id, ordinal, length);
+                let forget = |engine: &Engine| {
+                    if let Ok(mut landing) = engine.landing.lock() {
+                        landing.remove(&id);
+                    }
+                };
                 if result.is_err() {
-                    self.landing.remove(&id);
+                    forget(&self.engine);
                 }
-                self.note_leaks();
+                self.engine.note_leaks();
                 // The caller stopped waiting, so no FreeLanding will come:
                 // close the export and free the memory now.
                 if let Err(Ok(fd)) = reply.send(result) {
                     drop(fd);
-                    self.landing.remove(&id);
+                    forget(&self.engine);
                 }
             }
             Job::FreeLanding { id, fd } => {
                 drop(fd);
-                if self.landing.remove(&id).is_some() {
+                let removed = self
+                    .engine
+                    .landing
+                    .lock()
+                    .ok()
+                    .and_then(|mut landing| landing.remove(&id));
+                // Freed here unless a running page still holds it.
+                if removed.is_some() {
+                    drop(removed);
                     eprintln!("racer: stage=gpu-landing allocation={id} state=freed");
                 }
-                self.note_leaks();
+                self.engine.note_leaks();
             }
             #[cfg(test)]
             Job::Run(f) => f(),
@@ -1487,19 +1915,23 @@ impl Helper {
 
     /// Allocate landing buffer `id` on GPU `ordinal`, and export it.
     fn landing(&mut self, id: u64, ordinal: i32, length: u64) -> Result<OwnedFd> {
-        if !self.landing.contains_key(&id) {
-            let context = self
-                .contexts
-                .iter()
-                .find(|context| context.ordinal() == ordinal)
-                .ok_or(Error::Unavailable)?;
-            let buffer = context.staging(length).map_err(|error| {
-                eprintln!("racer: stage=gpu ordinal={ordinal} state=landing-failed reason={error}");
-                Error::Overloaded
-            })?;
-            self.landing.insert(id, buffer);
-        }
-        let buffer = self.landing.get(&id).ok_or(Error::Internal)?;
+        let mut landing = self.engine.landing.lock().map_err(|_| Error::Internal)?;
+        let buffer = match landing.entry(id) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let device = self
+                    .engine
+                    .device(ordinal)
+                    .map_err(|_| Error::Unavailable)?;
+                let buffer = device.context.staging(length).map_err(|error| {
+                    eprintln!(
+                        "racer: stage=gpu ordinal={ordinal} state=landing-failed reason={error}"
+                    );
+                    Error::Overloaded
+                })?;
+                entry.insert(Arc::new(buffer))
+            }
+        };
         if buffer.size() != length {
             return Err(Error::InvalidConfiguration);
         }
@@ -1511,12 +1943,13 @@ impl Helper {
         })
     }
 
-    /// Import the allocation on the GPU that owns it. With the client's GPU
-    /// UUID, that GPU is tried first: device numbers differ between the
-    /// client's container and the dataplane, but UUIDs do not. An unknown
-    /// UUID is a GPU the dataplane cannot use, so the read falls back to the
-    /// host (501). Without a UUID (older clients), each usable GPU is tried
-    /// until one owns the allocation.
+    /// Import the allocation on the GPU that owns it and hand it to that
+    /// GPU's executor. With the client's GPU UUID, that GPU is tried first:
+    /// device numbers differ between the client's container and the
+    /// dataplane, but UUIDs do not. An unknown UUID is a GPU the dataplane
+    /// cannot use, so the read falls back to the host (501). Without a UUID
+    /// (older clients), each usable GPU is tried until one owns the
+    /// allocation.
     fn import(
         &mut self,
         id: u64,
@@ -1525,12 +1958,13 @@ impl Helper {
         window: Range<u64>,
         gpu_uuid: Option<[u8; 16]>,
     ) -> Result<i32> {
-        let mut order: Vec<usize> = (0..self.contexts.len()).collect();
+        let devices = &self.engine.devices;
+        let mut order: Vec<usize> = (0..devices.len()).collect();
         if let Some(uuid) = gpu_uuid {
             let Some(first) = self.uuids.iter().position(|known| *known == uuid) else {
                 eprintln!(
                     "racer: stage=gpu state=import-skipped reason=unknown-gpu-uuid uuid={}",
-                    racer_gpu::uuid_string(&uuid)
+                    racer_gpu::display_id(&uuid)
                 );
                 return Err(Error::NotImplemented);
             };
@@ -1539,21 +1973,40 @@ impl Helper {
         }
         let mut last = racer_gpu::Error::WrongDevice;
         for (attempt, index) in order.into_iter().enumerate() {
-            let context = &self.contexts[index];
+            let device = &devices[index];
             let handle = fd.try_clone().map_err(|_| Error::Unavailable)?;
-            match context.import(handle, size, window.clone()) {
+            match device.context.import(handle, size, window.clone()) {
                 Ok(import) => {
                     if attempt > 0 && gpu_uuid.is_some() {
                         eprintln!(
                             "racer: stage=gpu state=uuid-mismatch ordinal={} uuid={}",
-                            context.ordinal(),
-                            racer_gpu::uuid_string(&self.uuids[index])
+                            device.ordinal,
+                            racer_gpu::display_id(&self.uuids[index])
                         );
                     }
-                    let stream = context.stream().map_err(import_error)?;
-                    let stream = std::rc::Rc::new(stream);
-                    self.requests.insert(id, Request { stream, import });
-                    return Ok(context.ordinal());
+                    // Register the owner and queue the adoption under one
+                    // owners lock: a concurrent release looks the owner up
+                    // under that lock, so its Release is queued after Adopt.
+                    // Lock order is owners, then the device queue; nothing
+                    // takes owners while holding a queue lock.
+                    let mut owners = self
+                        .engine
+                        .state
+                        .owners
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    owners.insert(id, device.ordinal);
+                    #[cfg(test)]
+                    testing::before_adopt(id);
+                    let adopted = device.queue.control(Task::Adopt {
+                        id,
+                        import: Arc::new(import),
+                    });
+                    if let Err(error) = adopted {
+                        owners.remove(&id);
+                        return Err(error);
+                    }
+                    return Ok(device.ordinal);
                 }
                 Err(racer_gpu::Error::WrongDevice) => continue,
                 Err(error) => {
@@ -1563,117 +2016,6 @@ impl Helper {
             }
         }
         Err(import_error(last))
-    }
-
-    fn write(&mut self, id: u64, offset: u64, work: &Work) -> Result<()> {
-        let plaintext = match work {
-            Work::Plaintext(plaintext) => plaintext,
-            Work::Sealed(sealed) => {
-                let result = self.write_sealed(id, offset, sealed);
-                if result.is_err() {
-                    let fenced = self.fence_request(id);
-                    self.fence_source(fenced, &sealed.page.source);
-                }
-                return result;
-            }
-        };
-        let request = self.requests.get(&id).ok_or(Error::Internal)?;
-        let destination = racer_gpu::Destination::Import(&request.import);
-        let queued = request
-            .stream
-            .copy_from_host(destination, offset, plaintext.clone());
-        // Synchronize even after a failed queue call: part of it may run.
-        let synchronized = request.stream.synchronize();
-        queued.and(synchronized).map_err(gpu_error)?;
-        self.state
-            .counters
-            .plaintext
-            .fetch_add(1, Ordering::Relaxed);
-        Ok(())
-    }
-
-    /// After a failed sealed write, make sure no queued GPU work still reads
-    /// the ciphertext's staged slot or landing page before the page drops
-    /// and the slot goes back for another cuFile read or NIC write. The
-    /// streams retain the GPU allocation, not the slot. If no fence
-    /// succeeds, the slot is quarantined for the life of the process.
-    /// `fenced` says whether the request stream synchronized.
-    fn fence_source(&mut self, mut fenced: bool, source: &SealedSource) {
-        let ordinal = match source {
-            SealedSource::Host(_) => return,
-            SealedSource::Staged { staged, .. } => staged.ordinal(),
-            SealedSource::Landed(landed) => landed.ordinal(),
-        };
-        if let Some(utility) = self.utility.get(&ordinal) {
-            fenced &= utility.synchronize().is_ok();
-        }
-        if fenced {
-            return;
-        }
-        eprintln!("racer: stage=gpu ordinal={ordinal} state=ciphertext-quarantined");
-        match source {
-            SealedSource::Host(_) => {}
-            SealedSource::Staged { staged, .. } => std::mem::forget(staged.clone()),
-            SealedSource::Landed(landed) => std::mem::forget(landed.clone()),
-        }
-    }
-
-    /// After a failed sealed write, wait for request `id`'s stream. If that
-    /// fails, a copy into or a decrypt out of the destination GPU's scratch
-    /// may still be queued, so that GPU's scratch is tainted until the
-    /// stream synchronizes. Returns whether the stream is fenced.
-    fn fence_request(&mut self, id: u64) -> bool {
-        let Some(request) = self.requests.get(&id) else {
-            return true;
-        };
-        if request.stream.synchronize().is_ok() {
-            return true;
-        }
-        let ordinal = request.import.ordinal();
-        let stream = request.stream.clone();
-        let held = self.tainted.entry(ordinal).or_default();
-        if held.is_empty() {
-            eprintln!("racer: stage=gpu ordinal={ordinal} state=scratch-tainted");
-        }
-        if !held.iter().any(|known| std::rc::Rc::ptr_eq(known, &stream)) {
-            held.push(stream);
-        }
-        false
-    }
-
-    /// Refuse to use GPU `ordinal`'s scratch while an unfenced failed write
-    /// may still write it. Each held stream is synchronized again first;
-    /// once all are fenced the taint clears and they are released.
-    fn check_scratch(&mut self, ordinal: i32) -> Result<()> {
-        let Some(held) = self.tainted.get_mut(&ordinal) else {
-            return Ok(());
-        };
-        held.retain(|stream| stream.synchronize().is_err());
-        if !held.is_empty() {
-            return Err(Error::Unavailable);
-        }
-        self.tainted.remove(&ordinal);
-        eprintln!("racer: stage=gpu ordinal={ordinal} state=scratch-fenced");
-        self.note_leaks();
-        Ok(())
-    }
-
-    /// This GPU's staging buffer, allocated on first use.
-    fn staging(&mut self, ordinal: i32) -> Result<&racer_gpu::StagingBuffer> {
-        if !self.staging.contains_key(&ordinal) {
-            let context = self
-                .contexts
-                .iter()
-                .find(|context| context.ordinal() == ordinal)
-                .ok_or(Error::Internal)?;
-            let size = self.state.slots.max(SCRATCH_SLOTS) * SLOT_BYTES;
-            let buffer = context.staging(size).map_err(|error| {
-                eprintln!("racer: stage=gpu ordinal={ordinal} state=staging-failed reason={error}");
-                Error::Overloaded
-            })?;
-            self.staging.insert(ordinal, buffer);
-        }
-        self.staging.get(&ordinal).ok_or(Error::Internal)
     }
 
     /// Queue a cuFile read of a file range into a staged slot. A reader
@@ -1696,14 +2038,13 @@ impl Helper {
         if self.unsupported.contains(&identity.0) {
             return Err((Error::Unavailable, reply));
         }
-        if let Err(error) = self.staging(staged.ordinal) {
-            return Err((error, reply));
-        }
-        let Some(staging) = self.staging.get(&staged.ordinal) else {
-            return Err((Error::Internal, reply));
+        let staging = match self.engine.staging(staged.ordinal) {
+            Ok(staging) => staging,
+            Err(error) => return Err((error, reply)),
         };
         if let Err(error) = staging.register_cufile() {
-            self.state
+            self.engine
+                .state
                 .counters
                 .file_failures
                 .fetch_add(1, Ordering::Relaxed);
@@ -1718,7 +2059,7 @@ impl Helper {
                         self.retire(id);
                     }
                 }
-                match self.gpu.open_file(fd) {
+                match self.engine.gpu.open_file(fd) {
                     Ok(file) => {
                         let id = self.next_file;
                         self.next_file += 1;
@@ -1734,7 +2075,8 @@ impl Helper {
                         id
                     }
                     Err(error) => {
-                        self.state
+                        self.engine
+                            .state
                             .counters
                             .file_failures
                             .fetch_add(1, Ordering::Relaxed);
@@ -1748,17 +2090,16 @@ impl Helper {
                 }
             }
         };
-        let (Some(open), Some(staging)) =
-            (self.open.get_mut(&id), self.staging.get(&staged.ordinal))
-        else {
+        let Some(open) = self.open.get_mut(&id) else {
             return Err((Error::Internal, reply));
         };
         // SAFETY: the file stays in `open` while `reads` is above zero, the
-        // staging buffer and backend live until the readers are joined, and
-        // the slot is this job's alone until the read answers.
+        // job holds the staging buffer, the backend lives until the readers
+        // are joined, and the slot is this job's alone until the read
+        // answers.
         let read = match unsafe {
             open.file
-                .detach(staging, staged.offset(), file_offset, length)
+                .detach(&staging, staged.offset(), file_offset, length)
         } {
             Ok(read) => read,
             Err(error) => return Err((gpu_error(error), reply)),
@@ -1768,6 +2109,7 @@ impl Helper {
             read,
             file: id,
             staged,
+            _staging: staging,
             reply,
         };
         if let Err(mpsc::SendError(job)) = reads.send(job) {
@@ -1816,7 +2158,8 @@ impl Helper {
     /// them. Other devices keep using cuFile.
     fn unsupported_device(&mut self, device: u64, error: racer_gpu::Error) {
         if self.unsupported.insert(device) {
-            self.state
+            self.engine
+                .state
                 .counters
                 .cufile_unsupported
                 .fetch_add(1, Ordering::Relaxed);
@@ -1829,33 +2172,564 @@ impl Helper {
 
     /// Stop trying cuFile after a failure that is not about one read.
     fn disable_cufile(&self, error: racer_gpu::Error, reason: CufileDisable) {
-        if self.state.cufile.swap(false, Ordering::Relaxed) {
-            self.state.counters.cufile_disabled(reason);
+        let state = &self.engine.state;
+        if state.cufile.swap(false, Ordering::Relaxed) {
+            state.counters.cufile_disabled(reason);
             eprintln!("racer: stage=gpu state=cufile-disabled reason={error}");
         }
     }
+}
 
-    /// Verify and decrypt a sealed page, then write only the requested range.
-    fn write_sealed(&mut self, id: u64, offset: u64, sealed: &Sealed) -> Result<()> {
-        let ordinal = self
-            .requests
-            .get(&id)
-            .ok_or(Error::Internal)?
-            .import
-            .ordinal();
-        self.check_scratch(ordinal)?;
-        self.staging(ordinal)?;
+/// A request imported on this executor's GPU.
+struct Owned {
+    import: Arc<racer_gpu::ImportedAllocation>,
+    /// A page of it is running on a stream.
+    busy: bool,
+    /// A release that waits for its pages: `Some(reply)` once asked.
+    release: Option<Option<oneshot::Sender<Result<()>>>>,
+}
+
+/// One stream of an executor and the page running on it.
+#[derive(Default)]
+struct Lane {
+    /// Made on first use; `None` again after it was set aside as tainted.
+    stream: Option<racer_gpu::Stream>,
+    /// This stream's page-locked host slot: `None` until first use, then
+    /// `Some(None)` if allocation failed (copies read pageable memory).
+    pinned: Option<Option<racer_gpu::PinnedBuffer>>,
+    running: Option<Running>,
+}
+
+/// A page whose GPU work is queued on a lane.
+struct Running {
+    task: WriteTask,
+    /// Released, in the fence, only once the work completes.
+    import: Arc<racer_gpu::ImportedAllocation>,
+    /// The scratch pair the page uses, if any.
+    pair: Option<u64>,
+    fence: racer_gpu::Fence,
+    step: Step,
+    /// Ciphertext came from another GPU: `(source GPU, bytes)` over the peer
+    /// path, or bounced through host memory.
+    peer: Option<(i32, u64)>,
+    bounced: bool,
+    /// The source GPU's fence for a bounce, kept until the page is done.
+    _bounce: Option<racer_gpu::Fence>,
+}
+
+/// What the fence of a running page marks.
+enum Step {
+    /// A plaintext copy into the import.
+    Copied,
+    /// A decrypt; `whole` wrote the import, otherwise the plaintext scratch
+    /// slot.
+    Decrypted { whole: bool },
+    /// The copy of a verified partial page out of scratch.
+    Tail,
+}
+
+/// A stream set aside after a failed page could not be fenced, with the
+/// scratch pair its queued work may still write.
+struct Tainted {
+    stream: racer_gpu::Stream,
+    pair: Option<u64>,
+}
+
+/// Runs one GPU's page jobs: up to [`STREAMS`] at once, each on its own
+/// stream, and completes them by polling fences.
+struct Executor {
+    engine: Arc<Engine>,
+    device: Arc<Device>,
+    lanes: Vec<Lane>,
+    /// Scratch pairs not held by a running page or a tainted stream.
+    free_pairs: Vec<u64>,
+    /// Page jobs not started yet, in arrival order.
+    waiting: std::collections::VecDeque<WriteTask>,
+    requests: HashMap<u64, Owned>,
+    tainted: Vec<Tainted>,
+    /// This executor's streams for reading ciphertext back to the host from
+    /// another GPU without a peer path, by source GPU ordinal. Made on first
+    /// use and driven only by this executor's thread.
+    utility: HashMap<i32, racer_gpu::Stream>,
+}
+
+/// Offsets of scratch pair `pair`: ciphertext, then partial plaintext.
+fn scratch(pair: u64) -> (u64, u64) {
+    (2 * pair * SLOT_BYTES, (2 * pair + 1) * SLOT_BYTES)
+}
+
+impl Executor {
+    fn run(mut self) {
+        let _thread = self.engine.gpu.enter_thread();
+        let mut nap = POLL_MIN;
+        loop {
+            let running = self.lanes.iter().any(|lane| lane.running.is_some());
+            // Idle: sleep until a message. Otherwise nap briefly between
+            // fence polls; a message still wakes the executor at once.
+            let wait = (running || !self.waiting.is_empty()).then_some(nap);
+            let (tasks, closed) = self.device.queue.take(wait);
+            let arrived = !tasks.is_empty();
+            for task in tasks {
+                self.accept(task);
+            }
+            let completed = self.poll();
+            self.dispatch();
+            let running = self.lanes.iter().any(|lane| lane.running.is_some());
+            if closed && !running && self.waiting.is_empty() {
+                break;
+            }
+            nap = if arrived || completed {
+                POLL_MIN
+            } else {
+                (nap * 2).min(POLL_MAX)
+            };
+        }
+        self.shutdown();
+    }
+
+    fn accept(&mut self, task: Task) {
+        match task {
+            Task::Adopt { id, import } => {
+                self.requests.insert(
+                    id,
+                    Owned {
+                        import,
+                        busy: false,
+                        release: None,
+                    },
+                );
+            }
+            Task::Write(task) => self.waiting.push_back(task),
+            Task::Release { id, reply } => {
+                let pending = self.waiting.iter().any(|task| task.id == id);
+                match self.requests.get_mut(&id) {
+                    Some(owned) if owned.busy || pending => owned.release = Some(reply),
+                    Some(_) => self.release(id, reply),
+                    None => {
+                        if let Some(reply) = reply {
+                            let _ = reply.send(Ok(()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Drop request `id`'s import and answer `reply`.
+    fn release(&mut self, id: u64, reply: Option<oneshot::Sender<Result<()>>>) {
+        if let Ok(mut owners) = self.engine.state.owners.lock() {
+            owners.remove(&id);
+        }
+        let before = self.engine.gpu.leaked();
+        drop(self.requests.remove(&id));
+        self.engine.note_leaks();
+        let result = if self.engine.gpu.leaked() == before {
+            Ok(())
+        } else {
+            Err(Error::Unavailable)
+        };
+        if let Some(reply) = reply {
+            let _ = reply.send(result);
+        }
+    }
+
+    /// Advance every running page whose fence completed. Returns whether
+    /// any did.
+    fn poll(&mut self) -> bool {
+        let mut completed = false;
+        for index in 0..self.lanes.len() {
+            let Some(running) = self.lanes[index].running.as_ref() else {
+                continue;
+            };
+            match running.fence.poll() {
+                Ok(false) => {}
+                Ok(true) => {
+                    completed = true;
+                    self.advance(index);
+                }
+                Err(error) => {
+                    completed = true;
+                    let running = self.lanes[index].running.take().expect("running");
+                    eprintln!(
+                        "racer: stage=gpu ordinal={} state=page-failed reason={error}",
+                        self.device.ordinal
+                    );
+                    if let Some((src, _)) = running.peer {
+                        self.peer_failed(src, &error);
+                    }
+                    self.fail(index, running.task, running.pair, Error::Unavailable);
+                }
+            }
+        }
+        completed
+    }
+
+    /// The work behind lane `index`'s fence completed: answer the page, or
+    /// queue its next step.
+    fn advance(&mut self, index: usize) {
+        let mut running = self.lanes[index].running.take().expect("running");
+        let counters = self.engine.state.counters.clone();
+        match running.step {
+            Step::Copied => {
+                counters.plaintext.fetch_add(1, Ordering::Relaxed);
+                self.finish(index, running, Ok(()));
+            }
+            Step::Decrypted { whole } => {
+                if let Some((_, bytes)) = running.peer {
+                    counters.peer_copies.fetch_add(1, Ordering::Relaxed);
+                    counters.peer_copy_bytes.fetch_add(bytes, Ordering::Relaxed);
+                }
+                if running.bounced {
+                    counters.peer_bounces.fetch_add(1, Ordering::Relaxed);
+                }
+                running.peer = None;
+                running.bounced = false;
+                let stream = self.lanes[index].stream.as_ref().expect("lane stream");
+                let verdict = stream.verdict();
+                match verdict {
+                    Ok(racer_gpu::Verdict::Passed) if whole => self.decrypted(index, running),
+                    Ok(racer_gpu::Verdict::Passed) => {
+                        // Only now, after the verdict, may scratch plaintext
+                        // reach the import.
+                        match self.queue_tail(index, &running) {
+                            Ok(fence) => {
+                                running.fence = fence;
+                                running.step = Step::Tail;
+                                self.lanes[index].running = Some(running);
+                            }
+                            Err(error) => self.fail(index, running.task, running.pair, error),
+                        }
+                    }
+                    Ok(racer_gpu::Verdict::TagMismatch) => {
+                        counters.rejected.fetch_add(1, Ordering::Relaxed);
+                        self.finish(index, running, Err(Error::CorruptRecord));
+                    }
+                    Ok(racer_gpu::Verdict::NotRun) => {
+                        self.finish(index, running, Err(Error::Unavailable))
+                    }
+                    Err(error) => {
+                        self.fail(index, running.task, running.pair, gpu_error(error));
+                    }
+                }
+            }
+            Step::Tail => self.decrypted(index, running),
+        }
+    }
+
+    /// A sealed page was verified and written.
+    fn decrypted(&mut self, index: usize, running: Running) {
+        let counters = &self.engine.state.counters;
+        counters.decrypted.fetch_add(1, Ordering::Relaxed);
+        if let Work::Sealed(sealed) = &running.task.work
+            && matches!(sealed.page.source, SealedSource::Landed(_))
+        {
+            counters.landed.fetch_add(1, Ordering::Relaxed);
+        }
+        self.finish(index, running, Ok(()));
+    }
+
+    /// Queue the copy of a verified partial page from scratch into the
+    /// import, and fence it.
+    fn queue_tail(&mut self, index: usize, running: &Running) -> Result<racer_gpu::Fence> {
+        let Work::Sealed(sealed) = &running.task.work else {
+            return Err(Error::Internal);
+        };
+        let (_, plaintext) = scratch(running.pair.ok_or(Error::Internal)?);
+        let staging = self.engine.staging(self.device.ordinal)?;
+        let import = &running.import;
+        let stream = self.lanes[index].stream.as_ref().ok_or(Error::Internal)?;
+        stream
+            .copy_from_staging(
+                racer_gpu::Destination::Import(import),
+                running.task.offset,
+                &staging,
+                plaintext + sealed.range.start,
+                sealed.range.end - sealed.range.start,
+            )
+            .map_err(gpu_error)?;
+        self.fence(stream)
+    }
+
+    /// Answer a page whose work completed, and free its lane and scratch.
+    fn finish(&mut self, index: usize, running: Running, result: Result<()>) {
+        let Running { task, pair, .. } = running;
+        if let Some(pair) = pair {
+            self.free_pairs.push(pair);
+        }
+        self.answer(task, result);
+        debug_assert!(self.lanes[index].running.is_none());
+    }
+
+    /// Answer `task`, then run a release that waited for it.
+    fn answer(&mut self, task: WriteTask, result: Result<()>) {
+        let WriteTask {
+            id, work, reply, ..
+        } = task;
+        // If the I/O side stopped waiting, the page drops here. Its storage
+        // is shared and thread safe, so that is fine.
+        // Count the page done before answering, so a caller that saw the
+        // answer never sees it still queued.
+        self.device.queue.finished();
+        let _ = reply.send((work, result));
+        let pending = self.waiting.iter().any(|task| task.id == id);
+        if let Some(owned) = self.requests.get_mut(&id) {
+            owned.busy = false;
+            if !pending && let Some(reply) = owned.release.take() {
+                self.release(id, reply);
+            }
+        }
+    }
+
+    /// Fail a page after some of its work may have been queued on lane
+    /// `index`. The lane's stream is synchronized first, so nothing queued
+    /// still reads the source or writes scratch. If that fails, the stream
+    /// and its scratch pair are set aside (tainted) until a later
+    /// synchronize succeeds, and the page's staged or landed source is
+    /// quarantined unless another fence covers it.
+    fn fail(&mut self, index: usize, task: WriteTask, pair: Option<u64>, error: Error) {
+        let lane = &mut self.lanes[index];
+        let fenced = lane
+            .stream
+            .as_ref()
+            .is_none_or(|stream| stream.synchronize().is_ok());
+        if fenced {
+            if let Some(pair) = pair {
+                self.free_pairs.push(pair);
+            }
+        } else if let Some(stream) = lane.stream.take() {
+            if self.tainted.is_empty() {
+                eprintln!(
+                    "racer: stage=gpu ordinal={} state=scratch-tainted",
+                    self.device.ordinal
+                );
+            }
+            self.tainted.push(Tainted { stream, pair });
+        }
+        if let Work::Sealed(sealed) = &task.work {
+            let ordinal = match &sealed.page.source {
+                SealedSource::Host(_) => None,
+                SealedSource::Staged { staged, .. } => Some(staged.ordinal()),
+                SealedSource::Landed(landed) => Some(landed.ordinal()),
+            };
+            let utility = ordinal.and_then(|ordinal| self.utility.get(&ordinal));
+            let fenced = fenced && utility.is_none_or(|stream| stream.synchronize().is_ok());
+            self.engine.fence_source(fenced, &sealed.page.source);
+        }
+        self.engine.note_leaks();
+        self.answer(task, Err(error));
+    }
+
+    /// Turn the peer path from `src` off after a failed copy.
+    fn peer_failed(&self, src: i32, error: &racer_gpu::Error) {
+        let dst = self.device.ordinal;
+        let state = &self.engine.state;
+        state.counters.peer_failures.fetch_add(1, Ordering::Relaxed);
+        let entry = state.peers.get().and_then(|matrix| matrix.entry(dst, src));
+        if entry.is_some_and(|allowed| allowed.swap(false, Ordering::Relaxed)) {
+            eprintln!(
+                "racer: stage=gpu ordinal={dst} peer={src} state=peer-disabled reason={error}"
+            );
+        }
+    }
+
+    /// Refuse sealed pages while a tainted stream may still write scratch.
+    /// Each tainted stream is synchronized again first; those that succeed
+    /// give their scratch pair back and are freed.
+    fn check_scratch(&mut self) -> Result<()> {
+        if self.tainted.is_empty() {
+            return Ok(());
+        }
+        let mut kept = Vec::new();
+        for tainted in std::mem::take(&mut self.tainted) {
+            if tainted.stream.synchronize().is_ok() {
+                if let Some(pair) = tainted.pair {
+                    self.free_pairs.push(pair);
+                }
+                drop(tainted.stream);
+                self.engine.state.streams.fetch_sub(1, Ordering::Relaxed);
+            } else {
+                kept.push(tainted);
+            }
+        }
+        self.tainted = kept;
+        if !self.tainted.is_empty() {
+            return Err(Error::Unavailable);
+        }
+        eprintln!(
+            "racer: stage=gpu ordinal={} state=scratch-fenced",
+            self.device.ordinal
+        );
+        self.engine.note_leaks();
+        Ok(())
+    }
+
+    /// Start waiting pages on idle lanes, in arrival order. A page waits
+    /// while its request has another page running, or while it needs a
+    /// scratch pair and none is free; later pages may pass it.
+    fn dispatch(&mut self) {
+        let mut position = 0;
+        while position < self.waiting.len() {
+            let Some(index) = self.lanes.iter().position(|lane| lane.running.is_none()) else {
+                return;
+            };
+            let task = &self.waiting[position];
+            if self.requests.get(&task.id).is_some_and(|owned| owned.busy) {
+                position += 1;
+                continue;
+            }
+            let sealed = matches!(task.work, Work::Sealed(_));
+            let needs = needs_scratch(task, self.device.ordinal);
+            if sealed && let Err(error) = self.check_scratch() {
+                let task = self.waiting.remove(position).expect("present");
+                self.answer(task, Err(error));
+                continue;
+            }
+            let pair = if needs {
+                match self.free_pairs.pop() {
+                    Some(pair) => Some(pair),
+                    None => {
+                        position += 1;
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+            let task = self.waiting.remove(position).expect("present");
+            self.begin(index, task, pair);
+        }
+    }
+
+    /// Queue `task`'s first step on lane `index`.
+    fn begin(&mut self, index: usize, task: WriteTask, pair: Option<u64>) {
+        let Some(owned) = self.requests.get_mut(&task.id) else {
+            if let Some(pair) = pair {
+                self.free_pairs.push(pair);
+            }
+            self.answer(task, Err(Error::Internal));
+            return;
+        };
+        owned.busy = true;
+        let import = owned.import.clone();
+        if self.lanes[index].stream.is_none() {
+            match self.device.context.stream() {
+                Ok(stream) => {
+                    self.engine.state.streams.fetch_add(1, Ordering::Relaxed);
+                    self.lanes[index].stream = Some(stream);
+                }
+                Err(error) => {
+                    if let Some(pair) = pair {
+                        self.free_pairs.push(pair);
+                    }
+                    self.answer(task, Err(gpu_error(error)));
+                    return;
+                }
+            }
+        }
+        let queued = match &task.work {
+            Work::Plaintext(plaintext) => self.queue_plaintext(index, &task, plaintext, &import),
+            Work::Sealed(sealed) => self.queue_sealed(index, &task, sealed, &import, pair),
+        };
+        match queued {
+            Ok(queued) => {
+                self.lanes[index].running = Some(Running {
+                    task,
+                    import,
+                    pair,
+                    fence: queued.fence,
+                    step: queued.step,
+                    peer: queued.peer,
+                    bounced: queued.bounced,
+                    _bounce: queued.bounce,
+                });
+            }
+            Err(error) => self.fail(index, task, pair, error),
+        }
+    }
+
+    /// Fence the work queued so far on lane `stream`, and ask CUDA to wake
+    /// this executor when it completes. Without host functions, or if the
+    /// launch fails, the executor still learns of completion by polling.
+    fn fence(&self, stream: &racer_gpu::Stream) -> Result<racer_gpu::Fence> {
+        let fence = stream.fence_in(&self.device.events).map_err(gpu_error)?;
+        let queue = self.device.queue.clone();
+        let _ = stream.on_complete(Box::new(move || queue.wake()));
+        Ok(fence)
+    }
+
+    /// Lane `index`'s pinned slot holding a copy of `bytes`, or `None` to
+    /// copy from pageable memory instead.
+    fn pinned_for(&mut self, index: usize, bytes: &[u8]) -> Option<racer_gpu::PinnedBuffer> {
+        let pinned = self.pinned_slot(index)?;
+        pinned.write(0, bytes).ok()?;
+        Some(pinned)
+    }
+
+    /// Lane `index`'s pinned slot, allocated on first use.
+    fn pinned_slot(&mut self, index: usize) -> Option<racer_gpu::PinnedBuffer> {
+        let lane = &mut self.lanes[index];
+        if lane.pinned.is_none() {
+            let ordinal = self.device.ordinal;
+            let slot = self.device.context.pinned(SLOT_BYTES).map_err(|error| {
+                eprintln!("racer: stage=gpu ordinal={ordinal} state=pinned-failed reason={error}");
+            });
+            lane.pinned = Some(slot.ok());
+        }
+        lane.pinned.clone().flatten()
+    }
+
+    fn queue_plaintext(
+        &mut self,
+        index: usize,
+        task: &WriteTask,
+        plaintext: &Plaintext,
+        import: &racer_gpu::ImportedAllocation,
+    ) -> Result<Queued> {
+        let pinned = self.pinned_for(index, plaintext.bytes());
+        let stream = self.lanes[index].stream.as_ref().ok_or(Error::Internal)?;
+        let destination = racer_gpu::Destination::Import(import);
+        let length = plaintext.bytes().len() as u64;
+        match &pinned {
+            Some(pinned) => stream.copy_from_pinned(destination, task.offset, pinned, 0, length),
+            None => stream.copy_from_host(destination, task.offset, plaintext.clone()),
+        }
+        .map_err(gpu_error)?;
+        Ok(Queued {
+            fence: self.fence(stream)?,
+            step: Step::Copied,
+            peer: None,
+            bounced: false,
+            bounce: None,
+        })
+    }
+
+    /// Queue the copies a sealed page needs, then its decrypt, and fence
+    /// them. Nothing waits on the host except an RDMA flush and the
+    /// pageable bounce fallback.
+    fn queue_sealed(
+        &mut self,
+        index: usize,
+        task: &WriteTask,
+        sealed: &Sealed,
+        import: &racer_gpu::ImportedAllocation,
+        pair: Option<u64>,
+    ) -> Result<Queued> {
+        let ordinal = self.device.ordinal;
+        let staging = self.engine.staging(ordinal)?;
         let page = &sealed.page;
         let length = u64::from(page.plaintext_length());
         if sealed.range.start >= sealed.range.end || sealed.range.end > length {
             return Err(Error::InvalidRange);
         }
-        if let SealedSource::Landed(landed) = &page.source
-            && landed.len() != length + 16
-        {
-            return Err(Error::Internal);
+        if let SealedSource::Landed(landed) = &page.source {
+            if landed.len() != length + 16 {
+                return Err(Error::Internal);
+            }
+            // The NIC wrote these bytes; the decrypt reads them twice
+            // (GHASH, then CTR), so they must be visible and final first.
+            self.engine
+                .flush_landed(landed.ordinal(), landed.ordinal() != ordinal)?;
         }
-        // Ciphertext on another GPU comes into this GPU's scratch first.
         let remote = match &page.source {
             SealedSource::Staged { staged, .. } if staged.ordinal() != ordinal => Some(Remote {
                 ordinal: staged.ordinal(),
@@ -1869,208 +2743,225 @@ impl Helper {
             }),
             _ => None,
         };
+        let whole = sealed.range.start == 0 && sealed.range.end == length;
+        let (ciphertext, plaintext) = match pair {
+            Some(pair) => scratch(pair),
+            None if remote.is_none() && whole && !matches!(page.source, SealedSource::Host(_)) => {
+                (0, 0)
+            }
+            None => return Err(Error::Internal),
+        };
+        let mut peer = None;
+        let mut bounced = false;
+        let mut bounce = None;
         if let Some(remote) = &remote {
-            self.copy_remote(id, ordinal, remote, length + 16)?;
+            let buffer = self.engine.source_buffer(remote)?;
+            let src = remote.ordinal;
+            let allowed = self
+                .engine
+                .state
+                .peers
+                .get()
+                .and_then(|matrix| matrix.entry(ordinal, src))
+                .is_some_and(|allowed| allowed.load(Ordering::Relaxed));
+            let mut copied = false;
+            if allowed {
+                let stream = self.lanes[index].stream.as_ref().ok_or(Error::Internal)?;
+                match stream.copy_from_peer(
+                    racer_gpu::Destination::Staging(&staging),
+                    ciphertext,
+                    &buffer,
+                    remote.offset,
+                    length + 16,
+                ) {
+                    Ok(()) => {
+                        peer = Some((src, length + 16));
+                        copied = true;
+                    }
+                    // Part of it may have been queued; the bounce below
+                    // is queued after it on the same stream, so it wins.
+                    Err(error) => self.peer_failed(src, &error),
+                }
+            }
+            if !copied {
+                bounce = self.bounce(index, remote, &buffer, &staging, ciphertext, length + 16)?;
+                bounced = true;
+            }
         }
-        let staging = self.staging.get(&ordinal).ok_or(Error::Internal)?;
-        let request = self.requests.get(&id).ok_or(Error::Internal)?;
-        let stream = &request.stream;
+        let pinned = match &page.source {
+            SealedSource::Host(copy) if remote.is_none() => {
+                self.pinned_for(index, copy.copy.ciphertext.bytes())
+            }
+            _ => None,
+        };
+        let stream = self.lanes[index].stream.as_ref().ok_or(Error::Internal)?;
+        let landing;
         let (source_buffer, source) = match &page.source {
-            _ if remote.is_some() => (staging, CIPHERTEXT_SCRATCH),
+            _ if remote.is_some() => (&staging, ciphertext),
             SealedSource::Host(copy) => {
                 let bytes = copy.copy.ciphertext.bytes();
                 if bytes.len() as u64 != length + 16 {
                     return Err(Error::CorruptRecord);
                 }
-                let copied = stream.copy_from_host(
-                    racer_gpu::Destination::Staging(staging),
-                    CIPHERTEXT_SCRATCH,
-                    HostCiphertext(copy.copy.ciphertext.clone()),
-                );
-                if let Err(error) = copied {
-                    let _ = stream.synchronize();
-                    return Err(gpu_error(error));
+                let destination = racer_gpu::Destination::Staging(&staging);
+                match &pinned {
+                    Some(pinned) => {
+                        stream.copy_from_pinned(destination, ciphertext, pinned, 0, length + 16)
+                    }
+                    None => stream.copy_from_host(
+                        destination,
+                        ciphertext,
+                        HostCiphertext(copy.copy.ciphertext.clone()),
+                    ),
                 }
-                (staging, CIPHERTEXT_SCRATCH)
+                .map_err(gpu_error)?;
+                (&staging, ciphertext)
             }
-            SealedSource::Staged { staged, .. } => (staging, staged.offset()),
+            SealedSource::Staged { staged, .. } => (&staging, staged.offset()),
             SealedSource::Landed(landed) => {
-                let buffer = self
+                landing = self
+                    .engine
                     .landing
+                    .lock()
+                    .map_err(|_| Error::Internal)?
                     .get(&landed.allocation)
+                    .cloned()
                     .ok_or(Error::Internal)?;
-                (buffer, landed.offset())
+                (&landing, landed.offset())
             }
         };
-        let request_key = racer_gpu::DecryptRequest {
+        let request = racer_gpu::DecryptRequest {
             key: page.key.key(),
             nonce: page.key.nonce(),
             aad: &page.aad,
             length,
-            expected_crc: page.expected_crc,
         };
         // A whole page decrypts straight into the import. Part of a page
         // decrypts into scratch first, because the tag covers the whole page
         // and nothing outside the window may be written.
-        let whole = sealed.range.start == 0 && sealed.range.end == length;
         let (destination, at) = if whole {
-            (racer_gpu::Destination::Import(&request.import), offset)
+            (racer_gpu::Destination::Import(import), task.offset)
         } else {
-            (racer_gpu::Destination::Staging(staging), PLAINTEXT_SCRATCH)
+            (racer_gpu::Destination::Staging(&staging), plaintext)
         };
-        let queued = stream.decrypt(&request_key, source_buffer, source, destination, at);
-        let synchronized = stream.synchronize();
-        if let Err(racer_gpu::Error::KernelUnavailable) = queued {
-            if let Ok(mut off) = self.state.kernels_off.lock() {
+        let decrypted = stream.decrypt(&request, source_buffer, source, destination, at);
+        if let Err(racer_gpu::Error::KernelUnavailable) = decrypted {
+            if let Ok(mut off) = self.engine.state.kernels_off.lock() {
                 off.insert(ordinal);
             }
             return Err(Error::Unavailable);
         }
-        queued.and(synchronized).map_err(gpu_error)?;
-        match stream.verdict().map_err(gpu_error)? {
-            racer_gpu::Verdict::Passed { .. } => {}
-            racer_gpu::Verdict::CrcMismatch { .. } | racer_gpu::Verdict::TagMismatch { .. } => {
-                self.state.counters.rejected.fetch_add(1, Ordering::Relaxed);
-                return Err(Error::CorruptRecord);
-            }
-            racer_gpu::Verdict::NotRun => return Err(Error::Unavailable),
-        }
-        if !whole {
-            let copied = stream.copy_from_staging(
-                racer_gpu::Destination::Import(&request.import),
-                offset,
-                staging,
-                PLAINTEXT_SCRATCH + sealed.range.start,
-                sealed.range.end - sealed.range.start,
-            );
-            let synchronized = stream.synchronize();
-            copied.and(synchronized).map_err(gpu_error)?;
-        }
-        self.state
-            .counters
-            .decrypted
-            .fetch_add(1, Ordering::Relaxed);
-        if matches!(page.source, SealedSource::Landed(_)) {
-            self.state.counters.landed.fetch_add(1, Ordering::Relaxed);
-        }
-        Ok(())
+        decrypted.map_err(gpu_error)?;
+        Ok(Queued {
+            fence: self.fence(stream)?,
+            step: Step::Decrypted { whole },
+            peer,
+            bounced,
+            bounce,
+        })
     }
 
-    /// Copy `length` bytes of ciphertext from another GPU into GPU `dst`'s
-    /// ciphertext scratch slot for request `id`, and wait for it. Uses the
-    /// peer path when the pair allows it; on failure turns the pair off and
-    /// falls back to host memory, as it does for pairs without one.
-    fn copy_remote(&mut self, id: u64, dst: i32, source: &Remote, length: u64) -> Result<()> {
-        let src = source.ordinal;
-        let peer = self
-            .state
-            .peers
-            .get()
-            .and_then(|matrix| matrix.entry(dst, src));
-        if peer.is_some_and(|allowed| allowed.load(Ordering::Relaxed)) {
-            let copied = {
-                let request = self.requests.get(&id).ok_or(Error::Internal)?;
-                let staging = self.staging.get(&dst).ok_or(Error::Internal)?;
-                let buffer = self.source_buffer(source)?;
-                let queued = request.stream.copy_from_peer(
-                    racer_gpu::Destination::Staging(staging),
-                    CIPHERTEXT_SCRATCH,
-                    buffer,
-                    source.offset,
-                    length,
-                );
-                // Synchronize even after a failed queue call: part may run.
-                let synchronized = request.stream.synchronize();
-                queued.and(synchronized)
-            };
-            let counters = &self.state.counters;
-            match copied {
-                Ok(()) => {
-                    counters.peer_copies.fetch_add(1, Ordering::Relaxed);
-                    counters
-                        .peer_copy_bytes
-                        .fetch_add(length, Ordering::Relaxed);
-                    return Ok(());
-                }
-                Err(error) => {
-                    counters.peer_failures.fetch_add(1, Ordering::Relaxed);
-                    if peer.is_some_and(|allowed| allowed.swap(false, Ordering::Relaxed)) {
-                        eprintln!(
-                            "racer: stage=gpu ordinal={dst} peer={src} state=peer-disabled reason={error}"
-                        );
-                    }
-                }
+    /// Move ciphertext from another GPU into this GPU's scratch through
+    /// host memory. With a free pinned slot this waits on nothing: the
+    /// source GPU's utility stream copies into the slot and the lane's
+    /// stream waits on that fence before copying it in. The returned fence
+    /// holds the slot until the page is done. Without one, the source is
+    /// read back synchronously (pageable fallback).
+    fn bounce(
+        &mut self,
+        index: usize,
+        remote: &Remote,
+        buffer: &racer_gpu::StagingBuffer,
+        staging: &racer_gpu::StagingBuffer,
+        ciphertext: u64,
+        length: u64,
+    ) -> Result<Option<racer_gpu::Fence>> {
+        let pinned = self.pinned_slot(index).filter(|pinned| !pinned.in_flight());
+        let utility = match self.utility.entry(remote.ordinal) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let stream = self
+                    .engine
+                    .device(remote.ordinal)?
+                    .context
+                    .stream()
+                    .map_err(gpu_error)?;
+                self.engine.state.streams.fetch_add(1, Ordering::Relaxed);
+                entry.insert(stream)
             }
-        }
-        self.bounce(id, dst, source, length)
-    }
-
-    /// Move ciphertext from another GPU into `dst`'s scratch through host
-    /// memory, and wait for it.
-    fn bounce(&mut self, id: u64, dst: i32, source: &Remote, length: u64) -> Result<()> {
-        let src = source.ordinal;
-        if !self.utility.contains_key(&src) {
-            let context = self
-                .contexts
-                .iter()
-                .find(|context| context.ordinal() == src)
-                .ok_or(Error::Internal)?;
-            let stream = context.stream().map_err(gpu_error)?;
-            self.utility.insert(src, stream);
+        };
+        let events = self.engine.device(remote.ordinal)?.events.clone();
+        let stream = self.lanes[index].stream.as_ref().ok_or(Error::Internal)?;
+        let destination = racer_gpu::Destination::Staging(staging);
+        if let Some(pinned) = pinned {
+            let fence = utility
+                .copy_to_pinned(buffer, remote.offset, &pinned, 0, length)
+                .and_then(|()| utility.fence_in(&events))
+                .map_err(gpu_error)?;
+            stream
+                .wait_for(&fence)
+                .and_then(|()| stream.copy_from_pinned(destination, ciphertext, &pinned, 0, length))
+                .map_err(gpu_error)?;
+            return Ok(Some(fence));
         }
         let mut bytes = vec![0; usize::try_from(length).map_err(|_| Error::Internal)?];
-        let utility = self.utility.get(&src).ok_or(Error::Internal)?;
         utility
-            .read_staging(self.source_buffer(source)?, source.offset, &mut bytes)
+            .read_staging(buffer, remote.offset, &mut bytes)
             .map_err(gpu_error)?;
-        let request = self.requests.get(&id).ok_or(Error::Internal)?;
-        let staging = self.staging.get(&dst).ok_or(Error::Internal)?;
-        let queued = request.stream.copy_from_host(
-            racer_gpu::Destination::Staging(staging),
-            CIPHERTEXT_SCRATCH,
-            bytes,
-        );
-        let synchronized = request.stream.synchronize();
-        queued.and(synchronized).map_err(gpu_error)?;
-        self.state
-            .counters
-            .peer_bounces
-            .fetch_add(1, Ordering::Relaxed);
-        Ok(())
+        stream
+            .copy_from_host(destination, ciphertext, bytes)
+            .map_err(gpu_error)?;
+        Ok(None)
     }
 
-    /// The buffer that holds ciphertext on another GPU.
-    fn source_buffer(&self, source: &Remote) -> Result<&racer_gpu::StagingBuffer> {
-        match source.landed {
-            Some(allocation) => self.landing.get(&allocation),
-            None => self.staging.get(&source.ordinal),
+    /// Release everything once the queue closed and every page answered.
+    fn shutdown(&mut self) {
+        let ids: Vec<u64> = self.requests.keys().copied().collect();
+        for id in ids {
+            self.release(id, None);
         }
-        .ok_or(Error::Internal)
+        let streams = &self.engine.state.streams;
+        for lane in self.lanes.drain(..) {
+            if lane.stream.is_some() {
+                streams.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+        for tainted in self.tainted.drain(..) {
+            drop(tainted.stream);
+            streams.fetch_sub(1, Ordering::Relaxed);
+        }
+        for (_, stream) in self.utility.drain() {
+            drop(stream);
+            streams.fetch_sub(1, Ordering::Relaxed);
+        }
+        self.engine.note_leaks();
     }
+}
 
-    /// Drop the stream (which synchronizes it), then the import.
-    fn release(&mut self, id: u64) -> Result<()> {
-        let Some(request) = self.requests.remove(&id) else {
-            return Ok(());
-        };
-        let before = self.gpu.leaked();
-        let synchronized = request.stream.synchronize();
-        let Request { stream, import } = request;
-        drop(stream);
-        drop(import);
-        self.note_leaks();
-        if synchronized.is_err() || self.gpu.leaked() != before {
-            return Err(Error::Unavailable);
-        }
-        Ok(())
-    }
+/// The first step of a page, queued.
+struct Queued {
+    fence: racer_gpu::Fence,
+    step: Step,
+    peer: Option<(i32, u64)>,
+    bounced: bool,
+    bounce: Option<racer_gpu::Fence>,
+}
 
-    fn note_leaks(&self) {
-        let leaked = self.gpu.leaked();
-        if self.state.leaked.swap(leaked, Ordering::Relaxed) != leaked {
-            eprintln!("racer: stage=gpu state=leaked total={leaked}");
-        }
-    }
+/// Whether `task` on GPU `ordinal` needs a scratch pair: host ciphertext
+/// and ciphertext from another GPU are copied into scratch first, and part
+/// of a page is decrypted into scratch before the copy out.
+fn needs_scratch(task: &WriteTask, ordinal: i32) -> bool {
+    let Work::Sealed(sealed) = &task.work else {
+        return false;
+    };
+    let length = u64::from(sealed.page.plaintext_length());
+    let whole = sealed.range.start == 0 && sealed.range.end == length;
+    let local = match &sealed.page.source {
+        SealedSource::Host(_) => false,
+        SealedSource::Staged { staged, .. } => staged.ordinal() == ordinal,
+        SealedSource::Landed(landed) => landed.ordinal() == ordinal,
+    };
+    !(whole && local)
 }
 
 #[cfg(test)]
@@ -2080,24 +2971,44 @@ pub(crate) mod testing {
     use std::cell::RefCell;
 
     thread_local! {
-        /// The simulation, on the GPU helper thread only.
+        /// The simulation, on the GPU coordinator thread only.
         static SIM: RefCell<Option<(racer_gpu::simulation::Simulation, racer_gpu::simulation::Environment)>> =
             const { RefCell::new(None) };
     }
 
-    /// The helper thread's simulation. Call through [`GpuHelper::run`].
+    /// A hook run on the coordinator between registering request `id`'s owner
+    /// and queuing its adoption, keyed by request id.
+    pub(super) static BEFORE_ADOPT: Mutex<Vec<(u64, AdoptHook)>> = Mutex::new(Vec::new());
+
+    /// A hook in [`BEFORE_ADOPT`].
+    pub(super) type AdoptHook = Box<dyn FnOnce() + Send>;
+
+    pub(super) fn before_adopt(id: u64) {
+        let hook = {
+            let mut hooks = BEFORE_ADOPT.lock().unwrap_or_else(|e| e.into_inner());
+            hooks
+                .iter()
+                .position(|(hook, _)| *hook == id)
+                .map(|at| hooks.swap_remove(at).1)
+        };
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// The coordinator thread's simulation. Call through [`GpuHelper::run`].
     pub(crate) fn simulation() -> racer_gpu::simulation::Simulation {
         SIM.with(|sim| sim.borrow().as_ref().unwrap().0.clone())
     }
 
-    /// Live simulated staging and landing buffers. Run on the helper thread.
+    /// Live simulated staging and landing buffers. Run on the coordinator thread.
     pub(crate) fn live_staging() -> usize {
         simulation().live().staging
     }
 
     /// A test scope with a few seconds on the real clock.
     pub(crate) fn scope() -> RequestScope {
-        RequestScope::new(
+        RequestScope::host(
             crate::model::RequestId([1; 16]),
             std::time::Instant::now() + std::time::Duration::from_secs(5),
         )
@@ -2148,16 +3059,41 @@ pub(crate) mod testing {
         page: Box<SealedPage>,
         range: Range<u64>,
     ) -> Result<()> {
+        let answer = submit(helper, id, page, range)?;
+        futures::executor::block_on(answer).unwrap().1
+    }
+
+    /// Queue `page`'s `range` for request `id` at offset 0 without waiting.
+    pub(super) fn submit(
+        helper: &GpuHelper,
+        id: u64,
+        page: Box<SealedPage>,
+        range: Range<u64>,
+    ) -> Result<oneshot::Receiver<(Work, Result<()>)>> {
+        let ordinal = owner(helper, id).ok_or(Error::Internal)?;
         let (reply, answer) = oneshot::channel();
-        helper
-            .send(Job::Write {
+        helper.submit(
+            ordinal,
+            WriteTask {
                 id,
                 offset: 0,
                 work: Work::Sealed(Sealed { page, range }),
                 reply,
-            })
-            .unwrap();
-        futures::executor::block_on(answer).unwrap().1
+            },
+        )?;
+        Ok(answer)
+    }
+
+    /// The GPU request `id` was imported on.
+    pub(crate) fn owner(helper: &GpuHelper, id: u64) -> Option<i32> {
+        helper.owners.lock().unwrap().get(&id).copied()
+    }
+
+    /// Release request `id` and wait for the answer.
+    pub(crate) fn release(helper: &GpuHelper, id: u64) -> Result<()> {
+        let (reply, answer) = oneshot::channel();
+        helper.release(id, Some(reply))?;
+        futures::executor::block_on(answer).unwrap()
     }
 
     /// Host-to-device copies the GPU has made so far.
@@ -2224,6 +3160,45 @@ mod tests {
     use crate::model::*;
     use rdma_verbs::DmabufMemory;
 
+    #[test]
+    fn queue_wake_ends_a_poll_nap_early() {
+        let queue = Arc::new(Queue::new(1));
+        let waker = queue.clone();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            waker.wake();
+        });
+        let started = std::time::Instant::now();
+        let (tasks, closed) = queue.take(Some(std::time::Duration::from_secs(30)));
+        handle.join().unwrap();
+        assert!(tasks.is_empty() && !closed);
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert!(!queue.woken.load(Ordering::Acquire), "wake is consumed");
+    }
+
+    #[test]
+    fn queue_wake_before_take_skips_the_nap() {
+        let queue = Queue::new(1);
+        queue.wake();
+        let started = std::time::Instant::now();
+        let _ = queue.take(Some(std::time::Duration::from_secs(30)));
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert!(!queue.woken.load(Ordering::Acquire));
+        // Idle waits ignore the flag: they wait for messages only.
+        queue.wake();
+        queue.close();
+        let (_, closed) = queue.take(None);
+        assert!(closed);
+    }
+
+    #[test]
+    fn fence_poll_nap_is_bounded() {
+        // A completed page waits at most one nap before the executor notices
+        // its fence; keep that added latency small.
+        assert!(POLL_MIN <= POLL_MAX);
+        assert!(POLL_MAX <= std::time::Duration::from_micros(100));
+    }
+
     const LENGTH: u64 = 2 * SLOT_BYTES;
 
     fn metadata(length: u64) -> ObjectMetadata {
@@ -2231,7 +3206,7 @@ mod tests {
             content_type: None,
             version: ObjectVersion {
                 object: ObjectId {
-                    cache: racer_control_wire::CacheId(
+                    cache: racer_wire::control::CacheId(
                         "00000000-0000-4000-8000-000000000001".into(),
                     ),
                     key: CacheKey([0; 32]),
@@ -2262,28 +3237,39 @@ mod tests {
     ) -> (Vec<u8>, impl FnOnce(SealedSource) -> Box<SealedPage>) {
         let metadata = metadata(plaintext.len() as u64);
         let envelope = PageEnvelope {
+            page_size: racer_wire::object::PageSize::DEFAULT,
             cipher: PageCipher::Xaes256Gcm,
             page: PageId {
                 version: metadata.version.clone(),
                 number: PageNumber(0),
             },
             key_id: key_id_from_generation(1, 1).unwrap(),
-            nonce: Nonce([2; 24]),
+            nonce: Nonce(crate::test_support::test_vector([2; 24])),
             plaintext_length: plaintext.len() as u32,
             ciphertext_length: plaintext.len() as u32 + 16,
         };
         let aad = crate::security::page_aad(&envelope).unwrap();
         let mut sealed = vec![0; plaintext.len() + 16];
-        racer_crypto::seal(&[7; 32], &envelope.nonce.0, &aad, plaintext, &mut sealed).unwrap();
+        racer_crypto::seal(
+            &crate::test_support::test_vector([7; 32]),
+            &envelope.nonce.0,
+            &aad,
+            plaintext,
+            &mut sealed,
+        )
+        .unwrap();
         if tamper {
             sealed[3] ^= 1;
         }
         let build = move |source| {
             let page = Box::new(SealedPage {
+                fused_store: None,
                 metadata,
                 aad,
-                key: racer_crypto::xaes_derive(&[7; 32], &envelope.nonce.0),
-                expected_crc: None,
+                key: racer_crypto::xaes_derive(
+                    &crate::test_support::test_vector([7; 32]),
+                    &envelope.nonce.0,
+                ),
                 source,
                 envelope,
             });
@@ -2351,7 +3337,26 @@ mod tests {
             plaintext[10..20]
         );
         assert_eq!(helper.counters().landed.load(Ordering::Relaxed), 2);
+        // The simulated GPU does not order RDMA writes: each decrypt flushed.
+        assert_eq!(helper.run(|| simulation().rdma_flushes()), 2);
         assert_eq!(helper.leaked(), 0);
+    }
+
+    #[test]
+    /// Landed ciphertext is not read when RDMA writes can be neither ordered
+    /// nor flushed; with native ordering no flush is needed.
+    fn landed_ciphertext_needs_ordered_or_flushed_rdma_writes() {
+        let helper = helper(&[None]);
+        let buffer = landing(&helper, 0, LENGTH).unwrap();
+        let plaintext: Vec<u8> = (0..5000).map(|i| (i % 251) as u8).collect();
+        let _fd = import(&helper, 1, 0);
+        helper.run(|| simulation().set_rdma_ordering(0, false));
+        let page = landed(&buffer, 0, &plaintext, false);
+        assert!(write(&helper, 1, page, 0..5000).is_err());
+        assert_eq!(helper.counters().landed.load(Ordering::Relaxed), 0);
+        helper.run(|| simulation().set_rdma_ordering(100, false));
+        write(&helper, 1, landed(&buffer, 0, &plaintext, false), 0..5000).unwrap();
+        assert_eq!(helper.run(|| simulation().rdma_flushes()), 0);
     }
 
     #[test]
@@ -2782,8 +3787,9 @@ mod tests {
     }
 
     #[test]
-    /// A peer copy that fails to synchronize, then a failed bounce, leave
-    /// the source slot out of the pool when no fence succeeds afterward.
+    /// A failed peer copy, then a failed bounce, leave the source slot out
+    /// of the pool when no fence succeeds afterward: neither the request's
+    /// stream nor the source GPU's utility stream synchronizes.
     fn unfenced_failed_copy_quarantines_the_source_slot() {
         use racer_gpu::simulation::Operation;
         let helper = helper(&[None, None]);
@@ -2792,8 +3798,9 @@ mod tests {
         let free = helper.free_slots(0);
         let page = staged(&helper, 0, &plaintext);
         helper.run(|| {
+            simulation().fault(Operation::CopyPeer, -5);
+            simulation().fault(Operation::CopyD2hAsync, -5);
             simulation().fault(Operation::StreamSync, -5);
-            simulation().fault(Operation::CopyD2h, -5);
             simulation().fault(Operation::StreamSync, -5);
         });
         assert!(write(&helper, 1, page, 0..5000).is_err());
@@ -2802,7 +3809,8 @@ mod tests {
     }
 
     #[test]
-    /// The same failures return the slot once a later fence succeeds.
+    /// The same copy failures return the slot when the request's stream
+    /// fences afterward.
     fn fenced_failed_copy_returns_the_source_slot() {
         use racer_gpu::simulation::Operation;
         let helper = helper(&[None, None]);
@@ -2811,8 +3819,8 @@ mod tests {
         let free = helper.free_slots(0);
         let page = staged(&helper, 0, &plaintext);
         helper.run(|| {
-            simulation().fault(Operation::StreamSync, -5);
-            simulation().fault(Operation::CopyD2h, -5);
+            simulation().fault(Operation::CopyPeer, -5);
+            simulation().fault(Operation::CopyD2hAsync, -5);
         });
         assert!(write(&helper, 1, page, 0..5000).is_err());
         assert_eq!(helper.free_slots(0), free);
@@ -2828,14 +3836,14 @@ mod tests {
     }
 
     /// Fail a cross-GPU write on request 1 (GPU 1) so that its stream is
-    /// never fenced: the peer copy and the bounce fail to synchronize, and
-    /// so does the fence after them.
+    /// never fenced: the peer copy and the bounce fail to queue, and the
+    /// stream fails to synchronize after them.
     fn taint_gpu_one(helper: &GpuHelper) {
         use racer_gpu::simulation::Operation;
         let page = staged(helper, 0, &plaintext());
         helper.run(|| {
-            simulation().fault(Operation::StreamSync, -5);
-            simulation().fault(Operation::StreamSync, -5);
+            simulation().fault(Operation::CopyPeer, -5);
+            simulation().fault(Operation::CopyD2hAsync, -5);
             simulation().fault(Operation::StreamSync, -5);
         });
         assert_eq!(write(helper, 1, page, 0..5000), Err(Error::Unavailable));
@@ -2902,8 +3910,8 @@ mod tests {
 
     #[test]
     /// A tainting request may be released while its stream is unfenced: the
-    /// taint keeps the stream alive, nothing leaks, and the next fence on
-    /// it clears the taint.
+    /// stream belongs to the executor, which keeps it, nothing leaks, and
+    /// the next fence on it clears the taint and frees it.
     fn released_tainting_request_keeps_its_stream_until_fenced() {
         use racer_gpu::simulation::Operation;
         let helper = helper(&[None, None]);
@@ -2911,20 +3919,10 @@ mod tests {
         let _first = import(&helper, 1, 1);
         let fd = import(&helper, 2, 1);
         taint_gpu_one(&helper);
-        let streams = helper.run(|| simulation().live().streams);
-        helper.run(|| simulation().fault(Operation::StreamSync, -5));
-        let (reply, answer) = oneshot::channel();
-        helper
-            .send(Job::Release {
-                id: 1,
-                reply: Some(reply),
-            })
-            .unwrap();
-        assert_eq!(
-            futures::executor::block_on(answer).unwrap(),
-            Err(Error::Unavailable)
-        );
+        let streams = helper.executor_streams();
         assert_eq!(helper.run(|| simulation().live().streams), streams);
+        assert_eq!(release(&helper, 1), Ok(()));
+        assert_eq!(helper.executor_streams(), streams, "tainted stream kept");
         helper.run(|| simulation().fault(Operation::StreamSync, -5));
         let page = staged(&helper, 1, &plaintext);
         assert_eq!(write(&helper, 2, page, 0..5000), Err(Error::Unavailable));
@@ -2933,22 +3931,28 @@ mod tests {
             racer_gpu::simulation::read_allocation(&fd, 0, 5000),
             plaintext
         );
-        assert_eq!(helper.run(|| simulation().live().streams), streams - 1);
+        // The tainted stream is gone; the write made a fresh one.
+        assert_eq!(helper.executor_streams(), streams);
+        assert_eq!(
+            helper.run(|| simulation().live().streams),
+            helper.executor_streams()
+        );
         assert_eq!(helper.leaked(), 0);
     }
 
     #[test]
-    /// A failed write whose stream fences does not taint the GPU.
+    /// A write whose fence reports a failure fails, but its stream fences,
+    /// so the GPU is not tainted.
     fn fenced_failed_write_does_not_block_scratch() {
         use racer_gpu::simulation::Operation;
         let helper = helper(&[None]);
         let plaintext = plaintext();
         let fd = import(&helper, 1, 0);
         let page = staged(&helper, 0, &plaintext);
-        helper.run(|| simulation().fault(Operation::StreamSync, -5));
+        helper.run(|| simulation().fault(Operation::EventQuery, -5));
         assert_eq!(write(&helper, 1, page, 10..20), Err(Error::Unavailable));
-        helper.run(|| simulation().fault(Operation::StreamSync, -5));
-        // The fault now lands on the decrypt's own sync, not a taint check.
+        helper.run(|| simulation().fault(Operation::EventQuery, -5));
+        // The fault now lands on the page's own fence, not a taint check.
         let page = staged(&helper, 0, &plaintext);
         assert_eq!(write(&helper, 1, page, 0..5000), Err(Error::Unavailable));
         write(&helper, 1, staged(&helper, 0, &plaintext), 0..5000).unwrap();
@@ -2956,6 +3960,35 @@ mod tests {
             racer_gpu::simulation::read_allocation(&fd, 0, 5000),
             plaintext
         );
+        assert_eq!(helper.leaked(), 0);
+    }
+
+    #[test]
+    /// Failures on the verdict read and the fence record fail only their
+    /// page; the stream fences, nothing is written, and the next page works.
+    fn verdict_and_fence_record_faults_fail_the_page() {
+        use racer_gpu::simulation::Operation;
+        let helper = helper(&[None]);
+        let plaintext = plaintext();
+        let fd = import(&helper, 1, 0);
+        // A partial page reaches the import only after its verdict.
+        helper.run(|| simulation().fault(Operation::Verdict, -5));
+        let page = staged(&helper, 0, &plaintext);
+        assert_eq!(write(&helper, 1, page, 0..100), Err(Error::Unavailable));
+        assert_eq!(
+            racer_gpu::simulation::read_allocation(&fd, 0, 100),
+            vec![0; 100]
+        );
+        helper.run(|| simulation().fault(Operation::EventRecord, -5));
+        let page = staged(&helper, 0, &plaintext);
+        assert_eq!(write(&helper, 1, page, 0..5000), Err(Error::Unavailable));
+        write(&helper, 1, staged(&helper, 0, &plaintext), 0..5000).unwrap();
+        assert_eq!(
+            racer_gpu::simulation::read_allocation(&fd, 0, 5000),
+            plaintext
+        );
+        assert_eq!(counter(&helper.counters().decrypted), 1);
+        assert_eq!(helper.leaked(), 0);
     }
 
     #[test]
@@ -3013,6 +4046,307 @@ mod tests {
         assert_eq!(helper.free_slots(0), free - 1);
         drop(second);
         assert_eq!(helper.free_slots(0), free);
+    }
+
+    /// Wait for every answer and return the results.
+    fn answers(answers: Vec<oneshot::Receiver<(Work, Result<()>)>>) -> Vec<Result<()>> {
+        answers
+            .into_iter()
+            .map(|answer| futures::executor::block_on(answer).unwrap().1)
+            .collect()
+    }
+
+    /// Positions of `operation` in the simulation trace.
+    fn positions(helper: &GpuHelper, operation: racer_gpu::simulation::Operation) -> Vec<usize> {
+        helper.run(move || {
+            simulation()
+                .trace()
+                .iter()
+                .enumerate()
+                .filter(|(_, event)| event.operation == operation)
+                .map(|(index, _)| index)
+                .collect()
+        })
+    }
+
+    #[test]
+    /// One GPU runs pages of several requests at once, each on its own
+    /// stream: every decrypt is queued before the first verdict is read.
+    /// Partial pages share the scratch pairs; more of them than pairs wait
+    /// for one and still complete.
+    fn pages_run_concurrently_on_several_streams_of_one_gpu() {
+        use racer_gpu::simulation::Operation;
+        let helper = helper(&[None]);
+        let plaintext = plaintext();
+        let fds: Vec<OwnedFd> = (1..=8).map(|id| import(&helper, id, 0)).collect();
+        let streams = STREAMS as u64;
+        // No event completes until every page has queued its decrypt, so the
+        // pages overlap however slowly the host runs the submissions.
+        helper.run(|| simulation().set_query_delay(u32::MAX));
+        let mark = helper.run(|| simulation().trace().len());
+        let pending = (1..=streams)
+            .map(|id| submit(&helper, id, staged(&helper, 0, &plaintext), 0..5000).unwrap())
+            .collect();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while positions(&helper, Operation::Decrypt)
+            .into_iter()
+            .filter(|at| *at >= mark)
+            .count()
+            < STREAMS
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "decrypts were not queued"
+            );
+            std::thread::yield_now();
+        }
+        helper.run(|| simulation().set_query_delay(50));
+        assert!(answers(pending).into_iter().all(|result| result.is_ok()));
+        let decrypts: Vec<usize> = positions(&helper, Operation::Decrypt)
+            .into_iter()
+            .filter(|at| *at >= mark)
+            .collect();
+        let verdicts: Vec<usize> = positions(&helper, Operation::Verdict)
+            .into_iter()
+            .filter(|at| *at >= mark)
+            .collect();
+        assert_eq!(decrypts.len(), STREAMS);
+        assert!(
+            decrypts[STREAMS - 1] < verdicts[0],
+            "decrypts {decrypts:?} verdicts {verdicts:?}"
+        );
+        for fd in &fds[..STREAMS] {
+            assert_eq!(
+                racer_gpu::simulation::read_allocation(fd, 0, 5000),
+                plaintext
+            );
+        }
+        // Eight partial pages, more than the scratch pairs and streams.
+        let pending = (1..=8)
+            .map(|id| {
+                let range = 100 * id..100 * id + 50;
+                submit(&helper, id, staged(&helper, 0, &plaintext), range).unwrap()
+            })
+            .collect();
+        assert!(answers(pending).into_iter().all(|result| result.is_ok()));
+        for (id, fd) in (1..=8u64).zip(&fds) {
+            let start = 100 * id as usize;
+            assert_eq!(
+                racer_gpu::simulation::read_allocation(fd, 0, 50),
+                plaintext[start..start + 50]
+            );
+        }
+        assert_eq!(counter(&helper.counters().decrypted), 12);
+        assert_eq!(helper.queued(0), 0);
+        assert!(helper.executor_streams() <= STREAMS);
+        assert!(helper.run(|| simulation().take_violations()).is_empty());
+        assert_eq!(helper.leaked(), 0);
+    }
+
+    #[test]
+    /// Two GPUs decrypt each other's staged ciphertext at the same time,
+    /// over the peer path, and with peer access off through pinned host
+    /// memory, where each destination stream waits on the source GPU's
+    /// fence instead of the host.
+    fn two_gpus_copy_each_others_ciphertext_concurrently() {
+        use racer_gpu::simulation::Operation;
+        for peer in [true, false] {
+            let options = GpuOptions {
+                peer,
+                ..GpuOptions::default()
+            };
+            let helper = helper_with_options(&[None, None], options, |_| {});
+            let plaintext = plaintext();
+            let fds: Vec<(u64, OwnedFd)> = (1..=4u64)
+                .map(|id| (id, import(&helper, id, (id % 2) as i32)))
+                .collect();
+            helper.run(|| simulation().set_query_delay(10));
+            let pending = fds
+                .iter()
+                .map(|(id, _)| {
+                    let source = 1 - (id % 2) as i32;
+                    let page = staged(&helper, source, &plaintext);
+                    submit(&helper, *id, page, 0..5000).unwrap()
+                })
+                .collect();
+            assert!(answers(pending).into_iter().all(|result| result.is_ok()));
+            for (_, fd) in &fds {
+                assert_eq!(
+                    racer_gpu::simulation::read_allocation(fd, 0, 5000),
+                    plaintext
+                );
+            }
+            if peer {
+                assert_eq!(counter(&helper.counters().peer_copies), 4);
+                assert_eq!(operations(&helper, Operation::StreamWait), 0);
+            } else {
+                assert_eq!(counter(&helper.counters().peer_bounces), 4);
+                assert_eq!(operations(&helper, Operation::StreamWait), 4);
+                assert_eq!(operations(&helper, Operation::CopyD2h), 0, "no host wait");
+            }
+            assert!(helper.run(|| simulation().take_violations()).is_empty());
+            assert_eq!(helper.leaked(), 0);
+        }
+    }
+
+    #[test]
+    /// Two executors that bounce ciphertext from the same source GPU each
+    /// use their own utility stream, so neither syncs or clears the other's
+    /// queued copies.
+    fn executors_bounce_through_their_own_utility_streams() {
+        let options = GpuOptions {
+            peer: false,
+            ..GpuOptions::default()
+        };
+        let helper = helper_with_options(&[None, None, None], options, |_| {});
+        let plaintext = plaintext();
+        let fds: Vec<(u64, OwnedFd)> = (1..=2u64)
+            .map(|id| (id, import(&helper, id, id as i32)))
+            .collect();
+        helper.run(|| simulation().set_query_delay(10));
+        let pending = fds
+            .iter()
+            .map(|(id, _)| submit(&helper, *id, staged(&helper, 0, &plaintext), 0..5000).unwrap())
+            .collect();
+        assert!(answers(pending).into_iter().all(|result| result.is_ok()));
+        for (_, fd) in &fds {
+            assert_eq!(
+                racer_gpu::simulation::read_allocation(fd, 0, 5000),
+                plaintext
+            );
+        }
+        assert_eq!(counter(&helper.counters().peer_bounces), 2);
+        // One request stream on each destination GPU, plus one utility
+        // stream per executor for source GPU 0.
+        assert_eq!(helper.executor_streams(), 4);
+        assert!(helper.run(|| simulation().take_violations()).is_empty());
+        assert_eq!(helper.leaked(), 0);
+    }
+
+    #[test]
+    /// A full executor queue refuses more pages with `Overloaded` and counts
+    /// them; once its pages complete it accepts pages again.
+    fn full_queue_is_overloaded() {
+        let options = GpuOptions {
+            queue_depth: 2,
+            ..GpuOptions::default()
+        };
+        let helper = helper_with_options(&[None], options, |_| {});
+        let plaintext = plaintext();
+        let fds: Vec<OwnedFd> = (1..=3).map(|id| import(&helper, id, 0)).collect();
+        helper.run(|| simulation().set_query_delay(u32::MAX));
+        let pending: Vec<_> = (1..=2)
+            .map(|id| submit(&helper, id, staged(&helper, 0, &plaintext), 0..5000).unwrap())
+            .collect();
+        let refused = submit(&helper, 3, staged(&helper, 0, &plaintext), 0..5000);
+        assert_eq!(refused.err(), Some(Error::Overloaded));
+        assert_eq!(counter(&helper.counters().queue_full), 1);
+        assert_eq!(helper.queued(0), 2);
+        helper.run(|| simulation().set_query_delay(0));
+        assert!(answers(pending).into_iter().all(|result| result.is_ok()));
+        eventually(|| helper.queued(0) == 0);
+        write(&helper, 3, staged(&helper, 0, &plaintext), 0..5000).unwrap();
+        assert_eq!(
+            racer_gpu::simulation::read_allocation(&fds[2], 0, 5000),
+            plaintext
+        );
+    }
+
+    #[test]
+    /// Dropping the helper with pages in flight lets the executors finish
+    /// and answer them, then releases every import, stream and event.
+    fn shutdown_drains_running_pages() {
+        let helper = helper(&[None, None]);
+        let plaintext = plaintext();
+        let fds: Vec<OwnedFd> = (1..=4u64)
+            .map(|id| import(&helper, id, (id % 2) as i32))
+            .collect();
+        let simulation = helper.run(simulation);
+        simulation.set_query_delay(20);
+        let pending: Vec<_> = (1..=4u64)
+            .map(|id| {
+                let page = staged(&helper, (id % 2) as i32, &plaintext);
+                submit(&helper, id, page, 10..20).unwrap()
+            })
+            .collect();
+        drop(helper);
+        assert!(answers(pending).into_iter().all(|result| result.is_ok()));
+        for fd in &fds {
+            assert_eq!(
+                racer_gpu::simulation::read_allocation(fd, 0, 10),
+                plaintext[10..20]
+            );
+        }
+        eventually(|| {
+            let live = simulation.live();
+            live.imports == 0 && live.streams == 0 && live.events == 0
+        });
+        assert!(simulation.take_violations().is_empty());
+    }
+
+    #[test]
+    /// A release racing an import, after the coordinator records the owner
+    /// but before it queues the adoption, is ordered after the adoption and
+    /// frees the import instead of leaking it.
+    fn release_racing_an_import_frees_it() {
+        const ID: u64 = 77;
+        let helper = helper(&[None]);
+        let (released, answer) = std::sync::mpsc::channel();
+        let racer = helper.clone();
+        BEFORE_ADOPT.lock().unwrap().push((
+            ID,
+            Box::new(move || {
+                std::thread::spawn(move || {
+                    let (reply, answer) = oneshot::channel();
+                    let queued = racer.release(ID, Some(reply));
+                    let _ = released.send(queued.and_then(|()| {
+                        futures::executor::block_on(answer).unwrap_or(Err(Error::Internal))
+                    }));
+                });
+                // Give the release time to run ahead of the adoption.
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }),
+        ));
+        let _fd = import(&helper, ID, 0);
+        assert_eq!(
+            answer
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap(),
+            Ok(())
+        );
+        let simulation = helper.run(simulation);
+        eventually(|| simulation.live().imports == 0 && owner(&helper, ID).is_none());
+        assert_eq!(helper.leaked(), 0);
+    }
+
+    #[test]
+    /// Deferred simulation still catches a source that changes while the
+    /// executor's queued decrypt reads it: the page fails instead of
+    /// writing unauthenticated bytes, and the violation is reported.
+    fn changed_source_under_a_queued_decrypt_is_caught() {
+        use racer_gpu::simulation::Operation;
+        let helper = helper(&[None]);
+        let plaintext = plaintext();
+        let fd = import(&helper, 1, 0);
+        let page = staged(&helper, 0, &plaintext);
+        let SealedSource::Staged { staged, .. } = &page.source else {
+            unreachable!()
+        };
+        let offset = staged.offset();
+        let decrypts = operations(&helper, Operation::Decrypt);
+        helper.run(|| simulation().set_query_delay(u32::MAX));
+        let pending = submit(&helper, 1, page, 0..5000).unwrap();
+        eventually(|| operations(&helper, Operation::Decrypt) > decrypts);
+        helper.run(move || simulation().poke_staging(0, offset + 7, &[0xff; 4]));
+        helper.run(|| simulation().set_query_delay(0));
+        assert_eq!(answers(vec![pending]), [Err(Error::Unavailable)]);
+        let violations = helper.run(|| simulation().take_violations());
+        assert!(!violations.is_empty(), "violation reported");
+        assert!(violations[0].contains("changed after work reading it was queued"));
+        assert_eq!(
+            racer_gpu::simulation::read_allocation(&fd, 0, 5000),
+            vec![0; 5000]
+        );
     }
 
     #[test]

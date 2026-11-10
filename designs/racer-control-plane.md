@@ -105,7 +105,20 @@ The control wire is at schema version 2 (`SCHEMA_VERSION`; version 1 is
 rejected) and delta version 2. Publications carry per-cache node pools, which
 the primary computes from each ClusterCache's `spec.nodeSelector` and member
 Node labels; see `racer-mesh-v2.md`. The canonical membership bytes, and so the
-membership version, cover members and pools. Protocol fixtures belong to the Rust control-wire crate rather than the deleted
+membership version, cover members and pools.
+
+Publications and deltas also carry `page_bytes`, the cluster-wide logical page
+size. Schema version 2 was changed in place to require it: a schema 2 document
+without `page_bytes` is rejected, so nodes and authorities must run matching
+builds. The size is fixed at cluster creation. The primary that makes the first
+publication takes it from its `RACER_PAGE_BYTES` and records it in the state
+record; later primaries publish the recorded size and only warn when their own
+setting differs. A node adopts the size of the first publication it accepts and
+rejects any publication that changes it, at preparation and again at commit.
+
+Page key retention (`RACER_RETAINED_PAGE_KEYS`) is likewise read by whichever
+primary runs, but decrypt keys are pruned only when a rotation activates new
+keys. A primary with a lower setting never drops keys between rotations. Protocol fixtures belong to the Rust `racer-wire` crate (`racer_wire::control`) rather than the deleted
 Go controller. Standalone test endpoints may still exercise the client without
 Kubernetes; managed deployments do not depend on a fixed controller URL or an
 operator-generated trust bundle.

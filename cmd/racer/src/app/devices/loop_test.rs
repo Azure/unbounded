@@ -146,6 +146,7 @@ fn drive<T>(reactor: &crate::runtime::Reactor, mut operation: crate::error::Oper
 #[test]
 #[ignore = "requires root, loop-control, CAP_SYS_ADMIN, CAP_MKNOD and io_uring; uses only disposable loops"]
 fn disposable_loop_devices_read_only_bind_restart() {
+    let env = racer_io::Env::host();
     assert_eq!(
         unsafe { libc::geteuid() },
         0,
@@ -261,8 +262,9 @@ fn disposable_loop_devices_read_only_bind_restart() {
     let admission = Rc::new(flow_control::Quotas::new(
         crate::admission::AdmissionPolicy::new(config.limits.clone()),
     ));
-    let reactor = crate::runtime::Reactor::new(admission);
-    let scope = crate::runtime::RequestScope::new(
+    let reactor = crate::runtime::Reactor::new(admission, &env);
+    let scope = crate::runtime::RequestScope::on(
+        &env.ctx.clock,
         crate::model::RequestId([99; 16]),
         Instant::now() + Duration::from_secs(30),
     )
@@ -334,7 +336,8 @@ fn disposable_loop_devices_read_only_bind_restart() {
     let index = Rc::new(crate::store::catalog::Index::new(
         crate::model::WorkerId(0),
         16,
-        crate::test_support::availability(),
+        crate::test_support::availability(&env),
+        env.ctx.clock.clone(),
     ));
     let checkpoint = crate::store::checkpoint::Checkpointer::new(
         config.slab_directory.clone(),
@@ -388,9 +391,10 @@ fn disposable_loop_devices_read_only_bind_restart() {
             .collect::<Vec<_>>(),
         digests
     );
-    let (_, mut recovered) = crate::store::checkpoint::read_candidates(&config.slab_directory)
-        .unwrap()
-        .remove(0);
+    let (_, mut recovered) =
+        crate::store::checkpoint::read_candidates(&env, &config.slab_directory)
+            .unwrap()
+            .remove(0);
     let recovery =
         crate::store::checkpoint::Recovery::new(config.slab_directory.clone(), index, segments);
     let mut geometry = checkpoint.geometry().unwrap();
@@ -409,9 +413,10 @@ fn disposable_loop_devices_read_only_bind_restart() {
     let changed = discover(&config, Some("cache-"), 2).unwrap();
     assert_ne!(changed.workers[0].digest, digests[0]);
     assert_ne!(changed.workers[1].digest, digests[1]);
-    let (_, mut recovered) = crate::store::checkpoint::read_candidates(&config.slab_directory)
-        .unwrap()
-        .remove(0);
+    let (_, mut recovered) =
+        crate::store::checkpoint::read_candidates(&env, &config.slab_directory)
+            .unwrap()
+            .remove(0);
     geometry.layout_digest = changed.workers[0].digest;
     recovery.configure_geometry(geometry).unwrap();
     assert_eq!(

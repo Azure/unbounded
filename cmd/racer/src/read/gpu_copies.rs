@@ -5,7 +5,7 @@
 //! ciphertext into GPU staging with cuFile, or had a peer land it in GPU
 //! memory, a concurrent sealed fetch for the same GPU, or for a GPU that can
 //! copy from it over a peer path, reuses that ciphertext instead of fetching
-//! it again. Each GPU still checks the CRC and the AEAD tag and decrypts by
+//! it again. Each GPU still checks the AEAD tag and decrypts by
 //! itself: only ciphertext is shared.
 //!
 //! The table never keeps GPU memory alive. It holds weak references, so a
@@ -59,7 +59,6 @@ struct Facts {
     metadata: ObjectMetadata,
     envelope: PageEnvelope,
     aad: Vec<u8>,
-    expected_crc: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -102,7 +101,6 @@ impl SharedCopy {
                 metadata: sealed.metadata.clone(),
                 envelope: sealed.envelope.clone(),
                 aad: sealed.aad.clone(),
-                expected_crc: sealed.expected_crc,
             }),
             held,
         })
@@ -120,11 +118,11 @@ impl SharedCopy {
     pub(super) fn sealed(&self, crypto: &PageCrypto, page: &PageId) -> Result<Box<SealedPage>> {
         let facts = &self.facts;
         let sealed = Box::new(SealedPage {
+            fused_store: None,
             metadata: facts.metadata.clone(),
             envelope: facts.envelope.clone(),
             aad: facts.aad.clone(),
             key: crypto.derive_page_key(&facts.envelope)?,
-            expected_crc: facts.expected_crc,
             source: match &self.held {
                 Held::Staged { staged, token } => SealedSource::Staged {
                     staged: staged.clone(),
@@ -191,7 +189,7 @@ pub(super) enum Outcome {
     /// through host memory, or the fetch failed. Waiters fetch for themselves.
     Nothing,
 
-    /// The fetching request ended first (cancelled or out of time). Waiters
+    /// The fetching request ended first (canceled or out of time). Waiters
     /// may look again, and one of them fetches.
     Abandoned,
 }
@@ -249,6 +247,18 @@ impl GpuCopies {
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.entries.borrow().len()
+    }
+
+    /// In-flight fetches, and requests waiting on them to finish.
+    #[cfg(test)]
+    pub(crate) fn flights(&self) -> (usize, usize) {
+        let entries = self.entries.borrow();
+        let flights = entries.values().flat_map(|entry| &entry.flights);
+        flights.fold((0, 0), |(count, waiters), flight| {
+            // The table holds one handle; each waiter holds a clone.
+            let handles = flight.receive.strong_count().unwrap_or(1);
+            (count + 1, waiters + handles.saturating_sub(1))
+        })
     }
 
     /// Find a reusable copy of `page` for GPU `ordinal`: one on the same
@@ -356,7 +366,7 @@ impl GpuCopies {
 }
 
 /// The right and duty to finish one shared fetch. Dropping it, as when the
-/// fetching request is cancelled, tells waiters the fetch was abandoned.
+/// fetching request is canceled, tells waiters the fetch was abandoned.
 pub(super) struct Lead {
     table: Rc<GpuCopies>,
     page: PageId,
@@ -397,7 +407,7 @@ mod tests {
         PageId {
             version: ObjectVersion {
                 object: ObjectId {
-                    cache: racer_control_wire::CacheId(
+                    cache: racer_wire::control::CacheId(
                         "00000000-0000-4000-8000-000000000001".into(),
                     ),
                     key: CacheKey([0; 32]),
@@ -546,15 +556,15 @@ mod tests {
                     expires_at: ExpiresAt::from_system_time(std::time::UNIX_EPOCH).unwrap(),
                 },
                 envelope: PageEnvelope {
+                    page_size: racer_wire::object::PageSize::DEFAULT,
                     cipher: PageCipher::Xaes256Gcm,
                     page: page(0),
-                    key_id: racer_control_wire::KeyId([0; 16]),
+                    key_id: racer_wire::control::KeyId([0; 16]),
                     nonce: Nonce([0; 24]),
                     plaintext_length: 1,
                     ciphertext_length: 17,
                 },
                 aad: vec![],
-                expected_crc: None,
             }),
             held: Held::Landed(landed.clone()),
         };

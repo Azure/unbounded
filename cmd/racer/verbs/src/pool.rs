@@ -443,6 +443,16 @@ impl Pool {
             .set(buffer.index, BufferState::Leaked);
     }
 
+    /// True if the NIC can no longer touch any buffer: each one is free or
+    /// held by a received page, which only the CPU reads.
+    pub(crate) fn nic_quiet(&self) -> bool {
+        let quiet = |shared: &PoolShared| {
+            (0..shared.count() as u32)
+                .all(|i| matches!(shared.state(i), BufferState::Free | BufferState::Owned))
+        };
+        quiet(&self.shared) && self.device.values().all(|d| quiet(&d.shared))
+    }
+
     /// Received pages still alive outside the owner.
     pub(crate) fn outstanding(&self) -> usize {
         Arc::strong_count(&self.shared) - 1
@@ -507,6 +517,13 @@ impl RegisteredPage {
     /// True if no bytes were received. Never true for a delivered page.
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    /// The free and total buffer counts of the pool this page came from, a
+    /// snapshot that may be stale by the time it is used. This page is not
+    /// free, so `free < total`.
+    pub fn pool_free(&self) -> (usize, usize) {
+        (lock(&self.shared.free).len(), self.shared.count())
     }
 }
 
@@ -726,11 +743,12 @@ mod tests {
         let (pool, charge) = pool(&sim, 1);
         let buffer = pool.take(BufferState::Binding).unwrap();
         let page = pool.own(buffer, 4).unwrap();
+        let live = sim.live_resources();
         drop(pool);
         assert_eq!(page.bytes(), [0; 4]);
         drop(page);
         assert_eq!(charge.get(), 1, "leaked region keeps the guard");
-        assert_eq!(sim.live_resources(), 3, "device and both regions stay");
+        assert_eq!(sim.live_resources(), live, "the device and regions stay");
     }
 
     #[test]
@@ -749,9 +767,10 @@ mod tests {
             }
             assert_eq!(pool.shared().state(0), state);
             assert!(pool.outstanding() == 0 && !pool.idle());
+            let live = sim.live_resources();
             drop(pool);
             assert_eq!(charge.get(), 1);
-            assert_eq!(sim.live_resources(), 3);
+            assert_eq!(sim.live_resources(), live);
         }
     }
 

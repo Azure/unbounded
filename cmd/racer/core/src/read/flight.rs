@@ -1,24 +1,76 @@
 //! Sans-IO page singleflight rules.
 //!
-//! Flight transitions run in `flow_control::coalesce::flight::state::State`; these step functions
+//! Flight transitions run in `crate::flow::coalesce::flight::state::State`; these step functions
 //! add the business decisions on top and are generic over the wake target `T` (production `Waker`s,
 //! simulator [`Token`]s).
 
+use crate::flow::coalesce::flight::Identity;
+use crate::flow::coalesce::flight::state::{Outcome, Phase, Published, State, WaiterPolicy};
 use crate::read::{Error, FailureKind, Result};
-use flow_control::coalesce::flight::Identity;
-use flow_control::coalesce::flight::state::{Outcome, Phase, Published, State, WaiterPolicy};
-use racer_object_wire::model::PageId;
-use std::cell::Cell;
-use std::collections::HashMap;
-use std::hash::BuildHasher;
-use std::rc::Rc;
 use std::time::Instant;
+
+mod table;
+pub use table::{Fence, FlightEntry, FlightTable, Joined, Operation, Removed, Ticket, Waiter};
+
+/// Names one instantiation of the page [`FlightTable`].
+///
+/// [`crate::read::worker::WorkerCore`] and the production `Flights` both name their page table
+/// through [`PageFlightTable`], so the two drivers share one table type family and one set of step
+/// functions; only the payload types differ.
+pub trait PageFlightTypes: 'static {
+    type Page;
+    /// Completed value published to joiners.
+    type Complete;
+    /// Reusable partial value.
+    type Partial;
+    /// Leader outcome split by the table's publish function.
+    type Outcome;
+    /// Per-waiter result payload of the default [`Waiter`].
+    type Result;
+    type Hash;
+    type Wake;
+    type Waiter: WaiterPolicy;
+    /// Per-entry driver extension.
+    type Ext;
+    /// Retained operation payload.
+    type Retained;
+}
+
+/// The page flight table for `F`.
+pub type PageFlightTable<F> = FlightTable<
+    <F as PageFlightTypes>::Page,
+    <F as PageFlightTypes>::Complete,
+    <F as PageFlightTypes>::Partial,
+    <F as PageFlightTypes>::Outcome,
+    <F as PageFlightTypes>::Result,
+    <F as PageFlightTypes>::Hash,
+    <F as PageFlightTypes>::Wake,
+    <F as PageFlightTypes>::Waiter,
+    <F as PageFlightTypes>::Ext,
+    <F as PageFlightTypes>::Retained,
+>;
 
 /// Opaque wake target chosen by the driver (for example, a simulated task id).
 pub type Token = u64;
 
-/// Table bounds. All dimensions must be nonzero. [`PageFlights`] does not
-/// bound retained operations; production caps them at `operations_per_flight`.
+/// A [`std::task::Waker`] as a table wake target. Two targets are equal when waking one would wake
+/// the other ([`std::task::Waker::will_wake`]), which is what the entry-capacity queue needs.
+#[derive(Clone, Debug)]
+pub struct WakeTarget(pub std::task::Waker);
+
+impl WakeTarget {
+    pub fn wake(self) {
+        self.0.wake();
+    }
+}
+
+impl PartialEq for WakeTarget {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.will_wake(&other.0)
+    }
+}
+
+/// Table bounds. All dimensions must be nonzero.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FlightLimits {
     pub entries: usize,
@@ -78,7 +130,7 @@ pub enum Settled<C, P> {
 pub enum JoinReject<E = Error> {
     /// The flight settled to this failure.
     Failed(E),
-    /// The flight holds `waiters_per_flight` waiters.
+    /// The flight holds `waiters_per_flight` waiters ([`Error::FlightFull`]: it is fetching).
     WaiterCap,
 }
 
@@ -86,7 +138,7 @@ impl<E: From<Error>> JoinReject<E> {
     pub fn error(self) -> E {
         match self {
             JoinReject::Failed(error) => error,
-            JoinReject::WaiterCap => Error::Overloaded.into(),
+            JoinReject::WaiterCap => Error::FlightFull.into(),
         }
     }
 }
@@ -138,7 +190,7 @@ pub enum CopyJoin<C, P> {
 }
 
 /// Gates of a copy-only join on an existing, refreshed flight: a settled result first, then a
-/// failed or draining phase (a miss), then the waiter cap (`Overloaded`). A copy join never
+/// failed or draining phase (a miss), then the waiter cap (`FlightFull`). A copy join never
 /// creates a flight.
 pub fn join_copy_existing<
     C: Clone,
@@ -161,7 +213,7 @@ pub fn join_copy_existing<
         return Ok(CopyJoin::Miss);
     }
     if state.waiters.len() >= limits.waiters_per_flight {
-        return Err(Error::Overloaded.into());
+        return Err(Error::FlightFull.into());
     }
     Ok(CopyJoin::Register)
 }
@@ -189,7 +241,7 @@ pub fn refresh<C, P, O, W: WaiterPolicy<Error = E>, T, E: Copy + PartialEq + Fro
     state.refresh(
         idle,
         Error::Unavailable.into(),
-        Error::Cancelled.into(),
+        Error::Canceled.into(),
         now,
         split,
         wakes,
@@ -334,8 +386,7 @@ pub fn fail<C, P, O, W: WaiterPolicy<Error = E>, T, E: Copy + PartialEq + From<E
         }
         FailureKind::Terminal(error)
             if state.handed_over()
-                && (error == Error::DeadlineExceeded.into()
-                    || error == Error::Cancelled.into()) =>
+                && (error == Error::DeadlineExceeded.into() || error == Error::Canceled.into()) =>
         {
             Outcome::Retry
         }
@@ -360,390 +411,11 @@ pub fn handover_ceiling(now: Instant, leader_deadline: Instant, handover: bool) 
 /// Read lifetimes a handed-over fill may run past its elected leader's.
 pub const HANDOVER_SPANS: u32 = 4;
 
-/// Resource a [`PageFlights`] join reserves, in production order.
+/// Resource a [`FlightTable`] join reserves, in production order.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Reserve {
     Waiter,
     Flight,
-}
-
-/// Simulated waiter: its deadline is both the request scope's and the budget's, read against the
-/// table's current time. It owns its admission charge `R` like production `WaiterRecord`.
-struct Waiter<R> {
-    deadline: Instant,
-    now: Rc<Cell<Instant>>,
-    _charge: R,
-}
-
-impl<R> WaiterPolicy for Waiter<R> {
-    type Error = Error;
-    fn check(&self) -> Option<Error> {
-        (self.now.get() >= self.deadline).then_some(Error::DeadlineExceeded)
-    }
-    fn deadline(&self) -> Instant {
-        self.deadline
-    }
-}
-
-struct Flight<C, P, O, R> {
-    state: State<C, P, O, Waiter<R>, Token>,
-    identity: Identity,
-    /// Retained leader operations still running (production `Entry::operations`).
-    operations: usize,
-    _charge: R,
-}
-
-impl<C, P, O, R> Flight<C, P, O, R> {
-    fn idle(&self) -> bool {
-        self.operations == 0
-    }
-}
-
-/// Result of a [`PageFlights`] join.
-#[derive(Debug, Eq, PartialEq)]
-pub enum Joined<C, P> {
-    /// No acquisition to wait for (copy joins only).
-    Miss,
-    Settled(Settled<C, P>),
-    /// Registered as waiter `id`.
-    Waiter(u64),
-}
-
-/// Single-owner page flight table for sans-IO drivers (the simulator), mirroring production
-/// `Flights` with an explicit clock and [`Token`] wakes. `R` is the admission charge each waiter
-/// and flight owns; dropping it releases the charge.
-pub struct PageFlights<C, P, O, R, S> {
-    flights: HashMap<PageId, Flight<C, P, O, R>, S>,
-    limits: FlightLimits,
-    split: fn(O) -> Published<C, P>,
-    now: Rc<Cell<Instant>>,
-    owner: Rc<()>,
-    next_id: u64,
-}
-
-impl<C: Clone, P: Clone, O, R, S: BuildHasher> PageFlights<C, P, O, R, S> {
-    pub fn new(
-        limits: FlightLimits,
-        split: fn(O) -> Published<C, P>,
-        now: Instant,
-        hasher: S,
-    ) -> Self {
-        Self {
-            flights: HashMap::with_hasher(hasher),
-            limits,
-            split,
-            now: Rc::new(Cell::new(now)),
-            owner: Rc::new(()),
-            next_id: 0,
-        }
-    }
-
-    /// Number of live flights.
-    pub fn len(&self) -> usize {
-        self.flights.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.flights.is_empty()
-    }
-
-    /// Waiters attached to `page`.
-    pub fn waiters(&self, page: &PageId) -> usize {
-        self.flights.get(page).map_or(0, |f| f.state.waiters.len())
-    }
-
-    fn refreshed(
-        &mut self,
-        page: &PageId,
-        wakes: &mut Vec<Token>,
-    ) -> Option<&mut Flight<C, P, O, R>> {
-        let now = self.now.get();
-        let flight = self.flights.get_mut(page)?;
-        let idle = flight.idle();
-        refresh(&mut flight.state, idle, || now, self.split, wakes);
-        Some(flight)
-    }
-
-    fn waiter(&mut self, deadline: Instant, charge: R) -> (u64, Waiter<R>) {
-        let id = self.next_id;
-        self.next_id += 1;
-        (
-            id,
-            Waiter {
-                deadline,
-                now: self.now.clone(),
-                _charge: charge,
-            },
-        )
-    }
-
-    /// Acquisition join (production `Flights::join_prepared`): the existing
-    /// flight's gates, the budget gate, the waiter reservation, then for a new
-    /// flight the entry cap and the flight reservation.
-    #[allow(clippy::too_many_arguments)] // Mirrors production join inputs.
-    pub fn join(
-        &mut self,
-        page: &PageId,
-        now: Instant,
-        deadline: Instant,
-        attempts: u32,
-        plaintext: bool,
-        mut reserve: impl FnMut(Reserve) -> Result<R>,
-        wakes: &mut Vec<Token>,
-    ) -> Result<Joined<C, P>> {
-        self.now.set(now);
-        let limits = self.limits;
-        let mut partial = false;
-        if let Some(flight) = self.refreshed(page, wakes) {
-            if let Some(settled) = join_existing(&flight.state, plaintext, &limits)? {
-                return Ok(Joined::Settled(settled));
-            }
-            partial = flight.state.partial.is_some();
-        }
-        join_budget_gate(now, deadline, attempts, partial)?;
-        let charge = reserve(Reserve::Waiter)?;
-        let (id, waiter) = self.waiter(deadline, charge);
-        if !self.flights.contains_key(page) {
-            entry_cap_gate(self.flights.len(), &self.limits)?;
-            let charge = reserve(Reserve::Flight)?;
-            self.flights.insert(
-                page.clone(),
-                Flight {
-                    state: State::default(),
-                    identity: Identity {
-                        owner: self.owner.clone(),
-                        incarnation: 0,
-                        generation: 0,
-                    },
-                    operations: 0,
-                    _charge: charge,
-                },
-            );
-        }
-        let flight = self.flights.get_mut(page).expect("inserted");
-        flight.state.register(id, waiter, true, plaintext);
-        Ok(Joined::Waiter(id))
-    }
-
-    /// Copy-only join (production `Flights::join_copy`): never creates a flight, leads, or adopts.
-    pub fn join_copy(
-        &mut self,
-        page: &PageId,
-        now: Instant,
-        deadline: Instant,
-        reserve: impl FnOnce(Reserve) -> Result<R>,
-        wakes: &mut Vec<Token>,
-    ) -> Result<Joined<C, P>> {
-        self.now.set(now);
-        let limits = self.limits;
-        let Some(flight) = self.refreshed(page, wakes) else {
-            return Ok(Joined::Miss);
-        };
-        match join_copy_existing(&flight.state, &limits)? {
-            CopyJoin::Miss => return Ok(Joined::Miss),
-            CopyJoin::Settled(settled) => return Ok(Joined::Settled(settled)),
-            CopyJoin::Register => {}
-        }
-        let charge = reserve(Reserve::Waiter)?;
-        let (id, waiter) = self.waiter(deadline, charge);
-        let flight = self.flights.get_mut(page).expect("present");
-        flight.state.register(id, waiter, false, false);
-        Ok(Joined::Waiter(id))
-    }
-
-    /// Poll waiter `id` at `now` with its remaining `attempts`; parks `token` when nothing is
-    /// ready. Copy waiters follow production `CopyWaiter::wait`, others `AcquisitionWaiter::wait`.
-    /// A canceled waiter fails `Cancelled`; one past its deadline fails `DeadlineExceeded`.
-    pub fn poll(
-        &mut self,
-        page: &PageId,
-        id: u64,
-        now: Instant,
-        attempts: u32,
-        token: Token,
-        wakes: &mut Vec<Token>,
-    ) -> Result<Wait<C, P>> {
-        self.now.set(now);
-        let (limit, split) = (self.limits.generations_per_flight, self.split);
-        let flight = self.flights.get_mut(page).ok_or(Error::Internal)?;
-        let waiter = flight.state.waiters.get(&id).ok_or(Error::Internal)?;
-        let (deadline, copy) = (waiter.deadline, !waiter.acquisition());
-        if waiter.error == Some(Error::Cancelled) {
-            return Ok(Wait::Failed(Error::Cancelled));
-        }
-        if now >= deadline {
-            flight.state.cancel(id, Error::DeadlineExceeded);
-            let idle = flight.idle();
-            refresh(&mut flight.state, idle, || now, split, wakes);
-            return Ok(Wait::Failed(Error::DeadlineExceeded));
-        }
-        let idle = flight.idle();
-        refresh(&mut flight.state, idle, || now, split, wakes);
-        let park = |slot: &mut Option<Token>| *slot = Some(token);
-        if copy {
-            return Ok(match copy_wait(&mut flight.state, id, park) {
-                None => Wait::Pending,
-                Some(Ok(settled)) => Wait::Ready(settled),
-                Some(Err(error)) => Wait::Failed(error),
-            });
-        }
-        Ok(wait(
-            &mut flight.state,
-            id,
-            &mut flight.identity,
-            limit,
-            deadline,
-            attempts,
-            idle,
-            || now,
-            split,
-            wakes,
-            park,
-        ))
-    }
-
-    /// Leader `id` finished (production `Flights::publish_acquired` or `Flights::fail`). `Internal`
-    /// for a stale leader (production `StaleFlight`).
-    pub fn finish(
-        &mut self,
-        page: &PageId,
-        id: u64,
-        result: std::result::Result<O, FailureKind>,
-        wakes: &mut Vec<Token>,
-    ) -> Result<()> {
-        let split = self.split;
-        let flight = self.leader(page, id, wakes)?;
-        let idle = flight.idle();
-        match result {
-            Ok(page) => publish(&mut flight.state, page, idle, split, wakes),
-            Err(failure) => fail(&mut flight.state, id, failure, idle, split, wakes),
-        }
-        Ok(())
-    }
-
-    /// The refreshed flight `id` currently leads (production `Flights::leader_entry`).
-    fn leader(
-        &mut self,
-        page: &PageId,
-        id: u64,
-        wakes: &mut Vec<Token>,
-    ) -> Result<&mut Flight<C, P, O, R>> {
-        let flight = self.refreshed(page, wakes).ok_or(Error::Internal)?;
-        flight
-            .state
-            .validate_leader(id, true)
-            .map_err(|_| Error::Internal)?;
-        Ok(flight)
-    }
-
-    /// Let leader `id`'s running acquisition pass to another live waiter when
-    /// `id` expires or is canceled (production `Flights::allow_handover`).
-    pub fn allow_handover(&mut self, page: &PageId, id: u64, wakes: &mut Vec<Token>) -> Result<()> {
-        self.leader(page, id, wakes)?.state.allow_handover();
-        Ok(())
-    }
-
-    /// Deadline of the waiter `page`'s running acquisition currently serves,
-    /// or `None` once it was revoked or settled.
-    pub fn leader_deadline(&self, page: &PageId) -> Option<Instant> {
-        self.flights
-            .get(page)
-            .and_then(|f| f.state.leader_deadline())
-    }
-
-    /// Whether `page` has an acquisition running (production `Flights::acquiring`).
-    pub fn acquiring(&self, page: &PageId) -> bool {
-        self.flights
-            .get(page)
-            .is_some_and(|f| matches!(f.state.phase, Phase::Acquiring))
-    }
-
-    /// Whether `page`'s running acquisition passed to a waiter other than the elected one.
-    pub fn handed_over(&self, page: &PageId) -> bool {
-        self.flights
-            .get(page)
-            .is_some_and(|f| f.state.handed_over())
-    }
-
-    /// Whether `id` is the active leader of `page`'s current acquisition.
-    pub fn is_leader(&self, page: &PageId, id: u64) -> bool {
-        self.flights
-            .get(page)
-            .is_some_and(|f| f.state.validate_leader(id, true).is_ok())
-    }
-
-    /// Retain one operation for leader `id` before it starts (production
-    /// `Flights::retain_operation`). Until [`PageFlights::complete_operation`] runs, a revoked
-    /// acquisition stays draining and the entry is kept.
-    pub fn retain_operation(
-        &mut self,
-        page: &PageId,
-        id: u64,
-        wakes: &mut Vec<Token>,
-    ) -> Result<()> {
-        self.leader(page, id, wakes)?.operations += 1;
-        Ok(())
-    }
-
-    /// The retained operation finished (production `Flights::complete_operation`): settle, notify,
-    /// and remove a quiescent entry. Call it before `finish`, as production does.
-    pub fn complete_operation(&mut self, page: &PageId, wakes: &mut Vec<Token>) -> Result<()> {
-        let flight = self.flights.get_mut(page).ok_or(Error::Internal)?;
-        flight.operations = flight.operations.checked_sub(1).ok_or(Error::Internal)?;
-        let flight = self.refreshed(page, wakes).expect("present");
-        flight.state.notify(wakes);
-        self.remove_quiescent(page);
-        Ok(())
-    }
-
-    /// Production `Entry::quiescent`: no waiters and no retained operations.
-    fn remove_quiescent(&mut self, page: &PageId) {
-        if self
-            .flights
-            .get(page)
-            .is_some_and(|f| f.state.waiters.is_empty() && f.idle())
-        {
-            self.flights.remove(page);
-        }
-    }
-
-    /// Leader `id`'s driver was dropped without an outcome (production
-    /// `Drop for FlightLeader`): revoke at once, never hand over.
-    pub fn abandon(&mut self, page: &PageId, id: u64, wakes: &mut Vec<Token>) {
-        let split = self.split;
-        if let Some(flight) = self.flights.get_mut(page)
-            && flight.state.validate_leader(id, true).is_ok()
-        {
-            flight.state.revoke(Error::Cancelled, wakes);
-            let idle = flight.idle();
-            settle(&mut flight.state, idle, split, wakes);
-        }
-    }
-
-    /// Cancel waiter `id` (production `Registration::cancel`).
-    pub fn cancel(&mut self, page: &PageId, id: u64, wakes: &mut Vec<Token>) {
-        if let Some(flight) = self.flights.get_mut(page) {
-            flight.state.cancel(id, Error::Cancelled);
-            self.refreshed(page, wakes);
-        }
-    }
-
-    /// Detach waiter `id`, dropping its charge and removing a quiescent
-    /// flight (production `Registration::detach`).
-    pub fn detach(&mut self, page: &PageId, id: u64, wakes: &mut Vec<Token>) {
-        let Some(flight) = self.flights.get_mut(page) else {
-            return;
-        };
-        flight.state.detach(id);
-        self.refreshed(page, wakes);
-        self.remove_quiescent(page);
-    }
-
-    /// Expire waiters whose deadline passed at `now` and settle outcomes.
-    pub fn refresh(&mut self, page: &PageId, now: Instant, wakes: &mut Vec<Token>) {
-        self.now.set(now);
-        self.refreshed(page, wakes);
-    }
 }
 
 #[cfg(test)]

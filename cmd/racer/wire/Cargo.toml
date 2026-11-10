@@ -1,0 +1,21 @@
+[package]
+name = "racer-wire"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+description = "Pure Racer control records, object protocol values, HTTP/1.1 head codec, and bounded binary codecs"
+
+[features]
+default = []
+# Strong-tag/time fixture constructors and a controllable Unix-socket origin.
+test-util = []
+
+[dependencies]
+base64 = "0.22"
+httparse = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+x509-parser = "0.16"
+zeroize = "1"

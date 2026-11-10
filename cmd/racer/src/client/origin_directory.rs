@@ -35,6 +35,13 @@ impl Owner {
     };
 }
 
+impl std::fmt::Display for Owner {
+    /// `uid=<uid> gid=<gid>`, the form diagnostics log.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "uid={} gid={}", self.uid, self.gid)
+    }
+}
+
 /// What [`prepare`] changed. Exposed for tests and diagnostics.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Outcome {
@@ -137,7 +144,7 @@ fn prepare_with(
     privileged: bool,
     ops: &mut impl Ops,
 ) -> io::Result<Outcome> {
-    let directory = uds_endpoint::child_directory(cache, b"origin", ORIGIN_MODE)?;
+    let directory = crate::uds_endpoint::child_directory(cache, b"origin", ORIGIN_MODE)?;
     let before = directory.metadata()?;
     if !before.is_dir() {
         return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
@@ -160,8 +167,7 @@ fn prepare_with(
             Err(error) if error.raw_os_error() == Some(libc::EPERM) && !privileged => {
                 eprintln!(
                     "racer: stage=origin-directory warning=unprivileged \
-                     uid={} gid={} error={error}",
-                    owner.uid, owner.gid
+                     {owner} error={error}"
                 );
                 outcome.unprivileged = true;
             }
@@ -305,6 +311,11 @@ mod tests {
             uid: unsafe { libc::geteuid() },
             gid: unsafe { libc::getegid() },
         }
+    }
+
+    #[test]
+    fn owner_displays_as_log_fields() {
+        assert_eq!(Owner { uid: 4242, gid: 7 }.to_string(), "uid=4242 gid=7");
     }
 
     #[test]

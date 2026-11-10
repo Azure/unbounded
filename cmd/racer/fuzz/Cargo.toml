@@ -1,0 +1,67 @@
+[package]
+name = "racer-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+description = "Decode-only libFuzzer targets for Racer parsers"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Standalone workspace so the Racer workspace, its lock, and NOTICE stay unaffected.
+[workspace]
+members = ["."]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+http1 = { path = "../http" }
+peer-wire = { path = "../peer-wire" }
+racer-wire = { path = "../wire" }
+racer = { path = ".." }
+page-alloc = { path = "../alloc" }
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "http_head"
+path = "fuzz_targets/http_head.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "small_body"
+path = "fuzz_targets/small_body.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "peer_envelope"
+path = "fuzz_targets/peer_envelope.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "control_documents"
+path = "fuzz_targets/control_documents.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "store_record"
+path = "fuzz_targets/store_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "checkpoint"
+path = "fuzz_targets/checkpoint.rs"
+test = false
+doc = false
+bench = false

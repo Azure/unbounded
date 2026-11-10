@@ -7,8 +7,8 @@
 
 use crate::error::Error;
 use crate::error::Result;
-use racer_control_wire::NodeId;
-use racer_control_wire::RailId;
+use racer_wire::control::NodeId;
+use racer_wire::control::RailId;
 use sha2::Digest;
 use sha2::Sha256;
 
@@ -34,15 +34,16 @@ pub(crate) struct Setup {
 }
 
 impl Setup {
-    /// Build a setup with a fresh random nonce.
+    /// Build a setup with a fresh random nonce from `rng`.
     pub fn new(
         rail: RailId,
         endpoint: [u8; ENDPOINT_LEN],
         recv_credits: u32,
         grants_per_link: u32,
+        rng: &racer_io::Rng,
     ) -> Result<Self> {
         let mut nonce = [0; 16];
-        uring_runtime::environment::fill_random(&mut nonce).map_err(|_| Error::Io)?;
+        rng.fill(&mut nonce).map_err(|_| Error::Io)?;
         let setup = Self {
             rail,
             nonce,
@@ -200,12 +201,12 @@ mod tests {
 
     #[test]
     fn new_draws_nonzero_distinct_nonces_and_rejects_zero_limits() {
-        let a = Setup::new(RailId(1), [2; 32], 8, 4).unwrap();
-        let b = Setup::new(RailId(1), [2; 32], 8, 4).unwrap();
+        let a = Setup::new(RailId(1), [2; 32], 8, 4, &racer_io::Rng::os()).unwrap();
+        let b = Setup::new(RailId(1), [2; 32], 8, 4, &racer_io::Rng::os()).unwrap();
         assert_ne!(a.nonce, [0; 16]);
         assert_ne!(a.nonce, b.nonce);
-        assert!(Setup::new(RailId(1), [2; 32], 0, 4).is_err());
-        assert!(Setup::new(RailId(1), [2; 32], 8, 0).is_err());
+        assert!(Setup::new(RailId(1), [2; 32], 0, 4, &racer_io::Rng::os()).is_err());
+        assert!(Setup::new(RailId(1), [2; 32], 8, 0, &racer_io::Rng::os()).is_err());
     }
 
     #[test]
@@ -245,7 +246,7 @@ mod tests {
                 ..setup(0, 9)
             };
             assert!(Setup::decode(&over.encode(), RailId(0)).is_err());
-            assert!(Setup::new(RailId(0), [2; 32], 8, grants).is_err());
+            assert!(Setup::new(RailId(0), [2; 32], 8, grants, &racer_io::Rng::os()).is_err());
         }
     }
 

@@ -19,7 +19,12 @@ mod loop_test;
 
 pub const MAX_SEGMENTS: u64 = 1_000_000;
 const MAX_PAGES: u64 = 1_000_000;
-const MAX_CHECKPOINT: usize = 512 * 1024 * 1024;
+/// Ceiling on the automatically sized checkpoint budget. The budget is a limit,
+/// not a reservation: recovery and snapshot memory scale with the cached pages.
+const MAX_CHECKPOINT: usize = 4 * 1024 * 1024 * 1024;
+/// Planned descriptor string bytes per entry (cache ID, etag and content type).
+/// Typical descriptors are far smaller than the 3 x 8192 byte wire maximum.
+const TYPICAL_DESCRIPTOR_STRINGS: usize = 256;
 const GUARD_BYTES: u64 = 1024 * 1024;
 
 pub struct Device {
@@ -439,6 +444,14 @@ fn device_alignment(file: &File) -> io::Result<Alignment> {
     Alignment::new(memory, offset, offset as usize).map_err(io::Error::other)
 }
 
+/// Warn when full-page records leave at least this much of each segment unused.
+const TAIL_WARNING_PERCENT: u64 = 10;
+
+/// Percent of a segment left unused after packing whole `record`s.
+fn tail_percent(segment_bytes: u64, record: u64) -> u64 {
+    (segment_bytes % record).saturating_mul(100) / segment_bytes
+}
+
 fn plan(mut devices: Vec<Device>, config: &Config, workers: usize) -> Result<Plan> {
     if workers == 0 || devices.is_empty() || config.segment_bytes == 0 {
         return Err(Error::InvalidConfiguration);
@@ -491,6 +504,15 @@ fn plan(mut devices: Vec<Device>, config: &Config, workers: usize) -> Result<Pla
     if record > config.segment_bytes {
         return Err(Error::InvalidConfiguration);
     }
+    let tail = tail_percent(config.segment_bytes, record);
+    if tail >= TAIL_WARNING_PERCENT {
+        eprintln!(
+            "racer: RACER_SEGMENT_BYTES={} fits {} full pages per segment; {tail}% of device \
+             capacity is unusable segment tail. Use a larger segment, such as 1 GiB",
+            config.segment_bytes,
+            config.segment_bytes / record,
+        );
+    }
     let mut device_index = 0;
     let mut offset = GUARD_BYTES;
     let mut plans = Vec::new();
@@ -541,13 +563,14 @@ fn plan(mut devices: Vec<Device>, config: &Config, workers: usize) -> Result<Pla
                 .checked_add(config.segment_bytes)
                 .ok_or(Error::InvalidConfiguration)?;
         }
-        // Snapshot charges include each descriptor's largest accepted strings.
-        let entries = pages.saturating_add((config.limits.metadata_entries.get() / workers).max(1));
-        let snapshot = entries
-            .saturating_mul(2048 + 3 * 8192 * 4)
-            .saturating_add(count as usize * 1024)
-            .saturating_add(4096);
-        max_snapshot = max_snapshot.max(snapshot);
+        let metadata = (config.limits.metadata_entries.get() / workers).max(1);
+        max_snapshot = max_snapshot.max(crate::store::checkpoint::checkpoint_budget(
+            workers,
+            count as usize,
+            pages,
+            metadata,
+            TYPICAL_DESCRIPTOR_STRINGS,
+        ));
         plans.push(WorkerDevices {
             placements,
             disk_groups,
@@ -556,13 +579,14 @@ fn plan(mut devices: Vec<Device>, config: &Config, workers: usize) -> Result<Pla
             page_entries: pages,
         });
     }
-    let requested = max_snapshot
-        .saturating_mul(workers)
-        .saturating_mul(4)
+    // Size from the discovered capacity so a full cache's cut is both written
+    // and recovered; an operator-configured larger budget always wins.
+    let checkpoint_bytes = max_snapshot
+        .min(MAX_CHECKPOINT)
         .max(config.checkpoint_bytes.get());
-    if requested > MAX_CHECKPOINT {
+    if max_snapshot > checkpoint_bytes {
         eprintln!(
-            "racer: checkpoint working-set capped at {MAX_CHECKPOINT}; worst-case demand={requested}; oversized cuts will be skipped"
+            "racer: checkpoint budget capped at {checkpoint_bytes}; full-cache demand={max_snapshot}; cuts beyond the budget will be skipped and the cache will start cold after a restart"
         );
     }
     eprintln!(
@@ -572,7 +596,7 @@ fn plan(mut devices: Vec<Device>, config: &Config, workers: usize) -> Result<Pla
     );
     Ok(Plan {
         workers: plans,
-        checkpoint_bytes: requested.min(MAX_CHECKPOINT),
+        checkpoint_bytes,
     })
 }
 
@@ -618,6 +642,18 @@ pub(super) fn recovery_layout_fixture() -> Vec<crate::store::checkpoint::Checkpo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tail_percent_flags_small_segments() {
+        let record = 16 * 1024 * 1024 + 4096;
+        // 64 MiB fits three 16 MiB records and leaves a quarter unused.
+        assert_eq!(tail_percent(64 << 20, record), 24);
+        assert!(tail_percent(64 << 20, record) >= TAIL_WARNING_PERCENT);
+        // 1 GiB fits 63 records: under the warning threshold.
+        assert_eq!(tail_percent(1 << 30, record), 1);
+        // An exact multiple wastes nothing.
+        assert_eq!(tail_percent(record * 4, record), 0);
+    }
 
     struct FakeClock(Duration);
 
@@ -1117,9 +1153,46 @@ mod tests {
         c.disk_page_entries = std::num::NonZeroUsize::new(100_000).unwrap();
         let p = plan(vec![device("a", 9, s)], &c, 2).unwrap();
         assert_eq!(p.workers[0].page_entries, 50_000);
-        assert_eq!(p.checkpoint_bytes, MAX_CHECKPOINT);
+        assert!(p.checkpoint_bytes >= c.checkpoint_bytes.get());
+        assert!(p.checkpoint_bytes <= MAX_CHECKPOINT);
         c.slab_bytes = 1;
         assert!(plan(vec![device("a", 9, s)], &c, 2).is_ok());
+    }
+
+    #[test]
+    fn checkpoint_budget_scales_with_device_capacity() {
+        let mut c = config();
+        c.segment_bytes = 64 * 1024 * 1024;
+        c.disk_page_entries = std::num::NonZeroUsize::new(1).unwrap();
+        c.checkpoint_bytes = std::num::NonZeroUsize::new(64 * 1024 * 1024).unwrap();
+        let s = c.segment_bytes;
+        let workers = 86;
+        // 8 x 3.84 TB NVMe at 64 MiB segments: about 457k segments.
+        let large: Vec<_> = (0..8)
+            .map(|n| device(&format!("nvme{n}"), 3_840_000_000_000 / s, s))
+            .collect();
+        let p = plan(large, &c, workers).unwrap();
+        let segments = p.workers.iter().map(|w| w.placements.len()).max().unwrap();
+        let pages = p.workers.iter().map(|w| w.page_entries).max().unwrap();
+        let metadata = (c.limits.metadata_entries.get() / workers).max(1);
+        let needed = crate::store::checkpoint::checkpoint_budget(
+            workers,
+            segments,
+            pages,
+            metadata,
+            TYPICAL_DESCRIPTOR_STRINGS,
+        );
+        // The full-cache cut fits: neither capped to 512 MiB nor to the seed.
+        assert!(needed > 512 * 1024 * 1024);
+        assert_eq!(p.checkpoint_bytes, needed);
+        assert!(p.checkpoint_bytes / 2 <= crate::store::checkpoint::MAX_CHECKPOINT_BYTES);
+
+        // Small devices keep the configured seed; a larger operator value wins.
+        let small = plan(vec![device("a", 9, s)], &c, 2).unwrap();
+        assert_eq!(small.checkpoint_bytes, c.checkpoint_bytes.get());
+        c.checkpoint_bytes = std::num::NonZeroUsize::new(MAX_CHECKPOINT * 2).unwrap();
+        let p = plan(vec![device("a", 9, s)], &c, 2).unwrap();
+        assert_eq!(p.checkpoint_bytes, MAX_CHECKPOINT * 2);
     }
 
     #[test]

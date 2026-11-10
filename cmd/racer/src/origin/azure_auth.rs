@@ -7,7 +7,8 @@
 //!   `Metadata: true`, optionally selecting a user-assigned identity by client ID.
 //! - Workload identity federation: the projected service account token named by
 //!   `RACER_AZURE_FEDERATED_TOKEN_FILE` (reread on every exchange) is exchanged at
-//!   `${RACER_AZURE_AUTHORITY_HOST:-https://login.microsoftonline.com/}<tenant>/oauth2/v2.0/token`
+//!   `<authority><tenant>/oauth2/v2.0/token`, where the authority is
+//!   `RACER_AZURE_AUTHORITY_HOST` (default `https://login.microsoftonline.com/`),
 //!   with the client credentials grant and a JWT bearer client assertion. Without a
 //!   configured tenant, the tenant comes from a storage `WWW-Authenticate` challenge
 //!   (see [`parse_bearer_challenge`] and [`AzureTokenCache::learn_tenant`]).
@@ -41,12 +42,6 @@ pub const STORAGE_RESOURCE: &str = "https://storage.azure.com/";
 
 /// Token scope for Azure Storage (Entra v2 `scope`).
 pub const STORAGE_SCOPE: &str = "https://storage.azure.com/.default";
-
-/// Environment variable naming the federated service account token file.
-pub const FEDERATED_TOKEN_FILE_ENV: &str = "RACER_AZURE_FEDERATED_TOKEN_FILE";
-
-/// Environment variable overriding the Entra authority host.
-pub const AUTHORITY_HOST_ENV: &str = "RACER_AZURE_AUTHORITY_HOST";
 
 /// Default Entra authority host.
 pub const DEFAULT_AUTHORITY_HOST: &str = "https://login.microsoftonline.com/";
@@ -99,7 +94,7 @@ pub enum AuthError {
     Configuration,
 
     /// The caller's scope was canceled.
-    Cancelled,
+    Canceled,
 
     /// The caller's deadline expired.
     DeadlineExceeded,
@@ -113,7 +108,7 @@ impl std::fmt::Display for AuthError {
             Self::Malformed => f.write_str("malformed token response"),
             Self::TenantUnknown => f.write_str("workload identity tenant unknown"),
             Self::Configuration => f.write_str("invalid Azure credential configuration"),
-            Self::Cancelled => f.write_str("canceled"),
+            Self::Canceled => f.write_str("canceled"),
             Self::DeadlineExceeded => f.write_str("deadline exceeded"),
         }
     }
@@ -124,7 +119,7 @@ impl std::error::Error for AuthError {}
 impl From<Error> for AuthError {
     fn from(error: Error) -> Self {
         match error {
-            Error::Cancelled => Self::Cancelled,
+            Error::Canceled => Self::Canceled,
             Error::DeadlineExceeded => Self::DeadlineExceeded,
             Error::InvalidConfiguration => Self::Configuration,
             _ => Self::Unavailable,
@@ -135,7 +130,7 @@ impl From<Error> for AuthError {
 impl From<AuthError> for Error {
     fn from(error: AuthError) -> Self {
         match error {
-            AuthError::Cancelled => Self::Cancelled,
+            AuthError::Canceled => Self::Canceled,
             AuthError::DeadlineExceeded => Self::DeadlineExceeded,
             AuthError::Configuration => Self::InvalidConfiguration,
             AuthError::Rejected(_) | AuthError::TenantUnknown => Self::OriginForbidden,
@@ -144,7 +139,7 @@ impl From<AuthError> for Error {
     }
 }
 
-/// Token service locations. [`AuthEndpoints::from_env`] gives production values.
+/// Token service locations. [`AuthEndpoints::new`] gives production values.
 #[derive(Clone)]
 pub struct AuthEndpoints {
     /// IMDS endpoint (plain HTTP).
@@ -157,26 +152,24 @@ pub struct AuthEndpoints {
     /// Federated token file for workload identity.
     pub federated_token_file: Option<PathBuf>,
 
-    /// TLS configuration for the authority; `None` loads the origin trust bundle
-    /// ([`http1::tls::trust_bundle_path`]) when the cache is created.
+    /// TLS configuration for an `https` authority: the node's origin trust
+    /// roots, loaded at assembly. `None` (no usable bundle) makes workload
+    /// identity over `https` a configuration error.
     pub tls: Option<Arc<rustls::ClientConfig>>,
 }
 
 impl AuthEndpoints {
-    /// IMDS at 169.254.169.254:80, the authority from [`AUTHORITY_HOST_ENV`], and
-    /// the federated token file from [`FEDERATED_TOKEN_FILE_ENV`].
-    pub fn from_env() -> Self {
-        let authority = std::env::var(AUTHORITY_HOST_ENV)
-            .ok()
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| DEFAULT_AUTHORITY_HOST.to_owned());
+    /// IMDS at 169.254.169.254:80, the configured authority and federated
+    /// token file, and the node's loaded trust roots.
+    pub fn new(
+        settings: &crate::config::OriginSettings,
+        tls: Option<Arc<rustls::ClientConfig>>,
+    ) -> Self {
         Self {
             imds: RemoteEndpoint::http(IMDS_ADDRESS, 80).expect("IMDS literal"),
-            authority,
-            federated_token_file: std::env::var_os(FEDERATED_TOKEN_FILE_ENV)
-                .filter(|v| !v.is_empty())
-                .map(PathBuf::from),
-            tls: None,
+            authority: settings.azure_authority_host.clone(),
+            federated_token_file: settings.azure_federated_token_file.clone(),
+            tls,
         }
     }
 }
@@ -202,6 +195,80 @@ pub struct AzureTokenCache {
     tenant: Mutex<Option<String>>,
 
     token: Mutex<Option<CachedToken>>,
+
+    /// Node-wide single-flight refresh shared by every worker's source.
+    flight: Mutex<Flight>,
+}
+
+/// State of the node-wide token refresh. At most one worker fetches at a
+/// time; the others park their wakers here and, when the fetch completes,
+/// adopt its token or its failure instead of fetching again.
+#[derive(Default)]
+struct Flight {
+    /// A fetch is running.
+    running: bool,
+
+    /// Completed fetches; a waiter compares it to detect completion.
+    completed: u64,
+
+    /// Failure of the latest completed fetch.
+    failure: Option<AuthError>,
+
+    /// Waiters parked on the running fetch, from any worker thread.
+    waiters: Vec<std::task::Waker>,
+}
+
+/// Leadership of the node-wide refresh. Dropping it without
+/// [`FlightGuard::finish`] (a canceled fetch) releases leadership without
+/// a result, so a waiter takes over.
+struct FlightGuard<'a> {
+    cache: &'a AzureTokenCache,
+}
+
+impl FlightGuard<'_> {
+    fn finish(self, failure: Option<AuthError>) {
+        let mut flight = self.cache.flight();
+        flight.completed += 1;
+        flight.failure = failure;
+    }
+}
+
+impl Drop for FlightGuard<'_> {
+    fn drop(&mut self) {
+        let waiters = {
+            let mut flight = self.cache.flight();
+            flight.running = false;
+            std::mem::take(&mut flight.waiters)
+        };
+        for waker in waiters {
+            waker.wake();
+        }
+    }
+}
+
+/// Resolves once the fetch running at creation ends (or none is running).
+struct FlightWait<'a> {
+    cache: &'a AzureTokenCache,
+
+    seen: u64,
+}
+
+impl std::future::Future for FlightWait<'_> {
+    type Output = ();
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        let mut flight = self.cache.flight();
+        if !flight.running || flight.completed != self.seen {
+            return std::task::Poll::Ready(());
+        }
+        if !flight.waiters.iter().any(|w| w.will_wake(cx.waker())) {
+            flight.waiters.push(cx.waker().clone());
+        }
+        std::task::Poll::Pending
+    }
 }
 
 impl std::fmt::Debug for AzureTokenCache {
@@ -248,6 +315,7 @@ impl AzureTokenCache {
             authority,
             tenant: Mutex::new(tenant),
             token: Mutex::new(None),
+            flight: Mutex::default(),
         })
     }
 
@@ -329,6 +397,26 @@ impl AzureTokenCache {
             .map(|t| t.token.clone())
     }
 
+    fn flight(&self) -> std::sync::MutexGuard<'_, Flight> {
+        self.flight.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Lead the refresh, or learn the completion count of the running one.
+    fn begin(&self) -> Result<FlightGuard<'_>, u64> {
+        let mut flight = self.flight();
+        if flight.running {
+            return Err(flight.completed);
+        }
+        flight.running = true;
+        Ok(FlightGuard { cache: self })
+    }
+
+    /// The failure of the fetch that completed after `seen`, if one did.
+    fn completed_since(&self, seen: u64) -> Option<Option<AuthError>> {
+        let flight = self.flight();
+        (flight.completed != seen).then_some(flight.failure)
+    }
+
     fn store(&self, token: CachedToken) {
         *self.token.lock().unwrap_or_else(|e| e.into_inner()) = Some(token);
     }
@@ -341,8 +429,6 @@ pub struct AzureTokenSource {
     reactor: Rc<Reactor>,
 
     resolver: Rc<dyn Resolver>,
-
-    flight: futures::lock::Mutex<()>,
 }
 
 impl AzureTokenSource {
@@ -362,7 +448,6 @@ impl AzureTokenSource {
             cache,
             reactor,
             resolver,
-            flight: futures::lock::Mutex::new(()),
         }
     }
 
@@ -378,57 +463,79 @@ impl AzureTokenSource {
 
     /// A storage bearer token (without the `Bearer ` prefix). Uses the cached
     /// token until its refresh time; if a refresh fails, an unexpired cached
-    /// token is still returned.
+    /// token is still returned. One refresh runs per node: requests on any
+    /// worker that find the token due wait for it and share its result.
     pub async fn bearer(&self, scope: &RequestScope) -> Result<Arc<str>, AuthError> {
-        scope.check()?;
-        if let Some(token) = self.cache.fresh(SystemTime::now()) {
-            return Ok(token);
+        loop {
+            scope.check()?;
+            if let Some(token) = self.cache.fresh(self.wall_now()) {
+                return Ok(token);
+            }
+            let seen = match self.cache.begin() {
+                Ok(flight) => return self.refresh(flight, scope).await,
+                Err(seen) => seen,
+            };
+            self.wait(seen, scope).await?;
+            // A finished fetch answers every waiter; a canceled one does not,
+            // and the next pass leads a new fetch.
+            if let Some(failure) = self.cache.completed_since(seen) {
+                let now = self.wall_now();
+                if let Some(token) = self.cache.fresh(now) {
+                    return Ok(token);
+                }
+                if let Some(error) = failure {
+                    return self.cache.unexpired(now).ok_or(error);
+                }
+            }
         }
-        let _flight = self.flight_lock(scope).await?;
-        scope.check()?;
-        if let Some(token) = self.cache.fresh(SystemTime::now()) {
+    }
+
+    fn wall_now(&self) -> SystemTime {
+        self.reactor.ctx().clock.wall_now()
+    }
+
+    /// Run the node-wide refresh as its leader.
+    async fn refresh(
+        &self,
+        flight: FlightGuard<'_>,
+        scope: &RequestScope,
+    ) -> Result<Arc<str>, AuthError> {
+        // Another worker may have refreshed between the check and `begin`.
+        if let Some(token) = self.cache.fresh(self.wall_now()) {
+            flight.finish(None);
             return Ok(token);
         }
         match self.fetch(scope).await {
             Ok(token) => {
                 let value = token.token.clone();
                 self.cache.store(token);
+                flight.finish(None);
                 Ok(value)
             }
-            Err(error) => match self.cache.unexpired(SystemTime::now()) {
-                Some(token)
-                    if !matches!(error, AuthError::Cancelled | AuthError::DeadlineExceeded) =>
-                {
-                    Ok(token)
+            Err(error) => {
+                if !matches!(error, AuthError::Canceled | AuthError::DeadlineExceeded) {
+                    flight.finish(Some(error));
+                    if let Some(token) = self.cache.unexpired(self.wall_now()) {
+                        return Ok(token);
+                    }
                 }
-                _ => Err(error),
-            },
+                Err(error)
+            }
         }
     }
 
-    /// Wait for the single-flight refresh lock under the waiter's own deadline
-    /// and cancellation. Giving up only drops this waiter; the fetch holding the
-    /// lock runs on under its own scope and still fills the cache.
-    async fn flight_lock(
-        &self,
-        scope: &RequestScope,
-    ) -> Result<futures::lock::MutexGuard<'_, ()>, AuthError> {
+    /// Wait for the running refresh under the waiter's own deadline and
+    /// cancellation. Giving up only drops this waiter; the fetch runs on under
+    /// its leader's scope and still fills the cache.
+    async fn wait(&self, seen: u64, scope: &RequestScope) -> Result<(), AuthError> {
         use futures::future::{Either, select};
-        use uring_runtime::reactor::timer::SleepMode;
-        if let Some(guard) = self.flight.try_lock() {
-            return Ok(guard);
-        }
-        #[cfg(test)]
-        let mode = if uring_runtime::environment::simulation_seed().is_some() {
-            SleepMode::ClockPoll
-        } else {
-            SleepMode::Kernel
+        let expiry = self.reactor.sleep_until(scope.deadline.0, scope);
+        let wait = FlightWait {
+            cache: &self.cache,
+            seen,
         };
-        #[cfg(not(test))]
-        let mode = SleepMode::Kernel;
-        let expiry = self.reactor.sleep_until(scope.deadline.0, mode, scope);
-        match select(self.flight.lock(), expiry).await {
-            Either::Left((guard, _)) => Ok(guard),
+        match select(wait, expiry).await {
+            Either::Left(((), _)) => Ok(()),
             Either::Right((slept, _)) => {
                 slept?;
                 scope.check()?;
@@ -440,7 +547,7 @@ impl AzureTokenSource {
     }
 
     async fn fetch(&self, scope: &RequestScope) -> Result<CachedToken, AuthError> {
-        let issued = SystemTime::now();
+        let issued = self.wall_now();
         let response = match &self.cache.credential {
             AzureCredential::ManagedIdentity { client_id } => {
                 let mut target = format!(
@@ -474,12 +581,15 @@ impl AzureTokenSource {
                     .as_ref()
                     .ok_or(AuthError::Configuration)?;
                 let assertion = read_assertion(
+                    &self.reactor,
                     self.cache
                         .endpoints
                         .federated_token_file
                         .as_deref()
                         .ok_or(AuthError::Configuration)?,
-                )?;
+                    scope,
+                )
+                .await?;
                 let mut body = Zeroizing::new(String::with_capacity(assertion.len() + 256));
                 body.push_str("client_assertion=");
                 body.push_str(&form_encode(&assertion));
@@ -512,7 +622,7 @@ impl AzureTokenSource {
             }
         };
         match response.status {
-            200 => parse_token(&response.body, issued),
+            200 => parse_token(&response.body, issued, self.wall_now()),
             408 | 429 | 500..=599 => Err(AuthError::Unavailable),
             // IMDS returns 404 and 410 while an identity is being provisioned.
             404 | 410
@@ -560,15 +670,9 @@ fn parse_authority(
         prefix.push('/');
     }
     let endpoint = if https {
-        let config = match tls {
-            Some(config) => config,
-            None => {
-                // An unreadable trust bundle is a configuration error at construction.
-                let roots = http1::tls::load_trust_bundle(&http1::tls::trust_bundle_path())
-                    .map_err(|_| AuthError::Configuration)?;
-                http1::tls::client_config(roots)
-            }
-        };
+        // Without usable trust roots an https authority is a configuration
+        // error; no file is read here, on a worker.
+        let config = tls.ok_or(AuthError::Configuration)?;
         RemoteEndpoint::https(host, port, config)
     } else {
         RemoteEndpoint::http(host, port)
@@ -586,19 +690,32 @@ fn valid_id(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
 }
 
-/// Read and trim the federated token. It is reread for every exchange because
-/// the kubelet rotates the projected file.
-fn read_assertion(path: &std::path::Path) -> Result<Zeroizing<String>, AuthError> {
-    use std::io::Read as _;
-    let file = std::fs::File::open(path).map_err(|_| AuthError::Configuration)?;
-    let mut bytes = Zeroizing::new(Vec::new());
-    file.take(MAX_ASSERTION + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| AuthError::Configuration)?;
+/// Read and trim the federated token through the worker's io_uring file
+/// operations, so the reactor never blocks on the file. It is reread for
+/// every exchange because the kubelet rotates the projected file.
+async fn read_assertion(
+    reactor: &Reactor,
+    path: &std::path::Path,
+    scope: &RequestScope,
+) -> Result<Zeroizing<String>, AuthError> {
+    use racer_io::scoped::fs::secure;
+    // One byte over the cap tells an oversized file from a full one.
+    let bytes = secure::read_path(reactor, path, MAX_ASSERTION as usize + 1, scope)
+        .await
+        .map_err(|error| match error {
+            Error::Canceled => AuthError::Canceled,
+            Error::DeadlineExceeded => AuthError::DeadlineExceeded,
+            _ => AuthError::Configuration,
+        })?;
+    parse_assertion(&bytes)
+}
+
+/// Validate and trim a federated token read from its file.
+fn parse_assertion(bytes: &[u8]) -> Result<Zeroizing<String>, AuthError> {
     if bytes.len() as u64 > MAX_ASSERTION {
         return Err(AuthError::Configuration);
     }
-    let text = std::str::from_utf8(&bytes).map_err(|_| AuthError::Configuration)?;
+    let text = std::str::from_utf8(bytes).map_err(|_| AuthError::Configuration)?;
     let text = text.trim();
     if text.is_empty() {
         return Err(AuthError::Configuration);
@@ -621,7 +738,8 @@ fn form_encode(value: &str) -> String {
 
 /// Parse an IMDS or Entra token response. `expires_on` (absolute seconds) wins
 /// over `expires_in` (relative to `issued`); numbers may be JSON strings.
-fn parse_token(body: &[u8], issued: SystemTime) -> Result<CachedToken, AuthError> {
+/// `now` is the wall time the response arrived.
+fn parse_token(body: &[u8], issued: SystemTime, now: SystemTime) -> Result<CachedToken, AuthError> {
     let value: serde_json::Value =
         serde_json::from_slice(body).map_err(|_| AuthError::Malformed)?;
     let token = value
@@ -642,7 +760,6 @@ fn parse_token(body: &[u8], issued: SystemTime) -> Result<CachedToken, AuthError
     } else {
         return Err(AuthError::Malformed);
     };
-    let now = SystemTime::now();
     let lifetime = expires
         .duration_since(now)
         .map_err(|_| AuthError::Malformed)?;

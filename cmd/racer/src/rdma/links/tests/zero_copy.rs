@@ -14,7 +14,8 @@ fn setup() -> (
     crate::memory::PageResult,
 ) {
     let mut w = world();
-    link_up(&mut w);
+    let env = w.env.clone();
+    link_up(&env, &mut w);
     let admission = memory_admission(16);
     let page = bundle(&admission, "v1");
     (w, admission, page)
@@ -30,11 +31,12 @@ fn free(w: &World) -> Option<usize> {
 
 /// Wrap a freshly received copy of `page`'s ciphertext without copying.
 fn registered(
+    env: &racer_io::Env,
     w: &mut World,
     admission: &Rc<flow_control::Quotas<AdmissionPolicy>>,
     page: &CiphertextPage,
 ) -> CiphertextPage {
-    let received = receive_registered(w, page);
+    let received = receive_registered(env, w, page);
     let pointer = received.bytes().as_ptr();
     let envelope = page.envelope().clone();
     let reservation = admission
@@ -54,10 +56,10 @@ fn registered(
 
 #[test]
 fn registered_ciphertext_reads_in_place_and_drop_frees_buffer() {
+    let env = racer_io::Env::host();
     let (mut w, admission, page) = setup();
-    let ciphertext = registered(&mut w, &admission, &page.ciphertext);
+    let ciphertext = registered(&env, &mut w, &admission, &page.ciphertext);
     assert_eq!(ciphertext.bytes(), page.ciphertext.bytes());
-    assert_eq!(ciphertext.checksum(), page.ciphertext.checksum());
     assert_eq!(owned(&w), Some(1));
     let before = admission.used(ResourceClass::Ciphertext);
     // A clone on another thread keeps the buffer; dropping it there frees it.
@@ -73,6 +75,7 @@ fn registered_ciphertext_reads_in_place_and_drop_frees_buffer() {
 
 #[test]
 fn registered_ciphertext_rejects_bad_length_and_reservation() {
+    let env = racer_io::Env::host();
     let (mut w, admission, page) = setup();
     let pool = BufferPool::new(admission.clone());
     let cache = page.metadata.version.object.cache.clone();
@@ -81,7 +84,7 @@ fn registered_ciphertext_rejects_bad_length_and_reservation() {
     let mut short = page.ciphertext.envelope().clone();
     short.plaintext_length -= 1;
     short.ciphertext_length -= 1;
-    let received = receive_registered(&mut w, &page.ciphertext);
+    let received = receive_registered(&env, &mut w, &page.ciphertext);
     assert_eq!(
         pool.registered_ciphertext(reserve(ResourceClass::Ciphertext, 18), short, received)
             .err(),
@@ -90,7 +93,7 @@ fn registered_ciphertext_rejects_bad_length_and_reservation() {
     pump!(w);
     assert_eq!(free(&w), Some(2), "the rejected page is freed");
     // Wrong reservation class.
-    let received = receive_registered(&mut w, &page.ciphertext);
+    let received = receive_registered(&env, &mut w, &page.ciphertext);
     assert_eq!(
         pool.registered_ciphertext(
             reserve(ResourceClass::Plaintext, 19),
@@ -104,13 +107,14 @@ fn registered_ciphertext_rejects_bad_length_and_reservation() {
     assert_eq!(free(&w), Some(2));
     assert_eq!(
         admission.used(ResourceClass::Plaintext),
-        3,
-        "only the bundle"
+        4096,
+        "only the bundle, at one plaintext granule"
     );
 }
 
 #[test]
 fn retainable_and_rehome_copy_out_and_release_the_buffer() {
+    let env = racer_io::Env::host();
     let (mut w, admission, page) = setup();
     let pool = BufferPool::new(admission.clone());
     let owned_page = page.ciphertext.clone();
@@ -118,7 +122,7 @@ fn retainable_and_rehome_copy_out_and_release_the_buffer() {
         &pool.retainable(owned_page).unwrap().inner,
         &page.ciphertext.inner
     ));
-    let ciphertext = registered(&mut w, &admission, &page.ciphertext);
+    let ciphertext = registered(&env, &mut w, &admission, &page.ciphertext);
     let pointer = ciphertext.bytes().as_ptr();
     let used = admission.used(ResourceClass::Ciphertext);
     let copy = pool.retainable(ciphertext).unwrap();
@@ -137,13 +141,13 @@ fn retainable_and_rehome_copy_out_and_release_the_buffer() {
     pump!(w);
     assert_eq!(free(&w), Some(2));
     // An exclusive registered page still copies on rehome.
-    let ciphertext = registered(&mut w, &admission, &page.ciphertext);
+    let ciphertext = registered(&env, &mut w, &admission, &page.ciphertext);
     let pointer = ciphertext.bytes().as_ptr();
     let reservation = admission
         .reserve(
             Some(&page.metadata.version.object.cache),
             ResourceClass::Ciphertext,
-            19,
+            page_alloc::buf::GRANULE,
         )
         .unwrap();
     let moved = ciphertext.rehome(reservation).unwrap();
@@ -156,8 +160,9 @@ fn retainable_and_rehome_copy_out_and_release_the_buffer() {
 
 #[test]
 fn retainable_failure_drops_the_page_and_frees_the_buffer() {
+    let env = racer_io::Env::host();
     let (mut w, admission, page) = setup();
-    let ciphertext = registered(&mut w, &admission, &page.ciphertext);
+    let ciphertext = registered(&env, &mut w, &admission, &page.ciphertext);
     let pool = BufferPool::new(admission.clone());
     // Exhaust ciphertext admission so the copy-out cannot be charged.
     let cache = page.metadata.version.object.cache.clone();
@@ -175,17 +180,18 @@ fn retainable_failure_drops_the_page_and_frees_the_buffer() {
 
 #[test]
 fn memory_cache_publish_copies_out_registered_ciphertext() {
+    let env = racer_io::Env::host();
     let (mut w, admission, page) = setup();
     let cache = MemoryCache::new(
         BufferPool::new(admission.clone()),
-        crate::test_support::availability(),
+        crate::test_support::availability(&env),
     );
     let id = page.plaintext.page().clone();
     // Unverified ciphertext entries.
     let unverified = UnverifiedPage {
         copy: crate::memory::CiphertextCopy {
             metadata: page.metadata.clone(),
-            ciphertext: registered(&mut w, &admission, &page.ciphertext),
+            ciphertext: registered(&env, &mut w, &admission, &page.ciphertext),
         },
         disk_token: None,
     };
@@ -204,7 +210,7 @@ fn memory_cache_publish_copies_out_registered_ciphertext() {
     assert_eq!(free(&w), Some(2));
     // Verified pages.
     let mut result = page.clone();
-    result.ciphertext = registered(&mut w, &admission, &page.ciphertext);
+    result.ciphertext = registered(&env, &mut w, &admission, &page.ciphertext);
     cache.publish(result.clone()).unwrap();
     // A duplicate publish keeps the first copy and does not charge again.
     let used = admission.used(ResourceClass::Ciphertext);
@@ -235,13 +241,12 @@ fn aligned_charge(
 
 #[test]
 fn detach_registered_copies_once_into_the_pool_and_shares_with_the_cache() {
+    let env = racer_io::Env::host();
     let (mut w, admission, page) = setup();
     let pool = BufferPool::new(admission.clone());
-    let cache = MemoryCache::new(pool.clone(), crate::test_support::availability());
+    let cache = MemoryCache::new(pool.clone(), crate::test_support::availability(&env));
     let baseline = admission.used(ResourceClass::Ciphertext);
-    let ciphertext = registered(&mut w, &admission, &page.ciphertext);
-    let checksum = page.ciphertext.checksum();
-    ciphertext.expected_checksum(checksum).unwrap();
+    let ciphertext = registered(&env, &mut w, &admission, &page.ciphertext);
     let pointer = ciphertext.bytes().as_ptr();
     let before = crate::memory::registered_copy_outs();
     let charge = aligned_charge(&pool, &admission, &ciphertext);
@@ -250,7 +255,11 @@ fn detach_registered_copies_once_into_the_pool_and_shares_with_the_cache() {
     assert!(!detached.is_registered());
     assert_ne!(detached.bytes().as_ptr(), pointer);
     assert_eq!(detached.bytes(), page.ciphertext.bytes());
-    assert_eq!(detached.cached_checksum(), Some(checksum), "checksum kept");
+    assert_eq!(
+        detached.envelope(),
+        page.ciphertext.envelope(),
+        "envelope kept"
+    );
     assert!(detached.is_disk_aligned(crate::memory::default_disk_alignment()));
     // The registered buffer was released by the copy-out.
     pump!(w);
@@ -278,10 +287,11 @@ fn detach_registered_copies_once_into_the_pool_and_shares_with_the_cache() {
 
 #[test]
 fn detach_registered_shares_an_earlier_retained_copy() {
+    let env = racer_io::Env::host();
     let (mut w, admission, page) = setup();
     let pool = BufferPool::new(admission.clone());
     let baseline = admission.used(ResourceClass::Ciphertext);
-    let ciphertext = registered(&mut w, &admission, &page.ciphertext);
+    let ciphertext = registered(&env, &mut w, &admission, &page.ciphertext);
     let before = crate::memory::registered_copy_outs();
     // A retaining path copies the page out first and the registered page
     // remembers that copy.
@@ -303,24 +313,26 @@ fn detach_registered_shares_an_earlier_retained_copy() {
 
 #[test]
 fn detach_registered_returns_the_buffer_to_the_worker_pool() {
+    let env = racer_io::Env::host();
     let (mut w, admission, page) = setup();
     let pool = BufferPool::new(admission.clone());
-    let ciphertext = registered(&mut w, &admission, &page.ciphertext);
+    let ciphertext = registered(&env, &mut w, &admission, &page.ciphertext);
     let charge = aligned_charge(&pool, &admission, &ciphertext);
     let detached = pool.detach_registered(ciphertext, charge).unwrap();
-    let idle = pool.aligned_stats();
+    let idle = pool.disk_idle_bytes();
     drop(detached);
-    assert!(pool.aligned_stats() != idle, "the copy is pooled storage");
+    assert!(pool.disk_idle_bytes() > idle, "the copy is pooled storage");
     pump!(w);
     assert_eq!(free(&w), Some(2));
 }
 
 #[test]
 fn detach_registered_refuses_short_charges_and_frees_the_buffer() {
+    let env = racer_io::Env::host();
     let (mut w, admission, page) = setup();
     let pool = BufferPool::new(admission.clone());
     let baseline = admission.used(ResourceClass::Ciphertext);
-    let ciphertext = registered(&mut w, &admission, &page.ciphertext);
+    let ciphertext = registered(&env, &mut w, &admission, &page.ciphertext);
     let before = crate::memory::registered_copy_outs();
     let short = admission
         .reserve(
@@ -341,9 +353,10 @@ fn detach_registered_refuses_short_charges_and_frees_the_buffer() {
 
 #[test]
 fn rehome_aligned_copies_shared_pages_into_the_pool() {
+    let env = racer_io::Env::host();
     let (mut w, admission, page) = setup();
     let pool = BufferPool::new(admission.clone());
-    let ciphertext = registered(&mut w, &admission, &page.ciphertext);
+    let ciphertext = registered(&env, &mut w, &admission, &page.ciphertext);
     let before = crate::memory::registered_copy_outs();
     let charge = aligned_charge(&pool, &admission, &ciphertext);
     let moved = pool.rehome_aligned(ciphertext, charge).unwrap();
@@ -364,4 +377,371 @@ fn rehome_aligned_copies_shared_pages_into_the_pool() {
     drop((moved, same));
     pump!(w);
     assert_eq!(free(&w), Some(2));
+}
+
+#[test]
+fn receive_hold_is_recorded_once_the_buffer_returns_to_the_pool() {
+    use crate::telemetry::Event;
+    let env = racer_io::Env::host();
+    let (mut w, admission, page) = setup();
+    let metrics = crate::telemetry::Metrics::default();
+    let clock = w.clock.ctx(1).clock.clone();
+    let received = receive_registered(&env, &mut w, &page.ciphertext);
+    let envelope = page.ciphertext.envelope().clone();
+    let reservation = admission
+        .reserve(
+            Some(&envelope.page.version.object.cache),
+            ResourceClass::Ciphertext,
+            received.len(),
+        )
+        .unwrap();
+    let hold = crate::memory::ReceiveHold::new(metrics.clone(), clock.clone(), clock.now());
+    let pool = BufferPool::new(admission.clone());
+    let ciphertext = pool
+        .registered_ciphertext_held(reservation, envelope, received, Some(hold))
+        .unwrap();
+    w.clock.advance(std::time::Duration::from_millis(7));
+    // A clone still holds the buffer: nothing is recorded yet.
+    let clone = ciphertext.clone();
+    drop(ciphertext);
+    assert_eq!(metrics.count(Event::RdmaReceiveHoldCount), 0);
+    // A copy-out drops the last registered handle and records the hold.
+    let charge = aligned_charge(&pool, &admission, &clone);
+    let detached = pool.detach_registered(clone, charge).unwrap();
+    assert!(!detached.is_registered());
+    assert_eq!(metrics.count(Event::RdmaReceiveHoldCount), 1);
+    assert_eq!(metrics.count(Event::RdmaReceiveHoldNs), 7_000_000);
+    pump!(w);
+    assert_eq!(free(&w), Some(2), "the buffer is back while the copy lives");
+    drop(detached);
+}
+
+/// A random page key, fixed for the test thread so a sealed page and the
+/// key a decrypt job derives from it agree.
+fn page_key() -> [u8; 32] {
+    thread_local! {
+        static KEY: [u8; 32] = {
+            let mut key = [0; 32];
+            getrandom::getrandom(&mut key).unwrap();
+            key
+        };
+    }
+    KEY.with(|key| *key)
+}
+
+/// A real sealed 3-byte page with the same envelope as the bundle, keyed with
+/// `page_key()`, as aligned pooled storage. Returns it and its plaintext.
+fn really_sealed(
+    pool: &BufferPool,
+    admission: &Rc<flow_control::Quotas<AdmissionPolicy>>,
+    page: &crate::memory::PageResult,
+) -> CiphertextPage {
+    let envelope = page.ciphertext.envelope().clone();
+    let aad = crate::security::page_aad(&envelope).unwrap();
+    let mut sealed = vec![0u8; 3 + racer_crypto::TAG_LEN];
+    racer_crypto::seal(&page_key(), &envelope.nonce.0, &aad, b"abc", &mut sealed).unwrap();
+    let mut buffer = pool
+        .encryption_output(
+            admission
+                .reserve(
+                    Some(&envelope.page.version.object.cache),
+                    ResourceClass::Ciphertext,
+                    sealed.len(),
+                )
+                .unwrap(),
+            sealed.len(),
+        )
+        .unwrap();
+    buffer.as_mut_slice().copy_from_slice(&sealed);
+    pool.aligned_ciphertext_page(buffer, envelope).unwrap()
+}
+
+fn host_memfd(size: usize) -> std::fs::File {
+    use std::io::Write;
+    use std::os::fd::FromRawFd;
+    // SAFETY: plain syscall; the descriptor is checked and owned below.
+    let fd = unsafe {
+        libc::memfd_create(
+            c"racer-fused".as_ptr(),
+            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        )
+    };
+    assert!(fd >= 0);
+    // SAFETY: a fresh descriptor this test owns.
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    file.write_all(&vec![0xee; size]).unwrap();
+    // SAFETY: adds a seal to a descriptor this test owns.
+    assert_eq!(
+        unsafe { libc::fcntl(fd, libc::F_ADD_SEALS, libc::F_SEAL_SHRINK) },
+        0
+    );
+    file
+}
+
+/// A host-read decrypt of a registered page with a fused store, for
+/// `range` of its 3 plaintext bytes and an AAD override.
+fn fused_job(
+    env: &racer_io::Env,
+    w: &mut World,
+    pool: &BufferPool,
+    admission: &Rc<flow_control::Quotas<AdmissionPolicy>>,
+    page: &crate::memory::PageResult,
+    range: std::ops::Range<u64>,
+    aad: Option<Vec<u8>>,
+) -> (
+    Box<crate::client::direct::DecryptInto>,
+    std::fs::File,
+    CiphertextPage,
+) {
+    let source = really_sealed(pool, admission, page);
+    let ciphertext = registered(env, w, admission, &source);
+    let charge = aligned_charge(pool, admission, &ciphertext);
+    let store = pool
+        .aligned_ciphertext(charge, ciphertext.bytes().len())
+        .unwrap();
+    let mut result = page.clone();
+    result.ciphertext = ciphertext;
+    let mut sealed = crate::read::sealed::tests::sealed(&result);
+    sealed.key = racer_crypto::xaes_derive(&page_key(), &sealed.envelope.nonce.0);
+    if let Some(aad) = aad {
+        sealed.aad = aad;
+    }
+    sealed.fused_store = Some(store);
+    let file = host_memfd(4096);
+    let length = range.end - range.start;
+    let mapping = crate::client::direct::HostMapping::new(
+        &file,
+        racer_wire::object::client::Destination { offset: 0, length },
+    )
+    .unwrap();
+    let job = Box::new(crate::client::direct::DecryptInto {
+        page: Box::new(sealed),
+        range,
+        mapping: Arc::new(mapping),
+        destination: 0,
+        stored: None,
+        node: None,
+        numa: None,
+    });
+    (job, file, source)
+}
+
+fn file_bytes(file: &std::fs::File, length: usize) -> Vec<u8> {
+    use std::os::unix::fs::FileExt;
+    let mut bytes = vec![0; length];
+    file.read_exact_at(&mut bytes, 0).unwrap();
+    bytes
+}
+
+#[test]
+fn fused_host_decrypt_detaches_the_registered_page_in_the_same_pass() {
+    let env = racer_io::Env::host();
+    let (mut w, admission, page) = setup();
+    let pool = BufferPool::new(admission.clone());
+    for (range, expected) in [(0..3, &b"abc"[..]), (1..3, b"bc"), (1..2, b"b")] {
+        let (mut job, file, source) =
+            fused_job(&env, &mut w, &pool, &admission, &page, range, None);
+        let before = crate::memory::registered_copy_outs();
+        job.run().unwrap();
+        assert!(job.fused());
+        assert_eq!(file_bytes(&file, expected.len()), expected);
+        job.publish_store();
+        assert!(!job.fused());
+        assert_eq!(crate::memory::registered_copy_outs(), before + 1);
+        // The verdict's copy swaps to the detached one, so dropping the job
+        // and the report returns the registered buffer.
+        let mut report = job.page.report();
+        assert!(
+            report
+                .copy
+                .as_ref()
+                .unwrap()
+                .copy
+                .ciphertext
+                .is_registered()
+        );
+        report.prefer_retained();
+        let detached = report.copy.as_ref().unwrap().copy.ciphertext.clone();
+        assert!(!detached.is_registered());
+        assert_eq!(detached.bytes(), source.bytes());
+        assert_eq!(detached.envelope(), source.envelope());
+        assert!(detached.is_disk_aligned(crate::memory::default_disk_alignment()));
+        drop(job);
+        pump!(w);
+        assert_eq!(free(&w), Some(2), "registered buffer returned");
+        drop((report, detached, source));
+    }
+}
+
+#[test]
+fn fused_host_decrypt_failure_zeroes_the_destination_and_publishes_nothing() {
+    let env = racer_io::Env::host();
+    let (mut w, admission, page) = setup();
+    let pool = BufferPool::new(admission.clone());
+    let baseline = admission.used(ResourceClass::Ciphertext);
+    for range in [0..3, 1..2] {
+        let length = (range.end - range.start) as usize;
+        let (mut job, file, source) = fused_job(
+            &env,
+            &mut w,
+            &pool,
+            &admission,
+            &page,
+            range,
+            Some(b"tampered".to_vec()),
+        );
+        let before = crate::memory::registered_copy_outs();
+        assert_eq!(job.run().err(), Some(Error::CorruptRecord));
+        assert!(!job.fused());
+        assert_eq!(file_bytes(&file, length), vec![0; length]);
+        job.publish_store();
+        assert_eq!(crate::memory::registered_copy_outs(), before);
+        let mut report = job.page.report();
+        report.prefer_retained();
+        assert!(
+            report
+                .copy
+                .as_ref()
+                .unwrap()
+                .copy
+                .ciphertext
+                .is_registered()
+        );
+        drop((job, report, source));
+        pump!(w);
+        assert_eq!(free(&w), Some(2));
+    }
+    pool.reclaim_idle_buffers();
+    assert_eq!(admission.used(ResourceClass::Ciphertext), baseline);
+}
+
+/// One crypto helper lane on NUMA node `node`, in its own share.
+fn helper_on(
+    worker: u16,
+    node: usize,
+) -> (
+    Rc<crate::security::CryptoClient>,
+    crate::security::PageCryptoEngine,
+    Arc<crate::security::CryptoShare>,
+) {
+    use crate::lifecycle::Service as _;
+    let share = crate::security::CryptoShare::on_node(1, Some(node));
+    let (io, mut port) = crate::security::pair(
+        crate::model::WorkerId(worker),
+        1,
+        std::num::NonZeroUsize::new(4).unwrap(),
+    );
+    port.share(share.clone(), 0);
+    let mut engine = crate::security::PageCryptoEngine::new(crate::security::CryptoRuntime {
+        port,
+        ctx: racer_io::WorkerCtx::host(),
+    });
+    // Start the lane and let it find no work.
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    engine.poll_budgeted(&mut cx, 1).unwrap();
+    (
+        Rc::new(crate::security::CryptoClient::new(io)),
+        engine,
+        share,
+    )
+}
+
+/// A host-read decrypt whose destination is on another node runs on that
+/// node's helper, completes on the requester, and is counted; a job for the
+/// helper's own node, or for no node, is not forwarded.
+#[test]
+fn decrypt_into_runs_on_the_destination_nodes_helper() {
+    use crate::lifecycle::Service as _;
+    let env = racer_io::Env::host();
+    let (mut w, admission, page) = setup();
+    let pool = BufferPool::new(admission.clone());
+    let (client, mut near, near_share) = helper_on(0, 0);
+    let (_far_client, mut far, far_share) = helper_on(1, 1);
+    crate::security::CryptoShare::link(&[near_share, far_share]);
+    let metrics = crate::telemetry::Metrics::default();
+    client.set_metrics(metrics.clone());
+    let scope = crate::runtime::RequestScope::host(
+        crate::model::RequestId([1; 16]),
+        std::time::Instant::now() + std::time::Duration::from_secs(10),
+    )
+    .unwrap();
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    for (node, forwarded) in [
+        (Some(1), true),
+        (Some(0), false),
+        (None, false),
+        (Some(7), false),
+    ] {
+        let (mut job, file, _source) =
+            fused_job(&env, &mut w, &pool, &admission, &page, 0..3, None);
+        job.node = node;
+        let before = metrics.count(crate::telemetry::Event::CryptoForwardedJobs);
+        let mut future = std::pin::pin!(client.decrypt_into(job, &scope));
+        assert!(future.as_mut().poll(&mut cx).is_pending());
+        // The requester's helper either runs the job or forwards it.
+        near.poll_budgeted(&mut cx, 1).unwrap();
+        client.poll_budgeted(8).unwrap();
+        let ready = future.as_mut().poll(&mut cx);
+        assert_eq!(ready.is_pending(), forwarded, "node {node:?}");
+        let job = match ready {
+            std::task::Poll::Ready(job) => job.unwrap(),
+            std::task::Poll::Pending => {
+                far.poll_budgeted(&mut cx, 1).unwrap();
+                client.poll_budgeted(8).unwrap();
+                let std::task::Poll::Ready(job) = future.as_mut().poll(&mut cx) else {
+                    panic!("the far helper ran the forwarded job");
+                };
+                job.unwrap()
+            }
+        };
+        assert!(job.fused());
+        assert_eq!(file_bytes(&file, 3), b"abc");
+        assert_eq!(
+            metrics.count(crate::telemetry::Event::CryptoForwardedJobs),
+            before + u64::from(forwarded)
+        );
+        drop(job);
+        pump!(w);
+    }
+}
+
+/// A job forwarded to a node whose last helper then exits still runs and
+/// completes on the requester; later jobs for that node stay local.
+#[test]
+fn forwarded_decrypt_runs_when_the_target_helpers_exit() {
+    use crate::lifecycle::Service as _;
+    let env = racer_io::Env::host();
+    let (mut w, admission, page) = setup();
+    let pool = BufferPool::new(admission.clone());
+    let (client, mut near, near_share) = helper_on(0, 0);
+    let (_far_client, far, far_share) = helper_on(1, 1);
+    let mut far = Some(far);
+    crate::security::CryptoShare::link(&[near_share, far_share]);
+    let scope = crate::runtime::RequestScope::host(
+        crate::model::RequestId([1; 16]),
+        std::time::Instant::now() + std::time::Duration::from_secs(10),
+    )
+    .unwrap();
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    for exited in [false, true] {
+        let (mut job, file, _source) =
+            fused_job(&env, &mut w, &pool, &admission, &page, 0..3, None);
+        job.node = Some(1);
+        let mut future = std::pin::pin!(client.decrypt_into(job, &scope));
+        assert!(future.as_mut().poll(&mut cx).is_pending());
+        near.poll_budgeted(&mut cx, 1).unwrap();
+        if !exited {
+            client.poll_budgeted(8).unwrap();
+            assert!(future.as_mut().poll(&mut cx).is_pending(), "forwarded");
+            // The far node's only helper exits and runs the queued job.
+            drop(far.take());
+        }
+        client.poll_budgeted(8).unwrap();
+        let std::task::Poll::Ready(job) = future.as_mut().poll(&mut cx) else {
+            panic!("completed");
+        };
+        assert!(job.unwrap().fused());
+        assert_eq!(file_bytes(&file, 3), b"abc");
+        pump!(w);
+    }
 }
