@@ -43,7 +43,7 @@ func testHostNetwork() *v1alpha3.HostNetworkSpec {
 
 // networkMediaFixture is mediaFixture with a declared host network and a
 // netboot image that advertises the local installer.
-func networkMediaFixture(t *testing.T, arch string, meta string) (*MediaProvider, *v1alpha3.Machine, *v1alpha3.MachineOperation) {
+func networkMediaFixture(t *testing.T, arch, meta string) (*MediaProvider, *v1alpha3.Machine, *v1alpha3.MachineOperation) {
 	t.Helper()
 
 	p, m, op := mediaFixture(t, arch)
@@ -100,6 +100,7 @@ func TestMediaLocalInstallerISO(t *testing.T) {
 						require.NoError(t, err)
 						data, err := os.ReadFile(path)
 						require.NoError(t, err)
+
 						tree[filepath.ToSlash(rel)] = data
 
 						return nil
@@ -151,7 +152,9 @@ func TestMediaLocalInstallerISO(t *testing.T) {
 func TestMediaLocalInstallerRejectsInputs(t *testing.T) {
 	t.Run("missing localInstaller", func(t *testing.T) {
 		p, m, op := networkMediaFixture(t, "amd64", "mediaFormat: "+mediaFormat+"\n")
+
 		var calls []string
+
 		p.Run = mockMediaRunner(t, &calls)
 		_, err := p.Prepare(t.Context(), m, op, op.Status.Targets[0].BootMedia.ID)
 		require.ErrorContains(t, err, localInstallerFormat)
@@ -161,7 +164,9 @@ func TestMediaLocalInstallerRejectsInputs(t *testing.T) {
 	t.Run("https serve URL", func(t *testing.T) {
 		p, m, op := networkMediaFixture(t, "amd64", localMeta)
 		p.Resolver.ServeURL = "https://192.0.2.2:8443"
+
 		var calls []string
+
 		p.Run = mockMediaRunner(t, &calls)
 		_, err := p.Prepare(t.Context(), m, op, op.Status.Targets[0].BootMedia.ID)
 		require.ErrorContains(t, err, "plain HTTP")
@@ -173,7 +178,9 @@ func TestMediaLocalInstallerRejectsInputs(t *testing.T) {
 		// The lease address is not declared on any interface.
 		op.Status.Targets[0].BootMedia.Netboot.Network.Bonds[0].Addresses = []string{"192.0.2.21/24"}
 		require.NoError(t, p.Client.Status().Update(t.Context(), op))
+
 		var calls []string
+
 		p.Run = mockMediaRunner(t, &calls)
 		_, err := p.Prepare(t.Context(), m, op, op.Status.Targets[0].BootMedia.ID)
 		require.ErrorContains(t, err, "invalid host network")
