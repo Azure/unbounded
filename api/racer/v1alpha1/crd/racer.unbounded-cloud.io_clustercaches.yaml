@@ -272,7 +272,82 @@ spec:
                 maximum: 1000
                 minimum: 0
                 type: integer
+              writes:
+                description: |-
+                  Writes enables object writes for this cache. Clients may then create
+                  objects with PUT, which Racer stores on several nodes and, unless the
+                  upload mode is Never, uploads to spec.origin. Writes cannot be combined
+                  with passthrough, and upload modes other than Never require spec.origin.
+                  When unset, the cache is read-only.
+                properties:
+                  holdTTL:
+                    default: 24h
+                    description: |-
+                      HoldTTL is the default time a written object is kept in the cache.
+                      Auto uploads release the hold once the upload commits. It must be
+                      positive and at most 720h. When unset, 24h.
+                    type: string
+                    x-kubernetes-validations:
+                    - message: holdTTL must be positive and at most 720h
+                      rule: duration(self) > duration('0s') && duration(self) <= duration('720h')
+                  maxDirtyPercent:
+                    default: 30
+                    description: |-
+                      MaxDirtyPercent bounds the share of this cache's disk share on a node
+                      that may hold written data not yet uploaded. Writes beyond it are
+                      refused until uploads catch up. When unset, 30.
+                    format: int32
+                    maximum: 90
+                    minimum: 1
+                    type: integer
+                  replicas:
+                    default: 2
+                    description: |-
+                      Replicas is the number of nodes that must store each written page
+                      before a write is acknowledged. When unset, 2.
+                    format: int32
+                    maximum: 3
+                    minimum: 1
+                    type: integer
+                  upload:
+                    description: Upload configures uploads of written objects to the
+                      origin.
+                    properties:
+                      maxBytesPerSecond:
+                        description: |-
+                          MaxBytesPerSecond bounds upload bandwidth for this cache on each node.
+                          0 means unlimited. When unset, 0.
+                        format: int64
+                        minimum: 0
+                        type: integer
+                      maxConcurrentBlocks:
+                        default: 16
+                        description: |-
+                          MaxConcurrentBlocks bounds concurrent block uploads for this cache on
+                          each node. When unset, 16.
+                        format: int32
+                        maximum: 1024
+                        minimum: 1
+                        type: integer
+                      mode:
+                        default: Auto
+                        description: |-
+                          Mode is the default upload mode for writes that do not request one.
+                          When unset, Auto.
+                        enum:
+                        - Auto
+                        - Manual
+                        - Never
+                        type: string
+                    type: object
+                type: object
             type: object
+            x-kubernetes-validations:
+            - message: writes cannot be combined with passthrough
+              rule: '!has(self.writes) || !has(self.passthrough)'
+            - message: writes.upload.mode must be Never unless origin is set
+              rule: '!has(self.writes) || has(self.origin) || (has(self.writes.upload)
+                && has(self.writes.upload.mode) && self.writes.upload.mode == ''Never'')'
         type: object
         x-kubernetes-validations:
         - message: name must fit the canonical Unix socket path
