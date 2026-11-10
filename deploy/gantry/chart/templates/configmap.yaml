@@ -101,6 +101,7 @@ data:
     cachemesh:
       enabled: true
       content_root: {{ include "gantry.cachemeshContentRoot" $ | quote }}
+      peer_key_file: {{ include "gantry.cachemeshPeerKeyFile" $ | quote }}
       {{- range $key, $field := dict "expectedSize" "expected_size" "maxNeighbors" "max_neighbors" "chunkSize" "chunk_size" "inflightBytes" "inflight_bytes" "maxConcurrentChunkFills" "max_concurrent_chunk_fills" }}
       {{- with (index $ "Values" "gantry" "cachemesh" $key) }}
       {{ $field }}: {{ . | int64 }}

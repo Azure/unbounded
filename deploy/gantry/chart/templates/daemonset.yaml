@@ -142,6 +142,9 @@ spec:
             - name: containerd-content
               mountPath: {{ include "gantry.cachemeshContentRoot" . }}
               readOnly: true
+            - name: cachemesh-peer-key
+              mountPath: {{ include "gantry.cachemeshPeerKeyFile" . | dir }}
+              readOnly: true
             {{- end }}
       volumes:
         - name: libp2p
@@ -168,4 +171,12 @@ spec:
           hostPath:
             path: {{ include "gantry.cachemeshContentRoot" . }}
             type: Directory
+        # Shared key that authenticates cachemesh traffic between agents.
+        - name: cachemesh-peer-key
+          secret:
+            secretName: {{ include "gantry.cachemeshPeerKeySecret" . }}
+            defaultMode: 0444
+            items:
+              - key: {{ include "gantry.cachemeshPeerKeySecretKey" . }}
+                path: {{ include "gantry.cachemeshPeerKeyFile" . | base }}
         {{- end }}

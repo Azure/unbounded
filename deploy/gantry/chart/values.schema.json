@@ -405,6 +405,19 @@
             },
             "verifyDigest": {
               "type": "boolean"
+            },
+            "peerKey": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "existingSecret": {
+                  "type": "string"
+                },
+                "secretKey": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
             }
           }
         },

@@ -96,3 +96,22 @@ hosts.toml: |
   {{- include "gantry.nodeConfigDefaultHosts" . | nindent 2 }}
 {{- end }}
 {{- end }}
+
+{{- /* Secret holding the cachemesh peer key. */ -}}
+{{- define "gantry.cachemeshPeerKeySecret" -}}
+{{- dig "peerKey" "existingSecret" "" .Values.gantry.cachemesh | default "gantry-cachemesh-peer-key" -}}
+{{- end }}
+
+{{- /* Key of the cachemesh peer key in its Secret; secretKey applies only to an existing Secret. */ -}}
+{{- define "gantry.cachemeshPeerKeySecretKey" -}}
+{{- if dig "peerKey" "existingSecret" "" .Values.gantry.cachemesh -}}
+{{- dig "peerKey" "secretKey" "" .Values.gantry.cachemesh | default "peer-key" -}}
+{{- else -}}
+peer-key
+{{- end -}}
+{{- end }}
+
+{{- /* Path of the cachemesh peer key file in the agent container. */ -}}
+{{- define "gantry.cachemeshPeerKeyFile" -}}
+/etc/gantry/cachemesh/peer-key
+{{- end }}

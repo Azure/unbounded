@@ -1,0 +1,27 @@
+{{- /*
+Shared key that authenticates cachemesh traffic between agents. Rendered
+only when cachemesh is enabled and no existing Secret is named. lookup keeps
+the current key across upgrades; helm template (where lookup returns
+nothing) renders a fresh random key.
+*/ -}}
+{{- with .Values.gantry.cachemesh }}
+{{- if and .enabled (not (dig "peerKey" "existingSecret" "" .)) }}
+{{- $name := include "gantry.cachemeshPeerKeySecret" $ }}
+{{- $existing := lookup "v1" "Secret" $.Release.Namespace $name }}
+{{- $key := "" }}
+{{- if $existing }}
+{{- $key = index (default (dict) $existing.data) "peer-key" | default "" }}
+{{- end }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $name }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "gantry.labels" $ | nindent 4 }}
+type: Opaque
+data:
+  peer-key: {{ $key | default (randAlphaNum 64 | b64enc) }}
+{{- end }}
+{{- end }}

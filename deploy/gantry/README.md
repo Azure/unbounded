@@ -133,6 +133,37 @@ re-discovers another provider. `0` means unlimited.
 Use `gantry.config` only when a setting has no dedicated value; it replaces
 the entire generated configuration.
 
+## Cachemesh
+
+`gantry.cachemesh.enabled=true` turns on the cachemesh content path
+(`designs/cachemesh.md`). Agents exchange control messages, chunks, and tag
+resolutions on the transfer port (5001) under `/cachemesh/`. Every such
+request is signed with a shared key (HMAC-SHA256), and agents reject unsigned
+or badly signed requests with 401. There is no unauthenticated mode.
+
+By default the chart creates the Secret `gantry-cachemesh-peer-key` with a
+random 64-character key. Upgrades keep the existing key. `helm template`
+cannot read the cluster, so every `helm template` run renders a new key;
+when you apply rendered manifests, apply the Secret once and keep it.
+
+To manage the key yourself, set `gantry.cachemesh.peerKey.existingSecret` to
+the name of a Secret in the release namespace, and
+`gantry.cachemesh.peerKey.secretKey` (default `peer-key`) to its entry. The
+entry holds one key per line, each at least 32 bytes. The agent fails to
+start when the key file is missing, empty, or holds a short key.
+
+The first key signs and every key verifies. To rotate without downtime:
+
+1. Add the new key as the second line and restart the agents.
+2. Move the new key to the first line and restart the agents.
+3. Remove the old key and restart the agents.
+
+Agents read the key file only at startup, so each step needs a full
+rollout before the next one.
+
+The key protects against other pods on the pod network. Any holder of the
+key, such as a compromised gantry pod, is trusted as a mesh member.
+
 ## Operator Profile
 
 ```sh

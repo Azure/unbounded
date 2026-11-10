@@ -165,3 +165,12 @@ gantry:
     # Hash every full blob served through the mesh; a mismatch aborts the
     # response before its last byte and drops the cached chunks.
     verifyDigest: true
+    # Shared key that authenticates cachemesh traffic between agents
+    # (HMAC-SHA256). By default the chart creates the Secret
+    # gantry-cachemesh-peer-key with a random 64-character key and keeps it
+    # across upgrades. Set existingSecret to use a Secret you manage
+    # instead; its secretKey entry holds one key per line (at least 32
+    # bytes each). The first key signs and every key verifies.
+    peerKey:
+      existingSecret: ""
+      secretKey: peer-key
