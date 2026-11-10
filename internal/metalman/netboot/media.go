@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -23,6 +24,7 @@ import (
 	"syscall"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -86,6 +88,10 @@ func mediaInSite(media *v1alpha3.MachineOperationBootMediaStatus, site string) b
 	return media != nil && media.Site == site
 }
 
+// errMediaLookup marks an ownership lookup that failed for a transient reason,
+// such as an API server error, rather than a definite refusal.
+var errMediaLookup = errors.New("media ownership lookup failed")
+
 // callbackOwner uses the frozen lease even after cleanup, failure, or Machine
 // deletion. A running installer must still be able to cross the reboot barrier.
 // Abandonment ends callback authorization when retention expires.
@@ -96,7 +102,7 @@ func (p *MediaProvider) callbackOwner(ctx context.Context, id string) (*mediaOwn
 
 	var ops v1alpha3.MachineOperationList
 	if err := p.Client.List(ctx, &ops); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: listing machine operations: %w", errMediaLookup, err)
 	}
 
 	var owner *mediaOwner
@@ -154,7 +160,11 @@ func (p *MediaProvider) owner(ctx context.Context, id string) (*mediaOwner, erro
 
 	var current v1alpha3.Machine
 	if err := p.Client.Get(ctx, client.ObjectKey{Name: target.MachineRef}, &current); err != nil {
-		return nil, err
+		if apierrors.IsNotFound(err) {
+			return nil, fmt.Errorf("media machine deleted: %w", err)
+		}
+
+		return nil, fmt.Errorf("%w: getting machine: %w", errMediaLookup, err)
 	}
 
 	if current.UID != o.status().MachineUID || !current.DeletionTimestamp.IsZero() || current.Labels["unbounded-cloud.io/site"] != p.Site {

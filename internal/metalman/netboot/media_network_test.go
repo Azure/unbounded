@@ -5,6 +5,7 @@ package netboot
 
 import (
 	"context"
+	"errors"
 	"io/fs"
 	"net/http"
 	"os"
@@ -13,6 +14,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
@@ -291,4 +294,37 @@ func TestNetworkConfigTemplate_HostNetplan(t *testing.T) {
 	data, err = newHostTemplateData(node, ClusterInfo{}, "", "", "192.0.2.20", false)
 	require.NoError(t, err)
 	require.Equal(t, newTemplateData(node, ClusterInfo{}, "", "", "192.0.2.20", false).values(), data.values())
+}
+
+// machineGetErrClient fails Machine lookups with a fixed error.
+type machineGetErrClient struct {
+	client.Client
+	err error
+}
+
+func (c machineGetErrClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if _, ok := obj.(*v1alpha3.Machine); ok {
+		return c.err
+	}
+
+	return c.Client.Get(ctx, key, obj, opts...)
+}
+
+func TestMediaInstallEndpointLookupErrors(t *testing.T) {
+	p, _, op := networkMediaFixture(t, "amd64", localMeta)
+	p.Resolver.Cluster = &StaticClusterInfo{Info: ClusterInfo{ApiserverURL: "https://203.0.113.5:6443"}}
+	setMediaPhase(t, p, op, "Installing")
+	id := op.Status.Targets[0].BootMedia.ID
+	base := p.Client
+
+	// A transient API error asks the installer to retry.
+	p.Client = machineGetErrClient{Client: base, err: errors.New("apiserver unavailable")}
+	require.Equal(t, http.StatusServiceUnavailable, mediaRequest(p, id, http.MethodGet, "install", "192.0.2.20").Code)
+
+	// A deleted Machine is a definite refusal.
+	p.Client = machineGetErrClient{Client: base, err: apierrors.NewNotFound(schema.GroupResource{Resource: "machines"}, "host")}
+	require.Equal(t, http.StatusConflict, mediaRequest(p, id, http.MethodGet, "install", "192.0.2.20").Code)
+
+	p.Client = base
+	require.Equal(t, http.StatusOK, mediaRequest(p, id, http.MethodGet, "install", "192.0.2.20").Code)
 }

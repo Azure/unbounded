@@ -170,7 +170,9 @@ lines. Keys: `IMAGE_URL`, `SERVE_URL`, `DS_URL`, `NODE_NAME`,
 Values match `^[a-zA-Z0-9_.:/@+-]*$`; metalman refuses to serve anything else
 and the installer re-validates and ignores unknown keys. A `409 Conflict`
 means metalman refuses this boot (stale media, wrong phase); the installer
-powers off. Other failures are retried.
+powers off. Transient ownership lookup errors (API server failures other
+than not found) return `503 Service Unavailable`. Other failures, including
+503, are retried.
 
 ## Persistent rendering
 

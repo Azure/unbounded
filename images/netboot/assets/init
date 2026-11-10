@@ -567,7 +567,8 @@ parse_install() {
 
 # fetch_install retries until metalman answers. It returns 0 with the
 # instructions in $2, 3 when metalman refuses the boot (409), and 1 on a
-# permanent failure.
+# permanent failure. Other statuses, including 503 for transient metalman
+# lookup errors, are retried.
 fetch_install() {
     fi_url="$1/install"
     fi_out=$2

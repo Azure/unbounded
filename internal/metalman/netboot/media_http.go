@@ -5,6 +5,7 @@ package netboot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -505,9 +506,17 @@ func (p *MediaProvider) recordLoaderStart(ctx context.Context, o *mediaOwner) er
 
 // serveInstall answers the local installer with the same authorization as
 // grub.cfg. Where grub.cfg serves halt, this returns 409 Conflict and the
-// installer powers off.
+// installer powers off. Transient lookup failures return 503 so the installer
+// retries instead of powering off.
 func (p *MediaProvider) serveInstall(w http.ResponseWriter, r *http.Request, id string, log *slog.Logger) {
 	o, err := p.owner(r.Context(), id)
+	if errors.Is(err, errMediaLookup) {
+		log.Warn("install authorization lookup failed", "err", err)
+		http.Error(w, "install authorization unavailable", http.StatusServiceUnavailable)
+
+		return
+	}
+
 	if err != nil {
 		log.Info("refusing install because it is no longer authorized", "err", err)
 		http.Error(w, "install not authorized", http.StatusConflict)
