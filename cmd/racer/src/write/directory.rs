@@ -11,12 +11,12 @@ use crate::model::ExpiresAt;
 use crate::model::ObjectId;
 use crate::model::ObjectMetadata;
 use crate::model::ObjectVersion;
+use crate::runtime::HashMap;
 use crate::security::OriginContext;
 use racer_core::write::Phase;
 use racer_core::write::Session;
 use racer_core::write::UploadState;
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::time::Duration;
 use std::time::SystemTime;
 

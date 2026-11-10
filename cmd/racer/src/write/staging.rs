@@ -14,7 +14,7 @@
 
 use crate::memory::CiphertextCopy;
 use crate::model::PageId;
-use std::collections::HashMap;
+use crate::runtime::HashMap;
 use std::sync::Mutex;
 
 /// Staged ciphertext by page, shared by every worker of a node.
