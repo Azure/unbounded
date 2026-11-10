@@ -1,0 +1,90 @@
+<!doctype html>
+<!-- Copyright (c) Microsoft Corporation. SPDX-License-Identifier: Apache-2.0 -->
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>Gantry | Image Distribution</title>
+    <link rel="stylesheet" href="/style.css">
+    <script type="module" src="/app.js"></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="/"><span class="brand-mark"></span>GANTRY</a>
+      <span class="product">Image Distribution</span>
+      <details class="image-picker" id="image-picker">
+        <summary><span id="image-picker-label">Choose image</span> &#9662;</summary>
+        <div class="image-picker-panel">
+          <div class="sidebar-title"><h2>Registry images</h2><button id="refresh" class="icon-button" title="Refresh image catalog" aria-label="Refresh image catalog">&#8635;</button></div>
+          <div id="registry" class="registry-label">Loading registry...</div>
+          <label class="search"><span>Search images</span><input id="search" type="search" placeholder="Search repository or tag..." autocomplete="off"></label>
+          <div id="catalog-status" class="muted small" role="status">Reading ACR manifests...</div>
+          <nav id="images" class="image-list" aria-label="ACR images"></nav>
+        </div>
+      </details>
+      <div class="topbar-end"><button id="generate-image" class="generate-button" hidden>+ Generate &amp; pull</button><button id="export-timings" disabled>Export timings</button><span id="cluster-label" class="cluster-label">Connecting to Kubernetes</span><span id="connection" class="connection">Connecting</span></div>
+    </header>
+    <main>
+      <div id="error" class="notice error-notice" role="alert" hidden></div>
+      <div id="catalog-warning" class="notice warning-notice" hidden></div>
+      <section id="build-status" class="panel build-status" aria-live="polite" hidden></section>
+      <section id="welcome" class="welcome">
+        <div class="welcome-orbit"><span class="brand-mark"></span></div>
+        <p class="eyebrow">YOUR ENTIRE CLUSTER. ONE LIVE VIEW.</p>
+        <h1>Watch images move.</h1>
+        <p>Select an ACR image to deploy one Pod per Flex worker and see distribution unfold across the cluster.</p>
+        <div class="welcome-tags"><span class="badge oci">OCI images</span><span class="badge streaming">ACR Artifact Streaming</span><span class="badge">Live Pod lifecycle</span></div>
+        <p class="small muted">Selecting a new image creates a DaemonSet. Existing deployments are resumed without creating another one. Images run their default command with a 512 MiB memory limit.</p>
+      </section>
+      <div id="workspace" hidden>
+        <section class="deployment-header">
+          <div class="image-symbol"><span class="brand-mark"></span></div>
+          <div class="deployment-title"><div class="title-row"><h1 id="image-title"></h1><span id="image-kind" class="badge"></span></div><p id="image-meta" class="muted small"></p><div class="deployment-state"><span class="badge active">DaemonSet active</span><span id="deployment-name"></span></div></div>
+        </section>
+        <div class="view-tabs" role="tablist" aria-label="Deployment view">
+          <button id="distribution-tab" role="tab" aria-selected="true" aria-controls="grid-panel">Image distribution</button>
+          <button id="lifecycle-tab" role="tab" aria-selected="false" aria-controls="grid-panel">Pod lifecycle</button>
+          <button id="startup-tab" role="tab" aria-selected="false" aria-controls="grid-panel">Startup latency</button>
+          <button id="storage-tab" role="tab" aria-selected="false" aria-controls="grid-panel">Node storage</button>
+          <span id="resume-note" class="muted small">Observing existing deployment</span>
+        </div>
+        <section id="stats" class="stats" aria-label="Cluster summary"></section>
+        <div class="aggregate-scope"><span>Gantry metrics cover all images. The worker grid shows the selected deployment.</span><span id="activity-coverage">Collecting agent observations...</span></div>
+        <div class="content-layout"><div class="cluster-column">
+        <section id="grid-panel" class="panel grid-panel" role="tabpanel">
+          <div class="panel-heading">
+            <div><h2 id="grid-title">Cluster distribution</h2><span id="grid-description" class="muted small">One cell per worker. Overall image bytes available.</span><p id="grid-summary" class="small muted"></p></div>
+            <div class="grid-controls"><button id="fit">Fit all</button><button id="zoom-out" aria-label="Zoom out">−</button><button id="zoom-in" aria-label="Zoom in">+</button><select id="filter" aria-label="Highlight nodes"><option value="all">All workers</option><option value="active">In progress</option><option value="failed">Errors</option><option value="unknown">Unknown</option></select></div>
+          </div>
+          <div class="grid-scroll"><div id="grid" class="node-grid" aria-label="Worker nodes" data-empty="Waiting for worker observations..."></div></div>
+          <div class="grid-footer"><div id="legend" class="legend"></div><span id="updated" class="muted small">Waiting for observations...</span></div>
+        </section>
+        <section class="panel bandwidth-panel"><div class="panel-heading"><div><h2>Aggregate bandwidth</h2><span class="small muted">Origin + peer receive traffic across discovered Gantry agents</span></div></div><svg id="cluster-bandwidth" viewBox="0 0 640 140" role="img" aria-label="Aggregate origin and peer receive bandwidth"></svg><div class="bandwidth-legend"><span class="origin-key">Origin receive</span><span class="peer-key">Peer receive</span><span class="muted">Bytes/s · receive side only</span></div></section>
+        </div><div class="inspector-column">
+          <section id="cluster-activity" class="panel cluster-activity"></section>
+          <section id="node-detail" class="panel node-detail" hidden></section>
+          <section id="activity" class="panel activity" hidden></section>
+        </div></div>
+        <section id="timings-table-panel" class="panel timings-table-panel" hidden><div class="panel-heading"><div><h2>Worker startup timings</h2><span class="small muted">Slowest observed Created-to-Ready durations first. Select a row for detailed pull events.</span></div></div><div class="table-scroll"><table><thead><tr><th>Worker</th><th>Pod state</th><th>Scheduling</th><th>Pod readiness</th><th>Created &#8594; Ready</th><th>Restarts</th></tr></thead><tbody id="timings-table"></tbody></table></div><p class="small muted table-note">Up to 20 workers shown. Missing or unfinished timings stay unavailable. Export includes all workers' observed Pod milestones, not reconstructed pull histories.</p></section>
+      </div>
+    </main>
+    <div id="tooltip" class="tooltip" role="tooltip" hidden></div>
+    <dialog id="generate-dialog" class="generate-dialog">
+      <form id="generate-form">
+        <div class="dialog-heading"><div><p class="eyebrow">ON-DEMAND DEMO IMAGE</p><h2>Generate. Push. Watch it pull.</h2></div><button id="generate-close" type="button" aria-label="Close generation dialog">&#215;</button></div>
+        <p class="muted small">Create unique random payload layers, push the image to ACR, then start one Pod per Flex worker.</p>
+        <p id="generate-limits" class="muted small"></p>
+        <div class="generate-fields">
+          <label>Payload layers<input id="generate-layers" type="number" min="1" step="1" value="3" required></label>
+          <label>MB per payload layer<input id="generate-layer-mb" type="number" min="1" step="1" value="50" required></label>
+        </div>
+        <div id="generate-summary" class="generate-summary"></div>
+        <p class="muted small">MB means 1,000,000 bytes. Random payloads do not compress away. A small runtime base adds another layer and keeps the Pods running. Existing workloads are not removed.</p>
+        <p class="muted small">Workers need space for both stored layers and unpacked files, roughly twice the payload for these ordinary OCI images.</p>
+        <p id="generate-error" class="generation-error" role="alert" hidden></p>
+        <button id="generate-submit" class="generate-button" type="submit">Generate, push &amp; pull</button>
+      </form>
+    </dialog>
+  </body>
+</html>

@@ -1210,6 +1210,19 @@ func TestQuarantineScopesWithholdingToWhatIsActuallyInDoubt(t *testing.T) {
 		}
 	})
 
+	t.Run("an entry naming a workload withholds only that name", func(t *testing.T) {
+		source := override.Source{Key: "a.yaml", Index: 0}
+		q := quarantineFor([]override.Problem{{
+			Key: "a.yaml", Source: &source, Component: "metalman", Kind: "Deployment",
+			Name: "metalman-west", Err: errors.New("nope"),
+		}})
+
+		got := withheldNames(dropOverridableOperations(planFor(), q))
+		if len(got) != 1 || got[0] != "metalman-west" {
+			t.Fatalf("withheld = %v, want only metalman-west", got)
+		}
+	})
+
 	t.Run("an entry naming no kind withholds every kind that component emits", func(t *testing.T) {
 		source := override.Source{Key: "a.yaml", Index: 0}
 		q := quarantineFor([]override.Problem{{

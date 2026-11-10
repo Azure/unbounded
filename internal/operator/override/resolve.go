@@ -105,7 +105,8 @@ func Resolve(plan *component.Plan, entries []SourcedEntry, knownSites []string) 
 
 // matches reports whether an entry targets an operation.
 func matches(entry Entry, op component.Operation) bool {
-	if entry.Component != op.Component || entry.Kind != op.Object.GetKind() {
+	if entry.Component != op.Component || entry.Kind != op.Object.GetKind() ||
+		(entry.Name != "" && entry.Name != op.Object.GetName()) {
 		return false
 	}
 

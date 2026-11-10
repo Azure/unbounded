@@ -29,6 +29,19 @@ func validateFragment(t *testing.T, fragment string) error {
 	return ValidateErr([]SourcedEntry{entryFrom(t, fragment)})
 }
 
+func TestValidateWorkloadNames(t *testing.T) {
+	for _, name := range []string{"gantry", "gantry-overlaybd-config", "BadName", "gantry/*", "../gantry"} {
+		t.Run(name, func(t *testing.T) {
+			err := validateFragment(t, "component: gantry\nkind: DaemonSet\nname: "+name+"\npatch:\n  spec:\n    minReadySeconds: 5")
+
+			wantError := name != "gantry" && name != "gantry-overlaybd-config"
+			if (err != nil) != wantError {
+				t.Fatalf("name %q validation: %v", name, err)
+			}
+		})
+	}
+}
+
 func TestRacerOverrideTargetsControllerAndDataplane(t *testing.T) {
 	for _, tc := range []struct {
 		name, fragment string

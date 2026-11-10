@@ -585,12 +585,30 @@ wait_component_rollout() {
   # Site reconciliation is asynchronous. A successful Site apply does not
   # imply that the operator has created its component workloads yet.
   while true; do
-    found=$(kube -n unbounded-system get "$resource" --ignore-not-found -o name) \
+    found=$(kube -n unbounded-system get "$resource" --ignore-not-found -o json) \
       || die "cannot query $resource while waiting for operator reconciliation"
     [[ -z "$found" ]] || break
     ((SECONDS < deadline)) || die "operator did not create $resource before the timeout"
     sleep 5
   done
+  if jq -e '.kind == "DaemonSet" and .spec.updateStrategy.type == "OnDelete"' <<<"$found" >/dev/null; then
+    log "Waiting for $resource current-generation pods to become available"
+    while ! jq -e '
+      (.status.desiredNumberScheduled // 0) as $desired |
+      $desired > 0
+      and (.status.observedGeneration // 0) >= .metadata.generation
+      and .status.currentNumberScheduled == $desired
+      and .status.updatedNumberScheduled == $desired
+      and .status.numberReady == $desired
+      and .status.numberAvailable == $desired
+    ' <<<"$found" >/dev/null; do
+      ((SECONDS < deadline)) || die "timed out waiting for $resource current-generation pods to become available"
+      sleep 5
+      found=$(kube -n unbounded-system get "$resource" -o json) \
+        || die "cannot query $resource while waiting for readiness"
+    done
+    return
+  fi
   kube -n unbounded-system rollout status "$resource" --timeout="${TIMEOUT}s"
 }
 

@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 // knownComponents are the components that generate workloads an override can
@@ -122,6 +123,12 @@ func validateEntry(sourced SourcedEntry) []string {
 	}
 
 	problems = append(problems, validateSites(entry, known, component.perSite)...)
+
+	if entry.Name != "" {
+		for _, problem := range validation.IsDNS1123Subdomain(entry.Name) {
+			problems = append(problems, "invalid workload name: "+problem)
+		}
+	}
 
 	if !entry.HasWork() {
 		problems = append(problems, "entry changes nothing; set patch, extraArgs, or both")

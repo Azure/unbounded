@@ -1,0 +1,277 @@
+---
+title: "Gantry Web Dashboard"
+weight: 13
+description: "Watch image distribution and Pod lifecycle across a Flex worker pool."
+---
+
+The standalone Gantry dashboard discovers tagged images in an Azure Container
+Registry and creates digest-pinned demo DaemonSets on Linux Flex workers. It
+does not modify the network-topology frontend.
+
+## Run Locally
+
+Sign in to Azure with `az login`. The selected Azure identity needs permission
+to enumerate repositories, tags, manifests, and image configuration blobs in
+the registry. Authentication uses `DefaultAzureCredential`; environment and
+workload identities are supported too. Credentials remain on the server and
+are never sent to the browser.
+
+Build and run:
+
+```sh
+make gantry-ui-build
+kubectl --kubeconfig ./cluster.kubeconfig create namespace gantry-demo
+bin/gantry-ui \
+  --kubeconfig ./cluster.kubeconfig \
+  --registry example.azurecr.io \
+  --namespace gantry-demo \
+  --node-pool flexpool
+```
+
+Open `http://127.0.0.1:8088`. Starting the server is read-only. **Selecting a
+new image creates a DaemonSet and runs the image's default command on every
+matching Flex worker.** Pods have a 512 MiB memory limit, request 10m CPU and
+32 MiB memory, have no API token, and cannot gain privileges. This is a demo
+workload runner, not a production application deployment system.
+
+Use an isolated demo namespace. Worker selection requires the configured
+agentpool, `nodepool-type=FlexNodes`, Linux, and the configured architecture.
+The native AKS system node is not targeted. Set `--architecture arm64` for
+ARM64 workers. Single-platform images of another architecture are marked
+incompatible; multi-platform indexes resolve to the configured Linux platform.
+The streaming badge is based on the resolved manifest's OverlayBD annotations,
+not the repository name or the presence of a conversion operation.
+
+The Kubernetes identity running the server needs:
+
+| Scope | Resources | Verbs |
+| --- | --- | --- |
+| Cluster | `nodes` | `list` |
+| Demo namespace | `daemonsets.apps` | `get`, `list`, `create` |
+| Demo namespace | `pods`, `events` | `list` |
+| Gantry namespace | `pods` | `list` |
+| Gantry namespace, proxy mode only | `pods/proxy` | `get` |
+
+Use a kubeconfig or an appropriately scoped in-cluster service account. The
+server does not create namespaces, change registry roles, upgrade agents,
+clear caches, delete existing workloads, or replace conflicting DaemonSets.
+
+## Cluster Overview and Worker Views
+
+The full-width workspace uses a searchable **Choose image / Change image**
+picker instead of a permanent registry sidebar. With no worker selected, the
+inspector shows **Gantry cluster activity**: aggregate origin/peer receive
+bandwidth, active origin and peer layer transfers, reported origin failures,
+peer busy responses, and peer dial failures. The bandwidth chart retains the
+last minute of observed receive rates. Selecting a worker opens its detail;
+**Clear selection**, a second click on that worker, or Escape restores the
+cluster overview.
+
+Gantry aggregates cover all images on all discovered Gantry agents, including
+native agents outside the selected Flex pool. The worker grid remains scoped
+to the selected image deployment. Each agent contributes once, even with
+multiple viewers or image selections. Peer uploads are not added to peer
+downloads: these are received layer payload bytes, not wire-level TCP/TLS or
+coordination traffic. Retries count as network traffic. Peer traffic share is
+not a cache-hit rate or a claim of saved bandwidth.
+
+Rates require two fresh observations from the same agent Pod. Samples older
+than ten seconds, unreachable agents, and counter resets do not turn into
+zero-rate samples or bandwidth spikes. Reporting coverage is shown explicitly;
+partial aggregates sum known agents only. Missing source gauges stay
+unavailable until the agents are upgraded.
+
+**Image distribution** displays one cell per worker, with one overall
+byte-availability bar. Clicking a cell opens the layer breakdown. Committed
+containerd content, active ingest prefixes, and cached streaming ranges are
+observed directly. Overlapping ranges count once, including overlap with an
+in-flight complete-layer ingest. These are stored layer bytes, not unpacked
+filesystem sizes. Already cached layers count immediately; this is not a
+cache-clearing or cold-pull benchmark.
+
+**Pod lifecycle** uses the same worker ordering and shows scheduling,
+preparation, running, readiness, successful completion, and failures. The
+selected worker shows observed timestamps and Kubernetes events. Kubernetes
+does not expose a distinct unpack percentage, so preparation is labeled as a
+combined image/filesystem/container phase rather than inventing unpack
+progress. Events may expire; missing history is explicitly left unavailable.
+
+**Startup latency** shows a selected worker's scheduling, waiting-to-pull,
+image preparation, container start, and Pod readiness waterfall. Pod milestones
+use observed status timestamps. Pull stages use events fenced to that exact
+Pod UID, not events from a replacement Pod on the same node. Event-based
+durations are approximate. A kubelet-reported successful pull duration is
+shown separately and can still be displayed when the earlier Pulling event
+has expired; its plotted start position is explicitly described as anchored
+to the Pulled event.
+
+Image preparation includes runtime pull/unpack work, not just network transfer.
+Aggregated Pulling events can report attempt counts without preserving every
+attempt's timing. Exact per-attempt durations and retry backoffs are not
+invented. Cache hits are labeled only when the runtime explicitly reports
+that the image was already present. Container restarts are shown separately,
+and restarted containers are not presented as reconstructed first startups.
+Missing or unfinished stages stay unavailable rather than becoming zero.
+
+The startup view also lists up to 20 workers ordered by observed
+Created-to-Ready duration. **Export timings** downloads all workers' observed
+Pod milestones as CSV; it does not pretend to contain pull histories that
+were not collected. Build/push time is not part of Pod startup latency.
+
+For ACR Artifact Streaming, a Pod can become Ready before all bytes are
+available. Full-image completion is neither a readiness prerequisite nor
+guaranteed. The range cache is not durable across Gantry restarts, so reported
+coverage can decrease. Peer/origin traffic rates are node-wide, may include
+other images and retries, and are not used to calculate byte percentages.
+Per-layer peer/origin attribution is not currently recorded.
+
+## Agent Compatibility and Collection
+
+The **Node storage** tab shows a filesystem-usage heatmap for the workers.
+Hover a cell for used bytes, space left, and capacity; select it for the full
+breakdown, reserved space, and the observation timestamp. Zooming the grid
+shows each worker's remaining space. Colors distinguish below 85% usage,
+85-95%, and 95-100%.
+
+These are real filesystem readings from the existing host-mounted directory
+backing Gantry's identity and range cache. They include every file on that
+filesystem, not just Gantry data or the selected image, and do not inventory
+other mounted disks. Space left excludes filesystem-reserved blocks; the
+usage percentage is used bytes divided by used plus available bytes.
+Storage requires upgraded agents. Missing first observations stay unknown;
+agent timeouts retain the last reading without reachability warnings.
+
+Live byte availability requires Gantry agents built with the read-only
+`GET /v1/progress?digest=sha256:...,...` operations endpoint on port 9095.
+Released agents without this endpoint report **unknown** byte progress, with
+an upgrade-required explanation in server logs and the API; Pod lifecycle remains observable. Racer
+does not currently implement this endpoint. This feature does not fix the
+separately tracked private-origin streaming authentication or chair-wait
+follow-ups.
+
+The source-specific activity and continuous bandwidth counters require agents
+with `gantry_active_transfers{source,kind}` and
+`gantry_transfer_bytes_total{source,kind}`. Bytes update while response bodies
+are read, and active counts span request setup through a terminal body read
+or Close. They include complete pulls and on-demand range fetches. The legacy
+terminal-byte and pull-success arithmetic remains unchanged.
+`GET /v1/progress` without a digest query returns activity without accessing
+containerd content; the dashboard uses it for agents outside the worker grid.
+
+Browser updates use server-sent events. A first snapshot establishes the grid;
+subsequent worker deltas are flushed in batches at most every 100 milliseconds
+as agent observations arrive, without waiting for the slowest worker. Multiple
+viewers share one collector per deployment; collection stops when the last
+viewer disconnects. Node details use the same incrementally updated cache,
+rather than sending every layer for every worker to every browser. Collection concurrency is bounded to 256
+requests, individual agent requests to three seconds, and a collection pass
+to 25 seconds. The one-second default interval is a minimum between collection
+starts, not a promise of per-second observations on every worker. There is no
+extra interval wait after a collection that already exceeded that minimum.
+When an agent is unreachable or returns invalid progress, the grid and layer
+details retain its last successfully reported byte state until another valid
+observation arrives. Its original observation timestamp is preserved, without
+showing agent-reachability warnings in the dashboard. Diagnostics remain in
+server logs and the API. Workers that have never reported byte
+telemetry remain unknown. Fresh observations can decrease coverage, for example
+after an agent restart. Pod lifecycle observations continue updating independently.
+Very short pulls may finish between observations.
+
+The browser merges worker deltas and batches rendering on animation frames.
+Unchanged grid cells are not rewritten. Selected-worker details refresh only
+when that worker has a new observation. Retained event history is fetched on
+selection or switching to lifecycle/startup views and refreshed every five
+seconds while those views are open, not for every byte update.
+
+Local mode uses the Kubernetes Pod proxy, with bounded client QPS. For large
+clusters, prefer running the server where Gantry Pod IPs are reachable and
+passing `--direct-agents`. Direct collection avoids one API-server proxy
+request per worker. Ensure network policy permits access to the agents'
+operations port. No browser contacts agents or Azure directly.
+
+When running with host networking, the dashboard can use `dnsPolicy: Default`
+to resolve ACR through the native node's resolver. Kubernetes API access uses
+the in-cluster address, and direct agent access uses Pod IPs; neither requires
+cluster DNS names. Registry requests and agent polling use separate connection
+pools so a thousand agent endpoints do not evict ACR's reusable connections.
+Registry error messages retain the failure but strip URL query strings,
+including signed blob-access parameters.
+
+The server binds only to loopback and rejects cross-origin and non-loopback
+Host headers. For a remote server, use an authenticated SSH tunnel; for a
+server inside a Pod, use `kubectl port-forward`. Do not expose this
+workload-creation interface through an unauthenticated public proxy.
+
+## Resume and Cleanup
+
+DaemonSet identity is derived from the registry, repository, and image digest,
+so selecting the same image again reuses its deployment. Browser reloads and
+server restarts discover the existing DaemonSets and read current cluster
+state. The browser remembers its selected deployment, and its URL can be
+bookmarked. Neither reload nor reconnect creates a new deployment.
+
+Demo workloads remain running when the UI closes. To remove one deliberately:
+
+```sh
+kubectl --kubeconfig ./cluster.kubeconfig -n gantry-demo delete daemonset GANTRY_DEMO_NAME
+```
+
+## Generate Images On Demand
+
+Image generation is disabled unless builder settings are supplied. When enabled,
+**Generate & pull** asks for the number of payload layers and MB per layer,
+creates an in-cluster build Job, pushes the completed ordinary OCI image to ACR,
+and then creates its digest-pinned Flex DaemonSet. It does not convert the image
+to ACR Artifact Streaming.
+
+Limits are 100 payload layers and 100 GB (100,000 MB) total random payload. MB means
+1,000,000 bytes. Each payload layer contains independent cryptographically
+random bytes, stored without compression; tar/gzip headers and the small runtime
+base add a little overhead. The base is an additional layer. Builds stream one
+temporary layer at a time rather than holding the image in memory. Generated
+Pods run a shell sleep loop. For example, 100 layers of 1,000 MB each produce
+100 GB of payload. Workers need sufficient disk for both the stored layers and
+unpacked files, roughly twice the payload for these incompressible ordinary OCI
+images. A 100 GB payload will not fit on a 128 GB worker disk.
+
+Configure the server with:
+
+```sh
+--builder-image example.azurecr.io/gantry-ui@sha256:BUILDER_DIGEST \
+--builder-base example.azurecr.io/demo/base@sha256:BASE_DIGEST \
+--builder-service-account gantry-image-builder \
+--builder-repository gantry-demo/generated \
+--builder-concurrency 1
+```
+
+Both images must be digest-pinned in the configured ACR. The builder image must
+contain `/unbounded/bin/gantry-ui`; the single-platform Linux base must match the
+configured architecture and contain `/bin/sh` and `sleep`. Use a small BusyBox
+base mirrored into ACR. Build Jobs target native AKS system nodes of that
+architecture, not the Flex workers.
+
+Use one dashboard replica. Concurrent requests and dashboard restarts preserve
+the configured active-Job limit; separate dashboard replicas do not share an
+admission lock. Jobs have no retries, a six-hour deadline, and a one-day
+completed-Job TTL. Each uses a non-root identity, read-only root filesystem,
+bounded resources, and a writable temporary volume sized for one payload layer
+plus packaging and log headroom. The volume limit and ephemeral-storage request
+and limit scale together, including for a single 100 GB layer; the native builder
+node must have that space available. Failed builds show the sanitized error
+cause and Job name; use `kubectl logs job/NAME` in the demo namespace for full
+diagnostics.
+Already-uploaded blobs may remain after a failed build.
+
+The dashboard service account additionally needs `get`, `list`, and `create`
+on `jobs.batch`, and `get` on `pods/log`, in the demo namespace. Use a separate
+builder service account with `create` on `daemonsets.apps` in that namespace.
+Enable AKS Workload Identity, annotate the builder service account with a
+dedicated managed-identity client ID, and federate its exact service-account
+subject. Give that identity registry-scoped `AcrPush`; leave the dashboard's
+Azure identity read-only. Workload-identity tokens stay inside the build Pod.
+
+The UI shows observed Job and layer generation/upload progress and resumes an
+active build after reload. The builder creates the workload after publication;
+reading build status never creates workloads. Completed images and demo
+DaemonSets remain until deliberately removed, regardless of Job TTL or closing
+the browser.
