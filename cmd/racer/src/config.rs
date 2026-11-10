@@ -130,6 +130,8 @@ pub struct WriteSettings {
     /// Age after which an orphaned written page is released (`RACER_WRITE_ORPHAN_SECS`).
     pub orphan_after: Duration,
     /// Lifetime of an origin version alias (`RACER_WRITE_ALIAS_SECS`).
+    /// Reserved: no alias is recorded yet (see `designs/racer-writes.md`,
+    /// "WP8 as built"), so this setting has no effect.
     pub alias_ttl: Duration,
     /// Upload tries per written object (`RACER_WRITE_UPLOAD_ATTEMPTS`).
     pub upload_attempts: u32,

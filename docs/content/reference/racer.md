@@ -558,8 +558,8 @@ each worker and are never divided.
 | `RACER_WRITE_LEASE_SECS` | `60` | Node | 5..3,600 s | Write session lease; the writer renews it every third of the lease, and an expired session is aborted. |
 | `RACER_WRITE_GROUP_COMMIT_MICROS` | `500` | Node | 0..100,000 us | Longest wait to batch written pages into one durability barrier; `0` syncs each page alone. |
 | `RACER_WRITE_JOURNAL_BYTES` | `67108864` (64 MiB) | Node | 1,048,576..17,179,869,184 bytes | Write journal size per I/O worker that triggers compaction. |
-| `RACER_WRITE_ORPHAN_SECS` | `3600` | Node | 60..604,800 s | Age after which a held written page whose session is unknown to its coordinator is released. Parsed but not yet used. <!-- verify against WP8 --> |
-| `RACER_WRITE_ALIAS_SECS` | `604800` | Node | 3,600..2,592,000 s | How long an uploaded object's origin version stays mapped to its Racer version. Parsed but not yet used; no alias is kept. <!-- verify against WP8 --> |
+| `RACER_WRITE_ORPHAN_SECS` | `3600` | Node | 60..604,800 s | Age after which a held written page whose session no page-zero member knows is released. |
+| `RACER_WRITE_ALIAS_SECS` | `604800` | Node | 3,600..2,592,000 s | Reserved for mapping an uploaded object's origin version to its Racer version; not used yet. |
 | `RACER_WRITE_UPLOAD_ATTEMPTS` | `10` | Node | 1..100 | Upload tries per written object before it is marked `failed`. |
 
 #### Timeouts

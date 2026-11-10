@@ -821,14 +821,14 @@ const BASE: &[Var] = &[
         Group::Writes,
         uint(60, 604_800, SECS),
         Value("3600"),
-        "Age after which a held written page whose session is unknown to its coordinator is released.",
+        "Age after which a held written page whose session no page-zero member knows is released.",
     ),
     var(
         "RACER_WRITE_ALIAS_SECS",
         Group::Writes,
         uint(3600, 2_592_000, SECS),
         Value("604800"),
-        "How long an uploaded object's origin version stays mapped to its Racer version.",
+        "Reserved for mapping an uploaded object's origin version to its Racer version; not used yet.",
     ),
     var(
         "RACER_WRITE_UPLOAD_ATTEMPTS",
