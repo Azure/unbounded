@@ -3,7 +3,10 @@
 
 package goalstates
 
-import "github.com/Azure/unbounded/pkg/agent/config"
+import (
+	"github.com/Azure/unbounded/pkg/agent/config"
+	"github.com/Azure/unbounded/pkg/agent/isolation"
+)
 
 // RootFS defines the goal state of the machine root fs.
 // This goal state produces a rootfs that is ready for running a Kubernetes node
@@ -57,6 +60,10 @@ type RootFS struct {
 	// NSpawnLifecycle holds the configured lifecycle hook commands. Nil means
 	// the hooks run the lifecycle helper, which provisioning installs.
 	NSpawnLifecycle *config.NSpawnLifecycleConfig
+
+	// RootOverride replaces the nspawn machine root for backends that install
+	// onto the host instead of into a machine. Nil means the nspawn root.
+	RootOverride isolation.NodeRoot
 }
 
 // UsesLifecycleHelper reports whether the machine's hooks run the lifecycle

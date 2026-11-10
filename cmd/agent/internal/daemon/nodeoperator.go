@@ -5,6 +5,7 @@ package daemon
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"reflect"
 	"strings"
@@ -93,6 +94,26 @@ type ModeOperators map[isolation.Mode]ModeOperator
 // BackendFactory builds a mode's isolation backend bound to one agent
 // configuration.
 type BackendFactory func(log *slog.Logger, cfg *provision.AgentConfig) isolation.Backend
+
+// ModeBackends holds the backend factory of every isolation mode this agent
+// can operate. The agent's mode composition table builds it.
+type ModeBackends map[isolation.Mode]BackendFactory
+
+// running reports whether the node stack active records is running, by asking
+// the backend of its mode.
+func (b ModeBackends) running(ctx context.Context, log *slog.Logger, active *ActiveMachine) (bool, error) {
+	newBackend, ok := b[activeModeOf(active)]
+	if !ok || newBackend == nil {
+		return false, fmt.Errorf("this agent has no backend for isolation mode %q", activeModeOf(active))
+	}
+
+	st, err := newBackend(log, active.Config).Status(ctx, isolation.SlotName(active.Name))
+	if err != nil {
+		return false, err
+	}
+
+	return st.Running, nil
+}
 
 // hasDrift reports whether the desired AgentConfig differs from the applied
 // config in any field that would require a machine update.

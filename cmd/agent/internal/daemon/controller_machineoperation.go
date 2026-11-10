@@ -43,6 +43,10 @@ type machineOperationTarget struct {
 	// rebootRequested is set once this daemon has issued a HostSoftReboot;
 	// see reconcileHostSoftReboot.
 	rebootRequested atomic.Bool
+	// handoff is set once a reprovision runs without this daemon: the
+	// handoff resets the host, which stops and removes the daemon. Nil is
+	// never set.
+	handoff *handoffState
 }
 
 // handlers returns the MachineOperation handlers this daemon runs.
@@ -56,14 +60,14 @@ func (t *machineOperationTarget) handlers() daemon.MachineOperationHandlers {
 }
 
 // unlessStopping defers every operation once this daemon has issued a host
-// reboot or staged an agent restart. systemd stops the daemon shortly after
-// either, which would interrupt a handler partway through and could leave its
-// operation InProgress with nothing to report it. Deferred operations stay
-// Pending, and the next daemon picks them up when it starts watching.
+// reboot, staged an agent restart or handed the host to a reprovision. The
+// daemon is stopped shortly after any of them, which would interrupt a
+// handler partway through and could leave its operation InProgress with
+// nothing to report it. Deferred operations stay Pending, and the next daemon picks them up when it starts watching.
 func (t *machineOperationTarget) unlessStopping(handler daemon.MachineOperationHandler[int64]) daemon.MachineOperationHandler[int64] {
 	return func(ctx context.Context, store daemon.MachineOperationStore[int64], op daemon.MachineOperation) (ctrl.Result, error) {
-		if t.rebootRequested.Load() || t.restartRequested.Load() {
-			t.log.Info("deferring MachineOperation: this daemon is stopping for a host reboot or agent restart",
+		if t.rebootRequested.Load() || t.restartRequested.Load() || t.handoff.active() {
+			t.log.Info("deferring MachineOperation: this daemon is stopping for a host reboot, an agent restart or an isolation reprovision",
 				"operation", op.Name, "kind", op.Kind)
 
 			return ctrl.Result{}, nil

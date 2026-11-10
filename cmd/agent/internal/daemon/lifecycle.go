@@ -22,6 +22,7 @@ import (
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/agentbinary"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/isolation"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 )
 
@@ -180,6 +181,27 @@ func renderDaemonAsset(name string, content []byte) ([]byte, error) {
 	return renderDaemonAssetForPaths(name, content, paths)
 }
 
+// SupportsIsolationCommand is the agent subcommand that exits zero when the
+// binary can operate the isolation mode it is given.
+const SupportsIsolationCommand = "supports-isolation"
+
+// isolationModeConfigs lists, as "mode=path" words for the recovery script,
+// the applied config file of every mode other than nspawn. A host that has one
+// runs a node in that mode.
+func isolationModeConfigs() string {
+	var words []string
+
+	for _, loc := range goalstates.AppliedConfigLocations() {
+		if loc.Mode == isolation.ModeNSpawn {
+			continue
+		}
+
+		words = append(words, string(loc.Mode)+"="+goalstates.AppliedConfigPath(loc.Name))
+	}
+
+	return strings.Join(words, " ")
+}
+
 func renderDaemonAssetForPaths(name string, content []byte, paths goalstates.AgentUpgradePaths) ([]byte, error) {
 	data := struct {
 		DaemonUnit                   string
@@ -189,6 +211,8 @@ func renderDaemonAssetForPaths(name string, content []byte, paths goalstates.Age
 		DaemonRecoveryScriptPath     string
 		DaemonAgentUpgradeSignalPath string
 		DaemonDeferredExitCode       int
+		IsolationModeConfigs         string
+		SupportsIsolationCommand     string
 	}{
 		DaemonUnit:                   goalstates.DaemonUnit,
 		DaemonRecoveryUnit:           goalstates.DaemonRecoveryUnit,
@@ -197,6 +221,8 @@ func renderDaemonAssetForPaths(name string, content []byte, paths goalstates.Age
 		DaemonRecoveryScriptPath:     goalstates.ResolveHostPaths().DaemonRecoveryScript,
 		DaemonAgentUpgradeSignalPath: paths.SignalPath,
 		DaemonDeferredExitCode:       DeferredExitCode,
+		IsolationModeConfigs:         isolationModeConfigs(),
+		SupportsIsolationCommand:     SupportsIsolationCommand,
 	}
 
 	tmpl, err := template.New(name).Parse(string(content))
@@ -457,8 +483,11 @@ func VerifyDaemonInstalled(ctx context.Context, log *slog.Logger) error {
 
 // RepairDaemon requires the caller's installation lock. It uses current applied
 // configuration, never the original bootstrap input that may name a retired slot.
-func RepairDaemon(ctx context.Context, log *slog.Logger) error {
-	if _, err := (hostOperator{}).FindActiveMachine(log); err != nil {
+// backends is the backend of every isolation mode this agent can operate, from
+// the agent's mode composition table: with two applied configs, the daemon asks
+// them which node stack runs, and so does the repair.
+func RepairDaemon(ctx context.Context, log *slog.Logger, backends ModeBackends) error {
+	if _, err := newHostOperator(backends).settleActiveMachine(log); err != nil {
 		return err
 	}
 

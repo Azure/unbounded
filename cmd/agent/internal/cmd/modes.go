@@ -11,6 +11,8 @@ import (
 	"github.com/Azure/unbounded/cmd/agent/internal/nspawnops"
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/isolation"
+	"github.com/Azure/unbounded/pkg/agent/isolation/container"
+	"github.com/Azure/unbounded/pkg/agent/isolation/none"
 )
 
 // agentMode is everything the agent needs to operate one isolation mode: its
@@ -51,6 +53,28 @@ func agentModes() agentModeTable {
 			},
 			newPlan: func() stagePlan { return nspawnPlan{} },
 		},
+		isolation.ModeNone: {
+			// Status, Exec and Logs need no goal state; the operator builds the
+			// fully wired node for everything else.
+			newBackend: func(log *slog.Logger, _ *provision.AgentConfig) isolation.Backend {
+				return none.NewDefault(log)
+			},
+			newOperator: func(daemon.BackendFactory) daemon.ModeOperator {
+				return daemon.NoneOperator{}
+			},
+			newPlan: func() stagePlan { return &nonePlan{} },
+		},
+		// Experimental: configuredMode and the daemon refuse it unless the
+		// agent configuration opts in (Experimental.ContainerIsolation).
+		isolation.ModeContainer: {
+			newBackend: func(log *slog.Logger, _ *provision.AgentConfig) isolation.Backend {
+				return container.NewDefault(log)
+			},
+			newOperator: func(daemon.BackendFactory) daemon.ModeOperator {
+				return daemon.ContainerOperator{}
+			},
+			newPlan: func() stagePlan { return &containerPlan{} },
+		},
 	}
 }
 
@@ -88,4 +112,20 @@ func (t agentModeTable) operators() (daemon.ModeOperators, error) {
 	}
 
 	return ops, nil
+}
+
+// backends returns the backend factory of every mode in the table.
+func (t agentModeTable) backends() (daemon.ModeBackends, error) {
+	out := make(daemon.ModeBackends, len(t))
+
+	for mode := range t {
+		m, err := t.lookup(mode)
+		if err != nil {
+			return nil, err
+		}
+
+		out[mode] = m.newBackend
+	}
+
+	return out, nil
 }

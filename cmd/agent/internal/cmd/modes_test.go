@@ -58,8 +58,20 @@ func TestLookupEmptyModeIsTheDefault(t *testing.T) {
 func TestLookupRefusesAModeWithNoEntry(t *testing.T) {
 	t.Parallel()
 
-	_, err := agentModes().lookup("none")
-	require.ErrorContains(t, err, `cannot operate isolation mode "none"`)
+	_, err := agentModes().lookup("microvm")
+	require.ErrorContains(t, err, `cannot operate isolation mode "microvm"`)
+}
+
+func TestLookupNoneIsFullyWired(t *testing.T) {
+	t.Parallel()
+
+	m, err := agentModes().lookup(isolation.ModeNone)
+	require.NoError(t, err)
+
+	b := m.newBackend(slog.New(slog.DiscardHandler), &provision.AgentConfig{})
+	require.Equal(t, isolation.ModeNone, b.Mode())
+	require.IsType(t, &nonePlan{}, m.newPlan())
+	require.IsType(t, daemon.NoneOperator{}, m.newOperator(m.newBackend))
 }
 
 func TestLookupRefusesAPartlyWiredMode(t *testing.T) {
@@ -88,4 +100,5 @@ func TestOperatorsBuildsOneOperatorPerMode(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, ops, len(agentModes()))
 	require.IsType(t, daemon.NSpawnOperator{}, ops[isolation.ModeNSpawn])
+	require.IsType(t, daemon.NoneOperator{}, ops[isolation.ModeNone])
 }

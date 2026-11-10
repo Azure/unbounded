@@ -51,6 +51,10 @@ type InstallOptions struct {
 	MaxExtractedBytes int64
 	HTTPClient        *http.Client
 	ExactMember       bool
+	// Check, when set, runs on the staged candidate after it passes Verify and
+	// before any link is switched. An error refuses the candidate and leaves
+	// the running agent selected.
+	Check func(ctx context.Context, path string) error
 }
 
 // SwitchResult describes a completed blue-green binary switch.
@@ -251,6 +255,12 @@ func InstallAndSwitchFromTarGz(
 
 	if err := Verify(ctx, targetPath); err != nil {
 		return SwitchResult{}, err
+	}
+
+	if opts.Check != nil {
+		if err := opts.Check(ctx, targetPath); err != nil {
+			return SwitchResult{}, fmt.Errorf("refuse agent binary %s: %w", targetPath, err)
+		}
 	}
 
 	if !lastGoodProtected {

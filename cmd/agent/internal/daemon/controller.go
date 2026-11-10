@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync/atomic"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/fields"
@@ -26,6 +27,7 @@ import (
 	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
 	daemon "github.com/Azure/unbounded/pkg/agent/daemon"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/isolation"
 )
 
 type repaveReconciler struct {
@@ -35,6 +37,54 @@ type repaveReconciler struct {
 	machineName  string
 	nodeName     string
 	nodeOperator nodeOperator
+
+	// env is where mode changes live on the host. Nil is the real host.
+	env *migrationEnv
+	// isolationMigrator carries out a mode change. Nil is env.
+	isolationMigrator isolationMigrator
+	// handoff is shared with the MachineOperation handlers: set once a
+	// reprovision runs without this daemon, which is then about to be
+	// removed. Nil is a private flag.
+	handoff *handoffState
+	// skipChangeTo is the target of a change a settle just resolved as a
+	// failure. The repave that follows goes ahead in the current mode instead
+	// of trying the change again at once; the next repave tries it.
+	skipChangeTo isolation.Mode
+}
+
+// handoffState records that a reprovision took the host over from this daemon.
+type handoffState struct{ handedOff atomic.Bool }
+
+func (h *handoffState) set() {
+	if h != nil {
+		h.handedOff.Store(true)
+	}
+}
+
+func (h *handoffState) active() bool { return h != nil && h.handedOff.Load() }
+
+func (r *repaveReconciler) migration() *migrationEnv {
+	if r.env == nil {
+		r.env = &migrationEnv{}
+	}
+
+	return r.env
+}
+
+func (r *repaveReconciler) migrator() isolationMigrator {
+	if r.isolationMigrator != nil {
+		return r.isolationMigrator
+	}
+
+	return r.migration()
+}
+
+func (r *repaveReconciler) markHandedOff() {
+	if r.handoff == nil {
+		r.handoff = &handoffState{}
+	}
+
+	r.handoff.set()
 }
 
 func runController(
@@ -45,6 +95,7 @@ func runController(
 	nodeName string,
 	nodeOperator nodeOperator,
 	installation *installstate.Store,
+	handoff *handoffState,
 ) error {
 	mgr, err := ctrl.NewManager(restCfg, manager.Options{
 		Scheme: newScheme(),
@@ -86,6 +137,7 @@ func runController(
 		nodeOperator:         nodeOperator,
 		agentUpgradeLockPath: goalstates.DaemonAgentUpgradeLockPath,
 		requestRestart:       func() { stopManager(ErrRestartRequested) },
+		handoff:              handoff,
 	}
 
 	machineOperationReconciler, err := daemon.NewMachinaMachineOperationReconcilerWithReader(
@@ -106,6 +158,7 @@ func runController(
 		machineName:  machineName,
 		nodeName:     nodeName,
 		nodeOperator: nodeOperator,
+		handoff:      handoff,
 	}
 
 	if err := daemon.SetupController(

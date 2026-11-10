@@ -302,8 +302,9 @@ pub fn issuer_reusable(cached: &CachedIssuer, cluster: &str, now: SystemTime) ->
 }
 
 /// The issuer for a new claim: the cached one when reusable, else a new one.
-/// One issuer per process keeps the number of keyring roots bounded by the
-/// number of Pods instead of the number of claims.
+/// One issuer per process ties the number of keyring roots to process starts
+/// instead of claims. Restarts still add roots, so the primary evicts roots no
+/// seat offers once the keyring is full.
 fn seat_issuer(shared: &Shared, now: SystemTime) -> Result<Rc<SeatIssuer>, Error> {
     let cluster = shared.cluster.borrow().clone();
     let mut cache = shared.issuer.borrow_mut();

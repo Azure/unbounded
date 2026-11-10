@@ -26,6 +26,11 @@ import (
 type configureKubelet struct {
 	goalState *goalstates.NodeStart
 
+	// hostUnit, when set, names the host-native kubelet unit. The service unit
+	// itself is then left to the backend and the drop-ins are written beside
+	// that unit instead of beside the nspawn machine's kubelet.service.
+	hostUnit string
+
 	changeTracker
 }
 
@@ -55,8 +60,10 @@ func (c *configureKubelet) Do(_ context.Context) error {
 		return fmt.Errorf("ensure kubelet configuration: %w", err)
 	}
 
-	if err := c.ensureKubeletServiceUnit(); err != nil {
-		return fmt.Errorf("ensure kubelet service unit: %w", err)
+	if c.hostUnit == "" {
+		if err := c.ensureKubeletServiceUnit(); err != nil {
+			return fmt.Errorf("ensure kubelet service unit: %w", err)
+		}
 	}
 
 	if err := c.ensureKubeletDropIns(); err != nil {
@@ -77,6 +84,29 @@ func (c *configureKubelet) ensureRuntimeFolders() error {
 	}
 
 	return nil
+}
+
+// ConfigureKubeletTracked returns the task ConfigureKubelet runs with change
+// tracking, for a node stack in its own root that restarts the kubelet only
+// when this changed.
+func ConfigureKubeletTracked(goalState *goalstates.NodeStart) HostConfigTask {
+	return &configureKubelet{goalState: goalState}
+}
+
+// ConfigureKubeletOnHost returns a task that writes the kubelet configuration,
+// CA, kubeconfig and the environment drop-ins for the host-native unit named
+// unit. The unit file itself belongs to the backend.
+func ConfigureKubeletOnHost(goalState *goalstates.NodeStart, unit string) HostConfigTask {
+	return &configureKubelet{goalState: goalState, hostUnit: unit}
+}
+
+// dropInDir is where the kubelet unit's drop-ins live.
+func (c *configureKubelet) dropInDir() string {
+	if c.hostUnit == "" {
+		return goalstates.KubeletServiceDropInDir
+	}
+
+	return filepath.Join(goalstates.SystemdSystemDir, c.hostUnit+".d")
 }
 
 type startKubelet struct {
@@ -265,7 +295,7 @@ func (c *configureKubelet) ensureKubeletDropIns() error {
 			return fmt.Errorf("render %s: %w", d.name, err)
 		}
 
-		dest := c.goalState.Root().Path(filepath.Join(goalstates.KubeletServiceDropInDir, d.name))
+		dest := c.goalState.Root().Path(filepath.Join(c.dropInDir(), d.name))
 		if err := c.write(dest, buf.Bytes(), 0o644); err != nil {
 			return fmt.Errorf("write %s: %w", dest, err)
 		}
@@ -293,7 +323,7 @@ func (c *configureKubelet) ensureKubeconfig() error {
 			return err
 		}
 
-		dropInPath := c.goalState.Root().Path(filepath.Join(goalstates.KubeletServiceDropInDir, "10-kubeconfig.conf"))
+		dropInPath := c.goalState.Root().Path(filepath.Join(c.dropInDir(), "10-kubeconfig.conf"))
 
 		previousDropIn, err := os.ReadFile(dropInPath)
 		if err != nil && !errors.Is(err, os.ErrNotExist) {

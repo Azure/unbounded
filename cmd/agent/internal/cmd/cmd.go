@@ -34,8 +34,13 @@ func Run() {
 		newCmdReset(cmdCtx),
 		newCmdVersion(),
 		newCmdNSpawnLifecycle(cmdCtx),
+		newCmdNodeLifecycle(cmdCtx),
 		newCmdHostAgentUpgrade(cmdCtx),
 		newCmdRecordAgentUpgradeFailureSignal(),
+		newCmdExec(cmdCtx),
+		newCmdLogs(cmdCtx),
+		newCmdSupportsIsolation(),
+		newCmdIsolationReprovision(cmdCtx),
 	)
 
 	if err := root.Execute(); err != nil {

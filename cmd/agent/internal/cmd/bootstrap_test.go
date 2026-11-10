@@ -5,6 +5,7 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,10 +17,12 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/Azure/unbounded/cmd/agent/internal/hostnode"
 	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/isolation"
+	"github.com/Azure/unbounded/pkg/agent/phases"
 	"github.com/Azure/unbounded/pkg/agent/preflight"
 )
 
@@ -281,6 +284,15 @@ func TestBootstrapIdentity_DefaultModeKeepsTheFingerprint(t *testing.T) {
 	explicit, err := bootstrapIdentity(cfg)
 	require.NoError(t, err)
 	require.Equal(t, unset, explicit)
+
+	// Another mode is another installation: a host installed in nspawn refuses
+	// a start in none until it is reset, instead of building a second node
+	// stack beside the first.
+	cfg.Isolation = "none"
+	other, err := bootstrapIdentity(cfg)
+	require.NoError(t, err)
+	require.NotEqual(t, unset.ConfigFingerprint, other.ConfigFingerprint)
+	require.Equal(t, unset.MachineName, other.MachineName)
 }
 
 func TestConfiguredMode(t *testing.T) {
@@ -294,9 +306,13 @@ func TestConfiguredMode(t *testing.T) {
 		require.Equal(t, isolation.ModeNSpawn, mode, value)
 	}
 
+	mode, err = configuredMode(&provision.UnboundedAgentConfig{AgentConfig: provision.AgentConfig{Isolation: "none"}})
+	require.NoError(t, err)
+	require.Equal(t, isolation.ModeNone, mode)
+
 	// A mode this agent has no table entry for is refused, and so is the
 	// bootstrap plan for it.
-	for _, value := range []string{"none", "container", "microvm"} {
+	for _, value := range []string{"microvm"} {
 		cfg := &provision.UnboundedAgentConfig{AgentConfig: provision.AgentConfig{Isolation: value}}
 
 		_, err = configuredMode(cfg)
@@ -304,5 +320,57 @@ func TestConfiguredMode(t *testing.T) {
 
 		_, err = (&agentStages{cfg: cfg}).plan()
 		require.Error(t, err, value)
+	}
+
+	// The experimental container mode runs only with the opt-in.
+	container := &provision.UnboundedAgentConfig{AgentConfig: provision.AgentConfig{Isolation: "container"}}
+
+	_, err = configuredMode(container)
+	require.ErrorContains(t, err, "experimental")
+
+	_, err = (&agentStages{cfg: container}).plan()
+	require.ErrorContains(t, err, "experimental")
+
+	container.Experimental = &provision.ExperimentalConfig{ContainerIsolation: true}
+
+	mode, err = configuredMode(container)
+	require.NoError(t, err)
+	require.Equal(t, isolation.ModeContainer, mode)
+}
+
+func TestRecordAttestation(t *testing.T) {
+	failing := func(*slog.Logger, *provision.AgentAttestConfig) phases.Task {
+		return hostnode.Func("persist-attest-config", func(context.Context) error { return errors.New("disk full") })
+	}
+
+	tests := []struct {
+		name    string
+		mode    string
+		persist func(*slog.Logger, *provision.AgentAttestConfig) phases.Task
+		wantErr string
+	}{
+		{name: "recorded", mode: "none", persist: func(*slog.Logger, *provision.AgentAttestConfig) phases.Task {
+			return hostnode.Func("persist-attest-config", func(context.Context) error { return nil })
+		}},
+		{name: "an nspawn host only warns", mode: "", persist: failing},
+		{name: "an explicit nspawn host only warns", mode: "nspawn", persist: failing},
+		{name: "a none host fails", mode: "none", persist: failing, wantErr: "disk full"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &provision.UnboundedAgentConfig{Attest: &provision.AgentAttestConfig{URL: "http://10.0.0.1:8880"}}
+			cfg.Isolation = tt.mode
+
+			s := &agentStages{log: slog.New(slog.DiscardHandler), cfg: cfg, persistAttest: tt.persist}
+
+			err := s.recordAttestation(context.Background())
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+				return
+			}
+
+			require.NoError(t, err)
+		})
 	}
 }

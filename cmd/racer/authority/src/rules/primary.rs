@@ -70,7 +70,8 @@ pub struct PassInputs<'a> {
     pub previous_image: Option<&'a Image>,
     /// Live seats by index.
     pub live: &'a BTreeMap<usize, LeaseObservation>,
-    /// Seats whose Lease could not be read this pass.
+    /// Seats whose Lease could not be read this pass. While any is unread,
+    /// `live` may miss a live seat, so keyring roots are not evicted.
     pub unread: &'a BTreeSet<usize>,
     pub writer: &'a Writer,
     /// Wall clock, Unix seconds.
@@ -109,8 +110,10 @@ pub struct PassPlan {
     pub desired: usize,
     pub eligible: usize,
     pub changed: bool,
-    /// Root offers refused because the keyring root slots are full.
+    /// Root offers refused because offered roots fill every keyring root slot,
+    /// or because eviction waits for every seat Lease to be read.
     pub refused_roots: usize,
+    /// Unoffered roots evicted to admit offers when the root slots were full.
     pub evicted_roots: usize,
     /// Names of ClusterCaches left out for an invalid `spec.nodeSelector`.
     pub rejected_caches: Vec<String>,

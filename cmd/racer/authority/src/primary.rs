@@ -525,7 +525,7 @@ async fn read_seats(t: &Term_) -> SeatSnapshot {
     for i in 0..annotations::MAX_SEATS {
         let v = match lease::get(&t.shared.lease_api, ns, &annotations::seat_lease(i)).await {
             Ok(v) => v,
-            Err(KubeError::NotFound) => continue,
+            Err(e) if seat_read_complete(&e) => continue,
             Err(_) => {
                 unread.insert(i);
                 continue;
@@ -536,6 +536,12 @@ async fn read_seats(t: &Term_) -> SeatSnapshot {
         holders.insert(i, (o, v));
     }
     SeatSnapshot { holders, unread }
+}
+
+/// A failed seat Lease read still counts as read only when the Lease does
+/// not exist.
+fn seat_read_complete(e: &KubeError) -> bool {
+    matches!(e, KubeError::NotFound)
 }
 
 fn live_seats(t: &Term_, s: &SeatSnapshot) -> BTreeMap<usize, LeaseObservation> {
@@ -674,17 +680,15 @@ async fn reconcile(t: &Rc<Term_>) -> Result<(), StateError> {
                 }
                 if plan.evicted_roots > 0 {
                     eprintln!(
-                        "racer: keyring full; evicted {} departed issuer root(s) early",
+                        "racer: keyring root slots full; evicted {} root(s) no seat offers",
                         plan.evicted_roots
                     );
                 }
+                log_refused_roots(plan.refused_roots);
                 if plan.refused_roots > 0 {
-                    // Every root slot holds an offered root. Those seats stay
-                    // unready until slots free up.
-                    eprintln!(
-                        "racer: keyring full; refused {} issuer root offer(s)",
-                        plan.refused_roots
-                    );
+                    // Offered roots fill every slot, or eviction waits for
+                    // every seat Lease to be read. Those seats stay unready
+                    // until slots free up.
                     shared.last_error.set(Some(crate::Error::Unavailable));
                 }
                 let PassPlan {
@@ -989,6 +993,25 @@ pub async fn reconcile_webhook(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_not_found_seat_reads_are_complete() {
+        use super::seat_read_complete;
+        use crate::kube::KubeError;
+        assert!(seat_read_complete(&KubeError::NotFound));
+        for e in [
+            KubeError::Conflict,
+            KubeError::Gone,
+            KubeError::Unauthorized,
+            KubeError::Forbidden,
+            KubeError::Invalid,
+            KubeError::TooLarge,
+            KubeError::Throttled,
+            KubeError::Unavailable,
+        ] {
+            assert!(!seat_read_complete(&e));
+        }
+    }
+
     #[test]
     fn ready_floor_grace() {
         use super::ready_floor;
@@ -1337,6 +1360,17 @@ mod seat_ready_tests {
         assert!(!seat_ready(Some("x"), Some(5), Some(4)));
         assert!(!seat_ready(Some("6"), Some(5), Some(4)));
         assert!(!seat_ready(Some("5"), None, Some(4)));
+    }
+}
+
+/// Logs refused roots when the count changes; refusal persists across passes
+/// while every slot is offered.
+fn log_refused_roots(refused: usize) {
+    thread_local! {
+        static LAST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+    if LAST.replace(refused) != refused && refused > 0 {
+        eprintln!("racer: keyring root slots full; refused {refused} offered root(s)");
     }
 }
 

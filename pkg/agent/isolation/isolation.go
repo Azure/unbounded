@@ -31,6 +31,12 @@ const (
 	// ModeNSpawn runs the node stack in a systemd-nspawn machine. It is the
 	// default, and the mode of every host that has no recorded mode.
 	ModeNSpawn Mode = "nspawn"
+	// ModeNone runs the node stack as agent-owned units directly on the host.
+	ModeNone Mode = "none"
+	// ModeContainer runs the node stack in a privileged OCI container
+	// supervised by an agent-owned systemd unit. It is experimental: the agent
+	// operates it only when its configuration opts in.
+	ModeContainer Mode = "container"
 )
 
 // DefaultMode is the mode used when none is configured or recorded.
@@ -46,10 +52,10 @@ func ParseMode(s string) (Mode, error) {
 	switch m := Mode(s); m {
 	case "":
 		return DefaultMode, nil
-	case ModeNSpawn:
+	case ModeNSpawn, ModeNone, ModeContainer:
 		return m, nil
 	default:
-		return "", fmt.Errorf("unsupported isolation mode %q (supported: %s)", s, ModeNSpawn)
+		return "", fmt.Errorf("unsupported isolation mode %q (supported: %s, %s, %s)", s, ModeNSpawn, ModeNone, ModeContainer)
 	}
 }
 

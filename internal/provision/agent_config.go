@@ -26,6 +26,7 @@ type (
 	RuncConfig              = config.RuncConfig
 	CNIConfig               = config.CNIConfig
 	AgentOfflineArtifacts   = config.AgentOfflineArtifacts
+	ExperimentalConfig      = config.ExperimentalConfig
 )
 
 // UnboundedAgentConfig extends the shared AgentConfig with unbounded-specific
@@ -127,6 +128,12 @@ type BuildAgentConfigParams struct {
 	// NodeName overrides the Kubernetes Node name used by kubelet. When empty,
 	// the agent resolves the node name from the host hostname.
 	NodeName string
+
+	// ExperimentalContainerIsolation opts the agent in to the experimental
+	// container isolation mode (Experimental.ContainerIsolation). It is set
+	// for every Machine the caller provisions, not only for one that declares
+	// container, so a node can later be changed to that mode at a repave.
+	ExperimentalContainerIsolation bool
 }
 
 // BuildAgentConfig constructs an AgentConfig from a Machine and cluster-level
@@ -184,7 +191,7 @@ func BuildAgentConfig(params BuildAgentConfigParams) UnboundedAgentConfig {
 
 	if machine.Spec.Agent != nil {
 		if machine.Spec.Agent.Downloads != nil {
-			downloads = agentDownloadsFromSpec(machine.Spec.Agent.Downloads)
+			downloads = AgentDownloadsFromSpec(machine.Spec.Agent.Downloads)
 		}
 
 		if machine.Spec.Agent.LocalDNS != nil {
@@ -220,6 +227,10 @@ func BuildAgentConfig(params BuildAgentConfigParams) UnboundedAgentConfig {
 		cfg.Attest = &AgentAttestConfig{URL: params.AttestURL}
 	}
 
+	if params.ExperimentalContainerIsolation {
+		cfg.Experimental = &ExperimentalConfig{ContainerIsolation: true}
+	}
+
 	return cfg
 }
 
@@ -253,10 +264,10 @@ func LocalDNSFromSpec(spec *v1alpha3.LocalDNSSpec) *config.AgentLocalDNSConfig {
 	}
 }
 
-// agentDownloadsFromSpec converts the Machine API AgentDownloadsSpec into
+// AgentDownloadsFromSpec converts the Machine API AgentDownloadsSpec into
 // the agent-facing AgentDownloads config. Returns nil if every entry is
 // unset, so the resulting JSON config remains minimal.
-func agentDownloadsFromSpec(spec *v1alpha3.AgentDownloadsSpec) *AgentDownloads {
+func AgentDownloadsFromSpec(spec *v1alpha3.AgentDownloadsSpec) *AgentDownloads {
 	if spec == nil {
 		return nil
 	}

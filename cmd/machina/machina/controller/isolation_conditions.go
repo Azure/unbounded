@@ -12,6 +12,7 @@ import (
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/machineops"
+	"github.com/Azure/unbounded/internal/provision"
 )
 
 // Reasons for the IsolationDrift condition.
@@ -23,6 +24,7 @@ const (
 	isolationReasonChangeRefused  = "ChangeRefused"
 	isolationReasonChangeProgress = "ChangeInProgress"
 	isolationReasonChangeStale    = "ChangeStale"
+	isolationReasonExperimental   = "ExperimentalModeDisabled"
 )
 
 // isolationChangeStaleAfter is how long a change may stay InProgress before
@@ -44,7 +46,11 @@ const isolationChangeStaleAfter = 2 * time.Hour
 // present only once the agent has reported status.isolation, and the
 // controller never acts on it. status.isolationChange refines the reason while
 // it is about the mode the spec declares.
-func syncIsolationConditions(machine *unboundedv1alpha3.Machine, now time.Time) (bool, time.Duration) {
+//
+// containerEnabled reports whether this machina enables the experimental
+// container mode. When it does not, a declared container is reported as
+// refused by machina, whatever the agent says.
+func syncIsolationConditions(machine *unboundedv1alpha3.Machine, now time.Time, containerEnabled bool) (bool, time.Duration) {
 	observed := machine.Status.Isolation
 	if observed == "" {
 		return apimeta.RemoveStatusCondition(&machine.Status.Conditions, unboundedv1alpha3.MachineConditionIsolationDrift), 0
@@ -70,6 +76,13 @@ func syncIsolationConditions(machine *unboundedv1alpha3.Machine, now time.Time) 
 		cond.Status = metav1.ConditionTrue
 		cond.Reason = isolationReasonDrift
 		cond.Message = fmt.Sprintf("spec.isolation is %q but the applied isolation is %q; the node changes at its next repave", declared, observed)
+
+		if err := checkIsolationEnabled(declared, containerEnabled); err != nil {
+			cond.Reason = isolationReasonExperimental
+			cond.Message = fmt.Sprintf("%v; the node keeps running %q", err, observed)
+
+			break
+		}
 
 		if change := machine.Status.IsolationChange; change != nil && change.TargetMode == declared {
 			recheck = describeIsolationChange(machine, change, &cond, now)
@@ -98,6 +111,12 @@ func describeIsolationChange(
 		case unboundedv1alpha3.IsolationChangeReasonReprovisionNotAllowed:
 			cond.Reason = isolationReasonChangeRefused
 			cond.Message = refusedReprovisionMessage(machine, change)
+		case unboundedv1alpha3.IsolationChangeReasonExperimentalNotEnabled:
+			cond.Reason = isolationReasonChangeRefused
+			cond.Message = fmt.Sprintf("the agent refused the change to the experimental isolation %q and the node still runs %q: %s; "+
+				"the agent configuration on the host must set Experimental.ContainerIsolation, which machina writes when "+
+				"experimentalContainerIsolation is enabled and the host is provisioned again",
+				declared, observed, change.Message)
 		case unboundedv1alpha3.IsolationChangeReasonUnsupportedMode:
 			cond.Reason = isolationReasonChangeRefused
 			cond.Message = fmt.Sprintf("the agent refused the change to isolation %q and the node still runs %q: %s; "+
@@ -162,4 +181,12 @@ func setConditionIfChanged(machine *unboundedv1alpha3.Machine, cond metav1.Condi
 	apimeta.SetStatusCondition(&machine.Status.Conditions, cond)
 
 	return true
+}
+
+// checkIsolationEnabled returns an error when mode is experimental and this
+// machina does not enable it. Machina then neither provisions a host in that
+// mode nor reports a pending change to it as on its way.
+func checkIsolationEnabled(mode unboundedv1alpha3.IsolationMode, containerEnabled bool) error {
+	return provision.CheckIsolationEnabled(mode, containerEnabled, "machina",
+		"set experimentalContainerIsolation: true in the machina configuration")
 }

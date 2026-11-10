@@ -588,9 +588,13 @@ spec:
                   already uses. Setting it does not move a running node: the node changes
                   to this mode at its next repave, which the agent performs when the Node
                   is deleted. The enum lists only the modes this release can run.
+                  container is experimental: machina provisions it, and the agent runs
+                  it, only when explicitly enabled (see the isolation reference docs).
                 enum:
                 - ""
                 - nspawn
+                - none
+                - container
                 type: string
               kubernetes:
                 description: Kubernetes contains Kubernetes-specific configuration.
@@ -1058,6 +1062,8 @@ spec:
                 enum:
                 - ""
                 - nspawn
+                - none
+                - container
                 type: string
               isolationChange:
                 description: |-

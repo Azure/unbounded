@@ -7,7 +7,9 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -578,5 +580,64 @@ func assertSecureUpgradeLink(t *testing.T, path, want string) {
 
 	if got != want {
 		t.Fatalf("resolved %s = %s, want %s", path, got, want)
+	}
+}
+
+// A candidate the caller's check refuses is never selected: the running agent
+// stays current and last-good keeps pointing at it. A candidate the check
+// accepts is selected as usual.
+func TestInstallAndSwitchFromTarGzRunsTheCandidateCheck(t *testing.T) {
+	t.Parallel()
+
+	for name, refuse := range map[string]bool{"refused": true, "accepted": false} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			paths := secureUpgradeReadyPaths(t)
+			payload := secureUpgradeArchive(t, "custom-agent", []byte("#!/bin/sh\nexit 0\n"))
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write(payload)
+			}))
+			t.Cleanup(server.Close)
+
+			var checked string
+
+			_, err := InstallAndSwitchFromTarGz(t.Context(), slog.Default(), paths, InstallOptions{
+				DownloadURL:    server.URL + "/agent.tar.gz",
+				ExpectedMember: "custom-agent",
+				ExactMember:    true,
+				HTTPClient:     server.Client(),
+				Check: func(_ context.Context, path string) error {
+					checked = path
+
+					if refuse {
+						return errors.New("cannot operate isolation mode none")
+					}
+
+					return nil
+				},
+			})
+
+			if checked != paths.GreenPath {
+				t.Fatalf("check ran on %q, want the staged candidate %q", checked, paths.GreenPath)
+			}
+
+			if refuse {
+				if err == nil || !strings.Contains(err.Error(), "cannot operate isolation mode none") {
+					t.Fatalf("err = %v", err)
+				}
+
+				assertSecureUpgradeLink(t, paths.CurrentPath, paths.BluePath)
+				assertSecureUpgradeLink(t, paths.LastGoodPath, paths.BluePath)
+
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("InstallAndSwitchFromTarGz: %v", err)
+			}
+
+			assertSecureUpgradeLink(t, paths.CurrentPath, paths.GreenPath)
+		})
 	}
 }

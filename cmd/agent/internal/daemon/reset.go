@@ -14,11 +14,14 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/Azure/unbounded/cmd/agent/internal/containerops"
 	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
+	"github.com/Azure/unbounded/cmd/agent/internal/noneops"
 	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/internal/fsutil"
 	"github.com/Azure/unbounded/internal/hostroot"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/isolation/none"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 	"github.com/Azure/unbounded/pkg/agent/phases/reset"
 )
@@ -28,6 +31,13 @@ import (
 // that ordering stays with the caller.
 func ResetAgent(log *slog.Logger) phases.Task {
 	return ownedReset(log, installstate.DefaultStore(), phases.Serial(log, StopDaemon(log), resetResources(log)))
+}
+
+// ResetAgentForReprovision is ResetAgent for the reprovision handoff: it leaves
+// the handoff's unit, binary, configuration and journal in place, since the
+// handoff runs from them.
+func ResetAgentForReprovision(log *slog.Logger) phases.Task {
+	return ownedReset(log, installstate.DefaultStore(), phases.Serial(log, StopDaemon(log), resetNodeResources(log)))
 }
 
 type lifecycleTask struct {
@@ -106,6 +116,7 @@ func teardownSyncPaths(storeRoot string) []string {
 		filepath.Dir(hostroot.Path),
 		hostroot.Resolve(),
 		hostroot.LegacyPath,
+		none.DefaultBase,
 		storeRoot,
 	}
 }
@@ -165,33 +176,129 @@ func durableReset(ctx context.Context, store *installstate.Store, inner phases.T
 	return store.Remove()
 }
 
+// hostNodeTeardown is the reset path of a node that does not run in an nspawn
+// machine: the tasks that slot into the positions of the machine tasks they
+// replace.
+type hostNodeTeardown interface {
+	Stop() phases.Task
+	RemoveConfig() phases.Task
+	Destroy() phases.Task
+}
+
+// resetHost decides which node teardowns a reset runs on this host.
+type resetHost struct {
+	// nonePresent reports whether the host has traces of a none node: the
+	// agent's layout directory or one of its units.
+	nonePresent func() bool
+	// noneTeardown is the none node's teardown.
+	noneTeardown func(log *slog.Logger) hostNodeTeardown
+	// containerPresent reports whether the host has traces of a container
+	// node: the agent's container layout directory or a slot's unit.
+	containerPresent func() bool
+	// containerTeardown is the container node's teardown.
+	containerTeardown func(log *slog.Logger) hostNodeTeardown
+}
+
+func defaultResetHost() resetHost {
+	return resetHost{
+		nonePresent: noneops.Present,
+		noneTeardown: func(log *slog.Logger) hostNodeTeardown {
+			return &noneops.Teardown{Log: log, Layout: none.Layout{}}
+		},
+		containerPresent: containerops.Present,
+		containerTeardown: func(log *slog.Logger) hostNodeTeardown {
+			return &containerops.Teardown{Log: log}
+		},
+	}
+}
+
+// presentTeardowns returns the teardown of every non-nspawn mode whose traces
+// are on the host, in a fixed order.
+func (h resetHost) presentTeardowns(log *slog.Logger) []hostNodeTeardown {
+	var out []hostNodeTeardown
+
+	for _, m := range []struct {
+		present  func() bool
+		teardown func(*slog.Logger) hostNodeTeardown
+	}{
+		{h.nonePresent, h.noneTeardown},
+		{h.containerPresent, h.containerTeardown},
+	} {
+		if m.present != nil && m.teardown != nil && m.present() {
+			out = append(out, m.teardown(log))
+		}
+	}
+
+	return out
+}
+
+// resetResources is the whole reset: the node and everything the agent
+// installed, and what a reprovision left behind.
 func resetResources(log *slog.Logger) phases.Task {
-	return phases.Serial(log,
-		RemoveDaemonUnit(log),
-		phases.Parallel(log,
-			reset.StopMachine(log, goalstates.NSpawnMachineKube1),
-			reset.StopMachine(log, goalstates.NSpawnMachineKube2),
-		),
-		reset.RemoveWireGuardKeys(log),
-		phases.Parallel(log,
-			reset.RemoveNSpawnConfig(log, goalstates.NSpawnMachineKube1),
-			reset.RemoveNSpawnConfig(log, goalstates.NSpawnMachineKube2),
-		),
-		phases.Parallel(log,
-			reset.RemoveMachine(log, goalstates.NSpawnMachineKube1),
-			reset.RemoveMachine(log, goalstates.NSpawnMachineKube2),
-		),
+	return phases.Serial(log, resetNodeResources(log), RemoveReprovisionHandoff(log))
+}
+
+// resetNodeResources is the reset without the reprovision handoff's files.
+func resetNodeResources(log *slog.Logger) phases.Task {
+	return resetResourcesOn(log, defaultResetHost())
+}
+
+// resetResourcesOn builds the reset sequence. The nspawn teardown always runs:
+// every step of it is idempotent, so it is harmless on a host with no machine,
+// and it is never skipped on the strength of a config that could be stale or
+// damaged. A mode's own teardown runs in addition, only when the host has that
+// mode's traces (its own units or directory), whatever the applied config says
+// or fails to say. A teardown therefore never runs on a host that has nothing
+// of its mode, so it never touches what another installation owns.
+//
+// The order is the same for every mode: daemon unit, stop, WireGuard keys,
+// config, node, bpffs, network and routes, nftables flush unit, bootstrap unit,
+// artifacts, systemd reload. Each mode's tasks sit in the position of the nspawn task they
+// correspond to.
+func resetResourcesOn(log *slog.Logger, h resetHost) phases.Task {
+	present := h.presentTeardowns(log)
+
+	withModes := func(nspawn phases.Task, pick func(hostNodeTeardown) phases.Task) []phases.Task {
+		out := []phases.Task{nspawn}
+		for _, t := range present {
+			out = append(out, pick(t))
+		}
+
+		return out
+	}
+
+	tasks := []phases.Task{RemoveDaemonUnit(log)}
+	tasks = append(tasks, withModes(phases.Parallel(log,
+		reset.StopMachine(log, goalstates.NSpawnMachineKube1),
+		reset.StopMachine(log, goalstates.NSpawnMachineKube2),
+	), hostNodeTeardown.Stop)...)
+	tasks = append(tasks, reset.RemoveWireGuardKeys(log))
+	tasks = append(tasks, withModes(phases.Parallel(log,
+		reset.RemoveNSpawnConfig(log, goalstates.NSpawnMachineKube1),
+		reset.RemoveNSpawnConfig(log, goalstates.NSpawnMachineKube2),
+	), hostNodeTeardown.RemoveConfig)...)
+	tasks = append(tasks, withModes(phases.Parallel(log,
+		reset.RemoveMachine(log, goalstates.NSpawnMachineKube1),
+		reset.RemoveMachine(log, goalstates.NSpawnMachineKube2),
+	), hostNodeTeardown.Destroy)...)
+	tasks = append(tasks,
 		phases.Parallel(log,
 			reset.RemoveBPFFSMount(log, goalstates.NSpawnMachineKube1),
 			reset.RemoveBPFFSMount(log, goalstates.NSpawnMachineKube2),
 		),
 		reset.CleanupNetwork(log),
+		// Every mode installs it, and the none and container variants run on
+		// every boot, so it is host-global rather than part of a mode's
+		// teardown. reload-systemd below picks up the removal.
+		reset.RemoveNFTablesFlush(log),
 		// Before the artifacts, so a failure stops the reset while the host is
 		// still recognizably installed.
 		RemoveFirstBootBootstrapUnit(log),
 		RemoveAgentArtifacts(log),
 		reset.ReloadSystemd(log),
 	)
+
+	return phases.Serial(log, tasks...)
 }
 
 func releaseInstallationLock(log *slog.Logger, lock *installstate.Lock) {

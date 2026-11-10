@@ -25,12 +25,11 @@ import (
 	"github.com/Azure/unbounded/internal/machineops"
 )
 
-// The API of this release declares only nspawn. A newer CRD, or an agent
-// reporting a refused change, can still carry other names, so the drift logic
-// treats modes as opaque strings.
+// The drift logic treats modes as opaque strings: a newer CRD, or an agent
+// reporting a refused change, can carry names this release does not declare.
 const (
-	isolationNone      unboundedv1alpha3.IsolationMode = "none"
-	isolationContainer unboundedv1alpha3.IsolationMode = "container"
+	isolationNone      = unboundedv1alpha3.IsolationNone
+	isolationContainer = unboundedv1alpha3.IsolationContainer
 )
 
 // testNow is the clock for condition tests.
@@ -39,7 +38,7 @@ var testNow = time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
 // syncIso runs syncIsolationConditions at testNow and returns whether it
 // changed anything.
 func syncIso(m *unboundedv1alpha3.Machine) bool {
-	changed, _ := syncIsolationConditions(m, testNow)
+	changed, _ := syncIsolationConditions(m, testNow, true)
 
 	return changed
 }
@@ -273,7 +272,7 @@ func TestSyncIsolationConditions_StaleInProgress(t *testing.T) {
 
 	// Recent: in progress, with a recheck when it would turn stale.
 	m := inProgress(testNow.Add(-30 * time.Minute))
-	changed, recheck := syncIsolationConditions(m, testNow)
+	changed, recheck := syncIsolationConditions(m, testNow, true)
 	require.True(t, changed)
 	require.Equal(t, "ChangeInProgress", cond(m, unboundedv1alpha3.MachineConditionIsolationDrift).Reason)
 	require.Equal(t, isolationChangeStaleAfter-30*time.Minute, recheck)
@@ -281,7 +280,7 @@ func TestSyncIsolationConditions_StaleInProgress(t *testing.T) {
 	// Exactly at the threshold and beyond: stale, no more rechecks.
 	for _, age := range []time.Duration{isolationChangeStaleAfter, 3 * isolationChangeStaleAfter} {
 		m = inProgress(testNow.Add(-age))
-		changed, recheck = syncIsolationConditions(m, testNow)
+		changed, recheck = syncIsolationConditions(m, testNow, true)
 		require.True(t, changed)
 
 		c := cond(m, unboundedv1alpha3.MachineConditionIsolationDrift)
@@ -294,14 +293,14 @@ func TestSyncIsolationConditions_StaleInProgress(t *testing.T) {
 	// No transition time: cannot age, so it stays in progress without a
 	// recheck.
 	m = inProgress(time.Time{})
-	_, recheck = syncIsolationConditions(m, testNow)
+	_, recheck = syncIsolationConditions(m, testNow, true)
 	require.Equal(t, "ChangeInProgress", cond(m, unboundedv1alpha3.MachineConditionIsolationDrift).Reason)
 	require.Zero(t, recheck)
 
 	// A stale report about another mode is ignored.
 	m = inProgress(testNow.Add(-3 * isolationChangeStaleAfter))
 	m.Status.IsolationChange.TargetMode = isolationNone
-	_, recheck = syncIsolationConditions(m, testNow)
+	_, recheck = syncIsolationConditions(m, testNow, true)
 	require.Equal(t, "AppliedModeDiffers", cond(m, unboundedv1alpha3.MachineConditionIsolationDrift).Reason)
 	require.Zero(t, recheck)
 }
@@ -436,10 +435,10 @@ func TestMachineReconciler_InProgressChangeRequeuesForStaleness(t *testing.T) {
 
 	s := newTestScheme(t)
 
-	machine := isolationMachine(isolationContainer)
+	machine := isolationMachine(isolationNone)
 	machine.Status.Isolation = unboundedv1alpha3.IsolationNSpawn
 	machine.Status.IsolationChange = &unboundedv1alpha3.IsolationChangeStatus{
-		TargetMode: isolationContainer, Phase: unboundedv1alpha3.IsolationChangeInProgress,
+		TargetMode: isolationNone, Phase: unboundedv1alpha3.IsolationChangeInProgress,
 		LastTransitionTime: metav1.NewTime(time.Now()),
 	}
 
@@ -450,4 +449,71 @@ func TestMachineReconciler_InProgressChangeRequeuesForStaleness(t *testing.T) {
 	require.NoError(t, err)
 	require.Positive(t, res.RequeueAfter)
 	require.LessOrEqual(t, res.RequeueAfter, isolationChangeStaleAfter)
+}
+
+// Without machina's experimental switch a declared container is refused by
+// machina, whatever the agent reports, and says how to enable it.
+func TestSyncIsolationConditions_ExperimentalContainerDisabled(t *testing.T) {
+	t.Parallel()
+
+	m := isolationMachine(isolationContainer)
+	m.Status.Isolation = unboundedv1alpha3.IsolationNSpawn
+	m.Status.IsolationChange = &unboundedv1alpha3.IsolationChangeStatus{
+		TargetMode: isolationContainer, Phase: unboundedv1alpha3.IsolationChangeInProgress,
+		LastTransitionTime: metav1.NewTime(testNow),
+	}
+
+	changed, recheck := syncIsolationConditions(m, testNow, false)
+	require.True(t, changed)
+	require.Zero(t, recheck, "nothing is pending on time")
+
+	c := cond(m, unboundedv1alpha3.MachineConditionIsolationDrift)
+	require.Equal(t, metav1.ConditionTrue, c.Status)
+	require.Equal(t, "ExperimentalModeDisabled", c.Reason)
+	require.Contains(t, c.Message, "experimentalContainerIsolation: true")
+	require.Contains(t, c.Message, `keeps running "nspawn"`)
+
+	// A node already in container is in sync; there is nothing to refuse.
+	m = isolationMachine(isolationContainer)
+	m.Status.Isolation = isolationContainer
+	_, _ = syncIsolationConditions(m, testNow, false)
+	require.Equal(t, "AppliedModeMatches", cond(m, unboundedv1alpha3.MachineConditionIsolationDrift).Reason)
+
+	// The other modes are not affected by the switch.
+	m = isolationMachine(isolationNone)
+	m.Status.Isolation = unboundedv1alpha3.IsolationNSpawn
+	_, _ = syncIsolationConditions(m, testNow, false)
+	require.Equal(t, "AppliedModeDiffers", cond(m, unboundedv1alpha3.MachineConditionIsolationDrift).Reason)
+}
+
+// An agent whose configuration does not opt in refuses the change even when
+// machina enables the mode; the condition says where the opt-in comes from.
+func TestSyncIsolationConditions_AgentRefusedAnExperimentalMode(t *testing.T) {
+	t.Parallel()
+
+	m := isolationMachine(isolationContainer)
+	m.Status.Isolation = unboundedv1alpha3.IsolationNSpawn
+	m.Status.IsolationChange = &unboundedv1alpha3.IsolationChangeStatus{
+		TargetMode: isolationContainer, Phase: unboundedv1alpha3.IsolationChangeFailed,
+		Reason: unboundedv1alpha3.IsolationChangeReasonExperimentalNotEnabled, Message: "not enabled on this host",
+	}
+
+	require.True(t, syncIso(m))
+
+	c := cond(m, unboundedv1alpha3.MachineConditionIsolationDrift)
+	require.Equal(t, "ChangeRefused", c.Reason)
+	require.Contains(t, c.Message, "Experimental.ContainerIsolation")
+	require.Contains(t, c.Message, "not enabled on this host")
+}
+
+func TestCheckIsolationEnabled(t *testing.T) {
+	t.Parallel()
+
+	for _, mode := range []unboundedv1alpha3.IsolationMode{"", unboundedv1alpha3.IsolationNSpawn, isolationNone} {
+		require.NoError(t, checkIsolationEnabled(mode, false), mode)
+		require.NoError(t, checkIsolationEnabled(mode, true), mode)
+	}
+
+	require.ErrorContains(t, checkIsolationEnabled(isolationContainer, false), "experimentalContainerIsolation")
+	require.NoError(t, checkIsolationEnabled(isolationContainer, true))
 }
