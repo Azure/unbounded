@@ -639,17 +639,46 @@ Implementation notes (`control.Node`):
   from a live cluster never cold-starts: the live leader's renewals keep
   changing the record. A `Discovered` live holder cancels a cold start.
 - Higher terms. Every control message and delta carries a full 64-bit term.
-  A member that sees a term above its view's records it
-  (`Elector.ObserveTerm`) and catches up from the sender; a leader that sees
-  a term above its own stops publishing at once and releases the Lease
-  (`resign`), as it does when a view of a later term is applied or its view
-  term no longer matches. The release record carries the highest term the
-  member has seen, so the next holder starts above both lineages even if
-  the Lease term annotation was lost (read as 0). Terms at or above
-  `control.MaxSaneTerm` (2^62) are garbage and ignored, so terms cannot
-  overflow. `NoteVersion`, fed from data-plane headers whose term is
-  truncated to 32 bits, may trigger a catch-up but never a step-down, so
-  terms that differ only above bit 32 cannot cause a regression.
+  Messages are not authenticated, so a term in a message is a claim that
+  only the Lease can confirm (see Lease corroboration below). A member that
+  sees a term above its view's records it (`Elector.ObserveTerm`), so its
+  next acquisition and any release start above it. A higher term in a
+  message never makes a leader step down: a leader stops publishing only
+  when its own Lease renewals fail (`RenewDeadline`, or a conflicting
+  write), or when it applies a view of a later term that the Lease shows,
+  and then it releases the Lease (`resign`) as before. The release record
+  carries the highest term the member has seen, so the next holder starts
+  above both lineages even if the Lease term annotation was lost (read as
+  0). Terms at or above `control.MaxSaneTerm` (2^62), or more than
+  `control.MaxTermLead` (2^32) above the highest term the member has read
+  from or written to the Lease (`Elector.LeaseTerm`), are garbage and
+  ignored, so messages cannot push terms toward overflow: each real
+  acquisition raises the Lease term by at most `MaxTermLead`.
+  `NoteVersion`, fed from data-plane headers whose term is truncated to
+  32 bits, may trigger a catch-up but never a step-down, so terms that
+  differ only above bit 32 cannot cause a regression.
+- Lease corroboration. The Lease is the only source of truth for who leads
+  at which term. A member's view is *backed* when the member leads its
+  term, or when the member's last Lease read named the view's leader (ID and
+  incarnation) at the view's term. A member with a backed view does not
+  adopt a view (delta or snapshot) of a later term unless its last Lease
+  read shows that term, and does not catch up from the peer that claimed
+  it; it reads the Lease instead (`Elector.Verify`, a consistent `Get`, at
+  most once per `LeaseDuration`, never by the leader, whose renewals
+  already check the Lease). If the read names a later term, the member
+  catches up from the address in the Lease. A member whose view is not
+  backed (most followers, which never read the Lease) catches up from the
+  sender as before, but what it adopts is checked by the snapshot trust
+  rules below. When such a member receives a delta of a term below its
+  view's, two terms are live and one may be forged, so it also reads the
+  Lease; if the Lease contradicts the view (another leader at the view's
+  term, or a lower term), it re-fetches from the Lease holder and adopts
+  the holder's snapshot even at a lower version. A leader asked for a
+  catch-up by a member that claims to be ahead of it (in its own term or a
+  later one) answers with its snapshot. Once rolled back, the member's view
+  is backed, so later forgeries of a higher term are refused. Followers
+  that never see a conflict make no Lease calls. Forging deltas within the
+  current term is not prevented here; that needs transport authentication.
 - A leaving member hands leadership off once: if a Lease acquire that was
   in flight when `Leave` was called succeeds (or it wins the lottery), it
   releases the Lease at once, which any candidate takes immediately. A
@@ -660,8 +689,12 @@ Implementation notes (`control.Node`):
   hand-off it releases again only when another member became Active after
   it started leaving (so is known to be alive).
 - Snapshot trust. A snapshot's version and digest are taken from its
-  encoding, so a corrupt or forged one decodes. A snapshot served by a peer
-  other than the leader of its view is *unconfirmed* until a delta applies on
+  encoding, so a corrupt or forged one decodes, and the leader it names and
+  the responder's identity are both claims of the responder. A snapshot is
+  trusted only when the member's last Lease read names the snapshot's
+  leader at the snapshot's term and that leader served it. Any other
+  snapshot, including one from a responder that claims to lead it without
+  the Lease saying so, is *unconfirmed* until a delta applies on
   top of it (the digest chain then vouches for it). An unconfirmed or bad
   view is never served to others. When a delta whose base is the current
   version fails with `view.ErrDigest`, the member re-fetches from a source
@@ -673,8 +706,9 @@ Implementation notes (`control.Node`):
   re-fetches the same way. A leader asked for a catch-up by a member that
   claims to be ahead of it in its own term answers with its snapshot, and
   an unconfirmed member adopts that lower version from the leader of its
-  term (a forged snapshot claimed a version that was never published).
-  This is the only case in which a view version decreases.
+  term (a forged snapshot claimed a version that was never published),
+  unless its view is backed by the Lease. This, and the Lease rollback
+  above, are the only cases in which a view version decreases.
 - Bounded state. Outbound calls awaiting a reply are capped at
   `MaxPendingCalls` (4096); further calls are dropped and their senders
   retry on their own timers. Seeds are capped at 32 (64 from the Lease),
@@ -693,7 +727,9 @@ Implementation notes (`control.Node`):
   existing lineage, keeping its epoch and keyspace generations.
 - When the Lease (as read by the elector) names a leader of a later term
   than the view, the member catches up from that leader. This heals two
-  lineages left by a partition.
+  lineages left by a partition. Requests routed to the leader (`Join`,
+  `Leave`, `Suspect`, `Invalidate`) go to the Lease holder's address when
+  the Lease does not back the member's view.
 - A failed `Broadcast` forward is retried once with the next-ranked member
   of the same cell.
 - Elector and health ticks run every `TickInterval` (1s).
@@ -726,7 +762,9 @@ type Record struct {
 
 States:
 
-- **Follower** (almost every member): no API calls at all.
+- **Follower** (almost every member): no API calls, except a rate-limited
+  `Verify` read when a peer's claim conflicts with its view (see Lease
+  corroboration).
 - **Candidate**: the member is among the top `Candidates` (3) by
   `Score(leaseSeed, member.Key)` over `Active` members admitted at least
   `MinCandidateAge` (60s) ago in its current view, or is the current leader.
@@ -754,9 +792,14 @@ States:
   after a cold restart) from reading every round.
 
 `Elector.ObserveTerm` records terms seen outside the Lease (see the node
-notes); the next acquisition uses `max(record.Term, view.Term, observed) +
-1`, a record term at or above `MaxSaneTerm` reads as 0, and `Release` writes
-the highest term seen into the released record.
+notes; the node drops terms more than `MaxTermLead` above
+`Elector.LeaseTerm`, the highest term read from or written to the Lease);
+the next acquisition uses `max(record.Term, view.Term, observed) + 1`, a
+record term at or above `MaxSaneTerm` reads as 0, and `Release` writes the
+highest term seen into the released record. `Elector.Verify` issues one
+consistent read outside the candidate and lottery states; its result only
+updates the known holder (a released, missing, or expired Lease names
+none) and never starts an acquisition.
 
 A record held by the same MemberID with a different incarnation is treated
 like any other holder (wait `LeaseDuration`), since IDs may collide; only a
@@ -769,7 +812,8 @@ paused past `RenewDeadline` never publishes on wake. `kubelease` preserves
 labels, foreign annotations, and unused spec fields on update.
 
 Fencing: every delta carries its term. Members reject deltas with a term lower
-than their view's term. A leader that loses the Lease stops publishing before
+than their view's term, and members whose view the Lease backs reject
+deltas of a later term than the Lease shows. A leader that loses the Lease stops publishing before
 any other member can acquire it (`RenewDeadline < LeaseDuration`).
 
 ## Data-plane API
@@ -1514,6 +1558,14 @@ Invariants it checks:
 - Liveness after faults heal: one leader, every live member at the same
   version, members are exactly the live processes, loads within one of
   target, sampled routes reach the owner in at most D hops.
+- Forgery: `TestDSTForgery` adds a peer that cannot write the Lease but
+  sends pings that claim later (and absurd) terms, `NewTerm` broadcasts
+  led by members the Lease does not name, and forged catch-up snapshots.
+  The leader and its term must survive the attack, a leader crash during
+  it must still fail over, and every member must converge (every forged
+  view it adopted rolled back). Forged views are exempt from the
+  one-digest-per-version and no-regression checks, since they were never
+  published.
 
 `go test ./internal/cachemesh/internal/dst` runs the default seed set. It
 is skipped under `-short` and `-race`. `CACHEMESH_DST_SEED`,
