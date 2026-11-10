@@ -86,9 +86,19 @@ func TestValidateAccepts(t *testing.T) {
 			n.Ethernets[1].MTU = i32(1500)
 		},
 		"vlan mtu ok": func(n *v1alpha3.HostNetworkSpec, _ *v1alpha3.DHCPLease) { n.VLANs[0].MTU = i32(1500) },
-		"vlan mtu without link mtu": func(n *v1alpha3.HostNetworkSpec, _ *v1alpha3.DHCPLease) {
+		"vlan default mtu without link mtu": func(n *v1alpha3.HostNetworkSpec, _ *v1alpha3.DHCPLease) {
 			n.Bonds[0].MTU = nil
+			n.VLANs[0].MTU = i32(1500)
+		},
+		"vlan jumbo on jumbo bond": func(n *v1alpha3.HostNetworkSpec, _ *v1alpha3.DHCPLease) {
+			n.Bonds[0].MTU = i32(9000)
 			n.VLANs[0].MTU = i32(9000)
+		},
+		"vlan jumbo on jumbo ethernet": func(n *v1alpha3.HostNetworkSpec, _ *v1alpha3.DHCPLease) {
+			n.Ethernets = append(n.Ethernets, v1alpha3.EthernetSpec{Name: "eth2", MACAddress: "02:00:00:00:00:03"})
+			n.Ethernets[2].MTU = i32(9000)
+			n.VLANs = append(n.VLANs, v1alpha3.VLANSpec{Name: "eth2.64", ID: 64, Link: "eth2"})
+			n.VLANs[1].MTU = i32(9000)
 		},
 		"balance-xor hash": func(n *v1alpha3.HostNetworkSpec, _ *v1alpha3.DHCPLease) { n.Bonds[0].Mode = "balance-xor" },
 		"active-backup": func(n *v1alpha3.HostNetworkSpec, _ *v1alpha3.DHCPLease) {
@@ -240,6 +250,15 @@ func TestValidateRejects(t *testing.T) {
 		{"vlan mtu exceeds link", func(n *v1alpha3.HostNetworkSpec, _ *v1alpha3.DHCPLease) {
 			n.VLANs[0].MTU = i32(9000)
 		}, "network.vlans[0].mtu"},
+		{"vlan jumbo on bond without mtu", func(n *v1alpha3.HostNetworkSpec, _ *v1alpha3.DHCPLease) {
+			n.Bonds[0].MTU = nil
+			n.VLANs[0].MTU = i32(9000)
+		}, "network.vlans[0].mtu"},
+		{"vlan jumbo on ethernet without mtu", func(n *v1alpha3.HostNetworkSpec, _ *v1alpha3.DHCPLease) {
+			n.Ethernets = append(n.Ethernets, v1alpha3.EthernetSpec{Name: "eth2", MACAddress: "02:00:00:00:00:03"})
+			n.VLANs = append(n.VLANs, v1alpha3.VLANSpec{Name: "eth2.64", ID: 64, Link: "eth2"})
+			n.VLANs[1].MTU = i32(9000)
+		}, "network.vlans[1].mtu"},
 		{"non-canonical cidr", func(n *v1alpha3.HostNetworkSpec, _ *v1alpha3.DHCPLease) {
 			n.VLANs[0].Addresses[0] = "198.51.100.030/24"
 		}, "network.vlans[0].addresses[0]"},

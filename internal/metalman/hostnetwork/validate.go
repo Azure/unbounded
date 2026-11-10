@@ -359,14 +359,31 @@ func (t *topology) checkVLANs() error {
 
 		seen[k] = i.path
 
-		if i.mtu != nil && l.mtu != nil && *i.mtu > *l.mtu {
-			return fmt.Errorf("%s.mtu: %d exceeds link %q MTU %d", i.path, *i.mtu, v.Link, *l.mtu)
+		// An unset link MTU leaves the kernel default, so compare against
+		// the effective link MTU rather than skipping the check.
+		if linkMTU := effectiveMTU(l); i.mtu != nil && *i.mtu > linkMTU {
+			return fmt.Errorf("%s.mtu: %d exceeds link %q MTU %d", i.path, *i.mtu, v.Link, linkMTU)
 		}
 
 		l.vlans = append(l.vlans, v.Name)
 	}
 
 	return nil
+}
+
+// defaultMTU is the kernel MTU of an ethernet or bond with no explicit MTU.
+const defaultMTU = 1500
+
+// effectiveMTU returns the MTU the installer leaves on an interface: its
+// declared MTU, or the kernel default when unset. Bond members cannot carry
+// VLANs, and the installer sets a bond MTU explicitly, so the declared value
+// is authoritative for both ethernets and bonds.
+func effectiveMTU(i *iface) int32 {
+	if i.mtu != nil {
+		return *i.mtu
+	}
+
+	return defaultMTU
 }
 
 func parseIPv4(s string) (netip.Addr, bool) {

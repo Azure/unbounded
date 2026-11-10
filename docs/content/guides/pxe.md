@@ -202,6 +202,8 @@ Rules:
   address and mask must be set on exactly one interface, and its `gateway` must
   match that interface's `gateway`. Metalman checks the source IP of installer
   requests against this address.
+- A VLAN `mtu` must not exceed its link's MTU. A link without `mtu` stays
+  at 1500, so jumbo VLANs need `mtu` on the bond or ethernet too.
 - Only IPv4 static addresses are supported. DHCP and IPv6 are not.
 
 With `network` set, Metalman builds a local installer ISO. The ISO holds the
