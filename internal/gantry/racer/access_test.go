@@ -274,6 +274,7 @@ func TestAccessCheckerTTLAndBound(t *testing.T) {
 	}
 
 	c.maxEntries = 4
+
 	for i := range 10 {
 		r := ref
 		r.Digest = racerDigest([]byte{byte(i)})
@@ -295,6 +296,7 @@ func TestAccessCheckerSingleflight(t *testing.T) {
 	var wg sync.WaitGroup
 
 	results := make(chan int, 16)
+
 	for range 16 {
 		wg.Go(func() { results <- c.check(ctx, ref).status })
 	}

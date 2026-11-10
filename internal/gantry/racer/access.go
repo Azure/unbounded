@@ -168,7 +168,12 @@ func (c *accessChecker) check(ctx context.Context, ref ifaces.OriginRef) accessD
 	case <-ctx.Done():
 		return accessDecision{status: http.StatusServiceUnavailable}
 	case res := <-ch:
-		return res.Val.(accessDecision) //nolint:forcetypeassert // the flight only returns accessDecision
+		d, ok := res.Val.(accessDecision)
+		if !ok {
+			return accessDecision{status: http.StatusServiceUnavailable}
+		}
+
+		return d
 	}
 }
 
