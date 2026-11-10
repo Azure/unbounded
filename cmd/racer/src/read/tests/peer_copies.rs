@@ -6322,7 +6322,7 @@ fn a_peer_joining_a_waiter_capped_flight_hears_flight_full() {
 /// rejects them like a receiver that predates them, without touching the
 /// cache, the origin, or other peers.
 #[test]
-fn write_operations_are_rejected_until_writes_are_served() {
+fn write_operations_on_a_cache_without_writes_change_nothing() {
     use crate::peer::protocol::{SessionId, WriteAction, WriteStore};
     use crate::peer::server::LocalPageService;
     let clock = racer_io::SimClock::new(933);
@@ -6330,38 +6330,51 @@ fn write_operations_are_rejected_until_writes_are_served() {
     let mut s = SuccessorFixture::new(&env);
     let version = s.f.page.version.clone();
     let session = SessionId([5; 16]);
+    use racer_core::write::WriteReply;
     let operations = [
-        PeerOperation::WriteSession {
-            object: version.object.clone(),
-            etag: None,
-            action: Box::new(WriteAction::Status { wait_millis: 0 }),
-        },
-        PeerOperation::WriteUpload {
-            version: version.clone(),
-            session,
-            pages: vec![0],
-        },
-        PeerOperation::WriteStore {
-            version: version.clone(),
-            store: Box::new(WriteStore {
+        (
+            PeerOperation::WriteSession {
+                object: version.object.clone(),
+                etag: None,
+                action: Box::new(WriteAction::Status { wait_millis: 0 }),
+            },
+            WriteReply::Unknown,
+        ),
+        (
+            PeerOperation::WriteUpload {
+                version: version.clone(),
                 session,
                 pages: vec![0],
-                length: 1,
-                page_size: crate::model::PageSize::DEFAULT,
-                content_type: None,
-                source: node(0),
-                hold_until_millis: 1,
-            }),
-        },
-        PeerOperation::WriteRelease {
-            version,
-            session,
-            pages: vec![0],
-            keep: false,
-        },
+            },
+            WriteReply::Failed,
+        ),
+        (
+            PeerOperation::WriteStore {
+                version: version.clone(),
+                store: Box::new(WriteStore {
+                    session,
+                    pages: vec![0],
+                    length: 1,
+                    page_size: crate::model::PageSize::DEFAULT,
+                    content_type: None,
+                    source: node(0),
+                    hold_until_millis: 1,
+                }),
+            },
+            WriteReply::Failed,
+        ),
+        (
+            PeerOperation::WriteRelease {
+                version,
+                session,
+                pages: vec![0],
+                keep: false,
+            },
+            WriteReply::Released,
+        ),
     ];
     let from = s.index(None);
-    for operation in operations {
+    for (operation, expected) in operations {
         s.ids += 1;
         let attempt = crate::model::AttemptId([s.ids; 16]);
         let acquire = matches!(
@@ -6404,7 +6417,11 @@ fn write_operations_are_rejected_until_writes_are_served() {
             &f.crypto,
             f.fill.drivers(),
         );
-        assert!(matches!(result, Err(Error::InvalidRequest)));
+        // A cache without `writes` neither opens, stores, nor uploads.
+        match result {
+            Ok(PeerResponse::Write(reply)) => assert_eq!(reply, expected),
+            other => panic!("unexpected {:?}", other.map(|r| r.kind())),
+        }
     }
     assert_eq!(s.f.origin.calls.get(), 0);
     assert!(s.peers.calls.borrow().is_empty());

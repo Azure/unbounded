@@ -358,6 +358,11 @@ pub struct MetadataService {
     deadlines: Rc<IngressDeadlines>,
 
     clock: Rc<RefCell<Clock>>,
+
+    /// Written objects this worker coordinates or replicates. A fresh
+    /// refresh serves them before asking peers or the origin, which does
+    /// not know an object until its upload commits.
+    writes: Rc<crate::write::Directory>,
 }
 
 impl MetadataService {
@@ -400,7 +405,13 @@ impl MetadataService {
             refreshes: Rc::new(RefreshTable::new(capacity, at)),
             deadlines: Rc::new(IngressDeadlines::default()),
             clock: Rc::new(RefCell::new(Clock::default())),
+            writes: Rc::default(),
         }
+    }
+
+    /// The write directory a fresh refresh consults first.
+    pub(crate) fn write_directory(&self) -> &Rc<crate::write::Directory> {
+        &self.writes
     }
 
     /// Wake actual ingress children, including those parked in FuturesUnordered.
@@ -609,6 +620,28 @@ impl MetadataService {
         scope.check()?;
         self.observe_clock()?;
         let clock_epoch = self.clock.borrow().inner.epoch();
+        // A written object this worker coordinates is current until it is
+        // deleted, expires, or uploads; the origin does not know it yet.
+        if let Some(metadata) = self
+            .writes
+            .current(&context.object, self.candidates.ctx().clock.wall_now())
+            && match &purpose {
+                RefreshPurpose::Pinned(etag) => *etag == metadata.version.etag,
+                _ => true,
+            }
+        {
+            if !matches!(purpose, RefreshPurpose::Pinned(_))
+                && self.clock.borrow().inner.epoch() == clock_epoch
+            {
+                self.storage.index.publish_current(metadata.clone())?;
+            } else {
+                self.storage.index.publish_version(metadata.immutable())?;
+            }
+            return Ok(RefreshOutput {
+                metadata,
+                page: None,
+            });
+        }
         let mode = self.storage.fill.mode(&context.object.cache);
         let resolution = if mode == racer_wire::control::CacheMode::PassthroughLocal {
             // The local route asks this node's own origin and never a peer.

@@ -2519,8 +2519,8 @@ impl CandidatePolicy {
         }
     }
 
-    /// This worker's link health (tests set its silence timing).
-    #[cfg(test)]
+    /// This worker's link health (tests set its silence timing; writers skip
+    /// silent store targets).
     pub(crate) fn link_health(&self) -> Rc<crate::topology::LinkHealth> {
         self.peers.link_health()
     }

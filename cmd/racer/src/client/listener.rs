@@ -985,6 +985,29 @@ async fn serve_connection(
                 )
                 .await;
             }
+            // Writes on a cache with writes enabled have their own route and
+            // close the connection; other caches keep the read parser's 405.
+            Ok(request) if crate::write::client::routes(reads, cache, &request.head) => {
+                let head = request.head;
+                let received = request.descriptors;
+                let descriptors = if received.truncated {
+                    Vec::new()
+                } else {
+                    received.descriptors
+                };
+                return crate::write::client::serve(
+                    connection,
+                    head,
+                    descriptors,
+                    cache,
+                    parser.header_limit(),
+                    reads,
+                    io,
+                    timeout,
+                    cancellation.clone(),
+                )
+                .await;
+            }
             other => other,
         };
         // Every descriptor must be claimed by a direct read; the rest close here.
@@ -1091,7 +1114,7 @@ async fn serve_connection(
     }
 }
 
-pub(super) fn new_scope(
+pub(crate) fn new_scope(
     ctx: &racer_io::WorkerCtx,
     timeout: Duration,
     cancellation: Cancellation,

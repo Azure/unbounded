@@ -45,6 +45,8 @@ pub struct Metrics {
 
     /// This worker's handle on the prefetch registry.
     prefetch: Arc<crate::prefetch::metrics::PrefetchMetrics>,
+    /// Node-wide write metrics, shared by every worker.
+    writes: Arc<crate::write::WriteMetrics>,
 
     shard: usize,
 }
@@ -701,6 +703,11 @@ impl Metrics {
         &self.prefetch
     }
 
+    /// Node-wide write metrics.
+    pub(crate) fn writes(&self) -> &Arc<crate::write::WriteMetrics> {
+        &self.writes
+    }
+
     pub(crate) fn observe_disks(&self, samples: Vec<DiskUsage>) {
         self.disks.replace(self.shard, samples);
     }
@@ -996,6 +1003,7 @@ impl Metrics {
         let cache_disks = crate::telemetry::primitives::SnapshotShards::new(count);
         let gpu = Arc::new(crate::gpu_telemetry::GpuTelemetry::default());
         let prefetch = crate::prefetch::metrics::PrefetchMetrics::shards(count);
+        let writes = Arc::new(crate::write::WriteMetrics::default());
         Ok(crate::telemetry::primitives::Metrics::shards(count)
             .into_iter()
             .zip(prefetch)
@@ -1010,6 +1018,7 @@ impl Metrics {
                 cache_disks: cache_disks.clone(),
                 gpu: gpu.clone(),
                 prefetch: Arc::new(prefetch),
+                writes: writes.clone(),
                 shard,
             })
             .collect())
@@ -1242,7 +1251,10 @@ impl Exposition<'_> {
                 } else {
                     match cache - 1 - caches.len() {
                         0 => metrics.gpu.write(out)?,
-                        1 => metrics.prefetch.write(out)?,
+                        1 => {
+                            metrics.prefetch.write(out)?;
+                            metrics.writes.write(out)?;
+                        }
                         _ => metrics.write_quotas(out)?,
                     }
                 }

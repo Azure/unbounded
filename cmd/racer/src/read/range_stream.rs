@@ -3310,6 +3310,7 @@ pub(super) mod tests {
             let response = ReadResponse {
                 metadata,
                 payload: crate::read::ReadPayload::Stream(stream),
+                upload_state: None,
             };
             let responses = Responses::new(io.clone(), delivery);
             let headers_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));

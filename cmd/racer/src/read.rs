@@ -47,6 +47,9 @@ pub struct ReadResponse {
     pub metadata: ObjectMetadata,
 
     pub payload: ReadPayload,
+
+    /// Upload state of a Racer-written version, reported on `HEAD`.
+    pub upload_state: Option<racer_core::write::UploadState>,
 }
 
 /// A HEAD or empty-object response has no stream. A nonempty response carries
@@ -72,15 +75,18 @@ impl ReadPayload {
 pub struct Coordinator {
     snapshots: std::sync::Arc<PublicationCell<Snapshot>>,
 
-    pub(super) metadata: Rc<MetadataService>,
+    pub(crate) metadata: Rc<MetadataService>,
 
-    pub(super) fill: Rc<Fill>,
+    pub(crate) fill: Rc<Fill>,
 
     streams: Rc<RangeStreams>,
 
     pub(super) credentials: Rc<CredentialCrypto>,
 
-    availability: Rc<crate::control::Availability>,
+    pub(crate) availability: Rc<crate::control::Availability>,
+
+    /// This worker's write sessions, staging handle, and upload settings.
+    pub(crate) writes: crate::write::WriteService,
 }
 
 /// Metadata/bootstrap allowance. Normal pinned client ranges admit bounded page
@@ -133,6 +139,7 @@ impl Coordinator {
         availability: Rc<crate::control::Availability>,
     ) -> Self {
         streams.directory().prefetch.attach_metrics(&fill.metrics);
+        let writes = crate::write::WriteService::new(metadata.write_directory().clone());
         Self {
             snapshots,
             metadata,
@@ -140,6 +147,7 @@ impl Coordinator {
             streams,
             credentials,
             availability,
+            writes,
         }
     }
 
@@ -358,6 +366,68 @@ impl Coordinator {
         }
     }
 
+    /// Serve one verified write operation. Acquire-mode operations open
+    /// their origin context; copy-mode ones carry none.
+    async fn serve_write_peer(
+        &self,
+        requester: &racer_wire::control::NodeId,
+        request: crate::peer::protocol::PeerRequest,
+        membership: std::sync::Arc<crate::topology::Membership>,
+        scope: &RequestScope,
+    ) -> Result<PeerResponse> {
+        let object = request
+            .operation
+            .write_object()
+            .ok_or(Error::InvalidRequest)?
+            .clone();
+        if object != request.origin.object {
+            return Err(Error::InvalidRequest);
+        }
+        if !self.availability.metadata(&object.cache) {
+            return Ok(PeerResponse::Unavailable);
+        }
+        let mut effective = scope.clone();
+        effective.deadline.0 =
+            racer_core::read::serve_deadline(effective.deadline.0, request.route.deadline.0);
+        effective.check()?;
+        let acquire = matches!(
+            request.operation,
+            PeerOperation::WriteSession { .. } | PeerOperation::WriteUpload { .. }
+        );
+        let reply = if acquire {
+            let context = self.open_context(request.origin)?;
+            crate::write::coordinator::serve(
+                self,
+                requester,
+                request.operation,
+                &context,
+                membership,
+                &effective,
+            )
+            .await
+        } else {
+            let context = crate::write::bare_context(&object);
+            crate::write::coordinator::serve(
+                self,
+                requester,
+                request.operation,
+                &context,
+                membership,
+                &effective,
+            )
+            .await
+        };
+        match reply {
+            Ok(reply) => Ok(PeerResponse::Write(reply)),
+            Err(error) => peer_error(error),
+        }
+    }
+
+    /// This worker's write service.
+    pub(crate) fn writes(&self) -> &crate::write::WriteService {
+        &self.writes
+    }
+
     /// Authenticate and charge the exact peer request and attempt context.
     pub(crate) fn open_context(&self, envelope: PeerOriginContext) -> Result<ChargedOriginContext> {
         let request = envelope.request;
@@ -428,6 +498,7 @@ impl Coordinator {
                         return Ok(ReadResponse {
                             metadata,
                             payload: ReadPayload::Empty,
+                            upload_state: None,
                         });
                     }
                     let range = resolve_range(
@@ -450,12 +521,23 @@ impl Coordinator {
                     Ok(ReadResponse {
                         metadata,
                         payload: ReadPayload::Stream(body),
+                        upload_state: None,
                     })
                 }
-                ReadKind::Head | ReadKind::HeadPinned { .. } => Ok(ReadResponse {
-                    metadata,
-                    payload: ReadPayload::Empty,
-                }),
+                ReadKind::Head | ReadKind::HeadPinned { .. } => {
+                    let upload_state = crate::write::coordinator::upload_state(
+                        self,
+                        &metadata.version,
+                        membership,
+                        scope,
+                    )
+                    .await;
+                    Ok(ReadResponse {
+                        metadata,
+                        payload: ReadPayload::Empty,
+                        upload_state,
+                    })
+                }
                 // Mapped to Subscription above.
                 ReadKind::HostRead { .. } | ReadKind::GpuRead { .. } => Err(Error::Internal),
             }
@@ -615,11 +697,10 @@ impl LocalPageService for Coordinator {
             {
                 return Err(Error::Unauthorized);
             }
-            // Write operations are decoded and authenticated, but not served
-            // yet: answer like a receiver that predates them, which writers
-            // treat as `Unavailable` for that target. WP5 replaces this.
+            // Write operations are served by the write service on this,
+            // the object's metadata worker (`WorkerDirectory::peer`).
             if request.operation.is_write() {
-                return Err(Error::InvalidRequest);
+                return self.serve_write_peer(&requester, request, membership, scope).await;
             }
             if let PeerOperation::Page {
                 page,

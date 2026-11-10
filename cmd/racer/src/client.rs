@@ -1212,7 +1212,10 @@ impl Responses {
             if !matches!(&response.payload, ReadPayload::Empty) {
                 return Err(Error::BadGateway);
             }
-            let head = racer_wire::object::client::success_head(&response.metadata, None)?;
+            let head = racer_wire::object::write::success_head_with_upload(
+                &response.metadata,
+                response.upload_state,
+            )?;
             connection = self.io.send_head(connection, head, scope).await?.connection;
             connection.finish_exchange()?;
             if let Some(observation) = observation.as_mut() {

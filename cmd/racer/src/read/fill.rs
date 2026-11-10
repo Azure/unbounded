@@ -136,8 +136,8 @@ use racer_core::read::LeaderSource;
 pub(super) use racer_core::read::optional_headroom;
 #[derive(Clone)]
 pub struct Fill {
-    pub(super) dependencies: FillDependencies,
-    pub(super) metrics: Metrics,
+    pub(crate) dependencies: FillDependencies,
+    pub(crate) metrics: Metrics,
     pub(super) local_copies: Rc<LocalCopies>,
     pub(super) local_plaintext: Rc<LocalPlaintext>,
     local_plaintext_keys: Rc<LocalPlaintextKeys>,
@@ -252,7 +252,7 @@ impl Fill {
         }
     }
 
-    pub(super) async fn warm_local(
+    pub(crate) async fn warm_local(
         &self,
         page: &PageId,
         scope: &RequestScope,
@@ -2211,6 +2211,12 @@ impl Fill {
     ) -> Operation<'a, Option<(ObjectMetadata, CiphertextPage)>> {
         Box::pin(async move {
             scope.check()?;
+            // A page a local writer staged is served to its store targets
+            // before any cache lookup: it is in no cache yet.
+            if let Some(copy) = self.dependencies.metadata_owner.write_staging.get(page) {
+                validate_copy(&copy, page, self.page_size()?)?;
+                return Ok(Some((copy.metadata, copy.ciphertext)));
+            }
             // A passthrough page can only be shared while it is in flight.
             let retained = !self.passthrough(&page.version.object.cache);
             if retained
