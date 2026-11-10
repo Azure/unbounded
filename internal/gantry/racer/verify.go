@@ -24,10 +24,12 @@ const invalidateTimeout = 5 * time.Second
 var errDigestMismatch = errors.New("racer object does not match its digest")
 
 // Invalidator drops one cached version of an object cluster-wide, best
-// effort. The Racer SDK client satisfies it once it exposes Invalidate.
+// effort. *racersdk.Client satisfies it.
 type Invalidator interface {
 	Invalidate(ctx context.Context, key racersdk.Key, etag string) error
 }
+
+var _ Invalidator = (*racersdk.Client)(nil)
 
 // WithInvalidator purges a cached version that fails digest verification so
 // the consumer's retry fetches fresh bytes instead of the same bad copy.

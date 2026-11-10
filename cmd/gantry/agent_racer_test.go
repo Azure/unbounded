@@ -32,6 +32,10 @@ func (*startupRacerClient) Stat(context.Context, racersdk.Request) (racersdk.Met
 	return racersdk.Metadata{}, errors.New("unexpected metadata request")
 }
 
+func (*startupRacerClient) Invalidate(context.Context, racersdk.Key, string) error {
+	return errors.New("unexpected invalidate request")
+}
+
 func (c *startupRacerClient) Close() error { c.closed.Store(true); return nil }
 
 func TestRacerStartupSelection(t *testing.T) {

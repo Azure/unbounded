@@ -28,6 +28,7 @@ const racerShutdownBudget = 10 * time.Second
 
 type racerAgentClient interface {
 	racer.Client
+	racer.Invalidator
 	Close() error
 }
 
@@ -92,9 +93,7 @@ func serveRacerAgent(ctx context.Context, c *config.Config, logger *slog.Logger,
 	// retain Racer correlation headers and rate-limited failure diagnostics.
 	mirrorSrv := mirror.New(c, nil, originClient,
 		mirror.WithContentBackend(racer.NewHandler(deps.client, originClient, logger, racer.WithRetryBudget(c.RacerRetryBudget), racer.WithRetryObserver(telemetry.MirrorRetry), racer.WithAccessCheck(originClient),
-			// Integration seam: add racer.WithInvalidator(deps.client) once
-			// racersdk.Client implements Invalidate.
-			racer.WithDigestMismatchObserver(telemetry.DigestMismatch))), mirror.WithLogger(logger), mirror.WithStartupReadinessGate())
+			racer.WithInvalidator(deps.client), racer.WithDigestMismatchObserver(telemetry.DigestMismatch))), mirror.WithLogger(logger), mirror.WithStartupReadinessGate())
 
 	var (
 		ready   atomic.Bool
