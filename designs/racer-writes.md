@@ -966,6 +966,47 @@ record; digest flip yields `Corrupt`; block ID length is constant 64 for pages
 `0` and `49_999`; XML golden test. Add fuzz target `write_journal` decoding
 arbitrary bytes. `make racer-purity-graph` must pass.
 
+### WP1 and WP2 as built
+
+The code refined these interfaces; the code is authoritative.
+
+- `UploadMode`, `Durability`, and `UploadState` live in
+  `cmd/racer/wire/src/object/write.rs` (the response heads need
+  `UploadState`); `racer_core::write` re-exports them with `MIN_REPLICAS` and
+  `MAX_REPLICAS`.
+- `parse_write(head, header_limit, page_size: PageSize) -> WriteResult<WriteRequest>`.
+  The shared `object::Error` has no `411`, `413`, or `428` variant, so writes
+  return `WriteError::{Object(Error), LengthRequired, PayloadTooLarge,
+  PreconditionRequired}` with `WriteError::status()`. `Content-Length` may be
+  absent or `0` on `DELETE`, `persist`, and `host-write`. Creation fields
+  (`If-None-Match`, `Racer-Durability`, and so on) on `DELETE` or `persist`
+  are `400`. Whether `Racer-Metadata` is present for the resolved upload mode,
+  and whether it names a version, is checked by the caller (WP5), because the
+  parser does not know cache defaults or the origin's metadata schema.
+- Extra helpers: `max_object_bytes(page_size)`, `MAX_HOLD_SECONDS`,
+  `error_token::*` constants, `write_no_content_head(Option<UploadState>)` for
+  `204`, and `client::error_head_with_allow(status, length, allow_writes)`.
+  The head codec omits reason phrases.
+- `NodeIdBytes` is `Vec<u8>`. `Holders::{encode, decode, validate, nodes}`.
+- `Session::open(identity: WriteIdentity, spec, now, lease)`: the session needs
+  the cache, key, ETag, and session ID to build journal records. The caller
+  journals `Session::open_record()`. `Session::from_manifest` rebuilds a
+  committed session (an interrupted upload restarts as `Pending`).
+  Refused events return a single `SessionEffect::Reject(Rejection)`.
+  `SessionEffect::ReleaseTargets` releases every ranked target before commit,
+  when the coordinator does not know who stored pages.
+  `SessionEvent::HolderRestored { page, node }` records a repaired copy. Hold
+  expiry is journaled as `Delete` (there is no separate expire kind).
+- Journal records carry `cache: String`, `key: [u8; 32]`, `etag: String`.
+  `journal::encode` returns `Result<(), JournalError>` and adds
+  `JournalError::Oversized` for fields that exceed their length prefixes.
+  Inside a manifest, the holder table is prefixed by a `u32 BE` byte length.
+  `encode_manifest`/`decode_manifest` produce the `racer-write-manifest`
+  payload, and `encode_header`/`decode_header` handle the 64-byte file header.
+- `block_list_xml(version_hex, pages: u64)` commits pages `0..pages` and starts
+  with an XML declaration. `UploadPlan::new(holders, pages, reachable, max_batch)`
+  yields `batches` and `unassigned`.
+
 ### WP3: durable write storage
 
 Files: new `cmd/racer/src/store/writes.rs` (write segment table, dirty
