@@ -2682,7 +2682,11 @@ impl CandidatePolicy {
             PeerOperation::Bootstrap { .. } => CandidateOperation::Bootstrap,
             PeerOperation::Metadata { .. } => CandidateOperation::Metadata,
             PeerOperation::Subscribe { .. } => CandidateOperation::Subscribe,
-            PeerOperation::Prefetch { .. } => CandidateOperation::Page,
+            PeerOperation::Prefetch { .. }
+            | PeerOperation::WriteSession { .. }
+            | PeerOperation::WriteStore { .. }
+            | PeerOperation::WriteRelease { .. }
+            | PeerOperation::WriteUpload { .. } => CandidateOperation::Page,
         };
         self.observer.candidate_final(CandidateFinal {
             failure: Failure::new(Stage::CandidateExhausted, error)
@@ -2862,6 +2866,16 @@ fn operation_identity(operation: &PeerOperation) -> (&ObjectId, PageNumber) {
             &version.object,
             PageNumber(action.pages().first().copied().unwrap_or(0)),
         ),
+        PeerOperation::WriteSession { object, .. } => (object, PageNumber(0)),
+        PeerOperation::WriteStore { version, store } => (
+            &version.object,
+            PageNumber(store.pages.first().copied().unwrap_or(0)),
+        ),
+        PeerOperation::WriteRelease { version, pages, .. }
+        | PeerOperation::WriteUpload { version, pages, .. } => (
+            &version.object,
+            PageNumber(pages.first().copied().unwrap_or(0)),
+        ),
     }
 }
 fn copy_operation(operation: &PeerOperation, mode: FetchMode) -> PeerOperation {
@@ -2890,6 +2904,38 @@ fn copy_operation(operation: &PeerOperation, mode: FetchMode) -> PeerOperation {
             version: version.clone(),
             action: action.clone(),
         },
+        // Write operations have fixed modes; the probe mode is not applied.
+        PeerOperation::WriteSession {
+            object,
+            etag,
+            action,
+        } => PeerOperation::WriteSession {
+            object: object.clone(),
+            etag: etag.clone(),
+            action: action.clone(),
+        },
+        PeerOperation::WriteStore { version, store } => PeerOperation::WriteStore {
+            version: version.clone(),
+            store: store.clone(),
+        },
+        PeerOperation::WriteRelease {
+            version,
+            session,
+            pages,
+        } => PeerOperation::WriteRelease {
+            version: version.clone(),
+            session: *session,
+            pages: pages.clone(),
+        },
+        PeerOperation::WriteUpload {
+            version,
+            session,
+            pages,
+        } => PeerOperation::WriteUpload {
+            version: version.clone(),
+            session: *session,
+            pages: pages.clone(),
+        },
     }
 }
 /// Payload-free shape of `operation` for racer-core classification.
@@ -2903,6 +2949,10 @@ pub(crate) fn operation_kind(operation: &PeerOperation) -> racer_core::read::Ope
         },
         PeerOperation::Bootstrap { .. } => OperationKind::Bootstrap,
         PeerOperation::Prefetch { .. } => OperationKind::Prefetch,
+        PeerOperation::WriteSession { .. }
+        | PeerOperation::WriteStore { .. }
+        | PeerOperation::WriteRelease { .. }
+        | PeerOperation::WriteUpload { .. } => OperationKind::Write,
     }
 }
 
@@ -4324,7 +4374,11 @@ pub(super) mod tests {
                     | PeerOperation::Metadata { mode, .. } => {
                         matches!(mode, FetchMode::CopyOnly)
                     }
-                    PeerOperation::Prefetch { .. } => false,
+                    PeerOperation::Prefetch { .. }
+                    | PeerOperation::WriteSession { .. }
+                    | PeerOperation::WriteStore { .. }
+                    | PeerOperation::WriteRelease { .. }
+                    | PeerOperation::WriteUpload { .. } => false,
                 };
                 self.calls
                     .borrow_mut()

@@ -1002,6 +1002,9 @@ fn response_matches(
         }
         return Ok(());
     }
+    if typed.is_write() {
+        return write_response_matches(response, request);
+    }
     if !typed.echoes_operation() {
         return Ok(());
     }
@@ -1026,6 +1029,39 @@ fn response_matches(
         let present = protocol::number(response, "racer-page-present")?;
         if !route::bootstrap_presence_ok(length, present)
             || (present == 1 && protocol::number(response, "racer-page")? != 0)
+        {
+            return Err(Error::Unauthorized);
+        }
+    }
+    Ok(())
+}
+/// A write reply answers only a write operation; the request binding already
+/// ties it to the exact signed request. `stored` answers only `write-store`
+/// and `uploaded` only `write-upload`, each with a subset of the requested
+/// pages. WP5 owns finer per-action result rules.
+fn write_response_matches(response: &MessageHead, request: &MessageHead) -> Result<()> {
+    use protocol::write;
+    let operation = field(request, "racer-operation")?;
+    if !operation.starts_with("write-") {
+        return Err(Error::Unauthorized);
+    }
+    let answered = match field(response, write::WRITE_RESULT)?.as_str() {
+        "stored" if operation == "write-store" => true,
+        "uploaded" if operation == "write-upload" => true,
+        "stored" | "uploaded" => return Err(Error::Unauthorized),
+        _ => false,
+    };
+    if answered {
+        let pages = |head: &MessageHead, name: &str| {
+            racer_core::prefetch::decode_pages(&protocol::decode_binary(
+                field(head, name)?.as_bytes(),
+            )?)
+            .ok_or(Error::Unauthorized)
+        };
+        let requested = pages(request, write::WRITE_PAGES)?;
+        if !pages(response, write::WRITE_STORED)?
+            .iter()
+            .all(|page| requested.binary_search(page).is_ok())
         {
             return Err(Error::Unauthorized);
         }
@@ -1061,6 +1097,8 @@ fn check_grant_deadline(head: &MessageHead, request: &RequestBinding) -> Result<
 }
 #[cfg(test)]
 mod tests {
+    mod write;
+
     use super::*;
     use crate::admission::AdmissionPolicy;
     use crate::admission::ResourceClass;

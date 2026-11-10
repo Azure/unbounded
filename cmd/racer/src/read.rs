@@ -615,6 +615,12 @@ impl LocalPageService for Coordinator {
             {
                 return Err(Error::Unauthorized);
             }
+            // Write operations are decoded and authenticated, but not served
+            // yet: answer like a receiver that predates them, which writers
+            // treat as `Unavailable` for that target. WP5 replaces this.
+            if request.operation.is_write() {
+                return Err(Error::InvalidRequest);
+            }
             if let PeerOperation::Page {
                 page,
                 mode: FetchMode::Offer,
@@ -646,6 +652,10 @@ impl LocalPageService for Coordinator {
                 PeerOperation::Page { page, .. } => Some(&page.version.object),
                 PeerOperation::Metadata { object, .. } => Some(object),
                 PeerOperation::Prefetch { version, .. } => Some(&version.object),
+                PeerOperation::WriteSession { .. }
+                | PeerOperation::WriteStore { .. }
+                | PeerOperation::WriteRelease { .. }
+                | PeerOperation::WriteUpload { .. } => request.operation.write_object(),
             };
             let object_matches = object.is_some_and(|object| object == &request.origin.object);
             use racer_core::read::{ServeAction, ServeFacts, serve_action};

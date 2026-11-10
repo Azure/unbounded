@@ -665,7 +665,8 @@ impl MetadataService {
                 }
                 PeerResponse::Page { .. }
                 | PeerResponse::Selected { .. }
-                | PeerResponse::Prefetch(_) => {
+                | PeerResponse::Prefetch(_)
+                | PeerResponse::Write(_) => {
                     return Err(Error::CorruptRecord.into());
                 }
                 PeerResponse::StaleMembership => return Err(Error::IncompatibleMembership.into()),

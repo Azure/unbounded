@@ -937,6 +937,14 @@ impl WorkerDirectory {
                 crate::peer::protocol::Operation::Prefetch { version, .. } => {
                     self.metadata_owner(&version.object)?
                 }
+                // Not served yet (WP5 routes writes); the owner's
+                // `serve_peer` rejects them.
+                operation @ (crate::peer::protocol::Operation::WriteSession { .. }
+                | crate::peer::protocol::Operation::WriteStore { .. }
+                | crate::peer::protocol::Operation::WriteRelease { .. }
+                | crate::peer::protocol::Operation::WriteUpload { .. }) => {
+                    self.metadata_owner(operation.write_object().ok_or(Error::InvalidRequest)?)?
+                }
             };
             if self.is_local(owner) {
                 return self.local()?.serve_peer(request, membership, scope).await;
