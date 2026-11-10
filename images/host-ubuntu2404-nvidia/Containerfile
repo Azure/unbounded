@@ -1,0 +1,78 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+
+# Metalman machine image for Ubuntu 24.04 on NVIDIA HGX systems with NVSwitch.
+# It starts from the same Ubuntu cloud image release as images/host-ubuntu2404
+# and adds the NVIDIA open GPU driver, Fabric Manager, NVLSM, NSCQ, and the
+# RDMA user space. amd64 only. See images/host-ubuntu2404-nvidia/README.md.
+#
+# Build:
+#   docker buildx build --platform linux/amd64 \
+#     -f images/host-ubuntu2404-nvidia/Containerfile \
+#     -t ghcr.io/azure/host-ubuntu2404-nvidia:dev .
+
+ARG UBUNTU_RELEASE_URL=https://cloud-images.ubuntu.com/releases/noble/release
+
+# Unpack the cloud image root file system. It has no kernel or bootloader.
+FROM --platform=$BUILDPLATFORM docker.io/library/ubuntu:24.04 AS fetch
+ARG TARGETARCH
+ARG UBUNTU_RELEASE_URL
+RUN apt-get update && \
+    ok=false && \
+    for attempt in 1 2 3 4 5; do \
+      if apt-get install -y --no-install-recommends ca-certificates curl xz-utils; then \
+        ok=true; break; \
+      fi; \
+      echo "apt-get install failed (attempt $attempt/5), retrying in 30s..."; \
+      sleep 30; \
+      apt-get update; \
+    done && $ok && \
+    rm -rf /var/lib/apt/lists/*
+RUN test "${TARGETARCH}" = amd64 || { echo "amd64 only, not ${TARGETARCH}" >&2; exit 1; } && \
+    tarball="ubuntu-24.04-server-cloudimg-${TARGETARCH}-root.tar.xz" && \
+    curl -fsSL --retry 5 -o "/tmp/${tarball}" "${UBUNTU_RELEASE_URL}/${tarball}" && \
+    curl -fsSL --retry 5 -o /tmp/SHA256SUMS "${UBUNTU_RELEASE_URL}/SHA256SUMS" && \
+    (cd /tmp && grep " \*\?${tarball}\$" SHA256SUMS | sha256sum -c -) && \
+    mkdir /rootfs && \
+    tar --extract --xz --file="/tmp/${tarball}" --numeric-owner --xattrs \
+      --xattrs-include='*' -C /rootfs && \
+    rm -f "/tmp/${tarball}" /rootfs/etc/resolv.conf && \
+    : > /rootfs/etc/resolv.conf
+
+FROM scratch AS rootfs
+ARG KERNEL_PACKAGE=linux-generic
+ARG NVIDIA_DRIVER_VERSION=595.71.05
+ARG NVLSM_VERSION=2025.10.12-1
+COPY --from=fetch /rootfs/ /
+COPY images/host-ubuntu2404-nvidia/assets/rootfs.sh /usr/local/bin/build-rootfs
+RUN KERNEL_PACKAGE="${KERNEL_PACKAGE}" NVIDIA_DRIVER_VERSION="${NVIDIA_DRIVER_VERSION}" \
+    NVLSM_VERSION="${NVLSM_VERSION}" sh /usr/local/bin/build-rootfs install
+RUN KERNEL_PACKAGE="${KERNEL_PACKAGE}" NVIDIA_DRIVER_VERSION="${NVIDIA_DRIVER_VERSION}" \
+    NVLSM_VERSION="${NVLSM_VERSION}" sh /usr/local/bin/build-rootfs finish
+
+FROM --platform=$BUILDPLATFORM docker.io/library/ubuntu:24.04 AS build
+ARG TARGETARCH
+RUN apt-get update && \
+    ok=false && \
+    for attempt in 1 2 3 4 5; do \
+      if apt-get install -y --no-install-recommends \
+           dosfstools e2fsprogs fdisk mtools pigz; then \
+        ok=true; break; \
+      fi; \
+      echo "apt-get install failed (attempt $attempt/5), retrying in 30s..."; \
+      sleep 30; \
+      apt-get update; \
+    done && $ok && \
+    rm -rf /var/lib/apt/lists/*
+COPY --from=rootfs /rootfs.tar /rootfs.kver /
+COPY images/host-azurelinux3/assets/disk.sh /usr/local/bin/build-disk
+COPY images/host-ubuntu2404-nvidia/assets/validate.sh /usr/local/bin/validate-disk
+RUN TARGETARCH="${TARGETARCH}" DISTRO=ubuntu sh /usr/local/bin/build-disk && \
+    rm /rootfs.tar && \
+    sh /usr/local/bin/validate-disk /disk/disk.img.gz
+
+FROM scratch
+LABEL org.opencontainers.image.source="https://github.com/Azure/unbounded" \
+      org.opencontainers.image.description="Metalman machine image for Ubuntu 24.04 with NVIDIA GPU driver and Fabric Manager"
+COPY --from=build /disk /disk
+COPY LICENSE NOTICE /unbounded/licenses/
