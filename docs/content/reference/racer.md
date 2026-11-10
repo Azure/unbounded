@@ -277,7 +277,7 @@ spec:
 | Field | Default | Accepted | Meaning |
 |-------|---------|----------|---------|
 | `writes.replicas` | `2` | 1..3 | Nodes that must store each page before a write is acknowledged. A request can override it with `Racer-Durability`. |
-| `writes.maxDirtyPercent` | `30` | 1..90 | Share of this cache's disk share on a node that may hold written data not yet uploaded. Writes over it get `503`. |
+| `writes.maxDirtyPercent` | `30` | 1..90 | Percent of each storage worker's segment capacity that this cache's written data, not yet uploaded, may use. Writes over it get `503`. |
 | `writes.holdTTL` | `24h` | More than `0s`, at most `720h` | Default time a written object stays pinned in the cache. An `Auto` upload ends the hold when it commits. A request can override it with `Racer-Hold-Seconds`. |
 | `writes.upload.mode` | `Auto` | `Auto`, `Manual`, `Never` | Default upload mode. `Auto` uploads after the write commits. `Manual` waits for `persist`. `Never` keeps the object only in the cache until its hold ends. |
 | `writes.upload.maxBytesPerSecond` | `0` | At least 0 | Upload bandwidth for this cache on each node. `0` means no limit. The cluster-wide limit is this value times the number of nodes. |
@@ -291,11 +291,12 @@ The API server also checks:
 Rules for enabling writes:
 
 - **Every node must support writes first.** Older dataplanes reject a cache
-  catalog that contains `writes`. Upgrade every Racer node before you set
-  `spec.writes` on any cache. <!-- verify against WP5: design says the operator checks this precondition; no check found on this branch -->
+  catalog that contains `writes`. The operator does not check node versions.
+  Upgrade every Racer node before you set `spec.writes` on any cache.
 - **Upload needs write access.** With an upload mode other than `Never`, the
   cache's Azure identity needs the `Storage Blob Data Contributor` role on the
-  container. Reads alone need only `Storage Blob Data Reader`.
+  container. Uploads use Put Block and Put Block List. Reads alone need only
+  `Storage Blob Data Reader`.
 - **Data not yet uploaded can be lost.** Written data that is not uploaded
   lives only on node disks. Deleting the ClusterCache, or changing a node's
   storage layout (devices or worker count), loses that node's copies.
@@ -557,8 +558,8 @@ each worker and are never divided.
 | `RACER_WRITE_LEASE_SECS` | `60` | Node | 5..3,600 s | Write session lease; the writer renews it every third of the lease, and an expired session is aborted. |
 | `RACER_WRITE_GROUP_COMMIT_MICROS` | `500` | Node | 0..100,000 us | Longest wait to batch written pages into one durability barrier; `0` syncs each page alone. |
 | `RACER_WRITE_JOURNAL_BYTES` | `67108864` (64 MiB) | Node | 1,048,576..17,179,869,184 bytes | Write journal size per I/O worker that triggers compaction. |
-| `RACER_WRITE_ORPHAN_SECS` | `3600` | Node | 60..604,800 s | Age after which a held written page whose session is unknown to its coordinator is released. |
-| `RACER_WRITE_ALIAS_SECS` | `604800` | Node | 3,600..2,592,000 s | How long an uploaded object's origin version stays mapped to its Racer version. |
+| `RACER_WRITE_ORPHAN_SECS` | `3600` | Node | 60..604,800 s | Age after which a held written page whose session is unknown to its coordinator is released. Parsed but not yet used. <!-- verify against WP8 --> |
+| `RACER_WRITE_ALIAS_SECS` | `604800` | Node | 3,600..2,592,000 s | How long an uploaded object's origin version stays mapped to its Racer version. Parsed but not yet used; no alias is kept. <!-- verify against WP8 --> |
 | `RACER_WRITE_UPLOAD_ATTEMPTS` | `10` | Node | 1..100 | Upload tries per written object before it is marked `failed`. |
 
 #### Timeouts
@@ -1222,9 +1223,9 @@ replace data, write a new key.
 `<key>` is the 64-hex cache key, and `Host` must be `racer`, as for reads.
 Writes never delete origin objects.
 
-When writes are off, or the cache is passthrough, these requests get `405`
-with `Allow: HEAD, POST`, the same as a node that does not support writes.
-<!-- verify against WP5 -->
+When writes are off, or the cache is passthrough, these requests, including
+`persist`, get `405` with `Allow: HEAD, POST`, the same as a node that does
+not support writes.
 
 #### Write request headers
 
@@ -1232,10 +1233,10 @@ with `Allow: HEAD, POST`, the same as a node that does not support writes.
 |--------|----------|------|
 | `Content-Length` | `PUT` | Required. 1 up to the size limit below. Missing: `411`. Too large: `413`. `0`: `400`. Other requests must send `0` or omit it. |
 | `If-None-Match` | `PUT`, `host-write` | Required, exactly `*`. Otherwise `428`. |
-| `Racer-Metadata` | all | Origin context, checked like reads. It must name the object without a version (Azure: no `versionId`). Required unless the upload mode is `never`. <!-- verify against WP5 --> |
+| `Racer-Metadata` | all | Origin context, checked like reads. It must name the object without a version (Azure: no `versionId`). Required on `persist`, and on `PUT` and `host-write` unless the upload mode is `never`. Optional on `DELETE`. Missing or versioned: `400`. |
 | `Authorization` | all | Optional, as for reads. |
 | `Racer-Durability` | `PUT`, `host-write` | `replicas=1`, `replicas=2`, `replicas=3`, or `origin`. Default `replicas=<writes.replicas>`. `origin` acknowledges only after the upload commits; with `Racer-Upload: manual` or `never` it is `400`. |
-| `Racer-Upload` | `PUT`, `host-write` | `auto`, `manual`, or `never` (lower case). Default `writes.upload.mode`. A cache without an origin accepts only `never`. <!-- verify against WP5 --> |
+| `Racer-Upload` | `PUT`, `host-write` | `auto`, `manual`, or `never` (lower case). Default `writes.upload.mode`. A cache without an origin accepts only `never`; other modes get `400`. |
 | `Racer-Hold-Seconds` | `PUT`, `host-write` | 1..2,592,000 (30 days). Default `writes.holdTTL`. |
 | `Racer-Content-Type` | `PUT`, `host-write` | Optional content type, stored with the object. |
 | `Racer-Source-Offset`, `Racer-Source-Length` | `host-write` | Required. The window of the passed descriptor. The length is the object size and must not be `0`. |
@@ -1252,7 +1253,8 @@ For `host-write`, the descriptor must be a regular file or memfd, as for
 
 An object has at most 50,000 pages, the Azure Blob block limit. Racer uploads
 one block per page. With 16 MiB pages, the largest object is
-838,860,800,000 bytes (about 781 GiB).
+838,860,800,000 bytes (about 781 GiB). Racer encodes the page holder table
+compactly, so default placement supports objects at this limit.
 
 #### Write responses
 
@@ -1263,6 +1265,7 @@ Response bodies are empty.
 | `201 Created` | `PUT` or `host-write` is durable at the requested level and visible to readers. Has `ETag: "racer-<32 hex>"` and `Racer-Upload-State`. |
 | `204 No Content` | `DELETE` or `persist` accepted. `persist` also returns `Racer-Upload-State`. |
 | `400` | Bad headers, a short body, or a bad header combination. |
+| `401`, `403` | Authorization or origin access was refused. |
 | `404` | `persist` or `DELETE` of a key with no written object. |
 | `405` | Writes off, passthrough cache, or wrong method. |
 | `409` | `persist` of an object that is not `manual`, or `DELETE` of an uploaded object. |
@@ -1270,11 +1273,10 @@ Response bodies are empty.
 | `412` | The key already exists in the cache or the origin. |
 | `413` | Object over the size limit. |
 | `428` | `If-None-Match: *` missing. |
-| `502` | Upload failed under `Racer-Durability: origin`. |
-| `503` | Racer cannot take the write now, for example because the dirty limit is reached or too few nodes are reachable. Has `Retry-After` in seconds. |
+| `431` | Request headers too large. |
+| `502` | Upload failed under `Racer-Durability: origin`. Token `upload`. |
+| `503` | Racer cannot take the write now, for example because the dirty limit is reached or too few nodes are reachable. Has `Retry-After: 1`. |
 | `504` | The request deadline passed before the write was durable. |
-
-<!-- verify against WP5: 404, 405, 409, 412, 502, 503, 504 and short-body 400 are served by the write service; 400, 411, 413, 428 are checked by the parser on this branch -->
 
 Errors may carry a `Racer-Write-Error` token for diagnosis:
 
@@ -1286,15 +1288,20 @@ Errors may carry a `Racer-Write-Error` token for diagnosis:
 | `lease` | The write session expired. |
 | `upload` | The upload failed. |
 | `uploaded` | `DELETE` of an object that is already in the origin. |
-| `conflict` | Another writer created the blob in the origin first. |
 | `not-manual` | `persist` of an object that is not `manual`. |
-| `lost` | Every copy of a page was lost before upload. |
+
+If another writer creates the blob in the origin first, the upload fails and
+the object's state becomes `failed`.
 
 #### Upload states
 
 `HEAD` on a written object returns its Racer `ETag`, `Content-Length`,
-`Racer-Expires-At` (the end of its hold), and `Racer-Upload-State`.
-<!-- verify against WP5 -->
+`Racer-Expires-At`, and `Racer-Upload-State`. `Racer-Expires-At` is when the
+reader must check again: about 1 second ahead, and never after the hold ends.
+Readers recheck written objects about every second, so a `DELETE` or a
+finished upload is seen across the cluster within about a second. After the
+upload commits, `HEAD` and reads return the origin blob's `ETag`, not the
+Racer `ETag`.
 
 | State | Meaning |
 |-------|---------|
@@ -1308,7 +1315,11 @@ Errors may carry a `Racer-Write-Error` token for diagnosis:
 Racer uploads each page as one Azure Put Block from a node that holds it, then
 commits the blob with Put Block List and `If-None-Match: *`. It tries an object
 up to `RACER_WRITE_UPLOAD_ATTEMPTS` times. Objects deleted, or whose hold ends,
-before the upload starts are dropped and never uploaded. <!-- verify against WP5 -->
+before the upload starts are dropped and never uploaded.
+
+Origin credentials are kept only in memory. If the node that coordinates an
+object restarts before its upload finishes, the upload waits until a client
+calls `persist` again with `Racer-Metadata`.
 
 #### Holds and the dirty limit
 
@@ -1317,28 +1328,29 @@ Each written object is pinned for its hold time and cannot be evicted. An
 whichever comes first. `manual`, `never`, and `failed` objects stay pinned
 until their hold ends, then are removed. Use `DELETE` to free them early.
 
-Each node limits the written data of a cache that is not yet uploaded to
-`writes.maxDirtyPercent` of the cache's disk share. A node over the limit
-refuses new pages, and Racer tries the next node in rank order. If no node can
-take a page, the write fails with `503`, `Retry-After`, and
-`Racer-Write-Error: dirty-cap`. The SDKs can retry these for you.
-<!-- verify against WP5 -->
+Each storage worker limits the written data of a cache that is not yet
+uploaded to `writes.maxDirtyPercent` of the worker's segment capacity. A node
+over the limit refuses new pages, and Racer tries the next node in rank order.
+If too few nodes can take a page and at least one was full, the write fails
+with `503`, `Retry-After: 1`, and `Racer-Write-Error: dirty-cap`. If no node
+was full, the token is `owners`. The SDKs can retry these for you.
 
 Node settings for writes are in the [Writes](#writes) table above.
 
 #### Write metrics
 
-<!-- verify against WP5: metric names come from the design; no write metrics exist on this branch -->
+Write metrics are per node. Most are labeled by cache ID, and a series
+appears only after the cache sees write activity.
 
 | Metric | Meaning |
 |--------|---------|
-| `racer_write_requests_total{cache,outcome}` | Write requests by outcome |
+| `racer_write_requests_total{cache,outcome}` | Write requests by outcome: `created`, `deleted`, `persisted`, `exists`, `rejected`, `unavailable`, `failed` |
 | `racer_write_bytes_total{cache}` | Bytes written |
 | `racer_write_dirty_bytes{cache}` | Written bytes not yet uploaded |
-| `racer_write_fsync_seconds` | Durability barrier latency (histogram) |
+| `racer_write_fsync_seconds` | Durability barrier latency on page stores and coordinator journal appends (histogram, no labels) |
 | `racer_write_upload_bytes_total{cache}` | Bytes uploaded to the origin |
 | `racer_write_upload_state{cache,state}` | Written objects by upload state |
-| `racer_write_repairs_total{cache}` | Pages copied again after a node loss |
+| `racer_write_repairs_total{cache}` | Pages copied again after a node loss. Stays `0` until repair is built. <!-- verify against WP8 --> |
 
 ### Spill holds
 
