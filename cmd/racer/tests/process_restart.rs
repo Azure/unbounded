@@ -1454,5 +1454,56 @@ fn periodic_checkpoint_sigkill_recovers_older_pages_and_bounds_recent_loss() {
     );
     assert!(second.stop(libc::SIGTERM).success(), "{}", second.logs());
 }
+
+/// A written object is durable once `PUT` returns `201`: after SIGKILL the
+/// next process restores its pages and session from the write journal and
+/// serves it without the origin, fresh and pinned.
+#[test]
+#[ignore = "requires root, private mount namespaces, io_uring and O_DIRECT"]
+fn sigkill_restart_recovers_written_pages_from_the_journal() {
+    let scratch = Scratch::new();
+    let control = control::Control::start(&scratch.0);
+    control.publication.lock().unwrap().caches[0].writes =
+        Some(racer_wire::control::WriteDefinition {
+            replicas: 1,
+            max_dirty_percent: 30,
+            hold_ttl: Duration::from_secs(3600),
+            upload_mode: racer_wire::control::UploadMode::Never,
+            upload_max_bytes_per_second: 0,
+            upload_max_concurrent_blocks: 16,
+        });
+    let (mut first, origin) = Process::start(&scratch, &control, 0);
+    origin.offline.store(true, Ordering::Release);
+    let mut socket = first.connect();
+    write!(
+        socket,
+        "PUT /v1/objects/{} HTTP/1.1\r\nHost: racer\r\nContent-Length: {LENGTH}\r\nIf-None-Match: *\r\nConnection: close\r\n\r\n",
+        "ab".repeat(32)
+    )
+    .unwrap();
+    let body: Vec<u8> = (0..LENGTH).map(byte).collect();
+    socket.write_all(&body).unwrap();
+    let head = read_head(&mut socket).unwrap();
+    let created = fields(&head);
+    assert!(head.starts_with("HTTP/1.1 201"), "{head}: {}", first.logs());
+    let etag = created["etag"].clone();
+    assert!(etag.starts_with("\"racer-"), "{etag}");
+    assert_eq!(first.stop(libc::SIGKILL).signal(), Some(libc::SIGKILL));
+    drop(origin);
+    let (mut second, origin) = Process::start(&scratch, &control, 1);
+    origin.offline.store(true, Ordering::Release);
+    for pin in [Some(etag.as_str()), None] {
+        let reply = second.request(pin, 0, LENGTH);
+        assert_eq!(reply.fields["etag"], etag);
+        assert_eq!(reply.fields["racer-object-length"], LENGTH.to_string());
+        assert_eq!(reply.body.len() as u64, LENGTH);
+    }
+    assert!(
+        origin.calls().is_empty(),
+        "a written object contacted the origin: {:?}",
+        origin.calls()
+    );
+    assert!(second.stop(libc::SIGTERM).success(), "{}", second.logs());
+}
 use racer::affinity::CpuLocation;
 use racer::affinity::EffectiveTopology;

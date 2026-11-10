@@ -58,7 +58,10 @@ impl Entry {
     pub fn metadata(&self, now: SystemTime) -> Option<ObjectMetadata> {
         let spec = self.session.spec();
         let hold = crate::store::writes::from_unix_millis(spec.hold_until_millis);
-        let expires = (now + METADATA_TTL).min(hold);
+        // Whole milliseconds: `ExpiresAt` refuses finer times.
+        let expires = crate::store::writes::from_unix_millis(crate::store::writes::unix_millis(
+            (now + METADATA_TTL).min(hold),
+        ));
         Some(ObjectMetadata {
             content_type: spec
                 .content_type

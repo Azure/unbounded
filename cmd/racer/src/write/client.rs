@@ -131,7 +131,7 @@ fn reject_for(error: Error) -> Reject {
 
 /// Whether `head` is a write the cache must serve: a write route on a cache
 /// with writes enabled. Writes on other caches keep the read parser's `405`.
-pub(crate) fn routes(local: &Coordinator, cache: &CacheId, head: &MessageHead) -> bool {
+pub fn routes(local: &Coordinator, cache: &CacheId, head: &MessageHead) -> bool {
     racer_wire::object::write::is_write(head)
         && local.availability.writes(cache).is_some()
         && !local.availability.passthrough(cache)
@@ -139,7 +139,7 @@ pub(crate) fn routes(local: &Coordinator, cache: &CacheId, head: &MessageHead) -
 
 /// Serve one write request and close the connection.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn serve(
+pub async fn serve(
     connection: ConnectionLease,
     head: MessageHead,
     descriptors: Vec<std::os::fd::OwnedFd>,

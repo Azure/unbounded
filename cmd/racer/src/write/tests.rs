@@ -86,3 +86,81 @@ fn host_sources_must_be_regular_files_covering_the_window() {
     let dir = std::fs::File::open(std::env::temp_dir()).unwrap();
     assert!(client::host_source(vec![std::os::fd::OwnedFd::from(dir)], 0, 0).is_err());
 }
+
+fn committed_entry(hold_until_millis: u64) -> directory::Entry {
+    use racer_core::write::{Durability, Holders, Session, SessionEvent, UploadMode, WriteSpec};
+    let etag = mint_etag([3; 16]).unwrap();
+    let spec = WriteSpec {
+        length: 10,
+        page_size: 4096,
+        content_type: Some("application/x-test".into()),
+        replicas: 1,
+        durability: Durability::Replicas(1),
+        upload: UploadMode::Never,
+        hold_until_millis,
+    };
+    let mut session = Session::open(
+        racer_core::write::WriteIdentity {
+            cache: object().cache.0,
+            key: object().key.0,
+            etag: String::from_utf8(etag.as_bytes().to_vec()).unwrap(),
+            session: racer_core::write::SessionId([1; 16]),
+        },
+        spec,
+        0,
+        60_000,
+    );
+    let effects = session.on_event(SessionEvent::Committed(Holders(vec![vec![b"n".to_vec()]])), 1);
+    assert!(!effects.is_empty());
+    directory::Entry {
+        role: directory::Role::Coordinator,
+        version: ObjectVersion {
+            object: object(),
+            etag,
+        },
+        session,
+        context: None,
+        commit_attempts: 0,
+    }
+}
+
+#[test]
+fn directory_serves_committed_versions_until_their_hold() {
+    let hold = 1_800_000_000_000;
+    let directory = Directory::default();
+    assert!(directory.insert(object(), committed_entry(hold)));
+    assert!(!directory.insert(object(), committed_entry(hold)));
+    // A wall clock with sub-millisecond precision still yields metadata.
+    let now = std::time::UNIX_EPOCH + std::time::Duration::from_nanos(1_700_000_000_123_456_789);
+    let current = directory.current(&object(), now).expect("visible");
+    assert_eq!(current.length, 10);
+    assert_eq!(current.expires_at.to_unix_millis().unwrap(), 1_700_000_001_123);
+    // The reader TTL never passes the hold.
+    let late = crate::store::writes::from_unix_millis(hold - 10);
+    assert_eq!(
+        directory
+            .current(&object(), late)
+            .unwrap()
+            .expires_at
+            .to_unix_millis()
+            .unwrap(),
+        hold
+    );
+    assert!(
+        directory
+            .current(&object(), crate::store::writes::from_unix_millis(hold))
+            .is_none()
+    );
+    assert_eq!(
+        directory.upload_states(),
+        vec![(object().cache.0, racer_core::write::UploadState::Never)]
+    );
+    let other = ObjectVersion {
+        object: object(),
+        etag: mint_etag([9; 16]).unwrap(),
+    };
+    assert!(directory.remove_version(&other).is_none());
+    assert_eq!(directory.len(), 1);
+    assert!(directory.remove(&object()).is_some());
+    assert!(directory.is_empty());
+}
