@@ -18,6 +18,7 @@ pub mod effect;
 pub mod errors;
 pub mod flight;
 pub mod hints;
+pub mod holders;
 pub mod serve;
 pub mod walk;
 pub mod window;
