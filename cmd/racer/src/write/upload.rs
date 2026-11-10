@@ -300,7 +300,9 @@ pub fn spawn_commit(local: &Coordinator, object: &ObjectId, membership: &Arc<Mem
                     Ok(Ok(etag)) => SessionEvent::BlockListCommitted {
                         blob_etag: String::from_utf8_lossy(etag.as_bytes()).into_owned(),
                     },
-                    Ok(Err(_conflict)) => SessionEvent::BlockListConflict,
+                    Ok(Err(_conflict)) => {
+                        conflict_outcome(&local, &version, &membership, &scope).await
+                    }
                     Err(_) => SessionEvent::UploadFailed,
                 }
             }
@@ -308,4 +310,52 @@ pub fn spawn_commit(local: &Coordinator, object: &ObjectId, membership: &Arc<Mem
         };
         background_event(&local, &object, session, event, &membership, &scope).await
     });
+}
+
+/// Probes of the other page-zero members after a block-list conflict.
+const CONFLICT_PROBES: u32 = 5;
+
+/// Wait between those probes.
+const CONFLICT_WAIT: Duration = Duration::from_millis(200);
+
+/// The event for a Put Block List conflict. After a coordinator failover two
+/// coordinators of the same version can both commit; the one that loses
+/// `If-None-Match: *` must not fail an object the other uploaded. Ask the
+/// other page-zero members: one that knows the version as committed means
+/// the blob is ours; one still uploading it is asked again shortly.
+/// Otherwise another writer won the key.
+async fn conflict_outcome(
+    local: &Coordinator,
+    version: &ObjectVersion,
+    membership: &Arc<Membership>,
+    scope: &RequestScope,
+) -> SessionEvent {
+    use super::failover::Knowledge;
+    use racer_core::write::UploadState;
+    let me = local.local_node();
+    let Ok(members) =
+        super::failover::page_zero_members(local, membership, &version.object, scope).await
+    else {
+        return SessionEvent::BlockListConflict;
+    };
+    for attempt in 0..CONFLICT_PROBES {
+        let mut uploading = false;
+        for node in members.iter().filter(|node| **node != me) {
+            match super::failover::probe(local, membership, node, version, scope).await {
+                Knowledge::Known(UploadState::Committed) => {
+                    return SessionEvent::UploadedElsewhere { blob_etag: None };
+                }
+                Knowledge::Known(UploadState::Uploading) => uploading = true,
+                _ => {}
+            }
+        }
+        if !uploading || attempt + 1 == CONFLICT_PROBES {
+            break;
+        }
+        let until = scope.clock().now() + CONFLICT_WAIT;
+        if sleep(local, until, scope).await.is_err() {
+            break;
+        }
+    }
+    SessionEvent::BlockListConflict
 }

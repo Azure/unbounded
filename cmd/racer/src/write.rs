@@ -19,11 +19,19 @@
 //!   and make it durable with `StoreWriter::persist_written`.
 //! - Holders upload their pages with Put Block ([`upload`]); the coordinator
 //!   commits the block list.
+//! - Maintenance keeps written objects alive and bounded (WP8): [`repair`]
+//!   restores lost copies, [`failover`] moves the coordinator role to a
+//!   manifest replica, [`rekey`] reseals pinned pages before their key ages
+//!   out, and [`gc`] drops orphaned pages and pages of removed caches.
 
 pub mod client;
 pub mod coordinator;
 pub mod directory;
+pub mod failover;
+pub mod gc;
 pub mod metrics;
+pub mod rekey;
+pub mod repair;
 pub mod staging;
 pub mod store_target;
 pub mod upload;
@@ -131,6 +139,8 @@ pub struct WriteService {
     loaded: Cell<bool>,
     next_tick: Cell<Option<Instant>>,
     ticking: Rc<Cell<bool>>,
+    pub(crate) gc: RefCell<gc::GcState>,
+    pub(crate) rekey: RefCell<rekey::RekeyState>,
     /// Test override of the origin used for create-once checks; with it,
     /// every cache counts as having a native origin.
     #[cfg(test)]
@@ -150,6 +160,8 @@ impl WriteService {
             loaded: Cell::new(false),
             next_tick: Cell::new(None),
             ticking: Rc::new(Cell::new(false)),
+            gc: RefCell::default(),
+            rekey: RefCell::default(),
             #[cfg(test)]
             origin: RefCell::new(None),
         }

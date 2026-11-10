@@ -118,16 +118,15 @@ fn committed_entry(hold_until_millis: u64) -> directory::Entry {
         1,
     );
     assert!(!effects.is_empty());
-    directory::Entry {
-        role: directory::Role::Coordinator,
-        version: ObjectVersion {
+    directory::Entry::new(
+        directory::Role::Coordinator,
+        ObjectVersion {
             object: object(),
             etag,
         },
         session,
-        context: None,
-        commit_attempts: 0,
-    }
+        None,
+    )
 }
 
 #[test]

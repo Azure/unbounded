@@ -386,6 +386,30 @@ impl Cluster {
             .sum()
     }
 
+    /// Per node, the role, phase, and upload state of every tracked session.
+    fn roles(
+        &self,
+    ) -> Vec<(
+        usize,
+        crate::write::directory::Role,
+        racer_core::write::Phase,
+        racer_core::write::UploadState,
+    )> {
+        let mut out = Vec::new();
+        for (index, node) in self.harness.nodes.iter().enumerate() {
+            for worker in &node.workers {
+                let directory = worker.app.coordinator.writes().directory().clone();
+                for object in directory.objects() {
+                    directory.with(&object, |e| {
+                        let e = e.unwrap();
+                        out.push((index, e.role, e.session.phase(), e.session.state()));
+                    });
+                }
+            }
+        }
+        out
+    }
+
     fn version(&self, object: usize, response: &Response) -> ObjectVersion {
         ObjectVersion {
             object: self.object(object),
@@ -808,7 +832,7 @@ fn holds_expire() {
     c.wait(Duration::from_secs(31));
     c.wait(Duration::from_secs(1));
     assert_eq!(c.written(), 0);
-    assert_eq!(c.sessions(), 0);
+    assert_eq!(c.sessions(), 0, "{:?}", c.roles());
     assert_eq!(c.head(1, OBJECT).status, 404);
 }
 

@@ -190,7 +190,7 @@ async fn session(
         WriteAction::Persist => persist(local, &object, context, &membership, scope).await,
         WriteAction::Replicate { manifest } => {
             let version = version.ok_or(Error::InvalidRequest)?;
-            replicate(local, version, manifest, scope).await
+            replicate(local, version, manifest, context, &membership, scope).await
         }
         WriteAction::ReplicateRanked {
             mut manifest,
@@ -203,7 +203,7 @@ async fn session(
                 Err(Error::InvalidRequest) => return Ok(WriteReply::Failed),
                 Err(error) => return Err(error),
             };
-            replicate(local, version, manifest, scope).await
+            replicate(local, version, manifest, context, &membership, scope).await
         }
     }
 }
@@ -227,7 +227,7 @@ fn event(
 }
 
 /// Apply `event` to whatever session `object` has.
-fn object_event(
+pub(crate) fn object_event(
     local: &Coordinator,
     object: &ObjectId,
     event: SessionEvent,
@@ -292,13 +292,12 @@ async fn open(
     // same key sees it.
     if !directory.insert(
         object.clone(),
-        Entry {
-            role: Role::Coordinator,
-            version: version.clone(),
-            session: opened,
-            context: Some(super::duplicate_context(context)?),
-            commit_attempts: 0,
-        },
+        Entry::new(
+            Role::Coordinator,
+            version.clone(),
+            opened,
+            Some(super::duplicate_context(context)?),
+        ),
     ) {
         return Ok(WriteReply::Exists);
     }
@@ -378,42 +377,69 @@ async fn commit(
     Ok(WriteReply::Committed { state })
 }
 
-/// Send the manifest to the next `replicas - 1` members of the page-zero
-/// ranking. Best effort: the coordinator's journal is already durable.
-async fn replicate_manifest(
+/// Send the manifest, with the upload credentials when this worker has
+/// them, to the next `replicas - 1` members of the page-zero ranking. Best
+/// effort: the coordinator's journal is already durable.
+pub(crate) async fn replicate_manifest(
     local: &Coordinator,
     object: &ObjectId,
     membership: &Arc<Membership>,
     scope: &RequestScope,
 ) {
-    let Some((version, manifest)) = local.writes.directory().with(object, |e| {
-        e.map(|e| (e.version.clone(), e.session.manifest()))
-    }) else {
-        return;
-    };
     let me = local.local_node();
     let Ok(ranked) = ranked(local, membership, object, 0, scope).await else {
         return;
     };
+    let Some(replicas) = local.writes.directory().with(object, |e| {
+        e.map(|e| usize::from(e.session.spec().replicas.saturating_sub(1)))
+    }) else {
+        return;
+    };
     let replicas: Vec<NodeId> = ranked
         .into_iter()
-        .filter(|node| *node != me)
-        .take(usize::from(manifest.spec.replicas.saturating_sub(1)))
+        .filter(|node| *node != me && membership.serves(&object.cache, node))
+        .take(replicas)
         .collect();
-    if replicas.is_empty() {
+    send_manifest(local, object, &replicas, membership, scope).await;
+}
+
+/// Send this worker's manifest of `object` (and its upload credentials,
+/// when it has them) to `nodes`.
+pub(crate) async fn send_manifest(
+    local: &Coordinator,
+    object: &ObjectId,
+    nodes: &[NodeId],
+    membership: &Arc<Membership>,
+    scope: &RequestScope,
+) {
+    if nodes.is_empty() {
         return;
     }
+    let Some((version, manifest, credentials)) = local.writes.directory().with(object, |e| {
+        e.map(|e| {
+            (
+                e.version.clone(),
+                e.session.manifest(),
+                e.context
+                    .as_ref()
+                    .and_then(|c| super::duplicate_context(c).ok()),
+            )
+        })
+    }) else {
+        return;
+    };
     let Some(action) = manifest_action(local, membership, object, manifest, scope).await else {
         return;
     };
-    let context = super::bare_context(object);
-    let sends = replicas.iter().map(|node| {
+    let context = credentials.unwrap_or_else(|| super::bare_context(object));
+    let context = &context;
+    let sends = nodes.iter().map(|node| {
         let operation = PeerOperation::WriteSession {
             object: object.clone(),
             etag: Some(version.etag.clone()),
             action: Box::new(action.clone()),
         };
-        send(local, membership, node, operation, &context, scope)
+        send(local, membership, node, operation, context, scope)
     });
     let _ = futures::future::join_all(sends).await;
 }
@@ -628,7 +654,7 @@ async fn replica_nodes(
         .unwrap_or_default()
 }
 
-fn delete_record(version: &ObjectVersion) -> Result<JournalRecord> {
+pub(crate) fn delete_record(version: &ObjectVersion) -> Result<JournalRecord> {
     Ok(JournalRecord::Delete {
         cache: version.object.cache.0.clone(),
         key: version.object.key.0,
@@ -682,10 +708,15 @@ async fn replicate(
     local: &Coordinator,
     version: ObjectVersion,
     manifest: Manifest,
+    context: &OriginContext,
+    membership: &Arc<Membership>,
     scope: &RequestScope,
 ) -> Result<WriteReply> {
     let object = version.object.clone();
-    if !writes_enabled(local, &object) || manifest.etag != etag_text(&version.etag)? {
+    if !writes_enabled(local, &object)
+        || manifest.etag != etag_text(&version.etag)?
+        || now_millis(local) >= manifest.spec.hold_until_millis
+    {
         return Ok(WriteReply::Failed);
     }
     let directory = local.writes.directory().clone();
@@ -695,29 +726,102 @@ async fn replicate(
     }) {
         return Ok(WriteReply::Exists);
     }
+    // The writer's origin credentials travel with the manifest, so a replica
+    // that takes over can finish the upload (WP8).
+    let credentials = (context.authorization.is_some() || context.metadata.is_some())
+        .then(|| super::duplicate_context(context).ok())
+        .flatten();
+    let held = directory.with(&object, |e| {
+        e.filter(|e| e.version == version).map(|e| e.role)
+    });
+    if held == Some(Role::Coordinator) {
+        // Another coordinator of this version (a failover overlap): merge
+        // its holders and its upload outcome into ours.
+        return merge(local, &object, manifest, credentials, membership, scope).await;
+    }
     let state = manifest.state;
+    let lease = u64::try_from(local.writes.settings().lease.as_millis()).unwrap_or(u64::MAX);
+    let mut session = Session::from_manifest(
+        object.cache.0.clone(),
+        object.key.0,
+        manifest.clone(),
+        lease,
+    );
+    let mut context = credentials;
+    if held == Some(Role::Replica) {
+        // The sender's holder table is authoritative; keep an upload this
+        // replica already saw commit, and its credentials.
+        let now = now_millis(local);
+        let previous = directory.with(&object, |e| {
+            e.map(|e| {
+                (
+                    e.session.state(),
+                    e.session.blob_etag().map(str::to_owned),
+                    e.context
+                        .as_ref()
+                        .and_then(|c| super::duplicate_context(c).ok()),
+                )
+            })
+        });
+        if let Some((previous_state, blob_etag, previous_context)) = previous {
+            if previous_state == UploadState::Committed {
+                session.on_event(SessionEvent::UploadedElsewhere { blob_etag }, now);
+            }
+            if context.is_none() {
+                context = previous_context;
+            }
+        }
+    }
     journal(
         local,
         JournalRecord::Commit {
             cache: object.cache.0.clone(),
             key: object.key.0,
-            manifest: manifest.clone(),
+            manifest: session.manifest(),
         },
     )
     .await?;
-    let lease = u64::try_from(local.writes.settings().lease.as_millis()).unwrap_or(u64::MAX);
     directory.replace(
         object.clone(),
-        Entry {
-            role: Role::Replica,
-            version,
-            session: Session::from_manifest(object.cache.0.clone(), object.key.0, manifest, lease),
-            context: None,
-            commit_attempts: 0,
-        },
+        Entry::new(Role::Replica, version, session, context),
     );
     publish(local, &object)?;
-    let _ = scope;
+    Ok(WriteReply::Committed { state })
+}
+
+/// Merge a manifest from another coordinator of the same version into this
+/// coordinator's session: union the holders, and adopt its upload if it
+/// committed the block list.
+async fn merge(
+    local: &Coordinator,
+    object: &ObjectId,
+    manifest: Manifest,
+    credentials: Option<OriginContext>,
+    membership: &Arc<Membership>,
+    scope: &RequestScope,
+) -> Result<WriteReply> {
+    let directory = local.writes.directory();
+    directory.with(object, |e| {
+        if let Some(e) = e
+            && e.context.is_none()
+        {
+            e.context = credentials;
+        }
+    });
+    let mut events = vec![SessionEvent::HoldersMerged(manifest.holders)];
+    if manifest.state == UploadState::Committed {
+        events.push(SessionEvent::UploadedElsewhere {
+            blob_etag: manifest.blob_etag,
+        });
+    }
+    for event in events {
+        if let Some(effects) = object_event(local, object, event) {
+            apply(local, object, effects, membership, scope).await?;
+        }
+    }
+    let state = directory
+        .with(object, |e| e.map(|e| e.session.state()))
+        .ok_or(Error::Unavailable)?;
     Ok(WriteReply::Committed { state })
 }
 
@@ -791,6 +895,9 @@ pub(crate) async fn apply(
                     .writer
                     .index()
                     .invalidate_current(object);
+                // Manifest replicas (and a coordinator this one overlapped
+                // with after a failover) learn the upload committed.
+                spawn_replicate(local, object, membership);
             }
             SessionEffect::Notify(_) => {}
             SessionEffect::Release { nodes } => {
@@ -804,13 +911,30 @@ pub(crate) async fn apply(
                 super::upload::spawn_commit(local, object, membership);
             }
             SessionEffect::Restore { .. } => {
-                // Repair is WP8: record nothing durable here; the holder
-                // table already reflects the loss.
+                // One repair task restores every under-replicated page.
+                super::repair::spawn(local, object, membership);
             }
             SessionEffect::Reject(why) => rejection = Some(why),
         }
     }
     Ok(rejection)
+}
+
+/// Send `object`'s manifest to its manifest replicas in the background.
+fn spawn_replicate(local: &Coordinator, object: &ObjectId, membership: &Arc<Membership>) {
+    let Ok(local) = local.prefetch_directory().local_coordinator() else {
+        return;
+    };
+    let Ok(permit) = local.drivers().reserve() else {
+        return;
+    };
+    let object = object.clone();
+    let membership = membership.clone();
+    permit.submit_detached(async move {
+        let scope = background_scope(&local)?;
+        replicate_manifest(&local, &object, &membership, &scope).await;
+        Ok::<(), Error>(())
+    });
 }
 
 /// A scope for detached coordinator work.
@@ -999,20 +1123,15 @@ pub(crate) fn load(local: &Coordinator) {
         };
         directory.replace(
             object,
-            Entry {
-                role: Role::Coordinator,
-                version,
-                session,
-                context: None,
-                commit_attempts: 0,
-            },
+            Entry::new(Role::Coordinator, version, session, None),
         );
     }
 }
 
 /// One maintenance turn: load the journal, expire leases and holds, drop
-/// expired holder pages, keep visible versions' descriptors published, and
-/// sample metrics.
+/// expired holder pages, rekey, collect garbage, decide coordinator roles,
+/// repair lost copies, resume pending uploads, keep visible versions'
+/// descriptors published, and sample metrics.
 pub(crate) async fn maintain(local: &Coordinator) -> Result<()> {
     load(local);
     let scope = background_scope(local)?;
@@ -1027,6 +1146,17 @@ pub(crate) async fn maintain(local: &Coordinator) -> Result<()> {
     }
     let membership = local.current_membership();
     let directory = local.writes.directory().clone();
+    // WP8: garbage, keys, roles, and repair. Each step is best effort; a
+    // failure leaves the rest of the turn to run.
+    let _ = super::rekey::run(local, &scope).await;
+    if let Some(membership) = &membership {
+        let _ = super::gc::collect(local, membership, &scope).await;
+        let _ = super::failover::check_roles(local, membership, &scope).await;
+        for object in directory.objects() {
+            let _ = super::repair::maintain_object(local, &object, membership, &scope).await;
+            let _ = super::failover::resume(local, &object, membership, &scope).await;
+        }
+    }
     for object in directory.objects() {
         let due = directory.with(&object, |e| {
             let e = e?;

@@ -262,6 +262,15 @@ impl Availability {
         self.keys.generation().ok().flatten()
     }
 
+    /// ID of the active page key of `cache`, the key new pages are sealed
+    /// under; `None` without one.
+    pub fn active_page_key(&self, cache: &CacheId) -> Option<KeyId> {
+        self.keys
+            .active(cache, KeyPurpose::Page)
+            .ok()
+            .map(|lease| lease.id())
+    }
+
     /// Require cache admission and the exact key needed by a stored page.
     pub fn page(&self, cache: &CacheId, key: KeyId) -> bool {
         self.cache(cache) && self.keys.admits(cache, key, KeyPurpose::Page)

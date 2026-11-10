@@ -50,9 +50,35 @@ pub struct Entry {
 
     /// Upload attempts made by Put Block List.
     pub commit_attempts: u32,
+
+    /// A repair task is restoring copies of this version's pages.
+    pub repairing: bool,
+
+    /// When this worker last decided its role for this entry, and under
+    /// which membership version. `None` forces a
+    /// check on the next maintenance turn.
+    pub role_checked: Option<(u64, std::time::Instant)>,
 }
 
 impl Entry {
+    /// An entry with no repair running and no role decided yet.
+    pub fn new(
+        role: Role,
+        version: ObjectVersion,
+        session: Session,
+        context: Option<OriginContext>,
+    ) -> Self {
+        Self {
+            role,
+            version,
+            session,
+            context,
+            commit_attempts: 0,
+            repairing: false,
+            role_checked: None,
+        }
+    }
+
     /// Immutable metadata with a reader TTL of [`METADATA_TTL`], capped at
     /// the hold deadline.
     pub fn metadata(&self, now: SystemTime) -> Option<ObjectMetadata> {
