@@ -3,6 +3,19 @@
 //! The write value types ([`UploadMode`], [`Durability`], [`UploadState`]) live
 //! here because racer-core depends on racer-wire; `racer_core::write`
 //! re-exports them.
+//!
+//! [`is_write`] routes a head here before [`super::client::RequestParser`],
+//! which keeps rejecting write methods. [`parse_write`] validates a write head
+//! with the same style as the read parser: duplicate singleton fields,
+//! decoded-size limit, `Host: racer`, and opaque context validation.
+
+use crate::http::{Header, MessageHead, StartLine, is_token, trim_ows};
+use crate::object::client::{Destination, MAX_HEAD_BYTES};
+use crate::object::model::{
+    CacheKey, ContentType, MAX_FIELD_BYTES, MAX_WIRE_INTEGER, ObjectMetadata, PageSize, StrongEtag,
+    parse_decimal,
+};
+use std::collections::HashSet;
 
 /// When a written object is uploaded to the origin, from `Racer-Upload`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -202,3 +215,427 @@ mod value_tests {
         }
     }
 }
+
+/// Largest `Racer-Hold-Seconds`, the 30-day hard-hold limit.
+pub const MAX_HOLD_SECONDS: u64 = 2_592_000;
+/// Azure Blob block limit; writes use one block per page.
+pub const MAX_WRITE_PAGES: u64 = 50_000;
+
+/// Largest object a cache with this page size accepts.
+pub fn max_object_bytes(page_size: PageSize) -> u64 {
+    MAX_WRITE_PAGES * page_size.get()
+}
+
+/// `Racer-Write-Error` diagnostic tokens.
+pub mod error_token {
+    pub const DIRTY_CAP: &str = "dirty-cap";
+    pub const OWNERS: &str = "owners";
+    pub const COORDINATOR: &str = "coordinator";
+    pub const LEASE: &str = "lease";
+    pub const UPLOAD: &str = "upload";
+    pub const UPLOADED: &str = "uploaded";
+    pub const CONFLICT: &str = "conflict";
+    pub const NOT_MANUAL: &str = "not-manual";
+    pub const LOST: &str = "lost";
+}
+
+/// A write operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WriteKind {
+    /// `PUT /v1/objects/<key>` with a body of exactly `content_length` bytes.
+    Put { content_length: u64 },
+    /// `POST /v1/objects/<key>/host-write`; the object is the descriptor
+    /// window `source`, and `source.length` is the object length.
+    HostWrite { source: Destination },
+    /// `POST /v1/objects/<key>/persist`.
+    Persist,
+    /// `DELETE /v1/objects/<key>`.
+    Delete,
+}
+
+impl WriteKind {
+    /// Whether this request creates an object.
+    pub fn creates(&self) -> bool {
+        matches!(self, Self::Put { .. } | Self::HostWrite { .. })
+    }
+
+    /// Object length for creating requests.
+    pub fn object_length(&self) -> Option<u64> {
+        match self {
+            Self::Put { content_length } => Some(*content_length),
+            Self::HostWrite { source } => Some(source.length),
+            _ => None,
+        }
+    }
+}
+
+/// Validated write request borrowing opaque fields. Deliberately neither
+/// Clone nor Debug, to avoid duplicating or logging secrets.
+pub struct WriteRequest<'a> {
+    pub kind: WriteKind,
+
+    pub key: CacheKey,
+
+    pub metadata: Option<&'a [u8]>,
+
+    pub authorization: Option<&'a [u8]>,
+
+    pub content_type: Option<ContentType>,
+
+    /// `None` selects the cache default.
+    pub durability: Option<Durability>,
+
+    /// `None` selects the cache default.
+    pub upload: Option<UploadMode>,
+
+    pub hold_seconds: Option<u64>,
+}
+
+/// Write parse failure. The read-path [`super::Error`] has no variants for
+/// `411`, `413`, or `428`, so writes carry their own.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WriteError {
+    /// A shared object protocol failure (`400`, `405`, `431`, ...).
+    Object(super::Error),
+    /// `PUT` without `Content-Length`: `411`.
+    LengthRequired,
+    /// Object above [`max_object_bytes`]: `413`.
+    PayloadTooLarge,
+    /// Creating request without `If-None-Match: *`: `428`.
+    PreconditionRequired,
+}
+
+impl WriteError {
+    /// HTTP status for the variants specific to writes; `None` for
+    /// [`WriteError::Object`], which callers map like read errors.
+    pub fn status(&self) -> Option<u16> {
+        match self {
+            Self::Object(_) => None,
+            Self::LengthRequired => Some(411),
+            Self::PayloadTooLarge => Some(413),
+            Self::PreconditionRequired => Some(428),
+        }
+    }
+}
+
+impl From<super::Error> for WriteError {
+    fn from(error: super::Error) -> Self {
+        Self::Object(error)
+    }
+}
+
+impl std::fmt::Display for WriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+impl std::error::Error for WriteError {}
+
+/// Result of parsing a write head.
+pub type WriteResult<T> = std::result::Result<T, WriteError>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Route {
+    Put,
+    Delete,
+    HostWrite,
+    Persist,
+}
+
+/// Classify the start line without reading fields.
+fn route(head: &MessageHead) -> Option<(Route, &str)> {
+    let StartLine::Request { method, target } = &head.start else {
+        return None;
+    };
+    let path = target.strip_prefix("/v1/objects/")?;
+    let (key, route) = match (method.as_str(), path.split_once('/')) {
+        ("PUT", None) => (path, Route::Put),
+        ("DELETE", None) => (path, Route::Delete),
+        ("POST", Some((key, "host-write"))) => (key, Route::HostWrite),
+        ("POST", Some((key, "persist"))) => (key, Route::Persist),
+        _ => return None,
+    };
+    (key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit())).then_some((route, key))
+}
+
+/// Whether this head is a write: `PUT` or `DELETE` on `/v1/objects/<64 hex>`,
+/// or `POST` on `/v1/objects/<64 hex>/host-write` or `/persist`.
+pub fn is_write(head: &MessageHead) -> bool {
+    route(head).is_some()
+}
+
+/// Validate a write head. `page_size` is the cluster page size and bounds the
+/// object length at [`max_object_bytes`]. Upload-mode defaults are not known
+/// here: callers resolve them, then enforce that `Racer-Metadata` is present
+/// for modes other than `never` and that the cache accepts the mode.
+pub fn parse_write<'a>(
+    head: &'a MessageHead,
+    header_limit: usize,
+    page_size: PageSize,
+) -> WriteResult<WriteRequest<'a>> {
+    let header_limit = header_limit.min(MAX_HEAD_BYTES);
+    let Some((route, key_text)) = route(head) else {
+        return Err(super::Error::MethodNotAllowed.into());
+    };
+    let StartLine::Request { method, target } = &head.start else {
+        unreachable!("route accepted a request line");
+    };
+    let creates = matches!(route, Route::Put | Route::HostWrite);
+    let invalid = || WriteError::Object(super::Error::InvalidRequest);
+    let mut decoded_bytes = method.len().saturating_add(target.len());
+    let mut seen = HashSet::new();
+    let mut host = None;
+    let mut content_length = None;
+    let mut if_none_match = None;
+    let mut metadata = None;
+    let mut authorization = None;
+    let mut content_type = None;
+    let mut durability = None;
+    let mut upload = None;
+    let mut hold_seconds = None;
+    let mut source_offset = None;
+    let mut source_length = None;
+    for header in &head.headers {
+        decoded_bytes = decoded_bytes
+            .saturating_add(header.name.len())
+            .saturating_add(header.value.len());
+        if decoded_bytes > header_limit {
+            return Err(super::Error::HeaderTooLarge.into());
+        }
+        if header.name.is_empty()
+            || !header.name.bytes().all(is_token)
+            || header
+                .value
+                .iter()
+                .any(|&b| b == 0x7f || (b < 0x20 && b != b'\t'))
+        {
+            return Err(invalid());
+        }
+        let name = header.name.to_ascii_lowercase();
+        let value = header.value.as_slice();
+        if matches!(
+            name.as_str(),
+            "host"
+                | "content-length"
+                | "content-type"
+                | "if-none-match"
+                | "racer-metadata"
+                | "authorization"
+                | "racer-content-type"
+                | "racer-durability"
+                | "racer-upload"
+                | "racer-hold-seconds"
+                | "racer-source-offset"
+                | "racer-source-length"
+        ) && !seen.insert(name.clone())
+        {
+            return Err(invalid());
+        }
+        match name.as_str() {
+            "host" => host = Some(trim_ows(value) == b"racer"),
+            "content-length" => content_length = Some(parse_decimal(value)?),
+            "transfer-encoding"
+            | "content-encoding"
+            | "content-range"
+            | "trailer"
+            | "upgrade"
+            | "expect"
+            | "etag"
+            | "if-match"
+            | "if-modified-since"
+            | "if-unmodified-since"
+            | "if-range"
+            | "range"
+            | "racer-expires-at" => return Err(invalid()),
+            "connection"
+                if value
+                    .split(|&b| b == b',')
+                    .any(|token| trim_ows(token).eq_ignore_ascii_case(b"upgrade")) =>
+            {
+                return Err(invalid());
+            }
+            "racer-metadata" => {
+                validate_opaque(value)?;
+                metadata = Some(value);
+            }
+            "authorization" => {
+                validate_opaque(value)?;
+                authorization = Some(value);
+            }
+            "if-none-match" if creates => if_none_match = Some(trim_ows(value) == b"*"),
+            "racer-content-type" if creates => {
+                content_type = Some(ContentType::parse(trim_ows(value))?);
+            }
+            "racer-durability" if creates => {
+                durability = Some(Durability::parse(trim_ows(value)).ok_or_else(invalid)?);
+            }
+            "racer-upload" if creates => {
+                upload = Some(UploadMode::parse(trim_ows(value)).ok_or_else(invalid)?);
+            }
+            "racer-hold-seconds" if creates => {
+                let seconds = parse_decimal(value)?;
+                if !(1..=MAX_HOLD_SECONDS).contains(&seconds) {
+                    return Err(invalid());
+                }
+                hold_seconds = Some(seconds);
+            }
+            "racer-source-offset" if route == Route::HostWrite => {
+                source_offset = Some(parse_decimal(value)?);
+            }
+            "racer-source-length" if route == Route::HostWrite => {
+                source_length = Some(parse_decimal(value)?);
+            }
+            // Creation fields on a non-creating request are a client bug.
+            "if-none-match"
+            | "racer-content-type"
+            | "racer-durability"
+            | "racer-upload"
+            | "racer-hold-seconds"
+            | "racer-source-offset"
+            | "racer-source-length" => {
+                return Err(invalid());
+            }
+            _ => {}
+        }
+    }
+    if host != Some(true) {
+        return Err(invalid());
+    }
+    let key = CacheKey::parse_hex(key_text.as_bytes())?;
+    let limit = max_object_bytes(page_size);
+    let kind = match route {
+        Route::Put => {
+            let length = content_length.ok_or(WriteError::LengthRequired)?;
+            if length == 0 {
+                return Err(invalid());
+            }
+            if length > limit {
+                return Err(WriteError::PayloadTooLarge);
+            }
+            WriteKind::Put {
+                content_length: length,
+            }
+        }
+        _ if content_length.is_some_and(|length| length != 0) => return Err(invalid()),
+        Route::HostWrite => {
+            let source = Destination {
+                offset: source_offset.ok_or_else(invalid)?,
+                length: source_length
+                    .filter(|&length| length != 0)
+                    .ok_or_else(invalid)?,
+            };
+            source
+                .offset
+                .checked_add(source.length)
+                .filter(|&end| end <= MAX_WIRE_INTEGER)
+                .ok_or_else(invalid)?;
+            if source.length > limit {
+                return Err(WriteError::PayloadTooLarge);
+            }
+            WriteKind::HostWrite { source }
+        }
+        Route::Persist => WriteKind::Persist,
+        Route::Delete => WriteKind::Delete,
+    };
+    if creates && if_none_match != Some(true) {
+        return Err(WriteError::PreconditionRequired);
+    }
+    if durability == Some(Durability::Origin)
+        && matches!(upload, Some(UploadMode::Never | UploadMode::Manual))
+    {
+        return Err(invalid());
+    }
+    Ok(WriteRequest {
+        kind,
+        key,
+        metadata,
+        authorization,
+        content_type,
+        durability,
+        upload,
+        hold_seconds,
+    })
+}
+
+/// Same rules as the read parser's opaque context fields.
+fn validate_opaque(value: &[u8]) -> super::Result<()> {
+    if value.len() > MAX_FIELD_BYTES {
+        return Err(super::Error::HeaderTooLarge);
+    }
+    if value.is_empty()
+        || value.first() == Some(&b' ')
+        || value.last() == Some(&b' ')
+        || value.iter().any(|&b| b < 0x20 || b == 0x7f)
+    {
+        return Err(super::Error::InvalidRequest);
+    }
+    Ok(())
+}
+
+/// `201 Created` for a durable, visible write.
+pub fn write_created_head(etag: &StrongEtag, state: UploadState) -> MessageHead {
+    MessageHead {
+        start: StartLine::Response { status: 201 },
+        headers: vec![
+            Header::new("ETag", etag.as_bytes()),
+            Header::new("Racer-Upload-State", state.as_str()),
+            Header::new("Content-Length", "0"),
+        ],
+    }
+}
+
+/// `204 No Content` for an accepted `DELETE` (no state) or `persist`.
+pub fn write_no_content_head(state: Option<UploadState>) -> MessageHead {
+    let mut headers = Vec::new();
+    if let Some(state) = state {
+        headers.push(Header::new("Racer-Upload-State", state.as_str()));
+    }
+    // 204 carries no Content-Length; the response has no body by definition.
+    MessageHead {
+        start: StartLine::Response { status: 204 },
+        headers,
+    }
+}
+
+/// Zero-body write error. `405` carries `Allow: HEAD, POST, PUT, DELETE`
+/// (writes enabled; disabled caches use [`super::client::error_head`]).
+/// `error` is a `Racer-Write-Error` token from [`error_token`].
+pub fn write_error_head(status: u16, error: Option<&str>, retry_after: Option<u32>) -> MessageHead {
+    let mut headers = vec![Header::new("Content-Length", "0")];
+    if status == 405 {
+        headers.push(Header::new("Allow", "HEAD, POST, PUT, DELETE"));
+    }
+    if let Some(error) = error {
+        headers.push(Header::new("Racer-Write-Error", error));
+    }
+    if let Some(seconds) = retry_after {
+        headers.push(Header::new("Retry-After", seconds.to_string()));
+    }
+    MessageHead {
+        start: StartLine::Response { status },
+        headers,
+    }
+}
+
+/// HEAD success for a possibly written object: [`super::client::success_head`]
+/// plus `Racer-Upload-State` before `Content-Length` when `state` is set.
+pub fn success_head_with_upload(
+    metadata: &ObjectMetadata,
+    state: Option<UploadState>,
+) -> super::Result<MessageHead> {
+    let mut head = super::client::success_head(metadata, None)?;
+    if let Some(state) = state {
+        let at = head
+            .headers
+            .iter()
+            .position(|h| h.name.eq_ignore_ascii_case("Content-Length"))
+            .unwrap_or(head.headers.len());
+        head.headers
+            .insert(at, Header::new("Racer-Upload-State", state.as_str()));
+    }
+    Ok(head)
+}
+
+#[cfg(test)]
+mod tests;

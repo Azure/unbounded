@@ -537,9 +537,24 @@ pub fn success_head(
 
 /// Encode a zero-body error selected by application policy, with required metadata.
 pub fn error_head(status: u16, unsatisfied_length: Option<u64>) -> Result<MessageHead> {
+    error_head_with_allow(status, unsatisfied_length, false)
+}
+
+/// [`error_head`] for a cache that may enable writes: with `allow_writes`, a
+/// `405` advertises `Allow: HEAD, POST, PUT, DELETE`.
+pub fn error_head_with_allow(
+    status: u16,
+    unsatisfied_length: Option<u64>,
+    allow_writes: bool,
+) -> Result<MessageHead> {
     let mut headers = vec![header("Content-Length", "0")];
     if status == 405 {
-        headers.push(header("Allow", "HEAD, POST"));
+        let allow = if allow_writes {
+            "HEAD, POST, PUT, DELETE"
+        } else {
+            "HEAD, POST"
+        };
+        headers.push(header("Allow", allow));
     }
     if status == 416 {
         let length = unsatisfied_length
