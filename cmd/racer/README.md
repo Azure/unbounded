@@ -60,6 +60,25 @@ dashboards and alerts that use the old names:
 | `racer_peer_local_pressure_total` | Removed; `racer_peer_admission_limit` is now a fixed cap |
 
 
+## Adapter persistence
+
+A ClusterCache with `spec.persistence: Adapter` publishes `CacheMode::Adapter`
+(wire spelling `adapter`). `CacheMode::disk()` is false for it, as for
+passthrough, so the store refuses its writes (`StoreWriter::allowed`), fills
+never persist it, reads skip Racer's disk and never spill, and every snapshot
+purges its disk records. Unlike passthrough, its pages and metadata stay in
+memory.
+
+On a miss, `Fill::acquire_once` asks the sources that
+`racer_core::read::local_sources` lists after memory and pending copies, and
+before the ranked owner walk and the remote origin. For an adapter cache that
+is `LocalSource::AdapterReplica`: `Origin::local_page_reserved` sends the
+node's own origin socket a pinned page `GET` with `Racer-Source: local`. A
+`404` or `412` is a local miss. A miss or any failure other than cancellation
+falls through without origin failure notes or link-health accounting.
+Further sources that are cheaper than ranked owners belong after it in
+`local_sources`.
+
 ## Origin HTTPS
 
 Origins reached over HTTPS (for example Azure Blob Storage) use rustls for the

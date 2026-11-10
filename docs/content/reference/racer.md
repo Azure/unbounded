@@ -19,7 +19,7 @@ See [Racer concepts]({{< relref "concepts/racer" >}}) and the [Azure Blob cache 
 | API | `racer.unbounded-cloud.io/v1alpha1`, kind `ClusterCache` |
 | Resource / short name | `clustercaches` / `ccache` |
 | Scope | Cluster-scoped |
-| Fields | Optional `spec.origin` for an Azure Blob origin that the dataplane reads directly; optional `spec.priority` for the cache's share of node capacity; optional `spec.passthrough` to proxy reads without caching; optional `spec.nodeSelector` to limit the cache to some nodes; no `status` |
+| Fields | Optional `spec.origin` for an Azure Blob origin that the dataplane reads directly; optional `spec.priority` for the cache's share of node capacity; optional `spec.passthrough` to proxy reads without caching; optional `spec.persistence` to keep pages in memory only and use the origin adapter's local copies; optional `spec.nodeSelector` to limit the cache to some nodes; no `status` |
 | Name | DNS subdomain, at most 82 characters total and 63 per dot-separated label |
 | Identity | Kubernetes UID, not name; deleting and recreating a cache creates a new identity |
 
@@ -126,6 +126,44 @@ spec:
   pages that a node read from its own origin.
 - `spec.passthrough` can be added, changed, or removed at any time. When a cache
   switches to passthrough, data previously cached for it is dropped.
+
+### Adapter persistence
+
+Set `spec.persistence: Adapter` when the origin adapter already keeps a
+durable local copy of the objects it serves on each node. Racer then keeps the
+cache's pages in memory only and uses the adapter's copy instead of its own
+disk:
+
+```yaml
+apiVersion: racer.unbounded-cloud.io/v1alpha1
+kind: ClusterCache
+metadata:
+  name: artifacts
+spec:
+  persistence: Adapter
+```
+
+- Racer never writes the cache's pages to its own disk, and reads never spill
+  pages ahead of the read window to disk. Prefetch warms memory only.
+- On a memory miss, the filling node first sends its own origin adapter a
+  local-only request for the page: the usual pinned page `GET` with the
+  `Racer-Source: local` header. The adapter serves the page only from a copy
+  of the pinned version that it holds locally and never contacts its remote
+  source; without one it answers `404`. A hit is encrypted and kept in memory
+  like any origin page. A miss or a failed local read falls through to peers
+  and then the remote origin, and never counts as an origin failure.
+- Both the reading node and an owner that fills a page for a peer ask their own
+  adapter first.
+- In the Go SDK, a local-only request has `OriginRequest.LocalOnly` set.
+  Adapters return `ErrNotFound` when they hold no local copy. Racer sends
+  local-only requests only to caches with `persistence: Adapter`, because an
+  adapter that ignored the field would read from its remote source.
+- `racer_adapter_local_hits_total`, `racer_adapter_local_misses_total`, and
+  `racer_adapter_local_failures_total` count local-only reads.
+- `Racer`, the default when unset, writes pages to Racer's own disk.
+  `Adapter` cannot be combined with `spec.passthrough` or `spec.origin`.
+  Persistence can be changed at any time. When a cache switches to `Adapter`,
+  pages previously written to Racer's disk for it are dropped.
 
 ### Node selector
 
