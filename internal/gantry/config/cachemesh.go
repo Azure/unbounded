@@ -52,6 +52,15 @@ type CachemeshConfig struct {
 	// Namespace holds the cachemesh leader Lease. Empty uses chair_namespace.
 	Namespace string `yaml:"namespace"`
 
+	// PeerKeyFile is the file holding the shared keys that authenticate
+	// cachemesh traffic between agents (GANTRY_CACHEMESH_PEER_KEY_FILE).
+	// Required when cachemesh is enabled. One key per line, surrounding
+	// whitespace trimmed, blank lines ignored; each key is at least 32
+	// bytes. The first key signs requests and every key verifies them, so
+	// a key rotates by adding the new key on a second line, moving it to
+	// the first line once every agent has it, then removing the old one.
+	PeerKeyFile string `yaml:"peer_key_file"`
+
 	// ChunkSize is the stripe size in bytes. Every agent in a cluster must
 	// use the same value; requests with a different size are refused. Must
 	// be a power of two between 1MiB and 1GiB.
@@ -155,6 +164,7 @@ func (c *Config) loadCachemeshEnv(env func(string) string) []error {
 
 	boolean("CACHEMESH_ENABLED", &m.Enabled)
 	str("CACHEMESH_NAMESPACE", &m.Namespace)
+	str("CACHEMESH_PEER_KEY_FILE", &m.PeerKeyFile)
 	num("CACHEMESH_CHUNK_SIZE", func(n int64) { m.ChunkSize = n })
 	num("CACHEMESH_EXPECTED_SIZE", setInt(&m.ExpectedSize))
 	num("CACHEMESH_MAX_NEIGHBORS", setInt(&m.MaxNeighbors))
@@ -185,6 +195,12 @@ func (c *Config) validateCachemesh() []error {
 
 	if c.PodIP == "" {
 		errs = append(errs, errors.New("cachemesh: requires pod_ip for the member address"))
+	}
+
+	if m.PeerKeyFile == "" {
+		bad("peer_key_file", "required: cachemesh traffic between agents is authenticated with shared keys")
+	} else if !filepath.IsAbs(m.PeerKeyFile) {
+		bad("peer_key_file", "must be an absolute path, got %q", m.PeerKeyFile)
 	}
 
 	if m.ChunkSize < MinCachemeshChunkSize || m.ChunkSize > MaxCachemeshChunkSize || m.ChunkSize&(m.ChunkSize-1) != 0 {

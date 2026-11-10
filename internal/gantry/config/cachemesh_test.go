@@ -14,6 +14,7 @@ func cachemeshBase() *Config {
 	c.ChairNamespace = "gantry"
 	c.PodIP = "10.0.0.1"
 	c.Cachemesh.Enabled = true
+	c.Cachemesh.PeerKeyFile = "/etc/gantry/cachemesh/peer-key"
 
 	return c
 }
@@ -49,6 +50,8 @@ func TestCachemeshValidateEnabled(t *testing.T) {
 	cases := map[string]func(c *Config){
 		"cachemesh.namespace":                  func(c *Config) { c.ChairNamespace = "" },
 		"pod_ip":                               func(c *Config) { c.PodIP = "" },
+		"cachemesh.peer_key_file":              func(c *Config) { c.Cachemesh.PeerKeyFile = "" },
+		"cachemesh.peer_key_file relative":     func(c *Config) { c.Cachemesh.PeerKeyFile = "key" },
 		"cachemesh.chunk_size":                 func(c *Config) { c.Cachemesh.ChunkSize = 3 << 20 },
 		"cachemesh.expected_size":              func(c *Config) { c.Cachemesh.ExpectedSize = -1 },
 		"cachemesh.content_root":               func(c *Config) { c.Cachemesh.ContentRoot = "rel/dir" },
@@ -101,6 +104,7 @@ func TestCachemeshYAMLAndEnv(t *testing.T) {
 cachemesh:
   enabled: true
   chunk_size: 16777216
+  peer_key_file: /keys/a
   max_neighbors: 48
   cache_tags: false
 `
@@ -108,7 +112,8 @@ cachemesh:
 		t.Fatalf("LoadYAML: %v", err)
 	}
 
-	if !c.Cachemesh.Enabled || c.Cachemesh.ChunkSize != 16<<20 || c.Cachemesh.MaxNeighbors != 48 || c.Cachemesh.CacheTags {
+	if !c.Cachemesh.Enabled || c.Cachemesh.ChunkSize != 16<<20 || c.Cachemesh.MaxNeighbors != 48 || c.Cachemesh.CacheTags ||
+		c.Cachemesh.PeerKeyFile != "/keys/a" {
 		t.Fatalf("YAML not applied: %+v", c.Cachemesh)
 	}
 
@@ -120,6 +125,7 @@ cachemesh:
 	env := map[string]string{
 		"GANTRY_CACHEMESH_ENABLED":                    "false",
 		"GANTRY_CACHEMESH_NAMESPACE":                  "mesh",
+		"GANTRY_CACHEMESH_PEER_KEY_FILE":              "/keys/b",
 		"GANTRY_CACHEMESH_CHUNK_SIZE":                 "33554432",
 		"GANTRY_CACHEMESH_EXPECTED_SIZE":              "150",
 		"GANTRY_CACHEMESH_MAX_NEIGHBORS":              "64",
@@ -135,7 +141,7 @@ cachemesh:
 	}
 
 	want := CachemeshConfig{
-		Namespace: "mesh", ChunkSize: 32 << 20, ExpectedSize: 150, MaxNeighbors: 64, CacheTags: true,
+		Namespace: "mesh", PeerKeyFile: "/keys/b", ChunkSize: 32 << 20, ExpectedSize: 150, MaxNeighbors: 64, CacheTags: true,
 		ContentRoot: "/data/content", InflightBytes: 4096, MaxConcurrentChunkFills: 16,
 	}
 	if c.Cachemesh != want {
