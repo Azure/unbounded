@@ -6,6 +6,7 @@
 pub mod azure;
 pub mod azure_auth;
 pub mod router;
+pub mod upload;
 
 use crate::admission::AdmissionPolicy;
 use crate::admission::ResourceClass;

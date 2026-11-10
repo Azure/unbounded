@@ -478,8 +478,7 @@ mod tests {
         assert_eq!(get("Authorization"), b"Bearer token");
 
         // Anonymous: no Authorization.
-        let anonymous =
-            put_block_head(&url, &object("k", ""), &ID, 0, 0, None, now).unwrap();
+        let anonymous = put_block_head(&url, &object("k", ""), &ID, 0, 0, None, now).unwrap();
         assert_eq!(anonymous.unique("Authorization").unwrap(), None);
     }
 
@@ -578,7 +577,10 @@ mod tests {
             put_block_list_head(&url, &object("k", "v"), &body, None, None, now).err(),
             Some(Error::InvalidRequest)
         );
-        assert_eq!(block_list_xml(&[[b'!'; 64]]).err(), Some(Error::InvalidRequest));
+        assert_eq!(
+            block_list_xml(&[[b'!'; 64]]).err(),
+            Some(Error::InvalidRequest)
+        );
         assert_eq!(
             std::str::from_utf8(&block_list_xml(&[]).unwrap()).unwrap(),
             "<?xml version=\"1.0\" encoding=\"utf-8\"?><BlockList></BlockList>"
