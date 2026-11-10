@@ -44,7 +44,18 @@ pub enum SessionEvent {
         page: u64,
         node: NodeIdBytes,
     },
+    /// Every holder in this list left the membership. One journal record for
+    /// the whole loss, unlike per-page [`Self::HolderLost`].
+    NodesLost(Vec<NodeIdBytes>),
+    /// Add these holders (a repair batch, or another coordinator's table) to
+    /// the table. Pages outside the object are ignored.
+    HoldersMerged(Holders),
     PageUploaded(u64),
+    /// Another coordinator of this version (after a failover) committed the
+    /// block list. Valid in any committed upload state.
+    UploadedElsewhere {
+        blob_etag: Option<String>,
+    },
     BlockListCommitted {
         blob_etag: String,
     },
@@ -225,6 +236,25 @@ impl Session {
         matches!(self.phase, Phase::Aborted | Phase::Deleted | Phase::Expired)
     }
 
+    /// Pages that have at least one but fewer than `replicas` holders, with
+    /// their first surviving holder, while the object still needs copies
+    /// (committed, not uploaded, not failed). Repair restores these.
+    pub fn under_replicated(&self) -> Vec<(u64, NodeIdBytes)> {
+        if self.phase != Phase::Committed
+            || matches!(self.state, UploadState::Committed | UploadState::Failed)
+        {
+            return Vec::new();
+        }
+        let want = usize::from(self.spec.replicas);
+        self.holders
+            .0
+            .iter()
+            .enumerate()
+            .filter(|(_, nodes)| !nodes.is_empty() && nodes.len() < want)
+            .map(|(page, nodes)| (page as u64, nodes[0].clone()))
+            .collect()
+    }
+
     /// The `Open` journal record for this session.
     pub fn open_record(&self) -> JournalRecord {
         JournalRecord::Open {
@@ -336,6 +366,76 @@ impl Session {
                     None => effects.extend(self.fail()),
                 }
                 effects
+            }
+            SessionEvent::NodesLost(lost) => {
+                let mut changed = false;
+                let mut restore = Vec::new();
+                let mut orphaned = false;
+                for (page, nodes) in self.holders.0.iter_mut().enumerate() {
+                    let before = nodes.len();
+                    nodes.retain(|n| !lost.contains(n));
+                    if nodes.len() == before {
+                        continue;
+                    }
+                    changed = true;
+                    match nodes.first() {
+                        Some(from) => restore.push(SessionEffect::Restore {
+                            page: page as u64,
+                            from: from.clone(),
+                        }),
+                        None => orphaned = true,
+                    }
+                }
+                if !changed {
+                    return Vec::new();
+                }
+                let mut effects = vec![SessionEffect::Journal(self.commit_record())];
+                if uploaded || self.state == UploadState::Failed {
+                    return effects;
+                }
+                if orphaned {
+                    effects.extend(self.fail());
+                } else {
+                    effects.extend(restore);
+                }
+                effects
+            }
+            SessionEvent::HoldersMerged(extra) => {
+                let mut changed = false;
+                for (page, add) in extra.0.into_iter().enumerate() {
+                    let Some(nodes) = self.holders.0.get_mut(page) else {
+                        break;
+                    };
+                    for node in add {
+                        if !node.is_empty()
+                            && !nodes.contains(&node)
+                            && nodes.len() < usize::from(u8::MAX)
+                        {
+                            nodes.push(node);
+                            changed = true;
+                        }
+                    }
+                }
+                if !changed {
+                    return Vec::new();
+                }
+                vec![SessionEffect::Journal(self.commit_record())]
+            }
+            SessionEvent::UploadedElsewhere { blob_etag } => {
+                if uploaded {
+                    return Vec::new();
+                }
+                self.state = UploadState::Committed;
+                self.uploaded.iter_mut().for_each(|u| *u = true);
+                self.block_list_sent = true;
+                self.blob_etag = blob_etag;
+                vec![
+                    SessionEffect::Journal(self.state_record()),
+                    SessionEffect::Release {
+                        nodes: self.holders.nodes(),
+                    },
+                    SessionEffect::Notify(self.state),
+                ]
             }
             SessionEvent::HolderRestored { page, node } => {
                 let Some(nodes) = self.holders.0.get_mut(page as usize) else {

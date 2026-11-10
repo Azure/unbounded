@@ -386,6 +386,109 @@ fn holder_loss_restores_or_fails() {
 }
 
 #[test]
+fn nodes_lost_journals_once_and_restores_each_page() {
+    let mut s = committed(UploadMode::Never);
+    assert!(
+        s.on_event(SessionEvent::NodesLost(vec![n("zzz")]), 2)
+            .is_empty()
+    );
+    let effects = s.on_event(SessionEvent::NodesLost(vec![n("a")]), 2);
+    assert_eq!(kinds(&effects), ["journal-commit", "restore", "restore"]);
+    assert_eq!(
+        effects[1..],
+        [
+            SessionEffect::Restore {
+                page: 0,
+                from: n("b")
+            },
+            SessionEffect::Restore {
+                page: 2,
+                from: n("c")
+            },
+        ]
+    );
+    assert_eq!(s.under_replicated(), vec![(0, n("b")), (2, n("c"))]);
+    // A merge restores the copies in one record; repeats change nothing.
+    let merge = Holders(vec![
+        vec![n("d")],
+        vec![],
+        vec![n("d"), n("c")],
+        vec![n("x")],
+    ]);
+    let effects = s.on_event(SessionEvent::HoldersMerged(merge.clone()), 3);
+    assert_eq!(kinds(&effects), ["journal-commit"]);
+    assert_eq!(s.holders().page(0), &[n("b"), n("d")]);
+    assert_eq!(s.holders().page(2), &[n("c"), n("d")]);
+    assert_eq!(s.holders().pages(), 3);
+    assert!(s.on_event(SessionEvent::HoldersMerged(merge), 3).is_empty());
+    assert!(s.under_replicated().is_empty());
+    // Losing every holder of a page fails the object.
+    let effects = s.on_event(SessionEvent::NodesLost(vec![n("b"), n("c")]), 4);
+    assert_eq!(
+        kinds(&effects),
+        ["journal-commit", "journal-state", "notify"]
+    );
+    assert_eq!(s.state(), UploadState::Failed);
+    assert!(s.under_replicated().is_empty());
+}
+
+#[test]
+fn merges_are_refused_before_commit() {
+    let mut s = open(UploadMode::Auto);
+    assert!(rejects(
+        &s.on_event(SessionEvent::HoldersMerged(holders()), 1),
+        Rejection::NotCommitted
+    ));
+    assert!(rejects(
+        &s.on_event(SessionEvent::NodesLost(vec![n("a")]), 1),
+        Rejection::NotCommitted
+    ));
+    assert!(rejects(
+        &s.on_event(SessionEvent::UploadedElsewhere { blob_etag: None }, 1),
+        Rejection::NotCommitted
+    ));
+    assert!(s.under_replicated().is_empty());
+}
+
+#[test]
+fn uploaded_elsewhere_settles_any_upload_state() {
+    for upload in [UploadMode::Auto, UploadMode::Manual] {
+        let mut s = committed(upload);
+        let effects = s.on_event(
+            SessionEvent::UploadedElsewhere {
+                blob_etag: Some("\"b\"".into()),
+            },
+            2,
+        );
+        assert_eq!(kinds(&effects), ["journal-state", "release", "notify"]);
+        assert_eq!(s.state(), UploadState::Committed);
+        assert_eq!(s.blob_etag(), Some("\"b\""));
+        // Idempotent, and nothing restarts it.
+        assert!(
+            s.on_event(SessionEvent::UploadedElsewhere { blob_etag: None }, 3)
+                .is_empty()
+        );
+        assert!(rejects(
+            &s.on_event(SessionEvent::PageUploaded(0), 3),
+            Rejection::InvalidState
+        ));
+        assert!(rejects(
+            &s.on_event(SessionEvent::DeleteRequested, 3),
+            Rejection::Uploaded
+        ));
+    }
+    // A coordinator that failed on a block-list conflict converges too.
+    let mut s = committed(UploadMode::Auto);
+    for page in 0..3 {
+        s.on_event(SessionEvent::PageUploaded(page), 2);
+    }
+    s.on_event(SessionEvent::BlockListConflict, 2);
+    assert_eq!(s.state(), UploadState::Failed);
+    s.on_event(SessionEvent::UploadedElsewhere { blob_etag: None }, 3);
+    assert_eq!(s.state(), UploadState::Committed);
+}
+
+#[test]
 fn from_manifest_restarts_upload() {
     let mut s = committed(UploadMode::Auto);
     let manifest = s.manifest();
@@ -446,7 +549,12 @@ fn random_sequences_keep_invariants() {
             now += rng.below(40);
             let page = rng.below(4);
             let node = n(["a", "b", "c", "d"][rng.below(4) as usize]);
-            let event = match rng.below(14) {
+            let event = match rng.below(17) {
+                14 => SessionEvent::NodesLost(vec![node]),
+                15 => SessionEvent::HoldersMerged(Holders(vec![vec![node]; 3])),
+                16 => SessionEvent::UploadedElsewhere {
+                    blob_etag: Some("e".into()),
+                },
                 0 => SessionEvent::Renewed,
                 1 => SessionEvent::Committed(if rng.below(4) == 0 {
                     Holders(vec![vec![n("a")]; 3])
