@@ -1079,7 +1079,9 @@ func TestGrubTemplate_NoInstallRequested(t *testing.T) {
 	require.NotContains(t, body, "eth0")
 }
 
-func TestNetworkConfigTemplate_SelectsBootLease(t *testing.T) {
+func renderNetworkConfigForLease(t *testing.T, holdLease bool) []byte {
+	t.Helper()
+
 	networkTmpl, err := os.ReadFile(filepath.Join("..", "..", "..", "images", "netboot", "assets", "network-config.tmpl"))
 	require.NoError(t, err)
 
@@ -1094,6 +1096,7 @@ func TestNetworkConfigTemplate_SelectsBootLease(t *testing.T) {
 						Gateway:    "10.0.2.1",
 						SubnetMask: "255.255.254.0",
 						DNS:        []string{"10.0.2.53", "2001:db8::53"},
+						HoldLease:  holdLease,
 					},
 				},
 			},
@@ -1104,26 +1107,49 @@ func TestNetworkConfigTemplate_SelectsBootLease(t *testing.T) {
 	result, err := renderTemplate(string(networkTmpl), data)
 	require.NoError(t, err)
 
+	return result
+}
+
+type parsedNetworkConfig struct {
+	Ethernets map[string]struct {
+		DHCP4          bool            `yaml:"dhcp4"`
+		DHCP4Overrides map[string]bool `yaml:"dhcp4-overrides"`
+		Addresses      []string        `yaml:"addresses"`
+	} `yaml:"ethernets"`
+}
+
+func TestNetworkConfigTemplate_SelectsBootLease(t *testing.T) {
+	result := renderNetworkConfigForLease(t, false)
+
 	body := string(result)
 	require.Contains(t, body, `macaddress: "aa:bb:cc:dd:ee:21"`)
 	require.Contains(t, body, `- "10.0.2.21/23"`)
 	require.Contains(t, body, `via: "10.0.2.1"`)
 	require.Contains(t, body, `- "10.0.2.53"`)
 	require.Contains(t, body, `- "2001:db8::53"`)
-	require.Contains(t, body, "dhcp4: true")
-	require.Contains(t, body, "use-routes: false")
-	require.Contains(t, body, "use-dns: false")
-	require.Contains(t, body, "use-hostname: false")
+	require.Contains(t, body, "dhcp4: false")
 	require.Contains(t, body, "dhcp6: false")
+	require.NotContains(t, body, "dhcp4-overrides")
+	require.NotContains(t, body, "dhcp4: true")
 	require.NotContains(t, body, "10.0.1.20")
 
-	var parsed struct {
-		Ethernets map[string]struct {
-			DHCP4          bool            `yaml:"dhcp4"`
-			DHCP4Overrides map[string]bool `yaml:"dhcp4-overrides"`
-			Addresses      []string        `yaml:"addresses"`
-		} `yaml:"ethernets"`
-	}
+	var parsed parsedNetworkConfig
+	require.NoError(t, yaml.Unmarshal(result, &parsed))
+	provisioning := parsed.Ethernets["provisioning"]
+	require.False(t, provisioning.DHCP4)
+	require.Nil(t, provisioning.DHCP4Overrides)
+	require.Equal(t, []string{"10.0.2.21/23"}, provisioning.Addresses)
+}
+
+func TestNetworkConfigTemplate_HoldLeaseEnablesDHCP4WithOverrides(t *testing.T) {
+	result := renderNetworkConfigForLease(t, true)
+
+	body := string(result)
+	require.Contains(t, body, `via: "10.0.2.1"`)
+	require.Contains(t, body, "dhcp6: false")
+	require.NotContains(t, body, "dhcp4: false")
+
+	var parsed parsedNetworkConfig
 	require.NoError(t, yaml.Unmarshal(result, &parsed))
 	provisioning := parsed.Ethernets["provisioning"]
 	require.True(t, provisioning.DHCP4)
@@ -1249,6 +1275,45 @@ func TestGrubTemplate_SelectsBootLeaseByRequestIP(t *testing.T) {
 	require.Contains(t, body, "ip=10.0.1.21::10.0.1.1:255.255.255.0:::none")
 	require.NotContains(t, body, "unbounded.boot_mac=aa:bb:cc:dd:ee:20")
 	require.NotContains(t, body, "unbounded.disk=")
+}
+
+func TestGrubTemplate_DHCPHoldFlag(t *testing.T) {
+	grubTmpl, err := os.ReadFile(filepath.Join("..", "..", "..", "images", "netboot", "assets", "grub.cfg.tmpl"))
+	require.NoError(t, err)
+
+	for _, tc := range []struct {
+		name      string
+		holdLease bool
+	}{
+		{name: "default omits flag", holdLease: false},
+		{name: "hold lease sets flag", holdLease: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			node := &v1alpha3.Machine{
+				ObjectMeta: metav1.ObjectMeta{Name: "node-hold", Namespace: "default"},
+				Spec: v1alpha3.MachineSpec{
+					PXE: &v1alpha3.PXESpec{
+						DHCPLeases: []v1alpha3.DHCPLease{
+							{IPv4: "10.0.1.21", MAC: "aa:bb:cc:dd:ee:21", Gateway: "10.0.1.1", SubnetMask: "255.255.255.0", HoldLease: tc.holdLease},
+						},
+					},
+				},
+			}
+
+			data := newTemplateData(node, ClusterInfo{ApiserverURL: "https://k8s.example.com"}, "http://10.0.1.1:8080", "", "10.0.1.21", true)
+			result, err := renderTemplate(string(grubTmpl), data)
+			require.NoError(t, err)
+
+			body := string(result)
+			require.Contains(t, body, "ip=10.0.1.21::10.0.1.1:255.255.255.0:::none")
+
+			if tc.holdLease {
+				require.Contains(t, body, "unbounded.dhcp_hold=1 \\\n")
+			} else {
+				require.NotContains(t, body, "unbounded.dhcp_hold")
+			}
+		})
+	}
 }
 
 func TestGrubTemplate_SerialConsoleByArchitecture(t *testing.T) {
