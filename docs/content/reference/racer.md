@@ -7,7 +7,7 @@ description: "Racer resources, configuration, diagnostics, Go SDK, and RDMA requ
 {{< callout type="warning" >}}
 Racer is pre-release. Its APIs, flags, and on-disk formats may change without a
 migration path. Cached data is disposable; Racer is not durable storage.
-[Written objects](#writes) are kept on several node disks, but they are not safe
+[Written objects](#object-writes) are kept on several node disks, but they are not safe
 from loss until they are uploaded to the origin. Start
 with the [Azure Blob cache guide]({{< relref "guides/azure-blob-cache" >}}).
 {{< /callout >}}
@@ -21,7 +21,7 @@ See [Racer concepts]({{< relref "concepts/racer" >}}) and the [Azure Blob cache 
 | API | `racer.unbounded-cloud.io/v1alpha1`, kind `ClusterCache` |
 | Resource / short name | `clustercaches` / `ccache` |
 | Scope | Cluster-scoped |
-| Fields | Optional `spec.origin` for an Azure Blob origin that the dataplane reads directly; optional `spec.priority` for the cache's share of node capacity; optional `spec.passthrough` to proxy reads without caching; optional `spec.nodeSelector` to limit the cache to some nodes; optional `spec.writes` to accept object writes (see [Writes](#writes)); no `status` |
+| Fields | Optional `spec.origin` for an Azure Blob origin that the dataplane reads directly; optional `spec.priority` for the cache's share of node capacity; optional `spec.passthrough` to proxy reads without caching; optional `spec.nodeSelector` to limit the cache to some nodes; optional `spec.writes` to accept object writes (see [Writes](#object-writes)); no `status` |
 | Name | DNS subdomain, at most 82 characters total and 63 per dot-separated label |
 | Identity | Kubernetes UID, not name; deleting and recreating a cache creates a new identity |
 
@@ -37,7 +37,7 @@ component flag. This resource is not a Kubernetes PersistentVolume or
 PersistentVolumeClaim (PVC), and does not set absolute capacity. It makes no
 durability promise for read data. With `spec.writes`, it promises only that a
 written object has the requested number of disk copies, or is in the origin
-(see [Writes](#writes)). `spec.priority` sets only its relative share of each node's
+(see [Writes](#object-writes)). `spec.priority` sets only its relative share of each node's
 cache capacity (see [Priority](#priority)). It configures an origin only when `spec.origin` is set (see
 [Azure origin](#azure-origin)). Cached read data is disposable. A cache's Kubernetes UID is its
 wire cache identity (`CacheID`).
@@ -245,6 +245,60 @@ reads the origin instead. Do these steps before you upgrade:
   `workloadIdentity` or `default` with an identity attached to the nodes. You
   can edit `credential` in place; only `containerURL` is immutable. Then delete
   the Secret if nothing else uses it.
+
+### Write settings
+
+Set `spec.writes` to let clients create objects in the cache. See
+[Object writes](#object-writes) for the client API. When `spec.writes` is
+unset, the cache is read-only.
+
+```yaml
+apiVersion: racer.unbounded-cloud.io/v1alpha1
+kind: ClusterCache
+metadata:
+  name: checkpoints
+spec:
+  origin:
+    azure:
+      containerURL: https://<account>.blob.core.windows.net/<container>
+      credential:
+        workloadIdentity:
+          clientID: <client ID>
+  writes:
+    replicas: 2
+    maxDirtyPercent: 30
+    holdTTL: 24h
+    upload:
+      mode: Auto
+      maxBytesPerSecond: 0
+      maxConcurrentBlocks: 16
+```
+
+| Field | Default | Accepted | Meaning |
+|-------|---------|----------|---------|
+| `writes.replicas` | `2` | 1..3 | Nodes that must store each page before a write is acknowledged. A request can override it with `Racer-Durability`. |
+| `writes.maxDirtyPercent` | `30` | 1..90 | Share of this cache's disk share on a node that may hold written data not yet uploaded. Writes over it get `503`. |
+| `writes.holdTTL` | `24h` | More than `0s`, at most `720h` | Default time a written object stays pinned in the cache. An `Auto` upload ends the hold when it commits. A request can override it with `Racer-Hold-Seconds`. |
+| `writes.upload.mode` | `Auto` | `Auto`, `Manual`, `Never` | Default upload mode. `Auto` uploads after the write commits. `Manual` waits for `persist`. `Never` keeps the object only in the cache until its hold ends. |
+| `writes.upload.maxBytesPerSecond` | `0` | At least 0 | Upload bandwidth for this cache on each node. `0` means no limit. The cluster-wide limit is this value times the number of nodes. |
+| `writes.upload.maxConcurrentBlocks` | `16` | 1..1,024 | Concurrent block uploads for this cache on each node. |
+
+The API server also checks:
+
+- `writes` cannot be set with `passthrough`.
+- Without `spec.origin`, `writes.upload.mode` must be set to `Never`.
+
+Rules for enabling writes:
+
+- **Every node must support writes first.** Older dataplanes reject a cache
+  catalog that contains `writes`. Upgrade every Racer node before you set
+  `spec.writes` on any cache. <!-- verify against WP5: design says the operator checks this precondition; no check found on this branch -->
+- **Upload needs write access.** With an upload mode other than `Never`, the
+  cache's Azure identity needs the `Storage Blob Data Contributor` role on the
+  container. Reads alone need only `Storage Blob Data Reader`.
+- **Data not yet uploaded can be lost.** Written data that is not uploaded
+  lives only on node disks. Deleting the ClusterCache, or changing a node's
+  storage layout (devices or worker count), loses that node's copies.
 
 ## Node requirements
 
