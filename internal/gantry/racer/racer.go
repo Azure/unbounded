@@ -430,6 +430,8 @@ type Handler struct {
 	diagnostics racerFailureDiagnostics
 	retry       retryPolicy
 	access      *accessChecker
+	invalidator Invalidator
+	onMismatch  func()
 }
 
 // HandlerOption configures optional Handler behavior.
@@ -642,6 +644,15 @@ func (s *Handler) streamContent(ctx context.Context, w http.ResponseWriter, id s
 	// OCI digest verification belongs to the consumer's assembled object.
 	var written int64
 
+	// Full objects are hashed as they stream; see verifyingWriter.
+	var verifier *verifyingWriter
+
+	out := io.Writer(w)
+	if offset == 0 {
+		verifier = newVerifyingWriter(w, ref.Digest, remaining)
+		out = verifier
+	}
+
 	current := value
 
 	defer func() {
@@ -651,8 +662,17 @@ func (s *Handler) streamContent(ctx context.Context, w http.ResponseWriter, id s
 	}()
 
 	for {
-		n, err := current.WriteTo(w)
+		n, err := current.WriteTo(out)
 		written += n
+
+		if err == nil && written == remaining && verifier != nil && !verifier.verify() {
+			err = errDigestMismatch
+		}
+
+		if errors.Is(err, errDigestMismatch) {
+			s.digestMismatch(ctx, id, request, metadata, remaining, written)
+			panic(http.ErrAbortHandler)
+		}
 
 		if err == nil && written == remaining {
 			// Every byte reached w, so earlier failures were source-side and

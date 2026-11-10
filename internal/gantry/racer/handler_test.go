@@ -1305,8 +1305,8 @@ func TestRacerStreamFailureAbortsHTTP(t *testing.T) {
 			rangeHeader, offset := "", 0
 
 			if failure == "digest mismatch" {
-				// The mirror transports bytes; the consumer verifies the final
-				// assembled OCI object.
+				// Full responses are verified by the mirror; ranged resumes
+				// are left to the consumer's verification of the assembled object.
 				data[0] ^= 0xff
 				data[len(data)-1] ^= 0xff
 			}
@@ -1356,6 +1356,16 @@ func TestRacerStreamFailureAbortsHTTP(t *testing.T) {
 			}
 
 			got, err := io.ReadAll(resp.Body)
+			if mode == "digest mismatch" {
+				// The final byte is withheld and the connection aborted;
+				// buffered bytes before it may also be dropped.
+				if !errors.Is(err, io.ErrUnexpectedEOF) || len(got) >= len(data) || !bytes.Equal(got, data[:len(got)]) {
+					t.Fatalf("full mismatch must abort before the final byte: bytes=%d err=%v", len(got), err)
+				}
+
+				return
+			}
+
 			if failure == "digest mismatch" {
 				if err != nil || !bytes.Equal(got, data[offset:]) {
 					t.Fatalf("corrupt bytes must reach verifying consumer: bytes=%d err=%v", len(got), err)

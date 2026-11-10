@@ -173,7 +173,8 @@ func TestRacerFailureDiagnosticsPaths(t *testing.T) {
 		{name: "ranged body", method: http.MethodGet, ranged: true, failBody: true, stage: "write_body", status: 206, expected: 1<<20 - 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			d := digest.MustParse("sha256:" + strings.Repeat("a", 64))
+			// Successful full responses are digest-verified, so use the real digest.
+			d := racerDigest([]byte("abc"))
 
 			metadata := racerMetadata(t, d, 3)
 			if tc.failBody {
