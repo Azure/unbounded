@@ -210,6 +210,10 @@ pub struct CandidatePolicy {
     /// `racer_core::read::hints`). The coordinator notes and defers on them; an owner walk asks
     /// them before origin.
     pub(crate) successors: RefCell<Successors>,
+    /// Peers this node served adapter-persistence pages to, by page (see
+    /// `racer_core::read::holders`). A fill asks them after the local
+    /// adapter and before the ranked walk.
+    pub(crate) holders: RefCell<Holders>,
     /// Pages this node fetched from origin as an owner after rank 0, to offer to rank 0 later (see
     /// `racer_core::read::hints`).
     pub(crate) notices: RefCell<Notices>,
@@ -249,6 +253,10 @@ pub(crate) use racer_core::liveness::{MAX_OFFERS_IN_FLIGHT, MAX_PINGS_IN_FLIGHT}
 pub(crate) type Rank0Watch = racer_core::liveness::Rank0Watch<crate::model::PageId, NodeId>;
 
 pub(crate) type Successors = racer_core::read::hints::SuccessorHints<crate::model::PageId, NodeId>;
+
+/// Holders of adapter-persistence pages. Keyed by page, whose version carries
+/// the etag, so a new version never routes to holders of an old one.
+pub(crate) type Holders = racer_core::read::holders::Holders<crate::model::PageId, NodeId>;
 
 /// How long a provider stays single-flight after a refused multi-flight
 /// Subscribe. An upgraded provider is asked again after this.
@@ -725,6 +733,10 @@ impl CandidatePolicy {
             successors: RefCell::new(Successors::new(
                 racer_core::read::hints::HINT_CAPACITY,
                 racer_core::read::hints::HINT_TTL,
+            )),
+            holders: RefCell::new(Holders::new(
+                racer_core::read::holders::HOLDER_CAPACITY,
+                racer_core::read::holders::HOLDER_TTL,
             )),
             notices: RefCell::new(Notices::new(racer_core::read::hints::NOTICE_CAPACITY)),
             offers: Rc::default(),
@@ -2579,6 +2591,79 @@ impl CandidatePolicy {
             )),
             Err(error) => Err(exchanged.timed_out || matches!(error, Error::DeadlineExceeded)),
         })
+    }
+
+    /// Note that `node` holds `page` in its own origin adapter: this node
+    /// served it the page of an adapter-persistence cache. Self is ignored.
+    pub(crate) fn record_holder(&self, page: &crate::model::PageId, node: &NodeId) {
+        if node == &self.node {
+            return;
+        }
+        self.holders
+            .borrow_mut()
+            .record(page, node.clone(), self.ctx.now());
+    }
+
+    /// Holders of `page` to ask, newest first, at most
+    /// [`racer_core::read::holders::HOLDER_ATTEMPTS`].
+    pub(crate) fn holder_candidates(&self, page: &crate::model::PageId) -> Vec<NodeId> {
+        self.holders
+            .borrow_mut()
+            .candidates(page, &self.node, self.ctx.now())
+    }
+
+    /// Drop `node` as a holder of `page` after it answered without a copy or failed.
+    pub(crate) fn forget_holder(&self, page: &crate::model::PageId, node: &NodeId) {
+        self.holders.borrow_mut().forget(page, node);
+    }
+
+    /// Ask holder `node` for `page` with a holder probe (mode `holder`): it
+    /// answers from its memory or its own adapter, or `Miss`, and never
+    /// acquires. The probe runs on its own short deadline and a fresh grant
+    /// of one local exchange and no remote attempts, so a dead holder costs
+    /// at most [`racer_core::read::holders::HOLDER_TIMEOUT`] and none of the
+    /// reader's budget. `Ok(None)` is any answer other than a page from
+    /// `node`; errors are the probe's failures.
+    pub(crate) async fn holder_copy(
+        &self,
+        membership: &std::sync::Arc<crate::topology::Membership>,
+        node: &NodeId,
+        page: &crate::model::PageId,
+        scope: &RequestScope,
+    ) -> Result<Option<VerifiedResponse>> {
+        use racer_core::read::hints::NOTICE_LINKS;
+        scope.check()?;
+        let deadline = scope
+            .deadline
+            .0
+            .min(self.ctx.now() + racer_core::read::holders::HOLDER_TIMEOUT);
+        let probe = scope.child(scope.request, deadline)?;
+        let context = OriginContext {
+            object: page.version.object.clone(),
+            metadata: None,
+            authorization: None,
+        };
+        let operation = PeerOperation::Page {
+            page: page.clone(),
+            mode: FetchMode::Holder,
+        };
+        let mut budget = AcquisitionBudget::new(deadline, 1, NOTICE_LINKS);
+        let response = self
+            .request_mode(
+                membership,
+                node,
+                &context,
+                &operation,
+                FetchMode::Holder,
+                &probe,
+                &mut budget,
+                1,
+                RequestMode::FundedRoute,
+            )
+            .await?;
+        Ok((response.origin().node() == node
+            && matches!(response.response(), PeerResponse::Page { .. }))
+        .then_some(response))
     }
 
     /// Send one copy offer for `due` to the page's current rank 0, and

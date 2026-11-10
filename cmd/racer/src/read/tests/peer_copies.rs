@@ -6317,3 +6317,200 @@ fn a_peer_joining_a_waiter_capped_flight_hears_flight_full() {
     assert_eq!(target.origin.calls.get(), 0);
     drop(held);
 }
+
+/// Holder table (`racer_core::read::holders`): an adapter-persistence owner
+/// records the readers it serves and asks them for the page after it left
+/// memory, before origin.
+mod holders {
+    use super::*;
+    use crate::telemetry::Event;
+    use racer_wire::control::CacheMode;
+
+    fn owner(env: &racer_io::Env, mode: CacheMode) -> SuccessorFixture {
+        let mut s = SuccessorFixture::at_rank(env, 0, "holders", 0x71);
+        s.f.set_mode(env, mode);
+        s.deadline(env, 60);
+        s
+    }
+
+    /// The two non-owner nodes or, with three owners of four, a non-owner
+    /// and the last owner (both plain readers here).
+    fn readers(s: &SuccessorFixture) -> (usize, usize) {
+        (s.index(None), s.index(Some(2)))
+    }
+
+    fn evict(s: &SuccessorFixture) {
+        s.f.fill.dependencies.memory.evict_idle(usize::MAX).unwrap();
+        assert!(
+            s.f.fill
+                .dependencies
+                .memory
+                .ciphertext(&s.f.page)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    fn holders(s: &SuccessorFixture) -> Vec<NodeId> {
+        s.f.fill
+            .dependencies
+            .candidates
+            .holder_candidates(&s.f.page)
+    }
+
+    /// After eviction, the owner gets the page back from the reader it
+    /// served, from that reader's adapter, without asking origin again.
+    #[test]
+    fn evicted_page_is_copied_from_a_recorded_holder() {
+        let env = racer_io::Env::host();
+        let mut s = owner(&env, CacheMode::Adapter);
+        let (reader, other) = readers(&s);
+        s.page(reader, FetchMode::Acquire);
+        assert_eq!(s.f.origin.calls.get(), 1);
+        assert_eq!(s.count(Event::HolderRecorded), 1);
+        assert_eq!(holders(&s), vec![node(reader)]);
+        evict(&s);
+        let copy = encrypted_copy(&mut s.f);
+        s.peers.reply(&node(reader), Reply::Copy(copy));
+        s.page(other, FetchMode::Acquire);
+        assert_eq!(s.f.origin.calls.get(), 1);
+        assert_eq!(s.count(Event::HolderHit), 1);
+        let calls = s.peers.calls.borrow();
+        assert_eq!(calls.len(), 1);
+        // A holder probe is not copy-only, carries no remote attempts, and
+        // goes to the recorded reader.
+        assert_eq!(calls[0].0, node(reader));
+        assert!(!calls[0].1);
+        assert_eq!(calls[0].2, 0);
+        // The copy was published: the next read is a memory hit.
+        drop(calls);
+        s.page(other, FetchMode::Acquire);
+        assert_eq!(s.peers.calls.borrow().len(), 1);
+        assert_eq!(s.f.origin.calls.get(), 1);
+    }
+
+    /// A holder answering without a copy, or failing, is forgotten and the
+    /// fill falls through to origin.
+    #[test]
+    fn holder_miss_or_failure_falls_through_and_is_forgotten() {
+        for (reply, event) in [
+            (Reply::Miss, Event::HolderMiss),
+            (Reply::Unauthorized, Event::HolderFailure),
+            (Reply::Stale, Event::HolderMiss),
+        ] {
+            let env = racer_io::Env::host();
+            let mut s = owner(&env, CacheMode::Adapter);
+            let (reader, other) = readers(&s);
+            s.page(reader, FetchMode::Acquire);
+            evict(&s);
+            s.peers.reply(&node(reader), reply);
+            s.page(other, FetchMode::Acquire);
+            assert_eq!(s.f.origin.calls.get(), 2);
+            assert_eq!(s.count(event), 1);
+            assert_eq!(s.count(Event::HolderHit), 0);
+            // Only the second reader remains, recorded by the second fill.
+            assert_eq!(holders(&s), vec![node(other)]);
+        }
+    }
+
+    /// At most `HOLDER_ATTEMPTS` holders are asked per fill.
+    #[test]
+    fn holder_attempts_are_bounded() {
+        use racer_core::read::holders::HOLDER_ATTEMPTS;
+        let env = racer_io::Env::host();
+        let mut s = owner(&env, CacheMode::Adapter);
+        let (a, b) = readers(&s);
+        let c = s.index(Some(1));
+        let policy = s.f.fill.dependencies.candidates.clone();
+        for holder in [a, b, c] {
+            policy.record_holder(&s.f.page, &node(holder));
+        }
+        for holder in [c, b] {
+            s.peers.reply(&node(holder), Reply::Miss);
+        }
+        s.page(a, FetchMode::Acquire);
+        assert_eq!(s.peers.calls.borrow().len(), HOLDER_ATTEMPTS);
+        assert_eq!(s.count(Event::HolderMiss), HOLDER_ATTEMPTS as u64);
+        assert_eq!(s.f.origin.calls.get(), 1);
+    }
+
+    /// Cached caches never record or ask holders.
+    #[test]
+    fn cached_caches_never_use_holders() {
+        let env = racer_io::Env::host();
+        let mut s = owner(&env, CacheMode::Cached);
+        let (reader, other) = readers(&s);
+        s.page(reader, FetchMode::Acquire);
+        assert_eq!(s.count(Event::HolderRecorded), 0);
+        assert!(holders(&s).is_empty());
+        // Even a holder recorded by hand is never asked.
+        s.f.fill
+            .dependencies
+            .candidates
+            .record_holder(&s.f.page, &node(reader));
+        // A cached page may stay pinned by its pending disk write; either
+        // way the fill never asks a holder.
+        s.f.fill.dependencies.memory.evict_idle(usize::MAX).unwrap();
+        s.page(other, FetchMode::Acquire);
+        assert!(s.peers.calls.borrow().is_empty());
+        assert_eq!(s.count(Event::HolderHit) + s.count(Event::HolderMiss), 0);
+    }
+
+    /// A holder serves a probe from memory or its own adapter, misses
+    /// otherwise, and never asks origin; other caches always miss.
+    #[test]
+    fn holder_probe_is_served_locally_only() {
+        let env = racer_io::Env::host();
+        let mut s = owner(&env, CacheMode::Adapter);
+        let (prober, _) = readers(&s);
+        s.miss(prober, FetchMode::Holder);
+        assert_eq!(s.f.origin.local_calls.get(), 1);
+        s.f.origin.local.set(LocalReplica::Hit);
+        s.page(prober, FetchMode::Holder);
+        assert_eq!(s.f.origin.local_calls.get(), 2);
+        // Published from the adapter: answered from memory now.
+        s.page(prober, FetchMode::Holder);
+        assert_eq!(s.f.origin.local_calls.get(), 2);
+        assert_eq!(s.f.origin.calls.get(), 0);
+        assert!(s.peers.calls.borrow().is_empty());
+        // A prober is never recorded as a holder.
+        assert_eq!(s.count(Event::HolderRecorded), 0);
+        assert_eq!(s.count(Event::HolderServed), 3);
+
+        let mut s = owner(&env, CacheMode::Cached);
+        s.f.origin.local.set(LocalReplica::Hit);
+        s.miss(prober, FetchMode::Holder);
+        assert_eq!(s.f.origin.local_calls.get(), 0);
+        assert_eq!(s.f.origin.calls.get(), 0);
+    }
+
+    /// Holder probes encode only as credential-free page requests without
+    /// remote attempts, and keep their mode on the wire.
+    #[test]
+    fn holder_encoding_is_restricted_to_credential_free_page_requests() {
+        let env = racer_io::Env::host();
+        let mut f = fixture(&env);
+        let (peers, _) = install_peers(&env, &mut f, Some(0));
+        let from = (peers.local + 1) % 4;
+        let admitted = page_request(&f, &peers, from, 0x35, FetchMode::Holder);
+        assert!(matches!(
+            admitted.request().operation,
+            PeerOperation::Page {
+                mode: FetchMode::Holder,
+                ..
+            }
+        ));
+        let mut request = admitted.into_signed().request;
+        request.route.remaining_attempts = 1;
+        assert!(crate::peer::protocol::request_head(&env.ctx.clock, &request).is_err());
+        let mut request = page_request(&f, &peers, from, 0x36, FetchMode::Holder)
+            .into_signed()
+            .request;
+        request.operation = PeerOperation::Metadata {
+            object: f.context.object.clone(),
+            selector: crate::model::MetadataSelector::Fresh,
+            mode: FetchMode::Holder,
+        };
+        assert!(crate::peer::protocol::request_head(&env.ctx.clock, &request).is_err());
+    }
+}

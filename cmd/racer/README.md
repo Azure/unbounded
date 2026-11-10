@@ -76,8 +76,33 @@ is `LocalSource::AdapterReplica`: `Origin::local_page_reserved` sends the
 node's own origin socket a pinned page `GET` with `Racer-Source: local`. A
 `404` or `412` is a local miss. A miss or any failure other than cancellation
 falls through without origin failure notes or link-health accounting.
-Further sources that are cheaper than ranked owners belong after it in
-`local_sources`.
+
+Next is `LocalSource::Holders`. With no disk copy, once an owner evicts an
+adapter page the durable copies live in the adapters of the nodes that read
+it. An owner that serves an adapter page to a peer `Acquire` records the
+signed requester (`Coordinator::note_holder`) in its worker's holder table
+(`racer_core::read::holders::Holders`, on `CandidatePolicy::holders`). Keys
+are page identities, whose version carries the etag, so a new version never
+routes to holders of an old one. Each page keeps at most `HOLDERS_PER_PAGE`
+(4) nodes, newest first and deduplicated, each for `HOLDER_TTL` (24h); the
+table keeps at most `HOLDER_CAPACITY` (65536) pages and evicts the oldest
+inserted page first. Time is injected, so the table is deterministic.
+
+`Fill::acquire_from_holders` asks up to `HOLDER_ATTEMPTS` (2) unexpired
+holders, other than this node, with a holder probe (`FetchMode::Holder`, wire
+mode `holder`). Like an offer, a probe is a credential-free page request
+with no remote attempts, sent on its own `HOLDER_TIMEOUT` (2s) deadline and a
+fresh one-exchange grant, so a dead holder neither stalls the fill nor spends
+the reader's budget. The holder (`Coordinator::serve_holder`) answers from
+memory or its own adapter (`LocalSource::AdapterReplica`), never acquires,
+forwards, or contacts the remote origin, and answers `Miss` for any other
+cache mode. A returned copy is decrypted, which authenticates it, and
+published to memory. A miss, a failure, or an unauthenticated copy forgets
+that holder and asks the next; after the last the fill continues with the
+ranked walk. Receivers that predate the mode reject it, which counts as a
+failure. `racer_holder_records_total`, `racer_holder_probes_served_total`,
+`racer_holder_hits_total`, `racer_holder_misses_total`, and
+`racer_holder_failures_total` count these steps.
 
 ## Invalidation
 

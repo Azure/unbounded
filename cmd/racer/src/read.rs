@@ -359,6 +359,73 @@ impl Coordinator {
         }
     }
 
+    /// Answer a holder probe (`FetchMode::Holder`): the page from memory or
+    /// from this node's own origin adapter, never acquiring, forwarding, or
+    /// contacting the remote origin. Caches other than persistence Adapter,
+    /// and caches not admitted here, always miss.
+    async fn serve_holder(
+        &self,
+        page: &crate::model::PageId,
+        scope: &RequestScope,
+    ) -> Result<PeerResponse> {
+        scope.check()?;
+        let cache = &page.version.object.cache;
+        if !self.availability.metadata(cache)
+            || self.fill.mode(cache) != racer_wire::control::CacheMode::Adapter
+        {
+            return Ok(PeerResponse::Miss);
+        }
+        self.fill
+            .metrics
+            .record(crate::telemetry::Event::HolderServed, 1);
+        if let PeerResponse::Page {
+            metadata,
+            ciphertext,
+        } = self.serve_page_copy(page, scope, false).await?
+        {
+            return Ok(PeerResponse::Page {
+                metadata,
+                ciphertext,
+            });
+        }
+        let context = OriginContext {
+            object: page.version.object.clone(),
+            metadata: None,
+            authorization: None,
+        };
+        match self
+            .fill
+            .acquire_adapter_replica(page, &context, scope, false)
+            .await?
+        {
+            Some(crate::memory::AcquiredPage::Plaintext(result)) => {
+                result.validate_metadata()?;
+                Ok(PeerResponse::Page {
+                    metadata: result.metadata,
+                    ciphertext: result.ciphertext,
+                })
+            }
+            Some(crate::memory::AcquiredPage::Ciphertext(_)) => Err(Error::Internal),
+            None => Ok(PeerResponse::Miss),
+        }
+    }
+
+    /// Record `requester` as a holder of `page` after this node served it
+    /// the page of an adapter-persistence cache: its own adapter now keeps a
+    /// durable copy that a later fill may ask for.
+    fn note_holder(&self, page: &crate::model::PageId, requester: &racer_wire::control::NodeId) {
+        if self.fill.mode(&page.version.object.cache) != racer_wire::control::CacheMode::Adapter {
+            return;
+        }
+        self.fill
+            .dependencies
+            .candidates
+            .record_holder(page, requester);
+        self.fill
+            .metrics
+            .record(crate::telemetry::Event::HolderRecorded, 1);
+    }
+
     /// Authenticate and charge the exact peer request and attempt context.
     pub(crate) fn open_context(&self, envelope: PeerOriginContext) -> Result<ChargedOriginContext> {
         let request = envelope.request;
@@ -644,6 +711,21 @@ impl LocalPageService for Coordinator {
                     .record(crate::telemetry::Event::SilencePingAnswered, 1);
                 return Ok(PeerResponse::Miss);
             }
+            if let PeerOperation::Page {
+                page,
+                mode: FetchMode::Holder,
+            } = &request.operation
+            {
+                if page.version.object != request.origin.object {
+                    return Err(Error::InvalidRequest);
+                }
+                let mut effective = scope.clone();
+                effective.deadline.0 = racer_core::read::serve_deadline(
+                    effective.deadline.0,
+                    request.route.deadline.0,
+                );
+                return self.serve_holder(page, &effective).await;
+            }
             let object = match &request.operation {
                 PeerOperation::Subscribe { .. } => None,
                 PeerOperation::Bootstrap { object, .. } => Some(object),
@@ -791,6 +873,7 @@ impl LocalPageService for Coordinator {
                                 .await
                                 .and_then(|page_result| {
                                     page_result.validate_metadata()?;
+                                    self.note_holder(&page, &requester);
                                     Ok(PeerResponse::Page {
                                         metadata: page_result.metadata,
                                         ciphertext: page_result.ciphertext,

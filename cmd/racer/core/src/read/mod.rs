@@ -526,6 +526,9 @@ pub enum LocalSource {
     /// A copy the node's own origin adapter holds, read with a local-only
     /// origin request that never contacts the remote origin.
     AdapterReplica,
+    /// Nodes this owner served the page to, asked for a copy from their own
+    /// adapters with a local-only peer request ([`holders`]).
+    Holders,
 }
 
 /// Facts that select the local sources of one fill.
@@ -538,12 +541,11 @@ pub struct LocalSourceFacts {
 
 /// The local sources of one fill, in visit order. A miss or failure of one
 /// falls through to the next, and after the last to the ranked walk; only
-/// cancellation ends the fill. Further sources that are cheaper than ranked
-/// owners, such as nodes that recently read the page, belong after
-/// [`LocalSource::AdapterReplica`].
+/// cancellation ends the fill. The node's own adapter comes first, then
+/// recorded holders, which cost one peer exchange each.
 pub fn local_sources(facts: LocalSourceFacts) -> &'static [LocalSource] {
     if facts.adapter {
-        &[LocalSource::AdapterReplica]
+        &[LocalSource::AdapterReplica, LocalSource::Holders]
     } else {
         &[]
     }
@@ -605,7 +607,7 @@ mod policy_tests {
         assert!(local_sources(LocalSourceFacts::default()).is_empty());
         assert_eq!(
             local_sources(LocalSourceFacts { adapter: true }),
-            &[LocalSource::AdapterReplica]
+            &[LocalSource::AdapterReplica, LocalSource::Holders]
         );
     }
 

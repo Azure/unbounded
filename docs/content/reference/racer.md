@@ -160,6 +160,13 @@ spec:
   adapter that ignored the field would read from its remote source.
 - `racer_adapter_local_hits_total`, `racer_adapter_local_misses_total`, and
   `racer_adapter_local_failures_total` count local-only reads.
+- After a page leaves an owner's memory, the owner asks up to two nodes that
+  it recently served the page to for a copy from their own adapters before it
+  asks other owners or the remote origin. Those nodes answer only from memory
+  or a local-only adapter read, within a short timeout. A node without a copy
+  is forgotten. Each owner remembers at most four nodes per page for 24 hours.
+  `racer_holder_hits_total`, `racer_holder_misses_total`, and
+  `racer_holder_failures_total` count these requests.
 - `Racer`, the default when unset, writes pages to Racer's own disk.
   `Adapter` cannot be combined with `spec.passthrough` or `spec.origin`.
   Persistence can be changed at any time. When a cache switches to `Adapter`,

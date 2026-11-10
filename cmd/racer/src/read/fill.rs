@@ -2578,6 +2578,9 @@ impl Fill {
                     self.acquire_adapter_replica(page, context, scope, want_plaintext)
                         .await?
                 }
+                racer_core::read::LocalSource::Holders => {
+                    self.acquire_from_holders(page, &membership, scope).await?
+                }
             };
             if let Some(found) = found {
                 return Ok(found);
@@ -2924,7 +2927,7 @@ impl Fill {
     /// cancellation, returns `None` so the fill falls through to peers and the
     /// remote origin: neither is evidence about the remote origin, so neither
     /// feeds origin failure notes, link health, or a cached miss.
-    async fn acquire_adapter_replica(
+    pub(super) async fn acquire_adapter_replica(
         &self,
         page: &PageId,
         context: &OriginContext,
@@ -2993,6 +2996,59 @@ impl Fill {
                 Ok(None)
             }
         }
+    }
+
+    /// Ask the nodes this owner served `page` to (persistence Adapter) for a
+    /// copy from their memory or their own adapters, newest first, at most
+    /// [`racer_core::read::holders::HOLDER_ATTEMPTS`]. A copy is decrypted,
+    /// which authenticates it, and published to memory like an adapter hit.
+    /// A holder that answers without a copy, fails, or returns a copy that
+    /// does not authenticate is forgotten and the next is asked; after the
+    /// last the fill falls through to the walk. Like the local adapter, no
+    /// outcome feeds origin failure notes or a cached miss.
+    async fn acquire_from_holders(
+        &self,
+        page: &PageId,
+        membership: &std::sync::Arc<crate::topology::Membership>,
+        scope: &RequestScope,
+    ) -> Result<Option<AcquiredPage>> {
+        let policy = &self.dependencies.candidates;
+        for holder in policy.holder_candidates(page) {
+            scope.check()?;
+            let attempt = async {
+                let Some(response) = self
+                    .call(
+                        DriverStage::CandidateCompositeCall,
+                        policy.holder_copy(membership, &holder, page, scope),
+                    )
+                    .await?
+                else {
+                    return Ok(None);
+                };
+                let result = self.decrypt_response(page, response, None, scope).await?;
+                result.validate_for(page)?;
+                Ok::<_, Error>(Some(result))
+            };
+            match attempt.await {
+                Ok(Some(result)) => {
+                    self.call(
+                        DriverStage::PublishCall,
+                        self.publish(result.clone(), None, scope),
+                    )
+                    .await?;
+                    self.metrics.record(Event::HolderHit, 1);
+                    return Ok(Some(result.into()));
+                }
+                Ok(None) => self.metrics.record(Event::HolderMiss, 1),
+                Err(error @ Error::Canceled) => return Err(error),
+                Err(_) => {
+                    scope.check()?;
+                    self.metrics.record(Event::HolderFailure, 1);
+                }
+            }
+            policy.forget_holder(page, &holder);
+        }
+        Ok(None)
     }
 
     async fn encrypt_origin_page(
