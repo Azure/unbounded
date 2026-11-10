@@ -220,11 +220,11 @@ func TestLoadPeerAuth(t *testing.T) {
 	key := strings.Repeat("a", meshfetch.MinPeerKeyLen)
 
 	for name, path := range map[string]string{
-		"unset":      "",
-		"missing":    filepath.Join(dir, "missing"),
-		"empty":      write("empty", "\n\n"),
-		"short":      write("short", "tooshort\n"),
-		"one short":  write("oneshort", key + "\ntooshort\n"),
+		"unset":     "",
+		"missing":   filepath.Join(dir, "missing"),
+		"empty":     write("empty", "\n\n"),
+		"short":     write("short", "tooshort\n"),
+		"one short": write("oneshort", key+"\ntooshort\n"),
 	} {
 		if _, err := loadPeerAuth(path); err == nil {
 			t.Errorf("%s: want error", name)
