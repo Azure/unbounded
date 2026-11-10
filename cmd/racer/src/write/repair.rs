@@ -4,7 +4,7 @@
 //! The coordinator watches its membership on every maintenance turn. Holders
 //! that left the cache's pool are removed from the holder table in one
 //! journaled `NodesLost` event; a page with no surviving holder fails the
-//! object (`Racer-Write-Error: lost`). For every page left with fewer than
+//! object (upload state `failed`). For every page left with fewer than
 //! `replicas` holders, a background task asks a new store target to pull the
 //! page from a surviving holder with the same `write-store` operation the
 //! writer uses: the target verifies the envelope and the AEAD tag of the
