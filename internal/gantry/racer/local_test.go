@@ -52,9 +52,13 @@ func localOrigin(t *testing.T, store LocalStore, upstream *testUpstream) racersd
 	})
 }
 
-func TestIsLocalOnlyDefaultsFalse(t *testing.T) {
+func TestIsLocalOnlyFollowsRequest(t *testing.T) {
 	if isLocalOnly(racersdk.OriginRequest{}) {
-		t.Fatal("isLocalOnly must stay false until racersdk carries LocalOnly")
+		t.Fatal("ordinary requests must not be local-only")
+	}
+
+	if !isLocalOnly(racersdk.OriginRequest{LocalOnly: true}) {
+		t.Fatal("LocalOnly requests must be local-only")
 	}
 }
 

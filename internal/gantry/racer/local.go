@@ -66,12 +66,9 @@ func WithLocalStore(store LocalStore) OriginOption {
 }
 
 // isLocalOnly reports whether Racer asked for a page from local storage only.
-// Integration seam: replace the body with `return request.LocalOnly` once
-// racersdk.OriginRequest carries that field.
+// Racer sets it for caches with spec.persistence Adapter.
 func isLocalOnly(request racersdk.OriginRequest) bool {
-	_ = request
-
-	return false
+	return request.LocalOnly
 }
 
 // localMiss is the error for a page this node does not hold. Racer maps
