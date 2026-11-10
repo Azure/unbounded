@@ -130,6 +130,12 @@ func TestPlanWithoutRacerCacheKeepsDefaultMode(t *testing.T) {
 	if ds.Spec.Template.Spec.NodeSelector["pool"] == "cache" {
 		t.Fatal("placement copied from racer without ClusterCache/gantry")
 	}
+
+	for _, volume := range ds.Spec.Template.Spec.Volumes {
+		if volume.Name == racerContentVolume {
+			t.Fatal("containerd content store mounted without ClusterCache/gantry")
+		}
+	}
 }
 
 func TestPlanWithRacerCacheConfiguresRacerBackend(t *testing.T) {
@@ -172,6 +178,14 @@ func TestPlanWithRacerCacheConfiguresRacerBackend(t *testing.T) {
 		t.Fatalf("origin mount = %+v", got)
 	}
 
+	if got := mounts[racerContentVolume]; got.MountPath != "/var/lib/containerd/io.containerd.content.v1.content" || !got.ReadOnly {
+		t.Fatalf("content mount = %+v, want read-only containerd content root", got)
+	}
+
+	if value := envValue(container, racerContentRootEnv); value != "/var/lib/containerd/io.containerd.content.v1.content" {
+		t.Fatalf("%s = %q", racerContentRootEnv, value)
+	}
+
 	// The default mounts remain.
 	if _, ok := mounts["config"]; !ok {
 		t.Fatalf("config mount dropped: %+v", container.VolumeMounts)
@@ -187,6 +201,11 @@ func TestPlanWithRacerCacheConfiguresRacerBackend(t *testing.T) {
 		if hostPath == nil || hostPath.Path != path || ptr.Deref(hostPath.Type, "") != corev1.HostPathDirectory {
 			t.Fatalf("volume %s = %+v, want hostPath %s type Directory", name, volumes[name], path)
 		}
+	}
+
+	content := volumes[racerContentVolume].HostPath
+	if content == nil || content.Path != "/var/lib/containerd/io.containerd.content.v1.content" || ptr.Deref(content.Type, "") != corev1.HostPathUnset {
+		t.Fatalf("content volume = %+v, want unchecked hostPath of the containerd content root", volumes[racerContentVolume])
 	}
 
 	pod := ds.Spec.Template.Spec
@@ -307,13 +326,13 @@ func TestApplyRacerModeIsIdempotent(t *testing.T) {
 		t.Fatalf("placement = %#v %#v %#v, want cleared", pod.NodeSelector, pod.Tolerations, pod.Affinity)
 	}
 
-	if len(pod.Volumes) != 2 {
-		t.Fatalf("volumes = %+v, want two Racer volumes", pod.Volumes)
+	if len(pod.Volumes) != 3 {
+		t.Fatalf("volumes = %+v, want three Racer volumes", pod.Volumes)
 	}
 
 	agent := pod.Containers[0]
-	if len(agent.Env) != 1 || agent.Env[0].Value != "true" || len(agent.VolumeMounts) != 2 {
-		t.Fatalf("agent = %+v, want one Racer env var and two mounts", agent)
+	if len(agent.Env) != 2 || agent.Env[0].Value != "true" || envValue(agent, racerContentRootEnv) != racerContentRoot || len(agent.VolumeMounts) != 3 {
+		t.Fatalf("agent = %+v, want two Racer env vars and three mounts", agent)
 	}
 
 	if len(pod.Containers[1].Env) != 0 || len(pod.Containers[1].VolumeMounts) != 0 {
@@ -432,4 +451,14 @@ func TestRacerCachePredicateOriginChange(t *testing.T) {
 	if p.Update(event.UpdateEvent{ObjectOld: other, ObjectNew: otherNew}) {
 		t.Fatal("a spec change on another ClusterCache reconciled Gantry")
 	}
+}
+
+func envValue(container corev1.Container, name string) string {
+	for _, env := range container.Env {
+		if env.Name == name {
+			return env.Value
+		}
+	}
+
+	return ""
 }

@@ -31,10 +31,19 @@ const (
 	// cache name can select it.
 	RacerCacheName = "gantry"
 
-	racerEnabledEnv    = "GANTRY_RACER_ENABLED"
-	racerClientVolume  = "racer-client"
-	racerOriginVolume  = "racer-origin"
-	reasonRacerPending = "RacerPending"
+	racerEnabledEnv   = "GANTRY_RACER_ENABLED"
+	racerClientVolume = "racer-client"
+	racerOriginVolume = "racer-origin"
+
+	// racerContentVolume exposes the node's containerd content store to Gantry
+	// read-only, so it can serve Racer local-only page requests from blobs
+	// containerd already holds (ClusterCache adapter persistence). It is
+	// mounted at the same path it has on the host, which is also the agent's
+	// default racer_content_root.
+	racerContentVolume  = "containerd-content"
+	racerContentRoot    = "/var/lib/containerd/io.containerd.content.v1.content"
+	racerContentRootEnv = "GANTRY_RACER_CONTENT_ROOT"
+	reasonRacerPending  = "RacerPending"
 
 	// reasonRacerOriginConflict reports a ClusterCache/gantry that sets a
 	// managed origin. Racer would then run its own origin on the Gantry origin
@@ -110,7 +119,8 @@ func racerOriginConflict() component.Result {
 }
 
 // applyRacerMode configures the Gantry agent DaemonSet for the Racer backend:
-// it enables Racer mode, mounts the cache socket directories, and replaces the
+// it enables Racer mode, mounts the cache socket directories and the read-only
+// containerd content store, and replaces the
 // node placement with the dataplane's so Gantry serves as the cache origin on
 // every node that runs the dataplane, and only there. The socket directories
 // are mounted with hostPath type Directory, so a Pod scheduled before Racer
@@ -131,13 +141,19 @@ func applyRacerMode(obj *unstructured.Unstructured, placement *workload.NodePlac
 
 		found = true
 
-		if err := upsertNamed(container, "env", &corev1.EnvVar{Name: racerEnabledEnv, Value: "true"}); err != nil {
-			return err
+		for _, env := range []corev1.EnvVar{
+			{Name: racerEnabledEnv, Value: "true"},
+			{Name: racerContentRootEnv, Value: racerContentRoot},
+		} {
+			if err := upsertNamed(container, "env", &env); err != nil {
+				return err
+			}
 		}
 
 		for _, mount := range []corev1.VolumeMount{
 			{Name: racerClientVolume, MountPath: racerSocketDir("client"), ReadOnly: true},
 			{Name: racerOriginVolume, MountPath: racerSocketDir("origin")},
+			{Name: racerContentVolume, MountPath: racerContentRoot, ReadOnly: true},
 		} {
 			if err := upsertNamed(container, "volumeMounts", &mount); err != nil {
 				return err
@@ -161,6 +177,10 @@ func applyRacerMode(obj *unstructured.Unstructured, placement *workload.NodePlac
 	for _, volume := range []corev1.Volume{
 		{Name: racerClientVolume, VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: racerSocketDir("client"), Type: ptr.To(corev1.HostPathDirectory)}}},
 		{Name: racerOriginVolume, VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: racerSocketDir("origin"), Type: ptr.To(corev1.HostPathDirectory)}}},
+		// No type check: a node whose containerd uses another root must still
+		// start Gantry; it then serves no local replicas and Racer falls back
+		// to peers and the registry.
+		{Name: racerContentVolume, VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: racerContentRoot, Type: ptr.To(corev1.HostPathUnset)}}},
 	} {
 		if err := upsertNamed(podSpec, "volumes", &volume); err != nil {
 			return err
