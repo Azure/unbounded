@@ -260,8 +260,8 @@ source available to refill missing pages.
 
 Written pages that are not yet uploaded are pinned and cannot be evicted. They
 live in separate write segments and are recorded in a journal that the node
-replays when it starts. Each cache limits how much of its disk share such pages
-may use (`spec.writes.maxDirtyPercent`).
+replays when it starts. Each cache limits how much of each storage worker's
+capacity such pages may use (`spec.writes.maxDirtyPercent`).
 
 ## How a Write Works
 
@@ -293,9 +293,9 @@ Key rules:
   space with no upload cost. Cache-only checkpoints are removed when their hold
   time ends.
 - **Copies, not a system of record.** Until its upload commits, a written
-  object survives only while one of its copies survives. Racer copies pages
-  again when a node leaves, but losing every copy before upload loses the
-  object. Use `Racer-Durability: origin` to wait for the upload instead.
+  object survives only while one of its copies survives. Racer does not yet
+  copy pages again when a node leaves, so losing every copy before upload
+  loses the object. <!-- verify against WP8 --> Use `Racer-Durability: origin` to wait for the upload instead.
 
 See [Object writes]({{< relref "reference/racer#object-writes" >}}) and
 [Save PyTorch Checkpoints to Racer]({{< relref "guides/racer-checkpoints" >}}).
