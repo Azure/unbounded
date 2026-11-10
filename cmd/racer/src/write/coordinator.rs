@@ -395,11 +395,25 @@ pub(crate) async fn replicate_manifest(
     }) else {
         return;
     };
-    let replicas: Vec<NodeId> = ranked
+    let members: Vec<NodeId> = ranked
         .into_iter()
-        .filter(|node| *node != me && membership.serves(&object.cache, node))
-        .take(replicas)
+        .filter(|node| membership.serves(&object.cache, node))
         .collect();
+    let mut replicas: Vec<NodeId> = members
+        .iter()
+        .filter(|node| **node != me)
+        .take(replicas)
+        .cloned()
+        .collect();
+    // Page zero's rank-0 member always learns the manifest, even with
+    // `replicas=1`: after a node joins ahead of this coordinator it is the
+    // member readers ask first, and failover hands it the coordinator role.
+    if let Some(first) = members.first()
+        && *first != me
+        && !replicas.contains(first)
+    {
+        replicas.push(first.clone());
+    }
     send_manifest(local, object, &replicas, membership, scope).await;
 }
 

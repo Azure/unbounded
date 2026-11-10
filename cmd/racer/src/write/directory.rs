@@ -58,6 +58,10 @@ pub struct Entry {
     /// which membership version. `None` forces a
     /// check on the next maintenance turn.
     pub role_checked: Option<(u64, std::time::Instant)>,
+
+    /// The membership version under which every page's rank-0 owner last
+    /// got a copy (`repair::rebalance`). `None` until the first pass.
+    pub rebalanced: Option<u64>,
 }
 
 impl Entry {
@@ -76,6 +80,7 @@ impl Entry {
             commit_attempts: 0,
             repairing: false,
             role_checked: None,
+            rebalanced: None,
         }
     }
 

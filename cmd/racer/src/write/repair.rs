@@ -95,6 +95,7 @@ pub(crate) async fn maintain_object(
         replicate_manifest(local, object, membership, scope).await;
     }
     spawn(local, object, membership);
+    spawn_rebalance(local, object, membership);
     Ok(())
 }
 
@@ -166,19 +167,7 @@ async fn restore(
     if pages.is_empty() {
         return Ok(());
     }
-    let template = WriteStore {
-        session,
-        pages: Vec::new(),
-        length: spec.length,
-        page_size: crate::model::PageSize::from_wire(spec.page_size)
-            .map_err(|_| Error::Internal)?,
-        content_type: spec
-            .content_type
-            .as_deref()
-            .and_then(|c| crate::model::ContentType::parse(c.as_bytes()).ok()),
-        source: local.local_node(),
-        hold_until_millis: spec.hold_until_millis,
-    };
+    let template = template(local, session, &spec)?;
     let health = local.fill.dependencies.candidates.link_health();
     let me = local.local_node();
     // Per page: the survivor to copy from and the ranked targets to try.
@@ -207,10 +196,53 @@ async fn restore(
             want,
         });
     }
-    let mut restored = Holders(vec![Vec::new(); holders.pages() as usize]);
+    let (restored, copies) = execute(
+        local,
+        object,
+        &version,
+        &template,
+        holders.pages(),
+        plans,
+        membership,
+        scope,
+    )
+    .await;
+    if copies == 0 {
+        return Ok(());
+    }
+    background_event(
+        local,
+        object,
+        session,
+        SessionEvent::HoldersMerged(restored),
+        membership,
+        scope,
+    )
+    .await?;
+    let metrics = local.fill.metrics.writes();
+    for _ in 0..copies {
+        metrics.repair(&object.cache.0);
+    }
+    replicate_manifest(local, object, membership, scope).await;
+    Ok(())
+}
+
+/// Run `plans`: each round sends every page still short of copies to its
+/// next untried target, batched per (target, source). Returns the copies
+/// stored, per page, and their count.
+#[allow(clippy::too_many_arguments)] // The repair inputs are distinct.
+async fn execute(
+    local: &Coordinator,
+    object: &ObjectId,
+    version: &crate::model::ObjectVersion,
+    template: &WriteStore,
+    pages: u64,
+    mut plans: Vec<Plan>,
+    membership: &Arc<Membership>,
+    scope: &RequestScope,
+) -> (Holders, u64) {
+    let mut restored = Holders(vec![Vec::new(); pages as usize]);
     let mut copies = 0u64;
-    // Rounds: each round sends every page still short of copies to its next
-    // untried target, batched per (target, source).
     for _ in 0..RANKED_DEPTH {
         let mut batches: BTreeMap<(NodeId, NodeId), Vec<u64>> = BTreeMap::new();
         for plan in plans.iter_mut().filter(|p| p.want > 0) {
@@ -253,24 +285,169 @@ async fn restore(
             }
         }
     }
-    if copies == 0 {
-        return Ok(());
+    (restored, copies)
+}
+
+/// Give every page of `object` whose rank-0 owner under `membership` does
+/// not hold it a copy there, in the background, once per membership
+/// version. After a node joins, a page's new rank-0 owner is its own origin
+/// authority for that page, and the origin does not know a written object
+/// until it uploads: without a local copy that reader fails.
+pub(crate) fn spawn_rebalance(
+    local: &Coordinator,
+    object: &ObjectId,
+    membership: &Arc<Membership>,
+) {
+    let placement = membership.version.0;
+    let start = local.writes.directory().with(object, |e| {
+        let Some(e) = e else {
+            return false;
+        };
+        if e.repairing
+            || e.role != Role::Coordinator
+            || e.rebalanced == Some(placement)
+            || e.session.phase() != Phase::Committed
+            || matches!(
+                e.session.state(),
+                UploadState::Committed | UploadState::Failed
+            )
+        {
+            return false;
+        }
+        e.repairing = true;
+        true
+    });
+    if !start {
+        return;
     }
-    background_event(
+    let Ok(worker) = local.prefetch_directory().local_coordinator() else {
+        set_repairing(local, object, false, None);
+        return;
+    };
+    let Ok(permit) = worker.drivers().reserve() else {
+        set_repairing(local, object, false, None);
+        return;
+    };
+    let object = object.clone();
+    let membership = membership.clone();
+    permit.submit_detached(async move {
+        let result = match background_scope(&worker) {
+            Ok(scope) => rebalance(&worker, &object, &membership, &scope).await,
+            Err(error) => Err(error),
+        };
+        let done = result.as_ref().is_ok_and(|complete| *complete);
+        set_repairing(&worker, &object, false, done.then_some(placement));
+        result.map(|_| ())
+    });
+}
+
+fn set_repairing(local: &Coordinator, object: &ObjectId, repairing: bool, rebalanced: Option<u64>) {
+    local.writes.directory().with(object, |e| {
+        if let Some(e) = e {
+            e.repairing = repairing;
+            if rebalanced.is_some() {
+                e.rebalanced = rebalanced;
+            }
+        }
+    });
+}
+
+/// Copy every page whose rank-0 owner lacks it to that owner. `true` when
+/// every rank-0 owner now holds its pages (or is silent: a later
+/// membership change retries).
+async fn rebalance(
+    local: &Coordinator,
+    object: &ObjectId,
+    membership: &Arc<Membership>,
+    scope: &RequestScope,
+) -> Result<bool> {
+    let Some((version, session, spec, holders)) = local.writes.directory().with(object, |e| {
+        let e = e?;
+        Some((
+            e.version.clone(),
+            e.session.identity().session,
+            e.session.spec().clone(),
+            e.session.holders().clone(),
+        ))
+    }) else {
+        return Ok(true);
+    };
+    let template = template(local, session, &spec)?;
+    let health = local.fill.dependencies.candidates.link_health();
+    let me = local.local_node();
+    let mut plans = Vec::new();
+    for page in 0..holders.pages() {
+        let held = holders.page(page);
+        let Some(source) = held.first().and_then(|s| String::from_utf8(s.clone()).ok()) else {
+            continue;
+        };
+        let Some(owner) = ranked(local, membership, object, page, scope)
+            .await?
+            .into_iter()
+            .find(|node| membership.serves(&object.cache, node))
+        else {
+            continue;
+        };
+        if held.contains(&owner.0.clone().into_bytes()) || (owner != me && health.silent(&owner)) {
+            continue;
+        }
+        plans.push(Plan {
+            page,
+            source: NodeId(source),
+            targets: vec![owner],
+            next: 0,
+            want: 1,
+        });
+    }
+    if plans.is_empty() {
+        return Ok(true);
+    }
+    let wanted = plans.len() as u64;
+    let (restored, copies) = execute(
         local,
         object,
-        session,
-        SessionEvent::HoldersMerged(restored),
+        &version,
+        &template,
+        holders.pages(),
+        plans,
         membership,
         scope,
     )
-    .await?;
-    let metrics = local.fill.metrics.writes();
-    for _ in 0..copies {
-        metrics.repair(&object.cache.0);
+    .await;
+    if copies > 0 {
+        background_event(
+            local,
+            object,
+            session,
+            SessionEvent::HoldersMerged(restored),
+            membership,
+            scope,
+        )
+        .await?;
+        replicate_manifest(local, object, membership, scope).await;
     }
-    replicate_manifest(local, object, membership, scope).await;
-    Ok(())
+    Ok(copies == wanted)
+}
+
+/// The `write-store` request every copy of this session shares.
+fn template(
+    local: &Coordinator,
+    session: racer_core::write::SessionId,
+    spec: &racer_core::write::WriteSpec,
+) -> Result<WriteStore> {
+    Ok(WriteStore {
+        session,
+        pages: Vec::new(),
+        length: spec.length,
+        page_size: crate::model::PageSize::from_wire(spec.page_size)
+            .map_err(|_| Error::Internal)?,
+        content_type: spec
+            .content_type
+            .as_deref()
+            .and_then(|c| crate::model::ContentType::parse(c.as_bytes()).ok()),
+        source: local.local_node(),
+        hold_until_millis: spec.hold_until_millis,
+    })
 }
 
 /// Restore plan of one page.
