@@ -21,6 +21,7 @@
 //! than queue. `request_timeout` narrows the caller's deadline for the whole
 //! operation, including token acquisition.
 
+pub mod crc64;
 pub mod identity;
 pub mod request;
 pub mod response;
