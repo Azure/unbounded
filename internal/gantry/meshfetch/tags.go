@@ -329,7 +329,7 @@ func (n *Node) metaFromPeer(ctx context.Context, p cachemesh.PeerRef, hdr cachem
 
 // handleMeta serves GET MetaPath: a tag resolution for a peer.
 func (n *Node) handleMeta(w http.ResponseWriter, r *http.Request) {
-	if !allowMethod(w, r, http.MethodGet) {
+	if !allowMethod(w, r, http.MethodGet) || !authorize(w, r, n.cfg.Auth, nil) {
 		return
 	}
 

@@ -20,7 +20,6 @@
 package meshfetch
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -124,6 +123,10 @@ type Config struct {
 	// Verify hashes every full blob FetchBlob serves.
 	Verify bool
 
+	// Auth signs requests to peers and verifies requests from peers.
+	// Required.
+	Auth *PeerAuth
+
 	// Client sends data-plane requests. Nil uses NewDataClient().
 	Client *http.Client
 	// DataAddr maps a peer to its data-plane host:port. Nil uses the
@@ -219,8 +222,8 @@ type Node struct {
 
 // New validates cfg and returns a Node.
 func New(cfg Config) (*Node, error) {
-	if cfg.Mesh == nil || cfg.Origin == nil {
-		return nil, errors.New("meshfetch: Mesh and Origin are required")
+	if cfg.Mesh == nil || cfg.Origin == nil || cfg.Auth == nil {
+		return nil, errors.New("meshfetch: Mesh, Origin, and Auth are required")
 	}
 
 	if cfg.ChunkSize <= 0 || cfg.ChunkSize > 1<<30 {
@@ -426,7 +429,7 @@ func (n *Node) serveHook(outcome string, bytes int64) {
 // from the local cache, an in-progress fill, or a new fill routed by
 // Mesh.Forward.
 func (n *Node) handleChunk(w http.ResponseWriter, r *http.Request) {
-	if !allowMethod(w, r, http.MethodGet) {
+	if !allowMethod(w, r, http.MethodGet) || !authorize(w, r, n.cfg.Auth, nil) {
 		return
 	}
 
@@ -696,14 +699,16 @@ func errStatus(err error) (int, string) {
 }
 
 // ControlTransport sends cachemesh control messages as HTTP POSTs to
-// ControlPath on the member's address.
+// ControlPath on the member's address, signed by Auth.
 type ControlTransport struct {
 	Client *http.Client
+	Auth   *PeerAuth
 }
 
-// NewControlTransport returns a ControlTransport with a small dedicated
-// keep-alive pool. Send is bounded by the context the Mesh passes.
-func NewControlTransport() ControlTransport {
+// NewControlTransport returns a ControlTransport that signs with auth and
+// uses a small dedicated keep-alive pool. Send is bounded by the context
+// the Mesh passes.
+func NewControlTransport(auth *PeerAuth) ControlTransport {
 	protocols := new(http.Protocols)
 	protocols.SetHTTP1(true)
 
@@ -716,14 +721,14 @@ func NewControlTransport() ControlTransport {
 		MaxIdleConnsPerHost: 4,
 		IdleConnTimeout:     90 * time.Second,
 		DisableCompression:  true,
-	}}}
+	}}, Auth: auth}
 }
 
 // Send implements cachemesh.ControlTransport.
 func (t ControlTransport) Send(ctx context.Context, addr cachemesh.Endpoint, msg []byte) ([]byte, error) {
 	h := http.Header{"Content-Type": {"application/octet-stream"}}
 
-	resp, err := send(ctx, t.Client, http.MethodPost, "http://"+addr+ControlPath, bytes.NewReader(msg), h, func(_ int, status string) error {
+	resp, err := send(ctx, t.Client, t.Auth, http.MethodPost, "http://"+addr+ControlPath, msg, h, func(_ int, status string) error {
 		return fmt.Errorf("cachemesh control %s: %s", addr, status)
 	})
 	if err != nil {
@@ -744,24 +749,29 @@ func readBounded(r io.Reader) ([]byte, error) {
 	return b, err
 }
 
-// ControlHandler serves cachemesh control messages for the Mesh in m. A nil
+// ControlHandler serves cachemesh control messages for the Mesh in m. A
+// request auth does not verify gets 401 before the Mesh sees it. A nil
 // Mesh, a Mesh that is not running, or an oversized message gets 503 or
 // 400, which the sender treats as a transport failure.
-func ControlHandler(m *atomic.Pointer[cachemesh.Mesh]) http.Handler {
+func ControlHandler(m *atomic.Pointer[cachemesh.Mesh], auth *PeerAuth) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !allowMethod(w, r, http.MethodPost) {
-			return
-		}
-
-		mesh := m.Load()
-		if mesh == nil {
-			http.Error(w, "cachemesh not running", http.StatusServiceUnavailable)
 			return
 		}
 
 		body, err := readBounded(http.MaxBytesReader(w, r.Body, cachemesh.MaxControlMessageSize+1))
 		if err != nil {
 			http.Error(w, "bad control message", http.StatusBadRequest)
+			return
+		}
+
+		if !authorize(w, r, auth, body) {
+			return
+		}
+
+		mesh := m.Load()
+		if mesh == nil {
+			http.Error(w, "cachemesh not running", http.StatusServiceUnavailable)
 			return
 		}
 

@@ -36,6 +36,7 @@ type cachemeshAgent struct {
 	mesh    *cachemesh.Mesh
 	meshPtr atomic.Pointer[cachemesh.Mesh]
 	node    *meshfetch.Node
+	auth    *meshfetch.PeerAuth
 	logger  *slog.Logger
 	cancel  context.CancelFunc
 	done    chan error
@@ -88,6 +89,27 @@ func cachemeshAddr(c *config.Config) (string, error) {
 	return net.JoinHostPort(c.PodIP, port), nil
 }
 
+// loadPeerAuth reads the shared peer keys. It fails when the file is
+// unset, unreadable, empty, or holds a key shorter than
+// meshfetch.MinPeerKeyLen: cachemesh never runs unauthenticated.
+func loadPeerAuth(path string) (*meshfetch.PeerAuth, error) {
+	if path == "" {
+		return nil, errors.New("cachemesh: peer_key_file is required")
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("cachemesh: peer key file: %w", err)
+	}
+
+	auth, err := meshfetch.ParsePeerKeys(data)
+	if err != nil {
+		return nil, fmt.Errorf("cachemesh: peer key file %s: %w", path, err)
+	}
+
+	return auth, nil
+}
+
 // newCachemeshAgent builds the cachemesh member. It does not start it.
 func newCachemeshAgent(c *config.Config, origin ifaces.OriginPuller, reg *metrics.Registry, logger *slog.Logger) (*cachemeshAgent, error) {
 	cm := c.Cachemesh
@@ -110,6 +132,11 @@ func newCachemeshAgent(c *config.Config, origin ifaces.OriginPuller, reg *metric
 		return nil, err
 	}
 
+	auth, err := loadPeerAuth(cm.PeerKeyFile)
+	if err != nil {
+		return nil, err
+	}
+
 	client, err := chairs.NewClientset(c.MembersKubeconfig)
 	if err != nil {
 		return nil, fmt.Errorf("cachemesh: %w", err)
@@ -122,7 +149,7 @@ func newCachemeshAgent(c *config.Config, origin ifaces.OriginPuller, reg *metric
 	mesh, err := cachemesh.New(cachemesh.Config{
 		ID:           cachemeshMemberID(c),
 		Addr:         addr,
-		Transport:    meshfetch.NewControlTransport(),
+		Transport:    meshfetch.NewControlTransport(auth),
 		Lease:        lease,
 		Logger:       logger,
 		MaxNeighbors: cm.MaxNeighbors,
@@ -140,6 +167,7 @@ func newCachemeshAgent(c *config.Config, origin ifaces.OriginPuller, reg *metric
 
 	node, err := meshfetch.New(meshfetch.Config{
 		Mesh:          mesh,
+		Auth:          auth,
 		Origin:        rangeOrigin,
 		Tags:          tagOrigin,
 		ChunkSize:     cm.ChunkSize,
@@ -154,7 +182,7 @@ func newCachemeshAgent(c *config.Config, origin ifaces.OriginPuller, reg *metric
 		return nil, err
 	}
 
-	a := &cachemeshAgent{mesh: mesh, node: node, logger: logger, tags: tagOrigin != nil}
+	a := &cachemeshAgent{mesh: mesh, node: node, auth: auth, logger: logger, tags: tagOrigin != nil}
 	a.meshPtr.Store(mesh)
 	registerCachemeshState(reg, a)
 
@@ -175,7 +203,7 @@ func newCachemeshAgent(c *config.Config, origin ifaces.OriginPuller, reg *metric
 // routes registers the control, chunk, and metadata endpoints on the
 // transfer listener.
 func (a *cachemeshAgent) routes(mux *http.ServeMux) {
-	mux.Handle(meshfetch.ControlPath, meshfetch.ControlHandler(&a.meshPtr))
+	mux.Handle(meshfetch.ControlPath, meshfetch.ControlHandler(&a.meshPtr, a.auth))
 	a.node.Register(mux)
 }
 

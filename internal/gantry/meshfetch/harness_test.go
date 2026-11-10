@@ -390,6 +390,7 @@ func newCluster(t testing.TB, o clusterOpts) *cluster {
 
 		cfg := Config{
 			Mesh:      m,
+			Auth:      testAuth,
 			Origin:    c.origin,
 			Tags:      c.origin,
 			ChunkSize: o.chunkSize,

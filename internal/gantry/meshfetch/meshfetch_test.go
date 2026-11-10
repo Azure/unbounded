@@ -238,7 +238,7 @@ func TestFetchBlobDeclinesBeforeHeaders(t *testing.T) {
 	}
 
 	n, err := New(Config{
-		Mesh: m, Origin: c.origin, ChunkSize: 1 << 16, MaxFills: 1,
+		Mesh: m, Auth: testAuth, Origin: c.origin, ChunkSize: 1 << 16, MaxFills: 1,
 		tune: tuning{maxServes: 1, lookahead: 1, chunkTimeout: time.Second, stallTimeout: time.Second, attempts: 1},
 	})
 	if err != nil {
@@ -393,7 +393,7 @@ func TestChunkHandlerShedsAndValidates(t *testing.T) {
 	q := n.node.chunkQuery(chunkReq{registry: "reg", repo: "library/app", d: d, key: chunkKey{digest: d.String()}}, 0, "").Encode()
 
 	rec := httptest.NewRecorder()
-	n.node.handleChunk(rec, httptest.NewRequest(http.MethodGet, ChunkPath+"?"+q, nil))
+	n.node.handleChunk(rec, signedGet(ChunkPath+"?"+q))
 
 	if rec.Code != http.StatusTooManyRequests || rec.Header().Get("Retry-After") == "" {
 		t.Fatalf("over the serve cap: %d", rec.Code)
@@ -408,7 +408,7 @@ func TestChunkHandlerShedsAndValidates(t *testing.T) {
 		"missing header": "r=reg&n=library/app&d=" + d.String() + "&k=0&i=0&cs=65536",
 	} {
 		bad := httptest.NewRecorder()
-		n.node.handleChunk(bad, httptest.NewRequest(http.MethodGet, ChunkPath+"?"+query, nil))
+		n.node.handleChunk(bad, signedGet(ChunkPath+"?"+query))
 
 		if bad.Code != http.StatusBadRequest {
 			t.Errorf("%s: status %d, want 400", name, bad.Code)
@@ -417,7 +417,7 @@ func TestChunkHandlerShedsAndValidates(t *testing.T) {
 
 	// Peek misses return 404 without a fill.
 	rec = httptest.NewRecorder()
-	n.node.handleChunk(rec, httptest.NewRequest(http.MethodGet, ChunkPath+"?"+n.node.chunkQuery(chunkReq{registry: "reg", repo: "library/app", d: d, key: chunkKey{digest: d.String()}}, 0, peekLocal).Encode(), nil))
+	n.node.handleChunk(rec, signedGet(ChunkPath+"?"+n.node.chunkQuery(chunkReq{registry: "reg", repo: "library/app", d: d, key: chunkKey{digest: d.String()}}, 0, peekLocal).Encode()))
 
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("peek miss: %d", rec.Code)
@@ -575,7 +575,7 @@ func TestOwnerPeekStartsOneOriginFill(t *testing.T) {
 
 	peek := func(n *testNode) *httptest.ResponseRecorder {
 		rec := httptest.NewRecorder()
-		n.node.handleChunk(rec, httptest.NewRequest(http.MethodGet, ChunkPath+"?"+n.node.chunkQuery(req, 0, peekOwner).Encode(), nil))
+		n.node.handleChunk(rec, signedGet(ChunkPath+"?"+n.node.chunkQuery(req, 0, peekOwner).Encode()))
 
 		return rec
 	}
@@ -591,7 +591,7 @@ func TestOwnerPeekStartsOneOriginFill(t *testing.T) {
 
 	// A handoff peek at the owner still never starts a fill.
 	rec := httptest.NewRecorder()
-	owner.node.handleChunk(rec, httptest.NewRequest(http.MethodGet, ChunkPath+"?"+owner.node.chunkQuery(req, 0, peekLocal).Encode(), nil))
+	owner.node.handleChunk(rec, signedGet(ChunkPath+"?"+owner.node.chunkQuery(req, 0, peekLocal).Encode()))
 
 	if rec.Code != http.StatusNotFound || c.origin.totalPulls() != 0 {
 		t.Fatalf("handoff peek at the owner: status %d, origin pulls %d", rec.Code, c.origin.totalPulls())
@@ -759,7 +759,14 @@ func TestLocalPeekServesOnlyLocalContent(t *testing.T) {
 
 		u := "http://" + c.dataAddr(cachemesh.PeerRef{ID: n.id}) + ChunkPath + "?" + n.node.chunkQuery(req, 0, peekLocal).Encode()
 
-		resp, err := http.Get(u)
+		hreq, err := http.NewRequest(http.MethodGet, u, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		testAuth.Sign(hreq, nil)
+
+		resp, err := http.DefaultClient.Do(hreq)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1097,7 +1104,7 @@ func TestPeerRefusesManifestFromLocalContent(t *testing.T) {
 		}
 
 		rec := httptest.NewRecorder()
-		n.node.handleChunk(rec, httptest.NewRequest(http.MethodGet, ChunkPath+"?"+n.node.chunkQuery(req, 0, peekLocal).Encode(), nil))
+		n.node.handleChunk(rec, signedGet(ChunkPath+"?"+n.node.chunkQuery(req, 0, peekLocal).Encode()))
 
 		if rec.Code != tc.want {
 			t.Fatalf("kind %d: peek status %d, want %d", tc.kind, rec.Code, tc.want)

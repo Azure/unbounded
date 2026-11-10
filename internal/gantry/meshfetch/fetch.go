@@ -4,6 +4,7 @@
 package meshfetch
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -805,13 +806,19 @@ func (n *Node) doChunk(ctx context.Context, p cachemesh.PeerRef, hdr *cachemesh.
 func (n *Node) get(ctx context.Context, p cachemesh.PeerRef, path string, q url.Values, h http.Header) (*http.Response, error) {
 	u := "http://" + n.cfg.DataAddr(p) + path + "?" + q.Encode()
 
-	return send(ctx, n.client, http.MethodGet, u, nil, h, func(code int, _ string) error { return statusError(code, p) })
+	return send(ctx, n.client, n.cfg.Auth, http.MethodGet, u, nil, h, func(code int, _ string) error { return statusError(code, p) })
 }
 
-// send sends one request with client. A response other than 200 is drained
-// and closed, and bad maps its status to the returned error.
-func send(ctx context.Context, client *http.Client, method, u string, body io.Reader, h http.Header, bad func(code int, status string) error) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, method, u, body)
+// send sends one request with client, signed by auth. A response other
+// than 200 is drained and closed, and bad maps its status to the returned
+// error.
+func send(ctx context.Context, client *http.Client, auth *PeerAuth, method, u string, body []byte, h http.Header, bad func(code int, status string) error) (*http.Response, error) {
+	var rd io.Reader
+	if body != nil {
+		rd = bytes.NewReader(body)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, u, rd)
 	if err != nil {
 		return nil, err
 	}
@@ -819,6 +826,8 @@ func send(ctx context.Context, client *http.Client, method, u string, body io.Re
 	for k, v := range h {
 		req.Header[k] = v
 	}
+
+	auth.Sign(req, body)
 
 	resp, err := client.Do(req)
 	if err != nil {

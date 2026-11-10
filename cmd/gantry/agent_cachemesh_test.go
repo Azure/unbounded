@@ -160,12 +160,17 @@ func (rangeOnlyOrigin) PullRange(context.Context, ifaces.OriginRef, int64) (io.R
 // The scrape-time metrics keep their names: dashboards and the cluster
 // bench summary read them.
 func TestCachemeshStateMetricNames(t *testing.T) {
-	mesh, err := cachemesh.New(cachemesh.Config{ID: "a", Addr: "a:1", Transport: meshfetch.NewControlTransport()})
+	auth, err := meshfetch.NewPeerAuth([][]byte{[]byte(strings.Repeat("k", meshfetch.MinPeerKeyLen))})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	node, err := meshfetch.New(meshfetch.Config{Mesh: mesh, Origin: rangeOnlyOrigin{}, ChunkSize: 1 << 20})
+	mesh, err := cachemesh.New(cachemesh.Config{ID: "a", Addr: "a:1", Transport: meshfetch.NewControlTransport(auth)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	node, err := meshfetch.New(meshfetch.Config{Mesh: mesh, Auth: auth, Origin: rangeOnlyOrigin{}, ChunkSize: 1 << 20})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -198,5 +203,35 @@ func TestCachemeshStateMetricNames(t *testing.T) {
 
 	if len(got) != len(cachemeshStateMetrics) {
 		t.Errorf("registered %d metrics, want %d", len(got), len(cachemeshStateMetrics))
+	}
+}
+
+// Cachemesh never runs without valid peer keys.
+func TestLoadPeerAuth(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, data string) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		return p
+	}
+	key := strings.Repeat("a", meshfetch.MinPeerKeyLen)
+
+	for name, path := range map[string]string{
+		"unset":      "",
+		"missing":    filepath.Join(dir, "missing"),
+		"empty":      write("empty", "\n\n"),
+		"short":      write("short", "tooshort\n"),
+		"one short":  write("oneshort", key + "\ntooshort\n"),
+	} {
+		if _, err := loadPeerAuth(path); err == nil {
+			t.Errorf("%s: want error", name)
+		}
+	}
+
+	if _, err := loadPeerAuth(write("ok", key+"\n"+strings.Repeat("b", 40)+"\n")); err != nil {
+		t.Fatalf("valid key file: %v", err)
 	}
 }
