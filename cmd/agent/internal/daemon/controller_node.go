@@ -74,6 +74,21 @@ func (r *repaveReconciler) ReconcileRepave(ctx context.Context, _ string) (recon
 		return reconcile.Result{}, err
 	}
 
+	// One live check before anything this reconcile can start: a mode change,
+	// a repave in either mode, or the restart of a repave that keeps the mode.
+	// A declared mode change is drift, so it is checked too. A refusal leaves
+	// the running node alone and changes no mode; the unit guards check every
+	// start again.
+	if hasDrift(active.Config, &desiredConfig.AgentConfig) {
+		if err := verifyAllocationMachine(ctx, r.log, r.apiReader, active.Config, r.allocationLaunch); err != nil {
+			if errors.Is(err, errAllocationLaunchUnconfirmed) {
+				return reconcile.Result{RequeueAfter: allocationLaunchCheckTimeout}, nil
+			}
+
+			return reconcile.Result{}, nil
+		}
+	}
+
 	// A different declared mode is a mode change. When the change is not made
 	// now, the repave goes ahead in the mode the node runs, so version and
 	// configuration rollouts continue.
@@ -100,16 +115,6 @@ func (r *repaveReconciler) ReconcileRepave(ctx context.Context, _ string) (recon
 
 		if err := markAppliedConfiguration(ctx, r.Client, r.machineName, appliedRef); err != nil {
 			return reconcile.Result{}, fmt.Errorf("mark applied configuration: %w", err)
-		}
-
-		return reconcile.Result{}, nil
-	}
-
-	// Checked live before anything changes, so a refusal leaves the running
-	// node alone. The new slot's pre-start checks again before it starts.
-	if err := verifyAllocationMachine(ctx, r.log, r.apiReader, active.Config, r.allocationLaunch); err != nil {
-		if errors.Is(err, errAllocationLaunchUnconfirmed) {
-			return reconcile.Result{RequeueAfter: allocationLaunchCheckTimeout}, nil
 		}
 
 		return reconcile.Result{}, nil

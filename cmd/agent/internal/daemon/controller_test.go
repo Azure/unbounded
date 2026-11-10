@@ -28,6 +28,7 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/agentbinary"
 	daemon "github.com/Azure/unbounded/pkg/agent/daemon"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/isolation"
 )
 
 const testAgentUpgradeSHA256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -956,37 +957,41 @@ func TestReconcileNodeReboot_AllocationLaunch(t *testing.T) {
 			wantReason:  "ExecutionFailed",
 		},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			c := fakeStatusClient(tc.cached, nodeRebootOperation())
+		// The check runs before RestartNode whatever the active mode is; the
+		// dispatcher then sends the restart to that mode's operator.
+		for _, mode := range []isolation.Mode{isolation.ModeNSpawn, isolation.ModeNone} {
+			t.Run(string(mode)+"/"+tc.name, func(t *testing.T) {
+				c := fakeStatusClient(tc.cached, nodeRebootOperation())
 
-			var reader client.Reader = c
-			if tc.reader != nil {
-				reader = tc.reader(t)
-			}
+				var reader client.Reader = c
+				if tc.reader != nil {
+					reader = tc.reader(t)
+				}
 
-			op := &fakeNodeOperator{active: &ActiveMachine{Name: "kube1", Config: tc.cfg(t)}, restartErr: tc.restartErr}
-			reconciler := newAllocationMachineOperationReconciler(t, c, reader, op)
+				op := &fakeNodeOperator{active: &ActiveMachine{Name: "kube1", Config: tc.cfg(t), Mode: mode}, restartErr: tc.restartErr}
+				reconciler := newAllocationMachineOperationReconciler(t, c, reader, op)
 
-			_, err := reconciler.ReconcileMachineOperation(context.Background(), "op-1")
-			require.NoError(t, err)
-			assert.Equal(t, tc.wantRestart, op.restartCalled)
+				_, err := reconciler.ReconcileMachineOperation(context.Background(), "op-1")
+				require.NoError(t, err)
+				assert.Equal(t, tc.wantRestart, op.restartCalled)
 
-			var updated v1alpha3.MachineOperation
-			require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
-			assert.Equal(t, tc.wantPhase, updated.Status.Phase)
-			completed := apimeta.FindStatusCondition(updated.Status.Conditions, "Completed")
-			require.NotNil(t, completed)
-			assert.Equal(t, tc.wantReason, completed.Reason)
+				var updated v1alpha3.MachineOperation
+				require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
+				assert.Equal(t, tc.wantPhase, updated.Status.Phase)
+				completed := apimeta.FindStatusCondition(updated.Status.Conditions, "Completed")
+				require.NotNil(t, completed)
+				assert.Equal(t, tc.wantReason, completed.Reason)
 
-			if tc.wantReason == AllocationLaunchRefusedReason {
-				assert.Contains(t, updated.Status.Message, ErrAllocationLaunchRefused.Error())
-				assert.Contains(t, updated.Status.Message, errAllocationMachineFenced.Error())
-			}
+				if tc.wantReason == AllocationLaunchRefusedReason {
+					assert.Contains(t, updated.Status.Message, ErrAllocationLaunchRefused.Error())
+					assert.Contains(t, updated.Status.Message, errAllocationMachineFenced.Error())
+				}
 
-			if tc.restartErr != nil {
-				assert.Equal(t, tc.restartErr.Error(), updated.Status.Message)
-			}
-		})
+				if tc.restartErr != nil {
+					assert.Equal(t, tc.restartErr.Error(), updated.Status.Message)
+				}
+			})
+		}
 	}
 }
 
