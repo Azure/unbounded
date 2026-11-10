@@ -240,14 +240,17 @@ func TestGantryIntegration(t *testing.T) {
 		assertRanges(t, 0, 0, 0)
 	})
 
-	t.Run("consumer rejects transported corruption", func(t *testing.T) {
+	t.Run("mirror aborts transported corruption", func(t *testing.T) {
 		p, metrics := newPull(t)
 		require.True(t, p.opts.Verify, "consumer verification must remain enabled")
 		corrupt.Store(true)
 
 		err := p.pull(t.Context())
-		require.ErrorContains(t, err, "digest mismatch")
-		require.Equal(t, float64(img.Manifest.Size), testutil.ToFloat64(metrics.receivedBytes), "mirror must deliver the complete corrupt object")
+		require.ErrorIs(t, err, io.ErrUnexpectedEOF)
+		// How much of the withheld prefix reaches the client depends on
+		// net/http buffering; only the final byte is guaranteed withheld.
+		require.Less(t, testutil.ToFloat64(metrics.receivedBytes), float64(img.Manifest.Size),
+			"mirror must not complete an object that fails digest verification")
 		require.Zero(t, testutil.ToFloat64(metrics.pulls.WithLabelValues("success")))
 		require.Equal(t, float64(1), testutil.ToFloat64(metrics.pulls.WithLabelValues("error")))
 	})

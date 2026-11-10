@@ -699,7 +699,7 @@ func (s *Handler) streamContent(ctx context.Context, w http.ResponseWriter, id s
 
 		if err == nil || written > remaining || !retryable(ctx, err) || !retry.wait(ctx, "write_body") {
 			s.logRacerFailure(id, "write_body", err, remaining, written)
-			panic(http.ErrAbortHandler)
+			abortAfterFlush(w)
 		}
 
 		// WriteTo may leave an interrupt deadline behind; clear it before
@@ -1478,4 +1478,14 @@ func (m *Metrics) MirrorRetry(stage string) {
 // DigestMismatch records one full response aborted by digest verification.
 func (m *Metrics) DigestMismatch() {
 	m.mismatches.Inc()
+}
+
+// abortAfterFlush pushes bytes already accepted by w onto the connection
+// before aborting, so a client can resume from every byte the handler counted
+// as written. Without the flush, net/http drops its buffered tail on abort.
+// Never call it on a digest mismatch: the withheld final byte is not in w.
+func abortAfterFlush(w http.ResponseWriter) {
+	_ = http.NewResponseController(w).Flush() //nolint:errcheck // best effort before abort
+
+	panic(http.ErrAbortHandler)
 }
