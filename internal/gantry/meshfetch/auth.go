@@ -8,6 +8,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net/http"
@@ -24,8 +25,11 @@ import (
 //	Gantry-Cachemesh-Auth: v1 t=<unix seconds> s=<base64url HMAC-SHA256>
 //
 // The MAC covers authDomain, the method, the escaped URL path, the raw
-// query, the timestamp, and the SHA-256 of the body (of the empty body for
-// GET). The first key signs; every key verifies, so keys rotate by adding
+// query, the timestamp, every value of each header in signedHeaders, and
+// the SHA-256 of the body (of the empty body for GET). The headers are
+// bound because handlers act on them: headerRoute steers forwarding and
+// headerRequester registers a holder the owner later fills from, so a
+// replayed request must not be able to change them. The first key signs; every key verifies, so keys rotate by adding
 // the new key second, then moving it first, then dropping the old one.
 const (
 	headerAuth = "Gantry-Cachemesh-Auth"
@@ -38,6 +42,10 @@ const (
 	// the receiver's clock.
 	MaxAuthSkew = 2 * time.Minute
 )
+
+// signedHeaders lists, in MAC order, the request headers a handler reads.
+// A header a handler starts to read must be added here.
+var signedHeaders = []string{headerRoute, headerRequester}
 
 // ErrUnauthenticated reports a request without a valid signature.
 var ErrUnauthenticated = errors.New("meshfetch: unauthenticated peer request")
@@ -152,6 +160,24 @@ func (a *PeerAuth) mac(key []byte, r *http.Request, ts int64, body []byte) []byt
 	for _, s := range []string{authDomain + "/" + authVer, r.Method, r.URL.EscapedPath(), r.URL.RawQuery, strconv.FormatInt(ts, 10)} {
 		m.Write([]byte(s))
 		m.Write([]byte{'\n'})
+	}
+
+	// Each signed header is its name, its value count, then each value
+	// length-prefixed, so absent, empty, and multi-valued headers all
+	// encode distinctly and values may contain any byte.
+	var n [8]byte
+
+	for _, name := range signedHeaders {
+		vs := r.Header.Values(name)
+		m.Write([]byte(name))
+		binary.BigEndian.PutUint64(n[:], uint64(len(vs)))
+		m.Write(n[:])
+
+		for _, v := range vs {
+			binary.BigEndian.PutUint64(n[:], uint64(len(v)))
+			m.Write(n[:])
+			m.Write([]byte(v))
+		}
 	}
 
 	m.Write(bh[:])
