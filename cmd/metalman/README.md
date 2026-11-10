@@ -243,7 +243,9 @@ that file. Set `holdLease: true` on a `dhcpLeases` entry to also run a DHCPv4
 client on the provisioning NIC so the site DHCP server keeps the lease for the
 static address and does not hand it to another host. Routes, DNS, NTP, hostname,
 and domains from DHCP are ignored. The client identifies with the NIC MAC so
-reservations keyed by MAC match. Leave it unset for DHCP-free provisioning.
+reservations keyed by MAC match. Metalman answers only PXE and HTTP boot
+firmware for a held lease, not the installed OS, so the OS holds the lease
+with the site DHCP server. Leave it unset for DHCP-free provisioning.
 The default netboot image serves the same lease as NoCloud
 `network-config`. If `spec.host.netboot.targetDisk` is
 set, the installer writes the image to that disk; otherwise it falls back to
