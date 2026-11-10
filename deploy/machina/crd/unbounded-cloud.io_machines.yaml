@@ -590,6 +590,7 @@ spec:
                                 name:
                                   description: Name is the bond interface name, for
                                     example bond0.
+                                  maxLength: 15
                                   pattern: ^[a-zA-Z][a-zA-Z0-9_-]{0,14}$
                                   type: string
                                 routes:
@@ -688,6 +689,7 @@ spec:
                                     Name is the interface name persisted on the installed host, for example
                                     enp1s0f0. Metalman matches the device by MACAddress and does not rely
                                     on the kernel's naming during installation.
+                                  maxLength: 15
                                   pattern: ^[a-zA-Z][a-zA-Z0-9_-]{0,14}$
                                   type: string
                                 routes:
@@ -766,6 +768,7 @@ spec:
                                 name:
                                   description: Name is the VLAN interface name, for
                                     example bond0.64.
+                                  maxLength: 15
                                   pattern: ^[a-zA-Z][a-zA-Z0-9_.-]{0,14}$
                                   type: string
                                 routes:
@@ -804,15 +807,6 @@ spec:
                         required:
                         - ethernets
                         type: object
-                        x-kubernetes-validations:
-                        - message: bond interfaces must reference declared ethernets
-                          rule: '!has(self.bonds) || self.bonds.all(b, b.interfaces.all(i,
-                            self.ethernets.exists(e, e.name == i)))'
-                        - message: vlan link must reference a declared ethernet or
-                            bond
-                          rule: '!has(self.vlans) || self.vlans.all(v, self.ethernets.exists(e,
-                            e.name == v.link) || (has(self.bonds) && self.bonds.exists(b,
-                            b.name == v.link)))'
                       pullSecretRef:
                         description: |-
                           PullSecretRef references a Docker registry credential Secret used to pull
@@ -913,6 +907,17 @@ spec:
                   rule: '!has(oldSelf.azure) || has(self.azure)'
                 - message: external host ownership is immutable once set
                   rule: '!has(oldSelf.external) || has(self.external)'
+                - fieldPath: .netboot.network.bonds
+                  message: bond interfaces must reference declared ethernets
+                  rule: '!has(self.netboot) || !has(self.netboot.network) || !has(self.netboot.network.bonds)
+                    || self.netboot.network.bonds.all(b, b.interfaces.all(i, self.netboot.network.ethernets.exists(e,
+                    e.name == i)))'
+                - fieldPath: .netboot.network.vlans
+                  message: vlan link must reference a declared ethernet or bond
+                  rule: '!has(self.netboot) || !has(self.netboot.network) || !has(self.netboot.network.vlans)
+                    || self.netboot.network.vlans.all(v, self.netboot.network.ethernets.exists(e,
+                    e.name == v.link) || (has(self.netboot.network.bonds) && self.netboot.network.bonds.exists(b,
+                    b.name == v.link)))'
               isolation:
                 description: |-
                   Isolation declares where the node stack (containerd, kubelet, CNI and
@@ -1195,6 +1200,7 @@ spec:
                             name:
                               description: Name is the bond interface name, for example
                                 bond0.
+                              maxLength: 15
                               pattern: ^[a-zA-Z][a-zA-Z0-9_-]{0,14}$
                               type: string
                             routes:
@@ -1291,6 +1297,7 @@ spec:
                                 Name is the interface name persisted on the installed host, for example
                                 enp1s0f0. Metalman matches the device by MACAddress and does not rely
                                 on the kernel's naming during installation.
+                              maxLength: 15
                               pattern: ^[a-zA-Z][a-zA-Z0-9_-]{0,14}$
                               type: string
                             routes:
@@ -1368,6 +1375,7 @@ spec:
                             name:
                               description: Name is the VLAN interface name, for example
                                 bond0.64.
+                              maxLength: 15
                               pattern: ^[a-zA-Z][a-zA-Z0-9_.-]{0,14}$
                               type: string
                             routes:
@@ -1405,14 +1413,6 @@ spec:
                     required:
                     - ethernets
                     type: object
-                    x-kubernetes-validations:
-                    - message: bond interfaces must reference declared ethernets
-                      rule: '!has(self.bonds) || self.bonds.all(b, b.interfaces.all(i,
-                        self.ethernets.exists(e, e.name == i)))'
-                    - message: vlan link must reference a declared ethernet or bond
-                      rule: '!has(self.vlans) || self.vlans.all(v, self.ethernets.exists(e,
-                        e.name == v.link) || (has(self.bonds) && self.bonds.exists(b,
-                        b.name == v.link)))'
                   pullSecretRef:
                     description: |-
                       PullSecretRef references a Docker registry credential Secret used to pull
@@ -1580,6 +1580,17 @@ spec:
                 && !has(self.providerID))'
             - message: fenced requires allocationRef
               rule: '!has(self.fenced) || !self.fenced || has(self.allocationRef)'
+            - fieldPath: .pxe.network.bonds
+              message: bond interfaces must reference declared ethernets
+              rule: '!has(self.pxe) || !has(self.pxe.network) || !has(self.pxe.network.bonds)
+                || self.pxe.network.bonds.all(b, b.interfaces.all(i, self.pxe.network.ethernets.exists(e,
+                e.name == i)))'
+            - fieldPath: .pxe.network.vlans
+              message: vlan link must reference a declared ethernet or bond
+              rule: '!has(self.pxe) || !has(self.pxe.network) || !has(self.pxe.network.vlans)
+                || self.pxe.network.vlans.all(v, self.pxe.network.ethernets.exists(e,
+                e.name == v.link) || (has(self.pxe.network.bonds) && self.pxe.network.bonds.exists(b,
+                b.name == v.link)))'
           status:
             description: MachineStatus defines the observed state of a Machine.
             properties:

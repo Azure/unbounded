@@ -50,6 +50,14 @@ Rules enforced by CRD CEL:
 - Bond members must name declared ethernets; VLAN links must name a declared
   ethernet or bond; `lacpRate` requires 802.3ad.
 
+The bond-member and VLAN-link rules are declared on `MachineSpec` (for
+`spec.pxe`) and `HostSpec` (for `spec.host.netboot`), not on
+`HostNetworkSpec`. `PXESpec` is also embedded in the MachineOperation
+`status.targets[].bootMedia.netboot` snapshot; `targets` has no `maxItems`, so
+nested list rules there exceed the API server's CEL cost budget and the CRD
+would be rejected. The snapshot is copied from a validated Machine and keeps
+the per-field schema and the `PXESpec` rules.
+
 Rules enforced by metalman before it builds media (`hostnetwork.Validate`); a
 violation fails the operation with a message naming the field:
 

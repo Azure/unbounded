@@ -134,6 +134,8 @@ const (
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.provider) || (has(self.provider) && self.provider == oldSelf.provider)",message="provider is immutable once set"
 // +kubebuilder:validation:XValidation:rule="!has(self.host) || (!has(self.host.netboot) && !has(self.host.azure) && !has(self.host.external)) || (!has(self.pxe) && !has(self.provider) && !has(self.providerID))",message="host ownership cannot be combined with legacy pxe, provider, or providerID fields"
 // +kubebuilder:validation:XValidation:rule="!has(self.fenced) || !self.fenced || has(self.allocationRef)",message="fenced requires allocationRef"
+// +kubebuilder:validation:XValidation:rule="!has(self.pxe) || !has(self.pxe.network) || !has(self.pxe.network.bonds) || self.pxe.network.bonds.all(b, b.interfaces.all(i, self.pxe.network.ethernets.exists(e, e.name == i)))",message="bond interfaces must reference declared ethernets",fieldPath=".pxe.network.bonds"
+// +kubebuilder:validation:XValidation:rule="!has(self.pxe) || !has(self.pxe.network) || !has(self.pxe.network.vlans) || self.pxe.network.vlans.all(v, self.pxe.network.ethernets.exists(e, e.name == v.link) || (has(self.pxe.network.bonds) && self.pxe.network.bonds.exists(b, b.name == v.link)))",message="vlan link must reference a declared ethernet or bond",fieldPath=".pxe.network.vlans"
 type MachineSpec struct {
 	// SSH contains the SSH connection and credential details for the
 	// machine.
@@ -231,6 +233,8 @@ type ProviderMachineReference struct {
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.netboot) || has(self.netboot)",message="netboot host ownership is immutable once set"
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.azure) || has(self.azure)",message="azure host ownership is immutable once set"
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.external) || has(self.external)",message="external host ownership is immutable once set"
+// +kubebuilder:validation:XValidation:rule="!has(self.netboot) || !has(self.netboot.network) || !has(self.netboot.network.bonds) || self.netboot.network.bonds.all(b, b.interfaces.all(i, self.netboot.network.ethernets.exists(e, e.name == i)))",message="bond interfaces must reference declared ethernets",fieldPath=".netboot.network.bonds"
+// +kubebuilder:validation:XValidation:rule="!has(self.netboot) || !has(self.netboot.network) || !has(self.netboot.network.vlans) || self.netboot.network.vlans.all(v, self.netboot.network.ethernets.exists(e, e.name == v.link) || (has(self.netboot.network.bonds) && self.netboot.network.bonds.exists(b, b.name == v.link)))",message="vlan link must reference a declared ethernet or bond",fieldPath=".netboot.network.vlans"
 type HostSpec struct {
 	// Image is an opaque provider-interpreted image identifier. If omitted,
 	// HostReplace preserves the host's current image.
@@ -525,8 +529,11 @@ type PXESpec struct {
 }
 
 // HostNetworkSpec declares a static host network topology.
-// +kubebuilder:validation:XValidation:rule="!has(self.bonds) || self.bonds.all(b, b.interfaces.all(i, self.ethernets.exists(e, e.name == i)))",message="bond interfaces must reference declared ethernets"
-// +kubebuilder:validation:XValidation:rule="!has(self.vlans) || self.vlans.all(v, self.ethernets.exists(e, e.name == v.link) || (has(self.bonds) && self.bonds.exists(b, b.name == v.link)))",message="vlan link must reference a declared ethernet or bond"
+//
+// The cross-reference rules (bond members and VLAN links) are declared on
+// MachineSpec and HostSpec rather than here: PXESpec is also embedded in the
+// unbounded MachineOperation status.targets list, where these nested list
+// rules would exceed the API server's CEL cost budget.
 type HostNetworkSpec struct {
 	// Ethernets declares the physical network interfaces, matched by their
 	// permanent MAC addresses.
@@ -602,6 +609,7 @@ type EthernetSpec struct {
 	// Name is the interface name persisted on the installed host, for example
 	// enp1s0f0. Metalman matches the device by MACAddress and does not rely
 	// on the kernel's naming during installation.
+	// +kubebuilder:validation:MaxLength=15
 	// +kubebuilder:validation:Pattern=`^[a-zA-Z][a-zA-Z0-9_-]{0,14}$`
 	Name string `json:"name"`
 
@@ -626,6 +634,7 @@ const (
 // +kubebuilder:validation:XValidation:rule="!has(self.lacpRate) || self.mode == '802.3ad'",message="lacpRate requires mode 802.3ad"
 type BondSpec struct {
 	// Name is the bond interface name, for example bond0.
+	// +kubebuilder:validation:MaxLength=15
 	// +kubebuilder:validation:Pattern=`^[a-zA-Z][a-zA-Z0-9_-]{0,14}$`
 	Name string `json:"name"`
 
@@ -667,6 +676,7 @@ type BondSpec struct {
 // VLANSpec declares an 802.1Q VLAN interface.
 type VLANSpec struct {
 	// Name is the VLAN interface name, for example bond0.64.
+	// +kubebuilder:validation:MaxLength=15
 	// +kubebuilder:validation:Pattern=`^[a-zA-Z][a-zA-Z0-9_.-]{0,14}$`
 	Name string `json:"name"`
 

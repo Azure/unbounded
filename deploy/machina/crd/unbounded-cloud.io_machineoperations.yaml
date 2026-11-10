@@ -588,6 +588,7 @@ spec:
                                       name:
                                         description: Name is the bond interface name,
                                           for example bond0.
+                                        maxLength: 15
                                         pattern: ^[a-zA-Z][a-zA-Z0-9_-]{0,14}$
                                         type: string
                                       routes:
@@ -687,6 +688,7 @@ spec:
                                           Name is the interface name persisted on the installed host, for example
                                           enp1s0f0. Metalman matches the device by MACAddress and does not rely
                                           on the kernel's naming during installation.
+                                        maxLength: 15
                                         pattern: ^[a-zA-Z][a-zA-Z0-9_-]{0,14}$
                                         type: string
                                       routes:
@@ -767,6 +769,7 @@ spec:
                                       name:
                                         description: Name is the VLAN interface name,
                                           for example bond0.64.
+                                        maxLength: 15
                                         pattern: ^[a-zA-Z][a-zA-Z0-9_.-]{0,14}$
                                         type: string
                                       routes:
@@ -806,15 +809,6 @@ spec:
                               required:
                               - ethernets
                               type: object
-                              x-kubernetes-validations:
-                              - message: bond interfaces must reference declared ethernets
-                                rule: '!has(self.bonds) || self.bonds.all(b, b.interfaces.all(i,
-                                  self.ethernets.exists(e, e.name == i)))'
-                              - message: vlan link must reference a declared ethernet
-                                  or bond
-                                rule: '!has(self.vlans) || self.vlans.all(v, self.ethernets.exists(e,
-                                  e.name == v.link) || (has(self.bonds) && self.bonds.exists(b,
-                                  b.name == v.link)))'
                             pullSecretRef:
                               description: |-
                                 PullSecretRef references a Docker registry credential Secret used to pull
