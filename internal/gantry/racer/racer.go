@@ -156,7 +156,12 @@ type upstream interface {
 // Origin returns a concurrent callback using only configured registry names and
 // aliases. The allowlist is copied at construction; upstream owns registry I/O,
 // including authentication, redirects, cancellation, and offset validation.
-func Origin(cfg *config.Config, source upstream) racersdk.Origin {
+func Origin(cfg *config.Config, source upstream, opts ...OriginOption) racersdk.Origin {
+	options := originOptions{localOnly: isLocalOnly}
+	for _, opt := range opts {
+		opt(&options)
+	}
+
 	registries := make(map[string]bool)
 
 	if cfg != nil {
@@ -181,6 +186,11 @@ func Origin(cfg *config.Config, source upstream) racersdk.Origin {
 		auth, err := parseAuthorization(request.Authorization)
 		if err != nil {
 			return racersdk.Metadata{}, nil, classifyError(err)
+		}
+
+		metadata, body, handled, err := serveLocal(ctx, options.local, ref, request, options.localOnly(request))
+		if handled {
+			return metadata, body, err
 		}
 
 		ctx = registryauth.WithAuthorization(ctx, auth)
