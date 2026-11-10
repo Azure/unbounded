@@ -904,3 +904,463 @@ fn store_targets_pull_over_rdma_links() {
     let read = c.get(1, OBJECT, body.len());
     assert!(read.object() == body);
 }
+
+// WP8: repair, coordinator failover, rekey, and garbage collection.
+
+impl Cluster {
+    /// Crash node `index` (power loss) and drop it from the membership.
+    fn crash(&mut self, index: usize) {
+        self.harness.retire(&self.env, index, true);
+        self.harness.settle();
+    }
+
+    /// The node index that coordinates the written object, if exactly one.
+    fn coordinator(&self) -> Option<usize> {
+        let coordinators: Vec<usize> = self
+            .roles()
+            .into_iter()
+            .filter(|(_, role, ..)| *role == crate::write::directory::Role::Coordinator)
+            .map(|(node, ..)| node)
+            .collect();
+        (coordinators.len() == 1).then(|| coordinators[0])
+    }
+
+    /// One cache key of epoch `epoch`, as `Harness::bundle` mints it.
+    fn cache_key(
+        &self,
+        epoch: u8,
+        index: usize,
+        state: wire::CacheKeyState,
+    ) -> wire::CacheEncryptionKey {
+        let purpose = [
+            wire::CacheKeyPurpose::Page,
+            wire::CacheKeyPurpose::OriginCredentials,
+        ][index];
+        wire::CacheEncryptionKey::new(
+            wire::CacheKeyRef {
+                cache: self.harness.definition(0).id,
+                id: crate::model::key_id_from_generation(
+                    u64::from(epoch) + 1,
+                    7 + index as u32 + u32::from(epoch) * 2,
+                )
+                .unwrap(),
+                purpose,
+            },
+            state,
+            zeroize::Zeroizing::new([19 + index as u8 + epoch * 2; 32]),
+        )
+    }
+
+    /// Rotate the cache keys: a new active page key, keeping the page keys
+    /// of the previous `keep` epochs as decrypt keys (the keyring keeps
+    /// `retained_page_keys - 1`).
+    fn rotate_keys(&mut self, keep: u8) {
+        self.harness.key_epoch += 1;
+        let epoch = self.harness.key_epoch;
+        let mut keys = vec![
+            self.cache_key(epoch, 0, wire::CacheKeyState::Active),
+            self.cache_key(epoch, 1, wire::CacheKeyState::Active),
+        ];
+        for old in epoch.saturating_sub(keep)..epoch {
+            keys.push(self.cache_key(old, 0, wire::CacheKeyState::Decrypt));
+        }
+        for node in &mut self.harness.nodes {
+            let bundle = wire::KeyringBundle {
+                schema_version: racer_wire::control::KEYRING_SCHEMA_VERSION,
+                cluster: node.config.cluster.clone(),
+                generation: wire::BundleGeneration(u64::from(epoch) + 1),
+                peer_trust_roots: vec![self.harness.ca.der().to_vec()],
+                cache_keys: keys.clone(),
+            };
+            node.workers[0].app.keys.install(bundle).unwrap();
+        }
+        self.harness.tick();
+    }
+
+    /// The page key of every live written page, per node.
+    fn written_keys(&self) -> Vec<racer_wire::control::KeyId> {
+        self.harness
+            .nodes
+            .iter()
+            .flat_map(|n| &n.workers)
+            .flat_map(|w| {
+                let writer = &w.app.store.writer;
+                writer
+                    .written_pages()
+                    .into_iter()
+                    .filter_map(|(page, _)| writer.index().lookup(&page).ok().flatten())
+                    .map(|indexed| indexed.key_id)
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    fn read_everywhere(&mut self, object: usize, body: &[u8], etag: &str) {
+        for reader in 0..self.harness.nodes.len() {
+            let mut read = self.get(reader, object, body.len());
+            for _ in 0..10 {
+                if read.status == 200 && read.object() == body {
+                    break;
+                }
+                self.wait(Duration::from_secs(2));
+                read = self.get(reader, object, body.len());
+            }
+            if read.status != 200 {
+                let mut diagnostics = String::new();
+                for node in &self.harness.nodes {
+                    for worker in &node.workers {
+                        worker
+                            .app
+                            .telemetry
+                            .failures
+                            .write(&mut diagnostics)
+                            .unwrap();
+                    }
+                }
+                eprintln!("{diagnostics}");
+            }
+            assert_eq!(read.status, 200, "reader {reader}: {:?}", read.headers);
+            assert_eq!(read.header("etag"), Some(etag), "reader {reader}");
+            assert!(read.object() == body, "reader {reader}");
+        }
+    }
+}
+
+fn block_list_commits(sink: &MemoryUploadSink) -> usize {
+    sink.calls()
+        .into_iter()
+        .filter(|c| *c == crate::origin::upload::UploadCall::PutBlockList)
+        .count()
+}
+
+/// Losing a holder before upload restores `replicas` copies from the
+/// survivors on new ranked targets; the object stays readable and uploads.
+#[test]
+fn a_lost_holder_is_repaired_before_upload() {
+    let mut c = Cluster::new(31, 5, Some(writes(2)));
+    let body = bytes(31, 330_000);
+    let created = c.put(0, OBJECT, &body, "Racer-Upload: manual\r\n");
+    assert_eq!(created.status, 201, "{:?}", created.headers);
+    let etag = created.header("etag").unwrap().to_owned();
+    let version = c.version(OBJECT, &created);
+    let count = pages(body.len());
+    let coordinator = c.coordinator().expect("one coordinator");
+    // A holder that is not the coordinator, so only repair is exercised.
+    let holders = c.holders(&version, count);
+    let victim = (0..c.harness.nodes.len())
+        .find(|n| *n != coordinator && holders.iter().any(|h| h.contains(n)))
+        .expect("a holder other than the coordinator");
+    let lost = holders.iter().filter(|h| h.contains(&victim)).count();
+    let victim_id = c.harness.nodes[victim].id;
+    c.crash(victim);
+    c.wait(Duration::from_secs(2));
+    c.wait(Duration::from_secs(2));
+    let repaired = c.holders(&version, count);
+    assert!(
+        repaired.iter().all(|h| h.len() == 2),
+        "{holders:?} -> {repaired:?}"
+    );
+    assert!(c.harness.nodes.iter().all(|n| n.id != victim_id));
+    // The coordinator's table names exactly the live holders.
+    let coordinator = c.coordinator().expect("one coordinator");
+    let table = c.harness.nodes[coordinator]
+        .workers
+        .iter()
+        .find_map(|w| {
+            w.app
+                .coordinator
+                .writes()
+                .directory()
+                .with(&c.object(OBJECT), |e| {
+                    e.map(|e| e.session.holders().clone())
+                })
+        })
+        .unwrap();
+    for (page, nodes) in table.0.iter().enumerate() {
+        let mut named: Vec<usize> = nodes
+            .iter()
+            .map(|n| {
+                let id = String::from_utf8(n.clone()).unwrap();
+                c.harness
+                    .nodes
+                    .iter()
+                    .position(|node| node.config.node.0 == id)
+                    .expect("holder is a member")
+            })
+            .collect();
+        named.sort();
+        assert_eq!(named, repaired[page], "page {page}");
+    }
+    let metrics = c.harness.nodes[coordinator].workers[0]
+        .app
+        .telemetry
+        .metrics
+        .writes()
+        .clone();
+    let mut text = String::new();
+    metrics.write(&mut text).unwrap();
+    assert!(
+        text.contains(&format!(
+            "racer_write_repairs_total{{cache=\"{}\"}} {lost}",
+            c.object(OBJECT).cache.0
+        )),
+        "{text}"
+    );
+    c.read_everywhere(OBJECT, &body, &etag);
+    let persisted = c.persist(1, OBJECT);
+    assert_eq!(persisted.status, 204, "{:?}", persisted.headers);
+    c.wait(Duration::from_secs(1));
+    let blob = c.sink.committed(&c.object(OBJECT)).expect("uploaded");
+    assert!(blob.data == body);
+}
+
+/// A page whose only holder is lost cannot be repaired: the object fails.
+#[test]
+fn losing_every_holder_of_a_page_fails_the_object() {
+    let mut c = Cluster::new(32, 4, Some(writes(1)));
+    let body = bytes(32, 400_000);
+    let created = c.put(0, OBJECT, &body, "Racer-Upload: manual\r\n");
+    assert_eq!(created.status, 201);
+    let version = c.version(OBJECT, &created);
+    let coordinator = c.coordinator().unwrap();
+    let holders = c.holders(&version, pages(body.len()));
+    let victim = (0..4)
+        .find(|n| *n != coordinator && holders.iter().any(|h| h.contains(n)))
+        .expect("a holder other than the coordinator");
+    c.crash(victim);
+    c.wait(Duration::from_secs(2));
+    let states: Vec<_> = c.roles().into_iter().map(|r| r.3).collect();
+    assert_eq!(states, vec![racer_core::write::UploadState::Failed]);
+    let head = c.head(0, OBJECT);
+    assert_eq!(head.header("racer-upload-state"), Some("failed"));
+    // A failed object never uploads.
+    assert_eq!(c.persist(0, OBJECT).status, 409);
+    assert!(c.sink.committed(&c.object(OBJECT)).is_none());
+}
+
+/// Losing the coordinator mid-upload: a manifest replica takes over with the
+/// forwarded credentials and commits the block list exactly once. When the
+/// old coordinator restarts with its stale journal, the roles converge to
+/// one coordinator and every copy of the manifest reports the upload.
+#[test]
+fn a_manifest_replica_takes_over_a_lost_coordinator() {
+    let mut c = Cluster::new(33, 4, Some(writes(2)));
+    // The coordinator's first block-list tries fail, so it is still
+    // uploading when it dies.
+    for _ in 0..3 {
+        c.sink.fail_next(
+            crate::origin::upload::UploadCall::PutBlockList,
+            Error::Unavailable,
+        );
+    }
+    let body = bytes(33, 260_000);
+    let request = {
+        let mut request = format!(
+            "PUT /v1/objects/{} HTTP/1.1\r\nHost: racer\r\nContent-Length: {}\r\nIf-None-Match: *\r\nRacer-Upload: auto\r\nRacer-Metadata: dst opaque metadata\r\nAuthorization: Bearer dst-fixture\r\nConnection: close\r\n\r\n",
+            key(OBJECT),
+            body.len()
+        )
+        .into_bytes();
+        request.extend_from_slice(&body);
+        request
+    };
+    let fd = c.connect(1);
+    let mut raw = Raw {
+        fd: Some(fd),
+        request,
+        sent: 0,
+        cut: None,
+        response: Vec::new(),
+        releases: Vec::new(),
+        released: 0,
+        cursor: None,
+    };
+    let mut done = false;
+    for _ in 0..MAX_TURNS {
+        c.harness.tick();
+        if raw.poll() {
+            done = true;
+            break;
+        }
+    }
+    assert!(done);
+    raw.fd.take();
+    let (start, _, _) = headers(&raw.response);
+    assert!(start.contains(" 201"), "{start}");
+    assert!(c.sink.committed(&c.object(OBJECT)).is_none());
+    let coordinator = c.coordinator().expect("one coordinator");
+    let old_id = c.harness.nodes[coordinator].id;
+    c.crash(coordinator);
+    for _ in 0..10 {
+        c.wait(Duration::from_secs(2));
+        if c.sink.committed(&c.object(OBJECT)).is_some() {
+            break;
+        }
+    }
+    let blob = c
+        .sink
+        .committed(&c.object(OBJECT))
+        .expect("takeover uploaded");
+    assert!(blob.data == body);
+    let successful = block_list_commits(&c.sink) - 3;
+    assert_eq!(successful, 1, "{:?}", c.sink.calls());
+    let survivor = c.coordinator().expect("a replica took over");
+    assert_eq!(
+        c.roles().iter().find(|r| r.0 == survivor).map(|r| r.3),
+        Some(racer_core::write::UploadState::Committed)
+    );
+    // The old coordinator returns with its journal (upload pending, no
+    // credentials) and its old rank.
+    c.harness.add(&c.env, Some(old_id));
+    c.configure();
+    c.harness.publish();
+    c.harness.settle();
+    for _ in 0..3 {
+        c.wait(Duration::from_secs(2));
+    }
+    c.wait(crate::write::failover::ROLE_RECHECK);
+    c.wait(Duration::from_secs(2));
+    let roles = c.roles();
+    assert_eq!(
+        roles
+            .iter()
+            .filter(|r| r.1 == crate::write::directory::Role::Coordinator)
+            .count(),
+        1,
+        "{roles:?}"
+    );
+    assert!(
+        roles
+            .iter()
+            .all(|r| r.3 == racer_core::write::UploadState::Committed),
+        "{roles:?}"
+    );
+    // Still exactly one commit.
+    assert_eq!(block_list_commits(&c.sink) - 3, 1, "{:?}", c.sink.calls());
+}
+
+/// Coordinator loss before upload: the replica takes over and a later
+/// persist uploads once.
+#[test]
+fn persist_after_a_coordinator_takeover_uploads_once() {
+    let mut c = Cluster::new(34, 3, Some(writes(2)));
+    let body = bytes(34, 200_000);
+    let created = c.put(0, OBJECT, &body, "Racer-Upload: manual\r\n");
+    assert_eq!(created.status, 201);
+    let etag = created.header("etag").unwrap().to_owned();
+    let coordinator = c.coordinator().unwrap();
+    c.crash(coordinator);
+    c.wait(Duration::from_secs(2));
+    c.wait(Duration::from_secs(2));
+    assert!(c.coordinator().is_some(), "{:?}", c.roles());
+    assert_eq!(
+        c.head(0, OBJECT).header("racer-upload-state"),
+        Some("manual")
+    );
+    c.read_everywhere(OBJECT, &body, &etag);
+    let persisted = c.persist(1, OBJECT);
+    assert_eq!(persisted.status, 204, "{:?}", persisted.headers);
+    c.wait(Duration::from_secs(2));
+    assert!(c.sink.committed(&c.object(OBJECT)).unwrap().data == body);
+    assert_eq!(block_list_commits(&c.sink), 1);
+}
+
+/// Written pages are resealed under the active key after each rotation, so
+/// they stay readable and uploadable after their original key is dropped.
+#[test]
+fn rekeying_keeps_written_pages_readable_past_key_retention() {
+    let mut c = Cluster::new(35, 3, Some(writes(2)));
+    let body = bytes(35, 270_000);
+    let created = c.put(2, OBJECT, &body, "Racer-Upload: manual\r\n");
+    assert_eq!(created.status, 201);
+    let etag = created.header("etag").unwrap().to_owned();
+    let written = c.written();
+    let original = c.cache_key(0, 0, wire::CacheKeyState::Active).key.id;
+    assert!(c.written_keys().iter().all(|k| *k == original));
+    // Retain one decrypt key: each rotation drops the key before last.
+    for _ in 0..3 {
+        c.rotate_keys(1);
+        let active = c
+            .cache_key(c.harness.key_epoch, 0, wire::CacheKeyState::Active)
+            .key
+            .id;
+        c.wait(Duration::from_secs(1));
+        c.wait(Duration::from_secs(1));
+        let keys = c.written_keys();
+        assert_eq!(keys.len(), written);
+        assert!(keys.iter().all(|k| *k == active), "{keys:?}");
+    }
+    // The original key and the next one are gone: only rekeyed pages can
+    // still be read.
+    assert!(
+        !c.harness.nodes[0].workers[0]
+            .app
+            .coordinator
+            .availability
+            .page(&c.object(OBJECT).cache, original)
+    );
+    assert_eq!(c.written(), written);
+    c.read_everywhere(OBJECT, &body, &etag);
+    assert_eq!(c.persist(0, OBJECT).status, 204);
+    c.wait(Duration::from_secs(2));
+    assert!(c.sink.committed(&c.object(OBJECT)).unwrap().data == body);
+}
+
+/// Written pages whose session no member knows are dropped after
+/// `orphan_after`, not before; known objects are kept.
+#[test]
+fn orphaned_written_pages_are_collected() {
+    let mut c = Cluster::new(36, 3, Some(writes(2)));
+    c.settings(|s| s.orphan_after = Duration::from_secs(60));
+    let orphan = bytes(36, 150_000);
+    let kept = bytes(37, 100_000);
+    let created = c.put(0, OBJECT, &orphan, "");
+    assert_eq!(created.status, 201);
+    let version = c.version(OBJECT, &created);
+    assert_eq!(c.put(1, OBJECT + 1, &kept, "").status, 201);
+    let total = c.written();
+    let orphaned = 2 * pages(orphan.len()) as usize;
+    // Every manifest copy of the first object is lost.
+    let object = c.object(OBJECT);
+    for node in &c.harness.nodes {
+        for worker in &node.workers {
+            worker.app.coordinator.writes().directory().remove(&object);
+        }
+    }
+    c.wait(Duration::from_secs(30));
+    c.wait(Duration::from_secs(1));
+    assert_eq!(c.written(), total, "collected too early");
+
+    for _ in 0..4 {
+        c.wait(Duration::from_secs(20));
+    }
+    assert_eq!(c.written(), total - orphaned);
+    let etag = c.head(0, OBJECT + 1).header("etag").unwrap().to_owned();
+    c.read_everywhere(OBJECT + 1, &kept, &etag);
+    // The orphan is gone everywhere.
+    assert!(
+        c.holders(&version, pages(orphan.len()))
+            .iter()
+            .all(Vec::is_empty)
+    );
+}
+
+/// Removing a cache releases its written pages and sessions.
+#[test]
+fn a_removed_cache_releases_its_written_pages() {
+    let mut c = Cluster::new(38, 3, Some(writes(2)));
+    let body = bytes(38, 200_000);
+    assert_eq!(c.put(0, OBJECT, &body, "").status, 201);
+    assert!(c.written() > 0);
+    assert!(c.sessions() > 0);
+    let env = c.env.clone();
+    c.harness.cache_recreate(&env);
+    c.configure();
+    c.wait(Duration::from_secs(5));
+    // Still within the grace period.
+    assert!(c.written() > 0);
+    c.wait(crate::write::gc::REMOVED_CACHE_GRACE);
+    c.wait(Duration::from_secs(1));
+    assert_eq!(c.written(), 0);
+    assert_eq!(c.sessions(), 0);
+}
