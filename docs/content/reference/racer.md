@@ -2040,7 +2040,7 @@ status = client.prefetch_status("epoch-17", wait=30, refs="failed")
 For tests, `github.com/Azure/unbounded/pkg/racersdk/racersdktest` runs a
 noncaching fake Racer. It does not test distributed or RDMA behavior.
 
-### Writes
+### Go writes
 
 The Go SDK wraps the [write API](#object-writes):
 
