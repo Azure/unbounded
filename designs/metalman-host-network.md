@@ -78,7 +78,9 @@ violation fails the operation with a message naming the field:
   enslaving resets the member MTU to the bond MTU.
 - `dhcpLeases[0]` stays the provisioning identity. Its MAC is one of the
   ethernets underlying the interface that carries its IPv4 address; that
-  address (with its subnet mask) is declared on exactly one interface; its
+  address (with its subnet mask) is declared on exactly one interface, as the
+  first entry in that interface's `addresses`, so the kernel uses it as the
+  source for installer requests to Metalman; its
   gateway equals the declared gateway, which sits on the same interface.
 - Next hops are not host addresses or a subnet's network/broadcast address;
   route destinations are unique per interface; `dns` holds at most three

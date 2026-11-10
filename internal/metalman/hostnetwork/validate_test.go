@@ -117,6 +117,9 @@ func TestValidateAccepts(t *testing.T) {
 		"multiple addresses": func(n *v1alpha3.HostNetworkSpec, _ *v1alpha3.DHCPLease) {
 			n.Bonds[0].Addresses = append(n.Bonds[0].Addresses, "203.0.113.5/30")
 		},
+		"lease first with secondary in same subnet": func(n *v1alpha3.HostNetworkSpec, _ *v1alpha3.DHCPLease) {
+			n.Bonds[0].Addresses = []string{"192.0.2.30/24", "192.0.2.31/24"}
+		},
 		"slash30": func(n *v1alpha3.HostNetworkSpec, l *v1alpha3.DHCPLease) {
 			n.Bonds[0].Addresses = []string{"192.0.2.2/30"}
 			l.IPv4, l.SubnetMask = "192.0.2.2", "255.255.255.252"
@@ -333,6 +336,9 @@ func TestValidateRejects(t *testing.T) {
 		{"bad dns", func(n *v1alpha3.HostNetworkSpec, _ *v1alpha3.DHCPLease) { n.DNS[1] = "dns.example" }, "network.dns[1]"},
 		{"dns unspecified", func(n *v1alpha3.HostNetworkSpec, _ *v1alpha3.DHCPLease) { n.DNS[1] = "0.0.0.0" }, "network.dns[1]"},
 		{"dns duplicate", func(n *v1alpha3.HostNetworkSpec, _ *v1alpha3.DHCPLease) { n.DNS[1] = n.DNS[0] }, "network.dns[1]"},
+		{"lease ip not first on interface", func(n *v1alpha3.HostNetworkSpec, _ *v1alpha3.DHCPLease) {
+			n.Bonds[0].Addresses = []string{"192.0.2.31/24", "192.0.2.30/24"}
+		}, "dhcpLeases[0].ipv4"},
 		{"lease ip invalid", func(_ *v1alpha3.HostNetworkSpec, l *v1alpha3.DHCPLease) { l.IPv4 = "" }, "dhcpLeases[0].ipv4"},
 		{"lease ip undeclared", func(_ *v1alpha3.HostNetworkSpec, l *v1alpha3.DHCPLease) {
 			l.IPv4 = "192.0.2.31"

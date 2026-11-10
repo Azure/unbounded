@@ -559,6 +559,14 @@ func (t *topology) checkLease(l v1alpha3.DHCPLease) error {
 		return fmt.Errorf("dhcpLeases[0].ipv4: %s is not declared on any interface", l.IPv4)
 	}
 
+	// The installer adds addresses in order without a preferred source, so
+	// the kernel picks the first address in a subnet as the primary source.
+	// Metalman authorizes installer requests by source IP, so the lease
+	// address must come first on its interface.
+	if src.prefixes[0] != p {
+		return fmt.Errorf("dhcpLeases[0].ipv4: %s must be the first address on %s", l.IPv4, src.name)
+	}
+
 	if p.Bits() != ones {
 		return fmt.Errorf("dhcpLeases[0].subnetMask: %s (/%d) does not match %s declared on %s", l.SubnetMask, ones, p, src.name)
 	}

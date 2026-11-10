@@ -199,7 +199,8 @@ Rules:
   kernel names.
 - The `dhcpLeases[0]` entry still names the host's provisioning identity.
   Its `mac` must be a NIC under the interface that carries its `ipv4`, its
-  address and mask must be set on exactly one interface, and its `gateway` must
+  address and mask must be set on exactly one interface as the first entry
+  in its `addresses`, and its `gateway` must
   match that interface's `gateway`. Metalman checks the source IP of installer
   requests against this address.
 - A VLAN `mtu` must not exceed its link's MTU. A link without `mtu` stays
