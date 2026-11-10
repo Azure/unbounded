@@ -54,6 +54,15 @@ func TestTeardownPresent(t *testing.T) {
 	require.True(t, td2.Present(), "so is the layout")
 }
 
+// A host left with only the allocation launch check is still torn down.
+func TestTeardownPresentFindsTheLaunchCheckUnit(t *testing.T) {
+	td, _, root := newTeardown(t)
+	require.False(t, td.Present())
+
+	put(t, root, "etc/systemd/system/"+none.UnitKubeletLaunchCheck, "")
+	require.True(t, td.Present())
+}
+
 func TestTeardownStopStopsOnlyInstalledUnitsInReverseOrder(t *testing.T) {
 	td, h, root := newTeardown(t)
 
