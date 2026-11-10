@@ -2,21 +2,28 @@
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
-# Assembles a bootable GPT disk image from /rootfs.tar without loop devices
-# or privileges. It runs on the build platform and writes /disk/disk.img.gz.
+# Assembles a bootable GPT disk image from a root file system archive without
+# loop devices or privileges. It runs on the build platform.
 #
 # Environment:
 #   TARGETARCH  amd64 or arm64
 #   DISTRO      azurelinux (default) or ubuntu; selects the initramfs name
 #               and where the signed GRUB looks for its configuration
 #   MSHV        set to 1 to start the Microsoft Hypervisor before Linux
+#   ROOTFS_TAR  root file system archive (default /rootfs.tar)
+#   ROOTFS_KVER file holding the kernel version (default /rootfs.kver)
+#   WORK        scratch directory, removed on success (default /tmp/disk)
+#   OUTPUT      compressed disk image (default /disk/disk.img.gz)
 set -eu
 
 : "${TARGETARCH:?TARGETARCH is required}"
 DISTRO="${DISTRO:-azurelinux}"
 MSHV="${MSHV:-0}"
 
-WORK=/tmp/disk
+ROOTFS_TAR="${ROOTFS_TAR:-/rootfs.tar}"
+ROOTFS_KVER="${ROOTFS_KVER:-/rootfs.kver}"
+WORK="${WORK:-/tmp/disk}"
+OUTPUT="${OUTPUT:-/disk/disk.img.gz}"
 ROOT="$WORK/root"
 ESP_MIB=256
 ALIGN_MIB=1
@@ -44,9 +51,9 @@ if [ "$MSHV" = 1 ] && [ "$TARGETARCH" != amd64 ]; then
   exit 1
 fi
 
-KVER=$(cat /rootfs.kver)
+KVER=$(cat "$ROOTFS_KVER")
 mkdir -p "$ROOT"
-tar --extract --file=/rootfs.tar --numeric-owner --xattrs \
+tar --extract --file="$ROOTFS_TAR" --numeric-owner --xattrs \
   --xattrs-include='*' -C "$ROOT"
 mkdir -p "$ROOT/proc" "$ROOT/sys" "$ROOT/dev" "$ROOT/run" "$ROOT/tmp" \
   "$ROOT/boot/efi"
@@ -133,6 +140,6 @@ EOF
 dd if="$ESP_IMG" of="$DISK" bs=1M seek="$ALIGN_MIB" conv=notrunc,sparse status=none
 dd if="$ROOT_IMG" of="$DISK" bs=1M seek=$((ALIGN_MIB + ESP_MIB)) conv=notrunc,sparse status=none
 
-mkdir -p /disk
-pigz -1 -c "$DISK" > /disk/disk.img.gz
+mkdir -p "$(dirname "$OUTPUT")"
+pigz -1 -c "$DISK" > "$OUTPUT"
 rm -rf "$WORK"
