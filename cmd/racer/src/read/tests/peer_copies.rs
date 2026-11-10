@@ -6357,6 +6357,7 @@ fn write_operations_are_rejected_until_writes_are_served() {
             version,
             session,
             pages: vec![0],
+            keep: false,
         },
     ];
     let from = s.index(None);

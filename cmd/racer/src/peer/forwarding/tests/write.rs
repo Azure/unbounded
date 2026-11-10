@@ -199,6 +199,13 @@ fn operations(env: &racer_io::Env) -> Vec<Operation> {
         version: version.clone(),
         session: SESSION,
         pages: vec![0, 1, 2, 3],
+        keep: false,
+    });
+    out.push(Operation::WriteRelease {
+        version: version.clone(),
+        session: SESSION,
+        pages: vec![1],
+        keep: true,
     });
     out.push(Operation::WriteUpload {
         version,
@@ -237,14 +244,16 @@ fn same(a: &Operation, b: &Operation) -> bool {
                 version: v1,
                 session: s1,
                 pages: p1,
+                keep: k1,
             },
             Operation::WriteRelease {
                 version: v2,
                 session: s2,
                 pages: p2,
+                keep: k2,
             },
-        )
-        | (
+        ) => v1 == v2 && s1 == s2 && p1 == p2 && k1 == k2,
+        (
             Operation::WriteUpload {
                 version: v1,
                 session: s1,
@@ -279,10 +288,12 @@ fn clone_operation(operation: &Operation) -> Operation {
             version,
             session,
             pages,
+            keep,
         } => Operation::WriteRelease {
             version: version.clone(),
             session: *session,
             pages: pages.clone(),
+            keep: *keep,
         },
         Operation::WriteUpload {
             version,
@@ -492,6 +503,7 @@ fn write_replies_that_do_not_answer_the_request_are_rejected() {
             version: version.clone(),
             session: SESSION,
             pages: vec![0],
+            keep: false,
         },
         WriteReply::Stored { pages: vec![0] }
     ));
@@ -651,6 +663,7 @@ fn malformed_write_operations_are_rejected_at_encode() {
             version: version.clone(),
             session: SESSION,
             pages: pages.clone(),
+            keep: false,
         });
         bad.push(Operation::WriteUpload {
             version: version.clone(),
@@ -680,6 +693,7 @@ fn malformed_write_operations_are_rejected_at_encode() {
             version: version.clone(),
             session: SESSION,
             pages: vec![0],
+            keep: false,
         },
     ] {
         let mut req = write_request(&env, 91, clone_operation(&operation));
@@ -811,6 +825,13 @@ fn malformed_write_operations_are_rejected_at_decode() {
         version: version.clone(),
         session: SESSION,
         pages: vec![1],
+        keep: false,
+    };
+    let release_keep = || Operation::WriteRelease {
+        version: version.clone(),
+        session: SESSION,
+        pages: vec![1],
+        keep: true,
     };
     let upload = || Operation::WriteUpload {
         version: version.clone(),
@@ -851,6 +872,9 @@ fn malformed_write_operations_are_rejected_at_decode() {
         (open(), Box::new(duplicate(write::WRITE_ACTION))),
         (commit(), Box::new(set(write::WRITE_HOLDERS, b"AA=="))),
         (commit(), Box::new(remove(write::WRITE_HOLDERS))),
+        (release_keep(), Box::new(set(write::WRITE_KEEP, b"0"))),
+        (release_keep(), Box::new(set(write::WRITE_KEEP, b"true"))),
+        (release_keep(), Box::new(duplicate(write::WRITE_KEEP))),
         (status(7), Box::new(set(write::WRITE_WAIT_MILLIS, b"0"))),
         (status(7), Box::new(set(write::WRITE_WAIT_MILLIS, b"30001"))),
         (status(7), Box::new(duplicate(write::WRITE_WAIT_MILLIS))),

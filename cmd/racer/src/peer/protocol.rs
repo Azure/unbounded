@@ -314,11 +314,14 @@ pub enum Operation {
         store: Box<WriteStore>,
     },
     /// Drop write pins on `pages` held for `session`. Copy-only, without
-    /// origin context.
+    /// origin context. With `keep` (after the object uploaded), the pages stay
+    /// readable as ordinary cache; without it (delete, abort, expiry) they are
+    /// removed from the catalog at once.
     WriteRelease {
         version: ObjectVersion,
         session: SessionId,
         pages: Vec<u64>,
+        keep: bool,
     },
     /// Ask a holder to upload `pages` to the origin. Acquire mode: carries
     /// origin context for upload credentials.
@@ -693,10 +696,15 @@ pub fn request_head(clock: &racer_io::Clock, request: &PeerRequest) -> Result<Me
             version,
             session,
             pages,
+            keep,
         } => {
             push(&mut head, "racer-operation", "write-release");
             version_fields(&mut head, version)?;
             write::encode_session_pages(&mut head, session, pages)?;
+            // Omitted when false, so the encoding is canonical.
+            if *keep {
+                push(&mut head, write::WRITE_KEEP, "1");
+            }
             (&version.object, &WRITE_COPY_MODE)
         }
         Operation::WriteUpload {
@@ -1445,6 +1453,11 @@ impl SecurityCodec {
                         version: version(head)?,
                         session,
                         pages,
+                        keep: match head.unique(write::WRITE_KEEP)? {
+                            None => false,
+                            Some(b"1") => true,
+                            Some(_) => return Err(Error::InvalidRequest),
+                        },
                     }
                 } else {
                     if !matches!(mode, FetchMode::Acquire) {

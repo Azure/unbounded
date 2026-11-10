@@ -36,6 +36,7 @@ pub const WRITE_DURABILITY: &str = "racer-write-durability";
 pub const WRITE_UPLOAD: &str = "racer-write-upload";
 pub const WRITE_HOLDERS: &str = "racer-write-holders";
 pub const WRITE_HOLDER_RANKS: &str = "racer-write-holder-ranks";
+pub const WRITE_KEEP: &str = "racer-write-keep";
 pub const WRITE_WAIT_MILLIS: &str = "racer-write-wait-millis";
 pub const WRITE_MANIFEST: &str = "racer-write-manifest";
 pub const WRITE_RESULT: &str = "racer-write-result";

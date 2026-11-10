@@ -245,6 +245,12 @@ impl Availability {
         self.mode(cache).passthrough()
     }
 
+    /// Whether this cache is published with a native (in-process) origin,
+    /// the only origin writes upload to and check for create-once.
+    pub fn native_origin(&self, cache: &CacheId) -> bool {
+        self.with_cache(cache, |c| c.is_some_and(|c| c.origin.is_some()))
+    }
+
     /// Require both cache admission and an active page key for metadata reads.
     pub fn metadata(&self, cache: &CacheId) -> bool {
         self.cache(cache) && self.keys.has_active(cache, KeyPurpose::Page)

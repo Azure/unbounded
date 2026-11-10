@@ -1764,6 +1764,30 @@ impl CandidatePolicy {
         Ok(authority)
     }
 
+    /// Grant a write coordinator or holder origin access for `object`/`page`
+    /// without ranking: the create-once origin check and uploads are this
+    /// node's own requests, never fills, so no walk elects them.
+    pub(crate) fn write_authority(
+        &self,
+        membership: std::sync::Arc<crate::topology::Membership>,
+        object: &ObjectId,
+        page: PageNumber,
+    ) -> Result<OriginAuthority> {
+        let authority = OriginAuthority {
+            diagnostic: CandidateTrail::default(),
+            membership,
+            node: self.node.clone(),
+            object: object.clone(),
+            owners: vec![self.node.clone()],
+            page,
+            predecessor_evidence: Vec::new(),
+            rank: 0,
+            local: true,
+        };
+        authority.validate(object, page)?;
+        Ok(authority)
+    }
+
     /// Send a run of granted probes at once (`Step::Granted`): copy-only, each on its own grant
     /// (`racer_core::read::walk::granted_budget`), all sharing the first
     /// probe's time share, so the run costs one round trip instead of one per
@@ -1976,7 +2000,7 @@ impl CandidatePolicy {
 
     /// Request a peer copy using the accepted membership and remaining budget.
     #[allow(clippy::too_many_arguments)] // Preserve explicit route and request authorization inputs.
-    pub(super) async fn request(
+    pub(crate) async fn request(
         &self,
         membership: &std::sync::Arc<crate::topology::Membership>,
         destination: &NodeId,
@@ -2922,10 +2946,12 @@ fn copy_operation(operation: &PeerOperation, mode: FetchMode) -> PeerOperation {
             version,
             session,
             pages,
+            keep,
         } => PeerOperation::WriteRelease {
             version: version.clone(),
             session: *session,
             pages: pages.clone(),
+            keep: *keep,
         },
         PeerOperation::WriteUpload {
             version,
