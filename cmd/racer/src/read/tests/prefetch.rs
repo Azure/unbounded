@@ -573,6 +573,74 @@ fn peer_invalidate_drops_local_pages_and_metadata_without_propagating() {
     endpoint.uninstall().unwrap();
 }
 
+/// An adapter-persistence cache keeps pages in memory only; invalidation drops
+/// them from memory, never touches disk, and still answers admitted.
+#[test]
+fn peer_invalidate_drops_adapter_pages_from_memory() {
+    use crate::peer::protocol::PrefetchAction;
+    let env = racer_io::Env::host();
+    let signers = network(&env, 1);
+    let mut f = fixture_with(&env, 2 * PAGE_BYTES + 7, None);
+    f.reactor.init().unwrap();
+    f.set_mode(&env, CacheMode::Adapter);
+    let membership = local_membership(&signers[0]);
+    let (local, mut endpoint, _publication) =
+        coordinator(&env, &f, &signers[0], &membership, NoPeer::requester(&env));
+    fill_all(&mut f, &mut endpoint, &local);
+    let version = f.page.version.clone();
+    let in_memory = |f: &Fixture| {
+        (0..3)
+            .filter(|&n| {
+                f.fill
+                    .dependencies
+                    .memory
+                    .ciphertext(&page(&version, n))
+                    .unwrap()
+                    .is_some()
+            })
+            .count()
+    };
+    assert_eq!(in_memory(&f), 3);
+    let index = f.fill.dependencies.writer.index().clone();
+    assert_eq!(f.fill.dependencies.writer.pending_count(), 0);
+    assert!(index.lookup(&page(&version, 0)).unwrap().is_none());
+    let context = crate::security::OriginContext {
+        object: f.context.object.clone(),
+        metadata: None,
+        authorization: None,
+    };
+    let scope = f.scope.clone();
+    let response = drive(&mut f, &mut endpoint, {
+        let local = &local;
+        let context = &context;
+        let version = version.clone();
+        async move {
+            crate::prefetch::service::serve(
+                local,
+                version,
+                PrefetchAction::Invalidate {
+                    pages: vec![0, 1, 2],
+                },
+                membership,
+                context,
+                &scope,
+            )
+            .await
+        }
+    })
+    .unwrap();
+    match response {
+        PeerResponse::Prefetch(results) => {
+            assert_eq!(results, vec![racer_core::prefetch::PageResult::Admitted; 3])
+        }
+        _ => panic!("prefetch results expected"),
+    }
+    assert_eq!(in_memory(&f), 0);
+    assert_eq!(f.fill.dependencies.writer.pending_count(), 0);
+    assert!(index.version(&version).unwrap().is_none());
+    endpoint.uninstall().unwrap();
+}
+
 /// Peers that record each invalidation sent to them and never answer.
 struct Unreachable {
     calls: std::cell::RefCell<Vec<(racer_wire::control::NodeId, Vec<u64>)>>,
