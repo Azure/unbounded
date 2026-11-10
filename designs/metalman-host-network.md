@@ -77,6 +77,9 @@ violation fails the operation with a message naming the field:
   ethernets underlying the interface that carries its IPv4 address; that
   address (with its subnet mask) is declared on exactly one interface; its
   gateway equals the declared gateway, which sits on the same interface.
+- Next hops are not host addresses or a subnet's network/broadcast address;
+  route destinations are unique per interface; `dns` holds at most three
+  unique canonical unicast IPv4 addresses.
 
 `dhcpLeases[0]` remains the key for every existing IP-based authorization
 check (bootmedia callbacks, first-boot attestation, artifact ownership, the
@@ -171,6 +174,16 @@ powers off. Other failures are retried.
   ethernet `.network` files match `PermanentMACAddress` (bond members share
   the bond's MAC, so `MACAddress` matching is ambiguous) and set `Bond=` or
   `VLAN=`; bonds and VLANs get `.netdev` and `.network` files.
+
+- Interfaces without addresses (bond members, VLAN-only links) disable
+  link-local addressing (`link-local: []`, `LinkLocalAddressing=no`).
+  Nameservers go on the gateway interface, or on the first addressed
+  interface when no gateway is declared. Bonds get no explicit MAC; networkd
+  assigns its stable generated MAC.
+- Netplan `match.macaddress` matches the permanent MAC since netplan 0.106
+  (Ubuntu 24.04 ships 1.0), so it is unambiguous for bond members there too.
+- `hostnetwork.RenderNetplanConfig` emits the same document without the
+  `network:` wrapper, matching the NoCloud template's shape.
 
 The NoCloud `network-config` template renders the same netplan document when
 `network` is set, for images that let cloud-init own networking.
