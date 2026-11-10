@@ -661,7 +661,17 @@ type Request struct {
 	// CacheUID is the Racer-Cache header: the ClusterCache UID the dataplane
 	// expects the origin to serve. Empty when the header is absent.
 	CacheUID string `json:"-"`
+	// LocalOnly is the Racer-Source: local header of a pinned page GET: serve
+	// only from a copy held locally, never from the remote source.
+	LocalOnly bool
 }
+
+// SourceHeader limits a pinned page GET to a locally held copy when its value
+// is SourceLocal.
+const (
+	SourceHeader = "Racer-Source"
+	SourceLocal  = "local"
+)
 
 // Format redacts request data using the SDK's diagnostic convention.
 func (r Request) Format(s fmt.State, _ rune) {
@@ -777,6 +787,14 @@ func requestFields(h http.Header) (Request, error) {
 		}
 	}
 
+	if values, ok := h[SourceHeader]; ok {
+		if len(values) != 1 || values[0] != SourceLocal {
+			return Request{}, failure(ErrorInvalidArgument, "request", nil)
+		}
+
+		result.LocalOnly = true
+	}
+
 	return result, nil
 }
 
@@ -809,6 +827,11 @@ func (r *Request) selectOperation(method string, origin bool) error {
 		}
 	default:
 		return &Error{Kind: ErrorInvalidArgument, Operation: "request", Status: 405}
+	}
+
+	// Only a pinned page has a local copy to serve.
+	if r.LocalOnly && r.Operation != OperationPinned {
+		return bad
 	}
 
 	return nil
@@ -850,6 +873,10 @@ func ValidateRequest(r Request) error {
 		}
 	}
 
+	if r.LocalOnly && r.Operation != OperationPinned {
+		return failure(ErrorInvalidArgument, "request", nil)
+	}
+
 	// Three variable fields, each bounded to 8 KiB, plus fixed framing and a
 	// two-int64 range fit below the 32 KiB aggregate limit. No serialization is
 	// needed to validate a request before capacity admission or network I/O.
@@ -873,6 +900,10 @@ func RequestHeaders(r Request) http.Header {
 
 	if r.Authorization != "" {
 		h["Authorization"] = []string{r.Authorization}
+	}
+
+	if r.LocalOnly {
+		h[SourceHeader] = []string{SourceLocal}
 	}
 
 	return h
@@ -937,6 +968,10 @@ func requestHead(r Request) ([]byte, error) {
 
 	if r.Authorization != "" {
 		b.WriteString("Authorization: " + r.Authorization + "\r\n")
+	}
+
+	if r.LocalOnly {
+		b.WriteString(SourceHeader + ": " + SourceLocal + "\r\n")
 	}
 
 	b.WriteString("\r\n")

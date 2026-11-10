@@ -40,6 +40,65 @@ pub fn request(
     })
 }
 
+/// Request field that limits a pinned page GET to a copy the adapter already
+/// holds locally. Its only value is [`SOURCE_LOCAL`]. Absent, the adapter may
+/// contact its remote source as usual.
+pub const SOURCE_HEADER: &str = "Racer-Source";
+
+/// The [`SOURCE_HEADER`] value of a local-only request.
+pub const SOURCE_LOCAL: &[u8] = b"local";
+
+/// Encode one local-only pinned page GET: the adapter must serve `page` only
+/// from a copy of the pinned version it already holds, never from its remote
+/// source. The response shape is a pinned page GET's; a local miss is 404.
+/// Opaque context is forwarded when available, but adapters must not require
+/// it, since a node filling a page for a peer may have none.
+pub fn local_page_request(
+    page: &PageId,
+    size: PageSize,
+    metadata: Option<&[u8]>,
+    authorization: Option<&[u8]>,
+) -> Result<MessageHead> {
+    let first = page
+        .number
+        .0
+        .checked_mul(size.get())
+        .ok_or(Error::InvalidRange)?;
+    let last = first
+        .checked_add(size.get() - 1)
+        .filter(|last| *last <= i64::MAX as u64)
+        .ok_or(Error::InvalidRange)?;
+    let mut head = request(&page.version.object.key, "GET", metadata, authorization)?;
+    head.headers.push(crate::http::Header::new(
+        "Range",
+        format!("bytes={first}-{last}").as_bytes(),
+    ));
+    head.headers.push(crate::http::Header::new(
+        "If-Match",
+        page.version.etag.as_bytes(),
+    ));
+    head.headers
+        .push(crate::http::Header::new(SOURCE_HEADER, SOURCE_LOCAL));
+    Ok(head)
+}
+
+/// Validate the head of a local-only page response before receiving payload.
+/// A well-framed 404 (no local copy) or 412 (the local copy is another
+/// version) is a local miss, `Ok(None)`, never evidence about the remote
+/// origin. Any other non-success is an error; success must match the pinned
+/// page exactly, as for [`validate_page_head`].
+pub fn validate_local_page_head(
+    head: &MessageHead,
+    page: &PageId,
+    size: PageSize,
+) -> Result<Option<(ObjectMetadata, u64)>> {
+    match validate_response(head, false) {
+        Err(Error::NotFound | Error::VersionUnavailable) => Ok(None),
+        Err(error) => Err(error),
+        Ok(_) => validate_page_head(head, page, size).map(Some),
+    }
+}
+
 /// Validate opaque origin context without interpreting credentials or normalizing bytes.
 pub fn opaque(bytes: &[u8]) -> Result<()> {
     if bytes.len() > MAX_FIELD_BYTES {

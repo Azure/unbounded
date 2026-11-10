@@ -28,6 +28,8 @@ pub enum RequestKind {
     Head,
     InitialGet,
     PinnedGet,
+    /// A pinned page GET limited to a local copy (`Racer-Source: local`).
+    LocalGet,
 }
 
 /// Recorded request identity, without sensitive context headers.
@@ -59,6 +61,9 @@ struct State {
     blocked: BTreeSet<RequestKind>,
 
     delays: BTreeMap<RequestKind, Duration>,
+
+    /// Pages a local-only GET finds in the adapter's local copy.
+    local_pages: BTreeSet<u64>,
 }
 
 /// An owned origin socket server; drop stops and joins all connection threads.
@@ -115,6 +120,7 @@ impl AdapterOrigin {
             rejected_pages: BTreeMap::new(),
             blocked: BTreeSet::new(),
             delays: BTreeMap::new(),
+            local_pages: BTreeSet::new(),
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let server = {
@@ -170,6 +176,12 @@ impl AdapterOrigin {
         let mut state = self.state.lock().unwrap();
         assert_eq!(body.len() as u64, state.metadata.length);
         state.body = Some(body);
+    }
+
+    /// Hold a local copy of `page`, so a local-only GET for it is served.
+    /// Without one, a local-only GET returns 404.
+    pub fn hold_local(&self, page: u64) {
+        self.state.lock().unwrap().local_pages.insert(page);
     }
 
     /// Return one scripted error for the next matching operation.
@@ -287,8 +299,14 @@ fn serve(mut stream: UnixStream, state: &Mutex<State>, stop: &AtomicBool) {
                 .unwrap()
         })
         .unwrap_or(0);
+    let local = request
+        .unique(crate::object::origin::SOURCE_HEADER)
+        .unwrap()
+        .is_some_and(|value| value == crate::object::origin::SOURCE_LOCAL);
     let kind = if head {
         RequestKind::Head
+    } else if local {
+        RequestKind::LocalGet
     } else if if_match.is_some() {
         RequestKind::PinnedGet
     } else {
@@ -328,7 +346,9 @@ fn serve(mut stream: UnixStream, state: &Mutex<State>, stop: &AtomicBool) {
         });
     let metadata = &state.metadata;
     let status = rejected.unwrap_or_else(|| {
-        if state.missing {
+        if kind == RequestKind::LocalGet && !state.local_pages.contains(&call.page) {
+            404
+        } else if state.missing {
             if call.if_match.is_some() { 412 } else { 404 }
         } else if call
             .if_match

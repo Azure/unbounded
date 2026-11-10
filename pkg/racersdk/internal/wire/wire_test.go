@@ -1251,3 +1251,60 @@ func TestParseHostReadResponse(t *testing.T) {
 		t.Error("stream response with Racer-Delivery accepted")
 	}
 }
+
+func TestLocalOnlyRequestWire(t *testing.T) {
+	head := rawRequest("GET", "Range: bytes=16777216-33554431\r\nIf-Match: \"v\"\r\nRacer-Source: local\r\n")
+
+	r, err := ParseRequestHead(head, true)
+	if err != nil || r.Operation != OperationPinned || !r.LocalOnly {
+		t.Fatalf("local-only request: %+v %v", r.LocalOnly, err)
+	}
+
+	canonical, err := RequestHead(r)
+	if err != nil || !strings.Contains(string(canonical), "\r\nRacer-Source: local\r\n") {
+		t.Fatalf("canonical local-only head: %q %v", canonical, err)
+	}
+
+	roundTrip, err := ParseRequestHead(canonical, true)
+	if err != nil || roundTrip != r {
+		t.Fatal("local-only round trip")
+	}
+
+	if RequestHeaders(r).Get(SourceHeader) != SourceLocal {
+		t.Fatal("local-only headers")
+	}
+
+	// Requests without the field keep their meaning and encoding.
+	plain, err := ParseRequestHead(rawRequest("GET", "Range: bytes=0-16777215\r\nIf-Match: \"v\"\r\n"), true)
+	if err != nil || plain.LocalOnly {
+		t.Fatal("plain request", err)
+	}
+
+	if encoded, err := RequestHead(plain); err != nil || strings.Contains(string(encoded), SourceHeader) {
+		t.Fatal("plain request encoding")
+	}
+
+	for _, tt := range []struct{ method, fields string }{
+		{"GET", "Range: bytes=0-16777215\r\nIf-Match: \"v\"\r\nRacer-Source: remote\r\n"},
+		{"GET", "Range: bytes=0-16777215\r\nIf-Match: \"v\"\r\nRacer-Source: Local\r\n"},
+		{"GET", "Range: bytes=0-16777215\r\nIf-Match: \"v\"\r\nRacer-Source:\r\n"},
+		{"GET", "Range: bytes=0-16777215\r\nIf-Match: \"v\"\r\nRacer-Source: local\r\nRacer-Source: local\r\n"},
+		// Only pinned page reads have a local copy to serve.
+		{"GET", "Range: bytes=0-16777215\r\nRacer-Source: local\r\n"},
+		{"HEAD", "Racer-Source: local\r\n"},
+		{"HEAD", "If-Match: \"v\"\r\nRacer-Source: local\r\n"},
+	} {
+		_, err := ParseRequestHead(rawRequest(tt.method, tt.fields), true)
+		if err == nil {
+			t.Fatalf("accepted %s %q", tt.method, tt.fields)
+		}
+	}
+
+	for _, r := range []Request{
+		{Operation: OperationHead, LocalOnly: true},
+		{Operation: OperationBootstrap, Range: BootstrapRange(), LocalOnly: true},
+	} {
+		_, err := RequestHead(r)
+		assertKind(t, err, ErrorInvalidArgument)
+	}
+}

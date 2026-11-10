@@ -1631,3 +1631,61 @@ func TestOriginIdleConnectionsStayOpenWithoutWaiters(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 }
+
+func TestOriginLocalOnlyRequests(t *testing.T) {
+	const local = "Range: bytes=0-16777215\r\nIf-Match: \"v\"\r\nRacer-Source: local\r\n"
+
+	for _, tt := range []struct {
+		name   string
+		fields string
+		meta   Metadata
+		err    error
+		status int
+		want   bool
+	}{
+		{"hit", local, originMeta(3), nil, 206, true},
+		{"miss", local, originMeta(3), ErrNotFound, 404, true},
+		{"other local version", local, originMeta(3), ErrVersionMismatch, 404, true},
+		{"served another version", local, Metadata{Size: 3, ETag: `"w"`, ExpiresAt: time.UnixMilli(0)}, nil, 404, true},
+		{"unavailable", local, originMeta(3), ErrUnavailable, 503, true},
+		{"failure", local, originMeta(3), errors.New("backend"), 500, true},
+		{"plain pinned miss keeps its meaning", "Range: bytes=0-16777215\r\nIf-Match: \"v\"\r\n", originMeta(3), ErrNotFound, 412, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var got OriginRequest
+
+			path, cancel, done := startOrigin(t, nil, func(_ context.Context, r OriginRequest) (Metadata, io.ReadCloser, error) {
+				got = r
+				return tt.meta, io.NopCloser(strings.NewReader("abc")), tt.err
+			})
+
+			response := originExchange(t, path, "GET", tt.fields)
+			if response.StatusCode != tt.status {
+				t.Fatal("status", response.StatusCode)
+			}
+
+			if got.LocalOnly != tt.want || got.ETag != `"v"` || got.Offset != 0 || got.Length != PageSize {
+				t.Fatalf("request %v", got)
+			}
+
+			// Local-only reads need no client context.
+			if got.Metadata != "" || got.Authorization != "" {
+				t.Fatal("unexpected context")
+			}
+
+			if tt.status == 206 {
+				body, err := io.ReadAll(response.Body)
+				if err != nil || string(body) != "abc" {
+					t.Fatal("body", string(body), err)
+				}
+			}
+
+			cancel()
+			<-done
+		})
+	}
+
+	if s := fmt.Sprint(OriginRequest{LocalOnly: true}); !strings.Contains(s, "LocalOnly: true") {
+		t.Fatal("format", s)
+	}
+}

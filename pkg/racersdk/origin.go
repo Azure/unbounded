@@ -61,12 +61,25 @@ type OriginRequest struct {
 	// Length is the maximum number of bytes to return, at most [PageSize].
 	// The range may extend past the end of the object.
 	Length int64
+	// LocalOnly asks for the page only from a copy of the ETag version that
+	// the adapter already holds locally; the remote source must not be
+	// contacted. It is set only on page requests with an ETag, and only for
+	// caches with persistence Adapter. Return [ErrNotFound] (or
+	// [ErrVersionMismatch]) when no such local copy exists; Racer treats it
+	// as a cheap miss and asks peers and the remote origin next. Adapters
+	// that hold no local copies should always return [ErrNotFound]; an
+	// adapter that ignored LocalOnly would contact its remote source, which
+	// is why Racer sends it only to caches with persistence Adapter.
+	// Metadata and Authorization are forwarded when available but may be
+	// empty, for example when a node fills a page for a peer, so a local-only
+	// read must not require them.
+	LocalOnly bool
 }
 
 // Format prints the request with Metadata and Authorization redacted.
 func (r OriginRequest) Format(s fmt.State, _ rune) {
 	// fmt.State cannot usefully report a write error back through Format.
-	_, _ = fmt.Fprintf(s, "OriginRequest{%v, Head: %t, ETag: %q, Offset: %d, Length: %d}", r.Request, r.Head, r.ETag, r.Offset, r.Length) //nolint:errcheck // See above.
+	_, _ = fmt.Fprintf(s, "OriginRequest{%v, Head: %t, ETag: %q, Offset: %d, Length: %d, LocalOnly: %t}", r.Request, r.Head, r.ETag, r.Offset, r.Length, r.LocalOnly) //nolint:errcheck // See above.
 }
 
 // OriginConfig configures [ServeOrigin].
@@ -248,8 +261,9 @@ func serveOriginLimits(ctx context.Context, limits originLimits, origin Origin, 
 
 func newOriginRequest(r wire.Request) OriginRequest {
 	o := OriginRequest{
-		Request: Request{Key: r.Key, Metadata: r.AdapterMetadata, Authorization: r.Authorization},
-		ETag:    r.Pin,
+		Request:   Request{Key: r.Key, Metadata: r.AdapterMetadata, Authorization: r.Authorization},
+		ETag:      r.Pin,
+		LocalOnly: r.LocalOnly,
 	}
 
 	switch r.Operation {
@@ -377,7 +391,7 @@ func serveOperation(w http.ResponseWriter, r *http.Request, limits originLimits,
 	metadata := result.metadata.wire()
 
 	if result.err != nil {
-		status := callbackStatus(result.err, pinned)
+		status := localMissStatus(request, result.err, callbackStatus(result.err, pinned))
 		if status == http.StatusRequestedRangeNotSatisfiable && (metadata.Validate() != nil || pinned && request.Pin != metadata.ETag) {
 			status = http.StatusBadGateway
 		}
@@ -388,8 +402,10 @@ func serveOperation(w http.ResponseWriter, r *http.Request, limits originLimits,
 	}
 
 	if pinned && metadata.Validate() == nil && metadata.ETag != request.Pin {
-		// The origin no longer has the pinned version.
-		writeOriginError(w, http.StatusPreconditionFailed, 0)
+		// The origin no longer has the pinned version. For a local-only
+		// request, the local copy is another version: a local miss.
+		writeOriginError(w, localMissStatus(request, ErrVersionMismatch, http.StatusPreconditionFailed), 0)
+
 		return
 	}
 
@@ -451,6 +467,18 @@ func serveOperation(w http.ResponseWriter, r *http.Request, limits originLimits,
 			panic(http.ErrAbortHandler)
 		}
 	}
+}
+
+// localMissStatus returns 404 for a local-only request whose adapter has no
+// local copy of the pinned version, whether it holds none or another
+// version, so Racer never mistakes a local miss for a remote answer.
+// Otherwise it returns status.
+func localMissStatus(request wire.Request, err error, status int) int {
+	if request.LocalOnly && (errors.Is(err, ErrNotFound) || errors.Is(err, ErrVersionMismatch)) {
+		return http.StatusNotFound
+	}
+
+	return status
 }
 
 // callbackStatus maps an origin or SDK error to the HTTP status sent to

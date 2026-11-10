@@ -305,3 +305,161 @@ fn portable_fixture_serves_pages_and_missing_pins() {
     drop(fixture);
     assert!(!path.exists());
 }
+
+/// A local-only page request is a pinned page GET plus `Racer-Source: local`.
+#[test]
+fn local_page_request_is_a_pinned_get_with_the_local_source() {
+    let metadata = metadata(PageSize::DEFAULT.get() + 3);
+    let page = PageId {
+        version: metadata.version.clone(),
+        number: PageNumber(1),
+    };
+    let size = PageSize::DEFAULT;
+    let head = origin::local_page_request(&page, size, Some(b"meta"), None).unwrap();
+    let StartLine::Request { method, target } = &head.start else {
+        panic!("request line");
+    };
+    assert_eq!(method, "GET");
+    assert_eq!(
+        target,
+        &format!("/v1/objects/{}", page.version.object.key.to_hex())
+    );
+    let last = 2 * size.get() - 1;
+    let range = format!("bytes={}-{last}", size.get());
+    assert_eq!(head.unique("Range").unwrap(), Some(range.as_bytes()));
+    assert_eq!(head.unique("If-Match").unwrap(), Some(b"\"v1\"".as_slice()));
+    assert_eq!(
+        head.unique(origin::SOURCE_HEADER).unwrap(),
+        Some(origin::SOURCE_LOCAL)
+    );
+    assert_eq!(
+        head.unique("Racer-Metadata").unwrap(),
+        Some(b"meta".as_slice())
+    );
+    assert!(head.unique("Authorization").unwrap().is_none());
+    // Opaque context keeps the ordinary request validation.
+    assert_eq!(
+        origin::local_page_request(&page, size, Some(b" bad"), None).map(|_| ()),
+        Err(Error::InvalidRequest)
+    );
+}
+
+/// A well-framed 404 or 412 is a local miss; other statuses keep their
+/// meaning, and a success must match the pinned page exactly.
+#[test]
+fn local_page_misses_are_not_errors() {
+    let metadata = metadata(3);
+    let page = PageId {
+        version: metadata.version.clone(),
+        number: PageNumber(0),
+    };
+    let size = PageSize::DEFAULT;
+    for status in [404, 412] {
+        let head = MessageHead {
+            start: StartLine::Response { status },
+            headers: vec![Header::new("Content-Length", "0")],
+        };
+        assert_eq!(
+            origin::validate_local_page_head(&head, &page, size),
+            Ok(None)
+        );
+    }
+    for (status, expected) in [
+        (400, Error::InvalidRequest),
+        (401, Error::OriginRejected),
+        (500, Error::Internal),
+        (503, Error::Unavailable),
+    ] {
+        let head = MessageHead {
+            start: StartLine::Response { status },
+            headers: vec![Header::new("Content-Length", "0")],
+        };
+        assert_eq!(
+            origin::validate_local_page_head(&head, &page, size),
+            Err(expected)
+        );
+    }
+    // A malformed miss is never a miss.
+    let head = MessageHead {
+        start: StartLine::Response { status: 404 },
+        headers: vec![Header::new("Content-Length", "1")],
+    };
+    assert_eq!(
+        origin::validate_local_page_head(&head, &page, size),
+        Err(Error::BadGateway)
+    );
+    let success = |range: &str, length: &str, etag: &str| MessageHead {
+        start: StartLine::Response { status: 206 },
+        headers: vec![
+            Header::new("Content-Length", length),
+            Header::new("Content-Range", range),
+            Header::new("Content-Type", "application/octet-stream"),
+            Header::new("ETag", etag),
+            Header::new("Racer-Expires-At", "1234"),
+            Header::new("Racer-Content-Type", "text/plain"),
+        ],
+    };
+    assert_eq!(
+        origin::validate_local_page_head(&success("bytes 0-2/3", "3", "\"v1\""), &page, size),
+        Ok(Some((metadata.clone(), 3)))
+    );
+    // A short page or another version fails instead of being served.
+    assert_eq!(
+        origin::validate_local_page_head(&success("bytes 0-1/3", "2", "\"v1\""), &page, size),
+        Err(Error::BadGateway)
+    );
+    assert_eq!(
+        origin::validate_local_page_head(&success("bytes 0-2/3", "3", "\"v2\""), &page, size),
+        Err(Error::BadGateway)
+    );
+}
+
+/// The fixture serves local-only GETs only for pages it holds locally.
+#[cfg(feature = "test-util")]
+#[test]
+fn portable_fixture_serves_local_copies_only() {
+    use racer_wire::object::test_util::{AdapterOrigin, RequestKind};
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+
+    let metadata = metadata(3);
+    let page = PageId {
+        version: metadata.version.clone(),
+        number: PageNumber(0),
+    };
+    let fixture = AdapterOrigin::new("cache", metadata.clone());
+    let path = fixture.root.join("cache/origin/socket");
+    let exchange = || {
+        let mut stream = UnixStream::connect(&path).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        write!(stream, "GET /v1/objects/{} HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\nRange: bytes=0-16777215\r\nIf-Match: \"v1\"\r\nRacer-Source: local\r\n\r\n", metadata.version.object.key.to_hex()).unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).unwrap();
+        let (head, used) = racer_wire::http::Codec::<()>::new(32768)
+            .decode_head(&response)
+            .unwrap()
+            .unwrap();
+        (head, response[used..].to_vec())
+    };
+    let (head, body) = exchange();
+    assert!(body.is_empty());
+    assert_eq!(
+        origin::validate_local_page_head(&head, &page, PageSize::DEFAULT),
+        Ok(None)
+    );
+    fixture.hold_local(0);
+    let (head, body) = exchange();
+    assert_eq!(body, b"abc");
+    assert_eq!(
+        origin::validate_local_page_head(&head, &page, PageSize::DEFAULT),
+        Ok(Some((metadata.clone(), 3)))
+    );
+    assert_eq!(fixture.count(RequestKind::LocalGet), 2);
+    assert_eq!(fixture.count(RequestKind::PinnedGet), 0);
+}
