@@ -1434,7 +1434,8 @@ mod codec {
                 replicas: self.replicas,
                 max_dirty_percent: self.max_dirty_percent,
                 hold_ttl: Duration::from_millis(self.hold_ttl_millis),
-                upload_mode: crate::control::UploadMode::parse(&self.upload_mode)?,
+                upload_mode: crate::control::UploadMode::parse(self.upload_mode.as_bytes())
+                    .ok_or(Error::InvalidRequest)?,
                 upload_max_bytes_per_second: self.upload_max_bytes_per_second,
                 upload_max_concurrent_blocks: self.upload_max_concurrent_blocks,
             })

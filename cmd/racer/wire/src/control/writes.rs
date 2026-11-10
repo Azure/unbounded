@@ -10,8 +10,9 @@ use std::time::Duration;
 /// Default for `WriteDefinition::replicas`.
 pub const DEFAULT_WRITE_REPLICAS: u8 = 2;
 
-/// Highest accepted `WriteDefinition::replicas`.
-pub const MAX_WRITE_REPLICAS: u8 = 3;
+/// Highest accepted `WriteDefinition::replicas`, the same limit as the
+/// client `Racer-Durability: replicas=N` value.
+pub const MAX_WRITE_REPLICAS: u8 = crate::object::write::MAX_REPLICAS;
 
 /// Default for `WriteDefinition::max_dirty_percent`.
 pub const DEFAULT_WRITE_MAX_DIRTY_PERCENT: u8 = 30;
@@ -22,9 +23,10 @@ pub const MAX_WRITE_MAX_DIRTY_PERCENT: u8 = 90;
 /// Default for `WriteDefinition::hold_ttl`.
 pub const DEFAULT_WRITE_HOLD_TTL: Duration = Duration::from_secs(24 * 3600);
 
-/// Longest accepted `WriteDefinition::hold_ttl`, matching the store's
-/// `MAX_HOLD_TTL` of 30 days.
-pub const MAX_WRITE_HOLD_TTL: Duration = Duration::from_secs(720 * 3600);
+/// Longest accepted `WriteDefinition::hold_ttl`, the 30-day hard-hold limit
+/// shared with `Racer-Hold-Seconds` and the store's `MAX_HOLD_TTL`.
+pub const MAX_WRITE_HOLD_TTL: Duration =
+    Duration::from_secs(crate::object::write::MAX_HOLD_SECONDS);
 
 /// Default for `WriteDefinition::upload_max_concurrent_blocks`.
 pub const DEFAULT_WRITE_UPLOAD_MAX_CONCURRENT_BLOCKS: u32 = 16;
@@ -32,40 +34,9 @@ pub const DEFAULT_WRITE_UPLOAD_MAX_CONCURRENT_BLOCKS: u32 = 16;
 /// Highest accepted `WriteDefinition::upload_max_concurrent_blocks`.
 pub const MAX_WRITE_UPLOAD_MAX_CONCURRENT_BLOCKS: u32 = 1024;
 
-/// When a written object is uploaded to the cache's origin.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
-pub enum UploadMode {
-    /// Upload after the write commits in the cache.
-    #[default]
-    Auto,
-
-    /// Upload only after the client asks with `persist`.
-    Manual,
-
-    /// Never upload; the object lives only in the cache until its hold ends.
-    Never,
-}
-
-impl UploadMode {
-    /// Wire and header spelling: `auto`, `manual`, or `never`.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::Manual => "manual",
-            Self::Never => "never",
-        }
-    }
-
-    /// Parse the wire spelling.
-    pub fn parse(s: &str) -> Result<Self> {
-        match s {
-            "auto" => Ok(Self::Auto),
-            "manual" => Ok(Self::Manual),
-            "never" => Ok(Self::Never),
-            _ => Err(Error::InvalidRequest),
-        }
-    }
-}
+/// The canonical upload mode lives with the client write protocol; the
+/// catalog uses the same type and spelling.
+pub use crate::object::write::UploadMode;
 
 /// Write settings of one cache. Present only when writes are enabled.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -184,9 +155,11 @@ mod tests {
     #[test]
     fn upload_mode_spelling() {
         for m in [UploadMode::Auto, UploadMode::Manual, UploadMode::Never] {
-            assert_eq!(UploadMode::parse(m.as_str()), Ok(m));
+            assert_eq!(UploadMode::parse(m.as_str().as_bytes()), Some(m));
         }
-        assert!(UploadMode::parse("Auto").is_err());
-        assert!(UploadMode::parse("").is_err());
+        assert_eq!(UploadMode::parse(b"Auto"), None);
+        assert_eq!(UploadMode::parse(b""), None);
+        assert_eq!(UploadMode::default(), UploadMode::Auto);
+        assert_eq!(MAX_WRITE_HOLD_TTL, Duration::from_secs(30 * 24 * 3600));
     }
 }

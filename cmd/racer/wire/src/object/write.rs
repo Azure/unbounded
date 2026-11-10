@@ -17,9 +17,11 @@ use crate::object::model::{
 };
 use std::collections::HashSet;
 
-/// When a written object is uploaded to the origin, from `Racer-Upload`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+/// When a written object is uploaded to the origin, from `Racer-Upload` or
+/// the cache's `spec.writes.uploadMode` default. `control` re-exports it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 pub enum UploadMode {
+    #[default]
     Auto,
     Manual,
     Never,

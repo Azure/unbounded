@@ -12,7 +12,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime};
 
-pub const MAX_HOLD_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+pub const MAX_HOLD_TTL: Duration = Duration::from_secs(racer_wire::object::write::MAX_HOLD_SECONDS);
 
 /// Identity of one reservation on a worker: the newest disk index hold
 /// identity when the reservation was made. Each page remembers the hold
