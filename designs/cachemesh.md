@@ -1461,8 +1461,12 @@ unchanged.
 - Signing: the sender adds
   `Gantry-Cachemesh-Auth: v1 t=<unix seconds> s=<base64url MAC>`. The MAC is
   HMAC-SHA256 over a domain prefix with the version, the method, the escaped
-  URL path, the raw query, the timestamp, and the SHA-256 of the body (of
-  the empty body for GET).
+  URL path, the raw query, the timestamp, the `Gantry-Cachemesh-Route` and
+  `Gantry-Cachemesh-Requester` headers, and the SHA-256 of the body (of the
+  empty body for GET). Each signed header is encoded as its name, its value
+  count, and each value length-prefixed, so absent, empty, and multi-valued
+  headers differ. Handlers act on both headers (forwarding and holder
+  registration), so a replayed request cannot alter them.
 - Verification: each handler verifies before it parses the request, touches
   mesh state, records a holder hint, or starts a fill. The control handler
   reads the body under its size bound first, since the MAC covers it.
