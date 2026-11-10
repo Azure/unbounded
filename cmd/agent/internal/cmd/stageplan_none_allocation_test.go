@@ -125,8 +125,8 @@ func TestNonePlanEnsureNodeStarted_AllocationLaunch(t *testing.T) {
 		require.Contains(t, ev.list(), "verify-launch")
 	})
 
-	// TLC's BootstrapStartFailed in mode none: the check allowed, then the
-	// fence landed and the launch-check unit refused the kubelet's start.
+	// The check allowed, then the fence landed and the launch-check unit
+	// refused the kubelet's start.
 	t.Run("fence after the check", func(t *testing.T) {
 		s, _, persisted := newAllocationNonePlan(t, false, nil)
 

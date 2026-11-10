@@ -106,7 +106,9 @@ func (t *machineOperationTarget) reconcileNodeReboot(ctx context.Context, store 
 	}
 
 	// Checked live before the restart, so a refusal leaves the running node
-	// alone. The restarted machine's pre-start checks again.
+	// alone. The restart is checked again by the node's pre-start in the
+	// nspawn mode and by the launch-check unit in the none mode; the
+	// experimental container mode has no unit guard.
 	if err := verifyAllocationMachine(ctx, t.log, t.apiReader, active.Config, t.allocationLaunch); err != nil {
 		return ctrl.Result{}, store.Finish(ctx, op, daemon.MachineOperationResult[int64]{
 			Phase:   v1alpha3.OperationPhaseFailed,
