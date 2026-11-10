@@ -84,6 +84,17 @@
 // [SplitPrefetch] divides a spec that exceeds Racer's per-ticket limits.
 // Rejected requests return a [*PrefetchError].
 //
+// # Invalidation
+//
+// [Client.Invalidate] drops one cached version of an object so the next read
+// fetches it from the origin again. Use it when a consumer detects corrupt
+// content, for example a digest mismatch:
+//
+//	err := client.Invalidate(ctx, key, metadata.ETag)
+//
+// Only the named ETag is dropped, never a newer version. The local node drops
+// it at once; other nodes are told best effort.
+//
 // # Serving cache misses
 //
 // Implement [Origin] and pass it to [ServeOrigin]. Racer calls the origin for
