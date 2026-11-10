@@ -1078,6 +1078,116 @@ Tests:
 - Extend `cmd/racer/tests/process_restart.rs` with a written-page restart test.
 - Add fuzz target `write_journal_file` replaying arbitrary journal files.
 
+### WP3 as built
+
+The code refined these interfaces; the code is authoritative.
+
+Allocator (`cmd/racer/alloc`):
+
+- `Segments::append_written(length) -> Result<(SegmentLease, Extent)>` appends
+  to a dedicated written-record tail, separate from the cache tail. The tail is
+  kept `Sealed` (not `Open`), so checkpoint images with a written tail still
+  validate; it rolls to a free slot when full, evicted, or recycled.
+- `Segments::adopt_written(id, generation, used_bytes) -> Result<()>` re-adopts
+  a segment at startup: a `Free` slot at the same or an older generation (a
+  cold start resets generations to 1) becomes `Sealed` at `generation`; an
+  `Open` or `Sealed` slot at `generation` only grows its used prefix; anything
+  else is `Stale` (the bytes were reused).
+- `DiskIndex::{pin_segment, unpin_segment, segment_pins}`: one pin per live
+  written record. `DiskIndex::can_evict` also requires zero pins, so the scored
+  clock never evicts a pinned segment. `DiskIndex::append_written` and
+  `PendingWrite::append_written` thread the written tail through publication.
+
+Store (`cmd/racer/src/store/`):
+
+- `catalog.rs`: `PageTicket::append_written(&mut self, page, segments, length)`
+  and `Index::{pin_segment(segment, count), unpin_segment(segment),
+  segment_pins(segment)}`. Pins do not change checkpoint content (the journal
+  restores them).
+- `journal.rs`: `WriteJournal` (file IO, group commit, compaction) and the
+  fold `JournalState { sequence, pages: BTreeMap<PageKey, JournalPage>,
+  sessions: BTreeMap<VersionKey, JournalSession> }` with
+  `JournalSession::{Open { session, spec, lease_until_millis },
+  Committed(Manifest)}`. `JournalState::apply` folds one record (`Abort` and
+  `Delete` also drop that version's pages; `State` updates a committed
+  manifest); `JournalState::records(sequence)` emits the compacted form.
+  `fold_file(bytes, worker, layout) -> Opened { state, layout_changed,
+  unbound_pages, torn_bytes }`.
+  - `WriteJournal::open(reactor, slab_directory, worker: u16, layout: [u8; 32],
+    compact_bytes) -> Result<(WriteJournal, Opened)>` reads and folds without
+    writing. `WriteJournal::rewrite() -> Operation<()>` publishes the live
+    state (stage, `fdatasync`, rename, directory `fsync`); recovery always
+    rewrites, which drops a torn tail and rebinds the layout, so the journal
+    is never truncated in place.
+  - `WriteJournal::append(record: JournalRecord, data: Option<Rc<Descriptor>>)
+    -> Operation<()>` resolves after the group commit that made it durable:
+    every registered `data` descriptor is `fdatasync`ed, then the batch is
+    written and the journal `fdatasync`ed. The write service (WP5) journals
+    `Open`, `Commit`, `State`, `Abort`, and `Delete` through this with
+    `data: None`. A failed or abandoned commit poisons the journal
+    (`WriteJournal::failure()`); later appends fail until restart.
+  - Also `state()`, `barriers()` (completed group commits), `len()`.
+- `writes.rs`, methods on `StoreWriter`:
+  - `recover_written(&self, slab_directory: &Path, layout: [u8; 32],
+    compact_bytes: u64, scope) -> Operation<WriteRecovery>`. `WriteRecovery {
+    restored: Vec<PageId>, unindexed: Vec<PageId>, lost: Vec<LostPage>,
+    state: JournalState, torn_bytes: u64 }`; `LostPage { key: PageKey, page:
+    Option<PageId>, reason: LostReason }` with `LostReason::{LayoutChanged,
+    Malformed, Stale, Unreadable, Corrupt}`. `unindexed` pages are durable and
+    pinned but their cache or key is not published, so they are not readable.
+  - `persist_written(&self, page: CiphertextCopy, session: SessionId,
+    hold_until: SystemTime, scope) -> Operation<WrittenEntry>`, where
+    `WrittenEntry { location: RecordLocation, session, hold_until,
+    disk_bytes: u64 }`.
+  - `release_written(&self, page: &PageId) -> Operation<bool>` (uploaded or
+    committed elsewhere: stays readable as ordinary cache) and
+    `drop_written(&self, page: &PageId) -> Operation<bool>` (deleted,
+    superseded, or orphaned: catalog entry removed first). Both journal
+    `PageRelease`, then unpin; `false` when the page was not written here.
+  - `set_written_hold(&self, page, hold_until: SystemTime) -> Operation<bool>`
+    journals a new `Page` record (extend or shorten).
+  - `written(&PageId) -> Option<WrittenEntry>`, `written_pages() ->
+    Vec<(PageId, WrittenEntry)>`, `expired_written(now: SystemTime) ->
+    Vec<PageId>`, `dirty_bytes(&CacheId) -> u64`, `dirty_limit(&CacheId) ->
+    u64`, `write_journal() -> Option<Rc<WriteJournal>>`.
+  - Free functions `page_key(&PageId)`, `page_id(&PageKey)`, `unix_millis`,
+    `from_unix_millis`, and `journal_layout(&CheckpointGeometry, workers) ->
+    [u8; 32]`.
+- `Availability::writes(&CacheId) -> Option<WriteDefinition>` in
+  `cmd/racer/src/control.rs`.
+
+Behavior and deviations:
+
+- The dirty cap is `maxDirtyPercent` (default 30) of the worker's segment
+  capacity (`Segments::capacity_bytes`), charged with record disk bytes.
+  Over the cap, and when no written segment or index entry is free, appends
+  are frozen by a checkpoint, or the same page is being stored concurrently,
+  `persist_written` returns `Error::Overloaded`, which WP5 maps to
+  `WriteReply::Full`. The cap lives in `writes.rs`; no
+  `ResourceClass::{WriteStaging, WritePlaintext}` was added to
+  `admission.rs` (record staging uses the existing `Ciphertext` class). WP5
+  adds writer-side staging classes if it needs them.
+- Group commit batches every record queued while the previous commit was in
+  flight, plus those ready on the leader's first yield, up to 64 records.
+  `RACER_WRITE_GROUP_COMMIT_MICROS` is not used as a timer wait: the
+  simulated reactor has no timer outside a virtual clock, and in-flight
+  batching already amortizes the barriers.
+- Records are written through the copy path (`encode_at`), never zero-copy.
+- Recovery runs in `WorkerApplication::recover_node` right after
+  `install_shard` (accepted or cold) and binds the journal to
+  `journal_layout`, which hashes the checkpoint layout digest, the slab
+  geometry, and the worker count. A changed layout reports every page lost
+  (`LayoutChanged`) but keeps session records, since sessions are not tied to
+  the local geometry. Pages that fail verification are dropped from the
+  rewritten journal.
+- Hold expiry is not a timer in the store: the write service polls
+  `expired_written(now)` and calls `drop_written` for pages the coordinator
+  did not extend.
+- Removing a cache does not release its written pages; they stay pinned until
+  dropped (WP8 garbage collection).
+- Deferred: the `process_restart.rs` written-page restart test needs the
+  client write path (WP5). The fuzz target is `write_journal_file`.
+
 ### WP4: peer protocol for writes
 
 Files: `cmd/racer/src/peer/protocol.rs` (variants, encode, decode, response
