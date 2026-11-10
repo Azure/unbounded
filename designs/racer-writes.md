@@ -1853,6 +1853,123 @@ emulated by the existing harness origin (or Azurite if the harness already
 supports it; otherwise `upload.mode: Never` coverage plus a WP6 transport test):
 PUT, read on another node, delete one Racer pod and read again, `persist` flow.
 
+### WP11 DST as built
+
+The code is authoritative; these notes record what the simulation covers and
+what it changed. The e2e part of WP11 (`make e2e-racer`) is not part of this
+work.
+
+Files: `cmd/racer/src/app/dst/writes.rs` (generated write traffic, oracle,
+and targeted tests), registered in `app::dst::SCENARIOS` (`cmd/racer/src/app/dst.rs`);
+seeds in `cmd/racer/dst/seeds/ci.txt`. The write tests in
+`app/dst/write_tests.rs` (WP5, WP8) are unchanged.
+
+Scenarios (each runs one seeded simulated cluster with writes enabled, 64 KiB
+pages, two workers per node, the `MemoryUploadSink`, and an origin fixture
+for create-once checks):
+
+| Scenario | Nodes | Extra faults |
+|---|---|---|
+| `app-writes` | 3 | - |
+| `app-writes-four-nodes` | 4 | - |
+| `app-writes-holder-loss` | 4 | permanent node loss (repair), at least once per run |
+| `app-writes-membership-churn` | 3 | node joins (rebalance, failover), at least once per run |
+
+Generated actions (24 per run; `racer-dst` app scenarios always use the
+default): PUT with random sizes (short last page, exact page, multi-page),
+`replicas` 1..3, upload `never`/`manual`/`auto`; create-once races (two
+writers, one key); concurrent readers during a PUT; reads; DELETE; persist;
+a writer that disconnects mid-body; short holds that expire; crash and restart
+from disk (power loss; the harness republishes membership, so a crash is
+also a membership change); one-node partitions; slow disks (delayed
+`writev`); retryable upload faults (Put Block, Put Block List).
+
+Invariants (each a panic):
+
+1. An acknowledged write reads back with identical bytes and ETag on every
+   node once faults heal (retrying `502`/`503` and truncated streams); a live
+   object never reads `404`. Under an active fault a read is the right bytes
+   or an error, never other bytes; `404` under a crash is allowed only when
+   the crashed node was the coordinator of a `replicas=1` object, whose only
+   manifest it holds (by design, `replicate_manifest` sends `replicas - 1`
+   copies).
+2. No partial objects: a concurrent reader sees `404`, an error, or a
+   complete earlier or acknowledged version.
+3. Create-once: at most one writer of a key wins; a live key answers `412`.
+4. Every upload commits exactly once (a recording sink counts Put Block List
+   successes and conflicts per object), the committed bytes equal the
+   written bytes, and no deleted, expired, or `never`/unpersisted object
+   reaches the sink.
+5. Deleted and expired versions read `404` everywhere after `METADATA_TTL`;
+   persist of an expired object is `404`.
+6. Dirty bytes stay within each worker's cap (checked on every turn).
+7. Holders: every page of a live, not uploaded object has at least
+   `min(replicas, nodes)` pinned copies after crashes, restarts, partitions,
+   repair, and rebalancing (journal recovery restores them); no written page
+   belongs to anything but a live version (no leaks after aborts, deletes,
+   expiry, or uploads). A version lost with its only holder (holder-loss
+   scenario) is dropped from the oracle and may keep its surviving pages.
+
+Bugs found and fixed:
+
+- Copy-only metadata probes (`MetadataService::copy_only`) answered from the
+  catalog only; after the coordinator's published pointer lapsed, readers
+  that were neither coordinator nor manifest replica took its miss as
+  authority and got a lasting `404`. Probes now consult the write directory.
+- The WP5 read-path gap: a reader whose page-zero rank 0 was skipped (silent
+  or unreachable) answered the origin's `404`. On caches with writes, a
+  `404` is authoritative only when this node is rank 0 or rank 0 answered a
+  miss (`absence_is_authoritative`, `read/metadata.rs`); otherwise `503`.
+- GC (`write/gc.rs`): a version counted as an orphan when one member
+  answered "unknown" while the coordinator was silent, so a partitioned
+  holder dropped live pages; every member must now answer. A holder that
+  missed the coordinator's one-shot release after an upload kept its pins
+  until hold expiry; it now unpins (pages stay readable) when its check
+  finds the version uploaded.
+- After a node joins, a written page's new rank-0 owner is its own origin
+  authority and failed reads (the origin does not know the object). The
+  coordinator now copies each page to its current rank-0 owner once per
+  membership version (`repair::spawn_rebalance`, same verified pull as
+  repair) and always hands page zero's rank-0 member the manifest, so
+  failover moves the coordinator role there. Copies beyond `replicas` are
+  kept (see open issues).
+- Deletes reached only the top `replicas - 1` members; they now go to every
+  page-zero member in the first `RANKED_DEPTH`. A manifest replica pushed
+  out of those members by joins stops answering reads, drops itself once a
+  member knows the version, and never promotes itself.
+- Write maps (`write::Directory`, GC state, staging) used std's randomly
+  seeded `HashMap`, so DST replays diverged; they use `runtime::HashMap`.
+
+How to run:
+
+```sh
+# Focused unit and simulated-cluster tests.
+timeout --signal=TERM 900s cargo test --locked --manifest-path cmd/racer/Cargo.toml -p racer --lib app::dst::writes
+# The CI seed set (includes the write scenarios), or a filter.
+make racer-dst DST_FILTER=app-writes
+# A seed sweep: a file of `app-writes seed=N` lines.
+make racer-dst DST_SEEDS=$PWD/tmp/seeds.txt
+# Replay one failure (the app seed racer-dst prints) with an action trace.
+RACER_DST_WRITES_TRACE=1 RACER_DST_WRITES_REPLAY=writes-membership-churn:3208429870 \
+  cargo test --locked --manifest-path cmd/racer/Cargo.toml -p racer --lib \
+  app::dst::writes::tests::replay -- --ignored --nocapture
+```
+
+Gated scenarios: none. `app::dst::GATED_SCENARIOS` stays (empty) for future
+scenarios that need unfinished features.
+
+Open issues:
+
+- Rebalance copies are never trimmed, so churn grows a page's pinned copies
+  beyond `replicas` (bounded by the dirty cap and the hold).
+- A failed object (a page lost with every holder) stays visible: reads get
+  `200` and a truncated stream, and its surviving pages stay pinned until
+  DELETE or hold expiry.
+- With `replicas=1`, a down coordinator makes the object unknown (`404`)
+  until it restarts.
+- After an upload the origin fixture serves no pages, so the DST does not
+  check reads of uploaded objects beyond their ETag.
+
 ### WP12: documentation
 
 Files: `docs/content/reference/racer.md` (new sections after "Prefetch",
