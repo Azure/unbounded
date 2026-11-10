@@ -719,12 +719,32 @@ impl World {
                     }
                     assert_eq!(etag, want.etag, "seed={} etag", self.harness.seed);
                     let (got, complete) = response.object();
+                    if !complete && want.uploading {
+                        // Pages released after the upload refill from the
+                        // origin, which this fixture does not serve.
+                        self.note("read-after-upload");
+                        return;
+                    }
+                    if !complete && want.bytes.starts_with(&got) {
+                        // The stream failed after its head: a failed read.
+                        let mut diagnostics = String::new();
+                        for worker in &self.harness.nodes[node].workers {
+                            worker.app.telemetry.failures.write(&mut diagnostics).unwrap();
+                        }
+                        if std::env::var_os("RACER_DST_WRITES_TRACE").is_some() {
+                            eprintln!("incomplete read attempt {attempt}: {diagnostics}");
+                        }
+                        self.note("read-incomplete");
+                        self.wait(Duration::from_secs(2));
+                        continue;
+                    }
                     assert!(
                         complete && got == want.bytes,
-                        "seed={} node {node} read wrong bytes of {object:x}: {} of {}",
+                        "seed={} node {node} read wrong bytes of {object:x}: {} of {} complete={complete} prefix={}",
                         self.harness.seed,
                         got.len(),
-                        want.bytes.len()
+                        want.bytes.len(),
+                        want.bytes.starts_with(&got)
                     );
                     self.note("read-hit");
                     return;
@@ -762,8 +782,51 @@ impl World {
                 ),
             }
         }
+        let detail = self.live.get(&object).map(|w| {
+            let version = self.version(object, &w.etag);
+            let pages = w.bytes.len().div_ceil(page_bytes()) as u64;
+            let membership = self.harness.nodes[0].workers[0]
+                .app
+                .snapshots
+                .current()
+                .unwrap()
+                .membership
+                .clone();
+            (0..pages)
+                .map(|number| {
+                    let page = PageId {
+                        version: version.clone(),
+                        number: PageNumber(number),
+                    };
+                    let holders: Vec<_> = self
+                        .harness
+                        .nodes
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, n)| {
+                            n.workers
+                                .iter()
+                                .any(|w| w.app.store.writer.written(&page).is_some())
+                        })
+                        .map(|(i, _)| i)
+                        .collect();
+                    let owners: Vec<_> = Placement::new(1)
+                        .rank(membership.clone(), &version.object, PageNumber(number))
+                        .ordered
+                        .iter()
+                        .map(|id| {
+                            self.harness
+                                .nodes
+                                .iter()
+                                .position(|n| &n.config.node == id)
+                        })
+                        .collect();
+                    format!("page {number}: holders {holders:?} owners {owners:?}")
+                })
+                .collect::<Vec<_>>()
+        });
         panic!(
-            "seed={} node {node} read of {object:x} never recovered",
+            "seed={} node {node} read of {object:x} never recovered: {detail:?}",
             self.harness.seed
         );
     }
@@ -913,6 +976,9 @@ impl World {
         let index = self.pick(nodes);
         self.note("crash-restart");
         let id = self.harness.retire(&self.env, index, true);
+        if std::env::var_os("RACER_DST_WRITES_TRACE").is_some() {
+            eprintln!("crashed index {index}");
+        }
         if self.pick(2) == 0 {
             // Readers during the outage: correct bytes or retryable.
             let object = FIRST + self.pick(KEYS);
@@ -981,9 +1047,11 @@ impl World {
         } else if response.status == 404 && want.as_ref().is_some_and(|w| !w.uploading) {
             // The read-path gap WP11 fixed: a reader that skips a silent
             // coordinator must not answer an authoritative 404.
+            let ranked = self.harness.ranked_nodes(&self.object(object));
             panic!(
-                "seed={} live object {object:x} read 404 under a fault",
-                self.harness.seed
+                "seed={} live object {object:x} read 404 under a fault (reader {node}, page-zero ranks {ranked:?}, nodes {})",
+                self.harness.seed,
+                self.harness.nodes.len()
             );
         }
     }
@@ -1268,6 +1336,16 @@ mod tests {
         for seed in 1..=3 {
             run("writes", seed, 0);
         }
+    }
+
+    /// Replay one generated run: `RACER_DST_WRITES_REPLAY=<scenario>:<seed>`
+    /// (the app seed a racer-dst failure prints).
+    #[test]
+    #[ignore = "replays a racer-dst failure on demand"]
+    fn replay() {
+        let spec = std::env::var("RACER_DST_WRITES_REPLAY").expect("RACER_DST_WRITES_REPLAY");
+        let (name, seed) = spec.split_once(':').expect("<scenario>:<seed>");
+        run(name, seed.parse().unwrap(), 0);
     }
 
     #[test]
