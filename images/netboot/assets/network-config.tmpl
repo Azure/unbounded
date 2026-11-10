@@ -1,4 +1,6 @@
-{{- if .BootLease }}
+{{- if .HostNetplan }}
+{{ .HostNetplan }}
+{{- else if .BootLease }}
 version: 2
 ethernets:
   provisioning:
