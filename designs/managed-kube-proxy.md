@@ -98,10 +98,14 @@ prereleases, and architecture suffixes are excluded. Explicit and
 provider-supplied versions, including `:latest`, remain unchanged. Automatic
 fallback selection never chooses `latest`.
 
-Provider NotFound errors fall back immediately. Other provider read errors get
-ten additional attempts at ten-second intervals. Registry tag listing uses
-anonymous access, follows pagination and safe redirects, and is bounded by a
-30-second timeout and 100 pages. Missing or invalid API server versions,
+Provider reads start immediately, and NotFound errors fall back immediately.
+Other provider read errors use exponential backoff, starting at 10 seconds,
+doubling after each failure, and capping the delay at 5 minutes. The total retry
+window is limited to 12 hours of wall-clock time, including API requests and
+waits. Expiration proceeds to API-server-version-based fallback; leadership
+cancellation stops discovery without falling back. Registry tag listing uses
+its separate 30-second timeout and 100-page limit, with anonymous access,
+pagination, and safe redirects. Missing or invalid API server versions,
 incomplete tag listings, and missing matching tags return errors and leave the
 managed kube-proxy controller unstarted rather than guessing an image.
 

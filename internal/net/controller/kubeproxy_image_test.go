@@ -6,6 +6,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"net/http"
 	"strings"
 	"testing"
 	"testing/synctest"
@@ -19,7 +20,10 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/version"
 	fakediscovery "k8s.io/client-go/discovery/fake"
+	"k8s.io/client-go/kubernetes"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/rest"
+	restfake "k8s.io/client-go/rest/fake"
 	clienttesting "k8s.io/client-go/testing"
 )
 
@@ -183,15 +187,18 @@ func TestManagedKubeProxyImageRetriesProviderDiscovery(t *testing.T) {
 		finalErr     error
 		wantAttempts int
 		wantFallback bool
+		wantElapsed  time.Duration
 	}{
 		{name: "success on the initial read", wantAttempts: 1},
 		{name: "NotFound on the initial read", finalErr: notFound, wantAttempts: 1, wantFallback: true},
-		{name: "timeout is retried", failures: 1, readErr: timeout, wantAttempts: 2},
-		{name: "internal error is retried", failures: 1, readErr: internalError, wantAttempts: 2},
-		{name: "other errors are retried", failures: 1, readErr: errors.New("connection reset"), wantAttempts: 2},
-		{name: "the final retry succeeds", failures: 10, readErr: internalError, wantAttempts: 11},
-		{name: "NotFound stops retries", failures: 1, readErr: timeout, finalErr: notFound, wantAttempts: 2, wantFallback: true},
-		{name: "exhausted retries fall back", failures: 11, readErr: internalError, wantAttempts: 11, wantFallback: true},
+		{name: "timeout is retried", failures: 1, readErr: timeout, wantAttempts: 2, wantElapsed: 10 * time.Second},
+		{name: "internal error is retried", failures: 1, readErr: internalError, wantAttempts: 2, wantElapsed: 10 * time.Second},
+		{name: "other errors are retried", failures: 1, readErr: errors.New("connection reset"), wantAttempts: 2, wantElapsed: 10 * time.Second},
+		{name: "retries continue at the maximum delay", failures: 8, readErr: internalError, wantAttempts: 9, wantElapsed: 20*time.Minute + 10*time.Second},
+		{name: "the final retry succeeds", failures: 147, readErr: internalError, wantAttempts: 148, wantElapsed: 11*time.Hour + 55*time.Minute + 10*time.Second},
+		{name: "NotFound stops retries", failures: 1, readErr: timeout, finalErr: notFound, wantAttempts: 2, wantFallback: true, wantElapsed: 10 * time.Second},
+		{name: "NotFound near the deadline stops retries", failures: 147, readErr: timeout, finalErr: notFound, wantAttempts: 148, wantFallback: true, wantElapsed: 11*time.Hour + 55*time.Minute + 10*time.Second},
+		{name: "exhausted retries fall back", failures: 148, readErr: internalError, wantAttempts: 148, wantFallback: true, wantElapsed: 12 * time.Hour},
 	}
 
 	for _, configured := range []struct {
@@ -251,9 +258,8 @@ func TestManagedKubeProxyImageRetriesProviderDiscovery(t *testing.T) {
 
 						assertKubeProxyImageDiscoveryAttempts(t, started, attempts, tt.wantAttempts)
 
-						wantElapsed := time.Duration(tt.wantAttempts-1) * 10 * time.Second
-						if elapsed := time.Since(started); elapsed != wantElapsed {
-							t.Fatalf("discovery took %v, want %v", elapsed, wantElapsed)
+						if elapsed := time.Since(started); elapsed != tt.wantElapsed {
+							t.Fatalf("discovery took %v, want %v", elapsed, tt.wantElapsed)
 						}
 					})
 				})
@@ -272,6 +278,7 @@ func TestManagedKubeProxyImageDiscoveryStopsOnCancellation(t *testing.T) {
 	}{
 		{name: "already canceled", cancelContext: true, wantErr: context.Canceled},
 		{name: "canceled during a retry wait", after: 5 * time.Second, cancelContext: true, wantAttempts: 1, wantErr: context.Canceled},
+		{name: "canceled during a capped retry wait", after: 20 * time.Minute, cancelContext: true, wantAttempts: 8, wantErr: context.Canceled},
 		{name: "deadline during a retry wait", after: 5 * time.Second, wantAttempts: 1, wantErr: context.DeadlineExceeded},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -334,11 +341,72 @@ func assertKubeProxyImageDiscoveryAttempts(t *testing.T, started time.Time, atte
 		t.Fatalf("discovery made %d attempts, want %d", len(attempts), want)
 	}
 
+	wantAt := started
+	delay := 10 * time.Second
+
 	for i, attemptedAt := range attempts {
-		wantAt := started.Add(time.Duration(i) * 10 * time.Second)
 		if !attemptedAt.Equal(wantAt) {
 			t.Fatalf("attempt %d at %v, want %v", i+1, attemptedAt.Sub(started), wantAt.Sub(started))
 		}
+
+		wantAt = wantAt.Add(delay)
+		delay = min(delay*2, 5*time.Minute)
+	}
+}
+
+func TestProviderKubeProxyImageRetryDeadlineLimitsInFlightRequests(t *testing.T) {
+	for _, tt := range []struct {
+		name          string
+		parentTimeout time.Duration
+		wantElapsed   time.Duration
+		wantErr       error
+	}{
+		{name: "twelve-hour retry budget", wantElapsed: 12 * time.Hour},
+		{name: "earlier parent deadline", parentTimeout: 2 * time.Hour, wantElapsed: 2 * time.Hour, wantErr: context.DeadlineExceeded},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				started := time.Now()
+				requests := 0
+
+				clientset, err := kubernetes.NewForConfigAndClient(&rest.Config{Host: "https://kubernetes.example"}, restfake.CreateHTTPClient(func(req *http.Request) (*http.Response, error) {
+					requests++
+
+					if req.URL.Path != "/apis/apps/v1/namespaces/kube-system/daemonsets/kube-proxy" {
+						t.Errorf("unexpected provider discovery request: %s", req.URL)
+					}
+
+					if deadline, ok := req.Context().Deadline(); !ok || !deadline.Equal(started.Add(tt.wantElapsed)) {
+						t.Errorf("request deadline = %v, present = %t, want %v", deadline, ok, started.Add(tt.wantElapsed))
+					}
+
+					<-req.Context().Done()
+
+					return nil, req.Context().Err()
+				}))
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				ctx := t.Context()
+
+				if tt.parentTimeout != 0 {
+					var cancel context.CancelFunc
+
+					ctx, cancel = context.WithTimeout(ctx, tt.parentTimeout)
+					defer cancel()
+				}
+
+				got, err := providerKubeProxyImage(ctx, clientset)
+				if got != "" || !errors.Is(err, tt.wantErr) {
+					t.Fatalf("providerKubeProxyImage() = %q, %v, want no image and %v", got, err, tt.wantErr)
+				}
+
+				if requests != 1 || time.Since(started) != tt.wantElapsed {
+					t.Fatalf("requests = %d, elapsed = %v, want 1 request bounded by %v", requests, time.Since(started), tt.wantElapsed)
+				}
+			})
+		})
 	}
 }
 
@@ -380,10 +448,10 @@ func TestManagedKubeProxyImageUnavailableServerVersionReturnsError(t *testing.T)
 					t.Fatalf("ManagedKubeProxyImage() = %q, want no image", got)
 				}
 
-				assertKubeProxyImageDiscoveryAttempts(t, started, attempts, 11)
+				assertKubeProxyImageDiscoveryAttempts(t, started, attempts, 148)
 
-				if elapsed := time.Since(started); elapsed != 100*time.Second {
-					t.Fatalf("discovery took %v, want %v", elapsed, 100*time.Second)
+				if elapsed := time.Since(started); elapsed != 12*time.Hour {
+					t.Fatalf("discovery took %v, want %v", elapsed, 12*time.Hour)
 				}
 			})
 		})

@@ -179,8 +179,15 @@ The controller works out the image once, when it starts leading. Image discovery
 and managed kube-proxy startup run in the background; the other network
 controllers and shared informers do not wait for them.
 
-Provider discovery stops immediately on NotFound. Other read errors get ten
-additional attempts at ten-second intervals before fallback version selection.
+Provider discovery makes an initial read immediately and stops on NotFound.
+Other read errors use exponential backoff: wait 10 seconds before the first
+retry, double the delay after each failure, and cap the delay at 5 minutes.
+**The total provider-discovery retry window is limited to 12 hours**, including
+both API-request time and time spent waiting between attempts. After that budget
+expires, the controller proceeds to API-server-version-based fallback selection.
+Leadership cancellation stops discovery immediately without proceeding to
+fallback. These background retries do not block the rest of the net controller.
+
 Registry searches have a 30-second total timeout and a limit of 100 pages.
 Failure to discover a valid API server version, complete the registry tag
 listing, or find a matching tag is logged and leaves the managed kube-proxy

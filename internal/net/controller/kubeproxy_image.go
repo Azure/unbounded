@@ -6,6 +6,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"math"
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -23,8 +24,9 @@ import (
 const DefaultKubeProxyRepository = "registry.k8s.io/kube-proxy"
 
 const (
-	providerKubeProxyImageRetries       = 10
-	providerKubeProxyImageRetryInterval = 10 * time.Second
+	providerKubeProxyImageRetryInitialInterval = 10 * time.Second
+	providerKubeProxyImageRetryMaxInterval     = 5 * time.Minute
+	providerKubeProxyImageRetryBudget          = 12 * time.Hour
 )
 
 // ManagedKubeProxyImage works out the image the managed kube-proxy DaemonSets
@@ -106,13 +108,19 @@ func managedKubeProxyImage(
 
 // providerKubeProxyImage returns the image of the kube-proxy container in
 // kube-system/kube-proxy, or an empty string when there is none to read.
-// NotFound falls back immediately; other read errors get ten retries at
-// ten-second intervals before falling back. Context cancellation stops discovery.
+// NotFound falls back immediately; other read errors use exponential backoff
+// from ten seconds to five minutes for at most twelve hours before falling back.
+// The budget covers both requests and waits. Parent cancellation stops discovery
+// without falling back.
 func providerKubeProxyImage(ctx context.Context, clientset kubernetes.Interface) (string, error) {
+	retryCtx, cancel := context.WithTimeout(ctx, providerKubeProxyImageRetryBudget)
+	defer cancel()
+
 	backoff := wait.Backoff{
-		Duration: providerKubeProxyImageRetryInterval,
-		Factor:   1,
-		Steps:    providerKubeProxyImageRetries + 1,
+		Duration: providerKubeProxyImageRetryInitialInterval,
+		Factor:   2,
+		Cap:      providerKubeProxyImageRetryMaxInterval,
+		Steps:    math.MaxInt32,
 	}
 
 	var (
@@ -120,7 +128,15 @@ func providerKubeProxyImage(ctx context.Context, clientset kubernetes.Interface)
 		attempts int
 	)
 
-	err := wait.ExponentialBackoffWithContext(ctx, backoff, func(ctx context.Context) (bool, error) {
+	// DelayFunc keeps returning the capped interval instead of ending retries
+	// when the cap is reached. Only the context deadline limits the retry window.
+	err := backoff.DelayFunc().Until(retryCtx, true, true, func(ctx context.Context) (bool, error) {
+		// Until invokes its immediate condition even for an already-canceled
+		// context, so check before issuing any API request.
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+
 		attempts++
 
 		ds, err := clientset.AppsV1().DaemonSets(metav1.NamespaceSystem).Get(ctx, "kube-proxy", metav1.GetOptions{})
@@ -129,7 +145,7 @@ func providerKubeProxyImage(ctx context.Context, clientset kubernetes.Interface)
 		}
 
 		if err != nil {
-			klog.Warningf("Failed to read kube-system/kube-proxy for managed kube-proxy image (attempt %d/%d): %v", attempts, providerKubeProxyImageRetries+1, err)
+			klog.Warningf("Failed to read kube-system/kube-proxy for managed kube-proxy image (attempt %d, retry budget %s): %v", attempts, providerKubeProxyImageRetryBudget, err)
 
 			return false, nil
 		}
@@ -149,7 +165,7 @@ func providerKubeProxyImage(ctx context.Context, clientset kubernetes.Interface)
 			return "", ctxErr
 		}
 
-		klog.Warningf("Falling back to defaults after %d failed attempts to read kube-system/kube-proxy", attempts)
+		klog.Warningf("Falling back to defaults after the %s retry budget for reading kube-system/kube-proxy expired (%d attempts)", providerKubeProxyImageRetryBudget, attempts)
 	}
 
 	return image, nil
