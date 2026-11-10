@@ -1000,6 +1000,7 @@ true.
 |---|---|---|---|
 | `enabled` | `CACHEMESH_ENABLED` | `false` | Turn the path on. |
 | `namespace` | `CACHEMESH_NAMESPACE` | `chair_namespace` | Namespace of the leader Lease (named `gantry-cachemesh`). |
+| `peer_key_file` | `CACHEMESH_PEER_KEY_FILE` | none (required) | Absolute path of the shared peer keys, one per line, at least 32 bytes each; the first signs, all verify. See Security. |
 | `chunk_size` | `CACHEMESH_CHUNK_SIZE` | 64MiB | Stripe size; power of two, 1MiB to 1GiB, same on every node. |
 | `expected_size` | `CACHEMESH_EXPECTED_SIZE` | 0 (library: 1000) | Expected node count. |
 | `max_neighbors` | `CACHEMESH_MAX_NEIGHBORS` | 32 | Data-plane neighbors per node; at least 1. |
@@ -1082,7 +1083,9 @@ size, so there is no separate HEAD request.
 ### Peer HTTP API
 
 All three routes are registered on the transfer listener with
-`transfer.WithExtraRoutes`, outside the otelhttp wrapper.
+`transfer.WithExtraRoutes`, outside the otelhttp wrapper. Every request
+carries the `Gantry-Cachemesh-Auth` signature (see Security); a request
+without a valid one gets 401 before any other processing.
 
 `POST /cachemesh/control`: body is one encoded control message, at most
 `cachemesh.MaxControlMessageSize`; the response body is the encoded reply
@@ -1403,13 +1406,50 @@ and `holder`.
 
 ### Security
 
-The control, chunk, and metadata endpoints have no authentication, like
-`/v2/` on the transfer port. Anyone who can reach port 5001 can join the mesh
-control plane, read chunks of any blob a node can pull, and make owners pull
-from the origin. Chunk owners pull with the agent's own registry identity
-(configured credentials or anonymous), never with a requester's delegated
-credentials, so a node can obtain blobs that only another node's pod was
-allowed to pull. Use NetworkPolicy to limit the port to Gantry agents.
+Every request to `/cachemesh/control`, `/cachemesh/chunk`, and
+`/cachemesh/meta` is authenticated with a shared key
+(`internal/gantry/meshfetch/auth.go`). `/v2/` on the transfer port is
+unchanged.
+
+- Signing: the sender adds
+  `Gantry-Cachemesh-Auth: v1 t=<unix seconds> s=<base64url MAC>`. The MAC is
+  HMAC-SHA256 over a domain prefix with the version, the method, the escaped
+  URL path, the raw query, the timestamp, and the SHA-256 of the body (of
+  the empty body for GET).
+- Verification: each handler verifies before it parses the request, touches
+  mesh state, records a holder hint, or starts a fill. The control handler
+  reads the body under its size bound first, since the MAC covers it.
+  Missing, malformed, stale (more than 2 minutes from the receiver's clock),
+  or unmatched signatures get 401. Comparison is constant time.
+- Keys: `cachemesh.peer_key_file` holds one key per line, each at least 32
+  bytes. The first key signs and every key verifies, so a key rotates in
+  three rollouts: add it second, move it first, drop the old one. The agent
+  reads the file at startup and refuses to start without valid keys; config
+  validation requires the path when cachemesh is enabled. There is no
+  unauthenticated mode. The Helm chart generates the key into a Secret
+  (kept across upgrades) or uses an existing one.
+
+This stops pods without the key from joining or disrupting the control
+plane (forged joins, leaves, suspicions, or leader snapshots), from making
+owners pull from the origin, and from registering holder addresses that
+peers would later fetch from.
+
+Residual risk:
+
+- Any holder of the key, such as a compromised Gantry pod, is a trusted
+  member: it can do all of the above.
+- Owners pull with the agent's own registry identity (configured
+  credentials or anonymous), never with a requester's delegated
+  credentials. An authenticated peer can therefore obtain blobs that only
+  another node's pod was allowed to pull, and can trigger origin fills
+  with that identity.
+- Responses are not signed, and the transfer port is plaintext (h2c and
+  HTTP/1.1) by design, so an attacker on the network path can read and
+  alter traffic. Chunk integrity rests on digest verification (see
+  Integrity). A captured request can be replayed within the skew window.
+
+NetworkPolicy limiting port 5001 to Gantry agents remains recommended as
+defense in depth.
 
 ### Limitations
 
