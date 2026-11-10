@@ -1111,6 +1111,11 @@ impl Index {
         self.state_mut().current.clear();
         Ok(())
     }
+    /// Drop one object's volatile current pointer (a deleted or uploaded
+    /// written object), preserving its version descriptors.
+    pub fn invalidate_current(&self, object: &ObjectId) {
+        self.state_mut().current.remove(object);
+    }
     /// Reclaim standalone catalog entries and any pointers depending on them.
     /// Page-attached descriptors follow page eviction instead; no page is removed.
     pub fn evict_metadata(&self, entries: usize) -> Result<usize> {

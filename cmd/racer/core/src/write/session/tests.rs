@@ -400,6 +400,35 @@ fn from_manifest_restarts_upload() {
     assert_eq!(r.on_event(SessionEvent::PersistRequested, 0).len(), 5);
 }
 
+#[test]
+fn upload_resumes_only_from_pending() {
+    let manifest = committed(UploadMode::Auto).manifest();
+    let mut restored = Session::from_manifest("c".into(), [7; 32], manifest, LEASE);
+    assert_eq!(restored.state(), UploadState::Pending);
+    let effects = restored.on_event(SessionEvent::UploadResumed, 1);
+    assert_eq!(restored.state(), UploadState::Uploading);
+    assert!(
+        effects
+            .iter()
+            .any(|e| matches!(e, SessionEffect::Upload { .. }))
+    );
+    // Already uploading, manual, or still open: refused.
+    assert!(rejects(
+        &restored.on_event(SessionEvent::UploadResumed, 2),
+        Rejection::InvalidState
+    ));
+    let mut manual = committed(UploadMode::Manual);
+    assert!(rejects(
+        &manual.on_event(SessionEvent::UploadResumed, 2),
+        Rejection::InvalidState
+    ));
+    let mut fresh = open(UploadMode::Auto);
+    assert!(rejects(
+        &fresh.on_event(SessionEvent::UploadResumed, 2),
+        Rejection::NotCommitted
+    ));
+}
+
 /// Random event sequences never publish before commit, never send the block
 /// list before every page uploaded, and never act after a terminal phase.
 #[test]

@@ -6,11 +6,13 @@
 
 pub mod holders;
 pub mod journal;
+pub mod ranks;
 pub mod session;
 pub mod upload;
 
 pub use holders::{HolderError, Holders, NodeIdBytes};
 pub use journal::{JournalError, JournalRecord};
+pub use ranks::{HolderRanks, MAX_RANK_DEPTH};
 pub use racer_wire::object::write::{
     Durability, MAX_REPLICAS, MIN_REPLICAS, UploadMode, UploadState,
 };
@@ -106,6 +108,13 @@ pub enum WriteAction {
         session: SessionId,
         holders: Holders,
     },
+    /// `commit` with a rank-relative holder table, for objects whose explicit
+    /// table does not fit a peer head. The coordinator resolves it against
+    /// the request's membership.
+    CommitRanked {
+        session: SessionId,
+        ranks: HolderRanks,
+    },
     Abort {
         session: SessionId,
     },
@@ -116,6 +125,12 @@ pub enum WriteAction {
     Persist,
     Replicate {
         manifest: Manifest,
+    },
+    /// `replicate` with a rank-relative holder table; `manifest.holders` is
+    /// empty and is resolved by the receiver.
+    ReplicateRanked {
+        manifest: Manifest,
+        ranks: HolderRanks,
     },
 }
 

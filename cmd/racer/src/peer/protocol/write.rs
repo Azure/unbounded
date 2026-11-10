@@ -16,6 +16,7 @@ use crate::model::ContentType;
 use crate::model::PageSize;
 use http1::MessageHead;
 use racer_core::write::Durability;
+use racer_core::write::HolderRanks;
 use racer_core::write::Holders;
 use racer_core::write::SessionId;
 use racer_core::write::UploadMode;
@@ -34,6 +35,7 @@ pub const WRITE_REPLICAS: &str = "racer-write-replicas";
 pub const WRITE_DURABILITY: &str = "racer-write-durability";
 pub const WRITE_UPLOAD: &str = "racer-write-upload";
 pub const WRITE_HOLDERS: &str = "racer-write-holders";
+pub const WRITE_HOLDER_RANKS: &str = "racer-write-holder-ranks";
 pub const WRITE_WAIT_MILLIS: &str = "racer-write-wait-millis";
 pub const WRITE_MANIFEST: &str = "racer-write-manifest";
 pub const WRITE_RESULT: &str = "racer-write-result";
@@ -67,12 +69,12 @@ pub fn action_name(action: &WriteAction) -> &'static str {
     match action {
         WriteAction::Open { .. } => "open",
         WriteAction::Renew { .. } => "renew",
-        WriteAction::Commit { .. } => "commit",
+        WriteAction::Commit { .. } | WriteAction::CommitRanked { .. } => "commit",
         WriteAction::Abort { .. } => "abort",
         WriteAction::Status { .. } => "status",
         WriteAction::Delete => "delete",
         WriteAction::Persist => "persist",
-        WriteAction::Replicate { .. } => "replicate",
+        WriteAction::Replicate { .. } | WriteAction::ReplicateRanked { .. } => "replicate",
     }
 }
 
@@ -158,6 +160,10 @@ pub(super) fn encode_action(head: &mut MessageHead, action: &WriteAction) -> Res
             encode_session(head, session);
             push_binary(head, WRITE_HOLDERS, &encode_holders(holders)?);
         }
+        WriteAction::CommitRanked { session, ranks } => {
+            encode_session(head, session);
+            push_binary(head, WRITE_HOLDER_RANKS, &encode_ranks(ranks)?);
+        }
         WriteAction::Status { wait_millis } => {
             if *wait_millis > racer_core::write::MAX_STATUS_WAIT_MILLIS {
                 return Err(Error::InvalidRequest);
@@ -175,8 +181,34 @@ pub(super) fn encode_action(head: &mut MessageHead, action: &WriteAction) -> Res
                 .map_err(|_| Error::InvalidRequest)?;
             push_binary(head, WRITE_MANIFEST, &encoded);
         }
+        WriteAction::ReplicateRanked { manifest, ranks } => {
+            check_spec(&manifest.spec)?;
+            if !manifest.holders.0.is_empty() || ranks.pages() != manifest.spec.pages() {
+                return Err(Error::InvalidRequest);
+            }
+            let mut encoded = Vec::new();
+            racer_core::write::journal::encode_manifest_head(manifest, &mut encoded)
+                .map_err(|_| Error::InvalidRequest)?;
+            push_binary(head, WRITE_MANIFEST, &encoded);
+            push_binary(head, WRITE_HOLDER_RANKS, &encode_ranks(ranks)?);
+        }
     }
     Ok(())
+}
+
+/// A rank-relative table names at least one page and at most `MAX_PAGES`.
+fn encode_ranks(ranks: &HolderRanks) -> Result<Vec<u8>> {
+    if ranks.pages() == 0 || ranks.pages() > racer_core::write::MAX_PAGES {
+        return Err(Error::InvalidRequest);
+    }
+    Ok(ranks.to_bytes())
+}
+
+fn decode_ranks(head: &MessageHead) -> Result<HolderRanks> {
+    let ranks =
+        HolderRanks::decode(&bytes(head, WRITE_HOLDER_RANKS)?).map_err(|_| Error::InvalidRequest)?;
+    encode_ranks(&ranks)?;
+    Ok(ranks)
 }
 
 /// A commit names at least one page and at least one holder per page. The
@@ -219,6 +251,15 @@ pub(super) fn decode_action(head: &MessageHead) -> Result<WriteAction> {
         "abort" => WriteAction::Abort {
             session: decode_session(head)?,
         },
+        "commit" if head.unique(WRITE_HOLDER_RANKS)?.is_some() => {
+            if head.unique(WRITE_HOLDERS)?.is_some() {
+                return Err(Error::InvalidRequest);
+            }
+            WriteAction::CommitRanked {
+                session: decode_session(head)?,
+                ranks: decode_ranks(head)?,
+            }
+        }
         "commit" => {
             let holders =
                 Holders::decode(&bytes(head, WRITE_HOLDERS)?).map_err(|_| Error::InvalidRequest)?;
@@ -240,6 +281,17 @@ pub(super) fn decode_action(head: &MessageHead) -> Result<WriteAction> {
         }
         "delete" => WriteAction::Delete,
         "persist" => WriteAction::Persist,
+        "replicate" if head.unique(WRITE_HOLDER_RANKS)?.is_some() => {
+            let manifest =
+                racer_core::write::journal::decode_manifest_head(&bytes(head, WRITE_MANIFEST)?)
+                    .map_err(|_| Error::InvalidRequest)?;
+            check_spec(&manifest.spec)?;
+            let ranks = decode_ranks(head)?;
+            if !manifest.holders.0.is_empty() || ranks.pages() != manifest.spec.pages() {
+                return Err(Error::InvalidRequest);
+            }
+            WriteAction::ReplicateRanked { manifest, ranks }
+        }
         "replicate" => {
             let manifest =
                 racer_core::write::journal::decode_manifest(&bytes(head, WRITE_MANIFEST)?)

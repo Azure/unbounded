@@ -116,7 +116,32 @@ fn actions() -> Vec<(WriteAction, bool)> {
             },
             true,
         ),
+        (
+            WriteAction::CommitRanked {
+                session: SESSION,
+                ranks: ranks(4),
+            },
+            true,
+        ),
+        (
+            WriteAction::ReplicateRanked {
+                manifest: Manifest {
+                    holders: Holders::default(),
+                    ..manifest()
+                },
+                ranks: ranks(4),
+            },
+            true,
+        ),
     ]
+}
+
+fn ranks(pages: u64) -> racer_core::write::HolderRanks {
+    let mut ranks = racer_core::write::HolderRanks::new(5).unwrap();
+    for page in 0..pages {
+        ranks.push(if page % 2 == 0 { 0b011 } else { 0b101 }).unwrap();
+    }
+    ranks
 }
 
 /// A request for `operation` with the fixed write mode's origin context.
@@ -322,7 +347,7 @@ fn write_operations_round_trip_signed_without_page_bytes() {
             }
         );
         let (signed, _) = sender.sign_request_to(request, &node(1)).unwrap();
-        let decoded = decode(&codec, &signed).unwrap();
+        let decoded = decode(&codec, &signed).unwrap_or_else(|e| panic!("operation {i}: {e:?}"));
         assert!(same(&decoded.request.operation, &expected), "operation {i}");
         assert!(decoded.request.operation.is_write());
         assert_eq!(
@@ -908,4 +933,99 @@ fn signatures_bind_every_write_header() {
             );
         }
     }
+}
+
+/// A maximum-size object (`MAX_WRITE_PAGES` pages) commits with a
+/// rank-relative holder table inside one signed head; an explicit table of
+/// that size does not fit, which is why writers prefer ranks.
+#[test]
+fn max_size_commit_fits_with_ranked_holders() {
+    let env = racer_io::Env::host();
+    let signatures = network(&env, 2);
+    let sender = Forwarding::new(signatures[0].clone());
+    let codec = codec();
+    let pages = racer_wire::object::write::MAX_WRITE_PAGES;
+    let base = request(&env, 1);
+    let version = version(&base);
+    let mut ranks = racer_core::write::HolderRanks::new(5).unwrap();
+    for _ in 0..pages {
+        ranks.push(0b011).unwrap();
+    }
+    let ranked = Operation::WriteSession {
+        object: version.object.clone(),
+        etag: Some(version.etag.clone()),
+        action: Box::new(WriteAction::CommitRanked {
+            session: SESSION,
+            ranks: ranks.clone(),
+        }),
+    };
+    let (signed, _) = sender
+        .sign_request_to(write_request(&env, 7, clone_operation(&ranked)), &node(1))
+        .unwrap();
+    let decoded = decode(&codec, &signed).unwrap();
+    assert!(same(&decoded.request.operation, &ranked));
+    let id = |n: usize| node(n).0.into_bytes();
+    let explicit = Operation::WriteSession {
+        object: version.object.clone(),
+        etag: Some(version.etag.clone()),
+        action: Box::new(WriteAction::Commit {
+            session: SESSION,
+            holders: Holders(vec![vec![id(1), id(2)]; pages as usize]),
+        }),
+    };
+    assert!(
+        sender
+            .sign_request_to(write_request(&env, 8, explicit), &node(1))
+            .is_err()
+    );
+}
+
+#[test]
+fn ranked_holder_tables_reject_malformed_and_mixed_forms() {
+    let env = racer_io::Env::host();
+    let base = request(&env, 1);
+    let version = version(&base);
+    let commit = || Operation::WriteSession {
+        object: version.object.clone(),
+        etag: Some(version.etag.clone()),
+        action: Box::new(WriteAction::CommitRanked {
+            session: SESSION,
+            ranks: ranks(3),
+        }),
+    };
+    assert!(tampered(&env, commit(), &|_| {}).0.is_ok());
+    let holders = crate::peer::protocol::binary(&holders().to_bytes().unwrap()).into_bytes();
+    let zero_run = crate::peer::protocol::binary(&[5, 0, 1]).into_bytes();
+    let wide = crate::peer::protocol::binary(&[5, 1, 32]).into_bytes();
+    let empty = crate::peer::protocol::binary(&[5]).into_bytes();
+    let changes: Vec<Box<dyn Fn(&mut Vec<http1::Header>)>> = vec![
+        Box::new(set(write::WRITE_HOLDER_RANKS, &zero_run)),
+        Box::new(set(write::WRITE_HOLDER_RANKS, &wide)),
+        Box::new(set(write::WRITE_HOLDER_RANKS, &empty)),
+        Box::new(set(write::WRITE_HOLDER_RANKS, b"!!")),
+        Box::new(duplicate(write::WRITE_HOLDER_RANKS)),
+    ];
+    for change in changes {
+        assert!(tampered(&env, commit(), &*change).0.is_err());
+    }
+    // Both table forms at once are ambiguous.
+    let both = |headers: &mut Vec<http1::Header>| {
+        headers.push(http1::Header::new(write::WRITE_HOLDERS, holders.clone()));
+    };
+    assert!(tampered(&env, commit(), &both).0.is_err());
+    // A ranked replicate must carry an empty manifest table covering every page.
+    let replicate = Operation::WriteSession {
+        object: version.object.clone(),
+        etag: Some(version.etag.clone()),
+        action: Box::new(WriteAction::ReplicateRanked {
+            manifest: Manifest {
+                holders: Holders::default(),
+                etag: String::from_utf8(version.etag.as_bytes().to_vec()).unwrap(),
+                ..manifest()
+            },
+            ranks: ranks(3),
+        }),
+    };
+    let head = request_head(&env.ctx.clock, &write_request(&env, 9, replicate));
+    assert!(head.is_err(), "ranks must cover every page");
 }

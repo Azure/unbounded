@@ -215,6 +215,35 @@ pub fn encode_manifest(manifest: &Manifest, out: &mut Vec<u8>) -> Result<(), Jou
     put_opt_str(out, manifest.blob_etag.as_deref())
 }
 
+/// Encode a manifest without its holder table (session, ETag, spec, state,
+/// blob ETag), for `replicate` with a rank-relative table.
+pub fn encode_manifest_head(manifest: &Manifest, out: &mut Vec<u8>) -> Result<(), JournalError> {
+    out.extend_from_slice(&manifest.session.0);
+    put_str(out, &manifest.etag)?;
+    put_spec(out, &manifest.spec)?;
+    out.push(manifest.state.code());
+    put_opt_str(out, manifest.blob_etag.as_deref())
+}
+
+/// Decode [`encode_manifest_head`]; the holder table is empty.
+pub fn decode_manifest_head(bytes: &[u8]) -> Result<Manifest, JournalError> {
+    let mut r = Reader(bytes);
+    let session = r.session()?;
+    let etag = r.string()?;
+    let spec = r.spec()?;
+    let state = UploadState::from_code(r.u8()?).ok_or(JournalError::Corrupt)?;
+    let blob_etag = r.opt_string()?;
+    r.finish()?;
+    Ok(Manifest {
+        session,
+        etag,
+        spec,
+        holders: Holders::default(),
+        state,
+        blob_etag,
+    })
+}
+
 /// Decode a complete manifest encoding.
 pub fn decode_manifest(bytes: &[u8]) -> Result<Manifest, JournalError> {
     let mut reader = Reader(bytes);
@@ -711,6 +740,30 @@ mod tests {
         let mut out = Vec::new();
         encode_manifest(&bad, &mut out).unwrap();
         assert_eq!(decode_manifest(&out), Err(JournalError::Corrupt));
+    }
+
+    #[test]
+    fn manifest_head_omits_holders() {
+        let mut out = Vec::new();
+        encode_manifest_head(&manifest(), &mut out).unwrap();
+        let decoded = decode_manifest_head(&out).unwrap();
+        assert_eq!(
+            decoded,
+            Manifest {
+                holders: Holders::default(),
+                ..manifest()
+            }
+        );
+        // Trailing bytes and truncation are rejected.
+        let mut long = out.clone();
+        long.push(0);
+        assert!(decode_manifest_head(&long).is_err());
+        assert!(decode_manifest_head(&out[..out.len() - 1]).is_err());
+        let mut bad = manifest();
+        bad.spec.replicas = 0;
+        let mut out = Vec::new();
+        encode_manifest_head(&bad, &mut out).unwrap();
+        assert_eq!(decode_manifest_head(&out), Err(JournalError::Corrupt));
     }
 
     #[test]

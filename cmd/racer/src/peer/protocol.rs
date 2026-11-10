@@ -672,7 +672,10 @@ pub fn request_head(clock: &racer_io::Clock, request: &PeerRequest) -> Result<Me
                 }
                 None => object_fields(&mut head, object)?,
             }
-            if let (WriteAction::Replicate { manifest }, Some(etag)) = (&**action, etag)
+            if let (
+                WriteAction::Replicate { manifest } | WriteAction::ReplicateRanked { manifest, .. },
+                Some(etag),
+            ) = (&**action, etag)
                 && manifest.etag != etag.as_str()
             {
                 return Err(Error::InvalidRequest);

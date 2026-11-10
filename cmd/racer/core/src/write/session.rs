@@ -53,6 +53,10 @@ pub enum SessionEvent {
     /// Upload gave up after its retries.
     UploadFailed,
     PersistRequested,
+    /// Restart an upload that was pending when the coordinator restarted
+    /// (`from_manifest` turns an interrupted upload into `Pending`). Valid only
+    /// in `Pending`.
+    UploadResumed,
     DeleteRequested,
     HoldExpired,
 }
@@ -380,6 +384,12 @@ impl Session {
             SessionEvent::PersistRequested => {
                 if self.state != UploadState::Manual {
                     return vec![SessionEffect::Reject(Rejection::NotManual)];
+                }
+                self.start_upload()
+            }
+            SessionEvent::UploadResumed => {
+                if self.state != UploadState::Pending {
+                    return vec![SessionEffect::Reject(Rejection::InvalidState)];
                 }
                 self.start_upload()
             }
