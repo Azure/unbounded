@@ -303,7 +303,13 @@ pub const SCENARIOS: &[&str] = &[
     "listeners-survive-queue-pressure",
     "concurrent-relayed-layers",
     "concurrent-relayed-layers-opaque",
+    "writes",
+    "writes-four-nodes",
 ];
+
+/// Write scenarios [`run`] accepts that are not in [`SCENARIOS`]: they need
+/// WP8 repair and failover, so the default run skips them.
+pub use writes::GATED as GATED_SCENARIOS;
 
 /// Runs app scenario `name` (see [`SCENARIOS`]) with `seed` and up to
 /// `steps` generated actions (generated scenarios only; 0 means one full
@@ -311,6 +317,7 @@ pub const SCENARIOS: &[&str] = &[
 /// resource bounds, release at quiescence, stranded work) is a panic, which
 /// becomes `Err` carrying the panic message.
 pub fn run(name: &str, seed: u64, steps: usize) -> std::result::Result<Run, String> {
+    let requested = steps;
     let steps = if steps == 0 {
         WEIGHTED_ACTIONS.len()
     } else {
@@ -364,6 +371,15 @@ pub fn run(name: &str, seed: u64, steps: usize) -> std::result::Result<Run, Stri
             }
             "concurrent-relayed-layers-opaque" => {
                 fixed(scenarios::concurrent_relayed_layers_opaque_opt_in_pressure_and_recovery)
+            }
+            write if write.starts_with("writes") => {
+                FIXED_DIGEST.with(|d| *d.borrow_mut() = Some(Sha256::new()));
+                writes::run(write, seed, requested.min(512));
+                FIXED_DIGEST
+                    .with(|d| d.borrow_mut().take())
+                    .expect("fixed digest is active")
+                    .finalize()
+                    .into()
             }
             other => panic!("unknown app scenario {other}"),
         }
@@ -428,6 +444,7 @@ mod scenarios;
 mod traffic;
 #[cfg(test)]
 mod write_tests;
+mod writes;
 
 #[derive(Clone, Copy, Debug)]
 enum Action {
