@@ -22,7 +22,7 @@ Before the agent can expose GPUs, the **host VM** must have:
 3. **Fabric Manager running** (NVSwitch-based GPUs only). H100, H200, and
    multi-GPU ND A100 systems require the `nvidia-fabricmanager` service.
    Without it, CUDA initialization fails with error 802
-   (`SYSTEM_DRIVER_MISMATCH`). B200 and later NVSwitch systems also need
+   (`SYSTEM_NOT_READY`). B200 and later NVSwitch systems also need
    NVLSM and the `ib_umad` module. The
    [NVSwitch host image]({{< relref "reference/gpu/nvswitch-host-image" >}})
    ships all of these for bare metal.
@@ -232,7 +232,7 @@ dataplane Pod until the configuration is written again and they restart.
 
 ## Troubleshooting
 
-### CUDA error 802 (`SYSTEM_DRIVER_MISMATCH`)
+### CUDA error 802 (`SYSTEM_NOT_READY`)
 
 This means Fabric Manager is not running. It is required for NVSwitch-based
 multi-GPU systems (H100, H200, ND A100):

@@ -66,7 +66,7 @@ the ESP boots through shim at `EFI/BOOT/BOOTX64.EFI`.
    runtime and kubelet.
 
 Until Fabric Manager finishes, CUDA calls fail with error 802
-(`SYSTEM_DRIVER_MISMATCH`). The image orders every agent node unit after
+(`SYSTEM_NOT_READY`). The image orders every agent node unit after
 Fabric Manager: `unbounded-containerd.service` and `unbounded-kubelet.service`
 in `none` mode, `systemd-nspawn@<machine>.service` in `nspawn` mode, and
 `unbounded-node-<slot>.service` in `container` mode. The node waits while
