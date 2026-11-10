@@ -123,6 +123,16 @@ func (s *Server) handler(conn net.PacketConn, peer net.Addr, m *dhcpv4.DHCPv4) {
 	mac := strings.ToLower(m.ClientHWAddr.String())
 	log := slog.With("mac", mac, "type", m.MessageType().String())
 
+	// A DHCPREQUEST naming another server identifier means the client chose
+	// that server's offer (RFC 2131 section 4.3.2, SELECTING state). Stay out
+	// of it so the client binds to the server it selected.
+	if m.MessageType() == dhcpv4.MessageTypeRequest {
+		if sid := m.ServerIdentifier(); sid != nil && !sid.IsUnspecified() && s.ServerIP != nil && !sid.Equal(s.ServerIP) {
+			log.Debug("ignoring DHCP request for another server", "serverIdentifier", sid.String())
+			return
+		}
+	}
+
 	ctx := context.Background()
 
 	var list v1alpha3.MachineList
@@ -150,6 +160,16 @@ func (s *Server) handler(conn net.PacketConn, peer net.Addr, m *dhcpv4.DHCPv4) {
 	}
 
 	if lease == nil {
+		return
+	}
+
+	// For held leases, the installed OS runs a DHCP client only to keep the
+	// lease with the site DHCP server. Answer only boot firmware (PXE or UEFI
+	// HTTP boot), so the OS client binds to the site server instead of us.
+	// GRUB and the installer initramfs use firmware and static addressing and
+	// do not send their own DHCP requests.
+	if lease.HoldLease && !isBootFirmwareRequest(m) {
+		log.Debug("ignoring non-firmware DHCP request for held lease", "node", node.Name, "vendorClass", m.ClassIdentifier())
 		return
 	}
 
@@ -240,6 +260,10 @@ func (s *Server) handler(conn net.PacketConn, peer net.Addr, m *dhcpv4.DHCPv4) {
 	if _, err := conn.WriteTo(resp.ToBytes(), dest); err != nil {
 		log.Error("sending DHCP response", "err", err)
 	}
+}
+
+func isBootFirmwareRequest(m *dhcpv4.DHCPv4) bool {
+	return strings.HasPrefix(m.ClassIdentifier(), "PXEClient") || isHTTPClientRequest(m)
 }
 
 func isHTTPClientRequest(m *dhcpv4.DHCPv4) bool {

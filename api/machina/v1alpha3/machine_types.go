@@ -412,6 +412,16 @@ type DHCPLease struct {
 	// DNS is a list of DNS server addresses.
 	// +optional
 	DNS []string `json:"dns,omitempty"`
+
+	// HoldLease, when true, makes the installed host also run a DHCPv4
+	// client on this lease's NIC so the site DHCP server keeps the lease
+	// for IPv4 and does not reassign it to another host. The static
+	// address, gateway, and DNS remain authoritative; routes, DNS, NTP,
+	// hostname, and domains from DHCP are ignored. The site DHCP server
+	// should reserve IPv4 for MAC. Leave unset where there is no DHCP
+	// server.
+	// +optional
+	HoldLease bool `json:"holdLease,omitempty"`
 }
 
 // RedfishSpec defines Redfish BMC connection details.

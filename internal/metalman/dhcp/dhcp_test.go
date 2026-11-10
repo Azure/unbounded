@@ -907,3 +907,114 @@ func (f *fakePacketConn) LocalAddr() net.Addr                { return &net.UDPAd
 func (f *fakePacketConn) SetDeadline(_ time.Time) error      { return nil }
 func (f *fakePacketConn) SetReadDeadline(_ time.Time) error  { return nil }
 func (f *fakePacketConn) SetWriteDeadline(_ time.Time) error { return nil }
+
+func newHoldLeaseServer(t *testing.T, hold bool) *Server {
+	t.Helper()
+
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-01"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{DHCPLeases: []v1alpha3.DHCPLease{{
+				MAC:        "aa:bb:cc:dd:ee:f0",
+				IPv4:       "10.0.1.10",
+				SubnetMask: "255.255.255.0",
+				HoldLease:  hold,
+			}}},
+		},
+	}
+
+	return &Server{
+		Interface: "eth0",
+		Reader:    newFakeReader(t, node),
+		ServerIP:  net.ParseIP("10.0.1.254").To4(),
+	}
+}
+
+func TestDHCPHandlerHoldLease(t *testing.T) {
+	mac, _ := net.ParseMAC("aa:bb:cc:dd:ee:f0")
+	peer := &net.UDPAddr{IP: net.ParseIP("10.0.1.10"), Port: 68}
+
+	tests := []struct {
+		name      string
+		hold      bool
+		class     string
+		request   bool
+		wantReply bool
+	}{
+		{name: "held lease ignores OS discover", hold: true},
+		{name: "held lease ignores OS request", hold: true, request: true},
+		{name: "held lease ignores other vendor class", hold: true, class: "udhcp 1.36.1"},
+		{name: "held lease answers PXE firmware", hold: true, class: "PXEClient:Arch:00007:UNDI:003016", wantReply: true},
+		{name: "held lease answers PXE firmware request", hold: true, class: "PXEClient:Arch:00007:UNDI:003016", request: true, wantReply: true},
+		{name: "held lease answers HTTP boot firmware", hold: true, class: "HTTPClient:Arch:00016:UNDI:003016", wantReply: true},
+		{name: "unheld lease answers OS discover", wantReply: true},
+		{name: "unheld lease answers OS request", request: true, wantReply: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := newHoldLeaseServer(t, tt.hold)
+
+			m, err := dhcpv4.NewDiscovery(mac)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if tt.request {
+				m.UpdateOption(dhcpv4.OptMessageType(dhcpv4.MessageTypeRequest))
+				m.UpdateOption(dhcpv4.OptRequestedIPAddress(net.ParseIP("10.0.1.10")))
+			}
+
+			if tt.class != "" {
+				m.UpdateOption(dhcpv4.OptClassIdentifier(tt.class))
+			}
+
+			conn := &fakePacketConn{}
+			srv.handler(conn, peer, m)
+
+			if got := conn.written != nil; got != tt.wantReply {
+				t.Fatalf("reply sent = %v, want %v", got, tt.wantReply)
+			}
+		})
+	}
+}
+
+func TestDHCPHandlerRequestServerIdentifier(t *testing.T) {
+	mac, _ := net.ParseMAC("aa:bb:cc:dd:ee:f0")
+	peer := &net.UDPAddr{IP: net.ParseIP("10.0.1.10"), Port: 68}
+
+	tests := []struct {
+		name      string
+		serverID  net.IP
+		wantReply bool
+	}{
+		{name: "site server selected", serverID: net.ParseIP("10.0.1.1")},
+		{name: "metalman selected", serverID: net.ParseIP("10.0.1.254"), wantReply: true},
+		{name: "no server identifier", wantReply: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := newHoldLeaseServer(t, false)
+
+			m, err := dhcpv4.NewDiscovery(mac)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			m.UpdateOption(dhcpv4.OptMessageType(dhcpv4.MessageTypeRequest))
+			m.UpdateOption(dhcpv4.OptClassIdentifier("PXEClient:Arch:00007:UNDI:003016"))
+
+			if tt.serverID != nil {
+				m.UpdateOption(dhcpv4.OptServerIdentifier(tt.serverID))
+			}
+
+			conn := &fakePacketConn{}
+			srv.handler(conn, peer, m)
+
+			if got := conn.written != nil; got != tt.wantReply {
+				t.Fatalf("reply sent = %v, want %v", got, tt.wantReply)
+			}
+		})
+	}
+}

@@ -40,6 +40,9 @@ menuentry "Unbounded Metal Install" {
     {{- end }}
     {{- if .BootLease }}
     unbounded.boot_mac={{ .BootLease.MAC }} \
+    {{- if .DHCPHoldLease }}
+    unbounded.dhcp_hold=1 \
+    {{- end }}
     {{- if (ipAddresses .BootLease.DNS) }}
     unbounded.dns={{ join (ipAddresses .BootLease.DNS) "," }} \
     {{- end }}
