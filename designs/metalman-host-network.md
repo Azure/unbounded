@@ -127,7 +127,9 @@ The legacy VirtualMedia flow (no `network`) is unchanged.
    recorded with an optimistic lock before instructions are returned. Media
    built without `network` answer 404. As with every bootmedia callback, an
    unknown media ID or a wrong source IP also answers 404, and a non-GET
-   request answers 405. Media built with `network` answer 404 to `grub.cfg`,
+   request answers 405. A transient failure to look up the media owner
+   (API server errors other than not found) answers 503 on every callback,
+   and callers retry. Media built with `network` answer 404 to `grub.cfg`,
    so a network installer config is never served for them.
 5. The installer writes the image, persists networking, and uses the existing
    `complete` and `ready` callbacks.

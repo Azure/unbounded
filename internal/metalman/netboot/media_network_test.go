@@ -310,6 +310,19 @@ func (c machineGetErrClient) Get(ctx context.Context, key client.ObjectKey, obj 
 	return c.Client.Get(ctx, key, obj, opts...)
 }
 
+type operationListErrClient struct {
+	client.Client
+	err error
+}
+
+func (c operationListErrClient) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	if _, ok := list.(*v1alpha3.MachineOperationList); ok {
+		return c.err
+	}
+
+	return c.Client.List(ctx, list, opts...)
+}
+
 func TestMediaInstallEndpointLookupErrors(t *testing.T) {
 	p, _, op := networkMediaFixture(t, "amd64", localMeta)
 	p.Resolver.Cluster = &StaticClusterInfo{Info: ClusterInfo{ApiserverURL: "https://203.0.113.5:6443"}}
@@ -325,6 +338,13 @@ func TestMediaInstallEndpointLookupErrors(t *testing.T) {
 	p.Client = machineGetErrClient{Client: base, err: apierrors.NewNotFound(schema.GroupResource{Resource: "machines"}, "host")}
 	require.Equal(t, http.StatusConflict, mediaRequest(p, id, http.MethodGet, "install", "192.0.2.20").Code)
 
+	// A failing operation List is also transient.
+	p.Client = operationListErrClient{Client: base, err: errors.New("apiserver unavailable")}
+	require.Equal(t, http.StatusServiceUnavailable, mediaRequest(p, id, http.MethodGet, "install", "192.0.2.20").Code)
+
+	// An unknown media ID is still not found.
 	p.Client = base
+	require.Equal(t, http.StatusNotFound, mediaRequest(p, "unknown-media-id", http.MethodGet, "install", "192.0.2.20").Code)
+
 	require.Equal(t, http.StatusOK, mediaRequest(p, id, http.MethodGet, "install", "192.0.2.20").Code)
 }

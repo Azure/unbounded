@@ -366,6 +366,13 @@ func (p *MediaProvider) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	o, err := p.callbackOwner(r.Context(), id)
 	if err != nil {
+		if errors.Is(err, errMediaLookup) {
+			log.Warn("boot media owner lookup failed", "err", err)
+			http.Error(w, http.StatusText(http.StatusServiceUnavailable), http.StatusServiceUnavailable)
+
+			return
+		}
+
 		log.Warn("rejecting boot media request without an owner", "err", err)
 		http.NotFound(w, r)
 
