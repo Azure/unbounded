@@ -4,7 +4,7 @@ ethernets:
   provisioning:
     match:
       macaddress: {{ yamlQuote .BootLease.MAC }}
-{{- if .BootLease.HoldLease }}
+{{- if .DHCPHoldLease }}
     # DHCP runs alongside the static address only to hold the lease for
     # it, so the site DHCP server does not hand the address to another
     # host. Routes, DNS, and hostname still come from the static config.

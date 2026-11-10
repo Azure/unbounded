@@ -347,8 +347,12 @@ func (f *FileResolver) resolveUserDataFromConfigMap(ctx context.Context, node *v
 // field this metalman does not have renders it as the zero value instead of
 // failing to render.
 type templateData struct {
-	Machine          *v1alpha3.Machine
-	BootLease        *v1alpha3.DHCPLease
+	Machine   *v1alpha3.Machine
+	BootLease *v1alpha3.DHCPLease
+	// DHCPHoldLease mirrors BootLease.HoldLease as a top-level key. Templates
+	// must read this key rather than the nested lease field, so an older
+	// controller that lacks it renders the DHCP-free default instead of failing.
+	DHCPHoldLease    bool
 	ApiserverURL     string
 	ServeURL         string
 	AgentConfigJSON  string
@@ -374,6 +378,7 @@ func newTemplateData(node *v1alpha3.Machine, ci ClusterInfo, serveURL, agentConf
 	return templateData{
 		Machine:          node,
 		BootLease:        bootLease,
+		DHCPHoldLease:    bootLease != nil && bootLease.HoldLease,
 		ApiserverURL:     ci.ApiserverURL,
 		ServeURL:         serveURL,
 		AgentConfigJSON:  agentConfigJSON,
