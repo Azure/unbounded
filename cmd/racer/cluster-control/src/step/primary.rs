@@ -67,6 +67,9 @@ pub struct PassInputs<'a> {
     pub current: Option<&'a StateRecord>,
     /// Image this process holds, if any.
     pub previous_image: Option<&'a Image>,
+    /// Every seat Lease was read or confirmed absent. When false, `live` may
+    /// miss a live seat, so keyring roots are not evicted.
+    pub seats_complete: bool,
     /// Live seats by index.
     pub live: &'a BTreeMap<usize, LeaseObservation>,
     pub writer: &'a Writer,
@@ -106,8 +109,10 @@ pub struct PassPlan {
     pub desired: usize,
     pub eligible: usize,
     pub changed: bool,
-    /// Root offers refused because the keyring root slots are full.
+    /// Root offers refused because offered roots fill every keyring root slot.
     pub refused_roots: usize,
+    /// Unoffered roots evicted to admit offers when the root slots were full.
+    pub evicted_roots: usize,
     /// Names of ClusterCaches left out for an invalid `spec.nodeSelector`.
     pub rejected_caches: Vec<String>,
 }
@@ -207,6 +212,7 @@ pub fn plan_pass(i: &PassInputs<'_>, rng: &mut dyn Entropy) -> Result<PassPlan, 
         &durable,
         catalog.as_deref(),
         &offers(i.live),
+        i.seats_complete,
         i.wall_unix,
         rng,
     )
@@ -295,6 +301,7 @@ pub fn plan_pass(i: &PassInputs<'_>, rng: &mut dyn Entropy) -> Result<PassPlan, 
         eligible,
         changed,
         refused_roots: plan.refused_roots,
+        evicted_roots: plan.evicted_roots,
         rejected_caches,
     })
 }
@@ -504,6 +511,7 @@ mod tests {
                 live: &live,
                 writer: &w,
                 wall_unix: NOW,
+                seats_complete: true,
                 membership_changed_unix: changed,
             },
             rng,

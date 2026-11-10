@@ -6,11 +6,20 @@
 //! `prepare_for`. Caches are never evicted to make room. Every change gets a
 //! new bundle generation; exhausted generations fail.
 //!
-//! Each seat offers an issuer root, reused across claims by the same Pod. A
-//! root is kept while a seat offers it,
-//! and for one Lease duration plus one certificate lifetime after that, capped
-//! at its NotAfter. A removed root is listed as retired until its NotAfter so a
-//! stale Lease annotation can never add it back.
+//! Each seat offers an issuer root, reused across claims by the same process.
+//! A root is kept while a seat offers it, and for one Lease duration plus one
+//! certificate lifetime after that, capped at its NotAfter. A root removed
+//! that way is listed as retired until its NotAfter so a stale Lease
+//! annotation can never add it back.
+//!
+//! Every process start offers a new root, so restarts can fill all
+//! [`MAX_ROOTS`] slots with roots no seat offers any more. A new offer then
+//! evicts the unoffered root with the earliest retain deadline, which is the
+//! one offered longest ago. Leaves that root issued stop verifying before
+//! they expire: a live seat outranks them. Evicted roots are not retired,
+//! because the seat that offered one may still hold its issuer and offer it
+//! again. Eviction waits for a pass that read every seat Lease, since an
+//! unread seat may still offer its root.
 
 use crate::entropy::Entropy;
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -376,8 +385,10 @@ fn new_key(
 pub struct Plan {
     pub durable: Durable,
     pub changed: bool,
-    /// Offers refused because [`MAX_ROOTS`] was reached.
+    /// Offers refused because [`MAX_ROOTS`] was reached by offered roots.
     pub refused_roots: usize,
+    /// Unoffered roots removed early to admit an offer when slots were full.
+    pub evicted_roots: usize,
 }
 
 /// Compute the next keyring. `catalog` must already be admitted.
@@ -394,20 +405,46 @@ pub fn plan(
         current,
         Some(catalog),
         offers,
+        true,
         now,
         &mut crate::entropy::OsEntropy,
     )
+}
+
+/// Removes roots past their retain deadline or NotAfter, except those `skip`
+/// keeps, and retires each one until its NotAfter.
+fn expire_roots(d: &mut Durable, now: u64, skip: impl Fn(&Root) -> bool) {
+    let mut kept = Vec::new();
+    for r in std::mem::take(&mut d.roots) {
+        if !skip(&r) && (now >= r.retain_until || now >= r.not_after) {
+            let der = STANDARD.decode(&r.der).unwrap_or_default();
+            if r.not_after > now {
+                d.retired.push(Retired {
+                    sha256: sha256(&der),
+                    until: r.not_after,
+                });
+            }
+        } else {
+            kept.push(r);
+        }
+    }
+    d.roots = kept;
 }
 
 /// Like [`plan`], but `None` means the catalog is unknown, for example before
 /// the ClusterCache watch synced or when it failed to build. Cache keys are
 /// then neither added nor removed: an unknown catalog is not an empty one,
 /// and dropping keys would give existing caches new keys later.
+///
+/// `evict` is false when `offers` may be incomplete, for example after a
+/// failed seat Lease read: a root missing from `offers` may then belong to a
+/// live seat, so full slots refuse new offers instead of evicting.
 pub fn plan_with(
     policy: &Policy,
     current: &Durable,
     catalog: Option<&[CacheDefinition]>,
     offers: &[Offer],
+    evict: bool,
     now: u64,
     rng: &mut dyn Entropy,
 ) -> Result<Plan, KeyringError> {
@@ -471,7 +508,15 @@ pub fn plan_with(
     let keep_after_offer = (policy.lease_duration + policy.certificate_lifetime + SKEW).as_secs();
     let min_life = (policy.certificate_lifetime + SKEW).as_secs();
     d.retired.retain(|r| r.until > now);
+    let offered: std::collections::HashSet<String> =
+        offers.iter().map(|o| STANDARD.encode(&o.der)).collect();
+    // Expire unoffered roots, and offered roots past NotAfter, first so
+    // eviction only happens when expiry alone does not free a slot.
+    expire_roots(&mut d, now, |r| {
+        offered.contains(&r.der) && r.not_after > now
+    });
     let mut refused = 0;
+    let mut evicted = 0;
     for offer in offers {
         let encoded = STANDARD.encode(&offer.der);
         if let Some(r) = d.roots.iter_mut().find(|r| r.der == encoded) {
@@ -497,8 +542,28 @@ pub fn plan_with(
             continue;
         }
         if d.roots.len() >= MAX_ROOTS {
-            refused += 1;
-            continue;
+            // A live seat outranks a root no seat offers any more. Without
+            // this, a crash loop that claims seats from new processes, each
+            // with a new issuer, fills every slot with dead roots and leaves
+            // all seats unready until those roots expire. Evict the unoffered
+            // root closest to its deadline. It is not retired, so a holder
+            // that offers it again is admitted like a new one.
+            let victim = evict
+                .then(|| {
+                    d.roots
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, r)| !offered.contains(&r.der))
+                        .min_by_key(|(_, r)| (r.retain_until, r.not_after))
+                        .map(|(i, _)| i)
+                })
+                .flatten();
+            let Some(victim) = victim else {
+                refused += 1;
+                continue;
+            };
+            d.roots.remove(victim);
+            evicted += 1;
         }
         d.roots.push(Root {
             der: encoded,
@@ -508,21 +573,7 @@ pub fn plan_with(
             retain_until: (now + 2 * keep_after_offer).min(info.not_after),
         });
     }
-    let mut kept = Vec::new();
-    for r in std::mem::take(&mut d.roots) {
-        if now >= r.retain_until || now >= r.not_after {
-            let der = STANDARD.decode(&r.der).unwrap_or_default();
-            if r.not_after > now {
-                d.retired.push(Retired {
-                    sha256: sha256(&der),
-                    until: r.not_after,
-                });
-            }
-        } else {
-            kept.push(r);
-        }
-    }
-    d.roots = kept;
+    expire_roots(&mut d, now, |_| false);
 
     // Only these fields count as a change. Retain deadline extensions are
     // persisted but do not bump the bundle generation.
@@ -553,6 +604,7 @@ pub fn plan_with(
         durable: d,
         changed,
         refused_roots: refused,
+        evicted_roots: evicted,
     })
 }
 
@@ -725,17 +777,26 @@ pub(crate) mod tests {
         )
         .unwrap()
         .durable;
-        let p = plan_with(&policy(), &d, None, &[], t, &mut OsEntropy).unwrap();
+        let p = plan_with(&policy(), &d, None, &[], true, t, &mut OsEntropy).unwrap();
         assert_eq!(p.durable.keys, d.keys);
         assert_eq!(p.durable.generation, d.generation);
         assert!(!p.changed);
         // Rotation still proceeds on the existing keys.
-        let p = plan_with(&policy(), &d, None, &[], d.next_rotation, &mut OsEntropy).unwrap();
+        let p = plan_with(
+            &policy(),
+            &d,
+            None,
+            &[],
+            true,
+            d.next_rotation,
+            &mut OsEntropy,
+        )
+        .unwrap();
         assert_eq!(p.durable.keys.len(), 8);
         assert!(d.keys.iter().all(|k| p.durable.keys.contains(k)));
         // An empty known catalog does drop them.
         assert!(
-            plan_with(&policy(), &d, Some(&[]), &[], t, &mut OsEntropy)
+            plan_with(&policy(), &d, Some(&[]), &[], true, t, &mut OsEntropy)
                 .unwrap()
                 .durable
                 .keys
@@ -859,6 +920,187 @@ pub(crate) mod tests {
         assert_eq!(p.refused_roots, 2);
     }
 
+    /// Fill every root slot with roots that pods which have since exited
+    /// offered: `retain_until` rises with the index.
+    fn full_of_departed_roots(t: u64) -> Durable {
+        let mut d = Durable::default();
+        for i in 0..MAX_ROOTS {
+            d.roots.push(Root {
+                der: STANDARD.encode(root(7)),
+                seat: (i % crate::annotations::MAX_SEATS) as u8,
+                holder: format!("departed-{i}"),
+                not_after: t + 7 * DAY,
+                retain_until: t + DAY + i as u64,
+            });
+        }
+        d.validate().unwrap();
+        d
+    }
+
+    fn offers(n: usize) -> Vec<Offer> {
+        (0..n)
+            .map(|i| Offer {
+                der: root(7),
+                seat: i as u8,
+                holder: format!("live-{i}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn full_slots_evict_unoffered_roots_for_live_offers() {
+        let t = now();
+        let d = full_of_departed_roots(t);
+        let live = offers(3);
+        let p = plan(&policy(), &d, &[], &live, t).unwrap();
+        assert_eq!(p.refused_roots, 0);
+        assert_eq!(p.evicted_roots, 3);
+        assert!(p.changed);
+        assert_eq!(p.durable.generation, d.generation + 1);
+        assert_eq!(p.durable.roots.len(), MAX_ROOTS);
+        p.durable.validate().unwrap();
+        for o in &live {
+            assert!(p.durable.root_committed(&o.der));
+        }
+        // The roots closest to their deadline went first, and are not retired.
+        for r in &d.roots[..3] {
+            assert!(!p.durable.roots.contains(r));
+        }
+        assert!(p.durable.roots.iter().any(|r| r == &d.roots[3]));
+        assert!(p.durable.retired.is_empty());
+
+        // Admitted roots stay; a later pass with the same offers is idle.
+        let again = plan(&policy(), &p.durable, &[], &live, t + 60).unwrap();
+        assert_eq!(again.evicted_roots, 0);
+        assert_eq!(again.refused_roots, 0);
+        assert!(!again.changed);
+    }
+
+    #[test]
+    fn expired_roots_free_slots_before_eviction() {
+        let t = now();
+        let mut d = full_of_departed_roots(t);
+        d.roots[10].retain_until = t;
+        d.roots[20].retain_until = t - 1;
+        let live = offers(3);
+        let p = plan(&policy(), &d, &[], &live, t).unwrap();
+        // Expiry frees two slots, so only one root is evicted.
+        assert_eq!(p.evicted_roots, 1);
+        assert_eq!(p.refused_roots, 0);
+        assert_eq!(p.durable.roots.len(), MAX_ROOTS);
+        assert_eq!(p.durable.retired.len(), 2);
+        p.durable.validate().unwrap();
+        for o in &live {
+            assert!(p.durable.root_committed(&o.der));
+        }
+        assert!(!p.durable.roots.contains(&d.roots[0]));
+        assert!(p.durable.roots.contains(&d.roots[1]));
+
+        // Expiry alone is enough when it frees a slot per offer.
+        let p = plan(&policy(), &d, &[], &live[..2], t).unwrap();
+        assert_eq!(p.evicted_roots, 0);
+        assert!(p.durable.roots.contains(&d.roots[0]));
+    }
+
+    #[test]
+    fn expired_offered_root_frees_slot_before_eviction() {
+        let t = now();
+        let mut d = full_of_departed_roots(t);
+        for r in &mut d.roots {
+            r.retain_until += DAY;
+        }
+        // A holder still offers a root whose certificate is past NotAfter
+        // at plan time, while its retain deadline has not passed.
+        d.roots[5].der = STANDARD.encode(root(1));
+        d.roots[5].not_after = t + DAY;
+        d.roots[5].retain_until = t + 2 * DAY;
+        let stale = d.roots[5].clone();
+        let t = t + DAY + 1;
+        let mut live = vec![Offer {
+            der: STANDARD.decode(&stale.der).unwrap(),
+            seat: stale.seat,
+            holder: stale.holder.clone(),
+        }];
+        live.extend(offers(1));
+        let p = plan(&policy(), &d, &[], &live, t).unwrap();
+        assert_eq!(p.evicted_roots, 0);
+        assert_eq!(p.refused_roots, 0);
+        assert!(!p.durable.roots.contains(&stale));
+        assert!(p.durable.root_committed(&live[1].der));
+        // Every other root, all still valid, survives.
+        for (i, r) in d.roots.iter().enumerate() {
+            if i != 5 {
+                assert!(p.durable.roots.contains(r));
+            }
+        }
+        p.durable.validate().unwrap();
+    }
+
+    #[test]
+    fn incomplete_seat_reads_defer_eviction() {
+        let t = now();
+        let d = full_of_departed_roots(t);
+        let live = offers(2);
+        let p = plan_with(&policy(), &d, Some(&[]), &live, false, t, &mut OsEntropy).unwrap();
+        assert_eq!(p.evicted_roots, 0);
+        assert_eq!(p.refused_roots, 2);
+        assert_eq!(p.durable.roots, d.roots);
+        for o in &live {
+            assert!(!p.durable.root_committed(&o.der));
+        }
+    }
+
+    #[test]
+    fn offered_roots_are_never_evicted() {
+        let t = now();
+        let mut d = full_of_departed_roots(t);
+        // Every slot is offered again; one more offer does not fit.
+        let mut live: Vec<_> = d
+            .roots
+            .iter()
+            .map(|r| Offer {
+                der: STANDARD.decode(&r.der).unwrap(),
+                seat: r.seat,
+                holder: r.holder.clone(),
+            })
+            .collect();
+        live.extend(offers(1));
+        let p = plan(&policy(), &d, &[], &live, t).unwrap();
+        assert_eq!(p.evicted_roots, 0);
+        assert_eq!(p.refused_roots, 1);
+        assert!(!p.durable.root_committed(&live[MAX_ROOTS].der));
+
+        // Only the unoffered root is evicted, even though it is not the
+        // one closest to its deadline.
+        d.roots[MAX_ROOTS - 1].retain_until = t + 2 * DAY;
+        let newest = STANDARD.decode(&d.roots[MAX_ROOTS - 1].der).unwrap();
+        live.remove(MAX_ROOTS - 1);
+        let p = plan(&policy(), &d, &[], &live, t).unwrap();
+        assert_eq!(p.evicted_roots, 1);
+        assert_eq!(p.refused_roots, 0);
+        assert!(!p.durable.root_committed(&newest));
+        assert!(p.durable.root_committed(&live[MAX_ROOTS - 1].der));
+    }
+
+    #[test]
+    fn evicted_root_is_admitted_when_offered_again() {
+        let t = now();
+        let d = full_of_departed_roots(t);
+        let evicted = STANDARD.decode(&d.roots[0].der).unwrap();
+        let p = plan(&policy(), &d, &[], &offers(1), t).unwrap();
+        assert_eq!(p.evicted_roots, 1);
+        assert!(!p.durable.root_committed(&evicted));
+        let back = Offer {
+            der: evicted.clone(),
+            seat: 0,
+            holder: "departed-0".into(),
+        };
+        let p = plan(&policy(), &p.durable, &[], &[back], t + 60).unwrap();
+        assert_eq!(p.evicted_roots, 1);
+        assert_eq!(p.refused_roots, 0);
+        assert!(p.durable.root_committed(&evicted));
+    }
+
     #[test]
     fn capacity_never_evicts() {
         let cap = catalog_capacity();
@@ -965,6 +1207,7 @@ pub(crate) mod tests {
             &d,
             Some(&catalog),
             &[],
+            true,
             t,
             &mut SplitMix64::new(5),
         )
@@ -974,6 +1217,7 @@ pub(crate) mod tests {
             &d,
             Some(&catalog),
             &[],
+            true,
             t,
             &mut SplitMix64::new(5),
         )
@@ -988,6 +1232,7 @@ pub(crate) mod tests {
             &d,
             Some(&catalog),
             &[],
+            true,
             t,
             &mut SplitMix64::new(6),
         )
@@ -997,7 +1242,7 @@ pub(crate) mod tests {
             serde_json::to_vec(&c.durable).unwrap()
         );
         assert_eq!(
-            plan_with(&policy(), &d, Some(&catalog), &[], t, &mut Failing).err(),
+            plan_with(&policy(), &d, Some(&catalog), &[], true, t, &mut Failing).err(),
             Some(KeyringError::Entropy)
         );
     }
