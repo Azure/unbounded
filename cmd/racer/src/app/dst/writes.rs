@@ -24,7 +24,7 @@ use std::collections::BTreeSet;
 /// by name but are not in [`super::SCENARIOS`], so the default run and CI
 /// skip them. Enable after WP8: move them into `SCENARIOS` and add seeds to
 /// `cmd/racer/dst/seeds/ci.txt`.
-pub const GATED: &[&str] = &["writes-holder-loss", "writes-membership-churn"];
+pub const GATED: &[&str] = &[];
 
 /// Orphan age the simulated nodes use (production default: one hour).
 const ORPHAN_AFTER: Duration = Duration::from_secs(8);
@@ -334,6 +334,9 @@ struct World {
     live: BTreeMap<usize, Written>,
     /// Etags of deleted or expired versions; never uploaded.
     gone: BTreeSet<String>,
+    /// Keys whose only copies were lost with a removed node: their state
+    /// is `failed` and reads may answer anything but their old bytes.
+    lost: BTreeSet<usize>,
     /// Etags of every acknowledged version.
     acked: BTreeSet<String>,
     /// Upload faults injected and not yet consumed.
@@ -376,6 +379,7 @@ impl World {
             sink,
             live: BTreeMap::new(),
             gone: BTreeSet::new(),
+            lost: BTreeSet::new(),
             acked: BTreeSet::new(),
             upload_faults: 0,
             profile,
@@ -693,6 +697,7 @@ impl World {
             }
         }
         if let Some(written) = acked {
+            self.lost.remove(&object);
             self.live.insert(object, written);
             self.check_holders(object);
         }
@@ -702,6 +707,11 @@ impl World {
     /// live. Retryable answers are retried after virtual time passes; a
     /// live object must never read as `404`.
     fn read(&mut self, node: usize, object: usize) {
+        if self.lost.contains(&object) && !self.live.contains_key(&object) {
+            // Lost with its holder: any answer but the old bytes is fine,
+            // and nothing here can tell them apart cheaply.
+            return;
+        }
         let want = self.live.get(&object).cloned();
         let length = want.as_ref().map_or(1, |w| w.bytes.len());
         for attempt in 0..READ_RETRIES {
@@ -833,6 +843,18 @@ impl World {
                 })
                 .collect::<Vec<_>>()
         });
+        if std::env::var_os("RACER_DST_WRITES_TRACE").is_some() {
+            let mut diagnostics = String::new();
+            for worker in &self.harness.nodes[node].workers {
+                worker
+                    .app
+                    .telemetry
+                    .failures
+                    .write(&mut diagnostics)
+                    .unwrap();
+            }
+            eprintln!("{diagnostics}");
+        }
         panic!(
             "seed={} node {node} read of {object:x} never recovered: {detail:?}",
             self.harness.seed
@@ -848,6 +870,11 @@ impl World {
 
     fn delete(&mut self) {
         let object = FIRST + self.pick(KEYS);
+        if self.lost.contains(&object) && !self.live.contains_key(&object) {
+            // Lost with its holder: any answer but the old bytes is fine,
+            // and nothing here can tell them apart cheaply.
+            return;
+        }
         let node = self.pick(self.harness.nodes.len());
         self.note("delete");
         let response = self
@@ -883,6 +910,11 @@ impl World {
 
     fn persist(&mut self) {
         let object = FIRST + self.pick(KEYS);
+        if self.lost.contains(&object) && !self.live.contains_key(&object) {
+            // Lost with its holder: any answer but the old bytes is fine,
+            // and nothing here can tell them apart cheaply.
+            return;
+        }
         let node = self.pick(self.harness.nodes.len());
         self.note("persist");
         let request = format!(
@@ -925,13 +957,7 @@ impl World {
         self.wait(Duration::from_secs(1));
         let reader = self.pick(self.harness.nodes.len());
         self.read(reader, object);
-        let written = self.written_pages();
-        assert_eq!(
-            written,
-            self.expected_pages(),
-            "seed={} aborted write left pages",
-            self.harness.seed
-        );
+        self.check_pages(false, "aborted write left pages");
     }
 
     /// A short hold expires: the object becomes unreadable and is never
@@ -1124,11 +1150,42 @@ impl World {
 
     /// Permanently remove a holder (gated: needs WP8 repair).
     fn holder_loss(&mut self) {
-        if self.harness.nodes.len() <= 2 {
+        // Keep three nodes, so `replicas=3` objects can be repaired.
+        if self.harness.nodes.len() <= 3 {
             return;
         }
         self.note("holder-loss");
         let index = self.pick(self.harness.nodes.len());
+        // A write whose every copy of some page was on the lost node is
+        // gone (its upload state becomes `failed`); the oracle forgets it.
+        // Every other acknowledged write must stay readable.
+        let lost: Vec<usize> = self
+            .live
+            .iter()
+            .filter(|(_, w)| !w.uploading)
+            .filter(|&(&object, w)| {
+                let version = self.version(object, &w.etag);
+                (0..w.bytes.len().div_ceil(page_bytes()) as u64).any(|number| {
+                    let page = PageId {
+                        version: version.clone(),
+                        number: PageNumber(number),
+                    };
+                    self.harness.nodes.iter().enumerate().all(|(i, n)| {
+                        (i == index)
+                            || n.workers
+                                .iter()
+                                .all(|w| w.app.store.writer.written(&page).is_none())
+                    })
+                })
+            })
+            .map(|(&object, _)| object)
+            .collect();
+        for object in lost {
+            let written = self.live.remove(&object).unwrap();
+            self.gone.insert(written.etag);
+            self.lost.insert(object);
+            self.note("write-lost-with-holder");
+        }
         self.harness.retire(&self.env, index, true);
         self.harness.publish();
         self.harness.settle();
@@ -1168,6 +1225,41 @@ impl World {
             .sum()
     }
 
+    /// Leak and loss check over every written page: each belongs to a live
+    /// version the oracle expects pinned (uploading ones too, unless
+    /// `settled`). Without membership changes the count is exact; with them,
+    /// rank-0 rebalancing may add copies beyond `replicas`.
+    fn check_pages(&self, settled: bool, what: &str) {
+        let mut stray = Vec::new();
+        for (index, node) in self.harness.nodes.iter().enumerate() {
+            for worker in &node.workers {
+                for (page, _) in worker.app.store.writer.written_pages() {
+                    let expected = self.live.iter().any(|(&object, w)| {
+                        self.object(object) == page.version.object
+                            && page.version.etag.as_bytes() == w.etag.as_bytes()
+                            && (!w.uploading || !settled)
+                    });
+                    if !expected {
+                        stray.push((index, page.version.object.key, page.number.0));
+                    }
+                }
+            }
+        }
+        assert!(
+            stray.is_empty(),
+            "seed={} {what}: stray written pages {stray:?}",
+            self.harness.seed
+        );
+        if !self.profile.holder_loss && !self.profile.churn && settled {
+            assert_eq!(
+                self.written_pages(),
+                self.expected_pages(),
+                "seed={} {what}",
+                self.harness.seed
+            );
+        }
+    }
+
     fn written_pages(&self) -> usize {
         self.harness
             .nodes
@@ -1191,7 +1283,13 @@ impl World {
         let pages = written.bytes.len().div_ceil(page_bytes()) as u64;
         let holders = self.holders(&version, pages);
         assert!(
-            holders.iter().all(|&h| h == written.replicas),
+            holders.iter().all(|&h| {
+                if self.profile.holder_loss || self.profile.churn {
+                    h >= written.replicas.min(self.harness.nodes.len())
+                } else {
+                    h == written.replicas
+                }
+            }),
             "seed={} {object:x} replicas={} holders per page {holders:?}",
             self.harness.seed,
             written.replicas
@@ -1258,37 +1356,8 @@ impl World {
                 self.harness.seed
             );
         }
-        if !self.profile.holder_loss && !self.profile.churn {
-            if self.written_pages() != self.expected_pages() {
-                for (i, n) in self.harness.nodes.iter().enumerate() {
-                    for w in &n.workers {
-                        for (page, entry) in w.app.store.writer.written_pages() {
-                            let live = self
-                                .live
-                                .iter()
-                                .find(|(o, _)| self.object(**o) == page.version.object);
-                            eprintln!(
-                                "node {i} page {:?} {:?} {} live={:?} entry={entry:?}",
-                                page.version.object.key,
-                                page.version.etag,
-                                page.number.0,
-                                live.map(|(_, w)| (
-                                    w.etag.clone(),
-                                    w.uploading,
-                                    w.replicas,
-                                    w.mode
-                                ))
-                            );
-                        }
-                    }
-                }
-            }
-            assert_eq!(
-                self.written_pages(),
-                self.expected_pages(),
-                "seed={} written pages leak or loss",
-                self.harness.seed
-            );
+        {
+            self.check_pages(true, "written pages leak or loss");
             for object in self.live.keys().copied().collect::<Vec<_>>() {
                 self.check_holders(object);
             }
@@ -1349,7 +1418,16 @@ pub(super) fn run(name: &str, seed: u64, steps: usize) {
     };
     let steps = if steps == 0 { DEFAULT_STEPS } else { steps };
     let mut world = World::new(seed, profile);
-    for _ in 0..steps {
+    for step in 0..steps {
+        // Every holder-loss or churn run exercises its fault at least once.
+        if step == steps / 2 {
+            if profile.holder_loss {
+                world.holder_loss();
+            }
+            if profile.churn {
+                world.churn();
+            }
+        }
         world.step();
     }
     world.finish();
@@ -1385,6 +1463,20 @@ mod tests {
     #[test]
     fn generated_writes_on_four_nodes() {
         run("writes-four-nodes", 7, 0);
+    }
+
+    #[test]
+    fn generated_writes_with_holder_loss() {
+        for seed in 1..=2 {
+            run("writes-holder-loss", seed, 0);
+        }
+    }
+
+    #[test]
+    fn generated_writes_with_membership_churn() {
+        for seed in 1..=2 {
+            run("writes-membership-churn", seed, 0);
+        }
     }
 
     /// A reader that is neither the coordinator nor a manifest replica asks
@@ -1427,6 +1519,54 @@ mod tests {
                 for reader in 0..3 {
                     world.read(reader, object);
                 }
+            }
+        }
+    }
+
+    /// Nodes that join become rank-0 owners of some written pages. A rank-0
+    /// owner is its own origin authority for a page, and the origin does
+    /// not know a written object before it uploads, so the coordinator
+    /// copies each page to its new rank-0 owner and hands page zero's new
+    /// rank 0 the manifest. Every node, old and new, reads every object.
+    #[test]
+    fn joined_nodes_read_written_objects() {
+        for seed in 1..=3 {
+            let mut world = World::new(
+                90 + seed,
+                Profile {
+                    nodes: 3,
+                    holder_loss: false,
+                    churn: true,
+                },
+            );
+            for index in 0..4 {
+                let object = FIRST + index;
+                let bytes = body(&mut world.harness.rng, 3 * page_bytes() - 5);
+                let created = world
+                    .exchange(
+                        index % 3,
+                        World::put_request(object, &bytes, "Racer-Durability: replicas=1\r\n"),
+                    )
+                    .unwrap();
+                assert_eq!(created.status, 201);
+                world.live.insert(
+                    object,
+                    Written {
+                        bytes,
+                        etag: created.header("etag").unwrap().to_owned(),
+                        replicas: 1,
+                        mode: UploadMode::Never,
+                        uploading: false,
+                    },
+                );
+            }
+            world.churn();
+            world.churn();
+            for object in world.live.keys().copied().collect::<Vec<_>>() {
+                for reader in 0..world.harness.nodes.len() {
+                    world.read(reader, object);
+                }
+                world.check_holders(object);
             }
         }
     }

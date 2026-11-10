@@ -305,6 +305,8 @@ pub const SCENARIOS: &[&str] = &[
     "concurrent-relayed-layers-opaque",
     "writes",
     "writes-four-nodes",
+    "writes-holder-loss",
+    "writes-membership-churn",
 ];
 
 /// Write scenarios [`run`] accepts that are not in [`SCENARIOS`]: they need
