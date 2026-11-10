@@ -66,7 +66,7 @@ top-level `spec.pxe` remains a deprecated fallback for existing Machines.
 | `host.netboot.image` | string | Yes | - | OCI machine image reference containing `/disk/disk.img.gz` (e.g. `"ghcr.io/azure/host-ubuntu2404:v1"`). |
 | `host.netboot.architecture` | string | No | `amd64` | Target CPU architecture for PXE boot artifacts and machine images. Allowed values: `amd64`, `arm64`. |
 | `host.netboot.netbootImage` | string | No | Metalman default | OCI netboot image reference containing PXE boot artifacts. |
-| `host.netboot.bootProtocol` | string | No | `PXE` | Network boot trigger protocol for repaves. `PXE` uses DHCP/TFTP bootfile options. `HTTP` uses Redfish UEFI HTTP boot with a URL derived from the netboot image metadata. Allowed values: `PXE`, `HTTP`. |
+| `host.netboot.bootProtocol` | string | No | `PXE` | Network boot trigger protocol for repaves. `PXE` uses DHCP/TFTP bootfile options. `HTTP` uses Redfish UEFI HTTP boot with a URL derived from the netboot image metadata. Allowed values: `PXE`, `HTTP`, `VirtualMedia`. |
 | `host.netboot.dhcpLeases` | []DHCPLease | No | - | Provisioning network settings. They are served as static DHCP leases during PXE boot and used for Redfish firmware, installer, NoCloud, and installed-system static configuration during HTTP boot. |
 | `host.netboot.dhcpLeases[].ipv4` | string | Yes | - | Static IPv4 address to assign. |
 | `host.netboot.dhcpLeases[].mac` | string | Yes | - | NIC MAC address (matched case-insensitively). |
@@ -74,6 +74,26 @@ top-level `spec.pxe` remains a deprecated fallback for existing Machines.
 | `host.netboot.dhcpLeases[].gateway` | string | Yes | - | Default gateway. |
 | `host.netboot.dhcpLeases[].dns` | []string | No | - | DNS server addresses. |
 | `host.netboot.targetDisk` | string | No | Installer-selected | Block device the installer writes the machine image to, such as `/dev/nvme0n1` or `/dev/disk/by-id/...`. When omitted, the initrd selects a disk automatically. |
+| `host.netboot.network` | HostNetworkSpec | No | - | Static host networking with bonds and VLANs, used by the installer and written to the installed OS. Requires `bootProtocol: VirtualMedia` and a `dhcpLeases` entry. See [Bonds and VLANs]({{< relref "/guides/pxe#bonds-and-vlans" >}}). |
+| `host.netboot.network.ethernets` | []EthernetSpec | Yes | - | Physical NICs, 1 to 16. |
+| `host.netboot.network.ethernets[].name` | string | Yes | - | Interface name on the host. |
+| `host.netboot.network.ethernets[].macAddress` | string | Yes | - | Lowercase MAC address used to match the NIC. |
+| `host.netboot.network.bonds` | []BondSpec | No | - | Bonds, up to 8. |
+| `host.netboot.network.bonds[].name` | string | Yes | - | Bond interface name. |
+| `host.netboot.network.bonds[].interfaces` | []string | Yes | - | Names of member `ethernets`, 1 to 8. |
+| `host.netboot.network.bonds[].mode` | string | No | `802.3ad` | `802.3ad`, `active-backup`, or `balance-xor`. |
+| `host.netboot.network.bonds[].miiMonitorInterval` | int | No | `100` | MII link check interval in milliseconds. |
+| `host.netboot.network.bonds[].transmitHashPolicy` | string | No | - | `layer2`, `layer2+3`, `layer3+4`, `encap2+3`, or `encap3+4`. Only for `802.3ad` and `balance-xor`. |
+| `host.netboot.network.bonds[].lacpRate` | string | No | - | `slow` or `fast`. Only for `802.3ad`. |
+| `host.netboot.network.vlans` | []VLANSpec | No | - | VLANs, up to 32. |
+| `host.netboot.network.vlans[].name` | string | Yes | - | VLAN interface name, such as `bond0.64`. |
+| `host.netboot.network.vlans[].id` | int | Yes | - | VLAN ID, 1 to 4094. |
+| `host.netboot.network.vlans[].link` | string | Yes | - | Name of the parent ethernet or bond. |
+| `host.netboot.network.dns` | []string | No | - | DNS servers, up to 3. |
+| `host.netboot.network.{ethernets,bonds,vlans}[].mtu` | int | No | - | MTU, 576 to 9216. |
+| `host.netboot.network.{ethernets,bonds,vlans}[].addresses` | []string | No | - | Static IPv4 addresses in CIDR form, such as `192.0.2.30/24`. |
+| `host.netboot.network.{ethernets,bonds,vlans}[].gateway` | string | No | - | Default IPv4 gateway. At most one interface may set it. |
+| `host.netboot.network.{ethernets,bonds,vlans}[].routes` | []RouteSpec | No | - | Static routes. Each has `to` (CIDR) and `via` (next hop in a subnet of this interface). |
 | `host.netboot.redfish` | RedfishSpec | No | - | BMC access via the Redfish API. |
 | `host.netboot.redfish.url` | string | Yes | - | Redfish endpoint URL. |
 | `host.netboot.redfish.username` | string | Yes | - | Redfish username. |
