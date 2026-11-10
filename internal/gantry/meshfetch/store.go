@@ -304,16 +304,27 @@ func (s *store) newFillLocked(k chunkKey) *fill {
 
 // newLocalFill returns a fill of k outside the map, with one reference
 // for the filler and one for the returned reader at offset off. It still
-// counts as a fill in progress.
-func (s *store) newLocalFill(k chunkKey, off int) (*fill, *reader) {
-	f := &fill{key: k, store: s, wake: make(chan struct{}), total: -1, upstream: noSlot, detached: true}
-	f.refs.Store(2)
-
+// counts as a fill in progress, so it returns errBusy when the fill cap
+// is reached and errClosed once the store is closed.
+func (s *store) newLocalFill(k chunkKey, off int) (*fill, *reader, error) {
 	s.mu.Lock()
+
+	switch {
+	case s.closed:
+		s.mu.Unlock()
+		return nil, nil, errClosed
+	case s.inflight >= s.cfg.maxFills:
+		s.mu.Unlock()
+		return nil, nil, errBusy
+	}
+
 	s.inflight++
 	s.mu.Unlock()
 
-	return f, f.newReader(off, true)
+	f := &fill{key: k, store: s, wake: make(chan struct{}), total: -1, upstream: noSlot, detached: true}
+	f.refs.Store(2)
+
+	return f, f.newReader(off, true), nil
 }
 
 // detachLocked removes f from the map and the memory list. Readers

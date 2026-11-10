@@ -1083,7 +1083,11 @@ func TestPeerRefusesManifestFromLocalContent(t *testing.T) {
 	}{{kindManifest, http.StatusNotFound}, {kindBlob, http.StatusOK}} {
 		req := chunkReq{registry: "reg", repo: "library/app", d: d, key: chunkKey{digest: d.String(), kind: tc.kind}}
 
-		rd := n.node.localOnly(req, 0)
+		rd, err := n.node.localOnly(req, 0)
+		if err != nil {
+			t.Fatalf("kind %d: localOnly: %v", tc.kind, err)
+		}
+
 		if (rd != nil) != (tc.kind == kindBlob) {
 			t.Fatalf("kind %d: localOnly reader=%v", tc.kind, rd != nil)
 		}

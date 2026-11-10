@@ -531,7 +531,10 @@ func (n *Node) chunkForPeer(r *http.Request, peek string, req chunkReq, off int)
 			rd.close()
 		}
 
-		if rd := n.localOnly(req, off); rd != nil {
+		if rd, err := n.localOnly(req, off); err != nil {
+			status, outcome := errStatus(err)
+			return nil, status, outcome
+		} else if rd != nil {
 			return rd, 0, ""
 		}
 
@@ -565,7 +568,10 @@ func (n *Node) chunkForPeer(r *http.Request, peek string, req chunkReq, off int)
 			return rd, 0, ""
 		}
 
-		if rd := n.localOnly(req, off); rd != nil {
+		if rd, err := n.localOnly(req, off); err != nil {
+			status, outcome := errStatus(err)
+			return nil, status, outcome
+		} else if rd != nil {
 			return rd, 0, ""
 		}
 
@@ -586,13 +592,17 @@ func (n *Node) chunkForPeer(r *http.Request, peek string, req chunkReq, off int)
 // localOnly returns a reader of the chunk read from the local content
 // store when it holds the whole chunk, else nil. The fill is outside the
 // store map, so it never joins an in-progress fill that may wait on the
-// requester.
-func (n *Node) localOnly(req chunkReq, off int) *reader {
+// requester. It counts against the fill cap and returns errBusy when the
+// cap is reached rather than waiting.
+func (n *Node) localOnly(req chunkReq, off int) (*reader, error) {
 	if _, _, ok := n.localChunk(req); !ok {
-		return nil
+		return nil, nil
 	}
 
-	f, r := n.store.newLocalFill(req.key, off)
+	f, r, err := n.store.newLocalFill(req.key, off)
+	if err != nil {
+		return nil, err
+	}
 
 	n.lookup("peer", "local")
 
@@ -603,7 +613,7 @@ func (n *Node) localOnly(req chunkReq, off int) *reader {
 		f.finish(err)
 	}()
 
-	return r
+	return r, nil
 }
 
 // ownerFill starts or joins the fill of req when this member is its owner

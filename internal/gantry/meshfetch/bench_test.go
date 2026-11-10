@@ -131,7 +131,11 @@ func benchContentStore(b *testing.B) (*DirContent, string) {
 // localReader returns a reader of a complete chunk of k whose pages are
 // all behind the window, so every page is read from the content store.
 func localReader(s *store, k chunkKey) *reader {
-	f, r := s.newLocalFill(k, 0)
+	f, r, err := s.newLocalFill(k, 0)
+	if err != nil {
+		panic(err)
+	}
+
 	_ = f.setMeta(benchChunk, "", benchChunk)
 
 	f.mu.Lock()

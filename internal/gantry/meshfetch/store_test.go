@@ -186,6 +186,39 @@ func TestStoreFillCapRefusesAndWaits(t *testing.T) {
 	}
 }
 
+// TestStoreLocalFillHonorsCap checks that fills read from the local
+// content store count against the fill cap: a peer cannot start an
+// unbounded number of them.
+func TestStoreLocalFillHonorsCap(t *testing.T) {
+	s := newTestStore(t, func(c *storeConfig) { c.maxFills = 1 })
+
+	f, r, err := s.newLocalFill(key(1), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := s.newLocalFill(key(2), 0); !errors.Is(err, errBusy) {
+		t.Fatalf("second local fill: want errBusy, got %v", err)
+	}
+
+	if _, _, err := s.acquire(context.Background(), key(3), 0, false, true); !errors.Is(err, errBusy) {
+		t.Fatalf("acquire beside a local fill: want errBusy, got %v", err)
+	}
+
+	f.finish(errors.New("done"))
+	f.release()
+	r.close()
+
+	f2, r2, err := s.newLocalFill(key(2), 0)
+	if err != nil {
+		t.Fatalf("local fill after the first ended: %v", err)
+	}
+
+	f2.finish(errors.New("done"))
+	f2.release()
+	r2.close()
+}
+
 func TestStoreFailedFillIsDroppedAndReadersSeeError(t *testing.T) {
 	s := newTestStore(t, nil)
 
