@@ -322,6 +322,9 @@ fn generated() -> Vec<(&'static str, &'static str, Vec<u8>)> {
 
     // Write journal: one record of every kind.
     out.push(("write_journal", "seed-records", write_journal_seed()));
+    let mut file = racer_core::write::journal::encode_header(0, &[0; 32]).to_vec();
+    file.extend_from_slice(&write_journal_seed());
+    out.push(("write_journal_file", "seed-journal", file));
     out
 }
 
@@ -470,6 +473,14 @@ fn seeds_decode() {
         assert!(
             used == data.len() && !records.is_empty(),
             "write_journal/{name} does not replay"
+        );
+    }
+
+    for (name, data) in seeds("write_journal_file") {
+        let opened = racer::store::journal::fold_file(&data, 0, &[0; 32]);
+        assert!(
+            opened.torn_bytes == 0 && !opened.layout_changed && data.len() > 64,
+            "write_journal_file/{name} does not replay"
         );
     }
 

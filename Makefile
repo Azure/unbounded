@@ -621,7 +621,7 @@ racer-lint: racer-purity-graph ## Check Rust formatting, workspace Clippy, and R
 	timeout --signal=TERM --kill-after=10s 600s cargo +$(RACER_RUST_TOOLCHAIN) test --locked --manifest-path cmd/racer/Cargo.toml -p racer-core --test purity
 
 FUZZ_SECONDS ?= 30
-RACER_FUZZ_TARGETS ?= http_head small_body peer_envelope control_documents store_record checkpoint write_head write_journal
+RACER_FUZZ_TARGETS ?= http_head small_body peer_envelope control_documents store_record checkpoint write_head write_journal write_journal_file
 
 .PHONY: racer-fuzz
 racer-fuzz: ## Run each Racer libFuzzer target for FUZZ_SECONDS (default 30)

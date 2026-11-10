@@ -80,3 +80,10 @@ path = "fuzz_targets/write_journal.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "write_journal_file"
+path = "fuzz_targets/write_journal_file.rs"
+test = false
+doc = false
+bench = false
