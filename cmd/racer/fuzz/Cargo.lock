@@ -965,6 +965,7 @@ dependencies = [
  "page-alloc",
  "peer-wire",
  "racer",
+ "racer-core",
  "racer-wire",
 ]
 

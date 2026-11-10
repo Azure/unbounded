@@ -215,6 +215,86 @@ fn generated() -> Vec<(&'static str, &'static str, Vec<u8>)> {
     record[..header.len()].copy_from_slice(&header);
     record[512..512 + ciphertext.len()].copy_from_slice(&ciphertext);
     out.push(("store_record", "seed-record", record));
+
+    // Write journal: one record of every kind.
+    out.push(("write_journal", "seed-records", write_journal_seed()));
+    out
+}
+
+fn write_journal_seed() -> Vec<u8> {
+    use racer_core::write::{
+        Durability, Holders, Manifest, SessionId, UploadMode, UploadState, WriteSpec, journal,
+    };
+    let etag = "\"racer-0123456789abcdef0123456789abcdef\"".to_string();
+    let spec = WriteSpec {
+        length: 10,
+        page_size: 4096,
+        content_type: Some("application/octet-stream".into()),
+        replicas: 2,
+        durability: Durability::Replicas(2),
+        upload: UploadMode::Auto,
+        hold_until_millis: 1_000,
+    };
+    let base = || ("cache".to_string(), [1u8; 32], etag.clone());
+    let (cache, key, etag) = base();
+    let records = vec![
+        journal::JournalRecord::Open {
+            cache: cache.clone(),
+            key,
+            etag: etag.clone(),
+            session: SessionId([2; 16]),
+            spec: spec.clone(),
+            lease_until_millis: 60_000,
+        },
+        journal::JournalRecord::Page {
+            cache: cache.clone(),
+            key,
+            etag: etag.clone(),
+            page: 0,
+            segment: 1,
+            generation: 2,
+            offset: 3,
+            length: 10,
+            session: SessionId([2; 16]),
+            hold_until_millis: 1_000,
+        },
+        journal::JournalRecord::Commit {
+            cache: cache.clone(),
+            key,
+            manifest: Manifest {
+                session: SessionId([2; 16]),
+                etag: etag.clone(),
+                spec,
+                holders: Holders(vec![vec![b"node-a".to_vec(), b"node-b".to_vec()]]),
+                state: UploadState::Pending,
+                blob_etag: None,
+            },
+        },
+        journal::JournalRecord::State {
+            cache: cache.clone(),
+            key,
+            etag: etag.clone(),
+            state: UploadState::Committed,
+            blob_etag: Some("\"0x8D\"".into()),
+        },
+        journal::JournalRecord::PageRelease {
+            cache: cache.clone(),
+            key,
+            etag: etag.clone(),
+            page: 0,
+        },
+        journal::JournalRecord::Abort {
+            cache: cache.clone(),
+            key,
+            etag: etag.clone(),
+        },
+        journal::JournalRecord::Delete { cache, key, etag },
+        journal::JournalRecord::Checkpoint { sequence: 1 },
+    ];
+    let mut out = Vec::new();
+    for record in &records {
+        journal::encode(record, &mut out).unwrap();
+    }
     out
 }
 
@@ -279,6 +359,25 @@ fn seeds_decode() {
     for (name, data) in seeds("store_record") {
         racer::store::parse_bytes(&data, Extent::new(0, data.len()).unwrap())
             .unwrap_or_else(|e| panic!("store_record/{name}: {e:?}"));
+    }
+
+    for (name, data) in seeds("write_journal") {
+        let (records, used) = racer_core::write::journal::replay(&data);
+        assert!(
+            used == data.len() && !records.is_empty(),
+            "write_journal/{name} does not replay"
+        );
+    }
+
+    for (name, data) in seeds("write_head") {
+        let (&control, head) = data.split_first().unwrap();
+        let page = racer_wire::object::PageSize::from_wire(4096 << (control % 13)).unwrap();
+        let (head, _) = Codec::<()>::new(64 * 1024)
+            .decode_head(head)
+            .unwrap()
+            .unwrap_or_else(|| panic!("write_head/{name} is incomplete"));
+        racer_wire::object::write::parse_write(&head, 64 * 1024, page)
+            .unwrap_or_else(|e| panic!("write_head/{name}: {e:?}"));
     }
 
     for (name, data) in seeds("http_head") {
