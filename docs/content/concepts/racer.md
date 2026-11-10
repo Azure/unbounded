@@ -295,7 +295,8 @@ Key rules:
 - **Copies, not a system of record.** Until its upload commits, a written
   object survives only while one of its copies survives. Racer does not yet
   copy pages again when a node leaves, so losing every copy before upload
-  loses the object. <!-- verify against WP8 --> Use `Racer-Durability: origin` to wait for the upload instead.
+  loses the object. Use `Racer-Durability: origin` to wait for the upload
+  instead. <!-- verify against WP8 -->
 
 See [Object writes]({{< relref "reference/racer#object-writes" >}}) and
 [Save PyTorch Checkpoints to Racer]({{< relref "guides/racer-checkpoints" >}}).
