@@ -882,6 +882,10 @@ func (s *Server) handleV2(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// The registry-root gate above only covers anonymous requests on private
+	// registries. In Racer mode the content backend additionally checks the
+	// caller's credential against this exact repository and digest upstream
+	// before serving cached content (racer.WithAccessCheck).
 	if s.contentBackend != nil {
 		contentRef := ifaces.OriginRef{Registry: upstream, Repository: repo, Digest: d, Kind: kind}
 		if kind == ifaces.KindBlob {

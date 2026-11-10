@@ -419,6 +419,7 @@ type Handler struct {
 	logger      *slog.Logger
 	diagnostics racerFailureDiagnostics
 	retry       retryPolicy
+	access      *accessChecker
 }
 
 // HandlerOption configures optional Handler behavior.
@@ -434,6 +435,18 @@ func WithRetryBudget(budget time.Duration) HandlerOption {
 // observe must be concurrency-safe and must not block.
 func WithRetryObserver(observe func(stage string)) HandlerOption {
 	return func(h *Handler) { h.retry.observe = observe }
+}
+
+// WithAccessCheck requires an upstream HEAD with the caller's exact
+// credential (or none) to succeed before Racer is consulted, because Racer
+// serves cache hits by digest without per-request authorization. Decisions are
+// cached briefly per credential hash, registry, repository, kind, and digest.
+func WithAccessCheck(head AccessHeader) HandlerOption {
+	return func(h *Handler) {
+		if head != nil {
+			h.access = newAccessChecker(head)
+		}
+	}
 }
 
 // NewHandler preserves the mirror's logging context and optional auth challenges.
@@ -484,6 +497,10 @@ func (s *Handler) ServeContent(w http.ResponseWriter, r *http.Request, ref iface
 		s.logRacerFailure(id, "request", err, -1, 0)
 		http.Error(w, "invalid Racer request", http.StatusBadRequest)
 
+		return
+	}
+
+	if s.access != nil && !s.checkAccess(w, r, id, ref) {
 		return
 	}
 
@@ -782,6 +799,46 @@ func writeRacerHeaders(w http.ResponseWriter, d digest.Digest, metadata racersdk
 	}
 
 	w.Header().Set("Gantry-Mirrored", "1")
+}
+
+// checkAccess writes the denial and returns false unless the upstream registry
+// allows the caller to read ref. 401 carries the repository's challenge so the
+// client can obtain a token and retry; transient failures return 503 so
+// containerd falls through to the upstream registry directly.
+func (s *Handler) checkAccess(w http.ResponseWriter, r *http.Request, id string, ref ifaces.OriginRef) bool {
+	d := s.access.check(r.Context(), ref)
+
+	switch d.status {
+	case http.StatusOK:
+		return true
+	case http.StatusUnauthorized:
+		challenge := d.challenge
+		if challenge == "" {
+			if auth, ok := s.auth.(repositoryAuthenticationChallenger); ok {
+				ctx, cancel := context.WithTimeout(r.Context(), authenticationChallengeTimeout)
+				if c, required, err := auth.RepositoryAuthenticationChallenge(ctx, ref); err == nil && required {
+					challenge = c
+				}
+
+				cancel()
+			}
+		}
+
+		if challenge != "" {
+			w.Header().Set("WWW-Authenticate", challenge)
+		}
+
+		http.Error(w, "authentication required", http.StatusUnauthorized)
+	case http.StatusForbidden:
+		http.Error(w, "access denied", http.StatusForbidden)
+	case http.StatusNotFound:
+		http.Error(w, "not found", http.StatusNotFound)
+	default:
+		s.logRacerFailure(id, "access_check", errors.New("upstream access check unavailable"), -1, 0)
+		http.Error(w, "upstream access check unavailable", http.StatusServiceUnavailable)
+	}
+
+	return false
 }
 
 func (s *Handler) racerError(w http.ResponseWriter, r *http.Request, ref ifaces.OriginRef, err error) {
