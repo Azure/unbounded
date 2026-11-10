@@ -509,6 +509,310 @@ spec:
                         - name
                         - namespace
                         type: object
+                      network:
+                        description: |-
+                          Network declares the host's static network topology: physical
+                          ethernets identified by MAC address, bonds, and VLANs. The installer
+                          brings it up before fetching install instructions and persists it as
+                          netplan or systemd-networkd configuration on the installed host.
+                          It requires the VirtualMedia boot protocol: metalman then boots the
+                          installer from the bootstrap ISO without network access, so links that
+                          only pass traffic once LACP negotiates (no switch fallback) still work.
+                          The first DHCPLeases entry remains the provisioning identity: its IPv4
+                          address and gateway must be configured on exactly one declared
+                          interface, and its MAC must be one of the declared ethernets.
+                          When omitted, metalman keeps the single-NIC behavior driven by
+                          DHCPLeases.
+                        properties:
+                          bonds:
+                            description: Bonds declares link aggregation interfaces
+                              built from ethernets.
+                            items:
+                              description: BondSpec declares a link aggregation interface.
+                              properties:
+                                addresses:
+                                  description: |-
+                                    Addresses lists static IPv4 addresses in CIDR notation, for example
+                                    192.0.2.10/24.
+                                  items:
+                                    maxLength: 18
+                                    type: string
+                                  maxItems: 8
+                                  type: array
+                                gateway:
+                                  description: |-
+                                    Gateway is the IPv4 default gateway reachable through this interface.
+                                    At most one interface in the host network may set it.
+                                  maxLength: 15
+                                  type: string
+                                interfaces:
+                                  description: Interfaces lists the names of the ethernets
+                                    aggregated by this bond.
+                                  items:
+                                    maxLength: 15
+                                    type: string
+                                  maxItems: 8
+                                  minItems: 1
+                                  type: array
+                                  x-kubernetes-list-type: set
+                                lacpRate:
+                                  description: |-
+                                    LACPRate is the LACPDU transmit rate requested from the link partner in
+                                    802.3ad mode.
+                                  enum:
+                                  - slow
+                                  - fast
+                                  type: string
+                                miiMonitorInterval:
+                                  default: 100
+                                  description: MIIMonitorInterval is the link monitoring
+                                    interval in milliseconds.
+                                  format: int32
+                                  maximum: 10000
+                                  minimum: 0
+                                  type: integer
+                                mode:
+                                  default: 802.3ad
+                                  description: Mode is the bonding mode.
+                                  enum:
+                                  - 802.3ad
+                                  - active-backup
+                                  - balance-xor
+                                  type: string
+                                mtu:
+                                  description: |-
+                                    MTU is the interface MTU in bytes. When omitted, the kernel default is
+                                    used.
+                                  format: int32
+                                  maximum: 9216
+                                  minimum: 576
+                                  type: integer
+                                name:
+                                  description: Name is the bond interface name, for
+                                    example bond0.
+                                  pattern: ^[a-zA-Z][a-zA-Z0-9_-]{0,14}$
+                                  type: string
+                                routes:
+                                  description: Routes lists static IPv4 routes through
+                                    this interface.
+                                  items:
+                                    description: RouteSpec declares a static IPv4
+                                      route.
+                                    properties:
+                                      to:
+                                        description: |-
+                                          To is the destination prefix in CIDR notation, for example
+                                          198.51.100.0/24.
+                                        maxLength: 18
+                                        type: string
+                                      via:
+                                        description: Via is the IPv4 next-hop address.
+                                        maxLength: 15
+                                        type: string
+                                    required:
+                                    - to
+                                    - via
+                                    type: object
+                                  maxItems: 32
+                                  type: array
+                                transmitHashPolicy:
+                                  description: |-
+                                    TransmitHashPolicy selects the member used to transmit each flow in
+                                    802.3ad and balance-xor modes.
+                                  enum:
+                                  - layer2
+                                  - layer2+3
+                                  - layer3+4
+                                  - encap2+3
+                                  - encap3+4
+                                  type: string
+                              required:
+                              - interfaces
+                              - name
+                              type: object
+                              x-kubernetes-validations:
+                              - message: lacpRate requires mode 802.3ad
+                                rule: '!has(self.lacpRate) || self.mode == ''802.3ad'''
+                            maxItems: 8
+                            type: array
+                            x-kubernetes-list-map-keys:
+                            - name
+                            x-kubernetes-list-type: map
+                          dns:
+                            description: DNS is the list of IPv4 nameserver addresses
+                              for the host.
+                            items:
+                              maxLength: 15
+                              type: string
+                            maxItems: 3
+                            type: array
+                          ethernets:
+                            description: |-
+                              Ethernets declares the physical network interfaces, matched by their
+                              permanent MAC addresses.
+                            items:
+                              description: EthernetSpec declares a physical network
+                                interface.
+                              properties:
+                                addresses:
+                                  description: |-
+                                    Addresses lists static IPv4 addresses in CIDR notation, for example
+                                    192.0.2.10/24.
+                                  items:
+                                    maxLength: 18
+                                    type: string
+                                  maxItems: 8
+                                  type: array
+                                gateway:
+                                  description: |-
+                                    Gateway is the IPv4 default gateway reachable through this interface.
+                                    At most one interface in the host network may set it.
+                                  maxLength: 15
+                                  type: string
+                                macAddress:
+                                  description: |-
+                                    MACAddress is the permanent MAC address of the physical interface, as
+                                    lowercase colon-separated hex (aa:bb:cc:dd:ee:ff).
+                                  pattern: ^([0-9a-f]{2}:){5}[0-9a-f]{2}$
+                                  type: string
+                                mtu:
+                                  description: |-
+                                    MTU is the interface MTU in bytes. When omitted, the kernel default is
+                                    used.
+                                  format: int32
+                                  maximum: 9216
+                                  minimum: 576
+                                  type: integer
+                                name:
+                                  description: |-
+                                    Name is the interface name persisted on the installed host, for example
+                                    enp1s0f0. Metalman matches the device by MACAddress and does not rely
+                                    on the kernel's naming during installation.
+                                  pattern: ^[a-zA-Z][a-zA-Z0-9_-]{0,14}$
+                                  type: string
+                                routes:
+                                  description: Routes lists static IPv4 routes through
+                                    this interface.
+                                  items:
+                                    description: RouteSpec declares a static IPv4
+                                      route.
+                                    properties:
+                                      to:
+                                        description: |-
+                                          To is the destination prefix in CIDR notation, for example
+                                          198.51.100.0/24.
+                                        maxLength: 18
+                                        type: string
+                                      via:
+                                        description: Via is the IPv4 next-hop address.
+                                        maxLength: 15
+                                        type: string
+                                    required:
+                                    - to
+                                    - via
+                                    type: object
+                                  maxItems: 32
+                                  type: array
+                              required:
+                              - macAddress
+                              - name
+                              type: object
+                            maxItems: 16
+                            minItems: 1
+                            type: array
+                            x-kubernetes-list-map-keys:
+                            - name
+                            x-kubernetes-list-type: map
+                          vlans:
+                            description: VLANs declares 802.1Q VLAN interfaces on
+                              top of ethernets or bonds.
+                            items:
+                              description: VLANSpec declares an 802.1Q VLAN interface.
+                              properties:
+                                addresses:
+                                  description: |-
+                                    Addresses lists static IPv4 addresses in CIDR notation, for example
+                                    192.0.2.10/24.
+                                  items:
+                                    maxLength: 18
+                                    type: string
+                                  maxItems: 8
+                                  type: array
+                                gateway:
+                                  description: |-
+                                    Gateway is the IPv4 default gateway reachable through this interface.
+                                    At most one interface in the host network may set it.
+                                  maxLength: 15
+                                  type: string
+                                id:
+                                  description: ID is the 802.1Q VLAN identifier.
+                                  format: int32
+                                  maximum: 4094
+                                  minimum: 1
+                                  type: integer
+                                link:
+                                  description: Link is the name of the ethernet or
+                                    bond carrying the VLAN.
+                                  maxLength: 15
+                                  type: string
+                                mtu:
+                                  description: |-
+                                    MTU is the interface MTU in bytes. When omitted, the kernel default is
+                                    used.
+                                  format: int32
+                                  maximum: 9216
+                                  minimum: 576
+                                  type: integer
+                                name:
+                                  description: Name is the VLAN interface name, for
+                                    example bond0.64.
+                                  pattern: ^[a-zA-Z][a-zA-Z0-9_.-]{0,14}$
+                                  type: string
+                                routes:
+                                  description: Routes lists static IPv4 routes through
+                                    this interface.
+                                  items:
+                                    description: RouteSpec declares a static IPv4
+                                      route.
+                                    properties:
+                                      to:
+                                        description: |-
+                                          To is the destination prefix in CIDR notation, for example
+                                          198.51.100.0/24.
+                                        maxLength: 18
+                                        type: string
+                                      via:
+                                        description: Via is the IPv4 next-hop address.
+                                        maxLength: 15
+                                        type: string
+                                    required:
+                                    - to
+                                    - via
+                                    type: object
+                                  maxItems: 32
+                                  type: array
+                              required:
+                              - id
+                              - link
+                              - name
+                              type: object
+                            maxItems: 32
+                            type: array
+                            x-kubernetes-list-map-keys:
+                            - name
+                            x-kubernetes-list-type: map
+                        required:
+                        - ethernets
+                        type: object
+                        x-kubernetes-validations:
+                        - message: bond interfaces must reference declared ethernets
+                          rule: '!has(self.bonds) || self.bonds.all(b, b.interfaces.all(i,
+                            self.ethernets.exists(e, e.name == i)))'
+                        - message: vlan link must reference a declared ethernet or
+                            bond
+                          rule: '!has(self.vlans) || self.vlans.all(v, self.ethernets.exists(e,
+                            e.name == v.link) || (has(self.bonds) && self.bonds.exists(b,
+                            b.name == v.link)))'
                       pullSecretRef:
                         description: |-
                           PullSecretRef references a Docker registry credential Secret used to pull
@@ -581,6 +885,13 @@ spec:
                     - message: VirtualMedia requires redfish
                       rule: '!has(self.bootProtocol) || self.bootProtocol != ''VirtualMedia''
                         || has(self.redfish)'
+                    - message: network requires bootProtocol VirtualMedia
+                      rule: '!has(self.network) || (has(self.bootProtocol) && self.bootProtocol
+                        == ''VirtualMedia'')'
+                    - message: network requires a dhcpLeases entry for the provisioning
+                        address
+                      rule: '!has(self.network) || (has(self.dhcpLeases) && size(self.dhcpLeases)
+                        > 0)'
                   provisioningFormat:
                     description: |-
                       ProvisioningFormat declares the first-boot format for the desired host
@@ -803,6 +1114,305 @@ spec:
                     - name
                     - namespace
                     type: object
+                  network:
+                    description: |-
+                      Network declares the host's static network topology: physical
+                      ethernets identified by MAC address, bonds, and VLANs. The installer
+                      brings it up before fetching install instructions and persists it as
+                      netplan or systemd-networkd configuration on the installed host.
+                      It requires the VirtualMedia boot protocol: metalman then boots the
+                      installer from the bootstrap ISO without network access, so links that
+                      only pass traffic once LACP negotiates (no switch fallback) still work.
+                      The first DHCPLeases entry remains the provisioning identity: its IPv4
+                      address and gateway must be configured on exactly one declared
+                      interface, and its MAC must be one of the declared ethernets.
+                      When omitted, metalman keeps the single-NIC behavior driven by
+                      DHCPLeases.
+                    properties:
+                      bonds:
+                        description: Bonds declares link aggregation interfaces built
+                          from ethernets.
+                        items:
+                          description: BondSpec declares a link aggregation interface.
+                          properties:
+                            addresses:
+                              description: |-
+                                Addresses lists static IPv4 addresses in CIDR notation, for example
+                                192.0.2.10/24.
+                              items:
+                                maxLength: 18
+                                type: string
+                              maxItems: 8
+                              type: array
+                            gateway:
+                              description: |-
+                                Gateway is the IPv4 default gateway reachable through this interface.
+                                At most one interface in the host network may set it.
+                              maxLength: 15
+                              type: string
+                            interfaces:
+                              description: Interfaces lists the names of the ethernets
+                                aggregated by this bond.
+                              items:
+                                maxLength: 15
+                                type: string
+                              maxItems: 8
+                              minItems: 1
+                              type: array
+                              x-kubernetes-list-type: set
+                            lacpRate:
+                              description: |-
+                                LACPRate is the LACPDU transmit rate requested from the link partner in
+                                802.3ad mode.
+                              enum:
+                              - slow
+                              - fast
+                              type: string
+                            miiMonitorInterval:
+                              default: 100
+                              description: MIIMonitorInterval is the link monitoring
+                                interval in milliseconds.
+                              format: int32
+                              maximum: 10000
+                              minimum: 0
+                              type: integer
+                            mode:
+                              default: 802.3ad
+                              description: Mode is the bonding mode.
+                              enum:
+                              - 802.3ad
+                              - active-backup
+                              - balance-xor
+                              type: string
+                            mtu:
+                              description: |-
+                                MTU is the interface MTU in bytes. When omitted, the kernel default is
+                                used.
+                              format: int32
+                              maximum: 9216
+                              minimum: 576
+                              type: integer
+                            name:
+                              description: Name is the bond interface name, for example
+                                bond0.
+                              pattern: ^[a-zA-Z][a-zA-Z0-9_-]{0,14}$
+                              type: string
+                            routes:
+                              description: Routes lists static IPv4 routes through
+                                this interface.
+                              items:
+                                description: RouteSpec declares a static IPv4 route.
+                                properties:
+                                  to:
+                                    description: |-
+                                      To is the destination prefix in CIDR notation, for example
+                                      198.51.100.0/24.
+                                    maxLength: 18
+                                    type: string
+                                  via:
+                                    description: Via is the IPv4 next-hop address.
+                                    maxLength: 15
+                                    type: string
+                                required:
+                                - to
+                                - via
+                                type: object
+                              maxItems: 32
+                              type: array
+                            transmitHashPolicy:
+                              description: |-
+                                TransmitHashPolicy selects the member used to transmit each flow in
+                                802.3ad and balance-xor modes.
+                              enum:
+                              - layer2
+                              - layer2+3
+                              - layer3+4
+                              - encap2+3
+                              - encap3+4
+                              type: string
+                          required:
+                          - interfaces
+                          - name
+                          type: object
+                          x-kubernetes-validations:
+                          - message: lacpRate requires mode 802.3ad
+                            rule: '!has(self.lacpRate) || self.mode == ''802.3ad'''
+                        maxItems: 8
+                        type: array
+                        x-kubernetes-list-map-keys:
+                        - name
+                        x-kubernetes-list-type: map
+                      dns:
+                        description: DNS is the list of IPv4 nameserver addresses
+                          for the host.
+                        items:
+                          maxLength: 15
+                          type: string
+                        maxItems: 3
+                        type: array
+                      ethernets:
+                        description: |-
+                          Ethernets declares the physical network interfaces, matched by their
+                          permanent MAC addresses.
+                        items:
+                          description: EthernetSpec declares a physical network interface.
+                          properties:
+                            addresses:
+                              description: |-
+                                Addresses lists static IPv4 addresses in CIDR notation, for example
+                                192.0.2.10/24.
+                              items:
+                                maxLength: 18
+                                type: string
+                              maxItems: 8
+                              type: array
+                            gateway:
+                              description: |-
+                                Gateway is the IPv4 default gateway reachable through this interface.
+                                At most one interface in the host network may set it.
+                              maxLength: 15
+                              type: string
+                            macAddress:
+                              description: |-
+                                MACAddress is the permanent MAC address of the physical interface, as
+                                lowercase colon-separated hex (aa:bb:cc:dd:ee:ff).
+                              pattern: ^([0-9a-f]{2}:){5}[0-9a-f]{2}$
+                              type: string
+                            mtu:
+                              description: |-
+                                MTU is the interface MTU in bytes. When omitted, the kernel default is
+                                used.
+                              format: int32
+                              maximum: 9216
+                              minimum: 576
+                              type: integer
+                            name:
+                              description: |-
+                                Name is the interface name persisted on the installed host, for example
+                                enp1s0f0. Metalman matches the device by MACAddress and does not rely
+                                on the kernel's naming during installation.
+                              pattern: ^[a-zA-Z][a-zA-Z0-9_-]{0,14}$
+                              type: string
+                            routes:
+                              description: Routes lists static IPv4 routes through
+                                this interface.
+                              items:
+                                description: RouteSpec declares a static IPv4 route.
+                                properties:
+                                  to:
+                                    description: |-
+                                      To is the destination prefix in CIDR notation, for example
+                                      198.51.100.0/24.
+                                    maxLength: 18
+                                    type: string
+                                  via:
+                                    description: Via is the IPv4 next-hop address.
+                                    maxLength: 15
+                                    type: string
+                                required:
+                                - to
+                                - via
+                                type: object
+                              maxItems: 32
+                              type: array
+                          required:
+                          - macAddress
+                          - name
+                          type: object
+                        maxItems: 16
+                        minItems: 1
+                        type: array
+                        x-kubernetes-list-map-keys:
+                        - name
+                        x-kubernetes-list-type: map
+                      vlans:
+                        description: VLANs declares 802.1Q VLAN interfaces on top
+                          of ethernets or bonds.
+                        items:
+                          description: VLANSpec declares an 802.1Q VLAN interface.
+                          properties:
+                            addresses:
+                              description: |-
+                                Addresses lists static IPv4 addresses in CIDR notation, for example
+                                192.0.2.10/24.
+                              items:
+                                maxLength: 18
+                                type: string
+                              maxItems: 8
+                              type: array
+                            gateway:
+                              description: |-
+                                Gateway is the IPv4 default gateway reachable through this interface.
+                                At most one interface in the host network may set it.
+                              maxLength: 15
+                              type: string
+                            id:
+                              description: ID is the 802.1Q VLAN identifier.
+                              format: int32
+                              maximum: 4094
+                              minimum: 1
+                              type: integer
+                            link:
+                              description: Link is the name of the ethernet or bond
+                                carrying the VLAN.
+                              maxLength: 15
+                              type: string
+                            mtu:
+                              description: |-
+                                MTU is the interface MTU in bytes. When omitted, the kernel default is
+                                used.
+                              format: int32
+                              maximum: 9216
+                              minimum: 576
+                              type: integer
+                            name:
+                              description: Name is the VLAN interface name, for example
+                                bond0.64.
+                              pattern: ^[a-zA-Z][a-zA-Z0-9_.-]{0,14}$
+                              type: string
+                            routes:
+                              description: Routes lists static IPv4 routes through
+                                this interface.
+                              items:
+                                description: RouteSpec declares a static IPv4 route.
+                                properties:
+                                  to:
+                                    description: |-
+                                      To is the destination prefix in CIDR notation, for example
+                                      198.51.100.0/24.
+                                    maxLength: 18
+                                    type: string
+                                  via:
+                                    description: Via is the IPv4 next-hop address.
+                                    maxLength: 15
+                                    type: string
+                                required:
+                                - to
+                                - via
+                                type: object
+                              maxItems: 32
+                              type: array
+                          required:
+                          - id
+                          - link
+                          - name
+                          type: object
+                        maxItems: 32
+                        type: array
+                        x-kubernetes-list-map-keys:
+                        - name
+                        x-kubernetes-list-type: map
+                    required:
+                    - ethernets
+                    type: object
+                    x-kubernetes-validations:
+                    - message: bond interfaces must reference declared ethernets
+                      rule: '!has(self.bonds) || self.bonds.all(b, b.interfaces.all(i,
+                        self.ethernets.exists(e, e.name == i)))'
+                    - message: vlan link must reference a declared ethernet or bond
+                      rule: '!has(self.vlans) || self.vlans.all(v, self.ethernets.exists(e,
+                        e.name == v.link) || (has(self.bonds) && self.bonds.exists(b,
+                        b.name == v.link)))'
                   pullSecretRef:
                     description: |-
                       PullSecretRef references a Docker registry credential Secret used to pull
@@ -875,6 +1485,13 @@ spec:
                 - message: VirtualMedia requires redfish
                   rule: '!has(self.bootProtocol) || self.bootProtocol != ''VirtualMedia''
                     || has(self.redfish)'
+                - message: network requires bootProtocol VirtualMedia
+                  rule: '!has(self.network) || (has(self.bootProtocol) && self.bootProtocol
+                    == ''VirtualMedia'')'
+                - message: network requires a dhcpLeases entry for the provisioning
+                    address
+                  rule: '!has(self.network) || (has(self.dhcpLeases) && size(self.dhcpLeases)
+                    > 0)'
               ssh:
                 description: |-
                   SSH contains the SSH connection and credential details for the

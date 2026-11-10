@@ -438,6 +438,8 @@ type RedfishSpec struct {
 
 // PXESpec defines PXE boot configuration for a Machine.
 // +kubebuilder:validation:XValidation:rule="!has(self.bootProtocol) || self.bootProtocol != 'VirtualMedia' || has(self.redfish)",message="VirtualMedia requires redfish"
+// +kubebuilder:validation:XValidation:rule="!has(self.network) || (has(self.bootProtocol) && self.bootProtocol == 'VirtualMedia')",message="network requires bootProtocol VirtualMedia"
+// +kubebuilder:validation:XValidation:rule="!has(self.network) || (has(self.dhcpLeases) && size(self.dhcpLeases) > 0)",message="network requires a dhcpLeases entry for the provisioning address"
 type PXESpec struct {
 	// Image is an OCI image reference containing the machine disk image.
 	// The image must contain /disk/disk.img.gz.
@@ -505,6 +507,179 @@ type PXESpec struct {
 	// machines.
 	// +optional
 	CloudInit *CloudInitSpec `json:"cloudInit,omitempty"`
+
+	// Network declares the host's static network topology: physical
+	// ethernets identified by MAC address, bonds, and VLANs. The installer
+	// brings it up before fetching install instructions and persists it as
+	// netplan or systemd-networkd configuration on the installed host.
+	// It requires the VirtualMedia boot protocol: metalman then boots the
+	// installer from the bootstrap ISO without network access, so links that
+	// only pass traffic once LACP negotiates (no switch fallback) still work.
+	// The first DHCPLeases entry remains the provisioning identity: its IPv4
+	// address and gateway must be configured on exactly one declared
+	// interface, and its MAC must be one of the declared ethernets.
+	// When omitted, metalman keeps the single-NIC behavior driven by
+	// DHCPLeases.
+	// +optional
+	Network *HostNetworkSpec `json:"network,omitempty"`
+}
+
+// HostNetworkSpec declares a static host network topology.
+// +kubebuilder:validation:XValidation:rule="!has(self.bonds) || self.bonds.all(b, b.interfaces.all(i, self.ethernets.exists(e, e.name == i)))",message="bond interfaces must reference declared ethernets"
+// +kubebuilder:validation:XValidation:rule="!has(self.vlans) || self.vlans.all(v, self.ethernets.exists(e, e.name == v.link) || (has(self.bonds) && self.bonds.exists(b, b.name == v.link)))",message="vlan link must reference a declared ethernet or bond"
+type HostNetworkSpec struct {
+	// Ethernets declares the physical network interfaces, matched by their
+	// permanent MAC addresses.
+	// +listType=map
+	// +listMapKey=name
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=16
+	Ethernets []EthernetSpec `json:"ethernets"`
+
+	// Bonds declares link aggregation interfaces built from ethernets.
+	// +listType=map
+	// +listMapKey=name
+	// +kubebuilder:validation:MaxItems=8
+	// +optional
+	Bonds []BondSpec `json:"bonds,omitempty"`
+
+	// VLANs declares 802.1Q VLAN interfaces on top of ethernets or bonds.
+	// +listType=map
+	// +listMapKey=name
+	// +kubebuilder:validation:MaxItems=32
+	// +optional
+	VLANs []VLANSpec `json:"vlans,omitempty"`
+
+	// DNS is the list of IPv4 nameserver addresses for the host.
+	// +kubebuilder:validation:MaxItems=3
+	// +kubebuilder:validation:items:MaxLength=15
+	// +optional
+	DNS []string `json:"dns,omitempty"`
+}
+
+// InterfaceAddressing holds the static IPv4 configuration of an interface.
+type InterfaceAddressing struct {
+	// MTU is the interface MTU in bytes. When omitted, the kernel default is
+	// used.
+	// +kubebuilder:validation:Minimum=576
+	// +kubebuilder:validation:Maximum=9216
+	// +optional
+	MTU *int32 `json:"mtu,omitempty"`
+
+	// Addresses lists static IPv4 addresses in CIDR notation, for example
+	// 192.0.2.10/24.
+	// +kubebuilder:validation:MaxItems=8
+	// +kubebuilder:validation:items:MaxLength=18
+	// +optional
+	Addresses []string `json:"addresses,omitempty"`
+
+	// Gateway is the IPv4 default gateway reachable through this interface.
+	// At most one interface in the host network may set it.
+	// +kubebuilder:validation:MaxLength=15
+	// +optional
+	Gateway string `json:"gateway,omitempty"`
+
+	// Routes lists static IPv4 routes through this interface.
+	// +kubebuilder:validation:MaxItems=32
+	// +optional
+	Routes []RouteSpec `json:"routes,omitempty"`
+}
+
+// RouteSpec declares a static IPv4 route.
+type RouteSpec struct {
+	// To is the destination prefix in CIDR notation, for example
+	// 198.51.100.0/24.
+	// +kubebuilder:validation:MaxLength=18
+	To string `json:"to"`
+
+	// Via is the IPv4 next-hop address.
+	// +kubebuilder:validation:MaxLength=15
+	Via string `json:"via"`
+}
+
+// EthernetSpec declares a physical network interface.
+type EthernetSpec struct {
+	// Name is the interface name persisted on the installed host, for example
+	// enp1s0f0. Metalman matches the device by MACAddress and does not rely
+	// on the kernel's naming during installation.
+	// +kubebuilder:validation:Pattern=`^[a-zA-Z][a-zA-Z0-9_-]{0,14}$`
+	Name string `json:"name"`
+
+	// MACAddress is the permanent MAC address of the physical interface, as
+	// lowercase colon-separated hex (aa:bb:cc:dd:ee:ff).
+	// +kubebuilder:validation:Pattern=`^([0-9a-f]{2}:){5}[0-9a-f]{2}$`
+	MACAddress string `json:"macAddress"`
+
+	InterfaceAddressing `json:",inline"`
+}
+
+const (
+	// BondMode8023AD is IEEE 802.3ad dynamic link aggregation (LACP).
+	BondMode8023AD = "802.3ad"
+	// BondModeActiveBackup keeps one member active at a time.
+	BondModeActiveBackup = "active-backup"
+	// BondModeBalanceXOR balances traffic by the transmit hash policy.
+	BondModeBalanceXOR = "balance-xor"
+)
+
+// BondSpec declares a link aggregation interface.
+// +kubebuilder:validation:XValidation:rule="!has(self.lacpRate) || self.mode == '802.3ad'",message="lacpRate requires mode 802.3ad"
+type BondSpec struct {
+	// Name is the bond interface name, for example bond0.
+	// +kubebuilder:validation:Pattern=`^[a-zA-Z][a-zA-Z0-9_-]{0,14}$`
+	Name string `json:"name"`
+
+	// Interfaces lists the names of the ethernets aggregated by this bond.
+	// +listType=set
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=8
+	// +kubebuilder:validation:items:MaxLength=15
+	Interfaces []string `json:"interfaces"`
+
+	// Mode is the bonding mode.
+	// +kubebuilder:validation:Enum="802.3ad";active-backup;balance-xor
+	// +kubebuilder:default="802.3ad"
+	// +optional
+	Mode string `json:"mode,omitempty"`
+
+	// MIIMonitorInterval is the link monitoring interval in milliseconds.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=10000
+	// +kubebuilder:default=100
+	// +optional
+	MIIMonitorInterval *int32 `json:"miiMonitorInterval,omitempty"`
+
+	// TransmitHashPolicy selects the member used to transmit each flow in
+	// 802.3ad and balance-xor modes.
+	// +kubebuilder:validation:Enum=layer2;layer2+3;layer3+4;encap2+3;encap3+4
+	// +optional
+	TransmitHashPolicy string `json:"transmitHashPolicy,omitempty"`
+
+	// LACPRate is the LACPDU transmit rate requested from the link partner in
+	// 802.3ad mode.
+	// +kubebuilder:validation:Enum=slow;fast
+	// +optional
+	LACPRate string `json:"lacpRate,omitempty"`
+
+	InterfaceAddressing `json:",inline"`
+}
+
+// VLANSpec declares an 802.1Q VLAN interface.
+type VLANSpec struct {
+	// Name is the VLAN interface name, for example bond0.64.
+	// +kubebuilder:validation:Pattern=`^[a-zA-Z][a-zA-Z0-9_.-]{0,14}$`
+	Name string `json:"name"`
+
+	// ID is the 802.1Q VLAN identifier.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=4094
+	ID int32 `json:"id"`
+
+	// Link is the name of the ethernet or bond carrying the VLAN.
+	// +kubebuilder:validation:MaxLength=15
+	Link string `json:"link"`
+
+	InterfaceAddressing `json:",inline"`
 }
 
 const (
