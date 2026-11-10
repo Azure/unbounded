@@ -293,10 +293,11 @@ Key rules:
   space with no upload cost. Cache-only checkpoints are removed when their hold
   time ends.
 - **Copies, not a system of record.** Until its upload commits, a written
-  object survives only while one of its copies survives. Racer does not yet
-  copy pages again when a node leaves, so losing every copy before upload
-  loses the object. Use `Racer-Durability: origin` to wait for the upload
-  instead. <!-- verify against WP8 -->
+  object survives only while one of its copies survives. When a node holding
+  a copy leaves, the coordinator copies its pages from a surviving copy to
+  another node. Losing every copy of a page before that repair or the upload
+  finishes loses the object, and it is marked `failed`. Use
+  `Racer-Durability: origin` to wait for the upload instead.
 
 See [Object writes]({{< relref "reference/racer#object-writes" >}}) and
 [Save PyTorch Checkpoints to Racer]({{< relref "guides/racer-checkpoints" >}}).

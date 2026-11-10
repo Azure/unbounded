@@ -1350,7 +1350,7 @@ appears only after the cache sees write activity.
 | `racer_write_fsync_seconds` | Durability barrier latency on page stores and coordinator journal appends (histogram, no labels) |
 | `racer_write_upload_bytes_total{cache}` | Bytes uploaded to the origin |
 | `racer_write_upload_state{cache,state}` | Written objects by upload state |
-| `racer_write_repairs_total{cache}` | Pages copied again after a node loss. Stays `0` until repair is built. <!-- verify against WP8 --> |
+| `racer_write_repairs_total{cache}` | Pages copied again after a node holding a copy left the cache's pool. |
 
 ### Spill holds
 
