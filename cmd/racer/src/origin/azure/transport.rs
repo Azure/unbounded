@@ -288,6 +288,48 @@ impl AzureTransport for PoolTransport {
             })
         })
     }
+
+    /// Send `head` then `body` (its `Content-Length`). The body is copied into
+    /// admitted request-context storage for the write. A failure is never
+    /// retried here: the request may have reached the service, so the caller
+    /// decides (Put Block and conditional Put Block List are safe to repeat).
+    fn exchange_body<'a>(
+        &'a self,
+        url: &'a AzureContainerUrl,
+        head: MessageHead,
+        body: &'a [u8],
+        scope: &'a RequestScope,
+    ) -> Operation<'a, PoolExchange> {
+        Box::pin(async move {
+            scope.check()?;
+            let Endpoint::Remote(remote) = self.endpoint(url)? else {
+                return Err(Error::Internal);
+            };
+            remote.resolve(&*self.resolver, scope).await?;
+            let sequence = remote.address_sequence();
+            let endpoint = Endpoint::Remote(sequence.clone());
+            let lease = self
+                .checkout(&remote, &sequence, &endpoint, false, scope)
+                .await?;
+            let sent = self.io.send_head(lease, head, scope).await?;
+            let mut lease = sent.connection;
+            if !body.is_empty() {
+                lease = self.io.write_body_bytes(lease, body, scope).await?.lease;
+            }
+            let started = std::cell::Cell::new(false);
+            let response = self
+                .io
+                .receive_head_observed(lease, scope, MAX_RESPONSE_HEAD, &started)
+                .await?;
+            Ok(PoolExchange {
+                head: response.value,
+                lease: response.connection,
+                _decoded: response._decoded,
+                io: self.io.clone(),
+                is_head: false,
+            })
+        })
+    }
 }
 
 /// One pooled response.

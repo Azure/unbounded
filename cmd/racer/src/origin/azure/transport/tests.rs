@@ -910,3 +910,176 @@ fn reused_connection_closed_before_response_retries_on_fresh_connection() {
     drop(f);
     server.join().unwrap();
 }
+
+/// Staged and committed blocks for the upload fake.
+#[derive(Default)]
+struct Uploads {
+    staged: std::collections::HashMap<(String, String), Vec<u8>>,
+    committed: std::collections::HashMap<String, Vec<u8>>,
+    etags: u32,
+}
+
+/// A faithful-enough Put Block and Put Block List for `/account/models`.
+/// `forbidden` fails with 403; `busy` answers 503 once, then works.
+fn azure_upload(head: &str, body: &[u8], state: &Mutex<Uploads>, busy: &Mutex<bool>) -> Vec<u8> {
+    use base64::Engine;
+    let target = head.split(' ').nth(1).unwrap();
+    assert!(head.starts_with("PUT "));
+    assert_eq!(header(head, "x-ms-version"), Some("2026-12-06"));
+    assert!(header(head, "x-ms-date").is_some());
+    assert_eq!(
+        header(head, "Content-Length")
+            .unwrap()
+            .parse::<usize>()
+            .unwrap(),
+        body.len()
+    );
+    let (path, query) = target.split_once('?').unwrap();
+    let key = path.strip_prefix("/account/models/").unwrap().to_owned();
+    if key == "forbidden" {
+        return b"HTTP/1.1 403 Forbidden\r\nx-ms-error-code: AuthorizationPermissionMismatch\r\nContent-Length: 0\r\n\r\n"
+            .to_vec();
+    }
+    if key == "busy" && std::mem::replace(&mut *busy.lock().unwrap(), false) {
+        return b"HTTP/1.1 503 Busy\r\nx-ms-error-code: ServerBusy\r\nContent-Length: 0\r\n\r\n"
+            .to_vec();
+    }
+    let crc = header(head, "x-ms-content-crc64").unwrap();
+    let expected = base64::engine::general_purpose::STANDARD
+        .encode(crate::origin::azure::crc64::checksum(body).to_le_bytes());
+    if crc != expected {
+        return b"HTTP/1.1 400 Bad\r\nx-ms-error-code: Crc64Mismatch\r\nContent-Length: 0\r\n\r\n"
+            .to_vec();
+    }
+    let mut state = state.lock().unwrap();
+    if let Some(id) = query.strip_prefix("comp=block&blockid=") {
+        let id = id
+            .replace("%2B", "+")
+            .replace("%2F", "/")
+            .replace("%3D", "=");
+        assert_eq!(id.len(), 64);
+        state.staged.insert((key, id), body.to_vec());
+        return format!(
+            "HTTP/1.1 201 Created\r\nx-ms-content-crc64: {expected}\r\nContent-Length: 0\r\n\r\n"
+        )
+        .into_bytes();
+    }
+    assert_eq!(query, "comp=blocklist");
+    assert_eq!(header(head, "If-None-Match"), Some("*"));
+    if state.committed.contains_key(&key) {
+        return b"HTTP/1.1 409 Conflict\r\nx-ms-error-code: BlobAlreadyExists\r\nContent-Length: 0\r\n\r\n"
+            .to_vec();
+    }
+    let xml = std::str::from_utf8(body).unwrap();
+    let mut data = Vec::new();
+    for part in xml.split("<Latest>").skip(1) {
+        let id = part.split("</Latest>").next().unwrap();
+        let Some(block) = state.staged.get(&(key.clone(), id.to_owned())) else {
+            return b"HTTP/1.1 400 Bad\r\nx-ms-error-code: InvalidBlockList\r\nContent-Length: 0\r\n\r\n"
+                .to_vec();
+        };
+        data.extend_from_slice(block);
+    }
+    state.committed.insert(key, data);
+    state.etags += 1;
+    format!(
+        "HTTP/1.1 201 Created\r\nETag: \"0x{}\"\r\nContent-Length: 0\r\n\r\n",
+        state.etags
+    )
+    .into_bytes()
+}
+
+#[test]
+fn plain_http_uploads_blocks_and_commits() {
+    use crate::origin::upload::{CommitConflict, RetryPolicy};
+    let env = racer_io::Env::host();
+    let Some(reactor) = reactor(&env) else { return };
+    let uploads = Arc::new(Mutex::new(Uploads::default()));
+    let busy = Arc::new(Mutex::new(true));
+    let (state, flag) = (uploads.clone(), busy.clone());
+    let (address, _accepted, server) = serve(None, 1, move |head, body| {
+        azure_upload(head, body, &state, &flag)
+    });
+    let url = format!("http://127.0.0.1:{}/account/models", address.port());
+    let f = fixture(
+        reactor,
+        &url,
+        AzureCredential::Anonymous,
+        MapResolver::new(vec![]),
+        TrustRoots::unavailable("/nonexistent/racer-bundle.pem".into()),
+        AnonymousOnly,
+    );
+    let version = b"0123456789abcdef0123456789abcdef";
+    let ids: Vec<_> = (0..3)
+        .map(|page| crate::origin::azure::upload::block_id(version, page))
+        .collect();
+    let pages: [&[u8]; 3] = [&[1; 4096], b"middle", b"end"];
+    let put = |key: &str, page: usize| {
+        let context = context(key);
+        let scope = scope();
+        drive(
+            &f.reactor,
+            Box::pin(f.origin.put_block_with(
+                &f.definition,
+                &context,
+                &ids[page],
+                pages[page],
+                &scope,
+            )),
+        )
+    };
+    let commit = |key: &str| {
+        let context = context(key);
+        let scope = scope();
+        drive(
+            &f.reactor,
+            Box::pin(f.origin.put_block_list_with(
+                &f.definition,
+                &context,
+                &ids,
+                Some("application/octet-stream"),
+                &scope,
+            )),
+        )
+    };
+    for page in [2, 0, 1] {
+        put("obj", page).unwrap();
+    }
+    let etag = commit("obj").unwrap().unwrap();
+    assert_eq!(etag.as_str(), "\"0x1\"");
+    let mut expected = vec![1; 4096];
+    expected.extend_from_slice(b"middleend");
+    assert_eq!(uploads.lock().unwrap().committed["obj"], expected);
+    // A second writer loses.
+    assert_eq!(commit("obj").unwrap(), Err(CommitConflict));
+    assert_eq!(put("forbidden", 0).err(), Some(Error::OriginForbidden));
+    // 503 is retryable, and the retry policy rides it out.
+    assert_eq!(put("busy", 0).err(), Some(Error::Unavailable));
+    *busy.lock().unwrap() = true;
+    let scope = scope();
+    let context = context("busy");
+    let policy = RetryPolicy {
+        attempts: 3,
+        base: Duration::from_millis(1),
+        cap: Duration::from_millis(1),
+    };
+    drive(
+        &f.reactor,
+        Box::pin(policy.run(
+            &scope,
+            0,
+            |_| async { Ok(()) },
+            |_| {
+                f.origin
+                    .put_block_with(&f.definition, &context, &ids[0], pages[0], &scope)
+            },
+        )),
+    )
+    .unwrap();
+    assert!(uploads.lock().unwrap().staged.contains_key(&(
+        "busy".to_owned(),
+        String::from_utf8(ids[0].to_vec()).unwrap()
+    )));
+    drop(f);
+    server.join().unwrap();
+}

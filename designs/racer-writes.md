@@ -1209,6 +1209,45 @@ vectors; transport tests against the existing scripted transport in
 `origin/azure/transport/tests.rs`: success, 409 conflict, 403, retry on 503;
 limiter properties.
 
+As implemented (code is authoritative; these notes record where it refines the
+plan above):
+
+- CRC-64 verified: azblob v1.8.2 `internal/shared/shared.go` uses
+  `crc64.MakeTable(0x9A6C9329AC4BC9B5)` with Go `crc64.Checksum` (reflected,
+  initial and final XOR `!0`; this is CRC-64/NVME, check value
+  `0xAE8B14860A799888`), and `internal/exported/transfer_validation_option.go`
+  sends the CRC as 8 little-endian bytes in standard base64. Vectors in
+  `origin/azure/crc64.rs` were produced with Go `hash/crc64` and that table.
+- `AzureTransport` gains a required `exchange_body(url, head, body, scope)`.
+  `PoolTransport` sends the head, copies the body into admitted
+  request-context storage (`write_body_bytes`), and never retries on a stale
+  pooled connection, since a write may have reached the service.
+- Head builders are `request::put_block_head` and
+  `request::put_block_list_head`; `request::head` rejects the write methods.
+  Put Block List also sends `x-ms-content-crc64` of its XML body (optional per
+  the REST docs). The body is
+  `<?xml version="1.0" encoding="utf-8"?><BlockList><Latest>id</Latest>...</BlockList>`
+  (`request::block_list_xml`, taking block IDs; WP2's `block_list_xml` takes
+  `(version_hex, pages)`, so the integrator may keep one and adapt the other).
+  A test-only `origin::azure::upload::block_id` mirrors WP2's `block_id`.
+- A response to Put Block that echoes a different `x-ms-content-crc64` is
+  `BadGateway`. `401` gets one retry with a refreshed token (as for reads),
+  then `OriginRejected`. A `409` other than `BlobAlreadyExists` is classified
+  like reads (`Internal`), not a conflict.
+- Sinks make one attempt per call. Retries are the caller's:
+  `origin::upload::RetryPolicy` (default 10 attempts, 200 ms base doubling to
+  a 30 s cap, jittered into `[d/2, d]`) with `RetryPolicy::run`, and
+  `origin::upload::retryable`. This keeps attempt counting and
+  stop-on-delete with the coordinator (WP5).
+- `UploadLimiter::try_acquire(bytes, now)` is non-blocking and returns
+  `Admission::{Ready(UploadPermit), Wait(Instant), Busy}`; the caller sleeps
+  on the worker clock. The bucket holds one second of burst and may go into
+  debt, so a block larger than the burst is admitted from a full bucket.
+  `UploadLimits` is the node-wide per-cache registry.
+- `MemoryUploadSink` (with `UploadCall`, `MemoryBlob`) lives in
+  `origin/upload.rs`; a commit naming an unstaged block fails with
+  `InvalidRequest`, like Azure `400 InvalidBlockList`.
+
 ### WP7: control plane and CRD
 
 Files: `api/racer/v1alpha1/clustercache_types.go` (+ generated deepcopy and CRD
