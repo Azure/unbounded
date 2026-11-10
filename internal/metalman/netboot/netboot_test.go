@@ -1110,9 +1110,31 @@ func TestNetworkConfigTemplate_SelectsBootLease(t *testing.T) {
 	require.Contains(t, body, `via: "10.0.2.1"`)
 	require.Contains(t, body, `- "10.0.2.53"`)
 	require.Contains(t, body, `- "2001:db8::53"`)
-	require.Contains(t, body, "dhcp4: false")
+	require.Contains(t, body, "dhcp4: true")
+	require.Contains(t, body, "use-routes: false")
+	require.Contains(t, body, "use-dns: false")
+	require.Contains(t, body, "use-hostname: false")
 	require.Contains(t, body, "dhcp6: false")
 	require.NotContains(t, body, "10.0.1.20")
+
+	var parsed struct {
+		Ethernets map[string]struct {
+			DHCP4          bool            `yaml:"dhcp4"`
+			DHCP4Overrides map[string]bool `yaml:"dhcp4-overrides"`
+			Addresses      []string        `yaml:"addresses"`
+		} `yaml:"ethernets"`
+	}
+	require.NoError(t, yaml.Unmarshal(result, &parsed))
+	provisioning := parsed.Ethernets["provisioning"]
+	require.True(t, provisioning.DHCP4)
+	require.Equal(t, []string{"10.0.2.21/23"}, provisioning.Addresses)
+	require.Equal(t, map[string]bool{
+		"use-routes":   false,
+		"use-dns":      false,
+		"use-ntp":      false,
+		"use-hostname": false,
+		"use-domains":  false,
+	}, provisioning.DHCP4Overrides)
 }
 
 func TestNetworkConfigTemplate_NoLeaseDisablesDynamicConfiguration(t *testing.T) {

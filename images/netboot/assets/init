@@ -381,7 +381,9 @@ if [ -n "$DS_URL" ] || [ -n "$IP_PARAM" ]; then
         # Images without netplan (for example Azure Linux) use
         # systemd-networkd directly. The lower file name sorts before the
         # image's default DHCP file, which is removed so that other NICs do
-        # not add competing default routes.
+        # not add competing default routes. DHCP runs on the provisioning
+        # NIC only to hold the site lease for the static address; routes,
+        # DNS, and hostname from the lease are ignored.
         log "persisting static network configuration for systemd-networkd"
         rm -f /mnt/etc/systemd/network/90-unbounded-dhcp.network
         {
@@ -389,7 +391,7 @@ if [ -n "$DS_URL" ] || [ -n "$IP_PARAM" ]; then
             echo "MACAddress=${BOOT_MAC}"
             echo ""
             echo "[Network]"
-            echo "DHCP=no"
+            echo "DHCP=ipv4"
             echo "IPv6AcceptRA=no"
             echo "Address=${CLIENT_IP}/${PREFIX}"
             [ -z "$GW" ] || echo "Gateway=${GW}"
@@ -399,9 +401,20 @@ if [ -n "$DS_URL" ] || [ -n "$IP_PARAM" ]; then
                 echo "DNS=${dns}"
             done
             IFS=$old_ifs
+            echo ""
+            echo "[DHCPv4]"
+            echo "UseRoutes=no"
+            echo "UseGateway=no"
+            echo "UseDNS=no"
+            echo "UseNTP=no"
+            echo "UseHostname=no"
+            echo "UseDomains=no"
         } > /mnt/etc/systemd/network/10-unbounded-metal.network
         chmod 644 /mnt/etc/systemd/network/10-unbounded-metal.network
     elif [ -n "$IP_PARAM" ]; then
+        # DHCP runs alongside the static address only to hold the site
+        # lease for it, so the DHCP server does not hand the address to
+        # another host. Routes, DNS, and hostname from the lease are ignored.
         log "persisting static network configuration"
         mkdir -p /mnt/etc/netplan
         rm -f /mnt/etc/netplan/50-cloud-init.yaml
@@ -412,7 +425,13 @@ network:
     provisioning:
       match:
         macaddress: "${BOOT_MAC}"
-      dhcp4: false
+      dhcp4: true
+      dhcp4-overrides:
+        use-routes: false
+        use-dns: false
+        use-ntp: false
+        use-hostname: false
+        use-domains: false
       dhcp6: false
       addresses:
         - "${CLIENT_IP}/${PREFIX}"

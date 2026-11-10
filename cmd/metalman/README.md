@@ -239,7 +239,10 @@ interface name such as `eth0`. It also passes the lease DNS servers, configures
 the installer network without DHCP, and writes matching MAC-based static netplan
 configuration into the installed system before its first boot. It disables
 cloud-init network rendering so fallback DHCP configuration cannot conflict with
-that file. The default netboot image serves the same lease as NoCloud
+that file. The installed system also runs a DHCPv4 client on the provisioning
+NIC so the site DHCP server keeps the lease for the static address and does not
+hand it to another host. Routes, DNS, and hostname from the DHCP lease are
+ignored. The default netboot image serves the same lease as NoCloud
 `network-config`. If `spec.host.netboot.targetDisk` is
 set, the installer writes the image to that disk; otherwise it falls back to
 automatic disk selection.
