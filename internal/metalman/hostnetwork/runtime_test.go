@@ -50,7 +50,6 @@ func TestRenderRuntimeDefaultsAndOptionals(t *testing.T) {
 	n.Bonds[0].TransmitHashPolicy = ""
 	n.Bonds[0].LACPRate = "fast"
 	n.Bonds[0].MTU = nil
-	n.Ethernets[0].MTU = i32(9000)
 	n.VLANs[0].MTU = i32(1400)
 	n.DNS = nil
 
@@ -60,7 +59,7 @@ func TestRenderRuntimeDefaultsAndOptionals(t *testing.T) {
 	}
 
 	for _, want := range []string{
-		"ethernet enp49s0f0np0 02:00:00:00:00:01 9000\n",
+		"ethernet enp49s0f0np0 02:00:00:00:00:01 -\n",
 		"bond bond0 802.3ad 100 - fast - enp49s0f0np0,enp49s0f1np1\n",
 		"vlan bond0.64 bond0 64 1400\n",
 	} {
@@ -84,6 +83,24 @@ func TestRenderRuntimeDefaultsAndOptionals(t *testing.T) {
 
 	if !strings.Contains(string(got), "bond bond0 active-backup 0 - - - enp49s0f0np0,enp49s0f1np1\n") {
 		t.Errorf("unexpected bond line:\n%s", got)
+	}
+
+	// A member MTU renders when the bond sets the same MTU.
+	n.Bonds[0].MTU = i32(9000)
+	n.Ethernets[0].MTU = i32(9000)
+
+	got, err = RenderRuntime(n, l)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, want := range []string{
+		"ethernet enp49s0f0np0 02:00:00:00:00:01 9000\n",
+		"bond bond0 active-backup 0 - - 9000 enp49s0f0np0,enp49s0f1np1\n",
+	} {
+		if !strings.Contains(string(got), want) {
+			t.Errorf("missing %q in:\n%s", want, got)
+		}
 	}
 }
 

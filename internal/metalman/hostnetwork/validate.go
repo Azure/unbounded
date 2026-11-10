@@ -313,6 +313,12 @@ func (t *topology) checkBonds() error {
 			if a := m.addr; len(a.Addresses) > 0 || a.Gateway != "" || len(a.Routes) > 0 {
 				return fmt.Errorf("%s: bond member %q must not have addresses, gateway, or routes", path, name)
 			}
+
+			// Enslaving resets a member MTU to the bond MTU, so a member MTU
+			// only takes effect when the bond declares the same value.
+			if m.mtu != nil && (i.mtu == nil || *i.mtu != *m.mtu) {
+				return fmt.Errorf("%s: bond member %q sets mtu %d, so bond %q must set the same mtu", path, name, *m.mtu, b.Name)
+			}
 		}
 	}
 

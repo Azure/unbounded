@@ -73,6 +73,8 @@ violation fails the operation with a message naming the field:
   and a next hop inside one of the interface's subnets.
 - `transmitHashPolicy` is only valid for 802.3ad and balance-xor.
 - A VLAN MTU does not exceed its link MTU when both are set.
+- A bond member that sets an MTU requires the bond to set the same MTU;
+  enslaving resets the member MTU to the bond MTU.
 - `dhcpLeases[0]` stays the provisioning identity. Its MAC is one of the
   ethernets underlying the interface that carries its IPv4 address; that
   address (with its subnet mask) is declared on exactly one interface; its

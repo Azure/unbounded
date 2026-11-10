@@ -119,6 +119,7 @@ func TestRenderNetplanReference(t *testing.T) {
 func TestRenderNetplanParses(t *testing.T) {
 	n, _ := reference()
 	n.Bonds[0].LACPRate = "slow"
+	n.Bonds[0].MTU = i32(9000)
 	n.Ethernets[0].MTU = i32(9000)
 
 	b, err := RenderNetplan(n)

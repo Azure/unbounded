@@ -81,6 +81,10 @@ func TestValidateAccepts(t *testing.T) {
 		"miimon zero": func(n *v1alpha3.HostNetworkSpec, _ *v1alpha3.DHCPLease) { n.Bonds[0].MIIMonitorInterval = i32(0) },
 		"lacp fast":   func(n *v1alpha3.HostNetworkSpec, _ *v1alpha3.DHCPLease) { n.Bonds[0].LACPRate = "fast" },
 		"no dns":      func(n *v1alpha3.HostNetworkSpec, _ *v1alpha3.DHCPLease) { n.DNS = nil },
+		"member mtu matches bond": func(n *v1alpha3.HostNetworkSpec, _ *v1alpha3.DHCPLease) {
+			n.Ethernets[0].MTU = i32(1500)
+			n.Ethernets[1].MTU = i32(1500)
+		},
 		"vlan mtu ok": func(n *v1alpha3.HostNetworkSpec, _ *v1alpha3.DHCPLease) { n.VLANs[0].MTU = i32(1500) },
 		"vlan mtu without link mtu": func(n *v1alpha3.HostNetworkSpec, _ *v1alpha3.DHCPLease) {
 			n.Bonds[0].MTU = nil
@@ -168,6 +172,13 @@ func TestValidateRejects(t *testing.T) {
 		}, "network.ethernets[1].macAddress"},
 		{"mtu low", func(n *v1alpha3.HostNetworkSpec, _ *v1alpha3.DHCPLease) { n.Bonds[0].MTU = i32(575) }, "network.bonds[0].mtu"},
 		{"mtu high", func(n *v1alpha3.HostNetworkSpec, _ *v1alpha3.DHCPLease) { n.VLANs[0].MTU = i32(9217) }, "network.vlans[0].mtu"},
+		{"member mtu differs from bond", func(n *v1alpha3.HostNetworkSpec, _ *v1alpha3.DHCPLease) {
+			n.Ethernets[1].MTU = i32(9000)
+		}, "network.bonds[0].interfaces[1]"},
+		{"member mtu without bond mtu", func(n *v1alpha3.HostNetworkSpec, _ *v1alpha3.DHCPLease) {
+			n.Bonds[0].MTU = nil
+			n.Ethernets[0].MTU = i32(1500)
+		}, "network.bonds[0].interfaces[0]"},
 		{"bad mode", func(n *v1alpha3.HostNetworkSpec, _ *v1alpha3.DHCPLease) { n.Bonds[0].Mode = "balance-rr" }, "network.bonds[0].mode"},
 		{"miimon negative", func(n *v1alpha3.HostNetworkSpec, _ *v1alpha3.DHCPLease) {
 			n.Bonds[0].MIIMonitorInterval = i32(-1)
