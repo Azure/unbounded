@@ -421,3 +421,51 @@ func TestReprovisionGiveUpSurvivesACleanupFailure(t *testing.T) {
 	require.NoError(t, h.runner.run(t.Context(), h.store), "the failure is recorded; a leftover file must not make systemd retry")
 	assert.Equal(t, migrate.StepFailed, h.step(t))
 }
+
+// A bootstrap the allocation launch check refused for good ends the handoff at
+// once: retrying would rerun the bootstrap up to a check that cannot pass.
+func TestReprovisionGivesUpOnAFinalLaunchRefusal(t *testing.T) {
+	h := newReprovisionHarness(t, migrate.StepReprovisioning)
+	h.startErr = fmt.Errorf("ensure-node-started: %w", daemon.ErrAllocationLaunchRefused)
+
+	require.NoError(t, h.runner.run(t.Context(), h.store), "systemd does not run the unit again")
+	assert.Equal(t, []string{"reset", "start", "report", "abandon"}, h.events)
+
+	j := h.journal(t)
+	assert.Equal(t, migrate.StepFailed, j.Step)
+	assert.Contains(t, j.Message, "reprovision to isolation mode none was refused by the allocation launch check; the host was reset and is not bootstrapped: ")
+	assert.Contains(t, j.Message, daemon.ErrAllocationLaunchRefused.Error())
+	require.Len(t, h.report, 1)
+	assert.Equal(t, j.Message, h.report[0].Message)
+
+	// A second run takes the StepFailed branch: no reset and no bootstrap.
+	h.events = nil
+	require.NoError(t, h.runner.run(t.Context(), h.store))
+	assert.Equal(t, []string{"abandon"}, h.events)
+}
+
+// Any other bootstrap failure, a transient refusal included, keeps the retry.
+func TestReprovisionRetriesAFailureThatIsNotAFinalLaunchRefusal(t *testing.T) {
+	for name, startErr := range map[string]func(t *testing.T) error{
+		"plain error": func(*testing.T) error { return errors.New("kubelet did not join") },
+		"transient refusal": func(t *testing.T) error {
+			expired, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+			defer cancel()
+
+			return unconfirmedRefusal(t, expired)
+		},
+		"refused unit start": func(*testing.T) error {
+			return errors.New("start-none-node: Job for unbounded-kubelet.service failed because a dependency failed")
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := newReprovisionHarness(t, migrate.StepReprovisioning)
+			h.startErr = startErr(t)
+
+			err := h.runner.run(t.Context(), h.store)
+			require.Error(t, err)
+			assert.Equal(t, migrate.StepBootstrapping, h.step(t), "the handoff is retried")
+			assert.Empty(t, h.report)
+		})
+	}
+}

@@ -208,6 +208,12 @@ func (r *reprovisionRunner) run(ctx context.Context, store migrate.JournalStore)
 	}
 
 	if err := r.start(ctx); err != nil {
+		// The allocation launch check refused for good: retrying reruns the
+		// bootstrap up to a check that cannot pass, so the handoff ends now.
+		if daemon.IsFinalAllocationLaunchRefusal(err) {
+			return r.giveUpRefused(ctx, store, j, err)
+		}
+
 		return r.fail(store, j, fmt.Errorf("bootstrap in mode %s: %w", j.To, err))
 	}
 
@@ -286,11 +292,32 @@ func (r *reprovisionRunner) giveUp(ctx context.Context, store migrate.JournalSto
 	j.Message = fmt.Sprintf("reprovision to isolation mode %s gave up after %d attempts over %s; %s: %s",
 		j.To, j.Attempts, r.giveUpAfter, state, last)
 
+	r.log.Error("reprovision gave up", "to", j.To, "attempts", j.Attempts, "last_error", last)
+
+	return r.endHandoff(ctx, store, j)
+}
+
+// giveUpRefused ends a handoff whose bootstrap the allocation launch check
+// refused for good, as giveUp does: the reset already ran, and the host stays
+// reset with no node.
+func (r *reprovisionRunner) giveUpRefused(ctx context.Context, store migrate.JournalStore, j migrate.Journal, refusal error) error {
+	j.Step = migrate.StepFailed
+	j.Message = fmt.Sprintf("reprovision to isolation mode %s was refused by the allocation launch check; the host was reset and is not bootstrapped: %v",
+		j.To, refusal)
+
+	r.log.Error("reprovision refused by the allocation launch check", "to", j.To, "error", refusal)
+
+	return r.endHandoff(ctx, store, j)
+}
+
+// endHandoff records the terminal failure in j, reports it in the Machine
+// status while the staged credential is still there, removes the unit and the
+// staged credentials, and returns nil so that systemd does not run the unit
+// again.
+func (r *reprovisionRunner) endHandoff(ctx context.Context, store migrate.JournalStore, j migrate.Journal) error {
 	if err := store.Save(j); err != nil {
 		return err
 	}
-
-	r.log.Error("reprovision gave up", "to", j.To, "attempts", j.Attempts, "last_error", last)
 
 	if r.report != nil {
 		if err := r.report(ctx, j); err != nil {

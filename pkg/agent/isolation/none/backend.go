@@ -468,6 +468,10 @@ func (b *Backend) Destroy(ctx context.Context, _ isolation.SlotRef) error {
 		}
 	}
 
+	if err := b.removeKubeletLaunchCheck(ctx, stillRunning[UnitKubelet]); err != nil {
+		errs = append(errs, err)
+	}
+
 	if err := b.systemctl(ctx, "daemon-reload"); err != nil {
 		errs = append(errs, fmt.Errorf("daemon-reload: %w", err))
 	}
@@ -490,6 +494,27 @@ func (b *Backend) Destroy(ctx context.Context, _ isolation.SlotRef) error {
 	}
 
 	return errors.Join(errs...)
+}
+
+// removeKubeletLaunchCheck removes the allocation launch check once the
+// kubelet unit is gone. A kubelet that did not stop keeps it, so the kubelet is
+// still checked when it restarts. The check is stopped first, which ends a
+// pending retry, and never disabled: it has no [Install] section. A check that
+// did not stop keeps its file, as the node units do.
+func (b *Backend) removeKubeletLaunchCheck(ctx context.Context, kubeletRunning bool) error {
+	if kubeletRunning || !b.unitExists(UnitKubeletLaunchCheck) {
+		return nil
+	}
+
+	if err := b.systemctl(ctx, "stop", UnitKubeletLaunchCheck); err != nil {
+		return fmt.Errorf("stop %s: %w", UnitKubeletLaunchCheck, err)
+	}
+
+	if err := os.Remove(filepath.Join(b.unitDir(), UnitKubeletLaunchCheck)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+
+	return nil
 }
 
 // reapPods ends what stopping the units leaves running: containerd runs with

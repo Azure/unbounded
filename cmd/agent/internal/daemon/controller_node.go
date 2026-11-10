@@ -74,6 +74,23 @@ func (r *repaveReconciler) ReconcileRepave(ctx context.Context, _ string) (recon
 		return reconcile.Result{}, err
 	}
 
+	// One live check before anything this reconcile can start: a mode change,
+	// a repave in either mode, or the restart of a repave that keeps the mode.
+	// A declared mode change is drift, so it is checked too. A refusal leaves
+	// the running node alone and changes no mode. In the nspawn and none modes
+	// the unit guards check every start again. The experimental container mode
+	// has no unit guard, so its starts are checked only here, at NodeReboot and
+	// at bootstrap; it needs one before it leaves experimental.
+	if hasDrift(active.Config, &desiredConfig.AgentConfig) {
+		if err := verifyAllocationMachine(ctx, r.log, r.apiReader, active.Config, r.allocationLaunch); err != nil {
+			if errors.Is(err, errAllocationLaunchUnconfirmed) {
+				return reconcile.Result{RequeueAfter: allocationLaunchCheckTimeout}, nil
+			}
+
+			return reconcile.Result{}, nil
+		}
+	}
+
 	// A different declared mode is a mode change. When the change is not made
 	// now, the repave goes ahead in the mode the node runs, so version and
 	// configuration rollouts continue.
