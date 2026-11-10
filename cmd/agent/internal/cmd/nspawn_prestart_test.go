@@ -189,6 +189,10 @@ func TestCommandExitCode(t *testing.T) {
 
 	// The code must not collide with an exit status the agent already uses.
 	require.NotContains(t, []int{0, 1, daemon.DeferredExitCode}, goalstates.NSpawnPreStartRefusedExitCode)
+
+	// Both start guards exit with the same code.
+	require.Equal(t, 77, goalstates.AllocationLaunchRefusedExitCode)
+	require.Equal(t, goalstates.AllocationLaunchRefusedExitCode, goalstates.NSpawnPreStartRefusedExitCode)
 }
 
 func TestNSpawnLifecycleSilencesUsage(t *testing.T) {

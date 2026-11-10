@@ -54,6 +54,33 @@ type hostSeams struct {
 	sync     func(paths ...string) error
 	archives func(*slog.Logger, *goalstates.ContainerImageArchiveStaging) phases.Task
 	persist  func(log *slog.Logger, mode isolation.Mode, slot string, cfg *config.AgentConfig) phases.Task
+	// persistLaunch and verifyLaunch are the allocation launch guard's record
+	// write and check. Nil uses the daemon's.
+	persistLaunch func(cfg *config.AgentConfig) error
+	verifyLaunch  func(ctx context.Context, log *slog.Logger, cfg *config.AgentConfig) error
+}
+
+// persistLaunchRecord writes the allocation launch record and syncs it, so it
+// is on disk before the node's units can start.
+func (h hostSeams) persistLaunchRecord(cfg *config.AgentConfig) error {
+	persist := h.persistLaunch
+	if persist == nil {
+		persist = daemon.PersistAllocationLaunchConfig
+	}
+
+	if err := persist(cfg); err != nil {
+		return err
+	}
+
+	return h.syncFS(goalstates.AgentConfigDir)
+}
+
+func (h hostSeams) verifyLaunchCheck(ctx context.Context, log *slog.Logger, cfg *config.AgentConfig) error {
+	if h.verifyLaunch != nil {
+		return h.verifyLaunch(ctx, log, cfg)
+	}
+
+	return daemon.VerifyAllocationLaunch(ctx, log, cfg)
 }
 
 func (h hostSeams) syncFS(paths ...string) error {
@@ -187,7 +214,9 @@ func (m hostMode) ensureNodeStarted(ctx context.Context, s *agentStages, node ho
 		tasks = append(tasks, seams.persistApplied(s.log, m.mode, m.slot, &s.cfg.AgentConfig))
 	}
 
-	if err := phases.Serial(s.log, tasks...).Do(ctx); err != nil {
+	// The guard runs even when the node is already running, and before any
+	// unit is configured or started.
+	if err := guardNodeStart(ctx, s.log, &s.cfg.AgentConfig, seams.persistLaunchRecord, seams.verifyLaunchCheck, phases.Serial(s.log, tasks...).Do); err != nil {
 		return err
 	}
 

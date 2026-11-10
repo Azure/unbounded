@@ -18,6 +18,21 @@ func Run() {
 		LogFormat: "text",
 	}
 
+	if err := newRootCommand(cmdCtx).Execute(); err != nil {
+		// The daemon standing down for an unfinished installation is an
+		// ordinary state, not a fault. It has already said so in the journal,
+		// and the unit treats this code as success so systemd leaves it alone
+		// rather than restarting it into its start limit.
+		if !errors.Is(err, daemon.ErrDeferred) {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		}
+
+		os.Exit(commandExitCode(err))
+	}
+}
+
+// newRootCommand returns the agent's root command with every subcommand.
+func newRootCommand(cmdCtx *CommandContext) *cobra.Command {
 	root := &cobra.Command{
 		Use:   "agent",
 		Short: "Unbounded Kubernetes Node Agent",
@@ -41,19 +56,10 @@ func Run() {
 		newCmdLogs(cmdCtx),
 		newCmdSupportsIsolation(),
 		newCmdIsolationReprovision(cmdCtx),
+		newCmdAllocationLaunchCheck(cmdCtx),
 	)
 
-	if err := root.Execute(); err != nil {
-		// The daemon standing down for an unfinished installation is an
-		// ordinary state, not a fault. It has already said so in the journal,
-		// and the unit treats this code as success so systemd leaves it alone
-		// rather than restarting it into its start limit.
-		if !errors.Is(err, daemon.ErrDeferred) {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		}
-
-		os.Exit(commandExitCode(err))
-	}
+	return root
 }
 
 // exitCodeError makes the process exit with code rather than 1. A command

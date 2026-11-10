@@ -103,14 +103,26 @@ func runNSpawnLifecyclePreStart(ctx context.Context, log *slog.Logger, machineNa
 // runs the pre-start again, so an outage never strands an unfenced host.
 func nspawnPreStart(authorize, regenerate func() error) error {
 	if err := authorize(); err != nil {
-		if daemon.IsFinalAllocationLaunchRefusal(err) {
-			return &exitCodeError{code: goalstates.NSpawnPreStartRefusedExitCode, err: err}
-		}
-
-		return err
+		return finalRefusalExit(err)
 	}
 
 	return regenerate()
+}
+
+// finalRefusalExit maps a start guard's error to its exit: a final allocation
+// launch refusal exits with goalstates.AllocationLaunchRefusedExitCode, which
+// the guard units do not restart; any other error is returned as is and exits
+// 1, which they do. nil stays nil.
+func finalRefusalExit(err error) error {
+	if err == nil {
+		return nil
+	}
+
+	if daemon.IsFinalAllocationLaunchRefusal(err) {
+		return &exitCodeError{code: goalstates.AllocationLaunchRefusedExitCode, err: err}
+	}
+
+	return err
 }
 
 // authorizeNSpawnStart runs the allocation launch guard before every start of
