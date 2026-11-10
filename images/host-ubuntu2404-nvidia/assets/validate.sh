@@ -76,6 +76,8 @@ for path in /etc /var /etc/netplan /etc/cloud/cloud.cfg /usr/bin/cloud-init \
   /etc/modules-load.d/nvidia.conf /etc/modules-load.d/unbounded-rdma.conf \
   /etc/systemd/system/nvidia-persistence-mode.service \
   /etc/systemd/system/nvidia-fabricmanager.service.d/10-unbounded.conf \
+  /etc/systemd/system/systemd-nspawn@.service.d/10-nvidia-fabricmanager.conf \
+  /etc/systemd/system/unbounded-node-.service.d/10-nvidia-fabricmanager.conf \
   /etc/systemd/system/multi-user.target.wants/nvidia-persistence-mode.service \
   /etc/systemd/system/multi-user.target.wants/nvidia-fabricmanager.service \
   /etc/apt/preferences.d/nvidia-driver-pin \

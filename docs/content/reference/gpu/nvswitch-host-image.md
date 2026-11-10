@@ -62,15 +62,16 @@ the ESP boots through shim at `EFI/BOOT/BOOTX64.EFI`.
    adds the ordering, loads `ib_umad` and `mlx5_ib` before start, restarts the
    service on failure, and skips it on machines with no GPU bound to the
    driver.
-4. cloud-init installs the unbounded-agent, which starts containerd and
-   kubelet.
+4. cloud-init installs the unbounded-agent, which starts the node's container
+   runtime and kubelet.
 
 Until Fabric Manager finishes, CUDA calls fail with error 802
-(`SYSTEM_DRIVER_MISMATCH`). The drop-in orders Fabric Manager before host
-`containerd.service` and `kubelet.service`, which covers the `none` isolation
-mode after a reboot. The agent itself does not wait for Fabric Manager. In the
-`nspawn` and `container` modes, or on first boot, a CUDA program that starts
-before Fabric Manager is ready gets error 802 and must be restarted.
+(`SYSTEM_DRIVER_MISMATCH`). The image orders every agent node unit after
+Fabric Manager: `unbounded-containerd.service` and `unbounded-kubelet.service`
+in `none` mode, `systemd-nspawn@<machine>.service` in `nspawn` mode, and
+`unbounded-node-<slot>.service` in `container` mode. The node waits while
+Fabric Manager starts, but still starts if Fabric Manager fails. In that case
+CUDA programs get error 802 until Fabric Manager runs.
 
 ## Secure Boot
 

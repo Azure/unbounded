@@ -212,12 +212,20 @@ systemctl enable nvidia-persistence-mode.service
 # loaded, and before CUDA workloads. The package unit only orders it after
 # the network. Restart it if NVLSM loses the race with the NVLink management
 # link coming up.
+#
+# The node stack runs in the unbounded-agent's units, not the distro's:
+# unbounded-containerd and unbounded-kubelet in the none isolation mode,
+# systemd-nspawn@<machine> in nspawn mode, and unbounded-node-<slot> in
+# container mode. Order all of them after Fabric Manager. The last two are
+# matched by a template and a prefix drop-in, since the names vary by machine.
+# These are ordering-only: a host where Fabric Manager is skipped or fails
+# still starts its node.
 mkdir -p /etc/systemd/system/nvidia-fabricmanager.service.d
 cat > /etc/systemd/system/nvidia-fabricmanager.service.d/10-unbounded.conf <<'EOF'
 [Unit]
 Wants=nvidia-persistence-mode.service
 After=systemd-modules-load.service nvidia-persistence-mode.service nvidia-persistenced.service
-Before=containerd.service kubelet.service
+Before=unbounded-containerd.service unbounded-kubelet.service containerd.service kubelet.service
 ConditionPathExistsGlob=/sys/bus/pci/drivers/nvidia/0*
 StartLimitIntervalSec=0
 
@@ -227,6 +235,13 @@ Restart=on-failure
 RestartSec=30s
 EOF
 systemctl enable nvidia-fabricmanager.service
+for unit_dir in systemd-nspawn@.service.d unbounded-node-.service.d; do
+  mkdir -p "/etc/systemd/system/$unit_dir"
+  cat > "/etc/systemd/system/$unit_dir/10-nvidia-fabricmanager.conf" <<'EOF'
+[Unit]
+After=nvidia-fabricmanager.service
+EOF
+done
 # IMEX is for multi-node NVLink domains. It is not installed, but make sure
 # a dependency never starts it.
 systemctl mask nvidia-imex.service
