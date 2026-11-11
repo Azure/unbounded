@@ -1684,6 +1684,135 @@ mod tests {
         }
     }
 
+    /// A page's rank 0 that lost its written copy misses at the origin and
+    /// falls back to a copy-only probe of the other owners. Peer reception
+    /// reserves a page from the same Ciphertext budget as origin encryption,
+    /// so the unused encryption reservation must be released first: with
+    /// room for one page, the read still succeeds from the surviving replica,
+    /// and a never-written key still answers `404`.
+    #[test]
+    fn copy_only_fallback_fits_a_one_page_ciphertext_budget() {
+        let mut fallbacks = 0;
+        for seed in 1..=4 {
+            let mut world = World::new(
+                120 + seed,
+                Profile {
+                    nodes: 3,
+                    holder_loss: false,
+                    churn: false,
+                },
+            );
+            for index in 0..4 {
+                let object = FIRST + index;
+                let bytes = body(&mut world.harness.rng, 3 * page_bytes() - 5);
+                let created = world
+                    .exchange(
+                        index % 3,
+                        World::put_request(object, &bytes, "Racer-Durability: replicas=2\r\n"),
+                    )
+                    .unwrap();
+                assert_eq!(created.status, 201);
+                world.live.insert(
+                    object,
+                    Written {
+                        bytes,
+                        etag: created.header("etag").unwrap().to_owned(),
+                        replicas: 2,
+                        mode: UploadMode::Never,
+                        uploading: false,
+                    },
+                );
+            }
+            world.harness.settle();
+            let membership = world.harness.nodes[0].workers[0]
+                .app
+                .snapshots
+                .current()
+                .unwrap()
+                .membership
+                .clone();
+            // Drop each page's copy on its rank 0 when another node keeps one.
+            let mut readers = Vec::new();
+            for (&object, written) in &world.live {
+                let version = world.version(object, &written.etag);
+                for number in 0..written.bytes.len().div_ceil(page_bytes()) as u64 {
+                    let page = PageId {
+                        version: version.clone(),
+                        number: PageNumber(number),
+                    };
+                    let holds = |node: &Node| {
+                        node.workers
+                            .iter()
+                            .any(|w| w.app.store.writer.written(&page).is_some())
+                    };
+                    let rank0 = Placement::new(1)
+                        .rank(membership.clone(), &version.object, page.number)
+                        .ordered[0]
+                        .clone();
+                    let rank0 = world
+                        .harness
+                        .nodes
+                        .iter()
+                        .position(|n| n.config.node == rank0)
+                        .unwrap();
+                    let elsewhere = world
+                        .harness
+                        .nodes
+                        .iter()
+                        .enumerate()
+                        .any(|(index, node)| index != rank0 && holds(node));
+                    if !elsewhere || !holds(&world.harness.nodes[rank0]) {
+                        continue;
+                    }
+                    for worker in &mut world.harness.nodes[rank0].workers {
+                        if worker.app.store.writer.written(&page).is_some() {
+                            drive_local(
+                                &worker.runtime,
+                                worker.crypto.as_mut(),
+                                worker.app.store.writer.drop_written(&page),
+                            )
+                            .unwrap();
+                        }
+                    }
+                    readers.push((rank0, object));
+                }
+            }
+            let mut charges = Vec::new();
+            for node in &world.harness.nodes {
+                for worker in &node.workers {
+                    worker.app.memory.evict_idle(usize::MAX).unwrap();
+                    let admission = &worker.runtime.admission;
+                    let free = admission.limit(ResourceClass::Ciphertext)
+                        - admission.used(ResourceClass::Ciphertext);
+                    let pinned = free.saturating_sub(page_bytes() + 16);
+                    if pinned != 0 {
+                        charges.push(
+                            admission
+                                .reserve(None, ResourceClass::Ciphertext, pinned)
+                                .unwrap(),
+                        );
+                    }
+                }
+            }
+            fallbacks += readers.len();
+            for (reader, object) in readers {
+                let retries = world.actions.get("read-retry").copied().unwrap_or(0);
+                world.read(reader, object);
+                // The first attempt succeeds: a retry would let a later
+                // rebalance hide a fallback that could not reserve its page.
+                assert_eq!(
+                    world.actions.get("read-retry").copied().unwrap_or(0),
+                    retries,
+                    "seed={seed} node {reader} retried {object:x}"
+                );
+            }
+            // Never written: the fallback misses and the origin's answer stands.
+            world.read(0, FIRST + 100);
+            drop(charges);
+        }
+        assert!(fallbacks > 0, "no rank 0 lost a copy another owner keeps");
+    }
+
     /// A reader that cannot reach page zero's rank 0 (the coordinator)
     /// answers a retryable error for a written object, never `404`.
     #[test]

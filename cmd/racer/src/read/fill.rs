@@ -2746,7 +2746,7 @@ impl Fill {
                     scope.check()?;
                     // Peer reception owns its ciphertext allocation. Reserve encryption
                     // output only when this candidate actually needs an origin fill.
-                    let ciphertext = self.observe_reservation(
+                    let mut ciphertext = Some(self.observe_reservation(
                         scope,
                         page,
                         FillAdmissionSite::OriginCiphertext,
@@ -2757,7 +2757,7 @@ impl Fill {
                                 self.page_plaintext_bytes()? + 16,
                             )
                         },
-                    )?;
+                    )?);
                     let plaintext = match plaintext.take() {
                         Some(reserved) => reserved,
                         None => self.observe_reservation(
@@ -2767,15 +2767,21 @@ impl Fill {
                             || self.reserve_bootstrap(&context.object.cache),
                         )?,
                     };
-                    match self
+                    let origin = self
                         .call(
                             DriverStage::OriginCall,
                             self.dependencies
                                 .origin
                                 .page_reserved(authority, context, page, plaintext, scope),
                         )
-                        .await
-                    {
+                        .await;
+                    if origin.is_err() {
+                        // Release the unused encryption output before any
+                        // copy-only fallback: peer reception reserves its own
+                        // page from the same Ciphertext budget.
+                        ciphertext = None;
+                    }
+                    match origin {
                         Ok(origin) => {
                             // An owner after rank 0 holds a copy rank 0 may not know of: offer it
                             // later. The authority's owners: a walk that refreshed its membership
@@ -2789,9 +2795,14 @@ impl Fill {
                                 self.metrics.record(Event::OrphanNotice, 1);
                             }
                             acquired = Some(
-                                self.encrypt_origin_page(page, origin, ciphertext, scope)
-                                    .await?
-                                    .into(),
+                                self.encrypt_origin_page(
+                                    page,
+                                    origin,
+                                    ciphertext.take().expect("origin encryption reservation"),
+                                    scope,
+                                )
+                                .await?
+                                .into(),
                             );
                             AcqInput::Origin { id, result: Ok(()) }
                         }
