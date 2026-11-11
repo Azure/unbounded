@@ -1829,3 +1829,115 @@ fn a_displaced_manifest_replica_keeps_its_written_pages_across_a_restart() {
     c.wait(Duration::from_secs(2));
     assert_eq!(c.holders(&version, pages(body.len())), holders);
 }
+
+/// A member that joins as page zero's rank 0 holds no manifest until the
+/// coordinator's background rebalance copies one to it, and the origin does
+/// not know the object before it uploads. Its own miss must not be an
+/// authoritative `404`: it asks the page-zero owners of the membership it
+/// replaced. The coordinator's rebalance is held off here (standing in for
+/// one still queued or slow) while nodes join and every node reads.
+fn a_new_page_zero_rank_0_reads_before_rebalance(seed: u64, replicas: u8) {
+    let mut c = Cluster::new(seed, 3, Some(writes(replicas)));
+    let body = bytes(seed, 140_000);
+    let created = c.put(
+        0,
+        OBJECT,
+        &body,
+        &format!("Racer-Upload: manual\r\nRacer-Durability: replicas={replicas}\r\n"),
+    );
+    assert_eq!(created.status, 201);
+    let etag = created.header("etag").unwrap().to_owned();
+    let object = c.object(OBJECT);
+    let hold = |c: &Cluster, held: bool| {
+        for node in &c.harness.nodes {
+            for worker in &node.workers {
+                worker
+                    .app
+                    .coordinator
+                    .writes()
+                    .directory()
+                    .with(&object, |e| {
+                        if let Some(e) = e
+                            && e.role == crate::write::directory::Role::Coordinator
+                        {
+                            e.repairing = held;
+                        }
+                    });
+            }
+        }
+    };
+    let first = c.harness.nodes.len();
+    let mut joined = None;
+    for _ in 0..32 {
+        hold(&c, true);
+        let env = c.env.clone();
+        c.harness.add(&env, None);
+        c.configure();
+        c.harness.publish();
+        c.harness.settle();
+        let coordinator = &c.harness.nodes[0].workers[0].app.coordinator;
+        let membership = coordinator.current_membership().unwrap();
+        let rank0 = coordinator
+            .fill
+            .dependencies
+            .candidates
+            .candidates(membership.clone(), &object, PageNumber(0))
+            .ordered
+            .into_iter()
+            .find(|node| membership.serves(&object.cache, node));
+        if let Some(n) = (first..c.harness.nodes.len())
+            .find(|n| rank0.as_ref() == Some(&node_id(c.harness.nodes[*n].id)))
+        {
+            joined = Some(n);
+            break;
+        }
+        // Not this join: let rebalance catch up before the next one, so
+        // only the last join is ahead of it.
+        hold(&c, false);
+        c.wait(Duration::from_secs(2));
+        c.wait(Duration::from_secs(2));
+    }
+    let joined = joined.expect("no joined node became page zero's rank 0");
+    assert!(
+        c.harness.nodes[joined].workers.iter().all(|w| w
+            .app
+            .coordinator
+            .writes()
+            .directory()
+            .with(&object, |e| e.is_none())),
+        "rebalance ran early"
+    );
+    for reader in [joined, 0, 1, 2] {
+        let head = c.head(reader, OBJECT);
+        assert_ne!(head.status, 404, "head at {reader}: {:?}", head.headers);
+        let read = c.get(reader, OBJECT, body.len());
+        assert_ne!(read.status, 404, "get at {reader}: {:?}", read.headers);
+        assert_eq!(
+            read.status, 200,
+            "get at {reader}: {} {:?}",
+            read.status, read.headers
+        );
+        assert_eq!(read.header("etag"), Some(etag.as_str()));
+        let got = read.object();
+        let first = got.iter().zip(&body).position(|(a, b)| a != b);
+        assert!(
+            got == body,
+            "reader {reader}: {} of {} bytes, first difference at {first:?}",
+            got.len(),
+            body.len()
+        );
+    }
+    // Every owner misses an object nobody wrote: still an authoritative 404.
+    for reader in [joined, 0] {
+        assert_eq!(c.head(reader, OBJECT + 1).status, 404, "reader {reader}");
+    }
+}
+
+#[test]
+fn a_new_page_zero_rank_0_does_not_404_before_rebalance() {
+    for seed in 60..64 {
+        for replicas in [2, 3] {
+            a_new_page_zero_rank_0_reads_before_rebalance(seed, replicas);
+        }
+    }
+}
