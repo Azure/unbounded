@@ -174,6 +174,18 @@ func Origin(cfg *config.Config, source upstream, opts ...OriginOption) racersdk.
 	}
 
 	return func(ctx context.Context, request racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
+		// A local-only request without metadata cannot name its kind, and the
+		// key and ETag alone cannot tell a manifest (whose Content-Type is its
+		// media type) from a blob that happens to be JSON, so any type chosen
+		// here could disagree with the registry's for the pinned version.
+		// Answer a miss rather than ErrInvalidRequest so Racer moves on to
+		// peers or the origin instead of failing the read. Racer forwards the
+		// reader's metadata to holders and adapter probes, so this is only a
+		// fallback for requests that never had any.
+		if request.Metadata == "" && options.localOnly(request) {
+			return racersdk.Metadata{}, nil, localMiss(errors.New("no origin metadata"))
+		}
+
 		ref, err := decodeReference(request.Key, request.Metadata)
 		if err != nil {
 			return racersdk.Metadata{}, nil, err

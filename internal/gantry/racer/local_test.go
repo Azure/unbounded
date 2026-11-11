@@ -230,3 +230,53 @@ func TestLocalAndRegistryBlobMetadataAgree(t *testing.T) {
 		t.Fatalf("registry %+v and local %+v metadata disagree", remote, local)
 	}
 }
+
+// A local-only request without metadata or authorization, such as one that
+// never had origin context, cannot tell a manifest from a blob, so it is a
+// miss rather than an invalid request; it never reaches the registry. With
+// the reader's metadata and no authorization it is served locally.
+func TestLocalOnlyWithoutMetadataIsAMiss(t *testing.T) {
+	data := []byte("held locally")
+	store, ref := localFixture(t, data, ifaces.KindBlob)
+	upstream := &testUpstream{}
+	origin := localOrigin(t, store, upstream)
+	tag := `"` + ref.Digest.String() + `"`
+
+	request := requestFor(t, ref, "")
+	request.Metadata = ""
+	request.Authorization = ""
+
+	_, body, err := origin(t.Context(), racersdk.OriginRequest{
+		Request: request, ETag: tag, Length: racersdk.PageSize, LocalOnly: true,
+	})
+	requireError(t, err, racersdk.ErrNotFound)
+
+	if body != nil {
+		t.Fatal("miss returned a body")
+	}
+
+	withMetadata := requestFor(t, ref, "")
+	withMetadata.Authorization = ""
+
+	metadata, body, err := origin(t.Context(), racersdk.OriginRequest{
+		Request: withMetadata, ETag: tag, Length: racersdk.PageSize, LocalOnly: true,
+	})
+	if err != nil || metadata.ETag != tag {
+		t.Fatalf("metadata=%+v err=%v", metadata, err)
+	}
+
+	got, err := io.ReadAll(body)
+	if err != nil || string(got) != string(data) {
+		t.Fatalf("body = %q, %v", got, err)
+	}
+
+	_ = body.Close()
+
+	if upstream.heads.Load()+upstream.pulls.Load() != 0 {
+		t.Fatal("local-only request reached the registry")
+	}
+
+	// Ordinary requests still reject missing metadata.
+	_, _, err = Origin(testConfig(), upstream)(t.Context(), racersdk.OriginRequest{Request: request, Length: racersdk.PageSize})
+	requireError(t, err, racersdk.ErrInvalidRequest)
+}
