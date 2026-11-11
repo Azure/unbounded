@@ -67,7 +67,8 @@ func TestRenderedExecutionProvenanceIsPinnedAndDeterministic(t *testing.T) {
 			Templates []struct {
 				Name      string `json:"name"`
 				Container struct {
-					Image string `json:"image"`
+					Image string   `json:"image"`
+					Args  []string `json:"args"`
 				} `json:"container"`
 			} `json:"templates"`
 		} `json:"spec"`
@@ -80,6 +81,13 @@ func TestRenderedExecutionProvenanceIsPinnedAndDeterministic(t *testing.T) {
 		workflow.Spec.Templates[0].Name != "certification" ||
 		workflow.Spec.Templates[0].Container.Image != testAdapterImage {
 		t.Fatalf("WorkflowTemplate adapter identity = %#v", workflow.Spec.Templates)
+	}
+
+	adapterArgs := workflow.Spec.Templates[0].Container.Args
+	serviceAccountFlag := slices.Index(adapterArgs, "--workflow-service-account")
+	if serviceAccountFlag < 0 || serviceAccountFlag+1 >= len(adapterArgs) ||
+		adapterArgs[serviceAccountFlag+1] != "project-signal-adapter" {
+		t.Fatalf("WorkflowTemplate adapter args do not select the default child Workflow ServiceAccount: %v", adapterArgs)
 	}
 
 	for _, parameter := range []string{"check-index", "phase-index", "stage-index"} {

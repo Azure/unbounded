@@ -66,9 +66,11 @@ spec:
           - "{{`{{inputs.parameters.phase-index}}`}}"
           - --stage-index
           - "{{`{{inputs.parameters.stage-index}}`}}"
-{{ if eq $vllmCanaryEnabled "true" }}
           - --workflow-service-account
+{{ if eq $vllmCanaryEnabled "true" }}
           - project-signal-vllm-workload
+{{ else }}
+          - project-signal-adapter
 {{ end }}
           - --result-configmap
           - "{{`{{inputs.parameters.result-configmap}}`}}"
