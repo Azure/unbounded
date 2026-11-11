@@ -4,6 +4,8 @@
 //! `u16 BE length` + node ID bytes. The page count is implied by the input
 //! length; decoders that know it check it with [`Holders::validate`].
 
+use std::collections::BTreeSet;
+
 /// A node ID as raw bytes (the UTF-8 of `control::NodeId`).
 pub type NodeIdBytes = Vec<u8>;
 
@@ -42,9 +44,10 @@ impl Holders {
 
     /// Every distinct node in the table, in first-seen order.
     pub fn nodes(&self) -> Vec<NodeIdBytes> {
+        let mut seen: BTreeSet<&[u8]> = BTreeSet::new();
         let mut out: Vec<NodeIdBytes> = Vec::new();
         for node in self.0.iter().flatten() {
-            if !out.contains(node) {
+            if seen.insert(node.as_slice()) {
                 out.push(node.clone());
             }
         }
@@ -196,5 +199,30 @@ mod tests {
         );
         assert_eq!(t.page(1).len(), 3);
         assert!(t.page(9).is_empty());
+    }
+
+    #[test]
+    fn nodes_keep_first_seen_order_across_many_pages() {
+        let ids: Vec<NodeIdBytes> = (0..64).map(|i| format!("node-{i}").into_bytes()).collect();
+        // 50,000 pages, three holders each, rotating through 64 nodes.
+        let t = Holders(
+            (0..50_000usize)
+                .map(|p| {
+                    (0..3)
+                        .map(|r| ids[(p + r * 7) % ids.len()].clone())
+                        .collect()
+                })
+                .collect(),
+        );
+        let nodes = t.nodes();
+        assert_eq!(nodes.len(), ids.len());
+        let mut expected = Vec::new();
+        for node in t.0.iter().flatten() {
+            if !expected.contains(node) {
+                expected.push(node.clone());
+            }
+        }
+        assert_eq!(nodes, expected);
+        assert!(Holders::default().nodes().is_empty());
     }
 }
