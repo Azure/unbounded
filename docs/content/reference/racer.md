@@ -1247,8 +1247,11 @@ Creation headers on `persist` or `DELETE`, and source headers on `PUT`, are
 `Range`, `Expect`, `If-Match`, `ETag`, and `Racer-Expires-At`. Send the body
 at once; `Expect: 100-continue` is not supported.
 
-For `host-write`, the descriptor must be a regular file or memfd, as for
-`host-read`, and must not change until the response arrives.
+For `host-write`, send exactly one file descriptor with the request, as
+`SCM_RIGHTS` data. It must be a regular file or memfd at least
+`Racer-Source-Offset + Racer-Source-Length` bytes long; otherwise the answer is
+`400`. Racer reads from it, so it must be open for reading; unlike `host-read`,
+it need not be writable. The file must not change until the response arrives.
 
 #### Size limits
 

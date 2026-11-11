@@ -1920,7 +1920,9 @@ uploaded step `finish` writes `.metadata` with `Racer-Upload: manual`, polls
 `committed` (`failed` raises `CheckpointUploadError`), then calls `persist` on
 `.metadata`. `upload_poll_interval` (default 1 s) and `upload_timeout`
 (default 3600 s, `None` for no limit) tune the wait; a timeout also raises
-`CheckpointUploadError`. Cache-only steps are unchanged (`never`).
+`CheckpointUploadError`. The wait is synchronous inside `finish()`, so
+`dcp.save` of an uploaded step returns only after every data object committed;
+only the `.metadata` upload continues in the background. Cache-only steps are unchanged (`never`).
 `is_complete` reports cache completeness only.
 
 ### WP11: simulation and e2e

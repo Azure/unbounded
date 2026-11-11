@@ -269,7 +269,8 @@ A cache with writes turned on can act as a fast checkpoint store. A training
 job writes a checkpoint to Racer at disk and network speed and goes back to
 work. Racer uploads it to object storage in the background.
 
-1. The app sends `PUT` to the cache's client socket.
+1. The app sends `PUT`, or `host-write` with a file descriptor, to the
+   cache's client socket.
 2. The local dataplane cuts the body into pages, encrypts them, and asks each
    page's top owners to copy it.
 3. Each owner writes the page to disk, flushes it with `fdatasync`, and

@@ -10,8 +10,10 @@ migration path. See the [Racer reference]({{< relref "reference/racer" >}}).
 {{< /callout >}}
 
 This guide saves PyTorch Distributed Checkpoint (DCP) checkpoints to a Racer
-cache. `dcp.save` returns once each page has 2 copies on node disks. Racer
-uploads chosen checkpoints to Azure Blob in the background.
+cache. For a cache-only step, `dcp.save` returns once each page has 2 copies
+on node disks. For a step that is uploaded to Azure Blob, `dcp.save` also waits
+until every data object's upload commits; only the upload of the small
+`.metadata` object finishes in the background.
 
 A checkpoint that is not uploaded is safe only while its copies survive. Upload
 the checkpoints you cannot afford to lose.
@@ -77,9 +79,13 @@ How it works:
   `committed`, then persists `.metadata`. A data object that is already
   served from the origin (a non-Racer `ETag` with no upload state) counts as
   committed. The origin never has `.metadata`
-  without its data. If an upload fails or does not finish within
-  `upload_timeout`, the save raises `CheckpointUploadError` and `.metadata`
-  stays only in the cache.
+  without its data. This wait runs inside `dcp.save` on the coordinator rank,
+  checking every `upload_poll_interval` seconds, so `dcp.save` returns only
+  after every data object is in the origin and `persist` was accepted for
+  `.metadata`. Poll `HEAD` on `.metadata` for `committed` if you need to know
+  that the whole checkpoint is in the origin. If an upload fails or does not
+  finish within `upload_timeout`, the save raises `CheckpointUploadError` and
+  `.metadata` stays only in the cache.
 - Other steps use `never` and stay only in the cache until their hold ends.
   `persist_every=0` keeps every step cache-only.
 - `RacerStorageReader.is_complete` checks the cache, not the origin. It is true
