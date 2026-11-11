@@ -1303,7 +1303,12 @@ reader must check again: about 1 second ahead, and never after the hold ends.
 Readers recheck written objects about every second, so a `DELETE` or a
 finished upload is seen across the cluster within about a second. After the
 upload commits, `HEAD` and reads return the origin blob's `ETag`, not the
-Racer `ETag`.
+Racer `ETag`. `HEAD` still reports `Racer-Upload-State: committed` under the
+blob `ETag` while the cluster tracks the write. Once it no longer does (for
+example after a node restart), `HEAD` returns the blob `ETag` with no
+`Racer-Upload-State`, like any origin object. A client that polls for
+`committed` should treat a non-Racer `ETag` with no upload state as already
+uploaded.
 
 | State | Meaning |
 |-------|---------|

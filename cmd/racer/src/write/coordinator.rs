@@ -185,7 +185,9 @@ async fn session(
             settle(local, &object);
             Ok(WriteReply::Released)
         }
-        WriteAction::Status { wait_millis } => status(local, &object, wait_millis, scope).await,
+        WriteAction::Status { wait_millis } => {
+            status(local, &object, version.as_ref(), wait_millis, scope).await
+        }
         WriteAction::Delete => delete(local, &object, version.as_ref(), &membership, scope).await,
         WriteAction::Persist => persist(local, &object, context, &membership, scope).await,
         WriteAction::Replicate { manifest } => {
@@ -552,12 +554,35 @@ async fn resolve_ranks(
     Ok(Holders(holders))
 }
 
+/// Upload state of `object`'s session. When `version` names the Blob ETag
+/// the session's upload committed as (the ETag a fresh `HEAD` sees once the
+/// origin has the object), the reply is `Committed` under that ETag, so a
+/// client polling a written key keeps seeing `committed` after the switch.
 async fn status(
     local: &Coordinator,
     object: &ObjectId,
+    version: Option<&ObjectVersion>,
     wait_millis: u32,
     scope: &RequestScope,
 ) -> Result<WriteReply> {
+    if let Some(version) = version.filter(|v| !super::is_written_etag(&v.etag)) {
+        let committed = local.writes.directory().with(object, |entry| {
+            entry.is_some_and(|e| {
+                e.session.state() == UploadState::Committed
+                    && e.session
+                        .blob_etag()
+                        .is_some_and(|blob| blob.as_bytes() == version.etag.as_bytes())
+            })
+        });
+        return Ok(if committed {
+            WriteReply::Status {
+                state: UploadState::Committed,
+                etag: etag_text(&version.etag)?,
+            }
+        } else {
+            WriteReply::Unknown
+        });
+    }
     let clock = scope.clock().clone();
     let until = clock.now() + Duration::from_millis(u64::from(wait_millis));
     loop {
@@ -1051,18 +1076,22 @@ pub(crate) async fn background_event(
     Ok(())
 }
 
-/// Upload state of a written version, for `HEAD`. Asks the version's
-/// coordinator; `None` for versions not written through Racer or on any
-/// failure.
+/// Upload state of a version, for `HEAD`. Asks the version's coordinator.
+/// A Racer ETag reports its session's state; any other ETag reports
+/// `Committed` only if it is the Blob ETag a still-known session committed
+/// as. `None` otherwise or on any failure.
 pub(crate) async fn upload_state(
     local: &Coordinator,
     version: &ObjectVersion,
     membership: Arc<Membership>,
     scope: &RequestScope,
 ) -> Option<UploadState> {
-    if !super::is_written_etag(&version.etag) || !writes_enabled(local, &version.object) {
+    if !writes_enabled(local, &version.object) {
         return None;
     }
+    // A Racer ETag asks for the session's state; any other ETag asks
+    // whether it is the session's committed Blob ETag.
+    let etag = (!super::is_written_etag(&version.etag)).then(|| version.etag.clone());
     let coordinator = ranked(local, &membership, &version.object, 0, scope)
         .await
         .ok()?
@@ -1070,7 +1099,7 @@ pub(crate) async fn upload_state(
         .next()?;
     let operation = PeerOperation::WriteSession {
         object: version.object.clone(),
-        etag: None,
+        etag,
         action: Box::new(WriteAction::Status { wait_millis: 0 }),
     };
     let context = super::bare_context(&version.object);

@@ -1419,7 +1419,14 @@ Deviations from the plan above:
   hold) instead of caching the current pointer until the hold, so `DELETE`
   and upload become visible cluster-wide within a second. After Put Block
   List commits, the current pointer is dropped and fresh reads go to the
-  origin (Blob ETag); no alias is kept (alias handling is WP8).
+  origin (Blob ETag); no alias is kept (alias handling is WP8). `HEAD` of
+  a non-Racer ETag sends `Status` with that ETag; the coordinator answers
+  `Status{Committed, etag}` when its session committed as that Blob ETag
+  (`write/coordinator.rs`, `status`), so `HEAD` keeps reporting
+  `committed` across the switch. A forgotten session (released, collected,
+  or a restart that lost it) gives no upload state; the DCP writer treats a
+  non-Racer ETag without upload state as committed (`dcp.py`,
+  `_await_uploads`).
 - Reply mapping: `delete` of an uploaded object and `persist` of a
   non-manual object answer `Status{state, etag}` (writer: `409 uploaded` /
   `409 not-manual`); accepted `persist` answers `Committed{state}`.

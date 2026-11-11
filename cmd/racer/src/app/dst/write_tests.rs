@@ -806,6 +806,48 @@ fn head_reports_upload_states_and_uploads_commit() {
 }
 
 #[test]
+fn head_after_an_upload_finished_reports_committed() {
+    let mut c = Cluster::new(23, 3, Some(writes(2)));
+    let body = bytes(11, 90_000);
+    let created = c.put(0, OBJECT, &body, "Racer-Upload: auto\r\n");
+    assert_eq!(created.status, 201);
+    let racer_etag = created.header("etag").map(str::to_owned);
+    // The upload finishes before anyone polls.
+    c.wait(Duration::from_secs(2));
+    let blob = c.sink.committed(&c.object(OBJECT)).expect("blob committed");
+    let blob_etag = String::from_utf8(blob.etag.as_bytes().to_vec()).unwrap();
+    // The origin now serves the uploaded blob under its Blob ETag.
+    c.harness.catalog.borrow_mut().current.insert(
+        OBJECT,
+        super::Version {
+            tag: blob_etag.clone(),
+            bytes: blob.data,
+        },
+    );
+    for node in 0..3 {
+        // Fresh metadata is the origin's: the Blob ETag, still committed.
+        let head = c.head(node, OBJECT);
+        assert_eq!(head.status, 200, "node {node}");
+        assert_eq!(head.header("etag"), Some(blob_etag.as_str()));
+        assert_ne!(head.header("etag").map(str::to_owned), racer_etag);
+        assert_eq!(head.header("racer-upload-state"), Some("committed"));
+    }
+    // An origin version no session committed as reports no upload state.
+    c.harness.catalog.borrow_mut().current.insert(
+        OBJECT,
+        super::Version {
+            tag: "\"replaced\"".into(),
+            bytes: bytes(12, 10),
+        },
+    );
+    c.wait(Duration::from_secs(2));
+    let head = c.head(0, OBJECT);
+    assert_eq!(head.status, 200);
+    assert_eq!(head.header("etag"), Some("\"replaced\""));
+    assert_eq!(head.header("racer-upload-state"), None);
+}
+
+#[test]
 fn a_retried_block_list_after_a_lost_response_commits() {
     let mut c = Cluster::new(19, 3, Some(writes(2)));
     // The first Put Block List commits but its 201 never arrives; the retry
