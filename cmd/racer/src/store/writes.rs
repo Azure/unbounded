@@ -259,6 +259,22 @@ fn release_record(key: PageKey, location: &RecordLocation) -> JournalRecord {
 }
 
 /// The journal identity of `page`.
+/// Segments that new written pages leave unpinned for rekey evacuation; see
+/// [`StoreWriter::relocate_written`].
+pub const REKEY_RESERVE_SEGMENTS: usize = 1;
+
+/// Whether a table of `count` segments, `pinned` of them holding written
+/// records, may pin one more for a new written page and still keep the
+/// rekey reserve unpinned. Tables too small for a reserve keep none.
+fn headroom(count: usize, pinned: usize) -> bool {
+    let reserve = if count > REKEY_RESERVE_SEGMENTS + 1 {
+        REKEY_RESERVE_SEGMENTS
+    } else {
+        0
+    };
+    pinned + 1 + reserve <= count
+}
+
 pub fn page_key(page: &PageId) -> Result<PageKey> {
     Ok(PageKey {
         cache: page.version.object.cache.0.clone(),
@@ -614,6 +630,62 @@ impl StoreWriter {
 
     /// [`Self::persist_written`], or with `replace` (the location of the
     /// record being replaced) a forced rewrite for [`Self::rekey_written`].
+    /// Move written `page` from `from` to a new record, keeping its session
+    /// and hold, so a rekey can empty `from`'s segment and free it. `None`
+    /// when `page` is not written here or no longer at `from`.
+    pub fn relocate_written<'a>(
+        &'a self,
+        page: CiphertextCopy,
+        from: RecordLocation,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, Option<WrittenEntry>> {
+        Box::pin(async move {
+            let id = page.ciphertext.envelope().page.clone();
+            let Some(existing) = self.writes.get(&id) else {
+                return Ok(None);
+            };
+            if existing.location != from {
+                return Ok(None);
+            }
+            self.persist_inner(
+                page,
+                existing.session,
+                existing.hold_until,
+                Some(existing.location),
+                scope,
+            )
+            .await
+        })
+    }
+
+    /// Segments holding at least one live written record.
+    pub fn pinned_segments(&self) -> usize {
+        (0..self.segments.count() as u64)
+            .filter(|&segment| self.index.segment_pins(SegmentId(segment)) > 0)
+            .count()
+    }
+
+    /// Whether a new (not replacing) written record of `length` bytes may
+    /// be stored. One that would pin another segment must leave
+    /// [`REKEY_RESERVE_SEGMENTS`] segments unpinned, so a rekey can always
+    /// relocate one whole segment's records and free it. Replacements
+    /// (rekey) may use the reserve. A table of at most
+    /// `REKEY_RESERVE_SEGMENTS + 1` segments is too small to keep one and has
+    /// none.
+    fn new_write_headroom(&self, length: usize) -> Result<()> {
+        if self
+            .segments
+            .written_fits(length)
+            .is_some_and(|segment| self.index.segment_pins(segment) > 0)
+        {
+            return Ok(());
+        }
+        if !headroom(self.segments.count(), self.pinned_segments()) {
+            return Err(Error::Overloaded);
+        }
+        Ok(())
+    }
+
     async fn persist_inner(
         &self,
         page: CiphertextCopy,
@@ -654,6 +726,9 @@ impl StoreWriter {
             let _persisting = self.writes.begin(&id)?;
             let alignment = self.slabs.alignment()?;
             let disk_bytes = super::record_length(&page, alignment)?;
+            if replace.is_none() {
+                self.new_write_headroom(disk_bytes)?;
+            }
             let replaced = self.writes.get(&id).map_or(0, |entry| entry.disk_bytes);
             let reservation = self
                 .writes
@@ -880,5 +955,24 @@ impl StoreWriter {
             |writes| writes.max_dirty_percent,
         );
         (u128::from(self.segments.capacity_bytes()) * u128::from(percent) / 100) as u64
+    }
+}
+
+#[cfg(test)]
+mod headroom_tests {
+    use super::headroom;
+
+    #[test]
+    fn new_writes_leave_the_rekey_reserve_unpinned() {
+        // Large tables keep one segment unpinned for rekey.
+        assert!(headroom(10, 8));
+        assert!(!headroom(10, 9));
+        assert!(!headroom(10, 10));
+        assert!(headroom(3, 1));
+        assert!(!headroom(3, 2));
+        // Tiny tables have no room for a reserve.
+        assert!(headroom(2, 1));
+        assert!(!headroom(2, 2));
+        assert!(headroom(1, 0));
     }
 }

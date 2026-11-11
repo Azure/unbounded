@@ -487,6 +487,18 @@ impl Segments {
         Ok((lease, extent))
     }
 
+    /// The current written segment, when the next [`Self::append_written`]
+    /// of `length` bytes would land in it rather than open a fresh segment.
+    pub fn written_fits(&self, length: usize) -> Option<SegmentId> {
+        let (position, generation) = self.written.get()?;
+        let slots = self.slots.borrow();
+        let image = &slots.get(position)?.image;
+        (image.state == SegmentState::Sealed
+            && image.generation == generation
+            && self.segment_bytes - image.used_bytes >= length as u64)
+            .then_some(image.id)
+    }
+
     /// Re-adopt a segment that holds durable written records after a restart,
     /// before any append can reuse it. A free slot at `generation` (or any
     /// older generation, as after a cold start) becomes Sealed at

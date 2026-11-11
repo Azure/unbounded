@@ -7120,6 +7120,51 @@ mod written {
         assert_eq!(restored, ids[2..].to_vec());
     }
 
+    /// Rekey evacuation moves a current-key record off its segment: the pin
+    /// moves, the session and hold stay, a stale source is a no-op, and the
+    /// journal replays the new location.
+    #[test]
+    fn relocate_moves_a_written_record_and_its_pin() {
+        let (simulation, env) = sim();
+        let f = opened(&env);
+        recover(&f, &env, LAYOUT, COMPACT);
+        let copy = f.copy(1, 100);
+        let page = id(&copy);
+        let before = persist(&f, &env, copy.clone()).unwrap();
+        let relocate = |from| {
+            drive(
+                &f.reactor,
+                f.store
+                    .writer
+                    .relocate_written(copy.clone(), from, &scope(&env)),
+            )
+        };
+        let after = relocate(before.location.clone()).unwrap().unwrap();
+        assert_ne!(after.location, before.location);
+        assert_eq!(after.session, before.session);
+        assert_eq!(after.hold_until, before.hold_until);
+        assert_eq!(f.store.writer.written(&page), Some(after.clone()));
+        let index = f.store.writer.index();
+        assert_eq!(
+            index.lookup(&page).unwrap().unwrap().location,
+            after.location
+        );
+        assert_eq!(index.segment_pins(after.location.segment), 1);
+        assert_eq!(f.store.writer.pinned_segments(), 1);
+        // Already moved: nothing to do.
+        assert_eq!(relocate(before.location.clone()).unwrap(), None);
+        assert_eq!(f.store.writer.written(&page), Some(after.clone()));
+        let f = f.restart_after(&env, || simulation.disk().crash().unwrap());
+        open(&f);
+        let recovered = recover(&f, &env, LAYOUT, COMPACT);
+        assert!(recovered.lost.is_empty(), "{:?}", recovered.lost);
+        assert_eq!(
+            f.store.writer.written(&page).unwrap().location,
+            after.location
+        );
+        assert_eq!(read(&f, &env, &page), Some(vec![1; 116]));
+    }
+
     /// A checkpoint fills the page index with cache mappings; a page written
     /// after it must still be indexed on restart, evicting disposable cache
     /// mappings rather than leaving the journaled page unreadable.
