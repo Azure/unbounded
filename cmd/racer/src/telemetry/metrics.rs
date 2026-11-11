@@ -1129,6 +1129,7 @@ impl Metrics {
             metrics: self,
             stage: 0,
             caches: None,
+            writes: None,
         }
     }
 
@@ -1210,13 +1211,16 @@ pub(crate) struct Exposition<'a> {
     stage: usize,
     /// Per-cache totals, captured once when the cache section starts.
     caches: Option<Vec<(Arc<str>, u64, u64)>>,
+    /// Write metrics snapshot, streamed one cache at a time.
+    writes: Option<crate::write::metrics::WriteExposition>,
 }
 
 impl Exposition<'_> {
     /// Fixed sections before the per-cache series.
     const HEAD: usize = 6;
-    /// Fixed sections after the per-cache series.
-    const TAIL: usize = 3;
+    /// Sections after the per-cache series: GPU, prefetch, the write
+    /// metrics (several pieces), and quotas.
+    const TAIL: usize = 4;
 
     /// Write the next piece; `Ok(true)` while more remain.
     pub(crate) fn next(
@@ -1251,9 +1255,14 @@ impl Exposition<'_> {
                 } else {
                     match cache - 1 - caches.len() {
                         0 => metrics.gpu.write(out)?,
-                        1 => {
-                            metrics.prefetch.write(out)?;
-                            metrics.writes.write(out)?;
+                        1 => metrics.prefetch.write(out)?,
+                        2 => {
+                            let writes = self
+                                .writes
+                                .get_or_insert_with(|| metrics.writes.exposition());
+                            if writes.next(out)? {
+                                return Ok(true);
+                            }
                         }
                         _ => metrics.write_quotas(out)?,
                     }
@@ -2281,5 +2290,48 @@ mod tests {
                 assert_eq!(reader.gauge(gauge), 0);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod write_exposition_tests {
+    use super::*;
+
+    /// Write metrics for more caches than one streamed piece can hold are
+    /// emitted one cache at a time, so every piece fits the server buffer.
+    #[test]
+    fn many_write_caches_stream_in_bounded_pieces() {
+        let workers = Metrics::for_workers(1).unwrap();
+        let metrics = &workers[0];
+        for i in 0..20_000 {
+            let cache = format!("{i:08x}-1111-4111-8111-111111111111");
+            metrics
+                .writes()
+                .request(&cache, crate::write::metrics::Outcome::Created);
+            metrics.writes().bytes(&cache, 1);
+        }
+        let limit = crate::telemetry::primitives::server::MAX_RESPONSE_BYTES;
+        let mut exposition = metrics.exposition();
+        let (mut total, mut largest) = (0, 0);
+        let mut body = String::new();
+        loop {
+            let mut piece = String::new();
+            let more = exposition.next(&mut piece).unwrap();
+            largest = largest.max(piece.len());
+            total += piece.len();
+            body.push_str(&piece);
+            if !more {
+                break;
+            }
+        }
+        assert!(total > limit, "{total}");
+        assert!(largest < limit / 16, "{largest}");
+        assert_eq!(
+            body.matches("# TYPE racer_write_requests_total ").count(),
+            1
+        );
+        assert!(body.contains(
+            "racer_write_bytes_total{cache=\"00004e1f-1111-4111-8111-111111111111\"} 1\n"
+        ));
     }
 }

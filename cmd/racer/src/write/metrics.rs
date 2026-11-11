@@ -185,55 +185,136 @@ impl WriteMetrics {
     /// Write every series in the Prometheus text format. Nothing is written
     /// before the first write activity.
     pub fn write(&self, out: &mut impl Write) -> std::fmt::Result {
+        let mut exposition = self.exposition();
+        while exposition.next(out)? {}
+        Ok(())
+    }
+
+    /// A snapshot written one bounded piece at a time: each family's type
+    /// line, then one piece per cache, so the streamed `/metrics` response
+    /// never needs room for every cache at once.
+    pub fn exposition(&self) -> WriteExposition {
         let state = self.lock();
-        if state.caches.is_empty() && state.fsync_count == 0 {
-            return Ok(());
+        let empty = state.caches.is_empty() && state.fsync_count == 0;
+        let rows = state
+            .caches
+            .iter()
+            .map(|(cache, entry)| Row {
+                cache: cache.clone(),
+                requests: entry.requests.iter().map(|(o, n)| (*o, *n)).collect(),
+                scalars: [
+                    entry.bytes,
+                    entry.dirty.values().sum(),
+                    entry.upload_bytes,
+                    entry.repairs,
+                    entry.unreadable.values().sum(),
+                ],
+                states: std::array::from_fn(|index| entry.states.values().map(|s| s[index]).sum()),
+            })
+            .collect();
+        WriteExposition {
+            rows,
+            fsync: state.fsync,
+            fsync_count: state.fsync_count,
+            fsync_micros: state.fsync_micros,
+            empty,
+            piece: 0,
         }
-        writeln!(out, "# TYPE racer_write_requests_total counter")?;
-        for (cache, entry) in &state.caches {
-            for (outcome, count) in &entry.requests {
-                writeln!(
-                    out,
-                    "racer_write_requests_total{{cache=\"{cache}\",outcome=\"{}\"}} {count}",
-                    outcome.as_str()
-                )?;
-            }
+    }
+}
+
+/// Per-cache values captured by [`WriteMetrics::exposition`].
+struct Row {
+    cache: String,
+    requests: Vec<(Outcome, u64)>,
+    scalars: [u64; SCALARS.len()],
+    states: [u64; STATES.len()],
+}
+
+/// Single-value per-cache families, in [`Row::scalars`] order.
+const SCALARS: [(&str, &str); 5] = [
+    ("racer_write_bytes_total", "counter"),
+    ("racer_write_dirty_bytes", "gauge"),
+    ("racer_write_upload_bytes_total", "counter"),
+    ("racer_write_repairs_total", "counter"),
+    ("racer_write_unreadable_pages", "gauge"),
+];
+
+/// Per-cache families: requests, the scalars, then upload states.
+const FAMILIES: usize = SCALARS.len() + 2;
+
+/// Resumable writer of a [`WriteMetrics`] snapshot. A failed piece leaves
+/// the position unchanged, so the caller can retry it with fresh space.
+pub struct WriteExposition {
+    rows: Vec<Row>,
+    fsync: [u64; FSYNC_BUCKETS_MICROS.len()],
+    fsync_count: u64,
+    fsync_micros: u64,
+    empty: bool,
+    piece: usize,
+}
+
+impl WriteExposition {
+    fn pieces(&self) -> usize {
+        if self.empty {
+            0
+        } else {
+            FAMILIES * (1 + self.rows.len()) + 1
         }
-        for (name, kind, value) in [
-            (
-                "racer_write_bytes_total",
-                "counter",
-                (|e: &CacheMetrics| e.bytes) as fn(&CacheMetrics) -> u64,
-            ),
-            ("racer_write_dirty_bytes", "gauge", |e| {
-                e.dirty.values().sum()
-            }),
-            ("racer_write_upload_bytes_total", "counter", |e| {
-                e.upload_bytes
-            }),
-            ("racer_write_repairs_total", "counter", |e| e.repairs),
-            ("racer_write_unreadable_pages", "gauge", |e| {
-                e.unreadable.values().sum()
-            }),
-        ] {
+    }
+
+    /// Write the next piece; `Ok(true)` while more remain.
+    pub fn next(&mut self, out: &mut impl Write) -> Result<bool, std::fmt::Error> {
+        let total = self.pieces();
+        if self.piece >= total {
+            return Ok(false);
+        }
+        let per_family = 1 + self.rows.len();
+        let (family, index) = (self.piece / per_family, self.piece % per_family);
+        if family == FAMILIES {
+            self.write_fsync(out)?;
+        } else if index == 0 {
+            let (name, kind) = match family {
+                0 => ("racer_write_requests_total", "counter"),
+                f if f <= SCALARS.len() => SCALARS[f - 1],
+                _ => ("racer_write_upload_state", "gauge"),
+            };
             writeln!(out, "# TYPE {name} {kind}")?;
-            for (cache, entry) in &state.caches {
-                writeln!(out, "{name}{{cache=\"{cache}\"}} {}", value(entry))?;
+        } else {
+            let row = &self.rows[index - 1];
+            let cache = &row.cache;
+            match family {
+                0 => {
+                    for (outcome, count) in &row.requests {
+                        writeln!(
+                            out,
+                            "racer_write_requests_total{{cache=\"{cache}\",outcome=\"{}\"}} {count}",
+                            outcome.as_str()
+                        )?;
+                    }
+                }
+                f if f <= SCALARS.len() => {
+                    let name = SCALARS[f - 1].0;
+                    writeln!(out, "{name}{{cache=\"{cache}\"}} {}", row.scalars[f - 1])?;
+                }
+                _ => {
+                    for (upload, count) in STATES.iter().zip(row.states) {
+                        writeln!(
+                            out,
+                            "racer_write_upload_state{{cache=\"{cache}\",state=\"{}\"}} {count}",
+                            upload.as_str()
+                        )?;
+                    }
+                }
             }
         }
-        writeln!(out, "# TYPE racer_write_upload_state gauge")?;
-        for (cache, entry) in &state.caches {
-            for (index, upload) in STATES.iter().enumerate() {
-                let count: u64 = entry.states.values().map(|s| s[index]).sum();
-                writeln!(
-                    out,
-                    "racer_write_upload_state{{cache=\"{cache}\",state=\"{}\"}} {count}",
-                    upload.as_str()
-                )?;
-            }
-        }
+        self.piece += 1;
+        Ok(self.piece < total)
+    }
+
+    fn write_fsync(&self, out: &mut impl Write) -> std::fmt::Result {
         writeln!(out, "# TYPE racer_write_fsync_seconds histogram")?;
-        for (bucket, bound) in state.fsync.iter().zip(FSYNC_BUCKETS_MICROS) {
+        for (bucket, bound) in self.fsync.iter().zip(FSYNC_BUCKETS_MICROS) {
             writeln!(
                 out,
                 "racer_write_fsync_seconds_bucket{{le=\"{}\"}} {bucket}",
@@ -243,14 +324,14 @@ impl WriteMetrics {
         writeln!(
             out,
             "racer_write_fsync_seconds_bucket{{le=\"+Inf\"}} {}",
-            state.fsync_count
+            self.fsync_count
         )?;
         writeln!(
             out,
             "racer_write_fsync_seconds_sum {}",
-            state.fsync_micros as f64 / 1e6
+            self.fsync_micros as f64 / 1e6
         )?;
-        writeln!(out, "racer_write_fsync_seconds_count {}", state.fsync_count)
+        writeln!(out, "racer_write_fsync_seconds_count {}", self.fsync_count)
     }
 }
 
@@ -312,5 +393,67 @@ mod tests {
         assert!(out.contains("racer_write_dirty_bytes{cache=\"c1\"} 5\n"));
         assert!(out.contains("racer_write_unreadable_pages{cache=\"c1\"} 0\n"));
         assert_eq!(metrics.requests("c1", Outcome::Created), 2);
+    }
+
+    /// Each piece holds one family's type line or one cache's series, so a
+    /// piece stays small however many caches write, and the pieces together
+    /// equal the whole exposition with every family contiguous.
+    #[test]
+    fn exposition_streams_one_cache_per_piece() {
+        let metrics = WriteMetrics::default();
+        let caches = 20_000;
+        for i in 0..caches {
+            let cache = format!("{i:08x}-1111-4111-8111-111111111111");
+            metrics.request(&cache, Outcome::Created);
+            metrics.bytes(&cache, 1);
+            metrics.sample_states(
+                0,
+                &[(cache.clone(), racer_core::write::UploadState::Pending)],
+            );
+        }
+        let mut whole = String::new();
+        metrics.write(&mut whole).unwrap();
+        assert!(whole.len() > 1024 * 1024, "{}", whole.len());
+        let mut exposition = metrics.exposition();
+        let mut joined = String::new();
+        let mut largest = 0;
+        loop {
+            let mut piece = String::new();
+            let more = exposition.next(&mut piece).unwrap();
+            largest = largest.max(piece.len());
+            joined.push_str(&piece);
+            if !more {
+                break;
+            }
+        }
+        assert_eq!(joined, whole);
+        assert!(largest < 4096, "{largest}");
+        // Every family's samples follow its single type line.
+        let mut seen = std::collections::BTreeSet::new();
+        let mut current = String::new();
+        for line in whole.lines() {
+            if let Some(rest) = line.strip_prefix("# TYPE ") {
+                current = rest.split(' ').next().unwrap().to_owned();
+                assert!(seen.insert(current.clone()), "{current} repeated");
+            } else {
+                let name = line.split(['{', ' ']).next().unwrap();
+                assert!(name.starts_with(&current), "{name} outside {current}");
+            }
+        }
+        // A failed piece is retried from the same position.
+        let mut exposition = metrics.exposition();
+        let mut full = String::new();
+        exposition.next(&mut full).unwrap();
+        let mut failing = Failing;
+        assert!(exposition.next(&mut failing).is_err());
+        exposition.next(&mut full).unwrap();
+        assert!(whole.starts_with(&full));
+    }
+
+    struct Failing;
+    impl Write for Failing {
+        fn write_str(&mut self, _: &str) -> std::fmt::Result {
+            Err(std::fmt::Error)
+        }
     }
 }
