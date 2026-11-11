@@ -606,7 +606,9 @@ the manifest) and re-replicates the manifest to restore `N` copies.
 - `DELETE` goes to C. C journals `Delete`, sends `WriteRelease` to every holder,
   removes the current pointer (`invalidate` the catalog entry), and replies
   `204`. A committed upload returns `409 uploaded` (Racer does not delete
-  origin objects).
+  origin objects). As built, C journals a `Tombstone` and waits for
+  `replicas` page-zero members to journal it before `204` (see "Delete
+  durability as built").
 - Hold expiry: C journals `Expire` and releases holders. For `auto` objects,
   expiry before upload completion still uploads if the upload already started;
   otherwise the object is dropped and `failed` is not reported (it is gone).
@@ -1796,7 +1798,8 @@ Left undone:
   membership change and every 30 s; many concurrent written objects make this
   noticeable, and a batched status operation would reduce it.
 - A restarted coordinator that missed a `DELETE` reloads the deleted session
-  and serves it until its hold, as in WP5.
+  and serves it until its hold, as in WP5. Fixed: see "Delete durability as
+  built".
 
 ### WP9: SDKs (Python and Go)
 
@@ -2256,6 +2259,110 @@ Test: `app::dst::write_tests::a_new_page_zero_rank_0_does_not_404_before_rebalan
 holds the coordinator's rebalance off, joins nodes until a joiner is page
 zero's rank 0, and reads from the joiner and the original members. Without
 the fix, HEAD at the joiner returns `404`.
+
+### Delete durability as built
+
+A review of PR #1112 found that an acknowledged `DELETE` could come back.
+Before this fix the coordinator journaled `Delete` and answered `204`, then
+told the other page-zero members once, ignoring failures
+(`write/coordinator.rs` `delete`, base lines 621-675). Every path below is
+reproduced by a test in `app::dst::write_tests` that failed before the fix:
+
+- A replica down during the delete restarts. `coordinator::load` reloaded
+  every journaled session as a coordinator (base line 1204) that served at
+  once. Test: `a_replica_down_during_delete_does_not_resurrect_it`.
+- The coordinator is down and leaves the pool; the `DELETE` reaches the
+  replica, now rank 0. A replica only dropped itself (base line 637): no
+  release, no word to other members. When the coordinator came back at rank
+  0 it reloaded the session and served it. Test:
+  `a_coordinator_down_during_delete_does_not_resurrect_it`.
+- A replica cut off during the delete. After the heal, the coordinator's
+  own read asked the owners (`written_elsewhere`) and took the replica's
+  copy (`read/metadata.rs`, base line 933), and the replica's role check
+  promoted it, since the coordinator now answered "unknown" (base
+  `failover.rs` lines 143 and 182). Test:
+  `a_partitioned_replica_does_not_resurrect_a_delete`.
+- A holder down during the delete kept its pinned pages until the orphan
+  age or the hold. Not a resurrection (no node had the manifest), but a
+  leak. GC also stopped at the first member that knew the version (base
+  `gc.rs` line 280), so a restored, not yet checked session hid a delete.
+  Test: `a_holder_down_during_delete_drops_its_pages_after_restart`.
+
+Fix:
+
+- New journal record `Tombstone` (kind 10, `racer_core::write::journal`):
+  cache, key, ETag, the version's hold deadline, and its replica count.
+  Replay drops the version's session and pages like `Delete`, remembers the
+  tombstone (`JournalState::tombstones`, `store/journal.rs`), and ignores a
+  later `Open`, `Commit`, or `Page` of that version. Compaction keeps live
+  tombstones; `WriteJournal::forget_tombstones` drops them once the hold
+  ends. Tombstones are per version (ETag), so a deleted key can be written
+  again. `Delete` keeps its meaning for expiry and removed caches. Like
+  `Forget`, the record needs no new file format; an older build cannot read
+  a journal that holds it.
+- A client `DELETE` goes to page zero's rank 0, which deletes as the
+  coordinator whatever role it tracked the version in (`coordinator::delete`).
+  The session journals the tombstone, releases the holders, and sends
+  `write-session` action `tombstone` to every page-zero member
+  (`spread_tombstone`). Each member journals the tombstone (fsync) and drops
+  its copies before it answers. The `DELETE` gets `204` only when
+  `min(replicas, members)` page-zero members, the coordinator included, hold
+  the tombstone, the same quorum as the write. Otherwise `503` (sends wait
+  at most `TOMBSTONE_TIMEOUT`, 2 s). A retry by a node that holds the
+  tombstone spreads it again and answers `404` once the quorum holds, or
+  `503`.
+- A rank 0 with no session and no tombstone for the key (one that joined
+  ahead of the coordinator before rebalance) forwards the `DELETE` to a
+  page-zero member that knows the object instead of answering `404`
+  (`delete_elsewhere`).
+- Tombstones spread in the background on every membership change and retry
+  with backoff from 1 s to 30 s until every page-zero member acknowledged
+  (`spawn_spread`, run by `maintain`). A member that gets one drops the
+  version's session, current pointer, and written pages.
+- Sessions restored from the journal start unconfirmed (`Entry::confirmed`).
+  An unconfirmed session serves no fresh read: local and peer metadata reads
+  return `Unavailable`, not the version and not a miss
+  (`MetadataService::refresh` and `copy_only`). It does not repair, resume
+  an upload, persist, or promote. The role check (`failover::check_roles`)
+  first asks every page-zero member about the version (`confirm`). A
+  `deleted` answer from any member drops it. It is confirmed when fewer than
+  `min(replicas, members)` members stayed silent, since an acknowledged
+  delete left that many tombstones (`failover::confirmation`).
+- `status` with a written ETag answers `deleted` when the node holds that
+  version's tombstone, and `failover::probe` names the version. The role
+  check drops a version that a member ranked ahead reports deleted. A replica
+  about to promote also asks the members ranked behind it.
+- Readers: `written_elsewhere` skips an owner's answer for a version this
+  node holds a tombstone for, and `copy_only` skips a cached current pointer
+  to one. `replicate` refuses a tombstoned version, and store targets refuse
+  new copies of one.
+- GC treats a version this node holds a tombstone for as due every turn and
+  drops its pages. Any `deleted` answer from a member drops them too, and a
+  `deleted` answer now wins over a member that still knows the version.
+
+Tests: the five DST tests above (`a_delete_short_of_its_quorum_is_retryable`
+covers the `503`), `store::journal::tests::tombstones_outlive_compaction_and_block_revival`,
+`write::failover::tests::a_restored_session_is_live_only_when_no_hidden_tombstone_can_exist`,
+the session and codec tests for kind 10, and the peer codec round trips for
+`tombstone` and `deleted`. The write-traffic oracle (`app/dst/writes.rs`)
+retries a `503` delete like a client. If it stays unacknowledged, reads may
+return the old bytes or `404`.
+
+Open issues:
+
+- A replica cut off from every node that holds the tombstone can still
+  promote itself and serve the deleted version to readers on its side until
+  the partition heals. Then the next tombstone spread or role check drops
+  it. Closing this needs quorum reads.
+- A restored session is unreadable (`503`) until its check hears from
+  enough members. With `replicas=1`, every other page-zero member must
+  answer, so one dead member still in the pool blocks reads of that object
+  until the pool drops the member.
+- Tombstones are kept per node until the version's hold ends, so a burst
+  of deletes of objects with long holds keeps one small journal record each
+  that long.
+- Pinned (`If-Match`) reads of a deleted version can still succeed while a
+  copy of its pages is left, as before.
 
 ### WP12: documentation
 

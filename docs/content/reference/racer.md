@@ -1267,7 +1267,7 @@ Response bodies are empty.
 | Status | When |
 |--------|------|
 | `201 Created` | `PUT` or `host-write` is durable at the requested level and visible to readers. Has `ETag: "racer-<32 hex>"` and `Racer-Upload-State`. |
-| `204 No Content` | `DELETE` or `persist` accepted. `persist` also returns `Racer-Upload-State`. |
+| `204 No Content` | `DELETE` or `persist` accepted. `persist` also returns `Racer-Upload-State`. A `204` `DELETE` is durable: as many nodes as the object has copies recorded it on disk. |
 | `400` | Bad headers, a short body, or a bad header combination. |
 | `401`, `403` | Authorization or origin access was refused. |
 | `404` | `persist` or `DELETE` of a key with no written object. |
@@ -1280,7 +1280,7 @@ Response bodies are empty.
 | `431` | Request headers too large. |
 | `500` | An internal fault, such as the random source failing. Retrying the same request is not expected to help. |
 | `502` | Upload failed under `Racer-Durability: origin`. Token `upload`. |
-| `503` | Racer cannot take the write now, for example because the dirty limit is reached or too few nodes are reachable. Has `Retry-After: 1`. |
+| `503` | Racer cannot take the write now, for example because the dirty limit is reached or too few nodes are reachable. Has `Retry-After: 1`. A `503` `DELETE` may already have removed the object; retry it. A retry returns `204`, or `404` once the earlier delete is durable. |
 | `504` | The request deadline passed before the write was durable. |
 
 Errors may carry a `Racer-Write-Error` token for diagnosis:

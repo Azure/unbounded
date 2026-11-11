@@ -292,7 +292,10 @@ Key rules:
   only in the cache. Keep most checkpoints cache-only and upload every Nth one.
 - **Drop old checkpoints early.** Deleting a checkpoint before upload frees its
   space with no upload cost. Cache-only checkpoints are removed when their hold
-  time ends.
+  time ends. A `DELETE` returns `204` only after as many nodes as the object
+  has copies have recorded it, so a node that was down or cut off during the
+  delete cannot bring the object back. If too few nodes are reachable, it
+  returns `503`; retry it.
 - **Copies, not a system of record.** Until its upload commits, a written
   object survives only while one of its copies survives. When a node holding
   a copy leaves the pool for longer than `RACER_WRITE_HOLDER_GRACE_SECS`
