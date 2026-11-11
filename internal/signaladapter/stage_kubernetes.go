@@ -18,6 +18,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -34,6 +35,9 @@ const (
 	workflowRestartMetricName         = "restartSourceCounts"
 	rawWorkflowResultArtifactName     = "rawWorkflowResult"
 	maxInvocationResultArtifacts      = 16
+	stageSharedMemoryVolumeName       = "shared-memory"
+	stageSharedMemoryMountPath        = "/dev/shm"
+	stageSharedMemorySize             = "1Gi"
 )
 
 type workflowRestartSourceCounts struct {
@@ -442,6 +446,12 @@ func (e *KubernetesStageExecutor) stagePod(
 		container.VolumeMounts,
 		stageHostPathMounts(invocation.Stage.Test.Security.HostPaths)...,
 	)
+	if invocation.Stage.Test.Security.IPCLock {
+		container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{
+			Name:      stageSharedMemoryVolumeName,
+			MountPath: stageSharedMemoryMountPath,
+		})
+	}
 	applyStageSecurity(&container, invocation.Stage.Test.Security)
 
 	pod := &corev1.Pod{
@@ -469,6 +479,18 @@ func (e *KubernetesStageExecutor) stagePod(
 			Containers:                   []corev1.Container{container},
 			Volumes:                      stageHostPathVolumes(invocation.Stage.Test.Security.HostPaths),
 		},
+	}
+	if invocation.Stage.Test.Security.IPCLock {
+		sizeLimit := resource.MustParse(stageSharedMemorySize)
+		pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
+			Name: stageSharedMemoryVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{
+					Medium:    corev1.StorageMediumMemory,
+					SizeLimit: &sizeLimit,
+				},
+			},
+		})
 	}
 
 	if driver.Type == signalv1.TestDriverTypeScript {

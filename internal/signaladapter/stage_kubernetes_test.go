@@ -1174,6 +1174,38 @@ func TestStagePodUsesFileHostPathTypeForApprovedProcLeaf(t *testing.T) {
 	}
 }
 
+func TestStagePodProvidesBoundedSharedMemoryForIPCLock(t *testing.T) {
+	t.Parallel()
+
+	invocation := stageExecutionInvocation()
+	invocation.Stage.Test.Security.IPCLock = true
+	executor := &KubernetesStageExecutor{
+		Namespace:     "signal-system",
+		ExecutionName: "stage",
+	}
+
+	pod, err := executor.stagePod(testWorkflow("parent", "parent-uid"), invocation, 0)
+	if err != nil {
+		t.Fatalf("stagePod() error = %v", err)
+	}
+
+	if len(pod.Spec.Volumes) != 1 ||
+		pod.Spec.Volumes[0].Name != stageSharedMemoryVolumeName ||
+		pod.Spec.Volumes[0].EmptyDir == nil ||
+		pod.Spec.Volumes[0].EmptyDir.Medium != corev1.StorageMediumMemory ||
+		pod.Spec.Volumes[0].EmptyDir.SizeLimit == nil ||
+		pod.Spec.Volumes[0].EmptyDir.SizeLimit.String() != stageSharedMemorySize {
+		t.Fatalf("stage Pod shared-memory volume = %#v", pod.Spec.Volumes)
+	}
+
+	mounts := pod.Spec.Containers[0].VolumeMounts
+	if len(mounts) != 1 ||
+		mounts[0].Name != stageSharedMemoryVolumeName ||
+		mounts[0].MountPath != stageSharedMemoryMountPath {
+		t.Fatalf("stage Pod shared-memory mounts = %#v", mounts)
+	}
+}
+
 func TestLegacyHostPathMountPreservesWritablePolicy(t *testing.T) {
 	t.Parallel()
 
