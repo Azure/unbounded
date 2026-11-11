@@ -989,7 +989,8 @@ The code refined these interfaces; the code is authoritative.
   parser does not know cache defaults or the origin's metadata schema.
 - Extra helpers: `max_object_bytes(page_size)`, `MAX_HOLD_SECONDS`,
   `error_token::*` constants, `write_no_content_head(Option<UploadState>)` for
-  `204`, and `client::error_head_with_allow(status, length, allow_writes)`.
+  `204`, `client::allowed_methods(target, writes)`, and
+  `client::error_head_with_allow(status, length, allow)`.
   The head codec omits reason phrases.
 - `NodeIdBytes` is `Vec<u8>`. `Holders::{encode, decode, validate, nodes}`.
 - `Session::open(identity: WriteIdentity, spec, now, lease)`: the session needs
@@ -1401,6 +1402,18 @@ rest of a long turn; the turn's own I/O wakes the worker instead.
 is how store targets pull (also over RDMA; see the test below). The listener
 routes `is_write` heads to `write::client::serve` when the cache has writes,
 and answers `405 Allow: HEAD, POST` for every write route otherwise.
+Review fix (as built): `write::client::serve` returns its `Outcome`, and the
+listener marks a `201` or `204` write as a successful client request. Before,
+every write ended with no success mark, so `racer_request_errors_total` and
+`racer_request_errors_other_total` counted each successful write as a failure
+and logged a `stage=client-request state=failed` line. A `503` write records
+`Unavailable` as its reason. On a cache with writes, every `405` lists the
+methods its path accepts (`client::allowed_methods`): `HEAD, POST, PUT,
+DELETE` on `/v1/objects/<key>` (including the read parser's `405`s, which
+answered `HEAD, POST` before) and `POST` on `host-read`, `gpu-read`,
+`host-write`, and `persist`. Any non-`POST` method on `host-write` or
+`persist` is `405`, not the read parser's `400`. Caches without writes keep
+`HEAD, POST` on every path.
 `MetadataService::refresh` consults the worker's write directory before
 peers and origin. `ReadResponse::upload_state` carries `Racer-Upload-State`
 for HEAD (the coordinator is asked with `status`). The lookup runs on a copy

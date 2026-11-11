@@ -1228,6 +1228,11 @@ When writes are off, or the cache is passthrough, these requests, including
 `persist`, get `405` with `Allow: HEAD, POST`, the same as a node that does
 not support writes.
 
+When writes are on, a `405` lists the methods its path accepts:
+`Allow: HEAD, POST, PUT, DELETE` on `/v1/objects/<key>`, and `Allow: POST` on
+`host-read`, `gpu-read`, `host-write`, and `persist`. Any method other than
+`POST` on `host-write` or `persist` gets that `405`.
+
 #### Write request headers
 
 | Header | Requests | Rule |
