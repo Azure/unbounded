@@ -52,6 +52,9 @@ type snapshotCache struct {
 	ctx         context.Context
 	cancel      context.CancelFunc
 	err         error
+	historyUID  string
+	history     RunHistory
+	baselines   map[string]trafficBaseline
 }
 
 type Server struct {

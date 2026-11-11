@@ -59,13 +59,18 @@ clear caches, delete existing workloads, or replace conflicting DaemonSets.
 ## Cluster Overview and Worker Views
 
 The full-width workspace uses a searchable **Choose image / Change image**
-picker instead of a permanent registry sidebar. With no worker selected, the
-inspector shows **Gantry cluster activity**: aggregate origin/peer receive
-bandwidth, active origin and peer layer transfers, reported origin failures,
-peer busy responses, and peer dial failures. The bandwidth chart retains the
-last minute of observed receive rates. Selecting a worker opens its detail;
-**Clear selection**, a second click on that worker, or Escape restores the
-cluster overview.
+picker instead of a permanent registry sidebar. **Gantry cluster activity**
+stays above four simultaneous panels: image distribution, Pod lifecycle,
+fleet readiness, and disk usage. The panels form a two-by-two grid on desktop
+with compact 40-column heatmaps and stack on mobile. Selecting a worker
+highlights it across all three heatmaps and opens its details below without hiding the panels or cluster
+activity. **Clear selection**, a second click on that worker, or Escape
+clears the selection.
+
+Cluster activity shows live origin/peer receive rates, active layer transfers,
+reported failures, and cumulative origin/peer received bytes observed during
+the selected run. The scope is **cluster-wide traffic observed during the
+selected run**, not exact traffic for the selected image.
 
 Gantry aggregates cover all images on all discovered Gantry agents, including
 native agents outside the selected Flex pool. The worker grid remains scoped
@@ -80,6 +85,16 @@ than ten seconds, unreachable agents, and counter resets do not turn into
 zero-rate samples or bandwidth spikes. Reporting coverage is shown explicitly;
 partial aggregates sum known agents only. Missing source gauges stay
 unavailable until the agents are upgraded.
+
+The bandwidth and Ready-worker charts span the selected deployment's creation
+through its latest observation, including runs longer than a minute. Their
+shared **From / To** sliders zoom the time range; **Reset to full run** restores
+it. Dashed baseline sections mark missing observations and collection gaps,
+not zero traffic or zero Ready workers. Collection begins at the first
+observation: earlier telemetry and traffic totals are not reconstructed.
+History is held by the server, so browser refresh keeps collected samples
+without storing large histories in the browser. History does not survive a
+dashboard server restart.
 
 **Image distribution** displays one cell per worker, with one overall
 byte-availability bar. Clicking a cell opens the layer breakdown. Committed
@@ -96,7 +111,17 @@ does not expose a distinct unpack percentage, so preparation is labeled as a
 combined image/filesystem/container phase rather than inventing unpack
 progress. Events may expire; missing history is explicitly left unavailable.
 
-**Startup latency** shows a selected worker's scheduling, waiting-to-pull,
+**Fleet readiness** shows current Ready Pods and 50%, 95%, and 100% milestones,
+measured from deployment creation using current Pods' observed Ready
+timestamps. A missing milestone remains unavailable. The chart uses collected
+Ready-worker counts rather than inventing telemetry before collection began.
+
+**Disk usage** shows the filesystem backing Gantry on each worker. Its usage
+includes all images and workloads, not just the selected image; percentages
+exclude filesystem-reserved space. Missing filesystem observations remain
+unknown. Worker details include used, available, total, and reserved bytes.
+
+The selected worker's **Startup waterfall** shows scheduling, waiting-to-pull,
 image preparation, container start, and Pod readiness waterfall. Pod milestones
 use observed status timestamps. Pull stages use events fenced to that exact
 Pod UID, not events from a replacement Pod on the same node. Event-based
@@ -113,10 +138,9 @@ that the image was already present. Container restarts are shown separately,
 and restarted containers are not presented as reconstructed first startups.
 Missing or unfinished stages stay unavailable rather than becoming zero.
 
-The startup view also lists up to 20 workers ordered by observed
-Created-to-Ready duration. **Export timings** downloads all workers' observed
-Pod milestones as CSV; it does not pretend to contain pull histories that
-were not collected. Build/push time is not part of Pod startup latency.
+Worker details retain the observed layer breakdown, lifecycle events, startup
+waterfall, disk usage, and node-wide receive rates. Build/push time is not part
+of Pod startup latency.
 
 For ACR Artifact Streaming, a Pod can become Ready before all bytes are
 available. Full-image completion is neither a readiness prerequisite nor
@@ -126,6 +150,11 @@ other images and retries, and are not used to calculate byte percentages.
 Per-layer peer/origin attribution is not currently recorded.
 
 ## Generate Images
+
+Worker heatmaps default to 25 columns and sort independently by status, with
+errors and attention-needed workers first. Disk groups sort fullest first.
+Charts and observed transfer totals freeze when all workers are Ready or
+Completed; live Pod and storage observations continue refreshing.
 
 **Generate & pull** creates random payload layers and publishes them before
 starting a digest-pinned demo DaemonSet. **Enable ACR streaming** is unchecked
@@ -238,8 +267,9 @@ containerd content; the dashboard uses it for agents outside the worker grid.
 Browser updates use server-sent events. A first snapshot establishes the grid;
 subsequent worker deltas are flushed in batches at most every 100 milliseconds
 as agent observations arrive, without waiting for the slowest worker. Multiple
-viewers share one collector per deployment; collection stops when the last
-viewer disconnects. Node details use the same incrementally updated cache,
+viewers share one collector per deployment. After the first viewer starts
+collection, it continues with no viewers until the deployment is deleted or
+evicted from the server cache. Node details use the same incrementally updated cache,
 rather than sending every layer for every worker to every browser. Collection concurrency is bounded to 256
 requests, individual agent requests to three seconds, and a collection pass
 to 25 seconds. The one-second default interval is a minimum between collection

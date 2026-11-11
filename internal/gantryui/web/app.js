@@ -1,19 +1,20 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-import { buildRequestError, bytes, distributionState, escape as esc, mergeNodeUpdates, percent, phaseLabel, storagePercent, storageState, summary } from "./model.js";
-import { clusterActivityHTML, drawBandwidth } from "./activity.js";
+import { buildRequestError, bytes, distributionState, escape as esc, mergeNodeUpdates, percent, phaseLabel, sortWorkers, storagePercent, storageState, summary } from "./model.js";
+import { clusterActivityHTML, drawHistoryChart } from "./activity.js";
+import { historyWindow, readinessMilestones } from "./history.js";
 import { duration, startupTimeline } from "./startup.js";
 
 const $ = id => document.getElementById(id);
 const state = {
   config: null, images: [], deployments: [], deployment: null, snapshot: null,
   selected: null, detail: null, events: [], eventsError: "", detailError: "",
-  view: "distribution", stream: null, zoom: 1, busy: false, connected: false,
-  stale: false, lastUpdate: 0, eventsRequest: null, cells: new Map(), traffic: [],
+  stream: null, zoom: 1, busy: false, connected: false,
+  stale: false, lastUpdate: 0, eventsRequest: null, cells: new Map(),
   build: null, buildBusy: false, buildTimer: null, buildRequest: null,
   renderFrame: 0, renderedNode: null, detailLoading: false, detailObservation: null,
-  clusterTraffic: [], eventsPodUID: null, timingsHTML: "", clusterPanelHTML: "",
+  eventsPodUID: null, clusterPanelHTML: "", timeRange: null,
   reclaimBusy: false, reclaimTimer: null, reclaimController: null, reclaimResetUID: null, reclaimStartController: null,
 };
 const kindBadge = image => `<span class="badge ${image.streaming ? "streaming" : "oci"}">${image.streaming ? "ACR STREAMING" : "OCI"}</span>`;
@@ -100,11 +101,12 @@ function activate(deployment, resumed) {
   if (state.reclaimBusy) return;
   state.stream?.close();
   state.eventsRequest?.abort();
-  Object.assign(state, { deployment, snapshot: null, selected: null, detail: null, events: [], cells: new Map(), traffic: [], lastUpdate: 0, connected: false });
-  $("grid").replaceChildren();
+  Object.assign(state, { deployment, snapshot: null, selected: null, detail: null, events: [], cells: new Map(), lastUpdate: 0, connected: false, timeRange: null, renderedNode: null, detailLoading: false, detailObservation: null, eventsPodUID: null });
+  for (const grid of document.querySelectorAll(".node-grid")) grid.replaceChildren();
+  $("history-from").value = "0";
+  $("history-to").value = "1000";
   $("stats").replaceChildren();
   $("grid-summary").textContent = "Collecting workers for this deployment...";
-  $("export-timings").disabled = true;
   $("welcome").hidden = true;
   $("workspace").hidden = false;
   $("image-picker-label").textContent = "Change image";
@@ -122,6 +124,7 @@ function activate(deployment, resumed) {
   history.replaceState(null, "", url);
   renderCatalog();
   renderDetail();
+  renderCharts();
   connection("Connecting");
   const stream = new EventSource(`/api/deployments/${deployment.id}/stream`);
   state.stream = stream;
@@ -159,6 +162,7 @@ function receivedObservations() {
   if (!Number.isFinite(state.lastUpdate)) throw new Error("Invalid observation timestamp");
   state.connected = true;
   state.stale = false;
+  renderUpdated();
   $("grid-panel").classList.remove("stale");
   connection("Live", true);
   error("");
@@ -175,72 +179,78 @@ function renderSnapshot() {
   const snapshot = state.snapshot;
   if (!snapshot) return;
   const image = snapshot.deployment.image;
-  const counts = summary(snapshot.nodes, image, state.view);
   renderClusterOverview();
-  $("export-timings").disabled = false;
-  $("grid-title").textContent = state.view === "distribution" ? "Cluster distribution" : state.view === "storage" ? "Node storage" : state.view === "startup" ? "Worker startup state" : "Pod lifecycle";
-  $("grid-description").textContent = state.view === "distribution"
-    ? "One cell per worker · Image bytes available locally"
-    : state.view === "storage" ? "One cell per worker · Filesystem backing Gantry data, across all images and workloads"
-      : "One cell per worker · Observed Pod state, independent of image download";
   const active = new Set(snapshot.nodes.map(node => node.name));
   if (state.selected && !active.has(state.selected)) {
     state.eventsRequest?.abort();
     state.selected = null;
     state.detail = null;
   }
-  $("grid-summary").textContent = state.view === "distribution"
+  for (const [key, cell] of state.cells) {
+    if (!active.has(cell.dataset.node)) { cell.remove(); state.cells.delete(key); }
+  }
+  for (const grid of document.querySelectorAll(".node-grid")) renderGrid(grid, image);
+  const ready = snapshot.nodes.filter(node => node.phase === "ready").length;
+  $("readiness-summary").textContent = `${number(ready)} / ${number(snapshot.nodes.length)} workers Ready now`;
+  $("readiness-milestones").innerHTML = readinessMilestones(snapshot.nodes, snapshot.history?.start, snapshot.observedAt)
+    .map(milestone => `<div><span>${milestone.percent}% Ready</span><strong>${duration(milestone.seconds)}</strong><small>${number(milestone.target)} workers · ${milestone.at === null ? "Not observed" : esc(time(milestone.at))}</small></div>`).join("");
+  renderCharts();
+  if (state.renderedNode !== selectedNode()) renderDetail();
+}
+
+function renderGrid(grid, image) {
+  const view = grid.dataset.view;
+  const snapshot = state.snapshot;
+  const counts = summary(snapshot.nodes, image, view);
+  const summaryID = view === "distribution" ? "grid-summary" : `${view}-summary`;
+  $(summaryID).textContent = view === "distribution"
     ? `${number(snapshot.nodes.length)} workers · ${number(counts.complete || 0)} bytes complete · ${number(counts.pulling || 0)} downloading · ${number(counts.failed || 0)} pull errors`
     : `${number(snapshot.nodes.length)} workers · ${number(counts.ready || 0)} Ready · ${number((counts.preparing || 0) + (counts.queued || 0) + (counts.scheduling || 0))} preparing · ${number(counts.failed || 0)} errors`;
-  if (state.view === "storage") {
+  if (view === "storage") {
     const reporting = snapshot.nodes.filter(node => storagePercent(node.storage) !== null);
     const totals = reporting.reduce((sum, node) => ({ used: sum.used + node.storage.used, available: sum.available + node.storage.available }), { used: 0, available: 0 });
-    $("grid-summary").textContent = `${number(reporting.length)} / ${number(snapshot.nodes.length)} workers observed · ${reporting.length ? bytes(totals.used) : "--"} used · ${reporting.length ? bytes(totals.available) : "--"} left`;
-  }
-  for (const [name, cell] of state.cells) {
-    if (!active.has(name)) { cell.remove(); state.cells.delete(name); }
+    $(summaryID).textContent = `${number(reporting.length)} / ${number(snapshot.nodes.length)} workers observed · ${reporting.length ? bytes(totals.used) : "--"} used · ${reporting.length ? bytes(totals.available) : "--"} left`;
   }
   let position = 0;
-  $("grid").dataset.empty = "No Linux workers match this pool and architecture.";
-  for (const node of snapshot.nodes) {
-    let cell = state.cells.get(node.name);
+  grid.dataset.empty = "No Linux workers match this pool and architecture.";
+  for (const node of sortWorkers(snapshot.nodes, image, view)) {
+    const key = `${view}:${node.name}`;
+    let cell = state.cells.get(key);
     if (!cell) {
       cell = document.createElement("button");
       cell.type = "button";
       cell.dataset.node = node.name;
       cell.className = "node-cell";
       cell.innerHTML = '<span class="cell-fill"></span><span class="cell-label"></span>';
-      state.cells.set(node.name, cell);
+      state.cells.set(key, cell);
     }
-    const phase = state.view === "distribution" ? distributionState(node, image) : state.view === "storage" ? storageState(node) : node.phase;
-    const value = state.view === "storage" ? storagePercent(node.storage) : percent(node.available, image.size);
-    const filter = $("filter").value;
-    const before = $("grid").children[position++];
-    if (before !== cell) $("grid").insertBefore(cell, before || null);
-    const storageLabel = state.view === "storage" ? `, ${bytes(node.storage?.used)} used, ${bytes(node.storage?.available)} left` : "";
-    const visualKey = JSON.stringify([phase, value, storageLabel, state.view, state.selected === node.name, node.nodeReady, filter, position === 1]);
+    const phase = view === "distribution" ? distributionState(node, image) : view === "storage" ? storageState(node) : node.phase;
+    const value = view === "storage" ? storagePercent(node.storage) : percent(node.available, image.size);
+    const filter = view === "distribution" ? $("filter").value : "all";
+    const before = grid.children[position++];
+    if (before !== cell) grid.insertBefore(cell, before || null);
+    const storageLabel = view === "storage" ? `, ${bytes(node.storage?.used)} used, ${bytes(node.storage?.available)} left` : "";
+    const visualKey = JSON.stringify([phase, value, storageLabel, view, state.selected === node.name, node.nodeReady, filter, position === 1]);
     if (cell.dataset.visualKey === visualKey) continue;
     cell.dataset.visualKey = visualKey;
     cell.className = `node-cell ${phase} ${state.selected === node.name ? "selected" : ""} ${node.nodeReady ? "" : "node-unready"}`;
-    cell.setAttribute("aria-label", `${node.name}: ${phaseLabel(phase)}${state.view === "distribution" ? `, ${progressText(value)} bytes available` : storageLabel}`);
+    cell.setAttribute("aria-label", `${node.name}: ${phaseLabel(phase)}${view === "distribution" ? `, ${progressText(value)} bytes available` : storageLabel}`);
     cell.setAttribute("aria-pressed", String(state.selected === node.name));
     cell.tabIndex = state.selected === node.name || (!state.selected && position === 1) ? 0 : -1;
-    cell.querySelector(".cell-fill").style.width = `${state.view === "lifecycle" ? 100 : value ?? 0}%`;
-    cell.querySelector(".cell-label").textContent = state.view === "distribution" ? `${shortName(node.name)} ${progressText(value)}` : state.view === "storage" ? `${shortName(node.name)} ${bytes(node.storage?.available)} left` : shortName(node.name);
+    cell.querySelector(".cell-fill").style.width = `${view === "lifecycle" ? 100 : value ?? 0}%`;
+    cell.querySelector(".cell-label").textContent = view === "distribution" ? `${shortName(node.name)} ${progressText(value)}` : view === "storage" ? `${shortName(node.name)} ${bytes(node.storage?.available)} left` : shortName(node.name);
     cell.classList.toggle("dimmed", filter !== "all" && (filter === "active" ? !["pulling", "preparing", "scheduling", "running"].includes(phase) : phase !== filter));
   }
-  $("grid").classList.toggle("zoomed", state.zoom > 1);
-  $("grid").style.gridTemplateColumns = `repeat(${Math.max(8, Math.floor(40 / state.zoom))}, minmax(0, 1fr))`;
-  $("grid").style.gridAutoRows = state.zoom > 1 ? `${24 * state.zoom}px` : "minmax(6px, 1fr)";
-  const legend = state.view === "distribution" ? ["complete", "pulling", "queued", "unknown", "failed"] : state.view === "storage" ? ["storage-ok", "storage-high", "storage-full", "unknown"] : ["scheduling", "preparing", "running", "ready", "completed", "failed"];
-  $("legend").innerHTML = legend.map(phase => `<span class="${phase}"><i></i>${phaseLabel(phase)}</span>`).join("");
-  if (state.renderedNode !== selectedNode()) renderDetail();
-  if (state.view === "startup" && state.selected) renderTimingsTable();
+  grid.classList.toggle("zoomed", state.zoom > 1);
+  grid.style.gridTemplateColumns = `repeat(${Math.max(8, Math.floor(25 / state.zoom))}, minmax(0, 1fr))`;
+  grid.style.gridAutoRows = `${14 * state.zoom}px`;
+  const legend = view === "distribution" ? ["complete", "pulling", "queued", "unknown", "failed"] : view === "storage" ? ["storage-ok", "storage-high", "storage-full", "unknown"] : ["scheduling", "preparing", "running", "ready", "completed", "failed"];
+  $(view === "distribution" ? "legend" : `${view}-legend`).innerHTML = legend.map(phase => `<span class="${phase}"><i></i>${phaseLabel(phase)}</span>`).join("");
 }
 
 function renderClusterOverview() {
   const activity = state.snapshot?.activity;
-  const rendered = clusterActivityHTML(activity);
+  const rendered = clusterActivityHTML(activity, state.snapshot?.history);
   if ($("stats").innerHTML !== rendered.cards) $("stats").innerHTML = rendered.cards;
   $("activity-coverage").textContent = rendered.coverage;
   if (state.clusterPanelHTML !== rendered.panel) {
@@ -248,50 +258,38 @@ function renderClusterOverview() {
     $("cluster-activity").innerHTML = rendered.panel;
     paintBars($("cluster-activity"));
   }
-  const at = Date.parse(activity?.observedAt);
-  const last = state.clusterTraffic.at(-1);
-  if (!activity?.rateReporting) { drawBandwidth($("cluster-bandwidth"), []); return; }
-  if (Number.isFinite(at) && activity.originRate != null && activity.peerRate != null && (!last || at - last.at >= 500)) {
-    state.clusterTraffic.push({ at, origin: activity.originRate, peer: activity.peerRate });
-    state.clusterTraffic = state.clusterTraffic.filter(point => point.at >= at - 60000).slice(-180);
-    drawBandwidth($("cluster-bandwidth"), state.clusterTraffic);
-  } else if (!state.clusterTraffic.length) drawBandwidth($("cluster-bandwidth"), []);
+}
+
+function renderCharts() {
+  const history = state.snapshot?.history;
+  const observed = state.snapshot?.observedAt;
+  drawHistoryChart($("cluster-bandwidth"), history, observed, state.timeRange);
+  drawHistoryChart($("readiness-chart"), history, observed, state.timeRange, true);
+  const window = historyWindow(history, observed, state.timeRange);
+  $("history-range").textContent = window.available ? `${time(window.start)} - ${time(window.end)}${state.timeRange ? " · zoomed" : " · full run"}` : "Waiting for server history";
+  for (const id of ["history-from", "history-to", "history-reset"]) $(id).disabled = !window.available;
 }
 
 function selectedNode() { return state.snapshot?.nodes.find(node => node.name === state.selected); }
 function observationKey(node) { return JSON.stringify([node?.podUID, node?.updatedAt, node?.telemetryError, node?.storageUpdatedAt]); }
 
 function clearSelection() {
-  const previous = state.cells.get(state.selected);
-  if (previous) { previous.classList.remove("selected"); previous.setAttribute("aria-pressed", "false"); previous.tabIndex = -1; }
   state.eventsRequest?.abort();
-  Object.assign(state, { selected: null, detail: null, events: [], eventsPodUID: null, detailLoading: false, detailObservation: null, traffic: [] });
-  if (state.cells.size) state.cells.values().next().value.tabIndex = 0;
+  Object.assign(state, { selected: null, detail: null, events: [], eventsPodUID: null, detailLoading: false, detailObservation: null });
+  renderSnapshot();
   renderDetail();
 }
 
 function chooseNode(name) {
   if (state.selected === name) { clearSelection(); return; }
-  const previous = state.cells.get(state.selected);
-  if (previous) {
-    previous.classList.remove("selected");
-    previous.setAttribute("aria-pressed", "false");
-    previous.tabIndex = -1;
-  } else if (state.cells.size) state.cells.values().next().value.tabIndex = -1;
   state.selected = name;
-  const cell = state.cells.get(name);
-  if (cell) {
-    cell.classList.add("selected");
-    cell.setAttribute("aria-pressed", "true");
-    cell.tabIndex = 0;
-  }
   state.detail = null;
   state.events = [];
   state.eventsPodUID = null;
   state.eventsError = "";
   state.detailError = "";
-  state.traffic = [];
   $("tooltip").hidden = true;
+  renderSnapshot();
   renderDetail();
   void loadNode();
 }
@@ -311,20 +309,15 @@ async function loadNode(live = false) {
   const current = () => !controller.signal.aborted && state.selected === name && state.deployment?.id === deployment && selectedNode()?.podUID === podUID;
   const requests = [api(`${base}/nodes/${encodeURIComponent(name)}`, { signal: controller.signal }).then(detail => {
     if (!current()) return;
-    const previous = state.detail;
     state.detail = detail;
     state.detailError = "";
-    if (!detail.telemetryError && detail.updatedAt !== previous?.updatedAt && detail.peerRate !== null && detail.originRate !== null) {
-      state.traffic.push({ peer: state.detail.peerRate, origin: state.detail.originRate });
-      state.traffic = state.traffic.slice(-40);
-    }
     renderDetail();
   }, failure => {
     if (!current()) return;
     state.detailError = failure.message;
     renderDetail();
   })];
-  if (["lifecycle", "startup"].includes(state.view) && (!live || state.eventsPodUID !== podUID)) requests.push(api(`${base}/events?node=${encodeURIComponent(name)}`, { signal: controller.signal }).then(events => {
+  if (!live || state.eventsPodUID !== podUID) requests.push(api(`${base}/events?node=${encodeURIComponent(name)}`, { signal: controller.signal }).then(events => {
     if (!current()) return;
     state.events = events;
     state.eventsPodUID = podUID;
@@ -342,22 +335,19 @@ async function loadNode(live = false) {
 function renderDetail() {
   const node = selectedNode();
   state.renderedNode = node;
-  $("cluster-activity").hidden = !!node;
   $("node-detail").hidden = !node;
-  $("activity").hidden = !node;
-  $("timings-table-panel").hidden = !node || state.view !== "startup";
   if (!node) {
     renderClusterOverview();
     return;
   }
   const image = state.deployment.image;
-  const storageView = state.view === "storage";
-  const value = storageView ? storagePercent(node.storage) : percent(node.available, image.size);
-  const phase = storageView ? storageState(node) : node.phase;
+  const value = percent(node.available, image.size);
+  const phase = node.phase;
   const restoreClearFocus = document.activeElement?.id === "clear-selection";
-  let content = `<div class="detail-heading"><h2>${esc(shortName(node.name))}</h2><span class="phase-badge ${esc(phase)}">${esc(phaseLabel(phase))}</span><button id="clear-selection" class="clear-selection">Clear selection &#215;</button><div class="detail-progress"><span>${storageView ? "Disk used" : "Image bytes available"} <strong>${progressText(value)}</strong></span>${bar(value, storageView ? phase : "")}</div></div><p class="small muted node-name">${esc(node.name)}</p>`;
+  let content = `<div class="detail-heading"><h2>${esc(shortName(node.name))}</h2><span class="phase-badge ${esc(phase)}">${esc(phaseLabel(phase))}</span><button id="clear-selection" class="clear-selection">Clear selection &#215;</button><div class="detail-progress"><span>Image bytes available <strong>${progressText(value)}</strong></span>${bar(value)}</div></div><p class="small muted node-name">${esc(node.name)}</p>`;
   if (!node.nodeReady) content += '<p class="notice warning-notice">Kubernetes reports this worker as not Ready.</p>';
-  if (state.view === "distribution") {
+  {
+    content += "<h3>Image layers</h3>";
     const detail = state.detail;
     if (state.detailError) content += `<p class="notice error-notice">${esc(state.detailError)}</p>`;
     if (!detail && !state.detailError) content += '<p class="muted">Reading layer observations...</p>';
@@ -370,18 +360,20 @@ function renderDetail() {
       content += `</tbody></table></div><p class="small muted detail-note">${detail.updatedAt ? `Last byte observation: ${esc(time(detail.updatedAt))}. ` : ""}Unique locally available bytes, not cumulative traffic. Per-layer peer/origin attribution is not currently recorded.</p>`;
       if (image.streaming) content += '<p class="small streaming-note">Artifact Streaming: a Pod can be Ready before all layer bytes are available. Cache coverage may decrease after an agent restart.</p>';
     }
-  } else if (storageView) {
+  }
+  {
+    content += "<h3>Disk usage</h3>";
     const storage = node.storage;
-    if (value === null) content += '<p class="muted">Waiting for the first filesystem observation.</p>';
+    if (storagePercent(storage) === null) content += '<p class="muted">Waiting for the first filesystem observation.</p>';
     else {
       content += `<div class="storage-cards">${[
         ["Used", storage.used], ["Space left", storage.available], ["Total capacity", storage.total], ["Filesystem reserved", storage.total - storage.used - storage.available],
       ].map(([label, amount]) => `<div><span>${label}</span><strong>${bytes(amount)}</strong></div>`).join("")}</div><p class="small muted">Filesystem backing <span class="digest">${esc(storage.path)}</span>. Includes all files on this filesystem, not just Gantry or the selected image. Usage percentage excludes filesystem-reserved space.</p><p class="small muted">Last storage observation: ${esc(time(node.storageUpdatedAt))}.</p>`;
     }
-  } else if (state.view === "startup") {
-    content += startupHTML(node);
-    if (state.eventsError) content += `<p class="notice error-notice">${esc(state.eventsError)}</p>`;
-  } else {
+  }
+  content += "<h3>Startup waterfall</h3>" + startupHTML(node);
+  {
+    content += "<h3>Pod lifecycle</h3>";
     content += `<p class="lifecycle-reason">${esc(node.reason)}</p><div class="timeline">${[
       ["Pod created", node.created], ["Scheduled", node.scheduled], ["Container started", node.started], ["Pod Ready", node.readyAt],
     ].map(([label, at]) => `<div class="${at ? "observed" : ""}"><i></i><strong>${label}</strong><span>${time(at)}</span></div>`).join("")}</div>`;
@@ -389,6 +381,8 @@ function renderDetail() {
     if (state.eventsError) content += `<p class="notice error-notice">${esc(state.eventsError)}</p>`;
     else content += `<div class="event-list">${state.events.length ? state.events.map(event => `<article class="${event.type === "Warning" ? "warning-event" : ""}"><time>${time(event.at)}</time><div><strong>${esc(event.reason)}</strong><p>${esc(event.message)}</p>${event.count > 1 ? `<span class="small muted">${event.count} occurrences</span>` : ""}</div></article>`).join("") : '<p class="muted">No retained events for this Pod. Events may expire; missing history is not reconstructed.</p>'}</div>`;
   }
+  const detail = state.detail;
+  content += `<h3>Worker transfer activity</h3><p class="small muted">All layer traffic on ${esc(shortName(node.name))}, not attribution to this image.</p><div class="traffic-cards"><div class="peer"><span>From peers</span><strong>${bytes(detail?.peerRate)}/s</strong></div><div class="origin"><span>From origin</span><strong>${bytes(detail?.originRate)}/s</strong></div></div><p class="small muted">${detail?.peerRate == null ? "Rates require two successful observations." : `Observed ${time(detail.updatedAt)}. Retries count as network traffic, not extra progress.`}</p>`;
   $("node-detail").innerHTML = content;
   paintBars($("node-detail"));
   for (const element of $("node-detail").querySelectorAll("[data-startup-offset]")) {
@@ -396,10 +390,6 @@ function renderDetail() {
     element.style.width = `${Number(element.dataset.startupWidth)}%`;
   }
   if (restoreClearFocus) $("clear-selection").focus({ preventScroll: true });
-  const detail = state.detail;
-  $("activity").innerHTML = `<h2>Node transfer activity</h2><p class="small muted">All layer traffic on ${esc(shortName(node.name))}, not attribution to this image.</p><div class="traffic-cards"><div class="peer"><span>From peers</span><strong>${bytes(detail?.peerRate)}/s</strong></div><div class="origin"><span>From origin</span><strong>${bytes(detail?.originRate)}/s</strong></div></div><svg id="sparkline" class="sparkline" viewBox="0 0 360 110" role="img" aria-label="Recent peer and origin transfer rates"></svg><div class="legend"><span class="pulling"><i></i>Peer traffic</span><span class="preparing"><i></i>Origin traffic</span></div><p class="small muted">${detail?.peerRate == null ? "Rates require two successful observations." : `Observed ${time(detail.updatedAt)}. Retries count as network traffic, not extra progress.`}</p>`;
-  drawTraffic();
-  if (state.view === "startup") renderTimingsTable();
 }
 
 function startupHTML(node) {
@@ -412,45 +402,6 @@ function startupHTML(node) {
     <p class="startup-note">Image preparation includes runtime pull and unpack work, not just network transfer. Event-derived durations are approximate. Hover a duration for its source.</p>
     ${state.deployment.image.streaming ? '<p class="small streaming-note">Artifact Streaming: Pod Ready and full-image byte completion are separate. Remaining bytes may arrive on demand.</p>' : ""}
     ${timing.warnings.map(warning => `<p class="small muted">${esc(warning)}</p>`).join("")}`;
-}
-
-function renderTimingsTable() {
-  if (!state.snapshot) return;
-  const entries = state.snapshot.nodes.map(node => ({ node, timing: startupTimeline(node, [], state.snapshot.observedAt) }));
-  entries.sort((a, b) => (b.timing.total ?? -1) - (a.timing.total ?? -1) || a.node.name.localeCompare(b.node.name));
-  const rows = entries.slice(0, 20).map(({ node, timing }) => `<tr class="${state.selected === node.name ? "selected" : ""}"><td><button data-timing-node="${esc(node.name)}">${esc(shortName(node.name))}</button></td><td>${esc(phaseLabel(node.phase))}</td><td>${duration(timing.stages[0].seconds)}</td><td>${duration(timing.stages[4].seconds)}</td><td>${duration(timing.total)}</td><td>${node.restarts || 0}</td></tr>`).join("");
-  if (state.timingsHTML !== rows) { state.timingsHTML = rows; $("timings-table").innerHTML = rows; }
-}
-
-function drawTraffic() {
-  const svg = $("sparkline");
-  const peak = Math.max(1, ...state.traffic.flatMap(point => [point.peer, point.origin]));
-  for (const [key, color] of [["peer", "#21a5ff"], ["origin", "#ffbe45"]]) {
-    const line = document.createElementNS("http://www.w3.org/2000/svg", "polyline");
-    line.setAttribute("points", state.traffic.map((point, index) => `${index / Math.max(1, state.traffic.length - 1) * 356 + 2},${106 - point[key] / peak * 96}`).join(" "));
-    line.setAttribute("fill", "none");
-    line.setAttribute("stroke", color);
-    line.setAttribute("stroke-width", "2");
-    svg.append(line);
-  }
-}
-
-function setView(view) {
-  state.view = view;
-  state.renderedNode = null;
-  $("distribution-tab").setAttribute("aria-selected", String(view === "distribution"));
-  $("lifecycle-tab").setAttribute("aria-selected", String(view === "lifecycle"));
-  $("startup-tab").setAttribute("aria-selected", String(view === "startup"));
-  $("storage-tab").setAttribute("aria-selected", String(view === "storage"));
-  const previousFilter = $("filter").value;
-  const filters = view === "storage"
-    ? [["all", "All workers"], ["storage-high", "85-95% used"], ["storage-full", "95-100% used"], ["unknown", "Unknown"]]
-    : [["all", "All workers"], ["active", "In progress"], ["failed", "Errors"], ["unknown", "Unknown"]];
-  $("filter").innerHTML = filters.map(([value, label]) => `<option value="${value}">${label}</option>`).join("");
-  $("filter").value = filters.some(([value]) => value === previousFilter) ? previousFilter : "all";
-  $("tooltip").hidden = true;
-  renderSnapshot();
-  if (state.selected) void loadNode();
 }
 
 function storageKey() { return `gantry-ui:${state.config.registry}:${state.config.nodePool}:${state.config.namespace}`; }
@@ -544,10 +495,9 @@ function resetRemovedDemos() {
   history.replaceState(null, "", url);
   $("workspace").hidden = true;
   $("welcome").hidden = false;
-  $("grid").replaceChildren();
+  for (const grid of document.querySelectorAll(".node-grid")) grid.replaceChildren();
   $("build-status").hidden = true;
   $("tooltip").hidden = true;
-  $("export-timings").disabled = true;
   $("image-picker-label").textContent = "Choose image";
   connection("Reclaiming disk space");
   renderCatalog();
@@ -699,16 +649,8 @@ $("images").addEventListener("click", event => {
 });
 $("search").addEventListener("input", renderCatalog);
 $("refresh").addEventListener("click", () => { void loadImages(true).catch(failure => error(failure.message)); });
-$("distribution-tab").addEventListener("click", () => setView("distribution"));
-$("lifecycle-tab").addEventListener("click", () => setView("lifecycle"));
-$("startup-tab").addEventListener("click", () => setView("startup"));
-$("storage-tab").addEventListener("click", () => setView("storage"));
 $("node-detail").addEventListener("click", event => {
   if (event.target.closest("#clear-selection")) clearSelection();
-});
-$("timings-table").addEventListener("click", event => {
-  const button = event.target.closest("[data-timing-node]");
-  if (button) chooseNode(button.dataset.timingNode);
 });
 document.addEventListener("click", event => {
   if (!$("image-picker").contains(event.target)) $("image-picker").open = false;
@@ -718,38 +660,37 @@ document.addEventListener("keydown", event => {
   if ($("image-picker").open) { $("image-picker").open = false; $("image-picker").querySelector("summary").focus(); }
   else if (state.selected) clearSelection();
 });
-$("export-timings").addEventListener("click", () => {
-  if (!state.snapshot) return;
-  const fields = ["worker", "pod", "pod_uid", "state", "created", "scheduled", "container_started", "ready", "created_to_ready_seconds", "container_restarts"];
-  const rows = state.snapshot.nodes.map(node => {
-    const timing = startupTimeline(node, [], state.snapshot.observedAt);
-    return [node.name, node.pod, node.podUID, node.phase, node.created, node.scheduled, node.started, node.readyAt, timing.total, node.restarts || 0];
-  });
-  const csv = [fields, ...rows].map(row => row.map(value => {
-    const raw = value == null ? "" : String(value);
-    const safe = /^[=+@\-\t\r]/.test(raw) ? `'${raw}` : raw;
-    return `"${safe.replaceAll('"', '""')}"`;
-  }).join(",")).join("\r\n");
-  const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
-  const anchor = document.createElement("a");
-  anchor.href = url;
-  anchor.download = `gantry-startup-${state.deployment.id}.csv`;
-  anchor.click();
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
+for (const id of ["history-from", "history-to"]) $(id).addEventListener("input", () => {
+  const window = historyWindow(state.snapshot?.history, state.snapshot?.observedAt);
+  if (!window.available) return;
+  const from = Math.min(Number($("history-from").value), Number($("history-to").value) - 1);
+  const to = Math.max(from + 1, Number($("history-to").value));
+  $("history-from").value = String(Math.max(0, from));
+  $("history-to").value = String(Math.max(1, to));
+  const span = window.fullEnd - window.fullStart;
+  state.timeRange = [window.fullStart + span * Math.max(0, from) / 1000, window.fullStart + span * Math.max(1, to) / 1000];
+  renderCharts();
+});
+$("history-reset").addEventListener("click", () => {
+  state.timeRange = null;
+  $("history-from").value = "0";
+  $("history-to").value = "1000";
+  renderCharts();
 });
 $("filter").addEventListener("change", renderSnapshot);
 $("fit").addEventListener("click", () => { state.zoom = 1; renderSnapshot(); });
 $("zoom-in").addEventListener("click", () => { state.zoom = Math.min(4, state.zoom * 1.4); renderSnapshot(); });
 $("zoom-out").addEventListener("click", () => { state.zoom = Math.max(1, state.zoom / 1.4); renderSnapshot(); });
-$("grid").addEventListener("click", event => {
+for (const grid of document.querySelectorAll(".node-grid")) {
+grid.addEventListener("click", event => {
   const cell = event.target.closest("[data-node]");
   if (cell) chooseNode(cell.dataset.node);
 });
-$("grid").addEventListener("keydown", event => {
-  const cells = [...$("grid").children];
+grid.addEventListener("keydown", event => {
+  const cells = [...grid.children];
   const index = cells.indexOf(event.target);
   if (index < 0) return;
-  const columns = Math.max(8, Math.floor(40 / state.zoom));
+  const columns = Math.max(8, Math.floor(25 / state.zoom));
   const offsets = { ArrowRight: 1, ArrowLeft: -1, ArrowDown: columns, ArrowUp: -columns };
   let next = index;
   if (event.key in offsets) next += offsets[event.key];
@@ -759,35 +700,38 @@ $("grid").addEventListener("keydown", event => {
   event.preventDefault();
   cells[Math.max(0, Math.min(cells.length - 1, next))]?.focus();
 });
-$("grid").addEventListener("pointerover", event => {
+grid.addEventListener("pointerover", event => {
   const cell = event.target.closest("[data-node]");
   const node = state.snapshot?.nodes.find(node => node.name === cell?.dataset.node);
   if (!node) return;
   const pct = percent(node.available, state.deployment.image.size);
   const tooltip = $("tooltip");
-  tooltip.innerHTML = state.view === "storage"
+  const view = grid.dataset.view;
+  tooltip.innerHTML = view === "storage"
     ? `<strong>${esc(shortName(node.name))}</strong><span>${bytes(node.storage?.used)} used · ${bytes(node.storage?.available)} left</span><span>${progressText(storagePercent(node.storage))} used · ${bytes(node.storage?.total)} capacity</span><span class="small muted">${node.storageUpdatedAt ? `Observed ${esc(time(node.storageUpdatedAt))}` : "Waiting for a filesystem observation"}</span>`
-    : `<strong>${esc(shortName(node.name))}</strong><span>${state.view === "distribution" ? `Image bytes available: ${progressText(pct)}` : esc(phaseLabel(node.phase))}</span><span class="small muted">${state.view === "distribution" && node.updatedAt ? `Last byte observation: ${esc(time(node.updatedAt))}` : "Click for details"}</span>`;
+    : `<strong>${esc(shortName(node.name))}</strong><span>${view === "distribution" ? `Image bytes available: ${progressText(pct)}` : esc(phaseLabel(node.phase))}</span><span class="small muted">${view === "distribution" && node.updatedAt ? `Last byte observation: ${esc(time(node.updatedAt))}` : "Click for details"}</span>`;
   const rect = cell.getBoundingClientRect();
   tooltip.style.left = `${Math.max(8, Math.min(innerWidth - 290, rect.left + 12))}px`;
   tooltip.style.top = `${Math.max(8, Math.min(innerHeight - 130, rect.bottom + 10))}px`;
   tooltip.hidden = false;
 });
-$("grid").addEventListener("pointerleave", () => { $("tooltip").hidden = true; });
+grid.addEventListener("pointerleave", () => { $("tooltip").hidden = true; });
+}
 window.addEventListener("beforeunload", () => { state.stream?.close(); state.eventsRequest?.abort(); state.buildRequest?.abort(); state.reclaimController?.abort(); state.reclaimStartController?.abort(); clearTimeout(state.buildTimer); clearTimeout(state.reclaimTimer); });
 setInterval(() => {
-  if (["lifecycle", "startup"].includes(state.view) && state.selected && !state.detailLoading) void loadNode();
+  if (state.selected && !state.detailLoading) void loadNode();
 }, 5000);
-setInterval(() => {
+function renderUpdated() {
   if (!state.lastUpdate) return;
   const age = Math.max(0, Math.floor((Date.now() - state.lastUpdate) / 1000));
-  $("updated").textContent = `Last snapshot ${age < 2 ? "just now" : `${age}s ago`}${state.stale ? " · stale" : ""}`;
   if (age > 45) {
     state.stale = true;
     $("grid-panel").classList.add("stale");
     connection("Stale observations");
   }
-}, 1000);
+  $("updated").textContent = `Observed ${time(state.lastUpdate)} · ${age < 2 ? "just now" : `${age}s ago`}${state.stale ? " · stale" : ""}`;
+}
+setInterval(renderUpdated, 1000);
 
 async function start() {
   try {

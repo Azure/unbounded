@@ -192,8 +192,19 @@ func TestStreamPublishesFastWorkerBeforeSlowWorkerAndSharesCollection(t *testing
 
 	select {
 	case <-canceled:
+		t.Fatal("closing the last viewer lost full-run collection")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	cached := server.snapshots[image.ID]
+	cached.mu.Lock()
+	cached.cancel()
+	cached.mu.Unlock()
+
+	select {
+	case <-canceled:
 	case <-time.After(time.Second):
-		t.Fatal("collection continued after the last viewer disconnected")
+		t.Fatal("explicit collector cancellation did not stop agent requests")
 	}
 }
 
@@ -211,6 +222,13 @@ func TestStreamReportsCollectionFailureInsteadOfAnEmptySuccess(t *testing.T) {
 	cached.collectMu.Lock()
 
 	server.snapshots[image.ID] = cached
+	defer func() {
+		cached.mu.Lock()
+		if cached.cancel != nil {
+			cached.cancel()
+		}
+		cached.mu.Unlock()
+	}()
 	defer cached.collectMu.Unlock()
 
 	httpServer := httptest.NewServer(server.Handler())
@@ -237,5 +255,93 @@ func TestStreamReportsCollectionFailureInsteadOfAnEmptySuccess(t *testing.T) {
 	event, body := readStreamFrame(t, bufio.NewScanner(response.Body))
 	if event != "status-error" || !strings.Contains(string(body), "node inventory unavailable") {
 		t.Fatalf("collection failure was hidden: %q %s", event, body)
+	}
+}
+
+func TestStreamReconnectReturnsEntireRunHistory(t *testing.T) {
+	image := testImage()
+	start := time.Now().UTC().Add(-3 * time.Minute)
+
+	workload, err := buildDeployment("demo", "flexpool", image)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	server := testServer(fake.NewSimpleClientset(workload), image)
+	cached := &snapshotCache{
+		ctx: context.Background(),
+		snapshot: Snapshot{
+			Deployment: Deployment{ID: image.ID, UID: "run", Created: start},
+			ObservedAt: time.Now().UTC(),
+			Nodes:      []*Node{{Name: "worker", Phase: "ready"}},
+		},
+		historyUID: "run",
+		history: RunHistory{
+			Start: start, ObservedFrom: start, OriginBytes: 1234, PeerBytes: 5678,
+			Points: []RunPoint{
+				{At: start, Total: 1},
+				{At: start.Add(time.Minute), Ready: 1, Total: 1},
+				{At: time.Now().UTC(), Ready: 1, Total: 1, OriginBytes: 1234, PeerBytes: 5678},
+			},
+		},
+	}
+	server.snapshots[image.ID] = cached
+
+	httpServer := httptest.NewServer(server.Handler())
+	defer httpServer.Close()
+
+	for range 2 {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, httpServer.URL+"/api/deployments/"+image.ID+"/stream", nil)
+		if err != nil {
+			cancel()
+			t.Fatal(err)
+		}
+
+		response, err := httpServer.Client().Do(request)
+		if err != nil {
+			cancel()
+			t.Fatal(err)
+		}
+
+		event, body := readStreamFrame(t, bufio.NewScanner(response.Body))
+
+		var snapshot Snapshot
+
+		err = json.Unmarshal(body, &snapshot)
+		_ = response.Body.Close()
+
+		cancel()
+
+		if err != nil || event != "snapshot" || snapshot.History == nil || len(snapshot.History.Points) != 3 ||
+			!snapshot.History.Points[0].At.Equal(start) || snapshot.History.OriginBytes != 1234 || snapshot.History.PeerBytes != 5678 {
+			t.Fatalf("reconnection lost full-run history: %s %v", body, err)
+		}
+	}
+}
+
+func TestRunCollectionStopsWhenDeploymentIsDeleted(t *testing.T) {
+	server := testServer(fake.NewSimpleClientset(), testImage())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cached := &snapshotCache{ctx: ctx, cancel: cancel}
+	finished := make(chan struct{})
+
+	go func() {
+		server.runCollection(ctx, testImage().ID, cached)
+		close(finished)
+	}()
+
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("collector continued for a deleted deployment")
+	}
+
+	if ctx.Err() == nil || cached.err == nil {
+		t.Fatal("deleted deployment did not cancel its collector and preserve the error")
 	}
 }

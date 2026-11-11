@@ -12,12 +12,15 @@ import (
 	"net/http"
 	"slices"
 	"time"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 )
 
 type nodeUpdates struct {
 	Nodes      []*Node          `json:"nodes"`
 	ObservedAt time.Time        `json:"observedAt"`
 	Activity   *ClusterActivity `json:"activity,omitempty"`
+	History    *RunHistory      `json:"history,omitempty"`
 }
 
 func (s *Server) streamUpdates(w http.ResponseWriter, r *http.Request) {
@@ -44,9 +47,6 @@ func (s *Server) streamUpdates(w http.ResponseWriter, r *http.Request) {
 		cached.mu.Lock()
 
 		cached.subscribers--
-		if cached.subscribers == 0 {
-			cached.cancel()
-		}
 		cached.mu.Unlock()
 	}()
 
@@ -64,6 +64,7 @@ func (s *Server) streamUpdates(w http.ResponseWriter, r *http.Request) {
 	)
 
 	initialized := false
+	historyPoints := 0
 
 	for {
 		select {
@@ -96,6 +97,7 @@ func (s *Server) streamUpdates(w http.ResponseWriter, r *http.Request) {
 			}
 
 			snapshot.Activity = s.clusterActivity(time.Now())
+			snapshot.History = s.recordRunHistory(cached, time.Now().UTC())
 
 			lastError = ""
 			full := !initialized || uid != snapshot.Deployment.UID || len(previous) != len(snapshot.Nodes)
@@ -116,19 +118,29 @@ func (s *Server) streamUpdates(w http.ResponseWriter, r *http.Request) {
 			}
 
 			if full {
+				snapshot.History = cloneRunHistory(snapshot.History, 0)
 				if err := writeStreamEvent(w, "snapshot", snapshot.grid()); err != nil {
 					return
 				}
 
 				initialized, uid = true, snapshot.Deployment.UID
-			} else if len(changed) > 0 || activityRevision != snapshot.Activity.Revision {
-				if err := writeStreamEvent(w, "node-updates", nodeUpdates{Nodes: changed, ObservedAt: snapshot.ObservedAt, Activity: snapshot.Activity}); err != nil {
+			} else if len(changed) > 0 || activityRevision != snapshot.Activity.Revision || snapshot.History != nil && len(snapshot.History.Points) > historyPoints {
+				var history *RunHistory
+				if snapshot.History != nil && len(snapshot.History.Points) > historyPoints {
+					history = cloneRunHistory(snapshot.History, historyPoints)
+				}
+
+				if err := writeStreamEvent(w, "node-updates", nodeUpdates{Nodes: changed, ObservedAt: snapshot.ObservedAt, Activity: snapshot.Activity, History: history}); err != nil {
 					return
 				}
 			}
 
 			previous = current
+
 			activityRevision = snapshot.Activity.Revision
+			if snapshot.History != nil {
+				historyPoints = len(snapshot.History.Points)
+			}
 		}
 	}
 }
@@ -173,6 +185,13 @@ func (s *Server) runCollection(ctx context.Context, id string, cached *snapshotC
 			cached.mu.Lock()
 			cached.err = err
 			cached.mu.Unlock()
+
+			if apierrors.IsNotFound(err) {
+				cached.cancel()
+				return
+			}
+		} else {
+			s.recordRunHistory(cached, time.Now().UTC())
 		}
 
 		timer := time.NewTimer(max(10*time.Millisecond, s.cfg.Interval-time.Since(started)))

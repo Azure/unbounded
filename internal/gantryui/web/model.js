@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
+import { mergeHistory } from "./history.js";
+
 export function percent(available, total) {
   if (available === null || available === undefined || !Number.isFinite(available)) return null;
   return total === 0 ? 100 : Math.min(100, Math.max(0, available / total * 100));
@@ -34,6 +36,22 @@ export function summary(nodes, image, view) {
     counts[state] = (counts[state] || 0) + 1;
   }
   return counts;
+}
+
+export function sortWorkers(nodes, image, view) {
+  const order = view === "distribution"
+    ? ["failed", "unknown", "queued", "pulling", "complete"]
+    : view === "storage"
+      ? ["storage-full", "storage-high", "unknown", "storage-ok"]
+      : ["failed", "unknown", "terminating", "scheduling", "queued", "preparing", "running", "completed", "ready"];
+  const rank = node => {
+    const phase = view === "distribution" ? distributionState(node, image) : view === "storage" ? storageState(node) : node.phase;
+    const index = order.indexOf(phase);
+    return index < 0 ? 1 : index;
+  };
+  return [...nodes].sort((a, b) => rank(a) - rank(b) ||
+    (view === "storage" ? (storagePercent(b.storage) ?? -1) - (storagePercent(a.storage) ?? -1) : 0) ||
+    a.name.localeCompare(b.name, "en", { numeric: true }));
 }
 
 export function bytes(value) {
@@ -75,5 +93,6 @@ export function mergeNodeUpdates(snapshot, update) {
     return current || node;
   });
   if (changes.size) throw new Error("Worker topology changed without a full snapshot");
-  return { ...snapshot, nodes, observedAt: update.observedAt, activity: update.activity ?? snapshot.activity };
+  return { ...snapshot, nodes, observedAt: update.observedAt, activity: update.activity ?? snapshot.activity,
+    history: mergeHistory(snapshot.history, update.history) };
 }

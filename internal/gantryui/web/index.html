@@ -23,7 +23,7 @@
           <nav id="images" class="image-list" aria-label="ACR images"></nav>
         </div>
       </details>
-      <div class="topbar-end"><button id="reclaim-show" aria-controls="reclaim-status" hidden>Show cleanup status</button><button id="reclaim-space" hidden>Reclaim disk space</button><button id="generate-image" class="generate-button" hidden>+ Generate &amp; pull</button><button id="export-timings" disabled>Export timings</button><span id="cluster-label" class="cluster-label">Connecting to Kubernetes</span><span id="connection" class="connection">Connecting</span></div>
+      <div class="topbar-end"><button id="reclaim-show" aria-controls="reclaim-status" hidden>Show cleanup status</button><button id="reclaim-space" hidden>Reclaim disk space</button><button id="generate-image" class="generate-button" hidden>+ Generate &amp; pull</button><span id="cluster-label" class="cluster-label">Connecting to Kubernetes</span><span id="connection" class="connection">Connecting</span></div>
     </header>
     <main>
       <div id="error" class="notice error-notice" role="alert" hidden></div>
@@ -41,33 +41,49 @@
       <div id="workspace" hidden>
         <section class="deployment-header">
           <div class="image-symbol"><span class="brand-mark"></span></div>
-          <div class="deployment-title"><div class="title-row"><h1 id="image-title"></h1><span id="image-kind" class="badge"></span></div><p id="image-meta" class="muted small"></p><div class="deployment-state"><span class="badge active">DaemonSet active</span><span id="deployment-name"></span></div></div>
+          <div class="deployment-title"><div class="title-row"><h1 id="image-title"></h1><span id="image-kind" class="badge"></span></div><p id="image-meta" class="muted small"></p><div class="deployment-state"><span class="badge active">DaemonSet active</span><span id="deployment-name"></span><span id="resume-note" class="muted small">Observing existing deployment</span></div></div>
         </section>
-        <div class="view-tabs" role="tablist" aria-label="Deployment view">
-          <button id="distribution-tab" role="tab" aria-selected="true" aria-controls="grid-panel">Image distribution</button>
-          <button id="lifecycle-tab" role="tab" aria-selected="false" aria-controls="grid-panel">Pod lifecycle</button>
-          <button id="startup-tab" role="tab" aria-selected="false" aria-controls="grid-panel">Startup latency</button>
-          <button id="storage-tab" role="tab" aria-selected="false" aria-controls="grid-panel">Node storage</button>
-          <span id="resume-note" class="muted small">Observing existing deployment</span>
-        </div>
         <section id="stats" class="stats" aria-label="Cluster summary"></section>
-        <div class="aggregate-scope"><span>Gantry metrics cover all images. The worker grid shows the selected deployment.</span><span id="activity-coverage">Collecting agent observations...</span></div>
-        <div class="content-layout"><div class="cluster-column">
-        <section id="grid-panel" class="panel grid-panel" role="tabpanel">
+        <div class="aggregate-scope"><span>Cluster-wide traffic observed during the selected run</span><span id="activity-coverage">Collecting agent observations...</span></div>
+        <div class="cluster-overview">
+          <section id="cluster-activity" class="panel cluster-activity"></section>
+          <section class="panel bandwidth-panel"><div class="panel-heading"><div><h2>Receive bandwidth over this run</h2><span class="small muted">Cluster-wide origin and peer receive rates, not exact image traffic</span></div></div><svg id="cluster-bandwidth" viewBox="0 0 640 140" preserveAspectRatio="none" role="img" aria-label="Run history of origin and peer receive bandwidth"></svg><div class="bandwidth-legend"><span class="origin-key">Origin receive</span><span class="peer-key">Peer receive</span><span class="muted">Bytes/s · dashed baseline = unobserved</span></div></section>
+        </div>
+        <div class="history-controls" aria-label="Chart time range">
+          <label>From <input id="history-from" type="range" min="0" max="1000" value="0" aria-label="Chart range start"></label>
+          <label>To <input id="history-to" type="range" min="0" max="1000" value="1000" aria-label="Chart range end"></label>
+          <button id="history-reset" type="button">Reset to full run</button><span id="history-range" class="small muted"></span>
+        </div>
+        <div id="grid-panel" class="fleet-panels">
+        <section class="panel grid-panel" aria-labelledby="grid-title">
           <div class="panel-heading">
             <div><h2 id="grid-title">Cluster distribution</h2><span id="grid-description" class="muted small">One cell per worker. Overall image bytes available.</span><p id="grid-summary" class="small muted"></p></div>
             <div class="grid-controls"><button id="fit">Fit all</button><button id="zoom-out" aria-label="Zoom out">−</button><button id="zoom-in" aria-label="Zoom in">+</button><select id="filter" aria-label="Highlight nodes"><option value="all">All workers</option><option value="active">In progress</option><option value="failed">Errors</option><option value="unknown">Unknown</option></select></div>
           </div>
-          <div class="grid-scroll"><div id="grid" class="node-grid" aria-label="Worker nodes" data-empty="Waiting for worker observations..."></div></div>
+          <div class="grid-scroll"><div id="grid" class="node-grid" data-view="distribution" aria-label="Image distribution workers" data-empty="Waiting for worker observations..."></div></div>
           <div class="grid-footer"><div id="legend" class="legend"></div><span id="updated" class="muted small">Waiting for observations...</span></div>
         </section>
-        <section class="panel bandwidth-panel"><div class="panel-heading"><div><h2>Aggregate bandwidth</h2><span class="small muted">Origin + peer receive traffic across discovered Gantry agents</span></div></div><svg id="cluster-bandwidth" viewBox="0 0 640 140" role="img" aria-label="Aggregate origin and peer receive bandwidth"></svg><div class="bandwidth-legend"><span class="origin-key">Origin receive</span><span class="peer-key">Peer receive</span><span class="muted">Bytes/s · receive side only</span></div></section>
-        </div><div class="inspector-column">
-          <section id="cluster-activity" class="panel cluster-activity"></section>
+        <section class="panel grid-panel" aria-labelledby="lifecycle-title">
+          <div class="panel-heading"><div><h2 id="lifecycle-title">Pod lifecycle</h2><span class="small muted">Errors first · Workers grouped by Pod status</span><p id="lifecycle-summary" class="small muted"></p></div></div>
+          <div class="grid-scroll"><div id="lifecycle-grid" class="node-grid" data-view="lifecycle" aria-label="Pod lifecycle workers" data-empty="Waiting for worker observations..."></div></div>
+          <div class="grid-footer"><div id="lifecycle-legend" class="legend"></div></div>
+        </section>
+        <section class="panel readiness-panel" aria-labelledby="readiness-title">
+          <div class="panel-heading"><div><h2 id="readiness-title">Fleet readiness</h2><span class="small muted">Selected deployment · Ready Pods across workers</span><p id="readiness-summary" class="small muted"></p></div></div>
+          <div id="readiness-milestones" class="readiness-milestones"></div>
+          <svg id="readiness-chart" viewBox="0 0 640 140" preserveAspectRatio="none" role="img" aria-label="Ready workers over the selected run"></svg>
+          <p class="small muted chart-note">Workers Ready over time. Dashed baseline = unobserved. Milestones use current Pods' observed Ready timestamps, not inferred telemetry.</p>
+        </section>
+        <section class="panel grid-panel" aria-labelledby="storage-title">
+          <div class="panel-heading"><div><h2 id="storage-title">Disk usage</h2><span class="small muted">Filesystem backing Gantry · All images and workloads</span><p id="storage-summary" class="small muted"></p></div></div>
+          <div class="grid-scroll"><div id="storage-grid" class="node-grid" data-view="storage" aria-label="Disk usage workers" data-empty="Waiting for worker observations..."></div></div>
+          <div class="grid-footer"><div id="storage-legend" class="legend"></div></div>
+        </section>
+        </div>
+        <p class="small muted">Select any worker to inspect its layers, lifecycle, startup waterfall, and disk usage below. Selection is synchronized across all heatmaps.</p>
+        <div class="worker-inspector">
           <section id="node-detail" class="panel node-detail" hidden></section>
-          <section id="activity" class="panel activity" hidden></section>
-        </div></div>
-        <section id="timings-table-panel" class="panel timings-table-panel" hidden><div class="panel-heading"><div><h2>Worker startup timings</h2><span class="small muted">Slowest observed Created-to-Ready durations first. Select a row for detailed pull events.</span></div></div><div class="table-scroll"><table><thead><tr><th>Worker</th><th>Pod state</th><th>Scheduling</th><th>Pod readiness</th><th>Created &#8594; Ready</th><th>Restarts</th></tr></thead><tbody id="timings-table"></tbody></table></div><p class="small muted table-note">Up to 20 workers shown. Missing or unfinished timings stay unavailable. Export includes all workers' observed Pod milestones, not reconstructed pull histories.</p></section>
+        </div>
       </div>
     </main>
     <div id="tooltip" class="tooltip" role="tooltip" hidden></div>

@@ -32,3 +32,13 @@ test("an idle but observed cluster has no fabricated traffic split", () => {
   assert.match(result.panel, /traffic-split inactive/);
   assert.doesNotMatch(result.panel, /NaN|Infinity|100.0% from peers/);
 });
+
+test("run counters are cumulative received bytes, separate from live rates and unknown history", () => {
+  const activity = { originRate: 0, peerRate: 0, complete: true };
+  const result = clusterActivityHTML(activity, { originBytes: 3000000000, peerBytes: 12000000000, observedFrom: "2026-11-10T12:00:00Z" });
+  assert.match(result.cards, /Origin received this run<\/span><strong>3.00 GB/);
+  assert.match(result.cards, /Peer received this run<\/span><strong>12.0 GB/);
+  assert.match(result.panel, /Cluster-wide traffic observed during the selected run/);
+  assert.match(result.panel, /not exact selected-image traffic/);
+  assert.match(clusterActivityHTML(activity).cards, /Origin received this run<\/span><strong>--/);
+});

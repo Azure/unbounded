@@ -67,6 +67,7 @@ type Snapshot struct {
 	Nodes      []*Node          `json:"nodes"`
 	ObservedAt time.Time        `json:"observedAt"`
 	Activity   *ClusterActivity `json:"activity,omitempty"`
+	History    *RunHistory      `json:"history,omitempty"`
 }
 
 func (snapshot Snapshot) grid() Snapshot {
@@ -200,6 +201,12 @@ func (s *Server) snapshotEntry(id string) (*snapshotCache, error) {
 				return nil, errors.New("too many active image streams")
 			}
 
+			evicted := s.snapshots[oldestID]
+			evicted.mu.Lock()
+			if evicted.cancel != nil {
+				evicted.cancel()
+			}
+			evicted.mu.Unlock()
 			delete(s.snapshots, oldestID)
 		}
 

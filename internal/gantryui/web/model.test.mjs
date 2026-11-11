@@ -3,7 +3,21 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildRequestError, bytes, distributionState, escape, mergeNodeUpdates, percent, storagePercent, storageState, summary } from "./model.js";
+import { buildRequestError, bytes, distributionState, escape, mergeNodeUpdates, percent, sortWorkers, storagePercent, storageState, summary } from "./model.js";
+
+test("grids independently group attention-needed workers first with numeric name ties", () => {
+  const nodes = [
+    {name:"flex10",phase:"ready",available:100},
+    {name:"flex2",phase:"failed",available:100},
+    {name:"flex1",phase:"ready",available:null},
+    {name:"flex3",phase:"preparing",available:50},
+  ];
+  assert.deepEqual(sortWorkers(nodes,{size:100},"lifecycle").map(n=>n.name),["flex2","flex3","flex1","flex10"]);
+  assert.deepEqual(sortWorkers(nodes,{size:100},"distribution").map(n=>n.name),["flex1","flex3","flex2","flex10"]);
+  assert.equal(nodes[0].name,"flex10");
+  const storage = used => ({total:100,used,available:100-used});
+  assert.deepEqual(sortWorkers([{name:"a",storage:storage(20)},{name:"b",storage:storage(99)},{name:"c",storage:storage(90)}],{},"storage").map(n=>n.name),["b","c","a"]);
+});
 
 test("streaming readiness is independent of byte availability", () => {
   const image = { size: 100, streaming: true };
