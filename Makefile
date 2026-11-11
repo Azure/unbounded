@@ -93,6 +93,11 @@ TOKEN_REFRESHER_IMAGE ?= $(CONTAINER_REGISTRY)/token-refresher:$(VERSION_TAG)
 MACHINE_OPS_CONTROLLER_BIN=bin/machine-ops-controller
 MACHINE_OPS_CONTROLLER_CMD=./cmd/machine-ops-controller
 MACHINE_OPS_CONTROLLER_IMAGE ?= $(CONTAINER_REGISTRY)/machine-ops-controller:$(VERSION_TAG)
+
+# The Unbounded Karpenter plugin is a nested Go module (plugins/karpenter),
+# because upstream Karpenter pins older Kubernetes libraries than this module.
+# Its targets delegate to plugins/karpenter/Makefile.
+KARPENTER_MAKE = $(MAKE) -C plugins/karpenter
 MACHINE_OPS_CONTROLLER_NAME ?= machine-ops-controller
 MACHINE_OPS_PROVIDER ?=
 MACHINE_OPS_SITE ?=
@@ -241,6 +246,7 @@ REACT_DEV ?= false
 
 .PHONY: all help fmt lint lint-actions test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc install-helm install-kind generate kubectl-unbounded forge relctl relctl-build agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests playpen-manifests e2e-gantry e2e-playpen e2e-racer gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build license-check notice notice-check gantry gantry-build gantry-manifests inventory-manifests
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests gantry-chart-lint gantry-chart-package release-bom release-manifests unbounded-operator-release-manifest
+.PHONY: karpenter karpenter-fmt karpenter-lint karpenter-test
 .PHONY: image-machina-local image-token-refresher-local image-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-unbounded-operator-push image-playpen-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
 
@@ -265,6 +271,8 @@ help: ## Show this help
 	@echo "  lint                             Run golangci-lint and actionlint"
 	@echo "  lint-actions                     Run actionlint over .github/workflows"
 	@echo "  test                             Run all tests"
+	@echo "  karpenter                        Lint and test the Karpenter plugin (nested module)"
+	@echo "  karpenter-fmt|lint|test          Individual Karpenter plugin steps"
 	@echo "  build                            Compile all Go packages"
 	@echo "  generate                         Run go generate (deepcopy, CRDs, protobuf)"
 	@echo "  vulncheck                        Run govulncheck; fails only on vulnerabilities with final fixes"
@@ -978,6 +986,19 @@ unroute-build: ## Build the unroute utility binary (no lint/test)
 	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(UNROUTE_BIN) $(UNROUTE_CMD)
 
 unroute: test unroute-build ## Build the unroute utility (implies test)
+
+##@ Karpenter plugin (nested Go module in plugins/karpenter)
+
+karpenter-fmt: ## Format the Karpenter plugin module
+	$(KARPENTER_MAKE) fmt
+
+karpenter-lint: ## Lint the Karpenter plugin module
+	$(KARPENTER_MAKE) lint
+
+karpenter-test: ## Test the Karpenter plugin module
+	$(KARPENTER_MAKE) test
+
+karpenter: karpenter-lint karpenter-test ## Lint and test the Karpenter plugin
 
 ##@ Gantry (peer-to-peer OCI distribution)
 

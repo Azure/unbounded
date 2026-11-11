@@ -114,6 +114,9 @@ jobs:
       - name: Lint
         run: make lint
 
+      - name: Lint Karpenter plugin
+        run: make karpenter-lint
+
       - name: Save Go caches
         if: success() && github.event_name == 'push'
         uses: ./.github/actions/setup-go-cached
@@ -162,6 +165,9 @@ jobs:
       - name: Summarize tests
         if: always() && hashFiles('tmp/go-test.json') != ''
         run: go run ./hack/cmd/test-summary tmp/go-test.json >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Test Karpenter plugin
+        run: make karpenter-test
 
       - name: Upload coverage
         if: always()
