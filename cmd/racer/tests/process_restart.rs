@@ -1535,6 +1535,7 @@ fn idle_process_threads_sleep_instead_of_polling() {
                 "RACER_CLUSTER_ID" => Some(CLUSTER.into()),
                 "RACER_CONTROL_ENDPOINT" => Some("https://controller.invalid:443".into()),
                 "RACER_MAX_THREADS" => Some(THREADS.into()),
+                "RACER_ENABLE_RDMA" => Some("false".into()),
                 _ => None,
             })
         })
