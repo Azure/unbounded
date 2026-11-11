@@ -1545,6 +1545,9 @@ func stageExecutionInvocation() StageInvocation {
 func TestStagePodCarriesScriptResourcesAndImmutableIdentity(t *testing.T) {
 	t.Parallel()
 
+	scriptContent := "#!/bin/sh\nexit 0\n"
+	scriptDigest := testStageDigest(scriptContent)
+
 	workflow := &unstructured.Unstructured{}
 	workflow.SetAPIVersion("argoproj.io/v1alpha1")
 	workflow.SetKind("Workflow")
@@ -1569,15 +1572,8 @@ func TestStagePodCarriesScriptResourcesAndImmutableIdentity(t *testing.T) {
 				Driver: signalv1.CertificationTestDriver{
 					Type: signalv1.TestDriverTypeScript,
 					Script: &signalv1.ScriptTestDriver{
-						Language: signalv1.ScriptLanguageShell,
-						Source: signalv1.ImmutableArtifactSource{
-							Type: signalv1.ArtifactSourceTypeConfigMap,
-							ConfigMap: &signalv1.ConfigMapArtifactSource{
-								Name:   "gpu-inventory",
-								Key:    "gpu-inventory.sh",
-								Digest: testStageDigest("script"),
-							},
-						},
+						Language:    signalv1.ScriptLanguageShell,
+						Artifact:    "gpu-inventory.sh",
 						RunnerImage: "example.invalid/runner@sha256:" + strings.Repeat("a", 64),
 						Resources: corev1.ResourceRequirements{
 							Requests: corev1.ResourceList{
@@ -1592,6 +1588,11 @@ func TestStagePodCarriesScriptResourcesAndImmutableIdentity(t *testing.T) {
 				InvocationTimeout: metav1.Duration{Duration: 2},
 			},
 		},
+		Artifacts: []signalv1.TestArtifact{{
+			Name:    "gpu-inventory.sh",
+			Content: scriptContent,
+			Digest:  scriptDigest,
+		}},
 		Participants: []signalv1.Participant{{
 			NodeName: "participant",
 			NodeUID:  types.UID("participant-uid"),
@@ -1634,6 +1635,30 @@ func TestStagePodCarriesScriptResourcesAndImmutableIdentity(t *testing.T) {
 		pod.Spec.Containers[0].VolumeMounts[1].Name != "results" ||
 		pod.Spec.Containers[0].VolumeMounts[1].MountPath != "/results" {
 		t.Fatalf("script result volume is not mounted: pod = %#v", pod.Spec)
+	}
+
+	if len(pod.Spec.InitContainers) != 1 ||
+		pod.Spec.InitContainers[0].Name != "materialize-script" ||
+		pod.Spec.Volumes[0].Name != "script" ||
+		pod.Spec.Volumes[0].EmptyDir == nil {
+		t.Fatalf("inline script materializer is absent: pod = %#v", pod.Spec)
+	}
+
+	initEnv := make(map[string]string)
+	for _, variable := range pod.Spec.InitContainers[0].Env {
+		initEnv[variable.Name] = variable.Value
+	}
+
+	decoded, err := base64.StdEncoding.DecodeString(initEnv["PROJECT_SIGNAL_ARTIFACT_B64"])
+	if err != nil {
+		t.Fatalf("decode materialized artifact: %v", err)
+	}
+
+	if string(decoded) != scriptContent ||
+		initEnv["PROJECT_SIGNAL_ARTIFACT_NAME"] != "gpu-inventory.sh" ||
+		initEnv["PROJECT_SIGNAL_ARTIFACT_DIGEST"] != scriptDigest ||
+		!strings.Contains(pod.Spec.InitContainers[0].Args[0], "sha256sum -c -") {
+		t.Fatalf("inline script materializer does not preserve artifact identity: %#v", pod.Spec.InitContainers[0])
 	}
 }
 

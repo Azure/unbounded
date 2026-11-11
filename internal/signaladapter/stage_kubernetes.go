@@ -6,6 +6,7 @@ package signaladapter
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -417,14 +418,17 @@ func (e *KubernetesStageExecutor) stagePod(
 
 	switch driver.Type {
 	case signalv1.TestDriverTypeScript:
-		if driver.Script == nil || driver.Script.Source.Type != signalv1.ArtifactSourceTypeConfigMap ||
-			driver.Script.Source.ConfigMap == nil {
-			return nil, errors.New("script runtime currently requires an immutable ConfigMap source")
+		if driver.Script == nil {
+			return nil, errors.New("script driver configuration is absent")
 		}
 
-		source := driver.Script.Source.ConfigMap
+		artifact, err := invocationArtifact(invocation, driver.Script.Artifact)
+		if err != nil {
+			return nil, err
+		}
+
 		container.Command = []string{"/bin/sh", "-ceu"}
-		container.Args = []string{scriptInvocationWrapper(driver.Script.Language, source.Key, source.Digest)}
+		container.Args = []string{scriptInvocationWrapper(driver.Script.Language, artifact.Name, artifact.Digest)}
 		container.VolumeMounts = []corev1.VolumeMount{{
 			Name:      "script",
 			MountPath: "/scripts",
@@ -494,13 +498,19 @@ func (e *KubernetesStageExecutor) stagePod(
 	}
 
 	if driver.Type == signalv1.TestDriverTypeScript {
-		source := driver.Script.Source.ConfigMap
+		artifact, err := invocationArtifact(invocation, driver.Script.Artifact)
+		if err != nil {
+			return nil, err
+		}
+
+		pod.Spec.InitContainers = []corev1.Container{artifactMaterializer(
+			driver.Script.RunnerImage,
+			artifact,
+		)}
 		pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
 			Name: "script",
 			VolumeSource: corev1.VolumeSource{
-				ConfigMap: &corev1.ConfigMapVolumeSource{
-					LocalObjectReference: corev1.LocalObjectReference{Name: source.Name},
-				},
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
 			},
 		}, corev1.Volume{
 			Name: "results",
@@ -511,6 +521,42 @@ func (e *KubernetesStageExecutor) stagePod(
 	}
 
 	return pod, nil
+}
+
+func invocationArtifact(
+	invocation StageInvocation,
+	name string,
+) (signalv1.TestArtifact, error) {
+	for index := range invocation.Artifacts {
+		if invocation.Artifacts[index].Name == name {
+			return invocation.Artifacts[index], nil
+		}
+	}
+
+	return signalv1.TestArtifact{}, fmt.Errorf("test artifact %q is unavailable", name)
+}
+
+func artifactMaterializer(image string, artifact signalv1.TestArtifact) corev1.Container {
+	return corev1.Container{
+		Name:    "materialize-script",
+		Image:   image,
+		Command: []string{"/bin/sh", "-ceu"},
+		Args: []string{`printf '%s' "$PROJECT_SIGNAL_ARTIFACT_B64" | base64 -d > "/scripts/$PROJECT_SIGNAL_ARTIFACT_NAME"
+printf '%s  %s\n' "${PROJECT_SIGNAL_ARTIFACT_DIGEST#sha256:}" "/scripts/$PROJECT_SIGNAL_ARTIFACT_NAME" | sha256sum -c -
+chmod 0555 "/scripts/$PROJECT_SIGNAL_ARTIFACT_NAME"`},
+		Env: []corev1.EnvVar{
+			{Name: "PROJECT_SIGNAL_ARTIFACT_NAME", Value: artifact.Name},
+			{Name: "PROJECT_SIGNAL_ARTIFACT_DIGEST", Value: artifact.Digest},
+			{
+				Name:  "PROJECT_SIGNAL_ARTIFACT_B64",
+				Value: base64.StdEncoding.EncodeToString([]byte(artifact.Content)),
+			},
+		},
+		VolumeMounts: []corev1.VolumeMount{{
+			Name:      "script",
+			MountPath: "/scripts",
+		}},
+	}
 }
 
 func stageHostPathVolumes(paths []signalv1.WorkloadHostPath) []corev1.Volume {
@@ -598,6 +644,16 @@ func (e *KubernetesStageExecutor) executeWorkflowTemplate(
 	driver := invocation.Stage.Test.Driver.WorkflowTemplate
 	if driver == nil {
 		return signalv1.InvocationResultEnvelope{}, errors.New("WorkflowTemplate driver configuration is absent")
+	}
+
+	var workflowArtifact *signalv1.TestArtifact
+	if driver.Artifact != "" {
+		artifact, err := invocationArtifact(invocation, driver.Artifact)
+		if err != nil {
+			return signalv1.InvocationResultEnvelope{}, err
+		}
+
+		workflowArtifact = &artifact
 	}
 
 	parent, err := e.Runner.Dynamic.Resource(workflowGVR).Namespace(e.Namespace).
@@ -696,6 +752,16 @@ func (e *KubernetesStageExecutor) executeWorkflowTemplate(
 		map[string]any{"name": "primary-participant-node-name", "value": invocation.Participants[0].NodeName},
 		map[string]any{"name": "resolved-inputs-json", "value": inputsJSON},
 		map[string]any{"name": "result-configmap", "value": name + "-result"},
+	}
+	if workflowArtifact != nil {
+		adapterParameters = append(adapterParameters,
+			map[string]any{"name": "script-name", "value": workflowArtifact.Name},
+			map[string]any{
+				"name":  "script-content-b64",
+				"value": base64.StdEncoding.EncodeToString([]byte(workflowArtifact.Content)),
+			},
+			map[string]any{"name": "script-digest", "value": workflowArtifact.Digest},
+		)
 	}
 
 	arguments, err := mergeWorkflowArguments(templateSpec["arguments"], adapterParameters)

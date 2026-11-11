@@ -35,8 +35,8 @@ cardinality validation runs only when roles are present.
 
 Supported drivers are:
 
-- `Script`: an immutable ConfigMap, OCI, or exact Git source executed by a
-  digest-pinned runner image.
+- `Script`: a digest-verified inline `CertificationTest` artifact executed by
+  a digest-pinned runner image.
 - `Container`: a digest-pinned OCI image with bounded command, arguments, and
   resources.
 - `WorkflowTemplate`: an approved template identified by a canonical SHA-256

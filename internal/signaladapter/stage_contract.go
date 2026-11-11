@@ -79,6 +79,12 @@ func (r *Runner) ResolveStageRequest(
 		return StageExecutionRequest{}, errors.New("stage index is outside the immutable Run plan")
 	}
 
+	stage := phase.Stages[request.StageIndex].DeepCopy()
+	artifacts, err := r.resolvePinnedCertificationTest(ctx, stage)
+	if err != nil {
+		return StageExecutionRequest{}, err
+	}
+
 	duplicate, err := duplicateQualificationStageIdentity(
 		run.Spec.ResolvedPlan,
 		request.PhaseIndex,
@@ -94,7 +100,8 @@ func (r *Runner) ResolveStageRequest(
 		PhaseOrder:                     int32(request.PhaseIndex),
 		StageOrder:                     int32(request.StageIndex),
 		PhaseRole:                      phase.Role,
-		Stage:                          *phase.Stages[request.StageIndex].DeepCopy(),
+		Stage:                          *stage,
+		Artifacts:                      artifacts,
 		Participants:                   indexedParticipants(run.Spec.Participants),
 		DuplicateQualificationIdentity: duplicate,
 	}
@@ -107,6 +114,78 @@ func (r *Runner) ResolveStageRequest(
 	resolved.Resume = resume
 
 	return resolved, nil
+}
+
+func (r *Runner) resolvePinnedCertificationTest(
+	ctx context.Context,
+	stage *signalv1.ResolvedStagePlan,
+) ([]signalv1.TestArtifact, error) {
+	testGVR := schema.GroupVersionResource{
+		Group:    signalv1.GroupVersion.Group,
+		Version:  signalv1.GroupVersion.Version,
+		Resource: "certificationtests",
+	}
+
+	object, err := r.Dynamic.Resource(testGVR).Get(ctx, stage.Test.Identity.Name, metav1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("get pinned CertificationTest: %w", err)
+	}
+
+	var test signalv1.CertificationTest
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(object.Object, &test); err != nil {
+		return nil, fmt.Errorf("decode pinned CertificationTest: %w", err)
+	}
+
+	identity := stage.Test.Identity
+	if test.UID != identity.UID ||
+		test.Generation != identity.Generation ||
+		test.Status.ObservedGeneration != identity.Generation ||
+		test.Status.Trust == nil ||
+		test.Status.Trust.State != identity.Trust ||
+		test.Status.Trust.ContentDigest != identity.ContentDigest {
+		return nil, errors.New("CertificationTest no longer matches the immutable Run identity")
+	}
+
+	if err := signalv1.ValidateTestArtifacts(test.Spec); err != nil {
+		return nil, fmt.Errorf("CertificationTest artifacts are invalid: %w", err)
+	}
+
+	parameterDigest, err := digestJSON(test.Spec.Parameters)
+	if err != nil {
+		return nil, fmt.Errorf("digest CertificationTest parameters: %w", err)
+	}
+
+	metricDigest, err := digestJSON(test.Spec.Metrics)
+	if err != nil {
+		return nil, fmt.Errorf("digest CertificationTest metrics: %w", err)
+	}
+
+	securityDigest, err := digestJSON(test.Spec.Security)
+	if err != nil {
+		return nil, fmt.Errorf("digest CertificationTest security: %w", err)
+	}
+
+	if parameterDigest != stage.Test.ParameterSchemaDigest ||
+		metricDigest != stage.Test.MetricSchemaDigest ||
+		securityDigest != stage.Test.SecurityRequirementsDigest ||
+		!reflect.DeepEqual(test.Spec.Metrics, stage.Test.Metrics) ||
+		!reflect.DeepEqual(test.Spec.Topology, stage.Test.Topology) ||
+		!reflect.DeepEqual(test.Spec.Driver, stage.Test.Driver) {
+		return nil, errors.New("CertificationTest contract no longer matches the immutable Run")
+	}
+
+	return append([]signalv1.TestArtifact(nil), test.Spec.Artifacts...), nil
+}
+
+func digestJSON(value any) (string, error) {
+	content, err := json.Marshal(value)
+	if err != nil {
+		return "", err
+	}
+
+	sum := sha256.Sum256(content)
+
+	return "sha256:" + hex.EncodeToString(sum[:]), nil
 }
 
 func indexedParticipants(participants []signalv1.Participant) []signalv1.Participant {

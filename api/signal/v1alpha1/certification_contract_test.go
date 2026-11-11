@@ -503,18 +503,16 @@ func TestResourceCELAllowsResourcesOmitted(t *testing.T) {
 					"minParticipants": int64(1),
 					"maxParticipants": int64(1),
 				},
+				"artifacts": []any{map[string]any{
+					"name":    "check.sh",
+					"content": "exit 0\n",
+					"digest":  "sha256:" + strings.Repeat("a", 64),
+				}},
 				"driver": map[string]any{
 					"type": "Script",
 					"script": map[string]any{
-						"language": "Shell",
-						"source": map[string]any{
-							"type": "ConfigMap",
-							"configMap": map[string]any{
-								"name":   "scripts",
-								"key":    "check.sh",
-								"digest": "sha256:" + strings.Repeat("a", 64),
-							},
-						},
+						"language":    "Shell",
+						"artifact":    "check.sh",
 						"runnerImage": fixtureImageA,
 					},
 				},
@@ -550,15 +548,8 @@ func TestResourceCELAllowsResourcesOmitted(t *testing.T) {
 		stage["test"].(map[string]any)["driver"] = map[string]any{
 			"type": "Script",
 			"script": map[string]any{
-				"language": "Shell",
-				"source": map[string]any{
-					"type": "ConfigMap",
-					"configMap": map[string]any{
-						"name":   "scripts",
-						"key":    "check.sh",
-						"digest": "sha256:" + strings.Repeat("a", 64),
-					},
-				},
+				"language":    "Shell",
+				"artifact":    "check.sh",
 				"runnerImage": fixtureImageA,
 			},
 		}

@@ -51,6 +51,37 @@ spec:
             type: object
           spec:
             properties:
+              artifacts:
+                description: |-
+                  Artifacts are inline, digest-verified execution inputs owned by this Test.
+                  They are not copied into CertificationRun resolved plans.
+                items:
+                  properties:
+                    content:
+                      description: |-
+                        Content is materialized into the execution workload only after the
+                        CertificationTest identity and trust decision match the admitted Run.
+                      maxLength: 98304
+                      minLength: 1
+                      type: string
+                    digest:
+                      pattern: ^sha256:[0-9a-f]{64}$
+                      type: string
+                    name:
+                      maxLength: 253
+                      minLength: 1
+                      pattern: ^[A-Za-z0-9._-]+$
+                      type: string
+                  required:
+                  - content
+                  - digest
+                  - name
+                  type: object
+                maxItems: 16
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
               description:
                 maxLength: 2048
                 type: string
@@ -153,6 +184,12 @@ spec:
                         size(self.resources.claims) <= 16'
                   script:
                     properties:
+                      artifact:
+                        description: Artifact names an entry in CertificationTest.spec.artifacts.
+                        maxLength: 253
+                        minLength: 1
+                        pattern: ^[A-Za-z0-9._-]+$
+                        type: string
                       language:
                         enum:
                         - Shell
@@ -223,83 +260,10 @@ spec:
                           for the payload.
                         pattern: ^[^@\s]+@sha256:[0-9a-f]{64}$
                         type: string
-                      source:
-                        properties:
-                          configMap:
-                            properties:
-                              digest:
-                                pattern: ^sha256:[0-9a-f]{64}$
-                                type: string
-                              key:
-                                maxLength: 253
-                                minLength: 1
-                                type: string
-                              name:
-                                maxLength: 253
-                                minLength: 1
-                                type: string
-                            required:
-                            - digest
-                            - key
-                            - name
-                            type: object
-                          git:
-                            properties:
-                              commit:
-                                pattern: ^[0-9a-f]{40}$
-                                type: string
-                              digest:
-                                pattern: ^sha256:[0-9a-f]{64}$
-                                type: string
-                              path:
-                                maxLength: 1024
-                                minLength: 1
-                                type: string
-                              repository:
-                                pattern: ^https://[^\s]+$
-                                type: string
-                            required:
-                            - commit
-                            - digest
-                            - path
-                            - repository
-                            type: object
-                          oci:
-                            properties:
-                              reference:
-                                description: Reference must include a digest and must
-                                  not be a mutable tag.
-                                pattern: ^[^@\s]+@sha256:[0-9a-f]{64}$
-                                type: string
-                            required:
-                            - reference
-                            type: object
-                          type:
-                            enum:
-                            - ConfigMap
-                            - OCI
-                            - Git
-                            type: string
-                        required:
-                        - type
-                        type: object
-                        x-kubernetes-validations:
-                        - message: ConfigMap sources require configMap
-                          rule: self.type != 'ConfigMap' || has(self.configMap)
-                        - message: configMap is valid only for ConfigMap sources
-                          rule: self.type == 'ConfigMap' || !has(self.configMap)
-                        - message: OCI sources require oci
-                          rule: self.type != 'OCI' || has(self.oci)
-                        - message: oci is valid only for OCI sources
-                          rule: self.type == 'OCI' || !has(self.oci)
-                        - message: Git sources require git
-                          rule: self.type != 'Git' || has(self.git)
-                        - message: git is valid only for Git sources
-                          rule: self.type == 'Git' || !has(self.git)
                     required:
+                    - artifact
                     - language
                     - runnerImage
-                    - source
                     type: object
                     x-kubernetes-validations:
                     - message: script resource limits must not exceed 16 entries
@@ -319,6 +283,13 @@ spec:
                     type: string
                   workflowTemplate:
                     properties:
+                      artifact:
+                        description: |-
+                          Artifact optionally names an entry in CertificationTest.spec.artifacts
+                          passed to the WorkflowTemplate as the standard script parameters.
+                        maxLength: 253
+                        pattern: ^$|^[A-Za-z0-9._-]+$
+                        type: string
                       digest:
                         pattern: ^sha256:[0-9a-f]{64}$
                         type: string
@@ -807,6 +778,12 @@ spec:
             x-kubernetes-validations:
             - message: minParticipants must not exceed maxParticipants
               rule: '!has(self.topology) || self.topology.minParticipants <= self.topology.maxParticipants'
+            - message: Script driver artifact must exist in spec.artifacts
+              rule: self.driver.type != 'Script' || (has(self.artifacts) && self.artifacts.exists(a,
+                a.name == self.driver.script.artifact))
+            - message: WorkflowTemplate driver artifact must exist in spec.artifacts
+              rule: self.driver.type != 'WorkflowTemplate' || !has(self.driver.workflowTemplate.artifact)
+                || (has(self.artifacts) && self.artifacts.exists(a, a.name == self.driver.workflowTemplate.artifact))
           status:
             properties:
               conditions:

@@ -1237,6 +1237,10 @@ func (r *AdmissionReconciler) resolveStage(
 		return nil, fmt.Errorf("unsupported CertificationTest trust state %q", test.Status.Trust.State)
 	}
 
+	if err := signalv1.ValidateTestArtifacts(test.Spec); err != nil {
+		return nil, fmt.Errorf("CertificationTest artifacts are invalid: %w", err)
+	}
+
 	parameters, err := resolvedStageParameters(test.Spec.Parameters, stage.Parameters)
 	if err != nil {
 		return nil, err
@@ -3510,15 +3514,50 @@ func (r *RunReconciler) readStageResult(
 		return nil, nil, err
 	}
 
+	test, err := r.readPinnedCertificationTest(ctx, stage.Test.Identity)
+	if err != nil {
+		return nil, nil, err
+	}
+
 	runnerImages, err := stageRunnerImageProvenance(
 		result.Annotations[stageResultRunnerImages],
-		stage.Test.Driver,
+		test.Spec.Driver,
 	)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	return &summary, runnerImages, nil
+}
+
+func (r *RunReconciler) readPinnedCertificationTest(
+	ctx context.Context,
+	identity signalv1.TestIdentitySnapshot,
+) (*signalv1.CertificationTest, error) {
+	reader := r.APIReader
+	if reader == nil {
+		reader = r.Client
+	}
+
+	var test signalv1.CertificationTest
+	if err := reader.Get(ctx, client.ObjectKey{Name: identity.Name}, &test); err != nil {
+		return nil, fmt.Errorf("read pinned CertificationTest: %w", err)
+	}
+
+	if test.UID != identity.UID ||
+		test.Generation != identity.Generation ||
+		test.Status.ObservedGeneration != identity.Generation ||
+		test.Status.Trust == nil ||
+		test.Status.Trust.State != identity.Trust ||
+		test.Status.Trust.ContentDigest != identity.ContentDigest {
+		return nil, errors.New("CertificationTest no longer matches the immutable Run identity")
+	}
+
+	if err := signalv1.ValidateTestArtifacts(test.Spec); err != nil {
+		return nil, fmt.Errorf("CertificationTest artifacts are invalid: %w", err)
+	}
+
+	return &test, nil
 }
 
 func stageRunnerImageProvenance(

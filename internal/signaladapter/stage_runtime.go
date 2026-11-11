@@ -63,6 +63,7 @@ type StageInvocation struct {
 	Ordinal         int32
 	Attempt         int32
 	Stage           signalv1.ResolvedStagePlan
+	Artifacts       []signalv1.TestArtifact
 	Participants    []signalv1.Participant
 	ParticipantRole map[int32]string
 }
@@ -81,6 +82,7 @@ type StageExecutionRequest struct {
 	StageOrder                     int32
 	PhaseRole                      signalv1.CheckStageRole
 	Stage                          signalv1.ResolvedStagePlan
+	Artifacts                      []signalv1.TestArtifact
 	Participants                   []signalv1.Participant
 	Resume                         []signalv1.InvocationResultEnvelope
 	DuplicateQualificationIdentity bool
@@ -228,6 +230,7 @@ func (r StageRunner) executeWithRetry(
 			Ordinal:         ordinal,
 			Attempt:         attempt,
 			Stage:           *request.Stage.DeepCopy(),
+			Artifacts:       slices.Clone(request.Artifacts),
 			Participants:    slices.Clone(participants),
 			ParticipantRole: roles,
 		}

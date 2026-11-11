@@ -22,6 +22,16 @@ data:
   test.sh: |
     echo test
 ---
+apiVersion: signal.unbounded-cloud.io/v1alpha1
+kind: CertificationTest
+metadata:
+  name: inline
+spec:
+  artifacts:
+    - name: test.sh
+      content: |
+        echo test
+---
 apiVersion: argoproj.io/v1alpha1
 kind: WorkflowTemplate
 metadata:
@@ -33,7 +43,7 @@ spec:
 		t.Fatalf("write fixture: %v", err)
 	}
 
-	dataDigest, err := manifestDigest(path, "ConfigMap", "scripts", "test.sh", "")
+	dataDigest, err := manifestDigest(path, "ConfigMap", "scripts", "test.sh", "", "")
 	if err != nil {
 		t.Fatalf("digest ConfigMap data: %v", err)
 	}
@@ -42,7 +52,23 @@ spec:
 		t.Fatalf("ConfigMap data digest = %s", dataDigest)
 	}
 
-	fieldDigest, err := manifestDigest(path, "WorkflowTemplate", "canary", "", "spec")
+	artifactDigest, err := manifestDigest(
+		path,
+		"CertificationTest",
+		"inline",
+		"",
+		"",
+		"test.sh",
+	)
+	if err != nil {
+		t.Fatalf("digest CertificationTest artifact: %v", err)
+	}
+
+	if artifactDigest != dataDigest {
+		t.Fatalf("CertificationTest artifact digest = %s, want %s", artifactDigest, dataDigest)
+	}
+
+	fieldDigest, err := manifestDigest(path, "WorkflowTemplate", "canary", "", "spec", "")
 	if err != nil {
 		t.Fatalf("digest WorkflowTemplate spec: %v", err)
 	}

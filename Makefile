@@ -1429,9 +1429,9 @@ signal-manifests: ## Render Project Signal manifests into deploy/signal/rendered
 	gpu_inventory_script_digest="$$( \
 		$(GOCMD) run ./hack/cmd/manifest-digest \
 			--file "$$gpu_inventory_catalog" \
-			--kind ConfigMap \
-			--name project-signal-gpu-inventory-v2 \
-			--data-key gpu-inventory.sh \
+			--kind CertificationTest \
+			--name project-signal-gpu-inventory-v1 \
+			--artifact gpu-inventory.sh \
 	)"; \
 	if [ "$(SIGNAL_GPU_INVENTORY_SCRIPT_DIGEST)" != "$$gpu_inventory_script_digest" ]; then \
 		echo "GPU inventory script digest mismatch: expected $(SIGNAL_GPU_INVENTORY_SCRIPT_DIGEST), rendered $$gpu_inventory_script_digest" >&2; \

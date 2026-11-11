@@ -558,24 +558,8 @@ func validateResolvedDriver(driver CertificationTestDriver) error {
 			return errors.New("script runner image must be digest-pinned")
 		}
 
-		switch driver.Script.Source.Type {
-		case ArtifactSourceTypeConfigMap:
-			if driver.Script.Source.ConfigMap == nil ||
-				!IsSHA256Digest(driver.Script.Source.ConfigMap.Digest) {
-				return errors.New("ConfigMap source digest is invalid")
-			}
-		case ArtifactSourceTypeOCI:
-			if driver.Script.Source.OCI == nil ||
-				!IsDigestPinnedImage(driver.Script.Source.OCI.Reference) {
-				return errors.New("OCI source must be digest-pinned")
-			}
-		case ArtifactSourceTypeGit:
-			if driver.Script.Source.Git == nil ||
-				!IsSHA256Digest(driver.Script.Source.Git.Digest) {
-				return errors.New("git source digest is invalid")
-			}
-		default:
-			return errors.New("script source type is invalid")
+		if strings.TrimSpace(driver.Script.Artifact) == "" {
+			return errors.New("script artifact is missing")
 		}
 	case TestDriverTypeContainer:
 		if driver.Container == nil || !IsDigestPinnedImage(driver.Container.Image) {

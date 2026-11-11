@@ -1367,6 +1367,13 @@ spec:
                                             || size(self.resources.claims) <= 16'
                                       script:
                                         properties:
+                                          artifact:
+                                            description: Artifact names an entry in
+                                              CertificationTest.spec.artifacts.
+                                            maxLength: 253
+                                            minLength: 1
+                                            pattern: ^[A-Za-z0-9._-]+$
+                                            type: string
                                           language:
                                             enum:
                                             - Shell
@@ -1438,85 +1445,10 @@ spec:
                                               digest-pinned runtime for the payload.
                                             pattern: ^[^@\s]+@sha256:[0-9a-f]{64}$
                                             type: string
-                                          source:
-                                            properties:
-                                              configMap:
-                                                properties:
-                                                  digest:
-                                                    pattern: ^sha256:[0-9a-f]{64}$
-                                                    type: string
-                                                  key:
-                                                    maxLength: 253
-                                                    minLength: 1
-                                                    type: string
-                                                  name:
-                                                    maxLength: 253
-                                                    minLength: 1
-                                                    type: string
-                                                required:
-                                                - digest
-                                                - key
-                                                - name
-                                                type: object
-                                              git:
-                                                properties:
-                                                  commit:
-                                                    pattern: ^[0-9a-f]{40}$
-                                                    type: string
-                                                  digest:
-                                                    pattern: ^sha256:[0-9a-f]{64}$
-                                                    type: string
-                                                  path:
-                                                    maxLength: 1024
-                                                    minLength: 1
-                                                    type: string
-                                                  repository:
-                                                    pattern: ^https://[^\s]+$
-                                                    type: string
-                                                required:
-                                                - commit
-                                                - digest
-                                                - path
-                                                - repository
-                                                type: object
-                                              oci:
-                                                properties:
-                                                  reference:
-                                                    description: Reference must include
-                                                      a digest and must not be a mutable
-                                                      tag.
-                                                    pattern: ^[^@\s]+@sha256:[0-9a-f]{64}$
-                                                    type: string
-                                                required:
-                                                - reference
-                                                type: object
-                                              type:
-                                                enum:
-                                                - ConfigMap
-                                                - OCI
-                                                - Git
-                                                type: string
-                                            required:
-                                            - type
-                                            type: object
-                                            x-kubernetes-validations:
-                                            - message: ConfigMap sources require configMap
-                                              rule: self.type != 'ConfigMap' || has(self.configMap)
-                                            - message: configMap is valid only for
-                                                ConfigMap sources
-                                              rule: self.type == 'ConfigMap' || !has(self.configMap)
-                                            - message: OCI sources require oci
-                                              rule: self.type != 'OCI' || has(self.oci)
-                                            - message: oci is valid only for OCI sources
-                                              rule: self.type == 'OCI' || !has(self.oci)
-                                            - message: Git sources require git
-                                              rule: self.type != 'Git' || has(self.git)
-                                            - message: git is valid only for Git sources
-                                              rule: self.type == 'Git' || !has(self.git)
                                         required:
+                                        - artifact
                                         - language
                                         - runnerImage
-                                        - source
                                         type: object
                                         x-kubernetes-validations:
                                         - message: script resource limits must not
@@ -1539,6 +1471,13 @@ spec:
                                         type: string
                                       workflowTemplate:
                                         properties:
+                                          artifact:
+                                            description: |-
+                                              Artifact optionally names an entry in CertificationTest.spec.artifacts
+                                              passed to the WorkflowTemplate as the standard script parameters.
+                                            maxLength: 253
+                                            pattern: ^$|^[A-Za-z0-9._-]+$
+                                            type: string
                                           digest:
                                             pattern: ^sha256:[0-9a-f]{64}$
                                             type: string

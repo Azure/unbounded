@@ -24,6 +24,7 @@ func main() {
 		name     string
 		dataKey  string
 		field    string
+		artifact string
 	)
 
 	flag.StringVar(&filePath, "file", "", "YAML manifest file")
@@ -31,17 +32,25 @@ func main() {
 	flag.StringVar(&name, "name", "", "Kubernetes object metadata.name")
 	flag.StringVar(&dataKey, "data-key", "", "ConfigMap data key to digest")
 	flag.StringVar(&field, "field", "", "Dot-separated object field to digest as canonical JSON")
+	flag.StringVar(&artifact, "artifact", "", "CertificationTest spec.artifacts name to digest")
 	flag.Parse()
 
 	if filePath == "" || kind == "" || name == "" {
 		exitError(errors.New("file, kind, and name are required"))
 	}
 
-	if (dataKey == "") == (field == "") {
-		exitError(errors.New("exactly one of data-key or field is required"))
+	selected := 0
+	for _, value := range []string{dataKey, field, artifact} {
+		if value != "" {
+			selected++
+		}
 	}
 
-	digest, err := manifestDigest(filePath, kind, name, dataKey, field)
+	if selected != 1 {
+		exitError(errors.New("exactly one of data-key, field, or artifact is required"))
+	}
+
+	digest, err := manifestDigest(filePath, kind, name, dataKey, field, artifact)
 	if err != nil {
 		exitError(err)
 	}
@@ -49,7 +58,7 @@ func main() {
 	fmt.Println(digest)
 }
 
-func manifestDigest(filePath, kind, name, dataKey, field string) (digest string, err error) {
+func manifestDigest(filePath, kind, name, dataKey, field, artifact string) (digest string, err error) {
 	file, err := os.Open(filePath)
 	if err != nil {
 		return "", err
@@ -106,6 +115,40 @@ func manifestDigest(filePath, kind, name, dataKey, field string) (digest string,
 			content, err = json.Marshal(value)
 			if err != nil {
 				return "", fmt.Errorf("encode %s/%s field %q: %w", kind, name, field, err)
+			}
+		case artifact != "":
+			artifacts, found, nestedErr := unstructured.NestedSlice(object.Object, "spec", "artifacts")
+			if nestedErr != nil {
+				return "", nestedErr
+			}
+
+			if !found {
+				return "", fmt.Errorf("%s/%s has no spec.artifacts", kind, name)
+			}
+
+			for index := range artifacts {
+				entry, ok := artifacts[index].(map[string]any)
+				if !ok || entry["name"] != artifact {
+					continue
+				}
+
+				value, ok := entry["content"].(string)
+				if !ok {
+					return "", fmt.Errorf(
+						"%s/%s artifact %q content is missing or invalid",
+						kind,
+						name,
+						artifact,
+					)
+				}
+
+				content = []byte(value)
+
+				break
+			}
+
+			if content == nil {
+				return "", fmt.Errorf("%s/%s artifact %q not found", kind, name, artifact)
 			}
 		}
 

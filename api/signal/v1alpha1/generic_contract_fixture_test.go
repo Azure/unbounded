@@ -4,6 +4,8 @@
 package v1alpha1
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"testing"
@@ -424,6 +426,9 @@ func TestFifteenScriptBaselineMapsToIndependentTests(t *testing.T) {
 	for index := range tests {
 		name := fmt.Sprintf("baseline-%02d", index+1)
 		digest := fmt.Sprintf("sha256:%064x", index+1)
+		content := "#!/bin/sh\nexit 0\n"
+		artifactSum := sha256.Sum256([]byte(content))
+		artifactDigest := "sha256:" + hex.EncodeToString(artifactSum[:])
 		tests[index] = CertificationTest{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:       name,
@@ -434,6 +439,11 @@ func TestFifteenScriptBaselineMapsToIndependentTests(t *testing.T) {
 				DisplayName: name,
 				Owner:       "project-signal",
 				Version:     "1",
+				Artifacts: []TestArtifact{{
+					Name:    name + ".sh",
+					Content: content,
+					Digest:  artifactDigest,
+				}},
 				Metrics: []TestMetricDefinition{{
 					Name:        "passed",
 					DisplayName: "Passed",
@@ -444,15 +454,8 @@ func TestFifteenScriptBaselineMapsToIndependentTests(t *testing.T) {
 				Driver: CertificationTestDriver{
 					Type: TestDriverTypeScript,
 					Script: &ScriptTestDriver{
-						Language: ScriptLanguageShell,
-						Source: ImmutableArtifactSource{
-							Type: ArtifactSourceTypeConfigMap,
-							ConfigMap: &ConfigMapArtifactSource{
-								Name:   "dapple-baseline-scripts",
-								Key:    name + ".sh",
-								Digest: digest,
-							},
-						},
+						Language:    ScriptLanguageShell,
+						Artifact:    name + ".sh",
 						RunnerImage: fixtureImageA,
 					},
 				},

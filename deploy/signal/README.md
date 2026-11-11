@@ -200,11 +200,11 @@ the same source cannot create independent qualification evidence.
 
 ### CertificationTest drivers
 
-- **Script:** uses an immutable ConfigMap, OCI artifact, or Git commit plus an
-  exact source digest, digest-pinned runner image, and explicit resource
-  requirements. The current Kubernetes executor supports immutable ConfigMap
-  script sources. A script may either emit the full canonical invocation
-  envelope or use the simpler file contract:
+- **Script:** names an inline `spec.artifacts` entry with an exact content
+  digest, digest-pinned runner image, and explicit resource requirements. The
+  adapter verifies the pinned Test identity and artifact digest, then
+  materializes the script into an `emptyDir` for execution. A script may either
+  emit the full canonical invocation envelope or use the simpler file contract:
   - write `Pass`, `Fail`, or `Inconclusive` to
     `$PROJECT_SIGNAL_RESULTS_DIR/verdict`;
   - write a bounded non-empty reason to
