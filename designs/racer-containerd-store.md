@@ -91,6 +91,15 @@ A local-only request is a normal origin page GET with the request header
 It means "serve this page only from a copy you already hold; do not contact
 the remote origin".
 
+- It carries the reader's opaque `Racer-Metadata` and never `Authorization`.
+  An owner filling for a peer uses the metadata from the peer's sealed origin
+  context, and a holder probe carries the same metadata (but no
+  authorization) so the holder's local-only request names the object as the
+  reader did (`cmd/racer/src/read/candidates.rs`, `holder_copy`;
+  `cmd/racer/src/read.rs`, `serve_holder`). Gantry needs the metadata to know
+  the object's kind and so its Content-Type; it answers a local-only request
+  without metadata with 404 rather than guess (`internal/gantry/racer/racer.go`,
+  `Origin`).
 - The adapter answers a miss with 404 (`racersdk.ErrNotFound`) and a
   different version with 412 (`racersdk.ErrVersionMismatch`). Racer treats
   both as a miss (`cmd/racer/src/origin.rs`, `local_page_reserved_at`).
@@ -128,8 +137,9 @@ whole blob on disk.
 | holders asked per fill (`HOLDER_ATTEMPTS`) | 2 |
 | deadline per probe (`HOLDER_TIMEOUT`) | 2s |
 
-- A probe is a peer page request with `FetchMode::Holder`. The holder answers
-  from its memory or from its own adapter with a local-only request. It never
+- A probe is a peer page request with `FetchMode::Holder` that carries the
+  reader's opaque metadata but no authorization. The holder answers from its
+  memory or from its own adapter with a local-only request. It never
   forwards or contacts the remote origin. A cache that is not `Adapter` on the
   holder always misses (`cmd/racer/src/read.rs`, `serve_holder`).
 - A copy from a holder is decrypted, which authenticates it.

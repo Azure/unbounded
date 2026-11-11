@@ -155,6 +155,9 @@ spec:
   and then the remote origin, and never counts as an origin failure.
 - Both the reading node and an owner that fills a page for a peer ask their own
   adapter first.
+- A local-only request carries the reader's `Racer-Metadata`, also when an
+  owner or a node it served sends it on the reader's behalf, but never its
+  `Authorization`.
 - In the Go SDK, a local-only request has `OriginRequest.LocalOnly` set.
   Adapters return `ErrNotFound` when they hold no local copy. Racer sends
   local-only requests only to caches with `persistence: Adapter`, because an
