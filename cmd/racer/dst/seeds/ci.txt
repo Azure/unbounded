@@ -99,3 +99,5 @@ app-writes-holder-loss seed=2
 app-writes-holder-loss seed=15
 app-writes-membership-churn seed=4
 app-writes-membership-churn seed=8
+app-writes-membership-churn seed=100
+app-writes-membership-churn seed=107
