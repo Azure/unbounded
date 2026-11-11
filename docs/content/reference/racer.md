@@ -2086,7 +2086,8 @@ status = client.prefetch_status("epoch-17", wait=30, refs="failed")
 | Origin | `/run/racer/<name>/origin/socket`, mode `0600`, in a dataplane-created directory owned by UID/GID 65532 with mode `0700` |
 
 For tests, `github.com/Azure/unbounded/pkg/racersdk/racersdktest` runs a
-noncaching fake Racer. It does not test distributed or RDMA behavior.
+noncaching fake Racer. It does not test distributed or RDMA behavior, and it
+does not serve host-read, so `HostRead` fails against it.
 
 ### Go writes
 
@@ -2103,8 +2104,13 @@ func (c *Client) Delete(ctx context.Context, request Request) error
 result, err := client.Put(ctx, request, bytes.NewReader(data), int64(len(data)),
 	racersdk.WriteOptions{Replicas: 2, Upload: racersdk.UploadNever, Hold: time.Hour})
 if errors.Is(err, racersdk.ErrExists) {
-	// The key exists; writes are create-once.
+	// The key exists; writes are create-once. Write a new key instead.
+	return err
 }
+if err != nil {
+	return err
+}
+fmt.Println(result.ETag, result.UploadState)
 ```
 
 The zero `WriteOptions` uses the cache defaults. `OriginDurable` waits for the

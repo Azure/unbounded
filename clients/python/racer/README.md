@@ -82,7 +82,9 @@ limits into tickets `<id>.0`, `<id>.1`, and so on. Rejections raise
 ```python
 request = racer.object_request("ckpt", "runs/a/step-100/weights.bin")
 result = client.write(request, data, replicas=2, upload="never", hold_seconds=3600)
-result = client.host_write(request, buf.fileno(), 0, buf.size)  # SCM_RIGHTS, no socket copy
+with racer.HostBuffer(len(data)) as buf:
+    buf.view[:] = data
+    result = client.host_write(request, buf.fileno(), 0, buf.size)  # SCM_RIGHTS, no socket copy
 state = client.persist(request)  # start the upload of a "manual" object
 client.delete(request)
 ```
@@ -100,6 +102,7 @@ requests must not name a `version_id`.
 ### PyTorch Distributed Checkpoint
 
 ```python
+import torch.distributed.checkpoint as dcp
 from racer.dcp import RacerStorageReader, RacerStorageWriter
 
 writer = RacerStorageWriter(client, "ckpt", "runs/a", step=step, persist_every=10)
