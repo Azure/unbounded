@@ -1538,6 +1538,43 @@ fn rekeying_keeps_written_pages_readable_past_key_retention() {
     assert!(c.sink.committed(&c.object(OBJECT)).unwrap().data == body);
 }
 
+/// A page key withdrawn before rekeying (no decrypt key retained) leaves
+/// written pages hidden from the index. The rekey scan counts them in
+/// `racer_write_unreadable_pages` instead of losing them silently.
+#[test]
+fn written_pages_under_a_withdrawn_key_are_counted_unreadable() {
+    let mut c = Cluster::new(38, 3, Some(writes(2)));
+    let body = bytes(38, 150_000);
+    assert_eq!(
+        c.put(0, OBJECT, &body, "Racer-Upload: manual\r\n").status,
+        201
+    );
+    let written = c.written();
+    assert!(written > 0);
+    c.rotate_keys(0);
+    c.wait(Duration::from_secs(1));
+    c.wait(Duration::from_secs(1));
+    let cache = c.object(OBJECT).cache.0;
+    let needle = format!("racer_write_unreadable_pages{{cache=\"{cache}\"}} ");
+    let mut unreadable = 0;
+    for node in &c.harness.nodes {
+        let mut text = String::new();
+        node.workers[0]
+            .app
+            .telemetry
+            .metrics
+            .writes()
+            .write(&mut text)
+            .unwrap();
+        unreadable += text
+            .lines()
+            .find_map(|l| l.strip_prefix(needle.as_str()))
+            .map_or(0, |v| v.parse::<usize>().unwrap());
+    }
+    assert_eq!(unreadable, written);
+    assert!(c.written_keys().is_empty());
+}
+
 /// Written pages whose session no member knows are dropped after
 /// `orphan_after`, not before; known objects are kept.
 #[test]

@@ -56,6 +56,9 @@ struct CacheMetrics {
     /// Dirty bytes and upload-state counts, last sampled per worker.
     dirty: BTreeMap<u16, u64>,
     states: BTreeMap<u16, [u64; STATES.len()]>,
+    /// Written pages whose page key left the keyring, last sampled per
+    /// worker by the rekey scan.
+    unreadable: BTreeMap<u16, u64>,
 }
 
 #[derive(Default)]
@@ -141,6 +144,20 @@ impl WriteMetrics {
         }
     }
 
+    /// Replace `worker`'s sample of written pages whose page key is no
+    /// longer in the keyring, per cache.
+    pub fn sample_unreadable(&self, worker: u16, unreadable: &[(String, u64)]) {
+        let mut state = self.lock();
+        for entry in state.caches.values_mut() {
+            entry.unreadable.remove(&worker);
+        }
+        for (cache, pages) in unreadable {
+            Self::cache(&mut state, cache)
+                .unreadable
+                .insert(worker, *pages);
+        }
+    }
+
     /// Replace `worker`'s upload-state counts.
     pub fn sample_states(&self, worker: u16, states: &[(String, racer_core::write::UploadState)]) {
         let mut state = self.lock();
@@ -195,6 +212,9 @@ impl WriteMetrics {
                 e.upload_bytes
             }),
             ("racer_write_repairs_total", "counter", |e| e.repairs),
+            ("racer_write_unreadable_pages", "gauge", |e| {
+                e.unreadable.values().sum()
+            }),
         ] {
             writeln!(out, "# TYPE {name} {kind}")?;
             for (cache, entry) in &state.caches {
@@ -265,6 +285,7 @@ mod tests {
         );
         metrics.fsync(Duration::from_micros(700));
         metrics.repair("c1");
+        metrics.sample_unreadable(0, &[("c1".into(), 3)]);
         let mut out = String::new();
         metrics.write(&mut out).unwrap();
         for line in [
@@ -274,6 +295,7 @@ mod tests {
             "racer_write_dirty_bytes{cache=\"c1\"} 12",
             "racer_write_upload_bytes_total{cache=\"c1\"} 4",
             "racer_write_repairs_total{cache=\"c1\"} 1",
+            "racer_write_unreadable_pages{cache=\"c1\"} 3",
             "racer_write_upload_state{cache=\"c1\",state=\"never\"} 2",
             "racer_write_upload_state{cache=\"c1\",state=\"pending\"} 0",
             "racer_write_fsync_seconds_bucket{le=\"0.0005\"} 0",
@@ -284,9 +306,11 @@ mod tests {
         }
         // A new sample replaces the worker's previous one.
         metrics.sample_dirty(0, &[]);
+        metrics.sample_unreadable(0, &[]);
         let mut out = String::new();
         metrics.write(&mut out).unwrap();
         assert!(out.contains("racer_write_dirty_bytes{cache=\"c1\"} 5\n"));
+        assert!(out.contains("racer_write_unreadable_pages{cache=\"c1\"} 0\n"));
         assert_eq!(metrics.requests("c1", Outcome::Created), 2);
     }
 }

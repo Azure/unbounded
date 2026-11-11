@@ -422,9 +422,22 @@ fn new_key(
     ))
 }
 
-/// Keep the newest `retained - 1` decrypt page keys of each cache.
-fn prune_decrypt(keys: &mut Vec<CacheEncryptionKey>, retained: usize) {
-    let keep = retained.clamp(1, wire::MAX_RETAINED_PAGE_KEYS) - 1;
+/// Fewest readable page keys of a write-enabled cache: the active key plus
+/// one decrypt key. Written pages are pinned past any key's lifetime and are
+/// rekeyed under the active key after each activation, which needs the
+/// previous key until the next activation, one rotation interval later.
+pub const MIN_WRITE_RETAINED_PAGE_KEYS: usize = 2;
+
+/// Keep the newest `retained - 1` decrypt page keys of each cache, and at
+/// least [`MIN_WRITE_RETAINED_PAGE_KEYS`]` - 1` for caches in `writes`. With
+/// `writes` of `None` (catalog unknown) every cache gets the write floor.
+fn prune_decrypt(
+    keys: &mut Vec<CacheEncryptionKey>,
+    retained: usize,
+    writes: Option<&BTreeSet<&str>>,
+) {
+    let retained = retained.clamp(1, wire::MAX_RETAINED_PAGE_KEYS);
+    let write_keep = retained.max(MIN_WRITE_RETAINED_PAGE_KEYS) - 1;
     let mut by_cache: BTreeMap<String, Vec<(u64, [u8; 16])>> = BTreeMap::new();
     for k in keys.iter().filter(|k| k.state == CacheKeyState::Decrypt) {
         by_cache
@@ -434,6 +447,11 @@ fn prune_decrypt(keys: &mut Vec<CacheEncryptionKey>, retained: usize) {
     }
     let mut drop = BTreeSet::new();
     for (cache, mut ids) in by_cache {
+        let keep = if writes.is_none_or(|w| w.contains(cache.as_str())) {
+            write_keep
+        } else {
+            retained - 1
+        };
         // Newest first.
         ids.sort_unstable_by(|a, b| b.cmp(a));
         for (_, id) in ids.into_iter().skip(keep) {
@@ -582,7 +600,13 @@ pub fn plan_unread(
         }
         d.activate_at = 0;
         d.next_rotation = now + (policy.interval - policy.prepare_for).as_secs();
-        prune_decrypt(&mut d.keys, policy.retained());
+        let writes: Option<BTreeSet<&str>> = catalog.map(|c| {
+            c.iter()
+                .filter(|c| c.writes.is_some())
+                .map(|c| c.id.0.as_str())
+                .collect()
+        });
+        prune_decrypt(&mut d.keys, policy.retained(), writes.as_ref());
     } else if d.activate_at == 0 && now >= d.next_rotation && !d.keys.is_empty() {
         if creation == 0 {
             return Err(KeyringError::Unavailable);
@@ -1555,6 +1579,62 @@ pub(crate) mod tests {
                 .iter()
                 .all(|k| k.state == CacheKeyState::Active)
         );
+    }
+
+    /// A write-enabled cache keeps the previous page key through one
+    /// rotation even with a retention of one, so written pages can be
+    /// rekeyed; a read-only cache in the same catalog drops it. An unknown
+    /// catalog applies the write floor to every cache.
+    #[test]
+    fn write_caches_keep_one_decrypt_key() {
+        let one = Policy {
+            retained_page_keys: 1,
+            ..policy()
+        };
+        let mut written = cache(2);
+        written.writes = Some(wire::WriteDefinition {
+            replicas: 2,
+            max_dirty_percent: 50,
+            hold_ttl: Duration::from_secs(60),
+            upload_mode: wire::UploadMode::Auto,
+            upload_max_bytes_per_second: 1 << 20,
+            upload_max_concurrent_blocks: 4,
+        });
+        let catalog = [cache(1), written.clone()];
+        let page_keys = |d: &Durable, c: &CacheDefinition| {
+            d.keys
+                .iter()
+                .filter(|k| {
+                    k.key.cache == c.id
+                        && k.key.purpose == CacheKeyPurpose::Page
+                        && k.state != CacheKeyState::Prepared
+                })
+                .count()
+        };
+        let mut d = plan(&one, &Durable::default(), &catalog, &[], now())
+            .unwrap()
+            .durable;
+        for _ in 0..3 {
+            d = plan(&one, &d, &catalog, &[], d.next_rotation)
+                .unwrap()
+                .durable;
+            d = plan(&one, &d, &catalog, &[], d.activate_at)
+                .unwrap()
+                .durable;
+            d.validate().unwrap();
+            assert_eq!(page_keys(&d, &catalog[0]), 1);
+            assert_eq!(page_keys(&d, &written), 2);
+        }
+        // Unknown catalog: no cache drops below the write floor.
+        let mut rng = crate::entropy::OsEntropy;
+        let p = plan_with(&one, &d, Some(&catalog), &[], d.next_rotation, &mut rng)
+            .unwrap()
+            .durable;
+        let p = plan_with(&one, &p, None, &[], p.activate_at, &mut rng)
+            .unwrap()
+            .durable;
+        assert_eq!(page_keys(&p, &catalog[0]), 2);
+        assert_eq!(page_keys(&p, &written), 2);
     }
 
     /// Six readable page keys and a retention of two: passes without an

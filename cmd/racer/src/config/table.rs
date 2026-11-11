@@ -964,7 +964,7 @@ const BASE: &[Var] = &[
         Group::Kubernetes,
         uint(1, racer_wire::control::MAX_RETAINED_PAGE_KEYS as u64, COUNT),
         Value("7"),
-        "Readable page keys per cache: the active key plus older decrypt keys. Read by the authority. Lowering it never drops keys at once: extra decrypt keys are dropped at the next key rotation.",
+        "Readable page keys per cache: the active key plus older decrypt keys. Read by the authority. Lowering it never drops keys at once: extra decrypt keys are dropped at the next key rotation. Caches with writes enabled always keep at least 2 (the active key and the previous one), so written pages can be rekeyed within one rotation interval.",
     )),
     control(var(
         "RACER_PAGE_BYTES",

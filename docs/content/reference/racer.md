@@ -593,7 +593,7 @@ each worker and are never divided.
 | `RACER_CONTROL_LISTEN` | `:8443` | Node | `ip:port` | Control seat listener. `:port` binds every IPv4 address. |
 | `RACER_WEBHOOK_LISTEN` | `:9443` | Node | `ip:port` | Object sidecar admission webhook listener. `:port` binds every IPv4 address. |
 | `RACER_OBJECT_IMAGE` | Unset: webhook serving off | Node | image reference | Image injected as the object sidecar. |
-| `RACER_RETAINED_PAGE_KEYS` | `7` | Node | 1..16 | Readable page keys per cache: the active key plus older decrypt keys. Read by the authority. Lowering it never drops keys at once: extra decrypt keys are dropped at the next key rotation. |
+| `RACER_RETAINED_PAGE_KEYS` | `7` | Node | 1..16 | Readable page keys per cache: the active key plus older decrypt keys. Read by the authority. Lowering it never drops keys at once: extra decrypt keys are dropped at the next key rotation. Caches with writes enabled always keep at least 2 (the active key and the previous one), so written pages can be rekeyed within one rotation interval. |
 | `RACER_PAGE_BYTES` | `16777216` (16 MiB) | Node | 16,777,216..16,777,216 bytes | Cluster-wide logical page size. Only 16777216 (16 MiB) is accepted: the client SDKs and the disk index do not yet support other sizes. Fixed at cluster creation: the authority publishes the value of the primary that made the first publication, records it in the `racer-state` Secret, and ignores later changes with a warning in the primary's log. Running nodes reject a publication that changes it. |
 | `RACER_KUBE_API_CA` | `/var/run/secrets/kubernetes.io/serviceaccount/ca.crt` | Node | absolute path | Kubernetes API CA bundle. |
 | `RACER_KUBE_API_TOKEN` | `/var/run/secrets/kubernetes.io/serviceaccount/token` | Node | absolute path | Default-audience token, used only for the Kubernetes API. |
@@ -1358,6 +1358,18 @@ appears only after the cache sees write activity.
 | `racer_write_upload_bytes_total{cache}` | Bytes uploaded to the origin |
 | `racer_write_upload_state{cache,state}` | Written objects by upload state |
 | `racer_write_repairs_total{cache}` | Pages copied again after a node holding a copy left the cache's pool. |
+| `racer_write_unreadable_pages{cache}` | Written pages on this node whose page key left the keyring before they were rekeyed. This node's copy of each is lost; nonzero means a holder fell behind key rotation. |
+
+Written objects can stay pinned (up to 30 days with `Racer-Hold-Seconds`)
+much longer than a page key stays readable (`RACER_RETAINED_PAGE_KEYS` key
+rotations). Each holder therefore reseals its written pages under the active
+page key after every rotation, up to 8 pages per maintenance turn per I/O
+worker. The authority keeps at least 2 readable page keys for every cache
+with `writes` set, whatever `RACER_RETAINED_PAGE_KEYS` says, so a holder has
+one full rotation interval after each activation to finish. A holder that is
+down longer than the retention window (`RACER_RETAINED_PAGE_KEYS` times the
+rotation interval) loses its copies; they are counted in
+`racer_write_unreadable_pages`.
 
 ### Spill holds
 

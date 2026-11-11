@@ -1689,7 +1689,19 @@ keys": the node cannot see the authority's `retained_page_keys`, which may be
 1 (no decrypt keys) or 2, and only "not active" is safe for every setting.
 The cost is one decrypt, encrypt, and record write per written page per
 rotation (daily by default). A page sealed under a key that was dropped
-before its holder rekeyed it stays unreadable, as before.
+before its holder rekeyed it stays unreadable, as before; each rescan counts
+such pinned but hidden pages per cache in `racer_write_unreadable_pages`.
+
+Overlap: rekey needs the previous key until it finishes. With
+`retained_page_keys` 1 the authority used to drop the previous page key at the
+same activation that made the new one active, so every written page became
+invisible at once and rekey never saw it. The authority keyring now keeps at
+least `MIN_WRITE_RETAINED_PAGE_KEYS` (2) readable page keys for every cache
+whose definition sets `writes` (and for every cache while the catalog is
+unknown), giving each holder one rotation interval after activation to rekey.
+At `BATCH` pages per turn per worker this is far beyond any store's written
+pages. Retention below the hold TTL is the reason rekey exists; only a holder
+offline longer than `retained_page_keys` rotation intervals loses its copies.
 
 Garbage collection (`gc.rs`, per worker, over the pages it holds):
 
@@ -1737,6 +1749,8 @@ with a stale journal and roles converge to one coordinator, all `committed`),
 `persist_after_a_coordinator_takeover_uploads_once`,
 `rekeying_keeps_written_pages_readable_past_key_retention` (three rotations
 keeping one decrypt key; fails without rekey),
+`written_pages_under_a_withdrawn_key_are_counted_unreadable`,
+`keyring::tests::write_caches_keep_one_decrypt_key` (authority),
 `orphaned_written_pages_are_collected`, and
 `a_removed_cache_releases_its_written_pages`.
 

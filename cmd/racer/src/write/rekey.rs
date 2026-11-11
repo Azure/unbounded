@@ -7,6 +7,20 @@
 //! A pinned page sealed under a dropped key is unreadable and cannot be
 //! uploaded.
 //!
+//! Overlap: rekeying needs the previous page key until every written page
+//! is resealed. The authority keeps at least one decrypt key for every
+//! write-enabled cache whatever `retained_page_keys` says
+//! (`MIN_WRITE_RETAINED_PAGE_KEYS`), so a holder has one rotation interval
+//! after each activation to rekey its pages. At [`BATCH`] pages per
+//! maintenance turn per worker that is far more than any store holds.
+//!
+//! A written page whose key already left the keyring (a holder that was
+//! down for longer than the retention window) is invisible to the index and
+//! cannot be rekeyed. Each scan counts such pages per cache in the
+//! `racer_write_unreadable_pages` gauge, so the loss of this copy is visible
+//! instead of silent. The copy stays pinned until its hold ends; other
+//! holders' copies are unaffected if they rekeyed in time.
+//!
 //! Threshold: a holder rekeys every written page whose key is not the
 //! cache's active page key. The node cannot see the authority's retention
 //! setting, which may be as low as one key (no decrypt keys at all), so
@@ -82,12 +96,30 @@ pub(crate) async fn run(local: &Coordinator, scope: &RequestScope) -> Result<usi
         state.generation != Some(generation) || state.next_scan.is_none_or(|at| now >= at)
     };
     if rescan {
-        let queue: VecDeque<PageId> = writer
-            .written_pages()
-            .into_iter()
-            .map(|(page, _)| page)
-            .filter(|page| stale(local, page))
-            .collect();
+        let mut unreadable: std::collections::BTreeMap<String, u64> = Default::default();
+        let mut queue = VecDeque::new();
+        for (page, _) in writer.written_pages() {
+            match writer.index().lookup(&page) {
+                Ok(Some(_)) => {
+                    if stale(local, &page) {
+                        queue.push_back(page);
+                    }
+                }
+                // Pinned but hidden: its page key left the keyring.
+                Ok(None) => {
+                    *unreadable
+                        .entry(page.version.object.cache.0.clone())
+                        .or_default() += 1;
+                }
+                Err(_) => {}
+            }
+        }
+        let unreadable: Vec<(String, u64)> = unreadable.into_iter().collect();
+        local
+            .fill
+            .metrics
+            .writes()
+            .sample_unreadable(writer.index().worker().0, &unreadable);
         let mut state = local.writes.rekey.borrow_mut();
         state.generation = Some(generation);
         state.next_scan = Some(now + RESCAN);
