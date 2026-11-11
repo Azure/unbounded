@@ -737,7 +737,7 @@ opened `O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC`. The directory is created and
 fsynced once.
 
 File header (64 bytes, written once, fsynced with the directory):
-`magic b"RCRWJNL1"` | `u32 BE format = 1` | `u16 BE worker` | 2 zero bytes |
+`magic b"RCRWJNL1"` | `u32 BE format = 2` | `u16 BE worker` | 2 zero bytes |
 `32-byte layout digest` (the same layout digest checkpoints use,
 `checkpoint.rs:96`) | 16 zero bytes.
 
