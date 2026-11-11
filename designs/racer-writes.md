@@ -946,7 +946,7 @@ Files: new `cmd/racer/core/src/write/{mod.rs,session.rs,journal.rs,upload.rs,hol
 Work:
 
 - Types in [Racer core types](#racer-core-types-wp2).
-- `journal.rs`: `JournalRecord` enum for kinds 1..8,
+- `journal.rs`: `JournalRecord` enum for kinds 1..8 (kind 9 `Forget` added later, see the membership-churn holder fix),
   `encode(&JournalRecord, &mut Vec<u8>)`, `decode(&[u8]) -> Result<(JournalRecord, usize), JournalError>`
   with `JournalError::{Torn, Corrupt}`, and `replay(bytes) -> (Vec<JournalRecord>, valid_prefix_len)`.
 - `session.rs`: the coordinator `Session` state machine with the event and effect
@@ -2157,6 +2157,48 @@ cache definition, which does not exist yet. The e2e accepts `404` or `503`.
   `write::rekey::tests::evacuation_drains_the_smallest_source_segment_first`,
   `store::writes::headroom_tests::new_writes_leave_the_rekey_reserve_unpinned`,
   `store::tests::written::relocate_moves_a_written_record_and_its_pin`.
+
+### Membership-churn holder fix as built
+
+racer-dst `app-writes-membership-churn` seeds 100 and 107 ended with pages of a
+`replicas=3` object at two pinned holders. The lost copy belonged to a manifest
+replica that a join displaced from page zero's ranked members and that later
+crashed and restarted:
+
+- The replica's role check (`check_roles`, `cmd/racer/src/write/failover.rs`)
+  drops a displaced replica's session and journaled that as a `Delete`.
+  `JournalState::apply` (`cmd/racer/src/store/journal.rs`) drops a deleted
+  version's pages too, while the in-memory pins stayed. The journal no longer
+  matched memory, and recovery after a restart lost the copies.
+- The coordinator still counted the node as a holder. Repair acts only on
+  holders missing from the pool past `RACER_WRITE_HOLDER_GRACE_SECS`
+  (`lost_holders`, `cmd/racer/src/write/repair.rs`), so a restart inside the
+  grace never got the copy back. Acknowledged data stayed at `replicas - 1`
+  copies. This was a product durability bug, not an invariant that was too
+  strict.
+
+Fix: a new journal record, `Forget` (kind 9, `racer_core::write::journal`).
+It drops the session and keeps the version's pages pinned. The displaced
+replica journals it through `coordinator::forget_record`. `Delete` keeps its
+meaning for real deletes, expiry, and removed caches. A journal that holds
+kind 9 records cannot be read by an older build.
+
+Two oracle fixes in `cmd/racer/src/app/dst/writes.rs` came out of a broader
+sweep (seeds 100 to 160 of all four writes scenarios). Neither changes the
+product:
+
+- `app-writes-holder-loss` seeds 152 and 159: a version lost with its only
+  holder may keep pages on its surviving holders. The design does not fail
+  that version; its page waits for the holder. The leak check tolerated those
+  pages by key, so a new version of the same key turned them into strays. It
+  now tolerates them by etag (`lost_versions`).
+- `app-writes-holder-loss` seed 146: a faulted read of such a key served the
+  lost version from a surviving copy, and the oracle panicked on any `200`.
+  The read must now return that version's acknowledged bytes.
+
+Tests: `app::dst::write_tests::a_displaced_manifest_replica_keeps_its_written_pages_across_a_restart`
+fails without the fix. `store::journal` fold tests and the codec round-trip
+cover `Forget`. The six seeds are in `cmd/racer/dst/seeds/ci.txt`.
 
 ### WP12: documentation
 
