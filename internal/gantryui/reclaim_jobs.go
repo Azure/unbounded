@@ -231,7 +231,8 @@ func reclaimWorkerJob(owner *batchv1.Job, spec ReclaimSpec, node corev1.Node, di
 				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{reclaimLabel: "worker"}},
 				Spec: corev1.PodSpec{
 					NodeName: node.Name, AutomountServiceAccountToken: ptr.To(false), RestartPolicy: corev1.RestartPolicyNever,
-					Tolerations: []corev1.Toleration{{Operator: corev1.TolerationOpExists}},
+					ImagePullSecrets: helperPullSecrets(spec.ImagePullSecret),
+					Tolerations:      []corev1.Toleration{{Operator: corev1.TolerationOpExists}},
 					Containers: []corev1.Container{{
 						Name: "reclaim-node", Image: spec.Image, ImagePullPolicy: corev1.PullIfNotPresent,
 						Command:         []string{"/unbounded/bin/gantry-ui", "reclaim-node"},

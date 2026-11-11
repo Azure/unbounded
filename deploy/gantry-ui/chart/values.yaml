@@ -1,0 +1,47 @@
+image:
+  repository: ghcr.io/vpatelsj/gantry-ui
+  # Required immutable dashboard image digest, also used by both helpers.
+  digest: ""
+  pullPolicy: IfNotPresent
+
+# Reference existing Secrets in the release namespace; this chart creates none.
+imagePullSecrets: []
+# Optional existing Secret used by builder/reclaimer Jobs, including node workers.
+helperImagePullSecret: ""
+
+# Required public-cloud ACR login server for demo images.
+registry: ""
+nodePool: flexpool
+architecture: amd64
+gantryNamespace: unbounded-system
+interval: 1s
+
+# The dashboard always selects Linux, independently of these additional labels.
+nodeSelector:
+  kubernetes.azure.com/mode: system
+tolerations: []
+
+azure:
+  # Required workload identity with ACR catalog/pull access.
+  clientID: ""
+
+builder:
+  enabled: false
+  azure:
+    # Separate workload identity with ACR push/pull access.
+    clientID: ""
+  # Required when enabled: <registry>/repository@sha256:<64 lowercase hex>.
+  base: ""
+  repository: gantry-demo/generated
+  concurrency: 1
+
+reclaimer:
+  enabled: false
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: "2"
+    memory: 1Gi

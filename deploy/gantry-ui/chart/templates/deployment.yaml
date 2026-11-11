@@ -1,0 +1,101 @@
+{{- include "gantry-ui.validate" . -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "gantry-ui.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gantry-ui.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gantry-ui
+      app.kubernetes.io/instance: {{ .Release.Name | quote }}
+  template:
+    metadata:
+      labels:
+        {{- include "gantry-ui.labels" . | nindent 8 }}
+        azure.workload.identity/use: "true"
+    spec:
+      serviceAccountName: {{ include "gantry-ui.fullname" . }}
+      hostNetwork: true
+      dnsPolicy: Default
+      dnsConfig:
+        options:
+          - name: ndots
+            value: "1"
+      nodeSelector:
+        {{- toYaml (merge (dict "kubernetes.io/os" "linux") .Values.nodeSelector) | nindent 8 }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: dashboard
+          image: {{ include "gantry-ui.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/unbounded/bin/gantry-ui"]
+          args:
+            - "--listen=127.0.0.1:8088"
+            - {{ printf "--registry=%s" .Values.registry | quote }}
+            - {{ printf "--namespace=%s" .Release.Namespace | quote }}
+            - {{ printf "--gantry-namespace=%s" .Values.gantryNamespace | quote }}
+            - {{ printf "--node-pool=%s" .Values.nodePool | quote }}
+            - {{ printf "--architecture=%s" .Values.architecture | quote }}
+            - "--direct-agents"
+            - {{ printf "--interval=%s" .Values.interval | quote }}
+            {{- if .Values.helperImagePullSecret }}
+            - {{ printf "--helper-image-pull-secret=%s" .Values.helperImagePullSecret | quote }}
+            {{- end }}
+            {{- if .Values.builder.enabled }}
+            - {{ printf "--builder-image=%s" (include "gantry-ui.image" .) | quote }}
+            - {{ printf "--builder-base=%s" .Values.builder.base | quote }}
+            - {{ printf "--builder-service-account=%s-builder" (include "gantry-ui.fullname" .) | quote }}
+            - {{ printf "--builder-repository=%s" .Values.builder.repository | quote }}
+            - {{ printf "--builder-concurrency=%v" .Values.builder.concurrency | quote }}
+            {{- end }}
+            {{- if .Values.reclaimer.enabled }}
+            - {{ printf "--reclaimer-image=%s" (include "gantry-ui.image" .) | quote }}
+            - {{ printf "--reclaimer-service-account=%s-reclaimer" (include "gantry-ui.fullname" .) | quote }}
+            {{- end }}
+          env:
+            - name: AZURE_CLIENT_ID
+              value: {{ .Values.azure.clientID | quote }}
+            - name: AZURE_TOKEN_CREDENTIALS
+              value: WorkloadIdentityCredential
+            - name: GOMEMLIMIT
+              value: 768MiB
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          readinessProbe:
+            httpGet:
+              host: 127.0.0.1
+              path: /api/config
+              port: 8088
+            periodSeconds: 3
+            timeoutSeconds: 2
+          livenessProbe:
+            httpGet:
+              host: 127.0.0.1
+              path: /api/config
+              port: 8088
+            periodSeconds: 15
+            timeoutSeconds: 2

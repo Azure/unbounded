@@ -10,6 +10,78 @@ does not modify the network-topology frontend.
 
 ## Run Locally
 
+### On-demand GHCR build and Helm installation
+
+This workflow is independent of Unbounded CI. It uses Docker Buildx or Podman
+to build the embedded Go dashboard, pushes to GHCR, resolves the pushed digest,
+then installs/upgrades only the dashboard Helm release. It does not install or
+upgrade Gantry, change Azure permissions, delete demo workloads, or start a
+public endpoint.
+
+Prerequisites:
+
+- Docker with Buildx, or Podman, running locally; Helm 3 and kubectl.
+- A GHCR login with package write access to your chosen repository. Use your
+  engine's normal login with `--password-stdin`; never put tokens in values files.
+- An existing Unbounded cluster with Gantry and Flex workers.
+- Azure Workload Identity enabled and federated identities for the chart's
+  service accounts. The dashboard identity needs ACR catalog/read permissions;
+  enabling generation requires a builder identity with repository pull/push.
+- A public GHCR image, or existing image-pull Secrets in the demo namespace.
+  GHCR packages may initially be private. ACR authentication and GHCR pull
+  authentication are separate.
+
+Configure a project-local values file using the chart's values as a reference:
+
+```yaml
+registry: example.azurecr.io
+nodePool: flexpool
+azure:
+  clientID: YOUR_DASHBOARD_IDENTITY_CLIENT_ID
+builder:
+  enabled: true
+  azure:
+    clientID: YOUR_BUILDER_IDENTITY_CLIENT_ID
+  base: example.azurecr.io/demo/base@sha256:YOUR_BASE_DIGEST
+reclaimer:
+  enabled: true
+```
+
+The base must be an existing small Linux image of the worker architecture in
+the configured ACR. Helpers come from the GHCR dashboard image; generated demo
+images still go to ACR. For private GHCR packages, configure both dashboard
+`imagePullSecrets` and `helperImagePullSecret` with existing Secret names.
+
+Run from the repository root:
+
+```sh
+bash hack/scripts/gantry-ui-deploy.sh \
+  --kubeconfig ./cluster.kubeconfig \
+  --context my-unbounded-context \
+  --values ./tmp/gantry-ui-values.yaml \
+  --image ghcr.io/vpatelsj/gantry-ui
+```
+
+The command requires an explicit context to avoid deploying to an unintended
+cluster. It selects Docker first, then Podman, or accepts `--engine podman`.
+The default image platform is `linux/amd64`; use `--platform linux/arm64` for
+ARM system nodes and workers. The command sets the chart's architecture to
+match the single-platform helper image, including its worker selection.
+Cross-platform builds require engine emulation support or a native
+builder. Helm NOTES prints the port-forward command.
+
+The chart uses host networking and binds to node loopback only. Keep one
+dashboard per system node/port, and use a dedicated demo namespace per release:
+the dashboard owns all labeled demos in its namespace and uses a fixed reclaim
+coordinator name. Federated identity subjects must match the service-account
+names rendered by Helm. The command does not create Azure federated credentials.
+
+The current hand-applied test deployment is not automatically adopted by Helm.
+Use a new namespace/release and a different system node, or deliberately migrate
+the old deployment before installing. The command never deletes or takes
+ownership of an existing manual installation. Chart history remains in memory;
+upgrading the dashboard restarts it and clears observed chart history.
+
 Sign in to Azure with `az login`. The selected Azure identity needs permission
 to enumerate repositories, tags, manifests, and image configuration blobs in
 the registry. Authentication uses `DefaultAzureCredential`; environment and
@@ -328,8 +400,8 @@ kubectl --kubeconfig ./cluster.kubeconfig -n gantry-demo delete daemonset GANTRY
 Image generation is disabled unless builder settings are supplied. When enabled,
 **Generate & pull** asks for the number of payload layers and MB per layer,
 creates an in-cluster build Job, pushes the completed ordinary OCI image to ACR,
-and then creates its digest-pinned Flex DaemonSet. It does not convert the image
-to ACR Artifact Streaming.
+and then creates its digest-pinned Flex DaemonSet. Checking **Enable ACR
+streaming** adds verified per-image conversion before the DaemonSet is created.
 
 Limits are 100 payload layers and 100 GB (100,000 MB) total random payload. MB means
 1,000,000 bytes. Each payload layer contains independent cryptographically
@@ -351,7 +423,10 @@ Configure the server with:
 --builder-concurrency 1
 ```
 
-Both images must be digest-pinned in the configured ACR. The builder image must
+Both images must be digest-pinned. The runtime base must stay in the configured
+ACR; the builder and reclaimer can come from GHCR. Set
+`--helper-image-pull-secret` for private helper images; that existing Secret is
+attached to builder, coordinator, and worker Jobs. The builder image must
 contain `/unbounded/bin/gantry-ui`; the single-platform Linux base must match the
 configured architecture and contain `/bin/sh` and `sleep`. Use a small BusyBox
 base mirrored into ACR. Build Jobs target native AKS system nodes of that

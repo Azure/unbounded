@@ -1,0 +1,63 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": ["image", "registry", "azure"],
+  "properties": {
+    "image": {
+      "type": "object",
+      "required": ["repository", "digest", "pullPolicy"],
+      "additionalProperties": false,
+      "properties": {
+        "repository": {"type": "string", "pattern": "^[a-z0-9][a-z0-9./_-]+$"},
+        "digest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+        "pullPolicy": {"enum": ["Always", "IfNotPresent", "Never"]}
+      }
+    },
+    "registry": {"type": "string", "pattern": "^[a-z0-9]{5,50}\\.azurecr\\.io$"},
+    "azure": {
+      "type": "object",
+      "required": ["clientID"],
+      "properties": {"clientID": {"type": "string", "minLength": 1}}
+    },
+    "nodePool": {"type": "string", "maxLength": 63, "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"},
+    "gantryNamespace": {"type": "string", "maxLength": 63, "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"},
+    "architecture": {"enum": ["amd64", "arm64"]},
+    "interval": {"type": "string", "minLength": 1},
+    "nodeSelector": {
+      "type": "object",
+      "additionalProperties": {"type": "string"},
+      "properties": {"kubernetes.io/os": {"const": "linux"}}
+    },
+    "tolerations": {"type": "array", "items": {"type": "object"}},
+    "imagePullSecrets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name"],
+        "additionalProperties": false,
+        "properties": {"name": {"type": "string", "minLength": 1, "maxLength": 253, "pattern": "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$"}}
+      }
+    },
+    "helperImagePullSecret": {"type": "string", "maxLength": 253, "pattern": "^$|^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$"},
+    "builder": {
+      "type": "object",
+      "required": ["enabled", "azure", "base", "repository", "concurrency"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "azure": {"type": "object", "properties": {"clientID": {"type": "string"}}},
+        "base": {"type": "string"},
+        "repository": {"type": "string", "pattern": "^[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)*$"},
+        "concurrency": {"type": "integer", "minimum": 1}
+      },
+      "if": {"properties": {"enabled": {"const": true}}},
+      "then": {
+        "properties": {
+          "azure": {"required": ["clientID"], "properties": {"clientID": {"minLength": 1}}},
+          "base": {"pattern": "^[a-z0-9]{5,50}\\.azurecr\\.io/[a-z0-9][a-z0-9/._-]*@sha256:[a-f0-9]{64}$"}
+        }
+      }
+    },
+    "reclaimer": {"type": "object", "required": ["enabled"], "properties": {"enabled": {"type": "boolean"}}},
+    "resources": {"type": "object"}
+  }
+}

@@ -28,24 +28,30 @@ const (
 )
 
 type ReclaimConfig struct {
-	Image          string
-	ServiceAccount string
+	Image           string
+	ServiceAccount  string
+	ImagePullSecret string
 }
 
 func (cfg ReclaimConfig) Validate(registry string) error {
-	if !validBuildBase(registry, cfg.Image) || len(validation.IsDNS1123Subdomain(cfg.ServiceAccount)) != 0 {
-		return errors.New("reclaimer requires a digest-pinned image in the configured ACR and a service account")
+	if !validHelperImage(cfg.Image) || len(validation.IsDNS1123Subdomain(cfg.ServiceAccount)) != 0 {
+		return errors.New("reclaimer requires a digest-pinned image and a service account")
+	}
+
+	if cfg.ImagePullSecret != "" && len(validation.IsDNS1123Subdomain(cfg.ImagePullSecret)) != 0 {
+		return errors.New("invalid helper image pull secret name")
 	}
 
 	return nil
 }
 
 type ReclaimSpec struct {
-	Namespace      string `json:"namespace"`
-	NodePool       string `json:"nodePool"`
-	Architecture   string `json:"architecture"`
-	Image          string `json:"image"`
-	ServiceAccount string `json:"serviceAccount"`
+	Namespace       string `json:"namespace"`
+	NodePool        string `json:"nodePool"`
+	Architecture    string `json:"architecture"`
+	Image           string `json:"image"`
+	ServiceAccount  string `json:"serviceAccount"`
+	ImagePullSecret string `json:"imagePullSecret,omitempty"`
 }
 
 type ReclaimProgress struct {
@@ -80,6 +86,10 @@ func (spec ReclaimSpec) Validate() error {
 
 	if spec.Architecture != "amd64" && spec.Architecture != "arm64" {
 		return errors.New("unsupported reclaimer architecture")
+	}
+
+	if spec.ImagePullSecret != "" && len(validation.IsDNS1123Subdomain(spec.ImagePullSecret)) != 0 {
+		return errors.New("invalid helper image pull secret name")
 	}
 	// Unlike the browser, this command is also invoked directly by Kubernetes.
 	if !validBuildBase(registryHost(spec.Image), spec.Image) {
@@ -248,7 +258,7 @@ func (s *Server) createReclaim(w http.ResponseWriter, r *http.Request) {
 
 	spec := ReclaimSpec{
 		Namespace: s.cfg.Namespace, NodePool: s.cfg.NodePool, Architecture: s.cfg.Architecture,
-		Image: s.cfg.Reclaimer.Image, ServiceAccount: s.cfg.Reclaimer.ServiceAccount,
+		Image: s.cfg.Reclaimer.Image, ServiceAccount: s.cfg.Reclaimer.ServiceAccount, ImagePullSecret: s.cfg.Reclaimer.ImagePullSecret,
 	}
 
 	desired, err := reclaimCoordinatorJob(spec)
@@ -293,8 +303,9 @@ func reclaimCoordinatorJob(spec ReclaimSpec) (*batchv1.Job, error) {
 				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{reclaimLabel: "coordinator"}},
 				Spec: corev1.PodSpec{
 					ServiceAccountName: spec.ServiceAccount, RestartPolicy: corev1.RestartPolicyNever,
-					NodeSelector:    map[string]string{"kubernetes.io/os": "linux", "kubernetes.io/arch": spec.Architecture, "kubernetes.azure.com/mode": "system"},
-					SecurityContext: &corev1.PodSecurityContext{RunAsNonRoot: ptr.To(true), RunAsUser: ptr.To(int64(65532)), RunAsGroup: ptr.To(int64(65532))},
+					ImagePullSecrets: helperPullSecrets(spec.ImagePullSecret),
+					NodeSelector:     map[string]string{"kubernetes.io/os": "linux", "kubernetes.io/arch": spec.Architecture, "kubernetes.azure.com/mode": "system"},
+					SecurityContext:  &corev1.PodSecurityContext{RunAsNonRoot: ptr.To(true), RunAsUser: ptr.To(int64(65532)), RunAsGroup: ptr.To(int64(65532))},
 					Containers: []corev1.Container{{
 						Name: "reclaimer", Image: spec.Image,
 						Command:         []string{"/unbounded/bin/gantry-ui", "reclaim"},

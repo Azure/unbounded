@@ -31,16 +31,21 @@ import (
 var buildName = regexp.MustCompile(`^gantry-build-[a-f0-9]{20}$`)
 
 type ImageBuildConfig struct {
-	Image          string
-	ServiceAccount string
-	Base           string
-	Repository     string
-	MaxConcurrent  int
+	Image           string
+	ServiceAccount  string
+	Base            string
+	Repository      string
+	MaxConcurrent   int
+	ImagePullSecret string
 }
 
 func (cfg ImageBuildConfig) Validate(host string) error {
-	if !validBuildBase(host, cfg.Base) || !validBuildBase(host, cfg.Image) {
-		return errors.New("builder image and runtime base must be digest-pinned images in the configured ACR")
+	if !validBuildBase(host, cfg.Base) || !validHelperImage(cfg.Image) {
+		return errors.New("builder image must be digest pinned; runtime base must be digest pinned in the configured ACR")
+	}
+
+	if cfg.ImagePullSecret != "" && len(validation.IsDNS1123Subdomain(cfg.ImagePullSecret)) > 0 {
+		return errors.New("invalid helper image pull secret name")
 	}
 
 	if _, err := reference.WithName(host + "/" + cfg.Repository); err != nil {
@@ -181,8 +186,9 @@ func imageBuildJob(spec BuildSpec, cfg ImageBuildConfig) (*batchv1.Job, error) {
 				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{managerLabel: "gantry-ui", buildLabel: spec.Name, "azure.workload.identity/use": "true"}},
 				Spec: corev1.PodSpec{
 					ServiceAccountName: cfg.ServiceAccount, RestartPolicy: corev1.RestartPolicyNever,
-					NodeSelector:    map[string]string{"kubernetes.io/os": "linux", "kubernetes.io/arch": spec.Architecture, "kubernetes.azure.com/mode": "system"},
-					SecurityContext: &corev1.PodSecurityContext{RunAsNonRoot: ptr.To(true), RunAsUser: ptr.To(int64(65532)), RunAsGroup: ptr.To(int64(65532)), FSGroup: ptr.To(int64(65532)), SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault}},
+					ImagePullSecrets: helperPullSecrets(cfg.ImagePullSecret),
+					NodeSelector:     map[string]string{"kubernetes.io/os": "linux", "kubernetes.io/arch": spec.Architecture, "kubernetes.azure.com/mode": "system"},
+					SecurityContext:  &corev1.PodSecurityContext{RunAsNonRoot: ptr.To(true), RunAsUser: ptr.To(int64(65532)), RunAsGroup: ptr.To(int64(65532)), FSGroup: ptr.To(int64(65532)), SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault}},
 					Containers: []corev1.Container{{
 						Name: "builder", Image: cfg.Image, Command: []string{"/unbounded/bin/gantry-ui", "build-image"},
 						Env:             []corev1.EnvVar{{Name: "GANTRY_IMAGE_BUILD", Value: string(encoded)}},
@@ -436,4 +442,16 @@ func validBuildBase(host, base string) bool {
 	d, digestErr := godigest.Parse(parts[1])
 
 	return err == nil && digestErr == nil && d.Algorithm() == godigest.SHA256
+}
+
+func validHelperImage(image string) bool {
+	return validBuildBase(registryHost(image), image)
+}
+
+func helperPullSecrets(name string) []corev1.LocalObjectReference {
+	if name == "" {
+		return nil
+	}
+
+	return []corev1.LocalObjectReference{{Name: name}}
 }

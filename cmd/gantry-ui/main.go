@@ -56,6 +56,7 @@ func run() error {
 	builderConcurrency := flag.Int("builder-concurrency", 1, "Maximum concurrent image-build Jobs")
 	reclaimerImage := flag.String("reclaimer-image", "", "Digest-pinned image containing the disk reclaimer; empty disables reclamation")
 	reclaimerAccount := flag.String("reclaimer-service-account", "", "Dedicated disk-reclaimer service account")
+	helperPullSecret := flag.String("helper-image-pull-secret", "", "Existing image pull secret in the demo namespace for builder and reclaimer Jobs")
 
 	flag.Parse()
 
@@ -86,7 +87,7 @@ func run() error {
 
 	var builder *gantryui.ImageBuildConfig
 	if *builderImage != "" || *builderBase != "" || *builderAccount != "" {
-		builder = &gantryui.ImageBuildConfig{Image: *builderImage, Base: *builderBase, ServiceAccount: *builderAccount, Repository: *builderRepository, MaxConcurrent: *builderConcurrency}
+		builder = &gantryui.ImageBuildConfig{Image: *builderImage, Base: *builderBase, ServiceAccount: *builderAccount, Repository: *builderRepository, MaxConcurrent: *builderConcurrency, ImagePullSecret: *helperPullSecret}
 		if err := builder.Validate(*registry); err != nil {
 			return err
 		}
@@ -94,7 +95,7 @@ func run() error {
 
 	var reclaimer *gantryui.ReclaimConfig
 	if *reclaimerImage != "" || *reclaimerAccount != "" {
-		reclaimer = &gantryui.ReclaimConfig{Image: *reclaimerImage, ServiceAccount: *reclaimerAccount}
+		reclaimer = &gantryui.ReclaimConfig{Image: *reclaimerImage, ServiceAccount: *reclaimerAccount, ImagePullSecret: *helperPullSecret}
 		if err := reclaimer.Validate(*registry); err != nil {
 			return err
 		}

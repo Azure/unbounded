@@ -1,0 +1,16 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+FROM docker.io/library/golang:1.26.10-bookworm AS builder
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -o /gantry-ui ./cmd/gantry-ui
+
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=builder --chmod=0755 /gantry-ui /unbounded/bin/gantry-ui
+COPY LICENSE NOTICE /unbounded/licenses/
+EXPOSE 8088
+ENTRYPOINT ["/unbounded/bin/gantry-ui"]
