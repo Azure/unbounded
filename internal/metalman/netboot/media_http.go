@@ -5,6 +5,7 @@ package netboot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -365,6 +366,13 @@ func (p *MediaProvider) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	o, err := p.callbackOwner(r.Context(), id)
 	if err != nil {
+		if errors.Is(err, errMediaLookup) {
+			log.Warn("boot media owner lookup failed", "err", err)
+			http.Error(w, http.StatusText(http.StatusServiceUnavailable), http.StatusServiceUnavailable)
+
+			return
+		}
+
 		log.Warn("rejecting boot media request without an owner", "err", err)
 		http.NotFound(w, r)
 
@@ -381,8 +389,24 @@ func (p *MediaProvider) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	local := o.status().Netboot.Network != nil
+
 	switch action {
+	case "install":
+		if !local {
+			http.NotFound(w, r)
+			return
+		}
+
+		p.serveInstall(w, r, id, log)
 	case "grub.cfg":
+		if local {
+			// Local installer media boots from the ISO and never fetches a
+			// GRUB config; refuse to hand it a network installer.
+			http.NotFound(w, r)
+			return
+		}
+
 		o, err = p.owner(r.Context(), id)
 		if err != nil {
 			log.Info("serving halt config because install is no longer authorized", "err", err)
@@ -410,21 +434,11 @@ func (p *MediaProvider) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if o.status().LoaderStartedAt == nil {
-			// Record the boot before any installer can run, so the controller
-			// never power cycles a host that is installing.
-			base := o.op.DeepCopy()
-			status := *o.status()
-			now := metav1.Now()
-			status.LoaderStartedAt = &now
+		if err := p.recordLoaderStart(r.Context(), o); err != nil {
+			log.Warn("saving loader start", "err", err)
+			http.Error(w, "cannot save loader start", http.StatusServiceUnavailable)
 
-			o.op.Status.Targets[o.index].BootMedia = &status
-			if err := p.Client.Status().Patch(r.Context(), o.op, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
-				log.Warn("saving loader start", "err", err)
-				http.Error(w, "cannot save loader start", http.StatusServiceUnavailable)
-
-				return
-			}
+			return
 		}
 
 		log.Info("serving boot media installer config")
@@ -480,6 +494,133 @@ func (p *MediaProvider) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// recordLoaderStart records the boot before any installer can run, so the
+// controller never power cycles a host that is installing.
+func (p *MediaProvider) recordLoaderStart(ctx context.Context, o *mediaOwner) error {
+	if o.status().LoaderStartedAt != nil {
+		return nil
+	}
+
+	base := o.op.DeepCopy()
+	status := *o.status()
+	now := metav1.Now()
+	status.LoaderStartedAt = &now
+
+	o.op.Status.Targets[o.index].BootMedia = &status
+
+	return p.Client.Status().Patch(ctx, o.op, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}))
+}
+
+// serveInstall answers the local installer with the same authorization as
+// grub.cfg. Where grub.cfg serves halt, this returns 409 Conflict and the
+// installer powers off. Transient lookup failures return 503 so the installer
+// retries instead of powering off.
+func (p *MediaProvider) serveInstall(w http.ResponseWriter, r *http.Request, id string, log *slog.Logger) {
+	o, err := p.owner(r.Context(), id)
+	if errors.Is(err, errMediaLookup) {
+		log.Warn("install authorization lookup failed", "err", err)
+		http.Error(w, "install authorization unavailable", http.StatusServiceUnavailable)
+
+		return
+	}
+
+	if err != nil {
+		log.Info("refusing install because it is no longer authorized", "err", err)
+		http.Error(w, "install not authorized", http.StatusConflict)
+
+		return
+	}
+
+	if phase := o.status().Phase; phase != "PoweringOn" && phase != "Installing" {
+		log.Info("refusing install while the host is not expected to boot", "phase", phase)
+		http.Error(w, "host not expected to boot", http.StatusConflict)
+
+		return
+	}
+
+	data, err := p.installInstructions(o)
+	if err != nil {
+		log.Error("rendering boot media install instructions", "err", err)
+		http.Error(w, "media install instructions unavailable", http.StatusServiceUnavailable)
+
+		return
+	}
+
+	if err := p.recordLoaderStart(r.Context(), o); err != nil {
+		log.Warn("saving loader start", "err", err)
+		http.Error(w, "cannot save loader start", http.StatusServiceUnavailable)
+
+		return
+	}
+
+	log.Info("serving boot media install instructions")
+	w.Header().Set("Content-Type", "text/plain")
+	w.Write(data) //nolint:errcheck // Best-effort HTTP response.
+}
+
+// installInstructions renders the KEY=VALUE instructions for the local
+// installer. The values match what the legacy GRUB config passes on the
+// kernel command line.
+func (p *MediaProvider) installInstructions(o *mediaOwner) ([]byte, error) {
+	if p.Resolver == nil || p.Resolver.Cache == nil {
+		return nil, fmt.Errorf("media resolver unavailable")
+	}
+
+	if _, err := mediaServeURL(p.Resolver.ServeURL); err != nil {
+		return nil, err
+	}
+
+	spec := o.status().Netboot
+	if spec == nil || spec.Network == nil {
+		return nil, fmt.Errorf("media has no host network")
+	}
+
+	if !pinnedImagePattern.MatchString(spec.Image) || !pinnedImagePattern.MatchString(spec.NetbootImage) {
+		return nil, fmt.Errorf("media requires digest-pinned images")
+	}
+
+	meta, err := p.Resolver.Cache.MetadataForRefArchitecture(spec.NetbootImage, spec.TargetArchitecture())
+	if err != nil {
+		return nil, err
+	}
+
+	if meta.MediaFormat != mediaFormat || meta.LocalInstaller != localInstallerFormat {
+		return nil, fmt.Errorf("incompatible media installer")
+	}
+
+	ci := ClusterInfo{}
+	if p.Resolver.Cluster != nil {
+		ci = p.Resolver.Cluster.ClusterInfo()
+	}
+
+	serve := strings.TrimRight(p.Resolver.ServeURL, "/")
+	values := [][2]string{
+		{"IMAGE_URL", serve + "/disk.img.gz"},
+		{"SERVE_URL", serve},
+		{"DS_URL", serve + "/cloud-init/"},
+		{"NODE_NAME", o.machine.Name},
+		{"NODE_NAMESPACE", o.machine.Namespace},
+		{"APISERVER_URL", ci.ApiserverURL},
+		{"MEDIA_CALLBACK", serve + "/bootmedia/" + o.status().ID},
+	}
+
+	if spec.TargetDisk != "" {
+		values = append(values, [2]string{"DISK", spec.TargetDisk})
+	}
+
+	var b strings.Builder
+
+	for _, kv := range values {
+		if !mediaTokenPattern.MatchString(kv[1]) {
+			return nil, fmt.Errorf("unsafe media install value for %s", kv[0])
+		}
+
+		b.WriteString(kv[0] + "=" + kv[1] + "\n")
+	}
+
+	return []byte(b.String()), nil
+}
+
 func (p *MediaProvider) installerConfig(o *mediaOwner) ([]byte, error) {
 	if p.Resolver == nil || p.Resolver.Cache == nil {
 		return nil, fmt.Errorf("media resolver unavailable")
@@ -529,7 +670,11 @@ func (p *MediaProvider) installerConfig(o *mediaOwner) ([]byte, error) {
 		}
 	}
 
-	data := newTemplateData(o.machine, ci, strings.TrimRight(p.Resolver.ServeURL, "/"), "", spec.DHCPLeases[0].IPv4, true)
+	data, err := newHostTemplateData(o.machine, ci, strings.TrimRight(p.Resolver.ServeURL, "/"), "", spec.DHCPLeases[0].IPv4, true)
+	if err != nil {
+		return nil, err
+	}
+
 	data.VirtualMedia = true
 	data.ArtifactRoot = "(http," + u.Host + ")"
 	data.MediaCallbackURL = strings.TrimRight(p.Resolver.ServeURL, "/") + "/bootmedia/" + o.status().ID

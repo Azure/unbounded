@@ -1377,6 +1377,19 @@ func TestMediaRealToolsOptional(t *testing.T) {
 			require.Contains(t, string(content), "/bootmedia/"+id+"/grub.cfg")
 		}
 	}
+
+	// A CD-ROM El Torito boot gives GRUB the ISO9660 tree as its root, for
+	// example (cd0)/grub, so the config must be there too.
+	isoPath := filepath.Join(t.TempDir(), "bootstrap.iso")
+	require.NoError(t, os.WriteFile(isoPath, second, 0o600))
+
+	for _, path := range []string{"/EFI/BOOT/grub.cfg", "/EFI/ubuntu/grub.cfg", "/boot/grub/grub.cfg", "/grub/grub.cfg", "/grub.cfg"} {
+		output := filepath.Join(t.TempDir(), "grub.cfg")
+		require.NoError(t, runMediaCommand(t.Context(), "xorriso", "-osirrox", "on", "-indev", isoPath, "-extract", path, output))
+		content, err := os.ReadFile(output)
+		require.NoError(t, err)
+		require.Contains(t, string(content), "/bootmedia/"+id+"/grub.cfg", path)
+	}
 }
 
 func assertHybridEFI(t *testing.T, iso []byte) []byte {

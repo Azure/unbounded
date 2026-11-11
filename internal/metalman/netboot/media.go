@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -23,17 +24,27 @@ import (
 	"syscall"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/metalman/bootmedia"
+	"github.com/Azure/unbounded/internal/metalman/hostnetwork"
 )
 
 const mediaFormat = "unbounded-uefi-v1"
 
 // Version the ISO layout separately from the netboot image's EFI artifacts.
 const mediaISOFormat = "unbounded-uefi-hybrid-v2"
+
+// mediaLocalISOFormat versions the ISO layout for media that carries the
+// installer and host network description, used when the spec sets network.
+const mediaLocalISOFormat = "unbounded-uefi-local-v1"
+
+// localInstallerFormat is the netboot image metadata value that advertises
+// the local media installer.
+const localInstallerFormat = "unbounded-local-installer-v1"
 
 var (
 	mediaIDPattern     = regexp.MustCompile(`^[0-9a-f]{32}$`)
@@ -77,6 +88,10 @@ func mediaInSite(media *v1alpha3.MachineOperationBootMediaStatus, site string) b
 	return media != nil && media.Site == site
 }
 
+// errMediaLookup marks an ownership lookup that failed for a transient reason,
+// such as an API server error, rather than a definite refusal.
+var errMediaLookup = errors.New("media ownership lookup failed")
+
 // callbackOwner uses the frozen lease even after cleanup, failure, or Machine
 // deletion. A running installer must still be able to cross the reboot barrier.
 // Abandonment ends callback authorization when retention expires.
@@ -87,7 +102,7 @@ func (p *MediaProvider) callbackOwner(ctx context.Context, id string) (*mediaOwn
 
 	var ops v1alpha3.MachineOperationList
 	if err := p.Client.List(ctx, &ops); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: listing machine operations: %w", errMediaLookup, err)
 	}
 
 	var owner *mediaOwner
@@ -145,7 +160,11 @@ func (p *MediaProvider) owner(ctx context.Context, id string) (*mediaOwner, erro
 
 	var current v1alpha3.Machine
 	if err := p.Client.Get(ctx, client.ObjectKey{Name: target.MachineRef}, &current); err != nil {
-		return nil, err
+		if apierrors.IsNotFound(err) {
+			return nil, fmt.Errorf("media machine deleted: %w", err)
+		}
+
+		return nil, fmt.Errorf("%w: getting machine: %w", errMediaLookup, err)
 	}
 
 	if current.UID != o.status().MachineUID || !current.DeletionTimestamp.IsZero() || current.Labels["unbounded-cloud.io/site"] != p.Site {
@@ -302,6 +321,17 @@ func (p *MediaProvider) ensureISO(ctx context.Context, o *mediaOwner) (string, e
 		return "", fmt.Errorf("netboot image lacks compatible %s media artifacts", mediaFormat)
 	}
 
+	local := spec.Network != nil
+	if local {
+		if meta.LocalInstaller != localInstallerFormat {
+			return "", fmt.Errorf("netboot image lacks the %s installer required by host network settings", localInstallerFormat)
+		}
+
+		if err := hostnetwork.Validate(spec.Network, spec.DHCPLeases[0]); err != nil {
+			return "", fmt.Errorf("invalid host network: %w", err)
+		}
+	}
+
 	var efiPaths []string
 
 	for _, name := range []string{shim, grub} {
@@ -316,18 +346,43 @@ func (p *MediaProvider) ensureISO(ctx context.Context, o *mediaOwner) (string, e
 
 		efiPaths = append(efiPaths, path)
 	}
-	// Validate the live installer template and its static values before any
-	// BMC power action, but never copy the rendered install intent into the ISO.
-	if _, err := p.installerConfig(o); err != nil {
-		return "", err
-	}
 
-	config, err := bootstrapConfig(spec.DHCPLeases[0], u, o.status().ID)
-	if err != nil {
-		return "", err
+	var (
+		config []byte
+		files  []mediaFile
+		format = mediaISOFormat
+	)
+
+	if local {
+		format = mediaLocalISOFormat
+		// Check the install instructions before any BMC power action.
+		if _, err := p.installInstructions(o); err != nil {
+			return "", err
+		}
+
+		files, err = p.localMediaFiles(spec, arch, o.status().ID)
+		if err != nil {
+			return "", err
+		}
+
+		config, err = localBootConfig(u, o.status().ID, arch)
+		if err != nil {
+			return "", err
+		}
+	} else {
+		// Validate the live installer template and its static values before any
+		// BMC power action, but never copy the rendered install intent into the ISO.
+		if _, err := p.installerConfig(o); err != nil {
+			return "", err
+		}
+
+		config, err = bootstrapConfig(spec.DHCPLeases[0], u, o.status().ID)
+		if err != nil {
+			return "", err
+		}
 	}
 	// Only immutable inputs affect identity, not controller phase transitions.
-	identity, err := json.Marshal([]any{mediaISOFormat, p.TFTPServer, p.Resolver.ServeURL, o.status().MachineUID, spec, o.status().ID})
+	identity, err := json.Marshal([]any{format, p.TFTPServer, p.Resolver.ServeURL, o.status().MachineUID, spec, o.status().ID})
 	if err != nil {
 		return "", err
 	}
@@ -360,7 +415,7 @@ func (p *MediaProvider) ensureISO(ctx context.Context, o *mediaOwner) (string, e
 	buildCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
 	defer cancel()
 
-	if err := p.buildISO(buildCtx, stage, boot, efiPaths[0], efiPaths[1], config); err != nil {
+	if err := p.buildISO(buildCtx, stage, boot, efiPaths[0], efiPaths[1], config, files); err != nil {
 		return "", err
 	}
 
@@ -403,7 +458,65 @@ func bootstrapConfig(l v1alpha3.DHCPLease, u *url.URL, id string) ([]byte, error
 	return []byte(b.String()), nil
 }
 
-func (p *MediaProvider) buildISO(ctx context.Context, stage, boot, shim, grub string, config []byte) error {
+// mediaFile is a file placed in the ISO9660 tree. Exactly one of From or
+// Data is set.
+type mediaFile struct {
+	Path string
+	From string
+	Data []byte
+}
+
+// localMediaFiles lists the ISO9660 files for local installer media: a
+// marker named by the media ID, the installer kernel and initrds from the
+// netboot image, and the per-operation host network archive.
+func (p *MediaProvider) localMediaFiles(spec *v1alpha3.PXESpec, arch, id string) ([]mediaFile, error) {
+	files := []mediaFile{{Path: "unbounded/" + id, Data: []byte{}}}
+
+	for _, name := range []string{"vmlinuz", "initrd", "init.cpio"} {
+		path, tmpl, err := p.Resolver.Cache.ResolvePathForArchitecture(spec.NetbootImage, arch, name)
+		if err != nil {
+			return nil, err
+		}
+
+		if tmpl {
+			return nil, fmt.Errorf("media installer payload %s must not be a template", name)
+		}
+
+		files = append(files, mediaFile{Path: "unbounded/" + name, From: path})
+	}
+
+	archive, err := hostnetwork.MediaCPIO(spec.Network, spec.DHCPLeases[0])
+	if err != nil {
+		return nil, fmt.Errorf("rendering host network media: %w", err)
+	}
+
+	return append(files, mediaFile{Path: "unbounded/media.cpio", Data: archive}), nil
+}
+
+// localBootConfig boots the installer from the media itself, so no firmware
+// or GRUB networking is needed. The installer brings up the declared host
+// network and fetches its instructions from install_url.
+func localBootConfig(u *url.URL, id, arch string) ([]byte, error) {
+	if !mediaIDPattern.MatchString(id) {
+		return nil, fmt.Errorf("invalid media ID")
+	}
+
+	console := ""
+	if arch != "arm64" {
+		console = " console=tty0 console=ttyS0,115200n8"
+	}
+
+	installURL := "http://" + u.Host + "/bootmedia/" + id
+
+	return fmt.Appendf(nil, "search --no-floppy --file --set=root /unbounded/%s\nlinux /unbounded/vmlinuz unbounded.install_url=%s%s\ninitrd /unbounded/initrd /unbounded/init.cpio /unbounded/media.cpio\nboot\n", id, installURL, console), nil
+}
+
+// mediaGrubConfigPaths lists where the media carries its GRUB config, both in
+// the FAT image and in the ISO9660 tree. Ubuntu GRUB builds use different
+// compiled prefixes.
+var mediaGrubConfigPaths = []string{"/EFI/BOOT/grub.cfg", "/EFI/ubuntu/grub.cfg", "/boot/grub/grub.cfg", "/grub/grub.cfg", "/grub.cfg"}
+
+func (p *MediaProvider) buildISO(ctx context.Context, stage, boot, shim, grub string, config []byte, files []mediaFile) error {
 	dir, err := os.MkdirTemp(filepath.Dir(stage), ".iso-")
 	if err != nil {
 		return err
@@ -412,6 +525,19 @@ func (p *MediaProvider) buildISO(ctx context.Context, stage, boot, shim, grub st
 
 	root := filepath.Join(dir, "root")
 	if err := os.MkdirAll(root, 0o700); err != nil {
+		return err
+	}
+
+	// When firmware boots the El Torito image from a CD-ROM, Ubuntu GRUB
+	// sets its root to the ISO9660 file system, for example (cd0)/grub, not
+	// to the FAT image. Place the same config in the ISO9660 tree so GRUB
+	// finds it there too.
+	tree := append([]mediaFile(nil), files...)
+	for _, dst := range mediaGrubConfigPaths {
+		tree = append(tree, mediaFile{Path: strings.TrimPrefix(dst, "/"), Data: config})
+	}
+
+	if err := writeMediaTree(root, tree); err != nil {
 		return err
 	}
 
@@ -458,7 +584,7 @@ func (p *MediaProvider) buildISO(ctx context.Context, stage, boot, shim, grub st
 	// only the same live config handoff, never install intent or credentials.
 	// On rack manager USB media, GRUB sees (hd0,gpt2) and finds its config next
 	// to the EFI binary.
-	for _, dst := range []string{"/EFI/BOOT/grub.cfg", "/EFI/ubuntu/grub.cfg", "/boot/grub/grub.cfg", "/grub/grub.cfg", "/grub.cfg"} {
+	for _, dst := range mediaGrubConfigPaths {
 		if err := run(ctx, "mcopy", "-i", fat, configPath, "::"+dst); err != nil {
 			return err
 		}
@@ -473,6 +599,56 @@ func (p *MediaProvider) buildISO(ctx context.Context, stage, boot, shim, grub st
 	// Use the same FAT image for El Torito EFI boot and a GPT EFI System
 	// Partition, since some rack managers expose the image as a removable USB disk.
 	return run(ctx, "xorriso", "-as", "mkisofs", "-quiet", "-V", "UBMEDIA", "--modification-date=2020010100000000", "--set_all_file_dates", "2020010100000000", "-o", filepath.Join(stage, "bootstrap.iso"), "-append_partition", "2", "0xef", fat, "-appended_part_as_gpt", "-e", "--interval:appended_partition_2:all::", "-no-emul-boot", root)
+}
+
+func writeMediaTree(root string, files []mediaFile) error {
+	for _, f := range files {
+		dst := filepath.Join(root, filepath.FromSlash(f.Path))
+		if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
+			return err
+		}
+
+		if f.From != "" {
+			if err := copyMediaFile(dst, f.From); err != nil {
+				return err
+			}
+
+			continue
+		}
+
+		if err := os.WriteFile(dst, f.Data, 0o600); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// copyMediaFile streams src into dst so memory use stays bounded regardless
+// of artifact size (kernels and initrds can be ~100 MB).
+func copyMediaFile(dst, src string) (err error) {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close() //nolint:errcheck // Read-only source.
+
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+
+	defer func() {
+		if cerr := out.Close(); err == nil {
+			err = cerr
+		}
+	}()
+
+	if _, err := io.Copy(out, in); err != nil {
+		return fmt.Errorf("copy %s: %w", src, err)
+	}
+
+	return out.Sync()
 }
 
 // normalizeMediaFAT removes wall-clock directory timestamps, without touching

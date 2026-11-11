@@ -25,6 +25,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/metalman/hostnetwork"
 	"github.com/Azure/unbounded/internal/metalman/indexing"
 	"github.com/Azure/unbounded/internal/provision"
 )
@@ -290,7 +291,12 @@ func (f *FileResolver) ResolveFileByPathForIP(ctx context.Context, path string, 
 				return nil, fmt.Errorf("marshal agent config: %w", err)
 			}
 
-			data, err := renderTemplate(string(content), newTemplateData(node, ci, f.ServeURL, string(agentConfigJSON), requestIP, installRequested))
+			td, err := newHostTemplateData(node, ci, f.ServeURL, string(agentConfigJSON), requestIP, installRequested)
+			if err != nil {
+				return nil, err
+			}
+
+			data, err := renderTemplate(string(content), td)
 			if err != nil {
 				return nil, err
 			}
@@ -362,6 +368,28 @@ type templateData struct {
 	VirtualMedia     bool
 	ArtifactRoot     string
 	MediaCallbackURL string
+	// HostNetplan is the declared host network as a netplan version 2
+	// document without the network: key, or empty when none is declared.
+	HostNetplan string
+}
+
+// newHostTemplateData is newTemplateData plus the declared host network.
+// A network that cannot be rendered fails the request rather than serving a
+// config without it.
+func newHostTemplateData(node *v1alpha3.Machine, ci ClusterInfo, serveURL, agentConfigJSON, requestIP string, installRequested bool) (templateData, error) {
+	d := newTemplateData(node, ci, serveURL, agentConfigJSON, requestIP, installRequested)
+	if node == nil || node.Spec.Netboot() == nil || node.Spec.Netboot().Network == nil {
+		return d, nil
+	}
+
+	doc, err := hostnetwork.RenderNetplanConfig(node.Spec.Netboot().Network)
+	if err != nil {
+		return templateData{}, fmt.Errorf("rendering host network: %w", err)
+	}
+
+	d.HostNetplan = strings.TrimRight(string(doc), "\n")
+
+	return d, nil
 }
 
 func newTemplateData(node *v1alpha3.Machine, ci ClusterInfo, serveURL, agentConfigJSON, requestIP string, installRequested bool) templateData {
