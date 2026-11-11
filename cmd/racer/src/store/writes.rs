@@ -193,6 +193,19 @@ impl Drop for Persisting<'_> {
     }
 }
 
+/// The journal record releasing the copy of `key` at `location`.
+fn release_record(key: PageKey, location: &RecordLocation) -> JournalRecord {
+    JournalRecord::PageRelease {
+        cache: key.cache,
+        key: key.key,
+        etag: key.etag,
+        page: key.page,
+        segment: location.segment.0,
+        generation: location.generation.0,
+        offset: location.extent.offset(),
+    }
+}
+
 /// The journal identity of `page`.
 pub fn page_key(page: &PageId) -> Result<PageKey> {
     Ok(PageKey {
@@ -608,17 +621,8 @@ impl StoreWriter {
             {
                 // Released (or replaced) while this record was written: the
                 // new Page record must not resurrect the pin.
-                let key = page_key(&id)?;
                 journal
-                    .append(
-                        JournalRecord::PageRelease {
-                            cache: key.cache,
-                            key: key.key,
-                            etag: key.etag,
-                            page: key.page,
-                        },
-                        None,
-                    )
+                    .append(release_record(page_key(&id)?, &location), None)
                     .await?;
                 drop(ticket);
                 return Ok(None);
@@ -684,15 +688,7 @@ impl StoreWriter {
         let key = page_key(page)?;
         self.writes
             .journal()?
-            .append(
-                JournalRecord::PageRelease {
-                    cache: key.cache,
-                    key: key.key,
-                    etag: key.etag,
-                    page: key.page,
-                },
-                None,
-            )
+            .append(release_record(key, &entry.location), None)
             .await?;
         if self.writes.remove_if(page, &entry.location).is_some() {
             self.index.unpin_segment(entry.location.segment)?;

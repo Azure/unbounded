@@ -146,13 +146,25 @@ impl JournalState {
                 key,
                 etag,
                 page,
+                segment,
+                generation,
+                offset,
             } => {
-                self.pages.remove(&PageKey {
+                let key = PageKey {
                     cache,
                     key,
                     etag,
                     page,
-                });
+                };
+                // Only the released copy: a replacing `Page` that landed
+                // first stays.
+                if self.pages.get(&key).is_some_and(|current| {
+                    current.segment == segment
+                        && current.generation == generation
+                        && current.offset == offset
+                }) {
+                    self.pages.remove(&key);
+                }
             }
             JournalRecord::Open {
                 cache,
@@ -725,6 +737,40 @@ mod tests {
         }
     }
 
+    fn release(n: u64, offset: u64) -> JournalRecord {
+        JournalRecord::PageRelease {
+            cache: "c".into(),
+            key: [1; 32],
+            etag: "\"v\"".into(),
+            page: n,
+            segment: 2,
+            generation: 3,
+            offset,
+        }
+    }
+
+    #[test]
+    fn release_of_a_replaced_copy_keeps_the_replacement() {
+        // A replacing persist journals Page(new) while a release of the old
+        // copy is in flight: the release lands after it and must not drop
+        // the acked replacement on replay or compaction.
+        let mut replacement = page(0);
+        if let JournalRecord::Page { offset, .. } = &mut replacement {
+            *offset = 8192;
+        }
+        let state = JournalState::from_records(&[page(0), replacement, release(0, 0)]);
+        assert_eq!(
+            state.pages.values().map(|p| p.offset).collect::<Vec<_>>(),
+            [8192]
+        );
+        let rebuilt = JournalState::from_records(&state.records(1));
+        assert_eq!(rebuilt.pages, state.pages);
+
+        // Releasing the current copy drops it.
+        let state = JournalState::from_records(&[page(0), release(0, 0)]);
+        assert!(state.pages.is_empty());
+    }
+
     fn spec() -> WriteSpec {
         WriteSpec {
             length: 10,
@@ -767,12 +813,7 @@ mod tests {
             page(0),
             page(1),
             page(2),
-            JournalRecord::PageRelease {
-                cache: "c".into(),
-                key: [1; 32],
-                etag: "\"v\"".into(),
-                page: 1,
-            },
+            release(1, 4096),
             JournalRecord::Commit {
                 cache: "c".into(),
                 key: [1; 32],

@@ -753,7 +753,7 @@ IDs as strings, cache ID as string, key as 32 bytes, etag as string):
 | Kind | Name | Body |
 |------|------|------|
 | 1 | `Page` | cache, key, etag, `u64 page`, `u64 segment`, `u64 generation`, `u64 offset`, `u32 length`, `SessionId`, `u64 hold_until_millis` |
-| 2 | `PageRelease` | cache, key, etag, `u64 page` |
+| 2 | `PageRelease` | cache, key, etag, `u64 page`, `u64 segment`, `u64 generation`, `u64 offset` (the released copy; replay drops the page only while it is still there) |
 | 3 | `Open` | cache, key, etag, `SessionId`, `WriteSpec` (fields in struct order; content type as optional string with a `u8` presence byte), `u64 lease_until_millis` |
 | 4 | `Commit` | cache, key, `Manifest` (fields in struct order) |
 | 5 | `State` | cache, key, etag, `u8 UploadState`, optional blob etag |

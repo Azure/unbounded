@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 /// File header magic.
 pub const MAGIC: &[u8; 8] = b"RCRWJNL1";
 /// File header format version.
-pub const FORMAT: u32 = 1;
+pub const FORMAT: u32 = 2;
 /// File header length.
 pub const HEADER_BYTES: usize = 64;
 /// Bytes before a record body: length and kind.
@@ -40,12 +40,18 @@ pub enum JournalRecord {
         session: SessionId,
         hold_until_millis: u64,
     },
-    /// Kind 2: a written page is no longer pinned.
+    /// Kind 2: the written copy of a page at `segment`, `generation`, and
+    /// `offset` is no longer pinned. Replay drops the page only while it is
+    /// still at that location, so a release that raced a replacing `Page`
+    /// cannot drop the newer copy.
     PageRelease {
         cache: String,
         key: [u8; 32],
         etag: String,
         page: u64,
+        segment: u64,
+        generation: u64,
+        offset: u64,
     },
     /// Kind 3: the coordinator opened a session.
     Open {
@@ -279,9 +285,14 @@ fn body(record: &JournalRecord, out: &mut Vec<u8>) -> Result<(), JournalError> {
             key,
             etag,
             page,
+            segment,
+            generation,
+            offset,
         } => {
             object(out, cache, key, Some(etag))?;
-            out.extend_from_slice(&page.to_be_bytes());
+            for value in [page, segment, generation, offset] {
+                out.extend_from_slice(&value.to_be_bytes());
+            }
         }
         JournalRecord::Open {
             cache,
@@ -509,6 +520,9 @@ fn read_body(kind: u8, r: &mut Reader<'_>) -> Result<JournalRecord, JournalError
             key,
             etag,
             page: r.u64()?,
+            segment: r.u64()?,
+            generation: r.u64()?,
+            offset: r.u64()?,
         },
         3 => JournalRecord::Open {
             cache,
@@ -584,6 +598,9 @@ mod tests {
                 key: [1; 32],
                 etag: etag(),
                 page: 0,
+                segment: 4,
+                generation: 5,
+                offset: 6,
             },
             JournalRecord::Open {
                 cache: cache(),

@@ -389,6 +389,9 @@ fn write_journal_seed() -> Vec<u8> {
             key,
             etag: etag.clone(),
             page: 0,
+            segment: 1,
+            generation: 2,
+            offset: 3,
         },
         journal::JournalRecord::Abort {
             cache: cache.clone(),
