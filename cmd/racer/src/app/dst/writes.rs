@@ -25,6 +25,8 @@ pub const GATED: &[&str] = &[];
 
 /// Orphan age the simulated nodes use (production default: one hour).
 const ORPHAN_AFTER: Duration = Duration::from_secs(8);
+/// Holder grace for random runs (`RACER_WRITE_HOLDER_GRACE_SECS`).
+const HOLDER_GRACE: Duration = Duration::from_secs(3);
 
 /// Generated actions per run when the caller passes 0 steps.
 const DEFAULT_STEPS: usize = 24;
@@ -416,6 +418,9 @@ impl World {
                 // missed-release recovery run inside a run.
                 let mut settings = writes.settings();
                 settings.orphan_after = ORPHAN_AFTER;
+                // Shorter than a fault's settle wait, so restarts inside it
+                // keep their holders and removals are repaired in the run.
+                settings.holder_grace = HOLDER_GRACE;
                 writes.set_settings(settings);
             }
         }

@@ -351,51 +351,46 @@ impl Session {
                 let Some(nodes) = self.holders.0.get_mut(page as usize) else {
                     return vec![SessionEffect::Reject(Rejection::InvalidState)];
                 };
-                let before = nodes.len();
-                nodes.retain(|n| *n != node);
-                if nodes.len() == before {
+                // A page's last holder is never dropped: a missing node may
+                // come back with its copy, so the page waits for it (reads
+                // and uploads of it fail retryably meanwhile) instead of the
+                // object failing.
+                if !nodes.contains(&node) || nodes.len() == 1 {
                     return Vec::new();
                 }
-                let survivor = nodes.first().cloned();
+                nodes.retain(|n| *n != node);
+                let from = nodes[0].clone();
                 let mut effects = vec![SessionEffect::Journal(self.commit_record())];
-                if uploaded || self.state == UploadState::Failed {
-                    return effects;
-                }
-                match survivor {
-                    Some(from) => effects.push(SessionEffect::Restore { page, from }),
-                    None => effects.extend(self.fail()),
+                if !uploaded && self.state != UploadState::Failed {
+                    effects.push(SessionEffect::Restore { page, from });
                 }
                 effects
             }
             SessionEvent::NodesLost(lost) => {
                 let mut changed = false;
                 let mut restore = Vec::new();
-                let mut orphaned = false;
                 for (page, nodes) in self.holders.0.iter_mut().enumerate() {
+                    // Keep every holder of a page none of whose holders
+                    // survive; see `HolderLost`.
+                    if nodes.iter().all(|n| lost.contains(n)) {
+                        continue;
+                    }
                     let before = nodes.len();
                     nodes.retain(|n| !lost.contains(n));
                     if nodes.len() == before {
                         continue;
                     }
                     changed = true;
-                    match nodes.first() {
-                        Some(from) => restore.push(SessionEffect::Restore {
-                            page: page as u64,
-                            from: from.clone(),
-                        }),
-                        None => orphaned = true,
-                    }
+                    restore.push(SessionEffect::Restore {
+                        page: page as u64,
+                        from: nodes[0].clone(),
+                    });
                 }
                 if !changed {
                     return Vec::new();
                 }
                 let mut effects = vec![SessionEffect::Journal(self.commit_record())];
-                if uploaded || self.state == UploadState::Failed {
-                    return effects;
-                }
-                if orphaned {
-                    effects.extend(self.fail());
-                } else {
+                if !uploaded && self.state != UploadState::Failed {
                     effects.extend(restore);
                 }
                 effects

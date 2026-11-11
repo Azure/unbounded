@@ -2,9 +2,11 @@
 //! object's pages after a holder is lost (WP8).
 //!
 //! The coordinator watches its membership on every maintenance turn. Holders
-//! that left the cache's pool are removed from the holder table in one
-//! journaled `NodesLost` event; a page with no surviving holder fails the
-//! object (upload state `failed`). For every page left with fewer than
+//! missing from the cache's pool for `RACER_WRITE_HOLDER_GRACE_SECS` are
+//! removed from the holder table in one journaled `NodesLost` event, except
+//! that a page none of whose holders survive keeps them all: the page waits
+//! for a holder to return (reads of it fail retryably meanwhile) instead of
+//! failing the object. For every page left with fewer than
 //! `replicas` holders, a background task asks a new store target to pull the
 //! page from a surviving holder with the same `write-store` operation the
 //! writer uses: the target verifies the envelope and the AEAD tag of the
@@ -41,24 +43,39 @@ use racer_wire::control::NodeId;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-/// Holders of `object`'s session that are no longer members of its cache's
-/// pool under `membership`.
+/// Holders of `object`'s session that have been missing from its cache's
+/// pool under `membership` for at least `grace`, as of `now` (Unix millis).
+/// A holder seen missing starts its grace period; one seen serving again is
+/// forgotten, so a restart or a rolling update within the grace never
+/// changes the holder table.
 pub(crate) fn lost_holders(
     local: &Coordinator,
     object: &ObjectId,
     membership: &Membership,
+    now: u64,
+    grace: std::time::Duration,
 ) -> Vec<NodeIdBytes> {
+    let grace = u64::try_from(grace.as_millis()).unwrap_or(u64::MAX);
     local.writes.directory().with(object, |e| {
         let Some(e) = e else {
             return Vec::new();
         };
-        e.session
+        let missing: Vec<NodeIdBytes> = e
+            .session
             .holders()
             .nodes()
             .into_iter()
             .filter(|node| {
                 String::from_utf8(node.clone())
                     .map_or(true, |id| !membership.serves(&object.cache, &NodeId(id)))
+            })
+            .collect();
+        e.missing.retain(|node, _| missing.contains(node));
+        missing
+            .into_iter()
+            .filter(|node| {
+                let since = *e.missing.entry(node.clone()).or_insert(now);
+                now.saturating_sub(since) >= grace
             })
             .collect()
     })
@@ -85,7 +102,8 @@ pub(crate) async fn maintain_object(
     if !eligible {
         return Ok(());
     }
-    let lost = lost_holders(local, object, membership);
+    let grace = local.writes.settings().holder_grace;
+    let lost = lost_holders(local, object, membership, super::now_millis(local), grace);
     if !lost.is_empty() {
         if let Some(effects) = object_event(local, object, SessionEvent::NodesLost(lost)) {
             // `apply` starts the repair for `Restore` effects.

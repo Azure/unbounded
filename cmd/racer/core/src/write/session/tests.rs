@@ -343,8 +343,8 @@ fn open_rejects_committed_only_events() {
 }
 
 #[test]
-fn holder_loss_restores_or_fails() {
-    let mut s = committed(UploadMode::Never);
+fn holder_loss_restores_or_waits() {
+    let mut s = committed(UploadMode::Manual);
     let lost = |s: &mut Session, page, node: &str| {
         s.on_event(
             SessionEvent::HolderLost {
@@ -375,13 +375,15 @@ fn holder_loss_restores_or_fails() {
     assert_eq!(kinds(&effects), ["journal-commit"]);
     assert_eq!(s.holders().page(0), &[n("b"), n("d")]);
     lost(&mut s, 2, "a");
-    let effects = lost(&mut s, 2, "c");
-    assert_eq!(
-        kinds(&effects),
-        ["journal-commit", "journal-state", "notify"]
-    );
-    assert_eq!(s.state(), UploadState::Failed);
+    // A page's last holder is kept: the page waits for it to return
+    // instead of failing the object.
+    assert!(lost(&mut s, 2, "c").is_empty());
+    assert_eq!(s.holders().page(2), &[n("c")]);
+    assert_eq!(s.state(), UploadState::Manual);
     // After failure, losses are recorded but not repaired.
+    s.on_event(SessionEvent::PersistRequested, 3);
+    s.on_event(SessionEvent::UploadFailed, 3);
+    assert_eq!(s.state(), UploadState::Failed);
     assert_eq!(kinds(&lost(&mut s, 1, "b")), ["journal-commit"]);
 }
 
@@ -422,14 +424,41 @@ fn nodes_lost_journals_once_and_restores_each_page() {
     assert_eq!(s.holders().pages(), 3);
     assert!(s.on_event(SessionEvent::HoldersMerged(merge), 3).is_empty());
     assert!(s.under_replicated().is_empty());
-    // Losing every holder of a page fails the object.
-    let effects = s.on_event(SessionEvent::NodesLost(vec![n("b"), n("c")]), 4);
+    // Losing every holder of a page keeps them all and never fails the
+    // object; other pages still drop the lost nodes and restore.
+    let before = s.holders().clone();
+    let effects = s.on_event(SessionEvent::NodesLost(vec![n("b"), n("d")]), 4);
+    assert_eq!(kinds(&effects), ["journal-commit", "restore", "restore"]);
     assert_eq!(
-        kinds(&effects),
-        ["journal-commit", "journal-state", "notify"]
+        effects[1..],
+        [
+            SessionEffect::Restore {
+                page: 1,
+                from: n("c")
+            },
+            SessionEffect::Restore {
+                page: 2,
+                from: n("c")
+            },
+        ]
     );
-    assert_eq!(s.state(), UploadState::Failed);
-    assert!(s.under_replicated().is_empty());
+    assert_eq!(s.holders().page(0), before.page(0));
+    assert_eq!(s.holders().page(2), &[n("c")]);
+    assert_eq!(s.state(), UploadState::Never);
+    // A loss that touches only fully missing pages changes nothing.
+    assert!(
+        s.on_event(SessionEvent::NodesLost(vec![n("b"), n("d")]), 5)
+            .is_empty()
+    );
+    // The node returns: it is still a holder, so nothing needs restoring
+    // from scratch and a merge from repair fills the page back up.
+    let merge = Holders(vec![vec![n("e")], vec![], vec![n("e")]]);
+    assert_eq!(
+        kinds(&s.on_event(SessionEvent::HoldersMerged(merge), 6)),
+        ["journal-commit"]
+    );
+    assert_eq!(s.holders().page(0).len(), 3);
+    assert_eq!(s.state(), UploadState::Never);
 }
 
 #[test]

@@ -129,6 +129,9 @@ pub struct WriteSettings {
     pub journal_bytes: u64,
     /// Age after which an orphaned written page is released (`RACER_WRITE_ORPHAN_SECS`).
     pub orphan_after: Duration,
+    /// How long a holder may be missing from its pool before it is dropped
+    /// from a holder table (`RACER_WRITE_HOLDER_GRACE_SECS`).
+    pub holder_grace: Duration,
     /// Lifetime of an origin version alias (`RACER_WRITE_ALIAS_SECS`).
     /// Reserved: no alias is recorded yet (see `designs/racer-writes.md`,
     /// "WP8 as built"), so this setting has no effect.
@@ -145,6 +148,7 @@ impl Default for WriteSettings {
             group_commit: Duration::from_micros(500),
             journal_bytes: 64 << 20,
             orphan_after: Duration::from_secs(3600),
+            holder_grace: Duration::from_secs(300),
             alias_ttl: Duration::from_secs(604_800),
             upload_attempts: 10,
         }
@@ -477,6 +481,7 @@ impl Config {
                 group_commit: Duration::from_micros(u("RACER_WRITE_GROUP_COMMIT_MICROS")),
                 journal_bytes: u("RACER_WRITE_JOURNAL_BYTES"),
                 orphan_after: Duration::from_secs(u("RACER_WRITE_ORPHAN_SECS")),
+                holder_grace: Duration::from_secs(u("RACER_WRITE_HOLDER_GRACE_SECS")),
                 alias_ttl: Duration::from_secs(u("RACER_WRITE_ALIAS_SECS")),
                 upload_attempts: u("RACER_WRITE_UPLOAD_ATTEMPTS") as u32,
             },
@@ -2281,6 +2286,7 @@ mod tests {
         assert_eq!(writes.group_commit, Duration::from_micros(500));
         assert_eq!(writes.journal_bytes, 64 << 20);
         assert_eq!(writes.orphan_after, Duration::from_secs(3600));
+        assert_eq!(writes.holder_grace, Duration::from_secs(300));
         assert_eq!(writes.alias_ttl, Duration::from_secs(604_800));
         assert_eq!(writes.upload_attempts, 10);
         // Inclusive bounds are accepted.
@@ -2295,6 +2301,8 @@ mod tests {
             ("RACER_WRITE_JOURNAL_BYTES", "17179869184"),
             ("RACER_WRITE_ORPHAN_SECS", "60"),
             ("RACER_WRITE_ORPHAN_SECS", "604800"),
+            ("RACER_WRITE_HOLDER_GRACE_SECS", "0"),
+            ("RACER_WRITE_HOLDER_GRACE_SECS", "86400"),
             ("RACER_WRITE_ALIAS_SECS", "3600"),
             ("RACER_WRITE_ALIAS_SECS", "2592000"),
             ("RACER_WRITE_UPLOAD_ATTEMPTS", "1"),
@@ -2308,6 +2316,7 @@ mod tests {
             ("RACER_WRITE_GROUP_COMMIT_MICROS", "0"),
             ("RACER_WRITE_JOURNAL_BYTES", "2097152"),
             ("RACER_WRITE_ORPHAN_SECS", "61"),
+            ("RACER_WRITE_HOLDER_GRACE_SECS", "9"),
             ("RACER_WRITE_ALIAS_SECS", "3601"),
             ("RACER_WRITE_UPLOAD_ATTEMPTS", "2"),
         ])
@@ -2321,6 +2330,7 @@ mod tests {
                 group_commit: Duration::ZERO,
                 journal_bytes: 2 << 20,
                 orphan_after: Duration::from_secs(61),
+                holder_grace: Duration::from_secs(9),
                 alias_ttl: Duration::from_secs(3601),
                 upload_attempts: 2,
             }
@@ -2336,6 +2346,7 @@ mod tests {
             ("RACER_WRITE_JOURNAL_BYTES", "17179869185"),
             ("RACER_WRITE_ORPHAN_SECS", "59"),
             ("RACER_WRITE_ORPHAN_SECS", "604801"),
+            ("RACER_WRITE_HOLDER_GRACE_SECS", "86401"),
             ("RACER_WRITE_ALIAS_SECS", "3599"),
             ("RACER_WRITE_ALIAS_SECS", "2592001"),
             ("RACER_WRITE_UPLOAD_ATTEMPTS", "0"),

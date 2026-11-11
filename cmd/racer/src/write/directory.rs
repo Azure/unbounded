@@ -62,6 +62,11 @@ pub struct Entry {
     /// The membership version under which every page's rank-0 owner last
     /// got a copy (`repair::rebalance`). `None` until the first pass.
     pub rebalanced: Option<u64>,
+
+    /// Holders seen missing from the cache's pool, with the wall time (Unix
+    /// millis) they were first seen missing. A holder is dropped only after
+    /// `RACER_WRITE_HOLDER_GRACE_SECS`; one seen again is forgotten.
+    pub missing: std::collections::BTreeMap<racer_core::write::NodeIdBytes, u64>,
 }
 
 impl Entry {
@@ -81,6 +86,7 @@ impl Entry {
             repairing: false,
             role_checked: None,
             rebalanced: None,
+            missing: Default::default(),
         }
     }
 

@@ -824,6 +824,13 @@ const BASE: &[Var] = &[
         "Age after which a held written page whose session no page-zero member knows is released.",
     ),
     var(
+        "RACER_WRITE_HOLDER_GRACE_SECS",
+        Group::Writes,
+        uint(0, 86_400, SECS),
+        Value("300"),
+        "How long a holder of an un-uploaded written page may be missing from its pool before the coordinator drops it and re-replicates; a page whose every holder is missing waits for one to return instead of failing.",
+    ),
+    var(
         "RACER_WRITE_ALIAS_SECS",
         Group::Writes,
         uint(3600, 2_592_000, SECS),

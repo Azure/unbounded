@@ -603,7 +603,12 @@ impl StoreWriter {
             let replaced = self.writes.get(&id).map_or(0, |entry| entry.disk_bytes);
             let reservation = self
                 .writes
-                .reserve_dirty(&cache, disk_bytes as u64, replaced, self.dirty_limit(&cache))
+                .reserve_dirty(
+                    &cache,
+                    disk_bytes as u64,
+                    replaced,
+                    self.dirty_limit(&cache),
+                )
                 .ok_or(Error::Overloaded)?;
             let mut ticket = match self.index.reserve_page_for(&id) {
                 Err(Error::Overloaded) if self.clock.borrow().is_some() => {

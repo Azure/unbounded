@@ -559,6 +559,7 @@ each worker and are never divided.
 | `RACER_WRITE_GROUP_COMMIT_MICROS` | `500` | Node | 0..100,000 us | Longest wait to batch written pages into one durability barrier; `0` syncs each page alone. |
 | `RACER_WRITE_JOURNAL_BYTES` | `67108864` (64 MiB) | Node | 1,048,576..17,179,869,184 bytes | Write journal size per I/O worker that triggers compaction. |
 | `RACER_WRITE_ORPHAN_SECS` | `3600` | Node | 60..604,800 s | Age after which a held written page whose session no page-zero member knows is released. |
+| `RACER_WRITE_HOLDER_GRACE_SECS` | `300` | Node | 0..86,400 s | How long a holder of an un-uploaded written page may be missing from its pool before the coordinator drops it and re-replicates; a page whose every holder is missing waits for one to return instead of failing. |
 | `RACER_WRITE_ALIAS_SECS` | `604800` | Node | 3,600..2,592,000 s | Reserved for mapping an uploaded object's origin version to its Racer version; not used yet. |
 | `RACER_WRITE_UPLOAD_ATTEMPTS` | `10` | Node | 1..100 | Upload tries per written object before it is marked `failed`. |
 

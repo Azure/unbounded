@@ -230,6 +230,9 @@ impl Cluster {
         cluster.configure();
         cluster.harness.publish();
         cluster.harness.settle();
+        // Drop missing holders on the next repair turn unless a test asks
+        // for a grace period.
+        cluster.settings(|s| s.holder_grace = Duration::ZERO);
         cluster
     }
 
@@ -1133,28 +1136,120 @@ fn a_lost_holder_is_repaired_before_upload() {
     assert!(blob.data == body);
 }
 
-/// A page whose only holder is lost cannot be repaired: the object fails.
+/// A page whose only holder leaves cannot be repaired, but the object does
+/// not fail: the holder stays in the table, reads answer retryably, and the
+/// object reads and uploads again once the node returns with its disk.
 #[test]
-fn losing_every_holder_of_a_page_fails_the_object() {
+fn losing_every_holder_of_a_page_waits_for_it_to_return() {
     let mut c = Cluster::new(32, 4, Some(writes(1)));
     let body = bytes(32, 400_000);
     let created = c.put(0, OBJECT, &body, "Racer-Upload: manual\r\n");
     assert_eq!(created.status, 201);
+    let etag = created.header("etag").unwrap().to_owned();
     let version = c.version(OBJECT, &created);
+    let count = pages(body.len());
     let coordinator = c.coordinator().unwrap();
-    let holders = c.holders(&version, pages(body.len()));
+    let holders = c.holders(&version, count);
     let victim = (0..4)
         .find(|n| *n != coordinator && holders.iter().any(|h| h.contains(n)))
         .expect("a holder other than the coordinator");
-    c.crash(victim);
+    let id = c.harness.retire(&c.env, victim, true);
+    c.harness.publish();
+    c.harness.settle();
+    c.wait(Duration::from_secs(2));
     c.wait(Duration::from_secs(2));
     let states: Vec<_> = c.roles().into_iter().map(|r| r.3).collect();
-    assert_eq!(states, vec![racer_core::write::UploadState::Failed]);
+    assert_eq!(states, vec![racer_core::write::UploadState::Manual]);
     let head = c.head(0, OBJECT);
-    assert_eq!(head.header("racer-upload-state"), Some("failed"));
-    // A failed object never uploads.
-    assert_eq!(c.persist(0, OBJECT).status, 409);
-    assert!(c.sink.committed(&c.object(OBJECT)).is_none());
+    assert_eq!(head.header("racer-upload-state"), Some("manual"));
+    // Missing pages are unavailable: the read fails retryably, either
+    // before the head or by ending the framed stream early (no end frame),
+    // and never as a 404 or with wrong bytes.
+    let mut short = false;
+    for reader in 0..c.harness.nodes.len() {
+        let read = c.get(reader, OBJECT, body.len());
+        let got = read.object();
+        short |= read.status == 200 && got.len() < body.len();
+        assert!(
+            matches!(read.status, 502 | 503) || (read.status == 200 && body.starts_with(&got)),
+            "reader {reader}: {} {:?}",
+            read.status,
+            read.headers
+        );
+    }
+    assert!(short, "no reader saw the missing pages");
+    // The node returns with its disk: the object is whole again.
+    c.harness.add(&c.env, Some(id));
+    let restarted = c.harness.nodes.pop().unwrap();
+    c.harness.nodes.insert(victim, restarted);
+    c.configure();
+    c.settings(|s| s.holder_grace = Duration::ZERO);
+    c.harness.publish();
+    c.harness.settle();
+    c.wait(Duration::from_secs(2));
+    assert_eq!(c.holders(&version, count), holders);
+    c.read_everywhere(OBJECT, &body, &etag);
+    let persisted = c.persist(0, OBJECT);
+    assert_eq!(persisted.status, 204, "{:?}", persisted.headers);
+    c.wait(Duration::from_secs(2));
+    let blob = c.sink.committed(&c.object(OBJECT)).expect("uploaded");
+    assert!(blob.data == body);
+}
+
+/// A holder that leaves the pool for less than the grace period is not
+/// dropped from the holder table: nothing is repaired and nothing fails.
+#[test]
+fn a_holder_back_within_the_grace_is_kept() {
+    let mut c = Cluster::new(40, 4, Some(writes(2)));
+    c.settings(|s| s.holder_grace = Duration::from_secs(60));
+    let body = bytes(40, 260_000);
+    let created = c.put(0, OBJECT, &body, "Racer-Upload: manual\r\n");
+    assert_eq!(created.status, 201);
+    let etag = created.header("etag").unwrap().to_owned();
+    let version = c.version(OBJECT, &created);
+    let count = pages(body.len());
+    let coordinator = c.coordinator().unwrap();
+    let holders = c.holders(&version, count);
+    let victim = (0..4)
+        .find(|n| *n != coordinator && holders.iter().any(|h| h.contains(n)))
+        .expect("a holder other than the coordinator");
+    let id = c.harness.retire(&c.env, victim, true);
+    c.harness.publish();
+    c.harness.settle();
+    c.wait(Duration::from_secs(2));
+    c.wait(Duration::from_secs(2));
+    // Still inside the grace: the table names the missing holder.
+    let table = c.harness.nodes[c.coordinator().unwrap()]
+        .workers
+        .iter()
+        .find_map(|w| {
+            w.app
+                .coordinator
+                .writes()
+                .directory()
+                .with(&c.object(OBJECT), |e| {
+                    e.map(|e| e.session.holders().clone())
+                })
+        })
+        .unwrap();
+    assert!(table.0.iter().all(|page| page.len() == 2), "{table:?}");
+    c.harness.add(&c.env, Some(id));
+    let restarted = c.harness.nodes.pop().unwrap();
+    c.harness.nodes.insert(victim, restarted);
+    c.configure();
+    c.settings(|s| s.holder_grace = Duration::from_secs(60));
+    c.harness.publish();
+    c.harness.settle();
+    c.wait(Duration::from_secs(2));
+    assert_eq!(c.holders(&version, count), holders);
+    let states: Vec<_> = c.roles().into_iter().map(|r| r.3).collect();
+    assert!(
+        states
+            .iter()
+            .all(|s| *s == racer_core::write::UploadState::Manual),
+        "{states:?}"
+    );
+    c.read_everywhere(OBJECT, &body, &etag);
 }
 
 /// Losing the coordinator mid-upload: a manifest replica takes over with the
