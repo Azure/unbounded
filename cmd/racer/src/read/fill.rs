@@ -2579,7 +2579,8 @@ impl Fill {
                         .await?
                 }
                 racer_core::read::LocalSource::Holders => {
-                    self.acquire_from_holders(page, &membership, scope).await?
+                    self.acquire_from_holders(page, &membership, context, scope)
+                        .await?
                 }
             };
             if let Some(found) = found {
@@ -3010,6 +3011,7 @@ impl Fill {
         &self,
         page: &PageId,
         membership: &std::sync::Arc<crate::topology::Membership>,
+        context: &OriginContext,
         scope: &RequestScope,
     ) -> Result<Option<AcquiredPage>> {
         let policy = &self.dependencies.candidates;
@@ -3019,7 +3021,7 @@ impl Fill {
                 let Some(response) = self
                     .call(
                         DriverStage::CandidateCompositeCall,
-                        policy.holder_copy(membership, &holder, page, scope),
+                        policy.holder_copy(membership, &holder, page, context, scope),
                     )
                     .await?
                 else {

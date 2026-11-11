@@ -2634,6 +2634,7 @@ impl CandidatePolicy {
         membership: &std::sync::Arc<crate::topology::Membership>,
         node: &NodeId,
         page: &crate::model::PageId,
+        origin: &OriginContext,
         scope: &RequestScope,
     ) -> Result<Option<VerifiedResponse>> {
         use racer_core::read::hints::NOTICE_LINKS;
@@ -2643,9 +2644,16 @@ impl CandidatePolicy {
             .0
             .min(self.ctx.now() + racer_core::read::holders::HOLDER_TIMEOUT);
         let probe = scope.child(scope.request, deadline)?;
+        // Carry the reader's opaque adapter metadata so the holder's
+        // local-only adapter request can name the object, but never its
+        // authorization: a holder probe never contacts the remote origin.
         let context = OriginContext {
             object: page.version.object.clone(),
-            metadata: None,
+            metadata: origin
+                .metadata
+                .as_ref()
+                .map(|value| crate::security::OpaqueMetadata::from_header(value.as_header()))
+                .transpose()?,
             authorization: None,
         };
         let operation = PeerOperation::Page {

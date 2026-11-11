@@ -53,6 +53,9 @@ struct ScriptedPeers {
     local_deadlines: RefCell<Vec<(Instant, Instant)>>,
 
     demands: RefCell<Vec<racer_core::subscriptions::Demand>>,
+
+    /// Opaque origin metadata each request carried.
+    metadata: RefCell<Vec<Option<Vec<u8>>>>,
 }
 impl ScriptedPeers {
     fn reply(&self, to: &NodeId, reply: Reply) {
@@ -114,6 +117,13 @@ impl ScriptedPeers {
             self.memberships
                 .borrow_mut()
                 .push(request.route.membership.0);
+            self.metadata.borrow_mut().push(
+                request
+                    .origin
+                    .metadata
+                    .as_ref()
+                    .map(|m| m.as_header().to_vec()),
+            );
             let (expected, reply) = self
                 .replies
                 .borrow_mut()
@@ -284,6 +294,7 @@ fn install_peers(
         memberships: RefCell::new(Vec::new()),
         local_deadlines: RefCell::new(Vec::new()),
         demands: RefCell::new(Vec::new()),
+        metadata: RefCell::new(Vec::new()),
     });
     let mut dependencies = f.fill.dependencies.clone();
     dependencies.candidates = Rc::new(CandidatePolicy::new(
@@ -5389,7 +5400,11 @@ fn page_request(
     let attempt = crate::model::AttemptId([id; 16]);
     let context = crate::security::OriginContext {
         object: f.context.object.clone(),
-        metadata: None,
+        metadata: f
+            .context
+            .metadata
+            .as_ref()
+            .map(|m| crate::security::OpaqueMetadata::from_header(m.as_header()).unwrap()),
         authorization: None,
     };
     let request = PeerRequest {
@@ -6484,7 +6499,43 @@ mod holders {
         assert_eq!(s.f.origin.calls.get(), 0);
     }
 
-    /// Holder probes encode only as credential-free page requests without
+    /// The owner forwards the reader's opaque adapter metadata, never its
+    /// authorization, to its own adapter and in the holder probe; a holder
+    /// whose memory copy is gone passes that metadata to its own adapter.
+    #[test]
+    fn holder_recovery_carries_the_reader_metadata() {
+        const METADATA: &[u8] = b"opaque-adapter-metadata";
+        let env = racer_io::Env::host();
+        let mut s = owner(&env, CacheMode::Adapter);
+        s.f.context.metadata =
+            Some(crate::security::OpaqueMetadata::from_header(METADATA).unwrap());
+        let (reader, other) = readers(&s);
+        s.page(reader, FetchMode::Acquire);
+        evict(&s);
+        let copy = encrypted_copy(&mut s.f);
+        s.peers.reply(&node(reader), Reply::Copy(copy));
+        s.page(other, FetchMode::Acquire);
+        assert_eq!(s.count(Event::HolderHit), 1);
+        assert_eq!(*s.peers.metadata.borrow(), vec![Some(METADATA.to_vec())]);
+        // Both owner fills asked their own adapter with the metadata first.
+        let local = s.f.origin.local_contexts.borrow().clone();
+        assert_eq!(local, vec![(Some(METADATA.to_vec()), false); 2]);
+
+        // The holder side: memory evicted, the adapter has the durable copy.
+        let mut s = owner(&env, CacheMode::Adapter);
+        s.f.context.metadata =
+            Some(crate::security::OpaqueMetadata::from_header(METADATA).unwrap());
+        let (prober, _) = readers(&s);
+        s.f.origin.local.set(LocalReplica::Hit);
+        s.page(prober, FetchMode::Holder);
+        assert_eq!(
+            *s.f.origin.local_contexts.borrow(),
+            vec![(Some(METADATA.to_vec()), false)]
+        );
+        assert_eq!(s.f.origin.calls.get(), 0);
+    }
+
+    /// Holder probes encode only as authorization-free page requests without
     /// remote attempts, and keep their mode on the wire.
     #[test]
     fn holder_encoding_is_restricted_to_credential_free_page_requests() {
@@ -6503,6 +6554,22 @@ mod holders {
         let mut request = admitted.into_signed().request;
         request.route.remaining_attempts = 1;
         assert!(crate::peer::protocol::request_head(&env.ctx.clock, &request).is_err());
+        // Opaque metadata is allowed; offers and pings still reject it.
+        f.context.metadata = Some(crate::security::OpaqueMetadata::from_header(b"m").unwrap());
+        let request = page_request(&f, &peers, from, 0x37, FetchMode::Holder)
+            .into_signed()
+            .request;
+        assert!(crate::peer::protocol::request_head(&env.ctx.clock, &request).is_ok());
+        for (id, mode) in [(0x38, FetchMode::Offer), (0x39, FetchMode::Ping)] {
+            let mut request = page_request(&f, &peers, from, id, FetchMode::Holder)
+                .into_signed()
+                .request;
+            if let PeerOperation::Page { mode: m, .. } = &mut request.operation {
+                *m = mode;
+            }
+            assert!(crate::peer::protocol::request_head(&env.ctx.clock, &request).is_err());
+        }
+        f.context.metadata = None;
         let mut request = page_request(&f, &peers, from, 0x36, FetchMode::Holder)
             .into_signed()
             .request;

@@ -3196,6 +3196,10 @@ pub(super) struct TestOrigin {
     pub(super) local: Cell<LocalReplica>,
     /// Local-only page requests received.
     pub(super) local_calls: Cell<usize>,
+    /// Each local-only request's opaque metadata and whether it carried
+    /// authorization.
+    #[allow(clippy::type_complexity)]
+    pub(super) local_contexts: RefCell<Vec<(Option<Vec<u8>>, bool)>>,
 }
 
 /// A [`TestOrigin`]'s answer to a local-only page request.
@@ -3223,6 +3227,10 @@ impl Origin for TestOrigin {
             scope.check()?;
             assert_eq!(context.object, page.version.object);
             self.local_calls.set(self.local_calls.get() + 1);
+            self.local_contexts.borrow_mut().push((
+                context.metadata.as_ref().map(|m| m.as_header().to_vec()),
+                context.authorization.is_some(),
+            ));
             let length = self.metadata.immutable().page_length(page)? as usize;
             let length = match self.local.get() {
                 LocalReplica::Miss => return Ok(None),
@@ -3692,6 +3700,7 @@ fn fixture_with_flight_clock(
         serve_metadata: Cell::new(false),
         local: Cell::new(LocalReplica::Miss),
         local_calls: Cell::new(0),
+        local_contexts: RefCell::new(Vec::new()),
         started_pages: RefCell::new(Vec::new()),
     });
     let (port, engine) = security::pair(worker, 0, config.limits.queue_entries);

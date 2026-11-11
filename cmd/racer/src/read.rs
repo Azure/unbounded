@@ -366,6 +366,7 @@ impl Coordinator {
     async fn serve_holder(
         &self,
         page: &crate::model::PageId,
+        origin: PeerOriginContext,
         scope: &RequestScope,
     ) -> Result<PeerResponse> {
         scope.check()?;
@@ -388,9 +389,18 @@ impl Coordinator {
                 ciphertext,
             });
         }
+        // The owner forwards the reader's opaque adapter metadata (never its
+        // authorization), so this local-only request names the object the
+        // same way the original reader did and the adapter can find its
+        // durable copy without contacting the remote origin.
+        let opened = self.open_context(origin)?;
         let context = OriginContext {
             object: page.version.object.clone(),
-            metadata: None,
+            metadata: opened
+                .metadata
+                .as_ref()
+                .map(|value| crate::security::OpaqueMetadata::from_header(value.as_header()))
+                .transpose()?,
             authorization: None,
         };
         match self
@@ -724,7 +734,7 @@ impl LocalPageService for Coordinator {
                     effective.deadline.0,
                     request.route.deadline.0,
                 );
-                return self.serve_holder(page, &effective).await;
+                return self.serve_holder(page, request.origin, &effective).await;
             }
             let object = match &request.operation {
                 PeerOperation::Subscribe { .. } => None,

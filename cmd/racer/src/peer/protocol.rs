@@ -69,8 +69,10 @@ pub enum FetchMode {
     /// adapter-persistence page asks a node it served the page to for a copy
     /// from that node's memory or its own origin adapter, never acquiring,
     /// forwarding, or contacting the remote origin. Page requests only, with
-    /// no origin credentials and no remote attempts, like [`Self::Offer`];
-    /// the receiver answers the page or `Miss`. Receivers that predate it
+    /// no authorization and no remote attempts, like [`Self::Offer`]. Unlike
+    /// [`Self::Offer`] it carries the reader's opaque adapter metadata, if
+    /// any, which the holder passes to its local-only adapter request; the
+    /// receiver answers the page or `Miss`. Receivers that predate it
     /// reject the request, which the sender treats as a miss.
     Holder,
 }
@@ -613,10 +615,13 @@ pub fn request_head(clock: &racer_io::Clock, request: &PeerRequest) -> Result<Me
     if !matches!(mode, FetchMode::Acquire) && request.route.remaining_attempts != 0 {
         return Err(Error::InvalidRequest);
     }
+    // Holder probes may carry the reader's opaque adapter metadata, so the
+    // holder's local-only adapter request can name the object, but never
+    // authorization: they never reach the remote origin.
     if matches!(mode, FetchMode::Offer | FetchMode::Ping | FetchMode::Holder)
         && (!matches!(request.operation, Operation::Page { .. })
             || request.origin.authorization.is_some()
-            || request.origin.metadata.is_some())
+            || (request.origin.metadata.is_some() && !matches!(mode, FetchMode::Holder)))
     {
         return Err(Error::InvalidRequest);
     }
