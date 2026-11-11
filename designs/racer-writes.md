@@ -1338,6 +1338,9 @@ Components:
   `racer_write_bytes_total{cache}`, `racer_write_dirty_bytes{cache}`,
   `racer_write_fsync_seconds` (histogram), `racer_write_upload_bytes_total{cache}`,
   `racer_write_upload_state{cache,state}` (gauge), `racer_write_repairs_total{cache}`.
+  `/metrics` streams them from a snapshot (`WriteMetrics::exposition`), one
+  family type line or one cache's series per piece, so the streamed server's
+  1 MiB piece limit holds for any number of write-enabled caches.
 
 Tests:
 
@@ -1516,9 +1519,17 @@ plan above):
   sends the CRC as 8 little-endian bytes in standard base64. Vectors in
   `origin/azure/crc64.rs` were produced with Go `hash/crc64` and that table.
 - `AzureTransport` gains a required `exchange_body(url, head, body, scope)`.
-  `PoolTransport` sends the head, copies the body into admitted
-  request-context storage (`write_body_bytes`), and never retries on a stale
-  pooled connection, since a write may have reached the service.
+  `PoolTransport` sends the head, copies the body through one admitted
+  request-context buffer of at most `BODY_CHUNK_BYTES` (64 KiB) at a time, so
+  a 16 MiB page upload fits a small RequestContext budget, and never retries
+  on a stale pooled connection, since a write may have reached the service.
+  The body is sent with `HttpIo::write_body_range_recoverable`, which hands
+  the connection back after a failed send once no reactor operation holds it.
+  When the service answered early and closed (for example `401` for a revoked
+  token), `PoolTransport` reads that response and returns it if it is an
+  error status (4xx or 5xx), so a `401` still reaches the token source and
+  the retry carries a fresh token. Any other status for a body that was not
+  fully sent is never trusted: the send error is returned.
 - Head builders are `request::put_block_head` and
   `request::put_block_list_head`; `request::head` rejects the write methods.
   Put Block List also sends `x-ms-content-crc64` of its XML body (optional per
@@ -1699,6 +1710,15 @@ invisible at once and rekey never saw it. The authority keyring now keeps at
 least `MIN_WRITE_RETAINED_PAGE_KEYS` (2) readable page keys for every cache
 whose definition sets `writes` (and for every cache while the catalog is
 unknown), giving each holder one rotation interval after activation to rekey.
+Catalog admission (`keyring::admit_catalog`) budgets that floor: it sizes the
+key bundle in bytes, charging a write-enabled cache `keys_for_cache(retained,
+true)` keys (five with retention 1: two readable, one prepared, two origin)
+and a read-only cache `keys_per_cache(retained)`. Keyed caches are never
+evicted; a keyed cache that newly enables writes keeps its slot but is
+admitted read-only (`writes` cleared) while the budget cannot cover its floor,
+in catalog order. An unkeyed cache that does not fit is skipped.
+`catalog_capacity(retained)` stays the read-only limit;
+`catalog_capacity_for(retained, true)` is the all-write limit.
 At `BATCH` pages per turn per worker this is far beyond any store's written
 pages. Retention below the hold TTL is the reason rekey exists; only a holder
 offline longer than `retained_page_keys` rotation intervals loses its copies.

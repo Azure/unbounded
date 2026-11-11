@@ -1366,7 +1366,11 @@ rotations). Each holder therefore reseals its written pages under the active
 page key after every rotation, up to 8 pages per maintenance turn per I/O
 worker. The authority keeps at least 2 readable page keys for every cache
 with `writes` set, whatever `RACER_RETAINED_PAGE_KEYS` says, so a holder has
-one full rotation interval after each activation to finish. A holder that is
+one full rotation interval after each activation to finish. With
+`RACER_RETAINED_PAGE_KEYS=1` this costs each write-enabled cache one extra key
+in the cluster key bundle, so fewer write-enabled caches fit than read-only
+ones. A cache that enables writes when the bundle has no room for that key
+keeps serving reads but is published without writes until room frees up. A holder that is
 down longer than the retention window (`RACER_RETAINED_PAGE_KEYS` times the
 rotation interval) loses its copies; they are counted in
 `racer_write_unreadable_pages`.
