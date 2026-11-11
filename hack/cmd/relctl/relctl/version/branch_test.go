@@ -140,6 +140,35 @@ func TestForBranchRefuses(t *testing.T) {
 	}
 }
 
+// TestIsReleaseBranch pins that only release-X.Y counts. A branch that merely
+// starts with "release-", such as a feature branch named release-notes-fix,
+// must not be reported as a release branch.
+func TestIsReleaseBranch(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string]bool{
+		"release-0.2":              true,
+		"release-1.0":              true,
+		"release-10.23":            true,
+		"main":                     false,
+		"":                         false,
+		"release-":                 false,
+		"release-1":                false,
+		"release-01.2":             false,
+		"release-0.2.4":            false,
+		"release-0.2-backup":       false,
+		"backup/release-0.2":       false,
+		"release-candidates-first": false,
+		"release-1234567890.0":     false,
+	}
+
+	for branch, want := range cases {
+		if got := IsReleaseBranch(branch); got != want {
+			t.Errorf("IsReleaseBranch(%q) = %v, want %v", branch, got, want)
+		}
+	}
+}
+
 // TestCheckModeRetiresRelease pins the rule the whole candidate model rests on:
 // a final is only ever a promoted candidate. mode=release minted the final
 // number before anything had shown the tree could build, so a failure needing a

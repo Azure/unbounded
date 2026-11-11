@@ -7,10 +7,11 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/google/go-github/v75/github"
+
+	"github.com/Azure/unbounded/hack/cmd/relctl/relctl/version"
 )
 
 // Release is a GitHub release, reduced to what relctl reports on.
@@ -161,7 +162,7 @@ func (c *Client) ReleaseBranches(ctx context.Context) ([]string, error) {
 		}
 
 		for _, branch := range branches {
-			if strings.HasPrefix(branch.GetName(), "release-") {
+			if version.IsReleaseBranch(branch.GetName()) {
 				names = append(names, branch.GetName())
 			}
 		}

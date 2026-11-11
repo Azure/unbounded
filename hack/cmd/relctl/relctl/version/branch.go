@@ -40,6 +40,12 @@ type Policy struct {
 // pathological name from being treated as a series at all.
 var releaseBranch = regexp.MustCompile(`^release-(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})$`)
 
+// IsReleaseBranch reports whether name is a release-X.Y branch. Other branches
+// that merely start with "release-" are not.
+func IsReleaseBranch(name string) bool {
+	return releaseBranch.MatchString(name)
+}
+
 // ForBranch decides what branch may release, and how much it may advance.
 //
 // The versioning rule (#627):
