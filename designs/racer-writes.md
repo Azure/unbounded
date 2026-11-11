@@ -2204,6 +2204,51 @@ Tests: `app::dst::write_tests::a_displaced_manifest_replica_keeps_its_written_pa
 fails without the fix. `store::journal` fold tests and the codec round-trip
 cover `Forget`. The six seeds are in `cmd/racer/dst/seeds/ci.txt`.
 
+### New rank 0 before rebalance fix as built
+
+A member that joins as (or is promoted to) a page's rank 0 holds no manifest
+or written page until the coordinator's background rebalance
+(`repair::spawn_rebalance`) copies them. A fresh read there resolved to its
+own origin authority, and the origin does not know the object before it
+uploads. Since `absence_is_authoritative` trusts rank 0's own miss, the read
+returned `404` for metadata, and `502` for pages (the origin answers a page of
+an unknown version with a gateway error).
+
+Fix, on caches with writes only (read-only caches are unchanged):
+
+- Metadata (`MetadataService::written_elsewhere`, `read/metadata.rs`): after an
+  origin `404` that would be authoritative, the node probes the other page-zero
+  owners of the current membership. If the membership it replaced is still
+  resolvable within `PREVIOUS_MEMBERSHIP_WITHIN`
+  (`CandidatePolicy::recent_previous_owners`), it probes that membership's
+  owners too. A joiner never saw the replaced membership, but rendezvous
+  ranking only shifts the previous owners down, so after one join they are
+  still among the current owners. Probes are copy-only and sent under the
+  current membership. The coordinator always answers. A manifest replica
+  answers only while `serves_written` still ranks it, so a displaced replica
+  cannot revive a deleted version. The read returns the first metadata
+  found. It returns `404` only when every probed owner answers a miss.
+  Any other answer, such as an unreachable owner, returns `503`.
+- Pages (`CandidatePolicy::written_copy`, `read/fill.rs`): after any origin
+  failure other than a credential rejection, the node probes the same owner
+  sets copy-only for the page and serves a validated copy as the fill result.
+- Both use a fresh probe budget under the request deadline. A forwarded
+  acquisition often reaches this point with its hop budget spent, and
+  copy-only probes never forward, so they cannot loop.
+
+Cost: a genuine `404` on a cache with writes now costs up to a few extra
+copy-only round trips at the node that asked the origin.
+
+Open: the fix covers a rank 0 that is one membership change ahead of
+rebalance. If several joins land before rebalance runs, previous owners can
+fall out of the top ranks, and the read can still miss. Rebalance runs once
+per membership version and closes that gap.
+
+Test: `app::dst::write_tests::a_new_page_zero_rank_0_does_not_404_before_rebalance`
+holds the coordinator's rebalance off, joins nodes until a joiner is page
+zero's rank 0, and reads from the joiner and the original members. Without
+the fix, HEAD at the joiner returns `404`.
+
 ### WP12: documentation
 
 Files: `docs/content/reference/racer.md` (new sections after "Prefetch",
