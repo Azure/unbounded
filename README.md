@@ -126,7 +126,9 @@ For the full walkthrough including pod networking verification, see the
 ### AKS Flex: create the entire cluster with one script
 
 Create one AKS system node and three automatically bootstrapped VMSS workers,
-with Unbounded networking and Gantry:
+with Unbounded networking and Gantry. AMD64 Flex workers default to
+`Standard_D8s_v3`, each with a 512 GiB Premium SSD (`Premium_LRS`) OS disk.
+The AKS system node remains `Standard_D4s_v6`:
 
 ```bash
 bash hack/scripts/aks-flex-cluster.sh \
@@ -144,6 +146,8 @@ Keep the state directory (`tmp/aks-flex/my-flex-cluster/` by default), which
 contains the kubeconfig and SSH key. Rerun with the same arguments to resume
 provisioning. Scale workers separately with `az vmss scale`; reruns preserve
 capacity. The script is not an upgrade or teardown tool.
+The new worker defaults do not resize or convert existing disks; deployments
+with a different disk configuration are rejected.
 
 For ARM64 Flex workers, add `--worker-arch arm64`. This selects the ARM64
 Ubuntu 24.04 host and agent archive, with `Standard_D4ps_v6` as the default
@@ -161,10 +165,73 @@ Publish the required component images under that registry with tags matching
 the operator's compiled version. These selections are pinned in the deployment
 state, so reruns cannot silently switch the installer or images.
 
+To build and deploy the current checkout instead of a published Unbounded
+release:
+
+```bash
+bash hack/scripts/aks-flex-cluster.sh \
+    --name my-checkout-cluster \
+    --location canadacentral \
+    --build-from-checkout \
+    --engine podman \
+    --image-registry ghcr.io/vpatelsj
+```
+
+Add `--plan` to preview without building, pushing, or provisioning anything.
+Checkout mode requires git, make, Go, npm, `sha256sum`, and a running Podman
+machine or Docker Buildx builder configured for `linux/amd64` and `linux/arm64`.
+Cross-architecture `RUN` steps require emulation in the builder VM.
+Without `--engine`, the script prefers Podman when installed, otherwise Docker.
+On macOS, install Podman, initialize its VM once with `podman machine init`,
+then run `podman machine start` and `podman login ghcr.io` before deploying.
+With Docker, use `--engine docker` and authenticate with `docker login ghcr.io`.
+If Podman build containers cannot resolve package servers through the host DNS,
+add `--engine podman --build-dns 1.1.1.1` (or another permitted DNS server).
+This changes DNS only for build containers, not macOS, the Podman VM, or the cluster.
+The images must allow public pulls; this script
+does not configure private registry pull credentials or change GHCR package
+visibility.
+
+After confirmation, the script builds the local installer using Make and
+publishes matching operator, Machina, token refresher, networking, Gantry, and
+Gantry node-config images using the repository's Containerfiles. The image tag
+and compiled version are both `checkout-<source-sha256>`, including non-ignored
+untracked files and uncommitted changes. This happens before Azure provisioning.
+The separate AKS Flex host agent still comes from the pinned `--agent-version`
+release (default `v0.2.0`).
+
+Keep the state directory: reruns reuse its saved installer and completed build
+without rebuilding or republishing images. Changed source contents or registry
+are rejected for an existing deployment. Use a new cluster name and state
+directory to deploy another checkout. Checkout mode cannot be combined with
+`--unbounded-version`, `--plugin-binary`, or `--operator-image`; the released
+deployment path remains the default.
+
 Gantry starts without ACR authentication. See the
 [ACR attachment guide](docs/content/guides/gantry.md#acr-attachment-and-explicit-authentication-on-flex-nodes)
 to enable it with a compatible plugin/operator; the script's pinned `v0.8.0`
 baseline does not include managed authentication.
+
+### Gantry dashboard: generate, push, and pull images
+
+For an existing checkout-built AKS Flex cluster, one script configures the
+dashboard and builder identities, ACR permissions and runtime base, publishes
+the UI image to GHCR, and installs the dashboard with image generation enabled:
+
+```bash
+bash hack/scripts/gantry-ui-deploy.sh \
+    --cluster-state tmp/aks-flex/my-flex-cluster \
+    --acr-name myregistry \
+    --image ghcr.io/myorg/gantry-ui \
+    --engine podman
+```
+
+UI build artifacts stay in GHCR; runtime bases and images generated through the
+UI stay in your ACR. The script verifies a small generate/push/Flex-pull workflow
+before printing the local dashboard URL and keeping its tunnel open. It does
+not enable destructive disk reclamation. See the
+[dashboard setup guide](deploy/gantry-ui/chart/README.md#full-setup-for-an-existing-aks-flex-cluster)
+for permissions, GHCR visibility, DNS options, and rerun behavior.
 
 ## Documentation
 

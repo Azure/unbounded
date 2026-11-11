@@ -1096,6 +1096,9 @@ resources/cni-plugins-linux-%-$(CNI_PLUGINS_VERSION).tgz:
 		"https://github.com/containernetworking/plugins/releases/download/$(CNI_PLUGINS_VERSION)/cni-plugins-linux-$*-$(CNI_PLUGINS_VERSION).tgz" \
 		-o $@
 
+.PHONY: net-image-resources
+net-image-resources: net-frontend resources/cni-plugins-linux-amd64-$(CNI_PLUGINS_VERSION).tgz resources/cni-plugins-linux-arm64-$(CNI_PLUGINS_VERSION).tgz ## Prepare frontend and CNI plugins for multiarch net image builds
+
 .PHONY: image-inventory-all-local
 image-inventory-all-local: image-inventory-aggregator-local image-inventory-inspector-local image-inventory-viewer-local
 
