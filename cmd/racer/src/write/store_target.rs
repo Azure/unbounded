@@ -22,10 +22,16 @@ use racer_core::write::WriteReply;
 use std::sync::Arc;
 
 /// Retries of a store refused for a transient reason.
-const TRANSIENT_RETRIES: u32 = 8;
+const TRANSIENT_RETRIES: u32 = 16;
 
-/// Base wait between those retries.
+/// Base wait between those retries; it doubles per attempt up to
+/// [`TRANSIENT_WAIT_MAX`], about 3 s in total. A checkpoint freeze or a 16 MiB
+/// staging reservation can outlast the 180 ms the first build allowed, which
+/// the kind e2e saw as a `503 dirty-cap` far below the cap.
 const TRANSIENT_WAIT: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// Longest single wait between transient retries.
+const TRANSIENT_WAIT_MAX: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Serve `write-store` on the object's metadata worker: each page is stored
 /// on its owning worker. Replies `stored` with the pages made durable, or
@@ -128,7 +134,11 @@ pub async fn store_page(
                     break Err(Error::Overloaded);
                 };
                 reactor
-                    .sleep_until(clock.now() + TRANSIENT_WAIT * attempt, scope)
+                    .sleep_until(
+                        clock.now()
+                            + (TRANSIENT_WAIT * (1 << attempt.min(8))).min(TRANSIENT_WAIT_MAX),
+                        scope,
+                    )
                     .await?;
             }
             result => break result,
