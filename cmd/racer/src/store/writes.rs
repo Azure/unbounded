@@ -470,11 +470,12 @@ impl StoreWriter {
             self.index.unpin_segment(previous.location.segment)?;
         }
         let cache = &id.version.object.cache;
-        let indexed = self.availability.page(cache, envelope.key_id)
-            && !self.availability.passthrough(cache)
+        // The page key is not required: a restarting node may not have its
+        // keyring yet, and the catalog's lookup checks the key per read.
+        let indexed = !self.availability.passthrough(cache)
             && self
                 .index
-                .publish(
+                .publish_written(
                     id.clone(),
                     IndexedPage {
                         location,

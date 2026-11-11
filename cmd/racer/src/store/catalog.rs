@@ -988,6 +988,18 @@ impl Index {
     pub fn publish(&self, page: PageId, entry: IndexedPage) -> Result<()> {
         self.publish_with(page, entry, None)
     }
+    /// [`Self::publish`] of a durable written page restored from the write
+    /// journal. Only cache admission is required, not its page key: a node
+    /// restarts before its keyring is installed, and a written page skipped
+    /// here would stay pinned but never served. [`Self::lookup`] still
+    /// requires the key, so the page becomes readable once it is installed.
+    pub fn publish_written(&self, page: PageId, entry: IndexedPage) -> Result<()> {
+        if !self.availability.cache(&page.version.object.cache) {
+            return Err(Error::MissingKey);
+        }
+        let mut reservation = None;
+        self.insert(page, entry, &mut reservation)
+    }
     /// [`Self::publish`] of a reserved write, or of a validated location
     /// when `reservation` is `None`. A reservation is always consumed.
     fn publish_with(
@@ -1014,6 +1026,14 @@ impl Index {
         {
             return Ok(());
         }
+        self.insert(page, entry, reservation)
+    }
+    fn insert(
+        &self,
+        page: PageId,
+        entry: IndexedPage,
+        reservation: &mut Option<super::pages::Reservation>,
+    ) -> Result<()> {
         Self::validate_descriptor(&entry.metadata)?;
         let payload_bytes = u64::from(entry.metadata.page_length_in(&page, entry.page_size)?);
         let mut state = self.state_mut();
@@ -1130,7 +1150,8 @@ impl Index {
     /// Drop published pages whose cache or page key is no longer admitted,
     /// examining at most `budget` entries in age order. Idle until the keyring
     /// generation changes, then resumes each call until one pass completes.
-    /// Held pages are kept; their hold decides their lifetime. Returns the
+    /// Held pages and records in pinned (written) segments are kept; their
+    /// hold or pin decides their lifetime. Returns the
     /// number of pages removed.
     pub fn sweep_unavailable(&self, budget: usize) -> usize {
         let generation = self.availability.key_generation();
@@ -1156,7 +1177,13 @@ impl Index {
         let examined = visited.len();
         self.key_sweep
             .set((generation, (examined == budget).then_some(next)));
-        let stale: Vec<_> = visited.into_iter().flatten().collect();
+        // Written records (pinned segments) outlive a key change: the write
+        // service rekeys or drops them, and their pin decides their lifetime.
+        let stale: Vec<_> = visited
+            .into_iter()
+            .flatten()
+            .filter(|(_, location)| self.segment_pins(location.segment) == 0)
+            .collect();
         let removed = stale.len();
         for (page, location) in stale {
             self.remove_if_matches(&page, &location);

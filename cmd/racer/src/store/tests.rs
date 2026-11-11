@@ -1674,6 +1674,28 @@ impl Fixture {
         between();
         Self::in_directory(env, _directory)
     }
+    /// [`Self::restart_after`] with `availability` for the restarted store.
+    fn restart_with(
+        self,
+        env: &racer_io::Env,
+        between: impl FnOnce(),
+        availability: Rc<crate::control::Availability>,
+    ) -> Self {
+        let Self {
+            metrics,
+            store,
+            admission,
+            reactor,
+            pool,
+            segments,
+            _directory,
+        } = self;
+        assert!(store.writer.is_idle());
+        assert_eq!(reactor.in_flight(), 0);
+        drop((store, reactor, pool, segments, admission, metrics));
+        between();
+        Self::assemble(env, _directory, availability)
+    }
 }
 fn scope(env: &racer_io::Env) -> RequestScope {
     RequestScope::on(
@@ -6634,6 +6656,41 @@ mod written {
             f.store.writer.written(&page).map(|e| e.location),
             Some(after.location)
         );
+    }
+
+    /// A node restarts before its keyring arrives. Its written pages are
+    /// restored and indexed anyway, a key sweep does not drop them, and they
+    /// read once the keys are installed. Before the fix they were reported
+    /// `unindexed` and stayed pinned but unreadable until hold expiry.
+    #[test]
+    fn written_pages_recovered_before_the_keyring_read_once_it_arrives() {
+        use crate::test_support::security::empty_keys;
+        use crate::test_support::security::initial_bundle;
+        let (simulation, env) = sim();
+        let cache = CacheId(crate::test_support::security::CACHE.into());
+        let f = opened(&env);
+        recover(&f, &env, LAYOUT, COMPACT);
+        let copy = f.copy(1, 100);
+        let page = id(&copy);
+        let entry = persist(&f, &env, copy).unwrap();
+        let keys = Rc::new(empty_keys(&env));
+        let availability = crate::control::for_caches(&env, keys.clone(), vec![cache.clone()]);
+        let f = f.restart_with(&env, || simulation.disk().crash().unwrap(), availability);
+        open(&f);
+        let recovered = recover(&f, &env, LAYOUT, COMPACT);
+        assert_eq!(recovered.restored, vec![page.clone()]);
+        assert!(recovered.unindexed.is_empty() && recovered.lost.is_empty());
+        let index = f.store.writer.index();
+        // Not readable without its key, and not swept for lacking it.
+        assert!(index.lookup(&page).unwrap().is_none());
+        assert_eq!(index.sweep_unavailable(64), 0);
+        keys.install(initial_bundle(&[cache])).unwrap();
+        assert_eq!(index.sweep_unavailable(64), 0);
+        assert_eq!(
+            index.lookup(&page).unwrap().unwrap().location,
+            entry.location
+        );
+        assert_eq!(read(&f, &env, &page), Some(vec![1; 116]));
     }
 
     #[test]
