@@ -687,6 +687,17 @@ async fn replica_nodes(
         .unwrap_or_default()
 }
 
+/// The record a displaced manifest replica journals when it drops the
+/// session: unlike [`delete_record`], replay keeps the version's written
+/// pages pinned, as they still are in memory.
+pub(crate) fn forget_record(version: &ObjectVersion) -> Result<JournalRecord> {
+    Ok(JournalRecord::Forget {
+        cache: version.object.cache.0.clone(),
+        key: version.object.key.0,
+        etag: etag_text(&version.etag)?,
+    })
+}
+
 pub(crate) fn delete_record(version: &ObjectVersion) -> Result<JournalRecord> {
     Ok(JournalRecord::Delete {
         cache: version.object.cache.0.clone(),

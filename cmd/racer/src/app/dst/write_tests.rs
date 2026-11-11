@@ -1717,3 +1717,80 @@ fn a_restarted_writer_keeps_its_object_readable_everywhere() {
         }
     }
 }
+
+/// A manifest replica that joins displaced from page zero's ranked members
+/// drops its session at the next role check, but it still holds a durable
+/// copy of every page it stored: the coordinator counts it as a holder and,
+/// within the holder grace, never repairs a restart. Its write journal must
+/// keep those pages pinned, so a crash restart afterward restores them
+/// (the `app-writes-membership-churn` failures for racer-dst seeds 100 and
+/// 107 left pages with `replicas - 1` holders).
+#[test]
+fn a_displaced_manifest_replica_keeps_its_written_pages_across_a_restart() {
+    let mut c = Cluster::new(37, 3, Some(writes(3)));
+    let body = bytes(37, 140_000);
+    let created = c.put(0, OBJECT, &body, "");
+    assert_eq!(created.status, 201);
+    let object = c.object(OBJECT);
+    let version = c.version(OBJECT, &created);
+    let holders = c.holders(&version, pages(body.len()));
+    assert!(holders.iter().all(|h| h.len() == 3), "{holders:?}");
+    let is_replica = |c: &Cluster, n: usize| {
+        c.harness.nodes[n].workers.iter().any(|w| {
+            w.app.coordinator.writes().directory().with(&object, |e| {
+                e.is_some_and(|e| e.role == crate::write::directory::Role::Replica)
+            })
+        })
+    };
+    let replica = (0..3)
+        .find(|&n| is_replica(&c, n))
+        .expect("a manifest replica");
+    let replica_id = node_id(c.harness.nodes[replica].id);
+    let mut displaced = false;
+    for _ in 0..32 {
+        c.harness.add(&c.env, None);
+        c.configure();
+        c.harness.publish();
+        c.harness.settle();
+        c.wait(Duration::from_secs(2));
+        let coordinator = &c.harness.nodes[0].workers[0].app.coordinator;
+        let membership = coordinator.current_membership().unwrap();
+        let ranked = coordinator
+            .fill
+            .dependencies
+            .candidates
+            .candidates(membership.clone(), &object, PageNumber(0))
+            .ordered;
+        if !ranked
+            .iter()
+            .filter(|node| membership.serves(&object.cache, node))
+            .take(crate::write::RANKED_DEPTH)
+            .any(|node| *node == replica_id)
+        {
+            displaced = true;
+            break;
+        }
+    }
+    assert!(displaced, "the replica stayed a page-zero member");
+    // Let the role check drop the displaced replica's session.
+    for _ in 0..3 {
+        c.wait(Duration::from_secs(16));
+    }
+    assert!(!is_replica(&c, replica), "{:?}", c.roles());
+    let holders = c.holders(&version, pages(body.len()));
+    assert!(
+        holders.iter().all(|h| h.contains(&replica)),
+        "the displaced replica still holds its pages: {holders:?}"
+    );
+    // Crash it (power loss) and restart it from its disk.
+    let id = c.harness.retire(&c.env, replica, true);
+    c.harness.add(&c.env, Some(id));
+    let restarted = c.harness.nodes.pop().unwrap();
+    c.harness.nodes.insert(replica, restarted);
+    c.configure();
+    c.harness.publish();
+    c.harness.settle();
+    assert_eq!(c.holders(&version, pages(body.len())), holders);
+    c.wait(Duration::from_secs(2));
+    assert_eq!(c.holders(&version, pages(body.len())), holders);
+}

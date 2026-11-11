@@ -227,6 +227,10 @@ impl JournalState {
                 });
             }
             JournalRecord::Checkpoint { sequence } => self.sequence = sequence,
+            // The session only: its written pages stay pinned.
+            JournalRecord::Forget { cache, key, etag } => {
+                self.sessions.remove(&VersionKey { cache, key, etag });
+            }
         }
     }
 
@@ -872,6 +876,21 @@ mod tests {
         assert_eq!(rebuilt.pages, state.pages);
         assert_eq!(rebuilt.sessions, state.sessions);
         assert_eq!(rebuilt.sequence, 5);
+
+        // Forget (a displaced manifest replica) drops the session but
+        // keeps its written pages pinned across a replay.
+        let mut forgotten = state.clone();
+        forgotten.apply(&JournalRecord::Forget {
+            cache: "c".into(),
+            key: [1; 32],
+            etag: "\"v\"".into(),
+        });
+        assert_eq!(forgotten.pages, state.pages);
+        assert!(!forgotten.sessions.contains_key(&version("\"v\"")));
+        assert_eq!(
+            JournalState::from_records(&forgotten.records(6)).pages,
+            state.pages
+        );
 
         // Abort and Delete drop the version's session and pages only.
         let mut state = state;

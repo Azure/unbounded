@@ -143,7 +143,9 @@ pub(crate) async fn check_roles(
             (Role::Replica, None) if member => {
                 promote(local, &object, &version, membership, scope).await;
             }
-            // A member knows it: this displaced copy is not needed.
+            // A member knows it: this displaced manifest copy is not
+            // needed. Its written pages are: they stay pinned (in memory and
+            // across a restart) until the coordinator releases them.
             (Role::Replica, Some(_)) if !member => {
                 if local.writes.directory().remove_version(&version).is_some() {
                     local
@@ -152,7 +154,7 @@ pub(crate) async fn check_roles(
                         .writer
                         .index()
                         .invalidate_current(&object);
-                    if let Ok(record) = super::coordinator::delete_record(&version) {
+                    if let Ok(record) = super::coordinator::forget_record(&version) {
                         let _ = super::coordinator::journal(local, record).await;
                     }
                 }

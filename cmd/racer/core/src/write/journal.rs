@@ -90,6 +90,15 @@ pub enum JournalRecord {
     },
     /// Kind 8: a compaction point.
     Checkpoint { sequence: u64 },
+    /// Kind 9: this worker no longer keeps the version's session (a
+    /// manifest replica the placement moved away). Unlike `Delete`, the
+    /// version's written pages stay pinned: they are still durable copies
+    /// that the coordinator counts until it releases them.
+    Forget {
+        cache: String,
+        key: [u8; 32],
+        etag: String,
+    },
 }
 
 impl JournalRecord {
@@ -104,6 +113,7 @@ impl JournalRecord {
             Self::Abort { .. } => 6,
             Self::Delete { .. } => 7,
             Self::Checkpoint { .. } => 8,
+            Self::Forget { .. } => 9,
         }
     }
 }
@@ -326,7 +336,9 @@ fn body(record: &JournalRecord, out: &mut Vec<u8>) -> Result<(), JournalError> {
             out.push(state.code());
             put_opt_str(out, blob_etag.as_deref())?;
         }
-        JournalRecord::Abort { cache, key, etag } | JournalRecord::Delete { cache, key, etag } => {
+        JournalRecord::Abort { cache, key, etag }
+        | JournalRecord::Delete { cache, key, etag }
+        | JournalRecord::Forget { cache, key, etag } => {
             object(out, cache, key, Some(etag))?;
         }
         JournalRecord::Checkpoint { sequence } => out.extend_from_slice(&sequence.to_be_bytes()),
@@ -488,7 +500,7 @@ fn read_body(kind: u8, r: &mut Reader<'_>) -> Result<JournalRecord, JournalError
     if kind == 8 {
         return Ok(JournalRecord::Checkpoint { sequence: r.u64()? });
     }
-    if !(1..=7).contains(&kind) {
+    if !(1..=7).contains(&kind) && kind != 9 {
         return Err(JournalError::Corrupt);
     }
     let cache = r.string()?;
@@ -540,6 +552,7 @@ fn read_body(kind: u8, r: &mut Reader<'_>) -> Result<JournalRecord, JournalError
             blob_etag: r.opt_string()?,
         },
         6 => JournalRecord::Abort { cache, key, etag },
+        9 => JournalRecord::Forget { cache, key, etag },
         _ => JournalRecord::Delete { cache, key, etag },
     })
 }
@@ -638,6 +651,11 @@ mod tests {
                 etag: String::new(),
             },
             JournalRecord::Checkpoint { sequence: 42 },
+            JournalRecord::Forget {
+                cache: cache(),
+                key: [1; 32],
+                etag: etag(),
+            },
         ]
     }
 
@@ -651,7 +669,7 @@ mod tests {
     fn every_kind_round_trips() {
         let records = all();
         let kinds: Vec<u8> = records.iter().map(JournalRecord::kind).collect();
-        assert_eq!(kinds, (1..=8).collect::<Vec<_>>());
+        assert_eq!(kinds, (1..=9).collect::<Vec<_>>());
         let mut stream = Vec::new();
         for record in &records {
             let b = bytes(record);
@@ -728,7 +746,7 @@ mod tests {
             out
         };
         assert_eq!(decode(&frame(0, &[])), Err(JournalError::Corrupt));
-        assert_eq!(decode(&frame(9, &[0; 8])), Err(JournalError::Corrupt));
+        assert_eq!(decode(&frame(10, &[0; 8])), Err(JournalError::Corrupt));
         // Trailing bytes after a valid body.
         assert_eq!(decode(&frame(8, &[0; 9])), Err(JournalError::Corrupt));
         // Invalid UTF-8 cache ID.
