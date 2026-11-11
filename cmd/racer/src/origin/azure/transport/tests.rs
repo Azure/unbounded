@@ -107,6 +107,11 @@ fn azure(head: &str, blobs: &Mutex<Blobs>) -> Vec<u8> {
 }
 
 fn reactor(env: &racer_io::Env) -> Option<Rc<Reactor>> {
+    reactor_with(env, NonZeroUsize::new(4 * PAGE_BYTES as usize).unwrap())
+}
+
+/// A reactor whose RequestContext budget is `request_context_bytes`.
+fn reactor_with(env: &racer_io::Env, request_context_bytes: NonZeroUsize) -> Option<Rc<Reactor>> {
     // Probe io_uring availability the same way other socket tests do.
     crate::test_support::enrollment::reactor(env)?;
     let n = NonZeroUsize::new(1024).unwrap();
@@ -117,7 +122,7 @@ fn reactor(env: &racer_io::Env) -> Option<Rc<Reactor>> {
             ciphertext_bytes: bytes,
             dirty_bytes: bytes,
             registered_bytes: bytes,
-            request_context_bytes: bytes,
+            request_context_bytes,
             flights: n,
             waiters_per_flight: n,
             queue_entries: NonZeroUsize::new(32).unwrap(),
@@ -1117,6 +1122,50 @@ fn plain_http_uploads_blocks_and_commits() {
         "busy".to_owned(),
         String::from_utf8(ids[0].to_vec()).unwrap()
     )));
+    drop(f);
+    server.join().unwrap();
+}
+
+/// A full-size page uploads under a RequestContext budget far smaller than
+/// the page: the body is copied through one bounded chunk buffer.
+#[test]
+fn full_page_upload_fits_a_small_request_context_budget() {
+    let env = racer_io::Env::host();
+    let budget = NonZeroUsize::new(4 * BODY_CHUNK_BYTES).unwrap();
+    assert!(budget.get() < PAGE_BYTES as usize);
+    let Some(reactor) = reactor_with(&env, budget) else {
+        return;
+    };
+    let uploads = Arc::new(Mutex::new(Uploads::default()));
+    let busy = Arc::new(Mutex::new(false));
+    let (state, flag) = (uploads.clone(), busy.clone());
+    let (address, _accepted, server) = serve(None, 1, move |head, body| {
+        azure_upload(head, body, &state, &flag)
+    });
+    let url = format!("http://127.0.0.1:{}/account/models", address.port());
+    let f = fixture(
+        reactor,
+        &url,
+        AzureCredential::Anonymous,
+        MapResolver::new(vec![]),
+        TrustRoots::unavailable("/nonexistent/racer-bundle.pem".into()),
+        AnonymousOnly,
+    );
+    let page: Vec<u8> = (0..PAGE_BYTES as usize).map(byte).collect();
+    let id = crate::origin::azure::upload::block_id(b"0123456789abcdef0123456789abcdef", 0);
+    let scope = scope();
+    drive(
+        &f.reactor,
+        Box::pin(
+            f.origin
+                .put_block_with(&f.definition, &context("obj"), &id, &page, &scope),
+        ),
+    )
+    .unwrap();
+    let staged = uploads.lock().unwrap();
+    assert_eq!(staged.staged.len(), 1);
+    assert_eq!(staged.staged.values().next().unwrap(), &page);
+    drop(staged);
     drop(f);
     server.join().unwrap();
 }

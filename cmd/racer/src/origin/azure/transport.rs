@@ -21,6 +21,7 @@ use crate::remote::{RemoteEndpoint, Resolver};
 use crate::runtime::RequestScope;
 use http1::tls::rustls::ClientConfig;
 use http1::{MessageHead, StartLine};
+use racer_io::ring::IoBuffer;
 use racer_wire::control::{AzureContainerUrl, OriginDefinition};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -289,10 +290,12 @@ impl AzureTransport for PoolTransport {
         })
     }
 
-    /// Send `head` then `body` (its `Content-Length`). The body is copied into
-    /// admitted request-context storage for the write. A failure is never
-    /// retried here: the request may have reached the service, so the caller
-    /// decides (Put Block and conditional Put Block List are safe to repeat).
+    /// Send `head` then `body` (its `Content-Length`). The body is copied
+    /// through one admitted request-context buffer of at most
+    /// [`BODY_CHUNK_BYTES`], so a full page upload needs no second page-sized
+    /// allocation. A failure is never retried here: the request may have
+    /// reached the service, so the caller decides (Put Block and conditional
+    /// Put Block List are safe to repeat).
     fn exchange_body<'a>(
         &'a self,
         url: &'a AzureContainerUrl,
@@ -314,7 +317,16 @@ impl AzureTransport for PoolTransport {
             let sent = self.io.send_head(lease, head, scope).await?;
             let mut lease = sent.connection;
             if !body.is_empty() {
-                lease = self.io.write_body_bytes(lease, body, scope).await?.lease;
+                let mut chunk = self.io.buffer(body.len().min(BODY_CHUNK_BYTES))?;
+                for piece in body.chunks(BODY_CHUNK_BYTES) {
+                    chunk.bytes_mut()?[..piece.len()].copy_from_slice(piece);
+                    let done = self
+                        .io
+                        .write_body_range(lease, chunk, 0..piece.len(), scope)
+                        .await?;
+                    lease = done.lease;
+                    chunk = done.buffer;
+                }
             }
             let started = std::cell::Cell::new(false);
             let response = self
@@ -331,6 +343,10 @@ impl AzureTransport for PoolTransport {
         })
     }
 }
+
+/// Largest piece of an upload body copied into request-context storage at a
+/// time.
+pub(crate) const BODY_CHUNK_BYTES: usize = 64 * 1024;
 
 /// One pooled response.
 pub struct PoolExchange {
