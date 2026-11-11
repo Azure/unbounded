@@ -12,7 +12,7 @@ def save_and_load(rank, world, store_path, socket_path, page_size):
 
     import racer
     import racer._wire as wire
-    from racer import dcp as rdcp
+    import racer.dcp as rdcp
 
     wire.PAGE_SIZE = page_size
     dist.init_process_group("gloo", init_method=f"file://{store_path}", rank=rank, world_size=world)

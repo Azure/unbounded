@@ -10,7 +10,6 @@ import pytest
 
 import racer
 import racer._wire as wire
-from racer import errors
 
 META = '{"schema":1,"bucket":"b","key":"k"}'
 ETAG_LEN = len('"racer-"') + 32
@@ -46,7 +45,7 @@ def test_write_round_trip(server, client, small_pages):
     client.delete(req())
     with pytest.raises(racer.NotFound):
         client.stat(req())
-    with pytest.raises(errors.WriteNotFound) as e:
+    with pytest.raises(racer.errors.WriteNotFound) as e:
         client.delete(req())
     assert isinstance(e.value, racer.NotFound)
 
@@ -122,14 +121,14 @@ def test_writes_disabled(server, client):
 @pytest.mark.parametrize(
     "status,code,cls,also",
     [
-        (503, "dirty-cap", racer.Busy, errors.Unavailable),
+        (503, "dirty-cap", racer.Busy, racer.errors.Unavailable),
         (502, "upload", racer.UploadFailed, racer.WriteError),
         (409, "conflict", racer.Conflict, racer.WriteError),
-        (428, "", errors.WriteInvalid, errors.InvalidArgument),
-        (413, "", errors.WriteInvalid, errors.InvalidArgument),
-        (411, "", errors.WriteInvalid, errors.InvalidArgument),
-        (504, "", errors.WriteUnavailable, errors.Unavailable),
-        (500, "", errors.WriteInternal, racer.WriteError),
+        (428, "", racer.errors.WriteInvalid, racer.errors.InvalidArgument),
+        (413, "", racer.errors.WriteInvalid, racer.errors.InvalidArgument),
+        (411, "", racer.errors.WriteInvalid, racer.errors.InvalidArgument),
+        (504, "", racer.errors.WriteUnavailable, racer.errors.Unavailable),
+        (500, "", racer.errors.WriteInternal, racer.WriteError),
     ],
 )
 def test_rejections(server, client, status, code, cls, also):
@@ -259,7 +258,7 @@ def test_persist_states(server, client):
 
 
 def test_metadata_required_unless_never(server, client):
-    with pytest.raises(errors.WriteInvalid):
+    with pytest.raises(racer.errors.WriteInvalid):
         client.write(req(metadata=None), b"x")
     client.write(req(metadata=None), b"x", upload="never")
 
@@ -286,7 +285,7 @@ def test_host_write_rejects(server, client):
         with pytest.raises(racer.RacerError):
             client.host_write(req(), buf.fileno(), -1, 1)
         assert server.seen == []
-        with pytest.raises(errors.WriteInvalid):
+        with pytest.raises(racer.errors.WriteInvalid):
             client.host_write(req(), buf.fileno(), 5, 10)  # past the end of the file
         client.host_write(req(), buf.fileno(), 0, 10, upload="never")
         with pytest.raises(racer.Exists):

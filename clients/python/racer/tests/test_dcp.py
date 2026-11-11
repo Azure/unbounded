@@ -21,7 +21,7 @@ dcp = pytest.importorskip("torch.distributed.checkpoint")
 
 from torch.distributed.checkpoint.api import CheckpointException  # noqa: E402
 
-from racer import dcp as rdcp  # noqa: E402
+import racer.dcp as rdcp  # noqa: E402
 
 
 def rank0_failure(call):
