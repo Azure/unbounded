@@ -1799,6 +1799,13 @@ As implemented (WP9), the SDKs refine this API:
 Tests: golden heads; fake-server round trips for each status; `SCM_RIGHTS`
 descriptor passing for `host_write` (mirror `pkg/racersdk/hostread_test.go`).
 
+Review fix (as built): the write path answers `500` only for internal
+faults that a retry will not fix (random source failure, an ETag or expiry
+that cannot be encoded, a bad stored page size, holder encoding), in
+`write/client.rs`. They stay `500` rather than `503`. The Go SDK matches it as
+`ErrInternal` and the Python client raises `racer.errors.WriteInternal` (a
+`WriteError`).
+
 ### WP10: PyTorch DCP storage plug-in
 
 Files: new `clients/python/racer/src/racer/dcp.py`; tests
