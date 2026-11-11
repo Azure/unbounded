@@ -196,6 +196,6 @@ dataplane memory and disk are not sampled; read them from Racer metrics.
 - Do not run a large pull without gantry. Direct pulls are capped by the
   origin NIC.
 - If `run.sh` is killed, delete leftovers with
-  `kubectl -n gantry-bench delete ds -l gantry-cluster-bench=true`.
+  `kubectl -n "${BENCH_NS}" delete ds -l gantry-cluster-bench=true`.
 - `registry.sh gc` while an image is being generated can delete its blobs.
 - `deploy.sh` edits operator ConfigMaps. Run `undeploy.sh` when done.

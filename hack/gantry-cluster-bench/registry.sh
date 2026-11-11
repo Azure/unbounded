@@ -30,9 +30,9 @@ rexec() {
 }
 
 cmd_up() {
-  k apply -f "${BENCH_DIR}/manifests/namespace.yaml"
+  render_manifest "${BENCH_DIR}/manifests/namespace.yaml" | k apply -f -
   require_registry_node
-  sed -e "s/\${REGISTRY_NODE}/${REGISTRY_NODE}/g" -e "s/\${REGISTRY_PORT}/${REGISTRY_PORT}/g" "${BENCH_DIR}/manifests/registry.yaml" | k apply -f -
+  render_manifest "${BENCH_DIR}/manifests/registry.yaml" | k apply -f -
   k -n "${BENCH_NS}" rollout status deploy/origin-registry --timeout=280s
   log "origin registry ready at $(origin_addr)"
 }

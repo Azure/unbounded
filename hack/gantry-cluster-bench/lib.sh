@@ -124,12 +124,20 @@ for_each_parallel() {
 # ds_apply <name> <mode> <env-yaml> <node>... creates the node.sh ConfigMap
 # and a DaemonSet running node.sh in MODE <mode> on exactly the given nodes.
 # <env-yaml> is extra container env entries, already indented by 12 spaces.
+# render_manifest <file>: print a bench manifest with ${BENCH_NS},
+# ${REGISTRY_NODE} and ${REGISTRY_PORT} substituted.
+render_manifest() {
+  sed -e "s|\${BENCH_NS}|${BENCH_NS}|g" \
+    -e "s|\${REGISTRY_NODE}|${REGISTRY_NODE:-}|g" \
+    -e "s|\${REGISTRY_PORT}|${REGISTRY_PORT:-}|g" "$1"
+}
+
 ds_apply() {
   local name="$1" mode="$2" envy="$3"
   shift 3
   (($# > 0)) || die "ds_apply: no nodes"
 
-  k apply -f "${BENCH_DIR}/manifests/namespace.yaml" >/dev/null
+  render_manifest "${BENCH_DIR}/manifests/namespace.yaml" | k apply -f - >/dev/null
   k -n "${BENCH_NS}" create configmap bench-node-script --from-file=node.sh="${BENCH_DIR}/node.sh" \
     --dry-run=client -o yaml | k apply -f - >/dev/null
 

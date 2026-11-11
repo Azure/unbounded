@@ -3,4 +3,4 @@
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: gantry-bench
+  name: ${BENCH_NS}

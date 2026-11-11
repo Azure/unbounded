@@ -10,7 +10,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: origin-registry
-  namespace: gantry-bench
+  namespace: ${BENCH_NS}
   labels:
     app: origin-registry
 spec:
