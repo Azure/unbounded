@@ -1423,6 +1423,82 @@ fn persist_after_a_coordinator_takeover_uploads_once() {
 
 /// Written pages are resealed under the active key after each rotation, so
 /// they stay readable and uploadable after their original key is dropped.
+/// A manifest replica that membership changes displaced from page zero's
+/// ranked members does not hear a delete (it goes to those members). Until
+/// its role check drops the copy, it must not answer fresh reads for the
+/// deleted version from its write directory or a cached current pointer.
+#[test]
+fn a_displaced_manifest_replica_does_not_serve_a_deleted_version() {
+    let mut c = Cluster::new(36, 3, Some(writes(2)));
+    let body = bytes(36, 140_000);
+    let created = c.put(0, OBJECT, &body, "Racer-Upload: manual\r\n");
+    assert_eq!(created.status, 201);
+    let object = c.object(OBJECT);
+    let (replica, worker) = c
+        .harness
+        .nodes
+        .iter()
+        .enumerate()
+        .find_map(|(n, node)| {
+            node.workers
+                .iter()
+                .position(|w| {
+                    w.app.coordinator.writes().directory().with(&object, |e| {
+                        e.is_some_and(|e| e.role == crate::write::directory::Role::Replica)
+                    })
+                })
+                .map(|w| (n, w))
+        })
+        .expect("a manifest replica");
+    // Hold the replica's entry aside while members join, standing in for a
+    // role check that has not run yet, so the delete cannot reach it.
+    let held = c.harness.nodes[replica].workers[worker]
+        .app
+        .coordinator
+        .writes()
+        .directory()
+        .remove(&object)
+        .unwrap();
+    let replica_id = node_id(c.harness.nodes[replica].id);
+    let mut displaced = false;
+    for _ in 0..32 {
+        c.harness.add(&c.env, None);
+        c.configure();
+        c.harness.publish();
+        c.harness.settle();
+        c.wait(Duration::from_secs(2));
+        let coordinator = &c.harness.nodes[0].workers[0].app.coordinator;
+        let membership = coordinator.current_membership().unwrap();
+        let ranked = coordinator
+            .fill
+            .dependencies
+            .candidates
+            .candidates(membership.clone(), &object, PageNumber(0))
+            .ordered;
+        if !ranked
+            .iter()
+            .filter(|node| membership.serves(&object.cache, node))
+            .take(crate::write::RANKED_DEPTH)
+            .any(|node| *node == replica_id)
+        {
+            displaced = true;
+            break;
+        }
+    }
+    assert!(displaced, "the replica stayed a page-zero member");
+    let deleted = c.delete(0, OBJECT);
+    assert_eq!(deleted.status, 204, "{:?}", deleted.headers);
+    c.wait(Duration::from_secs(2));
+    c.harness.nodes[replica].workers[worker]
+        .app
+        .coordinator
+        .writes()
+        .directory()
+        .replace(object.clone(), held);
+    assert_eq!(c.head(replica, OBJECT).status, 404);
+    assert_eq!(c.get(replica, OBJECT, body.len()).status, 404);
+}
+
 #[test]
 fn rekeying_keeps_written_pages_readable_past_key_retention() {
     let mut c = Cluster::new(35, 3, Some(writes(2)));

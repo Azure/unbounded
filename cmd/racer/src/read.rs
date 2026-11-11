@@ -814,7 +814,9 @@ impl LocalPageService for Coordinator {
                         metadata: None,
                         authorization: None,
                     };
-                    self.metadata.bootstrap_copy(&context, &effective).await
+                    self.metadata
+                        .bootstrap_copy(&context, &membership, &effective)
+                        .await
                 }
                 PeerOperation::Page {
                     page,
@@ -836,7 +838,7 @@ impl LocalPageService for Coordinator {
                         authorization: None,
                     };
                     self.metadata
-                        .copy_only(selector.clone(), &context, &effective)
+                        .copy_only(selector.clone(), &context, &membership, &effective)
                         .await
                         .and_then(|value| match value {
                             Some(metadata) => {

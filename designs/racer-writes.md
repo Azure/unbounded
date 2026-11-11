@@ -1995,7 +1995,13 @@ Bugs found and fixed:
 - Deletes reached only the top `replicas - 1` members; they now go to every
   page-zero member in the first `RANKED_DEPTH`. A manifest replica pushed
   out of those members by joins stops answering reads, drops itself once a
-  member knows the version, and never promotes itself.
+  member knows the version, and never promotes itself. Every lookup of the
+  write directory (`MetadataService::serves_written`, used by `copy_only`
+  for local and peer copy-only reads and by `refresh`) applies that
+  membership check, and a replica's cached current pointer is never
+  consulted in its place. A displaced replica that missed a DELETE then
+  asks the current members and gets `404`, not the deleted version. Pinned
+  (`If-Match`) reads of immutable version facts are unchanged.
 - Write maps (`write::Directory`, GC state, staging) used std's randomly
   seeded `HashMap`, so DST replays diverged; they use `runtime::HashMap`.
 

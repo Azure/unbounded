@@ -497,7 +497,10 @@ impl MetadataService {
         bounded_scope.deadline.0 = scope.deadline.0.min(budget.deadline());
         let scope = &bounded_scope;
         scope.check()?;
-        if let Some(metadata) = self.copy_only(purpose.selector(), context, scope).await? {
+        if let Some(metadata) = self
+            .copy_only(purpose.selector(), context, &membership, scope)
+            .await?
+        {
             return Ok(RefreshOutput {
                 metadata,
                 page: None,
@@ -636,17 +639,7 @@ impl MetadataService {
         if let Some(metadata) = self
             .writes
             .current_role(&context.object, self.candidates.ctx().clock.wall_now())
-            .filter(|(_, role)| {
-                // A manifest replica that membership changes pushed out of
-                // page zero's ranked members no longer hears deletes (they
-                // go to those members); it must not answer for the object.
-                *role == crate::write::Role::Coordinator
-                    || self.candidates.is_candidate(&self.candidates.candidates(
-                        membership.clone(),
-                        &context.object,
-                        PageNumber(0),
-                    ))
-            })
+            .filter(|(_, role)| self.serves_written(*role, &membership, &context.object))
             .map(|(metadata, _)| metadata)
             && match &purpose {
                 RefreshPurpose::Pinned(etag) => *etag == metadata.version.etag,
@@ -900,10 +893,11 @@ impl MetadataService {
     pub(crate) async fn bootstrap_copy(
         &self,
         context: &OriginContext,
+        membership: &std::sync::Arc<crate::topology::Membership>,
         scope: &RequestScope,
     ) -> Result<PeerResponse> {
         let Some(metadata) = self
-            .copy_only(MetadataSelector::Fresh, context, scope)
+            .copy_only(MetadataSelector::Fresh, context, membership, scope)
             .await?
         else {
             return Ok(PeerResponse::Miss);
@@ -939,7 +933,7 @@ impl MetadataService {
         budget: &mut AcquisitionBudget,
     ) -> Result<PeerResponse> {
         if let response @ PeerResponse::Bootstrap { .. } =
-            self.bootstrap_copy(context, scope).await?
+            self.bootstrap_copy(context, &membership, scope).await?
         {
             return Ok(response);
         }
@@ -992,11 +986,33 @@ impl MetadataService {
         })
     }
 
+    /// Whether this worker answers for a written object it tracks in `role`.
+    /// The coordinator always does. A manifest replica that membership
+    /// changes pushed out of page zero's ranked members no longer hears
+    /// deletes (they go to those members), so it must not.
+    fn serves_written(
+        &self,
+        role: crate::write::Role,
+        membership: &std::sync::Arc<crate::topology::Membership>,
+        object: &ObjectId,
+    ) -> bool {
+        role == crate::write::Role::Coordinator
+            || self.candidates.is_candidate(&self.candidates.candidates(
+                membership.clone(),
+                object,
+                PageNumber(0),
+            ))
+    }
+
     /// Read fresh current metadata or immutable pinned facts without acquisition.
+    ///
+    /// `membership` decides whether a manifest replica of a written object
+    /// still answers for it (see [`Self::serves_written`]).
     pub fn copy_only<'a>(
         &'a self,
         selector: MetadataSelector,
         context: &'a OriginContext,
+        membership: &'a std::sync::Arc<crate::topology::Membership>,
         scope: &'a RequestScope,
     ) -> Operation<'a, Option<ObjectMetadata>> {
         Box::pin(async move {
@@ -1014,11 +1030,23 @@ impl MetadataService {
                     // Answering a miss here would make the asking reader
                     // treat the coordinator's miss as authority and get
                     // the origin's `404`.
-                    if let Some(metadata) = self
+                    //
+                    // A manifest replica answers only while it is a page-zero
+                    // member: once membership changes displace it, a delete
+                    // no longer reaches it. Its cached current pointer is
+                    // skipped as well, so it cannot bypass that check; the
+                    // caller then asks the current members.
+                    match self
                         .writes
-                        .current(&context.object, self.candidates.ctx().clock.wall_now())
+                        .current_role(&context.object, self.candidates.ctx().clock.wall_now())
                     {
-                        return Ok(Some(metadata));
+                        Some((metadata, role))
+                            if self.serves_written(role, membership, &context.object) =>
+                        {
+                            return Ok(Some(metadata));
+                        }
+                        Some(_) => return Ok(None),
+                        None => {}
                     }
                     let Some(current) = self.storage.index.current(&context.object)? else {
                         return Ok(None);
