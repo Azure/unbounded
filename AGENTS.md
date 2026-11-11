@@ -59,6 +59,9 @@ unbounded-kube is organized into several directories:
 - `make build` compiles all Go packages (`go build ./...`).
 - `make vulncheck` runs `govulncheck` and fails only on vulnerabilities that are both reachable from our code and have a final-release fix, since those are the ones a production module bump resolves. Reachable ones with no final fix are reported and allowed through; prerelease and Go pseudo-version fixes are also reported but do not block.
 - `make fmt` formats Go source (gofumpt + wsl_v5 blank-line rules); `make lint` runs golangci-lint; `make test` runs all tests.
+- `make test` runs through gotestsum: the output matches `go test -v`, and it ends with every skipped and failed test
+  and its reason. The JSON report is written to `tmp/go-test.json`, and CI turns it into the job summary. Other test
+  targets use `$(GOTEST)`, which also passes `-v`.
 - `make lint` runs the same checks locally and in CI and does NOT auto-fix. Always run `make fmt` before committing to satisfy the linter (gofumpt and wsl_v5 are enforced by `make lint`/CI); do not hand-format.
 - Locally `test` implies `lint`. In CI (`CI=1`), each runs independently.
 

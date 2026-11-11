@@ -159,6 +159,10 @@ jobs:
       - name: Test
         run: make test
 
+      - name: Summarize tests
+        if: always() && hashFiles('tmp/go-test.json') != ''
+        run: go run ./hack/cmd/test-summary tmp/go-test.json >> "$GITHUB_STEP_SUMMARY"
+
       - name: Upload coverage
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
