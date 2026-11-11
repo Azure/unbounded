@@ -212,8 +212,9 @@ func (r *Registry) get(ctx context.Context, path string, query url.Values) ([]by
 		return nil, errors.New("registry metadata exceeds 4 MiB")
 	}
 
-	expected := path[strings.LastIndex(path, "/")+1:]
-	if strings.HasPrefix(expected, "sha256:") && godigest.FromBytes(body).String() != expected {
+	resource, expected := path[:strings.LastIndex(path, "/")], path[strings.LastIndex(path, "/")+1:]
+	if (strings.HasSuffix(resource, "/manifests") || strings.HasSuffix(resource, "/blobs")) &&
+		strings.HasPrefix(expected, "sha256:") && godigest.FromBytes(body).String() != expected {
 		return nil, errors.New("registry metadata digest mismatch")
 	}
 

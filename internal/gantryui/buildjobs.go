@@ -97,6 +97,14 @@ func (s *Server) createBuild(w http.ResponseWriter, r *http.Request) {
 	s.buildMu.Lock()
 	defer s.buildMu.Unlock()
 
+	if active, err := s.reclaimActive(r.Context()); err != nil {
+		s.fail(w, http.StatusBadGateway, err)
+		return
+	} else if active {
+		s.fail(w, http.StatusConflict, errors.New("wait for disk reclamation before generating images"))
+		return
+	}
+
 	jobs, err := s.cfg.Client.BatchV1().Jobs(s.cfg.Namespace).List(r.Context(), metav1.ListOptions{
 		LabelSelector: managerLabel + "=gantry-ui," + buildLabel,
 	})
@@ -304,7 +312,7 @@ func (s *Server) describeBuild(ctx context.Context, job *batchv1.Job, details bo
 			return state, err
 		}
 
-		if deployment.Image.Repository != spec.Repository || deployment.Image.Tag != job.Name || !strings.HasPrefix(deployment.Image.Reference, spec.Registry+"/"+spec.Repository+"@") {
+		if deployment.Image.Repository != spec.Repository || deployment.Image.Tag != job.Name || deployment.Image.Streaming != spec.Streaming || !strings.HasPrefix(deployment.Image.Reference, spec.Registry+"/"+spec.Repository+"@") {
 			return state, errors.New("generated workload does not match its build")
 		}
 

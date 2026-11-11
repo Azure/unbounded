@@ -33,13 +33,13 @@ import (
 )
 
 func TestBuildRequestLimits(t *testing.T) {
-	for _, request := range []BuildRequest{{1, 1}, {20, 101}, {100, 1}, {100, 1000}, {1, 100_000}} {
+	for _, request := range []BuildRequest{{Layers: 1, LayerMB: 1}, {Layers: 20, LayerMB: 101}, {Layers: 100, LayerMB: 1}, {Layers: 100, LayerMB: 1000}, {Layers: 1, LayerMB: 100_000}} {
 		if err := request.Validate(); err != nil {
 			t.Fatalf("valid request %+v: %v", request, err)
 		}
 	}
 
-	for _, request := range []BuildRequest{{0, 1}, {-1, 1}, {101, 1}, {1, 0}, {1, -1}, {100, 1001}, {1, 100_001}, {1, int(^uint(0) >> 1)}} {
+	for _, request := range []BuildRequest{{Layers: 0, LayerMB: 1}, {Layers: -1, LayerMB: 1}, {Layers: 101, LayerMB: 1}, {Layers: 1, LayerMB: 0}, {Layers: 1, LayerMB: -1}, {Layers: 100, LayerMB: 1001}, {Layers: 1, LayerMB: 100_001}, {Layers: 1, LayerMB: int(^uint(0) >> 1)}} {
 		if err := request.Validate(); err == nil {
 			t.Fatalf("accepted out-of-bounds request %+v", request)
 		}
@@ -139,8 +139,10 @@ func TestRandomLayerReportsGenerationFailures(t *testing.T) {
 }
 
 func TestImageBuildPublishesBeforeStartingPullAndCleansTemporaryLayers(t *testing.T) {
-	for _, failure := range []string{"", "push", "workload"} {
+	for _, failure := range []string{"", "push", "workload", "streaming", "conversion", "invalid artifact", "missing referrer", "invalid annotations", "wrong platform", "streaming tag"} {
 		t.Run("failure="+failure, func(t *testing.T) {
+			streaming := failure != "" && failure != "push" && failure != "workload"
+			wantFailure := failure != "" && failure != "streaming"
 			baseLayer := []byte("existing runtime layer")
 			baseConfig, _ := json.Marshal(ocispec.Image{Platform: ocispec.Platform{OS: "linux", Architecture: "amd64"}, RootFS: ocispec.RootFS{Type: "layers", DiffIDs: []godigest.Digest{godigest.FromBytes(baseLayer)}}})
 			baseManifest, _ := json.Marshal(ocispec.Manifest{Versioned: specs.Versioned{SchemaVersion: 2}, MediaType: ocispec.MediaTypeImageManifest, Config: buildDescriptor(ocispec.MediaTypeImageConfig, baseConfig), Layers: []ocispec.Descriptor{buildDescriptor(ocispec.MediaTypeImageLayer, baseLayer)}})
@@ -149,7 +151,11 @@ func TestImageBuildPublishesBeforeStartingPullAndCleansTemporaryLayers(t *testin
 
 			blobs := map[string][]byte{}
 
-			var published []byte
+			var (
+				published, streamed        []byte
+				converted, streamingTagged bool
+				conversionRequests         int
+			)
 
 			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				mu.Lock()
@@ -198,12 +204,110 @@ func TestImageBuildPublishesBeforeStartingPullAndCleansTemporaryLayers(t *testin
 						return
 					}
 
-					published = body
+					if streaming && !strings.HasSuffix(r.URL.Path, "-oci") {
+						if !converted {
+							t.Error("streaming tag published before conversion succeeded")
+						}
+
+						if failure == "streaming tag" {
+							http.Error(w, "tag denied", http.StatusForbidden)
+							return
+						}
+
+						streamingTagged = true
+					} else {
+						published = body
+					}
+
 					w.Header().Set("Docker-Content-Digest", godigest.FromBytes(body).String())
 					w.WriteHeader(http.StatusCreated)
+				case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/acr/v1/generated/_streaming/"):
+					conversionRequests++
+
+					if !streaming || len(published) == 0 || !strings.HasSuffix(r.URL.Path, godigest.FromBytes(published).String()) {
+						t.Error("conversion must target only the completed, opted-in source")
+					}
+
+					var payload map[string]string
+					if err := json.NewDecoder(r.Body).Decode(&payload); err != nil || payload["conversionFormat"] != "overlaybd" || payload["conversionVersion"] != "v1" {
+						t.Errorf("wrong conversion request: %+v, %v", payload, err)
+					}
+
+					w.Header().Set("Content-Type", "application/json")
+
+					if failure == "conversion" {
+						w.WriteHeader(http.StatusForbidden)
+						_, _ = w.Write([]byte(`{"error":"conversion denied"}`))
+
+						return
+					}
+
+					converted = true
+
+					var artifact ocispec.Manifest
+					if err := json.Unmarshal(published, &artifact); err != nil {
+						t.Fatal(err)
+					}
+
+					artifact.ArtifactType = streamingArtifactType
+					subject := buildDescriptor(ocispec.MediaTypeImageManifest, published)
+					artifact.Subject = &subject
+
+					for i := range artifact.Layers {
+						layer := &artifact.Layers[i]
+						layer.Annotations = map[string]string{
+							"containerd.io/snapshot/overlaybd/blob-digest": layer.Digest.String(),
+							"containerd.io/snapshot/overlaybd/blob-size":   strconv.FormatInt(layer.Size, 10),
+						}
+					}
+
+					if failure == "invalid artifact" {
+						artifact.Subject.Digest = godigest.FromString("wrong source")
+					}
+
+					if failure == "invalid annotations" {
+						artifact.Layers[0].Annotations = nil
+					}
+
+					if failure == "wrong platform" {
+						var config ocispec.Image
+						if err := json.Unmarshal(blobs[artifact.Config.Digest.String()], &config); err != nil {
+							t.Error(err)
+							return
+						}
+
+						config.Architecture = "arm64"
+						body, _ := json.Marshal(config)
+						artifact.Config = buildDescriptor(ocispec.MediaTypeImageConfig, body)
+						blobs[artifact.Config.Digest.String()] = body
+					}
+
+					streamed, _ = json.Marshal(artifact)
+
+					w.WriteHeader(http.StatusAccepted)
+					_, _ = w.Write([]byte(`{"id":"conversion-one","status":"Succeeded"}`))
+				case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v2/generated/referrers/"):
+					descriptor := buildDescriptor(ocispec.MediaTypeImageManifest, streamed)
+
+					descriptor.ArtifactType = streamingArtifactType
+					if r.URL.Query().Get("artifactType") != streamingArtifactType {
+						t.Error("missing streaming artifact filter")
+					}
+
+					descriptors := []ocispec.Descriptor{descriptor}
+					if failure == "missing referrer" {
+						descriptors = nil
+					}
+
+					_ = json.NewEncoder(w).Encode(ocispec.Index{Manifests: descriptors})
 				case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v2/generated/manifests/"):
 					w.Header().Set("Content-Type", ocispec.MediaTypeImageManifest)
-					_, _ = w.Write(published)
+
+					if streaming && (strings.HasSuffix(r.URL.Path, godigest.FromBytes(streamed).String()) || streamingTagged && !strings.HasSuffix(r.URL.Path, "-oci")) {
+						_, _ = w.Write(streamed)
+					} else {
+						_, _ = w.Write(published)
+					}
 				case (r.Method == http.MethodGet || r.Method == http.MethodHead) && strings.HasPrefix(r.URL.Path, "/v2/generated/blobs/"):
 					blob, ok := blobs[strings.TrimPrefix(r.URL.Path, "/v2/generated/blobs/")]
 					if !ok {
@@ -225,7 +329,7 @@ func TestImageBuildPublishesBeforeStartingPullAndCleansTemporaryLayers(t *testin
 			}
 
 			registry := &Registry{host: u.Host, architecture: "amd64", client: &auth.Client{Client: server.Client()}}
-			spec := BuildSpec{BuildRequest: BuildRequest{2, 1}, Name: "gantry-build-" + strings.Repeat("a", 20), Registry: u.Host, Repository: "generated", Base: u.Host + "/base@" + godigest.FromBytes(baseManifest).String(), Namespace: "demo", NodePool: "flexpool", Architecture: "amd64"}
+			spec := BuildSpec{BuildRequest: BuildRequest{Layers: 2, LayerMB: 1, Streaming: streaming}, Name: "gantry-build-" + strings.Repeat("a", 20), Registry: u.Host, Repository: "generated", Base: u.Host + "/base@" + godigest.FromBytes(baseManifest).String(), Namespace: "demo", NodePool: "flexpool", Architecture: "amd64"}
 			client := fake.NewSimpleClientset()
 			client.PrependReactor("create", "daemonsets", func(k8stesting.Action) (bool, runtime.Object, error) {
 				mu.Lock()
@@ -233,6 +337,10 @@ func TestImageBuildPublishesBeforeStartingPullAndCleansTemporaryLayers(t *testin
 
 				if len(published) == 0 {
 					t.Error("workload started before manifest publication")
+				}
+
+				if streaming && (!converted || !streamingTagged) {
+					t.Error("workload started before verified streaming artifact was tagged")
 				}
 
 				if failure == "workload" {
@@ -247,7 +355,7 @@ func TestImageBuildPublishesBeforeStartingPullAndCleansTemporaryLayers(t *testin
 			var progress []BuildProgress
 
 			err = RunImageBuild(context.Background(), client, registry, spec, directory, func(p BuildProgress) { progress = append(progress, p) })
-			if (err != nil) != (failure != "") {
+			if (err != nil) != wantFailure {
 				t.Fatalf("build failure=%q: %v", failure, err)
 			}
 
@@ -261,7 +369,11 @@ func TestImageBuildPublishesBeforeStartingPullAndCleansTemporaryLayers(t *testin
 				t.Fatal(listErr)
 			}
 
-			if failure != "" {
+			if !streaming && conversionRequests != 0 {
+				t.Fatal("regular OCI generation requested conversion")
+			}
+
+			if wantFailure {
 				if len(workloads.Items) != 0 {
 					t.Fatal("failed build launched a workload")
 				}
@@ -295,7 +407,12 @@ func TestImageBuildPublishesBeforeStartingPullAndCleansTemporaryLayers(t *testin
 				t.Fatalf("invalid generated image configuration: %+v", config)
 			}
 
-			if got := workloads.Items[0].Spec.Template.Spec.Containers[0].Image; got != u.Host+"/generated@"+godigest.FromBytes(published).String() {
+			deployed := published
+			if streaming {
+				deployed = streamed
+			}
+
+			if got := workloads.Items[0].Spec.Template.Spec.Containers[0].Image; got != u.Host+"/generated@"+godigest.FromBytes(deployed).String() {
 				t.Fatalf("pull was not pinned to published digest: %s", got)
 			}
 		})

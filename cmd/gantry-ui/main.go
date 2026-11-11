@@ -36,6 +36,10 @@ func run() error {
 		return runImageBuilder()
 	}
 
+	if len(os.Args) > 1 && (os.Args[1] == "reclaim" || os.Args[1] == "reclaim-node") {
+		return runReclaimer(os.Args[1])
+	}
+
 	listen := flag.String("listen", "127.0.0.1:8088", "Loopback HTTP address; use a trusted tunnel for remote access")
 	kubeconfig := flag.String("kubeconfig", "", "Kubeconfig path (uses normal client-go loading when omitted)")
 	namespace := flag.String("namespace", "gantry-demo", "Existing namespace for UI-owned demo DaemonSets")
@@ -50,6 +54,8 @@ func run() error {
 	builderAccount := flag.String("builder-service-account", "", "Workload-identity service account for image-build Jobs")
 	builderRepository := flag.String("builder-repository", "gantry-demo/generated", "ACR repository for generated images")
 	builderConcurrency := flag.Int("builder-concurrency", 1, "Maximum concurrent image-build Jobs")
+	reclaimerImage := flag.String("reclaimer-image", "", "Digest-pinned image containing the disk reclaimer; empty disables reclamation")
+	reclaimerAccount := flag.String("reclaimer-service-account", "", "Dedicated disk-reclaimer service account")
 
 	flag.Parse()
 
@@ -86,6 +92,14 @@ func run() error {
 		}
 	}
 
+	var reclaimer *gantryui.ReclaimConfig
+	if *reclaimerImage != "" || *reclaimerAccount != "" {
+		reclaimer = &gantryui.ReclaimConfig{Image: *reclaimerImage, ServiceAccount: *reclaimerAccount}
+		if err := reclaimer.Validate(*registry); err != nil {
+			return err
+		}
+	}
+
 	loading := clientcmd.NewDefaultClientConfigLoadingRules()
 	loading.ExplicitPath = *kubeconfig
 
@@ -109,7 +123,8 @@ func run() error {
 		Client: client, Catalog: catalog, Registry: *registry, Namespace: *namespace,
 		NodePool: *pool, Architecture: *architecture, GantryNamespace: *gantryNamespace,
 		DirectAgents: *direct, Interval: *interval,
-		Builder: builder,
+		Builder:   builder,
+		Reclaimer: reclaimer,
 	})
 	server := &http.Server{
 		Addr: *listen, Handler: app.Handler(), ReadHeaderTimeout: 5 * time.Second,

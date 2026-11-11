@@ -37,8 +37,9 @@ const (
 )
 
 type BuildRequest struct {
-	Layers  int `json:"layers"`
-	LayerMB int `json:"layerMB"`
+	Layers    int  `json:"layers"`
+	LayerMB   int  `json:"layerMB"`
+	Streaming bool `json:"streaming,omitempty"`
 }
 
 func (request BuildRequest) Validate() error {
@@ -213,17 +214,31 @@ func RunImageBuild(ctx context.Context, client kubernetes.Interface, registry *R
 
 	emit(BuildProgress{Stage: "publishing", Layers: spec.Layers, Message: "Publishing the completed OCI image"})
 
-	if err := target.PushReference(ctx, buildDescriptor(ocispec.MediaTypeImageManifest, body), bytes.NewReader(body), spec.Name); err != nil {
+	tag := spec.Name
+	if spec.Streaming {
+		tag += "-oci"
+	}
+
+	if err := target.PushReference(ctx, buildDescriptor(ocispec.MediaTypeImageManifest, body), bytes.NewReader(body), tag); err != nil {
 		return fmt.Errorf("publish image manifest: %w", err)
 	}
 
-	image, err := registry.image(ctx, spec.Repository, spec.Name)
+	image, err := registry.image(ctx, spec.Repository, tag)
 	if err != nil {
 		return fmt.Errorf("verify published image: %w", err)
 	}
 
 	if image == nil || image.Digest != godigest.FromBytes(body).String() {
 		return errors.New("published image did not match the generated manifest")
+	}
+
+	if spec.Streaming {
+		emit(BuildProgress{Stage: "converting", Layers: spec.Layers, Message: "Creating the ACR streaming artifact; worker pulls wait for conversion"})
+
+		image, err = registry.buildStreamingImage(ctx, target, spec, image.Digest, emit)
+		if err != nil {
+			return fmt.Errorf("create ACR streaming image: %w", err)
+		}
 	}
 
 	emit(BuildProgress{Stage: "deploying", Layers: spec.Layers, Message: "Starting the Flex-worker pull"})

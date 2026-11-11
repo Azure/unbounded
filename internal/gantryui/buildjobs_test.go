@@ -38,7 +38,7 @@ func TestBuildAPICreatesOnlyBoundedWorkloadIdentityJobs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for _, body := range []string{`{"layers":0,"layerMB":1}`, `{"layers":100,"layerMB":1001}`, `{"layers":101,"layerMB":1}`, `{"layers":2.5,"layerMB":1}`, `{"layers":2,"layerMB":1,"repository":"other"}`, `{"layers":2,"layerMB":1} {}`} {
+	for _, body := range []string{`{"layers":0,"layerMB":1}`, `{"layers":100,"layerMB":1001}`, `{"layers":101,"layerMB":1}`, `{"layers":2.5,"layerMB":1}`, `{"layers":2,"layerMB":1,"repository":"other"}`, `{"layers":2,"layerMB":1,"streaming":"true"}`, `{"layers":2,"layerMB":1} {}`} {
 		if response := apiRequest(server, http.MethodPost, "/api/builds", body); response.Code != http.StatusBadRequest {
 			t.Fatalf("invalid request %s: %d %s", body, response.Code, response.Body)
 		}
@@ -74,7 +74,7 @@ func TestBuildAPICreatesOnlyBoundedWorkloadIdentityJobs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if spec.BuildRequest != (BuildRequest{2, 3}) || spec.Registry != server.cfg.Registry || spec.Namespace != "demo" || spec.Repository != "demo/generated" {
+	if spec.BuildRequest != (BuildRequest{Layers: 2, LayerMB: 3}) || spec.Registry != server.cfg.Registry || spec.Namespace != "demo" || spec.Repository != "demo/generated" {
 		t.Fatalf("untrusted build specification: %+v", spec)
 	}
 
@@ -92,8 +92,46 @@ func TestBuildAPICreatesOnlyBoundedWorkloadIdentityJobs(t *testing.T) {
 	}
 }
 
+func TestBuildAPIPreservesStreamingOptIn(t *testing.T) {
+	for _, streaming := range []bool{false, true} {
+		t.Run(fmt.Sprint(streaming), func(t *testing.T) {
+			client := fake.NewSimpleClientset()
+			server := testServer(client, testImage())
+			server.cfg.Builder = testBuildConfig()
+
+			response := apiRequest(server, http.MethodPost, "/api/builds", fmt.Sprintf(`{"layers":1,"layerMB":1,"streaming":%t}`, streaming))
+			if response.Code != http.StatusCreated {
+				t.Fatalf("create build: %d %s", response.Code, response.Body)
+			}
+
+			var build ImageBuild
+			if err := json.Unmarshal(response.Body.Bytes(), &build); err != nil {
+				t.Fatal(err)
+			}
+
+			job, err := client.BatchV1().Jobs("demo").Get(context.Background(), build.Name, metav1.GetOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			var spec, saved BuildSpec
+			if err := json.Unmarshal([]byte(job.Spec.Template.Spec.Containers[0].Env[0].Value), &spec); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := json.Unmarshal([]byte(job.Annotations[buildAnnotation]), &saved); err != nil {
+				t.Fatal(err)
+			}
+
+			if build.Request.Streaming != streaming || spec.Streaming != streaming || saved.Streaming != streaming {
+				t.Fatal("streaming selection was not preserved in response and durable Job")
+			}
+		})
+	}
+}
+
 func TestLargeBuildJobsReserveOnePackagedLayer(t *testing.T) {
-	for _, request := range []BuildRequest{{100, 1}, {100, 1000}, {1, 100_000}} {
+	for _, request := range []BuildRequest{{Layers: 100, LayerMB: 1}, {Layers: 100, LayerMB: 1000}, {Layers: 1, LayerMB: 100_000}} {
 		t.Run(fmt.Sprintf("%dx%dMB", request.Layers, request.LayerMB), func(t *testing.T) {
 			client := fake.NewSimpleClientset()
 			server := testServer(client, testImage())
@@ -125,6 +163,39 @@ func TestLargeBuildJobsReserveOnePackagedLayer(t *testing.T) {
 				t.Fatalf("storage must cover one packaged layer, not the entire image: reserved=%d limit=%d payload=%d", reserved, limit, payload)
 			}
 		})
+	}
+}
+
+func TestBuildStatusRejectsOCIWorkloadForStreamingRequest(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	server := testServer(client, testImage())
+	server.cfg.Builder = testBuildConfig()
+
+	response := apiRequest(server, http.MethodPost, "/api/builds", `{"layers":1,"layerMB":1,"streaming":true}`)
+
+	var build ImageBuild
+	if err := json.Unmarshal(response.Body.Bytes(), &build); err != nil || response.Code != http.StatusCreated {
+		t.Fatalf("create streaming build: %d %v", response.Code, err)
+	}
+
+	image := testImage()
+	image.Repository, image.Tag = "demo/generated", build.Name
+	image.Reference = server.cfg.Registry + "/" + image.Repository + "@" + image.Digest
+	image.Streaming = false
+
+	workload, err := buildDeployment("demo", "flexpool", image)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	workload.Labels[buildLabel] = build.Name
+	if _, err := client.AppsV1().DaemonSets("demo").Create(context.Background(), workload, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	response = apiRequest(server, http.MethodGet, "/api/builds/"+build.Name, "")
+	if response.Code != http.StatusBadGateway {
+		t.Fatalf("streaming request accepted an OCI workload: %d %s", response.Code, response.Body)
 	}
 }
 

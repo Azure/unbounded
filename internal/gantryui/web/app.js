@@ -14,6 +14,7 @@ const state = {
   build: null, buildBusy: false, buildTimer: null, buildRequest: null,
   renderFrame: 0, renderedNode: null, detailLoading: false, detailObservation: null,
   clusterTraffic: [], eventsPodUID: null, timingsHTML: "", clusterPanelHTML: "",
+  reclaimBusy: false, reclaimTimer: null, reclaimController: null, reclaimResetUID: null, reclaimStartController: null,
 };
 const kindBadge = image => `<span class="badge ${image.streaming ? "streaming" : "oci"}">${image.streaming ? "ACR STREAMING" : "OCI"}</span>`;
 const shortName = name => name.match(/flex\d+$/)?.[0] || name;
@@ -37,7 +38,11 @@ function error(message, source = "operation") {
 async function api(path, options = {}) {
   const response = await fetch(path, options);
   const data = await response.json();
-  if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+  if (!response.ok) {
+    const failure = new Error(data.error || `HTTP ${response.status}`);
+    failure.retryAfter = response.status === 409 ? Number(response.headers.get("Retry-After")) : 0;
+    throw failure;
+  }
   return data;
 }
 
@@ -52,7 +57,7 @@ function renderCatalog() {
   $("images").innerHTML = images.map(image => {
     const compatible = image.architecture === state.config.architecture && image.os === "linux";
     const existing = state.deployments.some(deployment => deployment.id === image.id);
-    return `<button class="image-card ${state.deployment?.id === image.id ? "selected" : ""}" data-image="${esc(image.id)}" ${!compatible || state.busy ? "disabled" : ""}>
+    return `<button class="image-card ${state.deployment?.id === image.id ? "selected" : ""}" data-image="${esc(image.id)}" ${!compatible || state.busy || state.reclaimBusy ? "disabled" : ""}>
       <span class="image-card-top"><span class="image-glyph">◇</span><strong>${esc(image.repository)}</strong>${existing ? '<span class="deployed-dot" title="Existing deployment"></span>' : ""}</span>
       <span class="image-tag">:${esc(image.tag)}</span>${kindBadge(image)}
       <span class="image-card-meta">${bytes(image.size)} <span>${esc(image.architecture)}${compatible ? "" : " · incompatible"}</span></span>
@@ -74,7 +79,7 @@ async function loadImages(refresh = false) {
 }
 
 async function selectImage(id) {
-  if (state.busy) return;
+  if (state.busy || state.reclaimBusy) return;
   $("image-picker").open = false;
   const existing = state.deployments.find(deployment => deployment.id === id);
   if (existing) { activate(existing, true); return; }
@@ -92,6 +97,7 @@ async function selectImage(id) {
 }
 
 function activate(deployment, resumed) {
+  if (state.reclaimBusy) return;
   state.stream?.close();
   state.eventsRequest?.abort();
   Object.assign(state, { deployment, snapshot: null, selected: null, detail: null, events: [], cells: new Map(), traffic: [], lastUpdate: 0, connected: false });
@@ -453,10 +459,10 @@ function generationSummary() {
   const layers = Number($("generate-layers").value);
   const layerMB = Number($("generate-layer-mb").value);
   const failure = buildRequestError(layers, layerMB, state.config.generation);
-  $("generate-summary").textContent = `${layers} payload layers × ${layerMB} MB = ${bytes(layers * layerMB * 1000000)} random payload, plus the small runtime base.`;
+  $("generate-summary").textContent = `${layers} payload layers × ${layerMB} MB = ${bytes(layers * layerMB * 1000000)} random payload, plus the small runtime base. ${$("generate-streaming").checked ? "ACR streaming conversion enabled." : "Regular OCI image."}`;
   $("generate-error").textContent = failure;
   $("generate-error").hidden = !failure;
-  $("generate-submit").disabled = !!failure || state.buildBusy;
+  $("generate-submit").disabled = !!failure || state.buildBusy || state.reclaimBusy;
 }
 
 function renderBuild(build, failure = "") {
@@ -464,13 +470,14 @@ function renderBuild(build, failure = "") {
   const label = ({
     queued: "Build queued", building: "Building image", base: "Preparing runtime base",
     generating: "Generating random payload", pushing: "Pushing layer to ACR",
-    publishing: "Publishing image", deploying: "Starting cluster pull", complete: "Image published. Cluster pull started.", failed: "Image generation failed",
+    publishing: "Publishing image", converting: "Converting image for ACR streaming", deploying: "Starting cluster pull", complete: "Image published. Cluster pull started.", failed: "Image generation failed",
   })[progress.stage] || "Building image";
   $("build-status").hidden = false;
   $("build-status").classList.toggle("failed", progress.stage === "failed");
-  $("build-status").innerHTML = `<h2>${esc(label)}</h2><p class="small muted">${build.request.layers} payload layers × ${build.request.layerMB} MB · ${esc(build.name)}</p><p class="small">${esc(progress.message)}${progress.layer ? ` · Layer ${progress.layer} / ${progress.layers}` : ""}${progress.layerBytes ? ` · ${bytes(progress.bytes)} / ${bytes(progress.layerBytes)}` : ""}</p>${progress.layerBytes ? bar(percent(progress.bytes, progress.layerBytes)) : ""}${failure ? `<p class="generation-error">${esc(failure)}. Retrying status...</p>` : ""}`;
+  $("build-status").innerHTML = `<h2>${esc(label)}</h2><p class="small muted">${build.request.layers} payload layers × ${build.request.layerMB} MB · ${build.request.streaming ? "ACR streaming" : "OCI"} · ${esc(build.name)}</p><p class="small">${esc(progress.message)}${progress.layer ? ` · Layer ${progress.layer} / ${progress.layers}` : ""}${progress.layerBytes ? ` · ${bytes(progress.bytes)} / ${bytes(progress.layerBytes)}` : ""}</p>${progress.layerBytes ? bar(percent(progress.bytes, progress.layerBytes)) : ""}${failure ? `<p class="generation-error">${esc(failure)}. Retrying status...</p>` : ""}`;
   paintBars($("build-status"));
-  $("generate-image").disabled = state.buildBusy;
+  $("generate-image").disabled = state.buildBusy || state.reclaimBusy;
+  $("reclaim-space").disabled = state.buildBusy || state.reclaimBusy;
   $("generate-image").textContent = state.buildBusy ? "Build in progress..." : "+ Generate & pull";
 }
 
@@ -512,7 +519,7 @@ function watchBuild(name) {
 async function resumeBuild() {
   const builds = await api("/api/builds");
   const saved = localStorage.getItem(`${storageKey()}:build`);
-  const build = builds.find(item => item.name === saved) || builds.find(item => !["failed", "complete"].includes(item.progress.stage));
+  const build = builds.find(item => item.name === saved && !["failed", "complete"].includes(item.progress.stage)) || builds.find(item => !["failed", "complete"].includes(item.progress.stage));
   if (build) {
     state.build = build;
     renderBuild(build);
@@ -525,9 +532,144 @@ $("generate-image").addEventListener("click", () => {
   $("generate-dialog").showModal();
   $("generate-layers").focus();
 });
+
+function resetRemovedDemos() {
+  state.stream?.close();
+  state.eventsRequest?.abort();
+  state.stream = null;
+  Object.assign(state, { deployment: null, snapshot: null, selected: null, detail: null, deployments: [], cells: new Map(), connected: false, lastUpdate: 0 });
+  localStorage.removeItem(storageKey());
+  const url = new URL(location.href);
+  url.searchParams.delete("deployment");
+  history.replaceState(null, "", url);
+  $("workspace").hidden = true;
+  $("welcome").hidden = false;
+  $("grid").replaceChildren();
+  $("build-status").hidden = true;
+  $("tooltip").hidden = true;
+  $("export-timings").disabled = true;
+  $("image-picker-label").textContent = "Choose image";
+  connection("Reclaiming disk space");
+  renderCatalog();
+}
+
+function renderReclaim(reclaim) {
+  const progress = reclaim.progress;
+  state.reclaimBusy = !["complete", "failed"].includes(progress.stage);
+  $("reclaim-space").disabled = state.reclaimBusy || state.buildBusy;
+  $("generate-image").disabled = state.reclaimBusy || state.buildBusy;
+  if (state.reclaimBusy && state.reclaimResetUID !== reclaim.uid) {
+    state.reclaimResetUID = reclaim.uid;
+    resetRemovedDemos();
+  }
+  const dismissed = localStorage.getItem(`${storageKey()}:reclaim-dismissed`) === reclaim.uid;
+  $("reclaim-status").dataset.uid = reclaim.uid;
+  $("reclaim-status").hidden = dismissed;
+  $("reclaim-show").hidden = !dismissed;
+  $("reclaim-status").classList.toggle("failed", progress.stage === "failed");
+  const percentDone = progress.total ? progress.completed / progress.total * 100 : null;
+  $("reclaim-status").innerHTML = `<div class="reclaim-heading"><h2>${progress.stage === "complete" ? "Disk reclamation finished" : progress.stage === "failed" ? "Disk reclamation needs attention" : "Reclaiming disk space"}</h2><button id="reclaim-dismiss" type="button" aria-label="Dismiss disk reclamation status" title="Hide status without stopping cleanup">Dismiss</button></div><p>${esc(progress.message)}</p><p class="small muted">${number(progress.deleted || 0)} demos deleted · ${number(progress.completed || 0)} / ${number(progress.total || 0)} workers · ${number(progress.failed || 0)} failures · ${bytes(progress.reclaimed || 0)} observed space recovered${progress.protectedLeases ? ` · ${number(progress.protectedLeases)} protected runtime leases` : ""}</p>${bar(percentDone)}<div class="reclaim-workers">${(reclaim.workers || []).map(worker => `<span class="${worker.stage === "complete" ? "complete" : worker.stage === "failed" ? "failed" : "pulling"}" title="${esc(worker.node)}: ${esc(worker.stage)}">${esc(shortName(worker.node))}</span>`).join("")}</div>`;
+  paintBars($("reclaim-status"));
+  renderCatalog();
+}
+
+async function pollReclaim() {
+  clearTimeout(state.reclaimTimer);
+  state.reclaimController?.abort();
+  const controller = new AbortController();
+  state.reclaimController = controller;
+  try {
+    const reclaim = await api("/api/reclaim", { signal: controller.signal });
+    if (controller.signal.aborted) return;
+    if (!reclaim) return;
+    renderReclaim(reclaim);
+    if (!state.reclaimBusy) {
+      state.deployments = await api("/api/deployments");
+      renderCatalog();
+      if (!state.deployment) connection("Connected", true);
+      return;
+    }
+  } catch (failure) {
+    if (controller.signal.aborted) return;
+    error(`Cannot read disk reclamation status: ${failure.message}`);
+  }
+  state.reclaimTimer = setTimeout(() => { void pollReclaim(); }, 2000);
+}
+
+$("reclaim-status").addEventListener("click", event => {
+  if (!event.target.closest("#reclaim-dismiss")) return;
+  localStorage.setItem(`${storageKey()}:reclaim-dismissed`, $("reclaim-status").dataset.uid);
+  $("reclaim-status").hidden = true;
+  $("reclaim-show").hidden = false;
+  $("reclaim-show").focus();
+});
+$("reclaim-show").addEventListener("click", () => {
+  localStorage.removeItem(`${storageKey()}:reclaim-dismissed`);
+  $("reclaim-status").hidden = false;
+  $("reclaim-show").hidden = true;
+  $("reclaim-dismiss").focus();
+});
+$("reclaim-space").addEventListener("click", () => {
+  $("reclaim-confirm").value = "";
+  $("reclaim-submit").disabled = true;
+  $("reclaim-error").hidden = true;
+  $("reclaim-namespace").textContent = state.config.namespace;
+  $("reclaim-dialog").showModal();
+  $("reclaim-confirm").focus();
+});
+$("reclaim-close").addEventListener("click", () => $("reclaim-dialog").close());
+$("reclaim-dialog").addEventListener("close", () => state.reclaimStartController?.abort());
+$("reclaim-dialog").addEventListener("cancel", () => state.reclaimStartController?.abort());
+$("reclaim-confirm").addEventListener("input", () => {
+  $("reclaim-submit").disabled = $("reclaim-confirm").value !== "DELETE ALL DEMOS" || state.reclaimBusy || state.buildBusy || !!state.reclaimStartController;
+});
+$("reclaim-form").addEventListener("submit", async event => {
+  event.preventDefault();
+  if ($("reclaim-submit").disabled) return;
+  $("reclaim-submit").disabled = true;
+  const controller = new AbortController();
+  state.reclaimStartController = controller;
+  const deadline = Date.now() + 120000;
+  try {
+    const body = JSON.stringify({ confirm: $("reclaim-confirm").value });
+    let reclaim;
+    while (!controller.signal.aborted) {
+      try {
+        reclaim = await api("/api/reclaim", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body, signal: controller.signal,
+        });
+        break;
+      } catch (failure) {
+        if (controller.signal.aborted) return;
+        if (!(failure.retryAfter > 0) || Date.now() >= deadline) throw failure;
+        $("reclaim-error").textContent = "Removing the previous cleanup's Jobs. Retrying automatically; close this dialog to cancel.";
+        $("reclaim-error").hidden = false;
+        await new Promise(resolve => {
+          const done = () => { clearTimeout(timer); controller.signal.removeEventListener("abort", done); resolve(); };
+          const timer = setTimeout(done, Math.min(failure.retryAfter, 5) * 1000);
+          controller.signal.addEventListener("abort", done, { once: true });
+        });
+      }
+    }
+    if (controller.signal.aborted) return;
+    state.reclaimStartController = null;
+    $("reclaim-dialog").close();
+    renderReclaim(reclaim);
+    void pollReclaim();
+  } catch (failure) {
+    if (controller.signal.aborted) return;
+    $("reclaim-error").textContent = failure.message;
+    $("reclaim-error").hidden = false;
+    $("reclaim-submit").disabled = false;
+  } finally {
+    if (state.reclaimStartController === controller) state.reclaimStartController = null;
+  }
+});
 $("generate-close").addEventListener("click", () => $("generate-dialog").close());
 $("generate-layers").addEventListener("input", generationSummary);
 $("generate-layer-mb").addEventListener("input", generationSummary);
+$("generate-streaming").addEventListener("change", generationSummary);
 $("generate-form").addEventListener("submit", async event => {
   event.preventDefault();
   generationSummary();
@@ -537,7 +679,7 @@ $("generate-form").addEventListener("submit", async event => {
   try {
     const build = await api("/api/builds", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ layers: Number($("generate-layers").value), layerMB: Number($("generate-layer-mb").value) }),
+      body: JSON.stringify({ layers: Number($("generate-layers").value), layerMB: Number($("generate-layer-mb").value), streaming: $("generate-streaming").checked }),
     });
     state.build = build;
     $("generate-dialog").close();
@@ -632,7 +774,7 @@ $("grid").addEventListener("pointerover", event => {
   tooltip.hidden = false;
 });
 $("grid").addEventListener("pointerleave", () => { $("tooltip").hidden = true; });
-window.addEventListener("beforeunload", () => { state.stream?.close(); state.eventsRequest?.abort(); state.buildRequest?.abort(); clearTimeout(state.buildTimer); });
+window.addEventListener("beforeunload", () => { state.stream?.close(); state.eventsRequest?.abort(); state.buildRequest?.abort(); state.reclaimController?.abort(); state.reclaimStartController?.abort(); clearTimeout(state.buildTimer); clearTimeout(state.reclaimTimer); });
 setInterval(() => {
   if (["lifecycle", "startup"].includes(state.view) && state.selected && !state.detailLoading) void loadNode();
 }, 5000);
@@ -650,6 +792,7 @@ setInterval(() => {
 async function start() {
   try {
     state.config = await api("/api/config");
+    if (state.config.reclaim?.enabled) $("reclaim-space").hidden = false;
     if (state.config.generation?.enabled) {
       $("generate-image").hidden = false;
       $("generate-layers").max = state.config.generation.maxLayers;
@@ -670,6 +813,7 @@ async function start() {
     } else error(`Cannot discover deployments: ${results[1].reason.message}`);
     if (results[0].status === "rejected") error(`Cannot load ACR catalog: ${results[0].reason.message}`);
     if (state.config.generation?.enabled) void resumeBuild().catch(failure => error(`Cannot resume image builds: ${failure.message}`));
+    if (state.config.reclaim?.enabled) void pollReclaim();
   } catch (failure) { error(failure.message); connection("Unavailable"); }
 }
 void start();

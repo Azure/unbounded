@@ -23,12 +23,13 @@
           <nav id="images" class="image-list" aria-label="ACR images"></nav>
         </div>
       </details>
-      <div class="topbar-end"><button id="generate-image" class="generate-button" hidden>+ Generate &amp; pull</button><button id="export-timings" disabled>Export timings</button><span id="cluster-label" class="cluster-label">Connecting to Kubernetes</span><span id="connection" class="connection">Connecting</span></div>
+      <div class="topbar-end"><button id="reclaim-show" aria-controls="reclaim-status" hidden>Show cleanup status</button><button id="reclaim-space" hidden>Reclaim disk space</button><button id="generate-image" class="generate-button" hidden>+ Generate &amp; pull</button><button id="export-timings" disabled>Export timings</button><span id="cluster-label" class="cluster-label">Connecting to Kubernetes</span><span id="connection" class="connection">Connecting</span></div>
     </header>
     <main>
       <div id="error" class="notice error-notice" role="alert" hidden></div>
       <div id="catalog-warning" class="notice warning-notice" hidden></div>
       <section id="build-status" class="panel build-status" aria-live="polite" hidden></section>
+      <section id="reclaim-status" class="panel build-status" aria-live="polite" hidden></section>
       <section id="welcome" class="welcome">
         <div class="welcome-orbit"><span class="brand-mark"></span></div>
         <p class="eyebrow">YOUR ENTIRE CLUSTER. ONE LIVE VIEW.</p>
@@ -70,6 +71,16 @@
       </div>
     </main>
     <div id="tooltip" class="tooltip" role="tooltip" hidden></div>
+    <dialog id="reclaim-dialog" class="generate-dialog">
+      <form id="reclaim-form">
+        <div class="dialog-heading"><div><p class="eyebrow">CLUSTER-WIDE CLEANUP</p><h2>Delete demos and reclaim disk space</h2></div><button id="reclaim-close" type="button" aria-label="Close disk reclamation dialog">&#215;</button></div>
+        <p>This stops and deletes <strong>all dashboard-managed demo DaemonSets and their Pods</strong> in <span id="reclaim-namespace"></span>, then prunes unused images on every Flex worker in the configured pool.</p>
+        <p class="muted small">Gantry, snapshotters, other workloads, and registry images are preserved. Active or uncertain runtime leases remain protected; reclamation is not a full disk wipe. Workers with stuck terminating demo Pods must recover before cleanup starts.</p>
+        <label class="search">Type DELETE ALL DEMOS to confirm<input id="reclaim-confirm" autocomplete="off" placeholder="DELETE ALL DEMOS" required></label>
+        <p id="reclaim-error" class="generation-error" role="alert" hidden></p>
+        <button id="reclaim-submit" class="reclaim-submit" type="submit" disabled>Delete all demos &amp; reclaim</button>
+      </form>
+    </dialog>
     <dialog id="generate-dialog" class="generate-dialog">
       <form id="generate-form">
         <div class="dialog-heading"><div><p class="eyebrow">ON-DEMAND DEMO IMAGE</p><h2>Generate. Push. Watch it pull.</h2></div><button id="generate-close" type="button" aria-label="Close generation dialog">&#215;</button></div>
@@ -79,6 +90,8 @@
           <label>Payload layers<input id="generate-layers" type="number" min="1" step="1" value="3" required></label>
           <label>MB per payload layer<input id="generate-layer-mb" type="number" min="1" step="1" value="50" required></label>
         </div>
+        <label class="generate-streaming"><input id="generate-streaming" type="checkbox"> Enable ACR streaming</label>
+        <p class="muted small">When checked, convert this image to ACR Artifact Streaming before starting worker pulls. Requires a Premium ACR and streaming-enabled workers. Unchecked creates a regular OCI image.</p>
         <div id="generate-summary" class="generate-summary"></div>
         <p class="muted small">MB means 1,000,000 bytes. Random payloads do not compress away. A small runtime base adds another layer and keeps the Pods running. Existing workloads are not removed.</p>
         <p class="muted small">Workers need space for both stored layers and unpacked files, roughly twice the payload for these ordinary OCI images.</p>

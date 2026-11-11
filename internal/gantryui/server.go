@@ -39,6 +39,7 @@ type Config struct {
 	Interval        time.Duration
 	Logger          *slog.Logger
 	Builder         *ImageBuildConfig
+	Reclaimer       *ReclaimConfig
 }
 
 type snapshotCache struct {
@@ -97,11 +98,14 @@ func (s *Server) Handler() http.Handler {
 			"registry": s.cfg.Registry, "namespace": s.cfg.Namespace,
 			"nodePool": s.cfg.NodePool, "architecture": s.cfg.Architecture,
 			"generation": map[string]any{"enabled": s.cfg.Builder != nil, "maxLayers": MaxBuildLayers, "maxTotalMB": MaxBuildMB},
+			"reclaim":    map[string]any{"enabled": s.cfg.Reclaimer != nil},
 		})
 	})
 	mux.HandleFunc("POST /api/builds", s.createBuild)
 	mux.HandleFunc("GET /api/builds", s.builds)
 	mux.HandleFunc("GET /api/builds/{name}", s.build)
+	mux.HandleFunc("POST /api/reclaim", s.createReclaim)
+	mux.HandleFunc("GET /api/reclaim", s.reclaimStatus)
 	mux.HandleFunc("GET /api/images", s.images)
 	mux.HandleFunc("GET /api/deployments", s.deployments)
 	mux.HandleFunc("POST /api/deployments", s.deploy)
@@ -211,6 +215,17 @@ func (s *Server) deployments(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) deploy(w http.ResponseWriter, r *http.Request) {
+	s.buildMu.Lock()
+	defer s.buildMu.Unlock()
+
+	if active, err := s.reclaimActive(r.Context()); err != nil {
+		s.fail(w, http.StatusBadGateway, err)
+		return
+	} else if active {
+		s.fail(w, http.StatusConflict, errors.New("wait for disk reclamation before starting demos"))
+		return
+	}
+
 	if r.Header.Get("Content-Type") != "application/json" {
 		s.fail(w, http.StatusUnsupportedMediaType, errors.New("Content-Type must be application/json"))
 		return

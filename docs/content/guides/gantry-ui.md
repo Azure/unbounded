@@ -125,6 +125,74 @@ coverage can decrease. Peer/origin traffic rates are node-wide, may include
 other images and retries, and are not used to calculate byte percentages.
 Per-layer peer/origin attribution is not currently recorded.
 
+## Generate Images
+
+**Generate & pull** creates random payload layers and publishes them before
+starting a digest-pinned demo DaemonSet. **Enable ACR streaming** is unchecked
+by default, preserving ordinary OCI generation.
+
+Check it to request per-image ACR Artifact Streaming conversion. The build
+shows conversion progress and waits for success, then verifies the artifact's
+source digest, OverlayBD annotations, and Linux architecture before tagging
+and deploying the streaming digest. Conversion failures fail the build without
+starting a workload or falling back to OCI.
+
+Streaming generation requires a Premium ACR, a builder identity with repository
+pull/push permissions (such as `AcrPush` on registries using legacy RBAC), and
+workers already configured for Gantry Artifact Streaming. It does not enable
+streaming on workers or change registry-wide/repository auto-conversion policy.
+The original OCI image remains under the build's `-oci` tag; the build tag
+identifies the verified streaming artifact. Conversion adds registry storage
+and service processing. The existing build deadline bounds the entire process.
+
+## Reclaim Disk Space
+
+Disk reclamation is disabled unless `--reclaimer-image` and
+`--reclaimer-service-account` are configured. Use the same digest-pinned
+dashboard image and a dedicated `gantry-reclaimer` identity. The optional
+[reclaimer RBAC](../../../deploy/gantry-ui/reclaimer-rbac.yaml) targets the
+`gantry-demo` namespace and the `gantry-ui` dashboard service account; adjust
+both deliberately for other installations.
+
+**Reclaim disk space** requires typing `DELETE ALL DEMOS`. It deletes all
+validated dashboard-managed demo DaemonSets in the dashboard namespace,
+waits for their owned Pods to terminate without force deletion, and prunes
+unused images on every Linux Flex worker in the configured pool and
+architecture. Other namespaces and non-dashboard DaemonSets are not deleted.
+Registry images are never removed. Demo generation and deployment are blocked
+while reclamation runs, and an active image build prevents reclamation.
+
+The durable coordinator Job survives browser reloads and dashboard restarts.
+The UI shows worker progress, failures, and observed filesystem bytes
+recovered. A failed operation is not reported as full reclamation. Retry
+removes the previous finished coordinator with background garbage collection.
+Its finished worker Jobs remain fenced to the old coordinator UID while
+Kubernetes collects them. If coordinator removal is still pending, the dialog
+automatically retries for up to two minutes; closing it cancels further retries.
+
+Use **Dismiss** to hide the status panel without stopping cleanup. It stays
+hidden across reloads for that operation; **Show cleanup status** restores
+it. A new cleanup operation shows its status automatically.
+
+Node cleanup Jobs run as root with privileged access to the containerd
+socket and a read-only mount of Gantry's data directory. They have no
+Kubernetes service-account token. The coordinator itself is unprivileged,
+but its ability to create these Jobs is powerful: use a dedicated trusted
+demo namespace, restrict who can access the loopback dashboard/tunnel, and
+do not grant this identity to unrelated workloads.
+
+All container references, pinned images, sandbox images, and uncertain
+runtime leases remain protected. Removing an unused image record does not
+guarantee immediate removal of shared layers or leased data. The operation
+is not a disk wipe, does not remove live containers, and does not restart
+containerd or snapshotters.
+
+Pod deletion can precede containerd's removal of stopped container records.
+Workers retry pruning the deleted demos' images until those runtime references
+clear, within the worker's two-minute cleanup deadline. A remaining protected
+demo image is reported as a failure, not successful reclamation. Unrelated
+container references remain protected without waiting for their removal.
+
 ## Agent Compatibility and Collection
 
 The **Node storage** tab shows a filesystem-usage heatmap for the workers.

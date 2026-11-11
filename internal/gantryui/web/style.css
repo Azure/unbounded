@@ -53,6 +53,7 @@ h3 { font-size: 13px; margin: 25px 0 14px; }
 .generate-fields label { font-size: 12px; color: #a9c7df; }
 .generate-fields input { display: block; width: 100%; margin-top: 10px; padding: 13px; background: #061827; color: #e4efff; border: 1px solid #2b536e; border-radius: 8px; font-size: 22px; }
 .generate-summary { padding: 16px; margin-bottom: 16px; border: 1px solid #226577; border-radius: 9px; background: #07333f; font-size: 13px; line-height: 1.8; }
+.generate-streaming { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; font-size: 13px; }
 .generate-dialog form > .generate-button { width: 100%; padding: 13px; margin-top: 12px; }
 .generation-error { font-size: 12px; line-height: 1.6; color: #ffb4c3; }
 .build-status { margin-bottom: 22px; padding: 18px 20px; border-color: #246475; }
@@ -60,6 +61,7 @@ h3 { font-size: 13px; margin: 25px 0 14px; }
 .build-status p { margin-bottom: 8px; overflow-wrap: anywhere; }
 .build-status .progress-track { margin-top: 12px; max-width: 500px; }
 .build-status.failed { border-color: #a14d62; }
+.reclaim-heading { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; }
 .registry-label { border: 1px solid #224562; border-radius: 8px; padding: 12px 10px; margin: 16px 0; font-size: 12px; color: #bfd9f3; overflow-wrap: anywhere; background: #0b2137; }
 .search span { position: absolute; height: 1px; overflow: hidden; width: 1px; }
 .search input { width: 100%; padding: 12px; border: 1px solid #23425d; border-radius: 7px; background: #071c30; color: #e4efff; outline: none; font-size: 12px; }
@@ -163,6 +165,9 @@ main { margin-left: 267px; padding: 26px 26px 30px; }
 .storage-cards > div { background: #0c253b; border: 1px solid #20445f; padding: 14px; border-radius: 8px; }
 .storage-cards span { display: block; color: #84a8c7; font-size: 11px; margin-bottom: 8px; }
 .storage-cards strong { color: #e4f6ff; font-size: 22px; }
+.reclaim-submit { background: #7d263c; border-color: #b74660; color: #fff; margin-top: 16px; }
+.reclaim-workers { display: grid; grid-template-columns: repeat(auto-fill, minmax(65px, 1fr)); gap: 4px; max-height: 180px; overflow: auto; margin: 12px 0; }
+.reclaim-workers span { border: 1px solid var(--phase, #607d9d); border-radius: 3px; padding: 3px; font-size: 10px; text-align: center; }
 .progress-track > span { display: block; height: 100%; border-radius: 5px; background: linear-gradient(90deg, #00d5b9, #25a8f3); transition: width .6s; }
 .node-name { font-size: 9px; margin: 9px 0 15px; color: #557d9b; overflow-wrap: anywhere; }
 .table-scroll { overflow-x: auto; }
