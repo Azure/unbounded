@@ -44,7 +44,7 @@ RUN apt-get update && \
     ok=false && \
     for attempt in 1 2 3 4 5; do \
       if apt-get install -y --no-install-recommends \
-           ca-certificates cpio curl efibootmgr kmod xz-utils; then \
+           ca-certificates cpio curl efibootmgr iproute2 kmod xz-utils; then \
         ok=true; break; \
       fi; \
       echo "apt-get install failed (attempt $attempt/5), retrying in 30s..."; \
@@ -89,11 +89,21 @@ COPY images/netboot/assets/init /tmp/initrd-root/init
 # The installer copies whole driver directories, then adds any module they
 # depend on from other directories, such as net/psample and net/tls for
 # mlx5_core. modules.dep lists the full dependency closure of each module, so
-# one pass is enough.
+# one pass is enough. Bonding lives under drivers/net; 8021q (VLAN) is copied
+# when the kernel builds it as a module, and its net/802 and net/llc
+# dependencies come from the modules.dep pass. iproute2's ip is installed at
+# /unbounded/bin/ip because the initrd's ip may lack bond and VLAN support.
 RUN chmod 755 /tmp/initrd-root/init && \
     mkdir -p /tmp/initrd-root/usr/bin /tmp/initrd-root/usr/lib && \
     cp /usr/bin/efibootmgr /usr/bin/curl /tmp/initrd-root/usr/bin/ && \
     for lib in $(ldd /usr/bin/efibootmgr /usr/bin/curl | awk '/=>/{print $3}'); do \
+        mkdir -p "/tmp/initrd-root$(dirname "$lib")" && \
+        cp "$lib" "/tmp/initrd-root${lib}"; \
+    done && \
+    IP_BIN=$(command -v ip) && \
+    mkdir -p /tmp/initrd-root/unbounded/bin && \
+    cp "$IP_BIN" /tmp/initrd-root/unbounded/bin/ip && \
+    for lib in $(ldd "$IP_BIN" | awk '/=>/{print $3}'); do \
         mkdir -p "/tmp/initrd-root$(dirname "$lib")" && \
         cp "$lib" "/tmp/initrd-root${lib}"; \
     done && \
@@ -104,6 +114,11 @@ RUN chmod 755 /tmp/initrd-root/init && \
     KMOD="/tmp/initrd-root/lib/modules/${KVER}" && \
     for dir in drivers/net drivers/scsi drivers/ata drivers/nvme \
                drivers/virtio drivers/block fs crypto lib; do \
+        mkdir -p "${KMOD}/kernel/${dir}" && \
+        cp -a "/lib/modules/${KVER}/kernel/${dir}/." "${KMOD}/kernel/${dir}/" || exit 1; \
+    done && \
+    for dir in net/8021q; do \
+        [ -d "/lib/modules/${KVER}/kernel/${dir}" ] || continue; \
         mkdir -p "${KMOD}/kernel/${dir}" && \
         cp -a "/lib/modules/${KVER}/kernel/${dir}/." "${KMOD}/kernel/${dir}/" || exit 1; \
     done && \
@@ -128,10 +143,10 @@ RUN mkdir -p /disk/grub /disk/cloud-init && \
 	if [ "${TARGETARCH}" = "amd64" ]; then \
 		cp /artifacts/shimx64.efi /artifacts/grubx64.efi /disk/ && \
 		cp /artifacts/shimx64.efi /disk/bootx64.efi && \
-		printf '%s\n' "dhcpBootImageName: shimx64.efi" "httpBootPath: bootx64.efi" "mediaFormat: unbounded-uefi-v1" > /disk/metadata.yaml; \
+		printf '%s\n' "dhcpBootImageName: shimx64.efi" "httpBootPath: bootx64.efi" "mediaFormat: unbounded-uefi-v1" "localInstaller: unbounded-local-installer-v1" > /disk/metadata.yaml; \
 	elif [ "${TARGETARCH}" = "arm64" ]; then \
 		cp /artifacts/shimaa64.efi /artifacts/grubaa64.efi /disk/ && \
-		printf '%s\n' "dhcpBootImageName: shimaa64.efi" "httpBootPath: shimaa64.efi" "mediaFormat: unbounded-uefi-v1" > /disk/metadata.yaml; \
+		printf '%s\n' "dhcpBootImageName: shimaa64.efi" "httpBootPath: shimaa64.efi" "mediaFormat: unbounded-uefi-v1" "localInstaller: unbounded-local-installer-v1" > /disk/metadata.yaml; \
 	fi
 
 COPY images/netboot/assets/grub.cfg.tmpl /disk/grub/grub.cfg.tmpl
