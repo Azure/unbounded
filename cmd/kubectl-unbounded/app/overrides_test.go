@@ -485,12 +485,14 @@ data:
 
 // TestOverridesValidateShippedExample checks the exact file the repository
 // ships, since its own comments instruct the reader to run this command on it.
+// The file is tracked, so a missing file means it moved and this path must
+// follow.
 func TestOverridesValidateShippedExample(t *testing.T) {
 	path := filepath.Join("..", "..", "..",
 		"deploy", "unbounded-operator", "examples", "component-overrides.example.yaml")
 
 	if _, err := os.Stat(path); err != nil {
-		t.Skipf("example not present: %v", err)
+		t.Fatalf("shipped example not found: %v", err)
 	}
 
 	var out bytes.Buffer

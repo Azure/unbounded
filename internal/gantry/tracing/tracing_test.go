@@ -318,14 +318,15 @@ func TestResourceMergeKeepsServiceName(t *testing.T) {
 }
 
 // TestResourceMergeRejectsMismatchedSchema documents WHY the override above is
-// schemaless. If this ever stops failing, the SDK changed its default schema
-// handling and the schemaless workaround can be revisited.
+// schemaless. It fails once the merge stops failing: the SDK changed its
+// default schema handling, and the schemaless workaround can be revisited. A
+// skip would hide that change in a passing run.
 func TestResourceMergeRejectsMismatchedSchema(t *testing.T) {
 	_, err := sdkresource.Merge(
 		sdkresource.Default(),
 		sdkresource.NewWithAttributes(semconv.SchemaURL, semconv.ServiceName(defaultServiceName)),
 	)
 	if err == nil {
-		t.Skip("SDK default resource no longer conflicts with the v1.26.0 schema; revisit the schemaless override")
+		t.Fatal("SDK default resource no longer conflicts with the v1.26.0 schema; revisit the schemaless override")
 	}
 }

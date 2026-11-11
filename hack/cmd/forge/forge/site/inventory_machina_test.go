@@ -51,8 +51,6 @@ func TestMachineHost(t *testing.T) {
 }
 
 func TestWriteInventoryAsMachina(t *testing.T) {
-	t.Skip()
-
 	t.Parallel()
 
 	inv := &azuredev.Inventory{
