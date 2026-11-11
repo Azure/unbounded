@@ -1463,17 +1463,26 @@ fn orphaned_written_pages_are_collected() {
 #[test]
 fn a_removed_cache_releases_its_written_pages() {
     let mut c = Cluster::new(38, 3, Some(writes(2)));
+    c.settings(|s| s.orphan_after = Duration::from_secs(60));
     let body = bytes(38, 200_000);
-    assert_eq!(c.put(0, OBJECT, &body, "").status, 201);
+    let manual = "Racer-Upload: manual\r\n";
+    assert_eq!(c.put(0, OBJECT, &body, manual).status, 201);
     assert!(c.written() > 0);
     assert!(c.sessions() > 0);
     let env = c.env.clone();
     c.harness.cache_recreate(&env);
     c.configure();
+    c.settings(|s| s.orphan_after = Duration::from_secs(60));
     c.wait(Duration::from_secs(5));
     // Still within the grace period.
     assert!(c.written() > 0);
+    // Past the grace, but not uploaded and still held: kept until the
+    // orphan age, so a republish that briefly omits a cache loses nothing.
     c.wait(crate::write::gc::REMOVED_CACHE_GRACE);
+    c.wait(Duration::from_secs(1));
+    assert!(c.written() > 0);
+    assert!(c.sessions() > 0);
+    c.wait(Duration::from_secs(30));
     c.wait(Duration::from_secs(1));
     assert_eq!(c.written(), 0);
     assert_eq!(c.sessions(), 0);

@@ -1246,6 +1246,8 @@ impl World {
         self.harness.retire(&self.env, index, true);
         self.harness.publish();
         self.harness.settle();
+        // The holder grace runs before repair starts.
+        self.wait(HOLDER_GRACE);
         self.wait(Duration::from_secs(5));
         for object in self.live.keys().copied().collect::<Vec<_>>() {
             let reader = self.pick(self.harness.nodes.len());
