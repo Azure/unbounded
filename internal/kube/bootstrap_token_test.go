@@ -52,6 +52,10 @@ func TestValidBootstrapTokenSecretForSite(t *testing.T) {
 	emptyID.Data["token-id"] = nil
 	emptySecret := valid.DeepCopy()
 	emptySecret.Data["token-secret"] = []byte(" ")
+	allocation := valid.DeepCopy()
+	allocation.Labels["unbounded-cloud.io/allocation-uid"] = "alloc-uid"
+	allocationEmptyLabel := valid.DeepCopy()
+	allocationEmptyLabel.Labels["unbounded-cloud.io/allocation-uid"] = ""
 
 	tests := map[string]struct {
 		secret *corev1.Secret
@@ -67,7 +71,9 @@ func TestValidBootstrapTokenSecretForSite(t *testing.T) {
 			secret: emptySecret,
 			site:   "site-a",
 		},
-		"nil": {site: "site-a"},
+		"nil":                          {site: "site-a"},
+		"allocation token":             {secret: allocation, site: "site-a"},
+		"allocation label empty value": {secret: allocationEmptyLabel, site: "site-a"},
 	}
 
 	for name, tt := range tests {
@@ -75,6 +81,38 @@ func TestValidBootstrapTokenSecretForSite(t *testing.T) {
 			require.Equal(t, tt.want, ValidBootstrapTokenSecretForSite(tt.secret, tt.site, now))
 		})
 	}
+}
+
+func TestGetBootstrapTokenForSiteIgnoresAllocationTokens(t *testing.T) {
+	ctx := context.Background()
+	allocation := bootstrapSecret("alloc1", "allocsecret00000", "site-a", time.Now().Add(2*time.Hour))
+	allocation.Labels["unbounded-cloud.io/allocation-uid"] = "alloc-uid"
+	client := fake.NewClientset(
+		bootstrapSecret("site12", "sitesecret000000", "site-a", time.Now().Add(time.Hour)),
+		allocation,
+	)
+
+	token, err := GetBootstrapTokenForSite(ctx, client, "site-a")
+	require.NoError(t, err)
+	require.Equal(t, "site12", token.ID)
+
+	onlyAllocation := fake.NewClientset(allocation.DeepCopy())
+	_, err = GetBootstrapTokenForSite(ctx, onlyAllocation, "site-a")
+	require.ErrorIs(t, err, ErrBootstrapTokenNotFound)
+}
+
+func TestBootstrapTokenSecretData(t *testing.T) {
+	expiresAt := time.Date(2026, 4, 28, 12, 0, 0, 0, time.UTC)
+
+	data := BootstrapTokenSecretData(&BootstrapToken{ID: "abc123", Secret: "0123456789abcdef", ExpiresAt: expiresAt})
+	require.Equal(t, map[string][]byte{
+		"auth-extra-groups":              []byte("system:bootstrappers:unbounded-agent-daemons"),
+		"expiration":                     []byte("2026-04-28T12:00:00Z"),
+		"token-id":                       []byte("abc123"),
+		"token-secret":                   []byte("0123456789abcdef"),
+		"usage-bootstrap-authentication": []byte("true"),
+		"usage-bootstrap-signing":        []byte("true"),
+	}, data)
 }
 
 func TestBootstrapTokenExpirationAcceptsTimezoneLessUTC(t *testing.T) {

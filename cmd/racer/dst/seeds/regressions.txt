@@ -1,0 +1,2 @@
+# Shrunk failing choice streams, replayed by `make racer-dst` after ci.txt.
+# Add the `words=` line the runner prints for a failure here once it is fixed.

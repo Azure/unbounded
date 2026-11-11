@@ -1824,7 +1824,7 @@ mod tests {
                 .is_pending()
         );
         assert_eq!(paths.queued_searches(), 2);
-        // Cancelling the head wakes the next waiter.
+        // Canceling the head wakes the next waiter.
         drop(head);
         assert_eq!(paths.queued_searches(), 1);
         assert_eq!(next_wakes.load(std::sync::atomic::Ordering::SeqCst), 1);

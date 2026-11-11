@@ -6,7 +6,7 @@
 use crate::{Alignment, Error, Extent, MAX_SEGMENTS, Result, SegmentGeometry};
 use std::{
     cell::{Cell, RefCell},
-    collections::{BTreeSet, HashSet},
+    collections::BTreeSet,
     rc::Rc,
 };
 
@@ -48,10 +48,6 @@ pub struct SegmentSnapshot {
 
     /// Aligned occupied prefix, including record padding.
     pub used_bytes: u64,
-
-    /// Caller-owned checkpoint hints: record offsets and retention deadlines.
-    /// Allocation ignores these; the caller must restore its own eviction vetoes.
-    pub retained_records: Vec<(u64, std::time::SystemTime)>,
 }
 
 /// Unique worker-local lease that prevents reuse until its completion owner drops.
@@ -154,12 +150,26 @@ struct Slot {
 /// ```
 #[must_use = "keep the guard alive while the table must remain frozen"]
 #[derive(Debug)]
-pub struct FreezeGuard(Rc<Cell<bool>>);
+pub struct FreezeGuard {
+    frozen: Rc<Cell<bool>>,
+    appends: Rc<Cell<bool>>,
+}
+
+impl FreezeGuard {
+    /// Allow appends again while eviction, recycling, and restore stay frozen.
+    /// Appends only reserve free slots or the unused tail of the open
+    /// segment, so a snapshot taken before this call still describes every
+    /// byte it maps: no mapped extent can be recycled and overwritten.
+    pub fn thaw_appends(&self) {
+        self.appends.set(false);
+    }
+}
 
 impl Drop for FreezeGuard {
     /// Release mutation exclusion even if the table has already been dropped.
     fn drop(&mut self) {
-        self.0.set(false);
+        self.frozen.set(false);
+        self.appends.set(false);
     }
 }
 
@@ -180,6 +190,9 @@ pub struct Segments {
 
     frozen: Rc<Cell<bool>>,
 
+    /// Appends are blocked by a fresh freeze until the guard thaws them.
+    appends_frozen: Rc<Cell<bool>>,
+
     table: TableIdentity,
 
     restore_epoch: Cell<u64>,
@@ -191,6 +204,9 @@ pub struct Segments {
     evicting: Cell<usize>,
 
     usage: RefCell<Vec<(u64, u64)>>,
+
+    /// Bumped by every mutable borrow of `slots`; see [`Segments::generation`].
+    generation: Cell<u64>,
 }
 
 impl Segments {
@@ -201,13 +217,28 @@ impl Segments {
             geometry: Cell::new(None),
             slots: RefCell::new(Vec::new()),
             frozen: Rc::new(Cell::new(false)),
+            appends_frozen: Rc::new(Cell::new(false)),
             table: TableIdentity::new(),
             restore_epoch: Cell::new(0),
             open: Cell::new(None),
             free: RefCell::new(BTreeSet::new()),
             evicting: Cell::new(0),
             usage: RefCell::new(Vec::new()),
+            generation: Cell::new(0),
         }
+    }
+
+    /// Mutable slot table. Every caller counts as a change to
+    /// [`Self::snapshot`], so checkpoint skipping cannot miss one.
+    fn slots_mut(&self) -> std::cell::RefMut<'_, Vec<Slot>> {
+        self.generation.set(self.generation.get().wrapping_add(1));
+        self.slots.borrow_mut()
+    }
+
+    /// Mutation generation of the slot table: equal values mean
+    /// [`Self::snapshot`] is unchanged.
+    pub fn generation(&self) -> u64 {
+        self.generation.get()
     }
 
     /// Fixed size of a physical segment.
@@ -223,7 +254,7 @@ impl Segments {
     /// Group consecutive slots for storage metrics. Counts must cover every slot.
     /// Call at startup; regrouping scans the table once.
     pub fn configure_usage_groups(&self, counts: &[usize]) -> Result<()> {
-        let mut slots = self.slots.borrow_mut();
+        let mut slots = self.slots_mut();
         if !self.is_configured()
             || counts.is_empty()
             || counts.contains(&0)
@@ -277,13 +308,14 @@ impl Segments {
         self.table.clone()
     }
 
-    /// Recovery revision used to invalidate eviction cursor and recent-read state.
-    pub(crate) fn restore_epoch(&self) -> u64 {
+    /// Recovery revision used to invalidate an eviction cursor.
+    #[doc(hidden)]
+    pub fn restore_epoch(&self) -> u64 {
         self.restore_epoch.get()
     }
 
     /// Install an entirely free bounded table exactly once, unless frozen.
-    #[cfg(any(test, feature = "simulation"))]
+    #[doc(hidden)]
     pub fn configure(&self, capacity: u64, count: usize, alignment: Alignment) -> Result<()> {
         self.configure_table(capacity, count, alignment)
     }
@@ -304,7 +336,7 @@ impl Segments {
         let geometry = SegmentGeometry::new(capacity, self.segment_bytes, count as u64, alignment)
             .map_err(|_| Error::InvalidConfiguration)?;
         self.geometry.set(Some(geometry));
-        *self.slots.borrow_mut() = (0..count)
+        *self.slots_mut() = (0..count)
             .map(|id| Slot {
                 usage_group: 0,
                 image: SegmentSnapshot {
@@ -312,7 +344,6 @@ impl Segments {
                     generation: Generation(1),
                     state: SegmentState::Free,
                     used_bytes: 0,
-                    retained_records: Vec::new(),
                 },
                 leases: Rc::new(Cell::new(0)),
             })
@@ -327,7 +358,7 @@ impl Segments {
     /// before returning Busy, allowing reclamation to make a retry possible.
     /// Reservation does not write or initialize disk bytes; see [`SegmentLease`].
     pub fn append(&self, length: usize) -> Result<(SegmentLease, Extent)> {
-        if self.frozen.get() {
+        if self.appends_frozen.get() {
             return Err(Error::Busy);
         }
         let alignment = self.geometry().ok_or(Error::Unavailable)?.alignment();
@@ -337,7 +368,7 @@ impl Segments {
         {
             return Err(Error::InvalidConfiguration);
         }
-        let mut slots = self.slots.borrow_mut();
+        let mut slots = self.slots_mut();
         let previous_open = self.open.get();
         let usable_open = previous_open.filter(|&position| {
             self.segment_bytes - slots[position].image.used_bytes >= length as u64
@@ -389,6 +420,17 @@ impl Segments {
         Ok((lease, extent))
     }
 
+    /// Seal the open segment, if any, so reclaim may evict it. Used when
+    /// every reclaimable record lives in the open tail. Returns whether a
+    /// segment was sealed.
+    pub fn seal_open(&self) -> bool {
+        let Some(position) = self.open.take() else {
+            return false;
+        };
+        self.slots_mut()[position].image.state = SegmentState::Sealed;
+        true
+    }
+
     /// Capture a checked prefix and increment its counter before publishing a lease.
     fn take_lease(&self, slot: &Slot, used_bytes: u64) -> Result<SegmentLease> {
         let start = slot
@@ -432,7 +474,7 @@ impl Segments {
     }
 
     /// Stop new leases for a sealed slot; repeating eviction is harmless.
-    #[cfg(any(test, feature = "simulation"))]
+    #[doc(hidden)]
     pub fn begin_evict(&self, id: SegmentId) -> Result<()> {
         self.begin_eviction(id)
     }
@@ -442,7 +484,7 @@ impl Segments {
         if self.frozen.get() {
             return Err(Error::Busy);
         }
-        let mut slots = self.slots.borrow_mut();
+        let mut slots = self.slots_mut();
         let slot = slots.get_mut(Self::position(id)?).ok_or(Error::Corrupt)?;
         if !matches!(
             slot.image.state,
@@ -458,7 +500,7 @@ impl Segments {
     }
 
     /// Reuse only an evicting, unleased slot, incrementing generation without wrap.
-    #[cfg(any(test, feature = "simulation"))]
+    #[doc(hidden)]
     pub fn recycle(&self, id: SegmentId) -> Result<()> {
         self.recycle_evicted(id)
     }
@@ -468,7 +510,7 @@ impl Segments {
         if self.frozen.get() {
             return Err(Error::Busy);
         }
-        let mut slots = self.slots.borrow_mut();
+        let mut slots = self.slots_mut();
         let slot = slots.get_mut(Self::position(id)?).ok_or(Error::Corrupt)?;
         if slot.image.state != SegmentState::Evicting || slot.leases.get() != 0 {
             return Err(Error::Busy);
@@ -497,13 +539,18 @@ impl Segments {
             .collect()
     }
 
-    /// Block allocation, eviction, recycling, and restore until the guard drops.
-    /// Reads and snapshots remain available; only one guard may exist at a time.
+    /// Block allocation, eviction, recycling, and restore until the guard drops
+    /// (allocation until [`FreezeGuard::thaw_appends`]). Reads and snapshots
+    /// remain available; only one guard may exist at a time.
     pub fn freeze(&self) -> Result<FreezeGuard> {
         if self.frozen.replace(true) {
             return Err(Error::Busy);
         }
-        Ok(FreezeGuard(self.frozen.clone()))
+        self.appends_frozen.set(true);
+        Ok(FreezeGuard {
+            frozen: self.frozen.clone(),
+            appends: self.appends_frozen.clone(),
+        })
     }
 
     /// Check the entire image and current restore eligibility without mutation.
@@ -581,7 +628,7 @@ impl Segments {
     /// Frozen tables and outstanding leases return Busy without changing state.
     pub fn restore(&self, images: Vec<SegmentSnapshot>) -> Result<()> {
         let epoch = self.validate_restore_epoch(&images)?;
-        let mut slots = self.slots.borrow_mut();
+        let mut slots = self.slots_mut();
         self.open.set(None);
         self.free.borrow_mut().clear();
         self.evicting.set(0);
@@ -590,7 +637,6 @@ impl Segments {
             *used = 0;
         }
         for (slot, mut image) in slots.iter_mut().zip(images) {
-            image.retained_records.clear();
             image.generation = Self::restored_generation(&image, &slot.image)?;
             if image.state == SegmentState::Open {
                 image.state = SegmentState::Sealed;
@@ -650,6 +696,17 @@ impl Segments {
         lease.validate_extent(extent)
     }
 
+    /// Number of slots in eviction, waiting for leases to drain.
+    pub fn evicting_count(&self) -> usize {
+        self.evicting.get()
+    }
+
+    /// Whether eviction and recycling are frozen by a live [`FreezeGuard`],
+    /// so no reclaim can add a free slot until the guard drops.
+    pub fn reuse_frozen(&self) -> bool {
+        self.frozen.get()
+    }
+
     /// Number of immediately appendable slots, excluding pending eviction.
     pub fn free_count(&self) -> usize {
         self.free.borrow().len()
@@ -687,418 +744,6 @@ impl TableIdentity {
     }
 }
 
-/// Application-owned mappings; removal must compare current entries first.
-/// Callbacks own metadata and version side effects and must never exceed budget.
-pub trait SegmentEntries {
-    /// Hard retention veto, including index-only removal and eviction in progress.
-    fn can_reclaim(&self, _segment: SegmentId) -> bool {
-        true
-    }
-
-    /// Active unpublished writes must not lose publication authority. Read
-    /// leases still permit eviction and independently fence physical reuse.
-    fn can_evict(&self, _segment: SegmentId) -> bool {
-        true
-    }
-
-    /// Remove at most budget current mappings, returning the number removed.
-    fn remove_bounded(&self, segment: SegmentId, budget: usize) -> usize;
-
-    /// Report whether any current mapping still refers to this segment.
-    fn is_empty(&self, segment: SegmentId) -> bool;
-}
-
-#[cfg(feature = "simulation")]
-/// Payload-free [`SegmentEntries`] for simulation: page to segment mappings,
-/// page lengths, read holds, and active writes, but no data or metadata.
-///
-/// Removal visits a segment's mappings in publication order, as the catalog
-/// index does, so [`SegmentClock`] makes the same eviction decisions when the
-/// caller supplies the same scores. Removed pages are recorded for the caller
-/// to drain with [`PhantomEntries::take_evicted`].
-pub struct PhantomEntries<K, H = std::collections::hash_map::RandomState> {
-    index: RefCell<crate::index::PageIndex<K, u32, H>>,
-
-    held: RefCell<HashSet<SegmentId>>,
-
-    writing: RefCell<HashSet<SegmentId>>,
-
-    evicted: RefCell<Vec<(K, u32)>>,
-}
-
-#[cfg(feature = "simulation")]
-impl<K: Eq + std::hash::Hash + Clone, H: std::hash::BuildHasher + Default> Default
-    for PhantomEntries<K, H>
-{
-    fn default() -> Self {
-        Self {
-            index: RefCell::new(crate::index::PageIndex::default()),
-            held: RefCell::new(HashSet::new()),
-            writing: RefCell::new(HashSet::new()),
-            evicted: RefCell::new(Vec::new()),
-        }
-    }
-}
-
-#[cfg(feature = "simulation")]
-impl<K: Eq + std::hash::Hash + Clone, H: std::hash::BuildHasher + Default> PhantomEntries<K, H> {
-    /// Publish `page` with `bytes` of payload in `segment`, replacing any
-    /// older mapping. Returns the replaced length.
-    ///
-    /// # Errors
-    /// Returns [`Error::Unavailable`] when publication ages are exhausted.
-    pub fn publish(&self, page: K, bytes: u32, segment: SegmentId) -> Result<Option<u32>> {
-        self.index
-            .borrow_mut()
-            .insert(page, bytes, segment)
-            .map_err(|_| Error::Unavailable)
-    }
-
-    /// Remove one mapping. Returns its length.
-    pub fn remove(&self, page: &K) -> Option<u32> {
-        self.index.borrow_mut().remove(page)
-    }
-
-    /// Length of a live mapping.
-    pub fn get(&self, page: &K) -> Option<u32> {
-        self.index.borrow().get(page).copied()
-    }
-
-    /// Number of live mappings.
-    pub fn len(&self) -> usize {
-        self.index.borrow().len()
-    }
-
-    /// Whether there are no live mappings.
-    pub fn is_empty(&self) -> bool {
-        self.index.borrow().is_empty()
-    }
-
-    /// Set or clear a read hold, which vetoes reclamation of the segment.
-    pub fn set_held(&self, segment: SegmentId, held: bool) {
-        let mut set = self.held.borrow_mut();
-        if held {
-            set.insert(segment);
-        } else {
-            set.remove(&segment);
-        }
-    }
-
-    /// Set or clear an active unpublished write, which vetoes eviction.
-    pub fn set_writing(&self, segment: SegmentId, writing: bool) {
-        let mut set = self.writing.borrow_mut();
-        if writing {
-            set.insert(segment);
-        } else {
-            set.remove(&segment);
-        }
-    }
-
-    /// Sum `value(page, bytes)` over at most `budget` mappings of `segment`,
-    /// charging `unseen` per mapping beyond the budget, like the catalog.
-    pub fn segment_score(
-        &self,
-        segment: SegmentId,
-        budget: usize,
-        unseen: u64,
-        mut value: impl FnMut(&K, u32) -> u64,
-    ) -> u64 {
-        self.index
-            .borrow()
-            .segment_score(segment, budget, unseen, |page, bytes| value(page, *bytes))
-    }
-
-    /// Drain pages removed by reclamation, in removal order.
-    pub fn take_evicted(&self) -> Vec<(K, u32)> {
-        std::mem::take(&mut self.evicted.borrow_mut())
-    }
-}
-
-#[cfg(feature = "simulation")]
-impl<K: Eq + std::hash::Hash + Clone, H: std::hash::BuildHasher + Default> SegmentEntries
-    for PhantomEntries<K, H>
-{
-    fn can_reclaim(&self, segment: SegmentId) -> bool {
-        !self.held.borrow().contains(&segment)
-    }
-
-    fn can_evict(&self, segment: SegmentId) -> bool {
-        !self.writing.borrow().contains(&segment) && self.can_reclaim(segment)
-    }
-
-    fn remove_bounded(&self, segment: SegmentId, budget: usize) -> usize {
-        if !self.can_evict(segment) {
-            return 0;
-        }
-        let pages: Vec<K> = self
-            .index
-            .borrow()
-            .segment(segment, budget)
-            .map(|(page, _)| page.clone())
-            .collect();
-        let mut index = self.index.borrow_mut();
-        let mut evicted = self.evicted.borrow_mut();
-        for page in &pages {
-            let bytes = index.remove(page).expect("indexed page");
-            evicted.push((page.clone(), bytes));
-        }
-        pages.len()
-    }
-
-    fn is_empty(&self, segment: SegmentId) -> bool {
-        self.index.borrow().segment_empty(segment)
-    }
-}
-
-/// One worker-local cursor and recent-read set for index and physical reclamation.
-#[repr(align(64))]
-pub struct SegmentClock {
-    segments: Rc<Segments>,
-
-    hand: Cell<usize>,
-
-    recent: RefCell<HashSet<SegmentId>>,
-
-    restore_epoch: Cell<u64>,
-}
-
-impl SegmentClock {
-    /// Attach bounded reclamation to one table without cloning its authority.
-    pub fn new(segments: Rc<Segments>) -> Self {
-        let epoch = segments.restore_epoch();
-        Self {
-            segments,
-            hand: Cell::new(0),
-            recent: RefCell::new(HashSet::new()),
-            restore_epoch: Cell::new(epoch),
-        }
-    }
-
-    /// Give live segments a second chance; ignore completions arriving after eviction.
-    pub fn mark_read(&self, segment: SegmentId) -> Result<()> {
-        self.sync_restore();
-        if !matches!(
-            self.segments.state(segment)?,
-            SegmentState::Open | SegmentState::Sealed
-        ) {
-            return Ok(());
-        }
-        self.recent.borrow_mut().insert(segment);
-        Ok(())
-    }
-
-    /// Clear transient eviction history after successful table recovery.
-    fn sync_restore(&self) {
-        let epoch = self.segments.restore_epoch();
-        if self.restore_epoch.replace(epoch) != epoch {
-            self.hand.set(0);
-            self.recent.borrow_mut().clear();
-        }
-    }
-
-    /// Advance one slot; callers only invoke this inside a nonempty bounded sweep.
-    fn next(&self, count: usize) -> SegmentId {
-        let hand = self.hand.get() % count;
-        self.hand.set((hand + 1) % count);
-        SegmentId(hand as u64)
-    }
-
-    /// Forget one mapping per candidate until admission succeeds, without changing
-    /// bytes or generations. At most two rotations, further capped by max_visits.
-    /// Freeze does not block caller-owned index mutation.
-    pub fn reclaim_index(
-        &self,
-        entries: &impl SegmentEntries,
-        max_visits: usize,
-        mut ready: impl FnMut() -> bool,
-    ) -> Result<()> {
-        self.sync_restore();
-        if ready() {
-            return Ok(());
-        }
-        let count = self.segments.count();
-        for _ in 0..count.saturating_mul(2).min(max_visits) {
-            let id = self.next(count);
-            if self.recent.borrow_mut().remove(&id) {
-                continue;
-            }
-            if !entries.can_reclaim(id) {
-                continue;
-            }
-            if entries.remove_bounded(id, 1) > 1 {
-                return Err(Error::InvalidConfiguration);
-            }
-            if ready() {
-                return Ok(());
-            }
-        }
-        Err(Error::Busy)
-    }
-
-    /// Visit at most min(slot count, max_visits, 64) slots, then rank eligible
-    /// candidates before entering eviction. Skipped slots count toward this limit.
-    /// Scores are soft preferences, not pins. The callback must itself bound
-    /// mapping inspection.
-    /// Existing eviction work sorts first so partial removals always make progress.
-    /// Logical heat is supplied by the caller, so recent disk completions do not
-    /// override value ranking.
-    /// For a nonzero reserve, success requires the reserve (capped at the slot
-    /// count), but does not guarantee that pending evictions have drained. Busy
-    /// means the bounded sweep could not meet the reserve or mutation was blocked.
-    /// Use [`Segments::free_count`] to check capacity and retry when more is needed.
-    /// A zero reserve is a no-op, not a drain request.
-    pub fn reclaim_scored(
-        &self,
-        entries: &impl SegmentEntries,
-        free_reserve: usize,
-        max_visits: usize,
-        max_entries: usize,
-        mut score: impl FnMut(SegmentId) -> u64,
-    ) -> Result<()> {
-        self.sync_restore();
-        if free_reserve == 0 {
-            return Ok(());
-        }
-        let count = self.segments.count();
-        if count == 0 {
-            return Err(Error::Unavailable);
-        }
-        let target = free_reserve.min(count);
-        if self.segments.free_count() >= target && self.segments.evicting.get() == 0 {
-            return Ok(());
-        }
-        let mut candidates = Vec::new();
-        for visit in 0..count.min(max_visits).min(64) {
-            let id = self.next(count);
-            let state = self.segments.state(id)?;
-            if !matches!(state, SegmentState::Sealed | SegmentState::Evicting) {
-                continue;
-            }
-            if !entries.can_reclaim(id) || (state == SegmentState::Sealed && !entries.can_evict(id))
-            {
-                continue;
-            }
-            // Rank before any begin_eviction or index side effects.
-            let value = if state == SegmentState::Evicting {
-                0
-            } else {
-                score(id)
-            };
-            candidates.push((state != SegmentState::Evicting, value, visit, id));
-        }
-        candidates.sort_by_key(|(sealed, value, visit, _)| (*sealed, *value, *visit));
-        let mut entries_left = max_entries;
-        for (_, _, _, id) in candidates {
-            let state = self.segments.state(id)?;
-            if !entries.can_reclaim(id) {
-                continue;
-            }
-            if state == SegmentState::Sealed
-                && (self
-                    .segments
-                    .free_count()
-                    .saturating_add(self.segments.evicting.get())
-                    >= target
-                    || !entries.can_evict(id))
-            {
-                continue;
-            }
-            if entries_left == 0 && !entries.is_empty(id) {
-                continue;
-            }
-            self.segments.begin_eviction(id)?;
-            self.recent.borrow_mut().remove(&id);
-            if entries_left != 0 && !entries.is_empty(id) {
-                let removed = entries.remove_bounded(id, entries_left);
-                if removed > entries_left {
-                    return Err(Error::InvalidConfiguration);
-                }
-                entries_left -= removed;
-            }
-            if !entries.is_empty(id) {
-                continue;
-            }
-            match self.segments.recycle_evicted(id) {
-                Ok(()) | Err(Error::Busy) => {}
-                Err(error) => return Err(error),
-            }
-        }
-        if self.segments.free_count() >= target {
-            Ok(())
-        } else {
-            Err(Error::Busy)
-        }
-    }
-
-    /// Reclaim a reserve with bounded visits and mapping removals, without compaction.
-    /// Busy leases keep segments Evicting until a later sweep. A zero reserve is a
-    /// no-op; a zero mapping budget can recycle empty but not populated segments.
-    /// For a nonzero reserve, success requires the reserve (capped at the slot
-    /// count), but does not guarantee that pending evictions have drained. Busy
-    /// means the bounded sweep could not meet the reserve or mutation was blocked.
-    /// Use [`Segments::free_count`] to check capacity and retry when more is needed.
-    pub fn reclaim(
-        &self,
-        entries: &impl SegmentEntries,
-        free_reserve: usize,
-        max_visits: usize,
-        max_entries: usize,
-    ) -> Result<()> {
-        self.sync_restore();
-        if free_reserve == 0 {
-            return Ok(());
-        }
-        let count = self.segments.count();
-        if count == 0 {
-            return Err(Error::Unavailable);
-        }
-        let target = free_reserve.min(count);
-        let mut free = self.segments.free_count();
-        let mut entries_left = max_entries;
-        for _ in 0..count.saturating_mul(2).min(max_visits) {
-            if free >= target {
-                return Ok(());
-            }
-            let id = self.next(count);
-            let state = self.segments.state(id)?;
-            if !matches!(state, SegmentState::Sealed | SegmentState::Evicting) {
-                continue;
-            }
-            if !entries.can_reclaim(id) || (state == SegmentState::Sealed && !entries.can_evict(id))
-            {
-                continue;
-            }
-            if self.recent.borrow_mut().remove(&id) {
-                continue;
-            }
-            if entries_left == 0 && !entries.is_empty(id) {
-                continue;
-            }
-            self.segments.begin_eviction(id)?;
-            if entries_left != 0 && !entries.is_empty(id) {
-                let removed = entries.remove_bounded(id, entries_left);
-                if removed > entries_left {
-                    return Err(Error::InvalidConfiguration);
-                }
-                entries_left -= removed;
-            }
-            if !entries.is_empty(id) {
-                continue;
-            }
-            match self.segments.recycle_evicted(id) {
-                Ok(()) => free += 1,
-                Err(Error::Busy) => {}
-                Err(e) => return Err(e),
-            }
-        }
-        if free >= target {
-            Ok(())
-        } else {
-            Err(Error::Busy)
-        }
-    }
-}
-
 /// Pure state-machine tests, including synthetic overflow and invalid recovery images.
 #[cfg(test)]
 mod tests {
@@ -1117,6 +762,31 @@ mod tests {
     }
 
     /// Lease ownership prevents reuse and old-generation acquisition.
+    #[test]
+    fn generation_moves_with_every_snapshot_change() {
+        let s = segments(1024, 2);
+        let start = s.generation();
+        let snapshot = s.snapshot();
+        let frozen = s.freeze().unwrap();
+        drop(frozen);
+        assert_eq!(s.generation(), start, "reads and freezes are not changes");
+        let mut last = start;
+        let mut changed = |s: &Segments, before: &[SegmentSnapshot]| {
+            assert_ne!(s.snapshot(), before);
+            assert_ne!(s.generation(), last);
+            last = s.generation();
+        };
+        let lease = s.append(1024).unwrap();
+        changed(&s, &snapshot);
+        let before = s.snapshot();
+        drop(lease);
+        s.begin_evict(SegmentId(0)).unwrap();
+        changed(&s, &before);
+        let before = s.snapshot();
+        s.recycle(SegmentId(0)).unwrap();
+        changed(&s, &before);
+    }
+
     #[test]
     fn no_reuse_before_lease_drop_and_no_aba() {
         let s = segments(1024, 2);
@@ -1352,6 +1022,27 @@ mod tests {
         drop(s.append(512).unwrap());
     }
 
+    /// Thawed appends reserve space while reuse stays frozen until the drop.
+    #[test]
+    fn freeze_guard_thaws_appends_but_not_reuse() {
+        let s = segments(1024, 2);
+        let frozen = s.freeze().unwrap();
+        assert!(matches!(s.append(512), Err(Error::Busy)));
+        frozen.thaw_appends();
+        let (lease, _) = s.append(512).unwrap();
+        drop(lease);
+        assert!(matches!(s.freeze(), Err(Error::Busy)));
+        assert_eq!(s.restore(s.snapshot()), Err(Error::Busy));
+        assert_eq!(s.begin_evict(SegmentId(0)), Err(Error::Busy));
+        assert_eq!(s.recycle(SegmentId(0)), Err(Error::Busy));
+        drop(frozen);
+        drop(s.append(512).unwrap());
+        // A new freeze blocks appends again.
+        let frozen = s.freeze().unwrap();
+        assert!(matches!(s.append(512), Err(Error::Busy)));
+        drop(frozen);
+    }
+
     /// A lease retains both validated dimensions and the nominal table identity.
     #[test]
     fn geometry_is_shared_by_configuration_and_leases() {
@@ -1497,582 +1188,5 @@ mod tests {
         assert_eq!(s.validate_restore(&before), Err(Error::Unavailable));
         assert_eq!(s.restore(before.clone()), Err(Error::Unavailable));
         assert_eq!(s.snapshot(), before);
-    }
-}
-
-/// Bounded sweep state-space coverage, including invalid callbacks and recovery.
-#[cfg(test)]
-mod clock_tests {
-    use super::*;
-
-    /// Deterministic index occupancy and removal-call observations.
-    struct Entries {
-        counts: RefCell<Vec<usize>>,
-
-        calls: RefCell<Vec<(SegmentId, usize)>>,
-
-        evictable: Cell<bool>,
-        hard_veto: Cell<bool>,
-    }
-
-    impl Entries {
-        /// Populate a synthetic index without changing allocator state.
-        fn new(counts: Vec<usize>) -> Self {
-            Self {
-                counts: RefCell::new(counts),
-                calls: RefCell::new(vec![]),
-                evictable: Cell::new(true),
-                hard_veto: Cell::new(false),
-            }
-        }
-    }
-
-    impl SegmentEntries for Entries {
-        fn can_reclaim(&self, _: SegmentId) -> bool {
-            !self.hard_veto.get()
-        }
-        /// Allow tests to protect unpublished mappings before eviction begins.
-        fn can_evict(&self, _: SegmentId) -> bool {
-            self.evictable.get()
-        }
-
-        /// Record and honor each bounded removal request.
-        fn remove_bounded(&self, id: SegmentId, budget: usize) -> usize {
-            self.calls.borrow_mut().push((id, budget));
-            let mut counts = self.counts.borrow_mut();
-            let count = &mut counts[id.0 as usize];
-            let removed = (*count).min(budget);
-            *count -= removed;
-            removed
-        }
-
-        /// Read current occupancy after bounded removal.
-        fn is_empty(&self, id: SegmentId) -> bool {
-            self.counts.borrow()[id.0 as usize] == 0
-        }
-    }
-
-    /// Create a shared table with enough slots for a bounded clock scenario.
-    fn segments(count: usize) -> Rc<Segments> {
-        let segments = Rc::new(Segments::new(1024));
-        segments
-            .configure(
-                1024 * count as u64,
-                count,
-                Alignment::new(512, 512, 512).unwrap(),
-            )
-            .unwrap();
-        segments
-    }
-
-    /// Empty tables and zero visits never invoke mapping removal.
-    #[test]
-    fn empty_and_zero_budget_sweeps_do_not_call_entries() {
-        let clock = SegmentClock::new(Rc::new(Segments::new(1024)));
-        let entries = Entries::new(vec![]);
-        assert_eq!(clock.reclaim_index(&entries, 64, || true), Ok(()));
-        assert_eq!(
-            clock.reclaim_index(&entries, 64, || false),
-            Err(Error::Busy)
-        );
-        assert_eq!(clock.reclaim(&entries, 1, 64, 256), Err(Error::Unavailable));
-        assert_eq!(clock.mark_read(SegmentId(0)), Err(Error::Corrupt));
-        assert!(entries.calls.borrow().is_empty());
-        let clock = SegmentClock::new(segments(1));
-        let entries = Entries::new(vec![1]);
-        assert_eq!(clock.reclaim_index(&entries, 0, || false), Err(Error::Busy));
-        assert!(entries.calls.borrow().is_empty());
-    }
-
-    #[test]
-    fn hard_veto_applies_to_already_evicting_and_index_only_sweeps() {
-        let segments = segments(2);
-        drop(segments.append(1024).unwrap());
-        segments.begin_evict(SegmentId(0)).unwrap();
-        let entries = Entries::new(vec![1, 0]);
-        entries.evictable.set(false);
-        entries.hard_veto.set(true);
-        let clock = SegmentClock::new(segments.clone());
-        assert_eq!(
-            clock.reclaim_scored(&entries, 2, 64, 256, |_| 0),
-            Err(Error::Busy)
-        );
-        assert_eq!(clock.reclaim(&entries, 2, 64, 256), Err(Error::Busy));
-        assert_eq!(
-            clock.reclaim_index(&entries, 64, || false),
-            Err(Error::Busy)
-        );
-        assert!(entries.calls.borrow().is_empty());
-        assert_eq!(segments.state(SegmentId(0)), Ok(SegmentState::Evicting));
-        entries.evictable.set(true);
-        entries.hard_veto.set(false);
-        clock.reclaim_scored(&entries, 2, 64, 256, |_| 0).unwrap();
-        assert_eq!(segments.free_count(), 2);
-    }
-
-    /// Index admission can forget open mappings without reclaiming their storage.
-    #[test]
-    fn index_second_chance_removes_open_mappings_without_recycling() {
-        let segments = segments(2);
-        drop(segments.append(512).unwrap());
-        let clock = SegmentClock::new(segments.clone());
-        let entries = Entries::new(vec![1, 1]);
-        clock.mark_read(SegmentId(0)).unwrap();
-        clock
-            .reclaim_index(&entries, 64, || entries.counts.borrow()[1] == 0)
-            .unwrap();
-        assert_eq!(*entries.counts.borrow(), [1, 0]);
-        clock.mark_read(SegmentId(0)).unwrap();
-        clock
-            .reclaim_index(&entries, 64, || entries.counts.borrow()[0] == 0)
-            .unwrap();
-        assert_eq!(segments.state(SegmentId(0)), Ok(SegmentState::Open));
-        assert!(segments.lease(SegmentId(0), Generation(1)).is_ok());
-        assert_eq!(segments.free_count(), 1);
-    }
-
-    /// Calls resume the prior cursor but never exceed visits or two rotations.
-    #[test]
-    fn sweep_budget_persists_cursor_and_limits_to_two_rotations() {
-        let clock = SegmentClock::new(segments(40));
-        let entries = Entries::new(vec![10; 40]);
-        assert_eq!(
-            clock.reclaim_index(&entries, 64, || false),
-            Err(Error::Busy)
-        );
-        assert_eq!(entries.calls.borrow().len(), 64);
-        assert_eq!(entries.calls.borrow()[63], (SegmentId(23), 1));
-        entries.calls.borrow_mut().clear();
-        assert_eq!(clock.reclaim_index(&entries, 1, || false), Err(Error::Busy));
-        assert_eq!(*entries.calls.borrow(), [(SegmentId(24), 1)]);
-        let clock = SegmentClock::new(segments(2));
-        let entries = Entries::new(vec![10; 2]);
-        assert_eq!(
-            clock.reclaim_index(&entries, 64, || false),
-            Err(Error::Busy)
-        );
-        assert_eq!(entries.calls.borrow().len(), 4);
-    }
-
-    /// Mapping budget exhaustion leaves partial eviction for the next bounded call.
-    #[test]
-    fn mapping_budget_keeps_partial_eviction_until_next_sweep() {
-        let segments = segments(2);
-        drop(segments.append(1024).unwrap());
-        drop(segments.append(1024).unwrap());
-        let clock = SegmentClock::new(segments.clone());
-        let entries = Entries::new(vec![257, 0]);
-        assert_eq!(clock.reclaim(&entries, 2, 64, 256), Err(Error::Busy));
-        assert_eq!(*entries.counts.borrow(), [1, 0]);
-        assert_eq!(*entries.calls.borrow(), [(SegmentId(0), 256)]);
-        assert_eq!(segments.state(SegmentId(0)), Ok(SegmentState::Evicting));
-        assert_eq!(segments.free_count(), 1);
-        clock.reclaim(&entries, 2, 64, 256).unwrap();
-        assert_eq!(segments.free_count(), 2);
-        assert_eq!(*entries.counts.borrow(), [0, 0]);
-    }
-
-    /// Sealed vetoes preserve mappings, but cannot strand eviction already in progress.
-    #[test]
-    fn reclaim_honors_sealed_veto_but_drains_existing_eviction() {
-        for mapping_count in [0usize, 2] {
-            let segments = segments(1);
-            let held = segments.append(1024).unwrap().0;
-            let clock = SegmentClock::new(segments.clone());
-            let entries = Entries::new(vec![mapping_count]);
-            entries.evictable.set(false);
-            let before = segments.snapshot();
-            assert_eq!(before[0].state, SegmentState::Sealed);
-
-            assert_eq!(clock.reclaim(&entries, 1, 2, 1), Err(Error::Busy));
-            assert_eq!(segments.snapshot(), before);
-            assert_eq!(*entries.counts.borrow(), [mapping_count]);
-            assert!(entries.calls.borrow().is_empty());
-            assert_eq!(segments.free_count(), 0);
-
-            entries.evictable.set(true);
-            assert_eq!(clock.reclaim(&entries, 1, 1, 1), Err(Error::Busy));
-            assert_eq!(segments.state(SegmentId(0)), Ok(SegmentState::Evicting));
-            assert_eq!(*entries.counts.borrow(), [mapping_count.saturating_sub(1)]);
-
-            // Once eviction starts, a later veto must not block remaining mappings.
-            entries.evictable.set(false);
-            assert_eq!(clock.reclaim(&entries, 1, 1, 1), Err(Error::Busy));
-            assert_eq!(*entries.counts.borrow(), [0]);
-            assert_eq!(entries.calls.borrow().len(), mapping_count);
-            assert_eq!(segments.state(SegmentId(0)), Ok(SegmentState::Evicting));
-            assert_eq!(segments.free_count(), 0);
-            assert_eq!(segments.snapshot()[0].generation, Generation(1));
-
-            // The live lease, not the veto, remains the physical reuse fence.
-            drop(held);
-            clock.reclaim(&entries, 1, 1, 0).unwrap();
-            assert_eq!(segments.state(SegmentId(0)), Ok(SegmentState::Free));
-            assert_eq!(segments.free_count(), 1);
-            assert_eq!(segments.snapshot()[0].generation, Generation(2));
-        }
-    }
-
-    /// Freeze checks precede index side effects, and leases precede physical reuse.
-    #[test]
-    fn busy_lease_and_frozen_table_preserve_reclaim_side_effect_order() {
-        let segments = segments(2);
-        let held = segments.append(1024).unwrap();
-        drop(segments.append(1024).unwrap());
-        let clock = SegmentClock::new(segments.clone());
-        let entries = Entries::new(vec![1, 1]);
-        let frozen = segments.freeze().unwrap();
-        assert_eq!(clock.reclaim(&entries, 2, 64, 256), Err(Error::Busy));
-        assert!(entries.calls.borrow().is_empty());
-        drop(frozen);
-        clock.mark_read(SegmentId(1)).unwrap();
-        assert_eq!(clock.reclaim(&entries, 2, 64, 256), Err(Error::Busy));
-        assert_eq!(segments.state(SegmentId(0)), Ok(SegmentState::Evicting));
-        assert_eq!(segments.free_count(), 1);
-        assert_eq!(clock.mark_read(SegmentId(0)), Ok(()));
-        assert_eq!(clock.mark_read(SegmentId(1)), Ok(()));
-        assert!(clock.recent.borrow().is_empty());
-        drop(held);
-        clock.reclaim(&entries, 2, 64, 256).unwrap();
-        assert_eq!(segments.free_count(), 2);
-        assert!(segments.lease(SegmentId(0), Generation(1)).is_err());
-    }
-
-    /// Skipping an open segment does not consume its future second chance.
-    #[test]
-    fn physical_sweep_preserves_recent_bit_on_ineligible_open_segment() {
-        let segments = segments(1);
-        drop(segments.append(512).unwrap());
-        let clock = SegmentClock::new(segments.clone());
-        let entries = Entries::new(vec![1]);
-        clock.mark_read(SegmentId(0)).unwrap();
-        assert_eq!(clock.reclaim(&entries, 1, 64, 256), Err(Error::Busy));
-        drop(segments.append(512).unwrap());
-        assert_eq!(clock.reclaim(&entries, 1, 1, 256), Err(Error::Busy));
-        assert!(entries.calls.borrow().is_empty());
-        clock.reclaim(&entries, 1, 1, 256).unwrap();
-        assert_eq!(*entries.calls.borrow(), [(SegmentId(0), 256)]);
-    }
-
-    /// A no-space rollover creates a reclaimable tail without reserving bytes.
-    #[test]
-    fn no_space_rollover_seals_tail_for_reclaim_and_retry() {
-        for retain_lease in [false, true] {
-            let segments = segments(1);
-            let mut held = Some(segments.append(512).unwrap().0);
-            if !retain_lease {
-                drop(held.take());
-            }
-            assert!(matches!(segments.append(1024), Err(Error::Busy)));
-            let image = &segments.snapshot()[0];
-            assert_eq!(image.state, SegmentState::Sealed);
-            assert_eq!(image.used_bytes, 512);
-            assert_eq!(image.generation, Generation(1));
-            let clock = SegmentClock::new(segments.clone());
-            let entries = Entries::new(vec![0]);
-            if retain_lease {
-                assert_eq!(clock.reclaim(&entries, 1, 2, 0), Err(Error::Busy));
-                assert_eq!(segments.state(SegmentId(0)), Ok(SegmentState::Evicting));
-                drop(held.take());
-            }
-            clock.reclaim(&entries, 1, 2, 0).unwrap();
-            assert!(entries.calls.borrow().is_empty());
-            let (lease, extent) = segments.append(1024).unwrap();
-            assert_eq!(lease.id(), SegmentId(0));
-            assert_eq!(lease.generation(), Generation(2));
-            assert_eq!(extent.offset(), 0);
-            assert_eq!(extent.length(), 1024);
-        }
-    }
-
-    /// Zero mapping work cannot start populated eviction but may recycle empty slots.
-    #[test]
-    fn zero_budget_does_not_start_populated_eviction_but_recycles_empty_candidates() {
-        let segments = segments(2);
-        drop(segments.append(1024).unwrap());
-        drop(segments.append(1024).unwrap());
-        let clock = SegmentClock::new(segments.clone());
-        let entries = Entries::new(vec![1, 0]);
-        clock.reclaim(&entries, 1, 2, 0).unwrap();
-        assert_eq!(segments.state(SegmentId(0)), Ok(SegmentState::Sealed));
-        assert_eq!(segments.state(SegmentId(1)), Ok(SegmentState::Free));
-        assert_eq!(*entries.counts.borrow(), [1, 0]);
-        assert!(entries.calls.borrow().is_empty());
-        assert_eq!(clock.reclaim(&entries, 2, 64, 0), Err(Error::Busy));
-        assert_eq!(segments.state(SegmentId(0)), Ok(SegmentState::Sealed));
-    }
-
-    /// A zero reserve does not inspect or change allocation and mapping state.
-    #[test]
-    fn zero_reserve_has_no_side_effects_even_when_unconfigured() {
-        let unconfigured = SegmentClock::new(Rc::new(Segments::new(1024)));
-        assert_eq!(
-            unconfigured.reclaim(&Entries::new(vec![]), 0, 64, 256),
-            Ok(())
-        );
-        let segments = segments(1);
-        drop(segments.append(1024).unwrap());
-        let clock = SegmentClock::new(segments.clone());
-        let entries = Entries::new(vec![1]);
-        clock.mark_read(SegmentId(0)).unwrap();
-        assert_eq!(clock.reclaim(&entries, 0, 64, 256), Ok(()));
-        assert_eq!(segments.state(SegmentId(0)), Ok(SegmentState::Sealed));
-        assert!(entries.calls.borrow().is_empty());
-        assert!(clock.recent.borrow().contains(&SegmentId(0)));
-    }
-
-    /// Scoring completes before mutation; mapping budgets, freeze, leases and
-    /// generation authority remain enforced even when the cheapest slot is busy.
-    #[test]
-    fn scored_eviction_preserves_fences_and_partial_progress() {
-        let segments = segments(3);
-        drop(segments.append(1024).unwrap());
-        let held = segments.append(1024).unwrap().0;
-        drop(segments.append(1024).unwrap());
-        let clock = SegmentClock::new(segments.clone());
-        let entries = Entries::new(vec![1, 2, 1]);
-        let scores = [30, 0, 10];
-        let frozen = segments.freeze().unwrap();
-        assert_eq!(
-            clock.reclaim_scored(&entries, 1, 64, 1, |id| scores[id.0 as usize]),
-            Err(Error::Busy)
-        );
-        assert!(entries.calls.borrow().is_empty());
-        drop(frozen);
-        assert_eq!(
-            clock.reclaim_scored(&entries, 1, 64, 1, |id| {
-                assert_eq!(segments.state(id), Ok(SegmentState::Sealed));
-                scores[id.0 as usize]
-            }),
-            Err(Error::Busy)
-        );
-        assert_eq!(*entries.counts.borrow(), [1, 1, 1]);
-        assert_eq!(segments.state(SegmentId(1)), Ok(SegmentState::Evicting));
-        assert!(segments.lease(SegmentId(1), Generation(1)).is_err());
-        assert_eq!(
-            clock.reclaim_scored(&entries, 1, 64, 2, |id| scores[id.0 as usize]),
-            Err(Error::Busy)
-        );
-        assert_eq!(*entries.counts.borrow(), [1, 0, 1]);
-        assert_eq!(segments.state(SegmentId(0)), Ok(SegmentState::Sealed));
-        assert_eq!(segments.state(SegmentId(1)), Ok(SegmentState::Evicting));
-        drop(held);
-        clock
-            .reclaim_scored(&entries, 1, 64, 0, |_| u64::MAX)
-            .unwrap();
-        assert_eq!(segments.free_count(), 1);
-        assert_eq!(segments.snapshot()[1].generation, Generation(2));
-    }
-
-    /// A score callback never turns a soft preference into immunity or a full scan.
-    #[test]
-    fn scored_eviction_caps_candidates_and_evicts_maximum_scores() {
-        let segments = segments(65);
-        for _ in 0..65 {
-            drop(segments.append(1024).unwrap());
-        }
-        let clock = SegmentClock::new(segments.clone());
-        let entries = Entries::new(vec![1; 65]);
-        let mut visits = 0;
-        clock
-            .reclaim_scored(&entries, 1, usize::MAX, 1, |_| {
-                visits += 1;
-                u64::MAX
-            })
-            .unwrap();
-        assert_eq!(visits, 64);
-        assert_eq!(entries.calls.borrow().len(), 1);
-        assert_eq!(segments.free_count(), 1);
-        assert_eq!(clock.hand.get(), 64);
-    }
-
-    /// Pending leased victims count toward reserve even outside the next sample.
-    #[test]
-    fn scored_eviction_never_overshoots_reserve_with_multiple_leased_victims() {
-        let segments = segments(3);
-        let mut leases: Vec<_> = (0..3)
-            .map(|_| Some(segments.append(1024).unwrap().0))
-            .collect();
-        let clock = SegmentClock::new(segments.clone());
-        let entries = Entries::new(vec![1; 3]);
-        for _ in 0..6 {
-            assert_eq!(
-                clock.reclaim_scored(&entries, 1, 1, 256, |_| 0),
-                Err(Error::Busy)
-            );
-            assert_eq!(*entries.counts.borrow(), [0, 1, 1]);
-            assert_eq!(segments.evicting.get(), 1);
-        }
-        drop(leases[0].take());
-        clock.reclaim_scored(&entries, 1, 64, 256, |_| 0).unwrap();
-        assert_eq!(segments.free_count(), 1);
-        assert_eq!(segments.evicting.get(), 0);
-        assert_eq!(*entries.counts.borrow(), [0, 1, 1]);
-    }
-
-    /// Meeting a smaller reserve does not promise to drain a leased pending victim.
-    #[test]
-    fn reserve_success_does_not_require_pending_evictions_to_drain() {
-        for scored in [false, true] {
-            let segments = segments(3);
-            let held = segments.append(1024).unwrap().0;
-            drop(segments.append(1024).unwrap());
-            let clock = SegmentClock::new(segments.clone());
-            let entries = Entries::new(vec![1, 1, 0]);
-            let reclaim = |reserve, visits| {
-                if scored {
-                    clock.reclaim_scored(&entries, reserve, visits, 3, |_| 0)
-                } else {
-                    clock.reclaim(&entries, reserve, visits, 3)
-                }
-            };
-            assert_eq!(reclaim(3, 1), Err(Error::Busy));
-            assert_eq!(segments.free_count(), 1);
-            assert_eq!(segments.evicting.get(), 1);
-            assert_eq!(reclaim(1, 0), Ok(()));
-            assert_eq!(segments.evicting.get(), 1);
-            assert_eq!(segments.state(SegmentId(0)), Ok(SegmentState::Evicting));
-            assert_eq!(reclaim(3, 6), Err(Error::Busy));
-            drop(held);
-            assert_eq!(reclaim(3, 6), Ok(()));
-            assert_eq!(segments.free_count(), 3);
-            assert_eq!(segments.evicting.get(), 0);
-        }
-    }
-
-    /// Over-reporting callbacks return configuration errors without unsafe reuse.
-    #[test]
-    fn removal_contract_violations_return_errors_without_panicking() {
-        /// An intentionally broken callback that over-reports every removal.
-        struct InvalidEntries;
-
-        impl SegmentEntries for InvalidEntries {
-            /// Violate the caller contract to test error handling.
-            fn remove_bounded(&self, _: SegmentId, budget: usize) -> usize {
-                budget + 1
-            }
-
-            /// Keep the segment populated despite the invalid removal report.
-            fn is_empty(&self, _: SegmentId) -> bool {
-                false
-            }
-        }
-        let segments = segments(1);
-        drop(segments.append(1024).unwrap());
-        let clock = SegmentClock::new(segments.clone());
-        assert_eq!(
-            clock.reclaim_index(&InvalidEntries, 1, || false),
-            Err(Error::InvalidConfiguration)
-        );
-        assert_eq!(
-            clock.reclaim(&InvalidEntries, 1, 1, 1),
-            Err(Error::InvalidConfiguration)
-        );
-        assert_eq!(segments.state(SegmentId(0)), Ok(SegmentState::Evicting));
-        assert_eq!(segments.free_count(), 0);
-    }
-
-    /// Every clock operation observes the restore epoch before using old history.
-    #[test]
-    fn restore_resets_cursor_and_recent_reads_before_any_clock_operation() {
-        let segments = segments(2);
-        drop(segments.append(1024).unwrap());
-        drop(segments.append(1024).unwrap());
-        let clock = SegmentClock::new(segments.clone());
-        let entries = Entries::new(vec![10, 10]);
-        assert_eq!(clock.reclaim_index(&entries, 1, || false), Err(Error::Busy));
-        clock.mark_read(SegmentId(0)).unwrap();
-        assert_eq!(clock.hand.get(), 1);
-        segments.restore(segments.snapshot()).unwrap();
-        entries.calls.borrow_mut().clear();
-        assert_eq!(clock.reclaim_index(&entries, 1, || false), Err(Error::Busy));
-        assert_eq!(*entries.calls.borrow(), [(SegmentId(0), 1)]);
-        clock.mark_read(SegmentId(1)).unwrap();
-        segments.restore(segments.snapshot()).unwrap();
-        clock.mark_read(SegmentId(0)).unwrap();
-        assert_eq!(clock.hand.get(), 0);
-        assert_eq!(*clock.recent.borrow(), HashSet::from([SegmentId(0)]));
-        segments.restore(segments.snapshot()).unwrap();
-        clock.reclaim(&entries, 0, 0, 0).unwrap();
-        assert!(clock.recent.borrow().is_empty());
-    }
-}
-
-/// Payload-free entries used by the simulator.
-#[cfg(all(test, feature = "simulation"))]
-mod phantom_tests {
-    use super::*;
-
-    /// Build a table where every slot is sealed.
-    fn sealed(count: usize) -> Rc<Segments> {
-        let segments = Segments::new(512);
-        segments
-            .configure(
-                512 * count as u64,
-                count,
-                Alignment::new(512, 512, 512).unwrap(),
-            )
-            .unwrap();
-        for _ in 0..count {
-            drop(segments.append(512).unwrap());
-        }
-        Rc::new(segments)
-    }
-
-    /// Mappings are removed in publication order and reported once.
-    #[test]
-    fn removal_follows_publication_order_and_reports_evictions() {
-        let entries = PhantomEntries::<u64>::default();
-        assert!(entries.is_empty());
-        for page in [5, 3, 9] {
-            assert_eq!(entries.publish(page, 10, SegmentId(0)).unwrap(), None);
-        }
-        assert_eq!(entries.publish(3, 20, SegmentId(0)).unwrap(), Some(10));
-        assert_eq!(entries.publish(7, 1, SegmentId(1)).unwrap(), None);
-        assert_eq!(entries.remove_bounded(SegmentId(0), 2), 2);
-        assert_eq!(entries.take_evicted(), vec![(5, 10), (9, 10)]);
-        assert!(entries.take_evicted().is_empty());
-        assert!(!SegmentEntries::is_empty(&entries, SegmentId(0)));
-        assert_eq!(entries.remove_bounded(SegmentId(0), 9), 1);
-        assert!(SegmentEntries::is_empty(&entries, SegmentId(0)));
-        assert_eq!(entries.get(&7), Some(1));
-        assert_eq!(entries.remove(&7), Some(1));
-        assert_eq!(entries.remove(&7), None);
-        assert_eq!(entries.len(), 0);
-    }
-
-    /// Holds veto reclamation; writes veto eviction only.
-    #[test]
-    fn holds_and_writes_veto_like_the_catalog() {
-        let entries = PhantomEntries::<u64>::default();
-        entries.publish(1, 10, SegmentId(0)).unwrap();
-        entries.set_writing(SegmentId(0), true);
-        assert!(entries.can_reclaim(SegmentId(0)));
-        assert!(!entries.can_evict(SegmentId(0)));
-        assert_eq!(entries.remove_bounded(SegmentId(0), 1), 0);
-        entries.set_writing(SegmentId(0), false);
-        entries.set_held(SegmentId(0), true);
-        assert!(!entries.can_reclaim(SegmentId(0)));
-        assert!(!entries.can_evict(SegmentId(0)));
-        entries.set_held(SegmentId(0), false);
-        assert!(entries.can_evict(SegmentId(0)));
-    }
-
-    /// The clock evicts the lowest scored segment and skips held ones.
-    #[test]
-    fn clock_ranks_phantom_segments_by_score() {
-        let segments = sealed(3);
-        let clock = SegmentClock::new(segments.clone());
-        let entries = PhantomEntries::<u64>::default();
-        for (page, segment, bytes) in [(1, 0, 30), (2, 1, 10), (3, 2, 5)] {
-            entries.publish(page, bytes, SegmentId(segment)).unwrap();
-        }
-        entries.set_held(SegmentId(2), true);
-        let score =
-            |segment| entries.segment_score(segment, 256, 1000, |_, bytes| u64::from(bytes));
-        clock.reclaim_scored(&entries, 1, 64, 256, score).unwrap();
-        assert_eq!(entries.take_evicted(), vec![(2, 10)]);
-        assert_eq!(segments.state(SegmentId(1)).unwrap(), SegmentState::Free);
-        assert_eq!(entries.segment_score(SegmentId(0), 0, 1000, |_, _| 1), 1000);
     }
 }

@@ -12,3 +12,7 @@ ExecStart={{.PreStartCommand}}
 Restart=on-failure
 RestartMode=direct
 RestartSec=10s
+{{- if .PreStartRefusedExitCode}}
+# A final allocation launch refusal must fail the start rather than loop.
+RestartPreventExitStatus={{.PreStartRefusedExitCode}}
+{{- end}}

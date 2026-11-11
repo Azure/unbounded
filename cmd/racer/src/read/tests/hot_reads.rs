@@ -3,6 +3,7 @@ use super::fill::*;
 use crate::client::ClientRequest;
 use crate::client::ReadKind;
 use crate::control::Snapshot;
+use crate::control::cell::PublicationCell;
 use crate::http::Codec;
 use crate::http::Delivery;
 use crate::model::ByteRange;
@@ -18,8 +19,7 @@ use crate::test_support::security::network;
 use crate::test_support::security::node;
 use crate::topology::LinkHealth;
 use crate::topology::Paths;
-use controlplane::Published;
-use racer_control_wire::MembershipVersion;
+use racer_wire::control::MembershipVersion;
 
 mod duplex_release {
     //! Exercise release credit through the real duplex response, not release_page.
@@ -30,19 +30,17 @@ mod duplex_release {
 
     #[test]
     fn duplex_exact_release_before_final_send_cqe_is_provisional() {
-        use uring_runtime::reactor::simulation::Fault;
-        use uring_runtime::reactor::simulation::Simulation;
+        use racer_io::sim::Fault;
+        use racer_io::sim::SimOs;
         for mode in ["valid", "duplicate", "malformed", "short", "drop"] {
-            let sim = Simulation::new();
-            let _sim = sim.enter();
-            let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
-            let _owner = queue.enter();
-            let signers = network(1);
-            let mut f = fixture();
+            let sim = SimOs::new();
+            let env = racer_io::Env::sim(&sim, racer_io::WorkerCtx::host());
+            let signers = network(&env, 1);
+            let mut f = fixture(&env);
             f.reactor.init().unwrap();
             let membership = local_membership(&signers[0]);
             let (local, mut endpoint, _publication) =
-                coordinator(&f, &signers[0], &membership, NoPeer::requester());
+                coordinator(&env, &f, &signers[0], &membership, NoPeer::requester(&env));
             let response = futures::executor::block_on(local.read(
                 ClientRequest {
                     kind: ReadKind::Subscription {
@@ -81,8 +79,8 @@ mod duplex_release {
             let mut bytes = Vec::new();
             let mut pump = |endpoint: &mut crate::read::dispatch::WorkerEndpoint| {
                 endpoint.poll(&mut cx, 64).unwrap();
-                uring_runtime::drivers::poll(&mut cx, 64);
-                uring_runtime::group::Service::poll_budgeted(
+                f.fill.drivers().poll(&mut cx, 64);
+                crate::lifecycle::Service::poll_budgeted(
                     &mut f.engine,
                     &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
                     64,
@@ -190,44 +188,48 @@ mod duplex_release {
     }
     #[test]
     fn duplex_release_replenishes_acquisition_while_next_page_write_is_blocked() {
-        run("valid");
+        let env = racer_io::Env::host();
+        run(&env, "valid");
     }
     #[test]
     fn duplex_release_malformed_length_and_incomplete_page_are_rejected_while_blocked() {
-        run("malformed");
-        run("incomplete");
+        let env = racer_io::Env::host();
+        run(&env, "malformed");
+        run(&env, "incomplete");
     }
     #[test]
     fn duplex_release_eof_cancellation_and_drop_drain_owned_write_fences() {
-        run("eof");
-        run("cancel");
-        run("drop");
+        let env = racer_io::Env::host();
+        run(&env, "eof");
+        run(&env, "cancel");
+        run(&env, "drop");
     }
     #[test]
     fn duplex_release_stalled_writer_expires_but_progressing_writer_outlives_read_deadline() {
-        run("deadline");
-        run("progress");
+        let env = racer_io::Env::host();
+        run(&env, "deadline");
+        run(&env, "progress");
     }
     #[test]
     fn duplex_release_partial_frame_survives_delivery_to_next_slice_transition() {
-        run("transition");
+        let env = racer_io::Env::host();
+        run(&env, "transition");
     }
 
-    fn run(mode: &str) {
-        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
-        let _owner = queue.enter();
-        let clock = uring_runtime::environment::SimulationClock::new(311);
-        let environment = clock.environment(0);
-        let _clock = environment.enter();
-        let signers = network(1);
-        let mut f = fixture_with(2 * PAGE_BYTES + 7, None);
+    fn run(env: &racer_io::Env, mode: &str) {
+        let clock = racer_io::SimClock::new(311);
+        let environment = clock.ctx(0);
+        let env = racer_io::Env::new(env.driver.clone(), environment.clone());
+        let signers = network(&env, 1);
+        let mut f = fixture_with(&env, 2 * PAGE_BYTES + 7, None);
         f.reactor.init().unwrap();
         let membership = local_membership(&signers[0]);
         let (local, mut endpoint, _publication) =
-            coordinator(&f, &signers[0], &membership, NoPeer::requester());
-        let scope = RequestScope::new(
+            coordinator(&env, &f, &signers[0], &membership, NoPeer::requester(&env));
+        let scope = RequestScope::on(
+            &env.ctx.clock,
             f.scope.request,
-            uring_runtime::environment::now() + Duration::from_secs(60),
+            env.ctx.now() + Duration::from_secs(60),
         )
         .unwrap();
         let request = ClientRequest {
@@ -322,7 +324,8 @@ mod duplex_release {
             "blocked send owns a completion fence"
         );
         // An independent reader retains the same immutable page with its own pipe.
-        let other_scope = RequestScope::new(f.scope.request, scope.deadline.0).unwrap();
+        let other_scope =
+            RequestScope::on(&env.ctx.clock, f.scope.request, scope.deadline.0).unwrap();
         let other = delivery
             .attach(
                 f.fill
@@ -387,13 +390,13 @@ mod duplex_release {
                 }
                 "cancel" => {
                     scope.cancel().unwrap();
-                    Error::Cancelled
+                    Error::Canceled
                 }
                 "deadline" => {
                     clock.advance(Duration::from_secs(31));
                     Error::DeadlineExceeded
                 }
-                "drop" => Error::Cancelled,
+                "drop" => Error::Canceled,
                 _ => unreachable!(),
             };
             if mode != "drop" {
@@ -538,7 +541,7 @@ mod duplex_release {
             drop((send, done));
         }
         assert_eq!(other.bytes_sent(), 0);
-        assert!(!other_scope.cancellation.is_cancelled());
+        assert!(!other_scope.cancellation.is_canceled());
         let (socket, mut independent_client) = std::os::unix::net::UnixStream::pair().unwrap();
         independent_client
             .set_read_timeout(Some(Duration::from_secs(1)))
@@ -585,7 +588,7 @@ mod duplex_release {
 struct Link {
     client: Rc<Requester>,
     /// The only node with a reachable peer endpoint.
-    provider: racer_control_wire::NodeId,
+    provider: racer_wire::control::NodeId,
     demands: Rc<RefCell<Vec<u64>>>,
     stats: Rc<LinkStats>,
 }
@@ -603,7 +606,7 @@ impl Link {
     fn direct_hedge_available(
         &self,
         _: &std::sync::Arc<crate::topology::Membership>,
-        _: &racer_control_wire::NodeId,
+        _: &racer_wire::control::NodeId,
     ) -> bool {
         false
     }
@@ -708,6 +711,7 @@ pub(super) fn local_membership(signer: &Signatures) -> std::sync::Arc<crate::top
 }
 
 pub(super) fn coordinator(
+    env: &racer_io::Env,
     f: &Fixture,
     signer: &Rc<Signatures>,
     membership: &std::sync::Arc<crate::topology::Membership>,
@@ -715,13 +719,14 @@ pub(super) fn coordinator(
 ) -> (
     Rc<Coordinator>,
     crate::read::dispatch::WorkerEndpoint,
-    Arc<Published<Snapshot>>,
+    Arc<PublicationCell<Snapshot>>,
 ) {
-    coordinator_with_window(f, signer, membership, peers, 2)
+    coordinator_with_window(env, f, signer, membership, peers, 2)
 }
 
 /// A read graph whose range streams use a `window`-page fetch window.
 pub(super) fn coordinator_with_window(
+    env: &racer_io::Env,
     f: &Fixture,
     signer: &Rc<Signatures>,
     membership: &std::sync::Arc<crate::topology::Membership>,
@@ -730,7 +735,7 @@ pub(super) fn coordinator_with_window(
 ) -> (
     Rc<Coordinator>,
     crate::read::dispatch::WorkerEndpoint,
-    Arc<Published<Snapshot>>,
+    Arc<PublicationCell<Snapshot>>,
 ) {
     let mut deps = f.fill.dependencies.clone();
     deps.candidates = Rc::new(CandidatePolicy::new(
@@ -738,9 +743,14 @@ pub(super) fn coordinator_with_window(
         Rc::new(Placement::new(64)),
         peers.clone(),
         deps.credentials.clone(),
-        Arc::new(controlplane::Published::new(Snapshot::retention(2))),
+        Arc::new(crate::control::cell::PublicationCell::new(
+            Snapshot::retention(2),
+        )),
+        env.ctx.clone(),
+        deps.candidates.drivers().clone(),
     ));
     f.read_graph(
+        env,
         Rc::new(Fill::new(deps)),
         membership,
         ReadGraphSettings {
@@ -756,14 +766,13 @@ pub(super) fn coordinator_with_window(
 
 #[test]
 fn concurrent_reads_share_page_work_and_bound_fetch_by_credit() {
-    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
-    let _owner = queue.enter();
-    let signers = network(1);
-    let mut f = fixture_with(3 * PAGE_BYTES + 7, None);
+    let env = racer_io::Env::host();
+    let signers = network(&env, 1);
+    let mut f = fixture_with(&env, 3 * PAGE_BYTES + 7, None);
     f.reactor.init().unwrap();
     let membership = local_membership(&signers[0]);
     let (local, mut endpoint, _publication) =
-        coordinator(&f, &signers[0], &membership, NoPeer::requester());
+        coordinator(&env, &f, &signers[0], &membership, NoPeer::requester(&env));
     let open = |credits, start| {
         let request = ClientRequest {
             kind: ReadKind::Subscription {
@@ -778,7 +787,7 @@ fn concurrent_reads_share_page_work_and_bound_fetch_by_credit() {
                 authorization: None,
             },
         };
-        let scope = RequestScope::new(f.scope.request, f.scope.deadline.0).unwrap();
+        let scope = RequestScope::host(f.scope.request, f.scope.deadline.0).unwrap();
         match futures::executor::block_on(local.read(request, &scope))
             .unwrap()
             .payload
@@ -876,8 +885,7 @@ fn concurrent_reads_share_page_work_and_bound_fetch_by_credit() {
 
 #[test]
 fn fetch_window_is_not_an_unreleased_credit_ceiling() {
-    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
-    let _owner = queue.enter();
+    let env = racer_io::Env::host();
     // Full-page batch, then a one-byte boundary with byte credit just below
     // and exactly at the threshold for two additional full pages.
     for (start, bytes, batch) in [
@@ -885,13 +893,13 @@ fn fetch_window_is_not_an_unreleased_credit_ceiling() {
         (PAGE_BYTES - 1, 2 * PAGE_BYTES, 2),
         (PAGE_BYTES - 1, 2 * PAGE_BYTES + 1, 3),
     ] {
-        let signers = network(1);
-        let mut f = fixture_with(5 * PAGE_BYTES + 7, None);
+        let signers = network(&env, 1);
+        let mut f = fixture_with(&env, 5 * PAGE_BYTES + 7, None);
         f.reactor.init().unwrap();
         let membership = local_membership(&signers[0]);
         let (local, mut endpoint, _publication) =
-            coordinator(&f, &signers[0], &membership, NoPeer::requester());
-        let scope = RequestScope::new(f.scope.request, f.scope.deadline.0).unwrap();
+            coordinator(&env, &f, &signers[0], &membership, NoPeer::requester(&env));
+        let scope = RequestScope::host(f.scope.request, f.scope.deadline.0).unwrap();
         let mut stream = match futures::executor::block_on(local.read(
             ClientRequest {
                 kind: ReadKind::Subscription {
@@ -987,26 +995,25 @@ fn fetch_window_is_not_an_unreleased_credit_ceiling() {
 fn zero_priority_read_beside_active_cache_progresses_while_first_page_is_held() {
     use crate::admission::ResourceClass;
     use flow_control::Policy;
-    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
-    let _owner = queue.enter();
-    let signers = network(1);
+    let env = racer_io::Env::host();
+    let signers = network(&env, 1);
     // Production sizes stream and admission windows from the same setting.
     let mut limits = crate::test_support::cluster::config(false).limits;
     limits.range_window_pages = std::num::NonZeroUsize::new(2).unwrap();
     limits.plaintext_bytes = std::num::NonZeroUsize::new(8 * PAGE_BYTES as usize).unwrap();
-    let mut f = fixture_with(3 * PAGE_BYTES + 7, Some(limits));
+    let mut f = fixture_with(&env, 3 * PAGE_BYTES + 7, Some(limits));
     f.reactor.init().unwrap();
     let admission = f.fill.dependencies.admission.clone();
     let cold = f.page.version.object.cache.clone();
-    let hot = racer_control_wire::CacheId("hot".into());
+    let hot = racer_wire::control::CacheId("hot".into());
     let definition =
-        |id: &racer_control_wire::CacheId, priority| racer_control_wire::CacheDefinition {
+        |id: &racer_wire::control::CacheId, priority| racer_wire::control::CacheDefinition {
             id: id.clone(),
             name: id.0.clone(),
             client_socket: "/c".into(),
             origin_socket: "/o".into(),
             priority,
-            mode: racer_control_wire::CacheMode::Cached,
+            mode: racer_wire::control::CacheMode::Cached,
             origin: None,
         };
     admission
@@ -1024,8 +1031,8 @@ fn zero_priority_read_beside_active_cache_progresses_while_first_page_is_held() 
     );
     let membership = local_membership(&signers[0]);
     let (local, mut endpoint, _publication) =
-        coordinator(&f, &signers[0], &membership, NoPeer::requester());
-    let scope = RequestScope::new(f.scope.request, f.scope.deadline.0).unwrap();
+        coordinator(&env, &f, &signers[0], &membership, NoPeer::requester(&env));
+    let scope = RequestScope::host(f.scope.request, f.scope.deadline.0).unwrap();
     let mut stream = match futures::executor::block_on(local.read(
         ClientRequest {
             kind: ReadKind::Subscription {
@@ -1099,16 +1106,15 @@ fn zero_priority_read_beside_active_cache_progresses_while_first_page_is_held() 
 
 #[test]
 fn later_page_completes_before_head_and_cancellation_keeps_completion_fence() {
-    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
-    let _owner = queue.enter();
+    let env = racer_io::Env::host();
     for mode in ["success", "cancel", "drop", "failure"] {
-        let signers = network(1);
-        let mut f = fixture_with(2 * PAGE_BYTES + 7, None);
+        let signers = network(&env, 1);
+        let mut f = fixture_with(&env, 2 * PAGE_BYTES + 7, None);
         f.reactor.init().unwrap();
         let membership = local_membership(&signers[0]);
         let (local, mut endpoint, _publication) =
-            coordinator(&f, &signers[0], &membership, NoPeer::requester());
-        let scope = RequestScope::new(f.scope.request, f.scope.deadline.0).unwrap();
+            coordinator(&env, &f, &signers[0], &membership, NoPeer::requester(&env));
+        let scope = RequestScope::host(f.scope.request, f.scope.deadline.0).unwrap();
         let request = ClientRequest {
             kind: ReadKind::Subscription {
                 pin: Some(f.page.version.etag.clone()),
@@ -1133,8 +1139,8 @@ fn later_page_completes_before_head_and_cancellation_keeps_completion_fence() {
         let mut pump = |endpoint: &mut crate::read::dispatch::WorkerEndpoint| {
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
             endpoint.poll(&mut cx, 64).unwrap();
-            uring_runtime::drivers::poll(&mut cx, 64);
-            uring_runtime::group::Service::poll_budgeted(
+            f.fill.drivers().poll(&mut cx, 64);
+            crate::lifecycle::Service::poll_budgeted(
                 &mut f.engine,
                 &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
                 64,
@@ -1183,14 +1189,18 @@ fn later_page_completes_before_head_and_cancellation_keeps_completion_fence() {
                 pump(&mut endpoint);
             }
             assert!(
-                queue.pending() > 0,
+                local.drivers().pending() > 0,
                 "canceled waiter is not actual origin completion"
             );
             f.origin.blocked_pages.borrow_mut().clear();
             for _ in 0..1024 {
                 pump(&mut endpoint);
             }
-            assert_eq!(queue.pending(), 0, "accepted head work drains its fence");
+            assert_eq!(
+                local.drivers().pending(),
+                0,
+                "accepted head work drains its fence"
+            );
             assert_eq!(&*f.origin.started_pages.borrow(), &[0, 1]);
         } else if mode == "failure" {
             f.origin.version_unavailable.set(true);
@@ -1285,7 +1295,8 @@ fn later_page_completes_before_head_and_cancellation_keeps_completion_fence() {
 
 #[test]
 fn production_range_windows_select_from_provider_share_node_work_and_deliver_in_order() {
-    let stats = production_range_windows(false);
+    let env = racer_io::Env::host();
+    let stats = production_range_windows(&env, false);
     assert!(
         stats
             .iter()
@@ -1295,7 +1306,8 @@ fn production_range_windows_select_from_provider_share_node_work_and_deliver_in_
 }
 #[test]
 fn production_range_windows_fall_back_to_single_flight_for_old_providers() {
-    let stats = production_range_windows(true);
+    let env = racer_io::Env::host();
+    let stats = production_range_windows(&env, true);
     assert!(!stats[0].flights.borrow().is_empty());
     for stats in &stats {
         let flights = stats.flights.borrow();
@@ -1317,7 +1329,7 @@ fn production_range_windows_fall_back_to_single_flight_for_old_providers() {
 /// larger windows that overload it and fall back to relayed fetches stall.
 /// Asserts in-order delivery and shared node work; returns each requester's
 /// Subscribe traffic.
-fn production_range_windows(old_provider: bool) -> Vec<Rc<LinkStats>> {
+fn production_range_windows(env: &racer_io::Env, old_provider: bool) -> Vec<Rc<LinkStats>> {
     const PAGES: u64 = 4;
     const WINDOW: usize = 4;
     let stats: Vec<Rc<LinkStats>> = (0..2)
@@ -1328,9 +1340,7 @@ fn production_range_windows(old_provider: bool) -> Vec<Rc<LinkStats>> {
             })
         })
         .collect();
-    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
-    let _owner = queue.enter();
-    let signers = network(3);
+    let signers = network(env, 3);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     drop(listener);
@@ -1356,7 +1366,7 @@ fn production_range_windows(old_provider: bool) -> Vec<Rc<LinkStats>> {
         .unwrap(),
     );
     let mut fixtures: Vec<_> = (0..3)
-        .map(|_| fixture_with(PAGES * PAGE_BYTES, None))
+        .map(|_| fixture_with(env, PAGES * PAGE_BYTES, None))
         .collect();
     for fixture in &fixtures {
         fixture.reactor.init().unwrap();
@@ -1367,7 +1377,7 @@ fn production_range_windows(old_provider: bool) -> Vec<Rc<LinkStats>> {
     let mut publications = Vec::new();
     for i in 0..3 {
         let peers: Rc<Requester> = if i == 2 {
-            NoPeer::requester()
+            NoPeer::requester(env)
         } else {
             let admission = fixtures[i].fill.dependencies.admission.clone();
             let reactor = fixtures[i].reactor.clone();
@@ -1389,18 +1399,23 @@ fn production_range_windows(old_provider: bool) -> Vec<Rc<LinkStats>> {
                 signers[i].clone(),
             ));
             let requester = Rc::new(crate::peer::Requester::new(
-                Rc::new(Paths::new(Rc::new(LinkHealth::default()), 4)),
+                Rc::new(Paths::new(
+                    Rc::new(LinkHealth::on(env.ctx.clock.clone())),
+                    4,
+                )),
                 Rc::new(Forwarding::new(signers[i].clone())),
                 transfers,
                 Rc::new(
                     PeerNetwork::new(
                         node(i),
                         crate::test_support::published_membership(membership.clone()),
+                        racer_io::Clock::host(),
                     )
                     .unwrap(),
                 ),
             ));
             Requester::scripted(
+                env.ctx.clock.clone(),
                 Rc::new(Link {
                     client: requester,
                     provider: node(2),
@@ -1413,7 +1428,7 @@ fn production_range_windows(old_provider: bool) -> Vec<Rc<LinkStats>> {
             )
         };
         let (local, endpoint, published) =
-            coordinator_with_window(&fixtures[i], &signers[i], &membership, peers, WINDOW);
+            coordinator_with_window(env, &fixtures[i], &signers[i], &membership, peers, WINDOW);
         locals.push(local);
         endpoints.push(endpoint);
         publications.push(published);
@@ -1425,10 +1440,15 @@ fn production_range_windows(old_provider: bool) -> Vec<Rc<LinkStats>> {
     });
     let admission = fixtures[2].fill.dependencies.admission.clone();
     let auth = Rc::new(Forwarding::new(signers[2].clone()));
-    let network = Rc::new(PeerNetwork::new(node(2), publications[2].clone()).unwrap());
-    let outbound = crate::peer::tests::NoOutbound::new(signers[2].clone(), network.clone());
+    let network = Rc::new(
+        PeerNetwork::new(node(2), publications[2].clone(), racer_io::Clock::host()).unwrap(),
+    );
+    let outbound = crate::peer::tests::NoOutbound::new(env, signers[2].clone(), network.clone());
     let relay = Rc::new(crate::peer::Relay::new(
-        Rc::new(Paths::new(Rc::new(LinkHealth::default()), 4)),
+        Rc::new(Paths::new(
+            Rc::new(LinkHealth::on(env.ctx.clock.clone())),
+            4,
+        )),
         auth.clone(),
         outbound.requester.clone(),
         admission.clone(),
@@ -1452,7 +1472,7 @@ fn production_range_windows(old_provider: bool) -> Vec<Rc<LinkStats>> {
         codec,
         signers[2].clone(),
     );
-    let serving_scope = RequestScope::new(
+    let serving_scope = RequestScope::host(
         RequestId([99; 16]),
         Instant::now() + Duration::from_secs(30),
     )
@@ -1513,13 +1533,17 @@ fn production_range_windows(old_provider: bool) -> Vec<Rc<LinkStats>> {
                     64,
                 )
                 .unwrap();
+            endpoint.drivers().poll(
+                &mut Context::from_waker(futures::task::noop_waker_ref()),
+                64,
+            );
         }
-        uring_runtime::drivers::poll(
-            &mut Context::from_waker(futures::task::noop_waker_ref()),
-            64,
-        );
         for f in &mut fixtures {
-            uring_runtime::group::Service::poll_budgeted(
+            f.fill.drivers().poll(
+                &mut Context::from_waker(futures::task::noop_waker_ref()),
+                64,
+            );
+            crate::lifecycle::Service::poll_budgeted(
                 &mut f.engine,
                 &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
                 64,
@@ -1646,9 +1670,8 @@ fn production_range_windows(old_provider: bool) -> Vec<Rc<LinkStats>> {
 }
 #[test]
 fn origin_fill_preserves_ciphertext_for_memory_and_pending_candidate_copy() {
-    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
-    let _owner = queue.enter();
-    let mut f = fixture();
+    let env = racer_io::Env::host();
+    let mut f = fixture(&env);
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
     let result = acquire(&mut f, &mut budget).unwrap();
     assert_eq!(result.plaintext.bytes(), b"abc");
@@ -1685,6 +1708,7 @@ fn origin_fill_preserves_ciphertext_for_memory_and_pending_candidate_copy() {
         &f.reactor,
         &mut f.engine,
         &f.crypto,
+        f.fill.drivers(),
     )
     .unwrap()
     .unwrap();
@@ -1725,6 +1749,7 @@ fn acquire_pair(f: &mut Fixture) -> (Result<PageResult>, Result<PageResult>) {
         ),
         &mut f.engine,
         &f.crypto,
+        f.fill.drivers(),
     )
 }
 
@@ -1741,12 +1766,10 @@ fn fill_and_release(f: &mut Fixture) -> CiphertextPage {
 
 #[test]
 fn memory_cache_retains_only_ciphertext_after_delivery() {
-    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
-    let _owner = queue.enter();
-    let mut f = fixture();
+    let env = racer_io::Env::host();
+    let mut f = fixture(&env);
     let ciphertext = fill_and_release(&mut f);
     let deps = &f.fill.dependencies;
-    deps.admission.reclaim_buffers();
     assert_eq!(deps.admission.used(ResourceClass::Plaintext), 0);
     assert!(deps.memory.get(&f.page).unwrap().is_none());
     let cached = deps.memory.ciphertext(&f.page).unwrap().unwrap();
@@ -1756,9 +1779,8 @@ fn memory_cache_retains_only_ciphertext_after_delivery() {
 
 #[test]
 fn cached_ciphertext_hit_decrypts_without_refetching() {
-    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
-    let _owner = queue.enter();
-    let mut f = fixture();
+    let env = racer_io::Env::host();
+    let mut f = fixture(&env);
     let ciphertext = fill_and_release(&mut f);
     let decrypts = f.fill.metrics.count(Event::FillDecryptCount);
     let hits = f.fill.metrics.count(Event::MemoryHit);
@@ -1777,7 +1799,6 @@ fn cached_ciphertext_hit_decrypts_without_refetching() {
     assert!(Arc::ptr_eq(&shared.plaintext.inner, &again.plaintext.inner));
     drop((again, shared));
     f.fill.dependencies.flights.poll_budgeted(64).unwrap();
-    f.fill.dependencies.admission.reclaim_buffers();
     assert_eq!(
         f.fill.dependencies.admission.used(ResourceClass::Plaintext),
         0
@@ -1786,9 +1807,8 @@ fn cached_ciphertext_hit_decrypts_without_refetching() {
 
 #[test]
 fn concurrent_cached_ciphertext_hits_coalesce_into_one_decrypt() {
-    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
-    let _owner = queue.enter();
-    let mut f = fixture();
+    let env = racer_io::Env::host();
+    let mut f = fixture(&env);
     fill_and_release(&mut f);
     let decrypts = f.fill.metrics.count(Event::FillDecryptCount);
     let (first, second) = acquire_pair(&mut f);
@@ -1801,9 +1821,8 @@ fn concurrent_cached_ciphertext_hits_coalesce_into_one_decrypt() {
 
 #[test]
 fn live_plaintext_is_reused_without_another_decrypt() {
-    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
-    let _owner = queue.enter();
-    let mut f = fixture();
+    let env = racer_io::Env::host();
+    let mut f = fixture(&env);
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
     let held = acquire(&mut f, &mut budget).unwrap();
     f.fill.dependencies.flights.poll_budgeted(64).unwrap();
@@ -1824,9 +1843,8 @@ fn live_plaintext_is_reused_without_another_decrypt() {
 
 #[test]
 fn peers_receive_cached_ciphertext_without_plaintext() {
-    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
-    let _owner = queue.enter();
-    let mut f = fixture();
+    let env = racer_io::Env::host();
+    let mut f = fixture(&env);
     let ciphertext = fill_and_release(&mut f);
     let decrypts = f.fill.metrics.count(Event::FillDecryptCount);
     let (metadata, copy) = futures::executor::block_on(f.fill.copy_only(&f.page, &f.scope))
@@ -1841,13 +1859,13 @@ fn peers_receive_cached_ciphertext_without_plaintext() {
 }
 
 /// A fixture whose memory cache can hold `pages` ciphertext pages.
-fn roomy_fixture(pages: u64) -> Fixture {
+fn roomy_fixture(env: &racer_io::Env, pages: u64) -> Fixture {
     let mut limits = crate::test_support::cluster::config(false).limits;
     let bytes =
         std::num::NonZeroUsize::new(2 * (pages as usize + 1) * PAGE_BYTES as usize).unwrap();
     limits.ciphertext_bytes = bytes;
     limits.plaintext_bytes = bytes;
-    fixture_with(pages * PAGE_BYTES, Some(limits))
+    fixture_with(env, pages * PAGE_BYTES, Some(limits))
 }
 
 /// Fill `pages` of `f` from origin through `membership`, then release every
@@ -1869,12 +1887,12 @@ fn cache_ciphertext_only(
                     .acquire(page, membership.clone(), &f.context, &f.scope, &mut budget),
                 &mut f.engine,
                 &f.crypto,
+                f.fill.drivers(),
             )
             .unwrap(),
         );
     }
     f.fill.dependencies.flights.poll_budgeted(64).unwrap();
-    f.fill.dependencies.admission.reclaim_buffers();
     assert_eq!(
         f.fill.dependencies.admission.used(ResourceClass::Plaintext),
         0
@@ -1904,7 +1922,7 @@ fn read_range(
     endpoint: &mut crate::read::dispatch::WorkerEndpoint,
     pages: u64,
 ) -> Vec<u64> {
-    let scope = RequestScope::new(f.scope.request, f.scope.deadline.0).unwrap();
+    let scope = RequestScope::host(f.scope.request, f.scope.deadline.0).unwrap();
     let request = ClientRequest {
         kind: ReadKind::Subscription {
             pin: Some(f.page.version.etag.clone()),
@@ -1940,8 +1958,8 @@ fn read_range(
             continue;
         }
         endpoint.poll(&mut cx, 64).unwrap();
-        uring_runtime::drivers::poll(&mut cx, 64);
-        uring_runtime::group::Service::poll_budgeted(&mut f.engine, &mut cx, 64).unwrap();
+        f.fill.drivers().poll(&mut cx, 64);
+        crate::lifecycle::Service::poll_budgeted(&mut f.engine, &mut cx, 64).unwrap();
         f.crypto.poll_budgeted(64).unwrap();
         f.reactor.poll_budgeted(128).unwrap();
     }
@@ -1949,19 +1967,18 @@ fn read_range(
     drop(stream);
     for _ in 0..32 {
         endpoint.poll(&mut cx, 64).unwrap();
-        uring_runtime::drivers::poll(&mut cx, 64);
+        f.fill.drivers().poll(&mut cx, 64);
     }
     delivered
 }
 
 #[test]
 fn warm_range_reread_decrypts_cached_ciphertext_without_any_transfer() {
+    let env = racer_io::Env::host();
     const PAGES: u64 = 6;
     const WINDOW: usize = 4;
-    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
-    let _owner = queue.enter();
-    let signers = network(2);
-    let mut f = roomy_fixture(PAGES);
+    let signers = network(&env, 2);
+    let mut f = roomy_fixture(&env, PAGES);
     f.reactor.init().unwrap();
     // A heavily weighted remote node owns every page, so a missed probe
     // selects the range from it. Any peer request panics.
@@ -1984,8 +2001,14 @@ fn warm_range_reread_decrypts_cached_ciphertext_without_any_transfer() {
     let prefill = f.membership.clone();
     cache_ciphertext_only(&mut f, &prefill, &all);
     let origin = f.origin.calls.get();
-    let (local, mut endpoint, _publication) =
-        coordinator_with_window(&f, &signers[0], &remote, NoPeer::requester(), WINDOW);
+    let (local, mut endpoint, _publication) = coordinator_with_window(
+        &env,
+        &f,
+        &signers[0],
+        &remote,
+        NoPeer::requester(&env),
+        WINDOW,
+    );
     assert_eq!(read_range(&mut f, &local, &mut endpoint, PAGES), all);
     assert_eq!(f.origin.calls.get(), origin, "no origin requests");
     assert_eq!(
@@ -1998,19 +2021,24 @@ fn warm_range_reread_decrypts_cached_ciphertext_without_any_transfer() {
 
 #[test]
 fn warm_range_reread_transfers_only_uncached_pages() {
+    let env = racer_io::Env::host();
     const PAGES: u64 = 6;
     const WINDOW: usize = 4;
-    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
-    let _owner = queue.enter();
-    let signers = network(1);
-    let mut f = roomy_fixture(PAGES);
+    let signers = network(&env, 1);
+    let mut f = roomy_fixture(&env, PAGES);
     f.reactor.init().unwrap();
     let membership = local_membership(&signers[0]);
     let prefill = f.membership.clone();
     cache_ciphertext_only(&mut f, &prefill, &[0, 1, 2, 4, 5]);
     f.origin.started_pages.borrow_mut().clear();
-    let (local, mut endpoint, _publication) =
-        coordinator_with_window(&f, &signers[0], &membership, NoPeer::requester(), WINDOW);
+    let (local, mut endpoint, _publication) = coordinator_with_window(
+        &env,
+        &f,
+        &signers[0],
+        &membership,
+        NoPeer::requester(&env),
+        WINDOW,
+    );
     assert_eq!(
         read_range(&mut f, &local, &mut endpoint, PAGES),
         (0..PAGES).collect::<Vec<_>>()

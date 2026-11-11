@@ -358,9 +358,9 @@ Logs and errors omit URL query and fragment data.
 `InstallAndSwitchFromTarGz` performs the upgrade as one logical operation:
 
 1. Require an HTTP or HTTPS URL and verify the compressed-archive SHA-256 when provided.
-2. Download the tarball within the configured size bound.
-3. Require the archive to contain only the exact `unbounded-agent` entry.
-4. Bound decompression and atomically install the inactive slot.
+2. Download the tarball.
+3. Take the `unbounded-agent` entry at the archive root and ignore every other entry.
+4. Atomically install the inactive slot.
 5. Run `unbounded-agent version` against the staged binary without exposing output.
 6. If the inactive slot is last-good, protect the running binary through `LastGoodPath` before replacing it; otherwise defer the last-good update until candidate verification succeeds.
 7. Atomically update `CurrentPath` to the staged binary.

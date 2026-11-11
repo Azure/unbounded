@@ -234,8 +234,7 @@ NET_FRONTEND_CACHE_FILE    := $(NET_FRONTEND_DIST_DIR)/.frontend-build-key
 # Frontend build toggle (dev builds produce unminified output with sourcemaps).
 REACT_DEV ?= false
 
-.PHONY: all help fmt lint lint-actions test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc install-helm install-kind generate kubectl-unbounded forge relctl relctl-build agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests playpen-manifests e2e-gantry e2e-playpen gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build license-check notice notice-check gantry gantry-build gantry-manifests inventory-manifests
-.PHONY: all help fmt lint lint-actions test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc install-helm generate kubectl-unbounded forge relctl relctl-build agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests playpen-manifests e2e-gantry e2e-playpen e2e-racer gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build license-check notice notice-check gantry gantry-build gantry-manifests inventory-manifests
+.PHONY: all help fmt lint lint-actions test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc install-helm install-kind generate kubectl-unbounded forge relctl relctl-build agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests playpen-manifests e2e-gantry e2e-playpen e2e-racer gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build license-check notice notice-check gantry gantry-build gantry-manifests inventory-manifests
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests gantry-chart-lint gantry-chart-package release-bom release-manifests unbounded-operator-release-manifest
 .PHONY: image-machina-local image-token-refresher-local image-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-unbounded-operator-push image-playpen-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
@@ -369,8 +368,13 @@ help: ## Show this help
 	@echo ""
 	@echo "Racer:"
 	@echo "  racer-test                       Test the Rust Racer workspace and Go Racer API and wire contracts"
+	@echo "  racer-fmt                        Format the Rust Racer workspace"
+	@echo "  racer-lint                       Check Rust formatting, workspace Clippy, and Racer purity"
+	@echo "  racer-purity-graph               Fail when a pure Racer crate depends on an IO crate"
 	@echo "  racer-gpu-test                   Build the CUDA shim with kernels and run GPU hardware tests"
-	@echo "  racer-sim                        Run the Racer simulator (ARGS='--scenario smoke --nodes 16')"
+	@echo "  racer-fuzz                       Run each Racer libFuzzer target briefly (FUZZ_SECONDS, default 30)"
+	@echo "  racer-dst                        Run the Racer DST seed set twice each (DST_SEEDS, DST_STEPS, DST_FILTER)"
+	@echo "  racer-dst-report                 Write one Model scenario's JSON report (ARGS='--scenario full-failover --nodes 200')"
 	@echo "  racer-envtest                    Run Racer API-server tests with KUBEBUILDER_ASSETS"
 	@echo "  racer-envtest-ci                 Provision pinned assets and run Racer API-server tests"
 	@echo "  racer-generate                   Generate Racer deepcopy and CRD artifacts"
@@ -602,6 +606,29 @@ racer-rust-test: ## Test the Rust Racer workspace, including the embedded cluste
 
 racer-test: racer-go-test racer-rust-test ## Check Racer
 
+RACER_RUST_TOOLCHAIN ?= 1.96.0
+
+.PHONY: racer-fmt racer-lint racer-purity-graph
+racer-fmt: ## Format the Rust Racer workspace
+	timeout --signal=TERM --kill-after=10s 300s cargo +$(RACER_RUST_TOOLCHAIN) fmt --manifest-path cmd/racer/Cargo.toml --all
+
+racer-purity-graph: ## Fail when a pure Racer crate depends on an IO crate
+	timeout --signal=TERM --kill-after=10s 300s python3 hack/scripts/racer-purity-graph.py --manifest-path cmd/racer/Cargo.toml --strict
+
+racer-lint: racer-purity-graph ## Check Rust formatting, workspace Clippy, and Racer purity
+	timeout --signal=TERM --kill-after=10s 300s cargo +$(RACER_RUST_TOOLCHAIN) fmt --manifest-path cmd/racer/Cargo.toml --all --check
+	timeout --signal=TERM --kill-after=10s 1200s cargo +$(RACER_RUST_TOOLCHAIN) clippy --locked --manifest-path cmd/racer/Cargo.toml --workspace --all-targets -- -D warnings
+	timeout --signal=TERM --kill-after=10s 600s cargo +$(RACER_RUST_TOOLCHAIN) test --locked --manifest-path cmd/racer/Cargo.toml -p racer-core --test purity
+
+FUZZ_SECONDS ?= 30
+RACER_FUZZ_TARGETS ?= http_head small_body peer_envelope control_documents store_record checkpoint
+
+.PHONY: racer-fuzz
+racer-fuzz: ## Run each Racer libFuzzer target for FUZZ_SECONDS (default 30)
+	cd cmd/racer/fuzz && for target in $(RACER_FUZZ_TARGETS); do \
+		timeout --signal=TERM --kill-after=10s 1500s env RUSTC_BOOTSTRAP=1 cargo +$(RACER_RUST_TOOLCHAIN) fuzz run "$$target" "corpus/$$target" -- -max_total_time=$(FUZZ_SECONDS) || exit 1; \
+	done
+
 RACER_GPU_NATIVE ?= $(CURDIR)/bin/racer-gpu-native
 # 1 skips when no GPU is found; require fails instead (dedicated GPU runners).
 RACER_GPU_TESTS ?= require
@@ -636,11 +663,20 @@ racer-python-dist: ## Build sdists and wheels for racer-client and racer-vllm in
 	timeout --signal=TERM --kill-after=10s 300s "$(RACER_PY_VENV)/bin/python" -m build -o tmp/racer-python-dist clients/python/racer
 	timeout --signal=TERM --kill-after=10s 300s "$(RACER_PY_VENV)/bin/python" -m build -o tmp/racer-python-dist clients/python/racer-vllm
 
-RACER_SIM_TIMEOUT ?= 7200s
+RACER_DST_TIMEOUT ?= 1200s
 
-.PHONY: racer-sim
-racer-sim: ## Run the Racer discrete-event simulator; pass options with ARGS='--nodes 50000 --seed 1'
-	timeout --signal=TERM --kill-after=10s $(RACER_SIM_TIMEOUT) cargo run --release --locked --manifest-path cmd/racer/Cargo.toml -p racer-sim -- $(ARGS)
+# DST_SEEDS: seed file or count N (seeds 1..=N per scenario); default dst/seeds/{ci,regressions}.txt.
+# DST_STEPS: step budget per run. DST_FILTER: scenario name substring. Each entry runs twice.
+.PHONY: racer-dst
+racer-dst: ## Run the Racer deterministic simulation tests; every seed runs twice and must match
+	DST_SEEDS="$(DST_SEEDS)" DST_STEPS="$(DST_STEPS)" DST_FILTER="$(DST_FILTER)" timeout --signal=TERM --kill-after=10s $(RACER_DST_TIMEOUT) cargo +$(RACER_RUST_TOOLCHAIN) run --locked --profile test --manifest-path cmd/racer/Cargo.toml -p racer-dst --bin racer-dst
+
+RACER_DST_REPORT_TIMEOUT ?= 7200s
+
+# One Model scenario's JSON report: --scenario, --nodes, --seed, --duration, --config, --out.
+.PHONY: racer-dst-report
+racer-dst-report: ## Write one Racer Model scenario's JSON report; pass options with ARGS='--scenario full-failover --nodes 200'
+	timeout --signal=TERM --kill-after=10s $(RACER_DST_REPORT_TIMEOUT) cargo +$(RACER_RUST_TOOLCHAIN) run --release --locked --manifest-path cmd/racer/Cargo.toml -p racer-dst --bin racer-dst -- $(ARGS)
 
 $(SETUP_ENVTEST):
 	@mkdir -p bin tmp/envtest-tools
@@ -1148,10 +1184,12 @@ machine-ops-controller-oci-push: machine-ops-controller-oci ## Build and push th
 
 MACHINA_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
 MACHINA_API_SERVER_ENDPOINT ?=
+MACHINA_EXPERIMENTAL_CONTAINER_ISOLATION ?= false
 MACHINA_MANIFEST_TEMPLATES_DIR := deploy/machina
 MACHINA_MANIFEST_RENDERED_DIR  := deploy/machina/rendered
 MACHINE_OPS_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
 MACHINE_OPS_API_SERVER_ENDPOINT ?=
+MACHINE_OPS_EXPERIMENTAL_CONTAINER_ISOLATION ?= false
 MACHINE_OPS_MANIFEST_TEMPLATES_DIR := deploy/machine-ops
 MACHINE_OPS_MANIFEST_RENDERED_DIR  := deploy/machine-ops/rendered
 PLAYPEN_NAMESPACE ?= playpen
@@ -1176,7 +1214,8 @@ machina-manifests: ## Render machina deployment manifests into deploy/machina/re
 		--output-dir $(MACHINA_MANIFEST_RENDERED_DIR) \
 		--set Namespace=$(MACHINA_NAMESPACE) \
 		--set ControllerImage=$(MACHINA_IMAGE) \
-		--set APIServerEndpoint=$(MACHINA_API_SERVER_ENDPOINT)
+		--set APIServerEndpoint=$(MACHINA_API_SERVER_ENDPOINT) \
+		--set ExperimentalContainerIsolation=$(MACHINA_EXPERIMENTAL_CONTAINER_ISOLATION)
 	@cp $(MACHINA_MANIFEST_TEMPLATES_DIR)/crd/*.yaml $(MACHINA_MANIFEST_RENDERED_DIR)/crd/
 	@echo "Rendered machina manifests into $(MACHINA_MANIFEST_RENDERED_DIR) (image: $(MACHINA_IMAGE))"
 
@@ -1215,7 +1254,8 @@ machine-ops-manifests: ## Render machine-ops-controller manifests into deploy/ma
 		--set ControllerImage=$(MACHINE_OPS_CONTROLLER_IMAGE) \
 		--set Provider=$(MACHINE_OPS_PROVIDER) \
 		--set Site=$(MACHINE_OPS_SITE) \
-		--set APIServerEndpoint=$(MACHINE_OPS_API_SERVER_ENDPOINT)
+		--set APIServerEndpoint=$(MACHINE_OPS_API_SERVER_ENDPOINT) \
+		--set ExperimentalContainerIsolation=$(MACHINE_OPS_EXPERIMENTAL_CONTAINER_ISOLATION)
 	@echo "Rendered machine-ops manifests into $(MACHINE_OPS_MANIFEST_RENDERED_DIR) (image: $(MACHINE_OPS_CONTROLLER_IMAGE))"
 
 playpen-manifests: ## Render playpen operator and runner manifests into deploy/playpen/rendered

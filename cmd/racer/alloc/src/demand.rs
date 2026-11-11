@@ -45,6 +45,8 @@ pub struct PoolStats {
     pub trimmed: u64,
     /// Whether the pool is held at its minimum depth.
     pub constrained: bool,
+    /// Checkouts that could not be pooled (no size class was available).
+    pub unpooled: u64,
 }
 
 /// Window-based controller for one idle pool's target depth.
@@ -268,6 +270,7 @@ impl PoolDemand {
             rejects: self.rejects_total,
             trimmed: self.trimmed_total,
             constrained: self.constrained,
+            unpooled: 0,
         }
     }
 }

@@ -8,8 +8,11 @@
  * RACER_GPU_PTX names a PTX file (see build-native-cuda.sh); without it, every
  * other call works and racer_gpu_decrypt returns RACER_GPU_ENOKERNEL.
  *
- * Every call runs on the dataplane's native helper thread. Each call pushes
- * the owning context and pops it before returning. */
+ * Calls may come from several threads (one executor per GPU, plus cuFile
+ * reader threads). Each call pushes the owning context and pops it before
+ * returning, and the shim's own lazy state (driver tables, kernel modules,
+ * peer bits) is guarded by load_lock or atomics. One stream is driven by one
+ * thread at a time. */
 #define _GNU_SOURCE
 #include "gpu_cuda.h"
 #include "cuda_private.h"
@@ -52,6 +55,8 @@ struct nvml_table { void *lib; RACER_NVML_FUNCTIONS(X_FIELD) };
 struct cufile_table { void *lib; int opened; RACER_CUFILE_FUNCTIONS(X_FIELD) };
 
 static struct cuda_table cu;
+static cuFlushGPUDirectRDMAWrites_fn cu_flush_rdma; /* optional */
+static cuLaunchHostFunc_fn cu_launch_host;           /* optional */
 static struct cufile_table cf;
 static pthread_mutex_t load_lock = PTHREAD_MUTEX_INITIALIZER;
 static __thread int32_t last_error;
@@ -70,17 +75,20 @@ static const uint8_t shim_sbox[256] = GCM_SBOX_INIT;
 #define CTR_THREADS 256u
 
 _Static_assert(sizeof(struct gcm_key) <= WORK_VERDICT, "workspace key slot");
-_Static_assert(sizeof(struct gcm_partial) == 32, "partial layout");
+_Static_assert(sizeof(struct gcm_partial) == 16, "partial layout");
 _Static_assert(sizeof(struct gcm_verdict) == sizeof(struct racer_gpu_verdict), "verdict layout");
 
 struct gpu_context {
     CUcontext ctx;
     CUdevice dev;
     int32_t ordinal;
-    int module_state; /* 0 untried, 1 loaded, -1 unavailable */
+    int module_state; /* 0 untried, 1 loaded, -1 unavailable; under load_lock */
+    int kernels_ready; /* atomic; 1 once every kernel function resolved */
     CUmodule module;
     CUfunction partials, finalize, ctr;
     uint64_t peers[RACER_GPU_MAX_PEER_ORDINAL / 64]; /* src ordinals enabled by racer_gpu_peer */
+    int rdma_ordering;                               /* -1 unknown, else CUGPUDirectRDMAWritesOrdering */
+    int rdma_flush;                                  /* cuFlushGPUDirectRDMAWrites usable */
 };
 
 struct gpu_buffer {
@@ -108,7 +116,13 @@ struct gpu_stream {
     CUdeviceptr work;
     uint64_t work_size;
     struct racer_gpu_verdict *verdict; /* pinned host memory */
-    int decrypt;                      /* 0 none, 1 queued, 2 synchronized */
+    CUevent done;                      /* recorded after the verdict copy */
+    int decrypt;                       /* 0 none, 1 queued, 2 complete */
+};
+
+struct gpu_event {
+    struct gpu_context *context;
+    CUevent event;
 };
 
 struct gpu_file {
@@ -148,6 +162,8 @@ int racer_gpu_init(void) {
             rc = RACER_GPU_EUNAVAILABLE;
             goto out;
         }
+        cu_flush_rdma = (cuFlushGPUDirectRDMAWrites_fn)dlsym(table.lib, "cuFlushGPUDirectRDMAWrites");
+        cu_launch_host = (cuLaunchHostFunc_fn)dlsym(table.lib, "cuLaunchHostFunc");
         cu = table;
         goto out;
     missing:
@@ -254,6 +270,7 @@ int racer_gpu_context(int32_t ordinal, void **out) {
     struct gpu_context *c = calloc(1, sizeof(*c));
     if (!c) return RACER_GPU_ENOMEM;
     c->ordinal = ordinal;
+    c->rdma_ordering = -1;
     int rc = drv(cu.cuDeviceGet(&c->dev, ordinal));
     if (!rc) rc = drv(cu.cuDevicePrimaryCtxRetain(&c->ctx, c->dev));
     if (rc) {
@@ -274,14 +291,25 @@ int racer_gpu_context_free(void *context) {
         pop();
         if (rc) return rc;
         c->module_state = 0;
+        __atomic_store_n(&c->kernels_ready, 0, __ATOMIC_RELAXED);
     }
     int rc = drv(cu.cuDevicePrimaryCtxRelease(c->dev));
     if (!rc) free(c);
     return rc;
 }
 
+static int kernels_locked(struct gpu_context *c);
+
 /* Load the decrypt kernels into a context. Context must be current. */
 static int kernels(struct gpu_context *c) {
+    if (__atomic_load_n(&c->kernels_ready, __ATOMIC_ACQUIRE)) return RACER_GPU_OK;
+    pthread_mutex_lock(&load_lock);
+    int rc = kernels_locked(c);
+    pthread_mutex_unlock(&load_lock);
+    return rc;
+}
+
+static int kernels_locked(struct gpu_context *c) {
     if (c->module_state == 0) {
         const char *image = PTX_IMAGE;
         c->module_state = -1;
@@ -295,8 +323,9 @@ static int kernels(struct gpu_context *c) {
             return RACER_GPU_ENOKERNEL;
         }
         c->module_state = 1;
+        __atomic_store_n(&c->kernels_ready, 1, __ATOMIC_RELEASE);
     }
-    return c->module_state == 1 && c->ctr ? RACER_GPU_OK : RACER_GPU_ENOKERNEL;
+    return __atomic_load_n(&c->kernels_ready, __ATOMIC_RELAXED) ? RACER_GPU_OK : RACER_GPU_ENOKERNEL;
 }
 
 int racer_gpu_stream(void *context, void **out) {
@@ -313,8 +342,13 @@ int racer_gpu_stream(void *context, void **out) {
     }
     rc = drv(cu.cuStreamCreate(&s->stream, CU_STREAM_NON_BLOCKING));
     if (!rc) {
-        rc = drv(cu.cuMemAllocHost((void **)&s->verdict, sizeof(*s->verdict)));
+        rc = drv(cu.cuEventCreate(&s->done, CU_EVENT_DISABLE_TIMING));
         if (rc && drv(cu.cuStreamDestroy(s->stream))) rc = RACER_GPU_ELEAKED;
+    }
+    if (!rc) {
+        rc = drv(cu.cuMemAllocHost((void **)&s->verdict, sizeof(*s->verdict)));
+        if (rc && (drv(cu.cuEventDestroy(s->done)) || drv(cu.cuStreamDestroy(s->stream))))
+            rc = RACER_GPU_ELEAKED;
     }
     pop();
     if (rc) {
@@ -350,6 +384,10 @@ int racer_gpu_stream_free(void *stream) {
     if (!rc && s->verdict) {
         rc = drv(cu.cuMemFreeHost(s->verdict));
         if (!rc) s->verdict = NULL;
+    }
+    if (!rc && s->done) {
+        rc = drv(cu.cuEventDestroy(s->done));
+        if (!rc) s->done = NULL;
     }
     if (!rc) rc = drv(cu.cuStreamDestroy(s->stream));
     pop();
@@ -551,7 +589,7 @@ int racer_gpu_copy_d2d(void *stream, void *dst, uint64_t dst_offset, void *src, 
 
 static int peer_enabled(const struct gpu_context *c, int32_t ordinal) {
     return ordinal >= 0 && ordinal < RACER_GPU_MAX_PEER_ORDINAL &&
-           (c->peers[ordinal / 64] >> (ordinal % 64)) & 1u;
+           (__atomic_load_n(&c->peers[ordinal / 64], __ATOMIC_ACQUIRE) >> (ordinal % 64)) & 1u;
 }
 
 int racer_gpu_peer(void *dst, void *src, int *access) {
@@ -561,7 +599,7 @@ int racer_gpu_peer(void *dst, void *src, int *access) {
     if (from->ordinal < 0 || from->ordinal >= RACER_GPU_MAX_PEER_ORDINAL) return RACER_GPU_EINVAL;
     uint64_t bit = 1ull << (from->ordinal % 64);
     if (d == from || d->dev == from->dev) {
-        d->peers[from->ordinal / 64] |= bit;
+        __atomic_fetch_or(&d->peers[from->ordinal / 64], bit, __ATOMIC_RELEASE);
         *access = 1;
         return RACER_GPU_OK;
     }
@@ -572,7 +610,7 @@ int racer_gpu_peer(void *dst, void *src, int *access) {
     CUresult result = cu.cuCtxEnablePeerAccess(from->ctx, 0);
     pop();
     if (result != CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED && (rc = drv(result))) return rc;
-    d->peers[from->ordinal / 64] |= bit;
+    __atomic_fetch_or(&d->peers[from->ordinal / 64], bit, __ATOMIC_RELEASE);
     *access = 1;
     return RACER_GPU_OK;
 }
@@ -621,7 +659,7 @@ int racer_gpu_decrypt(void *stream, const struct racer_gpu_decrypt *p, void *src
     if (!s || !p || buffer(dst, &d) || buffer(src, &from) || from->kind != KIND_STAGING)
         return RACER_GPU_EINVAL;
     if (p->length > RACER_GPU_MAX_DECRYPT || p->aad_length > RACER_GPU_MAX_AAD ||
-        (!p->aad && p->aad_length) || p->check_crc > 1)
+        (!p->aad && p->aad_length) || p->reserved)
         return RACER_GPU_EINVAL;
     if (d->context != s->context || from->context != s->context) return RACER_GPU_EDEVICE;
     if (s->decrypt == 1) return RACER_GPU_EBUSY;
@@ -657,10 +695,8 @@ int racer_gpu_decrypt(void *stream, const struct racer_gpu_decrypt *p, void *src
     CUdeviceptr sealed = from->base + src_offset, out_ptr = d->base + dst_offset;
     CUdeviceptr key_ptr = s->work + WORK_KEY, verdict = s->work + WORK_VERDICT;
     CUdeviceptr partials = s->work + WORK_PARTIALS;
-    uint32_t check = p->check_crc;
-    uint64_t expected = p->expected_crc;
     void *partial_args[] = {&sealed, &n, &key_ptr, &partials, &chunks};
-    void *finalize_args[] = {&sealed, &n, &key_ptr, &partials, &chunks, &check, &expected, &verdict};
+    void *finalize_args[] = {&sealed, &n, &key_ptr, &partials, &chunks, &verdict};
     void *ctr_args[] = {&sealed, &n, &key_ptr, &verdict, &out_ptr};
     uint64_t blocks = (n + 15) / 16;
     rc = drv(cu.cuMemsetD8Async(verdict, 0, sizeof(struct gcm_verdict), s->stream));
@@ -678,6 +714,7 @@ int racer_gpu_decrypt(void *stream, const struct racer_gpu_decrypt *p, void *src
     if (!rc) rc = wiped;
     if (!rc)
         rc = drv(cu.cuMemcpyDtoHAsync(s->verdict, verdict, sizeof(*s->verdict), s->stream));
+    if (!rc) rc = drv(cu.cuEventRecord(s->done, s->stream));
 out:
     pop();
     return rc;
@@ -686,11 +723,191 @@ out:
 int racer_gpu_verdict(void *stream, struct racer_gpu_verdict *out) {
     struct gpu_stream *s = stream;
     if (!s || !out) return RACER_GPU_EINVAL;
+    if (s->decrypt == 1) {
+        /* Completed if the event recorded after the verdict copy has. */
+        int rc = push(s->context);
+        if (rc) return rc;
+        CUresult result = cu.cuEventQuery(s->done);
+        pop();
+        if (result == CUDA_ERROR_NOT_READY) return RACER_GPU_EBUSY;
+        if ((rc = drv(result))) return rc;
+        s->decrypt = 2;
+    }
     if (s->decrypt != 2) return RACER_GPU_EBUSY;
     *out = *s->verdict;
     memset(s->verdict, 0, sizeof(*s->verdict));
     s->decrypt = 0;
     return RACER_GPU_OK;
+}
+
+int racer_gpu_event(void *context, void **out) {
+    struct gpu_context *c = context;
+    if (!c || !out) return RACER_GPU_EINVAL;
+    *out = NULL;
+    struct gpu_event *e = calloc(1, sizeof(*e));
+    if (!e) return RACER_GPU_ENOMEM;
+    e->context = c;
+    int rc = push(c);
+    if (!rc) {
+        rc = drv(cu.cuEventCreate(&e->event, CU_EVENT_DISABLE_TIMING));
+        pop();
+    }
+    if (rc) {
+        free(e);
+        return rc;
+    }
+    *out = e;
+    return RACER_GPU_OK;
+}
+
+int racer_gpu_event_free(void *event) {
+    struct gpu_event *e = event;
+    if (!e) return RACER_GPU_EINVAL;
+    int rc = push(e->context);
+    if (rc) return rc;
+    rc = drv(cu.cuEventSynchronize(e->event));
+    if (!rc) rc = drv(cu.cuEventDestroy(e->event));
+    pop();
+    if (!rc) free(e);
+    return rc;
+}
+
+int racer_gpu_event_record(void *event, void *stream) {
+    struct gpu_event *e = event;
+    struct gpu_stream *s = stream;
+    if (!e || !s) return RACER_GPU_EINVAL;
+    if (e->context != s->context) return RACER_GPU_EDEVICE;
+    int rc = push(s->context);
+    if (rc) return rc;
+    rc = drv(cu.cuEventRecord(e->event, s->stream));
+    pop();
+    return rc;
+}
+
+int racer_gpu_event_query(void *event) {
+    struct gpu_event *e = event;
+    if (!e) return RACER_GPU_EINVAL;
+    int rc = push(e->context);
+    if (rc) return rc;
+    CUresult result = cu.cuEventQuery(e->event);
+    pop();
+    return result == CUDA_ERROR_NOT_READY ? RACER_GPU_EBUSY : drv(result);
+}
+
+int racer_gpu_event_sync(void *event) {
+    struct gpu_event *e = event;
+    if (!e) return RACER_GPU_EINVAL;
+    int rc = push(e->context);
+    if (rc) return rc;
+    rc = drv(cu.cuEventSynchronize(e->event));
+    pop();
+    return rc;
+}
+
+int racer_gpu_stream_wait(void *stream, void *event) {
+    struct gpu_stream *s = stream;
+    struct gpu_event *e = event;
+    if (!s || !e) return RACER_GPU_EINVAL;
+    int rc = push(s->context);
+    if (rc) return rc;
+    rc = drv(cu.cuStreamWaitEvent(s->stream, e->event, 0));
+    pop();
+    return rc;
+}
+
+int racer_gpu_launch_host(void *stream, void (*fn)(void *), void *data) {
+    struct gpu_stream *s = stream;
+    if (!s || !fn) return RACER_GPU_EINVAL;
+    if (!cu_launch_host) return RACER_GPU_EUNAVAILABLE;
+    int rc = push(s->context);
+    if (rc) return rc;
+    rc = drv(cu_launch_host(s->stream, fn, data));
+    pop();
+    return rc;
+}
+
+int racer_gpu_host_alloc(void *context, uint64_t size, void **out) {
+    struct gpu_context *c = context;
+    if (!c || !size || size > SIZE_MAX || !out) return RACER_GPU_EINVAL;
+    *out = NULL;
+    int rc = push(c);
+    if (rc) return rc;
+    rc = drv(cu.cuMemHostAlloc(out, size, CU_MEMHOSTALLOC_PORTABLE));
+    pop();
+    return rc ? (*out = NULL, rc) : RACER_GPU_OK;
+}
+
+int racer_gpu_host_free(void *context, void *host) {
+    struct gpu_context *c = context;
+    if (!c || !host) return RACER_GPU_EINVAL;
+    int rc = push(c);
+    if (rc) return rc;
+    rc = drv(cu.cuMemFreeHost(host));
+    pop();
+    return rc;
+}
+
+int racer_gpu_host_register(void *context, void *host, uint64_t size) {
+    struct gpu_context *c = context;
+    if (!c || !host || !size || size > SIZE_MAX) return RACER_GPU_EINVAL;
+    int rc = push(c);
+    if (rc) return rc;
+    rc = drv(cu.cuMemHostRegister(host, size, CU_MEMHOSTREGISTER_PORTABLE));
+    pop();
+    return rc;
+}
+
+int racer_gpu_host_unregister(void *context, void *host) {
+    struct gpu_context *c = context;
+    if (!c || !host) return RACER_GPU_EINVAL;
+    int rc = push(c);
+    if (rc) return rc;
+    rc = drv(cu.cuMemHostUnregister(host));
+    pop();
+    return rc;
+}
+
+int racer_gpu_copy_d2h_async(void *stream, void *dst, void *src, uint64_t src_offset,
+                             uint64_t length) {
+    struct gpu_stream *s = stream;
+    struct gpu_buffer *from;
+    if (!s || !dst || buffer(src, &from) || from->kind != KIND_STAGING) return RACER_GPU_EINVAL;
+    if (from->context != s->context) return RACER_GPU_EDEVICE;
+    int rc = span(from, src_offset, length);
+    if (rc) return rc;
+    if ((rc = push(s->context))) return rc;
+    rc = drv(cu.cuMemcpyDtoHAsync(dst, from->base + src_offset, length, s->stream));
+    pop();
+    return rc;
+}
+
+int racer_gpu_flush_rdma(void *context, uint32_t scope) {
+    struct gpu_context *c = context;
+    if (!c || (scope != RACER_GPU_RDMA_SCOPE_OWNER && scope != RACER_GPU_RDMA_SCOPE_ALL))
+        return RACER_GPU_EINVAL;
+    int ordering = __atomic_load_n(&c->rdma_ordering, __ATOMIC_ACQUIRE);
+    if (ordering < 0) {
+        int value = CU_GPU_DIRECT_RDMA_WRITES_ORDERING_NONE, options = 0;
+        if (cu.cuDeviceGetAttribute(&value, CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WRITES_ORDERING,
+                                    c->dev) != CUDA_SUCCESS)
+            value = CU_GPU_DIRECT_RDMA_WRITES_ORDERING_NONE;
+        if (cu.cuDeviceGetAttribute(&options,
+                                    CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_FLUSH_WRITES_OPTIONS,
+                                    c->dev) != CUDA_SUCCESS)
+            options = 0;
+        __atomic_store_n(&c->rdma_flush,
+                         cu_flush_rdma && (options & CU_FLUSH_GPU_DIRECT_RDMA_WRITES_OPTION_HOST),
+                         __ATOMIC_RELAXED);
+        __atomic_store_n(&c->rdma_ordering, value < 0 ? 0 : value, __ATOMIC_RELEASE);
+        ordering = value < 0 ? 0 : value;
+    }
+    if ((uint32_t)ordering >= scope) return RACER_GPU_OK;
+    if (!__atomic_load_n(&c->rdma_flush, __ATOMIC_RELAXED)) return RACER_GPU_EUNSUPPORTED;
+    int rc = push(c);
+    if (rc) return rc;
+    rc = drv(cu_flush_rdma(CU_FLUSH_GPU_DIRECT_RDMA_WRITES_TARGET_CURRENT_CTX, (int)scope));
+    pop();
+    return rc;
 }
 
 static int file_error(CUfileError_t e) {

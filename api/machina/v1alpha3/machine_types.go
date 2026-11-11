@@ -31,6 +31,10 @@ const (
 // +kubebuilder:printcolumn:name="Phase",type="string",JSONPath=".status.phase"
 // +kubebuilder:printcolumn:name="K8s Version",type="string",JSONPath=".spec.kubernetes.version"
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
+// The allocationRef and fenced transition rules sit on the root, not on spec,
+// because a rule on the spec node is skipped when an update drops the whole spec.
+// +kubebuilder:validation:XValidation:rule="(has(self.spec) && has(self.spec.allocationRef)) == (has(oldSelf.spec) && has(oldSelf.spec.allocationRef)) && (!has(self.spec) || !has(self.spec.allocationRef) || self.spec.allocationRef == oldSelf.spec.allocationRef)",message="allocationRef is immutable",fieldPath=".spec.allocationRef"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.spec) || !has(oldSelf.spec.fenced) || !oldSelf.spec.fenced || (has(self.spec) && has(self.spec.fenced) && self.spec.fenced)",message="fenced cannot be unset",fieldPath=".spec.fenced"
 
 // Machine represents a machine that can be managed by machina.
 type Machine struct {
@@ -129,6 +133,7 @@ const (
 // MachineSpec defines the desired state of a Machine.
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.provider) || (has(self.provider) && self.provider == oldSelf.provider)",message="provider is immutable once set"
 // +kubebuilder:validation:XValidation:rule="!has(self.host) || (!has(self.host.netboot) && !has(self.host.azure) && !has(self.host.external)) || (!has(self.pxe) && !has(self.provider) && !has(self.providerID))",message="host ownership cannot be combined with legacy pxe, provider, or providerID fields"
+// +kubebuilder:validation:XValidation:rule="!has(self.fenced) || !self.fenced || has(self.allocationRef)",message="fenced requires allocationRef"
 type MachineSpec struct {
 	// SSH contains the SSH connection and credential details for the
 	// machine.
@@ -154,7 +159,9 @@ type MachineSpec struct {
 	// already uses. Setting it does not move a running node: the node changes
 	// to this mode at its next repave, which the agent performs when the Node
 	// is deleted. The enum lists only the modes this release can run.
-	// +kubebuilder:validation:Enum="";nspawn
+	// container is experimental: machina provisions it, and the agent runs
+	// it, only when explicitly enabled (see the isolation reference docs).
+	// +kubebuilder:validation:Enum="";nspawn;none;container
 	// +optional
 	Isolation IsolationMode `json:"isolation,omitempty"`
 
@@ -187,6 +194,16 @@ type MachineSpec struct {
 	// controller.
 	// +optional
 	ConfigurationRef *MachineConfigurationRef `json:"configurationRef,omitempty"`
+
+	// AllocationRef identifies the MachineAllocation this Machine was
+	// created for. It can be set only when the Machine is created.
+	// +optional
+	AllocationRef *UIDReference `json:"allocationRef,omitempty"`
+
+	// Fenced forbids the agent from starting this Machine's node again. It
+	// can only change from false to true, and requires AllocationRef.
+	// +optional
+	Fenced bool `json:"fenced,omitempty"`
 }
 
 // ProviderMachineReference identifies a cluster-scoped provider-owned Machine
@@ -395,6 +412,16 @@ type DHCPLease struct {
 	// DNS is a list of DNS server addresses.
 	// +optional
 	DNS []string `json:"dns,omitempty"`
+
+	// HoldLease, when true, makes the installed host also run a DHCPv4
+	// client on this lease's NIC so the site DHCP server keeps the lease
+	// for IPv4 and does not reassign it to another host. The static
+	// address, gateway, and DNS remain authoritative; routes, DNS, NTP,
+	// hostname, and domains from DHCP are ignored. The site DHCP server
+	// should reserve IPv4 for MAC. Leave unset where there is no DHCP
+	// server.
+	// +optional
+	HoldLease bool `json:"holdLease,omitempty"`
 }
 
 // RedfishSpec defines Redfish BMC connection details.
@@ -584,9 +611,16 @@ type KubernetesSpec struct {
 // IsolationMode names where the node stack runs on a host.
 type IsolationMode string
 
-// IsolationNSpawn runs the node stack in a systemd-nspawn machine. It is the
-// default.
-const IsolationNSpawn IsolationMode = "nspawn"
+const (
+	// IsolationNSpawn runs the node stack in a systemd-nspawn machine. It is
+	// the default.
+	IsolationNSpawn IsolationMode = "nspawn"
+	// IsolationNone runs the node stack directly on the host.
+	IsolationNone IsolationMode = "none"
+	// IsolationContainer runs the node stack in a privileged OCI container.
+	// It is experimental and must be enabled explicitly.
+	IsolationContainer IsolationMode = "container"
+)
 
 // IsolationChangePhase is how far a mode change got.
 // +kubebuilder:validation:Enum=InProgress;Succeeded;Failed
@@ -620,11 +654,15 @@ const (
 // IsolationChangeStatus.Reason.
 const (
 	// IsolationChangeReasonUnsupportedMode means the agent on the host cannot
-	// run the target mode, for example because it predates it.
+	// run the target mode, for example because it predates it, or cannot
+	// change a running node to it.
 	IsolationChangeReasonUnsupportedMode = "UnsupportedMode"
 	// IsolationChangeReasonReprovisionNotAllowed means the change needs a
 	// reprovision and the Machine does not carry AnnotationAllowReprovision.
 	IsolationChangeReasonReprovisionNotAllowed = "ReprovisionNotAllowed"
+	// IsolationChangeReasonExperimentalNotEnabled means the target mode is
+	// experimental and the agent's configuration does not opt in to it.
+	IsolationChangeReasonExperimentalNotEnabled = "ExperimentalNotEnabled"
 )
 
 // IsolationChangeMessageMaxLength is the longest IsolationChangeStatus.Message
@@ -857,7 +895,7 @@ type MachineStatus struct {
 	// Isolation is the isolation mode the agent reports as applied on the
 	// host. Empty means the agent has not reported one. It is compared with
 	// spec.isolation to report drift. Only the agent writes it.
-	// +kubebuilder:validation:Enum="";nspawn
+	// +kubebuilder:validation:Enum="";nspawn;none;container
 	// +optional
 	Isolation IsolationMode `json:"isolation,omitempty"`
 

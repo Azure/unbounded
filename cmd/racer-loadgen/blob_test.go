@@ -302,6 +302,15 @@ func TestSDKAdmissionAndIndependentTarget(t *testing.T) {
 	config = sdkClientConfig(opts, maxLiveConcurrency)
 	require.Equal(t, 2048, config.MaxConnections)
 
+	// Parallel ranges each hold a connection, so they widen admission.
+	opts.RangeBytes, opts.RangeParallel = 64<<20, 16
+	config = sdkClientConfig(opts, opts.Concurrency)
+	require.Equal(t, 800*16, config.MaxConnections)
+
+	opts.RangeBytes = 0
+	config = sdkClientConfig(opts, opts.Concurrency)
+	require.Equal(t, 800, config.MaxConnections, "range-parallel is unused without range-bytes")
+
 	p, err := newPuller(&syntheticImage{}, opts, pullTestMetrics())
 	require.NoError(t, err, "NewClient is valid without dialing a Racer or Gantry endpoint")
 	p.close()

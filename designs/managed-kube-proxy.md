@@ -70,9 +70,10 @@ Unbounded-owned DaemonSets whose site no longer exists are deleted.
 
 ## DaemonSet Template
 
-The managed DaemonSet uses the cluster's existing `kube-system/kube-proxy` image
-when available. If that DaemonSet does not exist, it falls back to
-`registry.k8s.io/kube-proxy:<server version>`.
+The managed DaemonSet copies the cluster's versioned `kube-system/kube-proxy`
+image as-is when available, including any digest. An unversioned provider image
+supplies its registry/repository. If there is no provider image, the final
+fallback repository is `registry.k8s.io/kube-proxy`.
 
 Image selection can be overridden with:
 
@@ -81,6 +82,43 @@ controller:
   managedKubeProxy:
     image: <image>
 ```
+
+An override with a tag or digest is used as-is. One without, such as a private
+mirror's `myregistry.example.com/kube-proxy`, takes the tag of the image
+`kube-system/kube-proxy` runs, so the mirror keeps the provider's version. Only
+the tag carries over, never the digest, because a mirror that re-pushed the
+image can hold it under a different digest.
+
+When no version is available, the controller parses the API server version into
+major.minor.patch and searches the selected repository for that exact release.
+The highest numeric `-N` maintenance suffix wins over the unsuffixed release;
+for example, `v1.36.2-2` wins over `v1.36.2-1` and `v1.36.2`. If no maintenance
+tag exists, the exact matching tag is used. Other patch/minor releases,
+prereleases, and architecture suffixes are excluded. Explicit and
+provider-supplied versions, including `:latest`, remain unchanged. Automatic
+fallback selection never chooses `latest`.
+
+Provider reads start immediately, and NotFound errors fall back immediately.
+Other provider read errors use exponential backoff, starting at 10 seconds,
+doubling after each failure, and capping the delay at 5 minutes. The total retry
+window is limited to 12 hours of wall-clock time, including API requests and
+waits. Expiration proceeds to API-server-version-based fallback; leadership
+cancellation stops discovery without falling back. Registry tag listing uses
+its separate 30-second timeout and 100-page limit, with anonymous access,
+pagination, and safe redirects. Missing or invalid API server versions,
+incomplete tag listings, and missing matching tags return errors and leave the
+managed kube-proxy controller unstarted rather than guessing an image.
+
+The image is worked out once, when the controller starts leading. Image
+discovery and managed kube-proxy startup run in a background goroutine under
+the leadership context, without blocking the other controllers or shared
+informer startup. After constructing the managed kube-proxy controller, the
+goroutine calls Start on both shared informer factories again. These calls are
+idempotent and start any newly requested informers, without relying on another
+controller to request the same resources or factories first.
+Where the operator manages unbounded-net, `images.kubeProxy` in its overrides
+ConfigMap sets the same flag on the controller Deployment, so it takes precedence
+over the runtime setting and changing it restarts the controller.
 
 Managed kube-proxy can be disabled with:
 

@@ -4,6 +4,11 @@
 package provision
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -107,47 +112,81 @@ func TestUnboundedAgentInstallScriptSeed(t *testing.T) {
 	require.Contains(t, string(out), "Not seeding")
 }
 
-func TestUnboundedAgentUninstallScript(t *testing.T) {
+// TestUnboundedAgentInstallScriptVerifiesDigest runs the download block with a
+// stand-in curl. With AGENT_SHA256 set the tarball is saved, checked and only
+// then extracted. Without it the script streams the tarball as before.
+func TestUnboundedAgentInstallScriptVerifiesDigest(t *testing.T) {
 	t.Parallel()
 
-	script := UnboundedAgentUninstallScript("my-test-node")
-	require.NotEmpty(t, script)
+	script := UnboundedAgentInstallScript()
+	start := strings.Index(script, `if [ -n "${AGENT_SHA256:-}" ]; then`)
+	require.GreaterOrEqual(t, start, 0)
 
-	// Should be a valid bash script.
-	require.Contains(t, script, "#!/bin/bash")
-	require.Contains(t, script, "set -eo pipefail")
+	const end = "\nfi\n"
 
-	// Machine name should be baked in, not the placeholder.
-	require.Contains(t, script, `MACHINE_NAME="my-test-node"`)
-	require.NotContains(t, script, "UNBOUNDED_MACHINE_NAME_PLACEHOLDER")
+	length := strings.Index(script[start:], end)
+	require.Positive(t, length)
 
-	// Should reference key cleanup operations.
-	require.Contains(t, script, "machinectl stop")
-	require.Contains(t, script, "machinectl terminate")
-	require.Contains(t, script, "ip link delete")
-	require.Contains(t, script, "/etc/systemd/nspawn/${MACHINE_NAME}.nspawn")
-	require.Contains(t, script, "/var/lib/machines/${MACHINE_NAME}")
-	require.Contains(t, script, "nftables-flush.service")
-	require.Contains(t, script, "99-kubernetes.conf")
-	require.Contains(t, script, "sysctl --system")
-	require.Contains(t, script, "docker.service")
-	require.Contains(t, script, "fstab.bak")
-	require.Contains(t, script, "swapon")
-	require.Contains(t, script, "unbounded-agent-uninstall.sh")
-	require.Contains(t, script, "daemon-reload")
-}
+	block := script[start : start+length+len(end)]
+	require.Contains(t, block, `curl -fsSL "${AGENT_URL}" | tar -xz -C "${tmp_dir}" unbounded-agent`)
+	require.Contains(t, block, "sha256sum -c")
 
-func TestUnboundedAgentUninstallScript_PlaceholderFullyReplaced(t *testing.T) {
-	t.Parallel()
+	var archive bytes.Buffer
 
-	script := UnboundedAgentUninstallScript("worker-42")
+	gz := gzip.NewWriter(&archive)
+	tw := tar.NewWriter(gz)
+	content := []byte("#!/bin/sh\necho agent\n")
+	require.NoError(t, tw.WriteHeader(&tar.Header{Name: "unbounded-agent", Mode: 0o755, Size: int64(len(content))}))
+	_, err := tw.Write(content)
+	require.NoError(t, err)
+	require.NoError(t, tw.Close())
+	require.NoError(t, gz.Close())
 
-	// The placeholder should not appear anywhere in the rendered script.
-	count := strings.Count(script, "UNBOUNDED_MACHINE_NAME_PLACEHOLDER")
-	require.Equal(t, 0, count, "placeholder should be fully replaced")
+	source := filepath.Join(t.TempDir(), "agent.tar.gz")
+	require.NoError(t, os.WriteFile(source, archive.Bytes(), 0o600))
 
-	// The machine name should appear in multiple places (MACHINE_NAME var,
-	// nspawn paths, rootfs paths, header comment).
-	nameCount := strings.Count(script, "worker-42")
-	require.GreaterOrEqual(t, nameCount, 2, "machine name should appear in multiple places")
+	sum := sha256.Sum256(archive.Bytes())
+	digest := hex.EncodeToString(sum[:])
+
+	// The stand-in curl writes to the -o file when given one and otherwise
+	// streams to stdout, the two ways the block calls it.
+	const fakeCurl = `curl() { if [ "$2" = "-o" ]; then cp "$4" "$3"; else cat "$2"; fi; }` + "\n"
+
+	run := func(t *testing.T, sha string) (string, []byte, error) {
+		t.Helper()
+
+		tmpDir := t.TempDir()
+		cmd := exec.Command("bash", "-eo", "pipefail", "-c", fakeCurl+block)
+
+		cmd.Env = append(os.Environ(), "AGENT_URL="+source, "tmp_dir="+tmpDir, "AGENT_SHA256="+sha)
+		out, err := cmd.CombinedOutput()
+
+		return tmpDir, out, err
+	}
+
+	t.Run("matching digest", func(t *testing.T) {
+		t.Parallel()
+
+		tmpDir, out, err := run(t, digest)
+		require.NoError(t, err, "%s", out)
+		require.FileExists(t, filepath.Join(tmpDir, "unbounded-agent"))
+		require.FileExists(t, filepath.Join(tmpDir, "unbounded-agent.tar.gz"))
+	})
+
+	t.Run("mismatched digest", func(t *testing.T) {
+		t.Parallel()
+
+		tmpDir, out, err := run(t, strings.Repeat("0", 64))
+		require.Error(t, err, "%s", out)
+		require.NoFileExists(t, filepath.Join(tmpDir, "unbounded-agent"))
+	})
+
+	t.Run("digest unset", func(t *testing.T) {
+		t.Parallel()
+
+		tmpDir, out, err := run(t, "")
+		require.NoError(t, err, "%s", out)
+		require.FileExists(t, filepath.Join(tmpDir, "unbounded-agent"))
+		require.NoFileExists(t, filepath.Join(tmpDir, "unbounded-agent.tar.gz"))
+	})
 }

@@ -9,6 +9,7 @@ use self::range_stream::RangeStreams;
 use crate::client::ClientRequest;
 use crate::client::ReadKind;
 use crate::control::Snapshot;
+use crate::control::cell::PublicationCell;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
@@ -16,7 +17,7 @@ use crate::model::ByteRange;
 use crate::model::MetadataSelector;
 use crate::model::ObjectId;
 use crate::model::ObjectMetadata;
-use crate::model::PAGE_BYTES;
+use crate::model::PageSize;
 use crate::model::ResolvedRange;
 use crate::peer::forwarding::VerifiedRequest;
 use crate::peer::protocol::FetchMode;
@@ -28,7 +29,6 @@ use crate::security::ChargedOriginContext;
 use crate::security::CredentialCrypto;
 use crate::security::OriginContext;
 use crate::security::PeerOriginContext;
-use controlplane::Published;
 use std::rc::Rc;
 
 pub mod candidates;
@@ -39,6 +39,7 @@ pub(crate) mod gpu_copies;
 pub mod metadata;
 pub mod range_stream;
 pub mod sealed;
+pub(crate) mod shared;
 pub mod spill;
 
 /// Metadata and its optional stream, with no independent range to disagree with it.
@@ -69,7 +70,7 @@ impl ReadPayload {
 
 /// Coordinate client admission and peer acquisition on the current worker.
 pub struct Coordinator {
-    snapshots: std::sync::Arc<Published<Snapshot>>,
+    snapshots: std::sync::Arc<PublicationCell<Snapshot>>,
 
     pub(super) metadata: Rc<MetadataService>,
 
@@ -105,15 +106,26 @@ pub(crate) fn inherited_budget(
 }
 
 impl Coordinator {
+    /// This worker's detached driver queue.
+    pub(crate) fn drivers(&self) -> &Rc<crate::drivers::DriverQueue> {
+        self.fill.dependencies.candidates.drivers()
+    }
+
     /// Expose the fill's hedge owner for coordinator tests.
     #[cfg(test)]
     pub(crate) fn hedge_owner(&self) -> Option<&std::sync::Arc<candidates::Hedges>> {
         self.fill.hedge_owner()
     }
 
+    /// In-flight GPU fetches and requests joined to them, for tests.
+    #[cfg(test)]
+    pub(crate) fn gpu_flights(&self) -> (usize, usize) {
+        self.fill.gpu_copies.flights()
+    }
+
     /// Assemble worker-local services without transferring their reactor ownership.
     pub fn new(
-        snapshots: std::sync::Arc<Published<Snapshot>>,
+        snapshots: std::sync::Arc<PublicationCell<Snapshot>>,
         metadata: Rc<MetadataService>,
         fill: Rc<Fill>,
         streams: Rc<RangeStreams>,
@@ -138,7 +150,7 @@ impl Coordinator {
         membership: std::sync::Arc<crate::topology::Membership>,
         page: &crate::model::PageId,
         scope: &RequestScope,
-    ) -> Option<Vec<racer_control_wire::NodeId>> {
+    ) -> Option<Vec<racer_wire::control::NodeId>> {
         let mut owners = self
             .fill
             .dependencies
@@ -159,7 +171,7 @@ impl Coordinator {
     fn note_successor(
         &self,
         page: &crate::model::PageId,
-        requester: &racer_control_wire::NodeId,
+        requester: &racer_wire::control::NodeId,
         membership: &crate::topology::Membership,
         copy_only: bool,
     ) {
@@ -184,7 +196,7 @@ impl Coordinator {
             .note(
                 page.clone(),
                 requester.clone(),
-                uring_runtime::environment::now(),
+                self.fill.dependencies.candidates.ctx().now(),
             );
         self.fill
             .metrics
@@ -197,7 +209,7 @@ impl Coordinator {
     async fn defer_to_successor(
         &self,
         page: &crate::model::PageId,
-        requester: &racer_control_wire::NodeId,
+        requester: &racer_wire::control::NodeId,
         membership: std::sync::Arc<crate::topology::Membership>,
         scope: &RequestScope,
     ) -> bool {
@@ -214,7 +226,11 @@ impl Coordinator {
             .candidates
             .successors
             .borrow()
-            .peek_for(page, requester, uring_runtime::environment::now());
+            .peek_for(
+                page,
+                requester,
+                self.fill.dependencies.candidates.ctx().now(),
+            );
         if hints.is_empty() {
             return false;
         }
@@ -235,7 +251,7 @@ impl Coordinator {
                 requester.clone(),
                 &to,
                 MAX_DEFERRALS,
-                uring_runtime::environment::now(),
+                self.fill.dependencies.candidates.ctx().now(),
             );
         self.fill
             .metrics
@@ -250,7 +266,7 @@ impl Coordinator {
     async fn copy_join_allowed(
         &self,
         page: &crate::model::PageId,
-        requester: &racer_control_wire::NodeId,
+        requester: &racer_wire::control::NodeId,
         membership: std::sync::Arc<crate::topology::Membership>,
         scope: &RequestScope,
     ) -> bool {
@@ -290,7 +306,7 @@ impl Coordinator {
     fn serve_offer(
         &self,
         page: &crate::model::PageId,
-        requester: &racer_control_wire::NodeId,
+        requester: &racer_wire::control::NodeId,
     ) -> Result<PeerResponse> {
         let holds = self.fill.holds(page);
         let acquiring = self.fill.dependencies.flights.acquiring(page);
@@ -306,7 +322,7 @@ impl Coordinator {
                     requester.clone(),
                     holds,
                     acquiring,
-                    uring_runtime::environment::now(),
+                    self.fill.dependencies.candidates.ctx().now(),
                 )
         {
             self.fill
@@ -359,10 +375,7 @@ impl Coordinator {
         Box::pin(async move {
             scope.check()?;
             let snapshot = self.snapshots.current()?.ok_or(Error::Unavailable)?;
-            if !snapshot
-                .caches
-                .iter()
-                .any(|c| c.id == request.origin.object.cache)
+            if !snapshot.caches.contains(&request.origin.object.cache)
                 || !self.availability.metadata(&request.origin.object.cache)
             {
                 return Err(Error::Unavailable);
@@ -399,7 +412,7 @@ impl Coordinator {
                         pin: None,
                         range,
                         page_credits: direct_window,
-                        byte_credits: direct_window as u64 * PAGE_BYTES,
+                        byte_credits: direct_byte_credits(direct_window, snapshot.page_size),
                     }
                 }
                 kind => kind,
@@ -417,8 +430,11 @@ impl Coordinator {
                             payload: ReadPayload::Empty,
                         });
                     }
-                    let range =
-                        resolve_range(range.unwrap_or(ByteRange::From(0)), metadata.length)?;
+                    let range = resolve_range(
+                        range.unwrap_or(ByteRange::From(0)),
+                        metadata.length,
+                        snapshot.page_size,
+                    )?;
                     let passthrough = self.fill.passthrough(&origin.object.cache);
                     let mut body = self.streams.open(
                         metadata.clone(),
@@ -447,7 +463,7 @@ impl Coordinator {
     }
 
     /// The node's worker directory, which owns the prefetch registry.
-    pub(crate) fn prefetch_directory(&self) -> &std::sync::Arc<dispatch::WorkerDirectory> {
+    pub(crate) fn prefetch_directory(&self) -> &std::rc::Rc<dispatch::WorkerDirectory> {
         self.streams.directory()
     }
 
@@ -464,11 +480,11 @@ impl Coordinator {
     /// not published or not ready.
     pub(crate) fn cache_membership(
         &self,
-        cache: &racer_control_wire::CacheId,
+        cache: &racer_wire::control::CacheId,
     ) -> Result<std::sync::Arc<crate::topology::Membership>> {
         let snapshot = self.snapshots.current()?.ok_or(Error::Unavailable)?;
         // Only the cache's pool members place, fill and track its pages.
-        if !snapshot.caches.iter().any(|c| &c.id == cache)
+        if !snapshot.caches.contains(cache)
             || !self.availability.metadata(cache)
             || !snapshot.membership.serves(cache, &self.local_node())
         {
@@ -477,11 +493,20 @@ impl Coordinator {
         Ok(snapshot.membership.clone())
     }
 
-    pub(crate) fn cache_passthrough(&self, cache: &racer_control_wire::CacheId) -> bool {
+    /// The page size the cluster publication fixed; unavailable before one is adopted.
+    pub(crate) fn page_size(&self) -> Result<PageSize> {
+        Ok(self
+            .snapshots
+            .current()?
+            .ok_or(Error::Unavailable)?
+            .page_size)
+    }
+
+    pub(crate) fn cache_passthrough(&self, cache: &racer_wire::control::CacheId) -> bool {
         self.fill.passthrough(cache)
     }
 
-    pub(crate) fn local_node(&self) -> racer_control_wire::NodeId {
+    pub(crate) fn local_node(&self) -> racer_wire::control::NodeId {
         self.fill.dependencies.candidates.node.clone()
     }
 
@@ -492,7 +517,7 @@ impl Coordinator {
         object: &ObjectId,
         page: u64,
         scope: &RequestScope,
-    ) -> Result<Option<racer_control_wire::NodeId>> {
+    ) -> Result<Option<racer_wire::control::NodeId>> {
         Ok(self
             .fill
             .dependencies
@@ -508,7 +533,7 @@ impl Coordinator {
     pub(crate) async fn peer_prefetch(
         &self,
         membership: &std::sync::Arc<crate::topology::Membership>,
-        owner: &racer_control_wire::NodeId,
+        owner: &racer_wire::control::NodeId,
         context: &OriginContext,
         operation: &PeerOperation,
         scope: &RequestScope,
@@ -532,6 +557,7 @@ impl Coordinator {
         Ok(match response.response() {
             PeerResponse::Prefetch(results) => PeerResponse::Prefetch(results.clone()),
             PeerResponse::Overloaded => PeerResponse::Overloaded,
+            PeerResponse::FlightFull => PeerResponse::FlightFull,
             PeerResponse::Unavailable => PeerResponse::Unavailable,
             PeerResponse::Miss => PeerResponse::Miss,
             PeerResponse::StaleMembership => PeerResponse::StaleMembership,
@@ -650,14 +676,8 @@ impl LocalPageService for Coordinator {
                 return Err(error.into());
             }
             let object = object.ok_or(Error::InvalidRequest)?;
-            let cache_available = self
-                .snapshots
-                .current()?
-                .ok_or(Error::Unavailable)?
-                .caches
-                .iter()
-                .any(|c| c.id == object.cache)
-                && self.availability.metadata(&object.cache);
+            // `metadata` checks cache admission against the current publication.
+            let cache_available = self.availability.metadata(&object.cache);
             let action = serve_action(facts(cache_available));
             if action == ServeAction::Miss {
                 return Ok(PeerResponse::Miss);
@@ -858,9 +878,15 @@ fn validate_metadata(
 }
 
 /// Preserve the object's length when translating an unsatisfiable client range.
-fn resolve_range(range: ByteRange, length: u64) -> Result<ResolvedRange> {
+/// Byte credits for a direct read's `window` pages at the published page
+/// size, so a small-page cluster does not grant 16 MiB per page.
+fn direct_byte_credits(window: usize, page: PageSize) -> u64 {
+    (window as u64).saturating_mul(page.get())
+}
+
+fn resolve_range(range: ByteRange, length: u64, page: PageSize) -> Result<ResolvedRange> {
     range
-        .resolve(length)
+        .resolve_paged(length, page)
         .map_err(|error| match Error::from(error) {
             Error::UnsatisfiableRange => Error::UnsatisfiableRangeWithLength(length),
             other => other,
@@ -877,6 +903,7 @@ fn peer_error(error: Error) -> Result<PeerResponse> {
         Some(ResponseKind::NotFound) => PeerResponse::NotFound,
         Some(ResponseKind::VersionUnavailable) => PeerResponse::VersionUnavailable,
         Some(ResponseKind::Overloaded) => PeerResponse::Overloaded,
+        Some(ResponseKind::FlightFull) => PeerResponse::FlightFull,
         Some(ResponseKind::OriginRejected) => PeerResponse::OriginRejected,
         Some(ResponseKind::OriginForbidden) => PeerResponse::OriginForbidden,
         Some(ResponseKind::Unavailable) => PeerResponse::Unavailable,

@@ -53,6 +53,7 @@ scoping is inherent to the per-site component):
 | `--health-port` | 8081 | Health/readiness probe port |
 | `--serve-url` | | External URL of this metalman instance |
 | `--default-netboot-image` | release-matched `netboot` image | Configured netboot OCI artifact used when `spec.host.netboot.netbootImage` is omitted |
+| `--experimental-container-isolation` | `false` | Enable the experimental `container` isolation mode: every agent configuration metalman renders opts in. Without it, a Machine that declares `spec.isolation: container` is not replaced and gets no agent configuration, but `grub.cfg` still chainloads its local disk when no install is pending. Not set by the operator; append it with a metalman `extraArgs` [workload override]({{< relref "reference/workload-overrides" >}}). See [Enabling the container mode]({{< relref "reference/agent/isolation#enabling-the-container-mode" >}}) |
 
 When `--dhcp-interface` is set, metalman binds to the interface for broadcast DHCP, and the DHCP server requires leader election. Without it, metalman accepts relayed (unicast) DHCP packets and the DHCP server responds regardless of leader status. Leader election always runs at the manager level for the reconcilers.
 
@@ -182,6 +183,7 @@ spec:
         subnetMask: "255.255.255.0"
         gateway: "10.10.0.1"
         dns: ["8.8.8.8"]
+        holdLease: true # optional: keep the site DHCP lease for this address
       cloudInit:
         userDataConfigMapRef:
           name: my-cloud-init
@@ -199,7 +201,7 @@ If the referenced ConfigMap does not exist, metalman falls back to the default m
 3. **GRUB decision.** A rendered `grub.cfg` checks for an active `HostReplace` `MachineOperation` targeting the Machine. If a repave is requested, GRUB boots the PXE installer; otherwise it chainloads the local OS. VirtualMedia carries install intent in its operation-owned ISO. When a Machine has multiple DHCP leases, metalman renders the lease matching the request source IP and passes that lease's MAC as `unbounded.boot_mac`.
 4. **Installer (initrd overlay).** An init script in the initrd:
    - Loads storage and network drivers, selects the provisioning NIC by MAC, and configures the static IP and DNS from kernel cmdline.
-   - Writes matching MAC-based static netplan configuration into the installed system before reboot and disables cloud-init network rendering so fallback DHCP configuration cannot conflict with it. The default netboot image also serves the selected lease as NoCloud `network-config`.
+   - Writes matching MAC-based static netplan configuration into the installed system before reboot and disables cloud-init network rendering so fallback DHCP configuration cannot conflict with it. Set `holdLease: true` on a `dhcpLeases` entry to also run a DHCPv4 client on the provisioning NIC so the site DHCP server keeps the lease for the static address and does not hand it to another host; routes, DNS, NTP, hostname, and domains from DHCP are ignored. The client identifies with the NIC MAC so reservations keyed by MAC match. Metalman answers only PXE and HTTP boot firmware for a held lease, not the installed OS, so the OS holds the lease with the site DHCP server. Reserve the address for its MAC on the site DHCP server. Leave `holdLease` unset where there is no DHCP server. The default netboot image also serves the selected lease as NoCloud `network-config`.
    - Downloads the gzip-compressed raw disk image from the machine image over HTTP (retries up to 120 times).
    - Writes the image to `spec.host.netboot.targetDisk` when set, otherwise to an automatically selected block device.
    - Mounts the root filesystem and injects cloud-init config and the agent configuration.

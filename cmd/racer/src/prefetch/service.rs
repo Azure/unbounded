@@ -9,7 +9,7 @@ use super::registry::{
 use super::{Config, Priority};
 use crate::error::{Error, Result};
 use crate::model::{
-    MetadataSelector, ObjectId, ObjectVersion, PAGE_BYTES, PageId, PageNumber, RequestId,
+    MetadataSelector, ObjectId, ObjectVersion, PageId, PageNumber, PageSize, RequestId,
     VersionMetadata,
 };
 use crate::peer::protocol::{Operation as PeerOperation, PeerResponse, PrefetchAction};
@@ -19,9 +19,9 @@ use crate::security::{Authorization, OpaqueMetadata, OriginContext};
 use crate::topology::Membership;
 use futures::StreamExt;
 use http1::MessageHead;
-use racer_control_wire::{CacheId, NodeId};
-use racer_core::prefetch::{Deferral, FailCode, OwnerBudget, PageResult};
-use racer_object_wire::prefetch::{ErrorCode, PrefetchError, PrefetchRequest, StatusQuery};
+use racer_core::prefetch::{Deferral, FailCode, OwnerBudget, OwnerLease, PageResult};
+use racer_wire::control::{CacheId, NodeId};
+use racer_wire::object::prefetch::{ErrorCode, PrefetchError, PrefetchRequest, StatusQuery};
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -42,6 +42,60 @@ const RESOLVE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Concurrent version resolutions per PUT.
 const RESOLVE_CONCURRENCY: usize = 16;
 
+/// Status long-poll wakers, one per waiting request: a poll replaces its own
+/// entry instead of adding another, and a finished wait removes it.
+#[derive(Default)]
+struct Waiters {
+    next: u64,
+    wakers: HashMap<u64, Waker>,
+}
+
+/// One status long-poll's place in [`Prefetch::waiters`]; removed on drop.
+struct Waiter<'a> {
+    prefetch: &'a Prefetch,
+    id: u64,
+}
+
+impl Waiter<'_> {
+    fn register(&self, waker: &Waker) {
+        let mut waiters = self.prefetch.waiters.lock().unwrap();
+        match waiters.wakers.get_mut(&self.id) {
+            Some(current) if current.will_wake(waker) => {}
+            Some(current) => current.clone_from(waker),
+            None => {
+                waiters.wakers.insert(self.id, waker.clone());
+            }
+        }
+    }
+}
+
+impl Drop for Waiter<'_> {
+    fn drop(&mut self) {
+        self.prefetch
+            .waiters
+            .lock()
+            .unwrap()
+            .wakers
+            .remove(&self.id);
+    }
+}
+
+/// One owner fill admission. Dropping it, including with a canceled fill
+/// future, returns the reference so the slot and its bookkeeping are released.
+pub(crate) struct OwnerFill<'a> {
+    prefetch: &'a Prefetch,
+    page: PageId,
+    lease: Option<OwnerLease>,
+}
+
+impl Drop for OwnerFill<'_> {
+    fn drop(&mut self) {
+        if let Some(lease) = self.lease.take() {
+            self.prefetch.owner_finish(&self.page, lease);
+        }
+    }
+}
+
 #[derive(Default)]
 struct Pump {
     running: bool,
@@ -59,32 +113,20 @@ pub struct Prefetch {
     draining: AtomicBool,
     pump: Mutex<Pump>,
     kicked: AtomicBool,
-    waiters: Mutex<Vec<Waker>>,
+    waiters: Mutex<Waiters>,
     next_wake: Mutex<Option<Instant>>,
     metrics: OnceLock<Arc<PrefetchMetrics>>,
-}
-
-impl Default for Prefetch {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-fn seed() -> u64 {
-    let mut bytes = [0; 8];
-    let _ = uring_runtime::environment::fill_random(&mut bytes);
-    u64::from_le_bytes(bytes)
-}
-
-fn now() -> Instant {
-    uring_runtime::environment::now()
+    /// Node-wide time and entropy.
+    ctx: racer_io::WorkerCtx,
 }
 
 impl Prefetch {
-    pub fn new() -> Self {
+    pub fn new(ctx: racer_io::WorkerCtx) -> Self {
         let config = Config::default();
+        // A failed draw keeps a fixed scheduler seed; it only orders ties.
+        let seed = ctx.rng.next_u64().unwrap_or_default();
         Self {
-            registry: Mutex::new(Registry::new(config, seed())),
+            registry: Mutex::new(Registry::new(config, seed, ctx.clock.clone())),
             owner: Mutex::new(OwnerBudget::new(
                 config.concurrent_fills as usize,
                 config.origin_bytes_per_sec,
@@ -94,17 +136,35 @@ impl Prefetch {
             draining: AtomicBool::new(false),
             pump: Mutex::new(Pump::default()),
             kicked: AtomicBool::new(false),
-            waiters: Mutex::new(Vec::new()),
+            waiters: Mutex::new(Waiters::default()),
             next_wake: Mutex::new(None),
             metrics: OnceLock::new(),
+            ctx,
         }
     }
 
-    /// Apply `RACER_PREFETCH_*` settings.
+    fn now(&self) -> Instant {
+        self.ctx.now()
+    }
+
+    /// A random request identifier; a failed draw yields the zero identifier.
+    fn request_id(&self) -> RequestId {
+        let mut bytes = [0; 16];
+        let _ = self.ctx.rng.fill(&mut bytes);
+        RequestId(bytes)
+    }
+
+    /// A fresh scope on this node's clock.
+    fn scope(&self, deadline: Instant) -> Result<RequestScope> {
+        RequestScope::with_clock(self.request_id(), deadline, self.ctx.clock.clone())
+    }
+
+    /// Apply `RACER_PREFETCH_*` settings. The owner budget changes in place,
+    /// so fills admitted before keep their leases.
     pub fn configure(&self, config: Config) -> Result<()> {
         config.validate()?;
         self.registry.lock().unwrap().configure(config);
-        *self.owner.lock().unwrap() = OwnerBudget::new(
+        self.owner.lock().unwrap().set_limits(
             config.concurrent_fills as usize,
             config.origin_bytes_per_sec,
         );
@@ -144,8 +204,18 @@ impl Prefetch {
     }
 
     fn wake_waiters(&self) {
-        for waker in std::mem::take(&mut *self.waiters.lock().unwrap()) {
+        let wakers = std::mem::take(&mut self.waiters.lock().unwrap().wakers);
+        for waker in wakers.into_values() {
             waker.wake();
+        }
+    }
+
+    fn waiter(&self) -> Waiter<'_> {
+        let mut waiters = self.waiters.lock().unwrap();
+        waiters.next += 1;
+        Waiter {
+            prefetch: self,
+            id: waiters.next,
         }
     }
 
@@ -163,13 +233,21 @@ impl Prefetch {
             let (queued, tickets) = registry.gauges();
             metrics.set_gauges(queued, tickets);
         }
-        *self.next_wake.lock().unwrap() = registry.next_deadline();
+        // Keep a pending status-wait wake from `wake_at`: the registry does not
+        // know it, and replacing it would leave that waiter parked past `until`.
+        let now = self.now();
+        let mut next = self.next_wake.lock().unwrap();
+        *next = registry
+            .next_deadline()
+            .into_iter()
+            .chain(next.filter(|at| *at > now))
+            .min();
     }
 
     /// Called from every worker's poll: expire tickets and wake the pump and
     /// waiters when a deadline passed.
     pub fn tick(&self) {
-        let now = now();
+        let now = self.now();
         let due = self
             .next_wake
             .try_lock()
@@ -186,8 +264,14 @@ impl Prefetch {
         self.wake_waiters();
     }
 
+    /// When the next [`Self::tick`] has expiries to run. A contended lock
+    /// reports none; its holder publishes the next deadline itself.
+    pub fn next_wake(&self) -> Option<Instant> {
+        self.next_wake.try_lock().ok().and_then(|next| *next)
+    }
+
     /// Ask the next tick at or after `at` to wake waiters.
-    fn wake_at(&self, at: Instant) {
+    pub(super) fn wake_at(&self, at: Instant) {
         let mut next = self.next_wake.lock().unwrap();
         if next.is_none_or(|current| at < current) {
             *next = Some(at);
@@ -200,7 +284,7 @@ impl Prefetch {
             return;
         }
         let mut registry = self.registry.lock().unwrap();
-        registry.cancel_caches(caches, Reason::Passthrough, now());
+        registry.cancel_caches(caches, Reason::Passthrough, self.now());
         self.changed(&mut registry);
         drop(registry);
         self.wake_waiters();
@@ -209,7 +293,7 @@ impl Prefetch {
     /// Cancel tickets of caches that are no longer published.
     pub fn retain_caches(&self, keep: impl Fn(&CacheId) -> bool) {
         let mut registry = self.registry.lock().unwrap();
-        registry.retain_caches(keep, now());
+        registry.retain_caches(keep, self.now());
         self.changed(&mut registry);
         drop(registry);
         self.wake_waiters();
@@ -233,17 +317,43 @@ impl Prefetch {
             self.promoted
                 .lock()
                 .unwrap()
-                .insert(page.clone(), (priority, now()));
+                .insert(page.clone(), (priority, self.now()));
         }
         promoted
     }
 
     /// Owner admission for one page fill.
-    fn owner_admit(&self, page: &PageId, bytes: u64, priority: Priority) -> Option<PageResult> {
-        match self.owner.lock().unwrap().admit(page.clone(), bytes, now()) {
-            Ok(()) => {
-                self.filling.lock().unwrap().insert(page.clone(), priority);
-                None
+    fn owner_admit(
+        &self,
+        page: &PageId,
+        bytes: u64,
+        priority: Priority,
+    ) -> std::result::Result<OwnerFill<'_>, PageResult> {
+        let now = self.now();
+        let mut owner = self.owner.lock().unwrap();
+        let expired = owner.expire(now);
+        let admitted = owner.admit(page.clone(), bytes, now);
+        drop(owner);
+        if !expired.is_empty() {
+            let mut filling = self.filling.lock().unwrap();
+            let mut promoted = self.promoted.lock().unwrap();
+            for page in &expired {
+                filling.remove(page);
+                promoted.remove(page);
+            }
+        }
+        match admitted {
+            Ok(lease) => {
+                self.filling
+                    .lock()
+                    .unwrap()
+                    .entry(page.clone())
+                    .or_insert(priority);
+                Ok(OwnerFill {
+                    prefetch: self,
+                    page: page.clone(),
+                    lease: Some(lease),
+                })
             }
             Err((why, wait)) => {
                 if let Some(metrics) = self.metrics()
@@ -251,20 +361,27 @@ impl Prefetch {
                 {
                     metrics.throttled(priority, wait);
                 }
-                Some(PageResult::Deferred {
+                Err(PageResult::Deferred {
                     retry_after_ms: wait.as_millis().clamp(1, u128::from(u32::MAX)) as u32,
                 })
             }
         }
     }
 
-    fn owner_finish(&self, page: &PageId) {
-        self.owner.lock().unwrap().finish(page);
+    fn owner_finish(&self, page: &PageId, lease: OwnerLease) {
+        let mut owner = self.owner.lock().unwrap();
+        owner.finish(page, lease);
+        let held = owner.holds(page);
+        drop(owner);
+        // Another admission still references this fill.
+        if held {
+            return;
+        }
         self.filling.lock().unwrap().remove(page);
         if let Some((priority, at)) = self.promoted.lock().unwrap().remove(page)
             && let Some(metrics) = self.metrics()
         {
-            metrics.demand_wait(priority, now().saturating_duration_since(at));
+            metrics.demand_wait(priority, self.now().saturating_duration_since(at));
         }
     }
 
@@ -281,7 +398,7 @@ impl Prefetch {
             self.kick();
             return;
         }
-        let Ok(permit) = uring_runtime::drivers::reserve() else {
+        let Ok(permit) = local.drivers().reserve() else {
             return;
         };
         pump.running = true;
@@ -303,15 +420,31 @@ impl Prefetch {
         &self,
         page: &PageId,
         priority: Priority,
-    ) -> Option<PageResult> {
-        self.owner_admit(page, PAGE_BYTES, priority)
+    ) -> std::result::Result<OwnerFill<'_>, PageResult> {
+        self.owner_admit(page, crate::model::PAGE_BYTES, priority)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn filling_for_test(&self) -> usize {
+        self.filling.lock().unwrap().len() + self.promoted.lock().unwrap().len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_for_test(&self, waker: &Waker, polls: usize) -> usize {
+        let waiter = self.waiter();
+        for _ in 0..polls {
+            waiter.register(waker);
+        }
+        let during = self.waiters.lock().unwrap().wakers.len();
+        drop(waiter);
+        during + self.waiters.lock().unwrap().wakers.len()
     }
 }
 
 /// Classify a whole-operation or whole-page error.
 pub(crate) fn classify(error: Error) -> UnitOutcome {
     match error {
-        Error::Overloaded => UnitOutcome::Retry(RetryKind::Overloaded, None),
+        Error::Overloaded | Error::FlightFull => UnitOutcome::Retry(RetryKind::Overloaded, None),
         Error::VersionUnavailable => UnitOutcome::Failed(RefError::VersionChanged),
         Error::NotFound => UnitOutcome::Failed(RefError::NotFound),
         Error::OriginRejected | Error::OriginForbidden | Error::Forbidden => {
@@ -351,7 +484,7 @@ fn fail_code(error: Error) -> FailCode {
         Error::VersionUnavailable => FailCode::VersionChanged,
         Error::NotFound => FailCode::NotFound,
         Error::OriginRejected | Error::OriginForbidden | Error::Forbidden => FailCode::Forbidden,
-        Error::Overloaded => FailCode::Overloaded,
+        Error::Overloaded | Error::FlightFull => FailCode::Overloaded,
         Error::CorruptRecord | Error::BadGateway | Error::Internal => FailCode::OriginError,
         _ => FailCode::Unavailable,
     }
@@ -373,14 +506,9 @@ fn origin_context(object: &ObjectId, context: &UnitContext) -> Result<OriginCont
     })
 }
 
-fn request_id() -> RequestId {
-    let mut bytes = [0; 16];
-    let _ = uring_runtime::environment::fill_random(&mut bytes);
-    RequestId(bytes)
-}
-
-fn page_length(length: u64, page: u64) -> u64 {
-    length.saturating_sub(page * PAGE_BYTES).min(PAGE_BYTES)
+fn page_length(length: u64, page: u64, size: PageSize) -> u64 {
+    let size = size.get();
+    length.saturating_sub(page.saturating_mul(size)).min(size)
 }
 
 /// Owner side of `prefetch fill`: one result per page, in order. Pages are
@@ -401,6 +529,10 @@ pub(crate) async fn serve_fill(
     if local.cache_passthrough(&version.object.cache) {
         return vec![PageResult::Failed(FailCode::Unavailable); pages.len()];
     }
+    let size = match local.page_size() {
+        Ok(size) => size,
+        Err(error) => return vec![PageResult::Failed(fail_code(error)); pages.len()],
+    };
     let fills = pages.iter().map(|&number| {
         let page = PageId {
             version: version.clone(),
@@ -413,15 +545,18 @@ pub(crate) async fn serve_fill(
                 Ok(false) => {}
                 Err(error) => return PageResult::Failed(fail_code(error)),
             }
-            if let Some(deferred) =
-                prefetch.owner_admit(&page, page_length(metadata.length, number), priority)
-            {
-                return deferred;
-            }
+            // Held across the fill: dropping this future releases the slot too.
+            let _fill = match prefetch.owner_admit(
+                &page,
+                page_length(metadata.length, number, size),
+                priority,
+            ) {
+                Ok(fill) => fill,
+                Err(deferred) => return deferred,
+            };
             let result = directory
                 .prefetch_page(page.clone(), metadata.clone(), membership, context, scope)
                 .await;
-            prefetch.owner_finish(&page);
             result.unwrap_or_else(|error| PageResult::Failed(fail_code(error)))
         }
     });
@@ -481,7 +616,12 @@ pub(crate) async fn serve(
             length,
             content_type,
             priority,
+            page_size,
         } => {
+            // Pages are numbered at the sender's page size; the cluster has one.
+            if local.page_size()? != page_size {
+                return Err(Error::InvalidRequest);
+            }
             let metadata = VersionMetadata {
                 content_type,
                 version: version.clone(),
@@ -512,7 +652,8 @@ async fn dispatch(
             .map(|&page| (unit(page), outcome, None))
             .collect::<Vec<_>>()
     };
-    let Ok(scope) = RequestScope::new(request_id(), now() + DISPATCH_TIMEOUT) else {
+    let prefetch = &local.prefetch_directory().prefetch;
+    let Ok(scope) = prefetch.scope(prefetch.now() + DISPATCH_TIMEOUT) else {
         return all(UnitOutcome::Retry(RetryKind::Unavailable, None));
     };
     let membership = match local.cache_membership(&version.object.cache) {
@@ -522,6 +663,10 @@ async fn dispatch(
     let context = match origin_context(&version.object, &batch.context) {
         Ok(context) => context,
         Err(_) => return all(UnitOutcome::Failed(RefError::OriginError)),
+    };
+    let page_size = match local.page_size() {
+        Ok(size) => size,
+        Err(error) => return all(classify(error)),
     };
     let me = local.local_node();
     let mut groups: BTreeMap<NodeId, Vec<u64>> = BTreeMap::new();
@@ -572,6 +717,7 @@ async fn dispatch(
                         length: batch.metadata.length,
                         content_type: batch.metadata.content_type.clone(),
                         priority: batch.priority,
+                        page_size,
                     },
                 };
                 let answer = local
@@ -623,7 +769,7 @@ async fn run_pump(prefetch: Arc<Prefetch>, local: Rc<Coordinator>) {
     let max_pages = (prefetch.config().concurrent_fills as usize)
         .clamp(1, racer_core::prefetch::MAX_OPERATION_PAGES);
     loop {
-        let now = now();
+        let now = prefetch.now();
         let draining = prefetch.draining();
         if let Some(membership) = local.current_membership() {
             if membership_version.is_some_and(|v| v != membership.version) {
@@ -664,7 +810,7 @@ async fn run_pump(prefetch: Arc<Prefetch>, local: Rc<Coordinator>) {
         })
         .await;
         if let Some(results) = next {
-            let now = uring_runtime::environment::now();
+            let now = prefetch.now();
             let membership = local.current_membership();
             prefetch.with_registry(|registry| {
                 let mut completed = Vec::with_capacity(results.len());
@@ -711,7 +857,8 @@ async fn resolve(
             })
         })
         .collect();
-    let scope = RequestScope::new(request_id(), now() + RESOLVE_TIMEOUT);
+    let prefetch = &local.prefetch_directory().prefetch;
+    let scope = prefetch.scope(prefetch.now() + RESOLVE_TIMEOUT);
     let mut resolved: Vec<Option<Resolution>> = vec![None; distinct.len()];
     if let Ok(scope) = &scope {
         let mut work = futures::stream::iter(distinct.iter().enumerate().map(
@@ -791,7 +938,7 @@ async fn coverage(
     units: Vec<UnitKey>,
     deadline: Instant,
 ) -> u64 {
-    let Ok(scope) = RequestScope::new(request_id(), deadline) else {
+    let Ok(scope) = local.prefetch_directory().prefetch.scope(deadline) else {
         return 0;
     };
     let me = local.local_node();
@@ -810,6 +957,9 @@ async fn coverage(
             .or_default()
             .push(unit.page);
     }
+    let Ok(page_size) = local.page_size() else {
+        return 0;
+    };
     let mut resident = 0u64;
     for ((owner, version), pages) in groups {
         for chunk in pages.chunks(racer_core::prefetch::MAX_OPERATION_PAGES) {
@@ -842,7 +992,7 @@ async fn coverage(
                 .iter()
                 .filter(|r| **r == PageResult::Resident)
                 .count() as u64
-                * PAGE_BYTES;
+                * page_size.get();
         }
     }
     resident
@@ -857,7 +1007,7 @@ pub struct Response {
 fn json(status: u16, value: &impl serde::Serialize) -> Response {
     match serde_json::to_vec(value) {
         Ok(body) => Response {
-            head: racer_object_wire::prefetch::json_head(status, body.len()),
+            head: racer_wire::object::prefetch::json_head(status, body.len()),
             body,
         },
         Err(_) => error(PrefetchError::new(
@@ -910,7 +1060,7 @@ async fn handle_inner(
             Ok(json(200, &api::List { prefetches }))
         }
         PrefetchRequest::Delete { id } => {
-            let status = prefetch.with_registry(|r| r.delete(cache, &id, now()))?;
+            let status = prefetch.with_registry(|r| r.delete(cache, &id, prefetch.now()))?;
             prefetch.kick();
             prefetch.wake_waiters();
             Ok(json(200, &status))
@@ -931,15 +1081,21 @@ async fn handle_inner(
             let config = prefetch.config();
             let spec = api::parse_spec(body, authorization.is_some(), &config)?;
             let authorization = authorization.map(|a| Arc::new(Zeroizing::new(a.to_vec())));
-            if let PutCheck::Replay(status) =
-                prefetch.with_registry(|r| r.check_put(cache, &id, &spec, now()))?
+            if let PutCheck::Replay(status) = prefetch
+                .with_registry(|r| r.check_put(cache, &id, &spec, &authorization, prefetch.now()))?
             {
                 return Ok(json(200, &*status));
             }
             let resolved = resolve(local, cache, &membership, &spec, authorization.as_ref()).await;
             scope.check().map_err(|_| unavailable("request expired"))?;
-            let (status, body) = prefetch
-                .with_registry(|r| r.apply_put(cache, &id, spec, resolved, authorization, now()))?;
+            // The cluster adopts one page size and never changes it.
+            let page_size = local
+                .page_size()
+                .map_err(|_| unavailable("cache is not ready"))?;
+            let (status, body) = prefetch.with_registry(|r| {
+                r.set_page_size(page_size);
+                r.apply_put(cache, &id, spec, resolved, authorization, prefetch.now())
+            })?;
             if let Ok(local) = directory.local_coordinator() {
                 prefetch.ensure_pump(local);
             }
@@ -947,6 +1103,34 @@ async fn handle_inner(
             Ok(json(status, &body))
         }
     }
+}
+
+/// Park a status long-poll until `done`, `until`, cancellation, or drain.
+pub(super) async fn wait_until(
+    prefetch: &Prefetch,
+    until: Instant,
+    scope: &RequestScope,
+    done: impl Fn() -> bool,
+) {
+    prefetch.wake_at(until);
+    let cancellation = scope.cancellation.subscribe().ok();
+    let waiter = prefetch.waiter();
+    std::future::poll_fn(|cx| {
+        if let Some(cancellation) = &cancellation {
+            cancellation.register(cx.waker());
+        }
+        waiter.register(cx.waker());
+        if done() || prefetch.now() >= until || scope.check().is_err() || prefetch.draining() {
+            Poll::Ready(())
+        } else {
+            // `wake_at` keeps only the earliest wake, and a tick drops it once
+            // past: re-arm this waiter's deadline on every poll so an earlier
+            // waiter's wake does not consume it.
+            prefetch.wake_at(until);
+            Poll::Pending
+        }
+    })
+    .await;
 }
 
 async fn get(
@@ -960,25 +1144,14 @@ async fn get(
     // Validate the id and cursor before waiting.
     prefetch.with_registry(|r| r.status(cache, id, query.refs, query.cursor.as_deref()))?;
     if let Some(wait) = query.wait.filter(|w| !w.is_zero()) {
-        let until = now() + wait;
-        prefetch.wake_at(until);
-        let cancellation = scope.cancellation.subscribe().ok();
-        std::future::poll_fn(|cx| {
-            if let Some(cancellation) = &cancellation {
-                cancellation.register(cx.waker());
-            }
-            prefetch.waiters.lock().unwrap().push(cx.waker().clone());
-            let settled = prefetch
+        let until = prefetch.now() + wait;
+        wait_until(prefetch, until, scope, || {
+            prefetch
                 .registry
                 .lock()
                 .unwrap()
                 .settled(cache, id)
-                .unwrap_or(true);
-            if settled || now() >= until || scope.check().is_err() || prefetch.draining() {
-                Poll::Ready(())
-            } else {
-                Poll::Pending
-            }
+                .unwrap_or(true)
         })
         .await;
     }
@@ -988,14 +1161,14 @@ async fn get(
         let units = prefetch.with_registry(|r| r.desired(cache, id))?;
         // Bound probing by the client request deadline so a slow or
         // unresponsive owner cannot consume the budget needed to answer.
-        let deadline = coverage_deadline(now(), scope.deadline.0);
+        let deadline = coverage_deadline(prefetch.now(), scope.deadline.0);
         let resident = match (local.cache_membership(cache), deadline) {
             (Ok(membership), Some(deadline)) => coverage(local, &membership, units, deadline).await,
             _ => 0,
         };
         status.coverage = Some(Coverage {
             resident_bytes: resident,
-            observed_at_ms: super::registry::wall_ms(),
+            observed_at_ms: super::registry::wall_ms(&prefetch.ctx.clock),
         });
     }
     Ok(json(200, &status))

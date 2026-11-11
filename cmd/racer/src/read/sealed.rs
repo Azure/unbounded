@@ -5,7 +5,7 @@
 //! plaintext in memory still arrive as [`Fetched::Page`], and so do pages that
 //! the CPU had to produce anyway (origin fills, which encrypt) or that another
 //! reader authenticated first. Every other page arrives as a [`SealedPage`]:
-//! the envelope, the AAD, the expected CRC, the XAES-derived page key, and the
+//! the envelope, the AAD, the XAES-derived page key, and the
 //! ciphertext in host memory or already in GPU staging.
 //!
 //! The derived key is wiped on drop and is never logged: [`SealedPage`] has no
@@ -24,19 +24,77 @@ use crate::model::PageId;
 use crate::store::ReadToken;
 use std::sync::Arc;
 
-/// Where a GPU should read a sealed page from.
+/// Who authenticates and decrypts sealed pages: a GPU, or the CPU writing
+/// straight into a host-read destination.
 #[derive(Clone)]
 pub struct SealedTarget {
-    pub(crate) helper: Arc<GpuHelper>,
+    /// The GPU helper, or None for a host-read sink that decrypts on the CPU
+    /// into the client's mapped destination. A host target never takes the
+    /// GPU staging or landing paths: its sealed pages are always in host
+    /// memory ([`SealedSource::Host`]).
+    pub(crate) helper: Option<Arc<GpuHelper>>,
 
-    /// The GPU that holds the request's allocation.
+    /// The GPU that holds the request's allocation. Unused for a host target.
     pub(crate) ordinal: i32,
+
+    /// For a host-read into a mapped destination: the mapping, and the file
+    /// offset the range's first byte lands at. Used to find each page's
+    /// destination NUMA node before it is fetched.
+    pub(crate) destination: Option<(Arc<crate::client::direct::HostMapping>, u64)>,
 }
 
 impl SealedTarget {
+    /// A target for a GPU that holds the request's allocation.
+    pub(crate) fn gpu(helper: Arc<GpuHelper>, ordinal: i32) -> Self {
+        Self {
+            helper: Some(helper),
+            ordinal,
+            destination: None,
+        }
+    }
+
+    /// A target for a host-read sink that decrypts into the client's file.
+    pub(crate) fn host() -> Self {
+        Self {
+            helper: None,
+            ordinal: -1,
+            destination: None,
+        }
+    }
+
+    /// For a CPU decrypt into `mapping`, where the range's first byte lands
+    /// at file offset `offset`.
+    pub(crate) fn host_into(mapping: Arc<crate::client::direct::HostMapping>, offset: u64) -> Self {
+        Self {
+            destination: Some((mapping, offset)),
+            ..Self::host()
+        }
+    }
+
+    /// NUMA node of the destination of page `number` of `range`, when the
+    /// target maps the destination and a page is resident there.
+    pub(crate) fn destination_node(
+        &self,
+        range: &crate::model::ResolvedRange,
+        number: crate::model::PageNumber,
+    ) -> Option<u16> {
+        let (mapping, offset) = self.destination.as_ref()?;
+        let slice = range.slice_at(number).ok()??;
+        let byte = number
+            .0
+            .checked_mul(range.page_size().get())?
+            .checked_add(u64::from(slice.offset))?;
+        mapping.node_at(offset.checked_add(byte.checked_sub(range.start())?)?)
+    }
+
     /// The GPU that holds the request's allocation.
     pub fn ordinal(&self) -> i32 {
         self.ordinal
+    }
+
+    /// The GPU helper. Fails for a host target, which has none.
+    pub(crate) fn helper(&self) -> Result<&Arc<GpuHelper>> {
+        self.helper.as_ref().ok_or(Error::Internal)
     }
 }
 
@@ -77,7 +135,7 @@ pub enum SealedSource {
 }
 
 /// A page that only the GPU will authenticate. Nothing here is proof of
-/// authenticity: the GPU checks the CRC and the AEAD tag before it writes.
+/// authenticity: the GPU checks the AEAD tag before it writes.
 pub struct SealedPage {
     pub metadata: ObjectMetadata,
 
@@ -89,10 +147,12 @@ pub struct SealedPage {
     /// The XAES-derived AES-256-GCM key and nonce. Wiped on drop.
     pub key: racer_crypto::DerivedPageKey,
 
-    /// The stored CRC-64 of ciphertext and tag, when known.
-    pub expected_crc: Option<u64>,
-
     pub source: SealedSource,
+
+    /// Empty aligned ciphertext storage for a host-read decrypt to fill in
+    /// the same pass, when the source is a registered RDMA buffer. See
+    /// `DecryptInto::run`. None leaves the source as it is.
+    pub(crate) fused_store: Option<crate::memory::CiphertextBuffer>,
 }
 
 /// What a page's owning worker needs to act on the GPU's verdict.
@@ -112,6 +172,17 @@ pub struct SealedReport {
 }
 
 impl SealedReport {
+    /// Swap a registered host copy for the detached copy a fused host-read
+    /// decrypt recorded on it, dropping this report's hold on the
+    /// registered buffer. Other copies are left as they are.
+    pub(crate) fn prefer_retained(&mut self) {
+        if let Some(copy) = &mut self.copy
+            && let Some(detached) = copy.copy.ciphertext.retained_copy()
+        {
+            copy.copy.ciphertext = detached;
+        }
+    }
+
     /// Whether the owner has anything to act on for this verdict: a host
     /// copy to persist or invalidate, a disk mapping to drop, or, on
     /// failure, a shared landed copy to forget. A passed landed page leaves
@@ -154,7 +225,11 @@ impl SealedPage {
         self.envelope.validate()?;
         if self.page() != page
             || self.metadata.version != page.version
-            || self.metadata.immutable().page_length(page)? != self.envelope.plaintext_length
+            || self
+                .metadata
+                .immutable()
+                .page_length_in(page, self.envelope.page_size)?
+                != self.envelope.plaintext_length
             || self.aad.len() > racer_gpu::MAX_AAD
         {
             return Err(Error::CorruptRecord);
@@ -185,10 +260,13 @@ pub(crate) mod tests {
     pub(crate) fn sealed(result: &PageResult) -> SealedPage {
         let envelope = result.ciphertext.envelope().clone();
         SealedPage {
+            fused_store: None,
             metadata: result.metadata.clone(),
             aad: crate::security::page_aad(&envelope).unwrap_or_default(),
-            key: racer_crypto::xaes_derive(&[7; 32], &envelope.nonce.0),
-            expected_crc: Some(result.ciphertext.checksum()),
+            key: racer_crypto::xaes_derive(
+                &crate::test_support::test_vector([7; 32]),
+                &envelope.nonce.0,
+            ),
             envelope,
             source: SealedSource::Host(UnverifiedPage {
                 copy: CiphertextCopy {
@@ -210,7 +288,7 @@ pub(crate) mod tests {
             content_type: None,
             version: ObjectVersion {
                 object: ObjectId {
-                    cache: racer_control_wire::CacheId(
+                    cache: racer_wire::control::CacheId(
                         "00000000-0000-4000-8000-000000000001".into(),
                     ),
                     key: CacheKey([0; 32]),

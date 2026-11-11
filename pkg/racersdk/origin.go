@@ -214,8 +214,9 @@ func serveOriginLimits(ctx context.Context, limits originLimits, origin Origin, 
 	lifetime, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	listener := &originListener{Listener: l, ctx: lifetime, slots: make(chan struct{}, limits.maxConnections), limits: limits}
+	listener := newOriginListener(lifetime, l, limits)
 	server := &http.Server{
+		ConnState:         listener.track,
 		ReadHeaderTimeout: limits.readHeaderTimeout,
 		IdleTimeout:       limits.idleTimeout,
 		WriteTimeout:      limits.writeTimeout,
@@ -815,30 +816,121 @@ func (c *originConn) takeHead() originHead {
 	return h
 }
 
-// Admission happens before Accept, so net/http never spawns an unbounded set of
+// Admission happens in Accept, so net/http never spawns an unbounded set of
 // connection goroutines waiting on the limit. Close releases each slot once.
+//
+// Keep-alive connections hold slots while idle. Racer keeps idle connections
+// per I/O worker, so idle sockets on some workers could otherwise fill every
+// slot while connections from other workers wait in the listen backlog until
+// an idle timeout closes one. Their requests stall for up to the idle timeout.
+// Instead, a connection waiting for a slot closes the longest idle one. Racer
+// retries a request that fails on a reused idle connection on a fresh one.
 type originListener struct {
 	net.Listener
 	ctx    context.Context
 	slots  chan struct{}
 	limits originLimits
+
+	mu   sync.Mutex
+	idle map[*originConn]time.Time
+	// ready has a token after a connection goes idle.
+	ready chan struct{}
 }
 
-// Accept reserves capacity before accepting a connection.
-func (l *originListener) Accept() (net.Conn, error) {
-	select {
-	case l.slots <- struct{}{}:
-	case <-l.ctx.Done():
-		return nil, l.ctx.Err()
+func newOriginListener(ctx context.Context, l net.Listener, limits originLimits) *originListener {
+	return &originListener{
+		Listener: l,
+		ctx:      ctx,
+		slots:    make(chan struct{}, limits.maxConnections),
+		limits:   limits,
+		idle:     make(map[*originConn]time.Time),
+		ready:    make(chan struct{}, 1),
 	}
+}
 
+// Accept takes the next connection, then waits for a slot, closing the
+// longest idle connection when none is free. Only a connection that is
+// already waiting evicts an idle one.
+func (l *originListener) Accept() (net.Conn, error) {
 	c, err := l.Listener.Accept()
 	if err != nil {
-		<-l.slots
 		return nil, err
 	}
 
-	return &originConn{Conn: c, limits: l.limits, release: func() { <-l.slots }}, nil
+	for {
+		select {
+		case l.slots <- struct{}{}:
+			return &originConn{Conn: c, limits: l.limits, release: func() { <-l.slots }}, nil
+		default:
+		}
+
+		if l.evict() {
+			continue
+		}
+
+		select {
+		case l.slots <- struct{}{}:
+			return &originConn{Conn: c, limits: l.limits, release: func() { <-l.slots }}, nil
+		case <-l.ready:
+		case <-l.ctx.Done():
+			closeQuietly(c)
+			return nil, l.ctx.Err()
+		}
+	}
+}
+
+// track records which admitted connections are idle between requests.
+func (l *originListener) track(c net.Conn, state http.ConnState) {
+	conn, ok := c.(*originConn)
+	if !ok {
+		return
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if state != http.StateIdle {
+		delete(l.idle, conn)
+		return
+	}
+
+	l.idle[conn] = time.Now()
+
+	select {
+	case l.ready <- struct{}{}:
+	default:
+	}
+}
+
+// evict closes the longest idle connection, releasing its slot, and reports
+// whether there was one.
+func (l *originListener) evict() bool {
+	l.mu.Lock()
+
+	var (
+		victim *originConn
+		since  time.Time
+	)
+
+	for conn, at := range l.idle {
+		if victim == nil || at.Before(since) {
+			victim, since = conn, at
+		}
+	}
+
+	if victim != nil {
+		delete(l.idle, victim)
+	}
+
+	l.mu.Unlock()
+
+	if victim == nil {
+		return false
+	}
+
+	closeQuietly(victim)
+
+	return true
 }
 
 type onceBody struct {

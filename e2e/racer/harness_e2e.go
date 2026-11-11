@@ -366,12 +366,14 @@ func (h *harness) installRacer() {
 
 	// Automatic sizing scales with host cores. The operator seeds this
 	// ConfigMap once and preserves administrator edits, rolling the DaemonSet
-	// on change.
+	// on change. CI runners can expose RDMA devices that kind cannot use, and
+	// automatic RDMA reserves an owner thread, so RDMA is disabled here.
 	h.waitExists("configmap", "racer-settings", 5*time.Minute)
 	h.kubectl("-n", operatorNamespace, "patch", "configmap", "racer-settings", "--type=merge",
-		"-p", `{"data":{"RACER_MAX_THREADS":"3"}}`)
+		"-p", `{"data":{"RACER_MAX_THREADS":"3","RACER_ENABLE_RDMA":"false"}}`)
 
-	// The embedded control plane needs a dedicated thread, so 3 is the floor.
+	// The embedded control plane needs a dedicated thread, so 3 is the floor
+	// without RDMA.
 	h.rollout("daemonset", "racer", 10*time.Minute)
 	h.waitFor("racer-primary lease held by a live seat", 5*time.Minute, func() (bool, string) {
 		v := h.controlView()

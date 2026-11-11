@@ -80,6 +80,8 @@ func TestWriteNSpawnConfigsFromGrantsMatchesLegacyData(t *testing.T) {
 		AMDSysFSPaths:                gs.AMD.SysFSPaths,
 	}
 	legacy.PreStartCommand, legacy.PostStartCommand = nspawnLifecycleCommands(gs, "kube1")
+	// The goal state runs the lifecycle helper, whose refused exit is not restarted.
+	legacy.PreStartRefusedExitCode = goalstates.NSpawnPreStartRefusedExitCode
 
 	for file, tmpl := range map[string]string{
 		gs.NSpawnConfigFile:       "nspawn.conf",

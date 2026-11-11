@@ -12,10 +12,10 @@
 //! Cancellation:
 //! - Dropping the [`Owner`] closes every queue and drops queued commands.
 //!   Commands own their [`Completer`]s, so their [`Op`]s resolve to
-//!   [`Error::Cancelled`]. Later sends fail with [`Error::Unavailable`].
+//!   [`Error::Canceled`]. Later sends fail with [`Error::Unavailable`].
 //! - Dropping a [`Worker`] keeps its queued commands for the owner to drain.
 //! - Dropping a [`Completer`] without completing resolves the [`Op`] to
-//!   [`Error::Cancelled`]. Dropping an [`Op`] makes [`Completer::complete`]
+//!   [`Error::Canceled`]. Dropping an [`Op`] makes [`Completer::complete`]
 //!   hand the value back so the owner can clean it up.
 
 use std::{
@@ -121,6 +121,16 @@ impl<C> Worker<C> {
 
         self.channel.owner.wake();
         Ok(())
+    }
+
+    /// Whether the queue is at capacity.
+    pub(crate) fn is_full(&self) -> bool {
+        lock(&self.channel.queue).commands.len() >= self.channel.capacity
+    }
+
+    /// Whether the queue holds commands the owner has not drained.
+    pub(crate) fn is_pending(&self) -> bool {
+        !lock(&self.channel.queue).commands.is_empty()
     }
 
     /// Ready once the queue has space. Fails with [`Error::Unavailable`]
@@ -380,7 +390,7 @@ impl<T> Drop for Completer<T> {
     /// Cancel an uncompleted op.
     fn drop(&mut self) {
         if let Some(cell) = self.0.take() {
-            let _ = Self::resolve(&cell, Err(Error::Cancelled));
+            let _ = Self::resolve(&cell, Err(Error::Canceled));
         }
     }
 }
@@ -507,7 +517,7 @@ mod tests {
         assert!(workers[0].try_send(completer).is_ok());
         drop(owner);
 
-        assert_eq!(op.poll(&mut cx), Poll::Ready(Err(Error::Cancelled)));
+        assert_eq!(op.poll(&mut cx), Poll::Ready(Err(Error::Canceled)));
         assert_eq!(
             workers[0].poll_ready(&mut cx),
             Poll::Ready(Err(Error::Unavailable))
@@ -569,7 +579,7 @@ mod tests {
         assert!(op.poll(&mut cx).is_pending());
         drop(completer);
         assert_eq!(wakes(&count), 1);
-        assert_eq!(op.poll(&mut cx), Poll::Ready(Err(Error::Cancelled)));
+        assert_eq!(op.poll(&mut cx), Poll::Ready(Err(Error::Canceled)));
     }
 
     #[test]
@@ -718,7 +728,7 @@ mod tests {
                                     outcomes.0 += 1;
                                     break;
                                 }
-                                Poll::Ready(Err(Error::Cancelled)) => {
+                                Poll::Ready(Err(Error::Canceled)) => {
                                     outcomes.1 += 1;
                                     break;
                                 }
@@ -735,8 +745,8 @@ mod tests {
         let polled: usize = senders
             .into_iter()
             .map(|sender| {
-                let (ok, cancelled) = sender.join().unwrap();
-                ok + cancelled
+                let (ok, canceled) = sender.join().unwrap();
+                ok + canceled
             })
             .sum();
 

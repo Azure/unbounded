@@ -377,7 +377,7 @@ pub(super) fn capture(duration: Duration, cancel: &AtomicBool) -> Result<Vec<u8>
     let collected = (|| {
         loop {
             if cancel.load(Ordering::Acquire) {
-                return Err(Error::Cancelled);
+                return Err(Error::Canceled);
             }
             let now = Instant::now();
             if now >= deadline {
@@ -413,7 +413,7 @@ pub(super) fn capture(duration: Duration, cancel: &AtomicBool) -> Result<Vec<u8>
                             match identity(tid, cancel, deadline) {
                                 Ok(value) if value == birth => (),
                                 Ok(_) => continue,
-                                Err(Error::Cancelled) => return Err(Error::Cancelled),
+                                Err(Error::Canceled) => return Err(Error::Canceled),
                                 Err(_)
                                     if !std::path::Path::new(&format!("/proc/self/task/{tid}"))
                                         .exists() =>
@@ -456,7 +456,7 @@ pub(super) fn capture(duration: Duration, cancel: &AtomicBool) -> Result<Vec<u8>
         return Err(error);
     }
     match collected {
-        Err(Error::Cancelled) if !cancel.load(Ordering::Acquire) && Instant::now() >= deadline => {}
+        Err(Error::Canceled) if !cancel.load(Ordering::Acquire) && Instant::now() >= deadline => {}
         other => other?,
     }
     for ((tid, birth), event) in &mut events {
@@ -493,7 +493,7 @@ mod tests {
         assert!(matches!(samples.add(overflow), Err(Error::ResourceLimit)));
         assert!(matches!(
             capture(Duration::from_secs(1), &AtomicBool::new(true)),
-            Err(Error::Cancelled)
+            Err(Error::Canceled)
         ));
     }
     #[test]

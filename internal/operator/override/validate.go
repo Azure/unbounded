@@ -130,7 +130,10 @@ func validateEntry(sourced SourcedEntry) []string {
 		}
 	}
 
-	if !entry.HasWork() {
+	switch {
+	case sourced.Source.Field == kubeProxyImageField || entry.KubeProxyImage != "":
+		problems = append(problems, validateKubeProxyImage(entry.KubeProxyImage)...)
+	case !entry.HasWork():
 		problems = append(problems, "entry changes nothing; set patch, extraArgs, or both")
 	}
 

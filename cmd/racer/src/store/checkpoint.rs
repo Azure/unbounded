@@ -29,9 +29,11 @@ use page_alloc::SegmentId;
 use page_alloc::SegmentSnapshot;
 use page_alloc::SegmentState;
 use page_alloc::Segments;
-use racer_control_wire::CacheId;
-use racer_control_wire::ClusterId;
-use racer_control_wire::KeyId;
+use racer_io::exec::yield_now;
+use racer_io::scoped::fs::prelude::*;
+use racer_wire::control::CacheId;
+use racer_wire::control::ClusterId;
+use racer_wire::control::KeyId;
 use sha2::Digest;
 use sha2::Sha256;
 use std::cell::Cell;
@@ -39,15 +41,19 @@ use std::cell::RefCell;
 use std::path::Path;
 use std::path::PathBuf;
 use std::rc::Rc;
-use uring_runtime::drivers::yield_now;
 
 pub(crate) const CHECKPOINT_NAMES: [&str; 2] = ["checkpoint.0", "checkpoint.1"];
-const SLOTS: uring_runtime::reactor::filesystem::checkpoint::Slots<HEADER_BYTES> =
-    uring_runtime::reactor::filesystem::checkpoint::Slots {
-        names: CHECKPOINT_NAMES,
-        minimum_bytes: HEADER_BYTES + CLUSTER_BYTES + 4 + DIGEST_BYTES,
-        maximum_bytes: MAX_CHECKPOINT_BYTES,
-    };
+const SLOTS: racer_io::fs::checkpoint::Slots<HEADER_BYTES> = racer_io::fs::checkpoint::Slots {
+    names: CHECKPOINT_NAMES,
+    minimum_bytes: HEADER_BYTES + CLUSTER_BYTES + 4 + DIGEST_BYTES,
+    maximum_bytes: MAX_CHECKPOINT_BYTES,
+};
+
+/// Publication scratch bound per write submission.
+/// One publication's outcome inside its reactor operation.
+type Published = std::result::Result<(), racer_io::fs::ReplacementError>;
+
+const PUBLISH_CHUNK: std::num::NonZeroUsize = std::num::NonZeroUsize::new(16384).unwrap();
 
 pub struct Checkpointer {
     layout_digest: [u8; 32],
@@ -119,6 +125,21 @@ impl Checkpointer {
         Ok(())
     }
 
+    /// Combined mutation generation of the index and segment table, or `None`
+    /// while any hold exists: hold TTLs shrink with time, so a cut with holds
+    /// always differs from the last one. Equal values mean an equal image.
+    pub fn generation(&self) -> Option<u64> {
+        if self.index.has_holds() {
+            return None;
+        }
+        // Both counters only grow, so their sum changes whenever either does.
+        Some(
+            self.index
+                .generation()
+                .wrapping_add(self.segments.generation()),
+        )
+    }
+
     pub fn snapshot_shard(&self) -> Operation<'_, ShardImage> {
         Box::pin(async move {
             let geometry = self.geometry.get().ok_or(Error::InvalidConfiguration)?;
@@ -128,14 +149,16 @@ impl Checkpointer {
             let paused = self.pause_writer().await?;
             let frozen = self.segments.freeze()?;
             let snapshot = (|| {
-                let mut segments = self.segments.snapshot();
+                let segments = self.segments.snapshot();
                 let mut remaining = MAX_CHECKPOINT_BYTES;
-                self.index.snapshot_holds(&mut segments, &mut remaining)?;
+                let mut holds = Vec::new();
+                self.index.snapshot_holds(&mut holds, &mut remaining)?;
                 let shard = ShardImage {
                     worker: self.index.worker(),
                     geometry,
                     index: self.index.snapshot()?,
                     segments,
+                    holds,
                 };
                 shard.validate()?;
                 Ok(shard)
@@ -150,7 +173,9 @@ impl Checkpointer {
 
     /// Copy at most 128 retained mappings per reactor turn and reject budget
     /// pressure before retaining the next batch. Frozen segment reuse makes
-    /// concurrent invalidations safe; no payload is read or fsynced.
+    /// concurrent invalidations safe; no payload is read or fsynced. The
+    /// writer is paused only while copying: on success it may append again
+    /// while segment reuse stays frozen until [`Self::finish_snapshot`].
     pub fn snapshot_incremental(self: &Rc<Self>, budget: usize) -> Operation<'static, ShardImage> {
         let owner = self.clone();
         Box::pin(async move {
@@ -171,7 +196,7 @@ impl Checkpointer {
                 // Recheck while copying: draining writes can publish pages, and
                 // holds can be added during traversal yields.
                 let metadata = owner.index.snapshot_metadata_budgeted(&mut remaining)?;
-                let mut segments = owner.segments.snapshot();
+                let segments = owner.segments.snapshot();
                 let mut entries = Vec::new();
                 let mut cursor = 0;
                 loop {
@@ -191,20 +216,27 @@ impl Checkpointer {
                 }
                 // Publications are fenced. Capture deadlines after traversal so
                 // holds acquired or extended during its yields are included.
-                owner.index.snapshot_holds(&mut segments, &mut remaining)?;
+                let mut holds = Vec::new();
+                owner.index.snapshot_holds(&mut holds, &mut remaining)?;
                 let mut shard = ShardImage {
                     worker: owner.index.worker(),
                     geometry,
                     index: super::catalog::IndexSnapshot { entries, metadata },
                     segments,
+                    holds,
                 };
                 shard.prune_holds();
                 Ok(shard)
             }
             .await;
             if result.is_ok() {
+                // The image is an owned copy. Later appends land only in free
+                // slots or the open segment's unused tail, which it does not
+                // map, so resume the writer now. Eviction and recycling stay
+                // frozen through publication, so no mapped extent is reused.
+                frozen.thaw_appends();
+                drop(paused);
                 *owner.frozen.borrow_mut() = Some(frozen);
-                *owner.paused.borrow_mut() = paused;
             }
             result
         })
@@ -220,22 +252,18 @@ impl Checkpointer {
 
     /// One coordinator calls this after all owner-worker snapshots have succeeded.
     /// The coordinator must keep all owners frozen until this operation completes.
-    pub fn publish(&self, cluster: ClusterId, shards: Vec<ShardImage>) -> Operation<'_, ()> {
-        Box::pin(async move {
-            let newest = candidates(&self.directory, MAX_CHECKPOINT_BYTES)?
-                .next()
-                .map(|(slot, image)| (slot, image.sequence));
-            // Replace the slot opposite the newest valid image, including after a
-            // torn newer publication. The surviving valid generation stays intact.
-            let (slot, sequence) = SLOTS.next_publication(newest).ok_or(Error::Unavailable)?;
-            let bytes = encode(&CheckpointImage {
-                version: CHECKPOINT_VERSION,
-                cluster,
-                sequence,
-                shards,
-            })?;
-            publish_bytes(&self.directory, slot, &bytes)
-        })
+    #[cfg(test)]
+    pub fn publish(
+        &self,
+        env: &racer_io::Env,
+        cluster: ClusterId,
+        shards: Vec<ShardImage>,
+    ) -> Operation<'_, ()> {
+        let directory = self.directory.clone();
+        let result = block_on_io(env, |reactor, ctx| async move {
+            publish_next(&reactor, &ctx, &directory, cluster, shards).await
+        });
+        Box::pin(async move { result })
     }
 
     /// Periodic disposable hints. The coordinator serializes generations and
@@ -251,36 +279,166 @@ impl Checkpointer {
         slot: usize,
         budget: usize,
     ) -> Result<Operation<'static, ()>> {
+        let publish = self.publish_changed_async(
+            cluster, shards, reactor, scope, sequence, slot, budget, None,
+        )?;
+        Ok(Box::pin(async move { publish.await.map(drop) }))
+    }
+
+    /// [`Self::publish_async`] that skips all I/O when the encoded cut, ignoring
+    /// its sequence, matches `previous`. Resolves to the cut's [`fingerprint`]
+    /// when written and `None` when skipped, so an idle node does not rewrite
+    /// an identical checkpoint every period.
+    #[allow(clippy::too_many_arguments)]
+    pub fn publish_changed_async(
+        &self,
+        cluster: ClusterId,
+        shards: Vec<ShardImage>,
+        reactor: Rc<crate::runtime::Reactor>,
+        scope: crate::runtime::RequestScope,
+        sequence: u64,
+        slot: usize,
+        budget: usize,
+        previous: Option<[u8; DIGEST_BYTES]>,
+    ) -> Result<Operation<'static, Option<[u8; DIGEST_BYTES]>>> {
         // Bound simultaneous decoded image, encoding and submission scratch.
         let estimated = snapshot_image_bytes(&shards)?;
         if estimated > budget / 2 {
             return Err(Error::Overloaded);
         }
         let directory = self.directory.clone();
+        let metrics = self
+            .writer
+            .borrow()
+            .upgrade()
+            .map(|writer| writer.metrics.clone());
+        // A real helper thread finishes at a wall time the simulator cannot
+        // schedule, so simulation encodes inline to keep replays deterministic.
+        let offload = !reactor.ctx().is_simulated();
         Ok(Box::pin(async move {
-            let bytes = encode_incremental(&CheckpointImage {
+            let image = CheckpointImage {
                 version: CHECKPOINT_VERSION,
+                page_size: shards_page_size(&shards)?,
                 cluster,
                 sequence,
                 shards,
-            })
-            .await?;
-            if bytes.len() > budget / 2 {
-                return Err(Error::Overloaded);
+            };
+            // Validation and encoding of a large cut is seconds of CPU. Run it
+            // on a helper thread so this reactor keeps serving I/O meanwhile.
+            let encoded = if offload {
+                encode_offloaded(image, budget).await
+            } else {
+                encode_inline(&image, budget)
+            };
+            if let Some(metrics) = &metrics {
+                metrics.record(
+                    crate::telemetry::Event::CheckpointEncodeNs,
+                    u64::try_from(encoded.elapsed.as_nanos()).unwrap_or(u64::MAX),
+                );
+                metrics.record(crate::telemetry::Event::CheckpointEncodeCount, 1);
             }
-            SLOTS
-                .publish_async(
-                    &reactor,
-                    &directory,
-                    slot,
-                    &bytes,
-                    std::num::NonZeroUsize::new(16384).unwrap(),
+            let (bytes, current) = encoded.result?;
+            if previous == Some(current) {
+                return Ok(None);
+            }
+            reactor
+                .run(
                     &scope,
+                    None,
+                    racer_io::scoped::SubmissionKind::OtherIo,
+                    move |io, ctx| {
+                        let (io, ctx) = (io.clone(), ctx.clone());
+                        Box::pin(async move {
+                            Ok(SLOTS
+                                .publish(&io, &directory, slot, &bytes, PUBLISH_CHUNK, &ctx)
+                                .await)
+                        }) as racer_io::Operation<'static, _>
+                    },
+                    |_: &racer_io::Operation<'static, Published>| None,
                 )
-                .await
-                .map_err(Into::into)
+                .await?
+                .map_err(Into::<Error>::into)?;
+            Ok(Some(current))
         }))
     }
+}
+
+/// Outcome of [`encode_offloaded`], with the CPU wall time it took.
+struct Encoded {
+    result: Result<(Vec<u8>, [u8; DIGEST_BYTES])>,
+    elapsed: std::time::Duration,
+    /// Name of the thread that encoded, so tests can prove the offload.
+    #[cfg(test)]
+    thread: Option<String>,
+}
+
+/// Validate, encode, budget-check, and fingerprint `image`.
+fn encode_checked(image: &CheckpointImage, budget: usize) -> Result<(Vec<u8>, [u8; DIGEST_BYTES])> {
+    let bytes = encode(image)?;
+    // Never replace a slot with a cut recovery would reject: the reader caps
+    // the file and charges decoded memory against the same budget, so check
+    // both before touching either slot.
+    publishable(&bytes, budget)?;
+    let current = fingerprint(&bytes)?;
+    Ok((bytes, current))
+}
+
+/// Run [`encode_checked`] on the calling thread.
+fn encode_inline(image: &CheckpointImage, budget: usize) -> Encoded {
+    let start = std::time::Instant::now();
+    let result = encode_checked(image, budget);
+    Encoded {
+        result,
+        elapsed: start.elapsed(),
+        #[cfg(test)]
+        thread: std::thread::current().name().map(Into::into),
+    }
+}
+
+/// Run [`encode_checked`] on a dedicated helper thread and await its result
+/// without blocking the calling reactor. Falls back to encoding inline only
+/// when the OS refuses a new thread.
+async fn encode_offloaded(image: CheckpointImage, budget: usize) -> Encoded {
+    let (sender, receiver) = futures::channel::oneshot::channel();
+    let image = std::sync::Arc::new(image);
+    let shared = image.clone();
+    let spawned = std::thread::Builder::new()
+        .name("racer-checkpoint".into())
+        .spawn(move || {
+            let start = std::time::Instant::now();
+            let result = encode_checked(&shared, budget);
+            // Free the image here, not on the reactor.
+            drop(shared);
+            let _ = sender.send(Encoded {
+                result,
+                elapsed: start.elapsed(),
+                #[cfg(test)]
+                thread: std::thread::current().name().map(Into::into),
+            });
+        });
+    if spawned.is_err() {
+        return encode_inline(&image, budget);
+    }
+    drop(image);
+    receiver.await.unwrap_or(Encoded {
+        result: Err(Error::Unavailable),
+        elapsed: std::time::Duration::ZERO,
+        #[cfg(test)]
+        thread: None,
+    })
+}
+
+/// Sequence-independent digest of an encoded checkpoint: SHA-256 over the
+/// header without its sequence field, and the body without its trailing digest.
+/// Two cuts with equal fingerprints recover identically.
+pub(crate) fn fingerprint(bytes: &[u8]) -> Result<[u8; DIGEST_BYTES]> {
+    if bytes.len() < HEADER_BYTES + DIGEST_BYTES {
+        return Err(Error::CorruptRecord);
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes[..16]);
+    hasher.update(&bytes[24..bytes.len() - DIGEST_BYTES]);
+    Ok(hasher.finalize().into())
 }
 
 impl Drop for Checkpointer {
@@ -308,16 +466,9 @@ fn descriptor_string_bytes(metadata: &VersionMetadata) -> usize {
             .map_or(0, |mime| mime.as_bytes().len())
 }
 
-fn snapshot_segment_bytes(records: usize) -> Result<usize> {
-    records
-        .checked_mul(RETAINED_RECORD_BYTES)
-        .and_then(|n| n.checked_add(SEGMENT_BYTES))
-        .ok_or(Error::Overloaded)
-}
-
 pub(super) fn snapshot_base_bytes(segments: usize) -> Result<usize> {
     segments
-        .checked_mul(snapshot_segment_bytes(0)?)
+        .checked_mul(SEGMENT_BYTES)
         .and_then(|n| n.checked_add(SHARD_BYTES))
         .ok_or(Error::Overloaded)
 }
@@ -326,11 +477,13 @@ fn snapshot_image_bytes(shards: &[ShardImage]) -> Result<usize> {
     let mut total = HEADER_BYTES + CLUSTER_BYTES + 4 + DIGEST_BYTES;
     for shard in shards {
         total = total.checked_add(SHARD_BYTES).ok_or(Error::Overloaded)?;
-        for segment in &shard.segments {
-            total = total
-                .checked_add(snapshot_segment_bytes(segment.retained_records.len())?)
-                .ok_or(Error::Overloaded)?;
-        }
+        total = shard
+            .segments
+            .len()
+            .checked_mul(SEGMENT_BYTES)
+            .and_then(|n| n.checked_add(total))
+            .and_then(|n| n.checked_add(shard.holds.len().checked_mul(HELD_RECORD_BYTES)?))
+            .ok_or(Error::Overloaded)?;
         for bytes in shard
             .index
             .entries
@@ -342,10 +495,6 @@ fn snapshot_image_bytes(shards: &[ShardImage]) -> Result<usize> {
         }
     }
     Ok(total)
-}
-
-fn publish_bytes(directory: &Path, slot: usize, bytes: &[u8]) -> Result<()> {
-    SLOTS.publish(directory, slot, bytes).map_err(|_| Error::Io)
 }
 
 /// Newest-valid checkpoint selection with empty-cache fallback and no payload scan.
@@ -364,8 +513,8 @@ impl Recovery {
     /// has no key ID, so it requires both a current cache UID and an active page key.
     pub fn filter_available(
         image: &mut CheckpointImage,
-        mut metadata_available: impl FnMut(&racer_control_wire::CacheId) -> bool,
-        mut available: impl FnMut(&racer_control_wire::CacheId, KeyId) -> bool,
+        mut metadata_available: impl FnMut(&racer_wire::control::CacheId) -> bool,
+        mut available: impl FnMut(&racer_wire::control::CacheId, KeyId) -> bool,
     ) {
         for shard in &mut image.shards {
             shard
@@ -413,6 +562,7 @@ impl Recovery {
                             metadata: vec![],
                         },
                         segments: empty.snapshot(),
+                        holds: vec![],
                     }
                 }
             };
@@ -423,16 +573,15 @@ impl Recovery {
             self.segments.validate_restore(&image.segments)?;
             self.index.validate_snapshot(&image.index)?;
             self.index
-                .validate_restored_holds(&image.index, &image.segments)?;
+                .validate_restored_holds(&image.index, &image.holds, image.segments.len())?;
             // Keep both preflights even though restore validates again: a frozen or
             // leased table must reject the cut before the index is mutated.
             // Index::restore checks its own standalone metadata capacity before
             // mutation. There is no await between validation and these installs.
             // The coordinator must fence admission for the complete operation.
             self.index.restore(image.index)?;
-            let deadlines = image.segments.clone();
             self.segments.restore(image.segments)?;
-            self.index.restore_holds(&deadlines)?;
+            self.index.restore_holds(&image.holds)?;
             Ok(())
         })
     }
@@ -442,26 +591,126 @@ impl Recovery {
 /// Callers must discard a rejected image before advancing. An inaccessible storage
 /// directory is fatal; individual checkpoint files are disposable hints. Slab
 /// opening/validation remains independently fatal during Store::open.
-pub(crate) fn candidates(directory: &Path, budget: usize) -> Result<Candidates> {
-    SLOTS
+pub(crate) async fn candidates(
+    reactor: &racer_io::Reactor,
+    directory: &Path,
+    budget: usize,
+    ctx: &racer_io::OpCtx,
+) -> Result<Candidates> {
+    let mut found = SLOTS
         .candidates(
+            reactor,
             directory,
             budget,
-            |header| sequence_hint(header).map_err(std::io::Error::other),
-            |bytes, budget| decode_with_budget(bytes, budget).map_err(std::io::Error::other),
+            |header| sequence_hint(header).map_err(|_| racer_io::Error::InvalidInput),
+            |bytes, budget| {
+                decode_with_budget(bytes, budget).map_err(|_| racer_io::Error::InvalidInput)
+            },
+            ctx,
         )
+        .await
         .map_err(|e| {
             eprintln!("racer: checkpoint storage directory unavailable: {e}");
             Error::Io
-        })
+        })?;
+    report_skipped(&mut found);
+    Ok(found)
 }
 
-pub(crate) type Candidates =
-    uring_runtime::reactor::filesystem::checkpoint::Candidates<CheckpointImage, HEADER_BYTES>;
+/// Decode the newest remaining image, reporting slots skipped on the way.
+pub(crate) async fn next_candidate(
+    found: &mut Candidates,
+    reactor: &racer_io::Reactor,
+    ctx: &racer_io::OpCtx,
+) -> Option<(usize, CheckpointImage)> {
+    let next = found.next(reactor, ctx).await;
+    report_skipped(found);
+    next
+}
 
+fn report_skipped(found: &mut Candidates) {
+    for (slot, error) in found.skipped.drain(..) {
+        eprintln!("racer: skipping checkpoint slot {slot}: {error}");
+    }
+}
+
+pub(crate) type Candidates = racer_io::fs::checkpoint::Candidates<CheckpointImage, HEADER_BYTES>;
+
+/// Publish `shards` as the successor of the newest valid image, into the
+/// opposite slot.
 #[cfg(test)]
-pub(crate) fn read_candidates(directory: &Path) -> Result<Vec<(usize, CheckpointImage)>> {
-    Ok(candidates(directory, MAX_CHECKPOINT_BYTES)?.collect())
+async fn publish_next(
+    reactor: &racer_io::Reactor,
+    ctx: &racer_io::OpCtx,
+    directory: &Path,
+    cluster: ClusterId,
+    shards: Vec<ShardImage>,
+) -> Result<()> {
+    let mut found = candidates(reactor, directory, MAX_CHECKPOINT_BYTES, ctx).await?;
+    let newest = next_candidate(&mut found, reactor, ctx)
+        .await
+        .map(|(slot, image)| (slot, image.sequence));
+    drop(found);
+    // Replace the slot opposite the newest valid image, including after a
+    // torn newer publication. The surviving valid generation stays intact.
+    let (slot, sequence) = SLOTS.next_publication(newest).ok_or(Error::Unavailable)?;
+    let bytes = encode(&CheckpointImage {
+        version: CHECKPOINT_VERSION,
+        page_size: shards_page_size(&shards)?,
+        cluster,
+        sequence,
+        shards,
+    })?;
+    SLOTS
+        .publish(reactor, directory, slot, &bytes, PUBLISH_CHUNK, ctx)
+        .await
+        .map_err(|_| Error::Io)
+}
+
+/// Run `make` on a private reactor for the current test environment's driver.
+#[cfg(any(test, feature = "dst"))]
+pub(crate) fn block_on_io<T: 'static, F: std::future::Future<Output = T> + 'static>(
+    env: &racer_io::Env,
+    make: impl FnOnce(racer_io::Reactor, racer_io::OpCtx) -> F,
+) -> T {
+    let env = env.clone();
+    let ctx = if env.driver.sim_os().is_none() && env.ctx.is_simulated() {
+        racer_io::WorkerCtx::host()
+    } else {
+        env.ctx.clone()
+    };
+    let reactor =
+        racer_io::Reactor::new(env.driver.clone(), racer_io::ring::Config::new(64), ctx).unwrap();
+    let executor = racer_io::exec::LocalExecutor::new(Some(reactor.wake_handle()));
+    executor
+        .block_on(&reactor, make(reactor.clone(), racer_io::OpCtx::none()))
+        .unwrap()
+}
+
+#[cfg(any(test, feature = "dst"))]
+pub(crate) fn read_candidates(
+    env: &racer_io::Env,
+    directory: &Path,
+) -> Result<Vec<(usize, CheckpointImage)>> {
+    read_candidates_with_budget(env, directory, MAX_CHECKPOINT_BYTES).map(Iterator::collect)
+}
+
+/// Decode every valid slot newest first on a private test reactor.
+#[cfg(any(test, feature = "dst"))]
+pub(crate) fn read_candidates_with_budget(
+    env: &racer_io::Env,
+    directory: &Path,
+    budget: usize,
+) -> Result<std::vec::IntoIter<(usize, CheckpointImage)>> {
+    let directory = directory.to_path_buf();
+    block_on_io(env, move |reactor, ctx| async move {
+        let mut found = candidates(&reactor, &directory, budget, &ctx).await?;
+        let mut images = Vec::new();
+        while let Some(image) = next_candidate(&mut found, &reactor, &ctx).await {
+            images.push(image);
+        }
+        Ok(images.into_iter())
+    })
 }
 
 // Bounded, versioned binary checkpoints. SHA-256 covers the header and body.
@@ -482,10 +731,13 @@ pub(crate) fn read_candidates(directory: &Path) -> Result<Vec<(usize, Checkpoint
 // restarts at 1, so they can repeat across clusters. Recovery skips a cut
 // from another cluster. Checkpoints with any other version or cluster are
 // discarded as disposable cache hints.
-pub const CHECKPOINT_VERSION: u32 = 2;
+pub const CHECKPOINT_VERSION: u32 = 4;
 const CLUSTER_BYTES: usize = 36;
 pub const FILE_LAYOUT_DIGEST: [u8; 32] = *b"racer-file-layout-v1\0\0\0\0\0\0\0\0\0\0\0\0";
-pub const MAX_CHECKPOINT_BYTES: usize = 64 * 1024 * 1024;
+/// Largest encoded checkpoint file. Recovery additionally bounds decoded memory
+/// by the configured budget, so this only guards the read buffer allocation and
+/// must admit any cut [`checkpoint_budget`] can size for large raw devices.
+pub const MAX_CHECKPOINT_BYTES: usize = 2 * 1024 * 1024 * 1024;
 const MAGIC: &[u8; 8] = b"RACERCP\0";
 const HEADER_BYTES: usize = 32;
 pub(super) const DIGEST_BYTES: usize = 32;
@@ -494,10 +746,11 @@ const MAX_ITEMS: usize = 1_000_000;
 const MAX_STRING_BYTES: usize = 8192;
 
 // Shared with decode_with_budget/recovery_memory input.count calls for shards,
-// segments, retained records, page entries, and standalone descriptors.
-const SHARD_BYTES: usize = 94; // worker + geometry + digest + three u32 counts.
-const SEGMENT_BYTES: usize = 29; // id + generation + state + used + record count.
-pub(super) const RETAINED_RECORD_BYTES: usize = 20; // offset + seconds + nanos.
+// segments, page entries, standalone descriptors, and held pages.
+const SHARD_BYTES: usize = 98; // worker + geometry + digest + four u32 counts.
+const SEGMENT_BYTES: usize = 25; // id + generation + state + used.
+/// Entry index + remaining hold nanoseconds.
+pub(super) const HELD_RECORD_BYTES: usize = 12;
 const DESCRIPTOR_BYTES: usize = 52; // key + length + three u32 string lengths.
 const PAGE_ENTRY_BYTES: usize = DESCRIPTOR_BYTES + PAGE_FIELD_BYTES;
 const PAGE_FIELD_BYTES: usize = 56; // page + key ID + segment + generation + offset + length.
@@ -532,6 +785,9 @@ impl From<page_alloc::SegmentGeometry> for CheckpointGeometry {
 impl CheckpointGeometry {
     /// Full-page capacity at actual direct-I/O alignment, conservatively allowing
     /// the largest supported record header. Short records can use tail space.
+    /// Pages are counted at the largest page size because storage opens before
+    /// the cluster page size is published, so this is a lower bound when the
+    /// published page size is smaller.
     pub fn payload_capacity(&self, reserve: usize, page_entries: usize) -> Result<(u64, u64)> {
         let record = self
             .alignment()?
@@ -608,20 +864,15 @@ pub struct ShardImage {
     pub geometry: CheckpointGeometry,
     pub index: IndexSnapshot,
     pub segments: Vec<SegmentSnapshot>,
+    /// Published held pages and the hold time left when the cut was taken.
+    /// Only remaining durations are persisted: restart re-arms each hold on
+    /// the new process's monotonic clock and never mixes in wall time.
+    pub holds: Vec<(PageId, std::time::Duration)>,
 }
 impl ShardImage {
     fn prune_holds(&mut self) {
-        let offsets: HashSet<_> = self
-            .index
-            .entries
-            .iter()
-            .map(|(_, entry)| entry.location.extent.offset())
-            .collect();
-        for segment in &mut self.segments {
-            segment
-                .retained_records
-                .retain(|(offset, _)| offsets.contains(offset));
-        }
+        let pages: HashSet<_> = self.index.entries.iter().map(|(page, _)| page).collect();
+        self.holds.retain(|(page, _)| pages.contains(page));
     }
 
     /// Validate against an isolated allocation table, without touching live state.
@@ -671,21 +922,14 @@ impl ShardImage {
                     .ok_or(Error::CorruptRecord)?,
             ));
         }
-        let locations: HashMap<_, _> = self
-            .index
-            .entries
-            .iter()
-            .map(|(_, entry)| (entry.location.extent.offset(), entry.location.segment))
-            .collect();
-        let mut retained = HashSet::default();
-        for segment in &self.segments {
-            for (offset, until) in &segment.retained_records {
-                if !retained.insert(*offset)
-                    || until.duration_since(std::time::UNIX_EPOCH).is_err()
-                    || locations.get(offset) != Some(&segment.id)
-                {
-                    return Err(Error::CorruptRecord);
-                }
+        let mut held = HashSet::default();
+        for (page, ttl) in &self.holds {
+            if !held.insert(page)
+                || !pages.contains(page)
+                || ttl.is_zero()
+                || *ttl > super::holds::MAX_HOLD_TTL
+            {
+                return Err(Error::CorruptRecord);
             }
         }
         extents.sort_unstable();
@@ -698,6 +942,9 @@ impl ShardImage {
 
 pub struct CheckpointImage {
     pub version: u32,
+    /// Page size every entry was cut at. Recovery under another
+    /// published page size discards the image and starts cold.
+    pub page_size: racer_wire::object::PageSize,
     /// Cluster UID that owns the keys named by page entries.
     pub cluster: ClusterId,
     pub sequence: u64,
@@ -725,7 +972,8 @@ pub async fn encode_incremental(image: &CheckpointImage) -> Result<Vec<u8>> {
     let mut out = Encoder(Vec::new());
     out.bytes(MAGIC)?;
     out.u32(image.version)?;
-    out.u32(0)?; // Reserved flags.
+    // Every page size is at most 16 MiB, so it fits a u32.
+    out.u32(image.page_size.get() as u32)?;
     out.u64(image.sequence)?;
     out.u64(0)?; // Total encoded length, filled before hashing.
     out.bytes(image.cluster.0.as_bytes())?;
@@ -762,17 +1010,6 @@ pub async fn encode_incremental(image: &CheckpointImage) -> Result<Vec<u8>> {
                 SegmentState::Evicting => 3,
             }])?;
             out.u64(segment.used_bytes)?;
-            out.count(segment.retained_records.len())?;
-            let mut records = segment.retained_records.clone();
-            records.sort_by_key(|(offset, _)| *offset);
-            for (offset, until) in &records {
-                let duration = until
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_err(|_| Error::CorruptRecord)?;
-                out.u64(*offset)?;
-                out.u64(duration.as_secs())?;
-                out.u32(duration.subsec_nanos())?;
-            }
         }
         out.count(shard.index.entries.len())?;
         let mut entries: Vec<_> = shard.index.entries.iter().collect();
@@ -781,10 +1018,12 @@ pub async fn encode_incremental(image: &CheckpointImage) -> Result<Vec<u8>> {
                 .cmp(&version_key(&b.version))
                 .then(a.number.0.cmp(&b.number.0))
         });
+        let mut positions = HashMap::default();
         for (i, (page, entry)) in entries.into_iter().enumerate() {
             if i % 128 == 0 {
                 yield_now().await;
             }
+            positions.insert(page, u32::try_from(i).map_err(|_| Error::CorruptRecord)?);
             out.descriptor(&entry.metadata)?;
             out.u64(page.number.0)?;
             out.bytes(&entry.key_id.0)?;
@@ -801,6 +1040,21 @@ pub async fn encode_incremental(image: &CheckpointImage) -> Result<Vec<u8>> {
                 yield_now().await;
             }
             out.descriptor(metadata)?;
+        }
+        out.count(shard.holds.len())?;
+        let mut holds = shard
+            .holds
+            .iter()
+            .map(|(page, ttl)| {
+                let position = *positions.get(page).ok_or(Error::CorruptRecord)?;
+                let nanos = u64::try_from(ttl.as_nanos()).map_err(|_| Error::CorruptRecord)?;
+                Ok((position, nanos))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        holds.sort_unstable();
+        for (position, nanos) in holds {
+            out.u32(position)?;
+            out.u64(nanos)?;
         }
     }
     let length = out
@@ -839,9 +1093,11 @@ pub fn decode_with_budget(bytes: &[u8], budget: usize) -> Result<CheckpointImage
         return Err(Error::CorruptRecord);
     }
     let version = input.u32()?;
-    if version != CHECKPOINT_VERSION || input.u32()? != 0 {
+    if version != CHECKPOINT_VERSION {
         return Err(Error::CorruptRecord);
     }
+    let page_size = racer_wire::object::PageSize::from_wire(u64::from(input.u32()?))
+        .map_err(|_| Error::CorruptRecord)?;
     let sequence = input.u64()?;
     if input.u64()? != bytes.len() as u64 {
         return Err(Error::CorruptRecord);
@@ -879,23 +1135,6 @@ pub fn decode_with_budget(bytes: &[u8], budget: usize) -> Result<CheckpointImage
                     _ => return Err(Error::CorruptRecord),
                 },
                 used_bytes: input.u64()?,
-                retained_records: {
-                    let count = input.count(MAX_ITEMS, RETAINED_RECORD_BYTES)?;
-                    let mut records = Vec::with_capacity(count);
-                    for _ in 0..count {
-                        let offset = input.u64()?;
-                        let seconds = input.u64()?;
-                        let nanos = input.u32()?;
-                        if nanos >= 1_000_000_000 {
-                            return Err(Error::CorruptRecord);
-                        }
-                        let until = std::time::UNIX_EPOCH
-                            .checked_add(std::time::Duration::new(seconds, nanos))
-                            .ok_or(Error::CorruptRecord)?;
-                        records.push((offset, until));
-                    }
-                    records
-                },
             });
         }
         let count = input.count(MAX_ITEMS, PAGE_ENTRY_BYTES)?;
@@ -915,6 +1154,7 @@ pub fn decode_with_budget(bytes: &[u8], budget: usize) -> Result<CheckpointImage
             entries.push((
                 page,
                 IndexedPage {
+                    page_size,
                     metadata,
                     key_id,
                     location: RecordLocation {
@@ -930,11 +1170,19 @@ pub fn decode_with_budget(bytes: &[u8], budget: usize) -> Result<CheckpointImage
         for _ in 0..count {
             metadata.push(input.descriptor()?);
         }
+        let count = input.count(MAX_ITEMS, HELD_RECORD_BYTES)?;
+        let mut holds = Vec::with_capacity(count);
+        for _ in 0..count {
+            let position = usize::try_from(input.u32()?).map_err(|_| Error::CorruptRecord)?;
+            let (page, _) = entries.get(position).ok_or(Error::CorruptRecord)?;
+            holds.push((page.clone(), std::time::Duration::from_nanos(input.u64()?)));
+        }
         shards.push(ShardImage {
             worker,
             geometry,
             index: IndexSnapshot { entries, metadata },
             segments,
+            holds,
         });
     }
     if !input.0.is_empty() {
@@ -942,12 +1190,58 @@ pub fn decode_with_budget(bytes: &[u8], budget: usize) -> Result<CheckpointImage
     }
     let image = CheckpointImage {
         version,
+        page_size,
         cluster,
         sequence,
         shards,
     };
     validate_image(&image)?;
     Ok(image)
+}
+
+/// Reject a cut that the writer budget or recovery would refuse.
+fn publishable(bytes: &[u8], budget: usize) -> Result<()> {
+    if bytes.len() > budget / 2 || recovery_memory(bytes, budget).is_err() {
+        return Err(Error::Overloaded);
+    }
+    Ok(())
+}
+
+/// Budget that lets periodic cuts of `workers` shards, each with `segments`
+/// segment records, `pages` disk page entries and `metadata` catalog entries
+/// whose descriptor strings total `strings` bytes, be both written and
+/// recovered. Mirrors the writer limits (`budget / (4 * workers)` per shard and
+/// `budget / 2` per image) and the [`recovery_memory`] charges, so a cut that
+/// fits this budget is never skipped on restart.
+pub(crate) fn checkpoint_budget(
+    workers: usize,
+    segments: usize,
+    pages: usize,
+    metadata: usize,
+    strings: usize,
+) -> usize {
+    let shard_encoded = SHARD_BYTES
+        .saturating_add(segments.saturating_mul(SEGMENT_BYTES))
+        .saturating_add(pages.saturating_mul(PAGE_ENTRY_BYTES + strings))
+        .saturating_add(metadata.saturating_mul(DESCRIPTOR_BYTES + strings));
+    let encoded = shard_encoded
+        .saturating_mul(workers)
+        .saturating_add(HEADER_BYTES + CLUSTER_BYTES + 4 + DIGEST_BYTES);
+    let shard_decoded = (std::mem::size_of::<ShardImage>() + 512)
+        .saturating_add(segments.saturating_mul(std::mem::size_of::<SegmentSnapshot>() + 512))
+        .saturating_add(
+            pages.saturating_mul(std::mem::size_of::<(PageId, IndexedPage)>() + 512 + 4 * strings),
+        )
+        .saturating_add(
+            metadata.saturating_mul(std::mem::size_of::<VersionMetadata>() + 512 + 4 * strings),
+        );
+    let decoded = shard_decoded
+        .saturating_mul(workers)
+        .saturating_add(encoded)
+        .saturating_add(std::mem::size_of::<CheckpointImage>());
+    decoded
+        .max(encoded.saturating_mul(2))
+        .max(shard_encoded.saturating_mul(4).saturating_mul(workers))
 }
 
 /// Conservative accounting, not serialized size: per-item scratch covers growing
@@ -987,12 +1281,7 @@ pub(super) fn recovery_memory(bytes: &[u8], budget: usize) -> Result<usize> {
             return Err(Error::CorruptRecord);
         }
         charge(segments, std::mem::size_of::<SegmentSnapshot>() + 512)?;
-        for _ in 0..segments {
-            input.take(25)?;
-            let count = input.count(MAX_ITEMS, RETAINED_RECORD_BYTES)?;
-            charge(count, 128)?;
-            input.take(count * RETAINED_RECORD_BYTES)?;
-        }
+        input.take(segments * SEGMENT_BYTES)?;
         let pages = input.count(MAX_ITEMS, PAGE_ENTRY_BYTES)?;
         charge(pages, std::mem::size_of::<(PageId, IndexedPage)>() + 512)?;
         for _ in 0..pages {
@@ -1004,6 +1293,12 @@ pub(super) fn recovery_memory(bytes: &[u8], budget: usize) -> Result<usize> {
         for _ in 0..metadata {
             charge(input.descriptor_bytes()?, 4)?;
         }
+        let holds = input.count(MAX_ITEMS, HELD_RECORD_BYTES)?;
+        charge(
+            holds,
+            std::mem::size_of::<(PageId, std::time::Duration)>() + 128,
+        )?;
+        input.take(holds * HELD_RECORD_BYTES)?;
     }
     if !input.0.is_empty() {
         return Err(Error::CorruptRecord);
@@ -1042,12 +1337,33 @@ fn version_key(version: &ObjectVersion) -> (&str, &[u8; 32], &[u8]) {
         version.etag.as_bytes(),
     )
 }
+/// The one page size shared by every entry of `shards`; the default when
+/// there are no entries. Mixed sizes are a corrupt cut.
+pub fn shards_page_size(shards: &[ShardImage]) -> Result<racer_wire::object::PageSize> {
+    let mut sizes = shards
+        .iter()
+        .flat_map(|shard| shard.index.entries.iter().map(|(_, entry)| entry.page_size));
+    let first = sizes.next().unwrap_or_default();
+    if sizes.all(|size| size == first) {
+        Ok(first)
+    } else {
+        Err(Error::CorruptRecord)
+    }
+}
+
 fn validate_image(image: &CheckpointImage) -> Result<()> {
     if image.version != CHECKPOINT_VERSION
         || image.cluster.0.len() != CLUSTER_BYTES
         || !racer_crypto::identity::canonical_uuid(&image.cluster.0)
         || image.shards.is_empty()
         || image.shards.len() > MAX_SHARDS
+        || image.shards.iter().any(|shard| {
+            shard
+                .index
+                .entries
+                .iter()
+                .any(|(_, entry)| entry.page_size != image.page_size)
+        })
     {
         return Err(Error::CorruptRecord);
     }
@@ -1083,11 +1399,11 @@ fn validate_image(image: &CheckpointImage) -> Result<()> {
 
 struct Encoder(Vec<u8>);
 impl Encoder {
-    fn writer(&mut self) -> wire_codec::Writer<'_> {
-        wire_codec::Writer::new(
+    fn writer(&mut self) -> racer_wire::codec::Writer<'_> {
+        racer_wire::codec::Writer::new(
             &mut self.0,
             MAX_CHECKPOINT_BYTES - DIGEST_BYTES,
-            wire_codec::Endian::Little,
+            racer_wire::codec::Endian::Little,
         )
     }
     fn bytes(&mut self, bytes: &[u8]) -> Result<()> {
@@ -1169,16 +1485,21 @@ impl<'a> Decoder<'a> {
 // filter, but do not create an application worker directory. This test-only
 // loader is not compiled into the dataplane.
 impl Recovery {
-    pub(crate) fn load(&self, alignment: Alignment) -> Operation<'_, Option<CheckpointImage>> {
-        self.load_filtered(alignment, |_, _| true)
+    pub(crate) fn load(
+        &self,
+        env: &racer_io::Env,
+        alignment: Alignment,
+    ) -> Operation<'_, Option<CheckpointImage>> {
+        self.load_filtered(env, alignment, |_, _| true)
     }
     pub(super) fn load_filtered(
         &self,
+        env: &racer_io::Env,
         alignment: Alignment,
         available: impl Fn(&CacheId, KeyId) -> bool,
     ) -> Operation<'_, Option<CheckpointImage>> {
-        let result = candidates(&self.directory, MAX_CHECKPOINT_BYTES).map(|mut cuts| {
-            cuts.find_map(|(_, mut image)| {
+        let result = read_candidates(env, &self.directory).map(|cuts| {
+            cuts.into_iter().find_map(|(_, mut image)| {
                 Recovery::filter_available(&mut image, |_| true, &available);
                 let valid = image.shards.iter().all(|s| {
                     s.geometry.matches_alignment(alignment)
@@ -1236,13 +1557,118 @@ mod budget_tests {
         }
     }
 
+    /// A full single-shard cut over `segments` segments with `per_segment`
+    /// short records each and one catalog entry.
+    fn full_image(segments: u64, per_segment: usize) -> CheckpointImage {
+        let alignment = Alignment::new(4096, 4096, 4096).unwrap();
+        let segment_bytes = 4 * 4096u64;
+        let geometry =
+            CheckpointGeometry::new(segment_bytes * segments, segment_bytes, segments, alignment)
+                .unwrap();
+        let store = Segments::from_geometry(geometry.allocation_geometry().unwrap()).unwrap();
+        let metadata = metadata();
+        let mut entries = Vec::new();
+        let mut leases = Vec::new();
+        for number in 0..segments as usize * per_segment {
+            let (lease, extent) = store.append(4096).unwrap();
+            let mut descriptor = metadata.clone();
+            descriptor.version.object.key.0[..8].copy_from_slice(&(number as u64).to_le_bytes());
+            entries.push((
+                PageId {
+                    version: descriptor.version.clone(),
+                    number: PageNumber(0),
+                },
+                IndexedPage {
+                    page_size: racer_wire::object::PageSize::DEFAULT,
+                    metadata: descriptor,
+                    key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
+                    location: RecordLocation {
+                        segment: lease.id(),
+                        generation: lease.generation(),
+                        extent,
+                    },
+                },
+            ));
+            leases.push(lease);
+        }
+        CheckpointImage {
+            version: CHECKPOINT_VERSION,
+            page_size: racer_wire::object::PageSize::DEFAULT,
+            cluster: crate::store::checkpoint::test_cluster(),
+            sequence: 1,
+            shards: vec![ShardImage {
+                worker: WorkerId(0),
+                geometry,
+                index: IndexSnapshot {
+                    entries,
+                    metadata: vec![metadata],
+                },
+                segments: store.snapshot(),
+                holds: Vec::new(),
+            }],
+        }
+    }
+
+    #[test]
+    fn planned_budget_writes_and_recovers_a_full_cut() {
+        let strings = descriptor_string_bytes(&metadata());
+        for (segments, per_segment) in [(1, 0), (1, 4), (64, 4), (512, 2)] {
+            let image = full_image(segments, per_segment);
+            let bytes = encode(&image).unwrap();
+            let pages = segments as usize * per_segment;
+            let budget = checkpoint_budget(1, segments as usize, pages, 1, strings);
+            // Whatever the planned budget lets the writer publish, recovery accepts.
+            assert_eq!(publishable(&bytes, budget), Ok(()));
+            assert!(bytes.len() <= MAX_CHECKPOINT_BYTES);
+            let decoded = decode_with_budget(&bytes, budget).unwrap();
+            assert_eq!(decoded.shards[0].index.entries.len(), pages);
+            // The writer refuses a cut that recovery would skip.
+            let needed = recovery_memory(&bytes, usize::MAX).unwrap();
+            assert_eq!(publishable(&bytes, needed - 1), Err(Error::Overloaded));
+            assert!(decode_with_budget(&bytes, needed - 1).is_err());
+        }
+    }
+
+    /// Validation and encoding run on a helper thread, not the polling
+    /// reactor, and produce exactly what inline encoding produces.
+    #[test]
+    fn offloaded_encode_runs_off_the_reactor_and_matches_inline() {
+        let image = full_image(64, 4);
+        let budget = usize::MAX / 2;
+        let inline = encode_checked(&image, budget).unwrap();
+        let encoded = futures::executor::block_on(encode_offloaded(image, budget));
+        assert_eq!(encoded.thread.as_deref(), Some("racer-checkpoint"));
+        assert_eq!(encoded.result.unwrap(), inline);
+        // Failures on the helper are reported, not lost.
+        let mut bad = full_image(1, 1);
+        bad.version += 1;
+        let encoded = futures::executor::block_on(encode_offloaded(bad, budget));
+        assert_eq!(encoded.result, Err(Error::CorruptRecord));
+        // A cut over budget is refused before any slot write.
+        let encoded = futures::executor::block_on(encode_offloaded(full_image(64, 4), 1));
+        assert_eq!(encoded.result, Err(Error::Overloaded));
+    }
+
+    #[test]
+    fn planned_budget_covers_per_shard_writer_split_and_saturates() {
+        let strings = 256;
+        let one = checkpoint_budget(1, 1000, 3000, 48, strings);
+        let many = checkpoint_budget(86, 1000, 3000, 48, strings);
+        // Writers snapshot each shard against budget / (4 * workers).
+        let shard = SHARD_BYTES + 1000 * SEGMENT_BYTES + 3000 * (PAGE_ENTRY_BYTES + strings);
+        assert!(many / (4 * 86) >= shard);
+        assert!(many >= 86 * one / 2);
+        assert_eq!(
+            checkpoint_budget(usize::MAX, usize::MAX, 1, 1, 1),
+            usize::MAX
+        );
+    }
+
     #[test]
     fn segment_charge_handles_empty_full_and_overflow() {
         assert_eq!(snapshot_base_bytes(0), Ok(SHARD_BYTES));
-        assert_eq!(snapshot_segment_bytes(0), Ok(29));
-        assert_eq!(snapshot_segment_bytes(63), Ok(1289));
-        assert_eq!(snapshot_segment_bytes(MAX_ITEMS), Ok(29 + 20 * MAX_ITEMS));
-        assert_eq!(snapshot_segment_bytes(usize::MAX), Err(Error::Overloaded));
+        assert_eq!(snapshot_base_bytes(1), Ok(SHARD_BYTES + 25));
+        assert_eq!(snapshot_base_bytes(64), Ok(SHARD_BYTES + 25 * 64));
         assert_eq!(snapshot_base_bytes(usize::MAX), Err(Error::Overloaded));
     }
 
@@ -1283,6 +1709,7 @@ mod budget_tests {
                             number: PageNumber(0),
                         },
                         IndexedPage {
+                            page_size: racer_wire::object::PageSize::DEFAULT,
                             metadata: descriptor,
                             key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
                             location: RecordLocation {
@@ -1293,14 +1720,14 @@ mod budget_tests {
                         },
                     ));
                     retained.push((
-                        extent.offset(),
-                        std::time::UNIX_EPOCH + std::time::Duration::from_secs(60),
+                        entries.last().unwrap().0.clone(),
+                        std::time::Duration::from_secs(60),
                     ));
                 }
-                let mut segments = segments.snapshot();
-                segments[0].retained_records = retained;
+                let segments = segments.snapshot();
                 let image = CheckpointImage {
                     version: CHECKPOINT_VERSION,
+                    page_size: racer_wire::object::PageSize::DEFAULT,
                     cluster: crate::store::checkpoint::test_cluster(),
                     sequence: 1,
                     shards: vec![ShardImage {
@@ -1311,26 +1738,43 @@ mod budget_tests {
                             metadata: vec![metadata],
                         },
                         segments,
+                        holds: retained,
                     }],
                 };
                 let encoded = encode(&image).unwrap();
                 assert_eq!(snapshot_image_bytes(&image.shards).unwrap(), encoded.len());
                 let decoded = decode(&encoded).unwrap();
-                assert_eq!(
-                    decoded.shards[0].segments[0].retained_records.len(),
-                    records
-                );
+                assert_eq!(decoded.shards[0].holds.len(), records);
                 assert_eq!(encode(&decoded).unwrap(), encoded);
+                if records == 0 {
+                    continue;
+                }
+                // Holds must name a distinct entry with a positive, bounded
+                // remaining duration.
+                let page = decoded.shards[0].index.entries[0].0.clone();
+                for bad in [
+                    std::time::Duration::ZERO,
+                    super::super::holds::MAX_HOLD_TTL + std::time::Duration::from_nanos(1),
+                ] {
+                    let mut shard = decode(&encoded).unwrap().shards.remove(0);
+                    shard.holds[0].1 = bad;
+                    assert_eq!(shard.validate().err(), Some(Error::CorruptRecord));
+                }
+                let mut shard = decode(&encoded).unwrap().shards.remove(0);
+                shard.holds.push((page, std::time::Duration::from_secs(1)));
+                assert_eq!(shard.validate().err(), Some(Error::CorruptRecord));
             }
         }
     }
 
     #[test]
     fn empty_shard_exact_budget_and_unconfigured_zero_segments() {
+        let env = racer_io::Env::host();
         let index = Rc::new(Index::new(
             WorkerId(0),
             1,
-            crate::test_support::availability(),
+            crate::test_support::availability(&env),
+            racer_io::Clock::host(),
         ));
         let segments = Rc::new(Segments::new(4096));
         let checkpoint = Rc::new(Checkpointer::new(PathBuf::new(), index, segments.clone()));
@@ -1355,7 +1799,7 @@ mod budget_tests {
         drop(segments.freeze().unwrap());
         let shard = futures::executor::block_on(checkpoint.snapshot_incremental(budget)).unwrap();
         assert!(shard.index.entries.is_empty());
-        assert!(shard.segments[0].retained_records.is_empty());
+        assert!(shard.holds.is_empty());
         assert!(checkpoint.frozen.borrow().is_some());
         checkpoint.finish_snapshot();
         assert!(segments.append(4096).is_ok());

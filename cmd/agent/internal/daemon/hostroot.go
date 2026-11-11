@@ -18,6 +18,9 @@ import (
 	"github.com/Azure/unbounded/internal/hostroot"
 	"github.com/Azure/unbounded/pkg/agent/agentbinary"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/isolation"
+	"github.com/Azure/unbounded/pkg/agent/isolation/container"
+	"github.com/Azure/unbounded/pkg/agent/isolation/none"
 	"github.com/Azure/unbounded/pkg/agent/phases/nodestart"
 )
 
@@ -137,6 +140,34 @@ func verifyMovedDaemon(ctx context.Context, root string) error {
 	return agentbinary.Verify(ctx, filepath.Join(root, "bin", hostroot.BinaryCurrentName))
 }
 
+// localDNSNetworkNode is the node start goal state the LocalDNS network files
+// of the active node are written from. A host-native or container node has no
+// nspawn machine to order after the network unit (its own units do that), so it
+// gets no machine drop-in.
+func localDNSNetworkNode(log *slog.Logger, active *ActiveMachine) (*goalstates.NodeStart, error) {
+	gs, err := goalstates.ResolveMachine(log, active.Config, active.Name, nil)
+	if err != nil {
+		return nil, fmt.Errorf("resolve machine goal state: %w", err)
+	}
+
+	switch activeModeOf(active) {
+	case isolation.ModeNone:
+		gs.NodeStart.RootOverride = none.Root{}
+	case isolation.ModeContainer:
+		// The container's supervising unit orders itself after the network
+		// unit, so it gets no machine drop-in either.
+		root, err := container.NewDefault(log).NodeRoot(active.Name)
+		if err != nil {
+			return nil, err
+		}
+
+		gs.NodeStart.RootOverride = root
+		gs.NodeStart.InContainer = true
+	}
+
+	return gs.NodeStart, nil
+}
+
 // rewriteHostRootUnits points every unit and script that names the agent's
 // files at the files under the host root.
 func rewriteHostRootUnits(ctx context.Context, log *slog.Logger, lifecycle lifecycleMigrator, active *ActiveMachine) error {
@@ -153,12 +184,12 @@ func rewriteHostRootUnits(ctx context.Context, log *slog.Logger, lifecycle lifec
 	// The LocalDNS network unit and its helper, on a host that has them. The
 	// network they configure is already up, so the unit is not run again.
 	if _, err := os.Stat(filepath.Join(goalstates.SystemdSystemDir, goalstates.LocalDNSNetworkUnit)); err == nil {
-		gs, err := goalstates.ResolveMachine(log, active.Config, active.Name, nil)
+		ns, err := localDNSNetworkNode(log, active)
 		if err != nil {
-			return fmt.Errorf("resolve machine goal state: %w", err)
+			return err
 		}
 
-		if err := nodestart.WriteLocalDNSNetworkFiles(gs.NodeStart); err != nil {
+		if err := nodestart.WriteLocalDNSNetworkFiles(ns); err != nil {
 			return err
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {

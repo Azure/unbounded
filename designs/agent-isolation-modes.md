@@ -114,7 +114,9 @@ Coupling points to abstract:
   keyed on `/etc/unbounded/agent/<m>-applied-config.json`
   (`goalstates.AppliedConfigPath`).
 - Uninstall: `internal/provision/assets/unbounded-agent-uninstall.sh`
-  hard-codes `machinectl`, `/etc/systemd/nspawn`, `/var/lib/machines`.
+  hard-coded `machinectl`, `/etc/systemd/nspawn`, `/var/lib/machines`. Nothing
+  ran it; it is removed, and `unbounded-agent reset` is the way to remove a
+  node in every mode.
 - Generated config and vendor data: `internal/provision/agent_config.go`,
   `images/netboot/assets/vendor-data.tmpl`, `hack/smoke-metalman.py`.
 
@@ -179,12 +181,28 @@ The applied-config file records `isolation`, `slot` and the owning backend. A
 missing `isolation` reads as `nspawn`. `FindActiveMachine` must handle both old
 and new files.
 
+An nspawn node keeps `<slot>-applied-config.json`. A node in any other mode
+stores it as `<mode>-<slot>-applied-config.json`
+(`goalstates.AppliedConfigName`), a name agents that predate the mode never
+read, so such an agent finds no node and refuses to operate it instead of
+running nspawn operations against it. The name and the recorded mode must
+agree, or discovery fails closed.
+
 ### 6.4 Version skew
 
 - The agent rejects any unrecognized `isolation` value with a clear error. An
   agent that predates the key does not reject it: the config is decoded with
   `encoding/json` (`cmd/agent/internal/cmd/config.go`), which ignores unknown
   keys, so that agent runs the node as `nspawn`.
+- An agent upgrade and the daemon recovery script ask the candidate (or the
+  last-good binary) `unbounded-agent supports-isolation <mode>` for every
+  non-nspawn mode whose applied config exists, and refuse a binary that fails
+  it. An agent that predates the subcommand fails it.
+- The netboot vendor-data template ships in the netboot image and is rendered
+  by whichever metalman serves it, so it references no field a metalman may
+  lack, and templates render from a map so an unknown field yields no value
+  instead of failing the render. The machined guards it writes are removed by
+  the agent at bootstrap in modes without an nspawn machine.
 - Machina passes `spec.isolation` through to generated agent config without
   checking the agent version. No release number is compiled into the code; the
   operator pins an agent version that supports the requested mode.
@@ -201,7 +219,9 @@ sets the `IsolationDrift` condition:
 | `AppliedModeMatches` | `False` | the declared mode runs |
 | `AppliedModeDiffers` | `True` | a different mode is declared; it applies at the next repave |
 | `ChangeInProgress` | `True` | `status.isolationChange` is `InProgress` for the declared mode |
+| `ChangeStale` | `True` | `InProgress` for more than two hours by `lastTransitionTime` |
 | `ChangeFailed` | `True` | `status.isolationChange` is `Failed` for the declared mode |
+| `ChangeRefused` | `True` | `Failed` with a reason (`UnsupportedMode`, `ReprovisionNotAllowed`) |
 
 The condition is absent until the agent has reported a mode. The mode changes
 when the node is next repaved (section 10).
@@ -334,8 +354,12 @@ Everything runs directly on the host.
   versioned directories such as `/opt/unbounded/node/<version>/`, with a
   `current` symlink. No distro packages.
 - Units: agent-owned systemd units for containerd, kubelet and CoreDNS.
-- Safety: preflight refuses to start if it finds a kubelet or containerd it does
-  not own (unit, binary or running process).
+- Safety: bootstrap (`EnsureHostClean`, not only the optional `preflight`
+  subcommand) refuses a host with a kubelet or containerd it does not own
+  (unit, binary or running process). A unit masked to `/dev/null`, which an
+  nspawn host leaves, is not one. containerd runs with the agent-owned
+  `/etc/unbounded/containerd/config.toml`, never the distro's
+  `/etc/containerd/config.toml`.
 - Requirements: writable `/etc`, `/opt`, `/var`. `/usr` is never modified, so
   a read-only `/usr` is fine.
 - Network and paths: host native. Pods share the host netns trivially.
@@ -343,12 +367,25 @@ Everything runs directly on the host.
   a documented difference for eBPF CNIs such as Cilium.
 - Exec: runs on the host as the unit's environment. Logs: `journalctl` for the
   agent-owned units.
-- Upgrade: stop units, flip `current`, start units, wait for kubelet
-  Ready, flip back automatically on failure. The node is briefly down.
+- Upgrade: stop units, end the pods (the shims of the agent's containerd and
+  the pod cgroups) before host networking is cleaned, flip `current`, write the
+  new units, start units, wait for kubelet Ready, and on failure flip back and
+  start the previous version with its own units, configuration and host
+  networking. The node is briefly down. A soft reboot restarts the units and
+  leaves the pods running.
+- CNI plugins are versioned with the rest (`<version>/cni/bin`) and linked one
+  by one into `/opt/cni/bin` through `current`, so plugins cluster add-ons
+  install there (unbounded-net's IPAM plugin) keep working.
+- Crash safety: an upgrade journal (`none-upgrade-journal.json` in the agent
+  config directory) records the version being replaced before anything
+  changes, and the saved configuration is kept until the applied config is
+  persisted. The daemon finishes an interrupted upgrade at its next start:
+  rolled back, or committed if it had succeeded.
 
 **Status (WP1).** Implemented end to end: bootstrap, start, soft reboot,
-upgrade with rollback, reset, `exec`, `logs`, preflight and uninstall.
-Decisions: the applied config is recorded under the fixed slot `kube1` (the
+upgrade with rollback, reset, `exec`, `logs` and preflight. Decisions: the
+applied config is recorded under the fixed slot `kube1`, as
+`none-kube1-applied-config.json` (the
 version directory, named `<kubernetes version>-<digest of other artifact
 versions>`, is the unit of upgrade); same-path files are written by the existing
 nodestart phases through a goal-state `RootOverride`, and binaries land in
@@ -386,9 +423,35 @@ Provisional until the node facts in section 13 are collected.
   agent-owned systemd unit supervises the container. The host's docker and
   containerd are not used.
 - Slots: `kube1`/`kube2` with root at `/var/lib/unbounded/containers/<slot>`.
-- Privileges: privileged, shared host netns and PID as needed, host bind mounts
-  for the same-path contract (invariant 3), `rshared` propagation for
-  `/var/lib/kubelet`, device and cgroup rules from grants.
+- Privileges: privileged process, shared host netns, own PID, mount, IPC and
+  cgroup namespaces, host bind mounts for the same-path contract (invariant 3),
+  device and cgroup rules from grants. `/sys` and `/proc/sys` are read-only
+  except `/proc/sys/net` (as nspawn with `SYSTEMD_NSPAWN_API_VFS_WRITABLE=network`),
+  the runtime default masked and read-only paths apply, and udev is masked in
+  the rootfs.
+- Mount propagation: pod volume mounts must be visible on the host. The root
+  propagation is `rshared`, `/var/lib/kubelet` is bound `rshared`, and the
+  supervising unit makes the host's `/var/lib/kubelet` a shared mount (a bind
+  on itself when nothing is mounted there) before every start, so the bind
+  joins its peer group. The agent never unmounts `/var/lib/kubelet` itself
+  when it activates a slot, only the mounts below it.
+- bpffs: a private bpffs per slot at `/run/bpffs/<slot>`, bound at
+  `/sys/fs/bpf`, the same host path the nspawn machine of the slot uses.
+- Supervision: the container runs in the unit's delegated cgroup (runc in
+  `DelegateSubgroup=supervisor`, the container's `cgroupsPath` in `payload`),
+  so stopping the unit ends it. The two slots' units conflict, starting a slot
+  disables the other, stopping one disables it and waits until runc reports
+  the container gone (killing it otherwise), and the pre-start hook refuses
+  while the other slot's container lives. The start timeout is derived from the
+  post-start waits and the unit has a start limit.
+- Gate: experimental. The agent refuses the mode unless its configuration sets
+  `Experimental.ContainerIsolation`; machina provisions it only with
+  `experimentalContainerIsolation` (and then opts every agent config it writes
+  in), metalman (`serve-pxe`) and machine-ops-controller (`HostReplace`) do the
+  same with `--experimental-container-isolation`, sharing
+  `provision.CheckIsolationEnabled` with machina, and
+  `kubectl unbounded machine manual-bootstrap` needs
+  `--experimental-container-isolation`.
 - SELinux: when enforcing, set `process.selinuxLabel` to `spc_t`. A preflight
   check verifies label support. Provisional.
 - Requirements: writable `/etc`, `/opt`, `/var`, a loadable `runc`, cgroup
@@ -403,13 +466,16 @@ Provisional until the node facts in section 13 are collected.
 **Status (WP2, provisional).** Implemented end to end: the OCI bundle and
 supervising unit, bootstrap, start, soft reboot, blue/green upgrade with
 rollback, reset, `exec`, `logs`, preflight, GPU wiring through the
-`node-lifecycle` hooks, and uninstall. The runtime is `runc`, downloaded to
+`node-lifecycle` hooks, and the in-place change to and from `nspawn`. The
+runtime is `runc`, downloaded to
 `/opt/unbounded/runtime/runc` in this mode only.
 Decisions: paths under the bind-mounted same-path directories are written on the
 host side, since a bind mount hides anything written below it in the rootfs;
 both slots share those directories, so a repave resets the shared kubelet state
 and a rollback restarts the old slot against the new shared files (saved and
-restored byte for byte, see section 10.4); the applied config moves to the new
+restored byte for byte, see section 10.4, including `/opt/cni/bin`, which
+preparing a slot writes), and only once the new slot's container is confirmed
+gone; the applied config moves to the new
 slot only after it is healthy; the node-lifecycle post-start hook asks the
 runtime, not `systemctl is-active`, because the unit is still activating while
 `ExecStartPost` runs (an inference from systemd semantics, not observed).
@@ -417,8 +483,13 @@ runtime, not `systemctl is-active`, because the unit is still activating while
 Unverified assumptions, all still open until the node facts in section 13 are
 collected:
 - `spc_t` is accepted by the node policy.
-- `rshared` on `/var/lib/kubelet` propagates through the host root mount, and
-  pod mounts propagate to the host.
+- The shared bind of `/var/lib/kubelet` and the `rshared` root propagation
+  make pod mounts visible on the host.
+- `DelegateSubgroup=` (systemd 254) is available, and runc places the
+  container in the `payload` subgroup of the delegated unit cgroup.
+- The container's private `/dev` is enough: devices that appear on the host
+  later, or that were not granted, are not in it, which limits CSI drivers and
+  device plugins (documented as a limitation).
 - `SIGRTMIN+3` through `runc` stops systemd as PID 1.
 - The capability, device and mount set in `config.json` is enough for kubelet,
   containerd and the CNI.
@@ -470,6 +541,14 @@ before deleting it, as for any repave.
 An empty `spec.isolation` declares nothing, so a repave never changes the mode
 of a node whose Machine does not declare one.
 
+A reprovision wipes the node stack, so it also needs an opt-in that is separate
+from the declaration: the Machine annotation
+`unbounded-cloud.io/allow-reprovision: "true"`. Without it the agent records the
+change `Failed` with reason `ReprovisionNotAllowed` and repaves in the current
+mode, so version rollouts continue (`planIsolationChange` in
+`controller_node.go`). When nothing else restarts the node stack, the agent
+restarts it so the deleted Node registers again.
+
 ### 10.2 Supported strategies
 
 The strategy follows from the pair; the operator does not choose it.
@@ -512,42 +591,82 @@ change) starts a new attempt.
 Pod data and the image store are re-pulled. Host-global state (invariant 2)
 is untouched.
 
-**Status.** Implemented for both strategies, driven from the repave.
+**Status.** Implemented for both strategies, driven from the repave. Only
+`nspawn` and `none` exist so far, so every change is a reprovision; the in-place
+engine is built and tested between the two nspawn slots and gets its first real
+pair with `container`.
 
 - *In place (nspawn <-> container).* `migrate.RunInPlace` with real hooks:
   the target mode's host preflight, the repave's download resolution and archive
   staging, prepare in the alternate slot, the repave's network cleanup, persist
   the target's applied config, and the repave's local kubelet check within five
-  minutes. Rollback removes the target's record and restores the source's.
-  Success removes the source and updates `status.isolation`. Kubelet
-  credentials are fresh because the target boots a new kubelet from the
-  configuration's bootstrap token, as a repave does; nothing is copied.
+  minutes. Rollback removes the target's record and restores the source's, and
+  starts the source again only once the target is stopped, destroyed and no
+  longer reported running; otherwise the change ends `Failed` and the node needs
+  attention. Success removes the source. Kubelet credentials are fresh because
+  the target boots a new kubelet from the configuration's bootstrap token, as a
+  repave does; nothing is copied.
 - *Crash safety.* `migrate.Journal` is a write-ahead step file at
-  `/etc/unbounded/agent/isolation-migration.json`. The daemon resolves a leftover
-  journal at start (before the source stopped: drop the target; once it may have
-  stopped: roll back; `awaiting-ready`: wait again; `ready`: finish cleanup) and
-  records the outcome in `status.isolationChange`. While both slots have an
-  applied config, the journal decides which one is active.
+  `/etc/unbounded/agent/isolation-migration.json`, written durably (file and
+  directory synced). The daemon resolves a leftover journal at start, on the
+  host alone, before it reads which slot is active and before it needs
+  credentials or the API server (before the source stopped: drop the target;
+  once it may have stopped: roll back; `awaiting-ready`: wait again; `ready`:
+  finish cleanup). It reports the outcome in `status.isolationChange` once it
+  has a client. A journal is removed only when it is terminal and its outcome
+  was reported; one that is not over, or cannot be read, is kept and blocks new
+  changes. While both slots have an applied config, the journal decides which
+  one is active; with no journal, the only recorded node stack that runs is
+  active, and otherwise the daemon refuses to pick one.
+- *Settling at repave.* A repave first settles any journal. When that resolved
+  a change, the repave is requeued rather than consumed, and the requeued
+  repave does not try a change that just failed again; the next Node deletion
+  does.
 - *Reprovision (any pair, required for `none`).* The reset removes the daemon,
   so the daemon stages `/var/lib/unbounded-agent-reprovision` (binary copy,
-  target config, journal) and starts `unbounded-agent-reprovision.service`,
-  whose hidden `isolation-reprovision` command runs the existing reset, then the
-  target mode's bootstrap, retried by systemd up to
-  `daemon.ReprovisionMaxAttempts` runs. The daemon that bootstrap installs
-  records the outcome once the applied config is in the target mode.
+  target config with the Machine's download sources, journal) and starts
+  `unbounded-agent-reprovision.service`, whose hidden `isolation-reprovision`
+  command runs the existing reset, then the target mode's bootstrap. Before the
+  journal is written, the staged binary's `--check` validates the configuration
+  and resolves the target plan's inputs. systemd reruns a failed run; the
+  command waits longer each time (doubling up to ten minutes) and gives up
+  `daemon.ReprovisionGiveUpAfter` (90 minutes) after the handoff started, below
+  machina's two hour `ChangeStale` threshold. Giving up records `Failed` in the
+  journal, reports it with the staged bootstrap token when there is one, and
+  removes the unit and staged files. The daemon that bootstrap installs records
+  the outcome once the applied config is in the target mode. A journal at
+  `reprovisioning` whose unit was never installed and enabled reset nothing; it
+  is concluded `Failed` and the staged files are removed. While a handoff runs,
+  the old daemon starts no repave and no MachineOperation.
 - *Shared configuration.* `confsnap` saves, byte for byte, the host files both
   stacks write at the same paths before an in-place change, a `none` upgrade
   and a container upgrade, and restores them before the source starts again on
-  any failure, also after a restart mid-change.
-- *Preflight and tokens.* The `none` target's static preflight runs before the
-  reset and the ownership half after. An attested host records its attestation
-  URL at bootstrap and attests again on reprovision; any other host is checked
-  for a still-valid bootstrap token before the reset. An invalid token cannot
-  be renewed from the agent: the operator must renew it or bootstrap with
-  attestation. A change to nspawn is refused up front when the host lacks the
-  nspawn runtime, because a change installs nothing.
-- *Gaps.* After a reprovision that never bootstraps, `status.isolationChange` is
-  recorded `Failed` only once an agent next runs on the host.
+  any failure. It never overwrites a complete snapshot and syncs what it saved
+  before writing its manifest. After a restart mid-change the snapshot is
+  restored for an in-place change (through `migrate.Journal`) and for a `none`
+  upgrade (through the none upgrade journal); a container upgrade restores it
+  only within the same process.
+- *Preflight and tokens.* The `none` target's static preflight
+  (`PreflightStatic`) runs before the reset. Its ownership half
+  (`PreflightOwnership`) cannot run then, since the node being changed runs a
+  kubelet and containerd the none backend does not own; it runs after the
+  reset as the first step of the bootstrap in mode `none`
+  (`nonePlan.EnsureHostClean`), before anything is installed. An attested host
+  records its attestation URL at bootstrap and attests again on reprovision;
+  any other host has its bootstrap token checked against the API server before
+  the reset, so an expired token is caught when the API server can be reached.
+  When it cannot be reached the change goes ahead and the handoff's bounded
+  retry reports a real failure. An invalid token cannot be renewed from the
+  agent: the operator must renew it or bootstrap with attestation. An in-place
+  change to nspawn is refused up front when the host lacks the nspawn runtime,
+  because it installs nothing; a reprovision to nspawn bootstraps, which
+  installs it, so a missing tool is only a warning there.
+- *Gaps.* The handoff does not fetch the target's artifacts before the reset:
+  `--check` resolves the goal state (which verifies an offline bundle), but an
+  unreachable download source is found only by the bootstrap after the reset,
+  and is retried until the deadline. An attested host that gives up cannot
+  report from the handoff; it is reported by the next agent on the host, or
+  shows `ChangeStale`.
 
 ### 10.5 Future: in-place upgrades without deleting the Node
 
@@ -719,20 +838,19 @@ Acceptance:
 - Config tests: `spec.isolation` reaches the generated agent config, and an
   unset field leaves the output unchanged.
 
-### WP4: `exec`, `logs`, lifecycle and uninstall
+### WP4: `exec`, `logs` and lifecycle
 
 Depends on: WP0, plus WP1 and WP2 for their `Exec`/`Logs` implementations.
 
 Owns: new agent subcommands in `cmd/agent/internal/cmd/` (`exec`, `logs`),
-`internal/provision/assets/unbounded-agent-uninstall.sh`,
 `kubectl unbounded` help text referencing machine access.
 
-Steps: add backend-agnostic `exec` and `logs` subcommands. Make the uninstall
-script read the mode from applied-config and call mode-specific cleanup, with
-a fallback to nspawn cleanup when no applied-config exists.
+Steps: add backend-agnostic `exec` and `logs` subcommands. The uninstall
+script, which nothing ran, is removed; `unbounded-agent reset` removes a node
+in every mode: it always runs the idempotent nspawn teardown and adds a mode's
+teardown only where the host has that mode's own units or directory.
 
-Acceptance: command tests per backend with fakes; the uninstall script has a
-shell test for each mode and for a legacy host with no recorded mode.
+Acceptance: command tests per backend with fakes.
 
 ### WP5: Docs and e2e
 

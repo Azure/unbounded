@@ -41,6 +41,29 @@ const (
 	// MachineAllocationConditionReleased reports whether every remote effect and
 	// the per-allocation bootstrap credential were confirmed released.
 	MachineAllocationConditionReleased = "Released"
+
+	// MachineAllocationFinalizer is held by the allocation controller on a
+	// MachineAllocation, its Machine and its allocation MachineOperations
+	// until release finishes.
+	MachineAllocationFinalizer = "unbounded-cloud.io/machineallocation"
+
+	// LabelAllocationUID carries the MachineAllocation UID on the allocation,
+	// its Machine, its MachineOperations and its bootstrap token Secret.
+	LabelAllocationUID = "unbounded-cloud.io/allocation-uid"
+
+	// LabelConsumerUID carries spec.consumerRef.uid, as written, on a
+	// MachineAllocation. An allocation whose consumer UID is not a valid label
+	// value fails with InvalidRequest.
+	LabelConsumerUID = "unbounded-cloud.io/consumer-uid"
+
+	// LabelMachineClass carries spec.classRef.name, as written, on a
+	// MachineAllocation and its Machine. An allocation whose class name is not
+	// a valid label value fails with InvalidRequest.
+	LabelMachineClass = "unbounded-cloud.io/machine-class"
+
+	// LabelCapacityType is the offering label derived from an offering's
+	// capacityType.
+	LabelCapacityType = "unbounded-cloud.io/capacity-type"
 )
 
 // +kubebuilder:object:root=true
@@ -55,6 +78,8 @@ const (
 // the status node is skipped when an update drops the whole status.
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.status) || !has(oldSelf.status.snapshot) || (has(self.status) && has(self.status.snapshot))",message="snapshot cannot be removed",fieldPath=".status.snapshot"
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.status) || !has(oldSelf.status.providerID) || (has(self.status) && has(self.status.providerID) && self.status.providerID == oldSelf.status.providerID)",message="providerID is immutable once set",fieldPath=".status.providerID"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.status) || !has(oldSelf.status.operations) || !has(oldSelf.status.operations.allocate) || (has(self.status) && has(self.status.operations) && has(self.status.operations.allocate) && self.status.operations.allocate == oldSelf.status.operations.allocate)",message="operations.allocate is immutable once set",fieldPath=".status.operations.allocate"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.status) || !has(oldSelf.status.operations) || !has(oldSelf.status.operations.release) || (has(self.status) && has(self.status.operations) && has(self.status.operations.release) && self.status.operations.release == oldSelf.status.operations.release)",message="operations.release is immutable once set",fieldPath=".status.operations.release"
 
 // MachineAllocation is one consumer-owned request for one machine from a
 // MachineClass. Its UID owns every remote effect made on its behalf.

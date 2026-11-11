@@ -158,7 +158,7 @@ to 1.
 ### 5. `Racer-Ordered` is removed
 
 - Rust: `ReadKind::Subscription.ordered` and the `racer-ordered` header are
-  removed from `object-wire`. The server ignores unknown headers, so an older
+  removed from `racer_wire::object`. The server ignores unknown headers, so an older
   SDK that still sends `Racer-Ordered` keeps working.
 - Go: `SubscriptionOptions.Ordered`, the header, its allowlist entries and the
   `ordered` flag on `Sequence` are removed. `Sequence` always enforces order.

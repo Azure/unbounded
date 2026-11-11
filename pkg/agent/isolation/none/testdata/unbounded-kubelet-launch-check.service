@@ -1,0 +1,14 @@
+# Managed by unbounded-agent. Do not edit directly.
+[Unit]
+Description=Allocation launch check for the kubelet (unbounded agent)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/unbounded/bin/unbounded-agent allocation-launch-check
+Restart=on-failure
+RestartMode=direct
+RestartSec=10s
+# A final allocation launch refusal must fail the start rather than loop.
+RestartPreventExitStatus=77

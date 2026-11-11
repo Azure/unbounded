@@ -1,19 +1,20 @@
 use super::*;
 use crate::config::Limits;
 use crate::control::Snapshot;
+use crate::control::cell::PublicationCell;
 use crate::control::publication::PublicationTarget;
 use crate::http::Codec;
 use crate::model::CacheKey;
 use crate::model::ObjectId;
+use crate::model::PAGE_BYTES;
 use crate::model::RequestId;
 use crate::model::StrongEtag;
 use crate::runtime::Reactor;
 use crate::security::Authorization;
 use crate::security::OpaqueMetadata;
-use controlplane::Published;
 use futures::executor::block_on;
-use racer_control_wire::CacheId;
-use racer_control_wire::ClusterId;
+use racer_wire::control::CacheId;
+use racer_wire::control::ClusterId;
 use std::future::Future;
 use std::io::Read;
 use std::io::Write;
@@ -41,7 +42,7 @@ fn context() -> OriginContext {
     }
 }
 fn scope() -> RequestScope {
-    RequestScope::new(RequestId([1; 16]), Instant::now() + Duration::from_secs(5)).unwrap()
+    RequestScope::host(RequestId([1; 16]), Instant::now() + Duration::from_secs(5)).unwrap()
 }
 pub(super) fn response_head(status: u16, fields: &[(&str, &[u8])]) -> MessageHead {
     MessageHead {
@@ -100,13 +101,18 @@ fn credentials(
     Rc::new(CredentialCrypto::new(
         Rc::new(Keyring::new(
             ClusterId("cluster".into()),
-            racer_control_wire::NodeId("local".into()),
-            Arc::new(KeyEpochs::default()),
+            racer_wire::control::NodeId("local".into()),
+            Arc::new(KeyEpochs::with_clock(crate::enrollment::wall_clock(
+                &racer_io::Clock::host(),
+            ))),
         )),
         admission,
+        racer_io::WorkerCtx::host().rng,
     ))
 }
-fn client() -> (
+fn client(
+    env: &racer_io::Env,
+) -> (
     OriginClient,
     Rc<flow_control::Quotas<AdmissionPolicy>>,
     Rc<Reactor>,
@@ -124,6 +130,8 @@ fn client() -> (
         queue_entries: n,
         connections_per_neighbor: n,
         client_connections: n,
+        peer_connections: n,
+        outbound_connections: n,
         pipes: n,
         range_window_pages: n,
         header_bytes: NonZeroUsize::new(32768).unwrap(),
@@ -136,7 +144,7 @@ fn client() -> (
         relay_transfers: n,
     };
     let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
-    let reactor = Rc::new(Reactor::new(admission.clone()));
+    let reactor = Rc::new(Reactor::new(admission.clone(), env));
     let pool = Rc::new(crate::http::new_pool(reactor.clone(), admission.clone(), 2));
     let io = Rc::new(crate::http::new_io(
         reactor.clone(),
@@ -144,7 +152,7 @@ fn client() -> (
         admission.clone(),
         PAGE_BYTES,
     ));
-    let snapshots = Arc::new(Published::new(Snapshot::retention(2)));
+    let snapshots = Arc::new(PublicationCell::new(Snapshot::retention(2)));
     let buffers = BufferPool::new(admission.clone());
     (
         OriginClient::new(
@@ -161,20 +169,26 @@ fn client() -> (
     )
 }
 
-fn published_client() -> (
+fn published_client(
+    env: &racer_io::Env,
+) -> (
     OriginClient,
     Rc<flow_control::Quotas<AdmissionPolicy>>,
     Rc<Reactor>,
     std::sync::Arc<crate::control::Snapshot>,
 ) {
-    let (mut client, admission, reactor) = client();
-    let publication = racer_control_wire::decode_publication(include_bytes!(concat!(
+    let (mut client, admission, reactor) = client(env);
+    let publication = racer_wire::control::decode_publication(include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/control-wire/testdata/publication.json"
+        "/wire/testdata/publication.json"
     )))
     .unwrap();
-    client.snapshots = Arc::new(Published::new(Snapshot::retention(2)));
-    let target = PublicationTarget::new(publication.cluster.clone(), client.snapshots.clone());
+    client.snapshots = Arc::new(PublicationCell::new(Snapshot::retention(2)));
+    let target = PublicationTarget::new(
+        publication.cluster.clone(),
+        client.snapshots.clone(),
+        racer_io::Clock::host(),
+    );
     let snapshot = target.apply(publication).unwrap();
     (client, admission, reactor, snapshot)
 }
@@ -192,7 +206,8 @@ fn remap(client: OriginClient, root: impl Into<PathBuf>) -> Result<OriginClient>
 
 #[test]
 fn socket_root_is_lexical_and_preserves_canonical_publications() {
-    let (client, _, _, snapshot) = published_client();
+    let env = racer_io::Env::host();
+    let (client, _, _, snapshot) = published_client(&env);
     let mut context = context();
     context.object.cache = snapshot.caches[0].id.clone();
     assert_eq!(
@@ -221,13 +236,13 @@ fn socket_root_is_lexical_and_preserves_canonical_publications() {
     for root in [
         "", "relative", ".", "/a/../b", "/a/./b", "/a//b", "/a/", "//a", "/a\0b",
     ] {
-        let (client, _, _) = self::client();
+        let (client, _, _) = self::client(&env);
         assert!(
             matches!(remap(client, root), Err(Error::InvalidConfiguration)),
             "{root:?}"
         );
     }
-    let (client, _, _) = self::client();
+    let (client, _, _) = self::client(&env);
     assert!(remap(client, "/").is_ok());
     let mut cache = snapshot.caches[0].clone();
     for path in ["/elsewhere/socket", "/run/racer/cache-a/origin//socket"] {
@@ -246,7 +261,7 @@ fn socket_root_is_lexical_and_preserves_canonical_publications() {
 
     let suffix = "/cache-a/origin/socket";
     let root = PathBuf::from(format!("/{}", "x".repeat(107 - suffix.len() - 1)));
-    let (client, _, _, snapshot) = published_client();
+    let (client, _, _, snapshot) = published_client(&env);
     let client = remap(client, root.clone()).unwrap();
     assert_eq!(
         resolve_socket(&client.socket_root, &snapshot.caches[0])
@@ -260,7 +275,7 @@ fn socket_root_is_lexical_and_preserves_canonical_publications() {
         resolve_socket(&too_long, &snapshot.caches[0]),
         Err(Error::InvalidConfiguration)
     );
-    let (client, _, _) = self::client();
+    let (client, _, _) = self::client(&env);
     assert!(matches!(
         remap(client, format!("/{}", "x".repeat(107))),
         Err(Error::InvalidConfiguration)
@@ -276,6 +291,7 @@ fn real_uds_root_remapping_keeps_public_authority_and_http_validation() {
     use crate::test_support::NoPeers;
     use crate::topology::Placement;
     use std::os::fd::AsRawFd;
+    let env = racer_io::Env::host();
     struct Directory(PathBuf);
     impl Drop for Directory {
         fn drop(&mut self) {
@@ -297,7 +313,7 @@ fn real_uds_root_remapping_keeps_public_authority_and_http_validation() {
     ));
     let listener = UnixListener::bind(root.join("cache-a/origin/socket")).unwrap();
     listener.set_nonblocking(true).unwrap();
-    let (client, admission, reactor, snapshot) = published_client();
+    let (client, admission, reactor, snapshot) = published_client(&env);
     let client = remap(client, root).unwrap();
     let mut context = context();
     context.object.cache = snapshot.caches[0].id.clone();
@@ -306,9 +322,11 @@ fn real_uds_root_remapping_keeps_public_authority_and_http_validation() {
     let policy = CandidatePolicy::new(
         candidates.ordered[0].clone(),
         Rc::new(Placement::new(2)),
-        NoPeers::requester(),
+        NoPeers::requester(&env),
         credentials(admission.clone()),
-        Arc::new(Published::new(Snapshot::retention(2))),
+        Arc::new(PublicationCell::new(Snapshot::retention(2))),
+        racer_io::WorkerCtx::host(),
+        Rc::new(crate::drivers::DriverQueue::new(1024)),
     );
     let scope = scope();
     let CandidateResolution::Origin(authority) = block_on(policy.resolve(
@@ -390,7 +408,8 @@ fn shared_adapter_controls_real_head_bootstrap_pin_and_rejection() {
     use crate::model::ObjectVersion;
     use crate::test_support::origin::AdapterOrigin;
     use crate::test_support::origin::RequestKind;
-    let (client, admission, reactor, snapshot) = published_client();
+    let env = racer_io::Env::host();
+    let (client, admission, reactor, snapshot) = published_client(&env);
     let mut context = context();
     context.object.cache = snapshot.caches[0].id.clone();
     let mut metadata = ObjectMetadata {
@@ -463,6 +482,7 @@ fn shared_adapter_controls_real_head_bootstrap_pin_and_rejection() {
 #[test]
 fn same_name_new_uid_dials_replacement_without_reusing_old_keepalive() {
     use std::os::fd::AsRawFd;
+    let env = racer_io::Env::host();
     let directory_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("target")
         .join(format!("origin-replacement-{}", std::process::id()));
@@ -476,15 +496,19 @@ fn same_name_new_uid_dials_replacement_without_reusing_old_keepalive() {
     let socket = root.join("cache-a/origin/socket");
     let old_listener = UnixListener::bind(&socket).unwrap();
     old_listener.set_nonblocking(true).unwrap();
-    let (mut client, admission, reactor) = self::client();
-    let mut publication = racer_control_wire::decode_publication(include_bytes!(concat!(
+    let (mut client, admission, reactor) = self::client(&env);
+    let mut publication = racer_wire::control::decode_publication(include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/control-wire/testdata/publication.json"
+        "/wire/testdata/publication.json"
     )))
     .unwrap();
     publication.sequence.0 = 1;
-    client.snapshots = Arc::new(Published::new(Snapshot::retention(2)));
-    let target = PublicationTarget::new(publication.cluster.clone(), client.snapshots.clone());
+    client.snapshots = Arc::new(PublicationCell::new(Snapshot::retention(2)));
+    let target = PublicationTarget::new(
+        publication.cluster.clone(),
+        client.snapshots.clone(),
+        racer_io::Clock::host(),
+    );
     let snapshot = target.apply(publication.clone()).unwrap();
     let client = remap(client, root).unwrap();
     let mut old_context = context();
@@ -532,7 +556,7 @@ fn same_name_new_uid_dials_replacement_without_reusing_old_keepalive() {
     replacement_listener.set_nonblocking(true).unwrap();
     publication.sequence.0 += 2; // The worker can skip the intervening removal.
     publication.caches[0].id = CacheId("55555555-5555-4555-8555-555555555555".into());
-    publication.pools = racer_control_wire::default_pools(&publication.caches);
+    publication.pools = racer_wire::control::default_pools(&publication.caches);
     publication.membership_version.0 += 1;
     let mut new_context = context();
     new_context.object.cache = publication.caches[0].id.clone();
@@ -663,8 +687,9 @@ fn check_request(
 
 #[test]
 fn distinct_cold_requests_wait_for_origin_slots_and_finish_complete_bodies() {
+    let env = racer_io::Env::host();
     let (_path, listener, endpoint) = listen();
-    let (client, admission, reactor) = client();
+    let (client, admission, reactor) = client(&env);
     let contexts: Vec<_> = (0..3)
         .map(|index| {
             let mut context = context();
@@ -735,6 +760,7 @@ fn distinct_cold_requests_wait_for_origin_slots_and_finish_complete_bodies() {
 
 #[test]
 fn real_uds_bootstrap_head_and_pinned_page_reuse_without_context_retention() {
+    let env = racer_io::Env::host();
     let (_path, listener, endpoint) = listen();
     let server = thread::spawn(move || {
         // All three exchanges must use this one accepted connection.
@@ -762,7 +788,7 @@ fn real_uds_bootstrap_head_and_pinned_page_reuse_without_context_retention() {
         thread::sleep(Duration::from_millis(10));
         stream.write_all(b"c").unwrap();
     });
-    let (client, admission, reactor) = client();
+    let (client, admission, reactor) = client(&env);
     let mut context = context();
     let scope = scope();
     let reply = drive(&reactor, client.bootstrap_at(&endpoint, &context, &scope)).unwrap();
@@ -817,8 +843,9 @@ fn real_uds_bootstrap_head_and_pinned_page_reuse_without_context_retention() {
 
 #[test]
 fn real_uds_head_progresses_when_page_plaintext_budget_is_exhausted() {
+    let env = racer_io::Env::host();
     let (_path, listener, endpoint) = listen();
-    let (client, admission, reactor) = client();
+    let (client, admission, reactor) = client(&env);
     let context = context();
     let scope = scope();
     let held = admission
@@ -878,6 +905,7 @@ fn real_uds_head_progresses_when_page_plaintext_budget_is_exhausted() {
 
 #[test]
 fn real_uds_empty_bootstrap_and_truncated_page() {
+    let env = racer_io::Env::host();
     let (_path, listener, endpoint) = listen();
     let server = thread::spawn(move || {
         let mut stream = accept(&listener);
@@ -886,7 +914,7 @@ fn real_uds_empty_bootstrap_and_truncated_page() {
         receive(&mut stream);
         stream.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 3\r\nContent-Type: application/octet-stream\r\nContent-Range: bytes 0-2/3\r\nETag: \"v\"\r\nRacer-Expires-At: 0\r\n\r\nab").unwrap();
     });
-    let (client, admission, reactor) = client();
+    let (client, admission, reactor) = client(&env);
     let context = context();
     let scope = scope();
     let reply = drive(&reactor, client.bootstrap_at(&endpoint, &context, &scope)).unwrap();
@@ -907,6 +935,7 @@ fn real_uds_empty_bootstrap_and_truncated_page() {
 
 #[test]
 fn real_uds_errors_preserve_credential_and_version_contracts() {
+    let env = racer_io::Env::host();
     for (status, fields, expected) in [
         (401, "", Error::OriginRejected),
         (403, "", Error::OriginForbidden),
@@ -935,7 +964,7 @@ fn real_uds_errors_preserve_credential_and_version_contracts() {
             )
             .unwrap();
         });
-        let (client, admission, reactor) = client();
+        let (client, admission, reactor) = client(&env);
         let result = drive(
             &reactor,
             client.metadata_at(
@@ -961,8 +990,9 @@ fn public_operations_reject_wrong_authority_before_io() {
     use crate::topology::Member;
     use crate::topology::Membership;
     use crate::topology::Placement;
-    use racer_control_wire::MembershipVersion;
-    use racer_control_wire::NodeId;
+    use racer_wire::control::MembershipVersion;
+    use racer_wire::control::NodeId;
+    let env = racer_io::Env::host();
     let node = NodeId("node".into());
     let membership = Arc::new(
         Membership::validate(
@@ -980,9 +1010,11 @@ fn public_operations_reject_wrong_authority_before_io() {
     let policy = CandidatePolicy::new(
         node,
         Rc::new(Placement::new(2)),
-        NoPeers::requester(),
-        credentials(client().1),
-        Arc::new(Published::new(Snapshot::retention(2))),
+        NoPeers::requester(&env),
+        credentials(client(&env).1),
+        Arc::new(PublicationCell::new(Snapshot::retention(2))),
+        racer_io::WorkerCtx::host(),
+        Rc::new(crate::drivers::DriverQueue::new(1024)),
     );
     let context = context();
     let scope = scope();
@@ -1001,7 +1033,7 @@ fn public_operations_reject_wrong_authority_before_io() {
     let CandidateResolution::Origin(authority) = resolution else {
         panic!("expected local authority")
     };
-    let (client, admission, _) = client();
+    let (client, admission, _) = client(&env);
     let mut wrong = OriginContext {
         object: context.object.clone(),
         metadata: None,
@@ -1043,6 +1075,7 @@ fn public_operations_reject_wrong_authority_before_io() {
 
 #[test]
 fn real_uds_final_page_consumes_supplied_budget_without_second_charge() {
+    let env = racer_io::Env::host();
     let (_path, listener, endpoint) = listen();
     let server = thread::spawn(move || {
         let mut stream = accept(&listener);
@@ -1055,7 +1088,7 @@ fn real_uds_final_page_consumes_supplied_budget_without_second_charge() {
         );
         stream.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 3\r\nContent-Type: application/octet-stream\r\nContent-Range: bytes 16777216-16777218/16777219\r\nETag: \"v\"\r\nRacer-Expires-At: 1234\r\n\r\nend").unwrap();
     });
-    let (client, admission, reactor) = client();
+    let (client, admission, reactor) = client(&env);
     let context = context();
     let held = admission
         .reserve(
@@ -1099,6 +1132,7 @@ fn real_uds_final_page_consumes_supplied_budget_without_second_charge() {
 
 #[test]
 fn real_uds_bounds_raw_heads_even_with_a_larger_shared_codec() {
+    let env = racer_io::Env::host();
     let (_path, listener, endpoint) = listen();
     let server = thread::spawn(move || {
         let mut stream = accept(&listener);
@@ -1110,7 +1144,7 @@ fn real_uds_bounds_raw_heads_even_with_a_larger_shared_codec() {
         // The receiver may close immediately upon reaching its raw-head limit.
         let _ = stream.write_all(response.as_bytes());
     });
-    let (mut client, admission, reactor) = client();
+    let (mut client, admission, reactor) = client(&env);
     client.io = Rc::new(crate::http::new_io(
         reactor.clone(),
         Codec::new(65536),
@@ -1136,9 +1170,10 @@ fn real_uds_bounds_raw_heads_even_with_a_larger_shared_codec() {
 
 #[test]
 fn real_uds_canceled_and_expired_reads_release_owned_resources() {
+    let env = racer_io::Env::host();
     for cancel in [false, true] {
         let (_path, listener, endpoint) = listen();
-        let scope = RequestScope::new(
+        let scope = RequestScope::host(
             RequestId([4; 16]),
             Instant::now() + Duration::from_millis(250),
         )
@@ -1153,12 +1188,12 @@ fn real_uds_canceled_and_expired_reads_release_owned_resources() {
             }
             wait.recv_timeout(Duration::from_secs(5)).unwrap();
         });
-        let (client, admission, reactor) = client();
+        let (client, admission, reactor) = client(&env);
         reactor.init().unwrap();
         let infrastructure_bytes = admission.used(ResourceClass::RequestContext);
         let result = drive(&reactor, client.bootstrap_at(&endpoint, &context(), &scope));
         assert!(
-            matches!(result, Err(error) if error == if cancel { Error::Cancelled } else { Error::DeadlineExceeded })
+            matches!(result, Err(error) if error == if cancel { Error::Canceled } else { Error::DeadlineExceeded })
         );
         release.send(()).unwrap();
         server.join().unwrap();
@@ -1187,7 +1222,7 @@ fn exchange_errors_preserve_resource_and_request_failures() {
     }
     for error in [
         Error::Overloaded,
-        Error::Cancelled,
+        Error::Canceled,
         Error::DeadlineExceeded,
         Error::OriginRejected,
         Error::OriginForbidden,
@@ -1213,8 +1248,9 @@ fn opaque_request_values_reject_present_empty_and_keep_obs_text() {
 
 #[test]
 fn reserved_operations_reject_invalid_charges_before_io_and_release_them() {
-    let (client, admission, _) = client();
-    let (_, foreign, _) = self::client();
+    let env = racer_io::Env::host();
+    let (client, admission, _) = client(&env);
+    let (_, foreign, _) = self::client(&env);
     let context = context();
     let wrong_cache = CacheId("other".into());
     let page = PageId {
@@ -1367,10 +1403,15 @@ mod metadata_tests {
             name: "Content-Type".into(),
             value: b"application/octet-stream".to_vec(),
         });
-        assert_eq!(validate_bootstrap(&response, &object()).unwrap().1, 0);
+        assert_eq!(
+            validate_bootstrap(&response, &object(), crate::model::PageSize::DEFAULT)
+                .unwrap()
+                .1,
+            0
+        );
         response.headers[0].value = b"3".to_vec();
         assert_eq!(
-            validate_bootstrap(&response, &object()),
+            validate_bootstrap(&response, &object(), crate::model::PageSize::DEFAULT),
             Err(Error::BadGateway)
         );
         response.start = StartLine::Response { status: 206 };
@@ -1379,12 +1420,15 @@ mod metadata_tests {
             value: b"bytes 0-2/3".to_vec(),
         });
         assert_eq!(
-            validate_bootstrap(&response, &object()).unwrap().0.length,
+            validate_bootstrap(&response, &object(), crate::model::PageSize::DEFAULT)
+                .unwrap()
+                .0
+                .length,
             3
         );
         response.headers.last_mut().unwrap().value = b"bytes 0-2/4".to_vec();
         assert_eq!(
-            validate_bootstrap(&response, &object()),
+            validate_bootstrap(&response, &object(), crate::model::PageSize::DEFAULT),
             Err(Error::BadGateway)
         );
     }
@@ -1437,11 +1481,16 @@ mod page_tests {
     fn pinned_final_page_accepts_only_exact_body_range_and_version() {
         let page = page();
         assert_eq!(
-            validate_page(&head(), &page, 3).unwrap().length,
+            validate_page(&head(), &page, crate::model::PageSize::DEFAULT, 3)
+                .unwrap()
+                .length,
             PAGE_BYTES + 3
         );
         for count in [0, 2, 4, PAGE_BYTES as usize] {
-            assert_eq!(validate_page(&head(), &page, count), Err(Error::BadGateway));
+            assert_eq!(
+                validate_page(&head(), &page, crate::model::PageSize::DEFAULT, count),
+                Err(Error::BadGateway)
+            );
         }
         for range in [
             "bytes 0-2/3",
@@ -1452,17 +1501,29 @@ mod page_tests {
         ] {
             let mut response = head();
             response.headers[2].value = range.as_bytes().to_vec();
-            assert_eq!(validate_page(&response, &page, 3), Err(Error::BadGateway));
+            assert_eq!(
+                validate_page(&response, &page, crate::model::PageSize::DEFAULT, 3),
+                Err(Error::BadGateway)
+            );
         }
         let mut response = head();
         response.headers[3].value = b"\"other\"".to_vec();
-        assert_eq!(validate_page(&response, &page, 3), Err(Error::BadGateway));
+        assert_eq!(
+            validate_page(&response, &page, crate::model::PageSize::DEFAULT, 3),
+            Err(Error::BadGateway)
+        );
         response = head();
         response.start = StartLine::Response { status: 200 };
-        assert_eq!(validate_page(&response, &page, 3), Err(Error::BadGateway));
+        assert_eq!(
+            validate_page(&response, &page, crate::model::PageSize::DEFAULT, 3),
+            Err(Error::BadGateway)
+        );
         response = head();
         response.headers[1].value = b"multipart/byteranges".to_vec();
-        assert_eq!(validate_page(&response, &page, 3), Err(Error::BadGateway));
+        assert_eq!(
+            validate_page(&response, &page, crate::model::PageSize::DEFAULT, 3),
+            Err(Error::BadGateway)
+        );
     }
 }
 mod protocol_tests {
@@ -1560,7 +1621,13 @@ mod protocol_tests {
                 let result = Codec::new(32768)
                     .decode_head(raw.as_bytes())
                     .map_err(|_| Error::BadGateway)
-                    .and_then(|head| validate_bootstrap(&head.unwrap().0, &object));
+                    .and_then(|head| {
+                        validate_bootstrap(
+                            &head.unwrap().0,
+                            &object,
+                            crate::model::PageSize::DEFAULT,
+                        )
+                    });
                 if prefix.is_empty() && suffix.is_empty() {
                     assert_eq!(result.unwrap().1, 1);
                 } else {
@@ -1643,5 +1710,99 @@ mod protocol_tests {
             });
             assert_eq!(validate_response(&head, false), Err(Error::BadGateway));
         }
+    }
+}
+
+const HEAD_OK: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nRacer-Content-Type: text/plain\r\nETag: \"v\"\r\nRacer-Expires-At: 1234\r\n\r\n";
+
+/// The adapter closes a pooled connection after reading the next request
+/// but before answering it, as when its idle timeout races the request. The
+/// request retries once on a fresh connection.
+#[test]
+fn real_uds_reused_connection_closed_before_response_retries_on_fresh_connection() {
+    let env = racer_io::Env::host();
+    let (_path, listener, endpoint) = listen();
+    let server = thread::spawn(move || {
+        let mut first = accept(&listener);
+        check_request(&receive(&mut first), "HEAD", None, None, false);
+        first.write_all(HEAD_OK).unwrap();
+        // The second request arrives on the idle connection, which closes
+        // without a response byte.
+        check_request(&receive(&mut first), "HEAD", None, None, false);
+        drop(first);
+        let mut second = accept(&listener);
+        check_request(&receive(&mut second), "HEAD", None, None, false);
+        second.write_all(HEAD_OK).unwrap();
+        // Hold the connection until the client is done with it.
+        let _ = second.read_to_end(&mut Vec::new());
+    });
+    let (client, _admission, reactor) = client(&env);
+    let mut context = context();
+    context.authorization = None;
+    context.metadata = None;
+    let scope = scope();
+    for _ in 0..2 {
+        let head = drive(
+            &reactor,
+            client.metadata_at(&endpoint, &context, MetadataSelector::Fresh, &scope),
+        )
+        .unwrap();
+        assert_eq!(head.metadata.length, 3);
+    }
+    client.pool.close();
+    server.join().unwrap();
+}
+
+/// A failure on a freshly connected socket is not retried: it cannot be a
+/// stale pooled connection.
+#[test]
+fn real_uds_fresh_connection_closed_before_response_is_not_retried() {
+    let env = racer_io::Env::host();
+    let (_path, listener, endpoint) = listen();
+    let server = thread::spawn(move || {
+        let mut first = accept(&listener);
+        check_request(&receive(&mut first), "HEAD", None, None, false);
+        drop(first);
+        listener.set_nonblocking(true).unwrap();
+        thread::sleep(Duration::from_millis(200));
+        assert!(listener.accept().is_err(), "no retry connection");
+    });
+    let (client, _admission, reactor) = client(&env);
+    let mut context = context();
+    context.authorization = None;
+    context.metadata = None;
+    let scope = scope();
+    assert_eq!(
+        drive(
+            &reactor,
+            client.metadata_at(&endpoint, &context, MetadataSelector::Fresh, &scope),
+        )
+        .map(|_| ()),
+        Err(Error::BadGateway)
+    );
+    server.join().unwrap();
+    client.pool.close();
+}
+
+#[test]
+fn health_key_is_debug_form_cached_per_endpoint_and_bounded() {
+    let env = racer_io::Env::host();
+    let (client, _, _) = client(&env);
+    let endpoint = |n: usize| Endpoint::Origin {
+        cache: racer_wire::control::CacheId(format!("{n:08x}-1111-4111-8111-111111111111")),
+        path: format!("/run/racer/{n}/origin/socket").into(),
+    };
+    let first = client.health_key(&endpoint(0));
+    assert_eq!(first.0, format!("{:?}", endpoint(0)));
+    assert!(Rc::ptr_eq(&first, &client.health_key(&endpoint(0))));
+    let other = client.health_key(&endpoint(1));
+    assert_eq!(other.0, format!("{:?}", endpoint(1)));
+    assert_ne!(first, other);
+    for n in 0..HEALTH_KEY_CACHE * 2 {
+        assert_eq!(
+            client.health_key(&endpoint(n)).0,
+            format!("{:?}", endpoint(n))
+        );
+        assert!(client.health_keys.borrow().len() <= HEALTH_KEY_CACHE);
     }
 }

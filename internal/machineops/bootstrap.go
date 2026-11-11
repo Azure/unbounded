@@ -104,6 +104,11 @@ func (r *MachineOperationReconciler) buildReplaceAgentConfig(ctx context.Context
 		return provision.UnboundedAgentConfig{}, fmt.Errorf("machine spec.kubernetes is required for HostReplace")
 	}
 
+	if err := provision.CheckIsolationEnabled(machine.Spec.Isolation, r.ExperimentalContainerIsolation, "machine-ops-controller",
+		"start machine-ops-controller with --experimental-container-isolation"); err != nil {
+		return provision.UnboundedAgentConfig{}, err
+	}
+
 	clusterInfo, err := r.clusterInfo(ctx)
 	if err != nil {
 		return provision.UnboundedAgentConfig{}, err
@@ -119,6 +124,16 @@ func (r *MachineOperationReconciler) buildReplaceAgentConfig(ctx context.Context
 		return provision.UnboundedAgentConfig{}, err
 	}
 
+	return buildAgentConfig(machine, clusterInfo, bootstrapToken, r.ExperimentalContainerIsolation), nil
+}
+
+// buildAgentConfig builds the agent config that a host launched or replaced
+// for machine starts with, joining with bootstrapToken. The config opts in to
+// the experimental container isolation mode when experimentalContainerIsolation
+// is set.
+func buildAgentConfig(machine *unboundedv1alpha3.Machine, clusterInfo *ClusterInfo, bootstrapToken string,
+	experimentalContainerIsolation bool,
+) provision.UnboundedAgentConfig {
 	return provision.BuildAgentConfig(provision.BuildAgentConfigParams{
 		Machine: machine,
 		Cluster: provision.ClusterEndpoint{
@@ -130,7 +145,9 @@ func (r *MachineOperationReconciler) buildReplaceAgentConfig(ctx context.Context
 		ProviderLabels: clusterInfo.ProviderLabels,
 		BootstrapToken: bootstrapToken,
 		NodeName:       machine.Name,
-	}), nil
+
+		ExperimentalContainerIsolation: experimentalContainerIsolation,
+	})
 }
 
 func (r *MachineOperationReconciler) clusterInfo(ctx context.Context) (*ClusterInfo, error) {

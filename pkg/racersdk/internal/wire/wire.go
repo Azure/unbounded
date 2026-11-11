@@ -1226,6 +1226,79 @@ type SubscriptionResponse struct {
 }
 
 func ParseSubscriptionResponse(head []byte, o SubscriptionOptions) (SubscriptionResponse, error) {
+	return parseBodyResponse(head, o, "")
+}
+
+// HostDelivery is the Racer-Delivery value of a host-read response.
+const HostDelivery = "host"
+
+// HostReadOptions selects the range and destination window of a host-read.
+// DestinationLength must be nonzero and at least the range length.
+type HostReadOptions struct {
+	Offset, Length                       uint64
+	Pin                                  string
+	DestinationOffset, DestinationLength uint64
+}
+
+func (o HostReadOptions) subscription() SubscriptionOptions {
+	return SubscriptionOptions{Offset: o.Offset, Length: o.Length, Pin: o.Pin}
+}
+
+// HostReadHead builds the POST /v1/objects/<key>/host-read request head.
+// The caller sends exactly one writable regular-file descriptor with it as
+// SCM_RIGHTS data. Direct reads send no credits.
+func HostReadHead(r Request, o HostReadOptions) ([]byte, error) {
+	if o.DestinationLength == 0 || o.DestinationLength > math.MaxInt64 || o.DestinationOffset > math.MaxInt64-o.DestinationLength ||
+		o.Length != 0 && o.Length > o.DestinationLength {
+		return nil, failure(ErrorInvalidArgument, "host-read destination", nil)
+	}
+
+	var b strings.Builder
+
+	fmt.Fprintf(&b, "POST %s%s/host-read HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\n"+
+		"Racer-Destination-Offset: %d\r\nRacer-Destination-Length: %d\r\n",
+		ObjectPrefix, hex.EncodeToString(r.Key[:]), o.DestinationOffset, o.DestinationLength)
+
+	if o.Offset != 0 || o.Length != 0 {
+		fmt.Fprintf(&b, "Range: bytes=%d-", o.Offset)
+
+		if o.Length != 0 {
+			fmt.Fprintf(&b, "%d", o.Offset+o.Length-1)
+		}
+
+		b.WriteString("\r\n")
+	}
+
+	// RequestHeaders carries the pin as If-Match; the caller sets r.Pin.
+	for name, values := range RequestHeaders(r) {
+		fmt.Fprintf(&b, "%s: %s\r\n", name, values[0])
+	}
+
+	b.WriteString("\r\n")
+	head := []byte(b.String())
+
+	return head, ValidateRawHead(head, false)
+}
+
+// ParseHostReadResponse validates a host-read head. Its page frames carry no
+// payload, so the body is FrameSize*(Pages+1) bytes.
+func ParseHostReadResponse(head []byte, o HostReadOptions) (SubscriptionResponse, error) {
+	result, err := parseBodyResponse(head, o.subscription(), HostDelivery)
+	if err != nil {
+		return result, err
+	}
+
+	if result.End-result.First > o.DestinationLength {
+		return SubscriptionResponse{}, failure(ErrorProtocol, "host-read response", nil)
+	}
+
+	return result, nil
+}
+
+// parseBodyResponse parses a Get-style head. An empty delivery expects page
+// payloads on the socket; otherwise Racer-Delivery must match and pages carry
+// no payload.
+func parseBodyResponse(head []byte, o SubscriptionOptions, delivery string) (SubscriptionResponse, error) {
 	var result SubscriptionResponse
 
 	bad := failure(ErrorProtocol, "subscription response", nil)
@@ -1284,8 +1357,17 @@ func ParseSubscriptionResponse(head []byte, o SubscriptionOptions) (Subscription
 		return result, err
 	}
 
+	if h.Get("Racer-Delivery") != delivery {
+		return result, bad
+	}
+
+	payload := end - first
+	if delivery != "" {
+		payload = 0
+	}
+
 	pages := PageCount(first, end)
-	if pages+1 > (math.MaxInt64-(end-first))/FrameSize || length != end-first+FrameSize*(pages+1) {
+	if pages+1 > (math.MaxInt64-payload)/FrameSize || length != payload+FrameSize*(pages+1) {
 		return result, bad
 	}
 

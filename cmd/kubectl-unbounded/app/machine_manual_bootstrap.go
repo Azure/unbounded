@@ -99,8 +99,13 @@ type manualBootstrapHandler struct {
 	// isolation selects where the node stack runs. Empty means nspawn. It
 	// accepts exactly the modes the agent of this release can operate
 	// (isolation.ParseMode), so a user cannot select a mode the agent would
-	// refuse on the host.
+	// refuse on the host. container also needs experimentalContainerIsolation.
 	isolation string
+
+	// experimentalContainerIsolation opts the generated agent configuration in
+	// to the experimental container isolation mode. --isolation container is
+	// refused without it.
+	experimentalContainerIsolation bool
 
 	// sandboxImage overrides the containerd CRI sandbox image.
 	sandboxImage string
@@ -393,8 +398,13 @@ func (h *manualBootstrapHandler) validate() error {
 		return err
 	}
 
-	if _, err := isolation.ParseMode(h.isolation); err != nil {
+	mode, err := isolation.ParseMode(h.isolation)
+	if err != nil {
 		return fmt.Errorf("invalid --isolation: %w", err)
+	}
+
+	if mode == isolation.ModeContainer && !h.experimentalContainerIsolation {
+		return fmt.Errorf("invalid --isolation: %q is experimental; pass --experimental-container-isolation to use it", mode)
 	}
 
 	if h.variant == "" {
@@ -565,6 +575,8 @@ func (h *manualBootstrapHandler) buildAgentConfig(ctx context.Context) (*provisi
 		},
 		ProviderLabels: providerLabels,
 		BootstrapToken: bootstrapToken,
+
+		ExperimentalContainerIsolation: h.experimentalContainerIsolation,
 	})
 
 	cfg.Kubelet.NodeIP = strings.TrimSpace(h.nodeIP)
@@ -800,7 +812,9 @@ Examples:
 	cmd.Flags().StringVar(&handler.nodeIP, "node-ip", "", "IP address to pass to kubelet")
 	cmd.Flags().BoolVar(&handler.localDNS, "local-dns", false, "Enable the nspawn-local CoreDNS cache")
 	cmd.Flags().StringVar(&handler.ociImage, "oci-image", "", "OCI image source for the agent rootfs (registry reference, HTTPS OCI layout archive, or oci-layout:// URL)")
-	cmd.Flags().StringVar(&handler.isolation, "isolation", "", "Where the node stack runs. Only nspawn (the default) is supported")
+	cmd.Flags().StringVar(&handler.isolation, "isolation", "", "Where the node stack runs: nspawn (the default), none, or container (experimental, needs --experimental-container-isolation)")
+	cmd.Flags().BoolVar(&handler.experimentalContainerIsolation, "experimental-container-isolation", false,
+		"Allow the experimental container isolation mode: --isolation container, or a later change of the node to it")
 	cmd.Flags().StringVar(&handler.sandboxImage, "sandbox-image", "", "Containerd CRI sandbox image reference")
 	cmd.Flags().StringVar(&handler.offlineArtifactsSource, "offline-artifacts-source", "", "Offline rootfs binary artifact source to embed in agent config (absolute path, file:// URL, HTTPS archive, or oci:// artifact reference)")
 	cmd.Flags().StringArrayVar(&handler.additionalHostMounts, "additional-host-mount", nil, `Extra host bind-mount for the nspawn machine in "source[:target][:ro]" format (can be repeated). target defaults to source; append :ro for a read-only mount`)

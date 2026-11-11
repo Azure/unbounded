@@ -77,6 +77,8 @@ func RunManager(ctx context.Context, cfg Config) error {
 		ClusterInfo:                 clusterInfo,
 		MaxConcurrentReconciles:     cfg.MaxConcurrentReconciles,
 		ProvisioningTimeoutDuration: cfg.ProvisioningTimeout,
+
+		ExperimentalContainerIsolation: cfg.ExperimentalContainerIsolation,
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setup Machine controller: %w", err)
 	}

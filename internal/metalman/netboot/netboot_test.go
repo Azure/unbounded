@@ -4,6 +4,7 @@
 package netboot
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -18,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"text/template"
 	"time"
 
 	"github.com/stretchr/testify/require"
@@ -1079,7 +1081,9 @@ func TestGrubTemplate_NoInstallRequested(t *testing.T) {
 	require.NotContains(t, body, "eth0")
 }
 
-func TestNetworkConfigTemplate_SelectsBootLease(t *testing.T) {
+func renderNetworkConfigForLease(t *testing.T, holdLease bool) []byte {
+	t.Helper()
+
 	networkTmpl, err := os.ReadFile(filepath.Join("..", "..", "..", "images", "netboot", "assets", "network-config.tmpl"))
 	require.NoError(t, err)
 
@@ -1094,6 +1098,7 @@ func TestNetworkConfigTemplate_SelectsBootLease(t *testing.T) {
 						Gateway:    "10.0.2.1",
 						SubnetMask: "255.255.254.0",
 						DNS:        []string{"10.0.2.53", "2001:db8::53"},
+						HoldLease:  holdLease,
 					},
 				},
 			},
@@ -1104,6 +1109,21 @@ func TestNetworkConfigTemplate_SelectsBootLease(t *testing.T) {
 	result, err := renderTemplate(string(networkTmpl), data)
 	require.NoError(t, err)
 
+	return result
+}
+
+type parsedNetworkConfig struct {
+	Ethernets map[string]struct {
+		DHCP4          bool            `yaml:"dhcp4"`
+		DHCPIdentifier string          `yaml:"dhcp-identifier"`
+		DHCP4Overrides map[string]bool `yaml:"dhcp4-overrides"`
+		Addresses      []string        `yaml:"addresses"`
+	} `yaml:"ethernets"`
+}
+
+func TestNetworkConfigTemplate_SelectsBootLease(t *testing.T) {
+	result := renderNetworkConfigForLease(t, false)
+
 	body := string(result)
 	require.Contains(t, body, `macaddress: "aa:bb:cc:dd:ee:21"`)
 	require.Contains(t, body, `- "10.0.2.21/23"`)
@@ -1112,7 +1132,40 @@ func TestNetworkConfigTemplate_SelectsBootLease(t *testing.T) {
 	require.Contains(t, body, `- "2001:db8::53"`)
 	require.Contains(t, body, "dhcp4: false")
 	require.Contains(t, body, "dhcp6: false")
+	require.NotContains(t, body, "dhcp4-overrides")
+	require.NotContains(t, body, "dhcp-identifier")
+	require.NotContains(t, body, "dhcp4: true")
 	require.NotContains(t, body, "10.0.1.20")
+
+	var parsed parsedNetworkConfig
+	require.NoError(t, yaml.Unmarshal(result, &parsed))
+	provisioning := parsed.Ethernets["provisioning"]
+	require.False(t, provisioning.DHCP4)
+	require.Nil(t, provisioning.DHCP4Overrides)
+	require.Equal(t, []string{"10.0.2.21/23"}, provisioning.Addresses)
+}
+
+func TestNetworkConfigTemplate_HoldLeaseEnablesDHCP4WithOverrides(t *testing.T) {
+	result := renderNetworkConfigForLease(t, true)
+
+	body := string(result)
+	require.Contains(t, body, `via: "10.0.2.1"`)
+	require.Contains(t, body, "dhcp6: false")
+	require.NotContains(t, body, "dhcp4: false")
+
+	var parsed parsedNetworkConfig
+	require.NoError(t, yaml.Unmarshal(result, &parsed))
+	provisioning := parsed.Ethernets["provisioning"]
+	require.True(t, provisioning.DHCP4)
+	require.Equal(t, "mac", provisioning.DHCPIdentifier)
+	require.Equal(t, []string{"10.0.2.21/23"}, provisioning.Addresses)
+	require.Equal(t, map[string]bool{
+		"use-routes":   false,
+		"use-dns":      false,
+		"use-ntp":      false,
+		"use-hostname": false,
+		"use-domains":  false,
+	}, provisioning.DHCP4Overrides)
 }
 
 func TestNetworkConfigTemplate_NoLeaseDisablesDynamicConfiguration(t *testing.T) {
@@ -1227,6 +1280,45 @@ func TestGrubTemplate_SelectsBootLeaseByRequestIP(t *testing.T) {
 	require.Contains(t, body, "ip=10.0.1.21::10.0.1.1:255.255.255.0:::none")
 	require.NotContains(t, body, "unbounded.boot_mac=aa:bb:cc:dd:ee:20")
 	require.NotContains(t, body, "unbounded.disk=")
+}
+
+func TestGrubTemplate_DHCPHoldFlag(t *testing.T) {
+	grubTmpl, err := os.ReadFile(filepath.Join("..", "..", "..", "images", "netboot", "assets", "grub.cfg.tmpl"))
+	require.NoError(t, err)
+
+	for _, tc := range []struct {
+		name      string
+		holdLease bool
+	}{
+		{name: "default omits flag", holdLease: false},
+		{name: "hold lease sets flag", holdLease: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			node := &v1alpha3.Machine{
+				ObjectMeta: metav1.ObjectMeta{Name: "node-hold", Namespace: "default"},
+				Spec: v1alpha3.MachineSpec{
+					PXE: &v1alpha3.PXESpec{
+						DHCPLeases: []v1alpha3.DHCPLease{
+							{IPv4: "10.0.1.21", MAC: "aa:bb:cc:dd:ee:21", Gateway: "10.0.1.1", SubnetMask: "255.255.255.0", HoldLease: tc.holdLease},
+						},
+					},
+				},
+			}
+
+			data := newTemplateData(node, ClusterInfo{ApiserverURL: "https://k8s.example.com"}, "http://10.0.1.1:8080", "", "10.0.1.21", true)
+			result, err := renderTemplate(string(grubTmpl), data)
+			require.NoError(t, err)
+
+			body := string(result)
+			require.Contains(t, body, "ip=10.0.1.21::10.0.1.1:255.255.255.0:::none")
+
+			if tc.holdLease {
+				require.Contains(t, body, "unbounded.dhcp_hold=1 \\\n")
+			} else {
+				require.NotContains(t, body, "unbounded.dhcp_hold")
+			}
+		})
+	}
 }
 
 func TestGrubTemplate_SerialConsoleByArchitecture(t *testing.T) {
@@ -4106,4 +4198,190 @@ func TestResolveFile_AgentConfigPinsNodeName(t *testing.T) {
 			require.Equal(t, "node-pin", cfg.MachineName)
 		})
 	}
+}
+
+func TestResolveFileByPath_ExperimentalContainerIsolation(t *testing.T) {
+	t.Parallel()
+
+	const imageRef = "ghcr.io/test/image:v1"
+
+	resolve := func(t *testing.T, mode v1alpha3.IsolationMode, enabled bool) (*ResolvedFile, error) {
+		t.Helper()
+
+		resolver := FileResolver{
+			Cache: setupOCICache(t, imageRef, strings.Repeat("c", 64), map[string][]byte{
+				"cloud-init/vendor-data.tmpl": []byte(`{{ .AgentConfigJSON }}`),
+			}),
+			Cluster:                        &StaticClusterInfo{},
+			ExperimentalContainerIsolation: enabled,
+		}
+		node := &v1alpha3.Machine{
+			ObjectMeta: metav1.ObjectMeta{Name: "node-1"},
+			Spec:       v1alpha3.MachineSpec{Isolation: mode},
+		}
+
+		return resolver.ResolveFileByPath(t.Context(), "cloud-init/vendor-data", node, imageRef)
+	}
+
+	decode := func(t *testing.T, resolved *ResolvedFile) provision.UnboundedAgentConfig {
+		t.Helper()
+
+		var cfg provision.UnboundedAgentConfig
+		require.NoError(t, json.Unmarshal(resolved.Data, &cfg))
+
+		return cfg
+	}
+
+	t.Run("off renders other modes without the opt-in", func(t *testing.T) {
+		t.Parallel()
+
+		for _, mode := range []v1alpha3.IsolationMode{"", v1alpha3.IsolationNSpawn, v1alpha3.IsolationNone} {
+			resolved, err := resolve(t, mode, false)
+			require.NoError(t, err, mode)
+
+			cfg := decode(t, resolved)
+			require.Nil(t, cfg.Experimental, mode)
+			require.False(t, cfg.ContainerIsolationEnabled(), mode)
+		}
+	})
+
+	t.Run("off refuses container", func(t *testing.T) {
+		t.Parallel()
+
+		_, err := resolve(t, v1alpha3.IsolationContainer, false)
+		require.ErrorContains(t, err, `spec.isolation "container" is experimental and not enabled on this metalman`)
+		require.ErrorContains(t, err, "--experimental-container-isolation")
+	})
+
+	t.Run("grub.cfg", func(t *testing.T) {
+		t.Parallel()
+
+		grubTmpl, err := os.ReadFile(filepath.Join("..", "..", "..", "images", "netboot", "assets", "grub.cfg.tmpl"))
+		require.NoError(t, err)
+
+		resolveGrub := func(t *testing.T, mode v1alpha3.IsolationMode, enabled, pending bool) (*ResolvedFile, error) {
+			t.Helper()
+
+			node := &v1alpha3.Machine{
+				ObjectMeta: metav1.ObjectMeta{Name: "node-grub", Namespace: "default"},
+				Spec: v1alpha3.MachineSpec{
+					Isolation: mode,
+					PXE: &v1alpha3.PXESpec{
+						TargetDisk: "/dev/disk/by-id/test-os-disk",
+						DHCPLeases: []v1alpha3.DHCPLease{{IPv4: "10.0.1.21", MAC: "aa:bb:cc:dd:ee:21"}},
+					},
+				},
+			}
+			objs := []client.Object{node}
+
+			if pending {
+				objs = append(objs, &v1alpha3.MachineOperation{
+					ObjectMeta: metav1.ObjectMeta{Name: "replace-node-grub", Namespace: "default"},
+					Spec: v1alpha3.MachineOperationSpec{
+						OperationKind: v1alpha3.OperationHostReplace,
+						MachineRef:    node.Name,
+					},
+					Status: v1alpha3.MachineOperationStatus{Phase: v1alpha3.OperationPhaseInProgress},
+				})
+			}
+
+			resolver := FileResolver{
+				Cache: setupOCICache(t, imageRef, strings.Repeat("d", 64), map[string][]byte{
+					"grub.cfg.tmpl": grubTmpl,
+				}),
+				Cluster:                        &StaticClusterInfo{},
+				Reader:                         fake.NewClientBuilder().WithScheme(newScheme(t)).WithObjects(objs...).Build(),
+				ExperimentalContainerIsolation: enabled,
+			}
+
+			return resolver.ResolveFileByPath(t.Context(), "grub.cfg", node, imageRef)
+		}
+
+		t.Run("no install pending chainloads a refused Machine", func(t *testing.T) {
+			t.Parallel()
+
+			for _, mode := range []v1alpha3.IsolationMode{"", v1alpha3.IsolationNSpawn, v1alpha3.IsolationContainer} {
+				resolved, err := resolveGrub(t, mode, false, false)
+				require.NoError(t, err, mode)
+				require.Contains(t, string(resolved.Data), "No pending repave", mode)
+				require.Contains(t, string(resolved.Data), "chainloader", mode)
+			}
+		})
+
+		t.Run("install pending refuses container", func(t *testing.T) {
+			t.Parallel()
+
+			_, err := resolveGrub(t, v1alpha3.IsolationContainer, false, true)
+			require.ErrorContains(t, err, `spec.isolation "container" is experimental and not enabled on this metalman`)
+		})
+
+		t.Run("install pending renders the installer for other modes", func(t *testing.T) {
+			t.Parallel()
+
+			for _, mode := range []v1alpha3.IsolationMode{"", v1alpha3.IsolationNSpawn} {
+				resolved, err := resolveGrub(t, mode, false, true)
+				require.NoError(t, err, mode)
+				require.NotContains(t, string(resolved.Data), "No pending repave", mode)
+				require.Contains(t, string(resolved.Data), "Unbounded Metal Install", mode)
+			}
+		})
+
+		t.Run("install pending renders container when enabled", func(t *testing.T) {
+			t.Parallel()
+
+			resolved, err := resolveGrub(t, v1alpha3.IsolationContainer, true, true)
+			require.NoError(t, err)
+			require.Contains(t, string(resolved.Data), "Unbounded Metal Install")
+		})
+	})
+
+	t.Run("on opts every Machine in", func(t *testing.T) {
+		t.Parallel()
+
+		for _, mode := range []v1alpha3.IsolationMode{"", v1alpha3.IsolationNSpawn, v1alpha3.IsolationContainer} {
+			resolved, err := resolve(t, mode, true)
+			require.NoError(t, err, mode)
+
+			cfg := decode(t, resolved)
+			require.True(t, cfg.ContainerIsolationEnabled(), mode)
+			require.Equal(t, string(mode), cfg.Isolation)
+		}
+	})
+}
+
+// TestTemplates_OlderControllerWithoutDHCPHoldLease simulates an older
+// controller whose template data lacks the DHCPHoldLease key. Both templates
+// must render without error and produce the DHCP-free default.
+func TestTemplates_OlderControllerWithoutDHCPHoldLease(t *testing.T) {
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "old-controller"},
+		Spec: v1alpha3.MachineSpec{PXE: &v1alpha3.PXESpec{DHCPLeases: []v1alpha3.DHCPLease{{
+			IPv4: "10.0.1.20", MAC: "aa:bb:cc:dd:ee:20", Gateway: "10.0.1.1", SubnetMask: "255.255.255.0", HoldLease: true,
+		}}}},
+	}
+	values := newTemplateData(node, ClusterInfo{}, "http://serve", "", "10.0.1.20", true).values()
+	require.Contains(t, values, "DHCPHoldLease")
+	delete(values, "DHCPHoldLease")
+
+	render := func(name string) string {
+		raw, err := os.ReadFile(filepath.Join("..", "..", "..", "images", "netboot", "assets", name))
+		require.NoError(t, err)
+
+		tmpl, err := template.New("").Funcs(templateFuncMap).Parse(string(raw))
+		require.NoError(t, err)
+
+		var buf bytes.Buffer
+		require.NoError(t, tmpl.Execute(&buf, values))
+
+		return buf.String()
+	}
+
+	grub := render("grub.cfg.tmpl")
+	require.NotContains(t, grub, "unbounded.dhcp_hold")
+
+	network := render("network-config.tmpl")
+	require.Contains(t, network, "dhcp4: false")
+	require.NotContains(t, network, "dhcp4: true")
+	require.NotContains(t, network, "dhcp4-overrides")
+	require.NotContains(t, network, "dhcp-identifier")
 }

@@ -201,9 +201,21 @@ class TestHostRootStates(unittest.TestCase):
                     f"ExecStartPost={bin_dir}/unbounded-agent-nspawn-lifecycle nspawn-lifecycle post-start kube1\n")
         for missing in complete.splitlines():
             units = complete.replace(missing + "\n", "")
-            with self.subTest(missing=missing), patch.object(e2e, "ssh_capture", return_value=units):
+            with self.subTest(missing=missing), patch.object(e2e, "ssh_capture", return_value=units), \
+                    patch.object(e2e, "ISOLATION_MODE", "nspawn"):
                 with self.assertRaises(SystemExit):
                     e2e._daemon_unit_runs(bin_dir)
+
+    def test_the_other_modes_need_no_machine_hook(self):
+        """Only nspawn has a machine whose service override runs a lifecycle
+        helper; the other modes run the node as host units."""
+        bin_dir = e2e.DAEMON_BIN_DIR
+        units = (f"ExecStart={bin_dir}/unbounded-agent-current daemon\n"
+                 f"ExecStart={bin_dir}/unbounded-agent-daemon-recovery.sh\n")
+        for mode in (m for m in e2e.ISOLATION_MODES if m != "nspawn"):
+            with self.subTest(mode=mode), patch.object(e2e, "ssh_capture", return_value=units), \
+                    patch.object(e2e, "ISOLATION_MODE", mode):
+                e2e._daemon_unit_runs(bin_dir)
 
     def test_the_daemon_unit_must_name_the_expected_root(self):
         """A fresh host's unit runs the agent under the host root. A linked
@@ -294,13 +306,13 @@ class TestLegacyAgent(unittest.TestCase):
         self.assertEqual(seen["url"], f"{e2e.LEGACY_AGENT_RELEASE_URL}/{e2e.LEGACY_AGENT_TARBALL}")
         self.assertEqual(after, "http://previous")
 
-    def test_downloaded_release_is_checked_and_repackaged_alone(self):
-        """AgentUpgrade takes an archive holding the agent alone, and the release
-        also ships its license files."""
+    def test_downloaded_release_is_checked_and_served_as_published(self):
+        """AgentUpgrade takes the release archive as published, license files
+        and all, so it is checked but not repackaged."""
         def release(content: bytes) -> bytes:
             buffer = io.BytesIO()
             with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
-                for name, data in (("LICENSE", b"license"), ("unbounded-agent", content)):
+                for name, data in (("LICENSE", b"license"), ("NOTICE", b"notice"), ("unbounded-agent", content)):
                     info = tarfile.TarInfo(name)
                     info.size = len(data)
                     archive.addfile(info, io.BytesIO(data))
@@ -315,9 +327,7 @@ class TestLegacyAgent(unittest.TestCase):
                     patch.object(e2e, "http_get", return_value=checksums), \
                     patch.object(e2e, "download_file", side_effect=lambda _url, dest, data=tarball: dest.write_bytes(data)):
                 if ok:
-                    with tarfile.open(e2e._download_legacy_agent_tarball()) as archive:
-                        self.assertEqual(archive.getnames(), ["unbounded-agent"])
-                        self.assertEqual(archive.extractfile("unbounded-agent").read(), b"the release")
+                    self.assertEqual(e2e._download_legacy_agent_tarball().read_bytes(), good)
                 else:
                     with self.assertRaises(SystemExit):
                         e2e._download_legacy_agent_tarball()

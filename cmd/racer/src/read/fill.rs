@@ -30,6 +30,7 @@ use crate::memory::UnverifiedPage;
 use crate::model::ObjectMetadata;
 use crate::model::PAGE_BYTES;
 use crate::model::PageId;
+use crate::model::PageSize;
 use crate::origin::Origin;
 use crate::peer::protocol::FetchMode;
 use crate::peer::protocol::Operation as PeerOperation;
@@ -45,9 +46,10 @@ use crate::telemetry::Gauge;
 use crate::telemetry::LookupTier;
 use crate::telemetry::Metrics;
 use crate::telemetry::{Detail, FillAdmissionSite};
+use racer_io::ring::IoBuffer;
 use std::rc::Rc;
 use std::sync::Arc;
-use uring_runtime::reactor::IoBuffer;
+use std::time::Duration;
 
 #[derive(Clone)]
 pub struct FillDependencies {
@@ -63,25 +65,67 @@ pub struct FillDependencies {
     pub admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
     /// Publish immutable descriptors to the page-zero owner over bounded commands.
     /// Page workers keep their own page-attached descriptor even if that catalog evicts it.
-    pub metadata_owner: Arc<super::dispatch::WorkerDirectory>,
+    pub metadata_owner: std::rc::Rc<super::dispatch::WorkerDirectory>,
 }
-type LocalCopies = flow_control::coalesce::shared::Table<PageId, Result<Option<UnverifiedPage>>>;
+type LocalCopies = super::shared::Table<PageId, Result<Option<UnverifiedPage>>>;
 /// Local plaintext recovery keyed by page: one decrypt of a retained or local
 /// copy is shared by every concurrent warm reader and by elected acquisitions
 /// that find the page cached. Local-only readers never start acquisition.
-type LocalPlaintext = flow_control::coalesce::shared::Table<PageId, Result<Option<PageResult>>>;
+type LocalPlaintext = super::shared::Table<PageId, Result<Option<PageResult>>>;
 /// Source key of each running local plaintext job, once its copy is chosen.
 /// New followers are admitted only while that key remains available.
 type LocalPlaintextKeys = std::cell::RefCell<
-    std::collections::BTreeMap<PageId, Rc<std::cell::Cell<Option<racer_control_wire::KeyId>>>>,
+    std::collections::BTreeMap<PageId, Rc<std::cell::Cell<Option<racer_wire::control::KeyId>>>>,
 >;
 
+/// First wait for local plaintext; each later wait doubles it up to [`PLAINTEXT_WAIT_MAX`].
+pub(super) const PLAINTEXT_WAIT_MIN: Duration = Duration::from_millis(1);
+
+/// Ceiling of one wait for local plaintext. Short, as a release is not signaled.
+pub(super) const PLAINTEXT_WAIT_MAX: Duration = Duration::from_millis(50);
+
+/// Wait `count` (1 for the first) for local plaintext, jittered into its upper half by a hash of
+/// `seed` and `count` so readers released by one charge do not retry in lockstep.
+pub(super) fn plaintext_wait(seed: u64, count: u8) -> Duration {
+    let shift = u32::from(count.saturating_sub(1)).min(16);
+    let full = PLAINTEXT_WAIT_MIN
+        .saturating_mul(1 << shift)
+        .min(PLAINTEXT_WAIT_MAX);
+    let half = full / 2;
+    let mut mix = seed ^ (u64::from(count) << 56) ^ 0x9e37_79b9_7f4a_7c15;
+    mix = (mix ^ (mix >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    mix = (mix ^ (mix >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    mix ^= mix >> 31;
+    let span = u64::try_from(half.as_nanos())
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    half + Duration::from_nanos(mix % span)
+}
+
+/// The free receive buffers a pool of `total` keeps for window heads before
+/// any host-read page ahead of its head is granted one: such a page keeps its
+/// buffer until its head is delivered, so while fewer than this many are
+/// free its grant is refused `Overloaded` before anything is sent, and the
+/// window fetches it again later. A quarter of the pool, and at least one
+/// buffer.
+pub(crate) fn ahead_grant_reserve(total: usize) -> usize {
+    (total / 4).max(1)
+}
+
+/// The free receive buffers a pool of `total` keeps for window heads after a
+/// host-read page ahead of its head has landed: such a page is fused (keeping
+/// its buffer until its head is delivered) only while at least this many are
+/// free, and is copied out otherwise. Grants already stop at
+/// [`ahead_grant_reserve`], so this is a last resort for pages granted just
+/// before the pool ran low. An eighth of the pool, and at least one buffer.
+pub(crate) fn ahead_registered_reserve(total: usize) -> usize {
+    (total / 8).max(1)
+}
+
 /// A host descriptor to hand to cuFile, or None for simulated descriptors.
-fn host_descriptor(
-    descriptor: &uring_runtime::reactor::descriptor::Descriptor,
-) -> Option<std::os::fd::OwnedFd> {
+fn host_descriptor(descriptor: &racer_io::ring::Descriptor) -> Option<std::os::fd::OwnedFd> {
     use std::os::fd::AsFd;
-    #[cfg(test)]
+    #[cfg(any(test, feature = "dst"))]
     if descriptor.as_sim().is_some() {
         return None;
     }
@@ -102,6 +146,14 @@ pub struct Fill {
 
     diagnostic: Option<DriverDiagnostic>,
     fence_acquisition: bool,
+    /// Set for a host-read sealed fetch. An elected driver that acquires a
+    /// registered RDMA page then leaves it out of the memory cache, so the
+    /// host-read sink's fused pass makes the only copy; the verdict
+    /// publishes that copy. See [`Self::publish_acquired_ciphertext`].
+    pub(super) defer_registered_publish: bool,
+    /// Timers for waiting out local plaintext pressure. Without one, a network fill fails
+    /// `Overloaded` once its reclaim attempt cannot make room.
+    plaintext_wait: Option<Rc<crate::runtime::Reactor>>,
 }
 
 /// Immediate acquisition tier, not the original producer or corruption location.
@@ -141,7 +193,7 @@ fn stage_events(stage: DriverStage) -> Option<(Event, Event)> {
         DriverStage::DiskReadCall => Some((Event::FillDiskReadCount, Event::FillDiskReadNs)),
         DriverStage::OriginCall => Some((Event::FillOriginCount, Event::FillOriginNs)),
         DriverStage::EncryptCall => Some((Event::FillEncryptCount, Event::FillEncryptNs)),
-        DriverStage::ChecksumCall => Some((Event::FillChecksumCount, Event::FillChecksumNs)),
+        DriverStage::TagCheckCall => Some((Event::FillTagCheckCount, Event::FillTagCheckNs)),
         DriverStage::Starting
         | DriverStage::BetweenCalls
         | DriverStage::CandidateCompositeCall
@@ -162,16 +214,22 @@ const GPU_COPY_JOIN_RETRIES: usize = 2;
 const LANDING_PROVIDERS: usize = 2;
 
 impl Fill {
+    /// This worker's detached driver queue.
+    #[cfg(test)]
+    pub(crate) fn drivers(&self) -> &std::rc::Rc<crate::drivers::DriverQueue> {
+        self.dependencies.candidates.drivers()
+    }
+
     /// Published mode of `cache`.
     pub(crate) fn mode(
         &self,
-        cache: &racer_control_wire::CacheId,
-    ) -> racer_control_wire::CacheMode {
+        cache: &racer_wire::control::CacheId,
+    ) -> racer_wire::control::CacheMode {
         self.dependencies.memory.availability().mode(cache)
     }
 
     /// Whether `cache` retains no pages or metadata on this node.
-    pub(crate) fn passthrough(&self, cache: &racer_control_wire::CacheId) -> bool {
+    pub(crate) fn passthrough(&self, cache: &racer_wire::control::CacheId) -> bool {
         self.mode(cache).passthrough()
     }
 
@@ -240,7 +298,7 @@ impl Fill {
         };
         let cancellation = scope.cancellation.subscribe()?;
         // A joined job runs under the scope of the caller that started it. If
-        // that inherited scope expires or is cancelled while this caller's own
+        // that inherited scope expires or is canceled while this caller's own
         // scope is still valid, retry under this caller's own scope. A job this
         // caller started shares its deadline, so its failure is final. The
         // bound stops a stream of short-lived starters from looping forever.
@@ -258,13 +316,18 @@ impl Fill {
             } else {
                 self.dependencies.flights.admit_local(page, None)?;
                 started = true;
-                let permit = uring_runtime::drivers::reserve().map_err(Error::from)?;
+                let permit = self
+                    .dependencies
+                    .candidates
+                    .drivers()
+                    .reserve()
+                    .map_err(Error::from)?;
                 let flight = if probe {
                     Some(self.dependencies.flights.reserve_copy_flight(page, scope)?)
                 } else {
                     None
                 };
-                let owned_scope = RequestScope::new(scope.request, scope.deadline.0)?;
+                let owned_scope = scope.child(scope.request, scope.deadline.0)?;
                 let (receive, completion) = self
                     .local_plaintext
                     .start(page.clone(), Err(Error::Unavailable));
@@ -321,14 +384,14 @@ impl Fill {
                 if probe {
                     scope.check()?;
                 }
-                uring_runtime::drivers::poll(cx, 64);
+                self.dependencies.candidates.drivers().poll(cx, 64);
                 let result = std::task::ready!(std::pin::Pin::new(&mut receive).poll(cx));
                 scope.check()?;
                 std::task::Poll::Ready(result)
             })
             .await;
             match result {
-                Err(Error::DeadlineExceeded | Error::Cancelled) if !started && joins_left > 0 => {
+                Err(Error::DeadlineExceeded | Error::Canceled) if !started && joins_left > 0 => {
                     scope.check()?;
                     joins_left -= 1;
                 }
@@ -344,7 +407,7 @@ impl Fill {
         &self,
         page: &PageId,
         scope: &RequestScope,
-        source_key: &std::cell::Cell<Option<racer_control_wire::KeyId>>,
+        source_key: &std::cell::Cell<Option<racer_wire::control::KeyId>>,
     ) -> Result<Option<PageResult>> {
         let Some(cached) = self.metrics.lookup(
             LookupTier::Ciphertext,
@@ -411,10 +474,15 @@ impl Fill {
             .diagnostic
             .as_ref()
             .map(|diagnostic| diagnostic.call(stage));
-        let start = uring_runtime::environment::now();
+        let start = self.dependencies.flights.clock().now();
         let result = work.await;
         if let Some((count, sum)) = stage_events(stage) {
-            self.metrics.record_duration(count, sum, start);
+            self.metrics.record_duration(
+                count,
+                sum,
+                start,
+                self.dependencies.flights.clock().now(),
+            );
         }
         result
     }
@@ -426,9 +494,10 @@ impl Fill {
         sum: Event,
         work: impl std::future::Future<Output = T>,
     ) -> T {
-        let start = uring_runtime::environment::now();
+        let start = self.dependencies.flights.clock().now();
         let result = work.await;
-        self.metrics.record_duration(count, sum, start);
+        self.metrics
+            .record_duration(count, sum, start, self.dependencies.flights.clock().now());
         result
     }
 
@@ -516,7 +585,7 @@ impl Fill {
             };
             let page = grant.page.clone();
             let accepted = async {
-                let copy = response_copy(response.response(), &page)?;
+                let copy = response_copy(response.response(), &page, self.page_size()?)?;
                 drop(response);
                 // Allocate and authenticate on the stable owner, which can reclaim
                 // every payload charge retained by its page cache.
@@ -629,7 +698,7 @@ impl Fill {
     }
     pub(super) fn reserve_with_reclamation(
         &self,
-        cache: &racer_control_wire::CacheId,
+        cache: &racer_wire::control::CacheId,
         class: ResourceClass,
         amount: usize,
     ) -> Result<flow_control::Charge<AdmissionPolicy>> {
@@ -643,7 +712,7 @@ impl Fill {
 
     pub(super) fn reserve_reclaiming(
         &self,
-        cache: &racer_control_wire::CacheId,
+        cache: &racer_wire::control::CacheId,
         class: ResourceClass,
         amount: usize,
         reserve: impl Fn() -> Result<flow_control::Charge<AdmissionPolicy>>,
@@ -652,6 +721,20 @@ impl Fill {
         // Zero released bytes does not mean exhaustion: the memory cursor may
         // have crossed only busy or other-cache entries. No await allows new
         // local charges to interleave; remote completions can only free bytes.
+        let admission = &self.dependencies.admission;
+        crate::admission::report_final(admission, || {
+            self.reclaim_retry(cache, class, amount, reserve)
+        })
+    }
+
+    /// The retry loop of [`Self::reserve_reclaiming`], recording every rejection.
+    fn reclaim_retry(
+        &self,
+        cache: &racer_wire::control::CacheId,
+        class: ResourceClass,
+        amount: usize,
+        reserve: impl Fn() -> Result<flow_control::Charge<AdmissionPolicy>>,
+    ) -> Result<flow_control::Charge<AdmissionPolicy>> {
         flow_control::progress::reclaim_retry(2, reserve, |error| {
             if *error != Error::Overloaded {
                 return false;
@@ -688,7 +771,7 @@ impl Fill {
                 .reserve(
                     Some(&page.version.object.cache),
                     ResourceClass::Plaintext,
-                    PAGE_BYTES as usize,
+                    self.page_plaintext_bytes()?,
                 )
                 .map_err(Into::into)
         })
@@ -703,13 +786,18 @@ impl Fill {
     ) -> Result<flow_control::Charge<AdmissionPolicy>> {
         let admission = &self.dependencies.admission;
         let cache = &page.version.object.cache;
-        let amount = PAGE_BYTES as usize;
+        let amount = self.page_plaintext_bytes()?;
         // The memory cache retains no plaintext, so nothing local can be
         // reclaimed. Retry once after a yield, which lets completed readers
-        // drop their plaintext.
+        // drop their plaintext. With a timer, keep waiting for them under a
+        // growing jittered backoff until the scope ends: concurrent readers
+        // queue for plaintext instead of failing and retrying elsewhere.
         let mut exhausted = false;
+        let mut waits: u8 = 0;
         loop {
             scope.check()?;
+            // Work ahead of a head never waits here; the window retries it.
+            self.ahead_headroom(scope, cache)?;
             let (mut result, mut detail) =
                 crate::admission::capture_rejection(admission, &mut reserve);
             if !matches!(result, Err(Error::Overloaded)) {
@@ -726,6 +814,23 @@ impl Fill {
                     return result;
                 }
             }
+            if (exhausted || deficit.is_none())
+                && let Some(reactor) = &self.plaintext_wait
+                // An amount past the whole limit is never admitted.
+                && amount <= admission.limit(ResourceClass::Plaintext)
+            {
+                waits = waits.saturating_add(1);
+                let request = u64::from_le_bytes(
+                    scope.request.0[..8]
+                        .try_into()
+                        .map_err(|_| Error::Internal)?,
+                );
+                let delay = plaintext_wait(page.number.0 ^ request, waits);
+                reactor
+                    .sleep_until(scope.clock().now() + delay, scope)
+                    .await?;
+                continue;
+            }
             if exhausted || deficit.is_none() {
                 admission.policy().observer().final_fill_admission(
                     scope,
@@ -738,7 +843,41 @@ impl Fill {
             exhausted = true;
             // Always yield before the retry. Cancellation never extends the
             // original allowance.
-            uring_runtime::drivers::yield_now().await;
+            racer_io::exec::yield_now().await;
+        }
+    }
+
+    /// Refuse plaintext to work for a page past its window's head (see
+    /// [`RequestScope::ahead`]) unless one more page stays free after it, in both
+    /// this worker's plaintext total and the cache's share. Window pages hold
+    /// their plaintext until the head before them is delivered, and a head's
+    /// fill waits for plaintext. Without this spare page, ready pages behind
+    /// waiting heads can fill the share, and every head on the worker then waits
+    /// for the others until a request deadline frees their pages. With it, the
+    /// last free page always goes to a head, which completes and moves its
+    /// window on. `Overloaded` makes the window retry the page after a backoff,
+    /// by then possibly as a head.
+    pub(super) fn ahead_headroom(
+        &self,
+        scope: &RequestScope,
+        cache: &racer_wire::control::CacheId,
+    ) -> Result<()> {
+        if !scope.ahead {
+            return Ok(());
+        }
+        let page = self.page_plaintext_bytes()?;
+        let admission = &self.dependencies.admission;
+        let class = ResourceClass::Plaintext;
+        let need = page.saturating_mul(2);
+        // `reclamation` is None both when `need` fits and when it never fits.
+        let fits = need <= admission.limit(class)
+            && need <= admission.fair_limit(cache, class)
+            && admission.reclamation(cache, class, need).is_none();
+        if fits {
+            Ok(())
+        } else {
+            self.metrics.record(Event::AheadPlaintextDeferred, 1);
+            Err(Error::Overloaded)
         }
     }
 
@@ -750,6 +889,9 @@ impl Fill {
         site: FillAdmissionSite,
         operation: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
+        if site.plaintext() {
+            self.ahead_headroom(scope, &page.version.object.cache)?;
+        }
         let (result, detail) =
             crate::admission::capture_rejection(&self.dependencies.admission, operation);
         if matches!(result, Err(Error::Overloaded)) {
@@ -817,9 +959,22 @@ impl Fill {
     /// before origin I/O using the same bounded reclamation as ordinary fills.
     pub(crate) fn reserve_bootstrap(
         &self,
-        cache: &racer_control_wire::CacheId,
+        cache: &racer_wire::control::CacheId,
     ) -> Result<flow_control::Charge<AdmissionPolicy>> {
-        self.reserve_with_reclamation(cache, ResourceClass::Plaintext, PAGE_BYTES as usize)
+        let amount = self.page_plaintext_bytes()?;
+        self.reserve_with_reclamation(cache, ResourceClass::Plaintext, amount)
+    }
+
+    /// One page's plaintext at the published cluster page size: what an origin fill or
+    /// bootstrap reserves before the page length is known.
+    pub(crate) fn page_plaintext_bytes(&self) -> Result<usize> {
+        Ok(self.page_size()?.get() as usize)
+    }
+
+    /// The published cluster page size. Every page this node accepts must be cut at
+    /// it, since ranges are sliced at it.
+    pub(crate) fn page_size(&self) -> Result<PageSize> {
+        self.dependencies.origin.page_size()
     }
 
     /// A received or retained copy already fixes the output length. Validate it
@@ -829,11 +984,16 @@ impl Fill {
         page: &PageId,
         copy: &crate::memory::CiphertextCopy,
     ) -> Result<flow_control::Charge<AdmissionPolicy>> {
-        validate_copy(copy, page)?;
+        validate_copy(copy, page, self.page_size()?)?;
+        // Charge the pooled capacity up front so reclamation covers it.
+        let capacity = self
+            .dependencies
+            .buffers
+            .plaintext_capacity(copy.ciphertext.envelope().plaintext_length as usize)?;
         self.reserve_with_reclamation(
             &page.version.object.cache,
             ResourceClass::Plaintext,
-            copy.ciphertext.envelope().plaintext_length as usize,
+            capacity,
         )
     }
     pub fn new(dependencies: FillDependencies) -> Self {
@@ -854,7 +1014,15 @@ impl Fill {
             gpu_copies: Rc::default(),
             diagnostic: None,
             fence_acquisition: false,
+            defer_registered_publish: false,
+            plaintext_wait: None,
         }
+    }
+    /// Wait on `reactor`'s timers for completed readers to release plaintext instead of failing
+    /// a network fill `Overloaded`, until the fill's scope ends.
+    pub(crate) fn with_plaintext_wait(mut self, reactor: Rc<crate::runtime::Reactor>) -> Self {
+        self.plaintext_wait = Some(reactor);
+        self
     }
     pub fn with_metrics(mut self, metrics: Metrics) -> Self {
         self.metrics = metrics;
@@ -942,6 +1110,9 @@ impl Fill {
     /// page takes the usual path through host memory, which keeps the usual
     /// single-flight sharing, memory publication and disk persistence; only
     /// the CPU decrypt and the plaintext publication are skipped.
+    ///
+    /// A host target ([`super::sealed::SealedTarget::host`]) always takes
+    /// that host-memory path; its sink decrypts into the client's file.
     pub(crate) async fn acquire_sealed(
         &self,
         page: PageId,
@@ -966,17 +1137,23 @@ impl Fill {
         let cached = self.dependencies.memory.unverified(&page)?.is_some();
         // Passthrough never serves a retained copy, so a residual disk copy
         // awaiting the worker purge is not staged, and a local-route read
-        // never contacts peers.
+        // never contacts peers. A host target has no GPU copies: its pages
+        // always come through host memory.
         let mode = self.mode(&page.version.object.cache);
         if !cached
-            && mode != racer_control_wire::CacheMode::PassthroughLocal
+            && target.helper.is_some()
+            && mode != racer_wire::control::CacheMode::PassthroughLocal
             && let Some(fetched) = self
                 .shared_gpu_copy(&page, membership.clone(), context, scope, budget, target)
                 .await?
         {
             return Ok(fetched);
         }
-        let acquired = self
+        // A host sink copies a registered page out during its decrypt, so
+        // an elected driver must not copy it out first for the memory cache.
+        let mut host = self.clone();
+        host.defer_registered_publish = target.helper.is_none();
+        let acquired = host
             .acquire_with_prefetch(
                 page.clone(),
                 membership.clone(),
@@ -990,8 +1167,16 @@ impl Fill {
             .await?;
         match acquired {
             AcquiredPage::Plaintext(result) => Ok(Fetched::Page(result)),
-            AcquiredPage::Ciphertext(copy) => match self.seal(&page, copy) {
+            AcquiredPage::Ciphertext(copy) => match self.seal_for(
+                &page,
+                copy,
+                target.helper.is_none().then_some(scope.reader_numa),
+                scope.ahead,
+            ) {
                 Ok(sealed) => Ok(Fetched::Sealed(sealed)),
+                // An ahead page that could not leave its receive buffer: the
+                // window retries it later, by then possibly as its head.
+                Err(Error::Overloaded) => Err(Error::Overloaded),
                 // A key the GPU cannot use, or an AAD too long for it: the
                 // CPU authenticates the page as for a Get.
                 Err(_) => self
@@ -1023,7 +1208,10 @@ impl Fill {
         let mut retries = GPU_COPY_JOIN_RETRIES;
         loop {
             scope.check()?;
-            match self.gpu_copies.lookup(page, &target.helper, target.ordinal) {
+            match self
+                .gpu_copies
+                .lookup(page, target.helper()?, target.ordinal)
+            {
                 Lookup::Live(copy) => {
                     if let Some(fetched) = self.joined_gpu_copy(page, &copy, target) {
                         return Ok(Some(fetched));
@@ -1068,7 +1256,7 @@ impl Fill {
                             super::gpu_copies::SharedCopy::from_sealed(sealed)
                                 .map_or(Outcome::Nothing, Outcome::Copy)
                         }
-                        Err(Error::Cancelled | Error::DeadlineExceeded) => Outcome::Abandoned,
+                        Err(Error::Canceled | Error::DeadlineExceeded) => Outcome::Abandoned,
                         _ => Outcome::Nothing,
                     });
                     return result;
@@ -1108,7 +1296,9 @@ impl Fill {
         target: &super::sealed::SealedTarget,
     ) -> Option<super::sealed::Fetched> {
         let sealed = copy.sealed(&self.dependencies.crypto, page).ok()?;
-        target.helper.record_joined();
+        if let Ok(helper) = target.helper() {
+            helper.record_joined();
+        }
         self.metrics.record(Event::GpuDirectJoined, 1);
         Some(super::sealed::Fetched::Sealed(sealed))
     }
@@ -1125,7 +1315,7 @@ impl Fill {
         target: &super::sealed::SealedTarget,
     ) -> Result<Option<super::sealed::Fetched>> {
         if !self.passthrough(&page.version.object.cache)
-            && target.helper.cufile()
+            && target.helper()?.cufile()
             && self
                 .dependencies
                 .writer
@@ -1137,12 +1327,12 @@ impl Fill {
             match self.stage_from_disk(page, scope, target).await {
                 Ok(Some(sealed)) => return Ok(Some(super::sealed::Fetched::Sealed(sealed))),
                 Ok(None) => {}
-                Err(error @ (Error::Cancelled | Error::DeadlineExceeded)) => return Err(error),
+                Err(error @ (Error::Canceled | Error::DeadlineExceeded)) => return Err(error),
                 // Any other failure reads the page through host memory.
                 Err(_) => {}
             }
         }
-        if self.mode(&page.version.object.cache) == racer_control_wire::CacheMode::PassthroughLocal
+        if self.mode(&page.version.object.cache) == racer_wire::control::CacheMode::PassthroughLocal
         {
             return Ok(None);
         }
@@ -1151,7 +1341,7 @@ impl Fill {
             .await
         {
             Ok(fetched) => Ok(fetched),
-            Err(error @ (Error::Cancelled | Error::DeadlineExceeded)) => Err(error),
+            Err(error @ (Error::Canceled | Error::DeadlineExceeded)) => Err(error),
             // Any other failure takes the usual path through host memory.
             Err(_) => Ok(None),
         }
@@ -1194,7 +1384,7 @@ impl Fill {
         if let Some(local) = self.acquire_local_copy(page, scope, false).await? {
             return Ok(Some(match local {
                 AcquiredPage::Plaintext(result) => super::sealed::Fetched::Page(result),
-                AcquiredPage::Ciphertext(copy) => match self.seal(page, copy) {
+                AcquiredPage::Ciphertext(copy) => match self.seal(page, copy, None) {
                     Ok(sealed) => super::sealed::Fetched::Sealed(sealed),
                     Err(_) => return Ok(None),
                 },
@@ -1224,7 +1414,7 @@ impl Fill {
                 .await
             {
                 Ok(delivered) => delivered,
-                Err(error @ (Error::Cancelled | Error::DeadlineExceeded)) => return Err(error),
+                Err(error @ (Error::Canceled | Error::DeadlineExceeded)) => return Err(error),
                 // A failed provider: ask the next one.
                 Err(_) => continue,
             };
@@ -1237,7 +1427,8 @@ impl Fill {
                 // slot, or HTTP): use it privately rather than fetch it again.
                 crate::peer::Delivered::Response(response) => {
                     // A miss or unusable answer: ask the next provider.
-                    let Ok(copy) = response_copy(response.response(), page) else {
+                    let Ok(copy) = response_copy(response.response(), page, self.page_size()?)
+                    else {
                         continue;
                     };
                     return Ok(self
@@ -1247,6 +1438,7 @@ impl Fill {
                                 copy,
                                 disk_token: None,
                             },
+                            None,
                         )
                         .ok()
                         .map(super::sealed::Fetched::Sealed));
@@ -1265,12 +1457,13 @@ impl Fill {
         if landed.ordinal() != target.ordinal || envelope.page != *page {
             return Ok(None);
         }
-        metadata.immutable().validate_page(&envelope)?;
+        metadata
+            .immutable()
+            .validate_page_in(&envelope, self.page_size()?)?;
         let sealed = Box::new(super::sealed::SealedPage {
+            fused_store: None,
             aad: crate::security::page_aad(&envelope)?,
             key: self.dependencies.crypto.derive_page_key(&envelope)?,
-            // No host bytes to checksum: the GPU checks the AEAD tag.
-            expected_crc: None,
             metadata,
             envelope,
             source: super::sealed::SealedSource::Landed(Arc::new(landed)),
@@ -1280,15 +1473,83 @@ impl Fill {
         Ok(Some(super::sealed::Fetched::Sealed(sealed)))
     }
 
-    /// Package host ciphertext for GPU verification.
-    fn seal(&self, page: &PageId, copy: UnverifiedPage) -> Result<Box<super::sealed::SealedPage>> {
-        validate_copy(&copy.copy, page)?;
+    /// Package host ciphertext for GPU verification or a host-read decrypt.
+    ///
+    /// For a GPU, a registered RDMA page is copied out first, as
+    /// [`Self::decrypt`] does: the sealed page lives until the GPU's decrypt
+    /// and the verdict's persist finish, and a registered buffer held that
+    /// long throttles RDMA receive to the client and disk rate.
+    ///
+    /// For a host-read sink (`host`), a registered page instead keeps its
+    /// buffer and gets empty aligned storage: the crypto worker copies and
+    /// decrypts it in one chunked pass (`DecryptInto::run`), so the page is
+    /// read from memory once instead of twice. The buffer is held only until
+    /// that pass ends; the client loop then swaps the verdict's copy for the
+    /// detached one. When the storage cannot be reserved, it detaches as for
+    /// a GPU.
+    ///
+    /// `host` is Some for a host-read sink, holding the NUMA node of the
+    /// crypto helper expected to decrypt the page (the requester's
+    /// `reader_numa`); the storage is bound to that node, since its write is
+    /// the most NUMA-sensitive part of the fused pass.
+    pub(super) fn seal(
+        &self,
+        page: &PageId,
+        copy: UnverifiedPage,
+        host: Option<Option<u16>>,
+    ) -> Result<Box<super::sealed::SealedPage>> {
+        self.seal_for(page, copy, host, false)
+    }
+
+    /// As [`Self::seal`], for a page `ahead` of its window's head (see
+    /// [`RequestScope::ahead`]).
+    ///
+    /// A host-read page waits in its window until every page before it is
+    /// delivered, and a fused page holds its RDMA receive buffer all that
+    /// time. Heads need receive buffers too, so ahead pages holding them all
+    /// stall every read until request deadlines free them. While its
+    /// buffer's pool has fewer than [`ahead_registered_reserve`] free
+    /// buffers, an ahead page is therefore copied out at once instead of
+    /// fused, counted as `pool_low` in `racer_host_read_fused_skipped_total`.
+    /// If even that copy is refused, the page fails `Overloaded`, which
+    /// returns its buffer, and the window retries it later.
+    pub(super) fn seal_for(
+        &self,
+        page: &PageId,
+        mut copy: UnverifiedPage,
+        host: Option<Option<u16>>,
+        ahead: bool,
+    ) -> Result<Box<super::sealed::SealedPage>> {
+        validate_copy(&copy.copy, page, self.page_size()?)?;
+        let pool_low = host.is_some()
+            && ahead
+            && copy
+                .copy
+                .ciphertext
+                .registered_pool_free()
+                .is_some_and(|(free, total)| free < ahead_registered_reserve(total));
+        if pool_low {
+            self.metrics.record(Event::HostReadFusedSkippedPoolLow, 1);
+            copy.copy.ciphertext = self.detach_registered(copy.copy.ciphertext);
+            if copy.copy.ciphertext.is_registered() {
+                self.metrics
+                    .record(Event::HostReadAheadRegisteredDropped, 1);
+                return Err(Error::Overloaded);
+            }
+        }
+        let fused_store = match host {
+            Some(node) if !pool_low => self.fused_store(&copy.copy.ciphertext, node),
+            _ => None,
+        };
+        if fused_store.is_none() {
+            copy.copy.ciphertext = self.detach_registered(copy.copy.ciphertext);
+        }
         let envelope = copy.copy.ciphertext.envelope().clone();
         let sealed = Box::new(super::sealed::SealedPage {
+            fused_store,
             metadata: copy.copy.metadata.clone(),
             aad: crate::security::page_aad(&envelope)?,
             key: self.dependencies.crypto.derive_page_key(&envelope)?,
-            expected_crc: copy.copy.ciphertext.cached_checksum(),
             envelope,
             source: super::sealed::SealedSource::Host(copy),
         });
@@ -1306,9 +1567,9 @@ impl Fill {
         scope: &RequestScope,
         target: &super::sealed::SealedTarget,
     ) -> Result<Option<Box<super::sealed::SealedPage>>> {
-        if target.helper.free_slots(target.ordinal) == 0 {
-            target
-                .helper
+        let helper = target.helper()?;
+        if helper.free_slots(target.ordinal) == 0 {
+            helper
                 .counters()
                 .exhausted
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1341,8 +1602,7 @@ impl Fill {
         let aad = crate::security::page_aad(&envelope)?;
         let key = self.dependencies.crypto.derive_page_key(&envelope)?;
         let read_length = record.read_length;
-        let staged = target
-            .helper
+        let staged = helper
             .stage_file(
                 target.ordinal,
                 fd,
@@ -1355,22 +1615,21 @@ impl Fill {
         let crate::store::DirectRecord {
             token,
             metadata,
-            checksum,
             lease,
             ..
         } = record;
         drop(lease);
         let staged = match staged {
             Ok(staged) => staged,
-            Err(error @ (Error::Cancelled | Error::DeadlineExceeded)) => return Err(error),
+            Err(error @ (Error::Canceled | Error::DeadlineExceeded)) => return Err(error),
             Err(_) => return Ok(None),
         };
         let sealed = Box::new(super::sealed::SealedPage {
+            fused_store: None,
             metadata,
             envelope,
             aad,
             key,
-            expected_crc: Some(checksum),
             source: super::sealed::SealedSource::Staged {
                 staged: Arc::new(staged),
                 token,
@@ -1395,6 +1654,12 @@ impl Fill {
             if let Some(copy) = copy
                 && copy.disk_token.is_none()
             {
+                // A host-read fetch may have left a registered page out of
+                // the memory cache; cache its authenticated detached copy.
+                // A page already cached is left as it is.
+                if !copy.copy.ciphertext.is_registered() {
+                    let _ = self.dependencies.memory.publish_ciphertext(copy.clone());
+                }
                 let interest = crate::retention::Interest::default();
                 let observation = self.retention_observation(&page, &interest, false);
                 self.persist_copy(copy.copy, observation);
@@ -1636,7 +1901,12 @@ impl Fill {
                 cached
             }
         };
-        let driver_permit = uring_runtime::drivers::reserve().map_err(Error::from)?;
+        let driver_permit = self
+            .dependencies
+            .candidates
+            .drivers()
+            .reserve()
+            .map_err(Error::from)?;
         let acquisition = waiter.acquisition(&leader)?;
         // The driver stays on this owner. Admit an independent zeroizing context
         // without crossing an AEAD domain.
@@ -1656,14 +1926,14 @@ impl Fill {
         // budget; the extra time is within the adopting waiter's own deadline and budget.
         let handover = !self.fence_acquisition;
         let ceiling = racer_core::read::flight::handover_ceiling(
-            uring_runtime::environment::now(),
+            caller_scope.clock().now(),
             caller_scope.deadline.0,
             handover,
         );
-        let owned_scope = RequestScope::new(caller_scope.request, ceiling)?;
+        let owned_scope = caller_scope.child(caller_scope.request, ceiling)?;
         let mut operation = self.dependencies.flights.retain_driver_operation(
             &leader,
-            self.metrics.lease(Gauge::ActiveFills)?,
+            self.metrics.lease_local(Gauge::ActiveFills)?,
             handover,
         )?;
         let mut owned_budget = acquisition.budget.transfer();
@@ -1675,14 +1945,15 @@ impl Fill {
         let diagnostic_lifetime = DriverDiagnostic::lifetime(fill.diagnostic.clone());
         let flights = self.dependencies.flights.clone();
         let (send, mut receive) = futures::channel::oneshot::channel();
-        let submitted = uring_runtime::environment::now();
+        let submitted = self.dependencies.flights.clock().now();
         driver_permit.submit_detached(Box::pin(async move {
             fill.metrics.record_duration(
                 Event::FillDriverStartCount,
                 Event::FillDriverStartNs,
                 submitted,
+                fill.dependencies.flights.clock().now(),
             );
-            let started = uring_runtime::environment::now();
+            let started = fill.dependencies.flights.clock().now();
             let _diagnostic_lifetime = diagnostic_lifetime;
             let mut work = Box::pin(async {
                 if shared_local {
@@ -1757,10 +2028,10 @@ impl Fill {
                 }
             });
             let result = std::future::poll_fn(|cx| {
-                if !caller_scope.cancellation.is_cancelled() {
+                if !caller_scope.cancellation.is_canceled() {
                     caller_cancellation.register(cx.waker());
                 }
-                if !owned_scope.cancellation.is_cancelled()
+                if !owned_scope.cancellation.is_canceled()
                     && ((!handover && caller_scope.check().is_err())
                         || operation.poll_cancellation(cx))
                 {
@@ -1773,8 +2044,12 @@ impl Fill {
             })
             .await;
             fill.stage(DriverStage::WorkReturned);
-            fill.metrics
-                .record_duration(Event::FillDriverCount, Event::FillDriverNs, started);
+            fill.metrics.record_duration(
+                Event::FillDriverCount,
+                Event::FillDriverNs,
+                started,
+                fill.dependencies.flights.clock().now(),
+            );
             drop(work);
             operation.complete()?;
             match result {
@@ -1785,13 +2060,7 @@ impl Fill {
                         fill.persist_verified(page, observation);
                     }
                     if let AcquiredPage::Ciphertext(copy) = &result {
-                        match fill.dependencies.memory.publish_ciphertext(copy.clone()) {
-                            Ok(()) => {}
-                            Err(error)
-                                if racer_core::read::Error::try_from(error)
-                                    .is_ok_and(racer_core::read::ciphertext_publish_tolerated) => {}
-                            Err(error) => return Err(error),
-                        }
+                        fill.publish_acquired_ciphertext(copy)?;
                     }
                     let _ = flights.publish_acquired(leader, result);
                 }
@@ -1808,11 +2077,11 @@ impl Fill {
                 }
             }
             let _ = send.send(owned_budget);
-            Ok(())
+            Ok::<(), Error>(())
         }));
         let remaining = std::future::poll_fn(|cx| {
-            uring_runtime::drivers::poll(cx, 64);
-            if !self.fence_acquisition || !acquisition.scope.cancellation.is_cancelled() {
+            self.dependencies.candidates.drivers().poll(cx, 64);
+            if !self.fence_acquisition || !acquisition.scope.cancellation.is_canceled() {
                 acquisition.cancellation.register(cx.waker());
             }
             if !self.fence_acquisition {
@@ -1842,14 +2111,16 @@ impl Fill {
             return Err(Error::CorruptRecord);
         }
         use crate::admission::ResourceClass;
-        use crate::model::PAGE_BYTES;
         if origin.plaintext.bytes()?.len()
-            != origin.metadata.immutable().page_length(page)? as usize
+            != origin
+                .metadata
+                .immutable()
+                .page_length_in(page, origin.page_size)? as usize
         {
             return Err(Error::CorruptRecord);
         }
         let mode = self.mode(&page.version.object.cache);
-        if mode == racer_control_wire::CacheMode::PassthroughLocal {
+        if mode == racer_wire::control::CacheMode::PassthroughLocal {
             // A local-route bootstrap comes from this node's own origin.
             self.dependencies.candidates.local_authority(
                 membership,
@@ -1878,15 +2149,19 @@ impl Fill {
                 self.reserve_with_reclamation(
                     &page.version.object.cache,
                     ResourceClass::Ciphertext,
-                    PAGE_BYTES as usize + 16,
+                    origin.page_size.get() as usize + 16,
                 )
             })?;
         let (plaintext, ciphertext) = self
             .call(
                 DriverStage::EncryptCall,
-                self.dependencies
-                    .crypto
-                    .encrypt(page.clone(), origin.plaintext, ciphertext, scope),
+                self.dependencies.crypto.encrypt(
+                    page.clone(),
+                    origin.page_size,
+                    origin.plaintext,
+                    ciphertext,
+                    scope,
+                ),
             )
             .await?;
         let result = PageResult {
@@ -1944,7 +2219,7 @@ impl Fill {
                     self.dependencies.memory.ciphertext(page),
                 )?
             {
-                validate_copy(&copy, page)?;
+                validate_copy(&copy, page, self.page_size()?)?;
                 self.metrics.record(Event::MemoryHit, 1);
                 return Ok(Some((copy.metadata, copy.ciphertext)));
             }
@@ -1954,7 +2229,7 @@ impl Fill {
                     self.dependencies.writer.copy_only(page),
                 )?
             {
-                validate_copy(&copy, page)?;
+                validate_copy(&copy, page, self.page_size()?)?;
                 self.metrics.record(Event::MemoryHit, 1);
                 return Ok(Some((copy.metadata, copy.ciphertext)));
             }
@@ -2016,9 +2291,14 @@ impl Fill {
         let mut receive = if let Some(existing) = existing {
             existing
         } else {
-            let permit = uring_runtime::drivers::reserve().map_err(Error::from)?;
+            let permit = self
+                .dependencies
+                .candidates
+                .drivers()
+                .reserve()
+                .map_err(Error::from)?;
             let flight = self.dependencies.flights.reserve_copy_flight(page, scope)?;
-            let owned_scope = RequestScope::new(scope.request, scope.deadline.0)?;
+            let owned_scope = scope.child(scope.request, scope.deadline.0)?;
             let (receive, completion) = self
                 .local_copies
                 .start(page.clone(), Err(Error::Unavailable));
@@ -2058,7 +2338,7 @@ impl Fill {
         std::future::poll_fn(|cx| {
             cancellation.register(cx.waker());
             scope.check()?;
-            uring_runtime::drivers::poll(cx, 64);
+            self.dependencies.candidates.drivers().poll(cx, 64);
             std::pin::Pin::new(&mut receive).poll(cx)
         })
         .await
@@ -2083,7 +2363,7 @@ impl Fill {
         page: &PageId,
         scope: &RequestScope,
         want_plaintext: bool,
-        source_key: Option<&std::cell::Cell<Option<racer_control_wire::KeyId>>>,
+        source_key: Option<&std::cell::Cell<Option<racer_wire::control::KeyId>>>,
     ) -> Result<Option<AcquiredPage>> {
         scope.check()?;
         // Residual copies from before a switch to passthrough are never served.
@@ -2131,7 +2411,7 @@ impl Fill {
             if !want_plaintext && let Some(token) = &token {
                 match self
                     .call(
-                        DriverStage::ChecksumCall,
+                        DriverStage::TagCheckCall,
                         self.validate_disk_copy(&copy, page, token, scope),
                     )
                     .await
@@ -2145,7 +2425,7 @@ impl Fill {
                     Err(error) => return Err(error),
                 }
             }
-            if !want_plaintext && validate_copy(&copy, page).is_ok() {
+            if !want_plaintext && validate_copy(&copy, page, self.page_size()?).is_ok() {
                 self.metrics.record(
                     if token.is_some() {
                         Event::DiskHit
@@ -2228,11 +2508,11 @@ impl Fill {
         token: &crate::store::ReadToken,
         scope: &RequestScope,
     ) -> Result<()> {
-        let result = match validate_copy(copy, page) {
+        let result = match validate_copy(copy, page, self.page_size()?) {
             Ok(()) => {
                 self.dependencies
                     .crypto
-                    .verify_checksum(copy.ciphertext.clone(), scope)
+                    .verify_tag(copy.ciphertext.clone(), scope)
                     .await
             }
             Err(error) => Err(error),
@@ -2256,10 +2536,11 @@ impl Fill {
         budget: &mut AcquisitionBudget,
         want_plaintext: bool,
     ) -> Result<AcquiredPage> {
+        use super::candidates::{AcqInput, AcqIo};
         use racer_core::read::Source;
-        use racer_core::read::walk::{Action, Event as FillEvent};
+        use racer_core::read::acquisition::Terminal;
         let mode = self.mode(&page.version.object.cache);
-        if mode == racer_control_wire::CacheMode::PassthroughLocal {
+        if mode == racer_wire::control::CacheMode::PassthroughLocal {
             return self
                 .acquire_local_origin(
                     page,
@@ -2314,7 +2595,7 @@ impl Fill {
                         .map(AcquiredPage::from)
                 } else {
                     Ok(AcquiredPage::Ciphertext(UnverifiedPage {
-                        copy: response_copy(response.response(), page)?,
+                        copy: response_copy(response.response(), page, self.page_size()?)?,
                         disk_token: None,
                     }))
                 }
@@ -2324,30 +2605,55 @@ impl Fill {
         let mut acquisition =
             policy.acquisition(candidates, &operation, scope, want_plaintext, false);
         let mut acquired = None;
-        let mut event = FillEvent::Start { local_hit: false };
+        acquisition.feed(
+            AcqInput::Start { local_hit: false },
+            budget,
+            scope.clock().now(),
+        )?;
         loop {
-            let action = self
-                .call(
-                    DriverStage::CandidateCompositeCall,
-                    Box::pin(policy.drive(
-                        &mut acquisition,
-                        event,
-                        context,
-                        &operation,
-                        scope,
-                        budget,
-                        &mut |response| peer_page(response, plaintext.take()),
-                        &mut acquired,
-                    )),
-                )
-                .await?;
-            event = match action {
-                Action::Hedge {
+            let input = match acquisition.next()?.split() {
+                Err(Terminal::Report(report)) => {
+                    policy.report(&acquisition, report, &operation, scope, budget);
+                    continue;
+                }
+                Err(Terminal::Done(done)) => {
+                    return match done.result {
+                        Ok(source) => {
+                            match source {
+                                Source::Local => {}
+                                Source::Origin => {
+                                    self.metrics.record(Event::OriginFill, 1);
+                                    if let Some(reason) = acquisition.origin_reason() {
+                                        self.metrics
+                                            .record(crate::telemetry::origin_walk_event(reason), 1);
+                                    }
+                                }
+                                Source::Hedge | Source::Peer => {
+                                    self.metrics.record(Event::PeerHit, 1)
+                                }
+                            }
+                            Ok(acquired.expect("acquired page"))
+                        }
+                        Err(error) => {
+                            let error = acquisition.error(error);
+                            Err(policy.failed(
+                                &mut acquisition,
+                                error,
+                                done.notes,
+                                &operation,
+                                scope,
+                                budget,
+                            ))
+                        }
+                    };
+                }
+                Ok(AcqIo::Hedge {
+                    id,
                     eligible,
                     first,
                     second,
-                } => {
-                    let hedge_start = uring_runtime::environment::now();
+                }) => {
+                    let hedge_start = self.dependencies.flights.clock().now();
                     let (result, end) = self
                         .timed(
                             Event::FillHedgeCount,
@@ -2362,14 +2668,20 @@ impl Fill {
                                     scope,
                                     budget,
                                     &self.dependencies.admission,
+                                    self.page_plaintext_bytes()?,
                                     |response, child| {
                                         Box::pin(async move {
                                             self.metrics.record_duration(
                                                 Event::FillPeerResponseCount,
                                                 Event::FillPeerResponseNs,
                                                 hedge_start,
+                                                self.dependencies.flights.clock().now(),
                                             );
-                                            let copy = response_copy(response.response(), page)?;
+                                            let copy = response_copy(
+                                                response.response(),
+                                                page,
+                                                self.page_size()?,
+                                            )?;
                                             if let Some(existing) = self
                                                 .retained_metadata(&page.version, &child)
                                                 .await?
@@ -2406,12 +2718,16 @@ impl Fill {
                     acquisition.trail.hedge_history_unavailable =
                         !matches!(end, racer_core::read::walk::HedgeEnd::NotStarted);
                     acquired = result.map(AcquiredPage::from);
-                    FillEvent::Hedge(end)
+                    AcqInput::Hedged {
+                        id,
+                        end,
+                        copy: acquired.is_some(),
+                    }
                 }
-                Action::Origin { rank } => {
-                    let authority = policy.authority(&mut acquisition, rank, &operation);
+                Ok(AcqIo::Origin { id, authority }) => {
+                    // The machine funded the attempt before planning the fetch.
+                    let authority = policy.authority(&mut acquisition, authority.rank, &operation);
                     authority.validate(&context.object, page.number)?;
-                    budget.begin_attempt(uring_runtime::environment::now(), scope.deadline.0)?;
                     scope.check()?;
                     // Peer reception owns its ciphertext allocation. Reserve encryption
                     // output only when this candidate actually needs an origin fill.
@@ -2423,7 +2739,7 @@ impl Fill {
                             self.reserve_with_reclamation(
                                 &context.object.cache,
                                 ResourceClass::Ciphertext,
-                                PAGE_BYTES as usize + 16,
+                                self.page_plaintext_bytes()? + 16,
                             )
                         },
                     )?;
@@ -2462,7 +2778,7 @@ impl Fill {
                                     .await?
                                     .into(),
                             );
-                            FillEvent::Origin(Ok(()))
+                            AcqInput::Origin { id, result: Ok(()) }
                         }
                         Err(error) => {
                             if error != Error::VersionUnavailable {
@@ -2473,11 +2789,14 @@ impl Fill {
                                     &error,
                                 );
                             }
-                            FillEvent::Origin(Err(error.try_into()?))
+                            AcqInput::Origin {
+                                id,
+                                result: Err(error.try_into()?),
+                            }
                         }
                     }
                 }
-                Action::Publish(_) => {
+                Ok(AcqIo::Publish { id, .. }) => {
                     let result = acquired.as_ref().expect("acquired page");
                     result.validate_for(page)?;
                     scope.check()?;
@@ -2490,18 +2809,26 @@ impl Fill {
                         )
                         .await?;
                     }
-                    FillEvent::Published(Ok(()))
+                    AcqInput::Published { id, result: Ok(()) }
                 }
-                Action::Done(Ok(source)) => {
-                    match source {
-                        Source::Local => {}
-                        Source::Origin => self.metrics.record(Event::OriginFill, 1),
-                        Source::Hedge | Source::Peer => self.metrics.record(Event::PeerHit, 1),
-                    }
-                    return Ok(acquired.expect("acquired page"));
+                Ok(io) => {
+                    self.call(
+                        DriverStage::CandidateCompositeCall,
+                        policy.perform(
+                            &mut acquisition,
+                            io,
+                            context,
+                            &operation,
+                            scope,
+                            budget,
+                            &mut |response| peer_page(response, plaintext.take()),
+                            &mut acquired,
+                        ),
+                    )
+                    .await
                 }
-                action => unreachable!("the acquisition driver performs {action:?}"),
             };
+            acquisition.feed(input, budget, scope.clock().now())?;
         }
     }
 
@@ -2517,7 +2844,7 @@ impl Fill {
         scope: &RequestScope,
         budget: &mut AcquisitionBudget,
         want_plaintext: bool,
-        mode: racer_control_wire::CacheMode,
+        mode: racer_wire::control::CacheMode,
     ) -> Result<AcquiredPage> {
         let authority = self.dependencies.candidates.local_authority(
             membership,
@@ -2537,14 +2864,14 @@ impl Fill {
                 self.reserve_bootstrap(&context.object.cache)
             })?
         };
-        budget.begin_attempt(uring_runtime::environment::now(), scope.deadline.0)?;
+        budget.begin_attempt(scope.clock().now(), scope.deadline.0)?;
         scope.check()?;
         let ciphertext =
             self.observe_reservation(scope, page, FillAdmissionSite::OriginCiphertext, || {
                 self.reserve_with_reclamation(
                     &context.object.cache,
                     ResourceClass::Ciphertext,
-                    PAGE_BYTES as usize + 16,
+                    self.page_plaintext_bytes()? + 16,
                 )
             })?;
         let origin = self
@@ -2571,20 +2898,27 @@ impl Fill {
         ciphertext: flow_control::Charge<AdmissionPolicy>,
         scope: &RequestScope,
     ) -> Result<PageResult> {
-        use uring_runtime::reactor::IoBuffer;
+        use racer_io::ring::IoBuffer;
         if origin.metadata.version != page.version {
             return Err(Error::CorruptRecord);
         }
-        let expected = origin.metadata.immutable().page_length(page)?;
+        let expected = origin
+            .metadata
+            .immutable()
+            .page_length_in(page, origin.page_size)?;
         if origin.plaintext.bytes()?.len() != expected as usize {
             return Err(Error::CorruptRecord);
         }
         let (plaintext, ciphertext) = self
             .call(
                 DriverStage::EncryptCall,
-                self.dependencies
-                    .crypto
-                    .encrypt(page.clone(), origin.plaintext, ciphertext, scope),
+                self.dependencies.crypto.encrypt(
+                    page.clone(),
+                    origin.page_size,
+                    origin.plaintext,
+                    ciphertext,
+                    scope,
+                ),
             )
             .await?;
         Ok(PageResult {
@@ -2602,11 +2936,12 @@ impl Fill {
         scope: &RequestScope,
     ) -> Result<PageResult> {
         scope.check()?;
-        let copy = response_copy(response.response(), page).inspect_err(|error| {
-            if *error == Error::CorruptRecord {
-                self.metrics.record(Event::CorruptMiss, 1);
-            }
-        })?;
+        let copy =
+            response_copy(response.response(), page, self.page_size()?).inspect_err(|error| {
+                if *error == Error::CorruptRecord {
+                    self.metrics.record(Event::CorruptMiss, 1);
+                }
+            })?;
         let reservation = match reservation {
             Some(reserved) => reserved,
             None => {
@@ -2630,7 +2965,7 @@ impl Fill {
     /// charge for their current capacity.
     fn selected_capacity(&self, ciphertext: &crate::memory::CiphertextPage) -> usize {
         let capacity = ciphertext.inner.capacity();
-        if !ciphertext.is_registered() && Arc::strong_count(&ciphertext.inner) == 1 {
+        if !ciphertext.is_registered() && ciphertext.exclusive() {
             return capacity;
         }
         self.dependencies
@@ -2639,13 +2974,66 @@ impl Fill {
             .map_or(capacity, |aligned| aligned.max(capacity))
     }
 
-    /// Copy an authenticated registered RDMA page once into pooled aligned
-    /// storage before it is published and persisted, so the memory cache and
-    /// the store share one page and the RDMA buffer returns to its pool.
-    ///
-    /// Copy-out admission is optional: when it is refused even after
-    /// reclamation, the registered page is kept and the memory cache and
-    /// store copy it out under their own admission as before.
+    /// Publish an elected acquisition's ciphertext to the memory cache. A
+    /// host-read sealed fetch skips a registered page: publishing copies it
+    /// out of the RDMA buffer, which would leave the sink's fused pass
+    /// nothing to do and read the page twice. Its verdict publishes the
+    /// detached copy instead ([`Self::sealed_verdict`]).
+    pub(super) fn publish_acquired_ciphertext(&self, copy: &UnverifiedPage) -> Result<()> {
+        if self.defer_registered_publish
+            && copy.copy.ciphertext.is_registered()
+            && copy.copy.ciphertext.retained_copy().is_none()
+        {
+            return Ok(());
+        }
+        match self.dependencies.memory.publish_ciphertext(copy.clone()) {
+            Ok(()) => Ok(()),
+            Err(error)
+                if racer_core::read::Error::try_from(error)
+                    .is_ok_and(racer_core::read::ciphertext_publish_tolerated) =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Empty aligned storage to detach registered `ciphertext` into during
+    /// its host-read decrypt. None when the page is not registered, already
+    /// has a copy, or the storage cannot be reserved; the reason is counted
+    /// in `racer_host_read_fused_skipped_total`.
+    fn fused_store(
+        &self,
+        ciphertext: &crate::memory::CiphertextPage,
+        node: Option<u16>,
+    ) -> Option<crate::memory::CiphertextBuffer> {
+        if !ciphertext.is_registered() {
+            self.metrics
+                .record(Event::HostReadFusedSkippedNotRegistered, 1);
+            return None;
+        }
+        if ciphertext.retained_copy().is_some() {
+            self.metrics.record(Event::HostReadFusedSkippedRetained, 1);
+            return None;
+        }
+        let buffers = &self.dependencies.buffers;
+        let length = ciphertext.bytes().len();
+        let cache = &ciphertext.envelope().page.version.object.cache;
+        let store = buffers.aligned_capacity(length).ok().and_then(|capacity| {
+            let reservation = self
+                .reserve_with_reclamation(cache, ResourceClass::Ciphertext, capacity)
+                .ok()?;
+            buffers
+                .aligned_ciphertext_on(reservation, length, node)
+                .ok()
+        });
+        if store.is_none() {
+            self.metrics
+                .record(Event::HostReadFusedSkippedReservation, 1);
+        }
+        store
+    }
+
     fn detach_registered(
         &self,
         ciphertext: crate::memory::CiphertextPage,
@@ -2683,21 +3071,31 @@ impl Fill {
         source: DecryptSource,
     ) -> Result<PageResult> {
         // These source counters include structural CorruptRecord rejections in
-        // this helper. They are independent of the exact CRC/AEAD engine counters,
+        // this helper. They are independent of the exact AEAD engine counters,
         // which are reaped even if a waiting fill has been abandoned.
         let result = async {
-            validate_copy(&copy, page)?;
+            validate_copy(&copy, page, self.page_size()?)?;
             // Keep the original immutable ciphertext lease across crypto submission.
             self.metrics.record(Event::PageDecrypt, 1);
+            let length = copy.ciphertext.envelope().plaintext_length as usize;
+            let storage = self
+                .dependencies
+                .buffers
+                .plaintext_storage(reservation, length)?;
+            // Detach before decrypting: the RDMA buffer returns to its pool
+            // sooner, and the crypto helper reads the worker-local copy
+            // instead of the registered buffer on the NIC's NUMA node. Each
+            // registered page is then read from memory once, not twice.
+            let ciphertext = self.detach_registered(copy.ciphertext);
             let plaintext = self
                 .dependencies
                 .crypto
-                .decrypt(copy.ciphertext.clone(), reservation, scope)
+                .decrypt(ciphertext.clone(), storage, scope)
                 .await?;
             let result = PageResult {
                 metadata: copy.metadata,
                 plaintext,
-                ciphertext: self.detach_registered(copy.ciphertext),
+                ciphertext,
             };
             result.validate_for(page)?;
             Ok(result)
@@ -2747,7 +3145,7 @@ impl Fill {
         {
             return;
         }
-        let Ok(permit) = uring_runtime::drivers::reserve() else {
+        let Ok(permit) = self.dependencies.candidates.drivers().reserve() else {
             return;
         };
         let mut fill = self.clone();
@@ -2840,12 +3238,18 @@ impl Fill {
             retention.persistence_attempt(false);
             return;
         }
+        // One sealed page at the published page size. Before a size is
+        // adopted, fall back to the largest page, which only over-reserves.
+        let sealed_page = self
+            .page_plaintext_bytes()
+            .unwrap_or(PAGE_BYTES as usize)
+            .saturating_add(16);
         if !owned
             && !optional_headroom(
                 admission.limit(ResourceClass::DirtyCiphertext),
                 admission.used(ResourceClass::DirtyCiphertext),
                 amount,
-                PAGE_BYTES as usize + 16,
+                sealed_page,
             )
         {
             retention.persistence_attempt(false);
@@ -2861,7 +3265,7 @@ impl Fill {
             .inner
             .reservation()
             .amount()
-            .max(PAGE_BYTES as usize + 16);
+            .max(sealed_page);
         let dirty = self.reserve_owned_persistence(
             id,
             ResourceClass::DirtyCiphertext,
@@ -2917,7 +3321,6 @@ impl Fill {
         if admission.used(class) <= available_used {
             return true;
         }
-        admission.reclaim_buffers();
         let deficit = admission.used(class).saturating_sub(available_used);
         if deficit != 0 {
             // Over-share caches' idle bytes go first. Zero callbacks never
@@ -2930,9 +3333,6 @@ impl Fill {
                 |_, _| 0,
                 |_, _| 0,
             );
-            // Evicted payloads may have returned backing to the recycler rather
-            // than releasing their charges. Drop those idle allocations too.
-            admission.reclaim_buffers();
         }
         optional_headroom(limit, admission.used(class), amount, one_page)
     }
@@ -3056,7 +3456,11 @@ impl Fill {
         Ok(())
     }
 }
-fn response_copy(response: &PeerResponse, page: &PageId) -> Result<crate::memory::CiphertextCopy> {
+fn response_copy(
+    response: &PeerResponse,
+    page: &PageId,
+    size: PageSize,
+) -> Result<crate::memory::CiphertextCopy> {
     match response {
         PeerResponse::Page {
             metadata,
@@ -3071,19 +3475,27 @@ fn response_copy(response: &PeerResponse, page: &PageId) -> Result<crate::memory
                 metadata: metadata.clone(),
                 ciphertext: ciphertext.clone(),
             };
-            validate_copy(&copy, page)?;
+            validate_copy(&copy, page, size)?;
             Ok(copy)
         }
         _ => Err(Error::CorruptRecord),
     }
 }
-pub(super) fn validate_copy(copy: &crate::memory::CiphertextCopy, page: &PageId) -> Result<()> {
+/// Structural checks for a received or retained copy of `page`. A copy cut at
+/// any page size other than the cluster's `size` is corrupt: its plaintext
+/// covers different object bytes than this node's ranges slice at, even though
+/// its tag authenticates.
+pub(super) fn validate_copy(
+    copy: &crate::memory::CiphertextCopy,
+    page: &PageId,
+    size: PageSize,
+) -> Result<()> {
     if &copy.ciphertext.envelope().page != page {
         return Err(Error::CorruptRecord);
     }
     copy.metadata
         .immutable()
-        .validate_page(copy.ciphertext.envelope())
+        .validate_page_in(copy.ciphertext.envelope(), size)
         .map_err(Into::into)
 }
 #[cfg(test)]
@@ -3094,7 +3506,42 @@ mod tests {
     use crate::model::ObjectVersion;
     use crate::model::StrongEtag;
     use crate::model::VersionMetadata;
-    use racer_control_wire::CacheId;
+    use racer_wire::control::CacheId;
+    #[test]
+    fn copies_cut_at_another_page_size_are_corrupt() {
+        use crate::read::range_stream::tests::metadata;
+        use crate::read::range_stream::tests::page_result_sized;
+        let admission = flow_control::Quotas::new(crate::admission::AdmissionPolicy::new(
+            crate::test_support::cluster::config(false).limits,
+        ));
+        let small = PageSize::new(64 << 10).unwrap();
+        let mut metadata = metadata();
+        metadata.length = 2 * PageSize::DEFAULT.get();
+        let full = page_result_sized(&admission, &metadata, 1, PageSize::DEFAULT);
+        let cut = page_result_sized(&admission, &metadata, 1, small);
+        let page = full.ciphertext.envelope().page.clone();
+        // Each copy is accepted only at the size it was cut at.
+        assert_eq!(
+            validate_copy(&full.copy(), &page, PageSize::DEFAULT),
+            Ok(())
+        );
+        assert_eq!(validate_copy(&cut.copy(), &page, small), Ok(()));
+        assert_eq!(
+            validate_copy(&cut.copy(), &page, PageSize::DEFAULT),
+            Err(Error::CorruptRecord)
+        );
+        assert_eq!(
+            validate_copy(&full.copy(), &page, small),
+            Err(Error::CorruptRecord)
+        );
+        // The page identity check still applies.
+        let mut other = page.clone();
+        other.number = crate::model::PageNumber(0);
+        assert_eq!(
+            validate_copy(&full.copy(), &other, PageSize::DEFAULT),
+            Err(Error::CorruptRecord)
+        );
+    }
     #[test]
     fn decrypt_source_counters_preserve_results_and_ignore_non_corruption() {
         let metrics = Metrics::default();
@@ -3112,7 +3559,7 @@ mod tests {
                 &[42]
             );
             for error in [
-                Error::Cancelled,
+                Error::Canceled,
                 Error::MissingKey,
                 Error::Overloaded,
                 Error::Io,

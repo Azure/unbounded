@@ -1,0 +1,174 @@
+# Reusable ClusterRoles for a controller that installs the MachineAllocation
+# controller with pkg/machineops/controller.AddCapacityToManager and
+# CapacityOptions.EnableAllocationController, and for the identity that runs
+# pkg/machineops/controller.AddToManager with a registration that declares
+# capacity. Nothing here is bound: bind each role as described below, and
+# install 06-machine-allocationref-policy.yaml.tmpl and
+# 07-machineallocation-bootstrap-token-policy.yaml.tmpl with them.
+#
+# Each kind listed in CapacityOptions.AllocationConsumerKinds also needs get,
+# list and watch for the allocation controller. The deployer grants those.
+#
+# Bind unbounded-machineallocation-controller with a ClusterRoleBinding. It
+# grants allocate on machines, which lets the controller create Machines with
+# spec.allocationRef. Never grant the controller "*" on machines: that also
+# lifts the limit 07-machineallocation-bootstrap-token-policy.yaml.tmpl puts on
+# its Secret writes.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: unbounded-machineallocation-controller
+  labels:
+    app.kubernetes.io/name: unbounded-machineallocation-controller
+    app.kubernetes.io/component: controller
+rules:
+  - apiGroups:
+      - "unbounded-cloud.io"
+    resources:
+      - "machineallocations"
+    verbs:
+      - "get"
+      - "list"
+      - "watch"
+      - "patch"
+  - apiGroups:
+      - "unbounded-cloud.io"
+    resources:
+      - "machineallocations/status"
+    verbs:
+      - "get"
+      - "update"
+      - "patch"
+  - apiGroups:
+      - "unbounded-cloud.io"
+    resources:
+      - "machineclasses"
+      - "sites"
+      - "machineconfigurationversions"
+    verbs:
+      - "get"
+      - "list"
+      - "watch"
+  - apiGroups:
+      - "unbounded-cloud.io"
+    resources:
+      - "machines"
+    verbs:
+      - "get"
+      - "list"
+      - "watch"
+      - "create"
+      - "patch"
+      - "allocate"
+  - apiGroups:
+      - "unbounded-cloud.io"
+    resources:
+      - "machineoperations"
+    verbs:
+      - "get"
+      - "list"
+      - "watch"
+      - "create"
+      - "patch"
+  - apiGroups:
+      - ""
+    resources:
+      - "nodes"
+    verbs:
+      - "get"
+      - "list"
+      - "watch"
+
+---
+# Bind unbounded-machineallocation-controller-provider-config with a
+# RoleBinding in the provider-config namespace
+# (CapacityOptions.ProviderConfigNamespace) only. Patch adds and removes the
+# finalizer that keeps an input ConfigMap until its allocation's HostAllocate
+# no longer needs it.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: unbounded-machineallocation-controller-provider-config
+  labels:
+    app.kubernetes.io/name: unbounded-machineallocation-controller
+    app.kubernetes.io/component: controller
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - "configmaps"
+    verbs:
+      - "get"
+      - "list"
+      - "watch"
+      - "patch"
+
+---
+# Bind unbounded-machineallocation-controller-bootstrap-tokens with a
+# RoleBinding in kube-system only. The controller creates and revokes one
+# bootstrap token Secret per allocation. RBAC cannot limit create or delete by
+# name or label, so 07-machineallocation-bootstrap-token-policy.yaml.tmpl limits
+# the creates and deletes to bootstrap token Secrets labeled
+# unbounded-cloud.io/allocation-uid.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: unbounded-machineallocation-controller-bootstrap-tokens
+  labels:
+    app.kubernetes.io/name: unbounded-machineallocation-controller
+    app.kubernetes.io/component: controller
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - "secrets"
+    verbs:
+      - "get"
+      - "create"
+      - "delete"
+
+---
+# Bind unbounded-machineallocation-operations with a ClusterRoleBinding to the
+# identity that runs AddToManager with a registration that declares capacity.
+# Also bind unbounded-machineclass-controller-provider-config from
+# 04-machineclass-rbac.yaml.tmpl to it with a RoleBinding in the
+# provider-config namespace, so it can read the inputs HostAllocate needs.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: unbounded-machineallocation-operations
+  labels:
+    app.kubernetes.io/name: unbounded-machineallocation-operations
+    app.kubernetes.io/component: controller
+rules:
+  - apiGroups:
+      - "unbounded-cloud.io"
+    resources:
+      - "machineallocations"
+    verbs:
+      - "get"
+  - apiGroups:
+      - "unbounded-cloud.io"
+    resources:
+      - "sites"
+    verbs:
+      - "get"
+
+---
+# Bind unbounded-machineallocation-operations-bootstrap-tokens with a
+# RoleBinding in kube-system only, to the identity that runs AddToManager. It
+# reads an allocation's bootstrap token to render the HostAllocate user data.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: unbounded-machineallocation-operations-bootstrap-tokens
+  labels:
+    app.kubernetes.io/name: unbounded-machineallocation-operations
+    app.kubernetes.io/component: controller
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - "secrets"
+    verbs:
+      - "get"

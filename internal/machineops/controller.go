@@ -59,6 +59,13 @@ type MachineOperationReconciler struct {
 	KubeClient                  kubernetes.Interface
 	APIServerEndpoint           string
 	CredentialSecretNamespace   string
+
+	// ExperimentalContainerIsolation enables the experimental container
+	// isolation mode for HostReplace: the replacement's agent configuration
+	// opts in (Experimental.ContainerIsolation). When it is not set, a
+	// HostReplace of a Machine that declares container fails before the
+	// provider runs.
+	ExperimentalContainerIsolation bool
 }
 
 // +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machineoperations,verbs=get;list;watch;delete
@@ -140,6 +147,10 @@ func (r *MachineOperationReconciler) Reconcile(ctx context.Context, req ctrl.Req
 			"machine", machine.Name)
 
 		return ctrl.Result{}, nil
+	}
+
+	if reason, message := allocationMachineRejection(op.Spec.OperationKind, &machine); reason != "" {
+		return r.failOperation(ctx, &op, reason, message)
 	}
 
 	if err := validateProviderReference(&machine, providerMatch.provider); err != nil {

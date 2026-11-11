@@ -5,9 +5,7 @@
 // The attribute below also marks this file as test-only for tests/purity.rs.
 #[cfg(test)]
 use super::*;
-use crate::read::budget::{
-    HELPER_ATTEMPTS, HELPER_FLOOR_LINKS, HELPER_LINKS, HELPER_MIN_ATTEMPTS, inherited_budget,
-};
+use crate::read::budget::{HELPER_ATTEMPTS, HELPER_LINKS, HELPER_MIN_ATTEMPTS, inherited_budget};
 use crate::read::{Answering, ReplicaSelection, demote_unanswered, visit_order};
 use std::fmt::Write;
 
@@ -143,6 +141,7 @@ const UNR: Outcome = Outcome::Probe(ProbeOutcome::Unreachable);
 const T_UNR: Outcome = Outcome::Transport(ProbeOutcome::Unreachable);
 const T_OVL: Outcome = Outcome::Transport(ProbeOutcome::Overloaded);
 const SHED: Outcome = Outcome::Shed;
+const FETCHING: Outcome = Outcome::Fetching;
 const TIMEOUT: Outcome = Outcome::TimedOut;
 const FAILED: Outcome = Outcome::Failed;
 const STALE: Outcome = Outcome::StaleMembership;
@@ -273,13 +272,14 @@ fn walks() {
         ("previous behind", with(owner(2), &|c| c.previous = 0b11), budget(8, 32), nothing, &[BEHIND, MISS], "0A3Fp:2/4/4 1C2Sp:8/32/4 => Origin { rank: 2, evidence: [Unreachable, CopyMiss] } 8/32/4"),
         // An owner that sheds the reader sends it to its helper once, funded from what is left,
         // with the helper's full funded envelope; a helper miss falls back to the other owners.
-        ("helper copy", helper(canonical), budget(8, 16), nothing, &[SHED, SHED, SHED, COPY], "0A3S:8/16/4 3A3Fh:4/8/8 => Copy 8/16/8"),
-        ("helper, floor links", helper(canonical), budget(8, HELPER_FLOOR_LINKS), nothing, &[SHED, SHED, SHED, COPY], "0A3S:8/4/4 3A3Fh:4/4/4 => Copy 8/4/4"),
-        ("helper, helper links", helper(canonical), budget(8, HELPER_LINKS), nothing, &[SHED, SHED, SHED, COPY], "0A3S:8/8/4 3A3Fh:4/8/8 => Copy 8/8/8"),
-        ("helper miss", helper(canonical), budget(32, 64), nothing, &[SHED], "0A3S:32/64/4 3A3Fh:4/8/8 1A2S:32/64/8 2A1S:32/64/8 => Exhausted { funding: false } 32/64/8"),
-        // Only a destination's own shed asks the helper.
-        ("relay overload, no helper", helper(canonical), budget(32, 64), nothing, &[OVL], "0A3S:32/64/4 1A2S:32/64/8 2A1S:32/64/8 => Exhausted { funding: false } 32/64/8"),
-        ("transport overload, no helper", helper(canonical), budget(32, 64), nothing, &[T_OVL], "0A3S:32/64/4 1A2S:32/64/8 2A1S:32/64/8 => Exhausted { funding: false } 32/64/8"),
+        ("helper copy", helper(canonical), budget(8, 16), nothing, &[SHED, SHED, SHED, COPY], "0A3S:8/16/4 3A3Fh:4/8/8 => Copy 8/16/4"),
+        ("helper, few links", helper(canonical), budget(8, 4), nothing, &[SHED, SHED, SHED, COPY], "0A3S:8/4/4 3A3Fh:4/8/8 => Copy 8/4/4"),
+        ("helper, helper links", helper(canonical), budget(8, HELPER_LINKS), nothing, &[SHED, SHED, SHED, COPY], "0A3S:8/8/4 3A3Fh:4/8/8 => Copy 8/8/4"),
+        ("helper miss", helper(canonical), budget(32, 64), nothing, &[SHED], "0A3S:32/64/4 3A3Fh:4/8/8 1A2S:32/64/4 2A1S:32/64/4 => Exhausted { funding: false } 32/64/4"),
+        // A destination's own shed, a relay's `Overloaded` and an unsigned overload (a holder
+        // that shed the request before verifying it) ask the helper; unreachable does not.
+        ("relay overload, helper", helper(canonical), budget(32, 64), nothing, &[OVL], "0A3S:32/64/4 3A3Fh:4/8/8 1A2S:32/64/8 2A1S:32/64/8 => Exhausted { funding: false } 32/64/8"),
+        ("transport overload, helper", helper(canonical), budget(32, 64), nothing, &[T_OVL], "0A3S:32/64/4 3A3Fh:4/8/8 1A2S:32/64/8 2A1S:32/64/8 => Exhausted { funding: false } 32/64/8"),
         ("unreachable, no helper", helper(canonical), budget(32, 64), nothing, &[T_UNR], "0A3S:32/64/4 1A2S:32/64/8 2A1S:32/64/8 => Exhausted { funding: false } 32/64/8"),
         ("miss, no helper", helper(canonical), budget(32, 64), nothing, &[MISS], "0A3S:32/64/4 1A2S:32/64/4 2A1S:32/64/4 => Exhausted { funding: false } 32/64/4"),
         // Without overflow the helper changes nothing (same trace with and without).
@@ -289,10 +289,11 @@ fn walks() {
         ("first 1", first(1), budget(8, 16), nothing, &[MISS], "1A3F:4/8/8 0A2S:8/16/8 2A1S:8/16/8 => Exhausted { funding: false } 8/16/8"),
         ("first 2, helper", helper(first(2).order), budget(8, 16), nothing, &[MISS], "2A3F:5/8/8 0A2S:8/16/8 1A1S:8/16/8 => Exhausted { funding: false } 8/16/8"),
         ("first 2", first(2), budget(8, 16), nothing, &[MISS], "2A3F:5/8/8 0A2S:8/16/8 1A1S:8/16/8 => Exhausted { funding: false } 8/16/8"),
-        // A helper never chains; owners never use helpers; too little left skips it.
+        // A helper never chains; owners never use helpers; a walk starting below
+        // `HELPER_MIN_ATTEMPTS` never asks one, and one that does spends the helper's own grant.
         ("helper budget", helper(canonical), budget(HELPER_ATTEMPTS, 8), nothing, &[SHED], "0A3S:4/8/4 1A2S:4/8/4 2A1S:4/8/4 => Exhausted { funding: false } 4/8/4"),
         ("owner ignores helper", with(owner(2), &|c| c.helper = true), budget(8, 16), nothing, &[SHED], "0A3F:2/4/4 1C2S:8/16/4 => Origin { rank: 2, evidence: [Overloaded, Overloaded] } 8/16/4"),
-        ("helper unaffordable", helper(first(2).order), budget(HELPER_MIN_ATTEMPTS + 1, 16), Spend::Transfer, &[SHED], "2A3F:5/8/8 0C2S:1/8/8 1A1S:0/0/0 => Exhausted { funding: false } 0/0/0"),
+        ("helper on its own grant", helper(first(2).order), budget(HELPER_MIN_ATTEMPTS + 1, 16), Spend::Transfer, &[SHED], "2A3F:5/8/8 3A3Fh:4/8/8 0C2S:1/8/8 1A1S:0/0/0 => Exhausted { funding: false } 0/0/0"),
         // A small budget visits rank 0 first instead of failing to fund rank 2.
         ("small budget", first(2), budget(HELPER_ATTEMPTS - 1, 7), nothing, &[COPY, MISS], "0A3S:3/7/4 => Copy 3/7/4"),
         // A hedge reports only `Overloaded`, never a destination shed.
@@ -308,6 +309,14 @@ fn walks() {
         ("rank 0 overloaded", owner(1), budget(8, 32), nothing, &[OVL], "0A2F:2/4/4 => Exhausted { funding: false } 8/32/8 r0"),
         ("rank 0 miss", owner(1), budget(8, 32), nothing, &[MISS], "0A2F:2/4/4 => Origin { rank: 1, evidence: [CopyMiss] } 8/32/4"),
         ("rank 0 shed", owner(1), budget(8, 32), nothing, &[SHED], "0A2F:2/4/4 => Origin { rank: 1, evidence: [Overloaded] } 8/32/4"),
+        // Rank 0's flight is full: proof it is fetching, so origin is left to it in every watch
+        // state; a later predecessor's copy still wins, and other owners' full flights are a shed.
+        ("rank 0 fetching", owner(1), budget(8, 32), nothing, &[FETCHING], "0A2F:2/4/4 => Exhausted { funding: false } 8/32/4 r0"),
+        ("rank 0 fetching, overdue", rank0(1, Rank0State::Overdue), budget(8, 32), nothing, &[FETCHING], "0A2F:2/4/4 => Exhausted { funding: false } 8/32/4 r0"),
+        ("rank 0 fetching, failed", rank0(1, Rank0State::Failed), budget(8, 32), nothing, &[FETCHING], "0A2F:2/4/4 => Exhausted { funding: false } 8/32/4 r0"),
+        ("rank 0 fetching, copy", owner(2), budget(8, 32), nothing, &[FETCHING, COPY], "0A3F:2/4/4 1C2S:8/32/4 => Copy 8/32/4 r0"),
+        ("rank 1 fetching", owner(2), budget(8, 32), nothing, &[MISS, FETCHING], "0A3F:2/4/4 1C2S:8/32/4 => Origin { rank: 2, evidence: [CopyMiss, Overloaded] } 8/32/4"),
+        ("reader, rank 0 fetching", reader(3), budget(8, 32), nothing, &[FETCHING], "0A3S:8/32/4 1A2S:8/32/4 2A1S:8/32/4 => Exhausted { funding: false } 8/32/4"),
         ("rank 1 silent", owner(2), budget(8, 32), nothing, &[MISS, TIMEOUT], "0A3F:2/4/4 1C2S:8/32/4 => Origin { rank: 2, evidence: [CopyMiss, Unreachable] } 8/32/8"),
         ("metadata silent", with(owner(1), &|c| c.page_operation = false), budget(8, 32), nothing, &[TIMEOUT], "0C2S:8/32/4 => Origin { rank: 1, evidence: [Unreachable] } 8/32/8"),
         ("handoff silent", with(owner(0), &|c| c.handoff = 1), budget(8, 32), nothing, &[TIMEOUT], "3C2Sh:8/32/4 => Origin { rank: 0, evidence: [] } 8/32/8"),
@@ -593,14 +602,22 @@ fn pure_rules() {
         assert_eq!((b.remaining_attempts(), b.remaining_links()), expected);
     }
     assert!(hedge_fallback(Error::CorruptRecord));
-    assert!(!hedge_fallback(Error::Unauthorized));
-    assert!(!hedge_fallback(Error::Cancelled));
+    // A hedge whose peer answer failed verification falls back to the serial walk.
+    assert!(hedge_fallback(Error::Unauthorized));
+    assert!(!hedge_fallback(Error::Canceled));
     // A local hop budget shortfall is evidence, not terminal.
     for (error, outcome) in [
         (Error::Os(1), Some(ProbeOutcome::Unreachable)),
         (Error::Overloaded, Some(ProbeOutcome::Overloaded)),
-        (Error::Unauthorized, None),
+        (Error::Unauthorized, Some(ProbeOutcome::UnusableCopy)),
+        (Error::Internal, Some(ProbeOutcome::UnusableCopy)),
+        (Error::CorruptRecord, Some(ProbeOutcome::UnusableCopy)),
+        (Error::MissingKey, Some(ProbeOutcome::UnusableCopy)),
+        (Error::InvalidRequest, Some(ProbeOutcome::UnusableCopy)),
         (Error::DeadlineExceeded, None),
+        (Error::Canceled, None),
+        (Error::OriginRejected, None),
+        (Error::OriginForbidden, None),
         (Error::HopBudgetExhausted, Some(ProbeOutcome::Unreachable)),
     ] {
         assert_eq!(transport_outcome(error), outcome);
@@ -1439,14 +1456,17 @@ fn fills() {
         ("remaining copy", false, production, remaining(UNAVAILABLE, &[answer(ResponseKind::Page), Event::Validated(Ok(None)), Event::Published(Ok(()))]), "Rank { ranking: Current, version: None }\nRank { ranking: Previous, version: Some(4) }\nHints\nProbe(Probe { index: 0, canonical: 0, mode: Acquire, remaining_opportunities: 2, route: FundedRoute, previous: false })\nRank { ranking: Authority, version: Some(5) } outcome=Ok(Transport(Unreachable)) rank0_probe\nOrigin { rank: 1 }\nProbe(Probe { index: 2, canonical: 2, mode: CopyOnly, remaining_opportunities: 1, route: SharedRoute, previous: false }) notes=0x1000\nValidate silence=Answered\nPublish(Peer) outcome=Ok(Copy)\nDone(Ok(Peer))\nv5 waits=0 handoff=[]"),
         ("remaining miss", false, production, remaining(UNAVAILABLE, &[answer(ResponseKind::Miss)]), "Rank { ranking: Current, version: None }\nRank { ranking: Previous, version: Some(4) }\nHints\nProbe(Probe { index: 0, canonical: 0, mode: Acquire, remaining_opportunities: 2, route: FundedRoute, previous: false })\nRank { ranking: Authority, version: Some(5) } outcome=Ok(Transport(Unreachable)) rank0_probe\nOrigin { rank: 1 }\nProbe(Probe { index: 2, canonical: 2, mode: CopyOnly, remaining_opportunities: 1, route: SharedRoute, previous: false }) notes=0x1000\nDone(Err(Unavailable)) outcome=Ok(Probe(CopyMiss)) silence=Answered\nv5 waits=0 handoff=[]"),
         ("remaining unreachable", false, production, remaining(UNAVAILABLE, &[UNAVAILABLE]), "Rank { ranking: Current, version: None }\nRank { ranking: Previous, version: Some(4) }\nHints\nProbe(Probe { index: 0, canonical: 0, mode: Acquire, remaining_opportunities: 2, route: FundedRoute, previous: false })\nRank { ranking: Authority, version: Some(5) } outcome=Ok(Transport(Unreachable)) rank0_probe\nOrigin { rank: 1 }\nProbe(Probe { index: 2, canonical: 2, mode: CopyOnly, remaining_opportunities: 1, route: SharedRoute, previous: false }) notes=0x1000\nDone(Err(Unavailable)) outcome=Ok(Transport(Unreachable))\nv5 waits=0 handoff=[]"),
-        ("remaining aborted", false, production, remaining(UNAVAILABLE, &[Event::Abort(Error::Cancelled)]), "Rank { ranking: Current, version: None }\nRank { ranking: Previous, version: Some(4) }\nHints\nProbe(Probe { index: 0, canonical: 0, mode: Acquire, remaining_opportunities: 2, route: FundedRoute, previous: false })\nRank { ranking: Authority, version: Some(5) } outcome=Ok(Transport(Unreachable)) rank0_probe\nOrigin { rank: 1 }\nProbe(Probe { index: 2, canonical: 2, mode: CopyOnly, remaining_opportunities: 1, route: SharedRoute, previous: false }) notes=0x1000\nDone(Err(Cancelled))\nv5 waits=0 handoff=[]"),
+        ("remaining aborted", false, production, remaining(UNAVAILABLE, &[Event::Abort(Error::Canceled)]), "Rank { ranking: Current, version: None }\nRank { ranking: Previous, version: Some(4) }\nHints\nProbe(Probe { index: 0, canonical: 0, mode: Acquire, remaining_opportunities: 2, route: FundedRoute, previous: false })\nRank { ranking: Authority, version: Some(5) } outcome=Ok(Transport(Unreachable)) rank0_probe\nOrigin { rank: 1 }\nProbe(Probe { index: 2, canonical: 2, mode: CopyOnly, remaining_opportunities: 1, route: SharedRoute, previous: false }) notes=0x1000\nDone(Err(Canceled))\nv5 waits=0 handoff=[]"),
         ("version unavailable", false, production, remaining(answer(ResponseKind::Miss), &[answer(ResponseKind::Miss)]), "Rank { ranking: Current, version: None }\nRank { ranking: Previous, version: Some(4) }\nHints\nProbe(Probe { index: 0, canonical: 0, mode: Acquire, remaining_opportunities: 2, route: FundedRoute, previous: false })\nRank { ranking: Authority, version: Some(5) } outcome=Ok(Probe(CopyMiss)) silence=Answered rank0=Answered rank0_probe\nOrigin { rank: 1 }\nProbe(Probe { index: 2, canonical: 2, mode: CopyOnly, remaining_opportunities: 1, route: SharedRoute, previous: false }) notes=0x1000\nDone(Err(VersionUnavailable)) outcome=Ok(Probe(CopyMiss)) silence=Answered\nv5 waits=0 handoff=[]"),
         // A stale answer to the remaining-copy walk is terminal.
         ("remaining stale", false, production, origin(&[Event::Origin(Err(Error::VersionUnavailable)), answer(ResponseKind::StaleMembership)]), "Rank { ranking: Current, version: None }\nRank { ranking: Previous, version: Some(4) }\nHints\nRank { ranking: Authority, version: Some(5) }\nOrigin { rank: 0 }\nProbe(Probe { index: 1, canonical: 1, mode: CopyOnly, remaining_opportunities: 2, route: SharedRoute, previous: false }) notes=0x1000\nDone(Err(IncompatibleMembership)) outcome=Err(IncompatibleMembership) silence=Answered\nv5 waits=0 handoff=[]"),
         // Every owner of a reader unreachable: exhausted. An empty ranking; a terminal error.
         ("exhausted", false, production, reader(&[Event::Reply(Reply::Failed { error: Error::Io, sent: true, scope_live: true }), Event::Reply(Reply::Failed { error: Error::Io, sent: true, scope_live: true }), Event::Reply(Reply::Failed { error: Error::Io, sent: true, scope_live: true })]), "Rank { ranking: Current, version: None }\nProbe(Probe { index: 0, canonical: 0, mode: Acquire, remaining_opportunities: 3, route: SharedRoute, previous: false })\nProbe(Probe { index: 1, canonical: 1, mode: Acquire, remaining_opportunities: 2, route: SharedRoute, previous: false }) outcome=Ok(Transport(Unreachable))\nProbe(Probe { index: 2, canonical: 2, mode: Acquire, remaining_opportunities: 1, route: SharedRoute, previous: false }) outcome=Ok(Transport(Unreachable))\nDone(Err(Unavailable)) outcome=Ok(Transport(Unreachable)) notes=0x200\nv5 waits=0 handoff=[]"),
         ("empty ranking", false, production, vec![START, Event::Ranked(Ok(Ranked::new(5, &[], None)))], "Rank { ranking: Current, version: None }\nDone(Err(Unavailable))\nv0 waits=0 handoff=[]"),
-        ("terminal", false, production, reader(&[Event::Reply(Reply::Failed { error: Error::Unauthorized, sent: true, scope_live: true })]), "Rank { ranking: Current, version: None }\nProbe(Probe { index: 0, canonical: 0, mode: Acquire, remaining_opportunities: 3, route: SharedRoute, previous: false })\nDone(Err(Unauthorized)) outcome=Err(Unauthorized)\nv5 waits=0 handoff=[]"),
+        // The caller's scope ending is terminal (a failed verification used to be, too; it now
+        // moves to the next owner).
+        ("terminal", false, production, reader(&[Event::Reply(Reply::Failed { error: Error::Canceled, sent: true, scope_live: true })]), "Rank { ranking: Current, version: None }\nProbe(Probe { index: 0, canonical: 0, mode: Acquire, remaining_opportunities: 3, route: SharedRoute, previous: false })\nDone(Err(Canceled)) outcome=Err(Canceled)\nv5 waits=0 handoff=[]"),
+        ("unverified answer", false, production, reader(&[Event::Reply(Reply::Failed { error: Error::Unauthorized, sent: true, scope_live: true })]), "Rank { ranking: Current, version: None }\nProbe(Probe { index: 0, canonical: 0, mode: Acquire, remaining_opportunities: 3, route: SharedRoute, previous: false })\nProbe(Probe { index: 1, canonical: 1, mode: Acquire, remaining_opportunities: 2, route: SharedRoute, previous: false }) outcome=Ok(Transport(UnusableCopy))\nv5 waits=0 handoff=[]"),
         // A stale reader refreshes to a newer membership; behind and a recent member of version
         // - 1 it walks there; owning the page there it waits instead; not a member it waits, and
         // without waits it skips.
@@ -1543,7 +1563,7 @@ fn fill_rank0_asks_previous_owners_on_grants() {
     assert!(trace.contains("Rank { ranking: Authority"), "{trace}");
 }
 
-/// Repeated relay overloads on rank 1's route to rank 0 feed the rank 0 watch like timeouts:
+/// Repeated relay overloads on rank 1's route to rank 0 feed the page's rank 0 watch entry:
 /// origin is withheld while rank 0 may be fetching, then used once the watch says `Overdue`.
 #[test]
 fn rank0_route_overloads_advance_the_watch_to_origin() {
@@ -1598,13 +1618,350 @@ fn rank0_route_overloads_advance_the_watch_to_origin() {
         );
         assert_eq!(
             note,
-            Some(Rank0Note::TimedOut),
+            Some(Rank0Note::Busy),
             "overload fed no note at step {step}"
         );
-        watch.timed_out(page, rank0, now, now);
+        watch.busy(page, rank0, now, now);
+        // Load on this page never marks rank 0 overdue for its other pages.
+        assert_ne!(watch.state(&(page + 1), &rank0, now), Rank0State::Overdue);
     }
     assert!(
         origin_at.is_some_and(|s| s > 0),
         "origin never used: {origin_at:?}"
+    );
+}
+
+/// A page refused only for load keeps waiting on a rank 0 that still answers other probes: the
+/// watch never turns `Overdue`, so the owner never asks origin for a page rank 0 can serve.
+#[test]
+fn rank0_overloads_never_reach_origin_while_rank0_answers() {
+    use crate::liveness::{Rank0Watch, WATCH_TTL};
+    const HANG: Duration = Duration::from_secs(10);
+    let mut watch = Rank0Watch::new(8, WATCH_TTL, HANG);
+    let (page, rank0) = (7u32, 10u32);
+    let start = Instant::now();
+    for step in 0..20u32 {
+        let now = start + Duration::from_secs(4) * step;
+        // Rank 0 serves this node's other pages.
+        watch.alive(rank0, now);
+        let state = watch.state(&page, &rank0, now);
+        assert_ne!(state, Rank0State::Overdue, "overdue at step {step}");
+        let mut f = fill(false, Features::PRODUCTION);
+        let mut b = budget(8, 32);
+        for event in [
+            START,
+            Event::Ranked(Ok(owners(5, Some(1)))),
+            Event::Ranked(Err(Error::Unavailable)),
+            Event::Hints {
+                hints: &[],
+                rank0: state,
+            },
+            Event::Reply(Reply::Answer {
+                kind: ResponseKind::Overloaded,
+                signed: false,
+            }),
+            Event::Ranked(Ok(owners(5, Some(1)))),
+        ] {
+            let (action, _) = f.on(event, &mut b, now);
+            assert!(
+                !matches!(action, Action::Origin { .. }),
+                "origin at step {step}"
+            );
+            if matches!(action, Action::Done(_)) {
+                assert_eq!(action, Action::Done(Err(Error::Overloaded)));
+                break;
+            }
+        }
+        assert_eq!(f.origin_reason, None);
+        watch.busy(page, rank0, now, now);
+    }
+    // Once rank 0 stops answering, the same load reaches origin, labeled overdue.
+    let now = start + Duration::from_secs(200);
+    watch.busy(page, rank0, now, now);
+    let now = now + HANG + Duration::from_secs(1);
+    let state = watch.state(&page, &rank0, now);
+    assert_eq!(state, Rank0State::Overdue);
+    let mut f = fill(false, Features::PRODUCTION);
+    let mut b = budget(8, 32);
+    let mut origin = false;
+    for event in [
+        START,
+        Event::Ranked(Ok(owners(5, Some(1)))),
+        Event::Ranked(Err(Error::Unavailable)),
+        Event::Hints {
+            hints: &[],
+            rank0: state,
+        },
+        Event::Reply(Reply::Answer {
+            kind: ResponseKind::Overloaded,
+            signed: false,
+        }),
+        Event::Ranked(Ok(owners(5, Some(1)))),
+    ] {
+        let (action, _) = f.on(event, &mut b, now);
+        origin |= matches!(action, Action::Origin { .. });
+    }
+    assert!(origin);
+    assert_eq!(f.origin_reason, Some(OriginReason::Rank0Overdue));
+}
+
+/// Every walk that ends at origin says what its probe of rank 0 showed.
+#[test]
+fn origin_walks_report_why_they_had_authority() {
+    let rank0 = |rank, state| WalkConfig {
+        rank0: state,
+        ..owner(rank)
+    };
+    let cases: [(WalkConfig, &[Outcome], Option<OriginReason>); 13] = [
+        (owner(0), &[], Some(OriginReason::Rank0Self)),
+        (owner(1), &[MISS], Some(OriginReason::Rank0Miss)),
+        (
+            owner(1),
+            &[Outcome::Probe(ProbeOutcome::UnusableCopy)],
+            Some(OriginReason::Rank0Unusable),
+        ),
+        (owner(1), &[SHED], Some(OriginReason::Rank0Shed)),
+        (owner(1), &[T_UNR], Some(OriginReason::Rank0Unreachable)),
+        (owner(1), &[UNR], Some(OriginReason::Rank0Unreachable)),
+        (owner(1), &[BEHIND], Some(OriginReason::Rank0Stale)),
+        (
+            rank0(1, Rank0State::Overdue),
+            &[TIMEOUT],
+            Some(OriginReason::Rank0Overdue),
+        ),
+        (
+            rank0(1, Rank0State::Overdue),
+            &[T_OVL],
+            Some(OriginReason::Rank0Overdue),
+        ),
+        (
+            rank0(1, Rank0State::Overdue),
+            &[FAILED],
+            Some(OriginReason::Rank0Failed),
+        ),
+        // Withheld: rank 0 is busy or silent within its interval; a delegated version miss ends
+        // the walk without origin.
+        (owner(1), &[VU], None),
+        (owner(1), &[OVL], None),
+        (owner(1), &[TIMEOUT], None),
+    ];
+    for (cfg, script, expected) in cases {
+        let mut walk = CandidateWalk::new(cfg);
+        let mut b = budget(8, 32);
+        let mut outcomes = script.iter().copied();
+        let (_, end) = drive(&mut walk, &mut b, |_, _| outcomes.next().unwrap_or(MISS));
+        let reason = matches!(end, End::Origin { .. }).then(|| walk.origin_reason());
+        assert_eq!(reason, expected, "{script:?} => {end:?}");
+    }
+    // A rank 2 owner reports rank 0's answer, not a later predecessor's.
+    let mut walk = CandidateWalk::new(owner(2));
+    let mut b = budget(8, 32);
+    let mut outcomes = [SHED, MISS].into_iter();
+    let (_, end) = drive(&mut walk, &mut b, |_, _| outcomes.next().unwrap());
+    assert!(matches!(end, End::Origin { rank: 2, .. }), "{end:?}");
+    assert_eq!(walk.origin_reason(), OriginReason::Rank0Shed);
+    // Labels are distinct.
+    let labels: std::collections::HashSet<_> = [
+        OriginReason::Rank0Self,
+        OriginReason::Rank0Miss,
+        OriginReason::Rank0Overdue,
+        OriginReason::Rank0Failed,
+        OriginReason::Rank0Shed,
+        OriginReason::Rank0Unreachable,
+        OriginReason::Rank0Unusable,
+        OriginReason::Rank0Stale,
+        OriginReason::Rank0NotAsked,
+    ]
+    .iter()
+    .map(|r| r.label())
+    .collect();
+    assert_eq!(labels.len(), 9);
+}
+
+/// An unsigned `Overloaded` (a relay's, or a holder's that shed the request before verifying
+/// it) asks the overflow helper next, as a signed shed does: the owner is behind a busy hop, and
+/// the helper is the way around it. A signed `Unavailable` does not.
+#[test]
+fn an_unsigned_overload_asks_the_helper_next() {
+    use crate::read::{PAGE_ATTEMPTS, PAGE_LINKS};
+    for (first, helper) in [
+        (SHED, true),
+        (OVL, true),
+        (T_OVL, true),
+        (UNR, false),
+        (MISS, false),
+    ] {
+        let mut walk = CandidateWalk::new(WalkConfig {
+            helper: true,
+            ..reader(3)
+        });
+        let mut b = budget(PAGE_ATTEMPTS, PAGE_LINKS);
+        let mut probed = Vec::new();
+        while let Ok(Step::Probe(probe)) = walk.next(&mut b) {
+            let deadline = b.deadline();
+            let request = walk.request_budget(&mut b);
+            plan(request, deadline, &probe).unwrap();
+            probed.push(probe.canonical);
+            let outcome = if probe.canonical == 0 { first } else { MISS };
+            if walk.complete(&mut b, outcome).unwrap().is_some() || probed.len() == 2 {
+                break;
+            }
+        }
+        assert_eq!(probed[0], 0, "{first:?}");
+        assert_eq!(probed.get(1) == Some(&3), helper, "{first:?} {probed:?}");
+    }
+}
+
+/// A page read whose rank 0 sheds it asks its overflow helper on the helper's own grant: a helper
+/// failing at once (often a reader failing the same way) still leaves every remaining owner
+/// probed, never ending `HopBudgetExhausted` or `Unavailable` before them.
+#[test]
+fn a_failed_helper_detour_leaves_every_remaining_owner_funded() {
+    use crate::read::{PAGE_ATTEMPTS, PAGE_LINKS};
+    for helper_outcome in [FAILED, UNR, T_UNR, OVL, T_OVL, TIMEOUT, MISS, SHED] {
+        let mut walk = CandidateWalk::new(WalkConfig {
+            helper: true,
+            ..reader(3)
+        });
+        let mut b = budget(PAGE_ATTEMPTS, PAGE_LINKS);
+        let mut probed = Vec::new();
+        let end = loop {
+            let probe = match walk.next(&mut b) {
+                Ok(Step::Probe(probe)) => probe,
+                Ok(Step::End(end)) => break Ok(end),
+                Ok(Step::Granted(_)) => panic!("no granted probes"),
+                Err(e) => break Err(e),
+            };
+            let deadline = b.deadline();
+            let request = walk.request_budget(&mut b);
+            if let Err(e) = plan(request, deadline, &probe) {
+                break Err(e);
+            }
+            probed.push(probe.canonical);
+            let outcome = match probe.canonical {
+                0 => SHED,
+                3 => helper_outcome,
+                _ => MISS,
+            };
+            if let Some(end) = walk.complete(&mut b, outcome).unwrap() {
+                break Ok(end);
+            }
+        };
+        assert_eq!(probed, [0, 3, 1, 2], "{helper_outcome:?} {end:?}");
+        assert_eq!(
+            end,
+            Ok(End::Exhausted { funding: false }),
+            "{helper_outcome:?}"
+        );
+    }
+}
+
+/// Drive a reader fill over owners 10, 11, 12, answering every probe with
+/// `replies` in turn (the last repeats), until it is done.
+fn reader_done(replies: &[Event<'static>]) -> Action {
+    let mut f = fill(false, Features::PRODUCTION);
+    let mut b = budget(64, 64);
+    let mut action = f.on(START, &mut b, Instant::now()).0;
+    action = match action {
+        Action::Rank { .. } => {
+            f.on(Event::Ranked(Ok(owners(5, None))), &mut b, Instant::now())
+                .0
+        }
+        other => other,
+    };
+    for i in 0..32 {
+        match action {
+            Action::Done(_) => return action,
+            Action::Probe(_) => {}
+            other => panic!("unexpected {other:?}"),
+        }
+        let reply = replies[i.min(replies.len() - 1)];
+        action = f.on(reply, &mut b, Instant::now()).0;
+    }
+    panic!("fill never finished");
+}
+
+const LOCAL_BUSY: Event<'static> = Event::Reply(Reply::Failed {
+    error: Error::Overloaded,
+    sent: false,
+    scope_live: true,
+});
+
+#[test]
+fn local_admission_saturation_is_overloaded_not_unavailable() {
+    // Every owner refused by this node's own peer admission: busy, retryable.
+    assert_eq!(
+        format!("{:?}", reader_done(&[LOCAL_BUSY])),
+        format!("{:?}", Action::Done(Err(Error::Overloaded)))
+    );
+    // An exchange that failed `Overloaded` after it went out (receive memory, a
+    // refusing route) is load too, alone or mixed with local refusals.
+    let sent_busy = Event::Reply(Reply::Failed {
+        error: Error::Overloaded,
+        sent: true,
+        scope_live: true,
+    });
+    assert_eq!(
+        format!("{:?}", reader_done(&[sent_busy, LOCAL_BUSY])),
+        format!("{:?}", Action::Done(Err(Error::Overloaded)))
+    );
+}
+
+#[test]
+fn owners_that_only_shed_are_overloaded_not_unavailable() {
+    let shed = answer(ResponseKind::Overloaded);
+    let relay = Event::Reply(Reply::Answer {
+        kind: ResponseKind::Overloaded,
+        signed: false,
+    });
+    let full = answer(ResponseKind::FlightFull);
+    // Every owner shed or had a full flight, or a relay refused for load, mixed with local
+    // refusals: busy.
+    for replies in [
+        &[shed][..],
+        &[relay],
+        &[full],
+        &[shed, LOCAL_BUSY, relay, full],
+    ] {
+        assert_eq!(
+            format!("{:?}", reader_done(replies)),
+            format!("{:?}", Action::Done(Err(Error::Overloaded))),
+            "{replies:?}"
+        );
+    }
+    // Any other evidence still wins.
+    for replies in [
+        &[shed, UNAVAILABLE][..],
+        &[Event::Reply(Reply::TimedOut), shed],
+    ] {
+        assert_eq!(
+            format!("{:?}", reader_done(replies)),
+            format!("{:?}", Action::Done(Err(Error::Unavailable))),
+            "{replies:?}"
+        );
+    }
+}
+
+#[test]
+fn unreachable_owners_still_fail_unavailable() {
+    // All owners down.
+    assert_eq!(
+        format!("{:?}", reader_done(&[UNAVAILABLE])),
+        format!("{:?}", Action::Done(Err(Error::Unavailable)))
+    );
+    // Some owners refused locally, one genuinely unreachable: real evidence wins.
+    assert_eq!(
+        format!("{:?}", reader_done(&[LOCAL_BUSY, UNAVAILABLE, LOCAL_BUSY])),
+        format!("{:?}", Action::Done(Err(Error::Unavailable)))
+    );
+    // A local failure that is not admission pressure stays unavailable.
+    let local_io = Event::Reply(Reply::Failed {
+        error: Error::Io,
+        sent: false,
+        scope_live: true,
+    });
+    assert_eq!(
+        format!("{:?}", reader_done(&[local_io])),
+        format!("{:?}", Action::Done(Err(Error::Unavailable)))
     );
 }

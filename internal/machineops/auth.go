@@ -42,19 +42,39 @@ func (r *MachineOperationReconciler) resolveOperationAuth(ctx context.Context, m
 		return nil, failure, nil
 	}
 
-	credential, failure, err := r.machineOperationCredentialFor(ctx, target)
+	_, auth, failure, err := resolveTargetAuth(ctx, r.Client, r.Client, r.CredentialSecretNamespace, target)
+
+	return auth, failure, err
+}
+
+// resolveTargetAuth finds the one MachineOperationCredential for target
+// through credentials and reads its Secret, if any, through secrets. A
+// non-empty secretNamespace is the only namespace the Secret may be read from.
+func resolveTargetAuth(
+	ctx context.Context,
+	credentials client.Reader,
+	secrets client.Reader,
+	secretNamespace string,
+	target operationAuthTarget,
+) (*unboundedv1alpha3.MachineOperationCredential, *OperationAuth, *authResolutionFailure, error) {
+	credential, failure, err := machineOperationCredentialFor(ctx, credentials, target)
 	if failure != nil || err != nil {
-		return nil, failure, err
+		return nil, nil, failure, err
 	}
 
 	if credential == nil {
-		return nil, &authResolutionFailure{
+		return nil, nil, &authResolutionFailure{
 			Reason:  authReasonNotFound,
 			Message: fmt.Sprintf("no MachineOperationCredential matches site %q and provider %q", target.SiteName, target.Provider),
 		}, nil
 	}
 
-	return r.authFromCredential(ctx, credential)
+	auth, failure, err := authFromCredential(ctx, secrets, secretNamespace, credential)
+	if failure != nil || err != nil {
+		return nil, nil, failure, err
+	}
+
+	return credential, auth, nil, nil
 }
 
 func operationAuthTargetFor(machine *unboundedv1alpha3.Machine) (operationAuthTarget, *authResolutionFailure) {
@@ -94,12 +114,13 @@ func operationAuthTargetFor(machine *unboundedv1alpha3.Machine) (operationAuthTa
 	return target, nil
 }
 
-func (r *MachineOperationReconciler) machineOperationCredentialFor(
+func machineOperationCredentialFor(
 	ctx context.Context,
+	reader client.Reader,
 	target operationAuthTarget,
 ) (*unboundedv1alpha3.MachineOperationCredential, *authResolutionFailure, error) {
 	var credentials unboundedv1alpha3.MachineOperationCredentialList
-	if err := r.List(ctx, &credentials); err != nil {
+	if err := reader.List(ctx, &credentials); err != nil {
 		return nil, nil, fmt.Errorf("list MachineOperationCredentials: %w", err)
 	}
 
@@ -141,8 +162,10 @@ func conflictingSiteLabels(labels map[string]string) (string, string, bool) {
 	return canonical, legacy, canonical != "" && legacy != "" && canonical != legacy
 }
 
-func (r *MachineOperationReconciler) authFromCredential(
+func authFromCredential(
 	ctx context.Context,
+	secrets client.Reader,
+	secretNamespace string,
 	credential *unboundedv1alpha3.MachineOperationCredential,
 ) (*OperationAuth, *authResolutionFailure, error) {
 	auth := &OperationAuth{Mode: credential.Spec.Auth.Mode}
@@ -164,7 +187,7 @@ func (r *MachineOperationReconciler) authFromCredential(
 		return auth, nil, nil
 	}
 
-	secret, failure, err := r.credentialSecret(ctx, credential)
+	secret, failure, err := credentialSecret(ctx, secrets, secretNamespace, credential)
 	if failure != nil || err != nil {
 		return nil, failure, err
 	}
@@ -177,8 +200,10 @@ func (r *MachineOperationReconciler) authFromCredential(
 	return auth, nil, nil
 }
 
-func (r *MachineOperationReconciler) credentialSecret(
+func credentialSecret(
 	ctx context.Context,
+	secrets client.Reader,
+	secretNamespace string,
 	credential *unboundedv1alpha3.MachineOperationCredential,
 ) (*corev1.Secret, *authResolutionFailure, error) {
 	ref := credential.Spec.Auth.SecretRef
@@ -189,17 +214,17 @@ func (r *MachineOperationReconciler) credentialSecret(
 		}, nil
 	}
 
-	if r.CredentialSecretNamespace != "" && ref.Namespace != r.CredentialSecretNamespace {
+	if secretNamespace != "" && ref.Namespace != secretNamespace {
 		return nil, &authResolutionFailure{
 			Reason:  authReasonSecretForbidden,
-			Message: fmt.Sprintf("MachineOperationCredential %s references Secret %s/%s outside the allowed namespace %s", credential.Name, ref.Namespace, ref.Name, r.CredentialSecretNamespace),
+			Message: fmt.Sprintf("MachineOperationCredential %s references Secret %s/%s outside the allowed namespace %s", credential.Name, ref.Namespace, ref.Name, secretNamespace),
 		}, nil
 	}
 
 	var secret corev1.Secret
 
 	secretKey := client.ObjectKey{Namespace: ref.Namespace, Name: ref.Name}
-	if err := r.Get(ctx, secretKey, &secret); err != nil {
+	if err := secrets.Get(ctx, secretKey, &secret); err != nil {
 		if apierrors.IsNotFound(err) {
 			return nil, &authResolutionFailure{
 				Reason:  authReasonSecretNotFound,

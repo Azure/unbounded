@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Golden bytes shared with the dataplane.
 
-Sources: cmd/racer/object-wire/src/client.rs (RequestParser::parse,
-direct_head, frame) and object-wire/tests/direct.rs.
+Sources: cmd/racer/wire/src/object/client.rs (RequestParser::parse,
+direct_head, frame) and wire/tests/direct.rs.
 """
 
 import array

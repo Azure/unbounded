@@ -250,6 +250,7 @@ func checkResolvable(entry Entry, source Source, workload *unstructured.Unstruct
 	}
 
 	problems = append(problems, checkExtraArgsTargets(entry, source, workload)...)
+	problems = append(problems, checkKubeProxyImageContainer(entry, source, workload)...)
 	problems = append(problems, checkMountCollisions(entry, source, workload)...)
 	problems = append(problems, checkVolumeCollisions(entry, source, workload)...)
 	problems = append(problems, checkExclusiveFields(entry, source, workload)...)

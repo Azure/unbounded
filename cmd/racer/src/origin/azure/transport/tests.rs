@@ -7,6 +7,7 @@ use super::*;
 use crate::admission::{AdmissionPolicy, ResourceClass};
 use crate::config::Limits;
 use crate::control::Snapshot;
+use crate::control::cell::PublicationCell;
 use crate::memory::BufferPool;
 use crate::model::{
     MetadataSelector, ObjectId, ObjectVersion, PAGE_BYTES, PageId, PageNumber, StrongEtag,
@@ -17,11 +18,12 @@ use crate::remote::tests::{MapResolver, serve, test_identity};
 use crate::runtime::Reactor;
 use crate::security::{OpaqueMetadata, OriginContext};
 use crate::test_support::enrollment::{Directory, drive, scope};
-use controlplane::Published;
-use racer_control_wire::{AzureCredential, CacheId, OriginDefinition};
+use racer_io::ring::IoBuffer;
+use racer_wire::control::{AzureCredential, CacheId, OriginDefinition};
 use std::num::NonZeroUsize;
+use std::sync::Mutex;
 use std::sync::atomic::Ordering;
-use uring_runtime::reactor::IoBuffer;
+use std::time::Instant;
 
 const SIZE: usize = 2 * PAGE_BYTES as usize + 5;
 
@@ -104,13 +106,13 @@ fn azure(head: &str, blobs: &Mutex<Blobs>) -> Vec<u8> {
     response
 }
 
-fn reactor() -> Option<Rc<Reactor>> {
+fn reactor(env: &racer_io::Env) -> Option<Rc<Reactor>> {
     // Probe io_uring availability the same way other socket tests do.
-    crate::test_support::enrollment::reactor()?;
+    crate::test_support::enrollment::reactor(env)?;
     let n = NonZeroUsize::new(1024).unwrap();
     let bytes = NonZeroUsize::new(4 * PAGE_BYTES as usize).unwrap();
-    let reactor = Rc::new(Reactor::new(Rc::new(flow_control::Quotas::new(
-        AdmissionPolicy::new(Limits {
+    let reactor = Rc::new(Reactor::new(
+        Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(Limits {
             plaintext_bytes: bytes,
             ciphertext_bytes: bytes,
             dirty_bytes: bytes,
@@ -121,6 +123,8 @@ fn reactor() -> Option<Rc<Reactor>> {
             queue_entries: NonZeroUsize::new(32).unwrap(),
             connections_per_neighbor: n,
             client_connections: n,
+            peer_connections: n,
+            outbound_connections: n,
             pipes: n,
             range_window_pages: n,
             header_bytes: NonZeroUsize::new(64 * 1024).unwrap(),
@@ -131,8 +135,9 @@ fn reactor() -> Option<Rc<Reactor>> {
             retained_snapshots: n,
             metadata_entries: n,
             relay_transfers: n,
-        }),
-    ))));
+        }))),
+        env,
+    ));
     reactor.init().unwrap();
     Some(reactor)
 }
@@ -165,7 +170,7 @@ fn fixture<K: AzureTokenSource>(
     let origin = AzureOrigin::new(
         transport,
         tokens,
-        Arc::new(Published::new(Snapshot::retention(2))),
+        Arc::new(PublicationCell::new(Snapshot::retention(2))),
         admission.clone(),
         BufferPool::new(admission),
         Arc::new(AzureLimits::default()),
@@ -255,7 +260,8 @@ impl<K: AzureTokenSource> Fixture<K> {
 
 #[test]
 fn plain_http_reads_pages_and_classifies_errors_on_one_connection() {
-    let Some(reactor) = reactor() else { return };
+    let env = racer_io::Env::host();
+    let Some(reactor) = reactor(&env) else { return };
     let blobs = Arc::new(Mutex::new(Blobs {
         etag: "\"v1\"".into(),
     }));
@@ -267,7 +273,7 @@ fn plain_http_reads_pages_and_classifies_errors_on_one_connection() {
         &url,
         AzureCredential::Anonymous,
         MapResolver::new(vec![]),
-        TrustRoots::at("/nonexistent/racer-bundle.pem".into()),
+        TrustRoots::unavailable("/nonexistent/racer-bundle.pem".into()),
         AnonymousOnly,
     );
 
@@ -332,7 +338,8 @@ fn plain_http_reads_pages_and_classifies_errors_on_one_connection() {
 
 #[test]
 fn https_with_a_private_ca_by_name() {
-    let Some(reactor) = reactor() else { return };
+    let env = racer_io::Env::host();
+    let Some(reactor) = reactor(&env) else { return };
     let identity = test_identity(&["account.blob.example"]);
     let blobs = Arc::new(Mutex::new(Blobs {
         etag: "\"v1\"".into(),
@@ -371,11 +378,12 @@ fn https_with_a_private_ca_by_name() {
 
 #[test]
 fn https_without_a_trust_bundle_fails_per_request() {
-    let trust = TrustRoots::at("/nonexistent/racer-bundle.pem".into());
+    let env = racer_io::Env::host();
+    // The load happens once, at construction; requests never reread it.
+    let trust = TrustRoots::load("/nonexistent/racer-bundle.pem".into());
     assert_eq!(trust.config().err(), Some(Error::Unavailable));
-    // Failures are remembered rather than reloaded on every request.
     assert_eq!(trust.config().err(), Some(Error::Unavailable));
-    let Some(reactor) = reactor() else { return };
+    let Some(reactor) = reactor(&env) else { return };
     let f = fixture(
         reactor,
         "https://account.blob.example/models",
@@ -391,7 +399,8 @@ fn https_without_a_trust_bundle_fails_per_request() {
 /// the storage challenge names the tenant, and the retry carries a token.
 #[test]
 fn workload_identity_learns_its_tenant_from_the_storage_challenge() {
-    let Some(reactor) = reactor() else { return };
+    let env = racer_io::Env::host();
+    let Some(reactor) = reactor(&env) else { return };
     let identity = test_identity(&["login.example"]);
     let directory = Directory::new();
     let token_file = directory.0.join("token");
@@ -439,7 +448,7 @@ fn workload_identity_learns_its_tenant_from_the_storage_challenge() {
             tenant_id: None,
         },
         MapResolver::new(vec![]),
-        TrustRoots::at("/nonexistent/racer-bundle.pem".into()),
+        TrustRoots::unavailable("/nonexistent/racer-bundle.pem".into()),
         tokens,
     );
     assert_eq!(f.metadata("small").unwrap().metadata.length, 5);
@@ -460,7 +469,8 @@ fn workload_identity_learns_its_tenant_from_the_storage_challenge() {
 
 #[test]
 fn decoded_response_head_stays_charged_while_the_exchange_lives() {
-    let Some(reactor) = reactor() else { return };
+    let env = racer_io::Env::host();
+    let Some(reactor) = reactor(&env) else { return };
     let blobs = Arc::new(Mutex::new(Blobs {
         etag: "\"v1\"".into(),
     }));
@@ -472,7 +482,7 @@ fn decoded_response_head_stays_charged_while_the_exchange_lives() {
         &url,
         AzureCredential::Anonymous,
         MapResolver::new(vec![]),
-        TrustRoots::at("/nonexistent/racer-bundle.pem".into()),
+        TrustRoots::unavailable("/nonexistent/racer-bundle.pem".into()),
         AnonymousOnly,
     );
     let container = AzureContainerUrl::parse(&url).unwrap();
@@ -540,15 +550,60 @@ fn decoded_response_head_stays_charged_while_the_exchange_lives() {
     server.join().unwrap();
 }
 
-fn refused_address() -> std::net::SocketAddr {
-    // Bind then drop, so connects to this port are refused.
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap()
+/// A loopback port that refuses connections for as long as this lives.
+struct Refused {
+    address: std::net::SocketAddr,
+    _socket: std::os::fd::OwnedFd,
+}
+
+/// Reserve a port with a bound but never listening socket, so connects are
+/// refused and no other socket can take the port while the test runs. A port
+/// bound and released instead could be reused by a concurrent test's
+/// listener, which would then accept the "dead" connect.
+fn refused_address() -> Refused {
+    use std::os::fd::FromRawFd;
+    // SAFETY: socket has no pointer arguments; the result is checked.
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    assert!(fd >= 0, "{}", std::io::Error::last_os_error());
+    // SAFETY: fd is a freshly created descriptor owned by nothing else.
+    let socket = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+    let mut address = libc::sockaddr_in {
+        sin_family: libc::AF_INET as libc::sa_family_t,
+        sin_port: 0,
+        sin_addr: libc::in_addr {
+            s_addr: u32::from(std::net::Ipv4Addr::LOCALHOST).to_be(),
+        },
+        sin_zero: [0; 8],
+    };
+    let mut length = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+    // SAFETY: address is a valid sockaddr_in of the given length for both calls.
+    unsafe {
+        assert_eq!(
+            libc::bind(fd, (&raw const address).cast(), length),
+            0,
+            "{}",
+            std::io::Error::last_os_error()
+        );
+        assert_eq!(
+            libc::getsockname(fd, (&raw mut address).cast(), &mut length),
+            0,
+            "{}",
+            std::io::Error::last_os_error()
+        );
+    }
+    Refused {
+        address: std::net::SocketAddr::from((
+            std::net::Ipv4Addr::LOCALHOST,
+            u16::from_be(address.sin_port),
+        )),
+        _socket: socket,
+    }
 }
 
 #[test]
 fn connect_failure_fails_over_to_the_next_resolved_address() {
-    let Some(reactor) = reactor() else { return };
+    let env = racer_io::Env::host();
+    let Some(reactor) = reactor(&env) else { return };
     let identity = test_identity(&["account.blob.example"]);
     let blobs = Arc::new(Mutex::new(Blobs {
         etag: "\"v1\"".into(),
@@ -557,7 +612,8 @@ fn connect_failure_fails_over_to_the_next_resolved_address() {
     let (address, accepted, server) = serve(Some(identity.server.clone()), 1, move |head, _| {
         azure(head, &state)
     });
-    let dead = std::net::SocketAddr::new(address.ip(), refused_address().port());
+    let refused = refused_address();
+    let dead = std::net::SocketAddr::new(address.ip(), refused.address.port());
     let url = format!(
         "https://account.blob.example:{}/account/models",
         address.port()
@@ -583,15 +639,18 @@ fn connect_failure_fails_over_to_the_next_resolved_address() {
 
 #[test]
 fn connect_failure_on_every_address_is_reported() {
-    let Some(reactor) = reactor() else { return };
-    let dead = refused_address();
+    let env = racer_io::Env::host();
+    let Some(reactor) = reactor(&env) else { return };
+    let refused = refused_address();
+    let second = refused_address();
+    let dead = refused.address;
     let url = format!("http://account.blob.example:{}/account/models", dead.port());
     let f = fixture(
         reactor,
         &url,
         AzureCredential::Anonymous,
-        MapResolver::new(vec![dead, refused_address()]),
-        TrustRoots::at("/nonexistent/racer-bundle.pem".into()),
+        MapResolver::new(vec![dead, second.address]),
+        TrustRoots::unavailable("/nonexistent/racer-bundle.pem".into()),
         AnonymousOnly,
     );
     assert!(f.bootstrap("big").is_err());
@@ -599,7 +658,11 @@ fn connect_failure_on_every_address_is_reported() {
 
 #[test]
 fn attempt_scope_narrows_only_non_final_attempts() {
-    let parent = scope();
+    let parent = RequestScope::host(
+        crate::model::RequestId([7; 16]),
+        Instant::now() + Duration::from_secs(10),
+    )
+    .unwrap();
     // Final attempt: the full request scope.
     assert_eq!(attempt_scope(&parent, 1).deadline.0, parent.deadline.0);
     // 10s over two attempts is capped at ATTEMPT_CAP.
@@ -618,12 +681,13 @@ fn attempt_scope_narrows_only_non_final_attempts() {
     // Narrowed scopes share the request's cancellation.
     let narrowed = attempt_scope(&parent, 2);
     parent.cancel().unwrap();
-    assert_eq!(narrowed.check(), Err(Error::Cancelled));
+    assert_eq!(narrowed.check(), Err(Error::Canceled));
 }
 
 #[test]
 fn stalled_handshake_fails_over_before_the_request_deadline() {
-    let Some(reactor) = reactor() else { return };
+    let env = racer_io::Env::host();
+    let Some(reactor) = reactor(&env) else { return };
     let identity = test_identity(&["account.blob.example"]);
     let blobs = Arc::new(Mutex::new(Blobs {
         etag: "\"v1\"".into(),
@@ -683,13 +747,16 @@ fn stalled_handshake_fails_over_before_the_request_deadline() {
 
 #[test]
 fn endpoints_for_unpublished_origins_are_dropped() {
-    let Some(reactor) = reactor() else { return };
+    let env = racer_io::Env::host();
+    let Some(reactor) = reactor(&env) else { return };
     let admission = reactor.admission().clone();
     let transport = PoolTransport::new(
         Rc::new(crate::http::new_pool(reactor.clone(), admission.clone(), 4)),
         Rc::new(crate::http::client_io(reactor, admission)),
         Rc::new(MapResolver::new(Vec::new())),
-        Arc::new(TrustRoots::from_env()),
+        Arc::new(TrustRoots::unavailable(
+            http1::tls::DEFAULT_TRUST_BUNDLE.into(),
+        )),
     );
     let origin = |url: &str| {
         OriginDefinition::azure(
@@ -719,20 +786,31 @@ fn endpoints_for_unpublished_origins_are_dropped() {
 
 #[test]
 fn admission_wait_does_not_spend_an_address_attempt() {
-    let Some(reactor) = reactor() else { return };
+    // Request and checkout deadlines run on a virtual clock that only the
+    // freeing step below advances, so a slow host cannot reorder the
+    // narrowed checkout expiry, the slot release, and the request deadline.
+    let clock = racer_io::ctx::VirtualClock::new();
+    let env = racer_io::Env::new(
+        racer_io::Driver::Uring,
+        racer_io::WorkerCtx::simulated(&clock, 0, 0),
+    );
+    let Some(reactor) = reactor(&env) else { return };
     let blobs = Arc::new(Mutex::new(Blobs {
         etag: "\"v1\"".into(),
     }));
     let state = blobs.clone();
     let (address, accepted, server) = serve(None, 2, move |head, _| azure(head, &state));
-    let dead = std::net::SocketAddr::new(address.ip(), refused_address().port());
+    let refused = refused_address();
+    let dead = std::net::SocketAddr::new(address.ip(), refused.address.port());
     let admission = reactor.admission().clone();
     // One connection per endpoint, so a second exchange waits for admission.
     let transport = PoolTransport::new(
         Rc::new(crate::http::new_pool(reactor.clone(), admission.clone(), 1)),
         Rc::new(crate::http::client_io(reactor.clone(), admission)),
         Rc::new(MapResolver::new(vec![address, dead])),
-        Arc::new(TrustRoots::at("/nonexistent/racer-bundle.pem".into())),
+        Arc::new(TrustRoots::unavailable(
+            "/nonexistent/racer-bundle.pem".into(),
+        )),
     );
     let url = format!(
         "http://account.blob.example:{}/account/models",
@@ -750,7 +828,12 @@ fn admission_wait_does_not_spend_an_address_attempt() {
         ],
     };
     // The first exchange takes the healthy address and holds the only slot.
-    let scope = scope();
+    let scope = RequestScope::with_clock(
+        crate::model::RequestId([7; 16]),
+        clock.now() + Duration::from_secs(10),
+        env.ctx.clock.clone(),
+    )
+    .unwrap();
     let held = drive(&reactor, transport.exchange(&container, head(), &scope)).unwrap();
     let held = std::cell::RefCell::new(Some(held));
 
@@ -759,15 +842,16 @@ fn admission_wait_does_not_spend_an_address_attempt() {
     // frees after that. The wait must not spend an attempt, so the refused
     // connect still fails over to the healthy address.
     let mut scope = scope.clone();
-    let started = Instant::now();
+    let started = clock.now();
     scope.deadline.0 = started + Duration::from_secs(2);
     let release = started + Duration::from_millis(1300);
     let waiting = transport.exchange(&container, head(), &scope);
     let freeing = std::future::poll_fn(|_| {
-        if Instant::now() >= release {
+        if clock.now() >= release {
             drop(held.borrow_mut().take());
             std::task::Poll::Ready(())
         } else {
+            clock.advance(Duration::from_millis(1)).unwrap();
             std::task::Poll::Pending
         }
     });
@@ -781,8 +865,48 @@ fn admission_wait_does_not_spend_an_address_attempt() {
         Some(&b"5"[..])
     );
     exchange.finish().unwrap();
-    assert!(started.elapsed() >= Duration::from_millis(1300));
+    assert!(clock.now() - started >= Duration::from_millis(1300));
     assert_eq!(accepted.load(Ordering::SeqCst), 2);
     drop(transport);
+    server.join().unwrap();
+}
+
+/// Storage closes a pooled connection after the next request arrives but
+/// before answering, as when its idle timeout races the request. The request
+/// retries once on a fresh connection.
+#[test]
+fn reused_connection_closed_before_response_retries_on_fresh_connection() {
+    use std::io::{Read as _, Write as _};
+    let env = racer_io::Env::host();
+    let Some(reactor) = reactor(&env) else { return };
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let blobs = Arc::new(Mutex::new(Blobs {
+        etag: "\"v1\"".into(),
+    }));
+    let server = std::thread::spawn(move || {
+        let (mut first, _) = listener.accept().unwrap();
+        let (head, _) = crate::remote::tests::read_request(&mut first).unwrap();
+        first.write_all(&azure(&head, &blobs)).unwrap();
+        // The next request arrives and the socket closes unanswered.
+        crate::remote::tests::read_request(&mut first).unwrap();
+        drop(first);
+        let (mut second, _) = listener.accept().unwrap();
+        let (head, _) = crate::remote::tests::read_request(&mut second).unwrap();
+        second.write_all(&azure(&head, &blobs)).unwrap();
+        let _ = second.read_to_end(&mut Vec::new());
+    });
+    let url = format!("http://127.0.0.1:{}/account/models", address.port());
+    let f = fixture(
+        reactor,
+        &url,
+        AzureCredential::Anonymous,
+        MapResolver::new(vec![]),
+        TrustRoots::unavailable("/nonexistent/racer-bundle.pem".into()),
+        AnonymousOnly,
+    );
+    assert_eq!(f.metadata("small").unwrap().metadata.length, 5);
+    assert_eq!(f.metadata("small").unwrap().metadata.length, 5);
+    drop(f);
     server.join().unwrap();
 }

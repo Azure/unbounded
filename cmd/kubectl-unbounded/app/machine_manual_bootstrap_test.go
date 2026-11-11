@@ -1574,17 +1574,24 @@ func TestManualBootstrapHandler_Isolation(t *testing.T) {
 
 	kubeconfigPath := writeTempKubeconfig(t)
 
-	for _, mode := range []string{"", "nspawn"} {
+	for _, mode := range []string{"", "nspawn", "none"} {
 		h := manualBootstrapHandler{siteName: "dc1", machineName: "my-node", kubeconfigPath: kubeconfigPath, isolation: mode}
 		require.NoError(t, h.validate(), "mode %q", mode)
 	}
 
 	// Modes the agent of this release cannot operate are refused before the
 	// cluster is contacted.
-	for _, mode := range []string{"none", "container", "microvm"} {
+	for _, mode := range []string{"microvm"} {
 		h := manualBootstrapHandler{siteName: "dc1", machineName: "my-node", kubeconfigPath: kubeconfigPath, isolation: mode}
 		require.ErrorContains(t, h.validate(), "invalid --isolation", "mode %q", mode)
 	}
+
+	// The experimental container mode needs its own flag.
+	container := manualBootstrapHandler{siteName: "dc1", machineName: "my-node", kubeconfigPath: kubeconfigPath, isolation: "container"}
+	require.ErrorContains(t, container.validate(), "--experimental-container-isolation")
+
+	container.experimentalContainerIsolation = true
+	require.NoError(t, container.validate())
 
 	// The flag flows into the generated agent config.
 	h := manualBootstrapHandler{
@@ -1605,4 +1612,13 @@ func TestManualBootstrapHandler_Isolation(t *testing.T) {
 	cfg, err = h.buildAgentConfig(context.Background())
 	require.NoError(t, err)
 	require.Empty(t, cfg.Isolation)
+	require.Nil(t, cfg.Experimental, "no opt-in without the flag")
+
+	// The experimental flag opts the agent in, with the mode passed through.
+	h.isolation = "container"
+	h.experimentalContainerIsolation = true
+	cfg, err = h.buildAgentConfig(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, "container", cfg.Isolation)
+	require.True(t, cfg.ContainerIsolationEnabled())
 }

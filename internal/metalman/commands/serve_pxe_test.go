@@ -53,6 +53,44 @@ func TestServePXEMediaTFTPServerFlag(t *testing.T) {
 	}
 }
 
+func TestServePXEExperimentalContainerIsolationFlag(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{name: "off by default"},
+		{name: "enabled", args: []string{"--experimental-container-isolation"}, want: true},
+		{name: "explicitly off", args: []string{"--experimental-container-isolation=false"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd := ServePXECmd()
+
+			flag := cmd.Flags().Lookup("experimental-container-isolation")
+			if flag == nil {
+				t.Fatal("serve-pxe must register --experimental-container-isolation")
+			}
+
+			if flag.DefValue != "false" || flag.Value.Type() != "bool" {
+				t.Fatalf("expected bool flag defaulting to false, got %s default %q", flag.Value.Type(), flag.DefValue)
+			}
+
+			if err := cmd.ParseFlags(tt.args); err != nil {
+				t.Fatal(err)
+			}
+
+			got, err := cmd.Flags().GetBool("experimental-container-isolation")
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if got != tt.want {
+				t.Errorf("experimental-container-isolation = %t, want %t", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestResolveMediaTFTPServer(t *testing.T) {
 	for _, tt := range []struct {
 		name     string

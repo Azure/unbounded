@@ -6,7 +6,6 @@ use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
 use crate::memory::BufferPool;
-use crate::memory::CiphertextBytes;
 use crate::memory::CiphertextPage;
 use crate::memory::PlaintextBuffer;
 use crate::memory::VerifiedBytes;
@@ -21,13 +20,13 @@ use crate::model::RequestId;
 use crate::model::WorkerId;
 use crate::runtime::RequestScope;
 use crate::telemetry::AeadFailure;
-use crate::telemetry::Failure;
-use crate::telemetry::Stage;
-use racer_control_wire::KeyId;
 use racer_crypto::TAG_LEN;
 use racer_crypto::identity::KeyLease;
 use racer_crypto::identity::KeyPurpose;
 use racer_crypto::identity::Keyring;
+use racer_io::ring::IoBuffer;
+use racer_io::xthread::offload;
+use racer_wire::control::KeyId;
 use std::cell::RefCell;
 use std::fmt;
 use std::num::NonZeroUsize;
@@ -39,8 +38,6 @@ use std::sync::atomic::Ordering;
 use std::task::Context;
 use std::task::Poll;
 use std::task::Waker;
-use uring_runtime::offload;
-use uring_runtime::reactor::IoBuffer;
 use zeroize::Zeroizing;
 
 impl From<racer_crypto::identity::Error> for crate::error::Error {
@@ -172,9 +169,11 @@ impl PeerOriginContext {
     }
 }
 
-pub(crate) fn fresh_nonce() -> Result<Nonce> {
-    let mut nonce = [0u8; 24];
-    uring_runtime::environment::fill_random(&mut nonce).map_err(|_| Error::Unavailable)?;
+/// A fresh AEAD nonce from `rng`, which must be cryptographically secure
+/// outside simulation ([`racer_io::Rng::os`] in production).
+pub(crate) fn fresh_nonce(rng: &racer_io::Rng) -> Result<Nonce> {
+    let mut nonce = [u8::default(); 24];
+    rng.fill(&mut nonce).map_err(|_| Error::Unavailable)?;
     Ok(Nonce(nonce))
 }
 pub(crate) fn field(out: &mut Vec<u8>, value: &[u8]) -> Result<()> {
@@ -183,33 +182,153 @@ pub(crate) fn field(out: &mut Vec<u8>, value: &[u8]) -> Result<()> {
     out.extend_from_slice(value);
     Ok(())
 }
+/// Page AAD as borrowed parts plus small stack scalars, so tag checks can
+/// stream it into GHASH without building a per-page buffer.
+///
 /// Layout: domain, cipher:u32 BE, cache(length:u32 BE, bytes), exact object key,
-/// quoted ETag(length:u32 BE, bytes), page:u64 BE, key ID, nonce, lengths:u32 BE.
+/// quoted ETag(length:u32 BE, bytes), page:u64 BE, page size:u32 BE, key ID,
+/// nonce, lengths:u32 BE. The page size binds the page number's meaning: a page
+/// claiming another size than it was sealed at fails authentication.
+pub(crate) struct PageAad<'a> {
+    envelope: &'a PageEnvelope,
+    cipher: [u8; 4],
+    cache_length: [u8; 4],
+    etag_length: [u8; 4],
+    number: [u8; 8],
+    page_size: [u8; 4],
+    plaintext_length: [u8; 4],
+    ciphertext_length: [u8; 4],
+}
+impl<'a> PageAad<'a> {
+    const DOMAIN: &'static [u8] = b"racer/page/aead/v2\0";
+
+    pub(crate) fn new(envelope: &'a PageEnvelope) -> Result<Self> {
+        envelope.validate()?;
+        let cache = envelope.page.version.object.cache.0.as_bytes();
+        let etag = envelope.page.version.etag.as_bytes();
+        if !racer_crypto::identity::canonical_uuid(&envelope.page.version.object.cache.0)
+            || etag.len() > crate::model::MAX_FIELD_BYTES
+        {
+            return Err(Error::CorruptRecord);
+        }
+        let length = |value: &[u8]| {
+            u32::try_from(value.len())
+                .map(u32::to_be_bytes)
+                .map_err(|_| Error::InvalidRequest)
+        };
+        Ok(Self {
+            envelope,
+            cipher: (envelope.cipher as u32).to_be_bytes(),
+            cache_length: length(cache)?,
+            etag_length: length(etag)?,
+            number: envelope.page.number.0.to_be_bytes(),
+            // At most 16 MiB, so it always fits.
+            page_size: u32::try_from(envelope.page_size.get())
+                .map_err(|_| Error::CorruptRecord)?
+                .to_be_bytes(),
+            plaintext_length: envelope.plaintext_length.to_be_bytes(),
+            ciphertext_length: envelope.ciphertext_length.to_be_bytes(),
+        })
+    }
+
+    /// The AAD is the concatenation of these parts.
+    pub(crate) fn parts(&self) -> [&[u8]; 13] {
+        let envelope = self.envelope;
+        [
+            Self::DOMAIN,
+            &self.cipher,
+            &self.cache_length,
+            envelope.page.version.object.cache.0.as_bytes(),
+            &envelope.page.version.object.key.0,
+            &self.etag_length,
+            envelope.page.version.etag.as_bytes(),
+            &self.number,
+            &self.page_size,
+            &envelope.key_id.0,
+            &envelope.nonce.0,
+            &self.plaintext_length,
+            &self.ciphertext_length,
+        ]
+    }
+}
+/// The canonical page AAD bytes; see [`PageAad`] for the layout.
 pub fn page_aad(envelope: &PageEnvelope) -> Result<Vec<u8>> {
-    envelope.validate()?;
-    if !racer_crypto::identity::canonical_uuid(&envelope.page.version.object.cache.0)
-        || envelope.page.version.etag.as_bytes().len() > crate::model::MAX_FIELD_BYTES
+    Ok(PageAad::new(envelope)?.parts().concat())
+}
+/// Run `f` over the canonical page AAD bytes, staged in a reused per-thread
+/// buffer so the seal and open paths (whose AEAD API needs contiguous AAD) do
+/// not allocate per page. Falls back to a fresh buffer if reentered.
+fn with_page_aad<R>(envelope: &PageEnvelope, f: impl FnOnce(&[u8]) -> R) -> Result<R> {
+    use std::cell::RefCell;
+    thread_local! {
+        static SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    }
+    let aad = PageAad::new(envelope)?;
+    let fill = |buffer: &mut Vec<u8>| {
+        buffer.clear();
+        for part in aad.parts() {
+            buffer.extend_from_slice(part);
+        }
+    };
+    SCRATCH.with(|scratch| match scratch.try_borrow_mut() {
+        Ok(mut buffer) => {
+            fill(&mut buffer);
+            Ok(f(&buffer))
+        }
+        Err(_) => {
+            let mut buffer = Vec::new();
+            fill(&mut buffer);
+            Ok(f(&buffer))
+        }
+    })
+}
+/// The stored AEAD tag: the last [`TAG_LEN`] ciphertext bytes, or zeros when
+/// the ciphertext is shorter than a tag. Reads only the tag bytes.
+fn stored_tag(ciphertext: &[u8]) -> [u8; TAG_LEN] {
+    ciphertext
+        .len()
+        .checked_sub(TAG_LEN)
+        .and_then(|start| ciphertext[start..].try_into().ok())
+        .unwrap_or([0; TAG_LEN])
+}
+/// Verify a page's stored AEAD tag against its envelope without decrypting.
+/// Length mismatches and tag mismatches are `CorruptRecord`; a key that does
+/// not match the envelope is `MissingKey`.
+fn verify_stored_tag(
+    key: &racer_crypto::identity::KeyLease,
+    ciphertext: &CiphertextPage,
+) -> Result<()> {
+    let envelope = ciphertext.envelope();
+    let length = envelope.plaintext_length as usize;
+    let bytes = ciphertext.bytes();
+    if bytes.len() != envelope.ciphertext_length as usize
+        || length.checked_add(TAG_LEN) != Some(bytes.len())
     {
         return Err(Error::CorruptRecord);
     }
-    let mut out = b"racer/page/aead/v1\0".to_vec();
-    out.extend_from_slice(&(envelope.cipher as u32).to_be_bytes());
-    field(&mut out, envelope.page.version.object.cache.0.as_bytes())?;
-    out.extend_from_slice(&envelope.page.version.object.key.0);
-    field(&mut out, envelope.page.version.etag.as_bytes())?;
-    out.extend_from_slice(&envelope.page.number.0.to_be_bytes());
-    out.extend_from_slice(&envelope.key_id.0);
-    out.extend_from_slice(&envelope.nonce.0);
-    out.extend_from_slice(&envelope.plaintext_length.to_be_bytes());
-    out.extend_from_slice(&envelope.ciphertext_length.to_be_bytes());
-    Ok(out)
+    let cache = &envelope.page.version.object.cache;
+    if key.cache() != cache || key.id() != envelope.key_id {
+        return Err(Error::MissingKey);
+    }
+    let aad = PageAad::new(envelope)?;
+    let (body, tag) = bytes.split_at(length);
+    key.verify_page_tag(
+        cache,
+        envelope.key_id,
+        &envelope.nonce.0,
+        &aad.parts(),
+        body,
+        tag,
+    )
+    .map_err(|_| Error::CorruptRecord)
 }
-/// Called only on crypto for exact AEAD rejects or opt-in send samples. Reuses
-/// the CRC already initialized by verify_checksum; never scans payload bytes.
+/// Called only on crypto for exact AEAD rejects or opt-in send samples. Reads
+/// only the stored tag; never scans payload bytes.
 pub(crate) fn capture_aead_failure(
     ciphertext: &CiphertextPage,
     aad: &[u8],
     request: RequestId,
+    unix_millis: u64,
 ) -> AeadFailure {
     use sha2::Digest;
     use sha2::Sha256;
@@ -226,7 +345,7 @@ pub(crate) fn capture_aead_failure(
         hash.update(field);
     }
     AeadFailure {
-        unix_millis: Failure::new(Stage::PeerDecode, Error::CorruptRecord).unix_millis,
+        unix_millis,
         request,
         peer: ciphertext.provenance,
         page: hash.finalize().into(),
@@ -236,14 +355,14 @@ pub(crate) fn capture_aead_failure(
         plaintext: envelope.plaintext_length,
         ciphertext: envelope.ciphertext_length,
         aad: Sha256::digest(aad).into(),
-        crc: ciphertext.cached_checksum(),
+        tag: stored_tag(ciphertext.bytes()),
     }
 }
 
 pub struct PageCrypto {
     keys: Rc<Keyring>,
     client: Rc<CryptoClient>,
-    buffers: Option<BufferPool>,
+    buffers: BufferPool,
 }
 impl PageCrypto {
     pub(crate) async fn sample_send(
@@ -267,16 +386,16 @@ impl PageCrypto {
         let _ = self
             .client
             .execute_sample(
-                CryptoInput::Checksum { ciphertext },
+                CryptoInput::VerifyTag { ciphertext },
                 key,
                 scope,
                 Some(sample),
             )
             .await;
     }
-    /// Verify persisted ciphertext integrity on the bounded crypto worker queue.
-    /// This does not authenticate a peer copy or produce publishable plaintext.
-    pub fn verify_checksum<'a>(
+    /// Verify ciphertext integrity with its AEAD tag, without decrypting, on
+    /// the bounded crypto worker queue. Produces no plaintext.
+    pub fn verify_tag<'a>(
         &'a self,
         ciphertext: CiphertextPage,
         scope: &'a RequestScope,
@@ -290,32 +409,27 @@ impl PageCrypto {
             )?;
             match self
                 .client
-                .execute(CryptoInput::Checksum { ciphertext }, key, scope)
+                .execute(CryptoInput::VerifyTag { ciphertext }, key, scope)
                 .await?
             {
-                CryptoOutput::Checksummed(_) => Ok(()),
+                CryptoOutput::TagVerified(_) => Ok(()),
                 _ => Err(Error::CorruptRecord),
             }
         })
     }
     /// I/O-local facade. Only owned page inputs and an immutable key lease cross
     /// to the engine; this Rc graph and its futures stay on I/O.
-    pub fn new(keys: Rc<Keyring>, client: Rc<CryptoClient>) -> Self {
+    ///
+    /// Page ciphertext is sealed directly into `buffers`, this worker's
+    /// aligned pool. The I/O thread checks the buffer out before submission,
+    /// so a crypto thread shared by several workers always fills, and the
+    /// page later returns, storage owned by the requesting worker.
+    pub fn new(keys: Rc<Keyring>, client: Rc<CryptoClient>, buffers: BufferPool) -> Self {
         Self {
             keys,
             client,
-            buffers: None,
+            buffers,
         }
-    }
-    /// Seal page ciphertext directly into this worker's aligned pool.
-    ///
-    /// The I/O thread checks the buffer out before submission, so a crypto
-    /// thread shared by several workers always fills, and the page later
-    /// returns, storage owned by the requesting worker.
-    #[must_use]
-    pub fn with_buffers(mut self, buffers: BufferPool) -> Self {
-        self.buffers = Some(buffers);
-        self
     }
     /// Derive the AES-256-GCM key and nonce that XAES-256-GCM uses for this
     /// page, so a GPU can authenticate and decrypt it. Checks the cache, key ID
@@ -341,14 +455,14 @@ impl PageCrypto {
     ///     admission::AdmissionPolicy, runtime::RequestScope};
     /// fn require_send<T: Send>(_: T) {}
     /// fn move_future(crypto: &PageCrypto, page: CiphertextPage,
-    ///     output: flow_control::Charge<AdmissionPolicy>, scope: &RequestScope) {
+    ///     output: racer::memory::PlaintextBuf, scope: &RequestScope) {
     ///     require_send(crypto.decrypt(page, output, scope));
     /// }
     /// ```
     pub fn decrypt<'a>(
         &'a self,
         ciphertext: CiphertextPage,
-        plaintext: flow_control::Charge<AdmissionPolicy>,
+        plaintext: crate::memory::PlaintextBuf,
         scope: &'a RequestScope,
     ) -> Operation<'a, VerifiedPage> {
         Box::pin(async move {
@@ -372,8 +486,9 @@ impl PageCrypto {
             {
                 CryptoOutput::Decrypted(page, _original_ciphertext) => Ok(page),
                 CryptoOutput::Encrypted(..)
-                | CryptoOutput::Checksummed(_)
-                | CryptoOutput::EnvelopeVerified(_) => Err(Error::CorruptRecord),
+                | CryptoOutput::TagVerified(_)
+                | CryptoOutput::EnvelopeVerified(_)
+                | CryptoOutput::DecryptedInto(_) => Err(Error::CorruptRecord),
             }
         })
     }
@@ -381,6 +496,7 @@ impl PageCrypto {
     pub fn encrypt<'a>(
         &'a self,
         page: PageId,
+        page_size: racer_wire::object::PageSize,
         plaintext: PlaintextBuffer,
         ciphertext: flow_control::Charge<AdmissionPolicy>,
         scope: &'a RequestScope,
@@ -389,26 +505,21 @@ impl PageCrypto {
             let key = self
                 .keys
                 .active(&page.version.object.cache, KeyPurpose::Page)?;
-            let ciphertext = match &self.buffers {
-                Some(buffers) => {
-                    use uring_runtime::reactor::IoBuffer;
-                    let length = plaintext
-                        .bytes()?
-                        .len()
-                        .checked_add(TAG_LEN)
-                        .ok_or(Error::InvalidRequest)?;
-                    match buffers.encryption_output(ciphertext, length)? {
-                        Ok(buffer) => EncryptOutput::Aligned(Box::new(buffer)),
-                        Err(reservation) => EncryptOutput::Unaligned(reservation),
-                    }
-                }
-                None => EncryptOutput::Unaligned(ciphertext),
+            let ciphertext = {
+                use racer_io::ring::IoBuffer;
+                let length = plaintext
+                    .bytes()?
+                    .len()
+                    .checked_add(TAG_LEN)
+                    .ok_or(Error::InvalidRequest)?;
+                Box::new(self.buffers.encryption_output(ciphertext, length)?)
             };
             match self
                 .client
                 .execute(
                     CryptoInput::Encrypt {
                         page,
+                        page_size,
                         plaintext,
                         ciphertext,
                     },
@@ -419,8 +530,9 @@ impl PageCrypto {
             {
                 CryptoOutput::Encrypted(plaintext, ciphertext) => Ok((plaintext, ciphertext)),
                 CryptoOutput::Decrypted(..)
-                | CryptoOutput::Checksummed(_)
-                | CryptoOutput::EnvelopeVerified(_) => Err(Error::CorruptRecord),
+                | CryptoOutput::TagVerified(_)
+                | CryptoOutput::EnvelopeVerified(_)
+                | CryptoOutput::DecryptedInto(_) => Err(Error::CorruptRecord),
             }
         })
     }
@@ -429,25 +541,299 @@ impl PageCrypto {
 /// Constructed on the paired crypto thread, without access to the I/O service graph.
 /// The vetted AEAD adapter processes owned jobs in bounded quanta, checks the
 /// original deadline/cancellation, and returns every accepted job as a completion.
+///
+/// Helpers that share a [`CryptoShare`] also run each other's queued jobs, so a
+/// backlog on one lane does not wait behind its own helper while siblings idle.
+/// Completions always return through the owning lane's port.
 pub struct PageCryptoEngine {
-    environment: uring_runtime::environment::Environment,
+    ctx: racer_io::WorkerCtx,
 
-    runtime: CryptoRuntime,
+    share: Arc<CryptoShare>,
 
-    executor: offload::Worker<CryptoCompletion>,
+    lane: usize,
+
+    /// Next sibling lane to try when stealing, so thieves spread over lanes.
+    cursor: usize,
+}
+type SharedPort = offload::WorkerPort<CryptoId, CryptoJob, CryptoCompletion>;
+/// One lane's worker endpoint, reachable from every helper of its share group.
+struct SharedLane {
+    port: SharedPort,
+
+    /// Jobs taken from this lane whose completions are not yet published.
+    in_flight: usize,
+
+    /// Completions a thief could not publish; the owner retries and reports them.
+    deferred: std::collections::VecDeque<CryptoCompletion>,
+
+    /// The owner observed closure with no queued job.
+    closed: bool,
+
+    /// Owner driver, woken when a thief finishes this lane's last job.
+    owner: Option<Waker>,
+}
+/// A job a helper on another NUMA node handed to this share's helpers,
+/// because its memory is on this node. Its completion goes back to `lane` of
+/// `origin`, as for a stolen job.
+struct Forwarded {
+    origin: Arc<CryptoShare>,
+
+    lane: usize,
+
+    job: CryptoJob,
+}
+/// Jobs forwarded to a share by helpers on other NUMA nodes.
+#[derive(Default)]
+struct ForeignQueue {
+    jobs: std::collections::VecDeque<Forwarded>,
+
+    /// Every helper of the share is gone; forwarding runs the job locally.
+    closed: bool,
+}
+/// Crypto lanes whose helpers may run each other's jobs, normally one NUMA node.
+/// Every lock is held only for queue operations, never across AEAD work.
+///
+/// Shares of different nodes are linked with [`Self::link`]: a job that asks
+/// for another node's helpers (a host-read decrypt into memory on that node)
+/// is forwarded to that node's share, run by one of its helpers, and
+/// completed on its owner lane like a stolen job.
+pub struct CryptoShare {
+    lanes: Box<[std::sync::Mutex<Option<SharedLane>>]>,
+
+    /// Lanes whose helper found no work anywhere, with the driver to wake.
+    idle: std::sync::Mutex<Vec<(usize, Waker)>>,
+
+    /// NUMA node of this share's helpers, when they are pinned to one.
+    node: Option<usize>,
+
+    /// Shares of other nodes that jobs may be forwarded to.
+    peers: std::sync::OnceLock<Box<[std::sync::Weak<CryptoShare>]>>,
+
+    /// Jobs forwarded here from other nodes' helpers.
+    foreign: std::sync::Mutex<ForeignQueue>,
+}
+impl CryptoShare {
+    /// Allocate a group of `lanes` slots, filled as each helper engine starts.
+    pub fn new(lanes: usize) -> Arc<Self> {
+        Self::on_node(lanes, None)
+    }
+    /// [`Self::new`], for helpers pinned to NUMA node `node`.
+    pub fn on_node(lanes: usize, node: Option<usize>) -> Arc<Self> {
+        Arc::new(Self {
+            lanes: (0..lanes).map(|_| std::sync::Mutex::new(None)).collect(),
+            idle: std::sync::Mutex::new(Vec::new()),
+            node,
+            peers: std::sync::OnceLock::new(),
+            foreign: std::sync::Mutex::new(ForeignQueue::default()),
+        })
+    }
+    /// Let jobs move between `shares` by node. Shares without a node, and
+    /// shares already linked, are left alone.
+    pub fn link(shares: &[Arc<Self>]) {
+        for share in shares.iter().filter(|share| share.node.is_some()) {
+            let peers = shares
+                .iter()
+                .filter(|peer| peer.node.is_some() && peer.node != share.node)
+                .map(Arc::downgrade)
+                .collect();
+            let _ = share.peers.set(peers);
+        }
+    }
+    fn foreign(&self) -> std::sync::MutexGuard<'_, ForeignQueue> {
+        self.foreign
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+    /// The linked share of node `node`, when it is not this share's node.
+    fn peer_on(&self, node: u16) -> Option<Arc<Self>> {
+        let node = Some(usize::from(node));
+        if self.node.is_none() || self.node == node {
+            return None;
+        }
+        self.peers
+            .get()?
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .find(|peer| peer.node == node)
+    }
+    /// Hand `job`, taken from `lane` of this share, to the helpers of the
+    /// node it asks for. Returns the job, to run here, when it asks for no
+    /// other linked node or that node's helpers are gone.
+    fn forward(self: &Arc<Self>, lane: usize, mut job: CryptoJob) -> Option<CryptoJob> {
+        let Some(peer) = job
+            .permit
+            .measurement
+            .node
+            .and_then(|node| self.peer_on(node))
+        else {
+            return Some(job);
+        };
+        {
+            let mut foreign = peer.foreign();
+            if foreign.closed {
+                return Some(job);
+            }
+            job.permit.measurement.forwarded = true;
+            foreign.jobs.push_back(Forwarded {
+                origin: self.clone(),
+                lane,
+                job,
+            });
+        }
+        peer.wake_idle(usize::MAX);
+        None
+    }
+    fn take_foreign(&self) -> Option<Forwarded> {
+        self.foreign().jobs.pop_front()
+    }
+    /// After this share's last helper is gone, refuse further forwarding and
+    /// return the jobs still queued, for the caller to run.
+    fn close_foreign(&self) -> Vec<Forwarded> {
+        let mut foreign = self.foreign();
+        foreign.closed = true;
+        foreign.jobs.drain(..).collect()
+    }
+    fn slot(&self, lane: usize) -> std::sync::MutexGuard<'_, Option<SharedLane>> {
+        // Holders never panic while mutating; recover the data on poison.
+        self.lanes[lane]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+    fn idle(&self) -> std::sync::MutexGuard<'_, Vec<(usize, Waker)>> {
+        self.idle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+    /// Wake one idle sibling to help with `lane`'s backlog.
+    fn wake_idle(&self, lane: usize) {
+        let waker = {
+            let mut idle = self.idle();
+            idle.iter()
+                .position(|(idle, _)| *idle != lane)
+                .map(|index| idle.swap_remove(index).1)
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+    fn set_idle(&self, lane: usize, waker: &Waker) {
+        let mut idle = self.idle();
+        match idle.iter_mut().find(|(idle, _)| *idle == lane) {
+            Some((_, current)) => current.clone_from(waker),
+            None => idle.push((lane, waker.clone())),
+        }
+    }
+    fn clear_idle(&self, lane: usize) {
+        self.idle().retain(|(idle, _)| *idle != lane);
+    }
+    /// Whether any lane other than `lane`, or the foreign queue, has a
+    /// queued job.
+    fn backlog_except(&self, lane: usize) -> bool {
+        if self
+            .foreign
+            .try_lock()
+            .map_or(true, |foreign| !foreign.jobs.is_empty())
+        {
+            return true;
+        }
+        (0..self.lanes.len()).any(|other| {
+            other != lane
+                && self.lanes[other]
+                    .try_lock()
+                    .is_ok_and(|slot| slot.as_ref().is_some_and(|l| l.port.has_jobs()))
+        })
+    }
+    /// Take one queued job from a sibling, skipping contended or absent lanes.
+    fn steal(&self, lane: usize, cursor: &mut usize) -> Option<(usize, CryptoJob)> {
+        let count = self.lanes.len();
+        for step in 0..count {
+            let other = (*cursor + step) % count;
+            if other == lane {
+                continue;
+            }
+            let Ok(mut slot) = self.lanes[other].try_lock() else {
+                continue;
+            };
+            let Some(shared) = slot.as_mut() else {
+                continue;
+            };
+            if let Ok(Some(job)) = shared.port.try_job() {
+                shared.in_flight += 1;
+                *cursor = (other + 1) % count;
+                return Some((other, job));
+            }
+        }
+        None
+    }
+    /// Publish a stolen job's completion on its owner lane. Failures are kept
+    /// for the owner to report; a lane whose owner is gone drops it.
+    fn finish_stolen(&self, source: usize, completion: CryptoCompletion) {
+        let (wake, orphan) = {
+            let mut slot = self.slot(source);
+            match slot.as_mut() {
+                Some(shared) => {
+                    shared.in_flight -= 1;
+                    let failed = match shared.port.complete(completion) {
+                        Ok(()) => false,
+                        Err(failure) => {
+                            shared.deferred.push_back(failure.command);
+                            true
+                        }
+                    };
+                    let wake = (failed || (shared.closed && shared.in_flight == 0))
+                        .then(|| shared.owner.clone())
+                        .flatten();
+                    (wake, None)
+                }
+                None => (None, Some(completion)),
+            }
+        };
+        drop(orphan);
+        if let Some(waker) = wake {
+            waker.wake();
+        }
+    }
+}
+impl CryptoPort {
+    /// Let helpers sharing `share` run this lane's jobs. `lane` must be unique
+    /// within the share and below its size.
+    pub fn share(&mut self, share: Arc<CryptoShare>, lane: usize) {
+        self.share = Some((share, lane));
+    }
+    #[cfg(test)]
+    pub(crate) fn shared(&self) -> Option<(&Arc<CryptoShare>, usize)> {
+        self.share.as_ref().map(|(share, lane)| (share, *lane))
+    }
 }
 impl PageCryptoEngine {
     pub fn new(runtime: CryptoRuntime) -> Self {
+        let CryptoRuntime {
+            port: CryptoPort { queue, share },
+            ctx,
+        } = runtime;
+        let (share, lane) = share.unwrap_or_else(|| (CryptoShare::new(1), 0));
+        *share.slot(lane) = Some(SharedLane {
+            port: queue,
+            in_flight: 0,
+            deferred: std::collections::VecDeque::new(),
+            closed: false,
+            owner: None,
+        });
         Self {
-            environment: uring_runtime::environment::Environment::current(),
-            runtime,
-            executor: offload::Worker::default(),
+            ctx,
+            share,
+            cursor: lane + 1,
+            lane,
         }
+    }
+    /// The crypto thread's clock and entropy.
+    pub fn ctx(&self) -> &racer_io::WorkerCtx {
+        &self.ctx
     }
     /// All fallible work borrows input. Ownership transfers only after the final
     /// cancellation check, so failures retain the exact input and quota owners.
-    pub fn process(job: CryptoJob) -> CryptoCompletion {
-        let measurement_start = uring_runtime::environment::now();
+    pub fn process(job: CryptoJob, ctx: &racer_io::WorkerCtx) -> CryptoCompletion {
+        let measurement_start = ctx.clock.now();
         let CryptoJob {
             mut permit,
             input,
@@ -457,7 +843,31 @@ impl PageCryptoEngine {
         let input = match input {
             CryptoInput::VerifyEnvelope(job) => {
                 let outcome = job.verify(&scope);
-                permit.executed(measurement_start);
+                permit.executed(ctx.clock.now(), measurement_start);
+                return CryptoCompletion {
+                    permit,
+                    outcome,
+                    _key: key,
+                };
+            }
+            CryptoInput::DecryptInto(mut job) => {
+                let outcome = match scope.check().and_then(|()| job.run()) {
+                    Ok(()) => CryptoOutcome::Completed(CryptoOutput::DecryptedInto(job)),
+                    Err(error) => {
+                        if error == Error::CorruptRecord {
+                            permit.rejected(IntegrityRejection::Aead);
+                        }
+                        permit.measurement.failure = Some(DecryptFailureMeta {
+                            request: scope.request,
+                            engine_ms: crate::telemetry::unix_millis(ctx.clock.wall_now()),
+                        });
+                        CryptoOutcome::Failed {
+                            input: CryptoInput::DecryptInto(job),
+                            error,
+                        }
+                    }
+                };
+                permit.executed(ctx.clock.now(), measurement_start);
                 return CryptoCompletion {
                     permit,
                     outcome,
@@ -472,91 +882,37 @@ impl PageCryptoEngine {
             key.as_ref().expect("page job key"),
             &scope,
             &mut permit,
+            ctx,
         );
         if let Some(sample) = &mut permit.send_sample
-            && let CryptoInput::Checksum { ciphertext } = &input
+            && let CryptoInput::VerifyTag { ciphertext } = &input
             && let Ok(aad) = page_aad(ciphertext.envelope())
         {
-            sample.facts = Some(capture_aead_failure(ciphertext, &aad, scope.request));
+            sample.facts = Some(capture_aead_failure(
+                ciphertext,
+                &aad,
+                scope.request,
+                crate::telemetry::unix_millis(ctx.clock.wall_now()),
+            ));
         }
         let outcome = match prepared {
             Err(error) => {
                 if permit.measurement.decrypt {
                     permit.measurement.failure = Some(DecryptFailureMeta {
                         request: scope.request,
-                        engine_ms: Failure::new(Stage::PeerDecode, error).unix_millis,
+                        engine_ms: crate::telemetry::unix_millis(ctx.clock.wall_now()),
                     });
                 }
                 CryptoOutcome::Failed { input, error }
             }
-            Ok((envelope, bytes)) => Self::complete(input, envelope, bytes),
+            Ok(envelope) => Self::complete(input, envelope),
         };
-        permit.executed(measurement_start);
+        permit.executed(ctx.clock.now(), measurement_start);
         CryptoCompletion {
             permit,
             outcome,
             _key: key,
         }
-    }
-
-    /// Decrypt with one read of the ciphertext for both its CRC and the AEAD
-    /// copy, when every check that the unfused path runs after the CRC would
-    /// pass. Returns `None` without side effects otherwise, so the caller's
-    /// unfused path reports exactly the error it always has.
-    ///
-    /// The unfused path scans the ciphertext for its CRC, then copies it into
-    /// plaintext storage for in-place AEAD: two reads of a page that, after an
-    /// RDMA receive, is no longer in cache. Here each chunk is checksummed
-    /// right after it is copied, while it is still cache resident.
-    fn open_fused(
-        key: &racer_crypto::identity::KeyLease,
-        ciphertext: &CiphertextPage,
-        plaintext: &flow_control::Charge<AdmissionPolicy>,
-        permit: &mut CryptoPermit,
-        scope: &RequestScope,
-    ) -> Result<Option<Zeroizing<Vec<u8>>>> {
-        let envelope = ciphertext.envelope();
-        let length = envelope.plaintext_length as usize;
-        if key.cache() != &envelope.page.version.object.cache
-            || key.id() != envelope.key_id
-            || ciphertext.bytes().len() != envelope.ciphertext_length as usize
-            || length.checked_add(TAG_LEN) != Some(ciphertext.bytes().len())
-            || plaintext
-                .validate(ResourceClass::Plaintext, length)
-                .is_err()
-            || plaintext.key() != Some(&envelope.page.version.object.cache)
-        {
-            return Ok(None);
-        }
-        let Ok(aad) = page_aad(envelope) else {
-            return Ok(None);
-        };
-        let Ok(storage) = plaintext.buffer(length) else {
-            return Ok(None);
-        };
-        let mut bytes = Zeroizing::new(storage);
-        let (_, tag) = ciphertext.bytes().split_at(length);
-        let checksum = racer_crypto::copy_prefix_crc64(ciphertext.bytes(), &mut bytes)
-            .map_err(|_| Error::CorruptRecord)?;
-        ciphertext
-            .verify_computed_checksum(checksum)
-            .inspect_err(|_| {
-                permit.rejected(IntegrityRejection::Crc);
-            })?;
-        key.open_page_in_place(
-            &envelope.page.version.object.cache,
-            envelope.key_id,
-            &envelope.nonce.0,
-            &aad,
-            &mut bytes,
-            tag,
-        )
-        .map_err(|_| {
-            permit.rejected(IntegrityRejection::Aead);
-            permit.aead_failure = Some(capture_aead_failure(ciphertext, &aad, scope.request));
-            Error::CorruptRecord
-        })?;
-        Ok(Some(bytes))
     }
 
     /// Borrow every quota owner until crypto and the final cancellation check succeed.
@@ -565,27 +921,24 @@ impl PageCryptoEngine {
         key: &racer_crypto::identity::KeyLease,
         scope: &RequestScope,
         permit: &mut CryptoPermit,
-    ) -> Result<(PageEnvelope, Zeroizing<Vec<u8>>)> {
+        ctx: &racer_io::WorkerCtx,
+    ) -> Result<PageEnvelope> {
         scope.check().inspect_err(|error| {
             permit.measurement.scope_failure = crate::telemetry::DecryptScopeFailure::Entry(*error);
         })?;
-        if let CryptoInput::Checksum { ciphertext } = input {
-            if let Some(sample) = &mut permit.send_sample {
-                sample.cached = ciphertext.cached_checksum().is_some();
-                if sample.cached {
-                    return Ok((ciphertext.envelope().clone(), Zeroizing::new(Vec::new())));
-                }
-            }
-            ciphertext.verify_checksum()?;
+        if let CryptoInput::VerifyTag { ciphertext } = input {
+            verify_stored_tag(key, ciphertext)?;
             scope.check()?;
-            return Ok((ciphertext.envelope().clone(), Zeroizing::new(Vec::new())));
+            return Ok(ciphertext.envelope().clone());
         }
         key.require_purpose(KeyPurpose::Page)?;
-        let (envelope, mut bytes) = match input {
+        let envelope = match input {
             CryptoInput::VerifyEnvelope(_) => unreachable!("envelope handled above"),
-            CryptoInput::Checksum { .. } => unreachable!("checksum handled above"),
+            CryptoInput::DecryptInto(_) => unreachable!("decrypt-into handled above"),
+            CryptoInput::VerifyTag { .. } => unreachable!("tag check handled above"),
             CryptoInput::Encrypt {
                 page,
+                page_size,
                 plaintext,
                 ciphertext,
             } => {
@@ -602,177 +955,129 @@ impl PageCryptoEngine {
                 let length = u32::try_from(raw.len()).map_err(|_| Error::InvalidRequest)?;
                 let envelope = PageEnvelope {
                     cipher: crate::model::PageCipher::Xaes256Gcm,
+                    page_size: *page_size,
                     page: page.clone(),
                     key_id: key.id(),
-                    nonce: fresh_nonce()?,
+                    nonce: fresh_nonce(&ctx.rng)?,
                     plaintext_length: length,
                     ciphertext_length: length.checked_add(16).ok_or(Error::InvalidRequest)?,
                 };
-                let aad = page_aad(&envelope)?;
-                let charge = match &*ciphertext {
-                    EncryptOutput::Unaligned(reservation) => {
-                        reservation.validate(
-                            ResourceClass::Ciphertext,
-                            envelope.ciphertext_length as usize,
-                        )?;
-                        reservation
-                    }
-                    EncryptOutput::Aligned(buffer) => {
-                        buffer
-                            .charge()
-                            .validate(ResourceClass::Ciphertext, buffer.capacity())?;
-                        buffer.charge()
-                    }
-                };
+                PageAad::new(&envelope)?;
+                let charge = ciphertext.charge();
+                charge.validate(ResourceClass::Ciphertext, ciphertext.capacity())?;
                 if charge.key() != Some(&page.version.object.cache) {
                     return Err(Error::InvalidConfiguration);
                 }
-                let mut bytes = Zeroizing::new(Vec::new());
                 let cache = &page.version.object.cache;
-                let output = match ciphertext {
-                    EncryptOutput::Unaligned(reservation) => {
-                        bytes = Zeroizing::new(
-                            reservation.buffer(envelope.ciphertext_length as usize)?,
-                        );
-                        &mut bytes[..]
-                    }
-                    EncryptOutput::Aligned(buffer) => {
-                        if buffer.len() != envelope.ciphertext_length as usize {
-                            return Err(Error::InvalidConfiguration);
-                        }
-                        buffer.as_mut_slice()
-                    }
-                };
+                if ciphertext.len() != envelope.ciphertext_length as usize {
+                    return Err(Error::InvalidConfiguration);
+                }
+                let output = ciphertext.as_mut_slice();
                 // Plaintext input remains immutable until the final cancellation
                 // check. AEAD output is erased if sealing fails part way, since
                 // pooled ciphertext storage is recycled without a wipe.
-                if let Err(error) = key.seal_page(cache, &envelope.nonce.0, &aad, raw, &mut *output)
-                {
+                if let Err(error) = with_page_aad(&envelope, |aad| {
+                    key.seal_page(cache, &envelope.nonce.0, aad, raw, &mut *output)
+                })? {
                     output.fill(0);
                     return Err(error.into());
                 }
-                (envelope, bytes)
+                envelope
             }
             CryptoInput::Decrypt {
                 ciphertext,
                 plaintext,
             } => {
                 let envelope = ciphertext.envelope();
-                if let Some(bytes) = Self::open_fused(key, ciphertext, plaintext, permit, scope)? {
-                    (envelope.clone(), bytes)
-                } else {
-                    ciphertext.verify_checksum().inspect_err(|_| {
-                        permit.rejected(IntegrityRejection::Crc);
-                    })?;
+                {
                     if key.cache() != &envelope.page.version.object.cache
                         || key.id() != envelope.key_id
                     {
                         return Err(Error::MissingKey);
                     }
-                    let aad = page_aad(envelope)?;
+                    PageAad::new(envelope)?;
                     let length = envelope.plaintext_length as usize;
                     if ciphertext.bytes().len() != envelope.ciphertext_length as usize
                         || length.checked_add(TAG_LEN) != Some(ciphertext.bytes().len())
                     {
                         return Err(Error::CorruptRecord);
                     }
-                    plaintext
-                        .validate(ResourceClass::Plaintext, envelope.plaintext_length as usize)?;
-                    if plaintext.key() != Some(&envelope.page.version.object.cache) {
+                    let charge = plaintext.charge();
+                    if plaintext.len() != length
+                        || charge
+                            .validate(ResourceClass::Plaintext, plaintext.capacity())
+                            .is_err()
+                    {
                         return Err(Error::InvalidConfiguration);
                     }
-                    // Decryption allocates only plaintext-length storage,
-                    // never an uncharged tag-sized tail under plaintext admission.
-                    let mut bytes = Zeroizing::new(plaintext.buffer(length)?);
-                    key.open_page(
-                        &envelope.page.version.object.cache,
-                        envelope.key_id,
-                        &envelope.nonce.0,
-                        &aad,
-                        ciphertext.bytes(),
-                        &mut bytes,
-                    )
-                    .map_err(|_| {
+                    if charge.key() != Some(&envelope.page.version.object.cache) {
+                        return Err(Error::InvalidConfiguration);
+                    }
+                    with_page_aad(envelope, |aad| {
+                        key.open_page(
+                            &envelope.page.version.object.cache,
+                            envelope.key_id,
+                            &envelope.nonce.0,
+                            aad,
+                            ciphertext.bytes(),
+                            &mut plaintext[..],
+                        )
+                        .map_err(|_| aad.to_vec())
+                    })?
+                    .map_err(|aad| {
+                        // Erase partial output now; the storage outlives the
+                        // failure with the returned input.
+                        plaintext.fill(0);
                         permit.rejected(IntegrityRejection::Aead);
-                        permit.aead_failure =
-                            Some(capture_aead_failure(ciphertext, &aad, scope.request));
+                        permit.aead_failure = Some(capture_aead_failure(
+                            ciphertext,
+                            &aad,
+                            scope.request,
+                            crate::telemetry::unix_millis(ctx.clock.wall_now()),
+                        ));
                         Error::CorruptRecord
                     })?;
-                    (envelope.clone(), bytes)
+                    envelope.clone()
                 }
             }
         };
         scope.check().inspect_err(|error| {
             permit.measurement.scope_failure = crate::telemetry::DecryptScopeFailure::Final(*error);
         })?;
-        Ok((envelope, std::mem::take(&mut bytes)))
+        Ok(envelope)
     }
 
     /// Infallible ownership transfer after preparation; failures never consume input.
-    fn complete(
-        input: CryptoInput,
-        envelope: PageEnvelope,
-        mut bytes: Zeroizing<Vec<u8>>,
-    ) -> CryptoOutcome {
+    fn complete(input: CryptoInput, envelope: PageEnvelope) -> CryptoOutcome {
         match input {
             CryptoInput::VerifyEnvelope(_) => unreachable!("envelope handled above"),
-            CryptoInput::Checksum { ciphertext } => {
-                CryptoOutcome::Completed(CryptoOutput::Checksummed(ciphertext))
+            CryptoInput::DecryptInto(_) => unreachable!("decrypt-into handled above"),
+            CryptoInput::VerifyTag { ciphertext } => {
+                CryptoOutcome::Completed(CryptoOutput::TagVerified(ciphertext))
             }
             CryptoInput::Encrypt {
                 page,
                 plaintext,
                 ciphertext,
+                ..
             } => {
-                let (plain, reservation) = plaintext.into_parts();
                 let plain = VerifiedPage {
                     inner: Arc::new(VerifiedBytes {
                         page,
-                        storage: flow_control::ChargedBytes {
-                            bytes: plain.into_vec(),
-                            reservation,
-                        },
+                        storage: plaintext.into_buf(),
                     }),
                 };
-                let encrypted = match ciphertext {
-                    EncryptOutput::Unaligned(mut reservation) => {
-                        reservation
-                            .shrink(bytes.capacity())
-                            .expect("validated crypto capacity");
-                        CiphertextPage {
-                            provenance: None,
-                            inner: Arc::new(CiphertextBytes {
-                                checksum: std::sync::OnceLock::from(racer_crypto::crc64(&bytes)),
-                                envelope,
-                                storage: flow_control::ChargedBytes {
-                                    bytes: std::mem::take(&mut *bytes),
-                                    reservation,
-                                }
-                                .into(),
-                            }),
-                        }
-                    }
-                    EncryptOutput::Aligned(buffer) => {
-                        let checksum = racer_crypto::crc64(buffer.as_slice());
-                        CiphertextPage::from_aligned(*buffer, envelope, Some(checksum))
-                    }
-                };
+                let encrypted = CiphertextPage::from_aligned(*ciphertext, envelope);
                 CryptoOutcome::Completed(CryptoOutput::Encrypted(plain, encrypted))
             }
             CryptoInput::Decrypt {
                 ciphertext,
-                mut plaintext,
+                plaintext,
             } => {
-                plaintext
-                    .shrink(bytes.capacity())
-                    .expect("validated crypto capacity");
                 let page = VerifiedPage {
                     inner: Arc::new(VerifiedBytes {
                         page: envelope.page,
-                        storage: flow_control::ChargedBytes {
-                            bytes: std::mem::take(&mut *bytes),
-                            reservation: plaintext,
-                        },
+                        storage: plaintext,
                     }),
                 };
                 CryptoOutcome::Completed(CryptoOutput::Decrypted(page, ciphertext))
@@ -780,26 +1085,140 @@ impl PageCryptoEngine {
         }
     }
     fn drive(&mut self, cx: &mut Context<'_>, budget: usize) -> Result<()> {
-        let _environment = self.environment.enter();
-        self.executor
-            .poll(&mut self.runtime.port.queue, cx, budget, |mut job| {
-                job.permit.dequeued();
-                Self::process(job)
-            })
-            .map_err(Into::into)
+        // Publish completions a thief could not, before taking more work.
+        {
+            let mut slot = self.share.slot(self.lane);
+            let shared = slot.as_mut().ok_or(Error::Io)?;
+            if !shared
+                .owner
+                .as_ref()
+                .is_some_and(|w| w.will_wake(cx.waker()))
+            {
+                shared.owner = Some(cx.waker().clone());
+            }
+            while let Some(completion) = shared.deferred.pop_front() {
+                if let Err(failure) = shared.port.complete(completion) {
+                    shared.deferred.push_front(failure.command);
+                    return Err(failure.error.into());
+                }
+            }
+        }
+        let mut processed = 0;
+        while processed < budget {
+            let (own, backlog) = {
+                let mut slot = self.share.slot(self.lane);
+                let shared = slot.as_mut().ok_or(Error::Io)?;
+                match shared.port.poll_job(cx) {
+                    Poll::Pending => (None, false),
+                    Poll::Ready(Err(error)) => return Err(error.into()),
+                    Poll::Ready(Ok(None)) => {
+                        shared.closed = true;
+                        (None, false)
+                    }
+                    Poll::Ready(Ok(Some(job))) => {
+                        shared.in_flight += 1;
+                        (Some(job), shared.port.has_jobs())
+                    }
+                }
+            };
+            if backlog {
+                self.share.wake_idle(self.lane);
+            }
+            let (source, job) = match own {
+                Some(job) => (self.lane, job),
+                None => match self.share.take_foreign() {
+                    Some(forwarded) => {
+                        self.run_forwarded(forwarded);
+                        processed += 1;
+                        continue;
+                    }
+                    None => match self.share.steal(self.lane, &mut self.cursor) {
+                        Some(stolen) => stolen,
+                        None => break,
+                    },
+                },
+            };
+            // A job for memory on another node runs on that node's helpers.
+            let Some(mut job) = self.share.forward(source, job) else {
+                processed += 1;
+                continue;
+            };
+            job.permit.dequeued(self.ctx.clock.now());
+            job.permit.measurement.stolen = source != self.lane;
+            let completion = Self::process(job, &self.ctx);
+            processed += 1;
+            if source != self.lane {
+                self.share.finish_stolen(source, completion);
+                continue;
+            }
+            let mut slot = self.share.slot(self.lane);
+            let shared = slot.as_mut().ok_or(Error::Io)?;
+            shared.in_flight -= 1;
+            if let Err(failure) = shared.port.complete(completion) {
+                shared.deferred.push_back(failure.command);
+                return Err(failure.error.into());
+            }
+        }
+        if budget != 0 && processed == budget {
+            self.share.clear_idle(self.lane);
+            cx.waker().wake_by_ref();
+        } else if budget != 0 {
+            // Advertise idleness, then recheck so a backlog published in
+            // between is not missed.
+            self.share.set_idle(self.lane, cx.waker());
+            if self.share.backlog_except(self.lane) {
+                self.share.clear_idle(self.lane);
+                cx.waker().wake_by_ref();
+            }
+        }
+        Ok(())
+    }
+    /// Run a job forwarded from another node and complete it on its owner.
+    fn run_forwarded(&self, forwarded: Forwarded) {
+        let Forwarded {
+            origin,
+            lane,
+            mut job,
+        } = forwarded;
+        job.permit.dequeued(self.ctx.clock.now());
+        let completion = Self::process(job, &self.ctx);
+        origin.finish_stolen(lane, completion);
+    }
+    /// Closed, with no job queued, running elsewhere, or awaiting publication.
+    fn is_drained(&self) -> bool {
+        self.share.slot(self.lane).as_ref().is_none_or(|shared| {
+            shared.closed && shared.in_flight == 0 && shared.deferred.is_empty()
+        })
     }
 }
-impl uring_runtime::group::Service<RequestScope> for PageCryptoEngine {
+impl Drop for PageCryptoEngine {
+    /// Remove this lane from its share; dropping the port announces closure.
+    fn drop(&mut self) {
+        self.share.clear_idle(self.lane);
+        let shared = self.share.slot(self.lane).take();
+        drop(shared);
+        // The last helper of the share runs jobs forwarded to it, so their
+        // owner lanes still see every completion.
+        if (0..self.share.lanes.len()).all(|lane| self.share.slot(lane).is_none()) {
+            for forwarded in self.share.close_foreign() {
+                self.run_forwarded(forwarded);
+            }
+        }
+    }
+}
+impl crate::lifecycle::Service<RequestScope> for PageCryptoEngine {
     fn register_driver(&self, waker: &std::task::Waker) {
-        self.runtime.port.register_driver(waker);
+        if let Some(shared) = self.share.slot(self.lane).as_ref() {
+            shared.port.register_driver(waker);
+        }
     }
     fn start<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
-        Box::pin(self.environment.scope(async move { scope.check() }))
+        Box::pin(async move { scope.check() })
     }
     fn poll_budgeted(&mut self, cx: &mut Context<'_>, work_budget: usize) -> Result<()> {
         // A helper error ends the worker group; name it before the process exits.
         self.drive(cx, work_budget).inspect_err(|error| {
-            if *error != Error::Cancelled {
+            if *error != Error::Canceled {
                 eprintln!("racer: stage=crypto-helper fatal error={error:?}");
             }
         })
@@ -811,7 +1230,7 @@ impl uring_runtime::group::Service<RequestScope> for PageCryptoEngine {
             if let Err(error) = self.drive(cx, 1) {
                 return Poll::Ready(Err(error));
             }
-            if self.executor.is_drained() {
+            if self.is_drained() {
                 Poll::Ready(Ok(()))
             } else {
                 let _ = scope;
@@ -904,6 +1323,8 @@ fn credential_bounds(
 pub struct CredentialCrypto {
     keys: Rc<Keyring>,
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
+    /// Credential nonces: [`racer_io::Rng::os`] outside simulation.
+    rng: racer_io::Rng,
 }
 impl CredentialCrypto {
     /// Independently charged zeroizing context. Warm admission may transfer this
@@ -936,8 +1357,16 @@ impl CredentialCrypto {
             _reservation: reservation,
         })
     }
-    pub fn new(keys: Rc<Keyring>, admission: Rc<flow_control::Quotas<AdmissionPolicy>>) -> Self {
-        Self { keys, admission }
+    pub fn new(
+        keys: Rc<Keyring>,
+        admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
+        rng: racer_io::Rng,
+    ) -> Self {
+        Self {
+            keys,
+            admission,
+            rng,
+        }
     }
     /// Borrow only for this bounded synchronous call; never retain, clone, enqueue,
     /// or cache the raw context. Each retry/fanout uses a new attempt ID and calls
@@ -991,7 +1420,7 @@ impl CredentialCrypto {
             let key = self
                 .keys
                 .active(&context.object.cache, KeyPurpose::OriginCredentials)?;
-            let nonce = fresh_nonce()?;
+            let nonce = fresh_nonce(&self.rng)?;
             let aad = credential_aad(key.id(), &context.object, scope.request, attempt, metadata)?;
             let mut bytes = Zeroizing::new(vec![0; raw.len() + TAG_LEN]);
             key.seal_credentials(&context.object.cache, &nonce.0, &aad, raw, &mut bytes)
@@ -1095,8 +1524,8 @@ pub struct CryptoSendFailure<T> {
     pub command: T,
     pub error: Error,
 }
-impl<T> From<uring_runtime::channel::SendFailure<T>> for CryptoSendFailure<T> {
-    fn from(failure: uring_runtime::channel::SendFailure<T>) -> Self {
+impl<T> From<racer_io::xthread::spsc::SendFailure<T>> for CryptoSendFailure<T> {
+    fn from(failure: racer_io::xthread::spsc::SendFailure<T>) -> Self {
         Self {
             command: failure.command,
             error: failure.error.into(),
@@ -1158,38 +1587,37 @@ impl PartialOrd for CryptoId {
 pub enum CryptoInput {
     /// Authenticate owned headers and hops without touching page body bytes.
     VerifyEnvelope(Box<crate::peer::forwarding::EnvelopeJob>),
-    /// Check a stored CRC without allocating plaintext or running AEAD.
-    Checksum { ciphertext: CiphertextPage },
+    /// Check the stored AEAD tag without allocating plaintext or decrypting.
+    VerifyTag { ciphertext: CiphertextPage },
+    /// Authenticate a sealed page and decrypt it straight into a host-read
+    /// destination. Carries its own derived key, so it takes no key lease.
+    DecryptInto(Box<crate::client::direct::DecryptInto>),
+    /// `plaintext` is pooled storage of exactly the plaintext length,
+    /// checked out by the requesting worker.
     Decrypt {
         ciphertext: CiphertextPage,
-        plaintext: flow_control::Charge<AdmissionPolicy>,
+        plaintext: crate::memory::PlaintextBuf,
     },
     Encrypt {
         page: PageId,
+        /// Cluster page size the plaintext was cut at.
+        page_size: racer_wire::object::PageSize,
         plaintext: PlaintextBuffer,
-        ciphertext: EncryptOutput,
+        /// Aligned AEAD output checked out of the requesting worker's pool,
+        /// already charged; the page is held as disk-aligned ciphertext.
+        ciphertext: Box<crate::memory::CiphertextBuffer>,
     },
-}
-/// Where AEAD output is written.
-pub enum EncryptOutput {
-    /// A fresh `Vec` charged to this Ciphertext reservation.
-    Unaligned(flow_control::Charge<AdmissionPolicy>),
-    /// Aligned storage checked out of the requesting worker's pool, already
-    /// charged; the page is held as disk-aligned ciphertext.
-    Aligned(Box<crate::memory::CiphertextBuffer>),
-}
-impl From<flow_control::Charge<AdmissionPolicy>> for EncryptOutput {
-    fn from(reservation: flow_control::Charge<AdmissionPolicy>) -> Self {
-        Self::Unaligned(reservation)
-    }
 }
 pub enum CryptoOutput {
     EnvelopeVerified(Box<crate::peer::forwarding::EnvelopeOutput>),
-    Checksummed(CiphertextPage),
+    TagVerified(CiphertextPage),
     /// Retain original ciphertext through completion too; I/O decides whether to
     /// retain it for peer copies/persistence after consuming the completion.
     Decrypted(VerifiedPage, CiphertextPage),
     Encrypted(VerifiedPage, CiphertextPage),
+    /// The page is in the destination. The job returns so its ciphertext is
+    /// released on I/O.
+    DecryptedInto(Box<crate::client::direct::DecryptInto>),
 }
 /// Non-cloneable, pair-bound reservation of both submission and completion space.
 /// Only the I/O endpoint can mint it. Failed submission returns the entire job.
@@ -1209,7 +1637,7 @@ pub struct CryptoPermit {
 /// Per-job timing and integrity observations, published only at I/O completion.
 #[derive(Default)]
 struct Measurement {
-    checksum_only: bool,
+    verify_only: bool,
 
     decrypt: bool,
 
@@ -1226,6 +1654,15 @@ struct Measurement {
     failure: Option<DecryptFailureMeta>,
 
     scope_failure: crate::telemetry::DecryptScopeFailure,
+
+    /// Executed by a sibling helper rather than the lane's own.
+    stolen: bool,
+
+    /// NUMA node whose helpers should run the job, if any.
+    node: Option<u16>,
+
+    /// Forwarded to a helper on [`Self::node`] from another node's helper.
+    forwarded: bool,
 }
 struct DecryptFailureMeta {
     request: RequestId,
@@ -1234,12 +1671,10 @@ struct DecryptFailureMeta {
 /// Exact failed integrity check, not a diagnosis of where bytes became invalid.
 #[derive(Clone, Copy)]
 pub(crate) enum IntegrityRejection {
-    Crc,
     Aead,
 }
-fn elapsed_ns(start: std::time::Instant) -> u64 {
-    uring_runtime::environment::now()
-        .saturating_duration_since(start)
+fn elapsed_ns(now: std::time::Instant, start: std::time::Instant) -> u64 {
+    now.saturating_duration_since(start)
         .as_nanos()
         .min(u128::from(u64::MAX)) as u64
 }
@@ -1258,18 +1693,21 @@ impl CryptoPermit {
     }
 
     /// Start queue timing at each publication attempt, including a retry.
-    fn submitted(&mut self) {
-        self.measurement.submitted = Some(uring_runtime::environment::now());
+    fn submitted(&mut self, now: std::time::Instant) {
+        self.measurement.submitted = Some(now);
     }
 
     /// Stop queue timing when the worker takes ownership, before execution.
-    fn dequeued(&mut self) {
-        self.measurement.queue_ns = self.measurement.submitted.map(elapsed_ns);
+    fn dequeued(&mut self, now: std::time::Instant) {
+        self.measurement.queue_ns = self
+            .measurement
+            .submitted
+            .map(|start| elapsed_ns(now, start));
     }
 
     /// Record elapsed execution even for failed or canceled accepted jobs.
-    pub(crate) fn executed(&mut self, start: std::time::Instant) {
-        self.measurement.execution_ns = Some(elapsed_ns(start));
+    pub(crate) fn executed(&mut self, now: std::time::Instant, start: std::time::Instant) {
+        self.measurement.execution_ns = Some(elapsed_ns(now, start));
     }
 
     /// Retain the exact integrity check that rejected this job.
@@ -1283,7 +1721,7 @@ impl CryptoCompletion {
     fn record(&self, metrics: &crate::telemetry::Metrics) {
         use crate::telemetry::Event::*;
         let m = &self.permit.measurement;
-        if m.checksum_only {
+        if m.verify_only {
             return;
         }
         let Some(execution) = m.execution_ns else {
@@ -1326,6 +1764,12 @@ impl CryptoCompletion {
         for (event, amount) in events.into_iter().zip(amounts) {
             metrics.record(event, amount);
         }
+        if m.stolen {
+            metrics.record(CryptoStolenJobs, 1);
+        }
+        if m.forwarded {
+            metrics.record(crate::telemetry::Event::CryptoForwardedJobs, 1);
+        }
         if m.decrypt
             && let CryptoOutcome::Failed { error, .. } = self.outcome
         {
@@ -1337,7 +1781,6 @@ impl CryptoCompletion {
         if let Some(rejection) = m.rejection {
             metrics.record(
                 match rejection {
-                    IntegrityRejection::Crc => CryptoDecryptCrcRejected,
                     IntegrityRejection::Aead => CryptoDecryptAeadRejected,
                 },
                 1,
@@ -1354,18 +1797,19 @@ pub struct CryptoJob {
 }
 impl CryptoPermit {
     pub fn job(mut self, input: CryptoInput, key: KeyLease, scope: RequestScope) -> CryptoJob {
-        use uring_runtime::reactor::IoBuffer;
-        self.measurement.checksum_only = matches!(
+        use racer_io::ring::IoBuffer;
+        self.measurement.verify_only = matches!(
             input,
-            CryptoInput::Checksum { .. } | CryptoInput::VerifyEnvelope(_)
+            CryptoInput::VerifyTag { .. } | CryptoInput::VerifyEnvelope(_)
         );
         self.measurement.decrypt = matches!(input, CryptoInput::Decrypt { .. });
         self.measurement.bytes = match &input {
             CryptoInput::VerifyEnvelope(_) => 0,
+            CryptoInput::DecryptInto(job) => job.len(),
             CryptoInput::Encrypt { plaintext, .. } => {
                 plaintext.bytes().map_or(0, |b| b.len() as u64)
             }
-            CryptoInput::Decrypt { ciphertext, .. } | CryptoInput::Checksum { ciphertext } => {
+            CryptoInput::Decrypt { ciphertext, .. } | CryptoInput::VerifyTag { ciphertext } => {
                 u64::from(ciphertext.envelope().plaintext_length)
             }
         };
@@ -1401,9 +1845,9 @@ pub struct CryptoCompletion {
     pub(crate) _key: Option<KeyLease>,
 }
 impl CryptoCompletion {
-    fn decrypt_failure(&self) -> Option<crate::telemetry::DecryptFailure> {
+    fn decrypt_failure(&self, reap_ms: u64) -> Option<crate::telemetry::DecryptFailure> {
         let m = &self.permit.measurement;
-        if !m.decrypt || m.checksum_only || m.execution_ns.is_none() {
+        if !m.decrypt || m.verify_only || m.execution_ns.is_none() {
             return None;
         }
         let CryptoOutcome::Failed { input, error } = &self.outcome else {
@@ -1418,10 +1862,11 @@ impl CryptoCompletion {
                 CryptoInput::Decrypt { ciphertext, .. } => {
                     Some(ciphertext.envelope().page.number.0)
                 }
+                CryptoInput::DecryptInto(job) => Some(job.page_number()),
                 _ => None,
             },
             engine_ms: m.failure.as_ref().map(|f| f.engine_ms),
-            reap_ms: Failure::new(Stage::PeerDecode, *error).unix_millis,
+            reap_ms,
             scope_failure: m.scope_failure,
             queue_ns: m.queue_ns,
             execution_ns: m.execution_ns,
@@ -1444,11 +1889,15 @@ pub struct IoCryptoPort {
 }
 pub struct CryptoPort {
     queue: offload::WorkerPort<CryptoId, CryptoJob, CryptoCompletion>,
+
+    share: Option<(Arc<CryptoShare>, usize)>,
 }
 /// Crypto-thread resources, independent of the I/O worker service graph.
 pub struct CryptoRuntime {
     /// Unique offload worker endpoint, transferred before local construction.
     pub port: CryptoPort,
+    /// The crypto thread's clock and entropy.
+    pub ctx: racer_io::WorkerCtx,
 }
 /// Allocate fixed-capacity handoffs without starting either service.
 pub fn pair(
@@ -1472,7 +1921,13 @@ pub fn try_pair(
         },
         capacity,
     )?;
-    Ok((IoCryptoPort { queue: client }, CryptoPort { queue: worker }))
+    Ok((
+        IoCryptoPort { queue: client },
+        CryptoPort {
+            queue: worker,
+            share: None,
+        },
+    ))
 }
 impl IoCryptoPort {
     /// Atomically reserve both directions. Saturation parks with a wakeup rather
@@ -1493,7 +1948,7 @@ impl IoCryptoPort {
         // Capture at publication attempt, not reservation. Retry overwrites it.
         self.queue
             .try_submit(job, |job| {
-                job.permit.submitted();
+                job.permit.submitted(job.scope.clock().now());
             })
             .map_err(Into::into)
     }
@@ -1517,7 +1972,7 @@ impl CryptoPort {
         let result = self.queue.poll_job(cx).map_err(Into::into);
         match result {
             Poll::Ready(Ok(Some(mut job))) => {
-                job.permit.dequeued();
+                job.permit.dequeued(job.scope.clock().now());
                 Poll::Ready(Ok(Some(job)))
             }
             other => other,
@@ -1551,6 +2006,21 @@ impl CryptoClient {
         scope: &'a RequestScope,
     ) -> Operation<'a, CryptoOutput> {
         self.execute_inner(CryptoInput::VerifyEnvelope(job), None, scope, None)
+    }
+    /// Decrypt a sealed page into a host-read destination on the crypto
+    /// worker. Returns the job once the page is authenticated and written.
+    pub(crate) async fn decrypt_into(
+        &self,
+        job: Box<crate::client::direct::DecryptInto>,
+        scope: &RequestScope,
+    ) -> Result<Box<crate::client::direct::DecryptInto>> {
+        match self
+            .execute_inner(CryptoInput::DecryptInto(job), None, scope, None)
+            .await?
+        {
+            CryptoOutput::DecryptedInto(job) => Ok(job),
+            _ => Err(Error::Internal),
+        }
     }
     pub fn new(port: IoCryptoPort) -> Self {
         let executor = offload::Client::new(NonZeroUsize::new(port.queue.capacity()).unwrap());
@@ -1600,6 +2070,7 @@ impl CryptoClient {
                 .execute(
                     &self.port.queue,
                     scope,
+                    scope.clock().now(),
                     |sequence| CryptoId {
                         worker: self.port.queue.identity().worker,
                         generation: self.port.queue.identity().generation,
@@ -1612,8 +2083,18 @@ impl CryptoClient {
                         let mut permit = CryptoPermit::new(reservation, sample);
                         if let Some(key) = key {
                             permit.job(input, key, scope.clone())
+                        } else if let CryptoInput::DecryptInto(job) = &input {
+                            permit.measurement.decrypt = true;
+                            permit.measurement.bytes = job.len();
+                            permit.measurement.node = job.node;
+                            CryptoJob {
+                                input,
+                                key: None,
+                                scope: scope.clone(),
+                                permit,
+                            }
                         } else {
-                            permit.measurement.checksum_only = true;
+                            permit.measurement.verify_only = true;
                             CryptoJob {
                                 input,
                                 key: None,
@@ -1623,7 +2104,7 @@ impl CryptoClient {
                         }
                     },
                     |job| {
-                        job.permit.submitted();
+                        job.permit.submitted(job.scope.clock().now());
                     },
                 )
                 .await?;
@@ -1644,10 +2125,28 @@ impl CryptoClient {
     fn observe(&self, completion: &CryptoCompletion) {
         if let Some(metrics) = self.metrics.borrow().as_ref() {
             completion.record(metrics);
+            if let CryptoOutcome::Completed(CryptoOutput::DecryptedInto(job)) = &completion.outcome
+            {
+                metrics.record(crate::telemetry::Event::HostReadDirectDecrypt, 1);
+                metrics.record(
+                    crate::telemetry::Event::HostReadDirectDecryptBytes,
+                    job.len(),
+                );
+                if job.fused() {
+                    metrics.record(crate::telemetry::Event::HostReadFusedDecrypt, 1);
+                }
+                for event in job.numa.iter().flat_map(|numa| numa.events()) {
+                    metrics.record(event, 1);
+                }
+            }
         }
-        if let Some(failure) = completion.decrypt_failure() {
-            self.observer.borrow().record_decrypt(failure);
+        let observer = self.observer.borrow();
+        if let Some(reap_ms) = observer.unix_millis()
+            && let Some(failure) = completion.decrypt_failure(reap_ms)
+        {
+            observer.record_decrypt(failure);
         }
+        drop(observer);
         let id = completion.id();
         if let Some(sample) = &completion.permit.send_sample {
             sample.finish(match &completion.outcome {
@@ -1680,19 +2179,18 @@ impl CryptoClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lifecycle::Service;
     use crate::model::*;
-    use racer_control_wire::CacheId;
-    use racer_control_wire::KeyId;
-    use uring_runtime::group::Service;
+    use racer_wire::control::CacheId;
+    use racer_wire::control::KeyId;
 
     /// Publication retries reset only queue timing, not execution or ownership.
     #[test]
     fn permit_bookkeeping_preserves_missing_submission_and_retry_timing() {
         use std::time::Duration;
-        use uring_runtime::environment::{SimulationClock, now};
 
-        let clock = SimulationClock::new(817);
-        let _environment = clock.environment(0).enter();
+        let clock = racer_io::SimClock::new(817);
+        let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
         let (port, _worker) = pair(WorkerId(0), 1, NonZeroUsize::new(1).unwrap());
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         let id = CryptoId {
@@ -1706,17 +2204,17 @@ mod tests {
         assert!(permit.send_sample.is_none());
         assert!(permit.aead_failure.is_none());
         assert_eq!(permit.measurement.execution_ns, None);
-        permit.dequeued();
+        permit.dequeued(env.ctx.now());
         assert_eq!(permit.measurement.queue_ns, None);
-        permit.submitted();
+        permit.submitted(env.ctx.now());
         clock.advance(Duration::from_nanos(11));
-        permit.submitted();
+        permit.submitted(env.ctx.now());
         clock.advance(Duration::from_nanos(7));
-        permit.dequeued();
+        permit.dequeued(env.ctx.now());
         assert_eq!(permit.measurement.queue_ns, Some(7));
-        let start = now();
+        let start = env.ctx.now();
         clock.advance(Duration::from_nanos(5));
-        permit.executed(start);
+        permit.executed(env.ctx.now(), start);
         permit.rejected(IntegrityRejection::Aead);
         assert_eq!(permit.measurement.execution_ns, Some(5));
         assert!(matches!(
@@ -1811,16 +2309,18 @@ mod tests {
     mod credentials {
         use super::*;
         use crate::model::CacheKey;
-        use racer_control_wire::CacheId;
+        use racer_wire::control::CacheId;
 
         #[test]
         fn local_context_is_independently_charged_and_keeps_exact_sensitive_fields() {
-            let keys = Rc::new(crate::test_support::security::keys());
+            let env = racer_io::Env::host();
+            let keys = Rc::new(crate::test_support::security::keys(&env));
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(false).limits,
             )));
-            let crypto = CredentialCrypto::new(keys, admission.clone());
-            let scope = RequestScope::new(
+            let crypto =
+                CredentialCrypto::new(keys, admission.clone(), racer_io::WorkerCtx::host().rng);
+            let scope = RequestScope::host(
                 RequestId([4; 16]),
                 std::time::Instant::now() + std::time::Duration::from_secs(5),
             )
@@ -1846,13 +2346,13 @@ mod tests {
             scope.cancel().unwrap();
             assert!(matches!(
                 crypto.local_context(&first, &scope),
-                Err(Error::Cancelled)
+                Err(Error::Canceled)
             ));
             drop((first, second));
             assert_eq!(admission.used(ResourceClass::RequestContext), 0);
         }
         fn scope() -> RequestScope {
-            RequestScope::new(
+            RequestScope::host(
                 RequestId([1; 16]),
                 std::time::Instant::now() + std::time::Duration::from_secs(10),
             )
@@ -1870,12 +2370,14 @@ mod tests {
         }
         #[test]
         fn exact_roundtrip_nonce_freshness_admission_and_cancellation() {
+            let env = racer_io::Env::host();
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(false).limits,
             )));
             let crypto = CredentialCrypto::new(
-                Rc::new(crate::test_support::security::keys()),
+                Rc::new(crate::test_support::security::keys(&env)),
                 admission.clone(),
+                racer_io::WorkerCtx::host().rng,
             );
             let original = origin();
             let scope = scope();
@@ -1902,14 +2404,15 @@ mod tests {
             scope.cancel().unwrap();
             assert!(matches!(
                 crypto.seal(&original, attempt, &scope),
-                Err(Error::Cancelled)
+                Err(Error::Canceled)
             ));
             assert_eq!(admission.used(ResourceClass::RequestContext), 0);
             let mut limits = crate::test_support::cluster::config(false).limits;
             limits.request_context_bytes = std::num::NonZeroUsize::new(1).unwrap();
             let crypto = CredentialCrypto::new(
-                Rc::new(crate::test_support::security::keys()),
+                Rc::new(crate::test_support::security::keys(&env)),
                 Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits))),
+                racer_io::WorkerCtx::host().rng,
             );
             assert!(matches!(
                 crypto.seal(&original, attempt, &self::scope()),
@@ -1918,12 +2421,14 @@ mod tests {
         }
         #[test]
         fn absent_authorization_is_charged_and_expired_context_is_rejected() {
+            let env = racer_io::Env::host();
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(false).limits,
             )));
             let crypto = CredentialCrypto::new(
-                Rc::new(crate::test_support::security::keys()),
+                Rc::new(crate::test_support::security::keys(&env)),
                 admission.clone(),
+                racer_io::WorkerCtx::host().rng,
             );
             let mut original = origin();
             original.authorization = None;
@@ -1944,17 +2449,19 @@ mod tests {
             scope.cancel().unwrap();
             assert!(matches!(
                 crypto.open_charged(sealed, scope.request, attempt),
-                Err(Error::Cancelled)
+                Err(Error::Canceled)
             ));
             assert_eq!(admission.used(ResourceClass::RequestContext), 0);
         }
         #[test]
         fn rejects_substitution_and_distinguishes_absent_from_empty() {
+            let env = racer_io::Env::host();
             let crypto = CredentialCrypto::new(
-                Rc::new(crate::test_support::security::keys()),
+                Rc::new(crate::test_support::security::keys(&env)),
                 Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                     crate::test_support::cluster::config(false).limits,
                 ))),
+                racer_io::WorkerCtx::host().rng,
             );
             let original = origin();
             let scope = scope();
@@ -2041,7 +2548,7 @@ mod tests {
         //! request latency.
 
         use crate::security::*;
-        use racer_control_wire::CacheId;
+        use racer_wire::control::CacheId;
 
         #[cfg(test)]
         mod measurement {
@@ -2060,10 +2567,10 @@ mod tests {
             use crate::telemetry::Event::*;
             use crate::telemetry::Metrics;
             use racer_crypto::TAG_LEN;
+            use racer_io::ring::IoBuffer;
             use std::rc::Rc;
             use std::time::Duration;
             use std::time::Instant;
-            use uring_runtime::reactor::IoBuffer;
 
             fn page() -> PageId {
                 PageId {
@@ -2079,10 +2586,11 @@ mod tests {
             }
             fn envelope(size: usize) -> PageEnvelope {
                 PageEnvelope {
+                    page_size: racer_wire::object::PageSize::DEFAULT,
                     cipher: crate::model::PageCipher::Xaes256Gcm,
                     page: page(),
                     key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
-                    nonce: Nonce([2; 24]),
+                    nonce: Nonce(crate::test_support::test_vector([2; 24])),
                     plaintext_length: size as u32,
                     ciphertext_length: size as u32 + 16,
                 }
@@ -2093,7 +2601,7 @@ mod tests {
                     let (CryptoOutput::Encrypted(plain, ciphertext)
                     | CryptoOutput::Decrypted(plain, ciphertext)) = output
                     else {
-                        panic!("AEAD measurement received checksum-only output");
+                        panic!("AEAD measurement received verify-only output");
                     };
                     assert_eq!(plain.bytes().len(), size);
                     assert_eq!(ciphertext.bytes().len(), size + 16);
@@ -2101,11 +2609,11 @@ mod tests {
                     assert_eq!(plain.bytes()[size - 1], 7);
                 }
             }
-            fn lifecycle(size: usize, paired: bool, operation: &str) {
+            fn lifecycle(env: &racer_io::Env, size: usize, paired: bool, operation: &str) {
                 let inputs = MeasurementInputs::new(size, operation);
                 let admission = &inputs.admission;
                 let cache = &inputs.page.version.object.cache;
-                let keys = tests::keyring();
+                let keys = tests::keyring(env);
                 let iterations = 16;
                 let concurrency = if paired { 8 } else { 1 };
                 let (io, mut engine) =
@@ -2118,13 +2626,20 @@ mod tests {
                             }))
                             .unwrap();
                             let Some(job) = job else { break };
-                            assert!(engine.complete(PageCryptoEngine::process(job)).is_ok());
+                            assert!(
+                                engine
+                                    .complete(PageCryptoEngine::process(
+                                        job,
+                                        &racer_io::WorkerCtx::host()
+                                    ))
+                                    .is_ok()
+                            );
                         }
                     }))
                 } else {
                     None
                 };
-                let scope = RequestScope::new(
+                let scope = RequestScope::host(
                     RequestId([0; 16]),
                     Instant::now() + Duration::from_secs(240),
                 )
@@ -2153,7 +2668,7 @@ mod tests {
                     if paired {
                         assert!(io.try_submit(job).is_ok());
                     } else {
-                        let result = PageCryptoEngine::process(job);
+                        let result = PageCryptoEngine::process(job, &racer_io::WorkerCtx::host());
                         validate(&result, size);
                         failures +=
                             usize::from(matches!(result.outcome, CryptoOutcome::Failed { .. }));
@@ -2180,7 +2695,6 @@ mod tests {
                 if let Some(thread) = thread {
                     thread.join().unwrap();
                 }
-                admission.reclaim_buffers();
                 assert_eq!(
                     failures,
                     if operation == "bad_tag" {
@@ -2195,40 +2709,51 @@ mod tests {
 
             #[test]
             fn lifecycle_setup_preserves_success_failure_and_quota_cleanup() {
+                let env = racer_io::Env::host();
                 for paired in [false, true] {
                     for operation in ["encrypt", "decrypt", "bad_tag"] {
-                        lifecycle(4095, paired, operation);
+                        lifecycle(&env, 4095, paired, operation);
                     }
                 }
             }
 
             /// Full client submission, waiter registration, real paired execution, I/O reap,
             /// result delivery, and cleanup for both encrypt and decrypt attribution.
-            fn accounting_sample(size: usize, decrypt: bool, iterations: usize) {
+            fn accounting_sample(
+                env: &racer_io::Env,
+                size: usize,
+                decrypt: bool,
+                iterations: usize,
+            ) {
                 let operation = if decrypt { "decrypt" } else { "encrypt" };
                 let inputs = MeasurementInputs::new(size, operation);
                 let admission = &inputs.admission;
-                let keys = tests::keyring();
+                let keys = tests::keyring(env);
                 let cache = &inputs.page.version.object.cache;
                 let metrics = Metrics::default();
                 let (io, mut engine) = pair(WorkerId(0), 0, NonZeroUsize::new(8).unwrap());
                 let client = CryptoClient::new(io);
                 client.set_metrics(metrics.clone());
-                let environment = uring_runtime::environment::Environment::current();
+                let thread_ctx = env.ctx.clone();
                 let thread = std::thread::spawn(move || {
-                    let _env = environment.enter();
+                    let env = racer_io::Env::new(racer_io::Driver::Uring, thread_ctx);
                     while let Some(job) =
                         futures::executor::block_on(futures::future::poll_fn(|cx| {
                             engine.poll_job(cx)
                         }))
                         .unwrap()
                     {
-                        assert!(engine.complete(PageCryptoEngine::process(job)).is_ok());
+                        assert!(
+                            engine
+                                .complete(PageCryptoEngine::process(job, &env.ctx))
+                                .is_ok()
+                        );
                     }
                 });
-                let scope = RequestScope::new(
+                let scope = RequestScope::on(
+                    &env.ctx.clock,
                     RequestId([0; 16]),
-                    uring_runtime::environment::now() + Duration::from_secs(240),
+                    env.ctx.now() + Duration::from_secs(240),
                 )
                 .unwrap();
                 for batch in (0..iterations).step_by(8) {
@@ -2246,7 +2771,7 @@ mod tests {
                         let (CryptoOutput::Encrypted(plain, cipher)
                         | CryptoOutput::Decrypted(plain, cipher)) = &output
                         else {
-                            panic!("AEAD measurement received checksum-only output");
+                            panic!("AEAD measurement received verify-only output");
                         };
                         assert_eq!(plain.bytes().len(), size);
                         assert_eq!((plain.bytes()[0], plain.bytes()[size - 1]), (7, 7));
@@ -2262,7 +2787,6 @@ mod tests {
                 }
                 client.close_submissions().unwrap();
                 thread.join().unwrap();
-                admission.reclaim_buffers();
                 assert_eq!(client.outstanding(), 0);
                 assert!(client.executor.is_empty());
                 assert_eq!(admission.used(ResourceClass::Plaintext), 0);
@@ -2280,7 +2804,7 @@ mod tests {
                 ]) {
                     assert_eq!(metrics.count(event), expected);
                 }
-                if uring_runtime::environment::simulation_seed().is_none() {
+                if !env.ctx.is_simulated() {
                     assert!(metrics.count(events[5]) > 0);
                     assert!(metrics.count(events[7]) > 0);
                 }
@@ -2288,34 +2812,35 @@ mod tests {
 
             #[test]
             fn attribution_preserves_client_cleanup_and_dst() {
-                use uring_runtime::environment;
-                use uring_runtime::environment::SimulationClock;
-                let clock = SimulationClock::new(73);
-                let env = clock.environment(0);
-                let _env = env.enter();
-                let _strict = environment::require_simulated();
+                let clock = racer_io::SimClock::new(73);
+                let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
                 for decrypt in [false, true] {
-                    accounting_sample(63, decrypt, 16);
+                    accounting_sample(&env, 63, decrypt, 16);
                 }
             }
 
             #[test]
             fn decrypt_submission_rejection_is_not_an_executed_failure() {
                 use std::time::Duration;
-                use uring_runtime::environment::{SimulationClock, now};
-                let clock = SimulationClock::new(849);
-                let _environment = clock.environment(0).enter();
+                let clock = racer_io::SimClock::new(849);
+                let sim_env = clock.ctx(0);
+                let env = racer_io::Env::new(racer_io::Driver::Uring, sim_env.clone());
+                let sim_ctx = sim_env.clone();
                 for closed in [false, true] {
                     let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                         crate::test_support::cluster::config(false).limits,
                     )));
-                    let keys = keyring();
+                    let keys = keyring(&env);
                     let cache = CacheId("00000000-0000-4000-8000-000000000003".into());
                     let lease = || keys.active(&cache, KeyPurpose::Page).unwrap();
-                    let scope =
-                        RequestScope::new(RequestId([7; 16]), now() + Duration::from_secs(10))
-                            .unwrap();
-                    let data = measurement_input(&admission, &cache, lease(), &scope, true, false);
+                    let scope = RequestScope::on(
+                        &sim_ctx.clock,
+                        RequestId([7; 16]),
+                        env.ctx.now() + Duration::from_secs(10),
+                    )
+                    .unwrap();
+                    let data =
+                        measurement_input(&env, &admission, &cache, lease(), &scope, true, false);
                     let (io, mut engine) = pair(WorkerId(0), 0, NonZeroUsize::new(1).unwrap());
                     let client = CryptoClient::new(io);
                     let metrics = Metrics::default();
@@ -2349,16 +2874,12 @@ mod tests {
             #[test]
             fn measurements_account_once_at_reap_even_for_cancel_and_abandon() {
                 use std::time::Duration;
-                use uring_runtime::environment;
-                use uring_runtime::environment::SimulationClock;
-                let clock = SimulationClock::new(42);
-                let env = clock.environment(0);
-                let _env = env.enter();
-                let _strict = environment::require_simulated();
+                let clock = racer_io::SimClock::new(42);
+                let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
                 let admission = std::rc::Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                     crate::test_support::cluster::config(false).limits,
                 )));
-                let keys = keyring();
+                let keys = keyring(&env);
                 for decrypt in [false, true] {
                     for mode in [
                         "success",
@@ -2368,7 +2889,6 @@ mod tests {
                         "aead",
                         "malformed",
                         "short_body",
-                        "abandon_crc",
                         "abandon_aead",
                         "deadline",
                         "missing_key",
@@ -2383,7 +2903,6 @@ mod tests {
                                 "aead"
                                     | "malformed"
                                     | "short_body"
-                                    | "abandon_crc"
                                     | "abandon_aead"
                                     | "deadline"
                                     | "missing_key"
@@ -2401,14 +2920,16 @@ mod tests {
                         if mode != "no_metrics" {
                             client.set_metrics(metrics.clone());
                         }
-                        let failures = crate::telemetry::Failures::default();
+                        let failures =
+                            crate::telemetry::Failures::with_clock(env.ctx.clock.clone());
                         client.set_failure_observer(failures.observer(WorkerId(0)));
-                        let scope = RequestScope::new(
+                        let scope = RequestScope::on(
+                            &env.ctx.clock,
                             crate::model::RequestId([0; 16]),
-                            environment::now() + Duration::from_secs(10),
+                            env.ctx.now() + Duration::from_secs(10),
                         )
                         .unwrap();
-                        let cache = racer_control_wire::CacheId(
+                        let cache = racer_wire::control::CacheId(
                             "00000000-0000-4000-8000-000000000003".into(),
                         );
                         let lease = || {
@@ -2417,6 +2938,7 @@ mod tests {
                         };
                         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
                         let mut data = measurement_input(
+                            &env,
                             &admission,
                             &cache,
                             lease(),
@@ -2426,7 +2948,6 @@ mod tests {
                                 mode,
                                 "failure"
                                     | "aead"
-                                    | "abandon_crc"
                                     | "abandon_aead"
                                     | "failure_late_cancel"
                                     | "no_metrics"
@@ -2442,14 +2963,20 @@ mod tests {
                                     KeyId([99; 16]);
                             }
                             if mode == "invalid_configuration" {
-                                *plaintext = admission
-                                    .reserve(Some(&cache), ResourceClass::Ciphertext, 1)
+                                // Storage refuses non-plaintext charges, so
+                                // configure a plaintext charge for another cache.
+                                let wrong = admission
+                                    .reserve(
+                                        Some(&CacheId("other".into())),
+                                        ResourceClass::Plaintext,
+                                        page_alloc::buf::GRANULE,
+                                    )
                                     .unwrap();
-                            }
-                            if matches!(mode, "aead" | "abandon_aead") {
-                                // Peer bytes without a persisted CRC must still fail AEAD.
-                                Arc::get_mut(&mut ciphertext.inner).unwrap().checksum =
-                                    std::sync::OnceLock::new();
+                                assert!(
+                                    plaintext
+                                        .replace_charge(crate::memory::PlaintextCharge(wrong))
+                                        .is_ok()
+                                );
                             }
                             if mode == "malformed" {
                                 Arc::get_mut(&mut ciphertext.inner)
@@ -2461,8 +2988,7 @@ mod tests {
                                 // A valid descriptor with a mismatched body is malformed,
                                 // not an authentication rejection from the primitive.
                                 let inner = Arc::get_mut(&mut ciphertext.inner).unwrap();
-                                inner.checksum = std::sync::OnceLock::new();
-                                inner.bytes.pop();
+                                inner.fixture_pop();
                             }
                         }
                         // Admission delay must not leak into residence.
@@ -2485,7 +3011,8 @@ mod tests {
                             }
                             _ => None,
                         };
-                        let mut completion = crate::security::PageCryptoEngine::process(job);
+                        let mut completion =
+                            crate::security::PageCryptoEngine::process(job, &env.ctx);
                         let engine_ms = completion
                             .permit
                             .measurement
@@ -2494,7 +3021,7 @@ mod tests {
                             .map(|f| f.engine_ms);
                         let expected_error = match mode {
                             "success" | "abandon" | "late_cancel" => None,
-                            "cancel" => Some(Error::Cancelled),
+                            "cancel" => Some(Error::Canceled),
                             "deadline" => Some(Error::DeadlineExceeded),
                             "missing_key" => Some(Error::MissingKey),
                             "invalid_configuration" => Some(Error::InvalidConfiguration),
@@ -2502,7 +3029,9 @@ mod tests {
                             _ => Some(Error::CorruptRecord),
                         };
                         if decrypt {
-                            let facts = completion.decrypt_failure();
+                            let facts = completion.decrypt_failure(crate::telemetry::unix_millis(
+                                env.ctx.clock.clone().wall_now(),
+                            ));
                             assert_eq!(facts.map(|f| f.error), expected_error, "{mode}");
                             if let Some(f) = facts {
                                 assert_eq!(f.request, Some(scope.request));
@@ -2512,7 +3041,7 @@ mod tests {
                                     f.scope_failure,
                                     match mode {
                                         "cancel" => crate::telemetry::DecryptScopeFailure::Entry(
-                                            Error::Cancelled
+                                            Error::Canceled
                                         ),
                                         "deadline" => crate::telemetry::DecryptScopeFailure::Entry(
                                             Error::DeadlineExceeded
@@ -2522,7 +3051,13 @@ mod tests {
                                 );
                             }
                             let execution = completion.permit.measurement.execution_ns.take();
-                            assert!(completion.decrypt_failure().is_none());
+                            assert!(
+                                completion
+                                    .decrypt_failure(crate::telemetry::unix_millis(
+                                        env.ctx.clock.clone().wall_now()
+                                    ))
+                                    .is_none()
+                            );
                             completion.permit.measurement.execution_ns = execution;
                         }
                         if matches!(mode, "late_cancel" | "failure_late_cancel") {
@@ -2532,20 +3067,19 @@ mod tests {
                         // The engine uses virtual time (zero cost in DST). Explicitly
                         // advance a measured interval to exercise the exact sum separately.
                         assert_eq!(completion.permit.measurement.execution_ns, Some(0));
-                        let start = environment::now();
+                        let start = env.ctx.now();
                         clock.advance(Duration::from_millis(2));
-                        completion.permit.executed(start);
+                        completion.permit.executed(env.ctx.now(), start);
                         let (_, mut wrong) = pair(WorkerId(1), 0, NonZeroUsize::new(1).unwrap());
                         completion = wrong.complete(completion).err().unwrap().command;
                         assert!(engine.complete(completion).is_ok());
                         let events = measurement_events(decrypt);
                         assert_eq!(metrics.count(events[0]), 0);
-                        assert_eq!(metrics.count(CryptoDecryptCrcRejected), 0);
                         assert_eq!(metrics.count(CryptoDecryptAeadRejected), 0);
                         let mut before_reap = String::new();
                         failures.write_decrypt(&mut before_reap).unwrap();
                         assert!(before_reap.contains("total=0 retained=0"));
-                        if matches!(mode, "abandon" | "abandon_crc" | "abandon_aead") {
+                        if matches!(mode, "abandon" | "abandon_aead") {
                             drop(future);
                         } else {
                             client.poll_budgeted(1).unwrap();
@@ -2557,7 +3091,7 @@ mod tests {
                                         mode,
                                         "cancel" | "late_cancel" | "failure_late_cancel"
                                     ) {
-                                        Error::Cancelled
+                                        Error::Canceled
                                     } else {
                                         expected_error.unwrap()
                                     }
@@ -2582,8 +3116,8 @@ mod tests {
                                 "engine_failure_observed_ms={}",
                                 engine_ms.unwrap()
                             )));
-                            let reap_ms = Failure::new(Stage::PeerDecode, expected_error.unwrap())
-                                .unix_millis;
+                            let reap_ms =
+                                crate::telemetry::unix_millis(env.ctx.clock.clone().wall_now());
                             assert!(records.contains(&format!("reap_ms={reap_ms} ")));
                             assert!(reap_ms > engine_ms.unwrap());
                             let reason = match mode {
@@ -2592,8 +3126,7 @@ mod tests {
                                 "missing_key" => "missing_key",
                                 "invalid_configuration" => "invalid_configuration",
                                 "malformed" | "short_body" => "corrupt_unclassified",
-                                "aead" | "abandon_aead" => "corrupt_aead",
-                                _ => "corrupt_crc",
+                                _ => "corrupt_aead",
                             };
                             assert!(
                                 records.contains(&format!("reason={reason} ")),
@@ -2628,25 +3161,19 @@ mod tests {
                             assert_eq!(metrics.count(event), expected, "{mode} {event:?}");
                         }
                         assert_eq!(client.outstanding(), 0);
-                        assert_eq!(
-                            metrics.count(CryptoDecryptCrcRejected),
-                            u64::from(
-                                decrypt
-                                    && matches!(
-                                        mode,
-                                        "failure" | "abandon_crc" | "failure_late_cancel"
-                                    )
-                            ),
-                            "{mode}"
-                        );
+                        // Every corrupt decrypt input is an AEAD rejection.
+                        let rejected = decrypt
+                            && matches!(
+                                mode,
+                                "aead" | "abandon_aead" | "failure" | "failure_late_cancel"
+                            );
                         assert_eq!(
                             metrics.count(CryptoDecryptAeadRejected),
-                            u64::from(matches!(mode, "aead" | "abandon_aead")),
+                            u64::from(rejected),
                             "{mode}"
                         );
                         let mut records = String::new();
                         failures.write_aead(&mut records).unwrap();
-                        let rejected = matches!(mode, "aead" | "abandon_aead");
                         assert_eq!(records.lines().count(), 1 + usize::from(rejected), "{mode}");
                         assert!(records.starts_with(if rejected {
                             "total=1 retained=1"
@@ -2654,31 +3181,102 @@ mod tests {
                             "total=0 retained=0"
                         }));
                         if rejected {
-                            assert!(!records.contains("crc=none"));
+                            assert!(records.contains(" tag="));
                         }
                     }
                 }
             }
 
             #[test]
-            fn send_crc_computes_fresh_body_and_holds_owner_through_abandoned_reap() {
+            fn stored_tag_check_accepts_sealed_pages_and_rejects_every_tamper() {
                 use crate::security::PageCryptoEngine;
-                use crate::telemetry::Pair;
-                use crate::telemetry::Samples;
-                use uring_runtime::environment;
+                let env = racer_io::Env::host();
                 let admission = std::rc::Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                     crate::test_support::cluster::config(false).limits,
                 )));
-                let keys = keyring();
+                let keys = keyring(&env);
                 let cache =
-                    racer_control_wire::CacheId("00000000-0000-4000-8000-000000000003".into());
+                    racer_wire::control::CacheId("00000000-0000-4000-8000-000000000003".into());
                 let lease = || {
                     keys.active(&cache, racer_crypto::identity::KeyPurpose::Page)
                         .unwrap()
                 };
-                let scope = RequestScope::new(
+                let scope = RequestScope::host(
                     crate::model::RequestId([7; 16]),
-                    environment::now() + Duration::from_secs(10),
+                    racer_io::Clock::host().now() + Duration::from_secs(10),
+                )
+                .unwrap();
+                let sealed = || {
+                    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+                    let (setup, _engine) = pair(WorkerId(0), 0, NonZeroUsize::new(1).unwrap());
+                    let Poll::Ready(Ok(permit)) = setup.poll_reserve(
+                        &mut cx,
+                        CryptoId {
+                            worker: WorkerId(0),
+                            generation: 0,
+                            sequence: 1,
+                        },
+                    ) else {
+                        panic!("permit")
+                    };
+                    let completion = PageCryptoEngine::process(
+                        permit.job(input(&admission), lease(), scope.clone()),
+                        &racer_io::WorkerCtx::host(),
+                    );
+                    let CryptoOutcome::Completed(CryptoOutput::Encrypted(_, ciphertext)) =
+                        completion.outcome
+                    else {
+                        panic!("encrypted")
+                    };
+                    ciphertext
+                };
+                let verify =
+                    |page: &CiphertextPage| super::super::verify_stored_tag(&lease(), page);
+                assert_eq!(verify(&sealed()), Ok(()));
+                for (case, expected) in [
+                    ("body", Error::CorruptRecord),
+                    ("tag", Error::CorruptRecord),
+                    ("nonce", Error::CorruptRecord),
+                    ("page", Error::CorruptRecord),
+                    ("short", Error::CorruptRecord),
+                    ("key", Error::MissingKey),
+                ] {
+                    let mut page = sealed();
+                    let inner = Arc::get_mut(&mut page.inner).unwrap();
+                    let last = inner.fixture_bytes_mut().len() - 1;
+                    match case {
+                        "body" => inner.fixture_bytes_mut()[0] ^= 1,
+                        "tag" => inner.fixture_bytes_mut()[last] ^= 1,
+                        "nonce" => inner.envelope.nonce.0[0] ^= 1,
+                        "page" => inner.envelope.page.number.0 += 1,
+                        "short" => {
+                            inner.fixture_pop();
+                        }
+                        _ => inner.envelope.key_id = KeyId([99; 16]),
+                    }
+                    assert_eq!(verify(&page), Err(expected), "{case}");
+                }
+            }
+
+            #[test]
+            fn send_tag_verifies_body_and_holds_owner_through_abandoned_reap() {
+                use crate::security::PageCryptoEngine;
+                use crate::telemetry::Pair;
+                use crate::telemetry::Samples;
+                let env = racer_io::Env::host();
+                let admission = std::rc::Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+                    crate::test_support::cluster::config(false).limits,
+                )));
+                let keys = keyring(&env);
+                let cache =
+                    racer_wire::control::CacheId("00000000-0000-4000-8000-000000000003".into());
+                let lease = || {
+                    keys.active(&cache, racer_crypto::identity::KeyPurpose::Page)
+                        .unwrap()
+                };
+                let scope = RequestScope::host(
+                    crate::model::RequestId([7; 16]),
+                    racer_io::Clock::host().now() + Duration::from_secs(10),
                 )
                 .unwrap();
                 let mut cx = Context::from_waker(futures::task::noop_waker_ref());
@@ -2693,19 +3291,18 @@ mod tests {
                 ) else {
                     panic!("permit")
                 };
-                let completion = PageCryptoEngine::process(permit.job(
-                    input(&admission),
-                    lease(),
-                    scope.clone(),
-                ));
-                let CryptoOutcome::Completed(CryptoOutput::Encrypted(plain, mut ciphertext)) =
+                let completion = PageCryptoEngine::process(
+                    permit.job(input(&admission), lease(), scope.clone()),
+                    &racer_io::WorkerCtx::host(),
+                );
+                let CryptoOutcome::Completed(CryptoOutput::Encrypted(plain, ciphertext)) =
                     completion.outcome
                 else {
                     panic!("encrypted")
                 };
                 drop(plain);
-                Arc::get_mut(&mut ciphertext.inner).unwrap().checksum = std::sync::OnceLock::new();
-                let expected = racer_crypto::crc64(ciphertext.bytes());
+                let stored = &ciphertext.bytes()[ciphertext.bytes().len() - TAG_LEN..];
+                let expected: String = stored.iter().map(|b| format!("{b:02x}")).collect();
                 let retained = ciphertext.clone();
                 let samples = Samples::default();
                 let filter = Pair::parse(
@@ -2713,26 +3310,31 @@ mod tests {
                 )
                 .unwrap();
                 let (ticket, sample) = samples
-                    .begin(&filter, &filter.sender, &filter.receiver)
+                    .begin(
+                        &filter,
+                        &filter.sender,
+                        &filter.receiver,
+                        env.ctx.clock.clone().now(),
+                    )
                     .unwrap();
                 ticket.finish(true);
                 drop(ticket);
                 let (io, mut engine) = pair(WorkerId(0), 1, NonZeroUsize::new(1).unwrap());
                 let client = CryptoClient::new(io);
                 let mut future = client.execute_sample(
-                    CryptoInput::Checksum { ciphertext },
+                    CryptoInput::VerifyTag { ciphertext },
                     lease(),
                     &scope,
                     Some(sample),
                 );
                 assert!(future.as_mut().poll(&mut cx).is_pending());
-                assert_eq!(retained.cached_checksum(), None);
                 drop(future);
                 let Poll::Ready(Ok(Some(job))) = engine.poll_job(&mut cx) else {
                     panic!("job")
                 };
-                let completion = PageCryptoEngine::process(job);
-                assert_eq!(retained.cached_checksum(), Some(expected));
+                let completion = PageCryptoEngine::process(job, &racer_io::WorkerCtx::host());
+                // The abandoned job's ciphertext owner lives until completion is reaped.
+                assert_eq!(Arc::strong_count(&retained.inner), 2);
                 assert!(engine.complete(completion).is_ok());
                 let mut text = String::new();
                 samples.write(&mut text).unwrap();
@@ -2743,39 +3345,40 @@ mod tests {
                 text.clear();
                 samples.write(&mut text).unwrap();
                 assert!(text.contains("busy=0"));
-                assert!(text.contains("send=completed status=computed"));
-                assert!(text.contains(&format!("crc={expected:016x}")));
+                assert!(text.contains("send=completed status=verified"));
+                assert!(text.contains(&format!(" tag={expected}")));
                 assert_eq!(text.lines().count(), 2);
                 assert_eq!(client.outstanding(), 0);
             }
 
             #[test]
-            fn send_crc_cached_cancel_missing_key_and_capacity_are_diagnostic_only() {
+            fn send_tag_mismatch_cancel_missing_key_and_capacity_are_diagnostic_only() {
                 use crate::security::PageCrypto;
                 use crate::security::PageCryptoEngine;
                 use crate::telemetry::Pair;
                 use crate::telemetry::Samples;
+                let env = racer_io::Env::host();
                 let admission = std::rc::Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                     crate::test_support::cluster::config(false).limits,
                 )));
-                let keys = std::rc::Rc::new(keyring());
+                let keys = std::rc::Rc::new(keyring(&env));
                 let filter = Pair::parse(
                     "8816d91d-e896-49bf-ba8a-da97ede93818,11111111-1111-4111-8111-111111111111",
                 )
                 .unwrap();
-                for mode in ["cached", "cancel", "missing", "capacity"] {
+                for mode in ["mismatch", "cancel", "missing", "capacity"] {
                     let mut page = crate::memory::tests::bundle_for(
                         &admission,
                         crate::model::VersionMetadata {
                             content_type: None,
                             version: crate::model::ObjectVersion {
                                 object: crate::model::ObjectId {
-                                    cache: racer_control_wire::CacheId(
+                                    cache: racer_wire::control::CacheId(
                                         "00000000-0000-4000-8000-000000000003".into(),
                                     ),
                                     key: crate::model::CacheKey([3; 32]),
                                 },
-                                etag: crate::model::StrongEtag::test_value("send-crc"),
+                                etag: crate::model::StrongEtag::test_value("send-tag"),
                             },
                             length: 3,
                         },
@@ -2783,33 +3386,43 @@ mod tests {
                     .ciphertext;
                     let inner = Arc::get_mut(&mut page.inner).unwrap();
                     inner.envelope.page.version.object.cache =
-                        racer_control_wire::CacheId("00000000-0000-4000-8000-000000000003".into());
-                    if mode == "cached" {
-                        inner.checksum.set(42).unwrap();
+                        racer_wire::control::CacheId("00000000-0000-4000-8000-000000000003".into());
+                    if mode == "mismatch" {
+                        // Flip a body byte so the stored tag no longer matches.
+                        inner.fixture_bytes_mut()[0] ^= 1;
                     }
                     if mode == "missing" {
                         // The fixture keyring installs [1;16], also the bundle's default.
-                        inner.envelope.key_id = racer_control_wire::KeyId([99; 16]);
+                        inner.envelope.key_id = racer_wire::control::KeyId([99; 16]);
                     }
                     let cache = page.envelope().page.version.object.cache.clone();
                     let lease = keys
                         .active(&cache, racer_crypto::identity::KeyPurpose::Page)
                         .unwrap();
-                    let scope = RequestScope::new(
+                    let scope = RequestScope::host(
                         crate::model::RequestId([7; 16]),
-                        uring_runtime::environment::now() + Duration::from_secs(10),
+                        racer_io::Clock::host().now() + Duration::from_secs(10),
                     )
                     .unwrap();
                     let (io, mut engine) = pair(WorkerId(0), 1, NonZeroUsize::new(1).unwrap());
                     let client = std::rc::Rc::new(CryptoClient::new(io));
                     let samples = Samples::default();
                     let (ticket, sample) = samples
-                        .begin(&filter, &filter.sender, &filter.receiver)
+                        .begin(
+                            &filter,
+                            &filter.sender,
+                            &filter.receiver,
+                            env.ctx.clock.clone().now(),
+                        )
                         .unwrap();
                     ticket.finish(true);
                     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
                     if mode == "missing" {
-                        let crypto = PageCrypto::new(keys.clone(), client.clone());
+                        let crypto = PageCrypto::new(
+                            keys.clone(),
+                            client.clone(),
+                            crate::memory::fixture_buffer_pool(),
+                        );
                         let mut future = Box::pin(crypto.sample_send(page, &scope, sample));
                         assert!(
                             future.as_mut().poll(&mut cx).is_ready(),
@@ -2832,7 +3445,7 @@ mod tests {
                             None
                         };
                         let mut future = client.execute_sample(
-                            CryptoInput::Checksum { ciphertext: page },
+                            CryptoInput::VerifyTag { ciphertext: page },
                             lease,
                             &scope,
                             Some(sample),
@@ -2842,7 +3455,7 @@ mod tests {
                             scope.cancel().unwrap();
                             assert!(matches!(
                                 future.as_mut().poll(&mut cx),
-                                Poll::Ready(Err(Error::Cancelled))
+                                Poll::Ready(Err(Error::Canceled))
                             ));
                             drop(future);
                             drop(held);
@@ -2853,7 +3466,8 @@ mod tests {
                             let Poll::Ready(Ok(Some(job))) = engine.poll_job(&mut cx) else {
                                 panic!("job")
                             };
-                            let completion = PageCryptoEngine::process(job);
+                            let completion =
+                                PageCryptoEngine::process(job, &racer_io::WorkerCtx::host());
                             assert!(engine.complete(completion).is_ok());
                             client.poll_budgeted(1).unwrap();
                             assert!(future.as_mut().poll(&mut cx).is_ready());
@@ -2865,15 +3479,15 @@ mod tests {
                     assert!(text.contains("busy=0"), "{mode}: {text}");
                     assert!(text.contains("send=completed"));
                     assert!(
-                        text.contains(if mode == "cached" {
-                            "status=cached"
+                        text.contains(if mode == "mismatch" {
+                            "status=mismatch"
                         } else {
                             "status=unavailable"
                         }),
                         "{mode}: {text}"
                     );
-                    if mode == "cached" {
-                        assert!(text.contains("crc=000000000000002a"));
+                    if mode == "mismatch" {
+                        assert!(text.contains(" tag="));
                     }
                     if mode == "missing" {
                         assert!(text.contains("MissingKey"));
@@ -2894,19 +3508,15 @@ mod tests {
             fn shared_worker_queue_measurements(decrypt: bool) {
                 use crate::security::PageCryptoEngine;
                 use std::time::Duration;
-                use uring_runtime::environment;
-                use uring_runtime::environment::SimulationClock;
 
-                let clock = SimulationClock::new(43);
-                let env = clock.environment(0);
-                let _env = env.enter();
-                let _strict = environment::require_simulated();
+                let clock = racer_io::SimClock::new(43);
+                let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
                 let admission = std::rc::Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                     crate::test_support::cluster::config(false).limits,
                 )));
-                let keys = keyring();
+                let keys = keyring(&env);
                 let cache =
-                    racer_control_wire::CacheId("00000000-0000-4000-8000-000000000003".into());
+                    racer_wire::control::CacheId("00000000-0000-4000-8000-000000000003".into());
                 let lease = || {
                     keys.active(&cache, racer_crypto::identity::KeyPurpose::Page)
                         .unwrap()
@@ -2916,9 +3526,10 @@ mod tests {
                 for mode in ["success", "failure", "cancel", "abandon"] {
                     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
                     let scopes = [0, 1].map(|id| {
-                        RequestScope::new(
+                        RequestScope::on(
+                            &env.ctx.clock,
                             crate::model::RequestId([id; 16]),
-                            environment::now() + Duration::from_secs(10),
+                            env.ctx.now() + Duration::from_secs(10),
                         )
                         .unwrap()
                     });
@@ -2947,6 +3558,7 @@ mod tests {
                     waiting.set_metrics(waiting_metrics.clone());
                     let mut future = Some(waiting.execute(
                         measurement_input(
+                            &env,
                             &admission,
                             &cache,
                             lease(),
@@ -2967,7 +3579,15 @@ mod tests {
                     assert_eq!(waiting.executor.waiter_counts(), (0, 1));
 
                     let mut other_future = other.execute(
-                        measurement_input(&admission, &cache, lease(), &scopes[0], decrypt, false),
+                        measurement_input(
+                            &env,
+                            &admission,
+                            &cache,
+                            lease(),
+                            &scopes[0],
+                            decrypt,
+                            false,
+                        ),
                         lease(),
                         &scopes[0],
                     );
@@ -2991,11 +3611,11 @@ mod tests {
                             panic!("submitted job")
                         };
                         assert_eq!(job.id().worker, worker);
-                        let mut completion = PageCryptoEngine::process(job);
+                        let mut completion = PageCryptoEngine::process(job, &env.ctx);
                         assert_eq!(completion.permit.measurement.execution_ns, Some(0));
-                        let start = environment::now();
+                        let start = env.ctx.now();
                         clock.advance(Duration::from_millis(service_ms));
-                        completion.permit.executed(start);
+                        completion.permit.executed(env.ctx.now(), start);
                         assert!(engine.complete(completion).is_ok());
                     }
                     // Neither the target's own 5ms execution nor this 11ms delay before
@@ -3022,7 +3642,7 @@ mod tests {
                         match (mode, future.as_mut().poll(&mut cx)) {
                             ("success", Poll::Ready(Ok(_)))
                             | ("failure", Poll::Ready(Err(_)))
-                            | ("cancel", Poll::Ready(Err(Error::Cancelled))) => {}
+                            | ("cancel", Poll::Ready(Err(Error::Canceled))) => {}
                             _ => panic!("unexpected {mode} result"),
                         }
                     }
@@ -3039,15 +3659,11 @@ mod tests {
 
             #[test]
             fn duration_saturates_without_host_time_in_dst() {
-                use uring_runtime::environment;
-                use uring_runtime::environment::SimulationClock;
-                let clock = SimulationClock::new(19);
-                let env = clock.environment(0);
-                let _env = env.enter();
-                let _strict = environment::require_simulated();
-                let start = environment::now();
+                let clock = racer_io::SimClock::new(19);
+                let env = racer_io::Env::new(racer_io::Driver::Uring, clock.ctx(0));
+                let start = env.ctx.now();
                 clock.advance(std::time::Duration::from_secs(u64::MAX / 1_000_000_000 + 1));
-                assert_eq!(elapsed_ns(start), u64::MAX);
+                assert_eq!(elapsed_ns(env.ctx.now(), start), u64::MAX);
             }
 
             fn measurement_events(decrypt: bool) -> [Event; 8] {
@@ -3077,6 +3693,7 @@ mod tests {
             }
 
             fn measurement_input(
+                env: &racer_io::Env,
                 admission: &Rc<flow_control::Quotas<AdmissionPolicy>>,
                 cache: &CacheId,
                 key: KeyLease,
@@ -3099,7 +3716,8 @@ mod tests {
                     ) else {
                         panic!("setup permit")
                     };
-                    let result = PageCryptoEngine::process(permit.job(data, key, scope.clone()));
+                    let result =
+                        PageCryptoEngine::process(permit.job(data, key, scope.clone()), &env.ctx);
                     let CryptoOutcome::Completed(CryptoOutput::Encrypted(plain, mut ciphertext)) =
                         result.outcome
                     else {
@@ -3107,13 +3725,17 @@ mod tests {
                     };
                     drop(plain);
                     if corrupt {
-                        Arc::get_mut(&mut ciphertext.inner).unwrap().bytes[0] ^= 1;
+                        Arc::get_mut(&mut ciphertext.inner)
+                            .unwrap()
+                            .fixture_bytes_mut()[0] ^= 1;
                     }
                     CryptoInput::Decrypt {
                         ciphertext,
-                        plaintext: admission
-                            .reserve(Some(cache), crate::admission::ResourceClass::Plaintext, 1)
-                            .unwrap(),
+                        plaintext: crate::memory::fixture_plaintext(
+                            admission,
+                            Some(cache),
+                            &[0; 1],
+                        ),
                     }
                 } else {
                     if corrupt && let CryptoInput::Encrypt { page, .. } = &mut data {
@@ -3191,7 +3813,7 @@ mod tests {
                     let descriptor = envelope(size);
                     let mut encrypted = vec![0; size + TAG_LEN];
                     racer_crypto::seal(
-                        &[7; 32],
+                        &crate::test_support::test_vector([7; 32]),
                         &descriptor.nonce.0,
                         &page_aad(&descriptor).unwrap(),
                         &source,
@@ -3235,15 +3857,18 @@ mod tests {
                             .unwrap();
                         plain.bytes_mut().unwrap().copy_from_slice(source);
                         CryptoInput::Encrypt {
+                            page_size: racer_wire::object::PageSize::DEFAULT,
                             page: page.clone(),
                             plaintext: plain,
-                            ciphertext: admission
-                                .reserve(Some(cache), ResourceClass::Ciphertext, size + 16)
-                                .unwrap()
-                                .into(),
+                            ciphertext: crate::memory::fixture_encrypt_output(
+                                admission,
+                                admission
+                                    .reserve(Some(cache), ResourceClass::Ciphertext, size + 16)
+                                    .unwrap(),
+                            ),
                         }
                     } else {
-                        // Fresh received allocation/checksum state, as on disk/peer ingress.
+                        // Fresh received allocation state, as on disk/peer ingress.
                         let bytes = encrypted;
                         let ciphertext = pool
                             .ciphertext(
@@ -3256,9 +3881,11 @@ mod tests {
                             .unwrap();
                         CryptoInput::Decrypt {
                             ciphertext,
-                            plaintext: admission
-                                .reserve(Some(cache), ResourceClass::Plaintext, size)
-                                .unwrap(),
+                            plaintext: crate::memory::fixture_plaintext(
+                                admission,
+                                Some(cache),
+                                &vec![0; size],
+                            ),
                         }
                     }
                 }
@@ -3269,10 +3896,10 @@ mod tests {
         mod channel_tests {
             #[cfg(test)]
             mod tests {
+                use racer_io::Error;
+                use racer_io::xthread::spsc::*;
                 use std::task::Context;
                 use std::task::Poll;
-                use uring_runtime::Error;
-                use uring_runtime::channel::*;
 
                 #[test]
                 fn adapter_maps_errors_without_losing_command_ownership() {
@@ -3309,7 +3936,7 @@ mod tests {
             }
 
             impl Fixture {
-                fn new() -> Self {
+                fn new(env: &racer_io::Env) -> Self {
                     let admission = std::rc::Rc::new(flow_control::Quotas::new(
                         AdmissionPolicy::new(crate::test_support::cluster::config(false).limits),
                     ));
@@ -3318,9 +3945,10 @@ mod tests {
                         admission,
                         client: CryptoClient::new(io),
                         engine,
-                        scope: RequestScope::new(
+                        scope: RequestScope::on(
+                            &env.ctx.clock,
                             crate::model::RequestId([0; 16]),
-                            uring_runtime::environment::now() + std::time::Duration::from_secs(5),
+                            env.ctx.now() + std::time::Duration::from_secs(5),
                         )
                         .unwrap(),
                     }
@@ -3335,6 +3963,7 @@ mod tests {
                 use crate::model::*;
                 let cache = CacheId("00000000-0000-4000-8000-000000000003".into());
                 CryptoInput::Encrypt {
+                    page_size: racer_wire::object::PageSize::DEFAULT,
                     page: PageId {
                         version: ObjectVersion {
                             object: ObjectId {
@@ -3353,23 +3982,26 @@ mod tests {
                             1,
                         )
                         .unwrap(),
-                    ciphertext: admission
-                        .reserve(Some(&cache), ResourceClass::Ciphertext, 17)
-                        .unwrap()
-                        .into(),
+                    ciphertext: crate::memory::fixture_encrypt_output(
+                        admission,
+                        admission
+                            .reserve(Some(&cache), ResourceClass::Ciphertext, 17)
+                            .unwrap(),
+                    ),
                 }
             }
 
             #[test]
             fn engine_loss_reclaims_queued_owners_and_unblocks_drain() {
                 use crate::admission::ResourceClass;
+                let env = racer_io::Env::host();
                 let Fixture {
                     admission,
                     client,
                     engine,
                     scope,
-                } = Fixture::new();
-                let mut future = client.execute(input(&admission), key(), &scope);
+                } = Fixture::new(&env);
+                let mut future = client.execute(input(&admission), key(&env), &scope);
                 let mut cx = Context::from_waker(futures::task::noop_waker_ref());
                 assert!(future.as_mut().poll(&mut cx).is_pending());
                 drop(engine);
@@ -3383,13 +4015,14 @@ mod tests {
             #[test]
             fn accepted_cancellation_cannot_return_before_completion_consumption() {
                 use crate::admission::ResourceClass;
+                let env = racer_io::Env::host();
                 let Fixture {
                     admission,
                     client,
                     mut engine,
                     scope,
-                } = Fixture::new();
-                let mut future = client.execute(input(&admission), key(), &scope);
+                } = Fixture::new(&env);
+                let mut future = client.execute(input(&admission), key(&env), &scope);
                 let mut cx = Context::from_waker(futures::task::noop_waker_ref());
                 assert!(future.as_mut().poll(&mut cx).is_pending());
                 scope.cancel().unwrap();
@@ -3398,12 +4031,13 @@ mod tests {
                     assert!(future.as_mut().poll(&mut cx).is_pending());
                 }
                 assert_eq!(client.outstanding(), 1);
-                assert_eq!(admission.used(ResourceClass::Plaintext), 1);
+                assert_eq!(admission.used(ResourceClass::Plaintext), 4096);
                 let job = match engine.poll_job(&mut cx) {
                     Poll::Ready(Ok(Some(job))) => job,
                     _ => panic!("job"),
                 };
-                let completion = crate::security::PageCryptoEngine::process(job);
+                let completion =
+                    crate::security::PageCryptoEngine::process(job, &racer_io::WorkerCtx::host());
                 assert!(engine.complete(completion).is_ok());
                 assert!(
                     future.as_mut().poll(&mut cx).is_pending(),
@@ -3412,7 +4046,7 @@ mod tests {
                 client.poll_budgeted(1).unwrap();
                 assert!(matches!(
                     future.as_mut().poll(&mut cx),
-                    Poll::Ready(Err(Error::Cancelled))
+                    Poll::Ready(Err(Error::Canceled))
                 ));
                 assert_eq!(client.outstanding(), 0);
                 assert_eq!(admission.used(ResourceClass::Plaintext), 0);
@@ -3420,15 +4054,17 @@ mod tests {
 
             #[test]
             fn accepted_deadline_expiry_waits_for_engine_completion() {
-                let clock = uring_runtime::environment::SimulationClock::new(91);
-                let _environment = clock.environment(0).enter();
+                let clock = racer_io::SimClock::new(91);
+                let sim_env = clock.ctx(0);
+                let env = racer_io::Env::new(racer_io::Driver::Uring, sim_env.clone());
+                let sim_ctx = sim_env.clone();
                 let Fixture {
                     admission,
                     client,
                     mut engine,
                     scope,
-                } = Fixture::new();
-                let key = key();
+                } = Fixture::new(&env);
+                let key = key(&env);
                 let mut future = client.execute(input(&admission), key, &scope);
                 let mut cx = Context::from_waker(futures::task::noop_waker_ref());
                 assert!(future.as_mut().poll(&mut cx).is_pending());
@@ -3438,7 +4074,7 @@ mod tests {
                     Poll::Ready(Ok(Some(job))) => job,
                     _ => panic!("job"),
                 };
-                let completion = crate::security::PageCryptoEngine::process(job);
+                let completion = crate::security::PageCryptoEngine::process(job, &sim_ctx.clone());
                 assert!(engine.complete(completion).is_ok());
                 client.poll_budgeted(1).unwrap();
                 assert!(matches!(
@@ -3451,13 +4087,14 @@ mod tests {
             #[test]
             fn drain_scope_cancellation_wakes_even_with_unconsumed_result() {
                 use crate::model::RequestId;
+                let env = racer_io::Env::host();
                 let Fixture {
                     admission,
                     client,
                     mut engine,
                     scope,
-                } = Fixture::new();
-                let mut future = client.execute(input(&admission), key(), &scope);
+                } = Fixture::new(&env);
+                let mut future = client.execute(input(&admission), key(&env), &scope);
                 let mut cx = Context::from_waker(futures::task::noop_waker_ref());
                 assert!(future.as_mut().poll(&mut cx).is_pending());
                 let job = match engine.poll_job(&mut cx) {
@@ -3476,14 +4113,14 @@ mod tests {
                             permit,
                             outcome: CryptoOutcome::Failed {
                                 input,
-                                error: Error::Cancelled
+                                error: Error::Canceled
                             },
                             _key: key,
                         })
                         .is_ok()
                 );
                 client.poll_budgeted(1).unwrap();
-                let drain_scope = RequestScope::new(RequestId([1; 16]), scope.deadline.0).unwrap();
+                let drain_scope = RequestScope::host(RequestId([1; 16]), scope.deadline.0).unwrap();
                 let count = Arc::new(WakeCounter::default());
                 let waker = Waker::from(count.clone());
                 let mut drain_cx = Context::from_waker(&waker);
@@ -3497,7 +4134,7 @@ mod tests {
                 ));
                 assert!(matches!(
                     future.as_mut().poll(&mut cx),
-                    Poll::Ready(Err(Error::Cancelled))
+                    Poll::Ready(Err(Error::Canceled))
                 ));
             }
 
@@ -3569,22 +4206,24 @@ mod tests {
                 ));
             }
 
-            pub(super) fn key() -> KeyLease {
-                keyring()
+            pub(super) fn key(env: &racer_io::Env) -> KeyLease {
+                keyring(env)
                     .active(
-                        &racer_control_wire::CacheId("00000000-0000-4000-8000-000000000003".into()),
+                        &racer_wire::control::CacheId(
+                            "00000000-0000-4000-8000-000000000003".into(),
+                        ),
                         racer_crypto::identity::KeyPurpose::Page,
                     )
                     .unwrap()
             }
 
-            pub(super) fn keyring() -> racer_crypto::identity::Keyring {
-                use racer_control_wire::CacheId;
-                use racer_control_wire::ClusterId;
-                use racer_control_wire::NodeId;
-                use racer_control_wire::*;
+            pub(super) fn keyring(env: &racer_io::Env) -> racer_crypto::identity::Keyring {
                 use racer_crypto::identity::KeyEpochs;
                 use racer_crypto::identity::Keyring;
+                use racer_wire::control::CacheId;
+                use racer_wire::control::ClusterId;
+                use racer_wire::control::NodeId;
+                use racer_wire::control::*;
                 let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
                 let mut params = rcgen::CertificateParams::default();
                 params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
@@ -3592,11 +4231,13 @@ mod tests {
                 let keys = Keyring::new(
                     ClusterId("00000000-0000-4000-8000-000000000001".into()),
                     NodeId("00000000-0000-4000-8000-000000000002".into()),
-                    Arc::new(KeyEpochs::default()),
+                    Arc::new(KeyEpochs::with_clock(crate::enrollment::wall_clock(
+                        &env.ctx.clock,
+                    ))),
                 );
                 let cache = CacheId("00000000-0000-4000-8000-000000000003".into());
                 keys.install(KeyringBundle {
-                    schema_version: racer_control_wire::SCHEMA_VERSION,
+                    schema_version: racer_wire::control::KEYRING_SCHEMA_VERSION,
                     cluster: ClusterId("00000000-0000-4000-8000-000000000001".into()),
                     generation: BundleGeneration(1),
                     peer_trust_roots: vec![ca.der().to_vec()],
@@ -3622,6 +4263,7 @@ mod tests {
                 use std::rc::Rc;
                 use std::time::Duration;
                 use std::time::Instant;
+                let env = racer_io::Env::host();
                 let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                     crate::test_support::cluster::config(false).limits,
                 )));
@@ -3636,6 +4278,7 @@ mod tests {
                     )
                     .unwrap();
                 let input = CryptoInput::Encrypt {
+                    page_size: racer_wire::object::PageSize::DEFAULT,
                     page: PageId {
                         version: ObjectVersion {
                             object: ObjectId {
@@ -3647,17 +4290,19 @@ mod tests {
                         number: PageNumber(0),
                     },
                     plaintext,
-                    ciphertext: admission
-                        .reserve(Some(&cache), ResourceClass::Ciphertext, 19)
-                        .unwrap()
-                        .into(),
+                    ciphertext: crate::memory::fixture_encrypt_output(
+                        &admission,
+                        admission
+                            .reserve(Some(&cache), ResourceClass::Ciphertext, 19)
+                            .unwrap(),
+                    ),
                 };
                 let (io, mut engine) = pair(WorkerId(0), 1, NonZeroUsize::new(1).unwrap());
                 let client = CryptoClient::new(io);
                 let scope =
-                    RequestScope::new(RequestId([0; 16]), Instant::now() + Duration::from_secs(5))
+                    RequestScope::host(RequestId([0; 16]), Instant::now() + Duration::from_secs(5))
                         .unwrap();
-                let mut operation = client.execute(input, key(), &scope);
+                let mut operation = client.execute(input, key(&env), &scope);
                 let mut cx = Context::from_waker(futures::task::noop_waker_ref());
                 struct Count(std::sync::atomic::AtomicUsize);
                 impl std::task::Wake for Count {
@@ -3671,7 +4316,7 @@ mod tests {
                 assert!(operation.as_mut().poll(&mut cx).is_pending());
                 drop(operation);
                 assert_eq!(client.outstanding(), 1);
-                assert_eq!(admission.used(ResourceClass::Plaintext), 3);
+                assert_eq!(admission.used(ResourceClass::Plaintext), 4096);
                 let job = match engine.poll_job(&mut cx) {
                     Poll::Ready(Ok(Some(job))) => job,
                     _ => panic!("accepted job"),
@@ -3688,14 +4333,14 @@ mod tests {
                             permit,
                             outcome: CryptoOutcome::Failed {
                                 input,
-                                error: Error::Cancelled
+                                error: Error::Canceled
                             },
                             _key: key,
                         })
                         .is_ok()
                 );
                 assert_eq!(client.outstanding(), 1);
-                assert_eq!(admission.used(ResourceClass::Plaintext), 3);
+                assert_eq!(admission.used(ResourceClass::Plaintext), 4096);
                 assert_eq!(count.0.load(Ordering::Relaxed), 1);
                 client.poll_budgeted(1).unwrap();
                 assert!(
@@ -3714,6 +4359,7 @@ mod tests {
                 use crate::model::*;
                 use std::rc::Rc;
                 use std::time::Instant;
+                let env = racer_io::Env::host();
                 let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                     crate::test_support::cluster::config(false).limits,
                 )));
@@ -3741,14 +4387,15 @@ mod tests {
                 };
                 let (io, mut engine) = pair(WorkerId(0), 0, NonZeroUsize::new(1).unwrap());
                 let client = CryptoClient::new(io);
-                let scope = RequestScope::new(RequestId([0; 16]), Instant::now()).unwrap();
+                let scope = RequestScope::host(RequestId([0; 16]), Instant::now()).unwrap();
                 let result = futures::executor::block_on(client.execute(
                     CryptoInput::Encrypt {
+                        page_size: racer_wire::object::PageSize::DEFAULT,
                         page,
                         plaintext,
-                        ciphertext: ciphertext.into(),
+                        ciphertext: crate::memory::fixture_encrypt_output(&admission, ciphertext),
                     },
-                    key(),
+                    key(&env),
                     &scope,
                 ));
                 assert!(matches!(result, Err(Error::DeadlineExceeded)));
@@ -3818,6 +4465,7 @@ mod tests {
     }
     fn envelope() -> PageEnvelope {
         PageEnvelope {
+            page_size: racer_wire::object::PageSize::DEFAULT,
             cipher: crate::model::PageCipher::Xaes256Gcm,
             page: PageId {
                 version: ObjectVersion {
@@ -3830,23 +4478,61 @@ mod tests {
                 number: PageNumber(7),
             },
             key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
-            nonce: Nonce([2; 24]),
+            nonce: Nonce(crate::test_support::test_vector([2; 24])),
             plaintext_length: 5,
             ciphertext_length: 21,
         }
     }
     #[test]
+    fn scratch_page_aad_matches_canonical_bytes_and_survives_reentry() {
+        let descriptor = envelope();
+        let expected = page_aad(&descriptor).unwrap();
+        let mut other = envelope();
+        other.plaintext_length = 6;
+        other.ciphertext_length = 22;
+        let other_expected = page_aad(&other).unwrap();
+        for _ in 0..2 {
+            with_page_aad(&descriptor, |aad| {
+                assert_eq!(aad, expected.as_slice());
+                with_page_aad(&other, |inner| assert_eq!(inner, other_expected.as_slice()))
+                    .unwrap();
+                assert_eq!(aad, expected.as_slice());
+            })
+            .unwrap();
+        }
+        let mut malformed = envelope();
+        malformed.ciphertext_length = 0;
+        assert_eq!(
+            with_page_aad(&malformed, |_| ()).is_err(),
+            page_aad(&malformed).is_err()
+        );
+    }
+    #[test]
     fn page_cipher_id_is_authenticated_in_aad() {
         let descriptor = envelope();
         let mut aad = page_aad(&descriptor).unwrap();
-        let offset = b"racer/page/aead/v1\0".len();
+        let offset = b"racer/page/aead/v2\0".len();
         assert_eq!(&aad[offset..offset + 4], &1u32.to_be_bytes());
         let mut sealed = [0; 21];
-        racer_crypto::seal(&[7; 32], &descriptor.nonce.0, &aad, b"hello", &mut sealed).unwrap();
+        racer_crypto::seal(
+            &crate::test_support::test_vector([7; 32]),
+            &descriptor.nonce.0,
+            &aad,
+            b"hello",
+            &mut sealed,
+        )
+        .unwrap();
         aad[offset + 3] ^= 1;
         let mut out = [0xa5; 5];
         assert!(
-            racer_crypto::open(&[7; 32], &descriptor.nonce.0, &aad, &sealed, &mut out).is_err()
+            racer_crypto::open(
+                &crate::test_support::test_vector([7; 32]),
+                &descriptor.nonce.0,
+                &aad,
+                &sealed,
+                &mut out
+            )
+            .is_err()
         );
         assert_eq!(out, [0; 5]);
     }
@@ -3855,10 +4541,17 @@ mod tests {
     fn page_aad_is_domain_separated_and_binds_every_descriptor_field() {
         let original = envelope();
         let aad = page_aad(&original).unwrap();
-        assert!(aad.starts_with(b"racer/page/aead/v1\0\0\0\0\x01\0\0\0\x24"));
+        assert!(aad.starts_with(b"racer/page/aead/v2\0\0\0\0\x01\0\0\0\x24"));
         let mut bytes = vec![0; 5 + TAG_LEN];
-        racer_crypto::seal(&[7; 32], &original.nonce.0, &aad, b"hello", &mut bytes).unwrap();
-        for index in 0..8 {
+        racer_crypto::seal(
+            &crate::test_support::test_vector([7; 32]),
+            &original.nonce.0,
+            &aad,
+            b"hello",
+            &mut bytes,
+        )
+        .unwrap();
+        for index in 0..9 {
             let mut changed = original.clone();
             match index {
                 0 => {
@@ -3874,12 +4567,14 @@ mod tests {
                     changed.plaintext_length += 1;
                     changed.ciphertext_length += 1;
                 }
+                // The same page number at another page size.
+                7 => changed.page_size = racer_wire::object::PageSize::new(64 << 10).unwrap(),
                 _ => changed.page.version.object.cache.0.replace_range(..1, "4"),
             }
             let mut tampered = vec![0; 5];
             assert!(
                 racer_crypto::open(
-                    &[7; 32],
+                    &crate::test_support::test_vector([7; 32]),
                     &changed.nonce.0,
                     &page_aad(&changed).unwrap(),
                     &bytes,
@@ -3892,9 +4587,23 @@ mod tests {
         corrupted[0] ^= 1;
         let mut output = vec![0; 5];
         assert!(
-            racer_crypto::open(&[7; 32], &original.nonce.0, &aad, &corrupted, &mut output).is_err()
+            racer_crypto::open(
+                &crate::test_support::test_vector([7; 32]),
+                &original.nonce.0,
+                &aad,
+                &corrupted,
+                &mut output
+            )
+            .is_err()
         );
-        racer_crypto::open(&[7; 32], &original.nonce.0, &aad, &bytes, &mut output).unwrap();
+        racer_crypto::open(
+            &crate::test_support::test_vector([7; 32]),
+            &original.nonce.0,
+            &aad,
+            &bytes,
+            &mut output,
+        )
+        .unwrap();
         assert_eq!(output, b"hello");
         let mut malformed = original;
         malformed.ciphertext_length += 1;
@@ -3909,8 +4618,8 @@ mod tests {
         descriptor.key_id = KeyId([1; 16]); // Fixed key ID from aead_vectors.py, not installed.
         let mut bytes = vec![0; 5 + TAG_LEN];
         racer_crypto::seal_credentials(
-            &[7; 32],
-            &[2; 24],
+            &crate::test_support::test_vector([7; 32]),
+            &crate::test_support::test_vector([2; 24]),
             &page_aad(&descriptor).unwrap(),
             b"hello",
             &mut bytes,
@@ -3919,8 +4628,8 @@ mod tests {
         assert_eq!(
             bytes,
             [
-                0xb2, 0xd4, 0x6c, 0x90, 0xe7, 0x98, 0x16, 0x03, 0x48, 0xb3, 0x6e, 0x1a, 0x89, 0xf2,
-                0xb4, 0xdc, 0x7d, 0x49, 0x17, 0x13, 0x15
+                0xb2, 0xd4, 0x6c, 0x90, 0xe7, 0xea, 0x51, 0xe0, 0x29, 0xb6, 0xe8, 0xd0, 0x20, 0x5d,
+                0x5a, 0x40, 0x2d, 0x98, 0x29, 0x24, 0x88
             ]
         );
     }
@@ -3932,6 +4641,7 @@ mod tests {
         use crate::security::pair;
         use sha2::Digest;
         use sha2::Sha256;
+        let env = racer_io::Env::host();
 
         // SHA-256 of the complete ciphertext plus detached tag, independently
         // generated with libsodium 1.0.18. Reproduce with aead_vectors.py.
@@ -3939,54 +4649,54 @@ mod tests {
         let vectors = [
             (
                 1,
-                "e61324a8db298fa724eebace826484a4fe1741f3822483fcc041f7678cdd63e6",
+                "902d04fe2515d8e144bc18f48ec9828b4a44bbc94e4074cc512728a3d9bd83a2",
             ),
             (
                 15,
-                "7518184c786851a15dd1c5bb1611d4969323097202f2f8ba2751fc4f4d0da920",
+                "d71434e67dbe2cbd2f254293d7af6b496340706f95dc5eacf54ccc22cb94ffed",
             ),
             (
                 16,
-                "754db504aac0a9bf1937dbb234302a2ff17e45a5405bd1f01eabbf7e3602bfee",
+                "6f67d58769c63fdab1053d90563a1b94df60b16f2e6dc7db97071d4d3b8ca1e3",
             ),
             (
                 17,
-                "c847ecb579fee8b6438137ceb0e1d38fc86142a1261b6c130b9a3c21536aaaf3",
+                "817267b777ab2af3ed1f1a3dea907d8e3f9f6f359473a7399c7332f251770f8a",
             ),
             (
                 63,
-                "5fcaa5d16d48a9682b2b67c0f7e8a92c78b46d5faba8055be2374f62a6a22d8b",
+                "2ec02cd29dccaf7f31848a1c9356a5d4b316488cb8cd5669b092ede5bd88c06a",
             ),
             (
                 64,
-                "bbb570f99a4ade3980a969c74357172d935c577e6a2a9a7aa3337b2472a331f6",
+                "b37dc286b2c84a6fe79556aa79d8e53194536cd5f287706a0abf166f4056d2fa",
             ),
             (
                 65,
-                "27a4d9f672a859747e37434a6603cb514c1ea9434a4cea4783188df16d6c214b",
+                "dd719fe6bd5d0dd5805384d836e1e467e2887034d56c392d38df506c995e1380",
             ),
             (
                 255,
-                "7518946a4afcb1d1d1f3ef67d1f5868a69bf43898319fb8e52e49cfeb675b7cf",
+                "538f9ef2d45a671c3eb94cdc7d2c0329601533c53c7cdc030f67bea786aec6b5",
             ),
             (
                 256,
-                "ec9cf529f452314760ffcb2d7f28070e2423f4e483638a7ad1543bf7ab0ea379",
+                "9db1041bf3cde1aafc0f78367712fe1a6e81970f934cabddd8a85938c3b90923",
             ),
             (
                 257,
-                "98a258d3b9dcb5cee06085e2294b0094a915c5df6bd19850e22e754480bc646e",
+                "3939acb09041e32debc0183bffaa95a18a3594f7eeaaf0467a90da9f1fc9736b",
             ),
             (
                 16777215,
-                "f87d981e91a2843f17f5f08ab03d595ec8e43a462f70b69e2d71db0026a3d472",
+                "002a3c9d0a158493c46cd3cdb66d8dfe06b5edbeb527f12d2536e1d5b616c4d6",
             ),
             (
                 16777216,
-                "8b8ec02ea8cf51a61703c064e988f7a15837f26753ff31d5dc44b808eb4e6fcc",
+                "bbf1eee5774267cf76c4aea9e8426da764b7799d713e848c3b9850120864728d",
             ),
         ];
-        let keys = crate::test_support::security::keys();
+        let keys = crate::test_support::security::keys(&env);
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         )));
@@ -4004,7 +4714,7 @@ mod tests {
                 .collect();
             let mut encrypted = vec![0; length + 16];
             racer_crypto::seal_credentials(
-                &[7; 32],
+                &crate::test_support::test_vector([7; 32]),
                 &descriptor.nonce.0,
                 &page_aad(&descriptor).unwrap(),
                 &raw,
@@ -4020,7 +4730,7 @@ mod tests {
             // after checking the independent known-answer digest above.
             descriptor.key_id = keys.active(cache, KeyPurpose::Page).unwrap().id();
             racer_crypto::seal(
-                &[7; 32],
+                &crate::test_support::test_vector([7; 32]),
                 &descriptor.nonce.0,
                 &page_aad(&descriptor).unwrap(),
                 &raw,
@@ -4052,17 +4762,20 @@ mod tests {
                 permit.job(
                     CryptoInput::Decrypt {
                         ciphertext: original,
-                        plaintext: admission
-                            .reserve(Some(cache), ResourceClass::Plaintext, length)
-                            .unwrap(),
+                        plaintext: crate::memory::fixture_plaintext(
+                            &admission,
+                            Some(cache),
+                            &vec![0; length],
+                        ),
                     },
                     keys.active(cache, KeyPurpose::Page).unwrap(),
-                    RequestScope::new(
+                    RequestScope::host(
                         RequestId([1; 16]),
                         std::time::Instant::now() + std::time::Duration::from_secs(10),
                     )
                     .unwrap(),
                 ),
+                &racer_io::WorkerCtx::host(),
             );
             let CryptoOutcome::Completed(CryptoOutput::Decrypted(clear, original)) =
                 &completion.outcome
@@ -4072,10 +4785,15 @@ mod tests {
             assert_eq!(clear.bytes(), raw);
             assert_eq!(original.bytes().as_ptr(), pointer);
             assert_eq!(Sha256::digest(original.bytes()), current_digest);
-            assert_eq!(admission.used(ResourceClass::Plaintext), length);
-            assert_eq!(admission.used(ResourceClass::Ciphertext), length + 16);
+            assert_eq!(
+                admission.used(ResourceClass::Plaintext),
+                length.max(1).next_multiple_of(4096)
+            );
+            assert_eq!(
+                admission.used(ResourceClass::Ciphertext),
+                (length + 16).next_multiple_of(page_alloc::buf::GRANULE)
+            );
             drop(completion);
-            admission.reclaim_buffers();
             assert_eq!(admission.used(ResourceClass::Plaintext), 0);
             assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
         }
@@ -4086,7 +4804,7 @@ mod tests {
         let aad = page_aad(&descriptor).unwrap();
         let mut encrypted = [0; 5 + TAG_LEN];
         racer_crypto::seal(
-            &[7; 32],
+            &crate::test_support::test_vector([7; 32]),
             &descriptor.nonce.0,
             &aad,
             b"hello",
@@ -4107,7 +4825,16 @@ mod tests {
             // A nonzero sentinel proves a failed open wipes the output rather
             // than merely observing the zero-initialized production buffer.
             let mut output = [0xa5; 5];
-            assert!(racer_crypto::open(&[7; 32], &nonce, &aad, &input, &mut output).is_err());
+            assert!(
+                racer_crypto::open(
+                    &crate::test_support::test_vector([7; 32]),
+                    &nonce,
+                    &aad,
+                    &input,
+                    &mut output
+                )
+                .is_err()
+            );
             assert_eq!(output, [0; 5]);
             assert_eq!(input, retained);
         }
@@ -4115,8 +4842,9 @@ mod tests {
     #[test]
     fn random_nonces_do_not_repeat() {
         let mut seen = std::collections::HashSet::new();
+        let rng = racer_io::Rng::os();
         for _ in 0..1024 {
-            assert!(seen.insert(fresh_nonce().unwrap().0));
+            assert!(seen.insert(fresh_nonce(&rng).unwrap().0));
         }
     }
     #[test]
@@ -4125,7 +4853,8 @@ mod tests {
         use crate::memory::BufferPool;
         use crate::security::CryptoId;
         use crate::security::pair;
-        let keys = crate::test_support::security::keys();
+        let env = racer_io::Env::host();
+        let keys = crate::test_support::security::keys(&env);
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         )));
@@ -4133,7 +4862,10 @@ mod tests {
         let descriptor = envelope();
         let cache = &descriptor.page.version.object.cache;
         let (io, port) = pair(WorkerId(0), 1, std::num::NonZeroUsize::new(1).unwrap());
-        let mut engine = PageCryptoEngine::new(CryptoRuntime { port });
+        let mut engine = PageCryptoEngine::new(CryptoRuntime {
+            port,
+            ctx: racer_io::WorkerCtx::host(),
+        });
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         for sequence in 1..=6 {
             let canceled = sequence == 2;
@@ -4141,7 +4873,7 @@ mod tests {
             let mut descriptor = descriptor.clone();
             let mut bytes = vec![0; 5 + TAG_LEN];
             racer_crypto::seal(
-                &[7; 32],
+                &crate::test_support::test_vector([7; 32]),
                 &descriptor.nonce.0,
                 &page_aad(&descriptor).unwrap(),
                 b"hello",
@@ -4167,11 +4899,9 @@ mod tests {
             let original_pointer = cipher.bytes().as_ptr();
             let input = CryptoInput::Decrypt {
                 ciphertext: cipher,
-                plaintext: admission
-                    .reserve(Some(cache), ResourceClass::Plaintext, 5)
-                    .unwrap(),
+                plaintext: crate::memory::fixture_plaintext(&admission, Some(cache), &[0; 5]),
             };
-            let scope = RequestScope::new(
+            let scope = RequestScope::host(
                 RequestId([1; 16]),
                 std::time::Instant::now() + std::time::Duration::from_secs(10),
             )
@@ -4226,19 +4956,25 @@ mod tests {
                     assert_eq!(
                         *error,
                         if canceled {
-                            Error::Cancelled
+                            Error::Canceled
                         } else {
                             Error::CorruptRecord
                         }
                     );
                     assert_eq!(ciphertext.bytes(), bytes);
                     assert_eq!(ciphertext.bytes().as_ptr(), original_pointer);
-                    assert_eq!(plaintext.amount(), 5);
+                    assert_eq!(plaintext.charge().amount(), page_alloc::buf::GRANULE);
                 }
                 _ => panic!("wrong outcome"),
             }
-            assert_eq!(admission.used(ResourceClass::Plaintext), 5);
-            assert_eq!(admission.used(ResourceClass::Ciphertext), 21);
+            assert_eq!(
+                admission.used(ResourceClass::Plaintext),
+                page_alloc::buf::GRANULE
+            );
+            assert_eq!(
+                admission.used(ResourceClass::Ciphertext),
+                page_alloc::buf::GRANULE
+            );
             drop(completion);
             assert_eq!(admission.used(ResourceClass::Plaintext), 0);
             assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
@@ -4250,7 +4986,8 @@ mod tests {
     fn encryption_seals_into_requesting_worker_aligned_pool() {
         use crate::admission::AdmissionPolicy;
         use crate::memory::BufferPool;
-        let keys = Rc::new(crate::test_support::security::keys());
+        let env = racer_io::Env::host();
+        let keys = Rc::new(crate::test_support::security::keys(&env));
         let page = envelope().page;
         let cache = page.version.object.cache.clone();
         let alignment = crate::memory::default_disk_alignment();
@@ -4263,13 +5000,16 @@ mod tests {
             )));
             let pool = BufferPool::new(admission.clone());
             let (io, port) = pair(WorkerId(worker), 1, NonZeroUsize::new(1).unwrap());
-            let crypto = PageCrypto::new(keys.clone(), Rc::new(CryptoClient::new(io)))
-                .with_buffers(pool.clone());
+            let crypto =
+                PageCrypto::new(keys.clone(), Rc::new(CryptoClient::new(io)), pool.clone());
             holders.push((admission, pool, crypto));
             // One crypto thread (this one) drives both workers' queues.
-            engines.push(PageCryptoEngine::new(CryptoRuntime { port }));
+            engines.push(PageCryptoEngine::new(CryptoRuntime {
+                port,
+                ctx: racer_io::WorkerCtx::host(),
+            }));
         }
-        let scope = RequestScope::new(
+        let scope = RequestScope::host(
             RequestId([1; 16]),
             std::time::Instant::now() + std::time::Duration::from_secs(10),
         )
@@ -4286,14 +5026,20 @@ mod tests {
                 )
                 .unwrap();
             {
-                use uring_runtime::reactor::IoBuffer;
+                use racer_io::ring::IoBuffer;
                 plaintext.bytes_mut().unwrap().fill(index as u8 + 1);
             }
             // Fill reserves the exact ciphertext length; the pool upgrades it.
             let reservation = admission
                 .reserve(Some(&cache), ResourceClass::Ciphertext, length + 16)
                 .unwrap();
-            let mut future = crypto.encrypt(page.clone(), plaintext, reservation, &scope);
+            let mut future = crypto.encrypt(
+                page.clone(),
+                racer_wire::object::PageSize::DEFAULT,
+                plaintext,
+                reservation,
+                &scope,
+            );
             assert!(future.as_mut().poll(&mut cx).is_pending());
             futures.push(future);
         }
@@ -4326,10 +5072,6 @@ mod tests {
             let length = 5000 + index;
             assert_eq!(clear.bytes().len(), length);
             assert_eq!(cipher.bytes().len(), length + 16);
-            assert_eq!(
-                cipher.cached_checksum(),
-                Some(racer_crypto::crc64(cipher.bytes()))
-            );
             let body = cipher
                 .disk_body(alignment)
                 .expect("disk-aligned ciphertext");
@@ -4339,7 +5081,7 @@ mod tests {
             assert!(body[length + 16..].iter().all(|byte| *byte == 0));
             let mut decrypted = vec![0; length];
             racer_crypto::open(
-                &[7; 32],
+                &crate::test_support::test_vector([7; 32]),
                 &cipher.envelope().nonce.0,
                 &page_aad(cipher.envelope()).unwrap(),
                 cipher.bytes(),
@@ -4349,15 +5091,121 @@ mod tests {
             assert!(decrypted.iter().all(|byte| *byte == *index as u8 + 1));
         }
         for (_, pool, _) in &holders {
-            assert_eq!(pool.aligned_stats().idle_buffers, 0);
+            assert_eq!(pool.disk_idle_bytes(), 0);
         }
         drop(results);
         for (admission, pool, _) in &holders {
             // Each page returned to the pool of the worker that requested it,
             // and idle storage keeps no Ciphertext admission.
-            assert_eq!(pool.aligned_stats().idle_buffers, 1);
+            assert!(pool.disk_idle_bytes() > 0);
             assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
         }
+    }
+    /// Helpers sharing a NUMA group run a sibling lane's backlog, return the
+    /// completions to the owning lane, wake an idle sibling, and count the theft.
+    #[test]
+    fn shared_helpers_steal_backlog_and_complete_on_owner_lane() {
+        use crate::admission::AdmissionPolicy;
+        use crate::memory::BufferPool;
+        struct Count(std::sync::atomic::AtomicUsize);
+        impl futures::task::ArcWake for Count {
+            fn wake_by_ref(this: &Arc<Self>) {
+                this.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let env = racer_io::Env::host();
+        let keys = Rc::new(crate::test_support::security::keys(&env));
+        let page = envelope().page;
+        let cache = page.version.object.cache.clone();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let share = CryptoShare::new(2);
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+            crate::test_support::cluster::config(false).limits,
+        )));
+        let pool = BufferPool::new(admission.clone());
+        let mut engines = Vec::new();
+        let mut clients = Vec::new();
+        for worker in 0..2 {
+            let (io, mut port) = pair(WorkerId(worker), 1, NonZeroUsize::new(4).unwrap());
+            port.share(share.clone(), usize::from(worker));
+            clients.push(Rc::new(CryptoClient::new(io)));
+            engines.push(PageCryptoEngine::new(CryptoRuntime {
+                port,
+                ctx: racer_io::WorkerCtx::host(),
+            }));
+        }
+        let metrics = crate::telemetry::Metrics::default();
+        clients[0].set_metrics(metrics.clone());
+        // The thief finds no work and advertises itself idle.
+        let idle = Arc::new(Count(std::sync::atomic::AtomicUsize::new(0)));
+        let idle_waker = futures::task::waker(idle.clone());
+        engines[1]
+            .poll_budgeted(&mut Context::from_waker(&idle_waker), 1)
+            .unwrap();
+        assert_eq!(idle.0.load(Ordering::SeqCst), 0);
+        let crypto = PageCrypto::new(keys, clients[0].clone(), pool.clone());
+        let scope = RequestScope::host(
+            RequestId([1; 16]),
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        let mut futures = Vec::new();
+        for index in 0..3 {
+            let length = 4000 + index;
+            let plaintext = pool
+                .plaintext(
+                    admission
+                        .reserve(Some(&cache), ResourceClass::Plaintext, length)
+                        .unwrap(),
+                    length,
+                )
+                .unwrap();
+            let reservation = admission
+                .reserve(Some(&cache), ResourceClass::Ciphertext, length + 16)
+                .unwrap();
+            let mut future = crypto.encrypt(
+                page.clone(),
+                racer_wire::object::PageSize::DEFAULT,
+                plaintext,
+                reservation,
+                &scope,
+            );
+            assert!(future.as_mut().poll(&mut cx).is_pending());
+            futures.push(future);
+        }
+        // The owner takes one job, sees a backlog, and wakes the idle sibling.
+        engines[0].poll_budgeted(&mut cx, 1).unwrap();
+        assert_eq!(idle.0.load(Ordering::SeqCst), 1);
+        // The sibling runs the remaining backlog of lane 0.
+        engines[1].poll_budgeted(&mut cx, 4).unwrap();
+        engines[0].poll_budgeted(&mut cx, 4).unwrap();
+        clients[0].poll_budgeted(8).unwrap();
+        for future in &mut futures {
+            assert!(matches!(future.as_mut().poll(&mut cx), Poll::Ready(Ok(_))));
+        }
+        assert_eq!(metrics.count(crate::telemetry::Event::CryptoStolenJobs), 2);
+        drop(futures);
+        // Closing lane 0 drains once no stolen job remains in flight.
+        clients[0].port.close_submissions().unwrap();
+        engines[0].poll_budgeted(&mut cx, 1).unwrap();
+        assert!(engines[0].is_drained());
+        assert!(!engines[1].is_drained());
+    }
+    /// Without a share, a lane's backlog is never visible to another helper.
+    #[test]
+    fn unshared_helpers_do_not_steal() {
+        let (io, port) = pair(WorkerId(0), 1, NonZeroUsize::new(1).unwrap());
+        let (_io, other) = pair(WorkerId(1), 1, NonZeroUsize::new(1).unwrap());
+        let engine = PageCryptoEngine::new(CryptoRuntime {
+            port,
+            ctx: racer_io::WorkerCtx::host(),
+        });
+        let thief = PageCryptoEngine::new(CryptoRuntime {
+            port: other,
+            ctx: racer_io::WorkerCtx::host(),
+        });
+        assert!(!Arc::ptr_eq(&engine.share, &thief.share));
+        drop(io);
     }
     #[test]
     fn encryption_preserves_staging_and_charges_on_failure() {
@@ -4365,7 +5213,8 @@ mod tests {
         use crate::memory::BufferPool;
         use crate::security::CryptoId;
         use crate::security::pair;
-        let keys = crate::test_support::security::keys();
+        let env = racer_io::Env::host();
+        let keys = crate::test_support::security::keys(&env);
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         )));
@@ -4373,7 +5222,10 @@ mod tests {
         let page = envelope().page;
         let cache = &page.version.object.cache;
         let (io, port) = pair(WorkerId(0), 1, std::num::NonZeroUsize::new(1).unwrap());
-        let mut engine = PageCryptoEngine::new(CryptoRuntime { port });
+        let mut engine = PageCryptoEngine::new(CryptoRuntime {
+            port,
+            ctx: racer_io::WorkerCtx::host(),
+        });
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         let mut nonces = std::collections::HashSet::new();
         for sequence in 1..=5 {
@@ -4402,7 +5254,7 @@ mod tests {
                     if undersized { 20 } else { 21 },
                 )
                 .unwrap();
-            let scope = RequestScope::new(
+            let scope = RequestScope::host(
                 RequestId([1; 16]),
                 std::time::Instant::now() + std::time::Duration::from_secs(10),
             )
@@ -4421,9 +5273,10 @@ mod tests {
             assert!(
                 io.try_submit(permit.job(
                     CryptoInput::Encrypt {
+                        page_size: racer_wire::object::PageSize::DEFAULT,
                         page: page.clone(),
                         plaintext,
-                        ciphertext: ciphertext.into()
+                        ciphertext: crate::memory::fixture_encrypt_output(&admission, ciphertext)
                     },
                     keys.active(cache, KeyPurpose::Page).unwrap(),
                     scope
@@ -4444,7 +5297,7 @@ mod tests {
                     assert!(nonces.insert(cipher.envelope().nonce.0));
                     let mut decrypted = vec![0; cipher.envelope().plaintext_length as usize];
                     racer_crypto::open(
-                        &[7; 32],
+                        &crate::test_support::test_vector([7; 32]),
                         &cipher.envelope().nonce.0,
                         &page_aad(cipher.envelope()).unwrap(),
                         cipher.bytes(),
@@ -4465,17 +5318,14 @@ mod tests {
                     assert_eq!(
                         *error,
                         if canceled {
-                            Error::Cancelled
+                            Error::Canceled
                         } else {
                             Error::InvalidConfiguration
                         }
                     );
                     assert_eq!(plaintext.bytes().unwrap().as_ptr(), pointer);
                     assert_eq!(plaintext.bytes().unwrap(), b"hello");
-                    let EncryptOutput::Unaligned(ciphertext) = ciphertext else {
-                        panic!("unaligned output");
-                    };
-                    assert_eq!(ciphertext.amount(), if undersized { 20 } else { 21 });
+                    assert_eq!(ciphertext.len(), if undersized { 20 } else { 21 });
                 }
                 _ => panic!("wrong outcome"),
             }
@@ -4489,7 +5339,7 @@ mod tests {
                 )
                 .is_pending()
             );
-            assert_eq!(admission.used(ResourceClass::Plaintext), 5);
+            assert_eq!(admission.used(ResourceClass::Plaintext), 4096);
             drop(completion);
             assert_eq!(admission.used(ResourceClass::Plaintext), 0);
             assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
@@ -4502,6 +5352,7 @@ mod tests {
         use crate::security::pair;
         use std::sync::atomic::AtomicUsize;
         use std::sync::atomic::Ordering;
+        let env = racer_io::Env::host();
         struct WakeCount(AtomicUsize);
         impl std::task::Wake for WakeCount {
             fn wake(self: Arc<Self>) {
@@ -4511,13 +5362,13 @@ mod tests {
                 self.0.fetch_add(1, Ordering::SeqCst);
             }
         }
-        let keys = crate::test_support::security::keys();
+        let keys = crate::test_support::security::keys(&env);
         let admission = flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         ));
         let descriptor = envelope();
         let cache = &descriptor.page.version.object.cache;
-        let scope = RequestScope::new(
+        let scope = RequestScope::host(
             RequestId([1; 16]),
             std::time::Instant::now() + std::time::Duration::from_secs(10),
         )
@@ -4526,7 +5377,10 @@ mod tests {
         let wake = Arc::new(WakeCount(AtomicUsize::new(0)));
         let waker = std::task::Waker::from(wake.clone());
         let mut cx = Context::from_waker(&waker);
-        let mut engine = PageCryptoEngine::new(CryptoRuntime { port });
+        let mut engine = PageCryptoEngine::new(CryptoRuntime {
+            port,
+            ctx: racer_io::WorkerCtx::host(),
+        });
         engine.register_driver(&waker);
         // Budget polling's noop task waker must not replace the runtime driver.
         engine
@@ -4534,13 +5388,13 @@ mod tests {
             .unwrap();
         for sequence in 1..=9 {
             let job_scope =
-                RequestScope::new(RequestId([sequence as u8; 16]), scope.deadline.0).unwrap();
+                RequestScope::host(RequestId([sequence as u8; 16]), scope.deadline.0).unwrap();
             if sequence % 3 == 2 {
                 job_scope.cancel().unwrap();
             }
             let mut bytes = vec![0; 5 + TAG_LEN];
             racer_crypto::seal(
-                &[7; 32],
+                &crate::test_support::test_vector([7; 32]),
                 &descriptor.nonce.0,
                 &page_aad(&descriptor).unwrap(),
                 b"hello",
@@ -4561,24 +5415,21 @@ mod tests {
                 panic!("reserve");
             };
             let cipher = CiphertextPage {
+                pinned: true,
                 provenance: None,
-                inner: Arc::new(CiphertextBytes {
-                    checksum: std::sync::OnceLock::new(),
+                inner: Arc::new(crate::memory::CiphertextBytes {
+                    pins: Default::default(),
                     envelope: descriptor.clone(),
-                    storage: flow_control::ChargedBytes {
-                        bytes,
-                        reservation: admission
-                            .reserve(Some(cache), ResourceClass::Ciphertext, 21)
-                            .unwrap(),
-                    }
-                    .into(),
+                    storage: crate::memory::fixture_ciphertext_storage(
+                        &admission,
+                        Some(cache),
+                        &bytes,
+                    ),
                 }),
             };
             let input = CryptoInput::Decrypt {
                 ciphertext: cipher,
-                plaintext: admission
-                    .reserve(Some(cache), ResourceClass::Plaintext, 5)
-                    .unwrap(),
+                plaintext: crate::memory::fixture_plaintext(&admission, Some(cache), &[0; 5]),
             };
             assert!(
                 io.try_submit(permit.job(
@@ -4608,7 +5459,7 @@ mod tests {
                     assert_eq!(
                         *error,
                         if sequence % 3 == 2 {
-                            Error::Cancelled
+                            Error::Canceled
                         } else {
                             Error::CorruptRecord
                         }
@@ -4620,7 +5471,7 @@ mod tests {
             drop(completion);
             assert_eq!(
                 admission.used(ResourceClass::Plaintext),
-                (9 - sequence) as usize * 5
+                (9 - sequence) as usize * 4096
             );
         }
         assert!(matches!(drain.as_mut().poll(&mut cx), Poll::Ready(Ok(()))));
