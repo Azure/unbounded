@@ -291,13 +291,25 @@ func open(ctx context.Context, source upstream, ref ifaces.OriginRef, request ra
 // application/octet-stream. Blob bytes are typed by the manifest that
 // references them, and registries disagree on the header they send, so a fixed
 // type keeps registry pages and pages served from the local content store
-// (see localContentType) on the same version metadata.
+// (see localContentType) on the same version metadata. Manifest types are
+// reduced to the bare, lowercase media type so a registry header such as
+// "application/vnd.oci.image.manifest.v1+json; charset=utf-8" matches the
+// mediaType field a local copy reports for the same ETag.
 func originContentType(kind ifaces.OriginRefKind, contentType string) string {
 	if kind != ifaces.KindManifest {
 		return "application/octet-stream"
 	}
 
-	return contentType
+	return manifestMediaType(contentType)
+}
+
+// manifestMediaType strips parameters and whitespace from a manifest content
+// type and lowercases it. Both the registry and local content store paths use
+// it so Racer sees one content type per manifest version.
+func manifestMediaType(contentType string) string {
+	mediaType, _, _ := strings.Cut(contentType, ";")
+
+	return strings.ToLower(strings.TrimSpace(mediaType))
 }
 
 func openRange(ctx context.Context, source ifaces.OriginRangePuller, ref ifaces.OriginRef, tag string, offset, length int64) (racersdk.Metadata, io.ReadCloser, error) {

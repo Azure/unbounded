@@ -164,9 +164,10 @@ func localContentType(kind ifaces.OriginRefKind, blob LocalBlob, size int64) (st
 		return "", fmt.Errorf("decode local manifest: %w", err)
 	}
 
-	if manifest.MediaType == "" {
+	mediaType := manifestMediaType(manifest.MediaType)
+	if mediaType == "" {
 		return "", errors.New("local manifest has no mediaType")
 	}
 
-	return manifest.MediaType, nil
+	return mediaType, nil
 }

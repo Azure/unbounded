@@ -206,7 +206,9 @@ file `<racer_content_root>/blobs/sha256/<hex>`.
 - The answer has the same size and ETag (`"sha256:<hex>"`) as a registry
   read. Blobs report `application/octet-stream`. A manifest reports its
   `mediaType` field; a manifest without one is a miss so the registry supplies
-  the header.
+  the header. Both paths reduce a manifest type to the bare, lowercase media
+  type (parameters such as `; charset=utf-8` are dropped), so a registry page
+  and a local page for the same ETag carry the same Racer content type.
 - A local-only request never contacts the registry and ignores the
   credential. Normal requests always use the registry.
 - containerd verifies a blob before it commits it, so local pages are not

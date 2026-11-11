@@ -84,7 +84,7 @@ func TestRacerRegistryContentType(t *testing.T) {
 						if tc.route == "blobs" {
 							wantType = "application/octet-stream"
 						} else if supplied {
-							wantType = tc.contentType
+							wantType = manifestMediaType(tc.contentType)
 						}
 
 						if err != nil || metadata.ContentType != wantType || metadata.Size != int64(len(tc.data)) {
@@ -123,7 +123,7 @@ func TestRacerRegistryContentType(t *testing.T) {
 						return
 					}
 
-					wantType := tc.contentType
+					wantType := manifestMediaType(tc.contentType)
 					if !supplied || tc.route == "blobs" {
 						wantType = "application/octet-stream"
 					}
