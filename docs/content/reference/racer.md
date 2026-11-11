@@ -1310,6 +1310,12 @@ example after a node restart), `HEAD` returns the blob `ETag` with no
 `committed` should treat a non-Racer `ETag` with no upload state as already
 uploaded.
 
+`HEAD` asks the object's write coordinator for the upload state and waits at
+most half of the remaining request time, up to 1 second. If the coordinator
+does not answer in time, `HEAD` still succeeds but omits `Racer-Upload-State`.
+A client that needs the state, such as one waiting for `committed`, should
+retry `HEAD` when the header is missing under a Racer `ETag`.
+
 | State | Meaning |
 |-------|---------|
 | `pending` | Waiting to upload (`auto`). |

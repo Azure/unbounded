@@ -1397,7 +1397,11 @@ routes `is_write` heads to `write::client::serve` when the cache has writes,
 and answers `405 Allow: HEAD, POST` for every write route otherwise.
 `MetadataService::refresh` consults the worker's write directory before
 peers and origin. `ReadResponse::upload_state` carries `Racer-Upload-State`
-for HEAD (the coordinator is asked with `status`). `OriginRouter` implements
+for HEAD (the coordinator is asked with `status`). The lookup runs on a copy
+of the request scope narrowed by `coordinator::upload_state_deadline` to half
+the remaining budget, capped at `UPLOAD_STATE_TIMEOUT` (1 s), so a stalled
+coordinator cannot spend the deadline the response still needs; on timeout
+or any error the HEAD omits the header. `OriginRouter` implements
 `UploadSink` (native origins only). `Availability::native_origin`,
 `Index::invalidate_current`, `CandidatePolicy::write_authority`,
 `telemetry::Metrics::writes()` were added.
