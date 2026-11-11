@@ -923,10 +923,49 @@ impl World {
         }
         let node = self.pick(self.harness.nodes.len());
         self.note("delete");
-        let response = self
+        let mut response = self
             .simple(node, "DELETE", &key(object))
             .expect("DELETE answered");
+        // A `503` delete of a live object may have taken effect without
+        // reaching its tombstone quorum: retry it like a client would. A
+        // retry answers `404` once the earlier attempt's delete stands.
+        let mut retried = false;
+        if response.status == 503 && self.live.contains_key(&object) {
+            for _ in 0..3 {
+                self.wait(Duration::from_secs(2));
+                let node = self.pick(self.harness.nodes.len());
+                self.note("delete-retry");
+                response = self
+                    .simple(node, "DELETE", &key(object))
+                    .expect("DELETE answered");
+                retried = true;
+                if response.status != 503 {
+                    break;
+                }
+            }
+        }
         match (self.live.get(&object).cloned(), response.status) {
+            (Some(written), 404) if retried => {
+                self.note("delete-retry-404");
+                self.live.remove(&object);
+                self.gone.insert(written.etag);
+                self.wait(Duration::from_secs(2));
+                for reader in 0..self.harness.nodes.len() {
+                    self.read(reader, object);
+                }
+            }
+            (Some(written), 503) if retried => {
+                // Still unacknowledged: deleted or not, reads may answer
+                // the acknowledged bytes or `404`, never anything else.
+                self.note("delete-unacknowledged");
+                self.live.remove(&object);
+                self.lost_versions
+                    .insert(written.etag.clone(), (object, written.bytes.clone()));
+                if !written.uploading {
+                    self.gone.insert(written.etag);
+                }
+                self.lost.insert(object);
+            }
             (Some(written), 204) => {
                 self.live.remove(&object);
                 self.gone.insert(written.etag);

@@ -268,6 +268,12 @@ impl Cluster {
     }
 
     fn exchange(&mut self, node: usize, request: Vec<u8>) -> Response {
+        self.exchange_then(node, request, true)
+    }
+
+    /// [`Self::exchange`]; `settle` waits for background work afterward,
+    /// which a partition can hold up.
+    fn exchange_then(&mut self, node: usize, request: Vec<u8>, settle: bool) -> Response {
         let fd = self.connect(node);
         let mut raw = Raw {
             fd: Some(fd),
@@ -283,7 +289,9 @@ impl Cluster {
             self.harness.tick();
             if raw.poll() {
                 raw.fd.take();
-                self.harness.settle();
+                if settle {
+                    self.harness.settle();
+                }
                 let (start, headers, end) = headers(&raw.response);
                 let status = start.split_whitespace().nth(1).unwrap().parse().unwrap();
                 return Response {
@@ -1940,4 +1948,246 @@ fn a_new_page_zero_rank_0_does_not_404_before_rebalance() {
             a_new_page_zero_rank_0_reads_before_rebalance(seed, replicas);
         }
     }
+}
+
+// Delete durability: an acknowledged `DELETE` must never be undone by a node
+// that missed it (a restart, a coordinator failover, or a partition).
+
+impl Cluster {
+    /// The node index of the node with id `id`.
+    fn index_of(&self, id: usize) -> usize {
+        self.harness
+            .nodes
+            .iter()
+            .position(|n| n.id == id)
+            .expect("a live node")
+    }
+
+    /// Nodes tracking `object` in `role`.
+    fn with_role(&self, object: &ObjectId, role: crate::write::directory::Role) -> Vec<usize> {
+        (0..self.harness.nodes.len())
+            .filter(|&n| {
+                self.harness.nodes[n].workers.iter().any(|w| {
+                    w.app
+                        .coordinator
+                        .writes()
+                        .directory()
+                        .with(object, |e| e.is_some_and(|e| e.role == role))
+                })
+            })
+            .collect()
+    }
+
+    /// Restart the node `id` from its disk and publish it as a member again.
+    fn restart(&mut self, id: usize) {
+        self.harness.add(&self.env, Some(id));
+        self.configure();
+        self.harness.publish();
+        self.harness.settle();
+    }
+
+    /// `DELETE` without waiting for background work (a partition holds it).
+    fn delete_unsettled(&mut self, node: usize, object: usize) -> Response {
+        let request = format!(
+            "DELETE /v1/objects/{} HTTP/1.1\r\nHost: racer\r\nRacer-Metadata: dst opaque metadata\r\nAuthorization: Bearer dst-fixture\r\nConnection: close\r\n\r\n",
+            key(object)
+        );
+        self.exchange_then(node, request.into_bytes(), false)
+    }
+
+    /// Cut node `index`'s peer links to every other node.
+    fn isolate(&mut self, index: usize) -> Vec<(SocketAddress, SocketAddress)> {
+        let mut links = Vec::new();
+        for (other, node) in self.harness.nodes.iter().enumerate() {
+            if other == index {
+                continue;
+            }
+            let pair = (
+                SocketAddress::Inet(self.harness.nodes[index].config.peer_listen),
+                SocketAddress::Inet(node.config.peer_listen),
+            );
+            self.harness.sim.partition(pair.0.clone(), pair.1.clone());
+            links.push(pair);
+        }
+        links
+    }
+
+    fn heal(&mut self, links: Vec<(SocketAddress, SocketAddress)>) {
+        for (a, b) in links {
+            self.harness.sim.heal(a, b);
+        }
+        self.harness.settle();
+    }
+
+    /// Every node reads `object` as missing: `HEAD` and a ranged `GET`
+    /// return `404`, and no node tracks a session or pins a page of it.
+    fn deleted_everywhere(&mut self, object: usize, length: usize, what: &str) {
+        for _ in 0..4 {
+            self.wait(Duration::from_secs(2));
+        }
+        for reader in 0..self.harness.nodes.len() {
+            let head = self.head(reader, object);
+            assert_eq!(
+                head.status,
+                404,
+                "{what}: reader {reader} HEAD {:?}, roles {:?}",
+                head.headers,
+                self.roles()
+            );
+            let read = self.get(reader, object, length);
+            assert_eq!(read.status, 404, "{what}: reader {reader} GET");
+        }
+        assert_eq!(self.sessions(), 0, "{what}: {:?}", self.roles());
+        let left: Vec<String> = self
+            .harness
+            .nodes
+            .iter()
+            .enumerate()
+            .flat_map(|(n, node)| {
+                node.workers.iter().flat_map(move |w| {
+                    let tombstoned =
+                        |v: &ObjectVersion| w.app.coordinator.writes().directory().tombstoned(v);
+                    w.app
+                        .store
+                        .writer
+                        .written_pages()
+                        .into_iter()
+                        .map(move |(page, _)| {
+                            format!(
+                                "node {n} page {} tombstoned {}",
+                                page.number.0,
+                                tombstoned(&page.version)
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        assert!(left.is_empty(), "{what}: pinned pages left: {left:?}");
+    }
+}
+
+/// A manifest replica that is down (still a member) while a `DELETE` is
+/// acknowledged must not serve the deleted version after it restarts with
+/// its journal.
+#[test]
+fn a_replica_down_during_delete_does_not_resurrect_it() {
+    for seed in [70, 71, 72] {
+        let mut c = Cluster::new(seed, 3, Some(writes(2)));
+        let body = bytes(seed, 140_000);
+        assert_eq!(c.put(0, OBJECT, &body, "").status, 201);
+        let object = c.object(OBJECT);
+        let replica = c.with_role(&object, crate::write::directory::Role::Replica)[0];
+        // Power loss, not published: the others still count it a member.
+        let id = c.harness.retire(&c.env, replica, true);
+        c.harness.settle();
+        let deleted = c.delete(0, OBJECT);
+        assert_eq!(deleted.status, 204, "{:?}", deleted.headers);
+        c.restart(id);
+        c.deleted_everywhere(OBJECT, body.len(), "restarted replica");
+        // The key can be written again.
+        assert_eq!(c.put(1, OBJECT, &body, "").status, 201);
+    }
+}
+
+/// A coordinator lost (and dropped from the membership) before a `DELETE`
+/// that its replica acknowledges must not serve the deleted version when it
+/// rejoins at its old rank with its journal.
+#[test]
+fn a_coordinator_down_during_delete_does_not_resurrect_it() {
+    for seed in [73, 74, 75] {
+        let mut c = Cluster::new(seed, 3, Some(writes(2)));
+        let body = bytes(seed, 140_000);
+        assert_eq!(c.put(0, OBJECT, &body, "").status, 201);
+        let coordinator = c.coordinator().expect("one coordinator");
+        let id = c.harness.retire(&c.env, coordinator, true);
+        c.harness.publish();
+        c.harness.settle();
+        c.wait(Duration::from_secs(2));
+        let deleted = c.delete(0, OBJECT);
+        assert_eq!(deleted.status, 204, "{:?}", deleted.headers);
+        c.restart(id);
+        c.deleted_everywhere(OBJECT, body.len(), "returned coordinator");
+        let _ = c.index_of(id);
+    }
+}
+
+/// A manifest replica partitioned from every peer while a `DELETE` is
+/// acknowledged must neither serve nor take over the deleted version once
+/// the partition heals.
+#[test]
+fn a_partitioned_replica_does_not_resurrect_a_delete() {
+    for seed in [76, 77, 78] {
+        let mut c = Cluster::new(seed, 3, Some(writes(2)));
+        let body = bytes(seed, 140_000);
+        assert_eq!(c.put(0, OBJECT, &body, "").status, 201);
+        let object = c.object(OBJECT);
+        let replica = c.with_role(&object, crate::write::directory::Role::Replica)[0];
+        let coordinator = c.coordinator().expect("one coordinator");
+        let links = c.isolate(replica);
+        let deleted = c.delete_unsettled(coordinator, OBJECT);
+        assert_eq!(deleted.status, 204, "{:?}", deleted.headers);
+        c.heal(links);
+        // Right after the heal the coordinator, the first node readers ask,
+        // must not adopt the replica's stale copy.
+        assert_eq!(c.head(coordinator, OBJECT).status, 404);
+        c.deleted_everywhere(OBJECT, body.len(), "healed replica");
+    }
+}
+
+/// A holder down during a `DELETE` drops its pinned pages soon after it
+/// restarts, not at its hold or orphan deadline.
+#[test]
+fn a_holder_down_during_delete_drops_its_pages_after_restart() {
+    let mut found = false;
+    for seed in 80..90 {
+        let mut c = Cluster::new(seed, 4, Some(writes(2)));
+        let body = bytes(seed, 4 * small_pages().get() as usize);
+        let created = c.put(0, OBJECT, &body, "");
+        assert_eq!(created.status, 201);
+        let object = c.object(OBJECT);
+        let version = c.version(OBJECT, &created);
+        let tracking = [
+            c.with_role(&object, crate::write::directory::Role::Coordinator),
+            c.with_role(&object, crate::write::directory::Role::Replica),
+        ]
+        .concat();
+        let holders = c.holders(&version, pages(body.len()));
+        let Some(holder) =
+            (0..4).find(|n| !tracking.contains(n) && holders.iter().any(|h| h.contains(n)))
+        else {
+            continue;
+        };
+        found = true;
+        let id = c.harness.retire(&c.env, holder, true);
+        c.harness.settle();
+        let deleted = c.delete(0, OBJECT);
+        assert_eq!(deleted.status, 204, "{:?}", deleted.headers);
+        c.restart(id);
+        c.deleted_everywhere(OBJECT, body.len(), "restarted holder");
+    }
+    assert!(
+        found,
+        "no seed placed a page on a node without the manifest"
+    );
+}
+
+/// A `DELETE` that cannot reach `replicas` page-zero members is not
+/// acknowledged (`503`). Its tombstone still spreads once they are back,
+/// and a retry then answers `404`: nothing written is left to delete.
+#[test]
+fn a_delete_short_of_its_quorum_is_retryable() {
+    let mut c = Cluster::new(79, 3, Some(writes(3)));
+    let body = bytes(79, 140_000);
+    assert_eq!(c.put(0, OBJECT, &body, "").status, 201);
+    let coordinator = c.coordinator().expect("one coordinator");
+    let others: Vec<usize> = (0..3).filter(|n| *n != coordinator).collect();
+    let mut links = c.isolate(others[0]);
+    links.extend(c.isolate(others[1]));
+    let refused = c.delete_unsettled(coordinator, OBJECT);
+    assert_eq!(refused.status, 503, "{:?}", refused.headers);
+    c.heal(links);
+    let retried = c.delete(coordinator, OBJECT);
+    assert_eq!(retried.status, 404, "{:?}", retried.headers);
+    c.deleted_everywhere(OBJECT, body.len(), "retried delete");
 }
