@@ -197,3 +197,37 @@ fn new_entries_have_no_repair_and_no_role_decision() {
     assert!(entry.role_checked.is_none());
     assert_eq!(entry.commit_attempts, 0);
 }
+
+#[test]
+fn upload_state_lookups_reserve_half_the_request_budget() {
+    use coordinator::UPLOAD_STATE_TIMEOUT;
+    use coordinator::upload_state_deadline;
+    use std::time::Duration;
+    use std::time::Instant;
+    let at = Instant::now();
+    // Half of a short budget, leaving the rest to send the response.
+    assert_eq!(
+        upload_state_deadline(at, Some(at + Duration::from_millis(400))),
+        Some(at + Duration::from_millis(200))
+    );
+    // A long budget is capped.
+    assert_eq!(
+        upload_state_deadline(at, Some(at + Duration::from_secs(60))),
+        Some(at + UPLOAD_STATE_TIMEOUT)
+    );
+    // An untimed request still bounds the lookup.
+    assert_eq!(
+        upload_state_deadline(at, None),
+        Some(at + UPLOAD_STATE_TIMEOUT)
+    );
+    // No budget left: skip the lookup.
+    assert_eq!(upload_state_deadline(at, Some(at)), None);
+    assert_eq!(
+        upload_state_deadline(at + Duration::from_secs(1), Some(at)),
+        None
+    );
+    assert_eq!(
+        upload_state_deadline(at, Some(at + Duration::from_nanos(1))),
+        None
+    );
+}

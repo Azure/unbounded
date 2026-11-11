@@ -50,7 +50,11 @@ fn entropy(local: &Coordinator) -> u64 {
     u64::from_le_bytes(bytes)
 }
 
-async fn sleep(local: &Coordinator, until: std::time::Instant, scope: &RequestScope) -> Result<()> {
+pub(super) async fn sleep(
+    local: &Coordinator,
+    until: std::time::Instant,
+    scope: &RequestScope,
+) -> Result<()> {
     match local.writes.reactor() {
         Some(reactor) => reactor.sleep_until(until, scope).await,
         None => Err(Error::Unavailable),

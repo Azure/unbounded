@@ -848,6 +848,41 @@ fn head_after_an_upload_finished_reports_committed() {
 }
 
 #[test]
+fn head_succeeds_without_upload_state_when_the_coordinator_stalls() {
+    let mut c = Cluster::new(24, 3, Some(writes(2)));
+    let body = bytes(13, 70_000);
+    let created = c.put(0, OBJECT, &body, "Racer-Upload: manual\r\n");
+    assert_eq!(created.status, 201);
+    let etag = created.header("etag").map(str::to_owned);
+    // Every coordinator answers Status only well past the lookup's
+    // allowance. An unbounded lookup would hold the HEAD for the whole stall
+    // and report the state; past the request timeout it would fail the HEAD.
+    for node in &c.harness.nodes {
+        for worker in &node.workers {
+            let writes = worker.app.coordinator.writes();
+            writes.set_status_stall(Some(Duration::from_secs(10)));
+        }
+    }
+    for node in 0..3 {
+        let head = c.head(node, OBJECT);
+        assert_eq!(head.status, 200, "node {node}");
+        assert_eq!(head.header("etag").map(str::to_owned), etag);
+        assert_eq!(head.header("racer-upload-state"), None, "node {node}");
+    }
+    // Once the coordinator answers again, so does the header.
+    for node in &c.harness.nodes {
+        for worker in &node.workers {
+            worker.app.coordinator.writes().set_status_stall(None);
+        }
+    }
+    c.wait(Duration::from_secs(2));
+    assert_eq!(
+        c.head(1, OBJECT).header("racer-upload-state"),
+        Some("manual")
+    );
+}
+
+#[test]
 fn a_retried_block_list_after_a_lost_response_commits() {
     let mut c = Cluster::new(19, 3, Some(writes(2)));
     // The first Put Block List commits but its 201 never arrives; the retry

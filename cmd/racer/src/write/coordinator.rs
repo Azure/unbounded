@@ -186,6 +186,11 @@ async fn session(
             Ok(WriteReply::Released)
         }
         WriteAction::Status { wait_millis } => {
+            #[cfg(test)]
+            if let Some(stall) = local.writes.status_stall() {
+                let until = scope.clock().now() + stall;
+                super::upload::sleep(local, until, scope).await?;
+            }
             status(local, &object, version.as_ref(), wait_millis, scope).await
         }
         WriteAction::Delete => delete(local, &object, version.as_ref(), &membership, scope).await,
@@ -1090,7 +1095,9 @@ pub(crate) async fn background_event(
 /// Upload state of a version, for `HEAD`. Asks the version's coordinator.
 /// A Racer ETag reports its session's state; any other ETag reports
 /// `Committed` only if it is the Blob ETag a still-known session committed
-/// as. `None` otherwise or on any failure.
+/// as. `None` otherwise or on any failure, including a lookup that outlives
+/// its share of the request budget ([`upload_state_deadline`]): the header is
+/// optional, so a slow coordinator must not fail the HEAD it decorates.
 pub(crate) async fn upload_state(
     local: &Coordinator,
     version: &ObjectVersion,
@@ -1103,6 +1110,10 @@ pub(crate) async fn upload_state(
     // A Racer ETag asks for the session's state; any other ETag asks
     // whether it is the session's committed Blob ETag.
     let etag = (!super::is_written_etag(&version.etag)).then(|| version.etag.clone());
+    let now = scope.clock().now();
+    let mut bounded = scope.clone();
+    bounded.deadline.0 = upload_state_deadline(now, scope.deadline_at())?;
+    let scope = &bounded;
     let coordinator = ranked(local, &membership, &version.object, 0, scope)
         .await
         .ok()?
@@ -1120,6 +1131,25 @@ pub(crate) async fn upload_state(
         }
         _ => None,
     }
+}
+
+/// Most an upload-state lookup may wait, whatever the request budget.
+pub(crate) const UPLOAD_STATE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Deadline for the optional upload-state lookup of a request expiring at
+/// `request_deadline` (`None` when untimed): half the remaining budget,
+/// capped at [`UPLOAD_STATE_TIMEOUT`]. The other half is reserved so the
+/// response is still sent when the coordinator stalls. `None` when no
+/// budget remains.
+pub(crate) fn upload_state_deadline(
+    at: std::time::Instant,
+    request_deadline: Option<std::time::Instant>,
+) -> Option<std::time::Instant> {
+    let share = match request_deadline {
+        Some(deadline) => (deadline.checked_duration_since(at)? / 2).min(UPLOAD_STATE_TIMEOUT),
+        None => UPLOAD_STATE_TIMEOUT,
+    };
+    (!share.is_zero()).then(|| at + share)
 }
 
 /// Load journaled sessions into the directory once the journal is bound.

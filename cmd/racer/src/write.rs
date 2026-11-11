@@ -146,6 +146,9 @@ pub struct WriteService {
     /// every cache counts as having a native origin.
     #[cfg(any(test, feature = "dst"))]
     origin: RefCell<Option<Rc<dyn crate::origin::Origin>>>,
+    /// Test support: delay every `Status` the coordinator serves.
+    #[cfg(test)]
+    status_stall: Cell<Option<std::time::Duration>>,
 }
 
 impl WriteService {
@@ -165,6 +168,8 @@ impl WriteService {
             rekey: RefCell::default(),
             #[cfg(any(test, feature = "dst"))]
             origin: RefCell::new(None),
+            #[cfg(test)]
+            status_stall: Cell::new(None),
         }
     }
 
@@ -173,6 +178,17 @@ impl WriteService {
     #[cfg(any(test, feature = "dst"))]
     pub(crate) fn set_test_origin(&self, origin: Option<Rc<dyn crate::origin::Origin>>) {
         *self.origin.borrow_mut() = origin;
+    }
+
+    /// Test support: stall each `Status` this coordinator serves by `stall`.
+    #[cfg(test)]
+    pub(crate) fn set_status_stall(&self, stall: Option<std::time::Duration>) {
+        self.status_stall.set(stall);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn status_stall(&self) -> Option<std::time::Duration> {
+        self.status_stall.get()
     }
 
     /// Install the node settings, the upload sink, the node-wide upload
