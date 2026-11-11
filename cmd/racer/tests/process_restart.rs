@@ -762,6 +762,17 @@ impl Process {
         incarnation: usize,
         profile: Option<&throughput::Profile>,
     ) -> (Self, Vec<Origin>) {
+        Self::start_with(scratch, control, incarnation, profile, &[])
+    }
+    /// Start like [`Self::start_profile`], then apply `overrides` last so they
+    /// replace any fixture default with the same name.
+    fn start_with(
+        scratch: &Scratch,
+        control: &control::Control,
+        incarnation: usize,
+        profile: Option<&throughput::Profile>,
+        overrides: &[(&str, &str)],
+    ) -> (Self, Vec<Origin>) {
         let expected_plan = profile.map(|profile| profile_plan(profile.pairs));
         // This fixture gives each process fresh runtime sockets and shares identity/
         // and slabs/. It does not cover stale sockets on deployment's hostPath.
@@ -842,6 +853,7 @@ impl Process {
                 ("RACER_SHUTDOWN_TIMEOUT_MS", "10000"),
             ]);
         }
+        command.envs(overrides.iter().copied());
         let source = CString::new(run.as_os_str().as_encoded_bytes()).unwrap();
         // SAFETY: the child performs only async-signal-safe syscalls before exec.
         // Make propagation private before mounting worktree-local storage over /run.
@@ -1454,5 +1466,148 @@ fn periodic_checkpoint_sigkill_recovers_older_pages_and_bounds_recent_loss() {
     );
     assert!(second.stop(libc::SIGTERM).success(), "{}", second.logs());
 }
+
+/// Per-thread CPU ticks and voluntary context switches of one process.
+#[derive(Default)]
+struct ThreadUsage(BTreeMap<u32, (String, u64, u64)>);
+
+impl ThreadUsage {
+    /// Sample `/proc/<pid>/task`, skipping io_uring kernel workers.
+    fn sample(pid: u32) -> Self {
+        let mut usage = Self::default();
+        for task in fs::read_dir(format!("/proc/{pid}/task")).unwrap() {
+            let path = task.unwrap().path();
+            let (Ok(comm), Ok(stat), Ok(status)) = (
+                fs::read_to_string(path.join("comm")),
+                fs::read_to_string(path.join("stat")),
+                fs::read_to_string(path.join("status")),
+            ) else {
+                continue;
+            };
+            if comm.starts_with("iou-") {
+                continue;
+            }
+            let tid = path.file_name().unwrap().to_str().unwrap().parse().unwrap();
+            // Fields after the parenthesized comm start at field 3 (state);
+            // utime and stime are fields 14 and 15.
+            let fields: Vec<&str> = stat[stat.rfind(')').unwrap() + 2..]
+                .split_whitespace()
+                .collect();
+            let ticks = fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap();
+            let wakes = status
+                .lines()
+                .find_map(|line| line.strip_prefix("voluntary_ctxt_switches:"))
+                .unwrap()
+                .trim()
+                .parse::<u64>()
+                .unwrap();
+            usage.0.insert(tid, (comm.trim().to_owned(), ticks, wakes));
+        }
+        usage
+    }
+
+    /// Per-thread `(name, ticks, wakes)` accrued since `before`.
+    fn since(&self, before: &Self) -> Vec<(String, u64, u64)> {
+        self.0
+            .iter()
+            .map(|(tid, (name, ticks, wakes))| {
+                let (ticks0, wakes0) = before.0.get(tid).map_or((0, 0), |(_, t, w)| (*t, *w));
+                (name.clone(), ticks - ticks0, wakes - wakes0)
+            })
+            .collect()
+    }
+}
+
+#[test]
+#[ignore = "requires root, private mount namespaces, io_uring and O_DIRECT"]
+fn idle_process_threads_sleep_instead_of_polling() {
+    // Two I/O lanes per crypto helper, as on production nodes, so helper
+    // shards and lanes both have to stay asleep.
+    const THREADS: &str = "6";
+    const WINDOW: Duration = Duration::from_secs(5);
+    let scratch = Scratch::new();
+    let control = control::Control::start(&scratch.0);
+    let (mut process, origins) = Process::start_with(
+        &scratch,
+        &control,
+        0,
+        None,
+        &[
+            ("RACER_MAX_THREADS", THREADS),
+            // Four I/O workers divide node quotas four ways.
+            ("RACER_PLAINTEXT_BYTES", "268435456"),
+            ("RACER_CIPHERTEXT_BYTES", "671088640"),
+            ("RACER_DIRTY_BYTES", "268435456"),
+            ("RACER_REQUEST_CONTEXT_BYTES", "67108864"),
+            ("RACER_QUEUE_ENTRIES", "64"),
+            ("RACER_CLIENT_CONNECTIONS", "48"),
+            ("RACER_METADATA_ENTRIES", "128"),
+            ("RACER_FLIGHTS", "32"),
+            ("RACER_PIPES", "8"),
+            ("RACER_SLAB_BYTES_PER_WORKER", "134217728"),
+        ],
+    );
+    // Serve one page so the read, crypto, and disk paths are all initialized.
+    check(&process.request(None, 0, P), 0, P);
+    // Hold unchanged control polls open like a production controller, so
+    // the measurement is not dominated by the fixture's fast poll turnaround.
+    control.hold_ms.store(60_000, Ordering::Release);
+    // Let startup work, enrollment, and post-read flushes settle.
+    thread::sleep(Duration::from_secs(3));
+    let pid = process.child.id();
+    let before = ThreadUsage::sample(pid);
+    let started = Instant::now();
+    thread::sleep(WINDOW);
+    let after = ThreadUsage::sample(pid);
+    let elapsed = started.elapsed().as_secs_f64();
+    process.assert_running();
+    // SAFETY: sysconf has no memory-safety preconditions.
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as f64;
+    let threads = after.since(&before);
+    let report = threads
+        .iter()
+        .map(|(name, ticks, wakes)| {
+            format!(
+                "{name}: {:.3} cores, {:.1} wakes/s",
+                *ticks as f64 / hz / elapsed,
+                *wakes as f64 / elapsed
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    eprintln!("idle threads:\n{report}");
+    // Lane 0 runs on the main thread; the others get their own threads.
+    let lanes = threads
+        .iter()
+        .filter(|(name, ..)| name.starts_with("racer-io-"))
+        .count();
+    let helpers = threads
+        .iter()
+        .filter(|(name, ..)| name.starts_with("racer-crypto"))
+        .count();
+    assert_eq!(
+        (lanes + 1, helpers),
+        (4, 2),
+        "expected the capped plan's threads:\n{report}"
+    );
+    let cores = threads.iter().map(|(_, ticks, _)| *ticks).sum::<u64>() as f64 / hz / elapsed;
+    // A thread that polls on a fixed millisecond cadence wakes about 1000
+    // times per second and costs a sizable fraction of a core. Idle threads
+    // only wake for periodic housekeeping.
+    assert!(
+        cores < 0.02,
+        "idle process consumed {cores:.3} cores:\n{report}"
+    );
+    for (name, _, wakes) in &threads {
+        let rate = *wakes as f64 / elapsed;
+        assert!(
+            rate < 30.0,
+            "idle {name} woke {rate:.1} times per second:\n{report}"
+        );
+    }
+    assert!(process.stop(libc::SIGTERM).success(), "{}", process.logs());
+    drop(origins);
+}
+
 use racer::affinity::CpuLocation;
 use racer::affinity::EffectiveTopology;
