@@ -1,0 +1,167 @@
+# Binds the reusable capacity roles in 04-machineclass-rbac.yaml.tmpl and
+# 05-machineallocation-rbac.yaml.tmpl to the machine-ops-controller
+# ServiceAccount, which runs AddToManager and AddCapacityToManager in one
+# manager. Rendered only with EnableCapacity=true, the value that also passes
+# --enable-capacity to the Deployment in 03-deployment.yaml.tmpl. Without it
+# this file holds no object and the controller keeps its host-operation
+# permissions only.
+#
+# The admission policies in 06-machine-allocationref-policy.yaml.tmpl and
+# 07-machineallocation-bootstrap-token-policy.yaml.tmpl must be installed with
+# these bindings.
+#
+# Each kind passed as AllocationConsumerKinds also needs get, list and watch
+# for this ServiceAccount. The deployer of that consumer grants those.
+{{- if eq (default "false" .EnableCapacity) "true" }}
+{{- $controllerName := default "machine-ops-controller" .ControllerName }}
+{{- $namespace := default "unbounded-system" .Namespace }}
+{{- $providerConfigNamespace := default $namespace .ProviderConfigNamespace }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $controllerName }}-machineclass
+  labels:
+    app.kubernetes.io/name: {{ $controllerName }}
+    app.kubernetes.io/component: controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: unbounded-machineclass-controller
+subjects:
+  - kind: ServiceAccount
+    name: {{ $controllerName }}
+    namespace: {{ $namespace }}
+
+---
+# Provider-config and bootstrap files ConfigMaps are read in the
+# provider-config namespace only (--provider-config-namespace). This binding
+# also serves the HostAllocate path, which reads the same inputs.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $controllerName }}-machineclass-provider-config
+  namespace: {{ $providerConfigNamespace }}
+  labels:
+    app.kubernetes.io/name: {{ $controllerName }}
+    app.kubernetes.io/component: controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: unbounded-machineclass-controller-provider-config
+subjects:
+  - kind: ServiceAccount
+    name: {{ $controllerName }}
+    namespace: {{ $namespace }}
+
+---
+# Credential Secrets are read in the credential Secret namespace only
+# (--credential-secret-namespace, which the Deployment sets to the controller
+# namespace).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $controllerName }}-machineclass-credentials
+  namespace: {{ $namespace }}
+  labels:
+    app.kubernetes.io/name: {{ $controllerName }}
+    app.kubernetes.io/component: controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: unbounded-machineclass-controller-credentials
+subjects:
+  - kind: ServiceAccount
+    name: {{ $controllerName }}
+    namespace: {{ $namespace }}
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $controllerName }}-machineallocation
+  labels:
+    app.kubernetes.io/name: {{ $controllerName }}
+    app.kubernetes.io/component: controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: unbounded-machineallocation-controller
+subjects:
+  - kind: ServiceAccount
+    name: {{ $controllerName }}
+    namespace: {{ $namespace }}
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $controllerName }}-machineallocation-provider-config
+  namespace: {{ $providerConfigNamespace }}
+  labels:
+    app.kubernetes.io/name: {{ $controllerName }}
+    app.kubernetes.io/component: controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: unbounded-machineallocation-controller-provider-config
+subjects:
+  - kind: ServiceAccount
+    name: {{ $controllerName }}
+    namespace: {{ $namespace }}
+
+---
+# Bootstrap token Secrets live in kube-system. The policy in
+# 07-machineallocation-bootstrap-token-policy.yaml.tmpl limits the creates and
+# deletes this grants to the allocation controller's own tokens.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $controllerName }}-machineallocation-bootstrap-tokens
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: {{ $controllerName }}
+    app.kubernetes.io/component: controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: unbounded-machineallocation-controller-bootstrap-tokens
+subjects:
+  - kind: ServiceAccount
+    name: {{ $controllerName }}
+    namespace: {{ $namespace }}
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $controllerName }}-machineallocation-operations
+  labels:
+    app.kubernetes.io/name: {{ $controllerName }}
+    app.kubernetes.io/component: controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: unbounded-machineallocation-operations
+subjects:
+  - kind: ServiceAccount
+    name: {{ $controllerName }}
+    namespace: {{ $namespace }}
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $controllerName }}-machineallocation-operations-bootstrap-tokens
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: {{ $controllerName }}
+    app.kubernetes.io/component: controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: unbounded-machineallocation-operations-bootstrap-tokens
+subjects:
+  - kind: ServiceAccount
+    name: {{ $controllerName }}
+    namespace: {{ $namespace }}
+{{- end }}
