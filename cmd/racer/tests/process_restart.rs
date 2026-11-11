@@ -1521,10 +1521,35 @@ impl ThreadUsage {
 #[test]
 #[ignore = "requires root, private mount namespaces, io_uring and O_DIRECT"]
 fn idle_process_threads_sleep_instead_of_polling() {
-    // Two I/O lanes per crypto helper, as on production nodes, so helper
-    // shards and lanes both have to stay asleep.
+    // Ask for two I/O lanes per crypto helper, as on production nodes, so
+    // helper shards and lanes both have to stay asleep.
     const THREADS: &str = "6";
     const WINDOW: Duration = Duration::from_secs(5);
+    // The cap is an upper bound. CPU quota, allowed cores, and NUMA layout
+    // decide the actual plan, so check it here and expect what it produces.
+    let plan = {
+        use racer::config::Config;
+        use racer::worker::AffinityPlan;
+        let config = Config::from_lookup(|name| {
+            Ok(match name {
+                "RACER_CLUSTER_ID" => Some(CLUSTER.into()),
+                "RACER_CONTROL_ENDPOINT" => Some("https://controller.invalid:443".into()),
+                "RACER_MAX_THREADS" => Some(THREADS.into()),
+                _ => None,
+            })
+        })
+        .unwrap();
+        AffinityPlan::discover(&config).unwrap()
+    };
+    let groups = plan.crypto_groups();
+    if !groups.iter().any(|group| group.len() > 1) {
+        eprintln!(
+            "skipping: host placement gives {} I/O lanes and {} crypto helpers, none shared",
+            plan.pairs.len(),
+            groups.len()
+        );
+        return;
+    }
     let scratch = Scratch::new();
     let control = control::Control::start(&scratch.0);
     let (mut process, origins) = Process::start_with(
@@ -1587,8 +1612,8 @@ fn idle_process_threads_sleep_instead_of_polling() {
         .count();
     assert_eq!(
         (lanes + 1, helpers),
-        (4, 2),
-        "expected the capped plan's threads:\n{report}"
+        (plan.pairs.len(), groups.len()),
+        "expected the discovered plan's threads:\n{report}"
     );
     let cores = threads.iter().map(|(_, ticks, _)| *ticks).sum::<u64>() as f64 / hz / elapsed;
     // A thread that polls on a fixed millisecond cadence wakes about 1000
