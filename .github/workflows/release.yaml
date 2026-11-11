@@ -44,14 +44,23 @@ name: unbounded release
 # SBOM-attests one multi-arch index.
 #
 # All artifacts land on a single GitHub release that is left as a draft.
-# Prerelease status is derived from the tag (a `-` suffix, e.g. v1.2.3-rc1).
-# The release-upgrade workflow publishes the draft after a successful soak
-# (deploy + smoke) on unbounded-stable; manual publish is still possible.
+# Prerelease status is derived from the tag (a `-` suffix, e.g. v1.2.3-rc.1).
+# release-upgrade then soaks it on unbounded-stable. A final is published when
+# that passes, or straight away when its candidate already passed one. A
+# candidate is never published: its result is recorded as the
+# unbounded/candidate commit status, and its draft is cleaned up once it is
+# superseded. See designs/release-candidates.md.
 #
 # RE-RUNNING THIS WORKFLOW MUST WORK. A release fails partway for reasons that
 # have nothing to do with the tree - a registry outage, a runner, a permission
 # - and the alternative to a re-run is deleting the tag and burning a version
 # number. That means every step here has to tolerate having already run.
+#
+# A failed CANDIDATE is the exception: it is not re-run. release-upgrade
+# discards its draft as soon as the build fails, and the next candidate is the
+# retry. Its number is an rc number, which is what they are for. A full re-run
+# (`gh run rerun <id>`, not --failed) still works, because `version` re-opens
+# the draft; --failed does not, because `version` succeeded and is skipped.
 #
 # THE RULE: EVERY WRITE TO THE RELEASE IS IDEMPOTENT. Around twenty jobs write
 # to it and that is fine; what is not allowed is a writer that fails, or
@@ -989,7 +998,7 @@ jobs:
   # ---------------------------------------------------------------------------
   # Attach the manifests tarball + krew manifest to the draft release that
   # GoReleaser created and set release notes. The release stays a draft here;
-  # the release-upgrade workflow publishes it after a successful soak.
+  # release-upgrade publishes a final, and records a candidate's result.
   # ---------------------------------------------------------------------------
   finalize:
     needs:
@@ -1093,7 +1102,14 @@ jobs:
             gh release edit "${TAG}" --prerelease
           fi
 
-          # The release is left as a draft here. The release-upgrade workflow
-          # publishes it automatically after a successful soak (deploy +
-          # smoke) on unbounded-stable; an operator can also publish manually.
-          echo "Release ${TAG} left as draft; release-upgrade will publish it after a successful soak (or publish manually with 'gh release edit ${TAG} --draft=false')."
+          # The release is left as a draft here. release-upgrade takes it from
+          # there: a final is published once its soak passes, or straight away
+          # when its candidate already passed one; a candidate is never
+          # published, and its result is recorded as the unbounded/candidate
+          # commit status. Publishing by hand bypasses the gate; the
+          # sanctioned bypass is `relctl publish`, which records why.
+          if [[ "${{ needs.version.outputs.is_prerelease }}" == "true" ]]; then
+            echo "Candidate ${TAG} left as a draft; release-upgrade will soak it and record the result."
+          else
+            echo "Release ${TAG} left as a draft; release-upgrade will publish it once it has passed a soak, its own or its candidate's."
+          fi

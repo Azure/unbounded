@@ -23,9 +23,9 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-# This script is meant to run non-interactively (it is also invoked by
-# setup-nightly-cluster.sh). Disable gh's pager so the secret/variable list
-# summaries below never drop the caller into an interactive pager.
+# This script is meant to run non-interactively. Disable gh's pager so the
+# secret/variable list summaries below never drop the caller into an
+# interactive pager.
 export GH_PAGER=cat
 
 REPO="Azure/unbounded"
@@ -65,7 +65,7 @@ Required:
 
 Optional:
   --manage-cni-plugin BOOL   Whether unbounded manages the CNI (true|false). Default: true
-  --channel CHANNEL          Deploy channel for the "next steps" hint: stable|nightly. Default: stable
+  --channel CHANNEL          Deploy channel for the "next steps" hint: stable. Default: stable
   --orca-azure-account NAME  Azure storage account for the Orca origin (enables Orca deploy)
   --orca-azure-container NAME Azure blob container for the Orca origin
   --orca-azure-endpoint URL  Azure blob endpoint (optional; blank => *.blob.core.windows.net)
@@ -144,9 +144,12 @@ case "$MANAGE_CNI_PLUGIN" in
 esac
 
 # Validate deploy channel (only affects the "next steps" hint printed below).
+# nightly is named rather than falling through to the generic message, so the
+# retirement explains itself to anyone still passing it.
 case "$DEPLOY_CHANNEL" in
-    stable|nightly) ;;
-    *) die "--channel must be 'stable' or 'nightly', got '$DEPLOY_CHANNEL'" ;;
+    stable) ;;
+    nightly) die "--channel nightly was retired: release candidates now soak main on unbounded-stable" ;;
+    *) die "--channel must be 'stable', got '$DEPLOY_CHANNEL'" ;;
 esac
 
 # Validate Orca config: account and container go together (endpoint is
@@ -289,23 +292,8 @@ Environment $ENV_NAME configured.
 EOF
 
 # Gateway nodes are labeled by forge's gateway pool, so no manual labeling
-# step is needed (both stable and nightly run on forge-built clusters). The
-# trigger differs per channel: stable deploys release tags via
-# release-upgrade.yaml; nightly deploys a snapshot of main via nightly.yaml.
-if [[ "$DEPLOY_CHANNEL" == "nightly" ]]; then
-    cat <<EOF
-Next steps:
-
-  1. Trigger the first install (run once per cluster):
-       gh workflow run nightly.yaml \\
-         --repo $REPO \\
-         -f force_init=true
-
-  2. Subsequent nightly snapshots of main deploy automatically to $ENV_NAME
-     at 06:00 UTC.
-EOF
-else
-    cat <<EOF
+# step is needed. Release tags deploy via release-upgrade.yaml.
+cat <<EOF
 Next steps:
 
   1. Trigger the first install (run once per cluster):
@@ -314,6 +302,6 @@ Next steps:
          -f tag=vX.Y.Z \\
          -f force_init=true
 
-  2. Subsequent published releases will deploy automatically to $ENV_NAME.
+  2. Subsequent release candidates, and finals that need a soak, will deploy
+     automatically to $ENV_NAME.
 EOF
-fi

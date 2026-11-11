@@ -53,9 +53,9 @@ func runDispatch(t *testing.T, stub *stubGitHub, stdin string, args ...string) (
 func TestDryRunDispatchesNothing(t *testing.T) {
 	stub := &stubGitHub{}
 
-	out, err := runDispatch(t, stub, "", "cut", "--branch", "main", "--repo-path", tagRepo(t), "--dry-run")
+	out, err := runDispatch(t, stub, "", "rc", "--branch", "main", "--repo-path", tagRepo(t), "--dry-run")
 	if err != nil {
-		t.Fatalf("cut --dry-run: %v\n%s", err, out)
+		t.Fatalf("rc --dry-run: %v\n%s", err, out)
 	}
 
 	if !strings.Contains(out, "Nothing was dispatched") {
@@ -67,18 +67,45 @@ func TestDryRunDispatchesNothing(t *testing.T) {
 	}
 }
 
-// TestCutPreviewsTheVersionBeforeAsking is why this is worth having over gh:
+// TestRcPreviewsTheVersionBeforeAsking is why this is worth having over gh:
 // the workflow's own dry_run costs a dispatch and a minute, and the answer is
 // computable locally from the same code.
-func TestCutPreviewsTheVersionBeforeAsking(t *testing.T) {
+func TestRcPreviewsTheVersionBeforeAsking(t *testing.T) {
 	out, err := runDispatch(t, &stubGitHub{}, "",
-		"cut", "--branch", "main", "--repo-path", tagRepo(t), "--dry-run")
+		"rc", "--branch", "main", "--repo-path", tagRepo(t), "--dry-run")
 	if err != nil {
-		t.Fatalf("cut: %v\n%s", err, out)
+		t.Fatalf("rc: %v\n%s", err, out)
 	}
 
-	if !strings.Contains(out, "This will cut v0.5.0 from main") {
+	if !strings.Contains(out, "This will cut v0.5.0-rc.1 from main") {
 		t.Errorf("no version preview:\n%s", out)
+	}
+}
+
+// TestCutIsRetired keeps the old command answering with what replaced it, flags
+// and all, and dispatching nothing. A final is only ever a promoted candidate.
+func TestCutIsRetired(t *testing.T) {
+	for _, args := range [][]string{
+		{"cut"},
+		{"cut", "--branch", "main", "--yes"},
+		{"cut", "--major"},
+	} {
+		stub := &stubGitHub{}
+
+		out, err := runDispatch(t, stub, "y\n", args...)
+		if err == nil {
+			t.Fatalf("%v: want a refusal\n%s", args, out)
+		}
+
+		for _, want := range []string{"retired", "relctl rc", "relctl promote"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("%v: refusal does not mention %q: %v", args, want, err)
+			}
+		}
+
+		if stub.dispatched != 0 {
+			t.Errorf("%v dispatched %d times", args, stub.dispatched)
+		}
 	}
 }
 
@@ -87,7 +114,7 @@ func TestCutPreviewsTheVersionBeforeAsking(t *testing.T) {
 func TestDispatchRefusedWithoutConfirmation(t *testing.T) {
 	stub := &stubGitHub{}
 
-	out, err := runDispatch(t, stub, "n\n", "cut", "--branch", "main", "--repo-path", tagRepo(t))
+	out, err := runDispatch(t, stub, "n\n", "rc", "--branch", "main", "--repo-path", tagRepo(t))
 	if err == nil {
 		t.Fatalf("want an error when the prompt is declined:\n%s", out)
 	}
@@ -100,9 +127,9 @@ func TestDispatchRefusedWithoutConfirmation(t *testing.T) {
 func TestDispatchProceedsOnYes(t *testing.T) {
 	stub := &stubGitHub{}
 
-	out, err := runDispatch(t, stub, "y\n", "cut", "--branch", "main", "--repo-path", tagRepo(t))
+	out, err := runDispatch(t, stub, "y\n", "rc", "--branch", "main", "--repo-path", tagRepo(t))
 	if err != nil {
-		t.Fatalf("cut: %v\n%s", err, out)
+		t.Fatalf("rc: %v\n%s", err, out)
 	}
 
 	if stub.dispatched != 1 {
@@ -113,9 +140,9 @@ func TestDispatchProceedsOnYes(t *testing.T) {
 func TestDispatchProceedsWithYesFlag(t *testing.T) {
 	stub := &stubGitHub{}
 
-	out, err := runDispatch(t, stub, "", "cut", "--branch", "main", "--repo-path", tagRepo(t), "--yes")
+	out, err := runDispatch(t, stub, "", "rc", "--branch", "main", "--repo-path", tagRepo(t), "--yes")
 	if err != nil {
-		t.Fatalf("cut --yes: %v\n%s", err, out)
+		t.Fatalf("rc --yes: %v\n%s", err, out)
 	}
 
 	if stub.dispatched != 1 {
@@ -311,8 +338,8 @@ func TestPrepareDispatchesOnMain(t *testing.T) {
 	stub := &stubGitHub{}
 
 	if _, err := runDispatch(t, stub, "",
-		"cut", "--branch", "release-0.4", "--repo-path", tagRepo(t), "--yes"); err != nil {
-		t.Fatalf("cut: %v", err)
+		"rc", "--branch", "release-0.4", "--repo-path", tagRepo(t), "--yes"); err != nil {
+		t.Fatalf("rc: %v", err)
 	}
 
 	if stub.lastRef != "main" {
@@ -321,6 +348,10 @@ func TestPrepareDispatchesOnMain(t *testing.T) {
 
 	if stub.lastInputs["branch"] != "release-0.4" {
 		t.Errorf("branch input = %v, want release-0.4", stub.lastInputs["branch"])
+	}
+
+	if stub.lastInputs["mode"] != "prerelease" {
+		t.Errorf("mode input = %v, want prerelease", stub.lastInputs["mode"])
 	}
 }
 

@@ -143,6 +143,14 @@ linters:
         linters:
           - misspell
         text: '`cancelled` is a misspelling'
+      # The same literal, plus the `cancelled()` status function, in the
+      # release workflow tests. They assert on workflow text, which has to say
+      # `cancelled` because GitHub does; rewritten, an assertion goes on
+      # "passing" against a string no workflow could contain.
+      - path: hack/release/
+        linters:
+          - misspell
+        text: '`cancelled` is a misspelling'
       # `CANCELLED` is the prefetch ticket state literal on Racer's client
       # socket wire contract (designs/racer-prefetch.md). Go identifiers and
       # prose still say canceled.

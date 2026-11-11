@@ -364,3 +364,25 @@ func TestAttributeTrustsItsCandidateList(t *testing.T) {
 		t.Errorf("Attribute() = %+v, want cchildress via %s", got, SourceDispatch)
 	}
 }
+
+// TestAttributeNamesNobodyForAScheduledCut covers the cron. A scheduled
+// release-prepare run's actor is whoever last edited the schedule, which names
+// someone who did nothing this time, so the answer is "scheduled", linked to
+// the run that cut it.
+func TestAttributeNamesNobodyForAScheduledCut(t *testing.T) {
+	t.Parallel()
+
+	prepare := prepareRun("cron-editor", tick(16, 32), tick(16, 34))
+	prepare.Event = "schedule"
+
+	got := Attribute(buildRun(deployKeyOwner, tick(16, 33)), []Run{prepare})
+
+	want := Attribution{By: Scheduled, Source: SourceSchedule, RunURL: prepare.URL}
+	if got != want {
+		t.Fatalf("Attribute() = %+v, want %+v", got, want)
+	}
+
+	if !got.Known() {
+		t.Error("a scheduled cut is a known answer, not an unknown one")
+	}
+}

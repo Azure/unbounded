@@ -156,7 +156,7 @@ func TestClassifyTextOutput(t *testing.T) {
 		t.Fatalf("classify: %v\n%s", err, out.String())
 	}
 
-	for _, want := range []string{"Soaks:", "Latest:", "yes"} {
+	for _, want := range []string{"From main:", "Latest:", "yes"} {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("output missing %q:\n%s", want, out.String())
 		}

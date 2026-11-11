@@ -149,12 +149,31 @@ func (r *resolver) promote() (tag, base string, err error) {
 		return "", "", fmt.Errorf("pre is only valid with mode=prerelease")
 	}
 
+	version := r.req.Version
+
+	// A named candidate says which train it belongs to, so it can stand in for
+	// version. Given both, they have to agree: promoting v0.3.0 from a v0.4.0
+	// candidate would ship one tree under another's number.
+	if r.req.Candidate != "" {
+		core, _, ok := ParseCandidate(r.req.Candidate)
+		if !ok {
+			return "", "", fmt.Errorf(
+				"candidate must be a vX.Y.Z-rc.N tag, got: %s", r.req.Candidate)
+		}
+
+		if version == "" {
+			version = core
+		} else if norm := "v" + strings.TrimPrefix(version, "v"); norm != core {
+			return "", "", fmt.Errorf("%s is not a candidate for %s", r.req.Candidate, norm)
+		}
+	}
+
 	switch {
-	case r.req.Version != "":
-		tag, err = r.promoteExplicit()
+	case version != "":
+		tag, err = r.promoteExplicit(version)
 	case len(r.live) == 0:
 		return "", "", fmt.Errorf(
-			"no live prerelease train to promote; use mode=release to cut a final version directly")
+			"no live prerelease train to promote; cut a candidate first with mode=prerelease")
 	case len(r.live) > 1:
 		// The v0.1.24 orphan came from guessing here. It no longer guesses.
 		return "", "", fmt.Errorf(
@@ -168,21 +187,32 @@ func (r *resolver) promote() (tag, base string, err error) {
 		return "", "", err
 	}
 
-	base, err = r.candidateCommit(tag)
-	if err != nil {
-		return "", "", err
+	if r.req.Candidate != "" {
+		base, err = r.namedCandidateCommit(tag, r.req.Candidate)
+		if err != nil {
+			return "", "", err
+		}
+
+		r.candidate = r.req.Candidate
+	} else {
+		r.candidate, base, err = r.candidateCommit(tag)
+		if err != nil {
+			return "", "", err
+		}
 	}
+
+	r.note("Promoting candidate %s", r.candidate)
 
 	return tag, base, nil
 }
 
 // promoteExplicit validates a caller-supplied final version.
-func (r *resolver) promoteExplicit() (string, error) {
-	norm := "v" + strings.TrimPrefix(r.req.Version, "v")
+func (r *resolver) promoteExplicit(version string) (string, error) {
+	norm := "v" + strings.TrimPrefix(version, "v")
 
 	if !semverTag.MatchString(norm) {
 		return "", fmt.Errorf(
-			"version must be a final vX.Y.Z with no suffix, no leading zeros and at most nine digits per component, got: %s", r.req.Version)
+			"version must be a final vX.Y.Z with no suffix, no leading zeros and at most nine digits per component, got: %s", version)
 	}
 
 	tags, err := r.rcTags(norm)
@@ -191,7 +221,7 @@ func (r *resolver) promoteExplicit() (string, error) {
 	}
 
 	if len(tags) == 0 {
-		return "", fmt.Errorf("no prerelease train found for %s; use mode=release to cut it directly", norm)
+		return "", fmt.Errorf("no prerelease train found for %s; cut a candidate first with mode=prerelease", norm)
 	}
 
 	// An explicit version must not be a way back to a train the resolver has
@@ -211,11 +241,12 @@ func (r *resolver) promoteExplicit() (string, error) {
 }
 
 // candidateCommit resolves the commit of a core's highest rc: the tree that was
-// actually built, deployed and smoke-tested.
-func (r *resolver) candidateCommit(name string) (string, error) {
+// actually built, deployed and smoke-tested. It returns that rc as well, so the
+// caller can say which candidate it is shipping.
+func (r *resolver) candidateCommit(name string) (string, string, error) {
 	highest, err := r.maxRC(name)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 
 	if highest == 0 {
@@ -224,17 +255,42 @@ func (r *resolver) candidateCommit(name string) (string, error) {
 		// that discovery declined to treat as a candidate.
 		existing, err := r.repo.AllTags(name + "-*")
 		if err != nil {
-			return "", err
+			return "", "", err
 		}
 
-		return "", fmt.Errorf(
-			"no rc tag found for %s (tags: %s); nothing to promote, use mode=release to cut it directly",
+		return "", "", fmt.Errorf(
+			"no rc tag found for %s (tags: %s); nothing to promote, cut a candidate first with mode=prerelease",
 			name, strings.Join(existing, " "))
 	}
 
-	commit, err := r.repo.CommitOf(fmt.Sprintf("%s-rc.%d", name, highest))
+	candidate := fmt.Sprintf("%s-rc.%d", name, highest)
+
+	commit, err := r.repo.CommitOf(candidate)
 	if err != nil {
-		return "", fmt.Errorf("could not resolve the commit of %s-rc.%d: %w", name, highest, err)
+		return "", "", fmt.Errorf("could not resolve the commit of %s: %w", candidate, err)
+	}
+
+	return candidate, commit, nil
+}
+
+// namedCandidateCommit resolves the commit of a candidate the caller chose.
+//
+// Held to the same definition as discovery: a canonical rc of this core,
+// reachable from HEAD. A candidate cut on another branch, or a malformed
+// suffix, is not something this branch can finalize.
+func (r *resolver) namedCandidateCommit(name, candidate string) (string, error) {
+	tags, err := r.rcTags(name)
+	if err != nil {
+		return "", err
+	}
+
+	if !slices.Contains(tags, candidate) {
+		return "", fmt.Errorf("%s is not a candidate reachable from HEAD for %s", candidate, name)
+	}
+
+	commit, err := r.repo.CommitOf(candidate)
+	if err != nil {
+		return "", fmt.Errorf("could not resolve the commit of %s: %w", candidate, err)
 	}
 
 	return commit, nil

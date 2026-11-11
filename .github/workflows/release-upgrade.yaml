@@ -8,8 +8,19 @@ name: release upgrade
 # so it can soak before being published to end users.
 #
 # In short: release.yaml builds and signs a tag into a DRAFT release, this
-# workflow fires on that run completing, deploys it, smokes it, and publishes
-# the draft.
+# workflow fires on that run completing, deploys it, smokes it, and then:
+#
+#   a candidate (vX.Y.Z-rc.N)  records the result as the unbounded/candidate
+#                              commit status and stays a draft. Candidates are
+#                              never published; promote reads that status to
+#                              decide what may become a final.
+#   a final (vX.Y.Z)           is published. A final promoted from a candidate
+#                              that passed skips the soak: same commit, already
+#                              soaked. Signatures and the BOM are still checked.
+#
+# It also cleans up candidate drafts that stop being useful: a candidate whose
+# build failed, older candidates a finished soak supersedes, and a train's
+# remaining candidates once its final publishes. See relctl drafts --help.
 #
 # Why workflow_run and not `release: [released]`?
 #   The previous trigger fired on draft -> published, which raced the asset
@@ -78,10 +89,11 @@ on:
         type: string
 
 # workflow_run-triggered workflows default to read-only. Most jobs only need
-# read access for checkout. Two jobs override this with `contents: write`:
-# `deploy` downloads assets from the DRAFT release (drafts are only visible
-# to tokens with push access), and `publish` flips the draft to published.
-# Made explicit so future additions don't accidentally inherit broader scopes.
+# read access for checkout. The jobs that write say so: `deploy` downloads
+# assets from the DRAFT release (drafts are only visible to tokens with push
+# access), `publish` flips the draft to published, and the candidate jobs
+# write commit statuses and delete drafts. Made explicit so future additions
+# don't accidentally inherit broader scopes.
 permissions:
   contents: read
 
@@ -95,11 +107,21 @@ permissions:
 # Queued rather than cancelled: an in-flight deploy is soaking a real cluster
 # and its result is worth having. A second tag waits for it.
 #
+# Except a run for a build that did not succeed. It deploys nothing; at most it
+# discards a failed candidate's draft. In the deploy group it would wait behind
+# a soak for no reason, and worse, GitHub keeps only ONE pending run per group,
+# so it would cancel whichever soak was queued behind the running one. With
+# candidates cut three times a day that stops being hypothetical, so those runs
+# get a group of their own.
+#
 # CUSTOMIZE: retargeting this workflow at another cluster means changing this
 # group as well as `environment:` on the jobs, or the two clusters will
 # serialize against each other for no reason.
 concurrency:
-  group: deploy-unbounded-stable
+  group: >-
+    ${{ (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion != 'success')
+        && format('release-upgrade-no-deploy-{0}', github.run_id)
+        || 'deploy-unbounded-stable' }}
   cancel-in-progress: false
 
 jobs:
@@ -125,10 +147,19 @@ jobs:
          && startsWith(github.event.workflow_run.head_branch, 'v'))
       )
     runs-on: ubuntu-latest
+    # statuses:read, so the soak plan can see whether a final's candidate
+    # passed its soak.
+    permissions:
+      contents: read
+      statuses: read
     outputs:
       tag: ${{ steps.resolve.outputs.tag }}
       from_main: ${{ steps.classify.outputs.from_main }}
       latest: ${{ steps.classify.outputs.latest }}
+      soak: ${{ steps.plan.outputs.soak }}
+      soak_reason: ${{ steps.plan.outputs.reason }}
+      candidate: ${{ steps.plan.outputs.candidate }}
+      prerelease: ${{ steps.resolve.outputs.prerelease }}
     steps:
       - name: Resolve tag
         id: resolve
@@ -159,8 +190,16 @@ jobs:
             exit 1
           fi
 
+          # A suffix makes it a prerelease, the same rule release.yaml applies.
+          # Candidates record a result rather than publish.
+          PRERELEASE=false
+          if [[ "$TAG" == *-* ]]; then
+            PRERELEASE=true
+          fi
+
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-          echo "Resolved deploy tag: ${TAG}"
+          echo "prerelease=${PRERELEASE}" >> "$GITHUB_OUTPUT"
+          echo "Resolved deploy tag: ${TAG} (prerelease: ${PRERELEASE})"
 
       # The default branch, deliberately, and never the incoming tag: this job
       # runs in the privileged workflow_run context, so checking out a ref
@@ -180,7 +219,8 @@ jobs:
         id: classify
         # Two answers, and they are not the same question.
         #
-        #   from_main  whether this soaks. unbounded-stable soaks main and only
+        #   from_main  whether this was cut from main, which the soak plan
+        #              below builds on. unbounded-stable soaks main and only
         #              main; a release cut from a release-X.Y branch has its own
         #              soak story and must not replace what main last deployed.
         #              Deliberately provenance, not ordering: the cluster can be
@@ -207,20 +247,44 @@ jobs:
           # what makes reachability answer the provenance question.
           go run ./hack/cmd/relctl classify "$TAG" --output github >> "$GITHUB_OUTPUT"
 
-      - name: Report a release-branch release
-        if: steps.classify.outputs.from_main != 'true'
+      - name: Plan the soak
+        id: plan
+        # Whether this deploys, runs Orca and smoke-tests at all. No for
+        # anything cut from a release branch (unbounded-stable soaks main only),
+        # and no for a final promoted from a candidate that passed its soak: the
+        # same commit has already been through it, and the final is a rebuild.
+        # Everything else soaks, including any soak dispatched by hand, and
+        # including a final whose candidate's result cannot be read. The safe
+        # direction is the one that touches the cluster.
+        #
+        # In relctl rather than here for the reason classify is: this decides
+        # whether a cluster is touched, and YAML cannot be tested without
+        # cutting a release.
         env:
           TAG: ${{ steps.resolve.outputs.tag }}
-          LATEST: ${{ steps.classify.outputs.latest }}
+          EVENT: ${{ github.event_name }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
-          echo "::notice::${TAG} was cut from a release branch; skipping deploy, Orca and smoke. It will publish without a soak."
+          go run ./hack/cmd/relctl soak-plan "$TAG" --event "$EVENT" --output github >> "$GITHUB_OUTPUT"
+
+      - name: Report a skipped soak
+        if: steps.plan.outputs.soak != 'true'
+        env:
+          TAG: ${{ steps.resolve.outputs.tag }}
+          LATEST: ${{ steps.classify.outputs.latest }}
+          REASON: ${{ steps.plan.outputs.reason }}
+        run: |
+          set -euo pipefail
+
+          echo "::notice::${TAG} does not soak: ${REASON}. Deploy, Orca and smoke are skipped; signatures and the BOM are still verified."
           {
-            echo "### ${TAG} was cut from a release branch"
+            echo "### ${TAG} does not soak"
             echo ""
-            echo "\`unbounded-stable\` soaks \`main\` only, so deploy, Orca and smoke were skipped."
-            echo "The release is published anyway; maintenance branches will get their own soak clusters."
+            echo "${REASON}."
+            echo ""
+            echo "Deploy, Orca and smoke were skipped. Signatures and the release BOM are still verified before anything is recorded or published."
             echo ""
             echo "- Marked Latest: \`${LATEST}\`"
           } >> "$GITHUB_STEP_SUMMARY"
@@ -238,9 +302,10 @@ jobs:
   # ---------------------------------------------------------------------------
   deploy:
     needs: resolve
-    # unbounded-stable soaks main only. A release cut from a release branch
-    # skips deploy, Orca and smoke entirely; see resolve's classify step.
-    if: github.repository == 'Azure/unbounded' && needs.resolve.outputs.from_main == 'true'
+    # Skipped when the soak plan says this release does not soak: anything cut
+    # from a release branch, and a final promoted from a candidate that passed.
+    # See resolve's soak plan.
+    if: github.repository == 'Azure/unbounded' && needs.resolve.outputs.soak == 'true'
     permissions:
       contents: write
     runs-on: ubuntu-latest
@@ -508,8 +573,8 @@ jobs:
           echo "Gating metalman: ${targets:-<none>}"
 
       - name: Wait for rollouts
-        # Shared with nightly.yaml so the two deploy gates cannot drift.
-        # Component workloads are created asynchronously after the operator
+        # The deploy gate lives in a script so it can be tested. Component
+        # workloads are created asynchronously after the operator
         # reconciles the Site, so the script waits for each to exist before
         # checking its rollout status, and fails fast naming the image when a pod
         # cannot pull one.
@@ -622,7 +687,7 @@ jobs:
   # ---------------------------------------------------------------------------
   deploy-orca:
     needs: [resolve, deploy]
-    if: github.repository == 'Azure/unbounded' && needs.resolve.outputs.from_main == 'true'
+    if: github.repository == 'Azure/unbounded' && needs.resolve.outputs.soak == 'true'
     runs-on: ubuntu-latest
     environment: unbounded-stable
     env:
@@ -732,7 +797,7 @@ jobs:
   # ---------------------------------------------------------------------------
   smoke-discover:
     needs: [resolve, deploy]
-    if: needs.resolve.outputs.from_main == 'true'
+    if: needs.resolve.outputs.soak == 'true'
     runs-on: ubuntu-latest
     outputs:
       tasks: ${{ steps.list.outputs.tasks }}
@@ -797,7 +862,7 @@ jobs:
   # ---------------------------------------------------------------------------
   smoke-tests:
     needs: [resolve, deploy, deploy-orca, smoke-discover]
-    if: needs.resolve.outputs.from_main == 'true'
+    if: needs.resolve.outputs.soak == 'true'
     runs-on: ubuntu-latest
     environment: unbounded-stable
     strategy:
@@ -852,12 +917,14 @@ jobs:
           "$SMOKE_SCRIPT"
 
   # ---------------------------------------------------------------------------
-  # Publish the GitHub Release once the soak succeeds: a clean deploy (core +
-  # Orca) plus green smoke. If any of them fails the release stays a draft.
+  # Publish a final once the soak succeeds: a clean deploy (core + Orca) plus
+  # green smoke. If any of them fails the release stays a draft.
   #
-  # Prereleases publish too, keeping their `--prerelease` flag, so they are
-  # visible but never "Latest". `--draft=false` is idempotent, so re-deploying
-  # an already-published tag is a no-op.
+  # A candidate passes the same gate but is NOT published. Candidates stay
+  # drafts; record-candidate turns this job's result into the commit status
+  # promote reads. Publishing every passing candidate would put dozens of
+  # prereleases a month on the releases page. `--draft=false` is idempotent, so
+  # re-deploying an already-published final is a no-op.
   # ---------------------------------------------------------------------------
   publish:
     needs: [resolve, deploy, deploy-orca, smoke-discover, smoke-tests]
@@ -889,14 +956,15 @@ jobs:
     # Two ways in, and no third:
     #
     #   every gate succeeded   the ordinary soaked release
-    #   every gate skipped     cut from a release branch; unbounded-stable soaks
-    #                          main only, so there was nothing to run
+    #   every gate skipped     the soak plan said this does not soak: cut from a
+    #                          release branch, or a final promoted from a
+    #                          candidate that already passed one
     #
     # A FAILED gate matches neither and publishes nothing, which is the property
     # worth protecting. resolve must also have succeeded: when the upstream
-    # release build fails, resolve is skipped and its empty from_main output
-    # must not look like a release-branch cut. `skipped` is compared explicitly
-    # rather than testing for "not success", which would let a failure through.
+    # release build fails, resolve is skipped and its empty soak output must
+    # not look like a planned skip. `skipped` is compared explicitly rather than
+    # testing for "not success", which would let a failure through.
     if: >
       !cancelled() &&
       github.repository == 'Azure/unbounded' &&
@@ -908,7 +976,7 @@ jobs:
          needs.deploy-orca.result == 'success' &&
          needs.smoke-discover.result == 'success' &&
          needs.smoke-tests.result == 'success') ||
-        (needs.resolve.outputs.from_main != 'true' &&
+        (needs.resolve.outputs.soak == 'false' &&
          needs.deploy.result == 'skipped' &&
          needs.deploy-orca.result == 'skipped' &&
          needs.smoke-discover.result == 'skipped' &&
@@ -922,12 +990,15 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       LATEST: ${{ needs.resolve.outputs.latest }}
       SOAKED: ${{ needs.deploy.result == 'success' }}
+      CANDIDATE: ${{ needs.resolve.outputs.candidate }}
     steps:
-      # Verification normally happens in the deploy job. A release cut from a
-      # release branch skips that job, so it happens here instead. Skipping the
-      # SOAK is a deliberate decision; skipping VERIFICATION is not, and would
-      # publish artifacts whose signatures and BOM nobody ever checked. Same
-      # script as the other two paths, so none of them can drift apart.
+      # Verification normally happens in the deploy job. A release that does
+      # not soak skips that job, so it happens here instead. Skipping the SOAK
+      # is a deliberate decision; skipping VERIFICATION is not, and would
+      # publish artifacts whose signatures and BOM nobody ever checked. A
+      # promoted final is a REBUILD of its candidate, signed under its own tag,
+      # so its candidate's verification says nothing about it. Same script as
+      # the other two paths, so none of them can drift apart.
       #
       # Mirrors deploy: the primary checkout is the deployed tag, and the
       # tooling comes from the workflow's own commit, because older tags do not
@@ -970,6 +1041,9 @@ jobs:
             "$TAG" "$(git rev-parse HEAD)" dist
 
       - name: Publish release
+        # Finals only. A candidate's outcome is the commit status record-candidate
+        # writes from this job's result; the release itself stays a draft.
+        if: needs.resolve.outputs.prerelease != 'true'
         run: |
           set -euo pipefail
 
@@ -986,6 +1060,9 @@ jobs:
             echo ""
             echo "- Marked Latest: \`${LATEST}\`"
             echo "- Soaked on unbounded-stable: \`${SOAKED}\`"
+            if [[ -n "$CANDIDATE" ]]; then
+              echo "- Promoted from: \`${CANDIDATE}\`"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ---------------------------------------------------------------------------
@@ -1032,6 +1109,7 @@ jobs:
       # this, "smoke: skipped" would be recorded as a soak that passed.
       DISCOVER_RESULT: ${{ needs.smoke-discover.result }}
       SMOKE_RESULT: ${{ needs.smoke-tests.result }}
+      PRERELEASE: ${{ needs.resolve.outputs.prerelease }}
     steps:
       - name: Require a reason
         # Checked before anything else so a forced run cannot get partway and
@@ -1040,6 +1118,16 @@ jobs:
           set -euo pipefail
           if [[ -z "${REASON// /}" ]]; then
             echo "::error::force_publish requires a non-empty reason; it is recorded on the release"
+            exit 1
+          fi
+
+      - name: Refuse a candidate
+        # Candidates are never published; they pass or fail. Shipping one whose
+        # soak cannot pass is a forced PROMOTE, which gates the final instead.
+        run: |
+          set -euo pipefail
+          if [[ "$PRERELEASE" == "true" ]]; then
+            echo "::error::${TAG} is a candidate, and candidates are not published; use relctl promote --candidate ${TAG} --force"
             exit 1
           fi
 
@@ -1147,6 +1235,185 @@ jobs:
             echo "- deploy: \`${DEPLOY_RESULT}\`, deploy-orca: \`${ORCA_RESULT}\`, smoke-discover: \`${DISCOVER_RESULT}\`, smoke-tests: \`${SMOKE_RESULT}\`"
             echo "- Artifact signatures and BOM: verified"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # Record a candidate's result, and prune the drafts it supersedes.
+  #
+  # The result is the unbounded/candidate commit status on the candidate's
+  # commit: success when publish (which, for a candidate, verifies and does not
+  # publish) succeeded, failure otherwise. release-prepare's promote gate reads
+  # it, and so does the final's soak plan.
+  #
+  # Runs for every candidate whose soak was attempted, passed or failed, so a
+  # failure is recorded rather than left looking like "not yet". Not for a
+  # forced publish, which publish-forced refuses for a candidate anyway.
+  # !cancelled() so a failed gate still reaches here; a cancelled run records
+  # nothing, which is the honest answer.
+  # ---------------------------------------------------------------------------
+  record-candidate:
+    needs: [resolve, deploy, deploy-orca, smoke-discover, smoke-tests, publish]
+    if: >
+      !cancelled() &&
+      github.repository == 'Azure/unbounded' &&
+      needs.resolve.result == 'success' &&
+      needs.resolve.outputs.prerelease == 'true' &&
+      inputs.force_publish != true &&
+      inputs.force_publish != 'true'
+    # statuses to record the result, contents to delete drafts.
+    permissions:
+      contents: write
+      statuses: write
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.resolve.outputs.tag }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PUBLISH_RESULT: ${{ needs.publish.result }}
+      SOAK: ${{ needs.resolve.outputs.soak }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      # relctl from the workflow's own commit, for the reason the deploy job
+      # takes its tooling from there: the tag being recorded may predate it.
+      # Cone mode brings go.mod and go.sum, and relctl imports nothing else in
+      # this repository.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: _relctl
+          sparse-checkout: hack/cmd/relctl
+          sparse-checkout-cone-mode: true
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: _relctl/go.mod
+          cache-dependency-path: _relctl/go.sum
+
+      - name: Build relctl
+        run: |
+          set -euo pipefail
+          cd _relctl
+          go build -o "${RUNNER_TEMP}/relctl" ./hack/cmd/relctl
+
+      - name: Record the result
+        run: |
+          set -euo pipefail
+
+          if [[ "$PUBLISH_RESULT" == "success" ]]; then
+            state=success
+            if [[ "$SOAK" == "true" ]]; then
+              description="${TAG} passed its soak on unbounded-stable"
+            else
+              description="${TAG} verified; not soaked (cut from a release branch)"
+            fi
+          else
+            state=failure
+            description="${TAG} did not pass its soak"
+          fi
+
+          "${RUNNER_TEMP}/relctl" candidate record "$TAG" \
+            --state "$state" --description "$description" --target-url "$RUN_URL"
+
+          {
+            echo "### Candidate ${TAG}: ${state}"
+            echo ""
+            echo "${description}. Recorded as the \`unbounded/candidate\` status on its commit."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Prune superseded drafts
+        # Older drafts of this version, keeping this one (so its soak can be
+        # re-run once a failure is fixed) and the newest that passed (what
+        # promote would ship). After recording, so the rule reads this
+        # candidate's own result. A failure here costs tidiness, not the
+        # result, which is already recorded.
+        run: |
+          set -euo pipefail
+          "${RUNNER_TEMP}/relctl" drafts prune "$TAG"
+
+  # ---------------------------------------------------------------------------
+  # Delete a published final's remaining candidate drafts.
+  #
+  # Once vX.Y.Z ships, its candidates have nothing left to do. Their tags,
+  # images and signatures stay; only the draft release entries go.
+  # ---------------------------------------------------------------------------
+  prune-drafts:
+    needs: [resolve, publish, publish-forced]
+    if: >
+      !cancelled() &&
+      github.repository == 'Azure/unbounded' &&
+      needs.resolve.result == 'success' &&
+      needs.resolve.outputs.prerelease != 'true' &&
+      (needs.publish.result == 'success' || needs.publish-forced.result == 'success')
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.resolve.outputs.tag }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: _relctl
+          sparse-checkout: hack/cmd/relctl
+          sparse-checkout-cone-mode: true
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: _relctl/go.mod
+          cache-dependency-path: _relctl/go.sum
+
+      - name: Prune the final's candidate drafts
+        run: |
+          set -euo pipefail
+          cd _relctl
+          go run ./hack/cmd/relctl drafts prune "$TAG"
+
+  # ---------------------------------------------------------------------------
+  # Discard the draft of a candidate whose BUILD failed.
+  #
+  # A failed candidate is not re-run; the next candidate is the retry, whether
+  # the schedule cuts it or someone runs `relctl rc`. Its draft holds a partial
+  # set of assets nothing will finish, so it goes. The tag stays.
+  #
+  # Runs in this workflow's no-deploy concurrency group (see the top), so it
+  # never waits behind a soak and never displaces one.
+  #
+  # Finals are left alone: a failed final's build is re-run, and that needs its
+  # draft.
+  # ---------------------------------------------------------------------------
+  discard-failed-candidate:
+    if: >
+      github.repository == 'Azure/unbounded' &&
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.event == 'push' &&
+      contains(fromJSON('["failure", "cancelled", "timed_out"]'), github.event.workflow_run.conclusion) &&
+      contains(github.event.workflow_run.head_branch, '-rc.')
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    env:
+      # Data, not code: see the resolve job on why workflow_run values are
+      # bound to env rather than inlined. relctl refuses anything that is not
+      # a canonical candidate tag.
+      TAG: ${{ github.event.workflow_run.head_branch }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: _relctl
+          sparse-checkout: hack/cmd/relctl
+          sparse-checkout-cone-mode: true
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: _relctl/go.mod
+          cache-dependency-path: _relctl/go.sum
+
+      - name: Discard the draft
+        run: |
+          set -euo pipefail
+          cd _relctl
+          go run ./hack/cmd/relctl drafts discard "$TAG"
 
   # Build docs from the release tag after publishing the latest release.
   docs:

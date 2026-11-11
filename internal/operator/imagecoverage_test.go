@@ -83,9 +83,10 @@ const releaseBOMSource = "hack/cmd/release-bom/main.go"
 const releaseBOMVar = "releaseImageNames"
 
 // deployWorkflows are the workflows that build images and then deploy the
-// operator, so each must cover the full set of component images.
+// operator, so each must cover the full set of component images. The nightly
+// was one until release candidates replaced it; a candidate is built by
+// release.yaml like any other release.
 var deployWorkflows = []string{
-	".github/workflows/nightly.yaml",
 	".github/workflows/release.yaml",
 }
 
@@ -190,10 +191,11 @@ func stepPushes(push any, outputs string) bool {
 
 // workflowImages returns every image repository the workflow builds and pushes.
 //
-// Parsing the YAML tree rather than scanning text is deliberate: the comment
-// above nightly's component-images matrix names machine-ops-controller while
-// explaining that it is NOT built there, and lists every component that is. A
-// textual scan reports both as built.
+// Parsing the YAML tree rather than scanning text is deliberate: the retired
+// nightly workflow carried a comment above its component-images matrix that
+// named machine-ops-controller while explaining that it was NOT built there,
+// and listed every component that was. A textual scan reported both as built,
+// and any workflow can carry a comment like that.
 func workflowImages(t *testing.T, path string) map[string]string {
 	t.Helper()
 

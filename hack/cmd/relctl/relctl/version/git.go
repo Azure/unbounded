@@ -174,6 +174,19 @@ func (g *GitRepo) Subject(commit string) (string, error) {
 	return g.run("log", "-1", "--format=%s", commit)
 }
 
+// TagsAt lists the tags that name a commit.
+//
+// Not part of Repo: only the release scheduler asks it, to tell whether HEAD
+// has already been cut, and it has no use in resolution.
+func (g *GitRepo) TagsAt(commit string) ([]string, error) {
+	out, err := g.run("tag", "--points-at", commit)
+	if err != nil {
+		return nil, err
+	}
+
+	return lines(out), nil
+}
+
 // CurrentBranch returns the branch HEAD is on, or empty when detached.
 //
 // Used to default relctl's --branch, so the bare command answers about the

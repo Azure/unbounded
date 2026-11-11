@@ -82,3 +82,27 @@ func ForBranch(branch string, major bool) (Policy, error) {
 
 	return Policy{}, fmt.Errorf("refusing to release from %s; expected main or release-X.Y", branch)
 }
+
+// CheckMode refuses a mode that no branch may cut with.
+//
+// mode=release is retired. It minted a final version straight from HEAD,
+// before anything had shown that HEAD could be built or deployed, so every
+// failure that needed a code change cost a version number: eight of the
+// seventeen minors from v0.6 to v0.22 never shipped. A final is now only ever
+// a promoted candidate, so a failure costs an rc number instead.
+//
+// The resolver keeps ModeRelease internally, because its table of cases
+// exercises the arithmetic through it. This is the policy gate in front of it,
+// applied by every caller that mints a tag.
+func CheckMode(mode Mode) error {
+	switch mode {
+	case ModePrerelease, ModePromote:
+		return nil
+	case ModeRelease:
+		return fmt.Errorf(
+			"mode=release is retired: every final is a promoted candidate; " +
+				"cut a candidate with mode=prerelease (relctl rc), then promote it (relctl promote)")
+	default:
+		return fmt.Errorf("unexpected mode: %s", mode)
+	}
+}

@@ -37,6 +37,10 @@ type stubGitHub struct {
 	branches []string
 	// releaseByTag maps a tag to a release. Absent means 404.
 	releaseByTag map[string]stubRelease
+	// statuses maps a commit to its candidate status. Absent means none.
+	statuses map[string]stubStatus
+	// commits maps a ref, such as a tag, to the commit it names.
+	commits map[string]string
 
 	// dispatched counts workflow_dispatch calls, so a test can assert that
 	// nothing was sent as easily as that something was.
@@ -44,6 +48,10 @@ type stubGitHub struct {
 	// lastRef and lastInputs record the most recent dispatch.
 	lastRef    string
 	lastInputs map[string]any
+	// recorded are the commit statuses written, in order.
+	recorded []map[string]string
+	// deleted are the release IDs deleted, in order.
+	deleted []string
 
 	// failPrepares makes the correlation fetch return 500 while leaving every
 	// other listing alone.
@@ -106,6 +114,7 @@ type stubUser struct {
 }
 
 type stubRelease struct {
+	ID         int64  `json:"id,omitempty"`
 	TagName    string `json:"tag_name"`
 	Draft      bool   `json:"draft"`
 	Prerelease bool   `json:"prerelease"`
@@ -113,6 +122,14 @@ type stubRelease struct {
 	// CreatedAt dates the release. Real drafts have this and have a null
 	// published_at, which is why the draft window reads created_at.
 	CreatedAt string `json:"created_at,omitempty"`
+}
+
+// stubStatus is a candidate commit status as the combined-status endpoint
+// returns it.
+type stubStatus struct {
+	State     string `json:"state"`
+	TargetURL string `json:"target_url,omitempty"`
+	UpdatedAt string `json:"updated_at,omitempty"`
 }
 
 func (s *stubGitHub) start(t *testing.T) string {
@@ -195,7 +212,7 @@ func (s *stubGitHub) start(t *testing.T) string {
 	mux.HandleFunc("/api/v3/repos/Azure/unbounded/actions/workflows/create-release-branch.yaml/dispatches",
 		s.recordDispatch(t))
 
-	mux.HandleFunc("/api/v3/repos/Azure/unbounded/releases/latest",
+	mux.HandleFunc("GET /api/v3/repos/Azure/unbounded/releases/latest",
 		func(w http.ResponseWriter, _ *http.Request) {
 			if s.latest == "" {
 				w.WriteHeader(http.StatusNotFound)
@@ -225,6 +242,68 @@ func (s *stubGitHub) start(t *testing.T) string {
 	mux.HandleFunc("/api/v3/repos/Azure/unbounded/releases",
 		func(w http.ResponseWriter, _ *http.Request) {
 			write(w, s.releases)
+		})
+
+	mux.HandleFunc("DELETE /api/v3/repos/Azure/unbounded/releases/{id}",
+		func(w http.ResponseWriter, r *http.Request) {
+			s.mu.Lock()
+			s.deleted = append(s.deleted, r.PathValue("id"))
+			s.mu.Unlock()
+
+			w.WriteHeader(http.StatusNoContent)
+		})
+
+	mux.HandleFunc("GET /api/v3/repos/Azure/unbounded/commits/{ref}/status",
+		func(w http.ResponseWriter, r *http.Request) {
+			var statuses []map[string]string
+
+			if status, ok := s.statuses[r.PathValue("ref")]; ok {
+				entry := map[string]string{"context": gh.CandidateContext, "state": status.State}
+
+				// Omitted when empty, as GitHub omits them: an empty string
+				// is not a timestamp, and the client rightly refuses it.
+				if status.TargetURL != "" {
+					entry["target_url"] = status.TargetURL
+				}
+
+				if status.UpdatedAt != "" {
+					entry["updated_at"] = status.UpdatedAt
+				}
+
+				statuses = append(statuses, entry)
+			}
+
+			write(w, map[string]any{"state": "success", "statuses": statuses})
+		})
+
+	mux.HandleFunc("GET /api/v3/repos/Azure/unbounded/commits/{ref}",
+		func(w http.ResponseWriter, r *http.Request) {
+			sha, ok := s.commits[r.PathValue("ref")]
+			if !ok {
+				w.WriteHeader(http.StatusNotFound)
+
+				return
+			}
+
+			// The SHA media type answers with the bare hash.
+			_, _ = w.Write([]byte(sha))
+		})
+
+	mux.HandleFunc("POST /api/v3/repos/Azure/unbounded/statuses/{sha}",
+		func(w http.ResponseWriter, r *http.Request) {
+			var body map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Errorf("decode status: %v", err)
+			}
+
+			body["sha"] = r.PathValue("sha")
+
+			s.mu.Lock()
+			s.recorded = append(s.recorded, body)
+			s.mu.Unlock()
+
+			w.WriteHeader(http.StatusCreated)
+			write(w, body)
 		})
 
 	mux.HandleFunc("/api/v3/repos/Azure/unbounded/branches",
@@ -358,56 +437,135 @@ func TestStatusJSON(t *testing.T) {
 		t.Errorf("LatestRelease = %q", decoded.LatestRelease)
 	}
 
-	if decoded.NextFromLocal != "v0.5.0" {
-		t.Errorf("NextFromLocal = %q, want v0.5.0", decoded.NextFromLocal)
+	// The next CANDIDATE: a final is only ever a promoted one.
+	if decoded.NextFromLocal != "v0.5.0-rc.1" {
+		t.Errorf("NextFromLocal = %q, want v0.5.0-rc.1", decoded.NextFromLocal)
 	}
 }
 
-func TestPreflightBlocksOnARedNightly(t *testing.T) {
+// The preflight tests.
+//
+// Releasable means there is a candidate to promote: the newest that passed its
+// soak, recent enough to be worth shipping, with CI green. These replace the
+// nightly checks preflight used to make, one for one: a red signal, a stale
+// one, an all-green one, and a release branch, where the signal means less.
+
+// greenCI is a passing CI run on a branch.
+func greenCI(branch string) []stubRun {
+	return []stubRun{{
+		ID: 2, Status: "completed", Conclusion: "success",
+		HeadBranch: branch, CreatedAt: ago(time.Hour),
+	}}
+}
+
+// TestPreflightBlocksWithoutAPassingCandidate is the red signal. Nothing has
+// passed, so there is nothing promote could ship.
+func TestPreflightBlocksWithoutAPassingCandidate(t *testing.T) {
 	t.Parallel()
 
-	stub := &stubGitHub{runs: map[string][]stubRun{
-		"nightly.yaml": {{ID: 1, Status: "completed", Conclusion: "failure", CreatedAt: ago(time.Hour)}},
-		"ci.yaml":      {{ID: 2, Status: "completed", Conclusion: "success", HeadBranch: "main", CreatedAt: ago(time.Hour)}},
-	}}
+	dir := candidateRepo(t)
 
-	out, _ := runCommand(t, stub, tagRepo(t), "preflight")
-
-	if !strings.Contains(out, "NOT RELEASABLE") {
-		t.Errorf("a red nightly must block:\n%s", out)
+	stub := &stubGitHub{
+		runs: map[string][]stubRun{"ci.yaml": greenCI("main")},
+		statuses: map[string]stubStatus{
+			revParse(t, dir, "v0.5.0-rc.1"): {State: "failure", UpdatedAt: ago(5 * time.Hour)},
+			revParse(t, dir, "v0.5.0-rc.2"): {State: "failure", UpdatedAt: ago(time.Hour)},
+		},
 	}
 
-	if !strings.Contains(out, "release blocker until it is understood") {
+	out, _ := runCommand(t, stub, dir, "preflight")
+
+	if !strings.Contains(out, "NOT RELEASABLE") {
+		t.Errorf("no passing candidate must block:\n%s", out)
+	}
+
+	if !strings.Contains(out, "no candidate of v0.5.0 has passed its soak") {
 		t.Errorf("output does not explain why:\n%s", out)
 	}
 }
 
-// TestPreflightBlocksOnAStaleNightly covers "green, and green recently". A
-// week-old pass describes a tree nobody has released since.
-func TestPreflightBlocksOnAStaleNightly(t *testing.T) {
+// TestPreflightBlocksWithNoCandidate is the state right after a promote, or
+// before the schedule has run: there is no train to promote at all.
+func TestPreflightBlocksWithNoCandidate(t *testing.T) {
 	t.Parallel()
 
-	stub := &stubGitHub{runs: map[string][]stubRun{
-		"nightly.yaml": {{ID: 1, Status: "completed", Conclusion: "success", CreatedAt: ago(7 * 24 * time.Hour)}},
-		"ci.yaml":      {{ID: 2, Status: "completed", Conclusion: "success", HeadBranch: "main", CreatedAt: ago(time.Hour)}},
-	}}
+	stub := &stubGitHub{runs: map[string][]stubRun{"ci.yaml": greenCI("main")}}
 
 	out, _ := runCommand(t, stub, tagRepo(t), "preflight")
 
 	if !strings.Contains(out, "NOT RELEASABLE") {
-		t.Errorf("a stale nightly must block:\n%s", out)
+		t.Errorf("no candidate must block:\n%s", out)
+	}
+
+	if !strings.Contains(out, "no candidate has been cut since v0.4.0") {
+		t.Errorf("output does not say a candidate is needed:\n%s", out)
+	}
+}
+
+// TestPreflightBlocksOnAStaleCandidate covers "passed, and recently". A
+// candidate main left behind days ago would ship a tree from days ago.
+func TestPreflightBlocksOnAStaleCandidate(t *testing.T) {
+	t.Parallel()
+
+	dir := candidateRepo(t)
+	gitIn(t, dir, "commit", "-q", "--allow-empty", "-m", "merged since")
+
+	stub := &stubGitHub{
+		runs: map[string][]stubRun{"ci.yaml": greenCI("main")},
+		statuses: map[string]stubStatus{
+			revParse(t, dir, "v0.5.0-rc.2"): {State: "success", UpdatedAt: ago(7 * 24 * time.Hour)},
+		},
+	}
+
+	out, _ := runCommand(t, stub, dir, "preflight")
+
+	if !strings.Contains(out, "NOT RELEASABLE") {
+		t.Errorf("a stale candidate must block:\n%s", out)
+	}
+
+	if !strings.Contains(out, "cut a fresh candidate") {
+		t.Errorf("output does not say what to do:\n%s", out)
+	}
+}
+
+// TestPreflightDoesNotCallAnUnchangedCandidateStale keeps age from being the
+// whole test. A candidate of a main nothing has merged to since is the
+// current tree, however old.
+func TestPreflightDoesNotCallAnUnchangedCandidateStale(t *testing.T) {
+	t.Parallel()
+
+	dir := candidateRepo(t)
+
+	stub := &stubGitHub{
+		runs: map[string][]stubRun{"ci.yaml": greenCI("main")},
+		statuses: map[string]stubStatus{
+			revParse(t, dir, "v0.5.0-rc.2"): {State: "success", UpdatedAt: ago(7 * 24 * time.Hour)},
+		},
+	}
+
+	out, err := runCommand(t, stub, dir, "preflight")
+	if err != nil {
+		t.Fatalf("preflight: %v\n%s", err, out)
+	}
+
+	if strings.Contains(out, "NOT RELEASABLE") {
+		t.Errorf("an old candidate of an unchanged main was refused:\n%s", out)
 	}
 }
 
 func TestPreflightPassesWhenEverythingIsGreen(t *testing.T) {
 	t.Parallel()
 
-	stub := &stubGitHub{runs: map[string][]stubRun{
-		"nightly.yaml": {{ID: 1, Status: "completed", Conclusion: "success", CreatedAt: ago(4 * time.Hour)}},
-		"ci.yaml":      {{ID: 2, Status: "completed", Conclusion: "success", HeadBranch: "main", CreatedAt: ago(time.Hour)}},
-	}}
+	dir := candidateRepo(t)
 
-	out, err := runCommand(t, stub, tagRepo(t), "preflight")
+	stub := &stubGitHub{
+		runs: map[string][]stubRun{"ci.yaml": greenCI("main")},
+		statuses: map[string]stubStatus{
+			revParse(t, dir, "v0.5.0-rc.2"): {State: "success", UpdatedAt: ago(4 * time.Hour)},
+		},
+	}
+
+	out, err := runCommand(t, stub, dir, "preflight")
 	if err != nil {
 		t.Fatalf("preflight: %v\n%s", err, out)
 	}
@@ -415,28 +573,62 @@ func TestPreflightPassesWhenEverythingIsGreen(t *testing.T) {
 	if !strings.Contains(out, "RELEASABLE") || strings.Contains(out, "NOT RELEASABLE") {
 		t.Errorf("want RELEASABLE:\n%s", out)
 	}
+
+	if !strings.Contains(out, "v0.5.0-rc.2") {
+		t.Errorf("output does not name the candidate:\n%s", out)
+	}
 }
 
-// TestPreflightSaysTheNightlyIsIrrelevantOnAReleaseBranch keeps a green tick
-// from referring to somewhere else. The nightly only ever runs on the default
-// branch.
-func TestPreflightSaysTheNightlyIsIrrelevantOnAReleaseBranch(t *testing.T) {
+// TestPreflightPromotesPastAFailedNewestCandidate is the scheduled-candidate
+// case: the newest failed, the one below it passed. Promote ships the one that
+// passed, so this is releasable, but the failure is reported rather than
+// hidden.
+func TestPreflightPromotesPastAFailedNewestCandidate(t *testing.T) {
 	t.Parallel()
 
-	stub := &stubGitHub{runs: map[string][]stubRun{
-		"ci.yaml": {{
-			ID: 2, Status: "completed", Conclusion: "success",
-			HeadBranch: "release-0.4", CreatedAt: ago(time.Hour),
-		}},
-	}}
+	dir := candidateRepo(t)
 
-	out, err := runCommand(t, stub, tagRepo(t), "preflight", "--branch", "release-0.4")
+	stub := &stubGitHub{
+		runs: map[string][]stubRun{"ci.yaml": greenCI("main")},
+		statuses: map[string]stubStatus{
+			revParse(t, dir, "v0.5.0-rc.1"): {State: "success", UpdatedAt: ago(5 * time.Hour)},
+			revParse(t, dir, "v0.5.0-rc.2"): {State: "failure", UpdatedAt: ago(time.Hour)},
+		},
+	}
+
+	out, err := runCommand(t, stub, dir, "preflight")
 	if err != nil {
 		t.Fatalf("preflight: %v\n%s", err, out)
 	}
 
-	if !strings.Contains(out, "says nothing about release-0.4") {
-		t.Errorf("output does not explain the nightly's scope:\n%s", out)
+	if strings.Contains(out, "NOT RELEASABLE") {
+		t.Errorf("a passing candidate below a failed one is releasable:\n%s", out)
+	}
+
+	for _, want := range []string{"v0.5.0-rc.2, has failed its soak", "promote ships v0.5.0-rc.1"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestPreflightExplainsCandidatesOnAReleaseBranch keeps a green tick from
+// meaning more than it does. A release branch's candidates are verified, not
+// soaked.
+func TestPreflightExplainsCandidatesOnAReleaseBranch(t *testing.T) {
+	t.Parallel()
+
+	stub := &stubGitHub{runs: map[string][]stubRun{"ci.yaml": greenCI("release-0.4")}}
+
+	out, _ := runCommand(t, stub, tagRepo(t), "preflight", "--branch", "release-0.4")
+
+	for _, want := range []string{
+		"release-0.4 are verified but not soaked",
+		"read from the checkout, which is main, not release-0.4",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output missing %q:\n%s", want, out)
+		}
 	}
 }
 

@@ -15,6 +15,8 @@ import (
 
 // Release is a GitHub release, reduced to what relctl reports on.
 type Release struct {
+	// ID is what the API deletes a release by. The tag cannot be used for that.
+	ID         int64
 	Tag        string
 	Draft      bool
 	Prerelease bool
@@ -43,6 +45,7 @@ func (r Release) State() string {
 
 func toRelease(r *github.RepositoryRelease) Release {
 	return Release{
+		ID:          r.GetID(),
 		Tag:         r.GetTagName(),
 		Draft:       r.GetDraft(),
 		Prerelease:  r.GetPrerelease(),
@@ -126,6 +129,23 @@ func (c *Client) Drafts(ctx context.Context) ([]Release, error) {
 	}
 
 	return drafts, nil
+}
+
+// DeleteRelease deletes a release, leaving its tag in place.
+//
+// The tag stays because the release entry is the only thing being retired.
+// The tag names a commit that images, signatures and the Go module proxy may
+// all already refer to, and deleting it is a separate, deliberate act.
+func (c *Client) DeleteRelease(ctx context.Context, release Release) error {
+	if release.ID == 0 {
+		return fmt.Errorf("release %s has no ID; refusing to guess which one to delete", release.Tag)
+	}
+
+	if _, err := c.api.Repositories.DeleteRelease(ctx, c.owner, c.repo, release.ID); err != nil {
+		return fmt.Errorf("delete release %s: %w", release.Tag, err)
+	}
+
+	return nil
 }
 
 // ReleaseBranches lists the release-X.Y branches that exist.

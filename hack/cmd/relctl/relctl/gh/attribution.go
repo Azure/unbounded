@@ -17,10 +17,17 @@ const (
 	// SourcePush means the tag was pushed by hand rather than by
 	// release-prepare, so the run's own actor is the person who pushed it.
 	SourcePush = "push"
+	// SourceSchedule means release-prepare's schedule cut the tag, so no
+	// person did. The scheduled run's actor is whoever last edited the cron,
+	// which names someone who did nothing this time.
+	SourceSchedule = "schedule"
 	// SourceUnknown means we could not tell, and say so rather than print a
 	// name that would be read as an answer.
 	SourceUnknown = "unknown"
 )
+
+// Scheduled is what a scheduled cut reports in place of a person.
+const Scheduled = "scheduled"
 
 // Attribution is who is actually responsible for a run.
 //
@@ -124,6 +131,13 @@ func Attribute(build Run, prepares []Run) Attribution {
 	}
 
 	if match, ok := containingPrepare(build, prepares); ok {
+		// A scheduled prepare has an actor, but it is whoever last edited the
+		// cron rather than anyone who cut this. Naming them would be the same
+		// mistake as naming the deploy key's owner.
+		if match.Event == "schedule" {
+			return Attribution{By: Scheduled, Source: SourceSchedule, RunURL: match.URL}
+		}
+
 		return Attribution{By: match.Actor, Source: SourceDispatch, RunURL: match.URL}
 	}
 

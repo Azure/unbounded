@@ -3,10 +3,10 @@
 
 // Package release contains tests for the shell tooling in hack/release/.
 //
-// wait-rollouts.sh gates the deploy jobs in nightly.yaml and
-// release-upgrade.yaml. It cannot be exercised by those workflows before it
-// merges, and a mistake in it either fails a good deploy or lets a broken one
-// through, so its control flow is covered here instead.
+// wait-rollouts.sh gates the deploy job in release-upgrade.yaml. It cannot be
+// exercised by that workflow before it merges, and a mistake in it either fails
+// a good deploy or lets a broken one through, so its control flow is covered
+// here instead.
 //
 // The tests drive the real script with a fake kubectl on PATH, following the
 // pattern in hack/cmd/gantry-benchmark/enable_test.go.

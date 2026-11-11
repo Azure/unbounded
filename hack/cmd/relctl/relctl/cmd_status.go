@@ -22,10 +22,19 @@ import (
 type statusResult struct {
 	LatestRelease  string `json:"latestRelease,omitempty"`
 	LatestFinalTag string `json:"latestFinalTag,omitempty"`
-	// NextFromLocal is the next version for whatever is CHECKED OUT, which is
+	// NextFromLocal is the next candidate for whatever is CHECKED OUT, which is
 	// not necessarily main. Named for what it is rather than what it usually
 	// is, because on a release branch checkout the two differ.
 	NextFromLocal string `json:"nextFromLocal,omitempty"`
+	// NextError is why NextFromLocal could not be resolved, when it could not.
+	// Separate from LocalError because the train view can be perfectly known
+	// while the next candidate is not, for instance with two live trains.
+	NextError string `json:"nextError,omitempty"`
+	// Candidate is what promote would finalize today: the newest candidate of
+	// the live train that passed its soak.
+	Candidate *candidateInfo `json:"candidate,omitempty"`
+	// CandidateError is why Candidate could not be established.
+	CandidateError string `json:"candidateError,omitempty"`
 	// LocalError is set when version resolution failed, so an absent train list
 	// cannot be misread as an empty one.
 	LocalError      string       `json:"localError,omitempty"`
@@ -141,28 +150,44 @@ func runStatus(ctx context.Context, out io.Writer, opts *Options, all bool) erro
 	}
 
 	result := statusResult{}
+	repo := opts.repo(ctx)
 
 	// Resolved locally, and a failure here is reported rather than rendered as
 	// a fact. "I could not tell" and "there are none" are different answers,
 	// and for the command whose whole purpose is being the dashboard, guessing
 	// the second is the worst thing it could do. Ordinary causes are a stale
 	// checkout, a wrong --repo-path, or running outside a clone.
-	resolved, err := version.Resolve(opts.repo(ctx), version.Request{
-		Mode: version.ModeRelease,
-		Bump: version.BumpMinor,
-	})
+	state, err := version.Discover(repo)
 	if err != nil {
 		result.LocalError = err.Error()
 	} else {
-		result.LatestFinalTag = resolved.LatestFinal
-		result.NextFromLocal = resolved.Tag
-		result.Live = resolved.Live
-		result.Stale = resolved.Stale
+		result.LatestFinalTag = state.LatestFinal
+		result.Live = state.Live
+		result.Stale = state.Stale
+
+		// What `relctl rc` would cut from main. Resolved separately from the
+		// train view, so a train view that is known is not lost to a next
+		// candidate that is not.
+		next, err := version.Resolve(repo, version.Request{
+			Mode: version.ModePrerelease,
+			Bump: version.BumpMinor,
+		})
+		if err != nil {
+			result.NextError = err.Error()
+		} else {
+			result.NextFromLocal = next.Tag
+		}
 	}
 
 	client, err := opts.client(ctx)
 	if err != nil {
 		return err
+	}
+
+	// Only for a single live train: with several, which one is about to be
+	// promoted is the question promote itself asks.
+	if state != nil && len(state.Live) == 1 {
+		result.Candidate, result.CandidateError = currentCandidate(ctx, client, repo, state.Live[0])
 	}
 
 	latest, err := client.LatestRelease(ctx)
@@ -227,6 +252,32 @@ func runStatus(ctx context.Context, out io.Writer, opts *Options, all bool) erro
 	}
 
 	return writeStatusText(out, result, all)
+}
+
+// currentCandidate finds the candidate promote would finalize, reporting a
+// failure as text rather than failing the dashboard over one row.
+func currentCandidate(
+	ctx context.Context,
+	client *gh.Client,
+	repo version.Repo,
+	train string,
+) (*candidateInfo, string) {
+	candidates, err := version.Candidates(repo, train)
+	if err != nil {
+		return nil, err.Error()
+	}
+
+	results, err := candidateResults(ctx, client, candidates)
+	if err != nil {
+		return nil, err.Error()
+	}
+
+	passing, ok := newestPassing(results)
+	if !ok {
+		return nil, ""
+	}
+
+	return &passing, ""
 }
 
 // inFlight lists release-related runs that have not finished.
@@ -322,11 +373,20 @@ func writeStatusText(out io.Writer, result statusResult, all bool) error {
 		// "(none)" four times for facts nobody established.
 		rows = append(rows, []string{"Local state:", "UNKNOWN (" + result.LocalError + ")"})
 	} else {
+		next := orNone(result.NextFromLocal)
+		if result.NextError != "" {
+			next = "UNKNOWN (" + result.NextError + ")"
+		}
+
 		rows = append(rows,
 			[]string{"Latest final tag:", orNone(result.LatestFinalTag)},
-			[]string{"Next from checkout:", orNone(result.NextFromLocal)},
+			[]string{"Next candidate:", next},
 			[]string{"Live trains:", joinOrNone(result.Live)},
 		)
+
+		if len(result.Live) == 1 {
+			rows = append(rows, []string{"Promotable:", promotableCell(result, time.Now())})
+		}
 
 		if len(result.Stale) > 0 {
 			rows = append(rows, []string{"Stale trains:", strings.Join(result.Stale, " ")})
@@ -389,10 +449,29 @@ func orNone(value string) string {
 	return value
 }
 
+// promotableCell renders what promote would finalize, or why nothing.
+func promotableCell(result statusResult, now time.Time) string {
+	switch {
+	case result.CandidateError != "":
+		return "UNKNOWN (" + result.CandidateError + ")"
+	case result.Candidate == nil:
+		return "(none: no candidate of this train has passed its soak)"
+	}
+
+	cell := result.Candidate.Tag
+	if when := recordedAgo(*result.Candidate, now); when != "" {
+		cell += "  (passed " + when + ")"
+	}
+
+	return cell
+}
+
 // writeDrafts lists the drafts, highest version first, one per line.
 //
-// A draft is a release that built and never shipped, and the usual cause is a
-// soak that failed. Saying so beats leaving a bare list.
+// A draft is a release that built and never shipped. A candidate stays one by
+// design, since a candidate's result is a commit status rather than a
+// publication; anything else is usually a build or soak that failed. Saying so
+// beats leaving a bare list.
 //
 // The date column is headed COMMITTED because that is what it is: the date of
 // the commit the draft points at, not the date the draft was made. GitHub does
@@ -416,7 +495,7 @@ func writeDrafts(out io.Writer, result statusResult, all bool) error {
 	}
 
 	if _, err := fmt.Fprintf(out,
-		"\nDrafts (%d): built but not published, usually a soak that failed.\n",
+		"\nDrafts (%d): built but not published. A candidate stays a draft by design; anything else is usually a failure.\n",
 		len(result.Drafts)); err != nil {
 		return err
 	}

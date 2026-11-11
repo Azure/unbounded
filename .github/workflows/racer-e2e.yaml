@@ -4,8 +4,8 @@
 name: racer e2e
 
 # Path filters cover Racer and the Gantry Racer backend. The suite also
-# exercises the operator install path, which the nightly schedule covers for
-# unrelated operator changes.
+# exercises the operator install path, which scheduled release candidates
+# cover for unrelated operator changes.
 on:
   pull_request:
     paths:
