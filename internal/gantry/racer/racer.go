@@ -666,7 +666,8 @@ func (s *Handler) streamContent(ctx context.Context, w http.ResponseWriter, id s
 	// of bytes accepted by w, pinned to the same version; every resumed read
 	// again gates its final byte on Complete. Otherwise abort rather than
 	// append an error body or let net/http complete the response.
-	// OCI digest verification belongs to the consumer's assembled object.
+	// Full responses are digest-checked here; ranged resumes are left to the
+	// consumer's commit-time check.
 	var written int64
 
 	// Full objects are hashed as they stream; see verifyingWriter.

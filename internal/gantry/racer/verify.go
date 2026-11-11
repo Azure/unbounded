@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"hash"
+	"io"
 	"net/http"
 	"time"
 
@@ -59,8 +60,14 @@ func WithDigestMismatchObserver(observe func()) HandlerOption {
 //
 // Hashing forces bytes through process memory, so it forgoes the SDK's
 // splice fast path for full responses.
+//
+// The body goes out through an io.Writer and the deadline through the
+// response controller. Callers have already set the attachment and nosniff
+// download headers (writeRacerDownloadHeaders), so these bytes are never
+// rendered as a document.
 type verifyingWriter struct {
-	w     http.ResponseWriter
+	w     io.Writer
+	rc    *http.ResponseController
 	want  digest.Digest
 	hash  hash.Hash
 	total int64
@@ -68,7 +75,7 @@ type verifyingWriter struct {
 }
 
 func newVerifyingWriter(w http.ResponseWriter, want digest.Digest, total int64) *verifyingWriter {
-	return &verifyingWriter{w: w, want: want, hash: sha256.New(), total: total}
+	return &verifyingWriter{w: w, rc: http.NewResponseController(w), want: want, hash: sha256.New(), total: total}
 }
 
 // Write hashes only bytes that w accepted, so resumes from the accepted count
@@ -112,7 +119,7 @@ func (v *verifyingWriter) write(p []byte) (int, error) {
 
 // SetWriteDeadline lets the SDK manage write deadlines through the wrapper.
 func (v *verifyingWriter) SetWriteDeadline(t time.Time) error {
-	return http.NewResponseController(v.w).SetWriteDeadline(t)
+	return v.rc.SetWriteDeadline(t)
 }
 
 func (v *verifyingWriter) matches() bool {
