@@ -6981,6 +6981,35 @@ mod written {
     }
 
     #[test]
+    fn concurrent_writes_cannot_overshoot_the_dirty_cap() {
+        let (_simulation, env) = sim();
+        let f = opened(&env);
+        recover(&f, &env, LAYOUT, COMPACT);
+        f.store.writer.index().set_page_capacity(64).unwrap();
+        let cache = CacheId(crate::test_support::security::CACHE.into());
+        let limit = f.store.writer.dirty_limit(&cache);
+        let request = scope(&env);
+        // Far more concurrent stores than the cap admits.
+        let copies: Vec<_> = (1..=40).map(|n| f.copy(n, 1 << 20)).collect();
+        let writes = futures::future::join_all(copies.into_iter().map(|copy| {
+            f.store
+                .writer
+                .persist_written(copy, SessionId([1; 16]), hold(), &request)
+        }));
+        let results = drive(&f.reactor, async { Ok(writes.await) }).unwrap();
+        assert!(results.iter().any(Result::is_ok));
+        assert!(
+            results
+                .iter()
+                .filter_map(|r| r.as_ref().err())
+                .all(|e| *e == Error::Overloaded)
+        );
+        assert!(results.iter().any(|r| r.is_err()), "cap never applied");
+        assert!(f.store.writer.dirty_bytes(&cache) <= limit);
+        assert_eq!(f.store.writer.writes.reserved(&cache), 0);
+    }
+
+    #[test]
     fn concurrent_writes_share_one_group_commit() {
         let (_simulation, env) = sim();
         let f = opened(&env);

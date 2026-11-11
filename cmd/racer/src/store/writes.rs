@@ -120,6 +120,9 @@ pub(crate) struct Writes {
     journal: RefCell<Option<Rc<WriteJournal>>>,
     pages: RefCell<HashMap<PageId, WrittenEntry>>,
     dirty: RefCell<HashMap<CacheId, u64>>,
+    /// Bytes of in-flight persists, held from the cap check to the insert so
+    /// concurrent stores cannot overshoot the dirty cap.
+    reserved: RefCell<HashMap<CacheId, u64>>,
     persisting: RefCell<HashSet<PageId>>,
 }
 
@@ -169,6 +172,35 @@ impl Writes {
         self.dirty.borrow().get(cache).copied().unwrap_or(0)
     }
 
+    pub(super) fn reserved(&self, cache: &CacheId) -> u64 {
+        self.reserved.borrow().get(cache).copied().unwrap_or(0)
+    }
+
+    /// Reserve `bytes` of `cache`'s dirty cap, net of `replaced` bytes the
+    /// store will supersede, or `None` when that would pass `limit`.
+    fn reserve_dirty(
+        &self,
+        cache: &CacheId,
+        bytes: u64,
+        replaced: u64,
+        limit: u64,
+    ) -> Option<DirtyReservation<'_>> {
+        let next = self
+            .dirty(cache)
+            .saturating_add(self.reserved(cache))
+            .saturating_sub(replaced)
+            .saturating_add(bytes);
+        if next > limit {
+            return None;
+        }
+        *self.reserved.borrow_mut().entry(cache.clone()).or_default() += bytes;
+        Some(DirtyReservation {
+            writes: self,
+            cache: cache.clone(),
+            bytes,
+        })
+    }
+
     fn begin(&self, page: &PageId) -> Result<Persisting<'_>> {
         if !self.persisting.borrow_mut().insert(page.clone()) {
             return Err(Error::Overloaded);
@@ -177,6 +209,26 @@ impl Writes {
             writes: self,
             page: page.clone(),
         })
+    }
+}
+
+/// Dirty-cap bytes held by one in-flight persist. Dropped after the entry is
+/// inserted (which charges the real bytes) or when the persist fails.
+struct DirtyReservation<'a> {
+    writes: &'a Writes,
+    cache: CacheId,
+    bytes: u64,
+}
+
+impl Drop for DirtyReservation<'_> {
+    fn drop(&mut self) {
+        let mut reserved = self.writes.reserved.borrow_mut();
+        if let Some(entry) = reserved.get_mut(&self.cache) {
+            *entry = entry.saturating_sub(self.bytes);
+            if *entry == 0 {
+                reserved.remove(&self.cache);
+            }
+        }
     }
 }
 
@@ -549,15 +601,10 @@ impl StoreWriter {
             let alignment = self.slabs.alignment()?;
             let disk_bytes = super::record_length(&page, alignment)?;
             let replaced = self.writes.get(&id).map_or(0, |entry| entry.disk_bytes);
-            if self
+            let reservation = self
                 .writes
-                .dirty(&cache)
-                .saturating_sub(replaced)
-                .saturating_add(disk_bytes as u64)
-                > self.dirty_limit(&cache)
-            {
-                return Err(Error::Overloaded);
-            }
+                .reserve_dirty(&cache, disk_bytes as u64, replaced, self.dirty_limit(&cache))
+                .ok_or(Error::Overloaded)?;
             let mut ticket = match self.index.reserve_page_for(&id) {
                 Err(Error::Overloaded) if self.clock.borrow().is_some() => {
                     let clock = self.clock.borrow().clone().expect("checked clock");
@@ -634,6 +681,7 @@ impl StoreWriter {
                 // The new Page record superseded the old one in the journal.
                 self.index.unpin_segment(previous.location.segment)?;
             }
+            drop(reservation);
             let envelope = page.ciphertext.envelope();
             let published = if self.allowed(&page) {
                 ticket.publish(
