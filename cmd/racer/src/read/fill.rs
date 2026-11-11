@@ -213,6 +213,12 @@ const GPU_COPY_JOIN_RETRIES: usize = 2;
 /// miss before the usual path asks the same providers again.
 const LANDING_PROVIDERS: usize = 2;
 
+/// The longest a local adapter probe may take before the fill falls through
+/// to holders, peers, and the remote origin. Matches the holder probe bound,
+/// [`racer_core::read::holders::HOLDER_TIMEOUT`].
+pub(crate) const ADAPTER_LOCAL_TIMEOUT: std::time::Duration =
+    racer_core::read::holders::HOLDER_TIMEOUT;
+
 impl Fill {
     /// This worker's detached driver queue.
     #[cfg(test)]
@@ -2935,7 +2941,15 @@ impl Fill {
         scope: &RequestScope,
         want_plaintext: bool,
     ) -> Result<Option<AcquiredPage>> {
+        use crate::control::rest::Scope as _;
+        scope.check()?;
+        // The probe runs on its own short deadline so a stalling adapter
+        // costs at most ADAPTER_LOCAL_TIMEOUT and leaves the rest of the
+        // read's deadline to holders, peers, and the remote origin. The
+        // narrowed scope shares the reader's cancellation.
+        let probe = scope.narrowed(self.dependencies.flights.clock().now() + ADAPTER_LOCAL_TIMEOUT);
         let attempt = async {
+            let scope = &probe;
             scope.check()?;
             if context.object != page.version.object {
                 return Err(Error::Unauthorized);
@@ -2990,8 +3004,10 @@ impl Fill {
                 self.metrics.record(Event::AdapterLocalMiss, 1);
                 Ok(None)
             }
-            Err(error @ (Error::Canceled | Error::DeadlineExceeded)) => Err(error),
+            Err(error @ Error::Canceled) => Err(error),
             Err(_) => {
+                // A probe that ran out of its own deadline is a local
+                // failure; one that outlived the read's deadline is not.
                 scope.check()?;
                 self.metrics.record(Event::AdapterLocalFailure, 1);
                 Ok(None)

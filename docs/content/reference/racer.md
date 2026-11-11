@@ -152,7 +152,9 @@ spec:
   source; without one it answers `404`, and for another version `412`. Racer
   treats both as a miss. A hit is encrypted and kept in memory
   like any origin page. A miss or a failed local read falls through to peers
-  and then the remote origin, and never counts as an origin failure.
+  and then the remote origin, and never counts as an origin failure. A local
+  read that takes longer than two seconds counts as failed, so a stalled
+  adapter leaves the rest of the read's deadline to the other sources.
 - Both the reading node and an owner that fills a page for a peer ask their own
   adapter first.
 - A local-only request carries the reader's `Racer-Metadata`, also when an

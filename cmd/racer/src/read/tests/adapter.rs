@@ -154,6 +154,50 @@ fn adapter_local_failures_fall_through_to_the_origin() {
     }
 }
 
+/// A stalling local adapter costs at most the probe bound: the fill falls
+/// through to the remote origin within the read's deadline.
+#[test]
+fn adapter_local_stall_falls_through_within_the_read_deadline() {
+    let env = racer_io::Env::host();
+    let mut f = fixture(&env);
+    f.set_mode(&env, CacheMode::Adapter);
+    f.origin.local.set(LocalReplica::Stall);
+    let bound = crate::read::fill::ADAPTER_LOCAL_TIMEOUT;
+    assert!(f.scope.deadline.0 > Instant::now() + bound * 2);
+    let started = Instant::now();
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
+    let fill = f.fill.clone();
+    let mut future = Box::pin(fill.acquire(
+        f.page.clone(),
+        f.membership.clone(),
+        &f.context,
+        &f.scope,
+        &mut budget,
+    ));
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let result = loop {
+        assert!(
+            started.elapsed() < bound * 4,
+            "the stalled probe was not bounded"
+        );
+        fill.drivers().poll(&mut cx, 64);
+        crate::lifecycle::Service::poll_budgeted(&mut f.engine, &mut cx, 64).unwrap();
+        f.crypto.poll_budgeted(64).unwrap();
+        if let Poll::Ready(value) = future.as_mut().poll(&mut cx) {
+            break value.unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    drop(future);
+    assert_eq!(result.plaintext.bytes(), b"abc");
+    assert!(started.elapsed() >= bound);
+    assert!(Instant::now() < f.scope.deadline.0);
+    assert_eq!(f.origin.local_calls.get(), 1);
+    assert_eq!(f.origin.calls.get(), 1);
+    assert_eq!(f.fill.metrics.count(Event::AdapterLocalFailure), 1);
+    assert_eq!(f.fill.metrics.count(Event::AdapterLocalHit), 0);
+}
+
 /// Passthrough caches never ask for a local copy.
 #[test]
 fn passthrough_never_asks_for_a_local_copy() {

@@ -3214,6 +3214,8 @@ pub(super) enum LocalReplica {
     Fail(Error),
     /// Serve a page one byte short of its length.
     Short,
+    /// Never answer: wait until the probe's scope ends.
+    Stall,
 }
 impl Origin for TestOrigin {
     fn local_page_reserved<'a>(
@@ -3235,6 +3237,17 @@ impl Origin for TestOrigin {
             let length = match self.local.get() {
                 LocalReplica::Miss => return Ok(None),
                 LocalReplica::Fail(error) => return Err(error),
+                LocalReplica::Stall => {
+                    std::future::poll_fn(|cx| match scope.check() {
+                        Ok(()) => {
+                            cx.waker().wake_by_ref();
+                            Poll::Pending
+                        }
+                        Err(error) => Poll::Ready(Err(error)),
+                    })
+                    .await?;
+                    unreachable!("a stalled probe only ends with its scope");
+                }
                 LocalReplica::Hit => length,
                 LocalReplica::Short => length - 1,
             };
