@@ -8,7 +8,9 @@
 //! - Put Block List `409 BlobAlreadyExists` or any `412`: Get Blob
 //!   Properties. A blob carrying this commit's `x-ms-meta-racercommit`
 //!   marker is ours (a retry after a lost `201`) and its `ETag` is returned;
-//!   anything else is [`CommitConflict`].
+//!   a `404` or another blob is [`CommitConflict`]. Any other probe status
+//!   (`429`, `5xx`, ...) classifies like a read, so transient failures stay
+//!   retryable rather than becoming a conflict.
 //! - `403`: `OriginForbidden`; `401`: `OriginRejected` (after the retry).
 //! - `429`, `5xx` (`ServerBusy`, `InternalError`, `OperationTimedOut`):
 //!   `Unavailable`, retryable (see [`crate::origin::upload::retryable`]).
@@ -126,8 +128,16 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
                 )
                 .await?;
             let head = probe.head();
-            let ours = status(head)? == 200
-                && field(head, request::COMMIT_MARKER)? == Some(marker.as_bytes());
+            let probed = status(head)?;
+            // Only 200 (inspect the marker) and 404 (deleted since: the
+            // name is contested) settle the commit. A 429, 5xx, or other
+            // failure says nothing about who committed, so it classifies
+            // like any response and stays retryable where transient.
+            if probed != 200 && probed != 404 {
+                return Err(self.reject(probe, false, &begun.scope).await);
+            }
+            let ours =
+                probed == 200 && field(head, request::COMMIT_MARKER)? == Some(marker.as_bytes());
             let etag = field(head, "ETag")?.and_then(|etag| StrongEtag::parse(etag).ok());
             let _ = probe.discard(&begun.scope).await;
             return Ok(match etag {

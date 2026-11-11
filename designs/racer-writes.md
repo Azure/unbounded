@@ -1543,7 +1543,10 @@ plan above):
   BlobAlreadyExists` or `412` the sink sends Get Blob Properties (`HEAD`); a
   `200` carrying our marker and a strong `ETag` returns that ETag as a
   commit, so a retry after a lost `201` is not a `BlockListConflict`.
-  Anything else stays `CommitConflict` and goes to `conflict_outcome`.
+  A `200` without our marker, or a `404`, stays `CommitConflict` and goes
+  to `conflict_outcome`. Any other probe status (`429`, `5xx`) classifies
+  like a read, so a transient failure is retried by the `RetryPolicy`
+  rather than turned into a conflict.
   `MemoryUploadSink` treats a recommit of the same block list the same way,
   and `lose_next_commit_response` commits but answers `Unavailable`.
 

@@ -492,6 +492,58 @@ fn put_block_list_retry_recognizes_its_own_commit() {
     h.script(&ok);
     let etag = h.commit(&ctx, 2, None).unwrap().unwrap();
     assert_eq!(etag.as_str(), "\"0x8DCAFE\"");
+    // The same recognition after a 412.
+    h.script(b"HTTP/1.1 412 Precondition Failed\r\nx-ms-error-code: ConditionNotMet\r\nContent-Length: 0\r\n\r\n");
+    h.script(&ok);
+    let etag = h.commit(&ctx, 2, None).unwrap().unwrap();
+    assert_eq!(etag.as_str(), "\"0x8DCAFE\"");
+}
+
+#[test]
+fn put_block_list_transient_probe_failure_is_retryable() {
+    let h = harness(AzureCredential::ManagedIdentity { client_id: None }, false);
+    let ctx = context("obj", "");
+    let precondition = b"HTTP/1.1 412 Precondition Failed\r\nx-ms-error-code: ConditionNotMet\r\nContent-Length: 0\r\n\r\n";
+    for probe in [
+        &b"HTTP/1.1 503 Busy\r\nx-ms-error-code: ServerBusy\r\nContent-Length: 0\r\n\r\n"[..],
+        &b"HTTP/1.1 429 Too Many\r\nContent-Length: 0\r\n\r\n"[..],
+        &b"HTTP/1.1 500 Err\r\nx-ms-error-code: InternalError\r\nContent-Length: 0\r\n\r\n"[..],
+    ] {
+        h.script(precondition);
+        h.script(probe);
+        let error = h.commit(&ctx, 1, None).err().unwrap();
+        assert_eq!(error, Error::Unavailable);
+        assert!(crate::origin::upload::retryable(&error));
+    }
+    // A retry policy rides out the transient probe and recognizes the commit.
+    let ids = [block_id(VERSION, 0)];
+    let body = super::super::request::block_list_xml(&ids).unwrap();
+    let marker = super::super::request::commit_marker(&body);
+    let mut ok = b"HTTP/1.1 200 OK\r\nETag: \"0x8DCAFE\"\r\nx-ms-meta-racercommit: ".to_vec();
+    ok.extend_from_slice(marker.as_bytes());
+    ok.extend_from_slice(b"\r\nContent-Length: 0\r\n\r\n");
+    h.script(precondition);
+    h.script(b"HTTP/1.1 503 Busy\r\nx-ms-error-code: ServerBusy\r\nContent-Length: 0\r\n\r\n");
+    h.script(precondition);
+    h.script(&ok);
+    let policy = RetryPolicy {
+        attempts: 5,
+        base: Duration::from_millis(1),
+        cap: Duration::from_millis(2),
+    };
+    let scope = scope();
+    let etag = block_on(policy.run(
+        &scope,
+        1,
+        |_| async { Ok(()) },
+        |_| {
+            h.origin
+                .put_block_list_with(&h.definition, &ctx, &ids, None, &scope)
+        },
+    ))
+    .unwrap()
+    .unwrap();
+    assert_eq!(etag.as_str(), "\"0x8DCAFE\"");
 }
 
 #[test]
