@@ -406,6 +406,7 @@ func (e *KubernetesStageExecutor) stagePod(
 			{Name: "PROJECT_SIGNAL_NODE_UID", Value: string(participant.NodeUID)},
 			{Name: "PROJECT_SIGNAL_PARAMETERS_JSON", Value: parametersJSON},
 			{Name: "PROJECT_SIGNAL_RESOLVED_INPUTS_JSON", Value: inputsJSON},
+			{Name: "PROJECT_SIGNAL_RESULTS_DIR", Value: "/results"},
 		},
 		Resources: driverResources(driver),
 	}
@@ -424,6 +425,9 @@ func (e *KubernetesStageExecutor) stagePod(
 			Name:      "script",
 			MountPath: "/scripts",
 			ReadOnly:  true,
+		}, {
+			Name:      "results",
+			MountPath: "/results",
 		}}
 	case signalv1.TestDriverTypeContainer:
 		if driver.Container == nil {
@@ -475,6 +479,11 @@ func (e *KubernetesStageExecutor) stagePod(
 				ConfigMap: &corev1.ConfigMapVolumeSource{
 					LocalObjectReference: corev1.LocalObjectReference{Name: source.Name},
 				},
+			},
+		}, corev1.Volume{
+			Name: "results",
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
 			},
 		})
 	}
@@ -1558,6 +1567,32 @@ func convertLegacyInvocationResult(
 	}
 
 	participant := invocation.Participants[0]
+	participantResult := signalv1.InvocationParticipantResult{
+		Index:   participant.Index,
+		Role:    invocation.ParticipantRole[participant.Index],
+		Outcome: outcome,
+		Start:   signalv1.NodeFingerprint{NodeUID: participant.NodeUID},
+		End:     signalv1.NodeFingerprint{NodeUID: participant.NodeUID},
+	}
+
+	qualification, qualificationErr := decodeQualificationMeasurements(
+		legacy.Measurements,
+		int(participant.Index),
+		string(signalv1.ExecutionBackendPod),
+	)
+	if qualificationErr != nil {
+		return signalv1.InvocationResultEnvelope{}, qualificationErr
+	}
+
+	if qualification != nil {
+		participantResult.Start.DriverVersion = qualification.DriverVersion
+		participantResult.End.DriverVersion = qualification.DriverVersion
+		participantResult.Start.GPUInventoryDigest = qualification.GPUInventoryDigest
+		participantResult.End.GPUInventoryDigest = qualification.GPUInventoryDigest
+		participantResult.VisibleDevices = append([]string(nil), qualification.VisibleDevices...)
+		participantResult.CoveredDevices = append([]string(nil), qualification.CoveredDevices...)
+	}
+
 	startedAt := legacy.StartedAt
 	finishedAt := legacy.FinishedAt
 
@@ -1585,13 +1620,7 @@ func convertLegacyInvocationResult(
 		ReasonCode:        reason,
 		Message:           boundedStageMessage(legacy.Reason),
 		Measurements:      measurements,
-		Participants: []signalv1.InvocationParticipantResult{{
-			Index:   participant.Index,
-			Role:    invocation.ParticipantRole[participant.Index],
-			Outcome: outcome,
-			Start:   signalv1.NodeFingerprint{NodeUID: participant.NodeUID},
-			End:     signalv1.NodeFingerprint{NodeUID: participant.NodeUID},
-		}},
+		Participants:      []signalv1.InvocationParticipantResult{participantResult},
 		Activity: signalv1.WorkloadActivitySummary{
 			SampleCount:          1,
 			SampleSequenceDigest: digestText(legacy.Measurements),
@@ -1704,12 +1733,65 @@ func scriptInvocationWrapper(language signalv1.ScriptLanguage, key, digest strin
 	}
 
 	return fmt.Sprintf(`
+set +e
+results_dir="${PROJECT_SIGNAL_RESULTS_DIR:-/results}"
+mkdir -p "$results_dir"
+rm -f "$results_dir/verdict" "$results_dir/reason" "$results_dir/measurements.json"
 script=/scripts/%s
 want=%s
 got=$(sha256sum "$script" | awk '{print $1}')
-test "sha256:$got" = "$want"
-exec %s "$script"
-`, key, digest, interpreter)
+if [ "sha256:$got" != "$want" ]; then
+  printf 'Inconclusive' > "$results_dir/verdict"
+  printf 'ScriptDigestMismatch' > "$results_dir/reason"
+  status=2
+else
+  %s "$script"
+  status=$?
+fi
+
+if [ -f "$results_dir/verdict" ] || [ -f "$results_dir/reason" ] || [ -f "$results_dir/measurements.json" ]; then
+  verdict="$(cat "$results_dir/verdict" 2>/dev/null || true)"
+  reason="$(cat "$results_dir/reason" 2>/dev/null || true)"
+  expected_status=2
+  case "$verdict" in
+    Pass) expected_status=0 ;;
+    Fail) expected_status=1 ;;
+    Inconclusive) expected_status=2 ;;
+    *)
+      verdict=Inconclusive
+      reason=InvalidResultVerdict
+      expected_status=2
+      ;;
+  esac
+
+  if [ -z "$reason" ]; then
+    verdict=Inconclusive
+    reason=MissingResultReason
+    expected_status=2
+  elif [ "$status" -ne "$expected_status" ]; then
+    verdict=Inconclusive
+    reason=ResultExitCodeMismatch
+    expected_status=2
+  fi
+
+  encode_file() {
+    if [ -f "$1" ]; then
+      base64 < "$1" | tr -d '\n'
+    else
+      printf '%%s' -
+    fi
+  }
+
+  printf '%s%%s %%s %%s %%d\n' \
+    "$(printf '%%s' "$verdict" | base64 | tr -d '\n')" \
+    "$(printf '%%s' "$reason" | base64 | tr -d '\n')" \
+    "$(encode_file "$results_dir/measurements.json")" \
+    "$expected_status"
+  exit "$expected_status"
+fi
+
+exit "$status"
+`, key, digest, interpreter, resultPrefix)
 }
 
 func invocationResourceName(base string, invocation StageInvocation, participant int32) string {

@@ -277,74 +277,218 @@ func ValidateStageSchedule(schedule StageSchedule) error {
 	return nil
 }
 
-// DeriveResolvedPlanDeadline sums ordered phase ceilings. Stages within a
-// phase are concurrent, so each phase contributes only its longest stage plus
-// the cleanup reserve. The retry budget extends the final invocation tail;
-// retries started during a repeated coverage window remain inside that window.
-func DeriveResolvedPlanDeadline(phases []ResolvedPhasePlan) (time.Duration, error) {
-	var required time.Duration
+type resolvedStageDependencyNode struct {
+	stage        *ResolvedStagePlan
+	dependencies []string
+}
 
+func resolvedStageDependencyGraph(
+	phases []ResolvedPhasePlan,
+) (map[string]resolvedStageDependencyNode, error) {
 	if len(phases) == 0 {
-		return 0, errors.New("at least one phase is required")
+		return nil, errors.New("at least one phase is required")
 	}
 
+	nodes := make(map[string]resolvedStageDependencyNode)
 	for phaseIndex := range phases {
-		var phaseDeadline time.Duration
-
 		if len(phases[phaseIndex].Stages) == 0 {
-			return 0, fmt.Errorf("phase %d must contain at least one stage", phaseIndex)
+			return nil, fmt.Errorf("phase %d must contain at least one stage", phaseIndex)
 		}
 
 		for stageIndex := range phases[phaseIndex].Stages {
-			stage := phases[phaseIndex].Stages[stageIndex]
-
-			schedule := stage.Schedule
-			if err := ValidateStageSchedule(schedule); err != nil {
-				return 0, fmt.Errorf(
-					"phase %d stage %d schedule is invalid: %w",
-					phaseIndex,
-					stageIndex,
-					err,
-				)
+			stage := &phases[phaseIndex].Stages[stageIndex]
+			if _, exists := nodes[stage.Name]; exists {
+				return nil, fmt.Errorf("resolved stage name %s is duplicated", stage.Name)
 			}
 
-			maxAttempts := int32(1)
-			if stage.Retry != nil {
-				maxAttempts = stage.Retry.MaxAttempts
-				if maxAttempts < 1 {
-					return 0, fmt.Errorf(
-						"phase %d stage %d retry maxAttempts must be positive",
-						phaseIndex,
-						stageIndex,
+			nodes[stage.Name] = resolvedStageDependencyNode{stage: stage}
+		}
+	}
+
+	for phaseIndex := range phases {
+		for stageIndex := range phases[phaseIndex].Stages {
+			stage := &phases[phaseIndex].Stages[stageIndex]
+			node := nodes[stage.Name]
+			seen := make(map[string]struct{}, len(stage.DependsOn))
+
+			if len(stage.DependsOn) == 0 && phaseIndex > 0 {
+				for previousIndex := range phases[phaseIndex-1].Stages {
+					node.dependencies = append(
+						node.dependencies,
+						phases[phaseIndex-1].Stages[previousIndex].Name,
 					)
 				}
-			}
+			} else {
+				for dependencyIndex := range stage.DependsOn {
+					dependency := stage.DependsOn[dependencyIndex]
+					if dependency.Stage == stage.Name {
+						return nil, fmt.Errorf("resolved stage %s cannot depend on itself", stage.Name)
+					}
 
-			invocationTimeout := schedule.InvocationTimeout.Duration
-			if invocationTimeout > time.Duration(1<<63-1)/time.Duration(maxAttempts) {
-				return 0, errors.New("stage retry deadline overflows")
-			}
+					if _, exists := seen[dependency.Stage]; exists {
+						return nil, fmt.Errorf(
+							"resolved stage %s dependency %s is duplicated",
+							stage.Name,
+							dependency.Stage,
+						)
+					}
 
-			stageDeadline := invocationTimeout * time.Duration(maxAttempts)
-			if schedule.CoverageWindow != nil {
-				if schedule.CoverageWindow.Duration >
-					time.Duration(1<<63-1)-stageDeadline {
-					return 0, errors.New("stage deadline overflows")
+					seen[dependency.Stage] = struct{}{}
+					if _, exists := nodes[dependency.Stage]; !exists {
+						return nil, fmt.Errorf(
+							"resolved stage %s dependency %s does not exist",
+							stage.Name,
+							dependency.Stage,
+						)
+					}
+
+					switch dependency.Condition {
+					case "", StageDependencyConditionSucceeded, StageDependencyConditionCompleted:
+					default:
+						return nil, fmt.Errorf(
+							"resolved stage %s dependency %s has invalid condition %q",
+							stage.Name,
+							dependency.Stage,
+							dependency.Condition,
+						)
+					}
+
+					node.dependencies = append(node.dependencies, dependency.Stage)
 				}
-
-				stageDeadline += schedule.CoverageWindow.Duration
 			}
 
-			if stageDeadline > phaseDeadline {
-				phaseDeadline = stageDeadline
+			nodes[stage.Name] = node
+		}
+	}
+
+	const (
+		unvisited = iota
+		visiting
+		visited
+	)
+
+	states := make(map[string]int, len(nodes))
+
+	var visit func(string) error
+	visit = func(stage string) error {
+		switch states[stage] {
+		case visiting:
+			return fmt.Errorf("resolved stage dependency graph contains a cycle at %s", stage)
+		case visited:
+			return nil
+		}
+
+		states[stage] = visiting
+		for _, dependency := range nodes[stage].dependencies {
+			if err := visit(dependency); err != nil {
+				return err
 			}
 		}
 
-		if required > time.Duration(1<<63-1)-phaseDeadline-MinimumBackendDeadlineReserve {
-			return 0, errors.New("combined phase deadlines overflow")
+		states[stage] = visited
+
+		return nil
+	}
+
+	for stage := range nodes {
+		if err := visit(stage); err != nil {
+			return nil, err
+		}
+	}
+
+	return nodes, nil
+}
+
+func resolvedStageDeadline(stage *ResolvedStagePlan) (time.Duration, error) {
+	schedule := stage.Schedule
+	if err := ValidateStageSchedule(schedule); err != nil {
+		return 0, err
+	}
+
+	maxAttempts := int32(1)
+	if stage.Retry != nil {
+		maxAttempts = stage.Retry.MaxAttempts
+		if maxAttempts < 1 {
+			return 0, errors.New("retry maxAttempts must be positive")
+		}
+	}
+
+	invocationTimeout := schedule.InvocationTimeout.Duration
+	if invocationTimeout > time.Duration(1<<63-1)/time.Duration(maxAttempts) {
+		return 0, errors.New("stage retry deadline overflows")
+	}
+
+	deadline := invocationTimeout * time.Duration(maxAttempts)
+	if schedule.CoverageWindow != nil {
+		if schedule.CoverageWindow.Duration > time.Duration(1<<63-1)-deadline {
+			return 0, errors.New("stage deadline overflows")
 		}
 
-		required += phaseDeadline + MinimumBackendDeadlineReserve
+		deadline += schedule.CoverageWindow.Duration
+	}
+
+	if deadline > time.Duration(1<<63-1)-MinimumBackendDeadlineReserve {
+		return 0, errors.New("stage deadline reserve overflows")
+	}
+
+	return deadline + MinimumBackendDeadlineReserve, nil
+}
+
+// DeriveResolvedPlanDeadline returns the longest stage dependency path. Stages
+// without explicit dependencies retain the previous-phase barrier semantics.
+// The retry budget extends the final invocation tail; retries started during a
+// repeated coverage window remain inside that window.
+func DeriveResolvedPlanDeadline(phases []ResolvedPhasePlan) (time.Duration, error) {
+	nodes, err := resolvedStageDependencyGraph(phases)
+	if err != nil {
+		return 0, err
+	}
+
+	deadlines := make(map[string]time.Duration, len(nodes))
+
+	var derive func(string) (time.Duration, error)
+	derive = func(name string) (time.Duration, error) {
+		if deadline, exists := deadlines[name]; exists {
+			return deadline, nil
+		}
+
+		node := nodes[name]
+		ownDeadline, err := resolvedStageDeadline(node.stage)
+		if err != nil {
+			return 0, fmt.Errorf("stage %s schedule is invalid: %w", name, err)
+		}
+
+		var dependencyDeadline time.Duration
+		for _, dependency := range node.dependencies {
+			candidate, err := derive(dependency)
+			if err != nil {
+				return 0, err
+			}
+
+			if candidate > dependencyDeadline {
+				dependencyDeadline = candidate
+			}
+		}
+
+		if dependencyDeadline > time.Duration(1<<63-1)-ownDeadline {
+			return 0, errors.New("combined stage deadlines overflow")
+		}
+
+		deadlines[name] = dependencyDeadline + ownDeadline
+
+		return deadlines[name], nil
+	}
+
+	var required time.Duration
+	for name := range nodes {
+		deadline, err := derive(name)
+		if err != nil {
+			return 0, err
+		}
+
+		if deadline > required {
+			required = deadline
+		}
 	}
 
 	return required, nil

@@ -209,6 +209,25 @@ type StageRetryPolicy struct {
 	RetryableFailures []RetryableFailureClass `json:"retryableFailures,omitempty"`
 }
 
+// +kubebuilder:validation:Enum=Succeeded;Completed
+type StageDependencyCondition string
+
+const (
+	StageDependencyConditionSucceeded StageDependencyCondition = "Succeeded"
+	StageDependencyConditionCompleted StageDependencyCondition = "Completed"
+)
+
+type StageDependency struct {
+	// Stage is the stable name of another stage in this Suite.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z]([-a-z0-9]*[a-z0-9])?$`
+	Stage string `json:"stage"`
+	// Condition defaults to Succeeded. Completed allows terminal cleanup or
+	// evidence stages to run after any terminal dependency outcome.
+	Condition StageDependencyCondition `json:"condition,omitempty"`
+}
+
 // +kubebuilder:validation:XValidation:rule="self.mode != 'RunOnce' || (!has(self.coverageWindow) && !has(self.interval) && !has(self.minExecutions) && !has(self.maxGap))",message="RunOnce schedules must not declare repeated-execution fields"
 // +kubebuilder:validation:XValidation:rule="self.mode == 'RunOnce' || (has(self.coverageWindow) && has(self.minExecutions) && has(self.maxGap))",message="Continuous and Periodic schedules require coverageWindow, minExecutions, and maxGap"
 // +kubebuilder:validation:XValidation:rule="self.mode != 'Periodic' || has(self.interval)",message="Periodic schedules require interval"
@@ -261,6 +280,11 @@ type CertificationStage struct {
 	ParticipantRoles []StageParticipantRoleBinding `json:"participantRoles,omitempty"`
 	Schedule         StageSchedule                 `json:"schedule"`
 	Retry            *StageRetryPolicy             `json:"retry,omitempty"`
+	// DependsOn overrides the default previous-phase barrier for this stage.
+	// +kubebuilder:validation:MaxItems=16
+	// +listType=map
+	// +listMapKey=stage
+	DependsOn []StageDependency `json:"dependsOn,omitempty"`
 	// Optional stages are reported but do not determine phase or Run success.
 	Optional bool `json:"optional,omitempty"`
 	// +kubebuilder:validation:MaxItems=16

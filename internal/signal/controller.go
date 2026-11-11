@@ -1317,6 +1317,7 @@ func (r *AdmissionReconciler) resolveStage(
 		ParticipantRoles:          roles,
 		Schedule:                  *stage.Schedule.DeepCopy(),
 		Retry:                     stage.Retry.DeepCopy(),
+		DependsOn:                 append([]signalv1.StageDependency(nil), stage.DependsOn...),
 		Optional:                  stage.Optional,
 		Assertions:                append([]signalv1.TestAssertion(nil), stage.Assertions...),
 		PerDeviceCoverageInterval: stage.PerDeviceCoverageInterval.DeepCopy(),
@@ -1634,6 +1635,7 @@ func validateSourcePhases(phases []signalv1.CertificationPhase) error {
 	}
 
 	phaseNames := make(map[string]struct{}, len(phases))
+	stageLocations := make(map[string][2]int)
 	stageCount := 0
 	startupCount := 0
 	terminalCount := 0
@@ -1667,16 +1669,19 @@ func validateSourcePhases(phases []signalv1.CertificationPhase) error {
 			return fmt.Errorf("phase %s has no stages", phase.Name)
 		}
 
-		stageNames := make(map[string]struct{}, len(phase.Stages))
-
 		stageCount += len(phase.Stages)
 		for stageIndex := range phase.Stages {
 			stage := &phase.Stages[stageIndex]
-			if _, exists := stageNames[stage.Name]; exists {
-				return fmt.Errorf("phase %s stage name %s is duplicated", phase.Name, stage.Name)
+			if location, exists := stageLocations[stage.Name]; exists {
+				return fmt.Errorf(
+					"stage name %s is duplicated in phases %s and %s",
+					stage.Name,
+					phases[location[0]].Name,
+					phase.Name,
+				)
 			}
 
-			stageNames[stage.Name] = struct{}{}
+			stageLocations[stage.Name] = [2]int{phaseIndex, stageIndex}
 			if err := signalv1.ValidateStageSchedule(stage.Schedule); err != nil {
 				return fmt.Errorf("phase %s stage %s schedule: %w", phase.Name, stage.Name, err)
 			}
@@ -1694,6 +1699,96 @@ func validateSourcePhases(phases []signalv1.CertificationPhase) error {
 
 	if stageCount > signalv1.MaxCertificationStages {
 		return fmt.Errorf("stage count %d exceeds maximum %d", stageCount, signalv1.MaxCertificationStages)
+	}
+
+	dependencies := make(map[string][]string, stageCount)
+	for phaseIndex := range phases {
+		for stageIndex := range phases[phaseIndex].Stages {
+			stage := &phases[phaseIndex].Stages[stageIndex]
+			seen := make(map[string]struct{}, len(stage.DependsOn))
+
+			if len(stage.DependsOn) == 0 && phaseIndex > 0 {
+				for previousIndex := range phases[phaseIndex-1].Stages {
+					dependencies[stage.Name] = append(
+						dependencies[stage.Name],
+						phases[phaseIndex-1].Stages[previousIndex].Name,
+					)
+				}
+
+				continue
+			}
+
+			for dependencyIndex := range stage.DependsOn {
+				dependency := stage.DependsOn[dependencyIndex]
+				if dependency.Stage == stage.Name {
+					return fmt.Errorf("stage %s cannot depend on itself", stage.Name)
+				}
+
+				if _, exists := seen[dependency.Stage]; exists {
+					return fmt.Errorf("stage %s dependency %s is duplicated", stage.Name, dependency.Stage)
+				}
+
+				seen[dependency.Stage] = struct{}{}
+				if _, exists := stageLocations[dependency.Stage]; !exists {
+					return fmt.Errorf("stage %s dependency %s does not exist", stage.Name, dependency.Stage)
+				}
+
+				switch dependency.Condition {
+				case "", signalv1.StageDependencyConditionSucceeded, signalv1.StageDependencyConditionCompleted:
+				default:
+					return fmt.Errorf(
+						"stage %s dependency %s has invalid condition %q",
+						stage.Name,
+						dependency.Stage,
+						dependency.Condition,
+					)
+				}
+
+				dependencies[stage.Name] = append(dependencies[stage.Name], dependency.Stage)
+			}
+		}
+	}
+
+	return validateStageDependencyGraph(stageLocations, dependencies)
+}
+
+func validateStageDependencyGraph(
+	stageLocations map[string][2]int,
+	dependencies map[string][]string,
+) error {
+	const (
+		unvisited = iota
+		visiting
+		visited
+	)
+
+	states := make(map[string]int, len(stageLocations))
+
+	var visit func(string) error
+	visit = func(stage string) error {
+		switch states[stage] {
+		case visiting:
+			return fmt.Errorf("stage dependency graph contains a cycle at %s", stage)
+		case visited:
+			return nil
+		}
+
+		states[stage] = visiting
+		for _, dependency := range dependencies[stage] {
+			if err := visit(dependency); err != nil {
+				return err
+			}
+		}
+
+		states[stage] = visited
+
+		return nil
+	}
+
+	for stage := range stageLocations {
+		if err := visit(stage); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -2880,6 +2975,18 @@ func buildResolvedWorkflow(run *signalv1.CertificationRun) (*unstructured.Unstru
 	}
 
 	tasks := make([]any, 0, resolvedStageCount(*run.Spec.ResolvedPlan))
+	taskNames := make(map[string]string, resolvedStageCount(*run.Spec.ResolvedPlan))
+
+	for phaseIndex := range run.Spec.ResolvedPlan.Phases {
+		for stageIndex := range run.Spec.ResolvedPlan.Phases[phaseIndex].Stages {
+			stage := &run.Spec.ResolvedPlan.Phases[phaseIndex].Stages[stageIndex]
+			if _, exists := taskNames[stage.Name]; exists {
+				return nil, fmt.Errorf("resolved stage name %s is duplicated", stage.Name)
+			}
+
+			taskNames[stage.Name] = stageTaskName(int32(phaseIndex), int32(stageIndex), stage.Name)
+		}
+	}
 
 	var previousPhase []struct {
 		name     string
@@ -2892,7 +2999,7 @@ func buildResolvedWorkflow(run *signalv1.CertificationRun) (*unstructured.Unstru
 
 		for stageIndex := range phase.Stages {
 			stage := &phase.Stages[stageIndex]
-			taskName := stageTaskName(int32(phaseIndex), int32(stageIndex), stage.Name)
+			taskName := taskNames[stage.Name]
 			currentPhaseNames[stageIndex] = taskName
 			task := map[string]any{
 				"name": taskName,
@@ -2910,7 +3017,27 @@ func buildResolvedWorkflow(run *signalv1.CertificationRun) (*unstructured.Unstru
 				},
 			}
 
-			if len(previousPhase) > 0 {
+			if len(stage.DependsOn) > 0 {
+				dependencies := make([]string, len(stage.DependsOn))
+				for index := range stage.DependsOn {
+					dependency := stage.DependsOn[index]
+					dependencyTask, exists := taskNames[dependency.Stage]
+					if !exists {
+						return nil, fmt.Errorf(
+							"resolved stage %s dependency %s does not exist",
+							stage.Name,
+							dependency.Stage,
+						)
+					}
+
+					dependencies[index] = stageDependencyExpression(
+						dependencyTask,
+						dependency.Condition,
+					)
+				}
+
+				task["depends"] = strings.Join(dependencies, " && ")
+			} else if len(previousPhase) > 0 {
 				dependencies := make([]string, len(previousPhase))
 				for index, previous := range previousPhase {
 					if previous.optional {
@@ -2979,6 +3106,21 @@ func buildResolvedWorkflow(run *signalv1.CertificationRun) (*unstructured.Unstru
 	}
 
 	return workflow, nil
+}
+
+func stageDependencyExpression(taskName string, condition signalv1.StageDependencyCondition) string {
+	if condition == signalv1.StageDependencyConditionCompleted {
+		return fmt.Sprintf(
+			"(%s.Succeeded || %s.Failed || %s.Errored || %s.Skipped || %s.Omitted)",
+			taskName,
+			taskName,
+			taskName,
+			taskName,
+			taskName,
+		)
+	}
+
+	return taskName + ".Succeeded"
 }
 
 func stageWorkflowParameters(

@@ -8,15 +8,6 @@
 {{- if not (regexMatch "^sha256:[0-9a-f]{64}$" .GPUInventoryTestContentDigest) }}
 {{- fail "GPUInventoryTestContentDigest must be an algorithm-qualified sha256 digest" }}
 {{- end }}
-{{- if empty .GPUCompatTestUID }}
-{{- fail "GPUCompatTestUID is required when acceptance Suites are enabled" }}
-{{- end }}
-{{- if not (regexMatch "^[1-9][0-9]*$" .GPUCompatTestGeneration) }}
-{{- fail "GPUCompatTestGeneration must be a positive integer when acceptance Suites are enabled" }}
-{{- end }}
-{{- if not (regexMatch "^sha256:[0-9a-f]{64}$" .GPUCompatTestContentDigest) }}
-{{- fail "GPUCompatTestContentDigest must be an algorithm-qualified sha256 digest" }}
-{{- end }}
 apiVersion: signal.unbounded-cloud.io/v1alpha1
 kind: CertificationSuite
 metadata:
@@ -62,55 +53,6 @@ spec:
                 type: String
                 stringValue: consistent
 
----
-apiVersion: signal.unbounded-cloud.io/v1alpha1
-kind: CertificationSuite
-metadata:
-  name: project-signal-gpu-compat-v1
-  labels:
-    app.kubernetes.io/name: project-signal-gpu-compat
-    app.kubernetes.io/part-of: project-signal
-    signal.unbounded-cloud.io/catalog-role: compatibility-diagnostic
-spec:
-  phases:
-{{- range $index := until 15 }}
-    - name: {{ printf "compat-r%02d" (add1 $index) }}
-      displayName: {{ printf "R%02d compatibility diagnostic" (add1 $index) }}
-      role: Validation
-      stages:
-        - name: {{ printf "r%02d" (add1 $index) }}
-          displayName: {{ printf "R%02d" (add1 $index) }}
-          test:
-            name: project-signal-gpu-inventory-compat-v1
-            uid: {{ $.GPUCompatTestUID }}
-            generation: {{ $.GPUCompatTestGeneration }}
-            contentDigest: {{ $.GPUCompatTestContentDigest }}
-          schedule:
-            mode: RunOnce
-            invocationTimeout: 2m
-          assertions:
-            - name: nvidia-smi-available
-              metric: nvidiaSmiAvailable
-              operator: BooleanEquals
-              expected:
-                type: Boolean
-                booleanValue: true
-            - name: eight-gpus-visible
-              metric: observedGpuCount
-              operator: Range
-              minimum:
-                type: Integer
-                integerValue: 8
-              maximum:
-                type: Integer
-                integerValue: 8
-            - name: driver-version-consistent
-              metric: driverVersionSet
-              operator: StatusEquals
-              expected:
-                type: String
-                stringValue: consistent
-{{- end }}
 {{- if eq (default "false" .VLLMCanaryEnabled) "true" }}
 {{- if empty .VLLMTestUID }}
 {{- fail "VLLMTestUID is required when vLLM acceptance Suite rendering is enabled" }}

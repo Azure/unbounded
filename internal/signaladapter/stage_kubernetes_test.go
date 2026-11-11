@@ -5,6 +5,7 @@ package signaladapter
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1252,12 +1253,14 @@ func TestScriptInvocationWrapperUsesApprovedLanguage(t *testing.T) {
 	t.Parallel()
 
 	shell := scriptInvocationWrapper(signalv1.ScriptLanguageShell, "check.sh", testStageDigest("script"))
-	if !strings.Contains(shell, `exec /bin/sh "$script"`) {
+	if !strings.Contains(shell, `/bin/sh "$script"`) ||
+		!strings.Contains(shell, resultPrefix) {
 		t.Fatalf("shell wrapper = %q", shell)
 	}
 
 	python := scriptInvocationWrapper(signalv1.ScriptLanguagePython, "check.py", testStageDigest("script"))
-	if !strings.Contains(python, `exec python3 "$script"`) {
+	if !strings.Contains(python, `python3 "$script"`) ||
+		!strings.Contains(python, `measurements.json`) {
 		t.Fatalf("python wrapper = %q", python)
 	}
 }
@@ -1561,9 +1564,54 @@ func TestStagePodCarriesScriptResourcesAndImmutableIdentity(t *testing.T) {
 		"PROJECT_SIGNAL_TEST_GENERATION":     "3",
 		"PROJECT_SIGNAL_TEST_CONTENT_DIGEST": testStageDigest("test"),
 		"PROJECT_SIGNAL_TEST_TRUST":          string(signalv1.CertificationTestTrustApproved),
+		"PROJECT_SIGNAL_RESULTS_DIR":         "/results",
 	} {
 		if env[name] != want {
 			t.Fatalf("%s = %q, want %q", name, env[name], want)
 		}
+	}
+
+	if pod.Spec.Volumes[1].Name != "results" ||
+		pod.Spec.Volumes[1].EmptyDir == nil ||
+		pod.Spec.Containers[0].VolumeMounts[1].Name != "results" ||
+		pod.Spec.Containers[0].VolumeMounts[1].MountPath != "/results" {
+		t.Fatalf("script result volume is not mounted: pod = %#v", pod.Spec)
+	}
+}
+
+func TestParseInvocationResultLogConvertsSimpleScriptResult(t *testing.T) {
+	t.Parallel()
+
+	invocation := stageExecutionInvocation()
+	driverVersion := "580.1"
+	inventoryDigest := testStageDigest("inventory")
+	measurements := fmt.Sprintf(
+		`{"passed":true,"qualification":{"driverVersion":%q,"gpuInventoryDigest":%q,"visibleDevices":["gpu-index-0"],"coveredDevices":["gpu-index-0"]}}`,
+		driverVersion,
+		inventoryDigest,
+	)
+	encode := func(value string) string {
+		return base64.StdEncoding.EncodeToString([]byte(value))
+	}
+	logs := fmt.Sprintf(
+		"%s%s %s %s 0\n",
+		resultPrefix,
+		encode("Pass"),
+		encode("completed"),
+		encode(measurements),
+	)
+
+	envelope, err := parseInvocationResultLog(logs, invocation)
+	if err != nil {
+		t.Fatalf("parseInvocationResultLog() error = %v", err)
+	}
+
+	if envelope.Outcome != signalv1.InvocationOutcomePassed ||
+		len(envelope.Participants) != 1 ||
+		envelope.Participants[0].Start.DriverVersion != driverVersion ||
+		envelope.Participants[0].Start.GPUInventoryDigest != inventoryDigest ||
+		len(envelope.Measurements) != 1 ||
+		envelope.Measurements[0].Name != "passed" {
+		t.Fatalf("converted simple result = %#v", envelope)
 	}
 }

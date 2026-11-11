@@ -445,6 +445,18 @@ func TestDeriveResolvedExecutionPlanDigest(t *testing.T) {
 			},
 		},
 		{
+			name: "stage dependency",
+			mutate: func(_ *CertificationEnvironmentBindings, plan *ResolvedCertificationPlan, _ *ExecutionPlanProvenance) {
+				stage := plan.Phases[0].Stages[0].DeepCopy()
+				stage.Name = "post-validation"
+				stage.DependsOn = []StageDependency{{
+					Stage:     plan.Phases[0].Stages[0].Name,
+					Condition: StageDependencyConditionCompleted,
+				}}
+				plan.Phases[0].Stages = append(plan.Phases[0].Stages, *stage)
+			},
+		},
+		{
 			name: "parameter",
 			mutate: func(_ *CertificationEnvironmentBindings, plan *ResolvedCertificationPlan, _ *ExecutionPlanProvenance) {
 				plan.Phases[0].Stages[0].Parameters[0].Value = stringValue("other-model")

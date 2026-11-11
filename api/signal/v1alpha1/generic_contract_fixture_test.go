@@ -445,6 +445,11 @@ func TestFifteenScriptBaselineMapsToIndependentTests(t *testing.T) {
 				Expected: booleanValuePointer(true),
 			}},
 		}
+		if index > 0 {
+			stages[index].DependsOn = []StageDependency{{
+				Stage: stages[index-1].Name,
+			}}
+		}
 	}
 
 	suite := CertificationSuite{
@@ -475,6 +480,19 @@ func TestFifteenScriptBaselineMapsToIndependentTests(t *testing.T) {
 		want := fmt.Sprintf("baseline-%02d", index+1)
 		if stage.Name != want || stage.Test.Name != want {
 			t.Fatalf("baseline stage %d identity = %q/%q, want %q", index, stage.Name, stage.Test.Name, want)
+		}
+
+		if index == 0 {
+			if len(stage.DependsOn) != 0 {
+				t.Fatalf("baseline stage %d dependencies = %#v, want none", index, stage.DependsOn)
+			}
+
+			continue
+		}
+
+		if len(stage.DependsOn) != 1 ||
+			stage.DependsOn[0].Stage != fmt.Sprintf("baseline-%02d", index) {
+			t.Fatalf("baseline stage %d dependencies = %#v", index, stage.DependsOn)
 		}
 	}
 }

@@ -220,8 +220,8 @@ func TestRenderedGPUInventoryCatalogPinsSource(t *testing.T) {
 	output := renderSignal(t, signalRenderData())
 	documents := splitYAMLDocuments(string(readRenderedFile(t, output, "05-gpu-inventory-tests.yaml")))
 
-	if len(documents) != 3 {
-		t.Fatalf("GPU inventory documents = %d, want 3", len(documents))
+	if len(documents) != 2 {
+		t.Fatalf("GPU inventory documents = %d, want 2", len(documents))
 	}
 
 	var scripts corev1.ConfigMap
@@ -252,55 +252,51 @@ func TestRenderedGPUInventoryCatalogPinsSource(t *testing.T) {
 		t.Fatal("GPU inventory digest includes a trailing NUL separator")
 	}
 
-	for index, wantRole := range []string{"qualification", "compatibility-diagnostic"} {
-		var test unstructured.Unstructured
-		if err := yaml.Unmarshal([]byte(documents[index+1]), &test.Object); err != nil {
-			t.Fatalf("decode CertificationTest %d: %v", index, err)
-		}
+	var test unstructured.Unstructured
+	if err := yaml.Unmarshal([]byte(documents[1]), &test.Object); err != nil {
+		t.Fatalf("decode CertificationTest: %v", err)
+	}
 
-		if test.GetKind() != "CertificationTest" ||
-			test.GetLabels()["signal.unbounded-cloud.io/catalog-role"] != wantRole {
-			t.Fatalf("CertificationTest %d identity = %s/%v", index, test.GetKind(), test.GetLabels())
-		}
+	if test.GetKind() != "CertificationTest" ||
+		test.GetLabels()["signal.unbounded-cloud.io/catalog-role"] != "qualification" {
+		t.Fatalf("CertificationTest identity = %s/%v", test.GetKind(), test.GetLabels())
+	}
 
-		gotDigest, found, err := unstructured.NestedString(
-			test.Object,
-			"spec",
-			"driver",
-			"script",
-			"source",
-			"configMap",
-			"digest",
+	gotDigest, found, err := unstructured.NestedString(
+		test.Object,
+		"spec",
+		"driver",
+		"script",
+		"source",
+		"configMap",
+		"digest",
+	)
+	if err != nil || !found || gotDigest != scriptDigest {
+		t.Fatalf(
+			"CertificationTest script digest = %q, found %t, error %v, want %s",
+			gotDigest,
+			found,
+			err,
+			scriptDigest,
 		)
-		if err != nil || !found || gotDigest != scriptDigest {
-			t.Fatalf(
-				"CertificationTest %d script digest = %q, found %t, error %v, want %s",
-				index,
-				gotDigest,
-				found,
-				err,
-				scriptDigest,
-			)
-		}
+	}
 
-		gotGPU, found, err := unstructured.NestedString(
-			test.Object,
-			"spec",
-			"driver",
-			"script",
-			"resources",
-			"requests",
-			"nvidia.com/gpu",
+	gotGPU, found, err := unstructured.NestedString(
+		test.Object,
+		"spec",
+		"driver",
+		"script",
+		"resources",
+		"requests",
+		"nvidia.com/gpu",
+	)
+	if err != nil || !found || gotGPU != "8" {
+		t.Fatalf(
+			"CertificationTest GPU request = %q, found %t, error %v, want 8",
+			gotGPU,
+			found,
+			err,
 		)
-		if err != nil || !found || gotGPU != "8" {
-			t.Fatalf(
-				"CertificationTest %d GPU request = %q, found %t, error %v, want 8",
-				index,
-				gotGPU,
-				found,
-				err,
-			)
-		}
 	}
 }
 
@@ -796,7 +792,7 @@ func TestVLLMModelCacheSeedFailsClosedWithoutImmutableInputs(t *testing.T) {
 	}
 }
 
-func TestRenderedAcceptanceSuitesSeparateQualificationDiagnosticsAndVLLM(t *testing.T) {
+func TestRenderedAcceptanceSuitesIncludeQualificationAndVLLM(t *testing.T) {
 	t.Parallel()
 
 	data := signalRenderData()
@@ -804,9 +800,6 @@ func TestRenderedAcceptanceSuitesSeparateQualificationDiagnosticsAndVLLM(t *test
 	data["GPUInventoryTestUID"] = "11111111-1111-1111-1111-111111111111"
 	data["GPUInventoryTestGeneration"] = "1"
 	data["GPUInventoryTestContentDigest"] = testDigest
-	data["GPUCompatTestUID"] = "22222222-2222-2222-2222-222222222222"
-	data["GPUCompatTestGeneration"] = "2"
-	data["GPUCompatTestContentDigest"] = testDigest
 	data["VLLMCanaryEnabled"] = "true"
 	data["VLLMCanaryImage"] = "example.invalid/vllm-canary@sha256:" + strings.Repeat("f", 64)
 	data["VLLMCanaryCPU"] = "4"
@@ -825,8 +818,8 @@ func TestRenderedAcceptanceSuitesSeparateQualificationDiagnosticsAndVLLM(t *test
 	output := renderSignal(t, data)
 	documents := splitYAMLDocuments(string(readRenderedFile(t, output, "10-acceptance-suites.yaml")))
 
-	if len(documents) != 3 {
-		t.Fatalf("acceptance Suite documents = %d, want 3", len(documents))
+	if len(documents) != 2 {
+		t.Fatalf("acceptance Suite documents = %d, want 2", len(documents))
 	}
 
 	var baseline unstructured.Unstructured
@@ -839,8 +832,7 @@ func TestRenderedAcceptanceSuitesSeparateQualificationDiagnosticsAndVLLM(t *test
 		t.Fatalf("baseline phases = %d, found %t, error %v, want 1", len(baselinePhases), found, err)
 	}
 
-	if strings.Count(documents[0], "name: project-signal-gpu-inventory-v1") != 1 ||
-		strings.Contains(documents[0], "project-signal-gpu-inventory-compat-v1") {
+	if strings.Count(documents[0], "name: project-signal-gpu-inventory-v1") != 1 {
 		t.Fatal("baseline Suite must contain exactly one canonical qualification Test")
 	}
 
@@ -849,36 +841,7 @@ func TestRenderedAcceptanceSuitesSeparateQualificationDiagnosticsAndVLLM(t *test
 		t.Fatal("baseline Suite must require a consistent driver version")
 	}
 
-	var compatibility unstructured.Unstructured
-	if err := yaml.Unmarshal([]byte(documents[1]), &compatibility.Object); err != nil {
-		t.Fatalf("decode compatibility Suite: %v", err)
-	}
-
-	compatibilityPhases, found, err := unstructured.NestedSlice(
-		compatibility.Object,
-		"spec",
-		"phases",
-	)
-	if err != nil || !found || len(compatibilityPhases) != 15 {
-		t.Fatalf(
-			"compatibility phases = %d, found %t, error %v, want 15 ordered diagnostics",
-			len(compatibilityPhases),
-			found,
-			err,
-		)
-	}
-
-	if !strings.Contains(documents[1], "project-signal-gpu-inventory-compat-v1") ||
-		strings.Contains(documents[1], "name: project-signal-gpu-inventory-v1") {
-		t.Fatal("compatibility Suite must reference only the diagnostic compatibility Test")
-	}
-
-	if strings.Count(documents[1], "metric: driverVersionSet") != 15 ||
-		strings.Count(documents[1], "stringValue: consistent") != 15 {
-		t.Fatal("every compatibility diagnostic must require a consistent driver version")
-	}
-
-	vllmText := documents[2]
+	vllmText := documents[1]
 	for _, metric := range []string{
 		"serviceReady",
 		"modelIdentity",
@@ -919,8 +882,8 @@ func TestRenderedExecutionAuthorityIsExplicitAndFailClosed(t *testing.T) {
 	output := renderSignal(t, data)
 
 	documents := splitYAMLDocuments(string(readRenderedFile(t, output, "11-execution-authority.yaml")))
-	if len(documents) != 9 {
-		t.Fatalf("execution authority documents = %d, want 9", len(documents))
+	if len(documents) != 8 {
+		t.Fatalf("execution authority documents = %d, want 8", len(documents))
 	}
 
 	text := strings.Join(documents, "\n---\n")
@@ -955,11 +918,6 @@ func TestRenderedExecutionAuthorityIsExplicitAndFailClosed(t *testing.T) {
 		`"value": "false"`,
 	)
 
-	policy := documents[8]
-	if strings.Contains(policy, "project-signal-gpu-compat-8x-v1") {
-		t.Fatal("compatibility diagnostics must grant zero Policy credit")
-	}
-
 	deployment := string(readRenderedFile(t, output, "06-deployment.yaml"))
 	assertContainsAll(
 		t,
@@ -980,8 +938,8 @@ func TestRenderedBaselineOnlyAuthorityOmitsVLLM(t *testing.T) {
 	authority := string(readRenderedFile(t, output, "11-execution-authority.yaml"))
 
 	documents := splitYAMLDocuments(authority)
-	if len(documents) != 8 {
-		t.Fatalf("baseline-only authority documents = %d, want 8", len(documents))
+	if len(documents) != 7 {
+		t.Fatalf("baseline-only authority documents = %d, want 7", len(documents))
 	}
 
 	entries, err := os.ReadDir(output)
@@ -1188,9 +1146,6 @@ func TestRenderedVLLMAcceptanceFailsClosedWithoutExactModelProvenance(t *testing
 			data["GPUInventoryTestUID"] = "11111111-1111-1111-1111-111111111111"
 			data["GPUInventoryTestGeneration"] = "1"
 			data["GPUInventoryTestContentDigest"] = testDigest
-			data["GPUCompatTestUID"] = "22222222-2222-2222-2222-222222222222"
-			data["GPUCompatTestGeneration"] = "2"
-			data["GPUCompatTestContentDigest"] = testDigest
 			data["VLLMCanaryEnabled"] = "true"
 			data["VLLMCanaryImage"] = "example.invalid/vllm-canary@sha256:" + strings.Repeat("f", 64)
 			data["VLLMCanaryCPU"] = "4"
@@ -1821,9 +1776,6 @@ func enableBaselineExecutionAuthorityRender(data map[string]string) {
 	data["GPUInventoryTestUID"] = "11111111-1111-1111-1111-111111111111"
 	data["GPUInventoryTestGeneration"] = "1"
 	data["GPUInventoryTestContentDigest"] = testDigest
-	data["GPUCompatTestUID"] = "22222222-2222-2222-2222-222222222222"
-	data["GPUCompatTestGeneration"] = "1"
-	data["GPUCompatTestContentDigest"] = testDigest
 }
 
 func renderSignal(t *testing.T, data map[string]string) string {

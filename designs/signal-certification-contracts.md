@@ -7,7 +7,7 @@ bindings, immutable Run plans, durable invocation results, and qualification
 policy.
 
 - `CertificationTest` defines what one logical test executes and measures.
-- `CertificationSuite` composes approved test identities into ordered phases.
+- `CertificationSuite` composes approved test identities into a dependency DAG.
   Stages in one phase may execute concurrently.
 - `CertificationProfile` selects participants and binds environment resources.
 - `CertificationRun` freezes the selected Suite, Profile, test definitions,
@@ -54,7 +54,8 @@ name. A later test generation requires a new approval decision.
 
 ## Suites and scheduling
 
-New Suites use ordered phases with operator-named stages. Startup and Terminal
+New Suites use operator-named stages with explicit dependencies. Phases remain
+as compatibility barriers for stages that omit `dependsOn`. Startup and Terminal
 phases contain only `RunOnce` stages. Validation phases may contain `RunOnce`,
 `Continuous`, or `Periodic` stages.
 
@@ -86,7 +87,7 @@ the complete plan:
 - Test name, UID, generation, content digest, and trust state.
 - Driver source, image, template, and runner digests.
 - Typed parameter values and declarative assertions.
-- Ordered phases, concurrent stages, schedules, retries, and topology.
+- Stage dependencies, compatibility phases, schedules, retries, and topology.
 - Profile environment bindings and participant role assignment.
 - Mutable authoring requests and their immutable resolutions.
 - Controller, adapter, resolver, runner, and workflow provenance.

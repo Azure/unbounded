@@ -255,6 +255,40 @@ func TestBuildResolvedWorkflowOrdersPhasesAndConcurrentStages(t *testing.T) {
 	}
 }
 
+func TestBuildResolvedWorkflowUsesExplicitStageDependencies(t *testing.T) {
+	t.Parallel()
+
+	run := resolvedWorkflowTestRun()
+	run.Spec.ResolvedPlan.Phases[1].Stages[0].DependsOn = []signalv1.StageDependency{{
+		Stage:     "prepare",
+		Condition: signalv1.StageDependencyConditionCompleted,
+	}}
+
+	workflow, err := buildWorkflow(run)
+	if err != nil {
+		t.Fatalf("buildWorkflow() error = %v", err)
+	}
+
+	templates, found, err := unstructured.NestedSlice(workflow.Object, "spec", "templates")
+	if err != nil || !found {
+		t.Fatalf("workflow templates missing: found %t, error %v", found, err)
+	}
+
+	tasks := templates[0].(map[string]any)["dag"].(map[string]any)["tasks"].([]any)
+	prepareName := tasks[0].(map[string]any)["name"].(string)
+	depends := tasks[2].(map[string]any)["depends"].(string)
+
+	for _, terminal := range []string{"Succeeded", "Failed", "Errored", "Skipped", "Omitted"} {
+		if !strings.Contains(depends, prepareName+"."+terminal) {
+			t.Fatalf("explicit dependency = %q, missing %s", depends, terminal)
+		}
+	}
+
+	if strings.Contains(depends, tasks[1].(map[string]any)["name"].(string)) {
+		t.Fatalf("explicit dependency unexpectedly includes the previous phase barrier: %q", depends)
+	}
+}
+
 func TestValidateSourcePhasesStageLimit(t *testing.T) {
 	t.Parallel()
 
@@ -284,6 +318,69 @@ func TestValidateSourcePhasesStageLimit(t *testing.T) {
 	if err := validateSourcePhases(phaseWithStages(signalv1.MaxCertificationStages + 1)); err == nil {
 		t.Fatal("over-limit stage plan was accepted")
 	}
+}
+
+func TestValidateSourcePhasesDependencies(t *testing.T) {
+	t.Parallel()
+
+	stage := func(name string, dependencies ...string) signalv1.CertificationStage {
+		result := signalv1.CertificationStage{
+			Name: name,
+			Schedule: signalv1.StageSchedule{
+				Mode:              signalv1.CheckExecutionModeRunOnce,
+				InvocationTimeout: metav1.Duration{Duration: time.Minute},
+			},
+		}
+		for _, dependency := range dependencies {
+			result.DependsOn = append(result.DependsOn, signalv1.StageDependency{Stage: dependency})
+		}
+
+		return result
+	}
+
+	t.Run("valid DAG", func(t *testing.T) {
+		t.Parallel()
+
+		phases := []signalv1.CertificationPhase{{
+			Name:   "validation",
+			Role:   signalv1.CheckStageRoleValidation,
+			Stages: []signalv1.CertificationStage{stage("inventory"), stage("burn", "inventory")},
+		}}
+		if err := validateSourcePhases(phases); err != nil {
+			t.Fatalf("validateSourcePhases() error = %v", err)
+		}
+	})
+
+	t.Run("missing dependency", func(t *testing.T) {
+		t.Parallel()
+
+		phases := []signalv1.CertificationPhase{{
+			Name:   "validation",
+			Role:   signalv1.CheckStageRoleValidation,
+			Stages: []signalv1.CertificationStage{stage("burn", "inventory")},
+		}}
+		if err := validateSourcePhases(phases); err == nil ||
+			!strings.Contains(err.Error(), "does not exist") {
+			t.Fatalf("validateSourcePhases() error = %v, want missing dependency", err)
+		}
+	})
+
+	t.Run("cycle", func(t *testing.T) {
+		t.Parallel()
+
+		phases := []signalv1.CertificationPhase{{
+			Name: "validation",
+			Role: signalv1.CheckStageRoleValidation,
+			Stages: []signalv1.CertificationStage{
+				stage("inventory", "burn"),
+				stage("burn", "inventory"),
+			},
+		}}
+		if err := validateSourcePhases(phases); err == nil ||
+			!strings.Contains(err.Error(), "cycle") {
+			t.Fatalf("validateSourcePhases() error = %v, want cycle", err)
+		}
+	})
 }
 
 func TestValidateStageEvidenceSummaryBoundaries(t *testing.T) {

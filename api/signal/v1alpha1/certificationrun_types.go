@@ -243,7 +243,11 @@ type ResolvedStagePlan struct {
 	ParticipantRoles []ResolvedStageParticipantRoleBinding `json:"participantRoles,omitempty"`
 	Schedule         StageSchedule                         `json:"schedule"`
 	Retry            *StageRetryPolicy                     `json:"retry,omitempty"`
-	Optional         bool                                  `json:"optional,omitempty"`
+	// +kubebuilder:validation:MaxItems=16
+	// +listType=map
+	// +listMapKey=stage
+	DependsOn []StageDependency `json:"dependsOn,omitempty"`
+	Optional  bool              `json:"optional,omitempty"`
 	// +kubebuilder:validation:MaxItems=16
 	// +listType=map
 	// +listMapKey=name

@@ -74,14 +74,11 @@ resolver images when external input resolution is part of the accepted plan.
 Those images are recorded in immutable plan and evidence provenance.
 
 Rendering also installs an immutable `project-signal-gpu-inventory-v1` script
-ConfigMap and two catalog entries:
+ConfigMap and one canonical catalog entry:
 
 - `project-signal-gpu-inventory-v1` is the single canonical qualification
   test after an operator records an `Approved` trust decision for its exact
   generation and content digest.
-- `project-signal-gpu-inventory-compat-v1` is compatibility-only and must
-  receive `Diagnostic` trust. R01 through R15 may reference it to preserve
-  legacy names and order, but those stages receive no qualification credit.
 
 The renderer independently hashes the exact ConfigMap script bytes and fails
 when they do not match `SIGNAL_GPU_INVENTORY_SCRIPT_DIGEST`.
@@ -130,10 +127,11 @@ A phase-based Suite is an ordered execution plan:
 
 | Field | Meaning |
 |---|---|
-| `spec.phases` | Ordered phases; Startup must be first and Terminal must be last |
+| `spec.phases` | Ordered compatibility barriers; Startup must be first and Terminal must be last |
 | `phase.role` | `Startup`, `Validation`, or `Terminal` |
-| `phase.stages` | Named stages that execute concurrently within the phase |
+| `phase.stages` | Globally named Signal steps |
 | `stage.test` | Exact Test name, UID, generation, and accepted content digest |
+| `stage.dependsOn` | Optional explicit DAG dependencies with `Succeeded` or `Completed` gates |
 | `stage.schedule` | `RunOnce`, `Continuous`, or `Periodic` execution contract |
 | `stage.assertions` | Typed assertions over metrics declared by the referenced Test |
 | `stage.retry` | Optional retry of infrastructure failures only |
@@ -143,6 +141,40 @@ declare repeated-execution fields. `Continuous` and `Periodic` additionally
 require a positive coverage window, minimum execution count, and maximum gap.
 `Periodic` also requires an interval. Startup and Terminal stages must use
 `RunOnce`.
+
+Stages without `dependsOn` retain the compatibility behavior: first-phase
+stages start immediately and later-phase stages wait for every stage in the
+previous phase. A stage with explicit dependencies waits only for those named
+stages. `Succeeded` is the default gate. `Completed` admits any terminal
+dependency outcome and is intended for bounded cleanup, evidence, and
+diagnostic steps. Stage names are unique across the Suite, missing or duplicate
+dependencies are rejected, and dependency cycles fail admission.
+
+For example, a private catalog can compose a shell preflight, an independent
+burn step, and a container or WorkflowTemplate serving test without putting
+their implementation in this repository:
+
+```yaml
+spec:
+  phases:
+    - name: validation
+      role: Validation
+      stages:
+        - name: inventory
+          test: {name: private-inventory-v1, uid: <uid>, generation: 1, contentDigest: sha256:<digest>}
+          schedule: {mode: RunOnce, invocationTimeout: 2m}
+        - name: burn
+          dependsOn:
+            - stage: inventory
+          test: {name: private-burn-v1, uid: <uid>, generation: 1, contentDigest: sha256:<digest>}
+          schedule: {mode: RunOnce, invocationTimeout: 30m}
+        - name: serving
+          dependsOn:
+            - stage: burn
+            - stage: inventory
+          test: {name: private-serving-v1, uid: <uid>, generation: 1, contentDigest: sha256:<digest>}
+          schedule: {mode: RunOnce, invocationTimeout: 20m}
+```
 
 The adapter owns repeated invocation scheduling. An interruption never
 silently resumes or aggregates prior activity into a new qualification window.
@@ -171,7 +203,22 @@ the same source cannot create independent qualification evidence.
 - **Script:** uses an immutable ConfigMap, OCI artifact, or Git commit plus an
   exact source digest, digest-pinned runner image, and explicit resource
   requirements. The current Kubernetes executor supports immutable ConfigMap
-  script sources.
+  script sources. A script may either emit the full canonical invocation
+  envelope or use the simpler file contract:
+  - write `Pass`, `Fail`, or `Inconclusive` to
+    `$PROJECT_SIGNAL_RESULTS_DIR/verdict`;
+  - write a bounded non-empty reason to
+    `$PROJECT_SIGNAL_RESULTS_DIR/reason`;
+  - optionally write a JSON metric map to
+    `$PROJECT_SIGNAL_RESULTS_DIR/measurements.json`; and
+  - exit with `0`, `1`, or `2`, matching the verdict.
+
+  The trusted adapter converts the simple result into the canonical invocation
+  envelope and supplies the Run, stage, Test, plan, participant, timing, and
+  cleanup identity. Qualification scripts include the reserved
+  `qualification` measurement object with driver version, GPU inventory digest,
+  visible devices, and covered devices; the adapter removes that object from
+  ordinary typed metrics and records it as participant evidence.
 - **Container:** uses a digest-pinned image with bounded command, arguments,
   resources, and reviewed security requirements.
 - **WorkflowTemplate:** uses an approved name and semantic SHA-256 digest. At
@@ -202,9 +249,8 @@ kubectl patch certificationtest "$test_name" --subresource=status --type=merge \
   -p "{\"status\":{\"observedGeneration\":${generation},\"trust\":{\"state\":\"Approved\",\"contentDigest\":\"${content_digest}\",\"reason\":\"reviewed immutable qualification test\"}}}"
 ```
 
-Use `Diagnostic`, not `Approved`, for
-`project-signal-gpu-inventory-compat-v1`. A new Test generation invalidates
-the prior trust decision until it is reviewed again.
+A new Test generation invalidates the prior trust decision until it is
+reviewed again.
 
 ### Legacy compatibility
 
@@ -212,12 +258,11 @@ Legacy `spec.scriptBundle` plus `spec.checks` remains readable and executable
 for migration. A Suite must use exactly one model: phases or legacy checks.
 Do not create new qualification definitions with the legacy model.
 
-The prior R01 through R15 baseline used 15 byte-identical copies of one GPU
-inventory script. Migration preserves those names only as ordered diagnostic
-stages referencing `project-signal-gpu-inventory-compat-v1`. The qualification
-Suite contains one separate stage referencing the canonical
-`project-signal-gpu-inventory-v1` Test. The compatibility stages must not be
-represented as 15 independent tests or credited 15 times.
+Team-owned R01 through R15 scripts belong in private, digest-pinned
+`CertificationTest` resources and a private Suite DAG. They must not be copied
+into the public Project Signal package or represented by repeated placeholder
+tests. Each independently meaningful script is one Test; the Suite binds its
+parameters, dependencies, schedule, retry policy, and typed assertions.
 
 Suite edits affect only future Runs.
 
@@ -230,20 +275,16 @@ make signal-manifests \
   SIGNAL_ACCEPTANCE_SUITES_ENABLED=true \
   SIGNAL_GPU_INVENTORY_TEST_UID=<live-uid> \
   SIGNAL_GPU_INVENTORY_TEST_GENERATION=<live-generation> \
-  SIGNAL_GPU_INVENTORY_TEST_CONTENT_DIGEST=sha256:<reviewed-spec-digest> \
-  SIGNAL_GPU_COMPAT_TEST_UID=<live-uid> \
-  SIGNAL_GPU_COMPAT_TEST_GENERATION=<live-generation> \
-  SIGNAL_GPU_COMPAT_TEST_CONTENT_DIGEST=sha256:<reviewed-spec-digest>
+  SIGNAL_GPU_INVENTORY_TEST_CONTENT_DIGEST=sha256:<reviewed-spec-digest>
 ```
 
-This renders separate `project-signal-gpu-baseline-v1` and
-`project-signal-gpu-compat-v1` Suites. The baseline has one qualification
-stage. The compatibility Suite has 15 ordered diagnostic phases so R01 through
-R15 remain sequential without creating duplicate qualification credit.
+This renders the public `project-signal-gpu-baseline-v1` Suite. Private
+certification catalogs render their own Tests and Suite DAGs against the same
+API.
 Environment-specific Profiles are not rendered by the static package because
 their participant selectors, namespaces, storage, network, and resolver inputs
 must be reviewed at cutover. The separate execution-authority overlay renders
-only the reviewed baseline, compatibility-diagnostic, and vLLM Profiles.
+only the reviewed baseline and vLLM Profiles that are explicitly enabled.
 
 ## CertificationProfile contract
 
@@ -842,9 +883,9 @@ and release before any CRD or controller replacement:
    record must contain Test name, UID, generation, and reviewed content digest;
    a stale generation must not remain trusted.
 10. Create the canonical GPU inventory Suite with one qualification stage.
-   Preserve R01-R15 only in a separate compatibility Suite using Diagnostic
-   trust. Mechanically verify that no qualification Suite or Policy references
-   R01-R15 and that the ledger receives exactly one canonical Test credit.
+    Install team-owned certification DAGs from their private catalogs and
+    verify that each independently meaningful step references its own reviewed
+    Test identity and immutable artifact digest.
 11. Run the GPU inventory baseline and vLLM acceptance as separate Runs.
    Independently recompute Test, source, image, WorkflowTemplate, plan, and
    evidence digests from the live objects before accepting either result.

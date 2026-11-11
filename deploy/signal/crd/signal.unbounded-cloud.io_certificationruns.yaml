@@ -951,6 +951,32 @@ spec:
                                 x-kubernetes-list-map-keys:
                                 - name
                                 x-kubernetes-list-type: map
+                              dependsOn:
+                                items:
+                                  properties:
+                                    condition:
+                                      description: |-
+                                        Condition defaults to Succeeded. Completed allows terminal cleanup or
+                                        evidence stages to run after any terminal dependency outcome.
+                                      enum:
+                                      - Succeeded
+                                      - Completed
+                                      type: string
+                                    stage:
+                                      description: Stage is the stable name of another
+                                        stage in this Suite.
+                                      maxLength: 63
+                                      minLength: 1
+                                      pattern: ^[a-z]([-a-z0-9]*[a-z0-9])?$
+                                      type: string
+                                  required:
+                                  - stage
+                                  type: object
+                                maxItems: 16
+                                type: array
+                                x-kubernetes-list-map-keys:
+                                - stage
+                                x-kubernetes-list-type: map
                               diagnosticOnly:
                                 type: boolean
                               displayName:
@@ -2431,7 +2457,7 @@ spec:
                                     fail with a reason
                                   rule: has(self.actual) || (!self.passed && has(self.message)
                                     && size(self.message.trim()) > 0)
-                              maxItems: 16
+                              maxItems: 8
                               type: array
                               x-kubernetes-list-map-keys:
                               - name
@@ -2676,7 +2702,7 @@ spec:
                                 - start
                                 - verdict
                                 type: object
-                              maxItems: 8
+                              maxItems: 16
                               type: array
                               x-kubernetes-list-map-keys:
                               - index

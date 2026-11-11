@@ -610,6 +610,34 @@ spec:
                             x-kubernetes-list-map-keys:
                             - name
                             x-kubernetes-list-type: map
+                          dependsOn:
+                            description: DependsOn overrides the default previous-phase
+                              barrier for this stage.
+                            items:
+                              properties:
+                                condition:
+                                  description: |-
+                                    Condition defaults to Succeeded. Completed allows terminal cleanup or
+                                    evidence stages to run after any terminal dependency outcome.
+                                  enum:
+                                  - Succeeded
+                                  - Completed
+                                  type: string
+                                stage:
+                                  description: Stage is the stable name of another
+                                    stage in this Suite.
+                                  maxLength: 63
+                                  minLength: 1
+                                  pattern: ^[a-z]([-a-z0-9]*[a-z0-9])?$
+                                  type: string
+                              required:
+                              - stage
+                              type: object
+                            maxItems: 16
+                            type: array
+                            x-kubernetes-list-map-keys:
+                            - stage
+                            x-kubernetes-list-type: map
                           displayName:
                             maxLength: 128
                             type: string

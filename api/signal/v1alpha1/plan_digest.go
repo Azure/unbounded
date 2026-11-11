@@ -143,6 +143,10 @@ func DeriveResolvedExecutionPlanDigest(
 		}
 	}
 
+	if _, err := resolvedStageDependencyGraph(plan.Phases); err != nil {
+		return "", fmt.Errorf("resolved stage dependencies are invalid: %w", err)
+	}
+
 	for phaseIndex := range plan.Phases {
 		if len(plan.Phases[phaseIndex].Stages) == 0 {
 			return "", fmt.Errorf("phase %d must contain at least one stage", phaseIndex)
@@ -387,6 +391,9 @@ func canonicalizeResolvedPlan(plan ResolvedCertificationPlan) *ResolvedCertifica
 				})
 			}
 
+			sort.Slice(stage.DependsOn, func(left, right int) bool {
+				return stage.DependsOn[left].Stage < stage.DependsOn[right].Stage
+			})
 			sort.Slice(stage.Assertions, func(left, right int) bool {
 				return stage.Assertions[left].Name < stage.Assertions[right].Name
 			})
