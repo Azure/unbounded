@@ -2232,6 +2232,8 @@ Fix, on caches with writes only (read-only caches are unchanged):
 - Pages (`CandidatePolicy::written_copy`, `read/fill.rs`): after any origin
   failure other than a credential rejection, the node probes the same owner
   sets copy-only for the page and serves a validated copy as the fill result.
+  It first releases the unused origin-encryption Ciphertext reservation, since
+  peer reception reserves its own page from the same budget.
 - Both use a fresh probe budget under the request deadline. A forwarded
   acquisition often reaches this point with its hop budget spent, and
   copy-only probes never forward, so they cannot loop.
