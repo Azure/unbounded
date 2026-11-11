@@ -211,8 +211,19 @@ file `<racer_content_root>/blobs/sha256/<hex>`.
   and a local page for the same ETag carry the same Racer content type.
 - A local-only request never contacts the registry and ignores the
   credential. Normal requests always use the registry.
-- containerd verifies a blob before it commits it, so local pages are not
-  re-hashed per page.
+- containerd verifies a blob before it commits it, but the file can later rot
+  or be altered. Gantry hashes each file once before it serves the file's
+  first local page (`internal/gantry/racer/replica.go`). Results are cached
+  by file identity (digest, device, inode, size, mtime, ctime; at most 4096
+  entries, oldest evicted first), so pages are not re-hashed per request.
+  Hashes run in the background, at most 2 at a time and 256 queued; a
+  request whose context ends first (Racer's local probe allows 2s) is a
+  miss, and a later request uses the finished result. A corrupt file is a
+  miss until its identity changes, which lets Racer fall through to peers or
+  the registry instead of re-reading the same bad bytes after `Invalidate`.
+  Every node checks its own files, so this also covers remote owners and
+  holders. Each hash counts in
+  `gantry_racer_local_replica_verifications_total{result}`.
 
 ### Gantry: digest verification
 
@@ -227,7 +238,10 @@ On a mismatch Gantry:
 2. counts `gantry_racer_mirror_digest_mismatches_total`,
 3. calls `Invalidate` for the version (5s budget, best effort), so a retry
    refills from other sources or the registry
-   (`cmd/gantry/agent_racer.go`, `racer.WithInvalidator`).
+   (`cmd/gantry/agent_racer.go`, `racer.WithInvalidator`),
+4. drops this node's local replica verification result for the digest, so
+   the containerd file is hashed again before it is served
+   (`racer.WithLocalReplicaReset`).
 
 Ranged responses (offset > 0) are not hashed here. containerd checks the
 digest when it commits the blob.
@@ -295,6 +309,7 @@ node A's content store instead of the registry.
 | owner node lost | Racer ranks the next owner, which fills the same way |
 | containerd GC removes a blob | the next local-only request misses; an open file stays readable until closed (inference: Linux unlink semantics) |
 | bad bytes from any source | digest mismatch; connection aborted; `Invalidate`; containerd retries |
+| corrupt containerd file on any node | that node's Gantry hash fails; file quarantined (local miss) until replaced |
 | registry 401 on fill at the owner | Racer returns unauthorized; Gantry answers 401 with challenge |
 | tag request | unchanged; containerd resolves upstream |
 
@@ -305,7 +320,8 @@ node A's content store instead of the registry.
   `racer_invalidate_{requests,rejected,truncated}_total`,
   `racer_invalidate_peer_{requests,failures,served}_total`
   (`cmd/racer/src/telemetry/metrics.rs`).
-- Gantry: `gantry_racer_mirror_digest_mismatches_total`.
+- Gantry: `gantry_racer_mirror_digest_mismatches_total`,
+  `gantry_racer_local_replica_verifications_total{result}`.
 
 ## Memory budgeting
 

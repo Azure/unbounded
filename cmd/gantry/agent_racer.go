@@ -72,10 +72,14 @@ func serveRacerAgent(ctx context.Context, c *config.Config, logger *slog.Logger,
 		return fmt.Errorf("racer origin client: %w", err)
 	}
 
+	replicas := racer.NewReplicaVerifier(logger, telemetry.LocalReplicaVerification)
+
 	originOptions, err := racerOriginOptions(c)
 	if err != nil {
 		return err
 	}
+
+	originOptions = append(originOptions, racer.WithReplicaVerifier(replicas))
 
 	// Signal cancellation starts draining; cancelOrigin runs after HTTP drain.
 	originCtx, cancelOrigin := context.WithCancel(context.WithoutCancel(ctx))
@@ -93,7 +97,7 @@ func serveRacerAgent(ctx context.Context, c *config.Config, logger *slog.Logger,
 	// retain Racer correlation headers and rate-limited failure diagnostics.
 	mirrorSrv := mirror.New(c, nil, originClient,
 		mirror.WithContentBackend(racer.NewHandler(deps.client, originClient, logger, racer.WithRetryBudget(c.RacerRetryBudget), racer.WithRetryObserver(telemetry.MirrorRetry), racer.WithAccessCheck(originClient),
-			racer.WithInvalidator(deps.client), racer.WithDigestMismatchObserver(telemetry.DigestMismatch))), mirror.WithLogger(logger), mirror.WithStartupReadinessGate())
+			racer.WithInvalidator(deps.client), racer.WithDigestMismatchObserver(telemetry.DigestMismatch), racer.WithLocalReplicaReset(replicas))), mirror.WithLogger(logger), mirror.WithStartupReadinessGate())
 
 	var (
 		ready   atomic.Bool

@@ -53,7 +53,8 @@ func (c contentStore) Open(d string) (LocalBlob, int64, error) {
 type OriginOption func(*originOptions)
 
 type originOptions struct {
-	local LocalStore
+	local    LocalStore
+	verifier *ReplicaVerifier
 	// localOnly is isLocalOnly unless a test overrides it.
 	localOnly func(racersdk.OriginRequest) bool
 }
@@ -63,6 +64,12 @@ type originOptions struct {
 // Racer issues when the ClusterCache keeps no copy of its own.
 func WithLocalStore(store LocalStore) OriginOption {
 	return func(o *originOptions) { o.local = store }
+}
+
+// WithReplicaVerifier shares v with the mirror Handler (see
+// WithLocalReplicaReset). Without it, Origin uses a private verifier.
+func WithReplicaVerifier(v *ReplicaVerifier) OriginOption {
+	return func(o *originOptions) { o.verifier = v }
 }
 
 // isLocalOnly reports whether Racer asked for a page from local storage only.
@@ -83,10 +90,11 @@ func localMiss(err error) error {
 // consistent across a pinned version. A local-only request never reaches the
 // registry, and every local failure becomes ErrNotFound.
 //
-// Containerd verifies a blob's digest before committing it under that digest,
-// so local bytes are trusted as content-addressed and not re-hashed per page.
-// The mirror verifies whole objects as it streams them to containerd.
-func serveLocal(ctx context.Context, store LocalStore, ref ifaces.OriginRef, request racersdk.OriginRequest, localOnly bool) (racersdk.Metadata, io.ReadCloser, bool, error) {
+// Containerd verifies a blob's digest before committing it, but the file can
+// later rot or be altered. verifier hashes each file once before its first
+// page is served; an unverified file whose hash does not finish before ctx
+// ends, or a corrupt one, is a miss.
+func serveLocal(ctx context.Context, store LocalStore, verifier *ReplicaVerifier, ref ifaces.OriginRef, request racersdk.OriginRequest, localOnly bool) (racersdk.Metadata, io.ReadCloser, bool, error) {
 	if !localOnly {
 		return racersdk.Metadata{}, nil, false, nil
 	}
@@ -113,8 +121,22 @@ func serveLocal(ctx context.Context, store LocalStore, ref ifaces.OriginRef, req
 		return miss(err)
 	}
 
+	if size < 0 {
+		_ = blob.Close() //nolint:errcheck // best-effort close on a miss
+
+		return miss(errors.New("unusable local object"))
+	}
+
+	if verifier != nil {
+		if err := verifier.check(ctx, store, ref.Digest.String(), blob, size); err != nil {
+			_ = blob.Close() //nolint:errcheck // best-effort close on a miss
+
+			return miss(err)
+		}
+	}
+
 	contentType, err := localContentType(ref.Kind, blob, size)
-	if err != nil || size < 0 {
+	if err != nil {
 		_ = blob.Close() //nolint:errcheck // best-effort close on a miss
 
 		return miss(errors.Join(err, errors.New("unusable local object")))

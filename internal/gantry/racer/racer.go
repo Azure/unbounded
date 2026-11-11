@@ -162,6 +162,10 @@ func Origin(cfg *config.Config, source upstream, opts ...OriginOption) racersdk.
 		opt(&options)
 	}
 
+	if options.local != nil && options.verifier == nil {
+		options.verifier = NewReplicaVerifier(nil, nil)
+	}
+
 	registries := make(map[string]bool)
 
 	if cfg != nil {
@@ -200,7 +204,7 @@ func Origin(cfg *config.Config, source upstream, opts ...OriginOption) racersdk.
 			return racersdk.Metadata{}, nil, classifyError(err)
 		}
 
-		metadata, body, handled, err := serveLocal(ctx, options.local, ref, request, options.localOnly(request))
+		metadata, body, handled, err := serveLocal(ctx, options.local, options.verifier, ref, request, options.localOnly(request))
 		if handled {
 			return metadata, body, err
 		}
@@ -469,6 +473,7 @@ type Handler struct {
 	access      *accessChecker
 	invalidator Invalidator
 	onMismatch  func()
+	replicas    *ReplicaVerifier
 }
 
 // HandlerOption configures optional Handler behavior.
@@ -1439,6 +1444,7 @@ type Metrics struct {
 	originBodyBytes *prometheus.CounterVec
 	retries         *prometheus.CounterVec
 	mismatches      prometheus.Counter
+	replicaChecks   *prometheus.CounterVec
 }
 
 // NewMetrics registers mirror and origin metrics.
@@ -1451,6 +1457,7 @@ func NewMetrics(reg *metrics.Registry) *Metrics {
 		originBodyBytes: reg.NewCounterVec("racer", prometheus.CounterOpts{Name: "gantry_racer_origin_bytes_total", Help: "Upstream GET body bytes read, including partial transfers."}, []string{"kind"}),
 		retries:         reg.NewCounterVec("racer", prometheus.CounterOpts{Name: "gantry_racer_mirror_retries_total", Help: "Racer mirror retries of transient failures by stage (stat, get, write_body)."}, []string{"stage"}),
 		mismatches:      reg.NewCounter("racer", prometheus.CounterOpts{Name: "gantry_racer_mirror_digest_mismatches_total", Help: "Full Racer mirror responses aborted because the bytes did not match the digest."}),
+		replicaChecks:   reg.NewCounterVec("racer", prometheus.CounterOpts{Name: "gantry_racer_local_replica_verifications_total", Help: "Containerd blob hashes before serving them to Racer, by result (verified, corrupt, error)."}, []string{"result"}),
 	}
 
 	return m
@@ -1503,6 +1510,11 @@ func (m *Metrics) MirrorRetry(stage string) {
 // DigestMismatch records one full response aborted by digest verification.
 func (m *Metrics) DigestMismatch() {
 	m.mismatches.Inc()
+}
+
+// LocalReplicaVerification records one local replica hash by result.
+func (m *Metrics) LocalReplicaVerification(result string) {
+	m.replicaChecks.WithLabelValues(result).Inc()
 }
 
 // abortAfterFlush pushes bytes already accepted by w onto the connection

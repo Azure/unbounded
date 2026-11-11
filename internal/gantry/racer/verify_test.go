@@ -134,6 +134,26 @@ func TestCorruptFullResponseAbortsAndInvalidates(t *testing.T) {
 	}
 }
 
+func TestCorruptFullResponseForgetsLocalReplica(t *testing.T) {
+	want := []byte("expected")
+	replicas := NewReplicaVerifier(nil, nil)
+	server, ref := verifyServer(t, want, []byte("tampered"), 0, WithLocalReplicaReset(replicas))
+
+	id := replicaID{digest: ref.Digest.String(), size: int64(len(want))}
+	replicas.entries[id] = &replicaEntry{state: replicaGood, done: make(chan struct{})}
+
+	if _, _, err := verifyGet(t, server); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("err = %v; want unexpected EOF", err)
+	}
+
+	replicas.mu.Lock()
+	defer replicas.mu.Unlock()
+
+	if _, ok := replicas.entries[id]; ok {
+		t.Fatal("verification result survived a digest mismatch")
+	}
+}
+
 func TestCorruptFullResponseWithoutInvalidator(t *testing.T) {
 	want := []byte("expected")
 	server, _ := verifyServer(t, want, []byte("tampered"), 0)

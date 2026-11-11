@@ -215,7 +215,7 @@ func TestLocalAndRegistryBlobMetadataAgree(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	local, body, found, err := serveLocal(t.Context(), store, ref, racersdk.OriginRequest{
+	local, body, found, err := serveLocal(t.Context(), store, NewReplicaVerifier(nil, nil), ref, racersdk.OriginRequest{
 		Request: requestFor(t, ref, ""), Head: true,
 	}, true)
 	if body != nil {
@@ -304,7 +304,7 @@ func TestLocalAndRegistryManifestMetadataAgree(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			local, body, found, err := serveLocal(t.Context(), store, ref, racersdk.OriginRequest{
+			local, body, found, err := serveLocal(t.Context(), store, NewReplicaVerifier(nil, nil), ref, racersdk.OriginRequest{
 				Request: requestFor(t, ref, ""), Head: true,
 			}, true)
 			if body != nil {

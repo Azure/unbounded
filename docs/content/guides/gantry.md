@@ -564,6 +564,11 @@ In Racer mode:
   `--racer-content-root`) sets the content store path. The default is
   `/var/lib/containerd/io.containerd.content.v1.content`. An empty value turns
   off local reads, and every local-only request is a miss.
+- Before Gantry serves a blob from the content store for the first time, it
+  checks the file's sha256 digest. It hashes at most 2 files at a time. A page
+  request that arrives before the check is done is a miss, and Racer reads
+  from another node or the registry instead. A file that fails the check is
+  never served until containerd replaces it.
 - Before Gantry serves content that Racer already has, it sends a `HEAD` to the
   upstream registry with the caller's credentials. This keeps a node from
   reading an image it could not pull itself. Gantry caches an allowed result
@@ -600,6 +605,7 @@ an image from a configured registry and check these metrics:
 | `gantry_racer_origin_requests_total{method,status}` | Increases when Racer asks this node to read from an upstream registry. Stays flat when Racer already has the content. |
 | `gantry_racer_origin_bytes_total{kind}` | Counts bytes read from upstream registries. |
 | `gantry_racer_mirror_digest_mismatches_total` | Stays at zero. An increase means Racer returned bytes that did not match the digest. |
+| `gantry_racer_local_replica_verifications_total{result}` | Counts content store files checked before Gantry serves them. `result="corrupt"` stays at zero. An increase means a file on disk does not match its digest. Gantry stops serving that file; check the node's disk. |
 | `racer_adapter_local_hits_total` | With `persistence: Adapter`, increases when Gantry serves a page from containerd's content store. |
 | `racer_adapter_local_misses_total` | Increases when containerd does not have the blob yet. |
 | `racer_adapter_local_failures_total` | Stays near zero. An increase means local reads fail; check the content store mount. |

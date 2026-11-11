@@ -38,6 +38,12 @@ func WithInvalidator(inv Invalidator) HandlerOption {
 	return func(h *Handler) { h.invalidator = inv }
 }
 
+// WithLocalReplicaReset makes a digest mismatch drop v's verification result
+// for that digest, so this node's local replica is hashed again.
+func WithLocalReplicaReset(v *ReplicaVerifier) HandlerOption {
+	return func(h *Handler) { h.replicas = v }
+}
+
 // WithDigestMismatchObserver reports each full response aborted because its
 // bytes did not match the digest. observe must be concurrency-safe and must
 // not block.
@@ -141,6 +147,9 @@ func (s *Handler) digestMismatch(ctx context.Context, id string, request racersd
 	if s.onMismatch != nil {
 		s.onMismatch()
 	}
+
+	// The bad bytes may have come from this node's containerd store.
+	s.replicas.Forget("sha256:" + request.Key.String())
 
 	if s.invalidator == nil {
 		return
