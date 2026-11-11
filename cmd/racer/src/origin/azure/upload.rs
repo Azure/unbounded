@@ -5,7 +5,10 @@
 //! its `request_timeout`, like reads. Responses map as follows:
 //!
 //! - `201 Created`: success. Put Block List returns the response `ETag`.
-//! - Put Block List `409 BlobAlreadyExists` or any `412`: [`CommitConflict`].
+//! - Put Block List `409 BlobAlreadyExists` or any `412`: Get Blob
+//!   Properties. A blob carrying this commit's `x-ms-meta-racercommit`
+//!   marker is ours (a retry after a lost `201`) and its `ETag` is returned;
+//!   anything else is [`CommitConflict`].
 //! - `403`: `OriginForbidden`; `401`: `OriginRejected` (after the retry).
 //! - `429`, `5xx` (`ServerBusy`, `InternalError`, `OperationTimedOut`):
 //!   `Unavailable`, retryable (see [`crate::origin::upload::retryable`]).
@@ -101,7 +104,36 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
             || (code == 409 && field(head, "x-ms-error-code")? == Some(b"BlobAlreadyExists"));
         if conflict {
             let _ = exchange.discard(&begun.scope).await;
-            return Ok(Err(CommitConflict));
+            // A retry after a lost 201 finds its own blob: recognize it by
+            // the commit marker and report the commit.
+            let marker = request::commit_marker(&body);
+            let probe = self
+                .send_with(
+                    definition,
+                    &begun,
+                    |bearer, now| {
+                        request::head(
+                            url,
+                            &begun.object,
+                            request::AzureMethod::Head,
+                            None,
+                            None,
+                            bearer,
+                            now,
+                        )
+                    },
+                    None,
+                )
+                .await?;
+            let head = probe.head();
+            let ours = status(head)? == 200
+                && field(head, request::COMMIT_MARKER)? == Some(marker.as_bytes());
+            let etag = field(head, "ETag")?.and_then(|etag| StrongEtag::parse(etag).ok());
+            let _ = probe.discard(&begun.scope).await;
+            return Ok(match etag {
+                Some(etag) if ours => Ok(etag),
+                _ => Err(CommitConflict),
+            });
         }
         if code != 201 {
             return Err(self.reject(exchange, false, &begun.scope).await);

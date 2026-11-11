@@ -38,7 +38,9 @@ pub trait UploadSink {
     ) -> Operation<'a, ()>;
 
     /// Commit blocks in order with `If-None-Match: *`. Returns the Blob ETag,
-    /// or [`CommitConflict`] when the blob already exists.
+    /// or [`CommitConflict`] when the blob already exists. A blob this same
+    /// block list already committed (a retry after a lost response) is not a
+    /// conflict: its ETag is returned.
     fn put_block_list<'a>(
         &'a self,
         context: &'a OriginContext,
@@ -304,13 +306,15 @@ struct MemoryState {
     uncommitted: HashMap<ObjectId, HashMap<[u8; 64], Vec<u8>>>,
     committed: HashMap<ObjectId, MemoryBlob>,
     faults: VecDeque<(UploadCall, Error)>,
+    lose_commit_responses: u32,
     calls: Vec<UploadCall>,
     next_etag: u64,
 }
 
 /// In-memory [`UploadSink`] for tests and simulation: blocks are staged per
 /// object, Put Block List commits only when the object does not exist yet
-/// (like `If-None-Match: *`), and faults can be injected per call. A commit
+/// (like `If-None-Match: *`, except that the same block list committed again
+/// returns the existing ETag, as the Azure sink does), and faults can be injected per call. A commit
 /// naming a block that was never staged fails with `InvalidRequest`, as Azure
 /// answers `400 InvalidBlockList`. Committing discards the other staged
 /// blocks, as Azure does.
@@ -326,6 +330,12 @@ impl MemoryUploadSink {
     /// consumed by the first matching call).
     pub fn fail_next(&self, call: UploadCall, error: Error) {
         self.state().faults.push_back((call, error));
+    }
+
+    /// Commit the next Put Block List but answer it with `Unavailable`, as
+    /// if the `201` was lost on the way back.
+    pub fn lose_next_commit_response(&self) {
+        self.state().lose_commit_responses += 1;
     }
 
     /// Make `object` exist, as if another writer committed it first.
@@ -412,7 +422,11 @@ impl UploadSink for MemoryUploadSink {
             scope.check()?;
             let mut state = self.state();
             Self::fault(&mut state, UploadCall::PutBlockList)?;
-            if state.committed.contains_key(&context.object) {
+            if let Some(existing) = state.committed.get(&context.object) {
+                // Our own earlier commit (its response was lost) is success.
+                if existing.block_ids == block_ids {
+                    return Ok(Ok(existing.etag.clone()));
+                }
                 return Ok(Err(CommitConflict));
             }
             let staged = state.uncommitted.get(&context.object);
@@ -434,6 +448,10 @@ impl UploadSink for MemoryUploadSink {
                     block_ids: block_ids.to_vec(),
                 },
             );
+            if state.lose_commit_responses > 0 {
+                state.lose_commit_responses -= 1;
+                return Err(Error::Unavailable);
+            }
             Ok(Ok(etag))
         })
     }

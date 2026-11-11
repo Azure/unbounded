@@ -365,3 +365,29 @@ fn memory_sink_conflicts_missing_blocks_and_faults() {
     let expired = RequestScope::host(RequestId([4; 16]), Instant::now()).unwrap();
     assert!(block_on(sink.put_block(&other, &id(1), b"z", &expired)).is_err());
 }
+
+#[test]
+fn memory_sink_recognizes_its_own_commit_after_a_lost_response() {
+    let sink = MemoryUploadSink::new();
+    let scope = scope_for(Duration::from_secs(5));
+    let ctx = context("lost");
+    block_on(sink.put_block(&ctx, &id(0), b"a", &scope)).unwrap();
+    block_on(sink.put_block(&ctx, &id(1), b"b", &scope)).unwrap();
+    sink.lose_next_commit_response();
+    assert_eq!(
+        block_on(sink.put_block_list(&ctx, &[id(0), id(1)], None, &scope)).err(),
+        Some(Error::Unavailable)
+    );
+    let committed = sink.committed(&ctx.object).unwrap();
+    // The retry finds the blob it committed: success with its ETag.
+    assert_eq!(
+        block_on(sink.put_block_list(&ctx, &[id(0), id(1)], None, &scope)).unwrap(),
+        Ok(committed.etag.clone())
+    );
+    // A different block list is still a conflict.
+    assert_eq!(
+        block_on(sink.put_block_list(&ctx, &[id(0)], None, &scope)).unwrap(),
+        Err(CommitConflict)
+    );
+    assert_eq!(sink.committed(&ctx.object).unwrap(), committed);
+}

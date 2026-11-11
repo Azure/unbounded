@@ -251,7 +251,8 @@ pub fn put_block_head(
 /// Put Block List head: `PUT {target}?comp=blocklist` with `Host`,
 /// `x-ms-version`, `x-ms-date`, `User-Agent`, `Content-Length`,
 /// `Content-Type: application/xml`, `x-ms-content-crc64` of the XML body,
-/// `If-None-Match: *`, `x-ms-blob-content-type` when set, then
+/// `If-None-Match: *`, `x-ms-meta-racercommit` ([`commit_marker`] of the
+/// body), `x-ms-blob-content-type` when set, then
 /// `Authorization` when a token is present.
 pub fn put_block_list_head(
     url: &AzureContainerUrl,
@@ -263,7 +264,7 @@ pub fn put_block_list_head(
 ) -> Result<MessageHead> {
     let mut target = write_target(url, object)?;
     target.push_str("?comp=blocklist");
-    let mut headers = common(url, now, 10);
+    let mut headers = common(url, now, 11);
     headers.push(Header::new(
         "Content-Length",
         body.len().to_string().as_bytes(),
@@ -275,6 +276,9 @@ pub fn put_block_list_head(
     ));
     // Create only: an existing blob fails with 409 BlobAlreadyExists.
     headers.push(Header::new("If-None-Match", b"*"));
+    // Stamp the commit, so a retry after a lost 201 can recognize its own
+    // blob (see `commit_marker`).
+    headers.push(Header::new(COMMIT_MARKER, commit_marker(body).as_bytes()));
     if let Some(content_type) = content_type {
         if content_type.is_empty()
             || !content_type
@@ -296,6 +300,19 @@ pub fn put_block_list_head(
         },
         headers,
     })
+}
+
+/// Blob metadata naming the block list a Racer commit wrote.
+pub const COMMIT_MARKER: &str = "x-ms-meta-racercommit";
+
+/// Lowercase hex SHA-256 of a Put Block List body. Block IDs embed the Racer
+/// version, so equal markers mean the same version's commit.
+pub fn commit_marker(body: &[u8]) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(body)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// Put Block List body committing `block_ids` in order, each as `Latest`:
@@ -545,6 +562,7 @@ mod tests {
                 "Content-Type",
                 "x-ms-content-crc64",
                 "If-None-Match",
+                "x-ms-meta-racercommit",
                 "x-ms-blob-content-type",
                 "Authorization"
             ]
@@ -553,6 +571,8 @@ mod tests {
         assert_eq!(get("Content-Length"), body.len().to_string().as_bytes());
         assert_eq!(get("Content-Type"), b"application/xml");
         assert_eq!(get("If-None-Match"), b"*");
+        assert_eq!(get(COMMIT_MARKER), commit_marker(&body).as_bytes());
+        assert_eq!(commit_marker(&body).len(), 64);
         assert_eq!(get("x-ms-blob-content-type"), b"text/plain; charset=utf-8");
         assert_eq!(get("x-ms-date"), b"Thu, 01 Jan 1970 00:00:00 GMT");
 

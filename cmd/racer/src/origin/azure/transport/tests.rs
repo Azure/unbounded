@@ -915,7 +915,7 @@ fn reused_connection_closed_before_response_retries_on_fresh_connection() {
 #[derive(Default)]
 struct Uploads {
     staged: std::collections::HashMap<(String, String), Vec<u8>>,
-    committed: std::collections::HashMap<String, Vec<u8>>,
+    committed: std::collections::HashMap<String, (Vec<u8>, String, u32)>,
     etags: u32,
 }
 
@@ -924,6 +924,19 @@ struct Uploads {
 fn azure_upload(head: &str, body: &[u8], state: &Mutex<Uploads>, busy: &Mutex<bool>) -> Vec<u8> {
     use base64::Engine;
     let target = head.split(' ').nth(1).unwrap();
+    if head.starts_with("HEAD ") {
+        // Get Blob Properties: the ETag and commit marker.
+        let key = target.strip_prefix("/account/models/").unwrap();
+        let state = state.lock().unwrap();
+        return match state.committed.get(key) {
+            Some((data, marker, etag)) => format!(
+                "HTTP/1.1 200 OK\r\nETag: \"0x{etag}\"\r\nx-ms-meta-racercommit: {marker}\r\nContent-Length: {}\r\n\r\n",
+                data.len()
+            )
+            .into_bytes(),
+            None => b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_vec(),
+        };
+    }
     assert!(head.starts_with("PUT "));
     assert_eq!(header(head, "x-ms-version"), Some("2026-12-06"));
     assert!(header(head, "x-ms-date").is_some());
@@ -980,8 +993,10 @@ fn azure_upload(head: &str, body: &[u8], state: &Mutex<Uploads>, busy: &Mutex<bo
         };
         data.extend_from_slice(block);
     }
-    state.committed.insert(key, data);
     state.etags += 1;
+    let marker = header(head, "x-ms-meta-racercommit").unwrap().to_owned();
+    let etag = state.etags;
+    state.committed.insert(key, (data, marker, etag));
     format!(
         "HTTP/1.1 201 Created\r\nETag: \"0x{}\"\r\nContent-Length: 0\r\n\r\n",
         state.etags
@@ -1049,9 +1064,31 @@ fn plain_http_uploads_blocks_and_commits() {
     assert_eq!(etag.as_str(), "\"0x1\"");
     let mut expected = vec![1; 4096];
     expected.extend_from_slice(b"middleend");
-    assert_eq!(uploads.lock().unwrap().committed["obj"], expected);
-    // A second writer loses.
-    assert_eq!(commit("obj").unwrap(), Err(CommitConflict));
+    assert_eq!(uploads.lock().unwrap().committed["obj"].0, expected);
+    // Committing the same block list again (a retry after a lost 201) finds
+    // its own blob.
+    assert_eq!(commit("obj").unwrap(), Ok(etag));
+    // A second writer of another version loses.
+    let other: Vec<_> = (0..1)
+        .map(|page| {
+            crate::origin::azure::upload::block_id(b"fedcba9876543210fedcba9876543210", page)
+        })
+        .collect();
+    let other_scope = scope();
+    assert_eq!(
+        drive(
+            &f.reactor,
+            Box::pin(f.origin.put_block_list_with(
+                &f.definition,
+                &context("obj"),
+                &other,
+                None,
+                &other_scope,
+            )),
+        )
+        .unwrap(),
+        Err(CommitConflict)
+    );
     assert_eq!(put("forbidden", 0).err(), Some(Error::OriginForbidden));
     // 503 is retryable, and the retry policy rides it out.
     assert_eq!(put("busy", 0).err(), Some(Error::Unavailable));

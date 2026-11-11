@@ -423,8 +423,20 @@ fn put_block_list_conflicts_and_errors() {
     h.script(
         b"HTTP/1.1 409 Conflict\r\nx-ms-error-code: BlobAlreadyExists\r\nContent-Length: 0\r\n\r\n",
     );
+    // A foreign blob (no marker) is a conflict.
+    h.script(b"HTTP/1.1 200 OK\r\nETag: \"0x8DF0\"\r\nContent-Length: 0\r\n\r\n");
     assert_eq!(h.commit(&ctx, 1, None).unwrap(), Err(CommitConflict));
+    let (probe, _) = h.last();
+    assert!(matches!(&probe.start, http1::StartLine::Request { method, .. } if method == "HEAD"));
+    assert_eq!(target(&probe), "/models/obj");
     h.script(b"HTTP/1.1 412 Precondition Failed\r\nx-ms-error-code: ConditionNotMet\r\nContent-Length: 0\r\n\r\n");
+    h.script(b"HTTP/1.1 200 OK\r\nETag: \"0x8DF0\"\r\nx-ms-meta-racercommit: 00\r\nContent-Length: 0\r\n\r\n");
+    assert_eq!(h.commit(&ctx, 1, None).unwrap(), Err(CommitConflict));
+    // Deleted between the commit and the probe: still a conflict.
+    h.script(
+        b"HTTP/1.1 409 Conflict\r\nx-ms-error-code: BlobAlreadyExists\r\nContent-Length: 0\r\n\r\n",
+    );
+    h.script(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
     assert_eq!(h.commit(&ctx, 1, None).unwrap(), Err(CommitConflict));
     // Other 409s are not a lost race.
     h.script(
@@ -451,6 +463,35 @@ fn put_block_list_conflicts_and_errors() {
         Some(Error::InvalidRequest)
     );
     assert_eq!(h.fake.sent.borrow().len(), before);
+}
+
+#[test]
+fn put_block_list_retry_recognizes_its_own_commit() {
+    let h = harness(AzureCredential::ManagedIdentity { client_id: None }, false);
+    let ctx = context("obj", "");
+    // The first attempt committed but its 201 was lost; the retry conflicts
+    // and finds this commit's marker on the blob.
+    h.script(b"HTTP/1.1 201 Created\r\nETag: \"0x8DCAFE\"\r\nContent-Length: 0\r\n\r\n");
+    h.commit(&ctx, 2, None).unwrap().unwrap();
+    let (head, body) = h.last();
+    let marker = head
+        .unique(super::super::request::COMMIT_MARKER)
+        .unwrap()
+        .unwrap()
+        .to_vec();
+    assert_eq!(
+        marker,
+        super::super::request::commit_marker(&body.unwrap()).into_bytes()
+    );
+    h.script(
+        b"HTTP/1.1 409 Conflict\r\nx-ms-error-code: BlobAlreadyExists\r\nContent-Length: 0\r\n\r\n",
+    );
+    let mut ok = b"HTTP/1.1 200 OK\r\nETag: \"0x8DCAFE\"\r\nx-ms-meta-racercommit: ".to_vec();
+    ok.extend_from_slice(&marker);
+    ok.extend_from_slice(b"\r\nContent-Length: 0\r\n\r\n");
+    h.script(&ok);
+    let etag = h.commit(&ctx, 2, None).unwrap().unwrap();
+    assert_eq!(etag.as_str(), "\"0x8DCAFE\"");
 }
 
 #[test]

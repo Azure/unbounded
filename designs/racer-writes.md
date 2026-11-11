@@ -1144,6 +1144,11 @@ Store (`cmd/racer/src/store/`):
     `drop_written(&self, page: &PageId) -> Operation<bool>` (deleted,
     superseded, or orphaned: catalog entry removed first). Both journal
     `PageRelease`, then unpin; `false` when the page was not written here.
+    `PageRelease` names the released copy (segment, generation, offset), and
+    replay drops a page only while it is still at that location. A release
+    of the old copy that lands in the journal after a replacing persist's
+    `Page` record (persist with `replace`) therefore keeps the acked
+    replacement on replay and compaction. Journal format is 2.
   - `set_written_hold(&self, page, hold_until: SystemTime) -> Operation<bool>`
     journals a new `Page` record (extend or shorten).
   - `written(&PageId) -> Option<WrittenEntry>`, `written_pages() ->
@@ -1532,6 +1537,15 @@ plan above):
 - `MemoryUploadSink` (with `UploadCall`, `MemoryBlob`) lives in
   `origin/upload.rs`; a commit naming an unstaged block fails with
   `InvalidRequest`, like Azure `400 InvalidBlockList`.
+- Lost-response retries: Put Block List stamps `x-ms-meta-racercommit`, the
+  hex SHA-256 of its XML body (`request::commit_marker`; block IDs embed the
+  version, so equal markers mean the same commit). On `409
+  BlobAlreadyExists` or `412` the sink sends Get Blob Properties (`HEAD`); a
+  `200` carrying our marker and a strong `ETag` returns that ETag as a
+  commit, so a retry after a lost `201` is not a `BlockListConflict`.
+  Anything else stays `CommitConflict` and goes to `conflict_outcome`.
+  `MemoryUploadSink` treats a recommit of the same block list the same way,
+  and `lose_next_commit_response` commits but answers `Unavailable`.
 
 ### WP7: control plane and CRD
 

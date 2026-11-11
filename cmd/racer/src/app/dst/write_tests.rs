@@ -803,6 +803,25 @@ fn head_reports_upload_states_and_uploads_commit() {
 }
 
 #[test]
+fn a_retried_block_list_after_a_lost_response_commits() {
+    let mut c = Cluster::new(19, 3, Some(writes(2)));
+    // The first Put Block List commits but its 201 never arrives; the retry
+    // conflicts with the blob it created and must recognize it as its own.
+    c.sink.lose_next_commit_response();
+    let body = bytes(10, 90_000);
+    let created = c.put(0, OBJECT, &body, "Racer-Upload: auto\r\n");
+    assert_eq!(created.status, 201);
+    c.wait(Duration::from_secs(5));
+    assert!(block_list_commits(&c.sink) >= 2);
+    let blob = c.sink.committed(&c.object(OBJECT)).expect("blob committed");
+    assert!(blob.data == body);
+    // Committed, not failed: the object is uploaded and not deletable.
+    let refused = c.delete(1, OBJECT);
+    assert_eq!(refused.status, 409);
+    assert_eq!(refused.header("racer-write-error"), Some("uploaded"));
+}
+
+#[test]
 fn delete_releases_holders() {
     let mut c = Cluster::new(19, 3, Some(writes(2)));
     let body = bytes(10, 140_000);
