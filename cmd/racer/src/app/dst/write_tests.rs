@@ -1525,3 +1525,40 @@ fn repair_waits_for_a_spare_member() {
     );
     c.read_everywhere(OBJECT, &body, &etag);
 }
+
+/// Kind e2e `survives a deleted racer pod`: write a multi-page object, then
+/// restart the writer node from its disk (graceful or power loss) before any
+/// other node read it, and require every node to read it back.
+fn restart_writer_then_read(seed: u64, nodes: usize, crash: bool, rotations: u8) {
+    let mut c = Cluster::new(seed, nodes, Some(writes(2)));
+    for _ in 0..rotations {
+        c.rotate_keys(1);
+    }
+    let body = bytes(seed, 2 * small_pages().get() as usize + 40_000);
+    let created = c.put(0, OBJECT, &body, "");
+    assert_eq!(created.status, 201);
+    let etag = created.header("etag").unwrap().to_owned();
+    let id = c.harness.retire(&c.env, 0, crash);
+    c.harness.add(&c.env, Some(id));
+    let restarted = c.harness.nodes.pop().unwrap();
+    c.harness.nodes.insert(0, restarted);
+    c.configure();
+    c.harness.publish();
+    c.harness.settle();
+    c.read_everywhere(OBJECT, &body, &etag);
+}
+
+/// Kind e2e `TestWritesNeverUpload` once returned a lasting 503 here; every
+/// combination of cluster size, restart kind, and key rotation must read.
+#[test]
+fn a_restarted_writer_keeps_its_object_readable_everywhere() {
+    for seed in 40..44 {
+        for nodes in [3, 4] {
+            for crash in [false, true] {
+                for rotations in [0, 2] {
+                    restart_writer_then_read(seed, nodes, crash, rotations);
+                }
+            }
+        }
+    }
+}
