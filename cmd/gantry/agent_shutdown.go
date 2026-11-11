@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"time"
@@ -69,7 +70,8 @@ func gracefulShutdown(d shutdownDeps) {
 	// cdsub already canceled by the outer ctx; wait briefly for its
 	// pending advertise calls to flush.
 	select {
-	case <-d.cdsubDone:
+	case err := <-d.cdsubDone:
+		reportCdsubExit(d.logger, err)
 	case <-shutdownCtx.Done():
 		d.logger.Warn("cdsub did not drain within shutdown budget")
 	}
@@ -114,4 +116,19 @@ func gracefulShutdown(d shutdownDeps) {
 	if err := d.metricsHTTP.Shutdown(shutdownCtx); err != nil {
 		d.logger.Warn("metrics shutdown error", slog.Any("err", err))
 	}
+}
+
+// reportCdsubExit logs what cdsub.Run returned while the agent drained, unless
+// it is the cancellation shutdown itself caused or nothing at all.
+//
+// On an ordinary shutdown Run returns the context's error. When cdsub crashed
+// earlier, runAgent's first select has already consumed and logged the error,
+// so the drain reads the closed channel's zero value. Only an error outside
+// those two cases is news.
+func reportCdsubExit(logger *slog.Logger, err error) {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return
+	}
+
+	logger.Warn("cdsub exited with an error while draining", slog.Any("err", err))
 }
