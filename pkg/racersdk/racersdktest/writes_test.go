@@ -560,3 +560,34 @@ func (zeroReader) Read(p []byte) (int, error) {
 	clear(p)
 	return len(p), nil
 }
+
+// TestHostReadUnsupported pins that the fake does not serve host-read, so a
+// test cannot come to rely on host-read semantics the fake never checks.
+func TestHostReadUnsupported(t *testing.T) {
+	c, _ := racersdktest.NewClientWithWrites(t, nil)
+	ctx := context.Background()
+	r := writeRequest(42)
+
+	if _, err := c.Put(ctx, r, strings.NewReader("data"), 4, racersdk.WriteOptions{Upload: racersdk.UploadNever}); err != nil {
+		t.Fatal(err)
+	}
+
+	file, err := os.CreateTemp(t.TempDir(), "dest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+
+	if err := file.Truncate(4); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = c.HostRead(ctx, r, file, racersdk.HostReadOptions{})
+	if err == nil {
+		t.Fatal("HostRead succeeded against the fake")
+	}
+
+	if got, _ := os.ReadFile(file.Name()); string(got) == "data" {
+		t.Fatal("HostRead wrote the object through the fake")
+	}
+}

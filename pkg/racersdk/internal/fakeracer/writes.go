@@ -512,7 +512,7 @@ func (w *Writes) remove(rw http.ResponseWriter, key [32]byte) {
 type filesKey struct{}
 
 // FileConn is a Unix connection that collects descriptors received with
-// SCM_RIGHTS, so the fake can serve host-read and host-write.
+// SCM_RIGHTS, so the fake can serve host-write.
 type FileConn struct {
 	*net.UnixConn
 

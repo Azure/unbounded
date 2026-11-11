@@ -53,8 +53,9 @@ type WriteRejection struct {
 // Writes is the fake's in-memory write directory. It accepts writes with the
 // header rules of the Racer write API: create-once, durability and upload
 // options, hold bounds, and SCM_RIGHTS host-write. Written objects are
-// readable through the same client with Get, HostRead, and Stat. Nothing is
-// replicated or uploaded; upload states change only through [Writes.SetUploadState]
+// readable through the same client with Get and Stat. The fake does not serve
+// host-read, so [racersdk.Client.HostRead] fails against it for written and
+// origin objects alike. Nothing is replicated or uploaded; upload states change only through [Writes.SetUploadState]
 // and Persist.
 type Writes struct {
 	dir *fakeracer.Writes
