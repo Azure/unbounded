@@ -122,6 +122,15 @@ pub enum WriteAction {
         wait_millis: u32,
     },
     Delete,
+    /// A coordinator tells a page-zero member that it deleted the version
+    /// (`racer-etag`): the member journals a tombstone until
+    /// `hold_until_millis` and drops any copy of the version it has. The
+    /// member answers `released` once the tombstone is durable. `replicas`
+    /// is the version's replica count.
+    Tombstone {
+        hold_until_millis: u64,
+        replicas: u8,
+    },
     Persist,
     Replicate {
         manifest: Manifest,
@@ -156,17 +165,30 @@ pub struct Manifest {
 /// Reply to a write peer operation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WriteReply {
-    Opened { lease_until_millis: u64 },
-    Stored { pages: Vec<u64> },
-    Committed { state: UploadState },
+    Opened {
+        lease_until_millis: u64,
+    },
+    Stored {
+        pages: Vec<u64>,
+    },
+    Committed {
+        state: UploadState,
+    },
     Released,
-    Uploaded { pages: Vec<u64> },
-    Status { state: UploadState, etag: String },
+    Uploaded {
+        pages: Vec<u64>,
+    },
+    Status {
+        state: UploadState,
+        etag: String,
+    },
     Exists,
     Full,
     LeaseExpired,
     Unknown,
     Failed,
+    /// The asked version was deleted (this node keeps its tombstone).
+    Deleted,
 }
 
 impl WriteReply {
@@ -184,6 +206,7 @@ impl WriteReply {
             Self::LeaseExpired => "lease-expired",
             Self::Unknown => "unknown",
             Self::Failed => "failed",
+            Self::Deleted => "deleted",
         }
     }
 }

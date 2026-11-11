@@ -634,6 +634,11 @@ impl MetadataService {
         scope.check()?;
         self.observe_clock()?;
         let clock_epoch = self.clock.borrow().inner.epoch();
+        // A restored written session not yet checked for a delete it may
+        // have missed: neither serve it nor let the origin's miss stand.
+        if self.writes.unconfirmed(&context.object) {
+            return Err(Error::Unavailable.into());
+        }
         // A written object this worker coordinates is current until it is
         // deleted, expires, or uploads; the origin does not know it yet.
         if let Some(metadata) = self
@@ -928,6 +933,10 @@ impl MetadataService {
                 .await
             {
                 Ok(response) => match response.response() {
+                    // A version this worker knows was deleted (an owner that
+                    // missed the delete) is no answer.
+                    PeerResponse::Metadata(metadata)
+                        if self.writes.tombstoned(&metadata.version) => {}
                     PeerResponse::Metadata(metadata) => {
                         super::validate_metadata(metadata, &context.object, &selector)?;
                         return Ok(metadata.clone());
@@ -1140,6 +1149,12 @@ impl MetadataService {
                     // no longer reaches it. Its cached current pointer is
                     // skipped as well, so it cannot bypass that check; the
                     // caller then asks the current members.
+                    //
+                    // A restored session not yet checked for a missed delete
+                    // answers neither the version nor a miss.
+                    if self.writes.unconfirmed(&context.object) {
+                        return Err(Error::Unavailable);
+                    }
                     match self
                         .writes
                         .current_role(&context.object, self.candidates.ctx().clock.wall_now())
@@ -1158,6 +1173,9 @@ impl MetadataService {
                     let Some(descriptor) = self.storage.index.version(&current.version)? else {
                         return Ok(None);
                     };
+                    if self.writes.tombstoned(&current.version) {
+                        return Ok(None);
+                    }
                     current.resolve(&descriptor, now).map_err(Into::into)
                 }
                 MetadataSelector::Pinned(etag) => {

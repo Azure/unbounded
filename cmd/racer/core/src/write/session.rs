@@ -331,7 +331,7 @@ impl Session {
             SessionEvent::DeleteRequested => {
                 self.phase = Phase::Deleted;
                 vec![
-                    SessionEffect::Journal(self.record(Kind::Delete)),
+                    SessionEffect::Journal(self.record(Kind::Tombstone)),
                     SessionEffect::ReleaseTargets,
                 ]
             }
@@ -493,7 +493,7 @@ impl Session {
                     return vec![SessionEffect::Reject(Rejection::Uploaded)];
                 }
                 self.phase = Phase::Deleted;
-                self.end()
+                self.end(Kind::Tombstone)
             }
             SessionEvent::HoldExpired => {
                 // A started upload finishes; an uploaded object is already released.
@@ -501,7 +501,7 @@ impl Session {
                     return Vec::new();
                 }
                 self.phase = Phase::Expired;
-                self.end()
+                self.end(Kind::Delete)
             }
         }
     }
@@ -514,9 +514,11 @@ impl Session {
         ]
     }
 
-    fn end(&mut self) -> Vec<SessionEffect> {
+    /// Release every holder and unpublish, journaling `kind`: a tombstone
+    /// for a client delete, a plain `Delete` for expiry.
+    fn end(&mut self, kind: Kind) -> Vec<SessionEffect> {
         vec![
-            SessionEffect::Journal(self.record(Kind::Delete)),
+            SessionEffect::Journal(self.record(kind)),
             SessionEffect::Release {
                 nodes: self.holders.nodes(),
             },
@@ -579,6 +581,13 @@ impl Session {
         match kind {
             Kind::Abort => JournalRecord::Abort { cache, key, etag },
             Kind::Delete => JournalRecord::Delete { cache, key, etag },
+            Kind::Tombstone => JournalRecord::Tombstone {
+                cache,
+                key,
+                etag,
+                hold_until_millis: self.spec.hold_until_millis,
+                replicas: self.spec.replicas,
+            },
         }
     }
 }
@@ -586,6 +595,7 @@ impl Session {
 enum Kind {
     Abort,
     Delete,
+    Tombstone,
 }
 
 #[cfg(test)]

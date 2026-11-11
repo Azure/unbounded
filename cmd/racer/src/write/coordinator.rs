@@ -194,6 +194,17 @@ async fn session(
             status(local, &object, version.as_ref(), wait_millis, scope).await
         }
         WriteAction::Delete => delete(local, &object, version.as_ref(), &membership, scope).await,
+        WriteAction::Tombstone {
+            hold_until_millis,
+            replicas,
+        } => {
+            let version = version.ok_or(Error::InvalidRequest)?;
+            if !super::is_written_etag(&version.etag) {
+                return Err(Error::InvalidRequest);
+            }
+            record_tombstone(local, &version, hold_until_millis, replicas).await?;
+            Ok(WriteReply::Released)
+        }
         WriteAction::Persist => persist(local, &object, context, &membership, scope).await,
         WriteAction::Replicate { manifest } => {
             let version = version.ok_or(Error::InvalidRequest)?;
@@ -570,6 +581,11 @@ async fn status(
     wait_millis: u32,
     scope: &RequestScope,
 ) -> Result<WriteReply> {
+    // A version this worker holds a tombstone for was deleted, whatever
+    // session of the object it tracks now.
+    if version.is_some_and(|v| local.writes.directory().tombstoned(v)) {
+        return Ok(WriteReply::Deleted);
+    }
     if let Some(version) = version.filter(|v| !super::is_written_etag(&v.etag)) {
         let committed = local.writes.directory().with(object, |entry| {
             entry.is_some_and(|e| {
@@ -618,6 +634,19 @@ async fn status(
     }
 }
 
+/// Longest a delete waits for page-zero members to journal its tombstone.
+pub const TOMBSTONE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// A client `DELETE` of `object` (or, forwarded, of `version`).
+///
+/// The page-zero member that gets it deletes as the coordinator, whatever
+/// role it tracked the version in: it journals a tombstone, releases the
+/// holders, and has every page-zero member journal the tombstone too. The
+/// delete is acknowledged (`released`) only once `replicas` of them (all of
+/// them, when fewer), this worker included, hold it durably, the same
+/// quorum the write was acknowledged on. Otherwise it answers
+/// `Unavailable` (a retryable `503`); the tombstone keeps spreading in the
+/// background, and a retried `DELETE` finishes the job.
 async fn delete(
     local: &Coordinator,
     object: &ObjectId,
@@ -627,29 +656,23 @@ async fn delete(
 ) -> Result<WriteReply> {
     let directory = local.writes.directory().clone();
     let found = directory.with(object, |e| {
-        e.filter(|e| version.is_none_or(|v| *v == e.version))
-            .map(|e| (e.role, e.version.clone()))
+        let e = e.filter(|e| version.is_none_or(|v| *v == e.version))?;
+        // A manifest replica (the coordinator is lost or ranked behind)
+        // and a restored, unconfirmed session delete as the coordinator.
+        e.role = Role::Coordinator;
+        e.confirmed = true;
+        Some((
+            e.version.clone(),
+            e.session.spec().hold_until_millis,
+            e.session.spec().replicas,
+        ))
     });
-    let Some((role, version)) = found else {
-        return Ok(WriteReply::Unknown);
+    let Some((version, hold_until_millis, replicas)) = found else {
+        return delete_elsewhere(local, object, version, membership, scope).await;
     };
-    if role == Role::Replica {
-        // The coordinator released the holders; drop the replica.
-        directory.remove_version(&version);
-        local
-            .fill
-            .dependencies
-            .writer
-            .index()
-            .invalidate_current(object);
-        journal(local, delete_record(&version)?).await?;
-        return Ok(WriteReply::Released);
-    }
     let Some(effects) = object_event(local, object, SessionEvent::DeleteRequested) else {
         return Ok(WriteReply::Unknown);
     };
-    // Tell manifest replicas before the effects consume the session.
-    let replicas = replica_nodes(local, membership, object, scope).await;
     match apply(local, object, effects, membership, scope).await? {
         Some(Rejection::Uploaded) => {
             return Ok(WriteReply::Status {
@@ -661,35 +684,288 @@ async fn delete(
         None => {}
     }
     settle(local, object);
-    let context = super::bare_context(object);
-    for node in replicas {
-        let operation = PeerOperation::WriteSession {
-            object: object.clone(),
-            etag: Some(version.etag.clone()),
-            action: Box::new(WriteAction::Delete),
-        };
-        let _ = send(local, membership, &node, operation, &context, scope).await;
+    // The session journaled the tombstone; make sure of it (an effect list
+    // without one would be a bug, and acknowledging then is not safe).
+    if !directory.tombstoned(&version) {
+        record_tombstone(local, &version, hold_until_millis, replicas).await?;
     }
-    Ok(WriteReply::Released)
+    acknowledge(local, &version, membership, scope).await
 }
 
-/// Every member that may hold a manifest of `object`, other than this node:
-/// the serving page-zero members among the first `RANKED_DEPTH`. Besides the
-/// `replicas - 1` manifest replicas, a member that joined ahead of this
-/// coordinator got the manifest (`replicate_manifest`), and a coordinator
-/// that this one took over from may still act as one until its next role
-/// check; a delete must reach them all, or they keep serving the version.
-async fn replica_nodes(
+/// `released` once enough page-zero members hold `version`'s tombstone,
+/// after one more round of spreading it; `Unavailable` otherwise.
+async fn acknowledge(
     local: &Coordinator,
+    version: &ObjectVersion,
     membership: &Arc<Membership>,
-    object: &ObjectId,
     scope: &RequestScope,
-) -> Vec<NodeId> {
+) -> Result<WriteReply> {
+    let mut bounded = scope.clone();
+    bounded.deadline.0 = scope
+        .deadline
+        .0
+        .min(scope.clock().now() + TOMBSTONE_TIMEOUT);
+    if spread_tombstone(local, version, membership, &bounded).await? {
+        Ok(WriteReply::Released)
+    } else {
+        Err(Error::Unavailable)
+    }
+}
+
+/// A `DELETE` of an object this worker tracks no session of.
+async fn delete_elsewhere(
+    local: &Coordinator,
+    object: &ObjectId,
+    version: Option<&ObjectVersion>,
+    membership: &Arc<Membership>,
+    scope: &RequestScope,
+) -> Result<WriteReply> {
+    // A retry of a delete this worker made (or learned of) that may not
+    // have been acknowledged: finish spreading its tombstone first.
+    let tombstoned: Vec<ObjectVersion> = local
+        .writes
+        .directory()
+        .tombstones_of(object)
+        .into_iter()
+        .filter(|v| version.is_none_or(|asked| asked == v))
+        .collect();
+    if !tombstoned.is_empty() {
+        // `404` (nothing written to delete) once the delete stands; until
+        // then the retry stays retryable.
+        for deleted in &tombstoned {
+            acknowledge(local, deleted, membership, scope).await?;
+        }
+        return Ok(WriteReply::Unknown);
+    }
+    if version.is_some() {
+        // A forwarded delete never forwards again.
+        return Ok(WriteReply::Unknown);
+    }
+    // This page-zero member may not have the manifest yet (it joined ahead
+    // of the coordinator, before rebalance). Forward the delete to a member
+    // that tracks the object rather than answer `404` for a live object.
     let me = local.local_node();
-    super::failover::page_zero_members(local, membership, object, scope)
-        .await
-        .map(|members| members.into_iter().filter(|node| *node != me).collect())
-        .unwrap_or_default()
+    let members = super::failover::page_zero_members(local, membership, object, scope).await?;
+    let mut silent = false;
+    for node in members.iter().filter(|node| **node != me) {
+        let operation = PeerOperation::WriteSession {
+            object: object.clone(),
+            etag: None,
+            action: Box::new(WriteAction::Status { wait_millis: 0 }),
+        };
+        let context = super::bare_context(object);
+        match send(local, membership, node, operation, &context, scope).await {
+            Ok(WriteReply::Status { etag, .. }) => {
+                let etag = StrongEtag::parse(etag.as_bytes())?;
+                if !super::is_written_etag(&etag) {
+                    continue;
+                }
+                let operation = PeerOperation::WriteSession {
+                    object: object.clone(),
+                    etag: Some(etag),
+                    action: Box::new(WriteAction::Delete),
+                };
+                return send(local, membership, node, operation, &context, scope).await;
+            }
+            Ok(_) => {}
+            Err(_) => silent = true,
+        }
+    }
+    if silent {
+        return Err(Error::Unavailable);
+    }
+    Ok(WriteReply::Unknown)
+}
+
+/// Durably record that a client deleted `version`, then drop this worker's
+/// copies of it: the directory entry, its current pointer, and its written
+/// pages. Idempotent.
+pub(crate) async fn record_tombstone(
+    local: &Coordinator,
+    version: &ObjectVersion,
+    hold_until_millis: u64,
+    replicas: u8,
+) -> Result<()> {
+    let directory = local.writes.directory().clone();
+    let known = directory.with_tombstone(version, |t| {
+        t.is_some_and(|t| t.hold_until_millis >= hold_until_millis)
+    });
+    if !known {
+        journal(
+            local,
+            JournalRecord::Tombstone {
+                cache: version.object.cache.0.clone(),
+                key: version.object.key.0,
+                etag: etag_text(&version.etag)?,
+                hold_until_millis,
+                replicas: replicas.max(1),
+            },
+        )
+        .await?;
+    }
+    let writer = &local.fill.dependencies.writer;
+    if directory.remove_version(version).is_some() {
+        writer.index().invalidate_current(&version.object);
+    }
+    for (page, _) in writer.written_pages() {
+        if page.version == *version {
+            let _ = writer.drop_written(&page).await;
+        }
+    }
+    Ok(())
+}
+
+/// Send `version`'s tombstone to every page-zero member of its object that
+/// did not acknowledge it under `membership` yet. Returns whether enough
+/// members hold it for the delete to stand: `replicas` of them, or all of
+/// them when fewer, counting this worker when it is one.
+pub(crate) async fn spread_tombstone(
+    local: &Coordinator,
+    version: &ObjectVersion,
+    membership: &Arc<Membership>,
+    scope: &RequestScope,
+) -> Result<bool> {
+    let directory = local.writes.directory().clone();
+    let placement = membership.version.0;
+    let Some((hold_until_millis, replicas, acked)) = directory.with_tombstone(version, |t| {
+        t.map(|t| {
+            if t.acked.0 != placement {
+                t.acked = (placement, Default::default());
+            }
+            (t.hold_until_millis, t.replicas, t.acked.1.clone())
+        })
+    }) else {
+        return Ok(false);
+    };
+    let me = local.local_node();
+    let members =
+        super::failover::page_zero_members(local, membership, &version.object, scope).await?;
+    let pending: Vec<NodeId> = members
+        .iter()
+        .filter(|node| **node != me && !acked.contains(*node))
+        .cloned()
+        .collect();
+    let context = super::bare_context(&version.object);
+    let sends = pending.iter().map(|node| {
+        let operation = PeerOperation::WriteSession {
+            object: version.object.clone(),
+            etag: Some(version.etag.clone()),
+            action: Box::new(WriteAction::Tombstone {
+                hold_until_millis,
+                replicas,
+            }),
+        };
+        let context = &context;
+        async move {
+            let reply = send(local, membership, node, operation, context, scope).await;
+            (node, matches!(reply, Ok(WriteReply::Released)))
+        }
+    });
+    let replies = futures::future::join_all(sends).await;
+    let held = directory.with_tombstone(version, |t| {
+        let t = t?;
+        if t.acked.0 != placement {
+            t.acked = (placement, Default::default());
+        }
+        for (node, ok) in replies {
+            if ok {
+                t.acked.1.insert(node.clone());
+            }
+        }
+        let held = members
+            .iter()
+            .filter(|node| **node == me || t.acked.1.contains(*node))
+            .count();
+        if held == members.len() {
+            t.spread = Some(placement);
+        }
+        Some(held)
+    });
+    let Some(held) = held else {
+        return Ok(false);
+    };
+    Ok(held >= usize::from(replicas.max(1)).min(members.len().max(1)))
+}
+
+/// First backoff after a background tombstone spread missed a member.
+const SPREAD_BACKOFF: Duration = Duration::from_secs(1);
+
+/// Longest backoff between background tombstone spreads.
+const SPREAD_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// Spread every tombstone not yet held by all page-zero members under
+/// `membership`, in the background, one task per tombstone at a time, with
+/// exponential backoff while a member stays unreachable.
+fn spawn_spread(local: &Coordinator, membership: &Arc<Membership>) {
+    let directory = local.writes.directory().clone();
+    let placement = membership.version.0;
+    let now = local.fill.dependencies.candidates.ctx().clock.now();
+    for version in directory.tombstones() {
+        let due = directory.with_tombstone(&version, |t| {
+            t.is_some_and(|t| {
+                if t.spread.is_some_and(|at| at != placement) {
+                    // A new placement: new members to tell, right away.
+                    t.spread = None;
+                    t.failures = 0;
+                    t.retry_at = None;
+                }
+                let due =
+                    !t.spreading && t.spread.is_none() && t.retry_at.is_none_or(|at| now >= at);
+                if due {
+                    t.spreading = true;
+                }
+                due
+            })
+        });
+        if !due {
+            continue;
+        }
+        let reset = |directory: &super::Directory, version: &ObjectVersion| {
+            directory.with_tombstone(version, |t| {
+                if let Some(t) = t {
+                    t.spreading = false;
+                }
+            });
+        };
+        let Ok(worker) = local.prefetch_directory().local_coordinator() else {
+            reset(&directory, &version);
+            return;
+        };
+        let Ok(permit) = worker.drivers().reserve() else {
+            reset(&directory, &version);
+            return;
+        };
+        let membership = membership.clone();
+        let directory = directory.clone();
+        permit.submit_detached(async move {
+            let result = async {
+                let mut scope = background_scope(&worker)?;
+                scope.deadline.0 = scope
+                    .deadline
+                    .0
+                    .min(scope.clock().now() + TOMBSTONE_TIMEOUT);
+                spread_tombstone(&worker, &version, &membership, &scope).await
+            }
+            .await;
+            let now = worker.fill.dependencies.candidates.ctx().clock.now();
+            directory.with_tombstone(&version, |t| {
+                if let Some(t) = t {
+                    t.spreading = false;
+                    if t.spread.is_some() {
+                        t.failures = 0;
+                        t.retry_at = None;
+                    } else {
+                        let backoff = SPREAD_BACKOFF
+                            .saturating_mul(1 << t.failures.min(5))
+                            .min(SPREAD_BACKOFF_MAX);
+                        t.failures = t.failures.saturating_add(1);
+                        t.retry_at = Some(now + backoff);
+                    }
+                }
+            });
+            result.map(|_| ())
+        });
+    }
 }
 
 /// The record a displaced manifest replica journals when it drops the
@@ -722,7 +998,7 @@ async fn persist(
     // A persist carries the client's origin context; keep it for the upload
     // (it is the only copy after a coordinator restart).
     let found = directory.with(object, |entry| {
-        let entry = entry.filter(|e| e.role == Role::Coordinator)?;
+        let entry = entry.filter(|e| e.role == Role::Coordinator && e.confirmed)?;
         let resume = entry.session.state() == UploadState::Pending && entry.context.is_none();
         if entry.context.is_none() {
             entry.context = super::duplicate_context(context).ok();
@@ -769,6 +1045,11 @@ async fn replicate(
         return Ok(WriteReply::Failed);
     }
     let directory = local.writes.directory().clone();
+    // A deleted version never comes back (a manifest push that raced the
+    // delete, or one from a node that missed it).
+    if directory.tombstoned(&version) {
+        return Ok(WriteReply::Deleted);
+    }
     // Never displace a session this worker coordinates.
     if directory.with(&object, |e| {
         e.is_some_and(|e| e.role == Role::Coordinator && e.version != version)
@@ -884,7 +1165,33 @@ pub(crate) async fn journal(local: &Coordinator, record: JournalRecord) -> Resul
         .ok_or(Error::Unavailable)?;
     let clock = local.fill.dependencies.candidates.ctx().clock.clone();
     let start = clock.now();
+    let tombstone = match &record {
+        JournalRecord::Tombstone {
+            cache,
+            key,
+            etag,
+            hold_until_millis,
+            replicas,
+        } => Some((
+            ObjectVersion {
+                object: ObjectId {
+                    cache: racer_wire::control::CacheId(cache.clone()),
+                    key: crate::model::CacheKey(*key),
+                },
+                etag: StrongEtag::parse(etag.as_bytes())?,
+            },
+            *hold_until_millis,
+            *replicas,
+        )),
+        _ => None,
+    };
     journal.append(record, None).await?;
+    if let Some((version, hold_until_millis, replicas)) = tombstone {
+        local
+            .writes
+            .directory()
+            .add_tombstone(version, hold_until_millis, replicas);
+    }
     local
         .fill
         .metrics
@@ -894,7 +1201,7 @@ pub(crate) async fn journal(local: &Coordinator, record: JournalRecord) -> Resul
 }
 
 /// Publish the version descriptor and a short-lived current pointer.
-fn publish(local: &Coordinator, object: &ObjectId) -> Result<()> {
+pub(crate) fn publish(local: &Coordinator, object: &ObjectId) -> Result<()> {
     let now = super::wall_now(local);
     let Some((metadata, visible)) = local
         .writes
@@ -1152,10 +1459,13 @@ pub(crate) fn upload_state_deadline(
     (!share.is_zero()).then(|| at + share)
 }
 
-/// Load journaled sessions into the directory once the journal is bound.
-/// Every reloaded session acts as its object's coordinator; a reloaded
-/// manifest replica therefore also releases holders at expiry, which is
-/// idempotent.
+/// Load journaled sessions and tombstones into the directory once the
+/// journal is bound. Every reloaded session acts as its object's
+/// coordinator; a reloaded manifest replica therefore also releases holders
+/// at expiry, which is idempotent. Reloaded committed sessions start
+/// unconfirmed: this worker may have missed a `DELETE` while it was down,
+/// so they serve nothing until the role check confirms that no page-zero
+/// member holds a tombstone for them.
 pub(crate) fn load(local: &Coordinator) {
     if local.writes.loaded() {
         return;
@@ -1167,7 +1477,23 @@ pub(crate) fn load(local: &Coordinator) {
     let now = now_millis(local);
     let lease = u64::try_from(local.writes.settings().lease.as_millis()).unwrap_or(u64::MAX);
     let directory = local.writes.directory().clone();
-    for (key, session) in journal.state().sessions {
+    let state = journal.state();
+    for (key, (hold_until_millis, replicas)) in state.tombstones {
+        let Ok(etag) = StrongEtag::parse(key.etag.as_bytes()) else {
+            continue;
+        };
+        let version = ObjectVersion {
+            object: ObjectId {
+                cache: racer_wire::control::CacheId(key.cache),
+                key: crate::model::CacheKey(key.key),
+            },
+            etag,
+        };
+        if hold_until_millis > now {
+            directory.add_tombstone(version, hold_until_millis, replicas);
+        }
+    }
+    for (key, session) in state.sessions {
         let object = ObjectId {
             cache: racer_wire::control::CacheId(key.cache.clone()),
             key: crate::model::CacheKey(key.key),
@@ -1199,10 +1525,9 @@ pub(crate) fn load(local: &Coordinator) {
                 lease,
             ),
         };
-        directory.replace(
-            object,
-            Entry::new(Role::Coordinator, version, session, None),
-        );
+        let mut entry = Entry::new(Role::Coordinator, version, session, None);
+        entry.confirmed = entry.session.phase() != Phase::Committed;
+        directory.replace(object, entry);
     }
 }
 
@@ -1224,6 +1549,14 @@ pub(crate) async fn maintain(local: &Coordinator) -> Result<()> {
     }
     let membership = local.current_membership();
     let directory = local.writes.directory().clone();
+    // Tombstones last as long as the deleted version's hold.
+    directory.expire_tombstones(now);
+    if let Some(journal) = writer.write_journal() {
+        journal.forget_tombstones(now);
+    }
+    if let Some(membership) = &membership {
+        spawn_spread(local, membership);
+    }
     // WP8: garbage, keys, roles, and repair. Each step is best effort; a
     // failure leaves the rest of the turn to run.
     let _ = super::rekey::run(local, &scope).await;

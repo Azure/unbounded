@@ -61,6 +61,8 @@ pub enum Knowledge {
     Unknown,
     /// It did not answer.
     Silent,
+    /// It holds a tombstone: a client deleted this version.
+    Deleted,
 }
 
 /// Ask `node` for the status of `version`.
@@ -71,9 +73,10 @@ pub(crate) async fn probe(
     version: &ObjectVersion,
     scope: &RequestScope,
 ) -> Knowledge {
+    // Naming the version lets the member answer that it was deleted.
     let operation = PeerOperation::WriteSession {
         object: version.object.clone(),
-        etag: None,
+        etag: Some(version.etag.clone()),
         action: Box::new(WriteAction::Status { wait_millis: 0 }),
     };
     let context = super::bare_context(&version.object);
@@ -81,6 +84,7 @@ pub(crate) async fn probe(
         Ok(WriteReply::Status { state, etag }) if etag.as_bytes() == version.etag.as_bytes() => {
             Knowledge::Known(state)
         }
+        Ok(WriteReply::Deleted) => Knowledge::Deleted,
         Ok(_) => Knowledge::Unknown,
         Err(_) => Knowledge::Silent,
     }
@@ -120,14 +124,43 @@ pub(crate) async fn check_roles(
             if e.session.phase() != Phase::Committed || wall >= e.session.spec().hold_until_millis {
                 return None;
             }
-            let due = e
-                .role_checked
-                .is_none_or(|(at, when)| at != placement || now >= when + ROLE_RECHECK);
-            due.then(|| (e.role, e.version.clone()))
+            // An unconfirmed (restored) session is checked every turn.
+            let due = !e.confirmed
+                || e.role_checked
+                    .is_none_or(|(at, when)| at != placement || now >= when + ROLE_RECHECK);
+            due.then(|| {
+                (
+                    e.role,
+                    e.version.clone(),
+                    e.confirmed,
+                    e.session.spec().hold_until_millis,
+                    e.session.spec().replicas,
+                )
+            })
         });
-        let Some((role, version)) = due else {
+        let Some((role, version, confirmed, hold_until_millis, replicas)) = due else {
             continue;
         };
+        let deleted = || async {
+            super::coordinator::record_tombstone(local, &version, hold_until_millis, replicas).await
+        };
+        if !confirmed {
+            match confirm(local, membership, &version, replicas, scope).await? {
+                Confirmation::Deleted => {
+                    deleted().await?;
+                    continue;
+                }
+                Confirmation::Pending => continue,
+                Confirmation::Live => {
+                    directory.with(&object, |e| {
+                        if let Some(e) = e.filter(|e| e.version == version) {
+                            e.confirmed = true;
+                        }
+                    });
+                    let _ = super::coordinator::publish(local, &object);
+                }
+            }
+        }
         let member = page_zero_members(local, membership, &object, scope)
             .await?
             .contains(&local.local_node());
@@ -137,10 +170,25 @@ pub(crate) async fn check_roles(
                 e.role_checked = Some((placement, now));
             }
         });
+        let decided = match decided {
+            Decision::Deleted => {
+                deleted().await?;
+                continue;
+            }
+            Decision::Lead => None,
+            Decision::Defer(leader) => Some(leader),
+        };
         match (role, decided) {
             // Only a page-zero member may take over: deletes and readers
             // reach those members, not a replica the placement moved away.
+            // It first asks the members ranked behind it for a tombstone
+            // (those ahead answered `decide`): a replica that missed a
+            // delete must not take the deleted version over.
             (Role::Replica, None) if member => {
+                if tombstoned_behind(local, membership, &version, scope).await? {
+                    deleted().await?;
+                    continue;
+                }
                 promote(local, &object, &version, membership, scope).await;
             }
             // A member knows it: this displaced manifest copy is not
@@ -168,22 +216,103 @@ pub(crate) async fn check_roles(
     Ok(())
 }
 
-/// `None` when this worker should coordinate `version`, or the first member
-/// ranked ahead of it that knows the version.
+/// The outcome of a role decision.
+enum Decision {
+    /// This worker should coordinate the version.
+    Lead,
+    /// The first member ranked ahead of this worker that knows the version.
+    Defer(NodeId),
+    /// A member ranked ahead holds a tombstone for the version.
+    Deleted,
+}
+
+/// Whether this worker should coordinate `version`.
 async fn decide(
     local: &Coordinator,
     membership: &Arc<Membership>,
     version: &ObjectVersion,
     scope: &RequestScope,
-) -> Result<Option<NodeId>> {
+) -> Result<Decision> {
     let me = local.local_node();
     let ranked = page_zero_members(local, membership, &version.object, scope).await?;
     for node in ranked.into_iter().take_while(|node| *node != me) {
-        if let Knowledge::Known(_) = probe(local, membership, &node, version, scope).await {
-            return Ok(Some(node));
+        match probe(local, membership, &node, version, scope).await {
+            Knowledge::Known(_) => return Ok(Decision::Defer(node)),
+            Knowledge::Deleted => return Ok(Decision::Deleted),
+            Knowledge::Unknown | Knowledge::Silent => {}
         }
     }
-    Ok(None)
+    Ok(Decision::Lead)
+}
+
+/// Whether a page-zero member ranked behind this worker holds a tombstone
+/// for `version`.
+async fn tombstoned_behind(
+    local: &Coordinator,
+    membership: &Arc<Membership>,
+    version: &ObjectVersion,
+    scope: &RequestScope,
+) -> Result<bool> {
+    let me = local.local_node();
+    let ranked = page_zero_members(local, membership, &version.object, scope).await?;
+    for node in ranked.into_iter().skip_while(|node| *node != me).skip(1) {
+        if probe(local, membership, &node, version, scope).await == Knowledge::Deleted {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// What a restored session's tombstone check found.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum Confirmation {
+    /// No member that answered holds a tombstone, and too few stayed silent
+    /// to hide one: the version is live.
+    Live,
+    /// A member holds a tombstone: the version was deleted.
+    Deleted,
+    /// Too many members stayed silent; ask again next turn.
+    Pending,
+}
+
+/// Ask every page-zero member (other than this worker) whether it holds a
+/// tombstone for `version`. An acknowledged delete left one on at least
+/// `min(replicas, members)` of them, so the version is live once fewer
+/// than that many stayed silent and none answered `deleted`
+/// ([`confirmation`]).
+async fn confirm(
+    local: &Coordinator,
+    membership: &Arc<Membership>,
+    version: &ObjectVersion,
+    replicas: u8,
+    scope: &RequestScope,
+) -> Result<Confirmation> {
+    let me = local.local_node();
+    let members = page_zero_members(local, membership, &version.object, scope).await?;
+    let others: Vec<NodeId> = members.iter().filter(|n| **n != me).cloned().collect();
+    let answers = futures::future::join_all(
+        others
+            .iter()
+            .map(|node| probe(local, membership, node, version, scope)),
+    )
+    .await;
+    Ok(confirmation(&answers, replicas, members.len()))
+}
+
+/// [`confirm`]'s rule over the other members' `answers`, for a version of
+/// `replicas` replicas among `members` page-zero members (this worker
+/// included when it is one).
+pub(crate) fn confirmation(answers: &[Knowledge], replicas: u8, members: usize) -> Confirmation {
+    if answers.contains(&Knowledge::Deleted) {
+        return Confirmation::Deleted;
+    }
+    let quorum = usize::from(replicas.max(1)).min(members.max(1));
+    let silent = answers.iter().filter(|a| **a == Knowledge::Silent).count();
+    if silent < quorum {
+        Confirmation::Live
+    } else {
+        Confirmation::Pending
+    }
 }
 
 /// Take over `version`: restore the manifest copies and resume a pending
@@ -196,7 +325,8 @@ async fn promote(
     scope: &RequestScope,
 ) {
     let promoted = local.writes.directory().with(object, |e| {
-        let Some(e) = e.filter(|e| e.version == *version && e.role == Role::Replica) else {
+        let Some(e) = e.filter(|e| e.version == *version && e.role == Role::Replica && e.confirmed)
+        else {
             return false;
         };
         e.role = Role::Coordinator;
@@ -220,6 +350,7 @@ pub(crate) async fn resume(
     let pending = local.writes.directory().with(object, |e| {
         e.is_some_and(|e| {
             e.role == Role::Coordinator
+                && e.confirmed
                 && e.session.phase() == Phase::Committed
                 && e.session.state() == UploadState::Pending
                 && e.context.is_some()
@@ -260,5 +391,42 @@ async fn demote(
             scope,
         )
         .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_restored_session_is_live_only_when_no_hidden_tombstone_can_exist() {
+        use Knowledge::*;
+        let known = Known(UploadState::Never);
+        // Any tombstone wins, whatever else answered.
+        assert_eq!(
+            confirmation(&[known.clone(), Deleted, Silent], 2, 4),
+            Confirmation::Deleted
+        );
+        // replicas=2 over 4 members: an acknowledged delete left the
+        // tombstone on two others, so one silent member cannot hide it.
+        assert_eq!(
+            confirmation(&[known.clone(), Unknown, Silent], 2, 4),
+            Confirmation::Live
+        );
+        assert_eq!(
+            confirmation(&[Unknown, Silent, Silent], 2, 4),
+            Confirmation::Pending
+        );
+        // replicas=1: the only tombstone may be on the silent member.
+        assert_eq!(
+            confirmation(&[Unknown, Silent], 1, 3),
+            Confirmation::Pending
+        );
+        assert_eq!(confirmation(&[Unknown, Unknown], 1, 3), Confirmation::Live);
+        // Fewer members than replicas: a delete needed every member, this
+        // worker included, so it was never acknowledged without it.
+        assert_eq!(confirmation(&[Silent], 3, 2), Confirmation::Live);
+        // Alone: nobody to ask.
+        assert_eq!(confirmation(&[], 2, 1), Confirmation::Live);
     }
 }

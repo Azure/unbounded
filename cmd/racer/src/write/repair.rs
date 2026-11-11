@@ -92,6 +92,7 @@ pub(crate) async fn maintain_object(
     let eligible = local.writes.directory().with(object, |e| {
         e.is_some_and(|e| {
             e.role == Role::Coordinator
+                && e.confirmed
                 && e.session.phase() == Phase::Committed
                 && !matches!(
                     e.session.state(),

@@ -105,12 +105,41 @@ pub struct JournalState {
     pub pages: BTreeMap<PageKey, JournalPage>,
     /// Live sessions.
     pub sessions: BTreeMap<VersionKey, JournalSession>,
+    /// Client-deleted versions, with the hold deadline (Unix millis) until
+    /// which this worker remembers each deletion and the version's replica
+    /// count. Pruned only by [`WriteJournal::forget_tombstones`].
+    pub tombstones: BTreeMap<VersionKey, (u64, u8)>,
 }
 
 impl JournalState {
-    /// Apply one record. `Abort` and `Delete` also drop the version's pages,
-    /// so a crash between them and the page releases loses no release.
+    /// Whether the version was deleted by a client (a live tombstone).
+    fn tombstoned(&self, cache: &str, key: &[u8; 32], etag: &str) -> bool {
+        self.tombstones.contains_key(&VersionKey {
+            cache: cache.to_owned(),
+            key: *key,
+            etag: etag.to_owned(),
+        })
+    }
+
+    /// Apply one record. `Abort`, `Delete`, and `Tombstone` also drop the
+    /// version's pages, so a crash between them and the page releases loses
+    /// no release. A tombstoned version never comes back: its later `Open`,
+    /// `Commit`, and `Page` records are ignored.
     pub fn apply(&mut self, record: &JournalRecord) {
+        match record {
+            JournalRecord::Page {
+                cache, key, etag, ..
+            }
+            | JournalRecord::Open {
+                cache, key, etag, ..
+            } if self.tombstoned(cache, key, etag) => return,
+            JournalRecord::Commit {
+                cache,
+                key,
+                manifest,
+            } if self.tombstoned(cache, key, &manifest.etag) => return,
+            _ => {}
+        }
         match record.clone() {
             JournalRecord::Page {
                 cache,
@@ -226,6 +255,23 @@ impl JournalState {
                         || page.etag != version.etag
                 });
             }
+            JournalRecord::Tombstone {
+                cache,
+                key,
+                etag,
+                hold_until_millis,
+                replicas,
+            } => {
+                let version = VersionKey { cache, key, etag };
+                self.sessions.remove(&version);
+                self.pages.retain(|page, _| {
+                    page.cache != version.cache
+                        || page.key != version.key
+                        || page.etag != version.etag
+                });
+                let facts = self.tombstones.entry(version).or_insert((0, replicas));
+                facts.0 = facts.0.max(hold_until_millis);
+            }
             JournalRecord::Checkpoint { sequence } => self.sequence = sequence,
             // The session only: its written pages stay pinned.
             JournalRecord::Forget { cache, key, etag } => {
@@ -244,10 +290,20 @@ impl JournalState {
     }
 
     /// The records that rebuild this state, after a compaction point at
-    /// `sequence`: the checkpoint, then sessions, then pages.
+    /// `sequence`: the checkpoint, then tombstones, sessions, and pages.
     pub fn records(&self, sequence: u64) -> Vec<JournalRecord> {
-        let mut out = Vec::with_capacity(1 + self.sessions.len() + self.pages.len());
+        let mut out =
+            Vec::with_capacity(1 + self.tombstones.len() + self.sessions.len() + self.pages.len());
         out.push(JournalRecord::Checkpoint { sequence });
+        for (version, (hold_until_millis, replicas)) in &self.tombstones {
+            out.push(JournalRecord::Tombstone {
+                cache: version.cache.clone(),
+                key: version.key,
+                etag: version.etag.clone(),
+                hold_until_millis: *hold_until_millis,
+                replicas: *replicas,
+            });
+        }
         for (version, session) in &self.sessions {
             out.push(match session {
                 JournalSession::Open {
@@ -648,6 +704,24 @@ impl WriteJournal {
         }
     }
 
+    /// Drop tombstones whose hold ended at `now_millis` from the live state
+    /// without journaling; the next compaction leaves them out. A replay of
+    /// an older file may restore one, which is harmless: the version's hold
+    /// is over, so no copy of it can serve.
+    pub fn forget_tombstones(&self, now_millis: u64) -> Vec<VersionKey> {
+        let mut state = self.state.borrow_mut();
+        let expired: Vec<VersionKey> = state
+            .tombstones
+            .iter()
+            .filter(|(_, (until, _))| *until <= now_millis)
+            .map(|(version, _)| version.clone())
+            .collect();
+        for version in &expired {
+            state.tombstones.remove(version);
+        }
+        expired
+    }
+
     /// Group commits completed, each one data and one journal barrier.
     pub fn barriers(&self) -> u64 {
         self.barriers.get()
@@ -907,6 +981,71 @@ mod tests {
             etag: "\"w\"".into(),
         });
         assert!(state.sessions.is_empty());
+    }
+
+    /// A tombstone drops the version's session and pages, survives a
+    /// compaction, and keeps a late `Open`, `Commit`, or `Page` of the same
+    /// version from reviving it. Other versions of the key are unaffected.
+    #[test]
+    fn tombstones_outlive_compaction_and_block_revival() {
+        let version = |etag: &str| VersionKey {
+            cache: "c".into(),
+            key: [1; 32],
+            etag: etag.into(),
+        };
+        let tombstone = |etag: &str, hold_until_millis| JournalRecord::Tombstone {
+            cache: "c".into(),
+            key: [1; 32],
+            etag: etag.into(),
+            hold_until_millis,
+            replicas: 2,
+        };
+        let commit = |etag: &str| JournalRecord::Commit {
+            cache: "c".into(),
+            key: [1; 32],
+            manifest: manifest(etag),
+        };
+        let mut state = JournalState::from_records(&[commit("\"v\""), page(0), page(1)]);
+        state.apply(&tombstone("\"v\"", 50));
+        assert!(state.sessions.is_empty());
+        assert!(state.pages.is_empty());
+        assert_eq!(state.tombstones[&version("\"v\"")], (50, 2));
+        // A late copy of the deleted version is ignored.
+        for late in [
+            commit("\"v\""),
+            page(0),
+            JournalRecord::Open {
+                cache: "c".into(),
+                key: [1; 32],
+                etag: "\"v\"".into(),
+                session: SessionId([9; 16]),
+                spec: spec(),
+                lease_until_millis: 5,
+            },
+        ] {
+            state.apply(&late);
+        }
+        assert!(state.sessions.is_empty());
+        assert!(state.pages.is_empty());
+        // A new version of the same key is live.
+        state.apply(&commit("\"w\""));
+        assert!(state.sessions.contains_key(&version("\"w\"")));
+        // A repeated tombstone keeps the later deadline.
+        state.apply(&tombstone("\"v\"", 40));
+        assert_eq!(state.tombstones[&version("\"v\"")], (50, 2));
+        // Compaction keeps the tombstone ahead of the sessions it blocks.
+        let records = state.records(3);
+        assert!(matches!(records[1], JournalRecord::Tombstone { .. }));
+        let mut rebuilt = JournalState::from_records(&records);
+        assert_eq!(
+            rebuilt,
+            JournalState {
+                sequence: 3,
+                ..state
+            }
+        );
+        rebuilt.apply(&commit("\"v\""));
+        assert!(!rebuilt.sessions.contains_key(&version("\"v\"")));
     }
 
     #[test]

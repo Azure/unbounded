@@ -67,6 +67,14 @@ pub struct Entry {
     /// millis) they were first seen missing. A holder is dropped only after
     /// `RACER_WRITE_HOLDER_GRACE_SECS`; one seen again is forgotten.
     pub missing: std::collections::BTreeMap<racer_core::write::NodeIdBytes, u64>,
+
+    /// Whether this worker may serve the version. A committed session
+    /// restored from the journal starts unconfirmed: it may have missed a
+    /// `DELETE` while the worker was down, so it serves no fresh read and
+    /// takes no coordinator action until its role check finds that no
+    /// page-zero member holds a tombstone for it
+    /// (`failover::check_roles`).
+    pub confirmed: bool,
 }
 
 impl Entry {
@@ -87,6 +95,7 @@ impl Entry {
             role_checked: None,
             rebalanced: None,
             missing: Default::default(),
+            confirmed: true,
         }
     }
 
@@ -111,12 +120,50 @@ impl Entry {
     }
 
     /// Whether readers should see this version as the object's current one:
-    /// committed, not uploaded (the origin is authoritative afterward), and
-    /// inside its hold.
+    /// confirmed, committed, not uploaded (the origin is authoritative
+    /// afterward), and inside its hold.
     pub fn visible(&self, now: SystemTime) -> bool {
-        matches!(self.session.phase(), Phase::Committed)
+        self.confirmed
+            && matches!(self.session.phase(), Phase::Committed)
             && self.session.state() != UploadState::Committed
             && now < crate::store::writes::from_unix_millis(self.session.spec().hold_until_millis)
+    }
+}
+
+/// A client-deleted version this worker remembers until its hold ends.
+#[derive(Clone, Debug)]
+pub struct Tombstone {
+    /// The version's hold deadline (Unix millis): no copy serves past it.
+    pub hold_until_millis: u64,
+    /// The version's replica count: an acknowledged delete left the
+    /// tombstone on at least this many page-zero members (or all of them,
+    /// when fewer).
+    pub replicas: u8,
+    /// A background task is spreading it to page-zero members.
+    pub spreading: bool,
+    /// Background spreads that left a member without it, in a row, and
+    /// when the next may start (exponential backoff).
+    pub failures: u32,
+    pub retry_at: Option<std::time::Instant>,
+    /// The membership version under which every page-zero member of the
+    /// object acknowledged this tombstone, if one did.
+    pub spread: Option<u64>,
+    /// Members that acknowledged it under the membership version `acked.0`.
+    pub acked: (u64, std::collections::BTreeSet<racer_wire::control::NodeId>),
+}
+
+impl Tombstone {
+    /// A tombstone nobody else acknowledged yet.
+    pub fn new(hold_until_millis: u64, replicas: u8) -> Self {
+        Self {
+            hold_until_millis,
+            replicas,
+            spreading: false,
+            failures: 0,
+            retry_at: None,
+            spread: None,
+            acked: Default::default(),
+        }
     }
 }
 
@@ -124,9 +171,65 @@ impl Entry {
 #[derive(Default)]
 pub struct Directory {
     entries: RefCell<HashMap<ObjectId, Entry>>,
+    tombstones: RefCell<HashMap<ObjectVersion, Tombstone>>,
 }
 
 impl Directory {
+    /// Whether `version` was deleted by a client and its tombstone is live.
+    pub fn tombstoned(&self, version: &ObjectVersion) -> bool {
+        self.tombstones.borrow().contains_key(version)
+    }
+
+    /// Whether `object` has an unconfirmed (restored, not yet checked for
+    /// tombstones) committed session here. Fresh reads of it are retryable,
+    /// not `404`, until it is confirmed or dropped.
+    pub fn unconfirmed(&self, object: &ObjectId) -> bool {
+        self.entries
+            .borrow()
+            .get(object)
+            .is_some_and(|e| !e.confirmed && matches!(e.session.phase(), Phase::Committed))
+    }
+
+    /// Remember the tombstone of `version` (keeping the later hold).
+    pub fn add_tombstone(&self, version: ObjectVersion, hold_until_millis: u64, replicas: u8) {
+        let mut tombstones = self.tombstones.borrow_mut();
+        let tombstone = tombstones
+            .entry(version)
+            .or_insert_with(|| Tombstone::new(hold_until_millis, replicas));
+        tombstone.hold_until_millis = tombstone.hold_until_millis.max(hold_until_millis);
+    }
+
+    /// Run `f` on the tombstone of `version`.
+    pub fn with_tombstone<R>(
+        &self,
+        version: &ObjectVersion,
+        f: impl FnOnce(Option<&mut Tombstone>) -> R,
+    ) -> R {
+        f(self.tombstones.borrow_mut().get_mut(version))
+    }
+
+    /// Every live tombstone's version.
+    pub fn tombstones(&self) -> Vec<ObjectVersion> {
+        self.tombstones.borrow().keys().cloned().collect()
+    }
+
+    /// The tombstoned versions of `object`.
+    pub fn tombstones_of(&self, object: &ObjectId) -> Vec<ObjectVersion> {
+        self.tombstones
+            .borrow()
+            .keys()
+            .filter(|v| v.object == *object)
+            .cloned()
+            .collect()
+    }
+
+    /// Drop tombstones whose hold ended at `now_millis`.
+    pub fn expire_tombstones(&self, now_millis: u64) {
+        self.tombstones
+            .borrow_mut()
+            .retain(|_, t| t.hold_until_millis > now_millis);
+    }
+
     /// The current written version of `object` for a fresh refresh, if one is
     /// visible.
     pub fn current(&self, object: &ObjectId, now: SystemTime) -> Option<ObjectMetadata> {

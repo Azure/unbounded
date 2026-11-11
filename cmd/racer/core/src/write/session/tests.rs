@@ -60,6 +60,7 @@ fn kinds(effects: &[SessionEffect]) -> Vec<&'static str> {
                 JournalRecord::State { .. } => "journal-state",
                 JournalRecord::Abort { .. } => "journal-abort",
                 JournalRecord::Delete { .. } => "journal-delete",
+                JournalRecord::Tombstone { .. } => "journal-tombstone",
                 _ => "journal-other",
             },
             SessionEffect::Release { .. } => "release",
@@ -282,7 +283,17 @@ fn persist_only_in_manual() {
 fn delete_is_terminal() {
     let mut s = committed(UploadMode::Never);
     let effects = s.on_event(SessionEvent::DeleteRequested, 2);
-    assert_eq!(kinds(&effects), ["journal-delete", "release", "unpublish"]);
+    assert_eq!(
+        kinds(&effects),
+        ["journal-tombstone", "release", "unpublish"]
+    );
+    // The tombstone lasts as long as the version's hold.
+    assert!(matches!(
+        &effects[0],
+        SessionEffect::Journal(JournalRecord::Tombstone {
+            hold_until_millis, ..
+        }) if *hold_until_millis == s.spec().hold_until_millis
+    ));
     assert_eq!(s.phase(), Phase::Deleted);
     assert!(s.is_terminal());
     for event in [
@@ -294,7 +305,7 @@ fn delete_is_terminal() {
     }
     let mut open = open(UploadMode::Auto);
     let effects = open.on_event(SessionEvent::DeleteRequested, 2);
-    assert_eq!(kinds(&effects), ["journal-delete", "release-targets"]);
+    assert_eq!(kinds(&effects), ["journal-tombstone", "release-targets"]);
     assert_eq!(open.phase(), Phase::Deleted);
 }
 

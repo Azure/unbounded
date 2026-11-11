@@ -43,7 +43,12 @@ pub async fn serve_store(
     membership: Arc<Membership>,
     scope: &RequestScope,
 ) -> Result<WriteReply> {
-    if !writes_enabled(local, &version.object) || store.page_size != local.page_size()? {
+    if !writes_enabled(local, &version.object)
+        || store.page_size != local.page_size()?
+        || local.writes.directory().tombstoned(&version)
+    {
+        // A deleted version takes no new copies (a repair or rebalance that
+        // raced the delete).
         return Ok(WriteReply::Failed);
     }
     let directory = local.prefetch_directory();

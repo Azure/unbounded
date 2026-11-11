@@ -99,6 +99,21 @@ pub enum JournalRecord {
         key: [u8; 32],
         etag: String,
     },
+    /// Kind 10: a client deleted the version. Like `Delete`, replay drops
+    /// its session and written pages; unlike it, the worker also remembers
+    /// the deletion until `hold_until_millis` (the version's hold), so a
+    /// node that missed the delete cannot bring the version back: a later
+    /// `Open`, `Commit`, or `Page` of it is ignored, and peers that ask about
+    /// it hear that it was deleted. `replicas` is the version's replica
+    /// count: a retried delete needs that many page-zero members to hold
+    /// the tombstone.
+    Tombstone {
+        cache: String,
+        key: [u8; 32],
+        etag: String,
+        hold_until_millis: u64,
+        replicas: u8,
+    },
 }
 
 impl JournalRecord {
@@ -114,6 +129,7 @@ impl JournalRecord {
             Self::Delete { .. } => 7,
             Self::Checkpoint { .. } => 8,
             Self::Forget { .. } => 9,
+            Self::Tombstone { .. } => 10,
         }
     }
 }
@@ -342,6 +358,17 @@ fn body(record: &JournalRecord, out: &mut Vec<u8>) -> Result<(), JournalError> {
             object(out, cache, key, Some(etag))?;
         }
         JournalRecord::Checkpoint { sequence } => out.extend_from_slice(&sequence.to_be_bytes()),
+        JournalRecord::Tombstone {
+            cache,
+            key,
+            etag,
+            hold_until_millis,
+            replicas,
+        } => {
+            object(out, cache, key, Some(etag))?;
+            out.extend_from_slice(&hold_until_millis.to_be_bytes());
+            out.push(*replicas);
+        }
     }
     Ok(())
 }
@@ -500,7 +527,7 @@ fn read_body(kind: u8, r: &mut Reader<'_>) -> Result<JournalRecord, JournalError
     if kind == 8 {
         return Ok(JournalRecord::Checkpoint { sequence: r.u64()? });
     }
-    if !(1..=7).contains(&kind) && kind != 9 {
+    if !(1..=7).contains(&kind) && kind != 9 && kind != 10 {
         return Err(JournalError::Corrupt);
     }
     let cache = r.string()?;
@@ -553,6 +580,13 @@ fn read_body(kind: u8, r: &mut Reader<'_>) -> Result<JournalRecord, JournalError
         },
         6 => JournalRecord::Abort { cache, key, etag },
         9 => JournalRecord::Forget { cache, key, etag },
+        10 => JournalRecord::Tombstone {
+            cache,
+            key,
+            etag,
+            hold_until_millis: r.u64()?,
+            replicas: r.u8()?,
+        },
         _ => JournalRecord::Delete { cache, key, etag },
     })
 }
@@ -656,6 +690,13 @@ mod tests {
                 key: [1; 32],
                 etag: etag(),
             },
+            JournalRecord::Tombstone {
+                cache: cache(),
+                key: [1; 32],
+                etag: etag(),
+                hold_until_millis: 77,
+                replicas: 3,
+            },
         ]
     }
 
@@ -669,7 +710,7 @@ mod tests {
     fn every_kind_round_trips() {
         let records = all();
         let kinds: Vec<u8> = records.iter().map(JournalRecord::kind).collect();
-        assert_eq!(kinds, (1..=9).collect::<Vec<_>>());
+        assert_eq!(kinds, (1..=10).collect::<Vec<_>>());
         let mut stream = Vec::new();
         for record in &records {
             let b = bytes(record);

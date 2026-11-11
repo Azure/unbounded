@@ -109,6 +109,13 @@ fn actions() -> Vec<(WriteAction, bool)> {
         ),
         (WriteAction::Delete, false),
         (WriteAction::Delete, true),
+        (
+            WriteAction::Tombstone {
+                hold_until_millis: 1_900_000_000_000,
+                replicas: 2,
+            },
+            true,
+        ),
         (WriteAction::Persist, false),
         (
             WriteAction::Replicate {
@@ -424,6 +431,7 @@ fn write_replies_round_trip_and_bind_to_their_request() {
         (&session_op, WriteReply::LeaseExpired),
         (&upload_op, WriteReply::Unknown),
         (&upload_op, WriteReply::Failed),
+        (&session_op, WriteReply::Deleted),
     ];
     for (i, (operation, reply)) in cases.into_iter().enumerate() {
         let request = write_request(&env, 60 + i as u8, operation());

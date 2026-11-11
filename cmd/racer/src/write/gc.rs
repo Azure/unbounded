@@ -198,6 +198,7 @@ async fn orphans(
     let due: Vec<ObjectVersion> = {
         let mut gc = local.writes.gc.borrow_mut();
         gc.versions.retain(|v, _| by_version.contains_key(v));
+        let directory = local.writes.directory();
         by_version
             .keys()
             .filter(|v| {
@@ -205,7 +206,9 @@ async fn orphans(
                     unknown_since: None,
                     next: now,
                 });
-                probe.next <= now
+                // A version this worker knows was deleted goes at once
+                // (a copy that landed after its tombstone did).
+                probe.next <= now || directory.tombstoned(v)
             })
             .take(PROBES_PER_TURN)
             .cloned()
@@ -238,11 +241,14 @@ async fn orphans(
                 Knowledge::Unknown => {
                     probe.unknown_since.get_or_insert(now);
                 }
-                Knowledge::Silent => {}
+                Knowledge::Silent | Knowledge::Deleted => {}
             }
-            probe
-                .unknown_since
-                .is_some_and(|since| now.saturating_duration_since(since) >= orphan_after)
+            // A deleted version's pages go at once: the delete's release
+            // missed this holder (it was down or cut off).
+            knowledge == Knowledge::Deleted
+                || probe
+                    .unknown_since
+                    .is_some_and(|since| now.saturating_duration_since(since) >= orphan_after)
         };
         if !expired {
             continue;
@@ -270,17 +276,29 @@ async fn known(
     if let Some((Role::Coordinator | Role::Replica, state)) = local_entry {
         return Ok(Knowledge::Known(state));
     }
+    if local.writes.directory().tombstoned(version) {
+        return Ok(Knowledge::Deleted);
+    }
     // Every member must answer: a silent one may be the coordinator or a
     // manifest replica that knows the version (a partition or a stale link
     // must never turn a live write into an orphan).
+    // A tombstone anywhere wins over a member that still knows the version
+    // (one restored from its journal that has not heard of the delete yet).
     let mut silent = false;
+    let mut known = None;
     let page_zero = page_zero_members(local, membership, &version.object, scope).await?;
     for node in &page_zero {
         match probe(local, membership, node, version, scope).await {
-            Knowledge::Known(state) => return Ok(Knowledge::Known(state)),
+            Knowledge::Known(state) => {
+                known.get_or_insert(state);
+            }
+            Knowledge::Deleted => return Ok(Knowledge::Deleted),
             Knowledge::Unknown => {}
             Knowledge::Silent => silent = true,
         }
+    }
+    if let Some(state) = known {
+        return Ok(Knowledge::Known(state));
     }
     if silent {
         return Ok(Knowledge::Silent);
@@ -305,6 +323,7 @@ async fn known(
     for node in rest {
         match probe(local, membership, &node, version, scope).await {
             Knowledge::Known(state) => return Ok(Knowledge::Known(state)),
+            Knowledge::Deleted => return Ok(Knowledge::Deleted),
             Knowledge::Unknown => {}
             Knowledge::Silent => silent = true,
         }

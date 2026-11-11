@@ -74,6 +74,7 @@ pub fn action_name(action: &WriteAction) -> &'static str {
         WriteAction::Abort { .. } => "abort",
         WriteAction::Status { .. } => "status",
         WriteAction::Delete => "delete",
+        WriteAction::Tombstone { .. } => "tombstone",
         WriteAction::Persist => "persist",
         WriteAction::Replicate { .. } | WriteAction::ReplicateRanked { .. } => "replicate",
     }
@@ -175,6 +176,16 @@ pub(super) fn encode_action(head: &mut MessageHead, action: &WriteAction) -> Res
             }
         }
         WriteAction::Delete | WriteAction::Persist => {}
+        WriteAction::Tombstone {
+            hold_until_millis,
+            replicas,
+        } => {
+            if *replicas == 0 {
+                return Err(Error::InvalidRequest);
+            }
+            push(head, WRITE_HOLD_UNTIL, hold_until_millis);
+            push(head, WRITE_REPLICAS, replicas);
+        }
         WriteAction::Replicate { manifest } => {
             check_spec(&manifest.spec)?;
             let mut encoded = Vec::new();
@@ -281,6 +292,13 @@ pub(super) fn decode_action(head: &MessageHead) -> Result<WriteAction> {
             WriteAction::Status { wait_millis }
         }
         "delete" => WriteAction::Delete,
+        "tombstone" => WriteAction::Tombstone {
+            hold_until_millis: number(head, WRITE_HOLD_UNTIL)?,
+            replicas: u8::try_from(number(head, WRITE_REPLICAS)?)
+                .ok()
+                .filter(|r| *r != 0)
+                .ok_or(Error::InvalidRequest)?,
+        },
         "persist" => WriteAction::Persist,
         "replicate" if head.unique(WRITE_HOLDER_RANKS)?.is_some() => {
             let manifest =
@@ -381,7 +399,8 @@ pub(super) fn encode_reply(head: &mut MessageHead, reply: &WriteReply) -> Result
         | WriteReply::Full
         | WriteReply::LeaseExpired
         | WriteReply::Unknown
-        | WriteReply::Failed => {}
+        | WriteReply::Failed
+        | WriteReply::Deleted => {}
     }
     Ok(())
 }
@@ -419,6 +438,7 @@ pub(super) fn decode_reply(head: &MessageHead) -> Result<WriteReply> {
         "lease-expired" => WriteReply::LeaseExpired,
         "unknown" => WriteReply::Unknown,
         "failed" => WriteReply::Failed,
+        "deleted" => WriteReply::Deleted,
         _ => return Err(Error::InvalidRequest),
     })
 }
