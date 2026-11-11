@@ -901,6 +901,10 @@ impl Index {
             .pages
             .set_hash_key(page_alloc::intern::KeyedState::from_bytes(key))
     }
+    /// Pages currently mapped.
+    pub fn page_count(&self) -> usize {
+        self.state.borrow().pages.len()
+    }
     pub fn page_capacity(&self) -> usize {
         self.page_capacity.get()
     }

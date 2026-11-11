@@ -364,6 +364,7 @@ impl StoreWriter {
                 });
             }
             let mut lost = Vec::new();
+            let mut publications = Vec::new();
             // Newest generation first per segment: a journal record proves its
             // segment was recycled after any older generation, so older
             // records on that segment are stale.
@@ -379,8 +380,8 @@ impl StoreWriter {
             for (key, entry) in pages {
                 scope.check()?;
                 match self.restore_written(&key, &entry, scope).await? {
-                    Ok((page, true)) => recovery.restored.push(page),
-                    Ok((page, false)) => recovery.unindexed.push(page),
+                    Ok((page, Some(publication))) => publications.push((page, publication)),
+                    Ok((page, None)) => recovery.unindexed.push(page),
                     Err(reason) => {
                         lost.push(key.clone());
                         recovery.lost.push(LostPage {
@@ -389,6 +390,15 @@ impl StoreWriter {
                             reason,
                         });
                     }
+                }
+            }
+            // Publish only after every journaled page is pinned, so reclaiming
+            // index entries for one cannot evict another's segment.
+            for (page, (entry, plaintext)) in publications {
+                if self.publish_restored(&page, entry, plaintext) {
+                    recovery.restored.push(page);
+                } else {
+                    recovery.unindexed.push(page);
                 }
             }
             journal.forget_pages(&lost);
@@ -421,7 +431,7 @@ impl StoreWriter {
         key: &PageKey,
         entry: &JournalPage,
         scope: &RequestScope,
-    ) -> Result<std::result::Result<(PageId, bool), LostReason>> {
+    ) -> Result<std::result::Result<(PageId, Option<(IndexedPage, u64)>), LostReason>> {
         let Ok(id) = page_id(key) else {
             return Ok(Err(LostReason::Malformed));
         };
@@ -497,27 +507,42 @@ impl StoreWriter {
         ) {
             self.index.unpin_segment(previous.location.segment)?;
         }
-        let cache = &id.version.object.cache;
-        // The page key is not required: a restarting node may not have its
-        // keyring yet, and the catalog's lookup checks the key per read.
-        let indexed = !self.availability.passthrough(cache)
-            && self
-                .index
-                .publish_written(
-                    id.clone(),
-                    IndexedPage {
-                        location,
-                        page_size: envelope.page_size,
-                        metadata: decoded.header.metadata.clone(),
-                        key_id: envelope.key_id,
-                    },
-                )
-                .is_ok();
-        if indexed {
-            self.retention()
-                .published(&id, u64::from(envelope.plaintext_length));
+        let publication = (!self.availability.passthrough(&id.version.object.cache)).then(|| {
+            (
+                IndexedPage {
+                    location,
+                    page_size: envelope.page_size,
+                    metadata: decoded.header.metadata.clone(),
+                    key_id: envelope.key_id,
+                },
+                u64::from(envelope.plaintext_length),
+            )
+        });
+        Ok(Ok((id, publication)))
+    }
+
+    /// Publish a restored written page. The page key is not required: a
+    /// restarting node may not have its keyring yet, and the catalog's lookup
+    /// checks the key per read. A full index evicts unpinned (checkpoint
+    /// restored, disposable) mappings: every journaled page is pinned before
+    /// any is published, so only cache entries are reclaimed.
+    fn publish_restored(&self, id: &PageId, entry: IndexedPage, plaintext: u64) -> bool {
+        let mut result = self.index.publish_written(id.clone(), entry.clone());
+        while result == Err(Error::Overloaded) {
+            let Some(clock) = self.clock.borrow().clone() else {
+                break;
+            };
+            let before = self.index.page_count();
+            let _ = clock.reclaim_entries();
+            if self.index.page_count() >= before {
+                break;
+            }
+            result = self.index.publish_written(id.clone(), entry.clone());
         }
-        Ok(Ok((id, indexed)))
+        if result.is_ok() {
+            self.retention().published(id, plaintext);
+        }
+        result.is_ok()
     }
 
     /// Store a verified ciphertext page as a durable written page: append it

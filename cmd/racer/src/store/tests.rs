@@ -7120,6 +7120,44 @@ mod written {
         assert_eq!(restored, ids[2..].to_vec());
     }
 
+    /// A checkpoint fills the page index with cache mappings; a page written
+    /// after it must still be indexed on restart, evicting disposable cache
+    /// mappings rather than leaving the journaled page unreadable.
+    #[test]
+    fn restored_written_page_evicts_checkpoint_mappings_from_a_full_index() {
+        let (simulation, env) = sim();
+        let f = opened(&env);
+        recover(&f, &env, LAYOUT, COMPACT);
+        // Room for the write too, so it does not recycle a cache segment.
+        f.store.writer.index().set_page_capacity(5).unwrap();
+        let request = scope(&env);
+        for number in 2..=5 {
+            f.enqueue(f.copy(number, 100)).unwrap();
+            drive(&f.reactor, f.store.writer.progress(8, &request)).unwrap();
+        }
+        assert_eq!(f.store.writer.index().page_count(), 4);
+        let image = drive(&f.reactor, f.store.checkpoint.snapshot_shard()).unwrap();
+        f.store.checkpoint.finish_snapshot();
+        let copy = f.copy(1, 100);
+        let page = id(&copy);
+        let entry = persist(&f, &env, copy).unwrap();
+        assert_eq!(f.store.writer.index().page_count(), 5);
+        let f = f.restart_after(&env, || simulation.disk().crash().unwrap());
+        open(&f);
+        // The restarted node indexes fewer pages: the cut alone fills it.
+        f.store.writer.index().set_page_capacity(4).unwrap();
+        drive(&f.reactor, f.store.recovery.install_shard(Some(image))).unwrap();
+        assert_eq!(f.store.writer.index().page_count(), 4);
+        let recovered = recover(&f, &env, LAYOUT, COMPACT);
+        assert!(recovered.lost.is_empty(), "{:?}", recovered.lost);
+        assert!(recovered.unindexed.is_empty());
+        assert_eq!(recovered.restored, vec![page.clone()]);
+        assert_eq!(read(&f, &env, &page), Some(vec![1; 116]));
+        let index = f.store.writer.index();
+        assert!(index.page_count() <= 4);
+        assert_eq!(index.segment_pins(entry.location.segment), 1);
+    }
+
     /// Checkpoint, recycle a segment, write a page into its new generation,
     /// and crash before the next checkpoint. The checkpoint restores the
     /// segment at its older generation; the journal record supersedes it,
