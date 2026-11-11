@@ -1169,3 +1169,185 @@ fn full_page_upload_fits_a_small_request_context_budget() {
     drop(f);
     server.join().unwrap();
 }
+
+/// Hands out a fresh token per call and records rejections.
+#[derive(Default)]
+struct CountingTokens {
+    issued: std::cell::Cell<u32>,
+    rejected: std::cell::RefCell<Vec<Vec<u8>>>,
+}
+
+impl AzureTokenSource for Rc<CountingTokens> {
+    fn bearer<'a>(
+        &'a self,
+        _credential: &'a AzureCredential,
+        _scope: &'a RequestScope,
+    ) -> crate::error::Operation<'a, Option<super::super::BearerToken>> {
+        Box::pin(async move {
+            self.issued.set(self.issued.get() + 1);
+            let token = format!("token-{}", self.issued.get()).into_bytes();
+            Ok(Some(super::super::BearerToken::new(token)?))
+        })
+    }
+
+    fn rejected(&self, _: &AzureCredential, _: Option<&[u8]>, sent: Option<&[u8]>) -> bool {
+        self.rejected
+            .borrow_mut()
+            .push(sent.unwrap_or_default().to_vec());
+        true
+    }
+}
+
+/// Serve one connection: read the request head only, answer `response`,
+/// then close with the body unread so the client's body write fails. The
+/// response is sent and the write side shut down before the close, so it is
+/// readable before the reset. Returns the request head.
+fn answer_early(listener: &std::net::TcpListener, response: &[u8]) -> String {
+    use std::io::{Read, Write};
+    let (mut tcp, _) = listener.accept().unwrap();
+    let mut head = Vec::new();
+    let mut byte = [0];
+    while !head.ends_with(b"\r\n\r\n") {
+        assert_eq!(tcp.read(&mut byte).unwrap(), 1);
+        head.push(byte[0]);
+    }
+    tcp.write_all(response).unwrap();
+    tcp.flush().unwrap();
+    tcp.shutdown(std::net::Shutdown::Write).unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    drop(tcp);
+    String::from_utf8(head).unwrap()
+}
+
+/// A 401 sent before the service read the body, followed by a close, still
+/// reaches the token source: the rejected token is dropped and the retry
+/// carries a new one.
+#[test]
+fn early_401_during_upload_refreshes_the_token() {
+    let env = racer_io::Env::host();
+    let Some(reactor) = reactor(&env) else { return };
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let uploads = Arc::new(Mutex::new(Uploads::default()));
+    let state = uploads.clone();
+    let server = std::thread::spawn(move || {
+        let first = answer_early(
+            &listener,
+            b"HTTP/1.1 401 Unauthorized\r\nx-ms-error-code: InvalidAuthenticationInfo\r\nWWW-Authenticate: Bearer authorization_uri=https://login.microsoftonline.com/t/oauth2/authorize resource_id=https://storage.azure.com\r\nContent-Length: 0\r\n\r\n",
+        );
+        let (tcp, _) = listener.accept().unwrap();
+        let mut tcp = tcp;
+        let (head, body) = crate::remote::tests::read_request(&mut tcp).unwrap();
+        let busy = Mutex::new(false);
+        let response = azure_upload(&head, &body, &state, &busy);
+        std::io::Write::write_all(&mut tcp, &response).unwrap();
+        (first, head)
+    });
+    let tokens = Rc::new(CountingTokens::default());
+    let f = fixture(
+        reactor,
+        &format!("http://127.0.0.1:{}/account/models", address.port()),
+        AzureCredential::ManagedIdentity { client_id: None },
+        MapResolver::new(vec![]),
+        TrustRoots::unavailable("/nonexistent/racer-bundle.pem".into()),
+        tokens.clone(),
+    );
+    let page: Vec<u8> = (0..PAGE_BYTES as usize).map(byte).collect();
+    let id = crate::origin::azure::upload::block_id(b"0123456789abcdef0123456789abcdef", 0);
+    let scope = scope();
+    drive(
+        &f.reactor,
+        Box::pin(
+            f.origin
+                .put_block_with(&f.definition, &context("obj"), &id, &page, &scope),
+        ),
+    )
+    .unwrap();
+    assert_eq!(*tokens.rejected.borrow(), vec![b"token-1".to_vec()]);
+    assert_eq!(tokens.issued.get(), 2);
+    let (first, second) = server.join().unwrap();
+    assert_eq!(header(&first, "Authorization"), Some("Bearer token-1"));
+    assert_eq!(header(&second, "Authorization"), Some("Bearer token-2"));
+    assert_eq!(uploads.lock().unwrap().staged.len(), 1);
+    drop(f);
+}
+
+/// A success status sent before the service read the whole body is not
+/// trusted: the upload fails.
+#[test]
+fn early_success_during_upload_is_not_trusted() {
+    let env = racer_io::Env::host();
+    let Some(reactor) = reactor(&env) else { return };
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        answer_early(
+            &listener,
+            b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n",
+        )
+    });
+    let f = fixture(
+        reactor,
+        &format!("http://127.0.0.1:{}/account/models", address.port()),
+        AzureCredential::Anonymous,
+        MapResolver::new(vec![]),
+        TrustRoots::unavailable("/nonexistent/racer-bundle.pem".into()),
+        AnonymousOnly,
+    );
+    let page: Vec<u8> = (0..PAGE_BYTES as usize).map(byte).collect();
+    let id = crate::origin::azure::upload::block_id(b"0123456789abcdef0123456789abcdef", 0);
+    let scope = scope();
+    let result = drive(
+        &f.reactor,
+        Box::pin(
+            f.origin
+                .put_block_with(&f.definition, &context("obj"), &id, &page, &scope),
+        ),
+    );
+    assert!(result.is_err(), "{result:?}");
+    server.join().unwrap();
+    drop(f);
+}
+
+/// A full page uploads over HTTPS through the chunked, recoverable body write.
+#[test]
+fn https_full_page_upload() {
+    let env = racer_io::Env::host();
+    let Some(reactor) = reactor(&env) else { return };
+    let identity = test_identity(&["account.blob.example"]);
+    let uploads = Arc::new(Mutex::new(Uploads::default()));
+    let busy = Arc::new(Mutex::new(false));
+    let (state, flag) = (uploads.clone(), busy.clone());
+    let (address, _accepted, server) =
+        serve(Some(identity.server.clone()), 1, move |head, body| {
+            azure_upload(head, body, &state, &flag)
+        });
+    let f = fixture(
+        reactor,
+        &format!(
+            "https://account.blob.example:{}/account/models",
+            address.port()
+        ),
+        AzureCredential::Anonymous,
+        MapResolver::new(vec![address]),
+        TrustRoots::fixed(http1::tls::client_config(identity.roots.clone())),
+        AnonymousOnly,
+    );
+    let page: Vec<u8> = (0..PAGE_BYTES as usize).map(byte).collect();
+    let id = crate::origin::azure::upload::block_id(b"0123456789abcdef0123456789abcdef", 0);
+    let scope = scope();
+    drive(
+        &f.reactor,
+        Box::pin(
+            f.origin
+                .put_block_with(&f.definition, &context("obj"), &id, &page, &scope),
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        uploads.lock().unwrap().staged.values().next().unwrap(),
+        &page
+    );
+    drop(f);
+    server.join().unwrap();
+}

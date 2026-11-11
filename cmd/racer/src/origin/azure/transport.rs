@@ -296,6 +296,13 @@ impl AzureTransport for PoolTransport {
     /// allocation. A failure is never retried here: the request may have
     /// reached the service, so the caller decides (Put Block and conditional
     /// Put Block List are safe to repeat).
+    ///
+    /// The service may answer before reading the whole body, for example a
+    /// 401 for a revoked token, and close the connection so the rest of the
+    /// body fails to send. Such an early response is returned when it is an
+    /// error status, so the caller can classify it and refresh a rejected
+    /// token. Any other status for a body that was not fully sent is never
+    /// trusted: the send error is returned instead.
     fn exchange_body<'a>(
         &'a self,
         url: &'a AzureContainerUrl,
@@ -320,12 +327,17 @@ impl AzureTransport for PoolTransport {
                 let mut chunk = self.io.buffer(body.len().min(BODY_CHUNK_BYTES))?;
                 for piece in body.chunks(BODY_CHUNK_BYTES) {
                     chunk.bytes_mut()?[..piece.len()].copy_from_slice(piece);
-                    let done = self
+                    match self
                         .io
-                        .write_body_range(lease, chunk, 0..piece.len(), scope)
-                        .await?;
-                    lease = done.lease;
-                    chunk = done.buffer;
+                        .write_body_range_recoverable(lease, chunk, 0..piece.len(), scope)
+                        .await
+                    {
+                        Ok(done) => {
+                            lease = done.lease;
+                            chunk = done.buffer;
+                        }
+                        Err(failure) => return self.early_response(failure, scope).await,
+                    }
                 }
             }
             let started = std::cell::Cell::new(false);
@@ -347,6 +359,39 @@ impl AzureTransport for PoolTransport {
 /// Largest piece of an upload body copied into request-context storage at a
 /// time.
 pub(crate) const BODY_CHUNK_BYTES: usize = 64 * 1024;
+
+impl PoolTransport {
+    /// After a body write failed, read a response the service already sent.
+    /// Only an error status (4xx or 5xx) is returned; anything else, or no
+    /// readable response, yields the send error.
+    async fn early_response(
+        &self,
+        failure: http1::connection::SendFailure<crate::http::HttpContext>,
+        scope: &RequestScope,
+    ) -> Result<PoolExchange> {
+        let Some(lease) = failure.connection else {
+            return Err(failure.error);
+        };
+        let started = std::cell::Cell::new(false);
+        let Ok(response) = self
+            .io
+            .receive_head_observed(lease, scope, MAX_RESPONSE_HEAD, &started)
+            .await
+        else {
+            return Err(failure.error);
+        };
+        if !matches!(response.value.start, StartLine::Response { status } if status >= 400) {
+            return Err(failure.error);
+        }
+        Ok(PoolExchange {
+            head: response.value,
+            lease: response.connection,
+            _decoded: response._decoded,
+            io: self.io.clone(),
+            is_head: false,
+        })
+    }
+}
 
 /// One pooled response.
 pub struct PoolExchange {
