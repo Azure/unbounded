@@ -1342,6 +1342,10 @@ If too few nodes can take a page and at least one was full, the write fails
 with `503`, `Retry-After: 1`, and `Racer-Write-Error: dirty-cap`. If no node
 was full, the token is `owners`. The SDKs can retry these for you.
 
+New written pages also leave one segment per storage worker free of written
+data, so key rotation can always move written pages to the new key. A node
+whose written data fills all but that segment refuses new pages the same way.
+
 Node settings for writes are in the [Writes](#writes) table above.
 
 #### Write metrics

@@ -2120,6 +2120,44 @@ does not answer would make objects the adapter serves read as missing during
 an adapter restart. A `404` needs an explicit "no origin" setting in the
 cache definition, which does not exist yet. The e2e accepts `404` or `503`.
 
+### Review fixes: recovery and rekey headroom (as built)
+
+- **Recycled segment after a checkpoint.** Checkpoints are not fsynced, so a
+  restart may restore a segment at an older generation than a journaled
+  record written after the segment was recycled. `Segments::adopt_written`
+  (`cmd/racer/alloc/src/segments.rs`) used to answer `Stale` and recovery
+  dropped the intact page. A non-free, unleased slot at an older generation
+  is now superseded: it becomes Sealed at the journal's generation with only
+  the journaled prefix used, and `StoreWriter::drop_superseded`
+  (`cmd/racer/src/store/writes.rs`) removes the checkpoint's mappings of the
+  older generation. Recovery restores journal records newest generation first
+  per segment, so an older record on a superseded segment is `Stale`. Test:
+  `store::tests::written::journal_supersedes_a_segment_recycled_after_the_checkpoint`.
+- **Full index on restart.** A checkpoint that fills the page index made
+  `Index::publish_written` return `Overloaded` for a page written after the
+  cut, leaving it pinned but unindexed. Recovery now pins every journaled page
+  first and then publishes them, reclaiming unpinned (checkpoint cache)
+  segments through `SegmentClock::reclaim_entries` while the index is full
+  (`StoreWriter::publish_restored`). Pinned segments are never reclaimed, so
+  journaled pages win over disposable mappings. Test:
+  `store::tests::written::restored_written_page_evicts_checkpoint_mappings_from_a_full_index`.
+- **Rekey near the dirty cap.** Rekeying pages in `HashMap` order spread new
+  records over the free space without emptying any source segment, so with
+  `maxDirtyPercent` near 90 it could stall until the old key retired. A scan
+  now queues whole source segments (any segment with a non-active-key
+  record), fewest live written records first, records in offset order, and
+  moves every record of a segment, including current-key ones, through
+  `StoreWriter::relocate_written` before starting the next
+  (`cmd/racer/src/write/rekey.rs`). A page that hits `Overloaded` goes back to
+  the front of the queue. New written pages that would pin another segment
+  must leave `REKEY_RESERVE_SEGMENTS` (1) segments unpinned (`headroom` in
+  `writes.rs`; tables of two or fewer segments keep no reserve); rekey
+  replacements may use it. One segment's live records always fit in one
+  segment, and once moved the source segment is evictable again. Tests:
+  `write::rekey::tests::evacuation_drains_the_smallest_source_segment_first`,
+  `store::writes::headroom_tests::new_writes_leave_the_rekey_reserve_unpinned`,
+  `store::tests::written::relocate_moves_a_written_record_and_its_pin`.
+
 ### WP12: documentation
 
 Files: `docs/content/reference/racer.md` (new sections after "Prefetch",
