@@ -24,7 +24,9 @@ create-once, so saving to an existing checkpoint_id fails with
 racer.Exists. Every ``persist_every``-th step is uploaded to the origin
 (data objects with ``Racer-Upload: auto``, ``.metadata`` with ``manual`` and
 then ``persist``, as below); other steps stay cache-only (``never``) until
-their hold ends.
+their hold ends. When steps are uploaded, ``bucket`` must be the container
+in the cache's Azure ``containerURL``; Racer rejects other buckets with
+``400`` (``Racer-Write-Error: bucket``).
 
 Requires torch (``pip install racer-client[dcp]``). See designs/racer-writes.md,
 WP10.

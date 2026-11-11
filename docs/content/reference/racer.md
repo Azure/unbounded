@@ -2122,7 +2122,8 @@ fmt.Println(result.ETag, result.UploadState)
 The zero `WriteOptions` uses the cache defaults. `OriginDurable` waits for the
 upload to commit. `RetryBusy` retries `503` answers for up to that long; `Put`
 retries only when the body is an `io.ReadSeeker`. `Request.Metadata` must not
-name a version. Errors match `ErrExists` (`412`), `ErrWritesDisabled` (`405`),
+name a version, and unless the upload mode is `never` its bucket must be the
+origin's container. Errors match `ErrExists` (`412`), `ErrWritesDisabled` (`405`),
 `ErrBusy` (`503`), `ErrUploadFailed` (`502`), `ErrConflict` (`409`), and
 `ErrInternal` (`500`). Use
 `errors.As` with `*WriteError` to read the status, `Racer-Write-Error` token,

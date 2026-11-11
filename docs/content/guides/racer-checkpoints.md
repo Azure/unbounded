@@ -59,15 +59,24 @@ import torch.distributed.checkpoint as dcp
 from racer.dcp import RacerStorageReader, RacerStorageWriter
 
 client = racer.Client(cache="ckpt")
+container = "<container>"  # the container in the cache's containerURL
 
-writer = RacerStorageWriter(client, "ckpt", "runs/a", step=step, persist_every=10)
+writer = RacerStorageWriter(client, container, "runs/a", step=step, persist_every=10)
 dcp.save(state_dict, checkpoint_id=f"step-{step}", storage_writer=writer)
 
-reader = RacerStorageReader(client, "ckpt", "runs/a")
+reader = RacerStorageReader(client, container, "runs/a")
 dcp.load(state_dict, checkpoint_id=f"step-{step}", storage_reader=reader)
 ```
 
+Create a new writer, with a new `checkpoint_id` and `step`, for each save.
+
 How it works:
+
+- The second argument is the bucket in each object's `Racer-Metadata`. Use
+  the container name from the cache's `containerURL`: uploads go to that
+  container, and Racer rejects an uploaded write that names another bucket
+  with `400` (`Racer-Write-Error: bucket`). Objects land in the container as
+  `<prefix>/<checkpoint_id>/<file>`, for example `runs/a/step-100/.metadata`.
 
 - Each rank writes one data object with `host_write` and `replicas=2`.
 - The coordinator rank writes `.metadata` last, after every data object is
@@ -104,11 +113,15 @@ checks, default 1), and `upload_timeout` (seconds to wait for uploads, default
 The Python client writes single objects too:
 
 ```python
-request = racer.object_request("ckpt", "runs/a/step-100/weights.bin")
+request = racer.object_request("<container>", "runs/a/step-100/weights.bin")
 result = client.write(request, data, replicas=2, upload="manual", hold_seconds=3600)
-state = client.persist(request)  # start the upload
-client.delete(request)           # or drop it from the cache
+state = client.persist(request)  # start the upload, or
+# client.delete(request)         # drop it from the cache instead
 ```
+
+The bucket must be the origin's container unless `upload="never"`. Each key
+can be written once: write `step-101/weights.bin` next, not
+`step-100/weights.bin` again.
 
 `host_write(request, fd, offset, length)` writes from a memfd or regular file
 without copying through the socket. Pass `durability_origin=True` to wait

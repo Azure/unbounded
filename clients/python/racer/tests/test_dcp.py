@@ -286,3 +286,30 @@ def test_multi_rank_save_load(server, tmp_path, small_pages):
     persisted, committed = server.persisted[0]
     assert persisted == meta
     assert set(committed) == {k for k, n in names.items() if n != ".metadata"}
+
+
+def test_uploaded_step_needs_the_origin_container_as_bucket(server, client):
+    # Like the dataplane: an uploading write must name the origin's container.
+    def reject(kind, k, headers):
+        upload = headers.get("racer-upload", server.default_upload)
+        if upload != "never" and f'"bucket":"{BUCKET}"' not in headers.get("racer-metadata", ""):
+            return (400, "bucket", None)
+        return None
+
+    server.write_reject = reject
+    def foreign():
+        writer = rdcp.RacerStorageWriter(client, "other", PREFIX, step=3, persist_every=3)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            dcp.save(state(), checkpoint_id="c1", storage_writer=writer)
+
+    failure = rank0_failure(foreign)
+    assert isinstance(failure, racer.errors.WriteInvalid) and failure.code == "bucket"
+    # Cache-only steps never reach the origin, so any bucket works.
+    writer = rdcp.RacerStorageWriter(client, "other", PREFIX, step=4, persist_every=3)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        dcp.save(state(), checkpoint_id="c2", storage_writer=writer)
+    assert writer.written == ["__0_0.distcp", ".metadata"]
+    # With the container as bucket, the uploaded step saves.
+    save(client, state(), "c3", step=3, persist_every=3)

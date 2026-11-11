@@ -80,13 +80,16 @@ limits into tickets `<id>.0`, `<id>.1`, and so on. Rejections raise
 ## Writing
 
 ```python
-request = racer.object_request("ckpt", "runs/a/step-100/weights.bin")
-result = client.write(request, data, replicas=2, upload="never", hold_seconds=3600)
+# The bucket is the container in the cache's Azure containerURL.
+scratch = racer.object_request("my-container", "runs/a/step-100/scratch.bin")
+result = client.write(scratch, data, replicas=2, upload="never", hold_seconds=3600)
+client.delete(scratch)  # drop it before its hold ends
+
+weights = racer.object_request("my-container", "runs/a/step-100/weights.bin")
 with racer.HostBuffer(len(data)) as buf:
     buf.view[:] = data
-    result = client.host_write(request, buf.fileno(), 0, buf.size)  # SCM_RIGHTS, no socket copy
-state = client.persist(request)  # start the upload of a "manual" object
-client.delete(request)
+    result = client.host_write(weights, buf.fileno(), 0, buf.size, upload="manual")  # SCM_RIGHTS, no socket copy
+state = client.persist(weights)  # start the upload of the "manual" object
 ```
 
 On a cache with writes enabled, `write` creates an object from bytes or a
@@ -94,7 +97,10 @@ binary file. `host_write` creates one from a window of a memfd or regular
 file. Writes are create-once: an existing key raises `Exists`. The call
 returns after Racer has `replicas` durable cache copies, or after the origin
 upload with `durability_origin=True`. `upload` is `auto`, `manual`, or
-`never`. `stat` reports `upload_state` for written objects. Failures raise
+`never`, and defaults to the cache's `writes.upload.mode`. A cache without
+an origin accepts only `never`. Unless `upload` is `never`, the request's
+bucket must be the origin container; another bucket gets `400` with code
+`bucket`. `persist` works only on `manual` objects. `stat` reports `upload_state` for written objects. Failures raise
 `WriteError` subclasses: `Exists`, `WritesDisabled`, `Busy` (pass
 `retry_busy=seconds` to retry), `UploadFailed`, and `Conflict`. Write
 requests must not name a `version_id`.
@@ -105,16 +111,18 @@ requests must not name a `version_id`.
 import torch.distributed.checkpoint as dcp
 from racer.dcp import RacerStorageReader, RacerStorageWriter
 
-writer = RacerStorageWriter(client, "ckpt", "runs/a", step=step, persist_every=10)
+writer = RacerStorageWriter(client, "my-container", "runs/a", step=step, persist_every=10)
 dcp.save(state_dict, checkpoint_id=f"step-{step}", storage_writer=writer)
-dcp.load(state_dict, checkpoint_id=f"step-{step}", storage_reader=RacerStorageReader(client, "ckpt", "runs/a"))
+dcp.load(state_dict, checkpoint_id=f"step-{step}", storage_reader=RacerStorageReader(client, "my-container", "runs/a"))
 ```
 
 Install with the `dcp` extra (`torch>=2.4`). Each rank writes one data
 object with `replicas=2`, and the coordinator writes `.metadata` last.
 Every `persist_every`-th step is uploaded to the origin, and other steps
 stay cache-only. A checkpoint without `.metadata` is incomplete:
-`RacerStorageReader` raises `IncompleteCheckpoint`.
+`RacerStorageReader` raises `IncompleteCheckpoint`. Use a new
+`checkpoint_id` for every save: writes are create-once. When
+`persist_every` is above 0, the bucket must be the origin container.
 
 ## Object keys
 
