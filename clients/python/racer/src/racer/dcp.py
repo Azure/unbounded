@@ -10,12 +10,21 @@ coordinator writes ``.metadata`` last, only after every data object returned
 RacerStorageReader reads ``.metadata`` first and raises IncompleteCheckpoint
 when it is missing.
 
+A ``201`` means durable in the cache, not uploaded, and Racer uploads objects
+in no particular order. So when a step is uploaded, the coordinator writes
+``.metadata`` with ``Racer-Upload: manual``, polls every data object's upload
+state until it is ``committed``, and only then persists ``.metadata``. The
+origin therefore never holds ``.metadata`` without every data object it names.
+In the cache, ``is_complete`` and ``read_metadata`` see ``.metadata`` as soon
+as every data object is cache-durable.
+
 Objects are keyed like racer-object S3 objects:
 ``object_key(bucket, f"{prefix}/{checkpoint_id}/{name}")``. Writes are
 create-once, so saving to an existing checkpoint_id fails with
 racer.Exists. Every ``persist_every``-th step is uploaded to the origin
-(``Racer-Upload: auto``); other steps stay cache-only (``never``) until their
-hold ends.
+(data objects with ``Racer-Upload: auto``, ``.metadata`` with ``manual`` and
+then ``persist``, as below); other steps stay cache-only (``never``) until
+their hold ends.
 
 Requires torch (``pip install racer-client[dcp]``). See designs/racer-writes.md,
 WP10.
@@ -27,6 +36,7 @@ import dataclasses
 import io
 import os
 import pickle
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Any
@@ -54,6 +64,7 @@ DATA_SUFFIX = ".distcp"
 DEFAULT_REPLICAS = 2
 
 __all__ = [
+    "CheckpointUploadError",
     "IncompleteCheckpoint",
     "RacerStorageReader",
     "RacerStorageWriter",
@@ -64,6 +75,10 @@ __all__ = [
 
 class IncompleteCheckpoint(RacerError, FileNotFoundError):
     """The checkpoint has no ``.metadata``: it was never finished, or it expired."""
+
+
+class CheckpointUploadError(RacerError):
+    """A data object failed to upload, or did not upload in time, so ``.metadata`` was not persisted."""
 
 
 @dataclass(frozen=True)
@@ -135,8 +150,12 @@ class RacerStorageWriter(StorageWriter):
         replicas: int = DEFAULT_REPLICAS,
         hold_seconds: int | None = None,
         retry_busy: float = 0.0,
+        upload_poll_interval: float = 1.0,
+        upload_timeout: float | None = 3600.0,
     ) -> None:
         super().__init__()
+        if upload_poll_interval <= 0 or (upload_timeout is not None and upload_timeout < 0):
+            raise RacerError("upload_poll_interval must be positive and upload_timeout not negative")
         self.client = client
         self.bucket = bucket
         self.prefix = prefix
@@ -147,6 +166,10 @@ class RacerStorageWriter(StorageWriter):
         self.replicas = replicas
         self.hold_seconds = hold_seconds
         self.retry_busy = retry_busy
+        # When uploading, finish() waits for every data object's upload to
+        # commit before it persists .metadata; None waits without a limit.
+        self.upload_poll_interval = upload_poll_interval
+        self.upload_timeout = upload_timeout
         self.save_id = uuid.uuid4().hex
         self.rank: int | None = None
         self.use_collectives = True
@@ -196,7 +219,37 @@ class RacerStorageWriter(StorageWriter):
         name = METADATA_NAME
         if not self.use_collectives and self.rank is not None:
             name = f"__{self.rank}{METADATA_NAME}"
-        self._put(name, pickle.dumps(metadata))
+        if self.upload != "auto":
+            self._put(name, pickle.dumps(metadata))
+            return
+        # Upload .metadata only after every data object is at the origin.
+        self._put(name, pickle.dumps(metadata), upload="manual")
+        self._await_uploads(sorted({info.relative_path for info in storage.values()}))
+        self.client.persist(self.request(name))
+
+    def _await_uploads(self, names: list[str]) -> None:
+        """Poll each data object's upload state until it is committed."""
+        deadline = None if self.upload_timeout is None else time.monotonic() + self.upload_timeout
+        pending = list(names)
+        while pending:
+            waiting = []
+            for name in pending:
+                state = self.client.stat(self.request(name)).upload_state
+                if state == "failed":
+                    raise CheckpointUploadError(f"checkpoint {self.checkpoint_id!r}: upload of {name} failed")
+                if state != "committed":
+                    waiting.append(name)
+            pending = waiting
+            if not pending:
+                return
+            if deadline is not None and time.monotonic() >= deadline:
+                raise CheckpointUploadError(
+                    f"checkpoint {self.checkpoint_id!r}: {len(pending)} data objects not uploaded in time"
+                )
+            pause = self.upload_poll_interval
+            if deadline is not None:
+                pause = max(0.0, min(pause, deadline - time.monotonic()))
+            time.sleep(pause)
 
     def storage_meta(self) -> StorageMeta | None:
         return StorageMeta(checkpoint_id=self.checkpoint_id, save_id=self.save_id)
@@ -213,16 +266,16 @@ class RacerStorageWriter(StorageWriter):
             raise RacerError("checkpoint_id is required")
         return checkpoint_request(self.bucket, self.prefix, self.checkpoint_id, name)
 
-    def _options(self) -> dict:
+    def _options(self, upload: str | None = None) -> dict:
         return {
             "replicas": self.replicas,
-            "upload": self.upload,
+            "upload": upload or self.upload,
             "hold_seconds": self.hold_seconds,
             "retry_busy": self.retry_busy,
         }
 
-    def _put(self, name: str, data: bytes) -> None:
-        self.client.write(self.request(name), data, **self._options())
+    def _put(self, name: str, data: bytes, upload: str | None = None) -> None:
+        self.client.write(self.request(name), data, **self._options(upload))
         self.written.append(name)
 
     def _write_data(self, plan: SavePlan, planner: SavePlanner) -> list[WriteResult]:
@@ -285,7 +338,12 @@ class RacerStorageReader(StorageReader):
         self.load_id = uuid.uuid4().hex
 
     def is_complete(self, rank: int | None = None) -> bool:
-        """Report whether the checkpoint's ``.metadata`` exists."""
+        """Report whether the checkpoint's ``.metadata`` exists in the cache.
+
+        It exists once every data object is durable in the cache. It says
+        nothing about the origin: for an uploaded step, ``.metadata`` reaches
+        the origin only after every data object it names is committed there.
+        """
         try:
             self.client.stat(self.request(self._metadata_name(rank)))
         except NotFound:

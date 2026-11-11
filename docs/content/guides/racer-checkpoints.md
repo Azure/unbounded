@@ -71,15 +71,25 @@ How it works:
 - The coordinator rank writes `.metadata` last, after every data object is
   stored. A checkpoint without `.metadata` is incomplete, and
   `RacerStorageReader` raises `IncompleteCheckpoint`.
-- Steps that are a multiple of `persist_every` use upload mode `auto` and go to
-  the origin. Other steps use `never` and stay only in the cache until their
-  hold ends. `persist_every=0` keeps every step cache-only.
+- Steps that are a multiple of `persist_every` go to the origin. Data objects
+  use upload mode `auto`. Uploads finish in any order, so `.metadata` uses
+  `manual`: the coordinator waits until every data object's upload is
+  `committed`, then persists `.metadata`. The origin never has `.metadata`
+  without its data. If an upload fails or does not finish within
+  `upload_timeout`, the save raises `CheckpointUploadError` and `.metadata`
+  stays only in the cache.
+- Other steps use `never` and stay only in the cache until their hold ends.
+  `persist_every=0` keeps every step cache-only.
+- `RacerStorageReader.is_complete` checks the cache, not the origin. It is true
+  once `.metadata` is in the cache.
 - Writes are create-once. Saving to an existing `checkpoint_id` raises
   `racer.Exists`.
 
 `RacerStorageWriter` also takes `replicas`, `hold_seconds` (default:
-the cache's `writes.holdTTL`), and `retry_busy` (seconds to retry when nodes
-are at their dirty limit).
+the cache's `writes.holdTTL`), `retry_busy` (seconds to retry when nodes
+are at their dirty limit), `upload_poll_interval` (seconds between upload state
+checks, default 1), and `upload_timeout` (seconds to wait for uploads, default
+3600, `None` for no limit).
 
 ## Write Single Objects
 

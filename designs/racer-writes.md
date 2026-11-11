@@ -1836,6 +1836,16 @@ ETag, raises `IncompleteCheckpoint` (a `RacerError` and `FileNotFoundError`)
 when `.metadata` is missing, and offers `is_complete()`. Re-saving an existing
 `checkpoint_id` fails with `Exists` (create-once).
 
+Review fix (as built): a `201` is cache durability, and uploads finish in
+any order, so an uploaded step must not send `.metadata` with `auto`. For an
+uploaded step `finish` writes `.metadata` with `Racer-Upload: manual`, polls
+`stat().upload_state` of every data object named in the storage data until
+`committed` (`failed` raises `CheckpointUploadError`), then calls `persist` on
+`.metadata`. `upload_poll_interval` (default 1 s) and `upload_timeout`
+(default 3600 s, `None` for no limit) tune the wait; a timeout also raises
+`CheckpointUploadError`. Cache-only steps are unchanged (`never`).
+`is_complete` reports cache completeness only.
+
 ### WP11: simulation and e2e
 
 Files: new `cmd/racer/src/app/dst/writes.rs` (traffic and faults);

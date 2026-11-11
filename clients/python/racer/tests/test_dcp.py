@@ -34,6 +34,12 @@ BUCKET = "ckpt"
 PREFIX = "runs/a"
 
 
+@pytest.fixture(autouse=True)
+def uploads(server):
+    # Data objects upload in the background while the writer polls them.
+    server.advance_uploads = True
+
+
 @pytest.fixture
 def client(server):
     return racer.Client(socket_path=server.path, timeout=10)
@@ -110,10 +116,52 @@ def test_upload_mode_by_step(server, client, step, every, mode):
     assert rdcp.upload_mode(step, every) == mode
     cid = f"s{step}-{every}"
     save(client, state(), cid, step=step, persist_every=every, hold_seconds=600)
-    for name in ("__0_0.distcp", ".metadata"):
-        w = server.written[key(name, cid)]
-        assert w.upload == mode and w.hold_seconds == 600
-        assert w.state == ("pending" if mode == "auto" else "never")
+    data = server.written[key("__0_0.distcp", cid)]
+    meta = server.written[key(".metadata", cid)]
+    assert data.hold_seconds == meta.hold_seconds == 600
+    assert data.upload == mode
+    if mode == "auto":
+        # Data uploads; .metadata is manual and persisted after the data commits.
+        assert data.state == "committed"
+        assert meta.upload == "manual" and meta.state == "pending"
+        assert server.persisted == [(key(".metadata", cid), [key("__0_0.distcp", cid)])]
+    else:
+        assert data.state == meta.state == meta.upload == "never"
+        assert server.persisted == []
+
+
+def test_uploaded_metadata_waits_for_every_data_object(server, client):
+    server.upload_steps[key("__0_0.distcp")] = 3
+    writer = save(client, state(), "c1", step=2, persist_every=2, upload_poll_interval=0.01)
+    assert writer.written == ["__0_0.distcp", ".metadata"]
+    data = key("__0_0.distcp")
+    assert server.heads.count(data) == 4
+    assert server.persisted == [(key(".metadata"), [data])]
+    assert server.written[key(".metadata")].state == "pending"
+
+
+def test_failed_data_upload_does_not_persist_metadata(server, client):
+    server.upload_fail.add(key("__0_0.distcp"))
+    failure = rank0_failure(lambda: save(client, state(), "c1", step=1, persist_every=1, upload_poll_interval=0.01))
+    assert isinstance(failure, rdcp.CheckpointUploadError)
+    assert server.written[key(".metadata")].state == "manual"
+    assert server.persisted == []
+
+
+def test_upload_wait_times_out(server, client):
+    server.upload_steps[key("__0_0.distcp")] = 10**6
+    failure = rank0_failure(
+        lambda: save(client, state(), "c1", step=1, persist_every=1, upload_poll_interval=0.01, upload_timeout=0.05)
+    )
+    assert isinstance(failure, rdcp.CheckpointUploadError)
+    assert server.persisted == []
+
+
+def test_upload_wait_rejects_bad_settings(client):
+    with pytest.raises(racer.RacerError):
+        rdcp.RacerStorageWriter(client, BUCKET, PREFIX, step=1, upload_poll_interval=0)
+    with pytest.raises(racer.RacerError):
+        rdcp.RacerStorageWriter(client, BUCKET, PREFIX, step=1, upload_timeout=-1)
 
 
 def test_upload_mode_rejects_negative():
@@ -189,4 +237,11 @@ def test_multi_rank_save_load(server, tmp_path, small_pages):
     seqs = {names[k]: w.seq for k, w in server.written.items() if k in names}
     assert set(seqs) == set(names.values())
     assert seqs[".metadata"] > max(seqs["__0_0.distcp"], seqs["__1_0.distcp"])
-    assert all(server.written[k].upload == "auto" for k in names)
+    assert all(server.written[k].upload == "auto" for k, n in names.items() if n != ".metadata")
+    meta = rdcp.checkpoint_request(BUCKET, "runs/m", "multi", ".metadata").hex
+    assert server.written[meta].upload == "manual"
+    # .metadata is persisted only after both ranks' data objects committed.
+    assert len(server.persisted) == 1
+    persisted, committed = server.persisted[0]
+    assert persisted == meta
+    assert set(committed) == {k for k, n in names.items() if n != ".metadata"}

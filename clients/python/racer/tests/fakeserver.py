@@ -82,6 +82,18 @@ class FakeRacer:
         self.written: dict[str, Written] = {}
         self.write_reject = None
         self.origin_keys: set[str] = set()
+        # Uploads: when advance_uploads is set, a HEAD of a pending or
+        # uploading object advances it, like
+        # a background upload: upload_steps[key] more HEADs (default 1) report
+        # "uploading", then it is "committed", or "failed" for keys in
+        # upload_fail. upload_order records keys in commit order.
+        self.advance_uploads = False
+        self.upload_steps: dict[str, int] = {}
+        self.upload_fail: set[str] = set()
+        self.upload_order: list[str] = []
+        self.heads: list[str] = []
+        # persisted records (key, upload_order at that moment) per persist.
+        self.persisted: list[tuple[str, list[str]]] = []
         self.write_seq = 0
         self._lock = threading.Lock()
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -258,7 +270,10 @@ class FakeRacer:
         size = len(obj.data)
         if method == "HEAD":
             extra = []
+            self.heads.append(key)
             if key in self.written:
+                if self.advance_uploads:
+                    self._advance_upload(key)
                 extra.append(("Racer-Upload-State", self.written[key].state))
             self._send(
                 conn, 200, meta + extra + [("Content-Length", str(size)), ("Content-Type", "application/octet-stream")]
@@ -446,6 +461,19 @@ class FakeRacer:
             self.objects[key] = Obj(data, etag, headers.get("racer-content-type"))
         self._send(conn, 201, [("ETag", etag), ("Racer-Upload-State", state), ("Content-Length", "0")])
 
+    def _advance_upload(self, key):
+        w = self.written[key]
+        if w.state not in ("pending", "uploading"):
+            return
+        left = self.upload_steps.get(key, 1)
+        if left > 0:
+            self.upload_steps[key] = left - 1
+            w.state = "uploading"
+            return
+        w.state = "failed" if key in self.upload_fail else "committed"
+        if w.state == "committed":
+            self.upload_order.append(key)
+
     def _persist(self, conn, key):
         w = self.written.get(key)
         if w is None:
@@ -454,6 +482,7 @@ class FakeRacer:
         if w.state in ("never", "committed"):
             self._write_error(conn, 409, "not-manual")
             return
+        self.persisted.append((key, list(self.upload_order)))
         if w.state == "manual":
             w.state = "pending"
         self._send(conn, 204, [("Racer-Upload-State", w.state)])
