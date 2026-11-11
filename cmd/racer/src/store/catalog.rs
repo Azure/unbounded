@@ -1194,6 +1194,21 @@ impl Index {
         let mut s = self.state_mut();
         s.pages.remove(page, Some(location));
     }
+    /// Remove `page` mapped at `location` whose bytes are gone, releasing its
+    /// retention charge as an eviction would.
+    pub fn forget_stale(&self, page: &PageId, location: &RecordLocation) {
+        let bytes = {
+            let state = self.state.borrow();
+            let Some(view) = state.pages.get(page) else {
+                return;
+            };
+            view.metadata.page_length_in(page, view.page_size).ok()
+        };
+        if let Some(bytes) = bytes {
+            self.retention().evicted(page, u64::from(bytes));
+        }
+        self.remove_if_matches(page, location);
+    }
     pub fn snapshot(&self) -> Result<IndexSnapshot> {
         let s = self.state.borrow();
         Ok(IndexSnapshot {

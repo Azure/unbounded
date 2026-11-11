@@ -491,14 +491,20 @@ impl Segments {
     /// before any append can reuse it. A free slot at `generation` (or any
     /// older generation, as after a cold start) becomes Sealed at
     /// `generation`; an Open or Sealed slot already at `generation` keeps its
-    /// state. Either way its used prefix grows to cover `used_bytes`. Any
-    /// other state or generation is `Stale`: the bytes may have been reused.
+    /// state. Either way its used prefix grows to cover `used_bytes`.
+    ///
+    /// A non-free, unleased slot at an older generation was restored from a
+    /// checkpoint taken before the segment was recycled and written again.
+    /// The fsynced journal record proves the reuse, so the slot is superseded:
+    /// it becomes Sealed at `generation` with only `used_bytes` in use, and
+    /// `Ok(true)` tells the caller to drop index entries of the older
+    /// generation. Any newer generation, or a leased older one, is `Stale`.
     pub fn adopt_written(
         &self,
         id: SegmentId,
         generation: Generation,
         used_bytes: u64,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if self.frozen.get() {
             return Err(Error::Busy);
         }
@@ -514,6 +520,7 @@ impl Segments {
         let position = Self::position(id)?;
         let mut slots = self.slots_mut();
         let slot = slots.get_mut(position).ok_or(Error::Corrupt)?;
+        let mut superseded = false;
         match slot.image.state {
             SegmentState::Free if slot.image.generation.0 <= generation.0 => {
                 self.free.borrow_mut().remove(&position);
@@ -521,13 +528,31 @@ impl Segments {
                 slot.image.state = SegmentState::Sealed;
             }
             SegmentState::Open | SegmentState::Sealed if slot.image.generation == generation => {}
+            SegmentState::Open | SegmentState::Sealed | SegmentState::Evicting
+                if slot.image.generation.0 < generation.0 && slot.leases.get() == 0 =>
+            {
+                if slot.image.state == SegmentState::Evicting {
+                    self.evicting.set(self.evicting.get() - 1);
+                }
+                if self.open.get() == Some(position) {
+                    self.open.set(None);
+                }
+                if self.written.get().is_some_and(|(open, _)| open == position) {
+                    self.written.set(None);
+                }
+                self.usage.borrow_mut()[slot.usage_group].1 -= slot.image.used_bytes;
+                slot.image.used_bytes = 0;
+                slot.image.generation = generation;
+                slot.image.state = SegmentState::Sealed;
+                superseded = true;
+            }
             _ => return Err(Error::Stale),
         }
         if slot.image.used_bytes < used_bytes {
             self.usage.borrow_mut()[slot.usage_group].1 += used_bytes - slot.image.used_bytes;
             slot.image.used_bytes = used_bytes;
         }
-        Ok(())
+        Ok(superseded)
     }
 
     /// Seal the open segment, if any, so reclaim may evict it. Used when
@@ -938,11 +963,24 @@ mod tests {
         // Adopting again at the same generation only grows the used prefix.
         s.adopt_written(SegmentId(1), Generation(7), 512).unwrap();
         assert_eq!(s.snapshot()[1].used_bytes, 1024);
-        // A different generation on a live slot was reused.
+        // An older generation on a live slot was reused.
         assert_eq!(
             s.adopt_written(SegmentId(1), Generation(6), 512),
             Err(Error::Stale)
         );
+        // A newer generation supersedes a checkpoint-restored live slot.
+        assert!(s.adopt_written(SegmentId(1), Generation(8), 512).unwrap());
+        assert_eq!(s.snapshot()[1].used_bytes, 512);
+        assert_eq!(s.snapshot()[1].generation, Generation(8));
+        assert!(s.lease(SegmentId(1), Generation(7)).is_err());
+        assert!(!s.adopt_written(SegmentId(1), Generation(8), 1024).unwrap());
+        // A leased slot is never superseded.
+        let lease = s.lease(SegmentId(1), Generation(8)).unwrap();
+        assert_eq!(
+            s.adopt_written(SegmentId(1), Generation(9), 512),
+            Err(Error::Stale)
+        );
+        drop(lease);
         let (lease, _) = s.append(512).unwrap();
         let open = lease.id();
         drop(lease);

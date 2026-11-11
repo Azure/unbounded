@@ -7120,6 +7120,51 @@ mod written {
         assert_eq!(restored, ids[2..].to_vec());
     }
 
+    /// Checkpoint, recycle a segment, write a page into its new generation,
+    /// and crash before the next checkpoint. The checkpoint restores the
+    /// segment at its older generation; the journal record supersedes it,
+    /// the stale checkpoint mapping is dropped, and the page survives.
+    #[test]
+    fn journal_supersedes_a_segment_recycled_after_the_checkpoint() {
+        let (simulation, env) = sim();
+        let f = opened(&env);
+        recover(&f, &env, LAYOUT, COMPACT);
+        let first = f.copy(1, 100);
+        let old_page = id(&first);
+        let old = persist(&f, &env, first).unwrap();
+        let segment = old.location.segment;
+        assert!(drive(&f.reactor, f.store.writer.release_written(&old_page)).unwrap());
+        // The cut holds the segment at the old generation with `old_page`.
+        let image = drive(&f.reactor, f.store.checkpoint.snapshot_shard()).unwrap();
+        f.store.checkpoint.finish_snapshot();
+        let index = f.store.writer.index();
+        let mapped = index.lookup(&old_page).unwrap().unwrap().location;
+        index.forget_stale(&old_page, &mapped);
+        f.segments.seal_open();
+        f.segments.begin_evict(segment).unwrap();
+        f.segments.recycle(segment).unwrap();
+        let copy = f.copy(2, 100);
+        let page = id(&copy);
+        let entry = persist(&f, &env, copy).unwrap();
+        assert_eq!(entry.location.segment, segment);
+        assert!(entry.location.generation.0 > old.location.generation.0);
+        let f = f.restart_after(&env, || simulation.disk().crash().unwrap());
+        open(&f);
+        drive(&f.reactor, f.store.recovery.install_shard(Some(image))).unwrap();
+        let index = f.store.writer.index();
+        assert!(index.lookup(&old_page).unwrap().is_some());
+        let recovered = recover(&f, &env, LAYOUT, COMPACT);
+        assert!(recovered.lost.is_empty(), "{:?}", recovered.lost);
+        assert_eq!(recovered.restored, vec![page.clone()]);
+        assert_eq!(read(&f, &env, &page), Some(vec![2; 116]));
+        assert_eq!(
+            f.store.writer.written(&page).unwrap().location,
+            entry.location
+        );
+        assert!(index.lookup(&old_page).unwrap().is_none());
+        assert_eq!(index.segment_pins(segment), 1);
+    }
+
     #[test]
     fn checkpointed_restart_restores_written_pages_through_the_journal() {
         let (_simulation, env) = sim();

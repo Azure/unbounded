@@ -364,7 +364,19 @@ impl StoreWriter {
                 });
             }
             let mut lost = Vec::new();
-            for (key, entry) in opened.state.pages {
+            // Newest generation first per segment: a journal record proves its
+            // segment was recycled after any older generation, so older
+            // records on that segment are stale.
+            let mut pages: Vec<_> = opened.state.pages.into_iter().collect();
+            pages.sort_by(|(a_key, a), (b_key, b)| {
+                (a.segment, std::cmp::Reverse(a.generation), a.offset, a_key).cmp(&(
+                    b.segment,
+                    std::cmp::Reverse(b.generation),
+                    b.offset,
+                    b_key,
+                ))
+            });
+            for (key, entry) in pages {
                 scope.check()?;
                 match self.restore_written(&key, &entry, scope).await? {
                     Ok((page, true)) => recovery.restored.push(page),
@@ -385,6 +397,21 @@ impl StoreWriter {
             *self.writes.journal.borrow_mut() = Some(Rc::new(journal));
             Ok(recovery)
         })
+    }
+
+    /// Remove checkpoint-restored mappings of `segment` older than
+    /// `generation`: the segment was recycled and rewritten after that
+    /// checkpoint, so their bytes are gone.
+    fn drop_superseded(&self, segment: SegmentId, generation: Generation) {
+        let stale: Vec<_> = self
+            .index
+            .segment_entries_bounded(segment, usize::MAX)
+            .into_iter()
+            .filter(|(_, location)| location.generation != generation)
+            .collect();
+        for (page, location) in stale {
+            self.index.forget_stale(&page, &location);
+        }
     }
 
     /// Verify and reinstate one journaled page. The outer error aborts
@@ -415,7 +442,8 @@ impl StoreWriter {
             .segments
             .adopt_written(segment, generation, end - start)
         {
-            Ok(()) => {}
+            Ok(false) => {}
+            Ok(true) => self.drop_superseded(segment, generation),
             Err(page_alloc::Error::Stale) => return Ok(Err(LostReason::Stale)),
             Err(page_alloc::Error::Corrupt) => return Ok(Err(LostReason::Malformed)),
             Err(error) => return Err(error.into()),
