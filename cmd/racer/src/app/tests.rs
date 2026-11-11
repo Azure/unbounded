@@ -2825,13 +2825,17 @@ fn startup_reauthenticates_retained_identity_and_fails_closed() {
     let env = racer_io::Env::host();
     let mut fixture = ControlFixture::new();
     let config = fixture.config.take().unwrap();
+    // A seat 403 is retried STARTUP_UNAUTHORIZED_RETRIES times with about
+    // 1s, 2s, 4s, 8s, 16s backoff, roughly 31s plus jitter. The scope must
+    // outlast that schedule, or a loaded run ends in DeadlineExceeded before
+    // the retry bound reports Unauthorized.
     let start = || {
         let node = NodeState::new(vec![WorkerId(0)], 64, racer_io::WorkerCtx::host()).unwrap();
         bootstrap(
             &config,
             &node,
             &config.limits,
-            &scope(&racer_io::Clock::host(), Duration::from_secs(30)).unwrap(),
+            &scope(&racer_io::Clock::host(), Duration::from_secs(120)).unwrap(),
             &env.ctx,
         )
     };

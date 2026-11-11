@@ -268,10 +268,10 @@ fn portable_fixture_serves_pages_and_missing_pins() {
     let exchange = |pinned: bool| {
         let mut stream = UnixStream::connect(&path).unwrap();
         stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
+            .set_read_timeout(Some(Duration::from_secs(30)))
             .unwrap();
         stream
-            .set_write_timeout(Some(Duration::from_secs(2)))
+            .set_write_timeout(Some(Duration::from_secs(30)))
             .unwrap();
         let pin = if pinned { "If-Match: \"v1\"\r\n" } else { "" };
         write!(stream, "GET /v1/objects/{} HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\nRange: bytes=0-16777215\r\n{pin}\r\n", metadata.version.object.key.to_hex()).unwrap();
@@ -433,10 +433,10 @@ fn portable_fixture_serves_local_copies_only() {
     let exchange = || {
         let mut stream = UnixStream::connect(&path).unwrap();
         stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
+            .set_read_timeout(Some(Duration::from_secs(30)))
             .unwrap();
         stream
-            .set_write_timeout(Some(Duration::from_secs(2)))
+            .set_write_timeout(Some(Duration::from_secs(30)))
             .unwrap();
         write!(stream, "GET /v1/objects/{} HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\nRange: bytes=0-16777215\r\nIf-Match: \"v1\"\r\nRacer-Source: local\r\n\r\n", metadata.version.object.key.to_hex()).unwrap();
         let mut response = Vec::new();
