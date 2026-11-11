@@ -141,6 +141,90 @@ spec:
 
 Store BMC passwords in a Secret referenced by `passwordRef`. `passwordRef.key` names the Secret key that holds the password and defaults to `password`. See the [CRD Reference]({{< relref "/reference/machina-crd" >}}) for all fields.
 
+## Bonds and VLANs
+
+Set `spec.host.netboot.network` to give a host bonds, VLANs, static addresses,
+routes, and DNS. Metalman uses this config both while it installs the host and
+on the installed OS. It needs `bootProtocol: VirtualMedia` and a `dhcpLeases`
+entry. It does not support `holdLease` on that lease.
+
+```yaml
+spec:
+  host:
+    netboot:
+      bootProtocol: VirtualMedia
+      image: ghcr.io/azure/host-ubuntu2404@sha256:...
+      netbootImage: ghcr.io/azure/netboot@sha256:...
+      dhcpLeases:
+      - ipv4: "192.0.2.30"
+        mac: "02:00:00:00:00:01"
+        subnetMask: "255.255.255.0"
+        gateway: "192.0.2.1"
+      network:
+        ethernets:
+        - name: nic0
+          macAddress: "02:00:00:00:00:01"
+        - name: nic1
+          macAddress: "02:00:00:00:00:02"
+        bonds:
+        - name: bond0
+          interfaces: [nic0, nic1]
+          mode: 802.3ad
+          miiMonitorInterval: 100
+          transmitHashPolicy: layer3+4
+          mtu: 1500
+          addresses: ["192.0.2.30/24"]
+          gateway: "192.0.2.1"
+        vlans:
+        - name: bond0.64
+          id: 64
+          link: bond0
+          addresses: ["198.51.100.30/24"]
+          routes:
+          - to: "203.0.113.0/24"
+            via: "198.51.100.1"
+        dns: ["192.0.2.53"]
+      redfish:
+        url: "https://bmc-01.example.com"
+        username: admin
+        passwordRef:
+          name: bmc-passwords
+          namespace: unbounded-system
+          key: bmc-01
+```
+
+Rules:
+
+- `ethernets` match NICs by MAC address, so names do not have to match
+  kernel names.
+- The `dhcpLeases[0]` entry still names the host's provisioning identity.
+  Its `mac` must be a NIC under the interface that carries its `ipv4`, its
+  address and mask must be set on exactly one interface as the first entry
+  in its `addresses`, and its `gateway` must
+  match that interface's `gateway`. Metalman checks the source IP of installer
+  requests against this address.
+- A VLAN `mtu` must not exceed its link's MTU. A link without `mtu` stays
+  at 1500, so jumbo VLANs need `mtu` on the bond or ethernet too.
+- Only IPv4 static addresses are supported. DHCP and IPv6 are not.
+
+With `network` set, Metalman builds a local installer ISO. The ISO holds the
+kernel, the initrd, and the network config. It does not fetch anything over the
+network before Linux starts, so it works on links that only come up with LACP.
+The installer sets up the bond and VLANs, then fetches its install
+instructions from `/bootmedia/<id>/install` on Metalman. Metalman serves these
+only for the active `HostReplace` operation and only to the lease address.
+
+The installer writes the same config to the installed OS. It writes
+`/etc/netplan/99-unbounded-metal.yaml` when the image uses netplan. Otherwise
+it writes `.netdev` and `.network` files to `/etc/systemd/network`. The
+netboot image must support local install mode, and `metadata.yaml` must set
+`localInstaller: unbounded-local-installer-v1`.
+
+Without `network`, VirtualMedia works as before: the ISO's GRUB brings up one
+NIC from `dhcpLeases[0]` and loads its config over HTTP.
+
+See `deploy/machina/examples/metalman-bond-vlan.yaml` for a full example.
+
 ## Cloud-Init Customization
 
 Cloud-init on PXE-booted machines uses two data sources that are merged at boot:
@@ -199,6 +283,7 @@ If the referenced ConfigMap does not exist, metalman falls back to the default m
 1. **Repave requested.** A `HostReplace` `MachineOperation` targets the Machine. Metalman sets the boot override and force-restarts the server. For `bootProtocol: PXE`, it selects PXE boot. For `bootProtocol: HTTP`, it sets a Redfish UEFI HTTP boot URL from the netboot image metadata. For `bootProtocol: VirtualMedia`, it prepares an operation-owned bootstrap ISO and mounts it through Redfish.
 2. **Boot handoff.** In PXE mode, DHCP assigns the static IP by MAC, advertises the TFTP bootfile, and TFTP serves `shimx64.efi`. In HTTP mode, Metalman configures the first lease as a static Redfish EthernetInterface and the firmware downloads the Redfish-supplied URL from Metalman's HTTP server; DHCP is not required for this path. In VirtualMedia mode, the firmware boots the mounted ISO; Metalman suppresses DHCP/TFTP boot hints, although the BMC must still retrieve the staged media.
 3. **GRUB decision.** A rendered `grub.cfg` checks for an active `HostReplace` `MachineOperation` targeting the Machine. If a repave is requested, GRUB boots the PXE installer; otherwise it chainloads the local OS. VirtualMedia carries install intent in its operation-owned ISO. When a Machine has multiple DHCP leases, metalman renders the lease matching the request source IP and passes that lease's MAC as `unbounded.boot_mac`.
+   With `network` set, the ISO's GRUB does not use the network. It boots the installer from the ISO. The installer sets up the bond and VLANs, then gets its install instructions from `/bootmedia/<id>/install`.
 4. **Installer (initrd overlay).** An init script in the initrd:
    - Loads storage and network drivers, selects the provisioning NIC by MAC, and configures the static IP and DNS from kernel cmdline.
    - Writes matching MAC-based static netplan configuration into the installed system before reboot and disables cloud-init network rendering so fallback DHCP configuration cannot conflict with it. Set `holdLease: true` on a `dhcpLeases` entry to also run a DHCPv4 client on the provisioning NIC so the site DHCP server keeps the lease for the static address and does not hand it to another host; routes, DNS, NTP, hostname, and domains from DHCP are ignored. The client identifies with the NIC MAC so reservations keyed by MAC match. Metalman answers only PXE and HTTP boot firmware for a held lease, not the installed OS, so the OS holds the lease with the site DHCP server. Reserve the address for its MAC on the site DHCP server. Leave `holdLease` unset where there is no DHCP server. The default netboot image also serves the selected lease as NoCloud `network-config`.

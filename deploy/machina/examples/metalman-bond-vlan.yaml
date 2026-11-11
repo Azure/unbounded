@@ -1,0 +1,70 @@
+# Example: a bare-metal Machine whose only uplinks are an LACP (802.3ad) bond
+# with a tagged VLAN. Metalman boots the installer from the VirtualMedia ISO,
+# brings up the bond and VLAN in the installer, fetches install instructions,
+# and persists the same topology as netplan or systemd-networkd configuration.
+#
+# Replace every placeholder before applying:
+# - macAddress values: the permanent MAC addresses of the physical NICs, for
+#   example from `cat /sys/class/net/<nic>/address` on a running host (before
+#   the NIC is enslaved to a bond) or from the BMC's Redfish
+#   EthernetInterfaces inventory.
+# - Addresses, gateway, routes, and DNS: all values below use documentation
+#   ranges (RFC 5737) and are not routable.
+# - Image digests, Redfish URL, and credentials.
+#
+# dhcpLeases[0] is the provisioning identity. Metalman authorizes installer
+# callbacks only from its ipv4 address, so it must be the address the host
+# uses to reach Metalman, and it must match the bond address and gateway.
+apiVersion: unbounded-cloud.io/v1alpha3
+kind: Machine
+metadata:
+  name: server-01
+  labels:
+    unbounded-cloud.io/site: rack-a
+spec:
+  host:
+    netboot:
+      image: ghcr.io/azure/host-ubuntu2404@sha256:0000000000000000000000000000000000000000000000000000000000000000
+      netbootImage: ghcr.io/azure/netboot@sha256:0000000000000000000000000000000000000000000000000000000000000000
+      architecture: amd64
+      bootProtocol: VirtualMedia
+      targetDisk: /dev/disk/by-id/example-os-disk
+      dhcpLeases:
+      - ipv4: "192.0.2.30"
+        mac: "02:00:00:00:00:01"
+        subnetMask: "255.255.255.0"
+        gateway: "192.0.2.1"
+        dns: ["192.0.2.53", "192.0.2.54"]
+      network:
+        ethernets:
+        - name: enp49s0f0np0
+          macAddress: "02:00:00:00:00:01"
+        - name: enp49s0f1np1
+          macAddress: "02:00:00:00:00:02"
+        bonds:
+        - name: bond0
+          interfaces: [enp49s0f0np0, enp49s0f1np1]
+          mode: 802.3ad
+          miiMonitorInterval: 100
+          transmitHashPolicy: layer3+4
+          mtu: 1500
+          addresses: ["192.0.2.30/24"]
+          gateway: "192.0.2.1"
+        vlans:
+        - name: bond0.64
+          id: 64
+          link: bond0
+          addresses: ["198.51.100.30/24"]
+          routes:
+          - to: "203.0.113.0/24"
+            via: "198.51.100.1"
+          - to: "100.64.0.0/16"
+            via: "198.51.100.1"
+        dns: ["192.0.2.53", "192.0.2.54"]
+      redfish:
+        url: "https://bmc-01.example.com"
+        username: admin
+        passwordRef:
+          name: bmc-passwords
+          namespace: unbounded-system
+          key: bmc-01

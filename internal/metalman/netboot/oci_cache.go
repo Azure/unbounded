@@ -20,6 +20,9 @@ type ImageMetadata struct {
 	HTTPBootPath      string `yaml:"httpBootPath"`
 	// MediaFormat gates the scoped installer callback and bootstrap layout.
 	MediaFormat string `yaml:"mediaFormat"`
+	// LocalInstaller advertises an installer that boots from local media and
+	// brings up declared host networking (bonds and VLANs) itself.
+	LocalInstaller string `yaml:"localInstaller"`
 }
 
 // OCICache manages unpacked OCI images on the local filesystem.
