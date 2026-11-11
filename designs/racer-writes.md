@@ -1599,8 +1599,14 @@ Core (`racer_core::write::session`):
 
 - `SessionEvent::NodesLost(Vec<NodeIdBytes>)` drops every listed holder from
   every page with one journaled `Commit` record, and emits one
-  `Restore { page, from }` per page left with a survivor; a page with none
-  fails the object. `HolderLost` stays for single-page reports.
+  `Restore { page, from }` per page left with a survivor. A page none of
+  whose holders survive keeps them all and is not failed: the page waits for
+  a holder to come back (reads of it end their stream early, which clients
+  treat as retryable, and an upload attempt that cannot reach it fails as
+  before). `HolderLost` follows the same rule and stays for single-page
+  reports. (Review fix: the first build failed the object, so a `replicas=1`
+  holder restart or a rolling restart of every holder of a page permanently
+  failed an acknowledged write.)
 - `SessionEvent::HoldersMerged(Holders)` unions holders into the table (one
   record); repair and coordinator merges use it instead of per-page
   `HolderRestored`, which journals the whole manifest each time.
@@ -1620,15 +1626,19 @@ page is not written here, or was released while the new record was written
 `Availability::active_page_key(&CacheId) -> Option<KeyId>` was added.
 
 Repair (`repair.rs`): `maintain_object` runs on coordinators of committed,
-not uploaded, not failed objects. Holders that `Membership::serves` no longer
-lists are dropped with `NodesLost`, and the manifest is sent to the replicas
-again. `spawn` starts one background task per object (`Entry::repairing`):
+not uploaded, not failed objects. Holders that `Membership::serves` has not
+listed for `RACER_WRITE_HOLDER_GRACE_SECS` (default 300) are dropped with
+`NodesLost`, and the manifest is sent to the replicas again. The first time a
+holder is seen missing is kept in memory per directory entry
+(`Entry::missing`); a holder seen serving again is forgotten, so a restart
+or rolling update within the grace changes nothing and causes no repair. `spawn` starts one background task per object (`Entry::repairing`):
 for each `under_replicated` page it tries the page's ranked owners (first
 `RANKED_DEPTH`, pool members, not silent, not already holders) in rounds,
 batching `write-store` per (target, source) with `source` set to the
 survivor; the target pulls and verifies the envelope and AEAD tag exactly
 as for a writer's store. Stored pages are merged with one `HoldersMerged`,
-counted in `racer_write_repairs_total`, and the manifest is replicated.
+counted in `racer_write_repairs_total`, and the manifest is replicated. Only
+pages of the chunk sent to a target are credited from its `stored` reply.
 Pages no target stored are retried on later turns, so a member that joins
 later receives them. The `Restore` effect now starts this task.
 
@@ -1673,16 +1683,23 @@ before its holder rekeyed it stays unreadable, as before.
 
 Garbage collection (`gc.rs`, per worker, over the pages it holds):
 
-- Orphans: a written version that no page-zero member knows is dropped once
+- Orphans: a written version that no pool member knows is dropped once
   it stayed unknown for `RACER_WRITE_ORPHAN_SECS`. Members are asked at most
   every `check_interval(orphan_after)` (a quarter, clamped to 1 s..300 s),
-  16 versions per turn; a version is unknown only when some member answered
-  and none knows it, so unreachable members never vote. The design's
-  "ask the coordinator" became "ask the page-zero members", because after a
-  failover the coordinator is not necessarily the first ranked member.
+  16 versions per turn: the page-zero members first, then, if none knows
+  it, every other member of the cache's pool, because churn can displace the
+  coordinator and its replicas from page zero before they re-replicate. A
+  version is unknown only when every asked member answered and none knows
+  it; a silent member blocks the vote. The design's "ask the coordinator"
+  became "ask the members", because after a failover the coordinator is not
+  necessarily the first ranked member, and a holder does not record its
+  coordinator.
 - Removed caches: written pages and directory entries of a cache that is no
   longer published are dropped (catalog entry removed, `Delete` journaled for
-  sessions) after `REMOVED_CACHE_GRACE` (30 s).
+  sessions) after `REMOVED_CACHE_GRACE` (30 s) only when their hold ended or
+  (for directory entries) the object is `committed` or `failed`; data that
+  may still upload waits for `RACER_WRITE_ORPHAN_SECS` of absence, so a
+  catalog republish that omits a cache briefly cannot drop it.
 
 Aliases: not built. After Put Block List commits, fresh reads go to the
 origin under the Blob ETag and refill from it; the pages cached under the
@@ -1701,7 +1718,8 @@ sequence test; `store::tests::written::rekey_replaces_the_record_and_moves_the_p
 `write::tests` for `gc::check_interval` and entry defaults; and in
 `app::dst::write_tests`: `a_lost_holder_is_repaired_before_upload` (5 nodes,
 holder crash, two copies restored, coordinator table matches, repair metric,
-reads everywhere, upload), `losing_every_holder_of_a_page_fails_the_object`,
+reads everywhere, upload), `losing_every_holder_of_a_page_waits_for_it_to_return`,
+`a_holder_back_within_the_grace_is_kept`,
 `repair_waits_for_a_spare_member`, `a_manifest_replica_takes_over_a_lost_coordinator`
 (coordinator crashes mid-upload with Put Block List faults; the replica
 finishes with forwarded credentials, one commit; the old coordinator restarts
@@ -1993,9 +2011,17 @@ Open issues:
 
 - Rebalance copies are never trimmed, so churn grows a page's pinned copies
   beyond `replicas` (bounded by the dirty cap and the hold).
-- A failed object (a page lost with every holder) stays visible: reads get
-  `200` and a truncated stream, and its surviving pages stay pinned until
-  DELETE or hold expiry.
+- A page whose every holder is missing is no longer failed, but it stays
+  visible: reads get `200` and a stream that ends early (no end frame), not
+  `503`, because the head is sent before every page is fetched. Its pages
+  stay pinned until a holder returns, DELETE, or hold expiry.
+- An upload (`auto`, or a `persist`) started while every holder of some page
+  is missing still fails the object (`upload::spawn_upload` sends
+  `UploadFailed` for a page no holder could send). Waiting for the holder
+  needs an `uploading` to `pending` transition.
+- A manifest replica displaced from page zero drops its directory entry but
+  keeps its pinned pages: those belong to its holder role, which the
+  coordinator's table still names, so releasing them would lose data.
 - With `replicas=1`, a down coordinator makes the object unknown (`404`)
   until it restarts.
 - After an upload the origin fixture serves no pages, so the DST does not

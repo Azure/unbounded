@@ -294,10 +294,14 @@ Key rules:
   time ends.
 - **Copies, not a system of record.** Until its upload commits, a written
   object survives only while one of its copies survives. When a node holding
-  a copy leaves, the coordinator copies its pages from a surviving copy to
-  another node. Losing every copy of a page before that repair or the upload
-  finishes loses the object, and it is marked `failed`. Use
-  `Racer-Durability: origin` to wait for the upload instead.
+  a copy leaves the pool for longer than `RACER_WRITE_HOLDER_GRACE_SECS`
+  (5 minutes by default), the coordinator copies its pages from a surviving
+  copy to another node, so a node restart within that time causes no
+  copying. When every copy of a page is on nodes that are gone, the object
+  is not failed: reads of it fail until one of those nodes returns with its
+  disk. If none returns, the object is lost when its hold ends, and an
+  upload started meanwhile marks it `failed`. Use `Racer-Durability: origin`
+  to wait for the upload instead.
 
 See [Object writes]({{< relref "reference/racer#object-writes" >}}) and
 [Save PyTorch Checkpoints to Racer]({{< relref "guides/racer-checkpoints" >}}).
