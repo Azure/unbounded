@@ -228,25 +228,44 @@ func TestRenderedGPUInventoryCatalogPinsSource(t *testing.T) {
 	output := renderSignal(t, signalRenderData())
 	documents := splitYAMLDocuments(string(readRenderedFile(t, output, "05-gpu-inventory-tests.yaml")))
 
-	if len(documents) != 2 {
-		t.Fatalf("GPU inventory documents = %d, want 2", len(documents))
+	if len(documents) != 1 {
+		t.Fatalf("GPU inventory documents = %d, want 1", len(documents))
 	}
 
-	var scripts corev1.ConfigMap
-	if err := yaml.Unmarshal([]byte(documents[0]), &scripts); err != nil {
-		t.Fatalf("decode GPU inventory ConfigMap: %v", err)
+	var test unstructured.Unstructured
+	if err := yaml.Unmarshal([]byte(documents[0]), &test.Object); err != nil {
+		t.Fatalf("decode CertificationTest: %v", err)
 	}
 
-	script := scripts.Data["gpu-inventory.sh"]
-	if scripts.Name != "project-signal-gpu-inventory-v2" {
-		t.Fatalf("GPU inventory script ConfigMap name = %q, want immutable v2 name", scripts.Name)
+	if test.GetKind() != "CertificationTest" ||
+		test.GetLabels()["signal.unbounded-cloud.io/catalog-role"] != "qualification" {
+		t.Fatalf("CertificationTest identity = %s/%v", test.GetKind(), test.GetLabels())
+	}
+
+	artifacts, found, err := unstructured.NestedSlice(test.Object, "spec", "artifacts")
+	if err != nil || !found || len(artifacts) != 1 {
+		t.Fatalf("CertificationTest artifacts = %#v, found %t, error %v", artifacts, found, err)
+	}
+
+	artifact, ok := artifacts[0].(map[string]any)
+	if !ok {
+		t.Fatalf("CertificationTest artifact = %#v", artifacts[0])
+	}
+
+	script, _ := artifact["content"].(string)
+	scriptDigest, _ := artifact["digest"].(string)
+	if artifact["name"] != "gpu-inventory.sh" {
+		t.Fatalf("CertificationTest artifact name = %v, want gpu-inventory.sh", artifact["name"])
 	}
 
 	scriptSum := sha256.Sum256([]byte(script))
-	scriptDigest := fmt.Sprintf("sha256:%x", scriptSum)
-
-	if scriptDigest != testScriptDigest {
-		t.Fatalf("GPU inventory script digest = %s, test fixture expects %s", scriptDigest, testScriptDigest)
+	if got := fmt.Sprintf("sha256:%x", scriptSum); got != scriptDigest || got != testScriptDigest {
+		t.Fatalf(
+			"GPU inventory script digest = %s, artifact = %s, test fixture = %s",
+			got,
+			scriptDigest,
+			testScriptDigest,
+		)
 	}
 
 	assertContainsAll(
@@ -260,32 +279,19 @@ func TestRenderedGPUInventoryCatalogPinsSource(t *testing.T) {
 		t.Fatal("GPU inventory digest includes a trailing NUL separator")
 	}
 
-	var test unstructured.Unstructured
-	if err := yaml.Unmarshal([]byte(documents[1]), &test.Object); err != nil {
-		t.Fatalf("decode CertificationTest: %v", err)
-	}
-
-	if test.GetKind() != "CertificationTest" ||
-		test.GetLabels()["signal.unbounded-cloud.io/catalog-role"] != "qualification" {
-		t.Fatalf("CertificationTest identity = %s/%v", test.GetKind(), test.GetLabels())
-	}
-
-	gotDigest, found, err := unstructured.NestedString(
+	gotArtifact, found, err := unstructured.NestedString(
 		test.Object,
 		"spec",
 		"driver",
 		"script",
-		"source",
-		"configMap",
-		"digest",
+		"artifact",
 	)
-	if err != nil || !found || gotDigest != scriptDigest {
+	if err != nil || !found || gotArtifact != "gpu-inventory.sh" {
 		t.Fatalf(
-			"CertificationTest script digest = %q, found %t, error %v, want %s",
-			gotDigest,
+			"CertificationTest script artifact = %q, found %t, error %v",
+			gotArtifact,
 			found,
 			err,
-			scriptDigest,
 		)
 	}
 
@@ -1480,6 +1486,16 @@ func TestRenderedRBACCoversQualificationAndEvidence(t *testing.T) {
 		"ClusterRole",
 		"",
 		"project-signal-adapter-infrastructure-reader",
+		"signal.unbounded-cloud.io",
+		"certificationtests",
+		[]string{"get"},
+	)
+	assertRule(
+		t,
+		adapterDocuments,
+		"ClusterRole",
+		"",
+		"project-signal-adapter-infrastructure-reader",
 		"storage.k8s.io",
 		"volumeattachments",
 		[]string{"list"},
@@ -1601,12 +1617,27 @@ func renderedGPUInventoryScript(t *testing.T) string {
 	output := renderSignal(t, signalRenderData())
 	documents := splitYAMLDocuments(string(readRenderedFile(t, output, "05-gpu-inventory-tests.yaml")))
 
-	var scripts corev1.ConfigMap
-	if err := yaml.Unmarshal([]byte(documents[0]), &scripts); err != nil {
-		t.Fatalf("decode GPU inventory ConfigMap: %v", err)
+	var test unstructured.Unstructured
+	if err := yaml.Unmarshal([]byte(documents[0]), &test.Object); err != nil {
+		t.Fatalf("decode GPU inventory CertificationTest: %v", err)
 	}
 
-	return scripts.Data["gpu-inventory.sh"]
+	artifacts, found, err := unstructured.NestedSlice(test.Object, "spec", "artifacts")
+	if err != nil || !found || len(artifacts) != 1 {
+		t.Fatalf("CertificationTest artifacts = %#v, found %t, error %v", artifacts, found, err)
+	}
+
+	artifact, ok := artifacts[0].(map[string]any)
+	if !ok {
+		t.Fatalf("CertificationTest artifact = %#v", artifacts[0])
+	}
+
+	script, ok := artifact["content"].(string)
+	if !ok || script == "" {
+		t.Fatalf("CertificationTest artifact content = %#v", artifact["content"])
+	}
+
+	return script
 }
 
 func runGPUInventoryScript(
