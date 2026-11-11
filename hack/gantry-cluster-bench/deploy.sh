@@ -62,8 +62,8 @@ log "gantry-config lists origin ${origin}"
 
 # 2. Workload override: limits and optional image.
 image_line=""
-[[ -z "${image}" ]] || image_line="                    image: ${image}
-                    imagePullPolicy: Always"
+[[ -z "${image}" ]] || image_line="                image: ${image}
+                imagePullPolicy: Always"
 cat >"${WORK_DIR}/overrides.yaml" <<EOF2
 apiVersion: overrides.unbounded-cloud.io/v1alpha1
 overrides:
