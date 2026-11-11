@@ -178,11 +178,8 @@ func Origin(cfg *config.Config, source upstream, opts ...OriginOption) racersdk.
 	}
 
 	return func(ctx context.Context, request racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
-		// A local-only request without metadata cannot name its kind, and the
-		// key and ETag alone cannot tell a manifest (whose Content-Type is its
-		// media type) from a blob that happens to be JSON, so any type chosen
-		// here could disagree with the registry's for the pinned version.
-		// Answer a miss rather than ErrInvalidRequest so Racer moves on to
+		// A local-only request without metadata cannot be decoded into a
+		// reference. Answer a miss rather than ErrInvalidRequest so Racer moves on to
 		// peers or the origin instead of failing the read. Racer forwards the
 		// reader's metadata to holders and adapter probes, so this is only a
 		// fallback for requests that never had any.
@@ -273,7 +270,7 @@ func open(ctx context.Context, source upstream, ref ifaces.OriginRef, request ra
 		return openRange(ctx, source, ref, tag, request.Offset, request.Length)
 	}
 
-	size, contentType, err := source.Head(ctx, ref)
+	size, _, err := source.Head(ctx, ref)
 	if err != nil {
 		return racersdk.Metadata{}, nil, classifyError(err)
 	}
@@ -284,32 +281,23 @@ func open(ctx context.Context, source upstream, ref ifaces.OriginRef, request ra
 
 	metadata := racersdk.Metadata{
 		Size: size, ETag: tag,
-		ContentType: originContentType(ref.Kind, contentType),
+		ContentType: objectContentType,
 		ExpiresAt:   time.Now().Add(metadataTTL).Truncate(time.Millisecond),
 	}
 
 	return metadata, nil, nil
 }
 
-// originContentType reports every non-manifest object as
-// application/octet-stream. Blob bytes are typed by the manifest that
-// references them, and registries disagree on the header they send, so a fixed
-// type keeps registry pages and pages served from the local content store
-// (see localContentType) on the same version metadata. Manifest types are
-// reduced to the bare, lowercase media type so a registry header such as
-// "application/vnd.oci.image.manifest.v1+json; charset=utf-8" matches the
-// mediaType field a local copy reports for the same ETag.
-func originContentType(kind ifaces.OriginRefKind, contentType string) string {
-	if kind != ifaces.KindManifest {
-		return "application/octet-stream"
-	}
+// objectContentType is the Racer content type of every object, from the
+// registry and the local content store alike. Racer keys objects by digest
+// alone, so the same digest may be filled through the blob route and later
+// read through the manifest route (or the reverse). A route-independent type
+// keeps every page and source on the same version metadata; the manifest route
+// recovers the media type from the manifest body (see manifestBodyMediaType).
+const objectContentType = "application/octet-stream"
 
-	return manifestMediaType(contentType)
-}
-
-// manifestMediaType strips parameters and whitespace from a manifest content
-// type and lowercases it. Both the registry and local content store paths use
-// it so Racer sees one content type per manifest version.
+// manifestMediaType strips parameters and whitespace from a manifest media
+// type and lowercases it.
 func manifestMediaType(contentType string) string {
 	mediaType, _, _ := strings.Cut(contentType, ";")
 
@@ -319,13 +307,13 @@ func manifestMediaType(contentType string) string {
 func openRange(ctx context.Context, source ifaces.OriginRangePuller, ref ifaces.OriginRef, tag string, offset, length int64) (racersdk.Metadata, io.ReadCloser, error) {
 	ref.Offset = offset
 
-	body, size, contentType, err := source.PullRange(ctx, ref, length)
+	body, size, _, err := source.PullRange(ctx, ref, length)
 	if err != nil {
 		return racersdk.Metadata{}, body, classifyError(err)
 	}
 
 	metadata := racersdk.Metadata{
-		Size: size, ETag: tag, ContentType: originContentType(ref.Kind, contentType),
+		Size: size, ETag: tag, ContentType: objectContentType,
 		ExpiresAt: time.Now().Add(metadataTTL).Truncate(time.Millisecond),
 	}
 	if size < 0 {
@@ -561,6 +549,12 @@ func (s *Handler) ServeContent(w http.ResponseWriter, r *http.Request, ref iface
 	// One retry budget covers Stat, Get, and body resumption for this request.
 	retry := s.retry.start()
 
+	if kind == ifaces.KindManifest {
+		s.serveManifest(w, r, id, ref, request, retry)
+
+		return
+	}
+
 	metadata, options, done := s.prepareResponse(w, r, id, ref, request, offset, retry)
 	if done {
 		return
@@ -582,18 +576,10 @@ func (s *Handler) ServeContent(w http.ResponseWriter, r *http.Request, ref iface
 	defer func() { _ = value.Close() }() //nolint:errcheck // best-effort close of the first read; resumes close their own
 
 	actual := value.Metadata()
-	// The manifest route also serves indexes, so an absent media type is ambiguous.
-	if !validRacerMetadata(actual, d) || (kind == ifaces.KindManifest && actual.ContentType == "") || (ranged && (actual.Size != metadata.Size ||
+	if !validRacerMetadata(actual, d) || (ranged && (actual.Size != metadata.Size ||
 		actual.ContentType != metadata.ContentType)) {
 		s.logRacerFailure(id, "get_metadata", errors.New("invalid metadata"), -1, 0)
 		http.Error(w, "invalid Racer metadata", http.StatusBadGateway)
-
-		return
-	}
-
-	if kind == ifaces.KindManifest && actual.Size > racersdk.PageSize {
-		s.logRacerFailure(id, "manifest_size", errors.New("manifest too large"), int64(actual.Size), 0)
-		http.Error(w, "Racer manifest too large", http.StatusBadGateway)
 
 		return
 	}
@@ -612,10 +598,6 @@ func (s *Handler) ServeContent(w http.ResponseWriter, r *http.Request, ref iface
 // Full GETs get metadata from Get instead of issuing a redundant Stat.
 func (s *Handler) prepareResponse(w http.ResponseWriter, r *http.Request, id string, ref ifaces.OriginRef, request racersdk.Request, offset int64, retry *retryState) (racersdk.Metadata, []racersdk.ReadOptions, bool) {
 	if r.Method != http.MethodHead && offset == 0 {
-		if ref.Kind == ifaces.KindManifest {
-			return racersdk.Metadata{}, []racersdk.ReadOptions{{SmallObject: true}}, false
-		}
-
 		return racersdk.Metadata{}, nil, false
 	}
 
@@ -627,7 +609,7 @@ func (s *Handler) prepareResponse(w http.ResponseWriter, r *http.Request, id str
 		return racersdk.Metadata{}, nil, true
 	}
 
-	if !validRacerMetadata(metadata, ref.Digest) || (ref.Kind == ifaces.KindManifest && metadata.ContentType == "") {
+	if !validRacerMetadata(metadata, ref.Digest) {
 		s.logRacerFailure(id, "stat_metadata", errors.New("invalid metadata"), -1, 0)
 		http.Error(w, "invalid Racer metadata", http.StatusBadGateway)
 
@@ -635,7 +617,7 @@ func (s *Handler) prepareResponse(w http.ResponseWriter, r *http.Request, id str
 	}
 
 	if r.Method == http.MethodHead {
-		writeRacerHeaders(w, ref.Digest, metadata, ref.Kind)
+		writeRacerHeaders(w, ref.Digest, metadata)
 		w.WriteHeader(http.StatusOK)
 
 		return metadata, nil, true
@@ -656,7 +638,7 @@ func (s *Handler) prepareResponse(w http.ResponseWriter, r *http.Request, id str
 
 func (s *Handler) streamContent(ctx context.Context, w http.ResponseWriter, id string, ref ifaces.OriginRef, request racersdk.Request, metadata racersdk.Metadata, offset int64, value *racersdk.Object, retry *retryState, smallObject bool) {
 	size := int64(metadata.Size)
-	writeRacerHeaders(w, ref.Digest, metadata, ref.Kind)
+	writeRacerHeaders(w, ref.Digest, metadata)
 
 	if offset > 0 {
 		w.Header().Set("Accept-Ranges", "bytes")
@@ -859,11 +841,11 @@ func validRacerMetadata(metadata racersdk.Metadata, d digest.Digest) bool {
 	return metadata.Size >= 0 && metadata.ETag == `"`+d.String()+`"`
 }
 
-func writeRacerHeaders(w http.ResponseWriter, d digest.Digest, metadata racersdk.Metadata, kind ifaces.OriginRefKind) {
+func writeRacerHeaders(w http.ResponseWriter, d digest.Digest, metadata racersdk.Metadata) {
 	w.Header().Set("Content-Type", metadata.ContentType)
 	w.Header().Set("Docker-Content-Digest", d.String())
 
-	if metadata.ContentType == "" && kind == ifaces.KindBlob {
+	if metadata.ContentType == "" {
 		w.Header().Set("Content-Type", "application/octet-stream")
 	}
 

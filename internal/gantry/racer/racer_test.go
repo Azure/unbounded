@@ -986,10 +986,8 @@ func TestRegistryOriginDistributionManifest(t *testing.T) {
 					wantGets++
 				}
 
-				wantType := contentType
-				if kind == ifaces.KindBlob {
-					wantType = "application/octet-stream"
-				}
+				// Racer metadata is route-independent for every kind.
+				wantType := objectContentType
 
 				if metadata.Size != int64(len(data)) || metadata.ContentType != wantType || gets.Load() != wantGets || heads.Load() != 0 {
 					t.Fatalf("metadata=%+v gets=%d heads=%d", metadata, gets.Load(), heads.Load())

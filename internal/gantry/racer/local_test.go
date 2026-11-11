@@ -173,7 +173,8 @@ func TestLocalOnlyManifestMediaType(t *testing.T) {
 	metadata, body, err := localOrigin(t, store, &testUpstream{})(t.Context(), racersdk.OriginRequest{
 		Request: requestFor(t, ref, ""), Length: racersdk.PageSize,
 	})
-	if err != nil || metadata.ContentType != "application/vnd.oci.image.manifest.v1+json" {
+	// Racer metadata is route-independent; the mirror types manifests from the body.
+	if err != nil || metadata.ContentType != objectContentType {
 		t.Fatalf("metadata=%+v err=%v", metadata, err)
 	}
 
@@ -181,10 +182,14 @@ func TestLocalOnlyManifestMediaType(t *testing.T) {
 
 	untyped, untypedRef := localFixture(t, []byte(`{"schemaVersion":2}`), ifaces.KindManifest)
 
-	_, _, err = localOrigin(t, untyped, &testUpstream{})(t.Context(), racersdk.OriginRequest{
+	metadata, body, err = localOrigin(t, untyped, &testUpstream{})(t.Context(), racersdk.OriginRequest{
 		Request: requestFor(t, untypedRef, ""), Length: racersdk.PageSize,
 	})
-	requireError(t, err, racersdk.ErrNotFound)
+	if err != nil || metadata.ContentType != objectContentType {
+		t.Fatalf("untyped metadata=%+v err=%v", metadata, err)
+	}
+
+	_ = body.Close() //nolint:errcheck // test cleanup
 }
 
 func TestNonLocalRequestIgnoresLocalStore(t *testing.T) {
@@ -281,8 +286,8 @@ func TestLocalOnlyWithoutMetadataIsAMiss(t *testing.T) {
 	requireError(t, err, racersdk.ErrInvalidRequest)
 }
 
-// A registry may send manifest Content-Type parameters or different case; both
-// the registry and local paths reduce it to the bare media type so they agree.
+// Whatever Content-Type the registry sends and whatever the local mediaType
+// field says, both paths report the same route-independent Racer content type.
 func TestLocalAndRegistryManifestMetadataAgree(t *testing.T) {
 	const mediaType = "application/vnd.oci.image.manifest.v1+json"
 
@@ -315,8 +320,8 @@ func TestLocalAndRegistryManifestMetadataAgree(t *testing.T) {
 				t.Fatalf("local head: found=%v err=%v", found, err)
 			}
 
-			if remote.ContentType != mediaType || local.ContentType != mediaType {
-				t.Fatalf("registry %q, local %q, want %q", remote.ContentType, local.ContentType, mediaType)
+			if remote.ContentType != objectContentType || local.ContentType != objectContentType {
+				t.Fatalf("registry %q, local %q, want %q", remote.ContentType, local.ContentType, objectContentType)
 			}
 		})
 	}
@@ -334,19 +339,22 @@ func TestManifestMediaType(t *testing.T) {
 			t.Errorf("manifestMediaType(%q) = %q, want %q", in, got, want)
 		}
 	}
-
-	if got := originContentType(ifaces.KindBlob, "text/plain; a=b"); got != "application/octet-stream" {
-		t.Errorf("blob content type = %q", got)
-	}
 }
 
-// A local manifest whose mediaType is only parameters cannot be typed, so it
-// is a miss.
-func TestLocalOnlyManifestParameterOnlyMediaTypeMisses(t *testing.T) {
-	store, ref := localFixture(t, []byte(`{"schemaVersion":2,"mediaType":"; charset=utf-8"}`), ifaces.KindManifest)
+// The local path does not parse manifests: one whose mediaType is only
+// parameters, or that is not JSON at all, is served as plain bytes and the
+// mirror decides whether it can type it.
+func TestLocalOnlyManifestParameterOnlyMediaTypeServed(t *testing.T) {
+	for _, data := range []string{`{"schemaVersion":2,"mediaType":"; charset=utf-8"}`, "not json"} {
+		store, ref := localFixture(t, []byte(data), ifaces.KindManifest)
 
-	_, _, err := localOrigin(t, store, &testUpstream{})(t.Context(), racersdk.OriginRequest{
-		Request: requestFor(t, ref, ""), Length: racersdk.PageSize,
-	})
-	requireError(t, err, racersdk.ErrNotFound)
+		metadata, body, err := localOrigin(t, store, &testUpstream{})(t.Context(), racersdk.OriginRequest{
+			Request: requestFor(t, ref, ""), Length: racersdk.PageSize,
+		})
+		if err != nil || metadata.ContentType != objectContentType || metadata.Size != int64(len(data)) {
+			t.Fatalf("data=%q metadata=%+v err=%v", data, metadata, err)
+		}
+
+		_ = body.Close() //nolint:errcheck // test cleanup
+	}
 }

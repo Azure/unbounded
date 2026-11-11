@@ -179,8 +179,13 @@ func TestRacerSecurityDirectHandler(t *testing.T) {
 				assertRacerDownloadHeaders(t, resp.Header)
 
 				want, wantType, status := data, "text/html", http.StatusOK
-				if failed {
+
+				switch {
+				case failed:
 					want, wantType, status = []byte("Racer request failed\n"), "text/plain; charset=utf-8", http.StatusServiceUnavailable
+				case kind == ifaces.KindManifest:
+					// The manifest route types its body itself; HTML is not a manifest.
+					want, wantType, status = []byte("unknown manifest media type\n"), "text/plain; charset=utf-8", http.StatusServiceUnavailable
 				}
 
 				if resp.StatusCode != status || resp.Header.Get("Content-Type") != wantType || !bytes.Equal(handlerReadBody(t, resp), want) {

@@ -80,13 +80,8 @@ func TestRacerRegistryContentType(t *testing.T) {
 					client := racerFakeClient(t, func(ctx context.Context, req racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
 						metadata, body, err := origin(ctx, req)
 
-						wantType := ""
-						if tc.route == "blobs" {
-							wantType = "application/octet-stream"
-						} else if supplied {
-							wantType = manifestMediaType(tc.contentType)
-						}
-
+						// Racer metadata is route-independent; the header is ignored.
+						wantType := objectContentType
 						if err != nil || metadata.ContentType != wantType || metadata.Size != int64(len(tc.data)) {
 							t.Errorf("registry metadata=%+v error=%v; want type=%q size=%d", metadata, err, wantType, len(tc.data))
 						}
@@ -97,8 +92,9 @@ func TestRacerRegistryContentType(t *testing.T) {
 					resp := racerRequest(t, server, method, tc.route, d, "", "")
 					body := handlerReadBody(t, resp)
 
+					// A manifest HEAD reads the body to recover its media type.
 					wantHeads, wantGets := int32(0), int32(1)
-					if method == http.MethodHead {
+					if method == http.MethodHead && tc.route == "blobs" {
 						wantHeads, wantGets = 1, 0
 					}
 
@@ -106,26 +102,20 @@ func TestRacerRegistryContentType(t *testing.T) {
 						t.Fatalf("registry calls: heads=%d gets=%d; want %d %d", heads.Load(), gets.Load(), wantHeads, wantGets)
 					}
 
-					if !supplied && tc.route == "manifests" {
-						if resp.StatusCode != http.StatusBadGateway || resp.Header.Get("Gantry-Mirrored") != "" || resp.Header.Get("Docker-Content-Digest") != "" {
+					// An empty body is not a JSON manifest, so its type is unknown.
+					if tc.route == "manifests" && tc.data == "" {
+						if resp.StatusCode != http.StatusServiceUnavailable || resp.Header.Get("Gantry-Mirrored") != "" || resp.Header.Get("Docker-Content-Digest") != "" {
 							t.Fatalf("unknown manifest type accepted: status=%d headers=%v", resp.StatusCode, resp.Header)
-						}
-
-						wantBody := "invalid Racer metadata\n"
-						if method == http.MethodHead {
-							wantBody = ""
-						}
-
-						if string(body) != wantBody || resp.Header.Get("Content-Type") != "text/plain; charset=utf-8" {
-							t.Fatalf("unexpected error response: body=%q headers=%v", body, resp.Header)
 						}
 
 						return
 					}
 
-					wantType := manifestMediaType(tc.contentType)
-					if !supplied || tc.route == "blobs" {
-						wantType = "application/octet-stream"
+					// Manifests take their type from the body, which for the
+					// parameterized case has no mediaType and is inferred.
+					wantType := objectContentType
+					if tc.route == "manifests" {
+						wantType = manifestMediaType(tc.contentType)
 					}
 
 					if resp.StatusCode != http.StatusOK || resp.Header.Get("Content-Type") != wantType || resp.Header.Get("Gantry-Mirrored") != "1" || resp.Header.Get("Docker-Content-Digest") != d.String() || resp.ContentLength != int64(len(tc.data)) {

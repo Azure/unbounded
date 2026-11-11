@@ -246,9 +246,10 @@ func TestGantryIntegration(t *testing.T) {
 		corrupt.Store(true)
 
 		err := p.pull(t.Context())
-		require.ErrorIs(t, err, io.ErrUnexpectedEOF)
-		// How much of the withheld prefix reaches the client depends on
-		// net/http buffering; only the final byte is guaranteed withheld.
+		// The manifest is read first. Manifests fit in one page, so the mirror
+		// verifies the buffered body before committing headers and answers
+		// 502 instead of aborting a started response.
+		require.ErrorContains(t, err, "status 502")
 		require.Less(t, testutil.ToFloat64(metrics.receivedBytes), float64(img.Manifest.Size),
 			"mirror must not complete an object that fails digest verification")
 		require.Zero(t, testutil.ToFloat64(metrics.pulls.WithLabelValues("success")))

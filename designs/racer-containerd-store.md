@@ -97,7 +97,7 @@ the remote origin".
   authorization) so the holder's local-only request names the object as the
   reader did (`cmd/racer/src/read/candidates.rs`, `holder_copy`;
   `cmd/racer/src/read.rs`, `serve_holder`). Gantry needs the metadata to know
-  the object's kind and so its Content-Type; it answers a local-only request
+  the object's registry and repository; it answers a local-only request
   without metadata with 404 rather than guess (`internal/gantry/racer/racer.go`,
   `Origin`).
 - The adapter answers a miss with 404 (`racersdk.ErrNotFound`) and a
@@ -204,11 +204,22 @@ file `<racer_content_root>/blobs/sha256/<hex>`.
 - A missing or unusable file is a miss (404). An `If-Match` for another
   version is 412.
 - The answer has the same size and ETag (`"sha256:<hex>"`) as a registry
-  read. Blobs report `application/octet-stream`. A manifest reports its
-  `mediaType` field; a manifest without one is a miss so the registry supplies
-  the header. Both paths reduce a manifest type to the bare, lowercase media
-  type (parameters such as `; charset=utf-8` are dropped), so a registry page
-  and a local page for the same ETag carry the same Racer content type.
+  read, and the same Racer content type, `application/octet-stream`, for
+  every kind. Racer keys an object by digest alone, so one digest may be
+  filled through the blob route and read through the manifest route, or the
+  reverse; a route-independent content type keeps every page and source on
+  the same version metadata (`internal/gantry/racer/racer.go`,
+  `objectContentType`). The local path does not parse manifests.
+- The mirror recovers a manifest's media type at the HTTP boundary
+  (`internal/gantry/racer/manifest.go`, `serveManifest`). A manifest fits in
+  one page, so the mirror buffers it, checks its digest, and only then writes
+  headers; HEAD reads the body too. The type is the manifest's `mediaType`
+  field reduced to the bare, lowercase media type; without one, a body with
+  `manifests` is an OCI index and one with `config` or `layers` is an OCI
+  image manifest. A body that is not JSON or cannot be typed (for example a
+  Docker schema 1 manifest) gets 503 so containerd falls through to the
+  registry, whose Content-Type is authoritative. A digest mismatch gets 502
+  and invalidates the cached version.
 - A local-only request never contacts the registry and ignores the
   credential. Normal requests always use the registry.
 - containerd verifies a blob before it commits it, but the file can later rot

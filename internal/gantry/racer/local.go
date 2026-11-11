@@ -5,7 +5,6 @@ package racer
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -135,15 +134,8 @@ func serveLocal(ctx context.Context, store LocalStore, verifier *ReplicaVerifier
 		}
 	}
 
-	contentType, err := localContentType(ref.Kind, blob, size)
-	if err != nil {
-		_ = blob.Close() //nolint:errcheck // best-effort close on a miss
-
-		return miss(errors.Join(err, errors.New("unusable local object")))
-	}
-
 	metadata := racersdk.Metadata{
-		Size: size, ETag: tag, ContentType: contentType,
+		Size: size, ETag: tag, ContentType: objectContentType,
 		ExpiresAt: time.Now().Add(metadataTTL).Truncate(time.Millisecond),
 	}
 
@@ -163,33 +155,4 @@ func serveLocal(ctx context.Context, store LocalStore, verifier *ReplicaVerifier
 type sectionCloser struct {
 	*io.SectionReader
 	io.Closer
-}
-
-// localContentType reports blobs and configs as application/octet-stream, the
-// type the mirror writes for untyped blobs. Manifests need their media type,
-// which a local copy only records in its mediaType field; a manifest without
-// one is a miss so the registry supplies the authoritative header.
-func localContentType(kind ifaces.OriginRefKind, blob LocalBlob, size int64) (string, error) {
-	if kind != ifaces.KindManifest {
-		return "application/octet-stream", nil
-	}
-
-	if size > racersdk.PageSize {
-		return "", errors.New("local manifest too large")
-	}
-
-	var manifest struct {
-		MediaType string `json:"mediaType"`
-	}
-
-	if err := json.NewDecoder(io.NewSectionReader(blob, 0, size)).Decode(&manifest); err != nil {
-		return "", fmt.Errorf("decode local manifest: %w", err)
-	}
-
-	mediaType := manifestMediaType(manifest.MediaType)
-	if mediaType == "" {
-		return "", errors.New("local manifest has no mediaType")
-	}
-
-	return mediaType, nil
 }

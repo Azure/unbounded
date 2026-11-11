@@ -52,7 +52,8 @@ func TestRacerRemoteRejectedCredentialRepositoryChallenge(t *testing.T) {
 		return
 	}
 
-	data := []byte("private remote content")
+	// A typeable manifest body serves both routes.
+	data := []byte(`{"schemaVersion":2,"layers":[],"annotations":{"note":"private remote content"}}`)
 	d := racerDigest(data)
 
 	const challenge = `Bearer realm="https://registry.example/token",scope="repository:library/image:pull",service="registry.example"`
@@ -496,30 +497,21 @@ func (u *racerRegistry) PullRange(ctx context.Context, ref ifaces.OriginRef, len
 }
 
 func TestRacerGETAndHEAD(t *testing.T) {
-	t.Run("header defaults by kind", func(t *testing.T) {
-		for _, tc := range []struct {
-			kind        ifaces.OriginRefKind
-			contentType string
-		}{
-			{ifaces.KindBlob, "application/octet-stream"},
-			{ifaces.KindManifest, ""},
-			{ifaces.KindConfig, ""},
-		} {
-			for _, supplied := range []string{"", "application/custom"} {
-				w := httptest.NewRecorder()
-				d := racerDigest(nil)
-				metadata := racerMetadata(t, d, 0)
-				metadata.ContentType = supplied
-				writeRacerHeaders(w, d, metadata, tc.kind)
+	t.Run("header default", func(t *testing.T) {
+		for _, supplied := range []string{"", "application/custom"} {
+			w := httptest.NewRecorder()
+			d := racerDigest(nil)
+			metadata := racerMetadata(t, d, 0)
+			metadata.ContentType = supplied
+			writeRacerHeaders(w, d, metadata)
 
-				want := supplied
-				if want == "" {
-					want = tc.contentType
-				}
+			want := supplied
+			if want == "" {
+				want = "application/octet-stream"
+			}
 
-				if w.Header().Get("Content-Type") != want || w.Header().Get("Content-Length") != "0" || w.Header().Get("Docker-Content-Digest") != d.String() {
-					t.Fatalf("kind=%v supplied=%q headers=%v", tc.kind, supplied, w.Header())
-				}
+			if w.Header().Get("Content-Type") != want || w.Header().Get("Content-Length") != "0" || w.Header().Get("Docker-Content-Digest") != d.String() {
+				t.Fatalf("supplied=%q headers=%v", supplied, w.Header())
 			}
 		}
 	})
@@ -583,8 +575,14 @@ func TestRacerGETAndHEAD(t *testing.T) {
 					t.Fatalf("response differs: got %d bytes; want %d", len(got), len(want))
 				}
 
-				if method == http.MethodHead && (heads.Load() != 1 || gets.Load() != 0) {
-					t.Fatalf("HEAD fetched object bytes: heads=%d gets=%d", heads.Load(), gets.Load())
+				// A manifest HEAD reads the one-page body to recover its media type.
+				wantHeads, wantGets := int32(1), int32(0)
+				if tc.route == "manifests" {
+					wantHeads, wantGets = 0, 1
+				}
+
+				if method == http.MethodHead && (heads.Load() != wantHeads || gets.Load() != wantGets) {
+					t.Fatalf("HEAD calls: heads=%d gets=%d; want %d %d", heads.Load(), gets.Load(), wantHeads, wantGets)
 				}
 			})
 		}
@@ -603,7 +601,8 @@ func (o racerHeaderOrigin) Head(context.Context, ifaces.OriginRef) (int64, strin
 // Exercise mirror's non-sniffing HEAD path rather than copy its policy here.
 func TestRacerMirrorPolicyParity(t *testing.T) {
 	t.Run("content headers", func(t *testing.T) {
-		for _, kind := range []ifaces.OriginRefKind{ifaces.KindBlob, ifaces.KindManifest} {
+		// Manifest HEADs take their type from the body (see TestRacerManifestMediaTypeFromBody).
+		for _, kind := range []ifaces.OriginRefKind{ifaces.KindBlob} {
 			for _, contentType := range []string{"", "application/custom"} {
 				for _, size := range []int{0, 17} {
 					d := racerDigest(nil)
@@ -628,15 +627,6 @@ func TestRacerMirrorPolicyParity(t *testing.T) {
 
 					if w.Code != http.StatusOK {
 						t.Fatalf("mirror HEAD failed: %d", w.Code)
-					}
-
-					// Racer rejects unknown manifest types instead of using the direct-mode default.
-					if kind == ifaces.KindManifest && contentType == "" {
-						if racerResponse.Code != http.StatusBadGateway || racerResponse.Header().Get("Gantry-Mirrored") != "" {
-							t.Fatalf("unknown manifest type accepted: status=%d headers=%v", racerResponse.Code, racerResponse.Header())
-						}
-
-						continue
 					}
 
 					if racerResponse.Code != http.StatusOK {
@@ -690,7 +680,7 @@ func TestRacerResumeAndInvalidRange(t *testing.T) {
 	t.Run("direct non-blob offsets are ignored", func(t *testing.T) {
 		for _, kind := range []ifaces.OriginRefKind{ifaces.KindManifest, ifaces.KindConfig} {
 			for _, offset := range []int64{4, 100} {
-				data := []byte(`{"schemaVersion":2}`)
+				data := []byte(`{"schemaVersion":2,"layers":[]}`)
 				d := racerDigest(data)
 				client := &racerTranscriptClient{Client: racerFakeClient(t, racerPageOrigin(t, d, data)), options: make(chan []racersdk.ReadOptions, 1)}
 				ref := ifaces.OriginRef{Registry: "registry.example", Repository: "library/image", Digest: d, Kind: kind, Offset: offset}
@@ -1789,7 +1779,9 @@ func TestRacerManifestGETWithSaturatedBulkPool(t *testing.T) {
 func TestRacerManifestSizeLimitBeforeHeaders(t *testing.T) {
 	for _, size := range []int{int(racersdk.PageSize), int(racersdk.PageSize) + 1} {
 		t.Run(strconv.Itoa(size), func(t *testing.T) {
-			data := bytes.Repeat([]byte("x"), size)
+			// A typeable manifest padded to exactly size bytes.
+			prefix, suffix := `{"layers":[],"x":"`, `"}`
+			data := []byte(prefix + strings.Repeat("x", size-len(prefix)-len(suffix)) + suffix)
 			d := racerDigest(data)
 			client := racerFakeClient(t, racerPageOrigin(t, d, data))
 			server := racerServer(t, racerConfig(), client, &racerDirectTrap{})
