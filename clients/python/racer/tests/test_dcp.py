@@ -140,6 +140,43 @@ def test_uploaded_metadata_waits_for_every_data_object(server, client):
     assert server.written[key(".metadata")].state == "pending"
 
 
+def test_uploads_finished_before_polling_count_as_committed(server, client):
+    # Every data upload committed before the first poll and the server no
+    # longer tracks the sessions: HEAD answers from the origin with a Blob
+    # ETag and no upload state.
+    server.advance_uploads = False
+    server.forget_uploads = True
+    writer = save(client, state(), "c1", step=1, persist_every=1, upload_poll_interval=0.01, upload_timeout=5)
+    data = key("__0_0.distcp")
+    assert writer.written == ["__0_0.distcp", ".metadata"]
+    assert server.objects[data].etag.startswith('"blob-')
+    assert server.heads.count(data) == 1
+    assert server.persisted == [(key(".metadata"), [data])]
+
+
+def test_untracked_racer_etag_is_not_committed(server, client):
+    # A Racer version ETag with no upload state is not known to be at the
+    # origin, so the writer keeps waiting and times out.
+    writer = rdcp.RacerStorageWriter(
+        client, BUCKET, PREFIX, step=1, persist_every=1, upload_poll_interval=0.01, upload_timeout=0.05
+    )
+    write_data = writer._write_data
+
+    def untracked(plan, planner):
+        results = write_data(plan, planner)
+        for name, w in server.written.items():
+            if name != key(".metadata"):
+                w.forgotten = True
+        return results
+
+    writer._write_data = untracked
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        failure = rank0_failure(lambda: dcp.save(state(), checkpoint_id="c1", storage_writer=writer))
+    assert isinstance(failure, rdcp.CheckpointUploadError)
+    assert server.persisted == []
+
+
 def test_failed_data_upload_does_not_persist_metadata(server, client):
     server.upload_fail.add(key("__0_0.distcp"))
     failure = rank0_failure(lambda: save(client, state(), "c1", step=1, persist_every=1, upload_poll_interval=0.01))

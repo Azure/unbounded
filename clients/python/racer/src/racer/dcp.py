@@ -36,6 +36,7 @@ import dataclasses
 import io
 import os
 import pickle
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -135,6 +136,14 @@ def _cpu_tensor(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
+_RACER_ETAG = re.compile(r'"racer-[0-9a-f]{32}"')
+
+
+def _is_racer_etag(etag: str) -> bool:
+    """Whether ``etag`` is a Racer-written version ETag (``"racer-<hex>"``)."""
+    return _RACER_ETAG.fullmatch(etag) is not None
+
+
 class RacerStorageWriter(StorageWriter):
     """A DCP StorageWriter that writes checkpoints into a Racer cache."""
 
@@ -228,13 +237,24 @@ class RacerStorageWriter(StorageWriter):
         self.client.persist(self.request(name))
 
     def _await_uploads(self, names: list[str]) -> None:
-        """Poll each data object's upload state until it is committed."""
+        """Poll each data object's upload state until it is committed.
+
+        A data object that the server serves under an origin ETag (not a
+        Racer ``"racer-<hex>"`` version ETag) with no upload state is at the
+        origin: its upload committed and the server no longer tracks the
+        write session (for example after a coordinator restart). That counts
+        as committed. Keys are unique per checkpoint, and create-once writes
+        mean no other writer can have put them at the origin first.
+        """
         deadline = None if self.upload_timeout is None else time.monotonic() + self.upload_timeout
         pending = list(names)
         while pending:
             waiting = []
             for name in pending:
-                state = self.client.stat(self.request(name)).upload_state
+                stat = self.client.stat(self.request(name))
+                state = stat.upload_state
+                if state is None and not _is_racer_etag(stat.etag):
+                    state = "committed"
                 if state == "failed":
                     raise CheckpointUploadError(f"checkpoint {self.checkpoint_id!r}: upload of {name} failed")
                 if state != "committed":

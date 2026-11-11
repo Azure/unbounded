@@ -38,6 +38,7 @@ class Written:
     metadata: str | None
     kind: str
     seq: int = 0
+    forgotten: bool = False
 
 
 @dataclass
@@ -91,6 +92,10 @@ class FakeRacer:
         self.upload_steps: dict[str, int] = {}
         self.upload_fail: set[str] = set()
         self.upload_order: list[str] = []
+        # When set, auto uploads commit at write time and the session is
+        # forgotten: a HEAD then answers from the origin with a Blob ETag
+        # and no Racer-Upload-State, as after a coordinator restart.
+        self.forget_uploads = False
         self.heads: list[str] = []
         # persisted records (key, upload_order at that moment) per persist.
         self.persisted: list[tuple[str, list[str]]] = []
@@ -271,7 +276,7 @@ class FakeRacer:
         if method == "HEAD":
             extra = []
             self.heads.append(key)
-            if key in self.written:
+            if key in self.written and not self.written[key].forgotten:
                 if self.advance_uploads:
                     self._advance_upload(key)
                 extra.append(("Racer-Upload-State", self.written[key].state))
@@ -459,6 +464,11 @@ class FakeRacer:
             self.write_seq += 1
             self.written[key] = Written(state, replicas, origin, upload, hold, metadata, kind, self.write_seq)
             self.objects[key] = Obj(data, etag, headers.get("racer-content-type"))
+            if self.forget_uploads and upload == "auto" and not origin:
+                self.written[key].state = "committed"
+                self.written[key].forgotten = True
+                self.upload_order.append(key)
+                self.objects[key].etag = '"blob-' + os.urandom(8).hex() + '"'
         self._send(conn, 201, [("ETag", etag), ("Racer-Upload-State", state), ("Content-Length", "0")])
 
     def _advance_upload(self, key):

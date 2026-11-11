@@ -74,7 +74,9 @@ How it works:
 - Steps that are a multiple of `persist_every` go to the origin. Data objects
   use upload mode `auto`. Uploads finish in any order, so `.metadata` uses
   `manual`: the coordinator waits until every data object's upload is
-  `committed`, then persists `.metadata`. The origin never has `.metadata`
+  `committed`, then persists `.metadata`. A data object that is already
+  served from the origin (a non-Racer `ETag` with no upload state) counts as
+  committed. The origin never has `.metadata`
   without its data. If an upload fails or does not finish within
   `upload_timeout`, the save raises `CheckpointUploadError` and `.metadata`
   stays only in the cache.
