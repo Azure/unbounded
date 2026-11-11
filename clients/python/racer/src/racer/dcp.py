@@ -204,7 +204,7 @@ class RacerStorageWriter(StorageWriter):
         future: Future[list[WriteResult]] = Future()
         try:
             future.set_result(self._write_data(plan, planner))
-        except BaseException as exc:  # noqa: BLE001 - DCP reports failures through the future
+        except Exception as exc:  # noqa: BLE001 - DCP reports failures through the future
             future.set_exception(exc)
         return future
 
@@ -382,7 +382,7 @@ class RacerStorageReader(StorageReader):
         try:
             self._read_data(plan, planner)
             future.set_result(None)
-        except BaseException as exc:  # noqa: BLE001 - DCP reports failures through the future
+        except Exception as exc:  # noqa: BLE001 - DCP reports failures through the future
             future.set_exception(exc)
         return future
 
