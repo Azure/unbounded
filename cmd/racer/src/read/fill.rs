@@ -2795,6 +2795,28 @@ impl Fill {
                             );
                             AcqInput::Origin { id, result: Ok(()) }
                         }
+                        // Whatever the origin says about a written object it
+                        // does not know yet (a miss, a version mismatch, or a
+                        // gateway error), another owner may hold the page.
+                        Err(error)
+                            if !matches!(error, Error::OriginRejected | Error::OriginForbidden)
+                                && self.writes(&context.object.cache)
+                                && let Some(copy) = policy
+                                    .written_copy(
+                                        authority,
+                                        context,
+                                        &PeerOperation::Page {
+                                            page: page.clone(),
+                                            mode: FetchMode::CopyOnly,
+                                        },
+                                        scope,
+                                        &mut |response| peer_page(response, None),
+                                    )
+                                    .await? =>
+                        {
+                            acquired = Some(copy);
+                            AcqInput::Origin { id, result: Ok(()) }
+                        }
                         Err(error) => {
                             if error != Error::VersionUnavailable {
                                 policy.note_origin_failure(

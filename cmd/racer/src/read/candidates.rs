@@ -780,6 +780,10 @@ impl CandidatePolicy {
         &self.drivers
     }
 
+    pub(crate) fn local_node(&self) -> &NodeId {
+        &self.node
+    }
+
     pub(crate) fn ctx(&self) -> &racer_io::WorkerCtx {
         &self.ctx
     }
@@ -1055,6 +1059,100 @@ impl CandidatePolicy {
     ) -> Operation<'a, Candidates> {
         self.placement
             .rank_scoped(membership, object, page, Some(scope))
+    }
+
+    /// After an origin miss for a page of a cache with writes, ask the other
+    /// owners under `authority`'s membership, and those of the membership it
+    /// recently replaced, for a copy-only copy. A member that became the
+    /// page's rank 0 holds no written page until rebalance copies it there,
+    /// and the origin does not know the object before it uploads. `None`
+    /// when no owner returns a usable copy.
+    pub(crate) async fn written_copy<'a, T: 'a>(
+        &'a self,
+        authority: &OriginAuthority,
+        context: &'a OriginContext,
+        operation: &'a PeerOperation,
+        scope: &'a RequestScope,
+        validate: &mut (impl FnMut(VerifiedResponse) -> Operation<'a, T> + 'a),
+    ) -> Result<Option<T>> {
+        let membership = &authority.membership;
+        // Copy-only probes never forward, so they cannot loop: they get their
+        // own budget under the request deadline, not the caller's, which the
+        // walk spent reaching the origin.
+        let mut budget = super::default_budget(scope);
+        let mut owners = authority.owners.clone();
+        if let Some(previous) = self
+            .recent_previous_owners(membership, &authority.object, authority.page, scope)
+            .await?
+        {
+            for node in previous.ordered {
+                if !owners.contains(&node) {
+                    owners.push(node);
+                }
+            }
+        }
+        for node in owners
+            .iter()
+            .filter(|node| **node != self.node && membership.member(node).is_ok())
+        {
+            match self
+                .request(
+                    membership,
+                    node,
+                    context,
+                    operation,
+                    FetchMode::CopyOnly,
+                    scope,
+                    &mut budget,
+                    1,
+                )
+                .await
+            {
+                Ok(response) => {
+                    if let Ok(copy) = validated_copy(response, operation, false, validate).await? {
+                        return Ok(Some(copy));
+                    }
+                }
+                Err(error) if scope.check().is_err() => return Err(error),
+                Err(_) => {}
+            }
+        }
+        Ok(None)
+    }
+
+    /// The page owners under the membership `current` replaced, when that
+    /// replacement is recent enough (`PREVIOUS_MEMBERSHIP_WITHIN`) that peers
+    /// still resolve it and its owners differ from the current ones. `None`
+    /// otherwise. This node need not be a member of it: a joiner asks it.
+    pub(crate) async fn recent_previous_owners(
+        &self,
+        current: &std::sync::Arc<crate::topology::Membership>,
+        object: &ObjectId,
+        page: PageNumber,
+        scope: &RequestScope,
+    ) -> Result<Option<Candidates>> {
+        let Some(version) = current.version.0.checked_sub(1) else {
+            return Ok(None);
+        };
+        let Some(previous) = self
+            .published
+            .resolve_recent(
+                version,
+                self.ctx.now(),
+                racer_core::read::walk::PREVIOUS_MEMBERSHIP_WITHIN,
+            )
+            .ok()
+            .flatten()
+        else {
+            return Ok(None);
+        };
+        let before = self
+            .candidates_scoped(previous, object, page, scope)
+            .await?;
+        let now = self
+            .candidates_scoped(current.clone(), object, page, scope)
+            .await?;
+        Ok((before.ordered != now.ordered).then_some(before))
     }
 
     pub fn resolve<'a>(

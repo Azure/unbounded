@@ -721,22 +721,40 @@ impl MetadataService {
                 PeerResponse::StaleMembership => return Err(Error::IncompatibleMembership.into()),
             },
             CandidateResolution::Origin(authority) => {
-                let output = self
-                    .refresh_origin(&authority, &purpose, membership, context, scope, budget)
+                let output = match self
+                    .refresh_origin(
+                        &authority,
+                        &purpose,
+                        membership.clone(),
+                        context,
+                        scope,
+                        budget,
+                    )
                     .await
-                    .map_err(|failure| match failure {
-                        RefreshFailure::Terminal(Error::NotFound)
-                            if self.storage.fill.writes(&context.object.cache)
-                                && !absence_is_authoritative(&authority) =>
-                        {
+                {
+                    Err(RefreshFailure::Terminal(Error::NotFound))
+                        if self.storage.fill.writes(&context.object.cache) =>
+                    {
+                        if !absence_is_authoritative(&authority) {
                             // The origin does not know a written object
                             // until it uploads, and only page zero's rank 0
                             // coordinates writes. Without its answer the
                             // object may exist: retryable, not 404.
-                            RefreshFailure::Terminal(Error::Unavailable)
+                            return Err(Error::Unavailable.into());
                         }
-                        failure => failure,
-                    })?;
+                        // Rank 0 may have joined (or been promoted) before
+                        // rebalance handed it the manifest: ask the page-zero
+                        // owners of the membership it replaced.
+                        let metadata = self
+                            .written_elsewhere(&purpose, &membership, context, scope)
+                            .await?;
+                        RefreshOutput {
+                            metadata,
+                            page: None,
+                        }
+                    }
+                    result => result?,
+                };
                 bootstrap_page = output.page;
                 output.metadata
             }
@@ -841,6 +859,92 @@ impl MetadataService {
             metadata: reply.metadata,
             page,
         })
+    }
+
+    /// After an origin `404` for a cache with writes, ask the other page-zero
+    /// owners, current and of the recently replaced membership, for a written
+    /// object's metadata. A member that joins as (or is promoted to) page
+    /// zero's rank 0 lacks the manifest until rebalance copies it, so its own
+    /// miss is not proof; a joiner may not know the replaced membership at
+    /// all, but rendezvous ranking only shifts the previous owners down, so
+    /// the current owners include them. Probes are copy-only under the
+    /// current membership: the coordinator always answers, a manifest replica
+    /// only while it is a page-zero member, so a displaced replica cannot
+    /// revive a deleted version. `NotFound` only when every probed owner
+    /// answers a miss; any other answer leaves the read retryable.
+    async fn written_elsewhere(
+        &self,
+        purpose: &RefreshPurpose,
+        membership: &std::sync::Arc<crate::topology::Membership>,
+        context: &OriginContext,
+        scope: &RequestScope,
+    ) -> std::result::Result<ObjectMetadata, RefreshFailure> {
+        let mut owners = self
+            .candidates
+            .candidates_scoped(membership.clone(), &context.object, PageNumber(0), scope)
+            .await?
+            .ordered;
+        if let Some(previous) = self
+            .candidates
+            .recent_previous_owners(membership, &context.object, PageNumber(0), scope)
+            .await?
+        {
+            for node in previous.ordered {
+                if !owners.contains(&node) {
+                    owners.push(node);
+                }
+            }
+        }
+        let selector = purpose.selector();
+        let operation = PeerOperation::Metadata {
+            object: context.object.clone(),
+            selector: selector.clone(),
+            mode: FetchMode::CopyOnly,
+        };
+        let me = self.candidates.local_node().clone();
+        // Copy-only probes never forward, so they cannot loop: they get their
+        // own budget under the request deadline, not the caller's, which a
+        // forwarded acquisition may have spent on its hops.
+        let mut probes = super::default_budget(scope);
+        let mut unknown = false;
+        for node in owners.iter().filter(|node| **node != me) {
+            if membership.member(node).is_err() {
+                // Gone: whatever it held, rebalance or repair restores
+                // from the surviving holders.
+                continue;
+            }
+            match self
+                .candidates
+                .request(
+                    membership,
+                    node,
+                    context,
+                    &operation,
+                    FetchMode::CopyOnly,
+                    scope,
+                    &mut probes,
+                    1,
+                )
+                .await
+            {
+                Ok(response) => match response.response() {
+                    PeerResponse::Metadata(metadata) => {
+                        super::validate_metadata(metadata, &context.object, &selector)?;
+                        return Ok(metadata.clone());
+                    }
+                    PeerResponse::Miss | PeerResponse::NotFound => {}
+                    _ => unknown = true,
+                },
+                Err(error) if scope.check().is_err() => return Err(error.into()),
+                Err(_) => unknown = true,
+            }
+        }
+        Err(if unknown {
+            Error::Unavailable
+        } else {
+            Error::NotFound
+        }
+        .into())
     }
 
     /// A conditional origin miss says nothing about immutable copies on later
