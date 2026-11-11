@@ -64,6 +64,10 @@ def blank(s):
 
 def save(client, sd, checkpoint_id, **kw):
     kw.setdefault("step", 1)
+    # Bound the upload wait: the writer's defaults poll each second for up to
+    # an hour, so a fake that never commits would stall the suite.
+    kw.setdefault("upload_poll_interval", 0.01)
+    kw.setdefault("upload_timeout", 5)
     writer = rdcp.RacerStorageWriter(client, BUCKET, PREFIX, **kw)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
