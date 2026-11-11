@@ -236,6 +236,19 @@ func TestResolvedStageRejectsUnsafeSecurityAndTopology(t *testing.T) {
 
 	_, _, base := genericVLLMContractFixture(t)
 
+	t.Run("read-only journal paths", func(t *testing.T) {
+		run := base.DeepCopy()
+		run.Spec.ResolvedPlan.Phases[0].Stages[0].Test.Security.HostPaths = []WorkloadHostPath{
+			{MountPath: "/var/log", Path: "/var/log", ReadOnly: true},
+			{MountPath: "/run/log", Path: "/run/log", ReadOnly: true},
+			{MountPath: "/etc/machine-id", Path: "/etc/machine-id", ReadOnly: true},
+		}
+
+		if _, err := deriveFixturePlanDigest(run); err != nil {
+			t.Fatalf("resolved plan rejected approved journal host paths: %v", err)
+		}
+	})
+
 	t.Run("unsafe host path", func(t *testing.T) {
 		run := base.DeepCopy()
 		run.Spec.ResolvedPlan.Phases[0].Stages[0].Test.Security.HostPaths = []WorkloadHostPath{{
@@ -283,6 +296,31 @@ func TestResolvedStageRejectsUnsafeSecurityAndTopology(t *testing.T) {
 
 		if _, err := deriveFixturePlanDigest(run); err == nil {
 			t.Fatal("resolved plan accepted a writable sys host path")
+		}
+	})
+
+	t.Run("writable journal path", func(t *testing.T) {
+		run := base.DeepCopy()
+		run.Spec.ResolvedPlan.Phases[0].Stages[0].Test.Security.HostPaths = []WorkloadHostPath{{
+			MountPath: "/var/log",
+			Path:      "/var/log",
+		}}
+
+		if _, err := deriveFixturePlanDigest(run); err == nil {
+			t.Fatal("resolved plan accepted a writable journal host path")
+		}
+	})
+
+	t.Run("journal descendant path", func(t *testing.T) {
+		run := base.DeepCopy()
+		run.Spec.ResolvedPlan.Phases[0].Stages[0].Test.Security.HostPaths = []WorkloadHostPath{{
+			MountPath: "/var/log/journal",
+			Path:      "/var/log/journal",
+			ReadOnly:  true,
+		}}
+
+		if _, err := deriveFixturePlanDigest(run); err == nil {
+			t.Fatal("resolved plan accepted an unapproved journal descendant")
 		}
 	})
 

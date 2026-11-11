@@ -1427,7 +1427,8 @@ func workloadHostPathType(path string) corev1.HostPathType {
 	case "/proc/cpuinfo",
 		"/proc/meminfo",
 		"/proc/version",
-		"/proc/sys/kernel/random/boot_id":
+		"/proc/sys/kernel/random/boot_id",
+		"/etc/machine-id":
 		return corev1.HostPathFile
 	default:
 		return corev1.HostPathDirectory

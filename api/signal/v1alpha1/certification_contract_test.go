@@ -675,8 +675,8 @@ func TestCertificationSuiteWorkloadPathBounds(t *testing.T) {
 
 	for _, rule := range []string{
 		"self.mountPath != '/scripts' && !self.mountPath.startsWith('/scripts/') && self.mountPath != '/results' && !self.mountPath.startsWith('/results/')",
-		"(self.path == '/proc/cpuinfo' || self.path == '/proc/meminfo' || self.path == '/proc/version' || self.path == '/proc/sys/kernel/random/boot_id' || self.path == '/sys' || self.path.startsWith('/sys/') || self.path == '/var/lib/project-signal' || self.path.startsWith('/var/lib/project-signal/')) && !self.path.contains('//') && !self.path.contains('/./') && !self.path.contains('/../') && !self.path.endsWith('/.') && !self.path.endsWith('/..')",
-		"!(self.path.startsWith('/proc/') || self.path == '/sys' || self.path.startsWith('/sys/')) || self.readOnly",
+		"(self.path == '/proc/cpuinfo' || self.path == '/proc/meminfo' || self.path == '/proc/version' || self.path == '/proc/sys/kernel/random/boot_id' || self.path == '/sys' || self.path.startsWith('/sys/') || self.path == '/var/lib/project-signal' || self.path.startsWith('/var/lib/project-signal/') || self.path == '/var/log' || self.path == '/run/log' || self.path == '/etc/machine-id') && !self.path.contains('//') && !self.path.contains('/./') && !self.path.contains('/../') && !self.path.endsWith('/.') && !self.path.endsWith('/..')",
+		"!(self.path.startsWith('/proc/') || self.path == '/sys' || self.path.startsWith('/sys/') || self.path == '/var/log' || self.path == '/run/log' || self.path == '/etc/machine-id') || self.readOnly",
 	} {
 		if !hasValidationRule(hostPath, rule) {
 			t.Fatalf("generated host path has no %q validation", rule)

@@ -1174,6 +1174,32 @@ func TestStagePodUsesFileHostPathTypeForApprovedProcLeaf(t *testing.T) {
 	}
 }
 
+func TestStagePodUsesFileHostPathTypeForMachineID(t *testing.T) {
+	t.Parallel()
+
+	invocation := stageExecutionInvocation()
+	invocation.Stage.Test.Security.HostPaths = []signalv1.WorkloadHostPath{{
+		Path:      "/etc/machine-id",
+		MountPath: "/etc/machine-id",
+		ReadOnly:  true,
+	}}
+	executor := &KubernetesStageExecutor{
+		Namespace:     "signal-system",
+		ExecutionName: "stage",
+	}
+
+	pod, err := executor.stagePod(testWorkflow("parent", "parent-uid"), invocation, 0)
+	if err != nil {
+		t.Fatalf("stagePod() error = %v", err)
+	}
+
+	if pod.Spec.Volumes[0].HostPath == nil ||
+		pod.Spec.Volumes[0].HostPath.Type == nil ||
+		*pod.Spec.Volumes[0].HostPath.Type != corev1.HostPathFile {
+		t.Fatalf("machine-id host path volume = %#v", pod.Spec.Volumes[0])
+	}
+}
+
 func TestStagePodProvidesBoundedSharedMemoryForIPCLock(t *testing.T) {
 	t.Parallel()
 

@@ -524,6 +524,9 @@ func isAllowedSignalHostPath(value string) bool {
 		value == "/proc/sys/kernel/random/boot_id" ||
 		value == "/sys" ||
 		strings.HasPrefix(value, "/sys/") ||
+		value == "/var/log" ||
+		value == "/run/log" ||
+		value == "/etc/machine-id" ||
 		value == "/var/lib/project-signal" ||
 		strings.HasPrefix(value, "/var/lib/project-signal/")
 }
@@ -538,7 +541,10 @@ func isReservedSignalMount(value string) bool {
 func isReadOnlySignalHostPath(value string) bool {
 	return strings.HasPrefix(value, "/proc/") ||
 		value == "/sys" ||
-		strings.HasPrefix(value, "/sys/")
+		strings.HasPrefix(value, "/sys/") ||
+		value == "/var/log" ||
+		value == "/run/log" ||
+		value == "/etc/machine-id"
 }
 
 func validateResolvedDriver(driver CertificationTestDriver) error {
