@@ -399,8 +399,9 @@ async fn persist(
     context: &OriginContext,
     scope: &RequestScope,
 ) -> std::result::Result<(MessageHead, Outcome), Reject> {
-    if context.metadata.is_none() {
-        return Err(Reject::new(400));
+    match &context.metadata {
+        None => return Err(Reject::new(400)),
+        Some(metadata) => upload_metadata(local, object, metadata.as_header())?,
     }
     match session_action(local, object, None, WriteAction::Persist, context, scope).await? {
         WriteReply::Committed { state } => Ok((
@@ -444,6 +445,45 @@ fn names_version(metadata: &[u8]) -> bool {
     }
 }
 
+/// Check that `metadata` names an object the cache's origin can upload to:
+/// canonical, hashing to the request key, without a version, and (Azure) in
+/// the configured container. Without this a write with a foreign bucket would
+/// be acknowledged and only fail at upload.
+fn upload_metadata(
+    local: &Coordinator,
+    object: &ObjectId,
+    metadata: &[u8],
+) -> std::result::Result<(), Reject> {
+    #[cfg(any(test, feature = "dst"))]
+    if local.writes.origin.borrow().is_some() {
+        // Test origins take opaque metadata.
+        return match names_version(metadata) {
+            true => Err(Reject::new(400)),
+            false => Ok(()),
+        };
+    }
+    local
+        .availability
+        .with_origin_container(&object.cache, |container| {
+            check_upload_metadata(metadata, &object.key, container)
+        })
+        .unwrap_or(Ok(()))
+}
+
+/// [`upload_metadata`] against one Azure container.
+fn check_upload_metadata(
+    metadata: &[u8],
+    key: &crate::model::CacheKey,
+    container: &str,
+) -> std::result::Result<(), Reject> {
+    match crate::origin::azure::identity::decode(metadata, key, container) {
+        Ok(object) if object.version_id.is_empty() => Ok(()),
+        Ok(_) => Err(Reject::new(400)),
+        Err(Error::OriginForbidden) => Err(Reject::token(400, error_token::BUCKET)),
+        Err(_) => Err(Reject::new(400)),
+    }
+}
+
 /// Resolve request options against the cache's write settings.
 fn spec(
     local: &Coordinator,
@@ -473,10 +513,7 @@ fn spec(
     if upload != UploadMode::Never {
         match &context.metadata {
             None => return Err(Reject::new(400)),
-            Some(metadata) if names_version(metadata.as_header()) => {
-                return Err(Reject::new(400));
-            }
-            Some(_) => {}
+            Some(metadata) => upload_metadata(local, object, metadata.as_header())?,
         }
     }
     let hold = options
@@ -1110,5 +1147,47 @@ async fn read_page(
                 .map_err(|_| Error::InvalidRequest)?;
             Ok(plaintext)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_upload_metadata;
+    use crate::origin::azure::identity::canonical;
+    use racer_wire::object::write::error_token;
+
+    #[test]
+    fn upload_metadata_must_name_the_configured_container() {
+        let (raw, key) = canonical("ckpt", "runs/a/0", "").unwrap();
+        assert_eq!(check_upload_metadata(&raw, &key, "ckpt"), Ok(()));
+
+        // A foreign bucket would fail only at upload; reject it up front.
+        let refused = check_upload_metadata(&raw, &key, "other").unwrap_err();
+        assert_eq!(
+            (refused.status, refused.token),
+            (400, Some(error_token::BUCKET))
+        );
+    }
+
+    #[test]
+    fn upload_metadata_must_be_canonical_unversioned_and_match_the_key() {
+        let (raw, key) = canonical("ckpt", "runs/a/0", "").unwrap();
+        let (_, other) = canonical("ckpt", "runs/a/1", "").unwrap();
+        assert_eq!(
+            check_upload_metadata(&raw, &other, "ckpt")
+                .unwrap_err()
+                .status,
+            400
+        );
+        let spaced = br#"{"schema":1, "bucket":"ckpt","key":"runs/a/0"}"#;
+        assert_eq!(
+            check_upload_metadata(spaced, &key, "ckpt")
+                .unwrap_err()
+                .status,
+            400
+        );
+        let (versioned, versioned_key) = canonical("ckpt", "runs/a/0", "v1").unwrap();
+        let refused = check_upload_metadata(&versioned, &versioned_key, "ckpt").unwrap_err();
+        assert_eq!((refused.status, refused.token), (400, None));
     }
 }

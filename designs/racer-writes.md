@@ -381,7 +381,7 @@ When writes are enabled, `405` responses on `/v1/objects/<key>` carry
 | `504` | Request deadline elapsed before durability | |
 
 `Racer-Write-Error` is a diagnostic token: `dirty-cap`, `owners`, `coordinator`,
-`lease`, `upload`, `uploaded`, `not-manual`. Bodies stay empty.
+`lease`, `upload`, `uploaded`, `not-manual`, `bucket`. Bodies stay empty.
 
 `Racer-Upload-State` values: `pending` (waiting to upload), `uploading`,
 `committed`, `failed`, `never` (cache-only), `manual` (waiting for `persist`).
@@ -1469,6 +1469,13 @@ Deviations from the plan above:
   whole-application simulated cluster) rather than `write/tests.rs`, which
   holds unit tests. `persist` on a disabled cache answers `405` (explicitly
   routed) instead of the read parser's `400`.
+- Review fix: creating writes that upload, and `persist`, check
+  `Racer-Metadata` against the cache's Azure origin before accepting
+  (`write/client.rs`, `upload_metadata`): it must be canonical, hash to the
+  request key, name no version, and name the configured container. A
+  foreign bucket answers `400 bucket`; before, it got `201` and failed only
+  at upload, when `AzureOrigin::begin` decodes it against the container
+  (`origin/azure.rs`). `never` writes without metadata are unchanged.
 
 Left for WP8/WP11: repair (`SessionEffect::Restore` is ignored), coordinator
 failover from manifest replicas, orphan GC, alias records, rekey; written

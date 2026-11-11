@@ -1239,7 +1239,7 @@ When writes are on, a `405` lists the methods its path accepts:
 |--------|----------|------|
 | `Content-Length` | `PUT` | Required. 1 up to the size limit below. Missing: `411`. Too large: `413`. `0`: `400`. Other requests must send `0` or omit it. |
 | `If-None-Match` | `PUT`, `host-write` | Required, exactly `*`. Otherwise `428`. |
-| `Racer-Metadata` | all | Origin context, checked like reads. It must name the object without a version (Azure: no `versionId`). Required on `persist`, and on `PUT` and `host-write` unless the upload mode is `never`. Optional on `DELETE`. Missing or versioned: `400`. |
+| `Racer-Metadata` | all | Origin context. It must name the object without a version (Azure: no `versionId`), and its `bucket` must be the container in the cache's `containerURL`, because that is where the upload goes. Required on `persist`, and on `PUT` and `host-write` unless the upload mode is `never`. Optional on `DELETE`. Missing, versioned, not matching the key, or another bucket: `400` (another bucket has token `bucket`). |
 | `Authorization` | all | Optional, as for reads. |
 | `Racer-Durability` | `PUT`, `host-write` | `replicas=1`, `replicas=2`, `replicas=3`, or `origin`. Default `replicas=<writes.replicas>`. `origin` acknowledges only after the upload commits; with `Racer-Upload: manual` or `never` it is `400`. |
 | `Racer-Upload` | `PUT`, `host-write` | `auto`, `manual`, or `never` (lower case). Default `writes.upload.mode`. A cache without an origin accepts only `never`; other modes get `400`. |
@@ -1299,6 +1299,7 @@ Errors may carry a `Racer-Write-Error` token for diagnosis:
 | `upload` | The upload failed. |
 | `uploaded` | `DELETE` of an object that is already in the origin. |
 | `not-manual` | `persist` of an object that is not `manual`. |
+| `bucket` | `Racer-Metadata` names a bucket other than the origin's container. |
 
 If another writer creates the blob in the origin first, the upload fails and
 the object's state becomes `failed`.

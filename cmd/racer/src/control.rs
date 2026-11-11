@@ -251,6 +251,19 @@ impl Availability {
         self.with_cache(cache, |c| c.is_some_and(|c| c.origin.is_some()))
     }
 
+    /// Run `f` over the Azure container of this cache's native origin, if it
+    /// has one. Writes check `Racer-Metadata` against it before accepting.
+    pub fn with_origin_container<R>(
+        &self,
+        cache: &CacheId,
+        f: impl FnOnce(&str) -> R,
+    ) -> Option<R> {
+        self.with_cache(cache, |c| {
+            c.and_then(|c| c.origin.as_ref())
+                .map(|o| f(o.azure.container_url.container()))
+        })
+    }
+
     /// Require both cache admission and an active page key for metadata reads.
     pub fn metadata(&self, cache: &CacheId) -> bool {
         self.cache(cache) && self.keys.has_active(cache, KeyPurpose::Page)

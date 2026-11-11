@@ -237,6 +237,7 @@ pub mod error_token {
     pub const UPLOAD: &str = "upload";
     pub const UPLOADED: &str = "uploaded";
     pub const NOT_MANUAL: &str = "not-manual";
+    pub const BUCKET: &str = "bucket";
 }
 
 /// A write operation.
