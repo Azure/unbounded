@@ -65,8 +65,9 @@ type Writes struct {
 	reject  func(WriteCall) *WriteReply
 	// defaults
 	upload string
-	// originExists reports whether the origin already has the object.
-	originExists func(ctx context.Context, key [32]byte, metadata, authorization string) bool
+	// originExists reports whether the origin already has the object. A
+	// non-nil error means the origin could not answer; the create fails.
+	originExists func(ctx context.Context, key [32]byte, metadata, authorization string) (bool, error)
 }
 
 // NewWrites returns an enabled write directory whose default upload mode is
@@ -101,8 +102,10 @@ func (w *Writes) SetReject(reject func(WriteCall) *WriteReply) {
 	w.reject = reject
 }
 
-// SetOriginExists installs the create-once origin check.
-func (w *Writes) SetOriginExists(exists func(ctx context.Context, key [32]byte, metadata, authorization string) bool) {
+// SetOriginExists installs the create-once origin check. When the check
+// returns an error the create fails with 503 and creates nothing, as Racer
+// does when its origin probe fails.
+func (w *Writes) SetOriginExists(exists func(ctx context.Context, key [32]byte, metadata, authorization string) (bool, error)) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -353,13 +356,24 @@ func parseSpec(h http.Header, defaultUpload string) (Written, int) {
 }
 
 func (w *Writes) create(rw http.ResponseWriter, r *http.Request, key [32]byte, kind string, spec Written,
-	files []*os.File, originExists func(context.Context, [32]byte, string, string) bool, metadata, authorization string,
+	files []*os.File, originExists func(context.Context, [32]byte, string, string) (bool, error), metadata, authorization string,
 ) {
 	w.mu.Lock()
 	_, exists := w.objects[key]
 	w.mu.Unlock()
 
-	if exists || originExists != nil && originExists(r.Context(), key, metadata, authorization) {
+	if !exists && originExists != nil {
+		var err error
+
+		exists, err = originExists(r.Context(), key, metadata, authorization)
+		if err != nil {
+			// Racer answers a failed create-once probe as a busy coordinator.
+			writeFailure(rw, WriteReply{Status: 503, Code: "coordinator", RetryAfter: 1})
+			return
+		}
+	}
+
+	if exists {
 		writeFailure(rw, WriteReply{Status: 412})
 		return
 	}

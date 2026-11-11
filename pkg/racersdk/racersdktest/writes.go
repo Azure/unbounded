@@ -85,7 +85,7 @@ func NewClientWithWrites(t testing.TB, origin racersdk.Origin) (*racersdk.Client
 }
 
 func (w *Writes) wrap(next racersdk.Origin) racersdk.Origin {
-	w.dir.SetOriginExists(func(ctx context.Context, key [32]byte, metadata, authorization string) bool {
+	w.dir.SetOriginExists(func(ctx context.Context, key [32]byte, metadata, authorization string) (bool, error) {
 		request := racersdk.OriginRequest{Request: racersdk.Request{Key: key, Metadata: metadata, Authorization: authorization}, Head: true}
 
 		_, body, err := callOrigin(ctx, next, request)
@@ -93,7 +93,14 @@ func (w *Writes) wrap(next racersdk.Origin) racersdk.Origin {
 			closeBody(body)
 		}
 
-		return err == nil
+		switch {
+		case err == nil:
+			return true, nil
+		case errors.Is(err, racersdk.ErrNotFound):
+			return false, nil
+		default:
+			return false, err
+		}
 	})
 
 	return func(ctx context.Context, request racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {

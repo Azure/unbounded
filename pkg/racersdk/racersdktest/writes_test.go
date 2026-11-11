@@ -159,6 +159,63 @@ func TestPutCreateOnce(t *testing.T) {
 	}
 }
 
+// TestPutCreateOnceOriginFailure checks that a create-once probe that fails
+// for any reason other than not-found fails the write with 503, as Racer does,
+// and creates nothing.
+func TestPutCreateOnceOriginFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"unavailable", racersdk.ErrUnavailable},
+		{"unauthorized", racersdk.ErrUnauthorized},
+		{"other", errors.New("boom")},
+		{"panic", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var fail atomic.Bool
+
+			fail.Store(true)
+
+			origin := func(_ context.Context, _ racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
+				if fail.Load() {
+					if tc.err == nil {
+						panic("origin panic")
+					}
+
+					return racersdk.Metadata{}, nil, tc.err
+				}
+
+				return racersdk.Metadata{}, nil, racersdk.ErrNotFound
+			}
+			c, writes := racersdktest.NewClientWithWrites(t, origin)
+			ctx := context.Background()
+			r := writeRequest(4)
+
+			_, err := c.Put(ctx, r, strings.NewReader("a"), 1, racersdk.WriteOptions{})
+
+			var we *racersdk.WriteError
+			if !errors.As(err, &we) || we.Status != 503 || !errors.Is(err, racersdk.ErrBusy) || errors.Is(err, racersdk.ErrExists) {
+				t.Fatalf("put: %v", err)
+			}
+
+			if _, ok := writes.Object(r.Key); ok {
+				t.Fatal("failed probe created the object")
+			}
+
+			fail.Store(false)
+
+			if _, err := c.Put(ctx, r, strings.NewReader("a"), 1, racersdk.WriteOptions{}); err != nil {
+				t.Fatalf("put after recovery: %v", err)
+			}
+
+			if _, ok := writes.Object(r.Key); !ok {
+				t.Fatal("not-found probe did not create the object")
+			}
+		})
+	}
+}
+
 func TestWriteDisabled(t *testing.T) {
 	c, writes := racersdktest.NewClientWithWrites(t, nil)
 	writes.SetEnabled(false)
