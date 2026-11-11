@@ -231,3 +231,17 @@ fn upload_state_lookups_reserve_half_the_request_budget() {
         None
     );
 }
+
+/// A maintenance turn that outlasts `TICK` must not leave a past deadline
+/// for the worker's park bound, or the worker spins until the turn ends.
+#[test]
+fn running_maintenance_turn_reports_no_deadline() {
+    let service = WriteService::new(Rc::new(directory::Directory::default()));
+    let past = Instant::now();
+    service.next_tick.set(Some(past));
+    assert_eq!(service.next_deadline(), Some(past));
+    service.ticking.set(true);
+    assert_eq!(service.next_deadline(), None);
+    service.ticking.set(false);
+    assert_eq!(service.next_deadline(), Some(past));
+}

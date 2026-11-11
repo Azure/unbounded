@@ -1391,6 +1391,10 @@ object's metadata worker (`serve_write_peer`); per-page work moves to the
 page owner with `WorkerDirectory::write_page`, and in-process sends to the
 local node use `WorkerDirectory::write_serve` (no network hop).
 `NodeDirectory` holds the node-wide `write_staging` and `upload_limits`.
+`WriteService::next_deadline` is `None` while a maintenance turn runs. `poll`
+starts no turn until the running one finishes, so reporting the past `TICK`
+deadline would only make the worker's park bound zero and spin it for the
+rest of a long turn; the turn's own I/O wakes the worker instead.
 `Fill::copy_only_joining` answers staged pages before any cache lookup, which
 is how store targets pull (also over RDMA; see the test below). The listener
 routes `is_write` heads to `write::client::serve` when the cache has writes,

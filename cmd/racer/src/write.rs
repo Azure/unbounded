@@ -237,7 +237,13 @@ impl WriteService {
     }
 
     /// When the next maintenance turn is due, for the worker's park bound.
+    /// None while a turn runs: `poll` starts no turn until it finishes, so a
+    /// past deadline would only make the worker spin without parking. The
+    /// running turn's own I/O wakes the worker when it completes.
     pub fn next_deadline(&self) -> Option<Instant> {
+        if self.ticking.get() {
+            return None;
+        }
         self.next_tick.get()
     }
 
