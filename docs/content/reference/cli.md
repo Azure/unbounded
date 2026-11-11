@@ -117,7 +117,35 @@ Use one method per cluster. Each refuses to take over the other: the chart
 won't install over an operator that `install` created, and `install` won't
 apply over an operator Deployment or ClusterRoleBinding owned by a Helm release
 (including the AKS flex operator extension). To switch methods, remove the
-existing install first.
+existing install first, as below.
+
+The chart always runs the operator from `imageRegistry`, like its components;
+`image.reference` and `image.name` are fixed for Helm installs, the same way
+`--operator-image` can't carry a registry.
+
+#### Switching install methods
+
+From `install` to the chart, delete the operator objects but keep the
+namespace. Every component the operator deployed, including unbounded-net,
+runs in it, so `kubectl delete -f unbounded-operator-<tag>.yaml` (which
+includes the Namespace) would take networking down on attached nodes.
+
+```bash
+NS=unbounded-system
+# Carry UNBOUNDED_API_SERVER_ENDPOINT and UNBOUNDED_REAP_LEGACY_RESOURCES over
+# to the chart values (apiServerEndpoint, reapLegacyResources) first.
+kubectl -n "$NS" get configmap unbounded-operator-config -o yaml
+
+kubectl -n "$NS" delete deployment/unbounded-operator serviceaccount/unbounded-operator \
+  configmap/unbounded-operator-config \
+  role/unbounded-operator-registry-auth-migration \
+  rolebinding/unbounded-operator-registry-auth-migration
+kubectl delete clusterrolebinding/unbounded-operator clusterrole/unbounded-operator
+# Do not delete the namespace.
+```
+
+Then `helm install` into the same namespace. From the chart to `install`,
+`helm uninstall` is enough; it leaves the namespace alone.
 
 `helm uninstall` removes the operator, its RBAC and its ConfigMap. The chart
 never creates the release namespace (`--create-namespace` does), so Helm leaves

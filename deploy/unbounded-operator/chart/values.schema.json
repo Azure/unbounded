@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$comment": "The root accepts extra keys: AKS cluster extensions inject platform values (Azure.Cluster.*, IdentityClientId, DataBoundary, scope, ...) that this chart ignores. The chart's own objects stay strict.",
+  "$comment": "The root accepts extra keys: AKS cluster extensions inject platform values (Azure.Cluster.*, IdentityClientId, DataBoundary, scope, ...) that this chart ignores. The chart's own objects stay strict. image.reference, image.name and namespace.create are pinned: only the static render (values-static.yaml, --skip-schema-validation) changes them, so a Helm install always runs the operator from imageRegistry, the same registry as its components.",
   "type": "object",
   "required": ["imageRegistry", "image", "apiServerEndpoint", "reapLegacyResources", "resources", "namespace"],
   "properties": {
@@ -10,8 +10,8 @@
       "additionalProperties": false,
       "required": ["reference", "name", "tag", "digest", "pullPolicy"],
       "properties": {
-        "reference": {"type": "string"},
-        "name": {"type": "string", "pattern": "^[a-z0-9]+([._-][a-z0-9]+)*$"},
+        "reference": {"const": ""},
+        "name": {"const": "unbounded-operator"},
         "tag": {"type": "string"},
         "digest": {"type": "string", "pattern": "^(sha256:[0-9a-f]{64})?$"},
         "pullPolicy": {"enum": ["Always", "IfNotPresent", "Never"]}

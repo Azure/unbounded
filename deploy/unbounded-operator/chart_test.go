@@ -183,6 +183,8 @@ func TestChartRejectsInvalidValues(t *testing.T) {
 
 	for name, set := range map[string]string{
 		"image name with registry": "image.name=ghcr.io/azure/unbounded-operator",
+		"renamed image":            "image.name=flex-operator",
+		"image reference":          "image.reference=mcr.microsoft.com/example/unbounded-operator:v0.22.0",
 		"malformed digest":         "image.digest=latest",
 		"unknown image field":      "image.repository=foo",
 		"chart-owned namespace":    "namespace.create=true",

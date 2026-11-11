@@ -42,7 +42,7 @@ only runs against a live cluster.
 {{- $releaseName := default "" (get $annotations "meta.helm.sh/release-name") -}}
 {{- $releaseNamespace := default "" (get $annotations "meta.helm.sh/release-namespace") -}}
 {{- if not (and (eq $releaseName .Release.Name) (eq $releaseNamespace .Release.Namespace)) -}}
-{{- fail (printf "Deployment %s/unbounded-operator already exists and isn't managed by this Helm release; it was likely installed by `kubectl unbounded install`. Remove that installation before installing the chart." .Release.Namespace) -}}
+{{- fail (printf "Deployment %s/unbounded-operator already exists and isn't managed by this Helm release; it was likely installed by `kubectl unbounded install`. Remove it first and keep the namespace; see \"Switching install methods\" in docs/content/reference/cli.md." .Release.Namespace) -}}
 {{- end -}}
 {{- end -}}
 {{- end }}

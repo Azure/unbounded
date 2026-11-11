@@ -5,11 +5,13 @@
 imageRegistry: ghcr.io/azure
 
 image:
-  # Full operator image reference; overrides name, tag and digest. Used by
-  # `make unbounded-operator-manifests`, whose UNBOUNDED_OPERATOR_IMAGE may be
-  # a locally built image outside imageRegistry.
+  # Full operator image reference; overrides name, tag and digest. Only
+  # `make unbounded-operator-manifests` sets it (UNBOUNDED_OPERATOR_IMAGE may be
+  # a locally built image). The schema pins it, and name, for Helm and AKS
+  # extension installs: the operator runs its own image as
+  # <imageRegistry>/unbounded-operator:<version> (gantry registry auth), so it
+  # must come from imageRegistry like every component.
   reference: ""
-  # Operator image name without a registry; the registry is imageRegistry.
   name: unbounded-operator
   # Defaults to the chart appVersion.
   tag: ""
