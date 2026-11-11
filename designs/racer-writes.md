@@ -2027,6 +2027,49 @@ Open issues:
 - After an upload the origin fixture serves no pages, so the DST does not
   check reads of uploaded objects beyond their ETag.
 
+### Restart fix as built
+
+Kind e2e `TestWritesNeverUpload` (`survives a deleted racer pod`) once
+returned a lasting `503` (`stage=FirstSlice error=MissingKey`) on some
+readers after the writer's Racer pod restarted. That run was on an older
+base; on this branch the original failure did not reproduce (4 of 4 kind runs
+read the object everywhere after the restart; one run failed earlier on a
+`503 dirty-cap` PUT, see below), and the simulated cluster passes the same
+sequence on both bases. Review of the restart path found a matching latent
+bug, now fixed:
+
+- `StoreWriter::restore_written` (`cmd/racer/src/store/writes.rs`) published a
+  recovered written page only when `Availability::page` admitted its key, and
+  `Index::try_publish` (`cmd/racer/src/store/catalog.rs`) silently skips such
+  pages too. A node that recovers its journal before its keyring is installed
+  kept the pages pinned but never indexed them, so it could not serve them
+  until hold expiry. Recovery now uses `Index::publish_written`, which only
+  requires cache admission; `Index::lookup` still checks the key per read.
+- `Index::sweep_unavailable` dropped catalog entries of written pages whose key
+  was not admitted. Records in pinned segments are now kept; their pin decides
+  their lifetime, and the write service rekeys or drops them.
+- Store targets retried a transient `Overloaded` from `persist_written`
+  (checkpoint freeze, tail roll, staging) for only about 180 ms, which a
+  16 MiB page store can outlast; a writer then answered `503 dirty-cap` far
+  below the cap. The retry now backs off to 250 ms for about 3 s. This cause of
+  the observed `dirty-cap` is an inference; the e2e did not capture the
+  target's state.
+
+Tests: `store::tests::written::written_pages_recovered_before_the_keyring_read_once_it_arrives`
+(fails without the fix) and
+`app::dst::write_tests::a_restarted_writer_keeps_its_object_readable_everywhere`
+(3 and 4 nodes, graceful and power-loss restarts, with and without key
+rotations).
+
+Reads after `DELETE` on a cache without `spec.origin` stay `503`, not `404`.
+Without `spec.origin` the cache's origin is the application adapter socket
+(`/run/racer/<name>/origin/socket`, `docs/content/reference/racer.md`), and
+`OriginRouter` (`cmd/racer/src/origin/router.rs`) cannot tell an adapter that
+is not deployed from one that is restarting. Answering `404` when the socket
+does not answer would make objects the adapter serves read as missing during
+an adapter restart. A `404` needs an explicit "no origin" setting in the
+cache definition, which does not exist yet. The e2e accepts `404` or `503`.
+
 ### WP12: documentation
 
 Files: `docs/content/reference/racer.md` (new sections after "Prefetch",
