@@ -338,6 +338,12 @@ struct World {
     /// Keys whose only copies were lost with a removed node: their state
     /// is `failed` and reads may answer anything but their old bytes.
     lost: BTreeSet<usize>,
+    /// Etags of the versions lost with a removed node. Their surviving
+    /// pages may stay pinned (until the orphan check or their hold drops
+    /// them) even after a new version of the key is written.
+    /// A surviving cached copy may still serve them: by etag, the key and
+    /// the acknowledged bytes.
+    lost_versions: BTreeMap<String, (usize, Vec<u8>)>,
     /// Etags of every acknowledged version.
     acked: BTreeSet<String>,
     /// Upload faults injected and not yet consumed.
@@ -381,6 +387,7 @@ impl World {
             live: BTreeMap::new(),
             gone: BTreeSet::new(),
             lost: BTreeSet::new(),
+            lost_versions: BTreeMap::new(),
             tolerate_404: false,
             acked: BTreeSet::new(),
             upload_faults: 0,
@@ -1105,11 +1112,35 @@ impl World {
         let Some(response) = raws[0].response() else {
             return;
         };
-        if response.status == 200 {
+        if response.status == 200 && want.is_none() && self.lost.contains(&object) {
+            // Lost with its holder: the design keeps such a version (its
+            // page waits for a holder), and a surviving copy may serve it.
+            // It must be that version's acknowledged bytes.
+            let etag = response.header("etag").unwrap_or("");
+            let lost = self
+                .lost_versions
+                .get(etag)
+                .filter(|(key, _)| *key == object);
+            let Some((_, bytes)) = lost else {
+                panic!(
+                    "seed={} faulted read of lost {object:x} served unknown etag {etag:?}",
+                    self.harness.seed
+                );
+            };
+            let (got, _) = response.object();
+            assert!(
+                got.len() <= bytes.len() && got == bytes[..got.len()],
+                "seed={} faulted read of lost {object:x} served wrong bytes",
+                self.harness.seed
+            );
+            self.note("faulted-read-lost-hit");
+        } else if response.status == 200 {
             let want = want.unwrap_or_else(|| {
                 panic!(
-                    "seed={} faulted read of a missing object",
-                    self.harness.seed
+                    "seed={} faulted read of missing object {object:x} (etag {:?}, lost {})",
+                    self.harness.seed,
+                    response.header("etag"),
+                    self.lost.contains(&object)
                 )
             });
             if response.header("etag") == Some(want.etag.as_str()) {
@@ -1239,6 +1270,8 @@ impl World {
             .collect();
         for object in lost {
             let written = self.live.remove(&object).unwrap();
+            self.lost_versions
+                .insert(written.etag.clone(), (object, written.bytes.clone()));
             self.gone.insert(written.etag);
             self.lost.insert(object);
             self.note("write-lost-with-holder");
@@ -1298,12 +1331,15 @@ impl World {
                             && page.version.etag.as_bytes() == w.etag.as_bytes()
                             && (!w.uploading || !settled)
                     });
-                    // A failed (lost) version keeps its surviving pages
-                    // until DELETE or its hold ends.
+                    // A version lost with its holder keeps its surviving
+                    // pages until DELETE, the orphan check, or its hold
+                    // ends, also after a new version of the key is
+                    // written (racer-dst `app-writes-holder-loss` seeds 152
+                    // and 159).
                     let failed = self
-                        .lost
-                        .iter()
-                        .any(|&object| self.object(object) == page.version.object);
+                        .lost_versions
+                        .keys()
+                        .any(|etag| page.version.etag.as_bytes() == etag.as_bytes());
                     if !expected && !failed {
                         stray.push((index, page.version.object.key, page.number.0));
                     }
