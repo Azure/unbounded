@@ -9,9 +9,10 @@ import (
 )
 
 const (
-	MaxTestParameters = 16
-	MaxTestMetrics    = 16
-	MaxTestRoles      = 8
+	MaxTestParameters    = 16
+	MaxTestMetrics       = 16
+	MaxTestRoles         = 8
+	MaxTypedStringLength = 65536
 )
 
 // +kubebuilder:validation:Enum=String;Integer;Decimal;Boolean;Duration;Quantity
@@ -29,7 +30,7 @@ const (
 // +kubebuilder:validation:XValidation:rule="(self.type == 'String' && has(self.stringValue) && !has(self.integerValue) && !has(self.decimalValue) && !has(self.booleanValue) && !has(self.durationValue) && !has(self.quantityValue)) || (self.type == 'Integer' && !has(self.stringValue) && has(self.integerValue) && !has(self.decimalValue) && !has(self.booleanValue) && !has(self.durationValue) && !has(self.quantityValue)) || (self.type == 'Decimal' && !has(self.stringValue) && !has(self.integerValue) && has(self.decimalValue) && !has(self.booleanValue) && !has(self.durationValue) && !has(self.quantityValue)) || (self.type == 'Boolean' && !has(self.stringValue) && !has(self.integerValue) && !has(self.decimalValue) && has(self.booleanValue) && !has(self.durationValue) && !has(self.quantityValue)) || (self.type == 'Duration' && !has(self.stringValue) && !has(self.integerValue) && !has(self.decimalValue) && !has(self.booleanValue) && has(self.durationValue) && !has(self.quantityValue)) || (self.type == 'Quantity' && !has(self.stringValue) && !has(self.integerValue) && !has(self.decimalValue) && !has(self.booleanValue) && !has(self.durationValue) && has(self.quantityValue))",message="exactly the value field matching type must be set"
 type TypedValue struct {
 	Type TypedValueType `json:"type"`
-	// +kubebuilder:validation:MaxLength=256
+	// +kubebuilder:validation:MaxLength=65536
 	StringValue  *string `json:"stringValue,omitempty"`
 	IntegerValue *int64  `json:"integerValue,omitempty"`
 	// DecimalValue is a base-10 JSON-independent decimal representation.

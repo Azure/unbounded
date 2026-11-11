@@ -628,6 +628,14 @@ func TestCertificationSuitePhaseContract(t *testing.T) {
 		}
 	}
 
+	stringValue := stage.Properties["parameters"].
+		Items.Schema.
+		Properties["value"].
+		Properties["stringValue"]
+	if stringValue.MaxLength == nil || *stringValue.MaxLength != MaxTypedStringLength {
+		t.Fatalf("stage parameter string maxLength = %v, want %d", stringValue.MaxLength, MaxTypedStringLength)
+	}
+
 	schedule := stage.Properties["schedule"]
 	for _, rule := range []string{
 		"self.mode != 'RunOnce' || (!has(self.coverageWindow) && !has(self.interval) && !has(self.minExecutions) && !has(self.maxGap))",

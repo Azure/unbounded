@@ -724,7 +724,7 @@ spec:
                                           minLength: 1
                                           type: string
                                         stringValue:
-                                          maxLength: 256
+                                          maxLength: 65536
                                           type: string
                                         type:
                                           enum:
@@ -787,7 +787,7 @@ spec:
                                           minLength: 1
                                           type: string
                                         stringValue:
-                                          maxLength: 256
+                                          maxLength: 65536
                                           type: string
                                         type:
                                           enum:
@@ -856,7 +856,7 @@ spec:
                                           minLength: 1
                                           type: string
                                         stringValue:
-                                          maxLength: 256
+                                          maxLength: 65536
                                           type: string
                                         type:
                                           enum:
@@ -1017,7 +1017,7 @@ spec:
                                           minLength: 1
                                           type: string
                                         stringValue:
-                                          maxLength: 256
+                                          maxLength: 65536
                                           type: string
                                         type:
                                           enum:
@@ -2396,7 +2396,7 @@ spec:
                                         minLength: 1
                                         type: string
                                       stringValue:
-                                        maxLength: 256
+                                        maxLength: 65536
                                         type: string
                                       type:
                                         enum:
