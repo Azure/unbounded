@@ -11,7 +11,7 @@
 // moving it through the test host.
 //
 // Exit codes: 0 success, 1 usage or unexpected error, 3 ErrExists,
-// 4 ErrNotFound, 5 content mismatch.
+// 4 ErrNotFound, 5 content mismatch, 6 ErrUnavailable.
 package main
 
 import (
@@ -30,9 +30,10 @@ import (
 )
 
 const (
-	exitExists   = 3
-	exitNotFound = 4
-	exitMismatch = 5
+	exitExists      = 3
+	exitNotFound    = 4
+	exitMismatch    = 5
+	exitUnavailable = 6
 )
 
 func main() {
@@ -160,6 +161,8 @@ func check(err error) {
 		fail(exitExists, err)
 	case errors.Is(err, racersdk.ErrNotFound):
 		fail(exitNotFound, err)
+	case errors.Is(err, racersdk.ErrUnavailable):
+		fail(exitUnavailable, err)
 	default:
 		fail(1, err)
 	}

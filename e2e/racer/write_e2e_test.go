@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -28,6 +29,7 @@ const (
 	// Probe exit codes, from e2e/racer/writeprobe.
 	probeExitExists   = 3
 	probeExitNotFound = 4
+	probeExitUnavail  = 6
 )
 
 // TestWritesNeverUpload covers cache-only writes on a ClusterCache without an
@@ -93,8 +95,11 @@ spec:
 		h.probe(reader, 0, "get", writeCacheName, key, size, "4")
 		h.probe(other, 0, "delete", writeCacheName, key)
 
+		// A cache without an origin has no authority for absence: once the
+		// written object is gone a read miss is 503 (origin router
+		// ok_or(Unavailable)), not 404. Either way it must stop being readable.
 		for _, pod := range []string{writer, reader, other} {
-			h.waitProbe(pod, probeExitNotFound, "get", writeCacheName, key, size, "4")
+			h.waitProbeAny(pod, []int{probeExitNotFound, probeExitUnavail}, "get", writeCacheName, key, size, "4")
 		}
 
 		h.probe(writer, probeExitNotFound, "delete", writeCacheName, key)
@@ -264,8 +269,14 @@ func (h *harness) probe(pod string, want int, args ...string) string {
 // membership changes after a pod restart or a delete.
 func (h *harness) waitProbe(pod string, want int, args ...string) {
 	h.t.Helper()
-	h.waitFor(fmt.Sprintf("writeprobe %v in %s to exit %d", args, pod, want), 5*time.Minute, func() (bool, string) {
+	h.waitProbeAny(pod, []int{want}, args...)
+}
+
+// waitProbeAny retries the probe until it exits with any code in want.
+func (h *harness) waitProbeAny(pod string, want []int, args ...string) {
+	h.t.Helper()
+	h.waitFor(fmt.Sprintf("writeprobe %v in %s to exit one of %v", args, pod, want), 5*time.Minute, func() (bool, string) {
 		out, code := h.runProbe(pod, args...)
-		return code == want, fmt.Sprintf("exit %d: %s", code, out)
+		return slices.Contains(want, code), fmt.Sprintf("exit %d: %s", code, out)
 	})
 }
