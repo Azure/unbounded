@@ -670,6 +670,14 @@ notices:
     license:
       - name: Apache License, Version 2.0
         link: https://github.com/prometheus/common/blob/v0.73.1/LICENSE
+  - dependency: github.com/shirou/gopsutil/v4
+    ecosystem: go
+    copyright:
+      - Copyright (c) 2014, WAKAYAMA Shirou
+      - Copyright (c) 2009 The Go Authors. All rights reserved.
+    license:
+      - name: BSD 3-Clause License
+        link: https://github.com/shirou/gopsutil/blob/v4.26.6/LICENSE
   - dependency: github.com/spf13/cobra
     ecosystem: go
     copyright:
