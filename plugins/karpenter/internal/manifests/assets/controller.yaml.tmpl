@@ -1,0 +1,424 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Namespace }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: unbounded-karpenter
+  namespace: {{ .Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: unbounded-karpenter
+rules:
+  - apiGroups:
+      - karpenter.sh
+    resources:
+      - nodepools
+      - nodepools/status
+      - nodeclaims
+      - nodeclaims/status
+      - nodeoverlays
+      - nodeoverlays/status
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - autoscaling.x-k8s.io
+    resources:
+      - capacitybuffers
+      - capacitybuffers/status
+    verbs:
+      - get
+      - list
+      - watch
+      - update
+      - patch
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+      - nodes
+      - persistentvolumes
+      - persistentvolumeclaims
+      - replicationcontrollers
+      - namespaces
+      - podtemplates
+      - services
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - autoscaling.k8s.io
+    resources:
+      - verticalpodautoscalers
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - storage.k8s.io
+    resources:
+      - storageclasses
+      - csinodes
+      - volumeattachments
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - apps
+    resources:
+      - daemonsets
+      - deployments
+      - replicasets
+      - statefulsets
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - apiextensions.k8s.io
+    resources:
+      - customresourcedefinitions
+    verbs:
+      - list
+      - watch
+  - apiGroups:
+      - policy
+    resources:
+      - poddisruptionbudgets
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - karpenter.sh
+    resources:
+      - nodeclaims
+      - nodeclaims/status
+      - nodeclaims/finalizers
+    verbs:
+      - create
+      - delete
+      - update
+      - patch
+  - apiGroups:
+      - karpenter.sh
+    resources:
+      - nodepools
+      - nodepools/status
+      - nodepools/finalizers
+      - nodeoverlays/status
+    verbs:
+      - update
+      - patch
+  - apiGroups:
+      - ""
+    resources:
+      - events
+    verbs:
+      - create
+      - patch
+  - apiGroups:
+      - ""
+    resources:
+      - nodes
+    verbs:
+      - create
+      - update
+      - patch
+      - delete
+  - apiGroups:
+      - ""
+    resources:
+      - nodes/status
+    verbs:
+      - patch
+  - apiGroups:
+      - ""
+    resources:
+      - pods/eviction
+    verbs:
+      - create
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+    verbs:
+      - delete
+      - patch
+      - update
+  - apiGroups:
+      - unbounded-cloud.io
+    resources:
+      - machineclasses
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - unbounded-cloud.io
+    resources:
+      - machineallocations
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - patch
+      - delete
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: unbounded-karpenter
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: unbounded-karpenter
+subjects:
+  - kind: ServiceAccount
+    name: unbounded-karpenter
+    namespace: {{ .Namespace }}
+---
+# The plugin may write only the allocations it makes for NodeClaims: named
+# from the NodeClaim UID and consumed by that NodeClaim. This keeps it from
+# releasing an allocation that an operator or another consumer owns.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: unbounded-karpenter-machineallocations
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups:
+          - unbounded-cloud.io
+        apiVersions:
+          - "*"
+        operations:
+          - CREATE
+          - UPDATE
+          - DELETE
+        resources:
+          - machineallocations
+  matchConditions:
+    - name: karpenter-plugin
+      # Matches the plugin's ServiceAccount in any namespace, so a namespace
+      # changed after rendering cannot switch this policy off. The policy only
+      # restricts, so matching more identities than the plugin is safe.
+      expression: "request.userInfo.username.startsWith('system:serviceaccount:') && request.userInfo.username.endsWith(':unbounded-karpenter')"
+  variables:
+    - name: target
+      expression: "request.operation == 'DELETE' ? oldObject : object"
+  validations:
+    - expression: "variables.target.spec.consumerRef.apiGroup == 'karpenter.sh' && variables.target.spec.consumerRef.kind == 'NodeClaim' && variables.target.metadata.name == 'nodeclaim-' + variables.target.spec.consumerRef.uid"
+      message: "the Unbounded Karpenter plugin may write only MachineAllocations named nodeclaim-<uid> whose consumer is the karpenter.sh NodeClaim with that UID"
+      reason: Forbidden
+    # The plugin authorizes release by setting spec.lifecycle. It must never
+    # remove the allocation controller's finalizer, which is what keeps an
+    # allocation until its release is confirmed.
+    - expression: "request.operation != 'UPDATE' || (has(object.metadata.finalizers) ? object.metadata.finalizers : []) == (has(oldObject.metadata.finalizers) ? oldObject.metadata.finalizers : [])"
+      message: "the Unbounded Karpenter plugin may not change MachineAllocation finalizers"
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: unbounded-karpenter-machineallocations
+spec:
+  policyName: unbounded-karpenter-machineallocations
+  validationActions:
+    - Deny
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: unbounded-karpenter-dns
+  namespace: kube-system
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - services
+    resourceNames:
+      - kube-dns
+    verbs:
+      - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: unbounded-karpenter-dns
+  namespace: kube-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: unbounded-karpenter-dns
+subjects:
+  - kind: ServiceAccount
+    name: unbounded-karpenter
+    namespace: {{ .Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: unbounded-karpenter-leader
+  namespace: {{ .Namespace }}
+rules:
+  - apiGroups:
+      - coordination.k8s.io
+    resources:
+      - leases
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+  - apiGroups:
+      - coordination.k8s.io
+    resources:
+      - leases
+    resourceNames:
+      - unbounded-karpenter
+    verbs:
+      - update
+      - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: unbounded-karpenter-leader
+  namespace: {{ .Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: unbounded-karpenter-leader
+subjects:
+  - kind: ServiceAccount
+    name: unbounded-karpenter
+    namespace: {{ .Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: unbounded-karpenter-node-leases
+  namespace: kube-node-lease
+rules:
+  - apiGroups:
+      - coordination.k8s.io
+    resources:
+      - leases
+    verbs:
+      - get
+      - list
+      - watch
+      - delete
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: unbounded-karpenter-node-leases
+  namespace: kube-node-lease
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: unbounded-karpenter-node-leases
+subjects:
+  - kind: ServiceAccount
+    name: unbounded-karpenter
+    namespace: {{ .Namespace }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: unbounded-karpenter
+  namespace: {{ .Namespace }}
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: unbounded-karpenter
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: unbounded-karpenter
+    spec:
+      serviceAccountName: unbounded-karpenter
+      # Karpenter must not run on a Node it can remove.
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: karpenter.sh/nodepool
+                    operator: DoesNotExist
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: unbounded-karpenter
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: controller
+          image: {{ .Image }}
+          imagePullPolicy: IfNotPresent
+          args:
+            - --leader-election-name=unbounded-karpenter
+            - --leader-election-namespace={{ .Namespace }}
+            - --ignore-dra-requests=true
+            - --feature-gates=NodeRepair=false,ReservedCapacity=false,SpotToSpotConsolidation=false,NodeOverlay=false,StaticCapacity=false,CapacityBuffer=false
+          env:
+            - name: UNBOUNDED_PRICE_CURRENCY
+              value: {{ .PriceCurrency | printf "%q" }}
+            - name: MEMORY_LIMIT
+              valueFrom:
+                resourceFieldRef:
+                  resource: limits.memory
+            - name: CPU_REQUESTS
+              valueFrom:
+                resourceFieldRef:
+                  resource: requests.cpu
+                  divisor: 1m
+          ports:
+            - name: metrics
+              containerPort: 8080
+            - name: health
+              containerPort: 8081
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 5
