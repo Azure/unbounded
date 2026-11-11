@@ -858,7 +858,7 @@ impl Rig {
             )
             .await
         });
-        assert_eq!(result, Ok(()));
+        assert!(result.is_ok(), "{result:?}");
         reader.join().unwrap()
     }
 }

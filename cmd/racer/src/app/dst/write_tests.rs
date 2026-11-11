@@ -632,6 +632,61 @@ fn writes_disabled_or_passthrough_are_405() {
     }
 }
 
+/// Node-wide failed client requests, summed over every node.
+fn request_errors(c: &Cluster) -> u64 {
+    c.harness
+        .nodes
+        .iter()
+        .map(|node| {
+            node.workers[0]
+                .app
+                .telemetry
+                .metrics
+                .count(crate::telemetry::Event::RequestError)
+        })
+        .sum()
+}
+
+/// `201` and `204` writes are successful client requests; only failed writes
+/// count in `racer_requests_errors_total`.
+#[test]
+fn successful_writes_are_not_request_errors() {
+    let mut c = Cluster::new(40, 3, Some(writes(2)));
+    let body = bytes(11, 70_000);
+    let before = request_errors(&c);
+    assert_eq!(c.put(0, OBJECT, &body, "").status, 201);
+    assert_eq!(
+        c.put(1, OBJECT + 1, &body, "Racer-Upload: manual\r\n")
+            .status,
+        201
+    );
+    assert_eq!(c.persist(2, OBJECT + 1).status, 204);
+    assert_eq!(c.delete(1, OBJECT).status, 204);
+    assert_eq!(request_errors(&c), before);
+    // A refused write still counts once.
+    assert_eq!(c.put(0, OBJECT + 1, &body, "").status, 412);
+    assert_eq!(request_errors(&c), before + 1);
+}
+
+/// With writes on, a `405` lists exactly the methods its path accepts.
+#[test]
+fn write_enabled_405s_list_the_path_methods() {
+    let mut c = Cluster::new(41, 3, Some(writes(2)));
+    let object = key(OBJECT);
+    for (method, path, allow) in [
+        ("PATCH", object.clone(), "HEAD, POST, PUT, DELETE"),
+        ("GET", object.clone(), "HEAD, POST, PUT, DELETE"),
+        ("GET", format!("{object}/host-read"), "POST"),
+        ("GET", format!("{object}/gpu-read"), "POST"),
+        ("GET", format!("{object}/host-write"), "POST"),
+        ("PUT", format!("{object}/persist"), "POST"),
+    ] {
+        let response = c.simple(0, method, &path);
+        assert_eq!(response.status, 405, "{method} {path}");
+        assert_eq!(response.header("allow"), Some(allow), "{method} {path}");
+    }
+}
+
 #[test]
 fn a_full_dirty_cap_is_503() {
     let mut definition = writes(3);

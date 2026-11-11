@@ -367,17 +367,18 @@ fn golden_heads() {
     assert_eq!(
         encode(&write_error_head(
             503,
+            client::WRITE_ALLOW,
             Some(error_token::DIRTY_CAP),
             Some(1)
         )),
         "HTTP/1.1 503 \r\nContent-Length: 0\r\nRacer-Write-Error: dirty-cap\r\nRetry-After: 1\r\n\r\n"
     );
     assert_eq!(
-        encode(&write_error_head(405, None, None)),
+        encode(&write_error_head(405, client::WRITE_ALLOW, None, None)),
         "HTTP/1.1 405 \r\nContent-Length: 0\r\nAllow: HEAD, POST, PUT, DELETE\r\n\r\n"
     );
     assert_eq!(
-        encode(&write_error_head(428, None, None)),
+        encode(&write_error_head(428, client::WRITE_ALLOW, None, None)),
         "HTTP/1.1 428 \r\nContent-Length: 0\r\n\r\n"
     );
     assert_eq!(
@@ -389,13 +390,40 @@ fn golden_heads() {
         "HTTP/1.1 204 \r\n\r\n"
     );
     assert_eq!(
-        encode(&client::error_head_with_allow(405, None, true).unwrap()),
-        encode(&write_error_head(405, None, None))
+        encode(&client::error_head_with_allow(405, None, client::WRITE_ALLOW).unwrap()),
+        encode(&write_error_head(405, client::WRITE_ALLOW, None, None))
     );
     assert_eq!(
         encode(&client::error_head(405, None).unwrap()),
         "HTTP/1.1 405 \r\nContent-Length: 0\r\nAllow: HEAD, POST\r\n\r\n"
     );
+    assert_eq!(
+        encode(&write_error_head(405, "POST", None, None)),
+        "HTTP/1.1 405 \r\nContent-Length: 0\r\nAllow: POST\r\n\r\n"
+    );
+}
+
+#[test]
+fn allowed_methods_match_each_path() {
+    let key = "ab".repeat(32);
+    let object = format!("/v1/objects/{key}");
+    for writes in [false, true] {
+        for (suffix, with_writes) in [
+            ("", "HEAD, POST, PUT, DELETE"),
+            ("/host-read", "POST"),
+            ("/gpu-read", "POST"),
+            ("/host-write", "POST"),
+            ("/persist", "POST"),
+        ] {
+            let target = format!("{object}{suffix}");
+            let want = if writes { with_writes } else { "HEAD, POST" };
+            assert_eq!(
+                client::allowed_methods(&target, writes),
+                want,
+                "{target} writes={writes}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -437,4 +465,35 @@ fn error_statuses() {
     assert_eq!(WriteError::PayloadTooLarge.status(), Some(413));
     assert_eq!(WriteError::PreconditionRequired.status(), Some(428));
     assert_eq!(INVALID.status(), None);
+}
+
+#[test]
+fn write_subresources_match_any_method() {
+    let key = "ab".repeat(32);
+    let head = |method: &str, target: String| MessageHead {
+        start: StartLine::Request {
+            method: method.into(),
+            target,
+        },
+        headers: Vec::new(),
+    };
+    for suffix in ["host-write", "persist"] {
+        for method in ["GET", "POST", "PUT", "HEAD"] {
+            assert!(is_write_subresource(&head(
+                method,
+                format!("/v1/objects/{key}/{suffix}")
+            )));
+        }
+        assert!(!is_write_subresource(&head(
+            "GET",
+            format!("/v1/objects/abc/{suffix}")
+        )));
+    }
+    for target in [
+        format!("/v1/objects/{key}"),
+        format!("/v1/objects/{key}/host-read"),
+        format!("/v1/objects/{key}/other"),
+    ] {
+        assert!(!is_write_subresource(&head("GET", target)));
+    }
 }

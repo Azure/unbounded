@@ -19,6 +19,11 @@ pub enum Outcome {
 }
 
 impl Outcome {
+    /// Whether the write did what the client asked: `201` or `204`.
+    pub fn succeeded(self) -> bool {
+        matches!(self, Self::Created | Self::Deleted | Self::Persisted)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Created => "created",

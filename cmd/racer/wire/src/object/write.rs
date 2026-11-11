@@ -365,6 +365,25 @@ pub fn is_write(head: &MessageHead) -> bool {
     route(head).is_some()
 }
 
+/// Whether this head targets a write-only subresource,
+/// `/v1/objects/<64 hex>/host-write` or `/persist`, with any method. On a
+/// cache with writes, a method other than `POST` there is `405`, not the
+/// read parser's `400` for an unknown path.
+pub fn is_write_subresource(head: &MessageHead) -> bool {
+    let StartLine::Request { target, .. } = &head.start else {
+        return false;
+    };
+    let Some((key, suffix)) = target
+        .strip_prefix("/v1/objects/")
+        .and_then(|path| path.split_once('/'))
+    else {
+        return false;
+    };
+    matches!(suffix, "host-write" | "persist")
+        && key.len() == 64
+        && key.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// Validate a write head. `page_size` is the cluster page size and bounds the
 /// object length at [`max_object_bytes`]. Upload-mode defaults are not known
 /// here: callers resolve them, then enforce that `Racer-Metadata` is present
@@ -598,13 +617,18 @@ pub fn write_no_content_head(state: Option<UploadState>) -> MessageHead {
     }
 }
 
-/// Zero-body write error. `405` carries `Allow: HEAD, POST, PUT, DELETE`
-/// (writes enabled; disabled caches use [`super::client::error_head`]).
+/// Zero-body write error. A `405` carries `Allow: <allow>`, normally
+/// [`super::client::allowed_methods`] for the request target with writes on.
 /// `error` is a `Racer-Write-Error` token from [`error_token`].
-pub fn write_error_head(status: u16, error: Option<&str>, retry_after: Option<u32>) -> MessageHead {
+pub fn write_error_head(
+    status: u16,
+    allow: &str,
+    error: Option<&str>,
+    retry_after: Option<u32>,
+) -> MessageHead {
     let mut headers = vec![Header::new("Content-Length", "0")];
     if status == 405 {
-        headers.push(Header::new("Allow", "HEAD, POST, PUT, DELETE"));
+        headers.push(Header::new("Allow", allow));
     }
     if let Some(error) = error {
         headers.push(Header::new("Racer-Write-Error", error));

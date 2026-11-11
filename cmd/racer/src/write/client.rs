@@ -110,8 +110,14 @@ impl Reject {
         }
     }
 
-    fn head(self) -> MessageHead {
-        racer_wire::object::write::write_error_head(self.status, self.token, self.retry_after)
+    /// The error head. `allow` is the `Allow` value a `405` advertises.
+    fn head(self, allow: &str) -> MessageHead {
+        racer_wire::object::write::write_error_head(
+            self.status,
+            allow,
+            self.token,
+            self.retry_after,
+        )
     }
 }
 
@@ -132,12 +138,17 @@ fn reject_for(error: Error) -> Reject {
 /// Whether `head` is a write the cache must serve: a write route on a cache
 /// with writes enabled. Writes on other caches keep the read parser's `405`.
 pub fn routes(local: &Coordinator, cache: &CacheId, head: &MessageHead) -> bool {
-    racer_wire::object::write::is_write(head)
-        && local.availability.writes(cache).is_some()
-        && !local.availability.passthrough(cache)
+    racer_wire::object::write::is_write(head) && writes_enabled(local, cache)
 }
 
-/// Serve one write request and close the connection.
+/// Whether `cache` serves writes: writes configured and not passthrough.
+pub fn writes_enabled(local: &Coordinator, cache: &CacheId) -> bool {
+    local.availability.writes(cache).is_some() && !local.availability.passthrough(cache)
+}
+
+/// Serve one write request and close the connection. Returns the outcome
+/// counted in `racer_write_requests_total`, so the caller can settle the
+/// node-wide request metrics the same way.
 #[allow(clippy::too_many_arguments)]
 pub async fn serve(
     connection: ConnectionLease,
@@ -149,13 +160,22 @@ pub async fn serve(
     io: &HttpIo,
     timeout: Duration,
     cancellation: Cancellation,
-) -> Result<()> {
+) -> Result<Outcome> {
     let scope = crate::client::listener::new_scope(
         io.reactor().ctx(),
         timeout.max(WRITE_TIMEOUT),
         cancellation,
     )?;
     let metrics = local.fill.metrics.writes().clone();
+    // Only a write route reaches here, so the cache had writes on when it was
+    // routed; a later `405` (writes turned off mid-request) still names what
+    // this path accepts.
+    let allow = match &head.start {
+        http1::StartLine::Request { target, .. } => {
+            racer_wire::object::client::allowed_methods(target, true)
+        }
+        _ => racer_wire::object::client::WRITE_ALLOW,
+    };
     let (connection, result) = handle(
         connection,
         &head,
@@ -169,22 +189,22 @@ pub async fn serve(
     .await;
     let Some(mut connection) = connection else {
         metrics.request(&cache.0, Outcome::Failed);
-        return Ok(());
+        return Ok(Outcome::Failed);
     };
     let (head, outcome) = match result {
         Ok((head, outcome)) => (head, outcome),
-        Err(reject) => (reject.head(), reject.outcome()),
+        Err(reject) => (reject.head(allow), reject.outcome()),
     };
     metrics.request(&cache.0, outcome);
     if scope.check().is_err() {
         // The client went away or the request expired; nothing to answer.
-        return Ok(());
+        return Ok(outcome);
     }
     let mut head = head;
     head.headers.push(http1::Header::new("Connection", "close"));
     connection.poison();
     let _ = io.send_head(connection, head, &scope).await?;
-    Ok(())
+    Ok(outcome)
 }
 
 /// The response head and outcome, and the connection when it can still

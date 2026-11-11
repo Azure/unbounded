@@ -995,7 +995,7 @@ async fn serve_connection(
                 } else {
                     received.descriptors
                 };
-                return crate::write::client::serve(
+                let outcome = crate::write::client::serve(
                     connection,
                     head,
                     descriptors,
@@ -1006,7 +1006,17 @@ async fn serve_connection(
                     timeout,
                     cancellation.clone(),
                 )
-                .await;
+                .await?;
+                // A `201` or `204` is a successful client request, not an
+                // error; failures keep a reason like a read's.
+                match outcome {
+                    outcome if outcome.succeeded() => observation.success(),
+                    crate::write::metrics::Outcome::Unavailable => {
+                        observation.fail(Error::Unavailable)
+                    }
+                    _ => {}
+                }
+                return Ok(());
             }
             // A cache without writes answers every write route like a node
             // that predates writes: 405 with `Allow: HEAD, POST`.
@@ -1018,11 +1028,33 @@ async fn serve_connection(
                     .await?;
                 return Ok(());
             }
+            // Any other method on a write-only subresource of a cache with
+            // writes: 405 naming the one method it accepts.
+            Ok(request)
+                if racer_wire::object::write::is_write_subresource(&request.head)
+                    && crate::write::client::writes_enabled(reads, cache) =>
+            {
+                drop(request.descriptors);
+                observation.fail(Error::MethodNotAllowed);
+                responses
+                    .send_error_with_allow(connection, Error::MethodNotAllowed, "POST", scope)
+                    .await?;
+                return Ok(());
+            }
             other => other,
         };
         // Every descriptor must be claimed by a direct read; the rest close here.
         let mut gpu_read = false;
+        // A `405` lists what this path accepts, which depends on whether the
+        // cache serves writes; see `allowed_methods`.
+        let mut allow = racer_wire::object::client::READ_ALLOW;
         let parsed = value.and_then(|received| {
+            if let http1::StartLine::Request { target, .. } = &received.head.start {
+                allow = racer_wire::object::client::allowed_methods(
+                    target,
+                    crate::write::client::writes_enabled(reads, cache),
+                );
+            }
             let request = parser.parse(cache, received.head)?;
             gpu_read = matches!(request.kind, crate::client::ReadKind::GpuRead { .. });
             Ok((request, received.descriptors))
@@ -1054,7 +1086,9 @@ async fn serve_connection(
             Ok(parsed) => parsed,
             Err(error) => {
                 observation.fail(error);
-                responses.send_error(connection, error, scope).await?;
+                responses
+                    .send_error_with_allow(connection, error, allow, scope)
+                    .await?;
                 return Ok(());
             }
         };
