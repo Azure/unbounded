@@ -286,12 +286,17 @@ async fn execute(
                     }),
                 };
                 let context = super::bare_context(object);
-                let stored =
+                let mut stored =
                     match send(local, membership, &target, operation, &context, scope).await {
                         Ok(WriteReply::Stored { pages }) => pages,
                         _ => Vec::new(),
                     };
-                for page in stored {
+                stored.sort_unstable();
+                stored.dedup();
+                // Credit only pages this chunk asked the target for: a reply
+                // naming others (a confused or hostile peer) must not count
+                // as a copy it never made.
+                for page in stored.into_iter().filter(|page| chunk.contains(page)) {
                     if let Some(plan) = plans.iter_mut().find(|p| p.page == page)
                         && plan.want > 0
                     {
