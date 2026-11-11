@@ -105,6 +105,9 @@ var (
 	// operation, such as persisting an object that is not manual or
 	// deleting one that is already uploaded.
 	ErrConflict = errors.New("racersdk: conflict")
+	// ErrInternal reports an internal Racer fault (HTTP 500). Retrying the
+	// same request is not expected to help.
+	ErrInternal = errors.New("racersdk: internal error")
 )
 
 // WriteError is a write rejected by Racer.
@@ -145,6 +148,8 @@ func (e *WriteError) Is(target error) bool {
 		return target == ErrConflict
 	case 412:
 		return target == ErrExists
+	case 500:
+		return target == ErrInternal
 	case 502:
 		return target == ErrUploadFailed
 	case 503:

@@ -131,6 +131,10 @@ class WriteInvalid(WriteError, InvalidArgument):
     """400, 411, 413, 428, 431: Racer rejected the request headers or body."""
 
 
+class WriteInternal(WriteError):
+    """500: an internal Racer fault. Retrying the same request is not expected to help."""
+
+
 class WriteUnavailable(WriteError, Unavailable):
     """504: the request deadline elapsed before durability."""
 
@@ -145,6 +149,7 @@ _WRITE_BY_STATUS = {
     413: WriteInvalid,
     428: WriteInvalid,
     431: WriteInvalid,
+    500: WriteInternal,
     502: UploadFailed,
     503: Busy,
     504: WriteUnavailable,

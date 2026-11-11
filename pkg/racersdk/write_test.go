@@ -68,3 +68,39 @@ func (zeros) Read(p []byte) (int, error) {
 	clear(p)
 	return len(p), nil
 }
+
+func TestWriteErrorSentinels(t *testing.T) {
+	cases := map[int]error{
+		409: ErrConflict,
+		412: ErrExists,
+		500: ErrInternal,
+		502: ErrUploadFailed,
+		503: ErrBusy,
+		504: ErrUnavailable,
+	}
+	for status, want := range cases {
+		err := error(&WriteError{Op: "put", Status: status})
+		if !errors.Is(err, want) {
+			t.Errorf("%d: not %v", status, want)
+		}
+
+		if status != 500 && errors.Is(err, ErrInternal) {
+			t.Errorf("%d: matches ErrInternal", status)
+		}
+	}
+
+	if errors.Is(&WriteError{Status: 500}, ErrUnavailable) {
+		t.Error("500 matches ErrUnavailable")
+	}
+}
+
+func TestPutInternalError(t *testing.T) {
+	c := rawServer(t, func(conn net.Conn, _ *bufio.Reader, _ []byte) {
+		_, _ = io.WriteString(conn, "HTTP/1.1 500 X\r\nContent-Length: 0\r\n\r\n")
+	})
+
+	_, err := c.Put(context.Background(), Request{Key: Key{1}}, strings.NewReader("abc"), 3, WriteOptions{Upload: UploadNever})
+	if !errors.Is(err, ErrInternal) || errors.Is(err, ErrBusy) {
+		t.Fatalf("%v", err)
+	}
+}

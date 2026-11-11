@@ -129,7 +129,7 @@ def test_writes_disabled(server, client):
         (413, "", errors.WriteInvalid, errors.InvalidArgument),
         (411, "", errors.WriteInvalid, errors.InvalidArgument),
         (504, "", errors.WriteUnavailable, errors.Unavailable),
-        (500, "", racer.WriteError, racer.StatusError),
+        (500, "", errors.WriteInternal, racer.WriteError),
     ],
 )
 def test_rejections(server, client, status, code, cls, also):

@@ -1274,6 +1274,7 @@ Response bodies are empty.
 | `413` | Object over the size limit. |
 | `428` | `If-None-Match: *` missing. |
 | `431` | Request headers too large. |
+| `500` | An internal fault, such as the random source failing. Retrying the same request is not expected to help. |
 | `502` | Upload failed under `Racer-Durability: origin`. Token `upload`. |
 | `503` | Racer cannot take the write now, for example because the dirty limit is reached or too few nodes are reachable. Has `Retry-After: 1`. |
 | `504` | The request deadline passed before the write was durable. |
@@ -2075,7 +2076,8 @@ The zero `WriteOptions` uses the cache defaults. `OriginDurable` waits for the
 upload to commit. `RetryBusy` retries `503` answers for up to that long; `Put`
 retries only when the body is an `io.ReadSeeker`. `Request.Metadata` must not
 name a version. Errors match `ErrExists` (`412`), `ErrWritesDisabled` (`405`),
-`ErrBusy` (`503`), `ErrUploadFailed` (`502`), and `ErrConflict` (`409`). Use
+`ErrBusy` (`503`), `ErrUploadFailed` (`502`), `ErrConflict` (`409`), and
+`ErrInternal` (`500`). Use
 `errors.As` with `*WriteError` to read the status, `Racer-Write-Error` token,
 and `Retry-After`.
 
