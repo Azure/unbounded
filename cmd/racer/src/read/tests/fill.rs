@@ -3216,6 +3216,8 @@ pub(super) enum LocalReplica {
     Short,
     /// Never answer: wait until the probe's scope ends.
     Stall,
+    /// Serve the page with a conflicting content type.
+    Conflict,
 }
 impl Origin for TestOrigin {
     fn local_page_reserved<'a>(
@@ -3248,7 +3250,7 @@ impl Origin for TestOrigin {
                     .await?;
                     unreachable!("a stalled probe only ends with its scope");
                 }
-                LocalReplica::Hit => length,
+                LocalReplica::Hit | LocalReplica::Conflict => length,
                 LocalReplica::Short => length - 1,
             };
             let mut plaintext = self.buffers.plaintext(reservation, length)?;
@@ -3257,9 +3259,14 @@ impl Origin for TestOrigin {
             } else {
                 plaintext.bytes_mut()?.fill(page.number.0 as u8);
             }
+            let mut metadata = self.metadata.clone();
+            if self.local.get() == LocalReplica::Conflict {
+                metadata.content_type =
+                    Some(crate::model::ContentType::parse(b"application/conflict").unwrap());
+            }
             Ok(Some(OriginPage {
                 page_size: racer_wire::object::PageSize::DEFAULT,
-                metadata: self.metadata.clone(),
+                metadata,
                 plaintext,
             }))
         })

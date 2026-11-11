@@ -198,6 +198,31 @@ fn adapter_local_stall_falls_through_within_the_read_deadline() {
     assert_eq!(f.fill.metrics.count(Event::AdapterLocalHit), 0);
 }
 
+/// A local copy whose immutable metadata conflicts with the retained version
+/// fails to publish; the fill falls through to the remote origin instead of
+/// failing the read.
+#[test]
+fn adapter_local_publication_failure_falls_through_to_the_origin() {
+    let env = racer_io::Env::host();
+    let mut f = fixture_with(&env, 2 * crate::model::PAGE_BYTES, None);
+    f.set_mode(&env, CacheMode::Adapter);
+    let first = f.page.clone();
+    f.page = PageId {
+        version: first.version.clone(),
+        number: crate::model::PageNumber(1),
+    };
+    acquire_plain(&mut f).unwrap();
+    assert_eq!(f.origin.calls.get(), 1);
+    f.page = first;
+    f.origin.local.set(LocalReplica::Conflict);
+    let result = acquire_plain(&mut f).unwrap();
+    assert_eq!(result.metadata.content_type, f.origin.metadata.content_type);
+    assert_eq!(f.origin.local_calls.get(), 2);
+    assert_eq!(f.origin.calls.get(), 2);
+    assert_eq!(f.fill.metrics.count(Event::AdapterLocalFailure), 1);
+    assert_eq!(f.fill.metrics.count(Event::AdapterLocalHit), 0);
+}
+
 /// Passthrough caches never ask for a local copy.
 #[test]
 fn passthrough_never_asks_for_a_local_copy() {

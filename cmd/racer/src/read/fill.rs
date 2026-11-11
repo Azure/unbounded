@@ -2988,15 +2988,18 @@ impl Fill {
                 .encrypt_origin_page(page, origin, ciphertext, scope)
                 .await?;
             result.validate_for(page)?;
+            // Publication is part of the attempt: a local copy whose
+            // immutable metadata conflicts with the retained version is a
+            // local failure, not a failed read.
+            self.call(
+                DriverStage::PublishCall,
+                self.publish(result.clone(), None, scope),
+            )
+            .await?;
             Ok(Some(result))
         };
         match attempt.await {
             Ok(Some(result)) => {
-                self.call(
-                    DriverStage::PublishCall,
-                    self.publish(result.clone(), None, scope),
-                )
-                .await?;
                 self.metrics.record(Event::AdapterLocalHit, 1);
                 Ok(Some(result.into()))
             }
