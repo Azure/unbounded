@@ -13,7 +13,10 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const noFollow = unix.O_NOFOLLOW
+const (
+	noFollow = unix.O_NOFOLLOW
+	nonBlock = unix.O_NONBLOCK
+)
 
 // openBeneath uses openat2 with RESOLVE_BENEATH and RESOLVE_NO_SYMLINKS so no
 // path component may be a symlink or escape root. Kernels without openat2 fall

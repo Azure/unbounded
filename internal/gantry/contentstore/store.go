@@ -94,7 +94,9 @@ func parseDigest(d string) (string, error) {
 }
 
 // openRoot opens rel beneath root with os.Root, which refuses to escape the
-// root, and O_NOFOLLOW so a symlinked final component is refused.
+// root, and O_NOFOLLOW so a symlinked final component is refused. O_NONBLOCK
+// keeps a FIFO with no writer from blocking the open before Open rejects it
+// as non-regular; it has no effect on regular files.
 func openRoot(root, rel string) (*os.File, error) {
 	r, err := os.OpenRoot(root)
 	if err != nil {
@@ -102,5 +104,5 @@ func openRoot(root, rel string) (*os.File, error) {
 	}
 	defer r.Close() //nolint:errcheck // read-only directory handle
 
-	return r.OpenFile(rel, os.O_RDONLY|noFollow, 0)
+	return r.OpenFile(rel, os.O_RDONLY|noFollow|nonBlock, 0)
 }

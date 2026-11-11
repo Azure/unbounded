@@ -11,7 +11,10 @@ import (
 	"syscall"
 )
 
-const noFollow = syscall.O_NOFOLLOW
+const (
+	noFollow = syscall.O_NOFOLLOW
+	nonBlock = syscall.O_NONBLOCK
+)
 
 func openBeneath(root, rel string) (*os.File, error) { return openRoot(root, rel) }
 
