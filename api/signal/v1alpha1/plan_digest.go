@@ -355,6 +355,18 @@ func canonicalizeResolvedPlan(plan ResolvedCertificationPlan) *ResolvedCertifica
 			sort.Slice(stage.Test.Metrics, func(left, right int) bool {
 				return stage.Test.Metrics[left].Name < stage.Test.Metrics[right].Name
 			})
+
+			for metricIndex := range stage.Test.Metrics {
+				telemetry := stage.Test.Metrics[metricIndex].Telemetry
+				if telemetry == nil {
+					continue
+				}
+
+				sort.Slice(telemetry.Dimensions, func(left, right int) bool {
+					return telemetry.Dimensions[left] < telemetry.Dimensions[right]
+				})
+			}
+
 			sort.Slice(stage.Test.Topology.Roles, func(left, right int) bool {
 				return stage.Test.Topology.Roles[left].Name < stage.Test.Topology.Roles[right].Name
 			})

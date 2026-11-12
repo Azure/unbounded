@@ -600,7 +600,19 @@ func TestDeriveResolvedExecutionPlanDigestCanonicalizesMapAndSetLists(t *testing
 				SecurityRequirementsDigest: testWorkflowTemplateHash,
 				Metrics: []TestMetricDefinition{
 					{Name: "latency", DisplayName: "Latency", Type: MetricValueTypeLatency},
-					{Name: "throughput", DisplayName: "Throughput", Type: MetricValueTypeThroughput},
+					{
+						Name:        "throughput",
+						DisplayName: "Throughput",
+						Type:        MetricValueTypeThroughput,
+						Unit:        "TFLOP/s",
+						Telemetry: &TestMetricTelemetry{
+							Live:        MetricLiveModeGaugeAndSamples,
+							Dimensions:  []MetricDimensionName{"gpu", "dtype"},
+							SeriesLimit: 8,
+							SampleLimit: 2,
+							Evidence:    MetricEvidenceMinimum,
+						},
+					},
 				},
 				Topology: TestTopology{
 					MinParticipants: 2,
@@ -664,6 +676,7 @@ func TestDeriveResolvedExecutionPlanDigestCanonicalizesMapAndSetLists(t *testing
 		t.Fatalf("derive canonical digest: %v", err)
 	}
 
+	reverseSlice(plan.Phases[0].Stages[0].Test.Metrics[1].Telemetry.Dimensions)
 	reverseSlice(plan.Phases[0].Stages[0].Test.Metrics)
 	reverseSlice(plan.Phases[0].Stages[0].Test.Topology.Roles)
 	reverseSlice(plan.Phases[0].Stages[0].Test.Security.Capabilities)

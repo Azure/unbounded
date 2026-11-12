@@ -11,6 +11,9 @@ import (
 const (
 	MaxTestParameters     = 16
 	MaxTestMetrics        = 16
+	MaxMetricDimensions   = 4
+	MaxMetricSeries       = 16
+	MaxMetricSamples      = 64
 	MaxTestRoles          = 8
 	MaxTestArtifactBytes  = 95 * 1024
 	MaxTestArtifactsBytes = 320 * 1024
@@ -87,6 +90,50 @@ const (
 	MetricValueTypeLatency    MetricValueType = "Latency"
 )
 
+// +kubebuilder:validation:Enum=Gauge;GaugeAndSamples
+type MetricLiveMode string
+
+const (
+	MetricLiveModeGauge           MetricLiveMode = "Gauge"
+	MetricLiveModeGaugeAndSamples MetricLiveMode = "GaugeAndSamples"
+)
+
+// +kubebuilder:validation:Enum=Latest;Minimum;Maximum
+type MetricEvidenceAggregation string
+
+const (
+	MetricEvidenceLatest  MetricEvidenceAggregation = "Latest"
+	MetricEvidenceMinimum MetricEvidenceAggregation = "Minimum"
+	MetricEvidenceMaximum MetricEvidenceAggregation = "Maximum"
+)
+
+// +kubebuilder:validation:MinLength=1
+// +kubebuilder:validation:MaxLength=32
+// +kubebuilder:validation:Pattern=`^[a-z][a-z0-9_]*$`
+type MetricDimensionName string
+
+type TestMetricTelemetry struct {
+	Live MetricLiveMode `json:"live"`
+	// Dimensions are workload-provided label keys. Run, stage, invocation, role,
+	// and node identity are injected by the trusted runtime and cannot be declared.
+	// +kubebuilder:validation:MaxItems=4
+	// +listType=set
+	Dimensions []MetricDimensionName `json:"dimensions,omitempty"`
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=16
+	SeriesLimit int32 `json:"seriesLimit"`
+	// SampleLimit bounds accepted records per dimension set. Gauge mode exports
+	// only the latest value; GaugeAndSamples also exports the bounded history.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=64
+	SampleLimit int32 `json:"sampleLimit"`
+	// Evidence maps the validated records back to this metric's typed final
+	// measurement. Omit it for operational-only telemetry.
+	Evidence MetricEvidenceAggregation `json:"evidence,omitempty"`
+}
+
+// +kubebuilder:validation:XValidation:rule="!has(self.telemetry) || self.type in ['Gauge', 'Ratio', 'Throughput', 'IOPS', 'Bandwidth', 'Latency']",message="live telemetry requires a decimal numeric metric type"
+// +kubebuilder:validation:XValidation:rule="!has(self.telemetry) || size(self.unit) > 0",message="live telemetry requires a unit"
 type TestMetricDefinition struct {
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=63
@@ -97,8 +144,9 @@ type TestMetricDefinition struct {
 	DisplayName string          `json:"displayName"`
 	Type        MetricValueType `json:"type"`
 	// +kubebuilder:validation:MaxLength=32
-	Unit     string `json:"unit,omitempty"`
-	Required bool   `json:"required,omitempty"`
+	Unit      string               `json:"unit,omitempty"`
+	Required  bool                 `json:"required,omitempty"`
+	Telemetry *TestMetricTelemetry `json:"telemetry,omitempty"`
 }
 
 type TestParticipantRole struct {

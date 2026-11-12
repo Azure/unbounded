@@ -331,6 +331,52 @@ spec:
                       type: string
                     required:
                       type: boolean
+                    telemetry:
+                      properties:
+                        dimensions:
+                          description: |-
+                            Dimensions are workload-provided label keys. Run, stage, invocation, role,
+                            and node identity are injected by the trusted runtime and cannot be declared.
+                          items:
+                            maxLength: 32
+                            minLength: 1
+                            pattern: ^[a-z][a-z0-9_]*$
+                            type: string
+                          maxItems: 4
+                          type: array
+                          x-kubernetes-list-type: set
+                        evidence:
+                          description: |-
+                            Evidence maps the validated records back to this metric's typed final
+                            measurement. Omit it for operational-only telemetry.
+                          enum:
+                          - Latest
+                          - Minimum
+                          - Maximum
+                          type: string
+                        live:
+                          enum:
+                          - Gauge
+                          - GaugeAndSamples
+                          type: string
+                        sampleLimit:
+                          description: |-
+                            SampleLimit bounds accepted records per dimension set. Gauge mode exports
+                            only the latest value; GaugeAndSamples also exports the bounded history.
+                          format: int32
+                          maximum: 64
+                          minimum: 1
+                          type: integer
+                        seriesLimit:
+                          format: int32
+                          maximum: 16
+                          minimum: 1
+                          type: integer
+                      required:
+                      - live
+                      - sampleLimit
+                      - seriesLimit
+                      type: object
                     type:
                       enum:
                       - Boolean
@@ -352,6 +398,12 @@ spec:
                   - name
                   - type
                   type: object
+                  x-kubernetes-validations:
+                  - message: live telemetry requires a decimal numeric metric type
+                    rule: '!has(self.telemetry) || self.type in [''Gauge'', ''Ratio'',
+                      ''Throughput'', ''IOPS'', ''Bandwidth'', ''Latency'']'
+                  - message: live telemetry requires a unit
+                    rule: '!has(self.telemetry) || size(self.unit) > 0'
                 maxItems: 16
                 minItems: 1
                 type: array

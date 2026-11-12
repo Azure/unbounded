@@ -253,6 +253,28 @@ func TestCertificationTestContract(t *testing.T) {
 		t.Fatalf("metric maxItems = %v, want %d", metrics.MaxItems, MaxTestMetrics)
 	}
 
+	metric := metrics.Items.Schema
+	telemetry := metric.Properties["telemetry"]
+
+	dimensions := telemetry.Properties["dimensions"]
+	if dimensions.MaxItems == nil || *dimensions.MaxItems != MaxMetricDimensions {
+		t.Fatalf("metric dimension maxItems = %v, want %d", dimensions.MaxItems, MaxMetricDimensions)
+	}
+
+	if maximum := telemetry.Properties["seriesLimit"].Maximum; maximum == nil ||
+		*maximum != MaxMetricSeries {
+		t.Fatalf("metric series maximum = %v, want %d", maximum, MaxMetricSeries)
+	}
+
+	if maximum := telemetry.Properties["sampleLimit"].Maximum; maximum == nil ||
+		*maximum != MaxMetricSamples {
+		t.Fatalf("metric sample maximum = %v, want %d", maximum, MaxMetricSamples)
+	}
+
+	if rule := "!has(self.telemetry) || self.type in ['Gauge', 'Ratio', 'Throughput', 'IOPS', 'Bandwidth', 'Latency']"; !hasValidationRule(metric, rule) {
+		t.Fatalf("generated metric definition has no %q validation", rule)
+	}
+
 	roles := spec.Properties["topology"].Properties["roles"]
 	if roles.MaxItems == nil || *roles.MaxItems != MaxTestRoles {
 		t.Fatalf("role maxItems = %v, want %d", roles.MaxItems, MaxTestRoles)
