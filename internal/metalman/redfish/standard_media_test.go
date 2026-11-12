@@ -39,6 +39,10 @@ type fakeILO struct {
 	ejects                               []string
 	missingHeader                        []string
 	ignoreInsert, ignoreBoot             bool
+	noInsert                             bool
+	firstMedia                           map[string]any
+	firstActionInfo                      string
+	actionInfoReads                      int
 }
 
 func newFakeILO(t *testing.T) (*fakeILO, *Client) {
@@ -117,15 +121,30 @@ func newFakeILO(t *testing.T) (*fakeILO, *Client) {
 		case strings.HasSuffix(path, "/VirtualMedia"):
 			write(map[string]any{"Members": []redfishLink{{ODataID: path + "/1/"}, {ODataID: path + "/2/"}}})
 		case strings.HasSuffix(path, "/VirtualMedia/1"):
+			if f.firstMedia != nil {
+				write(f.firstMedia)
+				return
+			}
+
 			write(map[string]any{"MediaTypes": []string{"Floppy", "USBStick"}})
 		case strings.HasSuffix(path, "/VirtualMedia/2"):
-			insert := redfishAction{Target: path + "/Actions/VirtualMedia.InsertMedia/"}
+			insert := &redfishAction{Target: path + "/Actions/VirtualMedia.InsertMedia/"}
 			if f.actionInfo != "" {
 				insert.ActionInfo = path + "/InsertMediaActionInfo/"
 			}
 
+			if f.noInsert {
+				insert = nil
+			}
+
 			write(map[string]any{"MediaTypes": []string{"CD", "DVD"}, "Image": f.image, "Inserted": f.inserted, "Actions": map[string]any{"#VirtualMedia.InsertMedia": insert, "#VirtualMedia.EjectMedia": redfishAction{Target: path + "/Actions/VirtualMedia.EjectMedia/"}}})
 		case strings.HasSuffix(path, "/InsertMediaActionInfo"):
+			f.actionInfoReads++
+			if strings.HasSuffix(path, "/VirtualMedia/1/InsertMediaActionInfo") {
+				_, _ = w.Write([]byte(f.firstActionInfo))
+				return
+			}
+
 			_, _ = w.Write([]byte(f.actionInfo))
 		case strings.HasSuffix(path, "/Actions/VirtualMedia.InsertMedia"):
 			var body map[string]any
@@ -263,12 +282,118 @@ func TestStandardVirtualMediaActionInfoAndBoot(t *testing.T) {
 	f.requireMatch = true
 	f.boot["BootSourceOverrideMode"] = "Legacy"
 
+	require.NoError(t, c.StageVirtualMedia(t.Context(), standardMedia))
+	require.Equal(t, 1, f.actionInfoReads)
+	require.Empty(t, f.mutations)
 	require.NoError(t, c.MountVirtualMedia(t.Context(), standardMedia))
 	require.Equal(t, []map[string]any{{"Image": testISOURL, "Inserted": true, "TransferProtocolType": "HTTP", "TransferMethod": "Stream"}}, f.inserts)
 	require.Contains(t, f.mutations, "POST /redfish/v1/Systems/1/VirtualMedia/2/Actions/VirtualMedia.InsertMedia/")
 	require.NoError(t, c.SetVirtualMediaBoot(t.Context()))
 	require.Len(t, f.patches, 1)
 	require.Equal(t, "UEFI", f.patches[0]["BootSourceOverrideMode"])
+}
+
+func TestStandardVirtualMediaStagingCapabilities(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		setup       func(*fakeILO)
+		message     string
+		unsupported bool
+	}{
+		{"cd not allowed", func(f *fakeILO) { f.allowed = []string{"Pxe"} }, "boot override target Cd is not allowed", true},
+		{"missing insert", func(f *fakeILO) { f.noInsert = true }, "advertises #VirtualMedia.InsertMedia", true},
+		{"required parameter", func(f *fakeILO) {
+			f.actionInfo = `{"Parameters":[{"Name":"UserName","Required":true}]}`
+		}, "requires unsupported parameter UserName", true},
+		{"protocol", func(f *fakeILO) {
+			f.actionInfo = `{"Parameters":[{"Name":"TransferProtocolType","AllowableValues":["HTTPS"]}]}`
+		}, "does not allow transfer protocol HTTP", true},
+		{"transfer method", func(f *fakeILO) {
+			f.actionInfo = `{"Parameters":[{"Name":"TransferMethod","Required":true,"AllowableValues":["Upload"]}]}`
+		}, "does not allow transfer method Stream", true},
+		{"malformed action info", func(f *fakeILO) { f.actionInfo = "invalid" }, "parsing ActionInfo", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f, c := newFakeILO(t)
+			f.image, f.inserted = "http://192.0.2.99/other.iso", true
+			tc.setup(f)
+
+			err := c.StageVirtualMedia(t.Context(), standardMedia)
+			require.ErrorContains(t, err, tc.message)
+
+			if tc.unsupported {
+				require.ErrorIs(t, err, ErrUnsupported)
+			} else {
+				require.NotErrorIs(t, err, ErrUnsupported)
+			}
+
+			require.Empty(t, f.mutations)
+			require.True(t, f.inserted)
+			require.Equal(t, "http://192.0.2.99/other.iso", f.image)
+		})
+	}
+}
+
+func TestStandardVirtualMediaStagingSelectsMountDevice(t *testing.T) {
+	for _, occupied := range []bool{false, true} {
+		t.Run(fmt.Sprintf("first device occupied=%t", occupied), func(t *testing.T) {
+			f, c := newFakeILO(t)
+			f.firstMedia = map[string]any{
+				"MediaTypes": []string{"CD"}, "Inserted": occupied, "Image": "other",
+				"Actions": map[string]any{"#VirtualMedia.InsertMedia": redfishAction{
+					Target:     "/redfish/v1/Managers/1/VirtualMedia/1/Actions/VirtualMedia.InsertMedia/",
+					ActionInfo: "/redfish/v1/Managers/1/VirtualMedia/1/InsertMediaActionInfo/",
+				}},
+			}
+			f.firstActionInfo = `{"Parameters":[{"Name":"UserName","Required":true}]}`
+
+			f.actionInfo = `{"Parameters":[{"Name":"Image","Required":true}]}`
+			if occupied {
+				f.firstActionInfo, f.actionInfo = f.actionInfo, f.firstActionInfo
+			}
+
+			require.ErrorIs(t, c.StageVirtualMedia(t.Context(), standardMedia), ErrUnsupported)
+			require.ErrorIs(t, c.MountVirtualMedia(t.Context(), standardMedia), ErrUnsupported)
+			require.Equal(t, 2, f.actionInfoReads)
+			require.Empty(t, f.mutations)
+		})
+	}
+}
+
+func TestStandardVirtualMediaStagingAlreadyMounted(t *testing.T) {
+	for _, noInsert := range []bool{false, true} {
+		t.Run(fmt.Sprintf("no insert=%t", noInsert), func(t *testing.T) {
+			f, c := newFakeILO(t)
+			f.image, f.inserted = testISOURL, true
+			f.noInsert = noInsert
+			f.actionInfo = `{"Parameters":[{"Name":"UserName","Required":true}]}`
+
+			require.NoError(t, c.StageVirtualMedia(t.Context(), standardMedia))
+			require.NoError(t, c.MountVirtualMedia(t.Context(), standardMedia))
+			require.Zero(t, f.actionInfoReads)
+			require.Empty(t, f.mutations)
+		})
+	}
+}
+
+func TestStandardVirtualMediaStagingPrefersEmptyDevice(t *testing.T) {
+	f, c := newFakeILO(t)
+	f.firstMedia = map[string]any{
+		"MediaTypes": []string{"CD"}, "Inserted": true, "Image": "other",
+		"Actions": map[string]any{"#VirtualMedia.InsertMedia": redfishAction{
+			Target:     "/redfish/v1/Managers/1/VirtualMedia/1/Actions/VirtualMedia.InsertMedia/",
+			ActionInfo: "/redfish/v1/Managers/1/VirtualMedia/1/InsertMediaActionInfo/",
+		}},
+	}
+	f.firstActionInfo = `{"Parameters":[{"Name":"UserName","Required":true}]}`
+	f.actionInfo = `{"Parameters":[{"Name":"Image","Required":true}]}`
+
+	require.NoError(t, c.StageVirtualMedia(t.Context(), standardMedia))
+	require.Empty(t, f.mutations)
+	require.NoError(t, c.MountVirtualMedia(t.Context(), standardMedia))
+	require.Equal(t, []string{"POST /redfish/v1/Managers/1/VirtualMedia/2/Actions/VirtualMedia.InsertMedia/"}, f.mutations)
+	require.Empty(t, f.ejects)
+	require.Equal(t, []map[string]any{{"Image": testISOURL}}, f.inserts)
 }
 
 func TestStandardVirtualMediaTaskMonitor(t *testing.T) {

@@ -214,30 +214,34 @@ func (c *Client) standardStageVirtualMedia(ctx context.Context, source bootmedia
 		return err
 	}
 
-	devices, err := c.virtualMediaDevices(ctx)
+	boot, err := c.systemBoot(ctx)
 	if err != nil {
 		return err
 	}
 
-	if !slices.ContainsFunc(devices, func(d virtualMediaDevice) bool { return d.insert != nil }) {
-		return fmt.Errorf("no CD or DVD device advertises #VirtualMedia.InsertMedia: %w", ErrUnsupported)
+	if len(boot.AllowedTargets) > 0 && !slices.Contains(boot.AllowedTargets, BootTargetCd) {
+		return fmt.Errorf("boot override target %s is not allowed by the BMC (allowed %v): %w", BootTargetCd, boot.AllowedTargets, ErrUnsupported)
 	}
 
-	return nil
+	_, _, err = c.prepareVirtualMediaInsert(ctx, source)
+
+	return err
 }
 
-func (c *Client) standardMountVirtualMedia(ctx context.Context, source bootmedia.Source) error {
+func (c *Client) prepareVirtualMediaInsert(ctx context.Context, source bootmedia.Source) (virtualMediaDevice, map[string]any, error) {
 	if err := validateMediaURL(source.URL); err != nil {
-		return err
+		return virtualMediaDevice{}, nil, err
 	}
 
 	devices, err := c.virtualMediaDevices(ctx)
 	if err != nil {
-		return err
+		return virtualMediaDevice{}, nil, err
 	}
 
-	if slices.ContainsFunc(devices, func(d virtualMediaDevice) bool { return d.holds(source.URL) }) {
-		return nil
+	for _, device := range devices {
+		if device.holds(source.URL) {
+			return device, nil, nil
+		}
 	}
 
 	var device *virtualMediaDevice
@@ -253,13 +257,22 @@ func (c *Client) standardMountVirtualMedia(ctx context.Context, source bootmedia
 	}
 
 	if device == nil {
-		return fmt.Errorf("no CD or DVD device advertises #VirtualMedia.InsertMedia: %w", ErrUnsupported)
+		return virtualMediaDevice{}, nil, fmt.Errorf("no CD or DVD device advertises #VirtualMedia.InsertMedia: %w", ErrUnsupported)
 	}
 
-	// Validate the action before ejecting existing media.
 	body, err := c.insertMediaBody(ctx, *device, source.URL)
+
+	return *device, body, err
+}
+
+func (c *Client) standardMountVirtualMedia(ctx context.Context, source bootmedia.Source) error {
+	device, body, err := c.prepareVirtualMediaInsert(ctx, source)
 	if err != nil {
 		return err
+	}
+
+	if device.holds(source.URL) {
+		return nil
 	}
 
 	target, err := actionPath(device.insert.Target, device.path)
@@ -268,7 +281,7 @@ func (c *Client) standardMountVirtualMedia(ctx context.Context, source bootmedia
 	}
 
 	if device.inserted {
-		if err := c.ejectVirtualMedia(ctx, *device); err != nil {
+		if err := c.ejectVirtualMedia(ctx, device); err != nil {
 			return err
 		}
 	}
