@@ -88,8 +88,6 @@ func (c *Client) systemBase() string {
 }
 
 func (c *Client) getResource(ctx context.Context, path string) ([]byte, string, error) {
-	path = resourceRequestPath(path)
-
 	resp, err := c.session.send(ctx, http.MethodGet, path, nil, standardHeader(""))
 	if err != nil {
 		return nil, "", err

@@ -382,10 +382,10 @@ func TestStandardVirtualMediaRelativeLinksWithTrailingSlashes(t *testing.T) {
 				base = "/redfish/v1/Systems/1"
 			}
 
-			require.Contains(t, f.resourceReads, base+"/VirtualMedia")
-			require.Contains(t, f.resourceReads, base+"/VirtualMedia/2")
-			require.Contains(t, f.resourceReads, base+"/VirtualMedia/2/InsertMediaActionInfo")
-			require.Contains(t, f.resourceReads, "/redfish/v1/Systems/1/ResetActionInfo")
+			require.Contains(t, f.resourceReads, base+"/VirtualMedia/")
+			require.Contains(t, f.resourceReads, base+"/VirtualMedia/2/")
+			require.Contains(t, f.resourceReads, base+"/VirtualMedia/2/InsertMediaActionInfo/")
+			require.Contains(t, f.resourceReads, "/redfish/v1/Systems/1/ResetActionInfo/")
 			require.Equal(t, []string{
 				"POST " + base + "/VirtualMedia/2/Actions/VirtualMedia.InsertMedia/",
 				"POST /redfish/v1/Systems/1/Actions/ComputerSystem.Reset/",
@@ -393,6 +393,169 @@ func TestStandardVirtualMediaRelativeLinksWithTrailingSlashes(t *testing.T) {
 			}, f.mutations)
 			require.Equal(t, []map[string]any{{"Image": testISOURL}}, f.inserts)
 			require.False(t, f.inserted)
+		})
+	}
+}
+
+func TestStandardVirtualMediaCanonicalURIs(t *testing.T) {
+	for _, canonical := range []string{"absolute path", "absolute URI", "relative"} {
+		for _, absoluteActions := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/absolute actions=%t", canonical, absoluteActions), func(t *testing.T) {
+				managerID := "/redfish/v1/Managers/canonical/"
+				collectionID := "/redfish/v1/Media/"
+				deviceID := "/redfish/v1/Media/DVD/"
+
+				switch canonical {
+				case "absolute URI":
+					managerID = "https://bmc.example" + managerID
+					collectionID = "https://bmc.example" + collectionID
+					deviceID = "https://bmc.example" + deviceID
+				case "relative":
+					managerID, collectionID, deviceID = "canonical/", "../../../Media/", "../DVD/"
+				}
+
+				insertTarget, ejectTarget := "Actions/Insert/", "Actions/Eject/"
+				if absoluteActions {
+					insertTarget = "https://bmc.example/redfish/v1/Actions/Insert/"
+					ejectTarget = "/redfish/v1/Actions/Eject/"
+				}
+
+				image := ""
+
+				var reads, mutations []string
+
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.Method == http.MethodPost {
+						mutations = append(mutations, r.URL.Path)
+						if strings.HasSuffix(r.URL.Path, "/Insert/") {
+							image = testISOURL
+						} else {
+							image = ""
+						}
+
+						return
+					}
+
+					reads = append(reads, r.URL.Path)
+
+					var body any
+
+					switch r.URL.Path {
+					case "/redfish/v1/Systems/1":
+						body = map[string]any{"Links": map[string]any{"ManagedBy": []redfishLink{{ODataID: "/redfish/v1/Managers/alias"}}}}
+					case "/redfish/v1/Managers/alias":
+						body = map[string]any{"@odata.id": managerID, "VirtualMedia": redfishLink{ODataID: "VirtualMedia/"}}
+					case "/redfish/v1/Managers/canonical/VirtualMedia/":
+						body = map[string]any{"@odata.id": collectionID, "Members": []redfishLink{{ODataID: "2/"}}}
+					case "/redfish/v1/Media/2/", "/redfish/v1/Media/DVD/":
+						body = map[string]any{"@odata.id": deviceID, "MediaTypes": []string{"DVD"}, "Image": image, "Inserted": image != "", "Actions": map[string]any{
+							"#VirtualMedia.InsertMedia": redfishAction{Target: insertTarget, ActionInfo: "InsertInfo/"},
+							"#VirtualMedia.EjectMedia":  redfishAction{Target: ejectTarget},
+						}}
+					case "/redfish/v1/Media/DVD/InsertInfo/":
+						body = map[string]any{"Parameters": []actionParameter{{Name: "Image", Required: true}}}
+					default:
+						http.NotFound(w, r)
+						return
+					}
+
+					_ = json.NewEncoder(w).Encode(body)
+				}))
+				t.Cleanup(srv.Close)
+
+				client := &Client{session: &bmcSession{httpClient: srv.Client(), baseURL: srv.URL}, deviceID: "1"}
+				require.NoError(t, client.standardMountVirtualMedia(t.Context(), standardMedia))
+				devices, err := client.virtualMediaDevices(t.Context())
+				require.NoError(t, err)
+				require.Len(t, devices, 1)
+				require.Equal(t, "/redfish/v1/Media/DVD/", devices[0].path)
+				require.NoError(t, client.ejectVirtualMedia(t.Context(), devices[0]))
+
+				require.Contains(t, reads, "/redfish/v1/Managers/alias")
+				require.Contains(t, reads, "/redfish/v1/Managers/canonical/VirtualMedia/")
+				require.Contains(t, reads, "/redfish/v1/Media/2/")
+				require.Contains(t, reads, "/redfish/v1/Media/DVD/InsertInfo/")
+				require.Contains(t, reads, "/redfish/v1/Media/DVD/")
+
+				base := "/redfish/v1/Media/DVD/Actions/"
+				if absoluteActions {
+					base = "/redfish/v1/Actions/"
+				}
+
+				require.Equal(t, []string{base + "Insert/", base + "Eject/"}, mutations)
+			})
+		}
+	}
+}
+
+func TestStandardGetResourcePreservesAdvertisedURI(t *testing.T) {
+	for _, path := range []string{"/redfish/v1/Media/DVD/", "/redfish/v1/Media/DVD", "/redfish/v1/Media/DVD/?view=full"} {
+		t.Run(path, func(t *testing.T) {
+			var requests []string
+
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests = append(requests, r.URL.RequestURI())
+				if r.URL.RequestURI() != path {
+					http.NotFound(w, r)
+					return
+				}
+
+				_, _ = w.Write([]byte(`{"MediaTypes":["DVD"]}`))
+			}))
+			t.Cleanup(srv.Close)
+
+			client := &Client{session: &bmcSession{httpClient: srv.Client(), baseURL: srv.URL}}
+			_, _, err := client.getResource(t.Context(), path)
+			require.NoError(t, err)
+			require.Equal(t, []string{path}, requests)
+		})
+	}
+}
+
+func TestStandardVirtualMediaInvalidCanonicalURI(t *testing.T) {
+	for _, resource := range []string{"manager", "collection", "device"} {
+		t.Run(resource, func(t *testing.T) {
+			canonical := func(kind, path string) string {
+				if kind == resource {
+					return "%zz"
+				}
+
+				return path
+			}
+
+			var mutations []string
+
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodGet {
+					mutations = append(mutations, r.Method+" "+r.URL.Path)
+				}
+
+				var body any
+
+				switch r.URL.Path {
+				case "/redfish/v1/Systems/1":
+					body = map[string]any{"Links": map[string]any{"ManagedBy": []redfishLink{{ODataID: "/manager/"}}}}
+				case "/manager/":
+					body = map[string]any{"@odata.id": canonical("manager", "/manager/"), "VirtualMedia": redfishLink{ODataID: "/collection/"}}
+				case "/collection/":
+					body = map[string]any{"@odata.id": canonical("collection", "/collection/"), "Members": []redfishLink{{ODataID: "/device/"}}}
+				case "/device/":
+					body = map[string]any{"@odata.id": canonical("device", "/device/"), "MediaTypes": []string{"CD"}}
+				default:
+					http.NotFound(w, r)
+					return
+				}
+
+				_ = json.NewEncoder(w).Encode(body)
+			}))
+			t.Cleanup(srv.Close)
+
+			client := &Client{session: &bmcSession{httpClient: srv.Client(), baseURL: srv.URL}, deviceID: "1"}
+			err := client.standardMountVirtualMedia(t.Context(), standardMedia)
+			require.ErrorContains(t, err, "parsing")
+			require.ErrorContains(t, err, resource)
+			require.ErrorContains(t, err, "link")
+			require.Empty(t, mutations)
 		})
 	}
 }
@@ -422,10 +585,10 @@ func TestStandardVirtualMediaExplicitSystemID(t *testing.T) {
 				}
 
 				require.NotContains(t, f.resourceReads, "/redfish/v1/Systems")
-				require.Contains(t, f.resourceReads, base+"/VirtualMedia/2/InsertMediaActionInfo")
+				require.Contains(t, f.resourceReads, base+"/VirtualMedia/2/InsertMediaActionInfo/")
 
 				if f.relativeLinks {
-					require.Contains(t, f.resourceReads, "/redfish/v1/Systems/1/ResetActionInfo")
+					require.Contains(t, f.resourceReads, "/redfish/v1/Systems/1/ResetActionInfo/")
 				}
 
 				require.Equal(t, []string{

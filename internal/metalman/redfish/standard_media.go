@@ -105,10 +105,18 @@ func (c *Client) virtualMediaCollections(ctx context.Context) ([]string, error) 
 		}
 
 		var manager struct {
+			redfishLink
 			VirtualMedia *redfishLink `json:"VirtualMedia"`
 		}
 		if err := json.Unmarshal(data, &manager); err != nil {
 			return nil, fmt.Errorf("parsing manager %s: %w", managerPath, err)
+		}
+
+		if manager.ODataID != "" {
+			managerPath, err = resourcePath(manager.ODataID, managerPath)
+			if err != nil {
+				return nil, fmt.Errorf("parsing manager link: %w", err)
+			}
 		}
 
 		if manager.VirtualMedia != nil {
@@ -136,10 +144,18 @@ func (c *Client) virtualMediaDevices(ctx context.Context) ([]virtualMediaDevice,
 		}
 
 		var collection struct {
+			redfishLink
 			Members []redfishLink `json:"Members"`
 		}
 		if err := json.Unmarshal(data, &collection); err != nil {
 			return nil, fmt.Errorf("parsing VirtualMedia collection %s: %w", collectionPath, err)
+		}
+
+		if collection.ODataID != "" {
+			collectionPath, err = resourcePath(collection.ODataID, collectionPath)
+			if err != nil {
+				return nil, fmt.Errorf("parsing VirtualMedia collection link: %w", err)
+			}
 		}
 
 		for _, member := range collection.Members {
@@ -179,6 +195,7 @@ func (c *Client) virtualMediaDevice(ctx context.Context, path string) (virtualMe
 	}
 
 	var media struct {
+		redfishLink
 		MediaTypes []string `json:"MediaTypes"`
 		Image      *string  `json:"Image"`
 		Inserted   *bool    `json:"Inserted"`
@@ -193,6 +210,13 @@ func (c *Client) virtualMediaDevice(ctx context.Context, path string) (virtualMe
 
 	if !slices.Contains(media.MediaTypes, "CD") && !slices.Contains(media.MediaTypes, "DVD") {
 		return virtualMediaDevice{}, false, nil
+	}
+
+	if media.ODataID != "" {
+		path, err = resourcePath(media.ODataID, path)
+		if err != nil {
+			return virtualMediaDevice{}, false, fmt.Errorf("parsing VirtualMedia device link: %w", err)
+		}
 	}
 
 	device := virtualMediaDevice{path: path, insert: media.Actions.Insert, eject: media.Actions.Eject}
