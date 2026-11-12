@@ -62,6 +62,13 @@ def runtime_identity_check():
     return evidence
 
 
+def root_authorized_keys_check():
+    if os.getuid() != 0 or os.geteuid() != 0:
+        raise RuntimeError("The baked SSH authorization check requires root")
+    if pathlib.Path("/root/.ssh/authorized_keys").exists():
+        raise RuntimeError("The image must not contain authorized SSH keys")
+
+
 def mpi_check(executable):
     try:
         result = subprocess.run(
@@ -111,6 +118,11 @@ def main():
     contract = json.loads((ROOT / "runner-contract.json").read_text())
     if contract.get("version") != 1:
         raise RuntimeError("Unsupported runner contract version")
+    if contract.get("runtime_identity") != {
+            "uid": 65532, "gid": 65532,
+            "user": "certification", "group": "certification"}:
+        raise RuntimeError("Runner contract runtime identity changed")
+    runtime_identity_check()
     if sys.version_info[:2] != (3, 12) or os.uname().machine != "x86_64":
         raise RuntimeError("The locked Python3.12/linux-amd64 ABI is required")
     resolved = {}
@@ -129,8 +141,6 @@ def main():
             raise RuntimeError(f"Required literal executable missing: {literal}")
     for private_key in pathlib.Path("/etc/ssh").glob("ssh_host_*_key"):
         raise RuntimeError(f"Image contains an SSH host private key: {private_key}")
-    if pathlib.Path("/root/.ssh/authorized_keys").exists():
-        raise RuntimeError("The image must not contain authorized SSH keys")
     if decimal.Decimal("15e-255") <= 0:
         raise RuntimeError("Exact decimal support is unavailable")
     signal.signal(signal.SIGCHLD, signal.SIG_DFL)

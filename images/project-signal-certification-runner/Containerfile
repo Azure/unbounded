@@ -83,12 +83,12 @@ ENV PATH="/opt/venv/bin:${PATH}" \
     PYTHONDONTWRITEBYTECODE=1
 WORKDIR /opt/gpu-burn
 
+RUN /opt/venv/bin/python3 -c \
+    'import runpy; runpy.run_path("/opt/certification-image/validate-image.py")["root_authorized_keys_check"]()'
+
+USER 65532:65532
 RUN NVIDIA_VISIBLE_DEVICES=void CUDA_VISIBLE_DEVICES="" \
-    /opt/certification-image/validate-image.py \
-    && setpriv --reuid=65532 --regid=65532 --clear-groups \
-        --bounding-set=-all --no-new-privs \
-        /opt/venv/bin/python3 -c \
-        'import runpy; runpy.run_path("/opt/certification-image/validate-image.py")["runtime_identity_check"]()'
+    /opt/certification-image/validate-image.py
 
 ENTRYPOINT []
 CMD ["/bin/bash"]

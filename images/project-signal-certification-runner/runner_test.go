@@ -65,3 +65,26 @@ func TestOfflineValidationUsesExecutableScratch(t *testing.T) {
 		t.Fatalf("build.py must mount executable scratch for compiled loader probes")
 	}
 }
+
+func TestRuntimeImageUsesFixedNonRootIdentity(t *testing.T) {
+	t.Parallel()
+
+	content, err := os.ReadFile(filepath.Clean("Containerfile"))
+	if err != nil {
+		t.Fatalf("read Containerfile: %v", err)
+	}
+
+	text := string(content)
+	userIndex := strings.Index(text, "\nUSER 65532:65532\n")
+	rootCheckIndex := strings.Index(text, `["root_authorized_keys_check"]()`)
+	runtimeCheckIndex := strings.LastIndex(text, "/opt/certification-image/validate-image.py")
+	if userIndex < 0 {
+		t.Fatal("Containerfile must configure the fixed certification runtime identity")
+	}
+	if rootCheckIndex < 0 || rootCheckIndex > userIndex {
+		t.Fatal("Containerfile must check root SSH authorization before dropping privileges")
+	}
+	if runtimeCheckIndex < userIndex {
+		t.Fatal("Containerfile must run the full validator as the fixed runtime identity")
+	}
+}

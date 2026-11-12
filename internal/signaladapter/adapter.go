@@ -39,6 +39,7 @@ const (
 	mpiHostfilePath         = "/tmp/project-signal-hostfile"
 	mpiKnownHostsPath       = "/tmp/project-signal-known-hosts"
 	resultPrefix            = "PROJECT_SIGNAL_RESULT_V2 "
+	workloadIdentityID      = int64(65532)
 )
 
 var runnerImagePattern = regexp.MustCompile(`^[^@\s]+@sha256:[0-9a-f]{64}$`)
@@ -1070,6 +1071,7 @@ func ordinaryPod(
 			Tolerations:                  tolerations,
 			ActiveDeadlineSeconds:        &backendDeadlineSeconds,
 			AutomountServiceAccountToken: ptr(false),
+			SecurityContext:              workloadPodSecurityContext(),
 			Containers:                   []corev1.Container{container},
 			Volumes:                      workloadVolumes(config.ScriptConfigMap, policy),
 		},
@@ -1202,6 +1204,8 @@ func podTemplate(
 		policy = policies[0]
 	}
 
+	applyWorkloadIdentity(&container)
+
 	template := corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{
 			Labels: labels,
@@ -1211,6 +1215,7 @@ func podTemplate(
 			Affinity:                     affinity,
 			Tolerations:                  tolerations,
 			AutomountServiceAccountToken: ptr(false),
+			SecurityContext:              workloadPodSecurityContext(),
 			Containers:                   []corev1.Container{container},
 			Volumes:                      workloadVolumes(scriptConfigMap, policy),
 		},
@@ -1296,6 +1301,25 @@ func applyPodPolicy(spec *corev1.PodSpec, policy signalv1.WorkloadPolicy) {
 	spec.DNSPolicy = corev1.DNSClusterFirstWithHostNet
 }
 
+func workloadPodSecurityContext() *corev1.PodSecurityContext {
+	return &corev1.PodSecurityContext{
+		RunAsUser:    ptr(workloadIdentityID),
+		RunAsGroup:   ptr(workloadIdentityID),
+		RunAsNonRoot: ptr(true),
+		FSGroup:      ptr(workloadIdentityID),
+	}
+}
+
+func applyWorkloadIdentity(container *corev1.Container) {
+	if container.SecurityContext == nil {
+		container.SecurityContext = &corev1.SecurityContext{}
+	}
+
+	container.SecurityContext.RunAsUser = ptr(workloadIdentityID)
+	container.SecurityContext.RunAsGroup = ptr(workloadIdentityID)
+	container.SecurityContext.RunAsNonRoot = ptr(true)
+}
+
 func workloadEnvironment(
 	config Config,
 	participant signalv1.Participant,
@@ -1357,6 +1381,8 @@ func workloadContainer(
 	container corev1.Container,
 	gpuCount int64,
 ) corev1.Container {
+	applyWorkloadIdentity(&container)
+
 	container.Resources = *policy.Resources.DeepCopy()
 	if gpuCount > 0 {
 		if container.Resources.Requests == nil {
@@ -1373,9 +1399,7 @@ func workloadContainer(
 	}
 
 	if policy.Privileged || policy.IPCLock {
-		container.SecurityContext = &corev1.SecurityContext{
-			Privileged: ptr(policy.Privileged),
-		}
+		container.SecurityContext.Privileged = ptr(policy.Privileged)
 		if policy.IPCLock {
 			container.SecurityContext.Capabilities = &corev1.Capabilities{
 				Add: []corev1.Capability{"IPC_LOCK"},

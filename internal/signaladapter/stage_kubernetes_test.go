@@ -409,6 +409,15 @@ func TestWorkflowTemplateFailureCleansOwnerFencedChild(t *testing.T) {
 		t.Fatal("child Workflow was not created")
 	}
 
+	patch, found, nestedErr := unstructured.NestedString(
+		createdChild.Object,
+		"spec",
+		"podSpecPatch",
+	)
+	if nestedErr != nil || !found || patch != workloadPodSpecPatch {
+		t.Fatalf("child Workflow PodSpec patch = %q, found %t, error %v", patch, found, nestedErr)
+	}
+
 	if createdChild.GetLabels()[runUIDLabel] != string(invocation.RunUID) {
 		t.Fatalf("child Workflow labels = %#v", createdChild.GetLabels())
 	}
@@ -1719,6 +1728,8 @@ func TestStagePodCarriesScriptResourcesAndImmutableIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stagePod() error = %v", err)
 	}
+
+	assertFixedPodIdentity(t, pod.Spec)
 
 	gpu := pod.Spec.Containers[0].Resources.Requests[corev1.ResourceName("nvidia.com/gpu")]
 	if gpu.Cmp(resource.MustParse("8")) != 0 {

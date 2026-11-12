@@ -116,7 +116,7 @@ def check_inputs(root=ROOT):
     if contract.get("version") != 1:
         raise ValueError("Unsupported runner contract version")
     if set(contract) != {
-        "version", "path_tools", "driver_injected_tools", "runtime_gates",
+        "version", "path_tools", "driver_injected_tools", "runtime_identity", "runtime_gates",
     }:
         raise ValueError("Runner contract contains unsupported fields")
     if not contract["path_tools"] or not all(
@@ -128,6 +128,13 @@ def check_inputs(root=ROOT):
         raise ValueError("The runner image must own nvidia-smi")
     if contract["driver_injected_tools"]:
         raise ValueError("Runner contract driver-injected tools changed")
+    if contract["runtime_identity"] != {
+        "uid": 65532,
+        "gid": 65532,
+        "user": "certification",
+        "group": "certification",
+    }:
+        raise ValueError("Runner contract runtime identity changed")
     if not contract["runtime_gates"] or not all(
         isinstance(gate, str) and gate.strip() for gate in contract["runtime_gates"]
     ):

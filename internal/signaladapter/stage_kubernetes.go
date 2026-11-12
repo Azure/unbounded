@@ -26,6 +26,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	utilptr "k8s.io/utils/ptr"
+	"sigs.k8s.io/yaml"
 
 	signalv1 "github.com/Azure/unbounded/api/signal/v1alpha1"
 )
@@ -47,6 +48,7 @@ const (
 	liveTelemetryPort                 = 9464
 	liveTelemetryVolumeBytes          = 256 * 1024
 	liveTelemetryFinalScrapeGrace     = 10 * time.Second
+	workloadPodSpecPatch              = `{"securityContext":{"fsGroup":65532,"runAsGroup":65532,"runAsNonRoot":true,"runAsUser":65532}}`
 )
 
 type workflowRestartSourceCounts struct {
@@ -521,6 +523,7 @@ func (e *KubernetesStageExecutor) stagePod(
 			NodeName:                     participant.NodeName,
 			HostNetwork:                  invocation.Stage.Test.Security.HostNetwork,
 			AutomountServiceAccountToken: utilptr.To(false),
+			SecurityContext:              workloadPodSecurityContext(),
 			Containers:                   []corev1.Container{container},
 			Volumes:                      stageHostPathVolumes(invocation.Stage.Test.Security.HostPaths),
 		},
@@ -644,6 +647,9 @@ func liveTelemetrySidecar(
 			AllowPrivilegeEscalation: utilptr.To(false),
 			ReadOnlyRootFilesystem:   utilptr.To(true),
 			Privileged:               utilptr.To(false),
+			RunAsUser:                utilptr.To(workloadIdentityID),
+			RunAsGroup:               utilptr.To(workloadIdentityID),
+			RunAsNonRoot:             utilptr.To(true),
 			Capabilities: &corev1.Capabilities{
 				Drop: []corev1.Capability{"ALL"},
 			},
@@ -670,7 +676,7 @@ func invocationArtifact(
 }
 
 func artifactMaterializer(image string, artifact signalv1.TestArtifact) corev1.Container {
-	return corev1.Container{
+	container := corev1.Container{
 		Name:    "materialize-script",
 		Image:   image,
 		Command: []string{"/bin/sh", "-ceu"},
@@ -690,6 +696,9 @@ chmod 0555 "/scripts/$PROJECT_SIGNAL_ARTIFACT_NAME"`},
 			MountPath: "/scripts",
 		}},
 	}
+	applyWorkloadIdentity(&container)
+
+	return container
 }
 
 func stageHostPathVolumes(paths []signalv1.WorkloadHostPath) []corev1.Volume {
@@ -824,6 +833,12 @@ func (e *KubernetesStageExecutor) executeWorkflowTemplate(
 	if err := validateWorkflowServiceAccount(templateSpec, e.WorkflowServiceAccount); err != nil {
 		return signalv1.InvocationResultEnvelope{}, err
 	}
+
+	if err := applyWorkflowRuntimeIdentity(templateSpec); err != nil {
+		return signalv1.InvocationResultEnvelope{}, err
+	}
+
+	templateSpec["podSpecPatch"] = workloadPodSpecPatch
 
 	claims := workflowPersistentVolumeClaims(templateSpec)
 
@@ -1595,6 +1610,225 @@ func validateWorkflowServiceAccountFields(value any, allowed string) error {
 	return nil
 }
 
+func applyWorkflowRuntimeIdentity(value any) error {
+	switch typed := value.(type) {
+	case map[string]any:
+		for key, child := range typed {
+			switch key {
+			case "container", "script":
+				container, ok := child.(map[string]any)
+				if !ok {
+					return fmt.Errorf("WorkflowTemplate %s must be an object", key)
+				}
+
+				if err := applyUnstructuredContainerIdentity(container); err != nil {
+					return err
+				}
+			case "containers", "initContainers", "sidecars", "ephemeralContainers":
+				containers, ok := child.([]any)
+				if !ok {
+					return fmt.Errorf("WorkflowTemplate %s must be a list", key)
+				}
+
+				for index, item := range containers {
+					container, ok := item.(map[string]any)
+					if !ok {
+						return fmt.Errorf("WorkflowTemplate %s[%d] must be an object", key, index)
+					}
+
+					if err := applyUnstructuredContainerIdentity(container); err != nil {
+						return err
+					}
+				}
+			case "resource":
+				resourceTemplate, ok := child.(map[string]any)
+				if !ok {
+					return errors.New("WorkflowTemplate resource must be an object")
+				}
+
+				if err := applyWorkflowResourceRuntimeIdentity(resourceTemplate); err != nil {
+					return err
+				}
+			}
+
+			if err := applyWorkflowRuntimeIdentity(child); err != nil {
+				return err
+			}
+		}
+	case []any:
+		for _, child := range typed {
+			if err := applyWorkflowRuntimeIdentity(child); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func applyWorkflowResourceRuntimeIdentity(resourceTemplate map[string]any) error {
+	manifest, ok := resourceTemplate["manifest"].(string)
+	if !ok {
+		return errors.New("WorkflowTemplate resource manifest must be a string")
+	}
+
+	resource := map[string]any{}
+	if err := yaml.Unmarshal([]byte(manifest), &resource); err != nil {
+		return fmt.Errorf("decode WorkflowTemplate resource manifest: %w", err)
+	}
+
+	kind, ok := resource["kind"].(string)
+	if !ok || kind == "" {
+		return errors.New("WorkflowTemplate resource kind must be a non-empty string")
+	}
+
+	switch kind {
+	case "Pod":
+		if err := applyNestedPodSpecIdentity(resource, "spec"); err != nil {
+			return err
+		}
+	case "Job", "Deployment", "DaemonSet", "StatefulSet", "ReplicaSet":
+		if err := applyNestedPodSpecIdentity(resource, "spec", "template", "spec"); err != nil {
+			return err
+		}
+	case "CronJob":
+		if err := applyNestedPodSpecIdentity(
+			resource,
+			"spec",
+			"jobTemplate",
+			"spec",
+			"template",
+			"spec",
+		); err != nil {
+			return err
+		}
+	case "MPIJob":
+		replicas, found, err := unstructured.NestedMap(resource, "spec", "mpiReplicaSpecs")
+		if err != nil || !found {
+			return errors.New("WorkflowTemplate MPIJob resource has no replica specifications")
+		}
+
+		for role, replica := range replicas {
+			replicaSpec, ok := replica.(map[string]any)
+			if !ok {
+				return fmt.Errorf("WorkflowTemplate MPIJob replica %q must be an object", role)
+			}
+
+			if err := applyNestedPodSpecIdentity(replicaSpec, "template", "spec"); err != nil {
+				return fmt.Errorf("apply WorkflowTemplate MPIJob replica %q identity: %w", role, err)
+			}
+		}
+
+		if err := unstructured.SetNestedMap(resource, replicas, "spec", "mpiReplicaSpecs"); err != nil {
+			return fmt.Errorf("write WorkflowTemplate MPIJob replica identities: %w", err)
+		}
+	case "ConfigMap", "Secret", "Service", "PersistentVolumeClaim":
+	default:
+		return fmt.Errorf(
+			"WorkflowTemplate resource kind %q is not approved for fixed runtime identity enforcement",
+			kind,
+		)
+	}
+
+	content, err := json.Marshal(resource)
+	if err != nil {
+		return fmt.Errorf("encode WorkflowTemplate resource manifest: %w", err)
+	}
+
+	resourceTemplate["manifest"] = string(content)
+
+	return nil
+}
+
+func applyNestedPodSpecIdentity(resource map[string]any, fields ...string) error {
+	spec, found, err := unstructured.NestedMap(resource, fields...)
+	if err != nil || !found {
+		return fmt.Errorf("WorkflowTemplate resource has no Pod spec at %q", strings.Join(fields, "."))
+	}
+
+	if err := applyUnstructuredPodSpecIdentity(spec); err != nil {
+		return err
+	}
+
+	if err := unstructured.SetNestedMap(resource, spec, fields...); err != nil {
+		return fmt.Errorf("write WorkflowTemplate resource Pod spec: %w", err)
+	}
+
+	return nil
+}
+
+func applyUnstructuredPodSpecIdentity(spec map[string]any) error {
+	securityContext := map[string]any{}
+
+	if value, found := spec["securityContext"]; found {
+		typed, ok := value.(map[string]any)
+		if !ok {
+			return errors.New("WorkflowTemplate Pod securityContext must be an object")
+		}
+
+		securityContext = typed
+	}
+
+	if securityContext == nil {
+		securityContext = map[string]any{}
+	}
+
+	securityContext["runAsUser"] = workloadIdentityID
+	securityContext["runAsGroup"] = workloadIdentityID
+	securityContext["runAsNonRoot"] = true
+	securityContext["fsGroup"] = workloadIdentityID
+	spec["securityContext"] = securityContext
+
+	for _, field := range []string{"initContainers", "containers", "ephemeralContainers"} {
+		value, found := spec[field]
+		if !found {
+			continue
+		}
+
+		containers, ok := value.([]any)
+		if !ok {
+			return fmt.Errorf("WorkflowTemplate Pod %s must be a list", field)
+		}
+
+		for _, item := range containers {
+			container, ok := item.(map[string]any)
+			if !ok {
+				return fmt.Errorf("WorkflowTemplate Pod %s entry must be an object", field)
+			}
+
+			if err := applyUnstructuredContainerIdentity(container); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func applyUnstructuredContainerIdentity(container map[string]any) error {
+	securityContext := map[string]any{}
+
+	if value, found := container["securityContext"]; found {
+		typed, ok := value.(map[string]any)
+		if !ok {
+			return errors.New("WorkflowTemplate container securityContext must be an object")
+		}
+
+		securityContext = typed
+	}
+
+	if securityContext == nil {
+		securityContext = map[string]any{}
+	}
+
+	securityContext["runAsUser"] = workloadIdentityID
+	securityContext["runAsGroup"] = workloadIdentityID
+	securityContext["runAsNonRoot"] = true
+	container["securityContext"] = securityContext
+
+	return nil
+}
+
 func validateWorkflowTemplateIdentity(
 	invocation StageInvocation,
 	template *unstructured.Unstructured,
@@ -2008,7 +2242,10 @@ func driverResources(driver signalv1.CertificationTestDriver) corev1.ResourceReq
 
 func applyStageSecurity(container *corev1.Container, security signalv1.ResolvedSecurityRequirements) {
 	container.SecurityContext = &corev1.SecurityContext{
-		Privileged: &security.Privileged,
+		Privileged:   &security.Privileged,
+		RunAsUser:    utilptr.To(workloadIdentityID),
+		RunAsGroup:   utilptr.To(workloadIdentityID),
+		RunAsNonRoot: utilptr.To(true),
 	}
 	if security.IPCLock || len(security.Capabilities) > 0 {
 		container.SecurityContext.Capabilities = &corev1.Capabilities{}
