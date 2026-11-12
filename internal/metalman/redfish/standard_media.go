@@ -298,7 +298,7 @@ func (c *Client) standardMountVirtualMedia(ctx context.Context, source bootmedia
 		return err
 	}
 
-	if !ok || !inserted.inserted || (inserted.image != "" && inserted.image != source.URL) {
+	if !ok || !inserted.holds(source.URL) {
 		return fmt.Errorf("virtual media %s does not report image %s as inserted", device.path, source.URL)
 	}
 
@@ -492,6 +492,10 @@ func (c *Client) standardCleanupVirtualMedia(ctx context.Context, source bootmed
 	}
 
 	for _, device := range devices {
+		if device.inserted && device.image == "" {
+			return fmt.Errorf("virtual media %s reports inserted media with an unknown image; cannot verify cleanup ownership", device.path)
+		}
+
 		if device.inserted && sameMediaCapability(device.image, source.URL) {
 			if err := c.ejectVirtualMedia(ctx, device); err != nil {
 				return err

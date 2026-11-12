@@ -37,6 +37,7 @@ type fakeILO struct {
 	patches                              []map[string]string
 	inserts                              []map[string]any
 	ejects                               []string
+	insertResult                         map[string]any
 	ejectResult                          map[string]any
 	missingHeader                        []string
 	ignoreInsert, ignoreBoot             bool
@@ -137,6 +138,11 @@ func newFakeILO(t *testing.T) (*fakeILO, *Client) {
 		case strings.HasSuffix(path, "/VirtualMedia/2"):
 			if len(f.ejects) > 0 && f.ejectResult != nil {
 				write(f.ejectResult)
+				return
+			}
+
+			if len(f.inserts) > 0 && f.insertResult != nil {
+				write(f.insertResult)
 				return
 			}
 
@@ -450,7 +456,75 @@ func TestStandardVirtualMediaCleanupCapability(t *testing.T) {
 
 			require.NoError(t, c.CleanupVirtualMedia(t.Context(), standardMedia))
 			require.Equal(t, !tc.eject, f.inserted)
+
+			if !tc.eject {
+				require.Equal(t, tc.image, f.image)
+				require.Empty(t, f.mutations)
+			}
 		})
+	}
+}
+
+func TestStandardVirtualMediaMountRequiresImageReadback(t *testing.T) {
+	for _, image := range []string{"missing", "empty", "unrelated"} {
+		t.Run(image, func(t *testing.T) {
+			f, c := newFakeILO(t)
+
+			f.insertResult = map[string]any{"MediaTypes": []string{"CD"}, "Inserted": true}
+			switch image {
+			case "empty":
+				f.insertResult["Image"] = ""
+			case "unrelated":
+				f.insertResult["Image"] = "http://192.0.2.99/other.iso"
+			}
+
+			err := c.MountVirtualMedia(t.Context(), standardMedia)
+			require.ErrorContains(t, err, "does not report image "+testISOURL+" as inserted")
+			require.NotErrorIs(t, err, ErrUnsupported)
+			require.Len(t, f.inserts, 1)
+			require.True(t, f.inserted)
+
+			err = c.CleanupVirtualMedia(t.Context(), standardMedia)
+			if image == "unrelated" {
+				require.NoError(t, err)
+			} else {
+				require.ErrorContains(t, err, "inserted media with an unknown image")
+				require.NotErrorIs(t, err, ErrUnsupported)
+			}
+
+			require.Empty(t, f.ejects)
+			require.True(t, f.inserted)
+			require.Len(t, f.mutations, 1)
+		})
+	}
+}
+
+func TestStandardVirtualMediaCleanupUnknownImage(t *testing.T) {
+	for _, image := range []string{"missing", "empty"} {
+		for _, inserted := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/inserted=%t", image, inserted), func(t *testing.T) {
+				f, c := newFakeILO(t)
+
+				f.firstMedia = map[string]any{"MediaTypes": []string{"DVD"}, "Inserted": inserted}
+				if image == "empty" {
+					f.firstMedia["Image"] = ""
+				}
+
+				f.image, f.inserted = "http://192.0.2.99/other.iso", true
+
+				err := c.CleanupVirtualMedia(t.Context(), standardMedia)
+				if inserted {
+					require.ErrorContains(t, err, "inserted media with an unknown image")
+					require.NotErrorIs(t, err, ErrUnsupported)
+				} else {
+					require.NoError(t, err)
+				}
+
+				require.True(t, f.inserted)
+				require.Equal(t, "http://192.0.2.99/other.iso", f.image)
+				require.Empty(t, f.mutations)
+			})
+		}
 	}
 }
 
