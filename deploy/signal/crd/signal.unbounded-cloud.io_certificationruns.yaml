@@ -2537,6 +2537,91 @@ spec:
                               x-kubernetes-validations:
                               - message: maxStartGap must not be negative
                                 rule: duration(self) >= duration('0s')
+                            measurements:
+                              description: |-
+                                Measurements is the bounded typed projection from the last completed
+                                invocation. Complete per-invocation values remain in durable evidence.
+                              items:
+                                properties:
+                                  name:
+                                    maxLength: 63
+                                    minLength: 1
+                                    type: string
+                                  unit:
+                                    maxLength: 32
+                                    type: string
+                                  value:
+                                    properties:
+                                      booleanValue:
+                                        type: boolean
+                                      decimalValue:
+                                        description: DecimalValue is a base-10 JSON-independent
+                                          decimal representation.
+                                        maxLength: 128
+                                        pattern: ^-?(0|[1-9][0-9]*)(\.[0-9]+)?$
+                                        type: string
+                                      durationValue:
+                                        type: string
+                                      integerValue:
+                                        format: int64
+                                        type: integer
+                                      quantityValue:
+                                        description: QuantityValue uses Kubernetes
+                                          quantity syntax.
+                                        maxLength: 64
+                                        minLength: 1
+                                        type: string
+                                      stringValue:
+                                        maxLength: 65536
+                                        type: string
+                                      type:
+                                        enum:
+                                        - String
+                                        - Integer
+                                        - Decimal
+                                        - Boolean
+                                        - Duration
+                                        - Quantity
+                                        type: string
+                                    required:
+                                    - type
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: exactly the value field matching type
+                                        must be set
+                                      rule: (self.type == 'String' && has(self.stringValue)
+                                        && !has(self.integerValue) && !has(self.decimalValue)
+                                        && !has(self.booleanValue) && !has(self.durationValue)
+                                        && !has(self.quantityValue)) || (self.type
+                                        == 'Integer' && !has(self.stringValue) &&
+                                        has(self.integerValue) && !has(self.decimalValue)
+                                        && !has(self.booleanValue) && !has(self.durationValue)
+                                        && !has(self.quantityValue)) || (self.type
+                                        == 'Decimal' && !has(self.stringValue) &&
+                                        !has(self.integerValue) && has(self.decimalValue)
+                                        && !has(self.booleanValue) && !has(self.durationValue)
+                                        && !has(self.quantityValue)) || (self.type
+                                        == 'Boolean' && !has(self.stringValue) &&
+                                        !has(self.integerValue) && !has(self.decimalValue)
+                                        && has(self.booleanValue) && !has(self.durationValue)
+                                        && !has(self.quantityValue)) || (self.type
+                                        == 'Duration' && !has(self.stringValue) &&
+                                        !has(self.integerValue) && !has(self.decimalValue)
+                                        && !has(self.booleanValue) && has(self.durationValue)
+                                        && !has(self.quantityValue)) || (self.type
+                                        == 'Quantity' && !has(self.stringValue) &&
+                                        !has(self.integerValue) && !has(self.decimalValue)
+                                        && !has(self.booleanValue) && !has(self.durationValue)
+                                        && has(self.quantityValue))
+                                required:
+                                - name
+                                - value
+                                type: object
+                              maxItems: 16
+                              type: array
+                              x-kubernetes-list-map-keys:
+                              - name
+                              x-kubernetes-list-type: map
                             mode:
                               enum:
                               - RunOnce

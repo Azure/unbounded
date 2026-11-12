@@ -206,6 +206,12 @@ type StageEvidenceSummary struct {
 	// +listType=map
 	// +listMapKey=name
 	Assertions []AssertionResult `json:"assertions,omitempty"`
+	// Measurements is the bounded typed projection from the last completed
+	// invocation. Complete per-invocation values remain in durable evidence.
+	// +kubebuilder:validation:MaxItems=16
+	// +listType=map
+	// +listMapKey=name
+	Measurements []MetricMeasurement `json:"measurements,omitempty"`
 	// InvocationEvidence is a bounded index into the durable invocation
 	// envelopes. The durable stage artifact remains authoritative.
 	// +kubebuilder:validation:MaxItems=8

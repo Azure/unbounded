@@ -2013,6 +2013,13 @@ func (in *StageEvidenceSummary) DeepCopyInto(out *StageEvidenceSummary) {
 			(*in)[i].DeepCopyInto(&(*out)[i])
 		}
 	}
+	if in.Measurements != nil {
+		in, out := &in.Measurements, &out.Measurements
+		*out = make([]MetricMeasurement, len(*in))
+		for i := range *in {
+			(*in)[i].DeepCopyInto(&(*out)[i])
+		}
+	}
 	if in.InvocationEvidence != nil {
 		in, out := &in.InvocationEvidence, &out.InvocationEvidence
 		*out = make([]InvocationEvidenceReference, len(*in))
