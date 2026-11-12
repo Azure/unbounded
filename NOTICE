@@ -290,35 +290,35 @@ notices:
       - Copyright 2014-2015 Stripe, Inc.
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/aws/aws-sdk-go-v2/blob/v1.47.5/LICENSE.txt
+        link: https://github.com/aws/aws-sdk-go-v2/blob/v1.47.8/LICENSE.txt
   - dependency: github.com/aws/aws-sdk-go-v2/config
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/aws/aws-sdk-go-v2/blob/config/v1.33.13/LICENSE.txt
+        link: https://github.com/aws/aws-sdk-go-v2/blob/config/v1.33.16/LICENSE.txt
   - dependency: github.com/aws/aws-sdk-go-v2/credentials
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/aws/aws-sdk-go-v2/blob/credentials/v1.20.13/LICENSE.txt
+        link: https://github.com/aws/aws-sdk-go-v2/blob/credentials/v1.20.16/LICENSE.txt
   - dependency: github.com/aws/aws-sdk-go-v2/service/s3
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/aws/aws-sdk-go-v2/blob/service/s3/v1.114.6/LICENSE.txt
+        link: https://github.com/aws/aws-sdk-go-v2/blob/service/s3/v1.114.9/LICENSE.txt
   - dependency: github.com/aws/smithy-go
     ecosystem: go
     copyright:
       - See LICENSE file
     license:
       - name: Apache License, Version 2.0
-        link: https://github.com/aws/smithy-go/blob/v1.28.7/LICENSE
+        link: https://github.com/aws/smithy-go/blob/v1.28.8/LICENSE
   - dependency: github.com/bougou/go-ipmi
     ecosystem: go
     copyright:
@@ -455,7 +455,7 @@ notices:
       - Copyright (c) 2015-2020, Tim Heckman
     license:
       - name: BSD 3-Clause License
-        link: https://github.com/gofrs/flock/blob/v0.13.1/LICENSE
+        link: https://github.com/gofrs/flock/blob/v0.13.2/LICENSE
   - dependency: github.com/golang-jwt/jwt/v5
     ecosystem: go
     copyright:
@@ -550,11 +550,11 @@ notices:
       - Copyright 2016 The filepathx Authors
     license:
       - name: BSD 3-Clause License
-        link: https://github.com/klauspost/compress/blob/v1.20.2/LICENSE
+        link: https://github.com/klauspost/compress/blob/v1.20.4/LICENSE
       - name: Apache License, Version 2.0
-        link: https://github.com/klauspost/compress/blob/v1.20.2/LICENSE
+        link: https://github.com/klauspost/compress/blob/v1.20.4/LICENSE
       - name: MIT License
-        link: https://github.com/klauspost/compress/blob/v1.20.2/LICENSE
+        link: https://github.com/klauspost/compress/blob/v1.20.4/LICENSE
   - dependency: github.com/lib/pq
     ecosystem: go
     copyright:
@@ -632,7 +632,7 @@ notices:
       - Copyright (c) 2015, Pierre Curto
     license:
       - name: BSD 3-Clause License
-        link: https://github.com/pierrec/lz4/blob/v4.1.28/LICENSE
+        link: https://github.com/pierrec/lz4/blob/v4.1.33/LICENSE
   - dependency: github.com/pin/tftp/v3
     ecosystem: go
     copyright:
@@ -684,7 +684,7 @@ notices:
       - Copyright (c) 2012 The Go Authors. All rights reserved.
     license:
       - name: BSD 3-Clause License
-        link: https://github.com/spf13/pflag/blob/v1.0.10/LICENSE
+        link: https://github.com/spf13/pflag/blob/v1.1.0/LICENSE
   - dependency: github.com/stretchr/testify
     ecosystem: go
     copyright:
@@ -698,7 +698,7 @@ notices:
       - Copyright (c) 2017-2019 Gianluca Arbezzano
     license:
       - name: MIT License
-        link: https://github.com/testcontainers/testcontainers-go/blob/v0.44.0/LICENSE
+        link: https://github.com/testcontainers/testcontainers-go/blob/v0.45.0/LICENSE
   - dependency: github.com/vishvananda/netlink
     ecosystem: go
     copyright:
@@ -940,7 +940,7 @@ notices:
       - Copyright (c) 2017 The Sqlite Authors. All rights reserved.
     license:
       - name: BSD 3-Clause License
-        link: https://gitlab.com/cznic/sqlite/-/blob/v1.61.1/LICENSE
+        link: https://gitlab.com/cznic/sqlite/-/blob/v1.62.0/LICENSE
   - dependency: oras.land/oras-go/v2
     ecosystem: go
     copyright:
