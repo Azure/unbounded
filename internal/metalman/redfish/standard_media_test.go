@@ -54,6 +54,20 @@ type fakeILO struct {
 	taskLink                             string
 	mediaReadyAfter, mediaPolls          int
 	cancelInsert                         context.CancelFunc
+	ejectAsync                           string
+	ejectPolls                           int
+	keepEjectedImage                     bool
+	connect                              func() *Client
+}
+
+func (f *fakeILO) finishEject() {
+	// A completed detach also stops any pending insertion of this image.
+	f.mediaReadyAfter = 0
+
+	f.inserted = false
+	if !f.keepEjectedImage {
+		f.image = ""
+	}
 }
 
 func newFakeILO(t *testing.T) (*fakeILO, *Client) {
@@ -261,7 +275,30 @@ func newFakeILOWithDeviceID(t *testing.T, deviceID string) (*fakeILO, *Client) {
 			require.Empty(t, body)
 
 			f.ejects = append(f.ejects, f.image)
-			f.image, f.inserted = "", false
+			if f.ejectAsync != "" {
+				if f.ejectAsync != "unmonitored" {
+					w.Header().Set("Location", "/redfish/v1/TaskService/TaskMonitors/2")
+				}
+
+				w.WriteHeader(http.StatusAccepted)
+
+				return
+			}
+
+			f.finishEject()
+		case path == "/redfish/v1/TaskService/TaskMonitors/2":
+			f.ejectPolls++
+
+			state := "Running"
+			if f.ejectAsync == "fail" {
+				state = "Exception"
+			} else if f.ejectAsync != "running" && f.ejectPolls > 1 {
+				f.finishEject()
+
+				state = "Completed"
+			}
+
+			write(map[string]string{"TaskState": state, "TaskStatus": "OK"})
 		case path == "/redfish/v1/TaskService/TaskMonitors/1" || path == "/redfish/v1/Managers/1/VirtualMedia/2/Actions/VirtualMedia.InsertMedia/task":
 			f.polls++
 			if f.polls == 1 {
@@ -283,11 +320,16 @@ func newFakeILOWithDeviceID(t *testing.T, deviceID string) (*fakeILO, *Client) {
 		}
 	}))
 	t.Cleanup(srv.Close)
-	c, err := Dial(t.Context(), srv.URL, tlsServerFingerprint(srv), "admin", "secret", deviceID)
-	require.NoError(t, err)
-	t.Cleanup(c.Close)
 
-	return f, c
+	f.connect = func() *Client {
+		c, err := Dial(t.Context(), srv.URL, tlsServerFingerprint(srv), "admin", "secret", deviceID)
+		require.NoError(t, err)
+		t.Cleanup(c.Close)
+
+		return c
+	}
+
+	return f, f.connect()
 }
 
 func TestStandardVirtualMediaInstallFlow(t *testing.T) {
@@ -1091,24 +1133,49 @@ func TestStandardVirtualMediaCleanupAfterInterruptedInsert(t *testing.T) {
 					source.URL = strings.Replace(testISOURL, "192.0.2.10", "192.0.2.99", 1)
 				}
 
-				for range 2 {
-					err = c.CleanupVirtualMedia(t.Context(), source)
-					require.ErrorContains(t, err, "insertion may be pending")
+				c.Close()
+
+				c = f.connect()
+				for _, ejectOutcome := range []string{"unmonitored", "fail", "running"} {
+					f.mu.Lock()
+					f.ejectAsync = ejectOutcome
+					f.mu.Unlock()
+
+					cleanupCtx, cleanupCancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+					err = c.CleanupVirtualMedia(cleanupCtx, source)
+
+					cleanupCancel()
+
+					switch ejectOutcome {
+					case "unmonitored":
+						require.ErrorContains(t, err, "no completion monitor")
+					case "fail":
+						require.ErrorContains(t, err, "task ended in state Exception")
+					case "running":
+						require.ErrorIs(t, err, context.DeadlineExceeded)
+					}
+
 					require.NotErrorIs(t, err, ErrUnsupported)
+					f.mu.Lock()
+					require.Equal(t, testISOURL, f.image)
+					require.False(t, f.inserted)
+					f.mu.Unlock()
 				}
 
 				f.mu.Lock()
-				require.Empty(t, f.ejects)
-				require.Len(t, f.mutations, 1)
-				f.inserted = true
+				f.ejectAsync, f.ejectPolls = "ok", 0
+				// Without a successful eject, this insertion would finish later.
+				f.mediaReadyAfter = f.mediaPolls + 3
 				f.mu.Unlock()
 
 				require.NoError(t, c.CleanupVirtualMedia(t.Context(), source))
-				require.Equal(t, []string{testISOURL}, f.ejects)
+				require.Equal(t, []string{testISOURL, testISOURL, testISOURL, testISOURL}, f.ejects)
+				require.Equal(t, 2, f.ejectPolls)
+				require.Zero(t, f.mediaReadyAfter)
 				require.False(t, f.inserted)
 				require.Empty(t, f.image)
 				require.NoError(t, c.CleanupVirtualMedia(t.Context(), source))
-				require.Len(t, f.ejects, 1)
+				require.Len(t, f.ejects, 4)
 			})
 		}
 	}
@@ -1351,13 +1418,56 @@ func TestStandardVirtualMediaCleanupAlreadyEmpty(t *testing.T) {
 func TestStandardVirtualMediaCleanupPendingImageCleared(t *testing.T) {
 	f, c := newFakeILO(t)
 	f.image = testISOURL
+	f.ejectAsync = "unmonitored"
 
 	require.ErrorContains(t, c.CleanupVirtualMedia(t.Context(), standardMedia), "insertion may be pending")
 
 	f.image = ""
 
 	require.NoError(t, c.CleanupVirtualMedia(t.Context(), standardMedia))
-	require.Empty(t, f.mutations)
+	require.Equal(t, []string{testISOURL}, f.ejects)
+}
+
+func TestStandardVirtualMediaCleanupStaleImageAfterRestart(t *testing.T) {
+	old := taskPollInterval
+	taskPollInterval = time.Millisecond
+
+	t.Cleanup(func() { taskPollInterval = old })
+
+	for _, initialInserted := range []bool{false, true} {
+		for _, async := range []string{"", "ok"} {
+			for _, changedHost := range []bool{false, true} {
+				t.Run(fmt.Sprintf("inserted=%t/async=%s/changedHost=%t", initialInserted, async, changedHost), func(t *testing.T) {
+					f, c := newFakeILO(t)
+					f.image, f.inserted = testISOURL, initialInserted
+					f.keepEjectedImage, f.ejectAsync = true, async
+
+					require.NoError(t, c.CleanupVirtualMedia(t.Context(), standardMedia))
+					require.Equal(t, testISOURL, f.image)
+					require.False(t, f.inserted)
+					require.Len(t, f.ejects, 1)
+
+					// Simulate failure to save Cleaned, followed by a restart.
+					// Only the original source survives, not client-side evidence.
+					c.Close()
+					c = f.connect()
+
+					source := standardMedia
+					if changedHost {
+						source.URL = strings.Replace(testISOURL, "192.0.2.10", "192.0.2.99", 1)
+					}
+
+					for range 2 {
+						require.NoError(t, c.CleanupVirtualMedia(t.Context(), source))
+						require.Equal(t, testISOURL, f.image)
+						require.False(t, f.inserted)
+					}
+
+					require.Equal(t, []string{testISOURL, testISOURL, testISOURL}, f.ejects)
+				})
+			}
+		}
+	}
 }
 
 func TestStandardVirtualMediaCleanupUnrelatedPendingImage(t *testing.T) {

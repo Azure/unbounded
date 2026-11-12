@@ -453,6 +453,12 @@ func (c *Client) ejectVirtualMedia(ctx context.Context, device virtualMediaDevic
 		return actionError(http.MethodPost, target, resp)
 	}
 
+	// An unmonitored 202 does not prove ejection completed. In particular,
+	// Inserted may already be false while an earlier insertion is pending.
+	if resp.status == http.StatusAccepted {
+		return fmt.Errorf("virtual media %s ejection has no completion monitor; insertion may be pending", device.path)
+	}
+
 	ejected, ok, err := c.virtualMediaDevice(ctx, device.path)
 	if err != nil {
 		return err
@@ -466,6 +472,8 @@ func (c *Client) ejectVirtualMedia(ctx context.Context, device virtualMediaDevic
 		return fmt.Errorf("virtual media %s still reports media as inserted", device.path)
 	}
 
+	// A completed EjectMedia detaches remote media. Tolerate a stale Image
+	// only after that completion, not as evidence from the initial read.
 	return nil
 }
 
@@ -595,12 +603,9 @@ func (c *Client) standardCleanupVirtualMedia(ctx context.Context, source bootmed
 		}
 
 		if sameMediaCapability(device.image, source.URL) {
-			// An owned image without Inserted may still be mounting after a
-			// canceled request. Keep ownership until it settles or is cleared.
-			if !device.inserted {
-				return fmt.Errorf("virtual media %s reports the owned image without insertion; cannot verify cleanup while insertion may be pending", device.path)
-			}
-
+			// Always complete an explicit eject, even when Inserted is false.
+			// The image may be pending or left stale by a previous eject whose
+			// cleanup status was not saved. Reissuing detach is restart-safe.
 			if err := c.ejectVirtualMedia(ctx, device); err != nil {
 				return err
 			}

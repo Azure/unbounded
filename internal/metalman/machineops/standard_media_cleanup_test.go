@@ -4,6 +4,7 @@
 package machineops
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/metalman/redfish"
@@ -254,7 +256,11 @@ func TestStandardVirtualMediaCleanupRetainsPendingInsertion(t *testing.T) {
 			// The BMC may still have the URL from before a serve-host change.
 			image = strings.Replace(image, "10.0.0.1", "10.0.0.99", 1)
 
-			var state, ejects atomic.Int32
+			var (
+				state, ejects atomic.Int32
+				pendingEject  atomic.Bool
+			)
+			pendingEject.Store(true)
 
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 				var body any
@@ -268,13 +274,8 @@ func TestStandardVirtualMediaCleanupRetainsPendingInsertion(t *testing.T) {
 				case "/redfish/v1/Systems/1/VirtualMedia":
 					body = map[string]any{"Members": []map[string]string{{"@odata.id": "/redfish/v1/Systems/1/VirtualMedia/1"}}}
 				case "/redfish/v1/Systems/1/VirtualMedia/1":
-					mediaImage := image
-					if state.Load() == 2 {
-						mediaImage = ""
-					}
-
 					body = map[string]any{
-						"MediaTypes": []string{"CD"}, "Image": mediaImage, "Inserted": state.Load() == 1,
+						"MediaTypes": []string{"CD"}, "Image": image, "Inserted": state.Load() == 1,
 						"Actions": map[string]any{"#VirtualMedia.EjectMedia": map[string]string{
 							"target": "/redfish/v1/Systems/1/VirtualMedia/1/Actions/VirtualMedia.EjectMedia",
 						}},
@@ -282,6 +283,13 @@ func TestStandardVirtualMediaCleanupRetainsPendingInsertion(t *testing.T) {
 				case "/redfish/v1/Systems/1/VirtualMedia/1/Actions/VirtualMedia.EjectMedia":
 					require.Equal(t, http.MethodPost, req.Method)
 					ejects.Add(1)
+
+					if pendingEject.Load() {
+						w.WriteHeader(http.StatusAccepted)
+						return
+					}
+
+					// Firmware retains the image URL after a completed detach.
 					state.Store(2)
 					w.WriteHeader(http.StatusNoContent)
 
@@ -327,14 +335,42 @@ func TestStandardVirtualMediaCleanupRetainsPendingInsertion(t *testing.T) {
 			require.False(t, current.Status.Targets[0].BootMedia.StagedDeleted)
 			require.False(t, current.Status.Targets[0].BootMedia.Released)
 			require.Equal(t, []string{"prepare"}, d.calls)
-			require.Zero(t, ejects.Load())
+			require.EqualValues(t, 2, ejects.Load())
 
 			state.Store(1)
+			pendingEject.Store(false)
+
+			base, ok := r.Client.(client.WithWatch)
+			require.True(t, ok)
+
+			r.Client = interceptor.NewClient(base, interceptor.Funcs{
+				SubResourceUpdate: func(context.Context, client.Client, string, client.Object, ...client.SubResourceUpdateOption) error {
+					return errors.New("save Cleaned failed")
+				},
+			})
+			_, err = r.Reconcile(t.Context(), request)
+			require.ErrorContains(t, err, "save Cleaned failed")
+			require.EqualValues(t, 3, ejects.Load())
+			require.EqualValues(t, 2, state.Load())
+			require.NoError(t, base.Get(t.Context(), request.NamespacedName, current))
+			require.Contains(t, current.Finalizers, mediaFinalizer)
+			require.False(t, current.Status.Targets[0].BootMedia.Cleaned)
+			require.False(t, current.Status.Targets[0].BootMedia.StagedDeleted)
+			require.False(t, current.Status.Targets[0].BootMedia.Released)
+			require.Equal(t, []string{"prepare"}, d.calls)
+
+			// Neither client nor controller remembers the successful eject.
+			bmc.Close()
+			bmc, err = redfish.Dial(t.Context(), srv.URL, "", "admin", "secret", "1")
+			require.NoError(t, err)
+			t.Cleanup(bmc.Close)
+			r = testReconciler(base, standardMediaTestClient{Client: bmc}, r.Site)
+			r.BootMedia = d
 
 			current = mediaStep(t, r, op.Name)
 			require.True(t, current.Status.Targets[0].BootMedia.Cleaned)
 			require.False(t, current.Status.Targets[0].BootMedia.Released)
-			require.EqualValues(t, 1, ejects.Load())
+			require.EqualValues(t, 4, ejects.Load())
 			require.EqualValues(t, 2, state.Load())
 			require.Equal(t, []string{"prepare"}, d.calls)
 			current = mediaStep(t, r, op.Name)
