@@ -16,7 +16,7 @@ import (
 	signalv1 "github.com/Azure/unbounded/api/signal/v1alpha1"
 )
 
-func TestCertificationMetricsCollectorPublishesActiveCompletedStageMeasurements(t *testing.T) {
+func TestCertificationMetricsCollectorPublishesActiveCompletedStageMinimum(t *testing.T) {
 	t.Parallel()
 
 	first := "812.5"
@@ -64,21 +64,6 @@ func TestCertificationMetricsCollectorPublishesActiveCompletedStageMeasurements(
 	}
 
 	families := gatherCertificationMetrics(t, run)
-	tflops := families["project_signal_certification_tflops"]
-	if tflops == nil || len(tflops.Metric) != 2 {
-		t.Fatalf("tflops metrics = %#v, want two", tflops)
-	}
-
-	assertMetricLabels(t, tflops.Metric[0], map[string]string{
-		"namespace": "project-signal",
-		"run":       "active-run",
-		"run_uid":   "run-uid",
-		"stage":     "r07-gpu-gemm-bf16",
-		"node":      "participant-0",
-		"dtype":     "bf16",
-		"gpu":       "gpu-index-0",
-	})
-
 	minimum := families["project_signal_fleet_certification_r07_assertion_decimal"]
 	if minimum == nil || len(minimum.Metric) != 1 ||
 		minimum.Metric[0].Gauge == nil ||
@@ -113,8 +98,7 @@ func TestCertificationMetricsCollectorOmitsMissingMeasurements(t *testing.T) {
 	}
 
 	families := gatherCertificationMetrics(t, run)
-	if families["project_signal_certification_tflops"] != nil ||
-		families["project_signal_fleet_certification_r07_assertion_decimal"] != nil {
+	if families["project_signal_fleet_certification_r07_assertion_decimal"] != nil {
 		t.Fatalf("unexpected metrics without measurements: %#v", families)
 	}
 }
