@@ -133,3 +133,4 @@ jobs:
       tags: ${{ needs.resolve.outputs.tag }}
       build-args: |
         VERSION=${{ needs.resolve.outputs.tag }}
+        GIT_COMMIT=${{ github.sha }}
