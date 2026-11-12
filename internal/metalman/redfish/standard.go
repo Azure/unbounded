@@ -248,6 +248,7 @@ func retryAfter(header http.Header) time.Duration {
 func licenseRequired(data []byte) bool {
 	var body struct {
 		Error struct {
+			Code         string `json:"code"`
 			ExtendedInfo []struct {
 				MessageID string `json:"MessageId"`
 			} `json:"@Message.ExtendedInfo"`
@@ -260,9 +261,22 @@ func licenseRequired(data []byte) bool {
 		return false
 	}
 
+	isLicense := func(messageID string) bool {
+		parts := strings.Split(messageID, ".")
+		switch parts[len(parts)-1] {
+		case "LicenseKeyRequired", "LicenseRequired", "OemLicenseNotPassed":
+			return true
+		default:
+			return false
+		}
+	}
+
+	if isLicense(body.Error.Code) {
+		return true
+	}
+
 	for _, info := range append(body.Error.ExtendedInfo, body.ExtendedInfo...) {
-		parts := strings.Split(info.MessageID, ".")
-		if name := parts[len(parts)-1]; name == "LicenseKeyRequired" || name == "LicenseRequired" {
+		if isLicense(info.MessageID) {
 			return true
 		}
 	}

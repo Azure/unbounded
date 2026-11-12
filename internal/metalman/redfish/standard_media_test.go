@@ -390,6 +390,53 @@ func TestStandardVirtualMediaCapabilities(t *testing.T) {
 	}
 }
 
+func TestStandardVirtualMediaForbidden(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		body        string
+		unsupported bool
+	}{
+		{"SMC code", `{"error":{"code":"SMC.1.0.OemLicenseNotPassed"}}`, true},
+		{"SMC nested extended info", `{"error":{"code":"Base.1.0.GeneralError","@Message.ExtendedInfo":[{"MessageId":"SMC.1.0.OemLicenseNotPassed"}]}}`, true},
+		{"SMC top-level extended info", `{"@Message.ExtendedInfo":[{"MessageId":"SMC.1.0.OemLicenseNotPassed"}]}`, true},
+		{"ordinary forbidden", `{"error":{"code":"Base.1.19.InsufficientPrivilege"}}`, false},
+	} {
+		for _, operation := range []string{"mount", "boot"} {
+			t.Run(tc.name+"/"+operation, func(t *testing.T) {
+				f, c := newFakeILO(t)
+				f.errorBody = tc.body
+				f.insertStatus, f.patchStatus = http.StatusForbidden, http.StatusForbidden
+
+				require.NoError(t, c.StageVirtualMedia(t.Context(), standardMedia))
+				require.Empty(t, f.mutations)
+
+				var err error
+				if operation == "mount" {
+					err = c.MountVirtualMedia(t.Context(), standardMedia)
+					require.Len(t, f.inserts, 1)
+				} else {
+					err = c.SetVirtualMediaBoot(t.Context())
+					require.Empty(t, f.inserts)
+				}
+
+				require.ErrorContains(t, err, "HTTP 403")
+				require.ErrorContains(t, err, tc.body)
+
+				if tc.unsupported {
+					require.ErrorIs(t, err, ErrUnsupported)
+				} else {
+					require.NotErrorIs(t, err, ErrUnsupported)
+				}
+
+				require.Len(t, f.mutations, 1)
+				require.Empty(t, f.ejects)
+				require.False(t, f.inserted)
+				require.Equal(t, "Disabled", f.boot["BootSourceOverrideEnabled"])
+			})
+		}
+	}
+}
+
 func TestStandardVirtualMediaBootTargets(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
