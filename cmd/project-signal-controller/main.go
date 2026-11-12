@@ -19,6 +19,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	"sigs.k8s.io/controller-runtime/pkg/metrics"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	signalv1 "github.com/Azure/unbounded/api/signal/v1alpha1"
@@ -148,6 +149,8 @@ func run(ctx context.Context, cfg config) error {
 	if err != nil {
 		return fmt.Errorf("create manager: %w", err)
 	}
+
+	metrics.Registry.MustRegister(projectsignal.NewCertificationMetricsCollector(mgr.GetClient()))
 
 	evidence, err := projectsignal.NewKubernetesEvidenceStore(
 		mgr.GetClient(),

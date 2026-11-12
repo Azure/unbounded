@@ -2541,16 +2541,39 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		}
 
 		checkStatuses := compactCheckStatuses(runningCheckStatuses(workflow, &run))
+		identity := run.Status.Evidence.Identity
+		if run.Spec.ResolvedPlan != nil {
+			stages, runnerImages, stageErr := r.completedStageSummaries(ctx, workflow, &run)
+			if stageErr != nil {
+				return ctrl.Result{}, stageErr
+			}
+
+			partial, _, _, identityErr := r.resolvedQualificationEvidenceIdentity(
+				ctx,
+				&run,
+				stages,
+				runnerImages,
+				"Inconclusive",
+				"RunActive",
+			)
+			if identityErr != nil {
+				return ctrl.Result{}, identityErr
+			}
+
+			identity = partial
+		}
 
 		if run.Status.Phase != signalv1.RunPhaseRunning ||
 			run.Status.Workflow.Phase != phase ||
-			!reflect.DeepEqual(run.Status.Checks, checkStatuses) {
+			!reflect.DeepEqual(run.Status.Checks, checkStatuses) ||
+			!reflect.DeepEqual(run.Status.Evidence.Identity, identity) {
 			before := run.DeepCopy()
 			run.Status.Phase = signalv1.RunPhaseRunning
 
 			run.Status.Workflow.Phase = phase
 
 			run.Status.Checks = checkStatuses
+			run.Status.Evidence.Identity = identity
 
 			return ctrl.Result{}, r.Status().Patch(ctx, &run, client.MergeFrom(before))
 		}
@@ -3462,6 +3485,53 @@ func (r *RunReconciler) terminalStageSummaries(
 	return stages, runnerImages, verdict, reason
 }
 
+func (r *RunReconciler) completedStageSummaries(
+	ctx context.Context,
+	workflow *unstructured.Unstructured,
+	run *signalv1.CertificationRun,
+) ([]signalv1.StageEvidenceSummary, []string, error) {
+	stages := make([]signalv1.StageEvidenceSummary, 0, resolvedStageCount(*run.Spec.ResolvedPlan))
+	runnerImages := make([]string, 0)
+	seenRunnerImages := map[string]struct{}{}
+
+	for phaseIndex := range run.Spec.ResolvedPlan.Phases {
+		phase := &run.Spec.ResolvedPlan.Phases[phaseIndex]
+		for stageIndex := range phase.Stages {
+			stage := &phase.Stages[stageIndex]
+			summary, stageRunnerImages, err := r.readStageResult(
+				ctx,
+				workflow,
+				run,
+				int32(phaseIndex),
+				int32(stageIndex),
+				phase.Role,
+				stage,
+			)
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+
+			if err != nil {
+				return nil, nil, err
+			}
+
+			stages = append(stages, *summary)
+			for _, image := range stageRunnerImages {
+				if _, exists := seenRunnerImages[image]; exists {
+					continue
+				}
+
+				seenRunnerImages[image] = struct{}{}
+				runnerImages = append(runnerImages, image)
+			}
+		}
+	}
+
+	sort.Strings(runnerImages)
+
+	return stages, runnerImages, nil
+}
+
 func (r *RunReconciler) readStageResult(
 	ctx context.Context,
 	workflow *unstructured.Unstructured,
@@ -3653,6 +3723,29 @@ func validateStageEvidenceSummary(
 		summary.InconclusiveInvocations+
 		summary.CanceledInvocations {
 		return errors.New("stage invocation outcome counts are inconsistent")
+	}
+
+	if len(summary.Measurements) > signalv1.MaxTestMetrics {
+		return errors.New("stage evidence contains too many typed measurements")
+	}
+
+	metricDefinitions := make(map[string]signalv1.TestMetricDefinition, len(stage.Test.Metrics))
+	for _, definition := range stage.Test.Metrics {
+		metricDefinitions[definition.Name] = definition
+	}
+
+	seenMeasurements := make(map[string]struct{}, len(summary.Measurements))
+	for _, measurement := range summary.Measurements {
+		definition, exists := metricDefinitions[measurement.Name]
+		if !exists || measurement.Unit != definition.Unit {
+			return fmt.Errorf("stage measurement %q does not match the immutable metric schema", measurement.Name)
+		}
+
+		if _, duplicate := seenMeasurements[measurement.Name]; duplicate {
+			return fmt.Errorf("stage measurement %q is repeated", measurement.Name)
+		}
+
+		seenMeasurements[measurement.Name] = struct{}{}
 	}
 
 	seenParticipants := make(map[int32]struct{}, len(summary.Participants))
