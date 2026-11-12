@@ -560,6 +560,10 @@ func summarizeStageExecution(
 	}
 
 	summary.Assertions = assertions
+	summary.Measurements = stageMeasurements(
+		request.Stage.Test.Metrics,
+		envelopes[len(envelopes)-1].Measurements,
+	)
 
 	invocationEvidence, err := boundedInvocationReferences(envelopes)
 	if err != nil {
@@ -570,6 +574,32 @@ func summarizeStageExecution(
 	summary.Verdict = stageVerdict(request, summary, assertionsPass)
 
 	return summary, nil
+}
+
+func stageMeasurements(
+	definitions []signalv1.TestMetricDefinition,
+	measurements []signalv1.MetricMeasurement,
+) []signalv1.MetricMeasurement {
+	allowed := make(map[string]signalv1.TestMetricDefinition, len(definitions))
+	for _, definition := range definitions {
+		allowed[definition.Name] = definition
+	}
+
+	result := make([]signalv1.MetricMeasurement, 0, min(len(measurements), len(allowed)))
+	for _, measurement := range measurements {
+		definition, exists := allowed[measurement.Name]
+		if !exists || measurement.Unit != definition.Unit {
+			continue
+		}
+
+		result = append(result, *measurement.DeepCopy())
+	}
+
+	sort.Slice(result, func(left, right int) bool {
+		return result[left].Name < result[right].Name
+	})
+
+	return result
 }
 
 func summarizeStageParticipants(

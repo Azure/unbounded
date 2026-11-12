@@ -46,7 +46,10 @@ func TestLegacyMeasurementsRedactRawIdentity(t *testing.T) {
 		"deviceInventoryDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		"gpuUUID": "GPU-raw",
 		"nodeName": "raw-node"
-	}`)
+	}`, []signalv1.TestMetricDefinition{{
+		Name: "observedGpuCount",
+		Unit: "devices",
+	}})
 	if err != nil {
 		t.Fatalf("legacyMeasurements() error = %v", err)
 	}
@@ -66,6 +69,12 @@ func TestLegacyMeasurementsRedactRawIdentity(t *testing.T) {
 		!strings.Contains(joined, "driverVersionSet") ||
 		!strings.Contains(joined, "deviceInventoryDigest") {
 		t.Fatalf("legacy measurements omitted approved GPU inventory metrics: %s", joined)
+	}
+
+	for _, measurement := range measurements {
+		if measurement.Name == "observedGpuCount" && measurement.Unit != "devices" {
+			t.Fatalf("observedGpuCount unit = %q, want devices", measurement.Unit)
+		}
 	}
 }
 

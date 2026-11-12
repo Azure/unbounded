@@ -1640,7 +1640,7 @@ func convertLegacyInvocationResult(
 		return signalv1.InvocationResultEnvelope{}, errors.New("legacy result conversion supports one participant")
 	}
 
-	measurements, err := legacyMeasurements(legacy.Measurements)
+	measurements, err := legacyMeasurements(legacy.Measurements, invocation.Stage.Test.Metrics)
 	if err != nil {
 		return signalv1.InvocationResultEnvelope{}, err
 	}
@@ -1720,10 +1720,18 @@ func convertLegacyInvocationResult(
 	}, nil
 }
 
-func legacyMeasurements(content string) ([]signalv1.MetricMeasurement, error) {
+func legacyMeasurements(
+	content string,
+	definitions []signalv1.TestMetricDefinition,
+) ([]signalv1.MetricMeasurement, error) {
 	var values map[string]any
 	if err := json.Unmarshal([]byte(content), &values); err != nil {
 		return nil, fmt.Errorf("decode legacy measurements: %w", err)
+	}
+
+	units := make(map[string]string, len(definitions))
+	for _, definition := range definitions {
+		units[definition.Name] = definition.Unit
 	}
 
 	result := make([]signalv1.MetricMeasurement, 0, len(values))
@@ -1740,7 +1748,11 @@ func legacyMeasurements(content string) ([]signalv1.MetricMeasurement, error) {
 			continue
 		}
 
-		result = append(result, signalv1.MetricMeasurement{Name: name, Value: typed})
+		result = append(result, signalv1.MetricMeasurement{
+			Name:  name,
+			Value: typed,
+			Unit:  units[name],
+		})
 	}
 
 	sortMeasurements(result)
