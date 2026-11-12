@@ -48,8 +48,10 @@ fleet scheduling are intentionally deferred.
 - `project-signal-prometheus` scrapes controller metrics every 15 seconds and
   retains up to 24 hours or 1 GiB in namespace-local ephemeral storage.
 
-Argo Workflows is required. The Kubeflow MPI Operator is required only for
-legacy Suites that still contain an `MPIJob` check.
+Argo Workflows is required. The Kubeflow MPI Operator is required when a
+Suite's bound WorkflowTemplates create `MPIJob` resources, including the
+private R03 and R05 certification stages; the public native stage model does
+not otherwise require it.
 
 ## First deployment
 
