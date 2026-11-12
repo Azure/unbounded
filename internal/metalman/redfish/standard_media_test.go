@@ -1053,6 +1053,67 @@ func TestStandardVirtualMediaPendingImageRetry(t *testing.T) {
 	require.Empty(t, f.mutations)
 }
 
+func TestStandardVirtualMediaCleanupAfterInterruptedInsert(t *testing.T) {
+	old := taskPollInterval
+	taskPollInterval = time.Millisecond
+
+	t.Cleanup(func() { taskPollInterval = old })
+
+	for _, outcome := range []string{"cancel", "timeout"} {
+		for _, changedHost := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/changedHost=%t", outcome, changedHost), func(t *testing.T) {
+				f, c := newFakeILO(t)
+				f.async = "unmonitored"
+
+				ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+				defer cancel()
+
+				if outcome == "cancel" {
+					f.cancelInsert = cancel
+				}
+
+				err := c.MountVirtualMedia(ctx, standardMedia)
+				if outcome == "cancel" {
+					require.ErrorIs(t, err, context.Canceled)
+				} else {
+					require.ErrorIs(t, err, context.DeadlineExceeded)
+				}
+
+				f.mu.Lock()
+				f.cancelInsert = nil
+				require.Equal(t, testISOURL, f.image)
+				require.False(t, f.inserted)
+				require.Len(t, f.inserts, 1)
+				f.mu.Unlock()
+
+				source := standardMedia
+				if changedHost {
+					source.URL = strings.Replace(testISOURL, "192.0.2.10", "192.0.2.99", 1)
+				}
+
+				for range 2 {
+					err = c.CleanupVirtualMedia(t.Context(), source)
+					require.ErrorContains(t, err, "insertion may be pending")
+					require.NotErrorIs(t, err, ErrUnsupported)
+				}
+
+				f.mu.Lock()
+				require.Empty(t, f.ejects)
+				require.Len(t, f.mutations, 1)
+				f.inserted = true
+				f.mu.Unlock()
+
+				require.NoError(t, c.CleanupVirtualMedia(t.Context(), source))
+				require.Equal(t, []string{testISOURL}, f.ejects)
+				require.False(t, f.inserted)
+				require.Empty(t, f.image)
+				require.NoError(t, c.CleanupVirtualMedia(t.Context(), source))
+				require.Len(t, f.ejects, 1)
+			})
+		}
+	}
+}
+
 func TestStandardVirtualMediaRetryAfterCanceledInsert(t *testing.T) {
 	old := taskPollInterval
 	taskPollInterval = time.Millisecond
@@ -1285,6 +1346,37 @@ func TestStandardVirtualMediaCleanupAlreadyEmpty(t *testing.T) {
 
 	require.NoError(t, c.CleanupVirtualMedia(t.Context(), standardMedia))
 	require.Empty(t, f.mutations)
+}
+
+func TestStandardVirtualMediaCleanupPendingImageCleared(t *testing.T) {
+	f, c := newFakeILO(t)
+	f.image = testISOURL
+
+	require.ErrorContains(t, c.CleanupVirtualMedia(t.Context(), standardMedia), "insertion may be pending")
+
+	f.image = ""
+
+	require.NoError(t, c.CleanupVirtualMedia(t.Context(), standardMedia))
+	require.Empty(t, f.mutations)
+}
+
+func TestStandardVirtualMediaCleanupUnrelatedPendingImage(t *testing.T) {
+	for _, image := range []string{
+		"http://192.0.2.10/other.iso",
+		strings.Replace(testISOURL, "/bootmedia/", "/prefix/bootmedia/", 1),
+		testISOURL + "?other",
+		strings.Replace(testISOURL, "0123456789abcdef0123456789abcdef", "1123456789abcdef0123456789abcdef", 1),
+	} {
+		t.Run(image, func(t *testing.T) {
+			f, c := newFakeILO(t)
+			f.image = image
+
+			require.NoError(t, c.CleanupVirtualMedia(t.Context(), standardMedia))
+			require.Equal(t, image, f.image)
+			require.False(t, f.inserted)
+			require.Empty(t, f.mutations)
+		})
+	}
 }
 
 func TestStandardVirtualMediaCleanupIncompleteDiscovery(t *testing.T) {

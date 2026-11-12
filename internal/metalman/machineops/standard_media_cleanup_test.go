@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -240,4 +241,108 @@ func TestStandardVirtualMediaPreMountCleanupRequiresClient(t *testing.T) {
 	require.Contains(t, current.Finalizers, mediaFinalizer)
 	require.False(t, current.Status.Targets[0].BootMedia.Cleaned)
 	require.Equal(t, []string{"prepare"}, d.calls)
+}
+
+func TestStandardVirtualMediaCleanupRetainsPendingInsertion(t *testing.T) {
+	for _, ending := range []string{"terminal", "deleted", "failed target"} {
+		t.Run(ending, func(t *testing.T) {
+			r, d, _, op := mediaFixture(t)
+			mediaStep(t, r, op.Name)
+			current := mediaStep(t, r, op.Name)
+			image, err := d.SourceURL(current.Status.Targets[0].BootMedia.ID)
+			require.NoError(t, err)
+			// The BMC may still have the URL from before a serve-host change.
+			image = strings.Replace(image, "10.0.0.1", "10.0.0.99", 1)
+
+			var state, ejects atomic.Int32
+
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				var body any
+
+				switch req.URL.Path {
+				case "/redfish/v1/Systems/1":
+					body = map[string]any{
+						"Boot":         map[string]string{"BootSourceOverrideTarget": "None", "BootSourceOverrideEnabled": "Disabled"},
+						"VirtualMedia": map[string]string{"@odata.id": "/redfish/v1/Systems/1/VirtualMedia"},
+					}
+				case "/redfish/v1/Systems/1/VirtualMedia":
+					body = map[string]any{"Members": []map[string]string{{"@odata.id": "/redfish/v1/Systems/1/VirtualMedia/1"}}}
+				case "/redfish/v1/Systems/1/VirtualMedia/1":
+					mediaImage := image
+					if state.Load() == 2 {
+						mediaImage = ""
+					}
+
+					body = map[string]any{
+						"MediaTypes": []string{"CD"}, "Image": mediaImage, "Inserted": state.Load() == 1,
+						"Actions": map[string]any{"#VirtualMedia.EjectMedia": map[string]string{
+							"target": "/redfish/v1/Systems/1/VirtualMedia/1/Actions/VirtualMedia.EjectMedia",
+						}},
+					}
+				case "/redfish/v1/Systems/1/VirtualMedia/1/Actions/VirtualMedia.EjectMedia":
+					require.Equal(t, http.MethodPost, req.Method)
+					ejects.Add(1)
+					state.Store(2)
+					w.WriteHeader(http.StatusNoContent)
+
+					return
+				default:
+					http.NotFound(w, req)
+					return
+				}
+
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(body)
+			}))
+			t.Cleanup(srv.Close)
+			bmc, err := redfish.Dial(t.Context(), srv.URL, "", "admin", "secret", "1")
+			require.NoError(t, err)
+			t.Cleanup(bmc.Close)
+			r.PowerClients = standardMediaTestClient{Client: bmc}
+			current.Status.Targets[0].BootMedia.Phase = "Mounting"
+
+			switch ending {
+			case "terminal":
+				current.Status.Phase = v1alpha3.OperationPhaseFailed
+			case "failed target":
+				current.Status.Targets[0].Phase = v1alpha3.OperationPhaseFailed
+			}
+
+			require.NoError(t, r.Status().Update(t.Context(), current))
+
+			if ending == "deleted" {
+				require.NoError(t, r.Delete(t.Context(), current))
+			}
+
+			request := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(op)}
+
+			for range 2 {
+				_, err = r.Reconcile(t.Context(), request)
+				require.ErrorContains(t, err, "insertion may be pending")
+			}
+
+			require.NoError(t, r.Get(t.Context(), request.NamespacedName, current))
+			require.Contains(t, current.Finalizers, mediaFinalizer)
+			require.False(t, current.Status.Targets[0].BootMedia.Cleaned)
+			require.False(t, current.Status.Targets[0].BootMedia.StagedDeleted)
+			require.False(t, current.Status.Targets[0].BootMedia.Released)
+			require.Equal(t, []string{"prepare"}, d.calls)
+			require.Zero(t, ejects.Load())
+
+			state.Store(1)
+
+			current = mediaStep(t, r, op.Name)
+			require.True(t, current.Status.Targets[0].BootMedia.Cleaned)
+			require.False(t, current.Status.Targets[0].BootMedia.Released)
+			require.EqualValues(t, 1, ejects.Load())
+			require.EqualValues(t, 2, state.Load())
+			require.Equal(t, []string{"prepare"}, d.calls)
+			current = mediaStep(t, r, op.Name)
+			require.True(t, current.Status.Targets[0].BootMedia.StagedDeleted)
+			require.False(t, current.Status.Targets[0].BootMedia.Released)
+			current = mediaStep(t, r, op.Name)
+			require.True(t, current.Status.Targets[0].BootMedia.Released)
+			require.Equal(t, []string{"prepare", "release"}, d.calls)
+		})
+	}
 }

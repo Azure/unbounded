@@ -594,7 +594,13 @@ func (c *Client) standardCleanupVirtualMedia(ctx context.Context, source bootmed
 			return fmt.Errorf("virtual media %s reports inserted media with an unknown image; cannot verify cleanup ownership", device.path)
 		}
 
-		if device.inserted && sameMediaCapability(device.image, source.URL) {
+		if sameMediaCapability(device.image, source.URL) {
+			// An owned image without Inserted may still be mounting after a
+			// canceled request. Keep ownership until it settles or is cleared.
+			if !device.inserted {
+				return fmt.Errorf("virtual media %s reports the owned image without insertion; cannot verify cleanup while insertion may be pending", device.path)
+			}
+
 			if err := c.ejectVirtualMedia(ctx, device); err != nil {
 				return err
 			}
