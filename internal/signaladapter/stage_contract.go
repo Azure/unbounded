@@ -95,9 +95,15 @@ func (r *Runner) ResolveStageRequest(
 		return StageExecutionRequest{}, fmt.Errorf("derive stage qualification identity: %w", err)
 	}
 
+	var adapterImage string
+	if run.Spec.PlanProvenance != nil {
+		adapterImage = run.Spec.PlanProvenance.AdapterImage
+	}
+
 	resolved := StageExecutionRequest{
 		RunUID:                         run.UID,
 		PlanDigest:                     run.Spec.PlanDigest,
+		AdapterImage:                   adapterImage,
 		PhaseOrder:                     int32(request.PhaseIndex),
 		StageOrder:                     int32(request.StageIndex),
 		PhaseRole:                      phase.Role,

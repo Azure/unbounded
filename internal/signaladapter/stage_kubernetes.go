@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -41,10 +42,9 @@ const (
 	stageSharedMemorySize             = "1Gi"
 	liveTelemetryVolumeName           = "live-telemetry"
 	liveTelemetryMountPath            = "/live-telemetry"
-	liveTelemetryMetricsPath          = liveTelemetryMountPath + "/metrics.prom"
+	liveTelemetryRecordsPath          = liveTelemetryMountPath + "/records.jsonl"
 	liveTelemetryDonePath             = liveTelemetryMountPath + "/done"
 	liveTelemetryPort                 = 9464
-	liveTelemetryMaxBytes             = 64 * 1024
 	liveTelemetryVolumeBytes          = 256 * 1024
 	liveTelemetryFinalScrapeGrace     = 10 * time.Second
 )
@@ -425,18 +425,26 @@ func (e *KubernetesStageExecutor) stagePod(
 		Resources: driverResources(driver),
 	}
 
-	liveTelemetry := stageStreamsLiveThroughput(invocation.Stage)
+	telemetryContract, liveTelemetry, err := metricTelemetryContract(invocation.Stage.Test.Metrics)
+	if err != nil {
+		return nil, err
+	}
+
 	if liveTelemetry {
+		if invocation.Stage.Test.Driver.Type != signalv1.TestDriverTypeScript {
+			return nil, errors.New("live metric telemetry currently requires a Script driver")
+		}
+
+		if !runnerImagePattern.MatchString(invocation.AdapterImage) {
+			return nil, errors.New("live metric telemetry requires the immutable adapter image")
+		}
+
 		container.Env = append(container.Env,
-			corev1.EnvVar{Name: "PROJECT_SIGNAL_RUN_NAME", Value: e.RunName},
-			corev1.EnvVar{Name: "PROJECT_SIGNAL_NAMESPACE", Value: e.Namespace},
-			corev1.EnvVar{Name: "PROJECT_SIGNAL_LIVE_METRICS_FILE", Value: liveTelemetryMetricsPath},
+			corev1.EnvVar{Name: "PROJECT_SIGNAL_METRICS_FILE", Value: liveTelemetryRecordsPath},
 			corev1.EnvVar{Name: "PROJECT_SIGNAL_LIVE_METRICS_DONE", Value: liveTelemetryDonePath},
 			corev1.EnvVar{
-				Name: "PROJECT_SIGNAL_NODE_NAME",
-				ValueFrom: &corev1.EnvVarSource{
-					FieldRef: &corev1.ObjectFieldSelector{FieldPath: "spec.nodeName"},
-				},
+				Name:  "PROJECT_SIGNAL_LIVE_METRICS_PORT",
+				Value: strconv.Itoa(liveTelemetryPort),
 			},
 		)
 	}
@@ -525,7 +533,14 @@ func (e *KubernetesStageExecutor) stagePod(
 		}
 		pod.Spec.Containers = append(
 			pod.Spec.Containers,
-			liveTelemetrySidecar(stageDriverImage(driver)),
+			liveTelemetrySidecar(
+				invocation.AdapterImage,
+				telemetryContract,
+				e.Namespace,
+				e.RunName,
+				invocation,
+				role,
+			),
 		)
 		pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
 			Name: liveTelemetryVolumeName,
@@ -576,78 +591,40 @@ func (e *KubernetesStageExecutor) stagePod(
 	return pod, nil
 }
 
-func stageStreamsLiveThroughput(stage signalv1.ResolvedStagePlan) bool {
-	if stage.Test.Driver.Type != signalv1.TestDriverTypeScript {
-		return false
-	}
-
-	for _, metric := range stage.Test.Metrics {
-		if metric.Type == signalv1.MetricValueTypeThroughput && metric.Unit == "TFLOP/s" {
-			return true
-		}
-	}
-
-	return false
-}
-
-func liveTelemetrySidecar(image string) corev1.Container {
+func liveTelemetrySidecar(
+	image string,
+	contractJSON string,
+	namespace string,
+	runName string,
+	invocation StageInvocation,
+	role string,
+) corev1.Container {
 	return corev1.Container{
 		Name:    "live-telemetry",
 		Image:   image,
-		Command: []string{"python3", "-c"},
-		Args: []string{fmt.Sprintf(`
-import http.server
-import os
-import stat
-import time
-
-metrics_path = %q
-done_path = %q
-maximum_bytes = %d
-final_grace_seconds = %f
-
-class Handler(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path != "/metrics":
-            self.send_error(404)
-            return
-        content = b""
-        try:
-            metadata = os.lstat(metrics_path)
-            if stat.S_ISREG(metadata.st_mode) and metadata.st_size <= maximum_bytes:
-                with open(metrics_path, "rb") as stream:
-                    content = stream.read(maximum_bytes + 1)
-                if len(content) > maximum_bytes:
-                    content = b""
-        except FileNotFoundError:
-            pass
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain; version=0.0.4")
-        self.send_header("Content-Length", str(len(content)))
-        self.end_headers()
-        self.wfile.write(content)
-
-    def log_message(self, _format, *_args):
-        return
-
-server = http.server.ThreadingHTTPServer(("0.0.0.0", %d), Handler)
-server.timeout = 1
-deadline = None
-while True:
-    server.handle_request()
-    if os.path.exists(done_path):
-        if deadline is None:
-            deadline = time.monotonic() + final_grace_seconds
-        elif time.monotonic() >= deadline:
-            break
-server.server_close()
-`,
-			liveTelemetryMetricsPath,
-			liveTelemetryDonePath,
-			liveTelemetryMaxBytes,
-			liveTelemetryFinalScrapeGrace.Seconds(),
-			liveTelemetryPort,
-		)},
+		Command: []string{"/project-signal-adapter"},
+		Args: []string{
+			"metric-proxy",
+			"--contract-json=" + contractJSON,
+			"--records=" + liveTelemetryRecordsPath,
+			"--done=" + liveTelemetryDonePath,
+			"--port=" + strconv.Itoa(liveTelemetryPort),
+			"--final-grace=" + liveTelemetryFinalScrapeGrace.String(),
+		},
+		Env: []corev1.EnvVar{
+			{Name: "PROJECT_SIGNAL_NAMESPACE", Value: namespace},
+			{Name: "PROJECT_SIGNAL_RUN_NAME", Value: runName},
+			{Name: "PROJECT_SIGNAL_RUN_UID", Value: string(invocation.RunUID)},
+			{Name: "PROJECT_SIGNAL_STAGE_ID", Value: invocation.Stage.Name},
+			{Name: "PROJECT_SIGNAL_INVOCATION_ID", Value: invocation.ID},
+			{Name: "PROJECT_SIGNAL_PARTICIPANT_ROLE", Value: role},
+			{
+				Name: "PROJECT_SIGNAL_NODE_NAME",
+				ValueFrom: &corev1.EnvVarSource{
+					FieldRef: &corev1.ObjectFieldSelector{FieldPath: "spec.nodeName"},
+				},
+			},
+		},
 		Ports: []corev1.ContainerPort{{
 			Name:          "live-metrics",
 			ContainerPort: liveTelemetryPort,
@@ -1884,9 +1861,9 @@ func legacyMeasurements(
 		return nil, fmt.Errorf("decode legacy measurements: %w", err)
 	}
 
-	units := make(map[string]string, len(definitions))
+	declared := make(map[string]signalv1.TestMetricDefinition, len(definitions))
 	for _, definition := range definitions {
-		units[definition.Name] = definition.Unit
+		declared[definition.Name] = definition
 	}
 
 	result := make([]signalv1.MetricMeasurement, 0, len(values))
@@ -1898,7 +1875,15 @@ func legacyMeasurements(
 			continue
 		}
 
+		definition, exists := declared[name]
 		typed, ok := legacyTypedValue(value)
+		unit := ""
+
+		if exists {
+			typed, ok = legacyTypedMetricValue(value, definition.Type)
+			unit = definition.Unit
+		}
+
 		if !ok {
 			continue
 		}
@@ -1906,13 +1891,72 @@ func legacyMeasurements(
 		result = append(result, signalv1.MetricMeasurement{
 			Name:  name,
 			Value: typed,
-			Unit:  units[name],
+			Unit:  unit,
 		})
 	}
 
 	sortMeasurements(result)
 
 	return result, nil
+}
+
+func legacyTypedMetricValue(
+	value any,
+	metricType signalv1.MetricValueType,
+) (signalv1.TypedValue, bool) {
+	switch metricType {
+	case signalv1.MetricValueTypeBoolean:
+		typed, ok := value.(bool)
+		if !ok {
+			return signalv1.TypedValue{}, false
+		}
+
+		return signalv1.TypedValue{
+			Type:         signalv1.TypedValueTypeBoolean,
+			BooleanValue: &typed,
+		}, true
+	case signalv1.MetricValueTypeStatus:
+		typed, ok := value.(string)
+		if !ok {
+			return signalv1.TypedValue{}, false
+		}
+
+		return signalv1.TypedValue{
+			Type:        signalv1.TypedValueTypeString,
+			StringValue: &typed,
+		}, true
+	case signalv1.MetricValueTypeCount:
+		number, ok := value.(float64)
+		if !ok || number != float64(int64(number)) {
+			return signalv1.TypedValue{}, false
+		}
+
+		integer := int64(number)
+
+		return signalv1.TypedValue{
+			Type:         signalv1.TypedValueTypeInteger,
+			IntegerValue: &integer,
+		}, true
+	case signalv1.MetricValueTypeGauge,
+		signalv1.MetricValueTypeRatio,
+		signalv1.MetricValueTypeThroughput,
+		signalv1.MetricValueTypeIOPS,
+		signalv1.MetricValueTypeBandwidth,
+		signalv1.MetricValueTypeLatency:
+		number, ok := value.(float64)
+		if !ok || math.IsNaN(number) || math.IsInf(number, 0) {
+			return signalv1.TypedValue{}, false
+		}
+
+		decimal := strconv.FormatFloat(number, 'f', -1, 64)
+
+		return signalv1.TypedValue{
+			Type:         signalv1.TypedValueTypeDecimal,
+			DecimalValue: &decimal,
+		}, true
+	default:
+		return legacyTypedValue(value)
+	}
 }
 
 func legacyTypedValue(value any) (signalv1.TypedValue, bool) {
@@ -2008,6 +2052,56 @@ if [ "sha256:$got" != "$want" ]; then
 else
   %s "$script"
   status=$?
+fi
+
+if [ -n "${PROJECT_SIGNAL_LIVE_METRICS_DONE:-}" ]; then
+  : > "$PROJECT_SIGNAL_LIVE_METRICS_DONE"
+  if ! python3 - "$results_dir/measurements.json" <<'PY_METRICS'
+import json
+import os
+import pathlib
+import sys
+import time
+import urllib.error
+import urllib.request
+
+measurements_path = pathlib.Path(sys.argv[1])
+measurements = {}
+if measurements_path.exists():
+    measurements = json.loads(measurements_path.read_text(encoding="utf-8"))
+    if not isinstance(measurements, dict):
+        raise SystemExit("measurements must be an object")
+final = None
+for _ in range(30):
+    try:
+        port = os.environ["PROJECT_SIGNAL_LIVE_METRICS_PORT"]
+        with urllib.request.urlopen("http://127.0.0.1:" + port + "/final", timeout=2) as response:
+            final = json.load(response)
+            break
+    except urllib.error.HTTPError as error:
+        if error.code == 202:
+            time.sleep(1)
+            continue
+        raise SystemExit("metric contract violation") from error
+    except OSError:
+        time.sleep(1)
+if final is None:
+    raise SystemExit("metric telemetry timeout")
+if not isinstance(final, dict):
+    raise SystemExit("final metric telemetry must be an object")
+if set(measurements) & set(final):
+    raise SystemExit("trusted metric telemetry collides with workload measurements")
+measurements.update(final)
+measurements_path.write_text(
+    json.dumps(measurements, sort_keys=True, separators=(",", ":")),
+    encoding="utf-8",
+)
+PY_METRICS
+  then
+    printf 'Inconclusive' > "$results_dir/verdict"
+    printf 'MetricContractViolation' > "$results_dir/reason"
+    status=2
+  fi
 fi
 
 if [ -f "$results_dir/verdict" ] || [ -f "$results_dir/reason" ] || [ -f "$results_dir/measurements.json" ]; then

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os/exec"
 	"strconv"
 	"strings"
 	"testing"
@@ -1332,6 +1333,13 @@ func TestScriptInvocationWrapperUsesApprovedLanguage(t *testing.T) {
 		!strings.Contains(python, `measurements.json`) {
 		t.Fatalf("python wrapper = %q", python)
 	}
+
+	command := exec.Command("sh", "-n")
+
+	command.Stdin = strings.NewReader(python)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("shell syntax error: %v\n%s", err, output)
+	}
 }
 
 func TestMergeWorkflowArgumentsPreservesApprovedDefaultsAndArtifacts(t *testing.T) {
@@ -1428,7 +1436,7 @@ func TestLegacyRunLabelsIncludeExactRunUID(t *testing.T) {
 	}
 }
 
-func TestStagePodStreamsScriptThroughputWithoutWorkloadCredentials(t *testing.T) {
+func TestStagePodStreamsDeclaredMetricsWithoutWorkloadCredentials(t *testing.T) {
 	t.Parallel()
 
 	scriptContent := "#!/bin/sh\nexit 0\n"
@@ -1440,7 +1448,15 @@ func TestStagePodStreamsScriptThroughputWithoutWorkloadCredentials(t *testing.T)
 		Type:        signalv1.MetricValueTypeThroughput,
 		Unit:        "TFLOP/s",
 		Required:    true,
+		Telemetry: &signalv1.TestMetricTelemetry{
+			Live:        signalv1.MetricLiveModeGaugeAndSamples,
+			Dimensions:  []signalv1.MetricDimensionName{"dtype", "gpu"},
+			SeriesLimit: 1,
+			SampleLimit: 2,
+			Evidence:    signalv1.MetricEvidenceMinimum,
+		},
 	}}
+	invocation.AdapterImage = "example.invalid/adapter@sha256:" + strings.Repeat("b", 64)
 	invocation.Stage.Test.Driver = signalv1.CertificationTestDriver{
 		Type: signalv1.TestDriverTypeScript,
 		Script: &signalv1.ScriptTestDriver{
@@ -1470,6 +1486,9 @@ func TestStagePodStreamsScriptThroughputWithoutWorkloadCredentials(t *testing.T)
 		*pod.Spec.AutomountServiceAccountToken ||
 		len(pod.Spec.Containers) != 2 ||
 		pod.Spec.Containers[1].Name != "live-telemetry" ||
+		pod.Spec.Containers[1].Image != invocation.AdapterImage ||
+		pod.Spec.Containers[1].Command[0] != "/project-signal-adapter" ||
+		pod.Spec.Containers[1].Args[0] != "metric-proxy" ||
 		pod.Annotations["prometheus.io/scrape"] != "true" ||
 		pod.Annotations["prometheus.io/port"] != strconv.Itoa(liveTelemetryPort) {
 		t.Fatalf("live telemetry Pod = %#v", pod)
@@ -1480,13 +1499,22 @@ func TestStagePodStreamsScriptThroughputWithoutWorkloadCredentials(t *testing.T)
 		env[variable.Name] = variable
 	}
 
-	if env["PROJECT_SIGNAL_RUN_NAME"].Value != "certification-run" ||
-		env["PROJECT_SIGNAL_LIVE_METRICS_FILE"].Value != liveTelemetryMetricsPath ||
-		env["PROJECT_SIGNAL_NODE_NAME"].ValueFrom == nil ||
-		env["PROJECT_SIGNAL_NODE_NAME"].ValueFrom.FieldRef == nil ||
-		env["PROJECT_SIGNAL_NODE_NAME"].ValueFrom.FieldRef.FieldPath != "spec.nodeName" ||
+	if env["PROJECT_SIGNAL_METRICS_FILE"].Value != liveTelemetryRecordsPath ||
 		!strings.Contains(pod.Spec.Containers[0].Args[0], "PROJECT_SIGNAL_LIVE_METRICS_DONE") {
 		t.Fatalf("live telemetry environment = %#v", env)
+	}
+
+	sidecarEnv := map[string]corev1.EnvVar{}
+	for _, variable := range pod.Spec.Containers[1].Env {
+		sidecarEnv[variable.Name] = variable
+	}
+
+	if sidecarEnv["PROJECT_SIGNAL_RUN_NAME"].Value != "certification-run" ||
+		sidecarEnv["PROJECT_SIGNAL_RUN_UID"].Value != string(invocation.RunUID) ||
+		sidecarEnv["PROJECT_SIGNAL_NODE_NAME"].ValueFrom == nil ||
+		sidecarEnv["PROJECT_SIGNAL_NODE_NAME"].ValueFrom.FieldRef == nil ||
+		sidecarEnv["PROJECT_SIGNAL_NODE_NAME"].ValueFrom.FieldRef.FieldPath != "spec.nodeName" {
+		t.Fatalf("trusted telemetry identity = %#v", sidecarEnv)
 	}
 
 	volumes := map[string]corev1.Volume{}

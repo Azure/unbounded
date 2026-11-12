@@ -58,6 +58,7 @@ type StageInvocation struct {
 	ID              string
 	RunUID          types.UID
 	PlanDigest      string
+	AdapterImage    string
 	PhaseOrder      int32
 	StageOrder      int32
 	Ordinal         int32
@@ -78,6 +79,7 @@ var errInvocationEvidenceIntegrity = errors.New("invocation evidence integrity f
 type StageExecutionRequest struct {
 	RunUID                         types.UID
 	PlanDigest                     string
+	AdapterImage                   string
 	PhaseOrder                     int32
 	StageOrder                     int32
 	PhaseRole                      signalv1.CheckStageRole
@@ -225,6 +227,7 @@ func (r StageRunner) executeWithRetry(
 			ID:              stageInvocationID(request, ordinal, attempt),
 			RunUID:          request.RunUID,
 			PlanDigest:      request.PlanDigest,
+			AdapterImage:    request.AdapterImage,
 			PhaseOrder:      request.PhaseOrder,
 			StageOrder:      request.StageOrder,
 			Ordinal:         ordinal,
