@@ -75,10 +75,16 @@ type MediaProvider struct {
 	CacheDir   string
 	TFTPServer string
 	// Run optionally replaces the bounded command runner for tests.
-	Run    func(context.Context, string, ...string) error
-	Now    func() time.Time
-	mu     sync.Mutex
-	grants map[string]isoGrant
+	Run        func(context.Context, string, ...string) error
+	Now        func() time.Time
+	mu         sync.Mutex // Protects grants and mediaLocks, never build or API work.
+	grants     map[string]isoGrant
+	mediaLocks map[string]*mediaLock
+}
+
+type mediaLock struct {
+	held  chan struct{}
+	users int // Includes the holder and waiters; protected by MediaProvider.mu.
 }
 
 type isoGrant struct {
@@ -189,8 +195,11 @@ func (p *MediaProvider) owner(ctx context.Context, id string) (*mediaOwner, erro
 }
 
 func (p *MediaProvider) Prepare(ctx context.Context, machine *v1alpha3.Machine, op *v1alpha3.MachineOperation, id string) (bootmedia.Source, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	unlock, err := p.lockMedia(ctx, id)
+	if err != nil {
+		return bootmedia.Source{}, err
+	}
+	defer unlock()
 
 	o, err := p.owner(ctx, id)
 	if err != nil {
@@ -238,15 +247,20 @@ func (p *MediaProvider) now() time.Time {
 
 // Release removes only local bytes. Durable Cleaned/terminal state revokes the
 // capability and must be saved by the controller before calling Release.
-func (p *MediaProvider) Release(_ context.Context, id string) error {
+func (p *MediaProvider) Release(ctx context.Context, id string) error {
 	if !mediaIDPattern.MatchString(id) || p.CacheDir == "" {
 		return fmt.Errorf("invalid media ID or cache directory")
 	}
 
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	unlock, err := p.lockMedia(ctx, id)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 
+	p.mu.Lock()
 	delete(p.grants, id)
+	p.mu.Unlock()
 
 	return os.RemoveAll(filepath.Join(p.CacheDir, "bootmedia", id))
 }
@@ -270,16 +284,24 @@ func (p *MediaProvider) openISO(ctx context.Context, name string, cache bool) (*
 
 	id := strings.TrimSuffix(rest, ".iso")
 
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	unlock, err := p.lockMedia(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 
 	now := p.now()
-	if g, ok := p.grants[id]; cache && ok && now.Before(g.expires) {
-		return os.Open(g.path)
-	}
-
 	if cache {
+		p.mu.Lock()
+
+		g, ok := p.grants[id]
+		if ok && now.Before(g.expires) {
+			p.mu.Unlock()
+			return os.Open(g.path)
+		}
+
 		delete(p.grants, id)
+		p.mu.Unlock()
 	}
 
 	o, err := p.owner(ctx, id)
@@ -296,6 +318,7 @@ func (p *MediaProvider) openISO(ctx context.Context, name string, cache bool) (*
 		return os.Open(path)
 	}
 
+	p.mu.Lock()
 	if p.grants == nil {
 		p.grants = map[string]isoGrant{}
 	}
@@ -307,8 +330,58 @@ func (p *MediaProvider) openISO(ctx context.Context, name string, cache bool) (*
 	}
 
 	p.grants[id] = isoGrant{path: path, expires: now.Add(mediaISOGrantTTL)}
+	p.mu.Unlock()
 
 	return os.Open(path)
+}
+
+// lockMedia orders builds, opens, and Release for one ID. Waiting is cancelable.
+// Entries remain shared until both the holder and all waiters have left.
+func (p *MediaProvider) lockMedia(ctx context.Context, id string) (func(), error) {
+	if !mediaIDPattern.MatchString(id) {
+		return nil, fmt.Errorf("invalid media ID")
+	}
+
+	p.mu.Lock()
+	if p.mediaLocks == nil {
+		p.mediaLocks = map[string]*mediaLock{}
+	}
+
+	l := p.mediaLocks[id]
+	if l == nil {
+		l = &mediaLock{held: make(chan struct{}, 1)}
+		p.mediaLocks[id] = l
+	}
+
+	l.users++
+	p.mu.Unlock()
+
+	select {
+	case l.held <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			p.unlockMedia(id, l, true)
+			return nil, err
+		}
+
+		return func() { p.unlockMedia(id, l, true) }, nil
+	case <-ctx.Done():
+		p.unlockMedia(id, l, false)
+		return nil, ctx.Err()
+	}
+}
+
+func (p *MediaProvider) unlockMedia(id string, l *mediaLock, held bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if held {
+		<-l.held
+	}
+
+	l.users--
+	if l.users == 0 {
+		delete(p.mediaLocks, id)
+	}
 }
 
 func mediaServeURL(raw string) (*url.URL, error) {
