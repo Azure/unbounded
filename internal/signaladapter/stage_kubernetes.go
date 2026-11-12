@@ -424,6 +424,7 @@ func (e *KubernetesStageExecutor) stagePod(
 		},
 		Resources: driverResources(driver),
 	}
+
 	liveTelemetry := stageStreamsLiveThroughput(invocation.Stage)
 	if liveTelemetry {
 		container.Env = append(container.Env,
@@ -453,6 +454,7 @@ func (e *KubernetesStageExecutor) stagePod(
 
 		container.Command = []string{"/bin/sh", "-ceu"}
 		container.Args = []string{scriptInvocationWrapper(driver.Script.Language, artifact.Name, artifact.Digest)}
+
 		container.VolumeMounts = []corev1.VolumeMount{{
 			Name:      "script",
 			MountPath: "/scripts",
@@ -534,6 +536,7 @@ func (e *KubernetesStageExecutor) stagePod(
 			},
 		})
 	}
+
 	if invocation.Stage.Test.Security.IPCLock {
 		sizeLimit := resource.MustParse(stageSharedMemorySize)
 		pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{

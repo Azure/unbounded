@@ -1460,6 +1460,7 @@ func TestStagePodStreamsScriptThroughputWithoutWorkloadCredentials(t *testing.T)
 		RunName:       "certification-run",
 		ExecutionName: "stage",
 	}
+
 	pod, err := executor.stagePod(testWorkflow("parent", "parent-uid"), invocation, 0)
 	if err != nil {
 		t.Fatalf("stagePod() error = %v", err)
@@ -1478,6 +1479,7 @@ func TestStagePodStreamsScriptThroughputWithoutWorkloadCredentials(t *testing.T)
 	for _, variable := range pod.Spec.Containers[0].Env {
 		env[variable.Name] = variable
 	}
+
 	if env["PROJECT_SIGNAL_RUN_NAME"].Value != "certification-run" ||
 		env["PROJECT_SIGNAL_LIVE_METRICS_FILE"].Value != liveTelemetryMetricsPath ||
 		env["PROJECT_SIGNAL_NODE_NAME"].ValueFrom == nil ||
@@ -1491,6 +1493,7 @@ func TestStagePodStreamsScriptThroughputWithoutWorkloadCredentials(t *testing.T)
 	for _, volume := range pod.Spec.Volumes {
 		volumes[volume.Name] = volume
 	}
+
 	telemetry := volumes[liveTelemetryVolumeName].EmptyDir
 	if telemetry == nil ||
 		telemetry.SizeLimit == nil ||
