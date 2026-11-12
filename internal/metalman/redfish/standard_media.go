@@ -319,7 +319,7 @@ func (c *Client) insertMediaBody(ctx context.Context, device virtualMediaDevice,
 	}
 
 	if params == nil {
-		return map[string]any{"Image": image, "Inserted": true, "WriteProtected": true}, nil
+		return map[string]any{"Image": image}, nil
 	}
 
 	protocol := "HTTP"
@@ -332,10 +332,10 @@ func (c *Client) insertMediaBody(ctx context.Context, device virtualMediaDevice,
 	for _, param := range params {
 		switch param.Name {
 		case "Image":
-		case "Inserted":
-			body["Inserted"] = true
-		case "WriteProtected":
-			body["WriteProtected"] = true
+		case "Inserted", "WriteProtected":
+			if param.Required {
+				body[param.Name] = true
+			}
 		case "TransferProtocolType":
 			if len(param.AllowableValues) > 0 && !slices.Contains(param.AllowableValues, protocol) {
 				return nil, fmt.Errorf("InsertMedia does not allow transfer protocol %s: %w", protocol, ErrUnsupported)

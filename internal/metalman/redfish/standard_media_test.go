@@ -268,7 +268,7 @@ func TestStandardVirtualMediaInstallFlow(t *testing.T) {
 	require.Equal(t, "POST /redfish/v1/Systems/1/Actions/ComputerSystem.Reset/", f.mutations[0])
 	require.NoError(t, c.MountVirtualMedia(t.Context(), standardMedia))
 	require.Equal(t, []string{"http://192.0.2.99/other.iso"}, f.ejects)
-	require.Equal(t, []map[string]any{{"Image": testISOURL, "Inserted": true, "WriteProtected": true}}, f.inserts)
+	require.Equal(t, []map[string]any{{"Image": testISOURL}}, f.inserts)
 	require.NoError(t, c.MountVirtualMedia(t.Context(), standardMedia))
 	require.Len(t, f.inserts, 1)
 	require.NoError(t, c.SetVirtualMediaBoot(t.Context()))
@@ -473,6 +473,55 @@ func TestStandardVirtualMediaCleanupBootTargets(t *testing.T) {
 	}
 }
 
+func TestStandardVirtualMediaInsertOptionalBooleans(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		actionInfo string
+		want       map[string]any
+	}{
+		{
+			name: "no action info",
+			want: map[string]any{"Image": testISOURL},
+		},
+		{
+			name:       "booleans not listed",
+			actionInfo: `{"Parameters":[{"Name":"Image","Required":true}]}`,
+			want:       map[string]any{"Image": testISOURL},
+		},
+		{
+			name:       "optional booleans",
+			actionInfo: `{"Parameters":[{"Name":"Image","Required":true},{"Name":"Inserted"},{"Name":"WriteProtected","Required":false}]}`,
+			want:       map[string]any{"Image": testISOURL},
+		},
+		{
+			name:       "required booleans",
+			actionInfo: `{"Parameters":[{"Name":"Image","Required":true},{"Name":"Inserted","Required":true},{"Name":"WriteProtected","Required":true}]}`,
+			want:       map[string]any{"Image": testISOURL, "Inserted": true, "WriteProtected": true},
+		},
+		{
+			name:       "only inserted required",
+			actionInfo: `{"Parameters":[{"Name":"Inserted","Required":true},{"Name":"WriteProtected"}]}`,
+			want:       map[string]any{"Image": testISOURL, "Inserted": true},
+		},
+		{
+			name:       "only write protected required",
+			actionInfo: `{"Parameters":[{"Name":"Inserted"},{"Name":"WriteProtected","Required":true}]}`,
+			want:       map[string]any{"Image": testISOURL, "WriteProtected": true},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f, c := newFakeILO(t)
+			f.actionInfo = tc.actionInfo
+
+			require.NoError(t, c.StageVirtualMedia(t.Context(), standardMedia))
+			require.Empty(t, f.mutations)
+			require.NoError(t, c.MountVirtualMedia(t.Context(), standardMedia))
+			require.Equal(t, []map[string]any{tc.want}, f.inserts)
+			require.True(t, f.inserted)
+		})
+	}
+}
+
 func TestStandardVirtualMediaActionInfoAndBoot(t *testing.T) {
 	f, c := newFakeILO(t)
 	f.actionInfo = `{"Parameters":[{"Name":"Image","Required":true},{"Name":"Inserted"},{"Name":"TransferProtocolType","AllowableValues":["HTTP","HTTPS"]},{"Name":"TransferMethod","Required":true,"AllowableValues":["Stream"]}]}`
@@ -484,7 +533,7 @@ func TestStandardVirtualMediaActionInfoAndBoot(t *testing.T) {
 	require.Equal(t, 1, f.actionInfoReads)
 	require.Empty(t, f.mutations)
 	require.NoError(t, c.MountVirtualMedia(t.Context(), standardMedia))
-	require.Equal(t, []map[string]any{{"Image": testISOURL, "Inserted": true, "TransferProtocolType": "HTTP", "TransferMethod": "Stream"}}, f.inserts)
+	require.Equal(t, []map[string]any{{"Image": testISOURL, "TransferProtocolType": "HTTP", "TransferMethod": "Stream"}}, f.inserts)
 	require.Contains(t, f.mutations, "POST /redfish/v1/Systems/1/VirtualMedia/2/Actions/VirtualMedia.InsertMedia/")
 	require.NoError(t, c.SetVirtualMediaBoot(t.Context()))
 	require.Len(t, f.patches, 1)
