@@ -39,6 +39,14 @@ const (
 	stageSharedMemoryVolumeName       = "shared-memory"
 	stageSharedMemoryMountPath        = "/dev/shm"
 	stageSharedMemorySize             = "1Gi"
+	liveTelemetryVolumeName           = "live-telemetry"
+	liveTelemetryMountPath            = "/live-telemetry"
+	liveTelemetryMetricsPath          = liveTelemetryMountPath + "/metrics.prom"
+	liveTelemetryDonePath             = liveTelemetryMountPath + "/done"
+	liveTelemetryPort                 = 9464
+	liveTelemetryMaxBytes             = 64 * 1024
+	liveTelemetryVolumeBytes          = 256 * 1024
+	liveTelemetryFinalScrapeGrace     = 10 * time.Second
 )
 
 type workflowRestartSourceCounts struct {
@@ -50,6 +58,7 @@ type KubernetesStageExecutor struct {
 	Runner                 *Runner
 	Namespace              string
 	WorkflowName           string
+	RunName                string
 	ExecutionName          string
 	WorkflowServiceAccount string
 }
@@ -415,6 +424,21 @@ func (e *KubernetesStageExecutor) stagePod(
 		},
 		Resources: driverResources(driver),
 	}
+	liveTelemetry := stageStreamsLiveThroughput(invocation.Stage)
+	if liveTelemetry {
+		container.Env = append(container.Env,
+			corev1.EnvVar{Name: "PROJECT_SIGNAL_RUN_NAME", Value: e.RunName},
+			corev1.EnvVar{Name: "PROJECT_SIGNAL_NAMESPACE", Value: e.Namespace},
+			corev1.EnvVar{Name: "PROJECT_SIGNAL_LIVE_METRICS_FILE", Value: liveTelemetryMetricsPath},
+			corev1.EnvVar{Name: "PROJECT_SIGNAL_LIVE_METRICS_DONE", Value: liveTelemetryDonePath},
+			corev1.EnvVar{
+				Name: "PROJECT_SIGNAL_NODE_NAME",
+				ValueFrom: &corev1.EnvVarSource{
+					FieldRef: &corev1.ObjectFieldSelector{FieldPath: "spec.nodeName"},
+				},
+			},
+		)
+	}
 
 	switch driver.Type {
 	case signalv1.TestDriverTypeScript:
@@ -437,6 +461,12 @@ func (e *KubernetesStageExecutor) stagePod(
 			Name:      "results",
 			MountPath: "/results",
 		}}
+		if liveTelemetry {
+			container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{
+				Name:      liveTelemetryVolumeName,
+				MountPath: liveTelemetryMountPath,
+			})
+		}
 	case signalv1.TestDriverTypeContainer:
 		if driver.Container == nil {
 			return nil, errors.New("container driver configuration is absent")
@@ -485,6 +515,25 @@ func (e *KubernetesStageExecutor) stagePod(
 			Volumes:                      stageHostPathVolumes(invocation.Stage.Test.Security.HostPaths),
 		},
 	}
+	if liveTelemetry {
+		pod.Annotations = map[string]string{
+			"prometheus.io/path":   "/metrics",
+			"prometheus.io/port":   strconv.Itoa(liveTelemetryPort),
+			"prometheus.io/scrape": "true",
+		}
+		pod.Spec.Containers = append(
+			pod.Spec.Containers,
+			liveTelemetrySidecar(stageDriverImage(driver)),
+		)
+		pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
+			Name: liveTelemetryVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{
+					SizeLimit: resource.NewQuantity(liveTelemetryVolumeBytes, resource.BinarySI),
+				},
+			},
+		})
+	}
 	if invocation.Stage.Test.Security.IPCLock {
 		sizeLimit := resource.MustParse(stageSharedMemorySize)
 		pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
@@ -522,6 +571,109 @@ func (e *KubernetesStageExecutor) stagePod(
 	}
 
 	return pod, nil
+}
+
+func stageStreamsLiveThroughput(stage signalv1.ResolvedStagePlan) bool {
+	if stage.Test.Driver.Type != signalv1.TestDriverTypeScript {
+		return false
+	}
+
+	for _, metric := range stage.Test.Metrics {
+		if metric.Type == signalv1.MetricValueTypeThroughput && metric.Unit == "TFLOP/s" {
+			return true
+		}
+	}
+
+	return false
+}
+
+func liveTelemetrySidecar(image string) corev1.Container {
+	return corev1.Container{
+		Name:    "live-telemetry",
+		Image:   image,
+		Command: []string{"python3", "-c"},
+		Args: []string{fmt.Sprintf(`
+import http.server
+import os
+import stat
+import time
+
+metrics_path = %q
+done_path = %q
+maximum_bytes = %d
+final_grace_seconds = %f
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path != "/metrics":
+            self.send_error(404)
+            return
+        content = b""
+        try:
+            metadata = os.lstat(metrics_path)
+            if stat.S_ISREG(metadata.st_mode) and metadata.st_size <= maximum_bytes:
+                with open(metrics_path, "rb") as stream:
+                    content = stream.read(maximum_bytes + 1)
+                if len(content) > maximum_bytes:
+                    content = b""
+        except FileNotFoundError:
+            pass
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; version=0.0.4")
+        self.send_header("Content-Length", str(len(content)))
+        self.end_headers()
+        self.wfile.write(content)
+
+    def log_message(self, _format, *_args):
+        return
+
+server = http.server.ThreadingHTTPServer(("0.0.0.0", %d), Handler)
+server.timeout = 1
+deadline = None
+while True:
+    server.handle_request()
+    if os.path.exists(done_path):
+        if deadline is None:
+            deadline = time.monotonic() + final_grace_seconds
+        elif time.monotonic() >= deadline:
+            break
+server.server_close()
+`,
+			liveTelemetryMetricsPath,
+			liveTelemetryDonePath,
+			liveTelemetryMaxBytes,
+			liveTelemetryFinalScrapeGrace.Seconds(),
+			liveTelemetryPort,
+		)},
+		Ports: []corev1.ContainerPort{{
+			Name:          "live-metrics",
+			ContainerPort: liveTelemetryPort,
+			Protocol:      corev1.ProtocolTCP,
+		}},
+		Resources: corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("10m"),
+				corev1.ResourceMemory: resource.MustParse("32Mi"),
+			},
+			Limits: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("100m"),
+				corev1.ResourceMemory: resource.MustParse("64Mi"),
+			},
+		},
+		SecurityContext: &corev1.SecurityContext{
+			AllowPrivilegeEscalation: utilptr.To(false),
+			ReadOnlyRootFilesystem:   utilptr.To(true),
+			Privileged:               utilptr.To(false),
+			Capabilities: &corev1.Capabilities{
+				Drop: []corev1.Capability{"ALL"},
+			},
+		},
+		VolumeMounts: []corev1.VolumeMount{{
+			Name:      liveTelemetryVolumeName,
+			MountPath: liveTelemetryMountPath,
+			ReadOnly:  true,
+		}},
+	}
 }
 
 func invocationArtifact(
@@ -1840,6 +1992,9 @@ set +e
 results_dir="${PROJECT_SIGNAL_RESULTS_DIR:-/results}"
 mkdir -p "$results_dir"
 rm -f "$results_dir/verdict" "$results_dir/reason" "$results_dir/measurements.json"
+if [ -n "${PROJECT_SIGNAL_LIVE_METRICS_DONE:-}" ]; then
+  trap ': > "$PROJECT_SIGNAL_LIVE_METRICS_DONE" || true' EXIT
+fi
 script=/scripts/%s
 want=%s
 got=$(sha256sum "$script" | awk '{print $1}')

@@ -125,6 +125,7 @@ func run(ctx context.Context, cfg config) error {
 			Runner:                 runner,
 			Namespace:              cfg.Namespace,
 			WorkflowName:           cfg.WorkflowName,
+			RunName:                cfg.RunName,
 			ExecutionName:          cfg.ExecutionName,
 			WorkflowServiceAccount: cfg.WorkflowServiceAccount,
 		}

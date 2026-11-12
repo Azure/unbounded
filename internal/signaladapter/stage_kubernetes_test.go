@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1424,6 +1425,77 @@ func TestLegacyRunLabelsIncludeExactRunUID(t *testing.T) {
 	})
 	if labels[runUIDLabel] != "run-uid" {
 		t.Fatalf("legacy workload labels = %#v", labels)
+	}
+}
+
+func TestStagePodStreamsScriptThroughputWithoutWorkloadCredentials(t *testing.T) {
+	t.Parallel()
+
+	scriptContent := "#!/bin/sh\nexit 0\n"
+	invocation := stageExecutionInvocation()
+	invocation.Stage.Name = "r07-gpu-gemm-bf16"
+	invocation.Stage.Test.Metrics = []signalv1.TestMetricDefinition{{
+		Name:        "gpu0MinTflops",
+		DisplayName: "GPU 0 minimum throughput",
+		Type:        signalv1.MetricValueTypeThroughput,
+		Unit:        "TFLOP/s",
+		Required:    true,
+	}}
+	invocation.Stage.Test.Driver = signalv1.CertificationTestDriver{
+		Type: signalv1.TestDriverTypeScript,
+		Script: &signalv1.ScriptTestDriver{
+			Language:    signalv1.ScriptLanguageShell,
+			Artifact:    "gpu-gemm.sh",
+			RunnerImage: "example.invalid/runner@sha256:" + strings.Repeat("a", 64),
+		},
+	}
+	invocation.Artifacts = []signalv1.TestArtifact{{
+		Name:    "gpu-gemm.sh",
+		Content: scriptContent,
+		Digest:  testStageDigest(scriptContent),
+	}}
+
+	executor := KubernetesStageExecutor{
+		Namespace:     "signal-system",
+		RunName:       "certification-run",
+		ExecutionName: "stage",
+	}
+	pod, err := executor.stagePod(testWorkflow("parent", "parent-uid"), invocation, 0)
+	if err != nil {
+		t.Fatalf("stagePod() error = %v", err)
+	}
+
+	if pod.Spec.AutomountServiceAccountToken == nil ||
+		*pod.Spec.AutomountServiceAccountToken ||
+		len(pod.Spec.Containers) != 2 ||
+		pod.Spec.Containers[1].Name != "live-telemetry" ||
+		pod.Annotations["prometheus.io/scrape"] != "true" ||
+		pod.Annotations["prometheus.io/port"] != strconv.Itoa(liveTelemetryPort) {
+		t.Fatalf("live telemetry Pod = %#v", pod)
+	}
+
+	env := map[string]corev1.EnvVar{}
+	for _, variable := range pod.Spec.Containers[0].Env {
+		env[variable.Name] = variable
+	}
+	if env["PROJECT_SIGNAL_RUN_NAME"].Value != "certification-run" ||
+		env["PROJECT_SIGNAL_LIVE_METRICS_FILE"].Value != liveTelemetryMetricsPath ||
+		env["PROJECT_SIGNAL_NODE_NAME"].ValueFrom == nil ||
+		env["PROJECT_SIGNAL_NODE_NAME"].ValueFrom.FieldRef == nil ||
+		env["PROJECT_SIGNAL_NODE_NAME"].ValueFrom.FieldRef.FieldPath != "spec.nodeName" ||
+		!strings.Contains(pod.Spec.Containers[0].Args[0], "PROJECT_SIGNAL_LIVE_METRICS_DONE") {
+		t.Fatalf("live telemetry environment = %#v", env)
+	}
+
+	volumes := map[string]corev1.Volume{}
+	for _, volume := range pod.Spec.Volumes {
+		volumes[volume.Name] = volume
+	}
+	telemetry := volumes[liveTelemetryVolumeName].EmptyDir
+	if telemetry == nil ||
+		telemetry.SizeLimit == nil ||
+		telemetry.SizeLimit.Value() != liveTelemetryVolumeBytes {
+		t.Fatalf("live telemetry volume = %#v", volumes[liveTelemetryVolumeName])
 	}
 }
 
