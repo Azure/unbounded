@@ -347,6 +347,14 @@ func (r *Reconciler) cleanupMedia(ctx context.Context, target v1alpha3.MachineOp
 		return fmt.Errorf("virtual media cleanup is unsupported")
 	}
 
+	if !deleteStaged && (target.BootMedia.Phase == "Staging" || target.BootMedia.Phase == "PoweringOff") {
+		// Mounting is persisted before any mount or boot override can change.
+		// Only skip boot/media cleanup when staging also had no BMC effects.
+		if staging, ok := vm.(bootmedia.ReadOnlyStagingClient); ok && staging.VirtualMediaStagingReadOnly() {
+			return nil
+		}
+	}
+
 	source, err := r.mediaSource(target.BootMedia)
 	if err != nil {
 		return err

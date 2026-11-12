@@ -19,10 +19,16 @@ import (
 
 type standardMediaTestClient struct {
 	*redfish.Client
+	calls *atomic.Int32
+	err   error
 }
 
 func (c standardMediaTestClient) ForMachine(context.Context, *v1alpha3.Machine) (PowerClient, error) {
-	return c.Client, nil
+	if c.calls != nil {
+		c.calls.Add(1)
+	}
+
+	return c.Client, c.err
 }
 
 func TestStandardVirtualMediaCapabilitiesFailBeforePower(t *testing.T) {
@@ -104,6 +110,15 @@ func TestStandardVirtualMediaCapabilitiesFailBeforePower(t *testing.T) {
 			require.Contains(t, current.Status.Targets[0].Message, reasonUnsupportedTarget)
 			require.Contains(t, current.Status.Targets[0].Message, tc.message)
 			require.Equal(t, []string{"prepare"}, d.calls)
+			require.Zero(t, mutations.Load())
+
+			for range 4 {
+				current = mediaStep(t, r, op.Name)
+			}
+
+			require.Empty(t, current.Finalizers)
+			require.True(t, current.Status.Targets[0].BootMedia.Released)
+			require.Equal(t, []string{"prepare", "release"}, d.calls)
 			require.Zero(t, mutations.Load())
 		})
 	}

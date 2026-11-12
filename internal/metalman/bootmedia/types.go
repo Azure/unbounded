@@ -46,3 +46,9 @@ type Client interface {
 	CleanupVirtualMedia(context.Context, Source) error
 	DeleteVirtualMedia(context.Context, Source) error
 }
+
+// ReadOnlyStagingClient optionally reports that staging makes no BMC changes.
+// Without this capability, staging may leave effects that require cleanup.
+type ReadOnlyStagingClient interface {
+	VirtualMediaStagingReadOnly() bool
+}

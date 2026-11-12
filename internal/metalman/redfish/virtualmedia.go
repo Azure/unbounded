@@ -15,7 +15,10 @@ import (
 	"github.com/Azure/unbounded/internal/metalman/bootmedia"
 )
 
-var _ bootmedia.Client = (*Client)(nil)
+var (
+	_ bootmedia.Client                = (*Client)(nil)
+	_ bootmedia.ReadOnlyStagingClient = (*Client)(nil)
+)
 
 // Tested rack manager firmware requires image names shorter than 40 characters.
 var virtualMediaName = regexp.MustCompile(`^ub-[0-9a-f]{1,32}\.iso$`)
@@ -29,6 +32,12 @@ const (
 // Staging checks the capabilities of a standard BMC before changing host power.
 func (c *Client) SupportsVirtualMedia() bool {
 	return true
+}
+
+// VirtualMediaStagingReadOnly reports whether staging only checks capabilities.
+// Rack staging writes files even before the host is powered off.
+func (c *Client) VirtualMediaStagingReadOnly() bool {
+	return c.rack == nil
 }
 
 func validateVirtualMediaName(name string) error {

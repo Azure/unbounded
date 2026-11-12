@@ -67,6 +67,7 @@ func TestVirtualMediaRequests(t *testing.T) {
 	})
 	c := dialRack(t, srv, "7")
 	require.True(t, c.SupportsVirtualMedia())
+	require.False(t, c.VirtualMediaStagingReadOnly())
 	require.NoError(t, c.StageVirtualMedia(t.Context(), testMedia))
 	require.NoError(t, c.MountVirtualMedia(t.Context(), testMedia))
 	require.NoError(t, c.SetVirtualMediaBoot(t.Context()))
@@ -100,6 +101,7 @@ func TestVirtualMediaUnsupported(t *testing.T) {
 	f.allowed = []string{"Pxe", "Hdd"}
 	// Standard clients validate the BMC's capabilities during staging.
 	require.True(t, c.SupportsVirtualMedia())
+	require.True(t, c.VirtualMediaStagingReadOnly())
 	require.ErrorIs(t, c.StageVirtualMedia(t.Context(), standardMedia), ErrUnsupported)
 	require.ErrorIs(t, c.MountVirtualMedia(t.Context(), standardMedia), ErrUnsupported)
 	require.ErrorIs(t, c.SetVirtualMediaBoot(t.Context()), ErrUnsupported)
