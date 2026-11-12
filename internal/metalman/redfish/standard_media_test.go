@@ -37,6 +37,7 @@ type fakeILO struct {
 	patches                              []map[string]string
 	inserts                              []map[string]any
 	ejects                               []string
+	ejectResult                          map[string]any
 	missingHeader                        []string
 	ignoreInsert, ignoreBoot             bool
 	noInsert                             bool
@@ -128,6 +129,11 @@ func newFakeILO(t *testing.T) (*fakeILO, *Client) {
 
 			write(map[string]any{"MediaTypes": []string{"Floppy", "USBStick"}})
 		case strings.HasSuffix(path, "/VirtualMedia/2"):
+			if len(f.ejects) > 0 && f.ejectResult != nil {
+				write(f.ejectResult)
+				return
+			}
+
 			insert := &redfishAction{Target: path + "/Actions/VirtualMedia.InsertMedia/"}
 			if f.actionInfo != "" {
 				insert.ActionInfo = path + "/InsertMediaActionInfo/"
@@ -440,6 +446,46 @@ func TestStandardVirtualMediaCleanupCapability(t *testing.T) {
 			require.Equal(t, !tc.eject, f.inserted)
 		})
 	}
+}
+
+func TestStandardVirtualMediaCleanupVerifiesEjection(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		image      string
+		inserted   bool
+		mediaTypes []string
+		message    string
+	}{
+		{"image cleared but inserted", "", true, []string{"CD"}, "still reports media as inserted"},
+		{"image unchanged and inserted", testISOURL, true, []string{"CD"}, "still reports media as inserted"},
+		{"image changed but inserted", "http://192.0.2.99/other.iso", true, []string{"CD"}, "still reports media as inserted"},
+		{"invalid device", "", false, []string{"USBStick"}, "does not report a CD or DVD device after ejection"},
+		{"ejected", "", false, []string{"CD"}, ""},
+		{"ejected with stale image", testISOURL, false, []string{"DVD"}, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f, c := newFakeILO(t)
+			f.image, f.inserted = testISOURL, true
+			f.ejectResult = map[string]any{"MediaTypes": tc.mediaTypes, "Image": tc.image, "Inserted": tc.inserted}
+
+			err := c.CleanupVirtualMedia(t.Context(), standardMedia)
+			if tc.message != "" {
+				require.ErrorContains(t, err, tc.message)
+				require.NotErrorIs(t, err, ErrUnsupported)
+			} else {
+				require.NoError(t, err)
+			}
+
+			require.Equal(t, []string{testISOURL}, f.ejects)
+		})
+	}
+}
+
+func TestStandardVirtualMediaCleanupAlreadyEmpty(t *testing.T) {
+	f, c := newFakeILO(t)
+
+	require.NoError(t, c.CleanupVirtualMedia(t.Context(), standardMedia))
+	require.Empty(t, f.mutations)
 }
 
 func TestStandardVirtualMediaRejectsInvalidURL(t *testing.T) {

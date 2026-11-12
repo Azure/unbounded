@@ -374,13 +374,17 @@ func (c *Client) ejectVirtualMedia(ctx context.Context, device virtualMediaDevic
 		return actionError(http.MethodPost, target, resp)
 	}
 
-	ejected, _, err := c.virtualMediaDevice(ctx, device.path)
+	ejected, ok, err := c.virtualMediaDevice(ctx, device.path)
 	if err != nil {
 		return err
 	}
 
-	if ejected.holds(device.image) {
-		return fmt.Errorf("virtual media %s still reports image %s as inserted", device.path, device.image)
+	if !ok {
+		return fmt.Errorf("virtual media %s does not report a CD or DVD device after ejection", device.path)
+	}
+
+	if ejected.inserted {
+		return fmt.Errorf("virtual media %s still reports media as inserted", device.path)
 	}
 
 	return nil
