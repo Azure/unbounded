@@ -105,8 +105,10 @@ func TestNodeCapsDrain(t *testing.T) {
 	capProjection(t, root, "pause", "0", "broken")
 	require.Eventually(t, func() bool { return testutil.ToFloat64(metrics.appliedConcurrency) == 0 }, time.Second, time.Millisecond)
 	close(release)
-	require.Eventually(t, func() bool { return testutil.ToFloat64(metrics.inFlight) == 0 }, time.Second, time.Millisecond)
-	require.Equal(t, float64(2), testutil.ToFloat64(metrics.pulls.WithLabelValues("success")))
+	require.Eventually(t, func() bool {
+		return testutil.ToFloat64(metrics.inFlight) == 0 &&
+			testutil.ToFloat64(metrics.pulls.WithLabelValues("success")) == 2
+	}, time.Second, time.Millisecond)
 	require.Positive(t, testutil.ToFloat64(metrics.verifiedBytes))
 	capProjection(t, root, "bad-resume", "8", "missing")
 	require.Never(t, func() bool { return testutil.ToFloat64(metrics.appliedConcurrency) != 0 }, 30*time.Millisecond, time.Millisecond)
