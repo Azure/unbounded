@@ -47,6 +47,8 @@ type fakeILO struct {
 	firstActionInfo                      string
 	actionInfoReads                      int
 	resourceStatuses                     map[string]int
+	relativeLinks                        bool
+	resourceReads                        []string
 }
 
 func newFakeILO(t *testing.T) (*fakeILO, *Client) {
@@ -67,6 +69,8 @@ func newFakeILO(t *testing.T) (*fakeILO, *Client) {
 
 		if r.Method != http.MethodGet {
 			f.mutations = append(f.mutations, r.Method+" "+r.URL.Path)
+		} else {
+			f.resourceReads = append(f.resourceReads, r.URL.Path)
 		}
 
 		path := strings.TrimRight(r.URL.Path, "/")
@@ -92,12 +96,26 @@ func newFakeILO(t *testing.T) (*fakeILO, *Client) {
 			boot["BootSourceOverrideTarget@Redfish.AllowableValues"] = f.allowed
 
 			system := map[string]any{"PowerState": f.powerState, "Boot": boot, "Actions": map[string]any{"#ComputerSystem.Reset": map[string]any{"target": "/redfish/v1/Systems/1/Actions/ComputerSystem.Reset/", "ResetType@Redfish.AllowableValues": []string{"On", "ForceOff"}}}}
+			if f.relativeLinks {
+				system["Actions"] = map[string]any{"#ComputerSystem.Reset": redfishAction{Target: "Actions/ComputerSystem.Reset/", ActionInfo: "ResetActionInfo/"}}
+			}
+
 			if !f.noManager {
-				system["Links"] = map[string]any{"ManagedBy": []redfishLink{{ODataID: "/redfish/v1/Managers/1/"}}}
+				manager := "/redfish/v1/Managers/1/"
+				if f.relativeLinks {
+					manager = "../../Managers/1/"
+				}
+
+				system["Links"] = map[string]any{"ManagedBy": []redfishLink{{ODataID: manager}}}
 			}
 
 			if f.systemMedia {
-				system["VirtualMedia"] = redfishLink{ODataID: "/redfish/v1/Systems/1/VirtualMedia/"}
+				media := "/redfish/v1/Systems/1/VirtualMedia/"
+				if f.relativeLinks {
+					media = "VirtualMedia/"
+				}
+
+				system["VirtualMedia"] = redfishLink{ODataID: media}
 			}
 
 			write(system)
@@ -125,10 +143,22 @@ func newFakeILO(t *testing.T) (*fakeILO, *Client) {
 			}
 		case strings.HasSuffix(path, "/Actions/ComputerSystem.Reset"):
 			w.WriteHeader(http.StatusOK)
+		case path == "/redfish/v1/Systems/1/ResetActionInfo":
+			write(map[string]any{"Parameters": []actionParameter{{Name: "ResetType", AllowableValues: []string{"On", "ForceOff"}}}})
 		case path == "/redfish/v1/Managers/1":
-			write(map[string]any{"VirtualMedia": redfishLink{ODataID: path + "/VirtualMedia/"}})
+			media := path + "/VirtualMedia/"
+			if f.relativeLinks {
+				media = "VirtualMedia/"
+			}
+
+			write(map[string]any{"VirtualMedia": redfishLink{ODataID: media}})
 		case strings.HasSuffix(path, "/VirtualMedia"):
-			write(map[string]any{"Members": []redfishLink{{ODataID: path + "/1/"}, {ODataID: path + "/2/"}}})
+			first, second := path+"/1/", path+"/2/"
+			if f.relativeLinks {
+				first, second = "1/", "2/"
+			}
+
+			write(map[string]any{"Members": []redfishLink{{ODataID: first}, {ODataID: second}}})
 		case strings.HasSuffix(path, "/VirtualMedia/1"):
 			if f.firstMedia != nil {
 				write(f.firstMedia)
@@ -147,16 +177,21 @@ func newFakeILO(t *testing.T) (*fakeILO, *Client) {
 				return
 			}
 
-			insert := &redfishAction{Target: path + "/Actions/VirtualMedia.InsertMedia/"}
+			base := path + "/"
+			if f.relativeLinks {
+				base = ""
+			}
+
+			insert := &redfishAction{Target: base + "Actions/VirtualMedia.InsertMedia/"}
 			if f.actionInfo != "" {
-				insert.ActionInfo = path + "/InsertMediaActionInfo/"
+				insert.ActionInfo = base + "InsertMediaActionInfo/"
 			}
 
 			if f.noInsert {
 				insert = nil
 			}
 
-			write(map[string]any{"MediaTypes": []string{"CD", "DVD"}, "Image": f.image, "Inserted": f.inserted, "Actions": map[string]any{"#VirtualMedia.InsertMedia": insert, "#VirtualMedia.EjectMedia": redfishAction{Target: path + "/Actions/VirtualMedia.EjectMedia/"}}})
+			write(map[string]any{"MediaTypes": []string{"CD", "DVD"}, "Image": f.image, "Inserted": f.inserted, "Actions": map[string]any{"#VirtualMedia.InsertMedia": insert, "#VirtualMedia.EjectMedia": redfishAction{Target: base + "Actions/VirtualMedia.EjectMedia/"}}})
 		case strings.HasSuffix(path, "/InsertMediaActionInfo"):
 			f.actionInfoReads++
 			if strings.HasSuffix(path, "/VirtualMedia/1/InsertMediaActionInfo") {
@@ -246,6 +281,43 @@ func TestStandardVirtualMediaInstallFlow(t *testing.T) {
 	require.NoError(t, c.DeleteVirtualMedia(t.Context(), standardMedia))
 	require.Len(t, f.ejects, 2)
 	require.Empty(t, f.missingHeader)
+}
+
+func TestStandardVirtualMediaRelativeLinksWithTrailingSlashes(t *testing.T) {
+	for _, owner := range []string{"manager", "system"} {
+		t.Run(owner, func(t *testing.T) {
+			f, c := newFakeILO(t)
+			f.relativeLinks = true
+			f.systemMedia = owner == "system"
+			f.noManager = f.systemMedia
+			f.actionInfo = `{"Parameters":[{"Name":"Image","Required":true}]}`
+
+			require.Equal(t, "1", c.deviceID)
+			require.Equal(t, "/redfish/v1/Systems/1", c.system())
+			require.NoError(t, c.StageVirtualMedia(t.Context(), standardMedia))
+			require.Empty(t, f.mutations)
+			require.NoError(t, c.MountVirtualMedia(t.Context(), standardMedia))
+			require.NoError(t, c.Reset(t.Context(), ResetForceOff))
+			require.NoError(t, c.CleanupVirtualMedia(t.Context(), standardMedia))
+
+			base := "/redfish/v1/Managers/1"
+			if f.systemMedia {
+				base = "/redfish/v1/Systems/1"
+			}
+
+			require.Contains(t, f.resourceReads, base+"/VirtualMedia")
+			require.Contains(t, f.resourceReads, base+"/VirtualMedia/2")
+			require.Contains(t, f.resourceReads, base+"/VirtualMedia/2/InsertMediaActionInfo")
+			require.Contains(t, f.resourceReads, "/redfish/v1/Systems/1/ResetActionInfo")
+			require.Equal(t, []string{
+				"POST " + base + "/VirtualMedia/2/Actions/VirtualMedia.InsertMedia/",
+				"POST /redfish/v1/Systems/1/Actions/ComputerSystem.Reset/",
+				"POST " + base + "/VirtualMedia/2/Actions/VirtualMedia.EjectMedia/",
+			}, f.mutations)
+			require.Equal(t, []map[string]any{{"Image": testISOURL}}, f.inserts)
+			require.False(t, f.inserted)
+		})
+	}
 }
 
 func TestStandardVirtualMediaCapabilities(t *testing.T) {

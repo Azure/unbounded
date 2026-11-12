@@ -899,7 +899,9 @@ func resolveSystem(ctx context.Context, s *bmcSession, deviceID string) (string,
 		return "", "", fmt.Errorf("parsing Systems member link: %w", err)
 	}
 
-	id := path[strings.LastIndex(path, "/")+1:]
+	idPath, _, _ := strings.Cut(resourceRequestPath(path), "?")
+
+	id := idPath[strings.LastIndex(idPath, "/")+1:]
 	if id == "" {
 		return "", "", fmt.Errorf("invalid Systems member link %q", collection.Members[0].ODataID)
 	}

@@ -42,7 +42,7 @@ func validateMediaURL(raw string) error {
 }
 
 func (c *Client) virtualMediaCollections(ctx context.Context) ([]string, error) {
-	systemPath := c.system()
+	systemPath := c.systemBase()
 
 	data, _, err := c.getResource(ctx, systemPath)
 	if err != nil {
@@ -139,7 +139,9 @@ func (c *Client) virtualMediaDevices(ctx context.Context) ([]virtualMediaDevice,
 				return nil, fmt.Errorf("parsing VirtualMedia member link: %w", err)
 			}
 
-			if slices.ContainsFunc(devices, func(d virtualMediaDevice) bool { return d.path == path }) {
+			if slices.ContainsFunc(devices, func(d virtualMediaDevice) bool {
+				return resourceRequestPath(d.path) == resourceRequestPath(path)
+			}) {
 				continue
 			}
 

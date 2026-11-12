@@ -57,19 +57,29 @@ func actionPath(target, basePath string) (string, error) {
 }
 
 func resourcePath(id, basePath string) (string, error) {
-	path, err := redfishPathFromODataID(id, basePath)
-	if err != nil {
-		return "", err
-	}
+	return redfishPathFromODataID(id, basePath)
+}
+
+// Normalize request paths without changing the base used to resolve links.
+func resourceRequestPath(path string) string {
+	path, query, hasQuery := strings.Cut(path, "?")
 
 	if trimmed := strings.TrimRight(path, "/"); trimmed != "" {
 		path = trimmed
 	}
 
-	return path, nil
+	if hasQuery {
+		path += "?" + query
+	}
+
+	return path
 }
 
 func (c *Client) system() string {
+	return resourceRequestPath(c.systemBase())
+}
+
+func (c *Client) systemBase() string {
 	if c.systemPath != "" {
 		return c.systemPath
 	}
@@ -78,6 +88,8 @@ func (c *Client) system() string {
 }
 
 func (c *Client) getResource(ctx context.Context, path string) ([]byte, string, error) {
+	path = resourceRequestPath(path)
+
 	resp, err := c.session.send(ctx, http.MethodGet, path, nil, standardHeader(""))
 	if err != nil {
 		return nil, "", err
@@ -324,7 +336,7 @@ func (c *Client) resetTarget(ctx context.Context, resetType ResetType) (string, 
 
 	allowed := reset.AllowableValues
 	if allowed == nil {
-		params, err := c.actionParameters(ctx, reset.redfishAction, path)
+		params, err := c.actionParameters(ctx, reset.redfishAction, c.systemBase())
 		if err != nil {
 			return "", err
 		}
@@ -342,7 +354,7 @@ func (c *Client) resetTarget(ctx context.Context, resetType ResetType) (string, 
 		return "", fmt.Errorf("reset type %s is not allowed by the BMC: %w", resetType, ErrUnsupported)
 	}
 
-	return actionPath(reset.Target, path)
+	return actionPath(reset.Target, c.systemBase())
 }
 
 type systemBootSettings struct {
