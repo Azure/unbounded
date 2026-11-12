@@ -10,10 +10,11 @@ import (
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
 
-// Source identifies a bootstrap ISO served to a management controller over TFTP.
+// Source identifies a bootstrap ISO served over HTTP or rack-manager TFTP.
 type Source struct {
 	Name   string
 	Server string
+	URL    string
 }
 
 // PrimerName returns a second name for the same ISO, or "" when name has no
@@ -32,6 +33,7 @@ func PrimerName(name string) string {
 // Provider builds immutable, operation-owned media before any power changes.
 type Provider interface {
 	Prepare(context.Context, *v1alpha3.Machine, *v1alpha3.MachineOperation, string) (Source, error)
+	SourceURL(string) (string, error)
 	Release(context.Context, string) error
 }
 

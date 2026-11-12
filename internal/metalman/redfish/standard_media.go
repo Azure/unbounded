@@ -1,0 +1,488 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
+package redfish
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/url"
+	"slices"
+	"strings"
+
+	"github.com/Azure/unbounded/internal/metalman/bootmedia"
+)
+
+// Standard BMCs pull the ISO by URL. VirtualMedia is linked from the system
+// or from its managers (as on HPE iLO). Only CD/DVD devices are used.
+type virtualMediaDevice struct {
+	path     string
+	image    string
+	inserted bool
+	insert   *redfishAction
+	eject    *redfishAction
+}
+
+func (d virtualMediaDevice) holds(image string) bool {
+	return d.inserted && d.image == image
+}
+
+func validateMediaURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil {
+		return fmt.Errorf("virtual-media image URL must be an absolute HTTP or HTTPS URL without credentials: %q", raw)
+	}
+
+	return nil
+}
+
+func (c *Client) virtualMediaCollections(ctx context.Context) ([]string, error) {
+	systemPath := c.system()
+
+	data, _, err := c.getResource(ctx, systemPath)
+	if err != nil {
+		return nil, err
+	}
+
+	var system struct {
+		VirtualMedia *redfishLink `json:"VirtualMedia"`
+		Links        struct {
+			ManagedBy []redfishLink `json:"ManagedBy"`
+		} `json:"Links"`
+	}
+	if err := json.Unmarshal(data, &system); err != nil {
+		return nil, fmt.Errorf("parsing system links: %w", err)
+	}
+
+	var collections []string
+
+	add := func(id, base string) error {
+		if id == "" {
+			return nil
+		}
+
+		path, err := resourcePath(id, base)
+		if err != nil {
+			return fmt.Errorf("parsing VirtualMedia link: %w", err)
+		}
+
+		if !slices.Contains(collections, path) {
+			collections = append(collections, path)
+		}
+
+		return nil
+	}
+
+	if system.VirtualMedia != nil {
+		if err := add(system.VirtualMedia.ODataID, systemPath); err != nil {
+			return nil, err
+		}
+	}
+
+	for _, link := range system.Links.ManagedBy {
+		managerPath, err := resourcePath(link.ODataID, systemPath)
+		if err != nil {
+			return nil, fmt.Errorf("parsing ManagedBy link: %w", err)
+		}
+
+		data, _, err := c.getResource(ctx, managerPath)
+		if err != nil {
+			return nil, err
+		}
+
+		var manager struct {
+			VirtualMedia *redfishLink `json:"VirtualMedia"`
+		}
+		if err := json.Unmarshal(data, &manager); err != nil {
+			return nil, fmt.Errorf("parsing manager %s: %w", managerPath, err)
+		}
+
+		if manager.VirtualMedia != nil {
+			if err := add(manager.VirtualMedia.ODataID, managerPath); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	return collections, nil
+}
+
+func (c *Client) virtualMediaDevices(ctx context.Context) ([]virtualMediaDevice, error) {
+	collections, err := c.virtualMediaCollections(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var devices []virtualMediaDevice
+
+	for _, collectionPath := range collections {
+		data, _, err := c.getResource(ctx, collectionPath)
+		if errors.Is(err, ErrUnsupported) {
+			continue
+		}
+
+		if err != nil {
+			return nil, err
+		}
+
+		var collection struct {
+			Members []redfishLink `json:"Members"`
+		}
+		if err := json.Unmarshal(data, &collection); err != nil {
+			return nil, fmt.Errorf("parsing VirtualMedia collection %s: %w", collectionPath, err)
+		}
+
+		for _, member := range collection.Members {
+			path, err := resourcePath(member.ODataID, collectionPath)
+			if err != nil {
+				return nil, fmt.Errorf("parsing VirtualMedia member link: %w", err)
+			}
+
+			if slices.ContainsFunc(devices, func(d virtualMediaDevice) bool { return d.path == path }) {
+				continue
+			}
+
+			device, ok, err := c.virtualMediaDevice(ctx, path)
+			if err != nil {
+				return nil, err
+			}
+
+			if ok {
+				devices = append(devices, device)
+			}
+		}
+	}
+
+	if len(devices) == 0 {
+		return nil, fmt.Errorf("no CD or DVD virtual media device found: %w", ErrUnsupported)
+	}
+
+	return devices, nil
+}
+
+func (c *Client) virtualMediaDevice(ctx context.Context, path string) (virtualMediaDevice, bool, error) {
+	data, _, err := c.getResource(ctx, path)
+	if err != nil {
+		return virtualMediaDevice{}, false, err
+	}
+
+	var media struct {
+		MediaTypes []string `json:"MediaTypes"`
+		Image      *string  `json:"Image"`
+		Inserted   *bool    `json:"Inserted"`
+		Actions    struct {
+			Insert *redfishAction `json:"#VirtualMedia.InsertMedia"`
+			Eject  *redfishAction `json:"#VirtualMedia.EjectMedia"`
+		} `json:"Actions"`
+	}
+	if err := json.Unmarshal(data, &media); err != nil {
+		return virtualMediaDevice{}, false, fmt.Errorf("parsing VirtualMedia %s: %w", path, err)
+	}
+
+	if !slices.Contains(media.MediaTypes, "CD") && !slices.Contains(media.MediaTypes, "DVD") {
+		return virtualMediaDevice{}, false, nil
+	}
+
+	device := virtualMediaDevice{path: path, insert: media.Actions.Insert, eject: media.Actions.Eject}
+	if media.Image != nil {
+		device.image = *media.Image
+	}
+
+	if media.Inserted != nil {
+		device.inserted = *media.Inserted
+	} else {
+		device.inserted = device.image != ""
+	}
+
+	if device.insert != nil && device.insert.Target == "" {
+		device.insert = nil
+	}
+
+	if device.eject != nil && device.eject.Target == "" {
+		device.eject = nil
+	}
+
+	return device, true, nil
+}
+
+// Staging checks capabilities without changing media or host power.
+func (c *Client) standardStageVirtualMedia(ctx context.Context, source bootmedia.Source) error {
+	if err := validateMediaURL(source.URL); err != nil {
+		return err
+	}
+
+	devices, err := c.virtualMediaDevices(ctx)
+	if err != nil {
+		return err
+	}
+
+	if !slices.ContainsFunc(devices, func(d virtualMediaDevice) bool { return d.insert != nil }) {
+		return fmt.Errorf("no CD or DVD device advertises #VirtualMedia.InsertMedia: %w", ErrUnsupported)
+	}
+
+	return nil
+}
+
+func (c *Client) standardMountVirtualMedia(ctx context.Context, source bootmedia.Source) error {
+	if err := validateMediaURL(source.URL); err != nil {
+		return err
+	}
+
+	devices, err := c.virtualMediaDevices(ctx)
+	if err != nil {
+		return err
+	}
+
+	if slices.ContainsFunc(devices, func(d virtualMediaDevice) bool { return d.holds(source.URL) }) {
+		return nil
+	}
+
+	var device *virtualMediaDevice
+
+	for i := range devices {
+		if devices[i].insert == nil {
+			continue
+		}
+
+		if device == nil || (device.inserted && !devices[i].inserted) {
+			device = &devices[i]
+		}
+	}
+
+	if device == nil {
+		return fmt.Errorf("no CD or DVD device advertises #VirtualMedia.InsertMedia: %w", ErrUnsupported)
+	}
+
+	// Validate the action before ejecting existing media.
+	body, err := c.insertMediaBody(ctx, *device, source.URL)
+	if err != nil {
+		return err
+	}
+
+	target, err := actionPath(device.insert.Target, device.path)
+	if err != nil {
+		return fmt.Errorf("parsing InsertMedia target: %w", err)
+	}
+
+	if device.inserted {
+		if err := c.ejectVirtualMedia(ctx, *device); err != nil {
+			return err
+		}
+	}
+
+	resp, err := c.modify(ctx, http.MethodPost, target, body)
+	if err != nil {
+		return err
+	}
+
+	if !isSuccessStatus(resp.status) {
+		return actionError(http.MethodPost, target, resp)
+	}
+
+	inserted, ok, err := c.virtualMediaDevice(ctx, device.path)
+	if err != nil {
+		return err
+	}
+
+	if !ok || !inserted.inserted || (inserted.image != "" && inserted.image != source.URL) {
+		return fmt.Errorf("virtual media %s does not report image %s as inserted", device.path, source.URL)
+	}
+
+	return nil
+}
+
+func (c *Client) insertMediaBody(ctx context.Context, device virtualMediaDevice, image string) (map[string]any, error) {
+	params, err := c.actionParameters(ctx, *device.insert, device.path)
+	if err != nil {
+		return nil, err
+	}
+
+	if params == nil {
+		return map[string]any{"Image": image, "Inserted": true, "WriteProtected": true}, nil
+	}
+
+	protocol := "HTTP"
+	if strings.HasPrefix(image, "https:") {
+		protocol = "HTTPS"
+	}
+
+	body := map[string]any{"Image": image}
+
+	for _, param := range params {
+		switch param.Name {
+		case "Image":
+		case "Inserted":
+			body["Inserted"] = true
+		case "WriteProtected":
+			body["WriteProtected"] = true
+		case "TransferProtocolType":
+			if len(param.AllowableValues) > 0 && !slices.Contains(param.AllowableValues, protocol) {
+				return nil, fmt.Errorf("InsertMedia does not allow transfer protocol %s: %w", protocol, ErrUnsupported)
+			}
+
+			body["TransferProtocolType"] = protocol
+		case "TransferMethod":
+			if param.Required {
+				if len(param.AllowableValues) > 0 && !slices.Contains(param.AllowableValues, "Stream") {
+					return nil, fmt.Errorf("InsertMedia does not allow transfer method Stream: %w", ErrUnsupported)
+				}
+
+				body["TransferMethod"] = "Stream"
+			}
+		default:
+			if param.Required {
+				return nil, fmt.Errorf("InsertMedia requires unsupported parameter %s: %w", param.Name, ErrUnsupported)
+			}
+		}
+	}
+
+	return body, nil
+}
+
+func (c *Client) ejectVirtualMedia(ctx context.Context, device virtualMediaDevice) error {
+	if device.eject == nil {
+		return fmt.Errorf("virtual media %s does not advertise #VirtualMedia.EjectMedia: %w", device.path, ErrUnsupported)
+	}
+
+	target, err := actionPath(device.eject.Target, device.path)
+	if err != nil {
+		return fmt.Errorf("parsing EjectMedia target: %w", err)
+	}
+
+	resp, err := c.modify(ctx, http.MethodPost, target, map[string]any{})
+	if err != nil {
+		return err
+	}
+
+	if !isSuccessStatus(resp.status) {
+		return actionError(http.MethodPost, target, resp)
+	}
+
+	ejected, _, err := c.virtualMediaDevice(ctx, device.path)
+	if err != nil {
+		return err
+	}
+
+	if ejected.holds(device.image) {
+		return fmt.Errorf("virtual media %s still reports image %s as inserted", device.path, device.image)
+	}
+
+	return nil
+}
+
+func (c *Client) standardSetVirtualMediaBoot(ctx context.Context) error {
+	boot, err := c.systemBoot(ctx)
+	if err != nil {
+		return err
+	}
+
+	if len(boot.AllowedTargets) > 0 && !slices.Contains(boot.AllowedTargets, BootTargetCd) {
+		return fmt.Errorf("boot override target %s is not allowed by the BMC (allowed %v): %w", BootTargetCd, boot.AllowedTargets, ErrUnsupported)
+	}
+
+	modeOK := !boot.HasMode || boot.Mode == BootModeUEFI
+	if boot.Target == BootTargetCd && boot.Enabled == BootOnce && modeOK {
+		return nil
+	}
+
+	settings := map[string]string{
+		"BootSourceOverrideTarget": string(BootTargetCd), "BootSourceOverrideEnabled": string(BootOnce),
+	}
+	if !modeOK {
+		settings["BootSourceOverrideMode"] = string(BootModeUEFI)
+	}
+
+	if err := c.patchBoot(ctx, settings); err != nil {
+		return err
+	}
+
+	boot, err = c.systemBoot(ctx)
+	if err != nil {
+		return err
+	}
+
+	if boot.Target != BootTargetCd || boot.Enabled != BootOnce || (boot.HasMode && boot.Mode != BootModeUEFI) {
+		return fmt.Errorf("boot override does not report one-time UEFI CD boot: %+v", boot)
+	}
+
+	return nil
+}
+
+// sameMediaCapability compares the complete capability path, not a filename
+// suffix. Cleanup must still work after the advertised serve address changes.
+func sameMediaCapability(image, source string) bool {
+	if validateMediaURL(image) != nil || validateMediaURL(source) != nil {
+		return false
+	}
+
+	a, err := url.Parse(image)
+	if err != nil {
+		return false
+	}
+
+	b, err := url.Parse(source)
+	if err != nil {
+		return false
+	}
+
+	parts := strings.Split(b.Path, "/")
+
+	return len(parts) == 4 && parts[1] == "bootmedia" &&
+		virtualMediaName.MatchString("ub-"+parts[2]+".iso") && len(parts[2]) == 32 &&
+		parts[3] == "boot.iso" && a.Path == b.Path &&
+		a.RawQuery == "" && a.Fragment == "" && a.RawPath == "" &&
+		b.RawQuery == "" && b.Fragment == "" && b.RawPath == ""
+}
+
+func (c *Client) standardCleanupVirtualMedia(ctx context.Context, source bootmedia.Source) error {
+	boot, err := c.systemBoot(ctx)
+	if err != nil {
+		return err
+	}
+
+	if boot.Target == BootTargetCd && boot.Enabled != BootDisabled {
+		settings := map[string]string{"BootSourceOverrideEnabled": string(BootDisabled)}
+		if len(boot.AllowedTargets) == 0 || slices.Contains(boot.AllowedTargets, BootTargetNone) {
+			settings["BootSourceOverrideTarget"] = string(BootTargetNone)
+		}
+
+		if err := c.patchBoot(ctx, settings); err != nil {
+			return err
+		}
+
+		boot, err = c.systemBoot(ctx)
+		if err != nil {
+			return err
+		}
+
+		if boot.Target == BootTargetCd && boot.Enabled != BootDisabled {
+			return fmt.Errorf("virtual CD boot override is still enabled after cleanup")
+		}
+	}
+
+	if source.URL == "" {
+		return nil
+	}
+
+	devices, err := c.virtualMediaDevices(ctx)
+	if errors.Is(err, ErrUnsupported) {
+		return nil
+	}
+
+	if err != nil {
+		return err
+	}
+
+	for _, device := range devices {
+		if device.inserted && sameMediaCapability(device.image, source.URL) {
+			if err := c.ejectVirtualMedia(ctx, device); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}

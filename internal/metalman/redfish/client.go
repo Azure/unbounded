@@ -79,6 +79,8 @@ const (
 type BootTarget string
 
 const (
+	BootTargetNone     BootTarget = "None"
+	BootTargetCd       BootTarget = "Cd"
 	BootTargetPxe      BootTarget = "Pxe"
 	BootTargetHdd      BootTarget = "Hdd"
 	BootTargetUefiHTTP BootTarget = "UefiHttp"
@@ -132,9 +134,10 @@ const (
 // Client provides Redfish operations against a single BMC.
 // Created via Pool.Get or Dial. Must be closed when no longer needed.
 type Client struct {
-	session  *bmcSession
-	deviceID string
-	rack     *rackManager
+	session    *bmcSession
+	deviceID   string
+	rack       *rackManager
+	systemPath string
 }
 
 // Dial connects to a BMC and returns a ready-to-use Client.
@@ -167,7 +170,7 @@ func Dial(ctx context.Context, url, certSHA256, user, pass, deviceID string) (*C
 		s.location = location
 	}
 
-	id, err := resolveDeviceID(ctx, s, deviceID)
+	id, systemPath, err := resolveSystem(ctx, s, deviceID)
 	if err != nil {
 		s.close()
 		return nil, err
@@ -185,7 +188,7 @@ func Dial(ctx context.Context, url, certSHA256, user, pass, deviceID string) (*C
 
 	slog.InfoContext(ctx, "Redfish dialed BMC", "url", url, "device", id)
 
-	return &Client{session: s, deviceID: id}, nil
+	return &Client{session: s, deviceID: id, systemPath: systemPath}, nil
 }
 
 // Close releases the client's Redfish session.
@@ -203,21 +206,21 @@ func (c *Client) PowerState(ctx context.Context) (PowerState, error) {
 		return c.rackPowerState(ctx)
 	}
 
-	path := fmt.Sprintf("/redfish/v1/Systems/%s", c.deviceID)
+	path := c.system()
 
-	data, status, err := c.session.do(ctx, http.MethodGet, path, nil)
+	resp, err := c.session.send(ctx, http.MethodGet, path, nil, standardHeader(""))
 	if err != nil {
 		return "", err
 	}
 
-	if status != http.StatusOK {
-		return "", redfishResponseError(http.MethodGet, path, status, data, nil)
+	if resp.status != http.StatusOK {
+		return "", redfishResponseError(http.MethodGet, path, resp.status, resp.data, nil)
 	}
 
 	var result struct {
 		PowerState PowerState `json:"PowerState"`
 	}
-	if err := json.Unmarshal(data, &result); err != nil {
+	if err := json.Unmarshal(resp.data, &result); err != nil {
 		return "", fmt.Errorf("parsing power state: %w", err)
 	}
 
@@ -241,16 +244,20 @@ func (c *Client) Reset(ctx context.Context, resetType ResetType) error {
 		return c.rackMutate(ctx, http.MethodPost, rackSystemPath+"/Actions/ComputerSystem.Reset", map[string]ResetType{"ResetType": resetType}, op)
 	}
 
-	path := fmt.Sprintf("/redfish/v1/Systems/%s/Actions/ComputerSystem.Reset", c.deviceID)
-	body := map[string]ResetType{"ResetType": resetType}
-
-	data, status, err := c.session.do(ctx, http.MethodPost, path, body)
+	path, err := c.resetTarget(ctx, resetType)
 	if err != nil {
 		return err
 	}
 
-	if !isSuccessStatus(status) {
-		return fmt.Errorf("reset %s failed: %w", resetType, redfishResponseError(http.MethodPost, path, status, data, nil))
+	body := map[string]ResetType{"ResetType": resetType}
+
+	resp, err := c.modify(ctx, http.MethodPost, path, body)
+	if err != nil {
+		return err
+	}
+
+	if !isSuccessStatus(resp.status) || licenseRequired(resp.data) {
+		return fmt.Errorf("reset %s failed: %w", resetType, actionError(http.MethodPost, path, resp))
 	}
 
 	slog.InfoContext(ctx, "Redfish reset", "device", c.deviceID, "resetType", resetType)
@@ -859,20 +866,19 @@ func validateFallbackSystem(ctx context.Context, s *bmcSession, deviceID string)
 	return nil
 }
 
-// resolveDeviceID returns the given deviceID if non-empty, or discovers it
-// by querying /redfish/v1/Systems and returning the first member.
-func resolveDeviceID(ctx context.Context, s *bmcSession, deviceID string) (string, error) {
+// resolveSystem follows the first advertised ComputerSystem unless an ID is set.
+func resolveSystem(ctx context.Context, s *bmcSession, deviceID string) (string, string, error) {
 	if deviceID != "" {
-		return deviceID, nil
+		return deviceID, "/redfish/v1/Systems/" + deviceID, nil
 	}
 
-	data, status, err := s.do(ctx, http.MethodGet, "/redfish/v1/Systems", nil)
+	resp, err := s.send(ctx, http.MethodGet, "/redfish/v1/Systems", nil, standardHeader(""))
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 
-	if status != http.StatusOK {
-		return "", redfishResponseError(http.MethodGet, "/redfish/v1/Systems", status, data, nil)
+	if resp.status != http.StatusOK {
+		return "", "", redfishResponseError(http.MethodGet, "/redfish/v1/Systems", resp.status, resp.data, nil)
 	}
 
 	var collection struct {
@@ -880,21 +886,25 @@ func resolveDeviceID(ctx context.Context, s *bmcSession, deviceID string) (strin
 			ODataID string `json:"@odata.id"`
 		} `json:"Members"`
 	}
-	if err := json.Unmarshal(data, &collection); err != nil {
-		return "", fmt.Errorf("parsing Systems collection: %w", err)
+	if err := json.Unmarshal(resp.data, &collection); err != nil {
+		return "", "", fmt.Errorf("parsing Systems collection: %w", err)
 	}
 
 	if len(collection.Members) == 0 {
-		return "", fmt.Errorf("no members in /redfish/v1/Systems")
+		return "", "", fmt.Errorf("no members in /redfish/v1/Systems")
 	}
 
-	// Extract the system ID from the last path segment.
-	id := collection.Members[0].ODataID
-	if i := strings.LastIndex(id, "/"); i >= 0 {
-		id = id[i+1:]
+	path, err := resourcePath(collection.Members[0].ODataID, "/redfish/v1/Systems")
+	if err != nil {
+		return "", "", fmt.Errorf("parsing Systems member link: %w", err)
 	}
 
-	return id, nil
+	id := path[strings.LastIndex(path, "/")+1:]
+	if id == "" {
+		return "", "", fmt.Errorf("invalid Systems member link %q", collection.Members[0].ODataID)
+	}
+
+	return id, path, nil
 }
 
 // isSuccessStatus returns true for HTTP status codes indicating success.

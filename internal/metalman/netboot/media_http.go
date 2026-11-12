@@ -344,7 +344,7 @@ func nonMediaSuccessor(machine *v1alpha3.Machine, ops []v1alpha3.MachineOperatio
 	return false
 }
 
-// ServeHTTP serves only operation-scoped control requests. Ordinary artifact
+// ServeHTTP serves operation-scoped ISOs and control requests. Ordinary artifact
 // downloads stay on the HTTP root, where frozen media lease claims take
 // precedence over the host source-IP lookup, including revoked claims.
 func (p *MediaProvider) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -359,8 +359,14 @@ func (p *MediaProvider) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	id, action := parts[0], parts[1]
 	log := slog.With("handler", "bootmedia", "action", action, "remote", r.RemoteAddr)
 
-	if (action == "complete" && r.Method != http.MethodPost) || (action != "complete" && r.Method != http.MethodGet) {
+	if !mediaMethodAllowed(action, r.Method) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	if action == mediaISOFile {
+		// The BMC uses its own address, not the host's frozen lease.
+		p.serveISO(w, r, id, log)
 		return
 	}
 
@@ -619,6 +625,46 @@ func (p *MediaProvider) installInstructions(o *mediaOwner) ([]byte, error) {
 	}
 
 	return []byte(b.String()), nil
+}
+
+func mediaMethodAllowed(action, method string) bool {
+	switch action {
+	case "complete":
+		return method == http.MethodPost
+	case mediaISOFile:
+		return method == http.MethodGet || method == http.MethodHead
+	default:
+		return method == http.MethodGet
+	}
+}
+
+func (p *MediaProvider) serveISO(w http.ResponseWriter, r *http.Request, id string, log *slog.Logger) {
+	file, err := p.openISO(r.Context(), "ub-"+id+".iso", true)
+	if err != nil {
+		if errors.Is(err, errMediaLookup) {
+			log.Warn("boot media ISO owner lookup failed", "err", err)
+			http.Error(w, http.StatusText(http.StatusServiceUnavailable), http.StatusServiceUnavailable)
+
+			return
+		}
+
+		log.Warn("rejecting boot media ISO request", "err", err)
+		http.NotFound(w, r)
+
+		return
+	}
+	defer file.Close() //nolint:errcheck // Best-effort close after the response.
+
+	info, err := file.Stat()
+	if err != nil {
+		log.Error("reading boot media ISO", "err", err)
+		http.Error(w, "media unavailable", http.StatusServiceUnavailable)
+
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	http.ServeContent(w, r, mediaISOFile, info.ModTime(), file)
 }
 
 func (p *MediaProvider) installerConfig(o *mediaOwner) ([]byte, error) {

@@ -25,9 +25,10 @@ const (
 	remoteDrivePath = rackSystemPath + "/Actions/ComputerSystem.RemoteDrive"
 )
 
-// SupportsVirtualMedia reports support for the rack manager remote-drive workflow.
+// SupportsVirtualMedia reports that this client implements virtual media.
+// Staging checks the capabilities of a standard BMC before changing host power.
 func (c *Client) SupportsVirtualMedia() bool {
-	return c.rack != nil
+	return true
 }
 
 func validateVirtualMediaName(name string) error {
@@ -41,8 +42,12 @@ func validateVirtualMediaName(name string) error {
 // StageVirtualMedia copies the ISO to rack storage under its name and its
 // primer name, without changing host power.
 func (c *Client) StageVirtualMedia(ctx context.Context, source bootmedia.Source) error {
-	if !c.SupportsVirtualMedia() {
-		return ErrUnsupported
+	if c.rack == nil {
+		return c.standardStageVirtualMedia(ctx, source)
+	}
+
+	if source.Server == "" {
+		return fmt.Errorf("rack-manager virtual media requires a TFTP server; set --media-tftp-server")
 	}
 
 	if err := validateVirtualMediaName(source.Name); err != nil {
@@ -75,8 +80,8 @@ func (c *Client) StageVirtualMedia(ctx context.Context, source bootmedia.Source)
 // Slot power-on also boots the host, so it must not run before media setup completes.
 // ImageName names a file staged in the rack manager TFTP store.
 func (c *Client) MountVirtualMedia(ctx context.Context, source bootmedia.Source) error {
-	if !c.SupportsVirtualMedia() {
-		return ErrUnsupported
+	if c.rack == nil {
+		return c.standardMountVirtualMedia(ctx, source)
 	}
 
 	if err := validateVirtualMediaName(source.Name); err != nil {
@@ -95,8 +100,8 @@ func (c *Client) MountVirtualMedia(ctx context.Context, source bootmedia.Source)
 
 // SetVirtualMediaBoot selects UEFI before selecting the remote drive.
 func (c *Client) SetVirtualMediaBoot(ctx context.Context) error {
-	if !c.SupportsVirtualMedia() {
-		return ErrUnsupported
+	if c.rack == nil {
+		return c.standardSetVirtualMediaBoot(ctx)
 	}
 
 	c.rack.mu.Lock()
@@ -115,8 +120,8 @@ func (c *Client) SetVirtualMediaBoot(ctx context.Context) error {
 // It never changes host power and requires both commands to succeed. Rack Off
 // reports host power, not BMC or mount state, and cannot prove cleanup succeeded.
 func (c *Client) CleanupVirtualMedia(ctx context.Context, source bootmedia.Source) error {
-	if !c.SupportsVirtualMedia() {
-		return ErrUnsupported
+	if c.rack == nil {
+		return c.standardCleanupVirtualMedia(ctx, source)
 	}
 
 	if err := validateVirtualMediaName(source.Name); err != nil {
@@ -148,8 +153,8 @@ func (c *Client) CleanupVirtualMedia(ctx context.Context, source bootmedia.Sourc
 // Callers must persist boot-safe cleanup before deletion and retain ownership on error.
 // Tested firmware reports an already-deleted file as Failure with "No such file or directory".
 func (c *Client) DeleteVirtualMedia(ctx context.Context, source bootmedia.Source) error {
-	if !c.SupportsVirtualMedia() {
-		return ErrUnsupported
+	if c.rack == nil {
+		return nil
 	}
 
 	if err := validateVirtualMediaName(source.Name); err != nil {

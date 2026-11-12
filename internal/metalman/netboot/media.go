@@ -38,6 +38,12 @@ const mediaFormat = "unbounded-uefi-v1"
 // Version the ISO layout separately from the netboot image's EFI artifacts.
 const mediaISOFormat = "unbounded-uefi-hybrid-v2"
 
+const (
+	mediaISOFile = "boot.iso"
+	// BMCs make many range requests. Recheck ownership at least every 10 seconds.
+	mediaISOGrantTTL = 10 * time.Second
+)
+
 // mediaLocalISOFormat versions the ISO layout for media that carries the
 // installer and host network description, used when the spec sets network.
 const mediaLocalISOFormat = "unbounded-uefi-local-v1"
@@ -53,12 +59,13 @@ var (
 )
 
 // MediaProvider builds operation-owned hybrid ISOs (El Torito plus GPT ESP).
-// Configure Site, Resolver, Client (an uncached API client), CacheDir, and an advertised
-// IPv4 TFTPServer.
+// Configure Site, Resolver, Client (an uncached API client), and CacheDir.
+// Resolver.ServeURL serves ISOs over HTTP. TFTPServer is optional for standard
+// BMCs and must be an advertised IPv4 address for rack managers.
 // Share this instance through HTTPServer.Media and TFTPServer.Media. The
 // controller must persist BootMedia and digest-pinned Netboot inputs first.
 // Tokens are capabilities on the isolated management/provisioning network;
-// TFTP has no source authentication. HTTP config and callbacks also require the
+// ISO downloads have no source authentication. HTTP config and callbacks require the
 // first frozen lease's source IP, without trusting forwarding headers.
 type MediaProvider struct {
 	// Site must match the frozen media site exactly; empty is not a wildcard.
@@ -68,8 +75,15 @@ type MediaProvider struct {
 	CacheDir   string
 	TFTPServer string
 	// Run optionally replaces the bounded command runner for tests.
-	Run func(context.Context, string, ...string) error
-	mu  sync.Mutex
+	Run    func(context.Context, string, ...string) error
+	Now    func() time.Time
+	mu     sync.Mutex
+	grants map[string]isoGrant
+}
+
+type isoGrant struct {
+	path    string
+	expires time.Time
 }
 
 var _ bootmedia.Provider = (*MediaProvider)(nil)
@@ -191,7 +205,35 @@ func (p *MediaProvider) Prepare(ctx context.Context, machine *v1alpha3.Machine, 
 		return bootmedia.Source{}, err
 	}
 
-	return bootmedia.Source{Name: "ub-" + id + ".iso", Server: p.TFTPServer}, nil
+	isoURL, err := p.SourceURL(id)
+	if err != nil {
+		return bootmedia.Source{}, err
+	}
+
+	return bootmedia.Source{Name: "ub-" + id + ".iso", Server: p.TFTPServer, URL: isoURL}, nil
+}
+
+// SourceURL reconstructs the ISO URL without authorizing or rebuilding it.
+// Cleanup uses it even after an operation has ended or the Machine is gone.
+func (p *MediaProvider) SourceURL(id string) (string, error) {
+	if !mediaIDPattern.MatchString(id) || p.Resolver == nil {
+		return "", fmt.Errorf("invalid media ID or missing resolver")
+	}
+
+	u, err := mediaServeURL(p.Resolver.ServeURL)
+	if err != nil {
+		return "", err
+	}
+
+	return strings.TrimRight(u.String(), "/") + "/bootmedia/" + id + "/" + mediaISOFile, nil
+}
+
+func (p *MediaProvider) now() time.Time {
+	if p.Now != nil {
+		return p.Now()
+	}
+
+	return time.Now()
 }
 
 // Release removes only local bytes. Durable Cleaned/terminal state revokes the
@@ -204,11 +246,18 @@ func (p *MediaProvider) Release(_ context.Context, id string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	delete(p.grants, id)
+
 	return os.RemoveAll(filepath.Join(p.CacheDir, "bootmedia", id))
 }
 
-// OpenISO authorizes a rack TFTP request before any host source-IP lookup.
+// OpenISO authorizes each TFTP request against the live operation.
 func (p *MediaProvider) OpenISO(ctx context.Context, name string) (*os.File, error) {
+	return p.openISO(ctx, name, false)
+}
+
+// HTTP range requests share a short grant to avoid a lookup for every chunk.
+func (p *MediaProvider) openISO(ctx context.Context, name string, cache bool) (*os.File, error) {
 	// The primer name ("up-" prefix) serves the same ISO; see bootmedia.PrimerName.
 	rest, ok := strings.CutPrefix(name, "ub-")
 	if !ok {
@@ -224,6 +273,15 @@ func (p *MediaProvider) OpenISO(ctx context.Context, name string) (*os.File, err
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	now := p.now()
+	if g, ok := p.grants[id]; cache && ok && now.Before(g.expires) {
+		return os.Open(g.path)
+	}
+
+	if cache {
+		delete(p.grants, id)
+	}
+
 	o, err := p.owner(ctx, id)
 	if err != nil {
 		return nil, err
@@ -233,6 +291,22 @@ func (p *MediaProvider) OpenISO(ctx context.Context, name string) (*os.File, err
 	if err != nil {
 		return nil, err
 	}
+
+	if !cache {
+		return os.Open(path)
+	}
+
+	if p.grants == nil {
+		p.grants = map[string]isoGrant{}
+	}
+
+	for k, g := range p.grants {
+		if !now.Before(g.expires) {
+			delete(p.grants, k)
+		}
+	}
+
+	p.grants[id] = isoGrant{path: path, expires: now.Add(mediaISOGrantTTL)}
 
 	return os.Open(path)
 }
@@ -283,7 +357,7 @@ func validateMediaLease(spec *v1alpha3.PXESpec) error {
 }
 
 func (p *MediaProvider) ensureISO(ctx context.Context, o *mediaOwner) (string, error) {
-	if p.Resolver == nil || p.Resolver.Cache == nil || p.CacheDir == "" || net.ParseIP(p.TFTPServer).To4() == nil || (o.status().SourceServer != p.TFTPServer && (o.status().SourceServer != "" || o.status().Phase != "Preparing")) {
+	if p.Resolver == nil || p.Resolver.Cache == nil || p.CacheDir == "" || (p.TFTPServer != "" && net.ParseIP(p.TFTPServer).To4() == nil) || (o.status().SourceServer != p.TFTPServer && (o.status().SourceServer != "" || o.status().Phase != "Preparing")) {
 		return "", fmt.Errorf("media resolver, cache, or advertised TFTP IPv4 is invalid or changed")
 	}
 
