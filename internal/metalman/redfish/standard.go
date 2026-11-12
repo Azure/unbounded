@@ -328,6 +328,7 @@ func (c *Client) actionParameters(ctx context.Context, action redfishAction, bas
 
 func (c *Client) resetTarget(ctx context.Context, resetType ResetType) (string, error) {
 	path := c.system()
+	base := c.systemBase()
 
 	data, _, err := c.getResource(ctx, path)
 	if errors.Is(err, ErrUnsupported) {
@@ -339,6 +340,7 @@ func (c *Client) resetTarget(ctx context.Context, resetType ResetType) (string, 
 	}
 
 	var system struct {
+		redfishLink
 		Actions struct {
 			Reset *struct {
 				redfishAction
@@ -350,6 +352,13 @@ func (c *Client) resetTarget(ctx context.Context, resetType ResetType) (string, 
 		return "", fmt.Errorf("parsing system actions: %w", err)
 	}
 
+	if system.ODataID != "" {
+		base, err = resourcePath(system.ODataID, base)
+		if err != nil {
+			return "", fmt.Errorf("parsing system link: %w", err)
+		}
+	}
+
 	reset := system.Actions.Reset
 	if reset == nil || reset.Target == "" {
 		return path + "/Actions/ComputerSystem.Reset", nil
@@ -357,7 +366,7 @@ func (c *Client) resetTarget(ctx context.Context, resetType ResetType) (string, 
 
 	allowed := reset.AllowableValues
 	if allowed == nil {
-		params, err := c.actionParameters(ctx, reset.redfishAction, c.systemBase())
+		params, err := c.actionParameters(ctx, reset.redfishAction, base)
 		if err != nil {
 			return "", err
 		}
@@ -375,7 +384,7 @@ func (c *Client) resetTarget(ctx context.Context, resetType ResetType) (string, 
 		return "", fmt.Errorf("reset type %s is not allowed by the BMC: %w", resetType, ErrUnsupported)
 	}
 
-	return actionPath(reset.Target, c.systemBase())
+	return actionPath(reset.Target, base)
 }
 
 type systemBootSettings struct {

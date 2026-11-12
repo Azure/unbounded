@@ -58,6 +58,12 @@ type fakeILO struct {
 func newFakeILO(t *testing.T) (*fakeILO, *Client) {
 	t.Helper()
 
+	return newFakeILOWithDeviceID(t, "")
+}
+
+func newFakeILOWithDeviceID(t *testing.T, deviceID string) (*fakeILO, *Client) {
+	t.Helper()
+
 	f := &fakeILO{powerState: PowerOff, boot: map[string]string{"BootSourceOverrideTarget": "None", "BootSourceOverrideEnabled": "Disabled", "BootSourceOverrideMode": "UEFI"}, allowed: []string{"None", "Cd", "Pxe", "Hdd"}}
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !testSessionAuth(w, r) {
@@ -99,7 +105,7 @@ func newFakeILO(t *testing.T) (*fakeILO, *Client) {
 
 			boot["BootSourceOverrideTarget@Redfish.AllowableValues"] = f.allowed
 
-			system := map[string]any{"PowerState": f.powerState, "Boot": boot, "Actions": map[string]any{"#ComputerSystem.Reset": map[string]any{"target": "/redfish/v1/Systems/1/Actions/ComputerSystem.Reset/", "ResetType@Redfish.AllowableValues": []string{"On", "ForceOff"}}}}
+			system := map[string]any{"@odata.id": "/redfish/v1/Systems/1/", "PowerState": f.powerState, "Boot": boot, "Actions": map[string]any{"#ComputerSystem.Reset": map[string]any{"target": "/redfish/v1/Systems/1/Actions/ComputerSystem.Reset/", "ResetType@Redfish.AllowableValues": []string{"On", "ForceOff"}}}}
 			if f.relativeLinks {
 				system["Actions"] = map[string]any{"#ComputerSystem.Reset": redfishAction{Target: "Actions/ComputerSystem.Reset/", ActionInfo: "ResetActionInfo/"}}
 			}
@@ -272,7 +278,7 @@ func newFakeILO(t *testing.T) (*fakeILO, *Client) {
 		}
 	}))
 	t.Cleanup(srv.Close)
-	c, err := Dial(t.Context(), srv.URL, tlsServerFingerprint(srv), "admin", "secret", "")
+	c, err := Dial(t.Context(), srv.URL, tlsServerFingerprint(srv), "admin", "secret", deviceID)
 	require.NoError(t, err)
 	t.Cleanup(c.Close)
 
@@ -340,6 +346,99 @@ func TestStandardVirtualMediaRelativeLinksWithTrailingSlashes(t *testing.T) {
 			}, f.mutations)
 			require.Equal(t, []map[string]any{{"Image": testISOURL}}, f.inserts)
 			require.False(t, f.inserted)
+		})
+	}
+}
+
+func TestStandardVirtualMediaExplicitSystemID(t *testing.T) {
+	for _, owner := range []string{"manager", "system"} {
+		for _, links := range []string{"relative", "absolute"} {
+			t.Run(owner+"/"+links, func(t *testing.T) {
+				f, c := newFakeILOWithDeviceID(t, "1")
+				f.relativeLinks = links == "relative"
+				f.systemMedia = owner == "system"
+				f.noManager = f.systemMedia
+				f.actionInfo = `{"Parameters":[{"Name":"Image","Required":true}]}`
+
+				require.Equal(t, "1", c.deviceID)
+				require.Equal(t, "/redfish/v1/Systems/1", c.systemBase())
+				require.Equal(t, "/redfish/v1/Systems/1", c.system())
+				require.NoError(t, c.StageVirtualMedia(t.Context(), standardMedia))
+				require.Empty(t, f.mutations)
+				require.NoError(t, c.MountVirtualMedia(t.Context(), standardMedia))
+				require.NoError(t, c.Reset(t.Context(), ResetForceOff))
+				require.NoError(t, c.CleanupVirtualMedia(t.Context(), standardMedia))
+
+				base := "/redfish/v1/Managers/1"
+				if f.systemMedia {
+					base = "/redfish/v1/Systems/1"
+				}
+
+				require.NotContains(t, f.resourceReads, "/redfish/v1/Systems")
+				require.Contains(t, f.resourceReads, base+"/VirtualMedia/2/InsertMediaActionInfo")
+
+				if f.relativeLinks {
+					require.Contains(t, f.resourceReads, "/redfish/v1/Systems/1/ResetActionInfo")
+				}
+
+				require.Equal(t, []string{
+					"POST " + base + "/VirtualMedia/2/Actions/VirtualMedia.InsertMedia/",
+					"POST /redfish/v1/Systems/1/Actions/ComputerSystem.Reset/",
+					"POST " + base + "/VirtualMedia/2/Actions/VirtualMedia.EjectMedia/",
+				}, f.mutations)
+				require.Equal(t, []map[string]any{{"Image": testISOURL}}, f.inserts)
+				require.False(t, f.inserted)
+				require.Empty(t, f.missingHeader)
+			})
+		}
+	}
+}
+
+func TestStandardSystemCanonicalURI(t *testing.T) {
+	for _, tc := range []struct {
+		name, body, wantError string
+		status                int
+	}{
+		{name: "canonical", body: `{"@odata.id":"/redfish/v1/Systems/1/"}`},
+		{name: "absolute URI", body: `{"@odata.id":"https://bmc.example/redfish/v1/Systems/1/"}`},
+		{name: "missing canonical URI", body: `{"Id":"1"}`},
+		{name: "different response ID", body: `{"Id":"other","@odata.id":"/redfish/v1/Systems/1/"}`},
+		{name: "invalid JSON", body: `{`, wantError: "parsing system"},
+		{name: "invalid canonical URI", body: `{"@odata.id":"%zz"}`, wantError: "parsing system link"},
+		{name: "unavailable", status: http.StatusServiceUnavailable, body: `{"error":"unavailable"}`, wantError: "returned HTTP 503"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				require.Equal(t, http.MethodGet, r.Method)
+				require.Equal(t, "/redfish/v1/Systems/1", r.URL.Path)
+				require.Equal(t, "4.0", r.Header.Get("OData-Version"))
+
+				if tc.status != 0 {
+					w.WriteHeader(tc.status)
+				}
+
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			t.Cleanup(srv.Close)
+
+			client := &Client{session: &bmcSession{httpClient: srv.Client(), baseURL: srv.URL}, deviceID: "1"}
+			target, resetErr := client.resetTarget(t.Context(), ResetForceOff)
+
+			collections, mediaErr := client.virtualMediaCollections(t.Context())
+			for _, err := range []error{resetErr, mediaErr} {
+				if tc.wantError != "" {
+					require.ErrorContains(t, err, tc.wantError)
+				} else {
+					require.NoError(t, err)
+				}
+			}
+
+			if tc.wantError == "" {
+				require.Equal(t, "/redfish/v1/Systems/1/Actions/ComputerSystem.Reset", target)
+			}
+
+			require.Empty(t, collections)
+			require.Equal(t, "1", client.deviceID)
 		})
 	}
 }

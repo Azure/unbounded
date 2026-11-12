@@ -51,6 +51,7 @@ func (c *Client) virtualMediaCollections(ctx context.Context) ([]string, error) 
 	}
 
 	var system struct {
+		redfishLink
 		VirtualMedia *redfishLink `json:"VirtualMedia"`
 		Links        struct {
 			ManagedBy []redfishLink `json:"ManagedBy"`
@@ -58,6 +59,13 @@ func (c *Client) virtualMediaCollections(ctx context.Context) ([]string, error) 
 	}
 	if err := json.Unmarshal(data, &system); err != nil {
 		return nil, fmt.Errorf("parsing system links: %w", err)
+	}
+
+	if system.ODataID != "" {
+		systemPath, err = resourcePath(system.ODataID, systemPath)
+		if err != nil {
+			return nil, fmt.Errorf("parsing system link: %w", err)
+		}
 	}
 
 	var collections []string
