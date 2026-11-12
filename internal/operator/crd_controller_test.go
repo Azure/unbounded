@@ -93,6 +93,9 @@ func TestCRDReconcilerSkipsMatchingCRD(t *testing.T) {
 	}
 
 	name := RequiredCRDNames[0]
+	if desired[name] == nil {
+		t.Fatalf("desiredCRDs has no %s CRD", name)
+	}
 
 	var current apiextensionsv1.CustomResourceDefinition
 	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(desired[name].Object, &current); err != nil {

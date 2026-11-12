@@ -2,7 +2,12 @@
 GOCMD=go
 GOFMT=gofumpt
 GOBUILD=$(GOCMD) build
-GOTEST=$(GOCMD) test
+GOTEST=$(GOCMD) test -v
+# gotestsum runs `go test -json`, prints the same output as `go test -v`, and
+# ends with a summary of every skipped and failed test with its output. The
+# JSON report feeds the CI job summary (hack/cmd/test-summary).
+GO_TEST_REPORT ?= $(CURDIR)/tmp/go-test.json
+GOTESTSUM=$(GOCMD) tool gotestsum --format standard-verbose --jsonfile $(GO_TEST_REPORT)
 GOMOD=$(GOCMD) mod
 GOLINT=golangci-lint run -c .golangci.yaml
 ENVTEST_K8S_VERSION ?= 1.37.0
@@ -569,13 +574,15 @@ ifdef CI
 # In CI each job is independent; skip chained prerequisites.
 
 test: machina-manifests token-refresher-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-operator-manifests gantry-manifests ## Run all tests with race detector
-	$(GOTEST) -race ./...
+	@mkdir -p $(dir $(GO_TEST_REPORT))
+	$(GOTESTSUM) -- -race ./...
 
 else
 # Locally, chain test -> lint for convenience.
 
 test: lint machina-manifests token-refresher-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-operator-manifests gantry-manifests ## Run all tests (implies lint)
-	$(GOTEST) ./...
+	@mkdir -p $(dir $(GO_TEST_REPORT))
+	$(GOTESTSUM) -- ./...
 
 endif
 
