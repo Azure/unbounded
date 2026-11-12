@@ -27,6 +27,7 @@ type fakeILO struct {
 	mu                                   sync.Mutex
 	image                                string
 	inserted                             bool
+	powerState                           PowerState
 	boot                                 map[string]string
 	allowed                              []string
 	noManager, systemMedia, requireMatch bool
@@ -51,7 +52,7 @@ type fakeILO struct {
 func newFakeILO(t *testing.T) (*fakeILO, *Client) {
 	t.Helper()
 
-	f := &fakeILO{boot: map[string]string{"BootSourceOverrideTarget": "None", "BootSourceOverrideEnabled": "Disabled", "BootSourceOverrideMode": "UEFI"}, allowed: []string{"None", "Cd", "Pxe", "Hdd"}}
+	f := &fakeILO{powerState: PowerOff, boot: map[string]string{"BootSourceOverrideTarget": "None", "BootSourceOverrideEnabled": "Disabled", "BootSourceOverrideMode": "UEFI"}, allowed: []string{"None", "Cd", "Pxe", "Hdd"}}
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !testSessionAuth(w, r) {
 			return
@@ -90,7 +91,7 @@ func newFakeILO(t *testing.T) (*fakeILO, *Client) {
 
 			boot["BootSourceOverrideTarget@Redfish.AllowableValues"] = f.allowed
 
-			system := map[string]any{"PowerState": "Off", "Boot": boot, "Actions": map[string]any{"#ComputerSystem.Reset": map[string]any{"target": "/redfish/v1/Systems/1/Actions/ComputerSystem.Reset/", "ResetType@Redfish.AllowableValues": []string{"On", "ForceOff"}}}}
+			system := map[string]any{"PowerState": f.powerState, "Boot": boot, "Actions": map[string]any{"#ComputerSystem.Reset": map[string]any{"target": "/redfish/v1/Systems/1/Actions/ComputerSystem.Reset/", "ResetType@Redfish.AllowableValues": []string{"On", "ForceOff"}}}}
 			if !f.noManager {
 				system["Links"] = map[string]any{"ManagedBy": []redfishLink{{ODataID: "/redfish/v1/Managers/1/"}}}
 			}
@@ -394,6 +395,60 @@ func TestStandardVirtualMediaStagingAlreadyMounted(t *testing.T) {
 	}
 }
 
+func TestStandardVirtualMediaStagingRequiresSelectedEject(t *testing.T) {
+	for _, state := range []struct {
+		name     string
+		image    string
+		inserted bool
+	}{
+		{"empty", "", false},
+		{"occupied", "http://192.0.2.99/other.iso", true},
+		{"already owned", testISOURL, true},
+	} {
+		for _, action := range []struct {
+			name        string
+			eject       *redfishAction
+			message     string
+			unsupported bool
+		}{
+			{"missing", nil, "does not advertise #VirtualMedia.EjectMedia", true},
+			{"empty target", &redfishAction{}, "does not advertise #VirtualMedia.EjectMedia", true},
+			{"invalid target", &redfishAction{Target: "http://[invalid"}, "parsing EjectMedia target", false},
+		} {
+			t.Run(state.name+"/"+action.name, func(t *testing.T) {
+				f, c := newFakeILO(t)
+				f.powerState = PowerOn
+				f.image, f.inserted = "http://192.0.2.99/second.iso", true
+				f.firstMedia = map[string]any{
+					"MediaTypes": []string{"CD"}, "Image": state.image, "Inserted": state.inserted,
+					"Actions": map[string]any{
+						"#VirtualMedia.InsertMedia": redfishAction{Target: "/redfish/v1/Managers/1/VirtualMedia/1/Actions/VirtualMedia.InsertMedia/"},
+						"#VirtualMedia.EjectMedia":  action.eject,
+					},
+				}
+
+				err := c.StageVirtualMedia(t.Context(), standardMedia)
+				require.ErrorContains(t, err, action.message)
+
+				if action.unsupported {
+					require.ErrorIs(t, err, ErrUnsupported)
+				} else {
+					require.NotErrorIs(t, err, ErrUnsupported)
+				}
+
+				require.Empty(t, f.mutations)
+				require.Equal(t, state.image, f.firstMedia["Image"])
+				require.Equal(t, state.inserted, f.firstMedia["Inserted"])
+				require.Equal(t, "http://192.0.2.99/second.iso", f.image)
+				require.True(t, f.inserted)
+				power, err := c.PowerState(t.Context())
+				require.NoError(t, err)
+				require.Equal(t, PowerOn, power)
+			})
+		}
+	}
+}
+
 func TestStandardVirtualMediaStagingPrefersEmptyDevice(t *testing.T) {
 	f, c := newFakeILO(t)
 	f.firstMedia = map[string]any{
@@ -471,6 +526,7 @@ func TestStandardVirtualMediaMountRequiresImageReadback(t *testing.T) {
 			f, c := newFakeILO(t)
 
 			f.insertResult = map[string]any{"MediaTypes": []string{"CD"}, "Inserted": true}
+
 			switch image {
 			case "empty":
 				f.insertResult["Image"] = ""

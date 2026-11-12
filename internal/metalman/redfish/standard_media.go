@@ -221,7 +221,12 @@ func (c *Client) standardStageVirtualMedia(ctx context.Context, source bootmedia
 		return fmt.Errorf("boot override target %s is not allowed by the BMC (allowed %v): %w", BootTargetCd, boot.AllowedTargets, ErrUnsupported)
 	}
 
-	_, _, err = c.prepareVirtualMediaInsert(ctx, source)
+	device, _, err := c.prepareVirtualMediaInsert(ctx, source)
+	if err != nil {
+		return err
+	}
+
+	_, err = device.ejectTarget()
 
 	return err
 }
@@ -353,14 +358,23 @@ func (c *Client) insertMediaBody(ctx context.Context, device virtualMediaDevice,
 	return body, nil
 }
 
-func (c *Client) ejectVirtualMedia(ctx context.Context, device virtualMediaDevice) error {
-	if device.eject == nil {
-		return fmt.Errorf("virtual media %s does not advertise #VirtualMedia.EjectMedia: %w", device.path, ErrUnsupported)
+func (d virtualMediaDevice) ejectTarget() (string, error) {
+	if d.eject == nil {
+		return "", fmt.Errorf("virtual media %s does not advertise #VirtualMedia.EjectMedia: %w", d.path, ErrUnsupported)
 	}
 
-	target, err := actionPath(device.eject.Target, device.path)
+	target, err := actionPath(d.eject.Target, d.path)
 	if err != nil {
-		return fmt.Errorf("parsing EjectMedia target: %w", err)
+		return "", fmt.Errorf("parsing EjectMedia target: %w", err)
+	}
+
+	return target, nil
+}
+
+func (c *Client) ejectVirtualMedia(ctx context.Context, device virtualMediaDevice) error {
+	target, err := device.ejectTarget()
+	if err != nil {
+		return err
 	}
 
 	resp, err := c.modify(ctx, http.MethodPost, target, map[string]any{})
