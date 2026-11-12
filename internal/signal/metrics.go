@@ -21,13 +21,20 @@ const metricsCollectionTimeout = 5 * time.Second
 var gpuTflopsMetricPattern = regexp.MustCompile(`^gpu([0-7])MinTflops$`)
 
 type CertificationMetricsCollector struct {
-	reader              client.Reader
-	r07MinimumAssertion *prometheus.Desc
+	reader               client.Reader
+	completedMeasurement *prometheus.Desc
+	r07MinimumAssertion  *prometheus.Desc
 }
 
 func NewCertificationMetricsCollector(reader client.Reader) *CertificationMetricsCollector {
 	return &CertificationMetricsCollector{
 		reader: reader,
+		completedMeasurement: prometheus.NewDesc(
+			"project_signal_fleet_certification_measurement",
+			"Numeric measurement projected from immutable completed stage evidence.",
+			[]string{"namespace", "run", "run_uid", "stage", "metric_id", "unit"},
+			nil,
+		),
 		r07MinimumAssertion: prometheus.NewDesc(
 			"project_signal_fleet_certification_r07_assertion_decimal",
 			"Minimum BF16 throughput projected from immutable completed R07 stage evidence.",
@@ -38,6 +45,8 @@ func NewCertificationMetricsCollector(reader client.Reader) *CertificationMetric
 }
 
 func (c *CertificationMetricsCollector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- c.completedMeasurement
+
 	ch <- c.r07MinimumAssertion
 }
 
@@ -70,6 +79,27 @@ func (c *CertificationMetricsCollector) collectRun(
 
 	for stageIndex := range run.Status.Evidence.Identity.Stages {
 		stage := &run.Status.Evidence.Identity.Stages[stageIndex]
+		for measurementIndex := range stage.Measurements {
+			measurement := &stage.Measurements[measurementIndex]
+
+			value, ok := numericMetricValue(measurement.Value)
+			if !ok {
+				continue
+			}
+
+			ch <- prometheus.MustNewConstMetric(
+				c.completedMeasurement,
+				prometheus.GaugeValue,
+				value,
+				run.Namespace,
+				run.Name,
+				string(run.UID),
+				stage.Name,
+				measurement.Name,
+				measurement.Unit,
+			)
+		}
+
 		if stage.Name != "r07-gpu-gemm-bf16" {
 			continue
 		}

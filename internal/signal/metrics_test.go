@@ -65,6 +65,20 @@ func TestCertificationMetricsCollectorPublishesActiveCompletedStageMinimum(t *te
 
 	families := gatherCertificationMetrics(t, run)
 
+	completed := families["project_signal_fleet_certification_measurement"]
+	if completed == nil || len(completed.Metric) != 2 {
+		t.Fatalf("completed measurements = %#v, want 2", completed)
+	}
+
+	assertMetricLabels(t, completed.Metric[0], map[string]string{
+		"namespace": "project-signal",
+		"run":       "active-run",
+		"run_uid":   "run-uid",
+		"stage":     "r07-gpu-gemm-bf16",
+		"metric_id": "gpu0MinTflops",
+		"unit":      "TFLOP/s",
+	})
+
 	minimum := families["project_signal_fleet_certification_r07_assertion_decimal"]
 	if minimum == nil || len(minimum.Metric) != 1 ||
 		minimum.Metric[0].Gauge == nil ||
@@ -99,6 +113,10 @@ func TestCertificationMetricsCollectorOmitsMissingMeasurements(t *testing.T) {
 	}
 
 	families := gatherCertificationMetrics(t, run)
+	if families["project_signal_fleet_certification_measurement"] != nil {
+		t.Fatalf("unexpected completed metrics without measurements: %#v", families)
+	}
+
 	if families["project_signal_fleet_certification_r07_assertion_decimal"] != nil {
 		t.Fatalf("unexpected metrics without measurements: %#v", families)
 	}
