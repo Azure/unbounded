@@ -333,6 +333,124 @@ mod tests {
         assert_eq!(decode(UID, true, Some(b"")), Err(StateError::Wiped));
     }
 
+    fn legacy_state() -> serde_json::Value {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+
+        let mut r = record();
+        r.sequence = 7;
+        r.membership_version = 3;
+        r.content_hash = "a".repeat(64);
+        r.membership_hash = "b".repeat(64);
+        r.publication_bytes = 1234;
+        r.desired_seats = 2;
+        r.committed_at = 100;
+        r.keyring.generation = 2;
+        r.keyring.next_rotation = 200;
+        r.keyring.activate_at = 150;
+        let mut value = serde_json::to_value(r).unwrap();
+        // v0.23 wrote hex IDs and base64 material in a JSON list, without page_bytes.
+        value["keyring"]["keys"] = serde_json::json!([
+            {"cache": UID, "id": "524b4731000000000000000200000004",
+             "purpose": "origin_credentials", "state": "prepared", "material": STANDARD.encode([4; 32])},
+            {"cache": UID, "id": "524b4731000000000000000100000002",
+             "purpose": "origin_credentials", "state": "active", "material": STANDARD.encode([2; 32])},
+            {"cache": UID, "id": "524b4731000000000000000200000003",
+             "purpose": "page", "state": "prepared", "material": STANDARD.encode([3; 32])},
+            {"cache": UID, "id": "524b4731000000000000000100000001",
+             "purpose": "page", "state": "active", "material": STANDARD.encode([1; 32])}
+        ]);
+        value
+    }
+
+    #[test]
+    fn legacy_keys_upgrade_to_compact_state() {
+        use racer_wire::control::{
+            CacheEncryptionKey, CacheId, CacheKeyPurpose, CacheKeyRef, CacheKeyState, KeyId,
+        };
+
+        let legacy = legacy_state();
+        assert!(legacy.get("page_bytes").is_none());
+        let decoded = decode(UID, true, Some(&serde_json::to_vec(&legacy).unwrap()))
+            .unwrap()
+            .unwrap();
+        let mut expected = record();
+        expected.sequence = 7;
+        expected.membership_version = 3;
+        expected.content_hash = "a".repeat(64);
+        expected.membership_hash = "b".repeat(64);
+        expected.publication_bytes = 1234;
+        expected.desired_seats = 2;
+        expected.committed_at = 100;
+        expected.keyring.generation = 2;
+        expected.keyring.next_rotation = 200;
+        expected.keyring.activate_at = 150;
+        for (purpose, generation, suffix, state) in [
+            (CacheKeyPurpose::Page, 1, 1, CacheKeyState::Active),
+            (CacheKeyPurpose::Page, 2, 3, CacheKeyState::Prepared),
+            (
+                CacheKeyPurpose::OriginCredentials,
+                1,
+                2,
+                CacheKeyState::Active,
+            ),
+            (
+                CacheKeyPurpose::OriginCredentials,
+                2,
+                4,
+                CacheKeyState::Prepared,
+            ),
+        ] {
+            expected.keyring.keys.push(CacheEncryptionKey::new(
+                CacheKeyRef {
+                    cache: CacheId(UID.into()),
+                    id: KeyId::from_generation(generation, suffix).unwrap(),
+                    purpose,
+                },
+                state,
+                Zeroizing::new([suffix as u8; 32]),
+            ));
+        }
+        assert_eq!(decoded, expected);
+        let encoded = encode(&decoded).unwrap();
+        let compact: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        assert!(compact["keyring"]["keys"].is_string());
+        assert_eq!(decode(UID, true, Some(&encoded)), Ok(Some(expected)));
+
+        let mut empty = legacy_state();
+        empty["keyring"]["keys"] = serde_json::json!([]);
+        assert!(decode(UID, true, Some(&serde_json::to_vec(&empty).unwrap())).is_ok());
+    }
+
+    #[test]
+    fn legacy_keys_reject_invalid_entries() {
+        for (field, bad) in [
+            ("id", "00"),
+            ("id", "zz4b4731000000000000000200000004"),
+            ("id", "éééééééééééééééé"),
+            ("purpose", "unknown"),
+            ("state", "unknown"),
+            ("material", "!"),
+            ("material", "AA=="),
+            ("cache", "not-a-uuid"),
+            ("id", "524b4731000000000000000300000004"),
+            ("extra", "unknown"),
+        ] {
+            let mut value = legacy_state();
+            value["keyring"]["keys"][0][field] = bad.into();
+            assert_eq!(
+                decode(UID, true, Some(&serde_json::to_vec(&value).unwrap())),
+                Err(StateError::Invalid),
+                "{field}={bad}"
+            );
+        }
+        let mut duplicate = legacy_state();
+        duplicate["keyring"]["keys"][0] = duplicate["keyring"]["keys"][1].clone();
+        assert_eq!(
+            decode(UID, true, Some(&serde_json::to_vec(&duplicate).unwrap())),
+            Err(StateError::Invalid)
+        );
+    }
+
     /// The page size is optional (older records lack it) and must be a
     /// valid size when present.
     #[test]
