@@ -28,6 +28,7 @@ unbounded-kube is organized into several directories:
 - `deploy/` - component manifests for deploying on a Kubernetes cluster.
   - `machina/` - machina controller manifest templates (*.yaml.tmpl) plus generated CRDs under `crd/`; rendered output lives under `machina/rendered/` (gitignored, produced by `make machina-manifests`).
   - `gantry/` - gantry DaemonSet, ConfigMap, and ServiceAccount manifests.
+  - `karpenter/` - rendered Karpenter plugin manifests under `karpenter/rendered/` (gitignored, produced by `make karpenter-manifests`); the template lives in the plugin module.
   - `net/` - unbounded-net controller and node manifest templates (*.yaml.tmpl); rendered output lives under `net/rendered/` (gitignored, produced by `make net-manifests`).
 - `designs/` - design documents, proposals, and internal planning documentation for the project.
 - `docs/` - public web site documentation only. Do not place design documents, plans, or ad-hoc internal docs here.
@@ -58,6 +59,10 @@ unbounded-kube is organized into several directories:
 - To build individual net binaries: `make unbounded-net-controller`, `make unbounded-net-node`, `make unbounded-net-routeplan-debug`, `make unping`, `make unroute`.
 - To build `gantry` use `make gantry` which runs tests and builds the binary.
 - To build `gantry` without lint/test use `make gantry-build` (used in Containerfiles).
+- The Karpenter plugin is a nested module, so the root `make fmt`, `make lint`, `make test` and `go build ./...` do not
+  cover it. Use `make karpenter` (lint, test, build), `make karpenter-fmt`, `make karpenter-test`,
+  `make karpenter-manifests` and `make image-karpenter-local`. Do not run `golangci-lint fmt` inside `plugins/`: it
+  resolves paths from the root config and reformats the whole repository.
 - Net-specific build tasks (container images, frontend, eBPF, render) are exposed via `net-` prefixed targets in the main `Makefile` (e.g., `make net-frontend`, `make net-ebpf-build`, `make net-ebpf-generate`, `make net-manifests`). Cluster deploy/undeploy targets live separately under `hack/net/` and are invoked via `make -C hack/net <target>` (e.g., `make -C hack/net deploy`). Run `make help` and `make -C hack/net help` for the full lists.
 - `make generate` runs `go generate ./...` to regenerate deepcopy, CRDs, and protobuf for all packages.
 - `make build` compiles all Go packages (`go build ./...`).

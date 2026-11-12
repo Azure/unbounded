@@ -166,8 +166,10 @@ jobs:
         if: always() && hashFiles('tmp/go-test.json') != ''
         run: go run ./hack/cmd/test-summary tmp/go-test.json >> "$GITHUB_STEP_SUMMARY"
 
+      # The plugin's API-server tests skip without envtest assets, so
+      # provision them here.
       - name: Test Karpenter plugin
-        run: make karpenter-test
+        run: make karpenter-test-ci
 
       - name: Upload coverage
         if: always()
