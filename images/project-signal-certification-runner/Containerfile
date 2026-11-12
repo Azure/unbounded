@@ -30,6 +30,18 @@ RUN : > /etc/apt/sources.list \
     && useradd --uid 65532 --gid 65532 --no-log-init --no-create-home \
         --home-dir /home/certification --shell /bin/bash certification \
     && install -d -o 65532 -g 65532 -m 0755 /home/certification \
+    && curl --fail --location --proto '=https' --tlsv1.2 \
+        https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/libnvidia-compute_590.48.01-0ubuntu1_amd64.deb \
+        -o /tmp/libnvidia-compute.deb \
+    && echo '87bd9b7f6e142f32e90a5efba52b74a9a790a69b44a46627d8ee1964aef7e809  /tmp/libnvidia-compute.deb' \
+        | sha256sum -c - \
+    && dpkg-deb -x /tmp/libnvidia-compute.deb /tmp/libnvidia-compute \
+    && echo '78c2d203c12619673ddd5ae9c487a79689c9461de40a9b948f3f4615f26dba29  /tmp/libnvidia-compute/usr/bin/nvidia-smi' \
+        | sha256sum -c - \
+    && install -m 0755 /tmp/libnvidia-compute/usr/bin/nvidia-smi /usr/local/bin/nvidia-smi \
+    && install -D -m 0644 /tmp/libnvidia-compute/usr/share/doc/libnvidia-compute/copyright \
+        /usr/share/licenses/project-signal-certification-runner/nvidia-driver-license \
+    && rm -rf /tmp/libnvidia-compute /tmp/libnvidia-compute.deb \
     && rm -f /etc/ssh/ssh_host_rsa_key /etc/ssh/ssh_host_rsa_key.pub \
         /etc/ssh/ssh_host_ecdsa_key /etc/ssh/ssh_host_ecdsa_key.pub \
         /etc/ssh/ssh_host_ed25519_key /etc/ssh/ssh_host_ed25519_key.pub \

@@ -40,6 +40,31 @@ def check_inputs(root=ROOT):
         raise ValueError("The official CUDA base must include a full digest")
     if f"FROM {lock['base']}\n" not in (root / "Containerfile").read_text():
         raise ValueError("Containerfile and locked CUDA base disagree")
+    nvidia_smi = lock.get("nvidia_smi", {})
+    if set(nvidia_smi) != {
+        "version", "package_version", "source_package", "url",
+        "package_sha256", "binary_sha256",
+    }:
+        raise ValueError("The nvidia-smi lock is incomplete")
+    nvidia_smi_url = urllib.parse.urlsplit(nvidia_smi["url"])
+    if (
+        nvidia_smi_url.scheme != "https"
+        or nvidia_smi_url.netloc != "developer.download.nvidia.com"
+        or nvidia_smi_url.query
+        or nvidia_smi_url.fragment
+        or nvidia_smi["source_package"] != "nvidia-graphics-drivers"
+        or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", nvidia_smi["version"])
+        or nvidia_smi["package_version"] != nvidia_smi["version"] + "-0ubuntu1"
+        or not re.fullmatch(r"[0-9a-f]{64}", nvidia_smi["package_sha256"])
+        or not re.fullmatch(r"[0-9a-f]{64}", nvidia_smi["binary_sha256"])
+    ):
+        raise ValueError("The nvidia-smi package lock is invalid")
+    containerfile = (root / "Containerfile").read_text()
+    for value in (
+        nvidia_smi["url"], nvidia_smi["package_sha256"], nvidia_smi["binary_sha256"],
+    ):
+        if value not in containerfile:
+            raise ValueError("Containerfile and nvidia-smi lock disagree")
     if not re.fullmatch(r"[0-9]{8}T[0-9]{6}Z", lock["ubuntu_snapshot"]):
         raise ValueError("Ubuntu snapshot timestamp is not immutable")
     snapshot = f"https://snapshot.ubuntu.com/ubuntu/{lock['ubuntu_snapshot']}/"
@@ -99,7 +124,9 @@ def check_inputs(root=ROOT):
         for tool in contract["path_tools"]
     ):
         raise ValueError("Runner contract path tools are invalid")
-    if contract["driver_injected_tools"] != ["nvidia-smi"]:
+    if "nvidia-smi" not in contract["path_tools"]:
+        raise ValueError("The runner image must own nvidia-smi")
+    if contract["driver_injected_tools"]:
         raise ValueError("Runner contract driver-injected tools changed")
     if not contract["runtime_gates"] or not all(
         isinstance(gate, str) and gate.strip() for gate in contract["runtime_gates"]

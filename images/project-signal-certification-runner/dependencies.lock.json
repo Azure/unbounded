@@ -9,6 +9,14 @@
     "sm_100",
     "compute_100"
   ],
+  "nvidia_smi": {
+    "version": "590.48.01",
+    "package_version": "590.48.01-0ubuntu1",
+    "source_package": "nvidia-graphics-drivers",
+    "url": "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/libnvidia-compute_590.48.01-0ubuntu1_amd64.deb",
+    "package_sha256": "87bd9b7f6e142f32e90a5efba52b74a9a790a69b44a46627d8ee1964aef7e809",
+    "binary_sha256": "78c2d203c12619673ddd5ae9c487a79689c9461de40a9b948f3f4615f26dba29"
+  },
   "sources": [
     {
       "name": "gpu-burn",

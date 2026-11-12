@@ -16,7 +16,11 @@ embedded script against its authoritative source revision and SHA-256.
   pinned in `dependencies.lock.json`, `requirements.lock`,
   `ubuntu.sources`, and `ubuntu-InRelease.sha256`.
 - Public workload tools include NCCL tests, NVBandwidth, GPU Burn, PyTorch,
-  OpenMPI, fio, compiler/OpenMP tooling, SSH, and journal utilities.
+  OpenMPI, fio, compiler/OpenMP tooling, SSH, journal utilities, and a
+  checksum-pinned `nvidia-smi` executable matching the qualified driver.
+- The image does not bundle NVIDIA driver libraries. The container runtime must
+  inject the host driver libraries and devices; image validation binds only the
+  unmodified `nvidia-smi` executable and its license.
 - `runner-contract.json` declares the software tools and runtime gates supplied
   by this image. It intentionally contains no script revision or script hash
   inventory.

@@ -38,11 +38,10 @@
     "sed",
     "stat",
     "ps",
-    "ldd"
-  ],
-  "driver_injected_tools": [
+    "ldd",
     "nvidia-smi"
   ],
+  "driver_injected_tools": [],
   "runtime_gates": [
     "Authorized driver and runtime injection, assigned GPUs, and native workload execution remain required.",
     "The caller supplies every script policy, threshold, duration, selection, result mount, and permission.",

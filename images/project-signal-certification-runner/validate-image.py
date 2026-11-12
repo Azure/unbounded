@@ -119,6 +119,11 @@ def main():
         if path is None:
             raise RuntimeError(f"Required image tool missing: {name}")
         resolved[name] = str(pathlib.Path(path).resolve())
+    nvidia_smi = pathlib.Path(resolved["nvidia-smi"])
+    if hashlib.sha256(nvidia_smi.read_bytes()).hexdigest() != lock["nvidia_smi"]["binary_sha256"]:
+        raise RuntimeError("nvidia-smi binary disagrees with the lock")
+    if lock["nvidia_smi"]["version"] not in command([resolved["nvidia-smi"], "--help"]):
+        raise RuntimeError("nvidia-smi executable version disagrees with the lock")
     for literal in ("/bin/bash", "/bin/true", "/usr/sbin/sshd"):
         if not pathlib.Path(literal).is_file() or not os.access(literal, os.X_OK):
             raise RuntimeError(f"Required literal executable missing: {literal}")
@@ -186,6 +191,12 @@ def main():
         "runner_contract_version": contract["version"], "platform": lock["platform"],
         "python": sys.version.split()[0], "python_distributions": installed,
         "torch_cuda_release": torch.version.cuda, "torch_compiled_architectures": flags,
+        "nvidia_smi": {
+            "path": resolved["nvidia-smi"],
+            "version": lock["nvidia_smi"]["version"],
+            "sha256": lock["nvidia_smi"]["binary_sha256"],
+            "driver_libraries": "runtime-injected",
+        },
         "mpi_launcher_version": mpi_version,
         "resolved_tools": resolved, "sanitized_loader": loaders,
         "compare_fatbin_sha256": hashlib.sha256(kernel.read_bytes()).hexdigest(),
