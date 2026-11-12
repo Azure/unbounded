@@ -166,6 +166,7 @@ func TestStandardVirtualMediaCleanupPhaseBoundary(t *testing.T) {
 					current := mediaStep(t, r, op.Name)
 
 					current.Status.Targets[0].BootMedia.Phase = phase
+
 					switch ending {
 					case "terminal":
 						current.Status.Phase = v1alpha3.OperationPhaseFailed

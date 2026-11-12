@@ -280,6 +280,10 @@ func (c *Client) prepareVirtualMediaInsert(ctx context.Context, source bootmedia
 		return virtualMediaDevice{}, nil, fmt.Errorf("no CD or DVD device advertises #VirtualMedia.InsertMedia: %w", ErrUnsupported)
 	}
 
+	if _, err := device.insertTarget(); err != nil {
+		return virtualMediaDevice{}, nil, err
+	}
+
 	body, err := c.insertMediaBody(ctx, *device, source.URL)
 
 	return *device, body, err
@@ -299,9 +303,9 @@ func (c *Client) standardMountVirtualMedia(ctx context.Context, source bootmedia
 		return c.waitVirtualMediaInsert(ctx, device.path, source.URL, nil)
 	}
 
-	target, err := actionPath(device.insert.Target, device.path)
+	target, err := device.insertTarget()
 	if err != nil {
-		return fmt.Errorf("parsing InsertMedia target: %w", err)
+		return err
 	}
 
 	if device.inserted {
@@ -406,6 +410,19 @@ func (c *Client) insertMediaBody(ctx context.Context, device virtualMediaDevice,
 	}
 
 	return body, nil
+}
+
+func (d virtualMediaDevice) insertTarget() (string, error) {
+	if d.insert == nil {
+		return "", fmt.Errorf("virtual media %s does not advertise #VirtualMedia.InsertMedia: %w", d.path, ErrUnsupported)
+	}
+
+	target, err := actionPath(d.insert.Target, d.path)
+	if err != nil {
+		return "", fmt.Errorf("parsing InsertMedia target: %w", err)
+	}
+
+	return target, nil
 }
 
 func (d virtualMediaDevice) ejectTarget() (string, error) {

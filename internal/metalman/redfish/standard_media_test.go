@@ -34,6 +34,7 @@ type fakeILO struct {
 	noManager, systemMedia, requireMatch bool
 	insertStatus, patchStatus            int
 	errorBody, actionInfo, async         string
+	insertTarget                         string
 	etag, polls                          int
 	mutations                            []string
 	patches                              []map[string]string
@@ -204,6 +205,10 @@ func newFakeILOWithDeviceID(t *testing.T, deviceID string) (*fakeILO, *Client) {
 			}
 
 			insert := &redfishAction{Target: base + "Actions/VirtualMedia.InsertMedia/"}
+			if f.insertTarget != "" {
+				insert.Target = f.insertTarget
+			}
+
 			if f.actionInfo != "" {
 				insert.ActionInfo = base + "InsertMediaActionInfo/"
 			}
@@ -774,6 +779,68 @@ func TestStandardVirtualMediaStagingSelectsMountDevice(t *testing.T) {
 			require.Equal(t, 2, f.actionInfoReads)
 			require.Empty(t, f.mutations)
 		})
+	}
+}
+
+func TestStandardVirtualMediaStagingInsertTarget(t *testing.T) {
+	for _, state := range []struct {
+		name     string
+		image    string
+		inserted bool
+	}{
+		{"empty", "", false},
+		{"occupied", "http://192.0.2.99/other.iso", true},
+		{"already mounted", testISOURL, true},
+	} {
+		for _, target := range []struct {
+			name, path string
+			invalid    bool
+		}{
+			{"relative", "Actions/VirtualMedia.InsertMedia/", false},
+			{"root relative", "/redfish/v1/Managers/1/VirtualMedia/2/Actions/VirtualMedia.InsertMedia/", false},
+			{"absolute", "https://bmc.example/redfish/v1/Managers/1/VirtualMedia/2/Actions/VirtualMedia.InsertMedia/", false},
+			{"malformed", "http://[invalid", true},
+		} {
+			t.Run(state.name+"/"+target.name, func(t *testing.T) {
+				f, c := newFakeILO(t)
+				f.powerState = PowerOn
+				f.image, f.inserted = state.image, state.inserted
+				f.insertTarget = target.path
+
+				stageErr := c.StageVirtualMedia(t.Context(), standardMedia)
+				require.Empty(t, f.mutations)
+				require.Equal(t, state.image, f.image)
+				require.Equal(t, state.inserted, f.inserted)
+
+				mountErr := c.MountVirtualMedia(t.Context(), standardMedia)
+				if target.invalid && state.image != testISOURL {
+					for _, err := range []error{stageErr, mountErr} {
+						require.ErrorContains(t, err, "parsing InsertMedia target")
+						require.NotErrorIs(t, err, ErrUnsupported)
+					}
+
+					require.Empty(t, f.mutations)
+					require.Equal(t, state.image, f.image)
+					require.Equal(t, state.inserted, f.inserted)
+				} else {
+					require.NoError(t, stageErr)
+					require.NoError(t, mountErr)
+					require.True(t, f.inserted)
+					require.Equal(t, testISOURL, f.image)
+
+					if state.image == testISOURL {
+						require.Empty(t, f.mutations)
+					} else {
+						require.Equal(t, []map[string]any{{"Image": testISOURL}}, f.inserts)
+					}
+				}
+
+				power, err := c.PowerState(t.Context())
+				require.NoError(t, err)
+				require.Equal(t, PowerOn, power)
+				require.NotContains(t, f.mutations, "POST /redfish/v1/Systems/1/Actions/ComputerSystem.Reset/")
+			})
+		}
 	}
 }
 
