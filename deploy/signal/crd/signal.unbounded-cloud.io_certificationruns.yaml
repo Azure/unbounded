@@ -239,20 +239,22 @@ spec:
                                 Project Signal mount
                               rule: self.mountPath != '/scripts' && !self.mountPath.startsWith('/scripts/')
                                 && self.mountPath != '/results' && !self.mountPath.startsWith('/results/')
-                            - message: path must be an approved proc leaf or a clean
-                                path under /sys or /var/lib/project-signal
+                            - message: path must be an approved proc leaf, journal
+                                path, or a clean path under /sys or /var/lib/project-signal
                               rule: (self.path == '/proc/cpuinfo' || self.path ==
                                 '/proc/meminfo' || self.path == '/proc/version' ||
                                 self.path == '/proc/sys/kernel/random/boot_id' ||
                                 self.path == '/sys' || self.path.startsWith('/sys/')
-                                || self.path == '/var/lib/project-signal' || self.path.startsWith('/var/lib/project-signal/'))
-                                && !self.path.contains('//') && !self.path.contains('/./')
-                                && !self.path.contains('/../') && !self.path.endsWith('/.')
-                                && !self.path.endsWith('/..')
-                            - message: proc and sys host paths must be read-only
+                                || self.path == '/var/lib/project-signal' || self.path.startsWith('/var/lib/project-signal/')
+                                || self.path == '/var/log' || self.path == '/run/log'
+                                || self.path == '/etc/machine-id') && !self.path.contains('//')
+                                && !self.path.contains('/./') && !self.path.contains('/../')
+                                && !self.path.endsWith('/.') && !self.path.endsWith('/..')
+                            - message: proc, sys, and journal host paths must be read-only
                               rule: '!(self.path.startsWith(''/proc/'') || self.path
-                                == ''/sys'' || self.path.startsWith(''/sys/'')) ||
-                                self.readOnly'
+                                == ''/sys'' || self.path.startsWith(''/sys/'') ||
+                                self.path == ''/var/log'' || self.path == ''/run/log''
+                                || self.path == ''/etc/machine-id'') || self.readOnly'
                           maxItems: 16
                           type: array
                           x-kubernetes-list-map-keys:
@@ -724,7 +726,7 @@ spec:
                                           minLength: 1
                                           type: string
                                         stringValue:
-                                          maxLength: 256
+                                          maxLength: 65536
                                           type: string
                                         type:
                                           enum:
@@ -787,7 +789,7 @@ spec:
                                           minLength: 1
                                           type: string
                                         stringValue:
-                                          maxLength: 256
+                                          maxLength: 65536
                                           type: string
                                         type:
                                           enum:
@@ -856,7 +858,7 @@ spec:
                                           minLength: 1
                                           type: string
                                         stringValue:
-                                          maxLength: 256
+                                          maxLength: 65536
                                           type: string
                                         type:
                                           enum:
@@ -946,10 +948,36 @@ spec:
                                       assertions
                                     rule: self.operator == 'PercentileMaximum' ||
                                       !has(self.percentile)
-                                maxItems: 8
+                                maxItems: 16
                                 type: array
                                 x-kubernetes-list-map-keys:
                                 - name
+                                x-kubernetes-list-type: map
+                              dependsOn:
+                                items:
+                                  properties:
+                                    condition:
+                                      description: |-
+                                        Condition defaults to Succeeded. Completed allows terminal cleanup or
+                                        evidence stages to run after any terminal dependency outcome.
+                                      enum:
+                                      - Succeeded
+                                      - Completed
+                                      type: string
+                                    stage:
+                                      description: Stage is the stable name of another
+                                        stage in this Suite.
+                                      maxLength: 63
+                                      minLength: 1
+                                      pattern: ^[a-z]([-a-z0-9]*[a-z0-9])?$
+                                      type: string
+                                  required:
+                                  - stage
+                                  type: object
+                                maxItems: 16
+                                type: array
+                                x-kubernetes-list-map-keys:
+                                - stage
                                 x-kubernetes-list-type: map
                               diagnosticOnly:
                                 type: boolean
@@ -991,7 +1019,7 @@ spec:
                                           minLength: 1
                                           type: string
                                         stringValue:
-                                          maxLength: 256
+                                          maxLength: 65536
                                           type: string
                                         type:
                                           enum:
@@ -1339,96 +1367,102 @@ spec:
                                             || size(self.resources.claims) <= 16'
                                       script:
                                         properties:
+                                          artifact:
+                                            description: Artifact names an entry in
+                                              CertificationTest.spec.artifacts.
+                                            maxLength: 253
+                                            minLength: 1
+                                            pattern: ^[A-Za-z0-9._-]+$
+                                            type: string
                                           language:
                                             enum:
                                             - Shell
                                             - Python
                                             type: string
+                                          resources:
+                                            description: ResourceRequirements describes
+                                              the compute resource requirements.
+                                            properties:
+                                              claims:
+                                                description: |-
+                                                  Claims lists the names of resources, defined in spec.resourceClaims,
+                                                  that are used by this container.
+
+                                                  This field depends on the
+                                                  DynamicResourceAllocation feature gate.
+
+                                                  This field is immutable. It can only be set for containers.
+                                                items:
+                                                  description: ResourceClaim references
+                                                    one entry in PodSpec.ResourceClaims.
+                                                  properties:
+                                                    name:
+                                                      description: |-
+                                                        Name must match the name of one entry in pod.spec.resourceClaims of
+                                                        the Pod where this field is used. It makes that resource available
+                                                        inside a container.
+                                                      type: string
+                                                    request:
+                                                      description: |-
+                                                        Request is the name chosen for a request in the referenced claim.
+                                                        If empty, everything from the claim is made available, otherwise
+                                                        only the result of this request.
+                                                      type: string
+                                                  required:
+                                                  - name
+                                                  type: object
+                                                type: array
+                                                x-kubernetes-list-map-keys:
+                                                - name
+                                                x-kubernetes-list-type: map
+                                              limits:
+                                                additionalProperties:
+                                                  anyOf:
+                                                  - type: integer
+                                                  - type: string
+                                                  pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                                                  x-kubernetes-int-or-string: true
+                                                description: |-
+                                                  Limits describes the maximum amount of compute resources allowed.
+                                                  More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                                                type: object
+                                              requests:
+                                                additionalProperties:
+                                                  anyOf:
+                                                  - type: integer
+                                                  - type: string
+                                                  pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                                                  x-kubernetes-int-or-string: true
+                                                description: |-
+                                                  Requests describes the minimum amount of compute resources required.
+                                                  If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
+                                                  otherwise to an implementation-defined value. Requests cannot exceed Limits.
+                                                  More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                                                type: object
+                                            type: object
                                           runnerImage:
                                             description: RunnerImage is the approved
                                               digest-pinned runtime for the payload.
                                             pattern: ^[^@\s]+@sha256:[0-9a-f]{64}$
                                             type: string
-                                          source:
-                                            properties:
-                                              configMap:
-                                                properties:
-                                                  digest:
-                                                    pattern: ^sha256:[0-9a-f]{64}$
-                                                    type: string
-                                                  key:
-                                                    maxLength: 253
-                                                    minLength: 1
-                                                    type: string
-                                                  name:
-                                                    maxLength: 253
-                                                    minLength: 1
-                                                    type: string
-                                                required:
-                                                - digest
-                                                - key
-                                                - name
-                                                type: object
-                                              git:
-                                                properties:
-                                                  commit:
-                                                    pattern: ^[0-9a-f]{40}$
-                                                    type: string
-                                                  digest:
-                                                    pattern: ^sha256:[0-9a-f]{64}$
-                                                    type: string
-                                                  path:
-                                                    maxLength: 1024
-                                                    minLength: 1
-                                                    type: string
-                                                  repository:
-                                                    pattern: ^https://[^\s]+$
-                                                    type: string
-                                                required:
-                                                - commit
-                                                - digest
-                                                - path
-                                                - repository
-                                                type: object
-                                              oci:
-                                                properties:
-                                                  reference:
-                                                    description: Reference must include
-                                                      a digest and must not be a mutable
-                                                      tag.
-                                                    pattern: ^[^@\s]+@sha256:[0-9a-f]{64}$
-                                                    type: string
-                                                required:
-                                                - reference
-                                                type: object
-                                              type:
-                                                enum:
-                                                - ConfigMap
-                                                - OCI
-                                                - Git
-                                                type: string
-                                            required:
-                                            - type
-                                            type: object
-                                            x-kubernetes-validations:
-                                            - message: ConfigMap sources require configMap
-                                              rule: self.type != 'ConfigMap' || has(self.configMap)
-                                            - message: configMap is valid only for
-                                                ConfigMap sources
-                                              rule: self.type == 'ConfigMap' || !has(self.configMap)
-                                            - message: OCI sources require oci
-                                              rule: self.type != 'OCI' || has(self.oci)
-                                            - message: oci is valid only for OCI sources
-                                              rule: self.type == 'OCI' || !has(self.oci)
-                                            - message: Git sources require git
-                                              rule: self.type != 'Git' || has(self.git)
-                                            - message: git is valid only for Git sources
-                                              rule: self.type == 'Git' || !has(self.git)
                                         required:
+                                        - artifact
                                         - language
                                         - runnerImage
-                                        - source
                                         type: object
+                                        x-kubernetes-validations:
+                                        - message: script resource limits must not
+                                            exceed 16 entries
+                                          rule: '!has(self.resources) || !has(self.resources.limits)
+                                            || size(self.resources.limits) <= 16'
+                                        - message: script resource requests must not
+                                            exceed 16 entries
+                                          rule: '!has(self.resources) || !has(self.resources.requests)
+                                            || size(self.resources.requests) <= 16'
+                                        - message: script resource claims must not
+                                            exceed 16 entries
+                                          rule: '!has(self.resources) || !has(self.resources.claims)
+                                            || size(self.resources.claims) <= 16'
                                       type:
                                         enum:
                                         - Script
@@ -1437,6 +1471,13 @@ spec:
                                         type: string
                                       workflowTemplate:
                                         properties:
+                                          artifact:
+                                            description: |-
+                                              Artifact optionally names an entry in CertificationTest.spec.artifacts
+                                              passed to the WorkflowTemplate as the standard script parameters.
+                                            maxLength: 253
+                                            pattern: ^$|^[A-Za-z0-9._-]+$
+                                            type: string
                                           digest:
                                             pattern: ^sha256:[0-9a-f]{64}$
                                             type: string
@@ -1593,20 +1634,25 @@ spec:
                                               !self.mountPath.startsWith('/scripts/')
                                               && self.mountPath != '/results' && !self.mountPath.startsWith('/results/')
                                           - message: path must be an approved proc
-                                              leaf or a clean path under /sys or /var/lib/project-signal
+                                              leaf, journal path, or a clean path
+                                              under /sys or /var/lib/project-signal
                                             rule: (self.path == '/proc/cpuinfo' ||
                                               self.path == '/proc/meminfo' || self.path
                                               == '/proc/version' || self.path == '/proc/sys/kernel/random/boot_id'
                                               || self.path == '/sys' || self.path.startsWith('/sys/')
                                               || self.path == '/var/lib/project-signal'
-                                              || self.path.startsWith('/var/lib/project-signal/'))
+                                              || self.path.startsWith('/var/lib/project-signal/')
+                                              || self.path == '/var/log' || self.path
+                                              == '/run/log' || self.path == '/etc/machine-id')
                                               && !self.path.contains('//') && !self.path.contains('/./')
                                               && !self.path.contains('/../') && !self.path.endsWith('/.')
                                               && !self.path.endsWith('/..')
-                                          - message: proc and sys host paths must
-                                              be read-only
+                                          - message: proc, sys, and journal host paths
+                                              must be read-only
                                             rule: '!(self.path.startsWith(''/proc/'')
-                                              || self.path == ''/sys'' || self.path.startsWith(''/sys/''))
+                                              || self.path == ''/sys'' || self.path.startsWith(''/sys/'')
+                                              || self.path == ''/var/log'' || self.path
+                                              == ''/run/log'' || self.path == ''/etc/machine-id'')
                                               || self.readOnly'
                                         maxItems: 8
                                         type: array
@@ -2296,7 +2342,7 @@ spec:
                                         minLength: 1
                                         type: string
                                       stringValue:
-                                        maxLength: 256
+                                        maxLength: 65536
                                         type: string
                                       type:
                                         enum:
@@ -2506,6 +2552,107 @@ spec:
                               x-kubernetes-validations:
                               - message: observedCoverageWindow must not be negative
                                 rule: duration(self) >= duration('0s')
+                            participants:
+                              items:
+                                properties:
+                                  end:
+                                    properties:
+                                      bootID:
+                                        maxLength: 128
+                                        type: string
+                                      driverVersion:
+                                        maxLength: 128
+                                        type: string
+                                      gpuInventoryDigest:
+                                        pattern: ^sha256:[0-9a-f]{64}$
+                                        type: string
+                                      kernelVersion:
+                                        maxLength: 256
+                                        type: string
+                                      kubeletVersion:
+                                        maxLength: 128
+                                        type: string
+                                      nodeUID:
+                                        description: |-
+                                          UID is a type that holds unique ID values, including UUIDs.  Because we
+                                          don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                                          intent and helps make sure that UIDs and names do not get conflated.
+                                        type: string
+                                      osImage:
+                                        maxLength: 256
+                                        type: string
+                                      systemUUID:
+                                        maxLength: 128
+                                        type: string
+                                    required:
+                                    - nodeUID
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: nodeUID is required
+                                      rule: size(self.nodeUID) > 0
+                                  index:
+                                    format: int32
+                                    maximum: 7
+                                    minimum: 0
+                                    type: integer
+                                  role:
+                                    enum:
+                                    - Requester
+                                    - Participant
+                                    type: string
+                                  start:
+                                    properties:
+                                      bootID:
+                                        maxLength: 128
+                                        type: string
+                                      driverVersion:
+                                        maxLength: 128
+                                        type: string
+                                      gpuInventoryDigest:
+                                        pattern: ^sha256:[0-9a-f]{64}$
+                                        type: string
+                                      kernelVersion:
+                                        maxLength: 256
+                                        type: string
+                                      kubeletVersion:
+                                        maxLength: 128
+                                        type: string
+                                      nodeUID:
+                                        description: |-
+                                          UID is a type that holds unique ID values, including UUIDs.  Because we
+                                          don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                                          intent and helps make sure that UIDs and names do not get conflated.
+                                        type: string
+                                      osImage:
+                                        maxLength: 256
+                                        type: string
+                                      systemUUID:
+                                        maxLength: 128
+                                        type: string
+                                    required:
+                                    - nodeUID
+                                    type: object
+                                    x-kubernetes-validations:
+                                    - message: nodeUID is required
+                                      rule: size(self.nodeUID) > 0
+                                  verdict:
+                                    enum:
+                                    - Pass
+                                    - Fail
+                                    - Inconclusive
+                                    type: string
+                                required:
+                                - end
+                                - index
+                                - role
+                                - start
+                                - verdict
+                                type: object
+                              maxItems: 16
+                              type: array
+                              x-kubernetes-list-map-keys:
+                              - index
+                              x-kubernetes-list-type: map
                             phaseOrder:
                               format: int32
                               maximum: 15

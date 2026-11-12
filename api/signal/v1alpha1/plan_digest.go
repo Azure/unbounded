@@ -143,6 +143,10 @@ func DeriveResolvedExecutionPlanDigest(
 		}
 	}
 
+	if _, err := resolvedStageDependencyGraph(plan.Phases); err != nil {
+		return "", fmt.Errorf("resolved stage dependencies are invalid: %w", err)
+	}
+
 	for phaseIndex := range plan.Phases {
 		if len(plan.Phases[phaseIndex].Stages) == 0 {
 			return "", fmt.Errorf("phase %d must contain at least one stage", phaseIndex)
@@ -387,6 +391,9 @@ func canonicalizeResolvedPlan(plan ResolvedCertificationPlan) *ResolvedCertifica
 				})
 			}
 
+			sort.Slice(stage.DependsOn, func(left, right int) bool {
+				return stage.DependsOn[left].Stage < stage.DependsOn[right].Stage
+			})
 			sort.Slice(stage.Assertions, func(left, right int) bool {
 				return stage.Assertions[left].Name < stage.Assertions[right].Name
 			})
@@ -517,6 +524,9 @@ func isAllowedSignalHostPath(value string) bool {
 		value == "/proc/sys/kernel/random/boot_id" ||
 		value == "/sys" ||
 		strings.HasPrefix(value, "/sys/") ||
+		value == "/var/log" ||
+		value == "/run/log" ||
+		value == "/etc/machine-id" ||
 		value == "/var/lib/project-signal" ||
 		strings.HasPrefix(value, "/var/lib/project-signal/")
 }
@@ -531,7 +541,10 @@ func isReservedSignalMount(value string) bool {
 func isReadOnlySignalHostPath(value string) bool {
 	return strings.HasPrefix(value, "/proc/") ||
 		value == "/sys" ||
-		strings.HasPrefix(value, "/sys/")
+		strings.HasPrefix(value, "/sys/") ||
+		value == "/var/log" ||
+		value == "/run/log" ||
+		value == "/etc/machine-id"
 }
 
 func validateResolvedDriver(driver CertificationTestDriver) error {
@@ -545,24 +558,8 @@ func validateResolvedDriver(driver CertificationTestDriver) error {
 			return errors.New("script runner image must be digest-pinned")
 		}
 
-		switch driver.Script.Source.Type {
-		case ArtifactSourceTypeConfigMap:
-			if driver.Script.Source.ConfigMap == nil ||
-				!IsSHA256Digest(driver.Script.Source.ConfigMap.Digest) {
-				return errors.New("ConfigMap source digest is invalid")
-			}
-		case ArtifactSourceTypeOCI:
-			if driver.Script.Source.OCI == nil ||
-				!IsDigestPinnedImage(driver.Script.Source.OCI.Reference) {
-				return errors.New("OCI source must be digest-pinned")
-			}
-		case ArtifactSourceTypeGit:
-			if driver.Script.Source.Git == nil ||
-				!IsSHA256Digest(driver.Script.Source.Git.Digest) {
-				return errors.New("git source digest is invalid")
-			}
-		default:
-			return errors.New("script source type is invalid")
+		if strings.TrimSpace(driver.Script.Artifact) == "" {
+			return errors.New("script artifact is missing")
 		}
 	case TestDriverTypeContainer:
 		if driver.Container == nil || !IsDigestPinnedImage(driver.Container.Image) {

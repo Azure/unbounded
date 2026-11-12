@@ -9,9 +9,12 @@ import (
 )
 
 const (
-	MaxTestParameters = 16
-	MaxTestMetrics    = 16
-	MaxTestRoles      = 8
+	MaxTestParameters     = 16
+	MaxTestMetrics        = 16
+	MaxTestRoles          = 8
+	MaxTestArtifactBytes  = 95 * 1024
+	MaxTestArtifactsBytes = 320 * 1024
+	MaxTypedStringLength  = 65536
 )
 
 // +kubebuilder:validation:Enum=String;Integer;Decimal;Boolean;Duration;Quantity
@@ -29,7 +32,7 @@ const (
 // +kubebuilder:validation:XValidation:rule="(self.type == 'String' && has(self.stringValue) && !has(self.integerValue) && !has(self.decimalValue) && !has(self.booleanValue) && !has(self.durationValue) && !has(self.quantityValue)) || (self.type == 'Integer' && !has(self.stringValue) && has(self.integerValue) && !has(self.decimalValue) && !has(self.booleanValue) && !has(self.durationValue) && !has(self.quantityValue)) || (self.type == 'Decimal' && !has(self.stringValue) && !has(self.integerValue) && has(self.decimalValue) && !has(self.booleanValue) && !has(self.durationValue) && !has(self.quantityValue)) || (self.type == 'Boolean' && !has(self.stringValue) && !has(self.integerValue) && !has(self.decimalValue) && has(self.booleanValue) && !has(self.durationValue) && !has(self.quantityValue)) || (self.type == 'Duration' && !has(self.stringValue) && !has(self.integerValue) && !has(self.decimalValue) && !has(self.booleanValue) && has(self.durationValue) && !has(self.quantityValue)) || (self.type == 'Quantity' && !has(self.stringValue) && !has(self.integerValue) && !has(self.decimalValue) && !has(self.booleanValue) && !has(self.durationValue) && has(self.quantityValue))",message="exactly the value field matching type must be set"
 type TypedValue struct {
 	Type TypedValueType `json:"type"`
-	// +kubebuilder:validation:MaxLength=256
+	// +kubebuilder:validation:MaxLength=65536
 	StringValue  *string `json:"stringValue,omitempty"`
 	IntegerValue *int64  `json:"integerValue,omitempty"`
 	// DecimalValue is a base-10 JSON-independent decimal representation.
@@ -130,55 +133,18 @@ type TestTopology struct {
 	Roles []TestParticipantRole `json:"roles,omitempty"`
 }
 
-type ConfigMapArtifactSource struct {
+type TestArtifact struct {
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9._-]+$`
 	Name string `json:"name"`
+	// Content is materialized into the execution workload only after the
+	// CertificationTest identity and trust decision match the admitted Run.
 	// +kubebuilder:validation:MinLength=1
-	// +kubebuilder:validation:MaxLength=253
-	Key string `json:"key"`
+	// +kubebuilder:validation:MaxLength=97280
+	Content string `json:"content"`
 	// +kubebuilder:validation:Pattern=`^sha256:[0-9a-f]{64}$`
 	Digest string `json:"digest"`
-}
-
-type OCIArtifactSource struct {
-	// Reference must include a digest and must not be a mutable tag.
-	// +kubebuilder:validation:Pattern=`^[^@\s]+@sha256:[0-9a-f]{64}$`
-	Reference string `json:"reference"`
-}
-
-type GitArtifactSource struct {
-	// +kubebuilder:validation:Pattern=`^https://[^\s]+$`
-	Repository string `json:"repository"`
-	// +kubebuilder:validation:Pattern=`^[0-9a-f]{40}$`
-	Commit string `json:"commit"`
-	// +kubebuilder:validation:MinLength=1
-	// +kubebuilder:validation:MaxLength=1024
-	Path string `json:"path"`
-	// +kubebuilder:validation:Pattern=`^sha256:[0-9a-f]{64}$`
-	Digest string `json:"digest"`
-}
-
-// +kubebuilder:validation:Enum=ConfigMap;OCI;Git
-type ArtifactSourceType string
-
-const (
-	ArtifactSourceTypeConfigMap ArtifactSourceType = "ConfigMap"
-	ArtifactSourceTypeOCI       ArtifactSourceType = "OCI"
-	ArtifactSourceTypeGit       ArtifactSourceType = "Git"
-)
-
-// +kubebuilder:validation:XValidation:rule="self.type != 'ConfigMap' || has(self.configMap)",message="ConfigMap sources require configMap"
-// +kubebuilder:validation:XValidation:rule="self.type == 'ConfigMap' || !has(self.configMap)",message="configMap is valid only for ConfigMap sources"
-// +kubebuilder:validation:XValidation:rule="self.type != 'OCI' || has(self.oci)",message="OCI sources require oci"
-// +kubebuilder:validation:XValidation:rule="self.type == 'OCI' || !has(self.oci)",message="oci is valid only for OCI sources"
-// +kubebuilder:validation:XValidation:rule="self.type != 'Git' || has(self.git)",message="Git sources require git"
-// +kubebuilder:validation:XValidation:rule="self.type == 'Git' || !has(self.git)",message="git is valid only for Git sources"
-type ImmutableArtifactSource struct {
-	Type      ArtifactSourceType       `json:"type"`
-	ConfigMap *ConfigMapArtifactSource `json:"configMap,omitempty"`
-	OCI       *OCIArtifactSource       `json:"oci,omitempty"`
-	Git       *GitArtifactSource       `json:"git,omitempty"`
 }
 
 // +kubebuilder:validation:Enum=Shell;Python
@@ -189,12 +155,20 @@ const (
 	ScriptLanguagePython ScriptLanguage = "Python"
 )
 
+// +kubebuilder:validation:XValidation:rule="!has(self.resources) || !has(self.resources.limits) || size(self.resources.limits) <= 16",message="script resource limits must not exceed 16 entries"
+// +kubebuilder:validation:XValidation:rule="!has(self.resources) || !has(self.resources.requests) || size(self.resources.requests) <= 16",message="script resource requests must not exceed 16 entries"
+// +kubebuilder:validation:XValidation:rule="!has(self.resources) || !has(self.resources.claims) || size(self.resources.claims) <= 16",message="script resource claims must not exceed 16 entries"
 type ScriptTestDriver struct {
-	Language ScriptLanguage          `json:"language"`
-	Source   ImmutableArtifactSource `json:"source"`
+	Language ScriptLanguage `json:"language"`
+	// Artifact names an entry in CertificationTest.spec.artifacts.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9._-]+$`
+	Artifact string `json:"artifact"`
 	// RunnerImage is the approved digest-pinned runtime for the payload.
 	// +kubebuilder:validation:Pattern=`^[^@\s]+@sha256:[0-9a-f]{64}$`
-	RunnerImage string `json:"runnerImage"`
+	RunnerImage string                      `json:"runnerImage"`
+	Resources   corev1.ResourceRequirements `json:"resources,omitempty"`
 }
 
 // +kubebuilder:validation:XValidation:rule="!has(self.resources) || !has(self.resources.limits) || size(self.resources.limits) <= 16",message="container resource limits must not exceed 16 entries"
@@ -218,6 +192,11 @@ type WorkflowTemplateTestDriver struct {
 	Name string `json:"name"`
 	// +kubebuilder:validation:Pattern=`^sha256:[0-9a-f]{64}$`
 	Digest string `json:"digest"`
+	// Artifact optionally names an entry in CertificationTest.spec.artifacts
+	// passed to the WorkflowTemplate as the standard script parameters.
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^$|^[A-Za-z0-9._-]+$`
+	Artifact string `json:"artifact,omitempty"`
 }
 
 // +kubebuilder:validation:Enum=Script;Container;WorkflowTemplate
@@ -257,6 +236,9 @@ type TestSecurityRequirements struct {
 }
 
 // +kubebuilder:validation:XValidation:rule="!has(self.topology) || self.topology.minParticipants <= self.topology.maxParticipants",message="minParticipants must not exceed maxParticipants"
+// +kubebuilder:validation:XValidation:rule="self.driver.type != 'Script' || (has(self.artifacts) && self.artifacts.exists(a, a.name == self.driver.script.artifact))",message="Script driver artifact must exist in spec.artifacts"
+// +kubebuilder:validation:XValidation:rule="self.driver.type != 'WorkflowTemplate' || !has(self.driver.workflowTemplate.artifact) || (has(self.artifacts) && self.artifacts.exists(a, a.name == self.driver.workflowTemplate.artifact))",message="WorkflowTemplate driver artifact must exist in spec.artifacts"
+// +kubebuilder:validation:XValidation:rule="!has(self.artifacts) || self.artifacts.map(a, a.content.size()).sum() <= 327680",message="total artifact content must not exceed 327680 characters"
 type CertificationTestSpec struct {
 	// Metadata name is the stable machine name.
 	// +kubebuilder:validation:MinLength=1
@@ -279,6 +261,12 @@ type CertificationTestSpec struct {
 	// +listType=map
 	// +listMapKey=name
 	Parameters []TestParameterDefinition `json:"parameters,omitempty"`
+	// Artifacts are inline, digest-verified execution inputs owned by this Test.
+	// They are not copied into CertificationRun resolved plans.
+	// +kubebuilder:validation:MaxItems=16
+	// +listType=map
+	// +listMapKey=name
+	Artifacts []TestArtifact `json:"artifacts,omitempty"`
 	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:MaxItems=16
 	// +listType=map

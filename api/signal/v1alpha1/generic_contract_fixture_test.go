@@ -4,6 +4,8 @@
 package v1alpha1
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"testing"
@@ -236,6 +238,19 @@ func TestResolvedStageRejectsUnsafeSecurityAndTopology(t *testing.T) {
 
 	_, _, base := genericVLLMContractFixture(t)
 
+	t.Run("read-only journal paths", func(t *testing.T) {
+		run := base.DeepCopy()
+		run.Spec.ResolvedPlan.Phases[0].Stages[0].Test.Security.HostPaths = []WorkloadHostPath{
+			{MountPath: "/var/log", Path: "/var/log", ReadOnly: true},
+			{MountPath: "/run/log", Path: "/run/log", ReadOnly: true},
+			{MountPath: "/etc/machine-id", Path: "/etc/machine-id", ReadOnly: true},
+		}
+
+		if _, err := deriveFixturePlanDigest(run); err != nil {
+			t.Fatalf("resolved plan rejected approved journal host paths: %v", err)
+		}
+	})
+
 	t.Run("unsafe host path", func(t *testing.T) {
 		run := base.DeepCopy()
 		run.Spec.ResolvedPlan.Phases[0].Stages[0].Test.Security.HostPaths = []WorkloadHostPath{{
@@ -283,6 +298,31 @@ func TestResolvedStageRejectsUnsafeSecurityAndTopology(t *testing.T) {
 
 		if _, err := deriveFixturePlanDigest(run); err == nil {
 			t.Fatal("resolved plan accepted a writable sys host path")
+		}
+	})
+
+	t.Run("writable journal path", func(t *testing.T) {
+		run := base.DeepCopy()
+		run.Spec.ResolvedPlan.Phases[0].Stages[0].Test.Security.HostPaths = []WorkloadHostPath{{
+			MountPath: "/var/log",
+			Path:      "/var/log",
+		}}
+
+		if _, err := deriveFixturePlanDigest(run); err == nil {
+			t.Fatal("resolved plan accepted a writable journal host path")
+		}
+	})
+
+	t.Run("journal descendant path", func(t *testing.T) {
+		run := base.DeepCopy()
+		run.Spec.ResolvedPlan.Phases[0].Stages[0].Test.Security.HostPaths = []WorkloadHostPath{{
+			MountPath: "/var/log/journal",
+			Path:      "/var/log/journal",
+			ReadOnly:  true,
+		}}
+
+		if _, err := deriveFixturePlanDigest(run); err == nil {
+			t.Fatal("resolved plan accepted an unapproved journal descendant")
 		}
 	})
 
@@ -386,6 +426,9 @@ func TestFifteenScriptBaselineMapsToIndependentTests(t *testing.T) {
 	for index := range tests {
 		name := fmt.Sprintf("baseline-%02d", index+1)
 		digest := fmt.Sprintf("sha256:%064x", index+1)
+		content := "#!/bin/sh\nexit 0\n"
+		artifactSum := sha256.Sum256([]byte(content))
+		artifactDigest := "sha256:" + hex.EncodeToString(artifactSum[:])
 		tests[index] = CertificationTest{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:       name,
@@ -396,6 +439,11 @@ func TestFifteenScriptBaselineMapsToIndependentTests(t *testing.T) {
 				DisplayName: name,
 				Owner:       "project-signal",
 				Version:     "1",
+				Artifacts: []TestArtifact{{
+					Name:    name + ".sh",
+					Content: content,
+					Digest:  artifactDigest,
+				}},
 				Metrics: []TestMetricDefinition{{
 					Name:        "passed",
 					DisplayName: "Passed",
@@ -406,15 +454,8 @@ func TestFifteenScriptBaselineMapsToIndependentTests(t *testing.T) {
 				Driver: CertificationTestDriver{
 					Type: TestDriverTypeScript,
 					Script: &ScriptTestDriver{
-						Language: ScriptLanguageShell,
-						Source: ImmutableArtifactSource{
-							Type: ArtifactSourceTypeConfigMap,
-							ConfigMap: &ConfigMapArtifactSource{
-								Name:   "dapple-baseline-scripts",
-								Key:    name + ".sh",
-								Digest: digest,
-							},
-						},
+						Language:    ScriptLanguageShell,
+						Artifact:    name + ".sh",
 						RunnerImage: fixtureImageA,
 					},
 				},
@@ -426,6 +467,7 @@ func TestFifteenScriptBaselineMapsToIndependentTests(t *testing.T) {
 				},
 			},
 		}
+
 		stages[index] = CertificationStage{
 			Name: name,
 			Test: CertificationTestReference{
@@ -444,6 +486,11 @@ func TestFifteenScriptBaselineMapsToIndependentTests(t *testing.T) {
 				Operator: AssertionOperatorBooleanEquals,
 				Expected: booleanValuePointer(true),
 			}},
+		}
+		if index > 0 {
+			stages[index].DependsOn = []StageDependency{{
+				Stage: stages[index-1].Name,
+			}}
 		}
 	}
 
@@ -475,6 +522,19 @@ func TestFifteenScriptBaselineMapsToIndependentTests(t *testing.T) {
 		want := fmt.Sprintf("baseline-%02d", index+1)
 		if stage.Name != want || stage.Test.Name != want {
 			t.Fatalf("baseline stage %d identity = %q/%q, want %q", index, stage.Name, stage.Test.Name, want)
+		}
+
+		if index == 0 {
+			if len(stage.DependsOn) != 0 {
+				t.Fatalf("baseline stage %d dependencies = %#v, want none", index, stage.DependsOn)
+			}
+
+			continue
+		}
+
+		if len(stage.DependsOn) != 1 ||
+			stage.DependsOn[0].Stage != fmt.Sprintf("baseline-%02d", index) {
+			t.Fatalf("baseline stage %d dependencies = %#v", index, stage.DependsOn)
 		}
 	}
 }

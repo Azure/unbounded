@@ -239,6 +239,10 @@ func TestCertificationTestContract(t *testing.T) {
 		t.Fatalf("parameter maxItems = %v, want %d", parameters.MaxItems, MaxTestParameters)
 	}
 
+	if rule := "!has(self.artifacts) || self.artifacts.map(a, a.content.size()).sum() <= 327680"; !hasValidationRule(&spec, rule) {
+		t.Fatalf("generated CertificationTest spec has no %q validation", rule)
+	}
+
 	typedValue := parameters.Items.Schema.Properties["default"]
 	if len(typedValue.XValidations) != 1 {
 		t.Fatalf("typed value validation count = %d, want 1", len(typedValue.XValidations))
@@ -488,6 +492,42 @@ func TestResourceCELAllowsResourcesOmitted(t *testing.T) {
 		}
 	})
 
+	t.Run("CertificationTest script", func(t *testing.T) {
+		t.Parallel()
+
+		crd := readCRD(t, "signal.unbounded-cloud.io_certificationtests.yaml")
+		object := map[string]any{
+			"apiVersion": GroupVersion.String(),
+			"kind":       "CertificationTest",
+			"metadata": map[string]any{
+				"name": "minimal",
+			},
+			"spec": map[string]any{
+				"topology": map[string]any{
+					"minParticipants": int64(1),
+					"maxParticipants": int64(1),
+				},
+				"artifacts": []any{map[string]any{
+					"name":    "check.sh",
+					"content": "exit 0\n",
+					"digest":  "sha256:" + strings.Repeat("a", 64),
+				}},
+				"driver": map[string]any{
+					"type": "Script",
+					"script": map[string]any{
+						"language":    "Shell",
+						"artifact":    "check.sh",
+						"runnerImage": fixtureImageA,
+					},
+				},
+			},
+		}
+
+		if errors := validateCRDCEL(t, crd, object); len(errors) != 0 {
+			t.Fatalf("server-equivalent CEL rejected Script driver without resources: %v", errors.ToAggregate())
+		}
+	})
+
 	t.Run("CertificationRun environment", func(t *testing.T) {
 		t.Parallel()
 
@@ -498,6 +538,28 @@ func TestResourceCELAllowsResourcesOmitted(t *testing.T) {
 
 		if errors := validateCRDCEL(t, crd, object); len(errors) != 0 {
 			t.Fatalf("server-equivalent CEL rejected resolved environment without resources: %v", errors.ToAggregate())
+		}
+	})
+
+	t.Run("CertificationRun script", func(t *testing.T) {
+		t.Parallel()
+
+		crd := readCRD(t, "signal.unbounded-cloud.io_certificationruns.yaml")
+		_, _, run := genericVLLMContractFixture(t)
+		object := unstructuredObject(t, run)
+		stages := object["spec"].(map[string]any)["resolvedPlan"].(map[string]any)["phases"].([]any)[0].(map[string]any)["stages"].([]any)
+		stage := stages[0].(map[string]any)
+		stage["test"].(map[string]any)["driver"] = map[string]any{
+			"type": "Script",
+			"script": map[string]any{
+				"language":    "Shell",
+				"artifact":    "check.sh",
+				"runnerImage": fixtureImageA,
+			},
+		}
+
+		if errors := validateCRDCEL(t, crd, object); len(errors) != 0 {
+			t.Fatalf("server-equivalent CEL rejected resolved Script driver without resources: %v", errors.ToAggregate())
 		}
 	})
 }
@@ -561,6 +623,14 @@ func TestCertificationSuitePhaseContract(t *testing.T) {
 		}
 	}
 
+	stringValue := stage.Properties["parameters"].
+		Items.Schema.
+		Properties["value"].
+		Properties["stringValue"]
+	if stringValue.MaxLength == nil || *stringValue.MaxLength != MaxTypedStringLength {
+		t.Fatalf("stage parameter string maxLength = %v, want %d", stringValue.MaxLength, MaxTypedStringLength)
+	}
+
 	schedule := stage.Properties["schedule"]
 	for _, rule := range []string{
 		"self.mode != 'RunOnce' || (!has(self.coverageWindow) && !has(self.interval) && !has(self.minExecutions) && !has(self.maxGap))",
@@ -600,8 +670,8 @@ func TestCertificationSuiteWorkloadPathBounds(t *testing.T) {
 
 	for _, rule := range []string{
 		"self.mountPath != '/scripts' && !self.mountPath.startsWith('/scripts/') && self.mountPath != '/results' && !self.mountPath.startsWith('/results/')",
-		"(self.path == '/proc/cpuinfo' || self.path == '/proc/meminfo' || self.path == '/proc/version' || self.path == '/proc/sys/kernel/random/boot_id' || self.path == '/sys' || self.path.startsWith('/sys/') || self.path == '/var/lib/project-signal' || self.path.startsWith('/var/lib/project-signal/')) && !self.path.contains('//') && !self.path.contains('/./') && !self.path.contains('/../') && !self.path.endsWith('/.') && !self.path.endsWith('/..')",
-		"!(self.path.startsWith('/proc/') || self.path == '/sys' || self.path.startsWith('/sys/')) || self.readOnly",
+		"(self.path == '/proc/cpuinfo' || self.path == '/proc/meminfo' || self.path == '/proc/version' || self.path == '/proc/sys/kernel/random/boot_id' || self.path == '/sys' || self.path.startsWith('/sys/') || self.path == '/var/lib/project-signal' || self.path.startsWith('/var/lib/project-signal/') || self.path == '/var/log' || self.path == '/run/log' || self.path == '/etc/machine-id') && !self.path.contains('//') && !self.path.contains('/./') && !self.path.contains('/../') && !self.path.endsWith('/.') && !self.path.endsWith('/..')",
+		"!(self.path.startsWith('/proc/') || self.path == '/sys' || self.path.startsWith('/sys/') || self.path == '/var/log' || self.path == '/run/log' || self.path == '/etc/machine-id') || self.readOnly",
 	} {
 		if !hasValidationRule(hostPath, rule) {
 			t.Fatalf("generated host path has no %q validation", rule)
@@ -869,6 +939,21 @@ func TestCertificationRunPlanAndEvidenceContract(t *testing.T) {
 		if _, found := stage.Properties[property]; !found {
 			t.Fatalf("generated stage evidence has no %s", property)
 		}
+	}
+
+	stageParticipants := stage.Properties["participants"]
+	if stageParticipants.MaxItems == nil || *stageParticipants.MaxItems != 16 {
+		t.Fatalf("stage evidence participants maxItems = %v, want 16", stageParticipants.MaxItems)
+	}
+
+	stageAssertions := stage.Properties["assertions"]
+	if stageAssertions.MaxItems == nil || *stageAssertions.MaxItems != 8 {
+		t.Fatalf("stage evidence assertions maxItems = %v, want 8", stageAssertions.MaxItems)
+	}
+
+	invocationEvidence := stage.Properties["invocationEvidence"]
+	if invocationEvidence.MaxItems == nil || *invocationEvidence.MaxItems != 8 {
+		t.Fatalf("stage invocation evidence maxItems = %v, want 8", invocationEvidence.MaxItems)
 	}
 
 	if !hasValidationRule(

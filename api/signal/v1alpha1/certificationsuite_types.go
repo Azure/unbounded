@@ -131,8 +131,8 @@ type ContinuityPolicy struct {
 
 // +kubebuilder:validation:XValidation:rule="self.mountPath.startsWith('/') && !self.mountPath.contains('//') && !self.mountPath.contains('/./') && !self.mountPath.contains('/../') && !self.mountPath.endsWith('/.') && !self.mountPath.endsWith('/..')",message="mountPath must be a clean absolute path"
 // +kubebuilder:validation:XValidation:rule="self.mountPath != '/scripts' && !self.mountPath.startsWith('/scripts/') && self.mountPath != '/results' && !self.mountPath.startsWith('/results/')",message="mountPath must not replace or shadow a reserved Project Signal mount"
-// +kubebuilder:validation:XValidation:rule="(self.path == '/proc/cpuinfo' || self.path == '/proc/meminfo' || self.path == '/proc/version' || self.path == '/proc/sys/kernel/random/boot_id' || self.path == '/sys' || self.path.startsWith('/sys/') || self.path == '/var/lib/project-signal' || self.path.startsWith('/var/lib/project-signal/')) && !self.path.contains('//') && !self.path.contains('/./') && !self.path.contains('/../') && !self.path.endsWith('/.') && !self.path.endsWith('/..')",message="path must be an approved proc leaf or a clean path under /sys or /var/lib/project-signal"
-// +kubebuilder:validation:XValidation:rule="!(self.path.startsWith('/proc/') || self.path == '/sys' || self.path.startsWith('/sys/')) || self.readOnly",message="proc and sys host paths must be read-only"
+// +kubebuilder:validation:XValidation:rule="(self.path == '/proc/cpuinfo' || self.path == '/proc/meminfo' || self.path == '/proc/version' || self.path == '/proc/sys/kernel/random/boot_id' || self.path == '/sys' || self.path.startsWith('/sys/') || self.path == '/var/lib/project-signal' || self.path.startsWith('/var/lib/project-signal/') || self.path == '/var/log' || self.path == '/run/log' || self.path == '/etc/machine-id') && !self.path.contains('//') && !self.path.contains('/./') && !self.path.contains('/../') && !self.path.endsWith('/.') && !self.path.endsWith('/..')",message="path must be an approved proc leaf, journal path, or a clean path under /sys or /var/lib/project-signal"
+// +kubebuilder:validation:XValidation:rule="!(self.path.startsWith('/proc/') || self.path == '/sys' || self.path.startsWith('/sys/') || self.path == '/var/log' || self.path == '/run/log' || self.path == '/etc/machine-id') || self.readOnly",message="proc, sys, and journal host paths must be read-only"
 type WorkloadHostPath struct {
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=1024
@@ -209,6 +209,25 @@ type StageRetryPolicy struct {
 	RetryableFailures []RetryableFailureClass `json:"retryableFailures,omitempty"`
 }
 
+// +kubebuilder:validation:Enum=Succeeded;Completed
+type StageDependencyCondition string
+
+const (
+	StageDependencyConditionSucceeded StageDependencyCondition = "Succeeded"
+	StageDependencyConditionCompleted StageDependencyCondition = "Completed"
+)
+
+type StageDependency struct {
+	// Stage is the stable name of another stage in this Suite.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z]([-a-z0-9]*[a-z0-9])?$`
+	Stage string `json:"stage"`
+	// Condition defaults to Succeeded. Completed allows terminal cleanup or
+	// evidence stages to run after any terminal dependency outcome.
+	Condition StageDependencyCondition `json:"condition,omitempty"`
+}
+
 // +kubebuilder:validation:XValidation:rule="self.mode != 'RunOnce' || (!has(self.coverageWindow) && !has(self.interval) && !has(self.minExecutions) && !has(self.maxGap))",message="RunOnce schedules must not declare repeated-execution fields"
 // +kubebuilder:validation:XValidation:rule="self.mode == 'RunOnce' || (has(self.coverageWindow) && has(self.minExecutions) && has(self.maxGap))",message="Continuous and Periodic schedules require coverageWindow, minExecutions, and maxGap"
 // +kubebuilder:validation:XValidation:rule="self.mode != 'Periodic' || has(self.interval)",message="Periodic schedules require interval"
@@ -261,9 +280,14 @@ type CertificationStage struct {
 	ParticipantRoles []StageParticipantRoleBinding `json:"participantRoles,omitempty"`
 	Schedule         StageSchedule                 `json:"schedule"`
 	Retry            *StageRetryPolicy             `json:"retry,omitempty"`
+	// DependsOn overrides the default previous-phase barrier for this stage.
+	// +kubebuilder:validation:MaxItems=16
+	// +listType=map
+	// +listMapKey=stage
+	DependsOn []StageDependency `json:"dependsOn,omitempty"`
 	// Optional stages are reported but do not determine phase or Run success.
 	Optional bool `json:"optional,omitempty"`
-	// +kubebuilder:validation:MaxItems=8
+	// +kubebuilder:validation:MaxItems=16
 	// +listType=map
 	// +listMapKey=name
 	Assertions []TestAssertion `json:"assertions,omitempty"`

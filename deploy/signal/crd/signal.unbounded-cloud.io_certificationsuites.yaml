@@ -227,20 +227,22 @@ spec:
                                 Project Signal mount
                               rule: self.mountPath != '/scripts' && !self.mountPath.startsWith('/scripts/')
                                 && self.mountPath != '/results' && !self.mountPath.startsWith('/results/')
-                            - message: path must be an approved proc leaf or a clean
-                                path under /sys or /var/lib/project-signal
+                            - message: path must be an approved proc leaf, journal
+                                path, or a clean path under /sys or /var/lib/project-signal
                               rule: (self.path == '/proc/cpuinfo' || self.path ==
                                 '/proc/meminfo' || self.path == '/proc/version' ||
                                 self.path == '/proc/sys/kernel/random/boot_id' ||
                                 self.path == '/sys' || self.path.startsWith('/sys/')
-                                || self.path == '/var/lib/project-signal' || self.path.startsWith('/var/lib/project-signal/'))
-                                && !self.path.contains('//') && !self.path.contains('/./')
-                                && !self.path.contains('/../') && !self.path.endsWith('/.')
-                                && !self.path.endsWith('/..')
-                            - message: proc and sys host paths must be read-only
+                                || self.path == '/var/lib/project-signal' || self.path.startsWith('/var/lib/project-signal/')
+                                || self.path == '/var/log' || self.path == '/run/log'
+                                || self.path == '/etc/machine-id') && !self.path.contains('//')
+                                && !self.path.contains('/./') && !self.path.contains('/../')
+                                && !self.path.endsWith('/.') && !self.path.endsWith('/..')
+                            - message: proc, sys, and journal host paths must be read-only
                               rule: '!(self.path.startsWith(''/proc/'') || self.path
-                                == ''/sys'' || self.path.startsWith(''/sys/'')) ||
-                                self.readOnly'
+                                == ''/sys'' || self.path.startsWith(''/sys/'') ||
+                                self.path == ''/var/log'' || self.path == ''/run/log''
+                                || self.path == ''/etc/machine-id'') || self.readOnly'
                           maxItems: 16
                           type: array
                           x-kubernetes-list-map-keys:
@@ -395,7 +397,7 @@ spec:
                                       minLength: 1
                                       type: string
                                     stringValue:
-                                      maxLength: 256
+                                      maxLength: 65536
                                       type: string
                                     type:
                                       enum:
@@ -455,7 +457,7 @@ spec:
                                       minLength: 1
                                       type: string
                                     stringValue:
-                                      maxLength: 256
+                                      maxLength: 65536
                                       type: string
                                     type:
                                       enum:
@@ -521,7 +523,7 @@ spec:
                                       minLength: 1
                                       type: string
                                     stringValue:
-                                      maxLength: 256
+                                      maxLength: 65536
                                       type: string
                                     type:
                                       enum:
@@ -605,10 +607,38 @@ spec:
                               - message: percentile is valid only for PercentileMaximum
                                   assertions
                                 rule: self.operator == 'PercentileMaximum' || !has(self.percentile)
-                            maxItems: 8
+                            maxItems: 16
                             type: array
                             x-kubernetes-list-map-keys:
                             - name
+                            x-kubernetes-list-type: map
+                          dependsOn:
+                            description: DependsOn overrides the default previous-phase
+                              barrier for this stage.
+                            items:
+                              properties:
+                                condition:
+                                  description: |-
+                                    Condition defaults to Succeeded. Completed allows terminal cleanup or
+                                    evidence stages to run after any terminal dependency outcome.
+                                  enum:
+                                  - Succeeded
+                                  - Completed
+                                  type: string
+                                stage:
+                                  description: Stage is the stable name of another
+                                    stage in this Suite.
+                                  maxLength: 63
+                                  minLength: 1
+                                  pattern: ^[a-z]([-a-z0-9]*[a-z0-9])?$
+                                  type: string
+                              required:
+                              - stage
+                              type: object
+                            maxItems: 16
+                            type: array
+                            x-kubernetes-list-map-keys:
+                            - stage
                             x-kubernetes-list-type: map
                           displayName:
                             maxLength: 128
@@ -653,7 +683,7 @@ spec:
                                       minLength: 1
                                       type: string
                                     stringValue:
-                                      maxLength: 256
+                                      maxLength: 65536
                                       type: string
                                     type:
                                       enum:

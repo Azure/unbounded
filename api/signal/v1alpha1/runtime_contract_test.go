@@ -359,3 +359,78 @@ func TestDeriveResolvedPlanDeadlineIncludesRetryTail(t *testing.T) {
 		t.Fatalf("DeriveResolvedPlanDeadline() = %s, want %s", got, want)
 	}
 }
+
+func TestDeriveResolvedPlanDeadlineUsesExplicitDependencyPath(t *testing.T) {
+	t.Parallel()
+
+	runOnce := func(timeout time.Duration) StageSchedule {
+		return StageSchedule{
+			Mode:              CheckExecutionModeRunOnce,
+			InvocationTimeout: metav1.Duration{Duration: timeout},
+		}
+	}
+	phases := []ResolvedPhasePlan{{
+		Name: "validation",
+		Role: CheckStageRoleValidation,
+		Stages: []ResolvedStagePlan{
+			{Name: "inventory", Schedule: runOnce(2 * time.Minute)},
+			{
+				Name:      "burn",
+				Schedule:  runOnce(3 * time.Minute),
+				DependsOn: []StageDependency{{Stage: "inventory"}},
+			},
+			{Name: "independent", Schedule: runOnce(6 * time.Minute)},
+		},
+	}}
+
+	got, err := DeriveResolvedPlanDeadline(phases)
+	if err != nil {
+		t.Fatalf("DeriveResolvedPlanDeadline() error = %v", err)
+	}
+
+	const want = 7 * time.Minute
+	if got != want {
+		t.Fatalf("DeriveResolvedPlanDeadline() = %s, want %s", got, want)
+	}
+}
+
+func TestDeriveResolvedPlanDeadlineRejectsDependencyCycle(t *testing.T) {
+	t.Parallel()
+
+	phases := []ResolvedPhasePlan{{
+		Name: "validation",
+		Role: CheckStageRoleValidation,
+		Stages: []ResolvedStagePlan{
+			{
+				Name:      "first",
+				Schedule:  StageSchedule{Mode: CheckExecutionModeRunOnce, InvocationTimeout: metav1.Duration{Duration: time.Minute}},
+				DependsOn: []StageDependency{{Stage: "second"}},
+			},
+			{
+				Name:      "second",
+				Schedule:  StageSchedule{Mode: CheckExecutionModeRunOnce, InvocationTimeout: metav1.Duration{Duration: time.Minute}},
+				DependsOn: []StageDependency{{Stage: "first"}},
+			},
+		},
+	}}
+
+	if _, err := DeriveResolvedPlanDeadline(phases); err == nil ||
+		!strings.Contains(err.Error(), "cycle") {
+		t.Fatalf("DeriveResolvedPlanDeadline() error = %v, want cycle", err)
+	}
+}
+
+func TestMarshalStageExecutionInputRejectsOversizedPayload(t *testing.T) {
+	t.Parallel()
+
+	payload := strings.Repeat("x", MaxStageExecutionInputBytes)
+	if _, err := MarshalStageExecutionInput(payload); err == nil ||
+		!strings.Contains(err.Error(), "maximum") {
+		t.Fatalf("MarshalStageExecutionInput() error = %v, want maximum size error", err)
+	}
+
+	payload = strings.Repeat("x", MaxStageExecutionInputBytes-2)
+	if _, err := MarshalStageExecutionInput(payload); err != nil {
+		t.Fatalf("MarshalStageExecutionInput() rejected bounded payload: %v", err)
+	}
+}
