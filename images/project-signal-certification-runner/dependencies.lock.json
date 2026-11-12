@@ -1,0 +1,82 @@
+{
+  "platform": "linux/amd64",
+  "base": "nvidia/cuda:12.8.1-devel-ubuntu24.04@sha256:4b9ed5fa8361736996499f64ecebf25d4ec37ff56e4d11323ccde10aa36e0c43",
+  "base_index_sha256": "520292dbb4f755fd360766059e62956e9379485d9e073bbd2f6e3c20c270ed66",
+  "ubuntu_snapshot": "20261015T000000Z",
+  "source_date_epoch": 1792115941,
+  "cuda_release": "12.8",
+  "cuda_architectures": [
+    "sm_100",
+    "compute_100"
+  ],
+  "sources": [
+    {
+      "name": "gpu-burn",
+      "commit": "0d19c94dcb2e9b6858b7586a4c327674cd67113b",
+      "url": "https://codeload.github.com/wilicc/gpu-burn/tar.gz/0d19c94dcb2e9b6858b7586a4c327674cd67113b",
+      "sha256": "58a6f4673af294cf98ada99bc0860632182afde862718b05b0e0b7ba3b2bdad7",
+      "licenses": [
+        "LICENSE"
+      ]
+    },
+    {
+      "name": "nvbandwidth",
+      "version": "0.10.0",
+      "commit": "82fc4e8c6afa0babb8687793678f615b3b8d793e",
+      "url": "https://codeload.github.com/NVIDIA/nvbandwidth/tar.gz/82fc4e8c6afa0babb8687793678f615b3b8d793e",
+      "sha256": "eecc72cb42e32d6fec14401752389711d6d9ffa7060efb9d6b3d5626b62731fc",
+      "git_metadata": "https://github.com/NVIDIA/nvbandwidth.git",
+      "licenses": [
+        "LICENSE",
+        "Licenses.txt"
+      ]
+    },
+    {
+      "name": "nccl-tests",
+      "version": "2.17.8",
+      "commit": "81463c58d093dba403c28c28cd050ea948e9e1ba",
+      "url": "https://codeload.github.com/NVIDIA/nccl-tests/tar.gz/81463c58d093dba403c28c28cd050ea948e9e1ba",
+      "sha256": "f5e6190fa86bb0c7c0c0ff5a9efc0e638777226d105ae847437257a6996781bf",
+      "licenses": [
+        "LICENSE.txt"
+      ]
+    },
+    {
+      "name": "argparse",
+      "version": "3.2",
+      "commit": "3eda91b2e1ce7d569f84ba295507c4cd8fd96910",
+      "url": "https://codeload.github.com/p-ranav/argparse/tar.gz/3eda91b2e1ce7d569f84ba295507c4cd8fd96910",
+      "sha256": "4eb07fc5472898df269b7d08d91db77ae41ce46f224283edbfd21a955168141c",
+      "licenses": [
+        "LICENSE"
+      ]
+    }
+  ],
+  "python_distributions": {
+    "torch": "2.8.0+cu128",
+    "filelock": "3.19.1",
+    "typing-extensions": "4.14.1",
+    "setuptools": "80.9.0",
+    "sympy": "1.14.0",
+    "mpmath": "1.3.0",
+    "networkx": "3.5",
+    "jinja2": "3.1.6",
+    "markupsafe": "3.0.2",
+    "fsspec": "2025.7.0",
+    "nvidia-cuda-nvrtc-cu12": "12.8.93",
+    "nvidia-cuda-runtime-cu12": "12.8.90",
+    "nvidia-cuda-cupti-cu12": "12.8.90",
+    "nvidia-cudnn-cu12": "9.10.2.21",
+    "nvidia-cublas-cu12": "12.8.4.1",
+    "nvidia-cufft-cu12": "11.3.3.83",
+    "nvidia-curand-cu12": "10.3.9.90",
+    "nvidia-cusolver-cu12": "11.7.3.90",
+    "nvidia-cusparse-cu12": "12.5.8.93",
+    "nvidia-cusparselt-cu12": "0.7.1",
+    "nvidia-nccl-cu12": "2.27.3",
+    "nvidia-nvtx-cu12": "12.8.90",
+    "nvidia-nvjitlink-cu12": "12.8.93",
+    "nvidia-cufile-cu12": "1.13.1.3",
+    "triton": "3.4.0"
+  }
+}

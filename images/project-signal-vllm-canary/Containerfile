@@ -1,0 +1,35 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+
+ARG GO_IMAGE=docker.io/library/golang:1.27.0-trixie@sha256:df98008ecd2b0ecc9f0a94d1b07e3564a9c92b555369b33d9b5f60d0765b2db7
+ARG VLLM_IMAGE=docker.io/vllm/vllm-openai@sha256:e4f88a835143cd22aee2397a26ec6bb80b3a4a6fe0c882bcbc63822904766089
+
+FROM ${GO_IMAGE} AS builder
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd/project-signal-model-cache ./cmd/project-signal-model-cache
+RUN CGO_ENABLED=0 go build -trimpath -o /out/project-signal-model-cache ./cmd/project-signal-model-cache
+
+FROM ${VLLM_IMAGE}
+
+USER root
+COPY --from=builder /out/project-signal-model-cache /usr/local/bin/project-signal-model-cache
+COPY images/project-signal-vllm-canary/harness.py /usr/local/bin/project-signal-vllm-canary
+COPY LICENSE NOTICE /unbounded/licenses/
+
+ENV HF_HUB_OFFLINE=1 \
+    HF_HUB_DISABLE_TELEMETRY=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    VLLM_NO_USAGE_STATS=1 \
+    DO_NOT_TRACK=1 \
+    NO_PROXY=127.0.0.1,localhost \
+    HOME=/tmp \
+    HF_HOME=/tmp/huggingface \
+    XDG_CACHE_HOME=/tmp/cache \
+    VLLM_CACHE_ROOT=/tmp/vllm \
+    TORCH_EXTENSIONS_DIR=/tmp/torch-extensions \
+    TRITON_CACHE_DIR=/tmp/triton
+
+USER 65532:65532
+ENTRYPOINT ["python3", "/usr/local/bin/project-signal-vllm-canary"]
