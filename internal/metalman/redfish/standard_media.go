@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/Azure/unbounded/internal/metalman/bootmedia"
 )
@@ -249,6 +250,12 @@ func (c *Client) prepareVirtualMediaInsert(ctx context.Context, source bootmedia
 		}
 	}
 
+	for _, device := range devices {
+		if device.image == source.URL {
+			return device, nil, nil
+		}
+	}
+
 	var device *virtualMediaDevice
 
 	for i := range devices {
@@ -280,6 +287,10 @@ func (c *Client) standardMountVirtualMedia(ctx context.Context, source bootmedia
 		return nil
 	}
 
+	if device.image == source.URL {
+		return c.waitVirtualMediaInsert(ctx, device.path, source.URL, nil)
+	}
+
 	target, err := actionPath(device.insert.Target, device.path)
 	if err != nil {
 		return fmt.Errorf("parsing InsertMedia target: %w", err)
@@ -300,6 +311,10 @@ func (c *Client) standardMountVirtualMedia(ctx context.Context, source bootmedia
 		return actionError(http.MethodPost, target, resp)
 	}
 
+	if resp.status == http.StatusAccepted {
+		return c.waitVirtualMediaInsert(ctx, device.path, source.URL, resp.header)
+	}
+
 	inserted, ok, err := c.virtualMediaDevice(ctx, device.path)
 	if err != nil {
 		return err
@@ -310,6 +325,31 @@ func (c *Client) standardMountVirtualMedia(ctx context.Context, source bootmedia
 	}
 
 	return nil
+}
+
+func (c *Client) waitVirtualMediaInsert(ctx context.Context, path, image string, header http.Header) error {
+	ctx, cancel := context.WithTimeout(ctx, taskTimeout)
+	defer cancel()
+
+	for {
+		timer := time.NewTimer(retryAfter(header))
+
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return fmt.Errorf("waiting for virtual media %s to report image %s as inserted: %w", path, image, ctx.Err())
+		case <-timer.C:
+		}
+
+		device, ok, err := c.virtualMediaDevice(ctx, path)
+		if err != nil {
+			return err
+		}
+
+		if ok && device.holds(image) {
+			return nil
+		}
+	}
 }
 
 func (c *Client) insertMediaBody(ctx context.Context, device virtualMediaDevice, image string) (map[string]any, error) {

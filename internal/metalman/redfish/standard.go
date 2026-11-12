@@ -159,6 +159,13 @@ func (c *Client) modify(ctx context.Context, method, path string, body any) (ses
 func (c *Client) waitTask(ctx context.Context, method, path string, accepted sessionResponse) (sessionResponse, error) {
 	location := accepted.header.Get("Location")
 	if location == "" {
+		var task redfishLink
+		if json.Unmarshal(accepted.data, &task) == nil {
+			location = task.ODataID
+		}
+	}
+
+	if location == "" {
 		return accepted, nil
 	}
 

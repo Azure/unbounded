@@ -4,6 +4,7 @@
 package redfish
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -49,6 +50,9 @@ type fakeILO struct {
 	resourceStatuses                     map[string]int
 	relativeLinks                        bool
 	resourceReads                        []string
+	taskLink                             string
+	mediaReadyAfter, mediaPolls          int
+	cancelInsert                         context.CancelFunc
 }
 
 func newFakeILO(t *testing.T) (*fakeILO, *Client) {
@@ -167,6 +171,17 @@ func newFakeILO(t *testing.T) (*fakeILO, *Client) {
 
 			write(map[string]any{"MediaTypes": []string{"Floppy", "USBStick"}})
 		case strings.HasSuffix(path, "/VirtualMedia/2"):
+			if len(f.inserts) > 0 && f.cancelInsert != nil {
+				f.cancelInsert()
+			}
+
+			if f.mediaReadyAfter > 0 && (len(f.inserts) > 0 || f.image == testISOURL) {
+				f.mediaPolls++
+				if f.mediaPolls >= f.mediaReadyAfter {
+					f.image, f.inserted = testISOURL, true
+				}
+			}
+
 			if len(f.ejects) > 0 && f.ejectResult != nil {
 				write(f.ejectResult)
 				return
@@ -211,8 +226,17 @@ func newFakeILO(t *testing.T) (*fakeILO, *Client) {
 			}
 
 			if f.async != "" {
-				w.Header().Set("Location", "/redfish/v1/TaskService/TaskMonitors/1")
+				if f.async == "unmonitored" {
+					f.image = fmt.Sprint(body["Image"])
+				} else if f.taskLink == "" {
+					w.Header().Set("Location", "/redfish/v1/TaskService/TaskMonitors/1")
+				}
+
 				w.WriteHeader(http.StatusAccepted)
+
+				if f.taskLink != "" {
+					write(redfishLink{ODataID: f.taskLink})
+				}
 
 				return
 			}
@@ -227,7 +251,7 @@ func newFakeILO(t *testing.T) (*fakeILO, *Client) {
 
 			f.ejects = append(f.ejects, f.image)
 			f.image, f.inserted = "", false
-		case path == "/redfish/v1/TaskService/TaskMonitors/1":
+		case path == "/redfish/v1/TaskService/TaskMonitors/1" || path == "/redfish/v1/Managers/1/VirtualMedia/2/Actions/VirtualMedia.InsertMedia/task":
 			f.polls++
 			if f.polls == 1 {
 				w.WriteHeader(http.StatusAccepted)
@@ -717,6 +741,204 @@ func TestStandardVirtualMediaTaskMonitor(t *testing.T) {
 			}
 
 			require.Equal(t, 2, f.polls)
+		})
+	}
+}
+
+func TestStandardVirtualMediaTaskBodyLink(t *testing.T) {
+	old := taskPollInterval
+	taskPollInterval = time.Millisecond
+
+	t.Cleanup(func() { taskPollInterval = old })
+
+	for _, link := range []string{"/redfish/v1/TaskService/TaskMonitors/1", "task"} {
+		for _, outcome := range []string{"ok", "fail"} {
+			t.Run(link+"/"+outcome, func(t *testing.T) {
+				f, c := newFakeILO(t)
+				f.async, f.taskLink = outcome, link
+
+				err := c.MountVirtualMedia(t.Context(), standardMedia)
+				if outcome == "fail" {
+					require.ErrorContains(t, err, "task ended in state Exception")
+				} else {
+					require.NoError(t, err)
+					require.True(t, f.inserted)
+				}
+
+				require.Equal(t, 2, f.polls)
+				require.Len(t, f.inserts, 1)
+				require.Empty(t, f.ejects)
+			})
+		}
+	}
+}
+
+func TestStandardVirtualMediaUnmonitoredInsert(t *testing.T) {
+	old := taskPollInterval
+	taskPollInterval = time.Millisecond
+
+	t.Cleanup(func() { taskPollInterval = old })
+
+	t.Run("delayed insertion", func(t *testing.T) {
+		f, c := newFakeILO(t)
+		f.async, f.mediaReadyAfter = "unmonitored", 3
+
+		require.NoError(t, c.MountVirtualMedia(t.Context(), standardMedia))
+		require.True(t, f.inserted)
+		require.Equal(t, 3, f.mediaPolls)
+		require.Len(t, f.inserts, 1)
+		require.Empty(t, f.ejects)
+		require.NoError(t, c.MountVirtualMedia(t.Context(), standardMedia))
+		require.Len(t, f.inserts, 1)
+	})
+
+	for _, outcome := range []string{"timeout", "cancel", "wrong image"} {
+		t.Run(outcome, func(t *testing.T) {
+			f, c := newFakeILO(t)
+
+			f.async = "unmonitored"
+			if outcome == "wrong image" {
+				f.insertResult = map[string]any{"MediaTypes": []string{"CD"}, "Image": testISOURL + "?other", "Inserted": true}
+			}
+
+			ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+			defer cancel()
+
+			if outcome == "cancel" {
+				f.cancelInsert = cancel
+			}
+
+			err := c.MountVirtualMedia(ctx, standardMedia)
+			if outcome == "cancel" {
+				require.ErrorIs(t, err, context.Canceled)
+			} else {
+				require.ErrorIs(t, err, context.DeadlineExceeded)
+			}
+
+			f.mu.Lock()
+			defer f.mu.Unlock()
+
+			require.Len(t, f.inserts, 1)
+			require.Empty(t, f.ejects)
+			require.Len(t, f.mutations, 1)
+		})
+	}
+}
+
+func TestStandardVirtualMediaPendingImageRetry(t *testing.T) {
+	old := taskPollInterval
+	taskPollInterval = time.Millisecond
+
+	t.Cleanup(func() { taskPollInterval = old })
+
+	f, c := newFakeILO(t)
+	f.image, f.mediaReadyAfter = testISOURL, 3
+
+	require.NoError(t, c.MountVirtualMedia(t.Context(), standardMedia))
+	require.True(t, f.inserted)
+	require.Equal(t, 3, f.mediaPolls)
+	require.Empty(t, f.mutations)
+}
+
+func TestStandardVirtualMediaRetryAfterCanceledInsert(t *testing.T) {
+	old := taskPollInterval
+	taskPollInterval = time.Millisecond
+
+	t.Cleanup(func() { taskPollInterval = old })
+
+	f, c := newFakeILO(t)
+	f.async = "unmonitored"
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	f.cancelInsert = cancel
+
+	require.ErrorIs(t, c.MountVirtualMedia(ctx, standardMedia), context.Canceled)
+
+	f.mu.Lock()
+	f.cancelInsert, f.mediaReadyAfter = nil, 3
+	f.mu.Unlock()
+
+	require.NoError(t, c.MountVirtualMedia(t.Context(), standardMedia))
+	require.Len(t, f.inserts, 1)
+	require.Empty(t, f.ejects)
+	require.Len(t, f.mutations, 1)
+}
+
+func TestStandardVirtualMediaSynchronousInsertReadbackFailure(t *testing.T) {
+	old := taskPollInterval
+	taskPollInterval = time.Hour
+
+	t.Cleanup(func() { taskPollInterval = old })
+
+	f, c := newFakeILO(t)
+	f.ignoreInsert = true
+
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+
+	err := c.MountVirtualMedia(ctx, standardMedia)
+	require.ErrorContains(t, err, "does not report image "+testISOURL+" as inserted")
+	require.NotErrorIs(t, err, context.DeadlineExceeded)
+	require.Len(t, f.inserts, 1)
+	require.Empty(t, f.ejects)
+}
+
+func TestStandardVirtualMediaInsertWaitHonorsRetryAfter(t *testing.T) {
+	old := taskPollInterval
+	taskPollInterval = time.Millisecond
+
+	t.Cleanup(func() { taskPollInterval = old })
+
+	f, c := newFakeILO(t)
+	f.image, f.inserted = testISOURL, true
+	reads := len(f.resourceReads)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer cancel()
+
+	err := c.waitVirtualMediaInsert(ctx, "/redfish/v1/Managers/1/VirtualMedia/2/", testISOURL, http.Header{"Retry-After": {"999999"}})
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.Len(t, f.resourceReads, reads)
+	require.Empty(t, f.mutations)
+}
+
+func TestStandardTaskLinkResolution(t *testing.T) {
+	old := taskPollInterval
+	taskPollInterval = time.Millisecond
+
+	t.Cleanup(func() { taskPollInterval = old })
+
+	for _, tc := range []struct {
+		name, path, link, location, monitor string
+	}{
+		{
+			name: "trailing slash action", path: "/redfish/v1/Managers/1/VirtualMedia/2/Actions/VirtualMedia.InsertMedia/",
+			link: "task", monitor: "/redfish/v1/Managers/1/VirtualMedia/2/Actions/VirtualMedia.InsertMedia/task",
+		},
+		{
+			name: "no trailing slash action", path: "/redfish/v1/Managers/1/VirtualMedia/2/Actions/VirtualMedia.InsertMedia",
+			link: "VirtualMedia.InsertMedia/task", monitor: "/redfish/v1/Managers/1/VirtualMedia/2/Actions/VirtualMedia.InsertMedia/task",
+		},
+		{
+			name: "location takes precedence", path: "/redfish/v1/Managers/1/VirtualMedia/2/Actions/VirtualMedia.InsertMedia/",
+			link: "unused", location: "/redfish/v1/TaskService/TaskMonitors/1", monitor: "/redfish/v1/TaskService/TaskMonitors/1",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f, c := newFakeILO(t)
+			f.async = "fail"
+			header := http.Header{}
+			header.Set("Location", tc.location)
+			data, err := json.Marshal(redfishLink{ODataID: tc.link})
+			require.NoError(t, err)
+
+			_, err = c.waitTask(t.Context(), http.MethodPost, tc.path, sessionResponse{status: http.StatusAccepted, header: header, data: data})
+			require.ErrorContains(t, err, "task ended in state Exception")
+			require.Contains(t, f.resourceReads, tc.monitor)
+			require.Equal(t, 2, f.polls)
+			require.Empty(t, f.mutations)
 		})
 	}
 }
