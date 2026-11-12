@@ -51,3 +51,17 @@ func TestRunnerDoesNotOwnCertificationScripts(t *testing.T) {
 		}
 	}
 }
+
+func TestOfflineValidationUsesExecutableScratch(t *testing.T) {
+	t.Parallel()
+
+	content, err := os.ReadFile(filepath.Clean("build.py"))
+	if err != nil {
+		t.Fatalf("read build.py: %v", err)
+	}
+
+	const executableTmpfs = `"/tmp:rw,exec,nosuid,nodev,size=64m"`
+	if !strings.Contains(string(content), executableTmpfs) {
+		t.Fatalf("build.py must mount executable scratch for compiled loader probes")
+	}
+}

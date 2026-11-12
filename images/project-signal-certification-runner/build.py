@@ -186,7 +186,7 @@ def build(engine, directory, root=ROOT, repository_root=REPOSITORY_ROOT):
         isolation = [
             engine, "run", "--rm", "--pull=never", "--network=none",
             "--cap-drop=ALL", "--security-opt=no-new-privileges", "--read-only",
-            "--tmpfs", "/tmp:rw,nosuid,nodev,size=64m",
+            "--tmpfs", "/tmp:rw,exec,nosuid,nodev,size=64m",
             "--env", "NVIDIA_VISIBLE_DEVICES=void", "--env", "CUDA_VISIBLE_DEVICES=",
         ]
         command = [
