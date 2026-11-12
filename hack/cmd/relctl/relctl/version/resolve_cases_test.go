@@ -86,4 +86,18 @@ var resolveCases = []resolveCase{
 	{kind: wantTag, name: "series without a minor refused", mode: "release", want: "ERROR", wantErr: "series must be X.Y", tags: []string{"v0.3.0"}, env: []string{"BUMP=patch", "SERIES=3"}},
 	{kind: wantTag, name: "tag outside the series refused", mode: "release", want: "ERROR", wantErr: "outside series 0.3", tags: []string{"v0.4.0"}, env: []string{"BUMP=patch", "SERIES=0.3"}},
 	{kind: wantTag, name: "release branch with no tags in its series refused", mode: "release", want: "ERROR", wantErr: "outside series 0.3", tags: []string{"v0.9.0@off"}, env: []string{"BUMP=patch", "SERIES=0.3"}},
+
+	// Promoting a named candidate. Added with scheduled candidates, where the
+	// highest rc is routinely still building or has failed, and the one worth
+	// shipping is the newest that passed. Which one that is lives on GitHub, so
+	// the caller names it and the resolver holds it to the same rules.
+	{kind: wantBase, name: "promote a named candidate below the highest", mode: "promote", want: "v0.2.5-rc.1", tags: []string{"v0.2.4", "v0.2.5-rc.1@new", "v0.2.5-rc.2@new"}, env: []string{"CANDIDATE=v0.2.5-rc.1"}},
+	{kind: wantTag, name: "a named candidate implies its version", mode: "promote", want: "v0.3.0", tags: []string{"v0.2.4", "v0.2.5-rc.1", "v0.3.0-rc.1"}, env: []string{"CANDIDATE=v0.3.0-rc.1"}},
+	{kind: wantTag, name: "a named candidate agreeing with version", mode: "promote", want: "v0.3.0", tags: []string{"v0.2.4", "v0.2.5-rc.1", "v0.3.0-rc.1"}, env: []string{"VERSION=0.3.0", "CANDIDATE=v0.3.0-rc.1"}},
+	{kind: wantTag, name: "a named candidate must match version", mode: "promote", want: "ERROR", wantErr: "is not a candidate for v0.2.5", tags: []string{"v0.2.4", "v0.2.5-rc.1", "v0.3.0-rc.1"}, env: []string{"VERSION=v0.2.5", "CANDIDATE=v0.3.0-rc.1"}},
+	{kind: wantTag, name: "a named candidate must be an rc", mode: "promote", want: "ERROR", wantErr: "candidate must be a vX.Y.Z-rc.N tag", tags: []string{"v0.2.4", "v0.2.5-rc.1"}, env: []string{"CANDIDATE=v0.2.5"}},
+	{kind: wantTag, name: "a named candidate must exist", mode: "promote", want: "ERROR", wantErr: "is not a candidate reachable from HEAD", tags: []string{"v0.2.4", "v0.2.5-rc.1"}, env: []string{"CANDIDATE=v0.2.5-rc.7"}},
+	{kind: wantTag, name: "a named candidate must be on this branch", mode: "promote", want: "ERROR", wantErr: "is not a candidate reachable from HEAD", tags: []string{"v0.2.4", "v0.2.5-rc.1", "v0.2.5-rc.2@off"}, env: []string{"CANDIDATE=v0.2.5-rc.2"}},
+	{kind: wantTag, name: "a named candidate of a stale train refused", mode: "promote", want: "ERROR", wantErr: "is older than the latest final", tags: []string{"v0.1.24-rc.18", "v0.2.4"}, env: []string{"CANDIDATE=v0.1.24-rc.18"}},
+	{kind: wantTag, name: "candidate rejected with prerelease", mode: "prerelease", want: "ERROR", wantErr: "candidate is only valid with mode=promote", tags: []string{"v0.2.4", "v0.2.5-rc.1"}, env: []string{"CANDIDATE=v0.2.5-rc.1"}},
 }

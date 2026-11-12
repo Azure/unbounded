@@ -7,27 +7,37 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"slices"
 	"time"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/mod/semver"
 
 	"github.com/Azure/unbounded/hack/cmd/relctl/relctl/gh"
 	"github.com/Azure/unbounded/hack/cmd/relctl/relctl/version"
 )
 
-// nightlyStaleAfter is how old a green nightly may be and still count.
+// candidateStaleAfter is how old a passing candidate may be and still count,
+// once main has moved past it.
 //
-// The nightly has to be green, and green recently. Two days allows for a
-// weekend gap in scheduling while still refusing a week-old result, which tells
-// you about a tree nobody has released since rather than about today's.
-const nightlyStaleAfter = 48 * time.Hour
+// Age alone is not staleness: a candidate of an unchanged main is the current
+// tree however old it is. What goes stale is a candidate main has left behind,
+// because promoting it ships a tree from days ago without everything since.
+// Two days allows for a weekend, matching what the nightly was held to.
+const candidateStaleAfter = 48 * time.Hour
 
 // preflightResult answers whether a branch is releasable.
 type preflightResult struct {
-	Branch     string   `json:"branch"`
-	Releasable bool     `json:"releasable"`
-	NightlyOK  bool     `json:"nightlyOk"`
-	NightlyAge string   `json:"nightlyAge,omitempty"`
+	Branch     string `json:"branch"`
+	Releasable bool   `json:"releasable"`
+	// CandidateOK says whether there is a passing candidate worth promoting.
+	CandidateOK bool `json:"candidateOk"`
+	// Candidate is what promote would finalize: the newest that passed.
+	Candidate *candidateInfo `json:"candidate,omitempty"`
+	// Newest is the newest candidate, when it is not the one that passed.
+	Newest *candidateInfo `json:"newest,omitempty"`
+	// Behind counts commits on the checkout since Candidate.
+	Behind     int      `json:"behind,omitempty"`
 	CIOK       bool     `json:"ciOk"`
 	LiveTrains []string `json:"liveTrains,omitempty"`
 	Blockers   []string `json:"blockers,omitempty"`
@@ -42,12 +52,16 @@ func preflightCommand(opts *Options) *cobra.Command {
 		Short: "Check whether a branch is releasable",
 		Long: `Check whether a branch is releasable.
 
-Checks the nightly, CI on the branch, and whether a candidate train is already
-in flight, and says RELEASABLE or NOT RELEASABLE with the reason.
+Releasable means there is a candidate to promote: the newest candidate that
+passed its soak, recent enough to be worth shipping, with CI green on the
+branch. Says RELEASABLE or NOT RELEASABLE with the reason.
 
-A red nightly is a release blocker until it is understood. It deploys the same
-component images the release will, to the same shape of cluster, so a nightly
-failure is a release failure you have not had yet.`,
+A newer candidate that failed is reported but does not block: promote ships the
+one that passed, not the one that failed. Read why it failed before promoting
+past it all the same.
+
+Candidates are read from the local clone and their results from GitHub, so this
+needs an up-to-date checkout and a credential.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runPreflight(cmd.Context(), cmd.OutOrStdout(), opts, branch)
@@ -74,21 +88,20 @@ func runPreflight(ctx context.Context, out io.Writer, opts *Options, branch stri
 	}
 
 	result := preflightResult{Branch: branch, Releasable: true}
+	repo := opts.repo(ctx)
 
-	// The nightly only ever runs on the default branch, so it says nothing
-	// about a release branch. Saying so is better than reporting a green tick
-	// that refers to somewhere else.
-	if branch == "main" {
-		nightlies, err := client.Runs(ctx, gh.ListRuns{Workflow: gh.WorkflowNightly, Limit: 5})
-		if err != nil {
-			return err
-		}
-
-		result.NightlyOK, result.NightlyAge = judgeNightly(nightlies, &result)
-	} else {
-		result.NightlyOK = true
+	if branch != "main" {
 		result.Notes = append(result.Notes,
-			"nightly only runs on the default branch, so it says nothing about "+branch)
+			"candidates cut from "+branch+" are verified but not soaked: unbounded-stable soaks main only")
+	}
+
+	if current, err := repo.CurrentBranch(); err == nil && current != "" && current != branch {
+		result.Notes = append(result.Notes,
+			"candidates are read from the checkout, which is "+current+", not "+branch)
+	}
+
+	if err := judgeCandidates(ctx, client, repo, &result, time.Now()); err != nil {
+		return err
 	}
 
 	ci, err := client.Runs(ctx, gh.ListRuns{Workflow: gh.WorkflowCI, Branch: branch, Limit: 5})
@@ -107,67 +120,113 @@ func runPreflight(ctx context.Context, out io.Writer, opts *Options, branch stri
 		result.CIOK = true
 	}
 
-	// A train already in flight is not a blocker, but cutting past it strands
-	// it, so it belongs in the report. A failure to resolve is reported rather
-	// than swallowed: silently omitting the note would read as "no train
-	// exists", which is the answer that gets one stranded.
-	resolved, err := version.Resolve(opts.repo(ctx), version.Request{
-		Mode: version.ModeRelease,
-		Bump: version.BumpMinor,
-	})
-
-	switch {
-	case err != nil:
-		result.Notes = append(result.Notes,
-			"could not resolve local state, so live trains are unknown: "+err.Error())
-	case len(resolved.Live) > 0:
-		result.LiveTrains = resolved.Live
-		result.Notes = append(result.Notes,
-			"a live train exists; mode=release cuts past it and strands it, mode=promote finishes it")
-	}
-
 	result.Releasable = len(result.Blockers) == 0
 
 	if opts.Output == OutputJSON {
 		return writeJSON(out, result)
 	}
 
-	return writePreflightText(out, result)
+	return writePreflightText(out, result, time.Now())
 }
 
-// judgeNightly decides whether the nightly signal is good enough.
-func judgeNightly(runs []gh.Run, result *preflightResult) (bool, string) {
-	for _, run := range runs {
-		if !run.Done() {
-			continue
-		}
+// judgeCandidates decides whether there is a candidate worth promoting.
+//
+// A failure to read the local state is a blocker rather than a note, which is
+// where this differs from the nightly it replaces. The nightly was its own
+// signal and the train view decorated it; here the train view IS the signal,
+// and "could not tell" must not read as releasable.
+func judgeCandidates(
+	ctx context.Context,
+	client *gh.Client,
+	repo *version.GitRepo,
+	result *preflightResult,
+	now time.Time,
+) error {
+	state, err := version.Discover(repo)
+	if err != nil {
+		result.Blockers = append(result.Blockers, "could not read candidates from the checkout: "+err.Error())
 
-		age := time.Since(run.CreatedAt).Round(time.Hour).String()
-
-		if !run.Succeeded() {
-			result.Blockers = append(result.Blockers,
-				"the most recent completed nightly is "+run.State()+
-					"; a red nightly is a release blocker until it is understood")
-
-			return false, age
-		}
-
-		if time.Since(run.CreatedAt) > nightlyStaleAfter {
-			result.Blockers = append(result.Blockers,
-				"the last green nightly is "+age+" old; it should be green recently")
-
-			return false, age
-		}
-
-		return true, age
+		return nil
 	}
 
-	result.Blockers = append(result.Blockers, "no completed nightly run found")
+	result.LiveTrains = state.Live
 
-	return false, ""
+	if len(state.Live) == 0 {
+		result.Blockers = append(result.Blockers,
+			"no candidate has been cut since "+state.LatestFinal+
+				"; cut one with relctl rc, or wait for the scheduled one")
+
+		return nil
+	}
+
+	// The highest train is the one anyone is about to promote. With more than
+	// one, promote asks which, and saying so here saves a refusal there.
+	train := slices.MaxFunc(state.Live, semver.Compare)
+	if len(state.Live) > 1 {
+		result.Notes = append(result.Notes,
+			fmt.Sprintf("several trains are live; this reports %s, and promote will need --version", train))
+	}
+
+	candidates, err := version.Candidates(repo, train)
+	if err != nil {
+		return err
+	}
+
+	results, err := candidateResults(ctx, client, candidates)
+	if err != nil {
+		return err
+	}
+
+	passing, ok := newestPassing(results)
+
+	if len(results) > 0 && (!ok || results[0].Tag != passing.Tag) {
+		newest := results[0]
+		result.Newest = &newest
+	}
+
+	if !ok {
+		result.Blockers = append(result.Blockers,
+			"no candidate of "+train+" has passed its soak; the newest, "+results[0].Tag+", has "+describeState(results[0]))
+
+		return nil
+	}
+
+	result.CandidateOK = true
+	result.Candidate = &passing
+
+	if result.Newest != nil {
+		result.Notes = append(result.Notes, fmt.Sprintf(
+			"the newest candidate, %s, has %s; promote ships %s, so read why before promoting past it",
+			result.Newest.Tag, describeState(*result.Newest), passing.Tag))
+	}
+
+	behind, err := repo.CountCommits(passing.Commit)
+	if err != nil {
+		return err
+	}
+
+	result.Behind = behind
+
+	if behind == 0 {
+		return nil
+	}
+
+	if passing.At != nil && now.Sub(*passing.At) > candidateStaleAfter {
+		result.CandidateOK = false
+		result.Blockers = append(result.Blockers, fmt.Sprintf(
+			"%s passed %s ago and %d commit(s) have merged since; cut a fresh candidate rather than ship a tree that old",
+			passing.Tag, elapsed(*passing.At, now), behind))
+
+		return nil
+	}
+
+	result.Notes = append(result.Notes, fmt.Sprintf(
+		"%d commit(s) merged since %s are not in it; promote ships %s as it was soaked", behind, passing.Tag, passing.Tag))
+
+	return nil
 }
 
-func writePreflightText(out io.Writer, result preflightResult) error {
+func writePreflightText(out io.Writer, result preflightResult, now time.Time) error {
 	verdict := "RELEASABLE"
 	if !result.Releasable {
 		verdict = "NOT RELEASABLE"
@@ -176,7 +235,7 @@ func writePreflightText(out io.Writer, result preflightResult) error {
 	rows := [][]string{
 		{"Branch:", result.Branch},
 		{"Verdict:", verdict},
-		{"Nightly:", tick(result.NightlyOK) + nightlySuffix(result.NightlyAge)},
+		{"Candidate:", tick(result.CandidateOK) + candidateSuffix(result.Candidate, now)},
 		{"CI:", tick(result.CIOK)},
 	}
 
@@ -211,10 +270,15 @@ func tick(ok bool) string {
 	return "FAILED"
 }
 
-func nightlySuffix(age string) string {
-	if age == "" {
+func candidateSuffix(candidate *candidateInfo, now time.Time) string {
+	if candidate == nil {
 		return ""
 	}
 
-	return " (" + age + " ago)"
+	suffix := " " + candidate.Tag
+	if when := recordedAgo(*candidate, now); when != "" {
+		suffix += " (passed " + when + ")"
+	}
+
+	return suffix
 }

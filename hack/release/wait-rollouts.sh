@@ -16,11 +16,12 @@
 # minutes, and whatever rewrites the template in that window is what kubectl
 # ends up reporting success for.
 #
-# Shared by .github/workflows/nightly.yaml and release-upgrade.yaml. Both gates
-# previously carried a copy of this logic and had already drifted (gantry was
-# gated in one and not the other). Both invoke it from a sparse checkout of the
-# workflow's own commit, so a rollback or backfill onto an older tag still runs
-# the current gate.
+# Used by release-upgrade.yaml, and shared with the nightly workflow until that
+# was retired. The two gates once carried a copy of this logic each and had
+# already drifted (gantry was gated in one and not the other), which is why it
+# is a script. It is invoked from a sparse checkout of the workflow's own
+# commit, so a rollback or backfill onto an older tag still runs the current
+# gate.
 #
 # Usage:
 #   hack/release/wait-rollouts.sh deploy/unbounded-operator ds/gantry ...
@@ -43,7 +44,7 @@
 #                                a DaemonSet shortfall stops being excusable
 #                                (default 2). 0 disables tolerance entirely.
 #   EXPECTED_IMAGE_TAG           The release being deployed, e.g. v0.2.5 or
-#                                nightly-abc1234. No workload is judged until
+#                                v0.2.5-rc.1. No workload is judged until
 #                                every image we publish carries it. Unset skips
 #                                that wait and disables tolerance.
 #   EXPECTED_IMAGE_REGISTRY      Where we publish, e.g. ghcr.io/azure. Required
@@ -193,9 +194,9 @@ GUARD_DISABLED=0
 declare -A IMAGE_FIRST_SEEN=()
 
 # cleanup reaps the background rollout watcher and closes any open log group.
-# Without it a canceled run (nightly sets cancel-in-progress) leaves
-# 'kubectl rollout status' running until its own timeout, and a failure exits
-# with the group still open, which hides the failure in a collapsed section.
+# Without it a canceled run leaves 'kubectl rollout status' running until its
+# own timeout, and a failure exits with the group still open, which hides the
+# failure in a collapsed section.
 cleanup() {
   if [[ -n "$ROLLOUT_PID" ]] && kill -0 "$ROLLOUT_PID" 2>/dev/null; then
     kill "$ROLLOUT_PID" 2>/dev/null || true

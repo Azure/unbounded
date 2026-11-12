@@ -9,6 +9,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/Azure/unbounded/hack/cmd/relctl/relctl/gh"
+	"github.com/Azure/unbounded/hack/cmd/relctl/relctl/version"
 )
 
 // The break-glass paths.
@@ -126,6 +127,14 @@ If you use this, file a follow-up to fix whatever made it necessary.`,
 
 			if reason == "" {
 				return fmt.Errorf("--reason is required: it is recorded on the release")
+			}
+
+			// A candidate is never published; it passes or fails. Shipping one
+			// whose soak cannot pass is a forced PROMOTE, which is where the
+			// gate now lives.
+			if _, _, ok := version.ParseCandidate(tag); ok {
+				return fmt.Errorf("%s is a candidate, and candidates are not published; "+
+					"to ship it without a passing soak, use relctl promote --candidate %s --force", tag, tag)
 			}
 
 			return dispatch{

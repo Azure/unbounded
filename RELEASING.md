@@ -1,24 +1,39 @@
 # Releasing Unbounded Kubernetes
 
-How to cut, soak, and publish a release, and what to do when one of those goes
-wrong. Maintainer-facing; for using a release, see the
+How a release is cut, soaked and published, and what to do when one of those
+goes wrong. Maintainer-facing; for using a release, see the
 [documentation site](https://unbounded-cloud.io/).
 
-Releases come from two places. `main` cuts minors and majors (`vX.Y.0`); a
-`release-X.Y` branch cuts patches (`vX.Y.Z`) against a series that has already
-shipped. See [The tag and branch model](#the-tag-and-branch-model).
+**Every final release is a promoted release candidate.** Candidates
+(`vX.Y.Z-rc.N`) are cut from `main` on a schedule, three times a day, and soaked
+on `unbounded-stable`. Shipping means promoting the newest candidate that
+passed. A failure costs an rc number rather than a version number, so the
+published versions have no gaps. The reasoning is in
+[designs/release-candidates.md](designs/release-candidates.md).
+
+`main` releases minors and majors (`vX.Y.0`); a `release-X.Y` branch releases
+patches (`vX.Y.Z`) to a series that has already shipped. See
+[The tag and branch model](#the-tag-and-branch-model).
 
 ## How a release happens
 
-Three workflows, in order. In the normal flow only the first is started by a
-human; `release-upgrade` is also dispatchable by hand for backfills, rollbacks
-and the [break-glass paths](#break-glass).
+Three workflows, in order.
 
 | Phase | Workflow | Trigger | Result |
 |---|---|---|---|
-| 1. Prepare | `release-prepare.yaml` | manual dispatch | pushes a `vX.Y.Z` tag, nothing else |
+| 1. Prepare | `release-prepare.yaml` | the schedule, or a manual dispatch | pushes a candidate tag `vX.Y.Z-rc.N`, or a final `vX.Y.Z` on promote. Nothing else |
 | 2. Build | `release.yaml` | the tag push | builds, signs, attests, creates a **draft** release |
-| 3. Soak and publish | `release-upgrade.yaml` | automatic, on phase 2 completing | deploys to `unbounded-stable`, smokes it, flips the draft to published |
+| 3. Soak | `release-upgrade.yaml` | automatic, on phase 2 completing | see below |
+
+What phase 3 does depends on the tag:
+
+- **A candidate** is deployed to `unbounded-stable` and smoke-tested. The result
+  is recorded as the `unbounded/candidate` commit status on its commit, and the
+  candidate stays a draft. **Candidates are never published.**
+- **A final** promoted from a candidate that passed is not soaked again: same
+  commit. Its signatures and BOM are verified and it is published.
+- **A final** that has no passing candidate behind it (a forced promote) is
+  soaked, and published if that passes.
 
 The split exists so phase 2 runs in the tag's context. Keyless cosign signatures
 carry the identity `release.yaml@refs/tags/vX.Y.Z`, and phase 3 verifies exactly
@@ -33,7 +48,8 @@ One consequence is worth knowing before it confuses someone: GitHub attributes a
 deploy-key push to whoever **registered the key**, so the actor shown on every
 `release.yaml` run is the same person regardless of who cut the release. It is
 not evidence that they did anything. `relctl watch <tag>` reports the real cutter
-on a `Cut by:` line, and `relctl status` in a `BY` column.
+on a `Cut by:` line, and `relctl status` in a `BY` column. A candidate the
+schedule cut reports `scheduled`.
 
 ## Driving this: `relctl` or `gh`
 
@@ -56,58 +72,62 @@ it and what else is sitting on `main`.
 
 | Situation | What to do |
 |---|---|
-| `main` is clean | [Cut from `main`](#cut-a-minor-or-major-release-from-main). It is a minor. Nothing special. |
-| `main` carries work you are not ready to ship | A release from `main` takes all of it, and there is no way to exclude it. Read the list first, then: [cut a candidate](#cut-a-release-candidate-first) the moment your fix lands and promote that, which holds that exact tree; or revert the unready work, cut, and re-land it after; or ship it anyway, having read the list. |
+| `main` is clean, and a candidate has passed | [Promote it](#ship-a-release-from-main). Nothing else. |
+| Your fix just merged and you cannot wait for the schedule | [Cut a candidate now](#cut-a-candidate-now), wait for it to pass, promote it. |
+| `main` carries work you are not ready to ship | Promote a candidate cut **before** that work merged: promote ships the candidate's tree, not `main` HEAD. `relctl promote --candidate vX.Y.Z-rc.N`. Otherwise revert the unready work and wait for a candidate. |
 | Someone is on an older series | [Cut a patch](#cut-a-patch-for-a-series-that-already-shipped) from that series' branch. This is the case release branches exist for, and the only way to ship the fix without everything merged since. |
 | The fix is needed on both | Land on `main`, then cherry-pick down. Never the reverse: the flow is one-way, so nothing needs forward-porting. |
 | A patch on the newest series | Allowed immediately. `release-0.5` can be opened the moment `v0.5.0` ships, without waiting for `main` to move, because `main` will never take `v0.5.1`. This is the property the whole rule buys. |
 | Two branches at once | Independent. Their numbers cannot collide. |
 | An incompatible change | [A major](#cutting-a-major-instead), from `main`. It is never derived; you ask for it. |
 
-## Cut a minor or major release from `main`
+## Ship a release from `main`
 
-The common case: everything merged since the last release. One dispatch, then
-waiting - nothing between the tag and the published release needs a human.
+The common case: everything merged up to the newest candidate that passed. One
+dispatch, then waiting - nothing between the tag and the published release needs
+a human.
 
 ### Before you start
 
-`main` has to be releasable: the nightly green and green recently, CI green on
-the commit you intend to release, and no candidate train already in flight.
+There has to be a candidate that passed its soak, recently enough to be worth
+shipping, with CI green on `main`.
 
 ```sh
 relctl preflight
 ```
 
 <details>
-<summary>The same checks with <code>gh</code></summary>
+<summary>The same check with <code>gh</code></summary>
 
 ```sh
-# The nightly deploys main to a real cluster and smoke-tests it. This is the
-# strongest signal we have. It should be green, and green recently.
-gh run list --repo Azure/unbounded --workflow nightly.yaml --limit 5
+# Candidates on main, newest first.
+git fetch --tags origin
+git tag --list 'v*-rc.*' --sort=-version:refname --merged origin/main | head
 
-# CI on the commit you intend to release.
+# A candidate's soak result is the unbounded/candidate status on its commit.
+gh api "repos/Azure/unbounded/commits/v0.5.0-rc.3/status" \
+  --jq '.statuses[] | select(.context == "unbounded/candidate") | .state'
+
+# CI on main.
 gh run list --repo Azure/unbounded --workflow ci.yaml --branch main --limit 5
 ```
 
 </details>
 
-A red nightly is a release blocker until it is understood. See
-[Is `main` releasable?](#is-main-releasable) for what each check means and what
-"green recently" is judged as.
+See [Is there something to promote?](#is-there-something-to-promote) for what
+each check means.
 
-### Cut it
+### Promote it
 
 ```sh
-# 1. What version, and what would ship?
-relctl next
-git log --oneline "$(relctl next -o json | jq -r .latestFinal)..origin/main"
+# 1. What would ship? The newest candidate that passed, and its commit.
+relctl candidate pick
 
-# 2. Cut it. Shows the version and every workflow input, then asks.
-#    Add --dry-run to see that without dispatching.
-relctl cut
+# 2. Promote it. Shows the candidate, the final it becomes and every workflow
+#    input, then asks. Add --dry-run to see that without dispatching.
+relctl promote
 
-# 3. Follow it through build, soak and publish. Exits non-zero if it does not
+# 3. Follow it through build and publish. Exits non-zero if it does not
 #    publish, so this can be the last line of a script.
 relctl watch v0.5.0
 ```
@@ -116,43 +136,68 @@ relctl watch v0.5.0
 <summary>The same thing with <code>gh</code> only</summary>
 
 ```sh
-# 1. What would ship? Everything on main since the last final tag.
-git fetch --tags origin
-git log --oneline \
-  "$(git describe --tags --abbrev=0 --match 'v[0-9]*' --exclude '*-*' origin/main)..origin/main"
-
-# 2. Confirm the version without cutting anything. The run log prints the tag
-#    it would create and the commit it would tag.
+# 1. Confirm what would be cut without cutting anything. The run summary shows
+#    the final, the candidate it is promoted from and its commit.
 gh workflow run release-prepare.yaml --repo Azure/unbounded \
-  -f mode=release -f dry_run=true
+  -f mode=promote -f dry_run=true
 
-# 3. Cut it. Same command, without dry_run.
-gh workflow run release-prepare.yaml --repo Azure/unbounded -f mode=release
+# 2. Promote. release-prepare picks the newest candidate that passed and refuses
+#    if there is none.
+gh workflow run release-prepare.yaml --repo Azure/unbounded -f mode=promote
 
-# 4. Watch it through. The tag push starts the build, which drafts the release;
-#    finishing that starts the soak, which publishes it.
+# 3. Watch it through.
 gh run list --repo Azure/unbounded --workflow release.yaml --limit 3
 gh run list --repo Azure/unbounded --workflow release-upgrade.yaml --limit 3
 
-# 5. Confirm. isDraft false means it shipped.
+# 4. Confirm. isDraft false means it shipped.
 gh release view v0.5.0 --repo Azure/unbounded --json tagName,isDraft,url
 ```
 
-The `dry_run=true` step exists because there was no other way to see the version
-before minting it. `relctl next` answers the same question locally and instantly,
-so the relctl path skips it - but the dispatch remains the only way to prove the
-WORKFLOW agrees, which is what makes it worth keeping before a first release from
-a branch nobody has cut from.
+</details>
+
+Promote tags **the candidate's commit**, not `main` HEAD, so anything merged
+after that candidate is not in the release. That is a feature as much as a
+constraint: the tree that was built, deployed and smoke-tested is the tree that
+ships. `relctl promote` and the dry run both say how many commits are being
+left out.
+
+The final is rebuilt from that commit, because the version is compiled into
+every binary and signatures are tied to the tag. It does **not** soak again,
+since its candidate already did; its signatures and BOM are verified before it
+publishes.
+
+### Cut a candidate now
+
+The schedule cuts a candidate around 12:15am, 8:15am and 4:15pm US Eastern when
+`main` has moved. When you need one sooner - a fix that just merged - cut it by
+hand:
+
+```sh
+relctl rc
+relctl watch v0.5.0-rc.4     # exits zero when it passes its soak
+relctl promote
+```
+
+<details>
+<summary>With <code>gh</code></summary>
+
+```sh
+gh workflow run release-prepare.yaml --repo Azure/unbounded -f mode=prerelease
+```
 
 </details>
 
+A hand-cut candidate is cut even if `main` HEAD already has one, which is how to
+retry a commit whose candidate failed for a reason that has since been fixed.
+
 ### Cutting a major instead
 
-There is no `bump` input. `main` cuts a minor unless you ask for a major, and a
-major is the one deliberate choice in the scheme:
+There is no `bump` input. `main` starts a minor train unless you ask for a
+major, and a major is the one deliberate choice in the scheme:
 
 ```sh
-relctl cut --major
+relctl rc --major     # starts vX.0.0-rc.1
+relctl promote        # once it passes
 ```
 
 <details>
@@ -160,7 +205,7 @@ relctl cut --major
 
 ```sh
 gh workflow run release-prepare.yaml --repo Azure/unbounded \
-  -f mode=release -f major=true
+  -f mode=prerelease -f major=true
 ```
 
 </details>
@@ -169,6 +214,10 @@ Ask for it when the release contains incompatible changes. While the project is
 pre-1.0 the compatibility signal lives entirely in the major, so `v1.0.0` is the
 release that says compatibility now matters. See
 [Choosing a version](#choosing-a-version).
+
+A minor train already in flight is continued rather than replaced, so starting a
+major while one is live needs `--allow-concurrent-trains`, and promote then needs
+`--version`. See [How trains work](#how-trains-work).
 
 ### If something fails
 
@@ -179,16 +228,16 @@ release, see [Break glass](#break-glass).
 
 For when someone is on `v0.3.x` and needs a fix without everything merged to
 `main` since. Open the branch if it does not exist, cherry-pick the fix, cut a
-patch.
+patch candidate, promote it.
 
 ### What is different
 
-Three things differ from a release cut from `main`, and all three bite before
-you start:
+Three things differ from a release from `main`, and all three bite before you
+start:
 
-- **It will not soak.** `unbounded-stable` soaks `main` only. The patch skips
-  deploy, Orca and smoke entirely, and then publishes - verified, but deployed
-  nowhere, and it does not sit as a draft waiting for anyone.
+- **It will not soak.** `unbounded-stable` soaks `main` only. A candidate from a
+  release branch skips deploy, Orca and smoke, and passes once its signatures and
+  BOM verify. The schedule never cuts on a release branch; you cut these by hand.
   [Why](#release-branches-do-not-soak)
 - **It may not be marked Latest.** A patch on an older series leaves the install
   command pointing at the newer release, so shipping `v0.3.1` after `v0.5.0`
@@ -206,14 +255,7 @@ you start:
   anything. `relctl branch create --dry-run` prints what it would send and
   dispatches nothing, so it cannot tell you.
 
-Release candidates are also pointless here: a candidate exists to soak, and one
-cut from a release branch will not. Cut candidates on `main`.
-
 ### Before you start
-
-The nightly only ever runs on the default branch, so it says nothing about a
-release branch. `relctl preflight --branch release-0.3` reports that rather than
-showing a tick that refers somewhere else.
 
 Check whether the branch already exists:
 
@@ -241,7 +283,7 @@ gh workflow run create-release-branch.yaml --repo Azure/unbounded -f series=0.3
 
 </details>
 
-### Cherry-pick, then cut
+### Cherry-pick, then cut and promote
 
 ```sh
 # 1. Cherry-pick the fix onto the branch through a pull request. Fixes land on
@@ -250,11 +292,13 @@ gh workflow run create-release-branch.yaml --repo Azure/unbounded -f series=0.3
 # 2. Check what it will cut. Run this ON the branch, or pass --branch: the
 #    version is resolved against whatever is checked out.
 git checkout release-0.3 && git fetch --tags
-relctl next
+relctl next                   # v0.3.1-rc.1
 
-# 3. Cut the patch. --branch defaults to the checkout, so on the branch this
-#    is just:
-relctl cut
+# 3. Cut the patch candidate, then promote it once it has built and verified.
+#    --branch defaults to the checkout, so on the branch this is just:
+relctl rc
+relctl watch v0.3.1-rc.1
+relctl promote
 
 # 4. Confirm it will not be marked Latest if main has moved past it. classify
 #    answers relative to the trunk, so it needs main checked out and refuses
@@ -268,9 +312,9 @@ relctl classify v0.3.1
 
 ```sh
 gh workflow run release-prepare.yaml --repo Azure/unbounded \
-  -f mode=release -f branch=release-0.3 -f dry_run=true
+  -f mode=prerelease -f branch=release-0.3
 gh workflow run release-prepare.yaml --repo Azure/unbounded \
-  -f mode=release -f branch=release-0.3
+  -f mode=promote -f branch=release-0.3
 ```
 
 </details>
@@ -288,72 +332,30 @@ owns.
 
 See [Recovery](#recovery).
 
-## Cut a release candidate first
-
-Worth it for anything you would not want to publish blind. Each candidate is
-built, signed and soaked on `unbounded-stable` exactly like a final release, and
-published as a prerelease, so it never becomes "Latest".
-
-```sh
-# 1. Start the train. Cut candidates on main: --branch release-X.Y is accepted
-#    but the candidate will not soak, which is the only reason to cut one.
-relctl rc
-
-# 2. Iterate. Same command: the train in flight is detected and the next rc
-#    taken automatically.
-relctl rc
-
-# 3. See where the train is at any point.
-relctl status                   # live and stale trains
-relctl next --mode prerelease   # the rc that would be cut next
-
-# 4. Promote when it is good.
-relctl promote
-```
-
-<details>
-<summary>The same thing with <code>gh</code> only</summary>
-
-```sh
-gh workflow run release-prepare.yaml --repo Azure/unbounded -f mode=prerelease
-gh workflow run release-prepare.yaml --repo Azure/unbounded -f mode=prerelease
-gh workflow run release-prepare.yaml --repo Azure/unbounded -f mode=promote
-```
-
-There is no `gh` equivalent of step 3: which trains are live is computed from
-tags rather than stored anywhere.
-
-</details>
-
-`relctl status` is the reason to prefer it here: which trains are live has no
-`gh` equivalent, because it is computed from tags rather than stored anywhere.
-A train that was abandoned shows as **stale**, which is the state that orphaned
-`v0.1.24` at rc.18.
-
-`promote` tags the **last candidate's commit**, not `main` HEAD, so anything
-merged after that candidate is not in the release. That is a feature as much as
-a constraint: cut a candidate as soon as your change lands and you hold that
-exact tree, whatever merges afterwards. See
-[How trains work](#how-trains-work) for the detail.
-
 ## Reference
 
 The rest of this document is what the guides above are built on: what each phase
-of the pipeline does, what to do when one of them goes wrong, and the two
-sanctioned overrides.
+of the pipeline does, what to do when one of them goes wrong, and the sanctioned
+overrides.
 
 ## How the pipeline works
 
 ### Preparing
 
 Everything is `release-prepare.yaml`. It only computes a version and pushes a
-tag; it builds nothing, so a mistake here is cheap to undo. The commands are in
-the guides above - [from `main`](#cut-a-minor-or-major-release-from-main) or
-[from a release branch](#cut-a-patch-for-a-series-that-already-shipped); what
-follows is what they mean.
+tag; it builds nothing, so a mistake here is cheap to undo.
 
-`-f dry_run=true` works with any mode and prints the version and commit it would
-cut without pushing anything.
+| Mode | Cuts |
+|---|---|
+| `prerelease` (the default) | the next candidate, `vX.Y.Z-rc.N` |
+| `promote` | the final `vX.Y.Z`, at the commit of the newest candidate that passed its soak, or of `-f candidate=`, which must have passed |
+
+There is no mode that cuts a final from HEAD. `mode=release` did that and is
+retired: it minted the version number before anything had shown the tree could
+build, so every failure that needed a code change cost a number.
+
+`-f dry_run=true` works with either mode and prints the version and commit it
+would cut without pushing anything.
 
 `-f branch=` selects what to cut from: `main`, or a `release-X.Y` branch.
 Anything else is refused, so a tag can never come from a feature branch. The
@@ -369,6 +371,29 @@ A consequence is that a change to the resolver takes effect only once merged to
 `main`. It cannot be rehearsed by dispatching this workflow from a branch,
 `dry_run` included; the Go tests under `hack/cmd/relctl` are how you test it
 before that.
+
+### The schedule
+
+`release-prepare` also runs on a schedule, around 12:15am, 8:15am and 4:15pm US
+Eastern (`America/New_York`, so daylight saving does not move it). Each run asks
+`relctl candidate due` and cuts a candidate from `main` unless:
+
+- the repository variable `RC_SCHEDULE` is `off`;
+- `main` HEAD already has a candidate or final tag, so nothing has changed; or
+- a release build or soak is still running.
+
+A skipped run is green, and its summary says why. The last rule exists because
+`release-upgrade` serializes on the cluster and GitHub keeps only one pending
+run per concurrency group: a new candidate's soak would cancel one already
+waiting.
+
+```sh
+gh variable set RC_SCHEDULE --body off    # stop scheduled candidates
+gh variable set RC_SCHEDULE --body on     # start them again
+```
+
+The cadence is the cron in `release-prepare.yaml`. Build plus soak takes one to
+two and a half hours, so it should not go much below a few hours.
 
 ### Building
 
@@ -405,11 +430,16 @@ tried here yet, and it only applies to tags whose `release.yaml` has the
 variable. Images that are never scanned, such as the host images and
 racer-vllm, are marked `trivy: false` in the `component-images` matrix.
 
-### Soaking and publishing
+### Soaking
 
-`release-upgrade.yaml` starts automatically when the build finishes. A release
-cut from a [release branch](#release-branches-do-not-soak) skips straight past
-the cluster work and publishes. Otherwise it:
+`release-upgrade.yaml` starts automatically when the build finishes. It first
+asks `relctl soak-plan` whether the release soaks at all. It does not when:
+
+- it was cut from a [release branch](#release-branches-do-not-soak); or
+- it is a final whose candidate at the same commit passed its soak.
+
+A soak dispatched by hand always runs, and a result that cannot be read means
+the release soaks. When it soaks, the workflow:
 
 1. downloads the draft release's artifacts,
 2. verifies their signatures and the BOM against the tag's cosign identity,
@@ -417,8 +447,11 @@ the cluster work and publishes. Otherwise it:
 4. waits for the gated component workloads to roll out,
 5. deploys Orca, the origin cache, as an integration workload,
 6. runs the smoke tests in `hack/release/smoke/`, taken from the default branch
-   so an old tag still gets today's checks,
-7. and only then flips the draft to published.
+   so an old tag still gets today's checks.
+
+When it does not soak, it verifies signatures and the BOM and goes straight to
+the outcome. **Verification is never skipped**: a promoted final is a rebuild
+signed under its own tag, so its candidate's verification says nothing about it.
 
 Step 4 gates on `unbounded-operator`, `unbounded-net-controller`,
 `unbounded-net-node`, `machina-controller`, `gantry`, and on
@@ -428,22 +461,46 @@ assumed: on `unbounded-stable` the cluster's own Site is `stable` while metalman
 runs for a remote site. A cluster where **no** Site enables it fails the deploy,
 because this one is expected to run it.
 
-A clean deploy, a clean Orca deploy and green smoke are the soak gate.
-**Publishing is not a manual step.** If you find yourself running
-`gh release edit --draft=false` by hand, use the
-[break-glass path](#break-glass) instead so the bypass is recorded.
-
 Smoke tests cannot be skipped. Discovery fails if `hack/release/smoke/` is empty
-on the default branch, and publishing requires both discovery and every task to
-succeed, so a release that ran no smoke tests stays a draft. Shipping one anyway
-is the [break-glass path](#break-glass), where it is recorded.
+on the default branch, and passing requires both discovery and every task to
+succeed.
 
-This is also why [`promote` tags the last candidate's commit](#how-trains-work):
-the soak is evidence about one specific tree, and it is only worth anything if
-that is the tree that ships.
+### The outcome
 
-Prereleases are published too, but stay flagged as prereleases and never become
-"Latest".
+**A candidate** records its result as the `unbounded/candidate` commit status on
+its commit: `success` when the soak passed (or, from a release branch, when
+verification did), `failure` otherwise. The candidate is never published, so it
+never appears on the releases page and is never "Latest". Promote reads the
+status, and so does the final's soak plan.
+
+The status is per commit, which is what promotion consumes. Two candidates of
+one commit - a hand-cut retry - share it, and the most recent soak of that tree
+is the one that counts.
+
+**A final** is published once it has passed a soak, its own or its candidate's.
+**Publishing is not a manual step.** If you find yourself running
+`gh release edit --draft=false` by hand, use the [break-glass path](#break-glass)
+instead so the bypass is recorded.
+
+### Drafts
+
+Every release is a draft until it publishes, and candidates never do, so
+`release-upgrade` deletes candidate drafts as they stop being useful:
+
+| When | Deleted |
+|---|---|
+| A candidate's build fails | that candidate's draft |
+| A candidate's soak finishes | drafts of older candidates of the same version, except the newest that passed, when this one did not |
+| A final publishes | its remaining candidates' drafts |
+
+Only candidates' drafts are touched. Tags, images and signatures stay, because
+images, signatures and the Go module proxy may refer to them. A finished
+candidate keeps its own draft, so its soak can be re-run once a cluster problem
+is fixed, without a rebuild. `relctl drafts prune --dry-run <tag>` shows what a
+cleanup would do.
+
+Drafts from before candidates were mandatory are not cleaned up automatically.
+`relctl status` lists them.
 
 ### Degraded clusters
 
@@ -452,53 +509,40 @@ cluster has lost contact with, so one dead node would otherwise block every
 release forever. The gate tolerates a shortfall when it is caused **only** by
 NotReady nodes and everything on a reachable node is healthy.
 
-`MAX_NOTREADY_NODES` caps how much is excusable: **2**, for both the release
-deploy and the nightly. Beyond the cap the shortfall is not excused and the
-rollout fails, with the offending nodes named and grouped by site.
+`MAX_NOTREADY_NODES` caps how much is excusable: **2**. Beyond the cap the
+shortfall is not excused and the rollout fails, with the offending nodes named
+and grouped by site.
 
 Tolerance is not a way to skip the upgrade. A shortfall is only excusable on a
 workload that already carries the release's image tag, so a rollout cannot be
 declared done while the operator is still reconciling the previous version.
 
-## Is `main` releasable?
+## Is there something to promote?
 
 ```sh
 relctl preflight
 ```
 
-It checks the nightly, CI on the branch, and whether a train is already in
-flight, and says RELEASABLE or NOT RELEASABLE with the reason.
+It says RELEASABLE when there is a candidate worth promoting, and NOT
+RELEASABLE with the reason when there is not:
 
-<details>
-<summary>The same checks with <code>gh</code></summary>
+- **No candidate has passed.** Either none has been cut since the last final, or
+  every one failed. Cut one, or find out why they fail.
+- **The passing candidate is stale**: it passed more than two days ago and
+  `main` has moved since. Promoting it would ship a tree from days ago without
+  everything since. Cut a fresh one. A candidate of a `main` that has not moved
+  is not stale however old it is: it is the current tree.
+- **CI is not green on the branch.**
 
-There is no single dashboard. Check these before cutting:
+A newer candidate that failed does not block: promote ships the one that passed,
+not the one that failed. Read why the newer one failed before promoting past it
+all the same. `relctl preflight` reports it.
 
-```sh
-# The nightly deploys main to a real cluster and smoke-tests it. This is the
-# strongest signal we have. It should be green, and green recently.
-gh run list --repo Azure/unbounded --workflow nightly.yaml --limit 5
+`relctl status` shows the same thing at a glance: the next candidate the
+schedule would cut, and under "Promotable:" what promote would ship.
 
-# CI on the commit you intend to release.
-gh run list --repo Azure/unbounded --workflow ci.yaml --branch main --limit 5
-```
-
-</details>
-
-A red nightly is a release blocker until it is understood. It deploys the same
-component images the release will, to the same shape of cluster, so a nightly
-failure is a release failure you have not had yet - unless it is only
-unreachable nodes, which the rollout gate tolerates. See
-[Degraded clusters](#degraded-clusters).
-
-"Green recently" is judged as within 48 hours, which allows for a weekend gap in
-scheduling while still refusing a week-old pass - that describes a tree nobody
-has released since.
-
-The nightly only ever runs on the default branch, so it says nothing about a
-release branch. `relctl preflight --branch` reports that rather than showing a
-tick that refers somewhere else; see
-[Cut a patch](#cut-a-patch-for-a-series-that-already-shipped).
+On a release branch, candidates are verified but not soaked, and preflight says
+so rather than showing a tick that means more than it does.
 
 ## Choosing a version
 
@@ -509,6 +553,8 @@ You do not choose. The version is determined by where you are cutting from:
 | **major** (`v0.4.0` to `v1.0.0`) | `main`, with `-f major=true` | incompatible changes |
 | **minor** (`v0.3.0` to `v0.4.0`) | `main` | every other release from `main` |
 | **patch** (`v0.3.0` to `v0.3.1`) | `release-0.3` | cherry-picked fixes to a shipped series |
+
+Each is reached the same way: candidates of it are cut, and one is promoted.
 
 `main` never cuts a patch, and a release branch never cuts anything else. That
 is what lets the two coexist: every series' patch space belongs to exactly one
@@ -546,14 +592,15 @@ a release from `main` takes everything merged since, with no way to exclude it.
 Patches now come only from a release branch carrying a deliberate set of
 cherry-picks, so the patch signal means more than it used to, not less.
 
+Because only promoted candidates become finals, the counter now advances only
+for a release that ships. Gaps in the rc numbers are expected; gaps in the
+versions are not.
+
 ### Prereleases use `rc` only
 
 The prerelease suffix is `rc.N`, and `release-prepare` rejects anything else.
 `alpha` and `beta` were previously used interchangeably with no defined
 meaning.
-
-Iterate a train by re-running prepare in `prerelease` mode with no input
-changes; the next `rc` is chosen for you. Promote when it is good.
 
 ### Every component shares one version
 
@@ -565,32 +612,38 @@ deployed at the release tag. There is no per-component versioning, and a
 component's image must be built by the release pipeline or its workload will not
 start. `internal/operator/imagecoverage_test.go` enforces that.
 
+This is also why a promoted final is rebuilt rather than relabeled: its
+candidate's binaries carry the candidate's version.
+
 ## How trains work
 
-A train is **in flight** when its core version has prerelease tags, no final
-tag, and is newer than the latest final tag.
+A train is **in flight** when its core version has candidate tags, no final tag,
+and is newer than the latest final tag.
 
 - `prerelease` continues the train in flight and takes the next `rc.N`. Which
   bump the branch would otherwise take is only consulted when there is no train
-  to continue, so it cannot fork a train halfway through.
+  to continue, so it cannot fork a train halfway through. The schedule cuts this
+  way too.
 - `pre` is almost never needed. Leave it blank. An explicit value must be
   `rc.N` and must be ahead of the current highest.
-- `promote` resolves on its own when exactly one train is in flight. With
+- `promote` resolves the train on its own when exactly one is in flight. With
   several it refuses and asks which, rather than guessing.
 
-`promote` creates the tag on **the last candidate's commit**, not on `main`
-HEAD. The point of a candidate is that it was built, deployed to
-`unbounded-stable` and smoke-tested; tagging HEAD would ship a different tree,
-including everything merged since, under a version whose only claim to being
-trustworthy is that soak. Anything merged after the last `rc` is therefore
-**not** in the release. `dry_run` prints the commit and how many commits are
-being left out.
+`promote` creates the tag on **the candidate's commit**, not on `main` HEAD, and
+the candidate is the **newest that passed its soak**, not the highest. With a
+candidate cut three times a day, the highest is routinely still building, or
+failed where the one below it did not. `-f candidate=` names a specific one,
+which must also have passed. Anything merged after the candidate is **not** in
+the release; `dry_run` prints the commit and how many commits are being left
+out.
 
-If you want those commits, cut another candidate first and promote that one.
+If you want those commits, wait for, or cut, a candidate that includes them.
 
 Starting a second train while one is in flight requires
 `-f allow_concurrent_trains=true`, and once two exist, `promote` requires an
-explicit `version`.
+explicit `version`. Scheduled runs fail rather than guess which train to
+continue, so settle on one train, by promoting or abandoning the other, to get
+them going again.
 
 That guard exists because of a real incident: the `v0.1.24` train reached
 `rc.18` and was silently orphaned when a `v0.2.0` train started beside it.
@@ -613,34 +666,31 @@ A worked sequence:
 
 | Event | Branch | Tag | Soaked? |
 |---|---|---|---|
-| Normal release | `main` | `v0.4.0` | yes |
-| Start a candidate train | `main` | `v0.5.0-rc.1` | yes, as a prerelease |
-| Promote | `main` | `v0.5.0` | yes |
+| Scheduled candidate | `main` | `v0.5.0-rc.1` | yes; fails |
+| Scheduled candidate, with the fix | `main` | `v0.5.0-rc.2` | yes; passes |
+| Promote | `main` | `v0.5.0` | no; `rc.2` already did, same commit |
 | A `v0.4.0` user needs a fix | `release-0.4` created from `v0.4.0` | - | - |
-| Cherry-pick, then cut | `release-0.4` | `v0.4.1` | no; publishes unsoaked |
-| Work continues | `main` | `v0.6.0` | yes |
-| Second fix on the branch | `release-0.4` | `v0.4.2` | no; publishes unsoaked |
-| The big one | `main` | `v1.0.0` | yes |
+| Cherry-pick, then cut | `release-0.4` | `v0.4.1-rc.1` | no; verified |
+| Promote | `release-0.4` | `v0.4.1` | no; verified |
+| Work continues | `main` | `v0.6.0-rc.1` ... | yes |
+| The big one | `main` | `v1.0.0-rc.1`, then `v1.0.0` | yes |
 
 ### Release branches do not soak
 
 `unbounded-stable` soaks `main`, and only `main`. A release cut from a release
-branch skips deploy, Orca and smoke entirely, and then **publishes** - it does
-not sit as a draft waiting for someone.
+branch, candidate or final, skips deploy, Orca and smoke entirely. A candidate
+passes once it verifies, and the final then publishes.
 
 That is a decision about provenance, not about version numbers. The soak cluster
-runs whatever `main` last put there, including a candidate, so "is this version
-newer" is the wrong question: a release from a branch has no business on that
-cluster whatever its number. Maintenance branches will get their own soak
-clusters; until they do, these releases ship unsoaked and that is deliberate.
+runs whatever `main` last put there, so "is this version newer" is the wrong
+question: a release from a branch has no business on that cluster whatever its
+number. Maintenance branches will get their own soak clusters; until they do,
+these releases ship unsoaked and that is deliberate.
 
 **Verification is not skipped.** Signatures and the release BOM are checked
-before publishing, by the same script the soaked path uses. Skipping a soak is a
-decision someone made; shipping something unverified is not.
-
-Candidates on a release branch are a special case worth knowing. A candidate
-exists to soak, so one cut from a branch cannot do its job: it will skip the
-soak like everything else from that branch. Cut candidates on `main`.
+before a candidate is recorded and before a final publishes, by the same script
+the soaked path uses. Skipping a soak is a decision someone made; shipping
+something unverified is not.
 
 ### What gets marked "Latest"
 
@@ -656,7 +706,8 @@ its own series, and it is not a prerelease. So:
   it genuinely is the newest release;
 - a patch from an older series is not, so shipping `v0.3.1` after `v0.5.0` leaves
   the install command pointing at `v0.5.0`;
-- republishing an older patch does not steal the marker back from a newer one.
+- republishing an older patch does not steal the marker back from a newer one;
+- a candidate never is, since it is never published.
 
 ### Which branches are maintained
 
@@ -675,19 +726,22 @@ about it.
 `gh` is authoritative, as [Driving this](#driving-this-relctl-or-gh) says at the
 top: the workflows are the interface, `gh` dispatches them, and where the two
 disagree `gh` is right and `relctl` has a bug. What `relctl` adds is the
-questions `gh` cannot answer, like which trains are live, which is computed from
-tags rather than stored anywhere.
+questions `gh` cannot answer, like which trains are live and which candidate
+promote would ship, which are computed from tags and statuses rather than
+stored anywhere.
 
-The one exception, where `relctl` is authoritative, is version resolution.
-`release-prepare` calls `relctl next` internally, so `relctl next` and the
-workflow give the same answer by construction rather than by agreement.
+The one exception, where `relctl` is authoritative, is the release decisions.
+`release-prepare` calls `relctl next`, `relctl candidate pick` and
+`relctl candidate due`, and `release-upgrade` calls `relctl soak-plan`, so
+`relctl` and the workflows give the same answer by construction rather than by
+agreement.
 
 See [hack/cmd/relctl/README.md](hack/cmd/relctl/README.md) for what each command
 needs; some work with no GitHub credential at all.
 
 ## Break glass
 
-Three sanctioned overrides. All are manual-dispatch only: the automatic path
+Four sanctioned overrides. All are manual-dispatch only: the automatic path
 carries no inputs and cannot be relaxed.
 
 They are not equally dangerous, and `relctl` asks for a different confirmation
@@ -697,25 +751,29 @@ for each rather than treating them alike:
 |---|---|---|---|
 | [Tolerate more unreachable nodes](#tolerate-more-unreachable-nodes) | how many NotReady nodes are excusable | `relctl soak <tag> --max-notready-nodes N` | `y/N`, with a warning |
 | [Re-initialize the cluster](#re-initialize-the-soak-cluster) | `site init` instead of `upgrade-apply` | `relctl soak <tag> --force-init` | typed phrase |
+| [Promote without a passing candidate](#promote-without-a-passing-candidate) | the candidate gate | `relctl promote --force --reason ...` | typed phrase |
 | [Publish without a soak](#publish-without-a-soak) | deploy, Orca and smoke entirely | `relctl publish <tag> --reason ...` | typed phrase, no `--yes` |
 
-A typed phrase cannot be satisfied by `--yes`, so the last two are not reachable
-by reflex or by a script that passes `--yes` everywhere. Raising the NotReady
-ceiling takes an ordinary prompt because it is a bounded relaxation that still
-fails on anything unhealthy, not a way past the gate.
+A typed phrase cannot be satisfied by `--yes`, so the last three are not
+reachable by reflex or by a script that passes `--yes` everywhere. Raising the
+NotReady ceiling takes an ordinary prompt because it is a bounded relaxation
+that still fails on anything unhealthy, not a way past the gate.
 
-Re-running a soak with no override at all is an ordinary retry:
+Re-running a soak with no override at all is an ordinary retry, for a candidate
+or a final:
 
 ```sh
-relctl soak v0.4.0
+relctl soak v0.5.0-rc.2
 ```
+
+A candidate's re-run records a fresh result on its commit.
 
 ### Tolerate more unreachable nodes
 
 When a known outage takes out more nodes than the cap allows:
 
 ```sh
-relctl soak v0.4.0 --max-notready-nodes 7
+relctl soak v0.5.0-rc.2 --max-notready-nodes 7
 ```
 
 <details>
@@ -723,7 +781,7 @@ relctl soak v0.4.0 --max-notready-nodes 7
 
 ```sh
 gh workflow run release-upgrade.yaml --repo Azure/unbounded \
-  -f tag=v0.4.0 -f max_notready_nodes=7
+  -f tag=v0.5.0-rc.2 -f max_notready_nodes=7
 ```
 
 </details>
@@ -737,7 +795,7 @@ the number deliberately; it is a claim someone can review.
 `site init` instead of `upgrade-apply`, for a first-ever bootstrap:
 
 ```sh
-relctl soak v0.4.0 --force-init
+relctl soak v0.5.0-rc.2 --force-init
 ```
 
 <details>
@@ -745,7 +803,7 @@ relctl soak v0.4.0 --force-init
 
 ```sh
 gh workflow run release-upgrade.yaml --repo Azure/unbounded \
-  -f tag=v0.4.0 -f force_init=true
+  -f tag=v0.5.0-rc.2 -f force_init=true
 ```
 
 </details>
@@ -758,12 +816,41 @@ a plain retry.
 
 If the soak failed and the cluster is intact, re-run it without this.
 
-### Publish without a soak
+### Promote without a passing candidate
 
-For when the soak cluster itself is the problem and the release must ship:
+For when the soak cluster itself is the problem, so no candidate can pass, and a
+release must ship:
 
 ```sh
-relctl publish v0.4.0 --reason "unbounded-stable unreachable during DC maintenance"
+relctl promote --force --reason "unbounded-stable unreachable during DC maintenance"
+```
+
+<details>
+<summary>With <code>gh</code></summary>
+
+```sh
+gh workflow run release-prepare.yaml --repo Azure/unbounded \
+  -f mode=promote -f force=true \
+  -f reason="unbounded-stable unreachable during DC maintenance"
+```
+
+</details>
+
+- It promotes the train's highest candidate, or `--candidate`, without checking
+  its result.
+- It runs behind the `unbounded-reviewers` environment, so it can be gated on
+  reviewer approval independently of ordinary releases.
+- The final it tags **does** soak, since there is no passing candidate to stand
+  in for one. If the cluster still cannot pass, the next step is
+  [Publish without a soak](#publish-without-a-soak), which records the bypass on
+  the release.
+
+### Publish without a soak
+
+For a final whose soak cannot pass because the soak cluster is the problem:
+
+```sh
+relctl publish v0.5.0 --reason "unbounded-stable unreachable during DC maintenance"
 ```
 
 There is no `--yes`. The confirmation phrase must be typed in full.
@@ -773,7 +860,7 @@ There is no `--yes`. The confirmation phrase must be typed in full.
 
 ```sh
 gh workflow run release-upgrade.yaml --repo Azure/unbounded \
-  -f tag=v0.4.0 -f force_publish=true \
+  -f tag=v0.5.0 -f force_publish=true \
   -f reason="unbounded-stable unreachable during DC maintenance"
 ```
 
@@ -786,8 +873,11 @@ gh workflow run release-upgrade.yaml --repo Azure/unbounded \
 - The deploy and smoke jobs still run, so their diagnostics are preserved.
 - The forced path uses the `unbounded-reviewers` environment, so it can be
   gated on reviewer approval independently of normal releases.
+- Candidates are refused: they are never published. Promote one with `--force`
+  instead.
 
-If you use this, file a follow-up to fix whatever made it necessary.
+If you use either forced path, file a follow-up to fix whatever made it
+necessary.
 
 ## Recovery
 
@@ -797,12 +887,22 @@ design: a dispatched build would sign with the wrong identity and fail
 verification downstream.
 
 ```sh
-git push origin :refs/tags/v0.4.0
+git push origin :refs/tags/v0.5.0-rc.3
 ```
 
-**The build failed partway.** Re-run it. `release.yaml` is safe to re-run: the
-draft release is opened once, up front, and every job that writes to it
-replaces rather than appends.
+**A candidate's build failed.** Do nothing to it. Its draft is discarded
+automatically and the next candidate is the retry: the schedule cuts one once
+`main` moves, or cut one now with `relctl rc`, which also re-cuts the same commit
+when the cause was not in the tree. The rc number it used is simply skipped.
+
+A failed candidate can still be re-run in full (`gh run rerun <run-id>`, not
+`--failed`), because the job that opens the draft runs again. `--failed` does
+not work for a candidate: its draft is already gone, and the job that opens it
+succeeded the first time, so it is not re-run.
+
+**A final's build failed partway.** Re-run it. `release.yaml` is safe to re-run:
+the draft release is opened once, up front, and every job that writes to it
+replaces rather than appends. A final's draft is never discarded.
 
 ```sh
 gh run rerun <run-id> --failed --repo Azure/unbounded
@@ -811,7 +911,8 @@ gh run rerun <run-id> --failed --repo Azure/unbounded
 `--failed` re-runs only what failed and leaves successful jobs alone, which is
 what you want for a transient cause: a registry blip, a runner, a permission
 that has since been granted. Fix the cause first, because a re-run re-runs the
-same tree.
+same tree. Since the final is a rebuild of a candidate that already built, a
+cause outside the tree is the likely one.
 
 Two limits on this:
 
@@ -821,45 +922,40 @@ Two limits on this:
   produced them are still green, so it will not rebuild them, and `finalize`
   fails on the missing artifact. Use a full `gh run rerun <run-id>` instead,
   which reruns everything.
-- **The release must still be a draft.** If the soak already published it, the
-  build refuses to run rather than rewriting a shipped release's artifacts.
-  Re-draft it first with `gh release edit <tag> --draft=true`.
+- **The release must still be a draft.** If it was already published, the build
+  refuses to run rather than rewriting a shipped release's artifacts. Re-draft
+  it first with `gh release edit <tag> --draft=true`.
 
-**A re-run cannot fix it.** Only then delete the tag and cut it again. This is
-the expensive path: it burns a version number.
-
-```sh
-git push origin :refs/tags/v0.4.0
-```
-
-Deleting the tag leaves the draft release behind. Deleting the draft too is
-tidier but no longer required: the next cut of the same version adopts it and
-overwrites its assets. If the tag came from `promote`, note that re-promoting
-resolves the same candidate commit again, so a fix that is a code change needs
-a new `rc` cut first - only a fix outside the tagged tree (a secret, a runner, a
-registry) can be retried by re-promoting.
+**A final's build cannot be fixed by a re-run.** Leave its tag where it is and
+promote a new candidate; the next final takes the next number. Do not delete the
+tag and promote again. Deleting it would let promote compute the same version a
+second time, for a different tree, while the first attempt's public images and
+signatures are still under that version. This should be rare: the final is a
+rebuild of a commit that already built.
 
 **Where did it get to?** `relctl watch <tag> --once` reports the build, every
-soak attempt including manual retries, and whether the release published. It
-correlates runs across all three workflows, which `gh run list` cannot: only the
-build names the tag.
+soak attempt including manual retries, and the outcome: published for a final,
+the recorded soak result for a candidate. It correlates runs across all three
+workflows, which `gh run list` cannot: only the build names the tag.
 
-**The soak failed.** Read the failure before reaching for the override. The
+**The soak failed.** Read the failure before reaching for an override. The
 deploy job's `Diagnose failed rollout` step dumps node readiness, Sites,
 workloads, applied images and operator logs. A missing image is named
-explicitly; so is a rollout blocked by unreachable nodes.
+explicitly; so is a rollout blocked by unreachable nodes. Once the cause is
+fixed, re-run the soak with `relctl soak <tag>`; a candidate keeps its draft for
+exactly this.
 
 **A release was published by mistake.** Re-draft it:
 
 ```sh
-gh release edit v0.4.0 --repo Azure/unbounded --draft=true
+gh release edit v0.5.0 --repo Azure/unbounded --draft=true
 ```
 
-**Stale drafts.** Abandoned candidates linger as drafts and should be deleted
-once their train is promoted, otherwise the release list becomes misleading.
-`relctl status` lists them with the date of the commit each points at, and
-`relctl status --all` shows every one rather than the last 30 days. At the time
-of writing there are 24, going back to `v0.1.17` (2026-06-19).
+**Old drafts.** Drafts from before candidates were mandatory are not cleaned up
+automatically. `relctl status` lists them with the date of the commit each
+points at, and `relctl status --all` shows every one rather than the last 30
+days. Delete them deliberately with `gh release delete <tag>` (without
+`--cleanup-tag`, so the tag stays).
 
 ## Rehearsing locally
 

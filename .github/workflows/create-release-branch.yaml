@@ -161,11 +161,14 @@ jobs:
               echo "> this branch's first commit."
               echo ""
             fi
-            echo "Cherry-pick fixes onto it through a pull request, then cut a patch:"
+            echo "Cherry-pick fixes onto it through a pull request, then cut a patch candidate"
+            echo "and promote it once it has built and verified:"
             echo ""
             echo '```sh'
             echo "gh workflow run release-prepare.yaml --repo ${GITHUB_REPOSITORY} \\"
-            echo "  -f mode=release -f branch=${BRANCH}"
+            echo "  -f mode=prerelease -f branch=${BRANCH}"
+            echo "gh workflow run release-prepare.yaml --repo ${GITHUB_REPOSITORY} \\"
+            echo "  -f mode=promote -f branch=${BRANCH}"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 

@@ -12,7 +12,8 @@ import (
 
 // Classification is what happens to a release once it has been built.
 type Classification struct {
-	// FromMain says whether this release soaks on unbounded-stable.
+	// FromMain says whether this release was cut from main, which is what
+	// decides whether it may soak on unbounded-stable.
 	FromMain bool
 	// Latest says whether the GitHub release is marked Latest.
 	Latest bool
@@ -32,12 +33,13 @@ var classifyTag = regexp.MustCompile(
 // seriesOf extracts the X.Y a tag belongs to.
 var seriesOf = regexp.MustCompile(`^v([0-9]+\.[0-9]+)\.`)
 
-// Classify decides whether a release soaks, and whether it is Latest.
+// Classify decides whether a release was cut from main, and whether it is
+// Latest.
 //
 // There are two questions here and they are NOT the same question. An earlier
 // design answered both with one version comparison and got the first one wrong.
 //
-//	FromMain  Should this soak on unbounded-stable?
+//	FromMain  May this soak on unbounded-stable?
 //
 //	          That cluster soaks main, and only main. A release cut from a
 //	          release-X.Y branch has its own soak story, and deploying it to
@@ -90,7 +92,7 @@ func Classify(repo Repo, tag string) (*Classification, error) {
 	}
 
 	if c.FromMain {
-		c.note("%s is reachable from HEAD: cut from the default branch, so it soaks.", tag)
+		c.note("%s is reachable from HEAD: cut from the default branch.", tag)
 	} else {
 		c.note("%s is NOT reachable from HEAD: cut from a release branch, so it does not soak.", tag)
 	}

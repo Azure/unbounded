@@ -12,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/Azure/unbounded/hack/cmd/relctl/relctl/gh"
+	"github.com/Azure/unbounded/hack/cmd/relctl/relctl/version"
 )
 
 // watchResult is where a release has got to.
@@ -26,7 +27,10 @@ type watchResult struct {
 	By      *gh.Attribution `json:"by,omitempty"`
 	Soaks   []runSummary    `json:"soaks,omitempty"`
 	Release string          `json:"release,omitempty"`
-	Done    bool            `json:"done"`
+	// Candidate is a candidate's recorded soak result. Candidates are never
+	// published, so for them this, not Release, is the outcome.
+	Candidate string `json:"candidate,omitempty"`
+	Done      bool   `json:"done"`
 	// AttributionError is set when the correlation candidates could not be
 	// listed, so an unknown cutter cannot be misread as an established fact
 	// about the tag. Reported rather than fatal: it costs a derived column,
@@ -44,7 +48,10 @@ func watchCommand(opts *Options) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "watch <tag>",
 		Short: "Follow a release through build, soak and publish",
-		Long: `Follow a release from its tag to a published release.
+		Long: `Follow a release from its tag to its outcome.
+
+For a final, the outcome is a published release. For a candidate it is the soak
+result recorded on its commit: candidates are never published.
 
 Three workflows are involved and none of them names the tag except the first:
 release.yaml is identifiable because a tag push sets the run's branch to the
@@ -191,7 +198,7 @@ func watchFailure(tag string, timeout time.Duration, deadline time.Time, err err
 //
 // Fetched on the first sighting of a BUILD, not before the loop. `watch <tag>`
 // is routinely started before the tag exists - the documented flow in
-// RELEASING.md is `relctl cut` and then `relctl watch <tag>` - and a list taken
+// RELEASING.md is `relctl promote` and then `relctl watch <tag>` - and a list taken
 // then cannot contain the prepare run that is about to push the tag. Attribute
 // reads that absence as "pushed by hand" and reports the run's actor, which on
 // a tag push is the deploy key's owner. Waiting for the build removes the race
@@ -299,9 +306,51 @@ func collectWatch(
 		current = release
 	}
 
-	result.Done = watchDone(progress.Build, progress.Soaks, current)
+	_, _, isCandidate := version.ParseCandidate(tag)
+
+	// Read from the build's commit, which is the tag's. Only once there is a
+	// build, since before then there is nothing that could have soaked.
+	if isCandidate && progress.Build != nil {
+		status, err := client.CandidateStatus(ctx, progress.Build.HeadSHA)
+		if err != nil {
+			return result, err
+		}
+
+		result.Candidate = candidateNoResult
+
+		if status != nil {
+			result.Candidate = candidateFailed
+			if status.Passed() {
+				result.Candidate = candidatePassed
+			}
+		}
+	}
+
+	if isCandidate {
+		result.Done = candidateWatchDone(progress.Build, progress.Soaks, result.Candidate)
+	} else {
+		result.Done = watchDone(progress.Build, progress.Soaks, current)
+	}
 
 	return result, nil
+}
+
+// candidateWatchDone is watchDone for a candidate, which never publishes.
+//
+// Done once the build fails, once a result is recorded, or once the newest soak
+// finishes either way. The last is a backstop: a soak that died before it could
+// record anything has still ended, and waiting for a status that will never be
+// written would cost the whole timeout.
+func candidateWatchDone(build *gh.Run, soaks []gh.Run, recorded string) bool {
+	if build != nil && build.Done() && !build.Succeeded() {
+		return true
+	}
+
+	if recorded == candidatePassed || recorded == candidateFailed {
+		return true
+	}
+
+	return len(soaks) > 0 && soaks[len(soaks)-1].Done()
 }
 
 // watchDone decides whether anything further will happen.
@@ -342,6 +391,14 @@ func watchVerdict(result watchResult) error {
 		return fmt.Errorf("build for %s is %s", result.Tag, result.Build.State)
 	}
 
+	if _, _, ok := version.ParseCandidate(result.Tag); ok {
+		if result.Candidate != candidatePassed {
+			return fmt.Errorf("%s did not pass its soak (%s)", result.Tag, orNone(result.Candidate))
+		}
+
+		return nil
+	}
+
 	switch result.Release {
 	case "":
 		return fmt.Errorf("no release exists for %s", result.Tag)
@@ -379,6 +436,10 @@ func writeWatchText(out io.Writer, result watchResult) error {
 		}
 	}
 
+	if result.Candidate != "" {
+		rows = append(rows, []string{"Soak result:", result.Candidate})
+	}
+
 	rows = append(rows, []string{"Release:", orNone(result.Release)})
 
 	return table(out, rows)
@@ -406,6 +467,13 @@ func attributionRow(attribution *gh.Attribution, failure string) (label, value s
 	}
 
 	switch {
+	case attribution.Source == gh.SourceSchedule:
+		value = attribution.By
+		if attribution.RunURL != "" {
+			value += "  (release-prepare's schedule " + attribution.RunURL + ")"
+		}
+
+		return "Cut by:", value
 	case attribution.Source == gh.SourceDispatch && attribution.Known():
 		value = attribution.By
 		if attribution.RunURL != "" {

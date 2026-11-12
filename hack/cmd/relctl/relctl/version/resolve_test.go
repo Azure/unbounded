@@ -65,6 +65,8 @@ func (c resolveCase) request() Request {
 			req.Pre = value
 		case "VERSION":
 			req.Version = value
+		case "CANDIDATE":
+			req.Candidate = value
 		case "ALLOW_CONCURRENT_TRAINS":
 			req.AllowConcurrentTrains = value == "true"
 		}

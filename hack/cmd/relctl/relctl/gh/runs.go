@@ -18,7 +18,6 @@ const (
 	WorkflowRelease = "release.yaml"
 	WorkflowUpgrade = "release-upgrade.yaml"
 	WorkflowBranch  = "create-release-branch.yaml"
-	WorkflowNightly = "nightly.yaml"
 	WorkflowCI      = "ci.yaml"
 )
 

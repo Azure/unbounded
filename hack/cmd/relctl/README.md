@@ -13,8 +13,14 @@ has a bug.**
 
 That ordering is deliberate. relctl exists to make the release process legible
 and hard to get wrong, not to become a second implementation of it. The one
-place it *is* authoritative is version resolution: `release-prepare` calls
-`relctl next`, so the answer here and the answer in CI come from the same code.
+place it *is* authoritative is the release decisions: `release-prepare` calls
+`relctl next`, `relctl candidate pick` and `relctl candidate due`, and
+`release-upgrade` calls `relctl classify`, `relctl soak-plan`,
+`relctl candidate record` and `relctl drafts`, so the answer here and the answer
+in CI come from the same code.
+
+Every final is a promoted release candidate; see
+[designs/release-candidates.md](../../../designs/release-candidates.md).
 
 ## Building
 
@@ -29,15 +35,21 @@ make relctl-build    # no lint or test
 |---|---|---|
 | `next` | yes | no |
 | `classify` | yes | no |
+| `soak-plan` | yes | only for a final from `main` |
 | `status` | for the train view | yes |
-| `preflight` | for the train note | yes |
+| `preflight` | yes | yes |
 | `watch` | no | yes |
-| `cut` `rc` `promote` | for the preview | yes |
+| `rc` | for the preview | yes |
+| `promote` | yes | yes |
+| `candidate pick` `candidate due` | yes | yes |
+| `candidate record` `drafts` | no | yes |
 | `branch create` `soak` `publish` | no | yes |
 
 Version resolution is pure git, so `next` and `classify` work with no
-`GITHUB_TOKEN` and no `gh` login — including inside a workflow that was never
-granted one.
+`GITHUB_TOKEN` and no `gh` login, including inside a workflow that was never
+granted one. Whether a candidate passed its soak is recorded on GitHub as the
+`unbounded/candidate` commit status, so anything that needs that answer needs a
+credential.
 
 Tags must be current. `relctl` reads the clone it is pointed at and does not
 fetch: run `git fetch --tags` first if an answer looks stale.
@@ -56,18 +68,25 @@ that stops a tool being used.
 
 ### `status`
 
-Latest release, live and stale trains, release branches, drafts, and anything in
-flight across `release-prepare`, `release.yaml`, `release-upgrade` and
-`create-release-branch`.
+Latest release, live and stale trains, the next candidate, what `promote` would
+ship, release branches, drafts, and anything in flight across `release-prepare`,
+`release.yaml`, `release-upgrade` and `create-release-branch`.
 
-Drafts are worth reading: a draft is a release that built and never shipped, and
-the usual cause is a failed soak. They accumulate silently.
+"Next candidate" is what `relctl rc` would cut from the checkout. It is reported
+as unknown, rather than blanking the train view, when it cannot be resolved,
+for instance with two live trains. "Promotable" is the newest candidate of the
+live train that passed its soak.
+
+Drafts are worth reading. Candidates stay drafts by design, and release-upgrade
+deletes them as they are superseded; any other draft is a release that built and
+never shipped. Drafts from before candidates were mandatory accumulate until
+someone clears them.
 
 Drafts list one per line with the date of the commit they point at, highest
 version first:
 
 ```
-Drafts (24): built but not published, usually a soak that failed.
+Drafts (24): built but not published. A candidate stays a draft by design; anything else is usually a failure.
   TAG          COMMITTED
   v0.2.4-rc.1  2026-08-12
   v0.2.1-rc.1  2026-08-03
@@ -109,10 +128,16 @@ In flight:
 The version that would be cut, without cutting it.
 
 ```sh
-relctl next                          # for the branch you are on
-relctl next --branch release-0.4     # for another branch's policy
-relctl next --mode prerelease        # the next candidate
+relctl next                                       # the next candidate on this branch
+relctl next --branch release-0.4                  # for another branch's policy
+relctl next --mode promote                        # the final the live train would ship
+relctl next --mode promote --candidate v0.5.0-rc.2
 ```
+
+The default mode is `prerelease`. `--mode release` is refused: it minted a final
+straight from HEAD and is retired. `--mode promote` resolves against the train's
+highest candidate unless `--candidate` names one, because which candidate passed
+is on GitHub and this command does not read it. `relctl candidate pick` does.
 
 `--branch` is **policy**: it decides what may be cut, per the versioning rule in
 `RELEASING.md`. Tag discovery is separately scoped by reachability from local
@@ -122,25 +147,41 @@ policy applied to that branch's history would answer confidently and wrongly.
 
 ### `classify`
 
-Whether a tag soaks, and whether it is Latest. Two questions that are not the
-same question; `relctl classify --help` explains why.
+Whether a tag was cut from `main`, and whether it is Latest. Two questions that
+are not the same question; `relctl classify --help` explains why.
 
 Needs a checkout of the **default branch** with full history and tags, because
 `from_main` is answered by reachability.
 
+### `soak-plan`
+
+Whether a release soaks on `unbounded-stable`, and why. `release-upgrade` asks
+this before deploying anything. It does not soak when it was cut from a release
+branch, or when it is a final whose candidate on the same commit passed its
+soak. Everything else soaks, including any soak dispatched by hand
+(`--event workflow_dispatch`) and any final whose candidate's result cannot be
+read: the safe direction is the one that touches the cluster.
+
+Same checkout requirement as `classify`, plus a credential when the tag is a
+final from `main`.
+
 ### `preflight`
 
-Whether a branch is releasable: the nightly green and green *recently*, CI on the
-branch, and any train already in flight.
+Whether there is something to promote: a candidate that passed its soak, recent
+enough to be worth shipping, with CI green on the branch.
 
-A red nightly is a blocker until it is understood — it deploys the same component
-images the release will, to the same shape of cluster. The nightly only ever runs
-on the default branch, so on a release branch the tool says so rather than
-showing a tick that refers somewhere else.
+"Recent enough" is age and movement together. A candidate more than two days old
+is stale only if `main` has moved since; a candidate of an unchanged `main` is
+the current tree however old it is. A newer candidate that failed is reported
+but does not block, since promote ships the one that passed.
+
+Candidates are read from the checkout. On a release branch, where candidates are
+verified rather than soaked, the tool says so.
 
 ### `watch`
 
-Follows a tag through build, soak and publish.
+Follows a tag through build, soak and its outcome: published, for a final, or
+the recorded soak result, for a candidate, which is never published.
 
 Only `release.yaml` is identifiable by tag, because a tag push sets the run's
 branch to the tag. `release-upgrade` fires on `workflow_run`, reports the default
@@ -148,8 +189,8 @@ branch, and exposes no link back to what triggered it — so its runs are matche
 by commit and time window. That window matters: a promoted final and its last
 candidate **share a commit**, so `head_sha` alone cannot tell their soaks apart.
 
-Exits non-zero if the release did not publish, so it can be the last line of a
-script.
+Exits non-zero if a final did not publish or a candidate did not pass, so it
+can be the last line of a script.
 
 It also names who cut the tag:
 
@@ -173,19 +214,50 @@ such as a 404 or a bad credential, fails at once instead of spending the timeout
 on an answer that will not change. `--once` is a single-shot query and never
 retries.
 
-### `cut`, `rc`, `promote`
+### `rc`, `promote`
 
-Dispatch `release-prepare`. Each shows the version it will mint — resolved
-locally by the same code the workflow runs — and every input it will send,
-then asks. `--dry-run` prints that and stops.
+Dispatch `release-prepare`. Each shows the version it will mint, resolved
+locally by the same code the workflow runs, and every input it will send, then
+asks. `--dry-run` prints that and stops.
 
 The preview is the reason to prefer these over `gh`: the workflow's own
 `dry_run` costs a dispatch and a minute to answer a question computable here
 instantly.
 
+`promote` finalizes the **newest candidate that passed its soak**, or
+`--candidate`, which must have passed. It looks that up before asking, refuses
+when there is none, and sends the candidate it found as an input, so the
+workflow promotes what was previewed rather than whatever is newest when it
+runs. `--force --reason` is break glass: it skips the check, needs a typed
+phrase, and runs behind the `unbounded-reviewers` environment.
+
 They dispatch on `main` even when cutting from a release branch, because
 `release-prepare` takes its tooling from the default branch deliberately and
 dispatching it on the branch would run that branch's copy of the workflow.
+
+`cut` is retired. It minted a final straight from HEAD; it now says what
+replaced it and dispatches nothing.
+
+### `candidate pick`, `candidate record`, `candidate due`
+
+The candidate model's three questions, mostly for the workflows.
+
+- `pick` names the candidate `promote` would finalize, or refuses. It is the
+  gate `release-prepare` runs before tagging a final.
+- `record` writes a candidate's soak result as the `unbounded/candidate` commit
+  status. `release-upgrade` runs it when a candidate's soak finishes.
+- `due` decides whether the schedule cuts a candidate now: not when
+  `RC_SCHEDULE` is `off`, not when HEAD already has a candidate or final, and not
+  while a build or soak is still running. Not due exits zero and says why.
+
+### `drafts prune`, `drafts discard`
+
+Delete candidate drafts that have stopped being useful. `prune <candidate>`
+removes older drafts of the same version that a finished soak supersedes,
+keeping the newest that passed; `prune <final>` removes a published final's
+remaining candidate drafts; `discard <candidate>` removes the draft of a
+candidate whose build failed. Only candidates' drafts are ever touched, and tags
+stay. `prune --dry-run` says what it would do.
 
 ### `branch create`
 
@@ -198,8 +270,10 @@ The break-glass paths. Both take a **typed confirmation** rather than accepting
 `--yes`, so neither is reachable by reflex or by a script that passes `--yes`
 everywhere. `publish` has no `--yes` flag at all.
 
-`soak <tag>` on its own is an ordinary retry and is not treated as break-glass.
-`--force-init` and `publish` are.
+`soak <tag>` on its own is an ordinary retry and is not treated as break-glass;
+for a candidate it records a fresh result. `--force-init` and `publish` are.
+`publish` refuses candidates, which are never published: `promote --force` is
+the break glass for those.
 
 ## Who cut a release
 
@@ -217,6 +291,7 @@ So relctl derives the answer instead, and reports it three ways:
 | Rendering | Means |
 | --- | --- |
 | `Cut by: <login>` with a `release-prepare` link | That person dispatched the `release-prepare` run that pushed the tag |
+| `Cut by: scheduled` with a `release-prepare` link | The schedule cut it. Nobody did; the scheduled run's actor is whoever last edited the cron |
 | `Pushed by: <login>` | The tag was pushed **by hand**, so the run's actor really is the person who pushed it |
 | `Cut by: unknown`, or `?` in the `BY` column | Could not be established |
 
@@ -268,8 +343,11 @@ This is a workaround. The fix is to stop pushing tags with a person's deploy key
 
 `github` emits `key=value` for `$GITHUB_OUTPUT` and is what the workflows
 consume. `next` emits `tag`, `base`, `bump` and `series`; `classify` emits
-`from_main` and `latest`. Diagnostics go to stderr in that mode, because anything
-on stdout lands in `$GITHUB_OUTPUT` and a stray line corrupts it.
+`from_main` and `latest`; `soak-plan` emits `soak`, `reason` and `candidate`;
+`candidate pick` emits `candidate` and `commit`; `candidate due` emits `due` and
+`reason`. Diagnostics go to stderr in that mode, because anything on stdout
+lands in `$GITHUB_OUTPUT` and a stray line corrupts it. A refusal writes nothing
+to stdout.
 
 Under Actions — detected via `GITHUB_ACTIONS` — warnings are emitted as
 `::warning::` so they surface as annotations.

@@ -93,6 +93,12 @@ type Request struct {
 	Pre string
 	// Version is an explicit final for promote.
 	Version string
+	// Candidate is an explicit rc for promote to finalize, e.g. v0.3.0-rc.2.
+	//
+	// Empty means the train's highest rc. Named explicitly when the caller has
+	// established which candidate actually passed its soak, which this package
+	// cannot: that is recorded on GitHub, and resolution is pure git.
+	Candidate string
 	// AllowConcurrentTrains permits starting a second live train.
 	AllowConcurrentTrains bool
 }
@@ -103,6 +109,8 @@ type Result struct {
 	Tag string
 	// Base is the commit to create it at.
 	Base string
+	// Candidate is the rc whose commit Base is, for promote. Empty otherwise.
+	Candidate string
 	// LatestFinal is the highest final reachable from HEAD, or v0.0.0.
 	LatestFinal string
 	// Live are cores still in flight.
@@ -200,6 +208,8 @@ type resolver struct {
 	latestFinal string
 	live        []string
 	stale       []string
+	// candidate is the rc a promote resolved to.
+	candidate string
 
 	report   []string
 	warnings []string
@@ -221,6 +231,10 @@ func (r *resolver) warn(format string, args ...any) {
 // resolves the candidate's commit; release and prerelease resolve HEAD.
 func Resolve(repo Repo, req Request) (*Result, error) {
 	r := &resolver{repo: repo, req: req}
+
+	if req.Candidate != "" && req.Mode != ModePromote {
+		return nil, fmt.Errorf("candidate is only valid with mode=promote")
+	}
 
 	if err := r.discover(); err != nil {
 		return nil, err
@@ -261,6 +275,7 @@ func Resolve(repo Repo, req Request) (*Result, error) {
 	return &Result{
 		Tag:         tag,
 		Base:        base,
+		Candidate:   r.candidate,
 		LatestFinal: r.latestFinal,
 		Live:        r.live,
 		Stale:       r.stale,

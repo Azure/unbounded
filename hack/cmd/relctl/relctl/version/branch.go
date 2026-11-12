@@ -40,6 +40,12 @@ type Policy struct {
 // pathological name from being treated as a series at all.
 var releaseBranch = regexp.MustCompile(`^release-(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})$`)
 
+// IsReleaseBranch reports whether name is a release-X.Y branch. Other branches
+// that merely start with "release-" are not.
+func IsReleaseBranch(name string) bool {
+	return releaseBranch.MatchString(name)
+}
+
 // ForBranch decides what branch may release, and how much it may advance.
 //
 // The versioning rule (#627):
@@ -81,4 +87,28 @@ func ForBranch(branch string, major bool) (Policy, error) {
 	}
 
 	return Policy{}, fmt.Errorf("refusing to release from %s; expected main or release-X.Y", branch)
+}
+
+// CheckMode refuses a mode that no branch may cut with.
+//
+// mode=release is retired. It minted a final version straight from HEAD,
+// before anything had shown that HEAD could be built or deployed, so every
+// failure that needed a code change cost a version number: eight of the
+// seventeen minors from v0.6 to v0.22 never shipped. A final is now only ever
+// a promoted candidate, so a failure costs an rc number instead.
+//
+// The resolver keeps ModeRelease internally, because its table of cases
+// exercises the arithmetic through it. This is the policy gate in front of it,
+// applied by every caller that mints a tag.
+func CheckMode(mode Mode) error {
+	switch mode {
+	case ModePrerelease, ModePromote:
+		return nil
+	case ModeRelease:
+		return fmt.Errorf(
+			"mode=release is retired: every final is a promoted candidate; " +
+				"cut a candidate with mode=prerelease (relctl rc), then promote it (relctl promote)")
+	default:
+		return fmt.Errorf("unexpected mode: %s", mode)
+	}
 }

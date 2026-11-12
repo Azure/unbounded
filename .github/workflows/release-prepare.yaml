@@ -7,6 +7,18 @@ name: unbounded release prepare
 # Phase 1 of the two-phase release: computes the next version and pushes the
 # tag. It builds, signs and publishes nothing.
 #
+# Every final is a promoted candidate. There is no mode that mints a final from
+# HEAD: that minted the version number before anything had shown the tree could
+# be built or deployed, so every failure needing a code change cost a number,
+# and eight of the seventeen minors from v0.6 to v0.22 never shipped. Now a
+# failure costs an rc number, and a final is only cut from a candidate whose
+# soak passed. See designs/release-candidates.md.
+#
+#   prerelease  cut the next candidate, vX.Y.Z-rc.N. Also what the schedule
+#               does, three times a day.
+#   promote     tag the final, vX.Y.Z, on the commit of the newest candidate
+#               that passed its soak (or a named one, which must have passed).
+#
 # Why split it out: release.yaml must run in the tag's context so its keyless
 # cosign signatures carry the identity `release.yaml@refs/tags/vX.Y.Z`, which
 # the deploy workflow verifies. A tag created mid-run by a workflow dispatched
@@ -40,30 +52,43 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "release: cut vX.Y.Z | prerelease: cut vX.Y.Z-<pre> | promote: finalize a prerelease"
+        description: "prerelease: cut the next candidate vX.Y.Z-rc.N | promote: finalize the newest candidate that passed its soak"
         required: true
         type: choice
         options:
-          - release
           - prerelease
           - promote
-        default: release
+        default: prerelease
       branch:
         description: "Branch to cut from: main, or a release-X.Y maintenance branch."
         required: true
         type: string
         default: main
       major:
-        description: "main only: cut a major (vX.0.0) instead of a minor. Majors are never derived."
+        description: "main only: start a major train (vX.0.0-rc.1) instead of a minor. Majors are never derived."
         type: boolean
         default: false
       pre:
-        description: "Prerelease suffix (e.g. rc.3). Blank takes the next rc automatically, which is almost always what you want."
+        description: "prerelease only: suffix (e.g. rc.3). Blank takes the next rc automatically, which is almost always what you want."
         required: false
         type: string
         default: ""
       version:
-        description: "promote only: explicit final version to cut (e.g. v0.2.0); blank = the single live prerelease train"
+        description: "promote only: the final to cut (e.g. v0.2.0); blank = the single live train"
+        required: false
+        type: string
+        default: ""
+      candidate:
+        description: "promote only: the candidate to finalize (e.g. v0.2.0-rc.3); blank = the newest that passed its soak"
+        required: false
+        type: string
+        default: ""
+      force:
+        description: "BREAK GLASS, promote only: finalize a candidate that has NOT passed its soak. Needs a reason and unbounded-reviewers approval."
+        type: boolean
+        default: false
+      reason:
+        description: "Why force is needed (required with it; recorded on the run)"
         required: false
         type: string
         default: ""
@@ -76,10 +101,26 @@ on:
         type: boolean
         default: false
 
+  # Scheduled candidates: around 8am, 4pm and midnight US Eastern, so there is a
+  # candidate soaked and ready to promote at the start of the working day.
+  # America/New_York, so the times hold across daylight saving. :15 rather than
+  # :00 because the top of the hour is when GitHub's scheduler is busiest and
+  # most likely to delay a run. A scheduled run cuts only when `relctl
+  # candidate due` says so: never on a HEAD that already has a candidate or a
+  # final, never while a build or soak is still running, and not at all while
+  # the repository variable RC_SCHEDULE is `off`.
+  schedule:
+    - cron: "15 0,8,16 * * *"
+      timezone: "America/New_York"
+
 # The tag push authenticates via the SSH deploy key, not GITHUB_TOKEN, so no
-# contents:write is needed here.
+# contents:write is needed here. actions:read lets the schedule see whether a
+# build or soak is still running; statuses:read lets promote see which
+# candidate passed its soak.
 permissions:
   contents: read
+  actions: read
+  statuses: read
 
 # Serialize prepares so two dispatches cannot race to mint tags.
 concurrency:
@@ -87,18 +128,89 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  tag:
+  # ---------------------------------------------------------------------------
+  # BREAK GLASS: the approval gate for a forced promote.
+  #
+  # A forced promote finalizes a candidate whose soak did not pass, for when the
+  # soak cluster rather than the release is the problem. It runs behind the
+  # same environment as release-upgrade's forced publish, so it can require
+  # reviewers independently of ordinary releases. The final it tags is not
+  # exempt from anything else: it still builds, signs and soaks, and if the
+  # cluster still cannot pass, `relctl publish` records the bypass on the
+  # release itself.
+  # ---------------------------------------------------------------------------
+  approve-force:
+    # Compared against both forms because a REST dispatch submits inputs as
+    # strings, and a non-empty string compared with a boolean is not equal.
+    if: github.event_name == 'workflow_dispatch' && (inputs.force == true || inputs.force == 'true')
     runs-on: ubuntu-latest
+    environment: unbounded-reviewers
     steps:
-      - name: Validate branch
+      - name: Require promote mode and a reason
+        env:
+          MODE: ${{ inputs.mode }}
+          REASON: ${{ inputs.reason }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$MODE" != "promote" ]]; then
+            echo "::error::force only applies to mode=promote (got mode=${MODE})"
+            exit 1
+          fi
+
+          if [[ -z "${REASON// /}" ]]; then
+            echo "::error::force requires a non-empty reason"
+            exit 1
+          fi
+
+          echo "::warning::Forced promote by ${ACTOR}: ${REASON}"
+          {
+            echo "### Forced promote approved"
+            echo ""
+            echo "- By: @${ACTOR}"
+            echo "- Reason: ${REASON}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  tag:
+    needs: approve-force
+    # Runs after approve-force when forcing, and in its absence otherwise.
+    # !cancelled() is required rather than stylistic: a job whose need was
+    # skipped is skipped too unless its condition carries a status function.
+    # A skipped gate only counts when nothing asked for force, so a forced run
+    # whose approval was refused cannot fall through to an ordinary one.
+    if: >
+      !cancelled() &&
+      (needs.approve-force.result == 'success' ||
+       (needs.approve-force.result == 'skipped' &&
+        inputs.force != true && inputs.force != 'true'))
+    runs-on: ubuntu-latest
+    env:
+      # A scheduled run carries no inputs, and workflow_dispatch defaults do not
+      # apply to it, so every input is defaulted here for the schedule's sake.
+      # Booleans are normalized to true or false: an absent input is an empty
+      # string, which relctl and the checks below would otherwise refuse.
+      MODE: ${{ inputs.mode || 'prerelease' }}
+      BRANCH: ${{ inputs.branch || 'main' }}
+      MAJOR: ${{ inputs.major == true || inputs.major == 'true' }}
+      FORCE: ${{ inputs.force == true || inputs.force == 'true' }}
+      ALLOW_CONCURRENT_TRAINS: ${{ inputs.allow_concurrent_trains == true || inputs.allow_concurrent_trains == 'true' }}
+    steps:
+      - name: Validate inputs
         # Checked before the checkout, so an unexpected ref never reaches it.
         # Restricted to main and release-X.Y rather than accepting any ref:
         # `ref: main` used to be a hard guarantee that a release came from
         # reviewed code on a protected branch, and an unrestricted input would
         # give that up. A tag cut from a feature branch still signs correctly
         # and passes every downstream check, so nothing else would catch it.
+        #
+        # Free-form inputs arrive as env vars, not interpolated into the script:
+        # a `${{ }}` inlined in a run block is expanded before bash parses it, so
+        # a shell metacharacter would become script syntax.
         env:
-          BRANCH: ${{ inputs.branch }}
+          VERSION: ${{ inputs.version }}
+          CANDIDATE: ${{ inputs.candidate }}
+          REASON: ${{ inputs.reason }}
         run: |
           set -euo pipefail
 
@@ -107,33 +219,27 @@ jobs:
             exit 1
           fi
 
+          if [[ "$MODE" != "promote" ]]; then
+            for input in VERSION CANDIDATE; do
+              if [[ -n "${!input}" ]]; then
+                echo "::error::${input,,} is only valid with mode=promote (got mode=${MODE})"
+                exit 1
+              fi
+            done
+          fi
+
+          if [[ "$FORCE" != "true" && -n "$REASON" ]]; then
+            echo "::error::reason only applies with force"
+            exit 1
+          fi
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.branch }}
+          ref: ${{ env.BRANCH }}
           fetch-depth: 0
           # Wires git to push over SSH with the deploy key so the resulting
           # tag push triggers release.yaml.
           ssh-key: ${{ secrets.RELEASE_TAG_DEPLOY_KEY }}
-
-      - name: Preflight deploy key
-        # Fail fast before any tag is created if the deploy key is missing or
-        # cannot authenticate, so we never leave a pushed tag without a build.
-        env:
-          HAS_KEY: ${{ secrets.RELEASE_TAG_DEPLOY_KEY != '' }}
-        run: |
-          set -euo pipefail
-
-          if [[ "$HAS_KEY" != "true" ]]; then
-            echo "::error::RELEASE_TAG_DEPLOY_KEY secret is not set; cannot push the tag"
-            exit 1
-          fi
-
-          if ! git ls-remote origin >/dev/null 2>&1; then
-            echo "::error::cannot authenticate to origin with the deploy key (git ls-remote failed)"
-            exit 1
-          fi
-
-          echo "Deploy key authenticates to origin."
 
       - name: Take the release tooling from the default branch
         # The branch supplies the history the version is computed against; main
@@ -165,7 +271,7 @@ jobs:
 
       - name: Build the release tooling
         # Built once rather than `go run` per invocation: this is on the path of
-        # every release, and the binary is used again by the summary step.
+        # every release, and the binary is used again by later steps.
         run: |
           set -euo pipefail
 
@@ -173,41 +279,109 @@ jobs:
           go build -o "${RUNNER_TEMP}/relctl" ./hack/cmd/relctl
           echo "Release tooling built from $(git rev-parse --short HEAD) on the default branch"
 
-      - name: Compute tag
-        # Inputs arrive as env vars, not interpolated into the script: `pre` and
-        # `version` are free-form, and a `${{ }}` inlined in a run block is
-        # expanded before bash parses it, so a shell metacharacter would become
-        # script syntax.
+      - name: Decide whether a candidate is due
+        # The schedule only. A dispatch is a person asking for a cut, so it is
+        # not second-guessed: `relctl rc` can deliberately re-cut a commit
+        # whose candidate failed for a reason since fixed.
         #
+        # Not due is an answer rather than a failure: the run goes green, the
+        # remaining steps skip, and the summary says why.
+        if: github.event_name == 'schedule'
+        id: due
+        env:
+          RC_SCHEDULE: ${{ vars.RC_SCHEDULE }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          answer="$("${RUNNER_TEMP}/relctl" candidate due \
+            --schedule "$RC_SCHEDULE" \
+            --repo-path "$GITHUB_WORKSPACE" \
+            --output github)"
+
+          echo "$answer" >> "$GITHUB_OUTPUT"
+
+          due="$(sed -n 's/^due=//p' <<<"$answer")"
+          reason="$(sed -n 's/^reason=//p' <<<"$answer")"
+
+          echo "Scheduled candidate due: ${due} (${reason})"
+          {
+            if [[ "$due" == "true" ]]; then
+              echo "### Scheduled candidate: cutting"
+            else
+              echo "### Scheduled candidate: skipped"
+            fi
+            echo ""
+            echo "${reason}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Preflight deploy key
+        # Fail fast before any tag is created if the deploy key is missing or
+        # cannot authenticate, so we never leave a pushed tag without a build.
+        if: steps.due.outputs.due != 'false'
+        env:
+          HAS_KEY: ${{ secrets.RELEASE_TAG_DEPLOY_KEY != '' }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$HAS_KEY" != "true" ]]; then
+            echo "::error::RELEASE_TAG_DEPLOY_KEY secret is not set; cannot push the tag"
+            exit 1
+          fi
+
+          if ! git ls-remote origin >/dev/null 2>&1; then
+            echo "::error::cannot authenticate to origin with the deploy key (git ls-remote failed)"
+            exit 1
+          fi
+
+          echo "Deploy key authenticates to origin."
+
+      - name: Pick the candidate to promote
+        # THE GATE. A final is cut only from a candidate whose soak passed, as
+        # recorded by release-upgrade in the unbounded/candidate commit status.
+        # relctl refuses when there is none, which fails the run before a tag
+        # exists. The newest passing candidate, unless one is named, in which
+        # case that one must have passed.
+        #
+        # Skipped when forcing: approve-force has already been through the
+        # reviewers' environment, and the final will soak instead.
+        if: steps.due.outputs.due != 'false' && env.MODE == 'promote' && env.FORCE != 'true'
+        id: pick
+        env:
+          VERSION: ${{ inputs.version }}
+          CANDIDATE: ${{ inputs.candidate }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          args=(candidate pick --repo-path "$GITHUB_WORKSPACE" --output github)
+
+          if [[ -n "$VERSION" ]]; then
+            args+=(--version "$VERSION")
+          fi
+
+          if [[ -n "$CANDIDATE" ]]; then
+            args+=(--candidate "$CANDIDATE")
+          fi
+
+          "${RUNNER_TEMP}/relctl" "${args[@]}" >> "$GITHUB_OUTPUT"
+
+      - name: Compute tag
         # One call where there were two. relctl decides what the branch may cut
         # and resolves the version in the same pass, because it has to know the
         # first to do the second, and emits all four keys: tag, base, bump and
         # series. bump is reported below; series is no longer consumed by
         # anything, since the resolver applies it internally.
+        if: steps.due.outputs.due != 'false'
         id: compute
         env:
-          MODE: ${{ inputs.mode }}
-          BRANCH: ${{ inputs.branch }}
-          MAJOR: ${{ inputs.major }}
           PRE: ${{ inputs.pre }}
           VERSION: ${{ inputs.version }}
-          ALLOW_CONCURRENT_TRAINS: ${{ inputs.allow_concurrent_trains }}
+          # The picked candidate when the gate ran, otherwise whatever was
+          # named. Blank on a forced promote means the train's highest rc.
+          CANDIDATE: ${{ steps.pick.outputs.candidate || inputs.candidate }}
         run: |
           set -euo pipefail
-
-          # The `version` override only applies to promote.
-          if [[ -n "$VERSION" && "$MODE" != "promote" ]]; then
-            echo "::error::version is only valid with mode=promote (got mode=${MODE})"
-            exit 1
-          fi
-
-          # A boolean input arrives as a string, and relctl takes a flag rather
-          # than a value, so anything unexpected would silently become false.
-          # The tool cannot make this refusal for us; it is made here.
-          case "$MAJOR" in
-            true | false) ;;
-            *) echo "::error::major must be true or false, got: ${MAJOR}"; exit 1 ;;
-          esac
 
           # Built as an array with explicit ifs: `[[ cond ]] && args+=(...)`
           # evaluates to false when the condition is false, which under `set -e`
@@ -234,50 +408,66 @@ jobs:
             args+=(--version "$VERSION")
           fi
 
+          if [[ -n "$CANDIDATE" ]]; then
+            args+=(--candidate "$CANDIDATE")
+          fi
+
           if [[ "$ALLOW_CONCURRENT_TRAINS" == "true" ]]; then
             args+=(--allow-concurrent-trains)
           fi
 
           "${RUNNER_TEMP}/relctl" "${args[@]}" >> "$GITHUB_OUTPUT"
 
+          # Recorded for the summary, which reads it from here.
+          echo "candidate=${CANDIDATE}" >> "$GITHUB_OUTPUT"
+
       - name: Push tag
         # Compared explicitly, not by truthiness: `gh workflow run -f
         # dry_run=false` submits a string, and a NON-EMPTY STRING IS TRUTHY, so
-        # `!inputs.dry_run` would skip the push on an ordinary run.
-        if: ${{ inputs.dry_run != true && inputs.dry_run != 'true' }}
+        # `!inputs.dry_run` would skip the push on an ordinary run. On the
+        # schedule both comparisons are against '', so it always pushes.
+        if: ${{ steps.due.outputs.due != 'false' && inputs.dry_run != true && inputs.dry_run != 'true' }}
         env:
           TAG: ${{ steps.compute.outputs.tag }}
           BASE: ${{ steps.compute.outputs.base }}
-          MODE: ${{ inputs.mode }}
-          BRANCH: ${{ inputs.branch }}
           BUMP: ${{ steps.compute.outputs.bump }}
+          CANDIDATE: ${{ steps.compute.outputs.candidate }}
+          REASON: ${{ inputs.reason }}
+          EVENT: ${{ github.event_name }}
         run: |
           set -euo pipefail
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          # BASE is HEAD for release and prerelease, and the last candidate's
-          # commit for promote, so promoting ships the tree that was soaked
-          # rather than everything merged since.
+          # BASE is HEAD for a candidate, and the candidate's commit for
+          # promote, so promoting ships the tree that was soaked rather than
+          # everything merged since.
           git tag "$TAG" "$BASE"
           git push origin "$TAG"
 
-          echo "Pushed ${TAG} at ${BASE} (mode=${MODE}, branch=${BRANCH}, bump=${BUMP}); release.yaml will build and sign it in tag context."
+          echo "Pushed ${TAG} at ${BASE} (mode=${MODE}, branch=${BRANCH}, bump=${BUMP}, by ${EVENT}); release.yaml will build and sign it in tag context."
           {
             echo "### Prepared release ${TAG}"
             echo ""
             echo "- Branch: \`${BRANCH}\`"
             echo "- Bump: \`${BUMP}\`"
             echo "- Commit: \`${BASE}\`"
+            echo "- Cut by: \`${EVENT}\`"
+            if [[ -n "$CANDIDATE" ]]; then
+              echo "- Promoted from: \`${CANDIDATE}\`"
+            fi
+            if [[ "$FORCE" == "true" ]]; then
+              echo "- **Forced**: the candidate had not passed its soak. Reason: ${REASON}"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Report dry run
-        if: ${{ inputs.dry_run == true || inputs.dry_run == 'true' }}
+        if: ${{ steps.due.outputs.due != 'false' && (inputs.dry_run == true || inputs.dry_run == 'true') }}
         env:
           TAG: ${{ steps.compute.outputs.tag }}
           BASE: ${{ steps.compute.outputs.base }}
-          BRANCH: ${{ inputs.branch }}
           BUMP: ${{ steps.compute.outputs.bump }}
+          CANDIDATE: ${{ steps.compute.outputs.candidate }}
         run: |
           set -euo pipefail
 
@@ -288,6 +478,9 @@ jobs:
             echo "- Branch: \`${BRANCH}\`"
             echo "- Bump: \`${BUMP}\`"
             echo "- Commit: \`${BASE}\`"
+            if [[ -n "$CANDIDATE" ]]; then
+              echo "- Promoted from: \`${CANDIDATE}\`"
+            fi
             echo "- Commits on HEAD not included: $(git rev-list --count "${BASE}..HEAD")"
             echo
             echo "No tag was pushed. Re-run with dry_run unchecked to cut it."

@@ -15,8 +15,10 @@ import (
 
 // nextResult is what `relctl next` answers.
 type nextResult struct {
-	Tag         string   `json:"tag"`
-	Base        string   `json:"base"`
+	Tag  string `json:"tag"`
+	Base string `json:"base"`
+	// Candidate is the rc a promote finalizes, empty for any other mode.
+	Candidate   string   `json:"candidate,omitempty"`
 	Bump        string   `json:"bump"`
 	Series      string   `json:"series,omitempty"`
 	LatestFinal string   `json:"latestFinal"`
@@ -32,6 +34,7 @@ func nextCommand(opts *Options) *cobra.Command {
 		major      bool
 		pre        string
 		explicit   string
+		candidate  string
 		concurrent bool
 	)
 
@@ -44,7 +47,13 @@ Computed from the local clone, so this needs an up-to-date checkout and no
 GitHub credential at all. Fetch tags first if the answer looks stale.
 
 The same resolution the release workflow performs, which is the point: the
-answer here and the answer there come from one implementation.`,
+answer here and the answer there come from one implementation.
+
+The default is the next candidate. mode=release is retired: a final is only
+ever a promoted candidate, so --mode promote is how to see the final a train
+would ship. Which candidate has passed its soak is recorded on GitHub, which
+this command does not read; pass --candidate to resolve against a specific one,
+or use 'relctl candidate pick' to find it.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runNext(cmd, opts, version.Request{
@@ -52,6 +61,7 @@ answer here and the answer there come from one implementation.`,
 				Series:                "",
 				Pre:                   pre,
 				Version:               explicit,
+				Candidate:             candidate,
 				AllowConcurrentTrains: concurrent,
 			}, branch, major)
 		},
@@ -59,10 +69,11 @@ answer here and the answer there come from one implementation.`,
 
 	cmd.Flags().StringVar(&branch, "branch", "",
 		"Branch to cut from: main, or release-X.Y (default: the checked-out branch)")
-	cmd.Flags().StringVar(&mode, "mode", string(version.ModeRelease), "release, prerelease or promote")
-	cmd.Flags().BoolVar(&major, "major", false, "main only: cut a major instead of a minor")
+	cmd.Flags().StringVar(&mode, "mode", string(version.ModePrerelease), "prerelease or promote")
+	cmd.Flags().BoolVar(&major, "major", false, "main only: start a major train instead of a minor")
 	cmd.Flags().StringVar(&pre, "pre", "", "Explicit prerelease suffix, e.g. rc.3")
 	cmd.Flags().StringVar(&explicit, "version", "", "promote only: the final version to cut")
+	cmd.Flags().StringVar(&candidate, "candidate", "", "promote only: the rc to finalize (default: the train's highest)")
 	cmd.Flags().BoolVar(&concurrent, "allow-concurrent-trains", false,
 		"Permit starting a second live prerelease train")
 
@@ -71,6 +82,12 @@ answer here and the answer there come from one implementation.`,
 
 func runNext(cmd *cobra.Command, opts *Options, req version.Request, branch string, major bool) error {
 	if err := opts.validateOutput(); err != nil {
+		return err
+	}
+
+	// Before anything else, so release-prepare refuses a retired mode with the
+	// reason rather than with whatever the resolver would trip over first.
+	if err := version.CheckMode(req.Mode); err != nil {
 		return err
 	}
 
@@ -101,6 +118,7 @@ func runNext(cmd *cobra.Command, opts *Options, req version.Request, branch stri
 	answer := nextResult{
 		Tag:         result.Tag,
 		Base:        result.Base,
+		Candidate:   result.Candidate,
 		Bump:        string(policy.Bump),
 		Series:      policy.Series,
 		LatestFinal: result.LatestFinal,
@@ -142,8 +160,13 @@ func writeNextText(out io.Writer, answer nextResult, result *version.Result) err
 	rows := [][]string{
 		{"Tag:", answer.Tag},
 		{"Base:", short(answer.Base)},
-		{"Bump:", answer.Bump},
 	}
+
+	if answer.Candidate != "" {
+		rows = append(rows, []string{"Candidate:", answer.Candidate})
+	}
+
+	rows = append(rows, []string{"Bump:", answer.Bump})
 
 	if answer.Series != "" {
 		rows = append(rows, []string{"Series:", answer.Series})

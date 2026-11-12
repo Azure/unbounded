@@ -98,8 +98,8 @@ to the shared `emptyDir`.
 
 ## 3. Install racer-vllm
 
-Release and nightly builds publish the image `racer-vllm` next to the other
-images, at the same registry and tag. It is `vllm/vllm-openai:v0.25.1` with
+Every release build, release candidates included, publishes the image
+`racer-vllm` next to the other images, at the same registry and tag. It is `vllm/vllm-openai:v0.25.1` with
 both packages installed, so it needs no changes.
 
 To use another vLLM image, install both Python packages into it. They are not

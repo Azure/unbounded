@@ -6,9 +6,8 @@
 # real Azure Blob origin and an in-cluster single-node Garage cachestore
 # (PVC-backed).
 #
-# This is the integration-test deploy path, used by both the
-# unbounded-stable (release-upgrade) and unbounded-nightly workflows. It
-# is deployment-neutral: it targets whatever cluster the current kube
+# This is the integration-test deploy path, used by the unbounded-stable
+# soak in release-upgrade. It is deployment-neutral: it targets whatever cluster the current kube
 # context / KUBECONFIG points at. It is intentionally NOT coupled to
 # Azurite (the dev emulator): the origin is a real Azure storage account.
 # It renders the shippable Orca manifests from deploy/orca and the

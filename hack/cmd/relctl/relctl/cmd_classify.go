@@ -15,7 +15,8 @@ import (
 // classifyResult is what happens to a release once it has been built.
 type classifyResult struct {
 	Tag string `json:"tag"`
-	// FromMain says whether this soaks on unbounded-stable.
+	// FromMain says whether this was cut from main. Whether it soaks is
+	// soak-plan's question, which builds on this one.
 	FromMain bool `json:"fromMain"`
 	// Latest says whether the GitHub release is marked Latest.
 	Latest bool `json:"latest"`
@@ -26,18 +27,20 @@ type classifyResult struct {
 func classifyCommand(opts *Options) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "classify <tag>",
-		Short: "Say whether a release soaks, and whether it is Latest",
-		Long: `Say whether a release soaks, and whether it is Latest.
+		Short: "Say whether a release was cut from main, and whether it is Latest",
+		Long: `Say whether a release was cut from main, and whether it is Latest.
 
 Two questions, and they are not the same question.
 
-  from_main  Whether this soaks on unbounded-stable. That cluster soaks main,
-             and only main: a release cut from a release-X.Y branch would
-             replace whatever main last deployed. Deliberately a question about
+  from_main  Whether this was cut from main. unbounded-stable soaks main, and
+             only main: a release cut from a release-X.Y branch would replace
+             whatever main last deployed. Deliberately a question about
              PROVENANCE rather than version ordering, because the cluster can be
              running a candidate newer than the newest final, and an ordering
              test would then say deploy when the honest answer is that this
-             release does not belong there at all.
+             release does not belong there at all. Whether a release soaks
+             builds on this; see soak-plan, which also skips the soak for a
+             final whose candidate already passed one.
 
   latest     Whether the GitHub release is marked Latest, which is what
              releases/latest/download resolves to and therefore the install
@@ -105,7 +108,7 @@ func runClassify(cmd *cobra.Command, opts *Options, tag string) error {
 func writeClassifyText(out io.Writer, answer classifyResult) error {
 	if err := table(out, [][]string{
 		{"Tag:", answer.Tag},
-		{"Soaks:", yesNo(answer.FromMain)},
+		{"From main:", yesNo(answer.FromMain)},
 		{"Latest:", yesNo(answer.Latest)},
 	}); err != nil {
 		return err

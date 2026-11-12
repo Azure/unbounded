@@ -139,3 +139,87 @@ func TestForBranchRefuses(t *testing.T) {
 		})
 	}
 }
+
+// TestIsReleaseBranch pins that only release-X.Y counts. A branch that merely
+// starts with "release-", such as a feature branch named release-notes-fix,
+// must not be reported as a release branch.
+func TestIsReleaseBranch(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string]bool{
+		"release-0.2":              true,
+		"release-1.0":              true,
+		"release-10.23":            true,
+		"main":                     false,
+		"":                         false,
+		"release-":                 false,
+		"release-1":                false,
+		"release-01.2":             false,
+		"release-0.2.4":            false,
+		"release-0.2-backup":       false,
+		"backup/release-0.2":       false,
+		"release-candidates-first": false,
+		"release-1234567890.0":     false,
+	}
+
+	for branch, want := range cases {
+		if got := IsReleaseBranch(branch); got != want {
+			t.Errorf("IsReleaseBranch(%q) = %v, want %v", branch, got, want)
+		}
+	}
+}
+
+// TestCheckModeRetiresRelease pins the rule the whole candidate model rests on:
+// a final is only ever a promoted candidate. mode=release minted the final
+// number before anything had shown the tree could build, so a failure needing a
+// code change cost a version.
+func TestCheckModeRetiresRelease(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		mode    Mode
+		wantErr string
+	}{
+		{mode: ModePrerelease},
+		{mode: ModePromote},
+		{mode: ModeRelease, wantErr: "mode=release is retired"},
+		{mode: "nonsense", wantErr: "unexpected mode"},
+	}
+
+	for _, tc := range cases {
+		t.Run(string(tc.mode), func(t *testing.T) {
+			t.Parallel()
+
+			err := CheckMode(tc.mode)
+
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("CheckMode(%s): %v", tc.mode, err)
+				}
+
+				return
+			}
+
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("CheckMode(%s) = %v, want an error containing %q", tc.mode, err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestCheckModePointsAtTheReplacement keeps the refusal actionable. Someone
+// reaching for the old command needs to be told what replaced it.
+func TestCheckModePointsAtTheReplacement(t *testing.T) {
+	t.Parallel()
+
+	err := CheckMode(ModeRelease)
+	if err == nil {
+		t.Fatal("CheckMode(release) = nil")
+	}
+
+	for _, want := range []string{"relctl rc", "relctl promote"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal does not mention %q: %v", want, err)
+		}
+	}
+}

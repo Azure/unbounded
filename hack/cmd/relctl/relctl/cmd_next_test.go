@@ -82,11 +82,16 @@ func TestNextGitHubOutputMatchesTheWorkflowContract(t *testing.T) {
 		t.Fatalf("github output has %d lines, want 4:\n%s", len(lines), got)
 	}
 
-	want := []string{"tag=v0.5.0", "base=", "bump=minor", "series="}
+	// The next CANDIDATE: a final is only ever a promoted one.
+	want := []string{"tag=v0.5.0-rc.1", "base=", "bump=minor", "series="}
 	for i, prefix := range want {
 		if !strings.HasPrefix(lines[i], prefix) {
 			t.Errorf("line %d = %q, want it to start with %q", i+1, lines[i], prefix)
 		}
+	}
+
+	if lines[0] != "tag=v0.5.0-rc.1" {
+		t.Errorf("line 1 = %q, want exactly tag=v0.5.0-rc.1", lines[0])
 	}
 }
 
@@ -111,8 +116,8 @@ func TestNextDefaultsToTheCheckedOutBranch(t *testing.T) {
 		t.Fatalf("next: %v\n%s", err, out.String())
 	}
 
-	if !strings.Contains(out.String(), "tag=v0.4.1") {
-		t.Errorf("want the release branch's patch, got:\n%s", out.String())
+	if !strings.Contains(out.String(), "tag=v0.4.1-rc.1\n") {
+		t.Errorf("want the release branch's patch candidate, got:\n%s", out.String())
 	}
 
 	if !strings.Contains(out.String(), "bump=patch") {
@@ -157,19 +162,19 @@ func TestNextAppliesTheBranchPolicy(t *testing.T) {
 		wantErr string
 	}{
 		{
-			name: "main cuts a minor",
+			name: "main cuts a minor candidate",
 			args: []string{"next", "--branch", "main"},
-			want: "tag=v0.5.0",
+			want: "tag=v0.5.0-rc.1\n",
 		},
 		{
-			name: "main cuts a major when asked",
+			name: "main cuts a major candidate when asked",
 			args: []string{"next", "--branch", "main", "--major"},
-			want: "tag=v1.0.0",
+			want: "tag=v1.0.0-rc.1\n",
 		},
 		{
-			name: "a release branch cuts a patch",
+			name: "a release branch cuts a patch candidate",
 			args: []string{"next", "--branch", "release-0.4"},
-			want: "tag=v0.4.1",
+			want: "tag=v0.4.1-rc.1\n",
 		},
 		{
 			// The rule that makes release branches possible at all: main and a
@@ -270,7 +275,7 @@ func TestNextNeedsNoCredential(t *testing.T) {
 		t.Fatalf("next without a credential: %v\n%s", err, out.String())
 	}
 
-	if !strings.Contains(out.String(), "tag=v0.5.0") {
+	if !strings.Contains(out.String(), "tag=v0.5.0-rc.1\n") {
 		t.Errorf("output = %q", out.String())
 	}
 }
