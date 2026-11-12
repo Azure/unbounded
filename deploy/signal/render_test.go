@@ -141,6 +141,7 @@ func TestRenderedPrometheusScrapesSignalController(t *testing.T) {
 	if err := yaml.Unmarshal([]byte(documents[0]), &serviceAccount); err != nil {
 		t.Fatalf("decode Prometheus ServiceAccount: %v", err)
 	}
+
 	if serviceAccount.Name != "project-signal-prometheus" ||
 		serviceAccount.AutomountServiceAccountToken == nil ||
 		!*serviceAccount.AutomountServiceAccountToken {
@@ -151,6 +152,7 @@ func TestRenderedPrometheusScrapesSignalController(t *testing.T) {
 	if err := yaml.Unmarshal([]byte(documents[1]), &role); err != nil {
 		t.Fatalf("decode Prometheus Role: %v", err)
 	}
+
 	if len(role.Rules) != 1 ||
 		!slices.Equal(role.Rules[0].Resources, []string{"pods"}) ||
 		!slices.Equal(role.Rules[0].Verbs, []string{"get", "list", "watch"}) {
