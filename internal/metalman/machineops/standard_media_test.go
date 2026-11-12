@@ -34,7 +34,7 @@ func TestStandardVirtualMediaCapabilitiesFailBeforePower(t *testing.T) {
 	}{
 		{
 			name: "cd not allowed", allowed: []string{"Pxe"},
-			message: "boot override target Cd is not allowed",
+			message: "neither boot override target UsbCd nor Cd is allowed",
 		},
 		{
 			name: "required parameter", allowed: []string{"Cd"},

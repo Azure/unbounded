@@ -117,8 +117,10 @@ bootstrap ISO for `HostReplace` instead of PXE or UEFI HTTP boot.
 
 Standard Redfish BMCs fetch the ISO over HTTP from Metalman's `--serve-url`.
 The BMC must expose a CD/DVD virtual-media device on its ComputerSystem or
-linked Manager, support `InsertMedia`, and allow one-time `Cd` boot. Some BMCs
-require a license for virtual media. Rack managers keep their TFTP staging and
+linked Manager, support `InsertMedia`, and allow one-time `UsbCd` or `Cd` boot.
+Metalman prefers `UsbCd` when advertised, otherwise uses `Cd` if allowed or if
+the BMC omits the allowed targets. Some BMCs require a license for virtual media.
+Rack managers keep their TFTP staging and
 remote-drive flow; `--media-tftp-server` is only needed for that flow and
 defaults to the server IP.
 

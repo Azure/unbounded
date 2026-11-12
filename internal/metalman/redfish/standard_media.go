@@ -219,8 +219,8 @@ func (c *Client) standardStageVirtualMedia(ctx context.Context, source bootmedia
 		return err
 	}
 
-	if len(boot.AllowedTargets) > 0 && !slices.Contains(boot.AllowedTargets, BootTargetCd) {
-		return fmt.Errorf("boot override target %s is not allowed by the BMC (allowed %v): %w", BootTargetCd, boot.AllowedTargets, ErrUnsupported)
+	if _, err := virtualMediaBootTarget(boot.AllowedTargets); err != nil {
+		return err
 	}
 
 	device, _, err := c.prepareVirtualMediaInsert(ctx, source)
@@ -404,23 +404,40 @@ func (c *Client) ejectVirtualMedia(ctx context.Context, device virtualMediaDevic
 	return nil
 }
 
+func virtualMediaBootTarget(allowed []BootTarget) (BootTarget, error) {
+	if slices.Contains(allowed, BootTargetUsbCd) {
+		return BootTargetUsbCd, nil
+	}
+
+	if len(allowed) == 0 || slices.Contains(allowed, BootTargetCd) {
+		return BootTargetCd, nil
+	}
+
+	return "", fmt.Errorf("neither boot override target UsbCd nor Cd is allowed by the BMC (allowed %v): %w", allowed, ErrUnsupported)
+}
+
+func isVirtualMediaBootTarget(target BootTarget) bool {
+	return target == BootTargetCd || target == BootTargetUsbCd
+}
+
 func (c *Client) standardSetVirtualMediaBoot(ctx context.Context) error {
 	boot, err := c.systemBoot(ctx)
 	if err != nil {
 		return err
 	}
 
-	if len(boot.AllowedTargets) > 0 && !slices.Contains(boot.AllowedTargets, BootTargetCd) {
-		return fmt.Errorf("boot override target %s is not allowed by the BMC (allowed %v): %w", BootTargetCd, boot.AllowedTargets, ErrUnsupported)
+	target, err := virtualMediaBootTarget(boot.AllowedTargets)
+	if err != nil {
+		return err
 	}
 
 	modeOK := !boot.HasMode || boot.Mode == BootModeUEFI
-	if boot.Target == BootTargetCd && boot.Enabled == BootOnce && modeOK {
+	if boot.Target == target && boot.Enabled == BootOnce && modeOK {
 		return nil
 	}
 
 	settings := map[string]string{
-		"BootSourceOverrideTarget": string(BootTargetCd), "BootSourceOverrideEnabled": string(BootOnce),
+		"BootSourceOverrideTarget": string(target), "BootSourceOverrideEnabled": string(BootOnce),
 	}
 	if !modeOK {
 		settings["BootSourceOverrideMode"] = string(BootModeUEFI)
@@ -435,8 +452,8 @@ func (c *Client) standardSetVirtualMediaBoot(ctx context.Context) error {
 		return err
 	}
 
-	if boot.Target != BootTargetCd || boot.Enabled != BootOnce || (boot.HasMode && boot.Mode != BootModeUEFI) {
-		return fmt.Errorf("boot override does not report one-time UEFI CD boot: %+v", boot)
+	if boot.Target != target || boot.Enabled != BootOnce || (boot.HasMode && boot.Mode != BootModeUEFI) {
+		return fmt.Errorf("boot override does not report one-time UEFI %s boot: %+v", target, boot)
 	}
 
 	return nil
@@ -474,7 +491,7 @@ func (c *Client) standardCleanupVirtualMedia(ctx context.Context, source bootmed
 		return err
 	}
 
-	if boot.Target == BootTargetCd && boot.Enabled != BootDisabled {
+	if isVirtualMediaBootTarget(boot.Target) && boot.Enabled != BootDisabled {
 		settings := map[string]string{"BootSourceOverrideEnabled": string(BootDisabled)}
 		if len(boot.AllowedTargets) == 0 || slices.Contains(boot.AllowedTargets, BootTargetNone) {
 			settings["BootSourceOverrideTarget"] = string(BootTargetNone)
@@ -489,7 +506,7 @@ func (c *Client) standardCleanupVirtualMedia(ctx context.Context, source bootmed
 			return err
 		}
 
-		if boot.Target == BootTargetCd && boot.Enabled != BootDisabled {
+		if isVirtualMediaBootTarget(boot.Target) && boot.Enabled != BootDisabled {
 			return fmt.Errorf("virtual CD boot override is still enabled after cleanup")
 		}
 	}

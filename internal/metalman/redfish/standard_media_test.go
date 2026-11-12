@@ -366,6 +366,113 @@ func TestStandardVirtualMediaCapabilities(t *testing.T) {
 	}
 }
 
+func TestStandardVirtualMediaBootTargets(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		allowed []string
+		target  BootTarget
+	}{
+		{"USB CD only", []string{"UsbCd"}, BootTargetUsbCd},
+		{"both prefer USB CD", []string{"Cd", "UsbCd"}, BootTargetUsbCd},
+		{"CD only", []string{"Cd"}, BootTargetCd},
+		{"missing allowed targets", nil, BootTargetCd},
+		{"empty allowed targets", []string{}, BootTargetCd},
+		{"no supported target", []string{"None", "Pxe", "Hdd"}, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f, c := newFakeILO(t)
+			f.allowed = tc.allowed
+
+			stageErr := c.StageVirtualMedia(t.Context(), standardMedia)
+			require.Empty(t, f.mutations)
+
+			setErr := c.SetVirtualMediaBoot(t.Context())
+			if tc.target == "" {
+				require.ErrorIs(t, stageErr, ErrUnsupported)
+				require.ErrorIs(t, setErr, ErrUnsupported)
+				require.Empty(t, f.mutations)
+
+				return
+			}
+
+			require.NoError(t, stageErr)
+			require.NoError(t, setErr)
+			require.Equal(t, []map[string]string{{"BootSourceOverrideTarget": string(tc.target), "BootSourceOverrideEnabled": "Once"}}, f.patches)
+			require.NoError(t, c.SetVirtualMediaBoot(t.Context()))
+			require.Len(t, f.patches, 1)
+		})
+	}
+}
+
+func TestStandardVirtualMediaBootRequiresSelectedTargetReadback(t *testing.T) {
+	for _, target := range []BootTarget{BootTargetCd, BootTargetUsbCd} {
+		t.Run(string(target), func(t *testing.T) {
+			f, c := newFakeILO(t)
+			f.allowed = []string{string(target)}
+			f.ignoreBoot = true
+			f.boot["BootSourceOverrideEnabled"] = "Once"
+
+			f.boot["BootSourceOverrideTarget"] = "UsbCd"
+			if target == BootTargetUsbCd {
+				f.boot["BootSourceOverrideTarget"] = "Cd"
+			}
+
+			require.ErrorContains(t, c.SetVirtualMediaBoot(t.Context()), "does not report one-time UEFI "+string(target)+" boot")
+			require.Equal(t, []map[string]string{{"BootSourceOverrideTarget": string(target), "BootSourceOverrideEnabled": "Once"}}, f.patches)
+		})
+	}
+}
+
+func TestStandardVirtualMediaCleanupBootTargets(t *testing.T) {
+	for _, target := range []BootTarget{BootTargetCd, BootTargetUsbCd} {
+		for _, tc := range []struct {
+			name    string
+			allowed []string
+			setNone bool
+		}{
+			{"both allowed", []string{"None", "Cd", "UsbCd"}, true},
+			{"allowed targets changed", []string{"Pxe"}, false},
+			{"only None now allowed", []string{"None"}, true},
+			{"missing allowed targets", nil, true},
+		} {
+			for _, ignore := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/%s/ignore=%t", target, tc.name, ignore), func(t *testing.T) {
+					f, c := newFakeILO(t)
+					f.boot["BootSourceOverrideTarget"] = string(target)
+					f.boot["BootSourceOverrideEnabled"] = "Once"
+					f.allowed = tc.allowed
+					f.ignoreBoot = ignore
+					f.image, f.inserted = testISOURL, true
+
+					err := c.CleanupVirtualMedia(t.Context(), standardMedia)
+
+					settings := map[string]string{"BootSourceOverrideEnabled": "Disabled"}
+					if tc.setNone {
+						settings["BootSourceOverrideTarget"] = "None"
+					}
+
+					require.Equal(t, []map[string]string{settings}, f.patches)
+
+					if ignore {
+						require.ErrorContains(t, err, "still enabled")
+						require.Empty(t, f.ejects)
+
+						return
+					}
+
+					require.NoError(t, err)
+					require.Equal(t, "Disabled", f.boot["BootSourceOverrideEnabled"])
+					require.False(t, f.inserted)
+					require.Equal(t, []string{testISOURL}, f.ejects)
+					require.NoError(t, c.CleanupVirtualMedia(t.Context(), standardMedia))
+					require.Len(t, f.patches, 1)
+					require.Len(t, f.ejects, 1)
+				})
+			}
+		}
+	}
+}
+
 func TestStandardVirtualMediaActionInfoAndBoot(t *testing.T) {
 	f, c := newFakeILO(t)
 	f.actionInfo = `{"Parameters":[{"Name":"Image","Required":true},{"Name":"Inserted"},{"Name":"TransferProtocolType","AllowableValues":["HTTP","HTTPS"]},{"Name":"TransferMethod","Required":true,"AllowableValues":["Stream"]}]}`
@@ -391,7 +498,7 @@ func TestStandardVirtualMediaStagingCapabilities(t *testing.T) {
 		message     string
 		unsupported bool
 	}{
-		{"cd not allowed", func(f *fakeILO) { f.allowed = []string{"Pxe"} }, "boot override target Cd is not allowed", true},
+		{"cd not allowed", func(f *fakeILO) { f.allowed = []string{"Pxe"} }, "neither boot override target UsbCd nor Cd is allowed", true},
 		{"missing insert", func(f *fakeILO) { f.noInsert = true }, "advertises #VirtualMedia.InsertMedia", true},
 		{"required parameter", func(f *fakeILO) {
 			f.actionInfo = `{"Parameters":[{"Name":"UserName","Required":true}]}`

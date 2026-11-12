@@ -81,6 +81,7 @@ type BootTarget string
 const (
 	BootTargetNone     BootTarget = "None"
 	BootTargetCd       BootTarget = "Cd"
+	BootTargetUsbCd    BootTarget = "UsbCd"
 	BootTargetPxe      BootTarget = "Pxe"
 	BootTargetHdd      BootTarget = "Hdd"
 	BootTargetUefiHTTP BootTarget = "UefiHttp"
