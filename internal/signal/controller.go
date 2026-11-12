@@ -1246,6 +1246,10 @@ func (r *AdmissionReconciler) resolveStage(
 		return nil, err
 	}
 
+	if _, err := signalv1.MarshalStageExecutionInput(parameters); err != nil {
+		return nil, fmt.Errorf("stage %s parameters are invalid: %w", stage.Name, err)
+	}
+
 	if err := validateStageAssertions(test.Spec.Metrics, stage.Assertions); err != nil {
 		return nil, err
 	}

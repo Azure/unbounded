@@ -22,6 +22,7 @@ func FindTestArtifact(spec CertificationTestSpec, name string) (TestArtifact, bo
 
 func ValidateTestArtifacts(spec CertificationTestSpec) error {
 	seen := make(map[string]struct{}, len(spec.Artifacts))
+	totalBytes := 0
 
 	for index := range spec.Artifacts {
 		artifact := spec.Artifacts[index]
@@ -35,6 +36,14 @@ func ValidateTestArtifacts(spec CertificationTestSpec) error {
 				"test artifact %q exceeds the %d-byte limit",
 				artifact.Name,
 				MaxTestArtifactBytes,
+			)
+		}
+
+		totalBytes += len([]byte(artifact.Content))
+		if totalBytes > MaxTestArtifactsBytes {
+			return fmt.Errorf(
+				"test artifacts exceed the %d-byte aggregate limit",
+				MaxTestArtifactsBytes,
 			)
 		}
 

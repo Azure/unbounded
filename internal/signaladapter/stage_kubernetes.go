@@ -1927,9 +1927,9 @@ func boundedStageMessage(value string) string {
 }
 
 func marshalStageJSON(value any) (string, error) {
-	content, err := json.Marshal(value)
+	content, err := signalv1.MarshalStageExecutionInput(value)
 	if err != nil {
-		return "", fmt.Errorf("encode stage execution input: %w", err)
+		return "", err
 	}
 
 	return string(content), nil

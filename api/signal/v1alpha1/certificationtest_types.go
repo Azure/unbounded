@@ -9,11 +9,12 @@ import (
 )
 
 const (
-	MaxTestParameters    = 16
-	MaxTestMetrics       = 16
-	MaxTestRoles         = 8
-	MaxTestArtifactBytes = 96 * 1024
-	MaxTypedStringLength = 65536
+	MaxTestParameters     = 16
+	MaxTestMetrics        = 16
+	MaxTestRoles          = 8
+	MaxTestArtifactBytes  = 95 * 1024
+	MaxTestArtifactsBytes = 320 * 1024
+	MaxTypedStringLength  = 65536
 )
 
 // +kubebuilder:validation:Enum=String;Integer;Decimal;Boolean;Duration;Quantity
@@ -140,7 +141,7 @@ type TestArtifact struct {
 	// Content is materialized into the execution workload only after the
 	// CertificationTest identity and trust decision match the admitted Run.
 	// +kubebuilder:validation:MinLength=1
-	// +kubebuilder:validation:MaxLength=98304
+	// +kubebuilder:validation:MaxLength=97280
 	Content string `json:"content"`
 	// +kubebuilder:validation:Pattern=`^sha256:[0-9a-f]{64}$`
 	Digest string `json:"digest"`
@@ -237,6 +238,7 @@ type TestSecurityRequirements struct {
 // +kubebuilder:validation:XValidation:rule="!has(self.topology) || self.topology.minParticipants <= self.topology.maxParticipants",message="minParticipants must not exceed maxParticipants"
 // +kubebuilder:validation:XValidation:rule="self.driver.type != 'Script' || (has(self.artifacts) && self.artifacts.exists(a, a.name == self.driver.script.artifact))",message="Script driver artifact must exist in spec.artifacts"
 // +kubebuilder:validation:XValidation:rule="self.driver.type != 'WorkflowTemplate' || !has(self.driver.workflowTemplate.artifact) || (has(self.artifacts) && self.artifacts.exists(a, a.name == self.driver.workflowTemplate.artifact))",message="WorkflowTemplate driver artifact must exist in spec.artifacts"
+// +kubebuilder:validation:XValidation:rule="!has(self.artifacts) || self.artifacts.map(a, a.content.size()).sum() <= 327680",message="total artifact content must not exceed 327680 characters"
 type CertificationTestSpec struct {
 	// Metadata name is the stable machine name.
 	// +kubebuilder:validation:MinLength=1

@@ -1662,6 +1662,25 @@ func TestStagePodCarriesScriptResourcesAndImmutableIdentity(t *testing.T) {
 	}
 }
 
+func TestMaximumInlineArtifactFitsLinuxEnvironmentEntry(t *testing.T) {
+	t.Parallel()
+
+	const (
+		artifactEnvironmentName = "PROJECT_SIGNAL_ARTIFACT_B64"
+		linuxMaximumStringBytes = 128 * 1024
+	)
+
+	encodedBytes := base64.StdEncoding.EncodedLen(signalv1.MaxTestArtifactBytes)
+	entryBytes := len(artifactEnvironmentName) + 1 + encodedBytes + 1
+	if entryBytes > linuxMaximumStringBytes {
+		t.Fatalf(
+			"maximum inline artifact environment entry = %d bytes, Linux maximum = %d",
+			entryBytes,
+			linuxMaximumStringBytes,
+		)
+	}
+}
+
 func TestParseInvocationResultLogConvertsSimpleScriptResult(t *testing.T) {
 	t.Parallel()
 

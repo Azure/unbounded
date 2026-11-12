@@ -4,12 +4,33 @@
 package v1alpha1
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
 )
 
-const MinimumBackendDeadlineReserve = time.Minute
+const (
+	MinimumBackendDeadlineReserve = time.Minute
+	MaxStageExecutionInputBytes   = 96 * 1024
+)
+
+func MarshalStageExecutionInput(value any) ([]byte, error) {
+	content, err := json.Marshal(value)
+	if err != nil {
+		return nil, fmt.Errorf("encode stage execution input: %w", err)
+	}
+
+	if len(content) > MaxStageExecutionInputBytes {
+		return nil, fmt.Errorf(
+			"stage execution input is %d bytes, maximum is %d",
+			len(content),
+			MaxStageExecutionInputBytes,
+		)
+	}
+
+	return content, nil
+}
 
 func ValidateExecutionDeadlines(backendDeadline, outerDeadline time.Duration) error {
 	if backendDeadline <= 0 {

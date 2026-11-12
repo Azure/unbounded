@@ -239,6 +239,10 @@ func TestCertificationTestContract(t *testing.T) {
 		t.Fatalf("parameter maxItems = %v, want %d", parameters.MaxItems, MaxTestParameters)
 	}
 
+	if rule := "!has(self.artifacts) || self.artifacts.map(a, a.content.size()).sum() <= 327680"; !hasValidationRule(&spec, rule) {
+		t.Fatalf("generated CertificationTest spec has no %q validation", rule)
+	}
+
 	typedValue := parameters.Items.Schema.Properties["default"]
 	if len(typedValue.XValidations) != 1 {
 		t.Fatalf("typed value validation count = %d, want 1", len(typedValue.XValidations))

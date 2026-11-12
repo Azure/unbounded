@@ -73,14 +73,14 @@ Set `SIGNAL_RESOLVER_IMAGES` to a comma-separated list of digest-pinned
 resolver images when external input resolution is part of the accepted plan.
 Those images are recorded in immutable plan and evidence provenance.
 
-Rendering also installs an immutable `project-signal-gpu-inventory-v1` script
-ConfigMap and one canonical catalog entry:
+Rendering also installs one canonical catalog entry with its digest-verified
+script embedded in `spec.artifacts`:
 
 - `project-signal-gpu-inventory-v1` is the single canonical qualification
   test after an operator records an `Approved` trust decision for its exact
   generation and content digest.
 
-The renderer independently hashes the exact ConfigMap script bytes and fails
+The renderer independently hashes the exact inline artifact bytes and fails
 when they do not match `SIGNAL_GPU_INVENTORY_SCRIPT_DIGEST`.
 
 Install the rendered CRDs and namespaced resources:
@@ -97,7 +97,7 @@ The install creates:
 - the `project-signal` namespace;
 - controller, adapter, and minimal child-workload service accounts and RBAC;
 - the fixed participant adapter WorkflowTemplate;
-- the immutable GPU inventory source and untrusted catalog specifications;
+- the untrusted GPU inventory catalog specification with its inline artifact;
 - the controller Deployment.
 
 The controller requires cluster permission to get, list, watch, update, and

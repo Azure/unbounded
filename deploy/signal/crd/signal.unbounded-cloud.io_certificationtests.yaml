@@ -61,7 +61,7 @@ spec:
                       description: |-
                         Content is materialized into the execution workload only after the
                         CertificationTest identity and trust decision match the admitted Run.
-                      maxLength: 98304
+                      maxLength: 97280
                       minLength: 1
                       type: string
                     digest:
@@ -784,6 +784,9 @@ spec:
             - message: WorkflowTemplate driver artifact must exist in spec.artifacts
               rule: self.driver.type != 'WorkflowTemplate' || !has(self.driver.workflowTemplate.artifact)
                 || (has(self.artifacts) && self.artifacts.exists(a, a.name == self.driver.workflowTemplate.artifact))
+            - message: total artifact content must not exceed 327680 characters
+              rule: '!has(self.artifacts) || self.artifacts.map(a, a.content.size()).sum()
+                <= 327680'
           status:
             properties:
               conditions:

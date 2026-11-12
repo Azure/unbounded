@@ -1081,11 +1081,13 @@ func TestResolvePhasePlanEnforcesCertificationTestTrust(t *testing.T) {
 		name         string
 		trust        signalv1.CertificationTestTrustState
 		mutableInput bool
+		largeInputs  bool
 		wantError    bool
 		wantQualify  bool
 	}{
 		{name: "approved", trust: signalv1.CertificationTestTrustApproved, wantQualify: true},
 		{name: "approved incomplete input", trust: signalv1.CertificationTestTrustApproved, mutableInput: true},
+		{name: "oversized execution inputs", trust: signalv1.CertificationTestTrustApproved, largeInputs: true, wantError: true},
 		{name: "diagnostic", trust: signalv1.CertificationTestTrustDiagnostic},
 		{name: "rejected", trust: signalv1.CertificationTestTrustRejected, wantError: true},
 		{name: "revoked", trust: signalv1.CertificationTestTrustRevoked, wantError: true},
@@ -1131,6 +1133,17 @@ func TestResolvePhasePlanEnforcesCertificationTestTrust(t *testing.T) {
 					},
 				},
 			}
+			if tt.largeInputs {
+				for _, name := range []string{"first", "second"} {
+					test.Spec.Parameters = append(test.Spec.Parameters, signalv1.TestParameterDefinition{
+						Name:        name,
+						DisplayName: name,
+						Type:        signalv1.TypedValueTypeString,
+						Required:    true,
+					})
+				}
+			}
+
 			kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(test).Build()
 			reconciler := &AdmissionReconciler{Client: kube, APIReader: kube}
 
@@ -1170,6 +1183,22 @@ func TestResolvePhasePlanEnforcesCertificationTestTrust(t *testing.T) {
 					}},
 				},
 			}
+			if tt.largeInputs {
+				for _, name := range []string{"first", "second"} {
+					value := strings.Repeat("x", 60*1024)
+					suite.Spec.Phases[0].Stages[0].Parameters = append(
+						suite.Spec.Phases[0].Stages[0].Parameters,
+						signalv1.StageParameterBinding{
+							Name: name,
+							Value: signalv1.TypedValue{
+								Type:        signalv1.TypedValueTypeString,
+								StringValue: &value,
+							},
+						},
+					)
+				}
+			}
+
 			participants := []signalv1.Participant{{
 				NodeName: "node",
 				NodeUID:  "node-uid",

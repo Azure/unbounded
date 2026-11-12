@@ -419,3 +419,18 @@ func TestDeriveResolvedPlanDeadlineRejectsDependencyCycle(t *testing.T) {
 		t.Fatalf("DeriveResolvedPlanDeadline() error = %v, want cycle", err)
 	}
 }
+
+func TestMarshalStageExecutionInputRejectsOversizedPayload(t *testing.T) {
+	t.Parallel()
+
+	payload := strings.Repeat("x", MaxStageExecutionInputBytes)
+	if _, err := MarshalStageExecutionInput(payload); err == nil ||
+		!strings.Contains(err.Error(), "maximum") {
+		t.Fatalf("MarshalStageExecutionInput() error = %v, want maximum size error", err)
+	}
+
+	payload = strings.Repeat("x", MaxStageExecutionInputBytes-2)
+	if _, err := MarshalStageExecutionInput(payload); err != nil {
+		t.Fatalf("MarshalStageExecutionInput() rejected bounded payload: %v", err)
+	}
+}

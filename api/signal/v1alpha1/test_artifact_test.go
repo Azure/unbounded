@@ -73,4 +73,26 @@ func TestValidateTestArtifacts(t *testing.T) {
 			t.Fatal("ValidateTestArtifacts() accepted oversized artifact content")
 		}
 	})
+
+	t.Run("oversized aggregate content", func(t *testing.T) {
+		t.Parallel()
+
+		oversized := spec
+		oversized.Driver = *spec.Driver.DeepCopy()
+		oversized.Artifacts = nil
+		for index := 0; index < 4; index++ {
+			content := strings.Repeat(string(rune('a'+index)), MaxTestArtifactBytes)
+			sum := sha256.Sum256([]byte(content))
+			oversized.Artifacts = append(oversized.Artifacts, TestArtifact{
+				Name:    string(rune('a'+index)) + ".sh",
+				Content: content,
+				Digest:  "sha256:" + hex.EncodeToString(sum[:]),
+			})
+		}
+		oversized.Driver.Script.Artifact = oversized.Artifacts[0].Name
+
+		if err := ValidateTestArtifacts(oversized); err == nil {
+			t.Fatal("ValidateTestArtifacts() accepted oversized aggregate artifact content")
+		}
+	})
 }
