@@ -79,6 +79,7 @@ func (c *CertificationMetricsCollector) collectRun(
 
 		for measurementIndex := range stage.Measurements {
 			measurement := &stage.Measurements[measurementIndex]
+
 			matches := gpuTflopsMetricPattern.FindStringSubmatch(measurement.Name)
 			if len(matches) != 2 || measurement.Unit != "TFLOP/s" {
 				continue

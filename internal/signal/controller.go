@@ -2541,6 +2541,7 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		}
 
 		checkStatuses := compactCheckStatuses(runningCheckStatuses(workflow, &run))
+
 		identity := run.Status.Evidence.Identity
 		if run.Spec.ResolvedPlan != nil {
 			stages, runnerImages, stageErr := r.completedStageSummaries(ctx, workflow, &run)
@@ -3498,6 +3499,7 @@ func (r *RunReconciler) completedStageSummaries(
 		phase := &run.Spec.ResolvedPlan.Phases[phaseIndex]
 		for stageIndex := range phase.Stages {
 			stage := &phase.Stages[stageIndex]
+
 			summary, stageRunnerImages, err := r.readStageResult(
 				ctx,
 				workflow,
@@ -3516,6 +3518,7 @@ func (r *RunReconciler) completedStageSummaries(
 			}
 
 			stages = append(stages, *summary)
+
 			for _, image := range stageRunnerImages {
 				if _, exists := seenRunnerImages[image]; exists {
 					continue

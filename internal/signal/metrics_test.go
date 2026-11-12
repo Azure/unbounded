@@ -64,6 +64,7 @@ func TestCertificationMetricsCollectorPublishesActiveCompletedStageMinimum(t *te
 	}
 
 	families := gatherCertificationMetrics(t, run)
+
 	minimum := families["project_signal_fleet_certification_r07_assertion_decimal"]
 	if minimum == nil || len(minimum.Metric) != 1 ||
 		minimum.Metric[0].Gauge == nil ||
