@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
@@ -776,6 +777,95 @@ func TestMediaBuildFailureCleanup(t *testing.T) {
 	entries, err := os.ReadDir(filepath.Join(p.CacheDir, "bootmedia"))
 	require.NoError(t, err)
 	require.Empty(t, entries)
+}
+
+func TestMediaHTTPISO(t *testing.T) {
+	p, m, op := mediaFixture(t, "amd64")
+	p.TFTPServer = ""
+
+	var calls []string
+
+	p.Run = mockMediaRunner(t, &calls)
+	id := op.Status.Targets[0].BootMedia.ID
+	source, err := p.Prepare(t.Context(), m, op, id)
+	require.NoError(t, err)
+	require.Empty(t, source.Server)
+	require.Equal(t, p.Resolver.ServeURL+"/bootmedia/"+id+"/boot.iso", source.URL)
+	path := "/bootmedia/" + id + "/boot.iso"
+	request := func(method, path, byteRange string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(method, path, nil)
+
+		r.RemoteAddr = "198.51.100.10:12345" // BMC address is not the host lease.
+		if byteRange != "" {
+			r.Header.Set("Range", byteRange)
+		}
+
+		w := httptest.NewRecorder()
+		p.ServeHTTP(w, r)
+
+		return w
+	}
+	w := request(http.MethodGet, path, "")
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Equal(t, "immutable ISO", w.Body.String())
+	w = request(http.MethodGet, path, "bytes=0-8")
+	require.Equal(t, http.StatusPartialContent, w.Code)
+	require.Equal(t, "immutable", w.Body.String())
+	require.Equal(t, "bytes 0-8/13", w.Header().Get("Content-Range"))
+	w = request(http.MethodHead, path, "")
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Empty(t, w.Body.String())
+	require.Equal(t, "13", w.Header().Get("Content-Length"))
+	require.Equal(t, http.StatusRequestedRangeNotSatisfiable, request(http.MethodGet, path, "bytes=99-").Code)
+	require.Equal(t, http.StatusMethodNotAllowed, request(http.MethodPost, path, "").Code)
+	require.Equal(t, http.StatusNotFound, request(http.MethodGet, strings.Replace(path, id, strings.Repeat("d", 32), 1), "").Code)
+	// The public TFTP entry point never borrows an HTTP grant.
+	op.Status.Targets[0].BootMedia.Cleaned = true
+	require.NoError(t, p.Client.Status().Update(t.Context(), op))
+	_, err = p.OpenISO(t.Context(), source.Name)
+	require.Error(t, err)
+}
+
+func TestMediaHTTPISOGrantExpiryAndRelease(t *testing.T) {
+	for _, release := range []bool{false, true} {
+		t.Run(fmt.Sprint(release), func(t *testing.T) {
+			p, m, op := mediaFixture(t, "amd64")
+
+			var calls []string
+
+			p.Run = mockMediaRunner(t, &calls)
+			now := time.Now()
+			p.Now = func() time.Time { return now }
+			id := op.Status.Targets[0].BootMedia.ID
+			_, err := p.Prepare(t.Context(), m, op, id)
+			require.NoError(t, err)
+
+			request := func() int {
+				w := httptest.NewRecorder()
+				p.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/bootmedia/"+id+"/boot.iso", nil))
+
+				return w.Code
+			}
+			require.Equal(t, http.StatusOK, request())
+
+			op.Status.Targets[0].BootMedia.Cleaned = true
+			require.NoError(t, p.Client.Status().Update(t.Context(), op))
+			require.Equal(t, http.StatusOK, request(), "range requests retain the short grant")
+
+			if release {
+				require.NoError(t, p.Release(t.Context(), id))
+			} else {
+				now = now.Add(mediaISOGrantTTL)
+			}
+
+			require.Equal(t, http.StatusNotFound, request())
+			// URL reconstruction works without a live owner or ISO bytes.
+			p.Client = nil
+			u, err := p.SourceURL(id)
+			require.NoError(t, err)
+			require.Contains(t, u, "/bootmedia/"+id+"/boot.iso")
+		})
+	}
 }
 
 func TestMediaRejectInputs(t *testing.T) {

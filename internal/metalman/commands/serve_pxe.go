@@ -394,7 +394,7 @@ func ServePXECmd() *cobra.Command {
 	cmd.Flags().BoolVar(&dhcpAutoInterface, "dhcp-auto-interface", false, "Auto-detect the DHCP interface from the server IP")
 	cmd.Flags().IntVar(&dhcpPort, "dhcp-port", 67, "UDP port for the DHCP server")
 	cmd.Flags().StringVar(&serveURL, "serve-url", "", "External URL of this serve instance")
-	cmd.Flags().StringVar(&mediaTFTPServer, "media-tftp-server", "", "Advertised IPv4 address for virtual-media TFTP pulls (defaults to server IP)")
+	cmd.Flags().StringVar(&mediaTFTPServer, "media-tftp-server", "", "Advertised IPv4 address for rack-manager virtual-media TFTP pulls (defaults to server IP)")
 	cmd.Flags().DurationVar(&leaseDuration, "leader-elect-lease-duration", 15*time.Second, "Duration that non-leader candidates will wait before attempting to acquire leadership")
 	cmd.Flags().DurationVar(&renewDeadline, "leader-elect-renew-deadline", 10*time.Second, "Duration the acting leader will retry refreshing leadership before giving up")
 	cmd.Flags().DurationVar(&retryPeriod, "leader-elect-retry-period", 2*time.Second, "Duration between leader election retries")
