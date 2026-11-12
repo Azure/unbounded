@@ -16,6 +16,8 @@ import (
 	"github.com/Azure/unbounded/internal/metalman/bootmedia"
 )
 
+var errNoVirtualMediaDevices = fmt.Errorf("no CD or DVD virtual media device found: %w", ErrUnsupported)
+
 // Standard BMCs pull the ISO by URL. VirtualMedia is linked from the system
 // or from its managers (as on HPE iLO). Only CD/DVD devices are used.
 type virtualMediaDevice struct {
@@ -120,10 +122,6 @@ func (c *Client) virtualMediaDevices(ctx context.Context) ([]virtualMediaDevice,
 
 	for _, collectionPath := range collections {
 		data, _, err := c.getResource(ctx, collectionPath)
-		if errors.Is(err, ErrUnsupported) {
-			continue
-		}
-
 		if err != nil {
 			return nil, err
 		}
@@ -157,7 +155,7 @@ func (c *Client) virtualMediaDevices(ctx context.Context) ([]virtualMediaDevice,
 	}
 
 	if len(devices) == 0 {
-		return nil, fmt.Errorf("no CD or DVD virtual media device found: %w", ErrUnsupported)
+		return nil, errNoVirtualMediaDevices
 	}
 
 	return devices, nil
@@ -485,7 +483,7 @@ func (c *Client) standardCleanupVirtualMedia(ctx context.Context, source bootmed
 	}
 
 	devices, err := c.virtualMediaDevices(ctx)
-	if errors.Is(err, ErrUnsupported) {
+	if errors.Is(err, errNoVirtualMediaDevices) {
 		return nil
 	}
 

@@ -44,6 +44,7 @@ type fakeILO struct {
 	firstMedia                           map[string]any
 	firstActionInfo                      string
 	actionInfoReads                      int
+	resourceStatuses                     map[string]int
 }
 
 func newFakeILO(t *testing.T) (*fakeILO, *Client) {
@@ -68,6 +69,11 @@ func newFakeILO(t *testing.T) (*fakeILO, *Client) {
 
 		path := strings.TrimRight(r.URL.Path, "/")
 		write := func(v any) { w.Header().Set("Content-Type", "application/json"); _ = json.NewEncoder(w).Encode(v) }
+
+		if status := f.resourceStatuses[path]; r.Method == http.MethodGet && status != 0 {
+			w.WriteHeader(status)
+			return
+		}
 
 		switch {
 		case path == "/redfish/v1/Systems":
@@ -486,6 +492,39 @@ func TestStandardVirtualMediaCleanupAlreadyEmpty(t *testing.T) {
 
 	require.NoError(t, c.CleanupVirtualMedia(t.Context(), standardMedia))
 	require.Empty(t, f.mutations)
+}
+
+func TestStandardVirtualMediaCleanupIncompleteDiscovery(t *testing.T) {
+	for _, path := range []string{
+		"/redfish/v1/Managers/1",
+		"/redfish/v1/Managers/1/VirtualMedia",
+		"/redfish/v1/Managers/1/VirtualMedia/1",
+		"/redfish/v1/Systems/1/VirtualMedia",
+	} {
+		for _, status := range []int{http.StatusNotFound, http.StatusMethodNotAllowed, http.StatusGone, http.StatusNotImplemented} {
+			t.Run(fmt.Sprintf("%s/%d", path, status), func(t *testing.T) {
+				f, c := newFakeILO(t)
+				f.image, f.inserted = testISOURL, true
+				f.systemMedia = strings.HasPrefix(path, "/redfish/v1/Systems/")
+				f.noManager = f.systemMedia
+				f.resourceStatuses = map[string]int{path: status}
+
+				err := c.CleanupVirtualMedia(t.Context(), standardMedia)
+				require.ErrorContains(t, err, path)
+				require.ErrorIs(t, err, ErrUnsupported)
+				require.NotErrorIs(t, err, errNoVirtualMediaDevices)
+				require.True(t, f.inserted)
+				require.Equal(t, testISOURL, f.image)
+				require.Empty(t, f.mutations)
+
+				f.resourceStatuses = nil
+
+				require.NoError(t, c.CleanupVirtualMedia(t.Context(), standardMedia))
+				require.False(t, f.inserted)
+				require.Equal(t, []string{testISOURL}, f.ejects)
+			})
+		}
+	}
 }
 
 func TestStandardVirtualMediaRejectsInvalidURL(t *testing.T) {
