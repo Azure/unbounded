@@ -4,6 +4,46 @@
 {{- end }}
 {{- $namespace := default "project-signal" .Namespace }}
 apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: project-signal-prometheus
+  namespace: {{ $namespace }}
+  labels:
+    app.kubernetes.io/name: project-signal-prometheus
+    app.kubernetes.io/part-of: project-signal
+automountServiceAccountToken: true
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: project-signal-prometheus-pod-discovery
+  namespace: {{ $namespace }}
+  labels:
+    app.kubernetes.io/name: project-signal-prometheus
+    app.kubernetes.io/part-of: project-signal
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: project-signal-prometheus-pod-discovery
+  namespace: {{ $namespace }}
+  labels:
+    app.kubernetes.io/name: project-signal-prometheus
+    app.kubernetes.io/part-of: project-signal
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: project-signal-prometheus-pod-discovery
+subjects:
+  - kind: ServiceAccount
+    name: project-signal-prometheus
+    namespace: {{ $namespace }}
+---
+apiVersion: v1
 kind: Service
 metadata:
   name: project-signal-controller-metrics
@@ -42,6 +82,28 @@ data:
         static_configs:
           - targets:
               - project-signal-controller-metrics.{{ $namespace }}.svc:8080
+      - job_name: project-signal-live-workloads
+        scrape_interval: 5s
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names:
+                - {{ $namespace }}
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: "true"
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: "(.+)"
+          - source_labels:
+              - __address__
+              - __meta_kubernetes_pod_annotation_prometheus_io_port
+            action: replace
+            regex: "([^:]+)(?::\\d+)?;(\\d+)"
+            replacement: "$1:$2"
+            target_label: __address__
       - job_name: project-signal-prometheus
         static_configs:
           - targets:
@@ -66,7 +128,8 @@ spec:
         app.kubernetes.io/name: project-signal-prometheus
         app.kubernetes.io/part-of: project-signal
     spec:
-      automountServiceAccountToken: false
+      serviceAccountName: project-signal-prometheus
+      automountServiceAccountToken: true
       securityContext:
         runAsNonRoot: true
         runAsUser: 65534

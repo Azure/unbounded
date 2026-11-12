@@ -767,16 +767,23 @@ and evidence digests, and credits only evidence that satisfies the Policy.
 
 The static package deploys a namespace-local Prometheus scraper. Its in-cluster
 query API is available from the `project-signal-prometheus` Service on port
-`9090`. The scraper has no Kubernetes API token and no external ingress.
-Restarting its Pod discards the local time series; certification evidence
-remains durable in immutable evidence ConfigMaps independently of Prometheus.
+`9090`. Its ServiceAccount can only get, list, and watch Pods in the Signal
+namespace for annotated workload discovery; it has no mutation privileges or
+external ingress. Restarting its Pod discards the local time series;
+certification evidence remains durable in immutable evidence ConfigMaps
+independently of Prometheus.
 
 After each stage completes, the controller validates the immutable stage result
 and publishes its bounded typed measurement projection in Run status while the
-parent Workflow continues. Controller metrics derive per-device throughput and
-stage minima from that state, so later active stages and workload cleanup do not
-create a short-lived scrape dependency. The final evidence URI and digest remain
-unset until terminal evidence publication.
+parent Workflow continues. The controller derives completed-stage minima from
+that state. Script stages that declare TFLOP/s throughput also receive a
+credential-free live telemetry sidecar; the namespace-local Prometheus discovers
+only those annotated Pods and scrapes per-device samples every five seconds.
+The sidecar remains available for a final scrape, then exits with the attempt so
+its live series become stale. Streamed samples are operational telemetry only:
+qualification continues to use the immutable stage result and final
+digest-covered evidence. The final evidence URI and digest remain unset until
+terminal evidence publication.
 
 Inspect Runs and lifecycle conditions:
 
