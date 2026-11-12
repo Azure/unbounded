@@ -771,6 +771,13 @@ query API is available from the `project-signal-prometheus` Service on port
 Restarting its Pod discards the local time series; certification evidence
 remains durable in immutable evidence ConfigMaps independently of Prometheus.
 
+After each stage completes, the controller validates the immutable stage result
+and publishes its bounded typed measurement projection in Run status while the
+parent Workflow continues. Controller metrics derive per-device throughput and
+stage minima from that state, so later active stages and workload cleanup do not
+create a short-lived scrape dependency. The final evidence URI and digest remain
+unset until terminal evidence publication.
+
 Inspect Runs and lifecycle conditions:
 
 ```bash
