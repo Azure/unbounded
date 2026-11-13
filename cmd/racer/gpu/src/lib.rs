@@ -42,6 +42,8 @@
 //! Tests on a real GPU: `make racer-gpu-test` (`tests/hardware.rs`).
 mod ffi;
 pub mod gcm;
+#[cfg(test)]
+mod kernel_select_tests;
 
 #[cfg(any(test, feature = "simulation"))]
 pub mod simulation;
