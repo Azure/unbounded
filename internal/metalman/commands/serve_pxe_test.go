@@ -7,6 +7,7 @@ import (
 	"net"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestServePXEMediaTFTPServerFlag(t *testing.T) {
@@ -88,6 +89,32 @@ func TestServePXEExperimentalContainerIsolationFlag(t *testing.T) {
 				t.Errorf("experimental-container-isolation = %t, want %t", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestServePXEOperationCloudInitTimeoutFlag(t *testing.T) {
+	cmd := ServePXECmd()
+
+	flag := cmd.Flags().Lookup("operation-cloud-init-timeout")
+	if flag == nil {
+		t.Fatal("serve-pxe must register --operation-cloud-init-timeout")
+	}
+
+	if flag.DefValue != "20m0s" || flag.Value.Type() != "duration" {
+		t.Fatalf("expected duration flag with 20m0s default, got %s default %q", flag.Value.Type(), flag.DefValue)
+	}
+
+	if err := cmd.ParseFlags([]string{"--operation-cloud-init-timeout=30m"}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := cmd.Flags().GetDuration("operation-cloud-init-timeout")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got != 30*time.Minute {
+		t.Errorf("operation-cloud-init-timeout = %s, want 30m", got)
 	}
 }
 

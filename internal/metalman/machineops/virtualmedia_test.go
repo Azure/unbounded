@@ -1062,6 +1062,30 @@ func TestVirtualMediaCloudInitAllowsSlowFirmwarePOST(t *testing.T) {
 	change = r.advanceMediaInstalled(t.Context(), change.target, metav1.NewTime(reboot.Add(15*time.Minute)))
 	require.Equal(t, v1alpha3.OperationPhaseInProgress, change.target.Phase)
 	require.Equal(t, v1alpha3.OperationStageWaitingCloudInit, change.target.Stage)
+
+	change = r.advanceMediaInstalled(t.Context(), change.target, metav1.NewTime(reboot.Add(20*time.Minute)))
+	require.Equal(t, v1alpha3.OperationPhaseFailed, change.target.Phase)
+	require.Equal(t, "TimedOut: waiting for cloud-init timed out", change.target.Message)
+}
+
+func TestVirtualMediaConfiguredCloudInitTimeout(t *testing.T) {
+	r := &Reconciler{CloudInitTimeout: 45 * time.Minute}
+	reboot := fixedNow()
+	target := v1alpha3.MachineOperationTargetStatus{
+		Phase: v1alpha3.OperationPhaseInProgress,
+		BootMedia: &v1alpha3.MachineOperationBootMediaStatus{
+			Phase:             "Installed",
+			PhaseStartedAt:    ptrTo(reboot),
+			RebootRequestedAt: &reboot,
+		},
+	}
+
+	change := r.advanceMediaInstalled(t.Context(), target, metav1.NewTime(reboot.Add(30*time.Minute)))
+	require.Equal(t, v1alpha3.OperationPhaseInProgress, change.target.Phase)
+
+	change = r.advanceMediaInstalled(t.Context(), target, metav1.NewTime(reboot.Add(45*time.Minute)))
+	require.Equal(t, v1alpha3.OperationPhaseFailed, change.target.Phase)
+	require.Equal(t, "TimedOut: waiting for cloud-init timed out", change.target.Message)
 }
 
 func TestVirtualMediaCloudInitDeadlineStartsAtRebootHandoff(t *testing.T) {
@@ -1083,9 +1107,9 @@ func TestVirtualMediaCloudInitDeadlineStartsAtRebootHandoff(t *testing.T) {
 		Type: v1alpha3.MachineOperationConditionCloudInitDone, Status: metav1.ConditionFalse,
 		Reason: "Running", LastTransitionTime: metav1.NewTime(now.Add(time.Minute)),
 	}}
-	change = r.advanceMediaInstalled(t.Context(), change.target, metav1.NewTime(now.Add(cloudInitTimeout-time.Second)))
+	change = r.advanceMediaInstalled(t.Context(), change.target, metav1.NewTime(now.Add(r.cloudInitTimeout()-time.Second)))
 	require.Equal(t, v1alpha3.OperationPhaseInProgress, change.target.Phase)
-	change = r.advanceMediaInstalled(t.Context(), change.target, metav1.NewTime(now.Add(cloudInitTimeout)))
+	change = r.advanceMediaInstalled(t.Context(), change.target, metav1.NewTime(now.Add(r.cloudInitTimeout())))
 	require.Equal(t, v1alpha3.OperationPhaseFailed, change.target.Phase)
 	require.Equal(t, "TimedOut: waiting for cloud-init timed out", change.target.Message)
 	target.BootMedia.RebootRequestedAt = nil

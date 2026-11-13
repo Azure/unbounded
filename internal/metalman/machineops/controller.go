@@ -48,10 +48,6 @@ const (
 	reasonWaitingForOlderOperation = "WaitingForOlderOperation"
 	reasonTimedOut                 = "TimedOut"
 	reasonExperimentalModeDisabled = "ExperimentalModeDisabled"
-
-	// cloudInitTimeout covers firmware POST as well as cloud-init. Large GPU
-	// servers can spend several minutes in POST alone before the OS starts.
-	cloudInitTimeout = 20 * time.Minute
 )
 
 // PowerClient is the Redfish power operation subset used by MachineOperation reconciliation.
@@ -87,7 +83,10 @@ type Reconciler struct {
 	PowerActionTimeout    time.Duration
 	MediaInstallTimeout   time.Duration
 	MediaBootTimeout      time.Duration
-	Now                   func() metav1.Time
+	// CloudInitTimeout covers firmware POST as well as cloud-init. Large GPU
+	// servers can spend several minutes in POST alone before the OS starts.
+	CloudInitTimeout time.Duration
+	Now              func() metav1.Time
 
 	// ExperimentalContainerIsolation enables the experimental container
 	// isolation mode. When it is not set, a HostReplace of a Machine that
@@ -761,7 +760,7 @@ func (r *Reconciler) advanceReplace(ctx context.Context, op *v1alpha3.MachineOpe
 		return r.waitForRepaveBoot(ctx, machine, target, now)
 	}
 
-	if change, done := cloudInitReplaceStatus(op.Status.Conditions, target, now); done {
+	if change, done := r.cloudInitReplaceStatus(op.Status.Conditions, target, now); done {
 		return change
 	}
 
@@ -1019,7 +1018,7 @@ func repavePowerError(target v1alpha3.MachineOperationTargetStatus, err error) t
 	return targetChange{target: target, err: err}
 }
 
-func cloudInitReplaceStatus(conditions []metav1.Condition, target v1alpha3.MachineOperationTargetStatus, now metav1.Time) (targetChange, bool) {
+func (r *Reconciler) cloudInitReplaceStatus(conditions []metav1.Condition, target v1alpha3.MachineOperationTargetStatus, now metav1.Time) (targetChange, bool) {
 	cond := apimeta.FindStatusCondition(conditions, v1alpha3.MachineOperationConditionCloudInitDone)
 	if cond != nil {
 		switch cond.Status {
@@ -1030,8 +1029,9 @@ func cloudInitReplaceStatus(conditions []metav1.Condition, target v1alpha3.Machi
 				return failTarget(target, reasonExecutionFailed, cond.Message, now), true
 			}
 
-			if !cond.LastTransitionTime.IsZero() && now.Sub(cond.LastTransitionTime.Time) >= cloudInitTimeout {
-				return failTarget(target, reasonTimedOut, fmt.Sprintf("cloud-init did not complete within %s", cloudInitTimeout), now), true
+			timeout := r.cloudInitTimeout()
+			if !cond.LastTransitionTime.IsZero() && now.Sub(cond.LastTransitionTime.Time) >= timeout {
+				return failTarget(target, reasonTimedOut, fmt.Sprintf("cloud-init did not complete within %s", timeout), now), true
 			}
 		}
 	}
@@ -1512,4 +1512,12 @@ func (r *Reconciler) powerActionTimeout() time.Duration {
 	}
 
 	return r.PowerActionTimeout
+}
+
+func (r *Reconciler) cloudInitTimeout() time.Duration {
+	if r.CloudInitTimeout > 0 {
+		return r.CloudInitTimeout
+	}
+
+	return 20 * time.Minute
 }

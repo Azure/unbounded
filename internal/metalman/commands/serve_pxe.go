@@ -57,6 +57,7 @@ func ServePXECmd() *cobra.Command {
 		operationMaxConcurrentMachines int
 		operationMaxAttempts           int32
 		operationPollInterval          time.Duration
+		operationCloudInitTimeout      time.Duration
 		defaultNetbootImage            string
 		defaultNetbootPullSecret       string
 		experimentalContainerIsolation bool
@@ -267,6 +268,7 @@ func ServePXECmd() *cobra.Command {
 				MaxConcurrentMachines: operationMaxConcurrentMachines,
 				MaxAttempts:           operationMaxAttempts,
 				PollInterval:          operationPollInterval,
+				CloudInitTimeout:      operationCloudInitTimeout,
 
 				ExperimentalContainerIsolation: experimentalContainerIsolation,
 			}).SetupWithManager(mgr); err != nil {
@@ -401,6 +403,7 @@ func ServePXECmd() *cobra.Command {
 	cmd.Flags().IntVar(&operationMaxConcurrentMachines, "operation-max-concurrent-machines", 10, "Maximum target Machines advanced concurrently within one MachineOperation")
 	cmd.Flags().Int32Var(&operationMaxAttempts, "operation-max-attempts", 3, "Maximum Redfish action attempts per target Machine")
 	cmd.Flags().DurationVar(&operationPollInterval, "operation-poll-interval", 5*time.Second, "Poll interval for in-progress MachineOperations")
+	cmd.Flags().DurationVar(&operationCloudInitTimeout, "operation-cloud-init-timeout", 20*time.Minute, "Time allowed from reboot handoff for first-boot cloud-init to finish, including firmware POST")
 	cmd.Flags().StringVar(&defaultNetbootImage, "default-netboot-image", DefaultNetbootImage, "Default OCI image containing PXE netboot artifacts")
 	cmd.Flags().StringVar(&defaultNetbootPullSecret, "default-netboot-pull-secret", "", "Namespaced Secret reference (namespace/name) for pulling the default netboot OCI image")
 	cmd.Flags().BoolVar(&experimentalContainerIsolation, "experimental-container-isolation", false,
