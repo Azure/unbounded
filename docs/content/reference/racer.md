@@ -832,7 +832,8 @@ Racer-Destination-Length: <length>
   dataplane did not find, including an unknown `Racer-Gpu-Uuid`. It is 400 when the size does not match the memory or
   the window does not fit in it.
 - A success has `Racer-Delivery: gpu`. A page frame means the GPU copy of that
-  page is complete.
+  page is complete. Several pages of one read can be on the GPU at once, but
+  page frames are still sent in page order.
 - When the read ends for any reason, the dataplane waits for its GPU work,
   then releases the memory. See [GPU reads](#gpu-reads).
 
