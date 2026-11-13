@@ -5,8 +5,12 @@
  * The shim itself dlopens libcuda.so.1, libnvidia-ml.so.1 and libcufile.so.0
  * with the declarations in cuda_private.h, so it builds without the CUDA
  * toolkit. The decrypt kernels are PTX embedded at build time when
- * RACER_GPU_PTX names a PTX file (see build-native-cuda.sh); without it, every
- * other call works and racer_gpu_decrypt returns RACER_GPU_ENOKERNEL.
+ * RACER_GPU_PTX names a PTX file (see build-native-cuda.sh), plus SASS cubins
+ * when RACER_GPU_CUBIN_SM90 or RACER_GPU_CUBIN_SM100 name them. The shim loads
+ * the cubin matching the device's compute capability (kernel_select.h) and
+ * falls back to the PTX if there is none or it fails to load. Without any
+ * image, every other call works and racer_gpu_decrypt returns
+ * RACER_GPU_ENOKERNEL.
  *
  * Calls may come from several threads (one executor per GPU, plus cuFile
  * reader threads). Each call pushes the owning context and pops it before
@@ -17,6 +21,7 @@
 #include "gpu_cuda.h"
 #include "cuda_private.h"
 #include "gcm_core.h"
+#include "kernel_select.h"
 
 #include <dlfcn.h>
 #include <pthread.h>
@@ -26,19 +31,39 @@
 #include <strings.h>
 #include <unistd.h>
 
+/* Embed a kernel image under `sym`. PTX is NUL terminated as cuModuleLoadData
+ * requires; cubins are ELF and get the same trailing byte harmlessly. */
+#define RACER_EMBED(sym, path)                                   \
+    __asm__(".section .rodata." #sym ",\"a\"\n"                 \
+            ".balign 16\n"                                       \
+            ".globl " #sym "\n"                                  \
+            ".hidden " #sym "\n" #sym ":\n"                      \
+            ".incbin \"" path "\"\n"                             \
+            ".byte 0\n"                                          \
+            ".previous\n");                                      \
+    extern const char sym[];
+
 #ifdef RACER_GPU_PTX
-/* Embed the PTX image, NUL terminated as cuModuleLoadData requires. */
-__asm__(".section .rodata.racer_gpu_ptx,\"a\"\n"
-        ".globl racer_gpu_ptx_image\n"
-        ".hidden racer_gpu_ptx_image\n"
-        "racer_gpu_ptx_image:\n"
-        ".incbin \"" RACER_GPU_PTX "\"\n"
-        ".byte 0\n"
-        ".previous\n");
-extern const char racer_gpu_ptx_image[];
+RACER_EMBED(racer_gpu_ptx_image, RACER_GPU_PTX)
 #define PTX_IMAGE racer_gpu_ptx_image
 #else
 #define PTX_IMAGE NULL
+#endif
+#ifdef RACER_GPU_CUBIN_SM90
+RACER_EMBED(racer_gpu_cubin_sm90, RACER_GPU_CUBIN_SM90)
+#define SM90_IMAGE racer_gpu_cubin_sm90
+#define HAVE_SM90 1
+#else
+#define SM90_IMAGE NULL
+#define HAVE_SM90 0
+#endif
+#ifdef RACER_GPU_CUBIN_SM100
+RACER_EMBED(racer_gpu_cubin_sm100, RACER_GPU_CUBIN_SM100)
+#define SM100_IMAGE racer_gpu_cubin_sm100
+#define HAVE_SM100 1
+#else
+#define SM100_IMAGE NULL
+#define HAVE_SM100 0
 #endif
 
 /* Function pointer types and tables for each library. */
@@ -309,12 +334,29 @@ static int kernels(struct gpu_context *c) {
     return rc;
 }
 
+/* Load the best kernel image for the device into c->module: the matching
+ * cubin, else the PTX. A cubin that fails to load falls back to the PTX. */
+static int load_module(struct gpu_context *c) {
+    int major = -1, minor = -1;
+    if (cu.cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, c->dev) ||
+        cu.cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, c->dev))
+        major = minor = -1;
+    const char *cubin = NULL;
+    switch (racer_kernel_select(major, minor, HAVE_SM90, HAVE_SM100)) {
+    case RACER_KERNEL_IMAGE_SM90: cubin = SM90_IMAGE; break;
+    case RACER_KERNEL_IMAGE_SM100: cubin = SM100_IMAGE; break;
+    default: break;
+    }
+    if (cubin && cu.cuModuleLoadData(&c->module, cubin) == CUDA_SUCCESS) return 0;
+    const char *ptx = PTX_IMAGE;
+    if (!ptx) return -1;
+    return drv(cu.cuModuleLoadData(&c->module, ptx)) ? -1 : 0;
+}
+
 static int kernels_locked(struct gpu_context *c) {
     if (c->module_state == 0) {
-        const char *image = PTX_IMAGE;
         c->module_state = -1;
-        if (!image) return RACER_GPU_ENOKERNEL;
-        if (drv(cu.cuModuleLoadData(&c->module, image))) return RACER_GPU_ENOKERNEL;
+        if (load_module(c)) return RACER_GPU_ENOKERNEL;
         if (drv(cu.cuModuleGetFunction(&c->partials, c->module, "racer_gcm_partials")) ||
             drv(cu.cuModuleGetFunction(&c->finalize, c->module, "racer_gcm_finalize")) ||
             drv(cu.cuModuleGetFunction(&c->ctr, c->module, "racer_gcm_ctr"))) {
