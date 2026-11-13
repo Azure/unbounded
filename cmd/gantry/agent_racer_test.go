@@ -251,14 +251,7 @@ func TestRacerReadinessAndCancellation(t *testing.T) {
 	waitRacerStatus(t, "http://"+c.MetricsListen+"/readyz", http.StatusServiceUnavailable)
 	cancel()
 
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatal(err)
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("agent did not stop")
-	}
+	waitRacerAgentStop(t, done)
 
 	if !client.closed.Load() {
 		t.Fatal("client not closed")
@@ -268,6 +261,67 @@ func TestRacerReadinessAndCancellation(t *testing.T) {
 	case <-originStopped:
 	default:
 		t.Fatal("origin not stopped")
+	}
+}
+
+// A client that opens a TCP connection and never sends request headers keeps
+// net/http in Shutdown until its five second StateNew grace period expires.
+// That wait is legitimate and bounded, so stopping the agent must be judged
+// against racerShutdownBudget rather than a short fixed timeout.
+func TestRacerShutdownBoundedWithUnresponsiveClient(t *testing.T) {
+	c := racerTestConfig(t)
+	client := &startupRacerClient{}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	done := make(chan error, 1)
+
+	go func() {
+		done <- serveRacerAgent(ctx, c, slog.New(slog.NewTextHandler(io.Discard, nil)), racerTestCache(t), racerAgentDeps{
+			client: client,
+			serveOrigin: func(ctx context.Context, _ racersdk.OriginConfig, _ racersdk.Origin) error {
+				<-ctx.Done()
+
+				return ctx.Err()
+			},
+			probe: func(context.Context, string) error { return nil },
+		})
+	}()
+
+	waitRacerStatus(t, "http://"+c.MetricsListen+"/readyz", http.StatusOK)
+
+	conn, err := net.Dial("tcp", c.MirrorListen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	// Let the server accept the connection so Shutdown has to wait for it.
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+
+	waitRacerAgentStop(t, done)
+
+	if !client.closed.Load() {
+		t.Fatal("client not closed")
+	}
+}
+
+// waitRacerAgentStop fails unless serveRacerAgent returns within its own
+// shutdown budget plus a scheduling margin. The budget is eight seconds of
+// HTTP drain plus origin socket cleanup, and a connection stuck in net/http's
+// StateNew grace period can consume most of it on a loaded runner.
+func waitRacerAgentStop(t *testing.T, done <-chan error) {
+	t.Helper()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(racerShutdownBudget + time.Second):
+		t.Fatal("agent did not stop")
 	}
 }
 
