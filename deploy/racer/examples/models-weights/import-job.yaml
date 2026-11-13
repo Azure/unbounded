@@ -2,6 +2,9 @@
 # models container. Replace every <placeholder>; see README.md.
 # The whole models--<org>--<model> cache directory is mounted because the
 # snapshot entries are relative symlinks into ../../blobs.
+# racer-vllm import authenticates with DefaultAzureCredential, which uses the
+# workload identity from AZURE_CLIENT_ID, AZURE_TENANT_ID and
+# AZURE_FEDERATED_TOKEN_FILE below.
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -36,7 +39,6 @@ spec:
             - /model/snapshots/<revision>
             - --dest
             - https://<storage-account>.blob.core.windows.net/models/<model-prefix>
-            - --azcopy
           env:
             - name: AZURE_CLIENT_ID
               value: <writer-identity-client-id>

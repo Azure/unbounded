@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # vLLM's OpenAI server with racer-client and racer-vllm installed, so
-# `vllm serve <dir> --load-format racer` and `racer-vllm-fetch` work as is.
+# `vllm serve <dir> --load-format racer` and `racer-vllm` work as is.
+# `racer-vllm import` needs the azure extra, which this image leaves out; run
+# imports from the racer-vllm-plugin image.
 # Override VLLM_VERSION to build against another supported vLLM release, or
 # VLLM_IMAGE to use a different base entirely. Upstream publishes both
 # linux/amd64 and linux/arm64 for these tags.
@@ -31,6 +33,7 @@ RUN --mount=type=bind,from=builder,source=/wheels,target=/wheels \
     else \
         python3 -m pip install --no-cache-dir --no-index --find-links /wheels racer-client racer-vllm; \
     fi; \
-    python3 -c "import racer, racer_vllm"; \
+    python3 -c "import racer, racer_vllm, racer_vllm.cli"; \
+    command -v racer-vllm; \
     command -v racer-vllm-fetch
 COPY LICENSE NOTICE /unbounded/licenses/

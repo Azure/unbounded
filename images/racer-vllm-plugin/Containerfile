@@ -6,6 +6,12 @@
 # from an init container into a shared volume) and setting
 # PYTHONPATH=/opt/racer/python. Neither package has native dependencies, so the
 # tree is the same on linux/amd64 and linux/arm64.
+#
+# The azure extra (azure-storage-blob, azure-identity) for `racer-vllm import`
+# goes to /opt/racer/azure instead, which only this image's racer-vllm
+# wrappers put on the path. It pulls in cryptography, requests and other
+# common packages that would shadow a vLLM image's own versions if they sat
+# under /opt/racer/python.
 ARG PYTHON_IMAGE=docker.io/library/python:3.12-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b
 
 # Build stage
@@ -16,22 +22,33 @@ COPY clients/python/racer ./clients/python/racer
 COPY clients/python/racer-vllm ./clients/python/racer-vllm
 # Install both together so racer-vllm's racer-client dependency resolves to
 # the local tree, not an index. --no-compile keeps the output free of
-# timestamped bytecode.
+# timestamped bytecode. pip --target writes console scripts into bin with the
+# builder's interpreter in the shebang, so drop them and write wrappers below.
 RUN pip install --no-cache-dir --no-compile --target /opt/racer/python \
         ./clients/python/racer ./clients/python/racer-vllm \
-    && rm -rf /opt/racer/python/bin
+    && rm -rf /opt/racer/python/bin \
+    && pip install --no-cache-dir --no-compile --target /opt/racer/azure \
+        ./clients/python/racer "./clients/python/racer-vllm[azure]" \
+    && rm -rf /opt/racer/azure/bin /opt/racer/azure/racer /opt/racer/azure/racer_vllm \
+        /opt/racer/azure/racer_client-*.dist-info /opt/racer/azure/racer_vllm-*.dist-info
 
 # Runtime stage
 FROM ${PYTHON_IMAGE}
 ENV PYTHONPATH=/opt/racer/python PYTHONDONTWRITEBYTECODE=1
 COPY --from=builder /opt/racer/python /opt/racer/python
-# Console-script wrapper; pip --target places entry points in a bin directory
-# whose shebang points at the builder's interpreter, so write our own.
-RUN printf '#!/bin/sh\nexec python3 -c "import sys, racer_vllm; sys.exit(racer_vllm.main())" "$@"\n' \
-        > /usr/local/bin/racer-vllm-fetch \
-    && chmod 0755 /usr/local/bin/racer-vllm-fetch \
-    && python3 -c "import racer, racer_vllm" \
+COPY --from=builder /opt/racer/azure /opt/racer/azure
+# Console-script wrappers. They keep PYTHONPATH=/opt/racer/python first and
+# append /opt/racer/azure; the "-c" program sees "$@" as sys.argv[1:].
+RUN for cmd in racer-vllm:main racer-vllm-fetch:fetch_main; do \
+        printf '#!/bin/sh\nexport PYTHONPATH="${PYTHONPATH:-/opt/racer/python}:/opt/racer/azure"\nexec python3 -c "import sys, racer_vllm; sys.exit(racer_vllm.%s())" "$@"\n' \
+            "${cmd#*:}" > "/usr/local/bin/${cmd%%:*}"; \
+        chmod 0755 "/usr/local/bin/${cmd%%:*}"; \
+    done \
+    && python3 -c "import racer, racer_vllm, racer_vllm.cli" \
+    && PYTHONPATH=/opt/racer/python:/opt/racer/azure python3 -c "import azure.storage.blob, azure.identity" \
+    && racer-vllm --help >/dev/null \
+    && racer-vllm-fetch --help >/dev/null \
     && useradd --system --uid 65532 --no-create-home --shell /usr/sbin/nologin racer
 COPY LICENSE NOTICE /unbounded/licenses/
 USER 65532:65532
-ENTRYPOINT ["/usr/local/bin/racer-vllm-fetch"]
+ENTRYPOINT ["/usr/local/bin/racer-vllm"]
