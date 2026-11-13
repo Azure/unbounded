@@ -24,8 +24,7 @@ from modelfix import (
     set_parallel,
 )
 
-import racer_vllm
-from racer_vllm import cli, filters, loader, reader, sharded
+from racer_vllm import LOAD_FORMAT, cli, filters, loader, parse_uri, reader, register, sharded
 from racer_vllm import manifest as mf
 from racer_vllm.store import LocalStore
 
@@ -55,8 +54,10 @@ def test_register_is_idempotent_and_builds_a_subclass(monkeypatch, server):
     ld = make_loader(monkeypatch, server)
     assert isinstance(ld, DefaultModelLoader)
     assert type(ld).__name__ == "RacerModelLoader"
-    assert racer_vllm.RacerModelLoader is type(ld)
-    assert racer_vllm.LOAD_FORMAT == "racer"
+    from racer_vllm import RacerModelLoader
+
+    assert RacerModelLoader is type(ld)
+    assert LOAD_FORMAT == "racer"
 
 
 def test_loader_reads_a_materialized_model(monkeypatch, server, torch, tmp_path, caplog):
@@ -82,7 +83,7 @@ def test_loader_reads_a_materialized_model(monkeypatch, server, torch, tmp_path,
 
 def test_loader_follows_secondary_weights_and_prefixes(monkeypatch, server, torch, tmp_path):
     u, files, m, d = materialized(server, tmp_path)
-    draft = racer_vllm.parse_uri("racer://cache1/models/org/draft")
+    draft = parse_uri("racer://cache1/models/org/draft")
     publish(server, draft)
     ld = make_loader(monkeypatch, server)
     model = Model(secondary=[Source(str(draft), prefix="draft.")])
@@ -335,7 +336,7 @@ def test_prepare_weights_matches_the_vllm_release(monkeypatch, server, tmp_path,
 
 def test_fake_vllm_registry_is_isolated(monkeypatch):
     reg = install_fake_vllm(monkeypatch)
-    racer_vllm.register()
+    register()
     assert reg["calls"] == ["racer"]
 
 
