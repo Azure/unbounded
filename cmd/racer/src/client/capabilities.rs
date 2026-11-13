@@ -17,7 +17,7 @@ const SCHEMA: u32 = 1;
 
 /// Page cipher names this build decodes. Every page is sealed, so
 /// `xaes256gcm` is the only one.
-const PAGE_CIPHERS: [&'static str; 1] = ["xaes256gcm"];
+const PAGE_CIPHERS: [&str; 1] = ["xaes256gcm"];
 
 /// The capabilities response body.
 #[derive(serde::Serialize)]
@@ -79,6 +79,31 @@ pub(crate) fn procfs_gpu_uuids(root: &std::path::Path) -> Vec<String> {
             })
         })
         .collect()
+}
+
+/// The driver's GPU UUIDs, scanned once per process. The set does not
+/// change while the process runs, so a non-empty scan is cached; an empty
+/// one is not, so a driver that loads later is still seen.
+pub(crate) fn driver_gpu_uuids() -> Vec<String> {
+    static CACHE: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    cached_scan(&CACHE, || {
+        procfs_gpu_uuids(std::path::Path::new("/proc/driver/nvidia/gpus"))
+    })
+}
+
+/// Return the cached result, or run `scan` and cache it when non-empty.
+fn cached_scan(
+    cache: &std::sync::OnceLock<Vec<String>>,
+    scan: impl FnOnce() -> Vec<String>,
+) -> Vec<String> {
+    if let Some(uuids) = cache.get() {
+        return uuids.clone();
+    }
+    let uuids = scan();
+    if uuids.is_empty() {
+        return uuids;
+    }
+    cache.get_or_init(|| uuids).clone()
 }
 
 /// Answer one capabilities request and close the connection.
@@ -169,5 +194,27 @@ mod tests {
         assert_eq!(got, ["GPU-aaaa", "GPU-bbbb"]);
         assert!(procfs_gpu_uuids(&dir.join("missing")).is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn scan_cached_once_unless_empty() {
+        let cache = std::sync::OnceLock::new();
+        let mut scans = 0;
+        assert!(
+            cached_scan(&cache, || {
+                scans += 1;
+                Vec::new()
+            })
+            .is_empty()
+        );
+        assert!(cache.get().is_none());
+        for _ in 0..3 {
+            let got = cached_scan(&cache, || {
+                scans += 1;
+                vec!["GPU-a".to_string()]
+            });
+            assert_eq!(got, ["GPU-a"]);
+        }
+        assert_eq!(scans, 2);
     }
 }
