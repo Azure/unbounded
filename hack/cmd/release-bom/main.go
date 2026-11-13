@@ -47,6 +47,7 @@ var releaseImageNames = []string{
 	"racer",
 	"racer-object",
 	"racer-vllm",
+	"racer-vllm-plugin",
 	"token-refresher",
 	"unbounded-net-controller",
 	"unbounded-net-node",
