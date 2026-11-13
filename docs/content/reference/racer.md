@@ -726,7 +726,7 @@ Racer-Retain: local
 - With it, a peer-delivered page is eligible for local disk on first sight,
   under the spill-hold cap `RACER_RETAINED_SEGMENT_PERCENT`. Over the cap the
   page is delivered but not kept.
-- The Python client takes `retain=True`; a prefetch spec takes `retainLocal`.
+- The Python client takes `retain=True`; a prefetch spec takes `retain_local`.
 
 This matters most on sites without RDMA, where every replica start would
 otherwise fetch the same peer pages again. Dataplanes that predate the header

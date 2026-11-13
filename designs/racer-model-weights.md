@@ -62,7 +62,7 @@ the full checkpoint on a miss; `require` fails; `off` never looks.
 Second-sight keeps peer pages only after a second read. Replicas on one node
 read the same pages once each, close together, and without RDMA the pages
 arrive over HTTP and are not kept, so the next replica fetches them again.
-`Racer-Retain: local` (Python `retain=True`, prefetch `retainLocal`) makes a
+`Racer-Retain: local` (Python `retain=True`, prefetch `retain_local`) makes a
 peer page eligible on first sight, under `RACER_RETAINED_SEGMENT_PERCENT`.
 `racer-vllm warm` uses it to fill a node before replicas start.
 
