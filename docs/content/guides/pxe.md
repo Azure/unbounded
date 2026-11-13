@@ -278,6 +278,15 @@ The `key` field defaults to `user-data` but can be overridden to select a differ
 
 If the referenced ConfigMap does not exist, metalman falls back to the default minimal cloud-config. If the ConfigMap exists but the referenced key is not found, metalman returns an error and the machine will not receive user-data.
 
+Metalman allows 20 minutes from the installer reboot handoff for first-boot cloud-init to complete and the Node to register. The budget includes firmware POST, which can consume most of it on large GPU servers. Set `spec.host.netboot.cloudInitTimeout` to a positive duration to override the default for a Machine:
+
+```yaml
+spec:
+  host:
+    netboot:
+      cloudInitTimeout: 30m
+```
+
 ## Boot Flow
 
 1. **Repave requested.** A `HostReplace` `MachineOperation` targets the Machine. Metalman sets the boot override and force-restarts the server. For `bootProtocol: PXE`, it selects PXE boot. For `bootProtocol: HTTP`, it sets a Redfish UEFI HTTP boot URL from the netboot image metadata. For `bootProtocol: VirtualMedia`, it prepares an operation-owned bootstrap ISO and mounts it through Redfish.
