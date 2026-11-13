@@ -999,6 +999,20 @@ jobs:
       # Actions cache. An empty cache-to disables the export. The net
       # controller and node builds use separate scopes because each export
       # replaces the scope's cache index.
+      - name: Build Project Signal runner image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        timeout-minutes: 15
+        with:
+          context: .
+          file: images/project-signal-runner/Containerfile
+          platforms: ${{ matrix.platform }}
+          load: true
+          push: false
+          tags: project-signal-runner:ci
+          cache-from: type=gha,scope=project-signal-runner-${{ matrix.arch }}
+          cache-to: ${{ github.event_name == 'push' && format('type=gha,mode=max,scope=project-signal-runner-{0}', matrix.arch) || '' }}
+          provenance: false
+
       - name: Build controller image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
