@@ -103,7 +103,12 @@ func (d *mediaTestDriver) Reset(ctx context.Context, action redfish.ResetType) e
 }
 
 func (d *mediaTestDriver) Prepare(ctx context.Context, _ *v1alpha3.Machine, _ *v1alpha3.MachineOperation, id string) (bootmedia.Source, error) {
-	return bootmedia.Source{Name: "ub-" + id + ".iso", Server: "10.0.0.1"}, d.effect(ctx, "prepare")
+	u, _ := d.SourceURL(id)
+	return bootmedia.Source{Name: "ub-" + id + ".iso", Server: "10.0.0.1", URL: u}, d.effect(ctx, "prepare")
+}
+
+func (d *mediaTestDriver) SourceURL(id string) (string, error) {
+	return "http://10.0.0.1:8880/bootmedia/" + id + "/boot.iso", nil
 }
 
 func (d *mediaTestDriver) Release(ctx context.Context, id string) error {
@@ -311,6 +316,96 @@ func TestVirtualMediaNotReadyThenTimeoutCleanup(t *testing.T) {
 	current = mediaStep(t, r, op.Name)
 	require.True(t, current.Status.Targets[0].BootMedia.Cleaned)
 	require.NotContains(t, d.calls, "ForceOff")
+}
+
+func TestVirtualMediaStagingUnsupportedBeforePower(t *testing.T) {
+	r, d, _, op := mediaFixture(t)
+	mediaStep(t, r, op.Name)
+	mediaStep(t, r, op.Name)
+
+	d.err = redfish.ErrUnsupported
+	current := mediaStep(t, r, op.Name)
+	require.Equal(t, v1alpha3.OperationPhaseFailed, current.Status.Phase)
+	require.Contains(t, current.Status.Targets[0].Message, reasonUnsupportedTarget)
+	require.NotContains(t, d.calls, "ForceOff")
+	require.NotContains(t, d.calls, "mount")
+}
+
+type stagingMediaTestDriver struct {
+	*mediaTestDriver
+	readOnly bool
+}
+
+func (d stagingMediaTestDriver) ForMachine(context.Context, *v1alpha3.Machine) (PowerClient, error) {
+	return d, nil
+}
+
+func (d stagingMediaTestDriver) VirtualMediaStagingReadOnly() bool { return d.readOnly }
+
+func TestVirtualMediaPreMountCleanupRetainsStagedDeletion(t *testing.T) {
+	for _, kind := range []string{"legacy", "rack", "read-only"} {
+		for _, phase := range []string{"Staging", "PoweringOff"} {
+			t.Run(kind+"/"+phase, func(t *testing.T) {
+				r, d, _, op := mediaFixture(t)
+				mediaStep(t, r, op.Name)
+
+				current := mediaStep(t, r, op.Name)
+				if phase == "PoweringOff" {
+					current = mediaStep(t, r, op.Name)
+				}
+
+				require.Equal(t, phase, current.Status.Targets[0].BootMedia.Phase)
+
+				if kind != "legacy" {
+					r.PowerClients = stagingMediaTestDriver{mediaTestDriver: d, readOnly: kind == "read-only"}
+				}
+
+				d.calls = nil
+				current.Status.Phase = v1alpha3.OperationPhaseFailed
+				require.NoError(t, r.Status().Update(t.Context(), current))
+
+				request := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(op)}
+				d.err = errors.New("cleanup failed")
+
+				_, err := r.Reconcile(t.Context(), request)
+				if kind != "read-only" {
+					require.ErrorContains(t, err, "cleanup failed")
+					require.NoError(t, r.Get(t.Context(), request.NamespacedName, current))
+					require.False(t, current.Status.Targets[0].BootMedia.Cleaned)
+					require.Contains(t, current.Finalizers, mediaFinalizer)
+					require.Equal(t, []string{"cleanup"}, d.calls)
+					d.err = nil
+					current = mediaStep(t, r, op.Name)
+				} else {
+					require.NoError(t, err)
+					require.Empty(t, d.calls)
+					require.NoError(t, r.Get(t.Context(), request.NamespacedName, current))
+				}
+
+				require.True(t, current.Status.Targets[0].BootMedia.Cleaned)
+				require.False(t, current.Status.Targets[0].BootMedia.StagedDeleted)
+
+				d.calls = nil
+				d.err = errors.New("delete failed")
+				_, err = r.Reconcile(t.Context(), request)
+				require.ErrorContains(t, err, "delete failed")
+				require.NoError(t, r.Get(t.Context(), request.NamespacedName, current))
+				require.Contains(t, current.Finalizers, mediaFinalizer)
+				require.False(t, current.Status.Targets[0].BootMedia.StagedDeleted)
+				require.False(t, current.Status.Targets[0].BootMedia.Released)
+				require.Equal(t, []string{"delete"}, d.calls)
+				d.err = nil
+
+				for range 3 {
+					current = mediaStep(t, r, op.Name)
+				}
+
+				require.Empty(t, current.Finalizers)
+				require.True(t, current.Status.Targets[0].BootMedia.Released)
+				require.Equal(t, []string{"delete", "delete", "release"}, d.calls)
+			})
+		}
+	}
 }
 
 func TestVirtualMediaDeletionUsesSnapshot(t *testing.T) {

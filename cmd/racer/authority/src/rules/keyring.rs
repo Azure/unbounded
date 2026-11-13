@@ -123,11 +123,91 @@ impl Serialize for Keys {
 
 impl<'de> Deserialize<'de> for Keys {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let encoded = zeroize::Zeroizing::new(String::deserialize(deserializer)?);
-        // Generations are checked by `Durable::validate`.
-        wire::decode_cache_keys_base64(&encoded, u64::MAX)
-            .map(Keys)
-            .map_err(|_| serde::de::Error::custom("invalid cache keys"))
+        // v0.23 stored a list. Read it during upgrades, but only write the compact table.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct LegacyKey {
+            cache: String,
+            id: String,
+            purpose: String,
+            state: String,
+            #[serde(deserialize_with = "material")]
+            material: zeroize::Zeroizing<[u8; 32]>,
+        }
+
+        fn material<'de, D: serde::Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<zeroize::Zeroizing<[u8; 32]>, D::Error> {
+            let encoded = zeroize::Zeroizing::new(String::deserialize(deserializer)?);
+            let mut material = zeroize::Zeroizing::new([0; 32]);
+            let len = STANDARD
+                .decode_slice(encoded.as_bytes(), material.as_mut_slice())
+                .map_err(|_| serde::de::Error::custom("invalid cache key material"))?;
+            if len != material.len() {
+                return Err(serde::de::Error::custom("invalid cache key material"));
+            }
+            Ok(material)
+        }
+
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = Keys;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a compact key table or a legacy key list")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, encoded: &str) -> Result<Keys, E> {
+                // Generations are checked by `Durable::validate`.
+                wire::decode_cache_keys_base64(encoded, u64::MAX)
+                    .map(Keys)
+                    .map_err(|_| E::custom("invalid cache keys"))
+            }
+
+            fn visit_string<E: serde::de::Error>(self, encoded: String) -> Result<Keys, E> {
+                self.visit_str(&zeroize::Zeroizing::new(encoded))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Keys, A::Error> {
+                use serde::de::Error;
+
+                let mut keys = Vec::new();
+                while let Some(k) = seq.next_element::<LegacyKey>()? {
+                    let invalid = || A::Error::custom("invalid legacy cache key");
+                    if k.id.len() != 32 || !k.id.is_ascii() {
+                        return Err(invalid());
+                    }
+                    let mut id = [0; 16];
+                    for (i, byte) in id.iter_mut().enumerate() {
+                        *byte = u8::from_str_radix(&k.id[2 * i..2 * i + 2], 16)
+                            .map_err(|_| invalid())?;
+                    }
+                    let purpose = match k.purpose.as_str() {
+                        "page" => CacheKeyPurpose::Page,
+                        "origin_credentials" => CacheKeyPurpose::OriginCredentials,
+                        _ => return Err(invalid()),
+                    };
+                    let state = match k.state.as_str() {
+                        "prepared" => CacheKeyState::Prepared,
+                        "active" => CacheKeyState::Active,
+                        _ => return Err(invalid()),
+                    };
+                    keys.push(CacheEncryptionKey::new(
+                        CacheKeyRef {
+                            cache: CacheId(k.cache),
+                            id: KeyId(id),
+                            purpose,
+                        },
+                        state,
+                        k.material,
+                    ));
+                }
+                sort_keys(&mut keys);
+                Ok(Keys(keys))
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
     }
 }
 
