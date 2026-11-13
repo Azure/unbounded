@@ -1965,8 +1965,10 @@ Where the bytes come from decides who decrypts them:
 - With RDMA on, a page from a peer can be written by the peer's NIC straight
   into GPU memory on this node (GPUDirect RDMA). See below.
 
-If the GPU finds a damaged page, the read fails and the dataplane drops that
-copy from memory or disk, as it does when the CPU finds one.
+When the GPU's verdict on a damaged page reaches the dataplane, the read
+fails and the dataplane drops that copy from memory or disk, as it does when
+the CPU finds one. If the read fails for another reason while a page is still
+being checked, that page may keep its copy until a later read rejects it.
 
 When a shared GPU fetch finishes without putting the page in GPU memory, the
 requests waiting on it read the page through host memory rather than each
