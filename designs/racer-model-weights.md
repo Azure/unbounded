@@ -23,7 +23,8 @@ The loader reads the manifest instead of listing or probing the origin for
 part files. It knows every tensor's location before the first read, which lets
 the planner build reads without fetching headers, and lets `verify` check
 sizes or hashes. `materialize` copies the manifest with the small files and
-pins each file's ETag.
+pins each file's ETag in `racer-source.json`, which also records the model's
+`racer://` URI; the loader reads every file at its pinned ETag.
 
 ## Planner and zero-copy staging
 
@@ -47,7 +48,10 @@ checkpoint.
 loading and before `process_weights_after_loading`. Capturing at that point
 keeps the artifacts independent of kernel-specific repacking, which vLLM
 redoes on every load. Artifacts live under `sharded/<fingerprint>/` next to
-the model.
+the model. `prepare` uploads them itself: each rank's data first, its
+`racer-sharded.json` last, and after every rank, `racer-sharded-index.json`
+at the model prefix, which lists the artifacts so `inspect` can find them
+without listing the origin. A capture that misses a rank is not uploaded.
 
 The fingerprint hashes the inputs that decide each rank's tensors: the
 manifest, the vLLM version, the parallel layout (tensor, pipeline, and expert
@@ -69,6 +73,4 @@ the full checkpoint on a miss; `require` fails; `off` never looks.
 
 ## Open questions
 
-- Whether `prepare` should upload artifacts itself or leave that to the
-  operator.
 - Garbage collection of stale `sharded/<fingerprint>/` directories.
