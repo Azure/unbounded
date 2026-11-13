@@ -1512,6 +1512,12 @@ func TestStagePodStreamsDeclaredMetricsWithoutWorkloadCredentials(t *testing.T) 
 		!strings.Contains(pod.Spec.Containers[0].Args[0], "PROJECT_SIGNAL_LIVE_METRICS_DONE") {
 		t.Fatalf("live telemetry environment = %#v", env)
 	}
+	if !strings.Contains(
+		pod.Spec.Containers[0].Args[0],
+		"if response.status == 202:",
+	) {
+		t.Fatalf("live telemetry wrapper does not wait for final evidence")
+	}
 
 	sidecarEnv := map[string]corev1.EnvVar{}
 	for _, variable := range pod.Spec.Containers[1].Env {

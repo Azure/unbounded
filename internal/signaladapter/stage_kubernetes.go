@@ -2491,12 +2491,12 @@ for _ in range(30):
     try:
         port = os.environ["PROJECT_SIGNAL_LIVE_METRICS_PORT"]
         with urllib.request.urlopen("http://127.0.0.1:" + port + "/final", timeout=2) as response:
+            if response.status == 202:
+                time.sleep(1)
+                continue
             final = json.load(response)
             break
     except urllib.error.HTTPError as error:
-        if error.code == 202:
-            time.sleep(1)
-            continue
         raise SystemExit("metric contract violation") from error
     except OSError:
         time.sleep(1)
