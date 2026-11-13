@@ -5,7 +5,7 @@
  * on devices with compute capability X.Z for Z >= Y (same major), so sm_90
  * covers 9.x and sm_100 covers 10.x. Anything else (8.x, 12.x, unknown)
  * takes the PTX, which the driver JIT-compiles. Shared by gpu_cuda.c and
- * the host tests (gcm_host.c) so the rule is tested without a GPU. */
+ * the host tests (kernel_select_host.c) so the rule is tested without a GPU. */
 #ifndef RACER_KERNEL_SELECT_H
 #define RACER_KERNEL_SELECT_H
 
