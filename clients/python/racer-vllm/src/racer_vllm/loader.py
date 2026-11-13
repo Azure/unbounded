@@ -73,6 +73,11 @@ class RacerLoaderMixin:
 
     def _racer_init(self, load_config) -> None:
         self.racer = settings.parse(getattr(load_config, "model_loader_extra_config", None) or {})
+        if self.racer.verify == "full" and self.racer.delivery == "gpu":
+            raise ValueError(
+                "racer loader: verify=full hashes data in host memory, so it cannot use delivery=gpu; "
+                "set delivery to host or auto, or verify to size"
+            )
         self._racer_model = None
         self._racer_stats = reader.new_stats()
         self._racer_clients: dict = {}
@@ -82,7 +87,7 @@ class RacerLoaderMixin:
         self._racer_manifests: dict = {}
         self._racer_sources: dict = {}
         self._racer_primary = None
-        self._racer_full_note = False
+        self._racer_gap_note = False
 
     # Locations ---------------------------------------------------------------
 
@@ -143,7 +148,9 @@ class RacerLoaderMixin:
             allocs[mode] = allocs[key]
             return allocs[mode]
 
-        modes = reader.probe(client, self.racer.delivery, make)
+        # verify=full hashes every byte on the host, so it never takes the GPU path.
+        delivery = "host" if self.racer.verify == "full" else self.racer.delivery
+        modes = reader.probe(client, delivery, make)
         pool = reader.StagingPool(
             self.racer.staging_bytes,
             self.racer.max_staging_bytes,
@@ -159,11 +166,12 @@ class RacerLoaderMixin:
     def _etag(self, client, uri: ModelURI, entry: dict, pin=None):
         """ETag for if_match.
 
-        pin is the ETag materialize recorded. verify=full and verify=none use
-        it as is (full checks sha256 instead of the size); verify=size stats
-        the file, at the pinned version when there is one, and checks its size.
+        pin is the ETag materialize recorded. With a pin, verify=full and
+        verify=none use it as is (full checks sha256 as well). Otherwise the
+        file is stat'ed, at the pinned version when there is one, and verify=size
+        and verify=full check its size.
         """
-        if self.racer.verify == "full" or (self.racer.verify == "none" and pin):
+        if pin and self.racer.verify in ("full", "none"):
             return pin
         key = (uri.cache, uri.bucket, uri.key(entry["name"]))
         meta = self._racer_stat_cache.get(key)
@@ -178,7 +186,7 @@ class RacerLoaderMixin:
                     "run 'racer-vllm materialize' again"
                 ) from None
             self._racer_stat_cache[key] = meta
-        if self.racer.verify == "size" and meta.size != entry["size"]:
+        if self.racer.verify in ("size", "full") and meta.size != entry["size"]:
             raise mf.ManifestError(
                 f"racer: {uri.key(entry['name'])} is {meta.size} bytes in Racer but {entry['size']} in the "
                 "manifest; the model changed since materialize, so run 'racer-vllm materialize' again"
@@ -238,7 +246,7 @@ class RacerLoaderMixin:
         )
         prefix = getattr(source, "prefix", "") or ""
         files = {f.name: f for f in mf.safetensors_files(m)}
-        jobs, hashers = [], {}
+        jobs, hashers, gaps = [], {}, []
         for name in self._encoder_only_filter(path, m, self._weight_names(path, m)):
             sf = files[name]
             entry = mf.file_entry(m, name)
@@ -246,9 +254,19 @@ class RacerLoaderMixin:
             req = uri.request(name)
             reads = plan(name, sf.tensors, keep, self.racer.staging_bytes, file_size=sf.size)
             if self.racer.verify == "full":
-                hashers[name] = self._full_hasher(client, req, sf, reads)
+                hashers[name] = self._full_hasher(client, req, sf, reads, etag)
+                if hashers[name].gaps:
+                    gaps.append(name)
             jobs += [(req, r, etag) for r in reads]
             self._racer_stats["files"] += 1
+
+        if gaps and not self._racer_gap_note:
+            self._racer_gap_note = True
+            log.warning(
+                "racer: verify=full reads skipped byte ranges of %s only to hash them; "
+                "these files cost more than the weights this rank loads",
+                ", ".join(gaps),
+            )
 
         def on_data(read, mv):
             h = hashers.get(read.file)
@@ -257,9 +275,8 @@ class RacerLoaderMixin:
 
         for name, tensor in rd.iter(jobs, on_data if hashers else None):
             yield prefix + name, tensor
-        if hashers and rd.pool.allocator.kind != reader.HOST and not self._racer_full_note:
-            self._racer_full_note = True
-            log.info("racer: verify=full hashes data only for host delivery; GPU reads were not hashed")
+        for h in hashers.values():
+            h.finish()
 
     def _encoder_only_filter(self, path: str, m: dict, names: list) -> list:
         """vLLM's --mm-encoder-only shard filter, applied to the manifest's file list."""
@@ -275,33 +292,46 @@ class RacerLoaderMixin:
             raise RuntimeError(f"racer loader: the mm-encoder-only filter removed every weight file of {path}")
         return list(kept)
 
-    def _full_hasher(self, client, req, sf, reads):
-        """sha256 over the whole file when the reads cover it contiguously, else None."""
+    def _full_hasher(self, client, req, sf, reads, etag=None):
+        """An on_data callback hashing the whole file; finish() checks the sha256.
+
+        Bytes the reads skip (filtered tensors, the header, a tail) are read
+        from Racer when the hasher reaches them, so the hash always covers the
+        file. The callback's gaps attribute is True when that happens.
+        """
         import hashlib
 
-        data_start = 8 + sf.header_bytes
-        pos = data_start
-        for r in reads:
-            if r.offset > pos:
-                return None
-            pos = max(pos, r.end)
-        if pos < sf.size:
-            return None
-        h = hashlib.sha256(client.read(req, 0, data_start))
-        state = {"pos": data_start}
+        h = hashlib.sha256()
+        state = {"pos": 0, "done": False}
+
+        def fill(upto):
+            if upto > state["pos"]:
+                h.update(client.read(req, state["pos"], upto - state["pos"], if_match=etag))
+                state["pos"] = upto
 
         def update(read, mv):
+            fill(read.offset)
             skip = state["pos"] - read.offset
-            if skip < 0:
-                return
             if skip < read.length:
-                h.update(mv[skip:])
+                h.update(mv[skip : read.length])
                 state["pos"] = read.end
-            if state["pos"] == sf.size:
-                got = h.hexdigest()
-                if got != sf.sha256:
-                    raise mf.ManifestError(f"{sf.name}: sha256 mismatch: manifest has {sf.sha256}, data has {got}")
 
+        def finish():
+            if state["done"]:
+                return
+            state["done"] = True
+            fill(sf.size)
+            got = h.hexdigest()
+            if state["pos"] != sf.size or got != sf.sha256:
+                raise mf.ManifestError(f"{sf.name}: sha256 mismatch: manifest has {sf.sha256}, data has {got}")
+
+        data_start = 8 + sf.header_bytes
+        pos, gaps = data_start, False
+        for r in reads:
+            gaps = gaps or r.offset > pos
+            pos = max(pos, r.end)
+        update.gaps = gaps or pos < sf.size
+        update.finish = finish
         return update
 
     def _vllm_version(self) -> str:
