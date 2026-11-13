@@ -2451,6 +2451,13 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 			return ctrl.Result{}, nil
 		}
 
+		if run.Status.Evidence.URI == "" {
+			result, recovered, err := r.resumeGroupedEvidence(ctx, &run)
+			if err != nil || recovered {
+				return result, err
+			}
+		}
+
 		return r.cleanup(ctx, &run)
 	}
 

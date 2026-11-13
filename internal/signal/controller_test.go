@@ -21,6 +21,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -997,6 +998,68 @@ func TestResolvedRunCleanupReleasesAndDeletesWithoutScriptBundle(t *testing.T) {
 		&current,
 	); !apierrors.IsNotFound(err) {
 		t.Fatalf("deleted Run lookup error = %v, want NotFound", err)
+	}
+}
+
+func TestTerminalRunRecoversDurableEvidenceBeforeCleanup(t *testing.T) {
+	t.Parallel()
+
+	scheme := resolvedCleanupScheme(t)
+	finishedAt := time.Date(2026, 11, 13, 0, 9, 53, 0, time.UTC)
+	run := &signalv1.CertificationRun{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "terminal-run",
+			Namespace:  "signal-system",
+			UID:        "terminal-run-uid",
+			Finalizers: []string{RunFinalizer},
+		},
+		Status: signalv1.CertificationRunStatus{
+			Phase: signalv1.RunPhaseCancelled,
+		},
+	}
+	evidence := []byte(fmt.Sprintf(
+		`{"runID":%q,"runName":%q,"phase":"Canceled","verdict":"Inconclusive","reason":"Canceled","finishedAt":%q,"checkStatus":[]}`,
+		run.UID,
+		run.Name,
+		finishedAt.Format(time.RFC3339Nano),
+	))
+	store := staticEvidenceStore{
+		data:   evidence,
+		uri:    "kubernetes://signal-system/terminal-run-evidence/evidence.json.gz",
+		digest: "sha256:" + strings.Repeat("a", 64),
+	}
+	kube := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&signalv1.CertificationRun{}).
+		WithObjects(run).
+		Build()
+	reconciler := &RunReconciler{Client: kube, APIReader: kube, Evidence: store}
+
+	if _, err := reconciler.Reconcile(
+		context.Background(),
+		ctrl.Request{NamespacedName: client.ObjectKey{
+			Namespace: run.Namespace,
+			Name:      run.Name,
+		}},
+	); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+
+	var current signalv1.CertificationRun
+	if err := kube.Get(
+		context.Background(),
+		client.ObjectKey{Namespace: run.Namespace, Name: run.Name},
+		&current,
+	); err != nil {
+		t.Fatalf("get recovered Run: %v", err)
+	}
+
+	if current.Status.Evidence.URI != store.uri ||
+		current.Status.Evidence.Digest != store.digest {
+		t.Fatalf("recovered evidence = %#v", current.Status.Evidence)
+	}
+	if !slices.Contains(current.Finalizers, RunFinalizer) {
+		t.Fatalf("Run finalizers = %#v, want cleanup deferred", current.Finalizers)
 	}
 }
 
