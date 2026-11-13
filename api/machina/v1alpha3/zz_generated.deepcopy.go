@@ -2139,6 +2139,11 @@ func (in *PXESpec) DeepCopyInto(out *PXESpec) {
 		*out = new(CloudInitSpec)
 		(*in).DeepCopyInto(*out)
 	}
+	if in.CloudInitTimeout != nil {
+		in, out := &in.CloudInitTimeout, &out.CloudInitTimeout
+		*out = new(v1.Duration)
+		**out = **in
+	}
 	if in.Network != nil {
 		in, out := &in.Network, &out.Network
 		*out = new(HostNetworkSpec)
