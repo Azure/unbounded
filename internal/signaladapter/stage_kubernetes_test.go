@@ -1512,6 +1512,7 @@ func TestStagePodStreamsDeclaredMetricsWithoutWorkloadCredentials(t *testing.T) 
 		!strings.Contains(pod.Spec.Containers[0].Args[0], "PROJECT_SIGNAL_LIVE_METRICS_DONE") {
 		t.Fatalf("live telemetry environment = %#v", env)
 	}
+
 	if !strings.Contains(
 		pod.Spec.Containers[0].Args[0],
 		"if response.status == 202:",

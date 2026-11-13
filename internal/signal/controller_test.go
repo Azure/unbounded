@@ -1058,6 +1058,7 @@ func TestTerminalRunRecoversDurableEvidenceBeforeCleanup(t *testing.T) {
 		current.Status.Evidence.Digest != store.digest {
 		t.Fatalf("recovered evidence = %#v", current.Status.Evidence)
 	}
+
 	if !slices.Contains(current.Finalizers, RunFinalizer) {
 		t.Fatalf("Run finalizers = %#v, want cleanup deferred", current.Finalizers)
 	}
@@ -1145,6 +1146,7 @@ func TestTerminalRunWithExistingIdentityCleansUpFromImmutableEvidence(t *testing
 	if slices.Contains(current.Finalizers, RunFinalizer) {
 		t.Fatalf("Run finalizers = %#v", current.Finalizers)
 	}
+
 	if current.Status.Evidence.URI != "" ||
 		current.Status.Evidence.Digest != "" ||
 		current.Status.Evidence.Identity == nil {

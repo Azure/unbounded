@@ -796,6 +796,7 @@ func TestBoundedInvocationReferencesPreserveFailureMessage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("boundedInvocationReferences() error = %v", err)
 	}
+
 	if len(references) != 1 || references[0].Message != envelope.Message {
 		t.Fatalf("invocation references = %#v", references)
 	}

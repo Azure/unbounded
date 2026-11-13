@@ -2413,6 +2413,7 @@ func applyStageSecurity(container *corev1.Container, security signalv1.ResolvedS
 	runAsUser := workloadIdentityID
 	runAsGroup := workloadIdentityID
 	runAsNonRoot := true
+
 	if security.AllowRoot {
 		runAsUser = 0
 		runAsGroup = 0
