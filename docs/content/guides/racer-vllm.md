@@ -20,9 +20,9 @@ among themselves instead of each downloading the full model.
 
 {{< callout type="note" >}}
 This guide describes the `racer-vllm` package layout (`racer-vllm materialize`,
-`import`, `prepare`, `warm`, `inspect`) and local retention. These land
-together; check that your release includes them. On older releases only
-`racer-vllm-fetch` and the `racer-model.json` flow exist.
+`import`, `prepare`, `warm`, `inspect`). These land together; check that your
+release includes them. On older releases only `racer-vllm-fetch` and the
+`racer-model.json` flow exist.
 {{< /callout >}}
 
 ## Prerequisites
@@ -177,9 +177,9 @@ checkpoint; with `sharded: require` it fails.
 
 ## 4. Optional: Warm the Cache
 
-`racer-vllm warm` asks the local dataplane to prefetch every weight file and
-keep the pages on this node (local retention). Run it on a node before
-replicas start there, for example from a Job pinned to the node:
+`racer-vllm warm` asks the dataplane to prefetch every weight file into the
+cache, so the first replica does not pay for origin reads. Run it before a
+rollout, for example from a Job:
 
 ```bash
 racer-vllm warm racer://models-hillsboro/models/qwen/Qwen3-8B
@@ -249,11 +249,9 @@ loader falls back to host delivery and logs the reason once. Set
 the way in. On large checkpoints that work is real, and it is the price of
 leaving encryption on everywhere.
 
-**No RDMA.** Without RDMA, pages from peers arrive over HTTP and are not
-kept on the reading node, so every replica start on a node fetches them
-again. Use `racer-vllm warm`, which prefetches with local retention, or let
-the loader read with retention. Retained pages are admitted and evicted like
-any other page a node does not own.
+**No RDMA.** Without RDMA, pages from peers arrive over HTTP, which is slower
+than the local disk. Run `racer-vllm warm` before a rollout so the cache is
+already full and replicas read from peers instead of the origin.
 
 **Capacity.** A model larger than a node's cache share is evicted while it
 loads. Raise the cache's `spec.priority`, add capacity, or use raw NVMe

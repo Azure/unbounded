@@ -688,28 +688,6 @@ Older dataplanes send pages out of order unless the client sends
 before SDKs. Older peers accept only one page request at a time from a node.
 The dataplane detects this and falls back to one request at a time for that peer.
 
-### Local retention
-
-A read or prefetch can ask the dataplane to keep the pages it receives from
-peers on this node:
-
-```
-GET /v1/objects/<key> HTTP/1.1
-Racer-Retain: local
-```
-
-- `local` is the only value. Without the header, pages from peers follow
-  [second-sight](#second-sight-disk-retention) and pages that arrive over HTTP
-  are not kept.
-- With it, a peer-delivered page is eligible for local disk on first sight,
-  under the spill-hold cap `RACER_RETAINED_SEGMENT_PERCENT`. Over the cap the
-  page is delivered but not kept.
-- The Python client takes `retain=True`; a prefetch spec takes `retain_local`.
-
-This matters most on sites without RDMA, where every replica start would
-otherwise fetch the same peer pages again. Dataplanes that predate the header
-ignore it.
-
 ### Host reads
 
 A client on the node can ask the dataplane to write an object straight into a
@@ -1903,7 +1881,7 @@ starts the GPU helper and never waits for a start in flight.
 ```json
 {"schema":1,"delivery":["gpu","host","stream"],
  "gpu_uuids":["gpu-0123..."],"page_bytes":16777216,
- "retain_local":true,"page_ciphers":["xaes256gcm"]}
+ "page_ciphers":["xaes256gcm"]}
 ```
 
 - `delivery` lists the read modes this build and node can serve. `stream` is

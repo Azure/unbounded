@@ -4,8 +4,8 @@ Plain YAML examples for serving vLLM models whose weights come from a Racer
 cache. They are templates: replace every `<placeholder>` before applying. The
 full walkthrough is the [vLLM guide](../../../../docs/content/guides/racer-vllm.md).
 
-These examples depend on local retention and the `racer-vllm` commands
-described in the guide. Check that your release includes them.
+These examples depend on the `racer-vllm` commands described in the guide.
+Check that your release includes them.
 
 | File | What it holds |
 |------|---------------|
@@ -53,9 +53,8 @@ serve manifests to the new cache name.
 
 ## Rollout order
 
-1. Upgrade the Racer dataplanes on every node to a release with local
-   retention and the current prefetch fields. Older dataplanes reject
-   `retain_local`.
+1. Upgrade the Racer dataplanes on every node to a release with the
+   `racer-vllm` manifest and sharded-artifact support.
 2. Apply `clustercaches.yaml`.
 3. Run the import job and wait for it to finish:
    `kubectl apply -f import-job.yaml`.
