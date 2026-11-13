@@ -2551,6 +2551,9 @@ spec:
                                     maxLength: 128
                                     minLength: 1
                                     type: string
+                                  message:
+                                    maxLength: 1024
+                                    type: string
                                   outcome:
                                     enum:
                                     - Passed
