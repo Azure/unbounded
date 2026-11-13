@@ -24,7 +24,15 @@ from typing import Callable, Optional
 
 from . import _wire as wire
 from . import prefetch as _prefetch
-from .errors import PrefetchError, ProtocolError, RacerError, StatusError, TruncatedError, UnsatisfiableRange
+from .errors import (
+    PrefetchError,
+    ProtocolError,
+    RacerError,
+    StatusError,
+    TruncatedError,
+    UnsatisfiableRange,
+    status_error,
+)
 from .prefetch import PrefetchSpec, PrefetchStatus
 from .keys import Request
 
@@ -226,6 +234,9 @@ def _response_metadata(h: wire.ResponseHead) -> Metadata | None:
     return Metadata(etag=etag, size=0, expires_at_ms=expiry, content_type=ct)
 
 
+CAPABILITIES_PATH = "/v1/capabilities"
+
+
 class Client:
     """Reads Racer objects through the client socket.
 
@@ -393,6 +404,35 @@ class Client:
             raise ProtocolError("bad HEAD metadata")
         return Metadata(etag=m.etag, size=size, expires_at_ms=m.expires_at_ms, content_type=m.content_type)
 
+    # Capabilities ----------------------------------------------------------
+
+    def capabilities(self) -> dict:
+        """GET /v1/capabilities: what this dataplane can serve.
+
+        Returns the decoded JSON object, for example
+        {"schema": 1, "delivery": ["gpu", "host", "stream"], "gpu_uuids": [...],
+        "page_bytes": 16777216, "page_ciphers": ["xaes256gcm"]}. Unknown fields
+        are kept. The call uses the client timeout. A non-200 answer raises the
+        StatusError for its status (NotFound from a dataplane without the
+        endpoint); a malformed answer raises ProtocolError.
+        """
+        conn = self._connect()
+        try:
+            conn.send_head(self._head_bytes(f"GET {CAPABILITIES_PATH} HTTP/1.1\r\nHost: racer\r\n\r\n"))
+            h = wire.parse_response_head(conn.read_head())
+            if h.status != 200:
+                raise status_error(h.status)
+            payload = self._read_body(conn, h)
+        finally:
+            conn.close()
+        try:
+            data = json.loads(payload)
+        except ValueError as exc:
+            raise ProtocolError("bad capabilities JSON") from exc
+        if not isinstance(data, dict) or not isinstance(data.get("delivery", []), list):
+            raise ProtocolError("bad capabilities")
+        return data
+
     # Prefetch --------------------------------------------------------------
 
     def prefetch(self, prefetch_id: str, spec: PrefetchSpec) -> PrefetchStatus:
@@ -490,7 +530,7 @@ class Client:
         if length is not None:
             n = wire.decimal(length)
             if n > _prefetch.MAX_RESPONSE_BYTES:
-                raise ProtocolError("prefetch response too large")
+                raise ProtocolError("response too large")
             return conn.read_exact(n)
         out = bytearray(conn.buf)
         conn.buf.clear()
@@ -500,7 +540,7 @@ class Client:
                 return bytes(out)
             out += chunk
             if len(out) > _prefetch.MAX_RESPONSE_BYTES:
-                raise ProtocolError("prefetch response too large")
+                raise ProtocolError("response too large")
 
     @staticmethod
     def _prefetch_error(h: wire.ResponseHead, payload: bytes) -> PrefetchError:
