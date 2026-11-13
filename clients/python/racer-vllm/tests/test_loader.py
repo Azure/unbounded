@@ -357,3 +357,24 @@ def test_mm_encoder_only_filter_uses_vllms_function(monkeypatch, server, torch, 
     ld.load_weights(model, model_config(d))
     assert set(model.got) == {"w1", "w2"}
     assert calls == [(["a.safetensors", "b.safetensors"], d, "model.safetensors.index.json", ("language_model.",))]
+
+
+class StrictDefaultModelLoader(DefaultModelLoader):
+    """Like vLLM's DefaultModelLoader: rejects extra config keys outside its allowlist."""
+
+    ALLOWED = {"enable_multithread_load", "num_threads", "enable_weights_track"}
+
+    def __init__(self, load_config):
+        extra = set(load_config.model_loader_extra_config or {}) - self.ALLOWED
+        if extra:
+            raise ValueError(f"Unexpected extra config keys for load format racer: {extra}")
+        self.seen_extra = dict(load_config.model_loader_extra_config or {})
+        super().__init__(load_config)
+
+
+def test_settings_pass_the_base_allowlist(monkeypatch, server):
+    ld = make_loader(monkeypatch, server, base=StrictDefaultModelLoader, uri=URI, verify="none", role="draft")
+    assert ld.seen_extra == {}
+    assert ld.racer.uri == URI and ld.racer.verify == "none" and ld.racer.role == "draft"
+    # The caller's config is restored, so vLLM and the loader both see the real settings.
+    assert ld.load_config.model_loader_extra_config["uri"] == URI

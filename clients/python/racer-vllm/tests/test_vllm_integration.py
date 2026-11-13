@@ -71,3 +71,13 @@ def test_base_calls_the_hooks_the_loader_overrides(base):
     for name in ("load_weights", "load_model"):
         params = compat.params(getattr(base, name))
         assert params[:1] in (["model"], ["vllm_config"]), (name, params)
+
+
+def test_loader_accepts_racer_settings(base):
+    from vllm.config import LoadConfig
+
+    extra = {"uri": "racer://c/b/p", "sharded": "auto", "verify": "size"}
+    cfg = LoadConfig(load_format="racer", model_loader_extra_config=dict(extra))
+    ld = loader.loader_class()(cfg)
+    assert ld.racer.uri == "racer://c/b/p"
+    assert cfg.model_loader_extra_config == extra
