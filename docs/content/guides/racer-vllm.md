@@ -18,7 +18,7 @@ This helps most when many vLLM replicas start at once. Each page of the
 weights comes from the origin only a few times, and replicas share the pages
 among themselves instead of each downloading the full model.
 
-{{< callout type="info" >}}
+{{< callout type="note" >}}
 This guide describes the `racer-vllm` package layout (`racer-vllm materialize`,
 `import`, `prepare`, `warm`, `inspect`), plaintext caches, and local
 retention. These land together; check that your release includes them. On
