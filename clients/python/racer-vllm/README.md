@@ -53,6 +53,7 @@ vllm serve /models/<name> --load-format racer \
 | `clone` | `auto` | `auto`, `always`, or `never` |
 | `verify` | `size` | `none`, `size`, or `full` |
 | `capture_dir` | Unset | Used by `prepare` |
+| `role` | `target` | `target`, or `draft` for a speculative-decoding draft model; `draft` selects the draft's own sharded artifacts and checkpoint filter |
 | `socket` | `RACER_SOCKET` | Client socket path |
 
 ## Tests
