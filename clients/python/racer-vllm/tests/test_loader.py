@@ -1,0 +1,359 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+"""The loader, its filters, fingerprints and sharded artifacts, on a fake vLLM."""
+
+import logging
+import types
+
+import pytest
+from modelfix import (
+    DefaultModelLoader,
+    DefaultModelLoaderV030,
+    URI,
+    W,
+    Model,
+    Source,
+    client,
+    install_fake_vllm,
+    make_loader,
+    model_config,
+    model_state,
+    publish,
+    put,
+    serve_dir,
+)
+
+import racer_vllm
+from racer_vllm import cli, filters, loader, reader, sharded
+from racer_vllm import manifest as mf
+from racer_vllm.store import LocalStore
+
+
+def key_of(seen):
+    """The object key of a request the fake server saw, or ""."""
+    prefix = "/v1/objects/"
+    return seen.target[len(prefix) :].partition("/")[0] if seen.target.startswith(prefix) else ""
+
+
+@pytest.fixture(autouse=True)
+def fresh_modes():
+    reader.forget()
+    yield
+    reader.forget()
+
+
+def materialized(server, tmp_path, **kw):
+    u, files, m = publish(server, **kw)
+    d = str(tmp_path / "model")
+    with client(server) as c:
+        cli.materialize(c, u, d, out=lambda *_: None)
+    return u, files, m, d
+
+
+def test_register_is_idempotent_and_builds_a_subclass(monkeypatch, server):
+    ld = make_loader(monkeypatch, server)
+    assert isinstance(ld, DefaultModelLoader)
+    assert type(ld).__name__ == "RacerModelLoader"
+    assert racer_vllm.RacerModelLoader is type(ld)
+    assert racer_vllm.LOAD_FORMAT == "racer"
+
+
+def test_loader_reads_a_materialized_model(monkeypatch, server, torch, tmp_path, caplog):
+    u, files, m, d = materialized(server, tmp_path)
+    ld = make_loader(monkeypatch, server)
+    model = Model()
+    start = len(server.seen)
+    with caplog.at_level(logging.INFO, logger="vllm.racer_vllm.loader"):
+        ld.load_weights(model, model_config(d))
+    assert model.got == W
+    # _prepare_weights answers vLLM's call with the manifest's weight files.
+    assert ld.prepared == [(d, ["a.safetensors", "b.safetensors"], True, "model.safetensors.index.json")]
+    line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("racer: loaded"))
+    assert "files=2" in line and "host=2" in line and "throughput=" in line
+    # Every weight file was stat'ed at its pinned ETag before any data read.
+    weights = {u.request(n).hex: n for n in ("a.safetensors", "b.safetensors")}
+    load = [s for s in server.seen[start:] if key_of(s) in weights]
+    heads = [s for s in load if s.method == "HEAD"]
+    assert len(heads) == 2 and all(s.headers.get("if-match") == '"v1"' for s in heads)
+    assert load.index(heads[-1]) < min(i for i, s in enumerate(load) if s.method == "POST")
+    assert ld._racer_clients == {} and ld._racer_readers == {}
+
+
+def test_loader_follows_secondary_weights_and_prefixes(monkeypatch, server, torch, tmp_path):
+    u, files, m, d = materialized(server, tmp_path)
+    draft = racer_vllm.parse_uri("racer://cache1/models/org/draft")
+    publish(server, draft)
+    ld = make_loader(monkeypatch, server)
+    model = Model(secondary=[Source(str(draft), prefix="draft.")])
+    ld.load_weights(model, model_config(d))
+    assert set(model.got) == set(W) | {"draft." + n for n in W}
+
+
+def test_loader_reads_a_racer_uri_directly(monkeypatch, server, torch):
+    publish(server)
+    ld = make_loader(monkeypatch, server, verify="none")
+    model = Model()
+    ld.load_weights(model, model_config(URI))
+    assert model.got == W
+
+
+def test_loader_uses_the_uri_setting(monkeypatch, server, torch, tmp_path):
+    u, files, m, d = materialized(server, tmp_path)
+    (tmp_path / "model" / mf.SOURCE_NAME).unlink()
+    ld = make_loader(monkeypatch, server, uri=URI, verify="none")
+    model = Model()
+    ld.load_weights(model, model_config(d))
+    assert model.got == W
+
+
+def test_loader_without_a_uri_fails(monkeypatch, server, torch, tmp_path):
+    u, files, m, d = materialized(server, tmp_path)
+    (tmp_path / "model" / mf.SOURCE_NAME).unlink()
+    ld = make_loader(monkeypatch, server)
+    with pytest.raises(ValueError, match="racer-vllm materialize"):
+        ld.load_weights(Model(), model_config(d))
+
+
+def test_download_model_needs_a_manifest(monkeypatch, server, tmp_path):
+    ld = make_loader(monkeypatch, server)
+    with pytest.raises(FileNotFoundError, match="racer-vllm materialize"):
+        ld.download_model(model_config(str(tmp_path)))
+    assert ld.download_model(model_config(URI)) == URI
+
+
+def test_loader_fails_when_the_model_changed_since_materialize(monkeypatch, server, torch, tmp_path):
+    u, files, m, d = materialized(server, tmp_path)
+    put(server, u, "a.safetensors", files["a.safetensors"], etag='"v2"')
+    ld = make_loader(monkeypatch, server)
+    with pytest.raises(mf.ManifestError, match="changed since materialize"):
+        ld.load_weights(Model(), model_config(d))
+
+
+def test_verify_size_rejects_a_wrong_length(monkeypatch, server, torch):
+    u, files, m = publish(server)
+    put(server, u, "b.safetensors", files["b.safetensors"] + b"\0")
+    ld = make_loader(monkeypatch, server)
+    with pytest.raises(mf.ManifestError, match="bytes in Racer"):
+        ld.load_weights(Model(), model_config(URI))
+
+
+def test_verify_full_checks_sha256(monkeypatch, server, torch, tmp_path):
+    u, files, m, d = materialized(server, tmp_path)
+    ld = make_loader(monkeypatch, server, verify="full", staging_bytes=1 << 16)
+    model = Model()
+    ld.load_weights(model, model_config(d))
+    assert model.got == W
+    bad = bytearray(files["b.safetensors"])
+    bad[-1] ^= 0xFF
+    put(server, u, "b.safetensors", bytes(bad))
+    reader.forget()
+    ld = make_loader(monkeypatch, server, verify="full", staging_bytes=1 << 16, uri=URI)
+    (tmp_path / "model" / mf.SOURCE_NAME).unlink()
+    with pytest.raises(mf.ManifestError, match="sha256 mismatch"):
+        ld.load_weights(Model(), model_config(d))
+
+
+def test_unused_weights_are_not_read(monkeypatch, server, torch, tmp_path):
+    u, files, m, d = materialized(server, tmp_path)
+    ld = make_loader(monkeypatch, server)
+    model = Model()
+    model.is_unused_checkpoint_weight = lambda name: name == "w3"
+    ld.load_weights(model, model_config(d))
+    assert set(model.got) == {"w1", "w2", "w4"}
+
+
+# Filters
+
+
+class DeepSeekMTP:
+    def __init__(self, layers):
+        self.config = types.SimpleNamespace(num_hidden_layers=layers)
+
+
+def test_draft_rule_keeps_only_mtp_layers():
+    keep = filters.keep_predicate(DeepSeekMTP(2), "draft")
+    assert keep("model.layers.2.mlp.weight")
+    assert not keep("model.layers.1.mlp.weight")
+    assert keep("lm_head.weight") and keep("model.embed_tokens.weight")
+    assert filters.keep_predicate(DeepSeekMTP(2), "target")("model.layers.0.x")
+    assert filters.draft_rule(object()) is None
+    no_cfg = DeepSeekMTP(None)
+    assert filters.draft_rule(no_cfg) is None
+
+
+def test_source_and_expert_filters():
+    keep = filters.keep_predicate(object(), "target", source_is_unused=lambda n: n == "x")
+    assert not keep("x") and keep("y")
+    from racer_vllm import compat
+
+    src = types.SimpleNamespace(is_unused_weight=["a"])
+    assert compat.source_is_unused(src)("a") and not compat.source_is_unused(src)("b")
+    assert compat.source_is_unused(types.SimpleNamespace()) is None
+    keep = filters.keep_predicate(object(), "target", local_expert_ids=[0, 2])
+    assert keep("m.experts.0.w") and keep("m.experts.2.w") and not keep("m.experts.1.w") and keep("m.attn.w")
+
+
+# Fingerprints
+
+
+def test_fingerprint_is_stable_and_sensitive():
+    cfg = model_config("x")
+    par = {"tp": 8, "pp": 1, "ep": 8, "enable_expert_parallel": True}
+    base = sharded.fingerprint(Model(), "target", "a" * 64, "0.33.0", model_config=cfg, parallel=par)
+    assert len(base) == 32
+    assert base == sharded.fingerprint(Model(), "target", "a" * 64, "0.33.0", model_config=cfg, parallel=dict(par))
+    variants = [
+        sharded.fingerprint(Model(), "draft", "a" * 64, "0.33.0", model_config=cfg, parallel=par),
+        sharded.fingerprint(Model(), "target", "b" * 64, "0.33.0", model_config=cfg, parallel=par),
+        sharded.fingerprint(Model(), "target", "a" * 64, "0.30.0", model_config=cfg, parallel=par),
+        sharded.fingerprint(Model(), "target", "a" * 64, "0.33.0", model_config=cfg, parallel=dict(par, tp=4)),
+        sharded.fingerprint(Model(), "target", "a" * 64, "0.33.0", model_config=cfg, parallel=dict(par, ep=1)),
+        sharded.fingerprint(Model(), "target", "a" * 64, "0.33.0", model_config=model_config("x", dtype="float16"),
+                            parallel=par),
+        sharded.fingerprint(DeepSeekMTP(1), "target", "a" * 64, "0.33.0", model_config=cfg, parallel=par),
+    ]
+    q = model_config("x")
+    q.quantization = "fp8"
+    variants.append(sharded.fingerprint(Model(), "target", "a" * 64, "0.33.0", model_config=q, parallel=par))
+    assert len({base, *variants}) == len(variants) + 1
+
+
+# Sharded artifacts
+
+
+STATE = {"layer.a": b"\x11" * 64, "layer.b": b"\x22" * 32}
+
+
+def capture_to(tmp_path, state, fp="f" * 32, ranks=(0,), world_size=1):
+    out = str(tmp_path / "capture")
+    for rank in ranks:
+        sharded.capture(Model(model_state(state)), "target", out, fingerprint=fp, rank=rank,
+                        world_size=world_size, source_manifest_sha256="0" * 64)
+    return out
+
+
+def test_capture_publish_and_load_sharded(monkeypatch, server, torch, tmp_path, caplog):
+    u, files, m, d = materialized(server, tmp_path)
+    ld = make_loader(monkeypatch, server, sharded="require")
+    fp, _, _ = ld._fingerprint(Model(), model_config(d))
+    root = tmp_path / "origin"
+    cli.publish_captured(LocalStore(str(root)), capture_to(tmp_path, STATE, fp), "0.33.0", out=lambda *_: None)
+    serve_dir(server, u, str(root))
+    target = Model(model_state({n: b"\0" * len(v) for n, v in STATE.items()}))
+    ld.load_weights(target, model_config(d))
+    assert {n: t.bytes() for n, t in target.state.items()} == STATE
+    assert target.got == {}  # the checkpoint was not read
+
+
+def test_sharded_auto_falls_back_and_require_fails(monkeypatch, server, torch, tmp_path, caplog):
+    u, files, m, d = materialized(server, tmp_path)
+    ld = make_loader(monkeypatch, server, sharded="auto")
+    model = Model(model_state(STATE))
+    with caplog.at_level(logging.INFO, logger="vllm.racer_vllm.sharded"):
+        ld.load_weights(model, model_config(d))
+    assert model.got == W
+    assert any("not using sharded artifact" in r.getMessage() for r in caplog.records)
+    ld = make_loader(monkeypatch, server, sharded="require")
+    with pytest.raises(sharded.ShardedMismatch, match="not found"):
+        ld.load_weights(Model(model_state(STATE)), model_config(d))
+
+
+def test_sharded_mismatch_is_detected(monkeypatch, server, torch, tmp_path):
+    u, files, m, d = materialized(server, tmp_path)
+    ld = make_loader(monkeypatch, server, sharded="require")
+    fp, _, _ = ld._fingerprint(Model(), model_config(d))
+    root = tmp_path / "origin"
+    cli.publish_captured(LocalStore(str(root)), capture_to(tmp_path, STATE, fp), out=lambda *_: None)
+    serve_dir(server, u, str(root))
+    other = Model(model_state({"layer.a": b"\0" * 64, "layer.c": b"\0" * 4}))
+    with pytest.raises(sharded.ShardedMismatch, match="layer"):
+        ld.load_weights(other, model_config(d))
+    ld = make_loader(monkeypatch, server, sharded="auto")
+    other = Model(model_state({"layer.a": b"\0" * 64, "layer.c": b"\0" * 4}))
+    ld.load_weights(other, model_config(d))
+    assert other.got == W
+
+
+def test_capture_reads_only_its_own_rank(monkeypatch, server, torch, tmp_path):
+    u, files, m, d = materialized(server, tmp_path)
+    ld = make_loader(monkeypatch, server, sharded="require")
+    fp, _, _ = ld._fingerprint(Model(), model_config(d))
+    root = tmp_path / "origin"
+    out = capture_to(tmp_path, STATE, fp, ranks=(0, 1), world_size=2)
+    cli.publish_captured(LocalStore(str(root)), out, out=lambda *_: None)
+    serve_dir(server, u, str(root))
+    # The fingerprint stands for the parallel layout; this loader is rank 0.
+    target = Model(model_state({n: b"\0" * len(v) for n, v in STATE.items()}))
+    ld.load_weights(target, model_config(d))
+    assert {n: t.bytes() for n, t in target.state.items()} == STATE
+    rank1 = sharded.artifact_prefix(fp, "target", 1)
+    keys = {u.child(rank1).request(n).hex for n in (mf.SHARDED_NAME, sharded.DATA_NAME)}
+    assert not any(key_of(s) in keys for s in server.seen)
+
+
+def test_captured_rejects_incomplete_ranks(monkeypatch, tmp_path, torch):
+    install_fake_vllm(monkeypatch)
+    out = capture_to(tmp_path, STATE, ranks=(0,), world_size=2)
+    with pytest.raises(mf.ManifestError, match="do not cover"):
+        sharded.captured(out)
+
+
+def test_capture_runs_between_load_weights_and_processing(monkeypatch, server, torch, tmp_path):
+    u, files, m, d = materialized(server, tmp_path)
+    cap = str(tmp_path / "cap")
+    ld = make_loader(monkeypatch, server, capture_dir=cap, sharded="auto")
+    model = Model(model_state(STATE))
+    calls = []
+    real_capture = sharded.capture
+    monkeypatch.setattr(sharded, "capture", lambda *a, **k: calls.append("capture") or real_capture(*a, **k))
+    vllm_config = types.SimpleNamespace(make_model=lambda: model)
+    assert ld.load_model(vllm_config, model_config(d)) is model
+    assert model.got == W  # capture_dir reads the checkpoint, never an artifact
+    assert calls == ["capture"] and ld.events == ["process_weights_after_loading"]
+    (key, ranks), = sharded.captured(cap).items()
+    assert key[1] == "target" and list(ranks) == [0]
+    monkeypatch.setenv(loader.CAPTURE_EXIT_ENV, "1")
+    reader.forget()
+    ld = make_loader(monkeypatch, server, capture_dir=str(tmp_path / "cap2"))
+    vllm_config = types.SimpleNamespace(make_model=lambda: Model(model_state(STATE)))
+    with pytest.raises(loader.CaptureComplete):
+        ld.load_model(vllm_config, model_config(d))
+    assert ld.events == []
+
+
+@pytest.mark.parametrize("base, arity", [(DefaultModelLoader, 4), (DefaultModelLoaderV030, 3)])
+def test_prepare_weights_matches_the_vllm_release(monkeypatch, server, tmp_path, base, arity):
+    u, files, m, d = materialized(server, tmp_path)
+    ld = make_loader(monkeypatch, server, base=base)
+    got = ld._prepare_weights(d, None, None, True, None)
+    assert len(got) == arity
+    assert got[:3] == (d, ["a.safetensors", "b.safetensors"], True)
+    if arity == 4:
+        assert got[3] == "model.safetensors.index.json"
+
+
+def test_fake_vllm_registry_is_isolated(monkeypatch):
+    reg = install_fake_vllm(monkeypatch)
+    racer_vllm.register()
+    assert reg["calls"] == ["racer"]
+
+
+def test_mm_encoder_only_filter_uses_vllms_function(monkeypatch, server, torch, tmp_path):
+    import sys
+
+    u, files, m, d = materialized(server, tmp_path)
+    ld = make_loader(monkeypatch, server)
+    calls = []
+
+    def filt(names, folder, index, prefixes, *, weights_mapper=None):
+        calls.append((list(names), folder, index, prefixes))
+        return [n for n in names if n != "b.safetensors"]
+
+    wu = types.ModuleType("vllm.model_executor.model_loader.weight_utils")
+    wu.filter_mm_encoder_only_safetensors_files = filt
+    monkeypatch.setitem(sys.modules, wu.__name__, wu)
+    ld._encoder_only_lm_prefixes = ("language_model.",)
+    model = Model()
+    ld.load_weights(model, model_config(d))
+    assert set(model.got) == {"w1", "w2"}
+    assert calls == [(["a.safetensors", "b.safetensors"], d, "model.safetensors.index.json", ("language_model.",))]
