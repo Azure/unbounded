@@ -388,7 +388,14 @@ def build(base):
         return cls
 
     def __init__(self, load_config, *args, **kwargs):
-        base.__init__(self, load_config, *args, **kwargs)
+        # DefaultModelLoader rejects extra config keys outside its own small
+        # allowlist, so hide the Racer settings from it while it initializes.
+        extra = getattr(load_config, "model_loader_extra_config", None)
+        load_config.model_loader_extra_config = {}
+        try:
+            base.__init__(self, load_config, *args, **kwargs)
+        finally:
+            load_config.model_loader_extra_config = extra
         self._racer_init(load_config)
 
     cls = type("RacerModelLoader", (RacerLoaderMixin, base), {"__init__": __init__, "__module__": __name__})
