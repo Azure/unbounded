@@ -541,12 +541,23 @@ jobs:
           set +e
           NS=unbounded-system
           echo "::group::Site CRDs"
-          kubectl get crd sites.unbounded-cloud.io sites.net.unbounded-cloud.io 2>&1
+          kubectl get crd sites.unbounded-cloud.io 2>&1
+          # The net-group Site CRD is migrated away by the operator's
+          # LegacyReaper. Its absence is expected once that migration has run,
+          # so report it as such instead of as a NotFound that reads like the
+          # cause of the failure.
+          if kubectl get crd sites.net.unbounded-cloud.io >/dev/null 2>&1; then
+            kubectl get crd sites.net.unbounded-cloud.io 2>&1
+          else
+            echo "sites.net.unbounded-cloud.io absent, expected after the legacy Site migration"
+          fi
           echo "::endgroup::"
           echo "::group::Sites (new + legacy)"
           kubectl get sites.unbounded-cloud.io -o wide 2>&1
           kubectl get sites.unbounded-cloud.io -o yaml 2>&1
-          kubectl get sites.net.unbounded-cloud.io -A -o wide 2>&1
+          if kubectl get crd sites.net.unbounded-cloud.io >/dev/null 2>&1; then
+            kubectl get sites.net.unbounded-cloud.io -A -o wide 2>&1
+          fi
           echo "::endgroup::"
           echo "::group::Node readiness"
           # A DaemonSet counts every node toward desiredNumberScheduled, so a
