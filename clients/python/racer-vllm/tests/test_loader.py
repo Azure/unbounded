@@ -445,6 +445,24 @@ def test_parallel_info_reports_an_unknown_rank(monkeypatch):
     assert sharded.rank_problem(par) and sharded.rank_problem({"rank": 2, "world_size": 2})
 
 
+def test_parallel_info_rank_ignores_data_parallel_replicas(monkeypatch):
+    import sys
+
+    install_fake_vllm(monkeypatch)
+    dist = sys.modules["vllm.distributed"]
+    # dp=3, tp=2, pp=1: world rank 5 is replica 2, tensor rank 1.
+    set_parallel(dist, tp=2, rank=5, tp_rank=1, pp_rank=0)
+    par = sharded.parallel_info()
+    assert par["rank"] == 1 and par["world_size"] == 2
+    assert sharded.rank_problem(par) is None
+    # tp=2, pp=2: pipeline rank 1, tensor rank 0 is shard rank 2.
+    set_parallel(dist, tp=2, pp=2, rank=6, tp_rank=0, pp_rank=1)
+    assert sharded.parallel_info()["rank"] == 2
+    # A group rank outside the layout is still rejected.
+    set_parallel(dist, tp=2, rank=0, tp_rank=2, pp_rank=0)
+    assert "outside" in sharded.rank_problem(sharded.parallel_info())
+
+
 @pytest.mark.parametrize("source", ["group", "config"])
 def test_capture_refuses_data_parallelism(monkeypatch, server, torch, tmp_path, source):
     import sys
