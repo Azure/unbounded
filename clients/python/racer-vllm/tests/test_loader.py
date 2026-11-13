@@ -455,3 +455,52 @@ def test_capture_refuses_data_parallelism(monkeypatch, server, torch, tmp_path, 
     with pytest.raises(RuntimeError, match="data parallel size is 2"):
         ld.load_weights(Model(model_state(STATE)), cfg)
     assert not (tmp_path / "cap" / "sharded").exists()
+
+
+def test_verify_full_hashes_filtered_files(monkeypatch, server, torch, caplog):
+    import functools
+
+    # Small pages, so skipping w3 leaves a gap the reads do not cover.
+    monkeypatch.setattr(loader, "plan", functools.partial(loader.plan, page_size=8))
+    u, files, m = publish(server)
+    bad = bytearray(files["b.safetensors"])
+    off = bytes(bad).index(W["w3"])
+    bad[off + 10] ^= 0xFF  # corrupt w3, which the model does not load
+    put(server, u, "b.safetensors", bytes(bad))
+    ld = make_loader(monkeypatch, server, verify="full")
+    model = Model()
+    model.is_unused_checkpoint_weight = lambda name: name == "w3"
+    with caplog.at_level(logging.WARNING, logger="vllm.racer_vllm.loader"):
+        with pytest.raises(mf.ManifestError, match="b.safetensors: sha256 mismatch"):
+            ld.load_weights(model, model_config(URI))
+    warned = [r.getMessage() for r in caplog.records if "verify=full" in r.getMessage()]
+    assert len(warned) == 1 and "b.safetensors" in warned[0]
+    # An intact file with a filtered tensor verifies and loads.
+    put(server, u, "b.safetensors", files["b.safetensors"])
+    reader.forget()
+    ld = make_loader(monkeypatch, server, verify="full")
+    model = Model()
+    model.is_unused_checkpoint_weight = lambda name: name == "w3"
+    ld.load_weights(model, model_config(URI))
+    assert set(model.got) == {"w1", "w2", "w4"}
+
+
+def test_verify_full_checks_the_size_of_an_unpinned_uri(monkeypatch, server, torch):
+    u, files, m = publish(server)
+    put(server, u, "b.safetensors", files["b.safetensors"] + b"\0")
+    ld = make_loader(monkeypatch, server, verify="full")
+    with pytest.raises(mf.ManifestError, match="bytes in Racer"):
+        ld.load_weights(Model(), model_config(URI))
+
+
+def test_verify_full_never_uses_gpu_delivery(monkeypatch, server, torch):
+    with pytest.raises(ValueError, match="verify=full"):
+        make_loader(monkeypatch, server, verify="full", delivery="gpu")
+    publish(server)
+    asked = []
+    real = reader.probe
+    monkeypatch.setattr(reader, "probe", lambda c, delivery, make: asked.append(delivery) or real(c, "host", make))
+    ld = make_loader(monkeypatch, server, verify="full", delivery="auto")
+    model = Model()
+    ld.load_weights(model, model_config(URI))
+    assert model.got == W and asked == ["host"]
