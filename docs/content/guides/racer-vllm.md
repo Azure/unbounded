@@ -225,7 +225,7 @@ optional.
 | `max_staging_bytes` | 4 GiB | Cap on all staging memory |
 | `concurrency` | `4` | Reads in flight |
 | `clone` | `auto` | Copy each tensor out of staging: `auto` copies only when the tensor would otherwise alias reused staging memory; `always`; `never` |
-| `verify` | `size` | `none`; `size` checks each file's length against the manifest; `full` checks SHA-256 instead (host delivery only) |
+| `verify` | `size` | `none`; `size` checks each file's length against the manifest; `full` also checks the length when no ETag is pinned and adds a SHA-256 over every byte, forces host delivery, and is rejected with `delivery: gpu` |
 | `capture_dir` | Unset | Used by `prepare`; leave unset when serving |
 | `role` | `target` | `draft` for a speculative-decoding draft model; it selects the draft's own sharded artifacts and checkpoint filter |
 | `socket` | `RACER_SOCKET` | Client socket path |
