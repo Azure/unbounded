@@ -1,2 +1,4 @@
-# Shrunk failing choice streams, replayed by `make racer-dst` after ci.txt.
-# Add the `words=` line the runner prints for a failure here once it is fixed.
+# Regressions replayed by `make racer-dst` after ci.txt.
+# Add the `words=` line the runner prints for a failure here once it is fixed,
+# or the `seed=` line for a deterministic failure that a seed set already names.
+authority-crash-restart seed=151

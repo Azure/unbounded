@@ -6,7 +6,10 @@
 //! a vacant seat, reads that one Lease, and claims it only when
 //! [`election::seat_to_claim`] agrees. With a live primary, the window and
 //! vacancies come from the primary Lease annotations; without one, the Pod
-//! contends for the initial seats with an exponentially growing window.
+//! contends for the initial seats with an exponentially growing window. That
+//! window is capped at [`MAX_ESTABLISHED_WINDOW`] for a Node the view says
+//! holds a seat while the primary Lease names a holder, so the cluster can
+//! replace a crashed seat holder.
 
 use crate::{
     entropy::Entropy,
@@ -23,8 +26,21 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Longest cold start claim window, in seconds.
+/// Longest cold start claim window, in seconds, before any primary was seen.
 pub const MAX_COLD_WINDOW: u64 = 600;
+
+/// Longest claim window, in seconds, for a Node the primary view says holds
+/// a seat while the primary Lease names a holder.
+///
+/// A Node the view says holds a seat is the cluster's recovery path while the
+/// primary Lease names a holder, so a seatless Pod on that Node must retry
+/// often enough that a crashed seat holder is replaced within the primary
+/// Lease duration. Matching [`limits::LEASE_RENEW`] keeps that recovery inside
+/// the primary Lease bound even on a slow clock. The wider
+/// [`MAX_COLD_WINDOW`] is only for a brand-new cluster (no primary yet) and
+/// for Nodes the view does not map to a seat, where many Pods may contend and
+/// a wide window keeps API load low.
+pub const MAX_ESTABLISHED_WINDOW: u64 = limits::LEASE_RENEW.as_secs();
 
 /// What the lottery sees before one round.
 #[derive(Clone, Copy, Debug)]
@@ -79,9 +95,19 @@ impl Lottery {
                 (v, i.view.claim_window.clamp(5, 3600))
             }
         } else {
+            // A Node the primary view says holds a seat is the recovery path:
+            // keep retrying inside the primary Lease duration so a crashed
+            // seat holder is replaced. A brand-new cluster, and Nodes the
+            // view does not map to a seat, still spread their claims across
+            // the wider cold window.
+            let max = if i.view.holder.is_some() && i.view.node_seated(i.node) {
+                MAX_ESTABLISHED_WINDOW
+            } else {
+                MAX_COLD_WINDOW
+            };
             (
                 (0..i.initial_seats).collect(),
-                (5u64 << self.attempt.min(7)).min(MAX_COLD_WINDOW),
+                (5u64 << self.attempt.min(7)).min(max),
             )
         };
         if candidates.is_empty() {
@@ -506,6 +532,52 @@ mod tests {
             }
             p => panic!("{p:?}"),
         }
+    }
+
+    #[test]
+    fn established_cluster_retries_within_a_lease() {
+        let now = Instant::now();
+        // A primary was seen, so seats are the recovery path even though the
+        // view is no longer live (the primary just crashed).
+        let v = PrimaryView {
+            holder: Some("p1/00".into()),
+            desired: 3,
+            seat_nodes: vec!["me".into()],
+            ..Default::default()
+        };
+        let mut l = Lottery::default();
+        for _ in 0..20 {
+            match l.plan(&inputs(&v, None), now, &mut SplitMix64::new(7)) {
+                Plan::Attempt { delay, index } => {
+                    assert!(index < 3);
+                    assert!(
+                        delay < Duration::from_secs(MAX_ESTABLISHED_WINDOW),
+                        "delay {delay:?} exceeds the established window"
+                    );
+                }
+                p => panic!("{p:?}"),
+            }
+            l.begin();
+        }
+        // Attempts still grow for the cold-start case; only the window cap
+        // that applies changes.
+        assert_eq!(l.attempt, 20);
+        // A Node the view does not map to a seat keeps the wider window.
+        let unseated = PrimaryView {
+            seat_nodes: Vec::new(),
+            ..v
+        };
+        let mut l = Lottery::default();
+        let mut wide = false;
+        for _ in 0..20 {
+            if let Plan::Attempt { delay, .. } =
+                l.plan(&inputs(&unseated, None), now, &mut SplitMix64::new(7))
+            {
+                wide |= delay >= Duration::from_secs(MAX_ESTABLISHED_WINDOW);
+            }
+            l.begin();
+        }
+        assert!(wide, "an unseated Node should keep the wide cold window");
     }
 
     #[test]

@@ -2,8 +2,11 @@
 use racer_dst::{
     Choices,
     authority::{self, ApiFaults},
+    choices::Source,
+    determinism::run_twice,
     engine::SECONDS,
     scenario::FaultMix,
+    scenarios,
 };
 
 /// With every API write rejected nobody can take the primary Lease, so the
@@ -41,4 +44,15 @@ fn two_authorities_elect_deterministically() {
     let b = s.run(Choices::seeded(7));
     assert_eq!(a.failure, None);
     assert_eq!(a, b);
+}
+
+/// A crash of the primary and seat holder is followed by a restart that
+/// loses its old seat. The restarted Pod must reclaim a seat and then a
+/// primary within [`authority::PRIMARY_BOUND`] of the last fault; an
+/// established cluster's seat lottery must not back off for minutes.
+#[test]
+fn crash_restart_recovers_a_primary_within_the_bound() {
+    let s = scenarios::find("authority-crash-restart").expect("catalog scenario");
+    let out = run_twice(&s, &Source::Seed(151)).unwrap_or_else(|d| panic!("{d}"));
+    assert_eq!(out.failure, None);
 }
