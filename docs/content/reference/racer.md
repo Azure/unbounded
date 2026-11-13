@@ -1880,7 +1880,7 @@ starts the GPU helper and never waits for a start in flight.
 
 ```json
 {"schema":1,"delivery":["gpu","host","stream"],
- "gpu_uuids":["gpu-0123..."],"page_bytes":16777216,
+ "gpu_uuids":["GPU-0123..."],"page_bytes":16777216,
  "page_ciphers":["xaes256gcm"]}
 ```
 
@@ -1904,20 +1904,20 @@ GPU memory. They need:
   container runtime and a CDI spec.
 - `RACER_ENABLE_GPU` in `racer-settings`. `auto`, the default, does
   not touch any GPU until a client sends the first `gpu-read`. Only then does
-  the dataplane load CUDA, look for GPUs, and turn GPU mode on. If that
-  One attempt runs at a time, and `gpu-read` requests that arrive while it
-  runs wait for it. If the attempt fails, those requests get 501, and so does
-  every `gpu-read` during a backoff that starts at 5 s and doubles per
-  consecutive failure up to 60 s. There is no background retry: the first
-  `gpu-read` after the backoff expires starts the next attempt and waits for
-  it, within that request's own scope, instead of getting 501. An idle node
-  does not retry on its own. The dataplane logs
+  the dataplane load CUDA, look for GPUs, and turn GPU mode on; it never
+  does this at startup. One attempt runs at a time, and `gpu-read` requests
+  that arrive while it runs wait for it. If the attempt fails, those requests
+  get 501, and so does every `gpu-read` during a backoff that starts at 5 s
+  and doubles per consecutive failure, capped at 60 s. There is no background
+  timer: the first `gpu-read` after the backoff expires starts the next
+  attempt and waits for it, within that request's own scope, instead of
+  getting 501. An idle node never retries on its own. The dataplane logs
   `stage=gpu state=starting attempt=<n>` for each attempt,
   `state=start-failed attempt=<n> reason=<reason> retry_in=<s>s` when one
   fails, and `state=recovered attempt=<n>` when an attempt after a failure
   succeeds.
-  `true` sets up the GPUs at startup and makes startup fail when there is no
-  usable GPU. `false` turns it off.
+  `true` sets up the GPUs at startup and makes startup fail, instead of
+  retrying, when there is no usable GPU. `false` turns it off.
 
 When it sets up the GPUs, the dataplane logs each GPU it finds: ordinal, UUID, PCI address,
 NUMA node, compute mode, and whether it can use it. It skips GPUs in

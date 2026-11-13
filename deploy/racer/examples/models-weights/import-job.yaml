@@ -1,5 +1,7 @@
 # Imports a Hugging Face snapshot that already exists on a node into the
 # models container. Replace every <placeholder>; see README.md.
+# The whole models--<org>--<model> cache directory is mounted because the
+# snapshot entries are relative symlinks into ../../blobs.
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -31,7 +33,7 @@ spec:
             - racer-vllm
             - import
             - --source
-            - /snapshot
+            - /model/snapshots/<revision>
             - --dest
             - https://<storage-account>.blob.core.windows.net/models/<model-prefix>
             - --azcopy
@@ -43,16 +45,16 @@ spec:
             - name: AZURE_FEDERATED_TOKEN_FILE
               value: /var/run/secrets/azure/tokens/azure-identity-token
           volumeMounts:
-            - name: snapshot
-              mountPath: /snapshot
+            - name: model-cache
+              mountPath: /model
               readOnly: true
             - name: azure-identity-token
               mountPath: /var/run/secrets/azure/tokens
               readOnly: true
       volumes:
-        - name: snapshot
+        - name: model-cache
           hostPath:
-            path: <hf-cache>/hub/models--<org>--<model>/snapshots/<revision>
+            path: <hf-cache>/hub/models--<org>--<model>
             type: Directory
         - name: azure-identity-token
           projected:
