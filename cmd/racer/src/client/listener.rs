@@ -970,6 +970,18 @@ async fn serve_connection(
         let scope = &scope;
         // Prefetch tickets have their own JSON route and close the connection.
         let value = match received.value {
+            // Capabilities answer at once, apart from any GPU start.
+            Ok(request) if super::capabilities::is_capabilities(&request.head) => {
+                drop(request);
+                return super::capabilities::serve(
+                    connection,
+                    responses.capabilities(),
+                    io,
+                    timeout,
+                    cancellation.clone(),
+                )
+                .await;
+            }
             Ok(request) if super::prefetch::is_prefetch(&request.head) => {
                 let head = request.head;
                 drop(request.descriptors);
