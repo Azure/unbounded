@@ -1,0 +1,400 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+"""RacerModelLoader: vLLM's DefaultModelLoader reading weights from Racer.
+
+The class is built on first use from vLLM's DefaultModelLoader (``build``),
+so everything vLLM does around the weight iterator (secondary weights,
+prefixes, weight-dict filters, missing-weight checks) still applies. Only the
+file listing, the byte source, and the optional sharded fast path change.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import time
+
+from . import compat, filters, reader, settings
+from . import manifest as mf
+from . import sharded as sh
+from .planner import plan
+from .uri import SCHEME, ModelURI, parse_uri
+
+log = logging.getLogger("vllm.racer_vllm.loader")
+
+LOAD_FORMAT = "racer"
+CAPTURE_EXIT_ENV = "RACER_VLLM_CAPTURE_EXIT"
+
+
+class CaptureComplete(SystemExit):
+    """Raised after a capture with RACER_VLLM_CAPTURE_EXIT=1, so no KV cache is allocated."""
+
+    def __init__(self, path: str = "") -> None:
+        super().__init__(0)
+        self.path = path
+
+
+def summary(role: str, rank: int, stats: dict, seconds: float) -> str:
+    """The one line logged after each load."""
+    total = sum(stats["bytes"].values())
+    rate = total / seconds / 1e6 if seconds > 0 else 0.0
+    modes = " ".join(f"{m}={stats['reads'][m]}" for m in reader.MODES)
+    return (
+        f"racer: loaded role={role} rank={rank} files={stats['files']} bytes={total} "
+        f"seconds={seconds:.2f} throughput={rate:.1f}MB/s reads {modes}"
+    )
+
+
+def _client_factory(cache: str, socket_path: str | None):
+    import racer
+
+    return racer.Client(cache=cache, socket_path=socket_path)
+
+
+def _allocator_factory(mode: str):
+    device = 0
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            device = torch.cuda.current_device()
+    except ImportError:
+        pass
+    return reader.GpuAllocator(device) if mode == reader.GPU else reader.HostAllocator(device)
+
+
+class RacerLoaderMixin:
+    """Overrides on top of DefaultModelLoader. See build()."""
+
+    client_factory = staticmethod(_client_factory)
+    allocator_factory = staticmethod(_allocator_factory)
+    event_factory = None
+
+    def _racer_init(self, load_config) -> None:
+        self.racer = settings.parse(getattr(load_config, "model_loader_extra_config", None) or {})
+        self._racer_model = None
+        self._racer_stats = reader.new_stats()
+        self._racer_clients: dict = {}
+        self._racer_readers: dict = {}
+        self._racer_allocators: dict = {}
+        self._racer_stat_cache: dict = {}
+        self._racer_manifests: dict = {}
+        self._racer_sources: dict = {}
+        self._racer_primary = None
+        self._racer_full_note = False
+
+    # Locations ---------------------------------------------------------------
+
+    def _uri_for(self, path: str) -> ModelURI:
+        if self.racer.uri and (self._racer_primary is None or path == self._racer_primary):
+            return parse_uri(self.racer.uri)
+        if path.startswith(SCHEME):
+            return parse_uri(path)
+        src = self._source_for(path)
+        if src is not None:
+            return parse_uri(src["uri"])
+        raise ValueError(
+            f"racer loader: no model URI for {path!r}; set model_loader_extra_config.uri or run "
+            "'racer-vllm materialize <racer-uri> <dir>' and serve that directory"
+        )
+
+    def _source_for(self, path: str):
+        """The racer-source.json that materialize wrote in path, or None."""
+        if path.startswith(SCHEME):
+            return None
+        if path not in self._racer_sources:
+            self._racer_sources[path] = mf.load_source(path)
+        return self._racer_sources[path]
+
+    def _pin(self, path: str, name: str):
+        src = self._source_for(path)
+        return None if src is None else src["etags"].get(name)
+
+    def _manifest_for(self, path: str) -> dict:
+        if path in self._racer_manifests:
+            return self._racer_manifests[path]
+        if path.startswith(SCHEME):
+            uri = parse_uri(path)
+            client = self._client(uri)
+            m = mf.loads(client.read(uri.request(mf.MANIFEST_NAME)))
+        else:
+            m = mf.load(os.path.join(path, mf.MANIFEST_NAME))
+        self._racer_manifests[path] = m
+        return m
+
+    def _client(self, uri: ModelURI):
+        c = self._racer_clients.get(uri.cache)
+        if c is None:
+            c = self.client_factory(uri.cache, self.racer.socket)
+            self._racer_clients[uri.cache] = c
+        return c
+
+    def _reader(self, client):
+        r = self._racer_readers.get(id(client))
+        if r is not None:
+            return r
+        allocs = self._racer_allocators
+
+        def make(mode):
+            key = reader.GPU if mode == reader.GPU else reader.HOST
+            if key not in allocs:
+                allocs[key] = self.allocator_factory(key)
+            allocs[mode] = allocs[key]
+            return allocs[mode]
+
+        modes = reader.probe(client, self.racer.delivery, make)
+        pool = reader.StagingPool(
+            self.racer.staging_bytes,
+            self.racer.max_staging_bytes,
+            self.racer.concurrency,
+            allocs[modes[0]],
+            self.racer.clone,
+            self.event_factory,
+        )
+        r = reader.WeightReader(client, pool, modes, dict(allocs), self._racer_stats)
+        self._racer_readers[id(client)] = r
+        return r
+
+    def _etag(self, client, uri: ModelURI, entry: dict, pin=None):
+        """ETag for if_match.
+
+        pin is the ETag materialize recorded. verify=full and verify=none use
+        it as is (full checks sha256 instead of the size); verify=size stats
+        the file, at the pinned version when there is one, and checks its size.
+        """
+        if self.racer.verify == "full" or (self.racer.verify == "none" and pin):
+            return pin
+        key = (uri.cache, uri.bucket, uri.key(entry["name"]))
+        meta = self._racer_stat_cache.get(key)
+        if meta is None:
+            import racer
+
+            try:
+                meta = client.stat(uri.request(entry["name"]), if_match=pin)
+            except racer.VersionUnavailable:
+                raise mf.ManifestError(
+                    f"racer: {uri.key(entry['name'])} changed since materialize recorded ETag {pin}; "
+                    "run 'racer-vllm materialize' again"
+                ) from None
+            self._racer_stat_cache[key] = meta
+        if self.racer.verify == "size" and meta.size != entry["size"]:
+            raise mf.ManifestError(
+                f"racer: {uri.key(entry['name'])} is {meta.size} bytes in Racer but {entry['size']} in the "
+                "manifest; the model changed since materialize, so run 'racer-vllm materialize' again"
+            )
+        return meta.etag
+
+    def _weight_names(self, path: str, m: dict) -> list:
+        names = [f.name for f in mf.safetensors_files(m)]
+        index = m.get("index")
+        if index and not path.startswith(SCHEME):
+            p = os.path.join(path, index)
+            if os.path.isfile(p):
+                with open(p) as f:
+                    wm = (json.load(f).get("weight_map") or {}).values()
+                wanted = set(wm)
+                if wanted:
+                    names = [n for n in names if n in wanted]
+        return names
+
+    # vLLM overrides ----------------------------------------------------------
+
+    def download_model(self, model_config, model=None):
+        path = str(model_config.model)
+        if not path.startswith(SCHEME) and not os.path.isfile(os.path.join(path, mf.MANIFEST_NAME)):
+            raise FileNotFoundError(
+                f"racer loader: {os.path.join(path, mf.MANIFEST_NAME)} is missing; run "
+                f"'racer-vllm materialize <racer-uri> {path}' first"
+            )
+        return path
+
+    def _prepare_weights(self, model_name_or_path, *args, **kwargs):
+        """(folder, weight files, use_safetensors), plus the index file where vLLM expects four."""
+        path = str(model_name_or_path)
+        m = self._manifest_for(path)
+        out = (path, self._weight_names(path, m), True)
+        if compat.prepare_weights_arity(type(self)) == 4:
+            out += (m.get("index") or "",)
+        return out
+
+    def get_all_weights(self, model_config, model, *args, **kwargs):
+        self._racer_model = model
+        if self._racer_primary is None:
+            self._racer_primary = str(model_config.model)
+        yield from super().get_all_weights(model_config, model, *args, **kwargs)
+
+    def _get_weights_iterator(self, source):
+        path = str(source.model_or_path)
+        m = self._manifest_for(path)
+        uri = self._uri_for(path)
+        client = self._client(uri)
+        rd = self._reader(client)
+        keep = filters.keep_predicate(
+            self._racer_model,
+            self.racer.role,
+            compat.source_is_unused(source),
+            getattr(self, "local_expert_ids", None),
+        )
+        prefix = getattr(source, "prefix", "") or ""
+        files = {f.name: f for f in mf.safetensors_files(m)}
+        jobs, hashers = [], {}
+        for name in self._encoder_only_filter(path, m, self._weight_names(path, m)):
+            sf = files[name]
+            entry = mf.file_entry(m, name)
+            etag = self._etag(client, uri, entry, self._pin(path, name))
+            req = uri.request(name)
+            reads = plan(name, sf.tensors, keep, self.racer.staging_bytes, file_size=sf.size)
+            if self.racer.verify == "full":
+                hashers[name] = self._full_hasher(client, req, sf, reads)
+            jobs += [(req, r, etag) for r in reads]
+            self._racer_stats["files"] += 1
+
+        def on_data(read, mv):
+            h = hashers.get(read.file)
+            if h is not None:
+                h(read, mv)
+
+        for name, tensor in rd.iter(jobs, on_data if hashers else None):
+            yield prefix + name, tensor
+        if hashers and rd.pool.allocator.kind != reader.HOST and not self._racer_full_note:
+            self._racer_full_note = True
+            log.info("racer: verify=full hashes data only for host delivery; GPU reads were not hashed")
+
+    def _encoder_only_filter(self, path: str, m: dict, names: list) -> list:
+        """vLLM's --mm-encoder-only shard filter, applied to the manifest's file list."""
+        prefixes = getattr(self, "_encoder_only_lm_prefixes", None)
+        index = m.get("index")
+        if prefixes is None or not index or path.startswith(SCHEME):
+            return names
+        fn = compat.mm_encoder_only_filter()
+        if fn is None:
+            return names
+        kept = fn(names, path, index, prefixes, weights_mapper=getattr(self, "_encoder_only_weights_mapper", None))
+        if not kept:
+            raise RuntimeError(f"racer loader: the mm-encoder-only filter removed every weight file of {path}")
+        return list(kept)
+
+    def _full_hasher(self, client, req, sf, reads):
+        """sha256 over the whole file when the reads cover it contiguously, else None."""
+        import hashlib
+
+        data_start = 8 + sf.header_bytes
+        pos = data_start
+        for r in reads:
+            if r.offset > pos:
+                return None
+            pos = max(pos, r.end)
+        if pos < sf.size:
+            return None
+        h = hashlib.sha256(client.read(req, 0, data_start))
+        state = {"pos": data_start}
+
+        def update(read, mv):
+            skip = state["pos"] - read.offset
+            if skip < 0:
+                return
+            if skip < read.length:
+                h.update(mv[skip:])
+                state["pos"] = read.end
+            if state["pos"] == sf.size:
+                got = h.hexdigest()
+                if got != sf.sha256:
+                    raise mf.ManifestError(f"{sf.name}: sha256 mismatch: manifest has {sf.sha256}, data has {got}")
+
+        return update
+
+    def _vllm_version(self) -> str:
+        try:
+            return compat.vllm_version()
+        except compat.VllmMissing:
+            return "unknown"
+
+    def _fingerprint(self, model, model_config) -> tuple:
+        path = str(model_config.model)
+        digest = mf.digest(self._manifest_for(path))
+        par = sh.parallel_info()
+        fp = sh.fingerprint(
+            model, self.racer.role, digest, self._vllm_version(), model_config=model_config, parallel=par
+        )
+        return fp, digest, par
+
+    def load_weights(self, model, model_config):
+        """Load from a matching sharded artifact or the checkpoint, then capture if asked.
+
+        vLLM's load_model calls this between creating the model and
+        process_weights_after_loading, so a capture here holds the weights as
+        the model's weight loaders left them, before any kernel repacking.
+        """
+        started = time.monotonic()
+        self._racer_model = model
+        self._racer_primary = str(model_config.model)
+        rank = 0
+        try:
+            done = False
+            if self.racer.sharded != "off" and not self.racer.capture_dir:
+                fp, _, par = self._fingerprint(model, model_config)
+                rank = par["rank"]
+                uri = self._uri_for(self._racer_primary)
+                client = self._client(uri)
+                done = sh.load_sharded(
+                    client,
+                    uri,
+                    model,
+                    rank,
+                    self.racer.role,
+                    fp,
+                    lambda: self._reader(client),
+                    require=self.racer.sharded == "require",
+                )
+            if not done:
+                super().load_weights(model, model_config)
+        finally:
+            for r in self._racer_readers.values():
+                r.pool.close()
+            self._racer_readers.clear()
+            for c in self._racer_clients.values():
+                close = getattr(c, "close", None)
+                if close is not None:
+                    close()
+            self._racer_clients.clear()
+        log.info("%s", summary(self.racer.role, rank, self._racer_stats, time.monotonic() - started))
+        if self.racer.capture_dir:
+            self._capture(model, model_config)
+
+    def _capture(self, model, model_config) -> None:
+        fp, digest, par = self._fingerprint(model, model_config)
+        path = sh.capture(
+            model,
+            self.racer.role,
+            self.racer.capture_dir,
+            fingerprint=fp,
+            rank=par["rank"],
+            world_size=par["world_size"],
+            source_manifest_sha256=digest,
+        )
+        log.info("racer: captured %s", path)
+        if os.environ.get(CAPTURE_EXIT_ENV) == "1":
+            raise CaptureComplete(path)
+
+
+_built: dict = {}
+
+
+def build(base):
+    """Return RacerModelLoader as a subclass of base (vLLM's DefaultModelLoader)."""
+    cls = _built.get(base)
+    if cls is not None:
+        return cls
+
+    def __init__(self, load_config, *args, **kwargs):
+        base.__init__(self, load_config, *args, **kwargs)
+        self._racer_init(load_config)
+
+    cls = type("RacerModelLoader", (RacerLoaderMixin, base), {"__init__": __init__, "__module__": __name__})
+    _built[base] = cls
+    return cls
+
+
+def loader_class():
+    return build(compat.default_model_loader())
