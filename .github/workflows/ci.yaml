@@ -573,6 +573,14 @@ jobs:
         if: matrix.kernels
         run: RACER_GPU_REQUIRE_PTX=1 timeout --signal=TERM --kill-after=10s 300s sh images/racer/build-native-cuda.sh cmd/racer/gpu/native bin/racer-gpu-native/libracer_gpu_cuda.so.1
 
+      - name: Require embedded kernel images in CUDA shim
+        if: matrix.kernels
+        run: |
+          syms=$(nm -a bin/racer-gpu-native/libracer_gpu_cuda.so.1)
+          for sym in racer_gpu_ptx_image racer_gpu_cubin_sm90 racer_gpu_cubin_sm100; do
+            printf '%s\n' "$syms" | grep -qw "$sym" || { echo "missing embedded image $sym" >&2; exit 1; }
+          done
+
       - name: Compile CUDA shim without kernels (not hardware validation)
         if: matrix.native && !matrix.kernels
         run: timeout --signal=TERM --kill-after=10s 300s sh images/racer/build-native-cuda.sh cmd/racer/gpu/native bin/racer-gpu-native/libracer_gpu_cuda.so.1

@@ -32,7 +32,9 @@
 #include <unistd.h>
 
 /* Embed a kernel image under `sym`. PTX is NUL terminated as cuModuleLoadData
- * requires; cubins are ELF and get the same trailing byte harmlessly. */
+ * requires; cubins are ELF and get the same trailing byte harmlessly. The
+ * image starts its own section, and .balign 16 raises that section's
+ * alignment (sh_addralign) to 16, so `sym` is 16-byte aligned. */
 #define RACER_EMBED(sym, path)                                   \
     __asm__(".section .rodata." #sym ",\"a\"\n"                 \
             ".balign 16\n"                                       \
@@ -335,31 +337,59 @@ static int kernels(struct gpu_context *c) {
 }
 
 /* Load the best kernel image for the device into c->module: the matching
- * cubin, else the PTX. A cubin that fails to load falls back to the PTX. */
-static int load_module(struct gpu_context *c) {
-    int major = -1, minor = -1;
-    if (cu.cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, c->dev) ||
-        cu.cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, c->dev))
-        major = minor = -1;
+ * cubin, else the PTX. A cubin that fails to load falls back to the PTX, and
+ * its CUresult stays in last_error when the PTX then loads. With ptx_only
+ * set, only the PTX is tried. *used_cubin reports which image was loaded. */
+static int load_module(struct gpu_context *c, int ptx_only, int *used_cubin) {
+    *used_cubin = 0;
     const char *cubin = NULL;
-    switch (racer_kernel_select(major, minor, HAVE_SM90, HAVE_SM100)) {
-    case RACER_KERNEL_IMAGE_SM90: cubin = SM90_IMAGE; break;
-    case RACER_KERNEL_IMAGE_SM100: cubin = SM100_IMAGE; break;
-    default: break;
+    if (!ptx_only) {
+        int major = -1, minor = -1;
+        if (cu.cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, c->dev) ||
+            cu.cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, c->dev))
+            major = minor = -1;
+        switch (racer_kernel_select(major, minor, HAVE_SM90, HAVE_SM100)) {
+        case RACER_KERNEL_IMAGE_SM90: cubin = SM90_IMAGE; break;
+        case RACER_KERNEL_IMAGE_SM100: cubin = SM100_IMAGE; break;
+        default: break;
+        }
     }
-    if (cubin && cu.cuModuleLoadData(&c->module, cubin) == CUDA_SUCCESS) return 0;
+    if (cubin && drv(cu.cuModuleLoadData(&c->module, cubin)) == RACER_GPU_OK) {
+        *used_cubin = 1;
+        return 0;
+    }
     const char *ptx = PTX_IMAGE;
     if (!ptx) return -1;
     return drv(cu.cuModuleLoadData(&c->module, ptx)) ? -1 : 0;
 }
 
+/* Resolve the three kernels in c->module; nonzero on failure. */
+static int resolve_kernels(struct gpu_context *c) {
+    return drv(cu.cuModuleGetFunction(&c->partials, c->module, "racer_gcm_partials")) ||
+           drv(cu.cuModuleGetFunction(&c->finalize, c->module, "racer_gcm_finalize")) ||
+           drv(cu.cuModuleGetFunction(&c->ctr, c->module, "racer_gcm_ctr"));
+}
+
 static int kernels_locked(struct gpu_context *c) {
     if (c->module_state == 0) {
         c->module_state = -1;
-        if (load_module(c)) return RACER_GPU_ENOKERNEL;
-        if (drv(cu.cuModuleGetFunction(&c->partials, c->module, "racer_gcm_partials")) ||
-            drv(cu.cuModuleGetFunction(&c->finalize, c->module, "racer_gcm_finalize")) ||
-            drv(cu.cuModuleGetFunction(&c->ctr, c->module, "racer_gcm_ctr"))) {
+        int used_cubin = 0;
+        if (load_module(c, 0, &used_cubin)) return RACER_GPU_ENOKERNEL;
+        int failed = resolve_kernels(c);
+        if (failed && used_cubin) {
+            /* With lazy loading a bad cubin can surface at function
+             * resolution rather than load: retry once with the PTX, keeping
+             * the cubin's CUresult in last_error if the PTX works. */
+            int32_t cubin_error = last_error;
+            if (drv(cu.cuModuleUnload(c->module))) {
+                c->module_state = 1; /* still loaded; free retries */
+                return RACER_GPU_ENOKERNEL;
+            }
+            if (load_module(c, 1, &used_cubin)) return RACER_GPU_ENOKERNEL;
+            failed = resolve_kernels(c);
+            if (!failed) last_error = cubin_error;
+        }
+        if (failed) {
             /* Keep it as loaded (state 1) if unload fails so free retries. */
             if (drv(cu.cuModuleUnload(c->module))) c->module_state = 1;
             return RACER_GPU_ENOKERNEL;
