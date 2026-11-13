@@ -235,9 +235,33 @@ impl Availability {
         self.with_cache(cache, |c| c.map(|c| c.mode).unwrap_or_default())
     }
 
+    /// Published write settings of this cache, when it accepts writes.
+    pub fn writes(&self, cache: &CacheId) -> Option<racer_wire::control::WriteDefinition> {
+        self.with_cache(cache, |c| c.and_then(|c| c.writes().cloned()))
+    }
+
     /// Whether this cache retains no pages or metadata.
     pub fn passthrough(&self, cache: &CacheId) -> bool {
         self.mode(cache).passthrough()
+    }
+
+    /// Whether this cache is published with a native (in-process) origin,
+    /// the only origin writes upload to and check for create-once.
+    pub fn native_origin(&self, cache: &CacheId) -> bool {
+        self.with_cache(cache, |c| c.is_some_and(|c| c.origin.is_some()))
+    }
+
+    /// Run `f` over the Azure container of this cache's native origin, if it
+    /// has one. Writes check `Racer-Metadata` against it before accepting.
+    pub fn with_origin_container<R>(
+        &self,
+        cache: &CacheId,
+        f: impl FnOnce(&str) -> R,
+    ) -> Option<R> {
+        self.with_cache(cache, |c| {
+            c.and_then(|c| c.origin.as_ref())
+                .map(|o| f(o.azure.container_url.container()))
+        })
     }
 
     /// Require both cache admission and an active page key for metadata reads.
@@ -249,6 +273,15 @@ impl Availability {
     /// added or retired. Retention sweeps restart when it changes.
     pub fn key_generation(&self) -> Option<u64> {
         self.keys.generation().ok().flatten()
+    }
+
+    /// ID of the active page key of `cache`, the key new pages are sealed
+    /// under; `None` without one.
+    pub fn active_page_key(&self, cache: &CacheId) -> Option<KeyId> {
+        self.keys
+            .active(cache, KeyPurpose::Page)
+            .ok()
+            .map(|lease| lease.id())
     }
 
     /// Require cache admission and the exact key needed by a stored page.
@@ -393,6 +426,7 @@ impl Availability {
                             priority: racer_wire::control::DEFAULT_PRIORITY,
                             mode,
                             origin: None,
+                            writes: None,
                         }
                     })
                     .collect(),
@@ -3361,6 +3395,7 @@ mod caches_tests {
             priority,
             mode: racer_wire::control::CacheMode::default(),
             origin: None,
+            writes: None,
         }
     }
 

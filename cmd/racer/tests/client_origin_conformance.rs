@@ -769,6 +769,7 @@ fn raw_uds_client_empty_bootstrap_and_head_success_writer() {
                     expires_at: ExpiresAt::from_system_time(UNIX_EPOCH).unwrap(),
                 },
                 payload: ReadPayload::Empty,
+                upload_state: None,
             };
             let responses = rig.responses();
             responses.validate(&kind, &response).unwrap();
@@ -1525,6 +1526,7 @@ fn raw_uds_sequential_requests_do_not_inherit_opaque_context() {
                     expires_at: ExpiresAt::from_system_time(UNIX_EPOCH).unwrap(),
                 },
                 payload: ReadPayload::Empty,
+                upload_state: None,
             };
             connection = rig
                 .responses()

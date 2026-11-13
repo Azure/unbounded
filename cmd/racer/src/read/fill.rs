@@ -136,8 +136,8 @@ use racer_core::read::LeaderSource;
 pub(super) use racer_core::read::optional_headroom;
 #[derive(Clone)]
 pub struct Fill {
-    pub(super) dependencies: FillDependencies,
-    pub(super) metrics: Metrics,
+    pub(crate) dependencies: FillDependencies,
+    pub(crate) metrics: Metrics,
     pub(super) local_copies: Rc<LocalCopies>,
     pub(super) local_plaintext: Rc<LocalPlaintext>,
     local_plaintext_keys: Rc<LocalPlaintextKeys>,
@@ -228,6 +228,15 @@ impl Fill {
         self.dependencies.memory.availability().mode(cache)
     }
 
+    /// Whether `cache` is published with writes enabled.
+    pub(crate) fn writes(&self, cache: &racer_wire::control::CacheId) -> bool {
+        self.dependencies
+            .memory
+            .availability()
+            .writes(cache)
+            .is_some()
+    }
+
     /// Whether `cache` retains no pages or metadata on this node.
     pub(crate) fn passthrough(&self, cache: &racer_wire::control::CacheId) -> bool {
         self.mode(cache).passthrough()
@@ -252,7 +261,7 @@ impl Fill {
         }
     }
 
-    pub(super) async fn warm_local(
+    pub(crate) async fn warm_local(
         &self,
         page: &PageId,
         scope: &RequestScope,
@@ -2211,6 +2220,12 @@ impl Fill {
     ) -> Operation<'a, Option<(ObjectMetadata, CiphertextPage)>> {
         Box::pin(async move {
             scope.check()?;
+            // A page a local writer staged is served to its store targets
+            // before any cache lookup: it is in no cache yet.
+            if let Some(copy) = self.dependencies.metadata_owner.write_staging.get(page) {
+                validate_copy(&copy, page, self.page_size()?)?;
+                return Ok(Some((copy.metadata, copy.ciphertext)));
+            }
             // A passthrough page can only be shared while it is in flight.
             let retained = !self.passthrough(&page.version.object.cache);
             if retained
@@ -2731,7 +2746,7 @@ impl Fill {
                     scope.check()?;
                     // Peer reception owns its ciphertext allocation. Reserve encryption
                     // output only when this candidate actually needs an origin fill.
-                    let ciphertext = self.observe_reservation(
+                    let mut ciphertext = Some(self.observe_reservation(
                         scope,
                         page,
                         FillAdmissionSite::OriginCiphertext,
@@ -2742,7 +2757,7 @@ impl Fill {
                                 self.page_plaintext_bytes()? + 16,
                             )
                         },
-                    )?;
+                    )?);
                     let plaintext = match plaintext.take() {
                         Some(reserved) => reserved,
                         None => self.observe_reservation(
@@ -2752,15 +2767,21 @@ impl Fill {
                             || self.reserve_bootstrap(&context.object.cache),
                         )?,
                     };
-                    match self
+                    let origin = self
                         .call(
                             DriverStage::OriginCall,
                             self.dependencies
                                 .origin
                                 .page_reserved(authority, context, page, plaintext, scope),
                         )
-                        .await
-                    {
+                        .await;
+                    if origin.is_err() {
+                        // Release the unused encryption output before any
+                        // copy-only fallback: peer reception reserves its own
+                        // page from the same Ciphertext budget.
+                        ciphertext = None;
+                    }
+                    match origin {
                         Ok(origin) => {
                             // An owner after rank 0 holds a copy rank 0 may not know of: offer it
                             // later. The authority's owners: a walk that refreshed its membership
@@ -2774,10 +2795,37 @@ impl Fill {
                                 self.metrics.record(Event::OrphanNotice, 1);
                             }
                             acquired = Some(
-                                self.encrypt_origin_page(page, origin, ciphertext, scope)
-                                    .await?
-                                    .into(),
+                                self.encrypt_origin_page(
+                                    page,
+                                    origin,
+                                    ciphertext.take().expect("origin encryption reservation"),
+                                    scope,
+                                )
+                                .await?
+                                .into(),
                             );
+                            AcqInput::Origin { id, result: Ok(()) }
+                        }
+                        // Whatever the origin says about a written object it
+                        // does not know yet (a miss, a version mismatch, or a
+                        // gateway error), another owner may hold the page.
+                        Err(error)
+                            if !matches!(error, Error::OriginRejected | Error::OriginForbidden)
+                                && self.writes(&context.object.cache)
+                                && let Some(copy) = policy
+                                    .written_copy(
+                                        authority,
+                                        context,
+                                        &PeerOperation::Page {
+                                            page: page.clone(),
+                                            mode: FetchMode::CopyOnly,
+                                        },
+                                        scope,
+                                        &mut |response| peer_page(response, None),
+                                    )
+                                    .await? =>
+                        {
+                            acquired = Some(copy);
                             AcqInput::Origin { id, result: Ok(()) }
                         }
                         Err(error) => {

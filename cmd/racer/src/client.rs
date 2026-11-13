@@ -1106,12 +1106,29 @@ impl Responses {
     /// Send a final error head with a bounded grace period for an expired request.
     pub fn send_error<'a>(
         &'a self,
-        mut connection: ConnectionLease,
+        connection: ConnectionLease,
         error: Error,
         scope: &'a RequestScope,
     ) -> Operation<'a, ConnectionLease> {
+        self.send_error_with_allow(
+            connection,
+            error,
+            racer_wire::object::client::READ_ALLOW,
+            scope,
+        )
+    }
+
+    /// [`Self::send_error`] whose `405` advertises `allow`, from
+    /// [`racer_wire::object::client::allowed_methods`] for the request path.
+    pub fn send_error_with_allow<'a>(
+        &'a self,
+        mut connection: ConnectionLease,
+        error: Error,
+        allow: &'static str,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, ConnectionLease> {
         Box::pin(async move {
-            let mut head = error_head(error)?;
+            let mut head = error_head_with_allow(error, allow)?;
             head.headers.push(header("Connection", "close"));
             connection.poison();
             // A failed operation's expired scope cannot write its own 503. Allow
@@ -1212,7 +1229,10 @@ impl Responses {
             if !matches!(&response.payload, ReadPayload::Empty) {
                 return Err(Error::BadGateway);
             }
-            let head = racer_wire::object::client::success_head(&response.metadata, None)?;
+            let head = racer_wire::object::write::success_head_with_upload(
+                &response.metadata,
+                response.upload_state,
+            )?;
             connection = self.io.send_head(connection, head, scope).await?.connection;
             connection.finish_exchange()?;
             if let Some(observation) = observation.as_mut() {
@@ -1251,7 +1271,13 @@ fn header(name: &str, value: impl AsRef<[u8]>) -> Header {
 }
 
 /// Map acquisition and validation errors to the SDK's HTTP response contract.
+#[cfg(test)]
 fn error_head(error: Error) -> Result<MessageHead> {
+    error_head_with_allow(error, racer_wire::object::client::READ_ALLOW)
+}
+
+/// [`error_head`] whose `405` advertises `allow`.
+fn error_head_with_allow(error: Error, allow: &str) -> Result<MessageHead> {
     let status = match error {
         Error::InvalidRequest | Error::InvalidRange => 400,
         Error::NotImplemented => 501,
@@ -1276,7 +1302,7 @@ fn error_head(error: Error) -> Result<MessageHead> {
         Error::UnsatisfiableRangeWithLength(length) => Some(length),
         _ => None,
     };
-    racer_wire::object::client::error_head(status, length).map_err(Into::into)
+    racer_wire::object::client::error_head_with_allow(status, length, allow).map_err(Into::into)
 }
 
 /// Encode metadata-only success headers using the shared wire contract.

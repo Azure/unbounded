@@ -291,6 +291,10 @@ struct SegmentMeta {
 
     writes: u32,
 
+    /// Live written (not yet uploaded) records the caller keeps in this
+    /// segment; see [`DiskIndex::pin_segment`].
+    pinned: u32,
+
     heat: u32,
 }
 
@@ -804,12 +808,38 @@ impl DiskIndex {
         ticket: PageTicket,
         length: usize,
     ) -> std::result::Result<(SegmentLease, Writing), (PageTicket, Error)> {
+        self.append_in(segments, ticket, length, false)
+    }
+
+    /// [`Self::append`] into the dedicated written-record tail
+    /// ([`Segments::append_written`]).
+    pub fn append_written(
+        &mut self,
+        segments: &Segments,
+        ticket: PageTicket,
+        length: usize,
+    ) -> std::result::Result<(SegmentLease, Writing), (PageTicket, Error)> {
+        self.append_in(segments, ticket, length, true)
+    }
+
+    fn append_in(
+        &mut self,
+        segments: &Segments,
+        ticket: PageTicket,
+        length: usize,
+        written: bool,
+    ) -> std::result::Result<(SegmentLease, Writing), (PageTicket, Error)> {
         // Check before appending: a lease dropped on this error path would
         // strand its extent until the segment is recycled.
         if segments.count() > self.segments.len() {
             return Err((ticket, Error::InvalidConfiguration));
         }
-        let (lease, extent) = match segments.append(length) {
+        let appended = if written {
+            segments.append_written(length)
+        } else {
+            segments.append(length)
+        };
+        let (lease, extent) = match appended {
             Ok(appended) => appended,
             Err(error) => return Err((ticket, error)),
         };
@@ -1150,11 +1180,44 @@ impl DiskIndex {
             .is_some_and(|meta| meta.writes == 0)
     }
 
-    /// Whether `segment` may be evicted: no write in flight and no held record.
+    /// Whether `segment` may be evicted: no write in flight, no held record,
+    /// and no pin.
     pub fn can_evict(&self, segment: SegmentId) -> bool {
         self.segments
             .get(segment.0 as usize)
-            .is_some_and(|meta| meta.writes == 0 && meta.held == 0)
+            .is_some_and(|meta| meta.writes == 0 && meta.held == 0 && meta.pinned == 0)
+    }
+
+    /// Keep `segment` from eviction until a matching [`Self::unpin_segment`].
+    /// Pins count live written records; they are independent of stored
+    /// entries, so a pinned segment stays even after its entries are removed.
+    pub fn pin_segment(&mut self, segment: SegmentId) -> Result<()> {
+        let meta = self
+            .segments
+            .get_mut(segment.0 as usize)
+            .ok_or(Error::InvalidConfiguration)?;
+        meta.pinned = meta.pinned.checked_add(1).ok_or(Error::Busy)?;
+        Ok(())
+    }
+
+    /// Drop one pin of `segment`. `InvalidConfiguration` if it has none.
+    pub fn unpin_segment(&mut self, segment: SegmentId) -> Result<()> {
+        let meta = self
+            .segments
+            .get_mut(segment.0 as usize)
+            .ok_or(Error::InvalidConfiguration)?;
+        meta.pinned = meta
+            .pinned
+            .checked_sub(1)
+            .ok_or(Error::InvalidConfiguration)?;
+        Ok(())
+    }
+
+    /// Pins on `segment`.
+    pub fn segment_pins(&self, segment: SegmentId) -> u32 {
+        self.segments
+            .get(segment.0 as usize)
+            .map_or(0, |meta| meta.pinned)
     }
 
     /// Stored entries in `segment`, most recently stored first. Callers bound
@@ -1624,6 +1687,55 @@ mod tests {
         assert_eq!(index.reserve(PageSlot(4), old).unwrap_err(), Error::Stale);
         assert_eq!(index.remove_cache(old, 1, |_, _| {}), Err(Error::Stale));
         write(&mut index, &segments, 4, new, 512).unwrap();
+        index.check_invariants();
+    }
+
+    #[test]
+    fn pins_block_eviction_and_written_records_use_a_dedicated_segment() {
+        let segments = segments(4);
+        let mut index = DiskIndex::new(8, 8, 4).unwrap();
+        let cache = index.add_cache(CacheIdx(0)).unwrap();
+        write(&mut index, &segments, 0, cache, 512).unwrap();
+        let cached = index.get(PageSlot(0)).unwrap().location.segment();
+        let ticket = index.reserve(PageSlot(1), cache).unwrap();
+        let (lease, writing) = index.append_written(&segments, ticket, 512).unwrap();
+        let written = writing.location().segment();
+        assert_ne!(
+            written, cached,
+            "written records never share a cache segment"
+        );
+        assert_eq!(segments.state(written).unwrap(), SegmentState::Sealed);
+        assert!(!index.can_evict(written), "write in flight");
+        let done = index.write_complete(writing);
+        drop(lease);
+        index.publish(done).unwrap();
+        index.pin_segment(written).unwrap();
+        assert_eq!(index.segment_pins(written), 1);
+        assert!(!index.can_evict(written));
+        assert!(index.can_reclaim(written));
+        // The clock skips the pinned segment even when it is the only candidate.
+        index.remove(PageSlot(0)).unwrap();
+        segments.seal_open();
+        let budget = ReclaimBudget {
+            free_reserve: 4,
+            max_visits: 64,
+            max_entries: 64,
+        };
+        let _ = index.reclaim(&segments, budget, |_, _| {});
+        assert!(index.get(PageSlot(1)).is_some(), "pinned record survives");
+        assert_eq!(segments.state(written).unwrap(), SegmentState::Sealed);
+        index.unpin_segment(written).unwrap();
+        assert_eq!(
+            index.unpin_segment(written),
+            Err(Error::InvalidConfiguration)
+        );
+        assert_eq!(
+            index.pin_segment(SegmentId(99)),
+            Err(Error::InvalidConfiguration)
+        );
+        assert!(index.can_evict(written));
+        let _ = index.reclaim(&segments, budget, |_, _| {});
+        assert!(index.get(PageSlot(1)).is_none(), "unpinned records evict");
         index.check_invariants();
     }
 

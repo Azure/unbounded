@@ -985,11 +985,76 @@ async fn serve_connection(
                 )
                 .await;
             }
+            // Writes on a cache with writes enabled have their own route and
+            // close the connection; other caches keep the read parser's 405.
+            Ok(request) if crate::write::client::routes(reads, cache, &request.head) => {
+                let head = request.head;
+                let received = request.descriptors;
+                let descriptors = if received.truncated {
+                    Vec::new()
+                } else {
+                    received.descriptors
+                };
+                let outcome = crate::write::client::serve(
+                    connection,
+                    head,
+                    descriptors,
+                    cache,
+                    parser.header_limit(),
+                    reads,
+                    io,
+                    timeout,
+                    cancellation.clone(),
+                )
+                .await?;
+                // A `201` or `204` is a successful client request, not an
+                // error; failures keep a reason like a read's.
+                match outcome {
+                    outcome if outcome.succeeded() => observation.success(),
+                    crate::write::metrics::Outcome::Unavailable => {
+                        observation.fail(Error::Unavailable)
+                    }
+                    _ => {}
+                }
+                return Ok(());
+            }
+            // A cache without writes answers every write route like a node
+            // that predates writes: 405 with `Allow: HEAD, POST`.
+            Ok(request) if racer_wire::object::write::is_write(&request.head) => {
+                drop(request.descriptors);
+                observation.fail(Error::MethodNotAllowed);
+                responses
+                    .send_error(connection, Error::MethodNotAllowed, scope)
+                    .await?;
+                return Ok(());
+            }
+            // Any other method on a write-only subresource of a cache with
+            // writes: 405 naming the one method it accepts.
+            Ok(request)
+                if racer_wire::object::write::is_write_subresource(&request.head)
+                    && crate::write::client::writes_enabled(reads, cache) =>
+            {
+                drop(request.descriptors);
+                observation.fail(Error::MethodNotAllowed);
+                responses
+                    .send_error_with_allow(connection, Error::MethodNotAllowed, "POST", scope)
+                    .await?;
+                return Ok(());
+            }
             other => other,
         };
         // Every descriptor must be claimed by a direct read; the rest close here.
         let mut gpu_read = false;
+        // A `405` lists what this path accepts, which depends on whether the
+        // cache serves writes; see `allowed_methods`.
+        let mut allow = racer_wire::object::client::READ_ALLOW;
         let parsed = value.and_then(|received| {
+            if let http1::StartLine::Request { target, .. } = &received.head.start {
+                allow = racer_wire::object::client::allowed_methods(
+                    target,
+                    crate::write::client::writes_enabled(reads, cache),
+                );
+            }
             let request = parser.parse(cache, received.head)?;
             gpu_read = matches!(request.kind, crate::client::ReadKind::GpuRead { .. });
             Ok((request, received.descriptors))
@@ -1021,7 +1086,9 @@ async fn serve_connection(
             Ok(parsed) => parsed,
             Err(error) => {
                 observation.fail(error);
-                responses.send_error(connection, error, scope).await?;
+                responses
+                    .send_error_with_allow(connection, error, allow, scope)
+                    .await?;
                 return Ok(());
             }
         };
@@ -1091,7 +1158,7 @@ async fn serve_connection(
     }
 }
 
-pub(super) fn new_scope(
+pub(crate) fn new_scope(
     ctx: &racer_io::WorkerCtx,
     timeout: Duration,
     cancellation: Cancellation,
@@ -1610,7 +1677,7 @@ fn temporary_name(name: &str) -> bool {
 /// priority- or mode-only change must not replace the socket or consume a
 /// retirement slot. The same holds for the origin definition, which only
 /// selects where fills read from. A reused listener keeps its original
-/// priority, mode, and origin, which listener code never reads.
+/// priority, mode, origin, and writes, which listener code never reads.
 pub(super) fn same_endpoint(current: &CacheDefinition, next: &CacheDefinition) -> bool {
     let CacheDefinition {
         id,
@@ -1620,6 +1687,7 @@ pub(super) fn same_endpoint(current: &CacheDefinition, next: &CacheDefinition) -
         priority: _,
         mode: _,
         origin: _,
+        writes: _,
     } = current;
     *id == next.id
         && *name == next.name

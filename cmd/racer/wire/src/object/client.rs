@@ -535,11 +535,48 @@ pub fn success_head(
     })
 }
 
+/// `Allow` value of a `405` on a cache without writes, or on a node that
+/// predates writes: every object path answers like the read API.
+pub const READ_ALLOW: &str = "HEAD, POST";
+
+/// `Allow` value of a `405` on `/v1/objects/<key>` when the cache enables writes.
+pub const WRITE_ALLOW: &str = "HEAD, POST, PUT, DELETE";
+
+/// The methods a `405` for request target `target` advertises. Without
+/// writes, every path keeps [`READ_ALLOW`] so a write-disabled cache cannot
+/// be told from a node that predates writes. With writes, the answer lists
+/// exactly what that path accepts: `POST` for the `host-read`, `gpu-read`,
+/// `host-write`, and `persist` subresources, and [`WRITE_ALLOW`] for the
+/// object itself.
+pub fn allowed_methods(target: &str, writes: bool) -> &'static str {
+    if !writes {
+        return READ_ALLOW;
+    }
+    let suffix = target
+        .strip_prefix("/v1/objects/")
+        .and_then(|path| path.split_once('/'))
+        .map(|(_, suffix)| suffix);
+    match suffix {
+        Some("host-read" | "gpu-read" | "host-write" | "persist") => "POST",
+        _ => WRITE_ALLOW,
+    }
+}
+
 /// Encode a zero-body error selected by application policy, with required metadata.
 pub fn error_head(status: u16, unsatisfied_length: Option<u64>) -> Result<MessageHead> {
+    error_head_with_allow(status, unsatisfied_length, READ_ALLOW)
+}
+
+/// [`error_head`] with an explicit `Allow` value for a `405`, normally from
+/// [`allowed_methods`].
+pub fn error_head_with_allow(
+    status: u16,
+    unsatisfied_length: Option<u64>,
+    allow: &str,
+) -> Result<MessageHead> {
     let mut headers = vec![header("Content-Length", "0")];
     if status == 405 {
-        headers.push(header("Allow", "HEAD, POST"));
+        headers.push(header("Allow", allow));
     }
     if status == 416 {
         let length = unsatisfied_length

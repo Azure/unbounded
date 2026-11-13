@@ -311,6 +311,8 @@ pub enum Outcome {
     NotFound,
     /// Per-page results of a `prefetch` operation.
     Prefetch,
+    /// A write operation reply (`racer-outcome: write`).
+    Write,
     /// Failure outcomes any hop may report (`unavailable`, `overloaded`, ...).
     Other,
 }
@@ -324,6 +326,7 @@ impl Outcome {
             "selected" => Self::Selected,
             "not-found" => Self::NotFound,
             "prefetch" => Self::Prefetch,
+            "write" => Self::Write,
             _ => Self::Other,
         }
     }
@@ -337,6 +340,11 @@ impl Outcome {
     /// Whether this outcome answers only a `prefetch` operation.
     pub fn is_prefetch(self) -> bool {
         matches!(self, Self::Prefetch)
+    }
+
+    /// Whether this outcome answers only a write operation.
+    pub fn is_write(self) -> bool {
+        matches!(self, Self::Write)
     }
 
     /// Outcomes that must echo the requested operation name.
@@ -714,6 +722,7 @@ mod tests {
             ("selected", true),
             ("not-found", true),
             ("prefetch", true),
+            ("write", true),
             ("held", false),
             ("warmed", false),
             ("released", false),
@@ -726,6 +735,10 @@ mod tests {
         }
         assert!(Outcome::Prefetch.is_prefetch());
         assert!(!Outcome::Page.is_prefetch());
+        assert!(Outcome::Write.is_write());
+        assert!(!Outcome::Write.is_prefetch());
+        assert!(!Outcome::Write.echoes_operation());
+        assert!(!Outcome::Prefetch.is_write());
         assert!(Outcome::Bootstrap.echoes_operation());
         assert!(!Outcome::Selected.echoes_operation());
         assert!(not_found_ok("metadata", "acquire", "fresh"));

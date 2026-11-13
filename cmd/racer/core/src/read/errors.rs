@@ -122,7 +122,8 @@ pub const fn response_error(kind: ResponseKind) -> Option<Error> {
         | ResponseKind::Bootstrap
         | ResponseKind::Page
         | ResponseKind::Metadata
-        | ResponseKind::Prefetch => return None,
+        | ResponseKind::Prefetch
+        | ResponseKind::Write => return None,
         ResponseKind::Miss | ResponseKind::StaleMembership | ResponseKind::Unavailable => {
             Error::Unavailable
         }
@@ -308,6 +309,7 @@ mod tests {
             ResponseKind::Page,
             ResponseKind::Metadata,
             ResponseKind::Prefetch,
+            ResponseKind::Write,
         ] {
             assert_eq!(response_error(kind), None);
         }

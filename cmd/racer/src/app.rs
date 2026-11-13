@@ -1171,6 +1171,9 @@ pub struct WorkerApplication {
 
     slab_directory: std::path::PathBuf,
 
+    /// Write journal size that triggers compaction (`RACER_WRITE_JOURNAL_BYTES`).
+    write_journal_bytes: u64,
+
     prepared_listeners: Rc<std::cell::RefCell<Option<crate::client::listener::PreparedListeners>>>,
 
     /// Caches whose sockets this node binds ([`CachePublication`]).
@@ -1656,11 +1659,13 @@ impl WorkerApplication {
             buffers.clone(),
             node.azure.limits.clone(),
         );
-        let origin: Rc<dyn Origin> = Rc::new(crate::origin::router::OriginRouter::new(
+        let router = Rc::new(crate::origin::router::OriginRouter::new(
             node.publications.clone(),
             adapter,
             Some(azure),
         ));
+        let origin: Rc<dyn Origin> = router.clone();
+        let uploads: Rc<dyn crate::origin::upload::UploadSink> = router;
         let flights = Rc::new(Flights::new(
             admission.clone(),
             availability.clone(),
@@ -1686,6 +1691,12 @@ impl WorkerApplication {
                 admission: admission.clone(),
                 metadata_owner: directory.clone(),
             },
+        );
+        coordinator.writes().configure(
+            config.writes.clone(),
+            Some(uploads),
+            directory.upload_limits.clone(),
+            reactor.clone(),
         );
         let relay = Rc::new(Relay::new(
             paths,
@@ -1835,6 +1846,7 @@ impl WorkerApplication {
             memory,
             caches: Vec::new(),
             slab_directory: config.slab_directory.clone(),
+            write_journal_bytes: config.writes.journal_bytes,
             prepared_listeners: Rc::new(std::cell::RefCell::new(None)),
             served_caches: Rc::new(RefCell::new(None)),
             local: config.node.clone(),
@@ -2257,6 +2269,7 @@ impl WorkerApplication {
             });
         if !self.stopping {
             self.coordinator.poll_offers(now);
+            self.coordinator.writes().poll(&self.coordinator, now);
         }
         stage_result(worker, "checkpoint", self.poll_checkpoint(cx))?;
         stage_result(worker, "ingress", self.poll_ingress(cx, budget))?;
@@ -2813,6 +2826,7 @@ impl crate::lifecycle::Service<RequestScope> for WorkerApplication {
             .next_deadline()
             .into_iter()
             .chain(self.flights.next_deadline())
+            .chain(self.coordinator.writes().next_deadline())
             .chain(
                 self.endpoint
                     .as_ref()

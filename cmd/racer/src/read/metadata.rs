@@ -322,6 +322,17 @@ impl From<Error> for RefreshFailure {
     }
 }
 
+/// Whether an origin `404` under `authority` proves an object of a cache with
+/// writes absent. A written object is known only to its coordinator, page
+/// zero's rank 0, until it uploads: the absence is proven when this node is
+/// rank 0 or rank 0 answered that it holds no copy. A rank 0 skipped as
+/// silent or unreachable (stale link health after churn) proves nothing.
+fn absence_is_authoritative(authority: &super::candidates::OriginAuthority) -> bool {
+    authority.rank() == 0
+        || authority.predecessor_evidence().first()
+            == Some(&racer_core::read::ProbeOutcome::CopyMiss)
+}
+
 fn caller_budget_failure(error: Error, budget: &AcquisitionBudget) -> bool {
     // Rejections are classified separately by RefreshFailure; for the rest,
     // racer-core's settlement rule decides whether another waiter retries.
@@ -358,6 +369,11 @@ pub struct MetadataService {
     deadlines: Rc<IngressDeadlines>,
 
     clock: Rc<RefCell<Clock>>,
+
+    /// Written objects this worker coordinates or replicates. A fresh
+    /// refresh serves them before asking peers or the origin, which does
+    /// not know an object until its upload commits.
+    writes: Rc<crate::write::Directory>,
 }
 
 impl MetadataService {
@@ -400,7 +416,13 @@ impl MetadataService {
             refreshes: Rc::new(RefreshTable::new(capacity, at)),
             deadlines: Rc::new(IngressDeadlines::default()),
             clock: Rc::new(RefCell::new(Clock::default())),
+            writes: Rc::default(),
         }
+    }
+
+    /// The write directory a fresh refresh consults first.
+    pub(crate) fn write_directory(&self) -> &Rc<crate::write::Directory> {
+        &self.writes
     }
 
     /// Wake actual ingress children, including those parked in FuturesUnordered.
@@ -475,7 +497,10 @@ impl MetadataService {
         bounded_scope.deadline.0 = scope.deadline.0.min(budget.deadline());
         let scope = &bounded_scope;
         scope.check()?;
-        if let Some(metadata) = self.copy_only(purpose.selector(), context, scope).await? {
+        if let Some(metadata) = self
+            .copy_only(purpose.selector(), context, &membership, scope)
+            .await?
+        {
             return Ok(RefreshOutput {
                 metadata,
                 page: None,
@@ -609,6 +634,35 @@ impl MetadataService {
         scope.check()?;
         self.observe_clock()?;
         let clock_epoch = self.clock.borrow().inner.epoch();
+        // A restored written session not yet checked for a delete it may
+        // have missed: neither serve it nor let the origin's miss stand.
+        if self.writes.unconfirmed(&context.object) {
+            return Err(Error::Unavailable.into());
+        }
+        // A written object this worker coordinates is current until it is
+        // deleted, expires, or uploads; the origin does not know it yet.
+        if let Some(metadata) = self
+            .writes
+            .current_role(&context.object, self.candidates.ctx().clock.wall_now())
+            .filter(|(_, role)| self.serves_written(*role, &membership, &context.object))
+            .map(|(metadata, _)| metadata)
+            && match &purpose {
+                RefreshPurpose::Pinned(etag) => *etag == metadata.version.etag,
+                _ => true,
+            }
+        {
+            if !matches!(purpose, RefreshPurpose::Pinned(_))
+                && self.clock.borrow().inner.epoch() == clock_epoch
+            {
+                self.storage.index.publish_current(metadata.clone())?;
+            } else {
+                self.storage.index.publish_version(metadata.immutable())?;
+            }
+            return Ok(RefreshOutput {
+                metadata,
+                page: None,
+            });
+        }
         let mode = self.storage.fill.mode(&context.object.cache);
         let resolution = if mode == racer_wire::control::CacheMode::PassthroughLocal {
             // The local route asks this node's own origin and never a peer.
@@ -665,15 +719,47 @@ impl MetadataService {
                 }
                 PeerResponse::Page { .. }
                 | PeerResponse::Selected { .. }
-                | PeerResponse::Prefetch(_) => {
+                | PeerResponse::Prefetch(_)
+                | PeerResponse::Write(_) => {
                     return Err(Error::CorruptRecord.into());
                 }
                 PeerResponse::StaleMembership => return Err(Error::IncompatibleMembership.into()),
             },
             CandidateResolution::Origin(authority) => {
-                let output = self
-                    .refresh_origin(&authority, &purpose, membership, context, scope, budget)
-                    .await?;
+                let output = match self
+                    .refresh_origin(
+                        &authority,
+                        &purpose,
+                        membership.clone(),
+                        context,
+                        scope,
+                        budget,
+                    )
+                    .await
+                {
+                    Err(RefreshFailure::Terminal(Error::NotFound))
+                        if self.storage.fill.writes(&context.object.cache) =>
+                    {
+                        if !absence_is_authoritative(&authority) {
+                            // The origin does not know a written object
+                            // until it uploads, and only page zero's rank 0
+                            // coordinates writes. Without its answer the
+                            // object may exist: retryable, not 404.
+                            return Err(Error::Unavailable.into());
+                        }
+                        // Rank 0 may have joined (or been promoted) before
+                        // rebalance handed it the manifest: ask the page-zero
+                        // owners of the membership it replaced.
+                        let metadata = self
+                            .written_elsewhere(&purpose, &membership, context, scope)
+                            .await?;
+                        RefreshOutput {
+                            metadata,
+                            page: None,
+                        }
+                    }
+                    result => result?,
+                };
                 bootstrap_page = output.page;
                 output.metadata
             }
@@ -780,6 +866,96 @@ impl MetadataService {
         })
     }
 
+    /// After an origin `404` for a cache with writes, ask the other page-zero
+    /// owners, current and of the recently replaced membership, for a written
+    /// object's metadata. A member that joins as (or is promoted to) page
+    /// zero's rank 0 lacks the manifest until rebalance copies it, so its own
+    /// miss is not proof; a joiner may not know the replaced membership at
+    /// all, but rendezvous ranking only shifts the previous owners down, so
+    /// the current owners include them. Probes are copy-only under the
+    /// current membership: the coordinator always answers, a manifest replica
+    /// only while it is a page-zero member, so a displaced replica cannot
+    /// revive a deleted version. `NotFound` only when every probed owner
+    /// answers a miss; any other answer leaves the read retryable.
+    async fn written_elsewhere(
+        &self,
+        purpose: &RefreshPurpose,
+        membership: &std::sync::Arc<crate::topology::Membership>,
+        context: &OriginContext,
+        scope: &RequestScope,
+    ) -> std::result::Result<ObjectMetadata, RefreshFailure> {
+        let mut owners = self
+            .candidates
+            .candidates_scoped(membership.clone(), &context.object, PageNumber(0), scope)
+            .await?
+            .ordered;
+        if let Some(previous) = self
+            .candidates
+            .recent_previous_owners(membership, &context.object, PageNumber(0), scope)
+            .await?
+        {
+            for node in previous.ordered {
+                if !owners.contains(&node) {
+                    owners.push(node);
+                }
+            }
+        }
+        let selector = purpose.selector();
+        let operation = PeerOperation::Metadata {
+            object: context.object.clone(),
+            selector: selector.clone(),
+            mode: FetchMode::CopyOnly,
+        };
+        let me = self.candidates.local_node().clone();
+        // Copy-only probes never forward, so they cannot loop: they get their
+        // own budget under the request deadline, not the caller's, which a
+        // forwarded acquisition may have spent on its hops.
+        let mut probes = super::default_budget(scope);
+        let mut unknown = false;
+        for node in owners.iter().filter(|node| **node != me) {
+            if membership.member(node).is_err() {
+                // Gone: whatever it held, rebalance or repair restores
+                // from the surviving holders.
+                continue;
+            }
+            match self
+                .candidates
+                .request(
+                    membership,
+                    node,
+                    context,
+                    &operation,
+                    FetchMode::CopyOnly,
+                    scope,
+                    &mut probes,
+                    1,
+                )
+                .await
+            {
+                Ok(response) => match response.response() {
+                    // A version this worker knows was deleted (an owner that
+                    // missed the delete) is no answer.
+                    PeerResponse::Metadata(metadata)
+                        if self.writes.tombstoned(&metadata.version) => {}
+                    PeerResponse::Metadata(metadata) => {
+                        super::validate_metadata(metadata, &context.object, &selector)?;
+                        return Ok(metadata.clone());
+                    }
+                    PeerResponse::Miss | PeerResponse::NotFound => {}
+                    _ => unknown = true,
+                },
+                Err(error) if scope.check().is_err() => return Err(error.into()),
+                Err(_) => unknown = true,
+            }
+        }
+        Err(if unknown {
+            Error::Unavailable
+        } else {
+            Error::NotFound
+        }
+        .into())
+    }
+
     /// A conditional origin miss says nothing about immutable copies on later
     /// candidates. Probe them copy-only before reporting the pin unavailable.
     pub(super) async fn copy_after_origin_miss(
@@ -830,10 +1006,11 @@ impl MetadataService {
     pub(crate) async fn bootstrap_copy(
         &self,
         context: &OriginContext,
+        membership: &std::sync::Arc<crate::topology::Membership>,
         scope: &RequestScope,
     ) -> Result<PeerResponse> {
         let Some(metadata) = self
-            .copy_only(MetadataSelector::Fresh, context, scope)
+            .copy_only(MetadataSelector::Fresh, context, membership, scope)
             .await?
         else {
             return Ok(PeerResponse::Miss);
@@ -869,7 +1046,7 @@ impl MetadataService {
         budget: &mut AcquisitionBudget,
     ) -> Result<PeerResponse> {
         if let response @ PeerResponse::Bootstrap { .. } =
-            self.bootstrap_copy(context, scope).await?
+            self.bootstrap_copy(context, &membership, scope).await?
         {
             return Ok(response);
         }
@@ -922,11 +1099,33 @@ impl MetadataService {
         })
     }
 
+    /// Whether this worker answers for a written object it tracks in `role`.
+    /// The coordinator always does. A manifest replica that membership
+    /// changes pushed out of page zero's ranked members no longer hears
+    /// deletes (they go to those members), so it must not.
+    fn serves_written(
+        &self,
+        role: crate::write::Role,
+        membership: &std::sync::Arc<crate::topology::Membership>,
+        object: &ObjectId,
+    ) -> bool {
+        role == crate::write::Role::Coordinator
+            || self.candidates.is_candidate(&self.candidates.candidates(
+                membership.clone(),
+                object,
+                PageNumber(0),
+            ))
+    }
+
     /// Read fresh current metadata or immutable pinned facts without acquisition.
+    ///
+    /// `membership` decides whether a manifest replica of a written object
+    /// still answers for it (see [`Self::serves_written`]).
     pub fn copy_only<'a>(
         &'a self,
         selector: MetadataSelector,
         context: &'a OriginContext,
+        membership: &'a std::sync::Arc<crate::topology::Membership>,
         scope: &'a RequestScope,
     ) -> Operation<'a, Option<ObjectMetadata>> {
         Box::pin(async move {
@@ -938,12 +1137,45 @@ impl MetadataService {
             let now = self.observe_clock()?;
             match selector {
                 MetadataSelector::Fresh => {
+                    // A written object this worker coordinates is current
+                    // whether or not a read published it to the catalog
+                    // (the published pointer lapses after METADATA_TTL).
+                    // Answering a miss here would make the asking reader
+                    // treat the coordinator's miss as authority and get
+                    // the origin's `404`.
+                    //
+                    // A manifest replica answers only while it is a page-zero
+                    // member: once membership changes displace it, a delete
+                    // no longer reaches it. Its cached current pointer is
+                    // skipped as well, so it cannot bypass that check; the
+                    // caller then asks the current members.
+                    //
+                    // A restored session not yet checked for a missed delete
+                    // answers neither the version nor a miss.
+                    if self.writes.unconfirmed(&context.object) {
+                        return Err(Error::Unavailable);
+                    }
+                    match self
+                        .writes
+                        .current_role(&context.object, self.candidates.ctx().clock.wall_now())
+                    {
+                        Some((metadata, role))
+                            if self.serves_written(role, membership, &context.object) =>
+                        {
+                            return Ok(Some(metadata));
+                        }
+                        Some(_) => return Ok(None),
+                        None => {}
+                    }
                     let Some(current) = self.storage.index.current(&context.object)? else {
                         return Ok(None);
                     };
                     let Some(descriptor) = self.storage.index.version(&current.version)? else {
                         return Ok(None);
                     };
+                    if self.writes.tombstoned(&current.version) {
+                        return Ok(None);
+                    }
                     current.resolve(&descriptor, now).map_err(Into::into)
                 }
                 MetadataSelector::Pinned(etag) => {

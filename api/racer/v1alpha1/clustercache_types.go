@@ -30,6 +30,8 @@ type ClusterCache struct {
 }
 
 // ClusterCacheSpec configures optional cache features.
+// +kubebuilder:validation:XValidation:rule="!has(self.writes) || !has(self.passthrough)",message="writes cannot be combined with passthrough"
+// +kubebuilder:validation:XValidation:rule="!has(self.writes) || has(self.origin) || (has(self.writes.upload) && has(self.writes.upload.mode) && self.writes.upload.mode == 'Never')",message="writes.upload.mode must be Never unless origin is set"
 type ClusterCacheSpec struct {
 	// Origin makes the Racer dataplane read this cache's objects directly from
 	// object storage, with no separate origin process. Origin can be set only
@@ -73,6 +75,85 @@ type ClusterCacheSpec struct {
 	// restricts client pods that use this cache to matching nodes.
 	// +optional
 	NodeSelector *metav1.LabelSelector `json:"nodeSelector,omitempty"`
+
+	// Writes enables object writes for this cache. Clients may then create
+	// objects with PUT, which Racer stores on several nodes and, unless the
+	// upload mode is Never, uploads to spec.origin. Writes cannot be combined
+	// with passthrough, and upload modes other than Never require spec.origin.
+	// When unset, the cache is read-only.
+	// +optional
+	Writes *Writes `json:"writes,omitempty"`
+}
+
+// UploadMode selects when written objects are uploaded to the origin.
+// +kubebuilder:validation:Enum=Auto;Manual;Never
+type UploadMode string
+
+const (
+	// UploadModeAuto uploads each written object after it commits in the cache.
+	UploadModeAuto UploadMode = "Auto"
+	// UploadModeManual uploads a written object only after the client asks
+	// with persist.
+	UploadModeManual UploadMode = "Manual"
+	// UploadModeNever keeps written objects only in the cache until their
+	// hold ends.
+	UploadModeNever UploadMode = "Never"
+)
+
+// Writes configures object writes for a cache.
+type Writes struct {
+	// Replicas is the number of nodes that must store each written page
+	// before a write is acknowledged. When unset, 2.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=3
+	// +kubebuilder:default=2
+	// +optional
+	Replicas *int32 `json:"replicas,omitempty"`
+
+	// MaxDirtyPercent bounds, as a percent of each storage worker's
+	// write-capable segment capacity, how much of a node's cache storage
+	// this cache's written data not yet uploaded may pin. Writes beyond it
+	// are refused until uploads catch up. When unset, 30.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=90
+	// +kubebuilder:default=30
+	// +optional
+	MaxDirtyPercent *int32 `json:"maxDirtyPercent,omitempty"`
+
+	// HoldTTL is the default time a written object is kept in the cache.
+	// Auto uploads release the hold once the upload commits. It must be
+	// positive and at most 720h. When unset, 24h.
+	// +kubebuilder:validation:XValidation:rule="duration(self) > duration('0s') && duration(self) <= duration('720h')",message="holdTTL must be positive and at most 720h"
+	// +kubebuilder:default="24h"
+	// +optional
+	HoldTTL *metav1.Duration `json:"holdTTL,omitempty"`
+
+	// Upload configures uploads of written objects to the origin.
+	// +optional
+	Upload *WriteUpload `json:"upload,omitempty"`
+}
+
+// WriteUpload configures uploads of written objects.
+type WriteUpload struct {
+	// Mode is the default upload mode for writes that do not request one.
+	// When unset, Auto.
+	// +kubebuilder:default=Auto
+	// +optional
+	Mode *UploadMode `json:"mode,omitempty"`
+
+	// MaxBytesPerSecond bounds upload bandwidth for this cache on each node.
+	// 0 means unlimited. When unset, 0.
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	MaxBytesPerSecond *int64 `json:"maxBytesPerSecond,omitempty"`
+
+	// MaxConcurrentBlocks bounds concurrent block uploads for this cache on
+	// each node. When unset, 16.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=1024
+	// +kubebuilder:default=16
+	// +optional
+	MaxConcurrentBlocks *int32 `json:"maxConcurrentBlocks,omitempty"`
 }
 
 // PassthroughRoute selects which node's origin serves a passthrough read.

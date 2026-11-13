@@ -780,6 +780,10 @@ impl CandidatePolicy {
         &self.drivers
     }
 
+    pub(crate) fn local_node(&self) -> &NodeId {
+        &self.node
+    }
+
     pub(crate) fn ctx(&self) -> &racer_io::WorkerCtx {
         &self.ctx
     }
@@ -1055,6 +1059,100 @@ impl CandidatePolicy {
     ) -> Operation<'a, Candidates> {
         self.placement
             .rank_scoped(membership, object, page, Some(scope))
+    }
+
+    /// After an origin miss for a page of a cache with writes, ask the other
+    /// owners under `authority`'s membership, and those of the membership it
+    /// recently replaced, for a copy-only copy. A member that became the
+    /// page's rank 0 holds no written page until rebalance copies it there,
+    /// and the origin does not know the object before it uploads. `None`
+    /// when no owner returns a usable copy.
+    pub(crate) async fn written_copy<'a, T: 'a>(
+        &'a self,
+        authority: &OriginAuthority,
+        context: &'a OriginContext,
+        operation: &'a PeerOperation,
+        scope: &'a RequestScope,
+        validate: &mut (impl FnMut(VerifiedResponse) -> Operation<'a, T> + 'a),
+    ) -> Result<Option<T>> {
+        let membership = &authority.membership;
+        // Copy-only probes never forward, so they cannot loop: they get their
+        // own budget under the request deadline, not the caller's, which the
+        // walk spent reaching the origin.
+        let mut budget = super::default_budget(scope);
+        let mut owners = authority.owners.clone();
+        if let Some(previous) = self
+            .recent_previous_owners(membership, &authority.object, authority.page, scope)
+            .await?
+        {
+            for node in previous.ordered {
+                if !owners.contains(&node) {
+                    owners.push(node);
+                }
+            }
+        }
+        for node in owners
+            .iter()
+            .filter(|node| **node != self.node && membership.member(node).is_ok())
+        {
+            match self
+                .request(
+                    membership,
+                    node,
+                    context,
+                    operation,
+                    FetchMode::CopyOnly,
+                    scope,
+                    &mut budget,
+                    1,
+                )
+                .await
+            {
+                Ok(response) => {
+                    if let Ok(copy) = validated_copy(response, operation, false, validate).await? {
+                        return Ok(Some(copy));
+                    }
+                }
+                Err(error) if scope.check().is_err() => return Err(error),
+                Err(_) => {}
+            }
+        }
+        Ok(None)
+    }
+
+    /// The page owners under the membership `current` replaced, when that
+    /// replacement is recent enough (`PREVIOUS_MEMBERSHIP_WITHIN`) that peers
+    /// still resolve it and its owners differ from the current ones. `None`
+    /// otherwise. This node need not be a member of it: a joiner asks it.
+    pub(crate) async fn recent_previous_owners(
+        &self,
+        current: &std::sync::Arc<crate::topology::Membership>,
+        object: &ObjectId,
+        page: PageNumber,
+        scope: &RequestScope,
+    ) -> Result<Option<Candidates>> {
+        let Some(version) = current.version.0.checked_sub(1) else {
+            return Ok(None);
+        };
+        let Some(previous) = self
+            .published
+            .resolve_recent(
+                version,
+                self.ctx.now(),
+                racer_core::read::walk::PREVIOUS_MEMBERSHIP_WITHIN,
+            )
+            .ok()
+            .flatten()
+        else {
+            return Ok(None);
+        };
+        let before = self
+            .candidates_scoped(previous, object, page, scope)
+            .await?;
+        let now = self
+            .candidates_scoped(current.clone(), object, page, scope)
+            .await?;
+        Ok((before.ordered != now.ordered).then_some(before))
     }
 
     pub fn resolve<'a>(
@@ -1764,6 +1862,30 @@ impl CandidatePolicy {
         Ok(authority)
     }
 
+    /// Grant a write coordinator or holder origin access for `object`/`page`
+    /// without ranking: the create-once origin check and uploads are this
+    /// node's own requests, never fills, so no walk elects them.
+    pub(crate) fn write_authority(
+        &self,
+        membership: std::sync::Arc<crate::topology::Membership>,
+        object: &ObjectId,
+        page: PageNumber,
+    ) -> Result<OriginAuthority> {
+        let authority = OriginAuthority {
+            diagnostic: CandidateTrail::default(),
+            membership,
+            node: self.node.clone(),
+            object: object.clone(),
+            owners: vec![self.node.clone()],
+            page,
+            predecessor_evidence: Vec::new(),
+            rank: 0,
+            local: true,
+        };
+        authority.validate(object, page)?;
+        Ok(authority)
+    }
+
     /// Send a run of granted probes at once (`Step::Granted`): copy-only, each on its own grant
     /// (`racer_core::read::walk::granted_budget`), all sharing the first
     /// probe's time share, so the run costs one round trip instead of one per
@@ -1976,7 +2098,7 @@ impl CandidatePolicy {
 
     /// Request a peer copy using the accepted membership and remaining budget.
     #[allow(clippy::too_many_arguments)] // Preserve explicit route and request authorization inputs.
-    pub(super) async fn request(
+    pub(crate) async fn request(
         &self,
         membership: &std::sync::Arc<crate::topology::Membership>,
         destination: &NodeId,
@@ -2495,8 +2617,8 @@ impl CandidatePolicy {
         }
     }
 
-    /// This worker's link health (tests set its silence timing).
-    #[cfg(test)]
+    /// This worker's link health (tests set its silence timing; writers skip
+    /// silent store targets).
     pub(crate) fn link_health(&self) -> Rc<crate::topology::LinkHealth> {
         self.peers.link_health()
     }
@@ -2682,7 +2804,11 @@ impl CandidatePolicy {
             PeerOperation::Bootstrap { .. } => CandidateOperation::Bootstrap,
             PeerOperation::Metadata { .. } => CandidateOperation::Metadata,
             PeerOperation::Subscribe { .. } => CandidateOperation::Subscribe,
-            PeerOperation::Prefetch { .. } => CandidateOperation::Page,
+            PeerOperation::Prefetch { .. }
+            | PeerOperation::WriteSession { .. }
+            | PeerOperation::WriteStore { .. }
+            | PeerOperation::WriteRelease { .. }
+            | PeerOperation::WriteUpload { .. } => CandidateOperation::Page,
         };
         self.observer.candidate_final(CandidateFinal {
             failure: Failure::new(Stage::CandidateExhausted, error)
@@ -2862,6 +2988,16 @@ fn operation_identity(operation: &PeerOperation) -> (&ObjectId, PageNumber) {
             &version.object,
             PageNumber(action.pages().first().copied().unwrap_or(0)),
         ),
+        PeerOperation::WriteSession { object, .. } => (object, PageNumber(0)),
+        PeerOperation::WriteStore { version, store } => (
+            &version.object,
+            PageNumber(store.pages.first().copied().unwrap_or(0)),
+        ),
+        PeerOperation::WriteRelease { version, pages, .. }
+        | PeerOperation::WriteUpload { version, pages, .. } => (
+            &version.object,
+            PageNumber(pages.first().copied().unwrap_or(0)),
+        ),
     }
 }
 fn copy_operation(operation: &PeerOperation, mode: FetchMode) -> PeerOperation {
@@ -2890,6 +3026,40 @@ fn copy_operation(operation: &PeerOperation, mode: FetchMode) -> PeerOperation {
             version: version.clone(),
             action: action.clone(),
         },
+        // Write operations have fixed modes; the probe mode is not applied.
+        PeerOperation::WriteSession {
+            object,
+            etag,
+            action,
+        } => PeerOperation::WriteSession {
+            object: object.clone(),
+            etag: etag.clone(),
+            action: action.clone(),
+        },
+        PeerOperation::WriteStore { version, store } => PeerOperation::WriteStore {
+            version: version.clone(),
+            store: store.clone(),
+        },
+        PeerOperation::WriteRelease {
+            version,
+            session,
+            pages,
+            keep,
+        } => PeerOperation::WriteRelease {
+            version: version.clone(),
+            session: *session,
+            pages: pages.clone(),
+            keep: *keep,
+        },
+        PeerOperation::WriteUpload {
+            version,
+            session,
+            pages,
+        } => PeerOperation::WriteUpload {
+            version: version.clone(),
+            session: *session,
+            pages: pages.clone(),
+        },
     }
 }
 /// Payload-free shape of `operation` for racer-core classification.
@@ -2903,6 +3073,10 @@ pub(crate) fn operation_kind(operation: &PeerOperation) -> racer_core::read::Ope
         },
         PeerOperation::Bootstrap { .. } => OperationKind::Bootstrap,
         PeerOperation::Prefetch { .. } => OperationKind::Prefetch,
+        PeerOperation::WriteSession { .. }
+        | PeerOperation::WriteStore { .. }
+        | PeerOperation::WriteRelease { .. }
+        | PeerOperation::WriteUpload { .. } => OperationKind::Write,
     }
 }
 
@@ -4324,7 +4498,11 @@ pub(super) mod tests {
                     | PeerOperation::Metadata { mode, .. } => {
                         matches!(mode, FetchMode::CopyOnly)
                     }
-                    PeerOperation::Prefetch { .. } => false,
+                    PeerOperation::Prefetch { .. }
+                    | PeerOperation::WriteSession { .. }
+                    | PeerOperation::WriteStore { .. }
+                    | PeerOperation::WriteRelease { .. }
+                    | PeerOperation::WriteUpload { .. } => false,
                 };
                 self.calls
                     .borrow_mut()

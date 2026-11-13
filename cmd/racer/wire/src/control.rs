@@ -45,6 +45,7 @@ pub use codec::*;
 pub use definitions::*;
 pub use origin::*;
 use std::time::Duration;
+pub use writes::*;
 
 /// Current control record schema version.
 pub const SCHEMA_VERSION: u32 = 2;
@@ -500,6 +501,8 @@ pub const MAX_DISCOVERED_ENDPOINTS: usize = 16;
 
 mod origin;
 
+mod writes;
+
 mod definitions {
     use std::{collections::HashSet, num::NonZeroU32, path::PathBuf};
 
@@ -599,6 +602,17 @@ mod definitions {
         /// Object origin the dataplane reads directly. None keeps the cache's
         /// origin Unix socket as the only origin.
         pub origin: Option<crate::control::OriginDefinition>,
+
+        /// Write settings. None disables writes, which is also how catalogs
+        /// from before writes existed decode.
+        pub writes: Option<crate::control::WriteDefinition>,
+    }
+
+    impl CacheDefinition {
+        /// Write settings when this cache accepts writes.
+        pub fn writes(&self) -> Option<&crate::control::WriteDefinition> {
+            self.writes.as_ref()
+        }
     }
 
     /// Pool identity: `default`, or `sel-` and 32 lowercase hexadecimal digits.
@@ -788,6 +802,17 @@ mod definitions {
             }
             if let Some(origin) = &d.origin {
                 origin.validate()?;
+            }
+            if let Some(writes) = &d.writes {
+                writes.validate()?;
+                // Passthrough caches retain nothing, and uploads need a
+                // native origin until writes through origin sockets exist.
+                if d.mode.passthrough()
+                    || (writes.upload_mode != crate::control::UploadMode::Never
+                        && d.origin.is_none())
+                {
+                    return Err(Error::InvalidRequest);
+                }
             }
             let (client, origin) = canonical_socket_paths(&d.name)?;
             // Path equality normalizes separators; the wire requires exact strings.
@@ -1362,6 +1387,59 @@ mod codec {
         // their canonical bytes.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin: Option<OriginDto>,
+
+        // Optional and omitted when absent, so caches without writes keep
+        // their canonical bytes and older catalogs still decode.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        writes: Option<WritesDto>,
+    }
+
+    /// Wire spelling of `WriteDefinition`.
+    #[derive(Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct WritesDto {
+        replicas: u8,
+
+        #[serde(rename = "maxDirtyPercent")]
+        max_dirty_percent: u8,
+
+        #[serde(rename = "holdTTLMillis")]
+        hold_ttl_millis: u64,
+
+        #[serde(rename = "uploadMode")]
+        upload_mode: String,
+
+        #[serde(rename = "uploadMaxBytesPerSecond")]
+        upload_max_bytes_per_second: u64,
+
+        #[serde(rename = "uploadMaxConcurrentBlocks")]
+        upload_max_concurrent_blocks: u32,
+    }
+
+    impl WritesDto {
+        fn from_definition(w: &crate::control::WriteDefinition) -> Result<Self> {
+            Ok(Self {
+                replicas: w.replicas,
+                max_dirty_percent: w.max_dirty_percent,
+                hold_ttl_millis: u64::try_from(w.hold_ttl.as_millis())
+                    .map_err(|_| Error::InvalidRequest)?,
+                upload_mode: w.upload_mode.as_str().into(),
+                upload_max_bytes_per_second: w.upload_max_bytes_per_second,
+                upload_max_concurrent_blocks: w.upload_max_concurrent_blocks,
+            })
+        }
+
+        fn into_definition(self) -> Result<crate::control::WriteDefinition> {
+            Ok(crate::control::WriteDefinition {
+                replicas: self.replicas,
+                max_dirty_percent: self.max_dirty_percent,
+                hold_ttl: Duration::from_millis(self.hold_ttl_millis),
+                upload_mode: crate::control::UploadMode::parse(self.upload_mode.as_bytes())
+                    .ok_or(Error::InvalidRequest)?,
+                upload_max_bytes_per_second: self.upload_max_bytes_per_second,
+                upload_max_concurrent_blocks: self.upload_max_concurrent_blocks,
+            })
+        }
     }
 
     /// Wire spelling of `OriginDefinition`.
@@ -1642,6 +1720,7 @@ mod codec {
                     priority: c.priority,
                     mode: c.mode.into(),
                     origin: c.origin.map(OriginDto::into_definition).transpose()?,
+                    writes: c.writes.map(WritesDto::into_definition).transpose()?,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1701,6 +1780,11 @@ mod codec {
                     .origin
                     .as_ref()
                     .map(OriginDto::from_definition)
+                    .transpose()?,
+                writes: c
+                    .writes
+                    .as_ref()
+                    .map(WritesDto::from_definition)
                     .transpose()?,
             });
         }
@@ -2416,6 +2500,108 @@ mod codec {
             assert_eq!(mh, hashes["membership"]);
             let b = encode_publication(&p).unwrap();
             assert_eq!(b, round_trip("publication.json", &b).unwrap());
+        }
+
+        /// Writes round trip, are omitted when absent so canonical bytes and
+        /// old catalogs are unchanged, and are validated against the cache.
+        #[test]
+        fn cache_writes_round_trip_omission_and_validation() {
+            let raw = fixture("publication.json");
+            let p = decode_publication(&raw).unwrap();
+            assert!(p.caches.iter().all(|c| c.writes.is_none()));
+            let base_bytes = encode_publication(&p).unwrap();
+            let (base_content, base_membership) = content_hashes(&p).unwrap();
+            assert!(
+                !String::from_utf8(base_bytes.clone())
+                    .unwrap()
+                    .contains("writes")
+            );
+
+            let url = crate::control::AzureContainerUrl::parse(
+                "https://acct.blob.core.windows.net/models",
+            )
+            .unwrap();
+            let mut next = p.clone();
+            next.caches[0].origin = Some(crate::control::OriginDefinition::azure(
+                url,
+                crate::control::AzureCredential::Anonymous,
+            ));
+            let with_origin = next.clone();
+            for mode in [
+                crate::control::UploadMode::Auto,
+                crate::control::UploadMode::Manual,
+                crate::control::UploadMode::Never,
+            ] {
+                next.caches[0].writes = Some(crate::control::WriteDefinition {
+                    replicas: 3,
+                    max_dirty_percent: 50,
+                    hold_ttl: Duration::from_millis(1500),
+                    upload_mode: mode,
+                    upload_max_bytes_per_second: 1 << 40,
+                    upload_max_concurrent_blocks: 8,
+                });
+                let b = encode_publication(&next).unwrap();
+                let decoded = decode_publication(&b).unwrap();
+                assert_eq!(decoded.caches, next.caches);
+                assert_eq!(decoded.caches[0].writes(), next.caches[0].writes.as_ref());
+                let (content, membership) = content_hashes(&next).unwrap();
+                assert_ne!(content, content_hashes(&with_origin).unwrap().0);
+                assert_eq!(membership, base_membership);
+            }
+            next.caches[0].writes = None;
+            assert_eq!(
+                content_hashes(&next).unwrap().0,
+                content_hashes(&with_origin).unwrap().0
+            );
+            next.caches[0].origin = None;
+            assert_eq!(encode_publication(&next).unwrap(), base_bytes);
+            assert_eq!(content_hashes(&next).unwrap().0, base_content);
+
+            // Exact wire spelling with defaults.
+            let mut next = with_origin.clone();
+            next.caches[0].writes = Some(crate::control::WriteDefinition::default());
+            let text = String::from_utf8(encode_publication(&next).unwrap()).unwrap();
+            let exact = "\"writes\":{\"replicas\":2,\"maxDirtyPercent\":30,\"holdTTLMillis\":86400000,\"uploadMode\":\"auto\",\"uploadMaxBytesPerSecond\":0,\"uploadMaxConcurrentBlocks\":16}";
+            assert!(text.contains(exact), "{text}");
+
+            // Never-upload writes need no origin; uploads do.
+            let mut cache_only = p.clone();
+            cache_only.caches[0].writes = Some(crate::control::WriteDefinition {
+                upload_mode: crate::control::UploadMode::Never,
+                ..Default::default()
+            });
+            assert!(validate_publication(&cache_only).is_ok());
+            let mut bad = cache_only.clone();
+            bad.caches[0].writes = Some(crate::control::WriteDefinition::default());
+            assert!(encode_publication(&bad).is_err());
+            assert!(validate_publication(&bad).is_err());
+            // Passthrough caches reject writes.
+            let mut bad = cache_only.clone();
+            bad.caches[0].mode = CacheMode::PassthroughPeers;
+            assert!(validate_publication(&bad).is_err());
+            // Out-of-range settings are rejected.
+            let mut bad = with_origin.clone();
+            bad.caches[0].writes = Some(crate::control::WriteDefinition {
+                replicas: 4,
+                ..Default::default()
+            });
+            assert!(encode_publication(&bad).is_err());
+
+            // Invalid wire writes are rejected by decode.
+            for (from, to) in [
+                ("\"uploadMode\":\"auto\"", "\"uploadMode\":\"Auto\""),
+                ("\"replicas\":2", "\"replicas\":0"),
+                ("\"holdTTLMillis\":86400000", "\"holdTTLMillis\":0"),
+                (
+                    "\"uploadMaxConcurrentBlocks\":16",
+                    "\"uploadMaxConcurrentBlocks\":16,\"extra\":1",
+                ),
+                ("\"maxDirtyPercent\":30,", ""),
+            ] {
+                assert!(text.contains(from), "{from}");
+                let changed = text.replacen(from, to, 1);
+                assert!(decode_publication(changed.as_bytes()).is_err(), "{to}");
+            }
         }
 
         /// Origins round trip, are omitted when absent, and are validated on decode.

@@ -827,6 +827,40 @@ impl Rig {
     fn bootstrap(&self, key: u8) -> Reply {
         self.drive(self.bootstrap.acquire(key, &scope())).unwrap()
     }
+
+    /// Send one write request through the client write service.
+    fn write(&self, request: Vec<u8>) -> Reply {
+        let (local, mut remote) = UnixStream::pair().unwrap();
+        let reader = thread::spawn(move || {
+            remote.set_read_timeout(Some(TIMEOUT)).unwrap();
+            remote.write_all(&request).unwrap();
+            let head = read_head(&mut remote).expect("write response head");
+            Reply {
+                status: head.split_whitespace().nth(1).unwrap().parse().unwrap(),
+                fields: fields(&head),
+                body: Vec::new(),
+            }
+        });
+        let scope = scope();
+        let result = self.drive(async {
+            let lease = racer::http::from_accepted(local.into(), &self.admission)?;
+            let received = self.io.receive_head(lease, &scope).await?;
+            racer::write::client::serve(
+                received.connection,
+                received.value,
+                Vec::new(),
+                &CacheId(CACHE.into()),
+                32768,
+                &self.coordinator,
+                &self.io,
+                TIMEOUT,
+                racer::runtime::Cancellation::new()?,
+            )
+            .await
+        });
+        assert!(result.is_ok(), "{result:?}");
+        reader.join().unwrap()
+    }
 }
 
 // Atomic bootstrap enters the verified local peer service boundary. Signatures,
@@ -895,6 +929,8 @@ std::thread_local! {
     /// Page size the fixture publication announces; tests run one per thread.
     static FIXTURE_PAGE_SIZE: std::cell::Cell<racer_wire::object::PageSize> =
         const { std::cell::Cell::new(racer_wire::object::PageSize::DEFAULT) };
+    /// Whether the fixture cache accepts writes.
+    static FIXTURE_WRITES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn fixture_publication() -> Publication {
@@ -920,6 +956,16 @@ fn fixture_publication() -> Publication {
             priority: racer_wire::control::DEFAULT_PRIORITY,
             mode: racer_wire::control::CacheMode::Cached,
             origin: None,
+            writes: FIXTURE_WRITES
+                .get()
+                .then(|| racer_wire::control::WriteDefinition {
+                    replicas: 1,
+                    max_dirty_percent: 30,
+                    hold_ttl: Duration::from_secs(3600),
+                    upload_mode: racer_wire::control::UploadMode::Never,
+                    upload_max_bytes_per_second: 0,
+                    upload_max_concurrent_blocks: 16,
+                }),
         }],
         page_size: FIXTURE_PAGE_SIZE.get(),
     }
@@ -2096,4 +2142,78 @@ fn cancel_backpressured_reader_preserves_fast_reader_and_releases_leases() {
 /// unchanged: `index >= N` is always false, so every byte is XORed with 0.
 fn test_vector<const N: usize>(bytes: [u8; N]) -> [u8; N] {
     core::array::from_fn(|index| bytes[index] ^ u8::from(index >= N))
+}
+
+#[test]
+fn put_then_read_through_the_production_graph() {
+    let size = racer_wire::object::PageSize::new(64 << 10).unwrap();
+    FIXTURE_PAGE_SIZE.set(size);
+    FIXTURE_WRITES.set(true);
+    let rig = Rig::with_dirty_pages(1, true, 8, 8);
+    // Bind the write journal, as startup recovery does.
+    rig.drive(rig.writer.recover_written(
+        &rig._scratch.path.join("slabs"),
+        [5; 32],
+        64 << 20,
+        &scope(),
+    ))
+    .unwrap();
+    let length = 2 * size.get() + 113;
+    let body: Vec<u8> = (0..length).map(|i| (i * 7 % 251) as u8).collect();
+    let mut request = format!(
+        "PUT /v1/objects/{} HTTP/1.1\r\nHost: racer\r\nContent-Length: {length}\r\nIf-None-Match: *\r\nRacer-Content-Type: application/x-test\r\nConnection: close\r\n\r\n",
+        "ab".repeat(32)
+    )
+    .into_bytes();
+    request.extend_from_slice(&body);
+    let created = rig.write(request.clone());
+    assert_eq!(created.status, 201, "{:?}", created.fields);
+    let etag = created.fields["etag"].clone();
+    assert!(etag.starts_with("\"racer-"));
+    assert_eq!(created.fields["racer-upload-state"], "never");
+    assert_eq!(rig.writer.written_pages().len(), 3);
+    // Create-once.
+    assert_eq!(rig.write(request).status, 412);
+    // A fresh read resolves the written version without the origin.
+    rig.adapter.offline();
+    let head = rig.request("HEAD", "");
+    assert_eq!(
+        head.status,
+        200,
+        "{:?} {:?}",
+        head.fields,
+        rig.adapter.calls()
+    );
+    let reply = rig.subscribe("");
+    assert_eq!(
+        reply.status,
+        200,
+        "{:?} {:?}",
+        reply.fields,
+        rig.adapter.calls()
+    );
+    assert_eq!(reply.fields["etag"], etag);
+    assert_eq!(reply.fields["racer-object-length"], length.to_string());
+    assert!(reply.body == body);
+    let head = rig.request("HEAD", "");
+    assert_eq!(head.status, 200);
+    assert_eq!(head.fields["etag"], etag);
+    assert_eq!(head.fields["racer-upload-state"], "never");
+    assert!(rig.adapter.calls().is_empty(), "{:?}", rig.adapter.calls());
+    // Delete releases the pages.
+    let deleted = rig.write(
+        format!(
+            "DELETE /v1/objects/{} HTTP/1.1\r\nHost: racer\r\nConnection: close\r\n\r\n",
+            "ab".repeat(32)
+        )
+        .into_bytes(),
+    );
+    assert_eq!(deleted.status, 204);
+    rig.drive(async {
+        // Releases run in the background on the coordinator's worker.
+        while !rig.writer.written_pages().is_empty() {
+            futures::pending!();
+        }
+    });
+    rig.drive(rig.reactor.drain()).unwrap();
 }

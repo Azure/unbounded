@@ -229,7 +229,10 @@ func (c *Client) Stat(ctx context.Context, request Request) (Metadata, error) {
 		return Metadata{}, err
 	}
 
-	return fromWireMetadata(response.Metadata), nil
+	m := fromWireMetadata(response.Metadata)
+	m.UploadState = UploadState(response.UploadState)
+
+	return m, nil
 }
 
 func (c *Client) head(ctx context.Context, r wire.Request, op string) (wire.Response, error) {

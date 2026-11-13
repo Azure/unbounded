@@ -87,3 +87,20 @@ app-healthy-relayed-page-reads-opaque seed=1
 app-listeners-survive-queue-pressure seed=1
 app-concurrent-relayed-layers seed=1
 app-concurrent-relayed-layers-opaque seed=1
+# Generated write traffic (WP11). Seeds that once failed are kept: writes 4
+# and 6 and four-nodes 1 and 2 (sole manifest down), holder-loss 15,
+# membership-churn 4 (uploaded object after a join) and 8 (delete after a join).
+app-writes seed=1
+app-writes seed=4
+app-writes seed=6
+app-writes-four-nodes seed=1
+app-writes-four-nodes seed=2
+app-writes-holder-loss seed=2
+app-writes-holder-loss seed=15
+app-writes-holder-loss seed=146
+app-writes-holder-loss seed=152
+app-writes-holder-loss seed=159
+app-writes-membership-churn seed=4
+app-writes-membership-churn seed=8
+app-writes-membership-churn seed=100
+app-writes-membership-churn seed=107

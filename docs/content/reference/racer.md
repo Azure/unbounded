@@ -6,7 +6,9 @@ description: "Racer resources, configuration, diagnostics, Go SDK, and RDMA requ
 
 {{< callout type="warning" >}}
 Racer is pre-release. Its APIs, flags, and on-disk formats may change without a
-migration path. Cached data is disposable; Racer is not durable storage. Start
+migration path. Cached data is disposable; Racer is not durable storage.
+[Written objects](#object-writes) are kept on several node disks, but they are not safe
+from loss until they are uploaded to the origin. Start
 with the [Azure Blob cache guide]({{< relref "guides/azure-blob-cache" >}}).
 {{< /callout >}}
 
@@ -19,7 +21,7 @@ See [Racer concepts]({{< relref "concepts/racer" >}}) and the [Azure Blob cache 
 | API | `racer.unbounded-cloud.io/v1alpha1`, kind `ClusterCache` |
 | Resource / short name | `clustercaches` / `ccache` |
 | Scope | Cluster-scoped |
-| Fields | Optional `spec.origin` for an Azure Blob origin that the dataplane reads directly; optional `spec.priority` for the cache's share of node capacity; optional `spec.passthrough` to proxy reads without caching; optional `spec.nodeSelector` to limit the cache to some nodes; no `status` |
+| Fields | Optional `spec.origin` for an Azure Blob origin that the dataplane reads directly; optional `spec.priority` for the cache's share of node capacity; optional `spec.passthrough` to proxy reads without caching; optional `spec.nodeSelector` to limit the cache to some nodes; optional `spec.writes` to accept object writes (see [Writes](#object-writes)); no `status` |
 | Name | DNS subdomain, at most 82 characters total and 63 per dot-separated label |
 | Identity | Kubernetes UID, not name; deleting and recreating a cache creates a new identity |
 
@@ -32,10 +34,12 @@ metadata:
 
 Any ClusterCache triggers installation by the Unbounded operator, not a Site
 component flag. This resource is not a Kubernetes PersistentVolume or
-PersistentVolumeClaim (PVC), does not set absolute capacity, and makes no
-durability promise. `spec.priority` sets only its relative share of each node's
+PersistentVolumeClaim (PVC), and does not set absolute capacity. It makes no
+durability promise for read data. With `spec.writes`, it promises only that a
+written object has the requested number of disk copies, or is in the origin
+(see [Writes](#object-writes)). `spec.priority` sets only its relative share of each node's
 cache capacity (see [Priority](#priority)). It configures an origin only when `spec.origin` is set (see
-[Azure origin](#azure-origin)). Cached data is disposable. A cache's Kubernetes UID is its
+[Azure origin](#azure-origin)). Cached read data is disposable. A cache's Kubernetes UID is its
 wire cache identity (`CacheID`).
 
 | Path on the node | Owner and purpose |
@@ -241,6 +245,61 @@ reads the origin instead. Do these steps before you upgrade:
   `workloadIdentity` or `default` with an identity attached to the nodes. You
   can edit `credential` in place; only `containerURL` is immutable. Then delete
   the Secret if nothing else uses it.
+
+### Write settings
+
+Set `spec.writes` to let clients create objects in the cache. See
+[Object writes](#object-writes) for the client API. When `spec.writes` is
+unset, the cache is read-only.
+
+```yaml
+apiVersion: racer.unbounded-cloud.io/v1alpha1
+kind: ClusterCache
+metadata:
+  name: checkpoints
+spec:
+  origin:
+    azure:
+      containerURL: https://<account>.blob.core.windows.net/<container>
+      credential:
+        workloadIdentity:
+          clientID: <client ID>
+  writes:
+    replicas: 2
+    maxDirtyPercent: 30
+    holdTTL: 24h
+    upload:
+      mode: Auto
+      maxBytesPerSecond: 0
+      maxConcurrentBlocks: 16
+```
+
+| Field | Default | Accepted | Meaning |
+|-------|---------|----------|---------|
+| `writes.replicas` | `2` | 1..3 | Nodes that must store each page before a write is acknowledged. A request can override it with `Racer-Durability`. |
+| `writes.maxDirtyPercent` | `30` | 1..90 | Percent of each storage worker's segment capacity that this cache's written data, not yet uploaded, may use. Writes over it get `503`. |
+| `writes.holdTTL` | `24h` | More than `0s`, at most `720h` | Default time a written object stays pinned in the cache. An `Auto` upload ends the hold when it commits. A request can override it with `Racer-Hold-Seconds`. |
+| `writes.upload.mode` | `Auto` | `Auto`, `Manual`, `Never` | Default upload mode. `Auto` uploads after the write commits. `Manual` waits for `persist`. `Never` keeps the object only in the cache until its hold ends. |
+| `writes.upload.maxBytesPerSecond` | `0` | At least 0 | Upload bandwidth for this cache on each node. `0` means no limit. The cluster-wide limit is this value times the number of nodes. |
+| `writes.upload.maxConcurrentBlocks` | `16` | 1..1,024 | Concurrent block uploads for this cache on each node. |
+
+The API server also checks:
+
+- `writes` cannot be set with `passthrough`.
+- Without `spec.origin`, `writes.upload.mode` must be set to `Never`.
+
+Rules for enabling writes:
+
+- **Every node must support writes first.** Older dataplanes reject a cache
+  catalog that contains `writes`. The operator does not check node versions.
+  Upgrade every Racer node before you set `spec.writes` on any cache.
+- **Upload needs write access.** With an upload mode other than `Never`, the
+  cache's Azure identity needs the `Storage Blob Data Contributor` role on the
+  container. Uploads use Put Block and Put Block List. Reads alone need only
+  `Storage Blob Data Reader`.
+- **Data not yet uploaded can be lost.** Written data that is not uploaded
+  lives only on node disks. Deleting the ClusterCache, or changing a node's
+  storage layout (devices or worker count), loses that node's copies.
 
 ## Node requirements
 
@@ -491,6 +550,19 @@ each worker and are never divided.
 | `RACER_PREFETCH_ORIGIN_BYTES_PER_SEC` | `0` | Node | 0..1,099,511,627,776 bytes/s | Prefetch origin read rate per owner; `0` turns the limit off. |
 | `RACER_PREFETCH_MAX_ATTEMPTS` | `5` | Node | 1..32 | Tries per page. |
 
+#### Writes
+
+| Variable | Default | Scope | Accepted | Description |
+| --- | --- | --- | --- | --- |
+| `RACER_WRITE_WINDOW_PAGES` | `8` | Node | 1..64 | Pages one write keeps in flight to their owners. |
+| `RACER_WRITE_LEASE_SECS` | `60` | Node | 5..3,600 s | Write session lease; the writer renews it every third of the lease, and an expired session is aborted. |
+| `RACER_WRITE_GROUP_COMMIT_MICROS` | `500` | Node | 0..100,000 us | Longest wait to batch written pages into one durability barrier; `0` syncs each page alone. |
+| `RACER_WRITE_JOURNAL_BYTES` | `67108864` (64 MiB) | Node | 1,048,576..17,179,869,184 bytes | Write journal size per I/O worker that triggers compaction. |
+| `RACER_WRITE_ORPHAN_SECS` | `3600` | Node | 60..604,800 s | Age after which a held written page whose session no page-zero member knows is released. |
+| `RACER_WRITE_HOLDER_GRACE_SECS` | `300` | Node | 0..86,400 s | How long a holder of an un-uploaded written page may be missing from its pool before the coordinator drops it and re-replicates; a page whose every holder is missing waits for one to return instead of failing. |
+| `RACER_WRITE_ALIAS_SECS` | `604800` | Node | 3,600..2,592,000 s | Reserved for mapping an uploaded object's origin version to its Racer version; not used yet. |
+| `RACER_WRITE_UPLOAD_ATTEMPTS` | `10` | Node | 1..100 | Upload tries per written object before it is marked `failed`. |
+
 #### Timeouts
 
 | Variable | Default | Scope | Accepted | Description |
@@ -521,7 +593,7 @@ each worker and are never divided.
 | `RACER_CONTROL_LISTEN` | `:8443` | Node | `ip:port` | Control seat listener. `:port` binds every IPv4 address. |
 | `RACER_WEBHOOK_LISTEN` | `:9443` | Node | `ip:port` | Object sidecar admission webhook listener. `:port` binds every IPv4 address. |
 | `RACER_OBJECT_IMAGE` | Unset: webhook serving off | Node | image reference | Image injected as the object sidecar. |
-| `RACER_RETAINED_PAGE_KEYS` | `7` | Node | 1..16 | Readable page keys per cache: the active key plus older decrypt keys. Read by the authority. Lowering it never drops keys at once: extra decrypt keys are dropped at the next key rotation. |
+| `RACER_RETAINED_PAGE_KEYS` | `7` | Node | 1..16 | Readable page keys per cache: the active key plus older decrypt keys. Read by the authority. Lowering it never drops keys at once: extra decrypt keys are dropped at the next key rotation. Caches with writes enabled always keep at least 2 (the active key and the previous one), so written pages can be rekeyed within one rotation interval. |
 | `RACER_PAGE_BYTES` | `16777216` (16 MiB) | Node | 16,777,216..16,777,216 bytes | Cluster-wide logical page size. Only 16777216 (16 MiB) is accepted: the client SDKs and the disk index do not yet support other sizes. Fixed at cluster creation: the authority publishes the value of the primary that made the first publication, records it in the `racer-state` Secret, and ignores later changes with a warning in the primary's log. Running nodes reject a publication that changes it. |
 | `RACER_KUBE_API_CA` | `/var/run/secrets/kubernetes.io/serviceaccount/ca.crt` | Node | absolute path | Kubernetes API CA bundle. |
 | `RACER_KUBE_API_TOKEN` | `/var/run/secrets/kubernetes.io/serviceaccount/token` | Node | absolute path | Default-audience token, used only for the Kubernetes API. |
@@ -1127,6 +1199,200 @@ All prefetch metrics have a `priority` label.
 | `racer_prefetch_window_dropped_bytes_total` | counter | Bytes dropped from the wanted set by updates |
 | `racer_prefetch_tickets` | gauge | Tickets on the node |
 | `racer_prefetch_tickets_finished_total` | counter | Tickets that finished, by outcome |
+
+### Object writes
+
+A cache with [`spec.writes`](#write-settings) accepts writes on its client
+socket. Racer stores each page on several nodes, makes each copy durable on
+disk (`fdatasync`), and then acknowledges. It then uploads the object to the
+origin, according to its upload mode.
+
+Racer is still a cache. Written data that is not uploaded is safe only while
+enough of its copies survive. Racer is not the system of record for an object
+until its upload state is `committed`.
+
+Writes are create-once. You cannot overwrite or append to an object. To
+replace data, write a new key.
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `PUT` | `/v1/objects/<key>` | Create an object from the request body |
+| `POST` | `/v1/objects/<key>/host-write` | Create an object from a file descriptor passed with `SCM_RIGHTS` |
+| `POST` | `/v1/objects/<key>/persist` | Start the upload of a `manual` object |
+| `DELETE` | `/v1/objects/<key>` | Remove a written object from the cache |
+
+`<key>` is the 64-hex cache key, and `Host` must be `racer`, as for reads.
+Writes never delete origin objects.
+
+When writes are off, or the cache is passthrough, these requests, including
+`persist`, get `405` with `Allow: HEAD, POST`, the same as a node that does
+not support writes.
+
+When writes are on, a `405` lists the methods its path accepts:
+`Allow: HEAD, POST, PUT, DELETE` on `/v1/objects/<key>`, and `Allow: POST` on
+`host-read`, `gpu-read`, `host-write`, and `persist`. Any method other than
+`POST` on `host-write` or `persist` gets that `405`.
+
+#### Write request headers
+
+| Header | Requests | Rule |
+|--------|----------|------|
+| `Content-Length` | `PUT` | Required. 1 up to the size limit below. Missing: `411`. Too large: `413`. `0`: `400`. Other requests must send `0` or omit it. |
+| `If-None-Match` | `PUT`, `host-write` | Required, exactly `*`. Otherwise `428`. |
+| `Racer-Metadata` | all | Origin context. It must name the object without a version (Azure: no `versionId`), and its `bucket` must be the container in the cache's `containerURL`, because that is where the upload goes. Required on `persist`, and on `PUT` and `host-write` unless the upload mode is `never`. Optional on `DELETE`. Missing, versioned, not matching the key, or another bucket: `400` (another bucket has token `bucket`). |
+| `Authorization` | all | Optional, as for reads. |
+| `Racer-Durability` | `PUT`, `host-write` | `replicas=1`, `replicas=2`, `replicas=3`, or `origin`. Default `replicas=<writes.replicas>`. `origin` acknowledges only after the upload commits; with `Racer-Upload: manual` or `never` it is `400`. |
+| `Racer-Upload` | `PUT`, `host-write` | `auto`, `manual`, or `never` (lower case). Default `writes.upload.mode`. A cache without an origin accepts only `never`; other modes get `400`. |
+| `Racer-Hold-Seconds` | `PUT`, `host-write` | 1..2,592,000 (30 days). Default `writes.holdTTL`. |
+| `Racer-Content-Type` | `PUT`, `host-write` | Optional content type, stored with the object. |
+| `Racer-Source-Offset`, `Racer-Source-Length` | `host-write` | Required. The window of the passed descriptor. The length is the object size and must not be `0`. |
+
+Creation headers on `persist` or `DELETE`, and source headers on `PUT`, are
+`400`. So are `Transfer-Encoding`, `Content-Encoding`, `Content-Range`,
+`Range`, `Expect`, `If-Match`, `ETag`, and `Racer-Expires-At`. Send the body
+at once; `Expect: 100-continue` is not supported.
+
+For `host-write`, send exactly one file descriptor with the request, as
+`SCM_RIGHTS` data. It must be a regular file or memfd at least
+`Racer-Source-Offset + Racer-Source-Length` bytes long; otherwise the answer is
+`400`. Racer reads from it, so it must be open for reading; unlike `host-read`,
+it need not be writable. The file must not change until the response arrives.
+
+#### Size limits
+
+An object has at most 50,000 pages, the Azure Blob block limit. Racer uploads
+one block per page. With 16 MiB pages, the largest object is
+838,860,800,000 bytes (about 781 GiB). Racer encodes the page holder table
+compactly, so default placement supports objects at this limit.
+
+#### Write responses
+
+Response bodies are empty.
+
+| Status | When |
+|--------|------|
+| `201 Created` | `PUT` or `host-write` is durable at the requested level and visible to readers. Has `ETag: "racer-<32 hex>"` and `Racer-Upload-State`. |
+| `204 No Content` | `DELETE` or `persist` accepted. `persist` also returns `Racer-Upload-State`. A `204` `DELETE` is durable: as many nodes as the object has copies recorded it on disk. |
+| `400` | Bad headers, a short body, or a bad header combination. |
+| `401`, `403` | Authorization or origin access was refused. |
+| `404` | `persist` or `DELETE` of a key with no written object. |
+| `405` | Writes off, passthrough cache, or wrong method. |
+| `409` | `persist` of an object that is not `manual`, or `DELETE` of an uploaded object. |
+| `411` | `PUT` without `Content-Length`. |
+| `412` | The key already exists in the cache or the origin. |
+| `413` | Object over the size limit. |
+| `428` | `If-None-Match: *` missing. |
+| `431` | Request headers too large. |
+| `500` | An internal fault, such as the random source failing. Retrying the same request is not expected to help. |
+| `502` | Upload failed under `Racer-Durability: origin`. Token `upload`. |
+| `503` | Racer cannot take the write now, for example because the dirty limit is reached or too few nodes are reachable. Has `Retry-After: 1`. A `503` `DELETE` may already have removed the object; retry it. A retry returns `204`, or `404` once the earlier delete is durable. |
+| `504` | The request deadline passed before the write was durable. |
+
+Errors may carry a `Racer-Write-Error` token for diagnosis:
+
+| Token | Meaning |
+|-------|---------|
+| `dirty-cap` | Nodes are at the dirty limit. Retry after uploads catch up. |
+| `owners` | Too few nodes could store the pages. |
+| `coordinator` | The node that coordinates this object is unreachable. |
+| `lease` | The write session expired. |
+| `upload` | The upload failed. |
+| `uploaded` | `DELETE` of an object that is already in the origin. |
+| `not-manual` | `persist` of an object that is not `manual`. |
+| `bucket` | `Racer-Metadata` names a bucket other than the origin's container. |
+
+If another writer creates the blob in the origin first, the upload fails and
+the object's state becomes `failed`.
+
+#### Upload states
+
+`HEAD` on a written object returns its Racer `ETag`, `Content-Length`,
+`Racer-Expires-At`, and `Racer-Upload-State`. `Racer-Expires-At` is when the
+reader must check again: about 1 second ahead, and never after the hold ends.
+Readers recheck written objects about every second, so a `DELETE` or a
+finished upload is seen across the cluster within about a second. After the
+upload commits, `HEAD` and reads return the origin blob's `ETag`, not the
+Racer `ETag`. `HEAD` still reports `Racer-Upload-State: committed` under the
+blob `ETag` while the cluster tracks the write. Once it no longer does (for
+example after a node restart), `HEAD` returns the blob `ETag` with no
+`Racer-Upload-State`, like any origin object. A client that polls for
+`committed` should treat a non-Racer `ETag` with no upload state as already
+uploaded.
+
+`HEAD` asks the object's write coordinator for the upload state and waits at
+most half of the remaining request time, up to 1 second. If the coordinator
+does not answer in time, `HEAD` still succeeds but omits `Racer-Upload-State`.
+A client that needs the state, such as one waiting for `committed`, should
+retry `HEAD` when the header is missing under a Racer `ETag`.
+
+| State | Meaning |
+|-------|---------|
+| `pending` | Waiting to upload (`auto`). |
+| `manual` | Waiting for `persist`. |
+| `uploading` | Upload in progress. |
+| `committed` | In the origin. The cache copies are now ordinary cached pages. |
+| `failed` | Upload failed. The object stays pinned until its hold ends, so you can read it back. |
+| `never` | Cache-only. Never uploaded. |
+
+Racer uploads each page as one Azure Put Block from a node that holds it, then
+commits the blob with Put Block List and `If-None-Match: *`. It tries an object
+up to `RACER_WRITE_UPLOAD_ATTEMPTS` times. Objects deleted, or whose hold ends,
+before the upload starts are dropped and never uploaded.
+
+Origin credentials are kept only in memory. If the node that coordinates an
+object restarts before its upload finishes, the upload waits until a client
+calls `persist` again with `Racer-Metadata`.
+
+#### Holds and the dirty limit
+
+Each written object is pinned for its hold time and cannot be evicted. An
+`auto` object is released once its upload commits, or when its hold ends,
+whichever comes first. `manual`, `never`, and `failed` objects stay pinned
+until their hold ends, then are removed. Use `DELETE` to free them early.
+
+Each storage worker limits the written data of a cache that is not yet
+uploaded to `writes.maxDirtyPercent` of the worker's segment capacity. A node
+over the limit refuses new pages, and Racer tries the next node in rank order.
+If too few nodes can take a page and at least one was full, the write fails
+with `503`, `Retry-After: 1`, and `Racer-Write-Error: dirty-cap`. If no node
+was full, the token is `owners`. The SDKs can retry these for you.
+
+New written pages also leave one segment per storage worker free of written
+data, so key rotation can always move written pages to the new key. A node
+whose written data fills all but that segment refuses new pages the same way.
+
+Node settings for writes are in the [Writes](#writes) table above.
+
+#### Write metrics
+
+Write metrics are per node. Most are labeled by cache ID, and a series
+appears only after the cache sees write activity.
+
+| Metric | Meaning |
+|--------|---------|
+| `racer_write_requests_total{cache,outcome}` | Write requests by outcome: `created`, `deleted`, `persisted`, `exists`, `rejected`, `unavailable`, `failed` |
+| `racer_write_bytes_total{cache}` | Bytes written |
+| `racer_write_dirty_bytes{cache}` | Written bytes not yet uploaded |
+| `racer_write_fsync_seconds` | Durability barrier latency on page stores and coordinator journal appends (histogram, no labels) |
+| `racer_write_upload_bytes_total{cache}` | Bytes uploaded to the origin |
+| `racer_write_upload_state{cache,state}` | Written objects by upload state |
+| `racer_write_repairs_total{cache}` | Pages copied again after a node holding a copy left the cache's pool. |
+| `racer_write_unreadable_pages{cache}` | Written pages on this node whose page key left the keyring before they were rekeyed. This node's copy of each is lost; nonzero means a holder fell behind key rotation. |
+
+Written objects can stay pinned (up to 30 days with `Racer-Hold-Seconds`)
+much longer than a page key stays readable (`RACER_RETAINED_PAGE_KEYS` key
+rotations). Each holder therefore reseals its written pages under the active
+page key after every rotation, up to 8 pages per maintenance turn per I/O
+worker. The authority keeps at least 2 readable page keys for every cache
+with `writes` set, whatever `RACER_RETAINED_PAGE_KEYS` says, so a holder has
+one full rotation interval after each activation to finish. With
+`RACER_RETAINED_PAGE_KEYS=1` this costs each write-enabled cache one extra key
+in the cluster key bundle, so fewer write-enabled caches fit than read-only
+ones. A cache that enables writes when the bundle has no room for that key
+keeps serving reads but is published without writes until room frees up. A holder that is
+down longer than the retention window (`RACER_RETAINED_PAGE_KEYS` times the
+rotation interval) loses its copies; they are counted in
+`racer_write_unreadable_pages`.
 
 ### Spill holds
 
@@ -1831,7 +2097,42 @@ status = client.prefetch_status("epoch-17", wait=30, refs="failed")
 | Origin | `/run/racer/<name>/origin/socket`, mode `0600`, in a dataplane-created directory owned by UID/GID 65532 with mode `0700` |
 
 For tests, `github.com/Azure/unbounded/pkg/racersdk/racersdktest` runs a
-noncaching fake Racer. It does not test distributed or RDMA behavior.
+noncaching fake Racer. It does not test distributed or RDMA behavior, and it
+does not serve host-read, so `HostRead` fails against it.
+
+### Go writes
+
+The Go SDK wraps the [write API](#object-writes):
+
+```go
+func (c *Client) Put(ctx context.Context, request Request, body io.Reader, length int64, options WriteOptions) (WriteResult, error)
+func (c *Client) HostWrite(ctx context.Context, request Request, file *os.File, offset, length int64, options WriteOptions) (WriteResult, error)
+func (c *Client) Persist(ctx context.Context, request Request) (UploadState, error)
+func (c *Client) Delete(ctx context.Context, request Request) error
+```
+
+```go
+result, err := client.Put(ctx, request, bytes.NewReader(data), int64(len(data)),
+	racersdk.WriteOptions{Replicas: 2, Upload: racersdk.UploadNever, Hold: time.Hour})
+if errors.Is(err, racersdk.ErrExists) {
+	// The key exists; writes are create-once. Write a new key instead.
+	return err
+}
+if err != nil {
+	return err
+}
+fmt.Println(result.ETag, result.UploadState)
+```
+
+The zero `WriteOptions` uses the cache defaults. `OriginDurable` waits for the
+upload to commit. `RetryBusy` retries `503` answers for up to that long; `Put`
+retries only when the body is an `io.ReadSeeker`. `Request.Metadata` must not
+name a version, and unless the upload mode is `never` its bucket must be the
+origin's container. Errors match `ErrExists` (`412`), `ErrWritesDisabled` (`405`),
+`ErrBusy` (`503`), `ErrUploadFailed` (`502`), `ErrConflict` (`409`), and
+`ErrInternal` (`500`). Use
+`errors.As` with `*WriteError` to read the status, `Racer-Write-Error` token,
+and `Retry-After`.
 
 ## Client socket mount
 

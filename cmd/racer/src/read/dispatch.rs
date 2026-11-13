@@ -129,6 +129,10 @@ pub struct NodeDirectory {
     ctx: racer_io::WorkerCtx,
     mailboxes: Vec<Arc<Mailbox>>,
     sequence: AtomicU64,
+    /// Node-wide staging of written pages until their targets pull them.
+    pub(crate) write_staging: Arc<crate::write::WriteStaging>,
+    /// Node-wide per-cache upload limits.
+    pub(crate) upload_limits: Arc<crate::origin::upload::UploadLimits>,
 }
 
 enum Work {
@@ -191,6 +195,8 @@ enum Work {
     Publish(VersionMetadata),
     Retained(ObjectVersion),
     Peer(VerifiedRequest, std::sync::Arc<crate::topology::Membership>),
+    /// Write work for this worker's objects or pages.
+    Write(Box<crate::write::WriteWork>),
 }
 enum Value {
     Held(HoldEpoch),
@@ -203,7 +209,17 @@ enum Value {
     Peer(PeerResponse),
     Prefetched(racer_core::prefetch::PageResult),
     Resident(bool),
+    Write(crate::write::WriteValue),
 }
+impl Value {
+    fn into_write(self) -> Result<crate::write::WriteValue> {
+        match self {
+            Value::Write(value) => Ok(value),
+            _ => Err(Error::StaleFlight),
+        }
+    }
+}
+
 /// Runtime executor specialized to application work results and acquisition credits.
 type Executor = mailbox::executor::Executor<Value, AcquisitionBudget, RequestScope>;
 
@@ -913,6 +929,85 @@ impl WorkerDirectory {
             Ok(found)
         })
     }
+    /// Serve a write operation from this node on the object's metadata
+    /// worker, as a peer request would be, without a network hop.
+    pub(crate) async fn write_serve(
+        &self,
+        requester: racer_wire::control::NodeId,
+        operation: crate::peer::protocol::Operation,
+        context: &OriginContext,
+        membership: Arc<crate::topology::Membership>,
+        scope: &RequestScope,
+    ) -> Result<racer_core::write::WriteReply> {
+        let object = operation
+            .write_object()
+            .ok_or(Error::InvalidRequest)?
+            .clone();
+        let owner = self.metadata_owner(&object)?;
+        if self.is_local(owner) {
+            let local = self.local()?;
+            return crate::write::coordinator::serve(
+                &local, &requester, operation, context, membership, scope,
+            )
+            .await;
+        }
+        let acquire = matches!(
+            operation,
+            crate::peer::protocol::Operation::WriteSession { .. }
+                | crate::peer::protocol::Operation::WriteUpload { .. }
+        );
+        let sealed = if acquire {
+            Some(self.seal(context, scope)?)
+        } else {
+            None
+        };
+        let work = crate::write::WriteWork::Serve {
+            requester,
+            operation,
+            context: sealed,
+            membership,
+        };
+        match self
+            .submit(owner, Work::Write(Box::new(work)), scope, None)?
+            .await?
+            .value?
+        {
+            Value::Write(crate::write::WriteValue::Reply(reply)) => Ok(reply),
+            _ => Err(Error::StaleFlight),
+        }
+    }
+
+    /// Run per-page write work on `page`'s owning worker.
+    pub(crate) async fn write_page(
+        &self,
+        page: &PageId,
+        work: crate::write::WriteWork,
+        scope: &RequestScope,
+    ) -> Result<crate::write::PageOutcome> {
+        let owner = self.page_owner(page)?;
+        let value = if self.is_local(owner) {
+            crate::write::execute(&*self.local()?, work, scope).await?
+        } else {
+            self.submit(owner, Work::Write(Box::new(work)), scope, None)?
+                .await?
+                .value?
+                .into_write()?
+        };
+        match value {
+            crate::write::WriteValue::Page(outcome) => Ok(outcome),
+            crate::write::WriteValue::Reply(_) => Err(Error::StaleFlight),
+        }
+    }
+
+    /// Seal `context` for an upload on another worker of this node.
+    pub(crate) fn seal_for_worker(
+        &self,
+        context: &OriginContext,
+        scope: &RequestScope,
+    ) -> Result<PeerOriginContext> {
+        self.seal(context, scope)
+    }
+
     fn peer<'a>(
         &'a self,
         request: VerifiedRequest,
@@ -936,6 +1031,14 @@ impl WorkerDirectory {
                 // page's owning worker.
                 crate::peer::protocol::Operation::Prefetch { version, .. } => {
                     self.metadata_owner(&version.object)?
+                }
+                // Not served yet (WP5 routes writes); the owner's
+                // `serve_peer` rejects them.
+                operation @ (crate::peer::protocol::Operation::WriteSession { .. }
+                | crate::peer::protocol::Operation::WriteStore { .. }
+                | crate::peer::protocol::Operation::WriteRelease { .. }
+                | crate::peer::protocol::Operation::WriteUpload { .. }) => {
+                    self.metadata_owner(operation.write_object().ok_or(Error::InvalidRequest)?)?
                 }
             };
             if self.is_local(owner) {
@@ -1295,6 +1398,9 @@ async fn execute(
             .serve_peer(request, membership, scope)
             .await
             .map(Value::Peer),
+        Work::Write(work) => crate::write::execute(local, *work, scope)
+            .await
+            .map(Value::Write),
     }
 }
 
@@ -1335,6 +1441,8 @@ impl NodeDirectory {
                 })
                 .collect(),
             sequence: AtomicU64::new(1),
+            write_staging: Arc::default(),
+            upload_limits: Arc::default(),
         })
     }
 

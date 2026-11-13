@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -537,5 +538,103 @@ func TestEnvtestClusterCachePassthroughValidation(t *testing.T) {
 		}}
 		require.NoError(t, c.Create(t.Context(), obj))
 		require.NoError(t, update(t, name, nil))
+	})
+}
+
+func TestEnvtestClusterCacheWritesValidation(t *testing.T) {
+	assets := os.Getenv("KUBEBUILDER_ASSETS")
+	if assets == "" {
+		t.Skip("set KUBEBUILDER_ASSETS for real API validation tests")
+	}
+
+	environment := &envtest.Environment{BinaryAssetsDirectory: assets, CRDDirectoryPaths: []string{"crd"}, ErrorIfCRDPathMissing: true}
+	rc, err := environment.Start()
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, environment.Stop()) })
+
+	scheme := runtime.NewScheme()
+	require.NoError(t, AddToScheme(scheme))
+	c, err := client.New(rc, client.Options{Scheme: scheme})
+	require.NoError(t, err)
+
+	n := 0
+	create := func(spec map[string]any) (string, error) {
+		n++
+		name := fmt.Sprintf("writes-%d", n)
+		obj := &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": GroupVersion.String(),
+			"kind":       "ClusterCache",
+			"metadata":   map[string]any{"name": name},
+			"spec":       spec,
+		}}
+
+		return name, c.Create(t.Context(), obj)
+	}
+	origin := func() map[string]any {
+		return map[string]any{"azure": map[string]any{"containerURL": "https://acct.blob.core.windows.net/models"}}
+	}
+	never := map[string]any{"upload": map[string]any{"mode": "Never"}}
+
+	t.Run("defaults every field", func(t *testing.T) {
+		name, err := create(map[string]any{"origin": origin(), "writes": map[string]any{"upload": map[string]any{}}})
+		require.NoError(t, err)
+
+		cache := &ClusterCache{}
+		require.NoError(t, c.Get(t.Context(), client.ObjectKey{Name: name}, cache))
+		w := cache.Spec.Writes
+		require.NotNil(t, w)
+		require.Equal(t, int32(2), *w.Replicas)
+		require.Equal(t, int32(30), *w.MaxDirtyPercent)
+		require.Equal(t, 24*time.Hour, w.HoldTTL.Duration)
+		require.NotNil(t, w.Upload)
+		require.Equal(t, UploadModeAuto, *w.Upload.Mode)
+		require.Equal(t, int32(16), *w.Upload.MaxConcurrentBlocks)
+		require.Nil(t, w.Upload.MaxBytesPerSecond)
+	})
+
+	for name, spec := range map[string]map[string]any{
+		"with origin":          {"origin": origin(), "writes": map[string]any{}},
+		"never without origin": {"writes": never},
+		"full": {"origin": origin(), "writes": map[string]any{
+			"replicas": int64(3), "maxDirtyPercent": int64(90), "holdTTL": "720h",
+			"upload": map[string]any{"mode": "Manual", "maxBytesPerSecond": int64(0), "maxConcurrentBlocks": int64(1024)},
+		}},
+	} {
+		t.Run("accepts "+name, func(t *testing.T) {
+			_, err := create(spec)
+			require.NoError(t, err)
+		})
+	}
+
+	for name, tc := range map[string]struct {
+		spec map[string]any
+		msg  string
+	}{
+		"passthrough":            {map[string]any{"passthrough": map[string]any{}, "writes": never}, "writes cannot be combined with passthrough"},
+		"upload without origin":  {map[string]any{"writes": map[string]any{}}, "writes.upload.mode must be Never unless origin is set"},
+		"manual without origin":  {map[string]any{"writes": map[string]any{"upload": map[string]any{"mode": "Manual"}}}, "writes.upload.mode must be Never"},
+		"zero replicas":          {map[string]any{"origin": origin(), "writes": map[string]any{"replicas": int64(0)}}, "spec.writes.replicas"},
+		"four replicas":          {map[string]any{"origin": origin(), "writes": map[string]any{"replicas": int64(4)}}, "spec.writes.replicas"},
+		"dirty percent too high": {map[string]any{"origin": origin(), "writes": map[string]any{"maxDirtyPercent": int64(91)}}, "spec.writes.maxDirtyPercent"},
+		"zero hold":              {map[string]any{"origin": origin(), "writes": map[string]any{"holdTTL": "0s"}}, "holdTTL must be positive and at most 720h"},
+		"long hold":              {map[string]any{"origin": origin(), "writes": map[string]any{"holdTTL": "721h"}}, "holdTTL must be positive and at most 720h"},
+		"lowercase mode":         {map[string]any{"origin": origin(), "writes": map[string]any{"upload": map[string]any{"mode": "auto"}}}, "spec.writes.upload.mode"},
+		"negative bandwidth":     {map[string]any{"origin": origin(), "writes": map[string]any{"upload": map[string]any{"maxBytesPerSecond": int64(-1)}}}, "spec.writes.upload.maxBytesPerSecond"},
+		"zero blocks":            {map[string]any{"origin": origin(), "writes": map[string]any{"upload": map[string]any{"maxConcurrentBlocks": int64(0)}}}, "spec.writes.upload.maxConcurrentBlocks"},
+	} {
+		t.Run("rejects "+name, func(t *testing.T) {
+			_, err := create(tc.spec)
+			require.True(t, apierrors.IsInvalid(err), "%v", err)
+			require.ErrorContains(t, err, tc.msg)
+		})
+	}
+
+	t.Run("unset stays unset", func(t *testing.T) {
+		name, err := create(map[string]any{})
+		require.NoError(t, err)
+
+		cache := &ClusterCache{}
+		require.NoError(t, c.Get(t.Context(), client.ObjectKey{Name: name}, cache))
+		require.Nil(t, cache.Spec.Writes)
 	})
 }

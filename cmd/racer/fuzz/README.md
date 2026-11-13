@@ -7,10 +7,12 @@ Racer parsers. Every target must return normally on any input; a panic is a bug.
 | ------------------- | ------------------------------------------------------------------------ |
 | `http_head`         | `http1::Codec::decode_head` (default and `trim_ows`, with opaque fields) |
 | `small_body`        | `http1::small::Decoder` (chunked, close-delimited, fixed length)         |
-| `peer_envelope`     | `peer_wire::decode_signed`, `decode_envelope`, `decode_attachment`, and related decoders |
+| `peer_envelope`     | `peer_wire::decode_signed`, `decode_envelope`, `decode_attachment`, and related decoders (seeds include write operation proofs) |
 | `control_documents` | `racer_wire::control` publication, keyring bundle, and enrollment decode  |
 | `store_record`      | `racer::store::parse_bytes` and `parse_prefix` (disk record headers)     |
 | `checkpoint`        | `racer::store::checkpoint::decode`                                       |
+| `write_head`        | `racer_wire::object::write::parse_write` on decoded heads               |
+| `write_journal`     | `racer_core::write::journal` replay, header, manifest, and holder decode |
 
 ## Layout
 
@@ -26,7 +28,7 @@ the fuzzer discovers, plus `artifacts/`, are ignored by `.gitignore`.
 `tests/seeds.rs` checks that every seed decodes with the current parsers and
 that encoder-built seeds (publication, keyring bundle, and enrollment
 documents copied from `wire/testdata`, peer v2 envelopes, the checkpoint
-image, and the store record) are current. Regenerate them after a format
+image, the store record, and the write journal records) are current. Regenerate them after a format
 change with:
 
 ```sh

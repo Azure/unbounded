@@ -589,6 +589,7 @@ impl Harness {
                     Ok(transition) => {
                         let node = &self.nodes[index];
                         let mut publication = publication(&node.config, self.generation, vec![]);
+                        publication.page_size = self.page_size;
                         publication.membership_version = MembershipVersion(self.generation);
                         publication.members = members.iter().cloned().map(Into::into).collect();
                         node.workers[0]

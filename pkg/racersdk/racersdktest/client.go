@@ -58,8 +58,16 @@ func NewClient(t testing.TB, origin racersdk.Origin) *racersdk.Client {
 }
 
 func start(origin racersdk.Origin) (*racersdk.Client, func(), error) {
+	return startWith(origin, nil)
+}
+
+func startWith(origin racersdk.Origin, writes *Writes) (*racersdk.Client, func(), error) {
 	if origin == nil {
 		return nil, nil, errors.New("nil origin")
+	}
+
+	if writes != nil {
+		origin = writes.wrap(origin)
 	}
 
 	newClient, ok := sdkhook.NewClientAt.(func(racersdk.ClientConfig, string) (*racersdk.Client, error))
@@ -93,8 +101,16 @@ func start(origin racersdk.Origin) (*racersdk.Client, func(), error) {
 	metadataTransport.MaxConnsPerHost = originHeadRequests
 	metadataTransport.MaxIdleConns = originHeadRequests
 	metadataTransport.MaxIdleConnsPerHost = originHeadRequests
-	handler := &trackedHandler{next: fakeracer.NewHandler(originTransports{bulk: transport, metadata: metadataTransport})}
+
+	var fakeWrites *fakeracer.Writes
+	if writes != nil {
+		fakeWrites = writes.dir
+	}
+
+	prefetches := fakeracer.NewPrefetches(fakeracer.PrefetchConfig{})
+	handler := &trackedHandler{next: fakeracer.NewHandlerWithWrites(originTransports{bulk: transport, metadata: metadataTransport}, prefetches, fakeWrites)}
 	server := &http.Server{
+		ConnContext:       fakeracer.ConnContext,
 		ReadHeaderTimeout: originHeaderWait, IdleTimeout: originIdleTimeout,
 		MaxHeaderBytes: wire.MaxHeadBytes, ErrorLog: log.New(io.Discard, "", 0),
 		BaseContext: func(net.Listener) context.Context { return ctx },
@@ -133,10 +149,12 @@ func start(origin racersdk.Origin) (*racersdk.Client, func(), error) {
 		return nil, nil, err
 	}
 
-	listener, err := net.Listen("unix", clientPath)
+	unixListener, err := net.ListenUnix("unix", &net.UnixAddr{Name: clientPath, Net: "unix"})
 	if err != nil {
 		return nil, nil, fmt.Errorf("fake listen: %w", err)
 	}
+
+	listener := fakeracer.FileListener{UnixListener: unixListener}
 
 	serving.Go(func() {
 		defer closeBody(listener)

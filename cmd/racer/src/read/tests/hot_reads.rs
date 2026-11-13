@@ -1015,6 +1015,7 @@ fn zero_priority_read_beside_active_cache_progresses_while_first_page_is_held() 
             priority,
             mode: racer_wire::control::CacheMode::Cached,
             origin: None,
+            writes: None,
         };
     admission
         .policy()

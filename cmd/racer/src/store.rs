@@ -44,7 +44,9 @@ use std::rc::Rc;
 pub mod catalog;
 pub mod checkpoint;
 pub mod holds;
+pub mod journal;
 mod pages;
+pub mod writes;
 
 pub struct Store {
     pub reader: Rc<StoreReader>,
@@ -598,6 +600,8 @@ pub struct StoreWriter {
     space_deferred: Cell<bool>,
     /// Last time a persist failure was logged, for rate limiting.
     last_failure_log: Cell<Option<std::time::Instant>>,
+    /// Durable written (write-back) pages; see [`writes`].
+    writes: writes::Writes,
 }
 /// Why a dirty page write failed, for `racer_dirty_discard_reasons_total`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -676,6 +680,7 @@ impl StoreWriter {
             space_deferred: Cell::new(false),
             last_failure_log: Cell::new(None),
             closed: Cell::new(false),
+            writes: writes::Writes::default(),
         }
     }
     pub fn with_metrics(mut self, metrics: crate::telemetry::Metrics) -> Self {

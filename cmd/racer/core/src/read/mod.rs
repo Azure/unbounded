@@ -170,6 +170,9 @@ pub enum PeerResponse<P, G> {
     StaleMembership,
     /// One owner result per page named by a `prefetch` operation, in order.
     Prefetch(Vec<crate::prefetch::PageResult>),
+    /// Reply to a write peer operation (`write-session`, `write-store`,
+    /// `write-release`, or `write-upload`). Never carries page bytes.
+    Write(crate::write::WriteReply),
 }
 
 impl<P, G> PeerResponse<P, G> {
@@ -190,6 +193,7 @@ impl<P, G> PeerResponse<P, G> {
             Self::OriginForbidden => ResponseKind::OriginForbidden,
             Self::StaleMembership => ResponseKind::StaleMembership,
             Self::Prefetch(_) => ResponseKind::Prefetch,
+            Self::Write(_) => ResponseKind::Write,
         }
     }
 }
@@ -205,6 +209,9 @@ mod response_tests {
         let prefetch: PeerResponse<(), ()> =
             PeerResponse::Prefetch(vec![crate::prefetch::PageResult::Resident]);
         assert_eq!(prefetch.kind(), ResponseKind::Prefetch);
+        let write: PeerResponse<(), ()> = PeerResponse::Write(crate::write::WriteReply::Released);
+        assert_eq!(write.kind(), ResponseKind::Write);
+        assert!(!ResponseKind::Write.has_payload());
     }
 }
 
@@ -346,8 +353,12 @@ pub enum ServeAction {
 }
 
 /// Dispatch rule. Subscriptions never arrive here; prefetch fills always acquire.
+/// Write operations are not read work and are rejected.
 pub fn serve_action(facts: ServeFacts) -> ServeAction {
-    if facts.operation == OperationKind::Subscribe {
+    if matches!(
+        facts.operation,
+        OperationKind::Subscribe | OperationKind::Write
+    ) {
         return ServeAction::Reject(Error::InvalidRequest);
     }
     if !facts.object_matches {
@@ -423,6 +434,14 @@ mod serve_tests {
         assert_eq!(
             serve_action(facts(OperationKind::Prefetch, true)),
             ServeAction::Acquire
+        );
+        assert_eq!(
+            serve_action(facts(OperationKind::Write, true)),
+            ServeAction::Reject(Error::InvalidRequest)
+        );
+        assert_eq!(
+            serve_action(facts(OperationKind::Write, false)),
+            ServeAction::Reject(Error::InvalidRequest)
         );
         assert_eq!(
             serve_action(ServeFacts {
@@ -1241,6 +1260,8 @@ pub enum OperationKind {
     },
     Bootstrap,
     Prefetch,
+    /// Any write peer operation. The read serve path rejects it.
+    Write,
 }
 
 /// Payload-free shape of a peer response.
@@ -1261,6 +1282,8 @@ pub enum ResponseKind {
     OriginForbidden,
     StaleMembership,
     Prefetch,
+    /// A write peer operation reply ([`crate::write::WriteReply`]).
+    Write,
 }
 
 impl ResponseKind {

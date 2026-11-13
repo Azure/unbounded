@@ -49,6 +49,10 @@ use std::time::SystemTime;
 #[cfg(test)]
 use std::time::UNIX_EPOCH;
 
+pub mod write;
+pub use racer_core::write::{SessionId, WriteAction, WriteReply};
+pub use write::WriteStore;
+
 pub enum FetchMode {
     CopyOnly,
     Acquire,
@@ -292,6 +296,64 @@ pub enum Operation {
         version: ObjectVersion,
         action: PrefetchAction,
     },
+    /// Write session control sent to the object's coordinator (page-zero
+    /// owner). `etag` names the version and is required except for
+    /// `status`, `delete`, and `persist`
+    /// ([`write::action_requires_etag`]). Acquire mode: carries origin
+    /// context for the open-time origin check.
+    WriteSession {
+        object: ObjectId,
+        etag: Option<StrongEtag>,
+        /// Boxed: a `replicate` manifest is much larger than other operations.
+        action: Box<WriteAction>,
+    },
+    /// Ask a store target to pull pages from `store.source` and make them
+    /// durable. Copy-only, without origin context.
+    WriteStore {
+        version: ObjectVersion,
+        store: Box<WriteStore>,
+    },
+    /// Drop write pins on `pages` held for `session`. Copy-only, without
+    /// origin context. With `keep` (after the object uploaded), the pages stay
+    /// readable as ordinary cache; without it (delete, abort, expiry) they are
+    /// removed from the catalog at once.
+    WriteRelease {
+        version: ObjectVersion,
+        session: SessionId,
+        pages: Vec<u64>,
+        keep: bool,
+    },
+    /// Ask a holder to upload `pages` to the origin. Acquire mode: carries
+    /// origin context for upload credentials.
+    WriteUpload {
+        version: ObjectVersion,
+        session: SessionId,
+        pages: Vec<u64>,
+    },
+}
+
+impl Operation {
+    /// Whether this is one of the write operations.
+    pub fn is_write(&self) -> bool {
+        matches!(
+            self,
+            Self::WriteSession { .. }
+                | Self::WriteStore { .. }
+                | Self::WriteRelease { .. }
+                | Self::WriteUpload { .. }
+        )
+    }
+
+    /// The object a write operation addresses, or `None` for reads.
+    pub fn write_object(&self) -> Option<&ObjectId> {
+        match self {
+            Self::WriteSession { object, .. } => Some(object),
+            Self::WriteStore { version, .. }
+            | Self::WriteRelease { version, .. }
+            | Self::WriteUpload { version, .. } => Some(&version.object),
+            _ => None,
+        }
+    }
 }
 
 /// One `prefetch` peer action. Pages are ascending, unique, 1..=256 entries.
@@ -594,7 +656,76 @@ pub fn request_head(clock: &racer_io::Clock, request: &PeerRequest) -> Result<Me
             }
             (&version.object, &PREFETCH_MODE)
         }
+        Operation::WriteSession {
+            object,
+            etag,
+            action,
+        } => {
+            push(&mut head, "racer-operation", "write-session");
+            match etag {
+                Some(etag) => version_fields(
+                    &mut head,
+                    &ObjectVersion {
+                        object: object.clone(),
+                        etag: etag.clone(),
+                    },
+                )?,
+                None if write::action_requires_etag(action) => {
+                    return Err(Error::InvalidRequest);
+                }
+                None => object_fields(&mut head, object)?,
+            }
+            if let (
+                WriteAction::Replicate { manifest } | WriteAction::ReplicateRanked { manifest, .. },
+                Some(etag),
+            ) = (&**action, etag)
+                && manifest.etag != etag.as_str()
+            {
+                return Err(Error::InvalidRequest);
+            }
+            write::encode_action(&mut head, action)?;
+            (object, &WRITE_ACQUIRE_MODE)
+        }
+        Operation::WriteStore { version, store } => {
+            push(&mut head, "racer-operation", "write-store");
+            version_fields(&mut head, version)?;
+            write::encode_store(&mut head, store)?;
+            (&version.object, &WRITE_COPY_MODE)
+        }
+        Operation::WriteRelease {
+            version,
+            session,
+            pages,
+            keep,
+        } => {
+            push(&mut head, "racer-operation", "write-release");
+            version_fields(&mut head, version)?;
+            write::encode_session_pages(&mut head, session, pages)?;
+            // Omitted when false, so the encoding is canonical.
+            if *keep {
+                push(&mut head, write::WRITE_KEEP, "1");
+            }
+            (&version.object, &WRITE_COPY_MODE)
+        }
+        Operation::WriteUpload {
+            version,
+            session,
+            pages,
+        } => {
+            push(&mut head, "racer-operation", "write-upload");
+            version_fields(&mut head, version)?;
+            write::encode_session_pages(&mut head, session, pages)?;
+            (&version.object, &WRITE_ACQUIRE_MODE)
+        }
     };
+    // Copy-only write operations never carry origin credentials or metadata.
+    if matches!(
+        request.operation,
+        Operation::WriteStore { .. } | Operation::WriteRelease { .. }
+    ) && (request.origin.authorization.is_some() || request.origin.metadata.is_some())
+    {
+        return Err(Error::InvalidRequest);
+    }
     if op_object != &request.origin.object {
         return Err(Error::InvalidRequest);
     }
@@ -646,6 +777,11 @@ pub fn request_head(clock: &racer_io::Clock, request: &PeerRequest) -> Result<Me
 }
 /// Prefetch operations carry origin credentials for the owner's fill.
 const PREFETCH_MODE: FetchMode = FetchMode::Acquire;
+/// `write-session` and `write-upload` carry origin context (the open-time
+/// origin check and upload credentials).
+const WRITE_ACQUIRE_MODE: FetchMode = FetchMode::Acquire;
+/// `write-store` and `write-release` are node-to-node and never touch the origin.
+const WRITE_COPY_MODE: FetchMode = FetchMode::CopyOnly;
 
 fn prefetch_action(head: &MessageHead) -> Result<PrefetchAction> {
     let pages = racer_core::prefetch::decode_pages(&bytes(head, "racer-prefetch-pages")?)
@@ -763,6 +899,10 @@ pub fn response_head(
                 &racer_core::prefetch::encode_results(results),
             );
             ("prefetch", 0)
+        }
+        PeerResponse::Write(reply) => {
+            write::encode_reply(&mut head, reply)?;
+            ("write", 0)
         }
     };
     head.start = StartLine::Response {
@@ -1180,6 +1320,7 @@ fn bodyless_response(head: &MessageHead, outcome: &str) -> Result<PeerResponse> 
                 .filter(|results| results.len() <= racer_core::prefetch::MAX_OPERATION_PAGES)
                 .ok_or(Error::InvalidRequest)?,
         ),
+        "write" => PeerResponse::Write(write::decode_reply(head)?),
         _ => return Err(Error::InvalidRequest),
     })
 }
@@ -1277,6 +1418,56 @@ impl SecurityCodec {
                 Operation::Prefetch {
                     version: version(head)?,
                     action: prefetch_action(head)?,
+                }
+            }
+            "write-session" => {
+                if !matches!(mode, FetchMode::Acquire) {
+                    return Err(Error::InvalidRequest);
+                }
+                Operation::WriteSession {
+                    object: object.clone(),
+                    etag: match head.unique("racer-etag")? {
+                        Some(_) => Some(etag(head)?),
+                        None => None,
+                    },
+                    action: Box::new(write::decode_action(head)?),
+                }
+            }
+            "write-store" => {
+                if !matches!(mode, FetchMode::CopyOnly) {
+                    return Err(Error::InvalidRequest);
+                }
+                Operation::WriteStore {
+                    version: version(head)?,
+                    store: Box::new(write::decode_store(head)?),
+                }
+            }
+            "write-release" | "write-upload" => {
+                let operation = field(head, "racer-operation")?;
+                let (session, pages) = write::decode_session_pages(head)?;
+                if operation == "write-release" {
+                    if !matches!(mode, FetchMode::CopyOnly) {
+                        return Err(Error::InvalidRequest);
+                    }
+                    Operation::WriteRelease {
+                        version: version(head)?,
+                        session,
+                        pages,
+                        keep: match head.unique(write::WRITE_KEEP)? {
+                            None => false,
+                            Some(b"1") => true,
+                            Some(_) => return Err(Error::InvalidRequest),
+                        },
+                    }
+                } else {
+                    if !matches!(mode, FetchMode::Acquire) {
+                        return Err(Error::InvalidRequest);
+                    }
+                    Operation::WriteUpload {
+                        version: version(head)?,
+                        session,
+                        pages,
+                    }
                 }
             }
             _ => return Err(Error::InvalidRequest),

@@ -6,7 +6,7 @@
 //! appended as `?versionid=<url.QueryEscape(id)>`, as azblob does.
 
 use super::identity::AzureObject;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::model::StrongEtag;
 use http1::Header;
 use http1::MessageHead;
@@ -17,13 +17,29 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// The service version azblob v1.8.2 (the Go SDK in go.mod) sends.
 pub const AZURE_SERVICE_VERSION: &[u8] = b"2026-12-06";
 
-/// Request method; Azure reads only need these two.
+/// Request method. Reads use [`head`]; the two upload operations have their
+/// own builders, [`put_block_head`] and [`put_block_list_head`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AzureMethod {
     /// Get Blob Properties.
     Head,
     /// Get Blob with an `x-ms-range`.
     Get,
+    /// Put Block (`PUT ?comp=block&blockid=`).
+    PutBlock,
+    /// Put Block List (`PUT ?comp=blocklist`).
+    PutBlockList,
+}
+
+impl AzureMethod {
+    /// The HTTP method token.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Head => "HEAD",
+            Self::Get => "GET",
+            Self::PutBlock | Self::PutBlockList => "PUT",
+        }
+    }
 }
 
 /// One inclusive byte range.
@@ -126,15 +142,11 @@ pub fn head(
     bearer: Option<&[u8]>,
     now: SystemTime,
 ) -> Result<MessageHead> {
-    let mut headers = Vec::with_capacity(7);
-    headers.push(Header::new("Host", url.host_header().as_bytes()));
-    headers.push(Header::new("x-ms-version", AZURE_SERVICE_VERSION));
-    // Azure Storage rejects authorized requests without a request date. The
-    // head is rebuilt per attempt, so retries carry a fresh date. `now` is
-    // the worker clock's wall time.
-    let now = now.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
-    headers.push(Header::new("x-ms-date", http_date(now).as_bytes()));
-    headers.push(Header::new("User-Agent", b"racer"));
+    if !matches!(method, AzureMethod::Head | AzureMethod::Get) {
+        // Writes carry a body and extra fields; see the dedicated builders.
+        return Err(Error::InvalidRequest);
+    }
+    let mut headers = common(url, now, 7);
     if let Some(range) = range {
         headers.push(Header::new(
             "x-ms-range",
@@ -144,23 +156,176 @@ pub fn head(
     if let Some(etag) = if_match {
         headers.push(Header::new("If-Match", etag.as_bytes()));
     }
+    authorization(&mut headers, bearer);
+    Ok(MessageHead {
+        start: StartLine::Request {
+            method: method.as_str().to_owned(),
+            target: target(url, object),
+        },
+        headers,
+    })
+}
+
+/// `Host`, `x-ms-version`, `x-ms-date`, and `User-Agent`, in that order.
+fn common(url: &AzureContainerUrl, now: SystemTime, capacity: usize) -> Vec<Header> {
+    let mut headers = Vec::with_capacity(capacity);
+    headers.push(Header::new("Host", url.host_header().as_bytes()));
+    headers.push(Header::new("x-ms-version", AZURE_SERVICE_VERSION));
+    // Azure Storage rejects authorized requests without a request date. The
+    // head is rebuilt per attempt, so retries carry a fresh date. `now` is
+    // the worker clock's wall time.
+    let now = now.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    headers.push(Header::new("x-ms-date", http_date(now).as_bytes()));
+    headers.push(Header::new("User-Agent", b"racer"));
+    headers
+}
+
+/// Append `Authorization: Bearer <token>` when a token is present.
+fn authorization(headers: &mut Vec<Header>, bearer: Option<&[u8]>) {
     if let Some(token) = bearer {
         let mut value = Vec::with_capacity(7 + token.len());
         value.extend_from_slice(b"Bearer ");
         value.extend_from_slice(token);
         headers.push(Header::new("Authorization", &value));
     }
+}
+
+/// Target for a write: writes never address a version.
+fn write_target(url: &AzureContainerUrl, object: &AzureObject) -> Result<String> {
+    if !object.version_id.is_empty() {
+        return Err(Error::InvalidRequest);
+    }
+    Ok(target(url, object))
+}
+
+/// A block ID must be nonempty standard base64 of at most 64 decoded bytes
+/// (Put Block). Racer IDs are always 64 characters (48 decoded bytes).
+fn valid_block_id(id: &[u8]) -> bool {
+    use base64::Engine;
+    !id.is_empty()
+        && base64::engine::general_purpose::STANDARD
+            .decode(id)
+            .is_ok_and(|raw| raw.len() <= 64)
+}
+
+/// Put Block head:
+/// `PUT {target}?comp=block&blockid={url.QueryEscape(id)}` with `Host`,
+/// `x-ms-version`, `x-ms-date`, `User-Agent`, `Content-Length`,
+/// `x-ms-content-crc64`, then `Authorization` when a token is present.
+/// `crc64` is the Azure CRC-64 of the `length` body bytes.
+pub fn put_block_head(
+    url: &AzureContainerUrl,
+    object: &AzureObject,
+    block_id: &[u8],
+    length: u64,
+    crc64: u64,
+    bearer: Option<&[u8]>,
+    now: SystemTime,
+) -> Result<MessageHead> {
+    if !valid_block_id(block_id) {
+        return Err(Error::InvalidRequest);
+    }
+    let mut target = write_target(url, object)?;
+    target.push_str("?comp=block&blockid=");
+    // Valid base64 is ASCII.
+    query_escape(
+        &mut target,
+        std::str::from_utf8(block_id).map_err(|_| Error::InvalidRequest)?,
+    );
+    let mut headers = common(url, now, 7);
+    headers.push(Header::new("Content-Length", length.to_string().as_bytes()));
+    headers.push(Header::new(
+        "x-ms-content-crc64",
+        super::crc64::header_value(crc64).as_bytes(),
+    ));
+    authorization(&mut headers, bearer);
     Ok(MessageHead {
         start: StartLine::Request {
-            method: match method {
-                AzureMethod::Head => "HEAD",
-                AzureMethod::Get => "GET",
-            }
-            .to_owned(),
-            target: target(url, object),
+            method: AzureMethod::PutBlock.as_str().to_owned(),
+            target,
         },
         headers,
     })
+}
+
+/// Put Block List head: `PUT {target}?comp=blocklist` with `Host`,
+/// `x-ms-version`, `x-ms-date`, `User-Agent`, `Content-Length`,
+/// `Content-Type: application/xml`, `x-ms-content-crc64` of the XML body,
+/// `If-None-Match: *`, `x-ms-meta-racercommit` ([`commit_marker`] of the
+/// body), `x-ms-blob-content-type` when set, then
+/// `Authorization` when a token is present.
+pub fn put_block_list_head(
+    url: &AzureContainerUrl,
+    object: &AzureObject,
+    body: &[u8],
+    content_type: Option<&str>,
+    bearer: Option<&[u8]>,
+    now: SystemTime,
+) -> Result<MessageHead> {
+    let mut target = write_target(url, object)?;
+    target.push_str("?comp=blocklist");
+    let mut headers = common(url, now, 11);
+    headers.push(Header::new(
+        "Content-Length",
+        body.len().to_string().as_bytes(),
+    ));
+    headers.push(Header::new("Content-Type", b"application/xml"));
+    headers.push(Header::new(
+        "x-ms-content-crc64",
+        super::crc64::header_value(super::crc64::checksum(body)).as_bytes(),
+    ));
+    // Create only: an existing blob fails with 409 BlobAlreadyExists.
+    headers.push(Header::new("If-None-Match", b"*"));
+    // Stamp the commit, so a retry after a lost 201 can recognize its own
+    // blob (see `commit_marker`).
+    headers.push(Header::new(COMMIT_MARKER, commit_marker(body).as_bytes()));
+    if let Some(content_type) = content_type {
+        if content_type.is_empty()
+            || !content_type
+                .bytes()
+                .all(|b| b == b' ' || b == b'\t' || b.is_ascii_graphic())
+        {
+            return Err(Error::InvalidRequest);
+        }
+        headers.push(Header::new(
+            "x-ms-blob-content-type",
+            content_type.as_bytes(),
+        ));
+    }
+    authorization(&mut headers, bearer);
+    Ok(MessageHead {
+        start: StartLine::Request {
+            method: AzureMethod::PutBlockList.as_str().to_owned(),
+            target,
+        },
+        headers,
+    })
+}
+
+/// Blob metadata naming the block list a Racer commit wrote.
+pub const COMMIT_MARKER: &str = "x-ms-meta-racercommit";
+
+/// Lowercase hex SHA-256 of a Put Block List body. Block IDs embed the Racer
+/// version, so equal markers mean the same version's commit.
+pub fn commit_marker(body: &[u8]) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(body)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Put Block List body committing `block_ids` in order, each as `Latest`:
+/// `<?xml version="1.0" encoding="utf-8"?><BlockList><Latest>id</Latest>...</BlockList>`.
+/// IDs are base64, so no XML escaping is needed; invalid IDs are rejected.
+/// The body itself is [`racer_core::write::block_list_xml_from_ids`].
+pub fn block_list_xml(
+    block_ids: &[[u8; racer_core::write::upload::BLOCK_ID_BYTES]],
+) -> Result<Vec<u8>> {
+    if !block_ids.iter().all(|id| valid_block_id(id)) {
+        return Err(Error::InvalidRequest);
+    }
+    Ok(racer_core::write::block_list_xml_from_ids(block_ids))
 }
 
 #[cfg(test)]
@@ -265,5 +430,172 @@ mod tests {
             assert_eq!(anonymous.unique(name).unwrap(), None);
         }
         assert!(anonymous.unique("x-ms-date").unwrap().is_some());
+    }
+
+    fn names(head: &MessageHead) -> Vec<&str> {
+        head.headers.iter().map(|h| h.name.as_str()).collect()
+    }
+
+    /// A 64-character ID whose base64 contains `+` and `/`.
+    const ID: [u8; 64] = *b"++//abcdABCD0123++//abcdABCD0123++//abcdABCD0123++//abcdABCD0123";
+
+    #[test]
+    fn put_block_golden() {
+        let url = AzureContainerUrl::parse("https://acct.blob.core.windows.net/models").unwrap();
+        let now = UNIX_EPOCH + std::time::Duration::from_secs(784_111_777);
+        let head = put_block_head(
+            &url,
+            &object("dir/file.bin", ""),
+            &ID,
+            5,
+            super::super::crc64::checksum(b"hello"),
+            Some(b"token"),
+            now,
+        )
+        .unwrap();
+        let StartLine::Request { method, target } = &head.start else {
+            panic!("request");
+        };
+        assert_eq!(method, "PUT");
+        assert_eq!(
+            target,
+            "/models/dir%2Ffile.bin?comp=block&blockid=\
+             %2B%2B%2F%2FabcdABCD0123%2B%2B%2F%2FabcdABCD0123\
+             %2B%2B%2F%2FabcdABCD0123%2B%2B%2F%2FabcdABCD0123"
+        );
+        assert_eq!(
+            names(&head),
+            [
+                "Host",
+                "x-ms-version",
+                "x-ms-date",
+                "User-Agent",
+                "Content-Length",
+                "x-ms-content-crc64",
+                "Authorization"
+            ]
+        );
+        let get = |name| head.unique(name).unwrap().unwrap();
+        assert_eq!(get("Host"), b"acct.blob.core.windows.net");
+        assert_eq!(get("x-ms-version"), AZURE_SERVICE_VERSION);
+        assert_eq!(get("x-ms-date"), b"Sun, 06 Nov 1994 08:49:37 GMT");
+        assert_eq!(get("Content-Length"), b"5");
+        assert_eq!(
+            get("x-ms-content-crc64"),
+            super::super::crc64::header_value(super::super::crc64::checksum(b"hello")).as_bytes()
+        );
+        assert_eq!(get("Authorization"), b"Bearer token");
+
+        // Anonymous: no Authorization.
+        let anonymous = put_block_head(&url, &object("k", ""), &ID, 0, 0, None, now).unwrap();
+        assert_eq!(anonymous.unique("Authorization").unwrap(), None);
+    }
+
+    #[test]
+    fn put_block_rejects_bad_input() {
+        let url = AzureContainerUrl::parse("https://acct.blob.core.windows.net/models").unwrap();
+        let now = SystemTime::now();
+        // Writes never address a version.
+        assert_eq!(
+            put_block_head(&url, &object("k", "v1"), &ID, 1, 0, None, now).err(),
+            Some(Error::InvalidRequest)
+        );
+        for bad in [&b""[..], b"not base64!", b"QUJD="] {
+            assert_eq!(
+                put_block_head(&url, &object("k", ""), bad, 1, 0, None, now).err(),
+                Some(Error::InvalidRequest)
+            );
+        }
+        // 64 decoded bytes is the Azure maximum; 65 is too long.
+        use base64::Engine;
+        let engine = base64::engine::general_purpose::STANDARD;
+        let max = engine.encode([7u8; 64]);
+        assert!(put_block_head(&url, &object("k", ""), max.as_bytes(), 1, 0, None, now).is_ok());
+        let over = engine.encode([7u8; 65]);
+        assert!(put_block_head(&url, &object("k", ""), over.as_bytes(), 1, 0, None, now).is_err());
+        // Read builder refuses write methods.
+        for method in [AzureMethod::PutBlock, AzureMethod::PutBlockList] {
+            assert_eq!(
+                head(&url, &object("k", ""), method, None, None, None, now).err(),
+                Some(Error::InvalidRequest)
+            );
+        }
+    }
+
+    #[test]
+    fn put_block_list_golden() {
+        let url =
+            AzureContainerUrl::parse("http://127.0.0.1:10000/devstoreaccount1/models").unwrap();
+        let body = block_list_xml(&[ID, [b'A'; 64]]).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&body).unwrap(),
+            format!(
+                "<?xml version=\"1.0\" encoding=\"utf-8\"?><BlockList>\
+                 <Latest>{}</Latest><Latest>{}</Latest></BlockList>",
+                std::str::from_utf8(&ID).unwrap(),
+                "A".repeat(64)
+            )
+        );
+        let now = UNIX_EPOCH;
+        let head = put_block_list_head(
+            &url,
+            &object("a b", ""),
+            &body,
+            Some("text/plain; charset=utf-8"),
+            Some(b"t"),
+            now,
+        )
+        .unwrap();
+        assert!(matches!(
+            &head.start,
+            StartLine::Request { method, target }
+                if method == "PUT" && target == "/devstoreaccount1/models/a%20b?comp=blocklist"
+        ));
+        assert_eq!(
+            names(&head),
+            [
+                "Host",
+                "x-ms-version",
+                "x-ms-date",
+                "User-Agent",
+                "Content-Length",
+                "Content-Type",
+                "x-ms-content-crc64",
+                "If-None-Match",
+                "x-ms-meta-racercommit",
+                "x-ms-blob-content-type",
+                "Authorization"
+            ]
+        );
+        let get = |name| head.unique(name).unwrap().unwrap();
+        assert_eq!(get("Content-Length"), body.len().to_string().as_bytes());
+        assert_eq!(get("Content-Type"), b"application/xml");
+        assert_eq!(get("If-None-Match"), b"*");
+        assert_eq!(get(COMMIT_MARKER), commit_marker(&body).as_bytes());
+        assert_eq!(commit_marker(&body).len(), 64);
+        assert_eq!(get("x-ms-blob-content-type"), b"text/plain; charset=utf-8");
+        assert_eq!(get("x-ms-date"), b"Thu, 01 Jan 1970 00:00:00 GMT");
+
+        let plain = put_block_list_head(&url, &object("k", ""), &body, None, None, now).unwrap();
+        assert_eq!(plain.unique("x-ms-blob-content-type").unwrap(), None);
+        assert_eq!(plain.unique("Authorization").unwrap(), None);
+        for bad in ["", "a\r\nb", "caf\u{e9}"] {
+            assert_eq!(
+                put_block_list_head(&url, &object("k", ""), &body, Some(bad), None, now).err(),
+                Some(Error::InvalidRequest)
+            );
+        }
+        assert_eq!(
+            put_block_list_head(&url, &object("k", "v"), &body, None, None, now).err(),
+            Some(Error::InvalidRequest)
+        );
+        assert_eq!(
+            block_list_xml(&[[b'!'; 64]]).err(),
+            Some(Error::InvalidRequest)
+        );
+        assert_eq!(
+            std::str::from_utf8(&block_list_xml(&[]).unwrap()).unwrap(),
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?><BlockList></BlockList>"
+        );
     }
 }

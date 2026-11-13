@@ -1,0 +1,3 @@
+DELETE /v1/objects/00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff HTTP/1.1
+Host: racer
+

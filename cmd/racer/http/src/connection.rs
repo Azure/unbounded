@@ -1151,6 +1151,159 @@ where {
         Box::pin(self.write_body_range_impl(connection, buffer, range, scope))
     }
 
+    /// Like [`Self::write_body_range`], but a failed write returns the
+    /// connection when no submitted I/O still holds it, so the caller can read
+    /// a response the peer sent before it stopped reading the body (for example
+    /// a 401 followed by a close). The returned connection is poisoned and its
+    /// send framing is left incomplete, so it never finishes an exchange.
+    pub fn write_body_range_recoverable<'a, B: SendBuffer + 'a>(
+        &'a self,
+        connection: ConnectionLease<C>,
+        buffer: B,
+        range: Range<usize>,
+        scope: &'a C::Scope,
+    ) -> RecoverableWrite<'a, C, B> {
+        Box::pin(async move {
+            let held: HeldLease<C> = Rc::new(RefCell::new(Some(connection)));
+            let length = range.len();
+            match self.send_held(&held, buffer, range, scope).await {
+                Ok(buffer) => {
+                    let lease = held.borrow_mut().take();
+                    match lease {
+                        Some(lease) => Ok(Completion {
+                            buffer,
+                            bytes: length,
+                            lease,
+                        }),
+                        None => Err(SendFailure {
+                            error: Error::Malformed.into(),
+                            connection: None,
+                        }),
+                    }
+                }
+                Err(error) => {
+                    // Only the last owner may reuse it: an operation still in
+                    // flight keeps its own reference.
+                    let connection =
+                        Rc::try_unwrap(held)
+                            .ok()
+                            .and_then(RefCell::into_inner)
+                            .map(|mut c| {
+                                c.poison();
+                                c
+                            });
+                    Err(SendFailure { error, connection })
+                }
+            }
+        })
+    }
+
+    /// Send `range` of `buffer` on the held connection, which every reactor
+    /// operation retains through its completion fence.
+    async fn send_held<B: SendBuffer>(
+        &self,
+        held: &HeldLease<C>,
+        mut buffer: B,
+        range: Range<usize>,
+        scope: &C::Scope,
+    ) -> std::result::Result<B, C::Error> {
+        scope.check()?;
+        let userspace = {
+            let mut guard = held.borrow_mut();
+            let connection = guard.as_mut().ok_or(Error::Malformed)?;
+            connection.begin_io();
+            if range.start > range.end || range.end > buffer.send_bytes()?.len() {
+                return Err(Error::Malformed.into());
+            }
+            let remaining = connection.tx_remaining.ok_or(Error::Malformed)?;
+            if range.len() as u64 > remaining {
+                return Err(Error::Malformed.into());
+            }
+            connection.userspace_tls.is_some()
+        };
+        let mut offset = range.start;
+        while offset < range.end {
+            if userspace {
+                let accepted = {
+                    let mut guard = held.borrow_mut();
+                    let connection = guard.as_mut().ok_or(Error::Malformed)?;
+                    let tls = connection.userspace_tls.as_mut().expect("userspace TLS");
+                    tls.write_plain(&buffer.send_bytes()?[offset..range.end])
+                        .map_err(|_| racer_io::Error::Io)?
+                };
+                if accepted == 0 || accepted > range.end - offset {
+                    return Err(racer_io::Error::Io.into());
+                }
+                self.flush_held(held, scope).await?;
+                offset += accepted;
+                held.borrow_mut()
+                    .as_mut()
+                    .ok_or(Error::Malformed)?
+                    .consume_sent(accepted)?;
+            } else {
+                let fd = held.borrow().as_ref().ok_or(Error::Malformed)?.socket();
+                let view = SendRange::checked::<C::Error>(buffer, offset..range.end)?;
+                let completed = self.reactor.send(fd, view, held.clone(), scope).await?;
+                if completed.bytes == 0 || completed.bytes > range.end - offset {
+                    return Err(racer_io::Error::Io.into());
+                }
+                offset += completed.bytes;
+                buffer = completed.buffer.buffer;
+                held.borrow_mut()
+                    .as_mut()
+                    .ok_or(Error::Malformed)?
+                    .consume_sent(completed.bytes)?;
+            }
+        }
+        Ok(buffer)
+    }
+
+    /// [`Self::flush_userspace`] for a held connection.
+    async fn flush_held(&self, held: &HeldLease<C>, scope: &C::Scope) -> Result<C, ()> {
+        loop {
+            let (mut tx, used, fd) = {
+                let mut guard = held.borrow_mut();
+                let connection = guard.as_mut().ok_or(Error::Malformed)?;
+                let fd = connection.socket();
+                let tls = connection.userspace_tls.as_mut().expect("userspace TLS");
+                if !tls.wants_write() {
+                    return Ok(());
+                }
+                let (tx, used) = tls.take_tx().map_err(|_| racer_io::Error::Io)?;
+                (tx, used, fd)
+            };
+            if used == 0 {
+                return Err(racer_io::Error::Io.into());
+            }
+            let mut sent = 0;
+            while sent < used {
+                match fd.try_send(&tx.bytes[sent..used]) {
+                    Ok(0) => return Err(racer_io::Error::Io.into()),
+                    Ok(n) => {
+                        sent += n;
+                        continue;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => (),
+                    Err(_) => return Err(racer_io::Error::Io.into()),
+                }
+                let range = BufferRange::new::<C::Error>(tx, sent..used)?;
+                let completed = self
+                    .reactor
+                    .send(fd.clone(), range, held.clone(), scope)
+                    .await?;
+                if completed.bytes == 0 || completed.bytes > used - sent {
+                    return Err(racer_io::Error::Io.into());
+                }
+                sent += completed.bytes;
+                tx = completed.buffer.into_inner();
+            }
+            let mut guard = held.borrow_mut();
+            let connection = guard.as_mut().ok_or(Error::Malformed)?;
+            let tls = connection.userspace_tls.as_mut().expect("userspace TLS");
+            tls.restore_tx(tx);
+        }
+    }
+
     /// Validate lazily and retain each send suffix through its completion fence.
     async fn write_body_range_impl<B: SendBuffer>(
         &self,
@@ -2461,6 +2614,24 @@ impl<C: Context> HttpIo<C> {
         self.send_owned(connection, buffer, range, scope, SendRange::checked)
             .await
     }
+}
+
+/// A connection shared with the reactor operations sending on it, so a failed
+/// send can hand it back once no operation holds it.
+type HeldLease<C> = Rc<RefCell<Option<ConnectionLease<C>>>>;
+
+/// Future of [`HttpIo::write_body_range_recoverable`].
+pub type RecoverableWrite<'a, C, B> = futures::future::LocalBoxFuture<
+    'a,
+    std::result::Result<Completion<B, ConnectionLease<C>>, SendFailure<C>>,
+>;
+
+/// A body write that failed, with its connection when it could be recovered.
+pub struct SendFailure<C: Context> {
+    /// Why the write failed.
+    pub error: C::Error,
+    /// Poisoned; only good for reading a response the peer already sent.
+    pub connection: Option<ConnectionLease<C>>,
 }
 
 /// Immutable send view retaining its entire backing owner.

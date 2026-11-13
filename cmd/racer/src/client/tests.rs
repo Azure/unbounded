@@ -978,6 +978,7 @@ fn definition() -> CacheDefinition {
         priority: racer_wire::control::DEFAULT_PRIORITY,
         mode: racer_wire::control::CacheMode::Cached,
         origin: None,
+        writes: None,
     }
 }
 fn scope() -> RequestScope {
@@ -2115,6 +2116,7 @@ fn actual_uds_empty_bootstrap_and_canceled_success() {
                 Ok(ReadResponse {
                     metadata: metadata.clone(),
                     payload: ReadPayload::Empty,
+                    upload_state: None,
                 }),
                 true,
             )
@@ -2435,6 +2437,7 @@ fn response_payload_validation_preserves_range_pin_and_empty_contracts() {
     let response = ReadResponse {
         metadata,
         payload: ReadPayload::Stream(stream),
+        upload_state: None,
     };
     let subscription = |range, pin| ReadKind::Subscription {
         pin,
@@ -2462,6 +2465,7 @@ fn response_payload_validation_preserves_range_pin_and_empty_contracts() {
     let mut empty = ReadResponse {
         metadata: body_metadata(0),
         payload: ReadPayload::Empty,
+        upload_state: None,
     };
     assert_eq!(responses.validate(&ReadKind::Head, &empty), Ok(()));
     assert_eq!(
@@ -2541,6 +2545,7 @@ fn actual_uds_read_failures_and_immutable_result_validation() {
             Ok(ReadResponse {
                 metadata,
                 payload: ReadPayload::Empty,
+                upload_state: None,
             }),
             false,
         );
@@ -3002,6 +3007,7 @@ fn priority_only_changes_reuse_listeners_beyond_retirement_bound() {
                 priority: racer_wire::control::DEFAULT_PRIORITY,
                 mode: racer_wire::control::CacheMode::Cached,
                 origin: None,
+                writes: None,
             }
         })
         .collect();

@@ -199,6 +199,11 @@ pub struct Segments {
 
     open: Cell<Option<usize>>,
 
+    /// Dedicated tail for written (write-back) records, with the generation it
+    /// was taken at. Kept Sealed so checkpoint images stay valid and only
+    /// [`Self::append_written`] grows it.
+    written: Cell<Option<(usize, Generation)>>,
+
     free: RefCell<BTreeSet<usize>>,
 
     evicting: Cell<usize>,
@@ -221,6 +226,7 @@ impl Segments {
             table: TableIdentity::new(),
             restore_epoch: Cell::new(0),
             open: Cell::new(None),
+            written: Cell::new(None),
             free: RefCell::new(BTreeSet::new()),
             evicting: Cell::new(0),
             usage: RefCell::new(Vec::new()),
@@ -418,6 +424,147 @@ impl Segments {
             self.open.set(None);
         }
         Ok((lease, extent))
+    }
+
+    /// Reserve an aligned range in the dedicated written-record tail. Written
+    /// records never share a segment with ordinary cache records, so a segment
+    /// pinned by live written data does not keep cache pages from eviction.
+    /// The tail stays [`SegmentState::Sealed`]; the caller pins it against
+    /// eviction (see `DiskIndex::pin_segment`). A tail that was evicted or
+    /// filled is replaced by a free slot. `Busy` when no slot is free or
+    /// appends are frozen.
+    pub fn append_written(&self, length: usize) -> Result<(SegmentLease, Extent)> {
+        if self.appends_frozen.get() {
+            return Err(Error::Busy);
+        }
+        let alignment = self.geometry().ok_or(Error::Unavailable)?.alignment();
+        if length == 0
+            || length as u64 > self.segment_bytes
+            || alignment.extent(0, length)?.length() != length
+        {
+            return Err(Error::InvalidConfiguration);
+        }
+        let mut slots = self.slots_mut();
+        let current = self.written.get().filter(|&(position, generation)| {
+            let image = &slots[position].image;
+            image.state == SegmentState::Sealed
+                && image.generation == generation
+                && self.segment_bytes - image.used_bytes >= length as u64
+        });
+        let (position, fresh) = match current {
+            Some((position, _)) => (position, false),
+            None => match self.free.borrow().first() {
+                Some(&position) => (position, true),
+                None => {
+                    self.written.set(None);
+                    return Err(Error::Busy);
+                }
+            },
+        };
+        let slot = &slots[position];
+        let offset = slot
+            .image
+            .id
+            .0
+            .checked_mul(self.segment_bytes)
+            .and_then(|v| v.checked_add(slot.image.used_bytes))
+            .ok_or(Error::InvalidConfiguration)?;
+        let extent = alignment.extent(offset, length)?;
+        let used_bytes = slot
+            .image
+            .used_bytes
+            .checked_add(length as u64)
+            .ok_or(Error::InvalidConfiguration)?;
+        let lease = self.take_lease(slot, used_bytes)?;
+        if fresh {
+            self.free.borrow_mut().remove(&position);
+        }
+        let slot = &mut slots[position];
+        slot.image.state = SegmentState::Sealed;
+        slot.image.used_bytes = used_bytes;
+        self.usage.borrow_mut()[slot.usage_group].1 += length as u64;
+        self.written.set(Some((position, slot.image.generation)));
+        Ok((lease, extent))
+    }
+
+    /// The current written segment, when the next [`Self::append_written`]
+    /// of `length` bytes would land in it rather than open a fresh segment.
+    pub fn written_fits(&self, length: usize) -> Option<SegmentId> {
+        let (position, generation) = self.written.get()?;
+        let slots = self.slots.borrow();
+        let image = &slots.get(position)?.image;
+        (image.state == SegmentState::Sealed
+            && image.generation == generation
+            && self.segment_bytes - image.used_bytes >= length as u64)
+            .then_some(image.id)
+    }
+
+    /// Re-adopt a segment that holds durable written records after a restart,
+    /// before any append can reuse it. A free slot at `generation` (or any
+    /// older generation, as after a cold start) becomes Sealed at
+    /// `generation`; an Open or Sealed slot already at `generation` keeps its
+    /// state. Either way its used prefix grows to cover `used_bytes`.
+    ///
+    /// A non-free, unleased slot at an older generation was restored from a
+    /// checkpoint taken before the segment was recycled and written again.
+    /// The fsynced journal record proves the reuse, so the slot is superseded:
+    /// it becomes Sealed at `generation` with only `used_bytes` in use, and
+    /// `Ok(true)` tells the caller to drop index entries of the older
+    /// generation. Any newer generation, or a leased older one, is `Stale`.
+    pub fn adopt_written(
+        &self,
+        id: SegmentId,
+        generation: Generation,
+        used_bytes: u64,
+    ) -> Result<bool> {
+        if self.frozen.get() {
+            return Err(Error::Busy);
+        }
+        let alignment = self.geometry().ok_or(Error::Unavailable)?.alignment();
+        if generation.0 == 0
+            || used_bytes == 0
+            || used_bytes > self.segment_bytes
+            || !used_bytes.is_multiple_of(alignment.offset())
+            || !used_bytes.is_multiple_of(alignment.length() as u64)
+        {
+            return Err(Error::Corrupt);
+        }
+        let position = Self::position(id)?;
+        let mut slots = self.slots_mut();
+        let slot = slots.get_mut(position).ok_or(Error::Corrupt)?;
+        let mut superseded = false;
+        match slot.image.state {
+            SegmentState::Free if slot.image.generation.0 <= generation.0 => {
+                self.free.borrow_mut().remove(&position);
+                slot.image.generation = generation;
+                slot.image.state = SegmentState::Sealed;
+            }
+            SegmentState::Open | SegmentState::Sealed if slot.image.generation == generation => {}
+            SegmentState::Open | SegmentState::Sealed | SegmentState::Evicting
+                if slot.image.generation.0 < generation.0 && slot.leases.get() == 0 =>
+            {
+                if slot.image.state == SegmentState::Evicting {
+                    self.evicting.set(self.evicting.get() - 1);
+                }
+                if self.open.get() == Some(position) {
+                    self.open.set(None);
+                }
+                if self.written.get().is_some_and(|(open, _)| open == position) {
+                    self.written.set(None);
+                }
+                self.usage.borrow_mut()[slot.usage_group].1 -= slot.image.used_bytes;
+                slot.image.used_bytes = 0;
+                slot.image.generation = generation;
+                slot.image.state = SegmentState::Sealed;
+                superseded = true;
+            }
+            _ => return Err(Error::Stale),
+        }
+        if slot.image.used_bytes < used_bytes {
+            self.usage.borrow_mut()[slot.usage_group].1 += used_bytes - slot.image.used_bytes;
+            slot.image.used_bytes = used_bytes;
+        }
+        Ok(superseded)
     }
 
     /// Seal the open segment, if any, so reclaim may evict it. Used when
@@ -630,6 +777,7 @@ impl Segments {
         let epoch = self.validate_restore_epoch(&images)?;
         let mut slots = self.slots_mut();
         self.open.set(None);
+        self.written.set(None);
         self.free.borrow_mut().clear();
         self.evicting.set(0);
         let mut usage = self.usage.borrow_mut();
@@ -759,6 +907,122 @@ mod tests {
         )
         .unwrap();
         s
+    }
+
+    #[test]
+    fn written_tail_is_separate_sealed_and_replaced_when_full_or_evicted() {
+        let s = segments(1024, 4);
+        let (cache_lease, cache) = s.append(512).unwrap();
+        let (w1, first) = s.append_written(512).unwrap();
+        assert_ne!(cache_lease.id(), w1.id());
+        assert_eq!(s.state(w1.id()).unwrap(), SegmentState::Sealed);
+        let (w2, second) = s.append_written(512).unwrap();
+        assert_eq!(w1.id(), w2.id());
+        assert_eq!(second.offset(), first.offset() + 512);
+        // The cache tail keeps appending to its own open segment.
+        let (cache_lease2, cache2) = s.append(512).unwrap();
+        assert_eq!(cache_lease2.id(), cache_lease.id());
+        assert_eq!(cache2.offset(), cache.offset() + 512);
+        // A full tail rolls to a fresh free slot.
+        let (w3, _) = s.append_written(512).unwrap();
+        assert_ne!(w3.id(), w1.id());
+        let full = w1.id();
+        let tail = w3.id();
+        drop((w1, w2, w3, cache_lease, cache_lease2));
+        // Checkpoint images with a written tail stay restorable.
+        s.validate_restore(&s.snapshot()).unwrap();
+        // An evicted tail is not appended to again.
+        s.begin_evict(tail).unwrap();
+        s.recycle(tail).unwrap();
+        let (w4, _) = s.append_written(512).unwrap();
+        assert_eq!(s.state(w4.id()).unwrap(), SegmentState::Sealed);
+        assert_eq!(s.snapshot()[w4.id().0 as usize].used_bytes, 512);
+        assert_eq!(s.state(full).unwrap(), SegmentState::Sealed);
+        assert_eq!(
+            s.append_written(0).err().unwrap(),
+            Error::InvalidConfiguration
+        );
+        assert_eq!(
+            s.append_written(2048).err().unwrap(),
+            Error::InvalidConfiguration
+        );
+        let frozen = s.freeze().unwrap();
+        assert_eq!(s.append_written(512).err().unwrap(), Error::Busy);
+        drop(frozen);
+    }
+
+    #[test]
+    fn written_tail_reports_busy_without_free_slots() {
+        let s = segments(512, 2);
+        let _a = s.append(512).unwrap();
+        let _b = s.append_written(512).unwrap();
+        assert_eq!(s.append_written(512).err().unwrap(), Error::Busy);
+    }
+
+    #[test]
+    fn adopt_written_restores_free_slots_and_rejects_reused_generations() {
+        let s = segments(1024, 3);
+        // Cold start: every slot is free at generation 1.
+        s.adopt_written(SegmentId(1), Generation(7), 1024).unwrap();
+        assert_eq!(s.state(SegmentId(1)).unwrap(), SegmentState::Sealed);
+        assert_eq!(s.free_count(), 2);
+        s.validate(
+            SegmentId(1),
+            Generation(7),
+            &Extent::new(1024 + 512, 512).unwrap(),
+        )
+        .unwrap();
+        // Adopting again at the same generation only grows the used prefix.
+        s.adopt_written(SegmentId(1), Generation(7), 512).unwrap();
+        assert_eq!(s.snapshot()[1].used_bytes, 1024);
+        // An older generation on a live slot was reused.
+        assert_eq!(
+            s.adopt_written(SegmentId(1), Generation(6), 512),
+            Err(Error::Stale)
+        );
+        // A newer generation supersedes a checkpoint-restored live slot.
+        assert!(s.adopt_written(SegmentId(1), Generation(8), 512).unwrap());
+        assert_eq!(s.snapshot()[1].used_bytes, 512);
+        assert_eq!(s.snapshot()[1].generation, Generation(8));
+        assert!(s.lease(SegmentId(1), Generation(7)).is_err());
+        assert!(!s.adopt_written(SegmentId(1), Generation(8), 1024).unwrap());
+        // A leased slot is never superseded.
+        let lease = s.lease(SegmentId(1), Generation(8)).unwrap();
+        assert_eq!(
+            s.adopt_written(SegmentId(1), Generation(9), 512),
+            Err(Error::Stale)
+        );
+        drop(lease);
+        let (lease, _) = s.append(512).unwrap();
+        let open = lease.id();
+        drop(lease);
+        s.adopt_written(open, Generation(1), 1024).unwrap();
+        assert_eq!(s.snapshot()[open.0 as usize].used_bytes, 1024);
+        // A free slot newer than the record was recycled after it.
+        s.seal_open();
+        s.begin_evict(open).unwrap();
+        s.recycle(open).unwrap();
+        assert_eq!(s.adopt_written(open, Generation(1), 512), Err(Error::Stale));
+        for bad in [0, 100, 2048] {
+            assert_eq!(
+                s.adopt_written(SegmentId(2), Generation(1), bad),
+                Err(Error::Corrupt)
+            );
+        }
+        assert_eq!(
+            s.adopt_written(SegmentId(2), Generation(0), 512),
+            Err(Error::Corrupt)
+        );
+        assert_eq!(
+            s.adopt_written(SegmentId(9), Generation(1), 512),
+            Err(Error::Corrupt)
+        );
+        let frozen = s.freeze().unwrap();
+        assert_eq!(
+            s.adopt_written(SegmentId(2), Generation(1), 512),
+            Err(Error::Busy)
+        );
+        drop(frozen);
     }
 
     /// Lease ownership prevents reuse and old-generation acquisition.

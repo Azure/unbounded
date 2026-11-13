@@ -19,6 +19,9 @@ pub struct CacheInfo {
     /// spec.origin as written; None when unset. Parsed by `build` like
     /// passthrough, so an invalid origin fails the catalog.
     pub origin: Option<Value>,
+    /// spec.writes as written; None when unset. Parsed by `build` like
+    /// origin, so invalid write settings fail the catalog.
+    pub writes: Option<Value>,
     /// spec.nodeSelector as written; None when unset. Parsed by `build` so an
     /// invalid selector drops only this cache.
     pub node_selector: Option<Value>,
@@ -35,6 +38,7 @@ impl CacheInfo {
                 .filter(|p| !p.is_null())
                 .cloned(),
             origin: v.pointer("/spec/origin").filter(|o| !o.is_null()).cloned(),
+            writes: v.pointer("/spec/writes").filter(|w| !w.is_null()).cloned(),
             node_selector: v
                 .pointer("/spec/nodeSelector")
                 .filter(|p| !p.is_null())
@@ -136,6 +140,77 @@ fn origin_definition(
         max_concurrent_requests,
     };
     definition.validate()?;
+    Ok(Some(definition))
+}
+
+/// Map spec.writes (the ClusterCache Writes) to a write definition. Unset
+/// fields take the CRD defaults. Writes are invalid on a passthrough cache, and
+/// an upload mode other than Never needs a native origin, mirroring the CRD's
+/// CEL rules so a skewed schema cannot publish a catalog subscribers reject.
+fn write_definition(
+    writes: Option<&Value>,
+    mode: wire::CacheMode,
+    has_origin: bool,
+) -> Result<Option<wire::WriteDefinition>, wire::Error> {
+    let invalid = wire::Error::InvalidRequest;
+    let Some(writes) = writes else {
+        return Ok(None);
+    };
+    if !writes.is_object() {
+        return Err(invalid);
+    }
+    let present = |v: &Value, key: &str| v.get(key).filter(|x| !x.is_null()).cloned();
+    let integer = |v: &Value, key: &str, default: u64| -> Result<u64, wire::Error> {
+        match present(v, key) {
+            None => Ok(default),
+            Some(n) => n.as_u64().ok_or(invalid),
+        }
+    };
+    let narrow = |n: u64| u8::try_from(n).map_err(|_| invalid);
+    let hold_ttl = match present(writes, "holdTTL") {
+        None => wire::DEFAULT_WRITE_HOLD_TTL,
+        Some(Value::String(s)) => go_duration(&s)
+            .and_then(|d| to_millis(d, true))
+            .ok_or(invalid)?,
+        Some(_) => return Err(invalid),
+    };
+    let upload = match present(writes, "upload") {
+        None => Value::Object(Default::default()),
+        Some(u) if u.is_object() => u,
+        Some(_) => return Err(invalid),
+    };
+    let upload_mode = match present(&upload, "mode") {
+        None => wire::UploadMode::Auto,
+        Some(Value::String(m)) if m == "Auto" => wire::UploadMode::Auto,
+        Some(Value::String(m)) if m == "Manual" => wire::UploadMode::Manual,
+        Some(Value::String(m)) if m == "Never" => wire::UploadMode::Never,
+        Some(_) => return Err(invalid),
+    };
+    let definition = wire::WriteDefinition {
+        replicas: narrow(integer(
+            writes,
+            "replicas",
+            wire::DEFAULT_WRITE_REPLICAS.into(),
+        )?)?,
+        max_dirty_percent: narrow(integer(
+            writes,
+            "maxDirtyPercent",
+            wire::DEFAULT_WRITE_MAX_DIRTY_PERCENT.into(),
+        )?)?,
+        hold_ttl,
+        upload_mode,
+        upload_max_bytes_per_second: integer(&upload, "maxBytesPerSecond", 0)?,
+        upload_max_concurrent_blocks: u32::try_from(integer(
+            &upload,
+            "maxConcurrentBlocks",
+            wire::DEFAULT_WRITE_UPLOAD_MAX_CONCURRENT_BLOCKS.into(),
+        )?)
+        .map_err(|_| invalid)?,
+    };
+    definition.validate()?;
+    if mode.passthrough() || (upload_mode != wire::UploadMode::Never && !has_origin) {
+        return Err(invalid);
+    }
     Ok(Some(definition))
 }
 
@@ -243,7 +318,9 @@ pub fn build(caches: &[CacheInfo]) -> Result<Catalog, wire::Error> {
                 continue;
             }
         };
-        let (client, origin) = wire::canonical_socket_paths(&c.name)?;
+        let (client, origin_socket) = wire::canonical_socket_paths(&c.name)?;
+        let mode = mode(c.passthrough.as_ref())?;
+        let origin = origin_definition(c.origin.as_ref())?;
         // The CRD bounds spec.priority; recheck so a skewed schema cannot publish
         // a catalog that every subscriber would reject.
         let priority = c.priority.unwrap_or(i64::from(wire::DEFAULT_PRIORITY));
@@ -254,10 +331,11 @@ pub fn build(caches: &[CacheInfo]) -> Result<Catalog, wire::Error> {
             id: CacheId(c.uid.clone()),
             name: c.name.clone(),
             client_socket: client,
-            origin_socket: origin,
+            origin_socket,
             priority: priority as u16,
-            mode: mode(c.passthrough.as_ref())?,
-            origin: origin_definition(c.origin.as_ref())?,
+            mode,
+            writes: write_definition(c.writes.as_ref(), mode, origin.is_some())?,
+            origin,
         });
         if let Some(s) = selector {
             selectors.insert(CacheId(c.uid.clone()), s);
@@ -283,6 +361,7 @@ mod tests {
             priority: None,
             passthrough: None,
             origin: None,
+            writes: None,
             node_selector: None,
         }
     }
@@ -538,6 +617,87 @@ mod tests {
             "2562047h2562047h",
         ] {
             assert_eq!(go_duration(s), None, "{s}");
+        }
+    }
+
+    #[test]
+    fn writes_map_to_definition() {
+        let u = "11111111-1111-4111-8111-111111111111";
+        let url = "https://acct.blob.core.windows.net/models";
+        let parse = |spec: Value| {
+            let info = CacheInfo::from_json(
+                &serde_json::json!({"metadata":{"uid":u,"name":"a"},"spec":spec}),
+            );
+            build(&[info]).map(|out| out.caches[0].writes.clone())
+        };
+        let origin = serde_json::json!({"azure":{"containerURL":url}});
+
+        // Absent or null writes leave writes disabled.
+        assert_eq!(parse(serde_json::json!({})), Ok(None));
+        assert_eq!(parse(serde_json::json!({"writes":null})), Ok(None));
+        assert_eq!(build(&[c(u, "a")]).unwrap().caches[0].writes, None);
+
+        // An empty object takes every default.
+        assert_eq!(
+            parse(serde_json::json!({"origin":origin,"writes":{}})),
+            Ok(Some(wire::WriteDefinition::default()))
+        );
+        let w = parse(serde_json::json!({"origin":origin,"writes":{
+            "replicas":3,"maxDirtyPercent":90,"holdTTL":"1h30m",
+            "upload":{"mode":"Manual","maxBytesPerSecond":1048576,"maxConcurrentBlocks":4}
+        }}))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            w,
+            wire::WriteDefinition {
+                replicas: 3,
+                max_dirty_percent: 90,
+                hold_ttl: std::time::Duration::from_secs(5400),
+                upload_mode: wire::UploadMode::Manual,
+                upload_max_bytes_per_second: 1 << 20,
+                upload_max_concurrent_blocks: 4,
+            }
+        );
+        // Sub-millisecond holds round up so they stay positive.
+        let w = parse(serde_json::json!({"origin":origin,"writes":{"holdTTL":"1ns"}}))
+            .unwrap()
+            .unwrap();
+        assert_eq!(w.hold_ttl, std::time::Duration::from_millis(1));
+        // Never needs no origin.
+        let w = parse(serde_json::json!({"writes":{"upload":{"mode":"Never"}}}))
+            .unwrap()
+            .unwrap();
+        assert_eq!(w.upload_mode, wire::UploadMode::Never);
+
+        for bad in [
+            serde_json::json!({"writes":{}}),
+            serde_json::json!({"writes":{"upload":{"mode":"Manual"}}}),
+            serde_json::json!({"passthrough":{},"writes":{"upload":{"mode":"Never"}}}),
+            serde_json::json!({"origin":origin,"passthrough":{"route":"Local"},"writes":{}}),
+            serde_json::json!({"origin":origin,"writes":true}),
+            serde_json::json!({"origin":origin,"writes":{"replicas":0}}),
+            serde_json::json!({"origin":origin,"writes":{"replicas":4}}),
+            serde_json::json!({"origin":origin,"writes":{"replicas":-1}}),
+            serde_json::json!({"origin":origin,"writes":{"replicas":"2"}}),
+            serde_json::json!({"origin":origin,"writes":{"maxDirtyPercent":0}}),
+            serde_json::json!({"origin":origin,"writes":{"maxDirtyPercent":91}}),
+            serde_json::json!({"origin":origin,"writes":{"maxDirtyPercent":300}}),
+            serde_json::json!({"origin":origin,"writes":{"holdTTL":"0s"}}),
+            serde_json::json!({"origin":origin,"writes":{"holdTTL":"721h"}}),
+            serde_json::json!({"origin":origin,"writes":{"holdTTL":"-1s"}}),
+            serde_json::json!({"origin":origin,"writes":{"holdTTL":5}}),
+            serde_json::json!({"origin":origin,"writes":{"upload":[]}}),
+            serde_json::json!({"origin":origin,"writes":{"upload":{"mode":"auto"}}}),
+            serde_json::json!({"origin":origin,"writes":{"upload":{"maxBytesPerSecond":-1}}}),
+            serde_json::json!({"origin":origin,"writes":{"upload":{"maxConcurrentBlocks":0}}}),
+            serde_json::json!({"origin":origin,"writes":{"upload":{"maxConcurrentBlocks":1025}}}),
+        ] {
+            assert_eq!(
+                parse(bad.clone()),
+                Err(wire::Error::InvalidRequest),
+                "{bad}"
+            );
         }
     }
 

@@ -139,6 +139,26 @@ impl Reservation {
         self.location = Some(location.clone());
         Ok((lease, location))
     }
+
+    /// [`Self::append`] into the dedicated written-record tail.
+    pub fn append_written(
+        &mut self,
+        segments: &Segments,
+        length: usize,
+    ) -> Result<(page_alloc::SegmentLease, RecordLocation)> {
+        if self.location.is_some() {
+            return Err(Error::InvalidConfiguration);
+        }
+        self.disk.borrow_mut().ensure_segments(segments.count())?;
+        let (lease, location) = self.write.append_written(segments, length)?;
+        let location = RecordLocation {
+            segment: location.segment(),
+            generation: location.generation(),
+            extent: location.extent(),
+        };
+        self.location = Some(location.clone());
+        Ok((lease, location))
+    }
 }
 
 fn location(view: &EntryView) -> RecordLocation {
@@ -720,6 +740,29 @@ impl Pages {
         self.inner
             .as_ref()
             .is_some_and(|inner| inner.disk.borrow().segment_held(segment))
+    }
+
+    /// Pin `segment` against eviction for one live written record. The
+    /// segment table grows to `count` segments first.
+    pub fn pin_segment(&mut self, segment: SegmentId, count: usize) -> Result<()> {
+        let inner = self.inner_mut()?;
+        let mut disk = inner.disk.borrow_mut();
+        disk.ensure_segments(count)?;
+        disk.pin_segment(segment).map_err(Into::into)
+    }
+
+    /// Drop one pin of `segment`.
+    pub fn unpin_segment(&mut self, segment: SegmentId) -> Result<()> {
+        let inner = self.inner_mut()?;
+        let result = inner.disk.borrow_mut().unpin_segment(segment);
+        result.map_err(Into::into)
+    }
+
+    /// Pins on `segment`.
+    pub fn segment_pins(&self, segment: SegmentId) -> u32 {
+        self.inner
+            .as_ref()
+            .map_or(0, |inner| inner.disk.borrow().segment_pins(segment))
     }
 
     /// Every stored page, in slot order.
