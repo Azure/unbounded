@@ -283,7 +283,7 @@ class RacerLoaderMixin:
 
         vLLM's filter reads the index from a folder. For a racer:// model the
         index is read from Racer (at the ETag its stat returned) into a
-        temporary folder first.
+        temporary folder first, at the same relative path it has in the model.
         """
         prefixes = getattr(self, "_encoder_only_lm_prefixes", None)
         index = m.get("index")
@@ -293,6 +293,16 @@ class RacerLoaderMixin:
         if fn is None:
             return names
         mapper = getattr(self, "_encoder_only_weights_mapper", None)
+
+        def run(folder):
+            # vLLM matches files by os.path.relpath(file, folder) against the
+            # index weight_map, so pass absolute paths inside the folder and
+            # map the kept ones back to manifest names.
+            folder = os.path.abspath(folder)
+            full = {os.path.join(folder, n): n for n in names}
+            kept = fn(list(full), folder, index, prefixes, weights_mapper=mapper)
+            return [full.get(k) or os.path.relpath(k, folder) for k in kept]
+
         if path.startswith(SCHEME):
             import tempfile
 
@@ -302,11 +312,13 @@ class RacerLoaderMixin:
             meta = client.stat(req)
             data = client.read(req, if_match=meta.etag)
             with tempfile.TemporaryDirectory(prefix="racer-vllm-index-") as folder:
-                with open(os.path.join(folder, os.path.basename(index)), "wb") as f:
+                p = os.path.join(folder, index)
+                os.makedirs(os.path.dirname(p), exist_ok=True)
+                with open(p, "wb") as f:
                     f.write(data)
-                kept = fn(names, folder, os.path.basename(index), prefixes, weights_mapper=mapper)
+                kept = run(folder)
         else:
-            kept = fn(names, path, index, prefixes, weights_mapper=mapper)
+            kept = run(path)
         if not kept:
             raise RuntimeError(f"racer loader: the mm-encoder-only filter removed every weight file of {path}")
         return list(kept)

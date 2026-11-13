@@ -340,6 +340,7 @@ def test_fake_vllm_registry_is_isolated(monkeypatch):
 
 
 def test_mm_encoder_only_filter_uses_vllms_function(monkeypatch, server, torch, tmp_path):
+    import os
     import sys
 
     u, files, m, d = materialized(server, tmp_path)
@@ -347,8 +348,10 @@ def test_mm_encoder_only_filter_uses_vllms_function(monkeypatch, server, torch, 
     calls = []
 
     def filt(names, folder, index, prefixes, *, weights_mapper=None):
-        calls.append((list(names), folder, index, prefixes))
-        return [n for n in names if n != "b.safetensors"]
+        # Like vLLM: files are matched by their path relative to the folder.
+        rel = [os.path.relpath(n, folder) for n in names]
+        calls.append((rel, folder, index, prefixes))
+        return [n for n, r in zip(names, rel) if r != "b.safetensors"]
 
     wu = types.ModuleType("vllm.model_executor.model_loader.weight_utils")
     wu.filter_mm_encoder_only_safetensors_files = filt
@@ -357,7 +360,8 @@ def test_mm_encoder_only_filter_uses_vllms_function(monkeypatch, server, torch, 
     model = Model()
     ld.load_weights(model, model_config(d))
     assert set(model.got) == {"w1", "w2"}
-    assert calls == [(["a.safetensors", "b.safetensors"], d, "model.safetensors.index.json", ("language_model.",))]
+    assert calls == [(["a.safetensors", "b.safetensors"], os.path.abspath(d), "model.safetensors.index.json",
+                      ("language_model.",))]
 
 
 class StrictDefaultModelLoader(DefaultModelLoader):
@@ -579,7 +583,8 @@ def test_mm_encoder_only_filter_reads_the_index_of_a_uri(monkeypatch, server, to
         with open(os.path.join(folder, index)) as f:
             wm = json.load(f)["weight_map"]
         calls.append(sorted(wm))
-        return [n for n in names if any(f == n and not t.startswith(prefixes) for t, f in wm.items())]
+        rel = {os.path.relpath(n, folder): n for n in names}
+        return [n for r, n in rel.items() if any(f == r and not t.startswith(prefixes) for t, f in wm.items())]
 
     wu = types.ModuleType("vllm.model_executor.model_loader.weight_utils")
     wu.filter_mm_encoder_only_safetensors_files = filt
@@ -618,3 +623,31 @@ def test_parallel_info_reads_enable_expert_parallel(monkeypatch):
                                parallel=sharded.parallel_info(types.SimpleNamespace(enable_expert_parallel=v)))
            for v in (True, False)}
     assert len(fps) == 2
+
+
+def test_mm_encoder_only_filter_keeps_the_index_subdirectory(monkeypatch, server, torch):
+    import json
+    import os
+    import sys
+
+    u, files, m = publish(server)
+    idx = {"weight_map": {"vision.w": "a.safetensors", "language_model.w": "b.safetensors"}}
+    put(server, u, "sub/model.safetensors.index.json", json.dumps(idx).encode())
+    ld = make_loader(monkeypatch, server, verify="none")
+    seen = []
+
+    def filt(names, folder, index, prefixes, *, weights_mapper=None):
+        seen.append(index)
+        with open(os.path.join(folder, index)) as f:
+            wm = json.load(f)["weight_map"]
+        return [n for n in names if any(f == os.path.relpath(n, folder) and not t.startswith(prefixes)
+                                        for t, f in wm.items())]
+
+    wu = types.ModuleType("vllm.model_executor.model_loader.weight_utils")
+    wu.filter_mm_encoder_only_safetensors_files = filt
+    monkeypatch.setitem(sys.modules, wu.__name__, wu)
+    ld._encoder_only_lm_prefixes = ("language_model.",)
+    got = ld._encoder_only_filter(URI, {"index": "sub/model.safetensors.index.json"},
+                                  ["a.safetensors", "b.safetensors"])
+    assert got == ["a.safetensors"]
+    assert seen == ["sub/model.safetensors.index.json"]
