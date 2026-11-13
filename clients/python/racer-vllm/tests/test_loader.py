@@ -563,3 +563,29 @@ def test_sharded_manifest_checks_offsets():
         node[path[-1]] = value
         with pytest.raises(mf.ManifestError, match=match):
             mf.validate_sharded(doc)
+
+
+def test_mm_encoder_only_filter_reads_the_index_of_a_uri(monkeypatch, server, torch):
+    import json
+    import os
+    import sys
+
+    publish(server)
+    ld = make_loader(monkeypatch, server, verify="none")
+    calls = []
+
+    def filt(names, folder, index, prefixes, *, weights_mapper=None):
+        # Like vLLM: keep files holding a tensor outside the language model.
+        with open(os.path.join(folder, index)) as f:
+            wm = json.load(f)["weight_map"]
+        calls.append(sorted(wm))
+        return [n for n in names if any(f == n and not t.startswith(prefixes) for t, f in wm.items())]
+
+    wu = types.ModuleType("vllm.model_executor.model_loader.weight_utils")
+    wu.filter_mm_encoder_only_safetensors_files = filt
+    monkeypatch.setitem(sys.modules, wu.__name__, wu)
+    ld._encoder_only_lm_prefixes = ("w3", "w4")
+    model = Model()
+    ld.load_weights(model, model_config(URI))
+    assert set(model.got) == {"w1", "w2"}
+    assert calls == [["w1", "w2", "w3", "w4"]]
