@@ -2,3 +2,6 @@
 # Add the `words=` line the runner prints for a failure here once it is fixed,
 # or the `seed=` line for a deterministic failure that a seed set already names.
 authority-crash-restart seed=151
+lane-pair-faults seed=27
+lane-pair-faults seed=137
+lane-pair-faults seed=200

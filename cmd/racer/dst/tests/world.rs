@@ -81,6 +81,20 @@ fn crash_mid_run_still_settles() {
 }
 
 #[test]
+fn lane_pair_faults_settles_after_a_late_restart() {
+    // These seeds draw a crash and restart in the last tens of milliseconds,
+    // so the restarted writer is still running its six rounds at the fault
+    // horizon. `settle` gives it time to finish before quiescence is
+    // required, without accepting a run that never settles.
+    let s = scenarios::find("lane-pair-faults").expect("catalog scenario");
+    for seed in [27, 137, 200] {
+        let out = run_twice(&s, &Source::Seed(seed)).unwrap_or_else(|d| panic!("seed {seed}: {d}"));
+        assert_eq!(out.failure, None, "seed {seed}");
+        assert!(out.quiescent, "seed {seed}");
+    }
+}
+
+#[test]
 fn clock_skew_moves_only_wall_time() {
     let clocks = Rc::new(RefCell::new(Vec::new()));
     let seen = clocks.clone();
@@ -376,6 +390,39 @@ fn resource_invariants_run_only_at_quiescence() {
     let out = s.clone().end(MILLIS).run(Choices::seeded(1));
     assert!(!out.quiescent);
     assert_eq!(ran.get(), 1);
+}
+
+#[test]
+fn settle_drains_work_in_flight_at_the_fault_horizon() {
+    let ran = Rc::new(Cell::new(0));
+    let seen = ran.clone();
+    let s = Scenario::new("t")
+        .roles(|env| lane_pair(env, 2))
+        .invariant("count", Class::Resource, move |p| {
+            assert!(p.quiescent);
+            seen.set(seen.get() + 1);
+            Ok(())
+        })
+        .end(MILLIS)
+        .settle(SECONDS);
+    let out = s.run(Choices::seeded(1));
+    assert_eq!(out.failure, None);
+    assert!(out.quiescent);
+    // The two rounds finish after the fault horizon, before the settle end.
+    assert!(out.end > MILLIS, "{out:?}");
+    assert_eq!(ran.get(), 1);
+}
+
+#[test]
+fn settle_does_not_mask_work_that_never_finishes() {
+    // A thousand rounds cannot finish inside the one-second settle window.
+    let s = Scenario::new("t")
+        .roles(|env| lane_pair(env, 1000))
+        .expect_quiescent()
+        .end(MILLIS)
+        .settle(SECONDS);
+    let failure = s.run(Choices::seeded(1)).failure.expect("must fail");
+    assert_eq!(failure.name, "not-quiescent", "{failure}");
 }
 
 #[test]

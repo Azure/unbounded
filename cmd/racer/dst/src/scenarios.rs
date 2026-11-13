@@ -1042,6 +1042,9 @@ pub fn catalog() -> Vec<Scenario> {
             })
             .with(all_roles_settled())
             .expect_quiescent()
+            // Faults stop at `end`; a node restarted in the last round needs
+            // time to finish its six rounds before the run must be settled.
+            .settle(SECONDS)
             .invariant("bounded-steps-per-node", Class::Safety, |probe| {
                 // Every node runs at most two roles.
                 let mut per = [0u32; 3];

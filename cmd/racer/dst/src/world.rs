@@ -21,6 +21,11 @@
 //!    role that still reports pending work ([`SimRole::pending`]) has no wake
 //!    source that could ever finish it, which is a liveness failure.
 //!
+//! [`Scenario::end`] is the fault horizon. A scenario with `settle` keeps
+//! stepping up to `end + settle` so work already in flight (for example a
+//! node restarted just before `end`) can finish before quiescence is
+//! required.
+//!
 //! Roles never `park`: the simulated reactor's park would advance the shared
 //! clock on its own. Time only moves in step 4.
 //!
@@ -672,6 +677,9 @@ impl<'s> World<'s> {
     /// `Ok(true)` when the world went quiescent.
     fn run_inner(&mut self) -> Result<bool, Failure> {
         let end = self.scenario.end;
+        // Faults stop at `end`; work already in flight gets `settle` more
+        // virtual time to finish before quiescence is required.
+        let hard_end = end.saturating_add(self.scenario.settle);
         loop {
             while let Some(fault) = self.engine.pop_until(self.engine.now()) {
                 self.apply(fault)?;
@@ -758,9 +766,9 @@ impl<'s> World<'s> {
                 (a, b) => a.or(b),
             };
             match next {
-                Some(at) if at <= end => self.advance(at)?,
+                Some(at) if at <= hard_end => self.advance(at)?,
                 Some(_) => {
-                    self.advance(end)?;
+                    self.advance(hard_end)?;
                     self.check(Class::Safety, false)?;
                     self.check(Class::Liveness, false)?;
                     let expect = self.scenario.expect_quiescent
@@ -771,10 +779,21 @@ impl<'s> World<'s> {
                             .any(|i| i.class == Class::Resource);
                     if expect {
                         let busy: Vec<String> = self
-                            .roles()
-                            .into_iter()
-                            .filter(|r| r.next != Next::Done && r.next != Next::Idle)
-                            .map(|r| format!("node {} role {}", r.node, r.name))
+                            .nodes
+                            .iter()
+                            .enumerate()
+                            .flat_map(|(n, node)| {
+                                node.roles.iter().map(move |s| (n, node.env.index, s))
+                            })
+                            .filter(|(_, _, s)| s.next != Next::Done && s.next != Next::Idle)
+                            .map(|(n, index, s)| match s.next {
+                                Next::WaitUntil(at) => format!(
+                                    "node {index} role {} WaitUntil({} ns)",
+                                    s.name,
+                                    self.nanos(n, at)
+                                ),
+                                next => format!("node {index} role {} {next:?}", s.name),
+                            })
                             .collect();
                         return Err(self.fail(
                             Class::Liveness,
