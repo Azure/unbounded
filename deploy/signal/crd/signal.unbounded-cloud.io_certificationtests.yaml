@@ -636,6 +636,8 @@ spec:
                 x-kubernetes-list-type: map
               security:
                 properties:
+                  allowRoot:
+                    type: boolean
                   capabilities:
                     items:
                       pattern: ^[A-Z][A-Z0-9_]*$

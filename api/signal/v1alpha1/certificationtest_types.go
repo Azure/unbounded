@@ -223,6 +223,7 @@ type CertificationTestDriver struct {
 
 type TestSecurityRequirements struct {
 	Privileged  bool `json:"privileged,omitempty"`
+	AllowRoot   bool `json:"allowRoot,omitempty"`
 	HostNetwork bool `json:"hostNetwork,omitempty"`
 	IPCLock     bool `json:"ipcLock,omitempty"`
 	// +kubebuilder:validation:MaxItems=16

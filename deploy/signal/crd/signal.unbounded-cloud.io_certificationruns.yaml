@@ -1594,6 +1594,8 @@ spec:
                                     type: string
                                   security:
                                     properties:
+                                      allowRoot:
+                                        type: boolean
                                       capabilities:
                                         items:
                                           pattern: ^[A-Z][A-Z0-9_]*$
@@ -2489,6 +2491,9 @@ spec:
                                   invocationID:
                                     maxLength: 128
                                     minLength: 1
+                                    type: string
+                                  message:
+                                    maxLength: 1024
                                     type: string
                                   outcome:
                                     enum:

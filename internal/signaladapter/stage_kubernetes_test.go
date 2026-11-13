@@ -36,6 +36,29 @@ import (
 
 const testWorkflowServiceAccount = "project-signal-vllm-workload"
 
+func TestApplyStageSecurityAllowRoot(t *testing.T) {
+	t.Parallel()
+
+	container := corev1.Container{}
+	applyStageSecurity(&container, signalv1.ResolvedSecurityRequirements{
+		AllowRoot:    true,
+		Capabilities: []string{"SYSLOG"},
+	})
+
+	if container.SecurityContext == nil ||
+		container.SecurityContext.RunAsUser == nil ||
+		*container.SecurityContext.RunAsUser != 0 ||
+		container.SecurityContext.RunAsGroup == nil ||
+		*container.SecurityContext.RunAsGroup != 0 ||
+		container.SecurityContext.RunAsNonRoot == nil ||
+		*container.SecurityContext.RunAsNonRoot {
+		t.Fatalf("run-as-root security context = %#v", container.SecurityContext)
+	}
+	if got := container.SecurityContext.Capabilities.Add; len(got) != 1 || got[0] != "SYSLOG" {
+		t.Fatalf("capabilities = %v, want [SYSLOG]", got)
+	}
+}
+
 func TestLegacyMeasurementsRedactRawIdentity(t *testing.T) {
 	t.Parallel()
 

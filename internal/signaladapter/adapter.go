@@ -39,6 +39,7 @@ const (
 	mpiHostfilePath         = "/tmp/project-signal-hostfile"
 	mpiKnownHostsPath       = "/tmp/project-signal-known-hosts"
 	resultPrefix            = "PROJECT_SIGNAL_RESULT_V2 "
+	workloadIdentityID      = int64(65532)
 )
 
 var runnerImagePattern = regexp.MustCompile(`^[^@\s]+@sha256:[0-9a-f]{64}$`)

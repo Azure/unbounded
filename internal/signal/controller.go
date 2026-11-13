@@ -1315,6 +1315,7 @@ func (r *AdmissionReconciler) resolveStage(
 			Driver:                     *test.Spec.Driver.DeepCopy(),
 			Security: signalv1.ResolvedSecurityRequirements{
 				Privileged:   test.Spec.Security.Privileged,
+				AllowRoot:    test.Spec.Security.AllowRoot,
 				HostNetwork:  test.Spec.Security.HostNetwork,
 				IPCLock:      test.Spec.Security.IPCLock,
 				Capabilities: slices.Clone(test.Spec.Security.Capabilities),

@@ -1793,8 +1793,20 @@ func driverResources(driver signalv1.CertificationTestDriver) corev1.ResourceReq
 }
 
 func applyStageSecurity(container *corev1.Container, security signalv1.ResolvedSecurityRequirements) {
+	runAsUser := workloadIdentityID
+	runAsGroup := workloadIdentityID
+	runAsNonRoot := true
+	if security.AllowRoot {
+		runAsUser = 0
+		runAsGroup = 0
+		runAsNonRoot = false
+	}
+
 	container.SecurityContext = &corev1.SecurityContext{
-		Privileged: &security.Privileged,
+		Privileged:   &security.Privileged,
+		RunAsUser:    utilptr.To(runAsUser),
+		RunAsGroup:   utilptr.To(runAsGroup),
+		RunAsNonRoot: utilptr.To(runAsNonRoot),
 	}
 	if security.IPCLock || len(security.Capabilities) > 0 {
 		container.SecurityContext.Capabilities = &corev1.Capabilities{}
