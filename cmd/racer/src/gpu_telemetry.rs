@@ -90,9 +90,10 @@ impl GpuTelemetry {
         let _ = self.helper.set(helper);
     }
 
-    /// Report the helper in `slot` once it starts, and standby until the
-    /// first `gpu-read` resolves it. Reading never starts it. Later calls are
-    /// ignored.
+    /// Report the helper in `slot` once it starts, and standby until the slot
+    /// leaves standby: when a helper is running, or after a terminal failure.
+    /// A failed start attempt keeps the slot in standby. Reading never starts
+    /// it. Later calls are ignored.
     pub fn attach_slot(&self, slot: Arc<crate::gpu_slot::GpuSlot>) {
         let _ = self.slot.set(slot);
     }
