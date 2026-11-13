@@ -1,0 +1,12 @@
+{{- if .Values.namespace.create }}
+# Only the static `kubectl apply` render creates the namespace (values-static.yaml,
+# rendered with --skip-schema-validation). The schema pins namespace.create to
+# false so a Helm or AKS extension install can't take ownership of the namespace
+# that holds every operator-managed component.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: unbounded-operator
+{{- end }}
