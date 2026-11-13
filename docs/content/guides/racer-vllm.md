@@ -247,14 +247,17 @@ mode (`gpu`, `host`, `stream`). On the dataplane, compare before and after a loa
 
 ```bash
 kubectl get --raw "/api/v1/namespaces/unbounded-system/pods/<dataplane-pod>:9090/proxy/metrics" \
-  | grep -E 'racer_delivery_bytes_total|racer_gpu_read_requests_total|lookup_(hits|misses)_total'
+  | grep -E 'racer_delivery_bytes_total|racer_gpu_read_requests_total|lookup_(hits|misses)_total|racer_peer_hits_total'
 ```
 
 - `racer_delivery_bytes_total` should grow by about the model size per
   replica.
 - `racer_gpu_read_requests_total{outcome="gpu"}` counts GPU deliveries.
-- The `racer_*_lookup_hits_total` and `racer_*_lookup_misses_total` series
-  show how many pages came from memory, disk, and peers.
+- The `racer_{plaintext,ciphertext,pending,disk_index}_lookup_hits_total`
+  and matching `_lookup_misses_total` series show which local tier answered
+  each page lookup: the plaintext and ciphertext memory caches, pending disk
+  writes, and the disk index. There is no peer lookup series;
+  `racer_peer_hits_total` counts pages received from peers.
 
 ## Troubleshooting
 
