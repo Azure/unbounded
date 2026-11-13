@@ -576,11 +576,17 @@ handle type, maps it, and wraps it as a torch tensor.
 ### vLLM plugin
 
 `racer-vllm` registers `--load-format racer` through the
-`vllm.general_plugins` entry point and `register_model_loader`. For each
-safetensors file it reads the header, reads each tensor's bytes into a reusable
-GPU staging buffer, and passes tensor views to `model.load_weights`. Files are
-found through `model.safetensors.index.json`. Object keys follow racer-object's
-rule (`internal/racerobject/racerobject.go`).
+`vllm.general_plugins` entry point and `register_model_loader`. It does not
+list the origin or read safetensors headers. `racer-vllm import` writes
+`racer-manifest.json` at the model prefix with every file's name, size and
+SHA-256 and each safetensors file's parsed tensor header
+(`clients/python/racer-vllm/src/racer_vllm/manifest.py`). The loader reads the
+checked-out manifest, and the planner (`planner.py`) turns the tensors this
+rank needs into merged byte ranges. Reads land in staging buffers, through
+`gpu-read` or `host-read`, and tensor views are passed to vLLM (`loader.py`).
+[Racer model weights](racer-model-weights.md) describes the manifest, planner
+and staging in detail. Object keys follow racer-object's rule
+(`internal/racerobject/racerobject.go`).
 
 ## Testing
 
