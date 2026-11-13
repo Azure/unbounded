@@ -2,18 +2,28 @@
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
-# Assembles a bootable GPT disk image from /rootfs.tar without loop devices
-# or privileges. It runs on the build platform and writes /disk/disk.img.gz.
+# Assembles a bootable GPT disk image from a root file system archive without
+# loop devices or privileges. It runs on the build platform.
 #
 # Environment:
 #   TARGETARCH  amd64 or arm64
+#   DISTRO      azurelinux (default) or ubuntu; selects the initramfs name
+#               and where the signed GRUB looks for its configuration
 #   MSHV        set to 1 to start the Microsoft Hypervisor before Linux
+#   ROOTFS_TAR  root file system archive (default /rootfs.tar)
+#   ROOTFS_KVER file holding the kernel version (default /rootfs.kver)
+#   WORK        scratch directory, removed on success (default /tmp/disk)
+#   OUTPUT      compressed disk image (default /disk/disk.img.gz)
 set -eu
 
 : "${TARGETARCH:?TARGETARCH is required}"
+DISTRO="${DISTRO:-azurelinux}"
 MSHV="${MSHV:-0}"
 
-WORK=/tmp/disk
+ROOTFS_TAR="${ROOTFS_TAR:-/rootfs.tar}"
+ROOTFS_KVER="${ROOTFS_KVER:-/rootfs.kver}"
+WORK="${WORK:-/tmp/disk}"
+OUTPUT="${OUTPUT:-/disk/disk.img.gz}"
 ROOT="$WORK/root"
 ESP_MIB=256
 ALIGN_MIB=1
@@ -25,14 +35,25 @@ case "$TARGETARCH" in
   *) echo "unsupported architecture: $TARGETARCH" >&2; exit 1 ;;
 esac
 
+case "$DISTRO" in
+  azurelinux) INITRD_PREFIX=initramfs- INITRD_SUFFIX=.img ;;
+  ubuntu) INITRD_PREFIX=initrd.img- INITRD_SUFFIX= ;;
+  *) echo "unsupported distribution: $DISTRO" >&2; exit 1 ;;
+esac
+
+if [ "$MSHV" = 1 ] && [ "$DISTRO" != azurelinux ]; then
+  echo "MSHV images support Azure Linux only, not $DISTRO" >&2
+  exit 1
+fi
+
 if [ "$MSHV" = 1 ] && [ "$TARGETARCH" != amd64 ]; then
   echo "MSHV images support amd64 only, not $TARGETARCH" >&2
   exit 1
 fi
 
-KVER=$(cat /rootfs.kver)
+KVER=$(cat "$ROOTFS_KVER")
 mkdir -p "$ROOT"
-tar --extract --file=/rootfs.tar --numeric-owner --xattrs \
+tar --extract --file="$ROOTFS_TAR" --numeric-owner --xattrs \
   --xattrs-include='*' -C "$ROOT"
 mkdir -p "$ROOT/proc" "$ROOT/sys" "$ROOT/dev" "$ROOT/run" "$ROOT/tmp" \
   "$ROOT/boot/efi"
@@ -65,7 +86,7 @@ fi
 cat >> "$WORK/grub.cfg" <<EOF
 search --no-floppy --fs-uuid --set=root $ROOT_UUID
 linux /boot/vmlinuz-$KVER root=UUID=$ROOT_UUID rw $CONSOLE
-initrd /boot/initramfs-$KVER.img
+initrd /boot/$INITRD_PREFIX$KVER$INITRD_SUFFIX
 boot
 EOF
 
@@ -76,9 +97,24 @@ export MTOOLS_SKIP_CHECK=1
 # Copy everything the packages installed on the ESP: shim and GRUB under
 # EFI/, plus the hypervisor and its loaders on MSHV images.
 mcopy -s -i "$ESP_IMG" "$ROOT/boot/efi/"* ::/
-mmd -i "$ESP_IMG" ::/boot ::/boot/grub2
-mcopy -i "$ESP_IMG" "$WORK/grub.cfg" ::/boot/grub2/grub.cfg
-mcopy -i "$ESP_IMG" "$WORK/grub.cfg" ::/EFI/BOOT/grub.cfg
+if [ "$DISTRO" = ubuntu ]; then
+  # The Canonical-signed GRUB reads EFI/ubuntu/grub.cfg on the ESP. Keep
+  # the boot entry on the root file system in /boot/grub/grub.cfg, where
+  # update-grub on the machine replaces it with a generated configuration.
+  mkdir -p "$ROOT/boot/grub"
+  cp "$WORK/grub.cfg" "$ROOT/boot/grub/grub.cfg"
+  cat > "$WORK/esp-grub.cfg" <<EOF
+search --no-floppy --fs-uuid --set=root $ROOT_UUID
+set prefix=(\$root)/boot/grub
+configfile \$prefix/grub.cfg
+EOF
+  mcopy -i "$ESP_IMG" "$WORK/esp-grub.cfg" ::/EFI/ubuntu/grub.cfg
+  mcopy -i "$ESP_IMG" "$WORK/esp-grub.cfg" ::/EFI/BOOT/grub.cfg
+else
+  mmd -i "$ESP_IMG" ::/boot ::/boot/grub2
+  mcopy -i "$ESP_IMG" "$WORK/grub.cfg" ::/boot/grub2/grub.cfg
+  mcopy -i "$ESP_IMG" "$WORK/grub.cfg" ::/EFI/BOOT/grub.cfg
+fi
 # The ESP is mounted at /boot/efi, so keep the root copy empty.
 rm -rf "${ROOT:?}/boot/efi/"*
 
@@ -104,6 +140,6 @@ EOF
 dd if="$ESP_IMG" of="$DISK" bs=1M seek="$ALIGN_MIB" conv=notrunc,sparse status=none
 dd if="$ROOT_IMG" of="$DISK" bs=1M seek=$((ALIGN_MIB + ESP_MIB)) conv=notrunc,sparse status=none
 
-mkdir -p /disk
-pigz -1 -c "$DISK" > /disk/disk.img.gz
+mkdir -p "$(dirname "$OUTPUT")"
+pigz -1 -c "$DISK" > "$OUTPUT"
 rm -rf "$WORK"
