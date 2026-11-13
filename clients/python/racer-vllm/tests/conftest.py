@@ -53,6 +53,24 @@ class FakeTensor:
     def __getitem__(self, s):
         return FakeTensor(self.buf, self.off + s.start, s.stop - s.start)
 
+    def reshape(self, shape):
+        shape = (shape,) if isinstance(shape, int) else tuple(shape)
+        if shape == (-1,):
+            shape = (self.n,)
+        return FakeTensor(self.buf, self.off, self.n, self.dtype, shape)
+
+    def detach(self):
+        return self
+
+    def contiguous(self):
+        return self
+
+    def cpu(self):
+        return self
+
+    def numpy(self):
+        return types.SimpleNamespace(tobytes=self.bytes)
+
     def clone(self):
         return FakeTensor(bytearray(self.bytes()), 0, self.n, self.dtype, self.shape)
 
@@ -117,7 +135,11 @@ class FakeTorch(types.ModuleType):
                 return False
 
         self.cuda = types.SimpleNamespace(
-            current_device=lambda: 0, device=Device, Event=Event, current_stream=lambda dev=None: None
+            current_device=lambda: 0,
+            device=Device,
+            Event=Event,
+            current_stream=lambda dev=None: None,
+            is_available=lambda: False,
         )
 
     def empty(self, size, dtype="uint8", device=None):
@@ -125,8 +147,11 @@ class FakeTorch(types.ModuleType):
             return FakeTensor(bytearray(size), 0, size, dtype)
         return FakeTensor(bytearray(), 0, 0, dtype, size if math.prod(size) == 0 else (0,))
 
-    def frombuffer(self, mv, dtype="uint8"):
-        return FakeTensor(bytearray(mv))
+    def frombuffer(self, obj, dtype="uint8"):
+        # Like torch: share the memory and keep a reference to the exporter.
+        t = FakeTensor(memoryview(obj).cast("B"))
+        t.exporter = obj
+        return t
 
 
 @pytest.fixture
