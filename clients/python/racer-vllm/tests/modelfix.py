@@ -160,7 +160,7 @@ def install_fake_vllm(monkeypatch, base=DefaultModelLoader):
     registry = {"calls": []}
     names = ("vllm", "vllm.model_executor", "vllm.model_executor.model_loader",
              "vllm.model_executor.model_loader.default_loader",
-             "vllm.model_executor.model_loader.sharded_state_loader")
+             "vllm.model_executor.model_loader.sharded_state_loader", "vllm.distributed")
     mods = {n: types.ModuleType(n) for n in names}
     mods["vllm"].__version__ = "0.33.0"
 
@@ -178,11 +178,20 @@ def install_fake_vllm(monkeypatch, base=DefaultModelLoader):
     mods["vllm.model_executor.model_loader.sharded_state_loader"].ShardedStateLoader = types.SimpleNamespace(
         _filter_subtensors=lambda sd: dict(sd)
     )
+    set_parallel(mods["vllm.distributed"])
+    mods["vllm"].distributed = mods["vllm.distributed"]
     for n, m in mods.items():
         monkeypatch.setitem(sys.modules, n, m)
     monkeypatch.setattr(racer_vllm, "_registered", False)
     monkeypatch.setattr(loader, "_built", {})
     return registry
+
+
+def set_parallel(dist, tp=1, pp=1, rank=0):
+    """Give a fake vllm.distributed module a parallel layout."""
+    dist.get_tensor_model_parallel_world_size = lambda: tp
+    dist.get_pp_group = lambda: types.SimpleNamespace(world_size=pp)
+    dist.get_world_group = lambda: types.SimpleNamespace(rank_in_group=rank)
 
 
 class Model:

@@ -329,24 +329,30 @@ class RacerLoaderMixin:
         started = time.monotonic()
         self._racer_model = model
         self._racer_primary = str(model_config.model)
-        rank = 0
+        rank = None
         try:
             done = False
             if self.racer.sharded != "off" and not self.racer.capture_dir:
                 fp, _, par = self._fingerprint(model, model_config)
-                rank = par["rank"]
-                uri = self._uri_for(self._racer_primary)
-                client = self._client(uri)
-                done = sh.load_sharded(
-                    client,
-                    uri,
-                    model,
-                    rank,
-                    self.racer.role,
-                    fp,
-                    lambda: self._reader(client),
-                    require=self.racer.sharded == "require",
-                )
+                why = sh.rank_problem(par)
+                if why is None:
+                    rank = par["rank"]
+                    uri = self._uri_for(self._racer_primary)
+                    client = self._client(uri)
+                    done = sh.load_sharded(
+                        client,
+                        uri,
+                        model,
+                        rank,
+                        self.racer.role,
+                        fp,
+                        lambda: self._reader(client),
+                        require=self.racer.sharded == "require",
+                    )
+                elif self.racer.sharded == "require":
+                    raise sh.ShardedMismatch(f"racer: cannot pick a sharded artifact: {why}")
+                else:
+                    log.warning("racer: not using sharded artifacts: %s; loading from the checkpoint", why)
             if not done:
                 super().load_weights(model, model_config)
         finally:
@@ -364,6 +370,9 @@ class RacerLoaderMixin:
 
     def _capture(self, model, model_config) -> None:
         fp, digest, par = self._fingerprint(model, model_config)
+        why = sh.rank_problem(par)
+        if why is not None:
+            raise RuntimeError(f"racer: cannot capture a sharded artifact: {why}")
         path = sh.capture(
             model,
             self.racer.role,
