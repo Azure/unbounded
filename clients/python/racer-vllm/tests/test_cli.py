@@ -8,15 +8,14 @@ import os
 
 import pytest
 from fakeprefetch import Outcome
-from modelfix import URI, W, Model, checkpoint, client, install_fake_vllm, model_state, publish, put
+from modelfix import URI, W, Model, checkpoint, install_fake_vllm, model_state, publish, put
 
-import racer_vllm
-from racer_vllm import cli, importer, sharded, store
+from racer_vllm import cli, fetch_main, importer, main, parse_uri, sharded, store
 from racer_vllm import manifest as mf
 
 
 def run(capsys, *argv):
-    rc = racer_vllm.main(list(argv))
+    rc = main(list(argv))
     out, err = capsys.readouterr()
     return rc, out, err
 
@@ -52,11 +51,11 @@ def test_help_everywhere(capsys, cmd):
 
 def test_fetch_alias(capsys, server, tmp_path):
     u, files, m = publish(server)
-    rc = racer_vllm.fetch_main([URI, str(tmp_path / "d"), "--socket", server.path])
+    rc = fetch_main([URI, str(tmp_path / "d"), "--socket", server.path])
     out, err = capsys.readouterr()
     assert rc == 0 and "deprecated" in err
     assert (tmp_path / "d" / mf.SOURCE_NAME).is_file()
-    assert racer_vllm.fetch_main(["--help"]) == 0
+    assert fetch_main(["--help"]) == 0
 
 
 def test_prepare_rejects_loader_flags(capsys):
@@ -311,7 +310,7 @@ def test_prepare_without_vllm(capsys, monkeypatch, server, tmp_path):
     publish(server)
     for mod in ("vllm", "vllm.engine", "vllm.engine.arg_utils"):
         monkeypatch.setitem(sys.modules, mod, None)
-    monkeypatch.setattr(racer_vllm, "_registered", True)
+    monkeypatch.setattr("racer_vllm._registered", True)
     rc, out, err = run(capsys, "prepare", URI, "--dest", f"file://{tmp_path}/o", "--workdir", str(tmp_path / "w"),
                        "--socket", server.path)
     assert rc == 1 and "needs vLLM" in err
@@ -340,6 +339,6 @@ def test_prepare_refuses_data_parallelism(monkeypatch, server, tmp_path, args):
     dest = tmp_path / "origin"
     calls = []
     with pytest.raises(cli.CommandError, match="data-parallel-size"):
-        cli.prepare(racer_vllm.parse_uri(URI), f"file://{dest}", str(tmp_path / "work"), args,
+        cli.prepare(parse_uri(URI), f"file://{dest}", str(tmp_path / "work"), args,
                     socket_path=server.path, runner=lambda *a: calls.append(a))
     assert calls == [] and not dest.exists() and not (tmp_path / "work").exists()

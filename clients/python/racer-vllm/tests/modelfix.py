@@ -12,8 +12,7 @@ from conftest import FakeTensor, make_safetensors
 from fakeserver import Obj
 
 import racer
-import racer_vllm
-from racer_vllm import importer, loader
+from racer_vllm import importer, loader, parse_uri, register
 from racer_vllm import manifest as mf
 
 URI = "racer://cache1/models/org/llama"
@@ -57,7 +56,7 @@ def put(server, uri, name, data, etag='"v1"'):
 
 def publish(server, uri=URI, files=None, etag='"v1"'):
     """Put a checkpoint and its manifest into the fake Racer. Returns (ModelURI, files, manifest)."""
-    u = racer_vllm.parse_uri(uri) if isinstance(uri, str) else uri
+    u = parse_uri(uri) if isinstance(uri, str) else uri
     files = checkpoint() if files is None else files
     m = manifest_for(files)
     for name, data in files.items():
@@ -182,7 +181,7 @@ def install_fake_vllm(monkeypatch, base=DefaultModelLoader):
     mods["vllm"].distributed = mods["vllm.distributed"]
     for n, m in mods.items():
         monkeypatch.setitem(sys.modules, n, m)
-    monkeypatch.setattr(racer_vllm, "_registered", False)
+    monkeypatch.setattr("racer_vllm._registered", False)
     monkeypatch.setattr(loader, "_built", {})
     return registry
 
@@ -234,8 +233,8 @@ def model_config(model, **kw):
 
 def make_loader(monkeypatch, server, base=DefaultModelLoader, **extra):
     registry = install_fake_vllm(monkeypatch, base)
-    racer_vllm.register()
-    racer_vllm.register()
+    register()
+    register()
     assert registry["calls"] == ["racer"]
     cfg = {"socket": server.path, "staging_bytes": 4096, "max_staging_bytes": 1 << 20, "concurrency": 2,
            "delivery": "host", "sharded": "off", **extra}
