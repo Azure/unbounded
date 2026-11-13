@@ -214,6 +214,6 @@ func TestReleaseBOMCoversReleaseWorkflowImages(t *testing.T) {
 	}
 
 	if !slices.Contains(releaseImageNames, "racer-vllm") {
-		t.Error("releaseImageNames must list the amd64-only racer-vllm image")
+		t.Error("releaseImageNames must list the racer-vllm image")
 	}
 }
