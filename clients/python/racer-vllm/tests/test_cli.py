@@ -331,3 +331,15 @@ def test_inspect_lists_sharded_artifacts(capsys, monkeypatch, server, torch, tmp
     rc, out, err = run(capsys, "inspect", URI, "--socket", server.path)
     assert rc == 0 and f"sharded   {'e' * 32} role=target ranks 1/1 vllm=0.33.0" in out
     assert W  # the checkpoint fixtures stay importable
+
+
+@pytest.mark.parametrize("args", [["--data-parallel-size", "2"], ["--data-parallel-size=4"], ["-dp", "2"]])
+def test_prepare_refuses_data_parallelism(monkeypatch, server, tmp_path, args):
+    install_fake_vllm(monkeypatch)
+    publish(server)
+    dest = tmp_path / "origin"
+    calls = []
+    with pytest.raises(cli.CommandError, match="data-parallel-size"):
+        cli.prepare(racer_vllm.parse_uri(URI), f"file://{dest}", str(tmp_path / "work"), args,
+                    socket_path=server.path, runner=lambda *a: calls.append(a))
+    assert calls == [] and not dest.exists() and not (tmp_path / "work").exists()

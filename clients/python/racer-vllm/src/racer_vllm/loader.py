@@ -313,7 +313,7 @@ class RacerLoaderMixin:
     def _fingerprint(self, model, model_config) -> tuple:
         path = str(model_config.model)
         digest = mf.digest(self._manifest_for(path))
-        par = sh.parallel_info()
+        par = sh.parallel_info(getattr(model_config, "parallel_config", None))
         fp = sh.fingerprint(
             model, self.racer.role, digest, self._vllm_version(), model_config=model_config, parallel=par
         )
@@ -371,6 +371,8 @@ class RacerLoaderMixin:
     def _capture(self, model, model_config) -> None:
         fp, digest, par = self._fingerprint(model, model_config)
         why = sh.rank_problem(par)
+        if why is None and par.get("dp", 1) > 1:
+            why = f"data parallel size is {par['dp']}; capture with one replica (artifacts are per tp/pp rank)"
         if why is not None:
             raise RuntimeError(f"racer: cannot capture a sharded artifact: {why}")
         path = sh.capture(
