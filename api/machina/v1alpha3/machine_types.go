@@ -4,6 +4,8 @@
 package v1alpha3
 
 import (
+	"time"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 )
@@ -523,6 +525,15 @@ type PXESpec struct {
 	// +optional
 	CloudInit *CloudInitSpec `json:"cloudInit,omitempty"`
 
+	// CloudInitTimeout bounds how long a HostReplace target may wait from the
+	// installer reboot handoff until first-boot cloud-init completes and the
+	// Node registers. It covers firmware POST. When omitted, metalman allows
+	// 20 minutes. Large GPU servers can spend most of the default budget in
+	// POST alone.
+	// +optional
+	// +kubebuilder:validation:XValidation:rule="duration(self) > duration('0s')",message="cloudInitTimeout must be positive"
+	CloudInitTimeout *metav1.Duration `json:"cloudInitTimeout,omitempty"`
+
 	// Network declares the host's static network topology: physical
 	// ethernets identified by MAC address, bonds, and VLANs. The installer
 	// brings it up before fetching install instructions and persists it as
@@ -718,6 +729,8 @@ const (
 	DefaultPXEArchitecture = PXEArchitectureAMD64
 	// DefaultPXEBootProtocol is used when host.netboot.bootProtocol is omitted.
 	DefaultPXEBootProtocol = PXEBootProtocolPXE
+	// DefaultCloudInitTimeout is used when host.netboot.cloudInitTimeout is omitted.
+	DefaultCloudInitTimeout = 20 * time.Minute
 )
 
 // TargetArchitecture returns the effective PXE target architecture.
@@ -736,6 +749,15 @@ func (p *PXESpec) TargetBootProtocol() string {
 	}
 
 	return p.BootProtocol
+}
+
+// TargetCloudInitTimeout returns the effective first-boot cloud-init timeout.
+func (p *PXESpec) TargetCloudInitTimeout() time.Duration {
+	if p == nil || p.CloudInitTimeout == nil {
+		return DefaultCloudInitTimeout
+	}
+
+	return p.CloudInitTimeout.Duration
 }
 
 // CloudInitSpec defines cloud-init customization for PXE-booted machines.

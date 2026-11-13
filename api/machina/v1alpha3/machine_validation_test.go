@@ -51,6 +51,46 @@ func TestMachineProviderOwnershipSchema(t *testing.T) {
 	})
 }
 
+func newCloudInitTimeoutMachineObject(t *testing.T) map[string]any {
+	t.Helper()
+
+	return parseObject(t, `
+apiVersion: unbounded-cloud.io/v1alpha3
+kind: Machine
+metadata:
+  name: host-1
+spec:
+  pxe:
+    image: ghcr.io/example/host:v1
+    cloudInitTimeout: 20m
+`)
+}
+
+func TestMachineCloudInitTimeout(t *testing.T) {
+	t.Parallel()
+
+	runMachineCreateCases(t, []machineCreateCase{
+		{name: "positive timeout", object: newCloudInitTimeoutMachineObject},
+		{
+			name:   "omitted timeout uses the default",
+			object: newCloudInitTimeoutMachineObject,
+			mutate: removeMachineField("spec", "pxe", "cloudInitTimeout"),
+		},
+		{
+			name:   "zero timeout",
+			object: newCloudInitTimeoutMachineObject,
+			mutate: setMachineField("0s", "spec", "pxe", "cloudInitTimeout"),
+			want:   []string{"cloudInitTimeout must be positive"},
+		},
+		{
+			name:   "negative timeout",
+			object: newCloudInitTimeoutMachineObject,
+			mutate: setMachineField("-1m", "spec", "pxe", "cloudInitTimeout"),
+			want:   []string{"cloudInitTimeout must be positive"},
+		},
+	})
+}
+
 func assertSchemaValidations(t *testing.T, schema apiextensionsv1.JSONSchemaProps, want map[string]string) {
 	t.Helper()
 

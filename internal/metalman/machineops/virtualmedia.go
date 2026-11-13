@@ -631,8 +631,9 @@ func (r *Reconciler) advanceMediaInstalled(ctx context.Context, target v1alpha3.
 	}
 
 	// Virtual media callbacks are per target, never operation-wide.
-	if change, done := r.cloudInitReplaceStatus(target.Conditions, target, now); done {
-		if target.BootMedia.PhaseStartedAt != nil && now.Sub(target.BootMedia.PhaseStartedAt.Time) >= r.cloudInitTimeout() {
+	timeout := target.BootMedia.Netboot.TargetCloudInitTimeout()
+	if change, done := cloudInitReplaceStatus(target.Conditions, target, timeout, now); done {
+		if target.BootMedia.PhaseStartedAt != nil && now.Sub(target.BootMedia.PhaseStartedAt.Time) >= timeout {
 			return failTarget(target, reasonTimedOut, "waiting for cloud-init timed out", now)
 		}
 
@@ -645,7 +646,7 @@ func (r *Reconciler) advanceMediaInstalled(ctx context.Context, target v1alpha3.
 			return targetChange{target: target, err: err}
 		}
 
-		if target.BootMedia.PhaseStartedAt != nil && now.Sub(target.BootMedia.PhaseStartedAt.Time) >= r.cloudInitTimeout() {
+		if target.BootMedia.PhaseStartedAt != nil && now.Sub(target.BootMedia.PhaseStartedAt.Time) >= timeout {
 			return failTarget(target, reasonTimedOut, "waiting for Node timed out", now)
 		}
 
