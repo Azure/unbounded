@@ -10,6 +10,9 @@ metadata:
     app.kubernetes.io/name: unbounded-net-node
     app.kubernetes.io/component: node
 rules:
+  - apiGroups: ["acn.azure.com"]
+    resources: ["nodenetworkconfigs"]
+    verbs: ["get"]
   # Nodes: read access to watch for podCIDR assignments, patch to add WireGuard pubkey annotation
   - apiGroups: [""]
     resources: ["nodes"]

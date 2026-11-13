@@ -29,6 +29,15 @@ You'll label gateway nodes, initialize a site, and join remote machines.
 {{< callout type="info" >}}
 **Clusters with an existing CNI** (e.g. Cilium, Calico, Azure CNI): Unbounded works alongside your existing CNI. Pass `--manage-cni-plugin=false` when running `site init`, or set `manageCniPlugin: false` on the Site resource after creation. See the [manageCniPlugin reference]({{< relref "reference/networking/custom-resources#managecniplugin-behavior" >}}) for details.
 
+For Azure CNI Overlay powered by Cilium, Kubernetes Nodes can have empty
+`spec.podCIDRs`. Unbounded reads the per-node static overlay allocations from
+`kube-system` NodeNetworkConfigs (`acn.azure.com/v1alpha`) instead. It verifies
+the current Node UID and internal IP before advertising those allocations in
+SiteNodeSlices and GatewayPools. Azure retains ownership of IPAM; Unbounded does
+not populate the managed Nodes' `spec.podCIDRs` or replace the CNI configuration.
+This fallback does not cover Azure CNI dynamic IP allocation or infer per-node
+CIDRs from the cluster-wide pod subnet.
+
 **Clusters without a CNI** (created with `--network-plugin none`): No extra configuration is needed — unbounded-net will serve as the CNI.
 {{< /callout >}}
 

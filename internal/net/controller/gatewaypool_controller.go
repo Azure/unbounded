@@ -39,6 +39,7 @@ import (
 	"k8s.io/klog/v2"
 
 	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
+	"github.com/Azure/unbounded/internal/net/azurepodcidr"
 )
 
 var gatewayPoolGVR = schema.GroupVersionResource{
@@ -67,8 +68,9 @@ const (
 
 // GatewayPoolController manages GatewayPool status based on node selector matches.
 type GatewayPoolController struct {
-	clientset     kubernetes.Interface
-	dynamicClient dynamic.Interface
+	clientset            kubernetes.Interface
+	dynamicClient        dynamic.Interface
+	azurePodCIDRInformer cache.SharedIndexInformer
 
 	nodeLister corev1listers.NodeLister
 	nodeSynced cache.InformerSynced
@@ -107,18 +109,34 @@ func NewGatewayPoolController(
 
 	nodeInformer := nodeInformerFactory.Core().V1().Nodes()
 
+	azureInformer, err := azurepodcidr.InformerIfAvailable(clientset.Discovery(), dynamicInformerFactory)
+	if err != nil {
+		return nil, err
+	}
+
 	gc := &GatewayPoolController{
-		clientset:           clientset,
-		dynamicClient:       dynamicClient,
-		nodeLister:          nodeInformer.Lister(),
-		nodeSynced:          nodeInformer.Informer().HasSynced,
-		gatewayPoolInformer: gatewayPoolInformer,
-		gatewayPoolSynced:   gatewayPoolInformer.HasSynced,
-		gatewayNodeInformer: gatewayNodeInformer,
-		gatewayNodeSynced:   gatewayNodeInformer.HasSynced,
-		workqueue:           workqueue.NewTypedRateLimitingQueueWithConfig(workqueue.DefaultTypedControllerRateLimiter[string](), workqueue.TypedRateLimitingQueueConfig[string]{Name: "GatewayPools"}),
-		gwPortAllocated:     make(map[int32]string),
-		gwPortByNode:        make(map[string]int32),
+		azurePodCIDRInformer: azureInformer,
+		clientset:            clientset,
+		dynamicClient:        dynamicClient,
+		nodeLister:           nodeInformer.Lister(),
+		nodeSynced:           nodeInformer.Informer().HasSynced,
+		gatewayPoolInformer:  gatewayPoolInformer,
+		gatewayPoolSynced:    gatewayPoolInformer.HasSynced,
+		gatewayNodeInformer:  gatewayNodeInformer,
+		gatewayNodeSynced:    gatewayNodeInformer.HasSynced,
+		workqueue:            workqueue.NewTypedRateLimitingQueueWithConfig(workqueue.DefaultTypedControllerRateLimiter[string](), workqueue.TypedRateLimitingQueueConfig[string]{Name: "GatewayPools"}),
+		gwPortAllocated:      make(map[int32]string),
+		gwPortByNode:         make(map[string]int32),
+	}
+
+	if azureInformer != nil {
+		if _, err := azureInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+			AddFunc:    gc.handleAzurePodCIDRChange,
+			UpdateFunc: func(_, current any) { gc.handleAzurePodCIDRChange(current) },
+			DeleteFunc: gc.handleAzurePodCIDRChange,
+		}); err != nil {
+			return nil, fmt.Errorf("register Azure gateway PodCIDR events: %w", err)
+		}
 	}
 
 	// Set up event handlers for nodes
@@ -203,6 +221,10 @@ func (gc *GatewayPoolController) Run(ctx context.Context, workers int) error {
 
 	// Wait for caches to sync
 	klog.Info("Waiting for GatewayPool informer caches to sync")
+
+	if gc.azurePodCIDRInformer != nil && !cache.WaitForCacheSync(ctx.Done(), gc.azurePodCIDRInformer.HasSynced) {
+		return fmt.Errorf("failed to sync Azure gateway PodCIDR cache")
+	}
 
 	if ok := cache.WaitForCacheSync(ctx.Done(), gc.nodeSynced, gc.gatewayPoolSynced, gc.gatewayNodeSynced); !ok {
 		return fmt.Errorf("failed to wait for caches to sync")
@@ -542,7 +564,13 @@ func (gc *GatewayPoolController) syncPool(ctx context.Context, poolName string) 
 		siteName := NodeSiteLabel(node)
 
 		// Calculate health endpoint IPs from podCIDRs (first IP of each CIDR is the gateway IP)
-		healthEndpoints := getHealthIPsFromPodCIDRs(node.Spec.PodCIDRs)
+		podCIDRs, err := azurepodcidr.FromCache(node, gc.azurePodCIDRInformer)
+		if err != nil {
+			klog.Errorf("GatewayPool %s: read node %s PodCIDRs: %v", poolName, node.Name, err)
+			continue
+		}
+
+		healthEndpoints := getHealthIPsFromPodCIDRs(podCIDRs)
 
 		matchingNodes = append(matchingNodes, unboundednetv1alpha1.GatewayNodeInfo{
 			Name:                 node.Name,
@@ -552,7 +580,7 @@ func (gc *GatewayPoolController) syncPool(ctx context.Context, poolName string) 
 			HealthEndpoints:      healthEndpoints,
 			WireGuardPublicKey:   wgPubKey,
 			GatewayWireguardPort: gc.allocateGatewayPort(node.Name),
-			PodCIDRs:             node.Spec.PodCIDRs,
+			PodCIDRs:             podCIDRs,
 		})
 
 		if err := gc.ensureGatewayPoolNode(ctx, pool, node, siteName); err != nil {

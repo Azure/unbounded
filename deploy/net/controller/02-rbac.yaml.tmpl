@@ -10,6 +10,9 @@ metadata:
     app.kubernetes.io/name: unbounded-net-controller
     app.kubernetes.io/component: controller
 rules:
+  - apiGroups: ["acn.azure.com"]
+    resources: ["nodenetworkconfigs"]
+    verbs: ["get", "list", "watch"]
   # Nodes: read, patch, and update for CIDR assignment and site labeling.
   # Cannot be further scoped -- the controller must operate on any node in the cluster.
   # Fields restricted by ValidatingAdmissionPolicy (09-vap.yaml.tmpl):
