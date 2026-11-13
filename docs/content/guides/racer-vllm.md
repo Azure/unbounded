@@ -241,7 +241,12 @@ kubectl -n unbounded-system logs <dataplane-pod> | grep 'stage=gpu state='
 ```
 
 `state=enabled` means GPU mode is on. `state=disabled` gives the reason, and
-`state=standby` means no GPU read has come in yet. With `delivery: auto` the
+`state=standby` means no GPU read has come in yet.
+`state=starting attempt=<n>` marks each attempt to turn GPU mode on.
+`state=start-failed attempt=<n> reason=<reason> retry_in=<s>s` explains why a
+GPU read got 501: reads get 501 until the backoff expires, and the first GPU
+read after `retry_in` starts the next attempt. `state=recovered attempt=<n>`
+means an attempt after a failure succeeded. With `delivery: auto` the
 loader falls back to host delivery and logs the reason once. Set
 `delivery: gpu` to make the fallback an error.
 
