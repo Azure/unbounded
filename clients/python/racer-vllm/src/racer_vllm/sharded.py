@@ -57,24 +57,39 @@ def _json_safe(v):
 
 
 def parallel_info() -> dict:
-    """tp, pp, ep sizes, enable_expert_parallel, and this rank, from vLLM (best effort)."""
-    out = {"tp": 1, "pp": 1, "ep": 1, "enable_expert_parallel": False, "rank": 0, "world_size": 1}
+    """tp, pp, ep sizes, enable_expert_parallel, and this rank, from vLLM (best effort).
+
+    rank and world_size are None when the layout cannot be read, so callers
+    never mistake an unknown rank for rank 0.
+    """
+    out = {"tp": 1, "pp": 1, "ep": 1, "enable_expert_parallel": False, "rank": None, "world_size": None}
     try:
         from vllm import distributed as d
 
-        out["tp"] = d.get_tensor_model_parallel_world_size()
-        out["pp"] = d.get_pp_group().world_size
-        out["rank"] = d.get_world_group().rank_in_group if hasattr(d, "get_world_group") else 0
-        out["world_size"] = out["tp"] * out["pp"]
-        ep = getattr(d, "get_ep_group", None)
-        if ep is not None:
-            try:
-                out["ep"] = ep().world_size
-            except Exception:
-                pass
+        tp = d.get_tensor_model_parallel_world_size()
+        pp = d.get_pp_group().world_size
+        rank = d.get_world_group().rank_in_group
     except Exception as exc:
         log.debug("racer: parallel info unavailable: %s", exc)
+        return out
+    out.update(tp=tp, pp=pp, rank=rank, world_size=tp * pp)
+    ep = getattr(d, "get_ep_group", None)
+    if ep is not None:
+        try:
+            out["ep"] = ep().world_size
+        except Exception:
+            pass
     return out
+
+
+def rank_problem(par: dict):
+    """Why par's rank cannot pick a sharded artifact, or None when it can."""
+    rank, ws = par.get("rank"), par.get("world_size")
+    if rank is None or ws is None:
+        return "the tensor/pipeline parallel rank is unknown"
+    if not 0 <= rank < ws:
+        return f"rank {rank} is outside [0, {ws})"
+    return None
 
 
 def fingerprint(model, role: str, manifest, vllm_version: str, *, model_config=None, parallel: dict | None = None) -> str:

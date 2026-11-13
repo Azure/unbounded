@@ -21,6 +21,7 @@ from modelfix import (
     publish,
     put,
     serve_dir,
+    set_parallel,
 )
 
 import racer_vllm
@@ -378,3 +379,63 @@ def test_settings_pass_the_base_allowlist(monkeypatch, server):
     assert ld.racer.uri == URI and ld.racer.verify == "none" and ld.racer.role == "draft"
     # The caller's config is restored, so vLLM and the loader both see the real settings.
     assert ld.load_config.model_loader_extra_config["uri"] == URI
+
+
+def published_rank0(monkeypatch, server, tmp_path, mode):
+    """A rank 0 artifact for a tp=2 layout, and a loader in mode. Returns (loader, model dir)."""
+    import sys
+
+    u, files, m, d = materialized(server, tmp_path)
+    ld = make_loader(monkeypatch, server, sharded=mode)
+    set_parallel(sys.modules["vllm.distributed"], tp=2)
+    fp, _, _ = ld._fingerprint(Model(), model_config(d))
+    root = tmp_path / "origin"
+    out = capture_to(tmp_path, STATE, fp, ranks=(0, 1), world_size=2)
+    cli.publish_captured(LocalStore(str(root)), out, out=lambda *_: None)
+    serve_dir(server, u, str(root))
+    return ld, d
+
+
+def broken_world_group():
+    raise RuntimeError("world group is not initialized")
+
+
+@pytest.mark.parametrize("layout", ["unknown", "out_of_range"])
+def test_sharded_never_guesses_the_rank(monkeypatch, server, torch, tmp_path, caplog, layout):
+    import sys
+
+    ld, d = published_rank0(monkeypatch, server, tmp_path, "auto")
+    dist = sys.modules["vllm.distributed"]
+    if layout == "unknown":
+        dist.get_world_group = broken_world_group  # tp reads fine, the rank does not
+    else:
+        set_parallel(dist, tp=2, rank=5)
+    model = Model(model_state({n: b"\0" * len(v) for n, v in STATE.items()}))
+    with caplog.at_level(logging.WARNING, logger="vllm.racer_vllm.loader"):
+        ld.load_weights(model, model_config(d))
+    assert model.got == W  # the checkpoint, not rank 0's artifact
+    assert all(t.bytes() == b"\0" * len(STATE[n]) for n, t in model.state.items())
+    assert any("not using sharded artifacts" in r.getMessage() for r in caplog.records)
+    reader.forget()
+    ld = make_loader(monkeypatch, server, sharded="require")
+    dist = sys.modules["vllm.distributed"]
+    if layout == "unknown":
+        set_parallel(dist, tp=2)
+        dist.get_world_group = broken_world_group
+    else:
+        set_parallel(dist, tp=2, rank=5)
+    with pytest.raises(sharded.ShardedMismatch, match="unknown|outside"):
+        ld.load_weights(Model(model_state(STATE)), model_config(d))
+
+
+def test_parallel_info_reports_an_unknown_rank(monkeypatch):
+    import sys
+
+    install_fake_vllm(monkeypatch)
+    dist = sys.modules["vllm.distributed"]
+    set_parallel(dist, tp=4)
+    assert sharded.parallel_info()["rank"] == 0
+    dist.get_world_group = broken_world_group
+    par = sharded.parallel_info()
+    assert par["rank"] is None and par["world_size"] is None
+    assert sharded.rank_problem(par) and sharded.rank_problem({"rank": 2, "world_size": 2})
