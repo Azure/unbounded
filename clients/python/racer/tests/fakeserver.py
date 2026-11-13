@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import array
 import fcntl
+import json
 import os
 import socket
 import stat
@@ -59,6 +60,8 @@ class FakeRacer:
         self.truncate = False
         self.seen: list[Seen] = []
         self.prefetches = FakePrefetches()
+        # Answer to GET /v1/capabilities; None mimics a dataplane without it (404).
+        self.capabilities = {"schema": 1, "delivery": ["gpu", "host", "stream"], "gpu_uuids": [], "page_bytes": wire.PAGE_SIZE}
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.sock.bind(path)
         self.sock.listen(16)
@@ -164,6 +167,20 @@ class FakeRacer:
             seen.body = body
             status, h, payload = self.prefetches.handle(method, target, headers, body)
             self._send(conn, status, h, payload)
+            return
+        if headers.get("host") == "racer" and path == "/v1/capabilities":
+            if method != "GET":
+                self._error(conn, 405)
+            elif self.capabilities is None:
+                self._error(conn, 404)
+            else:
+                body = json.dumps(self.capabilities).encode()
+                self._send(
+                    conn,
+                    200,
+                    [("Content-Type", "application/json"), ("Content-Length", str(len(body))), ("Connection", "close")],
+                    body,
+                )
             return
         if headers.get("host") != "racer" or not target.startswith(wire.OBJECT_PREFIX):
             self._error(conn, 400)
