@@ -757,8 +757,15 @@ func (r *Reconciler) advanceReplace(ctx context.Context, op *v1alpha3.MachineOpe
 		return r.waitForRepaveBoot(ctx, machine, target, now)
 	}
 
-	if change, done := cloudInitReplaceStatus(op.Status.Conditions, target, machine.Spec.Netboot().TargetCloudInitTimeout(), now); done {
-		return change
+	timeout := machine.Spec.Netboot().TargetCloudInitTimeout()
+	handoff := pxeRebootHandoff(op.Status.Conditions, target)
+
+	if change, done := cloudInitReplaceStatus(op.Status.Conditions, target, timeout, now); done {
+		if change.target.Phase == v1alpha3.OperationPhaseFailed || !rebootHandoffExpired(handoff, timeout, now) {
+			return change
+		}
+
+		return failTarget(change.target, reasonTimedOut, fmt.Sprintf("cloud-init did not complete within %s", timeout), now)
 	}
 
 	nodeName := machine.NodeName()
@@ -766,6 +773,10 @@ func (r *Reconciler) advanceReplace(ctx context.Context, op *v1alpha3.MachineOpe
 	var node corev1.Node
 	if err := r.Get(ctx, client.ObjectKey{Name: nodeName}, &node); err != nil {
 		if apierrors.IsNotFound(err) {
+			if rebootHandoffExpired(handoff, timeout, now) {
+				return failTarget(target, reasonTimedOut, fmt.Sprintf("Node %s did not register within %s", nodeName, timeout), now)
+			}
+
 			target.Stage = v1alpha3.OperationStageWaitingNode
 			target.Message = fmt.Sprintf("waiting for Node %s to exist", nodeName)
 
@@ -1036,6 +1047,34 @@ func cloudInitReplaceStatus(conditions []metav1.Condition, target v1alpha3.Machi
 	target.Message = "waiting for first-boot cloud-init to complete"
 
 	return targetChange{target: target}, true
+}
+
+// pxeRebootHandoff returns when a PXE or HTTP HostReplace handed the host from
+// the installer to the installed system. The boot image write is the last
+// installer milestone, so its condition transition is the reboot handoff; the
+// firmware POST and cloud-init run after it. When that transition is missing,
+// the cloud-init transition is the next best bound, and the target start time
+// is the last resort, so a missing or synthetic condition cannot wait forever.
+func pxeRebootHandoff(conditions []metav1.Condition, target v1alpha3.MachineOperationTargetStatus) metav1.Time {
+	if cond := apimeta.FindStatusCondition(conditions, v1alpha3.MachineOperationConditionBootImageWritten); cond != nil && !cond.LastTransitionTime.IsZero() {
+		return cond.LastTransitionTime
+	}
+
+	if cond := apimeta.FindStatusCondition(conditions, v1alpha3.MachineOperationConditionCloudInitDone); cond != nil && !cond.LastTransitionTime.IsZero() {
+		return cond.LastTransitionTime
+	}
+
+	if target.StartedAt != nil {
+		return *target.StartedAt
+	}
+
+	return metav1.Time{}
+}
+
+// rebootHandoffExpired reports whether timeout has elapsed since handoff. An
+// unknown handoff time does not expire: there is nothing to measure from.
+func rebootHandoffExpired(handoff metav1.Time, timeout time.Duration, now metav1.Time) bool {
+	return !handoff.IsZero() && now.Sub(handoff.Time) >= timeout
 }
 
 func (r *Reconciler) applyTargetChanges(ctx context.Context, opName string, changes []targetChange, restoreHostReplaceTriggerConditions bool) error {
