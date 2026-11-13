@@ -31,9 +31,11 @@ func TestCompileFileRendersDriverTypesAndArtifacts(t *testing.T) {
 	require.NoError(t, os.Mkdir(filepath.Join(root, "scripts"), 0o755))
 
 	script := []byte("#!/usr/bin/env bash\nprintf 'ok\\n'\n")
+	config := []byte("{\"mode\":\"qualification\"}\n")
 	workflowScript := []byte("#!/usr/bin/env python3\nprint('ok')\n")
 
 	require.NoError(t, os.WriteFile(filepath.Join(root, "scripts", "check.sh"), script, 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "scripts", "config.json"), config, 0o600))
 	require.NoError(t, os.WriteFile(
 		filepath.Join(root, "scripts", "workflow.py"),
 		workflowScript,
@@ -56,13 +58,15 @@ spec:
   tests:
   - name: script-check
     displayName: Script check
-    artifact:
-      path: scripts/check.sh
+    artifacts:
+    - path: scripts/check.sh
+    - path: scripts/config.json
     driver:
       type: Script
       script:
         language: Shell
         runtime: base
+        artifact: check.sh
   - name: container-check
     displayName: Container check
     driver:
@@ -99,7 +103,10 @@ spec:
 
 	require.Equal(t, signalv1alpha1.TestDriverTypeScript, tests[0].Spec.Driver.Type)
 	require.Equal(t, testRuntimeA, tests[0].Spec.Driver.Script.RunnerImage)
+	require.Equal(t, "check.sh", tests[0].Spec.Driver.Script.Artifact)
 	require.Equal(t, string(script), tests[0].Spec.Artifacts[0].Content)
+	require.Equal(t, string(config), tests[0].Spec.Artifacts[1].Content)
+
 	sum := sha256.Sum256(script)
 	require.Equal(t, "sha256:"+hex.EncodeToString(sum[:]), tests[0].Spec.Artifacts[0].Digest)
 	require.Equal(t, "qualification", tests[0].Annotations["signal.unbounded-cloud.io/source-plan"])
@@ -244,6 +251,137 @@ spec:
 	)
 }
 
+func TestCompileFileWithBindingsAndInputsOverridesStageParameters(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	require.NoError(t, os.WriteFile(
+		filepath.Join(root, "check.sh"),
+		[]byte("#!/usr/bin/env bash\nprintf 'ok\\n'\n"),
+		0o600,
+	))
+
+	plan := fmt.Sprintf(`apiVersion: signal.unbounded-cloud.io/v1alpha1
+kind: CertificationPlan
+metadata:
+  name: qualification
+spec:
+  owner: qualification-team
+  version: source-123
+  runtimes:
+    base: %s
+  tests:
+  - name: script-check
+    displayName: Script check
+    parameters:
+    - name: environmentJson
+      displayName: Execution environment
+      type: String
+      required: true
+    artifact:
+      path: check.sh
+    driver:
+      type: Script
+      script:
+        language: Shell
+        runtime: base
+  suite:
+    name: qualification
+    phases:
+    - name: validation
+      role: Validation
+      stages:
+      - name: check
+        test: script-check
+        parameters:
+        - name: environmentJson
+          value:
+            type: String
+            stringValue: '{"duration":"short"}'
+        schedule:
+          mode: RunOnce
+          invocationTimeout: 5m
+`, testRuntimeA)
+	planPath := filepath.Join(root, "certification-plan.yaml")
+	require.NoError(t, os.WriteFile(planPath, []byte(plan), 0o600))
+
+	bindingsPath := filepath.Join(root, "certification-bindings.yaml")
+	require.NoError(t, os.WriteFile(bindingsPath, []byte(fmt.Sprintf(`apiVersion: signal.unbounded-cloud.io/v1alpha1
+kind: CertificationPlanBindings
+metadata:
+  name: qualification
+spec:
+  tests:
+    script-check:
+      name: script-check
+      uid: 11111111-1111-1111-1111-111111111111
+      generation: 1
+      contentDigest: %s
+`, testDigest)), 0o600))
+
+	inputsPath := filepath.Join(root, "certification-inputs.yaml")
+	require.NoError(t, os.WriteFile(inputsPath, []byte(`apiVersion: signal.unbounded-cloud.io/v1alpha1
+kind: CertificationPlanInputs
+metadata:
+  name: qualification
+spec:
+  stages:
+    check:
+      parameters:
+      - name: environmentJson
+        value:
+          type: String
+          stringValue: '{"duration":"long"}'
+`), 0o600))
+
+	rendered, err := CompileFileWithBindingsAndInputs(planPath, bindingsPath, inputsPath)
+	require.NoError(t, err)
+
+	documents := strings.Split(strings.TrimSpace(string(rendered)), "---\n")
+	require.Len(t, documents, 2)
+
+	var suite signalv1alpha1.CertificationSuite
+	require.NoError(t, yaml.Unmarshal([]byte(documents[1]), &suite))
+	require.Len(t, suite.Spec.Phases[0].Stages[0].Parameters, 1)
+	require.Equal(
+		t,
+		`{"duration":"long"}`,
+		*suite.Spec.Phases[0].Stages[0].Parameters[0].Value.StringValue,
+	)
+
+	require.NoError(t, os.WriteFile(inputsPath, []byte(`apiVersion: signal.unbounded-cloud.io/v1alpha1
+kind: CertificationPlanInputs
+metadata:
+  name: qualification
+spec:
+  stages:
+    unknown:
+      parameters: []
+`), 0o600))
+	_, err = CompileFileWithBindingsAndInputs(planPath, bindingsPath, inputsPath)
+	require.ErrorContains(t, err, `inputs spec.stages contains undefined stage "unknown"`)
+
+	require.NoError(t, os.WriteFile(inputsPath, []byte(`apiVersion: signal.unbounded-cloud.io/v1alpha1
+kind: CertificationPlanInputs
+metadata:
+  name: qualification
+spec:
+  stages:
+    check:
+      parameters:
+      - name: environmentJson
+        value:
+          type: String
+          stringValue: first
+      - name: environmentJson
+        value:
+          type: String
+          stringValue: second
+`), 0o600))
+	_, err = CompileFileWithBindingsAndInputs(planPath, bindingsPath, inputsPath)
+	require.ErrorContains(t, err, `input parameter "environmentJson" is duplicated`)
+}
+
 func TestCompileFileWithBindingsRejectsMissingIdentityAndDependencyCycle(t *testing.T) {
 	t.Parallel()
 
@@ -362,7 +500,7 @@ func TestCompileFileRejectsUnsafeOrInvalidInputs(t *testing.T) {
 			sourceRoot:  ".",
 			artifact:    "scripts/missing.sh",
 			runtime:     testRuntimeA,
-			wantError:   "resolve artifact.path",
+			wantError:   "resolve path",
 			writeSource: false,
 		},
 	}
@@ -408,6 +546,104 @@ spec:
         language: Shell
         runtime: base
 `, tt.sourceRoot, tt.runtime, tt.extra, tt.artifact)
+			planPath := filepath.Join(root, "certification-plan.yaml")
+			require.NoError(t, os.WriteFile(planPath, []byte(plan), 0o600))
+
+			_, err := CompileFile(planPath)
+			require.ErrorContains(t, err, tt.wantError)
+		})
+	}
+}
+
+func TestCompileFileRejectsInvalidArtifactSelection(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		artifacts string
+		driver    string
+		wantError string
+	}{
+		{
+			name: "singular and plural",
+			artifacts: `    artifact:
+      path: first.sh
+    artifacts:
+    - path: second.sh
+`,
+			driver: `      script:
+        language: Shell
+        runtime: base
+`,
+			wantError: "artifact and artifacts are mutually exclusive",
+		},
+		{
+			name: "multiple without selection",
+			artifacts: `    artifacts:
+    - path: first.sh
+    - path: second.sh
+`,
+			driver: `      script:
+        language: Shell
+        runtime: base
+`,
+			wantError: "artifact must be selected when multiple artifacts are declared",
+		},
+		{
+			name: "selection is not declared",
+			artifacts: `    artifact:
+      path: first.sh
+`,
+			driver: `      script:
+        language: Shell
+        runtime: base
+        artifact: missing.sh
+`,
+			wantError: `artifact "missing.sh" is not declared`,
+		},
+		{
+			name: "container rejects artifacts",
+			artifacts: `    artifact:
+      path: first.sh
+`,
+			driver: `      container:
+        runtime: base
+`,
+			wantError: "container driver must not declare artifacts",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			root := t.TempDir()
+			for _, name := range []string{"first.sh", "second.sh"} {
+				require.NoError(t, os.WriteFile(
+					filepath.Join(root, name),
+					[]byte("#!/usr/bin/env bash\n"),
+					0o600,
+				))
+			}
+
+			plan := fmt.Sprintf(`apiVersion: signal.unbounded-cloud.io/v1alpha1
+kind: CertificationPlan
+metadata:
+  name: qualification
+spec:
+  owner: qualification-team
+  version: source-123
+  runtimes:
+    base: %s
+  tests:
+  - name: script-check
+    displayName: Script check
+%s    driver:
+      type: %s
+%s`, testRuntimeA, tt.artifacts, map[bool]string{
+				true:  "Container",
+				false: "Script",
+			}[strings.Contains(tt.driver, "container:")], tt.driver)
 			planPath := filepath.Join(root, "certification-plan.yaml")
 			require.NoError(t, os.WriteFile(planPath, []byte(plan), 0o600))
 

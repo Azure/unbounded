@@ -585,15 +585,15 @@ func (e *KubernetesStageExecutor) stagePod(
 	}
 
 	if driver.Type == signalv1.TestDriverTypeScript {
-		artifact, err := invocationArtifact(invocation, driver.Script.Artifact)
-		if err != nil {
-			return nil, err
+		pod.Spec.InitContainers = make([]corev1.Container, len(invocation.Artifacts))
+		for index := range invocation.Artifacts {
+			pod.Spec.InitContainers[index] = artifactMaterializer(
+				driver.Script.RunnerImage,
+				invocation.Artifacts[index],
+				index,
+			)
 		}
 
-		pod.Spec.InitContainers = []corev1.Container{artifactMaterializer(
-			driver.Script.RunnerImage,
-			artifact,
-		)}
 		pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
 			Name: "script",
 			VolumeSource: corev1.VolumeSource{
@@ -691,9 +691,13 @@ func invocationArtifact(
 	return signalv1.TestArtifact{}, fmt.Errorf("test artifact %q is unavailable", name)
 }
 
-func artifactMaterializer(image string, artifact signalv1.TestArtifact) corev1.Container {
+func artifactMaterializer(
+	image string,
+	artifact signalv1.TestArtifact,
+	index int,
+) corev1.Container {
 	container := corev1.Container{
-		Name:    "materialize-script",
+		Name:    fmt.Sprintf("materialize-artifact-%d", index),
 		Image:   image,
 		Command: []string{"/bin/sh", "-ceu"},
 		Args: []string{`printf '%s' "$PROJECT_SIGNAL_ARTIFACT_B64" | base64 -d > "/scripts/$PROJECT_SIGNAL_ARTIFACT_NAME"

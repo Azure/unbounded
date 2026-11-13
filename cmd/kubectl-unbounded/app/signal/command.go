@@ -15,6 +15,7 @@ import (
 type renderOptions struct {
 	filename  string
 	bindings  string
+	inputs    string
 	testsOnly bool
 }
 
@@ -41,6 +42,10 @@ func newRenderCommand() *cobra.Command {
 			"Plans with a Suite use --tests-only for bootstrap and --bindings after Test approval.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if options.inputs != "" && options.bindings == "" {
+				return fmt.Errorf("--inputs requires --bindings")
+			}
+
 			var (
 				rendered []byte
 				err      error
@@ -50,10 +55,18 @@ func newRenderCommand() *cobra.Command {
 			case options.testsOnly:
 				rendered, err = signalplan.CompileTestsFile(options.filename)
 			case options.bindings != "":
-				rendered, err = signalplan.CompileFileWithBindings(
-					options.filename,
-					options.bindings,
-				)
+				if options.inputs != "" {
+					rendered, err = signalplan.CompileFileWithBindingsAndInputs(
+						options.filename,
+						options.bindings,
+						options.inputs,
+					)
+				} else {
+					rendered, err = signalplan.CompileFileWithBindings(
+						options.filename,
+						options.bindings,
+					)
+				}
 			default:
 				rendered, err = signalplan.CompileFile(options.filename)
 			}
@@ -76,6 +89,12 @@ func newRenderCommand() *cobra.Command {
 		"",
 		"CertificationPlanBindings YAML containing approved Test identities",
 	)
+	cmd.Flags().StringVar(
+		&options.inputs,
+		"inputs",
+		"",
+		"CertificationPlanInputs YAML containing environment-specific stage parameters",
+	)
 	cmd.Flags().BoolVar(
 		&options.testsOnly,
 		"tests-only",
@@ -83,6 +102,7 @@ func newRenderCommand() *cobra.Command {
 		"render only CertificationTests while bootstrapping a plan that defines a Suite",
 	)
 	cmd.MarkFlagsMutuallyExclusive("bindings", "tests-only")
+	cmd.MarkFlagsMutuallyExclusive("inputs", "tests-only")
 
 	if err := cmd.MarkFlagRequired("filename"); err != nil {
 		panic(err)

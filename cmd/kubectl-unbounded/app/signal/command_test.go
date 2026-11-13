@@ -36,6 +36,11 @@ spec:
   tests:
   - name: script-check
     displayName: Script check
+    parameters:
+    - name: environmentJson
+      displayName: Environment
+      type: String
+      required: true
     artifact:
       path: scripts/check.sh
     driver:
@@ -95,6 +100,11 @@ spec:
       stages:
       - name: script-check
         test: script-check
+        parameters:
+        - name: environmentJson
+          value:
+            type: String
+            stringValue: '{"EXPECTED":"base"}'
         schedule:
           mode: RunOnce
           invocationTimeout: 5m
@@ -116,6 +126,21 @@ spec:
       contentDigest: sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
 `), 0o600))
 
+	inputsPath := filepath.Join(root, "certification-inputs.yaml")
+	require.NoError(t, os.WriteFile(inputsPath, []byte(`apiVersion: signal.unbounded-cloud.io/v1alpha1
+kind: CertificationPlanInputs
+metadata:
+  name: qualification
+spec:
+  stages:
+    script-check:
+      parameters:
+      - name: environmentJson
+        value:
+          type: String
+          stringValue: '{"EXPECTED":"override"}'
+`), 0o600))
+
 	testsOutput := &bytes.Buffer{}
 	testsCommand := newRenderCommand()
 	testsCommand.SetOut(testsOutput)
@@ -127,8 +152,17 @@ spec:
 	packageOutput := &bytes.Buffer{}
 	packageCommand := newRenderCommand()
 	packageCommand.SetOut(packageOutput)
-	packageCommand.SetArgs([]string{"--filename", planPath, "--bindings", bindingsPath})
+	packageCommand.SetArgs([]string{
+		"--filename", planPath,
+		"--bindings", bindingsPath,
+		"--inputs", inputsPath,
+	})
 	require.NoError(t, packageCommand.Execute())
 	require.Contains(t, packageOutput.String(), "kind: CertificationTest")
 	require.Contains(t, packageOutput.String(), "kind: CertificationSuite")
+	require.Contains(t, packageOutput.String(), `stringValue: '{"EXPECTED":"override"}'`)
+
+	inputsOnlyCommand := newRenderCommand()
+	inputsOnlyCommand.SetArgs([]string{"--filename", planPath, "--inputs", inputsPath})
+	require.EqualError(t, inputsOnlyCommand.Execute(), "--inputs requires --bindings")
 }

@@ -38,13 +38,17 @@ spec:
   tests:
   - name: gpu-identity
     displayName: GPU identity
-    artifact:
+    artifacts:
+    - name: runner.py
+      path: scripts/runner.py
+    - name: gpu-identity.sh
       path: scripts/gpu-identity.sh
     driver:
       type: Script
       script:
         language: Shell
         runtime: base
+        artifact: gpu-identity.sh
         resources:
           requests:
             nvidia.com/gpu: "8"
@@ -79,9 +83,17 @@ spec:
         - stage: gpu-identity
 ```
 
+Use singular `artifact` for a one-file Test. Use `artifacts` when the selected
+entrypoint needs supporting files. Every file is embedded with its own digest,
+and a multi-artifact Script or WorkflowTemplate driver must select its
+entrypoint by artifact name. Script Pods materialize every approved artifact,
+but execute only the selected entrypoint. Container drivers do not accept
+artifacts.
+
 Supported drivers are:
 
-- `Script`, with an artifact, `Shell` or `Python` language, and named runtime.
+- `Script`, with one selected artifact, `Shell` or `Python` language, and a
+  named runtime.
 - `Container`, with a named runtime plus optional command and arguments.
 - `WorkflowTemplate`, with a template name, canonical SHA-256 digest, and an
   optional artifact passed through the standard script parameters.
@@ -150,6 +162,35 @@ kubectl unbounded signal render \
   > certification-package.yaml
 
 kubectl apply -f certification-package.yaml
+```
+
+Environment-specific values can remain outside the readable plan in a
+`CertificationPlanInputs` file. Inputs override same-named stage parameters
+and fail closed if they name a stage that is not in the plan:
+
+```yaml
+apiVersion: signal.unbounded-cloud.io/v1alpha1
+kind: CertificationPlanInputs
+metadata:
+  name: node-qualification
+spec:
+  stages:
+    gpu-identity:
+      parameters:
+      - name: environmentJson
+        value:
+          type: String
+          stringValue: '{"EXPECTED_GPU_COUNT":"8"}'
+```
+
+Pass the overlay only with approved bindings:
+
+```bash
+kubectl unbounded signal render \
+  --filename certification-plan.yaml \
+  --bindings certification-bindings.yaml \
+  --inputs certification-inputs.yaml \
+  > certification-package.yaml
 ```
 
 The complete package contains the deterministic `CertificationTest` objects

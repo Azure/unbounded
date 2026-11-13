@@ -1717,11 +1717,18 @@ func TestStagePodCarriesScriptResourcesAndImmutableIdentity(t *testing.T) {
 				InvocationTimeout: metav1.Duration{Duration: 2},
 			},
 		},
-		Artifacts: []signalv1.TestArtifact{{
-			Name:    "gpu-inventory.sh",
-			Content: scriptContent,
-			Digest:  scriptDigest,
-		}},
+		Artifacts: []signalv1.TestArtifact{
+			{
+				Name:    "gpu-inventory.sh",
+				Content: scriptContent,
+				Digest:  scriptDigest,
+			},
+			{
+				Name:    "gpu-inventory.json",
+				Content: `{"expectedGpuCount":8}`,
+				Digest:  testStageDigest(`{"expectedGpuCount":8}`),
+			},
+		},
 		Participants: []signalv1.Participant{{
 			NodeName: "participant",
 			NodeUID:  types.UID("participant-uid"),
@@ -1768,11 +1775,12 @@ func TestStagePodCarriesScriptResourcesAndImmutableIdentity(t *testing.T) {
 		t.Fatalf("script result volume is not mounted: pod = %#v", pod.Spec)
 	}
 
-	if len(pod.Spec.InitContainers) != 1 ||
-		pod.Spec.InitContainers[0].Name != "materialize-script" ||
+	if len(pod.Spec.InitContainers) != 2 ||
+		pod.Spec.InitContainers[0].Name != "materialize-artifact-0" ||
+		pod.Spec.InitContainers[1].Name != "materialize-artifact-1" ||
 		pod.Spec.Volumes[0].Name != "script" ||
 		pod.Spec.Volumes[0].EmptyDir == nil {
-		t.Fatalf("inline script materializer is absent: pod = %#v", pod.Spec)
+		t.Fatalf("inline artifact materializers are absent: pod = %#v", pod.Spec)
 	}
 
 	initEnv := make(map[string]string)
@@ -1790,6 +1798,21 @@ func TestStagePodCarriesScriptResourcesAndImmutableIdentity(t *testing.T) {
 		initEnv["PROJECT_SIGNAL_ARTIFACT_DIGEST"] != scriptDigest ||
 		!strings.Contains(pod.Spec.InitContainers[0].Args[0], "sha256sum -c -") {
 		t.Fatalf("inline script materializer does not preserve artifact identity: %#v", pod.Spec.InitContainers[0])
+	}
+
+	configEnv := make(map[string]string)
+	for _, variable := range pod.Spec.InitContainers[1].Env {
+		configEnv[variable.Name] = variable.Value
+	}
+
+	config, err := base64.StdEncoding.DecodeString(configEnv["PROJECT_SIGNAL_ARTIFACT_B64"])
+	if err != nil {
+		t.Fatalf("decode materialized config artifact: %v", err)
+	}
+
+	if string(config) != `{"expectedGpuCount":8}` ||
+		configEnv["PROJECT_SIGNAL_ARTIFACT_NAME"] != "gpu-inventory.json" {
+		t.Fatalf("supporting artifact was not materialized: %#v", pod.Spec.InitContainers[1])
 	}
 }
 
