@@ -187,19 +187,9 @@ from its own origin). See
 Racer splits every object into **16 MiB pages**. A page is the unit for caching,
 transfer between nodes, placement, and origin reads.
 
-By default every page is **sealed**: encrypted and authenticated with AES-GCM
-under a per-cache key, in memory, on disk, and between nodes. A cache can
-instead be created as **plaintext** (`spec.encryption.mode: Plaintext`). Its
-pages are stored and sent as they are, with a CRC32C per page that is checked
-on read. The mode is fixed when the cache is created.
-
-Plaintext suits public model weights. Anyone can download them anyway, so
-encryption protects nothing, and skipping it removes the decrypt step from
-every GPU load: pages go straight from disk or the network to the GPU. What it
-gives up: a CRC32C detects corruption, not tampering, so someone who can write
-to a node's cache disk or alter traffic between nodes can change the bytes a
-reader gets without detection, and the data on disk is readable by anyone with
-access to the device. Keep private or licensed data in sealed caches.
+Every page is **sealed**: encrypted and authenticated with AES-GCM under a
+per-cache key, in memory, on disk, and between nodes. There is no unsealed
+mode.
 
 ### Origins
 
@@ -289,8 +279,7 @@ protections:
   belongs to the Racer DaemonSet, then issues a short-lived certificate
   (24 hours by default).
 - **Encryption** -- Pages are encrypted and authenticated (XAES-256-GCM) with
-  a per-cache key, both between nodes and on disk. Plaintext caches opt out of this
-  and keep only a per-page CRC32C. The elected control plane
+  a per-cache key, both between nodes and on disk. The elected control plane
   creates and rotates these keys.
 - **Signed requests** -- Every node signs each request it sends or forwards to
   another node.

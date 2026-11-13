@@ -15,9 +15,9 @@ pub(crate) const CAPABILITIES_PATH: &str = "/v1/capabilities";
 /// The response schema version.
 const SCHEMA: u32 = 1;
 
-/// Page cipher names this build decodes: sealed pages use `xaes256gcm`,
-/// plaintext pages `none`.
-const PAGE_CIPHERS: [&str; 2] = ["xaes256gcm", "none"];
+/// Page cipher names this build decodes. Every page is sealed, so
+/// `xaes256gcm` is the only one.
+const PAGE_CIPHERS: [&'static str; 1] = ["xaes256gcm"];
 
 /// The capabilities response body.
 #[derive(serde::Serialize)]
@@ -27,7 +27,7 @@ struct Capabilities {
     gpu_uuids: Vec<String>,
     page_bytes: u64,
     retain_local: bool,
-    page_ciphers: [&'static str; 2],
+    page_ciphers: [&'static str; 1],
 }
 
 /// Whether a request head selects the capabilities route.
@@ -128,7 +128,7 @@ mod tests {
         assert_eq!(
             text,
             format!(
-                r#"{{"schema":1,"delivery":["host","stream"],"gpu_uuids":[],"page_bytes":{},"retain_local":true,"page_ciphers":["xaes256gcm","none"]}}"#,
+                r#"{{"schema":1,"delivery":["host","stream"],"gpu_uuids":[],"page_bytes":{},"retain_local":true,"page_ciphers":["xaes256gcm"]}}"#,
                 crate::model::PAGE_BYTES
             )
         );
