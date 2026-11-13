@@ -463,8 +463,7 @@ copies and bytes, peer copy failures, and host bounces.
   to each GPU separately. Uploading it once and fanning out to other GPUs is
   future work.
 - Each GPU runs at most four pages at once (one per stream). Whether more
-  streams, or more than one page per request in flight, pay off needs
-  measurement on hardware.
+  streams pay off needs measurement on hardware.
 
 ### Executor model
 
@@ -476,8 +475,9 @@ copies and bytes, peer copy failures, and host bounces.
   tests run them all on the simulated backend.
 - **Streams in flight.** An executor keeps up to four pages in flight
   (`STREAMS` in `src/gpu.rs`), each on its own stream. A stream has at most
-  one decrypt outstanding, as the shim requires. A request has at most one
-  page running, so its pages land in order.
+  one decrypt outstanding, as the shim requires. A request may have up to
+  four pages running, one per stream, and the client still sends its page
+  frames in order.
 - **Events and fences.** `Stream::fence_in` records an event from the GPU's
   `EventPool` (no `cuEventCreate` per fence) and moves the stream's holds
   (buffers, host sources) into a `Fence`, which releases them when
