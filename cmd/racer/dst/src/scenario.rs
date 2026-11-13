@@ -89,8 +89,14 @@ pub struct Scenario {
     pub invariants: Vec<Invariant>,
     /// Cost table.
     pub costs: Costs,
-    /// Virtual end time.
+    /// Virtual end time and fault horizon: drawn faults are scheduled before
+    /// it.
     pub end: Nanos,
+    /// Extra virtual time after `end` in which a full-fidelity run that
+    /// requires quiescence may finish work already in flight (for example a
+    /// node restarted shortly before `end`). Liveness checks run at the end
+    /// of this window, not at `end`.
+    pub settle: Nanos,
     /// Step budget (`DST_STEPS` overrides it in the runner).
     pub max_steps: u64,
     /// Steps allowed without virtual time advancing (busy-loop detector).
@@ -150,6 +156,7 @@ impl Scenario {
             invariants: Vec::new(),
             costs: Costs::checked_in(),
             end: 10 * SECONDS,
+            settle: 0,
             max_steps: 1_000_000,
             busy_limit: 100_000,
             step_budget_fails: true,
@@ -237,6 +244,13 @@ impl Scenario {
     /// Virtual end time.
     pub fn end(mut self, end: Nanos) -> Self {
         self.end = end;
+        self
+    }
+
+    /// Extra virtual time after [`Scenario::end`] in which a run that must be
+    /// quiescent may finish work already in flight.
+    pub fn settle(mut self, settle: Nanos) -> Self {
+        self.settle = settle;
         self
     }
 

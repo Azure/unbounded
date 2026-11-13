@@ -150,14 +150,9 @@ func (d *downloadKubeBinaries) downloadCrictlBinary(ctx context.Context, downloa
 		start := time.Now()
 		found := false
 
-		for tarFile, err := range downloadURL.DecompressTarGz(ctx) {
-			if err != nil {
-				logger.Error("download failed", "error", err)
-				return fmt.Errorf("download crictl archive: %w", err)
-			}
-
+		err := downloadURL.ForEachTarGzFile(ctx, func(tarFile *utilio.TarFile) error {
 			if tarFile.Name != "crictl" {
-				continue
+				return nil
 			}
 
 			found = true
@@ -167,7 +162,11 @@ func (d *downloadKubeBinaries) downloadCrictlBinary(ctx context.Context, downloa
 				return fmt.Errorf("install crictl binary %q: %w", targetFilePath, err)
 			}
 
-			break
+			return nil
+		})
+		if err != nil {
+			logger.Error("download failed", "error", err)
+			return fmt.Errorf("download crictl archive: %w", err)
 		}
 
 		if !found {

@@ -92,13 +92,9 @@ func runcDownloadURL(override *goalstates.DownloadSource, version, arch string) 
 
 // downloadContainerd downloads and extracts containerd binaries from a tar.gz archive.
 func downloadContainerd(ctx context.Context, downloadURL artifactsource.Source, destDir string) error {
-	for tarFile, err := range downloadURL.DecompressTarGz(ctx) {
-		if err != nil {
-			return fmt.Errorf("decompress containerd tar: %w", err)
-		}
-
+	err := downloadURL.ForEachTarGzFile(ctx, func(tarFile *utilio.TarFile) error {
 		if !strings.HasPrefix(tarFile.Name, containerdTarPrefix) {
-			continue
+			return nil
 		}
 
 		binaryName := strings.TrimPrefix(tarFile.Name, containerdTarPrefix)
@@ -107,6 +103,11 @@ func downloadContainerd(ctx context.Context, downloadURL artifactsource.Source, 
 		if err := utilio.InstallFile(targetFilePath, tarFile.Body, 0o755); err != nil {
 			return fmt.Errorf("install containerd binary %q: %w", targetFilePath, err)
 		}
+
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("download containerd: %w", err)
 	}
 
 	return nil

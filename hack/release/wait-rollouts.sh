@@ -32,7 +32,12 @@
 #
 # Optional overrides:
 #   NAMESPACE                    Namespace to watch (default unbounded-system).
-#   ROLLOUT_TIMEOUT              Per-workload rollout timeout (default 5m).
+#   ROLLOUT_TIMEOUT              Per-Deployment rollout timeout (default 5m).
+#   DAEMONSET_ROLLOUT_TIMEOUT    Per-DaemonSet rollout timeout (default 15m).
+#                                A DaemonSet replaces pods node by node and
+#                                each node may pull the image first, so a
+#                                safe rollout of a CNI agent takes longer than
+#                                a Deployment that only gates its few replicas.
 #   CREATE_TIMEOUT_SECONDS       How long to wait for a workload to be created
 #                                by the operator before giving up (default 300).
 #   POLL_INTERVAL_SECONDS        Cadence of both polls, image and node
@@ -125,6 +130,7 @@ fi
 
 NS="${NAMESPACE:-unbounded-system}"
 ROLLOUT_TIMEOUT="${ROLLOUT_TIMEOUT:-5m}"
+DAEMONSET_ROLLOUT_TIMEOUT="${DAEMONSET_ROLLOUT_TIMEOUT:-15m}"
 CREATE_TIMEOUT_SECONDS="${CREATE_TIMEOUT_SECONDS:-300}"
 POLL_INTERVAL_SECONDS="${POLL_INTERVAL_SECONDS:-5}"
 IMAGE_FAILURE_GRACE_SECONDS="${IMAGE_FAILURE_GRACE_SECONDS:-90}"
@@ -1093,10 +1099,17 @@ wait_for_release() {
 # them; the polls only add early exits, one in each direction.
 wait_rollout() {
   local target="$1" kind="$2" selector="$3" desired="$4" rc=0
+  local timeout="$ROLLOUT_TIMEOUT"
+
+  # kind is empty when the spec could not be read or the image guard is off.
+  # The argument prefix still says what the target is.
+  case "${kind:-$target}" in
+    DaemonSet|ds/*) timeout="$DAEMONSET_ROLLOUT_TIMEOUT" ;;
+  esac
 
   IMAGE_FIRST_SEEN=()
 
-  "${KUBECTL[@]}" rollout status "$target" --timeout="$ROLLOUT_TIMEOUT" &
+  "${KUBECTL[@]}" rollout status "$target" --timeout="$timeout" &
   ROLLOUT_PID=$!
 
   while kill -0 "$ROLLOUT_PID" 2>/dev/null; do

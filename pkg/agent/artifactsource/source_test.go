@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -24,6 +25,8 @@ import (
 
 	"github.com/stretchr/testify/require"
 	"oras.land/oras-go/v2/registry/remote/retry"
+
+	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 )
 
 func TestParseRedactsInvalidURL(t *testing.T) {
@@ -48,6 +51,132 @@ func TestSourceOpenHTTPSURL(t *testing.T) {
 	got, err := io.ReadAll(body)
 	require.NoError(t, err)
 	require.Equal(t, "artifact-data", string(got))
+}
+
+func TestForEachTarGzFileRetriesTruncatedResponse(t *testing.T) {
+	t.Parallel()
+
+	content := strings.Repeat("binary-content", 512)
+	archive := tarGzArchive(t, map[string]string{"vlan": content})
+
+	var attempts atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprint(len(archive)))
+
+		if attempts.Add(1) == 1 {
+			_, _ = w.Write(archive[:len(archive)/2])
+
+			return
+		}
+
+		_, _ = w.Write(archive)
+	}))
+	defer server.Close()
+
+	source, err := Parse(server.URL + "/cni.tgz")
+	require.NoError(t, err)
+
+	destDir := t.TempDir()
+	target := filepath.Join(destDir, "vlan")
+
+	var delays []time.Duration
+
+	wait := func(_ context.Context, delay time.Duration) error {
+		delays = append(delays, delay)
+		// The interrupted attempt installed the file atomically, so nothing
+		// is left behind for a later version check to trust.
+		require.NoFileExists(t, target)
+
+		return nil
+	}
+
+	install := func(tarFile *utilio.TarFile) error {
+		return utilio.InstallFile(filepath.Join(destDir, tarFile.Name), tarFile.Body, 0o755)
+	}
+
+	require.NoError(t, source.forEachTarGzFile(t.Context(), install, wait))
+	require.EqualValues(t, 2, attempts.Load())
+	require.Equal(t, []time.Duration{httpDownloadRetryDelay}, delays)
+
+	got, err := os.ReadFile(target)
+	require.NoError(t, err)
+	require.Equal(t, content, string(got))
+}
+
+func TestForEachTarGzFileDoesNotRetryPermanentHTTPError(t *testing.T) {
+	t.Parallel()
+
+	var attempts atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		attempts.Add(1)
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	source, err := Parse(server.URL + "/cni.tgz")
+	require.NoError(t, err)
+
+	installed := false
+	install := func(*utilio.TarFile) error {
+		installed = true
+
+		return nil
+	}
+
+	wait := func(context.Context, time.Duration) error {
+		t.Fatal("permanent HTTP failures must not be retried")
+
+		return nil
+	}
+
+	err = source.forEachTarGzFile(t.Context(), install, wait)
+	require.ErrorContains(t, err, "status code 404")
+	require.False(t, installed)
+	require.EqualValues(t, 1, attempts.Load())
+}
+
+func TestForEachTarGzFileStopsOnCancellation(t *testing.T) {
+	t.Parallel()
+
+	content := strings.Repeat("binary-content", 512)
+	archive := tarGzArchive(t, map[string]string{"vlan": content})
+
+	var attempts atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprint(len(archive)))
+
+		if attempts.Add(1) == 1 {
+			_, _ = w.Write(archive[:len(archive)/2])
+
+			return
+		}
+
+		_, _ = w.Write(archive)
+	}))
+	defer server.Close()
+
+	source, err := Parse(server.URL + "/cni.tgz")
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(t.Context())
+
+	wait := func(ctx context.Context, _ time.Duration) error {
+		cancel()
+
+		return context.Cause(ctx)
+	}
+
+	destDir := t.TempDir()
+	install := func(tarFile *utilio.TarFile) error {
+		return utilio.InstallFile(filepath.Join(destDir, tarFile.Name), tarFile.Body, 0o755)
+	}
+
+	err = source.forEachTarGzFile(ctx, install, wait)
+	require.ErrorIs(t, err, context.Canceled)
+	require.EqualValues(t, 1, attempts.Load())
 }
 
 func TestDownloadToLocalFileRetriesInterruptedHTTPBody(t *testing.T) {

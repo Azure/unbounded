@@ -5,13 +5,61 @@ package rootfs
 
 import (
 	"bytes"
+	"fmt"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
 
+	"github.com/stretchr/testify/require"
+
+	"github.com/Azure/unbounded/pkg/agent/artifactsource"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
+
+func TestDownloadCNIPluginsRetriesTruncatedArchive(t *testing.T) {
+	t.Parallel()
+
+	content := strings.Repeat("cni-plugin-", 512)
+	archive := tarGzArchive(t, map[string]string{
+		"vlan":       content,
+		"bridge":     content,
+		"host-local": content,
+		"loopback":   content,
+	})
+
+	var attempts atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprint(len(archive)))
+
+		if attempts.Add(1) == 1 {
+			_, _ = w.Write(archive[:len(archive)/2])
+
+			return
+		}
+
+		_, _ = w.Write(archive)
+	}))
+	defer server.Close()
+
+	source, err := artifactsource.Parse(server.URL + "/cni-plugins.tgz")
+	require.NoError(t, err)
+
+	destDir := t.TempDir()
+	require.NoError(t, downloadCNIPlugins(t.Context(), source, destDir))
+	require.EqualValues(t, 2, attempts.Load())
+
+	for _, name := range []string{"vlan", "bridge", "host-local", "loopback"} {
+		got, err := os.ReadFile(filepath.Join(destDir, name))
+		require.NoError(t, err)
+		require.Equal(t, content, string(got))
+	}
+}
 
 func TestCNIDownloadURL(t *testing.T) {
 	t.Parallel()

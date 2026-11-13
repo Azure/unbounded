@@ -817,6 +817,53 @@ func TestSucceedsWhenEveryWorkloadRollsOut(t *testing.T) {
 	requireGroupsBalanced(t, output)
 }
 
+// TestDaemonSetGetsItsOwnRolloutTimeout is the regression guard for the
+// v0.25.0 release deploy. A DaemonSet replaces pods node by node and each node
+// may have to pull the image first, so a CNI agent's safe rollout cannot share
+// the Deployment window. The gate timed out at 5m with 16 of 20 net-node pods
+// available while four nodes were still pulling.
+func TestDaemonSetGetsItsOwnRolloutTimeout(t *testing.T) {
+	requireBash(t)
+	t.Parallel()
+
+	f := newFake(t)
+	f.set("getjson-ds_gantry", reply{stdout: daemonSet(selectorLabel, dsStatus{desired: 1, ready: 1}, gantryImage)})
+	f.set("getjson-deploy_machina-controller", reply{stdout: deployment("app=machina", dsStatus{desired: 1, ready: 1}, "ghcr.io/azure/machina:"+releaseTag)})
+	f.set("pods", reply{stdout: podList(pod{name: "gantry-a", containers: []container{{name: "c0", image: gantryImage}}})})
+
+	output, code := f.run(map[string]string{
+		"ROLLOUT_TIMEOUT":           "7s",
+		"DAEMONSET_ROLLOUT_TIMEOUT": "3m",
+	}, target, "deploy/machina-controller")
+
+	requireCode(t, code, 0, output)
+	requireContains(t, f.calls(), "rollout status ds/gantry --timeout=3m")
+	requireContains(t, f.calls(), "rollout status deploy/machina-controller --timeout=7s")
+	requireGroupsBalanced(t, output)
+}
+
+// TestDaemonSetTimeoutUsesTheArgumentPrefix covers the fallback used when the
+// workload spec could not be read: the kind is then empty, and the ds/ prefix
+// still says the target is a DaemonSet.
+func TestDaemonSetTimeoutUsesTheArgumentPrefix(t *testing.T) {
+	requireBash(t)
+	t.Parallel()
+
+	f := newFake(t)
+	// workload() omits the kind, which is what an unreadable spec leaves behind.
+	f.set("getjson-ds_gantry", reply{stdout: workload(selectorLabel, gantryImage)})
+	f.set("pods", reply{stdout: podList(pod{name: "gantry-a", containers: []container{{name: "c0", image: gantryImage}}})})
+
+	output, code := f.run(map[string]string{
+		"ROLLOUT_TIMEOUT":           "7s",
+		"DAEMONSET_ROLLOUT_TIMEOUT": "3m",
+	}, target)
+
+	requireCode(t, code, 0, output)
+	requireContains(t, f.calls(), "rollout status ds/gantry --timeout=3m")
+	requireGroupsBalanced(t, output)
+}
+
 func TestFailsAndNamesTheImageWhenPullBackoffPersists(t *testing.T) {
 	requireBash(t)
 	t.Parallel()

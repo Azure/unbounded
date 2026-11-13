@@ -17,7 +17,16 @@ spec:
   updateStrategy:
     type: RollingUpdate
     rollingUpdate:
-      maxUnavailable: 100%
+      # One node at a time. This pod serves the IPAM socket that every pod
+      # sandbox on the node dials, and the socket is removed when the pod
+      # stops, so the node cannot create sandboxes until its replacement is
+      # serving. Replacing the whole fleet at once removes pod networking on
+      # every node for as long as each image pull takes: with maxUnavailable
+      # 100% a release rollout left four nodes pulling and new sandboxes
+      # failed with "dial unix /run/unbounded-net/ipam.sock: connect: no such
+      # file or directory". A value of 1 limits a slow or broken image to one
+      # node.
+      maxUnavailable: 1
   template:
     metadata:
       annotations:

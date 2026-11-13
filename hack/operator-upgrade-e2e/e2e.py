@@ -97,8 +97,6 @@ REPAIR_CRD = "machineoperationcredentials.unbounded-cloud.io"
 NET_CONFIG_DATA_SENTINEL = "operator-upgrade-e2e-sentinel"
 NET_CONFIG_BINARY_SENTINEL = "operator-upgrade-e2e-sentinel.bin"
 
-PAUSE_IMAGE = "registry.k8s.io/pause:3.10"
-
 # CIDRs for the Site spec. Because the old install uses --manage-cni-plugin=false
 # these are never applied to the kind node's CNI. The cluster Site's node CIDR is
 # computed at install time to cover the kind nodes' InternalIPs (see
@@ -593,7 +591,6 @@ def _current_install_command(args: argparse.Namespace) -> list[str]:
         str(plugin), "install",
         "--kubeconfig", str(KUBECONFIG),
         "--operator-image", imgs["operator"],
-        "--metalman-image", PAUSE_IMAGE,
         "--wait", "--timeout", "5m",
     ]
 

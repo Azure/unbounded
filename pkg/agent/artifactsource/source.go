@@ -443,8 +443,41 @@ func (s Source) ExtractTar(ctx context.Context, destDir string) error {
 	return utilio.ExtractTar(body, destDir)
 }
 
+// ForEachTarGzFile calls install for each file in a gzip-compressed tar
+// artifact source.
+//
+// Unlike DecompressTarGz, a retryable transport failure restarts the whole
+// fetch and extraction rather than surfacing halfway through the archive. That
+// is only safe because install must replace the destination atomically, so an
+// abandoned attempt cannot leave a partial file that a later version check
+// mistakes for a complete install.
+func (s Source) ForEachTarGzFile(ctx context.Context, install func(*utilio.TarFile) error) error {
+	return s.forEachTarGzFile(ctx, install, waitForHTTPDownloadRetry)
+}
+
+func (s Source) forEachTarGzFile(
+	ctx context.Context,
+	install func(*utilio.TarFile) error,
+	wait func(context.Context, time.Duration) error,
+) error {
+	return s.readWithRetryAndWait(ctx, func(body io.Reader) error {
+		for tarFile, err := range utilio.DecompressTarGz(body) {
+			if err != nil {
+				return fmt.Errorf("read tar.gz artifact: %w", err)
+			}
+
+			if err := install(tarFile); err != nil {
+				return err
+			}
+		}
+
+		return nil
+	}, wait)
+}
+
 // DecompressTarGz returns an iterator that yields files from a gzip-compressed
-// tar artifact source.
+// tar artifact source. Transport failures surface mid-iteration and are not
+// retried; use ForEachTarGzFile when each file is installed atomically.
 func (s Source) DecompressTarGz(ctx context.Context) utilio.TarFileSeq {
 	return func(yield func(*utilio.TarFile, error) bool) {
 		body, err := s.Open(ctx)

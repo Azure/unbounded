@@ -92,6 +92,13 @@ record) or a new `HashMap` iteration on a behavior path.
 
 ## Bugs found
 
+- `authority-crash-restart` seed 151: a Pod that restarted without its seat
+  used the cold-start window (up to `MAX_COLD_WINDOW`, 600 s) while old seat
+  Leases aged out, so the cluster stayed without a primary past
+  `PRIMARY_BOUND`. For a Node the primary view maps to a seat while the
+  primary Lease names a holder, the window now caps at `LEASE_RENEW`
+  (`MAX_ESTABLISHED_WINDOW`), so a crashed seat holder is replaced inside
+  the primary Lease bound.
 - `authority-crash-restart` seed 1: a dropped `Authority` leaked every task,
   listener and connection (futures held the runtime `Rc` across awaits, a
   cycle), so a restarted Pod failed to bind its addresses. Fixed in
