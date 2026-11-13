@@ -114,8 +114,10 @@ impl GpuTelemetry {
             "# TYPE racer_gpu_enabled gauge\nracer_gpu_enabled {}",
             u8::from(helper.is_some())
         )?;
-        // 1 while `RACER_ENABLE_GPU=auto` waits for the first `gpu-read`
-        // before touching any GPU; 0 once that start resolves either way.
+        // 1 while `RACER_ENABLE_GPU=auto` has no helper and would start one
+        // on a `gpu-read`, including after a failed attempt. 0 once a helper
+        // is running, or after a terminal failure (`RACER_ENABLE_GPU=true`,
+        // or a failed start thread spawn).
         writeln!(
             out,
             "# TYPE racer_gpu_standby gauge\nracer_gpu_standby {}",

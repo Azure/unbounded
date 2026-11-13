@@ -10,8 +10,8 @@
 //! is final. An attempt that fails or finds no usable GPU leaves the slot in
 //! standby: the requests that waited on it get 501, and so does every
 //! `gpu-read` until the backoff ([`retry_delay`]) has elapsed, when the next
-//! `gpu-read` tries again. Only a start that panics turns GPU mode off for
-//! the life of the process.
+//! `gpu-read` tries again. Only two cases turn GPU mode off for the life of
+//! the process: a start that panics, and a start thread that fails to spawn.
 
 use crate::gpu::GpuHelper;
 use futures::channel::oneshot;

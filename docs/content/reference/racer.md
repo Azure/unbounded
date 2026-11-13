@@ -1670,7 +1670,7 @@ from the GPUs the dataplane found and the active RDMA rails.
 |--------|------|---------|
 | `racer_gpu_read_requests_total{outcome}` | counter | `gpu-read` requests by how the dataplane opened them: `gpu` (imported on a GPU; the read can still fail later), `not_enabled` (501, `gpu-read` is off), `wrong_device` (501, the memory is on a GPU the dataplane cannot use, or the `Racer-Gpu-Uuid` header names a GPU it did not find), `busy` (503), `invalid` (400), or `failed`. Requests the parser rejects before it knows the mode are not counted. |
 | `racer_gpu_enabled` | gauge | 1 when `gpu-read` is on and found a usable GPU, else 0. |
-| `racer_gpu_standby` | gauge | 1 while `auto` mode waits for the first `gpu-read` before it touches a GPU, else 0. |
+| `racer_gpu_standby` | gauge | 1 while `RACER_ENABLE_GPU=auto` has no helper and would start one on a `gpu-read`, including after a failed attempt. 0 once a helper is running, or after a terminal failure (`RACER_ENABLE_GPU=true`, or a failed start thread spawn). |
 
 The rest are reported only when `racer_gpu_enabled` is 1:
 
@@ -1905,10 +1905,17 @@ GPU memory. They need:
 - `RACER_ENABLE_GPU` in `racer-settings`. `auto`, the default, does
   not touch any GPU until a client sends the first `gpu-read`. Only then does
   the dataplane load CUDA, look for GPUs, and turn GPU mode on. If that
-  attempt fails, `gpu-read` returns 501 and the dataplane retries in the
-  background with a 5 s delay that doubles to 60 s, one attempt at a time.
-  Reads keep getting 501 until an attempt succeeds, and the dataplane logs
-  `stage=gpu state=starting attempt=<n>` and `state=recovered attempt=<n>`.
+  One attempt runs at a time, and `gpu-read` requests that arrive while it
+  runs wait for it. If the attempt fails, those requests get 501, and so does
+  every `gpu-read` during a backoff that starts at 5 s and doubles per
+  consecutive failure up to 60 s. There is no background retry: the first
+  `gpu-read` after the backoff expires starts the next attempt and waits for
+  it, within that request's own scope, instead of getting 501. An idle node
+  does not retry on its own. The dataplane logs
+  `stage=gpu state=starting attempt=<n>` for each attempt,
+  `state=start-failed attempt=<n> reason=<reason> retry_in=<s>s` when one
+  fails, and `state=recovered attempt=<n>` when an attempt after a failure
+  succeeds.
   `true` sets up the GPUs at startup and makes startup fail when there is no
   usable GPU. `false` turns it off.
 
