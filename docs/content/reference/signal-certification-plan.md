@@ -1,14 +1,14 @@
 ---
 title: "Project Signal certification plans"
 weight: 40
-description: "Generate immutable CertificationTests from repository-owned source files."
+description: "Generate immutable Project Signal Tests and ordered Suites from repository-owned source files."
 ---
 
 `CertificationPlan` is the repository authoring format for Project Signal
 tests. It references source files and named digest-pinned runtimes; it is not a
 Kubernetes resource.
 
-Render the plan with:
+For a plan that defines only Tests, render it with:
 
 ```bash
 kubectl unbounded signal render \
@@ -58,6 +58,25 @@ spec:
         runtime: vllm
         command: [python3]
         args: [-m, vllm.entrypoints.openai.api_server]
+  suite:
+    name: node-qualification
+    phases:
+    - name: validation
+      displayName: Ordered node validation
+      role: Validation
+      stages:
+      - name: gpu-identity
+        test: gpu-identity
+        schedule:
+          mode: RunOnce
+          invocationTimeout: 10m
+      - name: vllm-canary
+        test: vllm-canary
+        schedule:
+          mode: RunOnce
+          invocationTimeout: 30m
+        dependsOn:
+        - stage: gpu-identity
 ```
 
 Supported drivers are:
@@ -70,3 +89,77 @@ Supported drivers are:
 When omitted, topology defaults to one participant and metrics default to the
 required `scriptResult` status metric. Runtime images and WorkflowTemplate
 digests must be immutable SHA-256 references.
+
+## Ordered Suite workflow
+
+A Suite pins each accepted Test by Kubernetes UID, generation, and approved
+content digest. Those identities do not exist until the generated Tests have
+been applied and approved, so Suite compilation is intentionally two-phase.
+This keeps the source workflow repeatable without weakening the qualification
+trust boundary.
+
+First render and apply only the Tests:
+
+```bash
+kubectl unbounded signal render \
+  --filename certification-plan.yaml \
+  --tests-only \
+  > certification-tests.yaml
+
+kubectl apply -f certification-tests.yaml
+```
+
+After an administrator approves the exact Test generations, capture their
+cluster identities:
+
+```bash
+kubectl unbounded signal bindings \
+  --filename certification-plan.yaml \
+  > certification-bindings.yaml
+```
+
+The command fails closed if a Test is missing, its current generation has not
+been observed, or its trust state is not `Approved` or `Diagnostic`. The
+generated file has this shape:
+
+```yaml
+apiVersion: signal.unbounded-cloud.io/v1alpha1
+kind: CertificationPlanBindings
+metadata:
+  name: node-qualification
+spec:
+  tests:
+    gpu-identity:
+      name: gpu-identity
+      uid: 11111111-1111-1111-1111-111111111111
+      generation: 1
+      contentDigest: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    vllm-canary:
+      name: vllm-canary
+      uid: 22222222-2222-2222-2222-222222222222
+      generation: 1
+      contentDigest: sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+```
+
+Then compile the complete apply-ready package:
+
+```bash
+kubectl unbounded signal render \
+  --filename certification-plan.yaml \
+  --bindings certification-bindings.yaml \
+  > certification-package.yaml
+
+kubectl apply -f certification-package.yaml
+```
+
+The complete package contains the deterministic `CertificationTest` objects
+followed by the bound `CertificationSuite`. Keep the package as the deployment
+and cleanup artifact:
+
+```bash
+kubectl delete -f certification-package.yaml
+```
+
+Changing a script, runtime, parameter schema, metric schema, security
+requirement, or other Test content produces a new Test generation and requires
+fresh approval and bindings before the Suite can be recompiled.

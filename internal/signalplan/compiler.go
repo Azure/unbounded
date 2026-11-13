@@ -27,10 +27,14 @@ import (
 const (
 	planAPIVersion  = "signal.unbounded-cloud.io/v1alpha1"
 	planKind        = "CertificationPlan"
+	bindingsKind    = "CertificationPlanBindings"
 	maxPlanFileSize = 1024 * 1024
 )
 
-var artifactNamePattern = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+var (
+	artifactNamePattern = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+	suiteNamePattern    = regexp.MustCompile(`^[a-z]([-a-z0-9]*[a-z0-9])?$`)
+)
 
 type CertificationPlan struct {
 	APIVersion string                    `json:"apiVersion"`
@@ -51,6 +55,50 @@ type CertificationPlanSpec struct {
 	Version    string                    `json:"version"`
 	Runtimes   map[string]string         `json:"runtimes,omitempty"`
 	Tests      []CertificationTestSource `json:"tests"`
+	Suite      *CertificationSuiteSource `json:"suite,omitempty"`
+}
+
+type CertificationSuiteSource struct {
+	Name        string                     `json:"name"`
+	Labels      map[string]string          `json:"labels,omitempty"`
+	Annotations map[string]string          `json:"annotations,omitempty"`
+	Phases      []CertificationPhaseSource `json:"phases"`
+}
+
+type CertificationPhaseSource struct {
+	Name        string                        `json:"name"`
+	DisplayName string                        `json:"displayName,omitempty"`
+	Role        signalv1alpha1.CheckStageRole `json:"role"`
+	Stages      []CertificationStageSource    `json:"stages"`
+}
+
+type CertificationStageSource struct {
+	Name                      string                                       `json:"name"`
+	DisplayName               string                                       `json:"displayName,omitempty"`
+	Test                      string                                       `json:"test"`
+	Parameters                []signalv1alpha1.StageParameterBinding       `json:"parameters,omitempty"`
+	ParticipantRoles          []signalv1alpha1.StageParticipantRoleBinding `json:"participantRoles,omitempty"`
+	Schedule                  signalv1alpha1.StageSchedule                 `json:"schedule"`
+	Retry                     *signalv1alpha1.StageRetryPolicy             `json:"retry,omitempty"`
+	DependsOn                 []signalv1alpha1.StageDependency             `json:"dependsOn,omitempty"`
+	Optional                  bool                                         `json:"optional,omitempty"`
+	Assertions                []signalv1alpha1.TestAssertion               `json:"assertions,omitempty"`
+	PerDeviceCoverageInterval *metav1.Duration                             `json:"perDeviceCoverageInterval,omitempty"`
+}
+
+type CertificationPlanBindings struct {
+	APIVersion string                            `json:"apiVersion"`
+	Kind       string                            `json:"kind"`
+	Metadata   CertificationPlanBindingsMetadata `json:"metadata"`
+	Spec       CertificationPlanBindingsSpec     `json:"spec"`
+}
+
+type CertificationPlanBindingsMetadata struct {
+	Name string `json:"name"`
+}
+
+type CertificationPlanBindingsSpec struct {
+	Tests map[string]signalv1alpha1.CertificationTestReference `json:"tests"`
 }
 
 type CertificationTestSource struct {
@@ -99,14 +147,21 @@ type WorkflowTemplateDriverSource struct {
 }
 
 func CompileFile(filename string) ([]byte, error) {
-	raw, err := readFileBounded(filename, maxPlanFileSize)
-	if err != nil {
-		return nil, fmt.Errorf("read CertificationPlan: %w", err)
-	}
+	return compileFile(filename, "", false)
+}
 
-	var plan CertificationPlan
-	if err := yaml.UnmarshalStrict(raw, &plan); err != nil {
-		return nil, fmt.Errorf("decode CertificationPlan: %w", err)
+func CompileTestsFile(filename string) ([]byte, error) {
+	return compileFile(filename, "", true)
+}
+
+func CompileFileWithBindings(filename, bindingsFilename string) ([]byte, error) {
+	return compileFile(filename, bindingsFilename, false)
+}
+
+func compileFile(filename, bindingsFilename string, testsOnly bool) ([]byte, error) {
+	plan, err := readPlan(filename)
+	if err != nil {
+		return nil, err
 	}
 
 	tests, err := compilePlan(filename, plan)
@@ -114,22 +169,152 @@ func CompileFile(filename string) ([]byte, error) {
 		return nil, err
 	}
 
+	resources := make([]any, 0, len(tests)+1)
+	for index := range tests {
+		resources = append(resources, &tests[index])
+	}
+
+	if plan.Spec.Suite != nil && !testsOnly {
+		if bindingsFilename == "" {
+			return nil, errors.New(
+				"spec.suite requires --bindings after the generated CertificationTests are approved; " +
+					"use --tests-only to bootstrap them",
+			)
+		}
+
+		bindings, err := readBindings(bindingsFilename)
+		if err != nil {
+			return nil, err
+		}
+
+		suite, err := compileSuite(plan, bindings)
+		if err != nil {
+			return nil, err
+		}
+
+		resources = append(resources, &suite)
+	} else if bindingsFilename != "" {
+		return nil, errors.New("--bindings requires spec.suite")
+	}
+
 	var rendered bytes.Buffer
 
-	for index := range tests {
+	for index := range resources {
 		if index > 0 {
 			rendered.WriteString("---\n")
 		}
 
-		document, err := yaml.Marshal(&tests[index])
+		document, err := yaml.Marshal(resources[index])
 		if err != nil {
-			return nil, fmt.Errorf("encode CertificationTest %q: %w", tests[index].Name, err)
+			return nil, fmt.Errorf("encode compiled resource: %w", err)
 		}
 
 		rendered.Write(document)
 	}
 
 	return rendered.Bytes(), nil
+}
+
+func BindingTargets(filename string) (string, []string, error) {
+	plan, err := readPlan(filename)
+	if err != nil {
+		return "", nil, err
+	}
+
+	if plan.Spec.Suite == nil {
+		return "", nil, errors.New("spec.suite is required to resolve bindings")
+	}
+
+	tests, err := compilePlan(filename, plan)
+	if err != nil {
+		return "", nil, err
+	}
+
+	referenced := make(map[string]struct{})
+
+	for phaseIndex := range plan.Spec.Suite.Phases {
+		for stageIndex := range plan.Spec.Suite.Phases[phaseIndex].Stages {
+			referenced[plan.Spec.Suite.Phases[phaseIndex].Stages[stageIndex].Test] = struct{}{}
+		}
+	}
+
+	names := make([]string, 0, len(referenced))
+	for index := range tests {
+		if _, exists := referenced[tests[index].Name]; exists {
+			names = append(names, tests[index].Name)
+			delete(referenced, tests[index].Name)
+		}
+	}
+
+	for name := range referenced {
+		return "", nil, fmt.Errorf("spec.suite references undefined test %q", name)
+	}
+
+	return plan.Metadata.Name, names, nil
+}
+
+func RenderBindings(
+	planName string,
+	references map[string]signalv1alpha1.CertificationTestReference,
+) ([]byte, error) {
+	bindings := CertificationPlanBindings{
+		APIVersion: planAPIVersion,
+		Kind:       bindingsKind,
+		Metadata: CertificationPlanBindingsMetadata{
+			Name: planName,
+		},
+		Spec: CertificationPlanBindingsSpec{
+			Tests: references,
+		},
+	}
+
+	rendered, err := yaml.Marshal(&bindings)
+	if err != nil {
+		return nil, fmt.Errorf("encode CertificationPlanBindings: %w", err)
+	}
+
+	return rendered, nil
+}
+
+func readPlan(filename string) (CertificationPlan, error) {
+	raw, err := readFileBounded(filename, maxPlanFileSize)
+	if err != nil {
+		return CertificationPlan{}, fmt.Errorf("read CertificationPlan: %w", err)
+	}
+
+	var plan CertificationPlan
+	if err := yaml.UnmarshalStrict(raw, &plan); err != nil {
+		return CertificationPlan{}, fmt.Errorf("decode CertificationPlan: %w", err)
+	}
+
+	return plan, nil
+}
+
+func readBindings(filename string) (CertificationPlanBindings, error) {
+	raw, err := readFileBounded(filename, maxPlanFileSize)
+	if err != nil {
+		return CertificationPlanBindings{}, fmt.Errorf("read CertificationPlanBindings: %w", err)
+	}
+
+	var bindings CertificationPlanBindings
+	if err := yaml.UnmarshalStrict(raw, &bindings); err != nil {
+		return CertificationPlanBindings{}, fmt.Errorf("decode CertificationPlanBindings: %w", err)
+	}
+
+	if bindings.APIVersion != planAPIVersion {
+		return CertificationPlanBindings{}, fmt.Errorf(
+			"bindings apiVersion must be %q",
+			planAPIVersion,
+		)
+	}
+
+	if bindings.Kind != bindingsKind {
+		return CertificationPlanBindings{}, errors.New(
+			`bindings kind must be "CertificationPlanBindings"`,
+		)
+	}
+
+	return bindings, nil
 }
 
 func readFileBounded(path string, limit int64) (content []byte, err error) {
@@ -342,6 +527,370 @@ func compileTest(
 	}
 
 	return test, nil
+}
+
+func compileSuite(
+	plan CertificationPlan,
+	bindings CertificationPlanBindings,
+) (signalv1alpha1.CertificationSuite, error) {
+	source := plan.Spec.Suite
+	if source == nil {
+		return signalv1alpha1.CertificationSuite{}, errors.New("spec.suite is required")
+	}
+
+	if bindings.Metadata.Name != plan.Metadata.Name {
+		return signalv1alpha1.CertificationSuite{}, fmt.Errorf(
+			"bindings metadata.name %q must match plan metadata.name %q",
+			bindings.Metadata.Name,
+			plan.Metadata.Name,
+		)
+	}
+
+	if errors := validation.IsDNS1123Subdomain(source.Name); len(errors) > 0 {
+		return signalv1alpha1.CertificationSuite{}, fmt.Errorf(
+			"spec.suite.name is invalid: %s",
+			strings.Join(errors, ", "),
+		)
+	}
+
+	if len(source.Phases) == 0 {
+		return signalv1alpha1.CertificationSuite{}, errors.New(
+			"spec.suite.phases must contain at least one phase",
+		)
+	}
+
+	if len(source.Phases) > 16 {
+		return signalv1alpha1.CertificationSuite{}, errors.New(
+			"spec.suite.phases must not contain more than 16 phases",
+		)
+	}
+
+	testNames := make(map[string]struct{}, len(plan.Spec.Tests))
+	for index := range plan.Spec.Tests {
+		testNames[plan.Spec.Tests[index].Name] = struct{}{}
+	}
+
+	for name := range bindings.Spec.Tests {
+		if _, exists := testNames[name]; !exists {
+			return signalv1alpha1.CertificationSuite{}, fmt.Errorf(
+				"bindings spec.tests contains undefined test %q",
+				name,
+			)
+		}
+	}
+
+	phases := make([]signalv1alpha1.CertificationPhase, len(source.Phases))
+	stageLocations := make(map[string][2]int)
+	dependencies := make(map[string][]string)
+	phaseNames := make(map[string]struct{}, len(source.Phases))
+	startupCount := 0
+	terminalCount := 0
+	stageCount := 0
+
+	for phaseIndex := range source.Phases {
+		sourcePhase := source.Phases[phaseIndex]
+		if len(sourcePhase.Name) > 63 || !suiteNamePattern.MatchString(sourcePhase.Name) {
+			return signalv1alpha1.CertificationSuite{}, fmt.Errorf(
+				"spec.suite phase name %q is invalid",
+				sourcePhase.Name,
+			)
+		}
+
+		if _, exists := phaseNames[sourcePhase.Name]; exists {
+			return signalv1alpha1.CertificationSuite{}, fmt.Errorf(
+				"spec.suite phase name %q is duplicated",
+				sourcePhase.Name,
+			)
+		}
+
+		phaseNames[sourcePhase.Name] = struct{}{}
+		if len(sourcePhase.Stages) == 0 {
+			return signalv1alpha1.CertificationSuite{}, fmt.Errorf(
+				"spec.suite phase %q has no stages",
+				sourcePhase.Name,
+			)
+		}
+
+		switch sourcePhase.Role {
+		case signalv1alpha1.CheckStageRoleStartup:
+			startupCount++
+
+			if phaseIndex != 0 {
+				return signalv1alpha1.CertificationSuite{}, errors.New(
+					"spec.suite Startup phase must be first",
+				)
+			}
+		case signalv1alpha1.CheckStageRoleValidation:
+		case signalv1alpha1.CheckStageRoleTerminal:
+			terminalCount++
+
+			if phaseIndex != len(source.Phases)-1 {
+				return signalv1alpha1.CertificationSuite{}, errors.New(
+					"spec.suite Terminal phase must be last",
+				)
+			}
+		default:
+			return signalv1alpha1.CertificationSuite{}, fmt.Errorf(
+				"spec.suite phase %q has invalid role %q",
+				sourcePhase.Name,
+				sourcePhase.Role,
+			)
+		}
+
+		phases[phaseIndex] = signalv1alpha1.CertificationPhase{
+			Name:        sourcePhase.Name,
+			DisplayName: sourcePhase.DisplayName,
+			Role:        sourcePhase.Role,
+			Stages:      make([]signalv1alpha1.CertificationStage, len(sourcePhase.Stages)),
+		}
+		stageCount += len(sourcePhase.Stages)
+
+		for stageIndex := range sourcePhase.Stages {
+			sourceStage := sourcePhase.Stages[stageIndex]
+			if len(sourceStage.Name) > 63 || !suiteNamePattern.MatchString(sourceStage.Name) {
+				return signalv1alpha1.CertificationSuite{}, fmt.Errorf(
+					"spec.suite stage name %q is invalid",
+					sourceStage.Name,
+				)
+			}
+
+			if location, exists := stageLocations[sourceStage.Name]; exists {
+				return signalv1alpha1.CertificationSuite{}, fmt.Errorf(
+					"spec.suite stage name %q is duplicated in phases %q and %q",
+					sourceStage.Name,
+					source.Phases[location[0]].Name,
+					sourcePhase.Name,
+				)
+			}
+
+			if _, exists := testNames[sourceStage.Test]; !exists {
+				return signalv1alpha1.CertificationSuite{}, fmt.Errorf(
+					"spec.suite stage %q references undefined test %q",
+					sourceStage.Name,
+					sourceStage.Test,
+				)
+			}
+
+			binding, exists := bindings.Spec.Tests[sourceStage.Test]
+			if !exists {
+				return signalv1alpha1.CertificationSuite{}, fmt.Errorf(
+					"bindings spec.tests[%q] is required by stage %q",
+					sourceStage.Test,
+					sourceStage.Name,
+				)
+			}
+
+			if err := validateTestBinding(sourceStage.Test, binding); err != nil {
+				return signalv1alpha1.CertificationSuite{}, err
+			}
+
+			if err := signalv1alpha1.ValidateStageSchedule(sourceStage.Schedule); err != nil {
+				return signalv1alpha1.CertificationSuite{}, fmt.Errorf(
+					"spec.suite phase %q stage %q schedule: %w",
+					sourcePhase.Name,
+					sourceStage.Name,
+					err,
+				)
+			}
+
+			if sourcePhase.Role != signalv1alpha1.CheckStageRoleValidation &&
+				sourceStage.Schedule.Mode != signalv1alpha1.CheckExecutionModeRunOnce {
+				return signalv1alpha1.CertificationSuite{}, fmt.Errorf(
+					"spec.suite phase %q non-validation stage %q must use RunOnce",
+					sourcePhase.Name,
+					sourceStage.Name,
+				)
+			}
+
+			stageLocations[sourceStage.Name] = [2]int{phaseIndex, stageIndex}
+			phases[phaseIndex].Stages[stageIndex] = signalv1alpha1.CertificationStage{
+				Name:                      sourceStage.Name,
+				DisplayName:               sourceStage.DisplayName,
+				Test:                      binding,
+				Parameters:                sourceStage.Parameters,
+				ParticipantRoles:          sourceStage.ParticipantRoles,
+				Schedule:                  sourceStage.Schedule,
+				Retry:                     sourceStage.Retry,
+				DependsOn:                 sourceStage.DependsOn,
+				Optional:                  sourceStage.Optional,
+				Assertions:                sourceStage.Assertions,
+				PerDeviceCoverageInterval: sourceStage.PerDeviceCoverageInterval,
+			}
+		}
+	}
+
+	if startupCount > 1 || terminalCount > 1 {
+		return signalv1alpha1.CertificationSuite{}, errors.New(
+			"spec.suite allows at most one Startup and one Terminal phase",
+		)
+	}
+
+	if stageCount > signalv1alpha1.MaxCertificationStages {
+		return signalv1alpha1.CertificationSuite{}, fmt.Errorf(
+			"spec.suite stage count %d exceeds maximum %d",
+			stageCount,
+			signalv1alpha1.MaxCertificationStages,
+		)
+	}
+
+	for phaseIndex := range phases {
+		for stageIndex := range phases[phaseIndex].Stages {
+			stage := phases[phaseIndex].Stages[stageIndex]
+			seen := make(map[string]struct{}, len(stage.DependsOn))
+
+			if len(stage.DependsOn) == 0 && phaseIndex > 0 {
+				for previousIndex := range phases[phaseIndex-1].Stages {
+					dependencies[stage.Name] = append(
+						dependencies[stage.Name],
+						phases[phaseIndex-1].Stages[previousIndex].Name,
+					)
+				}
+
+				continue
+			}
+
+			for dependencyIndex := range stage.DependsOn {
+				dependency := stage.DependsOn[dependencyIndex]
+				if dependency.Stage == stage.Name {
+					return signalv1alpha1.CertificationSuite{}, fmt.Errorf(
+						"spec.suite stage %q cannot depend on itself",
+						stage.Name,
+					)
+				}
+
+				if _, exists := seen[dependency.Stage]; exists {
+					return signalv1alpha1.CertificationSuite{}, fmt.Errorf(
+						"spec.suite stage %q dependency %q is duplicated",
+						stage.Name,
+						dependency.Stage,
+					)
+				}
+
+				seen[dependency.Stage] = struct{}{}
+				if _, exists := stageLocations[dependency.Stage]; !exists {
+					return signalv1alpha1.CertificationSuite{}, fmt.Errorf(
+						"spec.suite stage %q dependency %q does not exist",
+						stage.Name,
+						dependency.Stage,
+					)
+				}
+
+				switch dependency.Condition {
+				case "",
+					signalv1alpha1.StageDependencyConditionSucceeded,
+					signalv1alpha1.StageDependencyConditionCompleted:
+				default:
+					return signalv1alpha1.CertificationSuite{}, fmt.Errorf(
+						"spec.suite stage %q dependency %q has invalid condition %q",
+						stage.Name,
+						dependency.Stage,
+						dependency.Condition,
+					)
+				}
+
+				dependencies[stage.Name] = append(dependencies[stage.Name], dependency.Stage)
+			}
+		}
+	}
+
+	if err := validateStageDependencyGraph(stageLocations, dependencies); err != nil {
+		return signalv1alpha1.CertificationSuite{}, err
+	}
+
+	labels := mergeStringMaps(plan.Metadata.Labels, source.Labels)
+	annotations := mergeStringMaps(plan.Metadata.Annotations, source.Annotations)
+	annotations["signal.unbounded-cloud.io/source-plan"] = plan.Metadata.Name
+
+	return signalv1alpha1.CertificationSuite{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: signalv1alpha1.GroupVersion.String(),
+			Kind:       "CertificationSuite",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        source.Name,
+			Labels:      labels,
+			Annotations: annotations,
+		},
+		Spec: signalv1alpha1.CertificationSuiteSpec{
+			Phases: phases,
+		},
+	}, nil
+}
+
+func validateTestBinding(
+	sourceName string,
+	binding signalv1alpha1.CertificationTestReference,
+) error {
+	if binding.Name != sourceName {
+		return fmt.Errorf(
+			"bindings spec.tests[%q].name %q must match the source test name",
+			sourceName,
+			binding.Name,
+		)
+	}
+
+	if binding.UID == "" {
+		return fmt.Errorf("bindings spec.tests[%q].uid is required", sourceName)
+	}
+
+	if binding.Generation < 1 {
+		return fmt.Errorf(
+			"bindings spec.tests[%q].generation must be at least 1",
+			sourceName,
+		)
+	}
+
+	if !signalv1alpha1.IsSHA256Digest(binding.ContentDigest) {
+		return fmt.Errorf(
+			"bindings spec.tests[%q].contentDigest must be a SHA-256 digest",
+			sourceName,
+		)
+	}
+
+	return nil
+}
+
+func validateStageDependencyGraph(
+	stageLocations map[string][2]int,
+	dependencies map[string][]string,
+) error {
+	const (
+		unvisited = iota
+		visiting
+		visited
+	)
+
+	states := make(map[string]int, len(stageLocations))
+
+	var visit func(string) error
+
+	visit = func(stage string) error {
+		switch states[stage] {
+		case visiting:
+			return fmt.Errorf("spec.suite stage dependency graph contains a cycle at %q", stage)
+		case visited:
+			return nil
+		}
+
+		states[stage] = visiting
+		for _, dependency := range dependencies[stage] {
+			if err := visit(dependency); err != nil {
+				return err
+			}
+		}
+
+		states[stage] = visited
+
+		return nil
+	}
+
+	for stage := range stageLocations {
+		if err := visit(stage); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func compileArtifact(sourceRoot string, source *ArtifactSource) ([]signalv1alpha1.TestArtifact, string, error) {

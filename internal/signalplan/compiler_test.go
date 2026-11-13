@@ -117,6 +117,209 @@ spec:
 	require.Equal(t, string(workflowScript), tests[2].Spec.Artifacts[0].Content)
 }
 
+func TestCompileFileWithBindingsRendersOrderedSuite(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	require.NoError(t, os.Mkdir(filepath.Join(root, "scripts"), 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(root, "scripts", "preflight.sh"),
+		[]byte("#!/usr/bin/env bash\nprintf 'preflight\\n'\n"),
+		0o600,
+	))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(root, "scripts", "workload.sh"),
+		[]byte("#!/usr/bin/env bash\nprintf 'workload\\n'\n"),
+		0o600,
+	))
+
+	plan := fmt.Sprintf(`apiVersion: signal.unbounded-cloud.io/v1alpha1
+kind: CertificationPlan
+metadata:
+  name: node-certification
+  labels:
+    app.kubernetes.io/part-of: project-signal
+spec:
+  owner: qualification-team
+  version: source-123
+  runtimes:
+    base: %s
+  tests:
+  - name: hardware-preflight
+    displayName: Hardware preflight
+    artifact:
+      path: scripts/preflight.sh
+    driver:
+      type: Script
+      script:
+        language: Shell
+        runtime: base
+  - name: gpu-workload
+    displayName: GPU workload
+    artifact:
+      path: scripts/workload.sh
+    driver:
+      type: Script
+      script:
+        language: Shell
+        runtime: base
+  suite:
+    name: node-certification
+    phases:
+    - name: validation
+      displayName: Ordered validation
+      role: Validation
+      stages:
+      - name: preflight
+        test: hardware-preflight
+        schedule:
+          mode: RunOnce
+          invocationTimeout: 5m
+      - name: workload
+        test: gpu-workload
+        schedule:
+          mode: RunOnce
+          invocationTimeout: 30m
+        dependsOn:
+        - stage: preflight
+`, testRuntimeA)
+	planPath := filepath.Join(root, "certification-plan.yaml")
+	require.NoError(t, os.WriteFile(planPath, []byte(plan), 0o600))
+
+	bindings := fmt.Sprintf(`apiVersion: signal.unbounded-cloud.io/v1alpha1
+kind: CertificationPlanBindings
+metadata:
+  name: node-certification
+spec:
+  tests:
+    hardware-preflight:
+      name: hardware-preflight
+      uid: %s
+      generation: 1
+      contentDigest: %s
+    gpu-workload:
+      name: gpu-workload
+      uid: %s
+      generation: 2
+      contentDigest: %s
+`, "11111111-1111-1111-1111-111111111111", testDigest,
+		"22222222-2222-2222-2222-222222222222", testDigest)
+	bindingsPath := filepath.Join(root, "certification-bindings.yaml")
+	require.NoError(t, os.WriteFile(bindingsPath, []byte(bindings), 0o600))
+
+	_, err := CompileFile(planPath)
+	require.ErrorContains(t, err, "spec.suite requires --bindings")
+
+	testsOnly, err := CompileTestsFile(planPath)
+	require.NoError(t, err)
+	require.NotContains(t, string(testsOnly), "kind: CertificationSuite")
+
+	rendered, err := CompileFileWithBindings(planPath, bindingsPath)
+	require.NoError(t, err)
+	require.Equal(t, rendered, mustCompileFileWithBindings(t, planPath, bindingsPath))
+
+	documents := strings.Split(strings.TrimSpace(string(rendered)), "---\n")
+	require.Len(t, documents, 3)
+
+	var suite signalv1alpha1.CertificationSuite
+	require.NoError(t, yaml.Unmarshal([]byte(documents[2]), &suite))
+	require.Equal(t, "node-certification", suite.Name)
+	require.Equal(
+		t,
+		"node-certification",
+		suite.Annotations["signal.unbounded-cloud.io/source-plan"],
+	)
+	require.Equal(t, "project-signal", suite.Labels["app.kubernetes.io/part-of"])
+	require.Len(t, suite.Spec.Phases, 1)
+	require.Len(t, suite.Spec.Phases[0].Stages, 2)
+	require.Equal(
+		t,
+		"11111111-1111-1111-1111-111111111111",
+		string(suite.Spec.Phases[0].Stages[0].Test.UID),
+	)
+	require.Equal(
+		t,
+		"preflight",
+		suite.Spec.Phases[0].Stages[1].DependsOn[0].Stage,
+	)
+}
+
+func TestCompileFileWithBindingsRejectsMissingIdentityAndDependencyCycle(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	require.NoError(t, os.WriteFile(
+		filepath.Join(root, "check.sh"),
+		[]byte("#!/usr/bin/env bash\nprintf 'ok\\n'\n"),
+		0o600,
+	))
+
+	plan := fmt.Sprintf(`apiVersion: signal.unbounded-cloud.io/v1alpha1
+kind: CertificationPlan
+metadata:
+  name: qualification
+spec:
+  owner: qualification-team
+  version: source-123
+  runtimes:
+    base: %s
+  tests:
+  - name: script-check
+    displayName: Script check
+    artifact:
+      path: check.sh
+    driver:
+      type: Script
+      script:
+        language: Shell
+        runtime: base
+  suite:
+    name: qualification
+    phases:
+    - name: validation
+      role: Validation
+      stages:
+      - name: first
+        test: script-check
+        schedule: {mode: RunOnce, invocationTimeout: 5m}
+        dependsOn: [{stage: second}]
+      - name: second
+        test: script-check
+        schedule: {mode: RunOnce, invocationTimeout: 5m}
+        dependsOn: [{stage: first}]
+`, testRuntimeA)
+	planPath := filepath.Join(root, "certification-plan.yaml")
+	require.NoError(t, os.WriteFile(planPath, []byte(plan), 0o600))
+
+	bindingsPath := filepath.Join(root, "certification-bindings.yaml")
+	require.NoError(t, os.WriteFile(bindingsPath, []byte(`apiVersion: signal.unbounded-cloud.io/v1alpha1
+kind: CertificationPlanBindings
+metadata:
+  name: qualification
+spec:
+  tests: {}
+`), 0o600))
+
+	_, err := CompileFileWithBindings(planPath, bindingsPath)
+	require.ErrorContains(t, err, `bindings spec.tests["script-check"] is required`)
+
+	require.NoError(t, os.WriteFile(bindingsPath, []byte(fmt.Sprintf(`apiVersion: signal.unbounded-cloud.io/v1alpha1
+kind: CertificationPlanBindings
+metadata:
+  name: qualification
+spec:
+  tests:
+    script-check:
+      name: script-check
+      uid: 11111111-1111-1111-1111-111111111111
+      generation: 1
+      contentDigest: %s
+`, testDigest)), 0o600))
+
+	_, err = CompileFileWithBindings(planPath, bindingsPath)
+	require.ErrorContains(t, err, "stage dependency graph contains a cycle")
+}
+
 func TestCompileFileRejectsUnsafeOrInvalidInputs(t *testing.T) {
 	t.Parallel()
 
@@ -256,6 +459,15 @@ func mustCompileFile(t *testing.T, path string) []byte {
 	t.Helper()
 
 	rendered, err := CompileFile(path)
+	require.NoError(t, err)
+
+	return rendered
+}
+
+func mustCompileFileWithBindings(t *testing.T, path, bindingsPath string) []byte {
+	t.Helper()
+
+	rendered, err := CompileFileWithBindings(path, bindingsPath)
 	require.NoError(t, err)
 
 	return rendered

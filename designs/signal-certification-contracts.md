@@ -68,10 +68,19 @@ artifact SHA-256, and emits deterministic `CertificationTest` YAML with the
 content embedded. WorkflowTemplate drivers may also attach one source artifact
 while pinning the separately managed template by name and canonical digest.
 
+Plans may also define ordered Suite phases and stages by source Test name.
+Suite generation is intentionally two-phase because an executable
+`CertificationSuite` must pin the live Test UID, generation, and
+administrator-approved content digest. `--tests-only` emits the bootstrap Test
+objects. `kubectl unbounded signal bindings` captures the observed accepted
+cluster identities into a strict `CertificationPlanBindings` file, and
+`--bindings` emits the Tests followed by the bound Suite. The compiler never
+invents or bypasses approval identities.
+
 Generated YAML may be committed for GitOps and direct cluster application, but
 it is never edited by hand. The plan, source files, and digest-pinned runtime
-catalog are authoritative. CI should render the plan and reject stale generated
-output.
+catalog are authoritative. The bindings file is the cluster-specific trust
+input. CI should render the plan and reject stale generated output.
 
 ## Suites and scheduling
 
